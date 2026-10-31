@@ -114,6 +114,7 @@ mod long_context;
 /// registration is approved.
 #[cfg(test)]
 mod m3_quality;
+mod m3_rows;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod moe;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
