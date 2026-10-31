@@ -525,14 +525,24 @@ fn m3_trace_compare() {
             b.get(key)
         );
     }
+    // Normalize the gather vocabulary: identity files written before the
+    // canonical-writer fix spell the two states "off" and "1"; later ones
+    // write "false" and "true". Both spell one on/off pair.
+    let norm = |v: Option<&str>| -> Option<String> {
+        match v {
+            Some("off") | Some("false") => Some("off".into()),
+            Some("1") | Some("true") | Some("on") => Some("on".into()),
+            other => other.map(str::to_string),
+        }
+    };
     let mut gathers = [
-        a.get("gather").map(String::as_str),
-        b.get("gather").map(String::as_str),
+        norm(a.get("gather").map(String::as_str)),
+        norm(b.get("gather").map(String::as_str)),
     ];
     gathers.sort_unstable();
     assert_eq!(
         gathers,
-        [Some("false"), Some("true")],
+        [Some("off".to_string()), Some("on".to_string())],
         "the pair must be one gather=off leg and one gather=on leg"
     );
     let a = std::fs::read(Path::new(parts[0]).join("trace_rows.sha256"))

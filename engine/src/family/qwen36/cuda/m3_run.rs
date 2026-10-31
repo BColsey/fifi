@@ -504,12 +504,15 @@ fn m3_trace_leg() {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
+    // Canonical on/off vocabulary: the raw env value ("off" or "1") would leak
+    // a mixed vocabulary that the compare step must then parse.
+    let gather_on = arm.single_gather != "off";
     std::fs::write(
         out_dir.join("trace_identity.txt"),
         format!(
             "arm={}\ngather={}\nbuild_sha256={build_sha}\nbinary_sha256={}\ntrace_sha256={}\nids={}\n",
             if arm.gguf { "gguf" } else { "exl3" },
-            arm.single_gather,
+            if gather_on { "true" } else { "false" },
             binary_sha_of_env(),
             trace_sha.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             ids.len()
@@ -519,6 +522,6 @@ fn m3_trace_leg() {
     println!(
         "m3 trace: {} row digests written, arm gather={}, identity file written",
         ids.len(),
-        arm.single_gather
+        if gather_on { "true" } else { "false" }
     );
 }
