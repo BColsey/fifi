@@ -71,13 +71,15 @@ fn err(text: &str) -> EngError {
     EngError::BadRequest(format!("m3: {text}"))
 }
 
-fn hex32(text: &str) -> Result<[u8; 32], EngError> {
-    let mut out = [0u8; 32];
+fn hex20(text: &str) -> Result<[u8; 20], EngError> {
+    let mut out = [0u8; 20];
     let bytes = text.as_bytes();
-    if bytes.len() != 64 {
-        return Err(err("M3_BUILD_SHA is not 64 hex characters"));
+    if bytes.len() != 40 {
+        return Err(err(
+            "M3_BUILD_SHA is not 40 hex characters (a git commit id)",
+        ));
     }
-    for i in 0..32 {
+    for i in 0..20 {
         let hi = (bytes[2 * i] as char).to_digit(16);
         let lo = (bytes[2 * i + 1] as char).to_digit(16);
         out[i] = 16 * hi.ok_or_else(|| err("M3_BUILD_SHA is not hex"))? as u8
@@ -93,7 +95,7 @@ struct Arm {
     gguf: bool,
     kv: KvMode,
     chunked: bool,
-    build_sha: [u8; 32],
+    build_sha: [u8; 20],
     single_gather: String,
 }
 
@@ -131,7 +133,7 @@ fn arm_of_env() -> Result<Arm, EngError> {
         gguf,
         kv,
         chunked,
-        build_sha: hex32(&env("M3_BUILD_SHA")?)?,
+        build_sha: hex20(&env("M3_BUILD_SHA")?)?,
         single_gather: std::env::var("FIFI_EXL3_SINGLE_GATHER").unwrap_or_else(|_| "off".into()),
     })
 }

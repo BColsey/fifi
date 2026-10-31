@@ -5,11 +5,12 @@
 //!
 //! No device types here: the CUDA leg (`cuda::m3_run`) writes sidecars
 //! through this module, and `m3_compare` runs on any host from two sidecar
-//! sets. The sidecar chunk is a 79-byte header (magic `M3R\x02`, window,
+//! sets. The sidecar chunk is a 67-byte header (magic `M3R\x02`, window,
 //! lo, score_lo, hi, n_rows as u64s, the 3-byte arm id — gguf, kv-q8,
-//! chunked — and the 32-byte build sha) + `(logprob_true f32, top1_correct
-//! u8, top1_id u32)` per scored position + the sha256 of everything before
-//! it: every chunk self-describes the arm and build that produced it.
+//! chunked — and the 20-byte git build sha) + `(logprob_true f32,
+//! top1_correct u8, top1_id u32)` per scored position + the sha256 of
+//! everything before it: every chunk self-describes the arm and build that
+//! produced it.
 
 use super::m3_quality::{Comparison, Margins, PositionRow, ProbeRow};
 use serde_json::Value;
@@ -255,10 +256,10 @@ pub(in crate::family::qwen36) fn sidecar_bytes(
     window: usize,
     (lo, score_lo, hi): (usize, usize, usize),
     arm: [u8; 3],
-    build_sha: [u8; 32],
+    build_sha: [u8; 20],
     rows: &[Row],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(79 + rows.len() * 9 + 32);
+    let mut out = Vec::with_capacity(67 + rows.len() * 9 + 32);
     out.extend_from_slice(b"M3R\x02");
     for field in [
         window as u64,
@@ -280,9 +281,9 @@ pub(in crate::family::qwen36) fn sidecar_bytes(
     out
 }
 
-/// The chunk's arm identity: the 3-byte arm id and the 32-byte build sha
-/// it was produced from.
-pub(in crate::family::qwen36) type ArmIdentity = ([u8; 3], [u8; 32]);
+/// The chunk's arm identity: the 3-byte arm id and the 20-byte git build
+/// sha it was produced from.
+pub(in crate::family::qwen36) type ArmIdentity = ([u8; 3], [u8; 20]);
 
 /// Reads and verifies one window chunk: sha over the body, header geometry
 /// against the layout, then the arm id and build sha it carries. Returns
@@ -293,7 +294,7 @@ pub(in crate::family::qwen36) fn read_sidecar(
     want: (usize, usize, usize),
 ) -> Result<(Vec<Row>, ArmIdentity), String> {
     let bytes = std::fs::read(path).map_err(|e| err(&format!("{}: {e}", path.display())))?;
-    if bytes.len() < 79 + 32 {
+    if bytes.len() < 67 + 32 {
         return Err(err(&format!("{}: too short", path.display())));
     }
     let (body, digest) = bytes.split_at(bytes.len() - 32);
@@ -314,14 +315,14 @@ pub(in crate::family::qwen36) fn read_sidecar(
         )));
     }
     let n = fields[4] as usize;
-    if body.len() != 79 + n * 9 {
+    if body.len() != 67 + n * 9 {
         return Err(err(&format!("{}: row count", path.display())));
     }
     let mut arm = [0u8; 3];
     arm.copy_from_slice(&body[44..47]);
-    let mut build = [0u8; 32];
-    build.copy_from_slice(&body[47..79]);
-    let rows = body[79..]
+    let mut build = [0u8; 20];
+    build.copy_from_slice(&body[47..67]);
+    let rows = body[67..]
         .as_chunks::<9>()
         .0
         .iter()
@@ -350,7 +351,7 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     // Every chunk must carry the SAME arm id and build sha: a sidecar set
     // mixed across arms or builds does not describe one arm.
     let mut window_rows = Vec::with_capacity(layout.windows.len());
-    let mut identity: Option<([u8; 3], [u8; 32])> = None;
+    let mut identity: Option<ArmIdentity> = None;
     for (w, &(lo, score_lo, hi)) in layout.windows.iter().enumerate() {
         let (rows, (arm, build)) =
             read_sidecar(&dir.join(format!("w{w:03}.m3row")), w, (lo, score_lo, hi))?;
@@ -594,7 +595,7 @@ mod tests {
     #[test]
     fn sidecar_round_trips_and_rejects_tampering() {
         let rows: Vec<Row> = vec![(-0.5, true, 7), (-1.25, false, 3)];
-        let bytes = sidecar_bytes(9, (100, 356, 400), [0, 1, 0], [7u8; 32], &rows);
+        let bytes = sidecar_bytes(9, (100, 356, 400), [0, 1, 0], [7u8; 20], &rows);
         let back = read_sidecar(
             std::path::Path::new("/dev/null-does-not-exist"),
             9,
@@ -605,11 +606,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
         assert_eq!(rows, vec![(-0.5f32, true, 7u32), (-1.25, false, 3)]);
-        assert_eq!((arm, build), ([0, 1, 0], [7u8; 32]));
+        assert_eq!((arm, build), ([0, 1, 0], [7u8; 20]));
         assert!(read_sidecar(&path, 8, (100, 356, 400)).is_err());
         assert!(read_sidecar(&path, 9, (101, 356, 400)).is_err());
         let mut tampered = bytes.clone();
-        tampered[79] ^= 1; // a row byte: the digest must reject it
+        tampered[67] ^= 1; // a row byte: the digest must reject it
         std::fs::write(&path, &tampered).unwrap();
         assert!(read_sidecar(&path, 9, (100, 356, 400)).is_err());
         let mut wrong_arm = bytes.clone();
@@ -621,7 +622,7 @@ mod tests {
         // the digest passes but the returned identity must say what it carries
         let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_ne!((arm, build), ([0, 1, 0], [7u8; 32]));
+        assert_ne!((arm, build), ([0, 1, 0], [7u8; 20]));
         std::fs::remove_file(&path).ok();
     }
 }
