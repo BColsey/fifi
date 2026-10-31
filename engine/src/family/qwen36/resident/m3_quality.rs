@@ -1,18 +1,19 @@
 //! The M3 quality gate: teacher-forced EXL3-vs-GGUF and chunked-vs-one-token
-//! margins over the frozen M3 layout (registration v2, 2026-10-31T04:16Z).
+//! margins over the frozen M3 layout (registration v4).
 //!
 //! The pure core in this file is metric math only: paired differences, the
 //! document-clustered bootstrap, and the one-sided bounds. It carries Linux
 //! unit tests like `decode_prefill_kl`'s core; the model arms (the GGUF and
 //! EXL3 loaders, the teacher-forced loops, the streamed sidecar writer) live
-//! in a `cuda` module behind the native cfg, added after the registration is
-//! approved.
+//! in the harness module added with the v4 registration.
 //!
-//! Frozen numbers (registration §2-3): NLL UB +0.02 nats, top-1 LB -0.5 pp,
+//! Frozen numbers (registration §3): NLL UB +0.02 nats, top-1 LB -0.5 pp,
 //! copy-probe LB -1.0 pp, retrieval LB -2.0 pp; bootstrap B=10,000, seed
-//! 20261031, one-sided 95% percentile, document clusters as the resample
+//! 20261031 (each bound re-seeds it, correlating the gates' draws — valid,
+//! disclosed), one-sided 95% percentile, document clusters as the resample
 //! unit. Every row of every arm is teacher-forced on the identical frozen id
-//! stream; the arms only differ in weights and prefill path.
+//! stream; arms differ in weights, KV dtype, and prefill path per the
+//! per-comparison pins.
 
 /// The four gate margins of one comparison. All are candidate-minus-reference
 /// differences; the NLL bound is a ceiling, the rest are floors (negative
@@ -191,6 +192,25 @@ impl Comparison {
         seed: u64,
     ) -> Self {
         let clusters: Vec<u32> = cand_pos.iter().map(|row| row.cluster).collect();
+        // Paired rows: the reference arm must carry the SAME positions in
+        // the SAME order; cluster equality per index is the load-bearing
+        // check (the bootstrap zips by index and weights by candidate
+        // clusters only).
+        assert!(
+            ref_pos.len() == cand_pos.len()
+                && ref_pos
+                    .iter()
+                    .zip(cand_pos)
+                    .all(|(r, c)| r.cluster == c.cluster),
+            "reference rows are not aligned with candidate rows"
+        );
+        for (c_rows, r_rows) in [(cand_copy, ref_copy), (cand_retr, ref_retr)] {
+            assert!(
+                c_rows.len() == r_rows.len()
+                    && c_rows.iter().zip(r_rows).all(|(c, r)| c.cluster == r.cluster),
+                "reference probe rows are not aligned with candidate rows"
+            );
+        }
         let nll = bootstrap_bound(
             &nll_rows(cand_pos).expect("the sidecar verified the logprob signs"),
             &nll_rows(ref_pos).expect("the sidecar verified the logprob signs"),
@@ -213,8 +233,7 @@ impl Comparison {
             // Resample only the probe-bearing clusters (registration §3):
             // compacted universe, so every draw contains events and the
             // pooled statistic is always defined (no 0/0 draws).
-            let mut universe: Vec<u32> =
-                cand.iter().chain(refr).map(|row| row.cluster).collect();
+            let mut universe: Vec<u32> = cand.iter().chain(refr).map(|row| row.cluster).collect();
             universe.sort_unstable();
             universe.dedup();
             let c: Vec<u32> = cand
@@ -278,15 +297,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let cmp = Comparison::evaluate(
-            &pos,
-            &pos,
-            &probes,
-            &probes,
-            &probes,
-            &probes,
-            3,
-            200,
-            20261031,
+            &pos, &pos, &probes, &probes, &probes, &probes, 3, 200, 20261031,
         );
         assert!(cmp.passes(&Margins::frozen()), "{cmp:?}");
         assert!(cmp.nll_ub.abs() < 1e-9 && cmp.top1_lb.abs() < 1e-9);
@@ -403,5 +414,35 @@ mod tests {
         let other = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261032, true);
         assert_eq!(first, second);
         assert_ne!(first, other);
+    }
+
+    /// Probes occupying only a SPARSE subset of the position clusters: the
+    /// probe universe must be the probe-bearing clusters (v4: 169/169 of
+    /// 1,526), so no draw can be event-free. 2 of 5 clusters here; the
+    /// bounds must be finite, and losing 3 of 6 events must fail the floor.
+    #[test]
+    fn sparse_probe_universe_stays_finite_and_directional() {
+        // Positions over 5 clusters (12 rows, cluster = i/5 % 5).
+        let pos = rows(
+            &[-1.0; 12],
+            &[true; 12],
+            5,
+        );
+        // 6 probe rows living only in clusters 1 and 3.
+        let probes = (0..6)
+            .map(|i| ProbeRow {
+                cluster: if i < 3 { 1 } else { 3 },
+                exact: true,
+            })
+            .collect::<Vec<_>>();
+        let cmp = Comparison::evaluate(&pos, &pos, &probes, &probes, &probes, &probes, 5, 500, 20261031);
+        assert!(cmp.probe_lb.is_finite() && cmp.probe_lb.abs() < 1e-9, "{cmp:?}");
+        assert!(cmp.passes(&Margins::frozen()), "{cmp:?}");
+        let mut lost = probes.clone();
+        lost[1].exact = false;
+        lost[4].exact = false;
+        lost[5].exact = false;
+        let bad = Comparison::evaluate(&pos, &pos, &lost, &probes, &probes, &probes, 5, 500, 20261031);
+        assert!(bad.probe_lb < -0.01 && !bad.passes(&Margins::frozen()), "{bad:?}");
     }
 }
