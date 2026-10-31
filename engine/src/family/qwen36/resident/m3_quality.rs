@@ -26,13 +26,14 @@ pub(super) struct Margins {
 }
 
 impl Margins {
-    /// The frozen registration values.
+    /// The frozen registration values, in the statistic's units: NLL in
+    /// nats, the three share floors in FRACTIONS (−0.5 pp, −1.0 pp, −2.0 pp).
     fn frozen() -> Self {
         Margins {
             nll_ub: 0.02,
-            top1_lb: -0.5,
-            copy_lb: -1.0,
-            retrieval_lb: -2.0,
+            top1_lb: -0.005,
+            copy_lb: -0.01,
+            retrieval_lb: -0.02,
         }
     }
 }
@@ -132,10 +133,11 @@ fn bootstrap_bound(
     }
 }
 
-/// The NLL rows of one arm: the per-row statistic is the true-token logprob
-/// itself, so the paired difference of means is the mean NLL delta. A
-/// positive logprob row is refused (the receipt semantics: true
-/// log-probabilities are always <= 0).
+/// The NLL rows of one arm: the per-row statistic is the true-token NLL
+/// (negated logprob, higher = worse), so the paired difference of means is
+/// the mean NLL delta and the +0.02-nat ceiling reads correctly. A positive
+/// logprob row is refused (the receipt semantics: true log-probabilities are
+/// always <= 0).
 fn nll_rows(rows: &[PositionRow]) -> Result<Vec<f64>, String> {
     rows.iter()
         .map(|row| {
@@ -145,7 +147,7 @@ fn nll_rows(rows: &[PositionRow]) -> Result<Vec<f64>, String> {
                     row.logprob_true
                 ))
             } else {
-                Ok(row.logprob_true as f64)
+                Ok(-(row.logprob_true as f64))
             }
         })
         .collect()
@@ -165,6 +167,7 @@ fn probe_rows(rows: &[ProbeRow]) -> Vec<f64> {
 
 /// The full verdict of one comparison from both arms' frozen rows. Pure: the
 /// device arms produce the rows, this decides.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Comparison {
     pub nll_ub: f64,
     pub top1_lb: f64,
@@ -173,8 +176,10 @@ pub(super) struct Comparison {
 }
 
 impl Comparison {
+    /// Grouped args would hide the cand/ref pairing the registration pins;
+    /// the seven data args ARE the frozen protocol.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
-        margins: &Margins,
         cand_pos: &[PositionRow],
         ref_pos: &[PositionRow],
         cand_copy: &[ProbeRow],
@@ -205,12 +210,22 @@ impl Comparison {
             false,
         );
         let probe_bound = |cand: &[ProbeRow], refr: &[ProbeRow]| {
-            let c: Vec<u32> = cand.iter().map(|row| row.cluster).collect();
+            // Resample only the probe-bearing clusters (registration §3):
+            // compacted universe, so every draw contains events and the
+            // pooled statistic is always defined (no 0/0 draws).
+            let mut universe: Vec<u32> =
+                cand.iter().chain(refr).map(|row| row.cluster).collect();
+            universe.sort_unstable();
+            universe.dedup();
+            let c: Vec<u32> = cand
+                .iter()
+                .map(|row| universe.binary_search(&row.cluster).expect("compact") as u32)
+                .collect();
             bootstrap_bound(
                 &probe_rows(cand),
                 &probe_rows(refr),
                 &c,
-                n_clusters,
+                universe.len() as u32,
                 draws,
                 seed,
                 false,
@@ -263,7 +278,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let cmp = Comparison::evaluate(
-            &Margins::frozen(),
             &pos,
             &pos,
             &probes,
@@ -300,7 +314,6 @@ mod tests {
         let worse_lp = [-1.05; 12];
         let worse = rows(&worse_lp, &base_ok, 4);
         let nll_bad = Comparison::evaluate(
-            &Margins::frozen(),
             &worse,
             &reference,
             &probes_ref,
@@ -318,7 +331,6 @@ mod tests {
         let better_lp = [-0.99; 12];
         let better = rows(&better_lp, &base_ok, 4);
         let nll_good = Comparison::evaluate(
-            &Margins::frozen(),
             &better,
             &reference,
             &probes_ref,
@@ -339,7 +351,6 @@ mod tests {
         flip_ok[8] = false;
         let flipped = rows(&base_lp, &flip_ok, 4);
         let top1_bad = Comparison::evaluate(
-            &Margins::frozen(),
             &flipped,
             &reference,
             &probes_ref,
@@ -358,7 +369,6 @@ mod tests {
         lost[5].exact = false;
         lost[9].exact = false;
         let probe_bad = Comparison::evaluate(
-            &Margins::frozen(),
             &reference,
             &reference,
             &lost,
@@ -382,9 +392,12 @@ mod tests {
     /// same seed twice is bit-identical, a different seed differs somewhere.
     #[test]
     fn bootstrap_is_deterministic_from_the_seed() {
-        let a = [0.1_f64; 40];
-        let b = [0.0_f64; 40];
-        let clusters = vec![0u32; 40];
+        // Varied clusters and asymmetric rows, so the drawn statistics depend
+        // on the RNG stream (uniform rows over one cluster would be
+        // seed-independent by construction).
+        let a: Vec<f64> = (0..40).map(|i| 0.1 + f64::from(i) * 0.0173).collect();
+        let b: Vec<f64> = (0..40).map(|i| 0.05 + f64::from(i) * 0.0091).collect();
+        let clusters: Vec<u32> = (0..40).map(|i| (i % 3) as u32).collect();
         let first = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261031, true);
         let second = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261031, true);
         let other = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261032, true);
