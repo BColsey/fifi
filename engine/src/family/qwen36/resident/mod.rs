@@ -113,8 +113,10 @@ mod long_context;
 /// unit tests; the model arms join behind the native cfg once the
 /// registration is approved.
 #[cfg(test)]
-mod m3_quality;
-mod m3_rows;
+pub(super) mod m3_quality;
+pub(super) mod m3_rows;
+#[cfg(test)]
+pub(super) mod m3_store;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod moe;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

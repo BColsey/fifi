@@ -29,7 +29,7 @@ pub(super) struct Margins {
 impl Margins {
     /// The frozen registration values, in the statistic's units: NLL in
     /// nats, the three share floors in FRACTIONS (−0.5 pp, −1.0 pp, −2.0 pp).
-    fn frozen() -> Self {
+    pub(in crate::family::qwen36) fn frozen() -> Self {
         Margins {
             nll_ub: 0.02,
             top1_lb: -0.005,
@@ -44,7 +44,7 @@ impl Margins {
 /// token (always <= 0; the receipt refuses a positive one), `top1_correct`
 /// is the greedy argmax equality on the true token.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct PositionRow {
+pub(in crate::family::qwen36) struct PositionRow {
     pub cluster: u32,
     pub logprob_true: f32,
     pub top1_correct: bool,
@@ -53,7 +53,7 @@ pub(super) struct PositionRow {
 /// One probe of one arm: all-token exact (copy continuations and retrieval
 /// marker spans alike; 0052 probes are all-token-exact by definition).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct ProbeRow {
+pub(in crate::family::qwen36) struct ProbeRow {
     pub cluster: u32,
     pub exact: bool,
 }
@@ -180,7 +180,7 @@ impl Comparison {
     /// Grouped args would hide the cand/ref pairing the registration pins;
     /// the seven data args ARE the frozen protocol.
     #[allow(clippy::too_many_arguments)]
-    fn evaluate(
+    pub(in crate::family::qwen36) fn evaluate(
         cand_pos: &[PositionRow],
         ref_pos: &[PositionRow],
         cand_copy: &[ProbeRow],
@@ -260,7 +260,7 @@ impl Comparison {
 
     /// All four gates must hold (registration §3); conjunctions need no alpha
     /// correction, and no gate is dropped after results.
-    fn passes(&self, margins: &Margins) -> bool {
+    pub(in crate::family::qwen36) fn passes(&self, margins: &Margins) -> bool {
         self.nll_ub <= margins.nll_ub
             && self.top1_lb >= margins.top1_lb
             && self.probe_lb >= margins.copy_lb

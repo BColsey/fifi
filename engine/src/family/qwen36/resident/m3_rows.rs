@@ -10,11 +10,15 @@
 //! are a hard error in the runner; here NaN simply never ranks and NaN
 //! propagates into the log-probability the runner checks.
 
+// Pure host math, but its only callers are test-gated (the scorer's tests
+// and the device harness), so a non-test build sees it unreferenced.
+#![cfg_attr(not(test), expect(dead_code, reason = "staged for the M3 harness legs"))]
+
 use super::m3_quality::PositionRow;
 
 /// `ln(sum(exp(row)))` in f64, stable at the max. An all-NaN or empty row
 /// is a caller bug the runner rejects; this returns -inf / NaN faithfully.
-pub(super) fn log_sum_exp(row: &[f32]) -> f64 {
+pub(in crate::family::qwen36) fn log_sum_exp(row: &[f32]) -> f64 {
     let max = row
         .iter()
         .copied()
@@ -35,7 +39,7 @@ pub(super) fn log_sum_exp(row: &[f32]) -> f64 {
 
 /// The log-probability of `true_id` under the row: `logit - lse`. A `true_id`
 /// outside the row is a layout bug, refused loudly.
-pub(super) fn logprob_true(row: &[f32], true_id: u32) -> Result<f64, &'static str> {
+pub(in crate::family::qwen36) fn logprob_true(row: &[f32], true_id: u32) -> Result<f64, &'static str> {
     let logit = f64::from(
         row.get(true_id as usize)
             .copied()
@@ -46,7 +50,7 @@ pub(super) fn logprob_true(row: &[f32], true_id: u32) -> Result<f64, &'static st
 
 /// The greedy argmax, ties to the lower id, NaN never ranks. An empty row or
 /// an all-NaN row is refused (the runner treats it as a device failure).
-pub(super) fn argmax_low_id(row: &[f32]) -> Result<u32, &'static str> {
+pub(in crate::family::qwen36) fn argmax_low_id(row: &[f32]) -> Result<u32, &'static str> {
     let mut best: Option<(u32, f32)> = None;
     for (id, &v) in row.iter().enumerate() {
         if v.is_nan() {
@@ -63,7 +67,7 @@ pub(super) fn argmax_low_id(row: &[f32]) -> Result<u32, &'static str> {
 /// The scored-position row of one logits row: true-token log-probability
 /// (f32 for storage; the scorer's bootstrap re-widens to f64) and the greedy
 /// argmax equality on the true token.
-pub(super) fn position_row(
+pub(in crate::family::qwen36) fn position_row(
     row: &[f32],
     true_id: u32,
     cluster: u32,

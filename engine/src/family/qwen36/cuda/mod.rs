@@ -64,6 +64,9 @@ mod exl3_step_merge_device_tests;
 #[cfg(test)]
 mod export_tests;
 pub mod gate;
+#[cfg(all(test, feature = "native-cuda"))]
+#[path = "m3_run.rs"]
+mod m3_run;
 #[cfg(test)]
 mod geometry_tests;
 #[cfg(test)]
