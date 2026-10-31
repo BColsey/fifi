@@ -314,6 +314,7 @@ fn run_window(
 #[test]
 #[ignore = "the 3090 under fifi-gpu-run: M3_ARM, M3_ARM_DIR, M3_KV, M3_PREFILL, M3_BUILD_SHA, M3_LAYOUT_DIR, M3_WINDOWS, M3_OUT"]
 fn m3_leg() {
+    refuse_stray_env(false);
     let layout_dir = crate::test_paths::required("M3_LAYOUT_DIR");
     let out_dir = PathBuf::from(env("M3_OUT").expect("M3_OUT"));
     std::fs::create_dir_all(&out_dir).expect("out dir");
@@ -393,11 +394,12 @@ fn m3_leg() {
             std::fs::write(
                 out_dir.join("manifest.json"),
                 format!(
-                    "{{\"arm\": {}, \"kv\": \"{}\", \"prefill\": \"{}\", \"gather\": \"{}\", \"build_sha256\": \"{build_sha}\", \"windows\": \"{lo_w}:{hi_w}\", \"layout_sha256\": \"{}\", \"ids_sha256\": \"{}\", \"padding_mass\": {mass:e}}}",
+                    "{{\"arm\": {}, \"kv\": \"{}\", \"prefill\": \"{}\", \"gather\": \"{}\", \"build_sha256\": \"{build_sha}\", \"binary_sha256\": \"{}\", \"windows\": \"{lo_w}:{hi_w}\", \"layout_sha256\": \"{}\", \"ids_sha256\": \"{}\", \"padding_mass\": {mass:e}}}",
                     if arm.gguf { "\"gguf\"" } else { "\"exl3\"" },
                     env("M3_KV").unwrap_or_default(),
                     env("M3_PREFILL").unwrap_or_default(),
                     arm.single_gather,
+                    binary_sha_of_env(),
                     m3_store::registered_layout_sha(),
                     m3_store::registered_ids_sha(),
                 ),
@@ -408,21 +410,73 @@ fn m3_leg() {
     }
 }
 
-/// The arm-4 entry: one trace window (M3_TRACE ids bin, u32 LE) forced
-/// through the arm serially, one sha256 per position's full f32 row. Two
-/// runs that differ in ANY row bit produce different digest files; the
-/// host-side `m3_trace_compare` test asserts them byte-equal.
+/// The leg env contract: no engine/service env reaches a deliberate leg
+/// run. The runner scrubs with env -i, but the harness enforces its own
+/// contract — any Q36_/FIFI_/INFERENCE_ name in the process aborts the
+/// leg with the strays listed (the trace leg alone may carry the arm-4
+/// single-gather switch).
+fn refuse_stray_env(allow_gather: bool) {
+    let strays: Vec<String> = std::env::vars()
+        .filter(|(k, _)| {
+            (k.starts_with("Q36_") || k.starts_with("INFERENCE_") || k.starts_with("FIFI_"))
+                && !(allow_gather && k == "FIFI_EXL3_SINGLE_GATHER")
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "stray env in the leg process (the runner must exec env -i): {strays:?}"
+    );
+}
+
+/// The binary sha256 the runner measured (sha256sum of the test binary
+/// itself): 64 hex, recorded in the leg's manifest so every artifact names
+/// the exact binary that produced it.
+fn binary_sha_of_env() -> String {
+    let sha = env("M3_BIN_SHA").unwrap_or_default();
+    assert!(
+        sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "M3_BIN_SHA must be the runner-measured 64-hex sha256 of the binary"
+    );
+    sha
+}
+
+/// The arm-4 entry: one trace window (M3_TRACE ids bin, i64 LE — the
+/// frozen file's sha and count are REGISTERED, a different file aborts)
+/// forced through the arm serially, one sha256 per position's full f32
+/// row. The leg writes trace_rows.sha256 plus trace_identity.txt (arm,
+/// gather, build, binary, trace sha, count) so the compare step can never
+/// pair a mismatched leg; the host `m3_trace_compare` asserts the pair is
+/// (gather off, gather on) of one build, then byte-equal digests.
 #[test]
-#[ignore = "the 3090 under fifi-gpu-run: M3_ARM, M3_ARM_DIR, M3_KV, M3_BUILD_SHA, M3_TRACE, M3_OUT"]
+#[ignore = "the 3090 under fifi-gpu-run: M3_ARM, M3_ARM_DIR, M3_KV, M3_BUILD_SHA, M3_BIN_SHA, M3_TRACE, M3_OUT"]
 fn m3_trace_leg() {
+    refuse_stray_env(true);
     let trace = std::fs::read(env("M3_TRACE").expect("M3_TRACE")).expect("trace bin");
+    assert!(
+        trace.len().is_multiple_of(8),
+        "trace bin is i64 LE: length {} is not a multiple of 8",
+        trace.len()
+    );
+    assert_eq!(
+        &Sha256::digest(&trace)[..],
+        &m3_store::registered_trace_sha()[..],
+        "the trace bin is not the registered trace_ids.bin"
+    );
     let ids: Vec<u32> = trace
-        .as_chunks::<4>()
+        .as_chunks::<8>()
         .0
         .iter()
-        .map(|c| u32::from_le_bytes(*c))
+        .map(|c| {
+            let v = i64::from_le_bytes(*c);
+            assert!(
+                (0..=u32::MAX as i64).contains(&v),
+                "trace id out of u32 range: {v}"
+            );
+            v as u32
+        })
         .collect();
-    assert!(ids.len() >= 64, "trace bin too short");
+    assert_eq!(ids.len(), m3_store::TRACE_IDS, "the registered trace count");
     let out_dir = PathBuf::from(env("M3_OUT").expect("M3_OUT"));
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let arm = arm_of_env().expect("arm");
@@ -444,8 +498,26 @@ fn m3_trace_leg() {
         }
     }
     std::fs::write(out_dir.join("trace_rows.sha256"), &digests).expect("digest write");
+    let trace_sha = m3_store::registered_trace_sha();
+    let build_sha = arm
+        .build_sha
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    std::fs::write(
+        out_dir.join("trace_identity.txt"),
+        format!(
+            "arm={}\ngather={}\nbuild_sha256={build_sha}\nbinary_sha256={}\ntrace_sha256={}\nids={}\n",
+            if arm.gguf { "gguf" } else { "exl3" },
+            arm.single_gather,
+            binary_sha_of_env(),
+            trace_sha.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            ids.len()
+        ),
+    )
+    .expect("identity write");
     println!(
-        "m3 trace: {} row digests written, arm gather={}",
+        "m3 trace: {} row digests written, arm gather={}, identity file written",
         ids.len(),
         arm.single_gather
     );

@@ -251,6 +251,19 @@ pub(in crate::family::qwen36) fn registered_ids_sha() -> &'static str {
     IDS_SHA
 }
 
+/// The frozen arm-4 trace input: i64 LE ids, sha and count registered.
+pub(in crate::family::qwen36) const TRACE_IDS: usize = 1119;
+const TRACE_SHA: &str = "0c04651f0c9d7a85a7dee46c3ae5007518aa13bd13497991dbe27cd145858a7a";
+
+pub(in crate::family::qwen36) fn registered_trace_sha() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hex = |c: u8| (c as char).to_digit(16).expect("hex digit") as u8;
+        *slot = (hex(TRACE_SHA.as_bytes()[i * 2]) << 4) | hex(TRACE_SHA.as_bytes()[i * 2 + 1]);
+    }
+    out
+}
+
 /// The sidecar bytes of one window: header + rows + trailing sha256.
 pub(in crate::family::qwen36) fn sidecar_bytes(
     window: usize,
@@ -339,6 +352,7 @@ pub(in crate::family::qwen36) fn read_sidecar(
 
 /// All position and probe rows of one arm, rebuilt from its sidecar set.
 struct ArmRows {
+    identity: ArmIdentity,
     positions: Vec<PositionRow>,
     retrieval: Vec<ProbeRow>,
     copy: Vec<ProbeRow>,
@@ -404,28 +418,64 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
             retrieval.push(row);
         }
     }
+    let identity = identity.expect("the layout has at least one window");
     Ok(ArmRows {
+        identity,
         positions,
         retrieval,
         copy,
     })
 }
 
-/// The frozen comparison of two sidecar sets: env M3_COMPARE="cand:ref"
-/// plus M3_LAYOUT_DIR. Writes the four margins and the verdict to stdout
-/// and panics on any incomplete or mismatching arm (crash rule).
+/// The frozen comparisons of two sidecar sets. `M3_COMPARE=P1:cand:ref`
+/// or `O1:cand:ref` (plus M3_LAYOUT_DIR): the pair's expected sidecar
+/// identities are registered HERE, so a swapped or mismatched pair aborts
+/// before any math, and the two arms must be scored on the SAME build.
+/// Writes the four margins and the verdict to stdout and panics on any
+/// incomplete or mismatching arm (crash rule).
 #[test]
-#[ignore = "needs two complete arm sidecar sets: M3_COMPARE=cand_dir:ref_dir M3_LAYOUT_DIR=dir"]
+#[ignore = "needs two complete arm sidecar sets: M3_COMPARE=P1|O1:cand_dir:ref_dir M3_LAYOUT_DIR=dir"]
 fn m3_compare() {
     let layout_dir = crate::test_paths::required("M3_LAYOUT_DIR");
-    let (cand_dir, ref_dir) = {
-        let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=cand:ref");
+    let (pair, cand_dir, ref_dir) = {
+        let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=P1|O1:cand:ref");
         let parts: Vec<&str> = spec.split(':').collect();
-        (PathBuf::from(parts[0]), PathBuf::from(parts[1]))
+        assert!(parts.len() == 3, "spec is PAIR:cand_dir:ref_dir");
+        (
+            parts[0].to_string(),
+            PathBuf::from(parts[1]),
+            PathBuf::from(parts[2]),
+        )
+    };
+    // [gguf, kv-q8, chunked]: P1 = arm3 vs arm2 (q8); O1 = arm2' vs arm1 (f16).
+    let (want_cand, want_ref, label) = match pair.as_str() {
+        "P1" => (
+            [0, 1, 1],
+            [0, 1, 0],
+            "P1: chunked prefill at q8 must not degrade quality",
+        ),
+        "O1" => (
+            [0, 0, 1],
+            [1, 0, 1],
+            "O1: EXL3 f16 chunked vs GGUF f16 chunked",
+        ),
+        other => panic!("unknown comparison {other}: P1 or O1"),
     };
     let layout = load_layout(&layout_dir).expect("layout");
     let cand = arm_rows(&cand_dir, &layout).expect("candidate arm");
     let reference = arm_rows(&ref_dir, &layout).expect("reference arm");
+    assert_eq!(
+        cand.identity.0, want_cand,
+        "candidate sidecar carries the wrong arm"
+    );
+    assert_eq!(
+        reference.identity.0, want_ref,
+        "reference sidecar carries the wrong arm"
+    );
+    assert_eq!(
+        cand.identity.1, reference.identity.1,
+        "the two arms were scored on different builds"
+    );
     let comparison = Comparison::evaluate(
         &cand.positions,
         &reference.positions,
@@ -438,24 +488,62 @@ fn m3_compare() {
         SEED,
     );
     let verdict = comparison.passes(&Margins::frozen());
-    println!("m3 comparison: {comparison:?} verdict={verdict}");
+    println!(
+        "m3 comparison {label}: cand arm {want_cand:?} ref arm {want_ref:?} build {:02x?}: {comparison:?} verdict={verdict}",
+        cand.identity.1
+    );
     assert!(verdict, "the frozen margins failed: {comparison:?}");
 }
 
-/// The arm-4 gate: two trace-leg digest files (one sha256 per position's
-/// full f32 row) must be byte-identical, else the arms disagree in some
-/// row bit. `#[ignore]`d host entry: M3_TRACE_COMPARE=dir_a:dir_b.
+/// The arm-4 gate: the two trace legs' digest files (one sha256 per
+/// position's full f32 row) must be byte-identical. The legs write a
+/// `trace_identity.txt` next to the digests; the compare first asserts the
+/// pair really is (gather off, gather on) of the SAME build, trace input
+/// and count — a mismatched pair aborts before the bitwise compare.
+/// `#[ignore]`d host entry: M3_TRACE_COMPARE=dir_a:dir_b.
 #[test]
 #[ignore = "two trace leg outputs: M3_TRACE_COMPARE=arm2_dir:arm4_dir"]
 fn m3_trace_compare() {
     let spec = std::env::var("M3_TRACE_COMPARE").expect("M3_TRACE_COMPARE=dir_a:dir_b");
     let parts: Vec<&str> = spec.split(':').collect();
-    let a = std::fs::read(PathBuf::from(parts[0]).join("trace_rows.sha256"))
+    let identity_of = |dir: &str| -> std::collections::BTreeMap<String, String> {
+        let text = std::fs::read_to_string(Path::new(dir).join("trace_identity.txt"))
+            .expect("trace_identity.txt");
+        text.lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let a = identity_of(parts[0]);
+    let b = identity_of(parts[1]);
+    for key in ["build_sha256", "trace_sha256", "ids"] {
+        assert_eq!(
+            a.get(key),
+            b.get(key),
+            "the trace pair disagrees on {key}: {:?} vs {:?}",
+            a.get(key),
+            b.get(key)
+        );
+    }
+    let mut gathers = [
+        a.get("gather").map(String::as_str),
+        b.get("gather").map(String::as_str),
+    ];
+    gathers.sort_unstable();
+    assert_eq!(
+        gathers,
+        [Some("false"), Some("true")],
+        "the pair must be one gather=off leg and one gather=on leg"
+    );
+    let a = std::fs::read(Path::new(parts[0]).join("trace_rows.sha256"))
         .expect("arm a trace_rows.sha256");
-    let b = std::fs::read(PathBuf::from(parts[1]).join("trace_rows.sha256"))
+    let b = std::fs::read(Path::new(parts[1]).join("trace_rows.sha256"))
         .expect("arm b trace_rows.sha256");
     assert_eq!(a.len(), b.len(), "the trace legs scored different lengths");
-    assert!(a.len() % 32 == 0 && !a.is_empty(), "not a digest file");
+    assert!(
+        a.len().is_multiple_of(32) && !a.is_empty(),
+        "not a digest file"
+    );
     for (i, (x, y)) in a
         .as_chunks::<32>()
         .0
@@ -536,7 +624,10 @@ mod tests {
                     s = s
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
-                    let u = (s >> 33) as f64 / u64::from(u32::MAX) as f64;
+                    // s>>33 spans [0, 2^31): dividing by 2^31 (NOT u32::MAX,
+                    // which halves the span and doubles the flip rate) maps
+                    // u onto [0,1) so `rate` is the true flip probability.
+                    let u = (s >> 33) as f64 / f64::from(1u32 << 31);
                     ProbeRow {
                         exact: u >= rate,
                         ..*r
