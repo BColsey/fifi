@@ -296,7 +296,8 @@ impl Drop for PinnedBuf {
     fn drop(&mut self) {
         let bytes = self.bytes;
         if let Some(raw) = self.raw.take() {
-            run_or_defer(move || release(raw, resident::pinned_free, &LIVE_PINNED, bytes));
+            let device = self.lease.device();
+            run_or_defer(move || release(raw, resident::pinned_free, &LIVE_PINNED, bytes, device));
         }
     }
 }

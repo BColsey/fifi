@@ -21,6 +21,7 @@ use super::{
     prefill_plan::Extra,
     resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes},
     rules::QwenRules,
+    shard::ShardTable,
     state_layout::{KvPool, StateLayout},
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
@@ -35,6 +36,7 @@ use crate::{
         qwen36::host::HostShape,
         session::DecodeSession,
     },
+    kernels::cuda::peer::{check_peer_facts, enable_peer_access, probe_device_set},
     kernels::cuda::resident::exl3::SingleRow,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::TokenizerBundle,
@@ -761,12 +763,48 @@ pub(crate) fn start(
 /// options from the loaded layout, step resources, then the leaks, the step and the capture
 /// setting. The SHA-256 toggle arrives already resolved (`start()` validated it), so this
 /// thread never reads the environment.
+/// The device-set gate at the head of `make`: `[0]` (or an absent member,
+/// which settings already read as `[0]`) passes untouched. Any other list is
+/// probed for real — visibility, one compute capability, direct peer access
+/// for every ordered pair, and a shard table whose column cuts keep the
+/// 256-value K-quant blocks whole — and the probe result is printed, so the
+/// operator learns from this refusal whether the box can ever serve
+/// multi-device. The step then refuses: this build serves on device 0 only,
+/// and silently serving there after `--config` named other devices would
+/// hide the mismatch. The multi-device step replaces the final refusal and
+/// keeps everything above it.
+fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
+    if settings.cuda_devices == [0] {
+        return Ok(());
+    }
+    let facts = probe_device_set(&settings.cuda_devices)?;
+    check_peer_facts(&facts).map_err(|refusal| {
+        EngError::BadRequest(format!(
+            "cuda_devices {:?}: {refusal}",
+            settings.cuda_devices
+        ))
+    })?;
+    enable_peer_access(&settings.cuda_devices)?;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
+    ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+    let first = &facts[0];
+    eprintln!(
+        "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full, shard table admitted",
+        settings.cuda_devices, first.cc_major, first.cc_minor
+    );
+    Err(EngError::BadRequest(format!(
+        "cuda_devices {:?}: this build serves on device 0 only; multi-device serving is not implemented yet",
+        settings.cuda_devices
+    )))
+}
+
 fn make(
     settings: Q36Settings,
     rules: QwenRules,
     plan: StartupPlan,
     mut guard: BuildGuard,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
+    check_device_set(&settings)?;
     let kv_cache = plan.reserve;
     let verify = plan.verify;
     let fixed_admission = plan.modes.fixed_admission;

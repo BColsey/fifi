@@ -1,0 +1,560 @@
+//! The peer mailbox ring: one mailbox allocation per device, and the
+//! exchange that turns per-device partial rows into the replicated row.
+//!
+//! The protocol and slot layout are stated in `native/abi_ring.h`; this
+//! module owns the layout arithmetic (pure, in [`MailboxLayout`]) and the
+//! mailbox allocations. An exchange publishes every device's partial into
+//! every peer's slot, then each device waits and sums locally, so a
+//! finished exchange leaves the identical full row on every device. The
+//! sequence advances once per exchange and the slot parity follows it, so
+//! a slot is only reused two exchanges later and never needs clearing.
+//!
+//! Slot reuse is safe only under the stream contract stated in
+//! `native/abi_ring.h`: all ring work for one device is queued in exchange
+//! order on one stream, and exchanges never overlap. The two-exchange
+//! chain through each publisher's own wait is what keeps an S+2 publish
+//! from overwriting a slot a consumer still reads for S. Callers that
+//! queue ring work on several streams break that chain.
+//!
+//! [`PeerRing::reset`] re-zeroes every mailbox and restarts the sequence;
+//! it is the session boundary. It also serves the (practically unreachable)
+//! sequence exhaustion, which `exchange_sum` refuses rather than wrapping
+//! into a slot a peer might still read. Construction does not enable peer
+//! access: `peer::enable_peer_access` runs first, at engine start. Two
+//! contexts on one physical device are a legal ring (the addresses are
+//! ordinary allocations then), which is how the protocol is tested on a
+//! single-card box.
+
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the multi-device decode step, its first production caller"
+    )
+)]
+
+use std::cell::Cell;
+
+use super::context::{CudaContext, DeviceBuffer, DeviceStream};
+use super::native;
+use crate::EngError;
+
+/// Bytes of slot header before the payload. Matches `kHeaderBytes` in
+/// `native/peer_ring.cu`.
+pub(crate) const HEADER_BYTES: usize = 128;
+/// Payloads are allocated at the f32 stride so the fp32 diagnostic mode
+/// needs no second mailbox.
+const VALUE_BYTES: usize = 4;
+/// The spin budget of one wait, in SM clock cycles: about a second on a
+/// 1.7 GHz part. A peer that has not published within it has failed, and
+/// the status word says so instead of hanging the device.
+pub(crate) const TIMEOUT_CYCLES: u64 = 1_700_000_000;
+
+fn bad(message: String) -> EngError {
+    EngError::BadRequest(format!("peer ring: {message}"))
+}
+
+/// Where every slot of one device's mailbox lies. Pure arithmetic over the
+/// device count and the largest payload (in f32 values) an exchange carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MailboxLayout {
+    cards: usize,
+    max_values: usize,
+}
+
+impl MailboxLayout {
+    pub(crate) fn new(cards: usize, max_values: usize) -> Result<Self, EngError> {
+        if !(1..=super::peer::MAX_DEVICES).contains(&cards) {
+            return Err(bad(format!(
+                "{cards} devices is outside 1..={}",
+                super::peer::MAX_DEVICES
+            )));
+        }
+        if max_values == 0 || max_values > native::peer_ring::MAX_VALUES {
+            return Err(bad(format!(
+                "a payload of {max_values} values is outside 1..={}",
+                native::peer_ring::MAX_VALUES
+            )));
+        }
+        Ok(Self { cards, max_values })
+    }
+
+    /// Bytes of one slot: header plus the payload at the f32 stride.
+    pub(crate) fn slot_bytes(&self) -> usize {
+        HEADER_BYTES + self.max_values * VALUE_BYTES
+    }
+
+    /// Bytes of one device's whole mailbox: a slot per source and parity.
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.slot_bytes() * self.cards * 2
+    }
+
+    /// Byte offset of the slot that `source` publishes into for `seq`.
+    pub(crate) fn slot_offset(&self, source: usize, seq: u32) -> Result<usize, EngError> {
+        if source >= self.cards {
+            return Err(bad(format!(
+                "source device {source} is outside the {}-device ring",
+                self.cards
+            )));
+        }
+        Ok((source * 2 + (seq as usize & 1)) * self.slot_bytes())
+    }
+}
+
+/// Which payload representation an exchange uses. `F32` is the diagnostic
+/// mode that keeps ring numerics attributable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RingMode {
+    F16,
+    F32,
+}
+
+impl RingMode {
+    fn f32_payload(self) -> bool {
+        matches!(self, RingMode::F32)
+    }
+}
+
+/// The mailboxes and sequence state of one device set. Not `Send`: the
+/// mailbox buffers share their contexts' leases and thread.
+pub(crate) struct PeerRing {
+    layout: MailboxLayout,
+    mailboxes: Vec<DeviceBuffer>,
+    /// Device address of each mailbox allocation, in device order, recorded
+    /// at construction. The allocations live in `mailboxes` for the ring's
+    /// whole life, so these stay valid.
+    bases: Vec<u64>,
+    next_seq: Cell<u32>,
+}
+
+impl PeerRing {
+    /// Allocates and zeroes one mailbox per context. `contexts[i]` owns the
+    /// mailbox that device `i` reads its peer slots from. Zeroing writes go
+    /// through a short-lived stream per context and return only when landed.
+    pub(crate) fn new(contexts: &[CudaContext], max_values: usize) -> Result<Self, EngError> {
+        let layout = MailboxLayout::new(contexts.len(), max_values)?;
+        let zeros = vec![0u8; layout.total_bytes()];
+        let mut mailboxes = Vec::with_capacity(contexts.len());
+        let mut bases = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            let buffer = context.allocate(layout.total_bytes())?;
+            let stream = context.stream()?;
+            buffer.write_at(&stream, 0, &zeros)?;
+            bases.push(context.owned(&buffer)?.address());
+            mailboxes.push(buffer);
+        }
+        Ok(Self {
+            layout,
+            mailboxes,
+            bases,
+            next_seq: Cell::new(1),
+        })
+    }
+
+    pub(crate) fn cards(&self) -> usize {
+        self.layout.cards
+    }
+
+    /// Re-zeroes every mailbox and restarts the sequence. The caller queues
+    /// this on `streams` it knows are ordered after earlier exchanges.
+    pub(crate) fn reset(
+        &self,
+        contexts: &[CudaContext],
+        streams: &[DeviceStream],
+    ) -> Result<(), EngError> {
+        self.check_members(contexts, streams.len())?;
+        let zeros = vec![0u8; self.layout.total_bytes()];
+        for (context, (stream, mailbox)) in contexts.iter().zip(streams.iter().zip(&self.mailboxes))
+        {
+            context.owned(mailbox)?;
+            mailbox.write_at(stream, 0, &zeros)?;
+        }
+        self.next_seq.set(1);
+        Ok(())
+    }
+
+    fn check_members(&self, contexts: &[CudaContext], streams: usize) -> Result<(), EngError> {
+        if contexts.len() != self.layout.cards || streams != self.layout.cards {
+            return Err(bad(format!(
+                "the ring spans {} devices, got {} contexts and {streams} streams",
+                self.layout.cards,
+                contexts.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn slot_address(&self, owner: usize, source: usize, seq: u32) -> Result<u64, EngError> {
+        let offset = self.layout.slot_offset(source, seq)?;
+        self.bases[owner]
+            .checked_add(u64::try_from(offset).map_err(|_| bad("slot offset overflow".into()))?)
+            .ok_or_else(|| bad("slot address overflow".into()))
+    }
+
+    /// Queues one exchange: every device publishes `partials[i]` to its
+    /// peers, then waits and writes the full sum to `outs[i]`. All slices are
+    /// per-device, in ring order; every buffer must hold `count` f32 values
+    /// (and each `statuses[i]` one u32, zeroed by the caller, which the wait
+    /// ORs its outcome into). The caller MUST read every status word before
+    /// using any `outs[i]`: on timeout the wait writes nothing, so the row
+    /// still holds a previous exchange's valid result, and an overflow bit
+    /// means a peer partial saturated in fp16. Any nonzero status poisons
+    /// the token; there is no valid row. On one device the exchange
+    /// degenerates to the wait-sum over zero peers, an in-order copy of the
+    /// partial row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exchange_sum(
+        &self,
+        contexts: &[CudaContext],
+        streams: &[DeviceStream],
+        partials: &[&DeviceBuffer],
+        outs: &[&DeviceBuffer],
+        statuses: &[&DeviceBuffer],
+        count: usize,
+        mode: RingMode,
+    ) -> Result<(), EngError> {
+        self.check_members(contexts, streams.len())?;
+        if partials.len() != self.layout.cards
+            || outs.len() != self.layout.cards
+            || statuses.len() != self.layout.cards
+        {
+            return Err(bad(
+                "partials, outs and statuses are one buffer per device".into()
+            ));
+        }
+        if count == 0 || count > self.layout.max_values {
+            return Err(bad(format!(
+                "an exchange of {count} values exceeds the mailbox payload of {}",
+                self.layout.max_values
+            )));
+        }
+        let seq = self.next_seq.get();
+        let Some(next) = seq.checked_add(1) else {
+            return Err(bad("the ring sequence is exhausted; reset the ring".into()));
+        };
+        let bytes = count * VALUE_BYTES;
+        for (source, context) in contexts.iter().enumerate() {
+            let src = context.raw_range(&partials[source].range(0, bytes)?)?;
+            for owner in 0..self.layout.cards {
+                if owner == source {
+                    continue;
+                }
+                let dst = self.slot_address(owner, source, seq)?;
+                context.launch_on(&streams[source], |stream| {
+                    native::peer_ring::publish(stream, src, dst, count, seq, mode.f32_payload())
+                })?;
+            }
+        }
+        for (owner, context) in contexts.iter().enumerate() {
+            let out = context.raw_range(&outs[owner].range(0, bytes)?)?;
+            let own = context.raw_range(&partials[owner].range(0, bytes)?)?;
+            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            let mut slots = Vec::with_capacity(self.layout.cards - 1);
+            for source in 0..self.layout.cards {
+                if source != owner {
+                    slots.push(self.slot_address(owner, source, seq)?);
+                }
+            }
+            context.launch_on(&streams[owner], |stream| {
+                native::peer_ring::wait_sum(
+                    stream,
+                    out,
+                    own,
+                    &slots,
+                    count,
+                    seq,
+                    mode.f32_payload(),
+                    TIMEOUT_CYCLES,
+                    word,
+                )
+            })?;
+        }
+        self.next_seq.set(next);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_layout_tiles_slots_by_source_then_parity() {
+        let layout = MailboxLayout::new(3, 2048).expect("layout");
+        assert_eq!(layout.slot_bytes(), 128 + 2048 * 4);
+        assert_eq!(layout.total_bytes(), layout.slot_bytes() * 6);
+        assert_eq!(layout.slot_offset(0, 1).expect("slot"), layout.slot_bytes());
+        assert_eq!(layout.slot_offset(0, 2).expect("slot"), 0);
+        assert_eq!(
+            layout.slot_offset(2, 3).expect("slot"),
+            layout.slot_bytes() * 5
+        );
+        // Consecutive sequences alternate slots for every source.
+        for source in 0..3 {
+            assert_ne!(
+                layout.slot_offset(source, 7).expect("slot"),
+                layout.slot_offset(source, 8).expect("slot")
+            );
+            assert_eq!(
+                layout.slot_offset(source, 7).expect("slot"),
+                layout.slot_offset(source, 9).expect("slot")
+            );
+        }
+    }
+
+    #[test]
+    fn the_layout_refuses_bad_shapes() {
+        assert!(MailboxLayout::new(0, 8).is_err());
+        assert!(MailboxLayout::new(5, 8).is_err());
+        assert!(MailboxLayout::new(2, 0).is_err());
+        assert!(MailboxLayout::new(2, native::peer_ring::MAX_VALUES + 1).is_err());
+        let layout = MailboxLayout::new(2, 8).expect("layout");
+        assert!(layout.slot_offset(2, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use crate::family::project::cuda::served_admission;
+    use crate::kernels::cuda::testkit::device_present;
+
+    fn upload_f32(
+        context: &CudaContext,
+        stream: &DeviceStream,
+        values: &[f32],
+    ) -> Result<DeviceBuffer, EngError> {
+        let buffer = context.allocate(values.len() * 4)?;
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        buffer.write_at(stream, 0, &bytes)?;
+        Ok(buffer)
+    }
+
+    fn download_f32(
+        buffer: &DeviceBuffer,
+        stream: &DeviceStream,
+        count: usize,
+    ) -> Result<Vec<f32>, EngError> {
+        let mut bytes = vec![0u8; count * 4];
+        buffer.read_at(stream, 0, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+
+    fn status_of(buffer: &DeviceBuffer, stream: &DeviceStream) -> Result<u32, EngError> {
+        Ok(download_f32(buffer, stream, 1)?[0].to_bits())
+    }
+
+    /// Two contexts on the one physical device of this box: the mailbox
+    /// addresses are ordinary allocations, so the whole protocol runs and
+    /// only the PCIe hop is absent. A real peer pair needs a second card.
+    #[test]
+    fn two_contexts_exchange_a_sum_and_repeat_it() {
+        if !device_present("two_contexts_exchange_a_sum_and_repeat_it") {
+            return;
+        }
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(0, &admission).expect("context 1"),
+        ];
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, 2048).expect("ring");
+        let a: Vec<f32> = (0..2048).map(|i| (i as f32) * 0.25 - 100.0).collect();
+        let b: Vec<f32> = (0..2048).map(|i| 50.0 - (i as f32) * 0.125).collect();
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(2048 * 4).expect("out 0"),
+            contexts[1].allocate(2048 * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        assert_eq!(ring.cards(), 2);
+        for round in 0..3 {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[&partials[0], &partials[1]],
+                &[&outs[0], &outs[1]],
+                &[&statuses[0], &statuses[1]],
+                2048,
+                RingMode::F32,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                assert_eq!(
+                    status_of(&statuses[index], stream).expect("status"),
+                    0,
+                    "round {round} device {index}"
+                );
+                let got = download_f32(&outs[index], stream, 2048).expect("download");
+                for (i, (&g, (&x, &y))) in got.iter().zip(a.iter().zip(&b)).enumerate() {
+                    assert_eq!(g, x + y, "round {round} device {index} value {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reset_ring_exchanges_again_from_sequence_one() {
+        if !device_present("a_reset_ring_exchanges_again_from_sequence_one") {
+            return;
+        }
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(0, &admission).expect("context 1"),
+        ];
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, 4).expect("ring");
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &[1.0, 2.0, 3.0, 4.0]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &[10.0, 20.0, 30.0, 40.0]).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(16).expect("out 0"),
+            contexts[1].allocate(16).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        let exchange = |ring: &PeerRing| {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[&partials[0], &partials[1]],
+                &[&outs[0], &outs[1]],
+                &[&statuses[0], &statuses[1]],
+                4,
+                RingMode::F32,
+            )
+            .expect("exchange");
+            for stream in &streams {
+                stream.synchronize().expect("sync");
+            }
+            download_f32(&outs[0], &streams[0], 4).expect("download")
+        };
+        assert_eq!(exchange(&ring), [11.0, 22.0, 33.0, 44.0]);
+        ring.reset(&contexts, &streams).expect("reset");
+        assert_eq!(exchange(&ring), [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn the_fp16_exchange_sums_within_half_precision_and_flags_overflow() {
+        if !device_present("the_fp16_exchange_sums_within_half_precision_and_flags_overflow") {
+            return;
+        }
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(0, &admission).expect("context 1"),
+        ];
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, 16).expect("ring");
+        // Device 1 publishes 70000.0, outside fp16: device 0 must see the
+        // overflow status bit; device 1 sums only device 0's in-range row.
+        let a = [1.5f32; 16];
+        let mut b = [2.25f32; 16];
+        b[3] = 70_000.0;
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(16 * 4).expect("out 0"),
+            contexts[1].allocate(16 * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        ring.exchange_sum(
+            &contexts,
+            &streams,
+            &[&partials[0], &partials[1]],
+            &[&outs[0], &outs[1]],
+            &[&statuses[0], &statuses[1]],
+            16,
+            RingMode::F16,
+        )
+        .expect("exchange");
+        for stream in &streams {
+            stream.synchronize().expect("sync");
+        }
+        assert_eq!(
+            status_of(&statuses[0], &streams[0]).expect("status 0"),
+            native::peer_ring::STATUS_OVERFLOW
+        );
+        assert_eq!(status_of(&statuses[1], &streams[1]).expect("status 1"), 0);
+        let got = download_f32(&outs[1], &streams[1], 16).expect("download");
+        assert_eq!(got[0], 3.75);
+        assert_eq!(got[3], 70_000.0 + 1.5);
+    }
+
+    #[test]
+    fn a_wait_with_no_publisher_times_out_in_the_status_word() {
+        if !device_present("a_wait_with_no_publisher_times_out_in_the_status_word") {
+            return;
+        }
+        let admission = served_admission();
+        let context = CudaContext::with_admission_on(0, &admission).expect("context");
+        let stream = context.stream().expect("stream");
+        let own = upload_f32(&context, &stream, &[1.0, 2.0, 3.0, 4.0]).expect("own");
+        let out = upload_f32(&context, &stream, &[-1.0; 4]).expect("out");
+        let status = upload_f32(&context, &stream, &[0.0]).expect("status");
+        let mailbox = context.allocate(HEADER_BYTES + 16).expect("mailbox");
+        let zeros = vec![0u8; HEADER_BYTES + 16];
+        mailbox.write_at(&stream, 0, &zeros).expect("zero mailbox");
+        let slot = context.owned(&mailbox).expect("owned").address();
+        let out_range = context
+            .raw_range(&out.range(0, 16).expect("out range"))
+            .expect("raw out");
+        let own_range = context
+            .raw_range(&own.range(0, 16).expect("own range"))
+            .expect("raw own");
+        let word_range = context
+            .raw_range(&status.range(0, 4).expect("word range"))
+            .expect("raw word");
+        context
+            .launch_on(&stream, |stream_raw| {
+                native::peer_ring::wait_sum(
+                    stream_raw,
+                    out_range,
+                    own_range,
+                    &[slot],
+                    4,
+                    1,
+                    true,
+                    1_000_000,
+                    word_range,
+                )
+            })
+            .expect("launch wait");
+        stream.synchronize().expect("sync");
+        assert_eq!(
+            status_of(&status, &stream).expect("status"),
+            native::peer_ring::STATUS_TIMEOUT
+        );
+        assert_eq!(download_f32(&out, &stream, 4).expect("out"), [-1.0; 4]);
+    }
+}

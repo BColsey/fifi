@@ -14,6 +14,8 @@ use std::ptr::NonNull;
 
 pub(super) mod device_info;
 pub(super) mod nvfp4_launch;
+pub(super) mod peer_probe;
+pub(super) mod peer_ring;
 pub(super) mod prefill;
 pub(super) mod resident;
 

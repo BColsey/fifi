@@ -120,6 +120,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/prefill/scatter_cols.cu",
     "src/kernels/cuda/native/prefill/flint_qk.cu",
     "src/kernels/cuda/native/resident/kv_f16_rows.cu",
+    "src/kernels/cuda/native/peer_probe.cu",
+    "src/kernels/cuda/native/peer_ring.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -153,6 +155,8 @@ const MMQ_GLUE_SOURCES: &[&str] = &[
 const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/abi.h",
     "src/kernels/cuda/native/abi_device.h",
+    "src/kernels/cuda/native/abi_peer.h",
+    "src/kernels/cuda/native/abi_ring.h",
     "src/kernels/cuda/native/abi_resident.h",
     "src/kernels/cuda/native/bf16_gemv.h",
     "src/kernels/cuda/native/device.h",

@@ -25,7 +25,7 @@
 
 use super::graph::ensure_closed;
 use super::stream::{DeviceStream, same_adapter};
-use super::{CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange, device_error, enter_dispatch};
+use super::{CHUNK_LIMIT, CudaContext, DeviceBuffer, DeviceRange, device_error, enter_on};
 use crate::EngError;
 use crate::kernels::cuda::native::DeviceFailure;
 use crate::kernels::cuda::native::resident::{self, RawRange, RawStream};
@@ -318,7 +318,7 @@ fn run_ordered(
     copy: impl FnOnce(&RawStream) -> Result<Vec<u8>, DeviceFailure>,
 ) -> Result<Vec<u8>, EngError> {
     let raw = stream.raw()?;
-    let _dispatch = enter_dispatch()?;
+    let _dispatch = enter_on(stream.lease().device())?;
     let completed = copy(raw).map_err(device_error)?;
     stream.note_enqueue();
     Ok(completed)

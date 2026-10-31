@@ -133,7 +133,7 @@ impl CudaContext {
                 "cuda pinned staging admission is outside the stage limit".to_owned(),
             ));
         }
-        let _dispatch = super::enter_dispatch()?;
+        let _dispatch = super::enter_on(0)?;
         let caps = admission.caps()?;
         crate::kernels::cuda::require_device(crate::kernels::cuda::device_count()?)?;
         let lease = super::Lease::acquire(&super::SLOTS, &TERMINAL)?;

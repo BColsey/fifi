@@ -59,6 +59,8 @@ pub(crate) use fault::{
 };
 mod guard;
 mod native;
+pub(crate) mod peer;
+pub(crate) mod peer_ring;
 pub(crate) mod plan;
 pub(crate) mod prefill;
 pub(crate) mod resident;
@@ -163,6 +165,7 @@ pub(crate) fn device_is_integrated() -> Result<bool, EngError> {
     ensure_usable(&TERMINAL)?;
     let _dispatch = guard::DispatchGuard::enter(&TERMINAL);
     ensure_usable(&TERMINAL)?;
+    context::select_device(0)?;
     native::device_info::device_integrated()
         .map_err(|status| native_error(&TERMINAL, count_operation(status), status))
 }
@@ -197,6 +200,7 @@ pub fn vector_add_f32(lhs: &[f32], rhs: &[f32]) -> Result<Vec<f32>, EngError> {
     out.resize(lhs.len(), 0.0);
     let _dispatch = guard::DispatchGuard::enter(&TERMINAL);
     ensure_usable(&TERMINAL)?;
+    context::select_device(0)?;
     native::vector_add_f32(lhs, rhs, &mut out)
         .map_err(|failure| smoke_error(&TERMINAL, failure))?;
     Ok(out)

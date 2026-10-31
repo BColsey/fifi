@@ -77,17 +77,32 @@ impl Drop for DispatchGuard<'_> {
 pub(super) struct Lease {
     slots: &'static AtomicUsize,
     failed: &'static AtomicBool,
+    /// The CUDA device ordinal every owner of this lease lives on. Fixed at
+    /// acquisition: an owner never migrates, and every native entry for an
+    /// owner of this lease selects this device first (`context::enter_on`).
+    device: std::ffi::c_int,
     /// Streams the adapter has created. One stream means all device work is ordered by it.
     streams: Cell<usize>,
 }
 
 impl Lease {
-    /// Admits one more adapter against `slots`, or reports why it cannot.
-    ///
-    /// A terminal backend admits nothing, even when a slot is free.
+    /// Admits one more adapter on device 0 against `slots`.
     pub(super) fn acquire(
         slots: &'static AtomicUsize,
         failed: &'static AtomicBool,
+    ) -> Result<Rc<Self>, EngError> {
+        Self::acquire_on(slots, failed, 0)
+    }
+
+    /// Admits one more adapter on `device` against `slots`, or reports why it
+    /// cannot.
+    ///
+    /// A terminal backend admits nothing, even when a slot is free. The caller
+    /// has already proved `device` is a visible ordinal; this records it.
+    pub(super) fn acquire_on(
+        slots: &'static AtomicUsize,
+        failed: &'static AtomicBool,
+        device: std::ffi::c_int,
     ) -> Result<Rc<Self>, EngError> {
         let _dispatch = DispatchGuard::enter(failed);
         super::ensure_usable(failed)?;
@@ -102,8 +117,14 @@ impl Lease {
         Ok(Rc::new(Self {
             slots,
             failed,
+            device,
             streams: Cell::new(0),
         }))
+    }
+
+    /// The device ordinal this lease and all its owners live on.
+    pub(super) fn device(&self) -> std::ffi::c_int {
+        self.device
     }
 
     pub(super) fn note_stream(&self) {

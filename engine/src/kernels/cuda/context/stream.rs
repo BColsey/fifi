@@ -38,7 +38,9 @@ use std::{
 #[cfg(test)]
 use super::DESTROY_CALLS;
 use super::graph::{self, ensure_closed, run_or_defer};
-use super::{CudaContext, LIVE_EVENTS, LIVE_STREAMS, STREAM_IDS, device_error, enter_dispatch};
+use super::{
+    CudaContext, LIVE_EVENTS, LIVE_STREAMS, STREAM_IDS, device_error, enter_on, select_device,
+};
 use crate::EngError;
 use crate::kernels::cuda::guard::{DispatchGuard, Lease};
 use crate::kernels::cuda::native::DeviceFailure;
@@ -112,7 +114,7 @@ impl DeviceStream {
         ensure_usable(&TERMINAL)?;
         same_adapter(&self.lease, &event.lease, "event")?;
         let (stream_raw, event_raw) = (self.raw()?, event.raw()?);
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::event_record(event_raw, stream_raw).map_err(device_error)?;
         event.mark.set(Some((self.id, self.enqueued.get())));
         event.captured.set(graph::window_open());
@@ -141,7 +143,7 @@ impl DeviceStream {
             event.ensure_host_waitable()?;
         }
         let (stream_raw, event_raw) = (self.raw()?, event.raw()?);
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::stream_wait_event(stream_raw, event_raw).map_err(device_error)?;
         self.note_enqueue();
         Ok(())
@@ -153,7 +155,7 @@ impl DeviceStream {
         ensure_usable(&TERMINAL)?;
         ensure_closed("a stream synchronize")?;
         let raw = self.raw()?;
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::stream_synchronize(raw).map_err(device_error)
     }
 
@@ -161,7 +163,7 @@ impl DeviceStream {
     pub(crate) fn is_capturing(&self) -> Result<bool, EngError> {
         ensure_usable(&TERMINAL)?;
         let raw = self.raw()?;
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::graph::stream_is_capturing(raw).map_err(device_error)
     }
 
@@ -210,7 +212,7 @@ impl DeviceEvent {
         ensure_closed("an event synchronize")?;
         self.ensure_host_waitable()?;
         let raw = self.raw()?;
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::event_synchronize(raw).map_err(device_error)
     }
 
@@ -280,7 +282,7 @@ impl DeviceStream {
         ensure_usable(&TERMINAL)?;
         same_adapter(&self.lease, &event.lease, "event")?;
         let (stream_raw, event_raw) = (self.raw()?, event.raw()?);
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         let status = if self.is_capturing()? {
             resident::event_record_external(event_raw, stream_raw)
         } else {
@@ -302,7 +304,7 @@ impl TimingEvent {
         ensure_usable(&TERMINAL)?;
         same_adapter(&self.lease, &later.lease, "event")?;
         let (start, end) = (self.raw()?, later.raw()?);
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         resident::event_elapsed_ms(start, end).map_err(device_error)
     }
 
@@ -316,7 +318,8 @@ impl TimingEvent {
 impl Drop for TimingEvent {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            run_or_defer(move || release(raw, resident::event_destroy, &LIVE_EVENTS, 1));
+            let device = self.lease.device();
+            run_or_defer(move || release(raw, resident::event_destroy, &LIVE_EVENTS, 1, device));
         }
     }
 }
@@ -346,8 +349,12 @@ pub(super) fn release<R>(
     destroy: fn(R) -> Result<(), DeviceFailure>,
     live: &AtomicUsize,
     count: usize,
+    device: std::ffi::c_int,
 ) {
     let _dispatch = DispatchGuard::enter(&TERMINAL);
+    if select_device(device).is_err() {
+        return;
+    }
     if TERMINAL.load(Ordering::Acquire) {
         return;
     }
@@ -364,7 +371,8 @@ pub(super) fn release<R>(
 impl Drop for DeviceStream {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            run_or_defer(move || release(raw, resident::stream_destroy, &LIVE_STREAMS, 1));
+            let device = self.lease.device();
+            run_or_defer(move || release(raw, resident::stream_destroy, &LIVE_STREAMS, 1, device));
         }
     }
 }
@@ -372,7 +380,8 @@ impl Drop for DeviceStream {
 impl Drop for DeviceEvent {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            run_or_defer(move || release(raw, resident::event_destroy, &LIVE_EVENTS, 1));
+            let device = self.lease.device();
+            run_or_defer(move || release(raw, resident::event_destroy, &LIVE_EVENTS, 1, device));
         }
     }
 }

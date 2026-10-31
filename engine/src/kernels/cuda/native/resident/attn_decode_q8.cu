@@ -838,7 +838,10 @@ bool arm_receipt() {
         cudaFuncAttributes attr{};
         const cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
         int sms = -1;
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        int device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess) {
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        }
         std::fprintf(stderr,
                      "attn_q8 register_v prefetch receipt: %s regs=%d smem=%d spill=%d "
                      "maxThreads=%d SMs=%d\n",

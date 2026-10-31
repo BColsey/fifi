@@ -52,6 +52,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `prefix_store_entries` | MLX | 6 | Saved prefixes kept with `prefix_reuse` on, 1 to 4,096. |
 | `weight_format` | CUDA | `gguf` | The format of the checkpoint in `model_dir`: `gguf` (the pinned Q4_K_M file) or `exl3` (an EXL3 pack directory with `config.json` and the safetensors shards). Any other value, including a different case, is refused. See [below](#exl3-pack-cuda). The MLX arm refuses `exl3`. |
 | `capture` | CUDA | `true` for `exl3`, `false` for `gguf` | Run each decode step as a CUDA graph. |
+| `cuda_devices` | CUDA | `[0]` | The CUDA devices this engine spans, as device numbers in strictly ascending order, at most four. The MLX arm refuses the key. Today a list other than `[0]` is probed at startup (the devices must exist, share one compute capability, and directly access each other's memory) and then refused: this build serves on device 0 only. |
 | `kv_offload_host_bytes` | CUDA | off | Keep the KV cache in host memory, up to this many bytes. See [below](#host-memory-kv-cache-cuda). |
 | `tiered` | CUDA | off | Keep only some experts on the GPU. See [below](#tiered-experts-cuda). |
 | `draft_mode` | CUDA, `exl3` | `disabled` | Where speculative drafts come from: `disabled`, `ngram` (the tokens that followed the latest earlier occurrence of the context's tail) or `mtp` (the model's own MTP head, which needs `mtp_model_dir`; not usable yet). Any other value is refused. |

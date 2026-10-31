@@ -191,7 +191,7 @@ impl AllocCache {
             super::super::ensure_usable(&self.terminal)?;
         }
         graph::ensure_closed("allocation-cache access")?;
-        let dispatch = super::enter_dispatch();
+        let dispatch = super::enter_on(self.lease.device());
         if dispatch.is_err() {
             self.mark_terminal();
         }
@@ -338,6 +338,10 @@ impl AllocCache {
 
     pub(super) fn return_block(&self, raw: RawDevice) {
         let _dispatch = DispatchGuard::enter(&TERMINAL);
+        if super::select_device(self.lease.device()).is_err() {
+            self.quarantine(raw);
+            return;
+        }
         if self.is_terminal() {
             self.quarantine(raw);
             return;
@@ -364,6 +368,10 @@ impl AllocCache {
 
     pub(super) fn free(&self, raw: RawDevice) -> Result<(), EngError> {
         let _dispatch = DispatchGuard::enter(&TERMINAL);
+        if super::select_device(self.lease.device()).is_err() {
+            self.quarantine(raw);
+            return super::super::ensure_usable(&self.terminal);
+        }
         if self.is_terminal() {
             self.quarantine(raw);
             return super::super::ensure_usable(&self.terminal);
@@ -480,9 +488,13 @@ impl Drop for AllocCache {
             let lease = Rc::clone(&self.lease);
             #[cfg(all(test, feature = "cuda-fault-qualification"))]
             let observer = Rc::clone(&self.test_native_calls);
+            let device = lease.device();
             graph::run_or_defer(move || {
                 let _lease = lease;
                 let _dispatch = DispatchGuard::enter(&TERMINAL);
+                if super::select_device(device).is_err() {
+                    return;
+                }
                 for raw in blocks {
                     if TERMINAL.load(Ordering::Acquire) {
                         break;

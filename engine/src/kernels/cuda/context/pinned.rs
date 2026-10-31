@@ -154,7 +154,10 @@ impl PinnedWord {
 impl Drop for PinnedWord {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            run_or_defer(move || release(raw, resident::pinned_free, &LIVE_PINNED, WORD_BYTES));
+            let device = self.lease.device();
+            run_or_defer(move || {
+                release(raw, resident::pinned_free, &LIVE_PINNED, WORD_BYTES, device)
+            });
         }
     }
 }

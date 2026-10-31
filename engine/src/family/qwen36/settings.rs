@@ -170,6 +170,11 @@ pub(crate) struct Q36Options {
     /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
     /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
     pub(crate) weight_format: Option<String>,
+    /// The CUDA devices this engine spans, as explicit ordinals in strictly ascending order.
+    /// Absent means `[0]`: the first device only, as before. A CUDA member; the MLX arm
+    /// refuses it. More than one device is refused with `weight_format` `exl3`, `tiered`,
+    /// `kv_offload_host_bytes`, and `capture`, each by name.
+    pub(crate) cuda_devices: Option<Vec<u32>>,
     /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. A CUDA
     /// member for `weight_format` `exl3` only.
     pub(crate) draft_mode: Option<String>,
@@ -264,6 +269,59 @@ fn check_weight_format(
         }
     }
     Ok(())
+}
+
+/// The most devices one `cuda_devices` list may name. The CUDA backend
+/// enforces the same bound against the visible devices at engine start.
+pub(crate) const MAX_CUDA_DEVICES: usize = 4;
+
+/// The checked `cuda_devices` list: `[0]` when the member is absent. The list
+/// is a shape contract only — that the ordinals are visible devices is the
+/// CUDA start's probe, which names both numbers. More than one device
+/// refuses the combinations the multi-device step does not run, each by name:
+/// the EXL3 pack (its shard slicing is unproven), tiered experts and
+/// host-paged KV (both read whole GGUF blocks on one device), and graph
+/// capture (the capture window owns one stream).
+fn cuda_devices_of(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<Vec<usize>, EngError> {
+    let Some(list) = &options.cuda_devices else {
+        return Ok(vec![0]);
+    };
+    if backend != Backend::Cuda {
+        return Err(bad("cuda_devices is CUDA-only".into()));
+    }
+    if list.is_empty() || list.len() > MAX_CUDA_DEVICES {
+        return Err(bad(format!(
+            "cuda_devices must name between 1 and {MAX_CUDA_DEVICES} devices, found {}",
+            list.len()
+        )));
+    }
+    if list.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(bad(format!(
+            "cuda_devices must be strictly ascending without duplicates, found {list:?}"
+        )));
+    }
+    if list.len() > 1 {
+        for (set, key) in [
+            (weights == WeightFormat::Exl3, "weight_format exl3"),
+            (options.tiered.is_some(), "tiered"),
+            (
+                options.kv_offload_host_bytes.is_some(),
+                "kv_offload_host_bytes",
+            ),
+            (options.capture == Some(true), "capture"),
+        ] {
+            if set {
+                return Err(bad(format!(
+                    "cuda_devices with more than one device does not support {key}"
+                )));
+            }
+        }
+    }
+    Ok(list.iter().map(|&device| device as usize).collect())
 }
 
 /// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
@@ -590,6 +648,9 @@ pub(crate) struct Q36Settings {
     pub(crate) weights: WeightFormat,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
     pub(crate) speculation: SpecConfig,
+    /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
+    /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
+    pub(crate) cuda_devices: Vec<usize>,
     /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
     /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
     /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
@@ -839,6 +900,7 @@ impl Q36Settings {
         let options = options.unwrap_or(&default);
         let weights = weight_format_of(options.weight_format.as_deref())?;
         check_weight_format(weights, options, backend)?;
+        let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
         let (prefill_budget, prefill_reserve, activation, kv, cache_limit, ignored_mlx_keys) =
@@ -997,6 +1059,7 @@ impl Q36Settings {
             tiered,
             weights,
             speculation,
+            cuda_devices,
             ignored_mlx_keys,
         })
     }
@@ -1096,6 +1159,50 @@ mod tests {
     fn cuda_offload(body: &str) -> Result<Q36Settings, EngError> {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         settings_for(Some(&options), &Q36Env::default(), Backend::Cuda)
+    }
+
+    #[test]
+    fn cuda_devices_default_to_the_first_device_and_parse_a_list() {
+        let resident = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(resident.cuda_devices, vec![0]);
+        let pair = cuda_offload(r#"{"cuda_devices":[0,1]}"#).unwrap();
+        assert_eq!(pair.cuda_devices, vec![0, 1]);
+        let second = cuda_offload(r#"{"cuda_devices":[1]}"#).unwrap();
+        assert_eq!(second.cuda_devices, vec![1]);
+    }
+
+    #[test]
+    fn cuda_devices_refuse_bad_shapes_and_combinations_by_name() {
+        for (body, needle) in [
+            (r#"{"cuda_devices":[]}"#, "cuda_devices"),
+            (r#"{"cuda_devices":[0,0]}"#, "strictly ascending"),
+            (r#"{"cuda_devices":[2,1]}"#, "strictly ascending"),
+            (r#"{"cuda_devices":[0,1,2,3,4]}"#, "cuda_devices"),
+            (
+                r#"{"cuda_devices":[0,1],"weight_format":"exl3"}"#,
+                "weight_format exl3",
+            ),
+            (r#"{"cuda_devices":[0,1],"capture":true}"#, "capture"),
+            (r#"{"cuda_devices":[0,1],"tiered":{"slots":8}}"#, "tiered"),
+            (
+                r#"{"cuda_devices":[0,1],"kv_dtype":"q8","kv_offload_host_bytes":1}"#,
+                "kv_offload_host_bytes",
+            ),
+        ] {
+            assert!(message(cuda_offload(body)).contains(needle), "{body}");
+        }
+        // One named device keeps every combination the single-device engine runs.
+        assert!(cuda_offload(r#"{"cuda_devices":[0],"capture":true}"#).is_ok());
+        // The member is CUDA-only even as a single-device list.
+        let options: Q36Options = serde_json::from_str(r#"{"cuda_devices":[0]}"#).unwrap();
+        assert!(
+            message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Mlx
+            ))
+            .contains("cuda_devices is CUDA-only")
+        );
     }
 
     #[test]
@@ -1780,6 +1887,7 @@ mod tests {
                 tiered: None,
                 weights: super::WeightFormat::Gguf,
                 speculation: SpecConfig::default(),
+                cuda_devices: vec![0],
                 ignored_mlx_keys: Vec::new(),
             }
         );

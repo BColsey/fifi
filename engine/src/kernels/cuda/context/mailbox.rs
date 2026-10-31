@@ -288,7 +288,8 @@ impl Drop for Mailbox {
         }) = Arc::try_unwrap(shared)
         {
             let bytes = layout.total_bytes();
-            run_or_defer(move || release(mapped, raw::mapped_free, &LIVE_PINNED, bytes));
+            let device = self.lease.device();
+            run_or_defer(move || release(mapped, raw::mapped_free, &LIVE_PINNED, bytes, device));
         }
     }
 }

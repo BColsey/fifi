@@ -34,7 +34,7 @@
 //! being replaced while a graph uses it.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_int,
     marker::PhantomData,
     rc::Rc,
@@ -42,7 +42,7 @@ use std::{
 };
 
 use super::{
-    ADAPTER_OPERATION, ALLOCATE_OPERATION, TERMINAL,
+    ADAPTER_OPERATION, ALLOCATE_OPERATION, INITIALIZE_OPERATION, TERMINAL,
     guard::{DispatchGuard, Lease},
     memory_info_operation,
     native::{self, Activations, DeviceFailure, RawDevice, TILE_ROWS, TileVec, Tiled, TiledType},
@@ -132,7 +132,8 @@ pub(crate) struct QuantTensor<'a> {
 /// byte offset. The upload asks for whole 8-row groups, in order.
 pub(crate) type BlockReader<'a> = &'a mut dyn FnMut(usize, &mut [u8]) -> Result<(), EngError>;
 
-/// One CUDA adapter lease on the first device.
+/// One CUDA adapter lease on one device (device 0 unless built with
+/// [`CudaContext::with_admission_on`]).
 pub(crate) struct CudaContext {
     lease: Rc<Lease>,
     workspace: RefCell<Workspace>,
@@ -229,6 +230,36 @@ impl CudaContext {
         Self::build(admission.caps()?, admission.growth)
     }
 
+    /// Like [`Self::with_admission`], on the CUDA device `device` instead of
+    /// device 0. An ordinal at or above the visible device count is a
+    /// `Backend` failure before any lease is taken. Every owner this context
+    /// creates lives on `device` for its whole life.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device loader, which builds one context per device"
+        )
+    )]
+    pub(crate) fn with_admission_on(
+        device: usize,
+        admission: &Admission,
+    ) -> Result<Self, EngError> {
+        Self::build_on(device, admission.caps()?, admission.growth)
+    }
+
+    /// The CUDA device ordinal this context and all its owners live on.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device loader, which builds one context per device"
+        )
+    )]
+    pub(crate) fn device(&self) -> usize {
+        usize::try_from(self.lease.device()).unwrap_or(0)
+    }
+
     /// Opts this lease into bounded backing reuse; other constructors stay uncached.
     pub(crate) fn with_admission_cache(
         admission: &Admission,
@@ -304,8 +335,24 @@ impl CudaContext {
     }
 
     fn build(caps: Activations, growth: Growth) -> Result<Self, EngError> {
-        require_device(super::device_count()?)?;
-        let lease = Lease::acquire(&SLOTS, &TERMINAL)?;
+        Self::build_on(0, caps, growth)
+    }
+
+    fn build_on(device: usize, caps: Activations, growth: Growth) -> Result<Self, EngError> {
+        let count = super::device_count()?;
+        require_device(count)?;
+        if device >= count {
+            return Err(EngError::Backend {
+                operation: INITIALIZE_OPERATION,
+                message: format!("CUDA device {device} is not visible ({count} devices)"),
+            });
+        }
+        let ordinal = c_int::try_from(device).map_err(|_| EngError::Backend {
+            operation: INITIALIZE_OPERATION,
+            message: format!("CUDA device {device} does not fit a device ordinal"),
+        })?;
+        let lease = Lease::acquire_on(&SLOTS, &TERMINAL, ordinal)?;
+        let _dispatch = enter_on(ordinal)?;
         let workspace = Workspace::allocate(&lease, caps)?;
         Ok(Self::from_workspace(lease, workspace, growth))
     }
@@ -1051,7 +1098,7 @@ impl CudaContext {
     }
 
     fn enter(&self) -> Result<DispatchGuard<'static>, EngError> {
-        enter_dispatch()
+        enter_on(self.lease.device())
     }
 
     /// Returns the allocation of a buffer that this context created.
@@ -1071,6 +1118,63 @@ impl CudaContext {
 fn enter_dispatch() -> Result<DispatchGuard<'static>, EngError> {
     let dispatch = DispatchGuard::enter(&TERMINAL);
     super::ensure_usable(&TERMINAL)?;
+    Ok(dispatch)
+}
+
+thread_local! {
+    /// The device this thread last selected through [`select_device`], or -1
+    /// before the first selection. The cache is sound only because every
+    /// device selection in the backend goes through that one function.
+    static SELECTED_DEVICE: Cell<c_int> = const { Cell::new(-1) };
+}
+
+/// Makes `device` the calling thread's current CUDA device. The caller must
+/// hold the dispatch guard. A repeat selection of the same device makes no
+/// native call. A failed selection is terminal (`native_error` latches it),
+/// because which device later calls would hit is then unknown.
+///
+/// On a host with no visible device the selection is a no-op that succeeds:
+/// there is no device a later call could be misdirected to, and host-only
+/// paths (the allocation cache's metadata entry is one) must keep working
+/// exactly as they did before device selection existed. The visible count is
+/// read once per process for this; it cannot change while the process runs.
+pub(in crate::kernels::cuda) fn select_device(device: c_int) -> Result<(), EngError> {
+    if SELECTED_DEVICE.with(Cell::get) == device {
+        return Ok(());
+    }
+    static VISIBLE_DEVICES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // The count is read through the raw native entry, never `super::device_count`:
+    // that wrapper latches the backend on a no-driver host, and selection runs on
+    // host-only entries that predate any device probe. A failed raw query means
+    // no usable device here, which is the no-op case below.
+    let visible = match VISIBLE_DEVICES.get() {
+        Some(&count) => count,
+        None => {
+            let count = native::device_count()
+                .ok()
+                .and_then(|raw| usize::try_from(raw).ok())
+                .unwrap_or(0);
+            let _ = VISIBLE_DEVICES.set(count);
+            count
+        }
+    };
+    if visible == 0 {
+        SELECTED_DEVICE.with(|selected| selected.set(device));
+        return Ok(());
+    }
+    native::peer_probe::set_device(device)
+        .map_err(|status| native_error(&TERMINAL, INITIALIZE_OPERATION, status))?;
+    SELECTED_DEVICE.with(|selected| selected.set(device));
+    Ok(())
+}
+
+/// Enters the dispatch guard and selects `device`, so the native calls that
+/// follow run on the device of the owner they serve. Entries for owners of a
+/// lease all pass that lease's device; host-only planning keeps
+/// [`enter_dispatch`] and must not make a device call.
+pub(super) fn enter_on(device: c_int) -> Result<DispatchGuard<'static>, EngError> {
+    let dispatch = enter_dispatch()?;
+    select_device(device)?;
     Ok(dispatch)
 }
 
@@ -1095,7 +1199,7 @@ impl DeviceBuffer {
     /// Allocates `bytes` of uninitialized device memory on the adapter of `lease`.
     fn allocate(lease: &Rc<Lease>, bytes: usize) -> Result<Self, EngError> {
         graph::ensure_closed("an allocation")?;
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(lease.device())?;
         let raw = native::alloc(bytes).map_err(device_error)?;
         Ok(Self::from_raw(lease, raw))
     }
@@ -1147,8 +1251,9 @@ impl Drop for DeviceBuffer {
             // Default-OFF backing also owns its lease until the deferred free completes.
             let lease = Rc::clone(&self.lease);
             graph::run_or_defer(move || {
+                let device = lease.device();
                 let _lease = lease;
-                release_buffer(raw);
+                release_buffer(raw, device);
             });
         }
     }
@@ -1156,8 +1261,11 @@ impl Drop for DeviceBuffer {
 
 /// Frees one allocation, for `Drop` and for the frees a capture window kept. A failed free is
 /// terminal: it latches the backend, and after that no free runs.
-fn release_buffer(raw: RawDevice) {
+fn release_buffer(raw: RawDevice, device: c_int) {
     let _dispatch = DispatchGuard::enter(&TERMINAL);
+    if select_device(device).is_err() {
+        return;
+    }
     // The context may be poisoned after a terminal failure. `RawDevice` has
     // no `Drop`, so skipping `free` leaves the memory to the process exit.
     if TERMINAL.load(Ordering::Acquire) {
@@ -1663,6 +1771,36 @@ mod f32_projection_tests {
             .flat_map(|value| value.to_ne_bytes())
             .collect();
         ctx.upload(&bytes).expect("upload F32 weight")
+    }
+
+    #[test]
+    fn a_context_on_device_zero_round_trips_and_an_invisible_device_refuses() {
+        // The shared cached gate, not this module's local one: after a no-driver
+        // latch the local helper's fresh count query panics instead of skipping.
+        if !super::super::device_present(
+            "a_context_on_device_zero_round_trips_and_an_invisible_device_refuses",
+        ) {
+            return;
+        }
+        let admission = crate::family::project::cuda::served_admission();
+        let ctx = CudaContext::with_admission_on(0, &admission).expect("context on device 0");
+        assert_eq!(ctx.device(), 0);
+        let weight = upload_floats(&ctx, &[1.0, -2.0, 3.0, -4.0, 5.0, 6.0]);
+        assert_eq!(
+            ctx.linear_f32(&weight, [2, 3], &[2.0, -1.0, 0.5]).unwrap(),
+            [5.5, -10.0]
+        );
+        let refused = CudaContext::with_admission_on(99, &admission)
+            .map(|_| ())
+            .expect_err("device 99 is not visible");
+        match refused {
+            EngError::Backend { message, .. } => {
+                assert!(message.contains("device 99 is not visible"), "{message}");
+            }
+            other => panic!("want Backend, got {other:?}"),
+        }
+        ctx.ensure_usable()
+            .expect("a refused ordinal leaves the backend usable");
     }
 
     #[test]

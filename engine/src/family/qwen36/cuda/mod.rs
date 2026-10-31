@@ -138,6 +138,7 @@ mod section_timing_device_tests;
 mod section_timing_tests;
 #[cfg(test)]
 mod shape_tests;
+mod shard;
 #[cfg(test)]
 mod spec_window_device_tests;
 pub(crate) mod start;

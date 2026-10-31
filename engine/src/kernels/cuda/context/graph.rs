@@ -40,7 +40,7 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use super::stream::{DeviceStream, release, same_adapter};
-use super::{ArenaHold, CudaContext, DeviceBuffer, LIVE_GRAPHS, device_error, enter_dispatch};
+use super::{ArenaHold, CudaContext, DeviceBuffer, LIVE_GRAPHS, device_error, enter_on};
 use crate::EngError;
 use crate::kernels::cuda::guard::Lease;
 use crate::kernels::cuda::native::resident::RawStream;
@@ -226,7 +226,7 @@ impl CudaContext {
             self.owned(pin)?;
         }
         let stream_raw = stream.raw()?;
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = self.enter()?;
         let open = begin_window(stream_raw, &self.lease)?;
         let outcome = body();
         finish_window(open, plan, outcome)
@@ -308,7 +308,7 @@ impl GraphExec<'_> {
         ensure_closed("a graph launch")?;
         same_adapter(&self.lease, stream.lease(), "stream")?;
         let (exec, stream_raw) = (self.raw()?, stream.raw()?);
-        let _dispatch = enter_dispatch()?;
+        let _dispatch = enter_on(self.lease.device())?;
         raw::graph_launch(exec, stream_raw).map_err(device_error)?;
         stream.note_enqueue();
         Ok(())
@@ -329,7 +329,8 @@ impl GraphExec<'_> {
 impl Drop for GraphExec<'_> {
     fn drop(&mut self) {
         if let Some(exec) = self.raw.take() {
-            run_or_defer(move || release(exec, raw::exec_destroy, &LIVE_GRAPHS, 1));
+            let device = self.lease.device();
+            run_or_defer(move || release(exec, raw::exec_destroy, &LIVE_GRAPHS, 1, device));
         }
     }
 }
