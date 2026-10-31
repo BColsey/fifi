@@ -180,6 +180,17 @@ fn options_of(kv: KvMode, layout: WeightLayout) -> StepOptions {
 /// hypothesis), then one forced step per scored target. Returns one row
 /// per scored position in target order, plus the padding probability mass
 /// when `mass` is set (window 0 only).
+/// UTC wall-clock stamp + seconds since `t0`, for lease-progress lines.
+fn stamp(t0: &std::time::Instant) -> String {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m, s) = (epoch / 3600 % 24, epoch / 60 % 60, epoch % 60);
+    format!("{h:02}:{m:02}:{s:02}Z +{:.0}s", t0.elapsed().as_secs_f64())
+}
+
+#[allow(clippy::too_many_arguments)] // test-harness leg: window slice + outputs
 fn run_window(
     step: &mut QwenResidentStep<'_>,
     arm: &Arm,
@@ -194,6 +205,12 @@ fn run_window(
         score_lo - lo >= MIN_PREFILL_IDS,
         "window {w}: the layout's prefill run {}/{MIN_PREFILL_IDS} is not v5",
         score_lo - lo
+    );
+    let t0 = std::time::Instant::now();
+    println!(
+        "m3 window {w} start: prefill {} ids ({})",
+        score_lo - lo,
+        if arm.chunked { "chunked" } else { "serial" }
     );
     let head = &ids[lo..score_lo - 1];
     if arm.chunked {
@@ -220,18 +237,32 @@ fn run_window(
                 "chunked arm {w}: arena verdict {verdict:?} is not Ready"
             )));
         }
-        for piece in head.chunks(CHUNK_ROWS as usize) {
+        for (ci, piece) in head.chunks(CHUNK_ROWS as usize).enumerate() {
             step.feed_rows_chunked(piece, CHUNK_ROWS as usize)?;
+            println!(
+                "m3 window {w} chunk {ci} fed {} rows [{}]",
+                piece.len(),
+                stamp(&t0)
+            );
         }
     } else {
         for &token in head {
             // The gate's prefill: one token, logits computed, row unread.
             step.run_token(token, false)?;
         }
+        println!("m3 window {w} prefill done [{}]", stamp(&t0));
     }
     let mut rows = Vec::with_capacity(hi - score_lo);
     let mut mass_sum = 0f64;
     for p in score_lo..hi {
+        if (p - score_lo) % 500 == 0 {
+            println!(
+                "m3 window {w} scored {}/{} [{}]",
+                p - score_lo,
+                hi - score_lo,
+                stamp(&t0)
+            );
+        }
         step.run_token(ids[p - 1], true)?;
         let values = step
             .row_bytes()
@@ -240,8 +271,8 @@ fn run_window(
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect::<Vec<f32>>();
-        let row = m3_rows::position_row(&values, ids[p], 0).map_err(|e| err(e))?;
-        let top1 = m3_rows::argmax_low_id(&values).map_err(|e| err(e))?;
+        let row = m3_rows::position_row(&values, ids[p], 0).map_err(err)?;
+        let top1 = m3_rows::argmax_low_id(&values).map_err(err)?;
         if mass {
             let (mut all, mut tail) = (0f64, 0f64);
             for (i, v) in values.iter().enumerate() {
@@ -265,6 +296,11 @@ fn run_window(
         }
         rows.push((row.logprob_true, row.top1_correct, top1));
     }
+    println!(
+        "m3 window {w} done: {} rows, wall {:.0}s",
+        hi - score_lo,
+        t0.elapsed().as_secs_f64()
+    );
     let mass = if mass {
         Some(mass_sum / (hi - score_lo) as f64)
     } else {
@@ -278,7 +314,7 @@ fn run_window(
 #[test]
 #[ignore = "the 3090 under fifi-gpu-run: M3_ARM, M3_ARM_DIR, M3_KV, M3_PREFILL, M3_BUILD_SHA, M3_LAYOUT_DIR, M3_WINDOWS, M3_OUT"]
 fn m3_leg() {
-    let layout_dir = PathBuf::from(crate::test_paths::required("M3_LAYOUT_DIR"));
+    let layout_dir = crate::test_paths::required("M3_LAYOUT_DIR");
     let out_dir = PathBuf::from(env("M3_OUT").expect("M3_OUT"));
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let layout = m3_store::load_layout(&layout_dir).expect("layout");
@@ -318,12 +354,13 @@ fn m3_leg() {
     .expect("resources");
     for (w, window) in layout.windows.iter().enumerate().take(hi_w).skip(lo_w) {
         let path = out_dir.join(format!("w{w:03}.m3row"));
-        if let Ok((existing, (arm_id, build))) = m3_store::read_sidecar(&path, w, *window) {
-            if existing.len() == window.2 - window.1 && arm_id == arm.id() && build == arm.build_sha
-            {
-                println!("m3 window {w}: verified sidecar already present, skipping");
-                continue;
-            }
+        if let Ok((existing, (arm_id, build))) = m3_store::read_sidecar(&path, w, *window)
+            && existing.len() == window.2 - window.1
+            && arm_id == arm.id()
+            && build == arm.build_sha
+        {
+            println!("m3 window {w}: verified sidecar already present, skipping");
+            continue;
         }
         // A fresh step per window: admit_guard refuses a second start and
         // reset_state does not clear admission, so isolation is a rebuild.
