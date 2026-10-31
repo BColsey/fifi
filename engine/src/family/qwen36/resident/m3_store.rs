@@ -1,12 +1,15 @@
-//! Shared pure-host storage of the M3 harness (registration v4): the
-//! frozen layout with sha verification, the per-window sidecar chunk, and
-//! the compare step that feeds `m3_quality::Comparison::evaluate`.
+//! Shared pure-host storage of the M3 harness (registration v5): the
+//! frozen layout with sha verification against the REGISTERED constants,
+//! the per-window sidecar chunk, and the compare step that feeds
+//! `m3_quality::Comparison::evaluate`.
 //!
 //! No device types here: the CUDA leg (`cuda::m3_run`) writes sidecars
 //! through this module, and `m3_compare` runs on any host from two sidecar
-//! sets. The sidecar chunk is a 44-byte header (magic, window, lo, score_lo,
-//! hi, n_rows as u64s) + `(logprob_true f32, top1_correct u8, top1_id u32)`
-//! per scored position + the sha256 of everything before it.
+//! sets. The sidecar chunk is a 79-byte header (magic `M3R\x02`, window,
+//! lo, score_lo, hi, n_rows as u64s, the 3-byte arm id — gguf, kv-q8,
+//! chunked — and the 32-byte build sha) + `(logprob_true f32, top1_correct
+//! u8, top1_id u32)` per scored position + the sha256 of everything before
+//! it: every chunk self-describes the arm and build that produced it.
 
 use super::m3_quality::{Comparison, Margins, PositionRow, ProbeRow};
 use serde_json::Value;
@@ -18,6 +21,81 @@ use std::path::{Path, PathBuf};
 const N_CLUSTERS: u32 = 1_526;
 const DRAWS: usize = 10_000;
 const SEED: u64 = 20_261_031;
+
+/// Registered digests and counts of the frozen v5 layout (registration
+/// §1). A layout whose digests differ aborts the harness: these are the
+/// numbers the review signed off on.
+const LAYOUT_SHA: &str = "86030447e2b4298e8eb383edeb4d58bfca2076663090f4c339dd8b4e7e268683";
+const IDS_SHA: &str = "d904346c1c6fa5b91d48c441bada957f651394894bf152a33ea64df9c7f7b2a7";
+const CLUSTERS_SHA: &str = "4a03ae50343c2072c43c3e880b548ca7f8bb574550d3f6457c146c5e8bb8030a";
+const N_WINDOWS: usize = 58;
+const N_RETRIEVAL: usize = 174;
+const N_COPY: usize = 387;
+
+/// Python `json.dumps(value, sort_keys=True)` byte-for-byte, for the
+/// layout document: keys sorted, ", " item and ": " key separators, ints,
+/// bools, null and ASCII-escaped strings only. A float aborts loudly (the
+/// canonical writer covers the layout's int-only schema) instead of
+/// hashing to a wrong recipe silently.
+fn python_recipe(v: &Value) -> Result<String, String> {
+    let esc = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{08}' => out.push_str("\\b"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\u{0c}' => out.push_str("\\f"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 || (c as u32) >= 0x7f => {
+                    let cp = c as u32;
+                    if cp <= 0xffff {
+                        out.push_str(&format!("\\u{cp:04x}"));
+                    } else {
+                        let s = cp - 0x1_0000;
+                        out.push_str(&format!(
+                            "\\u{:04x}\\u{:04x}",
+                            0xd800 + (s >> 10),
+                            0xdc00 + (s & 0x3ff)
+                        ));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    };
+    Ok(match v {
+        Value::Null => "null".to_owned(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => {
+            if n.as_u64().is_none() && n.as_i64().is_none() {
+                return Err(err(
+                    "the recipe carries a float; canonical writer covers ints",
+                ));
+            }
+            n.to_string()
+        }
+        Value::String(s) => esc(s),
+        Value::Array(a) => {
+            let parts = a.iter().map(python_recipe).collect::<Result<Vec<_>, _>>()?;
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            let parts = keys
+                .into_iter()
+                .map(|k| Ok::<_, String>(format!("{}: {}", esc(k), python_recipe(&o[k])?)))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("{{{}}}", parts.join(", "))
+        }
+    })
+}
 
 fn err(text: &str) -> String {
     format!("m3 store: {text}")
@@ -48,24 +126,50 @@ fn u64_of(v: &Value, key: &str) -> Result<u64, String> {
 /// way check_v4.py does: the layout sha recipe, and the ids and cluster
 /// bins against the layout's own fields.
 pub(in crate::family::qwen36) fn load_layout(dir: &Path) -> Result<Layout, String> {
-    let text = std::fs::read_to_string(dir.join("m3_layout_v4.json"))
+    let text = std::fs::read_to_string(dir.join("m3_layout_v5.json"))
         .map_err(|e| err(&format!("the layout json does not read: {e}")))?;
     let doc: Value = serde_json::from_str(&text).map_err(|e| err(&format!("layout json: {e}")))?;
     let mut recipe = doc.clone();
-    recipe["layout_sha256"].take();
-    let recipe = serde_json::to_string(&recipe).map_err(|e| err(&format!("layout recipe: {e}")))?;
+    recipe
+        .as_object_mut()
+        .ok_or_else(|| err("layout is not an object"))?
+        .remove("layout_sha256");
+    let recipe = python_recipe(&recipe)?;
     if sha256_hex(recipe.as_bytes()) != doc["layout_sha256"].as_str().unwrap_or("") {
         return Err(err("the layout sha recipe does not reproduce"));
     }
-    let ids_bin = std::fs::read(dir.join("m3_corpus_ids_v4.bin"))
+    let ids_bin = std::fs::read(dir.join("m3_corpus_ids_v5.bin"))
         .map_err(|e| err(&format!("the ids bin does not read: {e}")))?;
     if sha256_hex(&ids_bin) != doc["ids_sha256"].as_str().unwrap_or("") {
         return Err(err("the ids bin sha does not match the layout"));
     }
-    let cluster_bin = std::fs::read(dir.join("m3_pos_clusters_v4.bin"))
+    let cluster_bin = std::fs::read(dir.join("m3_pos_clusters_v5.bin"))
         .map_err(|e| err(&format!("the cluster bin does not read: {e}")))?;
     if sha256_hex(&cluster_bin) != doc["pos_clusters_sha256"].as_str().unwrap_or("") {
         return Err(err("the cluster bin sha does not match the layout"));
+    }
+    for (name, got, want) in [
+        (
+            "layout_sha256",
+            doc["layout_sha256"].as_str().unwrap_or(""),
+            LAYOUT_SHA,
+        ),
+        (
+            "ids_sha256",
+            doc["ids_sha256"].as_str().unwrap_or(""),
+            IDS_SHA,
+        ),
+        (
+            "pos_clusters_sha256",
+            doc["pos_clusters_sha256"].as_str().unwrap_or(""),
+            CLUSTERS_SHA,
+        ),
+    ] {
+        if got != want {
+            return Err(err(&format!(
+                "{name} {got} is not the REGISTERED digest {want}"
+            )));
+        }
     }
     let n = u64_of(&doc, "n_ids")? as usize;
     if ids_bin.len() != n * 4 || cluster_bin.len() != n * 2 {
@@ -98,13 +202,33 @@ pub(in crate::family::qwen36) fn load_layout(dir: &Path) -> Result<Layout, Strin
     let mut probes = Vec::new();
     for (key, is_copy) in [("retrieval_probes", false), ("copy_probes", true)] {
         for p in doc[key].as_array().ok_or_else(|| err(key))? {
+            let span = p["span_ids"]
+                .as_array()
+                .ok_or_else(|| err("span_ids is not an array"))?;
             probes.push((
-                u64_of(&p["span_ids"], "0")? as usize,
-                u64_of(&p["span_ids"], "1")? as usize,
-                u64_of(p, "cluster")? as u32,
+                span.first()
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| err("span_ids[0] is not a u64"))? as usize,
+                span.get(1)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| err("span_ids[1] is not a u64"))? as usize,
+                u64_of(p, "doc")? as u32,
                 is_copy,
             ));
         }
+    }
+    let counts = (
+        probes.iter().filter(|p| !p.3).count(),
+        probes.iter().filter(|p| p.3).count(),
+    );
+    if windows.len() != N_WINDOWS || counts != (N_RETRIEVAL, N_COPY) {
+        return Err(err(&format!(
+            "windows/retrieval/copy = {}/{}/{} are not the REGISTERED \
+             {N_WINDOWS}/{N_RETRIEVAL}/{N_COPY}",
+            windows.len(),
+            counts.0,
+            counts.1
+        )));
     }
     Ok(Layout {
         ids,
@@ -117,14 +241,25 @@ pub(in crate::family::qwen36) fn load_layout(dir: &Path) -> Result<Layout, Strin
 /// One scored row as stored: logprob f32, argmax-correct flag, argmax id.
 pub(in crate::family::qwen36) type Row = (f32, bool, u32);
 
+/// The registered digests, for the leg's arm manifest.
+pub(in crate::family::qwen36) fn registered_layout_sha() -> &'static str {
+    LAYOUT_SHA
+}
+
+pub(in crate::family::qwen36) fn registered_ids_sha() -> &'static str {
+    IDS_SHA
+}
+
 /// The sidecar bytes of one window: header + rows + trailing sha256.
 pub(in crate::family::qwen36) fn sidecar_bytes(
     window: usize,
     (lo, score_lo, hi): (usize, usize, usize),
+    arm: [u8; 3],
+    build_sha: [u8; 32],
     rows: &[Row],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(44 + rows.len() * 9 + 32);
-    out.extend_from_slice(b"M3R\x01");
+    let mut out = Vec::with_capacity(79 + rows.len() * 9 + 32);
+    out.extend_from_slice(b"M3R\x02");
     for field in [
         window as u64,
         lo as u64,
@@ -134,6 +269,8 @@ pub(in crate::family::qwen36) fn sidecar_bytes(
     ] {
         out.extend_from_slice(&field.to_le_bytes());
     }
+    out.extend_from_slice(&arm);
+    out.extend_from_slice(&build_sha);
     for (logprob, correct, top1) in rows {
         out.extend_from_slice(&logprob.to_le_bytes());
         out.push(u8::from(*correct));
@@ -143,22 +280,27 @@ pub(in crate::family::qwen36) fn sidecar_bytes(
     out
 }
 
-/// Reads and verifies one window chunk: sha over the body, then header
-/// geometry against the layout. Returns the rows in target order.
+/// The chunk's arm identity: the 3-byte arm id and the 32-byte build sha
+/// it was produced from.
+pub(in crate::family::qwen36) type ArmIdentity = ([u8; 3], [u8; 32]);
+
+/// Reads and verifies one window chunk: sha over the body, header geometry
+/// against the layout, then the arm id and build sha it carries. Returns
+/// the rows in target order with the chunk's arm identity.
 pub(in crate::family::qwen36) fn read_sidecar(
     path: &Path,
     window: usize,
     want: (usize, usize, usize),
-) -> Result<Vec<Row>, String> {
+) -> Result<(Vec<Row>, ArmIdentity), String> {
     let bytes = std::fs::read(path).map_err(|e| err(&format!("{}: {e}", path.display())))?;
-    if bytes.len() < 44 + 32 {
+    if bytes.len() < 79 + 32 {
         return Err(err(&format!("{}: too short", path.display())));
     }
     let (body, digest) = bytes.split_at(bytes.len() - 32);
     if &Sha256::digest(body)[..] != digest {
         return Err(err(&format!("{}: sha mismatch", path.display())));
     }
-    if &body[..4] != b"M3R\x01" {
+    if &body[..4] != b"M3R\x02" {
         return Err(err(&format!("{}: wrong magic", path.display())));
     }
     let fields: Vec<u64> = (0..5)
@@ -172,10 +314,14 @@ pub(in crate::family::qwen36) fn read_sidecar(
         )));
     }
     let n = fields[4] as usize;
-    if body.len() != 44 + n * 9 {
+    if body.len() != 79 + n * 9 {
         return Err(err(&format!("{}: row count", path.display())));
     }
-    Ok(body[44..]
+    let mut arm = [0u8; 3];
+    arm.copy_from_slice(&body[44..47]);
+    let mut build = [0u8; 32];
+    build.copy_from_slice(&body[47..79]);
+    let rows = body[79..]
         .as_chunks::<9>()
         .0
         .iter()
@@ -186,7 +332,8 @@ pub(in crate::family::qwen36) fn read_sidecar(
                 u32::from_le_bytes([c[5], c[6], c[7], c[8]]),
             )
         })
-        .collect())
+        .collect();
+    Ok((rows, (arm, build)))
 }
 
 /// All position and probe rows of one arm, rebuilt from its sidecar set.
@@ -200,9 +347,24 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     let mut positions = Vec::new();
     // Per-window rows cached once; probe spans index into them by absolute
     // id (windows tile the stream, so score_lo..hi covers every target).
+    // Every chunk must carry the SAME arm id and build sha: a sidecar set
+    // mixed across arms or builds does not describe one arm.
     let mut window_rows = Vec::with_capacity(layout.windows.len());
+    let mut identity: Option<([u8; 3], [u8; 32])> = None;
     for (w, &(lo, score_lo, hi)) in layout.windows.iter().enumerate() {
-        let rows = read_sidecar(&dir.join(format!("w{w:03}.m3row")), w, (lo, score_lo, hi))?;
+        let (rows, (arm, build)) =
+            read_sidecar(&dir.join(format!("w{w:03}.m3row")), w, (lo, score_lo, hi))?;
+        match identity {
+            None => identity = Some((arm, build)),
+            Some((want_arm, want_build)) => {
+                if (arm, build) != (want_arm, want_build) {
+                    return Err(err(&format!(
+                        "window {w}: sidecar arm/build {:?}/{:?} disagrees with {:?}/{:?}",
+                        arm, build, want_arm, want_build
+                    )));
+                }
+            }
+        }
         for (i, (logprob, correct, _)) in rows.iter().enumerate() {
             let p = score_lo + i;
             if !logprob.is_finite() {
@@ -254,7 +416,7 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
 #[test]
 #[ignore = "needs two complete arm sidecar sets: M3_COMPARE=cand_dir:ref_dir M3_LAYOUT_DIR=dir"]
 fn m3_compare() {
-    let layout_dir = PathBuf::from(std::env::var("M3_LAYOUT_DIR").expect("M3_LAYOUT_DIR"));
+    let layout_dir = crate::test_paths::required("M3_LAYOUT_DIR");
     let (cand_dir, ref_dir) = {
         let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=cand:ref");
         let parts: Vec<&str> = spec.split(':').collect();
@@ -279,16 +441,160 @@ fn m3_compare() {
     assert!(verdict, "the frozen margins failed: {comparison:?}");
 }
 
+/// The arm-4 gate: two trace-leg digest files (one sha256 per position's
+/// full f32 row) must be byte-identical, else the arms disagree in some
+/// row bit. `#[ignore]`d host entry: M3_TRACE_COMPARE=dir_a:dir_b.
+#[test]
+#[ignore = "two trace leg outputs: M3_TRACE_COMPARE=arm2_dir:arm4_dir"]
+fn m3_trace_compare() {
+    let spec = std::env::var("M3_TRACE_COMPARE").expect("M3_TRACE_COMPARE=dir_a:dir_b");
+    let parts: Vec<&str> = spec.split(':').collect();
+    let a = std::fs::read(PathBuf::from(parts[0]).join("trace_rows.sha256"))
+        .expect("arm a trace_rows.sha256");
+    let b = std::fs::read(PathBuf::from(parts[1]).join("trace_rows.sha256"))
+        .expect("arm b trace_rows.sha256");
+    assert_eq!(a.len(), b.len(), "the trace legs scored different lengths");
+    assert!(a.len() % 32 == 0 && !a.is_empty(), "not a digest file");
+    for (i, (x, y)) in a
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<32>().0)
+        .enumerate()
+    {
+        assert_eq!(x, y, "trace position {i}: row bits differ");
+    }
+    println!("m3 trace: {} positions bitwise-identical", a.len() / 32);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frozen v5 layout files load and match every REGISTERED digest and
+    /// count. Runs in the gate whenever M3_LAYOUT_DIR resolves (env or
+    /// ~/.config/fifi/test-paths.json); under FIFI_TEST_REQUIRE_DATA=1 a
+    /// missing location fails instead of skipping.
+    #[test]
+    fn frozen_layout_loads_with_registered_shas() {
+        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
+            return;
+        };
+        let layout = load_layout(&dir).expect("the frozen layout loads");
+        assert_eq!(layout.windows.len(), N_WINDOWS);
+        assert_eq!(layout.probes.iter().filter(|p| !p.3).count(), N_RETRIEVAL);
+        assert_eq!(layout.probes.iter().filter(|p| p.3).count(), N_COPY);
+    }
+
+    /// Power statement (registration §power): the minimum uniform exactness
+    /// loss each probe gate detects against a perfect reference, through the
+    /// REAL frozen bootstrap on the REAL v5 cluster universe. A uniform loss
+    /// of r marks each probe inexact independently with a deterministic LCG;
+    /// the detection threshold is the smallest grid rate where the verdict
+    /// flips. Must be monotone, and the smaller probe set (retrieval) cannot
+    /// detect a finer loss than the larger (copy).
+    #[test]
+    fn power_statement_against_perfect_reference() {
+        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
+            return;
+        };
+        let layout = load_layout(&dir).expect("layout");
+        let positions: Vec<PositionRow> = layout
+            .windows
+            .iter()
+            .flat_map(|&(_, score_lo, hi)| {
+                (score_lo..hi).map(|p| PositionRow {
+                    cluster: u32::from(layout.clusters[p]),
+                    logprob_true: -0.5,
+                    top1_correct: true,
+                })
+            })
+            .collect();
+        let copy_ref = layout
+            .probes
+            .iter()
+            .filter(|p| p.3)
+            .map(|p| ProbeRow {
+                cluster: p.2,
+                exact: true,
+            })
+            .collect::<Vec<_>>();
+        let retr_ref = layout
+            .probes
+            .iter()
+            .filter(|p| !p.3)
+            .map(|p| ProbeRow {
+                cluster: p.2,
+                exact: true,
+            })
+            .collect::<Vec<_>>();
+        let flip = |rows: &[ProbeRow], rate: f64| -> Vec<ProbeRow> {
+            let mut s = 0x853c_49e6_748f_ea9du64;
+            rows.iter()
+                .map(|r| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = (s >> 33) as f64 / u64::from(u32::MAX) as f64;
+                    ProbeRow {
+                        exact: u >= rate,
+                        ..*r
+                    }
+                })
+                .collect()
+        };
+        let rates: Vec<f64> = (0..=40).map(|i| i as f64 * 0.0025).collect(); // 0% .. 10%
+        let mut detection = [None, None]; // (copy, retrieval)
+        for (gate, is_copy) in [(0, true), (1, false)] {
+            let mut verdicts = Vec::with_capacity(rates.len());
+            for &rate in &rates {
+                let (cand_copy, cand_retr) = if is_copy {
+                    (flip(&copy_ref, rate), retr_ref.clone())
+                } else {
+                    (copy_ref.clone(), flip(&retr_ref, rate))
+                };
+                let comparison = Comparison::evaluate(
+                    &positions, &positions, &cand_copy, &copy_ref, &cand_retr, &retr_ref,
+                    N_CLUSTERS, DRAWS, SEED,
+                );
+                verdicts.push(comparison.passes(&Margins::frozen()));
+            }
+            assert!(verdicts[0], "the gate fails at zero loss");
+            assert!(
+                verdicts.windows(2).all(|w| w[0] || !w[1]),
+                "detection is not monotone: {verdicts:?}"
+            );
+            detection[gate] = rates
+                .iter()
+                .zip(&verdicts)
+                .find(|&(_, p)| !*p)
+                .map(|(r, _)| *r);
+        }
+        let (copy_det, retr_det) = (
+            detection[0].expect("copy gate never failed"),
+            detection[1].expect("retrieval gate never failed"),
+        );
+        assert!(
+            copy_det <= retr_det,
+            "copy ({}) coarser than retrieval ({copy_det} <= {retr_det} failed)",
+            copy_det
+        );
+        assert!(copy_det <= 0.05, "the copy gate misses a 5% uniform loss");
+        println!(
+            "m3 power: copy n={} detects a uniform loss >= {:.2}%; retrieval n={} >= {:.2}% (n_clusters {N_CLUSTERS}, B {DRAWS})",
+            copy_ref.len(),
+            100.0 * copy_det,
+            retr_ref.len(),
+            100.0 * retr_det
+        );
+    }
 
     /// The sidecar round-trips and read_sidecar rejects tampering, a wrong
     /// window, and wrong geometry.
     #[test]
     fn sidecar_round_trips_and_rejects_tampering() {
         let rows: Vec<Row> = vec![(-0.5, true, 7), (-1.25, false, 3)];
-        let bytes = sidecar_bytes(9, (100, 356, 400), &rows);
+        let bytes = sidecar_bytes(9, (100, 356, 400), [0, 1, 0], [7u8; 32], &rows);
         let back = read_sidecar(
             std::path::Path::new("/dev/null-does-not-exist"),
             9,
@@ -297,16 +603,25 @@ mod tests {
         assert!(back.is_err());
         let path = std::env::temp_dir().join("m3_store_selfcheck");
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(
-            read_sidecar(&path, 9, (100, 356, 400)).unwrap(),
-            vec![(-0.5f32, true, 7u32), (-1.25, false, 3u32)]
-        );
+        let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
+        assert_eq!(rows, vec![(-0.5f32, true, 7u32), (-1.25, false, 3)]);
+        assert_eq!((arm, build), ([0, 1, 0], [7u8; 32]));
         assert!(read_sidecar(&path, 8, (100, 356, 400)).is_err());
         assert!(read_sidecar(&path, 9, (101, 356, 400)).is_err());
         let mut tampered = bytes.clone();
-        tampered[44] ^= 1;
+        tampered[79] ^= 1; // a row byte: the digest must reject it
         std::fs::write(&path, &tampered).unwrap();
         assert!(read_sidecar(&path, 9, (100, 356, 400)).is_err());
+        let mut wrong_arm = bytes.clone();
+        wrong_arm[44] ^= 1; // the arm id byte, digest recomputed below
+        let len = wrong_arm.len();
+        let digest = Sha256::digest(&wrong_arm[..len - 32]);
+        wrong_arm[len - 32..].copy_from_slice(&digest);
+        std::fs::write(&path, &wrong_arm).unwrap();
+        // the digest passes but the returned identity must say what it carries
+        let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!((arm, build), ([0, 1, 0], [7u8; 32]));
         std::fs::remove_file(&path).ok();
     }
 }
