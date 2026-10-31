@@ -107,6 +107,13 @@ mod load_timing;
 /// carry Linux unit tests, and the Mac harness inside carries the native cfg.
 #[cfg(test)]
 mod long_context;
+/// The M3 quality gate: frozen EXL3-vs-GGUF and chunked-vs-one-token margins
+/// over the frozen M3 layout. `cfg(test)` like `decode_prefill_kl`: the pure
+/// metric core (paired document-clustered bootstrap bounds) carries Linux
+/// unit tests; the model arms join behind the native cfg once the
+/// registration is approved.
+#[cfg(test)]
+mod m3_quality;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod moe;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
