@@ -572,13 +572,12 @@ mod tests {
 
     /// The frozen v5 layout files load and match every REGISTERED digest and
     /// count. Runs in the gate whenever M3_LAYOUT_DIR resolves (env or
-    /// ~/.config/fifi/test-paths.json); under FIFI_TEST_REQUIRE_DATA=1 a
-    /// missing location fails instead of skipping.
+    /// ~/.config/fifi/test-paths.json). Unset FAILS LOUDLY (v5 review SF): a
+    /// silent skip here would let the gate pass without ever loading the
+    /// registered layout.
     #[test]
     fn frozen_layout_loads_with_registered_shas() {
-        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
-            return;
-        };
+        let dir = crate::test_paths::required("M3_LAYOUT_DIR");
         let layout = load_layout(&dir).expect("the frozen layout loads");
         assert_eq!(layout.windows.len(), N_WINDOWS);
         assert_eq!(layout.probes.iter().filter(|p| !p.3).count(), N_RETRIEVAL);
@@ -594,9 +593,7 @@ mod tests {
     /// detect a finer loss than the larger (copy).
     #[test]
     fn power_statement_against_perfect_reference() {
-        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
-            return;
-        };
+        let dir = crate::test_paths::required("M3_LAYOUT_DIR");
         let layout = load_layout(&dir).expect("layout");
         let positions: Vec<PositionRow> = layout
             .windows
