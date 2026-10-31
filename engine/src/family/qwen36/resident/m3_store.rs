@@ -125,7 +125,13 @@ pub(in crate::family::qwen36) fn sidecar_bytes(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(44 + rows.len() * 9 + 32);
     out.extend_from_slice(b"M3R\x01");
-    for field in [window as u64, lo as u64, score_lo as u64, hi as u64, rows.len() as u64] {
+    for field in [
+        window as u64,
+        lo as u64,
+        score_lo as u64,
+        hi as u64,
+        rows.len() as u64,
+    ] {
         out.extend_from_slice(&field.to_le_bytes());
     }
     for (logprob, correct, top1) in rows {
@@ -158,11 +164,7 @@ pub(in crate::family::qwen36) fn read_sidecar(
     let fields: Vec<u64> = (0..5)
         .map(|i| u64::from_le_bytes(body[4 + i * 8..12 + i * 8].try_into().unwrap()))
         .collect();
-    let got = (
-        fields[1] as usize,
-        fields[2] as usize,
-        fields[3] as usize,
-    );
+    let got = (fields[1] as usize, fields[2] as usize, fields[3] as usize);
     if fields[0] as usize != window || got != want {
         return Err(err(&format!(
             "{}: header {got:?} disagrees with layout {want:?}",
@@ -200,11 +202,7 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     // id (windows tile the stream, so score_lo..hi covers every target).
     let mut window_rows = Vec::with_capacity(layout.windows.len());
     for (w, &(lo, score_lo, hi)) in layout.windows.iter().enumerate() {
-        let rows = read_sidecar(
-            &dir.join(format!("w{w:03}.m3row")),
-            w,
-            (lo, score_lo, hi),
-        )?;
+        let rows = read_sidecar(&dir.join(format!("w{w:03}.m3row")), w, (lo, score_lo, hi))?;
         for (i, (logprob, correct, _)) in rows.iter().enumerate() {
             let p = score_lo + i;
             if !logprob.is_finite() {
@@ -225,9 +223,7 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     let exact_at = |p: usize| -> Option<bool> {
         window_rows
             .iter()
-            .find(|(score_lo, rows)| {
-                p >= *score_lo && p - *score_lo < rows.len()
-            })
+            .find(|(score_lo, rows)| p >= *score_lo && p - *score_lo < rows.len())
             .map(|(score_lo, rows)| rows[p - score_lo].1)
     };
     let mut retrieval = Vec::new();
@@ -235,9 +231,8 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     for &(span_lo, span_hi, cluster, is_copy) in &layout.probes {
         let mut exact = true;
         for p in span_lo..span_hi {
-            exact &= exact_at(p).ok_or_else(|| {
-                err(&format!("probe position {p} lies in no scored window"))
-            })?;
+            exact &= exact_at(p)
+                .ok_or_else(|| err(&format!("probe position {p} lies in no scored window")))?;
         }
         let row = ProbeRow { cluster, exact };
         if is_copy {
@@ -259,9 +254,7 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
 #[test]
 #[ignore = "needs two complete arm sidecar sets: M3_COMPARE=cand_dir:ref_dir M3_LAYOUT_DIR=dir"]
 fn m3_compare() {
-    let layout_dir = PathBuf::from(
-        std::env::var("M3_LAYOUT_DIR").expect("M3_LAYOUT_DIR"),
-    );
+    let layout_dir = PathBuf::from(std::env::var("M3_LAYOUT_DIR").expect("M3_LAYOUT_DIR"));
     let (cand_dir, ref_dir) = {
         let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=cand:ref");
         let parts: Vec<&str> = spec.split(':').collect();
@@ -296,7 +289,11 @@ mod tests {
     fn sidecar_round_trips_and_rejects_tampering() {
         let rows: Vec<Row> = vec![(-0.5, true, 7), (-1.25, false, 3)];
         let bytes = sidecar_bytes(9, (100, 356, 400), &rows);
-        let back = read_sidecar(std::path::Path::new("/dev/null-does-not-exist"), 9, (100, 356, 400));
+        let back = read_sidecar(
+            std::path::Path::new("/dev/null-does-not-exist"),
+            9,
+            (100, 356, 400),
+        );
         assert!(back.is_err());
         let path = std::env::temp_dir().join("m3_store_selfcheck");
         std::fs::write(&path, &bytes).unwrap();

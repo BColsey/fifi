@@ -12,7 +12,10 @@
 
 // Pure host math, but its only callers are test-gated (the scorer's tests
 // and the device harness), so a non-test build sees it unreferenced.
-#![cfg_attr(not(test), expect(dead_code, reason = "staged for the M3 harness legs"))]
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the M3 harness legs")
+)]
 
 use super::m3_quality::PositionRow;
 
@@ -39,7 +42,10 @@ pub(in crate::family::qwen36) fn log_sum_exp(row: &[f32]) -> f64 {
 
 /// The log-probability of `true_id` under the row: `logit - lse`. A `true_id`
 /// outside the row is a layout bug, refused loudly.
-pub(in crate::family::qwen36) fn logprob_true(row: &[f32], true_id: u32) -> Result<f64, &'static str> {
+pub(in crate::family::qwen36) fn logprob_true(
+    row: &[f32],
+    true_id: u32,
+) -> Result<f64, &'static str> {
     let logit = f64::from(
         row.get(true_id as usize)
             .copied()
@@ -61,7 +67,8 @@ pub(in crate::family::qwen36) fn argmax_low_id(row: &[f32]) -> Result<u32, &'sta
             _ => best = Some((id as u32, v)),
         }
     }
-    best.map(|(id, _)| id).ok_or("no finite entry in the logits row")
+    best.map(|(id, _)| id)
+        .ok_or("no finite entry in the logits row")
 }
 
 /// The scored-position row of one logits row: true-token log-probability
@@ -115,7 +122,11 @@ mod tests {
     /// the 5-row universe.
     #[test]
     fn padding_participates_in_normalization() {
-        let row = [1.0f32; 5].iter().copied().chain([0.0f32; 3]).collect::<Vec<_>>();
+        let row = [1.0f32; 5]
+            .iter()
+            .copied()
+            .chain([0.0f32; 3])
+            .collect::<Vec<_>>();
         let lp = logprob_true(&row, 2).unwrap();
         let want = 1.0f64 - (5.0 * 1.0f64.exp() + 3.0).ln();
         assert!((lp - want).abs() < 1e-12, "got {lp}, want {want}");

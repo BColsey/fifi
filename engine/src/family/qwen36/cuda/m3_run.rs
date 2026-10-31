@@ -86,7 +86,10 @@ fn arm_of_env() -> Result<Arm, EngError> {
     })
 }
 
-fn weights_of(projector: &CudaProjector, arm: &Arm) -> Result<(CudaWeights, WeightLayout), EngError> {
+fn weights_of(
+    projector: &CudaProjector,
+    arm: &Arm,
+) -> Result<(CudaWeights, WeightLayout), EngError> {
     if arm.gguf {
         let gguf = arm.dir.join("Qwen3.6-35B-A3B-Q4_K_M.gguf");
         let model = open_qwen3_6_35b_a3b(&gguf, None)?;

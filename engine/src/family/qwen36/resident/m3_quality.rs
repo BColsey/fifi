@@ -207,7 +207,10 @@ impl Comparison {
         for (c_rows, r_rows) in [(cand_copy, ref_copy), (cand_retr, ref_retr)] {
             assert!(
                 c_rows.len() == r_rows.len()
-                    && c_rows.iter().zip(r_rows).all(|(c, r)| c.cluster == r.cluster),
+                    && c_rows
+                        .iter()
+                        .zip(r_rows)
+                        .all(|(c, r)| c.cluster == r.cluster),
                 "reference probe rows are not aligned with candidate rows"
             );
         }
@@ -423,11 +426,7 @@ mod tests {
     #[test]
     fn sparse_probe_universe_stays_finite_and_directional() {
         // Positions over 5 clusters (12 rows, cluster = i/5 % 5).
-        let pos = rows(
-            &[-1.0; 12],
-            &[true; 12],
-            5,
-        );
+        let pos = rows(&[-1.0; 12], &[true; 12], 5);
         // 6 probe rows living only in clusters 1 and 3.
         let probes = (0..6)
             .map(|i| ProbeRow {
@@ -435,14 +434,24 @@ mod tests {
                 exact: true,
             })
             .collect::<Vec<_>>();
-        let cmp = Comparison::evaluate(&pos, &pos, &probes, &probes, &probes, &probes, 5, 500, 20261031);
-        assert!(cmp.probe_lb.is_finite() && cmp.probe_lb.abs() < 1e-9, "{cmp:?}");
+        let cmp = Comparison::evaluate(
+            &pos, &pos, &probes, &probes, &probes, &probes, 5, 500, 20261031,
+        );
+        assert!(
+            cmp.probe_lb.is_finite() && cmp.probe_lb.abs() < 1e-9,
+            "{cmp:?}"
+        );
         assert!(cmp.passes(&Margins::frozen()), "{cmp:?}");
         let mut lost = probes.clone();
         lost[1].exact = false;
         lost[4].exact = false;
         lost[5].exact = false;
-        let bad = Comparison::evaluate(&pos, &pos, &lost, &probes, &probes, &probes, 5, 500, 20261031);
-        assert!(bad.probe_lb < -0.01 && !bad.passes(&Margins::frozen()), "{bad:?}");
+        let bad = Comparison::evaluate(
+            &pos, &pos, &lost, &probes, &probes, &probes, 5, 500, 20261031,
+        );
+        assert!(
+            bad.probe_lb < -0.01 && !bad.passes(&Margins::frozen()),
+            "{bad:?}"
+        );
     }
 }
