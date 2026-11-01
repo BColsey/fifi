@@ -38,6 +38,7 @@ use std::cell::Cell;
 use super::context::{CudaContext, DeviceBuffer, DeviceStream};
 use super::native;
 use crate::EngError;
+use crate::kernels::cuda::DeviceRange;
 
 /// Bytes of slot header before the payload. Matches `kHeaderBytes` in
 /// `native/peer_ring.cu`.
@@ -223,9 +224,9 @@ impl PeerRing {
         &self,
         contexts: &[CudaContext],
         streams: &[DeviceStream],
-        partials: &[&DeviceBuffer],
-        outs: &[&DeviceBuffer],
-        statuses: &[&DeviceBuffer],
+        partials: &[DeviceRange<'_>],
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
         count: usize,
         mode: RingMode,
     ) -> Result<(), EngError> {
@@ -235,7 +236,7 @@ impl PeerRing {
             || statuses.len() != self.layout.cards
         {
             return Err(bad(
-                "partials, outs and statuses are one buffer per device".into()
+                "partials, outs and statuses are one range per device".into()
             ));
         }
         if count == 0 || count > self.layout.max_values {
@@ -246,8 +247,16 @@ impl PeerRing {
         }
         let (seq, next) = self.take_seq()?;
         let bytes = count * VALUE_BYTES;
+        if (partials
+            .iter()
+            .chain(outs)
+            .any(|range| range.bytes() < bytes))
+            || statuses.iter().any(|range| range.bytes() < 4)
+        {
+            return Err(bad("an exchange range is shorter than its payload".into()));
+        }
         for (source, context) in contexts.iter().enumerate() {
-            let src = context.raw_range(&partials[source].range(0, bytes)?)?;
+            let src = context.raw_range(&partials[source])?;
             for owner in 0..self.layout.cards {
                 if owner == source {
                     continue;
@@ -259,9 +268,9 @@ impl PeerRing {
             }
         }
         for (owner, context) in contexts.iter().enumerate() {
-            let out = context.raw_range(&outs[owner].range(0, bytes)?)?;
-            let own = context.raw_range(&partials[owner].range(0, bytes)?)?;
-            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            let out = context.raw_range(&outs[owner])?;
+            let own = context.raw_range(&partials[owner])?;
+            let word = context.raw_range(&statuses[owner])?;
             let mut slots = Vec::with_capacity(self.layout.cards - 1);
             for source in 0..self.layout.cards {
                 if source != owner {
@@ -298,9 +307,9 @@ impl PeerRing {
         contexts: &[CudaContext],
         streams: &[DeviceStream],
         source_card: usize,
-        src: &DeviceBuffer,
-        outs: &[&DeviceBuffer],
-        statuses: &[&DeviceBuffer],
+        src: DeviceRange<'_>,
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
         count: usize,
     ) -> Result<(), EngError> {
         self.check_members(contexts, streams.len())?;
@@ -311,7 +320,7 @@ impl PeerRing {
             )));
         }
         if outs.len() != self.layout.cards || statuses.len() != self.layout.cards {
-            return Err(bad("outs and statuses are one buffer per device".into()));
+            return Err(bad("outs and statuses are one range per device".into()));
         }
         if count == 0 || count > self.layout.max_values {
             return Err(bad(format!(
@@ -321,8 +330,14 @@ impl PeerRing {
         }
         let (seq, next) = self.take_seq()?;
         let bytes = count * VALUE_BYTES;
+        if src.bytes() < bytes
+            || outs.iter().any(|range| range.bytes() < bytes)
+            || statuses.iter().any(|range| range.bytes() < 4)
+        {
+            return Err(bad("a broadcast range is shorter than its payload".into()));
+        }
         let publisher = &contexts[source_card];
-        let src_range = publisher.raw_range(&src.range(0, bytes)?)?;
+        let src_range = publisher.raw_range(&src)?;
         for owner in 0..self.layout.cards {
             let dst = self.slot_address(owner, source_card, seq)?;
             publisher.launch_on(&streams[source_card], |stream| {
@@ -330,8 +345,8 @@ impl PeerRing {
             })?;
         }
         for (owner, context) in contexts.iter().enumerate() {
-            let out = context.raw_range(&outs[owner].range(0, bytes)?)?;
-            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            let out = context.raw_range(&outs[owner])?;
+            let word = context.raw_range(&statuses[owner])?;
             let slot = self.slot_address(owner, source_card, seq)?;
             context.launch_on(&streams[owner], |stream| {
                 native::peer_ring::wait_copy(stream, out, slot, count, seq, TIMEOUT_CYCLES, word)
@@ -353,9 +368,9 @@ impl PeerRing {
         &self,
         contexts: &[CudaContext],
         streams: &[DeviceStream],
-        parts: &[&DeviceBuffer],
-        outs: &[&DeviceBuffer],
-        statuses: &[&DeviceBuffer],
+        parts: &[DeviceRange<'_>],
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
         ranges: &[std::ops::Range<usize>],
         total: usize,
     ) -> Result<(), EngError> {
@@ -368,6 +383,11 @@ impl PeerRing {
             return Err(bad(
                 "parts, outs, statuses and ranges are one per device".into()
             ));
+        }
+        if statuses.iter().any(|range| range.bytes() < 4)
+            || outs.iter().any(|range| range.bytes() < total * VALUE_BYTES)
+        {
+            return Err(bad("a gather range is shorter than its payload".into()));
         }
         let mut next_start = 0usize;
         for range in ranges {
@@ -387,7 +407,10 @@ impl PeerRing {
         let (seq, next) = self.take_seq()?;
         for (source, context) in contexts.iter().enumerate() {
             let count = ranges[source].len();
-            let src = context.raw_range(&parts[source].range(0, count * VALUE_BYTES)?)?;
+            if parts[source].bytes() < count * VALUE_BYTES {
+                return Err(bad("a gather part is shorter than its slice".into()));
+            }
+            let src = context.raw_range(&parts[source])?;
             for owner in 0..self.layout.cards {
                 let dst = self.slot_address(owner, source, seq)?;
                 context.launch_on(&streams[source], |stream| {
@@ -396,10 +419,13 @@ impl PeerRing {
             }
         }
         for (owner, context) in contexts.iter().enumerate() {
-            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            let word = context.raw_range(&statuses[owner])?;
             for (source, range) in ranges.iter().enumerate() {
+                let (offset, len) = (range.start * VALUE_BYTES, range.len() * VALUE_BYTES);
                 let out = context.raw_range(
-                    &outs[owner].range(range.start * VALUE_BYTES, range.len() * VALUE_BYTES)?,
+                    &outs[owner]
+                        .buffer()
+                        .range(outs[owner].offset() + offset, len)?,
                 )?;
                 let slot = self.slot_address(owner, source, seq)?;
                 let count = range.len();
@@ -496,6 +522,12 @@ mod device_tests {
         Ok(download_f32(buffer, stream, 1)?[0].to_bits())
     }
 
+    /// The whole buffer as one range: what the step-level callers pass for
+    /// the ring operations that take arena slots (a `DeviceRange`).
+    fn whole(buffer: &DeviceBuffer) -> DeviceRange<'_> {
+        buffer.range(0, buffer.bytes()).expect("whole range")
+    }
+
     /// Two contexts on the one physical device of this box: the mailbox
     /// addresses are ordinary allocations, so the whole protocol runs and
     /// only the PCIe hop is absent. A real peer pair needs a second card.
@@ -533,9 +565,9 @@ mod device_tests {
             ring.exchange_sum(
                 &contexts,
                 &streams,
-                &[&partials[0], &partials[1]],
-                &[&outs[0], &outs[1]],
-                &[&statuses[0], &statuses[1]],
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
                 2048,
                 RingMode::F32,
             )
@@ -586,9 +618,9 @@ mod device_tests {
             ring.exchange_sum(
                 &contexts,
                 &streams,
-                &[&partials[0], &partials[1]],
-                &[&outs[0], &outs[1]],
-                &[&statuses[0], &statuses[1]],
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
                 4,
                 RingMode::F32,
             )
@@ -638,9 +670,9 @@ mod device_tests {
         ring.exchange_sum(
             &contexts,
             &streams,
-            &[&partials[0], &partials[1]],
-            &[&outs[0], &outs[1]],
-            &[&statuses[0], &statuses[1]],
+            &[whole(&partials[0]), whole(&partials[1])],
+            &[whole(&outs[0]), whole(&outs[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
             16,
             RingMode::F16,
         )
@@ -705,9 +737,9 @@ mod device_tests {
         ring.exchange_sum(
             &contexts,
             &streams,
-            &[&partials[0], &partials[1]],
-            &[&sums[0], &sums[1]],
-            &[&statuses[0], &statuses[1]],
+            &[whole(&partials[0]), whole(&partials[1])],
+            &[whole(&sums[0]), whole(&sums[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
             16,
             RingMode::F32,
         )
@@ -716,18 +748,18 @@ mod device_tests {
             &contexts,
             &streams,
             1,
-            &src,
-            &[&outs[0], &outs[1]],
-            &[&statuses[0], &statuses[1]],
+            whole(&src),
+            &[whole(&outs[0]), whole(&outs[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
             16,
         )
         .expect("broadcast");
         ring.exchange_sum(
             &contexts,
             &streams,
-            &[&partials[0], &partials[1]],
-            &[&sums[0], &sums[1]],
-            &[&statuses[0], &statuses[1]],
+            &[whole(&partials[0]), whole(&partials[1])],
+            &[whole(&sums[0]), whole(&sums[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
             16,
             RingMode::F32,
         )
@@ -770,9 +802,9 @@ mod device_tests {
         ring.all_gather_row(
             &contexts,
             &streams,
-            &[&parts[0], &parts[1]],
-            &[&outs[0], &outs[1]],
-            &[&statuses[0], &statuses[1]],
+            &[whole(&parts[0]), whole(&parts[1])],
+            &[whole(&outs[0]), whole(&outs[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
             &[0..192, 192..512],
             512,
         )
@@ -791,9 +823,9 @@ mod device_tests {
             ring.all_gather_row(
                 &contexts,
                 &streams,
-                &[&parts[0], &parts[1]],
-                &[&outs[0], &outs[1]],
-                &[&statuses[0], &statuses[1]],
+                &[whole(&parts[0]), whole(&parts[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
                 &[0..192, 200..512],
                 512,
             )
