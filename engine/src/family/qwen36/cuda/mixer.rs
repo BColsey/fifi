@@ -23,12 +23,13 @@ use super::{
     dims::KvMode,
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
-    mixer_ops::{BLOCK_ROWS, BlockOp, block_ops},
+    mixer_ops::{BLOCK_ROWS, BlockOp, CardOp, block_ops, block_ops_card},
     mixer_shapes::{attn_decode_shape, attn_prep_shape, plain_shape},
     mixer_shapes::{attn_q8_shape, check_delta_eps, conv_shape, delta_shape, kv8_shape},
     mixer_weights::{LayerWeights, MixerWeights},
     paging_store::{PageAttention, PageId, PageToken},
     resources::PagedResources,
+    shard::ShardTable,
     state::ResidentState,
     state_layout::{Plane, Word},
     step_plan::{Slot, StepPlan},
@@ -87,9 +88,82 @@ impl KindOps {
     }
 }
 
+/// The card op lists of every layer kind (Native weights), for one card of the multi-device
+/// step: the local launches of `block_ops_card` with the ring markers in place. The coordinator
+/// runs these against the card's own stream and serves the markers from the peer ring.
+pub(super) struct CardKindOps {
+    pub(super) delta: Vec<CardOp>,
+    pub(super) attn: Vec<CardOp>,
+}
+
+impl CardKindOps {
+    /// The card `card` of `table`: its own geometry `g` (`MixerGeometry::for_card`) and its
+    /// absolute K/V row range into the full cache row.
+    pub(super) fn new(
+        table: &ShardTable,
+        card: usize,
+        g: &MixerGeometry,
+        kv_mode: KvMode,
+    ) -> Result<Self, EngError> {
+        let rows = table.kv_rows(card)?;
+        let k_range = (rows.start, rows.end);
+        Ok(Self {
+            delta: block_ops_card(
+                crate::family::AttentionKind::DeltaNet,
+                g,
+                k_range,
+                WeightLayout::Native,
+                kv_mode,
+            )?,
+            attn: block_ops_card(
+                crate::family::AttentionKind::Full,
+                g,
+                k_range,
+                WeightLayout::Native,
+                kv_mode,
+            )?,
+        })
+    }
+
+    pub(super) fn of(&self, kind: crate::family::AttentionKind) -> Result<&[CardOp], EngError> {
+        match kind {
+            crate::family::AttentionKind::DeltaNet => Ok(&self.delta),
+            crate::family::AttentionKind::Full => Ok(&self.attn),
+            other => Err(EngError::Checkpoint(format!(
+                "card mixer: attention kind {other:?} has no resident mixer"
+            ))),
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = &CardOp> {
+        self.delta.iter().chain(self.attn.iter())
+    }
+}
+
 /// The arena ranges the blocks use, resolved once per session from the slots the ops name.
 pub(super) struct MixerViews<'a> {
     views: Vec<(Slot, DeviceRange<'a>)>,
+}
+
+/// The slots every op of `ops` names, deduplicated in first-seen order and resolved against
+/// `plan` (the shared enumeration of the single-device and card view builders).
+fn named_slots<'s>(
+    plan: &StepPlan,
+    ops: impl Iterator<Item = &'s BlockOp>,
+) -> Result<Vec<(Slot, usize)>, EngError> {
+    let mut indices: Vec<(Slot, usize)> = Vec::new();
+    for op in ops {
+        for slot in op.reads().into_iter().chain(op.writes()) {
+            if indices.iter().any(|(known, _)| *known == slot) {
+                continue;
+            }
+            let index = plan.index(slot).ok_or_else(|| {
+                EngError::BadRequest(format!("mixer views: the plan has no slot {slot:?}"))
+            })?;
+            indices.push((slot, index));
+        }
+    }
+    Ok(indices)
 }
 
 impl<'a> MixerViews<'a> {
@@ -105,6 +179,52 @@ impl<'a> MixerViews<'a> {
             .map(|(slot, index)| Ok((slot, arena.tensor(index)?)))
             .collect::<Result<Vec<_>, EngError>>()?;
         Ok(Self { views })
+    }
+
+    /// The card variant of [`Self::new`] for the multi-device shards: the slots come from the
+    /// CARD op lists (whose gathers and fp16 append name KRows/VRows under both modes, which
+    /// the single-device Fp16 list never does), resolved against the card plan
+    /// `StepPlan::for_card` builds. Every card of the table builds its own views.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device step, its first production caller"
+        )
+    )]
+    pub(super) fn for_card(
+        plan: &StepPlan,
+        arena: &'a DeviceArena,
+        ops: &CardKindOps,
+    ) -> Result<Self, EngError> {
+        let locals = || {
+            ops.all().filter_map(|op| match op {
+                CardOp::Local(op) => Some(op),
+                CardOp::GatherK | CardOp::GatherV | CardOp::MixerSum => None,
+            })
+        };
+        let views = named_slots(plan, locals())?
+            .into_iter()
+            .map(|(slot, index)| Ok((slot, arena.tensor(index)?)))
+            .collect::<Result<Vec<_>, EngError>>()?;
+        Ok(Self { views })
+    }
+
+    /// The pure slot enumeration of [`Self::for_card`]: every LOCAL op of the card lists names
+    /// a slot the card plan holds (the markers carry no slots; the ring moves ranges the
+    /// coordinator already holds).
+    #[cfg(test)]
+    pub(super) fn card_slot_indices(
+        plan: &StepPlan,
+        ops: &CardKindOps,
+    ) -> Result<Vec<(Slot, usize)>, EngError> {
+        let locals = || {
+            ops.all().filter_map(|op| match op {
+                CardOp::Local(op) => Some(op),
+                CardOp::GatherK | CardOp::GatherV | CardOp::MixerSum => None,
+            })
+        };
+        named_slots(plan, locals())
     }
 
     pub(super) fn slot_indices(

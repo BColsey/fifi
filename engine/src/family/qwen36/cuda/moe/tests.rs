@@ -454,7 +454,11 @@ fn the_card_moe_sequence_aligns_its_markers_on_every_card() {
     };
     let single = moe_sequence(8, WeightLayout::Native);
     assert_eq!(locals(&card0), single, "card 0 keeps the whole list");
-    assert_eq!(locals(&card1), single[1..], "the other card skips the router");
+    assert_eq!(
+        locals(&card1),
+        single[1..],
+        "the other card skips the router"
+    );
 }
 
 /// On the native list: every slot an op touches is live in its phase in the NATIVE plan, and
