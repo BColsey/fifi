@@ -57,6 +57,16 @@ unsafe extern "C" {
         count: c_int,
         seq: c_uint,
     ) -> c_int;
+    #[link_name = "inference_cuda_ring_wait_copy_f32"]
+    fn wait_copy_f32_raw(
+        stream: *mut c_void,
+        out: *mut f32,
+        peer_slot: *const c_void,
+        count: c_int,
+        seq: c_uint,
+        timeout_cycles: c_ulonglong,
+        status: *mut c_uint,
+    ) -> c_int;
     #[link_name = "inference_cuda_ring_wait_sum_f16"]
     fn wait_sum_f16_raw(
         stream: *mut c_void,
@@ -199,6 +209,39 @@ pub(in crate::kernels::cuda) fn wait_sum(
     checked(status, super::STAGE_NONE)
 }
 
+/// Queues the wait-copy: spin until the slot at device address `peer_slot`
+/// carries `seq`, then copy its `count` f32 payload values into `out`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::kernels::cuda) fn wait_copy(
+    stream: &RawStream,
+    out: RawRange<'_>,
+    peer_slot: u64,
+    count: usize,
+    seq: u32,
+    timeout_cycles: u64,
+    status_word: RawRange<'_>,
+) -> Result<(), DeviceFailure> {
+    let count = checked_count(count, &[out])?;
+    if seq == 0 || !peer_slot.is_multiple_of(16) || status_word.bytes() < 4 {
+        return Err(invalid_argument());
+    }
+    // SAFETY: `out` covers `count` f32 values and `status_word` one u32 of
+    // live allocations (proved above); the slot is in a live mailbox
+    // allocation recorded by the safe layer. The entry only queues.
+    let status = unsafe {
+        wait_copy_f32_raw(
+            stream.as_ptr(),
+            out.address().cast::<f32>(),
+            slot_ptr(peer_slot).cast_const(),
+            count,
+            seq,
+            timeout_cycles,
+            status_word.address().cast::<c_uint>(),
+        )
+    };
+    checked(status, super::STAGE_NONE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +272,19 @@ mod tests {
                 4,
                 1,
                 1,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, super::super::STATUS_INVALID_ARGUMENT);
+        // SAFETY: same adapter-side argument checks, on the wait-copy entry.
+        let status = unsafe {
+            wait_copy_f32_raw(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                1,
+                0,
                 0,
                 std::ptr::null_mut(),
             )

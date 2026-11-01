@@ -263,6 +263,46 @@ impl ShardTable {
     }
 }
 
+/// One card's greedy candidate from its vocabulary shard: the global token
+/// id and its logit, as the existing device argmax produces them per shard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HeadCandidate {
+    pub(crate) token: u32,
+    pub(crate) logit: f32,
+}
+
+/// The winner over per-card candidates, by the one argmax rule of the
+/// engine (`family::sampler` and the device `beats()` in
+/// `native/resident/step_params.cu`): the largest value, the lowest token
+/// id on a tie, and a NaN never wins. Candidates carry global token ids,
+/// so the rule needs no shard knowledge; an empty or all-NaN set has no
+/// winner, matching the device kernel's no-candidate result. Because the
+/// rule is a strict total order on (value, id) pairs, the winner equals
+/// the unsplit argmax over the same logits.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the two-device step, which merges per-shard candidates"
+    )
+)]
+pub(crate) fn merge_head_candidates(candidates: &[HeadCandidate]) -> Option<HeadCandidate> {
+    let mut best: Option<HeadCandidate> = None;
+    for &candidate in candidates {
+        let wins = match best {
+            None => !candidate.logit.is_nan(),
+            Some(current) => {
+                candidate.logit > current.logit
+                    || (candidate.logit == current.logit && candidate.token < current.token)
+            }
+        };
+        if wins {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +406,53 @@ mod tests {
             }
             other => panic!("want BadRequest, got {other:?}"),
         }
+    }
+
+    fn candidate(token: u32, logit: f32) -> HeadCandidate {
+        HeadCandidate { token, logit }
+    }
+
+    #[test]
+    fn the_head_merge_follows_the_one_argmax_rule() {
+        // Largest wins; on a tie the lowest global token id, in any order.
+        let tied = [candidate(90, 3.0), candidate(12, 3.0), candidate(40, 2.5)];
+        assert_eq!(merge_head_candidates(&tied), Some(candidate(12, 3.0)));
+        let shuffled = [candidate(40, 2.5), candidate(90, 3.0), candidate(12, 3.0)];
+        assert_eq!(merge_head_candidates(&shuffled), Some(candidate(12, 3.0)));
+        // +infinity wins like a value; NaN never wins, even alone.
+        assert_eq!(
+            merge_head_candidates(&[candidate(1, f32::NAN), candidate(2, f32::INFINITY)]),
+            Some(candidate(2, f32::INFINITY))
+        );
+        assert_eq!(merge_head_candidates(&[candidate(1, f32::NAN)]), None);
+        assert_eq!(merge_head_candidates(&[]), None);
+        // The merged winner over shard maxima equals the unsplit argmax:
+        // split one row at the table's vocab ranges and compare.
+        let table = ShardTable::new(&shape(), 3, 32).expect("table");
+        let row: Vec<f32> = (0..248_320)
+            .map(|i| ((i * 2_654_435_761usize) % 1000) as f32 * 0.001)
+            .collect();
+        let mut shards = Vec::new();
+        for card in 0..3 {
+            let range = table.head_rows(card).expect("vocab range");
+            let (at, &logit) = row[range.clone()].iter().enumerate().fold(
+                (0usize, &f32::NEG_INFINITY),
+                |best, (i, v)| {
+                    if v > best.1 { (i, v) } else { best }
+                },
+            );
+            shards.push(candidate((range.start + at) as u32, logit));
+        }
+        let whole = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+                if v > best.1 { (i, v) } else { best }
+            });
+        assert_eq!(
+            merge_head_candidates(&shards),
+            Some(candidate(whole.0 as u32, whole.1))
+        );
     }
 
     #[test]

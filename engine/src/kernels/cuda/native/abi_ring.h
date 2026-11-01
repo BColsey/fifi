@@ -85,6 +85,17 @@ int inference_cuda_ring_wait_sum_f16(void *stream, float *out,
                                      unsigned long long timeout_cycles,
                                      unsigned *status);
 
+/* Waits until the slot at `peer_slot` carries sequence `seq`, then copies
+ * its `count` f32 payload values to `out` unchanged (bit-exact, so integer
+ * payloads ride it bit-cast through f32). This is the broadcast and
+ * all-gather transport: one publisher, every device copies. Timeout and
+ * status semantics are the wait-sum's. */
+int inference_cuda_ring_wait_copy_f32(void *stream, float *out,
+                                      const void *peer_slot, int count,
+                                      unsigned seq,
+                                      unsigned long long timeout_cycles,
+                                      unsigned *status);
+
 /* The f32-payload form of the wait-sum above. */
 int inference_cuda_ring_wait_sum_f32(void *stream, float *out,
                                      const float *own,

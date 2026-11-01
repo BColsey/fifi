@@ -184,6 +184,17 @@ impl PeerRing {
         Ok(())
     }
 
+    /// The next sequence of the shared stream and its successor. Every ring
+    /// operation (sum, broadcast, gather) takes exactly one, so slot parity
+    /// alternates across operation kinds too.
+    fn take_seq(&self) -> Result<(u32, u32), EngError> {
+        let seq = self.next_seq.get();
+        let Some(next) = seq.checked_add(1) else {
+            return Err(bad("the ring sequence is exhausted; reset the ring".into()));
+        };
+        Ok((seq, next))
+    }
+
     fn slot_address(&self, owner: usize, source: usize, seq: u32) -> Result<u64, EngError> {
         let offset = self.layout.slot_offset(source, seq)?;
         self.bases[owner]
@@ -228,10 +239,7 @@ impl PeerRing {
                 self.layout.max_values
             )));
         }
-        let seq = self.next_seq.get();
-        let Some(next) = seq.checked_add(1) else {
-            return Err(bad("the ring sequence is exhausted; reset the ring".into()));
-        };
+        let (seq, next) = self.take_seq()?;
         let bytes = count * VALUE_BYTES;
         for (source, context) in contexts.iter().enumerate() {
             let src = context.raw_range(&partials[source].range(0, bytes)?)?;
@@ -268,6 +276,140 @@ impl PeerRing {
                     word,
                 )
             })?;
+        }
+        self.next_seq.set(next);
+        Ok(())
+    }
+
+    /// Queues one broadcast: device `source_card` publishes `count` f32
+    /// values of `src` into every device's mailbox (its own included), and
+    /// every device copies them to `outs[i]`. The copy is bit-exact, so
+    /// integer payloads (router picks) ride bit-cast through f32. Status
+    /// handling is the exchange's: read every `statuses[i]` before using
+    /// any output; a timeout leaves the previous contents in place.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn broadcast(
+        &self,
+        contexts: &[CudaContext],
+        streams: &[DeviceStream],
+        source_card: usize,
+        src: &DeviceBuffer,
+        outs: &[&DeviceBuffer],
+        statuses: &[&DeviceBuffer],
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.check_members(contexts, streams.len())?;
+        if source_card >= self.layout.cards {
+            return Err(bad(format!(
+                "broadcast source {source_card} is outside the {}-device ring",
+                self.layout.cards
+            )));
+        }
+        if outs.len() != self.layout.cards || statuses.len() != self.layout.cards {
+            return Err(bad("outs and statuses are one buffer per device".into()));
+        }
+        if count == 0 || count > self.layout.max_values {
+            return Err(bad(format!(
+                "a broadcast of {count} values exceeds the mailbox payload of {}",
+                self.layout.max_values
+            )));
+        }
+        let (seq, next) = self.take_seq()?;
+        let bytes = count * VALUE_BYTES;
+        let publisher = &contexts[source_card];
+        let src_range = publisher.raw_range(&src.range(0, bytes)?)?;
+        for owner in 0..self.layout.cards {
+            let dst = self.slot_address(owner, source_card, seq)?;
+            publisher.launch_on(&streams[source_card], |stream| {
+                native::peer_ring::publish(stream, src_range, dst, count, seq, true)
+            })?;
+        }
+        for (owner, context) in contexts.iter().enumerate() {
+            let out = context.raw_range(&outs[owner].range(0, bytes)?)?;
+            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            let slot = self.slot_address(owner, source_card, seq)?;
+            context.launch_on(&streams[owner], |stream| {
+                native::peer_ring::wait_copy(stream, out, slot, count, seq, TIMEOUT_CYCLES, word)
+            })?;
+        }
+        self.next_seq.set(next);
+        Ok(())
+    }
+
+    /// Queues one all-gather of a row dealt across devices: device `i`
+    /// computed the values `ranges[i]` of a `total` row (its new K or V
+    /// slice, say) in `parts[i]`; afterwards every `outs[i]` holds the full
+    /// row, each slice at its range offset. Only the new row moves —
+    /// anything accumulated from earlier rows already lives in every
+    /// replica. Ranges must be in ring order and exactly tile `total`.
+    /// Status handling is the exchange's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn all_gather_row(
+        &self,
+        contexts: &[CudaContext],
+        streams: &[DeviceStream],
+        parts: &[&DeviceBuffer],
+        outs: &[&DeviceBuffer],
+        statuses: &[&DeviceBuffer],
+        ranges: &[std::ops::Range<usize>],
+        total: usize,
+    ) -> Result<(), EngError> {
+        self.check_members(contexts, streams.len())?;
+        if parts.len() != self.layout.cards
+            || outs.len() != self.layout.cards
+            || statuses.len() != self.layout.cards
+            || ranges.len() != self.layout.cards
+        {
+            return Err(bad(
+                "parts, outs, statuses and ranges are one per device".into()
+            ));
+        }
+        let mut next_start = 0usize;
+        for range in ranges {
+            if range.start != next_start || range.is_empty() || range.len() > self.layout.max_values
+            {
+                return Err(bad(format!(
+                    "gather ranges {ranges:?} do not tile 0..{total} within the mailbox payload"
+                )));
+            }
+            next_start = range.end;
+        }
+        if next_start != total {
+            return Err(bad(format!(
+                "gather ranges end at {next_start}, the row is {total} values"
+            )));
+        }
+        let (seq, next) = self.take_seq()?;
+        for (source, context) in contexts.iter().enumerate() {
+            let count = ranges[source].len();
+            let src = context.raw_range(&parts[source].range(0, count * VALUE_BYTES)?)?;
+            for owner in 0..self.layout.cards {
+                let dst = self.slot_address(owner, source, seq)?;
+                context.launch_on(&streams[source], |stream| {
+                    native::peer_ring::publish(stream, src, dst, count, seq, true)
+                })?;
+            }
+        }
+        for (owner, context) in contexts.iter().enumerate() {
+            let word = context.raw_range(&statuses[owner].range(0, 4)?)?;
+            for (source, range) in ranges.iter().enumerate() {
+                let out = context.raw_range(
+                    &outs[owner].range(range.start * VALUE_BYTES, range.len() * VALUE_BYTES)?,
+                )?;
+                let slot = self.slot_address(owner, source, seq)?;
+                let count = range.len();
+                context.launch_on(&streams[owner], |stream| {
+                    native::peer_ring::wait_copy(
+                        stream,
+                        out,
+                        slot,
+                        count,
+                        seq,
+                        TIMEOUT_CYCLES,
+                        word,
+                    )
+                })?;
+            }
         }
         self.next_seq.set(next);
         Ok(())
@@ -509,6 +651,149 @@ mod device_tests {
         let got = download_f32(&outs[1], &streams[1], 16).expect("download");
         assert_eq!(got[0], 3.75);
         assert_eq!(got[3], 70_000.0 + 1.5);
+    }
+
+    fn two_context_ring(max_values: usize) -> ([CudaContext; 2], [DeviceStream; 2], PeerRing) {
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(0, &admission).expect("context 1"),
+        ];
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, max_values).expect("ring");
+        (contexts, streams, ring)
+    }
+
+    #[test]
+    fn a_broadcast_lands_bit_exact_on_every_device() {
+        if !device_present("a_broadcast_lands_bit_exact_on_every_device") {
+            return;
+        }
+        let (contexts, streams, ring) = two_context_ring(64);
+        // Router-shaped payload: top-8 (id, weight) pairs, ids bit-cast.
+        let mut picks = [0f32; 16];
+        for i in 0..8 {
+            picks[2 * i] = f32::from_bits(100 + i as u32 * 37);
+            picks[2 * i + 1] = 0.125 * (i as f32 + 1.0);
+        }
+        let src = upload_f32(&contexts[1], &streams[1], &picks).expect("src");
+        let outs = [
+            upload_f32(&contexts[0], &streams[0], &[-9.0; 16]).expect("out 0"),
+            upload_f32(&contexts[1], &streams[1], &[-9.0; 16]).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        // Interleave with a sum exchange: both operations share one sequence.
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &[1.0; 16]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &[2.0; 16]).expect("partial 1"),
+        ];
+        let sums = [
+            contexts[0].allocate(64).expect("sum 0"),
+            contexts[1].allocate(64).expect("sum 1"),
+        ];
+        ring.exchange_sum(
+            &contexts,
+            &streams,
+            &[&partials[0], &partials[1]],
+            &[&sums[0], &sums[1]],
+            &[&statuses[0], &statuses[1]],
+            16,
+            RingMode::F32,
+        )
+        .expect("exchange");
+        ring.broadcast(
+            &contexts,
+            &streams,
+            1,
+            &src,
+            &[&outs[0], &outs[1]],
+            &[&statuses[0], &statuses[1]],
+            16,
+        )
+        .expect("broadcast");
+        ring.exchange_sum(
+            &contexts,
+            &streams,
+            &[&partials[0], &partials[1]],
+            &[&sums[0], &sums[1]],
+            &[&statuses[0], &statuses[1]],
+            16,
+            RingMode::F32,
+        )
+        .expect("exchange after broadcast");
+        for (index, stream) in streams.iter().enumerate() {
+            stream.synchronize().expect("sync");
+            assert_eq!(status_of(&statuses[index], stream).expect("status"), 0);
+            let got = download_f32(&outs[index], stream, 16).expect("download picks");
+            for (g, w) in got.iter().zip(&picks) {
+                assert_eq!(g.to_bits(), w.to_bits(), "device {index}");
+            }
+            assert_eq!(
+                download_f32(&sums[index], stream, 16).expect("download sum"),
+                [3.0; 16],
+                "device {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_gather_row_replicates_the_full_row_on_every_device() {
+        if !device_present("an_all_gather_row_replicates_the_full_row_on_every_device") {
+            return;
+        }
+        let (contexts, streams, ring) = two_context_ring(512);
+        // Uneven KV-row slices: 192 values from device 0, 320 from device 1.
+        let full: Vec<f32> = (0..512).map(|i| i as f32 * -0.5).collect();
+        let parts = [
+            upload_f32(&contexts[0], &streams[0], &full[0..192]).expect("part 0"),
+            upload_f32(&contexts[1], &streams[1], &full[192..512]).expect("part 1"),
+        ];
+        let outs = [
+            upload_f32(&contexts[0], &streams[0], &[777.0; 512]).expect("out 0"),
+            upload_f32(&contexts[1], &streams[1], &[777.0; 512]).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        ring.all_gather_row(
+            &contexts,
+            &streams,
+            &[&parts[0], &parts[1]],
+            &[&outs[0], &outs[1]],
+            &[&statuses[0], &statuses[1]],
+            &[0..192, 192..512],
+            512,
+        )
+        .expect("gather");
+        for (index, stream) in streams.iter().enumerate() {
+            stream.synchronize().expect("sync");
+            assert_eq!(status_of(&statuses[index], stream).expect("status"), 0);
+            assert_eq!(
+                download_f32(&outs[index], stream, 512).expect("download"),
+                full,
+                "device {index}"
+            );
+        }
+        // Ranges that do not tile refuse before any launch.
+        assert!(
+            ring.all_gather_row(
+                &contexts,
+                &streams,
+                &[&parts[0], &parts[1]],
+                &[&outs[0], &outs[1]],
+                &[&statuses[0], &statuses[1]],
+                &[0..192, 200..512],
+                512,
+            )
+            .is_err()
+        );
     }
 
     #[test]

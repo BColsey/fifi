@@ -164,6 +164,30 @@ __global__ void wait_sum_kernel(float *out, const float *own,
     }
 }
 
+__global__ void wait_copy_kernel(float *out, const void *slot, int count,
+                                 unsigned seq,
+                                 unsigned long long timeout_cycles,
+                                 unsigned *status) {
+    __shared__ int proceed;
+    if (threadIdx.x == 0) {
+        proceed = 0;
+        if (wait_for_slots(slot, nullptr, nullptr, 1, seq, timeout_cycles)) {
+            proceed = 1;
+        } else {
+            atomicOr(status, kStatusTimeout);
+        }
+    }
+    __syncthreads();
+    if (proceed == 0) {
+        return;
+    }
+    const float *payload = reinterpret_cast<const float *>(
+        reinterpret_cast<const char *>(slot) + kHeaderBytes);
+    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+        out[i] = payload[i];
+    }
+}
+
 bool publish_args_ok(const float *src, const void *dst_slot, int count,
                      unsigned seq) {
     return src != nullptr && dst_slot != nullptr && aligned16(src) &&
@@ -243,6 +267,24 @@ extern "C" int inference_cuda_ring_wait_sum_f16(
         wait_sum_kernel<half><<<1, kThreads, 0, as_stream(stream)>>>(
             out, own, peer_slot0, peer_slot1, peer_slot2, peer_count, count,
             seq, timeout_cycles, status);
+        return finish(cudaGetLastError());
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_ring_wait_copy_f32(
+    void *stream, float *out, const void *peer_slot, int count, unsigned seq,
+    unsigned long long timeout_cycles, unsigned *status) {
+    try {
+        if (out == nullptr || peer_slot == nullptr || status == nullptr ||
+            !aligned16(out) || !aligned16(peer_slot) || count <= 0 ||
+            count > kMaxValues || seq == 0) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        (void)cudaGetLastError();
+        wait_copy_kernel<<<1, kThreads, 0, as_stream(stream)>>>(
+            out, peer_slot, count, seq, timeout_cycles, status);
         return finish(cudaGetLastError());
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
