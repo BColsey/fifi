@@ -74,6 +74,8 @@ use std::fmt;
 
 use super::{
     dims::{KvMode, StepDims, StepOptions},
+    mixer_geometry::MixerGeometry,
+    shard::ShardTable,
     state_layout::align_up,
 };
 use crate::{
@@ -287,7 +289,8 @@ pub(super) enum Phase {
     AttnPrep = 9,
     /// The KV8 append of the Int8G32 step: `kv8_append` quantizes the f32 k and v rows of
     /// `ATTN_PREP` into the code and scale planes, before the decode attention reads them.
-    /// Fp16 plans never enter this phase.
+    /// A single-device Fp16 plan never enters this phase (the fused prep writes the caches
+    /// directly); a CARD Fp16 plan runs `kv_f16_append` here over its gathered rows.
     Kv8Append = 10,
     AttnCore = 11,
     AttnPack = 12,
@@ -506,6 +509,49 @@ impl StepPlan {
         let mut plan = Self::new(dims, 1, options, scratch)?;
         plan.slots.retain(|slot| slot.slot != Slot::AttnPart);
         Self::from_slots(1, plan.slots)
+    }
+
+    /// The slot list of ONE CARD of the multi-device step (Native weights, one row). Replicated
+    /// and summed rows keep the full shape's width — the residual stream, `MixOut`, the router
+    /// and top-k tensors, the final norm — and the head's logits cover only the card's
+    /// vocabulary shard. Sharded widths shrink to the card's extent: the delta and attention
+    /// projections and their activations over the card's head ranges, the expert gate/up packs
+    /// over its inter rows. [`Slot::KRows`] and [`Slot::VRows`] exist under BOTH KV modes at the
+    /// FULL row width: every card's buffer receives the whole gathered row, not its own extent.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device step, its first production caller"
+        )
+    )]
+    pub(super) fn for_card(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+        options: &StepOptions,
+        scratch: &KernelScratch,
+    ) -> Result<Self, EngError> {
+        if options.layout != WeightLayout::Native {
+            return Err(EngError::BadRequest(
+                "card step plan: the multi-device step takes the native layout".to_owned(),
+            ));
+        }
+        scratch.check(dims, 1, options.kv_mode)?;
+        let geometry = MixerGeometry::for_card(dims, table, card)?;
+        let mut list = SlotList {
+            rows: 1,
+            slots: Vec::new(),
+        };
+        list_card_mixers(&mut list, dims, &geometry, scratch)?;
+        list_card_moe(&mut list, dims, table, card, scratch)?;
+        let h = dims.shape.hidden;
+        list.add(Slot::Q8Final, list.q8(h, 1), FINAL_NORM, LM_HEAD)?;
+        list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+        let vocab = table.head_rows(card)?.len();
+        list.add(Slot::Logits, list.row(vocab), LM_HEAD, ARGMAX)?;
+        list.add(Slot::ArgmaxPart, Ok(scratch.argmax_part), ARGMAX, ARGMAX)?;
+        Self::from_slots(1, list.slots)
     }
 
     fn from_slots(rows: usize, slots: Vec<PlannedSlot>) -> Result<Self, EngError> {
@@ -872,7 +918,85 @@ fn list_moe(
     list.add(Slot::SharedOut, list.row(h), down_first, COMBINE)
 }
 
-/// The EXL3 projection scratch of the whole step, shared in stream order by every projection:
+/// The card variant of [`list_mixers`] for the Native multi-device step: every width is the
+/// card's own (`MixerGeometry::for_card`) except the residual rows and the gathered K/V rows,
+/// which stay at the full shape's width (`Slot::KRows`'s card contract).
+fn list_card_mixers(
+    list: &mut SlotList,
+    dims: &StepDims,
+    geometry: &MixerGeometry,
+    scratch: &KernelScratch,
+) -> Result<(), EngError> {
+    let (d, a) = (&geometry.delta, &geometry.attn);
+    let h = dims.shape.hidden;
+    // The gathered rows are the whole cache row, even on a card that holds fewer KV heads:
+    // GatherK/GatherV write the full row and the append consumes it at that width.
+    let kv_width = dims.shape.attn.heads_kv * dims.shape.attn.head_dim;
+    list.add(Slot::ResidA, list.row(h), EMBED, ARGMAX)?;
+    list.add(Slot::ResidB, list.row(h), EMBED, ARGMAX)?;
+    list.add(Slot::Q8Mix, list.q8(h, 1), MIX_PACK, ATTN_IN)?;
+    list.add(Slot::DeltaProj, list.row(d.ld), DELTA_IN, DELTA_RULE)?;
+    list.add(
+        Slot::DeltaConv,
+        list.row(d.channels),
+        DELTA_CONV,
+        DELTA_RULE,
+    )?;
+    list.add(
+        Slot::DeltaCore,
+        list.row(d.value_width),
+        DELTA_RULE,
+        DELTA_PACK,
+    )?;
+    list.add(
+        Slot::Q8DeltaOut,
+        list.q8(d.value_width, 1),
+        DELTA_PACK,
+        DELTA_OUT,
+    )?;
+    list.add(Slot::AttnProj, list.row(a.ld), ATTN_IN, ATTN_CORE)?;
+    list.add(Slot::AttnQ, list.row(a.q_width), ATTN_PREP, ATTN_CORE)?;
+    // BOTH KV modes: the Int8G32 handoff and the Fp16 card path both gather at full width.
+    list.add(Slot::KRows, list.row(kv_width), ATTN_PREP, KV8_APPEND)?;
+    list.add(Slot::VRows, list.row(kv_width), ATTN_PREP, KV8_APPEND)?;
+    list.add(Slot::AttnPart, Ok(scratch.attn_part), ATTN_CORE, ATTN_CORE)?;
+    list.add(Slot::AttnCore, list.row(a.q_width), ATTN_CORE, ATTN_PACK)?;
+    list.add(Slot::Q8AttnOut, list.q8(a.q_width, 1), ATTN_PACK, ATTN_OUT)?;
+    list.add(Slot::MixOut, list.row(h), DELTA_OUT, ADD_NORM)
+}
+
+/// The card variant of [`list_moe`] for the Native multi-device step: the router and top-k
+/// tensors stay full (the router runs once, its picks broadcast), the inter-width packs shrink
+/// to the card's expert rows, and the down/shared outputs stay full hidden width (each card's
+/// partial is summed by the ring exchange).
+fn list_card_moe(
+    list: &mut SlotList,
+    dims: &StepDims,
+    table: &ShardTable,
+    card: usize,
+    scratch: &KernelScratch,
+) -> Result<(), EngError> {
+    let (h, e) = (dims.shape.hidden, &dims.shape.moe);
+    let m = list.rows;
+    let inter = table.expert_inter(card)?.len();
+    let shared_inter = table.shared_inter(card)?.len();
+    list.add(Slot::Q8Moe, list.q8(h, 1), ADD_NORM, GATE_UP)?;
+    // The NATIVE NormRow lifetime: written by the mixer prologue at MIX_PACK, last read by the
+    // argmax over the head's own shard.
+    list.add(Slot::NormRow, list.row(h), MIX_PACK, ARGMAX)?;
+    list.add(Slot::RouterLogits, Ok(scratch.router_logits), ROUTE, ROUTE)?;
+    list.add(Slot::TopkId, product(&[m, e.top_k, I32]), ROUTE, COMBINE)?;
+    list.add(Slot::TopkWeight, list.row(e.top_k), ROUTE, COMBINE)?;
+    list.add(Slot::SharedGate, list.row(1), ROUTE, COMBINE)?;
+    let gate_up = product(&[m, e.top_k, 2 * inter, F32]);
+    list.add(Slot::ExpertGu, gate_up, GATE_UP, DOWN)?;
+    list.add(Slot::Q8Down, list.q8(inter, e.top_k), SWIGLU, DOWN)?;
+    let down = product(&[m, e.top_k, h, F32]);
+    list.add(Slot::ExpertDown, down, DOWN, COMBINE)?;
+    list.add(Slot::SharedGu, list.row(2 * shared_inter), GATE_UP, DOWN)?;
+    list.add(Slot::Q8Shared, list.q8(shared_inter, 1), SWIGLU, DOWN)?;
+    list.add(Slot::SharedOut, list.row(h), DOWN, COMBINE)
+}
 /// the rotated inputs, the split-K partial and the sticky arithmetic flag. The sizes are the
 /// largest any projection of the step needs: mixers, grouped expert launches, the head.
 fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngError> {

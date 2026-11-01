@@ -1,12 +1,14 @@
 //! Unit tests of the mixer geometry and the weight shapes. CPU only.
 use super::{
     common_tests::{dims, plan},
+    dims::{KvMode, StepDims, StepOptions},
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense},
     shard::ShardTable,
-    step_plan::Slot,
+    step_plan::{KernelScratch, Phase, Slot, StepPlan},
 };
 use crate::family::project::cuda::WeightLayout;
 use crate::family::{AttentionKind, gguf_model::Role};
+use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
 #[test]
 fn projection_rows_tile_exactly_and_match_the_plan() {
@@ -194,5 +196,148 @@ fn card_geometries_tile_the_full_geometry() {
             assert_eq!(c.delta.alpha_off + c.delta.alpha_rows, c.delta.ld);
             assert_eq!(c.attn.v_off + c.attn.kv_rows, c.attn.ld);
         }
+    }
+}
+
+/// The Native one-row options of `kv_mode` (the multi-device step's layout).
+fn native_options(kv_mode: KvMode) -> StepOptions {
+    StepOptions {
+        kv_mode,
+        context_tokens: 1024,
+        delta_slots: 1,
+        forked_experts: false,
+        tiered: None,
+        layout: WeightLayout::Native,
+    }
+}
+
+fn native_plan(d: &StepDims, kv_mode: KvMode) -> StepPlan {
+    let options = native_options(kv_mode);
+    let scratch = KernelScratch::for_dims(d, 1, kv_mode).expect("scratch");
+    StepPlan::new(d, 1, &options, &scratch).expect("single-device plan")
+}
+
+fn card_plan(d: &StepDims, cards: usize, card: usize, kv_mode: KvMode) -> StepPlan {
+    let table = ShardTable::new(&d.shape, cards, 32).expect("table");
+    let options = native_options(kv_mode);
+    let scratch = KernelScratch::for_dims(d, 1, kv_mode).expect("scratch");
+    StepPlan::for_card(d, &table, card, &options, &scratch).expect("card plan")
+}
+
+/// (slot, bytes, first phase, last phase) of every slot, in plan order.
+fn describe(plan: &StepPlan) -> Vec<(Slot, usize, usize, usize)> {
+    plan.tensors()
+        .iter()
+        .map(|s| (s.slot, s.bytes, s.first, s.last))
+        .collect()
+}
+
+#[test]
+fn a_one_card_plan_is_the_single_device_native_plan_plus_the_gathered_rows() {
+    let d = dims();
+    let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;
+    for kv_mode in [KvMode::Fp16, KvMode::Int8G32] {
+        let mut want = describe(&native_plan(&d, kv_mode));
+        if kv_mode == KvMode::Fp16 {
+            // The single-device Fp16 plan has no gathered rows; the card plan adds them at the
+            // exact Int8G32 handoff lifetime. The expected order is the single-device Int8G32
+            // list, whose own KRows/VRows sit where list_mixers adds them.
+            let kv8 = describe(&native_plan(&d, KvMode::Int8G32));
+            assert_eq!(want.len() + 2, kv8.len(), "{kv_mode:?}");
+            let mut at = 0;
+            for expected in &kv8 {
+                if matches!(expected.0, Slot::KRows | Slot::VRows) {
+                    assert_eq!(
+                        (expected.2, expected.3),
+                        (Phase::AttnPrep as usize, Phase::Kv8Append as usize)
+                    );
+                    assert_eq!(expected.1, kv_width * 4, "{kv_mode:?}: full-row gather");
+                } else {
+                    assert_eq!(&want[at], expected, "{kv_mode:?}");
+                    at += 1;
+                }
+            }
+            want = kv8;
+        }
+        let got = describe(&card_plan(&d, 1, 0, kv_mode));
+        assert_eq!(got, want, "{kv_mode:?}: one card must change nothing else");
+    }
+}
+
+#[test]
+fn card_plans_gather_full_row_kv_and_tile_the_sharded_widths() {
+    let d = dims();
+    let single = native_plan(&d, KvMode::Int8G32);
+    let bytes = |plan: &StepPlan, slot: Slot| plan.tensors()[plan.index(slot).expect("slot")].bytes;
+    let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;
+    for cards in [2, 3] {
+        let table = ShardTable::new(&d.shape, cards, 32).expect("table");
+        let (mut gu_sum, mut logits_sum) = (0, 0);
+        for card in 0..cards {
+            for kv_mode in [KvMode::Fp16, KvMode::Int8G32] {
+                let plan = card_plan(&d, cards, card, kv_mode);
+                // Full-row gathers under BOTH modes: the whole cache row, not the card's extent.
+                for slot in [Slot::KRows, Slot::VRows] {
+                    assert_eq!(
+                        bytes(&plan, slot),
+                        kv_width * 4,
+                        "{cards}/{card} {kv_mode:?}"
+                    );
+                }
+                // Replicated rows stay full width.
+                for slot in [Slot::ResidA, Slot::ResidB, Slot::MixOut, Slot::NormRow] {
+                    assert_eq!(
+                        bytes(&plan, slot),
+                        d.shape.hidden * 4,
+                        "{cards}/{card} {slot:?}"
+                    );
+                }
+                // The projections shrink to the card geometry the kernels launch with.
+                let g = MixerGeometry::for_card(&d, &table, card).expect("card geometry");
+                assert_eq!(bytes(&plan, Slot::DeltaProj), g.delta.ld * 4);
+                assert_eq!(bytes(&plan, Slot::AttnProj), g.attn.ld * 4);
+                assert_eq!(bytes(&plan, Slot::AttnQ), g.attn.q_width * 4);
+            }
+            let plan = card_plan(&d, cards, card, KvMode::Int8G32);
+            gu_sum += bytes(&plan, Slot::ExpertGu);
+            logits_sum += bytes(&plan, Slot::Logits);
+            // The inter-width pack shrinks to the card's own padded rows (q8_1 pads per
+            // block, so the card packs do not sum to the single-device pack).
+            assert_eq!(
+                bytes(&plan, Slot::Q8Down),
+                q8_1_bytes(
+                    table.expert_inter(card).expect("inter").len(),
+                    d.shape.moe.top_k
+                )
+                .expect("q8 pack"),
+                "{cards}/{card}: Q8Down"
+            );
+        }
+        // The linear f32 tensors of the sharded widths tile the single-device sizes.
+        assert_eq!(
+            gu_sum,
+            bytes(&single, Slot::ExpertGu),
+            "{cards} cards: ExpertGu"
+        );
+        assert_eq!(logits_sum, d.shape.vocab * 4, "{cards} cards: Logits");
+    }
+}
+
+#[test]
+fn card_plans_refuse_the_non_native_layouts() {
+    let d = dims();
+    for layout in [WeightLayout::Tiled, WeightLayout::Exl3] {
+        let options = StepOptions {
+            layout,
+            ..native_options(KvMode::Fp16)
+        };
+        let table = ShardTable::new(&d.shape, 2, 32).expect("table");
+        let scratch = KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch");
+        let error = StepPlan::for_card(&d, &table, 0, &options, &scratch)
+            .expect_err("non-native card plan");
+        assert!(
+            format!("{error:?}").contains("multi-device step takes the native layout"),
+            "{error:?}"
+        );
     }
 }
