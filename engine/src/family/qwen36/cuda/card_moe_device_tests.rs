@@ -132,7 +132,7 @@ fn expert_col_slice(
     range: std::ops::Range<usize>,
 ) -> Vec<u8> {
     assert!(
-        range.start % Q4K_VALUES == 0 && range.end % Q4K_VALUES == 0,
+        range.start.is_multiple_of(Q4K_VALUES) && range.end.is_multiple_of(Q4K_VALUES),
         "the column cut must sit on Q4_K row blocks"
     );
     let blocks = k / Q4K_VALUES;
@@ -509,25 +509,17 @@ fn run_rig() -> Result<Evidence, EngError> {
         }
         let reference_run = read_run(&stack.streams()[0], &ref_bufs)?;
         let mut card_runs = Vec::with_capacity(2);
-        for card in 0..2 {
-            let ctx = &stack.contexts()[card];
-            let stream = &stack.streams()[card];
-            card_bufs[card]
-                .norm
-                .write_at(stream, 0, &f32_bytes(&s.norms[t]))?;
-            card_bufs[card]
-                .resid
-                .write_at(stream, 0, &f32_bytes(&s.resids[t]))?;
-            produce(ctx, stream, &card_bufs[card])?;
+        for ((ctx, stream), bufs) in stack.contexts().iter().zip(stack.streams()).zip(&card_bufs) {
+            bufs.norm.write_at(stream, 0, &f32_bytes(&s.norms[t]))?;
+            bufs.resid.write_at(stream, 0, &f32_bytes(&s.resids[t]))?;
+            produce(ctx, stream, bufs)?;
         }
-        let buf_sets: Vec<MoeBuffers<'_>> = card_bufs
-            .iter()
-            .map(|b| moe_bufs(b))
-            .collect::<Result<_, _>>()?;
+        let buf_sets: Vec<MoeBuffers<'_>> =
+            card_bufs.iter().map(moe_bufs).collect::<Result<_, _>>()?;
         run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
-        for card in 0..2 {
-            stack.streams()[card].synchronize()?;
-            card_runs.push(read_run(&stack.streams()[card], &card_bufs[card])?);
+        for (stream, bufs) in stack.streams().iter().zip(&card_bufs) {
+            stream.synchronize()?;
+            card_runs.push(read_run(stream, bufs)?);
         }
         tokens.push((reference_run, card_runs));
     }
@@ -574,10 +566,8 @@ fn a_moe_block_runs_distributed_and_matches_the_reference() {
     let dims = &ev.dims;
     let gu_stride = |d: &MoeDims| d.inter * 2;
     let pack_row = |d: &MoeDims| q8_1_bytes(d.inter, 1).expect("q8 row");
-    let shared_pack_row = |d: &MoeDims| q8_1_bytes(d.shared_inter, 1).expect("q8 row");
     for (t, (reference, cards)) in ev.tokens.iter().enumerate() {
-        for card in 0..2 {
-            let run = &cards[card];
+        for (card, run) in cards.iter().enumerate() {
             let cd = &ev.card_dims[card];
             // The router's broadcast: ids, weights and the shared gate exact.
             assert_eq!(

@@ -20,17 +20,6 @@
 //! `kv_f16_append: <rule>`; size, alignment and overlap are refused by `require_fit` and
 //! `require_apart` with their own texts.
 
-// Staged with the multi-device card step: the wrapper's first production
-// caller is the card driver; until then only the device rigs call it,
-// which the lib target does not see.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device card step, its first production caller"
-    )
-)]
-
 use std::ffi::c_int;
 
 use crate::EngError;

@@ -109,15 +109,17 @@ struct Evidence {
     mix_out_ref: Vec<f32>,
     resid_out_ref: Vec<f32>,
     core_ref: Vec<f32>,
-    planes_ref: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    planes_ref: Planes,
     rows_after_gather: Vec<(Vec<f32>, Vec<f32>)>,
     mix_out: Vec<Vec<f32>>,
     resid_out: Vec<Vec<f32>>,
     core: Vec<Vec<f32>>,
-    planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    planes: Vec<Planes>,
     head_runs: Vec<std::ops::Range<usize>>,
     words: Vec<u32>,
 }
+
+type Planes = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
     let d = step_dims();
@@ -799,7 +801,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
     let read_ref_state = |state: &ResidentState| -> Result<(Vec<f32>, Vec<f32>), EngError> {
         let rec = state.delta_rec(0, ordinal)?;
         let conv = state.delta_conv(0, ordinal)?;
-        let mut read = |view: crate::kernels::cuda::DeviceRange<'_>| -> Result<Vec<f32>, EngError> {
+        let read = |view: crate::kernels::cuda::DeviceRange<'_>| -> Result<Vec<f32>, EngError> {
             let mut bytes = vec![0u8; view.bytes()];
             view.buffer().read_at(stream0, view.offset(), &mut bytes)?;
             Ok(bytes
@@ -999,7 +1001,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
         let state = stack.shards()[card].state();
         let rec = state.delta_rec(0, ordinal)?;
         let conv = state.delta_conv(0, ordinal)?;
-        let mut read = |view: crate::kernels::cuda::DeviceRange<'_>| -> Result<Vec<f32>, EngError> {
+        let read = |view: crate::kernels::cuda::DeviceRange<'_>| -> Result<Vec<f32>, EngError> {
             let mut bytes = vec![0u8; view.bytes()];
             view.buffer().read_at(stream, view.offset(), &mut bytes)?;
             Ok(bytes

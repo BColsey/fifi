@@ -451,12 +451,10 @@ mod device_tests {
                 RingMode::F32,
             )
             .expect("the fresh exchange");
-        for card in 0..2 {
-            stack.streams()[card].synchronize().expect("sync");
+        for (card, (stream, out)) in stack.streams().iter().zip(outs.iter()).enumerate().take(2) {
+            stream.synchronize().expect("sync");
             let mut bytes = vec![0u8; n * 4];
-            outs[card]
-                .read_at(&stack.streams()[card], 0, &mut bytes)
-                .expect("read");
+            out.read_at(stream, 0, &mut bytes).expect("read");
             let got: Vec<f32> = bytes
                 .as_chunks::<4>()
                 .0

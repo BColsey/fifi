@@ -165,10 +165,14 @@ fn card_geometries_tile_the_full_geometry() {
             g.attn.q_width,
             "{cards} cards: o columns"
         );
+        // Since the key channels are replicated on every card (the DeltaNet
+        // cross-card fix), only the value channels tile; raw channel sums
+        // double-count the replicated keys.
+        let key_channels = g.delta.channels - g.delta.value_width;
         assert_eq!(
             sum(&|c| c.delta.channels),
-            g.delta.channels,
-            "{cards} cards: conv channels"
+            g.delta.channels + (cards - 1) * key_channels,
+            "{cards} cards: conv channels (keys replicated, values tiled)"
         );
         assert_eq!(
             sum(&|c| c.delta.z_rows),
@@ -177,8 +181,8 @@ fn card_geometries_tile_the_full_geometry() {
         );
         assert_eq!(
             sum(&|c| c.delta.key_heads),
-            g.delta.key_heads,
-            "{cards} cards: key heads"
+            cards * g.delta.key_heads,
+            "{cards} cards: key heads (replicated)"
         );
         // The replicated widths stay full on every card.
         for card in 0..cards {

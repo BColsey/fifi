@@ -684,7 +684,9 @@ mod card_ops_tests {
             );
             assert!(matches!(
                 at(8),
-                BlockOp::AttnDecode { .. } | BlockOp::AttnDecodeQ8 { .. }
+                BlockOp::AttnDecode { .. }
+                    | BlockOp::AttnDecodeQ8 { .. }
+                    | BlockOp::AttnDecodeQ8Card { .. }
             ));
             // The out projection closes the block with the card's partial.
             assert!(ops.len() > 9);

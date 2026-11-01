@@ -781,7 +781,7 @@ fn attn_ops_card(
             // kv-head range of the replicated plane.
             let head_dim = a.head_dim;
             let groups = attn_decode_q8::GROUP;
-            if a.heads_q % groups != 0 {
+            if !a.heads_q.is_multiple_of(groups) {
                 return Err(EngError::BadRequest(format!(
                     "card attn: the card's {} query heads are not whole groups of {groups}; \
                      the q8 decode cannot split them",
@@ -790,7 +790,7 @@ fn attn_ops_card(
             }
             let span = a.heads_q / groups;
             let kv_heads = (k_range.0 / head_dim, k_range.0 / head_dim + span);
-            if k_range.0 % head_dim != 0 || k_range.1 / head_dim != kv_heads.1 {
+            if !k_range.0.is_multiple_of(head_dim) || k_range.1 / head_dim != kv_heads.1 {
                 return Err(EngError::BadRequest(format!(
                     "card attn: kv rows {k_range:?} do not cover the card's {span} kv heads"
                 )));

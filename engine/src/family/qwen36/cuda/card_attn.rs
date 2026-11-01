@@ -23,13 +23,6 @@ use super::mixer_geometry::MixerGeometry;
 /// card prep. Two cards of the 35B shape (8 KV heads of 256 rows) split
 /// evenly; a table whose deal does not is refused here, in planning, not
 /// mis-prepped mid-token.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device step, its first production caller"
-    )
-)]
 pub(super) fn card_kv_heads(k_range: (usize, usize), head_dim: usize) -> Result<usize, EngError> {
     let (start, end) = k_range;
     if start % head_dim != 0 || end % head_dim != 0 {
@@ -45,13 +38,6 @@ pub(super) fn card_kv_heads(k_range: (usize, usize), head_dim: usize) -> Result<
 /// and fused row, one decode row, over a cache of `capacity` cells. The
 /// same builder states the one-context reference shape of the rig (the
 /// full geometry with the full head counts).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device step, its first production caller"
-    )
-)]
 pub(super) fn card_prep_shape(
     g: &MixerGeometry,
     kv_heads: usize,
@@ -75,13 +61,6 @@ pub(super) fn card_prep_shape(
 /// buffer: the range's global first K row, as f32 bytes. Whole heads keep
 /// the slice 16-byte aligned, which the rows entry's own fit checks then
 /// re-prove on the range it is handed.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device step, its first production caller"
-    )
-)]
 pub(super) fn card_slice_offset(k_range: (usize, usize)) -> usize {
     k_range.0 * 4
 }

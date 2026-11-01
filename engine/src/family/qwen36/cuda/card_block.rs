@@ -274,9 +274,9 @@ pub(crate) fn run_card_moe_block(
                 let hidden = bufs[0].route.resid_in.bytes() / 4;
                 for slot in 0..top_k {
                     let mut partials = Vec::with_capacity(cards);
-                    for card in 0..cards {
-                        partials.push(bufs[card].expert.expert_down.buffer().range(
-                            bufs[card].expert.expert_down.offset() + slot * hidden * F32,
+                    for buf in bufs {
+                        partials.push(buf.expert.expert_down.buffer().range(
+                            buf.expert.expert_down.offset() + slot * hidden * F32,
                             hidden * F32,
                         )?);
                     }

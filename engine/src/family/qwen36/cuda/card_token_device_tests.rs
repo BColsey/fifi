@@ -529,15 +529,17 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
     let ctx0 = &stack.contexts()[0];
     let stream0 = &stack.streams()[0];
     let hidden = d.shape.hidden;
-    let vocab = shape.vocab as usize;
+    let vocab = shape.vocab;
     let eps = d.shape.eps;
     let table = ShardTable::new(&d.shape, 2, 32)?;
 
     // ---- The fixtures, one rng stream over the whole model.
     let mut rng = Rng::new(0x707_0E7);
     let geometry_full = MixerGeometry::new(&d)?;
-    let mut dense_sources: Vec<(AttentionKind, Vec<(Role, Vec<u8>, usize, usize)>)> = Vec::new();
-    let mut raw_sources: Vec<(AttentionKind, Vec<(Role, Vec<f32>)>)> = Vec::new();
+    type DenseSource = Vec<(Role, Vec<u8>, usize, usize)>;
+    type RawSource = Vec<(Role, Vec<f32>)>;
+    let mut dense_sources: Vec<(AttentionKind, DenseSource)> = Vec::new();
+    let mut raw_sources: Vec<(AttentionKind, RawSource)> = Vec::new();
     let unique_kinds: Vec<AttentionKind> = {
         let mut seen = Vec::new();
         for &kind in &kinds {
@@ -627,7 +629,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         let raws = raw_sources
             .iter()
             .find(|(k, _)| *k == kind)
-            .and_then(|(_, r)| Some(r))
+            .map(|(_, r)| r)
             .ok_or_else(|| EngError::Checkpoint("ref: no raws".into()))?;
         let raw_bufs: Vec<(Role, DeviceBuffer)> = raws
             .iter()
@@ -686,7 +688,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         .map(|(owned, (router, shared))| owned.moe(router, shared))
         .collect();
     let ref_moe_view =
-        |parity: usize, slot: Slot| -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
+        |_parity: usize, slot: Slot| -> Result<crate::kernels::cuda::DeviceRange<'_>, EngError> {
             let at = plan_ref
                 .index(slot)
                 .ok_or_else(|| EngError::Checkpoint(format!("ref moe: no {slot:?} slot")))?;
@@ -782,7 +784,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             let raws = raw_sources
                 .iter()
                 .find(|(k, _)| *k == kind)
-                .and_then(|(_, r)| Some(r))
+                .map(|(_, r)| r)
                 .ok_or_else(|| EngError::Checkpoint("card: no raws".into()))?;
             let card_raw: Vec<(Role, DeviceBuffer)> = raws
                 .iter()
@@ -892,7 +894,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         })
         .collect::<Result<_, _>>()?;
     let output_norms: Vec<DeviceBuffer> = (0..2)
-        .map(|card| Ok::<_, EngError>(stack.contexts()[card].upload(&f32_bytes(&output_norm))?))
+        .map(|card| stack.contexts()[card].upload(&f32_bytes(&output_norm)))
         .collect::<Result<_, _>>()?;
     let block_ops: Vec<Vec<&[CardOp]>> = ops_owned
         .iter()
@@ -930,7 +932,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
     // mode feeds the reference its OWN id, so sequence equality proves
     // the coordinator's real feedback path.
     let mut ref_token = FIRST_TOKEN;
-    let mut card_token = FIRST_TOKEN;
+    let mut card_token;
     for t in 0..tokens {
         // The reference step first. The local borrows keep the fn-scope
         // ones dead here, so the driver's `&mut stack` below is free.
@@ -953,7 +955,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                     m: 1,
                 },
             )?;
-            for l in 0..layers {
+            for (l, moe) in moe_ref.iter().enumerate() {
                 mixers_ref.run_block(
                     stream0,
                     &state_ref,
@@ -991,7 +993,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                         ctx: ctx0,
                         stream: stream0,
                     },
-                    &moe_ref[l],
+                    moe,
                     &ref_moe_set,
                     &moe_full_dims,
                 )?;

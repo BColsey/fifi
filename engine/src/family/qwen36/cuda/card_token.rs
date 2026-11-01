@@ -160,7 +160,7 @@ pub(crate) fn run_card_token(
     // step, at the card's narrowed intermediate widths.
     let moe_bufs = |parity: usize| -> Result<Vec<MoeBuffers<'_>>, EngError> {
         let mut sets = Vec::with_capacity(cards);
-        for card in 0..cards {
+        for (card, status) in statuses.iter().enumerate() {
             let route = RouteBufs {
                 resid_in: view(card, resid_in(parity))?,
                 resid_out: view(card, resid_out(parity))?,
@@ -169,7 +169,7 @@ pub(crate) fn run_card_token(
                 ids: view(card, Slot::TopkId)?,
                 weights: view(card, Slot::TopkWeight)?,
                 shared_gate: view(card, Slot::SharedGate)?,
-                status: statuses[card],
+                status: *status,
             };
             let expert = ExpertBufs {
                 packs: Packs::Q8 {

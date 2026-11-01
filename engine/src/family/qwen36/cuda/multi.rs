@@ -32,11 +32,9 @@
 //! Every card queues ALL of its work - its local kernels and its ring
 //! participation (the publish of its partial and its wait for the peers')
 //! - on ONE stream, in the global exchange order. The four properties the
-//! executor must preserve for each exchange:
+//!   executor must preserve for each exchange:
 //!
-//! 1. The producer kernels precede the card's publish in that stream's
-//!    order (the publish is queued on the PRODUCER's stream, inside the
-//!    ring operation).
+//! 1. The producer kernels precede the card's publish in that stream's order (the publish is queued on the PRODUCER's stream, inside the ring operation).
 //! 2. No consumer reads an exchange's result before every participant
 //!    published: the mailbox sequence handshake enforces this on the
 //!    device - the wait spins until the peer's slot carries the current
