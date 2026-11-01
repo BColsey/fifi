@@ -214,9 +214,12 @@ pub(crate) enum Slot {
     /// f32 `[rows][attn_proj]`: per query head `[q | gate]`, then k, then v.
     AttnProj,
     AttnQ,
-    /// f32 `[rows][n_kv_head][head_dim]` k rows of the Int8G32 KV handoff: written by the
-    /// rows entry of `attn_prep` at `ATTN_PREP`, quantized into the code and scale planes
-    /// by `kv8_append` at `KV8_APPEND`. Present only under `KvMode::Int8G32`.
+    /// f32 `[rows][n_kv_head][head_dim]` k rows of the KV handoff: written by the
+    /// rows entry of `attn_prep` at `ATTN_PREP`, consumed by `kv8_append` or
+    /// `kv_f16_append` at `KV8_APPEND`. In single-device plans present only under
+    /// `KvMode::Int8G32` (the fused fp16 path writes the caches directly); in CARD
+    /// plans present under BOTH modes, and sized at the FULL row width — every
+    /// card's buffer receives the whole gathered row, not its own extent.
     KRows,
     /// The v twin of [`Slot::KRows`]: the unchanged, un-roped v rows of the same handoff.
     VRows,
