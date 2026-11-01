@@ -4,9 +4,11 @@
 //! One [`ShardTable`] is built from the layout record ([`HostShape`]), a card
 //! count, and the K-alignment the column-sharded weights need. It owns every
 //! range a loader or a step shard may ask for, so no other module deals heads
-//! or widths by hand. Ranges are dealt in contiguous runs; when a count does
-//! not divide, the earlier cards take one extra unit (16 query heads on 3
-//! cards deal 6/5/5). A table for one card is the full range everywhere,
+//! or widths by hand. Ranges are dealt in contiguous runs; when a count
+//! does not divide, the earlier cards take one extra unit. Full attention
+//! is the exception: its query heads move in whole 8-head groups (the
+//! decode kernel's `n_head == 8 * n_kv_head` grouping), so 16 query heads
+//! on 3 cards refuse rather than deal 6/5/5. A table for one card is the full range everywhere,
 //! which is what keeps the single-device path the degenerate case of this
 //! arithmetic rather than a second code path.
 //!
@@ -16,10 +18,13 @@
 //!   ratio of `HostShape`), and a run never splits a key head's value heads,
 //!   so the recurrent state, the conv channels and the `out` columns of a
 //!   group stay on one card.
-//! - Full attention is dealt by **query head**. The shard unit of `AttnQ` is
-//!   one head's fused query-then-gate rows. Qwen3.6 has only 2 KV heads, so
-//!   the K/V rows are dealt by value blocks instead of heads and the KV cache
-//!   itself stays replicated (the step all-gathers each new K/V row).
+//! - Full attention is dealt by **query-head group**. The shard unit of
+//!   `AttnQ` is one head's fused query-then-gate rows, but the decode
+//!   kernel serves exactly eight query heads per K/V head, and a card
+//!   decodes its query heads against its own K/V slice of the replicated
+//!   row, so runs keep whole 8-head groups: 16 query heads on 2 cards deal
+//!   8/8, each card owning the K/V head its group reads (the step
+//!   all-gathers each new K/V row, so the cache stays replicated).
 //! - Experts are dealt by **intermediate width inside every expert**, in
 //!   32-value blocks, so every card holds a slice of every expert and routing
 //!   never moves activations between cards.
@@ -43,6 +48,13 @@ use crate::family::project::cuda::SliceSpec;
 
 /// Values per dealt block of an expert's intermediate width and of a K/V row.
 pub(crate) const VALUE_BLOCK: usize = 32;
+
+/// The decode kernel serves exactly eight query heads per K/V head
+/// (`n_head == 8 * n_kv_head`, resident/attn_decode.h), and a card
+/// decodes its dealt query heads against its OWN K/V slice of the
+/// replicated row (`card_prep_shape`). Legal runs therefore keep whole
+/// 8-head query groups, each card's K/V rows following its groups.
+pub(crate) const ATTN_Q_PER_KV_HEAD: usize = 8;
 
 fn refuse(message: String) -> EngError {
     EngError::BadRequest(format!("shard table: {message}"))
@@ -173,6 +185,13 @@ impl ShardTable {
             return Err(refuse("a shard table needs at least one card".to_owned()));
         }
         let (d, a, m) = (&shape.delta, &shape.attn, &shape.moe);
+        if a.heads_q != ATTN_Q_PER_KV_HEAD * a.heads_kv {
+            return Err(refuse(format!(
+                "attention geometry {} query heads over {} K/V heads is not the decode \
+                 kernel's 8-per-head grouping; per-card decode cannot run it",
+                a.heads_q, a.heads_kv
+            )));
+        }
         // The delta kernel pairs value head h with key head h % TOTAL key
         // heads, so a card's value heads need keys from across the whole
         // model whenever the value/key ratio exceeds 1. Keys therefore
@@ -180,8 +199,20 @@ impl ShardTable {
         // heads are dealt.
         let key_heads = vec![0..d.key_heads; cards];
         let value_heads = deal(d.value_heads, 1, cards, "DeltaNet value heads")?;
-        let query_heads = deal(a.heads_q, 1, cards, "attention query heads")?;
-        let kv_rows = deal(a.heads_kv * a.head_dim, VALUE_BLOCK, cards, "K/V rows")?;
+        let query_heads = deal(
+            a.heads_q,
+            ATTN_Q_PER_KV_HEAD,
+            cards,
+            "attention query heads",
+        )?;
+        // K/V rows follow the query groups: the card holding group g
+        // stores, and decodes against, K/V head g's rows.
+        let kv_rows = query_heads
+            .iter()
+            .map(|q| {
+                q.start / ATTN_Q_PER_KV_HEAD * a.head_dim..q.end / ATTN_Q_PER_KV_HEAD * a.head_dim
+            })
+            .collect();
         let inter = deal(m.inter, VALUE_BLOCK, cards, "expert intermediate")?;
         let shared_inter = deal(m.shared_inter, VALUE_BLOCK, cards, "shared intermediate")?;
         let vocab = deal(shape.vocab, 1, cards, "vocabulary")?;
@@ -238,7 +269,7 @@ impl ShardTable {
             (
                 runs.query_heads.as_slice(),
                 shape.attn.heads_q,
-                1,
+                ATTN_Q_PER_KV_HEAD,
                 "attention query heads",
             ),
             (
@@ -284,6 +315,35 @@ impl ShardTable {
         check_k_cuts(&attn_o, k_align, "attention o")?;
         check_k_cuts(&runs.inter, k_align, "expert down")?;
         check_k_cuts(&runs.shared_inter, k_align, "shared down")?;
+        if shape.attn.heads_q != ATTN_Q_PER_KV_HEAD * shape.attn.heads_kv {
+            return Err(refuse(format!(
+                "attention geometry {} query heads over {} K/V heads is not the decode \
+                 kernel's 8-per-head grouping",
+                shape.attn.heads_q, shape.attn.heads_kv
+            )));
+        }
+        for card in 0..cards {
+            let q = &runs.query_heads[card];
+            let kv = &runs.kv_rows[card];
+            if !kv.len().is_multiple_of(shape.attn.head_dim) {
+                return Err(refuse(format!(
+                    "card {card} holds {} K/V rows, which split a {}-row head",
+                    kv.len(),
+                    shape.attn.head_dim
+                )));
+            }
+            let kv_heads_card = kv.len() / shape.attn.head_dim;
+            if q.len() != ATTN_Q_PER_KV_HEAD * kv_heads_card
+                || q.start != kv.start / shape.attn.head_dim * ATTN_Q_PER_KV_HEAD
+            {
+                return Err(refuse(format!(
+                    "card {card} holds {} query heads over {} K/V heads; the decode kernel \
+                     groups 8 query heads per K/V head, so runs must keep whole groups",
+                    q.len(),
+                    kv_heads_card
+                )));
+            }
+        }
         Ok(Self {
             cards,
             key_heads: vec![0..shape.delta.key_heads; cards],
@@ -572,9 +632,9 @@ mod tests {
     }
 
     #[test]
-    fn every_width_partitions_for_one_to_four_cards() {
+    fn every_width_partitions_for_one_and_two_cards() {
         let shape = shape();
-        for cards in 1..=4 {
+        for cards in 1..=2 {
             let table = ShardTable::new(&shape, cards, 32).expect("table");
             // Keys replicate (the delta kernel pairs value head h with key
             // head h % 16, so every card needs all of them); values deal.
@@ -595,6 +655,17 @@ mod tests {
             assert_partition(&runs(&table, ShardTable::shared_inter), 512, "shared inter");
             assert_partition(&runs(&table, ShardTable::head_rows), 248_320, "vocab");
         }
+        // The 16 query heads are two whole 8-head decode groups; three
+        // and four cards cannot each own one, so the table refuses by
+        // name instead of dealing heads the kernel cannot run.
+        for cards in 3..=4 {
+            match ShardTable::new(&shape, cards, 32) {
+                Err(EngError::BadRequest(message)) => {
+                    assert!(message.contains("attention query heads"), "{message}");
+                }
+                other => panic!("{cards} cards must refuse, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -610,45 +681,64 @@ mod tests {
     }
 
     #[test]
-    fn three_cards_deal_the_documented_uneven_runs() {
-        let table = ShardTable::new(&shape(), 3, 32).expect("three cards");
-        assert_eq!(
-            runs(&table, ShardTable::key_heads),
-            vec![0..16, 0..16, 0..16]
-        );
-        assert_eq!(
-            runs(&table, ShardTable::value_heads),
-            vec![0..11, 11..22, 22..32]
-        );
-        assert_eq!(
-            runs(&table, ShardTable::query_heads),
-            vec![0..6, 6..11, 11..16]
-        );
-        // 16 blocks of 32 dealt 6/5/5: the earlier card takes the extra block.
+    fn two_cards_deal_the_documented_runs_and_three_refuse() {
+        let table = ShardTable::new(&shape(), 2, 32).expect("two cards");
+        assert_eq!(runs(&table, ShardTable::key_heads), vec![0..16, 0..16]);
+        assert_eq!(runs(&table, ShardTable::value_heads), vec![0..16, 16..32]);
+        // Query heads move in whole 8-head groups (the decode kernel
+        // serves 8 query heads per K/V head); K/V rows follow the groups.
+        assert_eq!(runs(&table, ShardTable::query_heads), vec![0..8, 8..16]);
+        assert_eq!(runs(&table, ShardTable::kv_rows), vec![0..256, 256..512]);
+        // 16 blocks of 32 dealt 8/8: the earlier card takes the extra block.
         assert_eq!(
             runs(&table, ShardTable::expert_inter),
-            vec![0..192, 192..352, 352..512]
+            vec![0..256, 256..512]
         );
-        // The middle card's qkv segments: replicated key channels (q, k in
-        // full) and its dealt value channels 11..22.
+        // Card 1's qkv segments: replicated key channels (q, k in full)
+        // and its dealt value channels 16..32.
         assert_eq!(
             table.delta_qkv_segments(1).expect("segments"),
-            [0..2048, 2048..4096, 5504..6912]
+            [0..2048, 2048..4096, 6144..8192]
         );
+        // Three cards cannot each own one of the two query groups.
+        let error = ShardTable::new(&shape(), 3, 32).expect_err("three cards must refuse");
+        match error {
+            EngError::BadRequest(message) => {
+                assert!(message.contains("attention query heads"), "{message}");
+            }
+            other => panic!("want BadRequest, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_cut_inside_a_quantization_block_is_refused_by_name() {
-        // At alignment 256 the three-card value-head deal [11, 11, 10] cuts
-        // the DeltaNet out columns at 11 * 128 = 1408 first (the value heads
-        // deal at grain 1, so the out-column cut lands mid-block); expert
-        // down would refuse later at 192. The refusal names the first cut.
-        ShardTable::new(&shape(), 2, 256).expect("two cards at 256");
-        let error = ShardTable::new(&shape(), 3, 256).expect_err("three cards at 256 refuse");
+        // A 17/15 value-head deal cuts the DeltaNet out columns at
+        // 17 * 128 = 2176, mid-way through a 256-value superblock (value
+        // heads deal at grain 1, so the cut may land mid-block). The
+        // refusal names the first bad cut.
+        let even = ShardTable::new(&shape(), 2, 256).expect("two cards at 256");
+        let bad = ShardRuns {
+            value_heads: vec![0..17, 17..32],
+            query_heads: (0..2)
+                .map(|c| even.query_heads(c).expect("q run"))
+                .collect(),
+            kv_rows: (0..2).map(|c| even.kv_rows(c).expect("kv run")).collect(),
+            inter: (0..2)
+                .map(|c| even.expert_inter(c).expect("inter run"))
+                .collect(),
+            shared_inter: (0..2)
+                .map(|c| even.shared_inter(c).expect("shared run"))
+                .collect(),
+            vocab: (0..2)
+                .map(|c| even.head_rows(c).expect("vocab run"))
+                .collect(),
+        };
+        let error =
+            ShardTable::from_runs(&shape(), 256, &bad).expect_err("a mid-block cut must refuse");
         match error {
             EngError::BadRequest(message) => {
                 assert!(message.contains("DeltaNet out"), "{message}");
-                assert!(message.contains("1408"), "{message}");
+                assert!(message.contains("2176"), "{message}");
             }
             other => panic!("want BadRequest, got {other:?}"),
         }
@@ -674,12 +764,12 @@ mod tests {
         assert_eq!(merge_head_candidates(&[]), None);
         // The merged winner over shard maxima equals the unsplit argmax:
         // split one row at the table's vocab ranges and compare.
-        let table = ShardTable::new(&shape(), 3, 32).expect("table");
+        let table = ShardTable::new(&shape(), 2, 32).expect("table");
         let row: Vec<f32> = (0..248_320)
             .map(|i| ((i * 2_654_435_761usize) % 1000) as f32 * 0.001)
             .collect();
         let mut shards = Vec::new();
-        for card in 0..3 {
+        for card in 0..2 {
             let range = table.head_rows(card).expect("vocab range");
             let (at, &logit) = row[range.clone()].iter().enumerate().fold(
                 (0usize, &f32::NEG_INFINITY),

@@ -142,7 +142,7 @@ fn a_one_card_table_yields_the_exact_single_device_geometry() {
 fn card_geometries_tile_the_full_geometry() {
     let d = dims();
     let full = MixerGeometry::new(&d).expect("geometry");
-    for cards in [2, 3] {
+    for cards in [2] {
         let table = ShardTable::new(&d.shape, cards, 32).expect("table");
         let sum = |get: &dyn Fn(&MixerGeometry) -> usize| -> usize {
             (0..cards)
@@ -274,7 +274,7 @@ fn card_plans_gather_full_row_kv_and_tile_the_sharded_widths() {
     let single = native_plan(&d, KvMode::Int8G32);
     let bytes = |plan: &StepPlan, slot: Slot| plan.tensors()[plan.index(slot).expect("slot")].bytes;
     let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;
-    for cards in [2, 3] {
+    for cards in [2] {
         let table = ShardTable::new(&d.shape, cards, 32).expect("table");
         let (mut gu_sum, mut logits_sum) = (0, 0);
         for card in 0..cards {

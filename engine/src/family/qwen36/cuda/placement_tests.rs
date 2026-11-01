@@ -312,3 +312,113 @@ fn five_devices_are_refused() {
     let err = plan_for(&spec, &profiles, GgufType::Q80).expect_err("five devices must refuse");
     assert!(format!("{err:?}").contains("four"), "{err:?}");
 }
+
+/// The decode kernel serves exactly 8 query heads per K/V head, so runs
+/// that deal query heads finely and K/V rows independently (both whole,
+/// contiguous, full coverage) still refuse: the card holding a query
+/// group must own that group's K/V head.
+#[test]
+fn from_runs_refuses_decoupled_kv() {
+    let spec = FamilySpec {
+        heads_q: 32,
+        heads_kv: 4,
+        ..scaled_spec()
+    };
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let good = ShardTable::new(&shape, 2, 256).unwrap();
+    assert_eq!(
+        good.query_heads(0).unwrap(),
+        0..16,
+        "32 query heads deal 16/16 in whole 8-groups"
+    );
+    let runs = ShardRuns {
+        value_heads: (0..2).map(|c| good.value_heads(c).unwrap()).collect(),
+        query_heads: (0..2).map(|c| good.query_heads(c).unwrap()).collect(),
+        // Whole heads, contiguous, full coverage — but 1 head on card 0
+        // against its 16 query heads (2 groups).
+        kv_rows: vec![
+            0..shape.attn.head_dim,
+            shape.attn.head_dim..4 * shape.attn.head_dim,
+        ],
+        inter: (0..2).map(|c| good.expert_inter(c).unwrap()).collect(),
+        shared_inter: (0..2).map(|c| good.shared_inter(c).unwrap()).collect(),
+        vocab: (0..2).map(|c| good.head_rows(c).unwrap()).collect(),
+    };
+    let err = ShardTable::from_runs(&shape, 256, &runs).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("groups 8 query heads per K/V head"),
+        "{err:?}"
+    );
+}
+
+/// A shape whose attention is not the kernel's 8-per-head grouping
+/// refuses at table construction, single card included.
+#[test]
+fn non_kernel_head_ratio_refuses() {
+    let spec = FamilySpec {
+        heads_q: 32,
+        heads_kv: 8,
+        ..scaled_spec()
+    };
+    let shape = HostShape::from_spec(&spec, 64).unwrap();
+    let err = ShardTable::new(&shape, 1, 256).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("8-per-head grouping"),
+        "{err:?}"
+    );
+}
+
+/// Qwen3.6 has 16 query heads = two whole 8-groups: three cards cannot
+/// each own a group, so the plan refuses by name instead of dealing
+/// fractional heads the kernel cannot run.
+#[test]
+fn three_cards_refuse_on_two_query_groups() {
+    let spec = scaled_spec();
+    let profiles: Vec<DeviceProfile> = (0..3)
+        .map(|i| DeviceProfile {
+            device: i,
+            name: format!("card {i}"),
+            total_bytes: 12 * GIB,
+            free_bytes: 11_000 * MIB,
+            multiprocessors: 28,
+            memory_bandwidth_bytes: 360_000_000_000,
+            can_access: vec![true; 3],
+        })
+        .collect();
+    let err = plan_for(&spec, &profiles, GgufType::Q80).expect_err("3 cards must refuse");
+    assert!(
+        format!("{err:?}").contains("attention query heads has 2 blocks for 3 cards"),
+        "{err:?}"
+    );
+}
+
+/// With only two query groups, the q/KV split is 50/50 no matter what
+/// bandwidth says: the receipt must say so instead of presenting a
+/// bandwidth-proportional deal the kernels cannot realize.
+#[test]
+fn unequal_bandwidth_reports_geometry_cap() {
+    let spec = scaled_spec();
+    let profiles = vec![rtx_3080_10g(9_800 * MIB), rtx_3060_12g(11_600 * MIB)];
+    let plan = plan_for(&spec, &profiles, GgufType::Q4K).expect("the pair fits");
+    assert_eq!(plan.receipt.chosen, "bandwidth-waterfill");
+    assert!(
+        plan.receipt
+            .geometry_capped
+            .iter()
+            .any(|d| d == "attention query heads"),
+        "capped dims: {:?}",
+        plan.receipt.geometry_capped
+    );
+    assert!(plan.receipt.reason.contains("geometry-capped"));
+    assert!(
+        !plan
+            .receipt
+            .geometry_capped
+            .iter()
+            .any(|d| d == "vocabulary"),
+        "the fine-grained vocab dim must not be flagged"
+    );
+    // The realized q split is the forced 8/8, kernels-legal.
+    assert_eq!(plan.table.query_heads(0).unwrap(), 0..8);
+    assert_eq!(plan.table.query_heads(1).unwrap(), 8..16);
+}

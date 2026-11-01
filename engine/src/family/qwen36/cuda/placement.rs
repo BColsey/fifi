@@ -13,7 +13,7 @@
 use crate::EngError;
 use crate::family::gguf_model::{Inventory, Role};
 use crate::family::qwen36::cuda::shard::{
-    ShardLoad, ShardRuns, ShardTable, VALUE_BLOCK, shard_loads,
+    ATTN_Q_PER_KV_HEAD, ShardLoad, ShardRuns, ShardTable, VALUE_BLOCK, shard_loads,
 };
 use crate::family::qwen36::host::HostShape;
 use crate::weights::GgufType;
@@ -115,6 +115,10 @@ pub(crate) struct PlacementReceipt {
     pub(crate) chosen: &'static str,
     pub(crate) reason: String,
     pub(crate) refusals: Vec<String>,
+    /// Dealt dimensions whose legal grain (quantization blocks, the
+    /// decode kernel's 8-head query groups) cannot express the chosen
+    /// shares: geometry, not bandwidth, fixed their split.
+    pub(crate) geometry_capped: Vec<String>,
     pub(crate) policy_safety_reserve_bytes: u64,
     pub(crate) policy_cuda_overhead_bytes: u64,
     pub(crate) cards: Vec<CardCommitment>,
@@ -147,6 +151,19 @@ impl PlacementReceipt {
                 self.refusals
                     .iter()
                     .map(|r| json_str(r))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            &mut first,
+        );
+        field(
+            &mut out,
+            "geometry_capped",
+            format!(
+                "[{}]",
+                self.geometry_capped
+                    .iter()
+                    .map(|d| json_str(d))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
@@ -425,6 +442,10 @@ fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
     } else {
         VALUE_BLOCK / gcd(VALUE_BLOCK, k_align) * k_align
     };
+    // The decode kernel serves 8 query heads per K/V head, so query
+    // heads move in whole 8-groups on top of the quantization grain.
+    let q_grain = head_grain(shape.attn.head_dim);
+    let q_block = q_grain * ATTN_Q_PER_KV_HEAD / gcd(q_grain, ATTN_Q_PER_KV_HEAD);
     [
         Dim {
             total: shape.delta.value_heads,
@@ -433,13 +454,13 @@ fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
         },
         Dim {
             total: shape.attn.heads_q,
-            block: head_grain(shape.attn.head_dim),
+            block: q_block,
             what: "attention query heads",
         },
         Dim {
             total: shape.attn.heads_kv * shape.attn.head_dim,
             block: VALUE_BLOCK,
-            what: "K/V rows",
+            what: "K/V rows (following their query groups)",
         },
         Dim {
             total: shape.moe.inter,
@@ -492,6 +513,14 @@ fn runs_from_counts(counts: [&[usize]; 6]) -> ShardRuns {
         shared_inter,
         vocab,
     }
+}
+
+/// A card's K/V row count follows its query-head groups: the card
+/// holding a group stores, and decodes against, that group's K/V head.
+fn kv_counts_from_q(q: &[usize], head_dim: usize) -> Vec<usize> {
+    q.iter()
+        .map(|heads| heads / ATTN_Q_PER_KV_HEAD * head_dim)
+        .collect()
 }
 
 /// Largest-remainder deal of `blocks` over `shares` (which sum to ~1),
@@ -634,7 +663,14 @@ fn realize(
 ) -> Result<(ShardTable, ShardRuns, Vec<u64>), String> {
     let dims = dims(req.shape, req.quant.block_elems() as usize);
     let mut counts: Vec<Vec<usize>> = Vec::with_capacity(dims.len());
-    for dim in &dims {
+    for (di, dim) in dims.iter().enumerate() {
+        // K/V rows are not dealt independently: the card holding a
+        // query group stores, and decodes against, that group's K/V
+        // head, so dim 2 always follows dim 1.
+        if di == 2 {
+            counts.push(kv_counts_from_q(&counts[1], req.shape.attn.head_dim));
+            continue;
+        }
         let blocks = dim.total / dim.block;
         let per_card = deal_blocks(blocks, &cand.shares).ok_or_else(|| {
             format!(
@@ -684,9 +720,15 @@ fn realize(
             idx
         };
         for &di in &order {
+            if di == 2 {
+                continue;
+            }
             if counts[di][over] > dims[di].block {
                 counts[di][over] -= dims[di].block;
                 counts[di][recipient] += dims[di].block;
+                if di == 1 {
+                    counts[2] = kv_counts_from_q(&counts[1], req.shape.attn.head_dim);
+                }
                 moved = true;
                 break;
             }
@@ -966,6 +1008,51 @@ fn finish(
             }
         })
         .collect();
+    // Dims whose realized split deviates from the candidate's target
+    // beyond rounding: the legal grain (quantization blocks, the decode
+    // kernel's whole 8-head query groups) — not bandwidth — fixed the
+    // split. Surfaced so a receipt never presents a bandwidth-proportional
+    // deal where the execution geometry forced another one. Five points
+    // of share is far beyond any block rounding the fine-grained dims can
+    // produce, and well inside the 0.18 a forced two-group 50/50 sits from
+    // a 0.68 bandwidth target.
+    let dims = dims(req.shape, req.quant.block_elems() as usize);
+    let run_lens: [Vec<usize>; 6] = [
+        runs.value_heads.iter().map(|r| r.len()).collect(),
+        runs.query_heads.iter().map(|r| r.len()).collect(),
+        runs.kv_rows.iter().map(|r| r.len()).collect(),
+        runs.inter.iter().map(|r| r.len()).collect(),
+        runs.shared_inter.iter().map(|r| r.len()).collect(),
+        runs.vocab.iter().map(|r| r.len()).collect(),
+    ];
+    let mut geometry_capped: Vec<String> = Vec::new();
+    if cand.shares.len() > 1 {
+        for (di, dim) in dims.iter().enumerate() {
+            if di == 2 || dim.total == 0 {
+                continue; // K/V rows follow their query groups
+            }
+            let total: usize = run_lens[di].iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let capped = (0..cand.shares.len()).any(|i| {
+                let realized = run_lens[di][i] as f64 / total as f64;
+                (realized - cand.shares[i]).abs() > 0.05
+            });
+            if capped {
+                geometry_capped.push(dim.what.to_owned());
+            }
+        }
+    }
+    let reason = if geometry_capped.is_empty() {
+        reason
+    } else {
+        format!(
+            "{reason}; geometry-capped: {} (the legal grain cannot express the \
+             bandwidth split)",
+            geometry_capped.join(", ")
+        )
+    };
     let receipt = PlacementReceipt {
         evidence: if cand.name == "conservative-even" || cand.name == "single-card" {
             "conservative"
@@ -976,6 +1063,7 @@ fn finish(
         chosen: cand.name,
         reason,
         refusals,
+        geometry_capped,
         policy_safety_reserve_bytes: req.policy.safety_reserve_bytes,
         policy_cuda_overhead_bytes: req.policy.cuda_overhead_bytes,
         cards,
