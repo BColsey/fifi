@@ -51,6 +51,31 @@
 //! of this invariant (producer -> publish and wait -> consumer, without
 //! host synchronization); the GatherV timeout rig pins the failure half
 //! (a dead exchange folds to a session-fatal status).
+//!
+//! # The v1 failure model (session-fatal, documented)
+//!
+//! Two DIFFERENT guarantees, deliberately split:
+//!
+//! * NO CORRUPTED TOKEN IS RETURNED. Every card's ring status words fold
+//!   into the token's fatal status at read-back, BEFORE sampling hands a
+//!   token out; any nonzero fold poisons the session irrevocably (no
+//!   rollback, no state reuse).
+//! * NO INVALID EXCHANGE RESULT IS CONSUMED - only at the persistent-state
+//!   boundary. The gather pair (GatherK/GatherV) is gated HOST-side before
+//!   the KV append queues, because the append writes the replicated cache
+//!   that later tokens read: the rig's `gathers_clean` check. Every OTHER
+//!   exchange (sums, broadcasts, expert sums) feeds arena slots that live
+//!   for the token, so v1 lets its wait's consumers run and relies on the
+//!   end-of-token fold: downstream kernels MAY consume the stale row of a
+//!   failed exchange. This is memory-safe by construction - the stale row
+//!   is a previously-valid f32 row of the same slot shape, every wait is
+//!   bounded by TIMEOUT_CYCLES (no unbounded spin), and the poisoned
+//!   session can emit nothing further - but intermediate results of the
+//!   failed token are garbage and are never exposed.
+//!
+//! Do NOT read the second bullet as "stale results are harmless": they are
+//! harmless only because the session dies. A future non-fatal executor
+//! needs device-side status guards before each dependent kernel instead.
 
 #![cfg_attr(
     not(test),

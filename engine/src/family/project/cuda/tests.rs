@@ -1790,8 +1790,9 @@ fn a_sliced_native_load_uploads_exactly_the_slice_bytes() {
 /// device bytes are the plan's bytes, and the bytes it uploads equal the
 /// independently reassembled reference (`assemble_slice` over the same
 /// source), for a block-aligned column half and a row band - the load
-/// layout a multi-device card's dense weights see. A loader-layout defect
-/// here would otherwise masquerade as distributed arithmetic later.
+/// layout a multi-device card's dense weights see, FOR THIS GEOMETRY; the
+/// integrated loader and the other packed types keep their own coverage
+/// (expert stacks: the Q8_0 sliced test above).
 #[test]
 fn a_sliced_q4k_native_load_uploads_the_reassembled_blocks() {
     const NAME: &str = "a_sliced_q4k_native_load_uploads_the_reassembled_blocks";

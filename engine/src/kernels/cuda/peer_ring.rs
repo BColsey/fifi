@@ -890,6 +890,10 @@ mod device_tests {
     /// back-to-back on both cards; verification happens once at the end.
     /// Round R's expected row is 2^(R-1) * (a + b): exact in f32, the scaling
     /// is a power of two.
+    ///
+    /// Receipt limit: both contexts sit on the ONE physical device of this
+    /// box, so this pins local stream sequencing and the mailbox protocol,
+    /// not the PCIe hop or peer visibility of a real card pair.
     #[test]
     fn chained_exchanges_keep_producer_and_consumer_order_without_host_syncs() {
         if !device_present("chained_exchanges_keep_producer_and_consumer_order") {
