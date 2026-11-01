@@ -32,9 +32,11 @@ use crate::EngError;
 use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
+use crate::family::qwen36::cuda::moe::{CardMoeOp, Launch, MoeBuffers, MoeLayerWeights, launch_op};
 use crate::family::qwen36::cuda::multi::fold_ring_status;
 use crate::family::qwen36::cuda::step_plan::Slot;
 use crate::kernels::cuda::DeviceRange;
+use crate::kernels::cuda::peer_ring::RingMode;
 
 const F32: usize = size_of::<f32>();
 
@@ -167,6 +169,130 @@ pub(crate) fn run_card_block(
         }
     }
     Ok(())
+}
+
+/// Runs the MoE block on every card of `stack`. `ops[card]` is that card's
+/// [`CardMoeOp`] list; the lists share one marker sequence - `RouteBroadcast`,
+/// `MoeSum` - while their `Local` payloads may differ (card 0 alone runs the
+/// router). The driver walks each card with its own cursor: it queues every
+/// `Local` op the cursor reaches before a marker on that card's stream
+/// (the production `launch_op` over the card's own weights and buffers), and
+/// when every cursor sits at the same ring marker it executes the exchange,
+/// so a card's local launches always queue between the exchanges that fence
+/// them on the one stream it owns.
+///
+/// * `RouteBroadcast`: ids, pick weights and the shared gate - the router's
+///   whole output - ride three word broadcasts from card 0, so every card
+///   then computes the same experts;
+/// * `MoeSum`: each pick slot's `expert_down` row and the `shared_out` row
+///   are full-width partials (the card's down projection covers its
+///   intermediate slice), summed in place per row - the ring's payload cap
+///   is one hidden row.
+pub(crate) fn run_card_moe_block(
+    stack: &CardStack,
+    weights: &[MoeLayerWeights<'_>],
+    bufs: &[MoeBuffers<'_>],
+    ops: &[&[CardMoeOp]],
+) -> Result<(), EngError> {
+    let cards = stack.shards().len();
+    if weights.len() != cards || bufs.len() != cards || ops.len() != cards {
+        return Err(EngError::BadRequest(format!(
+            "card moe: {cards} cards, {} weight sets, {} buffer sets, {} op lists",
+            weights.len(),
+            bufs.len(),
+            ops.len()
+        )));
+    }
+    let markers = |ops: &[CardMoeOp]| -> Vec<CardMoeOp> {
+        ops.iter()
+            .copied()
+            .filter(|op| !matches!(op, CardMoeOp::Local(_)))
+            .collect()
+    };
+    for (card, list) in ops.iter().enumerate() {
+        if markers(list) != markers(ops[0]) {
+            return Err(EngError::BadRequest(format!(
+                "card moe: card {card}'s marker sequence differs from card 0's"
+            )));
+        }
+    }
+    let mut statuses = Vec::with_capacity(cards);
+    for card in 0..cards {
+        statuses.push(stack.shards()[card].ring_status()?);
+    }
+    let mut at = vec![0usize; cards];
+    loop {
+        for card in 0..cards {
+            while let Some(CardMoeOp::Local(local)) = ops[card].get(at[card]) {
+                launch_op(
+                    &Launch {
+                        ctx: &stack.contexts()[card],
+                        stream: &stack.streams()[card],
+                    },
+                    &weights[card],
+                    &bufs[card],
+                    *local,
+                )?;
+                at[card] += 1;
+            }
+        }
+        if at[0] == ops[0].len() {
+            for (card, cursor) in at.iter().enumerate() {
+                if *cursor != ops[card].len() {
+                    return Err(EngError::BadRequest(format!(
+                        "card moe: card {card} still has ops when card 0 is done"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        let exchange = ops[0][at[0]];
+        for card in 1..cards {
+            if ops[card].get(at[card]) != Some(&exchange) {
+                return Err(EngError::BadRequest(format!(
+                    "card moe: card {card} sits at {:?}, card 0 at {exchange:?}",
+                    ops[card].get(at[card])
+                )));
+            }
+        }
+        match exchange {
+            CardMoeOp::RouteBroadcast => {
+                let word = |card: usize, which: usize| match which {
+                    0 => bufs[card].route.ids,
+                    1 => bufs[card].route.weights,
+                    _ => bufs[card].route.shared_gate,
+                };
+                for which in 0..3 {
+                    let count = word(0, which).bytes() / 4;
+                    let outs: Vec<DeviceRange<'_>> =
+                        (0..cards).map(|card| word(card, which)).collect();
+                    stack.broadcast(0, word(0, which), &outs, &statuses, count)?;
+                }
+            }
+            CardMoeOp::MoeSum => {
+                let top_k = bufs[0].route.ids.bytes() / 4;
+                let hidden = bufs[0].route.resid_in.bytes() / 4;
+                for slot in 0..top_k {
+                    let mut partials = Vec::with_capacity(cards);
+                    for card in 0..cards {
+                        partials.push(bufs[card].expert.expert_down.buffer().range(
+                            bufs[card].expert.expert_down.offset() + slot * hidden * F32,
+                            hidden * F32,
+                        )?);
+                    }
+                    stack.exchange_sum(&partials, &partials, &statuses, hidden, RingMode::F32)?;
+                }
+                let shared: Vec<DeviceRange<'_>> = (0..cards)
+                    .map(|card| bufs[card].expert.shared_out)
+                    .collect();
+                stack.exchange_sum(&shared, &shared, &statuses, hidden, RingMode::F32)?;
+            }
+            CardMoeOp::Local(_) => unreachable!("the local loop advanced every cursor"),
+        }
+        for cursor in at.iter_mut() {
+            *cursor += 1;
+        }
+    }
 }
 
 /// Reads every card's ring status word and refuses - session-fatal, the

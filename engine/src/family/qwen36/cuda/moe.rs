@@ -1385,7 +1385,7 @@ fn op_combine(launch: &Launch<'_>, bufs: &MoeBuffers<'_>, dims: MoeDims) -> Resu
 /// One op of the sequence as one wrapper call. The match is the op table: one arm per variant,
 /// each arm one call (the arm count is the op count of [`MoeOp`], inspected and kept as one match
 /// on purpose: a table of closures would hide the arguments of every call).
-fn launch_op(
+pub(super) fn launch_op(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
     bufs: &MoeBuffers<'_>,
