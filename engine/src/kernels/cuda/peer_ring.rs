@@ -879,4 +879,88 @@ mod device_tests {
         );
         assert_eq!(download_f32(&out, &stream, 4).expect("out"), [-1.0; 4]);
     }
+
+    /// The coordinator invariant, pinned: ONE stream per card, all ring work
+    /// in exchange order, and NO host synchronization between exchanges.
+    /// Each round's PARTIAL is the previous round's `wait_sum` OUTPUT on the
+    /// same stream, so a publish that could overtake its stream's wait, or a
+    /// wait that could sum a slot before the peer's publish landed, shows up
+    /// as a wrong value: the peer's round-R publish reads a buffer the peer's
+    /// round-(R-1) wait wrote on that same stream. Sixteen rounds queue
+    /// back-to-back on both cards; verification happens once at the end.
+    /// Round R's expected row is 2^(R-1) * (a + b): exact in f32, the scaling
+    /// is a power of two.
+    #[test]
+    fn chained_exchanges_keep_producer_and_consumer_order_without_host_syncs() {
+        if !device_present("chained_exchanges_keep_producer_and_consumer_order") {
+            return;
+        }
+        let (contexts, streams, ring) = two_context_ring(64);
+        let n = 64usize;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 8.0).collect();
+        let b: Vec<f32> = (0..n).map(|i| 16.0 - i as f32 * 0.25).collect();
+        // Round 0's partials are preloaded; every later round's partial is a
+        // previous round's out, so no host write joins the queue phase.
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        let rounds = 16usize;
+        let outs: Vec<[DeviceBuffer; 2]> = (0..rounds)
+            .map(|_| {
+                [
+                    contexts[0].allocate(n * 4).expect("out 0"),
+                    contexts[1].allocate(n * 4).expect("out 1"),
+                ]
+            })
+            .collect();
+        let exchange = |partial: &[DeviceRange<'_>; 2], out: &[DeviceRange<'_>; 2]| {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                partial,
+                out,
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                n,
+                RingMode::F32,
+            )
+        };
+        exchange(
+            &[whole(&partials[0]), whole(&partials[1])],
+            &[whole(&outs[0][0]), whole(&outs[0][1])],
+        )
+        .expect("round 0");
+        for round in 1..rounds {
+            exchange(
+                &[whole(&outs[round - 1][0]), whole(&outs[round - 1][1])],
+                &[whole(&outs[round][0]), whole(&outs[round][1])],
+            )
+            .expect("chained round");
+        }
+        let mut want = a.iter().zip(&b).map(|(&x, &y)| x + y).collect::<Vec<_>>();
+        for (round, pair) in outs.iter().enumerate() {
+            for (card, buffer) in pair.iter().enumerate() {
+                let got = download_f32(buffer, &streams[card], n).expect("download");
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g, w, "round {round} card {card} value {i}");
+                }
+            }
+            if round + 1 < rounds {
+                for w in &mut want {
+                    *w += *w;
+                }
+            }
+        }
+        for (card, stream) in streams.iter().enumerate() {
+            assert_eq!(
+                status_of(&statuses[card], stream).expect("status"),
+                0,
+                "card {card}: every chained exchange succeeded"
+            );
+        }
+    }
 }

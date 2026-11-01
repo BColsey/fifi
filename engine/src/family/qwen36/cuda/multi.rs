@@ -26,6 +26,31 @@
 //! of `kernels::cuda::peer_ring` covers mixed operation kinds), and all of
 //! them queue on the one per-device step stream, which is what the slot
 //! reuse argument requires.
+//!
+//! # The coordinator invariant (one stream per card)
+//!
+//! Every card queues ALL of its work - its local kernels and its ring
+//! participation (the publish of its partial and its wait for the peers')
+//! - on ONE stream, in the global exchange order. The four properties the
+//! executor must preserve for each exchange:
+//!
+//! 1. The producer kernels precede the card's publish in that stream's
+//!    order (the publish is queued on the PRODUCER's stream, inside the
+//!    ring operation).
+//! 2. No consumer reads an exchange's result before every participant
+//!    published: the mailbox sequence handshake enforces this on the
+//!    device - the wait spins until the peer's slot carries the current
+//!    sequence - so host submission order needs no cross-stream events.
+//! 3. A partial range is never rewritten between its producer and its
+//!    publish: both sit in the one stream.
+//! 4. Every card advances through the SAME exchange sequence, failures
+//!    included (the marker-alignment tests of the card op lists pin the
+//!    sequence; a timed-out wait still consumes its sequence slot).
+//!
+//! The chained-exchange device test of `peer_ring` pins the ordering half
+//! of this invariant (producer -> publish and wait -> consumer, without
+//! host synchronization); the GatherV timeout rig pins the failure half
+//! (a dead exchange folds to a session-fatal status).
 
 #![cfg_attr(
     not(test),
