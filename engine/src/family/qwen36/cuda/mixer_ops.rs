@@ -177,6 +177,37 @@ pub(super) enum BlockOp {
         out: Slot,
         split: AttnSplit,
     },
+    /// The multi-device twin of [`BlockOp::AttnPrepRows`]: the same per-head
+    /// RMSNorm and rope for THIS card's query-head run and `k_range` rows of
+    /// the new K row - the range is absolute in the full row, because a
+    /// card's run may start inside a head and a K row's RoPE phase comes
+    /// from the range, never from the slice - with the unchanged V slice
+    /// beside it, into the card's extents of the full replicated `k_rows`
+    /// and `v_rows` slots. No cache byte is written: the append waits for
+    /// the gathers.
+    AttnPrepCard {
+        proj: Slot,
+        q: Slot,
+        q_norm: Role,
+        k_norm: Role,
+        k_rows: Slot,
+        v_rows: Slot,
+        k_range: (usize, usize),
+        pos: StepField,
+        status: StepField,
+    },
+    /// The multi-device twin of the fused fp16 append inside
+    /// [`BlockOp::AttnPrep`]: the gathered FULL f32 `k` and `v` rows written
+    /// into this layer's fp16 cache `planes` at the `pos` word; a refused
+    /// position ORs mask 4 into the `status` word.
+    KvAppendF16 {
+        k: Slot,
+        v: Slot,
+        k_plane: Plane,
+        v_plane: Plane,
+        pos: StepField,
+        status: StepField,
+    },
 }
 
 impl BlockOp {
@@ -192,8 +223,10 @@ impl BlockOp {
             | Self::QuantizeQ8 { phase, .. } => phase,
             Self::Conv { .. } => Phase::DeltaConv,
             Self::Delta { .. } => Phase::DeltaRule,
-            Self::AttnPrep { .. } | Self::AttnPrepRows { .. } => Phase::AttnPrep,
-            Self::Kv8Append { .. } => Phase::Kv8Append,
+            Self::AttnPrep { .. } | Self::AttnPrepRows { .. } | Self::AttnPrepCard { .. } => {
+                Phase::AttnPrep
+            }
+            Self::Kv8Append { .. } | Self::KvAppendF16 { .. } => Phase::Kv8Append,
             Self::AttnDecode { .. } | Self::AttnDecodeQ8 { .. } => Phase::AttnCore,
         }
     }
@@ -211,8 +244,12 @@ impl BlockOp {
             Self::Pack { x, .. } | Self::QuantizeQ8 { x, .. } => vec![x],
             Self::Conv { proj, .. } => vec![proj],
             Self::Delta { conv, proj, .. } => vec![conv, proj],
-            Self::AttnPrep { proj, .. } | Self::AttnPrepRows { proj, .. } => vec![proj],
-            Self::Kv8Append { k, v, .. } => vec![k, v],
+            Self::AttnPrep { proj, .. }
+            | Self::AttnPrepRows { proj, .. }
+            | Self::AttnPrepCard { proj, .. } => {
+                vec![proj]
+            }
+            Self::Kv8Append { k, v, .. } | Self::KvAppendF16 { k, v, .. } => vec![k, v],
             Self::AttnDecode { q, proj, .. } | Self::AttnDecodeQ8 { q, proj, .. } => {
                 vec![q, proj]
             }
@@ -237,8 +274,11 @@ impl BlockOp {
             Self::AttnPrepRows {
                 q, k_rows, v_rows, ..
             } => vec![q, k_rows, v_rows],
+            Self::AttnPrepCard {
+                q, k_rows, v_rows, ..
+            } => vec![q, k_rows, v_rows],
             // The quantized cells go to the state's KV planes, which are not plan slots.
-            Self::Kv8Append { .. } => Vec::new(),
+            Self::Kv8Append { .. } | Self::KvAppendF16 { .. } => Vec::new(),
             Self::AttnDecode { part, out, .. } | Self::AttnDecodeQ8 { part, out, .. } => {
                 vec![part, out]
             }
@@ -626,5 +666,186 @@ pub(super) fn block_ops_with(
         }
     }
     ops.push(epilogue(layout));
+    Ok(ops)
+}
+
+/// One step of one card's mixer block: a local [`BlockOp`] launch, or one of
+/// the two K/V row gathers of a full-attention layer, which sit between the
+/// card's prep and the cache append and each consume one ring sequence (the
+/// token plan of `multi.rs` counts one `KvGatherK` and one `KvGatherV` per
+/// full-attention layer). The gathers are markers: the driver runs them
+/// through the peer ring between the neighbouring local launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CardOp {
+    Local(BlockOp),
+    /// This card publishes its K row slice and every card's slice lands in
+    /// its full `KRows` row: one `all_gather_row`, one sequence.
+    GatherK,
+    /// The V half, its own `all_gather_row` and sequence.
+    GatherV,
+}
+
+/// The attention core of one card: the card's projections at its geometry's
+/// offsets, the card prep (absolute `k_range` rows into the full row slots),
+/// the two gathers, the full-row append of the KV mode, and the decode over
+/// the card's query-head run against the replicated cache.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the multi-device step, its first production caller"
+    )
+)]
+fn attn_ops_card(
+    g: &MixerGeometry,
+    k_range: (usize, usize),
+    layout: WeightLayout,
+    kv_mode: KvMode,
+) -> Vec<CardOp> {
+    let a = &g.attn;
+    let project = |role, col| {
+        CardOp::Local(project_op(
+            Phase::AttnIn,
+            role,
+            (Slot::XfMix, Slot::Q8Mix, Slot::NormRow),
+            Slot::AttnProj,
+            col,
+            layout,
+        ))
+    };
+    let append = match kv_mode {
+        KvMode::Fp16 => CardOp::Local(BlockOp::KvAppendF16 {
+            k: Slot::KRows,
+            v: Slot::VRows,
+            k_plane: Plane::K,
+            v_plane: Plane::V,
+            pos: StepField::Pos,
+            status: StepField::Status,
+        }),
+        KvMode::Int8G32 => CardOp::Local(BlockOp::Kv8Append {
+            k: Slot::KRows,
+            v: Slot::VRows,
+            k_codes: Plane::K,
+            k_scales: Plane::KScales,
+            v_codes: Plane::V,
+            v_scales: Plane::VScales,
+            pos: StepField::Pos,
+            status: StepField::Status,
+        }),
+    };
+    let decode = match kv_mode {
+        KvMode::Fp16 => CardOp::Local(BlockOp::AttnDecode {
+            q: Slot::AttnQ,
+            proj: Slot::AttnProj,
+            part: Slot::AttnPart,
+            out: Slot::AttnCore,
+            kv_len: StepField::KvLen,
+        }),
+        KvMode::Int8G32 => CardOp::Local(BlockOp::AttnDecodeQ8 {
+            q: Slot::AttnQ,
+            proj: Slot::AttnProj,
+            k_codes: Plane::K,
+            k_scales: Plane::KScales,
+            v_codes: Plane::V,
+            v_scales: Plane::VScales,
+            kv_len: StepField::KvLen,
+            part: Slot::AttnPart,
+            out: Slot::AttnCore,
+            split: AttnSplit::Q8,
+        }),
+    };
+    let mut ops = vec![
+        project(Role::AttnQ, 0),
+        project(Role::AttnK, a.k_off),
+        project(Role::AttnV, a.v_off),
+        CardOp::Local(BlockOp::AttnPrepCard {
+            proj: Slot::AttnProj,
+            q: Slot::AttnQ,
+            q_norm: Role::AttnQNorm,
+            k_norm: Role::AttnKNorm,
+            k_rows: Slot::KRows,
+            v_rows: Slot::VRows,
+            k_range,
+            pos: StepField::Pos,
+            status: StepField::Status,
+        }),
+        CardOp::GatherK,
+        CardOp::GatherV,
+        append,
+        decode,
+    ];
+    ops.extend(
+        pack_op(
+            Phase::AttnPack,
+            Slot::AttnCore,
+            Slot::XfAttnOut,
+            Slot::Q8AttnOut,
+            a.q_width,
+            layout,
+        )
+        .into_iter()
+        .map(CardOp::Local),
+    );
+    ops.push(CardOp::Local(project_op(
+        Phase::AttnOut,
+        Role::AttnOutput,
+        (Slot::XfAttnOut, Slot::Q8AttnOut, Slot::AttnCore),
+        Slot::MixOut,
+        0,
+        layout,
+    )));
+    ops
+}
+
+/// The mixer block of one card of a layer of `kind`, as pure planning: the
+/// same prologue, epilogue and op vocabulary as [`block_ops_with`] over the
+/// CARD's geometry (its query-head run, its K/V projection rows, its channel
+/// segments), with the full-attention core split around the two K/V gathers.
+/// A DeltaNet card block is exactly the single-device list over the card
+/// geometry (every DeltaNet shape is a geometry field); a full-attention card
+/// block is the only place the distributed step departs from the fused
+/// single-device prep. Card lists are NATIVE-only: the card's fp16 append and
+/// the `KRows`/`VRows` gather slots exist in native plans, and v1 serves
+/// multi-device on native weights. The fused input projection is refused -
+/// `check_fused_inproj` stops it at start, and the card path states it again
+/// so no caller can fuse its way past the shard table's four separate
+/// projections.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the multi-device step, its first production caller"
+    )
+)]
+pub(super) fn block_ops_card(
+    kind: AttentionKind,
+    g: &MixerGeometry,
+    k_range: (usize, usize),
+    layout: WeightLayout,
+    kv_mode: KvMode,
+) -> Result<Vec<CardOp>, EngError> {
+    if layout != WeightLayout::Native {
+        return Err(EngError::BadRequest(
+            "card block ops: multi-device serving takes the native layout; the gather slots and \
+             the card append exist in native plans"
+                .to_owned(),
+        ));
+    }
+    for (role, col, rows, ld) in native_columns(g, kind, false) {
+        check_native_column(role, col, rows, ld)?;
+    }
+    let mut ops = vec![CardOp::Local(prologue(layout))];
+    match kind {
+        AttentionKind::DeltaNet => {
+            ops.extend(delta_ops(g, layout, false).into_iter().map(CardOp::Local))
+        }
+        AttentionKind::Full => ops.extend(attn_ops_card(g, k_range, layout, kv_mode)),
+        other => {
+            return Err(EngError::Checkpoint(format!(
+                "card block ops: attention kind {other:?} has no resident mixer"
+            )));
+        }
+    }
+    ops.push(CardOp::Local(epilogue(layout)));
     Ok(ops)
 }

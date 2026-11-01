@@ -7,10 +7,12 @@
 //! Where each operation sits in the existing step, by the slots it moves:
 //! - `EmbedBroadcast`: card 0 embeds the token; the embedded row (the
 //!   `Embed` op's output in the residual slot) is broadcast before layer 0.
-//! - `KvGather` (full-attention layers only): inside the mixer, after the
-//!   K/V projections and before attention reads the cache — each card's new
-//!   K/V slice is replicated into every card's cache row for this position.
-//!   Only the new row moves; history never does.
+//! - `KvGatherK`/`KvGatherV` (full-attention layers only): inside the
+//!   mixer, after the K/V projections and before attention reads the
+//!   cache — each card's new K and V slices are replicated into every
+//!   card's full cache row for this position, as two `all_gather_row`
+//!   sequences over the separate row slots. Only the new row moves;
+//!   history never does.
 //! - `MixerSum`: at the mixer/MoE boundary, the exchange sums
 //!   `Slot::MixOut` — the out-projection partial the next norm consumes as
 //!   its fused `delta` — so every card's norm adds the full mixer output.
@@ -41,23 +43,44 @@ use crate::kernels::cuda::peer_ring::{STATUS_OVERFLOW, STATUS_TIMEOUT};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenOp {
     EmbedBroadcast,
-    KvGather { layer: usize },
-    MixerSum { layer: usize },
-    RouteBroadcast { layer: usize },
-    MoeSum { layer: usize },
+    /// The K half of a full-attention layer's new cache row: one
+    /// `all_gather_row` over the card's post-RoPE K slice, one sequence.
+    KvGatherK {
+        layer: usize,
+    },
+    /// The V half of the same row: its own `all_gather_row` and its own
+    /// sequence. K and V live in separate slots (`KRows` and `VRows`), so
+    /// one packed publication would need a per-card repack buffer and a
+    /// multi-extent gather; two sequences keep the existing transport
+    /// unchanged. The append that consumes the row waits for BOTH, so a
+    /// timeout on either poisons the token through the status fold.
+    KvGatherV {
+        layer: usize,
+    },
+    MixerSum {
+        layer: usize,
+    },
+    RouteBroadcast {
+        layer: usize,
+    },
+    MoeSum {
+        layer: usize,
+    },
 }
 
 /// The full ring sequence of one decoded token over `layers` (the step
 /// table's attention kinds, in layer order): one embedding broadcast,
 /// then per layer the mixer sum and the MoE sum with a route broadcast
-/// between them, and a K/V gather inside each full-attention layer,
-/// queued before that layer's mixer sum.
+/// between them, and inside each full-attention layer a K and a V gather
+/// (two sequences; see [`TokenOp::KvGatherV`]) queued before that layer's
+/// mixer sum.
 pub(crate) fn exchange_plan(layers: &[AttentionKind]) -> Vec<TokenOp> {
-    let mut ops = Vec::with_capacity(1 + layers.len() * 3 + 10);
+    let mut ops = Vec::with_capacity(1 + layers.len() * 3 + 20);
     ops.push(TokenOp::EmbedBroadcast);
     for (layer, &kind) in layers.iter().enumerate() {
         if kind == AttentionKind::Full {
-            ops.push(TokenOp::KvGather { layer });
+            ops.push(TokenOp::KvGatherK { layer });
+            ops.push(TokenOp::KvGatherV { layer });
         }
         ops.push(TokenOp::MixerSum { layer });
         ops.push(TokenOp::RouteBroadcast { layer });
@@ -107,15 +130,17 @@ mod tests {
     fn the_exchange_plan_counts_one_sequence_per_operation() {
         let layers: Vec<AttentionKind> = QWEN3_6_35B_A3B.layers_attention.to_vec();
         let ops = exchange_plan(&layers);
-        // 1 embed + 40 layers * (mixer + route + moe) + 10 full-layer gathers.
-        assert_eq!(ops.len(), 131);
+        // 1 embed + 40 layers * (mixer + route + moe) + 10 full layers' K and
+        // V gathers (two sequences each).
+        assert_eq!(ops.len(), 141);
         assert_eq!(ops[0], TokenOp::EmbedBroadcast);
         // Layer order is absolute and each layer's operations stay in order:
-        // a full layer's gather precedes its mixer sum.
+        // a full layer's gathers precede its mixer sum, K before V.
         let mut last_layer = 0usize;
         for op in &ops[1..] {
             let layer = match *op {
-                TokenOp::KvGather { layer }
+                TokenOp::KvGatherK { layer }
+                | TokenOp::KvGatherV { layer }
                 | TokenOp::MixerSum { layer }
                 | TokenOp::RouteBroadcast { layer }
                 | TokenOp::MoeSum { layer } => layer,
@@ -124,15 +149,25 @@ mod tests {
             assert!(layer >= last_layer, "ops leave layer order at {op:?}");
             last_layer = layer;
         }
-        let gathers = ops
+        let k_gathers = ops
             .iter()
-            .filter(|op| matches!(op, TokenOp::KvGather { .. }))
+            .filter(|op| matches!(op, TokenOp::KvGatherK { .. }))
             .count();
-        assert_eq!(gathers, 10);
-        // First full layer of the 3+1 pattern is absolute layer 3.
+        let v_gathers = ops
+            .iter()
+            .filter(|op| matches!(op, TokenOp::KvGatherV { .. }))
+            .count();
+        assert_eq!((k_gathers, v_gathers), (10, 10));
+        // First full layer of the 3+1 pattern is absolute layer 3, K first.
         assert_eq!(
-            ops.iter().find(|op| matches!(op, TokenOp::KvGather { .. })),
-            Some(&TokenOp::KvGather { layer: 3 })
+            ops.iter()
+                .find(|op| matches!(op, TokenOp::KvGatherK { .. })),
+            Some(&TokenOp::KvGatherK { layer: 3 })
+        );
+        assert_eq!(
+            ops.iter()
+                .find(|op| matches!(op, TokenOp::KvGatherV { .. })),
+            Some(&TokenOp::KvGatherV { layer: 3 })
         );
     }
 

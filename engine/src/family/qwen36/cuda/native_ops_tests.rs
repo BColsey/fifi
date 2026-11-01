@@ -525,3 +525,158 @@ fn fused_gdn_inproj_spec_is_one_row_wide_entry() {
     assert_eq!(fused[1].role, Role::SsmOut);
     assert_eq!(fused[1].rows, unfused[4].rows);
 }
+
+#[cfg(test)]
+mod card_ops_tests {
+    use super::super::common_tests::dims;
+    use super::super::mixer_geometry::MixerGeometry;
+    use super::super::mixer_ops::{BlockOp, CardOp, block_ops, block_ops_card, block_ops_with};
+    use super::super::shard::ShardTable;
+    use super::super::step_plan::Slot;
+    use crate::family::AttentionKind;
+    use crate::family::project::cuda::WeightLayout;
+    use crate::family::qwen36::cuda::dims::KvMode;
+
+    fn table(cards: usize) -> ShardTable {
+        ShardTable::new(&dims().shape, cards, 32).expect("table")
+    }
+
+    fn card_geometry(table: &ShardTable, card: usize) -> MixerGeometry {
+        MixerGeometry::for_card(&dims(), table, card).expect("card geometry")
+    }
+
+    fn local(op: &CardOp) -> &BlockOp {
+        match op {
+            CardOp::Local(op) => op,
+            gather => panic!("expected a local op, met {gather:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deltanet_card_block_is_the_single_device_list_over_the_card_geometry() {
+        let table = table(2);
+        for card in 0..2 {
+            let g = card_geometry(&table, card);
+            let card_list = block_ops_card(
+                AttentionKind::DeltaNet,
+                &g,
+                (0, 0),
+                WeightLayout::Native,
+                KvMode::Fp16,
+            )
+            .expect("card list");
+            // The k_range of a DeltaNet card is unused (no attention core).
+            let single = block_ops_with(
+                false,
+                AttentionKind::DeltaNet,
+                &g,
+                WeightLayout::Native,
+                KvMode::Fp16,
+            )
+            .expect("single-device list");
+            assert_eq!(
+                card_list,
+                single.into_iter().map(CardOp::Local).collect::<Vec<_>>(),
+                "card {card}: a DeltaNet card block is pure geometry substitution"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_attention_card_block_splits_prep_gathers_and_append_in_order() {
+        let table = table(2);
+        let rows = table.kv_rows(1).expect("k rows");
+        let k_range = (rows.start, rows.end);
+        let g = card_geometry(&table, 1);
+        for (mode, append) in [
+            (KvMode::Fp16, "the fp16 append"),
+            (KvMode::Int8G32, "the kv8 append"),
+        ] {
+            let ops = block_ops_card(AttentionKind::Full, &g, k_range, WeightLayout::Native, mode)
+                .expect("card list");
+            let at = |i: usize| local(&ops[i]);
+            // prologue, then the three projections, then the card prep.
+            assert!(matches!(
+                at(1),
+                BlockOp::Project { .. } | BlockOp::ProjectQ { .. }
+            ));
+            assert!(matches!(
+                at(2),
+                BlockOp::Project { .. } | BlockOp::ProjectQ { .. }
+            ));
+            assert!(matches!(
+                at(3),
+                BlockOp::Project { .. } | BlockOp::ProjectQ { .. }
+            ));
+            let BlockOp::AttnPrepCard {
+                k_range: range,
+                k_rows,
+                v_rows,
+                ..
+            } = at(4)
+            else {
+                panic!("{append}: op 4 must be the card prep, met {:?}", at(4));
+            };
+            assert_eq!(
+                range, &k_range,
+                "{append}: the prep carries the absolute rows"
+            );
+            assert_eq!((*k_rows, *v_rows), (Slot::KRows, Slot::VRows), "{append}");
+            // The gathers sit between the prep and the append, K before V.
+            assert_eq!(
+                (ops[5], ops[6]),
+                (CardOp::GatherK, CardOp::GatherV),
+                "{append}"
+            );
+            let append_op = at(7);
+            match (mode, append_op) {
+                (KvMode::Fp16, BlockOp::KvAppendF16 { k, v, .. })
+                | (KvMode::Int8G32, BlockOp::Kv8Append { k, v, .. }) => {
+                    assert_eq!((*k, *v), (Slot::KRows, Slot::VRows), "{append}");
+                }
+                _ => panic!("{append}: op 7 must be the mode's append, met {append_op:?}"),
+            }
+            // The append reads the full gathered rows before the decode.
+            assert_eq!(
+                append_op.reads(),
+                vec![Slot::KRows, Slot::VRows],
+                "{append}"
+            );
+            assert!(matches!(
+                at(8),
+                BlockOp::AttnDecode { .. } | BlockOp::AttnDecodeQ8 { .. }
+            ));
+            // The out projection closes the block with the card's partial.
+            assert!(ops.len() > 9);
+        }
+    }
+
+    #[test]
+    fn card_blocks_refuse_the_tiled_layout_and_the_one_card_table_stays_single_device() {
+        let table = table(2);
+        let g = card_geometry(&table, 0);
+        assert!(
+            block_ops_card(
+                AttentionKind::Full,
+                &g,
+                (0, 8),
+                WeightLayout::Tiled,
+                KvMode::Fp16
+            )
+            .is_err()
+        );
+        // The single-device path IS the one-card path: its fused prep never
+        // splits, so the single-device list has no gather anywhere.
+        let single = block_ops(
+            AttentionKind::Full,
+            &MixerGeometry::new(&dims()).expect("geometry"),
+            WeightLayout::Native,
+            KvMode::Fp16,
+        )
+        .expect("single-device list");
+        assert!(single.iter().all(|op| !matches!(
+            op,
+            BlockOp::AttnPrepCard { .. } | BlockOp::KvAppendF16 { .. }
+        )));
+    }
+}

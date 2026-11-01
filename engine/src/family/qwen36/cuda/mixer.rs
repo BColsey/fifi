@@ -624,6 +624,16 @@ impl<'a> Mixers<'a> {
                     )
                 }
             }
+            // The multi-device ops carry no single-device launch: the card
+            // prep and append run through the card driver, which owns the
+            // ring gathers between them. Meeting one here is a construction
+            // bug, so refuse loudly instead of guessing a launch.
+            BlockOp::AttnPrepCard { .. } | BlockOp::KvAppendF16 { .. } => {
+                Err(EngError::BadRequest(
+                    "mixer: the multi-device prep and append ops have no single-device launcher"
+                        .into(),
+                ))
+            }
         }
     }
 }
