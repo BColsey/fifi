@@ -123,6 +123,159 @@ pub(crate) fn native_device_bytes(name: &str, ty: GgufType, dims: &[u64]) -> Res
         .ok_or_else(overflow)
 }
 
+/// One device's slice of a native tensor: the dims it uploads under, its
+/// device bytes, and the source byte segments that assemble it, in upload
+/// order. Segments are relative to the tensor's first data byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TensorSlice {
+    pub(crate) dims: Vec<u64>,
+    pub(crate) bytes: u64,
+    pub(crate) segments: Vec<(u64, u64)>,
+}
+
+/// Values and bytes of one indivisible unit of `ty` along a row: a native
+/// quantization block, or one element for the raw types. A column cut may
+/// only land between units.
+const fn slice_unit(ty: GgufType) -> Option<(u64, u64)> {
+    match ty {
+        GgufType::F32 => Some((1, 4)),
+        GgufType::F16 => Some((1, 2)),
+        _ => native_block(ty),
+    }
+}
+
+/// Plans the slice of a native tensor covering columns `cols` and rows
+/// `rows` (both in values, GGUF order: `dims[0]` is the row length,
+/// `dims[1]` the rows per plane, `dims[2]` the planes of a stack). The
+/// row range applies inside every plane, which is how an expert stack is
+/// cut by intermediate width. The full tensor must itself satisfy the
+/// native layout rules, exactly as [`native_device_bytes`] checks them,
+/// and the slice bytes are that function's count on the sliced dims, so
+/// admission and assembly can never disagree. A whole-tensor slice is one
+/// segment: the 1-device upload is byte-identical to today's.
+pub(crate) fn plan_slice(
+    name: &str,
+    ty: GgufType,
+    dims: &[u64],
+    cols: std::ops::Range<u64>,
+    rows: std::ops::Range<u64>,
+) -> Result<TensorSlice, EngError> {
+    let refuse = |detail: String| EngError::Checkpoint(format!("tensor {name}: {detail}"));
+    let Some((unit_values, unit_bytes)) = slice_unit(ty) else {
+        return Err(refuse(format!(
+            "type {ty:?} has no native block to slice on"
+        )));
+    };
+    if dims.is_empty() || dims.len() > 3 {
+        return Err(refuse(format!(
+            "rank {} is outside the sliced ranks 1..=3",
+            dims.len()
+        )));
+    }
+    let (full_cols, full_rows, planes) = (
+        dims[0],
+        dims.get(1).copied().unwrap_or(1),
+        dims.get(2).copied().unwrap_or(1),
+    );
+    // The full tensor must be a legal native tensor before any cut of it is.
+    native_device_bytes(name, ty, dims)?;
+    if cols.start >= cols.end || cols.end > full_cols {
+        return Err(refuse(format!(
+            "column range {cols:?} is outside 0..{full_cols} or empty"
+        )));
+    }
+    if !cols.start.is_multiple_of(unit_values) || !cols.end.is_multiple_of(unit_values) {
+        return Err(refuse(format!(
+            "column range {cols:?} splits a {unit_values}-value block of {ty:?}"
+        )));
+    }
+    if rows.start >= rows.end || rows.end > full_rows {
+        return Err(refuse(format!(
+            "row range {rows:?} is outside 0..{full_rows} or empty"
+        )));
+    }
+    let mut slice_dims = dims.to_vec();
+    slice_dims[0] = cols.end - cols.start;
+    if slice_dims.len() > 1 {
+        slice_dims[1] = rows.end - rows.start;
+    } else if rows != (0..1) {
+        return Err(refuse("a rank-1 tensor takes the row range 0..1".into()));
+    }
+    let bytes = native_device_bytes(name, ty, &slice_dims)?;
+    let overflow = || EngError::MemoryPlan(format!("tensor {name}: slice size overflows u64"));
+    let row_bytes = (full_cols / unit_values)
+        .checked_mul(unit_bytes)
+        .ok_or_else(overflow)?;
+    let slice_row_bytes = ((cols.end - cols.start) / unit_values)
+        .checked_mul(unit_bytes)
+        .ok_or_else(overflow)?;
+    let col_offset = (cols.start / unit_values)
+        .checked_mul(unit_bytes)
+        .ok_or_else(overflow)?;
+    let rows_in_slice = rows.end - rows.start;
+    let whole_cols = cols.start == 0 && cols.end == full_cols;
+    let mut segments = Vec::new();
+    for plane in 0..planes {
+        let plane_base = plane
+            .checked_mul(full_rows)
+            .and_then(|r| r.checked_mul(row_bytes))
+            .ok_or_else(overflow)?;
+        if whole_cols {
+            let start = plane_base
+                .checked_add(rows.start.checked_mul(row_bytes).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?;
+            let len = rows_in_slice.checked_mul(row_bytes).ok_or_else(overflow)?;
+            segments.push((start, len));
+        } else {
+            for row in rows.clone() {
+                let start = plane_base
+                    .checked_add(row.checked_mul(row_bytes).ok_or_else(overflow)?)
+                    .and_then(|s| s.checked_add(col_offset))
+                    .ok_or_else(overflow)?;
+                segments.push((start, slice_row_bytes));
+            }
+        }
+    }
+    let assembled = segments
+        .iter()
+        .try_fold(0u64, |sum, &(_, len)| sum.checked_add(len))
+        .ok_or_else(overflow)?;
+    if assembled != bytes {
+        return Err(EngError::MemoryPlan(format!(
+            "tensor {name}: slice segments hold {assembled} bytes, admission counted {bytes}"
+        )));
+    }
+    Ok(TensorSlice {
+        dims: slice_dims,
+        bytes,
+        segments,
+    })
+}
+
+/// Assembles a planned slice from the tensor's source bytes. The loader
+/// reads the same segments from the file instead of a memory slice; both
+/// consume [`TensorSlice::segments`] and nothing else.
+pub(crate) fn assemble_slice(source: &[u8], slice: &TensorSlice) -> Result<Vec<u8>, EngError> {
+    let total = usize::try_from(slice.bytes).map_err(|_| {
+        EngError::MemoryPlan("cuda slice assembly: byte count overflows usize".into())
+    })?;
+    let mut out = Vec::with_capacity(total);
+    for &(offset, len) in &slice.segments {
+        let (offset, len) = (usize::try_from(offset), usize::try_from(len));
+        let segment = offset
+            .ok()
+            .zip(len.ok())
+            .and_then(|(o, l)| source.get(o..o.checked_add(l)?))
+            .ok_or_else(|| {
+                EngError::Checkpoint(
+                    "cuda slice assembly: a segment runs past the tensor bytes".into(),
+                )
+            })?;
+        out.extend_from_slice(segment);
+    }
+    Ok(out)
+}
+
 fn check_tile_shape(name: &str, ty: GgufType, rows: u64, cols: u64) -> Result<(), EngError> {
     let tile_cols = tile_cols(ty);
     if rows == 0
@@ -341,6 +494,120 @@ mod tests {
             native_device_bytes("e", GgufType::Q50, &[896, 2304, 64]),
             Ok(28 * 22 * 2304 * 64)
         );
+    }
+
+    /// Source bytes in which every quantization block holds one repeated
+    /// marker byte, its global block index modulo 251. The expected slice is
+    /// then rebuilt block by block from (plane, row, block) coordinates, a
+    /// formula path independent of the planner's segment arithmetic.
+    fn marked_source(dims: &[u64], unit_values: u64, unit_bytes: u64) -> Vec<u8> {
+        let blocks_per_row = dims[0] / unit_values;
+        let rows: u64 = dims[1..].iter().product();
+        let mut source = Vec::new();
+        for block in 0..rows * blocks_per_row {
+            source.resize(source.len() + unit_bytes as usize, (block % 251) as u8);
+        }
+        source
+    }
+
+    fn expected_slice(
+        source: &[u8],
+        dims: &[u64],
+        unit_values: u64,
+        unit_bytes: u64,
+        cols: std::ops::Range<u64>,
+        rows: std::ops::Range<u64>,
+    ) -> Vec<u8> {
+        let blocks_per_row = dims[0] / unit_values;
+        let planes = dims.get(2).copied().unwrap_or(1);
+        let mut out = Vec::new();
+        for plane in 0..planes {
+            for row in rows.clone() {
+                for block in (cols.start / unit_values)..(cols.end / unit_values) {
+                    let global = ((plane * dims[1] + row) * blocks_per_row + block) as usize;
+                    let at = global * unit_bytes as usize;
+                    out.extend_from_slice(&source[at..at + unit_bytes as usize]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_whole_tensor_slice_is_one_segment_and_the_source_itself() {
+        for (ty, dims) in [
+            (GgufType::Q4K, &[2048u64, 512][..]),
+            (GgufType::Q6K, &[512, 2048][..]),
+            (GgufType::Q80, &[2048, 512, 4][..]),
+            (GgufType::F32, &[2048][..]),
+        ] {
+            let rows = dims.get(1).copied().unwrap_or(1);
+            let slice = plan_slice("w", ty, dims, 0..dims[0], 0..rows).expect("whole slice");
+            assert_eq!(slice.dims, dims);
+            assert_eq!(
+                slice.bytes,
+                native_device_bytes("w", ty, dims).expect("bytes")
+            );
+            let planes = u64::try_from(slice.segments.len()).expect("segments");
+            assert_eq!(planes, dims.get(2).copied().unwrap_or(1));
+        }
+        let source: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+        let slice = plan_slice("n", GgufType::F32, &[1250], 0..1250, 0..1).expect("whole");
+        assert_eq!(assemble_slice(&source, &slice).expect("assemble"), source);
+    }
+
+    #[test]
+    fn row_and_column_slices_assemble_to_their_blocks() {
+        // Q80: 32 values / 34 bytes per block. Rows of 128, 6 rows, 3 planes.
+        let dims = [128u64, 6, 3];
+        let source = marked_source(&dims, 32, 34);
+        for (cols, rows) in [
+            (0..128, 2..5),
+            (32..96, 0..6),
+            (64..128, 1..3),
+            (0..32, 5..6),
+        ] {
+            let slice =
+                plan_slice("e", GgufType::Q80, &dims, cols.clone(), rows.clone()).expect("slice");
+            assert_eq!(
+                slice.bytes,
+                native_device_bytes("e", GgufType::Q80, &slice.dims).expect("bytes")
+            );
+            assert_eq!(
+                assemble_slice(&source, &slice).expect("assemble"),
+                expected_slice(&source, &dims, 32, 34, cols, rows)
+            );
+        }
+        // The two halves of an expert-down shape at Q4K alignment cover it.
+        let down = [512u64, 2048];
+        let left = plan_slice("d", GgufType::Q4K, &down, 0..256, 0..2048).expect("left");
+        let right = plan_slice("d", GgufType::Q4K, &down, 256..512, 0..2048).expect("right");
+        assert_eq!(
+            left.bytes + right.bytes,
+            native_device_bytes("d", GgufType::Q4K, &down).expect("whole")
+        );
+    }
+
+    #[test]
+    fn slice_cuts_inside_a_block_and_outside_the_tensor_refuse() {
+        let dims = [512u64, 2048];
+        for (cols, rows) in [
+            (0..192, 0..2048),
+            (128..512, 0..2048),
+            (0..768, 0..2048),
+            (0..512, 0..2049),
+            (256..256, 0..2048),
+        ] {
+            assert!(
+                plan_slice("w", GgufType::Q4K, &dims, cols.clone(), rows.clone()).is_err(),
+                "{cols:?} x {rows:?} must refuse"
+            );
+        }
+        // Q80 blocks are 32 wide: the same 192 cut is legal there.
+        assert!(plan_slice("w", GgufType::Q80, &dims, 0..192, 0..2048).is_ok());
+        // A type with no native block, and an over-rank tensor, refuse.
+        assert!(plan_slice("w", GgufType::Q5K, &dims, 0..512, 0..2048).is_err());
+        assert!(plan_slice("w", GgufType::F32, &[4, 4, 4, 4], 0..4, 0..4).is_err());
     }
 
     #[test]

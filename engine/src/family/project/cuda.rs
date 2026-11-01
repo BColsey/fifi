@@ -86,6 +86,84 @@ pub(crate) struct LoadOptions<'a> {
     pub(crate) layout: WeightLayout,
 }
 
+/// One tensor's slice of a sliced load: the column and row ranges (in
+/// values, GGUF order) this device uploads. Ranges must land on the
+/// tensor type's native block boundaries; `plan::plan_slice` checks them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SliceSpec {
+    pub(crate) cols: std::ops::Range<u64>,
+    pub(crate) rows: std::ops::Range<u64>,
+}
+
+/// Reads `buf.len()` source bytes of one tensor at byte `offset`, the shape
+/// of `GgufWeights::read_range` a sliced upload reads through.
+type RangeReader<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), EngError> + 'a;
+
+/// Serves an assembled slice byte stream from its source segments: given an
+/// offset into the assembled stream, fill the buffer by reading the
+/// corresponding file ranges. This is the reader a sliced native upload
+/// hands to `upload_native`, whose chunk offsets address the assembled
+/// (sliced) tensor exactly as they address a whole one today.
+struct SliceReader<'s> {
+    segments: &'s [(u64, u64)],
+    /// Assembled-stream offset at which each segment starts.
+    starts: Vec<u64>,
+}
+
+impl<'s> SliceReader<'s> {
+    fn new(segments: &'s [(u64, u64)]) -> Self {
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut at = 0u64;
+        for &(_, len) in segments {
+            starts.push(at);
+            at += len;
+        }
+        Self { segments, starts }
+    }
+
+    fn fill(
+        &self,
+        at: u64,
+        out: &mut [u8],
+        read_range: &mut RangeReader<'_>,
+    ) -> Result<(), EngError> {
+        let mut done = 0usize;
+        while done < out.len() {
+            let pos = at + done as u64;
+            let index = match self.starts.binary_search(&pos) {
+                Ok(index) => index,
+                Err(next) => next.checked_sub(1).ok_or_else(|| {
+                    EngError::Checkpoint(
+                        "cuda sliced upload: a read starts before the slice".into(),
+                    )
+                })?,
+            };
+            let (source, len) = self.segments[index];
+            let within = pos - self.starts[index];
+            if within >= len {
+                return Err(EngError::Checkpoint(
+                    "cuda sliced upload: a read runs past the slice".into(),
+                ));
+            }
+            let take = usize::try_from(len - within)
+                .map_err(|_| EngError::MemoryPlan("cuda sliced upload: size overflows".into()))?
+                .min(out.len() - done);
+            read_range(source + within, &mut out[done..done + take])?;
+            done += take;
+        }
+        Ok(())
+    }
+}
+
+/// One planned tensor of a load: its file record, its admitted device
+/// bytes, and the slice it uploads under, if this is a sliced load.
+struct PlannedTensor<'w> {
+    tensor: &'w GgufTensor,
+    bytes: u64,
+    slice: Option<plan::TensorSlice>,
+}
+
+/// One checkpoint tensor resident on the device.
 pub(crate) enum CudaWeight {
     /// A Q4_K, Q6_K or Q8_0 matrix in the vendored tile layout. `experts` is
     /// the stack depth of a rank-3 tensor, whose rows are the `experts`
@@ -277,7 +355,7 @@ pub(crate) struct LoadedModel {
 }
 
 struct LoadPlan<'a> {
-    tensors: Vec<(&'a GgufTensor, u64)>,
+    tensors: Vec<PlannedTensor<'a>>,
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
@@ -327,6 +405,26 @@ impl CudaProjector {
     pub(crate) fn new() -> Result<Self, EngError> {
         Ok(Self {
             context: CudaContext::with_admission(&served_admission())?,
+            chunk_limit: CHUNK_LIMIT,
+            integrated: cuda::device_is_integrated()?,
+            oom_retries: Cell::new(0),
+        })
+    }
+
+    /// Like [`Self::new`], on CUDA device `device`: one projector per device
+    /// of a multi-device load, each admitting against its own device's free
+    /// memory. The integrated-GPU load policy is a one-device (Jetson)
+    /// concern and is read for device 0 as today.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the two-device start, which builds one projector per device"
+        )
+    )]
+    pub(crate) fn on_device(device: usize) -> Result<Self, EngError> {
+        Ok(Self {
+            context: CudaContext::with_admission_on(device, &served_admission())?,
             chunk_limit: CHUNK_LIMIT,
             integrated: cuda::device_is_integrated()?,
             oom_retries: Cell::new(0),
@@ -392,6 +490,41 @@ impl CudaProjector {
         names: &[&str],
         options: LoadOptions<'_>,
     ) -> Result<CudaWeights, EngError> {
+        self.load_inner(weights, names, options, &[])
+    }
+
+    /// Like [`Self::load`], uploading only the named tensors' slices: each
+    /// tensor of `slices` lands under its own name with the sliced shape
+    /// (its `NativeWeight` rows and `k` are the slice's), every other named
+    /// tensor loads whole. Admission counts slice bytes, so per-device
+    /// demand is this device's share alone. Sliced loads are Native-layout
+    /// only, refuse a slice for a tensor the load did not name or a name
+    /// sliced twice, and never fuse the GDN input projections. An empty
+    /// `slices` is exactly [`Self::load`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the two-device start, which loads one slice set per device"
+        )
+    )]
+    pub(crate) fn load_sliced(
+        &self,
+        weights: &GgufWeights,
+        names: &[&str],
+        options: LoadOptions<'_>,
+        slices: &[(&str, SliceSpec)],
+    ) -> Result<CudaWeights, EngError> {
+        self.load_inner(weights, names, options, slices)
+    }
+
+    fn load_inner(
+        &self,
+        weights: &GgufWeights,
+        names: &[&str],
+        options: LoadOptions<'_>,
+        slices: &[(&str, SliceSpec)],
+    ) -> Result<CudaWeights, EngError> {
         self.context.ensure_usable()?;
         if options.layout == WeightLayout::Exl3 {
             return Err(EngError::Checkpoint(
@@ -400,12 +533,36 @@ impl CudaProjector {
         }
         load_index(names)?; // the duplicate-name refusal still covers the whole request
         let layout = options.layout;
+        // The slice set of a sliced load, by tensor name. A slice for a tensor this load
+        // did not name, a name sliced twice, or any slice on a non-native layout refuses
+        // before planning: a sliced tensor has a different shape than its file record,
+        // and only the native readers take shapes from the weight itself.
+        let mut slice_specs: HashMap<&str, &SliceSpec> = HashMap::with_capacity(slices.len());
+        for (name, spec) in slices {
+            if slice_specs.insert(name, spec).is_some() {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {name} is sliced twice in one load"
+                )));
+            }
+            if !names.contains(name) {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {name} is sliced but not part of this load"
+                )));
+            }
+        }
+        if !slice_specs.is_empty() && layout != WeightLayout::Native {
+            return Err(EngError::Checkpoint(
+                "a sliced load needs the Native layout".into(),
+            ));
+        }
         // The fused GDN input projections (default OFF): the four siblings keep their admission
         // bytes (the fused matrix is the same bytes) but upload as ONE tensor under the qkv
         // name, and the sibling index entries vanish. The skipped siblings also COMPACT the
         // uploaded vector, so the surviving entries renumber to their upload positions - a
-        // later tensor must not keep its pre-skip slot (review F1).
-        let fused = if layout == WeightLayout::Native && gdn_fuse_inproj() {
+        // later tensor must not keep its pre-skip slot (review F1). A sliced load never
+        // fuses: the siblings slice by different head ranges than the fused matrix has.
+        let fused = if layout == WeightLayout::Native && slice_specs.is_empty() && gdn_fuse_inproj()
+        {
             gdn_inproj_groups(names)
         } else {
             Vec::new()
@@ -419,11 +576,37 @@ impl CudaProjector {
         }
         let tensors = names
             .iter()
-            .map(|name| planned(weights, name, layout))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|name| {
+                let (tensor, whole_bytes) = planned(weights, name, layout)?;
+                match slice_specs.get(name) {
+                    None => Ok(PlannedTensor {
+                        tensor,
+                        bytes: whole_bytes,
+                        slice: None,
+                    }),
+                    Some(spec) => {
+                        let slice = plan::plan_slice(
+                            name,
+                            tensor.ggml_type(),
+                            tensor.dims(),
+                            spec.cols.clone(),
+                            spec.rows.clone(),
+                        )?;
+                        let bytes = slice.bytes;
+                        Ok(PlannedTensor {
+                            tensor,
+                            bytes,
+                            slice: Some(slice),
+                        })
+                    }
+                }
+            })
+            .collect::<Result<Vec<PlannedTensor<'_>>, EngError>>()?;
         let total = tensors
             .iter()
-            .try_fold(0u64, |sum, &(_, bytes)| sum.checked_add(bytes))
+            .try_fold(0u64, |sum, planned_tensor| {
+                sum.checked_add(planned_tensor.bytes)
+            })
             .ok_or_else(|| EngError::MemoryPlan("cuda admission: tensors overflow u64".into()))?;
         let policy = LoadPolicy::for_device(self.integrated);
         // Before admission: the free figure of an integrated GPU counts cache as
@@ -483,13 +666,14 @@ impl CudaProjector {
         let upload_began = Instant::now();
         let mut fused_at: HashMap<usize, [usize; 3]> = fused.into_iter().collect();
         let mut skip: HashSet<usize> = fused_at.values().flatten().copied().collect();
-        for (position, (tensor, _)) in tensors.iter().enumerate() {
+        for (position, planned_tensor) in tensors.iter().enumerate() {
+            let tensor = planned_tensor.tensor;
             if skip.remove(&position) {
                 continue;
             }
             let weight = if let Some(sibs) = fused_at.remove(&position) {
                 let sib_positions = sibs;
-                let sibs = sib_positions.map(|slot| tensors[slot].0);
+                let sibs = sib_positions.map(|slot| tensors[slot].tensor);
                 let weight = retry_on_oom(
                     &policy,
                     &self.oom_retries,
@@ -500,7 +684,7 @@ impl CudaProjector {
                 // evictable exactly like the pushed tensor's own range (review F5).
                 if let Some(file) = drop_file {
                     for &slot in &sib_positions {
-                        let (sib, _) = tensors[slot];
+                        let sib = tensors[slot].tensor;
                         cuda::drop_page_cache(file, sib.abs_offset(), sib.byte_len())?;
                     }
                 }
@@ -509,7 +693,7 @@ impl CudaProjector {
                 retry_on_oom(
                     &policy,
                     &self.oom_retries,
-                    || self.upload(weights, tensor, layout),
+                    || self.upload(weights, tensor, layout, planned_tensor.slice.as_ref()),
                     || recover(weights.file(), policy.retry_pause),
                 )?
             };
@@ -652,14 +836,19 @@ impl CudaProjector {
         weights: &GgufWeights,
         tensor: &GgufTensor,
         layout: WeightLayout,
+        slice: Option<&plan::TensorSlice>,
     ) -> Result<CudaWeight, EngError> {
         let name = tensor.name();
         match (tensor.ggml_type(), layout) {
             (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
-                self.upload_quant(weights, tensor, name, ty, layout)
+                self.upload_quant(weights, tensor, name, ty, layout, slice)
             }
             (ty @ (GgufType::F32 | GgufType::F16), _) => {
                 let (_, bytes) = weights.read_tensor(name)?;
+                let bytes = match slice {
+                    Some(slice) => plan::assemble_slice(&bytes, slice)?,
+                    None => bytes,
+                };
                 Ok(CudaWeight::Raw {
                     name: name.to_owned(),
                     ty,
@@ -686,7 +875,11 @@ impl CudaProjector {
         name: &str,
         ty: GgufType,
         layout: WeightLayout,
+        slice: Option<&plan::TensorSlice>,
     ) -> Result<CudaWeight, EngError> {
+        if let Some(slice) = slice {
+            return self.upload_quant_sliced(weights, tensor, name, ty, slice);
+        }
         let (n_rows, k) = matrix_shape(tensor)?;
         let experts = stack_depth(tensor)?;
         let source_len = usize::try_from(tensor.byte_len()).map_err(|_| {
@@ -728,6 +921,59 @@ impl CudaProjector {
                 "tensor {name}: GGUF blocks cannot be uploaded as EXL3"
             ))),
         }
+    }
+
+    /// Uploads one slice of a quantized tensor in the native layout: the
+    /// sliced shape goes through the same `upload_native` chunking as a
+    /// whole tensor, with a reader that maps assembled offsets to the
+    /// slice's file segments. The device then holds exactly the bytes a
+    /// file containing only the sliced tensor would upload.
+    fn upload_quant_sliced(
+        &self,
+        weights: &GgufWeights,
+        tensor: &GgufTensor,
+        name: &str,
+        ty: GgufType,
+        slice: &plan::TensorSlice,
+    ) -> Result<CudaWeight, EngError> {
+        let shape_error =
+            || EngError::Checkpoint(format!("tensor {name} has an unusable sliced shape"));
+        if slice.dims.len() != tensor.dims().len() {
+            return Err(shape_error());
+        }
+        let k = usize::try_from(slice.dims[0]).map_err(|_| shape_error())?;
+        let n_rows = slice.dims[1..]
+            .iter()
+            .try_fold(1u64, |rows, &dim| rows.checked_mul(dim))
+            .and_then(|rows| usize::try_from(rows).ok())
+            .ok_or_else(shape_error)?;
+        let experts = match slice.dims.get(2) {
+            Some(&depth) => Some(usize::try_from(depth).map_err(|_| shape_error())?),
+            None => None,
+        };
+        let source_len = usize::try_from(slice.bytes).map_err(|_| {
+            EngError::MemoryPlan(format!("cuda allocate: tensor {name} slice does not fit"))
+        })?;
+        let quant = QuantTensor {
+            name,
+            ty,
+            n_rows,
+            k,
+            source_len,
+        };
+        let reader = SliceReader::new(&slice.segments);
+        let weight = self
+            .context
+            .upload_native(quant, self.chunk_limit, &mut |at, buf| {
+                reader.fill(at as u64, buf, &mut |offset, part| {
+                    weights.read_range(name, offset, part)
+                })
+            })?
+            .with_experts(experts);
+        Ok(CudaWeight::Native {
+            name: name.to_owned(),
+            weight,
+        })
     }
 }
 
@@ -927,10 +1173,11 @@ fn planned<'w>(
 /// one chunk of at most `chunk_limit` bytes.
 fn check_scale_ranges(
     weights: &GgufWeights,
-    tensors: &[(&GgufTensor, u64)],
+    tensors: &[PlannedTensor<'_>],
     chunk_limit: usize,
 ) -> Result<(), EngError> {
-    for &(tensor, _) in tensors {
+    for planned_tensor in tensors {
+        let tensor = planned_tensor.tensor;
         let check = match tensor.ggml_type() {
             GgufType::Q6K => cuda::check_q6k_scales,
             GgufType::Q80 => cuda::check_q8_0_scales,

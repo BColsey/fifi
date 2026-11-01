@@ -1635,6 +1635,151 @@ fn a_native_load_puts_the_file_bytes_on_the_device_and_refuses_tile_readers() {
     );
 }
 
+/// Q8_0 payload in which every block holds one repeated marker byte, its
+/// global block index modulo 251, so a downloaded slice names its blocks.
+fn marked_q80_payload(blocks: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(blocks * Q8_0_BLOCK_BYTES);
+    for block in 0..blocks {
+        payload.resize(payload.len() + Q8_0_BLOCK_BYTES, (block % 251) as u8);
+    }
+    payload
+}
+
+#[test]
+fn the_slice_reader_serves_any_chunking_of_the_assembled_stream() {
+    let dims = [128u64, 6, 3];
+    let source = marked_q80_payload(72);
+    let slice = crate::kernels::cuda::plan::plan_slice("e", GgufType::Q80, &dims, 32..96, 1..5)
+        .expect("plan the slice");
+    let want = crate::kernels::cuda::plan::assemble_slice(&source, &slice).expect("assemble");
+    let reader = SliceReader::new(&slice.segments);
+    for chunk in [1usize, 7, 34, 100, 4096] {
+        let mut got = Vec::new();
+        let mut at = 0u64;
+        while (got.len() as u64) < slice.bytes {
+            let take = chunk.min(usize::try_from(slice.bytes).expect("bytes") - got.len());
+            let mut part = vec![0u8; take];
+            reader
+                .fill(at, &mut part, &mut |offset, buf| {
+                    let start = usize::try_from(offset).expect("offset");
+                    buf.copy_from_slice(&source[start..start + buf.len()]);
+                    Ok(())
+                })
+                .expect("fill");
+            got.extend_from_slice(&part);
+            at += take as u64;
+        }
+        assert_eq!(got, want, "chunk {chunk}");
+    }
+    // A read past the end refuses instead of serving bytes of another block.
+    let mut byte = [0u8; 1];
+    assert!(
+        reader
+            .fill(slice.bytes, &mut byte, &mut |_, _| Ok(()))
+            .is_err()
+    );
+}
+
+#[test]
+fn a_sliced_native_load_uploads_exactly_the_slice_bytes() {
+    const NAME: &str = "a_sliced_native_load_uploads_exactly_the_slice_bytes";
+    if !device_present(NAME) {
+        return;
+    }
+    // An expert stack: 3 experts of 6 rows of 128 Q8_0 values.
+    let dims = [128u64, 6, 3];
+    let payload = marked_q80_payload(72);
+    let (_dir, weights) = open_fixture(&[Entry {
+        name: "stack",
+        ty: GgufType::Q80,
+        dims: dims.to_vec(),
+        payload: payload.clone(),
+    }]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let download_native = |loaded: &CudaWeights| -> Vec<u8> {
+        let CudaWeight::Native { weight, .. } = weight_of(loaded, "stack") else {
+            panic!("stack did not load native");
+        };
+        assert_eq!(weight.experts(), Some(3));
+        let mut device = vec![0u8; weight.buffer().bytes()];
+        projector
+            .context
+            .download(weight.buffer(), &mut device)
+            .expect("download the slice");
+        device
+    };
+    // The whole upload through the new entry point, empty slice set included.
+    let whole = projector
+        .load(&weights, &["stack"], native)
+        .expect("load whole");
+    assert_eq!(download_native(&whole), payload);
+    drop(whole);
+    let specs = [(
+        "stack",
+        SliceSpec {
+            cols: 32..96,
+            rows: 1..5,
+        },
+    )];
+    let sliced = projector
+        .load_sliced(&weights, &["stack"], native, &specs)
+        .expect("load sliced");
+    let plan = crate::kernels::cuda::plan::plan_slice("stack", GgufType::Q80, &dims, 32..96, 1..5)
+        .expect("plan");
+    assert_eq!(
+        sliced.device_bytes(),
+        usize::try_from(plan.bytes).expect("bytes")
+    );
+    let CudaWeight::Native { weight, .. } = weight_of(&sliced, "stack") else {
+        panic!("stack did not load native");
+    };
+    assert_eq!((weight.n_rows(), weight.k()), (12, 64));
+    assert_eq!(
+        download_native(&sliced),
+        crate::kernels::cuda::plan::assemble_slice(&payload, &plan).expect("assemble")
+    );
+    drop(sliced);
+    // Two column halves over all rows tile the whole tensor's admission.
+    let halves = [(0..64u64), (64..128u64)].map(|cols| {
+        let spec = [("stack", SliceSpec { cols, rows: 0..6 })];
+        projector
+            .load_sliced(&weights, &["stack"], native, &spec)
+            .expect("load half")
+            .device_bytes()
+    });
+    assert_eq!(halves[0] + halves[1], payload.len());
+    // Sliced-load refusals name their cause before any upload.
+    assert_error(
+        projector.load_sliced(&weights, &["stack"], LoadOptions::default(), &specs),
+        "Checkpoint",
+        "needs the Native layout",
+    );
+    assert_error(
+        projector.load_sliced(
+            &weights,
+            &["stack"],
+            native,
+            &[("other", specs[0].1.clone())],
+        ),
+        "Checkpoint",
+        "not part of this load",
+    );
+    assert_error(
+        projector.load_sliced(
+            &weights,
+            &["stack"],
+            native,
+            &[specs[0].clone(), specs[0].clone()],
+        ),
+        "Checkpoint",
+        "sliced twice",
+    );
+}
+
 #[test]
 fn a_stack_of_experts_that_miss_the_tile_groups_fails_the_load() {
     const NAME: &str = "a_stack_of_experts_that_miss_the_tile_groups_fails_the_load";
@@ -3277,7 +3422,13 @@ fn plan_of<'a>(
 ) -> LoadPlan<'a> {
     let tensors = names
         .iter()
-        .map(|name| planned(weights, name, WeightLayout::Tiled))
+        .map(|name| {
+            planned(weights, name, WeightLayout::Tiled).map(|(tensor, bytes)| PlannedTensor {
+                tensor,
+                bytes,
+                slice: None,
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .expect("plan the tensors");
     LoadPlan {
