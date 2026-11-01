@@ -36,7 +36,8 @@ use super::shard::ShardTable;
 use crate::EngError;
 use crate::family::project::cuda::served_admission;
 use crate::kernels::cuda::peer_ring::{PeerRing, STATUS_TIMEOUT};
-use crate::kernels::cuda::resident::attn_prep::{AttnPrepRowsCall, RopeParams};
+use crate::kernels::cuda::resident::attn_prep::{AttnPrepCall, AttnPrepRowsCall, RopeParams};
+use crate::kernels::cuda::resident::kv_f16_append::{KvF16AppendData, KvF16AppendShape};
 use crate::kernels::cuda::resident::kv8_append::{Kv8CodeScale, Kv8Data, Kv8Shape};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 
@@ -585,4 +586,302 @@ fn a_poisoned_v_gather_stops_the_session_before_the_append() {
             "card {card} scales must stay untouched"
         );
     }
+}
+
+/// The fp16 caches of one card: raw half-word bytes, compared bit-exact.
+struct F16CardResult {
+    k_cache: Vec<u8>,
+    v_cache: Vec<u8>,
+}
+
+struct F16Pipeline {
+    reference_k_cache: Vec<u8>,
+    reference_v_cache: Vec<u8>,
+    cards: Vec<F16CardResult>,
+}
+
+/// The Fp16 arm of the rig: the card path (per-card attn_prep_rows, K+V
+/// gathers, gate, `kv_f16_append`) against the FUSED single-device fp16
+/// append inside `attn_prep` on the reference context. Bit-exact cache
+/// equality is the contract: the standalone kernel is the fused kernel's
+/// store arm, same `__float2half`, same `[cells][n_kv_head][256]` layout.
+fn run_two_context_f16_pipeline(steps: usize) -> Result<F16Pipeline, EngError> {
+    let admission = served_admission();
+    let table = ShardTable::new(&dims().shape, 2, 256)?;
+    let full = MixerGeometry::new(&dims())?;
+    let card_geometry = [
+        MixerGeometry::for_card(&dims(), &table, 0)?,
+        MixerGeometry::for_card(&dims(), &table, 1)?,
+    ];
+    let kv_runs = [table.kv_rows(0)?, table.kv_rows(1)?];
+    let q_runs = [table.query_heads(0)?, table.query_heads(1)?];
+    let card_kv = [
+        card_kv_heads(
+            (kv_runs[0].start, kv_runs[0].end),
+            card_geometry[0].attn.head_dim,
+        )?,
+        card_kv_heads(
+            (kv_runs[1].start, kv_runs[1].end),
+            card_geometry[1].attn.head_dim,
+        )?,
+    ];
+    let norm: Vec<f32> = (0..full.attn.head_dim)
+        .map(|i| 1.0 + (i % 64) as f32 / 128.0)
+        .collect();
+    let rope = RopeParams {
+        eps: full.eps,
+        rope_base: full.attn.rope_base,
+    };
+    let kv_total = full.attn.kv_rows;
+    let norm_bytes = norm.len() * F32;
+    let cache_bytes = CELLS * full.attn.heads_kv * full.attn.head_dim * 2;
+    let contexts = [
+        CudaContext::with_admission_on(0, &admission)?,
+        CudaContext::with_admission_on(0, &admission)?,
+    ];
+    let streams = [contexts[0].stream()?, contexts[1].stream()?];
+
+    // The reference: the FUSED fp16 append of the single-device path, run
+    // per token step into its own caches.
+    let reference_context = &contexts[0];
+    let reference_stream = &streams[0];
+    let ref_q = upload_on(
+        reference_context,
+        reference_stream,
+        &f32_bytes(&vec![0.0; full.attn.q_width]),
+    )?;
+    let ref_norm = upload_on(reference_context, reference_stream, &f32_bytes(&norm))?;
+    let ref_k_cache = upload_on(reference_context, reference_stream, &vec![0u8; cache_bytes])?;
+    let ref_v_cache = upload_on(reference_context, reference_stream, &vec![0u8; cache_bytes])?;
+    let ref_pos = upload_on(reference_context, reference_stream, &u32_bytes(&[0]))?;
+    let ref_status = upload_on(reference_context, reference_stream, &u32_bytes(&[0]))?;
+    for step in 0..steps {
+        let (full_row, _) = fused_rows(&full, &q_runs, &kv_runs, step);
+        let pos = POS + step as i32;
+        let ref_proj = upload_on(reference_context, reference_stream, &f32_bytes(&full_row))?;
+        ref_pos.write_at(reference_stream, 0, &u32_bytes(&[pos as u32]))?;
+        reference_context.attn_prep(
+            reference_stream,
+            AttnPrepCall {
+                shape: card_prep_shape(&full, full.attn.heads_kv, CELLS),
+                rope,
+                admit_pos: pos as usize,
+                proj: ref_proj.range(0, full.attn.ld * F32)?,
+                q_norm: ref_norm.range(0, norm_bytes)?,
+                k_norm: ref_norm.range(0, norm_bytes)?,
+                k_cache: ref_k_cache.range(0, cache_bytes)?,
+                v_cache: ref_v_cache.range(0, cache_bytes)?,
+                q: ref_q.range(0, full.attn.q_width * F32)?,
+                pos: ref_pos.range(0, 4)?,
+                status: ref_status.range(0, 4)?,
+            },
+        )?;
+    }
+    reference_stream.synchronize()?;
+
+    // The cards: rows through the gathers, then the standalone fp16 append.
+    struct F16Side {
+        q: DeviceBuffer,
+        k_rows: DeviceBuffer,
+        v_rows: DeviceBuffer,
+        norm: DeviceBuffer,
+        pos: DeviceBuffer,
+        status: DeviceBuffer,
+        gather_status: DeviceBuffer,
+        k_cache: DeviceBuffer,
+        v_cache: DeviceBuffer,
+    }
+    let mut sides = Vec::new();
+    for card in 0..2 {
+        let context = &contexts[card];
+        let g = &card_geometry[card];
+        sides.push(F16Side {
+            q: upload_on(
+                context,
+                &streams[card],
+                &f32_bytes(&vec![0.0; g.attn.q_width]),
+            )?,
+            k_rows: upload_on(context, &streams[card], &f32_bytes(&vec![0.0; kv_total]))?,
+            v_rows: upload_on(context, &streams[card], &f32_bytes(&vec![0.0; kv_total]))?,
+            norm: upload_on(context, &streams[card], &f32_bytes(&norm))?,
+            pos: upload_on(context, &streams[card], &u32_bytes(&[POS as u32]))?,
+            status: upload_on(context, &streams[card], &u32_bytes(&[0]))?,
+            gather_status: upload_on(context, &streams[card], &u32_bytes(&[0]))?,
+            k_cache: upload_on(context, &streams[card], &vec![0u8; cache_bytes])?,
+            v_cache: upload_on(context, &streams[card], &vec![0u8; cache_bytes])?,
+        });
+    }
+    let ring = PeerRing::new(&contexts, kv_total)?;
+    let shape = KvF16AppendShape {
+        rows: 1,
+        n_kv_head: full.attn.heads_kv,
+        head_dim: full.attn.head_dim,
+        cells: CELLS,
+    };
+    for step in 0..steps {
+        let (_, card_rows_now) = fused_rows(&full, &q_runs, &kv_runs, step);
+        let pos = POS + step as i32;
+        for card in 0..2 {
+            let g = &card_geometry[card];
+            let proj = upload_on(
+                &contexts[card],
+                &streams[card],
+                &f32_bytes(&card_rows_now[card]),
+            )?;
+            sides[card]
+                .pos
+                .write_at(&streams[card], 0, &u32_bytes(&[pos as u32]))?;
+            let kv_run = (kv_runs[card].start, kv_runs[card].end);
+            contexts[card].attn_prep_rows(
+                &streams[card],
+                AttnPrepRowsCall {
+                    shape: card_prep_shape(g, card_kv[card], CELLS),
+                    rope,
+                    admit_pos: pos as usize,
+                    proj: proj.range(0, g.attn.ld * F32)?,
+                    q_norm: sides[card].norm.range(0, norm_bytes)?,
+                    k_norm: sides[card].norm.range(0, norm_bytes)?,
+                    k_rows: kv_slice(&sides[card].k_rows, kv_run)?,
+                    v_rows: kv_slice(&sides[card].v_rows, kv_run)?,
+                    q: sides[card].q.range(0, g.attn.q_width * F32)?,
+                    pos: sides[card].pos.range(0, 4)?,
+                    status: sides[card].status.range(0, 4)?,
+                },
+            )?;
+        }
+        for half in ['k', 'v'] {
+            let mut parts = Vec::new();
+            let mut outs = Vec::new();
+            let mut statuses = Vec::new();
+            for card in 0..2 {
+                let buffer = if half == 'k' {
+                    &sides[card].k_rows
+                } else {
+                    &sides[card].v_rows
+                };
+                let kv_run = (kv_runs[card].start, kv_runs[card].end);
+                parts.push(kv_slice(buffer, kv_run)?);
+                outs.push(buffer.range(0, kv_total * F32)?);
+                statuses.push(sides[card].gather_status.range(0, 4)?);
+            }
+            ring.all_gather_row(
+                &contexts, &streams, &parts, &outs, &statuses, &kv_runs, kv_total,
+            )?;
+        }
+        streams[0].synchronize()?;
+        streams[1].synchronize()?;
+        let word = |card: usize| -> Result<u32, EngError> {
+            Ok(download_u32(&contexts[card], &sides[card].gather_status)?[0])
+        };
+        gathers_clean(&[word(0)?, word(1)?])?;
+        for card in 0..2 {
+            contexts[card].kv_f16_append(
+                &streams[card],
+                shape,
+                KvF16AppendData {
+                    k: sides[card].k_rows.range(0, kv_total * F32)?,
+                    v: sides[card].v_rows.range(0, kv_total * F32)?,
+                    k_cache: sides[card].k_cache.range(0, cache_bytes)?,
+                    v_cache: sides[card].v_cache.range(0, cache_bytes)?,
+                },
+                sides[card].pos.range(0, 4)?,
+                sides[card].status.range(0, 4)?,
+            )?;
+        }
+        streams[0].synchronize()?;
+        streams[1].synchronize()?;
+    }
+    let mut cards = Vec::new();
+    for card in 0..2 {
+        cards.push(F16CardResult {
+            k_cache: download_bytes(&contexts[card], &sides[card].k_cache)?,
+            v_cache: download_bytes(&contexts[card], &sides[card].v_cache)?,
+        });
+    }
+    Ok(F16Pipeline {
+        reference_k_cache: download_bytes(reference_context, &ref_k_cache)?,
+        reference_v_cache: download_bytes(reference_context, &ref_v_cache)?,
+        cards,
+    })
+}
+
+#[test]
+fn two_contexts_f16_append_matches_the_fused_cache() {
+    if !device_present("two_contexts_f16_append_matches_the_fused_cache") {
+        return;
+    }
+    let pipeline = run_two_context_f16_pipeline(3).expect("device phase");
+    for (card, result) in pipeline.cards.iter().enumerate() {
+        // Bit-exact half-words against the fused single-device append:
+        // rows 37, 38, 39 written, the rest untouched (zero).
+        assert_eq!(
+            result.k_cache, pipeline.reference_k_cache,
+            "card {card} k cache"
+        );
+        assert_eq!(
+            result.v_cache, pipeline.reference_v_cache,
+            "card {card} v cache"
+        );
+    }
+}
+
+#[test]
+fn kv_f16_append_refuses_shapes_the_kernel_rejects() {
+    if !device_present("kv_f16_append_refuses_shapes_the_kernel_rejects") {
+        return;
+    }
+    let admission = served_admission();
+    let context = CudaContext::with_admission_on(0, &admission).expect("context");
+    let stream = context.stream().expect("stream");
+    let rows = upload_on(&context, &stream, &f32_bytes(&[0.0; 512])).expect("rows");
+    let cache = upload_on(&context, &stream, &vec![0u8; 4096]).expect("cache");
+    let pos = upload_on(&context, &stream, &u32_bytes(&[0])).expect("pos");
+    let status = upload_on(&context, &stream, &u32_bytes(&[0])).expect("status");
+    let shape = KvF16AppendShape {
+        rows: 1,
+        n_kv_head: 2,
+        head_dim: 256,
+        cells: 4,
+    };
+    let data = KvF16AppendData {
+        k: rows.range(0, 2048).expect("k"),
+        v: rows.range(0, 2048).expect("v"),
+        k_cache: cache.range(0, 4096).expect("k cache"),
+        // A v_cache too short for one cache (2048 of 4096 bytes) must
+        // refuse before any native call.
+        v_cache: cache.range(0, 2048).expect("v cache"),
+    };
+    let err = context
+        .kv_f16_append(
+            &stream,
+            shape,
+            data,
+            pos.range(0, 4).unwrap(),
+            status.range(0, 4).unwrap(),
+        )
+        .expect_err("a short v_cache");
+    assert!(
+        matches!(&err, EngError::BadRequest(m) if m.contains("v_cache")),
+        "names the range: {err:?}"
+    );
+    let mut shape17 = shape;
+    shape17.rows = 17;
+    let err = context
+        .kv_f16_append(
+            &stream,
+            shape17,
+            KvF16AppendData {
+                k: rows.range(0, 2048).unwrap(),
+                v: rows.range(0, 2048).unwrap(),
+                k_cache: cache.range(0, 4096).unwrap(),
+                v_cache: cache.range(0, 4096).unwrap(),
+            },
+            pos.range(0, 4).unwrap(),
+            status.range(0, 4).unwrap(),
+        )
+        .expect_err("rows above the decode bound");
+    assert!(
+        matches!(&err, EngError::BadRequest(m) if m.contains("rows")),
+        "names rows: {err:?}"
+    );
 }

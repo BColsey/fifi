@@ -66,6 +66,7 @@ pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod gemma_matvec;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod kv8_append;
+pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod kv_f16_rows;
 pub(in crate::kernels::cuda) mod mailbox;
 pub(in crate::kernels::cuda) mod matmul_expert;
