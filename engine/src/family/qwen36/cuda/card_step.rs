@@ -1,14 +1,16 @@
 //! The per-card execution owner of the multi-device step (v1 eager).
 //!
-//! [`CardShard`] owns every device resource one card needs, in the drop
-//! order the ownership requires (buffers, then the stream, then the
-//! context), and [`CardStack`] owns the shards plus the one [`PeerRing`]
-//! that spans them. What each shard holds:
+//! [`CardStack`] owns the whole distributed step: one [`CardShard`] per
+//! card (its arena, its full-size state, its ring status word), the
+//! contexts, the ONE stream per card (the coordinator invariant of
+//! `multi.rs`), and the [`PeerRing`] spanning them. Contexts and streams
+//! sit at the STACK, not inside the shards, because the ring operations
+//! take the participating contexts and streams as whole slices; the
+//! shard's buffers hold their own device leases, so they stay valid
+//! wherever the handles live.
 //!
-//! * the CUDA context, bound to the card's device ordinal;
-//! * ONE stream - the coordinator invariant of `multi.rs` (all local
-//!   kernels and all ring participation of this card queue on it, in the
-//!   global exchange order);
+//! What each shard holds:
+//!
 //! * the arena built from `StepPlan::for_card`'s tensor list through the
 //!   same planner, so arena tensor `i` IS plan slot `i` at the plan's
 //!   offset;
@@ -35,58 +37,40 @@ use crate::family::qwen36::cuda::dims::{StepDims, StepOptions};
 use crate::family::qwen36::cuda::shard::ShardTable;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::{KernelScratch, StepPlan};
-use crate::kernels::cuda::peer_ring::PeerRing;
+use crate::kernels::cuda::peer_ring::{PeerRing, RingMode};
 use crate::kernels::cuda::{
     Admission, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
 };
 
-/// One card's device resources. Field order is drop order: the arena, the
-/// state and the status word (all allocated through the context) drop
-/// before the stream, and the stream before the context that owns it.
+/// One card's device allocations. Field order is drop order; every buffer
+/// holds its own device lease, so nothing here depends on the context
+/// handle outliving the shard.
 pub(crate) struct CardShard {
     arena: DeviceArena,
     state: ResidentState,
     ring_word: DeviceBuffer,
-    stream: DeviceStream,
-    context: CudaContext,
 }
 
 impl CardShard {
-    /// Builds the shard around an existing context: its one stream, the
-    /// arena over `plan`'s tensor list, the full-size state, and a zeroed
-    /// ring status word. The ring must be built from the bare contexts
-    /// BEFORE this takes them: [`PeerRing`] captures each mailbox's base
-    /// address, so the contexts may move into shards afterwards.
-    pub(crate) fn with_context(
-        context: CudaContext,
+    /// The shard's allocations on `context` with `stream`: the arena over
+    /// `plan`'s tensor list, the full-size state, and a zeroed ring status
+    /// word.
+    pub(crate) fn new(
+        context: &CudaContext,
+        stream: &DeviceStream,
         plan: &StepPlan,
         dims: &StepDims,
         options: &StepOptions,
     ) -> Result<Self, EngError> {
-        let stream = context.stream()?;
         let arena = context.arena(&plan.arena_tensors())?;
-        let state = ResidentState::allocate(&context, &stream, dims, options)?;
+        let state = ResidentState::allocate(context, stream, dims, options)?;
         let ring_word = context.allocate(4)?;
-        ring_word.write_at(&stream, 0, &0u32.to_le_bytes())?;
+        ring_word.write_at(stream, 0, &0u32.to_le_bytes())?;
         Ok(Self {
             arena,
             state,
             ring_word,
-            stream,
-            context,
         })
-    }
-
-    /// The shard on a freshly admitted `device`.
-    pub(crate) fn new(
-        device: usize,
-        admission: &Admission,
-        plan: &StepPlan,
-        dims: &StepDims,
-        options: &StepOptions,
-    ) -> Result<Self, EngError> {
-        let context = CudaContext::with_admission_on(device, admission)?;
-        Self::with_context(context, plan, dims, options)
     }
 
     /// Arena tensor `index` of this card's plan: the same slot, at the
@@ -97,14 +81,6 @@ impl CardShard {
 
     pub(crate) fn state(&self) -> &ResidentState {
         &self.state
-    }
-
-    pub(crate) fn stream(&self) -> &DeviceStream {
-        &self.stream
-    }
-
-    pub(crate) fn context(&self) -> &CudaContext {
-        &self.context
     }
 
     /// The card's ring status word as the range the ring operations take.
@@ -118,15 +94,18 @@ impl CardShard {
     }
 }
 
-/// The whole distributed step's owners: one shard per card, the shared
-/// ring, the shard table, and every card's plan. The ring is declared
-/// first: its mailboxes are allocations of the shard contexts, so it must
-/// drop before them.
+/// The whole distributed step's owners. Field order is drop order: the
+/// ring's mailboxes first, then the shards' allocations, then the plain
+/// plans and table, and the context handles last - though every device
+/// allocation above carries its own lease, the order keeps destruction
+/// easy to reason about.
 pub(crate) struct CardStack {
     ring: PeerRing,
     shards: Vec<CardShard>,
     table: ShardTable,
     plans: Vec<StepPlan>,
+    streams: Vec<DeviceStream>,
+    contexts: Vec<CudaContext>,
 }
 
 impl CardStack {
@@ -150,17 +129,26 @@ impl CardStack {
         let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
         let scratch = KernelScratch::for_dims(dims, 1, options.kv_mode)?;
         let mut contexts = Vec::with_capacity(devices.len());
+        let mut streams = Vec::with_capacity(devices.len());
         for &device in devices {
-            contexts.push(CudaContext::with_admission_on(device, admission)?);
+            let context = CudaContext::with_admission_on(device, admission)?;
+            streams.push(context.stream()?);
+            contexts.push(context);
         }
         // The ring first: it captures each mailbox's base address from the
-        // bare contexts, which then move into the shards.
+        // bare contexts before anything else borrows them.
         let ring = PeerRing::new(&contexts, dims.shape.hidden)?;
         let mut plans = Vec::with_capacity(devices.len());
         let mut shards = Vec::with_capacity(devices.len());
-        for (card, context) in contexts.into_iter().enumerate() {
+        for (card, context) in contexts.iter().enumerate() {
             let plan = StepPlan::for_card(dims, &table, card, options, &scratch)?;
-            shards.push(CardShard::with_context(context, &plan, dims, options)?);
+            shards.push(CardShard::new(
+                context,
+                &streams[card],
+                &plan,
+                dims,
+                options,
+            )?);
             plans.push(plan);
         }
         Ok(Self {
@@ -168,6 +156,8 @@ impl CardStack {
             shards,
             table,
             plans,
+            streams,
+            contexts,
         })
     }
 
@@ -186,6 +176,59 @@ impl CardStack {
     pub(crate) fn plans(&self) -> &[StepPlan] {
         &self.plans
     }
+
+    /// The participating contexts, one per card, in card order.
+    pub(crate) fn contexts(&self) -> &[CudaContext] {
+        &self.contexts
+    }
+
+    /// The ONE stream per card, in card order: the coordinator invariant.
+    pub(crate) fn streams(&self) -> &[DeviceStream] {
+        &self.streams
+    }
+
+    /// One ring sum over every card: `partials[card]` in, `outs[card]`
+    /// out, `statuses[card]` ORed. The executor's per-op entry point; the
+    /// caller keeps the gather-pair gate and the end-of-token fold.
+    pub(crate) fn exchange_sum(
+        &self,
+        partials: &[DeviceRange<'_>],
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+        mode: RingMode,
+    ) -> Result<(), EngError> {
+        self.ring.exchange_sum(
+            &self.contexts,
+            &self.streams,
+            partials,
+            outs,
+            statuses,
+            count,
+            mode,
+        )
+    }
+
+    /// One ring broadcast from `source_card`, the same argument shape as
+    /// [`Self::exchange_sum`].
+    pub(crate) fn broadcast(
+        &self,
+        source_card: usize,
+        src: DeviceRange<'_>,
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.ring.broadcast(
+            &self.contexts,
+            &self.streams,
+            source_card,
+            src,
+            outs,
+            statuses,
+            count,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +238,17 @@ mod device_tests {
     use crate::family::qwen36::cuda::common_tests::dims;
     use crate::family::qwen36::cuda::dims::KvMode;
     use crate::kernels::cuda::device_present;
+
+    fn options() -> StepOptions {
+        StepOptions {
+            kv_mode: KvMode::Int8G32,
+            context_tokens: 1024,
+            delta_slots: 1,
+            forked_experts: false,
+            tiered: None,
+            layout: crate::family::project::cuda::WeightLayout::Native,
+        }
+    }
 
     /// Two logical shards on the one physical device: every plan slot lands
     /// in its own arena at the plan's offset and size, both states are
@@ -208,16 +262,8 @@ mod device_tests {
             return;
         }
         let d = dims();
-        let options = StepOptions {
-            kv_mode: KvMode::Int8G32,
-            context_tokens: 1024,
-            delta_slots: 1,
-            forked_experts: false,
-            tiered: None,
-            layout: crate::family::project::cuda::WeightLayout::Native,
-        };
         let admission = served_admission();
-        let stack = CardStack::new(&d, &options, &[0, 0], &admission).expect("two logical shards");
+        let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("shards");
         assert_eq!(stack.shards().len(), 2);
         assert_eq!(stack.plans().len(), 2);
         assert_eq!(stack.ring().cards(), 2);
@@ -253,13 +299,123 @@ mod device_tests {
                 "card {card}: kv state size"
             );
         }
-        for shard in stack.shards() {
+        for (card, shard) in stack.shards().iter().enumerate() {
             let mut word = [0u8; 4];
             shard
                 .ring_word()
-                .read_at(shard.stream(), 0, &mut word)
+                .read_at(&stack.streams()[card], 0, &mut word)
                 .expect("read the status word");
             assert_eq!(u32::from_le_bytes(word), 0);
+        }
+    }
+
+    /// The destruction path under load: queue eight dependent chained
+    /// exchanges on a fresh stack, sync NOTHING, and drop the stack
+    /// through its ordinary field order (auxiliary buffers first, ring,
+    /// then the shards and handles). A healthy device afterwards - a
+    /// fresh stack exchanges exactly - proves the drop left no pending
+    /// reference or CUDA error behind; the test adds no synchronization
+    /// production itself does not perform.
+    #[test]
+    fn a_stack_with_queued_exchanges_drops_clean_without_syncs() {
+        const NAME: &str = "a_stack_with_queued_exchanges_drops_clean_without_syncs";
+        if !device_present(NAME) {
+            return;
+        }
+        let d = dims();
+        let admission = served_admission();
+        {
+            let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("stack");
+            let n = 64usize;
+            let rounds = 8usize;
+            // Auxiliary buffers after the stack, so they drop first.
+            let mut partials = Vec::with_capacity(2);
+            let mut outs = Vec::with_capacity(2 * rounds);
+            for card in 0..2 {
+                let seed: Vec<u8> = (0..n)
+                    .map(|i| ((card * 17 + i) as f32).to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .concat();
+                let partial = stack.contexts()[card].allocate(n * 4).expect("partial");
+                partial
+                    .write_at(&stack.streams()[card], 0, &seed)
+                    .expect("seed partial");
+                partials.push(partial);
+                for _ in 0..rounds {
+                    outs.push(stack.contexts()[card].allocate(n * 4).expect("out"));
+                }
+            }
+            // Round 0 from the seeded partials; every later round chains the
+            // previous round's out on the same card stream.
+            let mut previous = [
+                partials[0].range(0, n * 4).expect("range"),
+                partials[1].range(0, n * 4).expect("range"),
+            ];
+            for round in 0..rounds {
+                let current = [
+                    outs[round].range(0, n * 4).expect("range"),
+                    outs[rounds + round].range(0, n * 4).expect("range"),
+                ];
+                let statuses = [
+                    stack.shards()[0].ring_status().expect("status"),
+                    stack.shards()[1].ring_status().expect("status"),
+                ];
+                stack
+                    .exchange_sum(&previous, &current, &statuses, n, RingMode::F32)
+                    .expect("queue the chained exchange");
+                previous = current;
+            }
+            // No synchronize: the buffers and the stack drop as-is.
+        }
+        // The device must be healthy: a fresh stack exchanges exactly.
+        let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("fresh stack");
+        let n = 64usize;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        let b: Vec<f32> = (0..n).map(|i| 100.0 - i as f32).collect();
+        let mut partials = Vec::with_capacity(2);
+        let mut outs = Vec::with_capacity(2);
+        for (card, values) in [a.clone(), b.clone()].iter().enumerate() {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let partial = stack.contexts()[card].allocate(n * 4).expect("partial");
+            partial
+                .write_at(&stack.streams()[card], 0, &bytes)
+                .expect("seed");
+            partials.push(partial);
+            outs.push(stack.contexts()[card].allocate(n * 4).expect("out"));
+        }
+        stack
+            .exchange_sum(
+                &[
+                    partials[0].range(0, n * 4).expect("range"),
+                    partials[1].range(0, n * 4).expect("range"),
+                ],
+                &[
+                    outs[0].range(0, n * 4).expect("range"),
+                    outs[1].range(0, n * 4).expect("range"),
+                ],
+                &[
+                    stack.shards()[0].ring_status().expect("status"),
+                    stack.shards()[1].ring_status().expect("status"),
+                ],
+                n,
+                RingMode::F32,
+            )
+            .expect("the fresh exchange");
+        for card in 0..2 {
+            stack.streams()[card].synchronize().expect("sync");
+            let mut bytes = vec![0u8; n * 4];
+            outs[card]
+                .read_at(&stack.streams()[card], 0, &mut bytes)
+                .expect("read");
+            let got: Vec<f32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            for (i, (&g, (&x, &y))) in got.iter().zip(a.iter().zip(&b)).enumerate() {
+                assert_eq!(g, x + y, "card {card} value {i}");
+            }
         }
     }
 }
