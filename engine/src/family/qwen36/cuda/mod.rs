@@ -107,6 +107,9 @@ mod paging_store;
 #[cfg(test)]
 mod paging_store_tests;
 mod pinned;
+mod placement;
+#[cfg(test)]
+mod placement_tests;
 mod prefill;
 #[cfg(test)]
 mod prefill_device_tests;

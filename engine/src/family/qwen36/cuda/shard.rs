@@ -42,7 +42,7 @@ use crate::family::gguf_model::{Inventory, Role};
 use crate::family::project::cuda::SliceSpec;
 
 /// Values per dealt block of an expert's intermediate width and of a K/V row.
-const VALUE_BLOCK: usize = 32;
+pub(crate) const VALUE_BLOCK: usize = 32;
 
 fn refuse(message: String) -> EngError {
     EngError::BadRequest(format!("shard table: {message}"))
@@ -116,6 +116,52 @@ pub(crate) struct ShardTable {
     total_key_heads: usize,
 }
 
+/// Explicit per-card runs for every dealt dimension, as produced by the
+/// placement planner (`placement`). `from_runs` enforces exactly what
+/// `new` guarantees: contiguous whole-grain coverage and `k_align`
+/// column cuts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardRuns {
+    pub(crate) value_heads: Vec<Range<usize>>,
+    pub(crate) query_heads: Vec<Range<usize>>,
+    pub(crate) kv_rows: Vec<Range<usize>>,
+    pub(crate) inter: Vec<Range<usize>>,
+    pub(crate) shared_inter: Vec<Range<usize>>,
+    pub(crate) vocab: Vec<Range<usize>>,
+}
+
+/// Refuses runs that are not a contiguous full covering of `total` in
+/// whole `grain` units, or that leave a card with an empty run.
+fn check_runs(
+    runs: &[Range<usize>],
+    total: usize,
+    grain: usize,
+    what: &str,
+) -> Result<(), EngError> {
+    let mut at = 0;
+    for (card, run) in runs.iter().enumerate() {
+        if run.is_empty() {
+            return Err(refuse(format!("{what} run {card} is empty")));
+        }
+        if !run.len().is_multiple_of(grain) {
+            return Err(refuse(format!(
+                "{what} run {card} of {} values splits {grain}-value blocks",
+                run.len()
+            )));
+        }
+        if run.start != at {
+            return Err(refuse(format!(
+                "{what} runs are not contiguous at card {card}"
+            )));
+        }
+        at = run.end;
+    }
+    if at != total {
+        return Err(refuse(format!("{what} runs cover {at} of {total}")));
+    }
+    Ok(())
+}
+
 impl ShardTable {
     /// Builds the table for `cards` devices. `k_align` is the quantization
     /// block width along K that the column-sharded matrices (`o`, `out`,
@@ -165,6 +211,92 @@ impl ShardTable {
             value_dim: d.value_dim,
             head_dim: a.head_dim,
             total_key_heads: d.key_heads,
+        })
+    }
+
+    /// Builds the table from planner-chosen runs instead of the default
+    /// even deal. Same validation as `new`: whole-grain contiguous full
+    /// coverage per dimension, and `k_align` column cuts on the
+    /// partial-sum matrices.
+    pub(crate) fn from_runs(
+        shape: &HostShape,
+        k_align: usize,
+        runs: &ShardRuns,
+    ) -> Result<Self, EngError> {
+        shape.check()?;
+        let cards = runs.value_heads.len();
+        if cards == 0 {
+            return Err(refuse("a shard table needs at least one card".to_owned()));
+        }
+        let specs = [
+            (
+                runs.value_heads.as_slice(),
+                shape.delta.value_heads,
+                1,
+                "DeltaNet value heads",
+            ),
+            (
+                runs.query_heads.as_slice(),
+                shape.attn.heads_q,
+                1,
+                "attention query heads",
+            ),
+            (
+                runs.kv_rows.as_slice(),
+                shape.attn.heads_kv * shape.attn.head_dim,
+                VALUE_BLOCK,
+                "K/V rows",
+            ),
+            (
+                runs.inter.as_slice(),
+                shape.moe.inter,
+                VALUE_BLOCK,
+                "expert intermediate",
+            ),
+            (
+                runs.shared_inter.as_slice(),
+                shape.moe.shared_inter,
+                VALUE_BLOCK,
+                "shared intermediate",
+            ),
+            (runs.vocab.as_slice(), shape.vocab, 1, "vocabulary"),
+        ];
+        for (dim_runs, total, grain, what) in specs {
+            if dim_runs.len() != cards {
+                return Err(refuse(format!(
+                    "{what} has {} runs for {cards} cards",
+                    dim_runs.len()
+                )));
+            }
+            check_runs(dim_runs, total, grain, what)?;
+        }
+        let delta_out: Vec<Range<usize>> = runs
+            .value_heads
+            .iter()
+            .map(|run| run.start * shape.delta.value_dim..run.end * shape.delta.value_dim)
+            .collect();
+        check_k_cuts(&delta_out, k_align, "DeltaNet out")?;
+        let attn_o: Vec<Range<usize>> = runs
+            .query_heads
+            .iter()
+            .map(|run| run.start * shape.attn.head_dim..run.end * shape.attn.head_dim)
+            .collect();
+        check_k_cuts(&attn_o, k_align, "attention o")?;
+        check_k_cuts(&runs.inter, k_align, "expert down")?;
+        check_k_cuts(&runs.shared_inter, k_align, "shared down")?;
+        Ok(Self {
+            cards,
+            key_heads: vec![0..shape.delta.key_heads; cards],
+            value_heads: runs.value_heads.clone(),
+            query_heads: runs.query_heads.clone(),
+            kv_rows: runs.kv_rows.clone(),
+            inter: runs.inter.clone(),
+            shared_inter: runs.shared_inter.clone(),
+            vocab: runs.vocab.clone(),
+            key_dim: shape.delta.key_dim,
+            value_dim: shape.delta.value_dim,
+            head_dim: shape.attn.head_dim,
+            total_key_heads: shape.delta.key_heads,
         })
     }
 
@@ -507,14 +639,16 @@ mod tests {
 
     #[test]
     fn a_cut_inside_a_quantization_block_is_refused_by_name() {
-        // Expert down K is 512 wide: 2 cards cut at 256 and pass at alignment
-        // 256; 3 cards would cut at 192 and must refuse.
+        // At alignment 256 the three-card value-head deal [11, 11, 10] cuts
+        // the DeltaNet out columns at 11 * 128 = 1408 first (the value heads
+        // deal at grain 1, so the out-column cut lands mid-block); expert
+        // down would refuse later at 192. The refusal names the first cut.
         ShardTable::new(&shape(), 2, 256).expect("two cards at 256");
         let error = ShardTable::new(&shape(), 3, 256).expect_err("three cards at 256 refuse");
         match error {
             EngError::BadRequest(message) => {
-                assert!(message.contains("expert down"), "{message}");
-                assert!(message.contains("192"), "{message}");
+                assert!(message.contains("DeltaNet out"), "{message}");
+                assert!(message.contains("1408"), "{message}");
             }
             other => panic!("want BadRequest, got {other:?}"),
         }
@@ -612,10 +746,33 @@ mod tests {
                     assert_eq!(tensor.role, Role::TokenEmbd, "{name0}");
                 }
                 (ShardLoad::Whole, ShardLoad::Whole) => {}
-                (ShardLoad::Sliced(_), ShardLoad::Sliced(_)) => {
+                (ShardLoad::Sliced(spec0), ShardLoad::Sliced(_)) => {
+                    // The fused DeltaNet QKV and its conv replicate the
+                    // key channels on every card - `delta_qkv_segments` gives
+                    // each card TWO full-key-width row blocks with only the
+                    // third block's value rows dealt - so the pair over-covers
+                    // the tensor by exactly one replicated copy; every other
+                    // slice tiles the tensor exactly.
+                    let key_channels = (2 * shape().delta.key_heads * shape().delta.key_dim) as u64;
+                    let expected = match tensor.role {
+                        Role::AttnQkv | Role::SsmConv1d => {
+                            let key_rows = 0..key_channels;
+                            let key_copy = crate::kernels::cuda::plan::plan_slice_rows(
+                                name0,
+                                ty,
+                                &tensor.dims,
+                                spec0.cols.clone(),
+                                &[key_rows],
+                            )
+                            .expect("the replicated key slice must plan")
+                            .bytes;
+                            whole + key_copy
+                        }
+                        _ => whole,
+                    };
                     assert_eq!(
                         slice_bytes(load0) + slice_bytes(load1),
-                        whole,
+                        expected,
                         "{name0}: the two slices must cover the tensor exactly"
                     );
                 }
