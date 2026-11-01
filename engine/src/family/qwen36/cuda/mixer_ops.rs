@@ -683,6 +683,11 @@ pub(super) enum CardOp {
     GatherK,
     /// The V half, its own `all_gather_row` and sequence.
     GatherV,
+    /// The sum of every card's `Slot::MixOut` partial at the mixer/MoE
+    /// boundary, so the epilogue's fused residual add and norm see the
+    /// full mixer output: one ring sum, one sequence. Sits between the
+    /// block's out projection and the epilogue that consumes the row.
+    MixerSum,
 }
 
 /// The attention core of one card: the card's projections at its geometry's
@@ -846,6 +851,10 @@ pub(super) fn block_ops_card(
             )));
         }
     }
+    // The out projection above wrote this card's PARTIAL MixOut; the epilogue folds the row
+    // into the residual, so the partials must sum first (the `MixerSum` of `multi.rs`'s
+    // token plan).
+    ops.push(CardOp::MixerSum);
     ops.push(CardOp::Local(epilogue(layout)));
     Ok(ops)
 }

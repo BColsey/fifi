@@ -574,11 +574,51 @@ mod card_ops_tests {
                 KvMode::Fp16,
             )
             .expect("single-device list");
+            // The card list is the single-device list with the one card addition: the
+            // `MixerSum` ring marker between the out projection and the epilogue.
+            let mut want: Vec<CardOp> = single.into_iter().map(CardOp::Local).collect();
+            let last = want.len() - 1;
+            want.insert(last, CardOp::MixerSum);
             assert_eq!(
-                card_list,
-                single.into_iter().map(CardOp::Local).collect::<Vec<_>>(),
-                "card {card}: a DeltaNet card block is pure geometry substitution"
+                card_list, want,
+                "card {card}: a DeltaNet card block is geometry substitution plus the mixer sum"
             );
+        }
+    }
+
+    #[test]
+    fn the_mixer_sum_sits_between_the_out_projection_and_the_epilogue() {
+        let table = table(2);
+        for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
+            for card in 0..2 {
+                let g = card_geometry(&table, card);
+                let rows = table.kv_rows(card).expect("k rows");
+                let ops = block_ops_card(
+                    kind,
+                    &g,
+                    (rows.start, rows.end),
+                    WeightLayout::Native,
+                    KvMode::Fp16,
+                )
+                .expect("card list");
+                let at = ops.len() - 3;
+                // The op before the sum writes the partial the epilogue consumes.
+                let CardOp::Local(before) = &ops[at] else {
+                    panic!("{kind:?} card {card}: expected the out projection")
+                };
+                assert!(
+                    before.writes().contains(&Slot::MixOut),
+                    "{kind:?} card {card}: the sum's producer writes MixOut, met {before:?}"
+                );
+                assert_eq!(ops[at + 1], CardOp::MixerSum);
+                let CardOp::Local(after) = &ops[at + 2] else {
+                    panic!("{kind:?} card {card}: expected the epilogue")
+                };
+                assert!(
+                    after.reads().contains(&Slot::MixOut),
+                    "{kind:?} card {card}: the epilogue reads MixOut, met {after:?}"
+                );
+            }
         }
     }
 

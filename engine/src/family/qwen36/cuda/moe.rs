@@ -189,6 +189,59 @@ pub(super) fn moe_sequence(top_k: usize, layout: WeightLayout) -> Vec<MoeOp> {
     ops
 }
 
+/// One step of one card's MoE block: a local [`MoeOp`] launch, or one of the
+/// block's two ring exchanges. The sequence is the Native `moe_sequence` with
+/// the markers of `multi.rs`'s token plan inserted; the local launches differ
+/// from the single device's only in the weights they read (the card's expert
+/// rows), which the launcher holds, not this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CardMoeOp {
+    Local(MoeOp),
+    /// After the router on card 0 (which runs it alone): its picks ride one
+    /// broadcast - `TopkId`, `TopkWeight` and the shared gate - so every card
+    /// then computes the same experts. Cards without the router receive here.
+    RouteBroadcast,
+    /// Before the combine: the ring sums every card's expert and shared down
+    /// partials (`ExpertDown`, `SharedOut`) into the full values the combine
+    /// folds into the replicated residual.
+    MoeSum,
+}
+
+/// The card MoE sequence (Native weights). `runs_router` is true on card 0
+/// (the one card that computes the picks) and false on every other card (its
+/// `RouteBroadcast` receives). Every card runs the SAME ordered sequence of
+/// markers - the slot-reuse argument of the ring requires the exchanges to
+/// align - and the local ops between them are identical in kind and order.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the multi-device step, its first production caller"
+    )
+)]
+pub(super) fn moe_sequence_card(runs_router: bool) -> Vec<CardMoeOp> {
+    let mut ops = Vec::with_capacity(12);
+    if runs_router {
+        ops.push(CardMoeOp::Local(MoeOp::Router));
+    }
+    ops.push(CardMoeOp::RouteBroadcast);
+    for op in [
+        MoeOp::ExpertGateQ,
+        MoeOp::ExpertUpQ,
+        MoeOp::SharedGateQ,
+        MoeOp::SharedUpQ,
+        MoeOp::SwigluSharedQ,
+        MoeOp::SwigluExperts,
+        MoeOp::ExpertDownQ,
+        MoeOp::SharedDownQ,
+    ] {
+        ops.push(CardMoeOp::Local(op));
+    }
+    ops.push(CardMoeOp::MoeSum);
+    ops.push(CardMoeOp::Local(MoeOp::Combine));
+    ops
+}
+
 /// The arena slots one op reads and writes, and the phase it runs in. The status word is not an
 /// arena slot: the router alone writes it, and this block never maps it.
 pub(super) struct OpSlots {
