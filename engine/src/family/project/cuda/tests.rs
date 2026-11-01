@@ -1786,6 +1786,65 @@ fn a_sliced_native_load_uploads_exactly_the_slice_bytes() {
     );
 }
 
+/// The mixer's dense type at its true block boundaries: a Q4_K slice's
+/// device bytes are the plan's bytes, and the bytes it uploads equal the
+/// independently reassembled reference (`assemble_slice` over the same
+/// source), for a block-aligned column half and a row band - the load
+/// layout a multi-device card's dense weights see. A loader-layout defect
+/// here would otherwise masquerade as distributed arithmetic later.
+#[test]
+fn a_sliced_q4k_native_load_uploads_the_reassembled_blocks() {
+    const NAME: &str = "a_sliced_q4k_native_load_uploads_the_reassembled_blocks";
+    if !device_present(NAME) {
+        return;
+    }
+    let mut rng = Rng(SEED);
+    // 24 rows of 512 Q4_K values: two 256-value super-blocks per row.
+    let dims = [512u64, 24];
+    let payload = q4k_blocks(&mut rng, 24 * 2);
+    let (_dir, weights) = open_fixture(&[Entry {
+        name: "dense",
+        ty: GgufType::Q4K,
+        dims: dims.to_vec(),
+        payload: payload.clone(),
+    }]);
+    let projector = CudaProjector::new().expect("create the CUDA projector");
+    let native = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let plan =
+        crate::kernels::cuda::plan::plan_slice("dense", GgufType::Q4K, &dims, 256..512, 8..16)
+            .expect("plan");
+    let specs = [(
+        "dense",
+        SliceSpec {
+            cols: 256..512,
+            rows: std::iter::once(8..16).collect(),
+        },
+    )];
+    let sliced = projector
+        .load_sliced(&weights, &["dense"], native, &specs)
+        .expect("load sliced");
+    assert_eq!(
+        sliced.device_bytes(),
+        usize::try_from(plan.bytes).expect("bytes")
+    );
+    let CudaWeight::Native { weight, .. } = weight_of(&sliced, "dense") else {
+        panic!("dense did not load native");
+    };
+    assert_eq!((weight.n_rows(), weight.k()), (8, 256));
+    let mut device = vec![0u8; weight.buffer().bytes()];
+    projector
+        .context
+        .download(weight.buffer(), &mut device)
+        .expect("download the slice");
+    assert_eq!(
+        device,
+        crate::kernels::cuda::plan::assemble_slice(&payload, &plan).expect("assemble")
+    );
+}
+
 #[test]
 fn a_stack_of_experts_that_miss_the_tile_groups_fails_the_load() {
     const NAME: &str = "a_stack_of_experts_that_miss_the_tile_groups_fails_the_load";
