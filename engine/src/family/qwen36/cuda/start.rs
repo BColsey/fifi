@@ -777,6 +777,10 @@ fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
     if settings.cuda_devices == [0] {
         return Ok(());
     }
+    check_fused_inproj(
+        settings.cuda_devices.len(),
+        crate::family::project::cuda::gdn_fuse_inproj(),
+    )?;
     let facts = probe_device_set(&settings.cuda_devices)?;
     check_peer_facts(&facts).map_err(|refusal| {
         EngError::BadRequest(format!(
@@ -800,6 +804,22 @@ fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
         "cuda_devices {:?}: this build serves on device 0 only; multi-device serving is not implemented yet",
         settings.cuda_devices
     )))
+}
+
+/// Multi-device serving refuses the GDN input-projection fusion: the fused
+/// `attn_qkv` matrix is a row concatenation whose multi-card slice plan
+/// (channel segments plus the z/beta/alpha siblings) has neither a loader
+/// slice nor alignment tests. Refusing here keeps the sharded path on the
+/// four separate projections the shard table already deals.
+fn check_fused_inproj(cards: usize, fused: bool) -> Result<(), EngError> {
+    if cards > 1 && fused {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving refuses INFERENCE_CUDA_GDN_FUSE_INPROJ=1; the \
+             fused input projection has no multi-card slice plan"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn make(
@@ -1458,5 +1478,22 @@ mod paged_start_tests {
         let mut bad = settings;
         bad.kv_offload_host_bytes = Some(1);
         assert!(StartupPlan::new(&bad, false, modes(false)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fused_inproj_tests {
+    use super::check_fused_inproj;
+
+    #[test]
+    fn multi_device_serving_refuses_the_fused_input_projection() {
+        check_fused_inproj(1, true).expect("one card keeps the fusion");
+        check_fused_inproj(1, false).expect("one card without the fusion");
+        check_fused_inproj(2, false).expect("multi-card without the fusion");
+        let error = check_fused_inproj(2, true).expect_err("multi-card plus the fusion");
+        assert!(
+            format!("{error:?}").contains("GDN_FUSE_INPROJ"),
+            "{error:?}"
+        );
     }
 }
