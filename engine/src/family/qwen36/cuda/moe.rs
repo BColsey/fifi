@@ -27,6 +27,7 @@
 
 use super::dims::StepDims;
 use super::mixer_weights::DenseWeight;
+use super::shard::ShardTable;
 use super::step_plan::{Phase, Slot};
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
@@ -77,6 +78,36 @@ impl MoeDims {
             inter: moe.inter,
             shared_inter: moe.shared_inter,
         }
+    }
+
+    /// The block dims of `card` of a `table`-sharded model at `rows` rows:
+    /// the intermediate widths become the card's slices of every expert's
+    /// and the shared expert's gate/up rows (and the matching `down`
+    /// columns). `hidden`, `n_expert` and `top_k` stay full — every card
+    /// holds a slice of every expert, routing is replicated by the ring
+    /// broadcast, and the residual row is replicated.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device step, its first production caller"
+        )
+    )]
+    pub(super) fn for_card(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+        rows: usize,
+    ) -> Result<Self, EngError> {
+        let moe = &dims.shape.moe;
+        Ok(Self {
+            rows,
+            hidden: dims.shape.hidden,
+            n_expert: moe.experts,
+            top_k: moe.top_k,
+            inter: table.expert_inter(card)?.len(),
+            shared_inter: table.shared_inter(card)?.len(),
+        })
     }
 }
 

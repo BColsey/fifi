@@ -4,6 +4,7 @@
 
 use super::super::super::host::HostShape;
 use super::super::dims::{KvMode, StepDims, StepOptions};
+use super::super::shard::ShardTable;
 use super::super::step_plan::{KernelScratch, Slot, StepPlan};
 use super::{
     BufferFacts, ExpertFacts, MoeDims, MoeOp, OpSlots, PackFacts, PackKind, ProjFacts, RangeFacts,
@@ -481,5 +482,34 @@ fn the_native_block_needs_the_q8_1_pack_sizes() {
         check_block(&dims, &weight_facts(&dims), &facts),
         "one block short",
         "xf_down",
+    );
+}
+
+#[test]
+fn card_moe_dims_slice_the_intermediate_widths_and_keep_the_rest_full() {
+    let d = step_dims();
+    let full = MoeDims::new(&d, 1);
+    let table = ShardTable::new(&d.shape, 2, 32).expect("table");
+    let mut inter = 0;
+    let mut shared = 0;
+    for card in 0..2 {
+        let dims = MoeDims::for_card(&d, &table, card, 1).expect("card dims");
+        inter += dims.inter;
+        shared += dims.shared_inter;
+        assert_eq!(dims.hidden, full.hidden, "the residual row is replicated");
+        assert_eq!(dims.n_expert, full.n_expert, "every expert on every card");
+        assert_eq!(dims.top_k, full.top_k, "routing is replicated");
+    }
+    assert_eq!(inter, full.inter, "expert inter slices tile the width");
+    assert_eq!(
+        shared, full.shared_inter,
+        "shared inter slices tile the width"
+    );
+    // A one-card table is the degenerate case: the single-device dims.
+    let one = ShardTable::new(&d.shape, 1, 32).expect("table");
+    assert_eq!(
+        MoeDims::for_card(&d, &one, 0, 1).expect("card dims"),
+        full,
+        "a one-card table must give the single-device dims"
     );
 }

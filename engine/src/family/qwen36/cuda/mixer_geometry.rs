@@ -9,6 +9,7 @@
 //! needs a matmul with a row stride or one concatenated weight.
 
 use super::dims::StepDims;
+use super::shard::ShardTable;
 use crate::family::project::cuda::WeightLayout;
 use crate::{
     EngError,
@@ -138,6 +139,105 @@ impl MixerGeometry {
                 delta.ld, attn.ld, dims.delta_proj, dims.attn_proj
             )));
         }
+        Ok(Self {
+            hidden: shape.hidden,
+            eps: shape.eps,
+            delta,
+            attn,
+        })
+    }
+
+    /// The geometry of `card` of a `table`-sharded model: every field of
+    /// [`Self::new`] with the sharded widths replaced by the card's run —
+    /// its key/value-head runs, its channel segments of `AttnQkv`, its
+    /// query-head run and its K/V projection rows. The replicated widths
+    /// stay full: `hidden` (the residual row every card holds), `heads_kv`
+    /// (the replicated KV cache), `value_dim`, `head_dim` and the RoPE
+    /// facts. A card's projection rows (`ld`) are therefore narrower than
+    /// the single-device row, so the plan-width check of `new` does not
+    /// apply; the two table-consistency checks below replace it.
+    ///
+    /// The card's K/V projection rows are its slice of the full row, not a
+    /// head multiple: ops that need the absolute row index (the RoPE phase
+    /// of a K row) read `table.kv_rows(card)`, not this geometry's slice
+    /// length. The full new K/V row reappears on every card through the
+    /// ring gather before the cache append.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device step, its first production caller"
+        )
+    )]
+    pub(super) fn for_card(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+    ) -> Result<Self, EngError> {
+        let shape = &dims.shape;
+        let (d, a) = (&shape.delta, &shape.attn);
+        if d.conv_kernel != CONV_TAPS {
+            return Err(EngError::Checkpoint(format!(
+                "mixer geometry: conv_kernel is {}, the causal conv kernel takes {CONV_TAPS}",
+                d.conv_kernel
+            )));
+        }
+        let key_heads = table.key_heads(card)?.len();
+        let value_heads = table.value_heads(card)?.len();
+        let segments = table.delta_qkv_segments(card)?;
+        let channels = segments.iter().map(|seg| seg.len()).sum::<usize>();
+        let z_rows = value_heads * d.value_dim;
+        let z_off = channels;
+        let beta_off = z_off + z_rows;
+        let alpha_off = beta_off + value_heads;
+        let value_width = z_rows;
+        if table.delta_out_cols(card)?.len() != value_width {
+            return Err(EngError::Checkpoint(format!(
+                "shard table: card {card} holds {} out columns for {} value-head columns",
+                table.delta_out_cols(card)?.len(),
+                value_width
+            )));
+        }
+        let delta = DeltaGeometry {
+            key_heads,
+            value_heads,
+            channels,
+            z_rows,
+            beta_rows: value_heads,
+            alpha_rows: value_heads,
+            z_off,
+            beta_off,
+            alpha_off,
+            ld: alpha_off + value_heads,
+            value_width,
+            value_dim: d.value_dim,
+            conv_kernel: d.conv_kernel,
+        };
+        let heads_q = table.query_heads(card)?.len();
+        let q_width = heads_q * a.head_dim;
+        if table.attn_o_cols(card)?.len() != q_width {
+            return Err(EngError::Checkpoint(format!(
+                "shard table: card {card} holds {} output columns for {} query-head columns",
+                table.attn_o_cols(card)?.len(),
+                q_width
+            )));
+        }
+        let q_rows = 2 * q_width;
+        let kv_rows = table.kv_rows(card)?.len();
+        let attn = AttnGeometry {
+            heads_q,
+            heads_kv: a.heads_kv,
+            head_dim: a.head_dim,
+            n_rot: a.rotary_dim,
+            rope_base: a.theta,
+            scale: (a.head_dim as f32).sqrt().recip(),
+            q_rows,
+            kv_rows,
+            k_off: q_rows,
+            v_off: q_rows + kv_rows,
+            ld: q_rows + 2 * kv_rows,
+            q_width,
+        };
         Ok(Self {
             hidden: shape.hidden,
             eps: shape.eps,

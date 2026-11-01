@@ -2,6 +2,7 @@
 use super::{
     common_tests::{dims, plan},
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense},
+    shard::ShardTable,
     step_plan::Slot,
 };
 use crate::family::project::cuda::WeightLayout;
@@ -124,4 +125,74 @@ fn dense_weights_must_match_rows_k_and_have_no_stack() {
     assert!(check_dense("w", (2047, 2048, None), &want).is_err());
     assert!(check_dense("w", (2048, 4096, None), &want).is_err());
     assert!(check_dense("w", (2048, 2048, Some(256)), &want).is_err());
+}
+
+#[test]
+fn a_one_card_table_yields_the_exact_single_device_geometry() {
+    let d = dims();
+    let table = ShardTable::new(&d.shape, 1, 32).expect("table");
+    let card = MixerGeometry::for_card(&d, &table, 0).expect("card geometry");
+    let full = MixerGeometry::new(&d).expect("geometry");
+    assert_eq!(card, full);
+}
+
+#[test]
+fn card_geometries_tile_the_full_geometry() {
+    let d = dims();
+    let full = MixerGeometry::new(&d).expect("geometry");
+    for cards in [2, 3] {
+        let table = ShardTable::new(&d.shape, cards, 32).expect("table");
+        let sum = |get: &dyn Fn(&MixerGeometry) -> usize| -> usize {
+            (0..cards)
+                .map(|card| get(&MixerGeometry::for_card(&d, &table, card).expect("card geometry")))
+                .sum()
+        };
+        let g = &full;
+        assert_eq!(
+            sum(&|c| c.attn.q_rows),
+            g.attn.q_rows,
+            "{cards} cards: q rows"
+        );
+        assert_eq!(
+            sum(&|c| c.attn.kv_rows),
+            g.attn.kv_rows,
+            "{cards} cards: kv rows"
+        );
+        assert_eq!(
+            sum(&|c| c.attn.q_width),
+            g.attn.q_width,
+            "{cards} cards: o columns"
+        );
+        assert_eq!(
+            sum(&|c| c.delta.channels),
+            g.delta.channels,
+            "{cards} cards: conv channels"
+        );
+        assert_eq!(
+            sum(&|c| c.delta.z_rows),
+            g.delta.z_rows,
+            "{cards} cards: z rows"
+        );
+        assert_eq!(
+            sum(&|c| c.delta.key_heads),
+            g.delta.key_heads,
+            "{cards} cards: key heads"
+        );
+        // The replicated widths stay full on every card.
+        for card in 0..cards {
+            let c = MixerGeometry::for_card(&d, &table, card).expect("card geometry");
+            assert_eq!(c.hidden, g.hidden, "card {card}: residual row");
+            assert_eq!(c.attn.heads_kv, g.attn.heads_kv, "card {card}: KV cache");
+            assert_eq!(c.attn.head_dim, g.attn.head_dim, "card {card}: head dim");
+            assert_eq!(c.attn.n_rot, g.attn.n_rot, "card {card}: rope");
+            assert_eq!(
+                c.delta.value_dim, g.delta.value_dim,
+                "card {card}: value dim"
+            );
+            // The card's fused rows stay internally tiled, exactly like the
+            // single-device row: the offsets close on `ld`.
+            assert_eq!(c.delta.alpha_off + c.delta.alpha_rows, c.delta.ld);
+            assert_eq!(c.attn.v_off + c.attn.kv_rows, c.attn.ld);
+        }
+    }
 }
