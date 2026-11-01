@@ -126,13 +126,13 @@ fn run(shared_input: bool) {
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission and the pinned sequential FP64 oracle"]
+#[ignore = "needs the whole GPU and the pinned sequential FP64 oracle"]
 fn layers_1_through_5_match_shared_input_fp64_oracle() {
     run(true);
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission; cumulative errors are diagnostic, not qualification"]
+#[ignore = "needs the whole GPU; cumulative errors are diagnostic, not qualification"]
 fn layers_0_through_5_propagate_cuda_state() {
     run(false);
 }

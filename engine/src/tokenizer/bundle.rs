@@ -294,6 +294,11 @@ impl WarmTurnCache {
     }
 }
 
+/// The refusal of a chat template that renders no text.
+fn empty_render() -> EngError {
+    EngError::BadRequest("rendered prompt is empty".to_string())
+}
+
 impl TokenizerBundle {
     pub fn load(dir: &Path, pin: &TokenizerPin) -> Result<Self, EngError> {
         let tokenizer_bytes = read_pinned(dir, "tokenizer.json", pin.tokenizer_json)?;
@@ -413,6 +418,21 @@ impl TokenizerBundle {
         self.vocab_size
     }
 
+    /// Renders the chat template to the prompt text that `encode_prompt` tokenizes, without
+    /// tokenizing it. An empty render is refused, as `encode_prompt` refuses it.
+    pub fn render_prompt(
+        &self,
+        msgs: &[PromptMessage],
+        tools: &[ToolSpec],
+        thinking: Thinking,
+    ) -> Result<String, EngError> {
+        let rendered = self.template.render(msgs, tools, thinking)?;
+        if rendered.is_empty() {
+            return Err(empty_render());
+        }
+        Ok(rendered)
+    }
+
     pub fn encode_prompt(
         &self,
         msgs: &[PromptMessage],
@@ -421,7 +441,7 @@ impl TokenizerBundle {
     ) -> Result<Vec<u32>, EngError> {
         let rendered = self.counted_render(msgs, tools, thinking)?;
         if rendered.is_empty() {
-            return Err(EngError::BadRequest("rendered prompt is empty".to_string()));
+            return Err(empty_render());
         }
         self.counted_encode(&rendered)
     }
@@ -920,7 +940,7 @@ impl TokenizerBundle {
         // encode first.
         let full = self.counted_render(msgs, tools, thinking)?;
         if full.is_empty() {
-            return Err(EngError::BadRequest("rendered prompt is empty".to_string()));
+            return Err(empty_render());
         }
         let (ids, offsets) = self.counted_encode_with_offsets(&full)?;
         let head = self.counted_head_render(msgs, tools, thinking)?;

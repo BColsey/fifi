@@ -96,6 +96,19 @@ pub(super) struct Grouping {
 
 impl Grouping {
     pub(super) fn new(ids: &[i32], rows: usize, experts: usize) -> Result<Self, EngError> {
+        Self::ranked(ids, rows, experts, &[false; 256])
+    }
+
+    /// Like [`Grouping::new`], but the pairs of experts flagged in `resident` come first (each
+    /// group still in ascending expert id, rows in ascending pair order). A layer-major pass
+    /// that stages its experts in rounds then fills the first rounds with experts that are
+    /// already on the device and leaves the copies to the last round.
+    pub(super) fn ranked(
+        ids: &[i32],
+        rows: usize,
+        experts: usize,
+        resident: &[bool; 256],
+    ) -> Result<Self, EngError> {
         if !(1..=4096).contains(&rows) || !(TOP_K..=256).contains(&experts) {
             return Err(bad("invalid routing metadata geometry"));
         }
@@ -113,7 +126,7 @@ impl Grouping {
             }
         }
         let mut order: Vec<_> = (0..ids.len()).collect();
-        order.sort_by_key(|&pair| (ids[pair], pair));
+        order.sort_by_key(|&pair| (!resident[ids[pair] as usize], ids[pair], pair));
         let mut inverse = vec![0; ids.len()];
         let mut tokens = Vec::with_capacity(ids.len());
         for (sorted, &original) in order.iter().enumerate() {

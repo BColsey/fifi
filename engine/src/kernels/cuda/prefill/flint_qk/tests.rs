@@ -188,6 +188,62 @@ fn analytic_norm_rope_and_read_only_gamma_alias() {
     );
 }
 
+/// A tall launch (more than eight rows) shares each row's angle across its heads and runs the
+/// norm one vector per lane; the rows it writes are the bits a run of narrow launches writes. The
+/// cases put a non-finite value in Q, in K and in a gamma so the zeroed outputs and the latched
+/// flag are compared as well.
+#[test]
+fn a_tall_launch_writes_the_bits_of_narrow_launches() {
+    if !testkit::device_present("D128 Q/K tall rope") {
+        return;
+    }
+    const ROWS: usize = 19;
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f32::from_bits((state & 0x80ff_ffff) | 0x3d00_0000) * 3.0
+    };
+    let q: Vec<f32> = (0..ROWS * 4096).map(|_| next()).collect();
+    let k: Vec<f32> = (0..ROWS * 512).map(|_| next()).collect();
+    let gamma: [Vec<f32>; 2] = std::array::from_fn(|_| (0..128).map(|_| next().abs()).collect());
+    type Mutation = fn(&mut Vec<f32>, &mut Vec<f32>, &mut [Vec<f32>; 2]);
+    let cases: [(&str, Mutation); 4] = [
+        ("finite", |_, _, _| {}),
+        ("infinite q", |q, _, _| {
+            q[11 * 4096 + 5 * 128 + 70] = f32::INFINITY
+        }),
+        ("nan k", |_, k, _| k[15 * 512 + 3 * 128 + 9] = f32::NAN),
+        ("nan gamma k", |_, _, gamma| gamma[1][40] = f32::NAN),
+    ];
+    for (name, mutate) in cases {
+        let (mut q, mut k, mut gamma) = (q.clone(), k.clone(), gamma.clone());
+        mutate(&mut q, &mut k, &mut gamma);
+        for position in [None, Some(1_000_037_u32)] {
+            let tall = Rig::new(&q, &k, [&gamma[0], &gamma[1]]);
+            tall.run(position);
+            let mut narrow = [Vec::new(), Vec::new()];
+            let mut flags = 0;
+            for first in (0..ROWS).step_by(8) {
+                let rows = (ROWS - first).min(8);
+                let rig = Rig::new(
+                    &q[first * 4096..(first + rows) * 4096],
+                    &k[first * 512..(first + rows) * 512],
+                    [&gamma[0], &gamma[1]],
+                );
+                rig.run(position.map(|p| p + first as u32));
+                narrow[0].extend(rig.output(0));
+                narrow[1].extend(rig.output(1));
+                flags |= rig.status();
+            }
+            assert_eq!(tall.output(0), narrow[0], "{name}: q at {position:?}");
+            assert_eq!(tall.output(1), narrow[1], "{name}: k at {position:?}");
+            assert_eq!(tall.status(), flags, "{name}: flag at {position:?}");
+            let latched = tall.status() & 8 != 0;
+            assert_eq!(latched, name != "finite", "{name}: mask 8 at {position:?}");
+        }
+    }
+}
+
 #[test]
 fn numeric_mask8_fences_norm_and_rope_before_shared_publication() {
     if !testkit::device_present("D128 Q/K numeric fence") {

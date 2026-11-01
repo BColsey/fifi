@@ -4,26 +4,43 @@ mod host;
 mod load;
 mod packing;
 
+pub(crate) use host::BankStats;
+
 #[cfg(test)]
 pub(crate) use load::load_flint_fixture;
 pub(crate) use load::load_flint_resident;
 
+use super::plan::{ABSENT_MEMBER, check_member_offsets};
 use super::{FfnRoles, ResidentPlan};
 use crate::{
     EngError,
     family::project::cuda::Exl3MatrixView,
-    kernels::cuda::{DeviceBuffer, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
     weights::exl3::Codebook,
 };
 
 pub(crate) struct FlintExl3Resident {
     buffer: DeviceBuffer,
     host: Option<host::HostOwner>,
+    /// Per layer, what the id-indexed launch reads (`None`: the layer declined); worked out on
+    /// first use, resident loads only.
+    pick_tables: Vec<std::cell::OnceCell<Option<PickEntry>>>,
     matrices: Vec<PackedMatrix>,
     plain: Vec<PackedRange>,
     roles: ResidentPlan,
     model_config: Vec<u8>,
 }
+
+/// A layer's id-addressed experts: `spans` is, per role (gate, up, down) and part (trellis, suh,
+/// svh), the device range from expert 0 to the end of the last expert, and `table` the 32-bit
+/// byte offset of each expert from expert 0.
+struct PickEntry {
+    members: u32,
+    spans: [(usize, usize); 9],
+    table: DeviceBuffer,
+}
+
+type PickLayout = (Vec<u32>, [(usize, usize); 9]);
 
 #[derive(Clone, Copy)]
 struct PackedRange {
@@ -66,6 +83,22 @@ pub(crate) enum FlintFfnView<'a> {
     },
 }
 
+/// One projection role (gate, up or down) of every expert of a layer, as ranges that start at
+/// expert 0 and run to the end of the last expert.
+pub(crate) struct PickRole<'a> {
+    pub(crate) trellis: DeviceRange<'a>,
+    pub(crate) suh: DeviceRange<'a>,
+    pub(crate) svh: DeviceRange<'a>,
+}
+
+/// A layer's experts addressed by id on the device: the three roles and the table of each
+/// expert's byte offset from expert 0 (the same offset moves the trellis and both scale vectors).
+pub(crate) struct PickBank<'a> {
+    pub(crate) members: u32,
+    pub(crate) table: DeviceRange<'a>,
+    pub(crate) roles: [PickRole<'a>; 3],
+}
+
 pub(crate) struct FlintLayerView<'a> {
     pub(crate) q: Exl3MatrixView<'a>,
     pub(crate) k: Exl3MatrixView<'a>,
@@ -90,6 +123,38 @@ impl FlintExl3Resident {
 
     pub(crate) fn device_weight_bytes(&self) -> u64 {
         self.buffer.bytes() as u64
+    }
+
+    /// Copies made into the bank so far, or `None` when every expert is resident.
+    pub(crate) fn bank_stats(&self) -> Option<BankStats> {
+        self.host.as_ref().map(|host| host.stats.get())
+    }
+
+    /// Device bytes of the pack with every expert resident, for the advice of a refused load.
+    pub(crate) fn resident_weight_bytes(path: &std::path::Path) -> Result<u64, EngError> {
+        load::resident_weight_bytes(path)
+    }
+
+    /// Whether `FIFI_FLINT_CUDA_EXPERT_CACHE` selects the host buffer for every load. An
+    /// unlisted word counts as not selected: the load itself refuses it.
+    pub(crate) fn cache_forced_on() -> bool {
+        load::cache_forced_on()
+    }
+
+    /// Whether `FIFI_FLINT_CUDA_EXPERT_CACHE=0` forces every expert onto the GPU.
+    pub(crate) fn cache_forced_off() -> bool {
+        load::cache_forced_off()
+    }
+
+    /// Why the host cache is in use (`auto`, `forced` or `override`), or `None` when every expert
+    /// is resident.
+    pub(crate) fn bank_reason(&self) -> Option<&'static str> {
+        self.host.as_ref().map(|host| host.reason.as_str())
+    }
+
+    /// Routed experts per layer on the device when the host cache holds the rest of the 256.
+    pub(crate) fn banked_experts(&self) -> Option<usize> {
+        self.host.as_ref().map(|host| host.slots)
     }
 
     pub(crate) fn embedding(&self) -> Result<DeviceRange<'_>, EngError> {
@@ -183,6 +248,136 @@ impl FlintExl3Resident {
 impl FlintExpertBank<'_> {
     pub(crate) fn len(&self) -> usize {
         self.indices.len()
+    }
+
+    /// Experts that can be staged together: the resident count of the host cache,
+    /// or the whole bank when every expert is resident for good.
+    pub(crate) fn round_capacity(&self) -> usize {
+        self.owner
+            .host
+            .as_ref()
+            .map_or(self.indices.len(), |host| host.slots)
+    }
+
+    /// The layer's experts as an id-addressed bank, or `None` when the load keeps experts in the
+    /// host store (their device places change) or the experts are not laid out at one common
+    /// byte offset per expert for all three roles. The table holds 32-bit offsets, so a layer
+    /// whose experts span 4 GiB or more declines too. The layout is worked out and the table
+    /// uploaded on first use; every decline names its reason once on stderr.
+    pub(crate) fn pick_bank(&self, ctx: &CudaContext) -> Result<Option<PickBank<'_>>, EngError> {
+        let owner = self.owner;
+        if owner.host.is_some() {
+            static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+            ANNOUNCED.call_once(|| {
+                eprintln!(
+                    "Flint device picks: declined, the expert bank keeps experts in the host store"
+                );
+            });
+            return Ok(None);
+        }
+        let Some(cell) = owner.pick_tables.get(self.layer) else {
+            return Ok(None);
+        };
+        if cell.get().is_none() {
+            let _ = cell.set(self.build_pick_entry(ctx)?);
+        }
+        let Some(Some(entry)) = cell.get() else {
+            return Ok(None);
+        };
+        let range = |(offset, bytes): (usize, usize)| owner.buffer.range(offset, bytes);
+        let role = |r: usize| -> Result<PickRole<'_>, EngError> {
+            Ok(PickRole {
+                trellis: range(entry.spans[r * 3])?,
+                suh: range(entry.spans[r * 3 + 1])?,
+                svh: range(entry.spans[r * 3 + 2])?,
+            })
+        };
+        Ok(Some(PickBank {
+            members: entry.members,
+            table: entry.table.range(0, entry.members as usize * 4)?,
+            roles: [role(0)?, role(1)?, role(2)?],
+        }))
+    }
+
+    fn build_pick_entry(&self, ctx: &CudaContext) -> Result<Option<PickEntry>, EngError> {
+        let (offsets, spans) = match self.pick_layout() {
+            Ok(layout) => layout,
+            Err(reason) => {
+                eprintln!(
+                    "Flint device picks: layer {} declined, {reason}",
+                    self.layer
+                );
+                return Ok(None);
+            }
+        };
+        for role in 0..3 {
+            let m = &self.owner.matrices[self.indices[0][role]];
+            let need = [m.trellis.bytes, m.shape[0], m.shape[1]];
+            let bank = [
+                spans[role * 3].1,
+                spans[role * 3 + 1].1,
+                spans[role * 3 + 2].1,
+            ];
+            check_member_offsets(&offsets, need, bank)?;
+        }
+        let members = u32::try_from(offsets.len())
+            .map_err(|_| EngError::BadRequest("Flint expert count overflows".into()))?;
+        let bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+        Ok(Some(PickEntry {
+            members,
+            spans,
+            table: ctx.upload(&bytes)?,
+        }))
+    }
+
+    /// Each expert's byte offset from expert 0 and, per role and part (trellis, suh, svh), the
+    /// range from expert 0 to the end of the last expert; or why the layout has no such offset.
+    fn pick_layout(&self) -> Result<PickLayout, &'static str> {
+        if self.indices.is_empty() {
+            return Err("the layer has no experts");
+        }
+        let matrix = |expert: usize, role: usize| &self.owner.matrices[self.indices[expert][role]];
+        let parts = |m: &PackedMatrix| [m.trellis, m.suh, m.svh];
+        let mut offsets = vec![0u32; self.indices.len()];
+        let mut spans = [(0usize, 0usize); 9];
+        for role in 0..3 {
+            let first = matrix(0, role);
+            for (expert, offset) in offsets.iter_mut().enumerate() {
+                let current = matrix(expert, role);
+                if current.shape != first.shape
+                    || current.bits_twice != first.bits_twice
+                    || current.book != first.book
+                {
+                    return Err("the experts differ in shape, rate or codebook");
+                }
+                let mut deltas = parts(current)
+                    .into_iter()
+                    .zip(parts(first))
+                    .map(|(c, f)| c.offset.checked_sub(f.offset));
+                let delta = deltas
+                    .next()
+                    .flatten()
+                    .and_then(|d| u32::try_from(d).ok())
+                    .filter(|&d| d != ABSENT_MEMBER)
+                    .ok_or("the experts span 4 GiB or more, or are not in id order")?;
+                if deltas.any(|d| d != Some(delta as usize)) {
+                    return Err("the experts do not share one offset for trellis and scales");
+                }
+                if role == 0 {
+                    *offset = delta;
+                } else if *offset != delta {
+                    return Err("the three roles do not share one offset per expert");
+                }
+                for (part, range) in parts(current).into_iter().enumerate() {
+                    let end = range.offset + range.bytes - parts(first)[part].offset;
+                    spans[role * 3 + part].1 = spans[role * 3 + part].1.max(end);
+                }
+            }
+            for (part, range) in parts(first).into_iter().enumerate() {
+                spans[role * 3 + part].0 = range.offset;
+            }
+        }
+        Ok((offsets, spans))
     }
 
     pub(crate) fn shape(&self, expert: usize) -> Result<(usize, usize), EngError> {

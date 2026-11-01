@@ -4,7 +4,8 @@
  * may overlap. Caller initializes flag once and retains owners until completion.
  * Numeric failures write zero and OR mask1; invalid gather IDs write a zero row
  * and OR PREFILL_STATUS_BOUND_VIOLATION. Neither operation clears earlier bits.
- * No BF16 conversion occurs here: use the shared row_scale publication entry.
+ * Unfused, no BF16 conversion occurs here: use the shared row_scale publication entry.
+ * The multiply alone rounds to BF16 when fused_publish is set.
  */
 #ifndef INFERENCE_CUDA_PREFILL_ROW_OPS_H
 #define INFERENCE_CUDA_PREFILL_ROW_OPS_H
@@ -38,6 +39,9 @@ typedef struct inference_cuda_row_mul_args {
     size_t rows;
     size_t columns;
     size_t rhs_columns;  /* exactly1 (per-row broadcast) or columns */
+    /* Producer-fusion arm: 1 stores the bf16 roundtrip of each product the
+     * separate publish kernel would apply; 0 stores the product as before. */
+    uint32_t fused_publish;
 } inference_cuda_row_mul_args;
 
 typedef struct inference_cuda_row_gather_args {
@@ -84,9 +88,10 @@ int inference_cuda_row_rank_sum_launch(const inference_cuda_row_rank_sum_args *a
 ROW_OPS_ASSERT(sizeof(inference_cuda_row_unary_args) == 64 &&
                offsetof(inference_cuda_row_unary_args, flag) == 32 &&
                offsetof(inference_cuda_row_unary_args, columns) == 56, "row unary layout");
-ROW_OPS_ASSERT(sizeof(inference_cuda_row_mul_args) == 88 &&
+ROW_OPS_ASSERT(sizeof(inference_cuda_row_mul_args) == 96 &&
                offsetof(inference_cuda_row_mul_args, flag) == 48 &&
-               offsetof(inference_cuda_row_mul_args, rhs_columns) == 80, "row multiply layout");
+               offsetof(inference_cuda_row_mul_args, rhs_columns) == 80 &&
+               offsetof(inference_cuda_row_mul_args, fused_publish) == 88, "row multiply layout");
 ROW_OPS_ASSERT(sizeof(inference_cuda_row_gather_args) == 88 &&
                offsetof(inference_cuda_row_gather_args, indices) == 16 &&
                offsetof(inference_cuda_row_gather_args, source_rows) == 80, "row gather layout");

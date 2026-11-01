@@ -35,6 +35,13 @@ pub(crate) enum FfnWeights<'a> {
     },
 }
 
+// Counts `Frame::complete` health reads (event synchronize + 4-byte read_at)
+// so the token-health tests can prove the armed path performs none.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static COMPLETE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 pub(crate) struct FfnCall<'a, 'w> {
     pub(crate) weights: &'a FfnWeights<'w>,
@@ -126,6 +133,11 @@ impl<'a> ExpertPlan<'a> {
 enum FrameFlag<'a> {
     Owned(DeviceBuffer),
     Deferred(DeviceRange<'a>),
+    /// Deferred to the token-health ring: the FFN frames of armed
+    /// single-row calls park their status word for the token-end gate
+    /// instead of draining. Attention-owned `Deferred` frames keep their
+    /// separate contract.
+    Parked(DeviceRange<'a>),
 }
 
 // Retain all scratch until late completion: dropping a CUDA buffer drains queued work.
@@ -134,8 +146,45 @@ struct Frame<'c, 's> {
     stream: &'s DeviceStream,
     buffers: Vec<(DeviceBuffer, usize)>,
     flag: FrameFlag<'c>,
+    /// Most rows a projection of this frame may carry: eight for the token-major walk, a piece
+    /// for the layer-major jobs pass.
+    rows_cap: usize,
     #[cfg(test)]
     statuses: Vec<Nvfp4LaunchStatus<'s>>,
+}
+
+/// Which call site issued a separate publish launch, so a test can pin how many each
+/// level's fusion removes.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum PublishLevel {
+    /// Frame::publish.
+    Direct = 0,
+    /// Frame::input_into, which the routed sites also reach.
+    Input = 1,
+    /// RoutedCuda::publish and publish_projection, counted on top of their input_into.
+    Routed = 2,
+}
+
+#[cfg(test)]
+static PUBLISH_LEVELS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[cfg(test)]
+pub(super) fn count_publish(level: PublishLevel) {
+    PUBLISH_LEVELS[level as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Separate publishes issued so far by [frame sites, routed expert sites].
+#[cfg(test)]
+pub(super) fn test_publish_levels() -> [u64; 2] {
+    let [direct, input, routed] = PUBLISH_LEVELS
+        .each_ref()
+        .map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+    [direct + input - routed, routed]
 }
 
 impl<'c, 's> Frame<'c, 's> {
@@ -158,15 +207,33 @@ impl<'c, 's> Frame<'c, 's> {
         Ok(Self::with_flag(ctx, stream, FrameFlag::Deferred(flag)))
     }
 
+    fn parked(
+        ctx: &'c CudaContext,
+        stream: &'s DeviceStream,
+        word: DeviceRange<'c>,
+    ) -> Result<Self, EngError> {
+        if word.bytes() != 4 {
+            return Err(bad("parked token health requires one status word"));
+        }
+        Ok(Self::with_flag(ctx, stream, FrameFlag::Parked(word)))
+    }
+
     fn with_flag(ctx: &'c CudaContext, stream: &'s DeviceStream, flag: FrameFlag<'c>) -> Self {
         Self {
             ctx,
             stream,
             buffers: Vec::new(),
             flag,
+            rows_cap: crate::family::flint::settings::PREFILL_MAX_ROWS,
             #[cfg(test)]
             statuses: Vec::new(),
         }
+    }
+
+    /// The same frame for a pass of up to `cap` rows.
+    fn tall(mut self, cap: usize) -> Self {
+        self.rows_cap = cap;
+        self
     }
 
     fn keep(&mut self, buffer: DeviceBuffer, bytes: usize) -> usize {
@@ -186,10 +253,17 @@ impl<'c, 's> Frame<'c, 's> {
         self.buffers[index].0.range(0, self.buffers[index].1)
     }
 
+    /// Producer-fusion arm (FIFI_FLINT_CUDA_FUSED_PUBLISH, default on):
+    /// armed producers store the bf16 roundtrip the publish kernel would
+    /// write, so their Frame publish sites skip the separate kernel.
+    fn fused_publish(&self) -> bool {
+        crate::family::flint::settings::fused_publish_armed()
+    }
+
     fn flag(&self) -> Result<DeviceRange<'_>, EngError> {
         match &self.flag {
             FrameFlag::Owned(buffer) => buffer.range(0, 4),
-            FrameFlag::Deferred(flag) => Ok(*flag),
+            FrameFlag::Deferred(flag) | FrameFlag::Parked(flag) => Ok(*flag),
         }
     }
 
@@ -221,7 +295,10 @@ impl<'c, 's> Frame<'c, 's> {
                 rows: shape.rows,
                 columns: shape.columns,
             },
-        )
+        )?;
+        #[cfg(test)]
+        count_publish(PublishLevel::Input);
+        Ok(())
     }
 
     fn publish(&mut self, x: usize, shape: RowShape) -> Result<usize, EngError> {
@@ -236,6 +313,8 @@ impl<'c, 's> Frame<'c, 's> {
                 columns: shape.columns,
             },
         )?;
+        #[cfg(test)]
+        count_publish(PublishLevel::Direct);
         Ok(out)
     }
 
@@ -261,6 +340,7 @@ impl<'c, 's> Frame<'c, 's> {
         rhs_columns: usize,
     ) -> Result<usize, EngError> {
         let out = self.allocate(shape)?;
+        let fused = self.fused_publish();
         self.ctx.row_multiply(
             self.stream,
             RowMulCall {
@@ -270,8 +350,13 @@ impl<'c, 's> Frame<'c, 's> {
                 flag: self.flag()?,
                 shape,
                 rhs_columns,
+                fused,
             },
         )?;
+        // The producer stored the published roundtrip; no publish kernel.
+        if fused {
+            return Ok(out);
+        }
         self.publish(out, shape)
     }
 
@@ -441,6 +526,7 @@ impl<'c, 's> Frame<'c, 's> {
         )?;
         let total = self.publish(sum, shape)?;
         let added = self.allocate(shape)?;
+        let fused = self.fused_publish();
         self.ctx.row_add(
             self.stream,
             RowAddCall {
@@ -448,8 +534,13 @@ impl<'c, 's> Frame<'c, 's> {
                 y: self.range(shared)?,
                 out: self.range(added)?,
                 n: block.rows * block.hidden,
+                flag: Some(self.flag()?),
+                fused,
             },
         )?;
+        if fused {
+            return Ok(added);
+        }
         self.publish(added, shape)
     }
 
@@ -464,6 +555,8 @@ impl<'c, 's> Frame<'c, 's> {
         event.synchronize()?;
         let mut flag = [0; 4];
         buffer.read_at(self.stream, 0, &mut flag)?;
+        #[cfg(test)]
+        COMPLETE_READS.with(|count| count.set(count.get() + 1));
         Self::validate_health(u32::from_ne_bytes(flag))
     }
 
@@ -478,6 +571,12 @@ impl<'c, 's> Frame<'c, 's> {
     }
 
     fn finish(mut self, output: usize) -> Result<DeviceBuffer, EngError> {
+        // Only token-health frames may park: their word is read once by the
+        // token-end gate. Attention-owned deferred frames still owe their
+        // group observation and are refused here.
+        if matches!(self.flag, FrameFlag::Parked(_)) {
+            return Ok(self.buffers.swap_remove(output).0);
+        }
         self.complete()?;
         Ok(self.buffers.swap_remove(output).0)
     }
@@ -487,6 +586,9 @@ struct Routed {
     ids: Vec<i32>,
     grouping: Grouping,
     gates: usize,
+    /// Frame buffer of the router's ids and status word when the picks stayed on the device
+    /// (`ids` then holds the placeholders 0..TOP_K and `grouping` is the identity).
+    device_ids: Option<usize>,
     #[cfg(test)]
     logits: Option<(usize, usize)>,
 }
@@ -503,15 +605,19 @@ fn route(
     x: usize,
     block: FfnBlock,
 ) -> Result<Routed, EngError> {
-    route_reusing(frame, router, x, block, None)
+    route_reusing(frame, router, x, block, None, false)
 }
 
+/// Routes `block`. With `device_picks` the ids stay on the device: nothing is read back, the
+/// router's status stays in the frame flag (the frame's completion reports it), and the result
+/// carries the placeholder ids 0..TOP_K with the identity grouping of one row.
 fn route_reusing(
     frame: &mut Frame<'_, '_>,
     router: DeviceRange<'_>,
     x: usize,
     block: FfnBlock,
     scratch: Option<DeviceRange<'_>>,
+    device_picks: bool,
 ) -> Result<Routed, EngError> {
     let shape = RouterShape {
         m: block.rows,
@@ -571,6 +677,18 @@ fn route_reusing(
             status: frame.flag()?,
         },
     )?;
+    if device_picks {
+        let placeholders: Vec<i32> = (0..TOP_K as i32).collect();
+        let grouping = Grouping::new(&placeholders, block.rows, block.experts)?;
+        return Ok(Routed {
+            ids: placeholders,
+            grouping,
+            gates,
+            device_ids: Some(ids),
+            #[cfg(test)]
+            logits: None,
+        });
+    }
     frame.ctx.copy_device(
         frame.stream,
         frame.flag()?,
@@ -597,6 +715,7 @@ fn route_reusing(
         ids,
         grouping,
         gates,
+        device_ids: None,
         #[cfg(test)]
         logits: Some((raw_logits, logits)),
     })
@@ -699,6 +818,8 @@ pub(crate) mod exl3;
 #[cfg(test)]
 mod exl3_dispatch_tests;
 pub(crate) mod runtime;
+#[cfg(test)]
+pub(crate) mod stage_clock;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

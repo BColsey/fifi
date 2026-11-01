@@ -51,9 +51,8 @@ const RIG_CELLS: usize = 16;
 const RIG_APPENDS: usize = 9;
 const RIG_CLEAN_APPENDS: usize = 3;
 
-fn required_dir() -> String {
-    std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_string())
+fn required_dir() -> std::path::PathBuf {
+    crate::test_paths::required("Q36_CUDA_MODEL_DIR")
 }
 
 /// The id list of an oracle prompt (`start_health_tests.rs`'s `p5_ids` shape).

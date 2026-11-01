@@ -147,7 +147,7 @@ fn trace(
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run, pinned GGUF/oracle/saved miss; RCA, not qualification"]
+#[ignore = "needs the whole GPU, pinned GGUF/oracle/saved miss; RCA, not qualification"]
 fn capture_l0_p01_m5_and_m4_boundaries() {
     let (oracle, sha) = oracle();
     let saved = std::fs::read(
@@ -216,13 +216,13 @@ fn capture_l0_p01_m5_and_m4_boundaries() {
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run, pinned full49 oracle/GGUF; collect shared misses, never qualify"]
+#[ignore = "needs the whole GPU, pinned full49 oracle/GGUF; collect shared misses, never qualify"]
 fn collect_all49_shared_diagnostics() {
     collect_shared_diagnostics(0);
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run; recover only layers30..49 after the sealed partial run"]
+#[ignore = "needs the whole GPU; recover only layers30..49 after the sealed partial run"]
 fn collect_remaining19_shared_diagnostics() {
     collect_shared_diagnostics(30);
 }

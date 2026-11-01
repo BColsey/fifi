@@ -31,6 +31,7 @@
 
 use super::cuda_executor::{FlintExecutor, FlintSession};
 use super::cuda_prefix::{CudaPrefixEnv, CudaPrefixPath};
+use crate::family::flint::settings::LayerMajor;
 use crate::family::{executor::ExecutorOps, session::SaveKind};
 use std::path::Path;
 
@@ -48,6 +49,7 @@ fn a_cuda_path_binds_every_flag_it_reads() {
             packed_pointwise: false,
             exl3_legacy: false,
             expert_cache: false,
+            layer_major: LayerMajor::Off,
         }
     }
     // One selector flip per arm, including the three bound by the respin
@@ -59,12 +61,20 @@ fn a_cuda_path_binds_every_flag_it_reads() {
             "packed_pointwise" => next.packed_pointwise = !next.packed_pointwise,
             "exl3_legacy" => next.exl3_legacy = !next.exl3_legacy,
             "expert_cache" => next.expert_cache = !next.expert_cache,
+            "layer_major" => next.layer_major = LayerMajor::Tiles,
+            "layer_jobs" => next.layer_major = LayerMajor::Jobs,
             _ => unreachable!("a bound selector"),
         }
         next
     }
     let off = env(false, false);
-    for field in ["packed_pointwise", "exl3_legacy", "expert_cache"] {
+    for field in [
+        "packed_pointwise",
+        "exl3_legacy",
+        "expert_cache",
+        "layer_major",
+        "layer_jobs",
+    ] {
         assert_ne!(
             CudaPrefixPath::from_values(Path::new("/model"), 4096, 8, "f16", off.clone()),
             CudaPrefixPath::from_values(Path::new("/model"), 4096, 8, "f16", flip(&off, field)),
@@ -103,20 +113,23 @@ fn a_cuda_path_binds_every_flag_it_reads() {
     );
 }
 
-/// q8 refuses at the executor boundary with a message naming the limit, on
-/// both save and restore, before any device work.
+/// q8 and the mixed q8k refuse at the executor boundary with a message
+/// naming the limit, on both save and restore, before any device work.
 #[test]
 fn q8_profile_refuses_prefix_reuse() {
     use crate::EngError;
     assert!(super::cuda_prefix::profile_allows_prefix("q8").is_err());
+    assert!(super::cuda_prefix::profile_allows_prefix("q8k").is_err());
     assert!(super::cuda_prefix::profile_allows_prefix("f16").is_ok());
-    let EngError::BadRequest(message) =
-        super::cuda_prefix::profile_allows_prefix("q8").unwrap_err()
-    else {
-        panic!("the q8 refusal must be a BadRequest naming the profiles");
-    };
-    assert!(message.contains("q8"), "{message}");
-    assert!(message.contains("f16"), "{message}");
+    for refused in ["q8", "q8k"] {
+        let EngError::BadRequest(message) =
+            super::cuda_prefix::profile_allows_prefix(refused).unwrap_err()
+        else {
+            panic!("the {refused} refusal must be a BadRequest naming the profiles");
+        };
+        assert!(message.contains("q8"), "{message}");
+        assert!(message.contains("f16"), "{message}");
+    }
 }
 
 /// GATE 1 (red-first): saving at the tip must not perturb the live session.

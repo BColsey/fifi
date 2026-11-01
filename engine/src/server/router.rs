@@ -1,9 +1,10 @@
 //! The router: the routes of the first server and the authentication layer.
 //!
 //! Routes: `GET /health`, `GET /ready`, `GET /v1/models`, `POST /v1/chat/completions`,
-//! `POST /v1/messages`, `POST /v1/messages/count_tokens`, and the server
-//! extension `GET /v1/recent-requests` (the GUI's live speed panel; not in
-//! the client contract).
+//! `POST /v1/completions`, `POST /v1/messages`, `POST /v1/messages/count_tokens`, and the server
+//! extensions `POST /v1/token/encode`, `POST /v1/token/decode`, `POST /v1/apply-template`, and
+//! `GET /v1/recent-requests` (the GUI's live speed panel). The extensions are not in the client
+//! contract.
 //! A route that the contract does not define, or that this server does not ship, gives a JSON 404.
 //! A method that a served path does not accept counts as an undefined route, because the contract
 //! defines no 405. `HEAD` on a `GET` route stays as axum serves it.
@@ -11,8 +12,10 @@
 use super::anthropic::{count_tokens, messages};
 use super::auth::{check_bearer, check_messages};
 use super::chat::chat;
+use super::completions::completions;
 use super::error::ServerError;
 use super::state::AppState;
+use super::tokenize::{apply_template, decode, encode};
 use super::wire::ModelList;
 use axum::Json;
 use axum::Router;
@@ -32,6 +35,10 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/recent-requests", get(recent_requests))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/completions", post(completions))
+        .route("/v1/token/encode", post(encode))
+        .route("/v1/token/decode", post(decode))
+        .route("/v1/apply-template", post(apply_template))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let messages_routes = Router::new()
         .route("/v1/messages", post(messages))

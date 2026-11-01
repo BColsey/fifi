@@ -121,6 +121,11 @@ impl ChunkWindow {
         self.start.saturating_sub(self.window - 1)..self.end
     }
 
+    /// Attention span this chunk was built with (the plan's ring window).
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
     /// May be `window + chunk_rows - 1`, not merely `window`.
     pub fn required_slots(&self) -> usize {
         self.live_range().len()

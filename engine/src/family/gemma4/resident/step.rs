@@ -458,6 +458,8 @@ impl Gemma {
                 x: input.buf.range(0, input.bytes())?,
                 y: sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
                 n: m * HIDDEN,
+                flag: None,
+                fused: false,
             },
         )?;
         self.norm_rows(
@@ -539,6 +541,8 @@ impl Gemma {
                 x: r1.buf.range(0, r1.bytes())?,
                 y: sc.nrm2.buf.range(0, sc.nrm2.bytes())?,
                 n: m * HIDDEN,
+                flag: None,
+                fused: false,
             },
         )?;
         ctx.row_scale(

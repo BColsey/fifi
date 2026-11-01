@@ -227,8 +227,7 @@ fn cohort_device_phase(
     let mut opts = options();
     opts.context_tokens = deep.map_or(COHORT_CONTEXT, |case| case.capacity);
     let rules = rules()?;
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let model = open_qwen3_6_35b_a3b(
         &std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf"),
         None,
@@ -554,9 +553,7 @@ fn cohort_score_positions_match_both_oracle_chunks() {
 }
 
 fn run_cohort(chunk_rows: usize, deep: Option<DeepCase>) {
-    let dir = std::env::var("Q36_CUDA_COHORT_DIR").unwrap_or_else(|_| {
-        "/media/dan/nvme/fifi/scrch/bba24a15/llamacpp-oracle/cohort".to_owned()
-    });
+    let dir = crate::test_paths::required("Q36_CUDA_COHORT_DIR");
     let bytes = std::fs::read(std::path::Path::new(&dir).join("tokens.json"))
         .expect("read supplied oracle cohort without retokenizing");
     let ids = cohort_ids(&bytes).expect("unchanged supplied oracle cohort");
@@ -671,9 +668,7 @@ fn wide_stage_matches_the_default_stage_above_the_tier() {
         rows: 512,
         fixed: true,
     };
-    let dir = std::env::var("Q36_CUDA_COHORT_DIR").unwrap_or_else(|_| {
-        "/media/dan/nvme/fifi/scrch/bba24a15/llamacpp-oracle/cohort".to_owned()
-    });
+    let dir = crate::test_paths::required("Q36_CUDA_COHORT_DIR");
     let bytes =
         std::fs::read(std::path::Path::new(&dir).join("tokens.json")).expect("cohort tokens");
     let ids = cohort_ids(&bytes).expect("cohort ids");
@@ -685,8 +680,7 @@ fn wide_stage_matches_the_default_stage_above_the_tier() {
     let mut opts = options();
     opts.context_tokens = case.capacity;
     let rules = rules().expect("rules");
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let model = open_qwen3_6_35b_a3b(
         &std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf"),
         None,

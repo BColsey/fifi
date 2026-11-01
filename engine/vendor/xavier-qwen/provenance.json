@@ -4,7 +4,7 @@
   "commit": "2f9183c1d99b7f459316f89b7dd9450ac7e8df66",
   "license": "MIT",
   "copyright": "Copyright (c) 2026 Dan Campos",
-  "origin_audit": "KUBDAN-ORIGIN-AUDIT-2f9183c.md, reviewed in coordinator REPLY-13 against llama.cpp acecd56032ddc34bada14a2d978f110d9c987095",
+  "origin_audit": "origin audit of commit 2f9183c, reviewed against llama.cpp acecd56032ddc34bada14a2d978f110d9c987095",
   "files": {
     "LICENSE": {
       "upstream_sha256": "56dc032b18ae6211f3a3589f625e362118f81b90e79c038af865829b9def1e74",
@@ -57,7 +57,7 @@
   "patches": [
     {
       "id": "exit-paths-and-alignment",
-      "description": "Return errors instead of ending the process (REPLY-16 option A, commit 52ae269) and the write_xf alignment fix (commit 884020c). No diff file is stored; the end points are the trimmed files and the files before RD-0.",
+      "description": "Return errors instead of ending the process (commit 52ae269) and the write_xf alignment fix (commit 884020c). No diff file is stored; the end points are the trimmed files and the files before RD-0.",
       "diff": null,
       "files": {
         "src/gemm.cuh": {
@@ -236,7 +236,7 @@
   ],
   "note": "Import commit 80fdb5b is byte-identical to upstream; trim commit cea80ef is whole-function only; the exit-path patch (52ae269) and the alignment fix (884020c) are their own commits. vendored_sha256 is the trimmed file. patched_sha256 is the file after the last entry of patches, in order: exit-paths-and-alignment, then RD-0-explicit-stream, then RD-0b-expert-index (their diffs are stored in patches/). RD-0b-expert-index is the third entry: it appends the device-indexed expert entry (patched_sha256 of kernels.cu, kernels.h and mma884.cuh is the file after it; gemm.cuh, repack.cu and repack.h are not in that entry). RD-4V (2026-10-10) restores the functions listed under \"restored\" into src/ops.cu and src/ops.h; the line ranges taken unchanged from 2f9183c are listed there, and the RD-4V patches follow in \"patches\".",
   "trim": {
-    "approval": "coordinator REPLY-13 item 2 and REPLY-16 item 2",
+    "approval": "approved in review of the origin audit",
     "scope": "whole functions and declarations only; kept code is byte-identical to upstream",
     "kept": {
       "src/kernels.cu": [
@@ -309,7 +309,7 @@
     }
   },
   "patch": {
-    "approval": "coordinator REPLY-16 item 1 (option A)",
+    "approval": "approved in review of the origin audit",
     "purpose": "A library must not end the process. Every path that ended the process with exit status 1 returns an error to the caller, and the diagnostics that were written to stderr are removed; the engine adapter maps each return to the decision 0040 status and stage.",
     "files": [
       "src/gemm.cuh",
@@ -340,7 +340,7 @@
     "packet": "RD-4V",
     "date": "2026-10-10",
     "commit": "2f9183c1d99b7f459316f89b7dd9450ac7e8df66",
-    "grant": "lane M REPLY-35 and lane C RD-4V conditions (2026-10-09)",
+    "grant": "approved in review under the RD-4V conditions (2026-10-09)",
     "functions": [
       "warp_sum",
       "block_sum",

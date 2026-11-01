@@ -123,7 +123,7 @@ fn a_status_refusal_keeps_the_class_and_the_precedence_of_the_wrapper() {
     assert_eq!(class(1 | 2), "route_experts", "1 beats 2");
     assert_eq!(class(2), "sample");
     assert_eq!(
-        class(16),
+        class(32),
         "step_status",
         "unknown bits alone are still a Backend error"
     );
@@ -135,6 +135,30 @@ fn a_status_refusal_keeps_the_class_and_the_precedence_of_the_wrapper() {
             ..
         }
     ));
+}
+
+/// Mask 16 is the EXL3 arithmetic verdict folded into the status: a `ModelOutput` with the text
+/// of the flag error, beaten by masks 4 and 8, and it beats the router and logit masks.
+#[test]
+fn the_exl3_arithmetic_mask_maps_to_the_flag_error() {
+    let text = |status: i32| match status_error(status) {
+        crate::EngError::ModelOutput(message) => message,
+        other => panic!("status {status}: not a ModelOutput: {other:?}"),
+    };
+    assert_eq!(text(16), "EXL3 projection flagged invalid arithmetic");
+    assert_eq!(
+        text(16 | 1 | 2),
+        "EXL3 projection flagged invalid arithmetic"
+    );
+    for beaten_by in [4, 8] {
+        assert!(
+            matches!(
+                status_error(16 | beaten_by),
+                crate::EngError::Backend { .. }
+            ),
+            "mask {beaten_by} beats 16"
+        );
+    }
 }
 
 /// The kernels' prefill mask — [`PREFILL_STATUS_BOUND_VIOLATION`], the one Rust mirror of

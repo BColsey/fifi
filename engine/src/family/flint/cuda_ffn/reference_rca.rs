@@ -392,7 +392,7 @@ fn replay_l0_p01_actual_operator_inputs() {
 }
 
 #[test]
-#[ignore = "requires fifi-build and pinned GGUF/oracle; CPU only, diagnostic not qualification"]
+#[ignore = "requires pinned GGUF/oracle; long CPU run, diagnostic not qualification"]
 fn capture_l0_p01_reference_boundaries() {
     let path = std::env::var("FIFI_FLINT_FULL_ORACLE").expect("frozen oracle");
     let sha = std::env::var("FIFI_FLINT_FULL_ORACLE_SHA256").expect("frozen oracle SHA256");

@@ -41,7 +41,7 @@ export class MonitorView {
    * routes. Every fetch carries the app's 4 s timeout, so a hung server
    * cannot stall the poll or the view. The poll calls this on every
    * branch — server up, starting, or down — so health, readiness, and
-   * the ring share one truth and one timestamp (Opus MF1: a recent-only
+   * the ring share one truth and one timestamp (a recent-only
    * poll leg kept last-good health next to a current time). */
   async refresh(): Promise<MonitorData> {
     if (this.refreshing) return this.data;
@@ -84,7 +84,7 @@ export class MonitorView {
     // The recent-rows fetch-and-reduce is the panel module's one
     // implementation; the sweep calls it only from a reachable server —
     // a dead one gets null rows, and applyProbe's full replacement keeps
-    // no last-good field (Opus MF1).
+    // no last-good field.
     const panel = healthOk
       ? await refreshRecentRows()
       : { recent: null, recentError: null };

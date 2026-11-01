@@ -220,8 +220,7 @@ fn device_phase(ids: &[u32], kernel_class: ChunkKernelClass) -> Result<Observed,
     let dims = step_dims();
     let inv = inventory();
     let opts = options();
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let gguf_path = std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf");
     let model = open_qwen3_6_35b_a3b(&gguf_path, None)?;
     let projector = CudaProjector::new()?;

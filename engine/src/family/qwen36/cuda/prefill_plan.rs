@@ -56,6 +56,14 @@ fn overflow() -> EngError {
     EngError::MemoryPlan("prefill plan: a size overflows".to_owned())
 }
 
+/// Bytes of a table of 16-bit elements, `parts` multiplied.
+fn half_bytes(parts: &[usize]) -> Result<usize, EngError> {
+    parts
+        .iter()
+        .try_fold(2usize, |total, &part| total.checked_mul(part))
+        .ok_or_else(overflow)
+}
+
 /// Bytes of `parts` 4-byte words multiplied together (f32 and i32 tensors).
 fn word_bytes(parts: &[usize]) -> Result<usize, EngError> {
     parts
@@ -377,6 +385,23 @@ pub(crate) enum ChunkSlot {
     Q8Act,
     Down,
     Fixup,
+    /// The rotated input rows of the dense EXL3 projections of a chunk (EXL3 arenas only).
+    Exl3Xh,
+    /// The split-K partials of the EXL3 projections.
+    Exl3Z,
+    /// The rows of a plain gate that wait for `scatter_cols`.
+    Exl3Y,
+    /// The sticky arithmetic flag of the EXL3 projections.
+    Exl3Flag,
+    /// The job table of the dense EXL3 projections of a chunk.
+    DenseJobs,
+    /// The two row lists of the EXL3 routed pass (u32): the token row each sorted pair reads and
+    /// the pair row it lands in; then the job table.
+    ExpertPerm,
+    /// The rotated input rows of the EXL3 routed projections (one job-table launch each).
+    ExpertXh,
+    /// The projection partials of the EXL3 routed projections.
+    ExpertZ,
 }
 
 type Row = (ChunkSlot, usize, Phase, Phase);
@@ -495,6 +520,252 @@ fn moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
         (S::Q8Act, q8_1_bytes(e.inter, routed)?, QuantAct, Down),
         (S::Down, word_bytes(&[routed, h])?, Down, Combine),
     ])
+}
+
+/// The most rows of one job of a dense EXL3 projection: the tallest CTA of the job-table kernel
+/// (256 rows decode each weight tile once for the whole job).
+pub(crate) const EXL3_TILE_ROWS: usize = 256;
+
+/// The most rows of one job of a routed expert: the narrowest CTA (64 rows). An expert holds a few
+/// dozen rows of a chunk, and a wider CTA would decode no fewer weights and run mostly idle warps.
+pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
+
+/// Words of one entry of the job table of the routed projections.
+pub(crate) const EXL3_JOB_WORDS: usize = 4;
+
+/// The most jobs of one routed pass over `routed` pairs and `experts` experts: one per expert
+/// with rows plus one per full tile beyond the first of an expert.
+pub(crate) fn exl3_max_jobs(experts: usize, routed: usize) -> usize {
+    experts + routed.div_ceil(EXL3_EXPERT_TILE_ROWS)
+}
+
+/// Every slot of an EXL3 chunk arena exactly once, in [`exl3_chunk_tensors`] order. An EXL3 chunk
+/// has no q8_1 copies, no MMQ id tables and no stream-k fixup range.
+pub(crate) const EXL3_SLOTS: [ChunkSlot; 31] = [
+    ChunkSlot::Hidden,
+    ChunkSlot::IdsTok,
+    ChunkSlot::X,
+    ChunkSlot::XfA,
+    ChunkSlot::Delta,
+    ChunkSlot::X2,
+    ChunkSlot::XfF,
+    ChunkSlot::ProjD,
+    ChunkSlot::ConvOut,
+    ChunkSlot::OOut,
+    ChunkSlot::ProjA,
+    ChunkSlot::Q,
+    ChunkSlot::AttnOut,
+    ChunkSlot::Logits,
+    ChunkSlot::TopkId,
+    ChunkSlot::TopkWeight,
+    ChunkSlot::SharedGate,
+    ChunkSlot::GuSh,
+    ChunkSlot::ActSh,
+    ChunkSlot::ShOut,
+    ChunkSlot::ExpertPerm,
+    ChunkSlot::Gu,
+    ChunkSlot::Act,
+    ChunkSlot::Down,
+    ChunkSlot::ExpertXh,
+    ChunkSlot::ExpertZ,
+    ChunkSlot::Exl3Xh,
+    ChunkSlot::Exl3Z,
+    ChunkSlot::Exl3Y,
+    ChunkSlot::Exl3Flag,
+    ChunkSlot::DenseJobs,
+];
+
+/// The bytes of the arithmetic flag word.
+const EXL3_FLAG_BYTES: usize = 4;
+
+fn exl3_common_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
+    use {ChunkSlot as S, Phase::*};
+    let hidden = row_bytes(m, g.hidden).ok_or_else(overflow)?;
+    // The `xf` sinks carry the 1-row fragment floor, as in `common_rows`.
+    let xf = xf_bytes(m, g.hidden)
+        .zip(xf_bytes(1, g.hidden))
+        .map(|(bytes, fragment)| bytes.max(fragment))
+        .ok_or_else(overflow)?;
+    Ok(vec![
+        (S::Hidden, hidden, Embed, Combine),
+        (S::IdsTok, word_bytes(&[m])?, Embed, Embed),
+        // The normalized rows are read by the first projection of either mixer.
+        (S::X, hidden, NormA, AProj),
+        (S::XfA, xf, NormA, NormA),
+        (S::Delta, hidden, DOut, NormF),
+        // The post-mixer norm rows feed the router, the shared expert and the routed gather.
+        (S::X2, hidden, NormF, Combine),
+        (S::XfF, xf, NormF, NormF),
+    ])
+}
+
+/// The mixer blocks of an EXL3 chunk: the F32 rows stay live up to the output projection, which
+/// reads them (the GGUF chunk reads a q8_1 copy instead).
+fn exl3_mixer_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
+    use {ChunkSlot as S, Phase::*};
+    let (d, a) = (&g.delta, &g.attn);
+    Ok(vec![
+        (S::ProjD, word_bytes(&[m, d.ld])?, DProj, DScan),
+        (
+            S::ConvOut,
+            cpf_dn_conv_out_bytes(m, d.channels)?,
+            DConv,
+            DScan,
+        ),
+        (
+            S::OOut,
+            cpf_dn_scan_out_bytes(m, d.value_heads, d.value_dim)?,
+            DScan,
+            DOut,
+        ),
+        (S::ProjA, word_bytes(&[m, a.ld])?, AProj, AFlash),
+        (S::Q, q_bytes(m, a.heads_q), APrep, AFlash),
+        (S::AttnOut, word_bytes(&[m, a.q_width])?, AFlash, AOut),
+    ])
+}
+
+/// The MoE block of an EXL3 chunk: the router, the shared expert, and the routed pass over the
+/// `m * top_k` pairs sorted by expert.
+fn exl3_moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
+    use {ChunkSlot as S, Phase::*};
+    let (h, e) = (dims.shape.hidden, &dims.shape.moe);
+    let routed = m.checked_mul(e.top_k).ok_or_else(overflow)?;
+    let picks = word_bytes(&[m, e.top_k])?;
+    let router = RouterShape {
+        m,
+        hidden: h,
+        n_expert: e.experts,
+        top_k: e.top_k,
+    };
+    Ok(vec![
+        (S::Logits, router_logits_bytes(router)?, Route, Route),
+        (S::TopkId, picks, Route, Combine),
+        (S::TopkWeight, picks, Route, Combine),
+        (S::SharedGate, word_bytes(&[m])?, Route, Combine),
+        (
+            S::GuSh,
+            word_bytes(&[m, 2 * e.shared_inter])?,
+            Shared,
+            Shared,
+        ),
+        (S::ActSh, word_bytes(&[m, e.shared_inter])?, Shared, Shared),
+        (S::ShOut, word_bytes(&[m, h])?, Shared, Combine),
+        // The two row lists of the routed projections, then the job table: the first list is read
+        // by the gate and up input rotation, the second by the down output rotation, which writes
+        // `Down` (below) while it is still live.
+        (
+            S::ExpertPerm,
+            word_bytes(&[2 * routed + EXL3_JOB_WORDS * exl3_max_jobs(e.experts, routed)])?,
+            Ids,
+            Down,
+        ),
+        (S::Gu, word_bytes(&[routed, 2 * e.inter])?, GateUp, Swiglu),
+        (S::Act, word_bytes(&[routed, e.inter])?, Swiglu, Down),
+        // The down projection writes the pair rows in row and rank order, read by the combine; its
+        // partials, rotated input and row lists are live in the same phase, so it is apart from them.
+        (S::Down, word_bytes(&[routed, h])?, Down, Combine),
+        (
+            S::ExpertXh,
+            half_bytes(&[routed, h.max(e.inter)])?,
+            GateUp,
+            Down,
+        ),
+        (
+            S::ExpertZ,
+            word_bytes(&[routed, h.max(e.inter)])?,
+            GateUp,
+            Down,
+        ),
+    ])
+}
+
+/// The projection scratch of an EXL3 chunk, live for the whole layer loop: the rotated input rows
+/// and the partials of a dense projection over all `m` rows, the rows of a plain gate that wait for
+/// `scatter_cols`, the arithmetic flag, and the job table of the dense projections (one job per
+/// tile of rows, the same for every layer). Widths are the widest input and output of any dense
+/// projection of the model.
+fn exl3_scratch_rows(dims: &StepDims, g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
+    use {ChunkSlot as S, Phase::*};
+    let (d, a, e) = (&g.delta, &g.attn, &dims.shape.moe);
+    let widest_k = [g.hidden, d.value_width, a.q_width, e.inter, e.shared_inter]
+        .into_iter()
+        .max()
+        .ok_or_else(overflow)?;
+    let widest_n = [
+        d.channels,
+        d.z_rows,
+        a.q_rows,
+        a.kv_rows,
+        g.hidden,
+        e.inter,
+        e.shared_inter,
+    ]
+    .into_iter()
+    .max()
+    .ok_or_else(overflow)?;
+    let plain = d.beta_rows.max(d.alpha_rows);
+    let jobs = EXL3_JOB_WORDS * m.div_ceil(EXL3_TILE_ROWS);
+    Ok(vec![
+        (S::Exl3Xh, half_bytes(&[m, widest_k])?, Embed, Combine),
+        (S::Exl3Z, word_bytes(&[m, widest_n])?, Embed, Combine),
+        (S::Exl3Y, word_bytes(&[m, plain])?, Embed, Combine),
+        (S::Exl3Flag, EXL3_FLAG_BYTES, Embed, Combine),
+        (S::DenseJobs, word_bytes(&[jobs])?, Embed, Combine),
+    ])
+}
+
+/// The tensors of an EXL3 chunk of `m` rows in `1..=2048`, in the order of [`EXL3_SLOTS`]. The
+/// arena is zero-filled once at session build, which clears the flag; the chunk driver clears it
+/// again before each chunk. Smaller chunks of a session use prefixes of
+/// the slots planned for its `M_sess`, as for the GGUF list.
+pub(crate) fn exl3_chunk_tensors(
+    dims: &StepDims,
+    m: usize,
+) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
+    check_ncols_domain(m)?;
+    let g = MixerGeometry::new(dims)?;
+    let rows = [
+        exl3_common_rows(&g, m)?,
+        exl3_mixer_rows(&g, m)?,
+        exl3_moe_rows(dims, m)?,
+        exl3_scratch_rows(dims, &g, m)?,
+    ];
+    Ok(rows
+        .into_iter()
+        .flatten()
+        .map(|(slot, bytes, first, last)| {
+            let (first, last) = (first as usize, last as usize);
+            (slot, ArenaTensor { bytes, first, last })
+        })
+        .collect())
+}
+
+/// The cost of one EXL3 chunk size: the `plan_arena` total of [`exl3_chunk_tensors`] and the
+/// attention `part` bytes, which do not depend on the weight format.
+pub(crate) fn exl3_chunk_cost(
+    dims: &StepDims,
+    m: usize,
+    nsm: usize,
+) -> Result<ChunkCost, EngError> {
+    let tensors: Vec<ArenaTensor> = exl3_chunk_tensors(dims, m)?
+        .into_iter()
+        .map(|(_, tensor)| tensor)
+        .collect();
+    let a = &dims.shape.attn;
+    let heads = (a.heads_q, a.heads_kv);
+    Ok(ChunkCost {
+        m,
+        arena: plan_arena(&tensors)?.total,
+        part: cpf_attn_workspace_bytes_for_sm(m, heads, a.head_dim, m, CPF_ATTN_Q_TILE, nsm)?,
+    })
+}
+
+/// The costs of every size of [`M_LADDER`] for an EXL3 chunk.
+pub(crate) fn exl3_chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkCost>, EngError> {
+    M_LADDER
+        .iter()
+        .map(|&m| exl3_chunk_cost(dims, m, nsm))
+        .collect()
 }
 
 /// The tensors of a chunk of `m` rows, in the order of the plan table, for a device with `nsm`

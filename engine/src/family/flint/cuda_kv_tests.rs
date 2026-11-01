@@ -120,6 +120,38 @@ fn internal_storage_charge_includes_both_native_scale_planes() {
 }
 
 #[test]
+fn mixed_q8k_plan_sizes_k_and_v_planes_independently() {
+    let plan = KvPlan::new(4096, 8, true)
+        .unwrap()
+        .with_kv_storage(KvStorage::Q8G32, KvStorage::F16);
+    assert_eq!(plan.per_plane_row_bytes(), (544, 1024));
+    let bytes: usize = (0..49)
+        .map(|layer| {
+            let allocation = LayerKvAllocation::new(&plan, layer).unwrap();
+            let cells = allocation.cache_rows();
+            // K carries payload+scale; V is the plain f16 payload.
+            assert_eq!(allocation.plane_components(), (cells * 512, cells * 32));
+            assert_eq!(allocation.v_plane_bytes(), cells * 1024);
+            allocation.plane_bytes() + allocation.v_plane_bytes()
+        })
+        .sum();
+    let (k, v) = plan.per_plane_row_bytes();
+    assert_eq!(bytes, plan.bytes(k + v).unwrap());
+    // Same physical capacities as the uniform profiles of the same context.
+    let uniform = KvPlan::new(4096, 8, true)
+        .unwrap()
+        .with_storage(KvStorage::Q8G32);
+    for layer in [0, 2, 48] {
+        assert_eq!(
+            LayerKvAllocation::new(&plan, layer).unwrap().cache_rows(),
+            LayerKvAllocation::new(&uniform, layer)
+                .unwrap()
+                .cache_rows()
+        );
+    }
+}
+
+#[test]
 fn append_runs_use_physical_capacity_not_encoded_plane_bytes() {
     for (storage, layer) in [
         (KvStorage::F16, 0),
@@ -199,6 +231,28 @@ fn allocator_rejects_an_out_of_range_layer_before_native_allocation() {
         assert!(matches!(
             LayerKvAllocation::new(&plan, layer),
             Err(EngError::BadRequest(_))
+        ));
+    }
+}
+
+#[test]
+fn small_test_window_plans_wrap_cursors_at_the_substituted_window() {
+    let linear = KvPlan::new(131, 1, false).unwrap();
+    let ring = KvPlan::new_test_window(131, 1, true, 65).unwrap();
+    for (label, plan, rows) in [("linear", &linear, 131), ("ring", &ring, 65)] {
+        let allocation = LayerKvAllocation::new(plan, 2).unwrap();
+        assert_eq!(allocation.cache_rows(), rows, "{label} capacity");
+        let mut cursor = allocation.cursor();
+        for position in 0usize..131 {
+            let append = cursor
+                .begin_append(position, 1)
+                .unwrap_or_else(|e| panic!("{label} append at {position}: {e:?}"));
+            assert_eq!(append.slot(position).unwrap(), position % rows);
+            append.commit();
+        }
+        assert!(matches!(
+            cursor.begin_append(131, 1),
+            Err(EngError::ContextLimit(_))
         ));
     }
 }

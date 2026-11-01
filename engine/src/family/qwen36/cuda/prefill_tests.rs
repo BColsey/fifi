@@ -184,6 +184,35 @@ fn chunk_rows_refuse_each_bound() {
     );
 }
 
+/// The EXL3 list is accepted by its own slot set and by no other: a missing slot is refused, and
+/// so is a slot of the other set in either list.
+#[test]
+fn view_list_checks_the_exl3_slot_set() {
+    use super::prefill_plan::{ChunkSlot, EXL3_SLOTS};
+    let slots = EXL3_SLOTS.to_vec();
+    let text = |arena_len: usize, slots: &[ChunkSlot]| {
+        let EngError::BadRequest(text) = check_view_list(arena_len, slots).expect_err("refused")
+        else {
+            panic!("not a BadRequest");
+        };
+        text
+    };
+    assert!(check_view_list(slots.len(), &slots).is_ok());
+    let short: Vec<_> = slots
+        .iter()
+        .copied()
+        .filter(|s| *s != ChunkSlot::ExpertPerm)
+        .collect();
+    assert!(text(short.len(), &short).contains("ExpertPerm is missing"));
+    let mut foreign = slots.clone();
+    foreign.push(ChunkSlot::Q8X);
+    assert!(text(foreign.len(), &foreign).contains("Q8X does not belong"));
+    // A GGUF list that carries an EXL3 scratch slot.
+    let mut native = ALL_SLOTS.to_vec();
+    native.push(ChunkSlot::Exl3Y);
+    assert!(text(native.len(), &native).contains("Exl3Y does not belong"));
+}
+
 /// One row per guard of the view checks, each with every earlier guard satisfied; then
 /// `slot_position`.
 #[test]
@@ -780,7 +809,7 @@ fn bufs_refuse_each_guard() {
             part_bytes,
             part_offset,
             nsm,
-            fixup_bytes: fixup,
+            fixup_bytes: Some(fixup),
         };
     let valid = facts(256, CPF_ATTN_PART_CAP, 0, 82, floor);
     assert!(check_bufs(&valid).is_ok());
@@ -1125,7 +1154,31 @@ fn prefill_stages_pass_the_prefill_word() {
     }
     let route = body("fn run_chunk_route(");
     assert_eq!(count(&route, "status:io.status"), 1, "the router word");
-    // The embedding takes the resolved word by shorthand.
+    // The embedding takes the resolved word by shorthand, once in each gather: the Q4_K table of a
+    // Native load and the BF16 table of an EXL3 pack.
     let embed = body("fn chunk_embed(");
-    assert_eq!(count(&embed, "status,"), 1, "the embedding");
+    assert_eq!(count(&embed, "status,"), 2, "the embedding");
+}
+
+/// The shared projection rows of the model satisfy the column scatter's multiples of four, and a
+/// width, offset or stride that does not is refused at admission, not in the middle of a chunk.
+/// Mutation: dropping the stride term of the check, or checking only the widths, fails one of the
+/// three refusals.
+#[test]
+fn the_exl3_column_layout_is_checked_for_the_column_scatter() {
+    use super::{mixer_geometry::MixerGeometry, prefill::check_exl3_columns};
+    let geometry = MixerGeometry::new(&common_tests::dims()).expect("geometry");
+    assert!(check_exl3_columns(&geometry).is_ok());
+    let refused = |edit: &dyn Fn(&mut MixerGeometry), what: &str| {
+        let mut bent = geometry;
+        edit(&mut bent);
+        let error = check_exl3_columns(&bent).expect_err("refused");
+        assert!(
+            matches!(&error, EngError::BadRequest(text) if text.contains("prefill chunk: columns")),
+            "{what}: {error:?}"
+        );
+    };
+    refused(&|g| g.delta.z_rows += 2, "a width");
+    refused(&|g| g.delta.z_off += 1, "an offset");
+    refused(&|g| g.attn.ld += 2, "a stride");
 }

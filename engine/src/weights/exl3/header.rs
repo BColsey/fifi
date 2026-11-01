@@ -72,6 +72,25 @@ impl Matrix {
         })
     }
 
+    /// Reassembles a matrix from components a transform already checked against `shape`.
+    pub(super) fn from_parts(
+        parts: (Tensor, Tensor, Tensor, Option<Tensor>),
+        book: Codebook,
+        shape: [usize; 2],
+        bits_twice: u8,
+    ) -> Self {
+        let (trellis, suh, svh, bias) = parts;
+        Self {
+            trellis,
+            suh,
+            svh,
+            bias,
+            book,
+            shape,
+            bits_twice,
+        }
+    }
+
     pub fn shape(&self) -> [usize; 2] {
         self.shape
     }

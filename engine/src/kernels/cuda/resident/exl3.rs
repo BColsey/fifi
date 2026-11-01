@@ -11,8 +11,183 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::native::resident::exl3 as ffi;
 use crate::weights::exl3::Codebook;
 
+/// `FIFI_EXL3_LEGACY`, read once per process: every launch of the rows entry asks.
+fn legacy_variable() -> Option<&'static std::ffi::OsStr> {
+    static LEGACY: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    LEGACY
+        .get_or_init(|| std::env::var_os("FIFI_EXL3_LEGACY"))
+        .as_deref()
+}
+
 fn midrows_enabled(rows: usize, legacy: Option<&std::ffi::OsStr>) -> bool {
     (64..=144).contains(&rows) && legacy != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Environment switch of the single-row grouped path. Unset takes the default of the context the
+/// projection runs on (the shuffle kernel, or the kernel its session registered with
+/// [`CudaContext::set_single_row_default`]: the Qwen3.6 EXL3 start registers `wide1`); `off` selects the shuffle kernel explicitly. `1` sends every 1..=8 row call
+/// of `exl3_linear` (split-K 2) through the shared-table gather kernel as a one-group grouped
+/// launch; `wide1`, `wide2` and `wide4` use the wide kernel with that many adjacent 16-column tiles
+/// per block (a call whose `n` is not a multiple of `16 * cols` takes the gather kernel). The
+/// arithmetic and reduction order are those of the shuffle single-call kernel (pinned bit for bit
+/// by `single_gather_tests`), so the switch changes speed only. Every other value is refused,
+/// never a silent fallback (the rule of `FIFI_EXL3_LAYER_MAJOR`). It is process-wide and read
+/// once: a change after the first EXL3 call is ignored.
+pub(crate) const SINGLE_GATHER_VAR: &str = "FIFI_EXL3_SINGLE_GATHER";
+
+/// The kernel a single-row call runs on. The switch governs every grouped launch the Qwen3.6 EXL3
+/// step makes as well: see [`grouped_kernel_for`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SingleRow {
+    Legacy,
+    Gather,
+    Wide(u32),
+}
+
+/// Parses the variable; an unset variable is the shuffle kernel.
+pub(crate) fn single_gather_from_env(value: Option<&std::ffi::OsStr>) -> Result<SingleRow, String> {
+    let Some(value) = value else {
+        return Ok(SingleRow::Legacy);
+    };
+    match value.to_str().map(str::trim) {
+        Some("off") => Ok(SingleRow::Legacy),
+        Some("1") => Ok(SingleRow::Gather),
+        Some("wide1") => Ok(SingleRow::Wide(1)),
+        Some("wide2") => Ok(SingleRow::Wide(2)),
+        Some("wide4") => Ok(SingleRow::Wide(4)),
+        _ => Err(format!(
+            "{SINGLE_GATHER_VAR} must be unset, \"off\", \"1\", \"wide1\", \"wide2\" or \"wide4\""
+        )),
+    }
+}
+
+/// The kernel an unset variable leaves to the context: an explicit value of the variable always
+/// wins, then the default the session that owns the context registered on it
+/// ([`CudaContext::set_single_row_default`]), then the shuffle kernel.
+pub(crate) fn effective_single_row(
+    explicit: Option<SingleRow>,
+    context_default: Option<SingleRow>,
+) -> SingleRow {
+    explicit.or(context_default).unwrap_or(SingleRow::Legacy)
+}
+
+/// The kernel a call of `rows` rows at `split_k` runs on when the switch selects `kernel`: only
+/// the small-row split-2 shape the grouped kernels implement leaves the shuffle kernel.
+fn single_row_route(kernel: SingleRow, rows: usize, split_k: u32) -> SingleRow {
+    if (1..=8).contains(&rows) && split_k == 2 {
+        kernel
+    } else {
+        SingleRow::Legacy
+    }
+}
+
+/// The grouped kernel a launch runs on: the gather kernel, or the wide kernel with `cols` tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupedKernel {
+    Gather,
+    Wide(u32),
+}
+
+/// The kernel for a launch whose calls have the widths `widths` when the switch selects `kernel`:
+/// the wide kernel only for a wide setting and when every width is a multiple of 16 times its tile
+/// count; the gather kernel otherwise (unset and `1` included).
+pub(crate) fn grouped_kernel_for(
+    kernel: SingleRow,
+    widths: impl IntoIterator<Item = usize>,
+) -> GroupedKernel {
+    match kernel {
+        SingleRow::Wide(cols)
+            if widths
+                .into_iter()
+                .all(|n| n.is_multiple_of(16 * cols as usize)) =>
+        {
+            GroupedKernel::Wide(cols)
+        }
+        _ => GroupedKernel::Gather,
+    }
+}
+
+/// The value the environment names, `None` when the variable is unset, or the refusal of a bad
+/// value. Read once per process; a context's own default applies only when this is `None`.
+fn single_gather_explicit() -> Result<Option<SingleRow>, EngError> {
+    static EXPLICIT: std::sync::OnceLock<Result<Option<SingleRow>, String>> =
+        std::sync::OnceLock::new();
+    EXPLICIT
+        .get_or_init(|| {
+            let value = std::env::var_os(SINGLE_GATHER_VAR);
+            match value.as_deref() {
+                None => Ok(None),
+                Some(text) => single_gather_from_env(Some(text)).map(Some),
+            }
+        })
+        .clone()
+        .map_err(EngError::BadRequest)
+}
+
+impl CudaContext {
+    /// Registers the kernel an unset `FIFI_EXL3_SINGLE_GATHER` selects for the EXL3 projections
+    /// run on this context. The session that owns the context calls it before its first token;
+    /// another context in the process is unaffected.
+    pub(crate) fn set_single_row_default(&self, kernel: SingleRow) {
+        self.exl3_single_row_default.set(Some(kernel));
+    }
+
+    /// The kernel the single-row projections of this context run on, or the refusal of a bad
+    /// value of the variable.
+    fn single_row_setting(&self) -> Result<SingleRow, EngError> {
+        Ok(effective_single_row(
+            single_gather_explicit()?,
+            self.exl3_single_row_default.get(),
+        ))
+    }
+
+    /// Refuses a bad `FIFI_EXL3_SINGLE_GATHER` value; a session start calls it.
+    pub(crate) fn check_single_gather(&self) -> Result<(), EngError> {
+        self.single_row_setting().map(|_| ())
+    }
+
+    /// The load-line suffix of this context's kernel: empty for the shuffle kernel, so the
+    /// default line is unchanged; ` single_gather=on single_kernel=<name>` when armed.
+    pub(crate) fn single_gather_suffix(&self) -> String {
+        self.single_row_setting()
+            .ok()
+            .and_then(single_row_label)
+            .map_or(String::new(), |name| {
+                format!(" single_gather=on single_kernel={name}")
+            })
+    }
+}
+
+/// The load-line name of the kernel a switch value selects, `None` for the shuffle kernel.
+pub(crate) fn single_row_label(kernel: SingleRow) -> Option<&'static str> {
+    match kernel {
+        SingleRow::Legacy => None,
+        SingleRow::Gather => Some("gather"),
+        SingleRow::Wide(1) => Some("wide1"),
+        SingleRow::Wide(2) => Some("wide2"),
+        SingleRow::Wide(4) => Some("wide4"),
+        SingleRow::Wide(_) => Some("wide"),
+    }
+}
+
+/// One row of an id-indexed launch: member 0 of a bank (`call` spans the whole bank) and the
+/// device-side choice of the member. The launch reads `ids[slot]` when its kernels run.
+pub(crate) struct Exl3IndexedCall<'a> {
+    pub(crate) call: Exl3LinearCall<'a>,
+    /// i32 member ids, written by an earlier kernel of the stream.
+    pub(crate) ids: DeviceRange<'a>,
+    pub(crate) slot: u32,
+    /// Members in the bank.
+    pub(crate) members: u32,
+    /// Bytes between the trellises of consecutive members.
+    pub(crate) trellis_stride: usize,
+    /// Floats between the suh (and the svh) of consecutive members.
+    pub(crate) scale_stride: usize,
+    /// Optional per-member byte offsets from member 0 (u32 words written by the host; an entry of
+    /// `u32::MAX` marks a member that is not resident). When present it replaces both
+    /// strides and `members` is its length; the writer of the table bounds it against the bank
+    /// ranges (the Flint walk does so with `plan::check_member_offsets`).
+    pub(crate) offsets: Option<DeviceRange<'a>>,
 }
 
 /// Decode the admitted packed trellis to input-major [k,n] binary16 bits.
@@ -78,13 +253,198 @@ pub(crate) struct Exl3LinearCall<'a> {
     pub(crate) n: usize,
     pub(crate) bits_twice: u8,
     pub(crate) book: Codebook,
+    /// Producer-fusion arm: the final rotate rounds instead of a publish kernel.
+    pub(crate) fused: bool,
 }
+/// One row block of a job-table projection: rows `row0..row0 + rows` of the call's `x`, `xh`, `z`
+/// and `out` are projected by member `member` of the bank. `rows` is 1 to 144.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Exl3Job {
+    pub(crate) member: u32,
+    pub(crate) row0: u32,
+    pub(crate) rows: u32,
+}
+
+impl Exl3Job {
+    /// The device table of `jobs` (16 bytes an entry: four little-endian i32, the last reserved),
+    /// to be uploaded where the call's `jobs` range starts.
+    pub(crate) fn table(jobs: &[Self]) -> Vec<u8> {
+        jobs.iter()
+            .flat_map(|job| {
+                [job.member, job.row0, job.rows, 0]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+            })
+            .collect()
+    }
+}
+
+/// Job-table projection (`exl3.h`): the members of one bank over many row blocks in three
+/// launches. `trellis`, `suh` and `svh` start at member 0 and are addressed by the strides, which
+/// the bank views of the project layer fill; a single matrix passes one member and any stride.
+/// `x` and `z` hold `total_rows` rows of `k` and `n` F32 values and `xh` the rotated input rows
+/// as `total_rows` rows of `k` F16 values; row `r` of a job lands
+/// at `out[(row0 + r) * out_ld + out_col ..][..n]`. `jobs` is the device table of `jobs_count`
+/// entries ([`Exl3Job::table`]), read when the kernels run; `max_rows` is at least every job's
+/// rows. Arithmetic is the rows kernel's (FP16-rounded operands, F32 accumulation) for every row
+/// count. Initialize the flag before use; it is sticky, and a job outside its bounds sets it.
+pub(crate) struct Exl3JobsCall<'a> {
+    pub(crate) trellis: DeviceRange<'a>,
+    pub(crate) suh: DeviceRange<'a>,
+    pub(crate) svh: DeviceRange<'a>,
+    pub(crate) trellis_stride: usize,
+    pub(crate) scale_stride: usize,
+    pub(crate) members: usize,
+    pub(crate) x: DeviceRange<'a>,
+    pub(crate) xh: DeviceRange<'a>,
+    pub(crate) z: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) flag: DeviceRange<'a>,
+    pub(crate) jobs: DeviceRange<'a>,
+    pub(crate) jobs_count: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) total_rows: usize,
+    pub(crate) out_ld: usize,
+    pub(crate) out_col: usize,
+    pub(crate) k: usize,
+    pub(crate) n: usize,
+    pub(crate) bits_twice: u8,
+    pub(crate) book: Codebook,
+    /// `u32` row lists (`exl3.h`): the row of `x` each table row reads and the row of `out` it
+    /// lands in. `None` is the identity; then `x_rows` and `out_total_rows` equal `total_rows`.
+    pub(crate) in_rows: Option<DeviceRange<'a>>,
+    pub(crate) out_rows: Option<DeviceRange<'a>>,
+    pub(crate) x_rows: usize,
+    pub(crate) out_total_rows: usize,
+}
+
+impl CudaContext {
+    fn jobs_raw<'c>(&'c self, call: &Exl3JobsCall<'c>) -> Result<ffi::JobsRaw<'c>, EngError> {
+        Ok(ffi::JobsRaw {
+            trellis: self.raw_range(&call.trellis)?,
+            suh: self.raw_range(&call.suh)?,
+            svh: self.raw_range(&call.svh)?,
+            x: self.raw_range(&call.x)?,
+            xh: self.raw_range(&call.xh)?,
+            z: self.raw_range(&call.z)?,
+            out: self.raw_range(&call.out)?,
+            flag: self.raw_range(&call.flag)?,
+            jobs: self.raw_range(&call.jobs)?,
+            trellis_stride: call.trellis_stride,
+            scale_stride: call.scale_stride,
+            members: call.members,
+            jobs_count: call.jobs_count,
+            max_rows: call.max_rows,
+            total_rows: call.total_rows,
+            out_ld: call.out_ld,
+            out_col: call.out_col,
+            k: call.k,
+            n: call.n,
+            bits_twice: call.bits_twice,
+            book: call.book,
+            in_rows: call
+                .in_rows
+                .as_ref()
+                .map(|list| self.raw_range(list))
+                .transpose()?,
+            out_rows: call
+                .out_rows
+                .as_ref()
+                .map(|list| self.raw_range(list))
+                .transpose()?,
+            x_rows: call.x_rows,
+            out_total_rows: call.out_total_rows,
+        })
+    }
+
+    /// Whether `call` would run the register-decode kernel on the current device (`exl3.h`).
+    #[cfg(test)]
+    pub(crate) fn exl3_jobs_use_registers(
+        &self,
+        call: &Exl3JobsCall<'_>,
+    ) -> Result<bool, EngError> {
+        self.ensure_usable()?;
+        let raw = self.jobs_raw(call)?;
+        ffi::jobs_use_registers(&raw).map_err(|_| {
+            EngError::BadRequest("EXL3 jobs: the call is refused by its checks".into())
+        })
+    }
+
+    /// Queues the three launches of `call` on `stream`.
+    pub(crate) fn exl3_jobs(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3JobsCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.jobs_raw(&call)?;
+        let needs = ffi::jobs_extents(&raw.shape()).ok_or_else(|| {
+            EngError::BadRequest("EXL3 jobs: invalid geometry, bank strides or limits".into())
+        })?;
+        let ranges = [
+            &call.trellis,
+            &call.suh,
+            &call.svh,
+            &call.jobs,
+            &call.x,
+            &call.xh,
+            &call.z,
+            &call.out,
+            &call.flag,
+        ];
+        let names = [
+            "EXL3 trellis",
+            "EXL3 suh",
+            "EXL3 svh",
+            "EXL3 jobs",
+            "EXL3 x",
+            "EXL3 xh",
+            "EXL3 z",
+            "EXL3 out",
+            "EXL3 flag",
+        ];
+        for (i, range) in ranges.iter().enumerate() {
+            require_fit(names[i], range, needs[i], if i == 0 { 2 } else { 4 })?;
+            for (j, other) in ranges[..i].iter().enumerate() {
+                if i >= 5 || j >= 5 {
+                    require_apart(
+                        &Claim::of(names[i], range, needs[i]),
+                        &Claim::of(names[j], other, needs[j]),
+                    )?;
+                }
+            }
+        }
+        // The row lists are read only: one entry a table row, 4-byte aligned, apart from every
+        // range the call writes (indices 5 to 8).
+        for (name, list) in [
+            ("EXL3 in rows", &call.in_rows),
+            ("EXL3 out rows", &call.out_rows),
+        ] {
+            let Some(list) = list else { continue };
+            let need = call.total_rows * 4;
+            require_fit(name, list, need, 4)?;
+            for (j, written) in ranges[5..].iter().enumerate() {
+                require_apart(
+                    &Claim::of(name, list, need),
+                    &Claim::of(names[5 + j], written, needs[5 + j]),
+                )?;
+            }
+        }
+        self.launch_on(stream, |s| ffi::jobs(s, &raw))
+    }
+}
+
 impl CudaContext {
     pub(crate) fn exl3_linear(
         &self,
         stream: &DeviceStream,
         call: Exl3LinearCall<'_>,
     ) -> Result<(), EngError> {
+        let route = single_row_route(self.single_row_setting()?, call.rows, call.split_k);
+        if route != SingleRow::Legacy {
+            let kernel = grouped_kernel_for(route, [call.n]);
+            return self.grouped_by(stream, std::slice::from_ref(&call), kernel);
+        }
         self.exl3_linear_mode(stream, call, false)
     }
 
@@ -172,6 +532,7 @@ impl CudaContext {
             n: call.n,
             bits_twice: call.bits_twice,
             book: call.book,
+            fused: call.fused,
         })
     }
 
@@ -184,6 +545,180 @@ impl CudaContext {
         calls: &[Exl3LinearCall<'_>],
         gather: bool,
     ) -> Result<(), EngError> {
+        let raw = self.grouped_raw(calls)?;
+        self.launch_on(stream, |s| ffi::grouped(s, &raw, gather))
+    }
+
+    /// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
+    /// 16-column tiles, so every call's `n` must be a multiple of `16 * cols`. Every byte
+    /// written equals the `gather` launch of [`Self::exl3_grouped`].
+    pub(crate) fn exl3_grouped_wide(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+        cols: u32,
+    ) -> Result<(), EngError> {
+        if !matches!(cols, 1 | 2 | 4 | 8)
+            || calls
+                .iter()
+                .any(|call| !call.n.is_multiple_of(16 * cols as usize))
+        {
+            return Err(EngError::BadRequest(format!(
+                "EXL3 wide launch: {cols} tiles per block need every width to be a multiple of 16 times that"
+            )));
+        }
+        let raw = self.grouped_raw(calls)?;
+        self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols))
+    }
+
+    /// The grouped launch of the Qwen3.6 MoE block: the gather kernel, or the wide kernel when
+    /// `FIFI_EXL3_SINGLE_GATHER` names one (`wide1`, `wide2`, `wide4`) and every call's `n` is a
+    /// multiple of its tile span. Both write the same bytes.
+    pub(crate) fn exl3_grouped_step(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+    ) -> Result<(), EngError> {
+        let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
+        self.grouped_by(stream, calls, kernel)
+    }
+
+    /// The grouped launch on `kernel`.
+    fn grouped_by(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+        kernel: GroupedKernel,
+    ) -> Result<(), EngError> {
+        match kernel {
+            GroupedKernel::Gather => self.exl3_grouped(stream, calls, true),
+            GroupedKernel::Wide(cols) => self.exl3_grouped_wide(stream, calls, cols),
+        }
+    }
+
+    /// The wide tile count of an indexed launch with columns `n`: the switch's, or 1.
+    pub(crate) fn exl3_indexed_cols(&self, n: usize) -> Result<u32, EngError> {
+        Ok(match grouped_kernel_for(self.single_row_setting()?, [n]) {
+            GroupedKernel::Wide(cols) => cols,
+            GroupedKernel::Gather => 1,
+        })
+    }
+
+    /// Enqueues the id-indexed grouped projection of one decode token: every call is one row of
+    /// a member of an expert bank, chosen from device memory when the kernels run, so the ids may
+    /// be written by an earlier kernel of this stream and the launch can be captured in a graph.
+    /// 1 to 16 calls of one `k`, `n` and flag; the spans of the calls are contiguous in call order
+    /// as for the grouped launches. An id outside `0..members` skips its pair and sets the sticky
+    /// flag. Every byte written equals the wide launch of the same members.
+    pub(crate) fn exl3_grouped_indexed(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3IndexedCall<'_>],
+        cols: u32,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
+        if calls.is_empty() || calls.len() > 16 {
+            return Err(refuse("needs 1..=16 calls"));
+        }
+        if !matches!(cols, 1 | 2 | 4 | 8)
+            || calls
+                .iter()
+                .any(|c| !c.call.n.is_multiple_of(16 * cols as usize))
+        {
+            return Err(refuse(
+                "every width must be a multiple of 16 times the tile count (1, 2, 4 or 8)",
+            ));
+        }
+        if calls.iter().any(|c| c.call.fused != calls[0].call.fused) {
+            return Err(refuse("the calls must all use the same fused-publish arm"));
+        }
+        let mut raw = Vec::with_capacity(calls.len());
+        let mut index = Vec::with_capacity(calls.len());
+        for c in calls {
+            let call = &c.call;
+            let needs = ffi::linear_extents(1, call.k, call.n, call.bits_twice, call.book, 2)
+                .filter(|_| call.rows == 1 && call.split_k == 2)
+                .ok_or_else(|| refuse("one row, split-K 2 and a valid geometry"))?;
+            if c.members == 0
+                || (c.offsets.is_none() && (c.trellis_stride == 0 || c.scale_stride == 0))
+            {
+                return Err(refuse("a bank without members or strides"));
+            }
+            if let Some(table) = &c.offsets {
+                require_fit("EXL3 member offsets", table, c.members as usize * 4, 4)?;
+                require_apart(
+                    &Claim::of("EXL3 member offsets", table, table.bytes()),
+                    &Claim::of("EXL3 xh", &call.xh, needs[5]),
+                )?;
+            }
+            let last = c.members as usize - 1;
+            let span = |stride: usize, unit: usize, need: usize| {
+                last.checked_mul(stride)
+                    .and_then(|bytes| bytes.checked_mul(unit))
+                    .and_then(|bytes| bytes.checked_add(need))
+            };
+            // With an offset table the members' places are data on the device: the host that
+            // wrote the table checked them (`check_member_offsets`); the launch only needs the
+            // member 0 extents.
+            let fits = if c.offsets.is_some() {
+                needs[0] <= call.trellis.bytes()
+                    && needs[1] * 4 <= call.suh.bytes()
+                    && needs[2] * 4 <= call.svh.bytes()
+            } else {
+                span(c.trellis_stride, 1, needs[0]).is_some_and(|b| b <= call.trellis.bytes())
+                    && span(c.scale_stride, 4, needs[1]).is_some_and(|b| b <= call.suh.bytes())
+                    && span(c.scale_stride, 4, needs[2]).is_some_and(|b| b <= call.svh.bytes())
+                    && c.trellis_stride.is_multiple_of(2)
+            };
+            if !fits {
+                return Err(refuse("the member strides leave the bank ranges"));
+            }
+            require_fit("EXL3 member ids", &c.ids, (c.slot as usize + 1) * 4, 4)?;
+            // The ids and every member of the bank are read-only inputs: apart from all writes.
+            for (name, range, bytes) in [
+                ("EXL3 xh", &call.xh, needs[5]),
+                ("EXL3 z", &call.z, needs[6]),
+                ("EXL3 out", &call.out, needs[7]),
+                ("EXL3 flag", &call.flag, needs[8]),
+            ] {
+                require_apart(
+                    &Claim::of("EXL3 member ids", &c.ids, c.ids.bytes()),
+                    &Claim::of(name, range, bytes),
+                )?;
+                for (bank_name, bank) in [
+                    ("EXL3 bank trellis", &call.trellis),
+                    ("EXL3 bank suh", &call.suh),
+                    ("EXL3 bank svh", &call.svh),
+                ] {
+                    require_apart(
+                        &Claim::of(bank_name, bank, bank.bytes()),
+                        &Claim::of(name, range, bytes),
+                    )?;
+                }
+            }
+            raw.push(self.exl3_linear_raw(call, false)?);
+            index.push(ffi::IndexRaw {
+                ids: self.raw_range(&c.ids)?,
+                slot: c.slot,
+                members: c.members,
+                trellis_stride: c.trellis_stride,
+                scale_stride: c.scale_stride,
+                offsets: c
+                    .offsets
+                    .as_ref()
+                    .map(|table| self.raw_range(table))
+                    .transpose()?,
+            });
+        }
+        self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
+    }
+
+    /// Checks the group of a grouped launch and maps it to native ranges.
+    fn grouped_raw<'a>(
+        &self,
+        calls: &[Exl3LinearCall<'a>],
+    ) -> Result<Vec<ffi::LinearRaw<'a>>, EngError> {
         self.ensure_usable()?;
         if calls.is_empty()
             || calls.len() > 48
@@ -196,11 +731,17 @@ impl CudaContext {
                 "EXL3 grouped needs 1..=48 pairs in local groups1..=8".into(),
             ));
         }
-        let raw = calls
+        // The native entry reads one fused-publish arm for the whole set and refuses a
+        // mix; a native refusal would latch the backend, so refuse here first.
+        if calls.iter().any(|call| call.fused != calls[0].fused) {
+            return Err(EngError::BadRequest(
+                "EXL3 grouped calls must all use the same fused-publish arm".into(),
+            ));
+        }
+        calls
             .iter()
             .map(|call| self.exl3_linear_raw(call, false))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.launch_on(stream, |s| ffi::grouped(s, &raw, gather))
+            .collect()
     }
 
     fn exl3_linear_mode(
@@ -210,8 +751,7 @@ impl CudaContext {
         midrows: bool,
     ) -> Result<(), EngError> {
         let raw = self.exl3_linear_raw(&call, midrows)?;
-        let midrows =
-            midrows && midrows_enabled(call.rows, std::env::var_os("FIFI_EXL3_LEGACY").as_deref());
+        let midrows = midrows && midrows_enabled(call.rows, legacy_variable());
         self.launch_on(stream, |s| {
             if midrows {
                 ffi::linear_midrows(s, &raw)
@@ -347,7 +887,13 @@ mod observer_tests {
 }
 
 #[cfg(test)]
+mod fused_publish_tests;
+#[cfg(test)]
+mod jobs_tests;
+#[cfg(test)]
 mod linear_tests;
+#[cfg(test)]
+mod single_gather_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

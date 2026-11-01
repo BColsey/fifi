@@ -74,6 +74,15 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_exl3_flag_clear_launch"]
+    fn exl3_flag_clear_raw(flag: *mut c_void, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_exl3_flag_fold_launch"]
+    fn exl3_flag_fold_raw(
+        params: *mut c_void,
+        flag: *mut c_void,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_argmax_launch"]
     fn argmax_raw(args: *const ArgmaxArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
 }
@@ -171,6 +180,55 @@ pub(in crate::kernels::cuda) fn step_advance_launch(
     // live local that the entry reads only during the call; it keeps no pointer to it. `stream`
     // is a live handle for the call.
     let status = unsafe { step_advance_raw(&args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Bytes of the EXL3 arithmetic flag word.
+const FLAG_BYTES: usize = 4;
+
+/// Queues the zeroing of the EXL3 arithmetic flag word (4 bytes, 4-byte aligned).
+pub(in crate::kernels::cuda) fn exl3_flag_clear_launch(
+    stream: &RawStream,
+    flag: RawRange<'_>,
+) -> Result<(), DeviceFailure> {
+    if !fits(&flag, FLAG_BYTES, WORD_ALIGN) {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: `fits` proved `flag` inside its live allocation, 4 bytes long and 4-byte aligned;
+    // the entry repeats the alignment check on the address. The allocation outlives the queued
+    // work (`inference_cuda_free` synchronizes first). `stream` is a live handle for the call and
+    // `stage` is a live, writable c_int.
+    let status = unsafe { exl3_flag_clear_raw(flag.address(), stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Queues the fold of the EXL3 arithmetic flag word into the status of `params`.
+pub(in crate::kernels::cuda) fn exl3_flag_fold_launch(
+    stream: &RawStream,
+    params: RawRange<'_>,
+    flag: RawRange<'_>,
+) -> Result<(), DeviceFailure> {
+    check_params(&params)?;
+    if !fits(&flag, FLAG_BYTES, WORD_ALIGN)
+        || !Span::of(&params, STEP_PARAMS_BYTES).apart(&Span::of(&flag, FLAG_BYTES))
+    {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_params` and `fits` proved `params` (32 bytes) and `flag` (4 bytes) inside
+    // their live allocations, 4-byte aligned, and sharing no byte, so the two writes cannot
+    // alias; the entry repeats the alignment checks on the addresses. The allocations outlive
+    // the queued work (`inference_cuda_free` synchronizes first). `stream` is a live handle for
+    // the call and `stage` is a live, writable c_int.
+    let status = unsafe {
+        exl3_flag_fold_raw(
+            params.address(),
+            flag.address(),
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
     checked(status, stage)
 }
 

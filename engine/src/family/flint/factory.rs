@@ -44,6 +44,23 @@ pub(super) fn context_limit_with(setting: Option<&str>) -> u32 {
     }
 }
 
+/// MLX freed-buffer cache limit selection (the OnceLock reader lives in
+/// `mlx_model`, which is Mac-gated; see the rollback documentation there).
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+))]
+pub(super) fn cache_limit_with(setting: Option<&str>) -> u64 {
+    match setting.map(str::trim) {
+        None => 64 * 1024 * 1024,
+        Some("67108864") => 64 * 1024 * 1024,
+        Some("0") => 0,
+        // Fail safe to the previous no-cache limit: a mistyped value must
+        // not silently retain memory the operator did not ask for.
+        Some(_) => 0,
+    }
+}
+
 /// One env-setting reader for the piece-size knob: SET-but-non-UTF-8 maps to
 /// "" (an unrecognized value), so the fail-safe below applies uniformly.
 #[cfg(any(
@@ -125,14 +142,22 @@ fn launch(
     let eos = bundle.eos_token_ids().to_vec();
     let vocab = bundle.vocab_size() as usize;
     let root = model_dir.to_owned();
+    let template_sha = pinned_template_sha();
     let engine = spawn_engine_noted(1, ready_note, move || {
-        super::mlx_executor::FlintExecutor::open(&root, eos, vocab)
+        super::mlx_executor::FlintExecutor::open(&root, eos, vocab, template_sha)
     })?;
     Ok(StartedEngine {
         engine,
         bundle,
         context_limit: context_limit(),
     })
+}
+
+/// The options a CUDA engine runs with. A present `flint` object stays fully explicit; an absent
+/// one gets the long-context default.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn effective_options(options: Option<&FlintOptions>) -> FlintOptions {
+    options.cloned().unwrap_or_else(FlintOptions::cuda_default)
 }
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -144,21 +169,23 @@ fn launch(
 ) -> Result<StartedEngine, EngError> {
     use crate::sched::worker::spawn_engine_noted;
 
-    let options = options
-        .ok_or_else(|| {
-            EngError::BadRequest(
-                "Flint CUDA requires flint context_limit and explicit kv_profile f16 or q8".into(),
-            )
-        })?
-        .clone();
+    let options_absent = options.is_none();
+    let options = effective_options(options);
+    if options_absent {
+        eprintln!(
+            "Flint CUDA: no flint options configured; using context_limit {} and kv_profile {}",
+            options.context_limit, options.kv_profile
+        );
+    }
     options.plan()?;
     let context_limit = options.context_limit;
     let bundle = load_tokenizer(tokenizer_dir)?;
     let eos = bundle.eos_token_ids().to_vec();
     let vocab = bundle.vocab_size() as usize;
     let root = model_dir.to_owned();
+    let template_sha = pinned_template_sha();
     let engine = spawn_engine_noted(1, ready_note, move || {
-        super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab)
+        super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab, template_sha)
     })?;
     Ok(StartedEngine {
         engine,
@@ -182,6 +209,25 @@ fn launch(
     ))
 }
 
+/// The pinned chat-template digest: also the park-identity `template`
+/// field, so engines and parks agree on one template identity.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+    all(feature = "native-cuda", target_os = "linux")
+))]
+const CHAT_TEMPLATE_JINJA_DIGEST: &[u8; 64] =
+    b"7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466";
+
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+    all(feature = "native-cuda", target_os = "linux")
+))]
+pub(super) fn pinned_template_sha() -> [u8; 32] {
+    digest(CHAT_TEMPLATE_JINJA_DIGEST)
+}
+
 #[cfg(any(
     test,
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
@@ -199,9 +245,7 @@ pub(super) fn load_tokenizer(dir: &Path) -> Result<TokenizerBundle, EngError> {
             tokenizer_config_json: digest(
                 b"159ac88217e90ffd0a4a294726048bb302829e82e1958dc85bb203aa79138fbf",
             ),
-            chat_template_jinja: digest(
-                b"7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466",
-            ),
+            chat_template_jinja: pinned_template_sha(),
             generation_config_json: digest(
                 b"a499c71895e008abd572558a5ad5904feaed92cf2a3b6e2cb0e9cabf03b96ed3",
             ),
@@ -253,6 +297,18 @@ mod tests {
         assert_eq!(super::context_limit_with(Some("invalid")), 8192);
     }
 
+    #[test]
+    fn cache_limit_rollback_and_fail_safe() {
+        assert_eq!(super::cache_limit_with(None), 64 * 1024 * 1024);
+        assert_eq!(super::cache_limit_with(Some("67108864")), 64 * 1024 * 1024);
+        assert_eq!(super::cache_limit_with(Some("0")), 0);
+        // Fail-safe: an unrecognized SET value rolls back to the no-cache 0.
+        assert_eq!(super::cache_limit_with(Some(" 0 ")), 0);
+        assert_eq!(super::cache_limit_with(Some("64MiB")), 0);
+        assert_eq!(super::cache_limit_with(Some("invalid")), 0);
+        assert_eq!(super::cache_limit_with(Some("")), 0);
+    }
+
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
     fn cuda_build_accepts_flint_backend_before_checkpoint_io() {
@@ -264,15 +320,60 @@ mod tests {
 
     #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     #[test]
-    fn cuda_pilot_requires_explicit_profile_before_checkpoint_io() {
-        let result = super::start_engine(
+    fn cuda_pilot_defaults_an_absent_object_and_refuses_a_bad_profile_before_checkpoint_io() {
+        use crate::EngError;
+        let (model, tokenizer) = (
             std::path::Path::new("missing-flint-model"),
             std::path::Path::new("missing-flint-tokenizer"),
-            None,
-            None,
         );
-        assert!(matches!(result, Err(crate::EngError::BadRequest(message))
-            if message.contains("requires flint context_limit and explicit kv_profile f16 or q8")));
+        // No flint object is no longer an options error: startup goes on, as far as the
+        // tokenizer, which is missing here.
+        let Err(error) = super::start_engine(model, tokenizer, None, None) else {
+            panic!("a missing tokenizer must refuse startup")
+        };
+        assert!(
+            !format!("{error:?}").contains("requires flint"),
+            "an absent flint object takes the default: {error:?}"
+        );
+        // A present object stays explicit: a bad profile is refused before any file is read.
+        let options = super::FlintOptions {
+            context_limit: 4096,
+            kv_profile: "q4".to_owned(),
+            prefill_chunk_size: 8,
+
+            cpu_moe_offload_layers: 0,
+            cpu_moe_split_experts: 0,
+            cpu_moe_threads: 0,
+        };
+        let result = super::start_engine(model, tokenizer, Some(&options), None);
+        assert!(matches!(result, Err(EngError::BadRequest(message))
+            if message.contains("explicit kv_profile f16, q8 or q8k")));
+    }
+
+    #[test]
+    fn an_absent_flint_object_takes_the_default_and_a_present_one_is_kept() {
+        let absent = super::effective_options(None);
+        assert_eq!(absent.context_limit, 131_072);
+        assert_eq!(absent.kv_profile, "f16");
+        assert_eq!(absent.prefill_chunk_size, 8);
+        let present = super::FlintOptions {
+            context_limit: 4096,
+            kv_profile: "q8".to_owned(),
+            prefill_chunk_size: 1,
+
+            cpu_moe_offload_layers: 0,
+            cpu_moe_split_experts: 0,
+            cpu_moe_threads: 0,
+        };
+        let kept = super::effective_options(Some(&present));
+        assert_eq!(
+            (
+                kept.context_limit,
+                kept.kv_profile.as_str(),
+                kept.prefill_chunk_size
+            ),
+            (4096, "q8", 1)
+        );
     }
 
     #[test]

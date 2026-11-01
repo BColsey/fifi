@@ -35,6 +35,9 @@ pub(crate) struct PinnedBuf {
     bytes: usize,
     /// Stream id and sequence of the last transfer that no waited event has covered yet.
     pending: Option<(u64, u64)>,
+    /// Whether a device-to-host copy ever targeted this buffer; a buffer the device only reads
+    /// can be viewed by the host while host-to-device copies are in flight.
+    device_written: bool,
     _thread_confined: PhantomData<*const ()>,
 }
 
@@ -59,6 +62,7 @@ impl CudaContext {
             lease: Rc::clone(&self.lease),
             bytes,
             pending: None,
+            device_written: false,
             _thread_confined: PhantomData,
         })
     }
@@ -106,6 +110,7 @@ impl CudaContext {
         resident::copy_d2h_async_at(dst_raw, dst_offset, range, stream_raw)
             .map_err(device_error)?;
         dst.pending = Some((stream.id(), stream.note_enqueue()));
+        dst.device_written = true;
         Ok(())
     }
 
@@ -267,6 +272,20 @@ impl PinnedBuf {
         })
     }
 
+    /// The whole buffer as a read-only host slice, for a buffer the device only reads.
+    ///
+    /// Returns `BadRequest` once any device-to-host copy has targeted the buffer. Outstanding
+    /// host-to-device copies do not matter: they read the memory, and so does the caller.
+    pub(crate) fn host_view(&self) -> Result<&[u8], EngError> {
+        ensure_usable(&TERMINAL)?;
+        if self.device_written {
+            return Err(refuse(
+                "the CUDA pinned buffer receives device copies: read it with `read` after a wait",
+            ));
+        }
+        Ok(resident::pinned_view(self.raw()?))
+    }
+
     pub(in crate::kernels::cuda) fn raw(&self) -> Result<&RawPinned, EngError> {
         self.raw
             .as_ref()
@@ -329,6 +348,36 @@ mod tests {
         output.read_at(&stream, 0, &mut got).expect("read output");
         assert_eq!(got, data);
         println!("PINNED_IMPORT_ROUNDTRIP_PASS");
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+    fn host_view_serves_a_device_read_only_buffer_and_refuses_one_the_device_wrote() {
+        assert!(testkit::device_present(
+            "host_view_serves_a_device_read_only_buffer_and_refuses_one_the_device_wrote"
+        ));
+        let ctx = CudaContext::new().expect("context");
+        let stream = ctx.stream().expect("stream");
+        let data = pattern(64, 7);
+        let device = testkit::upload_bytes(&ctx, &data);
+        let output = ctx.allocate(64).expect("output");
+        let mut host = ctx.pinned_buf(64).expect("pinned");
+        host.write(0, &data).expect("fill");
+        // Host-to-device copies only read the buffer, so a view stays valid with one in flight.
+        ctx.copy_from_pinned(&stream, &mut host, 0, output.range(0, 64).expect("range"))
+            .expect("H2D");
+        assert!(host.is_pending());
+        assert_eq!(host.host_view().expect("view during H2D"), &data[..]);
+        host.synchronize(&stream).expect("synchronize");
+        // A device-to-host copy makes the contents the device's to change: no view any more.
+        ctx.copy_to_pinned(&stream, device.range(0, 64).expect("source"), &mut host, 0)
+            .expect("D2H");
+        host.synchronize(&stream).expect("synchronize");
+        assert_bad_request(
+            host.host_view().map(|_| ()),
+            "view after D2H",
+            "receives device copies",
+        );
     }
 
     fn pattern(len: usize, seed: u8) -> Vec<u8> {

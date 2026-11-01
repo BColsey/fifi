@@ -25,6 +25,7 @@
 use super::super::host::HostShape;
 use super::book::Health;
 use super::dims::{KvMode, StepDims, StepOptions, TieredPlan};
+use super::exl3_load::load_exl3_dir;
 use super::native_device_rig::{Rng, device_present};
 use super::pinned::{ROTARY_DIM, head_rows_of};
 use super::resources::StepResources;
@@ -47,7 +48,7 @@ use crate::{
         qwen36::settings::tokenizer_pin,
         session::{DecodeSession, SaveKind},
     },
-    kernels::cuda::CudaContext,
+    kernels::cuda::{CudaContext, resident::exl3::SingleRow},
     tokenizer::{DecodeFinish, IncrementalDecoder, TokenizerBundle},
 };
 use sha2::{Digest, Sha256};
@@ -116,8 +117,7 @@ fn p5_ids() -> Result<Vec<u32>, EngError> {
 /// The pinned model's GGUF: the directory from `Q36_CUDA_MODEL_DIR`, the pinned NAME (the name
 /// is part of the identity, `start::pinned_gguf`).
 fn gguf_path() -> Result<PathBuf, EngError> {
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     Ok(Path::new(&dir).join(GGUF_NAME))
 }
 
@@ -464,19 +464,76 @@ fn mid_piece_phase(capture: bool) -> Result<(Vec<u32>, Vec<Turn>), EngError> {
         capture,
         section_marks: false,
     })?;
+    mid_piece_turns(&mut step, &bundle, &p5_ids()?)
+}
+
+/// The four turns of D1/D1c on a step that is already built.
+fn mid_piece_turns(
+    step: &mut QwenResidentStep<'_>,
+    bundle: &TokenizerBundle,
+    p5: &[u32],
+) -> Result<(Vec<u32>, Vec<Turn>), EngError> {
     let mut session = DecodeSession::default();
-    let p5 = p5_ids()?;
-    let prompt = head(&p5, 77)?.to_vec();
+    let prompt = head(p5, 77)?.to_vec();
     // The unrelated turn Z = P5[300..380] runs between the save and the restore: the restore must
     // overwrite KV rows that hold Z's data, not the rows T's own cold turn left.
-    let z = range_of(&p5, 300..380)?.to_vec();
+    let z = range_of(p5, 300..380)?.to_vec();
     let turns = vec![
-        turn(&mut step, &mut session, &bundle, &prompt, Some(37))?,
-        turn(&mut step, &mut session, &bundle, &z, None)?,
-        turn(&mut step, &mut session, &bundle, &prompt, Some(37))?,
-        turn(&mut step, &mut session, &bundle, &prompt, None)?,
+        turn(step, &mut session, bundle, &prompt, Some(37))?,
+        turn(step, &mut session, bundle, &z, None)?,
+        turn(step, &mut session, bundle, &prompt, Some(37))?,
+        turn(step, &mut session, bundle, &prompt, None)?,
     ];
     Ok((prompt, turns))
+}
+
+/// `n` ids in a fixed pseudo-random order, all inside the text range of the vocabulary: a
+/// prompt that needs no fixture file. The text is gibberish; the comparison is of bytes.
+fn synthetic_ids(n: usize) -> Vec<u32> {
+    let mut state = 0x9e37_79b9_u64;
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            1_000 + u32::try_from((state >> 33) % 100_000).unwrap_or(0)
+        })
+        .collect()
+}
+
+/// D1c on the real EXL3 pack with the default FP16 KV: the same four turns on a step that
+/// serves the pack's projections, captured. Every existing captured-restore test above runs
+/// native GGUF weights.
+fn exl3_mid_piece_phase() -> Result<(Vec<u32>, Vec<Turn>), EngError> {
+    let pack = std::env::var_os("FIFI_EXL3_CHECKPOINT")
+        .map(PathBuf::from)
+        .ok_or_else(|| EngError::Checkpoint("FIFI_EXL3_CHECKPOINT is not set".into()))?;
+    let tokenizer_dir = gguf_path()?;
+    let bundle = TokenizerBundle::load(
+        tokenizer_dir.parent().unwrap_or(Path::new(".")),
+        &tokenizer_pin()?,
+    )?;
+    let rules = rules_for(&bundle)?;
+    let projector = CudaProjector::new()?;
+    let weights = load_exl3_dir(&projector, &pack, Reserve::default())?;
+    // The kernel a served pack runs: the start registers wide1 on its context.
+    projector
+        .context()
+        .set_single_row_default(SingleRow::Wide(1));
+    let mut opts = options(KvMode::Fp16, CONTEXT, None);
+    opts.layout = WeightLayout::Exl3;
+    let res = StepResources::new(
+        projector.context(),
+        dims()?,
+        &Inventory::for_spec(&QWEN3_6_35B_A3B)?,
+        &opts,
+    )?;
+    let mut step = QwenResidentStep::new(projector.context(), &res, &weights, &opts, rules)?;
+    step.set_capture_config(CaptureConfig {
+        capture: true,
+        section_marks: false,
+    })?;
+    mid_piece_turns(&mut step, &bundle, &synthetic_ids(612))
 }
 
 #[test]
@@ -557,6 +614,45 @@ fn restore_mid_piece_is_bitwise_captured() {
     assert_chain_length("reference", reference);
     assert_same_bits("a save does not perturb the captured turn", cold, reference);
     assert_same_bits("the captured restore replays bitwise", restored, reference);
+}
+
+#[test]
+#[ignore = "the 3090, held exclusively: loads the real EXL3 pack from FIFI_EXL3_CHECKPOINT"]
+fn restore_mid_piece_is_bitwise_captured_on_the_exl3_pack() {
+    if !device_present("restore_mid_piece_is_bitwise_captured_on_the_exl3_pack") {
+        return;
+    }
+    let (prompt, turns) =
+        exl3_mid_piece_phase().unwrap_or_else(|e| panic!("D1c EXL3 device phase: {e:?}"));
+    let (cold, z, restored, reference) = (&turns[0], &turns[1], &turns[2], &turns[3]);
+    assert_eq!(cold.covered, 0);
+    assert_eq!(cold.saved, Some(true));
+    assert_eq!(z.covered, 0);
+    assert_eq!(z.saved, None);
+    assert_eq!(restored.covered, 37);
+    assert_eq!(restored.key_len, Some(37));
+    let after = restored
+        .restored
+        .as_ref()
+        .expect("the restore was observed");
+    assert_eq!(after.history, prompt[..37]);
+    assert_eq!(after.pending, Some(prompt[36]));
+    assert_eq!(after.tokens, 36);
+    for (what, got) in [
+        ("cold", cold),
+        ("Z", z),
+        ("restored", restored),
+        ("reference", reference),
+    ] {
+        assert_captured(what, got);
+        assert_chain_length(what, got);
+    }
+    assert_same_bits("a save does not perturb the EXL3 turn", cold, reference);
+    assert_same_bits(
+        "the captured EXL3 restore replays bitwise",
+        restored,
+        reference,
+    );
 }
 
 /// D2/D5's device phase: T1 = P5[..340] with the boundary 300, then T2 = P5[..560] with the

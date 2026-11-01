@@ -1005,6 +1005,12 @@ fn check_kv_views(
     if !matches!(call.storage, AttnKvStorage::Q8Affine { .. }) {
         return Err(rule("kv_views", "tagged views require Q8 storage"));
     }
+    /* K carries the call's storage; V may match it (uniform q8) or stay F16
+     * (the mixed "q8k" profile). */
+    let plane_storage_ok = |plane: usize, view: &AttnKvView<'_>| {
+        view.layout.storage == call.storage
+            || (plane == 1 && matches!(view.layout.storage, AttnKvStorage::F16))
+    };
     let mut writes = vec![
         Claim::of("out", &call.out, need.out),
         Claim::of("part", &call.part, need.part),
@@ -1012,8 +1018,8 @@ fn check_kv_views(
     if let Some(status) = &call.status {
         writes.push(Claim::of("status", status, 4));
     }
-    for (view, cache) in views.iter().zip([&call.k_cache, &call.v_cache]) {
-        if view.layout.storage != call.storage
+    for (plane, (view, cache)) in views.iter().zip([&call.k_cache, &call.v_cache]).enumerate() {
+        if !plane_storage_ok(plane, view)
             || !std::ptr::eq(view.payload.buffer(), cache.buffer())
             || view.payload.offset() != cache.offset()
             || view.payload.bytes() != cache.bytes()
@@ -1116,9 +1122,9 @@ impl CudaContext {
         self.attn_prefill_enqueue(stream, call, AttnPrefillLaunch::Q8Reference)
     }
 
-    /// Same-ELF fixture path: identical admission and args, but the native entry passes the
-    /// tiled opt-in — the only way to reach the tiled kernel. The default launch keeps the old
-    /// kernel in every build. Fixture builds only.
+    /// Same-ELF fixture path: identical admission and args, but the native entry passes
+    /// the tiled route — one of the two ways tests reach the tiled kernel (the
+    /// default-ON production route entry is the other). Fixture builds only.
     #[cfg(all(test, feature = "cuda-q8-reference"))]
     pub(crate) fn attn_prefill_q8_tiled(
         &self,
@@ -1126,6 +1132,53 @@ impl CudaContext {
         call: AttnPrefillCall<'_>,
     ) -> Result<(), EngError> {
         self.attn_prefill_enqueue(stream, call, AttnPrefillLaunch::Q8Tiled)
+    }
+
+    /// Production route entry: the driver calls this whenever
+    /// FIFI_FLINT_CUDA_Q8_TILED stays armed (default ON); the entry launches the tiled kernel or,
+    /// when its predicate rejects the shape, the default old kernel and counts the
+    /// fallback. Admission is identical to [`Self::attn_prefill`].
+    pub(crate) fn attn_prefill_q8_tiled_opt_in(
+        &self,
+        stream: &DeviceStream,
+        call: AttnPrefillCall<'_>,
+    ) -> Result<(), EngError> {
+        self.attn_prefill_enqueue(
+            stream,
+            call,
+            AttnPrefillLaunch::Q8TiledRoute { use_tiled: true },
+        )
+    }
+
+    /// Test-only disabled form of the route entry: `use_tiled = false` keeps the
+    /// default enqueue through the same entry, covering the route contract's OFF leg.
+    #[cfg(all(test, feature = "cuda-q8-reference"))]
+    pub(crate) fn attn_prefill_q8_tiled_disabled(
+        &self,
+        stream: &DeviceStream,
+        call: AttnPrefillCall<'_>,
+    ) -> Result<(), EngError> {
+        self.attn_prefill_enqueue(
+            stream,
+            call,
+            AttnPrefillLaunch::Q8TiledRoute { use_tiled: false },
+        )
+    }
+
+    /// Route-fallback count for tests (see the native counter; production fallbacks
+    /// also log once per process to stderr).
+    #[cfg(test)]
+    pub(crate) fn q8_tiled_fallback_count() -> u64 {
+        crate::kernels::cuda::native::prefill::attn_prefill::Q8_TILED_FALLBACKS
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Route-acceptance count for tests: how many launches ran the tile kernel
+    /// through the route entry (counted only after a successful enqueue).
+    #[cfg(test)]
+    pub(crate) fn q8_tiled_route_count() -> u64 {
+        crate::kernels::cuda::native::prefill::attn_prefill::Q8_TILED_ROUTES
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn attn_prefill_enqueue(
@@ -1148,10 +1201,16 @@ impl CudaContext {
         #[cfg(all(test, feature = "cuda-q8-reference"))]
         let full = matches!(
             launch,
-            AttnPrefillLaunch::Full | AttnPrefillLaunch::Q8Reference | AttnPrefillLaunch::Q8Tiled
+            AttnPrefillLaunch::Full
+                | AttnPrefillLaunch::Q8Reference
+                | AttnPrefillLaunch::Q8Tiled
+                | AttnPrefillLaunch::Q8TiledRoute { .. }
         );
         #[cfg(not(all(test, feature = "cuda-q8-reference")))]
-        let full = matches!(launch, AttnPrefillLaunch::Full);
+        let full = matches!(
+            launch,
+            AttnPrefillLaunch::Full | AttnPrefillLaunch::Q8TiledRoute { .. }
+        );
         let mut ints = if full {
             check_full_shape(&call.shape, call.q_tile, &call.span, call.storage)?
         } else {

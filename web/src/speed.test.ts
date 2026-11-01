@@ -27,7 +27,7 @@ test("medians ignore ok rows without the value", () => {
   strictEqual(summary.firstTokenMs, 100, "one ttft value: its own median");
 });
 
-test("cancelled and error rows never feed a median (Opus MF1)", () => {
+test("cancelled and error rows never feed a median", () => {
   const summary = speedSummary([
     row({ outcome: "cancelled", time_to_first_token_ms: 999, decode_tokens_per_second: 999 }),
     row({ outcome: "error", time_to_first_token_ms: 500, decode_tokens_per_second: 500 }),

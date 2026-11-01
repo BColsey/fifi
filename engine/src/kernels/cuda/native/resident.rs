@@ -57,6 +57,7 @@ pub(in crate::kernels::cuda) mod attn_decode_gemma;
 pub(in crate::kernels::cuda) mod attn_decode_q8;
 pub(in crate::kernels::cuda) mod attn_prep;
 pub(in crate::kernels::cuda) mod embed;
+pub(in crate::kernels::cuda) mod embed_bf16;
 pub(in crate::kernels::cuda) mod embed_q8;
 pub(in crate::kernels::cuda) mod exl3;
 pub(in crate::kernels::cuda) mod expert_activation;
@@ -66,6 +67,7 @@ pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod gemma_matvec;
 pub(in crate::kernels::cuda) mod graph;
 pub(in crate::kernels::cuda) mod kv8_append;
+pub(in crate::kernels::cuda) mod kv_f16_rows;
 pub(in crate::kernels::cuda) mod mailbox;
 pub(in crate::kernels::cuda) mod matmul_expert;
 pub(in crate::kernels::cuda) mod matmul_q5_0;
@@ -658,6 +660,20 @@ pub(in crate::kernels::cuda) fn pinned_read_into(
         *slot = unsafe { base.add(offset + index).read_volatile() };
     }
     Ok(())
+}
+
+/// The whole pinned allocation as a read-only slice.
+///
+/// Precondition the caller must discharge: no device-to-host copy ever targets this allocation
+/// (the host only reads it while the device may read it too). The only caller,
+/// `PinnedBuf::host_view`, refuses a buffer a device copy has written.
+pub(in crate::kernels::cuda) fn pinned_view(pinned: &RawPinned) -> &[u8] {
+    // SAFETY: the allocation is `pinned.bytes` bytes long, live and unfreed while `pinned` is
+    // borrowed, and zero-initialized before use. The caller's precondition rules out a device
+    // write, and the host never writes through a shared borrow of the owner.
+    unsafe {
+        std::slice::from_raw_parts(pinned.ptr.as_ptr().cast::<u8>().cast_const(), pinned.bytes)
+    }
 }
 
 /// Writes a checked pinned range. The owner proves no transfer can access it.

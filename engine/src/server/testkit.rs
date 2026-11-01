@@ -48,7 +48,7 @@ pub(super) fn bundle_with_flint_template() -> Arc<TokenizerBundle> {
     ))
 }
 
-fn bundle_with_template(template_source: &str) -> Arc<TokenizerBundle> {
+pub(super) fn bundle_with_template(template_source: &str) -> Arc<TokenizerBundle> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/testdata/tokenizer");
     let dir = tempfile::tempdir().expect("tempdir");
     for name in [

@@ -25,7 +25,7 @@ use crate::{
     EngError,
     family::{
         gguf_model::{Inventory, Role},
-        project::cuda::{CudaWeight, CudaWeights, WeightLayout},
+        project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Weight},
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, NativeWeight, TiledWeight,
@@ -493,9 +493,10 @@ fn stack_of<'w>(
             check_native_stack(name, (weight.n_rows(), weight.k(), Some(experts)), want)?;
             Ok(StackWeights::Native(weight))
         }
-        (Some(CudaWeight::Exl3 { .. }), _) | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(
-            format!("moe weights: {name} needs EXL3 per-expert dispatch"),
-        )),
+        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _)
+        | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
+            "moe weights: {name} needs EXL3 per-expert dispatch"
+        ))),
         (Some(CudaWeight::Tiled { .. }), WeightLayout::Native)
         | (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("moe weights: {name} is loaded in the other layout than the session"),
@@ -573,6 +574,10 @@ pub(super) fn moe_layer_parts<'w>(
 pub(super) enum GlobalWeight<'w> {
     Tiled(&'w TiledWeight),
     Native(&'w NativeWeight),
+    /// The embedding table of an EXL3 pack, kept as stored: BF16 rows.
+    Bf16(&'w DeviceBuffer),
+    /// The head of an EXL3 pack.
+    Exl3(&'w Exl3Weight),
 }
 
 /// The embedding table of the step, either layout.
@@ -589,6 +594,10 @@ impl GlobalWeight<'_> {
                 "step weights: the global tensor is loaded native; the tiled gather reads tiles"
                     .to_owned(),
             )),
+            Self::Bf16(_) | Self::Exl3(_) => Err(EngError::Checkpoint(
+                "step weights: the global tensor is loaded EXL3; the tiled gather reads tiles"
+                    .to_owned(),
+            )),
         }
     }
 
@@ -598,6 +607,10 @@ impl GlobalWeight<'_> {
             Self::Native(weight) => Ok(weight),
             Self::Tiled(_) => Err(EngError::Checkpoint(
                 "step weights: the global tensor is loaded tiled; the native gather reads blocks"
+                    .to_owned(),
+            )),
+            Self::Bf16(_) | Self::Exl3(_) => Err(EngError::Checkpoint(
+                "step weights: the global tensor is loaded EXL3; the native gather reads blocks"
                     .to_owned(),
             )),
         }
@@ -613,6 +626,30 @@ pub(super) fn check_native_embed(name: &str, quant: QuantType) -> Result<(), Eng
     Err(EngError::Checkpoint(format!(
         "step weights: {name} is {quant:?}, the native embedding gather takes Q4_K blocks"
     )))
+}
+
+/// A global tensor of an EXL3 load: the head is an EXL3 matrix, the embedding the stored BF16
+/// table, each of the shape `spec` names.
+fn exl3_global<'w>(
+    weights: &'w CudaWeights,
+    name: &str,
+    spec: &DenseSpec,
+) -> Result<GlobalWeight<'w>, EngError> {
+    match (weights.get(name), spec.role) {
+        (Some(CudaWeight::Exl3 { weight, .. }), Role::Output) => {
+            check_dense(name, (weight.shape[1], weight.shape[0], None), spec)?;
+            Ok(GlobalWeight::Exl3(weight))
+        }
+        (Some(CudaWeight::Raw { ty, buffer, .. }), Role::TokenEmbd)
+            if *ty == GgufType::Bf16 && buffer.bytes() == spec.rows * spec.k * 2 =>
+        {
+            Ok(GlobalWeight::Bf16(buffer))
+        }
+        _ => Err(EngError::Checkpoint(format!(
+            "step weights: {name} is not the EXL3 {:?} tensor of {} rows of {}",
+            spec.role, spec.rows, spec.k
+        ))),
+    }
 }
 
 /// The embedding table, the output head and the output norm, in the session's `layout`.
@@ -631,9 +668,7 @@ impl<'w> GlobalWeights<'w> {
     ) -> Result<Self, EngError> {
         let global = |name: &str, spec: &DenseSpec| -> Result<GlobalWeight<'w>, EngError> {
             match layout {
-                WeightLayout::Exl3 => Err(EngError::Checkpoint(format!(
-                    "step weights: EXL3 global tensor {name} is not admitted"
-                ))),
+                WeightLayout::Exl3 => exl3_global(weights, name, spec),
                 WeightLayout::Tiled => Ok(GlobalWeight::Tiled(dense(weights, name, spec)?)),
                 WeightLayout::Native => {
                     let Some(CudaWeight::Native { weight, .. }) = weights.get(name) else {

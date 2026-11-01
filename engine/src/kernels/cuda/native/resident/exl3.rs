@@ -182,9 +182,10 @@ struct LinearArgs {
     n: usize,
     bits_twice: c_int,
     book: c_int,
+    fused_publish: u32,
 }
 const _: () = assert!(
-    size_of::<LinearArgs>() == 176
+    size_of::<LinearArgs>() == 184
         && offset_of!(LinearArgs, trellis) == 0
         && offset_of!(LinearArgs, trellis_bytes) == 8
         && offset_of!(LinearArgs, suh) == 16
@@ -208,6 +209,7 @@ const _: () = assert!(
         && offset_of!(LinearArgs, n) == 160
         && offset_of!(LinearArgs, bits_twice) == 168
         && offset_of!(LinearArgs, book) == 172
+        && offset_of!(LinearArgs, fused_publish) == 176
 );
 unsafe extern "C" {
     #[cfg(test)]
@@ -245,6 +247,8 @@ pub(in crate::kernels::cuda) struct LinearRaw<'a> {
     pub(in crate::kernels::cuda) n: usize,
     pub(in crate::kernels::cuda) bits_twice: u8,
     pub(in crate::kernels::cuda) book: Codebook,
+    /// Producer-fusion arm: round at output_rotate/grouped_output_rotate.
+    pub(in crate::kernels::cuda) fused: bool,
 }
 pub(in crate::kernels::cuda) fn linear(
     stream: &RawStream,
@@ -330,6 +334,7 @@ fn linear_args(call: &LinearRaw<'_>, midrows: bool) -> Result<LinearArgs, Device
         n: call.n,
         bits_twice: c_int::from(call.bits_twice),
         book: book_tag(call.book),
+        fused_publish: u32::from(call.fused),
     };
     Ok(args)
 }
@@ -373,6 +378,170 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+    fn inference_cuda_exl3_grouped_indexed(
+        args: *const LinearArgs,
+        index: *const IndexArgs,
+        count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        cols: u32,
+    ) -> c_int;
+    fn inference_cuda_exl3_grouped_wide(
+        args: *const LinearArgs,
+        count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        cols: u32,
+    ) -> c_int;
+}
+
+/// Mirror of `inference_cuda_exl3_index_args`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IndexArgs {
+    ids: *const c_void,
+    ids_bytes: usize,
+    slot: u32,
+    members: u32,
+    trellis_stride: usize,
+    scale_stride: usize,
+    offsets: *const c_void,
+}
+const _: () = assert!(
+    size_of::<IndexArgs>() == 48
+        && offset_of!(IndexArgs, slot) == 16
+        && offset_of!(IndexArgs, trellis_stride) == 24
+        && offset_of!(IndexArgs, scale_stride) == 32
+        && offset_of!(IndexArgs, offsets) == 40
+);
+
+/// The device-side member choice of one call of an indexed launch.
+pub(in crate::kernels::cuda) struct IndexRaw<'a> {
+    pub(in crate::kernels::cuda) ids: RawRange<'a>,
+    pub(in crate::kernels::cuda) slot: u32,
+    pub(in crate::kernels::cuda) members: u32,
+    /// Bytes between the trellises of consecutive members.
+    pub(in crate::kernels::cuda) trellis_stride: usize,
+    /// Floats between the suh (and the svh) of consecutive members.
+    pub(in crate::kernels::cuda) scale_stride: usize,
+    /// Optional u32 byte offset per member (0xFFFFFFFF = absent), replacing both strides.
+    pub(in crate::kernels::cuda) offsets: Option<RawRange<'a>>,
+}
+
+/// The id-indexed grouped launch: `calls[i]` is one row of member 0 of a bank, `index[i]` names
+/// the member from device memory when the kernels run. 1 to 16 calls; `cols` as for
+/// [`grouped_wide`].
+pub(in crate::kernels::cuda) fn grouped_indexed(
+    stream: &RawStream,
+    calls: &[LinearRaw<'_>],
+    index: &[IndexRaw<'_>],
+    cols: u32,
+) -> Result<(), DeviceFailure> {
+    if calls.is_empty()
+        || calls.len() > 16
+        || calls.len() != index.len()
+        || !matches!(cols, 1 | 2 | 4 | 8)
+    {
+        return Err(invalid_argument());
+    }
+    let mut args = Vec::with_capacity(calls.len());
+    let mut indexes = Vec::with_capacity(calls.len());
+    for (call, at) in calls.iter().zip(index) {
+        let ids_need = (at.slot as usize)
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(invalid_argument)?;
+        if call.rows != 1
+            || call.split_k != 2
+            || at.members == 0
+            || at.ids.bytes() < ids_need
+            || !at.ids.offset().is_multiple_of(4)
+        {
+            return Err(invalid_argument());
+        }
+        match &at.offsets {
+            Some(table) => {
+                let need = (at.members as usize)
+                    .checked_mul(4)
+                    .ok_or_else(invalid_argument)?;
+                if table.bytes() < need || !table.offset().is_multiple_of(4) {
+                    return Err(invalid_argument());
+                }
+            }
+            None if at.trellis_stride == 0 || at.scale_stride == 0 => {
+                return Err(invalid_argument());
+            }
+            None => {}
+        }
+        args.push(linear_args(call, false)?);
+        indexes.push(IndexArgs {
+            ids: at.ids.address().cast_const(),
+            ids_bytes: at.ids.bytes(),
+            slot: at.slot,
+            members: at.members,
+            trellis_stride: at.trellis_stride,
+            scale_stride: at.scale_stride,
+            offsets: at
+                .offsets
+                .as_ref()
+                .map_or(std::ptr::null(), |table| table.address().cast_const()),
+        });
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: every call record has live bounded owners and validated local extents (member 0 of
+    // its bank), every id range is a live allocation of at least `slot + 1` aligned words, and C
+    // validates the group shapes, the contiguity of the working spans and their aliasing before
+    // any enqueue. The strides, the member counts and the offset tables (a live allocation of at least
+    // `members` aligned words) were bounded against the bank extents by the caller
+    // (`CudaContext::exl3_grouped_indexed`); a wrong id or an absent member is skipped by the
+    // kernels and sets the sticky flag. `cols` is 1, 2, 4 or 8.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_indexed(
+            args.as_ptr(),
+            indexes.as_ptr(),
+            args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            cols,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
+/// 16-column tiles. Same validation and results as [`grouped`] with `gather`; `n` of every call
+/// must be a multiple of `16 * cols`.
+pub(in crate::kernels::cuda) fn grouped_wide(
+    stream: &RawStream,
+    calls: &[LinearRaw<'_>],
+    cols: u32,
+) -> Result<(), DeviceFailure> {
+    if calls.is_empty() || calls.len() > 48 || !matches!(cols, 1 | 2 | 4 | 8) {
+        return Err(invalid_argument());
+    }
+    let mut pairs = 0usize;
+    let mut args = Vec::with_capacity(calls.len());
+    for call in calls {
+        pairs = pairs.checked_add(call.rows).ok_or_else(invalid_argument)?;
+        if !(1..=8).contains(&call.rows) || call.split_k != 2 || pairs > 48 {
+            return Err(invalid_argument());
+        }
+        args.push(linear_args(call, false)?);
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `grouped`: every record has live bounded owners and validated local extents, C
+    // validates all group shapes, the column multiple and aliases before any enqueue, and `cols`
+    // is 1, 2, 4 or 8.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_wide(
+            args.as_ptr(),
+            args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            cols,
+        )
+    };
+    checked(status, stage)
 }
 
 pub(in crate::kernels::cuda) fn grouped(
@@ -417,6 +586,326 @@ pub(in crate::kernels::cuda) fn grouped(
         }
     };
     checked(status, stage)
+}
+
+/// Most jobs of one launch, and most rows of one job: the limits of `exl3.h`.
+pub(in crate::kernels::cuda) const JOBS_MAX: usize = 4096;
+pub(in crate::kernels::cuda) const JOB_ROWS_MAX: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct JobsArgs {
+    trellis: *const u16,
+    trellis_bytes: usize,
+    suh: *const f32,
+    suh_bytes: usize,
+    svh: *const f32,
+    svh_bytes: usize,
+    x: *const f32,
+    x_bytes: usize,
+    xh: *mut u16,
+    xh_bytes: usize,
+    z: *mut f32,
+    z_bytes: usize,
+    out: *mut f32,
+    out_bytes: usize,
+    flag: *mut u32,
+    flag_bytes: usize,
+    jobs: *const i32,
+    jobs_bytes: usize,
+    trellis_stride: usize,
+    scale_stride: usize,
+    members: usize,
+    k: usize,
+    n: usize,
+    total_rows: usize,
+    out_ld: usize,
+    out_col: usize,
+    jobs_count: u32,
+    max_rows: u32,
+    bits_twice: c_int,
+    book: c_int,
+    in_rows: *const u32,
+    in_rows_bytes: usize,
+    out_rows: *const u32,
+    out_rows_bytes: usize,
+    x_rows: usize,
+    out_total_rows: usize,
+}
+const _: () = assert!(
+    size_of::<JobsArgs>() == 272
+        && offset_of!(JobsArgs, in_rows) == 224
+        && offset_of!(JobsArgs, x_rows) == 256
+        && offset_of!(JobsArgs, flag) == 112
+        && offset_of!(JobsArgs, jobs) == 128
+        && offset_of!(JobsArgs, trellis_stride) == 144
+        && offset_of!(JobsArgs, k) == 168
+        && offset_of!(JobsArgs, total_rows) == 184
+        && offset_of!(JobsArgs, jobs_count) == 208
+        && offset_of!(JobsArgs, bits_twice) == 216
+);
+unsafe extern "C" {
+    fn inference_cuda_exl3_jobs(
+        args: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+    fn inference_cuda_exl3_jobs_kernel(
+        args: *const JobsArgs,
+        capability_major: c_int,
+        ptx_version: c_int,
+        enabled: c_int,
+    ) -> c_int;
+}
+
+/// One job-table projection (`exl3.h`): the ranges, the bank strides in elements and the shape.
+pub(in crate::kernels::cuda) struct JobsRaw<'a> {
+    pub(in crate::kernels::cuda) trellis: RawRange<'a>,
+    pub(in crate::kernels::cuda) suh: RawRange<'a>,
+    pub(in crate::kernels::cuda) svh: RawRange<'a>,
+    pub(in crate::kernels::cuda) x: RawRange<'a>,
+    pub(in crate::kernels::cuda) xh: RawRange<'a>,
+    pub(in crate::kernels::cuda) z: RawRange<'a>,
+    pub(in crate::kernels::cuda) out: RawRange<'a>,
+    pub(in crate::kernels::cuda) flag: RawRange<'a>,
+    pub(in crate::kernels::cuda) jobs: RawRange<'a>,
+    /// u16 elements between the trellises of two members.
+    pub(in crate::kernels::cuda) trellis_stride: usize,
+    /// F32 values between the `suh` (and between the `svh`) of two members.
+    pub(in crate::kernels::cuda) scale_stride: usize,
+    pub(in crate::kernels::cuda) members: usize,
+    pub(in crate::kernels::cuda) jobs_count: usize,
+    pub(in crate::kernels::cuda) max_rows: usize,
+    pub(in crate::kernels::cuda) total_rows: usize,
+    pub(in crate::kernels::cuda) out_ld: usize,
+    pub(in crate::kernels::cuda) out_col: usize,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) bits_twice: u8,
+    pub(in crate::kernels::cuda) book: Codebook,
+    /// Row lists (`exl3.h`): the row of `x` each table row reads and the row of `out` it lands in;
+    /// `None` is the identity, and then `x_rows` / `out_total_rows` equal `total_rows`.
+    pub(in crate::kernels::cuda) in_rows: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) out_rows: Option<RawRange<'a>>,
+    pub(in crate::kernels::cuda) x_rows: usize,
+    pub(in crate::kernels::cuda) out_total_rows: usize,
+}
+
+/// The numbers of a job-table call that fix its extents, apart from the ranges.
+#[derive(Clone, Copy)]
+pub(in crate::kernels::cuda) struct JobsShape {
+    pub(in crate::kernels::cuda) trellis_stride: usize,
+    pub(in crate::kernels::cuda) scale_stride: usize,
+    pub(in crate::kernels::cuda) members: usize,
+    pub(in crate::kernels::cuda) jobs_count: usize,
+    pub(in crate::kernels::cuda) max_rows: usize,
+    pub(in crate::kernels::cuda) total_rows: usize,
+    pub(in crate::kernels::cuda) out_ld: usize,
+    pub(in crate::kernels::cuda) out_col: usize,
+    pub(in crate::kernels::cuda) k: usize,
+    pub(in crate::kernels::cuda) n: usize,
+    pub(in crate::kernels::cuda) bits_twice: u8,
+    pub(in crate::kernels::cuda) book: Codebook,
+    pub(in crate::kernels::cuda) x_rows: usize,
+    pub(in crate::kernels::cuda) out_total_rows: usize,
+    pub(in crate::kernels::cuda) has_in_rows: bool,
+    pub(in crate::kernels::cuda) has_out_rows: bool,
+}
+
+impl JobsRaw<'_> {
+    pub(in crate::kernels::cuda) fn shape(&self) -> JobsShape {
+        JobsShape {
+            trellis_stride: self.trellis_stride,
+            scale_stride: self.scale_stride,
+            members: self.members,
+            jobs_count: self.jobs_count,
+            max_rows: self.max_rows,
+            total_rows: self.total_rows,
+            out_ld: self.out_ld,
+            out_col: self.out_col,
+            k: self.k,
+            n: self.n,
+            bits_twice: self.bits_twice,
+            book: self.book,
+            x_rows: self.x_rows,
+            out_total_rows: self.out_total_rows,
+            has_in_rows: self.in_rows.is_some(),
+            has_out_rows: self.out_rows.is_some(),
+        }
+    }
+}
+
+/// The byte extents of a job-table call in ABI order: trellis, suh, svh, jobs, x, xh, z, out,
+/// flag. `None` for a shape or stride outside the limits of `exl3.h`. The rotated input `xh` is
+/// F16 (two bytes a value), where `x` is F32.
+pub(in crate::kernels::cuda) fn jobs_extents(call: &JobsShape) -> Option<[usize; 9]> {
+    let (packed_bytes, _) = geometry(call.k, call.n, call.bits_twice, call.book)?;
+    let single = call.members == 1;
+    let in_limits = (1..=JOBS_MAX).contains(&call.jobs_count)
+        && (1..=JOB_ROWS_MAX).contains(&call.max_rows)
+        && (1..=(1 << 24)).contains(&call.members)
+        && (1..=65536).contains(&call.total_rows)
+        && call.out_ld >= call.out_col.checked_add(call.n)?
+        && call.out_ld <= (1 << 24)
+        && call.out_col <= (1 << 24)
+        && (1..=65536).contains(&call.x_rows)
+        && (1..=65536).contains(&call.out_total_rows)
+        && (call.has_in_rows || call.x_rows == call.total_rows)
+        && (call.has_out_rows || call.out_total_rows == call.total_rows)
+        && (single
+            || (call.trellis_stride >= packed_bytes / 2
+                && call.scale_stride >= call.k + call.n
+                && call.trellis_stride <= (1 << 36)
+                && call.scale_stride <= (1 << 36)));
+    if !in_limits {
+        return None;
+    }
+    let input = call.total_rows.checked_mul(call.k)?;
+    let read = call.x_rows.checked_mul(call.k)?;
+    let projected = call.total_rows.checked_mul(call.n)?;
+    if input > (1usize << 32) || read > (1usize << 32) || projected > (1usize << 32) {
+        return None;
+    }
+    let last = call.members - 1;
+    let (trellis_step, scale_step) = if single {
+        (0, 0)
+    } else {
+        (call.trellis_stride, call.scale_stride)
+    };
+    let output = (call.out_total_rows - 1)
+        .checked_mul(call.out_ld)?
+        .checked_add(call.out_col)?
+        .checked_add(call.n)?;
+    // Members and strides are bounded above, so these products fit; checked anyway.
+    let member_end = |step: usize, tail: usize, width: usize| {
+        last.checked_mul(step)?
+            .checked_add(tail)?
+            .checked_mul(width)
+    };
+    Some([
+        member_end(trellis_step, packed_bytes / 2, 2)?,
+        member_end(scale_step, call.k, 4)?,
+        member_end(scale_step, call.n, 4)?,
+        call.jobs_count * 16,
+        read * 4,
+        input * 2,
+        projected * 4,
+        output * 4,
+        4,
+    ])
+}
+
+/// The checked arguments of a job-table call: extents, alignment and disjoint writes proved.
+fn jobs_args(call: &JobsRaw<'_>) -> Result<JobsArgs, DeviceFailure> {
+    let needs = jobs_extents(&call.shape()).ok_or_else(invalid_argument)?;
+    let ranges = [
+        &call.trellis,
+        &call.suh,
+        &call.svh,
+        &call.jobs,
+        &call.x,
+        &call.xh,
+        &call.z,
+        &call.out,
+        &call.flag,
+    ];
+    for (i, range) in ranges.iter().enumerate() {
+        let alignment = if i == 0 { 2 } else { 4 };
+        if range.bytes() < needs[i] || !range.offset().is_multiple_of(alignment) {
+            return Err(invalid_argument());
+        }
+        // Writes: xh, z, out and flag (indices 5 to 8) are disjoint from every other range.
+        for (j, other) in ranges[..i].iter().enumerate() {
+            if (i >= 5 || j >= 5) && !Span::of(range, needs[i]).apart(&Span::of(other, needs[j])) {
+                return Err(invalid_argument());
+            }
+        }
+    }
+    // The row lists are read only: 4-byte aligned, one entry a table row, apart from every range
+    // the call writes (xh, z, out and flag, indices 5 to 8 of the extents).
+    for list in [&call.in_rows, &call.out_rows].into_iter().flatten() {
+        let need = call.total_rows * 4;
+        if list.bytes() < need || !list.offset().is_multiple_of(4) {
+            return Err(invalid_argument());
+        }
+        for (j, written) in ranges[5..].iter().enumerate() {
+            if !Span::of(list, need).apart(&Span::of(written, needs[5 + j])) {
+                return Err(invalid_argument());
+            }
+        }
+    }
+    Ok(JobsArgs {
+        trellis: call.trellis.address().cast(),
+        trellis_bytes: call.trellis.bytes(),
+        suh: call.suh.address().cast(),
+        suh_bytes: call.suh.bytes(),
+        svh: call.svh.address().cast(),
+        svh_bytes: call.svh.bytes(),
+        x: call.x.address().cast(),
+        x_bytes: call.x.bytes(),
+        xh: call.xh.address().cast(),
+        xh_bytes: call.xh.bytes(),
+        z: call.z.address().cast(),
+        z_bytes: call.z.bytes(),
+        out: call.out.address().cast(),
+        out_bytes: call.out.bytes(),
+        flag: call.flag.address().cast(),
+        flag_bytes: call.flag.bytes(),
+        jobs: call.jobs.address().cast(),
+        jobs_bytes: call.jobs.bytes(),
+        trellis_stride: call.trellis_stride,
+        scale_stride: call.scale_stride,
+        members: call.members,
+        k: call.k,
+        n: call.n,
+        total_rows: call.total_rows,
+        out_ld: call.out_ld,
+        out_col: call.out_col,
+        jobs_count: u32::try_from(call.jobs_count).map_err(|_| invalid_argument())?,
+        max_rows: u32::try_from(call.max_rows).map_err(|_| invalid_argument())?,
+        bits_twice: c_int::from(call.bits_twice),
+        book: book_tag(call.book),
+        in_rows: call
+            .in_rows
+            .as_ref()
+            .map_or(std::ptr::null(), |list| list.address().cast()),
+        in_rows_bytes: call.in_rows.as_ref().map_or(0, |list| list.bytes()),
+        out_rows: call
+            .out_rows
+            .as_ref()
+            .map_or(std::ptr::null(), |list| list.address().cast()),
+        out_rows_bytes: call.out_rows.as_ref().map_or(0, |list| list.bytes()),
+        x_rows: call.x_rows,
+        out_total_rows: call.out_total_rows,
+    })
+}
+
+pub(in crate::kernels::cuda) fn jobs(
+    stream: &RawStream,
+    call: &JobsRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let args = jobs_args(call)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: live bounded owners, complete extents, alignment and disjoint writes proved above and
+    // repeated in C; the table is read on the device, and the C entry guards every job against the
+    // bank and the row bounds. The explicit live stream is under the dispatch guard.
+    let status = unsafe { inference_cuda_exl3_jobs(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Whether the call would run the register-decode kernel on the current device (`exl3.h`).
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn jobs_use_registers(
+    call: &JobsRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    let args = jobs_args(call)?;
+    // SAFETY: a checked argument block; the entry only reads its integers and the device's
+    // compute capability.
+    match unsafe { inference_cuda_exl3_jobs_kernel(&args, -1, 0, 0) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_argument()),
+    }
 }
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -671,6 +1160,199 @@ pub(in crate::kernels::cuda) mod launch_observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An argument block with the given alignment-relevant fields; its pointers are never read.
+    fn selector_args(
+        xh: usize,
+        trellis: usize,
+        stride: usize,
+        members: usize,
+        k: usize,
+    ) -> JobsArgs {
+        JobsArgs {
+            trellis: trellis as *const u16,
+            trellis_bytes: 0,
+            suh: std::ptr::null(),
+            suh_bytes: 0,
+            svh: std::ptr::null(),
+            svh_bytes: 0,
+            x: std::ptr::null(),
+            x_bytes: 0,
+            xh: xh as *mut u16,
+            xh_bytes: 0,
+            z: std::ptr::null_mut(),
+            z_bytes: 0,
+            out: std::ptr::null_mut(),
+            out_bytes: 0,
+            flag: std::ptr::null_mut(),
+            flag_bytes: 0,
+            jobs: std::ptr::null(),
+            jobs_bytes: 0,
+            trellis_stride: stride,
+            scale_stride: 0,
+            members,
+            k,
+            n: 0,
+            total_rows: 0,
+            out_ld: 0,
+            out_col: 0,
+            jobs_count: 0,
+            max_rows: 0,
+            bits_twice: 8,
+            book: 0,
+            in_rows: std::ptr::null(),
+            in_rows_bytes: 0,
+            out_rows: std::ptr::null(),
+            out_rows_bytes: 0,
+            x_rows: 0,
+            out_total_rows: 0,
+        }
+    }
+
+    #[test]
+    fn the_register_kernel_is_chosen_by_capability_ptx_alignment_and_k() {
+        // The device facts and the switch are arguments, so the test needs no device and does not
+        // depend on FIFI_EXL3_JOBS_REG in the environment.
+        let select = |args: &JobsArgs, major: c_int, ptx: c_int, enabled: c_int| {
+            // SAFETY: the entry reads the integers of the block; a capability of 0 or more is
+            // taken as given and never queries a device.
+            unsafe { inference_cuda_exl3_jobs_kernel(args, major, ptx, enabled) }
+        };
+        let aligned = selector_args(0x10_0000, 0x20_0000, 4096, 5, 2048);
+        // Compute capability 8.6 (the 3090) on an sm_86 binary takes it; 7.2 does not.
+        assert_eq!(select(&aligned, 8, 86, 1), 1);
+        assert_eq!(select(&aligned, 9, 90, 1), 1);
+        assert_eq!(select(&aligned, 7, 72, 1), 0);
+        assert_eq!(select(&aligned, 0, 0, 1), 0);
+        // An sm_72-only build run on a compute capability 8 device (PTX JIT) has the trap stub, and
+        // reports the SASS arch of the device: only the ptx version of the code shows it.
+        assert_eq!(select(&aligned, 8, 72, 1), 0);
+        assert_eq!(select(&aligned, 8, 80, 1), 1);
+        // The rollback switch.
+        assert_eq!(select(&aligned, 8, 86, 0), 0);
+        // An input row start or a trellis start that is only 4- or 2-byte aligned, a member stride
+        // that is not a multiple of 8 elements, or a K that is not a multiple of 32: old kernel.
+        for args in [
+            selector_args(0x10_0004, 0x20_0000, 4096, 5, 2048),
+            selector_args(0x10_0000, 0x20_0002, 4096, 5, 2048),
+            selector_args(0x10_0000, 0x20_0000, 4099, 5, 2048),
+            selector_args(0x10_0000, 0x20_0000, 4096, 5, 2064),
+        ] {
+            assert_eq!(select(&args, 8, 86, 1), 0);
+        }
+        // One member ignores the stride.
+        assert_eq!(
+            select(
+                &selector_args(0x10_0000, 0x20_0000, 4099, 1, 2048),
+                8,
+                86,
+                1
+            ),
+            1
+        );
+        // A null block is refused.
+        assert_eq!(
+            // SAFETY: a null block is refused before any read.
+            unsafe { inference_cuda_exl3_jobs_kernel(std::ptr::null(), 8, 86, 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn the_job_table_extents_size_the_rotated_input_as_f16() {
+        // k = 256, n = 384 at 4 bits (bits_twice 8): 16 row tiles and 24 column tiles of 16 values.
+        let shape = JobsShape {
+            trellis_stride: 0,
+            scale_stride: 0,
+            members: 1,
+            jobs_count: 2,
+            max_rows: 16,
+            total_rows: 32,
+            out_ld: 384,
+            out_col: 0,
+            k: 256,
+            n: 384,
+            bits_twice: 8,
+            book: Codebook::Mul1,
+            x_rows: 32,
+            out_total_rows: 32,
+            has_in_rows: false,
+            has_out_rows: false,
+        };
+        let needs = jobs_extents(&shape).expect("a valid shape");
+        assert_eq!(needs[3], 2 * 16, "the table: 16 bytes a job");
+        assert_eq!(needs[4], 32 * 256 * 4, "x holds F32 values");
+        assert_eq!(needs[5], 32 * 256 * 2, "xh holds F16 values");
+        assert_eq!(needs[6], 32 * 384 * 4, "z holds F32 values");
+        assert_eq!(needs[7], 32 * 384 * 4, "out holds F32 values at ld = n");
+        assert_eq!(needs[8], 4, "the flag is one word");
+        // A window inside a wider row moves the end of the output only.
+        let wide = JobsShape {
+            out_ld: 400,
+            out_col: 16,
+            ..shape
+        };
+        let needs = jobs_extents(&wide).expect("a window");
+        assert_eq!(needs[7], (31 * 400 + 16 + 384) * 4);
+        assert_eq!(needs[5], 32 * 256 * 2);
+        // Row lists: x and out follow their own row counts, xh stays one row a table row.
+        let listed = JobsShape {
+            x_rows: 10,
+            out_total_rows: 40,
+            has_in_rows: true,
+            has_out_rows: true,
+            ..shape
+        };
+        let needs = jobs_extents(&listed).expect("lists");
+        assert_eq!(needs[4], 10 * 256 * 4, "x holds x_rows rows");
+        assert_eq!(needs[5], 32 * 256 * 2, "xh holds a row for every table row");
+        assert_eq!(
+            needs[7],
+            (39 * 384 + 384) * 4,
+            "out holds out_total_rows rows"
+        );
+        // Without a list the row counts must be those of the table.
+        for bad in [
+            JobsShape {
+                x_rows: 10,
+                ..shape
+            },
+            JobsShape {
+                out_total_rows: 40,
+                ..shape
+            },
+            JobsShape {
+                x_rows: 0,
+                has_in_rows: true,
+                ..shape
+            },
+            JobsShape {
+                out_total_rows: 65537,
+                has_out_rows: true,
+                ..shape
+            },
+        ] {
+            assert!(jobs_extents(&bad).is_none());
+        }
+        // Over the row cap, no jobs, and a window past the row refuse.
+        for bad in [
+            JobsShape {
+                max_rows: 257,
+                ..shape
+            },
+            JobsShape {
+                jobs_count: 0,
+                ..shape
+            },
+            JobsShape {
+                out_ld: 383,
+                ..shape
+            },
+        ] {
+            assert!(jobs_extents(&bad).is_none());
+        }
+    }
+
     #[test]
     fn midrows_geometry_requires_9_to_144_rows_and_f32_working_spans() {
         for book in [Codebook::ThreeInst, Codebook::Mcg, Codebook::Mul1] {
@@ -780,6 +1462,7 @@ mod tests {
             n: 128,
             bits_twice: 3,
             book: 2,
+            fused_publish: 0,
         }
     }
 
@@ -889,6 +1572,7 @@ mod tests {
             n: 128,
             bits_twice: 3,
             book: Codebook::Mul1,
+            fused: false,
         };
         // Existing raw-wrapper seam: invalid calls must never consume this stream.
         let stream = RawStream(NonNull::dangling());
@@ -966,6 +1650,7 @@ mod tests {
             n: 128,
             bits_twice: 3,
             book: 2,
+            fused_publish: 0,
         };
         let mut cases = [base; 16];
         cases[0].rows = 0;

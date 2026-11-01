@@ -248,7 +248,7 @@ impl CudaContext {
         }
         let raw = self.owned(range.buffer())?;
         let _dispatch = self.enter()?;
-        native::upload_at(raw, range.offset(), host).map_err(device_error)
+        super::host_write(range.buffer(), raw, range.offset(), host)
     }
 }
 

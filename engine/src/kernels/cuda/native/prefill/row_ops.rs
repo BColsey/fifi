@@ -69,6 +69,7 @@ struct MulArgs {
     rows: usize,
     columns: usize,
     rhs_columns: usize,
+    fused_publish: u32,
 }
 
 #[repr(C)]
@@ -111,7 +112,7 @@ const _: () = assert!(
         && offset_of!(UnaryArgs, columns) == 56
 );
 const _: () = assert!(
-    size_of::<MulArgs>() == 88
+    size_of::<MulArgs>() == 96
         && offset_of!(MulArgs, x) == 0
         && offset_of!(MulArgs, x_bytes) == 8
         && offset_of!(MulArgs, rhs) == 16
@@ -123,6 +124,7 @@ const _: () = assert!(
         && offset_of!(MulArgs, rows) == 64
         && offset_of!(MulArgs, columns) == 72
         && offset_of!(MulArgs, rhs_columns) == 80
+        && offset_of!(MulArgs, fused_publish) == 88
 );
 const _: () = assert!(
     size_of::<GatherArgs>() == 88
@@ -190,6 +192,7 @@ pub(in crate::kernels::cuda) struct RowMulRaw<'a> {
     pub(in crate::kernels::cuda) rows: usize,
     pub(in crate::kernels::cuda) columns: usize,
     pub(in crate::kernels::cuda) rhs_columns: usize,
+    pub(in crate::kernels::cuda) fused: bool,
 }
 
 pub(in crate::kernels::cuda) struct RowGatherRaw<'a> {
@@ -280,6 +283,7 @@ pub(in crate::kernels::cuda) fn row_mul_launch(
         rows: call.rows,
         columns: call.columns,
         rhs_columns: call.rhs_columns,
+        fused_publish: u32::from(call.fused),
     };
     let mut stage = STAGE_NONE;
     // SAFETY: check_regions proves extents/alignment/disjoint writes of live owned ranges.

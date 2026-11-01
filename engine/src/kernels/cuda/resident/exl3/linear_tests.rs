@@ -21,7 +21,12 @@ impl WeightSource for Components {
         Tier::Resident
     }
 }
-fn fixture(subnormal: bool, book: Codebook, bits_twice: u8, shape: (usize, usize)) -> Matrix {
+pub(super) fn fixture(
+    subnormal: bool,
+    book: Codebook,
+    bits_twice: u8,
+    shape: (usize, usize),
+) -> Matrix {
     let (k, n) = shape;
     let mut rng = testkit::Rng::new(0x4558_4c33);
     let tensor = |dtype, shape, bytes| Tensor::try_from_host(dtype, shape, bytes).unwrap();
@@ -78,7 +83,7 @@ fn fixture(subnormal: bool, book: Codebook, bits_twice: u8, shape: (usize, usize
             .unwrap();
     Matrix::load(&source, "m", &config).unwrap()
 }
-fn upload_scales(ctx: &CudaContext, tensor: &Tensor) -> DeviceBuffer {
+pub(super) fn upload_scales(ctx: &CudaContext, tensor: &Tensor) -> DeviceBuffer {
     let values: Vec<_> = tensor
         .host_bytes()
         .unwrap()
@@ -287,6 +292,7 @@ fn constant_projection(
             n: 128,
             bits_twice: 3,
             book: matrix.codebook(),
+            fused: false,
         },
     )
     .unwrap();
@@ -350,6 +356,7 @@ fn staged_guard_cases(ctx: &CudaContext, stream: &DeviceStream, geometry: (usize
                 n: 128,
                 bits_twice: 3,
                 book: Codebook::Mul1,
+                fused: false,
             },
         )
         .unwrap();
@@ -574,6 +581,7 @@ fn midrows_opt_in_preserves_f32_stages_and_subnormal_scales() {
                 n,
                 bits_twice: matrix.bitrate_twice(),
                 book: matrix.codebook(),
+                fused: false,
             },
         )
         .unwrap();
@@ -748,6 +756,7 @@ fn projection_cases(midrows: bool) {
                 n,
                 bits_twice: matrix.bitrate_twice(),
                 book: matrix.codebook(),
+                fused: false,
             };
             if midrows {
                 ctx.exl3_linear_midrows(&stream, call)
@@ -878,6 +887,7 @@ fn grouped_gather_matches_shfl_gather_bitwise() {
                             n,
                             bits_twice: bits,
                             book,
+                            fused: false,
                         }
                     })
                     .collect();
@@ -930,6 +940,7 @@ fn grouped_gather_matches_shfl_gather_bitwise() {
                 n,
                 bits_twice: bits,
                 book,
+                fused: false,
             };
             ctx.exl3_linear(&stream, call).unwrap();
             first += rows;

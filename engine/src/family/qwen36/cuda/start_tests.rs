@@ -312,14 +312,18 @@ fn the_kv_mode_of_the_config_maps_f32_to_fp16_and_q8_to_int8g32() {
 }
 
 #[test]
-fn exl3_serving_is_refused_for_every_kv_dtype() {
-    for kv in [KvDtype::F32, KvDtype::Q8, KvDtype::Bf16] {
-        match kv_mode_of(kv, WeightLayout::Exl3) {
-            Err(EngError::BadRequest(text)) => {
-                assert!(text.contains("EXL3 serving is not admitted"), "{text}");
-            }
-            other => panic!("EXL3 serving must be refused for {kv:?}: {other:?}"),
-        }
+fn exl3_serving_takes_the_kv_modes_of_the_native_layout() {
+    assert_eq!(
+        kv_mode_of(KvDtype::F32, WeightLayout::Exl3).expect("f32"),
+        KvMode::Fp16
+    );
+    assert_eq!(
+        kv_mode_of(KvDtype::Q8, WeightLayout::Exl3).expect("q8"),
+        KvMode::Int8G32
+    );
+    match kv_mode_of(KvDtype::Bf16, WeightLayout::Exl3) {
+        Err(EngError::BadRequest(text)) => assert!(text.contains("bf16"), "{text}"),
+        other => panic!("a bf16 KV start must be refused on CUDA: {other:?}"),
     }
 }
 

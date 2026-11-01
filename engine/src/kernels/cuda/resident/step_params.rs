@@ -33,6 +33,9 @@ pub(crate) const STATUS_NON_FINITE_LOGITS: i32 = 2;
 /// Status mask 4: the step state is invalid (set by `step_begin`, or by `embed` for a token id
 /// outside the table).
 pub(crate) const STATUS_INVALID_STEP_STATE: i32 = 4;
+/// Status mask 16: an EXL3 projection of the step saw a nonfinite value (OR-ed in by
+/// [`CudaContext::exl3_flag_fold`]).
+pub(crate) const STATUS_EXL3_ARITHMETIC: i32 = 16;
 /// Bytes of the [`StepParams`] block.
 pub(crate) const STEP_PARAMS_BYTES: usize = raw::STEP_PARAMS_BYTES;
 /// Byte offset of `token_id` in the block.
@@ -300,6 +303,43 @@ impl CudaContext {
         require_fit("params", &params, STEP_PARAMS_BYTES, 4)?;
         self.launch_on(stream, move |raw_stream| {
             raw::step_begin_launch(raw_stream, params_raw)
+        })
+    }
+
+    /// Enqueues the zeroing of the sticky EXL3 arithmetic flag word `flag` (4 bytes, 4-byte
+    /// aligned). Runs right after `step_begin` in an EXL3 step.
+    pub(crate) fn exl3_flag_clear(
+        &self,
+        stream: &DeviceStream,
+        flag: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let flag_raw = self.raw_range(&flag)?;
+        require_fit("EXL3 flag", &flag, 4, 4)?;
+        self.launch_on(stream, move |raw_stream| {
+            raw::exl3_flag_clear_launch(raw_stream, flag_raw)
+        })
+    }
+
+    /// Enqueues the fold of the EXL3 arithmetic flag word into `params.status`: when bit 0 of
+    /// `flag` is set, mask [`STATUS_EXL3_ARITHMETIC`] is OR-ed into the status; the word is zeroed
+    /// either way. Runs after the last EXL3 projection and before `argmax`, so the result pair
+    /// carries the verdict. `flag` and `params` must not overlap.
+    pub(crate) fn exl3_flag_fold(
+        &self,
+        stream: &DeviceStream,
+        params: DeviceRange<'_>,
+        flag: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let params_raw = self.raw_range(&params)?;
+        let flag_raw = self.raw_range(&flag)?;
+        require_fit("params", &params, STEP_PARAMS_BYTES, 4)?;
+        require_fit("EXL3 flag", &flag, 4, 4)?;
+        require_apart(
+            &Claim::of("params", &params, STEP_PARAMS_BYTES),
+            &Claim::of("EXL3 flag", &flag, 4),
+        )?;
+        self.launch_on(stream, move |raw_stream| {
+            raw::exl3_flag_fold_launch(raw_stream, params_raw, flag_raw)
         })
     }
 

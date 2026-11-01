@@ -3425,7 +3425,7 @@ mod tests {
     }
 
     fn assert_no_machine_context(name: &str, scanned: &str, text: &str) {
-        // JSON-escaped slashes ("\/home\/dan") would hide every path needle
+        // JSON-escaped slashes ("\/home\/user") would hide every path needle
         // from a raw scan, so scan a de-escaped copy instead. Fixtures hold
         // JSON nested inside JSON strings, so escaping can stack; repeat the
         // replace until it stabilizes. Scanning the de-escaped text is safe:
@@ -3478,7 +3478,7 @@ mod tests {
     #[test]
     fn assert_no_machine_context_boundary() {
         // These must panic — non-neutral home paths, plain or JSON-escaped
-        // ("\/home\/dan" must not slip past the scan).
+        // ("\/home\/user" must not slip past the scan).
         let failing = [
             "/home/username",
             "/home/user2",

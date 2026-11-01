@@ -603,8 +603,18 @@ __device__ inline float q8_value(const inference_cuda_attn_kv_view &v, int row, 
     return fmaf(scale, code, bias);
 }
 
+/* The mixed-profile ("q8k") V plane: F16 storage, no scales — the payload at
+ * the view's own strides, one __half per (row, head, dim). */
+__device__ inline float f16_value(const inference_cuda_attn_kv_view &v, int row, int h, int d) {
+    const size_t payload = (size_t)row * v.payload_time_stride_bytes +
+                           (size_t)h * v.payload_head_stride_bytes + (size_t)d * 2;
+    return __half2float(*((const __half *)((const char *)v.payload + payload)));
+}
+
 // A launch covers every query row; decode only visible keys, without an F16 cache copy.
-template <int kHeadDim>
+// VIsF16 is the mixed profile ("q8k"): K dequantizes as q8 while V reads f16
+// payload at its own strides; the branch folds at compile time.
+template <int kHeadDim, bool VIsF16>
 __global__ void attn_prefill_part_q8_k(Args a, inference_cuda_attn_kv_pair views) {
     constexpr int kThreads = kHeadDim < 128 ? 128 : kHeadDim;
     __shared__ float dot[kThreads / 32];
@@ -638,7 +648,9 @@ __global__ void attn_prefill_part_q8_k(Args a, inference_cuda_attn_kv_pair views
             const float weight = isfinite(score) ? expf(score - next) : __int_as_float(0x7fc00000);
             normalizer = fmaf(normalizer, alpha, weight);
             if (d < kHeadDim)
-                accumulator = fmaf(accumulator, alpha, weight * q8_value(views.v, row, kh, d));
+                accumulator = fmaf(accumulator, alpha,
+                    weight * (VIsF16 ? f16_value(views.v, row, kh, d)
+                                     : q8_value(views.v, row, kh, d)));
             maximum = next;
             __syncthreads();  // all warps must consume this dot before the next key
         }
@@ -764,6 +776,17 @@ bool q8_view(const inference_cuda_attn_kv_view &v, const inference_cuda_attn_pre
            scalar_plane(v.bias, v.bias_dtype, counts, bias, false);
 }
 
+/* The F16 V view of the mixed profile ("q8k"): 2-byte cells at the view's own
+ * strides, one contiguous head_dim run per (row, head); no scales, no bias. */
+bool f16_view(const inference_cuda_attn_kv_view &v, const inference_cuda_attn_prefill_args *a) {
+    if (v.storage != INFERENCE_CUDA_ATTN_STORAGE_F16 || v.scales != NULL || v.bias != NULL)
+        return false;
+    const size_t counts[3] = {(size_t)a->cache_rows, (size_t)a->n_kv_head, 1};
+    const size_t strides[3] = {v.payload_time_stride_bytes, v.payload_head_stride_bytes, 0};
+    return aligned_to(v.payload, 2) &&
+           read_span(v.payload, (size_t)a->head_dim * 2, counts, strides);
+}
+
 /* The wrapper mirrors every rule here, so the native entry cannot return INVALID_ARGUMENT
  * (which would latch the backend); a C caller gets the same refusal before any launch. */
 bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
@@ -805,10 +828,15 @@ bool valid(const inference_cuda_attn_prefill_args *a, bool segmented = false) {
     const inference_cuda_attn_kv_pair &views = *a->kv_views;
     const size_t floats = inference_cuda_attn_prefill_part_floats(
         a->m, a->n_kv_head, a->head_dim, a->max_splits, a->n_head / a->n_kv_head);
-    return a->n_head <= kMaxGridY && floats > 0 && floats <= (64u << 20) / sizeof(float) &&
-           a->k_cache == views.k.payload && a->v_cache == views.v.payload &&
-           views.k.group_size == views.v.group_size && views.k.q8_signed == views.v.q8_signed &&
-           q8_view(views.k, *a) && q8_view(views.v, *a);
+    if (!(a->n_head <= kMaxGridY && floats > 0 && floats <= (64u << 20) / sizeof(float) &&
+          a->k_cache == views.k.payload && a->v_cache == views.v.payload))
+        return false;
+    /* Uniform q8: both planes q8 with matching group geometry. Mixed ("q8k"):
+     * K q8, V f16. */
+    if (q8_view(views.v, *a))
+        return views.k.group_size == views.v.group_size &&
+               views.k.q8_signed == views.v.q8_signed && q8_view(views.k, *a);
+    return f16_view(views.v, a) && q8_view(views.k, *a);
 }
 
 bool valid_sans_bounds(const inference_cuda_attn_prefill_args *a) {
@@ -904,11 +932,10 @@ Failure enqueue_typed(const Args &k, void *stream) {
     return failure;
 }
 
-#ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Everything in this block is fixture-only: this ifdef compiles away in every production build, so
- * the production enqueue and every non-test code path never see it. The tiled step-2 kernel and its
- * helpers exist only so the same-ELF fixture can drive them through
- * inference_cuda_attn_prefill_q8_tiled_launch. */
+/* The tiled q8 kernel and its helpers are production-compiled but only
+ * the Rust route (FIFI_FLINT_CUDA_Q8_TILED, read once, default ON; rollback = any
+ * rejected value such as "0") and the same-ELF fixture entry reach
+ * enqueue_q8_tiled. The legacy kernels and enqueue below stay byte-identical. */
 /* The group scalars depend only on (row, head, d/32). With group_size 32 a whole warp is one
  * group, so lane 0 can load them once per key and the per-element reloads disappear.
  * Addresses, conversions and the fmaf(scale, code, bias) formula stay identical to q8_value,
@@ -928,25 +955,19 @@ __device__ inline Q8GroupScalars q8_group_scalars(
     return {scale, bias};
 }
 
-__device__ inline float q8_code(const inference_cuda_attn_kv_view &v, int row, int h, int d) {
-    const size_t payload = (size_t)row * v.payload_time_stride_bytes +
-                           (size_t)h * v.payload_head_stride_bytes + d;
-    return v.q8_signed ? (float)((const signed char *)v.payload)[payload]
-                       : (float)((const unsigned char *)v.payload)[payload];
-}
-
-
-/* Tiled q8 part kernel (mode 0; enqueue_q8 selects it when kHeadDim == 128, both planes' group_size
- * is 32 and G <= 8): one block per (query tile, kv head, split), the F16 dsplit shape, so the G
- * query-head blocks that share a kv head stop re-dequanting the same keys. kTile keys are
- * cooperatively dequantized to smem f32, double-buffered: tile n+1's raw bytes are prefetched into
- * registers before tile n is consumed (byte-granular loads; q8 bytes cannot cp.async on the
- * fixtures' odd strides). Warp g = GQA head g (padding warps g >= group only keep the barriers) and
- * scans the tile's tokens; each token's softmax is per key TILE: kTile butterfly-reduced scores sit
- * in registers, one tile max, one rescale, one expf per key — the per-key serial chain of the
- * scalar kernel is gone. Masking/poison rules, the (maximum, normalizer, accumulator) contract,
- * cell layout rr = (t - t0) * group + g and index order match attn_prefill_part_q8_k; no
- * atomics. */
+/* Tiled q8 part kernel (mode 0; only the fixture entry and the production route entry
+ * launch it, when head_dim == 128, both planes' group_size is 32 and G <= 8): one block
+ * per (query tile, kv head,
+ * split), the F16 dsplit shape, so the G query-head blocks that share a kv head stop
+ * re-dequanting the same keys. kTile keys are cooperatively dequantized to smem f32,
+ * double-buffered: tile n+1's raw bytes are prefetched into registers before tile n is
+ * consumed (byte-granular loads; q8 bytes cannot cp.async on the fixtures' odd strides).
+ * Warp g = GQA head g (padding warps g >= group only keep the barriers) and scans
+ * the tile's tokens; each token's softmax is per key TILE: kTile butterfly-reduced
+ * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
+ * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
+ * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
+ * attn_prefill_part_q8_k; no atomics. */
 template <int kHeadDim>
 __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
@@ -1133,9 +1154,10 @@ __global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
     }
 }
 
-/* Fixture-only tiled enqueue: the same admission and combine as enqueue_q8, but the part
- * kernel is attn_prefill_part_q8_tile_k<128>. Kept as a separate function so enqueue_q8
- * keeps main's exact text (byte-identity proof). */
+/* Tiled enqueue shared by the fixture entry and the production route entry: the same
+ * admission and combine as enqueue_q8, but the part kernel is
+ * attn_prefill_part_q8_tile_k<128>. Kept as a separate function so enqueue_q8 keeps
+ * main's exact text (byte-identity proof). */
 template <int kHeadDim>
 static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views,
                                 void *stream) {
@@ -1145,17 +1167,18 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
     /* Arm once per process (the arm_part pattern): the no-spill receipt (localSizeBytes
      * == 0) and the 64 KB dynamic-smem opt-in; a failed arm fails every launch, never
      * silently falls back. No 16-key fallback (dead code at the production block count). */
-    static const bool armed = [] {
+    static const cudaError_t arm_error = []() -> cudaError_t {
         cudaFuncAttributes attr = {};
-        if (cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>) != cudaSuccess)
-            return false;
-        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0) return false;
+        const cudaError_t got =
+            cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>);
+        if (got != cudaSuccess) return got;  // propagate the real CUDA error
+        if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0)
+            return cudaErrorInvalidValue;  // attribute-invariant refusal, not a CUDA error
         return cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    kTileBytes) == cudaSuccess;
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kTileBytes);
     }();
-    if (!armed) {
-        failure.record(cudaErrorInvalidValue, INFERENCE_CUDA_STAGE_LAUNCH);
+    if (arm_error != cudaSuccess) {
+        failure.record(arm_error, INFERENCE_CUDA_STAGE_LAUNCH);
         return failure;
     }
     attn_prefill_part_q8_tile_k<128><<<dim3((k.m + kQTile - 1) / kQTile, k.n_kv_head,
@@ -1169,15 +1192,20 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
     }
     return failure;
 }
-#endif
 template <int kHeadDim>
 Failure enqueue_q8(const Args &k, inference_cuda_attn_kv_pair views, void *stream) {
     constexpr int threads = kHeadDim < 128 ? 128 : kHeadDim;
     Failure failure;
     if (k.mode != 2) {
-        attn_prefill_part_q8_k<kHeadDim><<<dim3(k.mode == 1 ? 1 : k.max_splits, k.n_head,
-                                               (k.m + kQTile - 1) / kQTile),
-                                          threads, 0, (cudaStream_t)stream>>>(k, views);
+        /* The mixed profile ("q8k") V view carries F16 storage; one launch-time
+         * check picks the instantiation, so neither kernel pays a per-element
+         * branch. */
+        const bool v_f16 = views.v.storage == INFERENCE_CUDA_ATTN_STORAGE_F16;
+        const auto part = v_f16 ? attn_prefill_part_q8_k<kHeadDim, true>
+                                : attn_prefill_part_q8_k<kHeadDim, false>;
+        part<<<dim3(k.mode == 1 ? 1 : k.max_splits, k.n_head,
+                    (k.m + kQTile - 1) / kQTile),
+              threads, 0, (cudaStream_t)stream>>>(k, views);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     }
     if (failure.ok() && k.mode != 1) {
@@ -1325,10 +1353,11 @@ extern "C" int inference_cuda_attn_prefill_q8_reference_launch(
 }
 #endif
 #ifdef INFERENCE_CUDA_Q8_REFERENCE
-/* Same-ELF fixture entry: the ONLY caller that can reach the tiled kernel; production launches
- * never do. Fixture builds only (the production enqueue does not change; this entry drives the
- * fixture-only enqueue_q8_tiled). The entry REFUSES shapes the tiled predicate would reject, so a
- * fixture run can never silently measure the old kernel under a tiled label. */
+/* Same-ELF fixture entry: drives the tiled enqueue for tests on the shapes the
+ * production route predicate accepts (head_dim 128, both planes' group_size 32,
+ * G <= 8), so a fixture run can never silently measure the old kernel under a
+ * tiled label. Fixture builds only; production traffic goes through the route
+ * entry below. */
 extern "C" int inference_cuda_attn_prefill_q8_tiled_launch(
     const inference_cuda_attn_prefill_args *a, void *stream, int *out_stage) {
     try {
@@ -1350,3 +1379,57 @@ extern "C" int inference_cuda_attn_prefill_q8_tiled_launch(
     }
 }
 #endif
+/* Null-tolerant writer for the route report (mirrors report_stage in device.h). */
+static inline void report_route(int *out_route, int route) {
+    if (out_route != NULL) {
+        *out_route = route;
+    }
+}
+/* Production route entry: the Rust side reads
+ * FIFI_FLINT_CUDA_Q8_TILED once and passes use_tiled; use_tiled = 0 keeps the default
+ * enqueue exactly as before (this entry then differs from the plain launch only by the
+ * out_route report). The predicate mirrors the fixture entry's refusal above; a reject
+ * falls back to the default enqueue and reports out_route = 2 so the Rust side counts
+ * fallbacks. out_route: 0 = default old path, 1 = tiled kernel, 2 = predicate fallback. */
+extern "C" int inference_cuda_attn_prefill_q8_tiled_route(
+    const inference_cuda_attn_prefill_args *a, void *stream, int *out_stage,
+    int use_tiled, int *out_route) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        report_route(out_route, 0);
+        if (!valid(a)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const Args k = to_args(a);
+        /* Full-execution calls (single-row prefill rows included) are the route's
+         * targets; segmented-part launches reach the device through a different
+         * entry and never this one. Sink logits need no guard here: the combine
+         * kernel folds them and the tiled path shares it. */
+        const bool predicate = a->kv_views != NULL && k.head_dim == 128 &&
+                               k.n_head / k.n_kv_head <= 8;
+        if (use_tiled && predicate) {
+            const inference_cuda_attn_kv_pair &views = *a->kv_views;
+            if (views.k.group_size == 32 && views.v.group_size == 32) {
+                report_route(out_route, 1);
+                const Failure failure = enqueue_q8_tiled<128>(k, views, stream);
+                report_stage(out_stage, failure.stage);
+                return (int)failure.err;
+            }
+        }
+        if (use_tiled) {
+            report_route(out_route, 2);  // predicate reject: old kernel + counted fallback
+            static const bool logged = [] {
+                fprintf(stderr,
+                        "inference: FIFI_FLINT_CUDA_Q8_TILED: shape rejected by the tiled "
+                        "route predicate; serving the legacy q8 kernel\n");
+                return true;
+            }();
+            (void)logged;
+        }
+        const Failure failure = enqueue(k, stream, a->kv_views);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}

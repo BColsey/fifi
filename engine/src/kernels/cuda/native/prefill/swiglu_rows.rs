@@ -16,14 +16,6 @@
 //! - The `extern` declaration, the `repr(C)` mirror and every raw pointer are private to this
 //!   file. Nothing is re-exported.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
-
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 

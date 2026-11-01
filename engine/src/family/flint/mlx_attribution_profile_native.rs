@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -212,55 +212,104 @@ fn sixteen_step_class_attribution() -> io::Result<()> {
     );
     clean_observation()?;
     if std::env::var_os("FIFI_FLINT_MLX_BATCH_PREFILL").is_some()
+        || std::env::var_os("FLINT_QUAL_STAGE_SYNC").is_some()
         || !crate::family::flint::mlx_forward::coalesce_residual_flagged()
+        || !crate::family::flint::mlx_forward::async_chain_flagged()
     {
         return Err(io::Error::other(
-            "attribution requires the serving piece-size env unset (it pins its own S4 512-row worker pieces) and D1 ON",
+            "attribution requires the serving piece-size and stage-sync envs unset, residual coalescing and the async chain ON (the evaluates_per_token row reports the chained cadence)",
         ));
     }
-    let (root, token_path, out) = qualification_paths()?;
-    if !fs::metadata(&token_path)?.is_file() {
-        return Err(io::Error::other("attribution input must be a regular file"));
-    }
-    let mut raw = Vec::new();
-    fs::File::open(&token_path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut raw)?;
-    let digest = format!("{:x}", Sha256::digest(&raw));
-    // Cross-check the hardcoded digest against the S4 speed manifest when
-    // one is provided, so a transcription typo in the constant cannot pass
-    // silently: the constant and the manifest must name the same stimulus.
-    if let Some(manifest_path) = std::env::var_os("FLINT_QUAL_SPEED_MANIFEST") {
-        let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)
-            .map_err(|error| io::Error::other(format!("bad speed manifest: {error}")))?;
-        let recorded = manifest["input"]["sha256"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("speed manifest lacks input.sha256"))?;
-        if recorded != "d72c7b49525c2c5fda9e60f6b6e5b1573a83c52199380524315d62a189185843" {
+    let requested = match std::env::var("FLINT_ATTRIB_DEPTH") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "4096".to_string(),
+        Err(error) => return Err(io::Error::other(format!("FLINT_ATTRIB_DEPTH: {error}"))),
+    };
+    let depth: usize = match requested.as_str() {
+        "4096" => 4096,
+        "16384" => 16384,
+        "30720" => 30720,
+        _ => {
             return Err(io::Error::other(
-                "digest constant disagrees with the speed manifest",
+                "FLINT_ATTRIB_DEPTH must be 4096, 16384, or 30720",
             ));
         }
-    }
-    if digest != "d72c7b49525c2c5fda9e60f6b6e5b1573a83c52199380524315d62a189185843" {
-        return Err(io::Error::other(
-            "attribution requires the frozen S4 4097-ID speed stimulus",
-        ));
-    }
-    let ids: Vec<u32> = serde_json::from_slice(&raw)?;
-    if ids.len() != 4097 || ids.iter().any(|&id| id >= 150_144) {
-        return Err(io::Error::other("invalid frozen speed IDs"));
-    }
+    };
+    // The 4K leg stays pinned to the frozen speed stimulus file; the deeper legs
+    // rebuild the same arithmetic sequence every run, so each digest is a
+    // constant and no stimulus file travels with the harness. The token env
+    // is a 4K-leg requirement only.
+    let (root, token_path, out) = if depth == 4096 {
+        let (root, token, out) = qualification_paths()?;
+        (root, Some(token), out)
+    } else {
+        let (root, out) = generated_leg_paths()?;
+        (root, None, out)
+    };
+    let (ids, stimulus_source, digest) = if depth == 4096 {
+        let token_path = token_path
+            .as_ref()
+            .ok_or_else(|| io::Error::other("4096 leg requires FLINT_QUAL_TOKENS"))?;
+        if !fs::metadata(token_path)?.is_file() {
+            return Err(io::Error::other("attribution input must be a regular file"));
+        }
+        let mut raw = Vec::new();
+        fs::File::open(token_path)?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut raw)?;
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        // Cross-check the hardcoded digest against the speed manifest when
+        // one is provided, so a transcription typo in the constant cannot pass
+        // silently: the constant and the manifest must name the same stimulus.
+        if let Some(manifest_path) = std::env::var_os("FLINT_QUAL_SPEED_MANIFEST") {
+            let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)
+                .map_err(|error| io::Error::other(format!("bad speed manifest: {error}")))?;
+            let recorded = manifest["input"]["sha256"]
+                .as_str()
+                .ok_or_else(|| io::Error::other("speed manifest lacks input.sha256"))?;
+            if recorded != "d72c7b49525c2c5fda9e60f6b6e5b1573a83c52199380524315d62a189185843" {
+                return Err(io::Error::other(
+                    "digest constant disagrees with the speed manifest",
+                ));
+            }
+        }
+        if digest != "d72c7b49525c2c5fda9e60f6b6e5b1573a83c52199380524315d62a189185843" {
+            return Err(io::Error::other(
+                "attribution requires the frozen 4097-ID speed stimulus",
+            ));
+        }
+        let ids: Vec<u32> = serde_json::from_slice(&raw)?;
+        if ids.len() != 4097 || ids.iter().any(|&id| id >= 150_144) {
+            return Err(io::Error::other("invalid frozen speed IDs"));
+        }
+        (ids, "frozen-speed-file", digest)
+    } else {
+        let ids = deterministic_stimulus(depth);
+        let raw = serde_json::to_vec(&ids)
+            .map_err(|error| io::Error::other(format!("stimulus encode: {error}")))?;
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        let pinned = match depth {
+            16384 => "e9b9b3bdb5f9e986d90102ad46179188342bf712290b6073d8b028b7b002ef58",
+            _ => "28729cec50cd5c029ae8ce25794973bbd1fc9f20cadf8fd44ab31354cc122e8b",
+        };
+        if digest != pinned {
+            return Err(io::Error::other(
+                "deterministic stimulus digest mismatch: the generator changed",
+            ));
+        }
+        (ids, "deterministic-arithmetic", digest)
+    };
     fs::create_dir(&out)?;
     let mut info = json!({"source_commit":git("HEAD")?,"source_tree":git("HEAD^{tree}")?,
         "model_revision":"3b93f9053b530488405ae9fca51d4900d6ce21f0","token_ids_sha256":digest,
-        "prefill_piece":512,"prefix_fed_untimed":4095,"requested_forwards":16,"start_position":4095,
-        "first_feed_id":ids[4095],"vocab":150144,"ignores_eos":true,"d1_coalescing":true,
+        "requested_depth":depth,"stimulus_source":stimulus_source,
+        "prefill_piece":512,"prefix_fed_untimed":depth-1,"requested_forwards":16,"start_position":depth-1,
+        "first_feed_id":ids[depth-1],"vocab":150144,"ignores_eos":true,"d1_coalescing":true,
         "forced_sync_per_class":true,"classes_sum_is_attribution_not_latency":true,
         "host_wall_profile_build_not_production_throughput":true,
         "layer_loop":"test-only replica of mlx_forward.rs at source_commit",
         "empty_sync_calibration":"8 evaluates of a resident sink tensor per step","completed":false});
-    let result = observe(&root, &out, &ids, &mut info);
+    let result = observe(&root, &out, &ids, &mut info, depth);
     info["completed"] = result.is_ok().into();
     if let Err(error) = &result {
         info["error"] = json!(error.to_string());
@@ -269,10 +318,10 @@ fn sixteen_step_class_attribution() -> io::Result<()> {
     result
 }
 
-fn prefix(model: &mut Model, state: &mut State, ids: &[u32]) -> io::Result<()> {
-    for start in (0usize..4096).step_by(512) {
+fn prefix(model: &mut Model, state: &mut State, ids: &[u32], depth: usize) -> io::Result<()> {
+    for start in (0usize..depth).step_by(512) {
         let begin = start.saturating_sub(1);
-        let end = (start + 512).min(4096) - 1;
+        let end = (start + 512).min(depth) - 1;
         if model
             .prefill_rows(state, &ids[begin..end], false)
             .map_err(err)?
@@ -281,21 +330,61 @@ fn prefix(model: &mut Model, state: &mut State, ids: &[u32]) -> io::Result<()> {
             return Err(io::Error::other("no-head prefix returned logits"));
         }
     }
-    if state.pos != 4095 {
+    if state.pos as usize != depth - 1 {
         return Err(io::Error::other("prefix position mismatch"));
     }
     Ok(())
 }
 
-fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value) -> io::Result<()> {
+/// The deeper-leg stimulus: one arithmetic sequence per depth, rebuilt every
+/// run, so the digest pinned in the test is the only state that travels.
+fn deterministic_stimulus(depth: usize) -> Vec<u32> {
+    (0..depth + 1)
+        .map(|i| ((i as u64 * 2654435761 + depth as u64) % 150144) as u32)
+        .collect()
+}
+
+/// Model and output paths for the generated-stimulus legs: the same checks
+/// qualification_paths applies, minus the token file the deep legs never read.
+fn generated_leg_paths() -> io::Result<(PathBuf, PathBuf)> {
+    use super::{env_path, scratch};
+    let root = env_path("FLINT_QUAL_MODEL")?.canonicalize()?;
+    let requested = env_path("FLINT_QUAL_OUTPUT")?;
+    if !requested.is_absolute() {
+        return Err(io::Error::other(
+            "qualification paths must use task scratch",
+        ));
+    }
+    let parent = requested
+        .parent()
+        .ok_or_else(|| io::Error::other("output parent missing"))?
+        .canonicalize()?;
+    let name = requested
+        .file_name()
+        .ok_or_else(|| io::Error::other("output name missing"))?
+        .to_owned();
+    let out = parent.join(name);
+    if !scratch(&parent) || out.starts_with(&root) {
+        return Err(io::Error::other("output must be scratch outside weights"));
+    }
+    Ok((root, out))
+}
+
+fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value, depth: usize) -> io::Result<()> {
     let _serial = crate::native_test_lock();
     let mut model = Model::open(root).map_err(err)?;
+    // The evaluate cadence the served decode uses, measured from the layer
+    // count and the chain group, not from a hand-copied number.
+    let layers = model.layers.len();
+    let group = crate::family::flint::mlx_forward::GROUP_LAYERS;
+    let chain_evaluates = layers / group + usize::from(layers % group != 0);
     {
         // Discard one full warm prefix+decode pass, like the sync profile.
         let mut warm = State::new();
-        prefix(&mut model, &mut warm, ids)?;
+        prefix(&mut model, &mut warm, ids, depth)?;
         let mut sampler = Sampler::greedy();
-        let mut pending = ids[4095];
+        let mut pending = ids[depth - 1];
+        let unsplit_started = Instant::now();
         for _ in 0..16 {
             let row = model
                 .step(&mut warm, pending, true)
@@ -303,11 +392,13 @@ fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value) -> io::Result
                 .ok_or_else(|| io::Error::other("warm step returned no logits"))?;
             pending = sampler.sample(&row).map_err(err)?;
         }
+        info["unsplit_warm_ms_per_step"] =
+            json!(unsplit_started.elapsed().as_secs_f64() * 1000.0 / 16.0);
     }
     let mut state = State::new();
-    prefix(&mut model, &mut state, ids)?;
+    prefix(&mut model, &mut state, ids, depth)?;
     let mut sampler = Sampler::greedy();
-    let mut pending = ids[4095];
+    let mut pending = ids[depth - 1];
     let mut classes = Classes::default();
     let mut empty_sync_nanos = 0u64;
     let mut empty_sync_count = 0u32;
@@ -495,6 +586,18 @@ fn observe(root: &Path, out: &Path, ids: &[u32], info: &mut Value) -> io::Result
         "sum_ms_per_step_minus_empty_sync": total_net_ms,
         "empty_sync_mean_ns": empty_mean_ns,
         "pipelined_reference_ms_per_step": 67.5,
+        "unsplit_warm_ms_per_step": info["unsplit_warm_ms_per_step"].clone(),
+        "evaluates_per_token": {
+            "async_chain": crate::family::flint::mlx_forward::async_chain_flagged(),
+            "layer_chain_evaluates": chain_evaluates,
+            "readback": 1,
+            "source": "mlx_forward GROUP_LAYERS chains plus the health readback",
+        },
+        "fence_vs_latency": {
+            "class_sum_ms_per_step": total_raw_ms,
+            "unsplit_warm_ms_per_step": info["unsplit_warm_ms_per_step"].clone(),
+            "note": "the class sum syncs at every class boundary; the warm pass does not",
+        },
         "note": "class sums are forced-sync attribution, not latency",
     });
     fs::write(

@@ -10,10 +10,12 @@
 //! process is refused.
 
 use super::super::settings::{
-    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, tokenizer_pin,
+    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, WeightFormat, tokenizer_pin,
+    weight_format_name,
 };
 use super::{
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
+    exl3_load::load_exl3_dir,
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
@@ -28,11 +30,12 @@ use crate::{
     EngError,
     family::{
         QWEN3_6_35B_A3B,
-        gguf_model::{Inventory, open_qwen3_6_35b_a3b},
+        gguf_model::{GgufModel, Inventory, open_qwen3_6_35b_a3b},
         project::cuda::{CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout},
         qwen36::host::HostShape,
         session::DecodeSession,
     },
+    kernels::cuda::resident::exl3::SingleRow,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::TokenizerBundle,
 };
@@ -69,6 +72,8 @@ impl PrefixMemory {
 
 struct RuntimeModes {
     chunked: bool,
+    /// `Q36_CUDA_CHUNK_PREFILL=0` was given: the rollback of the chunk path at every KV storage.
+    chunk_off: bool,
     chunk_rows: u32,
     context_staging: bool,
     fixed_admission: bool,
@@ -279,6 +284,19 @@ fn chunk_prefill_rows(value: Option<&std::ffi::OsStr>) -> Result<u32, EngError> 
 
 fn chunk_prefill_wanted(kv: KvDtype, value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
     prefill_flag(CHUNK_PREFILL_VAR, matches!(kv, KvDtype::Q8), value)
+}
+
+/// Whether `Q36_CUDA_CHUNK_PREFILL=0` was given. The flag's default depends on the KV storage, but an
+/// explicit 0 is the rollback of the chunk path at every storage (the value was validated by
+/// `chunk_prefill_wanted`).
+fn chunk_rollback_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "0")
+}
+
+/// Whether the prefill arena is admitted. The FP16 storage chunks by default through the arena, so
+/// the rollback must keep it from being admitted; Int8G32 consults the flag itself.
+fn arena_wanted(kv: KvMode, chunk_off: bool) -> bool {
+    !(kv == KvMode::Fp16 && chunk_off)
 }
 
 fn context_staging_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
@@ -550,11 +568,8 @@ pub(super) fn check_tiered_start(settings: &Q36Settings) -> Result<(), EngError>
 /// the Tiled layout is a typed refusal here (the plan refuses it again, `check_layout_rows`).
 pub(super) fn kv_mode_of(kv: KvDtype, layout: WeightLayout) -> Result<KvMode, EngError> {
     match (kv, layout) {
-        (_, WeightLayout::Exl3) => Err(EngError::BadRequest(
-            "engine config: EXL3 serving is not admitted".into(),
-        )),
         (KvDtype::F32, _) => Ok(KvMode::Fp16),
-        (KvDtype::Q8, WeightLayout::Native) => Ok(KvMode::Int8G32),
+        (KvDtype::Q8, WeightLayout::Native | WeightLayout::Exl3) => Ok(KvMode::Int8G32),
         (KvDtype::Q8, WeightLayout::Tiled) => Err(EngError::BadRequest(
             "engine config: kv_dtype q8 builds the Int8G32 KV mode, which takes the native \
              layout; Tiled is the fp16 control path"
@@ -653,6 +668,14 @@ pub(super) fn load_options(kv_cache: u64, fixed_admission: bool) -> LoadOptions<
     }
 }
 
+/// The pinned GGUF of the artifact directory, checked and opened, with its path.
+fn open_gguf(artifact: &Path, verify: bool) -> Result<(GgufModel, PathBuf), EngError> {
+    let gguf = pinned_gguf(artifact);
+    check_gguf_identity(&gguf, verify)?;
+    let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+    Ok((model, gguf))
+}
+
 /// Loads and pins the tokenizer, builds the rules from the SAME loaded bundle BEFORE any device
 /// work (a missing tokenizer file fails in seconds, not after a 20 GB upload), takes the
 /// one-engine guard, and starts the engine thread. The state is `Loading` until `make` returns;
@@ -667,6 +690,7 @@ pub(crate) fn start(
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
+    let chunk_off = chunk_rollback_requested(std::env::var_os(CHUNK_PREFILL_VAR).as_deref());
     let chunk_rows = if chunked {
         chunk_prefill_rows(std::env::var_os(CHUNK_ROWS_VAR).as_deref())?
     } else {
@@ -704,6 +728,7 @@ pub(crate) fn start(
     }
     let modes = RuntimeModes {
         chunked,
+        chunk_off,
         chunk_rows,
         context_staging,
         fixed_admission,
@@ -756,18 +781,35 @@ fn make(
     let fixed_admission = plan.modes.fixed_admission;
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
-    let gguf = pinned_gguf(&settings.artifact);
-    check_gguf_identity(&gguf, verify)?;
-    let model = open_qwen3_6_35b_a3b(&gguf, None)?;
+    let gguf = match settings.weights {
+        WeightFormat::Gguf => Some(open_gguf(&settings.artifact, verify)?),
+        WeightFormat::Exl3 => None,
+    };
     let tiered = tiered_plan_of(&settings);
     // A tiered load leaves the routed expert stacks in the file: the banks hold the hot ones.
-    let device = match tiered {
-        None => {
+    let device = match (&gguf, tiered) {
+        (None, _) => {
+            let reserve = load_options(kv_cache, fixed_admission).reserve;
+            let began = Instant::now();
+            // A served EXL3 pack runs its projections on the wide kernel unless the operator names
+            // another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); bit-identical output.
             projector
-                .load_model(&model, load_options(kv_cache, fixed_admission))?
+                .context()
+                .set_single_row_default(SingleRow::Wide(1));
+            let device = load_exl3_dir(&projector, &settings.artifact, reserve)?;
+            eprintln!(
+                "q36 cuda: EXL3 weights loaded from {} in {:.1} s",
+                settings.artifact.display(),
+                began.elapsed().as_secs_f64()
+            );
+            device
+        }
+        (Some((model, _)), None) => {
+            projector
+                .load_model(model, load_options(kv_cache, fixed_admission))?
                 .device
         }
-        Some(_) => {
+        (Some((model, _)), Some(_)) => {
             let names = model.plan().device_names();
             let names = names_without_experts(&names);
             projector.load(
@@ -828,6 +870,7 @@ fn make(
         // not a serving feature.
         section_marks: false,
     })?;
+    step.set_speculation(&settings.speculation)?;
     // Q8 chunking defaults on at 1024 rows; overrides use the supported row ladder.
     // Other sessions keep DEFAULT_CUDA_PREFILL_CHUNK; MLX `prefill_chunk` is ignored.
     let kv8_chunked = modes.chunked && kv_mode == KvMode::Int8G32;
@@ -873,31 +916,38 @@ fn make(
                 bytes_per_token: 0,
             });
         }
-        let device_free = after
-            .free
-            .saturating_sub(prefill_headroom(modes.fixed_admission));
-        let verdict = step.admit_prefill(
-            PrefillBudget {
-                device_free,
-                extras,
-            },
-            modes.context_staging,
-            modes.fixed_admission,
-            modes.wide_stage,
-        )?;
-        let line = if kv_mode == KvMode::Int8G32 {
-            kv8_prefill_start_line(&verdict)
+        if arena_wanted(kv_mode, modes.chunk_off) {
+            let device_free = after
+                .free
+                .saturating_sub(prefill_headroom(modes.fixed_admission));
+            let verdict = step.admit_prefill(
+                PrefillBudget {
+                    device_free,
+                    extras,
+                },
+                modes.context_staging,
+                modes.fixed_admission,
+                modes.wide_stage,
+            )?;
+            let line = if kv_mode == KvMode::Int8G32 {
+                kv8_prefill_start_line(&verdict)
+            } else {
+                prefill_start_line(&verdict)
+            };
+            eprintln!("{line}");
         } else {
-            prefill_start_line(&verdict)
-        };
-        eprintln!("{line}");
+            eprintln!("q36 cuda: prefill chunk off (Q36_CUDA_CHUNK_PREFILL=0): one token per step");
+        }
     }
     if let Some(plan) = tiered {
         // The banks come last: they take what the weights, the KV cache and the step state left.
+        let (model, gguf) = gguf.as_ref().ok_or_else(|| {
+            EngError::BadRequest("engine config: tiered experts read the GGUF file".into())
+        })?;
         attach_tiered_parts(
             &mut step,
             projector.context(),
-            ((model.weights.header(), &gguf), &res.dims),
+            ((model.weights.header(), gguf), &res.dims),
             &plan,
         )?;
         eprintln!(
@@ -906,8 +956,9 @@ fn make(
         );
     }
     eprintln!(
-        "q36 cuda: weights resident ({} B), free after load {} B, context_limit {}, kv {}, \
-         capture {}",
+        "q36 cuda: {} weights resident ({} B), free after load {} B, context_limit {}, kv {}, \
+         capture {}{}",
+        weight_format_name(settings.weights),
         before.free.saturating_sub(after.free),
         after.free,
         options.context_tokens,
@@ -915,7 +966,8 @@ fn make(
             KvMode::Fp16 => "fp16",
             KvMode::Int8G32 => "int8g32",
         },
-        if settings.capture { "on" } else { "off" }
+        if settings.capture { "on" } else { "off" },
+        projector.context().single_gather_suffix()
     );
     Ok((step, DecodeSession::default()))
 }
@@ -1114,6 +1166,29 @@ mod chunk_prefill_flag_tests {
     }
 
     #[test]
+    fn the_rollback_flag_reaches_the_arena_decision_at_fp16() {
+        use super::{arena_wanted, chunk_rollback_requested};
+        use crate::family::qwen36::cuda::dims::KvMode;
+        assert!(!chunk_rollback_requested(None));
+        assert!(!chunk_rollback_requested(Some(OsStr::new("1"))));
+        assert!(chunk_rollback_requested(Some(OsStr::new("0"))));
+        // FP16 chunks through the arena unless the flag is 0; Int8G32 consults the flag itself.
+        assert!(arena_wanted(KvMode::Fp16, chunk_rollback_requested(None)));
+        assert!(arena_wanted(
+            KvMode::Fp16,
+            chunk_rollback_requested(Some(OsStr::new("1")))
+        ));
+        assert!(!arena_wanted(
+            KvMode::Fp16,
+            chunk_rollback_requested(Some(OsStr::new("0")))
+        ));
+        assert!(arena_wanted(
+            KvMode::Int8G32,
+            chunk_rollback_requested(Some(OsStr::new("0")))
+        ));
+    }
+
+    #[test]
     fn fp16_default_is_unchanged() {
         assert!(!chunk_prefill_wanted(KvDtype::F32, None).unwrap());
         assert!(!chunk_prefill_wanted(KvDtype::F32, Some(OsStr::new("0"))).unwrap());
@@ -1182,6 +1257,7 @@ mod paged_start_tests {
     fn modes(chunked: bool) -> RuntimeModes {
         RuntimeModes {
             chunked,
+            chunk_off: false,
             chunk_rows: 512,
             context_staging: false,
             fixed_admission: false,

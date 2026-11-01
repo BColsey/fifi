@@ -1,4 +1,5 @@
 use super::*;
+use crate::family::flint::settings::kv_device_f16_selected;
 use crate::family::flint::{
     config::FULL_LAYERS,
     cuda_ffn::device::runtime::{test_commit_ends, test_counts, test_head_ranges, test_head_reads},
@@ -8,6 +9,8 @@ use crate::kernels::cuda::DeviceBuffer;
 use sha2::{Digest, Sha256};
 use std::{ops::Range, path::PathBuf};
 
+#[path = "cuda_executor_tests/layer_major.rs"]
+mod layer_major;
 #[path = "cuda_executor_tests/prefill_controls.rs"]
 mod prefill_controls;
 
@@ -42,6 +45,58 @@ fn pinned_late_health_arm() -> bool {
     }
 }
 
+/// The token-health ring arm these probes run under. Their scalar-read and observation budgets
+/// count the per-frame attention checks the ring replaces on single-row calls, so they belong to
+/// the ring-off arm: the session's state must hold no ring, whatever spelling of off the runner
+/// pinned `FIFI_FLINT_TOKEN_HEALTH` to, now that the ring is on by default.
+fn require_token_health_off(state: &State) {
+    assert!(
+        !state.test_token_health_armed(),
+        "GPU runner must turn the token-health ring off (FIFI_FLINT_TOKEN_HEALTH=0)"
+    );
+}
+
+/// The alloc-cache arm this process runs under, for the legacy allocation golden:
+/// with the cache on, decode scratch is served from the cache and the request
+/// counts the golden asserts never reach the driver path, so that leg must pin 0.
+fn pinned_alloc_cache_arm() -> bool {
+    match std::env::var("FIFI_FLINT_CUDA_ALLOC_CACHE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        other => panic!("GPU runner must pin FIFI_FLINT_CUDA_ALLOC_CACHE=0/1, got {other:?}"),
+    }
+}
+
+/// The kv_device_f16 arm this process runs under. The environment decides it and
+/// the session's guard word must agree, so the budgets below belong to the arm
+/// that actually ran.
+fn pinned_kv_device_f16_arm(state: &State) -> bool {
+    let selected =
+        kv_device_f16_selected(std::env::var_os("FIFI_FLINT_CUDA_KV_DEVICE_F16").as_deref());
+    assert_eq!(
+        state.test_kv_guard_armed(),
+        selected,
+        "the session's guard word must follow FIFI_FLINT_CUDA_KV_DEVICE_F16"
+    );
+    selected
+}
+
+/// Ranged D2H reads of exactly `bytes` among the served reads. The host guard
+/// reads each layer's new K and V rows whole, rows * 2,048 B apiece.
+fn d2h_reads_in(reads: &std::collections::BTreeMap<usize, usize>, bytes: usize) -> usize {
+    reads.get(&bytes).copied().unwrap_or(0)
+}
+
+fn d2h_reads(ctx: &CudaContext, bytes: usize) -> usize {
+    d2h_reads_in(&ctx.buffer_requests().ranged_d2h, bytes)
+}
+
+/// Source-row reads of `computes` computes: K and V in each of the 49 layers on
+/// the host guard path, none once the device guard is armed.
+fn kv_row_reads(armed: bool, computes: usize) -> usize {
+    if armed { 0 } else { 2 * 49 * computes }
+}
+
 fn fixture_work_reserve(
     serial: &KvPlan,
     batch: &KvPlan,
@@ -65,6 +120,86 @@ fn fixture_work_reserve(
     }
 }
 
+#[test]
+fn layer_major_staging_bytes_table_and_overflow() {
+    // Six routed planes, two faces, WIDTH 2048, f32: 96 KiB per row.
+    let row: u64 = 6 * 2 * 2048 * 4;
+    for rows in [8_usize, 64, 4096, 65_536] {
+        assert_eq!(
+            State::layer_major_staging_bytes(rows),
+            Some(row * rows as u64),
+            "rows {rows}"
+        );
+    }
+    assert_eq!(State::layer_major_staging_bytes(8), Some(786_432));
+    assert_eq!(State::layer_major_staging_bytes(4096), Some(402_653_184));
+    // A piece of usize::MAX rows must refuse, not wrap.
+    assert_eq!(State::layer_major_staging_bytes(usize::MAX), None);
+}
+
+#[test]
+fn layer_major_admission_admits_at_the_ceiling_and_names_the_overage() {
+    let ceiling: u64 = 1 << 30;
+    let (kv, work, staging, headroom) = (300_u64 << 20, 200 << 20, 236 << 20, 288 << 20);
+    // Exactly the ceiling admits.
+    layer_major_admission(
+        "FIFI_EXL3_LAYER_MAJOR=jobs",
+        kv,
+        work,
+        staging,
+        headroom,
+        ceiling,
+    )
+    .unwrap();
+    // One MiB over refuses with every figure and the remedy spelled out.
+    let error = layer_major_admission(
+        "FIFI_EXL3_LAYER_MAJOR=jobs",
+        kv + (1 << 20),
+        work,
+        staging,
+        headroom,
+        ceiling,
+    )
+    .expect_err("one MiB over the ceiling");
+    let text = format!("{error:?}");
+    for needle in [
+        "FIFI_EXL3_LAYER_MAJOR=jobs needs 1025 MiB",
+        "1025 MiB",
+        "kv 301",
+        "work 200",
+        "staging 236",
+        "headroom 288",
+        "1024 MiB ceiling by 1048576 B",
+        "65K->32K",
+        "unset it",
+    ] {
+        assert!(
+            text.contains(needle),
+            "refusal text lacks {needle:?}: {text}"
+        );
+    }
+    // One byte over refuses too, and the message still shows the overage the
+    // truncated MiB figures hide.
+    let error = layer_major_admission(
+        "FIFI_EXL3_LAYER_MAJOR=1",
+        kv,
+        work,
+        staging + 1,
+        headroom,
+        ceiling,
+    )
+    .expect_err("one byte over the ceiling");
+    let text = format!("{error:?}");
+    for needle in ["needs 1024 MiB", "1024 MiB ceiling by 1 B"] {
+        assert!(
+            text.contains(needle),
+            "refusal text lacks {needle:?}: {text}"
+        );
+    }
+    // Overflowing any term refuses instead of wrapping.
+    assert!(layer_major_admission("FIFI_EXL3_LAYER_MAJOR=1", u64::MAX, 1, 1, 1, u64::MAX).is_err());
+}
+
 fn real_executor_at_context(
     context: usize,
     production_b8: bool,
@@ -83,7 +218,10 @@ fn real_executor_at_context(
         matches!(arm.as_str(), "0" | "1"),
         "explicit cache0/cache1 test arm"
     );
-    let (executor, initial) = FlintExecutor::open(&root, &options, vec![2], VOCAB).unwrap();
+    // [0u8; 32] is a fixture template identity: parks only need
+    // consistency within a test.
+    let (executor, initial) =
+        FlintExecutor::open(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
     assert_eq!(executor.ctx.alloc_cache_enabled(), arm == "1");
     assert_eq!(executor.prefill_chunk_size, 8);
     drop(initial);
@@ -565,14 +703,40 @@ fn decode_fingerprint(
         .unwrap()
 }
 
+/// SHA-256 of the `SHA256SUMS` file of the EXL3 pack the allocation golden was taken on.
+const ALLOC_GOLDEN_PACK_SUMS: &str =
+    "2c9b4f0cdda3a24be7bb35c5cad3a9f4afe0fc387d963dc1e27367e56dd1e80f";
+
+fn pack_is_the_allocation_golden_pack() -> bool {
+    let root = PathBuf::from(std::env::var_os("FLINT_EXL3_PACK").expect("opt-in real EXL3 pack"));
+    let sums = std::fs::read(root.join("SHA256SUMS"))
+        .expect("SHA256SUMS missing or unreadable in the FLINT_EXL3_PACK directory");
+    format!("{:x}", Sha256::digest(&sums)) == ALLOC_GOLDEN_PACK_SUMS
+}
+
 #[test]
-#[ignore = "requires admitted CUDA and full EXL3 pack; allocation and independent bitwise golden gate"]
+#[ignore = "requires admitted CUDA and full EXL3 pack; allocation and bitwise golden gate"]
 fn decode_reuses_large_scratch_on_real_dispatch() {
+    if !pack_is_the_allocation_golden_pack() {
+        eprintln!(
+            "SKIPPED: FLINT_EXL3_PACK is not the pack of the allocation golden \
+             (SHA256SUMS differs from {ALLOC_GOLDEN_PACK_SUMS}); nothing was checked"
+        );
+        return;
+    }
     assert!(
         !pinned_late_health_arm(),
         "legacy allocation golden requires FIFI_FLINT_LATE_HEALTH=0"
     );
+    assert!(
+        !pinned_alloc_cache_arm(),
+        "legacy allocation golden requires FIFI_FLINT_CUDA_ALLOC_CACHE=0: with the \
+         cache on the decode scratch is served from it and the asserted request \
+         counts (private==49) no longer describe the driver path"
+    );
     let (mut executor, mut serial, _batch) = real_executor();
+    require_token_health_off(&serial.state);
+    let armed = pinned_kv_device_f16_arm(&serial.state);
     let observer = executor.ctx.buffer_requests();
     let sentinel = executor.ctx.allocate(31).unwrap();
     assert_eq!(
@@ -660,7 +824,7 @@ fn decode_reuses_large_scratch_on_real_dispatch() {
     println!(
         "successful write_at-only H2D requests={h2d_calls}, bytes={h2d_bytes} (excludes ctx.upload and other copy paths)"
     );
-    // Keep the independent receipt ahead of the allocation gate, including on failure.
+    // Keep the receipt print ahead of the allocation gate, including on failure.
     let mut ids = vec![next];
     let mut heads = vec![head_hash];
     for _ in 1..16 {
@@ -685,17 +849,22 @@ fn decode_reuses_large_scratch_on_real_dispatch() {
         "logits_sha256": heads, "layer_major_k_v_f16_sha256": format!("{:x}", kv.finalize()),
     });
     println!("ALLOC_REUSE_GOLDEN={golden}");
-    // Frozen from independently qualified b275, never regenerated from this candidate.
+    // Taken on the pack named by `ALLOC_GOLDEN_PACK_SUMS`. The first receipt of this file never
+    // reproduced on that pack, so it was retaken; change it only with a named cause.
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("cuda_executor_alloc_golden.json")).unwrap();
-    assert_eq!(
-        golden, expected,
-        "entire independent allocation baseline receipt"
-    );
+    assert_eq!(golden, expected, "entire allocation baseline receipt");
+    // Host guard: 98 KV writes of 1,024 B and one 32-B sampler write. Armed: the
+    // device writes the KV rows, and the only added write is the 4-byte word clear.
     assert_eq!(
         (h2d_calls, h2d_bytes),
-        (99, 100_384),
-        "unchanged ranged KV/sampler writes"
+        if armed { (2, 36) } else { (99, 100_384) },
+        "ranged KV/sampler writes"
+    );
+    assert_eq!(
+        d2h_reads_in(&after.ranged_d2h, 2048) - d2h_reads_in(&before.ranged_d2h, 2048),
+        kv_row_reads(armed, 1),
+        "K/V source-row reads of the measured decode"
     );
     // The 49 per-layer EXL3 projection arenas remain transient; State scratch must not be.
     assert_eq!(
@@ -951,6 +1120,8 @@ fn cache_single_state(
         &options,
         bundle.eos_token_ids().to_vec(),
         bundle.vocab_size() as usize,
+        // Fixture template identity (parks need per-test consistency).
+        [0u8; 32],
     )
     .unwrap();
     assert_eq!(executor.ctx.alloc_cache_enabled(), expected);
@@ -1103,7 +1274,7 @@ fn context_2048_same_pack_bitwise_golden() {
         .unwrap();
         // Sequential opens charge the actual production plan and keep only one State live.
         let (mut executor, mut session) =
-            FlintExecutor::open(&root, &options, vec![2], VOCAB).unwrap();
+            FlintExecutor::open(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
         assert_eq!(session.state.test_late_health_enabled(), late_health);
         let before = test_counts();
         let heads = test_head_reads();
@@ -1186,11 +1357,14 @@ fn late_health_attention_status_budget_and_bitwise_probe() {
         other => panic!("explicit late-health 0/1 test arm required, got {other:?}"),
     };
     let (executor, mut session, spare) = real_executor_at_context(CONTEXT, true);
+    require_token_health_off(&session.state);
+    let armed = pinned_kv_device_f16_arm(&session.state);
     let decoder = executor.decoder().unwrap();
     let tokens = fixture_tokens(4);
     let mut digest = Sha256::new();
     let mut head_probe_ids = Vec::new();
     let before = executor.ctx.scalar_read_requests();
+    let row_reads_before = d2h_reads(&executor.ctx, 2048);
     let bulk_before = test_health_observations();
     for &token in &tokens {
         let next = decoder
@@ -1209,7 +1383,9 @@ fn late_health_attention_status_budget_and_bitwise_probe() {
         head_probe_ids.push(next);
     }
     let reads = executor.ctx.scalar_read_requests() - before;
-    let expected_per_step = if enabled { 103 } else { 1132 };
+    // The armed token gate adds one 4-byte read per compute.
+    let expected_per_step = if enabled { 103 } else { 1132 } + usize::from(armed);
+    let row_reads = d2h_reads(&executor.ctx, 2048) - row_reads_before;
     let bulk = test_health_observations() - bulk_before;
     assert_eq!(session.state.fed(), tokens.len());
     assert!(!session.state.test_poisoned());
@@ -1225,6 +1401,7 @@ fn late_health_attention_status_budget_and_bitwise_probe() {
         "LATE_HEALTH_PROBE {}",
         serde_json::json!({
             "enabled": enabled, "alloc_cache_enabled": executor.ctx.alloc_cache_enabled(),
+            "kv_device_f16": armed, "kv_row_reads": row_reads,
             "steps": tokens.len(), "scalar_reads": reads,
             "expected_scalar_reads_per_step": expected_per_step,
             "head_bits_sha256": format!("{:x}", digest.finalize()),
@@ -1242,6 +1419,11 @@ fn late_health_attention_status_budget_and_bitwise_probe() {
         tokens.len() * expected_per_step,
         "late mode must replace attention's 1029 scalar reads by 49 typed bulk observations"
     );
+    assert_eq!(
+        row_reads,
+        kv_row_reads(armed, tokens.len()),
+        "armed device guard must issue no 2,048-B K/V source-row reads"
+    );
 }
 
 #[test]
@@ -1254,9 +1436,13 @@ fn late_health_b8_commits_and_head_bitwise_probe() {
         other => panic!("explicit late-health 0/1 test arm required, got {other:?}"),
     };
     let (executor, spare, mut session) = real_executor_at_context(CONTEXT, true);
+    require_token_health_off(&session.state);
+    let armed = pinned_kv_device_f16_arm(&session.state);
     let decoder = executor.decoder().unwrap();
     let tokens = fixture_tokens(9);
     let before_scalar = executor.ctx.scalar_read_requests();
+    let chunk_reads_before = d2h_reads(&executor.ctx, 8 * 2048);
+    let step_reads_before = d2h_reads(&executor.ctx, 2048);
     let before_bulk = test_health_observations();
     let before_counts = test_counts();
     let before_ends = test_commit_ends().len();
@@ -1268,9 +1454,10 @@ fn late_health_b8_commits_and_head_bitwise_probe() {
         test_health_observations() - before_bulk,
         if enabled { 49 } else { 0 }
     );
+    // The armed token gate adds one 4-byte read per compute.
     assert_eq!(
         executor.ctx.scalar_read_requests() - before_scalar,
-        if enabled { 99 } else { 1128 }
+        if enabled { 99 } else { 1128 } + usize::from(armed)
     );
     let head = decoder
         .step(&mut session.state, tokens[8], |_, logits| {
@@ -1297,13 +1484,24 @@ fn late_health_b8_commits_and_head_bitwise_probe() {
     );
     let scalar = executor.ctx.scalar_read_requests() - before_scalar;
     let bulk = test_health_observations() - before_bulk;
-    assert_eq!(scalar, if enabled { 202 } else { 2260 });
+    assert_eq!(
+        scalar,
+        if enabled { 202 } else { 2260 } + 2 * usize::from(armed)
+    );
     assert_eq!(bulk, if enabled { 98 } else { 0 });
+    let chunk_reads = d2h_reads(&executor.ctx, 8 * 2048) - chunk_reads_before;
+    let step_reads = d2h_reads(&executor.ctx, 2048) - step_reads_before;
+    assert_eq!(
+        (chunk_reads, step_reads),
+        (kv_row_reads(armed, 1), kv_row_reads(armed, 1)),
+        "armed device guard must issue no K/V source-row reads for the 8-row chunk or the step"
+    );
     executor.stream.synchronize().unwrap();
     println!(
         "LATE_HEALTH_B8_PROBE {}",
         serde_json::json!({
             "enabled": enabled, "alloc_cache_enabled": executor.ctx.alloc_cache_enabled(),
+            "kv_device_f16": armed, "kv_row_reads": [chunk_reads, step_reads],
             "control": "same-binary OFF; not a pre-feature receipt", "prefill_rows": 8,
             "fed": session.state.fed(), "head_bits_sha256": head,
             "commit_ends": ends, "counts": counts, "head_reads": test_head_reads() - before_heads,
@@ -1332,6 +1530,8 @@ fn late_health_b8_ring_wrap_commits_and_head_bitwise_probe() {
         "explicit cache0/cache1 ring-wrap arm required"
     );
     let (executor, spare, mut session) = real_executor_at_context(2048, true);
+    require_token_health_off(&session.state);
+    let armed = pinned_kv_device_f16_arm(&session.state);
     assert_eq!(session.state.test_kv().len(), 49);
     let ring_rows = session.state.test_kv()[2].keys.bytes() / ROW_BYTES;
     assert_eq!(ring_rows, 520);
@@ -1346,6 +1546,8 @@ fn late_health_b8_ring_wrap_commits_and_head_bitwise_probe() {
     let tokens = fixture_tokens(bulk_rows + 1);
     let decoder = executor.decoder().unwrap();
     let before_scalar = executor.ctx.scalar_read_requests();
+    let chunk_reads_before = d2h_reads(&executor.ctx, 8 * 2048);
+    let step_reads_before = d2h_reads(&executor.ctx, 2048);
     let before_bulk = test_health_observations();
     let before_counts = test_counts();
     let before_ends = test_commit_ends().len();
@@ -1390,20 +1592,28 @@ fn late_health_b8_ring_wrap_commits_and_head_bitwise_probe() {
     );
     let scalar = executor.ctx.scalar_read_requests() - before_scalar;
     let bulk = test_health_observations() - before_bulk;
+    // The armed token gate adds one 4-byte read per compute: the chunks and the step.
     assert_eq!(
         scalar,
         if enabled {
             99 * (groups - 1) + 103
         } else {
             1128 * (groups - 1) + 1132
-        }
+        } + usize::from(armed) * groups
     );
     assert_eq!(bulk, if enabled { 49 * groups } else { 0 });
+    let chunk_reads = d2h_reads(&executor.ctx, 8 * 2048) - chunk_reads_before;
+    let step_reads = d2h_reads(&executor.ctx, 2048) - step_reads_before;
+    assert_eq!(
+        (chunk_reads, step_reads),
+        (kv_row_reads(armed, groups - 1), kv_row_reads(armed, 1)),
+        "armed device guard must issue no K/V source-row reads across the ring wrap"
+    );
     executor.stream.synchronize().unwrap();
     println!(
         "LATE_HEALTH_B8_RING_WRAP_PROBE {}",
         serde_json::json!({
-            "case": "B8 ring-wrap", "enabled": enabled,
+            "case": "B8 ring-wrap", "enabled": enabled, "kv_device_f16": armed,
             "alloc_cache_enabled": executor.ctx.alloc_cache_enabled(),
             "control": "same-binary OFF; not a pre-feature receipt",
             "context_limit": 2048, "prefill_chunk_size": 8, "kv_profile": "f16",
@@ -1525,6 +1735,7 @@ fn exercise_health_checkpoint(
 #[ignore = "requires admitted GPU and real EXL3 weights; pair late-health0/1 cacheOFF"]
 fn late_health_all_checkpoints_refuse_before_output_and_reset_bitwise() {
     let (executor, mut session, spare) = real_executor_at_context(CONTEXT, true);
+    require_token_health_off(&session.state);
     assert!(!executor.ctx.alloc_cache_enabled());
     let token = fixture_tokens(1)[0];
     let pristine = executor
@@ -1755,7 +1966,11 @@ fn control_q8_interim_prompt_generation() {
         std::env::var("INFERENCE_CUDA_REQUIRE_DEVICE").as_deref(),
         Ok("1")
     );
-    assert!(std::env::var_os("FIFI_FLINT_CUDA_EXPERT_CACHE").is_none());
+    assert_eq!(
+        std::env::var("FIFI_FLINT_CUDA_EXPERT_CACHE").as_deref(),
+        Ok("0"),
+        "the resident load is the arm: the unset default may bank"
+    );
     assert!(pinned_late_health_arm(), "late-health must be ON");
     let seal = fs::read(std::env::var_os("FLINT_INTERIM_INPUT_SEAL").unwrap()).unwrap();
     let seal_sha = format!("{:x}", Sha256::digest(&seal));
@@ -1814,6 +2029,8 @@ fn control_q8_interim_prompt_generation() {
         &options,
         bundle.eos_token_ids().to_vec(),
         bundle.vocab_size() as usize,
+        // Fixture template identity (parks need per-test consistency).
+        [0u8; 32],
     )
     .unwrap();
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
@@ -1862,8 +2079,13 @@ fn control_q8_interim_prompt_generation() {
         "case": selected, "kv_profile": profile, "input_seal_sha256": seal_sha,
         "prompt_sha256": case["raw_prompt"]["sha256"], "input_ids_sha256": case["prompt_ids"]["sha256"],
         "runtime_prompt_ids_count": ids.len(), "context_limit": 4096, "max_new_tokens": 256,
-        "prefill_chunk_size": 8, "sampler": "greedy", "alloc_cache_enabled": true, "expert_cache": "UNSET",
+        "prefill_chunk_size": 8, "sampler": "greedy", "alloc_cache_enabled": true, "expert_cache": "0",
         "late_health_enabled": session.state.test_late_health_enabled(),
+        "q8_tiled_armed": crate::family::flint::settings::q8_tiled_armed(),
+        "q8_tiled_resolved": crate::family::flint::settings::resolved_q8_tiled(
+            &profile,
+            crate::family::flint::settings::q8_tiled_armed,
+        ),
         "started_utc_unix_ms": started_utc_unix_ms, "decode_started_utc_unix_ms": decode_started_utc_unix_ms,
         "ended_utc_unix_ms": ended_utc_unix_ms, "load_ms": load_ms, "prefill_ms": prefill_ms,
         "decode_ms": decode_ms, "batches": batches, "ids": emitted, "emitted_length": emitted.len(),

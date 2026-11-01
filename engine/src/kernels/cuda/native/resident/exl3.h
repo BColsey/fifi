@@ -55,12 +55,18 @@ typedef struct inference_cuda_exl3_linear_args {
     uint32_t *flag; size_t flag_bytes;
     size_t rows; size_t k; size_t n;
     int bits_twice; int book;
+    /* Producer-fusion arm: 0 stores f32 as before; 1 stores the bf16 roundtrip
+     * (the same value the separate publish kernel writes) in the final
+     * output_rotate, so the caller can skip that publish kernel. */
+    uint32_t fused_publish;
 } inference_cuda_exl3_linear_args;
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_exl3_linear_args) == 176 &&
+static_assert(sizeof(inference_cuda_exl3_linear_args) == 184 &&
               offsetof(inference_cuda_exl3_linear_args, flag) == 128 &&
               offsetof(inference_cuda_exl3_linear_args, rows) == 144 &&
-              offsetof(inference_cuda_exl3_linear_args, book) == 172, "EXL3 linear ABI");
+              offsetof(inference_cuda_exl3_linear_args, book) == 172 &&
+              offsetof(inference_cuda_exl3_linear_args, fused_publish) == 176,
+              "EXL3 linear ABI");
 #endif
 /* Legacy entrypoint selects split_k=2; the argument layout is unchanged. */
 int inference_cuda_exl3_linear(const inference_cuda_exl3_linear_args *args,
@@ -85,6 +91,45 @@ int inference_cuda_exl3_grouped(const inference_cuda_exl3_linear_args *calls,
  * which stays untouched). */
 int inference_cuda_exl3_grouped_gathered(const inference_cuda_exl3_linear_args *calls,
                                          size_t count, void *stream, int *out_stage);
+/* Same contract as inference_cuda_exl3_grouped_gathered; each block covers `cols` (1, 2, 4 or 8)
+ * adjacent 16-column tiles of n, so n must be a multiple of 16 * cols. Accumulation order, decode
+ * and reduction match the gather entry, so every written byte is identical. Any other `cols`
+ * or an n that is not a multiple is INVALID_ARGUMENT. */
+int inference_cuda_exl3_grouped_wide(const inference_cuda_exl3_linear_args *calls,
+                                     size_t count, void *stream, int *out_stage,
+                                     unsigned cols);
+/* Id-indexed grouped projection (the routed experts of one decode token). calls[i] describes one
+ * row of member 0 of a bank (trellis, suh, svh at member 0); index[i] names the member on the
+ * device: ids[slot] is read when the kernels run, so the ids may be written by an earlier kernel of
+ * the same stream and the launch can be captured in a graph. Member m lives at
+ * trellis + m * trellis_stride bytes and suh/svh + m * scale_stride floats. An id outside
+ * [0, members) skips its pair and sets bit0 of the flag. 1..16 calls of one row each, all of
+ * one k, n and flag, spans contiguous in call order as for the grouped entries; `cols` as for
+ * inference_cuda_exl3_grouped_wide. Bad arguments are INVALID_ARGUMENT before any launch. */
+typedef struct inference_cuda_exl3_index_args {
+    const int32_t *ids; size_t ids_bytes;
+    uint32_t slot; uint32_t members;
+    size_t trellis_stride;
+    size_t scale_stride;
+    /* Optional member table: when non-null it holds `members` u32 byte offsets (multiples of 4)
+     * of the members from member 0, and replaces the strides (which are then ignored): member m
+     * lives at trellis + offsets[m] bytes and suh/svh + offsets[m] / 4 floats. An entry of
+     * 0xFFFFFFFF marks a member that is not resident: its pair is skipped and bit0 of the flag is
+     * set, as for an id outside [0, members). */
+    const uint32_t *offsets;
+} inference_cuda_exl3_index_args;
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_exl3_index_args) == 48 &&
+              offsetof(inference_cuda_exl3_index_args, slot) == 16 &&
+              offsetof(inference_cuda_exl3_index_args, trellis_stride) == 24 &&
+              offsetof(inference_cuda_exl3_index_args, scale_stride) == 32 &&
+              offsetof(inference_cuda_exl3_index_args, offsets) == 40,
+              "EXL3 index ABI");
+#endif
+int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_linear_args *calls,
+                                        const inference_cuda_exl3_index_args *index,
+                                        size_t count, void *stream, int *out_stage,
+                                        unsigned cols);
 /* Explicit tensor-core projection for rows9..144, one F32 Z bank.
  * FP16-rounded operands feed an F32 accumulator. Operand conversion and
  * tensor-core accumulation can round differently from legacy F32 arithmetic.
@@ -92,6 +137,107 @@ int inference_cuda_exl3_grouped_gathered(const inference_cuda_exl3_linear_args *
  * is required. No default dispatch change. */
 int inference_cuda_exl3_linear_midrows(const inference_cuda_exl3_linear_args *args,
                                        void *stream, int *out_stage);
+/* Job-table projection for rows 1..256 per job: one launch per stage (input rotation,
+ * tensor-core projection, output rotation) over any number of row blocks ("jobs"), each of
+ * which reads one member of a bank of same-shaped, same-rate matrices. The prefill MoE runs
+ * every expert of a chunk with it. The table is read from device memory when the kernels run, so a
+ * caller may also write it on the device (no caller does yet).
+ *
+ * A job is {member, row0, rows}: rows row0..row0+rows of x, xh, z and out belong to member
+ * `member` (0 <= member < members). Member m's trellis starts trellis_stride u16 elements, and
+ * its suh and svh scale_stride floats, after member m-1's; a bank stores [suh | svh] per member,
+ * so suh and svh are one buffer with svh at an offset of k floats and scale_stride = k + n. A
+ * single matrix has members = 1 and strides of any value (ignored).
+ *
+ * x:[total_rows,K] is read (rotated input rows are written to xh:[total_rows,K] as F16, two
+ * bytes each); z:[total_rows,N] holds one F32 projection bank; out receives row r, column c of job j at
+ * out[(row0 + r) * out_ld + out_col + c], so a projection can land in its half of a wider row.
+ * Arithmetic is the rows kernel's: FP16-rounded operands, F32 accumulation, for ALL row counts.
+ * Rows of different jobs must be disjoint. A job outside its bounds (member, row0, rows,
+ * rows > max_rows) is skipped and sets bit0 of flag, a caller-initialized sticky u32 that
+ * invalidates the whole output; check it after completion. xh, z, out and flag must be disjoint
+ * from every other range; trellis, suh, svh and the table may alias each other. The table is
+ * jobs_count entries of 16 bytes in device memory, read when the kernels run. K, N, bits_twice and
+ * book follow the linear ABI; jobs_count <= 4096; max_rows <= 256 bounds every job's rows and
+ * picks the CTA (64, 128 or 256 rows); out_ld >= out_col + N. Other rules match the linear entry points. */
+typedef struct inference_cuda_exl3_job {
+    int32_t member;
+    int32_t row0;
+    int32_t rows;
+    int32_t reserved; /* zero */
+} inference_cuda_exl3_job;
+typedef struct inference_cuda_exl3_jobs_args {
+    const uint16_t *trellis; size_t trellis_bytes;
+    const float *suh; size_t suh_bytes;
+    const float *svh; size_t svh_bytes;
+    const float *x; size_t x_bytes;
+    uint16_t *xh; size_t xh_bytes; /* F16 bits */
+    float *z; size_t z_bytes;
+    float *out; size_t out_bytes;
+    uint32_t *flag; size_t flag_bytes;
+    const inference_cuda_exl3_job *jobs; size_t jobs_bytes;
+    size_t trellis_stride; size_t scale_stride; size_t members;
+    size_t k; size_t n;
+    size_t total_rows; size_t out_ld; size_t out_col;
+    uint32_t jobs_count; uint32_t max_rows;
+    int bits_twice; int book;
+    /* Row lists: row r of the table (the rows back to back, jobs in order) reads row in_rows[r] of x
+     * and lands in row out_rows[r] of out; a null list is the identity. Then x holds x_rows rows
+     * and out out_total_rows rows (both equal total_rows without a list). The lists are read, not
+     * written; an entry out of range sets bit0 of flag and the row is dropped, and repeated
+     * entries of out_rows are the caller's business (the last writer wins). */
+    const uint32_t *in_rows; size_t in_rows_bytes;
+    const uint32_t *out_rows; size_t out_rows_bytes;
+    size_t x_rows; size_t out_total_rows;
+} inference_cuda_exl3_jobs_args;
+
+/* The kernel family a job-table call would run, without launching: 1 for the register-decode kernel
+ * (switch on, compute capability major >= 8 running code compiled for sm_80 or more (ptxVersion), 16-byte aligned
+ * input rows, trellis and member stride, K a multiple of 32), 0 for the shared-memory kernels.
+ * A negative capability_major asks the current device and FIFI_EXL3_JOBS_REG (cached, as a launch
+ * does); otherwise capability_major, ptx_version and enabled are taken as given, so a test needs
+ * neither a device nor the environment. Returns INFERENCE_CUDA_INVALID_ARGUMENT for a null args
+ * pointer. The call's other arguments are not validated here. */
+int inference_cuda_exl3_jobs_kernel(const inference_cuda_exl3_jobs_args *args, int capability_major,
+                                    int ptx_version, int enabled);
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_exl3_job) == 16 &&
+              sizeof(inference_cuda_exl3_jobs_args) == 272 &&
+              offsetof(inference_cuda_exl3_jobs_args, flag) == 112 &&
+              offsetof(inference_cuda_exl3_jobs_args, jobs) == 128 &&
+              offsetof(inference_cuda_exl3_jobs_args, trellis_stride) == 144 &&
+              offsetof(inference_cuda_exl3_jobs_args, k) == 168 &&
+              offsetof(inference_cuda_exl3_jobs_args, total_rows) == 184 &&
+              offsetof(inference_cuda_exl3_jobs_args, jobs_count) == 208 &&
+              offsetof(inference_cuda_exl3_jobs_args, bits_twice) == 216 &&
+              offsetof(inference_cuda_exl3_jobs_args, in_rows) == 224 &&
+              offsetof(inference_cuda_exl3_jobs_args, x_rows) == 256, "EXL3 jobs ABI");
+#endif
+int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *args,
+                             void *stream, int *out_stage);
+
+/* Member addressing of a job-table call, shared by every stage kernel that reads the table: the
+ * trellis of member m starts trellis_stride u16 elements after member m-1's, its suh and svh
+ * scale_stride floats after. A single matrix (members = 1) ignores the strides. */
+#ifdef __cplusplus
+#ifdef __CUDACC__
+#define INFERENCE_CUDA_EXL3_HD __host__ __device__
+#else
+#define INFERENCE_CUDA_EXL3_HD
+#endif
+static inline INFERENCE_CUDA_EXL3_HD const uint16_t *
+inference_cuda_exl3_member_trellis(const inference_cuda_exl3_jobs_args &p, int32_t member) {
+    return p.trellis + (p.members > 1 ? size_t(member) * p.trellis_stride : 0);
+}
+static inline INFERENCE_CUDA_EXL3_HD const float *
+inference_cuda_exl3_member_suh(const inference_cuda_exl3_jobs_args &p, int32_t member) {
+    return p.suh + (p.members > 1 ? size_t(member) * p.scale_stride : 0);
+}
+static inline INFERENCE_CUDA_EXL3_HD const float *
+inference_cuda_exl3_member_svh(const inference_cuda_exl3_jobs_args &p, int32_t member) {
+    return p.svh + (p.members > 1 ? size_t(member) * p.scale_stride : 0);
+}
+#endif
 #ifdef __cplusplus
 }
 #endif

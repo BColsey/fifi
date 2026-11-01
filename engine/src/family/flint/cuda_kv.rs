@@ -2,7 +2,7 @@
 
 use super::{
     config::FULL_LAYERS,
-    kv_plan::{KvPlan, KvStorage, WINDOW},
+    kv_plan::{KvPlan, KvStorage},
     reference::ChunkWindow,
 };
 use crate::EngError;
@@ -10,9 +10,14 @@ use crate::EngError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayerKvAllocation {
     storage: KvStorage,
+    /// V plane storage; equals `storage` unless a mixed profile ("q8k")
+    /// set the planes apart.
+    v_storage: KvStorage,
     cache_rows: usize,
     data_bytes: usize,
     scale_bytes: usize,
+    v_data_bytes: usize,
+    v_scale_bytes: usize,
     context_rows: usize,
     window_rows: usize,
 }
@@ -20,21 +25,28 @@ pub(crate) struct LayerKvAllocation {
 impl LayerKvAllocation {
     pub(crate) fn new(plan: &KvPlan, layer: usize) -> Result<Self, EngError> {
         let cache_rows = plan.cache_rows(layer)?;
-        let (data_row, scale_row) = plan.storage().plane_row_bytes();
-        let plane_bytes = cache_rows
-            .checked_mul(data_row + scale_row)
-            .ok_or_else(|| EngError::MemoryPlan("Flint KV plane size overflows".into()))?;
-        let data_bytes = cache_rows * data_row;
+        let plane = |storage: KvStorage| {
+            let (data_row, scale_row) = storage.plane_row_bytes();
+            let plane_bytes = cache_rows
+                .checked_mul(data_row + scale_row)
+                .ok_or_else(|| EngError::MemoryPlan("Flint KV plane size overflows".into()))?;
+            Ok::<_, EngError>((plane_bytes - scale_row * cache_rows, scale_row * cache_rows))
+        };
+        let (data_bytes, scale_bytes) = plane(plan.k_storage())?;
+        let (v_data_bytes, v_scale_bytes) = plane(plan.v_storage())?;
         Ok(Self {
-            storage: plan.storage(),
+            storage: plan.k_storage(),
+            v_storage: plan.v_storage(),
             cache_rows,
             data_bytes,
-            scale_bytes: plane_bytes - data_bytes,
+            scale_bytes,
+            v_data_bytes,
+            v_scale_bytes,
             context_rows: plan.context_rows(),
             window_rows: if FULL_LAYERS.contains(&(layer as u64)) {
                 plan.context_rows()
             } else {
-                WINDOW
+                plan.window()
             },
         })
     }
@@ -48,6 +60,13 @@ impl LayerKvAllocation {
     #[cfg(test)]
     pub(crate) fn plane_bytes(&self) -> usize {
         self.data_bytes + self.scale_bytes
+    }
+
+    /// V-plane payload plus scales; equals [`Self::plane_bytes`] on every
+    /// uniform profile.
+    #[cfg(test)]
+    pub(crate) fn v_plane_bytes(&self) -> usize {
+        self.v_data_bytes + self.v_scale_bytes
     }
 
     /// Host bytes of one data plane covering the committed rows
@@ -81,14 +100,23 @@ impl LayerKvAllocation {
     ) -> Result<LayerKv, EngError> {
         Ok(LayerKv {
             keys: ctx.allocate(self.data_bytes)?,
-            values: ctx.allocate(self.data_bytes)?,
-            scales: if self.scale_bytes == 0 {
-                None
-            } else {
-                Some([
+            values: ctx.allocate(self.v_data_bytes)?,
+            scales: match (self.scale_bytes, self.v_scale_bytes) {
+                (0, 0) => None,
+                // Uniform: both planes quantized, both scale planes live.
+                (same, v) if same == v && same > 0 => Some([
                     ctx.allocate(self.scale_bytes)?,
-                    ctx.allocate(self.scale_bytes)?,
-                ])
+                    ctx.allocate(self.v_scale_bytes)?,
+                ]),
+                // Mixed "q8k": the f16 V plane carries no scales; the empty
+                // placeholder keeps the pair shape and is never read or written.
+                (k, 0) if k > 0 => Some([ctx.allocate(self.scale_bytes)?, ctx.empty_buffer()?]),
+                (0, v) if v > 0 => Some([ctx.empty_buffer()?, ctx.allocate(self.v_scale_bytes)?]),
+                _ => {
+                    return Err(EngError::MemoryPlan(
+                        "Flint KV scale planes disagree across K and V".into(),
+                    ));
+                }
             },
             cursor: self.cursor(),
         })
@@ -160,8 +188,21 @@ impl KvAppend<'_> {
         self.window.live_range()
     }
 
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn window(&self) -> usize {
+        self.window.window()
+    }
+
     pub(crate) fn storage(&self) -> KvStorage {
         self.cursor.allocation.storage
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Portable builds never query the V plane; the mixed profile is CUDA-only"
+    )]
+    pub(crate) fn v_storage(&self) -> KvStorage {
+        self.cursor.allocation.v_storage
     }
 
     pub(crate) fn cache_rows(&self) -> usize {

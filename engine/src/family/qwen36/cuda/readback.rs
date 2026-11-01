@@ -58,7 +58,8 @@ pub(super) fn parse_sync_each(value: Option<&str>) -> Result<bool, EngError> {
 pub(super) fn check_mode(sync_each: bool, capture_requested: bool) -> Result<(), EngError> {
     if sync_each && capture_requested {
         return Err(EngError::BadRequest(format!(
-            "{SYNC_EACH_VAR}=1 synchronizes after every launch, which a graph capture forbids"
+            "{SYNC_EACH_VAR}=1 synchronizes after every launch, which a graph capture forbids; \
+             set \"capture\": false in the qwen36 settings to run the eager step with it"
         )));
     }
     Ok(())

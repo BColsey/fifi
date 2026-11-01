@@ -13,12 +13,73 @@ pub(super) struct Packing {
     pub(super) staging: u64,
 }
 
+/// The banked placement before the bank is sized: everything that does not depend on how many
+/// experts per layer stay on the device.
+pub(super) struct CachedAudit {
+    packing: Packing,
+    strides: Vec<usize>,
+    arena_base: usize,
+    routed: Vec<Option<(usize, u16)>>,
+    layers: Vec<usize>,
+}
+
 pub(super) struct CachedPacking {
     pub(super) packing: Packing,
     pub(super) layout: super::super::cache::HostLayout,
     pub(super) arena_base: usize,
     pub(super) routed: Vec<Option<(usize, u16)>>,
     pub(super) layers: Vec<usize>,
+    pub(super) reason: super::super::cache::BankReason,
+}
+
+impl CachedAudit {
+    /// Device bytes where the bank starts: the non-routed weights, aligned.
+    pub(super) fn arena_base(&self) -> usize {
+        self.arena_base
+    }
+
+    /// Device bytes one more resident expert costs, summed over the routed layers that keep
+    /// device slots (all but the first `offloaded`).
+    pub(super) fn per_slot_bytes(&self, offloaded: usize) -> Result<u64, EngError> {
+        self.strides
+            .iter()
+            .skip(offloaded)
+            .try_fold(0u64, |sum, &stride| {
+                sum.checked_add(u64::try_from(stride).ok()?)
+            })
+            .ok_or_else(overflow)
+    }
+
+    /// Sizes the bank to `slot_count` resident experts per layer, in use for `reason`.
+    pub(super) fn with_slots(
+        self,
+        slot_count: usize,
+        offloaded: usize,
+        reason: super::super::cache::BankReason,
+        limits: &FlintResidentLimits,
+    ) -> Result<CachedPacking, EngError> {
+        let layout =
+            super::super::cache::HostLayout::with_offloaded(&self.strides, slot_count, offloaded)?;
+        let mut packing = self.packing;
+        packing.bytes = self
+            .arena_base
+            .checked_add(layout.slot_bytes())
+            .ok_or_else(overflow)?;
+        if packing.bytes as u64 > limits.max_weight_bytes {
+            return Err(EngError::MemoryPlan(format!(
+                "Flint reduced weights require {} bytes; budget {}",
+                packing.bytes, limits.max_weight_bytes
+            )));
+        }
+        Ok(CachedPacking {
+            packing,
+            layout,
+            arena_base: self.arena_base,
+            routed: self.routed,
+            layers: self.layers,
+            reason,
+        })
+    }
 }
 
 fn audit_layer_stride(
@@ -59,11 +120,11 @@ fn audit_layer_stride(
 }
 
 impl Packing {
-    pub(super) fn cached(
+    pub(super) fn audit_cached(
         roles: &super::ResidentPlan,
         limits: &FlintResidentLimits,
-    ) -> Result<CachedPacking, EngError> {
-        use super::super::{FfnRoles, cache::HostLayout};
+    ) -> Result<CachedAudit, EngError> {
+        use super::super::FfnRoles;
         let mut audit_limits = *limits;
         audit_limits.max_weight_bytes = u64::MAX;
         let mut packing = Self::new(&roles.layout, &audit_limits)?;
@@ -78,7 +139,6 @@ impl Packing {
             layers.push(layer);
             strides.push(stride);
         }
-        let layout = HostLayout::new(&strides)?;
         let mut cursor = 0;
         for (index, slots) in packing.matrices.iter_mut().enumerate() {
             if routed[index].is_none() {
@@ -93,18 +153,9 @@ impl Packing {
         let arena_base = cursor
             .checked_next_multiple_of(ARENA_ALIGN)
             .ok_or_else(overflow)?;
-        packing.bytes = arena_base
-            .checked_add(layout.slot_bytes())
-            .ok_or_else(overflow)?;
-        if packing.bytes as u64 > limits.max_weight_bytes {
-            return Err(EngError::MemoryPlan(format!(
-                "Flint reduced weights require {} bytes; budget {}",
-                packing.bytes, limits.max_weight_bytes
-            )));
-        }
-        Ok(CachedPacking {
+        Ok(CachedAudit {
             packing,
-            layout,
+            strides,
             arena_base,
             routed,
             layers,
@@ -215,6 +266,7 @@ fn allocation(error: std::collections::TryReserveError) -> EngError {
 mod tests {
     use std::io::Write;
 
+    use super::super::super::cache::BankReason;
     use super::*;
     use crate::{
         family::project::cuda::Reserve,
@@ -354,6 +406,45 @@ mod tests {
         }
     }
 
+    fn cached_packing(
+        roles: &super::super::ResidentPlan,
+        limits: &FlintResidentLimits,
+        slot_count: usize,
+    ) -> Result<CachedPacking, EngError> {
+        Packing::audit_cached(roles, limits)?.with_slots(slot_count, 0, BankReason::Forced, limits)
+    }
+
+    #[test]
+    fn bank_cost_scales_with_the_resident_count_and_a_full_bank_matches_the_resident_load() {
+        let roles = published_roles();
+        let limits = FlintResidentLimits {
+            max_weight_bytes: u64::MAX,
+            max_staging_bytes: u64::MAX,
+            reserve: Reserve::default(),
+        };
+        let audit = Packing::audit_cached(&roles, &limits).unwrap();
+        let (base, per_slot) = (audit.arena_base(), audit.per_slot_bytes(0).unwrap());
+        // 47 routed layers at one 1,603,584-byte expert each.
+        assert_eq!(per_slot, 47 * 1_603_584);
+        // Offloaded layers keep no slots, so one more resident expert costs less.
+        assert_eq!(audit.per_slot_bytes(8).unwrap(), 39 * 1_603_584);
+        for count in [48, 192, 224, 255] {
+            let banked = cached_packing(&roles, &limits, count).unwrap();
+            assert_eq!(banked.layout.slot_count(), count);
+            assert_eq!(
+                banked.packing.bytes as u64,
+                base as u64 + count as u64 * per_slot
+            );
+        }
+        let off = Packing::new(&roles.layout, &limits).unwrap();
+        assert_eq!(
+            cached_packing(&roles, &limits, 256).unwrap().packing.bytes,
+            off.bytes
+        );
+        assert!(cached_packing(&roles, &limits, 0).is_err());
+        assert!(cached_packing(&roles, &limits, 257).is_err());
+    }
+
     #[test]
     fn cached_placement_reduces_real_allocation_and_enforces_exact_cap() {
         let roles = published_roles();
@@ -363,7 +454,7 @@ mod tests {
             reserve: Reserve::default(),
         };
         let off = Packing::new(&roles.layout, &limits).unwrap();
-        let cached = Packing::cached(&roles, &limits).unwrap();
+        let cached = cached_packing(&roles, &limits, 224).unwrap();
         assert_eq!(
             off.bytes - cached.packing.bytes,
             cached.layout.host_bytes() - cached.layout.slot_bytes()
@@ -391,10 +482,10 @@ mod tests {
             }
         }
         limits.max_weight_bytes = cached.packing.bytes as u64;
-        assert!(Packing::cached(&roles, &limits).is_ok());
+        assert!(cached_packing(&roles, &limits, 224).is_ok());
         limits.max_weight_bytes -= 1;
         assert!(matches!(
-            Packing::cached(&roles, &limits),
+            cached_packing(&roles, &limits, 224),
             Err(EngError::MemoryPlan(_))
         ));
         limits.max_weight_bytes = u64::MAX;
@@ -426,7 +517,7 @@ mod tests {
                 reserve: Reserve::default(),
             };
             assert!(matches!(
-                Packing::cached(&roles, &limits),
+                Packing::audit_cached(&roles, &limits),
                 Err(EngError::Checkpoint(_))
             ));
         }

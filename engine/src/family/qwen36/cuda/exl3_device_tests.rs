@@ -125,6 +125,11 @@ fn capture(
             .buffer()
             .write_at(&stream, range.offset(), &vec![0xff; range.bytes()])?;
     }
+    // The step clears the arithmetic flag before its first op; the block no longer does, and an
+    // arena's initial contents are unspecified, so the capture clears it explicitly.
+    let flag = view(Slot::Exl3Flag)?;
+    flag.buffer()
+        .write_at(&stream, flag.offset(), &0u32.to_le_bytes())?;
     let mixers = Mixers::new(
         ctx,
         MixerParts {

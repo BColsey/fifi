@@ -6,9 +6,10 @@ use super::{
     common_tests::{dims, plan_of},
     dims::KvMode,
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot as S, Extra, M_LADDER, PART_CHARGE, Phase, Phase::*,
-        PrefillStep, SPARE_MIN, chunk_cost, chunk_costs, chunk_list, chunk_list_with_depth_tier,
-        chunk_tensors, fixed_depth_rows, kv_bytes, m_pos, state_bytes,
+        Admission, ChunkCost, ChunkSlot as S, EXL3_SLOTS, EXL3_TILE_ROWS, Extra, M_LADDER,
+        PART_CHARGE, Phase, Phase::*, PrefillStep, SPARE_MIN, chunk_cost, chunk_costs, chunk_list,
+        chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_cost, exl3_chunk_costs,
+        exl3_chunk_tensors, exl3_max_jobs, fixed_depth_rows, kv_bytes, m_pos, state_bytes,
     },
 };
 use crate::{
@@ -1157,5 +1158,212 @@ fn v1_totals_and_admission_tables_are_reported_beside_0049s_rows() {
                     .unwrap()
             })
         );
+    }
+}
+
+// ---- the EXL3 arena list ----------------------------------------------------------------------
+
+fn exl3_tensors_of(m: usize) -> Vec<(S, ArenaTensor)> {
+    exl3_chunk_tensors(&dims(), m).expect("EXL3 chunk tensors")
+}
+
+#[test]
+fn the_exl3_list_is_the_exl3_slots_once_each_at_every_ladder_size() {
+    for m in M_LADDER {
+        let slots: Vec<S> = exl3_tensors_of(m).iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(
+            slots, EXL3_SLOTS,
+            "m {m}: the slot column is EXL3_SLOTS in order"
+        );
+        for slot in [
+            S::Q8X,
+            S::Q8OD,
+            S::Q8OA,
+            S::Fixup,
+            S::IdsDst,
+            S::Q8S,
+            S::Q8Act,
+        ] {
+            assert!(
+                !slots.contains(&slot),
+                "m {m}: {slot:?} is a GGUF-only slot"
+            );
+        }
+    }
+}
+
+/// Offsets from `plan_arena` for the list.
+fn exl3_offsets(tensors: &[(S, ArenaTensor)]) -> Vec<usize> {
+    plan_arena(&only(tensors)).expect("plan").offsets
+}
+
+#[test]
+fn live_exl3_slots_never_share_a_byte() {
+    // Two tensors whose phase ranges meet (the planner treats the ranges as closed) must not
+    // overlap: a stage reads one and writes the other in the same phase.
+    for m in [128, 2048] {
+        let tensors = exl3_tensors_of(m);
+        let offsets = exl3_offsets(&tensors);
+        for (i, (a, ta)) in tensors.iter().enumerate() {
+            for (j, (b, tb)) in tensors.iter().enumerate().skip(i + 1) {
+                if ta.first.max(tb.first) > ta.last.min(tb.last) {
+                    continue;
+                }
+                let (a0, a1) = (offsets[i], offsets[i] + ta.bytes);
+                let (b0, b1) = (offsets[j], offsets[j] + tb.bytes);
+                assert!(a1 <= b0 || b1 <= a0, "m {m}: {a:?} and {b:?} share bytes");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_exl3_rows_are_live_where_the_stages_read_them() {
+    // The output projections read the F32 rows the GGUF chunk quantizes: they stay live to
+    // the stage that reads them, and the normalized rows to the first projection of either mixer.
+    let by = |slot: S| {
+        exl3_tensors_of(256)
+            .into_iter()
+            .find(|(s, _)| *s == slot)
+            .expect("slot")
+            .1
+    };
+    assert_eq!(
+        (by(S::OOut).first, by(S::OOut).last),
+        (DScan as usize, DOut as usize)
+    );
+    assert_eq!(
+        (by(S::AttnOut).first, by(S::AttnOut).last),
+        (AFlash as usize, AOut as usize)
+    );
+    assert!(by(S::X).last >= AProj as usize && by(S::X).last >= DProj as usize);
+    assert_eq!(
+        by(S::X2).last,
+        Combine as usize,
+        "the routed gate and up read X2 late"
+    );
+    // The routed pass: the index lists are read by gate and up (the input list) and by down (the
+    // output list), so they live to the down phase; gate and up write `Gu` for the SwiGLU, which
+    // writes `Act` for down; the shared expert's output and the picks wait for the combine.
+    // Mutation: ending `ExpertPerm` at the gate/up phase lets the planner reuse it before down
+    // reads the output list.
+    let span = |slot: S| (by(slot).first, by(slot).last);
+    assert_eq!(span(S::ExpertPerm), (Ids as usize, Down as usize));
+    assert_eq!(span(S::Gu), (GateUp as usize, Swiglu as usize));
+    assert_eq!(span(S::Act), (Swiglu as usize, Down as usize));
+    assert_eq!(span(S::ShOut), (Shared as usize, Combine as usize));
+    assert_eq!(span(S::TopkId), (Route as usize, Combine as usize));
+    assert_eq!(span(S::TopkWeight), (Route as usize, Combine as usize));
+    assert_eq!(span(S::SharedGate), (Route as usize, Combine as usize));
+    assert_eq!(span(S::Logits), (Route as usize, Route as usize));
+    // The down projection writes `Down` in its own phase, and the combine reads it.
+    assert_eq!(span(S::Down), (Down as usize, Combine as usize));
+    // The routed projections' scratch is live from gate and up to the end of down.
+    for slot in [S::ExpertXh, S::ExpertZ] {
+        assert_eq!(
+            (by(slot).first, by(slot).last),
+            (GateUp as usize, Down as usize)
+        );
+    }
+}
+
+#[test]
+fn every_smaller_exl3_chunk_fits_the_slots_planned_at_m_sess() {
+    let d = dims();
+    for &m_sess in M_LADDER.iter().rev() {
+        let planned = exl3_chunk_tensors(&d, m_sess).expect("the session's plan");
+        let planned_bytes = |slot: S| planned.iter().find(|(s, _)| *s == slot).unwrap().1.bytes;
+        for m in (1..=m_sess).step_by(7).chain([m_sess]) {
+            for (slot, tensor) in exl3_chunk_tensors(&d, m).expect("a smaller chunk") {
+                assert!(
+                    tensor.bytes <= planned_bytes(slot),
+                    "M_sess {m_sess} m {m} {slot:?}: {} B exceeds {} B",
+                    tensor.bytes,
+                    planned_bytes(slot)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_exl3_scratch_covers_the_widest_projection_and_the_plain_gates() {
+    let bytes = |m: usize, slot: S| {
+        exl3_tensors_of(m)
+            .into_iter()
+            .find(|(s, _)| *s == slot)
+            .unwrap()
+            .1
+            .bytes
+    };
+    // The DeltaNet output projection reads 4,096 values per row; the qkv projection writes 8,192.
+    assert!(bytes(128, S::Exl3Xh) >= 128 * 4096 * 2);
+    assert!(bytes(2048, S::Exl3Z) >= 2048 * 8192 * 4);
+    // The dense projections run over all rows of the chunk, so the scratch grows with it; the job
+    // table has one 16-byte entry for each started tile of rows.
+    assert_eq!(bytes(2048, S::Exl3Xh), 2048 * 4096 * 2);
+    assert_eq!(bytes(1024, S::DenseJobs), 16 * (1024 / EXL3_TILE_ROWS));
+    assert_eq!(bytes(1025, S::DenseJobs), 16 * (1024 / EXL3_TILE_ROWS + 1));
+    // A plain gate writes `m` rows of 32 values at once.
+    assert!(bytes(2048, S::Exl3Y) >= 2048 * 32 * 4);
+    assert_eq!(bytes(128, S::Exl3Flag), 4);
+}
+
+#[test]
+fn exl3_costs_follow_the_ladder_and_pin_the_routed_faces() {
+    let d = dims();
+    let costs = exl3_chunk_costs(&d, NSM).expect("costs");
+    assert_eq!(costs.iter().map(|c| c.m).collect::<Vec<_>>(), M_LADDER);
+    for cost in &costs {
+        assert_eq!(*cost, exl3_chunk_cost(&d, cost.m, NSM).unwrap());
+    }
+    // 2,048 rows * 8 picks of 2,048 hidden values: the paired face.
+    let sorted = 2048 * 8 * 2048 * 4;
+    let tensors = exl3_tensors_of(2048);
+    let face = |slot: S| tensors.iter().find(|(s, _)| *s == slot).unwrap().1.bytes;
+    assert_eq!(face(S::Down), sorted);
+    // The routed projections' scratch is a full pair face wide: `max(hidden, inter)` values, the
+    // rotated input rows in F16 and the partials in F32.
+    assert_eq!((face(S::ExpertXh), face(S::ExpertZ)), (sorted / 2, sorted));
+    // The job table of the busiest chunk: 256 experts and 16,384 pairs of 64-row tiles.
+    let jobs = exl3_max_jobs(256, 2048 * 8);
+    assert_eq!(jobs, 256 + 256);
+    assert!(face(S::ExpertPerm) >= 4 * (2 * 2048 * 8 + 4 * jobs));
+    let arena = costs[0].arena;
+    println!(
+        "EXL3 chunk arena at 2048 rows: {arena} B ({} MiB)",
+        arena / MIB
+    );
+    assert!(arena >= sorted && arena < 1024 * MIB, "{arena}");
+}
+
+/// The down projection writes `Down` through the second row list in `ExpertPerm` from the partials
+/// in `ExpertZ`: at every ladder size `Down` is apart from both, whatever order the planner visits
+/// the tensors in. The lifetimes carry the guarantee (`Down` starts where both are still live),
+/// and the placement is checked directly beside it.
+/// Mutation: ending `ExpertPerm` or `ExpertZ` before the down phase, or starting `Down` after it,
+/// fails the lifetime check; listing `ExpertPerm` before the projection scratch changes the
+/// placement the second check looks at.
+#[test]
+fn the_scattered_output_is_apart_from_its_inputs_at_every_ladder_size() {
+    for m in M_LADDER {
+        let tensors = exl3_tensors_of(m);
+        let offsets = exl3_offsets(&tensors);
+        let find = |slot: S| {
+            let at = tensors.iter().position(|(s, _)| *s == slot).expect("slot");
+            (tensors[at].1, offsets[at])
+        };
+        let (down, down_at) = find(S::Down);
+        for input in [S::ExpertPerm, S::ExpertZ] {
+            let (tensor, at) = find(input);
+            assert!(
+                tensor.last >= down.first,
+                "m {m}: {input:?} must be live where Down starts"
+            );
+            assert!(
+                at + tensor.bytes <= down_at || down_at + down.bytes <= at,
+                "m {m}: Down shares bytes with {input:?}"
+            );
+        }
     }
 }

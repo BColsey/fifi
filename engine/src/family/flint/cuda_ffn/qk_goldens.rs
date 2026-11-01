@@ -25,7 +25,7 @@ fn export_requested_qk_goldens() {
     let output = std::path::PathBuf::from(
         std::env::var("FIFI_FLINT_QK_ORACLE_DIR").expect("fresh Q/K golden directory"),
     );
-    assert!(output.starts_with("/media/dan/nvme/fifi/scrch/"));
+    assert!(output.starts_with(crate::test_paths::required("FIFI_SCRATCH_ROOT")));
     std::fs::create_dir(&output).unwrap();
     let gamma_q: [f32; 128] =
         std::array::from_fn(|i| f32::from_bits(0x3f700001 + ((i as u32 % 17) << 12)));

@@ -126,6 +126,33 @@ __global__ void kv8_append_k(Args a) {
     }
 }
 
+/* The K-only chunk variant of kv8_append_k for the mixed profile ("q8k": K
+ * quantized, V kept f16): identical math on the K plane, no V read or write.
+ * The frozen both-plane entry above is untouched. */
+__global__ void kv8_chunk_k_k(Args a) {
+    const int kvh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const long long base = (long long)a.pos0;
+    if (base < 0 || base + a.m > a.cells) {
+        if (a.status && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+            atomicOr(a.status, kStatusInvalidStepState);
+        return;
+    }
+    const int groups = a.head_dim / kGroup;
+    const size_t cell = (size_t)(base + t);
+    const size_t in_at = ((size_t)t * a.n_kv_head + kvh) * a.head_dim + d;
+    const size_t code_at = (size_t)kvh * a.cells * a.head_dim + cell * a.head_dim + d;
+    const size_t scale_at = (size_t)kvh * a.cells * groups + cell * groups + d / kGroup;
+    const float kx = a.k[in_at];
+    const float kmax = warp_max_a(fabsf(kx));
+    const float kd = __fdiv_rn(kmax, 127.f);
+    const unsigned short ks = quant_scale(kd);
+    const float kden = a.code_scale == kStoredHalf ? h2f(ks) : kd;
+    a.k_codes[code_at] = (signed char)(ks == 0 ? 0 : quant_code(kx, kden));
+    if ((d & (kGroup - 1)) == 0) {
+        a.k_scales[scale_at] = ks;
+    }
+}
+
 bool aligned_to(const void *p, uintptr_t n) { return ((uintptr_t)p & (n - 1)) == 0; }
 
 // The six data pointers every entry takes: f32 rows in, one code array and one scale array out,
@@ -168,6 +195,13 @@ Args make_args(const void *k, const void *v, void *k_codes, void *k_scales, void
 Failure launch(const Args &a, cudaStream_t s) {
     Failure failure;
     kv8_append_k<<<dim3(a.n_kv_head, a.m), a.head_dim, 0, s>>>(a);
+    failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+    return failure;
+}
+
+Failure launch_k(const Args &a, cudaStream_t s) {
+    Failure failure;
+    kv8_chunk_k_k<<<dim3(a.n_kv_head, a.m), a.head_dim, 0, s>>>(a);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     return failure;
 }
@@ -215,6 +249,34 @@ extern "C" int inference_cuda_kv8_chunk_launch(const inference_cuda_kv8_chunk_ar
                            in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale);
         a.pos0 = in->pos0;
         const Failure failure = launch(a, (cudaStream_t)stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+/* The K-only chunk entry of the mixed profile: the frozen both-plane args
+ * struct, but v, v_codes and v_scales must all be NULL (V stays f16). */
+extern "C" int inference_cuda_kv8_chunk_k_launch(const inference_cuda_kv8_chunk_args *in,
+                                                 void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        const bool k_only = in != NULL && in->v == NULL && in->v_codes == NULL &&
+                            in->v_scales == NULL;
+        const bool pointers = k_only && in->k != NULL && in->k_codes != NULL &&
+                              in->k_scales != NULL && aligned_to(in->k, 4) &&
+                              aligned_to(in->k_codes, 4) && aligned_to(in->k_scales, 4);
+        const bool position = in == NULL || (in->pos0 >= 0 && (long long)in->pos0 + in->t <= in->cells);
+        if (!pointers || !position ||
+            !valid_geometry(in->t, in->n_kv_head, in->head_dim, in->cells) ||
+            in->t > kMaxChunk || !valid_code_scale(in->code_scale)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Args a = make_args(in->k, NULL, in->k_codes, in->k_scales, NULL, NULL,
+                           in->t, in->n_kv_head, in->head_dim, in->cells, in->code_scale);
+        a.pos0 = in->pos0;
+        const Failure failure = launch_k(a, (cudaStream_t)stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

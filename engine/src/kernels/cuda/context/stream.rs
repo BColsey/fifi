@@ -72,7 +72,12 @@ impl CudaContext {
         self.ensure_usable()?;
         ensure_closed("a stream creation")?;
         let _dispatch = self.enter()?;
+        // A second stream ends the one-stream guarantee the lazy cache return relies on.
+        if let Some(cache) = &self.alloc_cache {
+            cache.settle()?;
+        }
         let raw = resident::stream_create().map_err(device_error)?;
+        self.lease.note_stream();
         LIVE_STREAMS.fetch_add(1, Ordering::AcqRel);
         Ok(DeviceStream {
             raw: Some(raw),

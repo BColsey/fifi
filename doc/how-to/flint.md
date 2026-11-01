@@ -4,7 +4,7 @@ Flint is a mixture-of-experts model with 39.8B parameters, 2.5B of them active p
 fifi serves it on Apple Silicon. On NVIDIA GPUs it runs as a pilot: short contexts work, and long-context quality is not measured.
 
 If you have not built fifi before, do the [tutorial](../getting-started.md) first.
-Run Flint in a server process of its own: it sets the MLX allocator cache limit to zero for the whole process.
+Run Flint in a server process of its own: it sets the MLX allocator cache limit to 64 MiB for the whole process (rollback: `FIFI_FLINT_MLX_CACHE_LIMIT=0`).
 
 ## On a Mac
 
@@ -57,7 +57,9 @@ The context limit is 32,768 tokens. To use less memory, set `FIFI_FLINT_MLX_CONT
 ## On an NVIDIA GPU (pilot)
 
 You need Linux with the CUDA 12 toolkit.
-The weights stay on the GPU; the pack is 20.7 GB.
+The pack is 20.7 GB.
+Up to a context of about 60,000 tokens (`f16`) every weight stays on the GPU.
+A longer context, which is the default, keeps part of the experts in about 18 GiB of page-locked host memory, so the machine needs that much free memory on top of the GPU.
 
 1. Download the EXL3 pack. It includes the tokenizer files:
 
@@ -73,7 +75,7 @@ The weights stay on the GPU; the pack is 20.7 GB.
    cargo build --release --bin enginesrv --features native-cuda
    ```
 
-3. Create `flint-cuda.json`. On CUDA the entry needs a `flint` object with the context limit and the KV cache format:
+3. Create `flint-cuda.json`. On CUDA the `flint` object is optional: without it the engine serves a context of 131,072 tokens with the `f16` KV cache. To choose the context limit and the KV cache format, add it:
 
    ```json
    {
@@ -93,7 +95,8 @@ The weights stay on the GPU; the pack is 20.7 GB.
 
 4. Start the server as above and wait for `/ready`.
 
-Startup checks free GPU memory and refuses a load that does not fit; lower `context_limit` if it is refused.
+Startup checks free GPU memory and free host memory and refuses a load that does not fit; lower `context_limit` if it is refused.
+The load line says `expert_slots=` and `bank=auto` when part of the experts is in host memory. To keep every expert on the GPU, set `FIFI_FLINT_CUDA_EXPERT_CACHE=0`; a context that does not fit then is refused with the largest one that does.
 Prefix reuse is experimental on CUDA: set `FIFI_FLINT_PREFIX_REUSE=1` and `"prefix_reuse": true`.
 It needs `"kv_profile": "f16"`; with `q8` the engine logs a note and serves without reuse.
 Greedy decoding and top-k sampling with k up to 20 run on the GPU; other sampling settings run on the host and are slower.

@@ -14,13 +14,24 @@ mod book_tests;
 #[cfg(test)]
 mod common_tests;
 mod dims;
+mod eager_window;
+#[cfg(test)]
+mod eager_window_device_tests;
 mod executor;
 #[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
 mod exl3_device_tests;
+mod exl3_load;
 #[cfg(test)]
+mod exl3_load_device_tests;
+mod exl3_moe;
+#[cfg(test)]
+mod exl3_moe_device_tests;
+mod exl3_moe_source;
 mod exl3_source;
+#[cfg(test)]
+mod exl3_step_device_tests;
 #[cfg(test)]
 mod export_tests;
 pub mod gate;
@@ -39,6 +50,9 @@ mod mixer_shapes;
 mod mixer_tests;
 mod mixer_weights;
 mod moe;
+mod mtp_load;
+#[cfg(test)]
+mod mtp_load_device_tests;
 #[cfg(test)]
 mod native_device_rig;
 #[cfg(test)]
@@ -86,6 +100,8 @@ mod prefill_device_tests;
 mod prefill_driver;
 #[cfg(test)]
 mod prefill_driver_tests;
+#[cfg(test)]
+mod prefill_exl3_step_device_tests;
 mod prefill_plan;
 #[cfg(test)]
 mod prefill_plan_tests;
@@ -122,6 +138,8 @@ mod section_timing_device_tests;
 mod section_timing_tests;
 #[cfg(test)]
 mod shape_tests;
+#[cfg(test)]
+mod spec_window_device_tests;
 pub(crate) mod start;
 #[cfg(test)]
 mod start_health_tests;

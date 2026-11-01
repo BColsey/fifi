@@ -11,6 +11,8 @@ pub mod memory;
 pub mod sched;
 pub mod server;
 pub mod tensor;
+#[cfg(test)]
+mod test_paths;
 pub mod tokenizer;
 pub mod weights;
 

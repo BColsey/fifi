@@ -4,7 +4,7 @@
 use super::{config::FULL_LAYERS, reference::ChunkWindow};
 use crate::EngError;
 
-const LAYERS: usize = 49;
+pub(crate) const LAYERS: usize = 49;
 pub(super) const WINDOW: usize = 513;
 const MODEL_CONTEXT_LIMIT: usize = 262_144;
 
@@ -36,15 +36,45 @@ impl KvStorage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvPlan {
     context_rows: usize,
-    storage: KvStorage,
+    /// Per-plane storage; K and V may differ (profile parameter: "q8k"
+    /// quantizes K and keeps V at F16). `with_storage` sets both together
+    /// and stays the default uniform path.
+    k_storage: KvStorage,
+    v_storage: KvStorage,
     cache_rows: [usize; LAYERS],
     snapshots: Option<SnapshotPlan>,
+    /// Most rows one append may carry.
+    chunk_rows: usize,
+    /// Ring attention window the capacities were computed with; production
+    /// [`Self::new`] always passes WINDOW, tests may substitute a smaller one.
+    window: usize,
 }
 
 impl KvPlan {
     /// The caller admits backend context/chunk limits first. False retains full capacities
     /// and disables these checkpoints; no environment variable or native state is changed.
     pub fn new(context: usize, chunk_rows: usize, ring_enabled: bool) -> Result<Self, EngError> {
+        Self::new_with_window(context, chunk_rows, ring_enabled, WINDOW)
+    }
+
+    /// Test-only variant of [`Self::new`] substituting the ring window so a short walk
+    /// still crosses the wrap boundary; absent from production builds.
+    #[cfg(test)]
+    pub(crate) fn new_test_window(
+        context: usize,
+        chunk_rows: usize,
+        ring_enabled: bool,
+        window: usize,
+    ) -> Result<Self, EngError> {
+        Self::new_with_window(context, chunk_rows, ring_enabled, window)
+    }
+
+    fn new_with_window(
+        context: usize,
+        chunk_rows: usize,
+        ring_enabled: bool,
+        window: usize,
+    ) -> Result<Self, EngError> {
         if context == 0 || chunk_rows == 0 {
             return Err(EngError::BadRequest(
                 "Flint KV context and chunk rows must be positive".into(),
@@ -55,7 +85,7 @@ impl KvPlan {
                 "Flint KV context exceeds {MODEL_CONTEXT_LIMIT} positions"
             )));
         }
-        let required = ChunkWindow::new(WINDOW, WINDOW - 1, chunk_rows)?.required_slots();
+        let required = ChunkWindow::new(window, window - 1, chunk_rows)?.required_slots();
         let mut cache_rows = [context; LAYERS];
         if ring_enabled {
             for (layer, capacity) in cache_rows.iter_mut().enumerate() {
@@ -66,16 +96,43 @@ impl KvPlan {
         }
         Ok(Self {
             context_rows: context,
-            storage: KvStorage::F16,
+            k_storage: KvStorage::F16,
+            v_storage: KvStorage::F16,
             cache_rows,
             snapshots: ring_enabled.then_some(SnapshotPlan {
-                rows: context.min(WINDOW),
+                rows: context.min(window),
             }),
+            chunk_rows,
+            window,
         })
     }
 
+    /// Most rows one append may carry, which the ring capacities were computed with.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn chunk_rows(&self) -> usize {
+        self.chunk_rows
+    }
+
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    pub(crate) fn window(&self) -> usize {
+        self.window
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Only the uniform-profile tests use the both-planes sugar"
+    )]
     pub(crate) fn with_storage(mut self, storage: KvStorage) -> Self {
-        self.storage = storage;
+        self.k_storage = storage;
+        self.v_storage = storage;
+        self
+    }
+
+    /// Per-plane profile parameter; only an explicit mixed profile
+    /// (settings "q8k") reaches a non-uniform plan.
+    pub(crate) fn with_kv_storage(mut self, k: KvStorage, v: KvStorage) -> Self {
+        self.k_storage = k;
+        self.v_storage = v;
         self
     }
 
@@ -84,7 +141,26 @@ impl KvPlan {
         reason = "Portable serving does not use the CUDA KV adapter"
     )]
     pub(crate) fn storage(&self) -> KvStorage {
-        self.storage
+        self.k_storage
+    }
+
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    pub(crate) fn k_storage(&self) -> KvStorage {
+        self.k_storage
+    }
+
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    pub(crate) fn v_storage(&self) -> KvStorage {
+        self.v_storage
+    }
+
+    /// Encoded (K, V) row bytes for one cache position, each plane on its
+    /// own storage.
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    pub(crate) fn per_plane_row_bytes(&self) -> (usize, usize) {
+        let k = self.k_storage.plane_row_bytes();
+        let v = self.v_storage.plane_row_bytes();
+        (k.0 + k.1, v.0 + v.1)
     }
 
     #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

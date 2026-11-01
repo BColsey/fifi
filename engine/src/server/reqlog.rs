@@ -1021,6 +1021,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_token_routes_write_one_ok_line_each_and_failures_write_none() {
+        let engine = testkit::engine(Vec::new());
+        let (app, capture) = app(&engine, 4_096);
+        let hi = json!([{"role": "user", "content": "hi"}]);
+        let calls = [
+            (
+                "/v1/token/encode",
+                json!({"model": "model-a", "text": "hi!"}),
+                3,
+            ),
+            (
+                "/v1/token/decode",
+                json!({"model": "model-a", "tokens": [104, 105]}),
+                2,
+            ),
+            (
+                "/v1/apply-template",
+                json!({"model": "model-a", "messages": hi}),
+                0,
+            ),
+        ];
+        for (uri, body, _) in &calls {
+            let (status, _headers, _bytes) =
+                testkit::send(&app, testkit::post_json(uri, body)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+        }
+        let failed = json!({"model": "model-a", "tokens": "x"});
+        testkit::send(&app, testkit::post_json("/v1/token/decode", &failed)).await;
+        let lines: Vec<Value> = capture
+            .writes()
+            .iter()
+            .map(|write| serde_json::from_str(write).expect("json line"))
+            .collect();
+        assert_eq!(lines.len(), 3, "one line per served request: {lines:?}");
+        for (line, (uri, _, tokens)) in lines.iter().zip(&calls) {
+            assert_eq!(line["endpoint"], *uri);
+            assert_eq!(line["method"], "POST");
+            assert_eq!(line["status"], 200);
+            assert_eq!(line["outcome"], "ok");
+            assert_eq!(line["model"], "model-a");
+            assert_eq!(line["stream"], false);
+            assert_eq!(line["prompt_tokens"], *tokens);
+            assert_eq!(line["completion_tokens"], 0);
+            assert_eq!(line["finish_reason"], Value::Null);
+        }
+    }
+
     #[test]
     fn prompt_digests_are_stable_truncated_and_anchored() {
         let ids: Vec<u32> = (0..5000).map(|i| u32::try_from(i).unwrap()).collect();

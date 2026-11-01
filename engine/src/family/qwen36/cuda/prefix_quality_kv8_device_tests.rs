@@ -22,7 +22,7 @@ fn chunked(
     Ok(rows)
 }
 
-fn snapshot(step: &mut QwenResidentStep<'_>) -> Result<PinnedSnapshot, EngError> {
+pub(super) fn snapshot(step: &mut QwenResidentStep<'_>) -> Result<PinnedSnapshot, EngError> {
     let pool = step
         .prefix_pins
         .as_mut()
@@ -68,8 +68,7 @@ fn device_phase(ids: &[u32]) -> Result<Kv8Observed, EngError> {
         layout: WeightLayout::Native,
     };
     let rules = QwenRules::new(vec![248_046, 248_044], VOCAB, HEAD)?;
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let model = open_qwen3_6_35b_a3b(
         &std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf"),
         None,
@@ -221,9 +220,7 @@ fn kv8_restore_partitions_preserve_all_scored_positions() {
 #[test]
 #[ignore = "full native KV8 model/cohort with three flags; CPU/GPU leases required"]
 fn q8_state_only_restore_matches_cold_chunked_on_oracle_cohort() {
-    let dir = std::env::var("Q36_CUDA_COHORT_DIR").unwrap_or_else(|_| {
-        "/media/dan/nvme/fifi/scrch/bba24a15/llamacpp-oracle/cohort".to_owned()
-    });
+    let dir = crate::test_paths::required("Q36_CUDA_COHORT_DIR");
     let bytes =
         std::fs::read(std::path::Path::new(&dir).join("tokens.json")).expect("supplied cohort");
     let ids = cohort_ids(&bytes).expect("unchanged supplied cohort");

@@ -821,3 +821,57 @@ mod tests {
         assert!(capture.stop().is_err());
     }
 }
+
+/// Test-only one-shot fault injection for the abort-provenance proofs:
+/// `compute` consults these at the token-start clear, at each layer's
+/// router boundary, after each FFN and after each residual, so the real
+/// decoder walks can drive the abort consult and the progress windows
+/// through the public step path. Absent from release builds.
+#[cfg(test)]
+pub(crate) mod inject {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static AFTER_FFN_ABORT_AT: Cell<Option<usize>> = const { Cell::new(None) };
+        static AFTER_RESIDUAL_ABORT_AT: Cell<Option<usize>> = const { Cell::new(None) };
+        static POST_CLEAR_WORDS: RefCell<Vec<(usize, u32)>> = const { RefCell::new(Vec::new()) };
+        static ABORTS_FIRED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Count of inject aborts actually consumed by `compute`; tests assert
+    /// one per leg so a leg that never reaches its hook cannot pass
+    /// vacuously.
+    pub(crate) fn take_aborts_fired() -> usize {
+        ABORTS_FIRED.with(|slot| slot.replace(0))
+    }
+
+    pub(crate) fn set_after_ffn_abort(layer: Option<usize>) {
+        AFTER_FFN_ABORT_AT.with(|slot| slot.set(layer));
+    }
+    pub(crate) fn set_after_residual_abort(layer: Option<usize>) {
+        AFTER_RESIDUAL_ABORT_AT.with(|slot| slot.set(layer));
+    }
+    pub(crate) fn set_post_clear_words(words: Vec<(usize, u32)>) {
+        POST_CLEAR_WORDS.with(|slot| *slot.borrow_mut() = words);
+    }
+
+    pub(crate) fn after_ffn_abort(index: usize) -> bool {
+        AFTER_FFN_ABORT_AT.with(|slot| {
+            slot.get() == Some(index) && {
+                ABORTS_FIRED.with(|fired| fired.set(fired.get() + 1));
+                true
+            }
+        })
+    }
+    pub(crate) fn after_residual_abort(index: usize) -> bool {
+        AFTER_RESIDUAL_ABORT_AT.with(|slot| {
+            slot.get() == Some(index) && {
+                ABORTS_FIRED.with(|fired| fired.set(fired.get() + 1));
+                true
+            }
+        })
+    }
+    pub(crate) fn take_post_clear_words() -> Vec<(usize, u32)> {
+        POST_CLEAR_WORDS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+    }
+}

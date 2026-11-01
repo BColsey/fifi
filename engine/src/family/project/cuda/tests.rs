@@ -611,7 +611,9 @@ pub(super) fn weight_of<'a>(loaded: &'a CudaWeights, name: &str) -> &'a CudaWeig
 pub(super) fn tiled_of<'a>(loaded: &'a CudaWeights, name: &str) -> &'a TiledWeight {
     match weight_of(loaded, name) {
         CudaWeight::Tiled { weight, .. } => weight,
-        CudaWeight::Exl3 { .. } => panic!("{name} loaded EXL3, not tiled"),
+        CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. } => {
+            panic!("{name} loaded EXL3, not tiled")
+        }
         CudaWeight::Native { .. } => panic!("{name} loaded native, not tiled"),
         CudaWeight::Raw { ty, .. } => panic!("{name} loaded raw as {ty:?}, not tiled"),
     }

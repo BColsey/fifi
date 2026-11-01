@@ -126,7 +126,7 @@ fn exl3_mixers_read_f32_and_keep_projection_inputs_live() {
         };
         let scratch = KernelScratch::for_dims(&d, 1, kv_mode).unwrap();
         let plan = StepPlan::exl3_mixers(&d, &options, &scratch).unwrap();
-        assert!(StepPlan::new(&d, 1, &options, &scratch).is_err());
+        let full = StepPlan::new(&d, 1, &options, &scratch).unwrap();
         for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
             let ops = block_ops(kind, &g, WeightLayout::Exl3, kv_mode).unwrap();
             assert!(
@@ -142,12 +142,143 @@ fn exl3_mixers_read_f32_and_keep_projection_inputs_live() {
                     | BlockOp::NormQ8 { .. }
             )));
             assert_exl3_live_slots(&plan, &ops);
+            assert_exl3_live_slots(&full, &ops);
         }
     }
 }
 
+#[test]
+fn the_exl3_delta_block_projects_the_gates_plain_and_the_rest_through_exl3() {
+    let g = geometry();
+    let ops = block_ops(
+        AttentionKind::DeltaNet,
+        &g,
+        WeightLayout::Exl3,
+        KvMode::Fp16,
+    )
+    .unwrap();
+    let columns = |wanted: fn(&super::mixer_ops::BlockOp) -> Option<(Role, usize)>| {
+        ops.iter().filter_map(wanted).collect::<Vec<_>>()
+    };
+    use super::mixer_ops::BlockOp;
+    let exl3 = columns(|op| match *op {
+        BlockOp::ProjectExl3 { role, col, .. } => Some((role, col)),
+        _ => None,
+    });
+    let plain = columns(|op| match *op {
+        BlockOp::ProjectPlain { role, col, .. } => Some((role, col)),
+        _ => None,
+    });
+    assert_eq!(
+        exl3,
+        [
+            (Role::AttnQkv, 0),
+            (Role::AttnGate, g.delta.z_off),
+            (Role::SsmOut, 0)
+        ]
+    );
+    assert_eq!(
+        plain,
+        [
+            (Role::SsmBeta, g.delta.beta_off),
+            (Role::SsmAlpha, g.delta.alpha_off)
+        ]
+    );
+    // A full-attention block has no plain projection, and no layout but EXL3 has one.
+    let attn = block_ops(AttentionKind::Full, &g, WeightLayout::Exl3, KvMode::Fp16).unwrap();
+    assert!(
+        !attn
+            .iter()
+            .any(|op| matches!(op, BlockOp::ProjectPlain { .. }))
+    );
+    for layout in [WeightLayout::Tiled, WeightLayout::Native] {
+        let ops = block_ops(AttentionKind::DeltaNet, &g, layout, KvMode::Fp16).unwrap();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, BlockOp::ProjectPlain { .. }))
+        );
+    }
+}
+
+#[test]
+fn the_exl3_step_plan_holds_the_moe_the_head_and_the_projection_scratch() {
+    use super::dims::StepOptions;
+    use super::step_plan::{KernelScratch, Phase, Slot, StepPlan};
+    let d = dims();
+    for kv_mode in [KvMode::Fp16, KvMode::Int8G32] {
+        let options = StepOptions {
+            kv_mode,
+            context_tokens: 1024,
+            delta_slots: 1,
+            forked_experts: false,
+            tiered: None,
+            layout: WeightLayout::Exl3,
+        };
+        let scratch = KernelScratch::for_dims(&d, 1, kv_mode).unwrap();
+        let plan = StepPlan::new(&d, 1, &options, &scratch).unwrap();
+        let span = |slot| plan.tensors()[plan.index(slot).unwrap_or_else(|| panic!("{slot:?}"))];
+        let moe = &d.shape.moe;
+        // The head writes the whole padded vocabulary through the split-K partial.
+        assert!(span(Slot::Exl3Z).bytes >= 4 * d.shape.vocab);
+        // The gate and up pairs of all picks, rotated: the widest group of the step.
+        assert!(span(Slot::Exl3Xh).bytes >= 4 * 2 * moe.top_k * d.shape.hidden);
+        assert!(span(Slot::Exl3Z).bytes >= 4 * 2 * moe.top_k * moe.inter);
+        assert_eq!(span(Slot::ExpertAct).bytes, 4 * moe.top_k * moe.inter);
+        assert_eq!(span(Slot::SharedAct).bytes, 4 * moe.shared_inter);
+        // The block runs the routed experts and then the shared expert as one op, so everything it
+        // touches is live from the gate and up launch to the combine and no two of those share
+        // bytes: the shared expert's launches must not overwrite the routed result or the row.
+        let block = [
+            Slot::NormRow,
+            Slot::ExpertGu,
+            Slot::ExpertAct,
+            Slot::ExpertDown,
+            Slot::SharedGu,
+            Slot::SharedAct,
+            Slot::SharedOut,
+        ];
+        for slot in block {
+            let planned = span(slot);
+            assert!(
+                planned.first <= Phase::GateUp as usize && planned.last >= Phase::Combine as usize,
+                "{slot:?} is live only {}..{}",
+                planned.first,
+                planned.last
+            );
+        }
+        for (i, a) in block.iter().enumerate() {
+            for b in &block[i + 1..] {
+                let (oa, ob) = (plan.offset(*a).unwrap(), plan.offset(*b).unwrap());
+                let (ea, eb) = (oa + span(*a).bytes, ob + span(*b).bytes);
+                assert!(ea <= ob || eb <= oa, "{a:?} and {b:?} share bytes");
+            }
+        }
+        for packed in [
+            Slot::Q8Mix,
+            Slot::Q8Moe,
+            Slot::Q8Down,
+            Slot::Q8Shared,
+            Slot::Q8Final,
+            Slot::XfDown(0),
+            Slot::XfShared,
+        ] {
+            assert!(plan.index(packed).is_none(), "{packed:?} in an EXL3 plan");
+        }
+        // The fused final norm still writes its unused pack beside the F32 row the head reads.
+        assert!(plan.index(Slot::XfFinal).is_some() && plan.index(Slot::FinalNormRow).is_some());
+        // Forked packs and more than one row have no EXL3 form.
+        let forked = StepOptions {
+            forked_experts: true,
+            ..options
+        };
+        assert!(StepPlan::new(&d, 1, &forked, &scratch).is_err());
+    }
+}
+
+/// Every slot an op reads was written by an earlier op or by the step (the sticky flag is
+/// cleared once per token, not by a block), and is planned live in the op's phase.
 fn assert_exl3_live_slots(plan: &super::step_plan::StepPlan, ops: &[super::mixer_ops::BlockOp]) {
-    let mut written = Vec::new();
+    let mut written = vec![super::step_plan::Slot::Exl3Flag];
     for op in ops {
         for slot in op.reads() {
             assert!(written.contains(&slot), "uninitialized {slot:?} in {op:?}");

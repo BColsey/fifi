@@ -6,6 +6,7 @@
 use super::{mixer_geometry::MixerGeometry, mixer_ops::BLOCK_ROWS};
 use crate::{
     EngError,
+    family::gguf_model::Role,
     kernels::cuda::resident::{
         attn_decode::AttnShape,
         attn_decode_q8::AttnQ8Shape,
@@ -13,8 +14,30 @@ use crate::{
         gdn_conv::ConvShape,
         gdn_delta::{DeltaShape, GDN_EPS},
         kv8_append::{Kv8CodeScale, Kv8Shape},
+        router::RouterShape,
     },
 };
+
+/// The shape of the plain F32 projection of `role`, a DeltaNet gate: the dot products of the
+/// row against `rows` rows of the gate's raw matrix. Only the logits kernel of the router runs,
+/// so `top_k` is the smallest value the shape allows.
+pub(super) fn plain_shape(g: &MixerGeometry, role: Role) -> Result<RouterShape, EngError> {
+    let rows = match role {
+        Role::SsmBeta => g.delta.beta_rows,
+        Role::SsmAlpha => g.delta.alpha_rows,
+        other => {
+            return Err(EngError::BadRequest(format!(
+                "mixer: {other:?} is not a plain projection"
+            )));
+        }
+    };
+    Ok(RouterShape {
+        m: BLOCK_ROWS,
+        hidden: g.hidden,
+        n_expert: rows,
+        top_k: 1,
+    })
+}
 
 /// The DeltaNet kernels take exactly this epsilon for the q/k norm and the output norm.
 pub(super) fn check_delta_eps(eps: f32) -> Result<(), EngError> {

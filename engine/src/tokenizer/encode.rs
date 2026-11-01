@@ -25,7 +25,7 @@ pub struct Tokenizer {
 }
 
 /// A synthetic encoding with distinct ids, used to observe the loaded
-/// post-processor's id rewriting DIRECTLY (Opus delta7): any insert,
+/// post-processor's id rewriting DIRECTLY: any insert,
 /// drop, duplication, or reorder shows up as an ids change at
 /// add_special_tokens=false — regardless of vocabulary coverage, which
 /// finite probe strings can never guarantee (Sol9's vacuous-vocab
@@ -61,7 +61,7 @@ fn synthetic_encoding() -> tokenizers::Encoding {
 ///    concatenate to the whole-string encoding. Plain-text seams are
 ///    deliberately NOT probed: SentencePiece-style normalizers prepend a
 ///    marker to any standalone encode, so they would be wrongly excluded
-///    (Opus delta7 SF) even though the warm seam itself is exact.
+///    even though the warm seam itself is exact.
 /// 3. Encoding must be deterministic run-to-run (stochastic models).
 ///
 /// Returns false on any mismatch — the tokenizer then always takes the
@@ -135,7 +135,7 @@ impl Tokenizer {
         let raw = serde_json::from_slice::<serde_json::Value>(bytes).ok();
         // A BPE `dropout` makes encoding stochastic: identical bytes can
         // tokenize differently on every call, so no derived boundary and
-        // no warm reuse may engage (Sol MF: stochastic eligibility).
+        // no warm reuse may engage.
         let deterministic = raw.as_ref().is_some_and(|v| {
             v.get("model")
                 .and_then(|m| m.get("dropout"))

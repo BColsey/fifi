@@ -1,5 +1,6 @@
 /* Entry of row_add on an explicit stream. Glue only, like the projector adapter. */
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -16,10 +17,18 @@ bool apart(const void *a, size_t ab, const void *b, size_t bb) {
     return x <= y ? ab <= y - x : bb <= x - y;
 }
 
-__global__ void row_add_kernel(float *out, const float *x, const float *y, long long total) {
+__global__ void row_add_kernel(float *out, const float *x, const float *y,
+                                long long total, unsigned *flag, uint32_t fused) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
-    out[i] = x[i] + y[i];
+    const float sum = x[i] + y[i];
+    if (fused) {
+        // The publish kernel's exact contract: bf16 roundtrip, nonfinite 0+flag.
+        const float published = __bfloat162float(__float2bfloat16_rn(sum));
+        out[i] = isfinite(published) ? published : (atomicOr(flag, 1u), 0.0f);
+    } else {
+        out[i] = sum;
+    }
 }
 
 }  // namespace
@@ -40,11 +49,22 @@ extern "C" int inference_cuda_row_add_launch(const inference_cuda_row_add_args *
         if (!apart(args->out, bytes, args->x, bytes) ||
             !apart(args->out, bytes, args->y, bytes))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (args->fused_publish > 1 ||
+            (args->fused_publish && (args->flag == NULL || args->flag_bytes < 4 ||
+                                     !aligned(args->flag, 4))))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        // The flag's four active bytes take atomicOr from every thread: they may not
+        // share a byte with a tensor the launch writes or reads.
+        if (args->fused_publish &&
+            (!apart(args->flag, 4, args->out, bytes) || !apart(args->flag, 4, args->x, bytes) ||
+             !apart(args->flag, 4, args->y, bytes)))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
         const int block = 256;
         const unsigned grid = (unsigned)((total + block - 1) / block);
         Failure failure;
         row_add_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
-            (float *)args->out, (const float *)args->x, (const float *)args->y, total);
+            (float *)args->out, (const float *)args->x, (const float *)args->y, total,
+            args->flag, args->fused_publish);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

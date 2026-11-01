@@ -148,7 +148,7 @@ pub(crate) struct CudaProjector {
     mamba_ssm_state: HashMap<u32, DeviceBuffer>,
     /// Small mamba weights (conv/bias/dt/A/D/norm) uploaded once.
     mamba_small_weights: HashMap<String, DeviceBuffer>,
-    /// Per-token device path counters (coordinator guard).
+    /// Per-token device path counters, read by the gate guard.
     pub(crate) device_mamba_steps: std::cell::Cell<u64>,
     pub(crate) grouped_launches: std::cell::Cell<u64>,
     lru: VecDeque<CacheKey>,
@@ -391,7 +391,7 @@ impl CudaProjector {
         self.resident_f8.get(name).map(|e| e.shape)
     }
 
-    /// Counter accessors for the coordinator's gate guard.
+    /// Counter accessors for the gate guard.
     pub(crate) fn device_mamba_count(&self) -> u64 {
         self.device_mamba_steps.get()
     }
@@ -399,7 +399,7 @@ impl CudaProjector {
         self.grouped_launches.get()
     }
 
-    /// Increments the device mamba step counter (coordinator guard:
+    /// Increments the device mamba step counter (gate guard:
     /// device_mamba_steps must be > 0 when NEM35_DEVICE_CHAIN is on).
     pub(crate) fn count_mamba_step(&self) {
         self.device_mamba_steps

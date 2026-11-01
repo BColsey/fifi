@@ -40,36 +40,27 @@ pub(crate) struct ChatInput {
     pub(crate) stream: bool,
 }
 
-/// Parses and validates a request body. The caller has already checked the size cap.
-pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
+/// Parses a request body as one JSON object. The caller has already checked the size cap.
+pub(super) fn json_object(body: &[u8]) -> Result<Map<String, Value>, ServerError> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|error| bad(format!("request body is not valid JSON: {error}")))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| bad("request body must be a JSON object"))?;
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(bad("request body must be a JSON object")),
+    }
+}
+
+/// Parses and validates a request body. The caller has already checked the size cap.
+pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
+    let object = &json_object(body)?;
     let messages = parse_messages(object.get("messages"))?;
     let mut tools = parse_tools(object.get("tools"))?;
     if parse_tool_choice(object.get("tool_choice"))? {
         tools.clear();
     }
     check_constrained_output(object)?;
-    let sampling = RequestedSampling {
-        temperature: number(object, "temperature")?,
-        top_p: number(object, "top_p")?,
-        top_k: count(object, "top_k", 0)?,
-    };
-    // The bounds of the fields the request sets are checked here, before the engine is known.
-    // The defaults of the engine that serves the request apply in the chat handler.
-    SamplingParams::from_request(
-        sampling.temperature,
-        sampling.top_p,
-        sampling.top_k,
-        &SamplingDefaults::CONTRACT,
-    )?;
-    let max_tokens = match count(object, "max_tokens", 1)? {
-        None => DEFAULT_MAX_TOKENS,
-        Some(limit) => u32::try_from(limit).unwrap_or(u32::MAX),
-    };
+    let sampling = requested_sampling(object)?;
+    let max_tokens = requested_max_tokens(object)?;
     Ok(ChatInput {
         model: optional_string(object, "model", "")?,
         engine: optional_string(object, "x-engine", "")?,
@@ -84,12 +75,40 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
     })
 }
 
+/// Reads `temperature`, `top_p` and `top_k`. The bounds of the fields the request sets are
+/// checked here, before the engine is known. The defaults of the engine that serves the request
+/// apply at submission.
+pub(super) fn requested_sampling(
+    object: &Map<String, Value>,
+) -> Result<RequestedSampling, ServerError> {
+    let sampling = RequestedSampling {
+        temperature: number(object, "temperature")?,
+        top_p: number(object, "top_p")?,
+        top_k: count(object, "top_k", 0)?,
+    };
+    SamplingParams::from_request(
+        sampling.temperature,
+        sampling.top_p,
+        sampling.top_k,
+        &SamplingDefaults::CONTRACT,
+    )?;
+    Ok(sampling)
+}
+
+/// Reads `max_tokens`: at least 1, 2,048 when absent, saturating at the `u32` limit.
+pub(super) fn requested_max_tokens(object: &Map<String, Value>) -> Result<u32, ServerError> {
+    Ok(match count(object, "max_tokens", 1)? {
+        None => DEFAULT_MAX_TOKENS,
+        Some(limit) => u32::try_from(limit).unwrap_or(u32::MAX),
+    })
+}
+
 /// The one place that rejects output controls which need grammar-constrained decoding.
 /// A `response_format` of type `json_object` or `json_schema`, `tool_choice` `required`, and a
 /// named `tool_choice` return `BadRequest` until the grammar slice replaces this function.
 /// `response_format` of type `text` and `tool_choice` `auto` or `none` pass. The shape of every
 /// member is checked first, so a malformed member gets its own message.
-fn check_constrained_output(object: &Map<String, Value>) -> Result<(), ServerError> {
+pub(super) fn check_constrained_output(object: &Map<String, Value>) -> Result<(), ServerError> {
     match object.get("response_format") {
         None => {}
         Some(Value::Object(format)) => {
@@ -180,7 +199,7 @@ fn count(
 }
 
 /// Reads the optional `stream` flag.
-fn flag(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
+pub(super) fn flag(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
     match object.get(field) {
         None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
@@ -191,7 +210,7 @@ fn flag(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
 /// Reads `x-thinking`: `default`, `on`, or `off`. The agent-client alias
 /// `chat_template_kwargs: {"enable_thinking": bool}` maps to `on`/`off`; when both
 /// fields are set they must agree. No other kwargs are accepted anywhere.
-fn thinking(object: &Map<String, Value>) -> Result<Thinking, ServerError> {
+pub(super) fn thinking(object: &Map<String, Value>) -> Result<Thinking, ServerError> {
     let field = match optional_string(object, "x-thinking", "")?.as_deref() {
         None | Some("default") => None,
         Some("on") => Some(Thinking::On),
@@ -233,7 +252,7 @@ fn enable_thinking(object: &Map<String, Value>) -> Result<Option<Thinking>, Serv
 }
 
 /// Reads `stop`: an array of strings.
-fn stops(object: &Map<String, Value>) -> Result<Vec<String>, ServerError> {
+pub(super) fn stops(object: &Map<String, Value>) -> Result<Vec<String>, ServerError> {
     let Some(value) = object.get("stop") else {
         return Ok(Vec::new());
     };

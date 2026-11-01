@@ -261,10 +261,9 @@ fn cuda_engine_streams_the_gate_tokens() {
     // wins, the LOWEST index on a tie, a NaN never wins. The rules agree on finite rows, so a
     // divergence is numeric — unless the reference top two logits are EXACTLY equal at the
     // divergence, which the report names as a rule difference.
-    let model_dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_string());
-    let tokenizer_dir =
-        std::env::var("Q36_CUDA_TOKENIZER_DIR").unwrap_or_else(|_| model_dir.clone());
+    let model_dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
+    let tokenizer_dir = std::env::var_os("Q36_CUDA_TOKENIZER_DIR")
+        .map_or_else(|| model_dir.clone(), std::path::PathBuf::from);
     let reference_path = std::env::var("Q36_CUDA_REFERENCE").unwrap_or_else(|_| {
         format!(
             "{}/../qualification/cuda-rd/oracle/cpu/clean/P5/run.json",

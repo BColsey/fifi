@@ -322,10 +322,44 @@ fn the_rules_are_built_before_the_first_device_call() {
     let device = make
         .find("CudaProjector::new()")
         .expect("make opens the device");
-    assert!(make.find("open_qwen3_6_35b_a3b(").unwrap() > device);
+    // The GGUF arm opens the file through `open_gguf`, which checks the identity first.
+    assert!(make.find("open_gguf(").unwrap() > device);
     assert!(make.find("load_model(").unwrap() > device);
+    let open = pinned(fn_section("fn open_gguf("));
+    let identity = open
+        .find("check_gguf_identity(")
+        .expect("open_gguf checks the identity");
+    assert!(
+        identity
+            < open
+                .find("open_qwen3_6_35b_a3b(")
+                .expect("open_gguf opens the file")
+    );
     // The rules reach make: the parameter list names them (a mutant that drops them fails).
     assert!(make.contains("rules:QwenRules") && make.contains("QwenResidentStep::new("));
+}
+
+/// The weight format picks the load: a GGUF entry opens the pinned file, an EXL3 entry opens no
+/// GGUF and loads the pack before the layout is read from the device weights.
+#[test]
+fn the_weight_format_selects_the_load_in_make() {
+    let make = pinned(fn_section("fn make("));
+    assert!(
+        make.contains("WeightFormat::Gguf=>Some(open_gguf("),
+        "{make}"
+    );
+    assert!(make.contains("WeightFormat::Exl3=>None"), "{make}");
+    let device = make
+        .find("CudaProjector::new()")
+        .expect("make opens the device");
+    let pack = make.find("load_exl3_dir(").expect("make loads the pack");
+    let layout = make
+        .find("device.layout()?")
+        .expect("make reads the layout");
+    assert!(device < pack && pack < layout, "{device} {pack} {layout}");
+    // Only the GGUF arm reaches the file-based loads.
+    assert_eq!(make.matches("open_gguf(").count(), 1);
+    assert_eq!(make.matches("load_exl3_dir(").count(), 1);
 }
 
 #[test]

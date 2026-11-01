@@ -6,6 +6,7 @@ use crate::family::project::cuda::{Reserve, exl3::Exl3Weight};
 use crate::kernels::cuda::device_present;
 use crate::weights::exl3::{Codebook, flint_pack::PackBuilder};
 use half::{bf16, f16};
+use sha2::{Digest, Sha256};
 
 pub(super) fn upload_f32(ctx: &CudaContext, values: &[f32]) -> DeviceBuffer {
     let bytes: Vec<_> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -368,6 +369,138 @@ fn exl3_moe_reuses_projection_scratch() {
     );
 }
 
+/// Separate publishes the armed fixture walk removes, by level: [frame sites (shared
+/// expert, combine, residual, projection publication), routed expert sites]. Adding or
+/// removing a fused site moves these numbers on purpose; each level is pinned on its own
+/// so a change that shifts publishes between levels cannot cancel out.
+const FUSED_WALK_REMOVED: [u64; 2] = [161, 54];
+
+/// Child half of the walk-level arm check: runs the tiny MoE walk under whatever
+/// FIFI_FLINT_CUDA_FUSED_PUBLISH this process started with and reports the arm state,
+/// the separate-publish launches it needed by level and a digest of the output bits. A
+/// plain suite run returns at the guard; only the parent below makes it load-bearing.
+#[test]
+fn fused_publish_walk_child_reports_census() {
+    if std::env::var_os("FIFI_TEST_FUSED_WALK_CHILD").is_none()
+        || !device_present("fused_publish_walk_child_reports_census")
+    {
+        return;
+    }
+    let before = test_publish_levels();
+    let (actual, expected, _, _) =
+        exl3_moe_outputs([-3.0, 2.0, -1.0, 3.0, -2.0, 1.0], [3, 1, 5, 2, 4, 0], false);
+    let after = test_publish_levels();
+    let [frame, routed] = [0, 1].map(|level| after[level] - before[level]);
+    // The host oracle models separate BF16 publication; both arms must meet it exactly.
+    assert_eq!(bits(&actual), bits(&expected));
+    let digest = Sha256::digest(
+        bits(&actual)
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    use crate::family::flint::settings as switches;
+    let profile = [
+        switches::packed_pointwise_enabled(),
+        switches::grouped_gather_enabled(),
+        switches::late_health_selected(std::env::var_os("FIFI_FLINT_LATE_HEALTH").as_deref()),
+        switches::token_health_armed(),
+        switches::q8_tiled_armed(),
+    ]
+    .map(u8::from);
+    println!(
+        "FUSED-WALK armed={} frame={frame} routed={routed} profile={}{}{}{}{} sha={digest:x}",
+        switches::fused_publish_armed(),
+        profile[0],
+        profile[1],
+        profile[2],
+        profile[3],
+        profile[4]
+    );
+}
+
+/// (armed, separate publishes [frame, routed], output digest) of one child walk.
+fn fused_walk_report(env_value: &str) -> (bool, [u64; 2], String) {
+    let test = format!(
+        "{}::fused_publish_walk_child_reports_census",
+        module_path!().split_once("::").unwrap().1
+    );
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args(["--exact", &test, "--test-threads", "1", "--nocapture"])
+        .env("FIFI_TEST_FUSED_WALK_CHILD", "1")
+        // The pinned counts belong to this profile; every switch is set explicitly so a
+        // changed default (token health is about to flip on) cannot move them.
+        .env("FIFI_FLINT_CUDA_PACKED_POINTWISE", "1")
+        .env("FIFI_FLINT_CUDA_GROUPED_GATHER", "1")
+        .env("FIFI_FLINT_LATE_HEALTH", "1")
+        .env("FIFI_FLINT_TOKEN_HEALTH", "0")
+        .env("FIFI_FLINT_CUDA_Q8_TILED", "1");
+    command.env("FIFI_FLINT_CUDA_FUSED_PUBLISH", env_value);
+    let output = command.output().expect("spawn the isolated child walk");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "child walk with {env_value:?} failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // libtest prints `test <name> ... ` on the same line as the first captured output.
+    let line = stdout
+        .lines()
+        .find_map(|line| line.split_once("FUSED-WALK ").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no census line from the child walk: {stdout}"));
+    let field = |name: &str| {
+        line.split(' ')
+            .find_map(|part| part.strip_prefix(name))
+            .unwrap_or_else(|| panic!("census line lacks {name}: {line}"))
+    };
+    // The resolved switches, as the load line reports them: packed pointwise, grouped
+    // gather, late health, token health, tiled q8.
+    assert_eq!(
+        field("profile="),
+        "11101",
+        "the child did not resolve the pinned profile: {line}"
+    );
+    (
+        field("armed=") == "true",
+        [field("frame="), field("routed=")].map(|count| count.parse().unwrap()),
+        field("sha=").to_owned(),
+    )
+}
+
+/// The walk is bit-identical with the arm on and off, the child process really ran
+/// armed (a dead knob fails here), and the arm removes exactly the pinned number of
+/// separate publishes at each level.
+#[test]
+fn fused_publish_walk_is_bit_identical_and_removes_only_publishes() {
+    if !device_present("fused_publish_walk_is_bit_identical_and_removes_only_publishes") {
+        return;
+    }
+    if std::env::var_os("FIFI_TEST_FUSED_WALK_CHILD").is_some() {
+        return;
+    }
+    let (off_armed, off, off_digest) = fused_walk_report("0");
+    let (on_armed, on, on_digest) = fused_walk_report("1");
+    assert!(
+        !off_armed,
+        "the child exported FIFI_FLINT_CUDA_FUSED_PUBLISH=0 but the arm is on"
+    );
+    assert!(
+        on_armed,
+        "the child exported FIFI_FLINT_CUDA_FUSED_PUBLISH=1 but the arm is off"
+    );
+    assert_eq!(
+        on_digest, off_digest,
+        "armed output differs from unarmed output"
+    );
+    let removed = [0, 1].map(|level| off[level] - on[level]);
+    assert_eq!(
+        removed, FUSED_WALK_REMOVED,
+        "separate publishes removed by [frame, routed] (unarmed {off:?}, armed {on:?})"
+    );
+    eprintln!("OBSERVED fused walk: separate publishes [frame, routed] {off:?} off, {on:?} on");
+}
+
 #[test]
 fn exl3_moe_rejects_poison_at_each_projection_position_and_recovers() {
     if !device_present("exl3_moe_rejects_poison_at_each_projection_position_and_recovers") {
@@ -712,6 +845,7 @@ fn exl3_checked_projection_rejects_preexisting_poison_without_changing_output() 
                 out: output.range(0, output.bytes()).unwrap(),
                 flag: flag.range(0, 4).unwrap(),
                 rows: 1,
+                fused: false,
             },
         );
         if status != 0 {
@@ -896,6 +1030,7 @@ mod cached_tiny {
                 flag: frame.flag().unwrap(),
                 shape,
                 rhs_columns: 1,
+                fused: false,
             },
         )
         .unwrap();
@@ -904,20 +1039,225 @@ mod cached_tiny {
     }
 
     #[test]
-    #[ignore = "requires explicit CUDA tiny-fixture lease and pinned-memory allowance; no absent-device skip"]
-    fn cached_256_native_cold_union_matches_scalar_and_resident() {
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn bank_of_224_cold_union_matches_scalar_and_resident() {
+        cached_bank_matches_scalar_and_resident(224);
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn bank_of_192_cold_union_matches_scalar_and_resident() {
+        cached_bank_matches_scalar_and_resident(192);
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn bank_of_48_cold_union_matches_scalar_and_resident() {
+        cached_bank_matches_scalar_and_resident(48);
+    }
+
+    /// A bank of all 256 experts is the plain resident load: no host buffer, same bytes, same output.
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn bank_of_256_is_the_plain_resident_load() {
         let directory = fixture().write();
         let ctx = CudaContext::new().expect("native tiny fixture requires actual CUDA");
         let stream = ctx.stream().unwrap();
         let resident = load_flint_fixture(&ctx, &stream, directory.path(), limits()).unwrap();
-        let cached =
-            FlintExl3Resident::load_cached_fixture(&ctx, &stream, directory.path(), limits())
+        let full =
+            FlintExl3Resident::load_cached_fixture(&ctx, &stream, directory.path(), limits(), 256)
                 .unwrap();
+        assert_eq!(full.banked_experts(), None);
+        assert_eq!(full.device_weight_bytes(), resident.device_weight_bytes());
+        assert!(
+            full.test_host_cache_byte().is_err(),
+            "a full bank must not allocate a host buffer"
+        );
+        let (off, on) = (resident.layer(1).unwrap().ffn, full.layer(1).unwrap().ffn);
+        let rows = test_rows();
+        for first in [224, 32, 128] {
+            set_routes(&off, &stream, first);
+            set_routes(&on, &stream, first);
+            let (expected, _, _) = scalar_reference(&ctx, &stream, &off, &rows);
+            let input = upload_f32(&ctx, rows.as_flattened());
+            let span = input.range(0, input.bytes()).unwrap();
+            let actual = super::super::exl3::forward(&ctx, &stream, &on, span).unwrap();
+            assert_eq!(bits(&read(&ctx, &actual)), bits(&expected));
+        }
+    }
+
+    /// Experts served by the CPU, whether a whole layer (offload) or the picks that miss the
+    /// bank (split), agree with the device layer up to the precision the device publishes at.
+    /// The two paths use the same weights, so the gap is bf16 rounding of intermediates plus the
+    /// device's fp16 rounding of each decoded weight.
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn cpu_served_experts_match_the_device_layer_within_published_precision() {
+        use crate::family::flint::cpu_moe::{self, CpuMoeConfig};
+        /// Clears the engine even when an assertion fails, so no later test inherits it.
+        struct Cleared;
+        impl Drop for Cleared {
+            fn drop(&mut self) {
+                cpu_moe::install(CpuMoeConfig::default()).unwrap();
+            }
+        }
+        let _cleared = Cleared;
+        for (offload, split) in [(1, 0), (0, 32)] {
+            cpu_moe::install(CpuMoeConfig::default()).unwrap();
+            cpu_moe::install(CpuMoeConfig::new(offload, split, 2).unwrap()).unwrap();
+            let directory = fixture().write();
+            let ctx = CudaContext::new().expect("native tiny fixture requires actual CUDA");
+            let stream = ctx.stream().unwrap();
+            let resident = load_flint_fixture(&ctx, &stream, directory.path(), limits()).unwrap();
+            let cached = FlintExl3Resident::load_cached_fixture(
+                &ctx,
+                &stream,
+                directory.path(),
+                limits(),
+                224,
+            )
+            .unwrap();
+            let (off, on) = (resident.layer(1).unwrap().ffn, cached.layer(1).unwrap().ffn);
+            let rows = test_rows();
+            // The routes pick experts first..first+32; the bank holds experts 0..224, so the
+            // split mode computes the experts from 224 up on the CPU.
+            for first in [224, 32, 128] {
+                set_routes(&off, &stream, first);
+                set_routes(&on, &stream, first);
+                let (expected, _, _) = scalar_reference(&ctx, &stream, &off, &rows);
+                let input = upload_f32(&ctx, rows.as_flattened());
+                let span = input.range(0, input.bytes()).unwrap();
+                let actual = super::super::exl3::forward(&ctx, &stream, &on, span).unwrap();
+                let got = read(&ctx, &actual);
+                let norm = |values: &[f32]| values.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let diff: Vec<f32> = got.iter().zip(&expected).map(|(a, b)| a - b).collect();
+                let relative = norm(&diff) / norm(&expected);
+                assert!(
+                    relative < 3e-2,
+                    "offload={offload} split={split} first={first}: relative error {relative}"
+                );
+            }
+            let moe = cpu_moe::active().unwrap();
+            assert!(
+                moe.summary().contains("pairs=") && !moe.summary().contains("pairs=0 "),
+                "{}",
+                moe.summary()
+            );
+        }
+    }
+
+    /// With the router's picks kept on the device, a single-row layer of a resident load writes
+    /// the bytes of the host-routed layer for every route, and a banked load offers no pick bank.
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn device_picks_match_the_host_routed_layer_bitwise() {
+        let directory = fixture().write();
+        let ctx = CudaContext::new().expect("native tiny fixture requires actual CUDA");
+        let stream = ctx.stream().unwrap();
+        let resident = load_flint_fixture(&ctx, &stream, directory.path(), limits()).unwrap();
+        let ffn = resident.layer(1).unwrap().ffn;
+        let FlintFfnView::Moe { experts, .. } = &ffn else {
+            panic!("expected MoE")
+        };
+        assert!(
+            experts.pick_bank(&ctx).unwrap().is_some(),
+            "a resident load must offer a pick bank"
+        );
+        let rows = test_rows();
+        for first in [224, 32, 128, 0, 100] {
+            set_routes(&ffn, &stream, first);
+            for row in rows.iter().take(3) {
+                let input = upload_f32(&ctx, row);
+                let span = input.range(0, input.bytes()).unwrap();
+                let host = super::super::exl3::forward(&ctx, &stream, &ffn, span).unwrap();
+                let device =
+                    super::super::exl3::forward_with(&ctx, &stream, &ffn, span, true).unwrap();
+                assert_eq!(
+                    bits(&read(&ctx, &host)),
+                    bits(&read(&ctx, &device)),
+                    "routes from {first}"
+                );
+            }
+        }
+        let cached =
+            FlintExl3Resident::load_cached_fixture(&ctx, &stream, directory.path(), limits(), 224)
+                .unwrap();
+        let banked = cached.layer(1).unwrap().ffn;
+        let FlintFfnView::Moe { experts, .. } = &banked else {
+            panic!("expected MoE")
+        };
+        assert!(experts.pick_bank(&ctx).unwrap().is_none());
+    }
+
+    /// While the picks are on the device a host expert lookup is refused; without them it serves
+    /// the expert.
+    #[test]
+    #[ignore = "needs a CUDA device and pinned memory; no absent-device skip"]
+    fn host_expert_lookup_is_refused_while_picks_are_on_the_device() {
+        let directory = fixture().write();
+        let ctx = CudaContext::new().expect("native tiny fixture requires actual CUDA");
+        let stream = ctx.stream().unwrap();
+        let resident = load_flint_fixture(&ctx, &stream, directory.path(), limits()).unwrap();
+        let ffn = resident.layer(1).unwrap().ffn;
+        let FlintFfnView::Moe { experts, .. } = &ffn else {
+            panic!("expected MoE")
+        };
+        let mut frame = Frame::new(&ctx, &stream).unwrap();
+        let mut scratch = exl3::Scratch::for_rows(&ctx, &ffn, 1).unwrap();
+        let ids = frame
+            .allocate(RowShape {
+                rows: 1,
+                columns: TOP_K,
+            })
+            .unwrap();
+        let bank = experts.pick_bank(&ctx).unwrap().unwrap();
+        let mut effects = exl3::RoutedCuda {
+            frame: &mut frame,
+            scratch: &mut scratch,
+            grouped: None,
+            experts,
+            packed_pointwise: false,
+            grouped_gather: false,
+            picks: Some((bank, ids)),
+        };
+        assert!(effects.host_expert(3).is_err());
+        effects.picks = None;
+        assert!(effects.host_expert(3).is_ok());
+    }
+
+    fn test_rows() -> [[f32; 128]; 8] {
+        let mut rows = [[0.0; 128]; 8];
+        for (index, row) in rows.iter_mut().enumerate() {
+            row[index] = (index + 1) as f32 / 128.0;
+            row[16 + index] = -1.0 / 256.0;
+        }
+        rows
+    }
+
+    /// Every pass here routes 32 distinct experts, so any bank of at least 32 serves it; a
+    /// smaller bank than the 224 of the first fixture only changes which experts must be copied.
+    fn cached_bank_matches_scalar_and_resident(slots: usize) {
+        let directory = fixture().write();
+        let ctx = CudaContext::new().expect("native tiny fixture requires actual CUDA");
+        let stream = ctx.stream().unwrap();
+        let resident = load_flint_fixture(&ctx, &stream, directory.path(), limits()).unwrap();
+        let cached = FlintExl3Resident::load_cached_fixture(
+            &ctx,
+            &stream,
+            directory.path(),
+            limits(),
+            slots,
+        )
+        .unwrap();
+        assert_eq!(cached.banked_experts(), Some(slots));
         let source_byte = cached.test_host_cache_byte().unwrap();
         // Each tiny expert has three (8192-byte trellis + two 512-byte scales) projections.
         let stride = 3 * (8192 + 512 + 512);
         let nonrouted = resident.device_weight_bytes() - 2 * 256 * stride;
-        assert_eq!(cached.device_weight_bytes(), nonrouted + 2 * 224 * stride);
+        assert_eq!(
+            cached.device_weight_bytes(),
+            nonrouted + 2 * slots as u64 * stride
+        );
         assert!(resident.device_weight_bytes() < 64 << 20);
         let off = resident.layer(1).unwrap().ffn;
         let on = cached.layer(1).unwrap().ffn;
@@ -935,11 +1275,7 @@ mod cached_tiny {
         };
         assert_eq!(on_bank.shape(0).unwrap(), (128, 128));
         assert!(on_bank.get(0).is_err(), "metadata must not prepare payload");
-        let mut rows = [[0.0; 128]; 8];
-        for (index, row) in rows.iter_mut().enumerate() {
-            row[index] = (index + 1) as f32 / 128.0;
-            row[16 + index] = -1.0 / 256.0;
-        }
+        let rows = test_rows();
         let mut seen = std::collections::BTreeSet::new();
         let mut previous = None;
         for first in [224, 32, 64, 96, 128, 160, 192, 224] {

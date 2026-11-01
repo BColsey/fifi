@@ -214,15 +214,25 @@ impl ExecutorOps for QwenResidentStep<'_> {
             context_limit: self.context_limit(),
         };
         self.log_prefill_job();
-        st.decode(self, generation, &limits)
+        let Some(mut speculator) = self.speculator.take() else {
+            return st.decode(self, generation, &limits);
+        };
+        let batch = speculator.decode(st, self, generation, &limits);
+        self.speculator = Some(speculator);
+        batch
     }
 
     fn after_emit(&mut self) -> Result<()> {
         self.complete_prefix_save()
     }
 
-    /// No transient routing or draft state exists: the step keeps nothing between turns.
-    fn boundary(&mut self, _st: &mut DecodeSession) {}
+    /// No transient routing or draft state exists: the step keeps nothing between turns. A
+    /// speculative step reports its counters.
+    fn boundary(&mut self, _st: &mut DecodeSession) {
+        if let Some(speculator) = self.speculator.as_ref().filter(|s| s.stats.used()) {
+            eprintln!("q36 cuda: {}", speculator.stats.line());
+        }
+    }
 
     /// Exports committed state into the bounded prefix store. Pinned CUDA stages Block and Tip
     /// entries; the admitted limits determine how many entries remain. The caller supplies `kind`,

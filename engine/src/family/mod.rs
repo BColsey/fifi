@@ -15,6 +15,14 @@ pub mod gguf_model;
 pub mod keys;
 pub mod layer_weights;
 pub mod nemotron35;
+// Conversation parking: host-tier store mechanics and tests.
+// The device-side path (cut at the `keep` position, staging upload,
+// prefix adoption) does not exist yet, so only tests use the store.
+#[allow(
+    dead_code,
+    reason = "no engine path calls the store yet; only its tests do"
+)]
+pub(crate) mod parking;
 #[allow(
     dead_code,
     reason = "the Projector seam serves the Flash-Next step and the planned Qwen3.6 CUDA adapter; until an executor wires them, only tests call it"
@@ -39,6 +47,11 @@ pub(crate) mod sampler;
 )]
 pub(crate) mod session;
 pub mod spec;
+#[allow(
+    dead_code,
+    reason = "the CUDA n-gram step reaches the repeat index, the accept rule, the window and the driver; the MTP chain, the calibrator and the hybrid and dynamic settings are reached only from tests until the MTP draft step exists"
+)]
+pub(crate) mod speculate;
 pub mod weight_plan;
 
 pub use keys::{KeyTier, TierAssignment};

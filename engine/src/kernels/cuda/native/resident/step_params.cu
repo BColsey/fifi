@@ -54,6 +54,7 @@ constexpr int kPoison = -1;              // written into pos, kv_len and kv_slot
 constexpr int kMaxAdvance = 4096;
 constexpr int kMaskNonFinite = INFERENCE_CUDA_STATUS_NONFINITE_LOGITS;
 constexpr int kMaskInvalidState = INFERENCE_CUDA_STATUS_INVALID_STEP_STATE;
+constexpr int kMaskExl3 = INFERENCE_CUDA_STATUS_EXL3_ARITHMETIC;
 static_assert(kBlocks == kThreads, "argmax_final_k reads one partial per thread");
 
 /* True when (v, i) is better than (bv, bi): larger value, or equal value and lower index. A NaN
@@ -154,6 +155,15 @@ __global__ void step_begin_k(inference_cuda_step_params *p) {
     p->status = cleared;
 }
 
+__global__ void exl3_flag_clear_k(uint32_t *flag) { *flag = 0; }
+
+/* The projections only OR bit 0 into the word, and nothing else runs between this kernel and the
+ * projections before it, so the exchange reads the whole verdict of the step. */
+__global__ void exl3_flag_fold_k(inference_cuda_step_params *p, uint32_t *flag) {
+    const uint32_t seen = atomicExch(flag, 0u);
+    if (seen & 1u) atomicOr(&p->status, kMaskExl3);
+}
+
 __global__ void step_advance_k(inference_cuda_step_params *p, int m) {
     const long long add = m;
     const bool ok = step_state_valid(p->pos, p->kv_len, p->kv_slot) && (long long)p->pos + add <= kPosMax;
@@ -239,6 +249,34 @@ extern "C" int inference_cuda_argmax_launch(const inference_cuda_argmax_args *a,
         }
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_exl3_flag_clear_launch(void *flag, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (flag == NULL || !aligned_to(flag, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        exl3_flag_clear_k<<<1, 1, 0, (cudaStream_t)stream>>>((uint32_t *)flag);
+        return launch_status(out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_exl3_flag_fold_launch(void *params, void *flag, void *stream,
+                                                    int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (params == NULL || flag == NULL || !aligned_to(params, 4) || !aligned_to(flag, 4)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        exl3_flag_fold_k<<<1, 1, 0, (cudaStream_t)stream>>>((inference_cuda_step_params *)params,
+                                                            (uint32_t *)flag);
+        return launch_status(out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }

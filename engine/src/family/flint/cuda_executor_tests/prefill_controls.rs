@@ -444,9 +444,13 @@ fn open_control(case: &Case, arm: &str, root: &Path) -> Checked<(FlintExecutor, 
         context_limit: case.context_capacity as u32,
         kv_profile: "f16".into(),
         prefill_chunk_size: rows,
+
+        cpu_moe_offload_layers: 0,
+        cpu_moe_split_experts: 0,
+        cpu_moe_threads: 0,
     };
     let (executor, session) =
-        FlintExecutor::open(root, &options, vec![2], VOCAB).map_err(engine_error)?;
+        FlintExecutor::open(root, &options, vec![2], VOCAB, [0u8; 32]).map_err(engine_error)?;
     require(
         executor.prefill_chunk_size == rows as usize
             && executor.context_limit == case.context_capacity

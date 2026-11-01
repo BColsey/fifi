@@ -64,6 +64,21 @@ curl http://127.0.0.1:18791/v1/chat/completions \
 ```
 
 Run the tests with `cargo test`.
+A few tests read data that is generated outside Git, such as parity fixtures.
+They skip when that data is absent, and they fail instead when `FIFI_TEST_REQUIRE_DATA` is set to exactly `1`; any other value leaves them skipping.
+A skipping test still reports `ok`. Its skip message appears only when you run `cargo test -- --nocapture`.
+Set it on any host that is supposed to have the data, so a gate cannot pass without running those tests.
+
+Tests that need model weights or recorded data on your machine find them by name.
+Each name is an environment variable, or else a key in the JSON object `~/.config/fifi/test-paths.json`, which lives outside the repository so every worktree shares it.
+The names are `Q36_CUDA_MODEL_DIR`, `FIFI_QWEN36_MODEL_DIR` (a Qwen3.6 model directory), `Q36_CUDA_COHORT_DIR` (the recorded prompt cohort), `FLINT_P01_GGUF_LOGITS` (a cached logits file) and `FIFI_SCRATCH_ROOT` (the directory under which tests may write).
+An `#[ignore]`d test that needs one of them fails with a message naming it when it is unset; the Qwen3.6 tokenizer tests skip instead.
+`FIFI_SCRATCH_ROOT` is also read as an environment variable only, never from the file, by the macOS native qualification code outside test builds, so set it there.
+
+The Git hooks in `.githooks/` are opt-in. Enable them in your clone with `git config --local core.hooksPath .githooks`.
+They need `python3`, and they fail if `scripts/check_staged.py` is missing rather than skipping the checks.
+GitHub Actions runs the formatting, Clippy, CPU-only test and script checks on every push to `main` and every pull request.
+The GPU and Mac qualification runs are not part of that workflow.
 
 ## Documentation
 
@@ -90,6 +105,7 @@ Run the tests with `cargo test`.
 - [How fifi plans memory](doc/explanation/memory.md)
 - [How conversation reuse works](doc/explanation/prefix-reuse.md)
 - [Benchmarks](doc/explanation/benchmarks.md)
+- [Current status](doc/explanation/status.md)
 
 ## License
 

@@ -52,6 +52,7 @@ impl Buffers {
             n: 128,
             bits_twice: 6,
             book: Codebook::Mul1,
+            fused: false,
         }
     }
 }

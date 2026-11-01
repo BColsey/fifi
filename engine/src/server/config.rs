@@ -326,7 +326,10 @@ mod tests {
         let q8 = load(&value.to_string()).expect("explicit native Q8 profile");
         assert_eq!(q8.engines[0].flint.as_ref().unwrap().kv_profile, "q8");
         value["engines"][0]["flint"]["kv_profile"] = serde_json::json!("q4");
-        assert!(message(load(&value.to_string())).contains("explicit kv_profile f16 or q8"));
+        assert!(message(load(&value.to_string())).contains("explicit kv_profile f16, q8 or q8k"));
+        value["engines"][0]["flint"]["kv_profile"] = serde_json::json!("q8k");
+        let q8k = load(&value.to_string()).expect("explicit native Q8K mixed profile");
+        assert_eq!(q8k.engines[0].flint.as_ref().unwrap().kv_profile, "q8k");
         value["engines"][0].as_object_mut().unwrap().remove("flint");
         assert!(load(&value.to_string()).unwrap().engines[0].flint.is_none());
     }

@@ -39,15 +39,19 @@ pub(crate) struct CudaPrefixEnv {
     /// The midrows legacy rollback arming (`FIFI_EXL3_LEGACY=1`): the
     /// rows 64..=144 routing selector.
     pub(crate) exl3_legacy: bool,
-    /// The expert host-cache opt-in (`FIFI_FLINT_CUDA_EXPERT_CACHE`):
+    /// The expert host cache forced on (`FIFI_FLINT_CUDA_EXPERT_CACHE=1`):
     /// changes the load path and therefore the numerics a snapshot binds.
     pub(crate) expert_cache: bool,
+    /// The layer-major prefill mode (`FIFI_EXL3_LAYER_MAJOR`): each mode runs its projections
+    /// on different matrix kernels, so the planes a snapshot holds are only valid for a
+    /// session in the same mode.
+    pub(crate) layer_major: crate::family::flint::settings::LayerMajor,
 }
 
 /// The numeric-path fingerprint a stored CUDA prefix binds: context limit,
-/// prefill chunk size, kv profile, the five effective selectors (alloc
-/// cache, late health, packed pointwise, midrows legacy, expert cache),
-/// and the model root. Mirrors the MLX `FlintPath` contract.
+/// prefill chunk size, kv profile, the six effective selectors (alloc
+/// cache, late health, packed pointwise, midrows legacy, expert cache,
+/// layer-major), and the model root. Mirrors the MLX `FlintPath` contract.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CudaPrefixPath {
     limit: u32,
@@ -99,7 +103,7 @@ impl CudaPrefixPath {
 /// profiles. Pure in the profile string so the refusal is testable on any
 /// host.
 pub(crate) fn profile_allows_prefix(profile: &str) -> Result<()> {
-    if profile == "q8" {
+    if profile == "q8" || profile == "q8k" {
         return Err(EngError::BadRequest(
             "flint cuda prefix reuse requires kv_profile f16: the q8 scale planes are not integrated".into(),
         ));

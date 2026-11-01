@@ -12,38 +12,25 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// The tiny in-repo fixture (same strings as tests.rs) for fast units.
-/// The real Qwen3.6 model dir for on-disk corpus tests: the
-/// `FIFI_QWEN36_MODEL_DIR` env override (a directory, or a
-/// `tokenizer.json` file — its parent is used) when set, else the
-/// default path. Returns None (and prints why) when the dir is absent, so
-/// hosts without the weights SKIP these tests instead of failing them.
+/// The real Qwen3.6 model dir for on-disk corpus tests: `FIFI_QWEN36_MODEL_DIR`
+/// (a directory, or a `tokenizer.json` file — its parent is used) from the
+/// environment or `~/.config/fifi/test-paths.json`. Returns None (and prints
+/// why) when it is not configured, so hosts without the weights SKIP these
+/// tests instead of failing them; `FIFI_TEST_REQUIRE_DATA` makes that
+/// a failure.
 pub(crate) fn qwen_model_dir() -> Option<std::path::PathBuf> {
-    let dir = match std::env::var_os("FIFI_QWEN36_MODEL_DIR") {
-        Some(v) => {
-            let p = std::path::PathBuf::from(v);
-            if p.is_file() {
-                p.parent().map(std::path::Path::to_path_buf).unwrap_or(p)
-            } else {
-                p
-            }
-        }
-        None => std::path::PathBuf::from("/media/dan/nvme/models/qwen3.6-35b-a3b"),
+    let dir = match crate::test_paths::or_skip("FIFI_QWEN36_MODEL_DIR")? {
+        p if p.is_file() => p.parent().map(std::path::Path::to_path_buf).unwrap_or(p),
+        p => p,
     };
-    let present = dir.join("tokenizer.json").is_file();
-    if !present && std::env::var_os("FIFI_QWEN36_MODEL_DIR").is_some() {
+    if !dir.join("tokenizer.json").is_file() {
         panic!(
             "FIFI_QWEN36_MODEL_DIR is set but {:?} has no tokenizer.json — \
              a typo silently skipped every real-model test",
             dir
         );
     }
-    if !present {
-        eprintln!(
-            "qwen model dir {:?} not on disk: SKIPPING real-model tests",
-            dir
-        );
-    }
-    present.then_some(dir)
+    Some(dir)
 }
 
 pub(crate) const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":100,"content":" world","special":false,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false},{"id":101,"content":"<|end|>","special":true,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false}],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":true},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"h":0,"e":1,"l":2,"o":3,"Ġ":4,"w":5,"r":6,"d":7,"hello":8,"a":9,"b":10,"he":11,"hel":12,"hell":13},"merges":[["h","e"],["he","l"],["hel","l"],["hell","o"]]}}"#;

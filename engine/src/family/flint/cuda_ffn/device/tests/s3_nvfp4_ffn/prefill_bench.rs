@@ -132,7 +132,7 @@ fn mode_requires_explicit_dry_or_timing() {
 }
 
 #[test]
-#[ignore = "requires admitted CUDA and pinned real tensors; timing mode requires exclusive coordinator GO"]
+#[ignore = "requires admitted CUDA and pinned real tensors; timing mode requires an exclusive GPU window"]
 fn nvfp4_dense_shared_prefill_microbench() {
     let mode = std::env::var("FIFI_FLINT_MMQ_BENCH_MODE").expect("explicit dry or timing mode");
     let measured = timing_mode(&mode);

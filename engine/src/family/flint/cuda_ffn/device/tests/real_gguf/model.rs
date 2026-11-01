@@ -45,7 +45,7 @@ pub(in crate::family::flint::cuda_ffn::device::tests) fn head(
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission, pinned full49 oracle and GGUF"]
+#[ignore = "needs the whole GPU, pinned full49 oracle and GGUF"]
 fn full49_eight_prefixes_match_shared_layers_and_llama_first_token() {
     run(true);
 }

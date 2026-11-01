@@ -55,6 +55,7 @@ fn row_ops_multiply_c_abi_rejects_bad_broadcast_and_written_aliases() {
             rows: 1,
             columns: 4,
             rhs_columns: 4,
+            fused_publish: 0,
         };
         match case {
             0 => a.rhs_columns = 2,

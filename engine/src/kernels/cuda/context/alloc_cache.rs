@@ -33,11 +33,91 @@ pub(super) struct TestNativeCalls {
     free_status: Option<std::ffi::c_int>,
 }
 
+/// When a returned block must wait for the device before it goes idle.
+///
+/// The default is a device-wide synchronize on every return. The lazy mode skips it while the
+/// adapter owns a single stream: the next user of the block is ordered behind the old one by that
+/// stream. The two things the stream does not order are host-synchronous writes into a cached
+/// block and a second stream, so those settle first (see [`AllocCache::settle`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReturnPolicy {
+    lazy: bool,
+    /// Blocks went idle without a device synchronize since the last one.
+    dirty: bool,
+}
+
+/// What a returned block does before it goes idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OnReturn {
+    Synchronize,
+    Defer,
+}
+
+impl ReturnPolicy {
+    /// Switches the mode and keeps what is still unsettled.
+    pub(super) fn with_lazy(mut self, lazy: bool) -> Self {
+        self.lazy = lazy;
+        self
+    }
+
+    /// The decision for a block returned while the adapter owns `streams` streams.
+    pub(super) fn on_return(&mut self, streams: usize) -> OnReturn {
+        if self.lazy && streams <= 1 {
+            self.dirty = true;
+            OnReturn::Defer
+        } else {
+            OnReturn::Synchronize
+        }
+    }
+
+    /// A device synchronize completed: every block returned so far is settled.
+    pub(super) fn synchronized(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Whether a host-synchronous write or a new stream must synchronize first.
+    pub(super) fn needs_settle(&self) -> bool {
+        self.dirty
+    }
+}
+
+/// What the cache serves and keeps: blocks up to `max_block` bytes, at most `max_idle` idle bytes
+/// in at most [`MAX_IDLE_SLOTS`] blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CacheLimits {
+    pub(super) max_block: usize,
+    pub(super) max_idle: usize,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            max_block: MAX_BLOCK_BYTES,
+            max_idle: MAX_IDLE_BYTES,
+        }
+    }
+}
+
+impl CacheLimits {
+    /// Whether a returned block of `bytes` goes idle, given `slots` blocks and `idle` bytes held.
+    pub(super) fn keeps(&self, slots: usize, idle: usize, bytes: usize) -> bool {
+        slots < MAX_IDLE_SLOTS && bytes <= self.max_idle.saturating_sub(idle)
+    }
+}
+
 pub(super) struct AllocCache {
     lease: Rc<Lease>,
     idle: RefCell<Vec<RawDevice>>,
     idle_bytes: Cell<usize>,
+    /// The largest block served from the cache and the most bytes it keeps idle.
+    limits: Cell<CacheLimits>,
+    policy: Cell<ReturnPolicy>,
     terminal: AtomicBool,
+    #[cfg(test)]
+    syncs: Cell<usize>,
+    /// Counts the synchronizes without calling the device, for host tests.
+    #[cfg(test)]
+    fake_sync: Cell<bool>,
     #[cfg(test)]
     hits: Cell<usize>,
     #[cfg(test)]
@@ -75,7 +155,13 @@ impl AllocCache {
             lease,
             idle: RefCell::new(idle),
             idle_bytes: Cell::new(0),
+            limits: Cell::new(CacheLimits::default()),
+            policy: Cell::new(ReturnPolicy::default()),
             terminal: AtomicBool::new(false),
+            #[cfg(test)]
+            syncs: Cell::new(0),
+            #[cfg(test)]
+            fake_sync: Cell::new(false),
             #[cfg(test)]
             hits: Cell::new(0),
             #[cfg(test)]
@@ -155,8 +241,40 @@ impl AllocCache {
         }
     }
 
+    /// What a returned block does before it goes idle: the device synchronize of the default,
+    /// or nothing while the lazy mode holds.
+    fn settle_for_return(&self) -> Result<(), EngError> {
+        let mut policy = self.policy.get();
+        let action = policy.on_return(self.lease.streams());
+        self.policy.set(policy);
+        if action == OnReturn::Synchronize {
+            self.synchronize()?;
+            policy.synchronized();
+            self.policy.set(policy);
+        }
+        Ok(())
+    }
+
+    /// Selects the lazy return (see [`ReturnPolicy`]); the default keeps the synchronize.
+    pub(super) fn set_lazy_return(&self, lazy: bool) {
+        self.policy.set(self.policy.get().with_lazy(lazy));
+    }
+
+    /// Synchronizes the device when blocks went idle unsynchronized, before work that the
+    /// stream does not order (a host-synchronous write, another stream) can touch them.
+    pub(super) fn settle(&self) -> Result<(), EngError> {
+        if self.policy.get().needs_settle() {
+            self.synchronize()?;
+            let mut policy = self.policy.get();
+            policy.synchronized();
+            self.policy.set(policy);
+        }
+        Ok(())
+    }
+
     pub(super) fn copy(&self, raw: &RawDevice, bytes: &[u8]) -> Result<(), EngError> {
         let _dispatch = self.enter()?;
+        self.settle()?;
         #[cfg(all(test, feature = "cuda-fault-qualification"))]
         self.inject(TestFaultStage::BeforeOwnedCopy);
         #[cfg(all(test, feature = "cuda-fault-qualification"))]
@@ -179,6 +297,13 @@ impl AllocCache {
     }
 
     fn synchronize(&self) -> Result<(), EngError> {
+        #[cfg(test)]
+        {
+            self.syncs.set(self.syncs.get() + 1);
+            if self.fake_sync.get() {
+                return Ok(());
+            }
+        }
         #[cfg(all(test, feature = "cuda-fault-qualification"))]
         self.inject(TestFaultStage::Sync);
         #[cfg(all(test, feature = "cuda-fault-qualification"))]
@@ -206,21 +331,32 @@ impl AllocCache {
         })
     }
 
+    /// Sets the limits; blocks already idle stay until reused or drained.
+    pub(super) fn set_limits(&self, limits: CacheLimits) {
+        self.limits.set(limits);
+    }
+
+    pub(super) fn max_block(&self) -> usize {
+        self.limits.get().max_block
+    }
+
     pub(super) fn return_block(&self, raw: RawDevice) {
         let _dispatch = DispatchGuard::enter(&TERMINAL);
         if self.is_terminal() {
             self.quarantine(raw);
             return;
         }
-        if self.synchronize().is_err() {
+        if self.settle_for_return().is_err() {
             self.quarantine(raw);
             return;
         }
         let bytes = raw.bytes();
         let mut idle = self.idle.borrow_mut();
-        if idle.len() < MAX_IDLE_SLOTS
-            && idle.len() < idle.capacity()
-            && bytes <= MAX_IDLE_BYTES - self.idle_bytes.get()
+        if idle.len() < idle.capacity()
+            && self
+                .limits
+                .get()
+                .keeps(idle.len(), self.idle_bytes.get(), bytes)
         {
             self.idle_bytes.set(self.idle_bytes.get() + bytes);
             idle.push(raw);
@@ -264,6 +400,9 @@ impl AllocCache {
             return Ok(());
         }
         self.synchronize()?;
+        let mut policy = self.policy.get();
+        policy.synchronized();
+        self.policy.set(policy);
         loop {
             let raw = self.idle.borrow_mut().pop();
             let Some(raw) = raw else { return Ok(()) };
@@ -441,15 +580,242 @@ impl super::CudaContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_limits_decide_what_goes_idle() {
+        use super::CacheLimits;
+        let default = CacheLimits::default();
+        assert!(default.keeps(0, 0, MAX_BLOCK_BYTES));
+        assert!(default.keeps(0, MAX_IDLE_BYTES - 5, 5));
+        assert!(!default.keeps(0, MAX_IDLE_BYTES - 5, 6));
+        assert!(!default.keeps(MAX_IDLE_SLOTS, 0, 1));
+        let tall = CacheLimits {
+            max_block: 64 << 20,
+            max_idle: 320 << 20,
+        };
+        assert!(tall.keeps(10, 100 << 20, 16 << 20));
+        assert!(!tall.keeps(10, 310 << 20, 16 << 20));
+        // Idle bytes above the limit (after lowering it) keep nothing instead of wrapping.
+        assert!(!tall.keeps(0, 400 << 20, 1));
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{cell::Cell, rc::Rc};
 
     use super::super::{CudaContext, SLOTS, TERMINAL, native};
     #[cfg(feature = "cuda-fault-qualification")]
     use super::TestFaultStage;
-    use super::{AllocCache, Lease, MAX_BLOCK_BYTES, MAX_IDLE_BYTES, MAX_IDLE_SLOTS};
+    use super::{
+        AllocCache, Lease, MAX_BLOCK_BYTES, MAX_IDLE_BYTES, MAX_IDLE_SLOTS, OnReturn, ReturnPolicy,
+    };
     use crate::EngError;
     use crate::kernels::cuda::{CapturePlan, guard::DispatchGuard, native::Activations};
+
+    #[test]
+    fn the_default_return_always_synchronizes_and_never_defers_a_settle() {
+        let mut policy = ReturnPolicy::default();
+        for streams in [0, 1, 2, 5] {
+            assert_eq!(policy.on_return(streams), OnReturn::Synchronize);
+            assert!(!policy.needs_settle(), "streams={streams}");
+        }
+    }
+
+    #[test]
+    fn the_lazy_return_defers_only_while_the_adapter_owns_at_most_one_stream() {
+        let mut policy = ReturnPolicy::default().with_lazy(true);
+        assert!(!policy.needs_settle());
+        for streams in [0, 1] {
+            assert_eq!(
+                policy.on_return(streams),
+                OnReturn::Defer,
+                "streams={streams}"
+            );
+            assert!(policy.needs_settle());
+            policy.synchronized();
+            assert!(!policy.needs_settle());
+        }
+        // A block that may have run on either of two streams is not ordered by one of them.
+        for streams in [2, 3, usize::MAX] {
+            assert_eq!(
+                policy.on_return(streams),
+                OnReturn::Synchronize,
+                "streams={streams}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_blocks_stay_unsettled_until_a_synchronize_and_a_later_return_cannot_hide_them() {
+        let mut policy = ReturnPolicy::default().with_lazy(true);
+        assert_eq!(policy.on_return(1), OnReturn::Defer);
+        assert_eq!(policy.on_return(1), OnReturn::Defer);
+        assert!(policy.needs_settle());
+        // A synchronizing return (a second stream appeared) settles everything before it.
+        assert_eq!(policy.on_return(2), OnReturn::Synchronize);
+        policy.synchronized();
+        assert!(!policy.needs_settle());
+        assert_eq!(policy.on_return(1), OnReturn::Defer);
+        assert!(policy.needs_settle());
+    }
+
+    /// A cache that counts synchronizes instead of calling the device.
+    fn counting_cache(
+        slots: &'static AtomicUsize,
+        failed: &'static AtomicBool,
+    ) -> (AllocCache, Rc<Lease>) {
+        let lease = Lease::acquire(slots, failed).expect("host test lease");
+        let cache = AllocCache::new(Rc::clone(&lease)).expect("host test cache");
+        cache.fake_sync.set(true);
+        (cache, lease)
+    }
+
+    #[test]
+    fn the_default_return_synchronizes_every_block_and_the_lazy_one_only_on_several_streams() {
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let (cache, lease) = counting_cache(&SLOTS, &FAILED);
+        lease.note_stream();
+        for _ in 0..3 {
+            cache.settle_for_return().unwrap();
+        }
+        assert_eq!(
+            cache.syncs.get(),
+            3,
+            "the default synchronizes every return"
+        );
+        cache.set_lazy_return(true);
+        for _ in 0..3 {
+            cache.settle_for_return().unwrap();
+        }
+        assert_eq!(
+            cache.syncs.get(),
+            3,
+            "one stream: lazy returns do not synchronize"
+        );
+        lease.note_stream();
+        cache.settle_for_return().unwrap();
+        assert_eq!(
+            cache.syncs.get(),
+            4,
+            "a second stream synchronizes every return"
+        );
+        cache.settle_for_return().unwrap();
+        assert_eq!(cache.syncs.get(), 5);
+        drop(cache);
+    }
+
+    #[test]
+    fn settling_synchronizes_once_per_batch_of_deferred_returns() {
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let (cache, lease) = counting_cache(&SLOTS, &FAILED);
+        cache.set_lazy_return(true);
+        // No stream yet: returns defer, and the first stream must settle them.
+        assert_eq!(lease.streams(), 0);
+        cache.settle_for_return().unwrap();
+        cache.settle_for_return().unwrap();
+        assert_eq!(cache.syncs.get(), 0);
+        cache.settle().unwrap();
+        assert_eq!(cache.syncs.get(), 1);
+        cache.settle().unwrap();
+        assert_eq!(cache.syncs.get(), 1, "nothing went idle since");
+        cache.settle_for_return().unwrap();
+        cache.settle().unwrap();
+        assert_eq!(cache.syncs.get(), 2);
+    }
+
+    #[test]
+    fn switching_the_mode_keeps_the_returns_that_are_still_unsettled() {
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let (cache, lease) = counting_cache(&SLOTS, &FAILED);
+        lease.note_stream();
+        cache.set_lazy_return(true);
+        cache.settle_for_return().unwrap();
+        cache.set_lazy_return(false);
+        cache.settle().unwrap();
+        assert_eq!(
+            cache.syncs.get(),
+            1,
+            "going back to the default must not drop the debt"
+        );
+        // A synchronizing return settles what an earlier deferral left behind.
+        cache.set_lazy_return(true);
+        cache.settle_for_return().unwrap();
+        cache.set_lazy_return(false);
+        cache.settle_for_return().unwrap();
+        assert_eq!(cache.syncs.get(), 2);
+        cache.settle().unwrap();
+        assert_eq!(cache.syncs.get(), 2);
+    }
+
+    #[test]
+    fn the_lease_counts_every_stream_that_was_created() {
+        static SLOTS: AtomicUsize = AtomicUsize::new(0);
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let lease = Lease::acquire(&SLOTS, &FAILED).expect("host test lease");
+        assert_eq!(lease.streams(), 0);
+        for expected in 1..=3 {
+            lease.note_stream();
+            assert_eq!(lease.streams(), expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native CUDA and an exclusive test process (--test-threads=1)"]
+    fn lazy_return_skips_the_synchronize_on_one_stream_and_settles_before_a_host_write() {
+        let caps = Activations { x: 4, xf: 4, y: 4 };
+        let ctx = CudaContext::with_workspace_cache(caps, true).expect("cache context");
+        let cache = ctx.alloc_cache.as_ref().expect("cache").clone();
+        let _stream = ctx.stream().expect("only stream");
+        // Default: one synchronize per returned block.
+        for _ in 0..4 {
+            drop(ctx.allocate(64).expect("block"));
+        }
+        assert_eq!(cache.syncs.get(), 4);
+        ctx.set_lazy_alloc_return(true);
+        let before = cache.syncs.get();
+        for _ in 0..4 {
+            drop(ctx.allocate(64).expect("block"));
+        }
+        assert_eq!(cache.syncs.get(), before, "lazy returns do not synchronize");
+        // A host-synchronous write into a reused block settles the returns first, once.
+        let upload = ctx.upload(&[7u8; 64]).expect("reused block");
+        assert_eq!(cache.syncs.get(), before + 1);
+        let again = ctx.upload(&[9u8; 64]).expect("second write");
+        assert_eq!(cache.syncs.get(), before + 1, "nothing new went idle");
+        // The same holds for an overwrite of an existing cached buffer after a return.
+        drop(ctx.allocate(64).expect("block"));
+        ctx.upload_at(&again, 0, &[1u8; 8]).expect("overwrite");
+        assert_eq!(
+            cache.syncs.get(),
+            before + 2,
+            "upload_at settles inside the dispatch"
+        );
+        assert!(ctx.upload_at(&again, 60, &[1u8; 8]).is_err());
+        drop(ctx.allocate(64).expect("block"));
+        let _ = ctx.upload_at(&again, 60, &[1u8; 8]);
+        assert_eq!(
+            cache.syncs.get(),
+            before + 2,
+            "a refused write pays no synchronize"
+        );
+        ctx.upload_at(&again, 0, &[2u8; 8]).expect("overwrite");
+        assert_eq!(cache.syncs.get(), before + 3);
+        drop((upload, again));
+        // A second stream settles what is idle and returns synchronize again.
+        let settled = cache.syncs.get();
+        drop(ctx.allocate(64).expect("block"));
+        assert_eq!(cache.syncs.get(), settled);
+        let _second = ctx.stream().expect("second stream");
+        assert_eq!(cache.syncs.get(), settled + 1, "a new stream settles first");
+        let after = cache.syncs.get();
+        drop(ctx.allocate(64).expect("block"));
+        assert_eq!(
+            cache.syncs.get(),
+            after + 1,
+            "two streams synchronize every return"
+        );
+    }
 
     #[test]
     #[ignore = "requires native CUDA and an exclusive test process (--test-threads=1)"]
@@ -2041,7 +2407,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "native OOM control; request total-device-bytes+1, run alone under coordinator lease"]
+    #[ignore = "native OOM control; request total-device-bytes+1, run alone on the card"]
     fn control_oversize_oom_bypasses_cache_and_preserves_idle() {
         assert_eq!(SLOTS.load(Ordering::Acquire), 0, "exclusive process");
         let ctx =

@@ -1,7 +1,8 @@
 //! One immutable pinned source and one authoritative cache map per model.
 //!
-//! Six routed experts per row can demand at most 37 rows in 224 active slots:
-//! C32 needs 192 slots; C64 needs 384 and is refused before weight allocation.
+//! Six routed experts per row can demand at most `slots / 6` rows in a bank of `slots`
+//! resident experts per layer: a bank smaller than the prefill piece's pairs is refused
+//! before weight allocation.
 
 use std::{
     cell::{Cell, RefCell},
@@ -9,26 +10,46 @@ use std::{
 };
 
 use super::super::{
-    FfnRoles, FlintResidentLimits,
-    cache::{EXPERTS, HostBudget, HostStore, LayerCache, MissCopy},
+    FfnRoles, FlintResidentLimits, ResidentPlan,
+    cache::{
+        BANK_MARGIN_BYTES, BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode,
+        HostBudget, HostStore, LayerCache, LayerLayout, MissCopy, choose_slots, plan_bank,
+    },
     plan::plan_resident,
 };
 use super::{
     FlintExl3Resident, FlintExpertBank, FlintExpertView, PackedMatrix, PackedRange,
-    packing::{CachedPacking, Packing},
+    packing::{CachedAudit, CachedPacking, Packing},
 };
 use crate::{
     EngError,
-    family::project::cuda::Exl3MatrixView,
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf, plan},
-    weights::exl3::{Checkpoint, Matrix, flint_pack::Geometry},
+    family::{
+        flint::cpu_moe::ExpertSource,
+        project::cuda::{Exl3MatrixView, Reserve},
+    },
+    kernels::{
+        cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf, plan},
+        exl3_cpu::{Exl3Projection, ExpertView},
+    },
+    weights::exl3::{Checkpoint, Codebook, Matrix, flint_pack::Geometry},
 };
+
+/// Experts copied from the host buffer into the GPU bank since the model loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BankStats {
+    pub(crate) misses: u64,
+    pub(crate) bytes: u64,
+}
 
 pub(super) struct HostOwner {
     state: RefCell<HostState>,
     poisoned: Cell<bool>,
+    pub(super) stats: Cell<BankStats>,
     layers: Vec<usize>,
     arena_base: usize,
+    // Resident experts per layer: the most experts one pass can use from a layer.
+    pub(super) slots: usize,
+    pub(super) reason: BankReason,
 }
 
 struct HostState {
@@ -86,6 +107,89 @@ fn admit_cached(
     Ok(())
 }
 
+/// What a load asks for: the switch, how many experts per layer, and the prefill piece it must
+/// serve.
+pub(super) struct BankAsk {
+    pub(super) mode: ExpertCacheMode,
+    pub(super) request: BankRequest,
+    pub(super) rows: usize,
+}
+
+/// Whether the plain resident load of `roles` would be admitted now: the same weight bytes and the
+/// same admission sum as `load_planned`, so a context that fits keeps today's load.
+fn resident_admits(
+    context: &CudaContext,
+    roles: &ResidentPlan,
+    limits: &FlintResidentLimits,
+) -> Result<bool, EngError> {
+    let Ok(packing) = Packing::new(&roles.layout, limits) else {
+        return Ok(false);
+    };
+    let free = u64::try_from(context.memory_info()?.free).map_err(|_| overflow())?;
+    let demand = plan::Demand {
+        tensors: packing.bytes as u64,
+        kv_cache: limits.reserve.kv_cache,
+        work: limits.reserve.work,
+        headroom: limits.reserve.headroom,
+    };
+    Ok(plan::admit(&demand, free).is_ok())
+}
+
+/// The device budget of the bank: `arena_base` bytes of other weights, the reserve and the margin
+/// come off `free`; each resident expert in every routed layer costs `per_slot`.
+fn bank_budget(
+    free: u64,
+    arena_base: usize,
+    per_slot: u64,
+    reserve: &Reserve,
+) -> Result<BankBudget, EngError> {
+    let fixed = [
+        reserve.kv_cache,
+        reserve.work,
+        reserve.headroom,
+        BANK_MARGIN_BYTES,
+    ]
+    .into_iter()
+    .try_fold(arena_base as u64, u64::checked_add)
+    .ok_or_else(overflow)?;
+    Ok(BankBudget {
+        free,
+        fixed,
+        per_slot,
+    })
+}
+
+/// Experts per layer for this device, KV cache, work reserve and prefill piece.
+fn choose_bank(
+    context: &CudaContext,
+    audit: &CachedAudit,
+    limits: &FlintResidentLimits,
+    ask: &BankAsk,
+    offloaded: usize,
+) -> Result<usize, EngError> {
+    let floor = crate::family::flint::cuda_ffn::device::exl3::cache_prefill_floor(ask.rows)?;
+    let free = u64::try_from(context.memory_info()?.free).map_err(|_| overflow())?;
+    let budget = bank_budget(
+        free,
+        audit.arena_base(),
+        audit.per_slot_bytes(offloaded)?,
+        &limits.reserve,
+    )?;
+    choose_slots(ask.request, budget, floor)
+}
+
+impl HostOwner {
+    fn note_misses(&self, copies: &[MissCopy]) {
+        let mut stats = self.stats.get();
+        stats.misses += copies.len() as u64;
+        stats.bytes += copies
+            .iter()
+            .map(|copy| copy.source.bytes as u64)
+            .sum::<u64>();
+        self.stats.set(stats);
+    }
+}
+
 fn enqueue(
     context: &CudaContext,
     stream: &DeviceStream,
@@ -111,19 +215,58 @@ fn enqueue(
     Ok(())
 }
 
-pub(super) fn load_cached(
+/// Loads the model as `ask` says. The plain resident load needs no pinned store and no cache; a
+/// bank of all 256 is that load too.
+pub(super) fn load_banked(
     context: &CudaContext,
     stream: &DeviceStream,
     path: &Path,
     checkpoint: Checkpoint,
     geometry: Geometry,
     limits: FlintResidentLimits,
+    ask: BankAsk,
 ) -> Result<FlintExl3Resident, EngError> {
     let mut audit_limits = limits;
     audit_limits.max_weight_bytes = u64::MAX;
     let roles = plan_resident(path, &checkpoint, &geometry, audit_limits)?;
-    let cached = Packing::cached(&roles, &limits)?;
+    let looks_resident = ask.mode == ExpertCacheMode::Auto && ask.request == BankRequest::Fit;
+    let resident_fits = looks_resident && resident_admits(context, &roles, &limits)?;
+    let BankPlan::Bank(reason) = plan_bank(ask.mode, ask.request, resident_fits)? else {
+        return super::load::load_planned(context, stream, checkpoint, roles, limits);
+    };
+    let audit = Packing::audit_cached(&roles, &limits)?;
+    // The layers whose experts run on the CPU keep no device slots.
+    let cpu = crate::family::flint::cpu_moe::active();
+    let offloaded = cpu.as_ref().map_or(0, |moe| moe.config().offload_layers());
+    let slots = choose_bank(context, &audit, &limits, &ask, offloaded)?;
+    // CPU-served experts read the pinned host store, which a bank of all 256 never builds.
+    let slots = if cpu.is_some() && slots == EXPERTS {
+        eprintln!(
+            "Flint CPU MoE: a bank of all {EXPERTS} experts is lowered to {} so the pinned host store exists",
+            EXPERTS - 1
+        );
+        EXPERTS - 1
+    } else {
+        slots
+    };
+    if slots == EXPERTS {
+        return super::load::load_planned(context, stream, checkpoint, roles, limits);
+    }
+    let cached = audit.with_slots(slots, offloaded, reason, &limits)?;
+    load_cached(context, stream, checkpoint, roles, cached, limits)
+}
+
+fn load_cached(
+    context: &CudaContext,
+    stream: &DeviceStream,
+    checkpoint: Checkpoint,
+    roles: ResidentPlan,
+    cached: CachedPacking,
+    limits: FlintResidentLimits,
+) -> Result<FlintExl3Resident, EngError> {
     admit_cached(context, &cached, limits, checkpoint.model_config.len())?;
+    let slots = cached.layout.slot_count();
+    let reason = cached.reason;
     let packing = cached.packing;
     let mut descriptors = Vec::new();
     descriptors
@@ -212,6 +355,7 @@ pub(super) fn load_cached(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(FlintExl3Resident {
         buffer,
+        pick_tables: Vec::new(),
         host: Some(HostOwner {
             state: RefCell::new(HostState {
                 pinned,
@@ -220,8 +364,11 @@ pub(super) fn load_cached(
                 stream: stream.id(),
             }),
             poisoned: Cell::new(false),
+            stats: Cell::default(),
             layers: cached.layers,
             arena_base: cached.arena_base,
+            slots,
+            reason,
         }),
         matrices,
         plain: packing.plain,
@@ -258,7 +405,12 @@ fn fill_matrix(
             }
             write(slot, raw)?;
         } else {
-            let converted = super::load::convert_halves(raw, tensor.dtype())?;
+            let [suh_factor, svh_factor] = super::load::scale_factors(prefix);
+            let converted = super::load::convert_halves_by(
+                raw,
+                tensor.dtype(),
+                if part == 1 { suh_factor } else { svh_factor },
+            )?;
             if converted.len() != slot.bytes {
                 return Err(refused("scale disagrees with placement"));
             }
@@ -308,8 +460,9 @@ impl FlintExl3Resident {
         stream: &DeviceStream,
         path: &Path,
         limits: FlintResidentLimits,
+        slots: usize,
     ) -> Result<Self, EngError> {
-        super::load::load_cached_fixture(context, stream, path, limits)
+        super::load::load_cached_fixture(context, stream, path, limits, slots)
     }
 
     pub(crate) fn recover_expert_cache(
@@ -391,16 +544,192 @@ impl FlintExl3Resident {
     }
 }
 
+/// The routed experts of one layer, read in place from the pinned host store.
+struct PackedSource<'a> {
+    bytes: &'a [u8],
+    matrices: &'a [PackedMatrix],
+    indices: &'a [[usize; 3]],
+    geometry: LayerLayout,
+}
+
+impl PackedSource<'_> {
+    fn bytes_of(&self, base: usize, range: PackedRange) -> Result<&[u8], EngError> {
+        let start = base.checked_add(range.offset).ok_or_else(overflow)?;
+        let end = start.checked_add(range.bytes).ok_or_else(overflow)?;
+        self.bytes
+            .get(start..end)
+            .ok_or_else(|| refused("expert bytes lie outside the host store"))
+    }
+
+    fn projection(&self, base: usize, index: usize) -> Result<Exl3Projection<'_>, EngError> {
+        let matrix = self
+            .matrices
+            .get(index)
+            .ok_or_else(|| refused("unknown matrix"))?;
+        if matrix.book != Codebook::Mul1 {
+            return Err(refused("CPU experts need the mul1 codebook"));
+        }
+        Exl3Projection::new(
+            matrix.shape,
+            usize::from(matrix.bits_twice) * 8,
+            self.bytes_of(base, matrix.trellis)?,
+            self.bytes_of(base, matrix.suh)?,
+            self.bytes_of(base, matrix.svh)?,
+        )
+    }
+}
+
+impl ExpertSource for PackedSource<'_> {
+    fn expert(&self, id: usize) -> Result<ExpertView<'_>, EngError> {
+        let indices = self
+            .indices
+            .get(id)
+            .ok_or_else(|| refused("unknown routed expert"))?;
+        let base = self
+            .geometry
+            .source(u16::try_from(id).map_err(|_| overflow())?)?
+            .offset;
+        Ok(ExpertView {
+            gate: self.projection(base, indices[0])?,
+            up: self.projection(base, indices[1])?,
+            down: self.projection(base, indices[2])?,
+        })
+    }
+}
+
+impl FlintExl3Resident {
+    fn host_ordinal(&self, layer: usize) -> Option<usize> {
+        let host = self.host.as_ref()?;
+        host.layers.iter().position(|&candidate| candidate == layer)
+    }
+
+    /// Runs `consume` with in-place host access to the routed experts of `layer`; needs the
+    /// pinned host store.
+    pub(crate) fn with_host_experts<R>(
+        &self,
+        layer: usize,
+        consume: impl FnOnce(&dyn ExpertSource) -> Result<R, EngError>,
+    ) -> Result<R, EngError> {
+        let (host, ordinal) = self
+            .host
+            .as_ref()
+            .zip(self.host_ordinal(layer))
+            .ok_or_else(|| refused("CPU experts need the pinned host store"))?;
+        let state = host
+            .state
+            .try_borrow()
+            .map_err(|_| refused("model cache is already borrowed"))?;
+        let FfnRoles::Moe { experts, .. } = &self.roles.layers[layer].ffn else {
+            return Err(refused("layer has no routed experts"));
+        };
+        consume(&PackedSource {
+            bytes: state.pinned.host_view()?,
+            matrices: &self.matrices,
+            indices: experts,
+            geometry: state.store.layout().layer(ordinal)?,
+        })
+    }
+
+    /// The `ordinal`-th routed layer of `layer` and which of its experts hold a device slot.
+    pub(crate) fn resident_experts(
+        &self,
+        layer: usize,
+    ) -> Result<Option<(usize, [bool; EXPERTS])>, EngError> {
+        let (Some(host), Some(ordinal)) = (self.host.as_ref(), self.host_ordinal(layer)) else {
+            return Ok(None);
+        };
+        let state = host
+            .state
+            .try_borrow()
+            .map_err(|_| refused("model cache is already borrowed"))?;
+        Ok(Some((ordinal, state.caches[ordinal].resident_flags())))
+    }
+
+    /// Moves `incoming` into the device slot of `outgoing` for `layer`, behind the work already
+    /// queued on `stream`.
+    pub(crate) fn swap_expert(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        layer: usize,
+        swap: (u16, u16),
+    ) -> Result<(), EngError> {
+        let (host, ordinal) = self
+            .host
+            .as_ref()
+            .zip(self.host_ordinal(layer))
+            .ok_or_else(|| refused("expert swaps need the pinned host store"))?;
+        let mut state = host
+            .state
+            .try_borrow_mut()
+            .map_err(|_| refused("model cache is already borrowed"))?;
+        let HostState { pinned, caches, .. } = &mut *state;
+        let copy = caches[ordinal].swap_in(swap.0, swap.1)?;
+        enqueue(
+            context,
+            stream,
+            pinned,
+            &self.buffer,
+            host.arena_base,
+            &[copy],
+        )
+    }
+}
+
 impl FlintExpertBank<'_> {
-    /// The callback must finish all routed, shared, and combine work with Frame::finish.
+    /// Marks experts as just used, in the order given, without any copy (see
+    /// [`LayerCache::touch`]). A no-op when every expert is resident for good.
+    pub(crate) fn touch_recent(&self, experts: &[u16]) -> Result<(), EngError> {
+        let Some(host) = &self.owner.host else {
+            return Ok(());
+        };
+        let mut state = host
+            .state
+            .try_borrow_mut()
+            .map_err(|_| refused("model cache is already borrowed"))?;
+        let ordinal = host
+            .layers
+            .iter()
+            .position(|&layer| layer == self.layer)
+            .ok_or_else(|| refused("unknown routed layer"))?;
+        state.caches[ordinal].touch(experts)
+    }
+}
+
+impl FlintExpertBank<'_> {
+    /// In-place host access to this layer's routed experts (needs the pinned host store).
+    pub(crate) fn cpu_experts<R>(
+        &self,
+        consume: impl FnOnce(&dyn ExpertSource) -> Result<R, EngError>,
+    ) -> Result<R, EngError> {
+        self.owner.with_host_experts(self.layer, consume)
+    }
+
+    /// This layer's routed-layer ordinal and which experts hold a device slot, or `None`
+    /// without a host store.
+    pub(crate) fn resident(&self) -> Result<Option<(usize, [bool; EXPERTS])>, EngError> {
+        self.owner.resident_experts(self.layer)
+    }
+
+    pub(crate) fn swap(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        swap: (u16, u16),
+    ) -> Result<(), EngError> {
+        self.owner.swap_expert(context, stream, self.layer, swap)
+    }
+
+    /// The callback must finish all routed, shared, and combine work with Frame::finish,
+    /// or enqueue it on `stream` so a later pass's slot copies queue behind it.
     /// Only a completed owned output may escape this scope, never live weight views.
-    pub(crate) fn with_prepared(
+    pub(crate) fn with_prepared<R>(
         &self,
         context: &CudaContext,
         stream: &DeviceStream,
         ids: &[i32],
-        consume: impl for<'a> FnOnce(&FlintExpertBank<'a>) -> Result<DeviceBuffer, EngError>,
-    ) -> Result<DeviceBuffer, EngError> {
+        consume: impl for<'a> FnOnce(&FlintExpertBank<'a>) -> Result<R, EngError>,
+    ) -> Result<R, EngError> {
         let Some(host) = &self.owner.host else {
             return consume(&FlintExpertBank {
                 owner: self.owner,
@@ -437,7 +766,7 @@ impl FlintExpertBank<'_> {
             .layer(ordinal)?
             .slot(0)?
             .bytes
-            .checked_mul(super::super::cache::SLOTS)
+            .checked_mul(host.slots)
             .ok_or_else(overflow)?;
         let pass = core.prepare(ids, max_copy_bytes)?;
         let ready = core.copy_ready(pass, stream.id(), |copies| {
@@ -448,7 +777,9 @@ impl FlintExpertBank<'_> {
                 &self.owner.buffer,
                 host.arena_base,
                 copies,
-            )
+            )?;
+            host.note_misses(copies);
+            Ok(())
         })?;
         let mut snapshot = [None; EXPERTS];
         for &id in ids {
@@ -468,5 +799,96 @@ impl FlintExpertBank<'_> {
         })?;
         host.poisoned.set(false);
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::cuda::plan::{Demand, admit};
+
+    // Distinct nonzero terms, so a dropped or doubled term changes which bank fits.
+    const RESERVE: Reserve = Reserve {
+        kv_cache: 3_795_369_984,
+        work: 696_027_652,
+        headroom: 536_870_912,
+    };
+    const ARENA_BASE: usize = 2_150_000_640;
+    const PER_SLOT: u64 = 47 * 1_603_584;
+
+    fn demand(slots: u64, headroom: u64) -> Demand {
+        Demand {
+            tensors: ARENA_BASE as u64 + slots * PER_SLOT,
+            kv_cache: RESERVE.kv_cache,
+            work: RESERVE.work,
+            headroom,
+        }
+    }
+
+    #[test]
+    fn the_chosen_bank_is_admitted_with_the_margin_and_one_more_expert_is_not() {
+        for free in (22..=26).map(|gib: u64| gib * (1 << 30) + 12_345_678) {
+            let budget = bank_budget(free, ARENA_BASE, PER_SLOT, &RESERVE).unwrap();
+            let slots = choose_slots(BankRequest::Fit, budget, 48).unwrap() as u64;
+            let with_margin = RESERVE.headroom + BANK_MARGIN_BYTES;
+            admit(&demand(slots, with_margin), free).unwrap();
+            if slots < EXPERTS as u64 {
+                assert!(admit(&demand(slots + 1, with_margin), free).is_err());
+            }
+            // The margin is spare room beyond what plan::admit itself requires.
+            admit(&demand(slots, RESERVE.headroom), free).unwrap();
+        }
+    }
+
+    #[test]
+    fn every_reserve_term_and_the_margin_shrink_the_bank() {
+        let free = 23 * (1 << 30);
+        let slots = |reserve: Reserve| {
+            let budget = bank_budget(free, ARENA_BASE, PER_SLOT, &reserve).unwrap();
+            choose_slots(BankRequest::Fit, budget, 48).unwrap()
+        };
+        let base = slots(RESERVE);
+        for bigger in [
+            Reserve {
+                kv_cache: RESERVE.kv_cache + (1 << 30),
+                ..RESERVE
+            },
+            Reserve {
+                work: RESERVE.work + (1 << 30),
+                ..RESERVE
+            },
+            Reserve {
+                headroom: RESERVE.headroom + (1 << 30),
+                ..RESERVE
+            },
+        ] {
+            assert!(slots(bigger) < base);
+        }
+        let without_margin =
+            (free - ARENA_BASE as u64 - RESERVE.kv_cache - RESERVE.work - RESERVE.headroom)
+                / PER_SLOT;
+        assert!((base as u64) < without_margin);
+        // The margin also governs the choice of all 256: a load with less than the margin to spare
+        // uses a smaller bank.
+        let fixed = ARENA_BASE as u64 + RESERVE.kv_cache + RESERVE.work + RESERVE.headroom;
+        let all = |extra: u64| {
+            let free = fixed + 256 * PER_SLOT + extra;
+            let budget = bank_budget(free, ARENA_BASE, PER_SLOT, &RESERVE).unwrap();
+            choose_slots(BankRequest::Fit, budget, 48).unwrap()
+        };
+        assert_eq!(all(BANK_MARGIN_BYTES - 1), 255);
+        assert_eq!(all(BANK_MARGIN_BYTES), 256);
+        assert!(
+            bank_budget(
+                u64::MAX,
+                usize::MAX,
+                1,
+                &Reserve {
+                    kv_cache: u64::MAX,
+                    ..RESERVE
+                }
+            )
+            .is_err()
+        );
     }
 }

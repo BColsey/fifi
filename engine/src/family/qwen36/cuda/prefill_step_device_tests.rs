@@ -24,9 +24,8 @@ const EOS: [u32; 2] = [248_046, 248_044];
 const CAP: u32 = 128;
 const CONTEXT_TOKENS: usize = 1024;
 
-fn model_dir() -> String {
-    std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_string())
+fn model_dir() -> std::path::PathBuf {
+    crate::test_paths::required("Q36_CUDA_MODEL_DIR")
 }
 
 fn prompt_ids(name: &str) -> Vec<u32> {
@@ -586,8 +585,7 @@ fn wide_stage_admits_under_the_real_card_free() {
     // must admit it rather than refuse a boot the default keeps. At 262144 the
     // fully-resident state leaves even the default stage over budget, which the
     // fallback pins cover host-side.
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let model = open_qwen3_6_35b_a3b(
         &std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf"),
         None,

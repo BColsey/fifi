@@ -2,6 +2,7 @@
 #include "status.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <initializer_list>
 #include <stdint.h>
 
@@ -51,7 +52,8 @@ bool valid_unary(const inference_cuda_row_unary_args *a) {
 
 bool valid_mul(const inference_cuda_row_mul_args *a) {
     size_t bytes, rhs_bytes;
-    return a && (a->rhs_columns == 1 || a->rhs_columns == a->columns) &&
+    return a && a->fused_publish <= 1 &&
+        (a->rhs_columns == 1 || a->rhs_columns == a->columns) &&
         float_bytes(a->rows, a->columns, &bytes) &&
         float_bytes(a->rows, a->rhs_columns, &rhs_bytes) && valid_regions({
             {a->x, a->x_bytes, bytes, false}, {a->rhs, a->rhs_bytes, rhs_bytes, false},
@@ -98,7 +100,12 @@ __global__ void mul_k(inference_cuda_row_mul_args a, size_t count) {
     const size_t column = a.rhs_columns == 1 ? 0 : i % a.columns;
     const float x = a.x[i];
     const float rhs = a.rhs[row * a.rhs_columns + column];
-    store_value(__fmul_rn(x, rhs), isfinite(x) && isfinite(rhs), a.out + i, a.flag);
+    const float product = __fmul_rn(x, rhs);
+    // Fused publish: the roundtrip precedes the store's finite check, exactly
+    // where the separate publish kernel applies it.
+    const float published = a.fused_publish ?
+        __bfloat162float(__float2bfloat16_rn(product)) : product;
+    store_value(published, isfinite(x) && isfinite(rhs), a.out + i, a.flag);
 }
 
 __global__ void gather_k(inference_cuda_row_gather_args a, size_t count) {

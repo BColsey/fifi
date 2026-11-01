@@ -8,7 +8,8 @@ use crate::weights::exl3::Checkpoint;
 use crate::{
     EngError,
     kernels::cuda::{
-        CudaContext, DeviceBuffer, DeviceRange, DeviceStream, resident::exl3::Exl3LinearCall,
+        CudaContext, DeviceBuffer, DeviceRange, DeviceStream,
+        resident::exl3::{Exl3IndexedCall, Exl3JobsCall, Exl3LinearCall},
     },
     tensor::{Dtype, Tensor},
     weights::exl3::{Codebook, Matrix},
@@ -23,6 +24,71 @@ pub(crate) struct Exl3Weight {
     pub(crate) shape: [usize; 2],
     pub(crate) bits_twice: u8,
     pub(crate) book: Codebook,
+}
+
+/// Same-shaped, same-rate matrices without bias in two device buffers: the routed experts of one
+/// projection of one layer. One allocation per component replaces one per matrix and expert; a
+/// member's trellis and scales are ranges at fixed strides.
+pub(crate) struct Exl3Bank {
+    // Reverse upload order also applies when the bank is dropped.
+    scales: DeviceBuffer,
+    trellis: DeviceBuffer,
+    count: usize,
+    shape: [usize; 2],
+    bits_twice: u8,
+    book: Codebook,
+}
+
+/// The whole-bank ranges of an id-indexed launch: member 0's spans extended over every member.
+#[derive(Clone, Copy)]
+pub(crate) struct Exl3BankSpan<'a> {
+    trellis: DeviceRange<'a>,
+    suh: DeviceRange<'a>,
+    svh: DeviceRange<'a>,
+    members: u32,
+    trellis_stride: usize,
+    scale_stride: usize,
+    shape: [usize; 2],
+    bits_twice: u8,
+    book: Codebook,
+}
+
+impl<'a> Exl3BankSpan<'a> {
+    /// The call that projects `io`'s row with the member `ids[slot]`; the ids are chosen on the
+    /// device when the launch runs.
+    pub(in crate::family) fn indexed_call(
+        &self,
+        io: &Exl3Io<'a>,
+        ids: DeviceRange<'a>,
+        slot: u32,
+    ) -> Exl3IndexedCall<'a> {
+        Exl3IndexedCall {
+            call: Exl3LinearCall {
+                trellis: self.trellis,
+                suh: self.suh,
+                svh: self.svh,
+                bias: None,
+                x: io.x,
+                xh: io.xh,
+                z: io.z,
+                out: io.out,
+                flag: io.flag,
+                rows: io.rows,
+                split_k: 2,
+                k: self.shape[0],
+                n: self.shape[1],
+                bits_twice: self.bits_twice,
+                book: self.book,
+                fused: io.fused,
+            },
+            ids,
+            slot,
+            members: self.members,
+            trellis_stride: self.trellis_stride,
+            scale_stride: self.scale_stride,
+            offsets: None,
+        }
+    }
 }
 
 /// Borrowed packed components; the owner outlives every in-flight projection.
@@ -49,6 +115,77 @@ pub(crate) struct Exl3Io<'a> {
     pub(crate) out: DeviceRange<'a>,
     pub(crate) flag: DeviceRange<'a>,
     pub(crate) rows: usize,
+    /// Producer-fusion arm: out receives the bf16 roundtrip the separate
+    /// publish kernel would write, so the caller skips that publish.
+    pub(crate) fused: bool,
+}
+
+/// The members of one bank (or one matrix as a bank of one) as the job-table projection addresses
+/// them: member `i` starts `i * trellis_stride` u16 elements into `trellis` and `i * scale_stride`
+/// floats into `suh` and `svh`, the addressing of [`Exl3Bank::view`].
+#[derive(Clone, Copy)]
+pub(crate) struct Exl3Members<'a> {
+    pub(crate) trellis: DeviceRange<'a>,
+    pub(crate) suh: DeviceRange<'a>,
+    pub(crate) svh: DeviceRange<'a>,
+    /// u16 elements between the trellises of two members.
+    pub(crate) trellis_stride: usize,
+    /// F32 values between the `suh` (and the `svh`) of two members.
+    pub(crate) scale_stride: usize,
+    pub(crate) members: usize,
+    pub(crate) shape: [usize; 2],
+    pub(crate) bits_twice: u8,
+    pub(crate) book: Codebook,
+}
+
+/// The rows of a job-table projection: the F32 input rows, the scratch of the rotation, the
+/// partials and the output (row `r` of a job at `out[(row0 + r) * out_ld + out_col ..]`), the
+/// sticky flag and the device table.
+pub(crate) struct Exl3JobsIo<'a> {
+    pub(crate) x: DeviceRange<'a>,
+    pub(crate) xh: DeviceRange<'a>,
+    pub(crate) z: DeviceRange<'a>,
+    pub(crate) out: DeviceRange<'a>,
+    pub(crate) flag: DeviceRange<'a>,
+    pub(crate) jobs: DeviceRange<'a>,
+    pub(crate) jobs_count: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) total_rows: usize,
+    pub(crate) out_ld: usize,
+    pub(crate) out_col: usize,
+}
+
+impl<'a> Exl3Members<'a> {
+    /// Maps borrowed spans only; enqueueing and observing health remain caller responsibilities.
+    pub(in crate::family) fn jobs_call(&self, io: &Exl3JobsIo<'a>) -> Exl3JobsCall<'a> {
+        Exl3JobsCall {
+            trellis: self.trellis,
+            suh: self.suh,
+            svh: self.svh,
+            trellis_stride: self.trellis_stride,
+            scale_stride: self.scale_stride,
+            members: self.members,
+            x: io.x,
+            xh: io.xh,
+            z: io.z,
+            out: io.out,
+            flag: io.flag,
+            jobs: io.jobs,
+            jobs_count: io.jobs_count,
+            max_rows: io.max_rows,
+            total_rows: io.total_rows,
+            out_ld: io.out_ld,
+            out_col: io.out_col,
+            k: self.shape[0],
+            n: self.shape[1],
+            bits_twice: self.bits_twice,
+            book: self.book,
+            in_rows: None,
+            out_rows: None,
+            x_rows: io.total_rows,
+            out_total_rows: io.total_rows,
+        }
+    }
 }
 
 impl Exl3MatrixView<'_> {
@@ -101,11 +238,33 @@ impl Exl3MatrixView<'_> {
             n: self.shape[1],
             bits_twice: self.bits_twice,
             book: self.book,
+            fused: io.fused,
         }
     }
 }
 
 impl Exl3Weight {
+    /// The matrix as a bank of one member for a job-table projection (a weight with a bias is
+    /// refused: the job-table output adds none).
+    pub(crate) fn members(&self) -> Result<Exl3Members<'_>, EngError> {
+        if self.bias.is_some() {
+            return Err(EngError::BadRequest(
+                "EXL3 job-table projection: the matrix has a bias".into(),
+            ));
+        }
+        Ok(Exl3Members {
+            trellis: self.trellis.range(0, self.trellis.bytes())?,
+            suh: self.suh.range(0, self.suh.bytes())?,
+            svh: self.svh.range(0, self.svh.bytes())?,
+            trellis_stride: 0,
+            scale_stride: 0,
+            members: 1,
+            shape: self.shape,
+            bits_twice: self.bits_twice,
+            book: self.book,
+        })
+    }
+
     pub(crate) fn view(&self) -> Result<super::Exl3MatrixView<'_>, EngError> {
         Ok(Exl3MatrixView {
             trellis: self.trellis.range(0, self.trellis.bytes())?,
@@ -141,6 +300,99 @@ impl Exl3Weight {
         ]
         .into_iter()
         .flatten()
+    }
+
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.device_buffers().map(DeviceBuffer::bytes).sum()
+    }
+}
+
+impl Exl3Bank {
+    /// Packed trellis bytes of one member.
+    fn trellis_stride(&self) -> usize {
+        self.shape[0] * self.shape[1] / 256 * usize::from(self.bits_twice) * 16
+    }
+
+    /// F32 scale bytes of one member: `suh` then `svh`.
+    fn scale_stride(&self) -> usize {
+        (self.shape[0] + self.shape[1]) * size_of::<f32>()
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn shape(&self) -> [usize; 2] {
+        self.shape
+    }
+
+    pub(crate) fn bits_twice(&self) -> u8 {
+        self.bits_twice
+    }
+
+    pub(crate) fn view(&self, index: usize) -> Result<Exl3MatrixView<'_>, EngError> {
+        if index >= self.count {
+            return Err(EngError::BadRequest(format!(
+                "EXL3 bank member {index} is outside {} members",
+                self.count
+            )));
+        }
+        let (trellis, scales) = (self.trellis_stride(), self.scale_stride());
+        let suh_bytes = self.shape[0] * size_of::<f32>();
+        Ok(Exl3MatrixView {
+            trellis: self.trellis.range(index * trellis, trellis)?,
+            suh: self.scales.range(index * scales, suh_bytes)?,
+            svh: self
+                .scales
+                .range(index * scales + suh_bytes, scales - suh_bytes)?,
+            bias: None,
+            shape: self.shape,
+            bits_twice: self.bits_twice,
+            book: self.book,
+        })
+    }
+
+    /// The whole bank for a job-table projection.
+    pub(crate) fn members(&self) -> Result<Exl3Members<'_>, EngError> {
+        let [k, n] = self.shape;
+        let last = (self.count - 1) * self.scale_stride();
+        Ok(Exl3Members {
+            trellis: self.trellis.range(0, self.trellis.bytes())?,
+            suh: self.scales.range(0, last + k * size_of::<f32>())?,
+            svh: self
+                .scales
+                .range(k * size_of::<f32>(), last + n * size_of::<f32>())?,
+            trellis_stride: self.trellis_stride() / size_of::<u16>(),
+            scale_stride: k + n,
+            members: self.count,
+            shape: self.shape,
+            bits_twice: self.bits_twice,
+            book: self.book,
+        })
+    }
+
+    /// The bank as one span for an id-indexed launch.
+    pub(crate) fn span(&self) -> Result<Exl3BankSpan<'_>, EngError> {
+        let suh_bytes = self.shape[0] * size_of::<f32>();
+        let members = u32::try_from(self.count)
+            .map_err(|_| EngError::BadRequest("EXL3 bank has too many members".into()))?;
+        Ok(Exl3BankSpan {
+            trellis: self.trellis.range(0, self.trellis.bytes())?,
+            suh: self.scales.range(0, self.scales.bytes())?,
+            svh: self
+                .scales
+                .range(suh_bytes, self.scales.bytes() - suh_bytes)?,
+            members,
+            trellis_stride: self.trellis_stride(),
+            scale_stride: self.scale_stride() / size_of::<f32>(),
+            shape: self.shape,
+            bits_twice: self.bits_twice,
+            book: self.book,
+        })
+    }
+
+    pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
+        [&self.trellis, &self.scales].into_iter()
     }
 
     pub(crate) fn device_bytes(&self) -> usize {
@@ -209,6 +461,73 @@ impl CudaProjector {
     }
 }
 
+impl CudaProjector {
+    /// Uploads `count` members into one bank. `member(i)` yields the stored matrix of member `i`,
+    /// one at a time, so the host holds one matrix beside the bank's scale vector. Every member
+    /// must match the first in shape, rate and codebook and carry no bias; the whole bank is
+    /// admitted before the first allocation.
+    pub(crate) fn upload_exl3_bank(
+        &self,
+        count: usize,
+        reserve: Reserve,
+        mut member: impl FnMut(usize) -> Result<Matrix, EngError>,
+    ) -> Result<Exl3Bank, EngError> {
+        self.context.ensure_usable()?;
+        if count == 0 {
+            return Err(EngError::BadRequest("EXL3 bank without members".into()));
+        }
+        let first = member(0)?;
+        let (shape, bits_twice, book) = (first.shape(), first.bitrate_twice(), first.codebook());
+        let stride = shape[0] * shape[1] / 256 * usize::from(bits_twice) * 16;
+        let scale_stride = (shape[0] + shape[1]) * size_of::<f32>();
+        let overflow = || EngError::MemoryPlan("EXL3 bank byte count overflow".into());
+        let trellis_bytes = stride.checked_mul(count).ok_or_else(overflow)?;
+        let scale_bytes = scale_stride.checked_mul(count).ok_or_else(overflow)?;
+        let total = trellis_bytes
+            .checked_add(scale_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(overflow)?;
+        self.admit(total, reserve)?;
+        let mut scales = Vec::new();
+        scales
+            .try_reserve_exact(scale_bytes)
+            .map_err(|error| EngError::MemoryPlan(format!("EXL3 bank scale staging: {error}")))?;
+        let trellis = self.context.allocate(trellis_bytes)?;
+        let mut next = Some(first);
+        for index in 0..count {
+            let matrix = match next.take() {
+                Some(matrix) => matrix,
+                None => member(index)?,
+            };
+            if matrix.shape() != shape
+                || matrix.bitrate_twice() != bits_twice
+                || matrix.codebook() != book
+                || matrix.bias().is_some()
+            {
+                return Err(EngError::Checkpoint(format!(
+                    "EXL3 bank member {index} differs from member 0 in shape, rate, codebook or bias"
+                )));
+            }
+            let packed = matrix
+                .trellis()
+                .host_bytes()
+                .ok_or_else(|| EngError::Checkpoint("EXL3 trellis requires host storage".into()))?;
+            self.context.upload_at(&trellis, index * stride, packed)?;
+            scales.extend_from_slice(&float_bytes(matrix.suh())?);
+            scales.extend_from_slice(&float_bytes(matrix.svh())?);
+        }
+        let scales = self.context.upload(&scales)?;
+        Ok(Exl3Bank {
+            scales,
+            trellis,
+            count,
+            shape,
+            bits_twice,
+            book,
+        })
+    }
+}
+
 fn float_bytes(tensor: &Tensor) -> Result<Vec<u8>, EngError> {
     let bytes = tensor
         .host_bytes()
@@ -244,6 +563,57 @@ fn float_bytes(tensor: &Tensor) -> Result<Vec<u8>, EngError> {
     Ok(output)
 }
 
+/// One row through `view` on a fresh stream, read back with the arithmetic flag: the F32 output
+/// and the flag word. For device tests of every caller of the seam.
+#[cfg(test)]
+pub(crate) fn project_one_row(
+    projector: &CudaProjector,
+    view: &Exl3MatrixView<'_>,
+    input: &[f32],
+) -> Result<(Vec<f32>, u32), EngError> {
+    let [k, n] = view.shape;
+    let ctx = projector.context();
+    let stream = ctx.stream()?;
+    let bytes = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    let x = ctx.upload(&bytes(input))?;
+    let xh = ctx.upload(&vec![0; k * 4])?;
+    let z = ctx.upload(&vec![0; n * 4])?;
+    let out = ctx.upload(&vec![0; n * 4])?;
+    let flag = ctx.upload(&[0; 4])?;
+    view.project(
+        ctx,
+        &stream,
+        Exl3Io {
+            x: x.range(0, k * 4)?,
+            xh: xh.range(0, k * 4)?,
+            z: z.range(0, n * 4)?,
+            out: out.range(0, n * 4)?,
+            flag: flag.range(0, 4)?,
+            rows: 1,
+            fused: false,
+        },
+    )?;
+    stream.synchronize()?;
+    let mut raw = vec![0; n * 4];
+    out.read_at(&stream, 0, &mut raw)?;
+    let mut status = [0; 4];
+    flag.read_at(&stream, 0, &mut status)?;
+    let values = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    Ok((values, u32::from_le_bytes(status)))
+}
+
+#[cfg(test)]
+mod bank_tests;
 #[cfg(test)]
 mod real_projection_tests;
 

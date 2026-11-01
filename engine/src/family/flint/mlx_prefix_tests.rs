@@ -172,7 +172,7 @@ fn open_real(root: &Path) -> (FlintExecutor, FlintSession) {
     let bundle = factory::load_tokenizer(root).expect("load the real tokenizer");
     let eos = bundle.eos_token_ids().to_vec();
     let vocab = bundle.vocab_size() as usize;
-    FlintExecutor::open(root, eos, vocab).expect("open the real loader")
+    FlintExecutor::open(root, eos, vocab, [0u8; 32]).expect("open the real loader")
 }
 
 /// The ring arm this gate process runs under, asserted against the
@@ -725,6 +725,8 @@ fn default_off_open_is_inert_to_a_garbage_budget_env() {
         &root,
         bundle.eos_token_ids().to_vec(),
         bundle.vocab_size() as usize,
+        // Fixture template identity (parks need per-test consistency).
+        [0u8; 32],
     )
     .expect("default-OFF open ignores the garbage budget env");
     assert_eq!(engine.prefix_retention_cap, 0, "no cap derivation ran");

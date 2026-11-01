@@ -88,6 +88,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[link_name = "inference_cuda_kv8_chunk_k_launch"]
+    fn kv8_chunk_k_launch_raw(
+        args: *const Kv8ChunkArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
 }
 
 /// Every integer argument of the launches, already bounded and converted by the wrapper before
@@ -280,6 +286,54 @@ pub(in crate::kernels::cuda) fn kv8_chunk_launch(
     // SAFETY: as `kv8_append_launch`; `check_data` proved the six data ranges, and the C entry
     // re-checks the addresses plus `pos0 + t <= cells` before any launch.
     let status = unsafe { kv8_chunk_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The mixed-profile ("q8k") K-only chunk append: quantizes the K plane only; the
+/// f16 V rows never pass through here. `pos0` is the host base position.
+pub(in crate::kernels::cuda) fn kv8_chunk_k_launch(
+    stream: &RawStream,
+    k: RawRange<'_>,
+    k_codes: RawRange<'_>,
+    k_scales: RawRange<'_>,
+    ints: Kv8Ints,
+    pos0: c_int,
+) -> Result<(), DeviceFailure> {
+    // Prove the K plane as in `check_data`, restricted to the ranges this
+    // variant touches; the C entry requires the three V pointers NULL.
+    if !matches!(ints.code_scale, 1 | 2) {
+        return Err(invalid_argument());
+    }
+    let need = needs(&ints)?;
+    if !(fits(&k, need.rows) && fits(&k_codes, need.codes) && fits(&k_scales, need.scales)) {
+        return Err(invalid_argument());
+    }
+    let written = [
+        Span::of(&k_codes, need.codes),
+        Span::of(&k_scales, need.scales),
+    ];
+    let read = Span::of(&k, need.rows);
+    if !(written[0].apart(&written[1]) && written.iter().all(|w| w.apart(&read))) {
+        return Err(invalid_argument());
+    }
+    let args = Kv8ChunkArgsRaw {
+        k: k.address().cast_const(),
+        v: std::ptr::null(),
+        k_codes: k_codes.address(),
+        k_scales: k_scales.address(),
+        v_codes: std::ptr::null_mut(),
+        v_scales: std::ptr::null_mut(),
+        pos0,
+        t: ints.rows,
+        n_kv_head: ints.n_kv_head,
+        head_dim: ints.head_dim,
+        cells: ints.cells,
+        code_scale: ints.code_scale,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `kv8_chunk_launch`, with the K-only extents proved above; the C
+    // entry re-checks the NULL V pointers and `pos0 + t <= cells` before any launch.
+    let status = unsafe { kv8_chunk_k_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

@@ -287,7 +287,9 @@ fn load_model_records_the_native_layout_of_its_options() {
             .unwrap_or_else(|| panic!("{NAME}: tensor {name} is missing"))
         {
             CudaWeight::Native { .. } | CudaWeight::Raw { .. } => {}
-            CudaWeight::Exl3 { .. } => panic!("{NAME}: tensor {name} loaded EXL3 under Native"),
+            CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. } => {
+                panic!("{NAME}: tensor {name} loaded EXL3 under Native")
+            }
             CudaWeight::Tiled { .. } => panic!("{NAME}: tensor {name} loaded tiled under Native"),
         }
     }

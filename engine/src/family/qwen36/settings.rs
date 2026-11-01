@@ -12,6 +12,7 @@ use super::host::HostShape;
 use super::host_load::rotary_dim;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
+use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
 use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -105,7 +106,7 @@ pub(crate) fn prefix_store_limits_of(
 }
 
 /// The `qwen36` object of an engine entry. Every member is optional.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Q36Options {
     /// The MLX allocator cache limit in bytes. Fallback: `Q36_CACHE_LIMIT`. There is no default.
@@ -144,7 +145,8 @@ pub(crate) struct Q36Options {
     pub(crate) kv_dtype: Option<String>,
     /// Opt-in host-backed CUDA Q8 KV budget, including pinned staging and owned metadata.
     pub(crate) kv_offload_host_bytes: Option<u64>,
-    /// Graph capture of the CUDA arm (default false: eager launches); the MLX arm ignores it.
+    /// Graph capture of the CUDA arm (default true for an EXL3 pack, false for GGUF: eager
+    /// launches); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
     /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks: the engine traces
     /// both blocks once after the weights load and runs every one-token decode step through the
@@ -165,6 +167,125 @@ pub(crate) struct Q36Options {
     /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
     /// resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
+    /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
+    /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
+    pub(crate) weight_format: Option<String>,
+    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. A CUDA
+    /// member for `weight_format` `exl3` only.
+    pub(crate) draft_mode: Option<String>,
+    /// The most drafts of one verify window, from 1 to 16. The default is 2.
+    pub(crate) num_draft_tokens: Option<u32>,
+    /// Shorten each window from the calibrated chance that its drafts are accepted. Default false.
+    /// The calibration reads the MTP head's confidence, so `ngram` ignores it.
+    pub(crate) dynamic_draft_tokens: Option<bool>,
+    /// The running product of acceptance chances below which a draft is dropped, above 0 and
+    /// below 1. The default is 0.4. Used with `dynamic_draft_tokens`.
+    pub(crate) draft_confidence: Option<f64>,
+    /// The most rows of one verify window, the pending token included, from 2 to 64. The default
+    /// is 8.
+    pub(crate) draft_max_rows: Option<u32>,
+    /// When the context repeats an earlier passage for this many tokens, draft that many tokens of
+    /// it in one window. 0 (the default) is off; otherwise from `ngram_match_min` to 256.
+    pub(crate) hybrid_draft_tokens: Option<u32>,
+    /// The shortest repeated tail that an n-gram draft needs, from 1 to 64. The default is 2.
+    pub(crate) ngram_match_min: Option<u32>,
+    /// The directory of the pack that holds the MTP head. Required by `draft_mode` `mtp`.
+    pub(crate) mtp_model_dir: Option<PathBuf>,
+}
+
+impl Q36Options {
+    /// The speculation members, as `SpecConfig::new` reads them.
+    fn spec_options(&self) -> SpecOptions {
+        SpecOptions {
+            draft_mode: self.draft_mode.clone(),
+            num_draft_tokens: self.num_draft_tokens,
+            dynamic_draft_tokens: self.dynamic_draft_tokens,
+            draft_confidence: self.draft_confidence,
+            draft_max_rows: self.draft_max_rows,
+            hybrid_draft_tokens: self.hybrid_draft_tokens,
+            ngram_match_min: self.ngram_match_min,
+            mtp_model_dir: self.mtp_model_dir.clone(),
+        }
+    }
+}
+
+/// The checkpoint format of one engine entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WeightFormat {
+    /// The pinned GGUF file inside `model_dir`.
+    #[default]
+    Gguf,
+    /// A stock EXL3 pack: the safetensors shards and `config.json` inside `model_dir`.
+    Exl3,
+}
+
+/// The config text of `weight_format`.
+pub(crate) fn weight_format_name(format: WeightFormat) -> &'static str {
+    match format {
+        WeightFormat::Gguf => "gguf",
+        WeightFormat::Exl3 => "exl3",
+    }
+}
+
+/// Parses the `weight_format` member by exact match; absent is the GGUF default. Anything else,
+/// a different case or padding included, is refused by name.
+pub(crate) fn weight_format_of(text: Option<&str>) -> Result<WeightFormat, EngError> {
+    match text {
+        None | Some("gguf") => Ok(WeightFormat::Gguf),
+        Some("exl3") => Ok(WeightFormat::Exl3),
+        Some(other) => Err(bad(format!(
+            "weight_format must be gguf or exl3, got {other:?}"
+        ))),
+    }
+}
+
+/// Refuses the combinations of an EXL3 entry that have no implementation: the MLX arm has no
+/// EXL3 reader, and the tiered and host-paged KV modes read GGUF blocks. Graph capture is allowed:
+/// a captured EXL3 step reads the picked experts on the device.
+fn check_weight_format(
+    format: WeightFormat,
+    options: &Q36Options,
+    backend: Backend,
+) -> Result<(), EngError> {
+    if format != WeightFormat::Exl3 {
+        return Ok(());
+    }
+    if backend != Backend::Cuda {
+        return Err(bad("weight_format exl3 is CUDA-only".into()));
+    }
+    for (set, key) in [
+        (options.tiered.is_some(), "tiered"),
+        (
+            options.kv_offload_host_bytes.is_some(),
+            "kv_offload_host_bytes",
+        ),
+    ] {
+        if set {
+            return Err(bad(format!("weight_format exl3 does not support {key}")));
+        }
+    }
+    Ok(())
+}
+
+/// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
+/// only verify window and the only MTP head the engine has.
+fn speculation_of(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<SpecConfig, EngError> {
+    let config = SpecConfig::new(&options.spec_options())?;
+    if config.enabled() && (backend != Backend::Cuda || weights != WeightFormat::Exl3) {
+        return Err(bad(
+            "draft_mode other than disabled needs the CUDA arm with weight_format exl3".into(),
+        ));
+    }
+    // The MTP head has no draft step yet: accepting the mode would promise a speed the engine
+    // does not have. The change that adds the step replaces this refusal.
+    if config.mode == DraftMode::Mtp {
+        return Err(bad("draft_mode mtp has no draft step yet".into()));
+    }
+    Ok(config)
 }
 
 /// The `tiered` member of the `qwen36` object. The CPU tier maps the model file read-only for the whole
@@ -470,6 +591,10 @@ pub(crate) struct Q36Settings {
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
+    /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
+    pub(crate) weights: WeightFormat,
+    /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
+    pub(crate) speculation: SpecConfig,
     /// The MLX allocator and session keys the CUDA arm ignores (the KV cache is sized by
     /// `context_limit` alone, the prefill runs one token per step): the start logs one line each.
     /// Empty on the MLX arm. `prefill_chunk` is among them until the chunked CUDA prefill accepts
@@ -720,6 +845,9 @@ impl Q36Settings {
         }
         let default = Q36Options::default();
         let options = options.unwrap_or(&default);
+        let weights = weight_format_of(options.weight_format.as_deref())?;
+        check_weight_format(weights, options, backend)?;
+        let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
         let (prefill_budget, prefill_reserve, activation, kv, cache_limit, ignored_mlx_keys) =
             match backend {
@@ -859,7 +987,11 @@ impl Q36Settings {
             activation,
             kv,
             kv_offload_host_bytes,
-            capture: options.capture.unwrap_or(false),
+            // A served EXL3 pack captures by default (its step reads the picks on the device);
+            // `"capture": false` rolls back to the eager step.
+            capture: options
+                .capture
+                .unwrap_or(weights == WeightFormat::Exl3 && backend == Backend::Cuda),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
             compile: match backend {
@@ -871,6 +1003,8 @@ impl Q36Settings {
             backend,
             prefix_reuse: false,
             tiered,
+            weights,
+            speculation,
             ignored_mlx_keys,
         })
     }
@@ -963,6 +1097,7 @@ mod tests {
     use crate::EngError;
     use crate::family::session::StoreLimits;
     use crate::family::spec::QWEN3_6_35B_A3B;
+    use crate::family::speculate::config::SpecConfig;
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
 
@@ -1228,6 +1363,212 @@ mod tests {
         }
     }
 
+    fn exl3_options(extra: impl FnOnce(&mut Q36Options)) -> Q36Options {
+        let mut options = Q36Options {
+            weight_format: Some("exl3".into()),
+            ..Q36Options::default()
+        };
+        extra(&mut options);
+        options
+    }
+
+    #[test]
+    fn the_weight_format_defaults_to_gguf_and_accepts_exactly_two_spellings() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            settings_for(None, &Q36Env::default(), Backend::Cuda)
+                .unwrap()
+                .weights,
+            super::WeightFormat::Gguf
+        );
+        for (text, want) in [
+            ("gguf", super::WeightFormat::Gguf),
+            ("exl3", super::WeightFormat::Exl3),
+        ] {
+            let got = cuda(Q36Options {
+                weight_format: Some(text.into()),
+                ..Q36Options::default()
+            })
+            .unwrap();
+            assert_eq!(got.weights, want);
+            assert_eq!(super::weight_format_name(want), text);
+        }
+        for bad in ["", "EXL3", "Gguf", " exl3", "exl3 ", "exl2", "safetensors"] {
+            let text = message(cuda(Q36Options {
+                weight_format: Some(bad.into()),
+                ..Q36Options::default()
+            }));
+            assert_eq!(
+                text,
+                format!("engine config: weight_format must be gguf or exl3, got {bad:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn speculation_is_off_unless_the_mode_says_otherwise() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let off = cuda(exl3_options(|_| ())).unwrap();
+        assert!(!off.speculation.enabled());
+        assert_eq!(off.speculation, SpecConfig::default());
+        // The members are checked even while a mode other than disabled is refused.
+        let members = cuda(exl3_options(|o| {
+            o.num_draft_tokens = Some(3);
+            o.ngram_match_min = Some(4);
+        }))
+        .unwrap();
+        assert!(!members.speculation.enabled());
+        assert_eq!(members.speculation.num_draft_tokens, 3);
+        assert_eq!(members.speculation.ngram_match_min, 4);
+    }
+
+    #[test]
+    fn ngram_drafting_is_accepted_and_mtp_waits_for_its_draft_step() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let on = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.num_draft_tokens = Some(3);
+            o.ngram_match_min = Some(4);
+        }))
+        .unwrap();
+        assert!(on.speculation.enabled());
+        assert_eq!(on.speculation.num_draft_tokens, 3);
+        assert_eq!(on.speculation.ngram_match_min, 4);
+        let text = message(cuda(exl3_options(|o| {
+            o.draft_mode = Some("mtp".into());
+            o.mtp_model_dir = Some(PathBuf::from("/h"));
+        })));
+        assert_eq!(text, "engine config: draft_mode mtp has no draft step yet");
+    }
+
+    #[test]
+    fn ngram_drafting_never_meets_a_host_paged_kv_cache() {
+        // A window exports the whole session state, which the host-paged cache cannot do. EXL3
+        // weights, the only weights a window runs on, already refuse that cache by name.
+        let options = exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.kv_dtype = Some("q8".into());
+            o.kv_offload_host_bytes = Some(1 << 30);
+        });
+        let text = message(settings_for(
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Cuda,
+        ));
+        assert_eq!(
+            text,
+            "engine config: weight_format exl3 does not support kv_offload_host_bytes"
+        );
+    }
+
+    #[test]
+    fn an_enabled_draft_mode_is_refused_where_no_window_runs() {
+        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3";
+        let gguf = Q36Options {
+            draft_mode: Some("ngram".into()),
+            ..Q36Options::default()
+        };
+        let cuda_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(message(cuda_gguf), want);
+        let exl3 = exl3_options(|o| o.draft_mode = Some("ngram".into()));
+        let mlx = settings_for(Some(&exl3), &Q36Env::default(), Backend::Mlx);
+        assert_eq!(
+            message(mlx),
+            "engine config: weight_format exl3 is CUDA-only"
+        );
+        let mlx_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Mlx);
+        assert_eq!(message(mlx_gguf), want);
+    }
+
+    #[test]
+    fn a_bad_speculation_member_is_named() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("model".into()))));
+        assert!(
+            text.contains("draft_mode must be disabled, ngram or mtp"),
+            "{text}"
+        );
+        let text = message(cuda(exl3_options(|o| o.num_draft_tokens = Some(0))));
+        assert!(text.contains("num_draft_tokens"), "{text}");
+        let text = message(cuda(exl3_options(|o| o.draft_mode = Some("mtp".into()))));
+        assert!(text.contains("mtp_model_dir"), "{text}");
+    }
+
+    #[test]
+    fn an_exl3_entry_is_refused_where_nothing_reads_it() {
+        let mlx = settings_for(
+            Some(&exl3_options(|_| ())),
+            &Q36Env::default(),
+            Backend::Mlx,
+        );
+        assert_eq!(
+            message(mlx),
+            "engine config: weight_format exl3 is CUDA-only"
+        );
+        let tiered = exl3_options(|o| {
+            o.tiered = Some(super::TieredOptions {
+                slots: Some(8),
+                ..super::TieredOptions::default()
+            })
+        });
+        let paged = exl3_options(|o| {
+            o.kv_dtype = Some("q8".into());
+            o.kv_offload_host_bytes = Some(1 << 30);
+        });
+        for (options, key) in [(tiered, "tiered"), (paged, "kv_offload_host_bytes")] {
+            let text = message(settings_for(
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Cuda,
+            ));
+            assert_eq!(
+                text,
+                format!("engine config: weight_format exl3 does not support {key}")
+            );
+        }
+        // The plain EXL3 entry passes the settings.
+        let plain = settings_for(
+            Some(&exl3_options(|_| ())),
+            &Q36Env::default(),
+            Backend::Cuda,
+        );
+        assert_eq!(plain.unwrap().weights, super::WeightFormat::Exl3);
+        // Graph capture is accepted for an EXL3 entry: the step reads the picks on the device.
+        let captured = settings_for(
+            Some(&exl3_options(|o| o.capture = Some(true))),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .unwrap();
+        assert_eq!(captured.weights, super::WeightFormat::Exl3);
+        assert!(captured.capture);
+    }
+
+    #[test]
+    fn an_exl3_entry_captures_by_default_and_can_roll_back() {
+        let capture = |options: &Q36Options, backend| {
+            settings_for(Some(options), &Q36Env::default(), backend)
+                .unwrap()
+                .capture
+        };
+        // Unset: an EXL3 entry on the CUDA arm captures; a GGUF entry stays eager.
+        assert!(capture(&exl3_options(|_| ()), Backend::Cuda));
+        assert!(!capture(
+            &exl3_options(|o| o.capture = Some(false)),
+            Backend::Cuda
+        ));
+        assert!(capture(
+            &exl3_options(|o| o.capture = Some(true)),
+            Backend::Cuda
+        ));
+        let gguf = Q36Options::default();
+        assert!(!capture(&gguf, Backend::Cuda));
+    }
+
     /// The rule derives its byte counts from the family spec and the cache form, never from a
     /// literal.
     #[test]
@@ -1447,6 +1788,8 @@ mod tests {
                 backend: Backend::Mlx,
                 prefix_reuse: false,
                 tiered: None,
+                weights: super::WeightFormat::Gguf,
+                speculation: SpecConfig::default(),
                 ignored_mlx_keys: Vec::new(),
             }
         );
@@ -1546,6 +1889,8 @@ mod tests {
             compile: Some(true),
             max_seqs: Some(4),
             tiered: None,
+            weight_format: None,
+            ..Q36Options::default()
         };
         let got = settings(Some(&options), &Q36Env::default()).unwrap();
         assert_eq!(got.cache_limit, 5);

@@ -11,6 +11,9 @@ const KV: usize = 512;
 const WORDS: usize = 13;
 const GROUP_BYTES: usize = WORDS * 4;
 const RING_BYTES: usize = 49 * GROUP_BYTES;
+// The ring is exactly the per-layer group slab; pinned so the literal 49
+// cannot drift from LAYERS.
+const _: () = assert!(RING_BYTES == super::LAYERS * GROUP_BYTES);
 
 #[cfg(test)]
 std::thread_local! {
@@ -107,7 +110,15 @@ impl Health {
         )
     }
 
-    fn retained_bytes(rows: usize) -> Result<u64> {
+    /// Test-only constructor: builds the ring regardless of
+    /// FIFI_FLINT_LATE_HEALTH, so unit tests stay independent of the GPU
+    /// runner's 0/1 pinning of that switch.
+    #[cfg(test)]
+    pub(super) fn for_tests(ctx: &CudaContext) -> Result<Self> {
+        Ok(Self(ctx.upload(&[0; RING_BYTES])?))
+    }
+
+    pub(super) fn retained_bytes(rows: usize) -> Result<u64> {
         // Includes all norm/projection/producer/CPF/residual buffers and the input row.
         let floats = 16 * WIDTH + 9 * QUERY + 10 * KV;
         rows.checked_mul(floats)
@@ -120,9 +131,10 @@ impl Health {
         if !Self::enabled() {
             return Ok(0);
         }
-        let rows = plan
-            .context_rows()
-            .min(crate::family::flint::settings::PREFILL_MAX_ROWS);
+        let rows = plan.context_rows().min(
+            plan.chunk_rows()
+                .max(crate::family::flint::settings::PREFILL_MAX_ROWS),
+        );
         Self::retained_bytes(rows)?
             .checked_add(RING_BYTES as u64)
             .ok_or_else(|| EngError::MemoryPlan("Flint late-health charge overflows".into()))
@@ -172,6 +184,33 @@ impl Health {
         }
         Ok(None)
     }
+
+    /// Whole-ring host copy for the token-end gate's ordered validation.
+    pub(super) fn read_ring(&self, stream: &DeviceStream) -> Result<[u8; RING_BYTES]> {
+        let mut bytes = [0; RING_BYTES];
+        self.0.read_at(stream, 0, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Validates one attention group's 13 words exactly as `Group::check`
+    /// would, so the token-end gate reports the same fault classes.
+    pub(super) fn validate_group(ring: &[u8; RING_BYTES], group: usize) -> Result<()> {
+        validate(&ring.as_chunks::<GROUP_BYTES>().0[group])
+    }
+
+    /// Writes one status word of one group's ring slot, the same word the
+    /// device producers target, so tests can fault a real session's ring.
+    #[cfg(test)]
+    pub(super) fn test_inject(
+        &self,
+        stream: &DeviceStream,
+        group: usize,
+        word: usize,
+        status: u32,
+    ) -> Result<()> {
+        let offset = group * GROUP_BYTES + word * 4;
+        self.0.write_at(stream, offset, &status.to_ne_bytes())
+    }
 }
 
 pub(super) struct Group<'c, 's> {
@@ -180,6 +219,8 @@ pub(super) struct Group<'c, 's> {
     words: Option<DeviceRange<'c>>,
     frames: Vec<Frame<'c, 's>>,
     buffers: Vec<DeviceBuffer>,
+    /// Most rows a projection or pointwise step of this group may carry.
+    rows_cap: usize,
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
     allocation_start: Option<usize>,
     #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -202,6 +243,7 @@ impl<'c, 's> Group<'c, 's> {
             words,
             frames: Vec::new(),
             buffers: Vec::new(),
+            rows_cap: crate::family::flint::settings::PREFILL_MAX_ROWS,
             #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
             allocation_rows: 1,
             #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
@@ -217,6 +259,17 @@ impl<'c, 's> Group<'c, 's> {
 
     pub(super) fn deferred(&self) -> bool {
         self.words.is_some()
+    }
+
+    /// The same group for a pass of up to `cap` rows: a layer-major jobs piece.
+    pub(super) fn tall(mut self, cap: usize) -> Self {
+        self.rows_cap = cap;
+        self
+    }
+
+    /// The row shape of `bytes` of `columns`-wide F32 rows, within this group's row cap.
+    pub(super) fn row_shape(&self, bytes: usize, columns: usize) -> Result<super::RowShape> {
+        exl3::row_shape_to(bytes, columns, self.rows_cap)
     }
 
     pub(super) fn validate_layer(&self, layer: &FlintLayerView<'_>) -> Result<()> {
@@ -315,11 +368,11 @@ impl<'c, 's> Group<'c, 's> {
         slot: Slot,
     ) -> Result<DeviceBuffer> {
         if !self.deferred() {
-            return exl3::project(self.ctx, self.stream, weight, x);
+            return exl3::project_to(self.ctx, self.stream, weight, x, self.rows_cap);
         }
         self.ctx.ensure_usable()?;
         let [k, n] = weight.shape;
-        let input = exl3::row_shape(x.bytes(), k)?;
+        let input = self.row_shape(x.bytes(), k)?;
         #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
         {
             self.allocation_rows = input.rows;
@@ -339,8 +392,9 @@ impl<'c, 's> Group<'c, 's> {
             out: frame.range(out)?,
             flag: frame.flag()?,
             rows: input.rows,
+            fused: false,
         };
-        self.ctx.exl3_linear(self.stream, weight.linear_call(&io))?;
+        exl3::linear_rows(self.ctx, self.stream, weight, io)?;
         self.finish(frame, out)
     }
 }

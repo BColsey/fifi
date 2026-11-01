@@ -10,7 +10,7 @@ use super::pieces::ReplyParser;
 use super::reply::{RunningJob, collect};
 use super::reqlog::{RequestLog, default_clock};
 use super::sse;
-use super::state::{AppState, unix_seconds};
+use super::state::{AppState, EngineEntry, unix_seconds};
 use super::validate::{ChatInput, parse_chat};
 use super::wire::{ChatCompletion, ReplyHead};
 use crate::EngError;
@@ -19,7 +19,9 @@ use crate::family::sampler::{Sampler, SamplingParams};
 use crate::sched::job::Job;
 use crate::sched::worker::SubmitError;
 use crate::tokenizer::toolcall::{Start, ToolGrammar};
-use crate::tokenizer::{IncrementalDecoder, OutputAssembler, PromptBoundaries, TokenizerBundle};
+use crate::tokenizer::{
+    IncrementalDecoder, OutputAssembler, PromptBoundaries, TokenizerBundle, ToolSpec,
+};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -43,10 +45,15 @@ pub(crate) async fn chat(State(state): State<Arc<AppState>>, body: Body) -> Resp
     }
 }
 
-async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+/// Reads a request body up to the cap of the contract.
+pub(super) async fn read_body(body: Body) -> Result<axum::body::Bytes, ServerError> {
+    axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
-        .map_err(|_| bad("the request body is larger than 16 MiB or cannot be read"))?;
+        .map_err(|_| bad("the request body is larger than 16 MiB or cannot be read"))
+}
+
+async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
+    let bytes = read_body(body).await?;
     let input = parse_chat(&bytes)?;
     // The stream flag is read before `submit` consumes the input. The headers go out at admission.
     let stream = input.stream;
@@ -154,6 +161,64 @@ pub(crate) async fn submit(
             message: error.to_string(),
         })
     })??;
+    let reply = ReplyMode::Chat {
+        start,
+        tools: input.tools,
+    };
+    let admission = Admission {
+        prompt,
+        boundaries,
+        sampling,
+        assembler,
+        max_tokens: input.max_tokens,
+        stream,
+        reply,
+        method,
+        endpoint,
+    };
+    admit(state, entry, admission)
+}
+
+/// How a reply reads the generated text.
+pub(super) enum ReplyMode {
+    /// A chat reply: think blocks and tool calls are split out of the text. `start` is where the
+    /// parser begins, and `tools` are the tools the request declared.
+    Chat { start: Start, tools: Vec<ToolSpec> },
+    /// A raw completion: the text passes through unchanged.
+    Raw,
+}
+
+/// A tokenized prompt and the request fields that admission still needs.
+pub(super) struct Admission {
+    pub(super) prompt: Vec<u32>,
+    pub(super) boundaries: PromptBoundaries,
+    pub(super) sampling: SamplingParams,
+    pub(super) assembler: OutputAssembler,
+    pub(super) max_tokens: u32,
+    pub(super) stream: bool,
+    pub(super) reply: ReplyMode,
+    pub(super) method: &'static str,
+    pub(super) endpoint: &'static str,
+}
+
+/// Checks the prompt against the context limit and queues the job on the engine of `entry`.
+/// The chat, Anthropic and completion routes all end here.
+pub(super) fn admit(
+    state: &AppState,
+    entry: &EngineEntry,
+    admission: Admission,
+) -> Result<Submitted, ServerError> {
+    let Admission {
+        prompt,
+        boundaries,
+        sampling,
+        assembler,
+        max_tokens: requested_tokens,
+        stream,
+        reply,
+        method,
+        endpoint,
+    } = admission;
     let prompt_tokens = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
     // From here on, every end of the request writes one line of the request log.
     let mut log = RequestLog::new(
@@ -186,7 +251,7 @@ pub(crate) async fn submit(
         ));
     }
     // The executor enforces this limit. The server counts no tokens.
-    let max_tokens = input.max_tokens.min(entry.context_limit - prompt_tokens);
+    let max_tokens = requested_tokens.min(entry.context_limit - prompt_tokens);
     let head = ReplyHead {
         id: state.next_completion_id(),
         created: unix_seconds(),
@@ -194,12 +259,15 @@ pub(crate) async fn submit(
         engine: entry.id.clone(),
     };
     log.set_id(&head.id);
-    let parser = ReplyParser::with_grammar(
-        start,
-        &input.tools,
-        &head.call_prefix(),
-        entry.bundle.tool_grammar(),
-    );
+    let parser = match reply {
+        ReplyMode::Chat { start, tools } => ReplyParser::with_grammar(
+            start,
+            &tools,
+            &head.call_prefix(),
+            entry.bundle.tool_grammar(),
+        ),
+        ReplyMode::Raw => ReplyParser::raw(),
+    };
     let decoder = IncrementalDecoder::new(entry.bundle.tokenizer());
     let sampler = Sampler::from_entropy(sampling);
     let generation = GenerationState::with_sampler(decoder, sampler).with_max_tokens(max_tokens);

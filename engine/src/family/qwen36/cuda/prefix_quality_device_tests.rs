@@ -1,4 +1,6 @@
 //! FP16 prefix restore against cold chunked prefill on the unchanged oracle cohort.
+#[path = "prefill_exl3_restore_device_tests.rs"]
+mod exl3_restore;
 #[path = "prefix_quality_kv8_device_tests.rs"]
 mod kv8;
 
@@ -195,8 +197,7 @@ fn device_phase(ids: &[u32]) -> Result<Observed, EngError> {
         layout: WeightLayout::Native,
     };
     let rules = QwenRules::new(vec![248_046, 248_044], VOCAB, HEAD)?;
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     let model = open_qwen3_6_35b_a3b(
         &std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf"),
         None,
@@ -364,9 +365,7 @@ fn scoring_uses_signed_nll_and_candidate_to_reference_kl() {
 #[test]
 #[ignore = "full native model and immutable oracle cohort; CPU/GPU leases required"]
 fn fp16_restore_matches_cold_chunked_on_oracle_cohort() {
-    let dir = std::env::var("Q36_CUDA_COHORT_DIR").unwrap_or_else(|_| {
-        "/media/dan/nvme/fifi/scrch/bba24a15/llamacpp-oracle/cohort".to_owned()
-    });
+    let dir = crate::test_paths::required("Q36_CUDA_COHORT_DIR");
     let bytes =
         std::fs::read(std::path::Path::new(&dir).join("tokens.json")).expect("supplied cohort");
     let ids = cohort_ids(&bytes).expect("unchanged supplied cohort");

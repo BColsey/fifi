@@ -496,7 +496,7 @@ impl<S: WeightSource> NemotronStack<S> {
     }
 
     fn step_inner(&mut self, token: u32, want_head: bool) -> Result<Option<u32>, EngError> {
-        // Disk I/O measurement (coordinator 01a1623d): read_bytes per token.
+        // Disk I/O measurement: read_bytes per token.
         let io_before = std::fs::read_to_string("/proc/self/io")
             .ok()
             .and_then(|text| {
@@ -523,7 +523,7 @@ impl<S: WeightSource> NemotronStack<S> {
         result
     }
 
-    /// Prints the disk read delta for this token (coordinator's 16x test).
+    /// Prints the disk read delta for this token (the 16x test).
     fn report_io(&self, before: Option<u64>) {
         let after = before.and_then(|_| {
             std::fs::read_to_string("/proc/self/io")
@@ -539,7 +539,7 @@ impl<S: WeightSource> NemotronStack<S> {
         }
     }
 
-    /// Startup guard (coordinator 01a16111): with NEM35_RESIDENT_DENSE=1,
+    /// Startup guard: with NEM35_RESIDENT_DENSE=1,
     /// logs the resident dense count/bytes after the first forward and
     /// warns if any F32 dense cache remains (weights that failed to go
     /// resident and still upload as F32 every call).
@@ -590,7 +590,7 @@ impl<S: WeightSource> NemotronStack<S> {
                          F32 dense cache; these weights upload every call"
                     );
                 }
-                // Host-heap breakdown (coordinator 01a1623d).
+                // Host-heap breakdown.
                 if let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") {
                     let mut anon = 0u64;
                     let mut file = 0u64;
@@ -718,7 +718,7 @@ impl<S: WeightSource> NemotronStack<S> {
         };
         let output = match state {
             BlockState::Mamba { conv, ssm } => {
-                // NEM35_DEVICE_CHAIN counter (coordinator guard): the mamba
+                // NEM35_DEVICE_CHAIN counter (gate guard): the mamba
                 // goes through the name-based device path (linear_by_name
                 // projections); count each layer.
                 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

@@ -117,6 +117,8 @@ fn residual(
             y: delta.range(0, delta.bytes())?,
             out: frame.range(output)?,
             n: shape.rows * WIDTH,
+            flag: Some(frame.flag()?),
+            fused: false,
         },
     )?;
     let published = frame.publish(output, shape)?;
@@ -370,19 +372,19 @@ fn qualify(layer: u32) {
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission and frozen real artifacts"]
+#[ignore = "needs the whole GPU and frozen real artifacts"]
 fn dense_layer_0_m4_matches_real_fp64_oracle() {
     qualify(0);
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission and frozen real artifacts"]
+#[ignore = "needs the whole GPU and frozen real artifacts"]
 fn moe_layer_2_m4_matches_real_fp64_oracle() {
     qualify(2);
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission; no model"]
+#[ignore = "needs the whole GPU; no model"]
 fn prefix_norm_and_residual_keep_three_four_and_five_rows() {
     let ctx = CudaContext::new().expect("requires CUDA");
     let stream = ctx.stream().unwrap();
@@ -402,7 +404,7 @@ fn prefix_norm_and_residual_keep_three_four_and_five_rows() {
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run admission; no model"]
+#[ignore = "needs the whole GPU; no model"]
 fn raw_head_projection_keeps_f32_without_changing_hidden_publication() {
     let ctx = CudaContext::new().expect("requires CUDA");
     let stream = ctx.stream().unwrap();

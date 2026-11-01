@@ -180,6 +180,11 @@ impl<'w> MixerWeights<'w> {
                 raw_f32(weights, table.name(layer, spec.role)?, spec.values)?,
             ));
         }
+        // The plain gates of an EXL3 layer are raw F32 matrices read by their own projection.
+        for spec in g.plain_specs(layout, kind) {
+            let name = table.name(layer, spec.role)?;
+            raw.push((spec.role, raw_f32(weights, name, spec.rows * spec.k)?));
+        }
         Ok(LayerWeights { dense, raw })
     }
 }
@@ -211,9 +216,10 @@ pub(super) fn dense_weight<'w>(
             check_dense(name, (weight.shape[1], weight.shape[0], None), spec)?;
             Ok(DenseWeight::Exl3(weight))
         }
-        (Some(CudaWeight::Exl3 { .. }), _) | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(
-            format!("mixer weights: {name} does not match the requested EXL3 layout"),
-        )),
+        (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _)
+        | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
+            "mixer weights: {name} does not match the requested EXL3 layout"
+        ))),
         (Some(CudaWeight::Tiled { .. }), WeightLayout::Native) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the tiled layout, the step runs native"),
         )),

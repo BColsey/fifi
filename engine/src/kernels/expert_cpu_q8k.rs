@@ -1031,6 +1031,13 @@ mod tests {
             ),
             ("nvfp4_cpu.rs", include_str!("nvfp4_cpu.rs"), 25usize),
             (
+                "exl3_cpu_avx512.rs",
+                include_str!("exl3_cpu_avx512.rs"),
+                4usize,
+            ),
+            ("exl3_cpu_pool.rs", include_str!("exl3_cpu_pool.rs"), 2usize),
+            ("exl3_cpu.rs", include_str!("exl3_cpu.rs"), 0),
+            (
                 "page_cache.rs",
                 include_str!("../weights/page_cache.rs"),
                 1usize,

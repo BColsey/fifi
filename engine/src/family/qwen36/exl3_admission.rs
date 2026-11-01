@@ -1,8 +1,12 @@
-//! CPU attention admission seam, test-only until the model loader consumes it.
+//! CPU admission of one attention layer of an EXL3 pack: the stored shapes, the norms and the
+//! byte budget, checked without a device. The device loader checks the same facts through the
+//! step's geometry.
 
-use half::{bf16, f16};
-
-use super::{host::HostShape, host_load::rotary_dim};
+use super::{
+    exl3_tensors::{effective_norm_bytes, norm_layout},
+    host::HostShape,
+    host_load::rotary_dim,
+};
 use crate::{
     EngError,
     family::{AttentionKind, FamilySpec},
@@ -108,57 +112,6 @@ fn admit_attention(
         })
         .collect::<Result<Vec<_>, EngError>>()?;
     Ok(AttentionAdmission { projections, norms })
-}
-
-/// Exact source vectors, not reshapes of another tensor with the same byte count.
-pub(super) fn norm_layout(dtype: Dtype, shape: &[u32], values: usize) -> Result<usize, EngError> {
-    if values == 0 || shape.len() != 1 || shape[0] as usize != values {
-        return Err(EngError::Checkpoint(format!(
-            "EXL3 attention norm: shape {shape:?}, expected [{values}]"
-        )));
-    }
-    if !matches!(dtype, Dtype::F16 | Dtype::Bf16 | Dtype::F32) {
-        return Err(EngError::Checkpoint(format!(
-            "EXL3 attention norm: unsupported dtype {dtype:?}"
-        )));
-    }
-    values
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| EngError::MemoryPlan("EXL3 norm staging byte count overflow".into()))
-}
-
-/// Convert actual storage to F32, then add one in F32, never in F16 or BF16.
-pub(super) fn effective_norm_bytes(tensor: &Tensor, values: usize) -> Result<Vec<u8>, EngError> {
-    let output_len = norm_layout(tensor.dtype(), tensor.shape(), values)?;
-    let bytes = tensor
-        .host_bytes()
-        .ok_or_else(|| EngError::Checkpoint("EXL3 attention norm requires host storage".into()))?;
-    let width = if tensor.dtype() == Dtype::F32 { 4 } else { 2 };
-    if bytes.len() != output_len / (4 / width) {
-        return Err(EngError::Checkpoint(
-            "EXL3 attention norm has invalid storage length".into(),
-        ));
-    }
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(output_len)
-        .map_err(|error| EngError::MemoryPlan(format!("EXL3 norm staging allocation: {error}")))?;
-    for word in bytes.chunks_exact(width) {
-        let value = match tensor.dtype() {
-            Dtype::F16 => f16::from_bits(u16::from_le_bytes([word[0], word[1]])).to_f32(),
-            Dtype::Bf16 => bf16::from_bits(u16::from_le_bytes([word[0], word[1]])).to_f32(),
-            Dtype::F32 => f32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-            _ => unreachable!("norm_layout checked the dtype"),
-        };
-        let effective = value + 1.0f32;
-        if !value.is_finite() || !effective.is_finite() {
-            return Err(EngError::Checkpoint(
-                "EXL3 attention norm contains nonfinite values".into(),
-            ));
-        }
-        output.extend_from_slice(&effective.to_le_bytes());
-    }
-    Ok(output)
 }
 
 mod tests {

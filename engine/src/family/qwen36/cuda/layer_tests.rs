@@ -65,3 +65,49 @@ fn a_kind_without_a_resident_mixer_is_refused() {
         "{error:?}"
     );
 }
+
+#[test]
+fn a_single_layer_table_renames_one_layer_and_restarts_its_ordinal() {
+    let d = dims();
+    let table = LayerTable::new(&d, &inventory()).expect("table");
+    let source = d
+        .shape
+        .kinds
+        .iter()
+        .position(|&kind| kind == AttentionKind::Full)
+        .expect("a full-attention layer");
+    let number = table.len();
+    let block = table.single(source, number).expect("single");
+    assert_eq!(block.len(), 1);
+    assert_eq!(
+        block.slot(0).expect("slot"),
+        LayerSlot {
+            kind: AttentionKind::Full,
+            ordinal: 0
+        }
+    );
+    let original = table.name(source, Role::AttnQ).expect("name");
+    let renamed = block.name(0, Role::AttnQ).expect("name");
+    assert_eq!(original, format!("blk.{source}.attn_q.weight"));
+    assert_eq!(renamed, format!("blk.{number}.attn_q.weight"));
+    for role in [
+        Role::AttnK,
+        Role::AttnV,
+        Role::AttnOutput,
+        Role::FfnGateExps,
+    ] {
+        let name = block.name(0, role).expect("name");
+        assert!(name.starts_with(&format!("blk.{number}.")), "{name}");
+        assert_eq!(
+            name.replace(&format!("blk.{number}."), ""),
+            table
+                .name(source, role)
+                .expect("name")
+                .replace(&format!("blk.{source}."), "")
+        );
+    }
+    assert!(
+        table.single(table.len(), number).is_err(),
+        "a layer outside the table"
+    );
+}

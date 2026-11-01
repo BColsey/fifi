@@ -17,8 +17,8 @@ use std::mem::{offset_of, size_of};
 use super::{
     ARGMAX_PART_BYTES, ArgmaxCall, MAX_ADVANCE, MAX_LOGITS, OFFSET_KV_LEN, OFFSET_KV_SLOT,
     OFFSET_POS, OFFSET_STATUS, OFFSET_TOKEN_ID, POS_MAX, RESULT_PAIR_BYTES, ResultPair,
-    STATUS_INVALID_STEP_STATE, STATUS_NON_FINITE_LOGITS, STATUS_ROUTER_FAULT, STEP_PARAMS_BYTES,
-    StepParams, StepStatus, WORD_MAX, check_n, ensure_rows,
+    STATUS_EXL3_ARITHMETIC, STATUS_INVALID_STEP_STATE, STATUS_NON_FINITE_LOGITS,
+    STATUS_ROUTER_FAULT, STEP_PARAMS_BYTES, StepParams, StepStatus, WORD_MAX, check_n, ensure_rows,
 };
 use crate::EngError;
 use crate::kernels::cuda::native::activation_bytes;
@@ -593,6 +593,109 @@ fn step_begin_clears_the_status_and_flags_a_bad_state() {
         assert_eq!(after, sim_begin(p), "begin on {p:?}");
         assert_eq!(after.status, STATUS_INVALID_STEP_STATE, "mask 4 for {p:?}");
     }
+}
+
+#[test]
+fn exl3_flag_folds_into_the_status_and_the_result_pair() {
+    if !testkit::device_present("exl3_flag_folds_into_the_status_and_the_result_pair") {
+        return;
+    }
+    let fx = Fx::new();
+    let flag = testkit::upload_filled(&fx.ctx, 0xFF, 8);
+    let word = |at: usize| flag.range(at, 4).expect("flag range");
+    let read_word = |at: usize| {
+        fx.stream.synchronize().expect("synchronize");
+        let bytes = testkit::read_bytes(&fx.ctx, &flag, at + 4);
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+    };
+    fx.ctx.exl3_flag_clear(&fx.stream, word(4)).expect("clear");
+    assert_eq!(
+        (read_word(0), read_word(4)),
+        (u32::MAX, 0),
+        "only its word clears"
+    );
+    // Bit 0 set: the verdict reaches the status, the pair and the word is consumed; the other
+    // status bits and words stay.
+    for (seen, folded) in [(1u32, true), (3, true), (0, false), (2, false)] {
+        let params = fx.upload_params(block(5, 9, STATUS_ROUTER_FAULT));
+        let range = params.range(0, STEP_PARAMS_BYTES).expect("params range");
+        let words = testkit::upload_bytes(&fx.ctx, &seen.to_le_bytes());
+        let seen_range = words.range(0, 4).expect("word range");
+        fx.ctx
+            .exl3_flag_fold(&fx.stream, range, seen_range)
+            .expect("fold");
+        let after = fx.read_params(&params);
+        let expected = STATUS_ROUTER_FAULT | if folded { STATUS_EXL3_ARITHMETIC } else { 0 };
+        assert_eq!(
+            after,
+            StepParams {
+                status: expected,
+                ..block(5, 9, 0)
+            },
+            "seen {seen}"
+        );
+        let bytes = testkit::read_bytes(&fx.ctx, &words, 4);
+        assert_eq!(bytes, [0; 4], "the word is consumed for seen {seen}");
+    }
+    // The pair of the following argmax carries the folded status.
+    let row = base_row(300);
+    let params = fx.upload_params(block(SENTINEL, 11, 0));
+    let flagged = testkit::upload_bytes(&fx.ctx, &1u32.to_le_bytes());
+    fx.ctx
+        .exl3_flag_fold(
+            &fx.stream,
+            params.range(0, STEP_PARAMS_BYTES).expect("params range"),
+            flagged.range(0, 4).expect("word range"),
+        )
+        .expect("fold");
+    let logits = testkit::upload_f32(&fx.ctx, &row);
+    let part = testkit::upload_filled(&fx.ctx, 0xFF, ARGMAX_PART_BYTES);
+    let result = testkit::upload_filled(&fx.ctx, 0xEE, RESULT_PAIR_BYTES);
+    fx.ctx
+        .argmax(
+            &fx.stream,
+            ArgmaxCall {
+                n: row.len(),
+                logits: logits.range(0, 4 * row.len()).expect("logits range"),
+                part: part.range(0, ARGMAX_PART_BYTES).expect("part range"),
+                params: params.range(0, STEP_PARAMS_BYTES).expect("params range"),
+                result: Some(result.range(0, RESULT_PAIR_BYTES).expect("result range")),
+            },
+        )
+        .expect("argmax");
+    assert_eq!(fx.read_pair(&result, 0).status.0, STATUS_EXL3_ARITHMETIC);
+}
+
+#[test]
+fn exl3_flag_calls_refuse_bad_ranges() {
+    if !testkit::device_present("exl3_flag_calls_refuse_bad_ranges") {
+        return;
+    }
+    let fx = Fx::new();
+    let buffer = testkit::upload_filled(&fx.ctx, 0, 64);
+    let range = |at, bytes| buffer.range(at, bytes).expect("range");
+    assert_bad_request(
+        fx.ctx.exl3_flag_clear(&fx.stream, range(0, 3)),
+        "short flag",
+        "EXL3 flag",
+    );
+    assert_bad_request(
+        fx.ctx.exl3_flag_clear(&fx.stream, range(2, 4)),
+        "unaligned flag",
+        "EXL3 flag",
+    );
+    assert_bad_request(
+        fx.ctx
+            .exl3_flag_fold(&fx.stream, range(0, STEP_PARAMS_BYTES), range(28, 4)),
+        "flag inside the params",
+        "EXL3 flag",
+    );
+    assert_bad_request(
+        fx.ctx
+            .exl3_flag_fold(&fx.stream, range(0, 16), range(32, 4)),
+        "short params",
+        "params",
+    );
 }
 
 #[test]

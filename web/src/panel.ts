@@ -63,7 +63,7 @@ export interface ProbeOutcome {
   recentError: string | null;
 }
 
-/** The merge (Opus MF1): a probe FULLY REPLACES the panel data and stamps
+/** The merge: a probe FULLY REPLACES the panel data and stamps
  * one fresh time. Nothing survives from the previous state — that is the
  * invariant; the poll may only call the full sweep, so a dead engine can
  * never show a last-good "runs"/"ready" next to a current timestamp. */
@@ -71,7 +71,7 @@ export function applyProbe(probe: ProbeOutcome): PanelData {
   return { ...probe, checkedAt: Date.now() };
 }
 
-/** The poll's per-tick decision (Sol MF2): which refresh runs. The last
+/** The poll's per-tick decision: which refresh runs. The last
  * known server state is an input ONLY so the decision owns it — the
  * correct answer consults it for nothing, because the full sweep probes
  * health itself. Gating the monitor refresh on readiness was a

@@ -68,19 +68,20 @@ fn forced_ffn(
         ids,
         grouping,
         gates,
+        device_ids: None,
         logits: None,
     };
     moe_routed(frame, x, block, weights, routed)
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run, sealed partial and new six-case FP64 routing records"]
+#[ignore = "needs the whole GPU, sealed partial and new six-case FP64 routing records"]
 fn capture_and_force_moe_miss_routes() {
     capture(&gguf::routes::PAIRS);
 }
 
 #[test]
-#[ignore = "requires fifi-gpu-run and new eight-case tail routing records"]
+#[ignore = "needs the whole GPU and new eight-case tail routing records"]
 fn capture_and_force_tail_moe_miss_routes() {
     capture(&gguf::routes::TAIL_PAIRS);
 }

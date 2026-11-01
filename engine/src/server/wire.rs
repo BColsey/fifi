@@ -419,6 +419,72 @@ impl ChatCompletionChunk {
     }
 }
 
+#[derive(Serialize)]
+struct TextChoice {
+    index: u32,
+    text: String,
+    logprobs: Option<()>,
+    finish_reason: Option<&'static str>,
+}
+
+/// The reply of `POST /v1/completions`, and its stream chunks: both have the `text_completion`
+/// shape. A chunk has no usage, except the last one.
+#[derive(Serialize)]
+pub(crate) struct Completion {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    engine: String,
+    choices: Vec<TextChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+}
+
+impl Completion {
+    /// The reply of a non-streaming request.
+    pub(crate) fn reply(
+        head: &ReplyHead,
+        text: String,
+        finish: FinishReason,
+        usage: Usage,
+    ) -> Self {
+        Self::build(head, text, Some(finish.as_str()), Some(usage))
+    }
+
+    /// A stream chunk with generated text.
+    pub(crate) fn chunk(head: &ReplyHead, text: String) -> Self {
+        Self::build(head, text, None, None)
+    }
+
+    /// The final stream chunk: no text, the finish reason, and the usage.
+    pub(crate) fn last(head: &ReplyHead, finish: FinishReason, usage: Usage) -> Self {
+        Self::build(head, String::new(), Some(finish.as_str()), Some(usage))
+    }
+
+    fn build(
+        head: &ReplyHead,
+        text: String,
+        finish_reason: Option<&'static str>,
+        usage: Option<Usage>,
+    ) -> Self {
+        Self {
+            id: head.id.clone(),
+            object: "text_completion",
+            created: head.created,
+            model: head.model.clone(),
+            engine: head.engine.clone(),
+            choices: vec![TextChoice {
+                index: 0,
+                text,
+                logprobs: None,
+                finish_reason,
+            }],
+            usage,
+        }
+    }
+}
+
 /// The `Engine` schema.
 #[derive(Serialize)]
 pub(crate) struct EngineInfo {

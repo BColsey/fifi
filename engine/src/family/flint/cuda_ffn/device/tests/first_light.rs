@@ -117,6 +117,8 @@ fn residual(
             y: delta.range(0, delta.bytes())?,
             out: frame.range(out)?,
             n: ROWS * WIDTH,
+            flag: Some(frame.flag()?),
+            fused: false,
         },
     )?;
     let published = frame.publish(out, SHAPE)?;

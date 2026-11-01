@@ -18,7 +18,7 @@ use crate::kernels::cuda::native;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::weights::GgufType;
 
-use super::{BlockReader, CudaContext, DeviceBuffer, QuantTensor, device_error, host_source};
+use super::{BlockReader, CudaContext, DeviceBuffer, QuantTensor, host_source};
 
 /// A quantized weight in the GGUF file's own block layout, resident on the device: one
 /// allocation of `n_rows` rows of `k / block_size` blocks each, `experts` the stack depth of a
@@ -93,7 +93,7 @@ impl CudaContext {
             let part = &mut source[..plan.count_of(first) * row_bytes];
             read(first * row_bytes, part)?;
             let _dispatch = self.enter()?;
-            native::upload_at(raw, first * row_bytes, part).map_err(device_error)?;
+            super::host_write(&buffer, raw, first * row_bytes, part)?;
         }
         Ok(NativeWeight {
             buffer,

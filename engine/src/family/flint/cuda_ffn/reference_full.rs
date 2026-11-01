@@ -4,7 +4,7 @@ use super::*;
 use crate::family::flint::cuda_ffn::{real_model, reference::real::run};
 
 #[test]
-#[ignore = "CPU model preparation requires fifi-build and the pinned GGUF"]
+#[ignore = "CPU model preparation requires the pinned GGUF; long CPU run"]
 fn freeze_full49_eight_prefixes() {
     let (file, header, identity) = real_model::model();
     let prefixes = real_model::prefixes();

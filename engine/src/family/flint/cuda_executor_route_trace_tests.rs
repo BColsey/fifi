@@ -237,7 +237,7 @@ fn retained_h2_request_controls_and_prompt_ids() -> Result<()> {
     Ok(())
 }
 #[test]
-#[ignore = "coordinator lease only: real Flint pack/tokenizer and FIFI_FLINT_ROUTE_TRACE_INPUT/OUT; no timing claim"]
+#[ignore = "needs the whole GPU: real Flint pack/tokenizer and FIFI_FLINT_ROUTE_TRACE_INPUT/OUT; no timing claim"]
 fn trace_real_exl3_routes() -> Result<()> {
     let input = required_path("FIFI_FLINT_ROUTE_TRACE_INPUT")?;
     let output = required_path("FIFI_FLINT_ROUTE_TRACE_OUT")?;
@@ -282,6 +282,8 @@ fn trace_real_exl3_routes() -> Result<()> {
         &options,
         bundle.eos_token_ids().to_vec(),
         bundle.tokenizer().vocab_size() as usize,
+        // Fixture template identity (parks need per-test consistency).
+        [0u8; 32],
     )?;
     let mut layers = Vec::new();
     for index in 0..executor.model.layer_count() {

@@ -68,6 +68,9 @@ pub(super) struct MixerGeometry {
 /// Taps of the causal conv kernel (`gdn_conv.h`: weights `[channels][4]`).
 const CONV_TAPS: usize = 4;
 
+/// The DeltaNet gates an EXL3 pack keeps as plain matrices (see `MixerGeometry::plain_specs`).
+const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
+
 /// A dense (tiled) mixer weight: its role, output rows and input length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DenseSpec {
@@ -159,7 +162,32 @@ impl MixerGeometry {
         // describe a wide qkv another layout's weights cannot satisfy.
         let fused =
             crate::family::project::cuda::gdn_fuse_inproj() && layout == WeightLayout::Native;
-        self.dense_specs_with(fused, kind)
+        let mut specs = self.dense_specs_with(fused, kind)?;
+        if layout == WeightLayout::Exl3 {
+            specs.retain(|spec| !PLAIN_ROLES.contains(&spec.role));
+        }
+        Ok(specs)
+    }
+
+    /// The projections that stay plain F32 matrices beside the EXL3 ones: the pack does not
+    /// quantize the 32-row step and decay gates of a DeltaNet layer.
+    pub(super) fn plain_specs(&self, layout: WeightLayout, kind: AttentionKind) -> Vec<DenseSpec> {
+        if layout != WeightLayout::Exl3 || kind != AttentionKind::DeltaNet {
+            return Vec::new();
+        }
+        let (h, d) = (self.hidden, &self.delta);
+        vec![
+            DenseSpec {
+                role: Role::SsmBeta,
+                rows: d.beta_rows,
+                k: h,
+            },
+            DenseSpec {
+                role: Role::SsmAlpha,
+                rows: d.alpha_rows,
+                k: h,
+            },
+        ]
     }
 
     /// The `dense_specs` twin with an explicit fusion flag, so the CPU tests pin both arms

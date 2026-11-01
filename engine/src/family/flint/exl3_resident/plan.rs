@@ -150,3 +150,72 @@ fn required(names: &HashMap<&str, usize>, name: &str) -> Result<usize, EngError>
         .copied()
         .ok_or_else(|| EngError::Checkpoint(format!("Flint EXL3 resident role {name} is missing")))
 }
+
+/// The offset-table entry of a member that is not on the device (`u32::MAX`, as the launch reads it).
+pub(super) const ABSENT_MEMBER: u32 = u32::MAX;
+
+/// Checks the host copy of a member offset table before it is written to the device: every
+/// present offset is a multiple of 4 bytes and leaves one member's `needs` (trellis bytes, suh
+/// floats, svh floats) inside the bank ranges `bank` (trellis bytes, suh bytes, svh bytes)
+/// measured from member 0, where a single offset moves all three.
+pub(super) fn check_member_offsets(
+    offsets: &[u32],
+    needs: [usize; 3],
+    bank: [usize; 3],
+) -> Result<(), EngError> {
+    if offsets.is_empty() {
+        return Err(offsets_error("member offset table is empty"));
+    }
+    for &offset in offsets.iter().filter(|&&offset| offset != ABSENT_MEMBER) {
+        let offset = offset as usize;
+        if !offset.is_multiple_of(4) {
+            return Err(offsets_error(
+                "a member offset is not a multiple of 4 bytes",
+            ));
+        }
+        let fits = [
+            (needs[0], bank[0]),
+            (needs[1] * 4, bank[1]),
+            (needs[2] * 4, bank[2]),
+        ]
+        .into_iter()
+        .all(|(need, range)| offset.checked_add(need).is_some_and(|end| end <= range));
+        if !fits {
+            return Err(offsets_error("a member leaves the bank ranges"));
+        }
+    }
+    Ok(())
+}
+
+fn offsets_error(message: &str) -> crate::EngError {
+    crate::EngError::BadRequest(format!("Flint expert offsets: {message}"))
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    #[test]
+    fn member_offsets_must_be_aligned_present_or_absent_and_inside_the_bank() {
+        // Three members of 100 bytes each: a 64-byte trellis then 4 + 4 floats (32 bytes).
+        let needs = [64, 4, 4];
+        let bank = [264, 232, 232];
+        assert!(check_member_offsets(&[0, 100, 200], needs, bank).is_ok());
+        assert!(check_member_offsets(&[200, ABSENT_MEMBER, 0], needs, bank).is_ok());
+        assert!(check_member_offsets(&[ABSENT_MEMBER], needs, bank).is_ok());
+        assert!(check_member_offsets(&[], needs, bank).is_err());
+        assert!(
+            check_member_offsets(&[0, 102], needs, bank).is_err(),
+            "unaligned"
+        );
+        assert!(
+            check_member_offsets(&[204], needs, bank).is_err(),
+            "trellis leaves the range"
+        );
+        // At 216 the trellis fits (216 + 64 <= 300) but the suh floats end at 216 + 16 = 232,
+        // one word past a 228-byte range.
+        assert!(check_member_offsets(&[216], needs, [300, 228, 228]).is_err());
+        assert!(check_member_offsets(&[216], needs, [300, 232, 232]).is_ok());
+        assert!(check_member_offsets(&[u32::MAX - 1], needs, bank).is_err());
+    }
+}

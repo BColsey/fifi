@@ -14,12 +14,16 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::row_add::{RowAddRaw, row_add_launch};
 
-/// One row_add call: n values in x and y, their sum in out.
+/// One row_add call: n values in x and y, their sum in out. With fused
+/// set, out holds the published bf16 roundtrip (nonfinite sums become 0
+/// with the flag's bit0 set) instead of the plain sum; fused requires flag.
 pub(crate) struct RowAddCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
     pub(crate) y: DeviceRange<'b>,
     pub(crate) n: usize,
+    pub(crate) flag: Option<DeviceRange<'b>>,
+    pub(crate) fused: bool,
 }
 
 impl CudaContext {
@@ -56,11 +60,28 @@ impl CudaContext {
         let out = Claim::of("out", &call.out, bytes);
         require_apart(&out, &Claim::of("x", &call.x, bytes))?;
         require_apart(&out, &Claim::of("y", &call.y, bytes))?;
+        if call.fused {
+            let flag = call
+                .flag
+                .as_ref()
+                .ok_or_else(|| EngError::BadRequest("fused row_add needs a flag".to_owned()))?;
+            require_fit("flag", flag, 4, 4)?;
+            let flag = Claim::of("flag", flag, 4);
+            require_apart(&flag, &out)?;
+            require_apart(&flag, &Claim::of("x", &call.x, bytes))?;
+            require_apart(&flag, &Claim::of("y", &call.y, bytes))?;
+        }
         Ok(RowAddRaw {
             out: out_raw,
             x: x_raw,
             y: y_raw,
             n: call.n,
+            flag: call
+                .flag
+                .as_ref()
+                .map(|flag| self.raw_range(flag))
+                .transpose()?,
+            fused: call.fused,
         })
     }
 }

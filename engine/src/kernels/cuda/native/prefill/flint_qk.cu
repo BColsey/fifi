@@ -89,6 +89,43 @@ __global__ void norm_k(inference_cuda_flint_qk_args a) {
         __dmul_rn(__dmul_rn(input[d], inverse), double(weight)), a.flag) : 0.0f;
 }
 
+/* The same arithmetic as norm_k with one thread per (row, head). norm_k keeps the oracle's
+ * dimension order with one thread summing 128 squares in a block, and on a GeForce part a warp
+ * instruction of F64 occupies the pipe for 16 cycles whether one lane or 32 use it, so a tall
+ * piece spends most of its Q/K time in those one-lane chains. Here the 32 lanes of a warp run 32
+ * vectors' chains side by side, each in the same order, so every output is the value norm_k
+ * writes, bit for bit, and the flag latches under the same conditions. */
+__global__ void norm_rows_k(inference_cuda_flint_qk_args a) {
+    const size_t vector = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (vector >= a.rows * 36) return;
+    const size_t head = vector % 36;
+    const size_t row = vector / 36;
+    const bool query = head < 32;
+    const size_t offset = (row * (query ? 32 : 4) + (query ? head : head - 32)) * 128;
+    const float *x = (query ? a.q : a.k) + offset;
+    const float *gamma = query ? a.gamma_q : a.gamma_k;
+    float *out = (query ? a.out_q : a.out_k) + offset;
+    double squares = 0.0;
+    bool good = true;
+    for (unsigned i = 0; i < 128; ++i) {
+        const float value = x[i];
+        good = good && isfinite(value) && isfinite(gamma[i]);
+        const double widened = double(value);
+        squares = __dadd_rn(squares, __dmul_rn(widened, widened));
+    }
+    if (!good) {
+        atomicOr(a.flag, unsigned(INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION));
+        for (unsigned d = 0; d < 128; ++d) out[d] = 0.0f;
+        return;
+    }
+    const double inverse = __ddiv_rn(1.0, __dsqrt_rn(
+        __dadd_rn(__ddiv_rn(squares, 128.0), double(1e-6f))));
+    for (unsigned d = 0; d < 128; ++d) {
+        out[d] = publication_input(
+            __dmul_rn(__dmul_rn(double(x[d]), inverse), double(gamma[d])), a.flag);
+    }
+}
+
 __global__ void rope_k(inference_cuda_flint_qk_args a) {
     const size_t head = blockIdx.x % 36;
     const size_t row = blockIdx.x / 36;
@@ -114,6 +151,36 @@ __global__ void rope_k(inference_cuda_flint_qk_args a) {
         __dadd_rn(__dmul_rn(left, sine), __dmul_rn(right, cosine)), a.flag);
 }
 
+/* The same arithmetic as rope_k with the angle shared by the heads of a row: one block per row,
+ * a thread per rotation pair, the 36 heads in a loop. rope_k recomputes pow and sincos in F64 for
+ * every head of a row, which on a GeForce part (F64 at 1/64 of F32) costs milliseconds for the
+ * thousand rows of a tall piece. Each output element is the value rope_k writes, bit for bit. */
+__global__ void rope_rows_k(inference_cuda_flint_qk_args a) {
+    const size_t row = blockIdx.x;
+    const unsigned pair = threadIdx.x;
+    const double position = double(a.position) + double(row);
+    const double angle = __dmul_rn(position, pow(10000.0, -double(pair) / 64.0));
+    double sine, cosine;
+    sincos(angle, &sine, &cosine);
+    for (unsigned head = 0; head < 36; ++head) {
+        const bool query = head < 32;
+        const size_t offset = (row * (query ? 32 : 4) + (query ? head : head - 32)) * 128;
+        const float *x = (query ? a.q : a.k) + offset;
+        float *out = (query ? a.out_q : a.out_k) + offset;
+        const double left = double(x[pair]);
+        const double right = double(x[pair + 64]);
+        if (!isfinite(left) || !isfinite(right)) {
+            out[pair] = out[pair + 64] = 0.0f;
+            atomicOr(a.flag, unsigned(INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION));
+            continue;
+        }
+        out[pair] = publication_input(
+            __dsub_rn(__dmul_rn(left, cosine), __dmul_rn(right, sine)), a.flag);
+        out[pair + 64] = publication_input(
+            __dadd_rn(__dmul_rn(left, sine), __dmul_rn(right, cosine)), a.flag);
+    }
+}
+
 int launch_status(int *out_stage) {
     Failure failure;
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
@@ -127,7 +194,11 @@ extern "C" int inference_cuda_flint_qk_norm(const inference_cuda_flint_qk_args *
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!stream || !valid(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        norm_k<<<unsigned(a->rows * 36), 128, 0, (cudaStream_t)stream>>>(*a);
+        if (a->rows > 8) {
+            norm_rows_k<<<unsigned((a->rows * 36 + 127) / 128), 128, 0, (cudaStream_t)stream>>>(*a);
+        } else {
+            norm_k<<<unsigned(a->rows * 36), 128, 0, (cudaStream_t)stream>>>(*a);
+        }
         return launch_status(out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
@@ -139,7 +210,13 @@ extern "C" int inference_cuda_flint_qk_rope(const inference_cuda_flint_qk_args *
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!stream || !valid(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        rope_k<<<unsigned(a->rows * 36), 64, 0, (cudaStream_t)stream>>>(*a);
+        // Eight rows or fewer are a decode or narrow-chunk step: 36 blocks per row spread the work
+        // over the device. A tall piece shares each row's angle across its heads instead.
+        if (a->rows > 8) {
+            rope_rows_k<<<unsigned(a->rows), 64, 0, (cudaStream_t)stream>>>(*a);
+        } else {
+            rope_k<<<unsigned(a->rows * 36), 64, 0, (cudaStream_t)stream>>>(*a);
+        }
         return launch_status(out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;

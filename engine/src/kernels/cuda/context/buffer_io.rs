@@ -182,6 +182,15 @@ impl CudaContext {
         record_allocation(std::rc::Rc::as_ptr(&self.lease) as usize, bytes);
         Ok(buffer)
     }
+
+    /// An allocation-free buffer of this context: the mixed profile's
+    /// placeholder for a plane that carries nothing ("q8k" has no V scale
+    /// plane). Distinct from [`Self::allocate`], which refuses zero bytes.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn empty_buffer(&self) -> Result<DeviceBuffer, EngError> {
+        self.ensure_usable()?;
+        Ok(DeviceBuffer::empty(&self.lease))
+    }
 }
 
 impl DeviceBuffer {

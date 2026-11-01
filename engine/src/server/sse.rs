@@ -11,11 +11,12 @@
 use super::error::ServerError;
 use super::pieces::Piece;
 use super::reply::{RunningJob, Step};
-use super::wire::{ChatCompletionChunk, ReplyHead};
+use super::wire::{ChatCompletionChunk, Completion, FinishReason, ReplyHead, Usage};
 use crate::EngError;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use serde::Serialize;
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -29,10 +30,20 @@ enum Phase {
     Finished,
 }
 
+/// The wire shape of a stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Chat chunks: a role chunk first, then deltas.
+    Chat,
+    /// Text completion chunks: no role chunk, text only.
+    Text,
+}
+
 /// The state of one stream between two events.
 struct Streaming {
     head: ReplyHead,
     running: RunningJob,
+    shape: Shape,
     phase: Phase,
     /// The number of tool calls sent so far.
     calls: u32,
@@ -42,10 +53,30 @@ struct Streaming {
 /// once. `keep_alive` is the quiet interval after which a comment goes out.
 /// Dropping the response drops the job, which cancels it.
 pub(crate) fn respond(head: ReplyHead, running: RunningJob, keep_alive: Duration) -> Response {
+    start_stream(Shape::Chat, head, running, keep_alive)
+}
+
+/// Like `respond`, for a text completion: the chunks have the `text_completion` shape and there
+/// is no role chunk. The stream still ends with the usage chunk and `[DONE]`.
+pub(crate) fn respond_text(head: ReplyHead, running: RunningJob, keep_alive: Duration) -> Response {
+    start_stream(Shape::Text, head, running, keep_alive)
+}
+
+fn start_stream(
+    shape: Shape,
+    head: ReplyHead,
+    running: RunningJob,
+    keep_alive: Duration,
+) -> Response {
+    let phase = match shape {
+        Shape::Chat => Phase::Role,
+        Shape::Text => Phase::Running,
+    };
     let state = Streaming {
         head,
         running,
-        phase: Phase::Role,
+        shape,
+        phase,
         calls: 0,
     };
     let events = futures::stream::unfold(state, advance)
@@ -72,8 +103,7 @@ async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
             }) => {
                 state.phase = Phase::Finished;
                 let mut events = piece_events(&mut state, pieces);
-                let last = ChatCompletionChunk::last(&state.head, finish, usage);
-                events.push(chunk_event(&last));
+                events.push(last_event(&state, finish, usage));
                 events.push(Event::default().data("[DONE]"));
                 events
             }
@@ -95,12 +125,7 @@ fn piece_events(state: &mut Streaming, pieces: Vec<Piece>) -> Vec<Event> {
     let mut events = Vec::new();
     for piece in pieces {
         match piece {
-            Piece::Content(text) => {
-                events.push(chunk_event(&ChatCompletionChunk::content(
-                    &state.head,
-                    text,
-                )));
-            }
+            Piece::Content(text) => events.push(content_event(state, text)),
             Piece::Reasoning(text) => {
                 events.push(chunk_event(&ChatCompletionChunk::reasoning(
                     &state.head,
@@ -122,7 +147,21 @@ fn piece_events(state: &mut Streaming, pieces: Vec<Piece>) -> Vec<Event> {
     events
 }
 
-fn chunk_event(chunk: &ChatCompletionChunk) -> Event {
+fn content_event(state: &Streaming, text: String) -> Event {
+    match state.shape {
+        Shape::Chat => chunk_event(&ChatCompletionChunk::content(&state.head, text)),
+        Shape::Text => chunk_event(&Completion::chunk(&state.head, text)),
+    }
+}
+
+fn last_event(state: &Streaming, finish: FinishReason, usage: Usage) -> Event {
+    match state.shape {
+        Shape::Chat => chunk_event(&ChatCompletionChunk::last(&state.head, finish, usage)),
+        Shape::Text => chunk_event(&Completion::last(&state.head, finish, usage)),
+    }
+}
+
+fn chunk_event(chunk: &impl Serialize) -> Event {
     Event::default().json_data(chunk).unwrap_or_else(|error| {
         error_event(&ServerError::Eng(EngError::Backend {
             operation: "serialize",

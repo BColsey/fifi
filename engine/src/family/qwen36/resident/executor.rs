@@ -2699,7 +2699,7 @@ mod tests {
     }
 
     /// The real checkpoint on the Mac: the executor with a greedy sampler must give the 32 greedy
-    /// ids of the frozen host-reference evidence for its 5-token prompt. The coordinator runs it
+    /// ids of the frozen host-reference evidence for its 5-token prompt. Run it
     /// with `--ignored --exact` under the lock. Environment: `Q36_CKPT_DIR` (the pinned checkpoint
     /// with `tokenizer.json`), `Q36_REF_DIR` (the directory of `host-ref.json`), `Q36_CACHE_LIMIT`
     /// (bytes), `Q36_EXECUTOR_REPORT` (the report file).
@@ -2809,7 +2809,7 @@ mod tests {
     /// prompt of the frozen host-reference evidence feeds 4 rows. With the path off the 32 greedy
     /// ids must equal the frozen ones. With a planned size the 4 rows are one chunk, and all 32
     /// greedy ids must equal the frozen ones, the rule that the Flash-Next executor test uses. The
-    /// report names the first difference and the number of equal ids. The coordinator runs it with
+    /// report names the first difference and the number of equal ids. Run it with
     /// `--ignored --exact` under the lock. Environment: `Q36_CKPT_DIR` (with `tokenizer.json`),
     /// `Q36_REF_DIR` (with `host-ref.json`), `Q36_CACHE_LIMIT` (bytes), `Q36_BUDGET` (bytes,
     /// default 32,212,254,720), `Q36_ACTIVATION` (`f32` | `bf16`, unset the F32 control; read
@@ -2911,7 +2911,7 @@ mod tests {
     /// the planned workspace, and in a qualification build the synchronizations, the forced
     /// flushes, and the peak retired bytes. It asserts no speed. Every size must be admitted by the
     /// plan of `Q36_BUDGET` and at most 512 (the largest worker piece that the settings accept).
-    /// The coordinator runs it with `--ignored --exact` under the exclusive lock. Environment:
+    /// Run it with `--ignored --exact` under the exclusive lock. Environment:
     /// `Q36_CKPT_DIR` (with `tokenizer.json`), `Q36_PROMPT_IDS` (the file of little-endian `u32`
     /// ids that `q36-dr4-prompt-ids.py` writes), `Q36_CACHE_LIMIT`, `Q36_BUDGET` (default
     /// 32,212,254,720), `Q36_CHUNKS`, `Q36_ACTIVATION` (`f32` | `bf16`, unset the F32 control;

@@ -200,7 +200,7 @@ pub(crate) mod oracle {
         2f64.powi(e - 7)
     }
 
-    /// Coordinator-ruled row-scaled metric, shared by host and native tests.
+    /// Row-scaled metric, shared by host and native tests.
     /// Error uses the f64 reference without an intermediate F32 cast. The scale
     /// is max(|reference element|, maximum |reference| over that head/token row).
     /// Nonfinite values fail before reduction; every element contributes.
@@ -245,11 +245,11 @@ pub(crate) mod oracle {
         let got = vec![1.0f32 + 2f32.powi(-7), 2f32.powi(-10) + 2f32.powi(-12)];
         let want = vec![1.0f64, 2f64.powi(-10)];
         let (worst, off) = pinned_max_ratio(&got, &want, 1, 1, 2);
-        // THE COORDINATOR RULING (replaces the 2^-7 floor): scale =
+        // THE ROW-SCALED RULE (replaces the 2^-7 floor): scale =
         // max(|ref_elem|, rowmax). Element 0: err 2^-7, scale 1, ulp 2^-7,
         // ratio 1. Element 1: err 2^-12, scale max(2^-10, 1) = 1, ulp 2^-7,
         // ratio 2^-5. MAX over every element = 1 - the rounding tracks the
-        // ROW magnitude, not a cancelled element (the ruling's reason).
+        // ROW magnitude, not a cancelled element (the rule's reason).
         assert!((worst - 1.0).abs() < 1e-9, "self-check: {worst}");
         assert_eq!(off.2, 0, "the offender is the large-magnitude element");
     }

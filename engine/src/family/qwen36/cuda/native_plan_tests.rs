@@ -308,9 +308,15 @@ fn the_native_plan_refuses_extra_rows_and_forked_packs() {
     let scratch2 = KernelScratch::for_dims(&d, 2, KvMode::Fp16).expect("scratch");
     match StepPlan::new(&d, 2, &options(WeightLayout::Native), &scratch2) {
         Err(crate::EngError::BadRequest(message)) => {
-            assert!(message.contains("one row"), "{message}");
+            assert_eq!(message, "step plan: the native layout takes one row, got 2");
         }
         other => panic!("two Native rows must be refused: {other:?}"),
+    }
+    match StepPlan::new(&d, 2, &options(WeightLayout::Exl3), &scratch2) {
+        Err(crate::EngError::BadRequest(message)) => {
+            assert_eq!(message, "step plan: the EXL3 layout takes one row, got 2");
+        }
+        other => panic!("two EXL3 rows must be refused: {other:?}"),
     }
     let forked = StepOptions {
         forked_experts: true,
@@ -324,7 +330,10 @@ fn the_native_plan_refuses_extra_rows_and_forked_packs() {
         &KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch"),
     ) {
         Err(crate::EngError::BadRequest(message)) => {
-            assert!(message.contains("merged expert down pack"), "{message}");
+            assert_eq!(
+                message,
+                "step plan: the native layout takes the single merged expert down pack"
+            );
         }
         other => panic!("forked Native packs must be refused: {other:?}"),
     }

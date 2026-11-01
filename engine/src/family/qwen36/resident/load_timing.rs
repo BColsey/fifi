@@ -121,7 +121,7 @@ impl Drop for ReadAccountingGuard {
 fn cold_load_phase_timing() {
     let _serial = crate::native_test_lock();
     let ckpt_dir = env_path("Q36_CKPT_DIR");
-    let out_dir = std::path::PathBuf::from(env_path("Q36_OUT_DIR"));
+    let out_dir = env_path("Q36_OUT_DIR");
     assert!(
         !out_dir.exists(),
         "Q36_OUT_DIR must not exist: {}",

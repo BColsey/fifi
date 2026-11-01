@@ -278,6 +278,51 @@ impl DecodeSession {
         limits: &Limits<'_>,
         token: u32,
     ) -> Result<DecodeBatch> {
+        let fed = step.fed();
+        self.publish_token(step, generation, limits, (token, fed))
+    }
+
+    /// Publishes the tokens of one verified window, in order, as one batch. Each token goes
+    /// through the policy of a solo token. The model has already consumed the rows that made
+    /// them: the last token is the pending one, so `step.fed()` counts the rows of the token
+    /// before it as well, and the finish test of an earlier token sees the positions that a solo
+    /// run would have fed by then. A finish ends the batch at the token that caused it.
+    pub(crate) fn finish_decode_tokens<S: TokenStepper>(
+        &mut self,
+        step: &mut S,
+        generation: &mut GenerationState,
+        limits: &Limits<'_>,
+        tokens: &[u32],
+    ) -> Result<DecodeBatch> {
+        let mut merged: Option<DecodeBatch> = None;
+        for (index, &token) in tokens.iter().enumerate() {
+            let fed = step.fed().saturating_sub(tokens.len() - 1 - index);
+            let one = self.publish_token(step, generation, limits, (token, fed))?;
+            let finished = one.finish.is_some();
+            match merged.as_mut() {
+                None => merged = Some(one),
+                Some(batch) => {
+                    batch.tokens.extend(one.tokens);
+                    batch.text.push_str(&one.text);
+                    batch.finish = one.finish;
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+        merged.ok_or_else(|| EngError::BadRequest("no token to publish".to_string()))
+    }
+
+    /// The policy of one published token. `fed` is the number of positions fed to the model when
+    /// the token is counted.
+    fn publish_token<S: TokenStepper>(
+        &mut self,
+        step: &mut S,
+        generation: &mut GenerationState,
+        limits: &Limits<'_>,
+        (token, fed): (u32, usize),
+    ) -> Result<DecodeBatch> {
         self.pending = None;
         self.history.push(token);
         let mut text = String::new();
@@ -296,7 +341,7 @@ impl DecodeSession {
             limits.eos,
             token,
             generation.remaining_tokens(),
-            step.fed(),
+            fed,
             limits.context_limit,
         ) {
             Some(reason) => self.end(step, generation, vec![token], text, reason),
@@ -1159,7 +1204,8 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     /// Drops one LRU entry per call - never more than one - in the radix-compression order: (0)
     /// dead TIP leaves - they never match the next turn of any conversation; (1) single-chain
     /// interior anchors - entries with exactly one maximal same-path extender (per32 under per49),
-    /// fully redundant; (2) anchor leaves - each lineage's deepest entry, its best restore;
+    /// whose deeper extender (per49) serves every prompt that extends it; a prompt that diverges
+    /// between per32 and per49 loses its per32 hit; (2) anchor leaves - each lineage's deepest entry, its best restore;
     /// (3) branch points - entries two or more incomparable branches extend (a shared header);
     /// oldest first within each tier; the DENIED job's own lineage is the explicit `protect` and
     /// spends last, never the store-global last-restore marker, which names another conversation
@@ -1170,17 +1216,19 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
         // Radix-compression order: spend what the radix tree can regrow before what it cannot.
         //   tier 0: dead TIP leaves - they never match the next turn of any conversation;
         //   tier 1: single-chain interior anchors - entries with exactly ONE maximal
-        //           same-path extender (per32 under per49): fully redundant, the chain's
-        //           deeper entry covers every prompt the interior one would;
+        //           same-path extender (per32 under per49): per49 serves every prompt that
+        //           extends it; a prompt that diverges between per32 and per49 loses its per32
+        //           hit, which is only a longer prefill, never a wrong state;
         //   tier 2: anchor leaves - each lineage's deepest entry, its best restore;
         //   tier 3: branch points - extended by two or more incomparable branches (a
         //           shared header): losing one costs EVERY branch under it;
         //   tier 4: the protected entry, the denied lineage, last resort.
         // Leaf status recomputed between evictions alone would strip a lineage entirely
         // (per49 gone -> per32 becomes a leaf -> next) while another lineage still holds
-        // a redundant interior, and the dead-tip tier frees only ~0.9 GB of ~3 GB the
+        // a covered interior, and the dead-tip tier frees only ~0.9 GB of ~3 GB the
         // replay's t6 needs, so tiers 1-3 ARE reached there: a covered per@32,768 frees
-        // ~420 MB at zero t6 reuse cost while branch headers stay for last.
+        // ~420 MB at zero t6 reuse cost in that replay (its prompts extend the deeper entry)
+        // while branch headers stay for last.
         //
         // Cost: one O(n^2) key-extension pass plus O(ext^2) maximal-extender counting
         // per entry - trivial at the default 6 entries, and the override cap (4096)

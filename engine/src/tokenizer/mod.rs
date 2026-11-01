@@ -25,6 +25,8 @@ mod boundary_derive_tests;
 #[cfg(test)]
 pub(crate) mod flint_tests;
 #[cfg(test)]
+mod parking_stability_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod warm_turn_tests;

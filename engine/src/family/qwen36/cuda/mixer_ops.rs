@@ -69,7 +69,8 @@ pub(super) enum BlockOp {
         y: Slot,
         col: usize,
     },
-    /// One EXL3 projection of the unquantized F32 row; scratch is shared in stream order.
+    /// One EXL3 projection of the unquantized F32 row; scratch is shared in stream order. The
+    /// sticky arithmetic flag is read once per token by the step, not after each projection.
     ProjectExl3 {
         phase: Phase,
         role: Role,
@@ -77,8 +78,15 @@ pub(super) enum BlockOp {
         y: Slot,
         col: usize,
     },
-    /// Initializes the dedicated EXL3 arithmetic flag before the first projection.
-    ResetExl3 { flag: Slot },
+    /// One plain F32 matrix times the F32 row, for the DeltaNet gates an EXL3 pack leaves
+    /// unquantized: the weight is the role's raw tensor, `rows` columns land at `col` of `y`.
+    ProjectPlain {
+        phase: Phase,
+        role: Role,
+        x: Slot,
+        y: Slot,
+        col: usize,
+    },
     /// `pack` of the f32 row `x` (`k` values) into `xf`.
     Pack {
         phase: Phase,
@@ -180,9 +188,9 @@ impl BlockOp {
             | Self::Project { phase, .. }
             | Self::ProjectQ { phase, .. }
             | Self::ProjectExl3 { phase, .. }
+            | Self::ProjectPlain { phase, .. }
             | Self::Pack { phase, .. }
             | Self::QuantizeQ8 { phase, .. } => phase,
-            Self::ResetExl3 { .. } => Phase::MixPack,
             Self::Conv { .. } => Phase::DeltaConv,
             Self::Delta { .. } => Phase::DeltaRule,
             Self::AttnPrep { .. } | Self::AttnPrepRows { .. } => Phase::AttnPrep,
@@ -200,7 +208,7 @@ impl BlockOp {
             Self::Project { xf, .. } => vec![xf],
             Self::ProjectQ { x_q8, .. } => vec![x_q8],
             Self::ProjectExl3 { x, .. } => vec![x, Slot::Exl3Flag],
-            Self::ResetExl3 { .. } => Vec::new(),
+            Self::ProjectPlain { x, .. } => vec![x],
             Self::Pack { x, .. } | Self::QuantizeQ8 { x, .. } => vec![x],
             Self::Conv { proj, .. } => vec![proj],
             Self::Delta { conv, proj, .. } => vec![conv, proj],
@@ -223,7 +231,7 @@ impl BlockOp {
             Self::ProjectExl3 { y, .. } => {
                 vec![y, Slot::Exl3Xh, Slot::Exl3Z, Slot::Exl3Flag]
             }
-            Self::ResetExl3 { flag } => vec![flag],
+            Self::ProjectPlain { y, .. } => vec![y],
             Self::Pack { xf, .. } => vec![xf],
             Self::QuantizeQ8 { q8, .. } => vec![q8],
             Self::Conv { out, .. } | Self::Delta { out, .. } => vec![out],
@@ -291,6 +299,16 @@ fn project_op(
             y,
             col,
         },
+        // The pack keeps the 32-row DeltaNet gates as plain matrices.
+        WeightLayout::Exl3 if matches!(role, Role::SsmBeta | Role::SsmAlpha) => {
+            BlockOp::ProjectPlain {
+                phase,
+                role,
+                x: x_f32,
+                y,
+                col,
+            }
+        }
         WeightLayout::Exl3 => BlockOp::ProjectExl3 {
             phase,
             role,
@@ -588,13 +606,7 @@ pub(super) fn block_ops_with(
             check_native_column(role, col, rows, ld)?;
         }
     }
-    let mut ops = Vec::new();
-    if layout == WeightLayout::Exl3 {
-        ops.push(BlockOp::ResetExl3 {
-            flag: Slot::Exl3Flag,
-        });
-    }
-    ops.push(prologue(layout));
+    let mut ops = vec![prologue(layout)];
     match kind {
         AttentionKind::DeltaNet => ops.extend(delta_ops(g, layout, fuse_inproj)),
         AttentionKind::Full => {

@@ -12,6 +12,7 @@
 
 use super::{
     dims::{KvMode, StepDims},
+    exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
     mixer::tail_extent,
     mixer_geometry::MixerGeometry,
@@ -19,7 +20,7 @@ use super::{
     mixer_weights::{DenseWeight, LayerWeights, MixerWeights},
     moe::{Launch, MoeDims, MoeLayerWeights, StackWeights},
     prefill_driver::Kv8Staging,
-    prefill_plan::{ChunkSlot, Phase},
+    prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
     state::ResidentState,
     state_layout::{Plane, Word},
     tiered_step::TieredRuntime,
@@ -56,6 +57,7 @@ use crate::{
             attn_decode_q8::{AttnDecodeQ8Call, attn_q8_part_bytes},
             attn_prep::RopeParams,
             embed::EmbedNativeCall,
+            embed_bf16::EmbedBf16Call,
             gdn_conv::{ConvCall, ConvShape},
             kv8_append::Kv8Data,
             matvec_q::QuantType,
@@ -68,6 +70,9 @@ use crate::{
 use kernel_diagnostics::{
     diagnostic_dense, diagnostic_dense_input, diagnostic_routed, diagnostic_shared,
 };
+
+#[path = "prefill_exl3.rs"]
+pub(super) mod exl3;
 
 /// Every slot of the chunk arena exactly once, in `chunk_tensors` order: the view checks take the
 /// arena as the plan of exactly this set, so a slot added to the plan without this module fails
@@ -168,8 +173,19 @@ fn not_a_view(slot: ChunkSlot) -> EngError {
     EngError::BadRequest(format!("prefill chunk: slots: {slot:?} is not a view"))
 }
 
+/// The slots a list must hold: the EXL3 set when the list carries the EXL3 flag slot, else the
+/// GGUF set. A list that mixes the two sets fails (V3) of [`check_view_list`] on its missing slots.
+fn required_slots(slots: &[ChunkSlot]) -> &'static [ChunkSlot] {
+    if slots.contains(&ChunkSlot::Exl3Flag) {
+        &EXL3_SLOTS
+    } else {
+        &ALL_SLOTS
+    }
+}
+
 /// (V1) the arena holds exactly the list's tensors; (V2) no slot twice; (V3) every slot of
-/// [`ALL_SLOTS`] present. The order is binding: every refusal names its guard.
+/// [`ALL_SLOTS`] (or [`EXL3_SLOTS`] for an EXL3 list) present, and no slot of the other set. The
+/// order is binding: every refusal names its guard.
 pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(), EngError> {
     if arena_len != slots.len() {
         return Err(EngError::BadRequest(format!(
@@ -184,12 +200,18 @@ pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(
             )));
         }
     }
-    for slot in ALL_SLOTS {
-        if !slots.contains(&slot) {
+    let required = required_slots(slots);
+    for slot in required {
+        if !slots.contains(slot) {
             return Err(EngError::BadRequest(format!(
                 "prefill chunk: slots: {slot:?} is missing"
             )));
         }
+    }
+    if let Some(extra) = slots.iter().find(|slot| !required.contains(slot)) {
+        return Err(EngError::BadRequest(format!(
+            "prefill chunk: slots: {extra:?} does not belong to this arena"
+        )));
     }
     Ok(())
 }
@@ -241,6 +263,13 @@ impl<'a> ChunkViews<'a> {
         }
         check_view_layout(list, &actual)?;
         Ok(Self { views })
+    }
+
+    /// Whether the views belong to an EXL3 arena, the list that carries the EXL3 flag slot.
+    pub(super) fn is_exl3(&self) -> bool {
+        self.views
+            .iter()
+            .any(|(slot, _)| *slot == ChunkSlot::Exl3Flag)
     }
 
     /// The arena view of `slot`, with the refusal of [`slot_position`] but without a list of the
@@ -712,7 +741,8 @@ pub(super) struct BufFacts {
     pub(super) part_bytes: usize,
     pub(super) part_offset: usize,
     pub(super) nsm: usize,
-    pub(super) fixup_bytes: usize,
+    /// `None` for an EXL3 chunk, which has no stream-k fixup range.
+    pub(super) fixup_bytes: Option<usize>,
 }
 
 /// Guards, in order: (B1) `m_sess` in `1..=2048` (the chunk cap, `NCOLS_LIMIT`); (B2) `part`
@@ -743,10 +773,12 @@ pub(super) fn check_bufs(f: &BufFacts) -> Result<(), EngError> {
         ));
     }
     let floor = fixup_floats_max(f.nsm)? * 4;
-    if f.fixup_bytes < floor {
+    if let Some(bytes) = f.fixup_bytes
+        && bytes < floor
+    {
         return Err(EngError::BadRequest(format!(
-            "prefill chunk: fixup: {} bytes, below the {}-byte floor of nsm {}",
-            f.fixup_bytes, floor, f.nsm
+            "prefill chunk: fixup: {bytes} bytes, below the {floor}-byte floor of nsm {}",
+            f.nsm
         )));
     }
     Ok(())
@@ -778,7 +810,11 @@ impl<'a> ChunkBufs<'a> {
             part_bytes: part.bytes(),
             part_offset: part.offset(),
             nsm: facts.nsm,
-            fixup_bytes: views.get(ChunkSlot::Fixup)?.bytes(),
+            fixup_bytes: if views.is_exl3() {
+                None
+            } else {
+                Some(views.get(ChunkSlot::Fixup)?.bytes())
+            },
         })?;
         Ok(Self {
             views,
@@ -939,7 +975,7 @@ fn model_facts(
     let mut facts = Vec::with_capacity(layers);
     for layer in 0..layers {
         let kind = table.slot(layer)?.kind;
-        let lw = weights.mixer.layer_weights(layer)?;
+        let lw = weights.mixer().layer_weights(layer)?;
         let dense = geometry
             .dense_specs(WeightLayout::Native, kind)?
             .into_iter()
@@ -964,7 +1000,12 @@ fn model_facts(
                 k: 0,
             },
         };
-        let mw = &weights.moe[layer];
+        let ChunkWeights::Native { moe, .. } = weights else {
+            return Err(EngError::BadRequest(
+                "prefill chunk: layout: the facts of a Native model need Native weights".to_owned(),
+            ));
+        };
+        let mw = &moe[layer];
         let stacks = [
             stack(Role::FfnGateExps, &mw.gate),
             stack(Role::FfnUpExps, &mw.up),
@@ -999,12 +1040,101 @@ fn model_facts(
     })
 }
 
-/// The weights of the chunk body: the mixer weights, the MoE weights per layer and the native token
-/// embedding.
-pub(super) struct ChunkWeights<'a, 'w> {
-    mixer: &'a MixerWeights<'w>,
-    moe: &'a [MoeLayerWeights<'w>],
-    embed: &'w NativeWeight,
+/// The weights of the chunk body: the mixer weights, the MoE weights per layer and the token
+/// embedding, of a GGUF (Native) load or of an EXL3 pack.
+pub(super) enum ChunkWeights<'a, 'w> {
+    /// The file's own blocks: the embedding is a Q4_K table.
+    Native {
+        mixer: &'a MixerWeights<'w>,
+        moe: &'a [MoeLayerWeights<'w>],
+        embed: &'w NativeWeight,
+    },
+    /// An EXL3 pack: the embedding is the stored BF16 table.
+    Exl3 {
+        mixer: &'a MixerWeights<'w>,
+        moe: &'a [Exl3MoeWeights<'w>],
+        embed: &'w DeviceBuffer,
+    },
+}
+
+/// Guards the first `layers` layers of `weights`: the GGUF facts of [`check_model`] for a Native
+/// load, [`check_exl3_model`] for an EXL3 pack.
+fn check_weights(
+    table: &LayerTable,
+    geometry: &MixerGeometry,
+    dims: &StepDims,
+    weights: &ChunkWeights<'_, '_>,
+    layers: usize,
+) -> Result<(), EngError> {
+    match weights {
+        ChunkWeights::Native { .. } => {
+            let facts = model_facts(table, geometry, dims, weights, layers)?;
+            check_model(&facts, layers)
+        }
+        ChunkWeights::Exl3 { mixer, moe, .. } => {
+            check_exl3_model(table, geometry, (mixer, moe.len()), layers)
+        }
+    }
+}
+
+/// Guards of an EXL3 model, in order: (E1) the scan epsilon bit for bit; (E2) a MoE block per
+/// layer; then per layer, in layer order, (E3) the kind, (E4) every dense role an EXL3 matrix and
+/// every plain gate a raw matrix, then (E5) the column layout of the shared rows. The shapes were
+/// checked when the weights were resolved.
+fn check_exl3_model(
+    table: &LayerTable,
+    geometry: &MixerGeometry,
+    (mixer, moe_layers): (&MixerWeights<'_>, usize),
+    layers: usize,
+) -> Result<(), EngError> {
+    if geometry.eps.to_bits() != GDN_SCAN_EPS.to_bits() {
+        return Err(EngError::BadRequest(
+            "prefill chunk: eps: the geometry's epsilon is not the scan's".to_owned(),
+        ));
+    }
+    if moe_layers < layers {
+        return Err(EngError::BadRequest(format!(
+            "prefill chunk: layers: {moe_layers} MoE blocks for {layers} layers"
+        )));
+    }
+    for layer in 0..layers {
+        let kind = table.slot(layer)?.kind;
+        if !matches!(kind, AttentionKind::DeltaNet | AttentionKind::Full) {
+            return Err(EngError::BadRequest(format!(
+                "prefill chunk: kind: layer {layer} is a {kind:?} mixer"
+            )));
+        }
+        let weights = mixer.layer_weights(layer)?;
+        for spec in geometry.dense_specs(WeightLayout::Exl3, kind)? {
+            weights.exl3(spec.role)?;
+        }
+        for spec in geometry.plain_specs(WeightLayout::Exl3, kind) {
+            weights.raw(spec.role)?;
+        }
+    }
+    check_exl3_columns(geometry)
+}
+
+/// (E5) The plain DeltaNet gates land in their columns of the shared row through `scatter_cols`,
+/// which moves four values at a time, so every width, column offset and row stride of the shared
+/// rows is checked to be a multiple of four. The job-table output of the dense projections needs
+/// no such multiple; the check covers them for simplicity.
+pub(super) fn check_exl3_columns(geometry: &MixerGeometry) -> Result<(), EngError> {
+    let delta = delta_proj_cols(geometry)
+        .into_iter()
+        .map(|column| (column, geometry.delta.ld));
+    let attn = attn_proj_cols(geometry)
+        .into_iter()
+        .map(|column| (column, geometry.attn.ld));
+    for ((role, width, offset), stride) in delta.chain(attn) {
+        if ![width, offset, stride].iter().all(|v| v.is_multiple_of(4)) {
+            return Err(EngError::BadRequest(format!(
+                "prefill chunk: columns: {role:?} is {width} wide at column {offset} of a \
+                 {stride}-value row; the column scatter needs multiples of 4"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The checked model of the chunk body.
@@ -1014,6 +1144,8 @@ pub(super) struct ChunkModel<'a, 'w> {
     moe_dims: MoeDims,
     weights: ChunkWeights<'a, 'w>,
     layers: usize,
+    /// Rows of the embedding table.
+    vocab: usize,
 }
 
 impl<'a, 'w> ChunkModel<'a, 'w> {
@@ -1024,14 +1156,14 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         dims: &StepDims,
         weights: ChunkWeights<'a, 'w>,
     ) -> Result<Self, EngError> {
-        let facts = model_facts(table, geometry, dims, &weights, table.len())?;
-        check_model(&facts, table.len())?;
+        check_weights(table, geometry, dims, &weights, table.len())?;
         Ok(Self {
             table,
             geometry,
             moe_dims: MoeDims::new(dims, 1),
             weights,
             layers: table.len(),
+            vocab: dims.shape.vocab,
         })
     }
 
@@ -1044,14 +1176,14 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         weights: ChunkWeights<'a, 'w>,
         n: usize,
     ) -> Result<Self, EngError> {
-        let facts = model_facts(table, geometry, dims, &weights, n)?;
-        check_model(&facts, n)?;
+        check_weights(table, geometry, dims, &weights, n)?;
         Ok(Self {
             table,
             geometry,
             moe_dims: MoeDims::new(dims, 1),
             weights,
             layers: n,
+            vocab: dims.shape.vocab,
         })
     }
 
@@ -1064,13 +1196,33 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
     }
 }
 impl<'a, 'w> ChunkWeights<'a, 'w> {
-    /// The production constructor: the driver and the rigs build the weights only through this.
+    /// The production constructor of a Native load: the driver and the rigs build the weights
+    /// only through this and [`Self::exl3`].
     pub(super) fn new(
         mixer: &'a MixerWeights<'w>,
         moe: &'a [MoeLayerWeights<'w>],
         embed: &'w NativeWeight,
     ) -> Self {
-        Self { mixer, moe, embed }
+        Self::Native { mixer, moe, embed }
+    }
+
+    /// The constructor of an EXL3 pack.
+    pub(super) fn exl3(
+        mixer: &'a MixerWeights<'w>,
+        moe: &'a [Exl3MoeWeights<'w>],
+        embed: &'w DeviceBuffer,
+    ) -> Self {
+        Self::Exl3 { mixer, moe, embed }
+    }
+
+    fn mixer(&self) -> &'a MixerWeights<'w> {
+        match self {
+            Self::Native { mixer, .. } | Self::Exl3 { mixer, .. } => mixer,
+        }
+    }
+
+    fn is_exl3(&self) -> bool {
+        matches!(self, Self::Exl3 { .. })
     }
 }
 
@@ -1169,16 +1321,44 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 struct LayerCtx<'a, 'w> {
     launch: &'a Launch<'a>,
     weights: &'a LayerWeights<'w>,
-    moe: &'a MoeLayerWeights<'w>,
+    moe: LayerMoe<'a, 'w>,
     ord: usize,
     layer: usize,
     kind: AttentionKind,
     status: DeviceRange<'a>,
 }
 
+/// The MoE weights of one layer, of either load.
+#[derive(Clone, Copy)]
+enum LayerMoe<'a, 'w> {
+    Native(&'a MoeLayerWeights<'w>),
+    Exl3(&'a Exl3MoeWeights<'w>),
+}
+
+impl<'a, 'w> LayerMoe<'a, 'w> {
+    /// The two raw router buffers: the matrix and the shared gate.
+    fn router(&self) -> (&'a DeviceBuffer, &'a DeviceBuffer) {
+        match self {
+            Self::Native(moe) => (moe.router, moe.router_shared),
+            Self::Exl3(moe) => (moe.router, moe.router_shared),
+        }
+    }
+}
+
 impl ChunkRun<'_, '_> {
     fn v(&self, slot: ChunkSlot) -> Result<DeviceRange<'_>, EngError> {
         self.bufs.views.get(slot)
+    }
+
+    /// The scratch of the EXL3 projections of this chunk.
+    fn exl3_scratch(&self) -> Result<exl3::Exl3Scratch<'_>, EngError> {
+        Ok(exl3::Exl3Scratch {
+            xh: self.v(ChunkSlot::Exl3Xh)?,
+            z: self.v(ChunkSlot::Exl3Z)?,
+            y: self.v(ChunkSlot::Exl3Y)?,
+            flag: self.v(ChunkSlot::Exl3Flag)?,
+            jobs: self.v(ChunkSlot::DenseJobs)?,
+        })
     }
 
     fn dense_input(
@@ -1208,16 +1388,35 @@ fn chunk_embed(
     run: &ChunkRun<'_, '_>,
     status: DeviceRange<'_>,
 ) -> Result<(), EngError> {
-    launch.ctx.embed_native(
-        launch.stream,
-        EmbedNativeCall {
-            weight: run.model.weights.embed,
-            ids: run.v(ChunkSlot::IdsTok)?,
-            x: run.v(ChunkSlot::Hidden)?,
-            status,
-            m: run.rows.m(),
-        },
-    )
+    let (ids, x, m) = (
+        run.v(ChunkSlot::IdsTok)?,
+        run.v(ChunkSlot::Hidden)?,
+        run.rows.m(),
+    );
+    match &run.model.weights {
+        ChunkWeights::Native { embed, .. } => launch.ctx.embed_native(
+            launch.stream,
+            EmbedNativeCall {
+                weight: embed,
+                ids,
+                x,
+                status,
+                m,
+            },
+        ),
+        ChunkWeights::Exl3 { embed, .. } => launch.ctx.embed_bf16(
+            launch.stream,
+            EmbedBf16Call {
+                table: whole(embed)?,
+                ids,
+                x,
+                status,
+                m,
+                n_rows: run.model.vocab,
+                k: run.model.geometry.hidden,
+            },
+        ),
+    }
 }
 
 /// Stage 1, `NormA`.
@@ -2244,7 +2443,7 @@ pub(super) fn run_chunk_route(launch: &Launch<'_>, io: &RouteIo<'_>) -> Result<(
 /// Stage 9 inside the layer walk.
 fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
-    let (router, router_shared) = (ctx.moe.router, ctx.moe.router_shared);
+    let (router, router_shared) = ctx.moe.router();
     run_chunk_route(
         launch,
         &RouteIo {
@@ -2266,6 +2465,9 @@ fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 /// the per-token path, `chunk_ready`).
 fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
+    let LayerMoe::Native(moe) = ctx.moe else {
+        return exl3::moe_block(run, ctx);
+    };
     let io = MoeChunkIo {
         m: run.rows.m(),
         dims: run.model.dims_at(run.rows.m()),
@@ -2279,15 +2481,22 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
     };
     #[cfg(test)]
     if run.kernel_class != ChunkKernelClass::ProductionMmq {
-        diagnostic_shared(launch, ctx.moe, &io)?;
+        diagnostic_shared(launch, moe, &io)?;
         if run.kernel_class == ChunkKernelClass::AllMmvq {
-            diagnostic_routed(launch, ctx.moe, &io)?;
+            diagnostic_routed(launch, moe, &io)?;
         } else {
-            run_chunk_routed(launch, ctx.moe, &io)?;
+            run_chunk_routed(launch, moe, &io)?;
         }
         return combine_chunk_moe(launch, &io);
     }
-    run_chunk_moe(launch, ChunkMoe::Resident(ctx.moe), &io)
+    run_chunk_moe(launch, ChunkMoe::Resident(moe), &io)
+}
+
+/// The MoE block of `layer` in a per-layer slice.
+fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
+    blocks.get(layer).ok_or_else(|| {
+        EngError::BadRequest(format!("prefill chunk: layer {layer} has no MoE block"))
+    })
 }
 
 /// One layer of the chunk: the state ranges by the layer's `ordinal`, the weights by `layer`
@@ -2300,28 +2509,39 @@ pub(super) fn run_chunk_layer(
     trace_piece: Option<u32>,
 ) -> Result<(), EngError> {
     let slot = run.model.table.slot(layer)?;
+    let moe = match &run.model.weights {
+        ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
+        ChunkWeights::Exl3 { moe, .. } => LayerMoe::Exl3(chunk_layer(moe, layer)?),
+    };
     let ctx = LayerCtx {
         launch,
-        weights: run.model.weights.mixer.layer_weights(layer)?,
-        moe: &run.model.weights.moe[layer],
+        weights: run.model.weights.mixer().layer_weights(layer)?,
+        moe,
         ord: slot.ordinal,
         layer,
         kind: slot.kind,
         status,
     };
+    // An EXL3 chunk reads the F32 rows in place: it has no quantize stages.
+    let exl3 = run.model.weights.is_exl3();
     for stage in layer_stages(slot.kind)? {
         match stage {
             Stage::NormA => norm_a(run, &ctx)?,
+            Stage::QuantA | Stage::QuantDOut | Stage::QuantAOut if exl3 => {}
             Stage::QuantA => quant_a(run, &ctx)?,
+            Stage::DeltaProj if exl3 => exl3::delta_proj(run, &ctx)?,
             Stage::DeltaProj => delta_proj(run, &ctx)?,
             Stage::Conv => delta_conv(run, &ctx)?,
             Stage::Scan => delta_scan(run, &ctx)?,
             Stage::QuantDOut => quant_d_out(run, &ctx)?,
+            Stage::SsmOut if exl3 => exl3::ssm_out(run, &ctx)?,
             Stage::SsmOut => ssm_out(run, &ctx)?,
+            Stage::AttnProj if exl3 => exl3::attn_proj(run, &ctx)?,
             Stage::AttnProj => attn_proj(run, &ctx)?,
             Stage::Prep => attn_prep(run, &ctx)?,
             Stage::Flash => attn_flash(run, &ctx)?,
             Stage::QuantAOut => quant_a_out(run, &ctx)?,
+            Stage::AttnOut if exl3 => exl3::attn_out(run, &ctx)?,
             Stage::AttnOut => attn_out(run, &ctx)?,
             Stage::NormF => norm_f(run, &ctx)?,
             Stage::Route => chunk_route(run, &ctx)?,
@@ -2343,6 +2563,7 @@ pub(super) fn run_chunk_layer(
                 chunk_moe(run, &ctx)?
             }
         }
+        exl3::split::mark_stage(launch.stream, stage);
     }
     Ok(())
 }
@@ -2367,11 +2588,18 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
         kv8_parts(run)?;
     }
     let status = run.state.word(Word::PrefillStatus)?;
+    if run.model.weights.is_exl3() {
+        exl3::clear_flag(launch, run)?;
+        exl3::write_dense_jobs(launch, &run.exl3_scratch()?, run.rows.m())?;
+    }
     chunk_embed(launch, run, status)?;
     // One prefill-piece index for every layer of the piece (resident_trace's counter).
     let trace_piece = crate::family::qwen36::trace::begin_prefill();
     for layer in 0..run.model.layers {
         run_chunk_layer(launch, run, status, layer, trace_piece)?;
+    }
+    if run.model.weights.is_exl3() {
+        exl3::check_flag(launch, run)?;
     }
     Ok(())
 }

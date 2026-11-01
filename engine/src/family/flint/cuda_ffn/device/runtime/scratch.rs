@@ -10,6 +10,10 @@ use crate::kernels::cuda::{
     xf_bytes,
 };
 
+/// Query rows per launch of the tall attention, and the bytes of partials its launches may use.
+pub(super) const TALL_ATTN_ROWS: usize = 64;
+const TALL_ATTN_PART_BYTES: usize = 32 << 20;
+
 pub(super) struct HotScratch(DeviceArena);
 
 impl HotScratch {
@@ -59,11 +63,14 @@ impl HotScratch {
 }
 
 fn tensors(plan: &KvPlan) -> Result<[ArenaTensor; 3]> {
-    let norm = (1..=plan.context_rows().min(PREFILL_MAX_ROWS)).try_fold(0, |max, rows| {
-        xf_bytes(rows, WIDTH)
-            .map(|bytes| max.max(bytes))
-            .ok_or_else(|| bad("EXL3 norm scratch"))
-    })?;
+    let norm = (1..=plan
+        .context_rows()
+        .min(plan.chunk_rows().max(PREFILL_MAX_ROWS)))
+        .try_fold(0, |max, rows| {
+            xf_bytes(rows, WIDTH)
+                .map(|bytes| max.max(bytes))
+                .ok_or_else(|| bad("EXL3 norm scratch"))
+        })?;
     let geometry = HotScratch::geometry();
     let least = cpf_attn_launch_plan(geometry, 1, 0, CPF_ATTN_SM_COUNT)?;
     let per_split = cpf_attn_part_bytes(
@@ -83,6 +90,12 @@ fn tensors(plan: &KvPlan) -> Result<[ArenaTensor; 3]> {
             ..least
         },
     )?;
+    // A jobs piece runs the attention in tiles of rows with their own partials.
+    let part = if plan.chunk_rows() > PREFILL_MAX_ROWS {
+        part.max(TALL_ATTN_PART_BYTES)
+    } else {
+        part
+    };
     let router = 256usize
         .checked_mul(WIDTH)
         .and_then(|cells| cells.checked_mul(4))

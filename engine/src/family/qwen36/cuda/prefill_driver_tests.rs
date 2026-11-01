@@ -7,10 +7,10 @@
 use super::common_tests;
 use super::dims::{KvMode, StepOptions};
 use super::prefill_driver::{
-    AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, StageChoice,
-    ZERO_CHUNK, admit_fixed, admit_fixed_staged, admit_guard, admit_m_sess, admit_with_staging,
-    drive_chunks, fixed_chunk_rows, fixed_staging_rows, needs_arena, require_fixed_room,
-    wide_stage_candidate, zero_spans,
+    AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
+    StageChoice, ZERO_CHUNK, admit_fixed, admit_fixed_staged, admit_guard, admit_m_sess,
+    admit_with_staging, drive_chunks, fixed_chunk_rows, fixed_staging_rows, ledger_line,
+    needs_arena, require_fixed_room, stage_label, wide_stage_candidate, zero_spans,
 };
 use super::prefill_plan::{
     ChunkCost, Extra, M_LADDER, PART_CHARGE, PrefillStep, SPARE_MIN, chunk_costs, chunk_list,
@@ -431,12 +431,59 @@ fn the_gate_refuses_without_an_arena_after_the_q6k_check() {
     );
 }
 
+/// An EXL3 session takes the chunk gate like a Native one: it needs an admitted arena, and the
+/// same KV rule and refusals apply.
+#[test]
+fn an_exl3_session_takes_the_chunk_gate_of_a_native_one() {
+    let exl3 = || ChunkFacts {
+        layout: WeightLayout::Exl3,
+        kv_mode: KvMode::Fp16,
+        kv8_chunked_prefill: false,
+        tiered: false,
+        mmq_q6k: false,
+        m_sess_cap: 2048,
+        arena: None,
+    };
+    assert_eq!(chunk_verdict(&exl3()), ChunkVerdict::NoArena);
+    assert_eq!(
+        chunk_verdict(&ChunkFacts {
+            arena: Some(1024),
+            ..exl3()
+        }),
+        ChunkVerdict::Ready { m_sess: 1024 }
+    );
+    assert_eq!(
+        chunk_verdict(&ChunkFacts {
+            kv_mode: KvMode::Int8G32,
+            arena: Some(1024),
+            ..exl3()
+        }),
+        ChunkVerdict::Kv8,
+        "Int8G32 needs the opt-in for an EXL3 pack too"
+    );
+    assert_eq!(
+        chunk_verdict(&ChunkFacts {
+            layout: WeightLayout::Tiled,
+            arena: Some(1024),
+            ..exl3()
+        }),
+        ChunkVerdict::TiledLayout
+    );
+}
+
 /// Only an otherwise-ready session plans an arena — one false row per condition of the pre-arena
 /// half.
 #[test]
 fn only_an_otherwise_ready_session_plans_an_arena() {
     assert!(needs_arena(
         WeightLayout::Native,
+        KvMode::Fp16,
+        false,
+        false,
+        false
+    ));
+    assert!(needs_arena(
+        WeightLayout::Exl3,
         KvMode::Fp16,
         false,
         false,
@@ -451,6 +498,13 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
     ));
     assert!(!needs_arena(
         WeightLayout::Native,
+        KvMode::Int8G32,
+        false,
+        false,
+        false
+    ));
+    assert!(!needs_arena(
+        WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
         false,
@@ -476,6 +530,13 @@ fn only_an_otherwise_ready_session_plans_an_arena() {
 fn kv8_opt_in_plans_an_arena_without_bypassing_layout_or_weight_guards() {
     assert!(needs_arena(
         WeightLayout::Native,
+        KvMode::Int8G32,
+        false,
+        false,
+        true
+    ));
+    assert!(needs_arena(
+        WeightLayout::Exl3,
         KvMode::Int8G32,
         false,
         false,
@@ -676,6 +737,7 @@ fn fixed_drive_limits_depth_without_shrinking_the_session_arena() {
 const FIXED_TEST_FREE: usize = 3_663_265_792;
 
 struct FixedCase {
+    context: usize,
     facts: AdmitFacts,
     extras: Vec<Extra>,
     costs: Vec<ChunkCost>,
@@ -693,6 +755,7 @@ fn fixed_case(capacity: usize) -> FixedCase {
     let layout = StateLayout::new(&dims, &options).unwrap();
     let scratch = KernelScratch::for_dims(&dims, 1, KvMode::Int8G32).unwrap();
     FixedCase {
+        context: capacity,
         facts: AdmitFacts {
             budget: FIXED_TEST_FREE - super::start::prefill_headroom(true),
             decode_arena: StepPlan::new(&dims, 1, &options, &scratch)
@@ -844,7 +907,7 @@ fn fixed_display_ambient_budget_ledger() {
 }
 
 #[test]
-fn fixed_rows_and_stage_are_context_bound_not_free_memory_bound() {
+fn fixed_chunk_and_staging_rows_are_context_bound() {
     for (capacity, rows, stage) in [
         (65_536, 1024, 65_536),
         (131_072, 1024, 131_072),
@@ -969,6 +1032,7 @@ fn wide_flag_admits_the_131072_stage_when_roomy() {
         case.staging,
         Some(wide),
         free,
+        case.context,
     )
     .expect("a roomy snapshot with the wide flag admits the wide stage");
     assert_eq!(cost.m, case.facts.cap);
@@ -1012,6 +1076,7 @@ fn wide_flag_falls_back_to_the_default_stage_one_byte_short() {
         case.staging,
         Some(wide),
         free,
+        case.context,
     )
     .expect("a wide miss must keep the boot on the default stage");
     assert_eq!(
@@ -1028,6 +1093,7 @@ fn wide_flag_falls_back_to_the_default_stage_one_byte_short() {
         case.staging,
         Some(wide),
         free,
+        case.context,
     )
     .expect("exactly the charged wide boundary admits the wide stage");
     assert_eq!(cost.m, case.facts.cap);
@@ -1040,7 +1106,10 @@ fn wide_flag_refusal_at_the_default_floor_keeps_todays_error_text() {
     // Wide miss AND default miss: today's default refusal surfaces AS IS.
     let mut case = fixed_case(180_224);
     let wide = Kv8StagingPlan::for_context(FULL_STAGE_TIER_ROWS, 2, 256).unwrap();
-    case.facts.budget = case.facts.budget.saturating_sub(1 << 30);
+    // The ladder halves the stage down to the composed floor (the measured 8192-row
+    // performance floor for this context) before refusing, so the floor needs a
+    // starvation beyond even the smallest stage's charge.
+    case.facts.budget = case.facts.budget.saturating_sub(2 << 30);
     let error = admit_fixed_staged(
         &case.facts,
         &case.extras,
@@ -1048,6 +1117,7 @@ fn wide_flag_refusal_at_the_default_floor_keeps_todays_error_text() {
         case.staging,
         Some(wide),
         FIXED_TEST_FREE,
+        case.context,
     )
     .unwrap_err();
     let EngError::MemoryPlan(text) = error else {
@@ -1078,6 +1148,7 @@ fn wide_flag_propagates_non_memory_errors_from_the_wide_admission() {
         case.staging,
         Some(wide),
         FIXED_TEST_FREE,
+        case.context,
     )
     .unwrap_err();
     assert_eq!(
@@ -1103,6 +1174,7 @@ fn wide_plan_arithmetic_overflow_falls_back_to_the_default_stage() {
         case.staging,
         Some(wide),
         FIXED_TEST_FREE,
+        case.context,
     )
     .expect("an overflowing wide charge falls back to the default stage");
     assert_eq!(
@@ -1138,6 +1210,7 @@ fn wide_flag_falls_back_when_only_the_live_room_misses() {
         case.staging,
         Some(wide),
         free,
+        case.context,
     )
     .expect("a live-room miss falls back to the default stage");
     assert_eq!(
@@ -1152,6 +1225,7 @@ fn wide_flag_falls_back_when_only_the_live_room_misses() {
         case.staging,
         Some(wide),
         wide_needed,
+        case.context,
     )
     .expect("exactly the wide need admits the wide stage");
     assert_eq!(
@@ -1161,41 +1235,281 @@ fn wide_flag_falls_back_when_only_the_live_room_misses() {
 }
 
 #[test]
-fn the_default_stage_still_refuses_when_only_live_room_misses() {
-    // The pre-existing invariant, now enforced inside the selection: without room for
-    // the default stage the boot refuses with today's text, wide candidate or not.
-    let case = fixed_case(180_224);
+fn the_default_stage_degrades_when_only_live_room_misses() {
+    // A live-room miss degrades instead of refusing: room for exactly the half
+    // stage admits at 16384 rows. The floor refusal keeps the original text in its
+    // own test below.
+    let mut case = fixed_case(180_224);
+    case.facts.budget = usize::MAX;
     let cost = case
         .costs
         .iter()
         .find(|cost| cost.m == case.facts.cap)
         .unwrap()
         .to_owned();
-    let free = live_required(&cost, case.staging.bytes) - 1;
-    let error = admit_fixed_staged(
+    let free = live_required(&cost, case.staging.bytes / 2);
+    let (cost, plan) = admit_default_or_shrink(&case, free, case.context);
+    assert_eq!(cost.m, case.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (case.staging.capacity / 2, case.staging.bytes / 2)
+    );
+}
+
+#[test]
+fn ladder_rungs_from_every_shipped_stage_halve_exactly_to_the_floor() {
+    // The halving guard keeps bytes exact, so from every shipped stage the ladder
+    // must walk a chain of even rungs that lands exactly on the floor.
+    for capacity in [32_768, 65_536, 131_072, 180_224, 196_608, 262_144] {
+        let floor = floor_for(capacity);
+        let mut rung = super::prefill_driver::fixed_staging_rows(capacity);
+        assert!(
+            rung.is_multiple_of(2) && rung >= floor,
+            "stage {rung} for {capacity}"
+        );
+        while rung > floor {
+            let next = rung / 2;
+            assert_eq!(next * 2, rung, "rung {rung} cannot halve exactly");
+            rung = next;
+        }
+        assert_eq!(rung, floor, "capacity {capacity} ladder missed the floor");
+    }
+}
+
+/// The stage-independent charges: everything the ledger bills besides the staging
+/// bytes of the current attempt.
+fn base_charges(case: &FixedCase, cost: &ChunkCost) -> usize {
+    let part = PART_CHARGE.max(cost.part);
+    [
+        case.facts.state_allocated,
+        case.facts.decode_arena,
+        cost.arena,
+        part,
+        case.extras[0].fixed,
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .unwrap()
+}
+
+#[test]
+fn fixed_admission_shrinks_past_an_overflowing_full_stage_charge() {
+    // The 131072 stage's charge sum overflows while the half stage fits exactly:
+    // the ladder must ADMIT at the half stage instead of surfacing the overflow.
+    // Overflow on the full stage must not surface: a smaller stage can un-overflow
+    // the sum. The exact budget and free pins charge the half-stage bytes
+    // (the same bytes the allocation will use), not the full stage's — no
+    // minus-one probe is run here, so this is the at-exact-boundary pin, not
+    // a proof of the just-below refusal (the floor tests carry that side).
+    let mut case = fixed_case(131_072);
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    let base = base_charges(&case, &cost);
+    let half_bytes = case.staging.bytes / 2;
+    // Overflow the full stage by a small, exact amount: base + tip + full staging
+    // exceeds usize::MAX while base + tip + half staging lands exactly on budget.
+    case.extras.push(Extra {
+        name: "overflow-tip",
+        fixed: usize::MAX - base - half_bytes - SPARE_MIN,
+        bytes_per_token: 0,
+    });
+    // Precondition: the full-stage attempt alone returns the overflow error.
+    let error = admit_fixed(&case.facts, &case.extras, &case.costs, case.staging).unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the full stage must overflow, got {error:?}")
+    };
+    assert_eq!(text, "prefill plan: a size overflows");
+    // The pins sit exactly at the half-stage bytes on both gates.
+    case.facts.budget = base + case.extras[1].fixed + half_bytes + SPARE_MIN;
+    let free = live_required(&cost, half_bytes);
+    let (cost, plan, _) = admit_fixed_staged(
         &case.facts,
         &case.extras,
         &case.costs,
         case.staging,
         None,
         free,
+        case.context,
     )
-    .unwrap_err();
-    let EngError::MemoryPlan(text) = error else {
-        panic!("the live-room refusal must surface, got {error:?}")
-    };
+    .expect("the ladder must admit the half stage");
+    assert_eq!(cost.m, case.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (case.staging.capacity / 2, half_bytes)
+    );
+}
+
+#[test]
+fn fixed_admission_overflow_exhaust_refuses_with_the_first_attempt_error() {
+    // The full stage overflows the charge sum; every intermediate rung overflows
+    // too; exactly the floor rung reaches usize::MAX and misses the budget the
+    // ordinary way. The refusal must be the FIRST attempt's overflow error, not
+    // the floor rung's budget-miss text.
+    let mut case = fixed_case(262_144);
     let cost = case
         .costs
         .iter()
         .find(|cost| cost.m == case.facts.cap)
-        .unwrap();
+        .unwrap()
+        .to_owned();
+    let base = base_charges(&case, &cost);
+    let floor = floor_for(case.context);
+    let floor_staging = case.staging.bytes * floor / case.staging.capacity;
+    case.extras.push(Extra {
+        name: "overflow-tip",
+        fixed: usize::MAX - base - floor_staging,
+        bytes_per_token: 0,
+    });
+    case.facts.budget = usize::MAX;
+    let error = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        usize::MAX,
+        case.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the overflow refusal must surface, got {error:?}")
+    };
+    assert_eq!(text, "prefill plan: a size overflows");
+}
+
+#[test]
+fn fixed_admission_keeps_the_first_refusal_when_the_stage_is_odd() {
+    // An odd stage cannot halve with exact bytes, so the ladder stops after the
+    // first attempt and surfaces ITS budget text, unchanged: the boot refuses
+    // rather than rounding a rung. The budget would admit the rounded half stage
+    // (base + spare + half the staging), so the refusal can only come from the
+    // evenness guard.
+    let mut case = fixed_case(65_536);
+    case.staging = Kv8StagingPlan::for_context(65_537, 2, 256).unwrap();
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    case.facts.budget = base_charges(&case, &cost) + SPARE_MIN + case.staging.bytes / 2;
+    let error = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        usize::MAX,
+        case.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the odd-stage refusal must surface, got {error:?}")
+    };
     assert_eq!(
         text,
         format!(
-            "fixed prefill admission: {free} live bytes cannot retain {} rows, staging and the margin",
-            cost.m
+            "fixed prefill admission: {} rows and {} staging bytes do not fit the budget",
+            case.facts.cap, case.staging.bytes
         )
     );
+}
+
+#[test]
+fn fixed_admission_keeps_the_first_refusal_when_a_rung_goes_odd() {
+    // 32770 halves exactly to the odd 16385, whose own half (8192, rounded) is
+    // at the floor and would fit the budget: the refusal is the FIRST
+    // attempt's text (the 32770-row bytes), not a rounded 8192 attempt's, so this
+    // pins both the evenness guard and the error source on a chain at the floor.
+    let mut case = fixed_case(32_768);
+    case.staging = Kv8StagingPlan::for_context(32_770, 2, 256).unwrap();
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    case.facts.budget = base_charges(&case, &cost) + SPARE_MIN + case.staging.bytes / 4;
+    let error = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        usize::MAX,
+        case.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the odd-rung refusal must surface, got {error:?}")
+    };
+    assert_eq!(
+        text,
+        format!(
+            "fixed prefill admission: {} rows and {} staging bytes do not fit the budget",
+            case.facts.cap, case.staging.bytes
+        )
+    );
+}
+
+#[test]
+fn fixed_admission_lands_on_the_last_even_rung_above_the_floor() {
+    // An even, non-power-of-two stage (3 x 8192) with a budget that fits exactly
+    // its half: the ladder admits 12288 rows — its last rung above the floor:
+    // halving again gives 6144, below the 8192 floor.
+    let mut case = fixed_case(24_576);
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    let base = base_charges(&case, &cost);
+    case.facts.budget = base + case.staging.bytes / 2 + SPARE_MIN;
+    let (cost, plan) = admit_default_or_shrink(&case, usize::MAX, case.context);
+    assert_eq!(cost.m, case.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (12_288, case.staging.bytes / 2)
+    );
+}
+
+#[test]
+fn fixed_admission_terminates_when_every_rung_overflows() {
+    // Two near-usize::MAX extras overflow every rung's charge sum; the ladder
+    // must terminate and refuse rather than loop or panic.
+    let mut case = fixed_case(262_144);
+    case.extras.push(Extra {
+        name: "overflow-a",
+        fixed: usize::MAX / 2,
+        bytes_per_token: 0,
+    });
+    case.extras.push(Extra {
+        name: "overflow-b",
+        fixed: usize::MAX / 2,
+        bytes_per_token: 0,
+    });
+    case.facts.budget = usize::MAX;
+    let error = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        usize::MAX,
+        case.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the overflow refusal must surface, got {error:?}")
+    };
+    // Every rung's overflow text is identical, so this pins the error class
+    // and the named extra, not which rung surfaced it.
+    assert_eq!(text, "prefill plan: extra overflow-b overflows");
 }
 
 #[test]
@@ -1215,6 +1529,7 @@ fn wide_flag_off_is_byte_for_byte_today_without_a_wide_candidate() {
         case.staging,
         None,
         free,
+        case.context,
     )
     .unwrap();
     let plain_cost = admit_fixed(&case.facts, &case.extras, &case.costs, case.staging).unwrap();
@@ -1230,5 +1545,363 @@ fn stage_choice_names_the_boot_line_provenance() {
     assert_eq!(
         (StageChoice::Wide.as_str(), StageChoice::Default.as_str()),
         ("wide", "default")
+    );
+}
+
+// ---- the tight-live-snapshot shrink ladder ----
+
+/// The charges the ledger bills at the observed live free (977,141,760 B
+/// after every allocation, the 2026-10-24 snapshot). The 180224 test pins the
+/// verdict this baseline produces (not the sum itself); the 262144 ladder
+/// tests reuse it as their baseline sum.
+fn budget_at_observed_free(case: &FixedCase) -> usize {
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap();
+    let part = PART_CHARGE.max(cost.part);
+    let charges = [
+        case.facts.state_allocated,
+        case.facts.decode_arena,
+        cost.arena,
+        part,
+        case.extras[0].fixed,
+        case.staging.bytes,
+        SPARE_MIN,
+    ];
+    charges
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .unwrap()
+        + 977_141_760
+}
+
+/// The production floor expression itself: the split bound composed with the
+/// performance floor. admit_fixed_staged computes this internally from the KV
+/// capacity; step.rs has no other floor computation.
+fn floor_for(context_capacity: usize) -> usize {
+    super::prefill_driver::fixed_stage_min_rows(context_capacity)
+}
+
+/// The default arm under the production floor: `free` is the live-room
+/// snapshot (usize::MAX for a roomy card), `kv_capacity` is the KV capacity
+/// the floor is computed from.
+fn admit_default_or_shrink(
+    case: &FixedCase,
+    free: usize,
+    kv_capacity: usize,
+) -> (ChunkCost, Kv8StagingPlan) {
+    let (cost, plan, choice) = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        free,
+        kv_capacity,
+    )
+    .expect("the default arm must decide");
+    assert_eq!(choice, StageChoice::Default);
+    (cost, plan)
+}
+
+#[test]
+fn ledger_line_pins_every_field_and_labels_a_wide_boot_not_shrunk() {
+    // The figures of a 262144 prefix-off ledger, plus the shipped
+    // device-prefix extra and a second distinct extra (nonzero
+    // bytes_per_token) so sum/first/last/max/+bpt extras mutants all
+    // differ, and a small part term so part_charge proves the
+    // PART_CHARGE.max() law on both sides (the second call uses a part
+    // term above it). The wide plan is 65536 rows, so wide_staging
+    // (128 MiB) differs from live_margin (FIXED_ADMISSION_MARGIN) and
+    // neither can print for the other.
+    let extras = [
+        Extra {
+            name: "device-prefix-delta",
+            fixed: 65_863_680,
+            bytes_per_token: 0,
+        },
+        Extra {
+            name: "second-extra",
+            fixed: 1_048_576,
+            bytes_per_token: 4_096,
+        },
+    ];
+    let staging = fixed_case(262_144).staging;
+    let wide = Kv8StagingPlan::for_context(65_536, 2, 256).unwrap();
+    let line = ledger_line(&LedgerFigures {
+        budget_post_margin: 2_802_778_112,
+        live_free: 149_880_832,
+        state_allocated: 2_917_991_168,
+        decode_arena: 1_159_168,
+        chunk_rows: 512,
+        part: 3_000_000,
+        arena: 61_229_056,
+        extras: &extras,
+        staging: &staging,
+        wide: Some(&wide),
+    });
+    assert_eq!(
+        line,
+        "q36 cuda: fixed admission ledger: budget_post_margin=2802778112 live_free=149880832 \
+live_margin=268435456 state=2917991168 decode_arena=1159168 arena=61229056 \
+part_charge=67108864 extras_fixed=66912256 spare_min=67108864 default_staging=67108864 \
+default_rows=32768 chunk_rows=512 wide_staging=134217728 wide_rows=65536"
+    );
+    // part above PART_CHARGE on a 16384-row stage (32 MiB, not 64 MiB):
+    // the charge follows the chunk's own term, and part_charge,
+    // spare_min, and default_staging are three distinct values, so
+    // swapping any two of these three fails it; call 1 separates the rest.
+    let narrow = Kv8StagingPlan::for_context(16_384, 2, 256).unwrap();
+    let line = ledger_line(&LedgerFigures {
+        budget_post_margin: 1,
+        live_free: 1,
+        state_allocated: 1,
+        decode_arena: 1,
+        chunk_rows: 512,
+        part: 100_000_000,
+        arena: 1,
+        extras: &[],
+        staging: &narrow,
+        wide: None,
+    });
+    assert_eq!(
+        line,
+        "q36 cuda: fixed admission ledger: budget_post_margin=1 live_free=1 \
+live_margin=268435456 state=1 decode_arena=1 arena=1 part_charge=100000000 \
+extras_fixed=0 spare_min=67108864 default_staging=33554432 default_rows=16384 chunk_rows=512"
+    );
+
+    // Labels: a wide boot is NOT shrunk; a rung below the default is.
+    assert_eq!(stage_label(StageChoice::Wide, 131_072, 32_768), "wide");
+    assert_eq!(stage_label(StageChoice::Default, 16_384, 32_768), "shrunk");
+    assert_eq!(stage_label(StageChoice::Default, 32_768, 32_768), "default");
+}
+
+#[test]
+fn the_split_bound_binds_the_ladder_above_one_million_rows() {
+    // kv_capacity 2,097,152: the composed floor is max(8192, ceil(kv / 128))
+    // = 16,384, the only range where the split bound outranks the measured
+    // performance floor. A 32,768-row default stage may halve exactly once.
+    let mut case = fixed_case(262_144);
+    case.facts.budget = usize::MAX;
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    let kv = 2_097_152usize;
+
+    // Live room for only 8192 rows: 16384 does not fit and the floor forbids
+    // halving further, so the boot refuses (every rung's live-room text is the
+    // same; the budget-exhaustion test pins the text itself).
+    let free_8k = live_required(&cost, case.staging.bytes / 4);
+    let error = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        None,
+        free_8k,
+        kv,
+    )
+    .unwrap_err();
+    assert!(matches!(error, EngError::MemoryPlan(_)));
+
+    // Live room for exactly 16384 rows: the ladder takes its one rung.
+    let free_16k = live_required(&cost, case.staging.bytes / 2);
+    let (cost, plan) = admit_default_or_shrink(&case, free_16k, kv);
+    assert_eq!(cost.m, case.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (case.staging.capacity / 2, case.staging.bytes / 2)
+    );
+}
+
+#[test]
+fn fixed_stage_floor_is_the_split_bound_for_every_context() {
+    use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_MAX_SPLITS;
+    assert_eq!(super::prefill_driver::fixed_stage_floor(262_144), 2_048);
+    assert_eq!(super::prefill_driver::fixed_stage_floor(180_224), 1_408);
+    // Ceiling division at a non-multiple of the split width.
+    assert_eq!(super::prefill_driver::fixed_stage_floor(131_073), 1_025);
+    for capacity in [32_768, 131_072, 180_224, 196_608, 262_144] {
+        let floor = super::prefill_driver::fixed_stage_floor(capacity);
+        assert!(
+            capacity.div_ceil(floor) <= CPF_ATTN_MAX_SPLITS,
+            "capacity {capacity} floor {floor} exceeds the split bound"
+        );
+    }
+    // The production floor composes the split bound with the performance
+    // floor; no rung below either bound may be admitted. For every shipped
+    // context the measured performance floor (8192) is the binding side; the
+    // split bound binds the composition itself only above 1,048,576 rows (the
+    // ladder test above pins that range end to end).
+    assert_eq!(floor_for(131_073), 8_192);
+    assert_eq!(floor_for(180_224), 8_192);
+    assert_eq!(floor_for(393_216), 8_192);
+    assert_eq!(
+        super::prefill_driver::fixed_stage_min_rows(2_097_152),
+        16_384
+    );
+}
+
+#[test]
+fn wide_refused_default_refused_the_ladder_admits_the_rung() {
+    // The shipped 262144 path with CPF_STAGE_128K=1: a wide stage is offered,
+    // the live snapshot refuses it, refuses the default stage too, and the
+    // ladder still admits the 16384 rung as the default-stage choice.
+    let mut case = fixed_case(262_144);
+    case.facts.budget = usize::MAX;
+    let wide = Kv8StagingPlan::for_context(FULL_STAGE_TIER_ROWS, 2, 256).unwrap();
+    let cost = case
+        .costs
+        .iter()
+        .find(|cost| cost.m == case.facts.cap)
+        .unwrap()
+        .to_owned();
+    let free = live_required(&cost, case.staging.bytes / 2);
+    let (cost, plan, choice) = admit_fixed_staged(
+        &case.facts,
+        &case.extras,
+        &case.costs,
+        case.staging,
+        Some(wide),
+        free,
+        case.context,
+    )
+    .expect("a refused wide and default must still boot on the rung");
+    assert_eq!(cost.m, case.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (case.staging.capacity / 2, case.staging.bytes / 2)
+    );
+    assert_eq!(choice, StageChoice::Default);
+}
+
+#[test]
+fn fixed_admission_admits_the_full_180224_plan_at_the_observed_budget() {
+    let mut case = fixed_case(180_224);
+    case.facts.budget = budget_at_observed_free(&case);
+    let (cost, plan) = admit_default_or_shrink(&case, usize::MAX, case.context);
+    assert_eq!(
+        (cost.m, plan.capacity, plan.bytes),
+        (case.facts.cap, case.staging.capacity, case.staging.bytes)
+    );
+}
+
+#[test]
+fn fixed_admission_roomy_card_keeps_the_32k_stage_at_262144() {
+    let case = fixed_case(262_144);
+    let (cost, plan) = admit_default_or_shrink(&case, usize::MAX, case.context);
+    assert_eq!(
+        (cost.m, plan.capacity, plan.bytes),
+        (case.facts.cap, case.staging.capacity, case.staging.bytes)
+    );
+}
+
+#[test]
+fn fixed_admission_shrinks_the_stage_when_the_budget_is_tight() {
+    // A baseline shift leaves room for half the stage but not the whole: the boot must
+    // degrade the stage, not refuse. The budget pins the charges exactly at the half
+    // stage, so the ladder lands on 16384 rows deterministically.
+    let mut full = fixed_case(262_144);
+    // Strip the calibration headroom too: the snapshot leaves room for exactly the half stage.
+    let base = budget_at_observed_free(&full) - full.staging.bytes - SPARE_MIN - 977_141_760;
+    full.facts.budget = base + SPARE_MIN + full.staging.bytes / 2;
+    let (cost, plan) = admit_default_or_shrink(&full, usize::MAX, full.context);
+    assert_eq!(cost.m, full.facts.cap);
+    assert_eq!(
+        (plan.capacity, plan.bytes),
+        (full.staging.capacity / 2, full.staging.bytes / 2)
+    );
+}
+
+#[test]
+fn fixed_admission_admits_at_the_floor_when_only_the_floor_fits() {
+    // Pins the composed floor itself — which at a 32,768-row default stage IS the
+    // quarter stage, so this doubles as the live-room quarter verdict: when live
+    // room fits the floor stage and nothing larger, the ladder stops exactly
+    // there.
+    let mut full = fixed_case(262_144);
+    full.facts.budget = usize::MAX;
+    let cost = full
+        .costs
+        .iter()
+        .find(|cost| cost.m == full.facts.cap)
+        .unwrap()
+        .to_owned();
+    let floor = floor_for(full.context);
+    let floor_staging = full.staging.bytes * floor / full.staging.capacity;
+    let free = live_required(&cost, floor_staging);
+    let (cost, plan) = admit_default_or_shrink(&full, free, full.context);
+    assert_eq!(cost.m, full.facts.cap);
+    assert_eq!((plan.capacity, plan.bytes), (floor, floor_staging));
+}
+
+#[test]
+fn fixed_admission_refuses_one_byte_below_the_floor_rung() {
+    // One byte under the floor must still refuse. The live-room error text
+    // names no stage bytes and every rung shares it, so this pins termination
+    // at the floor and the error class.
+    let mut full = fixed_case(262_144);
+    full.facts.budget = usize::MAX;
+    let cost = full
+        .costs
+        .iter()
+        .find(|cost| cost.m == full.facts.cap)
+        .unwrap()
+        .to_owned();
+    let floor = floor_for(full.context);
+    let floor_staging = full.staging.bytes * floor / full.staging.capacity;
+    let free = live_required(&cost, floor_staging) - 1;
+    let error = admit_fixed_staged(
+        &full.facts,
+        &full.extras,
+        &full.costs,
+        full.staging,
+        None,
+        free,
+        full.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the floor refusal must surface, got {error:?}")
+    };
+    assert_eq!(
+        text,
+        format!(
+            "fixed prefill admission: {free} live bytes cannot retain {} rows, staging and the margin",
+            cost.m
+        )
+    );
+}
+
+#[test]
+fn fixed_admission_refuses_below_the_smallest_stage_with_the_original_text() {
+    let mut starved = fixed_case(262_144);
+    // Below even the smallest stage rung: the floor must keep the full-stage error verbatim.
+    starved.facts.budget = starved.facts.budget.saturating_sub(2 << 30);
+    let error = admit_fixed_staged(
+        &starved.facts,
+        &starved.extras,
+        &starved.costs,
+        starved.staging,
+        None,
+        usize::MAX,
+        starved.context,
+    )
+    .unwrap_err();
+    let EngError::MemoryPlan(text) = error else {
+        panic!("the floor must refuse with MemoryPlan, got {error:?}")
+    };
+    assert_eq!(
+        text,
+        format!(
+            "fixed prefill admission: {} rows and {} staging bytes do not fit the budget",
+            starved.facts.cap, starved.staging.bytes
+        )
     );
 }

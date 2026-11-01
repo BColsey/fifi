@@ -32,7 +32,7 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::resident::kv8_append::{
-    Kv8DataRaw, Kv8Ints, Kv8WordsRaw, kv8_append_launch, kv8_chunk_launch,
+    Kv8DataRaw, Kv8Ints, Kv8WordsRaw, kv8_append_launch, kv8_chunk_k_launch, kv8_chunk_launch,
 };
 
 /// Values per fp16 scale: the frozen group of the format.
@@ -300,6 +300,61 @@ impl CudaContext {
         let raw = raw_data(self, &data, ints)?;
         self.launch_on(stream, move |raw_stream| {
             kv8_chunk_launch(raw_stream, raw, pos0)
+        })
+    }
+
+    /// The mixed-profile ("q8k") K-only chunk append: quantizes `shape.rows` prefill
+    /// tokens of k into the K code and scale planes at cells `pos0 .. pos0 + rows`.
+    /// V stays f16 and never passes through here. Returns when the kernel is queued.
+    ///
+    /// Returns `BadRequest` for every refusal of [`Self::kv8_chunk`] that concerns
+    /// only the K plane, the position, or the shape.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(crate) fn kv8_chunk_k(
+        &self,
+        stream: &DeviceStream,
+        shape: Kv8Shape,
+        k: DeviceRange<'_>,
+        k_codes: DeviceRange<'_>,
+        k_scales: DeviceRange<'_>,
+        pos0: usize,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let ints = check_shape("kv8_chunk_k", &shape, MAX_CHUNK_ROWS)?;
+        if pos0
+            .checked_add(shape.rows)
+            .is_none_or(|end| end > shape.cells)
+        {
+            return Err(rule(
+                "kv8_chunk_k",
+                &format!(
+                    "pos0 {pos0} + rows {} is above cells {}",
+                    shape.rows, shape.cells
+                ),
+            ));
+        }
+        let pos0 = to_int("kv8_chunk_k", pos0)?;
+        let (rows, codes, scales) = (shape.row_bytes(), shape.code_bytes(), shape.scale_bytes());
+        require_fit("k", &k, rows, 4)?;
+        require_fit("k_codes", &k_codes, codes, 4)?;
+        require_fit("k_scales", &k_scales, scales, 4)?;
+        let written = [
+            Claim::of("k_codes", &k_codes, codes),
+            Claim::of("k_scales", &k_scales, scales),
+        ];
+        let read = [Claim::of("k", &k, rows)];
+        for (i, claim) in written.iter().enumerate() {
+            for other in written[i + 1..].iter().chain(read.iter()) {
+                require_apart(claim, other)?;
+            }
+        }
+        let (k, k_codes, k_scales) = (
+            self.raw_range(&k)?,
+            self.raw_range(&k_codes)?,
+            self.raw_range(&k_scales)?,
+        );
+        self.launch_on(stream, move |raw_stream| {
+            kv8_chunk_k_launch(raw_stream, k, k_codes, k_scales, ints, pos0)
         })
     }
 }

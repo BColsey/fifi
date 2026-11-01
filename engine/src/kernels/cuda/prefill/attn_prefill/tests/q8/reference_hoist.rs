@@ -148,9 +148,10 @@ fn hoist_case(
         Ok(call)
     };
     let mut snapshots = Vec::new();
-    // The tiled kernel is reachable only through the fixture entry — and only when the CALLER
-    // asks for it (the hoist bit-identity test keeps the old kernel). The shape guards still
-    // apply inside the launch predicate.
+    // The tiled kernel is reachable through the fixture entry and the production
+    // route entry — and only when the CALLER asks for it (the hoist bit-identity
+    // test keeps the old kernel). The shape guards still apply inside the launch
+    // predicate.
     let tiled = use_tiled && routes_tiled(&shape, case.group_size, case.segmented);
     for reference in [false, false, true] {
         fx.reset_outputs()?;
@@ -706,8 +707,8 @@ fn q8_prefill_parallelism_microbench_report() {
                     .attn_prefill_q8_reference(&fx.stream, call())
                     .expect("reference launch");
             } else if matches!(arm, Arm::Q8Hoisted) {
-                // The tiled kernel is reachable only through the fixture entry; the default
-                // launch keeps the old kernel.
+                // The tiled kernel is reached through the default-ON production route;
+                // this arm drives the same-ELF fixture entry directly.
                 fx.ctx
                     .attn_prefill_q8_tiled(&fx.stream, call())
                     .expect("tiled launch");
@@ -924,4 +925,212 @@ fn q8_reference_at_planner_splits_stays_within_reduction_reorder_tolerance() {
             plan.max_splits
         );
     }
+}
+
+/// Production-route contract: the tiled entry routes the
+/// flint shape to the tiled kernel WITHOUT counting a fallback, is deterministic across
+/// runs, and a predicate-rejected shape (head_dim 64) falls back to the old kernel with
+/// byte-identical output plus exactly one counted fallback. The counter assert is the
+/// mutation target: forcing the predicate either way breaks exactly one leg.
+#[test]
+fn q8_tiled_route_counts_fallbacks_and_is_deterministic() {
+    if !testkit::device_present("q8_tiled_route_counts_fallbacks_and_is_deterministic") {
+        return;
+    }
+    // Which native entry `run` drives: the production tiled route, the fixture-only
+    // tiled entry, or the default (old-kernel) launch. Inputs are rebuilt identically
+    // per call (deterministic planes), so outputs across ways are comparable.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Way {
+        Route,
+        RouteDisabled,
+        TiledFixture,
+        Default,
+    }
+    let run =
+        |shape: AttnPrefillShape, way: Way, with_sinks: bool| -> Result<(Vec<u8>, i64), EngError> {
+            let storage = AttnKvStorage::Q8Affine {
+                group_size: 32,
+                signed: true,
+            };
+            let mut k = plane(shape, storage, (Dtype::F16, None), 0);
+            let mut v = plane(shape, storage, (Dtype::F16, None), 1);
+            enrich_scales(&mut k, shape, true, 0);
+            enrich_scales(&mut v, shape, true, 1);
+            let kv_len = shape.cache_rows * shape.n_kv_head * shape.head_dim;
+            let input = Data {
+                q: vec![0.25; shape.m * shape.n_head * shape.head_dim],
+                k: vec![0; kv_len],
+                v: vec![0; kv_len],
+                proj: vec![0.25; shape.m * shape.ld],
+            };
+            let split = CpfAttnSplit {
+                max_splits: 41,
+                min_keys: 256,
+            };
+            let mut fx = Fx::with_data(shape, split, false, true, &input)
+                .expect("route fixture device phase");
+            fx.span = CpfAttnSpan::FULL;
+            let kb = k.upload(&fx.ctx)?;
+            let vb = v.upload(&fx.ctx)?;
+            let views = [k.view(&kb)?, v.view(&vb)?];
+            let before = CudaContext::q8_tiled_fallback_count() as i64;
+            // Production always passes sinks (runtime attention()): per-query-head
+            // logits folded by the combine kernel the tiled path shares. The
+            // buffer outlives `call` because DeviceRange borrows it (E0597).
+            let sink_buffer = if with_sinks {
+                let sinks: Vec<f32> = (0..shape.n_head)
+                    .map(|head| [-4.0, 0.5, 12.0][head % 3] + head as f32 / 64.0)
+                    .collect();
+                let sink_bytes: Vec<u8> = sinks.iter().flat_map(|x| x.to_ne_bytes()).collect();
+                Some(fx.ctx.upload(&sink_bytes)?)
+            } else {
+                None
+            };
+            let mut call = fx.call()?;
+            call.storage = storage;
+            call.k_cache = views[0].payload;
+            call.v_cache = views[1].payload;
+            call.kv_views = Some(views);
+            if let Some(buffer) = &sink_buffer {
+                call.sinks = Some(buffer.range(0, shape.n_head * 4)?);
+            }
+            fx.reset_outputs()?;
+            match way {
+                Way::Route => {
+                    fx.ctx
+                        .attn_prefill_q8_tiled_opt_in(&fx.stream, call)
+                        .expect("tiled route launch");
+                }
+                Way::RouteDisabled => {
+                    fx.ctx
+                        .attn_prefill_q8_tiled_disabled(&fx.stream, call)
+                        .expect("disabled route launch");
+                }
+                Way::TiledFixture => {
+                    fx.ctx
+                        .attn_prefill_q8_tiled(&fx.stream, call)
+                        .expect("fixture tiled launch");
+                }
+                Way::Default => {
+                    fx.ctx
+                        .attn_prefill(&fx.stream, call)
+                        .expect("default launch");
+                }
+            }
+            fx.stream.synchronize()?;
+            let status = u32::from_le_bytes(fx.bytes(STATUS)[..4].try_into().expect("status word"));
+            assert_eq!(status, 0, "route launch status");
+            let delta = CudaContext::q8_tiled_fallback_count() as i64 - before;
+            Ok((fx.bytes(OUT).to_vec(), delta))
+        };
+    let flint = AttnPrefillShape {
+        m: 1,
+        n_head: 32,
+        n_kv_head: 4,
+        head_dim: 128,
+        cache_rows: 3200,
+        ld: 0,
+        p0: 3199,
+    };
+    let (out_routed_1, delta_1) = run(flint, Way::Route, true).expect("route flint 1");
+    let (out_routed_2, delta_2) = run(flint, Way::Route, true).expect("route flint 2");
+    assert_eq!(delta_1, 0, "accepted shape must not count a fallback");
+    assert_eq!(delta_2, 0, "accepted shape must not count a fallback");
+    assert_eq!(out_routed_1, out_routed_2, "route must be deterministic");
+    // The accepted branch must actually run the tiled kernel: bitwise-equal to the
+    // fixture-only tiled entry on the same inputs, within the stated tolerance of the
+    // default kernel, different from the untouched fill bytes, and distinguishable from
+    // the legacy kernel's output (so a legacy enqueue cannot pass as tiled).
+    let (out_tiled_fixture, delta_fixture) =
+        run(flint, Way::TiledFixture, true).expect("fixture tiled");
+    assert_eq!(delta_fixture, 0, "fixture entry never counts fallbacks");
+    assert_eq!(
+        out_routed_1, out_tiled_fixture,
+        "accepted route output must equal the tiled fixture bitwise"
+    );
+    let out_fill = vec![0x55u8; out_routed_1.len()];
+    assert_ne!(
+        out_routed_1, out_fill,
+        "routed output must differ from the untouched fill bytes"
+    );
+    let (out_default_flint, delta_default_flint) =
+        run(flint, Way::Default, true).expect("default on flint shape");
+    assert_eq!(delta_default_flint, 0, "default path never counts");
+    let legacy_margin = out_routed_1
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out_default_flint.as_chunks::<4>().0.iter())
+        .map(|(a, b)| (f32::from_le_bytes(*a) - f32::from_le_bytes(*b)).abs())
+        .fold(0.0f32, f32::max);
+    println!("tiled-vs-legacy max abs margin: {legacy_margin}");
+    assert_ne!(
+        out_routed_1, out_default_flint,
+        "fixture must distinguish tiled output from legacy output"
+    );
+    let rows = flint.m * flint.n_head;
+    // The same entry with use_tiled = false must keep the old kernel: output equal to
+    // the default launch bitwise, no fallback counted.
+    let (out_route_off, delta_route_off) =
+        run(flint, Way::RouteDisabled, true).expect("route with use_tiled = false");
+    assert_eq!(delta_route_off, 0, "disabled route never counts a fallback");
+    assert_eq!(
+        out_route_off, out_default_flint,
+        "use_tiled = false must equal the default kernel byte for byte"
+    );
+    for row in 0..rows {
+        let (routed, default) = (
+            &out_routed_1[row * flint.head_dim * 4..(row + 1) * flint.head_dim * 4],
+            &out_default_flint[row * flint.head_dim * 4..(row + 1) * flint.head_dim * 4],
+        );
+        let bound = default
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .fold(0.0f32, |m, x| m.max(x.abs()))
+            * 2.0f32.powi(-14);
+        assert!(
+            bound.is_finite(),
+            "bound must be finite (row {row}); an infinite bound accepts anything"
+        );
+        for (h, r) in routed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(default.as_chunks::<4>().0.iter())
+        {
+            let (hv, rv) = (f32::from_le_bytes(*h), f32::from_le_bytes(*r));
+            assert!(
+                hv.is_finite() && rv.is_finite(),
+                "non-finite value at row {row}"
+            );
+            let diff = (hv - rv).abs();
+            assert!(
+                diff.is_finite() && diff <= bound,
+                "routed-vs-default row {row} exceeds the 2^-14 bound: {diff} > {bound}"
+            );
+        }
+    }
+    let rejected = AttnPrefillShape {
+        m: 1,
+        n_head: 32,
+        n_kv_head: 4,
+        head_dim: 64,
+        cache_rows: 3200,
+        ld: 0,
+        p0: 3199,
+    };
+    let (out_fallback, delta_fallback) = run(rejected, Way::Route, true).expect("route rejected");
+    let (out_default, delta_default) = run(rejected, Way::Default, true).expect("default rejected");
+    assert_eq!(
+        delta_fallback, 1,
+        "rejected shape counts exactly one fallback"
+    );
+    assert_eq!(delta_default, 0, "default path never counts");
+    assert_eq!(
+        out_fallback, out_default,
+        "fallback output must equal the default kernel byte for byte"
+    );
 }

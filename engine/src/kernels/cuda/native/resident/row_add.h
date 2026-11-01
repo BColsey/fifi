@@ -7,6 +7,7 @@
 #define INFERENCE_CUDA_RESIDENT_ROW_ADD_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,12 +18,18 @@ typedef struct inference_cuda_row_add_args {
     const void *x;   /* f32 [n], read */
     const void *y;   /* f32 [n], read */
     int n;           /* values, a multiple of 32, 32..4194304 */
+    /* Producer-fusion arm: 1 stores the bf16 roundtrip each published value
+     * gets (nonfinite becomes 0 with flag bit 0 set, matching the separate
+     * publish kernel); 0 stores the plain sum as before. */
+    unsigned *flag;
+    size_t flag_bytes;
+    uint32_t fused_publish;
 } inference_cuda_row_add_args;
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_row_add_args) == 32 && offsetof(inference_cuda_row_add_args, out) == 0 && offsetof(inference_cuda_row_add_args, x) == 8 && offsetof(inference_cuda_row_add_args, y) == 16 && offsetof(inference_cuda_row_add_args, n) == 24, "layout");
+static_assert(sizeof(inference_cuda_row_add_args) == 56 && offsetof(inference_cuda_row_add_args, out) == 0 && offsetof(inference_cuda_row_add_args, x) == 8 && offsetof(inference_cuda_row_add_args, y) == 16 && offsetof(inference_cuda_row_add_args, n) == 24 && offsetof(inference_cuda_row_add_args, flag) == 32 && offsetof(inference_cuda_row_add_args, fused_publish) == 48, "layout");
 #else
-_Static_assert(sizeof(inference_cuda_row_add_args) == 32 && offsetof(inference_cuda_row_add_args, out) == 0 && offsetof(inference_cuda_row_add_args, x) == 8 && offsetof(inference_cuda_row_add_args, y) == 16 && offsetof(inference_cuda_row_add_args, n) == 24, "layout");
+_Static_assert(sizeof(inference_cuda_row_add_args) == 56 && offsetof(inference_cuda_row_add_args, out) == 0 && offsetof(inference_cuda_row_add_args, x) == 8 && offsetof(inference_cuda_row_add_args, y) == 16 && offsetof(inference_cuda_row_add_args, n) == 24 && offsetof(inference_cuda_row_add_args, flag) == 32 && offsetof(inference_cuda_row_add_args, fused_publish) == 48, "layout");
 #endif
 
 /* One launch on stream (must not be NULL). out is written; x and y are read.

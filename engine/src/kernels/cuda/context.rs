@@ -148,6 +148,10 @@ pub(crate) struct CudaContext {
     workspace_allocations: std::cell::Cell<usize>,
     #[cfg(all(test, feature = "native-cuda"))]
     successful_allocations: std::cell::Cell<usize>,
+    /// The kernel an unset `FIFI_EXL3_SINGLE_GATHER` selects for the EXL3 projections run on this
+    /// context: set by the session that owns it, so two engines in one process choose apart.
+    pub(in crate::kernels::cuda) exl3_single_row_default:
+        std::cell::Cell<Option<super::resident::exl3::SingleRow>>,
     _thread_confined: PhantomData<*const ()>,
     alloc_cache: Option<Rc<alloc_cache::AllocCache>>,
     /// Keep this field last. It returns credit only after native owners finish cleanup.
@@ -247,6 +251,26 @@ impl CudaContext {
         self.alloc_cache.is_some()
     }
 
+    /// Lets cached blocks go idle without a device synchronize while the adapter owns one stream.
+    /// A no-op without the cache.
+    pub(crate) fn set_lazy_alloc_return(&self, lazy: bool) {
+        if let Some(cache) = &self.alloc_cache {
+            cache.set_lazy_return(lazy);
+        }
+    }
+
+    /// Raises what the allocation cache serves and keeps, for a pass whose frames are tall: blocks
+    /// up to `max_block` bytes, `max_idle` bytes idle. The caller charges `max_idle` to its
+    /// work reserve. A no-op without the cache.
+    pub(crate) fn set_alloc_cache_limits(&self, max_block: usize, max_idle: usize) {
+        if let Some(cache) = &self.alloc_cache {
+            cache.set_limits(alloc_cache::CacheLimits {
+                max_block,
+                max_idle,
+            });
+        }
+    }
+
     pub(crate) fn drain_alloc_cache(&self) -> Result<(), EngError> {
         match &self.alloc_cache {
             Some(cache) => cache.drain(),
@@ -301,6 +325,7 @@ impl CudaContext {
             successful_allocations: std::cell::Cell::new(0),
             _thread_confined: PhantomData,
             alloc_cache: None,
+            exl3_single_row_default: std::cell::Cell::new(None),
             pinned_stage_admission: None,
         }
     }
@@ -425,7 +450,7 @@ impl CudaContext {
             )));
         }
         let _dispatch = self.enter()?;
-        native::upload_at(raw, offset, bytes).map_err(device_error)
+        host_write(buffer, raw, offset, bytes)
     }
 
     /// Copies a device buffer back to the host. `out` must not be longer than
@@ -992,7 +1017,7 @@ impl CudaContext {
     /// Allocates `bytes` of uninitialized device memory.
     fn alloc(&self, bytes: usize) -> Result<DeviceBuffer, EngError> {
         let buffer = match &self.alloc_cache {
-            Some(cache) if bytes <= alloc_cache::MAX_BLOCK_BYTES => cache.allocate(bytes)?,
+            Some(cache) if bytes <= cache.max_block() => cache.allocate(bytes)?,
             _ => DeviceBuffer::allocate(&self.lease, bytes)?,
         };
         #[cfg(all(test, feature = "native-cuda"))]
@@ -1023,8 +1048,12 @@ impl CudaContext {
             let vecs = &mut staging[..part.groups() * plan.group_vecs()];
             repack_chunk(name, part, src, vecs)?;
             let _dispatch = self.enter()?;
-            native::upload_at(raw, first * plan.group_bytes, TileVec::as_bytes(vecs))
-                .map_err(device_error)?;
+            host_write(
+                buffer,
+                raw,
+                first * plan.group_bytes,
+                TileVec::as_bytes(vecs),
+            )?;
         }
         Ok(())
     }
@@ -1062,6 +1091,19 @@ impl DeviceBuffer {
     /// Bytes of the device allocation.
     pub(crate) fn bytes(&self) -> usize {
         self.raw.as_ref().map_or(0, RawDevice::bytes)
+    }
+
+    /// A buffer with no allocation: the placeholder for a plane that carries
+    /// no data on the mixed profile ("q8k" keeps no V scale plane). `bytes()`
+    /// is 0; nothing writes through it.
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    pub(in crate::kernels::cuda) fn empty(lease: &Rc<Lease>) -> Self {
+        Self {
+            raw: None,
+            lease: Rc::clone(lease),
+            _thread_confined: PhantomData,
+            alloc_cache: None,
+        }
     }
 
     /// Allocates `bytes` of uninitialized device memory on the adapter of `lease`.
@@ -1524,6 +1566,22 @@ pub(crate) use launch::{MatmulIo, PackCall, Projection};
 pub(crate) use mailbox::Mailbox;
 pub(crate) use native_weight::NativeWeight;
 pub(crate) use nvfp4_launch::Nvfp4WeightRange;
+/// Writes `bytes` into `buffer` at `offset` from the host, synchronously. No stream orders such
+/// a write, so a cached block that went idle without a device synchronize settles first. Every
+/// host-synchronous write into a device buffer goes through here or through `AllocCache::copy`,
+/// which settles the same way.
+pub(super) fn host_write(
+    buffer: &DeviceBuffer,
+    raw: &RawDevice,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), EngError> {
+    if let Some(cache) = &buffer.alloc_cache {
+        cache.settle()?;
+    }
+    native::upload_at(raw, offset, bytes).map_err(device_error)
+}
+
 #[cfg(test)]
 pub(crate) use nvfp4_launch::{Nvfp4GroupedPlan, Nvfp4LaunchStatus};
 pub(crate) use pinned::{PinnedWord, WordValue};

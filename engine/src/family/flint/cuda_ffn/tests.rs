@@ -132,3 +132,33 @@ fn invalid_route_metadata_never_builds_a_descriptor_plan() {
     duplicate[4] = duplicate[0];
     assert!(Grouping::new(&duplicate, 1, 8).is_err());
 }
+
+#[test]
+fn ranked_grouping_puts_resident_experts_first_and_keeps_each_group_stable() {
+    // One row picks experts 6, 2, 5, 0, 7, 3 of eight; experts 5, 6 and 2 are on the device.
+    let ids = [6, 2, 5, 0, 7, 3];
+    let mut resident = [false; 256];
+    for expert in [5, 6, 2] {
+        resident[expert] = true;
+    }
+    let plan = Grouping::ranked(&ids, 1, 8, &resident).unwrap();
+    let experts: Vec<i32> = plan.order.iter().map(|&pair| ids[pair]).collect();
+    assert_eq!(experts, [2, 5, 6, 0, 3, 7]);
+    for (sorted, &original) in plan.order.iter().enumerate() {
+        assert_eq!(plan.inverse[original], sorted as i32);
+    }
+    // With nothing resident it is the plain expert-major order.
+    let plain = Grouping::ranked(&ids, 1, 8, &[false; 256]).unwrap();
+    assert_eq!(plain.order, Grouping::new(&ids, 1, 8).unwrap().order);
+}
+
+#[test]
+fn ranked_grouping_keeps_rows_in_pair_order_inside_a_group() {
+    // Two rows both pick expert 4 (resident) and expert 1 (not).
+    let ids = [4, 1, 2, 3, 5, 6, 0, 4, 7, 1, 2, 3];
+    let mut resident = [false; 256];
+    resident[4] = true;
+    let plan = Grouping::ranked(&ids, 2, 8, &resident).unwrap();
+    assert_eq!(&plan.order[..2], &[0, 7]);
+    assert_eq!(plan.tokens[..2], [0, 1]);
+}

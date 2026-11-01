@@ -2,6 +2,8 @@
 
 pub(crate) mod chunk_plan;
 mod config;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod cpu_moe;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 mod cuda_executor;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
@@ -10,6 +12,16 @@ pub(crate) mod cuda_ffn;
 pub(crate) mod cuda_kv;
 #[cfg(test)]
 mod cuda_kv_tests;
+/// Park-identity construction (pack fingerprint, cache-config hash)
+/// for the host park store; pure CPU code, built wherever an executor is.
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+// Assembled at the park hooks once they exist, like gguf_weights above.
+#[cfg_attr(not(test), allow(dead_code))]
+mod park_identity;
 // The prefix module's consumers are the native-cuda executor and its
 // device gates; portable test builds do not compile it (
 // a consumer-less compile is dead-code under clippy -D warnings).

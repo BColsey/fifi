@@ -64,7 +64,7 @@ fn stage_fence(k: &mut MlxKernels, label: &str, tensor: &ExecutionTensor) -> Res
 
 /// Async chain: decode layers per evaluate group when the chain is on. 49 layers -> 13
 /// roots.
-const GROUP_LAYERS: usize = 4;
+pub(crate) const GROUP_LAYERS: usize = 4;
 
 /// Async-chain switch: one-row chunks (decode steps and single-row prefill pieces) are
 /// grouped into `GROUP_LAYERS`-layer evaluate chains. Default ON (an A/B run measured

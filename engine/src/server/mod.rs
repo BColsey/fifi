@@ -8,6 +8,7 @@ mod auth;
 #[cfg(test)]
 mod cancel_tests;
 mod chat;
+mod completions;
 mod config;
 #[cfg(test)]
 mod contract;
@@ -27,6 +28,7 @@ mod sse;
 mod state;
 #[cfg(test)]
 mod testkit;
+mod tokenize;
 mod validate;
 mod wire;
 

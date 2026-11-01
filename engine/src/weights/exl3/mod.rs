@@ -5,16 +5,16 @@ pub(crate) mod flint_pack;
 mod full;
 mod header;
 mod reference;
+mod reorder;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod source;
 
 pub use config::Config;
 pub use header::Matrix;
 pub use reference::Codebook;
-#[cfg(test)]
-pub(crate) use source::CONFIG_LIMIT;
+pub use reorder::{Axis, GROUP, check_order};
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) use source::Checkpoint;
+pub(crate) use source::{CONFIG_LIMIT, Checkpoint};
 
 /// Stored components, including legacy forms that Matrix::load must explicitly refuse.
 pub const COMPONENT_SUFFIXES: [&str; 9] = [

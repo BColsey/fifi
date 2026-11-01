@@ -96,8 +96,7 @@ fn options() -> StepOptions {
 }
 
 fn gguf_path() -> Result<PathBuf, EngError> {
-    let dir = std::env::var("Q36_CUDA_MODEL_DIR")
-        .unwrap_or_else(|_| "/media/dan/nvme/models/qwen3.6-35b-a3b".to_owned());
+    let dir = crate::test_paths::required("Q36_CUDA_MODEL_DIR");
     Ok(Path::new(&dir).join(GGUF_NAME))
 }
 

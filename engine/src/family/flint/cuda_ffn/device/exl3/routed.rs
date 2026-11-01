@@ -157,6 +157,16 @@ pub(super) trait Effects {
     -> Result<(), EngError>;
     fn indices(&mut self, values: &[i32]) -> Result<Self::Tensor, EngError>;
     fn expert(&mut self, id: usize) -> Result<Expert<Self::Matrix>, EngError>;
+    /// Whether the router's picks are on the device: the host then knows no expert id, and
+    /// [`Self::pick_expert`] describes each pick instead of [`Self::expert`].
+    fn device_picks(&self) -> bool {
+        false
+    }
+    /// The description of a pick whose id only the device knows; the launch of the grouped
+    /// projections chooses the member. Refused when the picks are on the host.
+    fn pick_expert(&mut self) -> Result<Expert<Self::Matrix>, EngError> {
+        Err(bad("the routed picks are not on the device"))
+    }
     fn copy(&mut self, source: Span<Self::Tensor>, out: Span<Self::Tensor>)
     -> Result<(), EngError>;
     fn gather(
@@ -168,6 +178,51 @@ pub(super) trait Effects {
     ) -> Result<(), EngError>;
     fn project(&mut self, weight: Self::Matrix, x: Self::Tensor) -> Result<(), EngError>;
     fn publish_projection(&mut self, out: Self::Tensor, shape: RowShape) -> Result<(), EngError>;
+    /// Whether this impl wants the producer-fusion fast paths (armed and
+    /// supported). Default false keeps the legacy call and allocation order.
+    fn prefers_fused_publish(&self) -> bool {
+        false
+    }
+    /// Producer-fusion fast path: write the projection's PUBLISHED values
+    /// directly into `out` when the impl fuses the publish (returns true).
+    /// The default enqueues the plain projection and returns false; the
+    /// caller then runs publish_projection on `out` as before.
+    fn project_published(
+        &mut self,
+        weight: Self::Matrix,
+        x: Self::Tensor,
+        out: Self::Tensor,
+        shape: RowShape,
+    ) -> Result<bool, EngError> {
+        let _ = (out, shape);
+        self.project(weight, x)?;
+        Ok(false)
+    }
+    /// Producer fusion for grouped projections: the group set publishes
+    /// directly into the per-group destination tensors `outs` (contiguous,
+    /// group order) when the impl fuses (returns true). Default: plain
+    /// grouped enqueue, caller publishes from the Out slot.
+    fn grouped_published(
+        &mut self,
+        calls: &[Projection<Self::Matrix, Self::Tensor>],
+        outs: &[Self::Tensor],
+    ) -> Result<bool, EngError> {
+        let _ = outs;
+        self.grouped(calls)?;
+        Ok(false)
+    }
+    /// Producer fusion for multiply: on Ok(()) `out` holds the PUBLISHED
+    /// values. Default: legacy raw-then-publish, which also publishes `out`.
+    fn multiply_published(
+        &mut self,
+        x: [Self::Tensor; 2],
+        out: Self::Tensor,
+        shape: RowShape,
+    ) -> Result<(), EngError> {
+        let raw = self.allocate(shape)?;
+        self.multiply(x, raw, shape)?;
+        self.publish(raw, out, shape)
+    }
     fn sigmoid(
         &mut self,
         x: Self::Tensor,
@@ -194,8 +249,17 @@ fn project<E: Effects>(
     x: E::Tensor,
     shape: RowShape,
 ) -> Result<E::Tensor, EngError> {
-    effects.project(weight, x)?;
+    if effects.prefers_fused_publish() {
+        // Destination exists before the enqueue only on the fused path.
+        let out = effects.allocate(shape)?;
+        if effects.project_published(weight, x, out, shape)? {
+            return Ok(out);
+        }
+        effects.publish_projection(out, shape)?;
+        return Ok(out);
+    }
     // Keep the legacy order: enqueue the projection before allocating publication.
+    effects.project(weight, x)?;
     let out = effects.allocate(shape)?;
     effects.publish_projection(out, shape)?;
     Ok(out)
@@ -206,6 +270,11 @@ fn multiply<E: Effects>(
     x: [E::Tensor; 2],
     shape: RowShape,
 ) -> Result<E::Tensor, EngError> {
+    if effects.prefers_fused_publish() {
+        let out = effects.allocate(shape)?;
+        effects.multiply_published(x, out, shape)?;
+        return Ok(out);
+    }
     let raw = effects.allocate(shape)?;
     effects.multiply(x, raw, shape)?;
     let out = effects.allocate(shape)?;
@@ -272,21 +341,46 @@ fn project_groups<E: Effects>(
             x: group.input,
         })
         .collect();
-    effects.grouped(&calls)?;
     let count = if packed_rows.is_some() {
         1
     } else {
         groups.len()
     };
-    for group in groups.iter().take(count) {
-        let shape = RowShape {
-            rows: packed_rows.unwrap_or(group.rows),
+    let shape_of = |group: &Group<E>| RowShape {
+        rows: packed_rows.unwrap_or(group.rows),
+        columns: if role == 2 {
+            group.expert.hidden
+        } else {
+            group.expert.intermediate
+        },
+    };
+    if effects.prefers_fused_publish() {
+        // Per-group stages (never the packed single stage): each group's
+        // published rows land at its own first-offset, so the union is the
+        // packed block when packed pointwise reads it. Stage() re-loans the
+        // same persistent slot key, so these and the fallback loop's stages
+        // are the same ranges.
+        let per_group = |group: &Group<E>| RowShape {
+            rows: group.rows,
             columns: if role == 2 {
                 group.expert.hidden
             } else {
                 group.expert.intermediate
             },
         };
+        let outs: Vec<_> = groups
+            .iter()
+            .map(|group| effects.stage(slot, group.first, per_group(group)))
+            .collect::<Result<_, _>>()?;
+        if effects.grouped_published(&calls, &outs)? {
+            return Ok(());
+        }
+        // The impl declined fusion after enqueueing the plain grouped projection.
+    } else {
+        effects.grouped(&calls)?;
+    }
+    for group in groups.iter().take(count) {
+        let shape = shape_of(group);
         let raw = effects.stage(Slot::Out, group.first, shape)?;
         let out = effects.stage(slot, group.first, shape)?;
         effects.publish(raw, out, shape)?;
@@ -328,7 +422,11 @@ fn grouped_inputs<E: Effects>(
                 end += 1;
             }
         }
-        let expert = effects.expert(id as usize)?;
+        let expert = if effects.device_picks() {
+            effects.pick_expert()?
+        } else {
+            effects.expert(id as usize)?
+        };
         if expert.hidden != block.hidden
             || groups
                 .first()

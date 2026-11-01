@@ -18,16 +18,29 @@ fn fixture_path() -> PathBuf {
         })
 }
 
-fn load_fixture(path: &Path) -> serde_json::Value {
-    let bytes = std::fs::read(path).unwrap_or_else(|error| {
-        panic!(
+/// The fixture is generated outside git. When it is absent the test skips, unless
+/// `FIFI_TEST_REQUIRE_DATA=1` is set, which turns the skip into a failure.
+fn load_fixture(path: &Path) -> Option<serde_json::Value> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::env::var("FIFI_TEST_REQUIRE_DATA").as_deref() != Ok("1") =>
+        {
+            eprintln!(
+                "skipping: missing real-group fixture {} (set FIFI_TEST_REQUIRE_DATA=1 to fail instead)",
+                path.display()
+            );
+            return None;
+        }
+        Err(error) => panic!(
             "missing real-group fixture {} ({error}); run qualification/real-groups/prepare-real-groups.py first",
             path.display()
-        )
-    });
+        ),
+    };
     let fixture: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture JSON parses");
     assert_eq!(fixture["schema"], SCHEMA);
-    fixture
+    Some(fixture)
 }
 
 fn load_manifest(fixture_path: &Path) -> serde_json::Value {
@@ -236,7 +249,9 @@ fn check_cell(cell: &serde_json::Value) {
 
 #[test]
 fn committed_fixture_declares_every_group_and_tolerance() {
-    let fixture = load_fixture(&fixture_path());
+    let Some(fixture) = load_fixture(&fixture_path()) else {
+        return;
+    };
     zero_tolerance(&fixture);
     assert_eq!(
         fixture["quantization"]["default"],
@@ -265,7 +280,9 @@ fn committed_fixture_declares_every_group_and_tolerance() {
 
 #[test]
 fn quantization_metadata_resolves_the_sampled_modules() {
-    let fixture = load_fixture(&fixture_path());
+    let Some(fixture) = load_fixture(&fixture_path()) else {
+        return;
+    };
     let manifest = load_manifest(&fixture_path());
     let config = serde_json::to_vec(&fixture["quantization"]["config"]).expect("encode config");
     let wrapped = serde_json::json!({"quantization": serde_json::from_slice::<serde_json::Value>(&config).unwrap()});
@@ -438,7 +455,9 @@ mod mac {
     #[test]
     fn every_real_group_matches_the_pinned_reference() {
         let _serial = GPU_TEST.lock().unwrap();
-        let fixture = load_fixture(&fixture_path());
+        let Some(fixture) = load_fixture(&fixture_path()) else {
+            return;
+        };
         zero_tolerance(&fixture);
         let manifest = load_manifest(&fixture_path());
         let basis = activation_tensor(&fixture["activations"]["basis"]);

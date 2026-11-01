@@ -39,6 +39,8 @@ pub(crate) struct ReplyParser {
     parser: ToolCallParser,
     grammar: ToolGrammar,
     allow_calls: bool,
+    /// True for a raw completion: `push` returns the text as it came and nothing is parsed.
+    raw: bool,
 }
 
 impl ReplyParser {
@@ -65,11 +67,28 @@ impl ReplyParser {
             ),
             grammar,
             allow_calls: !tools.is_empty(),
+            raw: false,
+        }
+    }
+
+    /// Creates the parser of a raw completion. The text of the reply stays content, byte for
+    /// byte: no think block or tool call is cut out, and no whitespace is trimmed.
+    pub(crate) fn raw() -> Self {
+        Self {
+            raw: true,
+            ..Self::with_grammar(Start::Content, &[], "", ToolGrammar::Qwen)
         }
     }
 
     /// Takes the next text of the reply and returns the parts that it completes.
     pub(crate) fn push(&mut self, text: &str) -> Vec<Piece> {
+        if self.raw {
+            return if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![Piece::Content(text.to_string())]
+            };
+        }
         let events = self.parser.push(text);
         self.convert(events, false)
     }
@@ -77,6 +96,9 @@ impl ReplyParser {
     /// Ends the reply and returns the parts that remain. `cut_by_length` is true when the output
     /// limit ended the reply: a call left open is then dropped.
     pub(crate) fn finish(&mut self, cut_by_length: bool) -> Vec<Piece> {
+        if self.raw {
+            return Vec::new();
+        }
         let events = self.parser.finish();
         self.convert(events, cut_by_length)
     }
@@ -187,6 +209,24 @@ mod tests {
     }
 
     const ADD: &str = "<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2.5\n</parameter>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_raw_parser_keeps_markers_and_whitespace_as_content() {
+        let mut parser = ReplyParser::raw();
+        let text = "  <think>a</think> <tool_call>\nx</tool_call>\n";
+        let mut pieces = parser.push(&text[..9]);
+        pieces.extend(parser.push(""));
+        pieces.extend(parser.push(&text[9..]));
+        pieces.extend(parser.finish(false));
+        let joined: String = pieces
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Content(text) => text,
+                other => panic!("a raw parser produced {other:?}"),
+            })
+            .collect();
+        assert_eq!(joined, text);
+    }
 
     #[test]
     fn plain_text_passes_through_as_content() {

@@ -42,9 +42,9 @@ use std::fmt;
 
 use crate::{
     EngError,
-    kernels::cuda::resident::step_params::StepStatus,
     kernels::cuda::resident::step_params::{MAX_ADVANCE, ensure_rows},
     kernels::cuda::resident::step_params::{POS_MAX, StepParams},
+    kernels::cuda::resident::step_params::{STATUS_EXL3_ARITHMETIC, StepStatus},
 };
 
 /// Whether the state may be trusted.
@@ -84,8 +84,8 @@ pub(crate) enum CommitRefusal {
 }
 
 /// The error of a non-zero status word, with the class of the wrapper (`StepStatus::error`,
-/// `Backend`): mask 4 `step_params`, then mask 8 `prefill_chunk`, then 1 `route_experts`, then 2
-/// `sample` (precedence 4 > 8 > 1 > 2); unknown bits alone are a `Backend` `step_status`.
+/// `Backend`): mask 4 `step_params`, then mask 8 `prefill_chunk`, then mask 16 (an EXL3 arithmetic flag, a `ModelOutput`), then 1
+/// `route_experts`, then 2 `sample` (precedence 4 > 8 > 16 > 1 > 2); unknown bits alone are a `Backend` `step_status`.
 pub(crate) fn status_error(status: i32) -> EngError {
     let report = StepStatus(status);
     if report.invalid_step_state() {
@@ -96,6 +96,9 @@ pub(crate) fn status_error(status: i32) -> EngError {
             operation: "prefill_chunk",
             message: "the prefill chunk reported a fault".to_owned(),
         };
+    }
+    if status & STATUS_EXL3_ARITHMETIC != 0 {
+        return super::step::exl3_flag_error();
     }
     report.error().unwrap_or_else(|| unknown_bits(status))
 }

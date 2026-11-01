@@ -127,6 +127,7 @@ fn real_qwen_projection_uses_shared_loader_and_checked_weight_facts() {
                     out: out.range(0, out.bytes()).unwrap(),
                     flag: flag.range(0, 1).unwrap(),
                     rows,
+                    fused: false,
                 }
             ),
             Err(EngError::BadRequest(_))
@@ -142,6 +143,7 @@ fn real_qwen_projection_uses_shared_loader_and_checked_weight_facts() {
                     out: out.range(0, out.bytes()).unwrap(),
                     flag: flag.range(0, 4).unwrap(),
                     rows,
+                    fused: false,
                 },
             )
             .unwrap();

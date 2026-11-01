@@ -1,5 +1,5 @@
 //! Private model observations. The default product does not include this module.
-use super::{Model, State, git, metadata, qualification_paths};
+use super::{Model, State, env_path, git, metadata, qualification_paths, scratch};
 use crate::family::flint::mlx_qualification::{profile_tokens, write_row};
 use serde_json::json;
 use sha2::{Digest, Sha256};

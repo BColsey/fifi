@@ -85,6 +85,31 @@ impl LayerTable {
         Ok(Self { layers })
     }
 
+    /// A table of one layer: layer `source` of this table, renamed `blk.<number>.<suffix>`, with
+    /// ordinal 0. It names a block that lives beside the model's own layers in the same set of
+    /// weights (the MTP head's block), so its names cannot collide with theirs.
+    pub(super) fn single(&self, source: usize, number: usize) -> Result<Self, EngError> {
+        let entry = self.entry(source)?;
+        let old = format!("blk.{source}.");
+        let names = entry
+            .names
+            .iter()
+            .map(|(role, name)| {
+                let suffix = name.strip_prefix(&old).ok_or_else(|| {
+                    EngError::Checkpoint(format!("layer table: {name} is not under layer {source}"))
+                })?;
+                Ok((*role, format!("blk.{number}.{suffix}")))
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        Ok(Self {
+            layers: vec![LayerEntry {
+                kind: entry.kind,
+                ordinal: 0,
+                names,
+            }],
+        })
+    }
+
     pub(super) fn len(&self) -> usize {
         self.layers.len()
     }

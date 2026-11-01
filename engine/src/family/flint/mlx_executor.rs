@@ -34,6 +34,10 @@ pub(super) struct FlintExecutor {
     eos: Vec<u32>,
     pub(super) vocab: usize,
     root: PathBuf,
+    /// The pinned chat-template digest threaded from the factory: the
+    /// park-identity `template` field.
+    #[allow(dead_code)] // read by the park hooks once they exist
+    template_sha: [u8; 32],
     /// The restore fact of the CURRENT job for `prefix_report` (cleared on
     /// reset so a job without a restore never reports the job before it).
     prefix_hit: PrefixHit,
@@ -119,7 +123,12 @@ impl FlintExecutor {
         }
     }
 
-    pub(super) fn open(root: &Path, eos: Vec<u32>, vocab: usize) -> Result<(Self, FlintSession)> {
+    pub(super) fn open(
+        root: &Path,
+        eos: Vec<u32>,
+        vocab: usize,
+        template_sha: [u8; 32],
+    ) -> Result<(Self, FlintSession)> {
         if vocab == 0
             || vocab > 150_144
             || eos.is_empty()
@@ -152,6 +161,7 @@ impl FlintExecutor {
                 eos,
                 vocab,
                 root: root.to_path_buf(),
+                template_sha,
                 // The store: one tip entry, no roots.
                 prefix: PrefixStore::with_limits(PREFIX_STORE_LIMITS),
                 prefix_hit: PrefixHit::Miss,

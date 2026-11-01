@@ -36,4 +36,5 @@ pub(crate) mod mmq_nvfp4;
 pub(crate) mod mmq_quant;
 pub(crate) mod mmq_size;
 pub(crate) mod row_ops;
+pub(crate) mod scatter_cols;
 pub(crate) mod swiglu_rows;

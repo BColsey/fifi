@@ -1,6 +1,7 @@
 //! Shared F32 row math and gather operations. These calls allocate, copy and
 //! synchronize nothing; callers retain owners and check the flag after completion.
-//! BF16 publication remains a separate shared row_scale operation.
+//! Unfused, BF16 publication remains a separate shared row_scale operation; a
+//! multiply with `fused` set rounds each product to BF16 itself.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
@@ -37,6 +38,9 @@ pub(crate) struct RowMulCall<'a> {
     pub(crate) flag: DeviceRange<'a>,
     pub(crate) shape: RowShape,
     pub(crate) rhs_columns: usize,
+    /// Producer-fusion arm: the kernel stores the published bf16 roundtrip
+    /// of each product; the caller skips its separate publish kernel.
+    pub(crate) fused: bool,
 }
 
 pub(crate) struct RowGatherCall<'a> {
@@ -133,6 +137,7 @@ impl CudaContext {
             rows: call.shape.rows,
             columns: call.shape.columns,
             rhs_columns: call.rhs_columns,
+            fused: call.fused,
         };
         self.launch_on(stream, |stream| ffi::row_mul_launch(stream, &raw))
     }

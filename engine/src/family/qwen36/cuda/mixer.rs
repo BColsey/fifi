@@ -24,7 +24,7 @@ use super::{
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_ops::{BLOCK_ROWS, BlockOp, block_ops},
-    mixer_shapes::{attn_decode_shape, attn_prep_shape},
+    mixer_shapes::{attn_decode_shape, attn_prep_shape, plain_shape},
     mixer_shapes::{attn_q8_shape, check_delta_eps, conv_shape, delta_shape, kv8_shape},
     mixer_weights::{LayerWeights, MixerWeights},
     paging_store::{PageAttention, PageId, PageToken},
@@ -52,6 +52,7 @@ use crate::{
             kv8_append::Kv8Data,
             matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
+            router::RouterLogitsCall,
         },
     },
 };
@@ -239,11 +240,6 @@ impl<'a> Mixers<'a> {
     ) -> Result<(), EngError> {
         state.check_block(stream)?;
         let slot = self.parts.table.slot(layer)?;
-        if self.parts.layout == WeightLayout::Exl3 && slot.kind == AttentionKind::DeltaNet {
-            return Err(EngError::BadRequest(
-                "EXL3 DeltaNet needs the repeat-interleave adapter before execution".into(),
-            ));
-        }
         let weights = self.parts.weights.layer_weights(layer)?;
         let run = Run {
             stream,
@@ -349,23 +345,30 @@ impl<'a> Mixers<'a> {
                 };
                 ctx.matmul(stream, projection, io)
             }
-            BlockOp::ResetExl3 { flag } => {
-                let flag = self.view(flag)?;
-                flag.buffer()
-                    .write_at(stream, flag.offset(), &0u32.to_le_bytes())
-            }
             BlockOp::ProjectExl3 {
                 role, x, y, col, ..
-            } => run.weights.exl3(role)?.project(
-                ctx,
-                stream,
-                Exl3Io {
+            } => {
+                let weight = run.weights.exl3(role)?.view()?;
+                let io = Exl3Io {
                     x: self.view(x)?,
                     xh: self.view(Slot::Exl3Xh)?,
                     z: self.view(Slot::Exl3Z)?,
                     out: tail(self.view(y)?, col)?,
                     flag: self.view(Slot::Exl3Flag)?,
                     rows: BLOCK_ROWS,
+                    fused: false,
+                };
+                ctx.exl3_linear(stream, weight.linear_call(&io))
+            }
+            BlockOp::ProjectPlain {
+                role, x, y, col, ..
+            } => ctx.router_logits_rows(
+                stream,
+                RouterLogitsCall {
+                    shape: plain_shape(g, role)?,
+                    x: self.view(x)?,
+                    w: run.weights.raw(role)?,
+                    logits: tail(self.view(y)?, col)?,
                 },
             ),
             BlockOp::Pack { x, xf, k, .. } => ctx.pack(

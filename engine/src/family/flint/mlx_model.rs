@@ -11,6 +11,28 @@ use crate::{
 };
 use std::path::Path;
 
+/// Mac MLX freed-buffer cache limit. Default 64 MiB: bounded reuse keeps
+/// per-step freed buffers on the device instead of paying a driver
+/// round-trip for every free/malloc pair. Rollback:
+/// FIFI_FLINT_MLX_CACHE_LIMIT=0 (read once per process at first use;
+/// changes require a restart); an unrecognized SET value fails safe to the
+/// previous 0 limit, not 64 MiB.
+pub(super) fn cache_limit_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = super::factory::cache_limit_with(super::factory::os_setting(
+            std::env::var_os("FIFI_FLINT_MLX_CACHE_LIMIT").as_deref(),
+        ));
+        // The one load line an operator needs to confirm the effective limit.
+        eprintln!(
+            "flint: MLX freed-buffer cache {} MiB",
+            limit / (1024 * 1024)
+        );
+        limit
+    })
+}
+
 type Result<T> = std::result::Result<T, EngError>;
 
 pub(super) struct SwiGlu {
@@ -171,8 +193,10 @@ impl Model {
         let mut source = FlintCheckpoint::open(root)?;
         let mut kernels = MlxKernels::try_new()?;
         kernels.allow_bf16(true);
-        // Initial synchronous path does not need MLX's unbounded freed-buffer cache.
-        kernels.set_cache_limit(0)?;
+        // Bounded freed-buffer reuse: without a cache every per-step
+        // free/malloc pair pays a driver round-trip. 64 MiB covers the
+        // measured decode churn envelope.
+        kernels.set_cache_limit(cache_limit_bytes())?;
         let mut layers = Vec::with_capacity(49);
         for index in 0..49 {
             layers.push(Layer::load(&mut kernels, &mut source, index)?);

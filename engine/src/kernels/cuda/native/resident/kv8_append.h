@@ -84,6 +84,11 @@ int inference_cuda_kv8_append_launch(const inference_cuda_kv8_append_args *args,
 /* One launch (grid n_kv_head by t, head_dim threads). */
 int inference_cuda_kv8_chunk_launch(const inference_cuda_kv8_chunk_args *args, void *stream,
                                     int *out_stage);
+/* The mixed-profile ("q8k") K-only chunk: same args struct, but v, v_codes and
+ * v_scales must be NULL — V stays f16 and is never quantized. One launch
+ * (grid n_kv_head by t, head_dim threads). */
+int inference_cuda_kv8_chunk_k_launch(const inference_cuda_kv8_chunk_args *args, void *stream,
+                                       int *out_stage);
 
 #ifdef __cplusplus
 }

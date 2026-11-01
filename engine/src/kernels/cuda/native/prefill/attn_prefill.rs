@@ -23,6 +23,7 @@
 
 use core::mem::{align_of, offset_of, size_of};
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::prefill::attn_prefill::{AttnKvLayout, AttnKvStorage, AttnScalarLayout};
@@ -190,15 +191,24 @@ pub(in crate::kernels::cuda) enum AttnPrefillLaunch {
         part_index: c_int,
     },
     #[cfg(all(test, feature = "cuda-q8-reference"))]
-    /// Same-ELF fixture entry: the pre-hoist per-element q8 math, so tests compare the hoisted
-    /// kernel against the original byte for byte. Fixture builds only (feature
-    /// `cuda-q8-reference`).
+    /// Same-ELF fixture path: identical admission and args, but the
+    /// native entry launches the q8 part kernel with the pre-hoist per-element math so
+    /// tests can compare it with the hoisted kernel byte for byte. Fixture builds only
+    /// (feature `cuda-q8-reference`).
     Q8Reference,
     #[cfg(all(test, feature = "cuda-q8-reference"))]
-    /// Same-ELF fixture entry: the tiled step-2 kernel — the ONLY caller that can reach it;
-    /// the default launch keeps the old kernel. Fixture builds only (feature
-    /// `cuda-q8-reference`).
+    /// Same-ELF fixture path: identical admission and args, but the native entry passes
+    /// the tiled route — one of the two ways tests reach the tiled kernel (the
+    /// default-ON production route entry is the other). Fixture builds only
+    /// (feature `cuda-q8-reference`).
     Q8Tiled,
+    /// Production route: the entry the Rust driver calls
+    /// when FIFI_FLINT_CUDA_Q8_TILED is armed; `use_tiled = false` is the same-entry
+    /// old-path form the route test exercises. Predicate rejects fall back inside the
+    /// entry and count into [`Q8_TILED_FALLBACKS`].
+    Q8TiledRoute {
+        use_tiled: bool,
+    },
     Combine,
 }
 
@@ -228,6 +238,31 @@ unsafe extern "C" {
         out_stage: *mut c_int,
     ) -> c_int;
 }
+
+unsafe extern "C" {
+    #[link_name = "inference_cuda_attn_prefill_q8_tiled_route"]
+    fn attn_prefill_q8_tiled_route_raw(
+        args: *const AttnPrefillArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        use_tiled: c_int,
+        out_route: *mut c_int,
+    ) -> c_int;
+}
+
+/// Fallbacks counted by the production route entry: tiled requested but the predicate
+/// rejected the shape, so the default old kernel ran. Test-visible for the
+/// mutation-checked route test; production code only increments, and the route logs
+/// the first fallback per process to stderr so silent fallbacks are visible
+/// without a fixture build.
+pub(in crate::kernels::cuda) static Q8_TILED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Route-acceptance count: successful tile-kernel launches through the route entry
+/// (incremented only after a clean enqueue, so arm/launch errors are not counted).
+/// Test-visible; kept live in production builds as telemetry on the same pattern as
+/// the fallback counter above: one relaxed add per accepted call on the tiled
+/// route (default ON, rollback via a rejected knob value).
+pub(in crate::kernels::cuda) static Q8_TILED_ROUTES: AtomicU64 = AtomicU64::new(0);
 
 /// Every integer argument of the launch, already bounded and converted by the wrapper before
 /// `launch_on`, so no conversion can fail inside the launch closure. `ld` is 0 without
@@ -351,8 +386,13 @@ fn check_views(io: &AttnPrefillRaw<'_>, need: &Needs) -> Result<(), DeviceFailur
     let Some(views) = &io.kv_views else {
         return Ok(());
     };
+    /* Uniform q8: both planes Q8Affine. Mixed ("q8k"): K stays Q8Affine, V is
+     * the F16 row plane; the C entry's valid() admits exactly this pair. */
     if !matches!(views[0].layout.storage, AttnKvStorage::Q8Affine { .. })
-        || views[0].layout.storage != views[1].layout.storage
+        || !matches!(
+            views[1].layout.storage,
+            AttnKvStorage::Q8Affine { .. } | AttnKvStorage::F16
+        )
     {
         return Err(invalid_argument());
     }
@@ -381,10 +421,12 @@ fn check_views(io: &AttnPrefillRaw<'_>, need: &Needs) -> Result<(), DeviceFailur
             .layout
             .extents(rows, heads, dim)
             .map_err(|_| invalid_argument())?;
-        let AttnKvStorage::Q8Affine { group_size, .. } = view.layout.storage else {
-            return Err(invalid_argument());
+        let groups = match view.layout.storage {
+            AttnKvStorage::Q8Affine { group_size, .. } => dim / group_size,
+            /* The mixed V plane carries no scale or bias planes. */
+            AttnKvStorage::F16 => 0,
+            _ => return Err(invalid_argument()),
         };
-        let groups = dim / group_size;
         let apart = |range: &RawRange<'_>, bytes| {
             let read = Span::of(range, bytes);
             out.apart(&read) && part.apart(&read) && status.as_ref().is_none_or(|s| s.apart(&read))
@@ -434,8 +476,16 @@ fn scalar_dtype(layout: Option<AttnScalarLayout>) -> Result<c_int, DeviceFailure
 }
 
 fn view_args(view: &AttnKvRaw<'_>) -> Result<AttnKvViewRaw, DeviceFailure> {
-    let AttnKvStorage::Q8Affine { group_size, signed } = view.layout.storage else {
-        return Err(invalid_argument());
+    /* Uniform q8 planes and the mixed ("q8k") V plane both pass through here;
+     * the raw struct is self-describing, so the C validators pick per view. */
+    let (storage, group_size, signed) = match view.layout.storage {
+        AttnKvStorage::Q8Affine { group_size, signed } => (
+            3,
+            c_int::try_from(group_size).map_err(|_| invalid_argument())?,
+            signed,
+        ),
+        AttnKvStorage::F16 => (0, 0, false),
+        _ => return Err(invalid_argument()),
     };
     let (scale, bias) = (view.layout.scales, view.layout.bias);
     Ok(AttnKvViewRaw {
@@ -456,8 +506,8 @@ fn view_args(view: &AttnKvRaw<'_>) -> Result<AttnKvViewRaw, DeviceFailure> {
         bias_time_stride_bytes: bias.map_or(0, |s| s.strides.time_stride_bytes),
         bias_head_stride_bytes: bias.map_or(0, |s| s.strides.head_stride_bytes),
         bias_group_stride_bytes: bias.map_or(0, |s| s.group_stride_bytes),
-        storage: 3,
-        group_size: c_int::try_from(group_size).map_err(|_| invalid_argument())?,
+        storage,
+        group_size,
         scale_dtype: scalar_dtype(scale)?,
         bias_dtype: scalar_dtype(bias)?,
         q8_signed: c_int::from(signed),
@@ -618,6 +668,23 @@ pub(in crate::kernels::cuda) fn attn_prefill_launch(
             #[cfg(all(test, feature = "cuda-q8-reference"))]
             AttnPrefillLaunch::Q8Tiled => {
                 attn_prefill_q8_tiled_raw(&args, stream.as_ptr(), &mut stage)
+            }
+            AttnPrefillLaunch::Q8TiledRoute { use_tiled } => {
+                let mut route: c_int = 0;
+                let status = attn_prefill_q8_tiled_route_raw(
+                    &args,
+                    stream.as_ptr(),
+                    &mut stage,
+                    c_int::from(use_tiled),
+                    &mut route,
+                );
+                if route == 1 && status == 0 {
+                    Q8_TILED_ROUTES.fetch_add(1, Ordering::Relaxed);
+                }
+                if route == 2 {
+                    Q8_TILED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                }
+                status
             }
         }
     };

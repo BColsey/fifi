@@ -1,5 +1,5 @@
 //! One original-GGUF L0 gate and its saved native post-norm input; not model qualification.
-//! Correctness only. Timing requires a separately reviewed harness and coordinator window.
+//! Correctness only. Timing requires a separately reviewed harness and an exclusive GPU window.
 
 use super::super::*;
 use crate::family::flint::{cuda_ffn::reference::real::gguf, gguf_weights};
@@ -516,7 +516,7 @@ fn bench_phase(fixture: &Fixture, measured: bool) -> Result<Vec<BenchCell>, EngE
 }
 
 #[test]
-#[ignore = "requires admitted CUDA, pinned fixtures; timing mode additionally requires reviewed harness and exclusive coordinator GO"]
+#[ignore = "requires admitted CUDA, pinned fixtures; timing mode additionally requires reviewed harness and an exclusive GPU window"]
 fn nvfp4_dense_l0_gate_microbench() {
     let mode = std::env::var("FIFI_FLINT_MMQ_BENCH_MODE").expect("explicit dry or timing mode");
     let measured = match mode.as_str() {

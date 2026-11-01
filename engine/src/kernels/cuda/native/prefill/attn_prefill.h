@@ -190,6 +190,14 @@ int inference_cuda_attn_prefill_q8_reference_launch(
     const inference_cuda_attn_prefill_args *args, void *stream, int *out_stage);
 #endif
 
+/* Production route for the tiled q8 part kernel: use_tiled != 0 attempts the tiled
+ * kernel (predicate-rejected shapes fall back to the default kernel, count into the
+ * route's fallback counter and log the first fallback per process); use_tiled == 0 is
+ * the plain default enqueue with a route report. */
+int inference_cuda_attn_prefill_q8_tiled_route(
+    const inference_cuda_attn_prefill_args *args, void *stream, int *out_stage,
+    int use_tiled, int *out_route);
+
 #ifdef __cplusplus
 }
 #endif

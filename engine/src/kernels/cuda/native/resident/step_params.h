@@ -29,6 +29,8 @@ extern "C" {
 #define INFERENCE_CUDA_STATUS_ROUTER_FAULT 1
 #define INFERENCE_CUDA_STATUS_NONFINITE_LOGITS 2
 #define INFERENCE_CUDA_STATUS_INVALID_STEP_STATE 4
+/* Mask 16: an EXL3 projection of the step saw a nonfinite value (moved in by exl3_flag_fold). */
+#define INFERENCE_CUDA_STATUS_EXL3_ARITHMETIC 16
 
 typedef struct inference_cuda_step_params {
     int token_id;
@@ -49,6 +51,13 @@ _Static_assert(sizeof(inference_cuda_step_params) == 32, "StepParams is 32 bytes
  * (invalid step state) is set when the state is not valid (see above). First kernel of a step; the bits of the step
  * before were published to the host (result pair of argmax) at its end. One launch. */
 int inference_cuda_step_begin_launch(void *params, void *stream, int *out_stage);
+
+/* The sticky arithmetic flag of the EXL3 projections (a caller-owned u32) rides the result pair:
+ * exl3_flag_clear zeroes the word and runs right after step_begin; exl3_flag_fold runs after the
+ * last EXL3 projection and before argmax: it zeroes the word and ORs mask 16 into
+ * params->status when bit 0 was set, so the one result read carries the verdict. One launch each. */
+int inference_cuda_exl3_flag_clear_launch(void *flag, void *stream, int *out_stage);
+int inference_cuda_exl3_flag_fold_launch(void *params, void *flag, void *stream, int *out_stage);
 
 /* Last kernel of a step: pos += m, kv_len += m, and kv_slot += m (kv_slot is reserved and
  * equals pos) when the state is valid and pos + m <= 2^30 - 2, so kv_len == pos + 1

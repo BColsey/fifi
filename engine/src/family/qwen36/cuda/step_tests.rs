@@ -155,6 +155,92 @@ fn the_start_block_and_the_result_pair_have_their_own_words() {
 }
 
 #[test]
+fn only_an_exl3_step_refuses_a_pair_with_the_arithmetic_mask() {
+    use super::step::exl3_pair_refusal;
+    use crate::family::project::cuda::WeightLayout;
+    use crate::kernels::cuda::resident::step_params::{ResultPair, StepStatus};
+    let pair = |status| ResultPair {
+        token: 7,
+        status: StepStatus(status),
+    };
+    for status in [16, 16 | 1, 16 | 2, 16 | 4, 16 | 8] {
+        match exl3_pair_refusal(WeightLayout::Exl3, pair(status)) {
+            Some(crate::EngError::ModelOutput(message)) => {
+                assert_eq!(
+                    message, "EXL3 projection flagged invalid arithmetic",
+                    "{status}"
+                )
+            }
+            other => panic!("status {status}: expected the flag error, got {other:?}"),
+        }
+    }
+    for status in [0, 1, 2, 4, 8, 1 | 2 | 4 | 8] {
+        assert!(
+            exl3_pair_refusal(WeightLayout::Exl3, pair(status)).is_none(),
+            "{status}"
+        );
+    }
+    for layout in [WeightLayout::Native, WeightLayout::Tiled] {
+        assert!(exl3_pair_refusal(layout, pair(16)).is_none(), "{layout:?}");
+    }
+}
+
+/// The routed and shared expert groups of the EXL3 block go through the step's grouped entry, so
+/// the wide kernel serves them when the switch names it.
+#[test]
+fn the_exl3_moe_block_launches_its_groups_through_the_step_entry() {
+    let source = include_str!("exl3_moe.rs");
+    let start = source.find("fn grouped(").expect("the grouped helper");
+    let body = &source[start..start + 1200];
+    assert!(body.contains("exl3_grouped_step("), "{body}");
+    assert!(!body.contains("exl3_grouped("), "{body}");
+}
+
+/// A refused pair poisons the state before the error returns, so no later token starts from it.
+#[test]
+fn a_refused_exl3_pair_poisons_the_state() {
+    let body = fn_section("fn run_token_inner(");
+    let check = body.find("exl3_pair_refusal(").expect("the pair check");
+    let after = &body[check..];
+    let poison = after
+        .find("self.state.poison()")
+        .expect("poison after the check");
+    let ret = after
+        .find("return Err(error)")
+        .expect("the return of the refusal");
+    assert!(poison < ret, "{after}");
+}
+
+/// The start refuses a bad `FIFI_EXL3_SINGLE_GATHER` before it allocates a stream.
+#[test]
+fn the_step_start_checks_the_single_row_switch_before_the_stream() {
+    let source = include_str!("step.rs");
+    let start = source.find("pub(crate) fn new(").expect("new");
+    let body = &source[start..];
+    let check = body
+        .find("check_single_gather()")
+        .expect("the switch check in new");
+    let stream = body.find("context.stream()").expect("the stream in new");
+    assert!(
+        check < stream,
+        "check_single_gather() must precede context.stream()"
+    );
+}
+
+/// The pair check runs before `decide`, so a flagged EXL3 token never reaches the commit.
+#[test]
+fn the_pair_check_precedes_the_decision() {
+    let body = fn_section("fn run_token_inner(");
+    let refusal = body
+        .find("exl3_pair_refusal(")
+        .expect("the pair check is in the token body");
+    let decision = body
+        .find("decide(pair")
+        .expect("the decision is in the token body");
+    assert!(refusal < decision, "exl3_pair_refusal must precede decide");
+}
+
+#[test]
 fn a_layout_mismatch_is_refused_before_any_context_work() {
     use crate::family::project::cuda::WeightLayout;
     // The pure refusal: the options must agree with the loaded weights.
@@ -629,6 +715,74 @@ fn capture_once_folds_the_attempt_through_the_seam_and_reruns_on_none() {
             "the capture_once body ({length} bytes) lacks {needle:?}"
         );
     }
+}
+
+/// An EXL3 step may capture: the MoE blocks read the picks on the device when the capture config
+/// asks for a graph, and the step keeps no refusal of the EXL3 layout.
+#[test]
+fn an_exl3_step_captures_with_device_picks() {
+    let source = include_str!("step.rs");
+    assert!(
+        !source.contains("exl3_capture_refusal"),
+        "the EXL3 capture refusal is gone"
+    );
+    let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+    let config = squeeze(fn_section("pub(crate) fn set_capture_config("));
+    assert!(
+        config.contains("self.exl3_device_ids=config.capture&&self.layout==WeightLayout::Exl3;"),
+        "{config}"
+    );
+    let run = squeeze(fn_section("fn run_op("));
+    let call = run.find("run_exl3_moe(").expect("the EXL3 MoE call");
+    assert!(
+        run[call..call + 90].contains("self.moe_dims,self.exl3_device_ids"),
+        "{run}"
+    );
+}
+
+/// A captured EXL3 step holds at most 8 picks; more is refused when the capture is configured.
+#[test]
+fn a_captured_exl3_step_refuses_more_than_eight_picks() {
+    use super::step::exl3_device_pick_refusal;
+    use crate::family::project::cuda::WeightLayout;
+    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, true, 8).is_ok());
+    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, true, 9).is_err());
+    assert!(exl3_device_pick_refusal(WeightLayout::Exl3, false, 9).is_ok());
+    assert!(exl3_device_pick_refusal(WeightLayout::Native, true, 9).is_ok());
+    let config = fn_section("pub(crate) fn set_capture_config(");
+    assert!(config.contains("exl3_device_pick_refusal("), "{config}");
+}
+
+/// The block's device-pick path makes no host read and no wait: a captured body cannot.
+#[test]
+fn the_device_pick_path_of_the_exl3_moe_block_never_waits_for_the_host() {
+    let source = include_str!("exl3_moe.rs");
+    for name in [
+        "fn routed_on_device(",
+        "fn grouped_indexed(",
+        "fn route(",
+        "fn shared(",
+        "fn combine(",
+        "fn swiglu(",
+    ] {
+        let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |at| at + 3);
+        let body = &rest[..end];
+        for forbidden in ["read_at(", "write_at(", "synchronize(", "read_picks("] {
+            assert!(!body.contains(forbidden), "{name} calls {forbidden}");
+        }
+    }
+    let block = source
+        .find("pub(super) fn run_exl3_moe(")
+        .expect("run_exl3_moe");
+    let body = &source[block..];
+    let device = body.find("if device_ids {").expect("the device branch");
+    let host = body.find("read_picks(").expect("the host branch");
+    assert!(
+        device < host,
+        "the device branch comes first and the host read is in the else arm"
+    );
 }
 
 #[test]

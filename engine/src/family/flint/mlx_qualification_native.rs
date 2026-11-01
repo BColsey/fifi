@@ -348,13 +348,18 @@ pub(in crate::family::flint) fn injected_input(
     result.map_err(|error| crate::EngError::Checkpoint(format!("isolated input: {error}")))
 }
 
-fn env_path(key: &str) -> io::Result<PathBuf> {
+pub(crate) fn env_path(key: &str) -> io::Result<PathBuf> {
     std::env::var_os(key)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other(format!("{key} is required")))
 }
-fn scratch(path: &Path) -> bool {
-    path.starts_with("/Users/dan/fifi/scrch") || path.starts_with("/media/dan/nvme/fifi/scrch")
+/// The scratch root is `FIFI_SCRATCH_ROOT`; test builds also read it from the host test-paths file.
+pub(crate) fn scratch(path: &Path) -> bool {
+    #[cfg(test)]
+    let root = crate::test_paths::lookup("FIFI_SCRATCH_ROOT");
+    #[cfg(not(test))]
+    let root = std::env::var_os("FIFI_SCRATCH_ROOT").map(PathBuf::from);
+    root.is_some_and(|root| path.starts_with(root))
 }
 fn git(arg: &str) -> io::Result<String> {
     let output = Command::new("git")

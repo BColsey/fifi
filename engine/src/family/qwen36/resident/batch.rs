@@ -1,4 +1,4 @@
-//! M1 row-batched decode (the mistralrs design, coordinator-corrected): the
+//! M1 row-batched decode (the mistralrs design): the
 //! row-wise operations batch across the window's B slots (embedding, norms,
 //! projections, router, MoE including the shared expert, final norm, head) -
 //! the weight-read amortization - while attention and the DeltaNet recurrence

@@ -838,6 +838,7 @@ fn shared_row_ops_keep_f32_math_and_sticky_numeric_bound_health() {
             flag: flag.range(0, 4).unwrap(),
             shape,
             rhs_columns: 1,
+            fused: false,
         },
     )
     .unwrap();

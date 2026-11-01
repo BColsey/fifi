@@ -105,6 +105,8 @@ pub(crate) enum CudaWeight {
         name: String,
         weight: exl3::Exl3Weight,
     },
+    /// The routed experts of one projection of one layer, in one bank.
+    Exl3Bank { name: String, bank: exl3::Exl3Bank },
     /// An F32 or F16 tensor copied as read.
     Raw {
         name: String,
@@ -117,7 +119,18 @@ impl CudaWeight {
     pub(crate) fn name(&self) -> &str {
         match self {
             Self::Tiled { name, .. } | Self::Native { name, .. } | Self::Raw { name, .. } => name,
-            Self::Exl3 { name, .. } => name,
+            Self::Exl3 { name, .. } | Self::Exl3Bank { name, .. } => name,
+        }
+    }
+
+    /// Every device buffer of the tensor.
+    fn buffers(&self) -> Vec<&DeviceBuffer> {
+        match self {
+            Self::Tiled { weight, .. } => vec![weight.buffer()],
+            Self::Native { weight, .. } => vec![weight.buffer()],
+            Self::Raw { buffer, .. } => vec![buffer],
+            Self::Exl3 { weight, .. } => weight.device_buffers().collect(),
+            Self::Exl3Bank { bank, .. } => bank.device_buffers().collect(),
         }
     }
 
@@ -128,6 +141,7 @@ impl CudaWeight {
             Self::Native { weight, .. } => weight.buffer().bytes(),
             Self::Raw { buffer, .. } => buffer.bytes(),
             Self::Exl3 { weight, .. } => weight.device_bytes(),
+            Self::Exl3Bank { bank, .. } => bank.device_bytes(),
         }
     }
 }
@@ -182,23 +196,7 @@ impl CudaWeights {
     /// Every device buffer of the load, in load order: the leaked pin slice of a resident
     /// step reads them, beside the arena slot.
     pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
-        self.weights.iter().flat_map(|weight| {
-            let extra = match weight {
-                CudaWeight::Exl3 { weight, .. } => Some(weight),
-                _ => None,
-            };
-            let first = match weight {
-                CudaWeight::Tiled { weight, .. } => weight.buffer(),
-                CudaWeight::Native { weight, .. } => weight.buffer(),
-                CudaWeight::Raw { buffer, .. } => buffer,
-                CudaWeight::Exl3 { weight, .. } => &weight.trellis,
-            };
-            std::iter::once(first).chain(
-                extra
-                    .into_iter()
-                    .flat_map(|weight| weight.device_buffers().skip(1)),
-            )
-        })
+        self.weights.iter().flat_map(CudaWeight::buffers)
     }
 
     pub(crate) fn times(&self) -> LoadTimes {
@@ -239,7 +237,7 @@ impl CudaWeight {
             Self::Tiled { .. } => TensorKind::Tiled,
             Self::Native { .. } => TensorKind::Native,
             Self::Raw { .. } => TensorKind::Raw,
-            Self::Exl3 { .. } => TensorKind::Exl3,
+            Self::Exl3 { .. } | Self::Exl3Bank { .. } => TensorKind::Exl3,
         }
     }
 }
@@ -820,9 +818,11 @@ impl Projector for CudaProjector {
 fn tiled<'w>(weight: &'w CudaWeight, operation: &str) -> Result<&'w TiledWeight, EngError> {
     match weight {
         CudaWeight::Tiled { weight, .. } => Ok(weight),
-        CudaWeight::Exl3 { name, .. } => Err(EngError::Checkpoint(format!(
-            "tensor {name} is EXL3; cuda {operation} reads tiles"
-        ))),
+        CudaWeight::Exl3 { name, .. } | CudaWeight::Exl3Bank { name, .. } => {
+            Err(EngError::Checkpoint(format!(
+                "tensor {name} is EXL3; cuda {operation} reads tiles"
+            )))
+        }
         CudaWeight::Native { name, .. } => Err(EngError::Checkpoint(format!(
             "tensor {name} is loaded in the native layout; cuda {operation} reads tiles"
         ))),
@@ -1024,7 +1024,7 @@ fn matrix_shape(tensor: &GgufTensor) -> Result<(usize, usize), EngError> {
 }
 
 pub(crate) mod exl3;
-pub(crate) use exl3::Exl3MatrixView;
+pub(crate) use exl3::{Exl3JobsIo, Exl3MatrixView};
 mod load_policy;
 #[cfg(test)]
 mod model_tests;

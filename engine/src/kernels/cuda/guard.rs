@@ -78,6 +78,8 @@ impl Drop for DispatchGuard<'_> {
 pub(super) struct Lease {
     slots: &'static AtomicUsize,
     failed: &'static AtomicBool,
+    /// Streams the adapter has created. One stream means all device work is ordered by it.
+    streams: Cell<usize>,
 }
 
 impl Lease {
@@ -98,7 +100,19 @@ impl Lease {
                 operation: super::INITIALIZE_OPERATION,
                 message: "this process already holds two CUDA adapter leases".into(),
             })?;
-        Ok(Rc::new(Self { slots, failed }))
+        Ok(Rc::new(Self {
+            slots,
+            failed,
+            streams: Cell::new(0),
+        }))
+    }
+
+    pub(super) fn note_stream(&self) {
+        self.streams.set(self.streams.get().saturating_add(1));
+    }
+
+    pub(super) fn streams(&self) -> usize {
+        self.streams.get()
     }
 }
 

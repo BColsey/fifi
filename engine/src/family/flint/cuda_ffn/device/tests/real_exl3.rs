@@ -24,9 +24,12 @@ const CASES: [(&str, &[u32]); 2] = [
     ("p01", &[630, 6963, 297, 9865, 332]),
     ("code01", &[1182, 836, 3444, 11, 286, 1080, 279, 597]),
 ];
-const P01_GGUF_LOGITS: &str = "/media/dan/nvme/fifi/scrch/d5cba1dd/flint-full49-5/teacher-native-full49-01d7df368e1f/actual/p01-logits.f32le";
 const P01_GGUF_SHA256: &str = "c6360d1a1a66ee7e01e4308f177ee4bc97243632b793049ce0828aea9b0a9964";
 const HOST_BRIDGE: &str = "device Q/K normalization and RoPE; GPU CPF; host F16 K/V conversion and write; NOT an all-device graph";
+
+fn p01_gguf_logits() -> PathBuf {
+    crate::test_paths::required("FLINT_P01_GGUF_LOGITS")
+}
 
 fn cached_head(bytes: &[u8], expected_sha256: &str) -> Result<Vec<f32>, EngError> {
     if bytes.len() != VOCAB * 4 || format!("{:x}", Sha256::digest(bytes)) != expected_sha256 {
@@ -49,7 +52,7 @@ fn resident_full49_first_token_and_sixteen_decode() {
     let pack = PathBuf::from(std::env::var_os("FLINT_EXL3_PACK").expect("opt-in EXL3 pack"));
     let output = real_model::fresh_directory(
         "FIFI_FLINT_CUDA_RESULT_DIR",
-        &[pack.clone(), PathBuf::from(P01_GGUF_LOGITS)],
+        &[pack.clone(), p01_gguf_logits()],
     );
     let cuda_started = Instant::now();
     let ctx = CudaContext::new().expect("EXL3 full49 requires CUDA");
@@ -185,7 +188,7 @@ fn resident_full49_first_token_and_sixteen_decode() {
 
     // This fixed, unqualified cached head never starts a live GGUF decoder.
     let comparison_started = Instant::now();
-    let cached = cached_head(&std::fs::read(P01_GGUF_LOGITS).unwrap(), P01_GGUF_SHA256).unwrap();
+    let cached = cached_head(&std::fs::read(p01_gguf_logits()).unwrap(), P01_GGUF_SHA256).unwrap();
     let comparison = comparison::compare(&cached, &heads[0]).unwrap();
     let report = serde_json::json!({
         "label":comparison::LABEL,"case":"p01","input_ids":CASES[0].1,
@@ -193,7 +196,7 @@ fn resident_full49_first_token_and_sixteen_decode() {
         "gguf_first_id":comparison::greedy(&cached).unwrap(),"exl3_first_id":comparison::greedy(&heads[0]).unwrap(),
         "first_divergence":null,"gguf_decode_ids_available":false,
         "comparison_scope":"cached first head only; no GGUF continuation artifact",
-        "cached_path":P01_GGUF_LOGITS,"cached_sha256":P01_GGUF_SHA256,"cached_bytes":VOCAB*4,
+        "cached_path":p01_gguf_logits(),"cached_sha256":P01_GGUF_SHA256,"cached_bytes":VOCAB*4,
         "cached_capture_head":"ff0279cdf4a45163eda9325b4283162bfff65240",
         "cached_capture_exit_code":101,"cached_capture_passes":6,"cached_capture_cases":8,
         "cached_capture_qualification":false,"gguf_model_sha256":gguf::MODEL_SHA256,"physical_kv":"F16",

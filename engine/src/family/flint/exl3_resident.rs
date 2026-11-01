@@ -27,8 +27,8 @@ pub(crate) use native::load_flint_fixture;
     reason = "native API staged for Flint dispatch and loader"
 )]
 pub(crate) use native::{
-    FlintExl3Resident, FlintExpertBank, FlintExpertView, FlintFfnView, FlintLayerView,
-    load_flint_resident,
+    BankStats, FlintExl3Resident, FlintExpertBank, FlintExpertView, FlintFfnView, FlintLayerView,
+    PickBank, PickRole, load_flint_resident,
 };
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]

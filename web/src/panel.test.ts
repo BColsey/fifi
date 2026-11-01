@@ -109,7 +109,7 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
   strictEqual(now.recent, null, "the ring card goes unavailable");
   strictEqual(now.recentError, null);
   ok(now.checkedAt >= wasHealthy.checkedAt, "the timestamp still advances");
-  // The MF1 invariant in one sweep of every display field: nothing that
+  // The full-replacement invariant in one sweep of every display field: nothing that
   // reads as "ok" outlives the probe that found otherwise.
   const okish = [now.healthOk, now.readyOk, now.models, now.recent].every(
     (field) => field === false || field === null

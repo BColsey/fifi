@@ -15,8 +15,8 @@
 use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot, Extra, PrefillStep, chunk_list_with_depth_tier,
-        chunk_tensors,
+        Admission, ChunkCost, ChunkSlot, Extra, PART_CHARGE, PrefillStep, SPARE_MIN,
+        chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
     },
 };
 use crate::{
@@ -275,11 +275,21 @@ impl StageChoice {
     }
 }
 
-/// The wide candidate first; a budget or live-room miss falls back to today's default
-/// stage and its refusal error AS IS (no ladder anywhere); every other error propagates
-/// unchanged. `free` is queried once by the caller BEFORE this selection, so both
-/// candidates are gated by the same live snapshot and a wide plan can never refuse a
-/// boot the default stage would have kept.
+/// Selects the fixed-prefill stage under one live snapshot. The wide candidate (131072
+/// rows) is tried first where it applies; any MemoryPlan from it falls back to the default
+/// stage, and only then does the tight-snapshot ladder run: a budget or live-room refusal
+/// halves the stage while the rows halve exactly, down to `fixed_stage_min_rows(kv_capacity)`
+/// — the split bound composed with the performance floor — where `kv_capacity` is the KV
+/// context capacity (not a floor). Above 131,072 rows the ladder adds up to
+/// 48 MiB (64 MiB stage -> 16 MiB floor) of headroom over the 32,768-row default
+/// stage, 240 MiB when the wide fallback ran first; at or below 131,072 rows it runs
+/// from the full-context stage down to the floor instead (240 MiB at 131,072,
+/// 112 MiB at 65,536). A snapshot too tight for every rung down to the
+/// floor refuses the boot with the ORIGINAL full-stage error text; odd stages keep that
+/// refusal too because bytes cannot halve exactly. Every MemoryPlan from an attempt
+/// shrinks — a budget or live-room refusal, a charge overflow (a smaller stage can
+/// un-overflow the sum), or live VRAM below the margin — every other error surfaces
+/// unchanged.
 pub(super) fn admit_fixed_staged(
     facts: &AdmitFacts,
     extras: &[Extra],
@@ -287,11 +297,18 @@ pub(super) fn admit_fixed_staged(
     default_plan: Kv8StagingPlan,
     wide_plan: Option<Kv8StagingPlan>,
     free: usize,
+    kv_capacity: usize,
 ) -> Result<(ChunkCost, Kv8StagingPlan, StageChoice), EngError> {
+    // The floor is computed here, from the KV capacity, so every caller —
+    // production and tests alike — gates the ladder with the same expression;
+    // the floor-admit tests exercise exactly this computation.
+    let min_capacity = fixed_stage_min_rows(kv_capacity);
+    let attempt = |plan: Kv8StagingPlan| {
+        admit_fixed(facts, extras, costs, plan)
+            .and_then(|cost| require_fixed_room(free, &cost, plan).map(|_| cost))
+    };
     if let Some(wide) = wide_plan {
-        let admitted = admit_fixed(facts, extras, costs, wide)
-            .and_then(|cost| require_fixed_room(free, &cost, wide).map(|_| cost));
-        match admitted {
+        match attempt(wide) {
             Ok(cost) => return Ok((cost, wide, StageChoice::Wide)),
             // Every MemoryPlan from the wide attempt falls back to the default
             // stage — budget, live room, or arithmetic overflow alike: a plan
@@ -305,9 +322,119 @@ pub(super) fn admit_fixed_staged(
             Err(other) => return Err(other),
         }
     }
-    let cost = admit_fixed(facts, extras, costs, default_plan)?;
-    require_fixed_room(free, &cost, default_plan)?;
-    Ok((cost, default_plan, StageChoice::Default))
+    match attempt(default_plan) {
+        Ok(cost) => Ok((cost, default_plan, StageChoice::Default)),
+        Err(first) if matches!(first, EngError::MemoryPlan(_)) => {
+            // Overflowing charge sums also arrive as MemoryPlan and are retried
+            // deliberately: a smaller stage can un-overflow the sum, and the floor
+            // bounds the ladder, so the worst case refuses with `first`.
+            let mut plan = default_plan;
+            while let Some(next) = shrink_once(plan, min_capacity) {
+                match attempt(next) {
+                    Ok(cost) => return Ok((cost, next, StageChoice::Default)),
+                    Err(EngError::MemoryPlan(_)) => plan = next,
+                    Err(other) => return Err(other),
+                }
+            }
+            Err(first)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// The architectural stage floor: the segmented-attention split bound for the context,
+/// so every rung the ladder may keep satisfies `capacity.div_ceil(rung) <= CPF_ATTN_MAX_SPLITS`.
+/// Pinned by tests: 262144 -> 2048, 180224 -> 1408.
+pub(super) fn fixed_stage_floor(kv_capacity: usize) -> usize {
+    kv_capacity.div_ceil(crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_MAX_SPLITS)
+}
+
+/// The performance floor: the lowest rung whose cold-prefill TTFT stays within 1.25x
+/// the full stage. Deep rungs re-dequantize the whole prefix per query subtile, so a
+/// silently much slower boot is worse than a clear refusal; rungs below this floor
+/// refuse with the original full-stage text. 8192 is the last rung measured inside
+/// the 1.25x cold-TTFT budget on one 24 GiB card: one cold 131,030-token prefill per
+/// rung at the 180224 profile gave 48.9 s at the wide stage, 58.44 s at 8192 and
+/// 78.67 s at 4096. That establishes the property only at that point (n = 1 per
+/// rung, single prompt depth); at other profiles or prompt depths the sub-floor cost
+/// is unmeasured. The split bound stays the floor for contexts above 1,048,576 rows.
+pub(super) const FIXED_STAGE_PERF_FLOOR_ROWS: usize = 8_192;
+
+/// The admission inputs and stage candidates of one boot, as the gates saw them:
+/// every field feeds one figure of [`ledger_line`].
+pub(super) struct LedgerFigures<'a> {
+    pub(super) budget_post_margin: usize,
+    pub(super) live_free: usize,
+    pub(super) state_allocated: usize,
+    pub(super) decode_arena: usize,
+    pub(super) chunk_rows: usize,
+    /// The cap-row chunk cost's part and arena terms (the cost the gates charge).
+    pub(super) part: usize,
+    pub(super) arena: usize,
+    pub(super) extras: &'a [Extra],
+    pub(super) staging: &'a Kv8StagingPlan,
+    pub(super) wide: Option<&'a Kv8StagingPlan>,
+}
+
+/// The boot ledger line as one string: every charge the admission gates
+/// compute, printed on accepted and refused boots alike, so a refusal can be
+/// closed by subtraction instead of guessed from the outside. `part_charge`
+/// is the charged law itself (`PART_CHARGE.max(part)`); `extras_fixed` sums
+/// the flat extras — Admission::passes additionally adds each extra's
+/// `bytes_per_token * m` via `extras_bytes`, which no flat figure can
+/// capture; the only production extra (the device-prefix-delta, start.rs)
+/// carries `bytes_per_token` 0, so the printed sum is the whole extras
+/// charge today.
+pub(super) fn ledger_line(f: &LedgerFigures) -> String {
+    format!(
+        "q36 cuda: fixed admission ledger: budget_post_margin={} \
+live_free={} live_margin={} state={} decode_arena={} \
+arena={} part_charge={} extras_fixed={} spare_min={} default_staging={} \
+default_rows={} chunk_rows={}{}",
+        f.budget_post_margin,
+        f.live_free,
+        FIXED_ADMISSION_MARGIN,
+        f.state_allocated,
+        f.decode_arena,
+        f.arena,
+        PART_CHARGE.max(f.part),
+        f.extras.iter().map(|extra| extra.fixed).sum::<usize>(),
+        SPARE_MIN,
+        f.staging.bytes,
+        f.staging.capacity,
+        f.chunk_rows,
+        f.wide.map_or(String::new(), |w| {
+            format!(" wide_staging={} wide_rows={}", w.bytes, w.capacity)
+        }),
+    )
+}
+
+/// The boot-line provenance label: a stage below the full default stage came
+/// from the shrink ladder; anything else names the choice that admitted it.
+/// A wide boot (131072 rows over a 32768-row default) is NOT shrunk.
+pub(super) fn stage_label(choice: StageChoice, rows: usize, full_rows: usize) -> &'static str {
+    if rows < full_rows {
+        "shrunk"
+    } else {
+        choice.as_str()
+    }
+}
+
+/// The last rung the ladder may reach for a context: the segmented-attention
+/// split bound composed with the performance floor, whichever is higher.
+pub(super) fn fixed_stage_min_rows(kv_capacity: usize) -> usize {
+    fixed_stage_floor(kv_capacity).max(FIXED_STAGE_PERF_FLOOR_ROWS)
+}
+
+/// Halves the stage while the capacity stays even and the half stays at or
+/// above the floor. Odd stages cannot halve with exact bytes, so they keep the
+/// full-stage refusal; every shipped profile stage is even (asserted in the tests).
+fn shrink_once(plan: Kv8StagingPlan, min_capacity: usize) -> Option<Kv8StagingPlan> {
+    let next = plan.capacity / 2;
+    (next >= min_capacity && next * 2 == plan.capacity).then_some(Kv8StagingPlan {
+        capacity: next,
+        bytes: plan.bytes / 2,
+    })
 }
 
 pub(super) fn require_fixed_room(
@@ -336,7 +463,7 @@ pub(super) fn require_fixed_room(
     Ok(())
 }
 
-/// The pre-arena gate accepts Native layout, `Fp16` or opted-in `Int8G32`, a non-tiered
+/// The pre-arena gate accepts a Native or EXL3 layout, `Fp16` or opted-in `Int8G32`, a non-tiered
 /// session, and no Q6_K MMQ weight. These conditions match the first four `chunk_verdict`
 /// checks. A rejected session needs no arena. `admit_prefill` runs this check before
 /// device queries or arena allocation.
@@ -349,7 +476,7 @@ pub(super) fn needs_arena(
 ) -> bool {
     let supported_kv =
         kv_mode == KvMode::Fp16 || (kv_mode == KvMode::Int8G32 && kv8_chunked_prefill);
-    layout == WeightLayout::Native && supported_kv && !tiered && !mmq_q6k
+    layout != WeightLayout::Tiled && supported_kv && !tiered && !mmq_q6k
 }
 
 /// The two session-build guards of `admit_prefill` as a pure seam (condition 8a): the
@@ -431,6 +558,29 @@ impl PrefillArena {
         budget: usize,
     ) -> Result<Self, EngError> {
         let list = chunk_tensors(dims, m_sess, facts.nsm)?;
+        Self::allocate_list(ctx, stream, list, (m_sess, facts, budget))
+    }
+
+    /// The same for an EXL3 pack: the tensor list of [`exl3_chunk_tensors`], which has no MMQ
+    /// scratch. `facts` keeps the device facts the attention plan reads.
+    pub(super) fn allocate_exl3(
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        dims: &StepDims,
+        m_sess: usize,
+        facts: MmqFacts,
+        budget: usize,
+    ) -> Result<Self, EngError> {
+        let list = exl3_chunk_tensors(dims, m_sess)?;
+        Self::allocate_list(ctx, stream, list, (m_sess, facts, budget))
+    }
+
+    fn allocate_list(
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        list: Vec<(ChunkSlot, ArenaTensor)>,
+        (m_sess, facts, budget): (usize, MmqFacts, usize),
+    ) -> Result<Self, EngError> {
         let tensors: Vec<ArenaTensor> = list.iter().map(|&(_, tensor)| tensor).collect();
         let arena = ctx.arena(&tensors)?;
         #[cfg(test)]

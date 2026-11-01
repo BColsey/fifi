@@ -6,7 +6,7 @@
 //! itself. This test therefore runs the same 8 greedy decode steps twice on the real checkpoint —
 //! once with `QWEN36_G2A_COMPILE` unset (the control) and once with `QWEN36_G2A_COMPILE=1` — and
 //! writes the logits rows `[8, 248320]` as one f32 file per run into `Q36_OUT_DIR`, so the
-//! coordinator compares the two files with `compare_logit_files` (two decoders in one process do
+//! caller compares the two files with `compare_logit_files` (two decoders in one process do
 //! not fit in memory, so each run is its own process). The 922-token tool prompt (the `ids` field
 //! of `IDS_FILE` plus the `suffix_ids` of `REF_JSON`, the same reader as `tool_forward`) is
 //! prefilled through the serving chunk of the shipped config; the 8 steps then run in

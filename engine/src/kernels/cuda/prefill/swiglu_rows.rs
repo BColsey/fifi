@@ -16,14 +16,6 @@
 //! `swiglu_rows: <rule>`; size, alignment and overlap are refused by `require_fit` and
 //! `require_apart` with their own texts.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
-    )
-)]
-
 use std::ffi::c_int;
 
 use crate::EngError;

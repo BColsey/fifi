@@ -20,6 +20,10 @@ const ROOTS: &[&str] = &[
     "web/index.html",
     "web/src",
     "engine",
+    "docs",
+    "qualification",
+    "scripts",
+    ".github",
 ];
 
 /// Directory names that hold build output, installed packages or pinned third-party bytes.
@@ -28,7 +32,7 @@ const SKIPPED_DIRS: &[&str] = &["target", "vendor", "node_modules", "dist", ".te
 /// Text formats whose prose a reader sees.
 const EXTENSIONS: &[&str] = &[
     "rs", "c", "cc", "cpp", "h", "hpp", "cu", "cuh", "m", "mm", "metal", "md", "ts", "js", "html",
-    "css", "py", "sh", "toml", "yaml", "yml",
+    "css", "py", "sh", "toml", "yaml", "yml", "json",
 ];
 
 /// Hyphenated uppercase words that are ordinary public vocabulary.
@@ -65,26 +69,34 @@ const NUMBERED_PHRASES: &[(&str, Follows)] = &[
     ("fix ", is_capital_then_digit),
 ];
 
-/// Phrases that are internal on their own: hosts, tools, rulings, the unpublished planning
-/// directory, and disclaimers about copied code.
+/// Phrases that are internal on their own: hosts, host paths, tools, rulings, the unpublished
+/// planning directory, and disclaimers about copied code.
 const PLAIN_PHRASES: &[&str] = &[
     concat!("kub", "dan"),
     "user decision",
     "user's decision",
     "the baton",
     concat!("ledger", "/"),
+    concat!("/media/", "dan"),
+    concat!("/home/", "dan"),
+    concat!("/users/", "dan"),
+    concat!("fifi/", "scrch"),
+    concat!("fifi/", "ledger"),
+    concat!("fifi/", "knowledge"),
+    concat!("fifi/", "wrktr"),
+    concat!("dan", "lap"),
     "no code copied",
     "no code taken",
     "no other code is copied",
 ];
 
+/// Host names that are too short to match inside other words.
+const HOST_WORDS: &[&str] = &[concat!("pi", "nu")];
+
 #[test]
 fn published_files_carry_no_internal_plan_labels() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut files = Vec::new();
-    for entry in ROOTS {
-        collect(&root.join(entry), &mut files);
-    }
+    let files = published_files(&root);
     let mut findings = Vec::new();
     for file in &files {
         let Ok(text) = fs::read_to_string(file) else {
@@ -95,8 +107,9 @@ fn published_files_carry_no_internal_plan_labels() {
             .unwrap_or(file)
             .display()
             .to_string();
+        let scan = scan_of(&name);
         for (index, line) in text.lines().enumerate() {
-            for label in labels(line) {
+            for label in labels_for(scan, line) {
                 findings.push(format!("{name}:{}: {label}", index + 1));
             }
         }
@@ -109,35 +122,110 @@ fn published_files_carry_no_internal_plan_labels() {
     );
 }
 
-/// Adds every shipped text file under `path` to `files`.
-fn collect(path: &Path, files: &mut Vec<PathBuf>) {
-    if path.is_file() {
+/// The shipped text files under the roots: the files Git tracks, plus new files it does not
+/// ignore. Ignored local files, such as the unpublished planning directories, are not shipped.
+/// Reading the list needs `git` on `PATH`, and the test fails clearly without it.
+fn published_files(root: &Path) -> Vec<PathBuf> {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ])
+        .args(ROOTS)
+        .output()
+        .expect("published_text needs git on PATH to list the shipped files");
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut files = Vec::new();
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Ok(relative) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let path = Path::new(relative);
+        let skipped = path.components().any(|part| {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(|name| SKIPPED_DIRS.contains(&name))
+        });
         // This file lists the phrases it looks for.
-        if has_text_extension(path) && !path.ends_with("tests/published_text.rs") {
-            files.push(path.to_path_buf());
-        }
-        return;
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        let skipped = child.is_dir()
-            && child
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| SKIPPED_DIRS.contains(&name));
-        if !skipped {
-            collect(&child, files);
+        if !skipped && has_text_extension(path) && !path.ends_with("tests/published_text.rs") {
+            files.push(root.join(path));
         }
     }
+    files
 }
 
 fn has_text_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| EXTENSIONS.contains(&extension))
+}
+
+/// What a file is checked for.
+#[derive(Clone, Copy)]
+enum Scan {
+    /// Everything: plan labels, work-item codes, hosts and tools.
+    Prose,
+    /// Decision records, whose numbered decision and addendum references are the content.
+    Records,
+    /// Recorded data, which carries its own codes; only host details are rejected.
+    Data,
+}
+
+fn scan_of(name: &str) -> Scan {
+    if name.starts_with("docs/decisions/") {
+        Scan::Records
+    } else if name.ends_with(".json") {
+        Scan::Data
+    } else {
+        Scan::Prose
+    }
+}
+
+fn labels_for(scan: Scan, line: &str) -> Vec<String> {
+    match scan {
+        Scan::Prose => labels(line),
+        Scan::Data => host_labels(line),
+        Scan::Records => labels(line)
+            .into_iter()
+            .filter(|label| !label.starts_with("decision ") && !label.starts_with("addendum "))
+            .collect(),
+    }
+}
+
+/// The host paths, host names and internal tools named on one line.
+fn host_labels(line: &str) -> Vec<String> {
+    // JSON escapes a slash as `\/`, and Windows paths use `\`; read both as `/`.
+    let lower = line
+        .to_ascii_lowercase()
+        .replace("\\/", "/")
+        .replace('\\', "/");
+    let mut found = Vec::new();
+    for phrase in PLAIN_PHRASES {
+        if lower.contains(phrase) {
+            found.push((*phrase).to_string());
+        }
+    }
+    for host in HOST_WORDS {
+        for (start, _) in lower.match_indices(host) {
+            if word_starts_at(&lower, start) && word_ends_at(&lower, start + host.len()) {
+                found.push((*host).to_string());
+            }
+        }
+    }
+    found
 }
 
 /// The internal labels of one line.
@@ -152,11 +240,7 @@ fn labels(line: &str) -> Vec<String> {
             }
         }
     }
-    for phrase in PLAIN_PHRASES {
-        if lower.contains(phrase) {
-            found.push((*phrase).to_string());
-        }
-    }
+    found.extend(host_labels(line));
     let words = line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'));
     for word in words.map(|word| word.trim_matches('-')) {
         if is_tag(word) && !ALLOWED_TAGS.contains(&word) {
@@ -215,6 +299,13 @@ fn word_starts_at(text: &str, index: usize) -> bool {
         .is_none_or(|c| !c.is_ascii_alphanumeric())
 }
 
+fn word_ends_at(text: &str, index: usize) -> bool {
+    text[index..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
+}
+
 fn first_word(text: &str) -> &str {
     let end = text
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
@@ -270,10 +361,52 @@ fn the_label_rules_match_codes_and_skip_ordinary_words() {
         labels(concat!("see ledger", "/plans")),
         [concat!("ledger", "/")]
     );
+    assert_eq!(
+        labels(concat!("weights in /home/", "dan/models")),
+        [concat!("/home/", "dan")]
+    );
+    assert_eq!(
+        labels(concat!("built on pi", "nu today")),
+        [concat!("pi", "nu")]
+    );
+    assert!(labels(concat!("a s", "pin", "up of the pool")).is_empty());
+    let record = concat!("see decision ", "0035 and the pi", "nu host");
+    assert_eq!(labels_for(Scan::Records, record), [concat!("pi", "nu")]);
+    assert!(labels_for(Scan::Data, concat!("task P0A", "-01")).is_empty());
+    let escaped = concat!(r#"{"path": "\/home\/"#, r#"dan\/x"}"#);
+    assert_eq!(labels_for(Scan::Data, escaped), [concat!("/home/", "dan")]);
+    assert_eq!(
+        labels_for(Scan::Data, concat!(r"C:\Users\", r"dan\x")),
+        [concat!("/users/", "dan")]
+    );
     assert_eq!(labels("ideas only, no code copied"), ["no code copied"]);
     assert!(labels("UTF-8 text, SHA-256 pins, Qwen3.6-35B-A3B, x-api-key").is_empty());
     assert!(
         labels("a decision tree, the lane width, Content-Type, sm_86, a fix for it").is_empty()
     );
     assert!(labels(concat!("PER-LAYER growth over C", "-1 rows")).is_empty());
+}
+
+#[test]
+fn ignored_local_files_are_not_published_files() {
+    let repo = tempfile::tempdir().expect("temporary repository");
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    fs::write(root.join(".gitignore"), "/docs/\n").unwrap();
+    fs::create_dir(root.join("docs")).unwrap();
+    fs::write(root.join("docs/local.md"), "ignored").unwrap();
+    fs::write(root.join("README.md"), "shipped").unwrap();
+    let names: Vec<String> = published_files(root)
+        .iter()
+        .map(|file| file.strip_prefix(root).unwrap().display().to_string())
+        .collect();
+    assert_eq!(names, ["README.md"]);
 }

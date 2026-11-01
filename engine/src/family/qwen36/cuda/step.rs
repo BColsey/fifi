@@ -34,6 +34,7 @@
 
 use super::{
     dims::{KvMode, StepOptions},
+    exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
     layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_geometry::MixerGeometry,
@@ -43,11 +44,12 @@ use super::{
         tiered::TieredScratch,
     },
     prefill_driver::{
-        AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, PrefillArena,
-        PrefillBudget, admit_fixed_staged, admit_guard, admit_with_staging, fixed_chunk_rows,
-        fixed_staging_rows, needs_arena, wide_stage_candidate,
+        AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
+        PrefillArena, PrefillBudget, admit_fixed_staged, admit_guard, admit_with_staging,
+        fixed_chunk_rows, fixed_staging_rows, ledger_line, needs_arena, stage_label,
+        wide_stage_candidate,
     },
-    prefill_plan::{chunk_costs, state_bytes},
+    prefill_plan::{chunk_costs, exl3_chunk_costs, state_bytes},
     prefix::{CudaPrefillPath, CudaSavedPrefix, PendingPrefix},
     readback::{
         ReadbackPlan, SHORTLIST_VAR, SYNC_EACH_VAR, captured_report, check_mode,
@@ -72,10 +74,14 @@ use super::{
 };
 use crate::{
     EngError,
-    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout},
+    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
     family::qwen36::settings::DEFAULT_CUDA_PREFILL_CHUNK,
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::session::PrefixSlot,
+    family::speculate::{
+        config::{DraftMode, SpecConfig},
+        driver::{RepeatDrafter, Speculator},
+    },
     family::{AttentionKind, gguf_model::Role, sampler::Sampler},
     kernels::cuda::{
         CapturePlan, CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
@@ -84,9 +90,10 @@ use crate::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
             embed::{EmbedCall, EmbedNativeCall},
+            embed_bf16::EmbedBf16Call,
             matvec_q::{MatvecCall, QuantType},
             shortlist::{self, ShortlistCall},
-            step_params::{ArgmaxCall, ResultPair, StepParams, StepStatus},
+            step_params::{ArgmaxCall, ResultPair, STATUS_EXL3_ARITHMETIC, StepParams, StepStatus},
         },
     },
 };
@@ -290,6 +297,34 @@ pub(super) fn tiered_capture_refusal(tiered_mode: bool, capture: bool) -> Result
     Ok(())
 }
 
+/// The id-indexed launch holds 16 pairs (gate and up of every pick), so a captured EXL3 step
+/// supports at most 8 picks per token.
+pub(super) fn exl3_device_pick_refusal(
+    layout: WeightLayout,
+    capture: bool,
+    top_k: usize,
+) -> Result<(), EngError> {
+    if layout == WeightLayout::Exl3 && capture && 2 * top_k > 16 {
+        return Err(EngError::BadRequest(format!(
+            "step: a captured EXL3 step reads at most 8 picks per token on the device, got {top_k}"
+        )));
+    }
+    Ok(())
+}
+
+/// The error of a token whose EXL3 projections flagged a nonfinite value or an invalid input.
+pub(super) fn exl3_flag_error() -> EngError {
+    EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
+}
+
+/// The refusal of a result pair whose status carries the EXL3 arithmetic verdict (mask 16). It is
+/// taken before `decide` sees the pair, so a flagged EXL3 token never commits, whatever other
+/// bits the status holds. Only an EXL3 step folds the flag into the status.
+pub(super) fn exl3_pair_refusal(layout: WeightLayout, pair: ResultPair) -> Option<EngError> {
+    (layout == WeightLayout::Exl3 && pair.status.0 & STATUS_EXL3_ARITHMETIC != 0)
+        .then(exl3_flag_error)
+}
+
 /// The environment value of `INFERENCE_CUDA_SYNC_EACH`, `None` when unset.
 fn sync_each_from_env() -> Result<bool, EngError> {
     match std::env::var(SYNC_EACH_VAR) {
@@ -320,6 +355,9 @@ pub(crate) struct QwenResidentStep<'a> {
     res: &'a StepResources,
     mixers: Mixers<'a>,
     moe: Vec<MoeLayerWeights<'a>>,
+    /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
+    /// read; `moe` is empty then.
+    exl3_moe: Vec<Exl3MoeWeights<'a>>,
     /// The tiered mode: the options asked for it. The routed expert stacks are then not loaded,
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
     /// token syncs with the host: about 0.8 ms per token over the plain step when every expert is
@@ -356,6 +394,9 @@ pub(crate) struct QwenResidentStep<'a> {
     warmed: bool,
     /// The capture setting of `set_capture_config` (default false).
     capture_on: bool,
+    /// An EXL3 step reads the router's picks on the device (no host read in the MoE block); set
+    /// with the capture config, which needs a body that makes no host read.
+    exl3_device_ids: bool,
     /// The sticky refusal flag: set only by a refused capture, never cleared -- `reset_state`
     /// and `import_state` are `ResidentState` methods and cannot touch it.
     refused: bool,
@@ -370,6 +411,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// later change wires the config member `qwen36.prefill_chunk` into it.
     m_sess_cap: u32,
     kv8_chunked_prefill: bool,
+    /// The window that has run and awaits its verdict (see `eager_window`).
+    pub(super) window: Option<super::eager_window::EagerWindow>,
+    /// The speculative decode step, when the settings asked for one.
+    pub(super) speculator: Option<Speculator<RepeatDrafter>>,
     #[cfg(test)]
     chunk_kernel_class: super::prefill::ChunkKernelClass,
     /// The bytes of the last logits row read back (little-endian f32).
@@ -432,12 +477,12 @@ pub(super) struct ChunkFacts {
     pub(super) arena: Option<usize>,
 }
 
-/// The chunk gate itself, in this order: Native first, then Fp16 KV, then the tier flag, then the
-/// Q6_K scan, then the admitted arena. The first refusal wins, so a session that fails more than
+/// The chunk gate itself, in this order: a Native or EXL3 layout first, then Fp16 KV, then the
+/// tier flag, then the Q6_K scan, then the admitted arena. The first refusal wins, so a session that fails more than
 /// one condition reports the earliest one; `NoArena` is checked after the Q6_K scan, and the accept
 /// verdict carries the ADMITTED size.
 pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
-    if facts.layout != WeightLayout::Native {
+    if facts.layout == WeightLayout::Tiled {
         return ChunkVerdict::TiledLayout;
     }
     if facts.kv_mode == KvMode::Int8G32 && !facts.kv8_chunked_prefill {
@@ -547,6 +592,10 @@ impl<'a> QwenResidentStep<'a> {
             ));
         }
         let sync_each = sync_each_from_env()?;
+        if options.layout == WeightLayout::Exl3 {
+            // A bad FIFI_EXL3_SINGLE_GATHER stops the start, not the first token.
+            context.check_single_gather()?;
+        }
         let stream = context.stream()?;
         let state = match &res.paged {
             Some(paged) => ResidentState::allocate_from_plan(context, &stream, &paged.state)?,
@@ -577,12 +626,23 @@ impl<'a> QwenResidentStep<'a> {
         };
         let specs = MoeSpecs::new(&res.dims)?;
         let tiered_mode = options.tiered.is_some();
+        let exl3_moe = if options.layout == WeightLayout::Exl3 {
+            let dims = moe_dims(&res.dims);
+            layers
+                .iter()
+                .map(|&layer| Exl3MoeWeights::resolve(weights, &res.table, layer, &dims))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let (moe, tiered_parts) = if tiered_mode {
             let parts = layers
                 .iter()
                 .map(|&layer| moe_layer_parts(&res.table, weights, &specs, layer, options.layout))
                 .collect::<Result<Vec<_>, _>>()?;
             (Vec::new(), Some(parts))
+        } else if options.layout == WeightLayout::Exl3 {
+            (Vec::new(), None)
         } else {
             let moe = layers
                 .iter()
@@ -610,6 +670,7 @@ impl<'a> QwenResidentStep<'a> {
             res,
             mixers: Mixers::new(context, parts)?,
             moe,
+            exl3_moe,
             tiered_mode,
             tiered_parts,
             tiered: None,
@@ -633,12 +694,15 @@ impl<'a> QwenResidentStep<'a> {
             started: false,
             warmed: false,
             capture_on: false,
+            exl3_device_ids: false,
             refused: false,
             marks: None,
             rules,
             widths,
             chunk_q6k,
             kv8_chunked_prefill: false,
+            window: None,
+            speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             shortlist_on: device_shortlist_enabled(std::env::var(SHORTLIST_VAR).ok().as_deref()),
@@ -670,13 +734,39 @@ impl<'a> QwenResidentStep<'a> {
                 "step: the capture mode is fixed once the session runs".to_owned(),
             ));
         }
+        exl3_device_pick_refusal(self.layout, config.capture, self.moe_dims.top_k)?;
         self.capture_on = config.capture;
+        // A captured body cannot wait for the host inside a layer: the EXL3 MoE blocks read the
+        // picks from device memory then.
+        self.exl3_device_ids = config.capture && self.layout == WeightLayout::Exl3;
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
             Some(SectionMarks::new(self.context, &self.res.dims.shape.kinds)?)
         } else {
             None
+        };
+        Ok(())
+    }
+
+    /// Arms the speculative decode step the settings ask for. Call it before the first token. The
+    /// n-gram mode drafts from the committed tokens; the MTP mode has no draft step yet and is
+    /// refused.
+    pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<(), EngError> {
+        self.speculator = match config.mode {
+            DraftMode::Disabled => None,
+            DraftMode::Ngram => Some(Speculator::new(
+                RepeatDrafter::new(
+                    (config.ngram_match_min, config.hybrid_tokens),
+                    (config.window_drafts(), config.hybrid_drafts()),
+                ),
+                config.max_rows - 1,
+            )),
+            DraftMode::Mtp => {
+                return Err(EngError::BadRequest(
+                    "draft_mode mtp has no draft step yet".to_owned(),
+                ));
+            }
         };
         Ok(())
     }
@@ -768,7 +858,11 @@ impl<'a> QwenResidentStep<'a> {
             admit.cap = fixed_chunk_rows(layout.kv.capacity, admit.cap);
         }
         let facts = self.context.mmq_device_facts()?;
-        let costs = chunk_costs(&self.res.dims, facts.nsm)?;
+        let costs = if self.layout == WeightLayout::Exl3 {
+            exl3_chunk_costs(&self.res.dims, facts.nsm)?
+        } else {
+            chunk_costs(&self.res.dims, facts.nsm)?
+        };
         let staging = if kv8 {
             let a = &self.res.geometry.attn;
             Some(if fixed {
@@ -813,19 +907,60 @@ impl<'a> QwenResidentStep<'a> {
             // One live snapshot gates BOTH candidates inside the selection, so a wide
             // plan can never refuse a boot the default stage would have kept.
             let free = self.context.memory_info()?.free;
-            let (cost, plan, choice) =
-                admit_fixed_staged(&admit, &budget.extras, &costs, plan, wide, free)?;
+            // Boot ledger: the first attempt's exact admission inputs, so a
+            // refusal can be closed by subtraction (which charge grew) instead
+            // of guessed from the outside.
+            let ledger_cost = costs.iter().find(|cost| cost.m == admit.cap);
+            // Every figure the admission gates actually charge: the part term is
+            // the max of the flat charge and the chunk's own, the budget is the
+            // post-margin device free, and the staging figures are named per
+            // candidate. The spare minimum is the last owed charge.
+            eprintln!(
+                "{}",
+                ledger_line(&LedgerFigures {
+                    budget_post_margin: budget.device_free,
+                    live_free: free,
+                    state_allocated: admit.state_allocated,
+                    decode_arena: admit.decode_arena,
+                    chunk_rows: admit.cap,
+                    part: ledger_cost.map_or(0, |cost| cost.part),
+                    arena: ledger_cost.map_or(0, |cost| cost.arena),
+                    extras: &budget.extras,
+                    staging: &plan,
+                    wide: wide.as_ref(),
+                })
+            );
+            let full_capacity = plan.capacity;
+            let (cost, plan, choice) = admit_fixed_staged(
+                &admit,
+                &budget.extras,
+                &costs,
+                plan,
+                wide,
+                free,
+                layout.kv.capacity,
+            )?;
+            // A tight live snapshot degrades the stage rung by rung instead of
+            // refusing the boot. Above 131,072 rows the ladder adds up to 48 MiB
+            // (64 MiB stage -> 16 MiB floor) of headroom over the 32,768-row default
+            // stage, plus 192 MiB when a wide stage was offered and refused; at or
+            // below 131,072 rows it runs from the full-context stage down to the
+            // floor instead. A snapshot too tight for every rung down to the floor
+            // still refuses, with the original full-stage error.
+            if plan.capacity < full_capacity {
+                eprintln!(
+                    "q36 cuda: fixed admission refused at {full_capacity} stage rows, shrank stage to {} stage rows",
+                    plan.capacity
+                );
+            }
             super::prefill::kv8_segment_query_rows(
                 super::prefill::chunk_attn_geometry(&self.res.geometry, cost.m),
                 layout.kv.capacity.div_ceil(plan.capacity),
             )?;
+            let label = stage_label(choice, plan.capacity, full_capacity);
             eprintln!(
                 "q36 cuda: fixed KV8 admission, {} rows, {} stage rows ({}), {} B margin, {} B live free; segmented attention enabled",
-                cost.m,
-                plan.capacity,
-                choice.as_str(),
-                FIXED_ADMISSION_MARGIN,
-                free
+                cost.m, plan.capacity, label, FIXED_ADMISSION_MARGIN, free
             );
             (Some(cost.m), Some(plan))
         } else {
@@ -837,7 +972,12 @@ impl<'a> QwenResidentStep<'a> {
             }
             return Ok(self.chunk_ready());
         };
-        let mut arena = PrefillArena::allocate(
+        let allocate = if self.layout == WeightLayout::Exl3 {
+            PrefillArena::allocate_exl3
+        } else {
+            PrefillArena::allocate
+        };
+        let mut arena = allocate(
             self.context,
             &self.stream,
             &self.res.dims,
@@ -1025,6 +1165,7 @@ impl<'a> QwenResidentStep<'a> {
             prefill,
             mixers,
             moe,
+            exl3_moe,
             globals,
             context,
             stream,
@@ -1042,11 +1183,16 @@ impl<'a> QwenResidentStep<'a> {
         let m = rows.len();
         let chunk_rows = ChunkRows::new(p0, m, state.layout().kv.capacity, arena.m_sess())?;
         let ids = chunk_ids(rows, widths.verdict)?;
-        let embed = match globals.embed {
-            super::resources::GlobalWeight::Native(weight) => weight,
-            super::resources::GlobalWeight::Tiled(_) => {
+        let weights = match globals.embed {
+            super::resources::GlobalWeight::Native(embed) => {
+                ChunkWeights::new(mixers.weights(), moe, embed)
+            }
+            super::resources::GlobalWeight::Bf16(table) => {
+                ChunkWeights::exl3(mixers.weights(), exl3_moe, table)
+            }
+            super::resources::GlobalWeight::Tiled(_) | super::resources::GlobalWeight::Exl3(_) => {
                 return Err(EngError::BadRequest(
-                    "prefill chunk: the embedding is not native".to_owned(),
+                    "prefill chunk: the embedding is neither native nor an EXL3 table".to_owned(),
                 ));
             }
         };
@@ -1061,12 +1207,7 @@ impl<'a> QwenResidentStep<'a> {
             arena.m_sess(),
         )?
         .with_kv8_staging(arena.kv8_staging()?);
-        let model = ChunkModel::new(
-            &res.table,
-            &res.geometry,
-            &res.dims,
-            ChunkWeights::new(mixers.weights(), moe, embed),
-        )?;
+        let model = ChunkModel::new(&res.table, &res.geometry, &res.dims, weights)?;
         // 3. From here every error poisons.
         *started = true;
         let opened = std::time::Instant::now();
@@ -1162,6 +1303,7 @@ impl<'a> QwenResidentStep<'a> {
     /// write that failed in the middle of the reset leaves it `Poisoned`.
     pub(crate) fn reset_state(&mut self) -> Result<(), EngError> {
         self.complete_prefix_save()?;
+        self.window = None;
         self.state.reset(&self.stream)?;
         if let Some(pool) = self.prefix_pins.as_mut() {
             pool.invalidate()?;
@@ -1195,21 +1337,65 @@ impl<'a> QwenResidentStep<'a> {
         res.arena.tensor(index)
     }
 
+    /// The routing ranges of the MoE block of the layers whose residual input is buffer `parity`
+    /// (0 is `ResidA`, 1 is `ResidB`).
+    fn route_bufs(&self, parity: usize) -> Result<RouteBufs<'_>, EngError> {
+        let view = |slot| self.view(slot);
+        Ok(RouteBufs {
+            resid_in: view(resid_in(parity))?,
+            resid_out: view(resid_out(parity))?,
+            norm_row: view(Slot::NormRow)?,
+            logits: view(Slot::RouterLogits)?,
+            ids: view(Slot::TopkId)?,
+            weights: view(Slot::TopkWeight)?,
+            shared_gate: view(Slot::SharedGate)?,
+            status: self.state.step_status()?,
+        })
+    }
+
+    /// The ranges of the EXL3 MoE block of the layers whose residual input is buffer `parity`.
+    fn exl3_moe_buffers(&self, parity: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
+        Ok(Exl3MoeBufs {
+            route: self.route_bufs(parity)?,
+            expert_gu: self.view(Slot::ExpertGu)?,
+            expert_act: self.view(Slot::ExpertAct)?,
+            expert_down: self.view(Slot::ExpertDown)?,
+            shared_gu: self.view(Slot::SharedGu)?,
+            shared_act: self.view(Slot::SharedAct)?,
+            shared_out: self.view(Slot::SharedOut)?,
+            scratch: self.exl3_scratch()?,
+        })
+    }
+
+    /// The scratch of the EXL3 projections: rotated inputs, partials and the arithmetic flag.
+    fn exl3_scratch(&self) -> Result<Scratch<'_>, EngError> {
+        Ok(Scratch {
+            xh: self.view(Slot::Exl3Xh)?,
+            z: self.view(Slot::Exl3Z)?,
+            flag: self.view(Slot::Exl3Flag)?,
+        })
+    }
+
+    /// Queues the clearing of the sticky arithmetic flag of the EXL3 projections, right after
+    /// `step_begin`.
+    fn clear_exl3_flag(&self) -> Result<(), EngError> {
+        self.context
+            .exl3_flag_clear(&self.stream, self.view(Slot::Exl3Flag)?)
+    }
+
+    /// Queues the fold of the flag into the status word, after the last EXL3 projection and
+    /// before `argmax`, so the result pair carries the verdict (mask 16).
+    fn fold_exl3_flag(&self, params: DeviceRange<'_>) -> Result<(), EngError> {
+        self.context
+            .exl3_flag_fold(&self.stream, params, self.view(Slot::Exl3Flag)?)
+    }
+
     /// The buffers of the MoE block of the layers whose residual input is buffer `parity` (0 is
     /// `ResidA`, 1 is `ResidB`).
     fn moe_buffers(&self, parity: usize) -> Result<MoeBuffers<'_>, EngError> {
         let view = |slot| self.view(slot);
         Ok(MoeBuffers {
-            route: RouteBufs {
-                resid_in: view(resid_in(parity))?,
-                resid_out: view(resid_out(parity))?,
-                norm_row: view(Slot::NormRow)?,
-                logits: view(Slot::RouterLogits)?,
-                ids: view(Slot::TopkId)?,
-                weights: view(Slot::TopkWeight)?,
-                shared_gate: view(Slot::SharedGate)?,
-                status: self.state.step_status()?,
-            },
+            route: self.route_bufs(parity)?,
             expert: ExpertBufs {
                 // The packs follow the plan: the fp16 packs of the Tiled plan or the padded
                 // q8_1 packs of the Native plan.
@@ -1328,6 +1514,10 @@ impl<'a> QwenResidentStep<'a> {
             Err(error) => return Err(self.fail(entered, error)),
         };
         let pair = self.read_back(&plan).inspect_err(|_| self.state.poison())?;
+        if let Some(error) = exl3_pair_refusal(self.layout, pair) {
+            self.state.poison();
+            return Err(error);
+        }
         if let Some(marks) = self.marks.as_mut() {
             marks.readable = true;
         }
@@ -1464,7 +1654,12 @@ impl<'a> QwenResidentStep<'a> {
         entered: &mut usize,
         trace_step: Option<u32>,
     ) -> Result<(), EngError> {
-        let bufs = [self.moe_buffers(0)?, self.moe_buffers(1)?];
+        // An EXL3 plan has no packs: its MoE blocks build their own ranges.
+        let bufs = if self.layout == WeightLayout::Exl3 {
+            None
+        } else {
+            Some([self.moe_buffers(0)?, self.moe_buffers(1)?])
+        };
         let params = self.state.word(Word::StepParams)?;
         for op in token_ops(self.res.table.len()) {
             *entered += 1;
@@ -1474,7 +1669,7 @@ impl<'a> QwenResidentStep<'a> {
             if let Some(marks) = &self.marks {
                 marks.record_before(op, &self.stream)?;
             }
-            self.run_op(op, admit_pos, &bufs, params, trace_step)?;
+            self.run_op(op, admit_pos, bufs.as_ref(), params, trace_step)?;
             if let Some(marks) = &self.marks {
                 marks.record_after(op, &self.stream)?;
             }
@@ -1547,7 +1742,18 @@ impl<'a> QwenResidentStep<'a> {
         step: u32,
         layer: usize,
     ) -> Result<(), EngError> {
-        let row = super::trace::f32_range(launch, &bufs.route.resid_in)?;
+        self.trace_row(launch, &bufs.route.resid_in, step, layer)
+    }
+
+    /// The trace dump of one residual row `resid`.
+    fn trace_row(
+        &self,
+        launch: &Launch<'_>,
+        resid: &DeviceRange<'_>,
+        step: u32,
+        layer: usize,
+    ) -> Result<(), EngError> {
+        let row = super::trace::f32_range(launch, resid)?;
         crate::family::qwen36::trace::write_step_row(step, layer, &row)
     }
 
@@ -1555,13 +1761,24 @@ impl<'a> QwenResidentStep<'a> {
         &self,
         op: StepOp,
         admit_pos: usize,
-        bufs: &[MoeBuffers<'_>; 2],
+        bufs: Option<&[MoeBuffers<'_>; 2]>,
         params: DeviceRange<'_>,
         trace_step: Option<u32>,
     ) -> Result<(), EngError> {
         let (ctx, s) = (self.context, &self.stream);
+        let packs = || {
+            bufs.ok_or_else(|| {
+                EngError::BadRequest("step: the EXL3 plan holds no pack buffers".to_owned())
+            })
+        };
         match op {
-            StepOp::Begin => ctx.step_begin(s, params),
+            StepOp::Begin => {
+                ctx.step_begin(s, params)?;
+                if self.layout == WeightLayout::Exl3 {
+                    self.clear_exl3_flag()?;
+                }
+                Ok(())
+            }
             StepOp::Embed => {
                 let ids = self.state.step_field(StepField::TokenId)?;
                 let x = self.view(resid_in(0))?;
@@ -1588,6 +1805,22 @@ impl<'a> QwenResidentStep<'a> {
                             m: STEP_ROWS,
                         },
                     ),
+                    // The table of an EXL3 pack, as stored.
+                    EmbedWeight::Bf16(table) => ctx.embed_bf16(
+                        s,
+                        EmbedBf16Call {
+                            table: table.range(0, table.bytes())?,
+                            ids,
+                            x,
+                            status,
+                            m: STEP_ROWS,
+                            n_rows: self.res.dims.shape.vocab,
+                            k: self.res.geometry.hidden,
+                        },
+                    ),
+                    EmbedWeight::Exl3(_) => Err(EngError::Checkpoint(
+                        "step weights: an EXL3 matrix is not an embedding table".to_owned(),
+                    )),
                 }
             }
             StepOp::Mixer(layer) => {
@@ -1597,31 +1830,53 @@ impl<'a> QwenResidentStep<'a> {
                 };
                 self.mixers.run_block(s, &self.state, layer, io)
             }
+            StepOp::Moe(layer) if self.layout == WeightLayout::Exl3 => {
+                let weights = self.exl3_moe.get(layer).ok_or_else(|| {
+                    EngError::BadRequest(format!("step: layer {layer} has no EXL3 MoE weights"))
+                })?;
+                let launch = Launch { ctx, stream: s };
+                let bufs = self.exl3_moe_buffers(layer % 2)?;
+                if let Some(step) = trace_step {
+                    self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
+                }
+                run_exl3_moe(
+                    &launch,
+                    weights,
+                    &bufs,
+                    &self.moe_dims,
+                    self.exl3_device_ids,
+                )
+            }
             StepOp::Moe(layer) if self.tiered_mode => {
                 let runtime = self.tiered.as_ref().ok_or_else(|| {
                     EngError::BadRequest("step: the tiered runtime is not attached".to_owned())
                 })?;
                 let launch = Launch { ctx, stream: s };
+                let bufs = &packs()?[layer % 2];
                 if let Some(step) = trace_step {
-                    self.trace_moe_row(&launch, &bufs[layer % 2], step, layer)?;
+                    self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
                 runtime
                     .borrow_mut()
-                    .run_layer(&launch, layer, &bufs[layer % 2], &self.moe_dims)
+                    .run_layer(&launch, layer, bufs, &self.moe_dims)
             }
             StepOp::Moe(layer) => {
                 let weights = self.moe.get(layer).ok_or_else(|| {
                     EngError::BadRequest(format!("step: layer {layer} has no MoE weights"))
                 })?;
                 let launch = Launch { ctx, stream: s };
+                let bufs = &packs()?[layer % 2];
                 if let Some(step) = trace_step {
-                    self.trace_moe_row(&launch, &bufs[layer % 2], step, layer)?;
+                    self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
-                run_moe_block(&launch, weights, &bufs[layer % 2], &self.moe_dims)
+                run_moe_block(&launch, weights, bufs, &self.moe_dims)
             }
             StepOp::FinalNorm => self.final_norm(),
             StepOp::LmHead => self.lm_head(),
             StepOp::Argmax => {
+                if self.layout == WeightLayout::Exl3 {
+                    self.fold_exl3_flag(params)?;
+                }
                 // The logits row of a traced step feeds the top-2 margin check (the near-tie
                 // question of the chunk-split diagnostic); `read_at` orders on the stream.
                 if let Some(step) = trace_step {
@@ -1650,9 +1905,20 @@ impl<'a> QwenResidentStep<'a> {
         let h = self.view(final_resid(layers))?;
         let weight = norm.range(0, norm.bytes())?;
         match self.layout {
-            WeightLayout::Exl3 => Err(EngError::BadRequest(
-                "EXL3 serving head is not admitted".into(),
-            )),
+            // The pack is discarded; the EXL3 head reads the F32 row beside it.
+            WeightLayout::Exl3 => self.context.add_norm_pack(
+                &self.stream,
+                AddNormCall {
+                    m: STEP_ROWS,
+                    n: self.res.geometry.hidden,
+                    eps: self.res.geometry.eps,
+                    h,
+                    delta: None,
+                    weight,
+                    xf: self.view(Slot::XfFinal)?,
+                    norm_out: Some(self.view(Slot::FinalNormRow)?),
+                },
+            ),
             WeightLayout::Tiled => self.context.add_norm_pack(
                 &self.stream,
                 AddNormCall {
@@ -1690,6 +1956,20 @@ impl<'a> QwenResidentStep<'a> {
         // The pack slot is resolved INSIDE each arm: the Native plan holds no XfFinal slot, so a
         // lookup before the match refused every native run.
         let y = self.view(Slot::Logits)?;
+        if let HeadWeight::Exl3(head) = self.globals.head {
+            let io = Exl3Io {
+                x: self.view(Slot::FinalNormRow)?,
+                xh: self.view(Slot::Exl3Xh)?,
+                z: self.view(Slot::Exl3Z)?,
+                out: y,
+                flag: self.view(Slot::Exl3Flag)?,
+                rows: STEP_ROWS,
+                fused: false,
+            };
+            return self
+                .context
+                .exl3_linear(&self.stream, head.view()?.linear_call(&io));
+        }
         match self.globals.head {
             HeadWeight::Tiled(head) => self.context.matmul(
                 &self.stream,
@@ -1719,6 +1999,9 @@ impl<'a> QwenResidentStep<'a> {
                     },
                 )
             }
+            HeadWeight::Bf16(_) | HeadWeight::Exl3(_) => Err(EngError::Checkpoint(
+                "step weights: the head of this load is not a quantized matrix".to_owned(),
+            )),
         }
     }
 
