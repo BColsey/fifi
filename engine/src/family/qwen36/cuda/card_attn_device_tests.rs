@@ -81,9 +81,10 @@ fn column_value(global_col: usize) -> f32 {
     0.25 + ((global_col * 7 + 3) % 997) as f32 / 64.0
 }
 
-/// Upload on the stream that consumes the buffer: `upload` lands on the
-/// context's default stream, which is NOT ordered against the side stream
-/// the kernels of this rig run on.
+/// Upload with the copy queued on `stream` (ordered behind its work, then
+/// waited on). The audit in NOW.md showed `upload` would also be safe — it
+/// ends in a device-wide synchronize — this just keeps every phase of the
+/// rig on one stream by construction.
 fn upload_on(
     context: &CudaContext,
     stream: &DeviceStream,
