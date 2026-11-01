@@ -53,6 +53,7 @@ mod moe;
 mod mtp_load;
 #[cfg(test)]
 mod mtp_load_device_tests;
+mod multi;
 #[cfg(test)]
 mod native_device_rig;
 #[cfg(test)]

@@ -786,10 +786,14 @@ fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
     })?;
     enable_peer_access(&settings.cuda_devices)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+    let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    for card in 0..settings.cuda_devices.len() {
+        super::shard::shard_loads(&table, &inventory, card)?;
+    }
     let first = &facts[0];
     eprintln!(
-        "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full, shard table admitted",
+        "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full, shard table and per-device load plans admitted",
         settings.cuda_devices, first.cc_major, first.cc_minor
     );
     Err(EngError::BadRequest(format!(

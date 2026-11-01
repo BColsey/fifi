@@ -50,6 +50,11 @@ const VALUE_BYTES: usize = 4;
 /// the status word says so instead of hanging the device.
 pub(crate) const TIMEOUT_CYCLES: u64 = 1_700_000_000;
 
+/// The status bit a wait sets when a peer never published.
+pub(crate) const STATUS_TIMEOUT: u32 = native::peer_ring::STATUS_TIMEOUT;
+/// The status bit a wait sets when a received fp16 payload overflowed.
+pub(crate) const STATUS_OVERFLOW: u32 = native::peer_ring::STATUS_OVERFLOW;
+
 fn bad(message: String) -> EngError {
     EngError::BadRequest(format!("peer ring: {message}"))
 }

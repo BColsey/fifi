@@ -293,13 +293,6 @@ fn as_u64(range: Range<usize>) -> Range<u64> {
 /// cut inside every plane. The union of all cards' slices of a tensor is
 /// the tensor, and the 1-card plan is `Whole` everywhere except the
 /// embedding, which its one card owns either way.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the two-device start, which loads one plan per device"
-    )
-)]
 pub(crate) fn shard_loads(
     table: &ShardTable,
     inventory: &Inventory,
