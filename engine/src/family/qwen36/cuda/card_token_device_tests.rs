@@ -64,6 +64,13 @@ const Q4K_VALUES: usize = 256;
 /// The split-sum envelope: the per-card partial matvecs differ from the
 /// fused one by reduction order only.
 const SPLIT_SUM_RELATIVE: f32 = 1e-3;
+
+/// The DeltaNet state gate. A value that crosses one q8 bin boundary of
+/// the normalized input row (~0.8% of the row's range) shifts its whole
+/// head block, so the recurrent and conv state carry a few per-mille of
+/// relative drift once the chain feeds residual envelope drift back in.
+/// Bit equality at identical inputs is the block rig's own gate.
+const STATE_ENVELOPE_RELATIVE: f32 = 5e-3;
 const TOKENS: usize = 3;
 /// The seed token of the greedy chain.
 const FIRST_TOKEN: u32 = 7;
@@ -78,6 +85,69 @@ fn options() -> StepOptions {
         forked_experts: false,
         tiered: None,
         layout: WeightLayout::Native,
+    }
+}
+
+/// The real 40-layer model spec with ONE memory-bound reduction: 32
+/// experts instead of 256. The full 256-expert stacks are ~18 GB of Q4_K
+/// per side - ~36 GB for the reference plus the two card shards on one
+/// 3090; 32 experts keep the per-expert-distinct-weights structure at
+/// ~4.5 GB. Everything else is the shipped shape: 40 layers, the real
+/// kinds pattern, hidden 2048, inter 512, top_k 8, vocab 152064.
+fn real_layer_spec() -> FamilySpec {
+    FamilySpec {
+        experts: 32,
+        ..QWEN3_6_35B_A3B
+    }
+}
+
+/// Best logit value and the best among the rest, over shard slices. The
+/// gap between them says how well separated the greedy winner is.
+fn top2_of<'a>(rows: impl IntoIterator<Item = &'a [f32]>) -> (f32, f32) {
+    let (mut best, mut runner) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for row in rows {
+        for &v in row {
+            if v > best {
+                runner = best;
+                best = v;
+            } else if v > runner {
+                runner = v;
+            }
+        }
+    }
+    (best, runner)
+}
+
+/// One KV plane's byte divergence against the reference. A card's KV row
+/// is written from its own projection of a residual that already sits
+/// inside the split-sum envelope, so an int8 code or an fp16 scale can
+/// flip at a bin boundary: a 1-LSB flip on at most one percent of a
+/// plane's bytes is the accepted drift class.
+#[derive(Clone, Copy, Debug)]
+struct PlaneDrift {
+    diffs: usize,
+    bytes: usize,
+    max_delta: u8,
+}
+
+impl PlaneDrift {
+    fn of(want: &[u8], got: &[u8]) -> Self {
+        let diffs = want.iter().zip(got).filter(|(a, b)| a != b).count();
+        let max_delta = want
+            .iter()
+            .zip(got)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        Self {
+            diffs,
+            bytes: want.len(),
+            max_delta,
+        }
+    }
+
+    fn within_bound(&self) -> bool {
+        self.max_delta <= 1 && self.diffs * 100 <= self.bytes
     }
 }
 
@@ -139,6 +209,16 @@ fn host_argmax(values: &[f32]) -> i32 {
 fn within_envelope(name: &str, card: usize, got: &[f32], want: &[f32]) {
     let diff = max_abs_diff(got, want);
     let bound = max_abs(want) * SPLIT_SUM_RELATIVE + 1e-6;
+    assert!(
+        diff <= bound,
+        "{name} card {card}: max diff {diff:.3e} over bound {bound:.3e} (row max {})",
+        max_abs(want)
+    );
+}
+
+fn within_state_envelope(name: &str, card: usize, got: &[f32], want: &[f32]) {
+    let diff = max_abs_diff(got, want);
+    let bound = max_abs(want) * STATE_ENVELOPE_RELATIVE + 1e-5;
     assert!(
         diff <= bound,
         "{name} card {card}: max diff {diff:.3e} over bound {bound:.3e} (row max {})",
@@ -399,19 +479,23 @@ struct StepEvidence {
     /// Per layer: the reference's `resid_out(l)` row.
     ref_boundaries: Vec<Vec<f32>>,
     ref_logits: Vec<f32>,
+    /// Winner-minus-runner-up logit gap, from the reference row and from
+    /// the merged shards.
+    ref_margin: f32,
+    merged_margin: f32,
 }
 
 struct Evidence {
     steps: Vec<StepEvidence>,
     ring_words: Vec<u32>,
-    full_ordinal: usize,
-    kv_exact: Vec<bool>,
+    full_ordinals: Vec<usize>,
+    /// [card][full ordinal][plane in K, KScales, V, VScales order].
+    kv_drift: Vec<Vec<Vec<PlaneDrift>>>,
     /// The global row offset of each card's head shard.
     starts: Vec<usize>,
 }
 
-fn run_rig() -> Result<Evidence, EngError> {
-    let spec = rig_spec();
+fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidence, EngError> {
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
     let d = StepDims::new(&shape, &inv)?;
@@ -424,10 +508,18 @@ fn run_rig() -> Result<Evidence, EngError> {
     let ordinals: Vec<usize> = (0..layers)
         .map(|l| Ok(table_layers.slot(l)?.ordinal))
         .collect::<Result<_, EngError>>()?;
-    let full_ordinal = ordinals[kinds
+    let full_ordinals: Vec<usize> = kinds
         .iter()
-        .position(|&k| k == AttentionKind::Full)
-        .ok_or_else(|| EngError::Checkpoint("no full layer".into()))?];
+        .zip(ordinals.iter())
+        .filter(|&(&k, _)| k == AttentionKind::Full)
+        .map(|(_, &o)| o)
+        .collect();
+    let delta_ordinals: Vec<usize> = kinds
+        .iter()
+        .zip(ordinals.iter())
+        .filter(|&(&k, _)| k == AttentionKind::DeltaNet)
+        .map(|(_, &o)| o)
+        .collect();
 
     let admission = served_admission();
     let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
@@ -833,16 +925,20 @@ fn run_rig() -> Result<Evidence, EngError> {
         };
 
     // ---- The greedy chain.
-    let mut steps = Vec::with_capacity(TOKENS);
-    let mut token = FIRST_TOKEN;
-    for t in 0..TOKENS {
+    let mut steps = Vec::with_capacity(tokens);
+    // Teacher-forced mode feeds both sides the merged id; independent
+    // mode feeds the reference its OWN id, so sequence equality proves
+    // the coordinator's real feedback path.
+    let mut ref_token = FIRST_TOKEN;
+    let mut card_token = FIRST_TOKEN;
+    for t in 0..tokens {
         // The reference step first. The local borrows keep the fn-scope
         // ones dead here, so the driver's `&mut stack` below is free.
         let (ref_id, ref_status, ref_logits, ref_boundaries) = {
             let ctx0 = &stack.contexts()[0];
             let stream0 = &stack.streams()[0];
             // The production order: the start block, then the row admit.
-            state_ref.write_step_params(stream0, &StepParams::new(token as i32, t as i32)?)?;
+            state_ref.write_step_params(stream0, &StepParams::new(ref_token as i32, t as i32)?)?;
             let admitted = state_ref.enqueue_rows(1)?;
             let params = state_ref.word(Word::StepParams)?;
             ctx0.step_begin(stream0, params)?;
@@ -1022,6 +1118,8 @@ fn run_rig() -> Result<Evidence, EngError> {
         let starts: Vec<usize> = head_runs.iter().map(|r| r.start).collect();
         let shards: Vec<&[f32]> = card_reads.iter().map(|(_, _, s)| s.as_slice()).collect();
         let merged_id = merge_head_candidates(&shards, &starts);
+        let (ref_best, ref_runner) = top2_of([ref_logits.as_slice()]);
+        let (merged_best, merged_runner) = top2_of(shards.iter().copied());
         steps.push(StepEvidence {
             ref_id,
             ref_status,
@@ -1030,25 +1128,39 @@ fn run_rig() -> Result<Evidence, EngError> {
             boundaries,
             ref_boundaries,
             ref_logits,
+            ref_margin: ref_best - ref_runner,
+            merged_margin: merged_best - merged_runner,
         });
-        // The greedy chain: both sides continue from the SAME id. The
-        // cards' own argmax wrote each card's LOCAL id into its TokenId
-        // word, so the merged global id is injected explicitly; `pos` and
-        // `kv_len` keep moving through each card's `step_advance`.
-        token = merged_id.max(0) as u32;
-        if t + 1 < TOKENS {
+        // The greedy chain. The cards' own argmax wrote each card's
+        // LOCAL id into its TokenId word, so the merged global id is
+        // injected explicitly; `pos` and `kv_len` keep moving through
+        // each card's `step_advance`. The reference reads its own
+        // StepParams word, so teacher-forced mode injects the merged id
+        // there too by feeding the next write, and independent mode
+        // leaves the reference on its own argmax.
+        ref_token = if independent {
+            ref_id as u32
+        } else {
+            merged_id.max(0) as u32
+        };
+        card_token = merged_id.max(0) as u32;
+        if t + 1 < tokens {
             for card in 0..2 {
                 let stream = &stack.streams()[card];
                 let word = stack.shards()[card]
                     .state()
                     .step_field(StepField::TokenId)?;
-                word.buffer()
-                    .write_at(stream, word.offset(), &(token as i32).to_le_bytes())?;
+                word.buffer().write_at(
+                    stream,
+                    word.offset(),
+                    &(card_token as i32).to_le_bytes(),
+                )?;
             }
         }
     }
 
-    // The ring words and the Full layer's KV planes.
+    // The ring words, every Full layer's KV planes, and every DeltaNet
+    // layer's committed state.
     let stream0 = &stack.streams()[0];
     let mut ring_words = Vec::with_capacity(2);
     for card in 0..2 {
@@ -1058,32 +1170,92 @@ fn run_rig() -> Result<Evidence, EngError> {
             .read_at(&stack.streams()[card], 0, &mut word)?;
         ring_words.push(u32::from_le_bytes(word));
     }
-    let mut kv_exact = Vec::with_capacity(2);
+    let mut kv_drift = Vec::with_capacity(2);
     for card in 0..2 {
-        let mut exact = true;
-        for plane in [Plane::K, Plane::KScales, Plane::V, Plane::VScales] {
-            let want = {
-                let view = state_ref.kv_plane(full_ordinal, plane)?;
-                let mut bytes = vec![0u8; view.bytes()];
-                view.buffer().read_at(stream0, view.offset(), &mut bytes)?;
-                bytes
-            };
-            let got = {
-                let view = stack.shards()[card].state().kv_plane(full_ordinal, plane)?;
-                let mut bytes = vec![0u8; view.bytes()];
-                view.buffer()
-                    .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
-                bytes
-            };
-            exact &= want == got;
+        let mut per_kv = Vec::with_capacity(full_ordinals.len());
+        for &ord in &full_ordinals {
+            let mut planes = Vec::with_capacity(4);
+            for plane in [Plane::K, Plane::KScales, Plane::V, Plane::VScales] {
+                let want = {
+                    let view = state_ref.kv_plane(ord, plane)?;
+                    let mut bytes = vec![0u8; view.bytes()];
+                    view.buffer().read_at(stream0, view.offset(), &mut bytes)?;
+                    bytes
+                };
+                let got = {
+                    let view = stack.shards()[card].state().kv_plane(ord, plane)?;
+                    let mut bytes = vec![0u8; view.bytes()];
+                    view.buffer()
+                        .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
+                    bytes
+                };
+                planes.push(PlaneDrift::of(&want, &got));
+            }
+            per_kv.push(planes);
         }
-        kv_exact.push(exact);
+        kv_drift.push(per_kv);
+
+        // Slot 0 is the committed DeltaNet state. The card's state is
+        // COMPACTED: its dealt value heads sit at local indices and its
+        // conv channels are its segments in stored order - the mapping
+        // the block rig compares bit-exactly at identical inputs. Over
+        // the whole token chain the q8 quantize absorbs most of the
+        // residual envelope drift, but a value crossing a bin boundary
+        // shifts its whole head block, so the gate here is the state
+        // envelope, not bit equality.
+        let head_block = d.shape.delta.key_dim * d.shape.delta.value_dim;
+        let conv_taps = d.shape.delta.conv_kernel - 1;
+        let head_run = table.value_heads(card)?;
+        for &ord in &delta_ordinals {
+            let rec_ref = {
+                let rec = state_ref.delta_rec(0, ord)?;
+                let mut rb = vec![0u8; rec.bytes()];
+                rec.buffer().read_at(stream0, rec.offset(), &mut rb)?;
+                bytes_f32(&rb)
+            };
+            let conv_ref = {
+                let conv = state_ref.delta_conv(0, ord)?;
+                let mut cb = vec![0u8; conv.bytes()];
+                conv.buffer().read_at(stream0, conv.offset(), &mut cb)?;
+                bytes_f32(&cb)
+            };
+            let (rec_card, conv_card) = {
+                let state = stack.shards()[card].state();
+                let rec = state.delta_rec(0, ord)?;
+                let conv = state.delta_conv(0, ord)?;
+                let mut rb = vec![0u8; rec.bytes()];
+                rec.buffer()
+                    .read_at(&stack.streams()[card], rec.offset(), &mut rb)?;
+                let mut cb = vec![0u8; conv.bytes()];
+                conv.buffer()
+                    .read_at(&stack.streams()[card], conv.offset(), &mut cb)?;
+                (bytes_f32(&rb), bytes_f32(&cb))
+            };
+            let want = &rec_ref[head_run.start * head_block..head_run.end * head_block];
+            let got = &rec_card[..want.len()];
+            within_state_envelope(&format!("delta rec (ordinal {ord})"), card, got, want);
+            let full_channels = conv_ref.len() / conv_taps;
+            let mut conv_want = Vec::with_capacity(conv_card.len());
+            for tap in 0..conv_taps {
+                for seg in table.delta_qkv_segments(card)? {
+                    conv_want.extend_from_slice(
+                        &conv_ref[tap * full_channels + seg.start..tap * full_channels + seg.end],
+                    );
+                }
+            }
+            within_state_envelope(
+                &format!("delta conv (ordinal {ord})"),
+                card,
+                &conv_card[..conv_want.len()],
+                &conv_want,
+            );
+        }
     }
     Ok(Evidence {
         steps,
         ring_words,
-        full_ordinal,
-        kv_exact,
+        full_ordinals,
+        kv_drift,
         starts: head_runs.iter().map(|r| r.start).collect(),
     })
 }
@@ -1094,7 +1266,17 @@ fn a_whole_token_runs_distributed_and_matches_the_reference() {
     if !device_present(NAME) {
         return;
     }
-    let evidence = run_rig().expect("rig");
+    let evidence = run_rig(rig_spec(), TOKENS, false).expect("rig");
+    assert_reference_match(&evidence, TOKENS);
+}
+
+/// Every gate the whole-model tests share: sequence equality (the only
+/// id the cards ever see is their own merged one), status words,
+/// per-layer residual envelopes, logit-shard envelopes, the greedy
+/// winner's separation, ring health, and end-of-run KV and DeltaNet
+/// state planes.
+fn assert_reference_match(evidence: &Evidence, tokens: usize) {
+    assert_eq!(evidence.steps.len(), tokens, "one step per token");
     for (t, step) in evidence.steps.iter().enumerate() {
         assert_eq!(
             step.merged_id, step.ref_id,
@@ -1124,11 +1306,51 @@ fn a_whole_token_runs_distributed_and_matches_the_reference() {
                 );
             }
         }
+        // The merged margin must track the reference margin: the winner
+        // and the runner-up each carry the logit envelope.
+        let peak = step.ref_logits.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let slack = 2.0 * (peak * 1e-3 + 1e-6);
+        assert!(
+            (step.merged_margin - step.ref_margin).abs() <= slack,
+            "token {t}: merged margin {} vs reference {}",
+            step.merged_margin,
+            step.ref_margin
+        );
+        assert!(
+            step.ref_margin > 0.0,
+            "token {t}: the winner must be separated (margin {})",
+            step.ref_margin
+        );
     }
     for (card, &word) in evidence.ring_words.iter().enumerate() {
         assert_eq!(word, 0, "card {card}: a ring exchange failed");
     }
-    for (card, &exact) in evidence.kv_exact.iter().enumerate() {
-        assert!(exact, "card {card}: KV planes diverged from the reference");
+    for (card, per_ordinal) in evidence.kv_drift.iter().enumerate() {
+        for (i, planes) in per_ordinal.iter().enumerate() {
+            for (p, drift) in planes.iter().enumerate() {
+                assert!(
+                    drift.within_bound(),
+                    "card {card} full ordinal {} plane {p}: {} of {} bytes differ (max delta {})",
+                    evidence.full_ordinals[i],
+                    drift.diffs,
+                    drift.bytes,
+                    drift.max_delta
+                );
+            }
+        }
     }
+}
+
+#[test]
+fn a_whole_40_layer_model_runs_distributed_and_matches_the_reference() {
+    const NAME: &str = "a_whole_40_layer_model_runs_distributed_and_matches_the_reference";
+    if !device_present(NAME) {
+        return;
+    }
+    // Independent greedy continuation: the reference feeds back its own
+    // argmax and the cards their merged id, so sequence equality proves
+    // the coordinator's real feedback mechanism, not just numerical
+    // agreement on identical inputs.
+    let evidence = run_rig(real_layer_spec(), TOKENS, true).expect("rig");
+    assert_reference_match(&evidence, TOKENS);
 }
