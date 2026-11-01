@@ -40,6 +40,12 @@ fn card_ops_name_only_slots_the_card_plan_holds() {
                 layout: WeightLayout::Native,
             };
             let scratch = KernelScratch::for_dims(&d, 1, kv_mode).expect("scratch");
+            // Same whole-group refusal as the slot test above.
+            if matches!(kv_mode, KvMode::Int8G32) && cards == 3 {
+                let g1 = MixerGeometry::for_card(&d, &table, 1).expect("card geometry");
+                assert!(CardKindOps::new(&table, 1, &g1, kv_mode).is_err());
+                continue;
+            }
             for card in 0..cards {
                 let plan =
                     StepPlan::for_card(&d, &table, card, &options, &scratch).expect("card plan");
@@ -83,6 +89,14 @@ fn exchange_markers_sit_inside_the_exchanged_slots_plan_lifetimes() {
                 layout: WeightLayout::Native,
             };
             let scratch = KernelScratch::for_dims(&d, 1, kv_mode).expect("scratch");
+            // The q8 card decode serves whole 8-head groups, so the 3-card
+            // split 8/4/4 plans fine but the card op list refuses the
+            // partial groups before they reach the decode planning.
+            if matches!(kv_mode, KvMode::Int8G32) && cards == 3 {
+                let g1 = MixerGeometry::for_card(&d, &table, 1).expect("card geometry");
+                assert!(CardKindOps::new(&table, 1, &g1, kv_mode).is_err());
+                continue;
+            }
             for card in 0..cards {
                 let plan =
                     StepPlan::for_card(&d, &table, card, &options, &scratch).expect("card plan");

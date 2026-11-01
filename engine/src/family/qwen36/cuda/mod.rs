@@ -14,6 +14,9 @@ mod book_tests;
 mod card_attn;
 #[cfg(test)]
 mod card_attn_device_tests;
+mod card_block;
+#[cfg(test)]
+mod card_block_device_tests;
 mod card_step;
 #[cfg(test)]
 mod common_tests;

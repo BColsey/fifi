@@ -38,6 +38,7 @@ use crate::family::qwen36::cuda::shard::ShardTable;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::{KernelScratch, StepPlan};
 use crate::kernels::cuda::peer_ring::{PeerRing, RingMode};
+use crate::kernels::cuda::resident::step_params::StepParams;
 use crate::kernels::cuda::{
     Admission, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
 };
@@ -73,6 +74,12 @@ impl CardShard {
         })
     }
 
+    /// The card's arena (the card block driver resolves its op slots
+    /// against it through `MixerViews::for_card`).
+    pub(crate) fn arena(&self) -> &DeviceArena {
+        &self.arena
+    }
+
     /// Arena tensor `index` of this card's plan: the same slot, at the
     /// plan's own offset and byte count.
     pub(crate) fn tensor(&self, index: usize) -> Result<DeviceRange<'_>, EngError> {
@@ -81,6 +88,12 @@ impl CardShard {
 
     pub(crate) fn state(&self) -> &ResidentState {
         &self.state
+    }
+
+    /// The state mutably: the coordinator writes the step words of a token
+    /// before the block list runs (the book guards of the writes).
+    pub(crate) fn state_mut(&mut self) -> &mut ResidentState {
+        &mut self.state
     }
 
     /// The card's ring status word as the range the ring operations take.
@@ -183,6 +196,19 @@ impl CardStack {
     }
 
     /// The ONE stream per card, in card order: the coordinator invariant.
+    /// Writes card `card`'s step words (the coordinator's per-token step
+    /// setup; the book guards of the writes live in the shard's state).
+    pub(crate) fn write_step_params(
+        &mut self,
+        card: usize,
+        params: &StepParams,
+    ) -> Result<(), EngError> {
+        let stream = &self.streams[card];
+        self.shards[card]
+            .state_mut()
+            .write_step_params(stream, params)
+    }
+
     pub(crate) fn streams(&self) -> &[DeviceStream] {
         &self.streams
     }
@@ -227,6 +253,30 @@ impl CardStack {
             outs,
             statuses,
             count,
+        )
+    }
+
+    /// One all-gather of a row dealt across the cards: card `i` computed
+    /// `ranges[i]` of the `total` row in `parts[i]`; afterwards every
+    /// `outs[i]` holds the full row. The K/V gathers of the full-attention
+    /// core run through here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn all_gather_row(
+        &self,
+        parts: &[DeviceRange<'_>],
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        ranges: &[std::ops::Range<usize>],
+        total: usize,
+    ) -> Result<(), EngError> {
+        self.ring.all_gather_row(
+            &self.contexts,
+            &self.streams,
+            parts,
+            outs,
+            statuses,
+            ranges,
+            total,
         )
     }
 }

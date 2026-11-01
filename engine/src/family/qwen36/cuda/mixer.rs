@@ -46,10 +46,11 @@ use crate::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
             attn_decode::{AttnDecodeCall, AttnSpan, AttnSplit},
-            attn_decode_q8::AttnDecodeQ8Call,
+            attn_decode_q8::{AttnDecodeQ8Call, AttnQ8Shape},
             attn_prep::{AttnPrepCall, AttnPrepRowsCall, RopeParams},
             gdn_conv::ConvCall,
             gdn_delta::{DeltaCall, DeltaWeights},
+            kv_f16_append::{KvF16AppendData, KvF16AppendShape},
             kv8_append::Kv8Data,
             matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
@@ -369,8 +370,38 @@ impl<'a> Mixers<'a> {
         Ok(())
     }
 
+    /// The arena view of `slot` (the card block driver resolves the rows the
+    /// ring moves through this).
+    pub(super) fn slot_view(&self, slot: Slot) -> Result<DeviceRange<'a>, EngError> {
+        self.view(slot)
+    }
+
     fn view(&self, slot: Slot) -> Result<DeviceRange<'a>, EngError> {
         self.parts.views.get(slot)
+    }
+
+    /// One LOCAL op of a card list against this mixer's parts: the card
+    /// geometry, the card weight table and the card arena views. The card
+    /// block driver walks the op list and routes the exchange markers to
+    /// the ring instead.
+    pub(super) fn run_local_op(
+        &self,
+        stream: &DeviceStream,
+        state: &ResidentState,
+        layer: usize,
+        ordinal: usize,
+        io: BlockIo<'_>,
+        op: &BlockOp,
+    ) -> Result<(), EngError> {
+        let weights = self.parts.weights.layer_weights(layer)?;
+        let run = Run {
+            stream,
+            state,
+            weights,
+            ordinal,
+            io,
+        };
+        self.run_op(&run, op)
     }
 
     fn append_paged(&self, run: &Run<'_>, call: PageToken<'_>) -> Result<(), EngError> {
@@ -744,15 +775,141 @@ impl<'a> Mixers<'a> {
                     )
                 }
             }
-            // The multi-device ops carry no single-device launch: the card
-            // prep and append run through the card driver, which owns the
-            // ring gathers between them. Meeting one here is a construction
-            // bug, so refuse loudly instead of guessing a launch.
-            BlockOp::AttnPrepCard { .. } | BlockOp::KvAppendF16 { .. } => {
-                Err(EngError::BadRequest(
-                    "mixer: the multi-device prep and append ops have no single-device launcher"
-                        .into(),
-                ))
+            // The card q8 decode: THIS card's query heads over ITS kv-head
+            // range of the replicated planes. The head-major kv8 planes
+            // make the range contiguous; the kernel's fixed GROUP mapping
+            // then sees whole groups, relative head 0 being the card's
+            // first (its fused row and q slot hold exactly its heads).
+            BlockOp::AttnDecodeQ8Card {
+                q,
+                proj,
+                k_codes,
+                k_scales,
+                v_codes,
+                v_scales,
+                kv_len,
+                part,
+                out,
+                split,
+                kv_heads,
+            } => {
+                let shape = AttnQ8Shape {
+                    m: BLOCK_ROWS,
+                    n_head: g.attn.heads_q,
+                    n_kv_head: kv_heads.1 - kv_heads.0,
+                    head_dim: g.attn.head_dim,
+                    cells: run.state.layout().kv.capacity,
+                    ld: g.attn.ld,
+                };
+                // The sub-range of one kv-head span inside the layer's
+                // plane: the card geometry keeps the FULL kv head count,
+                // so the per-head stride divides the plane evenly.
+                let plane_extent = |plane: Plane| -> Result<DeviceRange<'_>, EngError> {
+                    let full = run.state.kv_plane(run.ordinal, plane)?;
+                    let per_head = full.bytes() / g.attn.heads_kv;
+                    full.buffer().range(
+                        full.offset() + kv_heads.0 * per_head,
+                        (kv_heads.1 - kv_heads.0) * per_head,
+                    )
+                };
+                ctx.attn_decode_q8(
+                    stream,
+                    AttnDecodeQ8Call {
+                        shape,
+                        span: AttnSpan::FULL,
+                        split,
+                        scale: g.attn.scale,
+                        q: self.view(q)?,
+                        proj: Some(self.view(proj)?),
+                        k_codes: plane_extent(k_codes)?,
+                        k_scales: plane_extent(k_scales)?,
+                        v_codes: plane_extent(v_codes)?,
+                        v_scales: plane_extent(v_scales)?,
+                        kv_len: run.state.step_field(kv_len)?,
+                        part: self.view(part)?,
+                        out: self.view(out)?,
+                    },
+                )
+            }
+            // The card prep: the SAME rows kernel over the card's head
+            // counts, writing the card's K/V extent at its GLOBAL rows of
+            // the full replicated row buffers (the gathered row is then
+            // assembled in place). Only a card mixer emits this op, and its
+            // parts carry the card geometry, so the launch below is the
+            // card's own.
+            BlockOp::AttnPrepCard {
+                proj,
+                q,
+                q_norm,
+                k_norm,
+                k_rows,
+                v_rows,
+                k_range,
+                pos,
+                status,
+            } => {
+                let kv_heads = super::card_attn::card_kv_heads(k_range, g.attn.head_dim)?;
+                fn row_extent(
+                    view: DeviceRange<'_>,
+                    k_range: (usize, usize),
+                ) -> Result<DeviceRange<'_>, EngError> {
+                    view.buffer().range(
+                        view.offset() + super::card_attn::card_slice_offset(k_range),
+                        (k_range.1 - k_range.0) * F32,
+                    )
+                }
+                ctx.attn_prep_rows(
+                    stream,
+                    AttnPrepRowsCall {
+                        shape: super::card_attn::card_prep_shape(
+                            g,
+                            kv_heads,
+                            run.state.layout().kv.capacity,
+                        ),
+                        rope: RopeParams {
+                            eps: g.eps,
+                            rope_base: g.attn.rope_base,
+                        },
+                        admit_pos: run.io.admit_pos,
+                        proj: self.view(proj)?,
+                        q_norm: run.weights.raw(q_norm)?,
+                        k_norm: run.weights.raw(k_norm)?,
+                        k_rows: row_extent(self.view(k_rows)?, k_range)?,
+                        v_rows: row_extent(self.view(v_rows)?, k_range)?,
+                        q: self.view(q)?,
+                        pos: run.state.step_field(pos)?,
+                        status: run.state.step_field(status)?,
+                    },
+                )
+            }
+            // The card F16 append: the gathered full rows into the
+            // replicated fp16 cache pair of this layer.
+            BlockOp::KvAppendF16 {
+                k,
+                v,
+                k_plane,
+                v_plane,
+                pos,
+                status,
+            } => {
+                let shape = KvF16AppendShape {
+                    rows: 1,
+                    n_kv_head: g.attn.heads_kv,
+                    head_dim: g.attn.head_dim,
+                    cells: run.state.layout().kv.capacity,
+                };
+                ctx.kv_f16_append(
+                    stream,
+                    shape,
+                    KvF16AppendData {
+                        k: self.view(k)?,
+                        v: self.view(v)?,
+                        k_cache: run.state.kv_plane(run.ordinal, k_plane)?,
+                        v_cache: run.state.kv_plane(run.ordinal, v_plane)?,
+                    },
+                    run.state.step_field(pos)?,
+                    run.state.step_field(status)?,
+                )
             }
         }
     }

@@ -20,6 +20,7 @@ use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role, project::cuda::WeightLayout},
     kernels::cuda::resident::attn_decode::AttnSplit,
+    kernels::cuda::resident::attn_decode_q8,
 };
 
 /// Rows of every block: the shared projection row exists only at one row (see `mixer_geometry.rs`).
@@ -177,6 +178,27 @@ pub(super) enum BlockOp {
         out: Slot,
         split: AttnSplit,
     },
+    /// The multi-device twin of [`BlockOp::AttnDecodeQ8`]: the same q8
+    /// decode over THIS card's query heads against the card's own
+    /// `kv_heads` of the replicated planes. The kernel serves exactly
+    /// `GROUP` query heads per kv head, so a card's head run (a whole
+    /// number of groups) decodes over exactly its kv-head range - and the
+    /// head-major kv8 planes make that range contiguous. The fp16 twin
+    /// waits on the fp16 kernel's cell-major planes.
+    AttnDecodeQ8Card {
+        q: Slot,
+        proj: Slot,
+        k_codes: Plane,
+        k_scales: Plane,
+        v_codes: Plane,
+        v_scales: Plane,
+        kv_len: StepField,
+        part: Slot,
+        out: Slot,
+        split: AttnSplit,
+        /// The card's ABSOLUTE kv-head range in the full replicated plane.
+        kv_heads: (usize, usize),
+    },
     /// The multi-device twin of [`BlockOp::AttnPrepRows`]: the same per-head
     /// RMSNorm and rope for THIS card's query-head run and `k_range` rows of
     /// the new K row - the range is absolute in the full row, because a
@@ -227,7 +249,9 @@ impl BlockOp {
                 Phase::AttnPrep
             }
             Self::Kv8Append { .. } | Self::KvAppendF16 { .. } => Phase::Kv8Append,
-            Self::AttnDecode { .. } | Self::AttnDecodeQ8 { .. } => Phase::AttnCore,
+            Self::AttnDecode { .. } | Self::AttnDecodeQ8 { .. } | Self::AttnDecodeQ8Card { .. } => {
+                Phase::AttnCore
+            }
         }
     }
 
@@ -250,7 +274,9 @@ impl BlockOp {
                 vec![proj]
             }
             Self::Kv8Append { k, v, .. } | Self::KvAppendF16 { k, v, .. } => vec![k, v],
-            Self::AttnDecode { q, proj, .. } | Self::AttnDecodeQ8 { q, proj, .. } => {
+            Self::AttnDecode { q, proj, .. }
+            | Self::AttnDecodeQ8 { q, proj, .. }
+            | Self::AttnDecodeQ8Card { q, proj, .. } => {
                 vec![q, proj]
             }
         }
@@ -279,7 +305,9 @@ impl BlockOp {
             } => vec![q, k_rows, v_rows],
             // The quantized cells go to the state's KV planes, which are not plan slots.
             Self::Kv8Append { .. } | Self::KvAppendF16 { .. } => Vec::new(),
-            Self::AttnDecode { part, out, .. } | Self::AttnDecodeQ8 { part, out, .. } => {
+            Self::AttnDecode { part, out, .. }
+            | Self::AttnDecodeQ8 { part, out, .. }
+            | Self::AttnDecodeQ8Card { part, out, .. } => {
                 vec![part, out]
             }
         }
@@ -706,7 +734,7 @@ fn attn_ops_card(
     k_range: (usize, usize),
     layout: WeightLayout,
     kv_mode: KvMode,
-) -> Vec<CardOp> {
+) -> Result<Vec<CardOp>, EngError> {
     let a = &g.attn;
     let project = |role, col| {
         CardOp::Local(project_op(
@@ -746,18 +774,41 @@ fn attn_ops_card(
             out: Slot::AttnCore,
             kv_len: StepField::KvLen,
         }),
-        KvMode::Int8G32 => CardOp::Local(BlockOp::AttnDecodeQ8 {
-            q: Slot::AttnQ,
-            proj: Slot::AttnProj,
-            k_codes: Plane::K,
-            k_scales: Plane::KScales,
-            v_codes: Plane::V,
-            v_scales: Plane::VScales,
-            kv_len: StepField::KvLen,
-            part: Slot::AttnPart,
-            out: Slot::AttnCore,
-            split: AttnSplit::Q8,
-        }),
+        KvMode::Int8G32 => {
+            // The whole-head rule of the card decode: the kernel serves
+            // GROUP query heads per kv head, so the card's head run must
+            // be whole groups - then its q heads attend exactly its
+            // kv-head range of the replicated plane.
+            let head_dim = a.head_dim;
+            let groups = attn_decode_q8::GROUP;
+            if a.heads_q % groups != 0 {
+                return Err(EngError::BadRequest(format!(
+                    "card attn: the card's {} query heads are not whole groups of {groups}; \
+                     the q8 decode cannot split them",
+                    a.heads_q
+                )));
+            }
+            let span = a.heads_q / groups;
+            let kv_heads = (k_range.0 / head_dim, k_range.0 / head_dim + span);
+            if k_range.0 % head_dim != 0 || k_range.1 / head_dim != kv_heads.1 {
+                return Err(EngError::BadRequest(format!(
+                    "card attn: kv rows {k_range:?} do not cover the card's {span} kv heads"
+                )));
+            }
+            CardOp::Local(BlockOp::AttnDecodeQ8Card {
+                q: Slot::AttnQ,
+                proj: Slot::AttnProj,
+                k_codes: Plane::K,
+                k_scales: Plane::KScales,
+                v_codes: Plane::V,
+                v_scales: Plane::VScales,
+                kv_len: StepField::KvLen,
+                part: Slot::AttnPart,
+                out: Slot::AttnCore,
+                split: AttnSplit::Q8,
+                kv_heads,
+            })
+        }
     };
     let mut ops = vec![
         project(Role::AttnQ, 0),
@@ -799,7 +850,7 @@ fn attn_ops_card(
         0,
         layout,
     )));
-    ops
+    Ok(ops)
 }
 
 /// The mixer block of one card of a layer of `kind`, as pure planning: the
@@ -844,7 +895,7 @@ pub(super) fn block_ops_card(
         AttentionKind::DeltaNet => {
             ops.extend(delta_ops(g, layout, false).into_iter().map(CardOp::Local))
         }
-        AttentionKind::Full => ops.extend(attn_ops_card(g, k_range, layout, kv_mode)),
+        AttentionKind::Full => ops.extend(attn_ops_card(g, k_range, layout, kv_mode)?),
         other => {
             return Err(EngError::Checkpoint(format!(
                 "card block ops: attention kind {other:?} has no resident mixer"

@@ -37,7 +37,8 @@ use crate::kernels::cuda::native::resident::attn_decode_q8::{
 use crate::kernels::cuda::resident::attn_decode::{AttnSpan, AttnSplit};
 
 /// Query heads per kv head; the lane layout of the kernel needs exactly 8.
-const GROUP: usize = 8;
+pub(crate) const GROUP: usize = 8;
+/// The most tokens one call takes.
 const MAX_TOKENS: usize = 16;
 /// The most kv heads (the kernel's grid and the part layout are sized for it).
 const MAX_KV_HEADS: usize = 64;
