@@ -86,13 +86,15 @@ pub(crate) struct LoadOptions<'a> {
     pub(crate) layout: WeightLayout,
 }
 
-/// One tensor's slice of a sliced load: the column and row ranges (in
-/// values, GGUF order) this device uploads. Ranges must land on the
-/// tensor type's native block boundaries; `plan::plan_slice` checks them.
+/// One tensor's slice of a sliced load: the column range and row ranges
+/// (in values, GGUF order) this device uploads. Ranges must land on the
+/// tensor type's native block boundaries; `plan::plan_slice_rows` checks
+/// them. Several row ranges concatenate in order (a fused tensor's
+/// logical row groups).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SliceSpec {
     pub(crate) cols: std::ops::Range<u64>,
-    pub(crate) rows: std::ops::Range<u64>,
+    pub(crate) rows: Vec<std::ops::Range<u64>>,
 }
 
 /// Reads `buf.len()` source bytes of one tensor at byte `offset`, the shape
@@ -585,12 +587,12 @@ impl CudaProjector {
                         slice: None,
                     }),
                     Some(spec) => {
-                        let slice = plan::plan_slice(
+                        let slice = plan::plan_slice_rows(
                             name,
                             tensor.ggml_type(),
                             tensor.dims(),
                             spec.cols.clone(),
-                            spec.rows.clone(),
+                            &spec.rows,
                         )?;
                         let bytes = slice.bytes;
                         Ok(PlannedTensor {

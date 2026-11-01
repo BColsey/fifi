@@ -153,12 +153,28 @@ const fn slice_unit(ty: GgufType) -> Option<(u64, u64)> {
 /// and the slice bytes are that function's count on the sliced dims, so
 /// admission and assembly can never disagree. A whole-tensor slice is one
 /// segment: the 1-device upload is byte-identical to today's.
+#[cfg(test)]
 pub(crate) fn plan_slice(
     name: &str,
     ty: GgufType,
     dims: &[u64],
     cols: std::ops::Range<u64>,
     rows: std::ops::Range<u64>,
+) -> Result<TensorSlice, EngError> {
+    plan_slice_rows(name, ty, dims, cols, &[rows])
+}
+
+/// Like [`plan_slice`], with several row ranges concatenated in order: the
+/// sliced tensor's rows are the ranges' rows in the given order. A fused
+/// tensor whose rows group several logical matrices (the DeltaNet `attn_qkv`
+/// channels are Q, then K, then V) slices into one range per group, and the
+/// device layout keeps that order. Ranges must be ascending and disjoint.
+pub(crate) fn plan_slice_rows(
+    name: &str,
+    ty: GgufType,
+    dims: &[u64],
+    cols: std::ops::Range<u64>,
+    rows: &[std::ops::Range<u64>],
 ) -> Result<TensorSlice, EngError> {
     let refuse = |detail: String| EngError::Checkpoint(format!("tensor {name}: {detail}"));
     let Some((unit_values, unit_bytes)) = slice_unit(ty) else {
@@ -189,16 +205,24 @@ pub(crate) fn plan_slice(
             "column range {cols:?} splits a {unit_values}-value block of {ty:?}"
         )));
     }
-    if rows.start >= rows.end || rows.end > full_rows {
-        return Err(refuse(format!(
-            "row range {rows:?} is outside 0..{full_rows} or empty"
-        )));
+    if rows.is_empty() {
+        return Err(refuse("the slice takes no row ranges".into()));
     }
+    let mut previous_end = 0u64;
+    for range in rows {
+        if range.start >= range.end || range.end > full_rows || range.start < previous_end {
+            return Err(refuse(format!(
+                "row ranges {rows:?} are empty, overlapping, or outside 0..{full_rows}"
+            )));
+        }
+        previous_end = range.end;
+    }
+    let rows_in_slice: u64 = rows.iter().map(|r| r.end - r.start).sum();
     let mut slice_dims = dims.to_vec();
     slice_dims[0] = cols.end - cols.start;
     if slice_dims.len() > 1 {
-        slice_dims[1] = rows.end - rows.start;
-    } else if rows != (0..1) {
+        slice_dims[1] = rows_in_slice;
+    } else if rows.len() != 1 || rows[0] != (0..1) {
         return Err(refuse("a rank-1 tensor takes the row range 0..1".into()));
     }
     let bytes = native_device_bytes(name, ty, &slice_dims)?;
@@ -212,7 +236,6 @@ pub(crate) fn plan_slice(
     let col_offset = (cols.start / unit_values)
         .checked_mul(unit_bytes)
         .ok_or_else(overflow)?;
-    let rows_in_slice = rows.end - rows.start;
     let whole_cols = cols.start == 0 && cols.end == full_cols;
     let mut segments = Vec::new();
     for plane in 0..planes {
@@ -220,19 +243,23 @@ pub(crate) fn plan_slice(
             .checked_mul(full_rows)
             .and_then(|r| r.checked_mul(row_bytes))
             .ok_or_else(overflow)?;
-        if whole_cols {
-            let start = plane_base
-                .checked_add(rows.start.checked_mul(row_bytes).ok_or_else(overflow)?)
-                .ok_or_else(overflow)?;
-            let len = rows_in_slice.checked_mul(row_bytes).ok_or_else(overflow)?;
-            segments.push((start, len));
-        } else {
-            for row in rows.clone() {
+        for range in rows {
+            if whole_cols {
                 let start = plane_base
-                    .checked_add(row.checked_mul(row_bytes).ok_or_else(overflow)?)
-                    .and_then(|s| s.checked_add(col_offset))
+                    .checked_add(range.start.checked_mul(row_bytes).ok_or_else(overflow)?)
                     .ok_or_else(overflow)?;
-                segments.push((start, slice_row_bytes));
+                let len = (range.end - range.start)
+                    .checked_mul(row_bytes)
+                    .ok_or_else(overflow)?;
+                segments.push((start, len));
+            } else {
+                for row in range.clone() {
+                    let start = plane_base
+                        .checked_add(row.checked_mul(row_bytes).ok_or_else(overflow)?)
+                        .and_then(|s| s.checked_add(col_offset))
+                        .ok_or_else(overflow)?;
+                    segments.push((start, slice_row_bytes));
+                }
             }
         }
     }
@@ -586,6 +613,33 @@ mod tests {
             left.bytes + right.bytes,
             native_device_bytes("d", GgufType::Q4K, &down).expect("whole")
         );
+    }
+
+    #[test]
+    fn multi_range_slices_concatenate_row_groups_in_order() {
+        // A fused rows axis of three groups (Q|K|V shape): dims [64, 12],
+        // Q8_0. Take rows 1..3, 5..6 and 8..12 across the full row length.
+        let dims = [64u64, 12];
+        let source = marked_source(&dims, 32, 34);
+        let ranges = [1..3u64, 5..6, 8..12];
+        let slice = plan_slice_rows("qkv", GgufType::Q80, &dims, 0..64, &ranges).expect("slice");
+        assert_eq!(slice.dims, vec![64, 7]);
+        let mut want = Vec::new();
+        for range in &ranges {
+            want.extend_from_slice(&expected_slice(
+                &source,
+                &dims,
+                32,
+                34,
+                0..64,
+                range.clone(),
+            ));
+        }
+        assert_eq!(assemble_slice(&source, &slice).expect("assemble"), want);
+        // Overlapping or descending ranges refuse.
+        assert!(plan_slice_rows("qkv", GgufType::Q80, &dims, 0..64, &[1..4, 3..5]).is_err());
+        assert!(plan_slice_rows("qkv", GgufType::Q80, &dims, 0..64, &[5..6, 1..2]).is_err());
+        assert!(plan_slice_rows("qkv", GgufType::Q80, &dims, 0..64, &[]).is_err());
     }
 
     #[test]

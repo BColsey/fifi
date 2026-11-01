@@ -1722,7 +1722,7 @@ fn a_sliced_native_load_uploads_exactly_the_slice_bytes() {
         "stack",
         SliceSpec {
             cols: 32..96,
-            rows: 1..5,
+            rows: std::iter::once(1..5).collect(),
         },
     )];
     let sliced = projector
@@ -1745,7 +1745,13 @@ fn a_sliced_native_load_uploads_exactly_the_slice_bytes() {
     drop(sliced);
     // Two column halves over all rows tile the whole tensor's admission.
     let halves = [(0..64u64), (64..128u64)].map(|cols| {
-        let spec = [("stack", SliceSpec { cols, rows: 0..6 })];
+        let spec = [(
+            "stack",
+            SliceSpec {
+                cols,
+                rows: std::iter::once(0..6).collect(),
+            },
+        )];
         projector
             .load_sliced(&weights, &["stack"], native, &spec)
             .expect("load half")

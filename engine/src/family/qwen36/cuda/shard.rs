@@ -38,6 +38,8 @@ use std::ops::Range;
 
 use super::super::host::HostShape;
 use crate::EngError;
+use crate::family::gguf_model::{Inventory, Role};
+use crate::family::project::cuda::SliceSpec;
 
 /// Values per dealt block of an expert's intermediate width and of a K/V row.
 const VALUE_BLOCK: usize = 32;
@@ -263,6 +265,114 @@ impl ShardTable {
     }
 }
 
+/// What one card loads of one inventory tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShardLoad {
+    /// The whole tensor, replicated (norms, router, per-head vectors).
+    Whole,
+    /// Only card 0 loads it (the embedding table; its row is broadcast).
+    CardZeroOnly,
+    /// This card's slice, in GGUF axis order.
+    Sliced(SliceSpec),
+}
+
+/// One row range as a range list, for the roles sliced along one run.
+fn one(range: Range<u64>) -> Vec<Range<u64>> {
+    std::iter::once(range).collect()
+}
+
+fn as_u64(range: Range<usize>) -> Range<u64> {
+    range.start as u64..range.end as u64
+}
+
+/// The load plan of one card over the whole inventory: every tensor the
+/// model holds, classified whole, card-0-only, or sliced by the table's
+/// ranges for its role. GGUF axes are `dims[0]` = row length (the input
+/// width a column-sharded matrix is cut along) and `dims[1]` = rows (the
+/// output width a row-sharded matrix is cut along), with expert stacks
+/// cut inside every plane. The union of all cards' slices of a tensor is
+/// the tensor, and the 1-card plan is `Whole` everywhere except the
+/// embedding, which its one card owns either way.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "staged for the two-device start, which loads one plan per device"
+    )
+)]
+pub(crate) fn shard_loads(
+    table: &ShardTable,
+    inventory: &Inventory,
+    card: usize,
+) -> Result<Vec<(String, ShardLoad)>, EngError> {
+    if card >= table.cards() {
+        return Err(refuse(format!(
+            "card {card} is outside the {}-card table",
+            table.cards()
+        )));
+    }
+    // One card loads everything whole (and through plain `load` at start);
+    // the slices below are its full ranges anyway.
+    let sliced = |cols: Range<u64>, rows: Vec<Range<u64>>| {
+        if table.cards() == 1 {
+            ShardLoad::Whole
+        } else {
+            ShardLoad::Sliced(SliceSpec { cols, rows })
+        }
+    };
+    inventory
+        .tensors()
+        .iter()
+        .map(|tensor| {
+            let dims = &tensor.dims;
+            let full_cols = 0..dims[0];
+            let full_rows = one(0..dims.get(1).copied().unwrap_or(1));
+            let load = match tensor.role {
+                Role::TokenEmbd => ShardLoad::CardZeroOnly,
+                Role::Output => sliced(full_cols, one(as_u64(table.head_rows(card)?))),
+                Role::AttnQ => sliced(full_cols, one(as_u64(table.attn_q_rows(card)?))),
+                Role::AttnK | Role::AttnV => sliced(full_cols, one(as_u64(table.kv_rows(card)?))),
+                Role::AttnOutput => sliced(as_u64(table.attn_o_cols(card)?), full_rows),
+                Role::AttnQkv | Role::SsmConv1d => sliced(
+                    full_cols,
+                    table
+                        .delta_qkv_segments(card)?
+                        .into_iter()
+                        .map(as_u64)
+                        .collect(),
+                ),
+                Role::AttnGate => sliced(full_cols, one(as_u64(table.delta_z_rows(card)?))),
+                Role::SsmOut => sliced(as_u64(table.delta_out_cols(card)?), full_rows),
+                Role::SsmAlpha | Role::SsmBeta => {
+                    sliced(full_cols, one(as_u64(table.value_heads(card)?)))
+                }
+                Role::SsmA | Role::SsmDtBias => sliced(as_u64(table.value_heads(card)?), one(0..1)),
+                Role::FfnGateExps | Role::FfnUpExps => {
+                    sliced(full_cols, one(as_u64(table.expert_inter(card)?)))
+                }
+                Role::FfnDownExps => sliced(as_u64(table.expert_inter(card)?), full_rows),
+                Role::FfnGateShexp | Role::FfnUpShexp => {
+                    sliced(full_cols, one(as_u64(table.shared_inter(card)?)))
+                }
+                Role::FfnDownShexp => sliced(as_u64(table.shared_inter(card)?), full_rows),
+                // Replicated: norms and per-head vectors every card applies to
+                // its own heads, the router (computed on card 0 in the step;
+                // loading it everywhere keeps the load plan shape-free), and
+                // the shared-expert gate scalar inputs.
+                Role::OutputNorm
+                | Role::AttnNorm
+                | Role::PostAttentionNorm
+                | Role::FfnGateInp
+                | Role::FfnGateInpShexp
+                | Role::AttnQNorm
+                | Role::AttnKNorm
+                | Role::SsmNorm => ShardLoad::Whole,
+            };
+            Ok((tensor.name.clone(), load))
+        })
+        .collect()
+}
+
 /// One card's greedy candidate from its vocabulary shard: the global token
 /// id and its logit, as the existing device argmax produces them per shard.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -453,6 +563,69 @@ mod tests {
             merge_head_candidates(&shards),
             Some(candidate(whole.0 as u32, whole.1))
         );
+    }
+
+    #[test]
+    fn two_card_load_plans_classify_and_cover_the_whole_inventory() {
+        use crate::weights::GgufType;
+        let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let table = ShardTable::new(&shape(), 2, 256).expect("two cards at 256");
+        let plans = [
+            shard_loads(&table, &inventory, 0).expect("card 0 plan"),
+            shard_loads(&table, &inventory, 1).expect("card 1 plan"),
+        ];
+        assert_eq!(plans[0].len(), inventory.tensors().len());
+        for (tensor, (name0, load0)) in inventory.tensors().iter().zip(&plans[0]) {
+            assert_eq!(&tensor.name, name0);
+            let load1 = &plans[1]
+                .iter()
+                .find(|(name, _)| name == name0)
+                .expect("card 1 entry")
+                .1;
+            let ty = match tensor.path() {
+                crate::family::gguf_model::TensorPath::DeviceTiled => GgufType::Q4K,
+                crate::family::gguf_model::TensorPath::DeviceF32 => GgufType::F32,
+            };
+            let whole = crate::kernels::cuda::plan::native_device_bytes(name0, ty, &tensor.dims)
+                .expect("whole bytes");
+            let slice_bytes = |load: &ShardLoad| -> u64 {
+                match load {
+                    ShardLoad::Whole => whole,
+                    ShardLoad::CardZeroOnly => whole,
+                    ShardLoad::Sliced(spec) => {
+                        crate::kernels::cuda::plan::plan_slice_rows(
+                            name0,
+                            ty,
+                            &tensor.dims,
+                            spec.cols.clone(),
+                            &spec.rows,
+                        )
+                        .unwrap_or_else(|e| panic!("{name0} slice must plan: {e:?}"))
+                        .bytes
+                    }
+                }
+            };
+            match (load0, load1) {
+                (ShardLoad::CardZeroOnly, ShardLoad::CardZeroOnly) => {
+                    assert_eq!(tensor.role, Role::TokenEmbd, "{name0}");
+                }
+                (ShardLoad::Whole, ShardLoad::Whole) => {}
+                (ShardLoad::Sliced(_), ShardLoad::Sliced(_)) => {
+                    assert_eq!(
+                        slice_bytes(load0) + slice_bytes(load1),
+                        whole,
+                        "{name0}: the two slices must cover the tensor exactly"
+                    );
+                }
+                other => panic!("{name0}: asymmetric load plan {other:?}"),
+            }
+        }
+        assert!(shard_loads(&table, &inventory, 2).is_err());
+        // The 1-card plan loads everything whole.
+        let one = ShardTable::new(&shape(), 1, 256).expect("one card");
+        for (_, load) in shard_loads(&one, &inventory, 0).expect("one-card plan") {
+            assert!(matches!(load, ShardLoad::Whole | ShardLoad::CardZeroOnly));
+        }
     }
 
     #[test]
