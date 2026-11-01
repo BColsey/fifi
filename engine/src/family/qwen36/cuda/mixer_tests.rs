@@ -23,12 +23,20 @@ fn a_projection_writes_the_tail_of_its_slot_from_its_column() {
 }
 
 /// Every LOCAL op of a card's mixer lists names a slot the card plan holds, for both kinds,
-/// both KV modes, and 1/2/3-card tables (the markers carry no slots - the ring moves ranges
+/// both KV modes, and 1/2-card tables (three cards cannot each own one of the two whole
+/// 8-head query groups; the markers carry no slots - the ring moves ranges
 /// the coordinator holds). Every card names the gathered rows under BOTH modes.
 #[test]
 fn card_ops_name_only_slots_the_card_plan_holds() {
     let d = dims();
-    for cards in [1, 2, 3] {
+    // The table itself is the grouping gate now: 3 cards refuse by name
+    // before any plan is built.
+    let err = ShardTable::new(&d.shape, 3, 32).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("attention query heads"),
+        "{err:?}"
+    );
+    for cards in [1, 2] {
         let table = ShardTable::new(&d.shape, cards, 32).expect("table");
         for kv_mode in [KvMode::Fp16, KvMode::Int8G32] {
             let options = StepOptions {
@@ -40,19 +48,6 @@ fn card_ops_name_only_slots_the_card_plan_holds() {
                 layout: WeightLayout::Native,
             };
             let scratch = KernelScratch::for_dims(&d, 1, kv_mode).expect("scratch");
-            // Same whole-group refusal as the slot test above.
-            if matches!(kv_mode, KvMode::Int8G32) && cards == 3 {
-                let g1 = MixerGeometry::for_card(&d, &table, 1).expect("card geometry");
-                let err = match CardKindOps::new(&table, 1, &g1, kv_mode) {
-                    Err(err) => err,
-                    Ok(_) => panic!("the 4-head card must be refused"),
-                };
-                assert!(
-                    format!("{err:?}").contains("not whole groups of 8"),
-                    "{err:?}"
-                );
-                continue;
-            }
             for card in 0..cards {
                 let plan =
                     StepPlan::for_card(&d, &table, card, &options, &scratch).expect("card plan");
@@ -84,7 +79,15 @@ fn card_ops_name_only_slots_the_card_plan_holds() {
 #[test]
 fn exchange_markers_sit_inside_the_exchanged_slots_plan_lifetimes() {
     let d = dims();
-    for cards in [1usize, 2, 3] {
+    // The table is the whole-group gate: a 3-card split would deal 8/4/4
+    // query heads and no card op list could run the partial groups, so the
+    // table refuses before any plan or op list is built.
+    let err = ShardTable::new(&d.shape, 3, 32).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("attention query heads"),
+        "{err:?}"
+    );
+    for cards in [1usize, 2] {
         let table = ShardTable::new(&d.shape, cards, 32).expect("table");
         for kv_mode in [KvMode::Fp16, KvMode::Int8G32] {
             let options = StepOptions {
@@ -96,21 +99,6 @@ fn exchange_markers_sit_inside_the_exchanged_slots_plan_lifetimes() {
                 layout: WeightLayout::Native,
             };
             let scratch = KernelScratch::for_dims(&d, 1, kv_mode).expect("scratch");
-            // The q8 card decode serves whole 8-head groups, so the 3-card
-            // split 8/4/4 plans fine but the card op list refuses the
-            // partial groups before they reach the decode planning.
-            if matches!(kv_mode, KvMode::Int8G32) && cards == 3 {
-                let g1 = MixerGeometry::for_card(&d, &table, 1).expect("card geometry");
-                let err = match CardKindOps::new(&table, 1, &g1, kv_mode) {
-                    Err(err) => err,
-                    Ok(_) => panic!("the 4-head card must be refused"),
-                };
-                assert!(
-                    format!("{err:?}").contains("not whole groups of 8"),
-                    "{err:?}"
-                );
-                continue;
-            }
             for card in 0..cards {
                 let plan =
                     StepPlan::for_card(&d, &table, card, &options, &scratch).expect("card plan");
