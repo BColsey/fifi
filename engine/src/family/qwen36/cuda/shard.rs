@@ -103,13 +103,13 @@ fn check_k_cuts(runs: &[Range<usize>], k_align: usize, what: &str) -> Result<(),
 pub(crate) struct ShardTable {
     cards: usize,
     key_heads: Vec<Range<usize>>,
+    value_heads: Vec<Range<usize>>,
     query_heads: Vec<Range<usize>>,
     kv_rows: Vec<Range<usize>>,
     inter: Vec<Range<usize>>,
     shared_inter: Vec<Range<usize>>,
     vocab: Vec<Range<usize>>,
     /// Value heads per key head of the shape the table was built from.
-    value_per_key: usize,
     key_dim: usize,
     value_dim: usize,
     head_dim: usize,
@@ -127,19 +127,22 @@ impl ShardTable {
             return Err(refuse("a shard table needs at least one card".to_owned()));
         }
         let (d, a, m) = (&shape.delta, &shape.attn, &shape.moe);
-        let key_heads = deal(d.key_heads, 1, cards, "DeltaNet key heads")?;
+        // The delta kernel pairs value head h with key head h % TOTAL key
+        // heads, so a card's value heads need keys from across the whole
+        // model whenever the value/key ratio exceeds 1. Keys therefore
+        // REPLICATE: every card holds all key channels, and only the value
+        // heads are dealt.
+        let key_heads = vec![0..d.key_heads; cards];
+        let value_heads = deal(d.value_heads, 1, cards, "DeltaNet value heads")?;
         let query_heads = deal(a.heads_q, 1, cards, "attention query heads")?;
         let kv_rows = deal(a.heads_kv * a.head_dim, VALUE_BLOCK, cards, "K/V rows")?;
         let inter = deal(m.inter, VALUE_BLOCK, cards, "expert intermediate")?;
         let shared_inter = deal(m.shared_inter, VALUE_BLOCK, cards, "shared intermediate")?;
         let vocab = deal(shape.vocab, 1, cards, "vocabulary")?;
-        let value_per_key = d.value_heads / d.key_heads;
         // Column cuts of the three partial-sum matrices, in K values.
-        let delta_out: Vec<Range<usize>> = key_heads
+        let delta_out: Vec<Range<usize>> = value_heads
             .iter()
-            .map(|run| {
-                run.start * value_per_key * d.value_dim..run.end * value_per_key * d.value_dim
-            })
+            .map(|run| run.start * d.value_dim..run.end * d.value_dim)
             .collect();
         check_k_cuts(&delta_out, k_align, "DeltaNet out")?;
         let attn_o: Vec<Range<usize>> = query_heads
@@ -152,12 +155,12 @@ impl ShardTable {
         Ok(Self {
             cards,
             key_heads,
+            value_heads,
             query_heads,
             kv_rows,
             inter,
             shared_inter,
             vocab,
-            value_per_key,
             key_dim: d.key_dim,
             value_dim: d.value_dim,
             head_dim: a.head_dim,
@@ -183,28 +186,29 @@ impl ShardTable {
         })
     }
 
-    /// The key heads `card` runs in every DeltaNet layer.
+    /// The key heads `card` runs in every DeltaNet layer: the FULL set on
+    /// every card (keys replicate; see `new`), so a card's value heads
+    /// always find their `h % total` key channels locally.
     pub(crate) fn key_heads(&self, card: usize) -> Result<Range<usize>, EngError> {
         self.at(&self.key_heads, card, "DeltaNet key heads")
     }
 
-    /// The value heads `card` runs: its key-head run widened by the ratio.
+    /// The value heads `card` runs: the dealt contiguous run.
     pub(crate) fn value_heads(&self, card: usize) -> Result<Range<usize>, EngError> {
-        let run = self.key_heads(card)?;
-        Ok(run.start * self.value_per_key..run.end * self.value_per_key)
+        self.at(&self.value_heads, card, "DeltaNet value heads")
     }
 
     /// The three channel segments of the fused DeltaNet `qkv` projection that
-    /// belong to `card`, in the stored channel order: its query channels, its
-    /// key channels, then its value channels, each as a range inside
-    /// `conv_dim` (`[key heads | key heads | value heads]` channels).
+    /// `card` holds, in the stored channel order: the query channels and key
+    /// channels (REPLICATED in full on every card) and its dealt value
+    /// channels, each as a range inside `conv_dim` (`[key heads | key heads |
+    /// value heads]` channels).
     pub(crate) fn delta_qkv_segments(&self, card: usize) -> Result<[Range<usize>; 3], EngError> {
-        let keys = self.key_heads(card)?;
         let values = self.value_heads(card)?;
         let key_width = self.total_key_heads * self.key_dim;
         Ok([
-            keys.start * self.key_dim..keys.end * self.key_dim,
-            key_width + keys.start * self.key_dim..key_width + keys.end * self.key_dim,
+            0..key_width,
+            key_width..2 * key_width,
             2 * key_width + values.start * self.value_dim
                 ..2 * key_width + values.end * self.value_dim,
         ])
@@ -440,7 +444,11 @@ mod tests {
         let shape = shape();
         for cards in 1..=4 {
             let table = ShardTable::new(&shape, cards, 32).expect("table");
-            assert_partition(&runs(&table, ShardTable::key_heads), 16, "key heads");
+            // Keys replicate (the delta kernel pairs value head h with key
+            // head h % 16, so every card needs all of them); values deal.
+            for card in 0..cards {
+                assert_eq!(table.key_heads(card).expect("run"), 0..16);
+            }
             assert_partition(&runs(&table, ShardTable::value_heads), 32, "value heads");
             assert_partition(&runs(&table, ShardTable::query_heads), 16, "query heads");
             assert_partition(&runs(&table, ShardTable::attn_q_rows), 8192, "attn q rows");
@@ -474,11 +482,11 @@ mod tests {
         let table = ShardTable::new(&shape(), 3, 32).expect("three cards");
         assert_eq!(
             runs(&table, ShardTable::key_heads),
-            vec![0..6, 6..11, 11..16]
+            vec![0..16, 0..16, 0..16]
         );
         assert_eq!(
             runs(&table, ShardTable::value_heads),
-            vec![0..12, 12..22, 22..32]
+            vec![0..11, 11..22, 22..32]
         );
         assert_eq!(
             runs(&table, ShardTable::query_heads),
@@ -489,10 +497,11 @@ mod tests {
             runs(&table, ShardTable::expert_inter),
             vec![0..192, 192..352, 352..512]
         );
-        // The middle card's qkv segments: key heads 6..11, value heads 12..22.
+        // The middle card's qkv segments: replicated key channels (q, k in
+        // full) and its dealt value channels 11..22.
         assert_eq!(
             table.delta_qkv_segments(1).expect("segments"),
-            [768..1408, 2816..3456, 5632..6912]
+            [0..2048, 2048..4096, 5504..6912]
         );
     }
 
