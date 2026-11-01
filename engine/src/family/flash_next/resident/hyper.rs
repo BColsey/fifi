@@ -18,12 +18,10 @@ pub(super) struct ResidentRead {
     pub(super) gate: Option<ExecutionTensor>,
 }
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
 
-/// Checks that `h` is `[C, H]` and that the weights match `shape`, before any native call.
 fn check_read(shape: &HyperShape, w: &RHyper, h: &ExecutionTensor) -> Result<(), EngError> {
     let c = dim(shape.branches())?;
     let hidden = dim(shape.hidden())?;
@@ -33,7 +31,7 @@ fn check_read(shape: &HyperShape, w: &RHyper, h: &ExecutionTensor) -> Result<(),
     check_weights(shape, w)
 }
 
-/// Checks that the weights match `shape`, before any native call. The chunk form reuses it.
+/// The chunk form reuses it.
 pub(super) fn check_weights(shape: &HyperShape, w: &RHyper) -> Result<(), EngError> {
     let c = dim(shape.branches())?;
     let hidden = dim(shape.hidden())?;
@@ -168,14 +166,12 @@ mod tests {
         (0..128).map(|i| ((i % 5) as f32 - 1.0) * 1.0e-7).collect()
     }
 
-    /// Imports host values as a resident F32 tensor of `shape`.
     fn resident(kernels: &mut MlxKernels, shape: Vec<u32>, data: &[f32]) -> ExecutionTensor {
         kernels
             .import_tensor(&f32_tensor(shape, data).unwrap())
             .unwrap()
     }
 
-    /// Asserts cosine >= 0.99999 and max |a - e| / max |e| <= 1e-4.
     fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
         assert_eq!(actual.len(), expected.len(), "{what}: length");
         let (mut dot, mut aa, mut ee, mut err, mut scale) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -297,7 +293,6 @@ mod tests {
         let mut proj = MlxProjector::new(&ckpt).unwrap();
         let block1: Vec<f32> = (0..64).map(|d| ((d % 3) as f32 - 1.0) * 1.0e-7).collect();
         let block2: Vec<f32> = (0..64).map(|d| ((d % 4) as f32 - 1.5) * 1.0e-7).collect();
-        // Host chain: attention hyper read and apply, then MLP hyper read and apply.
         let mut host_h = residual();
         let read1 =
             host::read(&mut proj, &shape.hyper, &view.layers[0].attn_hyper, &host_h).unwrap();
@@ -307,7 +302,6 @@ mod tests {
             host::read(&mut proj, &shape.hyper, &view.layers[0].mlp_hyper, &host_h).unwrap();
         let host_gate2 = read2.gate.unwrap();
         host::apply(&shape.hyper, &mut host_h, &host_gate2, &block2).unwrap();
-        // Resident chain on the same inputs.
         let h0 = resident(&mut kernels, vec![2, 64], &residual());
         let b1 = resident(&mut kernels, vec![1, 64], &block1);
         let b2 = resident(&mut kernels, vec![1, 64], &block2);

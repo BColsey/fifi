@@ -60,8 +60,6 @@ fn feed(p0: usize, ns: u64) -> super::run_report::StepRecord {
     }
 }
 
-/// The storage core of the prefill report: the records it keeps, the two row counts, and the
-/// clear.
 #[test]
 fn the_prefill_report_accumulates_until_a_reset() {
     let mut report = super::run_report::PrefillReport::default();
@@ -136,7 +134,6 @@ fn fixture_report() -> super::run_report::PrefillReport {
     report
 }
 
-/// The job line of the fixture report.
 #[test]
 fn the_job_line_names_the_pieces_and_the_steps() {
     let line = fixture_report().job_line();
@@ -146,7 +143,6 @@ fn the_job_line_names_the_pieces_and_the_steps() {
     );
 }
 
-/// The once-per-job guard: Some once, then None until a refill, then Some again.
 #[test]
 fn take_job_line_returns_once_until_a_reset() {
     let mut report = fixture_report();

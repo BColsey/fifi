@@ -181,9 +181,7 @@ mod within_mode {
     use super::super::settings::{Activation, NO_BUDGET_PIECE};
     use crate::family::route::keeps_floored_anchor;
 
-    /// The cosine gate of every parity run: 0.99999.
     pub(super) const MIN_COSINE: f64 = 0.999_99;
-    /// The largest relative error of the F32 chunk gates: 1e-4.
     pub(super) const MAX_REL_ERROR: f64 = 1e-4;
     /// The floor of the BF16 run's minimum per-layer cosine: 0.95, below the 0.9799 that the
     /// reference BF16 decode run observed. The one definition that `parity.rs` imports too; it
@@ -192,15 +190,12 @@ mod within_mode {
     /// The minimum layer cosine of the reference BF16 decode run: the no-ratchet anchor of the
     /// floor.
     pub(super) const D1_BF16_MIN_LAYER_COSINE: f64 = 0.9799;
-    /// The largest regression below the anchor that the floor allows.
     pub(super) const BF16_LAYER_COSINE_REGRESSION: f64 = 0.01;
 
-    /// True for a finite cosine at or above the gate. A NaN fails.
     pub(super) fn passes(cosine: f64) -> bool {
         cosine.is_finite() && cosine >= MIN_COSINE
     }
 
-    /// True for a relative error that is finite and at most `MAX_REL_ERROR`.
     pub(super) fn rel_passes(rel: f64) -> bool {
         rel.is_finite() && rel <= MAX_REL_ERROR
     }
@@ -341,7 +336,6 @@ mod within_mode {
         Ok(configs)
     }
 
-    /// The default config list of the eval run.
     pub(super) fn default_bank_configs() -> Vec<BankConfig> {
         parse_bank_configs(
             "steps,chunk256,chunk64,tail8,tail20,tail40,tail60,tail100,tail150,tail300",
@@ -349,7 +343,6 @@ mod within_mode {
         .unwrap_or_else(|error| panic!("the default bank config list is broken: {error}"))
     }
 
-    /// The name of a config as the report row key: `steps`, `chunkN`, `tailT`.
     pub(super) fn bank_config_name(config: &BankConfig) -> String {
         match config {
             BankConfig::Steps => "steps".to_string(),
@@ -358,7 +351,6 @@ mod within_mode {
         }
     }
 
-    /// `n` in pieces of at most `width` rows (at least 1): the piece list a chunked run feeds.
     fn chunk_lengths(n: usize, width: usize) -> Vec<usize> {
         let width = width.max(1);
         let mut pieces = vec![width; n / width];

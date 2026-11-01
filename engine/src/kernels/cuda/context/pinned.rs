@@ -47,7 +47,6 @@ pub(crate) struct WordValue {
 }
 
 impl CudaContext {
-    /// Allocates the pinned word.
     pub(crate) fn pinned_word(&self) -> Result<PinnedWord, EngError> {
         self.ensure_usable()?;
         ensure_closed("a pinned word allocation")?;

@@ -22,10 +22,8 @@ const Q4K_TILE_BYTES: u64 = 72 * 16;
 const Q6K_TILE_BYTES: u64 = 112 * 16;
 const Q8_0_TILE_BYTES: u64 = 136 * 16;
 const Q5_0_TILE_BYTES: u64 = 44 * 16;
-/// Values per row of one Q5_0 tile.
 const Q5_0_TILE_COLS: u64 = 128;
 
-/// Values per row of one tile of `ty`.
 fn tile_cols(ty: GgufType) -> u64 {
     match ty {
         GgufType::Q50 => Q5_0_TILE_COLS,
@@ -33,7 +31,6 @@ fn tile_cols(ty: GgufType) -> u64 {
     }
 }
 
-/// Device memory one load needs, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Demand {
     pub(crate) tensors: u64,

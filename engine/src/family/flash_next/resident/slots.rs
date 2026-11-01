@@ -25,10 +25,8 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Sets in the pool.
 pub(super) const POOL_SETS: usize = 3;
 
-/// The page layout of one layer set: three expert stacks and the F32 gates.
 pub(super) struct SetLayout {
     pub(super) stacks: [StackLayout; 3],
     pub(super) gates: PageRange,
@@ -37,7 +35,6 @@ pub(super) struct SetLayout {
 }
 
 impl SetLayout {
-    /// Places the gate, up, and down stacks of `w` with `count` experts, then the gates.
     pub(super) fn new(
         ckpt: &StreamedCheckpoint,
         w: &RMoe,
@@ -153,7 +150,6 @@ impl ExpertSlots {
             })
     }
 
-    /// The writable bytes of an acquired set.
     pub(super) fn write(&mut self, index: usize) -> Result<&mut [u8], EngError> {
         self.sets
             .get_mut(index)
@@ -199,7 +195,6 @@ mod tests {
         kernels.import_tensor(&zero).unwrap()
     }
 
-    /// Writes one byte into set `index` and imports it as a lent resident.
     fn lend_one(
         slots: &mut ExpertSlots,
         kernels: &mut MlxKernels,

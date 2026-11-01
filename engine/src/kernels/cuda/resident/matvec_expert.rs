@@ -30,7 +30,6 @@ use crate::kernels::cuda::native::resident::matvec_expert::{
 use crate::kernels::cuda::resident::matvec_q::{QuantType, ROWS_MULTIPLE};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
-/// One expert matvec: the stack, the device ids, the activation view and the strided output.
 pub(crate) struct ExpertMatvecCall<'b> {
     pub(crate) ty: QuantType,
     pub(crate) w_stack: DeviceRange<'b>,
@@ -45,7 +44,6 @@ pub(crate) struct ExpertMatvecCall<'b> {
     pub(crate) n_used: usize,
 }
 
-/// The numbers of an expert matvec the byte counts follow from.
 #[derive(Clone, Copy)]
 struct ExpertShape {
     ty: QuantType,
@@ -57,7 +55,6 @@ struct ExpertShape {
     y_slot_stride: usize,
 }
 
-/// Bytes of the four ranges an expert matvec uses.
 struct ExpertNeeds {
     w_stack: usize,
     ids: usize,
@@ -65,10 +62,6 @@ struct ExpertNeeds {
     y: usize,
 }
 
-/// What an expert matvec reads and writes: the native blocks of `n_expert` experts of `rows` rows,
-/// `n_used` ids, one padded q8_1 row (or one per used slot) and, for `y`, the strided footprint
-/// `(n_used - 1) * y_slot_stride + rows` floats. `None` on overflow, for `n_used` 0 or when `k` is
-/// off the type's block grid.
 fn expert_needs(shape: &ExpertShape) -> Option<ExpertNeeds> {
     let x_rows = if shape.x_per_slot { shape.n_used } else { 1 };
     let y_floats = shape
@@ -100,12 +93,6 @@ impl ExpertMatvecCall<'_> {
 }
 
 impl CudaContext {
-    /// Queues the expert matvec of `call` on `stream`, writing `call.y`.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, for `k` off the type's
-    /// block grid, for `rows` 0 or not a multiple of 4, for `n_used` outside `1..=8` or above
-    /// `n_expert`, for `y_slot_stride` below `rows`, for a short or misaligned range, and for a
-    /// `y` that overlaps the stack, the ids or the activation.
     pub(crate) fn matvec_expert(
         &self,
         stream: &DeviceStream,
@@ -116,7 +103,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| matvec_expert_launch(stream_raw, &raw))
     }
 
-    /// Every check of an expert matvec, then the native view of its ranges.
     fn plan_matvec_expert<'b>(
         &self,
         call: &ExpertMatvecCall<'b>,

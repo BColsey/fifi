@@ -56,8 +56,6 @@ pub(crate) fn compiled_delta_rows_cleanup_count() -> u64 {
     unsafe { ffi::mlx_compile_delta_rows_cleanup_count() }
 }
 
-/// Reads only a CPU counter: how many times the Flint layer compile probe's
-/// closure body ran (traces). Steady cache-hit replays do not run the body.
 /// Per-operation-label build counts from `produce` (test builds only; the
 /// label-map instrumentation exists for the qualification label report).
 #[cfg(all(test, feature = "native-fault-qualification"))]
@@ -113,8 +111,6 @@ struct State {
 }
 
 impl State {
-    /// Whether `dtype` is a float operand of the resident operations: F32, and BF16 only after
-    /// `Context::allow_bf16` sets the switch.
     fn accepts_float(&self, dtype: Dtype) -> bool {
         dtype == Dtype::F32 || (dtype == Dtype::Bf16 && self.allow_bf16)
     }

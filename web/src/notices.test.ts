@@ -1,5 +1,3 @@
-/** Tests for the pure notice queue policy (node:test; no DOM at runtime). */
-
 import { test } from "node:test";
 import { deepStrictEqual } from "node:assert";
 import { noticeList } from "./notices.js";

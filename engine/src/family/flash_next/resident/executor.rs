@@ -137,20 +137,16 @@ pub(crate) struct FlashExecutor {
     log: std::sync::Arc<std::sync::Mutex<ChunkLog>>,
 }
 
-/// Tests only: the chunk runs and the page set opens of an executor.
 #[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChunkLog {
     /// The row count of each chunk that ran through `ResidentDecoder::prefill`, in order.
     chunks: Vec<usize>,
-    /// The number of times the prefill page sets opened.
     opens: usize,
 }
 
-/// The mutable state of one session.
 pub(crate) struct FlashSession {
     state: ResidentState,
-    /// The committed tokens, the pending token, and the finish flag.
     core: DecodeSession,
 }
 
@@ -160,17 +156,13 @@ pub(crate) struct FlashSession {
 struct FlashStep<'a> {
     decoder: &'a mut ResidentDecoder<'static>,
     state: &'a mut ResidentState,
-    /// The chunk size that `plan_prefill` stored, or `None` for one-token steps.
     chunk: Option<u32>,
-    /// The chunk size that the open prefill page sets serve, or 0 when none are open.
     open_tokens: &'a mut u32,
-    /// Tests only: the chunk log of the executor.
     #[cfg(test)]
     log: &'a std::sync::Mutex<ChunkLog>,
 }
 
 impl FlashStep<'_> {
-    /// Opens the prefill page sets for `tokens` rows per chunk unless they are open already.
     fn open_prefill(&mut self, tokens: u32) -> Result<()> {
         if *self.open_tokens != tokens {
             *self.open_tokens = 0;
@@ -195,8 +187,6 @@ impl TokenStepper for FlashStep<'_> {
             .map(|_| ())
     }
 
-    /// Feeds `tokens` as `Prompt` rows. With a planned chunk size, each run of that many rows is
-    /// one chunk, and a single row is a one-token step. Without one, every row is a step.
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
         let PrefillPath::Chunked(size) = PrefillPath::of(self.chunk) else {
             return tokens.iter().try_for_each(|&token| self.feed(token));
@@ -232,19 +222,16 @@ impl TokenStepper for FlashStep<'_> {
         fed_positions(self.state)
     }
 
-    /// Closes the prefill page sets, then clears the native state.
     fn reset(&mut self) -> Result<()> {
         close_pages(self.decoder, self.open_tokens);
         self.decoder.reset(self.state)
     }
 }
 
-/// The number of positions that the native state has fed.
 fn fed_positions(state: &ResidentState) -> usize {
     usize::try_from(state.pos()).unwrap_or(usize::MAX)
 }
 
-/// Releases and drops the prefill page sets. Nothing happens when none are open.
 fn close_pages(decoder: &mut ResidentDecoder<'static>, open_tokens: &mut u32) {
     decoder.close_prefill();
     *open_tokens = 0;
@@ -254,7 +241,6 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("{name}: {error}"))
 }
 
-/// Opens every shard of the checkpoint directory that the index names.
 fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     let name = "model.safetensors.index.json";
     let index = std::fs::read(dir.join(name)).map_err(|error| io_error(name, &error))?;
@@ -281,8 +267,7 @@ fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
 }
 
 impl FlashExecutor {
-    /// Loads the artifact in `artifact`, imports the weights, and creates the session. Call it on
-    /// the engine thread. `cache_limit` is the MLX allocator cache limit in bytes.
+    /// Call it on the engine thread. `cache_limit` is the MLX allocator cache limit in bytes.
     pub(crate) fn open(
         artifact: &Path,
         cache_limit: u64,
@@ -297,7 +282,7 @@ impl FlashExecutor {
         Self::from_parts(kernels, ckpt, &flash, rules)
     }
 
-    /// Builds the executor from loaded parts. The caller may drop `flash` afterwards.
+    /// The caller may drop `flash` afterwards.
     pub(crate) fn from_parts(
         kernels: MlxKernels,
         ckpt: &'static StreamedCheckpoint,
@@ -333,9 +318,6 @@ impl FlashExecutor {
         Ok((executor, session))
     }
 
-    /// The number of positions that the model accepts. A prompt of this many tokens or more is
-    /// rejected with `ContextLimit`, and a job ends with `Length` when its next feed needs this
-    /// position. The server uses it to check a prompt before admission.
     pub(crate) fn context_limit(&self) -> usize {
         self.context_limit
     }
@@ -420,7 +402,6 @@ impl FlashExecutor {
         Ok(PrefillPlan { chunk, terms })
     }
 
-    /// The numeric path that `feed_rows` takes now. A chunk size of one is a one-token step.
     fn prefill_path(&self) -> PrefillPath {
         PrefillPath::of(self.chunk)
     }
@@ -437,7 +418,6 @@ impl FlashExecutor {
         self.chunk = chunk;
     }
 
-    /// Releases and drops the prefill page sets. Nothing happens when none are open.
     fn close_prefill(&mut self) {
         close_pages(&mut self.decoder, &mut self.open_tokens);
     }
@@ -497,7 +477,6 @@ impl ExecutorOps for FlashExecutor {
             })
     }
 
-    /// Restores the saved prefix into the reset session when the session rules accept the prompt.
     fn restore_prefix(&mut self, st: &mut FlashSession, prompt: &[u32]) -> Result<usize> {
         let path = self.prefill_path();
         let decoder = &mut self.decoder;
@@ -553,7 +532,6 @@ mod tests {
         build_with(Embedding::Flat, rules)
     }
 
-    /// Builds the executor on the synthetic checkpoint with the given embedding table.
     fn build_with(embedding: Embedding, rules: FlashRules) -> (FlashExecutor, FlashSession) {
         let ckpt: &'static StreamedCheckpoint =
             Box::leak(Box::new(fixtures::checkpoint_with(embedding)));
@@ -567,7 +545,6 @@ mod tests {
         oracle_with(Embedding::Flat, prompt, count, sampler, limit)
     }
 
-    /// `oracle` on the synthetic checkpoint with the given embedding table.
     fn oracle_with(
         embedding: Embedding,
         prompt: &[u32],
@@ -616,7 +593,6 @@ mod tests {
         logits_alone_with(Embedding::Flat, prompt)
     }
 
-    /// `logits_alone` on the synthetic checkpoint with the given embedding table.
     fn logits_alone_with(embedding: Embedding, prompt: &[u32]) -> Vec<f32> {
         let ckpt = fixtures::checkpoint_with(embedding);
         let flash = FlashWeights::load(&ckpt, &fixtures::config()).unwrap();
@@ -638,7 +614,7 @@ mod tests {
         row.iter().map(|value| value.to_bits()).collect()
     }
 
-    /// A prompt of `len` tokens. The ids cycle through 1 to 7, because the fixture has 8 ids.
+    /// The ids cycle through 1 to 7, because the fixture has 8 ids.
     fn cycle(len: usize) -> Vec<u32> {
         (0..len)
             .map(|i| u32::try_from(i % 7).unwrap() + 1)
@@ -668,7 +644,6 @@ mod tests {
         rows: Vec<Vec<f32>>,
     }
 
-    /// Resets the session and prefills `prompt` in worker pieces of `worker_chunk` tokens.
     fn start_job(
         executor: &mut FlashExecutor,
         session: &mut FlashSession,
@@ -682,8 +657,6 @@ mod tests {
         }
     }
 
-    /// Runs the prompt as the worker does, then feeds the pending token and `FORCED` through
-    /// `Logits` steps and keeps every logits row.
     fn run_job(
         executor: &mut FlashExecutor,
         session: &mut FlashSession,
@@ -719,7 +692,6 @@ mod tests {
         }
     }
 
-    /// The chunk runs and page opens of the executor since the last call. The log is cleared.
     fn take_log(executor: &FlashExecutor) -> (Vec<usize>, usize) {
         let log = std::mem::take(&mut *executor.log.lock().unwrap());
         (log.chunks, log.opens)
@@ -791,12 +763,10 @@ mod tests {
             self.zero_state + self.growth_per_position * self.positions
         }
 
-        /// The value for `plan_prefill`. A margin that is not set adds 0.
         fn total(&self) -> u64 {
             self.session_state() + self.mlx_cache_limit + self.pressure_margin.unwrap_or(0)
         }
 
-        /// One `name=value` line per term. A margin that is not set says so.
         fn report(&self) -> String {
             let margin = self.pressure_margin.map_or_else(
                 || {
@@ -837,8 +807,6 @@ mod tests {
         }
     }
 
-    /// Each term of the reserve changes the total by its own bytes, and a margin that is not set
-    /// is named in the report.
     #[test]
     fn the_session_reserve_sums_the_state_the_cache_limit_and_the_margin() {
         let _serial = crate::native_test_lock();
@@ -1075,7 +1043,6 @@ mod tests {
             ("B", &prompt_b[..], &logits_b, &want_b),
             ("A again", &prompt_a[..], &logits_a, &want_a),
         ] {
-            // The logits of the first decode step, read through the decoder of the executor.
             executor.reset(&mut session).unwrap();
             assert_eq!(session.state.pos(), 0, "{name}: position after reset");
             assert!(executor.history(&session).is_empty(), "{name}: history");
@@ -1088,7 +1055,6 @@ mod tests {
                 .logits
                 .unwrap();
             assert_eq!(&bits(&row), want_logits, "{name}: first logits row");
-            // The sampled tokens of a whole job.
             executor.reset(&mut session).unwrap();
             assert_eq!(session.state.pos(), 0, "{name}: position after reset");
             assert!(executor.history(&session).is_empty(), "{name}: history");
@@ -1215,7 +1181,6 @@ mod tests {
                     assert_eq!(argmax(got), best, "{what}: argmax of row {n}");
                 }
             }
-            // The decode after a chunked prompt still works and closes the pages.
             start_job(&mut executor, &mut session, &prompt, worker);
             let mut job = seeded_generation(6);
             let tokens = tokens_of(&decode_all(&mut executor, &mut session, &mut job));
@@ -1227,8 +1192,6 @@ mod tests {
         }
     }
 
-    /// Each prompt is split at the planned size: a chunk never has more rows than the size, a
-    /// last single row is a step, a size of 2 is a chunk, and a size of 1 makes no chunk at all.
     #[test]
     fn the_chunks_of_a_prompt_never_exceed_the_planned_size() {
         let _serial = crate::native_test_lock();
@@ -1582,12 +1545,10 @@ mod tests {
 
     /// A prompt of 6 tokens whose first 4 tokens form the saved key.
     const PREFIX_PROMPT: [u32; 6] = [1, 2, 3, 4, 5, 6];
-    /// The key length of the prefix tests.
     const KEY: usize = 4;
     /// Bytes that one fed QSA position adds in the fixture (resident `state.rs`).
     const QSA_PER_POSITION: u64 = 640;
 
-    /// Saves `PREFIX_PROMPT[..KEY]` in a reset session: prefill the key, then save it.
     fn save_key(executor: &mut FlashExecutor, session: &mut FlashSession) -> bool {
         executor.reset(session).unwrap();
         executor.prefill(session, &PREFIX_PROMPT[..KEY]).unwrap();
@@ -2073,13 +2034,11 @@ mod tests {
             }
             panic!("the job did not finish in 40 decode calls");
         };
-        // Run A: one full prefill of 300 tokens.
         executor.reset(&mut session).unwrap();
         let started = std::time::Instant::now();
         executor.prefill(&mut session, &prompt).unwrap();
         let full_prefill_seconds = started.elapsed().as_secs_f64();
         let full = decode32(&mut executor, &mut session);
-        // Run B: prefill the key, save, reset, restore, prefill the last 50 tokens.
         executor.reset(&mut session).unwrap();
         executor.prefill(&mut session, key).unwrap();
         assert!(
@@ -2220,7 +2179,6 @@ mod tests {
             .expect("FLASH_NEXT_CACHE_LIMIT is not set")
             .parse()
             .expect("FLASH_NEXT_CACHE_LIMIT is not a byte count");
-        // The tokenizer files come from the artifact directory and are checked against the manifest.
         let pin = tokenizer_pin(&manifest, 248_077).unwrap();
         let bundle = TokenizerBundle::load(&artifact, &pin).unwrap();
         assert_eq!(bundle.eos_token_ids(), [248_046, 248_044], "EOS ids");

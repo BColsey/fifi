@@ -565,7 +565,6 @@ fn the_model_type_must_belong_to_the_family() {
         root.as_object_mut().expect("root").remove("model_type");
     }));
     assert!(message.contains("model_type"), "{message}");
-    // Either level alone names the family.
     checked(|root| {
         root["text_config"]
             .as_object_mut()

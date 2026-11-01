@@ -36,7 +36,6 @@ use crate::{
 /// Page sets in the pool. Two suffice: layer `L` reuses the set of layer `L - 2`.
 const PREFILL_SETS: usize = 2;
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
@@ -105,7 +104,6 @@ impl PrefillLayout {
     }
 }
 
-/// The residents of one imported wave.
 pub(super) struct WavePages {
     /// The gate, up, and down stacks, `[experts, rows, columns]`, in wave rank order.
     pub(super) stacks: [ResidentPackedWeight; 3],
@@ -119,7 +117,6 @@ pub(super) struct WavePages {
     pub(super) inverse: Option<ExecutionTensor>,
 }
 
-/// Two page sets for the chunks of one prefill.
 pub(super) struct PrefillPool {
     slots: ExpertSlots,
     set_experts: u32,
@@ -293,12 +290,10 @@ impl PrefillPool {
     }
 }
 
-/// The little-endian bytes of each word of `list`.
 fn le_words(list: &[u32]) -> impl ExactSizeIterator<Item = [u8; 4]> + '_ {
     list.iter().map(|word| word.to_le_bytes())
 }
 
-/// Writes the little-endian `words` at `offset` of `bytes`.
 fn put_words(
     bytes: &mut [u8],
     offset: usize,

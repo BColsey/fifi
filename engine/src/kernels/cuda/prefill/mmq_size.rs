@@ -89,7 +89,6 @@ pub(crate) enum Q8_1Layout {
 }
 
 impl MmqType {
-    /// The scale layout of the q8_1 activations this weight type reads.
     pub(crate) fn q8_1_layout(self) -> Q8_1Layout {
         match self {
             Self::Q80 | Self::Q50 | Self::Q6K | Self::Nvfp4 => Q8_1Layout::D4,

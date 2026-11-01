@@ -170,7 +170,6 @@ impl ResidentWeights {
 /// Change it together with the vendored crate.
 const MAX_HEADER_BYTES: u64 = 100_000_000;
 
-/// Returns the header bytes when the length prefix fits the buffer and the crate limit.
 fn header_bytes(bytes: &[u8]) -> Option<&[u8]> {
     let prefix: [u8; PREFIX_LEN] = bytes.get(..PREFIX_LEN)?.try_into().ok()?;
     let length = u64::from_le_bytes(prefix);

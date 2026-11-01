@@ -25,15 +25,13 @@ pub(crate) const QUEUE_CAPACITY: usize = 32;
 /// Capacity of the bounded output channel of one job (scheduler.md, item 3).
 pub(crate) const EVENT_CAPACITY: usize = 1_024;
 
-/// Token counts of a finished job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JobUsage {
-    /// Tokens in the submitted prompt.
     pub(crate) prompt_tokens: u32,
     /// Tokens in the batches that the executor committed, including a final EOS token.
     pub(crate) completion_tokens: u32,
-    /// Prompt tokens served from the saved prefix state. It is 0 unless the job carries a
-    /// prefix boundary and the executor restored a saved prefix.
+    /// It is 0 unless the job carries a prefix boundary and the executor restored a saved
+    /// prefix.
     pub(crate) reused_tokens: u32,
     /// The prefix-store report of the job, taken after the prefill: the store of a job with a
     /// prefix boundary, or `None` when the executor keeps no prefix report (the default of
@@ -45,13 +43,9 @@ pub(crate) struct JobUsage {
 /// `prefix_hit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrefixHit {
-    /// No stored entry matched the prompt.
     Miss,
-    /// The job restored a pinned root.
     Root,
-    /// The job restored a periodic checkpoint.
     Periodic,
-    /// The job restored a tip entry.
     Tip,
     /// The job restored a block cut: the rolling intermediate entry of the lineage, so a
     /// rewritten prompt's reuse is distinguishable from a tip's exact extension.
@@ -59,7 +53,6 @@ pub(crate) enum PrefixHit {
 }
 
 impl PrefixHit {
-    /// The name of the request-log field `prefix_hit`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             PrefixHit::Miss => "miss",
@@ -71,8 +64,6 @@ impl PrefixHit {
     }
 }
 
-/// The prefix-hit class of the entry a restore took: `Some(kind)` maps to its own
-/// class and `None` (nothing restored) to `Miss`. The one mapping that the executors share.
 impl From<Option<SaveKind>> for PrefixHit {
     fn from(kind: Option<SaveKind>) -> Self {
         match kind {
@@ -98,7 +89,6 @@ pub(crate) struct PrefixReport {
     /// the charge of its own entries. The store never sizes a snapshot, and an executor
     /// without a charge reports 0.
     pub(crate) bytes: u64,
-    /// The kind of the entry the job restored, or `Miss` when nothing restored.
     pub(crate) hit: PrefixHit,
     /// Prompt tokens shared with the longest stored key beyond the restored prefix: tokens
     /// that were shared with a stored key but not covered by a checkpoint. It is 0 when the
@@ -135,7 +125,6 @@ pub(crate) struct PrefixReport {
 }
 
 impl Default for PrefixReport {
-    /// The report of an executor that keeps no prefix state: all zero with a `Miss`.
     fn default() -> Self {
         Self {
             entries: 0,
@@ -150,18 +139,14 @@ impl Default for PrefixReport {
     }
 }
 
-/// One message from the engine thread to the owner of a job.
 #[derive(Debug, PartialEq)]
 pub(crate) enum JobEvent {
-    /// One committed batch. The batch with `finish` set is the last one.
+    /// The batch with `finish` set is the last one.
     Batch(DecodeBatch),
-    /// The usage of the job. It follows the last batch and always has room in the channel.
     Finished(JobUsage),
-    /// The job failed. No batch or usage follows. It always has room in the channel.
     Error(EngError),
 }
 
-/// The engine side of a job. It moves to the engine thread.
 pub(crate) struct Job {
     pub(super) prompt: Vec<u32>,
     pub(super) generation: GenerationState,
@@ -174,16 +159,12 @@ pub(crate) struct Job {
     pub(super) root_boundary: Option<usize>,
 }
 
-/// The owner side of a job: its event receiver and its cancellation handle.
-/// Dropping it cancels the job.
 pub(crate) struct JobHandle {
-    /// The bounded output channel. Only this job's events arrive here.
     pub(crate) events: mpsc::Receiver<JobEvent>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Job {
-    /// Creates a job and its handle. The prompt must hold at least one token.
     pub(crate) fn new(
         prompt: Vec<u32>,
         generation: GenerationState,
@@ -209,9 +190,7 @@ impl Job {
     }
 
     /// Marks the first `boundary` prompt tokens as the reusable prefix. The engine restores a
-    /// saved prefix that matches them and saves the state after them. The boundary must leave at
-    /// least one token after it. A job that already carries a root keeps the rule `root <
-    /// boundary`: a new boundary at or before that root is refused.
+    /// saved prefix that matches them and saves the state after them.
     pub(crate) fn with_prefix_boundary(mut self, boundary: usize) -> Result<Job, EngError> {
         if boundary == 0 || boundary >= self.prompt.len() {
             return Err(EngError::BadRequest(
@@ -228,9 +207,8 @@ impl Job {
     }
 
     /// Marks the first `root` prompt tokens as the root save point: the engine saves them as a
-    /// pinned root after prefilling them. A root needs a prefix boundary first
-    /// (`with_prefix_boundary`) and must lie inside it: `0 < root < prefix_boundary`. The
-    /// 2,048-token minimum of a root is the worker's rule, not the job's.
+    /// pinned root after prefilling them. The 2,048-token minimum of a root is the worker's
+    /// rule, not the job's.
     pub(crate) fn with_root_boundary(mut self, root: usize) -> Result<Job, EngError> {
         let Some(boundary) = self.prefix_boundary else {
             return Err(EngError::BadRequest(
@@ -248,12 +226,10 @@ impl Job {
 }
 
 impl JobHandle {
-    /// Asks the engine to stop this job. A queued job does not start. A running job stops after its current pass.
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
-    /// True after `cancel` or after the engine cancelled the job.
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
@@ -265,19 +241,16 @@ impl Drop for JobHandle {
     }
 }
 
-/// Sends a data event. It keeps the last slot free for the terminal event.
-/// Returns false when the channel is full (slow client) or closed.
+/// Sends a data event, keeping the last slot free for the terminal event.
 pub(super) fn send_data(events: &mpsc::Sender<JobEvent>, event: JobEvent) -> bool {
     events.capacity() >= 2 && events.try_send(event).is_ok()
 }
 
-/// Sends the one terminal event. The slot that `send_data` keeps free holds it.
+/// Sends the one terminal event into the slot that `send_data` keeps free.
 pub(super) fn send_terminal(events: &mpsc::Sender<JobEvent>, event: JobEvent) {
     let _ = events.try_send(event);
 }
 
-/// Sends the events of a job that ended before any generation: a `Cancelled` batch and a usage
-/// event with no completion tokens.
 pub(super) fn send_cancelled(events: &mpsc::Sender<JobEvent>, prompt_tokens: u32) {
     send_data(
         events,
@@ -322,8 +295,6 @@ mod tests {
         })
     }
 
-    /// The default report of an executor that keeps no prefix state is all zero with a `Miss`,
-    /// and each hit kind carries its request-log name.
     #[test]
     fn a_default_prefix_report_is_all_zero_with_a_miss_and_the_hits_have_names() {
         assert_eq!(
@@ -351,9 +322,8 @@ mod tests {
         }
     }
 
-    /// The `From` mapping of the restored kind: every `SaveKind` names its own class
-    /// and `None` names a `Miss`. The `Periodic` row is the one no other test reaches, because
-    /// the store-level tests restore roots and tips only.
+    /// The `Periodic` row is the one no other test reaches, because the store-level tests
+    /// restore roots and tips only.
     ///
     /// Mutation check: mapping `Some(SaveKind::Periodic)` to `PrefixHit::Tip` fails the
     /// periodic row.
@@ -415,8 +385,6 @@ mod tests {
 
     #[test]
     fn a_new_prefix_boundary_must_stay_after_the_root_boundary() {
-        // The tip 4 and the root 3 are valid. A new boundary of 3 or 2 would leave the root at
-        // or after the tip, so the job refuses it. A boundary of 5 keeps the rule.
         let cases: [(usize, bool); 3] = [(2, false), (3, false), (5, true)];
         for (boundary, accepted) in cases {
             let (job, _handle) = Job::new(vec![5, 6, 7, 8, 9, 10], generation()).expect("job");
@@ -433,7 +401,6 @@ mod tests {
 
     #[test]
     fn a_root_boundary_must_lie_inside_the_reusable_prefix() {
-        // The tip boundary is 3, so a root of 1 or 2 lies inside it.
         let cases: [(usize, bool); 5] = [(0, false), (1, true), (2, true), (3, false), (4, false)];
         for (root, accepted) in cases {
             let (job, _handle) = Job::new(vec![5, 6, 7, 8], generation()).expect("job");

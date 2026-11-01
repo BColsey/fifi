@@ -1,7 +1,6 @@
 use super::*;
 use crate::kernels::cuda::testkit;
 
-/// Explicit RNE bit cases: ties-even, signed zero, wide normals and BF16 subnormals.
 #[test]
 fn row_bf16_publication_matches_rne_without_f16_narrowing() {
     if !testkit::device_present("row BF16 publication RNE") {

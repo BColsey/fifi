@@ -228,7 +228,6 @@ fn host_labels(line: &str) -> Vec<String> {
     found
 }
 
-/// The internal labels of one line.
 fn labels(line: &str) -> Vec<String> {
     let lower = line.to_ascii_lowercase();
     let mut found = Vec::new();

@@ -11,7 +11,6 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// Output and replacement state of one resident DeltaNet step. Every tensor is lazy.
 pub(super) struct DeltaStep {
     /// Layer output `[1, H]`.
     pub(super) out: ExecutionTensor,
@@ -25,7 +24,6 @@ fn overflow() -> EngError {
     EngError::BadRequest("resident delta dimensions overflow".into())
 }
 
-/// Returns `sqrt(sum(x * x) + 1e-6)` for each row of a `[rows, width]` tensor, as `[rows, 1]`.
 fn l2_den(
     m: &mut MlxKernels,
     x: &ExecutionTensor,
@@ -37,10 +35,8 @@ fn l2_den(
     m.unary(UnaryOp::Sqrt, &sum)
 }
 
-/// Builds one DeltaNet decode step over `x` (`hidden` elements) and the old `rec` and `ring`.
-///
-/// It performs no synchronization. The caller replaces its state with the returned `rec` and `ring`.
-/// A state shape error returns `BadRequest` before the first native call.
+/// The caller replaces its state with the returned `rec` and `ring`. A state shape error
+/// returns `BadRequest` before the first native call.
 pub(super) fn step(
     ctx: &mut Ctx<'_>,
     shape: &DeltaShape,
@@ -179,17 +175,14 @@ mod tests {
         assert!(rel <= 1e-4, "{what}: rel {rel}");
     }
 
-    /// `x[i] = ((i % 7) - 3) / 8` for `i` in `0..64` (H = 64).
     fn ramp7() -> Vec<f32> {
         (0..64).map(|i| ((i % 7) as f32 - 3.0) * 0.125).collect()
     }
 
-    /// `x[i] = ((i % 5) - 2) / 16` for `i` in `0..64`.
     fn ramp5() -> Vec<f32> {
         (0..64).map(|i| ((i % 5) as f32 - 2.0) * 0.0625).collect()
     }
 
-    /// Imports `x` as `[1, 64]`.
     fn input(kernels: &mut MlxKernels, x: &[f32]) -> ExecutionTensor {
         kernels
             .import_tensor(&f32_tensor(vec![1, 64], x).unwrap())

@@ -111,7 +111,6 @@ fn shape(dims: &[usize]) -> Vec<u32> {
     dims.iter().map(|&d| d as u32).collect()
 }
 
-/// The six resident operands of a case.
 struct Resident {
     q: ExecutionTensor,
     k: ExecutionTensor,

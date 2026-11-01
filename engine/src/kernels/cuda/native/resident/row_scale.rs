@@ -48,7 +48,6 @@ const _: () = assert!(
         && offset_of!(RowScaleArgsRepr, n) == 24
 );
 
-/// What one row-scale launch reads and writes: m rows of n f32 values and the scale.
 pub(in crate::kernels::cuda) struct RowScaleRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -57,8 +56,6 @@ pub(in crate::kernels::cuda) struct RowScaleRaw<'a> {
     pub(in crate::kernels::cuda) n: usize,
 }
 
-/// Proves a row-scale launch before the native call: a finite scale, m and n in
-/// range, both ranges sized and 4-byte aligned, and out disjoint from x.
 fn check_row_scale(call: &RowScaleRaw<'_>) -> Result<(), DeviceFailure> {
     let values = call
         .m
@@ -78,7 +75,6 @@ fn check_row_scale(call: &RowScaleRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the row scale of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn row_scale_launch(
     stream: &RawStream,
     call: &RowScaleRaw<'_>,

@@ -18,10 +18,8 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::embed_bf16::{EmbedBf16Raw, embed_bf16_launch};
 
-/// The most tokens one gather takes.
 pub(crate) const EMBED_BF16_MAX_TOKENS: usize = 4096;
 
-/// One gather: the table, the ids, the output rows and the step status word.
 pub(crate) struct EmbedBf16Call<'b> {
     /// `n_rows` rows of `k` BF16 codes.
     pub(crate) table: DeviceRange<'b>,
@@ -44,7 +42,6 @@ fn bytes(factors: &[usize]) -> Result<usize, EngError> {
 }
 
 impl CudaContext {
-    /// Queues the gather of `call` on `stream`, writing `call.x`.
     pub(crate) fn embed_bf16(
         &self,
         stream: &DeviceStream,

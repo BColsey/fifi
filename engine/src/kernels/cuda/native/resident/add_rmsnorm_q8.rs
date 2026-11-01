@@ -75,10 +75,7 @@ fn q8_bytes_native(n: usize) -> Option<usize> {
     padded.checked_div(32)?.checked_mul(36)
 }
 
-/// Proves a launch before the native call: `n` a multiple of 256 in `256..=32768`, `eps` finite
-/// and above 0, every f32 range `n` floats and 4-byte aligned (`norm_out` 16), `q8` the padded
-/// row and 4-byte aligned, and the written extents (`h`, `norm_out`, `q8`) disjoint from every
-/// other extent (`delta` and `weight` may share bytes with each other).
+/// `delta` and `weight` may share bytes; every extent the kernel writes must be apart.
 fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
     let n = call.n;
     let row = n.checked_mul(4).ok_or_else(invalid_argument)?;
@@ -120,8 +117,6 @@ fn check_add_norm_q8(call: &AddNormQ8Raw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the fused add, RMSNorm and q8_1 quantize of `call` on `stream`. Returns when the kernel
-/// is queued.
 pub(in crate::kernels::cuda) fn add_rmsnorm_q8_launch(
     stream: &RawStream,
     call: &AddNormQ8Raw<'_>,

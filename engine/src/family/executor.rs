@@ -1,6 +1,4 @@
-//! Crate-internal executor seam: the `ExecutorOps` trait and the per-job `GenerationState`.
-//!
-//! The scripted test fake lives in `crate::exec_fake`.
+//! The scripted test fake for the `ExecutorOps` seam lives in `crate::exec_fake`.
 
 use crate::EngError;
 use crate::family::sampler::Sampler;
@@ -18,19 +16,15 @@ pub(crate) struct GenerationState {
     pub(crate) cancel: Arc<AtomicBool>,
     /// The sampler of this job. The executor draws from it inside `decode`.
     pub(crate) sampler: Sampler,
-    /// The output limit of this job. `None` means the job has no limit of its own.
     max_tokens: Option<u32>,
-    /// The tokens that count toward `max_tokens`. An EOS token does not count.
     generated: u32,
 }
 
 impl GenerationState {
-    /// Creates the state of one job with an unset cancellation flag and a greedy sampler.
     pub(crate) fn new(decoder: IncrementalDecoder) -> Self {
         Self::with_sampler(decoder, Sampler::greedy())
     }
 
-    /// Creates the state of one job with an unset cancellation flag and the given sampler.
     pub(crate) fn with_sampler(decoder: IncrementalDecoder, sampler: Sampler) -> Self {
         Self {
             decoder,
@@ -41,19 +35,18 @@ impl GenerationState {
         }
     }
 
-    /// Sets the output limit of this job. A limit of zero ends the job on its first `decode` call.
+    /// A limit of zero ends the job on its first `decode` call.
     pub(crate) fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
 
-    /// Returns the tokens the job can still generate, or `None` when the job has no limit.
     pub(crate) fn remaining_tokens(&self) -> Option<u32> {
         self.max_tokens
             .map(|limit| limit.saturating_sub(self.generated))
     }
 
-    /// Counts `count` generated tokens against the limit. Never count an EOS token.
+    /// The tokens that count toward `max_tokens`; an EOS token never counts.
     pub(crate) fn record_generated(&mut self, count: u32) {
         self.generated = self.generated.saturating_add(count);
     }
@@ -64,7 +57,7 @@ impl GenerationState {
 /// feeds a token, so a prompt that cannot fit is refused before any engine work.
 pub(crate) trait ExecutorOps {
     type Session;
-    /// The admitted simultaneous sessions. Existing executors keep their single-session path.
+    /// Existing executors keep their single-session path.
     fn max_seqs(&self) -> usize {
         1
     }
@@ -93,7 +86,6 @@ pub(crate) trait ExecutorOps {
     }
     /// The committed tokens of the session.
     fn history<'s>(&self, st: &'s Self::Session) -> &'s [u32];
-    /// Clears all mutable session state together.
     fn reset(&mut self, st: &mut Self::Session) -> Result<()>;
     /// Consumes one non-empty prompt chunk.
     fn prefill(&mut self, st: &mut Self::Session, toks: &[u32]) -> Result<()>;
@@ -248,7 +240,6 @@ mod tests {
         }
     }
 
-    /// An executor that implements only the required calls.
     struct Bare;
 
     impl ExecutorOps for Bare {

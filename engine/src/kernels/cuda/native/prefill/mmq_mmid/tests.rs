@@ -36,7 +36,6 @@ use crate::weights::GgufType;
 /// Bytes of each device allocation behind a range: far above the base call's needs, so a row
 /// whose check a mutant deletes launches inside its allocations as far as the geometry allows.
 const ALLOC: usize = 16 << 20;
-/// The NaN prefill of `dst`, as bytes.
 const NAN: [u8; 4] = 0x7fc0_dead_u32.to_le_bytes();
 
 /// The legal base geometry: 4 experts of 128 rows by K 256, 4 tokens, 2 ids, `ld` 128.
@@ -70,8 +69,6 @@ const BOUNDS: usize = 3;
 const DST: usize = 4;
 const FIXUP: usize = 5;
 
-/// The device allocations behind the six ranges, the base address of each, and the SM count the
-/// entry will see.
 struct Fx {
     bufs: [DeviceBuffer; 6],
     addr: [*mut c_void; 6],
@@ -90,7 +87,6 @@ impl Fx {
         let sms = device_facts(ctx)?.nsm;
         let nsm = c_int::try_from(sms)
             .map_err(|_| EngError::BadRequest(format!("the device reports {sms} SMs")))?;
-        // Weights: random Q4_K blocks (4 experts x 128 rows, K 256) padded to the allocation.
         let mut weights = testkit::weight_source(GgufType::Q4K, 4 * 128, 256);
         weights.resize(ALLOC, 0);
         // Ids: compact column c -> token slot c, two columns per expert.
@@ -293,7 +289,6 @@ fn rows(fx: &Fx) -> Vec<Row> {
     rows
 }
 
-/// Issues one raw call and returns the entry's status.
 fn issue(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -361,7 +356,6 @@ fn mmq_mmid_raw_ffi_refuses_every_c_side_launch_check() {
         );
     }
     println!("{} raw rows, every one refused", statuses.len());
-    // A refused call queued nothing: dst is still the NaN prefill.
     let dst = dst.expect("all rows refused");
     assert!(
         dst.as_chunks::<4>().0.iter().all(|c| *c == NAN),

@@ -4,7 +4,6 @@ use super::*;
 use crate::kernels::cuda::CudaContext;
 use crate::kernels::cuda::testkit;
 
-/// One row of four values scaled by two matches the host reference exactly.
 #[test]
 fn scales_one_row_against_the_host_reference() {
     if !testkit::device_present("row_scale basic") {
@@ -46,7 +45,6 @@ fn batch_guard_values(rows: usize, columns: usize) -> Vec<f32> {
         .collect()
 }
 
-/// One guard and one restore cover all routed rows, preserving earlier status bits.
 #[test]
 fn row_pow2_round_trip_preserves_a_block_and_earlier_status() {
     if !testkit::device_present("row_pow2 block round trip") {
@@ -280,7 +278,6 @@ fn row_pow2_rejects_nonfinite_rows_without_clearing_status() {
     ctx.ensure_usable().expect("caller can reject and retry");
 }
 
-/// The wrapper refuses a non-finite scale before any native call.
 #[test]
 fn refuses_a_non_finite_scale() {
     if !testkit::device_present("row_scale nan refusal") {

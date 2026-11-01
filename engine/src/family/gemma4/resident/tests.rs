@@ -1,7 +1,6 @@
 //! Real-checkpoint tests of the resident decode step.
 use super::{Gemma, VOCAB};
 
-/// Loads the pinned checkpoint and runs one decode step.
 #[test]
 #[ignore = "requires the pinned Humanizer file and a device"]
 fn decodes_one_token_against_the_pinned_checkpoint() {

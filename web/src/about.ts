@@ -1,8 +1,3 @@
-/**
- * About view: connection facts, server facts, and local settings.
- * The API key lives in this browser only.
- */
-
 import type { Model } from "./api";
 import { loadSettings, saveSettings, type ThemeChoice } from "./store";
 
@@ -187,7 +182,6 @@ export class AboutView {
   }
 }
 
-/** Apply a theme choice to the document root. */
 export function applyTheme(choice: ThemeChoice): void {
   if (choice === "system") delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = choice;

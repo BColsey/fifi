@@ -25,7 +25,6 @@ const CUDA_ERROR_NO_DEVICE: i32 = 100;
 const REQUIRE_DEVICE_MESSAGE: &str =
     "INFERENCE_CUDA_REQUIRE_DEVICE is set but no CUDA device is visible";
 
-/// What a device test does with the result of [`super::device_count`].
 #[derive(Debug, Clone, PartialEq)]
 enum Presence {
     /// A device is visible; the test runs.
@@ -95,7 +94,6 @@ struct Probed {
 }
 
 impl Probed {
-    /// The probe outcome of `count`.
     fn of(count: Result<i32, EngError>) -> Self {
         let visible = count.as_ref().copied().ok();
         Self {
@@ -116,7 +114,6 @@ struct ProbeCache {
 }
 
 impl ProbeCache {
-    /// An empty cache.
     const fn new() -> Self {
         Self {
             probed: OnceLock::new(),
@@ -129,7 +126,6 @@ impl ProbeCache {
     }
 }
 
-/// The process's one device probe.
 static DEVICE_PROBE: ProbeCache = ProbeCache::new();
 
 /// A host with no driver or device skips the test, unless `INFERENCE_CUDA_REQUIRE_DEVICE`
@@ -247,7 +243,7 @@ pub(super) fn latching_test_in_child(path: &str, expect: &[&str]) -> bool {
 pub(crate) struct Rng(u64);
 
 impl Rng {
-    /// A generator for `seed`. The all-zero state is a fixed point of xorshift, so seed 0 maps to
+    /// The all-zero state is a fixed point of xorshift, so seed 0 maps to
     /// a fixed non-zero state.
     pub(crate) fn new(seed: u64) -> Self {
         Self(if seed == 0 {
@@ -257,7 +253,6 @@ impl Rng {
         })
     }
 
-    /// The next 64 random bits.
     pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -265,7 +260,7 @@ impl Rng {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    /// A value in `0..limit`. The modulo bias is negligible for test data. Panics for `limit` 0.
+    /// The modulo bias is negligible for test data. Panics for `limit` 0.
     pub(crate) fn below(&mut self, limit: u64) -> u64 {
         assert!(limit > 0, "the Rng limit must be positive");
         self.next_u64() % limit
@@ -544,7 +539,6 @@ pub(super) fn unpack_xf(xf: &[u8], m: usize, k: usize) -> Vec<u16> {
     out
 }
 
-/// A device buffer that holds `bytes`.
 pub(super) fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> DeviceBuffer {
     ctx.upload(bytes).expect("upload of the test bytes")
 }
@@ -617,7 +611,6 @@ pub(super) fn input(tokens: usize, k: usize) -> Vec<f32> {
         .collect()
 }
 
-/// A device buffer that holds `values`.
 pub(super) fn upload_f32(ctx: &CudaContext, values: &[f32]) -> DeviceBuffer {
     let bytes: Vec<u8> = values
         .iter()
@@ -660,7 +653,6 @@ pub(super) fn blocking(
         .expect("blocking linear")
 }
 
-/// Repeats of one projection in the determinism tests.
 pub(super) const REPEATS: usize = 1_000;
 /// Repeats queued, synchronized and compared together; bounds the host and device memory of a run.
 const REPEAT_CHUNK: usize = 100;
@@ -857,7 +849,6 @@ mod presence_tests {
         }
     }
 
-    /// The failure of any error that is not a missing driver or device.
     fn query_failure(error: &EngError) -> Presence {
         Presence::Fail(format!("CUDA device count query: {error:?}"))
     }

@@ -755,30 +755,21 @@ mod tests {
 
     #[test]
     fn capacity_target_rounds_to_4096_doubles_then_caps() {
-        // Rounding: any need up to 4096 allocates exactly 4096 rows.
         assert_eq!(capacity_target(1, 0, 32768), 4096);
         assert_eq!(capacity_target(4096, 0, 32768), 4096);
-        // 4097 rounds to 8192.
         assert_eq!(capacity_target(4097, 0, 32768), 8192);
-        // Doubling: an existing 8192 never grows to less than 16384.
         assert_eq!(capacity_target(8193, 8192, 32768), 16384);
-        assert_eq!(capacity_target(8193, 8192, 8192), 8192); // capped
-        // A far need caps at the limit instead of jumping past it.
+        assert_eq!(capacity_target(8193, 8192, 8192), 8192);
         assert_eq!(capacity_target(30000, 16384, 32768), 32768);
         assert_eq!(capacity_target(32768, 0, 32768), 32768);
-        // Rollback limit: growth lands exactly on 8192.
         assert_eq!(capacity_target(5000, 0, 8192), 8192);
     }
 
     #[test]
     fn vendor_decode_slice_len_bounds() {
-        // The slice end INCLUDES the row just appended (p0 + rows).
         assert_eq!(vendor_decode_slice_len(4095, 1, 8192, true), Some(4096));
-        // First step past the growth boundary still slices (4097 < 8192).
         assert_eq!(vendor_decode_slice_len(4096, 1, 8192, true), Some(4097));
-        // Exactly full plane: the slice would be the plane itself.
         assert_eq!(vendor_decode_slice_len(8191, 1, 8192, true), None);
-        // Flag off: byte-for-byte whole plane.
         assert_eq!(vendor_decode_slice_len(4095, 1, 8192, false), None);
     }
 

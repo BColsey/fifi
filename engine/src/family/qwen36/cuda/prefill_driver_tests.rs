@@ -314,9 +314,7 @@ fn admission_takes_the_cap_the_decode_arena_and_the_extras() {
         )
         .expect("the admission runs")
     };
-    // A budget that admits 2048 with cap 2048 gives 2048 ...
     assert_eq!(admits(boundary(0), 0, M_LADDER[0], &[]), Some(2048));
-    // ... and with cap 128 gives 128 (the cap narrows the ladder).
     assert_eq!(admits(boundary(0), 0, 128, &[]), Some(128));
     // Charging the decode arena lowers the budget the ladder sees by exactly that many
     // bytes, so the SAME budget admits the next size down only when the arena is charged

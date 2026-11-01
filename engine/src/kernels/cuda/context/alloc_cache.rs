@@ -46,7 +46,6 @@ pub(super) struct ReturnPolicy {
     dirty: bool,
 }
 
-/// What a returned block does before it goes idle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OnReturn {
     Synchronize,
@@ -241,8 +240,6 @@ impl AllocCache {
         }
     }
 
-    /// What a returned block does before it goes idle: the device synchronize of the default,
-    /// or nothing while the lazy mode holds.
     fn settle_for_return(&self) -> Result<(), EngError> {
         let mut policy = self.policy.get();
         let action = policy.on_return(self.lease.streams());
@@ -255,7 +252,6 @@ impl AllocCache {
         Ok(())
     }
 
-    /// Selects the lazy return (see [`ReturnPolicy`]); the default keeps the synchronize.
     pub(super) fn set_lazy_return(&self, lazy: bool) {
         self.policy.set(self.policy.get().with_lazy(lazy));
     }

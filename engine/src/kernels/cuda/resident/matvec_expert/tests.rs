@@ -15,7 +15,6 @@ use crate::kernels::cuda::{CapturePlan, CudaContext, DeviceBuffer, DeviceStream}
 
 const N_EXPERT: usize = 16;
 const N_USED: usize = 8;
-/// Slots include 0 and 15 and a repeated id.
 const IDS: [i32; N_USED] = [0, 15, 3, 3, 7, 15, 1, 9];
 const TYPES: [QuantType; 4] = [
     QuantType::Q4K,
@@ -157,8 +156,6 @@ fn expert_launch(
     .expect("expert matvec");
 }
 
-/// The byte counts `plan_matvec_expert` checks a call against: the footprint of `y`, the
-/// per-slot activation rows and the checked `rows * n_expert`.
 #[test]
 fn expert_needs_are_pure_and_exact() {
     let shape = ExpertShape {
@@ -270,7 +267,6 @@ fn matvec_expert_equals_the_dense_launch_per_slot() {
                     assert_eq!(*byte, 0xAA, "{ty:?} gate launch wrote into the up half");
                 }
             }
-            // The up launch at offset rows, and the per-slot activation view.
             let up_y = testkit::upload_filled(&ctx, 0x55, y_bytes);
             expert_launch(
                 &ctx,
@@ -383,8 +379,6 @@ fn matvec_expert_follows_the_device_ids() {
     }
 }
 
-/// The out-of-range id guard of one shape: ids holding -1 and `N_EXPERT` in two slots give those
-/// slots the quiet NaN in every row and leave the other slots equal to the dense oracle.
 fn check_out_of_range_ids(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -442,7 +436,6 @@ fn matvec_expert_ids_out_of_range_are_documented() {
     check_out_of_range_ids(&ctx, &stream, QuantType::Q4K, DOWN, (true, 0x8200_0002));
 }
 
-/// Where `y` of an expert refusal case lies.
 #[derive(Clone, Copy)]
 enum YIn {
     Own,
@@ -451,8 +444,6 @@ enum YIn {
     X,
 }
 
-/// One refusal case of the expert wrapper: the numbers of the call and the (offset, bytes) of its
-/// ranges inside the rig's buffers.
 #[derive(Clone, Copy)]
 struct Spec {
     k: usize,
@@ -507,7 +498,6 @@ struct RefusalRig {
     ctx: CudaContext,
 }
 
-/// The second adapter: a stream, a stack and an ids buffer that belong to another context.
 struct OtherContext {
     stream: DeviceStream,
     stack: DeviceBuffer,
@@ -515,7 +505,6 @@ struct OtherContext {
     _ctx: CudaContext,
 }
 
-/// A device buffer that holds `ids` as little-endian ints, zero padded to `total` bytes.
 fn padded_ids(ctx: &CudaContext, ids: &[i32], total: usize) -> DeviceBuffer {
     let mut bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
     bytes.resize(total, 0);
@@ -559,9 +548,6 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// For `plan_matvec_expert`, every refusal is a `BadRequest` with the text of its own check (among
-/// them the footprint of `y`), nothing is queued, the backend stays usable, and the valid call of
-/// the same rig launches.
 #[test]
 fn matvec_expert_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("matvec_expert_rejects_unsound_calls_before_launching") {
@@ -823,7 +809,6 @@ fn matvec_expert_rejects_unsound_calls_before_launching() {
     for (case, needle, spec) in cases {
         assert_bad_request(attempt(&rig, &other, spec), case, needle);
     }
-    // No refusal queued anything: y is untouched and the backend works; then the valid call runs.
     rig.stream.synchronize().expect("drain");
     let untouched = testkit::read_bytes(&rig.ctx, &rig.y, 8192);
     assert!(untouched.iter().all(|&byte| byte == 0xAB), "y untouched");

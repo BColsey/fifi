@@ -55,7 +55,7 @@ unsafe extern "C" {
 
 /// True when `m` tokens against an expert of `rows` x `k` are a shape the launch accepts: `m` in
 /// `1..=8`, a tiled shape, and no split along k. The split rule is the vendored `split_k`; the
-/// adapter asks it, so this crate keeps no copy. Host only, no CUDA call.
+/// adapter asks it, so this crate keeps no copy.
 pub(in crate::kernels::cuda) fn expert_shape_ok(m: usize, rows: usize, k: usize) -> bool {
     let (Ok(m), Ok(rows), Ok(k)) = (
         c_int::try_from(m),
@@ -68,9 +68,6 @@ pub(in crate::kernels::cuda) fn expert_shape_ok(m: usize, rows: usize, k: usize)
     unsafe { expert_shape_ok_raw(m, rows, k) == 0 }
 }
 
-/// What one expert launch reads and writes: `stack` holds the tiles of the `count` experts of
-/// `rows` x `k` that the call may select, `ids` the expert ids (the kernel reads `ids[slot]`),
-/// `xf` the packed input of `m` tokens, and `y` receives `m` rows of `rows` values.
 pub(in crate::kernels::cuda) struct ExpertRaw<'a> {
     pub(in crate::kernels::cuda) ty: TiledType,
     pub(in crate::kernels::cuda) stack: RawRange<'a>,
@@ -84,7 +81,6 @@ pub(in crate::kernels::cuda) struct ExpertRaw<'a> {
     pub(in crate::kernels::cuda) k: usize,
 }
 
-/// The integer arguments of a checked call.
 struct Args {
     m: c_int,
     rows: c_int,
@@ -93,7 +89,6 @@ struct Args {
     count: c_int,
 }
 
-/// Bytes each range of a call must hold.
 struct Sizes {
     stack: usize,
     ids: usize,
@@ -135,8 +130,6 @@ fn call_sizes(call: &ExpertRaw<'_>) -> Option<Sizes> {
     })
 }
 
-/// Proves an expert launch before the native call: shape, sizes, alignment (stack and xf 16, ids
-/// and y 4) and that `y` overlaps none of the ranges the kernel reads.
 fn check_expert(call: &ExpertRaw<'_>) -> Result<Args, DeviceFailure> {
     let args = call_args(call).ok_or_else(invalid_argument)?;
     let need = call_sizes(call).ok_or_else(invalid_argument)?;
@@ -158,7 +151,6 @@ fn check_expert(call: &ExpertRaw<'_>) -> Result<Args, DeviceFailure> {
     Ok(args)
 }
 
-/// Queues the expert matmul of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn matmul_expert_launch(
     stream: &RawStream,
     call: &ExpertRaw<'_>,
@@ -208,7 +200,6 @@ mod tests {
     use super::super::super::STATUS_INVALID_ARGUMENT;
     use super::*;
 
-    /// The arguments of one `inference_cuda_matmul_expert_launch` call as plain numbers.
     #[derive(Clone, Copy)]
     struct ExpertArgs {
         ty: c_int,
@@ -243,14 +234,12 @@ mod tests {
         stream: 0x1,
     };
 
-    /// A named edit of a valid argument set.
     type Case = (&'static str, fn(&mut ExpertArgs));
 
     fn pointer<T>(address: usize) -> *mut T {
         std::ptr::without_provenance_mut(address)
     }
 
-    /// `(status, stage)` of the entry for `args`.
     fn run_expert(args: ExpertArgs) -> (c_int, c_int) {
         let mut stage = STAGE_NONE;
         // SAFETY: only called with arguments the entry refuses before it uses any pointer or

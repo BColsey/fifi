@@ -14,9 +14,8 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::row_add::{RowAddRaw, row_add_launch};
 
-/// One row_add call: n values in x and y, their sum in out. With fused
-/// set, out holds the published bf16 roundtrip (nonfinite sums become 0
-/// with the flag's bit0 set) instead of the plain sum; fused requires flag.
+/// With `fused` set, `out` holds the published bf16 roundtrip (nonfinite sums become 0 with the
+/// flag's bit0 set) instead of the plain sum; `fused` requires `flag`.
 pub(crate) struct RowAddCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -27,7 +26,6 @@ pub(crate) struct RowAddCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the sum of call on stream, writing call.out.
     pub(crate) fn row_add(
         &self,
         stream: &DeviceStream,

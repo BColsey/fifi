@@ -102,9 +102,7 @@ use crate::{
 const PROMPT: [u32; 5] = [760, 6511, 314, 9338, 369];
 /// Five prompt steps and 31 greedy steps.
 const STEPS: usize = 36;
-/// SHA-256 of the pinned `config.json`.
 const CONFIG_SHA256: &str = "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767";
-/// SHA-256 of the pinned `model.safetensors.index.json`.
 const INDEX_SHA256: &str = "e359cd95565275b923fed8df019dd8e869d9af5dc4a621b4114ab7a8e6c534d1";
 /// The logits-cosine floor of the `f32` control. The BF16 run of this gate uses
 /// `BF16_MIN_COSINE` instead.
@@ -193,7 +191,6 @@ fn number_or_nan(value: f64) -> serde_json::Value {
     }
 }
 
-/// Refuses a checkpoint directory whose `model.safetensors.index.json` differs from the pin.
 fn assert_pinned_index(ckpt_dir: &std::path::Path) {
     let path = ckpt_dir.join("model.safetensors.index.json");
     let index = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -257,7 +254,6 @@ fn speed_routings() -> Vec<Routing> {
     }
 }
 
-/// Writes `report` to `<out>/<name>`, creating `out`.
 fn write_report(out: &str, name: &str, report: &serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(report).unwrap());
     std::fs::create_dir(out).expect("Q36_OUT_DIR must not exist yet");
@@ -282,7 +278,6 @@ impl Peaks {
         kernels.qualification_reset_retire_peak();
     }
 
-    /// Reads both peaks of the block that `reset` started.
     fn read(kernels: &MlxKernels) -> Self {
         Self {
             mlx_peak: kernels.memory_stats().unwrap().peak,
@@ -290,7 +285,6 @@ impl Peaks {
         }
     }
 
-    /// The larger of each peak of two blocks.
     fn max(self, other: Self) -> Self {
         Self {
             mlx_peak: self.mlx_peak.max(other.mlx_peak),
@@ -627,7 +621,6 @@ fn device_routing_picks_the_host_experts_on_the_real_checkpoint() {
     assert!(failures.is_empty(), "routing gate failed: {failures:#?}");
 }
 
-/// One timed decode: the prompt steps, then `new_tokens` greedy tokens.
 struct Trial {
     /// Greedy tokens per second after the first generated token, `(new_tokens - 1) / seconds`.
     generation_tps: f64,
@@ -640,7 +633,6 @@ struct Trial {
     decode_timing: QualificationTiming,
 }
 
-/// The sum of the counts and times of `timings`.
 fn sum_timing(timings: impl Iterator<Item = QualificationTiming>) -> QualificationTiming {
     timings.fold(QualificationTiming::default(), |a, b| QualificationTiming {
         import_calls: a.import_calls + b.import_calls,
@@ -652,7 +644,6 @@ fn sum_timing(timings: impl Iterator<Item = QualificationTiming>) -> Qualificati
     })
 }
 
-/// The timing keys of a report row, with `prefix` before each key.
 fn timing_fields(row: &mut serde_json::Value, prefix: &str, timing: QualificationTiming) {
     let fields = [
         ("import_calls", timing.import_calls.into()),
@@ -718,7 +709,6 @@ fn trial(
     }
 }
 
-/// The median of the values.
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]

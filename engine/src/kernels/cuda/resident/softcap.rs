@@ -18,7 +18,6 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::softcap::{SoftcapRaw, softcap_launch};
 
-/// One softcap call: n values in x, the capped values in out.
 pub(crate) struct SoftcapCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -27,7 +26,6 @@ pub(crate) struct SoftcapCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the softcap of call on stream, writing call.out.
     pub(crate) fn softcap(
         &self,
         stream: &DeviceStream,

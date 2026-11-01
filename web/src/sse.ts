@@ -1,7 +1,6 @@
 /**
- * Server-sent-events parser for chat streams.
- * Follows the contract: comment lines are ignored, a blank line ends an
- * event, and "data: [DONE]" ends a successful stream.
+ * Follows the SSE contract: comment lines are ignored, a blank line ends
+ * an event, and "data: [DONE]" ends a successful stream.
  */
 
 export interface SseEvent {
@@ -27,7 +26,6 @@ export class SseParser {
     }
   }
 
-  /** Flush a trailing partial line at stream close. */
   close(): void {
     if (this.buffer !== "") {
       const line = this.buffer.replace(/\r$/, "");

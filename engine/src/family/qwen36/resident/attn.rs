@@ -107,15 +107,10 @@ pub(super) enum KvBuffers {
         v: ExecutionTensor,
     },
     /// The Q8 form: the codes, scales, and biases of the keys and of the values.
-    Q8 {
-        /// The quantized keys.
-        k: Q8Tensor,
-        /// The quantized values.
-        v: Q8Tensor,
-    },
+    Q8 { k: Q8Tensor, v: Q8Tensor },
 }
 
-/// Keys and values of one dense attention layer, as capacity buffers. `None` while `len` is 0.
+/// Keys and values of one dense attention layer, as capacity buffers.
 pub(super) struct KvCache {
     /// The buffers of both sides; `None` while the cache holds no position.
     pub(super) buffers: Option<KvBuffers>,
@@ -264,7 +259,6 @@ impl KvCache {
     }
 }
 
-/// The shared form of one Q8 side (the `share` arm).
 fn share_q8(side: &Q8Tensor) -> Q8Tensor {
     Q8Tensor {
         codes: side.codes.share(),
@@ -296,7 +290,6 @@ pub(super) fn growth_bytes(
     )
 }
 
-/// One resident attention step: the layer output and the replacement cache.
 pub(super) struct AttnStep {
     /// Layer output `[1, H]` (decode) or `[T, H]` (chunk).
     pub(super) out: ExecutionTensor,
@@ -396,8 +389,6 @@ fn grown_q8_side(
     Ok(side)
 }
 
-/// Appends the three parts of one quantized side `side` into the capacity buffers `target` at
-/// `[0, 0, at, 0]`: three `kv_append` calls per tensor side.
 fn append_q8_side(
     ctx: &mut Ctx<'_>,
     target: Q8Tensor,
@@ -458,7 +449,6 @@ pub(super) fn append(
         }
         (KvDtype::F32, Some(KvBuffers::Q8 { .. })) => return Err(mismatch()),
         (KvDtype::F32, None) => {
-            // The first rows of an empty cache allocate round_up(rows, step) positions.
             let cap_dim = dim(cap)?;
             let k_buf = zero_rows(ctx, kv_heads, cap_dim, width)?;
             let v_buf = zero_rows(ctx, kv_heads, cap_dim, width)?;
@@ -491,7 +481,6 @@ pub(super) fn append(
         (KvDtype::Bf16, Some(KvBuffers::F32 { .. } | KvBuffers::Q8 { .. })) => {
             return Err(mismatch());
         }
-        // A BF16 buffer under any other form's plan is the same refusal.
         (KvDtype::F32 | KvDtype::Q8, Some(KvBuffers::Bf16 { .. })) => return Err(mismatch()),
         (KvDtype::Bf16, None) => {
             let cap_dim = dim(cap)?;
@@ -519,8 +508,6 @@ pub(super) fn append(
             let v_side = quantize(v_new)?;
             match buffers {
                 None => {
-                    // The first rows of an empty cache: zero quantized buffers of `cap`
-                    // positions, then the append at the origin.
                     let cap_dim = dim(cap)?;
                     let k_buf = zero_q8_side(ctx, kv_heads, cap_dim, width)?;
                     let v_buf = zero_q8_side(ctx, kv_heads, cap_dim, width)?;
@@ -1009,7 +996,6 @@ mod tests {
                 [1, hkv as u32, want_cap as u32, hd as u32],
                 "step {n} key shape"
             );
-            // The host oracle within the parity bounds, and the old formulation bit for bit.
             let out = values(&mut kernels, &next.out).unwrap();
             assert_parity(&out, &want, &format!("step {n} output"));
             assert_eq!(
@@ -1017,7 +1003,6 @@ mod tests {
                 values(&mut kernels, &old.0).unwrap(),
                 "step {n} output differs from the concatenate formulation"
             );
-            // The caches agree bit for bit on the valid prefix.
             let (k_buf, v_buf) = f32_pair(&next.cache);
             let got_k = values(&mut kernels, k_buf).unwrap();
             let got_v = values(&mut kernels, v_buf).unwrap();
@@ -1478,7 +1463,6 @@ mod tests {
                     "step {n}: a Q8 layer output is not finite"
                 );
             }
-            // The tolerance inputs from the F32 cache of this step.
             let (k_buf, v_buf) = f32_pair(&f32_cache);
             let k_rows = values(&mut kernels, k_buf).unwrap();
             let v_rows = values(&mut kernels, v_buf).unwrap();
@@ -1498,7 +1482,6 @@ mod tests {
             worst = worst.max(step_worst);
         }
         println!("q8 layer outputs: worst difference {worst}");
-        // The Q8 cache holds six buffers with the expected shapes and dtypes.
         let (k, v) = q8_pair(&q8_cache);
         for (side, name) in [(k, "keys"), (v, "values")] {
             assert_eq!(
@@ -1720,7 +1703,6 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        // Run one step in each form, then cross the forms over.
         let control = step(
             &mut ctx,
             &shape,

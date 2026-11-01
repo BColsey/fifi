@@ -17,7 +17,6 @@ use crate::kernels::cuda::resident::row_add::RowAddCall;
 use crate::kernels::cuda::resident::row_scale::RowScaleCall;
 use crate::kernels::cuda::resident::softcap::SoftcapCall;
 
-/// Scale applied to the embedding row: sqrt(hidden).
 pub(crate) fn embed_scale() -> f32 {
     (HIDDEN as f32).sqrt()
 }
@@ -179,8 +178,6 @@ impl Gemma {
         for layer in &self.layers {
             let (input, r1, r2, out) = layer_buffers(current);
             self.decode_layer(layer, h[input], h[r1], h[r2], h[out], pos, m)?;
-            // decode_layer leaves the finished layer output in the out buffer, so the
-            // next layer reads exactly that buffer.
             current = out;
         }
         if !logits {

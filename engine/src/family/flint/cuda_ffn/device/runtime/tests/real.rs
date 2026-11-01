@@ -471,7 +471,6 @@ fn abort_consult_provenance_and_progress_windows(
     inject::set_after_residual_abort(None);
     inject::set_post_clear_words(Vec::new());
 
-    // Hygiene: with every injection cleared the session decodes bitwise.
     state.reset(stream).unwrap();
     for (position, expected) in pristine.iter().enumerate() {
         decoder
@@ -525,7 +524,6 @@ fn real_weights_token_health_arm_bitwise_single_row_and_gate_faults() {
     armed.test_arm_token_health(&ctx).unwrap();
     armed_traversal_matches_bitwise_and_defers_only_single_row(&decoder, &mut armed, &mut plain);
 
-    // Rebuild a pristine recording on the armed session, then prove the gate.
     armed.reset(&stream).unwrap();
     let pristine: Vec<Vec<u32>> = (0..4)
         .map(|position| {
@@ -677,13 +675,11 @@ fn real_weights_kv_guard_fault_rejects_finish_and_survives_reset() {
             Ok(())
         })
     };
-    // Clean prefix: the armed gate passes with word 0 and accept runs.
     let mut accepted = false;
     for position in 0..3 {
         step(&mut state, position, &mut accepted).unwrap();
     }
     assert!(accepted, "clean armed steps must reach the head");
-    // Fault leg: the seam writes the fault word where a kernel flag would.
     TEST_KV_FAULT.store(true, std::sync::atomic::Ordering::Relaxed);
     accepted = false;
     let before = state.kv[0].cursor.committed_prefix();
@@ -700,11 +696,9 @@ fn real_weights_kv_guard_fault_rejects_finish_and_survives_reset() {
         before,
         "rejected token must not advance the cursor"
     );
-    // Refused until reset: another fault-free step still refuses (poisoned).
     accepted = false;
     assert!(step(&mut state, 4, &mut accepted).is_err());
     assert!(!accepted);
-    // Reset clears the poison but NOT the device word.
     state.reset(&stream).unwrap();
     let mut word = [0u8; 4];
     state

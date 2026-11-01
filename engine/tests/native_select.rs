@@ -430,7 +430,6 @@ fn take_along_axis_rejects_mismatched_layouts() {
     );
 }
 
-/// The message of a `BadRequest`, or a description of any other outcome.
 fn message_of<T>(result: Result<T, EngError>) -> String {
     match result {
         Err(EngError::BadRequest(message)) => message,

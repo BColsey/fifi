@@ -37,7 +37,6 @@ use super::{DeviceFailure, STAGE_NONE, checked, invalid_argument};
 )]
 pub(crate) const PREFILL_STATUS_BOUND_VIOLATION: c_int = 0x8;
 
-// One `pub(in crate::kernels::cuda) mod <n>;` line per kernel child module, alphabetical.
 pub(in crate::kernels::cuda) mod attn_prefill;
 pub(in crate::kernels::cuda) mod attn_prep_chunk;
 pub(in crate::kernels::cuda) mod flint_qk;

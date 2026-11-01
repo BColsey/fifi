@@ -2039,7 +2039,6 @@ fn warm_sentencepiece_style_normalizer_stays_eligible() {
         whole,
         "the Prepend marker must make the plain-text seam mismatch"
     );
-    // The warm-shaped seam is byte-exact.
     let whole = tok.encode("hello<|end|> world").expect("whole");
     let head = tok.encode("hello").expect("head");
     let tail = tok.encode("<|end|> world").expect("tail");

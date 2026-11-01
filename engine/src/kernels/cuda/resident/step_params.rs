@@ -36,29 +36,18 @@ pub(crate) const STATUS_INVALID_STEP_STATE: i32 = 4;
 /// Status mask 16: an EXL3 projection of the step saw a nonfinite value (OR-ed in by
 /// [`CudaContext::exl3_flag_fold`]).
 pub(crate) const STATUS_EXL3_ARITHMETIC: i32 = 16;
-/// Bytes of the [`StepParams`] block.
 pub(crate) const STEP_PARAMS_BYTES: usize = raw::STEP_PARAMS_BYTES;
-/// Byte offset of `token_id` in the block.
 pub(crate) const OFFSET_TOKEN_ID: usize = 0;
-/// Byte offset of `pos` in the block.
 pub(crate) const OFFSET_POS: usize = 4;
-/// Byte offset of `kv_len` in the block.
 pub(crate) const OFFSET_KV_LEN: usize = 8;
-/// Byte offset of `kv_slot` in the block.
 pub(crate) const OFFSET_KV_SLOT: usize = 12;
-/// Byte offset of `status` in the block.
 pub(crate) const OFFSET_STATUS: usize = 16;
-/// Bytes of the argmax scratch.
 pub(crate) const ARGMAX_PART_BYTES: usize = raw::ARGMAX_PART_BYTES;
-/// Bytes of the result pair.
 pub(crate) const RESULT_PAIR_BYTES: usize = raw::RESULT_PAIR_BYTES;
-/// Largest `kv_len`: a step word never reaches 2^30.
 pub(crate) const WORD_MAX: i32 = (1 << 30) - 1;
 /// Largest `pos`, so that `kv_len = pos + 1` always fits.
 pub(crate) const POS_MAX: i32 = WORD_MAX - 1;
-/// Largest `m` of one `step_advance`.
 pub(crate) const MAX_ADVANCE: usize = raw::MAX_ADVANCE;
-/// Largest number of logits of one `argmax`.
 pub(crate) const MAX_LOGITS: usize = raw::MAX_LOGITS;
 
 /// The per-step parameter block that the resident kernels read from device memory.
@@ -77,15 +66,12 @@ pub(crate) struct StepParams {
     pub(crate) kv_len: i32,
     /// Reserved; equals `pos`.
     pub(crate) kv_slot: i32,
-    /// Flags by mask: 1 router fault, 2 non-finite logits, 4 invalid step state.
     pub(crate) status: i32,
     /// Padding to 32 bytes; nobody writes it.
     pub(crate) pad: [i32; 3],
 }
 
 impl StepParams {
-    /// The start block of a step at `pos` with `token_id`: `kv_len = pos + 1`, `kv_slot = pos`
-    /// and `status = 0`. `BadRequest` for a negative token or a `pos` outside `0..=POS_MAX`.
     pub(crate) fn new(token_id: i32, pos: i32) -> Result<Self, EngError> {
         if token_id < 0 {
             return Err(EngError::BadRequest(format!(
@@ -127,7 +113,6 @@ impl StepParams {
         bytes
     }
 
-    /// The inverse of [`StepParams::to_bytes`].
     pub(crate) fn from_bytes(bytes: [u8; STEP_PARAMS_BYTES]) -> Self {
         let mut words = [0_i32; 8];
         let (chunks, _) = bytes.as_chunks::<4>();
@@ -187,28 +172,22 @@ pub(crate) fn ensure_rows(pos: usize, advance: usize, rows: usize) -> Result<(),
 pub(crate) struct StepStatus(pub(crate) i32);
 
 impl StepStatus {
-    /// True when mask 1 is set.
     pub(crate) fn router_fault(self) -> bool {
         self.0 & STATUS_ROUTER_FAULT != 0
     }
 
-    /// True when mask 2 is set.
     pub(crate) fn non_finite_logits(self) -> bool {
         self.0 & STATUS_NON_FINITE_LOGITS != 0
     }
 
-    /// True when mask 4 is set.
     pub(crate) fn invalid_step_state(self) -> bool {
         self.0 & STATUS_INVALID_STEP_STATE != 0
     }
 
-    /// The bits that no mask names.
     pub(crate) fn unknown_bits(self) -> i32 {
         self.0 & !(STATUS_ROUTER_FAULT | STATUS_NON_FINITE_LOGITS | STATUS_INVALID_STEP_STATE)
     }
 
-    /// The error the status maps to, or `None`. Precedence when several bits are set: mask 4,
-    /// then mask 1, then mask 2. Unknown bits alone map to no error.
     pub(crate) fn error(self) -> Option<EngError> {
         let (operation, message) = if self.invalid_step_state() {
             (
@@ -266,7 +245,6 @@ impl ResultPair {
     }
 }
 
-/// `n` as the C length: `BadRequest` unless `1 <= n <= MAX_LOGITS`.
 pub(crate) fn check_n(n: usize) -> Result<c_int, EngError> {
     match c_int::try_from(n) {
         Ok(value) if (1..=MAX_LOGITS).contains(&n) => Ok(value),
@@ -276,9 +254,7 @@ pub(crate) fn check_n(n: usize) -> Result<c_int, EngError> {
     }
 }
 
-/// What one `argmax` reads and writes. `result` may be absent.
 pub(crate) struct ArgmaxCall<'b> {
-    /// Number of logits, `1..=MAX_LOGITS`.
     pub(crate) n: usize,
     /// The logits row: `4 * n` bytes of f32, 4-byte aligned. Read only.
     pub(crate) logits: DeviceRange<'b>,
@@ -292,8 +268,7 @@ pub(crate) struct ArgmaxCall<'b> {
 
 impl CudaContext {
     /// Enqueues `step_begin` on `stream`: the status of `params` becomes 0, or 4 when the step
-    /// state is invalid. Must be the first kernel of the step. `params` holds at least
-    /// [`STEP_PARAMS_BYTES`] bytes at a 4-byte aligned offset.
+    /// state is invalid. Must be the first kernel of the step.
     pub(crate) fn step_begin(
         &self,
         stream: &DeviceStream,
@@ -306,8 +281,8 @@ impl CudaContext {
         })
     }
 
-    /// Enqueues the zeroing of the sticky EXL3 arithmetic flag word `flag` (4 bytes, 4-byte
-    /// aligned). Runs right after `step_begin` in an EXL3 step.
+    /// Enqueues the zeroing of the sticky EXL3 arithmetic flag word `flag`. Runs right after
+    /// `step_begin` in an EXL3 step.
     pub(crate) fn exl3_flag_clear(
         &self,
         stream: &DeviceStream,
@@ -386,7 +361,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of an argmax, then the native view of its ranges.
     fn plan_argmax<'b>(&self, call: &ArgmaxCall<'b>) -> Result<raw::ArgmaxRaw<'b>, EngError> {
         let params = self.raw_range(&call.params)?;
         let logits = self.raw_range(&call.logits)?;

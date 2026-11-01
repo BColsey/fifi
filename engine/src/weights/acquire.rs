@@ -17,33 +17,28 @@ use crate::{
     tensor::{Dtype, Tensor},
 };
 
-/// Which part of a stored tensor a request selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
-    /// The complete stored tensor.
     Whole,
     /// One slice of the stored leading dimension, such as one expert or one table row.
     LeadingSlice {
-        /// Index into the stored leading dimension.
         index: u32,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Scheduling class of a request.
 pub enum Priority {
     Demand,
     Prefetch,
 }
 
-/// Cancellation state for one request. T1 supplies only an inactive handle.
+/// T1 supplies only an inactive handle.
 #[derive(Debug, Clone, Default)]
 pub struct CancelHandle {
     _inactive: (),
 }
 
 impl CancelHandle {
-    /// Creates an inactive handle.
     pub fn new() -> Self {
         Self::default()
     }
@@ -66,7 +61,6 @@ pub struct AcquireRequest {
 }
 
 impl AcquireRequest {
-    /// Builds a request for the exact stored tensor `key`.
     pub fn new(
         key: String,
         selection: Selection,
@@ -84,13 +78,10 @@ impl AcquireRequest {
 
 #[derive(Debug)]
 pub enum Completion {
-    /// Complete checked portable bytes with stored dtype and shape.
     Ready(Tensor),
-    /// The key is absent from the checked index.
     Missing,
 }
 
-/// One caller's handle on a pending acquisition.
 #[derive(Debug)]
 pub struct Ticket {
     outcome: Result<Completion, EngError>,
@@ -98,7 +89,7 @@ pub struct Ticket {
 
 /// A store that reads tensors of one shard on demand through a seekable source.
 ///
-/// One store covers one shard. [`Completion::Missing`] means the key is absent
+/// [`Completion::Missing`] means the key is absent
 /// from this shard's checked header. [`StreamedCheckpoint`] routes across the
 /// shards of one indexed checkpoint.
 ///
@@ -110,7 +101,6 @@ pub struct StreamedWeights {
 }
 
 impl StreamedWeights {
-    /// Reads and checks the header from `reader`, which holds `byte_len` bytes.
     pub fn open(
         mut reader: Box<dyn ShardIo + Send>,
         byte_len: u64,
@@ -126,7 +116,6 @@ impl StreamedWeights {
         })
     }
 
-    /// Accepts the request and starts the read.
     pub fn acquire(&self, request: AcquireRequest) -> Result<Ticket, EngError> {
         let outcome = match request.selection {
             Selection::Whole => self.read_whole(&request.key),
@@ -229,7 +218,6 @@ impl StreamedWeights {
         Ok(bytes)
     }
 
-    /// Fills `dst` from data offset `start` with one seek and one `read_exact` under the reader lock.
     fn read_range_into(&self, key: &str, start: u64, dst: &mut [u8]) -> Result<(), EngError> {
         let position =
             self.header.data_start().checked_add(start).ok_or_else(|| {
@@ -293,7 +281,7 @@ mod read_stats {
     #[cfg(not(test))]
     pub(super) fn record(_bytes: u64, _elapsed: Duration) {}
 
-    /// Switches the accounting on or off; the load harness brackets exactly its load phases.
+    /// The load harness brackets exactly its load phases.
     #[cfg(all(
         test,
         feature = "native-mlx",
@@ -319,7 +307,6 @@ mod read_stats {
         )
     }
 
-    /// Zeroes the accounting for the next phase snapshot.
     #[cfg(all(
         test,
         feature = "native-mlx",
@@ -342,17 +329,13 @@ mod read_stats {
 ))]
 pub(crate) use read_stats::{reset, set, snapshot};
 
-/// Streamed stores for every shard of one indexed checkpoint.
-///
 /// `open` checks that the index and the shard headers name the same keys in the same shards.
-/// Each request goes to the store of the shard that holds its key.
 pub struct StreamedCheckpoint {
     stores: Vec<StreamedWeights>,
     route: BTreeMap<String, usize>,
 }
 
 impl StreamedCheckpoint {
-    /// Opens one store per `(shard name, reader, byte length)` and checks them against `index`.
     pub fn open(
         index: &[u8],
         shards: Vec<(String, Box<dyn ShardIo + Send>, u64)>,
@@ -413,12 +396,10 @@ impl StreamedCheckpoint {
         Ok(Self { stores, route })
     }
 
-    /// Returns true when the index names `key`.
     pub fn contains(&self, key: &str) -> bool {
         self.route.contains_key(key)
     }
 
-    /// Returns the stored dtype and shape of `key`, or `None` when the index does not name it.
     pub fn stored(&self, key: &str) -> Option<(Dtype, Vec<u32>)> {
         let index = *self.route.get(key)?;
         let entry = self.stores.get(index)?.header.entry(key)?;
@@ -479,7 +460,6 @@ impl StreamedCheckpoint {
         })
     }
 
-    /// Accepts the request and starts the read in the shard that holds the key.
     pub fn acquire(&self, request: AcquireRequest) -> Result<Ticket, EngError> {
         match self.route.get(&request.key) {
             None => Ok(Ticket {
@@ -493,7 +473,6 @@ impl StreamedCheckpoint {
         }
     }
 
-    /// Reads leading slice `index` of `key` into `dst` in the shard that holds the key.
     /// See [`StreamedWeights::read_slice_into`].
     pub fn read_slice_into(&self, key: &str, index: u32, dst: &mut [u8]) -> Result<(), EngError> {
         let &store = self
@@ -506,13 +485,12 @@ impl StreamedCheckpoint {
             .read_slice_into(key, index, dst)
     }
 
-    /// Returns the outcome of a ticket from this checkpoint.
     pub fn wait(&self, ticket: Ticket) -> Result<Completion, EngError> {
         ticket.outcome
     }
 }
 
-/// Reports a route that names no store. `open` builds the route from the checked shard set.
+/// `open` builds the route from the checked shard set.
 fn invalid_route() -> EngError {
     EngError::Checkpoint("checkpoint route is invalid".into())
 }
@@ -640,7 +618,6 @@ mod tests {
 
     #[test]
     fn read_slice_into_writes_the_bytes_of_each_slice() {
-        // Three slices of 24 bytes and two slices of 6 bytes, with distinct bytes everywhere.
         let (file, index) = shard(&[
             ("a", "U32", vec![3, 2, 3], (0..72u8).collect()),
             ("b", "BF16", vec![2, 3], (100..112u8).collect()),

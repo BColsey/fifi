@@ -607,7 +607,6 @@ mod tests {
         );
     }
 
-    /// Bytes of the stored QSA tensors, summed from the tensors themselves.
     fn stored_qsa_bytes(state: &ResidentState) -> u64 {
         state
             .layers()

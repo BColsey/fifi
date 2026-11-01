@@ -67,7 +67,6 @@ pub(in crate::kernels::cuda) struct GdnDeltaInts {
     pub(in crate::kernels::cuda) n_v_heads: c_int,
 }
 
-/// What one gated delta launch reads and writes: the converted ranges, the integers and `eps`.
 pub(in crate::kernels::cuda) struct GdnDeltaRaw<'a> {
     pub(in crate::kernels::cuda) conv: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
@@ -80,7 +79,6 @@ pub(in crate::kernels::cuda) struct GdnDeltaRaw<'a> {
     pub(in crate::kernels::cuda) eps: f32,
 }
 
-/// The bytes each range must hold.
 struct Needs {
     conv: usize,
     proj: usize,
@@ -90,12 +88,10 @@ struct Needs {
     out: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -103,7 +99,6 @@ fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
         .ok_or_else(invalid_argument)
 }
 
-/// Bytes of a `[m][ld]` f32 array whose last row is read up to column `cols`.
 fn rows_bytes(m: usize, ld: usize, cols: usize) -> Result<usize, DeviceFailure> {
     product(&[m - 1, ld, 4])?
         .checked_add(product(&[cols, 4])?)
@@ -137,8 +132,6 @@ fn needs(ints: &GdnDeltaInts) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// Proves a launch before the native call: size and 4-byte alignment of every range, and that
-/// `state` and `out`, which the kernel writes, share no byte with any other range.
 fn check_delta(io: &GdnDeltaRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints)?;
     let ranges = [
@@ -172,7 +165,6 @@ fn check_delta(io: &GdnDeltaRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gated delta kernel on `stream`. Returns when it is queued.
 pub(in crate::kernels::cuda) fn gdn_delta_launch(
     stream: &RawStream,
     io: GdnDeltaRaw<'_>,

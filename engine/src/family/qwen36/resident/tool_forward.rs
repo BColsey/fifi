@@ -278,7 +278,6 @@ fn u32_array(value: &serde_json::Value, field: &str) -> Vec<u32> {
         .collect()
 }
 
-/// The number at `field` of `entry`.
 fn f64_field(entry: &serde_json::Value, field: &str) -> f64 {
     entry[field]
         .as_f64()
@@ -368,9 +367,7 @@ fn format_token_value(logits: &[f32]) -> (f32, f64) {
 /// `ResidentDecoder` exactly as the engine worker does. Shared with `decode_timing`, which
 /// drives the same serving prefill.
 pub(super) struct ServeStep<'a, 'c> {
-    /// The decoder of the loaded executor.
     pub(super) decoder: &'a mut ResidentDecoder<'c>,
-    /// The native state of the session.
     pub(super) state: &'a mut ResidentState,
     /// The planned chunk size, or `None` for one-token steps.
     pub(super) chunk: Option<u32>,
@@ -420,12 +417,10 @@ impl TokenStepper for ServeStep<'_, '_> {
             })
     }
 
-    /// The number of positions fed so far.
     fn fed(&self) -> usize {
         usize::try_from(self.state.pos()).unwrap_or(usize::MAX)
     }
 
-    /// Clears the model state of the session.
     fn reset(&mut self) -> Result<()> {
         self.decoder.reset(self.state)
     }
@@ -451,9 +446,7 @@ struct ExtraMode {
     name: String,
     /// The requested and effective chunk of the mode.
     label: ChunkLabel,
-    /// The worker piece the mode fed.
     piece: usize,
-    /// The measured run.
     run: ModeRun,
 }
 
@@ -540,7 +533,6 @@ struct ChunkLabel {
 }
 
 impl ChunkLabel {
-    /// The label of a chunk-shaped mode: `requested` against the admitted `effective`.
     fn of(requested: u32, effective: Option<u32>) -> Self {
         Self {
             requested: Some(requested),
@@ -548,7 +540,6 @@ impl ChunkLabel {
         }
     }
 
-    /// The label of a mode that requests no chunk.
     fn none() -> Self {
         Self {
             requested: None,

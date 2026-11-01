@@ -43,12 +43,10 @@ mod kv8;
 #[path = "prefill_device_tests/kv8_numerical.rs"]
 mod kv8_numerical;
 
-/// A whole buffer of the NaN sentinel.
 fn nan_bytes(bytes: usize) -> Vec<u8> {
     vec![NAN_FILL; bytes]
 }
 
-/// The f32s of little-endian bytes.
 fn floats(bytes: &[u8]) -> Vec<f32> {
     let (words, _) = bytes.as_chunks::<4>();
     words.iter().map(|word| f32::from_le_bytes(*word)).collect()
@@ -59,7 +57,6 @@ fn unit01(rng: &mut Rng) -> f64 {
     rng.below(1 << 24) as f64 / (1u64 << 24) as f64
 }
 
-/// The i32s of little-endian bytes.
 fn ints(bytes: &[u8]) -> Vec<i32> {
     let (words, _) = bytes.as_chunks::<4>();
     words.iter().map(|word| i32::from_le_bytes(*word)).collect()
@@ -79,14 +76,12 @@ fn q8_0_rows(rows: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
     bytes
 }
 
-/// The dequantized weight `i` of one Q8_0 block.
 fn q8_0_value(block: &[u8], i: usize) -> f64 {
     let d = f64::from(f16(u16::from_le_bytes([block[0], block[1]])));
     let code = i8::from_le_bytes([block[2 + i % 32]]) as f64;
     d * code
 }
 
-/// The tensor descriptor of a synthetic upload.
 fn tensor(
     ty: crate::weights::GgufType,
     source_len: usize,
@@ -249,7 +244,6 @@ fn ref_route(
     (order, weights, gate)
 }
 
-/// The f64 SwiGLU of one gate/up pair.
 fn ref_silu(g: f64, u: f64) -> f64 {
     g / (1.0 + (-g).exp()) * u
 }
@@ -795,7 +789,6 @@ fn chunk_moe_resident_matches_the_host_reference() {
         }
 
         check_hop("routed down (act hop)", &down_f, &down_want, hidden, 2e-3);
-        // The shared expert's hops.
         let mut sh_gu_want = Vec::with_capacity(2 * m * DIMS.shared_inter);
         for t in 0..m {
             let x = &x2_src[t * hidden..][..hidden];
@@ -916,7 +909,6 @@ use crate::family::gguf_model::Role;
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 
 const RIG_LAYERS: usize = 5;
-/// The context of the rig state: 512 positions.
 const RIG_CAP: usize = 512;
 
 /// Every tensor of one rig layer, OWNED (the whole rig is dropped by value), filled by tiling
@@ -1224,10 +1216,10 @@ fn rig_moe<'r>(rig: &'r Rig, layer: usize) -> MoeLayerWeights<'r> {
     }
 }
 
-/// The mixer weights of the rig's five layers, layer 4 optionally from the sixth set.
 /// The rig's dense and raw weight entries of one layer.
 type RigEntries<'a> = (Vec<(Role, DenseWeight<'a>)>, Vec<(Role, DeviceRange<'a>)>);
 
+/// The mixer weights of the rig's five layers, layer 4 optionally from the sixth set.
 fn rig_mixer(rig: &Rig, sixth_layer_4: bool) -> Result<MixerWeights<'_>, EngError> {
     let mut entries: Vec<Option<LayerWeights<'_>>> = (0..rig.table.len()).map(|_| None).collect();
     for (layer, l) in rig.layers.iter().enumerate() {
@@ -1409,8 +1401,6 @@ fn step_status_bytes(state: &ResidentState, stream: &DeviceStream) -> Result<[u8
     Ok(word)
 }
 
-/// One `run_chunk_body` of the rig at (`p0`, `m`) with clean ids, from the buffers `bufs`.
-/// The chunk must already be open.
 /// One rig chunk's placement: the buffers, the placement, and the ids seed.
 struct RigChunk<'a> {
     bufs: &'a ChunkBufs<'a>,
@@ -1423,6 +1413,7 @@ struct RigChunk<'a> {
 }
 
 /// One `run_chunk_body` of the rig at the chunk's placement with clean ids.
+/// The chunk must already be open.
 fn rig_body(
     rig: &Rig,
     state: &ResidentState,

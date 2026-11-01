@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Generated tokens in the decode run.
 const GENERATED: usize = 512;
 /// Host tokens compared with the resident tokens.
 const MATCH: usize = 32;
@@ -53,7 +52,6 @@ struct ReadCounter {
 }
 
 impl ReadCounter {
-    /// The bytes and nanoseconds counted so far.
     fn snapshot(&self) -> (u64, u64) {
         (
             self.bytes.load(Ordering::Relaxed),
@@ -188,7 +186,6 @@ fn opt(value: Option<u64>) -> String {
     }
 }
 
-/// Comma-separated values.
 fn join<T: ToString>(values: &[T]) -> String {
     values
         .iter()
@@ -255,19 +252,16 @@ fn expert_bytes_per_token(ckpt: &StreamedCheckpoint, weights: &ResidentWeights) 
     total
 }
 
-/// What every teacher-forced layer check reads.
 struct Source<'a> {
     ckpt: &'a StreamedCheckpoint,
     shape: &'a ModelShape,
     dir: &'a Path,
 }
 
-/// Imports host values as a resident F32 tensor of `shape`.
 fn import(ctx: &mut Ctx<'_>, shape: Vec<u32>, data: &[f32]) -> Result<ExecutionTensor, EngError> {
     ctx.kernels.import_tensor(&f32_tensor(shape, data)?)
 }
 
-/// The `[C, H]` shape of a hyper residual.
 fn residual_shape(shape: &HyperShape) -> Result<Vec<u32>, EngError> {
     Ok(vec![dim(shape.branches())?, dim(shape.hidden())?])
 }
@@ -818,7 +812,6 @@ fn resident_decode_reports_speed_memory_and_host_tokens() {
         join(&PROMPT)
     );
 
-    // Load and import.
     let started = Instant::now();
     let flash = FlashWeights::load(&ckpt, &config).unwrap();
     let load_seconds = started.elapsed().as_secs_f64();
@@ -1025,7 +1018,6 @@ const C5_TOKENS: [u32; MATCH] = [
     1092, 369, 279, 6511, 314, 9338, 30, 271, 248068, 198, 760, 1156, 369, 9859, 728,
 ];
 
-/// One prompt of the trace prompts file.
 struct TracePrompt {
     id: u32,
     tokens: Vec<u32>,
@@ -1057,7 +1049,6 @@ fn trace_prompts(bytes: &[u8]) -> Vec<TracePrompt> {
     prompts
 }
 
-/// Lower-case hex SHA-256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)

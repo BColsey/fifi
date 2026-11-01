@@ -18,7 +18,6 @@ use crate::kernels::cuda::resident::matvec_q::QuantType;
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// The context limit of the session tests.
 const LIMIT: usize = 32_768;
 
 /// The facts of a session that passes every chunk-gate condition.
@@ -41,8 +40,6 @@ fn the_gate_accepts_a_native_fp16_plain_session_and_carries_the_admitted_m() {
         ChunkVerdict::Ready { m_sess: 2048 },
         "the accept case"
     );
-    // The ADMITTED size rides the accept verdict, never the cap: a session whose arena admitted 512
-    // of a 2,048 cap reports 512.
     let admitted = ChunkFacts {
         arena: Some(512),
         ..ready()
@@ -56,8 +53,7 @@ fn the_gate_accepts_a_native_fp16_plain_session_and_carries_the_admitted_m() {
 
 #[test]
 fn the_gate_refuses_each_condition_with_its_typed_reason() {
-    // One row per condition: the Tiled layout, the KV8 cache (v1 has no KV8 prefill), the tiered
-    // session, and the Q6_K MMQ weight of the chunk.
+    // The KV8 refusal stands because v1 has no KV8 prefill.
     let tiled = ChunkFacts {
         layout: WeightLayout::Tiled,
         ..ready()
@@ -173,7 +169,6 @@ fn scan_fixtures() -> (LayerTable, MixerGeometry) {
     (table, geometry)
 }
 
-/// The name of `role` in `layer`, looked up once for the closures below.
 fn role_name(table: &LayerTable, layer: usize, role: Role) -> String {
     table.name(layer, role).expect("role name").to_string()
 }
@@ -278,8 +273,6 @@ fn an_absent_dense_projection_is_refused_by_name() {
 
 #[test]
 fn the_chunk_path_takes_the_admitted_m_sess() {
-    // THE switch: every refusal keeps the per-token arm, and only the accept takes the chunk arm at
-    // its admitted `m_sess`.
     for verdict in [
         ChunkVerdict::TiledLayout,
         ChunkVerdict::Kv8,
@@ -623,8 +616,6 @@ fn default_worker_regrouping_preserves_the_cuda_chunk_plan() {
     }
 }
 
-/// The initial worker piece is the admitted M_sess, and every refusal answers None so the caller's
-/// fallback stands.
 #[test]
 fn the_worker_piece_follows_the_verdict() {
     for m_sess in [2048usize, 1024, 512, 256, 128] {

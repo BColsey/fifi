@@ -35,7 +35,6 @@ const PROFILE: &str = if cfg!(debug_assertions) {
     "release"
 };
 
-/// A context and its stream.
 struct Dev {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -49,7 +48,6 @@ impl Dev {
     }
 }
 
-/// Rows, live columns and padded width of one call.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     m: usize,
@@ -64,7 +62,6 @@ struct Scale {
     up: f64,
 }
 
-/// What the device holds after a call: the bytes of `gu` and of `xf`.
 struct After {
     gu: Vec<u8>,
     xf: Vec<u8>,
@@ -83,8 +80,6 @@ fn make_gu(rng: &mut Rng, shape: Shape, scale: Scale) -> Vec<f32> {
     gu
 }
 
-/// Uploads `gu`, fills `xf` with `xf_fill`, runs the call (padded form when `n_ff < k_pad`) and
-/// returns what the device holds afterwards.
 fn run_case(dev: &Dev, shape: Shape, gu: &[f32], xf_fill: u8) -> After {
     let gu_len = gu.len() * 4;
     let xf_len = xf_bytes(shape.m, shape.k_pad).expect("xf size");
@@ -122,12 +117,10 @@ fn tail(xf: &[u8]) -> [u8; 16] {
     out
 }
 
-/// The float64 reference of one element.
 fn ref_swiglu(gate: f32, up: f32) -> f64 {
     silu_f64(f64::from(gate)) * f64::from(up)
 }
 
-/// Counts of the E2 check of the live columns.
 #[derive(Default)]
 struct Stats {
     checked: usize,
@@ -135,7 +128,6 @@ struct Stats {
     one_step: usize,
 }
 
-/// E2 check of every live element of `xf` against the reference of `gu`.
 fn check_live(shape: Shape, gu: &[f32], xf: &[u8], stats: &mut Stats) {
     let table = unpack_xf(xf, shape.m, shape.k_pad);
     for t in 0..shape.m {
@@ -153,8 +145,7 @@ fn check_live(shape: Shape, gu: &[f32], xf: &[u8], stats: &mut Stats) {
     }
 }
 
-/// Runs one group of calls (`seeds` seeds) of one unpadded shape and returns the E2 counts. Also
-/// asserts that `gu` came back unchanged.
+/// Also asserts that `gu` came back unchanged.
 fn run_group(dev: &Dev, shape: Shape, scale: Scale, seeds: std::ops::Range<u64>) -> Stats {
     let mut stats = Stats::default();
     for seed in seeds {
@@ -181,7 +172,6 @@ fn unpadded(m: usize, n_ff: usize) -> Shape {
     }
 }
 
-/// Prints the counts of a group and returns its misses.
 fn report(label: &str, stats: &Stats) -> usize {
     println!(
         "[{PROFILE}] swiglu_pack {label}: {} elements, {} E2 misses, {} one-step",
@@ -319,8 +309,6 @@ fn pin_testkit_helpers() {
     pin_unpack_xf();
 }
 
-/// `unpack_xf` on a hand-built fragment-order buffer (token 2, lane 6, q 1, wi 3) and a
-/// row-major one.
 fn pin_unpack_xf() {
     let mut fragment = vec![0u8; 1_048_592];
     let vec_index = 3 * 32 + 6;
@@ -345,10 +333,8 @@ fn pin_unpack_xf() {
     }
 }
 
-/// Rows of the weight in the consumer check of the padded width.
 const WEIGHT_ROWS: usize = 64;
 
-/// The `xf` a pack makes of `x` (`[m][k]` f32), read back.
 fn pack_reference(dev: &Dev, x: &[f32], shape: Shape) -> Vec<u8> {
     let x_buffer = upload_f32(&dev.ctx, x);
     let xf_len = xf_bytes(shape.m, shape.k_pad).expect("xf size");
@@ -364,7 +350,6 @@ fn pack_reference(dev: &Dev, x: &[f32], shape: Shape) -> Vec<u8> {
     read_bytes(&dev.ctx, &xf_buffer, xf_len)
 }
 
-/// `y` of the matmul of a Q4_K weight over the fragment-order or row-major `xf` bytes.
 fn consumer_y(dev: &Dev, weight: &TiledWeight, xf: &[u8], m: usize) -> Vec<u8> {
     let xf_buffer: DeviceBuffer = upload_bytes(&dev.ctx, xf);
     let y_len = m * WEIGHT_ROWS * 4;
@@ -384,9 +369,6 @@ fn consumer_y(dev: &Dev, weight: &TiledWeight, xf: &[u8], m: usize) -> Vec<u8> {
     read_bytes(&dev.ctx, &y_buffer, y_len)
 }
 
-/// One shape of the padded-width contract: tails of `gu` zeroed, tail of `xf` exactly `0x0000`,
-/// bytes equal to the pack of `[h | 0]`, the same result onto two garbage patterns and the same
-/// consumer output.
 fn check_padded(dev: &Dev, shape: Shape, stats: &mut Stats) {
     let mut rng = Rng::new(0x7ad0_0000 + (shape.n_ff * 7 + shape.m) as u64);
     let gu = make_gu(&mut rng, shape, Scale { gate: 1.5, up: 1.0 });
@@ -644,7 +626,6 @@ fn fitting(m: usize, k_pad: usize) -> (Geo, Geo) {
     ((0, gu), (0, xf_bytes(m, k_pad).expect("xf size")))
 }
 
-/// A refusal of the shape of the call, buffers sized for it.
 fn shape_row(name: &'static str, tag: &'static str, call: (usize, usize, usize)) -> Row {
     let (gu, xf) = fitting(call.0, call.2);
     Row {
@@ -657,7 +638,6 @@ fn shape_row(name: &'static str, tag: &'static str, call: (usize, usize, usize))
     }
 }
 
-/// A refusal of a range of the valid base call `m` 1, `n_ff` = `k_pad` 256.
 fn range_row(name: &'static str, needle: &'static str, gu: Geo, xf: Geo, shared: bool) -> Row {
     Row {
         name,
@@ -824,7 +804,6 @@ fn attempt(dev: &Dev, row: &Row) -> (Result<(), EngError>, bool) {
     (result, before == hashes())
 }
 
-/// The ranges of a call whose arguments are valid: each must be accepted.
 fn accepted_rows() -> Vec<Row> {
     let mut rows = Vec::new();
     let mut add = |name, call: (usize, usize, usize), gu: Geo, xf: Geo, shared| {
@@ -921,13 +900,10 @@ fn refuse_foreign_buffers(dev: &Dev) {
     }
 }
 
-/// Width of the activation, rows of the gate and up projections, and rows of the down projection
-/// of the chain test.
 const CHAIN_K: usize = 2048;
 const CHAIN_FF: usize = 512;
 const CHAIN_OUT: usize = 256;
 
-/// What the chain test reads back from the device.
 struct Chain {
     gu: Vec<f32>,
     xf: Vec<u8>,
@@ -1048,7 +1024,6 @@ fn swiglu_pack_expert_chain_equals_the_host_reference() {
     );
 }
 
-/// The padded and the unpadded call, captured into a graph, replay to the bytes of the eager call.
 #[test]
 fn swiglu_pack_inside_a_capture_equals_eager() {
     if !testkit::device_present("swiglu_pack_inside_a_capture_equals_eager") {

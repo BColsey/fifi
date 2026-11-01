@@ -7,7 +7,7 @@ use crate::weights::{ShardIo, StreamedCheckpoint};
 /// One stored tensor: name, safetensors dtype, shape, little-endian bytes.
 pub(super) type Entry = (String, &'static str, Vec<u32>, Vec<u8>);
 
-/// The integer hash behind every synthetic value: `(i * 2654435761 + tag * 40503 + 12345) mod 2^32`.
+/// The integer hash behind every synthetic value.
 pub(super) fn hash32(tag: u64, i: u64) -> u32 {
     ((i * 2_654_435_761 + tag * 40_503 + 12_345) % 4_294_967_296) as u32
 }
@@ -25,7 +25,7 @@ pub(super) fn bf16(value: f32) -> [u8; 2] {
 }
 
 /// Pushes `{stem}.weight` (U32), `{stem}.scales`, and `{stem}.biases` (BF16) for a packed tensor with
-/// leading axes `lead` and `cols` logical columns; the shape argument is `(stem, lead, cols)`. `word(i)` is payload word `i` (row-major),
+/// leading axes `lead` and `cols` logical columns. `word(i)` is payload word `i` (row-major),
 /// `scale(g)` and `bias(g)` are the values of group `g` (row-major).
 pub(super) fn packed(
     out: &mut Vec<Entry>,
@@ -62,7 +62,6 @@ pub(super) fn packed(
     ));
 }
 
-/// Pushes a BF16 tensor.
 pub(super) fn dense(out: &mut Vec<Entry>, key: &str, shape: Vec<u32>, values: &[f32]) {
     out.push((
         key.to_string(),

@@ -19,7 +19,6 @@ use super::locator::{ExpertLocator, LocatorError};
 pub struct ServerRequest {
     /// Sequence the device released; one per published request, from 1.
     pub seq: u64,
-    /// The layer that asked, `0..layers`.
     pub layer: u32,
     /// Valid entries of `ids` and `weights`; anything outside `1..=8` is refused.
     pub count: u32,
@@ -48,21 +47,13 @@ pub trait RequestPort: Send + 'static {
     fn answer(&self, seq: u64, result: Result<&[f32], u32>) -> bool;
 }
 
-/// Answer code of [`ServeError::BadRequest`]: the request failed validation.
 pub const ERR_BAD_REQUEST: u32 = 1;
-/// Answer code of [`ServeError::Row`]: the port refused the normed row.
 pub const ERR_ROW: u32 = 2;
-/// Answer code of [`ServeError::Locator`]: the locator could not name an expert's bytes.
 pub const ERR_LOCATOR: u32 = 3;
-/// Answer code of [`ServeError::Pool`]: the pool refused or failed the layer.
 pub const ERR_POOL: u32 = 4;
-/// Answer code of [`ServeError::NonFinitePartial`]: the partial was not all finite.
 pub const ERR_NON_FINITE: u32 = 5;
-/// Answer code of [`ServeError::Answer`]: the port could not take the answer.
 pub const ERR_ANSWER: u32 = 6;
-/// Code of [`ServeError::Missing`]: a collect deadline passed short (caller-side only).
 pub const ERR_MISSING: u32 = 7;
-/// Answer code of [`ServeError::Dead`]: the request was lost to a caught panic.
 pub const ERR_DEAD: u32 = 8;
 
 /// Why a request was answered with an error (the first of a token is kept).
@@ -102,11 +93,9 @@ impl ServeError {
     }
 }
 
-/// One token's outcome: requests answered, first error kept, summed serving time.
 pub struct TokenServe {
     /// Requests answered this token, successes and errors alike.
     pub served: u64,
-    /// The first error of the token, or `None` when every answer was a success.
     pub first_error: Option<ServeError>,
     /// Summed serving time of the token's requests (polling excluded).
     pub busy: Duration,
@@ -119,7 +108,6 @@ const IDLE_WAIT: Duration = Duration::from_millis(1);
 /// Slack of the caller-side bounds (`collect`, `shutdown`): no wait is unbounded.
 const WAIT_SLACK: Duration = Duration::from_secs(1);
 
-/// What the thread serves with, bundled to travel into the thread.
 struct Rig<P: RequestPort> {
     port: P,
     locator: ExpertLocator,
@@ -128,7 +116,6 @@ struct Rig<P: RequestPort> {
     timeout: Duration,
 }
 
-/// The armed/stop flags and token bookkeeping, shared under one lock.
 #[derive(Default)]
 struct Token {
     armed: bool,
@@ -197,15 +184,11 @@ impl Drop for ExitGuard {
     }
 }
 
-/// The server thread: while armed, poll and serve; while disarmed, wait on the condvar; leave when stopped. `after`
-/// (the last answered sequence) persists, so a stale sequence is never answered twice; a panic inside one request is
-/// caught, answered `ERR_DEAD`, and the next is served.
 fn thread_main<P: RequestPort>(rig: Rig<P>, shared: Arc<(Mutex<Token>, Condvar)>) {
     let _exit = ExitGuard(Arc::clone(&shared));
     let (mutex, signal) = (&shared.0, &shared.1);
     let (mut after, mut spin_until) = (0u64, Instant::now() + POLL_SPIN);
     loop {
-        // Disarmed: neither poll nor answer, just wait out the 1 ms slices.
         let mut token = mutex.lock().unwrap_or_else(PoisonError::into_inner);
         while !token.armed && !token.stop {
             let waited = signal.wait_timeout(token, IDLE_WAIT);
@@ -256,7 +239,6 @@ pub struct LayerServer {
 }
 
 impl LayerServer {
-    /// Starts the thread; `Err(BadRequest)` when the port's `hidden` disagrees with the pool's, `Err(Dead)` on no thread.
     pub fn spawn(
         port: impl RequestPort,
         locator: ExpertLocator,
@@ -316,7 +298,6 @@ impl LayerServer {
         }
         let served = token.served;
         let first_error = if served < expected && token.first_error.is_none() {
-            // A dead thread is reported as such, now and on every later token; a live shortfall is `Missing`.
             Some(if token.dead {
                 ServeError::Dead
             } else {
@@ -334,7 +315,6 @@ impl LayerServer {
         }
     }
 
-    /// Stops the thread: stop flag, wake, join bounded by `timeout + 1 s`; else `Dead`.
     pub fn shutdown(mut self) -> Result<(), ServeError> {
         let mut token = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
         token.stop = true;

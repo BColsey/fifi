@@ -24,7 +24,6 @@ pub struct TokenizerPin {
     pub vocab_size: u32,
 }
 
-/// The message-boundary token counts of one encoded prompt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PromptBoundaries {
     /// The number of prompt tokens that end at the last message boundary, when the prompt ids
@@ -209,7 +208,6 @@ impl WarmTurnCache {
         self.fallbacks
     }
 
-    /// The fixed cause string of the last counted fallback, if any.
     pub fn last_fallback_reason(&self) -> Option<&'static str> {
         self.last_fallback
     }
@@ -249,7 +247,6 @@ impl WarmTurnCache {
         self.reuses
     }
 
-    /// Test-only: digest invocations charged to this cache so far.
     #[cfg(test)]
     pub fn digest_calls(&self) -> usize {
         self.digest_calls
@@ -358,8 +355,6 @@ impl TokenizerBundle {
         &self.tokenizer
     }
 
-    /// The id of `eos_token` in `tokenizer_config.json`. It is the first id of
-    /// `eos_token_ids`.
     pub fn eos_token_id(&self) -> u32 {
         self.eos_token_ids[0]
     }
@@ -391,7 +386,6 @@ impl TokenizerBundle {
         self.template.force_flags_off();
     }
 
-    /// Test-only: forces both replay flags on (see the template method).
     #[cfg(test)]
     pub fn force_flags_on(&mut self) {
         self.template.force_flags_on();
@@ -752,8 +746,6 @@ impl TokenizerBundle {
         if self.tokenizer.ends_inside_added_token(head.as_str()) {
             return Err(WarmRefusal::HeadPartial);
         }
-        // Both junctions must pass the full suffix proof (eligibility,
-        // added-token start at byte 0, offset-0 added first id).
         let (Some(head_delta_ids), Some(gen_ids)) = (
             self.request_suffix_ids(head.as_str(), cache.head_render.as_str()),
             self.request_suffix_ids(&full, head.as_str()),
@@ -987,9 +979,6 @@ impl TokenizerBundle {
     /// suffix is non-empty, some added token's text starts it (cheap
     /// pre-screen), and its first encoded token is that added token.
     fn request_suffix_ids(&self, full: &str, head: &str) -> Option<Vec<u32>> {
-        // Tokenizer-wide eligibility first (load-time: no truncation, no
-        // padding, every added token free of contextual/text-altering
-        // flags) — under it, an added-token split is byte-faithful.
         if !self.tokenizer.boundary_eligible() {
             return None;
         }
@@ -1263,10 +1252,6 @@ mod tests {
         }
     }
 
-    /// The boundary rule as a table: a Developer opener counts as
-    /// system-like; several leading system messages all skip; a system-only
-    /// history makes the WHOLE head the boundary; empty input is None (the
-    /// caller keeps the boundary unknown).
     #[test]
     fn first_message_end_covers_leading_system_messages_plus_one_turn() {
         let cases: &[(&str, Vec<PromptMessage>, Option<usize>)] = &[

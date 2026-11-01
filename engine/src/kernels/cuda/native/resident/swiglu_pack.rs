@@ -63,21 +63,16 @@ pub(in crate::kernels::cuda) struct SwigluInts {
     pub(in crate::kernels::cuda) k_pad: c_int,
 }
 
-/// What one SwiGLU pack reads and writes: the converted ranges and the integers.
 pub(in crate::kernels::cuda) struct SwigluRaw<'a> {
     pub(in crate::kernels::cuda) gu: RawRange<'a>,
     pub(in crate::kernels::cuda) xf: RawRange<'a>,
     pub(in crate::kernels::cuda) ints: SwigluInts,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Proves a launch before the native call: the shape, the sizes and alignment of both ranges (`gu`
-/// 4, `xf` 16) and that `xf`, which the launch writes, shares no byte with `gu`, which it writes
-/// as well (the zero tails). The extents compared are the ones the kernel touches.
 fn check_swiglu(call: &SwigluRaw<'_>) -> Result<(), DeviceFailure> {
     let (m, n_ff, k_pad) = (
         size(call.ints.m)?,
@@ -159,7 +154,6 @@ mod tests {
         stream: 0x1,
     };
 
-    /// A named edit of the valid argument set.
     type Case = (&'static str, fn(&mut Args));
 
     fn pointer(address: usize) -> *mut c_void {

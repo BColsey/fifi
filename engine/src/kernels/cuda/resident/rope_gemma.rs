@@ -37,7 +37,6 @@ pub(crate) struct RopeGemmaCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the rope_gemma of call on stream, rotating call.q and call.k in place.
     pub(crate) fn rope_gemma(
         &self,
         stream: &DeviceStream,

@@ -1109,7 +1109,6 @@ mod tests {
         );
     }
 
-    /// An F32 tensor `[2]` for `read_head`.
     fn head_pair(decoder: &mut ResidentDecoder<'_>, pair: [f32; 2]) -> ExecutionTensor {
         let host = f32_tensor(vec![2], &pair).unwrap();
         decoder.kernels.import_tensor(&host).unwrap()

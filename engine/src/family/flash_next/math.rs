@@ -1,23 +1,17 @@
-//! Host f32 helpers shared by the Flash-Next forward blocks.
-
 use crate::EngError;
 
-/// Logistic function `1 / (1 + exp(-x))`.
 pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// SiLU `x * sigmoid(x)`.
 pub(crate) fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
-/// Stable softplus `max(x, 0) + ln(1 + exp(-|x|))`.
 pub(crate) fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
-/// Checks that `values` holds exactly `len` elements.
 pub(crate) fn expect_len(values: &[f32], len: usize, what: &str) -> Result<(), EngError> {
     if values.len() != len {
         return Err(EngError::BadRequest(format!(
@@ -28,13 +22,12 @@ pub(crate) fn expect_len(values: &[f32], len: usize, what: &str) -> Result<(), E
     Ok(())
 }
 
-/// Dot product `sum(a[i] * b[i])` for equal-length slices.
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> Result<f32, EngError> {
     expect_len(b, a.len(), "dot operand")?;
     Ok(a.iter().zip(b).map(|(x, y)| x * y).sum())
 }
 
-/// Zero-centered RMS normalization `x[i] * (1 + weight[i]) / sqrt(mean(x^2) + eps)`, in the oracle operation order.
+/// Zero-centered RMS normalization in the oracle operation order.
 pub(crate) fn rms0(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngError> {
     if x.is_empty() {
         return Err(EngError::BadRequest("rms0 input is empty".to_owned()));
@@ -48,7 +41,6 @@ pub(crate) fn rms0(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngE
         .collect())
 }
 
-/// Half-split RoPE rotating pairs `(i, i + rotary_dim / 2)` by `pos / theta^(2i / rotary_dim)`.
 /// The position converts to f32 as the oracle does, so positions above 2^24 round.
 pub(crate) fn rope_half(
     values: &mut [f32],

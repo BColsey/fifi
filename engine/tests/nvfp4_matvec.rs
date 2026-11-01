@@ -1,5 +1,3 @@
-//! Fused NVFP4 matvec parity and rejection tests.
-
 use inference_engine::kernels::nvfp4::WeightBlock;
 use inference_engine::tensor::Dtype;
 

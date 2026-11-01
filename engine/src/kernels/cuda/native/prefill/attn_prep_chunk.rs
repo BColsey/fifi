@@ -29,7 +29,6 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
-/// Mode of the KV outputs: append the normed and rotated rows to the fp16 cache planes.
 pub(in crate::kernels::cuda) const MODE_APPEND_FP16: c_int = 0;
 /// Mode of the KV outputs: write the post-rope k rows and the unchanged v rows as f32, the
 /// input contract of `kv8_append`'s chunk entry.
@@ -124,8 +123,6 @@ pub(in crate::kernels::cuda) enum PrepChunkOut<'a> {
     },
 }
 
-/// What one chunk preparation launch reads and writes: the converted ranges, the mode's
-/// outputs, the optional prefill status word, the integers and the rope scalars.
 pub(in crate::kernels::cuda) struct AttnPrepChunkRaw<'a> {
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
     pub(in crate::kernels::cuda) q_norm: RawRange<'a>,
@@ -138,7 +135,6 @@ pub(in crate::kernels::cuda) struct AttnPrepChunkRaw<'a> {
     pub(in crate::kernels::cuda) rope_base: f32,
 }
 
-/// The bytes each range must hold.
 struct Needs {
     proj: usize,
     norm: usize,
@@ -146,12 +142,10 @@ struct Needs {
     kv: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -179,10 +173,6 @@ fn needs(io: &AttnPrepChunkRaw<'_>) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// Proves a launch before the native call: sizes and alignment of every range (`q` and the
-/// fp16 caches 16-byte; `proj`, the norms, the f32 rows of the RowsOut mode and the status
-/// word 4-byte) and that every range the kernel writes (`q`, the mode's KV outputs, `status`)
-/// shares no byte with any other range of the call.
 fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(io)?;
     let norm = need.norm;
@@ -211,8 +201,7 @@ fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
             .status
             .as_ref()
             .is_none_or(|s| s.offset().is_multiple_of(4));
-    // `q`, both KV outputs of the mode and the status word are written: each is apart from
-    // every other range of the call; the reads may overlap each other.
+    // Only written ranges must be pairwise apart; the reads may overlap each other.
     let mut written = vec![
         Span::of(&io.q, need.q),
         Span::of(kv_a, need.kv),
@@ -236,7 +225,6 @@ fn check_prep_chunk(io: &AttnPrepChunkRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// The C mirror of `io`, with NULL exactly where the mode leaves a pointer unused.
 fn c_args(io: &AttnPrepChunkRaw<'_>) -> AttnPrepChunkArgsRaw {
     let (k_cache, v_cache, k_rows, v_rows) = match &io.out {
         PrepChunkOut::AppendFp16 { k_cache, v_cache } => (
@@ -281,7 +269,7 @@ fn c_args(io: &AttnPrepChunkRaw<'_>) -> AttnPrepChunkArgsRaw {
 
 /// Queues the chunk preparation kernel on `stream`: per-head RMSNorm and rope of the q and k
 /// rows at the positions `p0 .. p0 + m`, the f32 `q` output, and the k/v rows written to the
-/// fp16 cache planes or to f32 rows by the mode. Returns when the kernel is queued.
+/// fp16 cache planes or to f32 rows by the mode.
 pub(in crate::kernels::cuda) fn attn_prep_chunk_launch(
     stream: &RawStream,
     io: AttnPrepChunkRaw<'_>,

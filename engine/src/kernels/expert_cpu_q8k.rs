@@ -26,15 +26,12 @@ use super::expert_cpu::{
 pub struct Q8kRow {
     /// Per-block scale `d = amax / 127`, dimensioned like the activation values.
     pub(crate) d: Vec<f32>,
-    /// One quantized activation per input value, `-127..=127`.
     pub(crate) q: Vec<i8>,
     /// 16 exact group sums per block (i16: `16 * 127` fits with room to spare).
     pub(crate) bsums: Vec<i16>,
 }
 
 impl Q8kRow {
-    /// Allocates a zeroed row for `k` activations; `k` must be a positive multiple of
-    /// [`Q4K_BLOCK_VALUES`] (whole blocks), else `BadShape`.
     pub fn zeros(k: usize) -> Result<Self, ExpertCpuError> {
         if k == 0 || !k.is_multiple_of(Q4K_BLOCK_VALUES) {
             return Err(ExpertCpuError::BadShape(format!(
@@ -57,15 +54,6 @@ fn row_zeros(k: usize) -> Q8kRow {
     }
 }
 
-/// Quantizes `x` into `out`, one 256-value block at a time: `amax = max|x_i|`; an
-/// all-zero block stores `d = 0.0` with all-zero `q` and `bsums`; otherwise `d =
-/// amax / 127.0`, `inv = 127.0 / amax` (both f32 divisions), `q_i = round(x_i * inv)`
-/// (Rust `f32::round`, ties away from zero) clamped to `-127..=127` as i8, and
-/// `bsums[j]` is the exact i16 sum of the `q` values `16j..16j+16` of the block.
-///
-/// `x` must be finite and a positive multiple of [`Q4K_BLOCK_VALUES`] long and must
-/// match `out`'s lengths; every violation is reported before a byte of `out` is
-/// written. Deterministic: identical inputs give bitwise-identical rows.
 pub fn quantize_q8k(x: &[f32], out: &mut Q8kRow) -> Result<(), ExpertCpuError> {
     if x.is_empty() || !x.len().is_multiple_of(Q4K_BLOCK_VALUES) {
         return Err(ExpertCpuError::BadShape(format!(
@@ -119,10 +107,9 @@ pub fn quantize_q8k(x: &[f32], out: &mut Q8kRow) -> Result<(), ExpertCpuError> {
     Ok(())
 }
 
-/// The float tail of one block: `t1 = d_w * sumi`, `t2 = dmin_w * summ`, block value
-/// `= d_x * (t1 - t2)`, in exactly that operation order. This is the ONE piece of
-/// float arithmetic of the integer dot, shared verbatim by the scalar and AVX2 paths;
-/// `sumi`/`summ` are exact integers, so reproducing them reproduces the bits.
+/// The ONE piece of float arithmetic of the integer dot, shared verbatim by the scalar
+/// and AVX2 paths; `sumi`/`summ` are exact integers, so reproducing them reproduces the
+/// bits.
 pub(crate) fn q8k_block_value(d_x: f32, d_w: f32, dmin_w: f32, sumi: i32, summ: i32) -> f32 {
     let t1 = d_w * sumi as f32;
     let t2 = dmin_w * summ as f32;
@@ -196,12 +183,10 @@ impl DotBackend {
         Self(Backend::Scalar)
     }
 
-    /// The scalar reference path, on every target and CPU.
     pub fn scalar() -> Self {
         Self(Backend::Scalar)
     }
 
-    /// `"scalar"` or `"avx2"`: the implementation this backend selects.
     pub fn name(&self) -> &'static str {
         match self.0 {
             Backend::Scalar => "scalar",
@@ -210,7 +195,7 @@ impl DotBackend {
     }
 }
 
-/// One row through `backend`; the AVX2 arm re-checks the feature bit inside its
+/// The AVX2 arm re-checks the feature bit inside its
 /// module before any intrinsic runs.
 fn row_dot(backend: DotBackend, row: &[u8], xq: &Q8kRow) -> f32 {
     match backend {
@@ -234,7 +219,6 @@ fn row_dot_simd(row: &[u8], xq: &Q8kRow) -> f32 {
     q4k_q8k_row_dot_scalar(row, xq)
 }
 
-/// `BadLength` for the first `xq` buffer that does not describe exactly `k` values.
 fn xq_bad_length(xq: &Q8kRow, k: usize) -> Option<ExpertCpuError> {
     let blocks = k / Q4K_BLOCK_VALUES;
     [
@@ -256,9 +240,6 @@ fn matvec_rows(backend: DotBackend, w: &[u8], k: usize, xq: &Q8kRow, out: &mut [
     }
 }
 
-/// Dots `rows` rows of `k` Q4_K weights with the quantized activation row `xq`
-/// through `backend`, writing `rows` f32 results to `out`.
-///
 /// The same contract as `expert_cpu::q4k_matvec`: `k` a positive multiple of
 /// [`Q4K_BLOCK_VALUES`], `rows` nonzero, `w` exactly `rows * k / 256 * 144` bytes,
 /// `xq` describing exactly `k` values, `out` exactly `rows` long; every violation is
@@ -306,9 +287,7 @@ pub fn q4k_q8k_matvec(
 /// `gate`/`up`/`act` rows (`inter` long) and two quantized rows, `qx` for the hidden
 /// input and `qh` for the intermediate activations.
 pub struct ExpertScratchQ8k {
-    /// Gate projection output, `inter` values.
     gate: Vec<f32>,
-    /// Up projection output, `inter` values.
     up: Vec<f32>,
     /// `silu(gate) * up`, `inter` values.
     act: Vec<f32>,
@@ -319,8 +298,7 @@ pub struct ExpertScratchQ8k {
 }
 
 impl ExpertScratchQ8k {
-    /// Allocates scratch sized for one expert of `shape`: value buffers `inter` long
-    /// and quantized rows for `hidden` and `inter` inputs. A shape that is not a
+    /// A shape that is not a
     /// positive multiple of 256 still allocates floor-sized buffers; the forward
     /// rejects such shapes before reading any scratch byte.
     pub fn new(shape: ExpertShape) -> Self {
@@ -334,11 +312,6 @@ impl ExpertScratchQ8k {
     }
 }
 
-/// Runs one expert through the integer path: quantize `x` (`hidden` values), gate
-/// and up rows against it, `h = silu(gate) * up` in f32 with the same silu as the
-/// reference `expert_forward` (`x / (1 + exp(-x))`), quantize `h` (`inter` values),
-/// down rows into `out`.
-///
 /// Validation is the `expert_forward` contract verbatim (shape first, then every
 /// implied length, `out` untouched on error) plus the quantizer's refusal of
 /// non-finite `x`; with matching scratch a call allocates nothing.
@@ -445,9 +418,7 @@ mod tests {
     #[test]
     fn quantizer_round_trips_within_half_a_step_and_pins_the_edges() {
         // Per element |x - d*q| <= d/2 + 4 ulp of the range top (the three roundings
-        // in d, inv and x*inv); the amax element maps to +-127; an all-zero block
-        // gives d = 0 and q = 0; bsums are the exact sums; repeats are bitwise
-        // identical; bad input is refused with out untouched.
+        // in d, inv and x*inv).
         let mut rng = Lcg(0x8E57_8E57_8E57_8E57);
         let k = 4 * Q4K_BLOCK_VALUES;
         let mut x = vec![0.0f32; k];
@@ -461,7 +432,6 @@ mod tests {
         let mut a = Q8kRow::zeros(k).unwrap();
         quantize_q8k(&x, &mut a).unwrap();
 
-        // Round trip plus exact bsums, per block.
         let ulp4 = |d: f32| d * 128.0 * f32::EPSILON;
         for b in 0..4 {
             let xs = &x[b * Q4K_BLOCK_VALUES..][..Q4K_BLOCK_VALUES];
@@ -494,7 +464,6 @@ mod tests {
             let want = if i % 2 == 0 { 127 } else { -127 };
             assert_eq!(a.q[Q4K_BLOCK_VALUES + i], want);
         }
-        // ... and the random block's amax element does too.
         let (mut at, mut amax) = (0usize, 0.0f32);
         for (i, &v) in x[3 * Q4K_BLOCK_VALUES..].iter().enumerate() {
             if v.abs() > amax {
@@ -518,7 +487,6 @@ mod tests {
         assert_eq!(a.q, b_row.q);
         assert_eq!(a.bsums, b_row.bsums);
 
-        // Bad input is refused with out untouched.
         let mut r = Q8kRow::zeros(k).unwrap();
         r.d[0] = 42.0;
         r.q[0] = 9;
@@ -577,7 +545,6 @@ mod tests {
         0x0001, 0x03ff, 0x0400, 0x3500, 0x3800, 0x3c00, 0x4000, 0x7bff, 0xbc00,
     ];
 
-    /// Writes one random Q4_K block: random scale/nibble bytes, finite d/dmin.
     fn random_block(rng: &mut Lcg, out: &mut [u8; Q4K_BLOCK_BYTES], d_bits: &[u16]) {
         *out = [0; Q4K_BLOCK_BYTES];
         for b in out[4..].iter_mut() {
@@ -588,7 +555,6 @@ mod tests {
         out[2..4].copy_from_slice(&pick(rng).to_le_bytes());
     }
 
-    /// `rows x k` random Q4_K weights: every block random with finite d/dmin.
     fn random_weights(rng: &mut Lcg, rows: usize, k: usize) -> Vec<u8> {
         let mut w = vec![0u8; rows * k / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES];
         for blk in w.as_chunks_mut::<Q4K_BLOCK_BYTES>().0 {
@@ -775,7 +741,6 @@ mod tests {
         };
         let all_nan = |v: &[f32]| v.iter().all(|v| v.is_nan());
 
-        // Shape violations first, on otherwise valid arguments.
         for bad in [
             ExpertShape {
                 hidden: 100,
@@ -866,7 +831,6 @@ mod tests {
             assert!(all_nan(&oo[..checked]), "{what} case touched out");
         }
 
-        // Non-finite x is refused by the quantizer contract, out untouched.
         let mut poison = x.clone();
         poison[3] = f32::NAN;
         let mut scratch = ExpertScratchQ8k::new(shape);
@@ -926,7 +890,6 @@ mod tests {
             (a, b)
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-        // Random data across k in {256, 512, 2048} and 3..=64 rows.
         for (rows, k) in [
             (3usize, 256usize),
             (17, 256),

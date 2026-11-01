@@ -73,7 +73,6 @@ pub(crate) enum WeightLayout {
     Exl3,
 }
 
-/// Options of one [`CudaProjector::load`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LoadOptions<'a> {
     pub(crate) reserve: Reserve,
@@ -87,7 +86,6 @@ pub(crate) struct LoadOptions<'a> {
     pub(crate) layout: WeightLayout,
 }
 
-/// One checkpoint tensor resident on the device.
 pub(crate) enum CudaWeight {
     /// A Q4_K, Q6_K or Q8_0 matrix in the vendored tile layout. `experts` is
     /// the stack depth of a rank-3 tensor, whose rows are the `experts`
@@ -123,7 +121,6 @@ impl CudaWeight {
         }
     }
 
-    /// Every device buffer of the tensor.
     fn buffers(&self) -> Vec<&DeviceBuffer> {
         match self {
             Self::Tiled { weight, .. } => vec![weight.buffer()],
@@ -134,7 +131,6 @@ impl CudaWeight {
         }
     }
 
-    /// Device bytes held by the tensor.
     pub(crate) fn device_bytes(&self) -> usize {
         match self {
             Self::Tiled { weight, .. } => weight.buffer().bytes(),
@@ -146,7 +142,6 @@ impl CudaWeight {
     }
 }
 
-/// Where the time of one [`CudaProjector::load`] went.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LoadTimes {
     /// The pre-upload scale scan of the Q6_K and Q8_0 tensors.
@@ -188,7 +183,6 @@ impl CudaWeights {
         self.weights.len()
     }
 
-    /// Device bytes held by all tensors of the load.
     pub(crate) fn device_bytes(&self) -> usize {
         self.weights.iter().map(CudaWeight::device_bytes).sum()
     }
@@ -231,7 +225,6 @@ pub(crate) enum TensorKind {
 }
 
 impl CudaWeight {
-    /// The layout kind of the tensor for [`load_layout`].
     pub(crate) fn kind(&self) -> TensorKind {
         match self {
             Self::Tiled { .. } => TensorKind::Tiled,
@@ -268,9 +261,7 @@ pub(crate) fn load_layout<'a>(
     Ok(layout.unwrap_or(WeightLayout::Tiled))
 }
 
-/// A whole model after [`CudaProjector::load_model`].
 pub(crate) struct LoadedModel {
-    /// All tensors of the plan, on the device.
     pub(crate) device: CudaWeights,
     /// The layout the quantized tensors were loaded in, so the resident step can assert it: one
     /// layout per load, never both. Staged: no production reader yet; the resident step asserts
@@ -285,14 +276,11 @@ pub(crate) struct LoadedModel {
     pub(crate) layout: WeightLayout,
 }
 
-/// What [`CudaProjector::transfer`] works from, after the checks and the
-/// admission of a load.
 struct LoadPlan<'a> {
     tensors: Vec<(&'a GgufTensor, u64)>,
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
-    /// The device layout of the quantized tensors.
     layout: WeightLayout,
     /// The fused GDN input-projection groups of this load, as `(qkv position, [sibling
     /// positions in column order])`; empty unless the fusion flag is set. The sibling
@@ -324,7 +312,6 @@ pub(crate) fn served_admission() -> Admission {
     }
 }
 
-/// Runs the projections of one forward step on the first CUDA device.
 pub(crate) struct CudaProjector {
     context: CudaContext,
     /// Tile bytes per upload chunk, and the size of a scan chunk.
@@ -332,7 +319,6 @@ pub(crate) struct CudaProjector {
     /// Whether the device shares memory with the host (a Jetson); it selects
     /// the [`LoadPolicy`] of every load.
     integrated: bool,
-    /// Device out-of-memory retries over all loads of this projector.
     oom_retries: Cell<u32>,
 }
 
@@ -363,13 +349,11 @@ impl CudaProjector {
         Self { integrated, ..self }
     }
 
-    /// Whether loads use the integrated-GPU policy.
     #[cfg(test)]
     pub(crate) fn integrated(&self) -> bool {
         self.integrated
     }
 
-    /// Device out-of-memory retries made by all loads of this projector.
     pub(crate) fn oom_retries(&self) -> u32 {
         self.oom_retries.get()
     }
@@ -384,8 +368,6 @@ impl CudaProjector {
         &self.context
     }
 
-    /// Device bytes held by live buffers in the process; see
-    /// [`CudaContext::live_bytes`].
     #[cfg(test)]
     pub(crate) fn live_bytes(&self) -> usize {
         self.context.live_bytes()
@@ -731,7 +713,6 @@ impl CudaProjector {
                 })
             }
             WeightLayout::Native => {
-                // The file's own blocks, no repack and no scale scan.
                 let weight = self
                     .context
                     .upload_native(quant, self.chunk_limit, &mut |at, buf| {

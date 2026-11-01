@@ -1,5 +1,3 @@
-//! Native paged-KV ownership and bounded allocation.
-
 use std::{cell::Cell, mem::size_of};
 
 mod backing;
@@ -46,7 +44,6 @@ impl TransferSlot {
     }
 }
 
-/// Two separately allocated transfer slots and the complete host backing.
 /// A slot's byte count is not an aligned stride for packing the slots together.
 pub(super) struct PagedKv {
     slots: [TransferSlot; 2],
@@ -115,7 +112,7 @@ impl PagedKv {
         })
     }
 
-    /// Loads a vacant slot. Eviction needs a separate consumer-completion/writeback proof.
+    /// Eviction needs a separate consumer-completion/writeback proof.
     pub(super) fn load(
         &mut self,
         context: &CudaContext,
@@ -375,7 +372,6 @@ impl PagedKv {
         result
     }
 
-    /// The loaded page's authoritative group and four physical plane views.
     fn page(&self, slot: usize) -> Result<PagedQ8Page<'_>, EngError> {
         let page = self
             .slots
@@ -397,7 +393,7 @@ impl PagedKv {
     }
 }
 
-/// One full-attention layer's immutable request. visible_keys is a positive global count.
+/// `visible_keys` is a positive global count.
 pub(super) struct PageAttention<'a> {
     pub(super) full_layer: usize,
     pub(super) visible_keys: usize,

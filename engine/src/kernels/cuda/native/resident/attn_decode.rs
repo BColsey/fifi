@@ -80,8 +80,6 @@ pub(in crate::kernels::cuda) struct AttnInts {
     pub(in crate::kernels::cuda) ring: c_int,
 }
 
-/// What one attention launch reads and writes: the converted ranges, the integers and the score
-/// scale.
 pub(in crate::kernels::cuda) struct AttnDecodeRaw<'a> {
     pub(in crate::kernels::cuda) q: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: Option<RawRange<'a>>,
@@ -94,7 +92,6 @@ pub(in crate::kernels::cuda) struct AttnDecodeRaw<'a> {
     pub(in crate::kernels::cuda) scale: f32,
 }
 
-/// The bytes each range must hold and the alignment of its start.
 struct Needs {
     q: usize,
     proj: usize,
@@ -103,12 +100,10 @@ struct Needs {
     out: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -142,9 +137,6 @@ fn needs(io: &AttnDecodeRaw<'_>) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// Proves a launch before the native call: sizes and alignment of every range (q 16, proj 4,
-/// k and v 16, kv_len 4, part 16, out 4) and that `out` and `part`, which the kernels write,
-/// share no byte with any other range.
 fn check_attn(io: &AttnDecodeRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(io)?;
     let sized = io.q.bytes >= need.q
@@ -183,7 +175,6 @@ fn check_attn(io: &AttnDecodeRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the two attention kernels (partials, then the fixed-order combine) on `stream`.
-/// Returns when both are queued.
 pub(in crate::kernels::cuda) fn attn_decode_launch(
     stream: &RawStream,
     io: AttnDecodeRaw<'_>,

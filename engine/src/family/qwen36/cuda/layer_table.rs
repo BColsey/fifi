@@ -15,7 +15,6 @@ use crate::{
     },
 };
 
-/// One layer: its kind, its ordinal among the layers of that kind and its tensors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LayerEntry {
     kind: AttentionKind,
@@ -28,7 +27,6 @@ pub(super) struct LayerTable {
     layers: Vec<LayerEntry>,
 }
 
-/// Where a layer's mixer state lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LayerSlot {
     pub(super) kind: AttentionKind,
@@ -122,7 +120,6 @@ impl LayerTable {
         })
     }
 
-    /// The GGUF name of `role` in `layer`; `Checkpoint` when the layer does not hold the role.
     pub(super) fn name(&self, layer: usize, role: Role) -> Result<&str, EngError> {
         self.entry(layer)?
             .names

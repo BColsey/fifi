@@ -481,7 +481,6 @@ fn the_rate_comes_from_the_config_bits_not_from_four() {
     let rates: Vec<_> = audit.bits_twice.iter().map(|(b, n)| (*b, *n)).collect();
     assert_eq!(rates, [(10, 1), (12, 45)]);
     assert!(audit.admitted.iter().all(|a| a.bits_twice == 12));
-    // The same tensors under a config that still says 4 bits are refused.
     let mut pack = PackBuilder::tiny_with_bits(6);
     pack.config["quantization_config"]["bits"] = json!(4.0);
     let dir = pack.write();

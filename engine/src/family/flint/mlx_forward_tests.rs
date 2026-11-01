@@ -301,7 +301,6 @@ fn the_compiled_tail_is_bitwise_identical_to_the_eager_tail() {
             bytes(&mut k, &compiled),
             "compiled must be bitwise eager at {dtype:?}"
         );
-        // The changed-operand replay recomputes the eager tail for the new operands.
         let residual2 = k.binary(BinaryOp::Add, &x2, &attended2).unwrap();
         let normed2 = k.rms_norm(&residual2, &gamma2, 1e-6).unwrap();
         let ff2 = dense.apply(&mut k, &normed2).unwrap();

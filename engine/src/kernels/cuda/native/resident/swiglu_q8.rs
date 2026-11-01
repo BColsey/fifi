@@ -30,7 +30,7 @@ unsafe extern "C" {
 }
 
 /// Mirror of `inference_cuda_swiglu_q8_args` (`swiglu_q8.h`), field for field. The layout is
-/// pinned below and by the `static_assert` of the header.
+/// pinned as well by the `static_assert` of the header.
 #[repr(C)]
 struct SwigluQ8ArgsRepr {
     gu: *const c_void,
@@ -49,8 +49,6 @@ const _: () = assert!(
         && offset_of!(SwigluQ8ArgsRepr, slots) == 24
 );
 
-/// What one launch reads and writes: the strided `[slot][gate|up]` rows of `gu` and the
-/// `slots` padded `block_q8_1` rows of `q8`.
 pub(in crate::kernels::cuda) struct SwigluQ8Raw<'a> {
     pub(in crate::kernels::cuda) gu: RawRange<'a>,
     pub(in crate::kernels::cuda) q8: RawRange<'a>,
@@ -67,9 +65,6 @@ fn q8_bytes_native(n_ff: usize, slots: usize) -> Option<usize> {
     padded.checked_div(32)?.checked_mul(36)?.checked_mul(slots)
 }
 
-/// Proves a launch before the native call: `n_ff` a multiple of 32 in `32..=32768`, `slots` in
-/// `1..=8`, `y_slot_stride >= 2 * n_ff`, `gu` the strided footprint and `q8` the padded rows, both
-/// 4-byte aligned, and `q8` disjoint from `gu`.
 fn check_swiglu_q8(call: &SwigluQ8Raw<'_>) -> Result<(), DeviceFailure> {
     let slot_gaps = call.slots.checked_sub(1).ok_or_else(invalid_argument)?;
     let gu_floats = call
@@ -102,8 +97,6 @@ fn check_swiglu_q8(call: &SwigluQ8Raw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the batched SwiGLU and q8_1 quantize of `call` on `stream`. Returns when the kernel is
-/// queued.
 pub(in crate::kernels::cuda) fn swiglu_q8_launch(
     stream: &RawStream,
     call: &SwigluQ8Raw<'_>,
@@ -132,9 +125,6 @@ mod tests {
     use super::super::RawDevice;
     use super::*;
 
-    /// The arguments of one launch as plain numbers; the addresses are made up and apart. Each
-    /// case changes one thing so the entry refuses before it reaches the device, and a valid
-    /// call is never made (the CPU runner has no driver).
     #[derive(Clone, Copy)]
     struct Args {
         gu: usize,
@@ -241,10 +231,6 @@ mod tests {
         })
     }
 
-    /// Host only: the native check against the ranges of an unbacked allocation. The valid
-    /// layout passes (stride 2048 > 2 * 896); each case changes one thing and is refused,
-    /// among them the tight strided footprint of `gu` and the padded
-    /// 32-block rows at the Mellum width.
     #[test]
     fn check_swiglu_q8_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 21);

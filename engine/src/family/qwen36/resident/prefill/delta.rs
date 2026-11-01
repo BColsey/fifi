@@ -28,7 +28,7 @@ use crate::{
     tensor::{Dtype, ExecutionTensor},
 };
 
-/// Output and replacement state of one DeltaNet chunk. Every tensor is lazy.
+/// Every tensor is lazy.
 pub(super) struct DeltaChunk {
     /// Layer output `[T, H]`.
     pub(super) out: ExecutionTensor,
@@ -322,7 +322,6 @@ mod tests {
             .collect()
     }
 
-    /// The host load for the oracle, the resident import, and the checkpoint reader.
     fn setup(spec: &FamilySpec) -> (StreamedCheckpoint, HostWeights, ResidentWeights, MlxKernels) {
         let ckpt = tiny::checkpoint(spec);
         let config = tiny::config(spec);

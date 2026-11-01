@@ -66,7 +66,6 @@ impl Inputs {
     }
 }
 
-/// The products of `terms` summed in f64.
 fn dot64(terms: &[(f32, f32)]) -> f64 {
     terms
         .iter()
@@ -788,7 +787,6 @@ fn combine_inside_a_capture_reads_the_new_values_between_replays() {
         base.down.clone(),
         base.shared.clone().expect("gated").1,
     );
-    // Three weight/gate variants over the one fixed problem.
     let variants: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
         .map(|rep| {
             let v = random_inputs(&mut rng, s, true, (0.3, 0.3), rep);

@@ -119,20 +119,18 @@ impl Shared {
     }
 }
 
-/// Why `EngineHandle::try_submit` refused a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubmitError {
-    /// The queue holds `QUEUE_CAPACITY` jobs. The server maps this to `Overloaded`.
+    /// The server maps this to `Overloaded`.
     QueueFull,
     /// A native failure or an executor panic stopped the engine. The server maps this to `Backend`.
     NativeFailed,
-    /// The engine failed to load. The server maps this to `Backend`, like `NativeFailed`.
+    /// The server maps this to `Backend`, like `NativeFailed`.
     LoadFailed,
     /// The engine has stopped or is stopping. The server maps this to `Overloaded`.
     Unavailable,
 }
 
-/// A message to the engine thread.
 enum Message {
     Job(Job),
     /// Ends the loop after the jobs ahead of it. `shutdown` sends it so that the thread stops
@@ -148,12 +146,10 @@ pub(crate) struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// The current state of the engine.
     pub(crate) fn state(&self) -> EngineState {
         self.shared.state()
     }
 
-    /// The cause of the `Error` or `NativeFailed` state, for `/ready` and the logs.
     pub(crate) fn failure(&self) -> Option<String> {
         self.shared.failure()
     }
@@ -181,23 +177,19 @@ impl EngineHandle {
     }
 }
 
-/// What `Engine::shutdown` found when the thread ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ShutdownReport {
-    /// The final state of the engine.
     pub(crate) state: EngineState,
     /// The cause of an `Error` or `NativeFailed` state, including every panic.
     pub(crate) failure: Option<String>,
 }
 
-/// One engine thread and its handle.
 pub(crate) struct Engine {
     handle: EngineHandle,
     thread: JoinHandle<()>,
 }
 
 impl Engine {
-    /// A new handle to the engine.
     pub(crate) fn handle(&self) -> EngineHandle {
         self.handle.clone()
     }
@@ -337,7 +329,6 @@ fn reject(job: Job) {
     );
 }
 
-/// Cancels a job that never started: the owner gets a `Cancelled` batch and a usage event.
 fn cancel_unstarted(job: Job) {
     job.generation.cancel.store(true, Ordering::SeqCst);
     send_cancelled(&job.events, prompt_tokens(&job.prompt));
@@ -509,7 +500,6 @@ fn work<E, F>(
     drain(jobs, cancel_unstarted);
 }
 
-/// The prompt of one job, the length of its reusable prefix, and the root inside it.
 struct PromptPlan<'a> {
     tokens: &'a [u32],
     /// The number of leading tokens that end at the last message boundary, or `None`.
@@ -519,7 +509,6 @@ struct PromptPlan<'a> {
     root: Option<usize>,
 }
 
-/// The shortest root that a save point accepts.
 const MIN_ROOT_TOKENS: usize = 2_048;
 
 /// The stride of the periodic save points: one entry at every multiple of this many positions
@@ -899,15 +888,14 @@ fn start<E: ExecutorOps>(
     Ok(restored)
 }
 
-/// The tokens from `from` up to `to`.
 fn span(tokens: &[u32], from: usize, to: usize) -> Result<&[u32], EngError> {
     tokens
         .get(from..to)
         .ok_or_else(|| EngError::BadRequest("prompt span is outside the prompt".to_string()))
 }
 
-/// Prefills `tokens` in chunks. The cancel flag stops it between two chunks, never before the
-/// first chunk of the job. Returns false when it stopped early.
+/// The cancel flag stops it between two chunks, never before the first chunk of the job.
+/// Returns false when it stopped early.
 fn prefill_chunks<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -952,8 +940,8 @@ fn reset_state<E: ExecutorOps>(
     }
 }
 
-/// Reports a job error. A `Backend` error is process-scoped: the worker makes no further
-/// executor call. Any other error fails only this job and leaves a reset session.
+/// A `Backend` error is process-scoped: the worker makes no further executor call. Any other
+/// error fails only this job and leaves a reset session.
 fn fail<E: ExecutorOps>(
     executor: &mut E,
     session: &mut E::Session,
@@ -1006,7 +994,6 @@ mod tests {
         cancel_after_prefill: Option<Arc<AtomicBool>>,
         /// Sets the cancel flag after the `at`-th `prefill` call (0 is the first).
         cancel_after_prefill_call: Option<(usize, Arc<AtomicBool>)>,
-        /// The number of `prefill` calls so far.
         prefill_calls: usize,
         /// Fails the n-th `reset` call (0 is the first) with the error.
         fail_reset_call: Option<(usize, EngError)>,
@@ -1020,7 +1007,6 @@ mod tests {
         /// Fails the n-th `save_prefix` call (0 is the first) with the error, before the fake
         /// sees it.
         fail_save_call: Option<(usize, EngError)>,
-        /// The number of `save_prefix` calls so far.
         save_calls: usize,
         /// Sets the cancel flag after the first `save_prefix` call that the fake accepts.
         cancel_after_save: Option<Arc<AtomicBool>>,
@@ -1269,7 +1255,6 @@ mod tests {
         })
     }
 
-    /// Reads one job's events until the engine closes its channel.
     fn collect(mut handle: JobHandle) -> Vec<JobEvent> {
         let mut events = Vec::new();
         while let Some(event) = handle.events.blocking_recv() {
@@ -1419,7 +1404,6 @@ mod tests {
         prompt
     }
 
-    /// Submits the job, waits for its end, and returns its events.
     fn run_one(handle: &EngineHandle, job: Job, events: JobHandle) -> Vec<JobEvent> {
         handle.try_submit(job).expect("submit");
         collect(events)
@@ -3152,7 +3136,6 @@ mod tests {
             ))]
         );
         assert_eq!(handle.state(), EngineState::Ready);
-        // The next job starts clean and runs to its end.
         let (second, second_events) = job_with_boundary(&[2, 2, 2, 2, 2], 3);
         assert_eq!(
             run_one(&handle, second, second_events),
@@ -3405,7 +3388,6 @@ mod tests {
         super::save_points(&plan, restored, limits, piece, None)
     }
 
-    /// The limits of a store with two roots and six entries.
     const WIDE: StoreLimits = StoreLimits {
         roots: 2,
         entries: 6,
@@ -3476,8 +3458,6 @@ mod tests {
             "no point at the restored position"
         );
     }
-
-    // --- the block prefix-match cut in the save lattice ---
 
     /// `points_full` with the block prefix-match spacing: `Some(spacing)` cuts one rolling
     /// intermediate entry at the last block boundary strictly below the tip.
@@ -4265,7 +4245,6 @@ mod tests {
             vec![(ROOT, true)],
             "the root saved before the failure stays; the tip is missing"
         );
-        // The next job restores the root and runs to its end.
         let (second, second_events) = job_with_points(&prompt, TIP, ROOT);
         assert_eq!(
             run_one(&handle, second, second_events),
@@ -4319,7 +4298,6 @@ mod tests {
         vec![2; 40_000]
     }
 
-    /// The `save_prefix` entries of a call log.
     fn saves_in(entries: &[String]) -> Vec<String> {
         entries
             .iter()

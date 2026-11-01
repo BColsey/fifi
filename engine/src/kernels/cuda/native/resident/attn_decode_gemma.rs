@@ -149,7 +149,6 @@ fn check_attn_decode_gemma(call: &AttnDecodeGemmaRaw<'_>) -> Result<(), DeviceFa
     Ok(())
 }
 
-/// Queues the attention of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn attn_decode_gemma_launch(
     stream: &RawStream,
     call: &AttnDecodeGemmaRaw<'_>,

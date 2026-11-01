@@ -23,7 +23,6 @@ use crate::kernels::cuda::resident::sample_gemma::{SampleGemmaCall, SampleParams
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream};
 use crate::tokenizer::{DecodeBatch, DecodeFinish};
 
-/// Sampling settings of the Humanizer request contract.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Sampling {
     pub(crate) temperature: f32,
@@ -46,14 +45,12 @@ impl Default for Sampling {
     }
 }
 
-/// The committed tokens and the next position of one session.
 #[derive(Default)]
 pub(crate) struct GemmaSession {
     history: Vec<u32>,
     pos: usize,
 }
 
-/// The loaded model, its sampling settings and the per-step sampler buffers.
 pub(crate) struct GemmaExecutor {
     model: Gemma,
     sampling: Sampling,
@@ -62,7 +59,6 @@ pub(crate) struct GemmaExecutor {
 }
 
 impl GemmaExecutor {
-    /// Loads the pinned checkpoint and allocates the sampler buffers.
     pub(crate) fn load(
         path: &std::path::Path,
         header_sha256: Option<&str>,
@@ -79,7 +75,6 @@ impl GemmaExecutor {
         })
     }
 
-    /// Feeds one token and advances the position.
     fn feed(&mut self, st: &mut GemmaSession, token: u32) -> Result<(), EngError> {
         self.model.decode(token, st.pos)?;
         st.pos += 1;
@@ -96,7 +91,6 @@ impl GemmaExecutor {
         Ok(())
     }
 
-    /// Draws one token from the capped logits of the last fed token.
     fn draw(&self, st: &GemmaSession) -> Result<(u32, f32), EngError> {
         self.sampler.draw(
             &self.model.ctx,
@@ -399,7 +393,6 @@ mod tests {
         assert!(produced >= 1, "no token was produced");
     }
 
-    /// Prefill then decode three steps against the pinned checkpoint on a device.
     #[test]
     #[ignore = "requires the pinned Humanizer file and a device"]
     fn prefills_and_decodes_three_tokens() {

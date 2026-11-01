@@ -5,8 +5,6 @@
 
 use crate::EngError;
 
-/// Default share of measured headroom an engine may commit.
-///
 /// 850 permille leaves the 15 percent that device and driver allocations need
 /// beyond the engine's own accounting.
 pub const DEFAULT_SHARE_PERMILLE: u16 = 850;
@@ -18,7 +16,6 @@ pub struct MemoryPolicy {
 }
 
 impl MemoryPolicy {
-    /// Builds a policy from a share in permille, 1 to 1000 inclusive.
     pub fn from_permille(share_permille: u16) -> Result<Self, EngError> {
         if !(1..=1000).contains(&share_permille) {
             return Err(EngError::MemoryPlan(
@@ -28,26 +25,22 @@ impl MemoryPolicy {
         Ok(Self { share_permille })
     }
 
-    /// The engine default policy.
     pub fn default_share() -> Self {
         Self {
             share_permille: DEFAULT_SHARE_PERMILLE,
         }
     }
 
-    /// The share in permille.
     pub fn share_permille(&self) -> u16 {
         self.share_permille
     }
 
-    /// Budget the engine may commit out of the measured available bytes.
     pub fn limit(&self, available_bytes: u64) -> u64 {
         let share = u128::from(self.share_permille);
         let scaled = u128::from(available_bytes) * share / 1000;
         u64::try_from(scaled).unwrap_or(u64::MAX)
     }
 
-    /// Refuses a charge larger than the limit.
     pub fn admit(&self, available_bytes: u64, charge_bytes: u64) -> Result<(), EngError> {
         let limit = self.limit(available_bytes);
         if charge_bytes > limit {

@@ -48,7 +48,6 @@ fn head_groups(order: &[usize], groups_per_head: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Reads tensors of one pack and puts them on the device.
 pub(super) struct PackReader<'a> {
     projector: &'a CudaProjector,
     pub(super) checkpoint: &'a Checkpoint,
@@ -98,7 +97,6 @@ impl<'a> PackReader<'a> {
         Matrix::load(&selected, prefix, &self.checkpoint.config)
     }
 
-    /// Reads the plain tensor `name` after checking its exact stored shape.
     fn plain(&self, name: &str, shape: &[u32]) -> Result<Tensor, EngError> {
         let missing = || EngError::Checkpoint(format!("EXL3 source: missing tensor {name}"));
         let (dtype, stored) = self.checkpoint.source.stored(name).ok_or_else(missing)?;
@@ -113,8 +111,6 @@ impl<'a> PackReader<'a> {
         selected.tensor(name).ok_or_else(missing)
     }
 
-    /// Uploads the matrix under `prefix` as `name` in the shape `want` asks for, with its groups
-    /// along one axis moved when `reorder` says so.
     pub(super) fn exl3(
         &self,
         name: String,
@@ -133,8 +129,6 @@ impl<'a> PackReader<'a> {
         Ok(CudaWeight::Exl3 { name, weight })
     }
 
-    /// Uploads `count` same-shaped matrices, `member(i)` yielding the stored matrix `i`, as the
-    /// bank `name`.
     pub(super) fn bank(
         &self,
         name: String,
@@ -147,7 +141,6 @@ impl<'a> PackReader<'a> {
         Ok(CudaWeight::Exl3Bank { name, bank })
     }
 
-    /// Uploads F32 bytes as the raw tensor `name`.
     fn raw_bytes(&self, name: String, bytes: &[u8]) -> Result<CudaWeight, EngError> {
         let budget = u64::try_from(bytes.len())
             .map_err(|_| EngError::MemoryPlan("EXL3 raw upload byte count overflow".into()))?;
@@ -181,7 +174,6 @@ impl<'a> PackReader<'a> {
         self.raw_bytes(name, &effective_norm_bytes(&tensor, values)?)
     }
 
-    /// Uploads the plain tensor `source` of `shape` as the F32 vector `name`, after `transform`.
     pub(super) fn vector(
         &self,
         name: String,
@@ -195,7 +187,6 @@ impl<'a> PackReader<'a> {
         self.raw_bytes(name, &f32_le_bytes(&values))
     }
 
-    /// Uploads the tensor `source` unchanged as `name`, kept in its stored half-width form.
     pub(super) fn table(
         &self,
         name: String,
@@ -348,7 +339,6 @@ impl DeltaOrders {
     }
 }
 
-/// One DeltaNet layer of the pack and the move of its value heads.
 struct DeltaSource<'a, 'r> {
     reader: &'r PackReader<'a>,
     layer: usize,
@@ -374,7 +364,6 @@ impl<'a, 'r> DeltaSource<'a, 'r> {
         layer_name(self.layer, suffix)
     }
 
-    /// The dense projection `spec` with its groups moved along the value-head axis.
     fn matrix(&self, name: String, spec: &DenseSpec) -> Result<CudaWeight, EngError> {
         let (suffix, reorder) = match spec.role {
             Role::AttnQkv => ("linear_attn.in_proj_qkv", (Axis::Output, &self.orders.qkv)),
@@ -404,7 +393,6 @@ impl<'a, 'r> DeltaSource<'a, 'r> {
         self.reader.vector(name, &self.name(suffix), &shape, rows)
     }
 
-    /// One raw vector: a norm, the conv taps, the decay, the step bias or the gated norm weight.
     fn raw(&self, name: String, spec: &RawSpec) -> Result<CudaWeight, EngError> {
         let (reader, heads, d) = (self.reader, &self.orders.heads, self.geometry);
         let count = [spec.values as u32];
@@ -450,7 +438,6 @@ fn unsupported(what: &str, role: Role) -> EngError {
     ))
 }
 
-/// Refuse a pack config whose DeltaNet fields or layer kind differ from the mixer geometry.
 fn check_delta_source(bytes: &[u8], layer: usize, g: &MixerGeometry) -> Result<(), EngError> {
     if bytes.len() as u64 > crate::weights::exl3::CONFIG_LIMIT {
         return Err(EngError::MemoryPlan(

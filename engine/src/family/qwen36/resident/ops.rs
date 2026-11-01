@@ -19,7 +19,6 @@ pub(super) fn short_import() -> EngError {
     }
 }
 
-/// Converts a host dimension to a resident shape dimension.
 pub(super) fn dim(n: usize) -> Result<u32, EngError> {
     u32::try_from(n).map_err(|_| EngError::BadRequest("resident dimension exceeds u32".into()))
 }
@@ -33,7 +32,6 @@ pub(super) fn f32_tensor(shape: Vec<u32>, values: &[f32]) -> Result<Tensor, EngE
     )
 }
 
-/// Builds a U32 host tensor.
 pub(super) fn u32_tensor(shape: Vec<u32>, values: &[u32]) -> Result<Tensor, EngError> {
     Tensor::try_from_host(
         Dtype::U32,
@@ -42,7 +40,6 @@ pub(super) fn u32_tensor(shape: Vec<u32>, values: &[u32]) -> Result<Tensor, EngE
     )
 }
 
-/// Builds an F32 host tensor of zeros.
 pub(super) fn zeros(shape: Vec<u32>) -> Result<Tensor, EngError> {
     let bytes = shape
         .iter()
@@ -77,7 +74,6 @@ pub(in crate::family::qwen36) fn values(
 pub(super) struct Bytes(u64);
 
 impl Bytes {
-    /// Adds `bytes`.
     pub(super) fn add(&mut self, bytes: u64) -> Result<(), EngError> {
         self.0 = self
             .0
@@ -85,11 +81,9 @@ impl Bytes {
             .ok_or_else(|| EngError::MemoryPlan("resident byte count overflows u64".into()))?;
         Ok(())
     }
-    /// Adds one resident tensor.
     pub(super) fn tensor(&mut self, tensor: &ExecutionTensor) -> Result<(), EngError> {
         self.add(tensor.byte_len())
     }
-    /// Adds the payload, scales, and biases of a packed weight.
     pub(super) fn packed(&mut self, weight: &ResidentPackedWeight) -> Result<(), EngError> {
         self.tensor(weight.payload())?;
         self.tensor(weight.scales())?;
@@ -98,7 +92,6 @@ impl Bytes {
         }
         Ok(())
     }
-    /// The total in bytes.
     pub(super) fn total(&self) -> u64 {
         self.0
     }
@@ -136,7 +129,6 @@ impl Consts {
             act: Dtype::F32,
         })
     }
-    /// Adds the constants' bytes to `total`.
     pub(super) fn bytes(&self, total: &mut Bytes) -> Result<(), EngError> {
         for tensor in [&self.zero, &self.qk_eps, &self.sqrt_kd] {
             total.tensor(tensor)?;
@@ -145,7 +137,6 @@ impl Consts {
     }
 }
 
-/// The adapter and the constants that every resident block uses.
 pub(in crate::family::qwen36) struct Ctx<'k> {
     /// `kernels` is read by the sibling trace module's Mac-gated readback (the only field it
     /// borrows), so it carries the module-group scope; `consts` and `compile` stay resident-only.
@@ -172,7 +163,6 @@ pub(in crate::family::qwen36) fn cast_to(
     ctx.kernels.cast(x, dtype)
 }
 
-/// Converts `x` to the activation dtype of the step (`Consts::act`).
 pub(super) fn to_act(ctx: &mut Ctx<'_>, x: &ExecutionTensor) -> Result<ExecutionTensor, EngError> {
     let act = ctx.consts.act;
     cast_to(ctx, x, act)
@@ -229,7 +219,6 @@ pub(super) fn linear_rows(
     ctx.kernels.qmm(x, weight)
 }
 
-/// Asserts element-wise closeness within `tol` (test helper).
 #[cfg(test)]
 pub(super) fn assert_close(actual: &[f32], expected: &[f32], tol: f32, what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length");
@@ -241,7 +230,6 @@ pub(super) fn assert_close(actual: &[f32], expected: &[f32], tol: f32, what: &st
     }
 }
 
-/// Asserts cosine at least 0.99999 and max error over max magnitude at most 1e-4 (test helper).
 /// This is the metric of the Flash-Next resident tests and of the Q36 per-layer parity gate.
 #[cfg(test)]
 pub(super) fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {

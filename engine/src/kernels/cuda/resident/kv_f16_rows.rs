@@ -35,12 +35,6 @@ pub(crate) struct KvF16RowsCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the KV f16 acceptance guard of call on stream, writing call.out
-    /// when present.
-    ///
-    /// Returns BadRequest for a stream or buffer of another adapter, geometry
-    /// outside the documented ranges, a short or misaligned range, or ranges
-    /// that overlap.
     pub(crate) fn kv_f16_rows(
         &self,
         stream: &DeviceStream,

@@ -17,15 +17,10 @@ pub const ROUTE_INVALID: i32 = 4;
 /// classifying the shorter list, as `TieredHost::begin_layer` refuses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LengthMismatch {
-    /// Picks in the id list.
     pub ids: usize,
-    /// Picks in the weight list.
     pub weights: usize,
 }
 
-/// The tiered word after layer `layer` ran: layer 0 starts the token (it clears the word first),
-/// later layers OR their bits in. `layer_word` is the [`Classified::word`] of that layer. The
-/// device test composes the per-layer words with this function.
 pub fn word_after(layer: usize, previous: i32, layer_word: i32) -> i32 {
     if layer == 0 {
         layer_word
@@ -34,7 +29,6 @@ pub fn word_after(layer: usize, previous: i32, layer_word: i32) -> i32 {
     }
 }
 
-/// What the classification of one layer produces.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Classified {
     /// The bank slot of each pick for the expert launches: a resident pick maps to its slot, a
@@ -137,7 +131,6 @@ mod tests {
 
     const ROW: [i32; 6] = [2, -1, 0, -1, 1, -1];
 
-    /// One refused route: the slot row it runs against, its picks, and which pick is refused.
     struct Refusal {
         what: &'static str,
         row: [i32; 6],

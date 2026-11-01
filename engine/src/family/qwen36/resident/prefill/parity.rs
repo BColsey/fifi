@@ -69,7 +69,6 @@ use crate::{
     kernels::MlxKernels,
 };
 
-/// Layer, hidden, and vocabulary sizes of the real model.
 const LAYERS: usize = 40;
 const HIDDEN: usize = 2048;
 const VOCAB: usize = 248_320;
@@ -96,7 +95,6 @@ fn max_rel(got: &[f32], want: &[f32]) -> f64 {
     if top > 0.0 { diff / top } else { f64::INFINITY }
 }
 
-/// The frozen evidence and the opened checkpoint.
 struct Evidence {
     ids: Vec<u32>,
     greedy: Vec<u32>,

@@ -15,7 +15,6 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Where the lines go: standard error in a server, a buffer in a test.
 pub(crate) type Sink = Arc<Mutex<dyn Write + Send>>;
 
 /// The sink of a new server state: standard error. The unit tests of this crate get a sink that
@@ -29,8 +28,6 @@ pub(crate) fn default_sink() -> Sink {
     }
 }
 
-/// The clock that stamps the moments of a request: a function that reads the current moment. A
-/// server request holds the wall clock; a test request holds a clock with fixed steps.
 pub(crate) type Clock = Box<dyn FnMut() -> Instant + Send>;
 
 /// The clock of a new request: the wall clock in a server, and in a test build a clock with fixed
@@ -43,8 +40,6 @@ pub(crate) fn default_clock() -> Clock {
     }
 }
 
-/// A clock with fixed steps for a test: read `n` gives `start + n * step`, so the span between two
-/// reads is exact and no real time passes.
 fn stepped_clock(step: Duration) -> Clock {
     let start = Instant::now();
     let mut reads = 0_u32;
@@ -55,14 +50,10 @@ fn stepped_clock(step: Duration) -> Clock {
     })
 }
 
-/// How a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
-    /// The job finished and the client got the reply.
     Ok,
-    /// The request failed. `error_code` names the failure.
     Error,
-    /// The client left, or the engine cancelled the job, before the reply was complete.
     Cancelled,
 }
 
@@ -76,7 +67,6 @@ impl Outcome {
     }
 }
 
-/// The facts of one finished request. `render` turns them into the log line.
 struct Entry<'a> {
     method: Option<&'a str>,
     endpoint: Option<&'a str>,
@@ -92,12 +82,11 @@ struct Entry<'a> {
     prompt_tokens: u32,
     completion_tokens: u32,
     reused_tokens: u32,
-    /// The time from admission to the first batch with a token.
     first_token: Option<Duration>,
     /// The tokens after the first batch and the time from the first to the last batch.
     decode: Option<(u32, Duration)>,
     /// The prefix report of the job. It is `None` until the pump reads the `Finished` event of the
-    /// request's own job, and `None` keeps the six `prefix_*` keys out of the line — a cancelled,
+    /// request's own job, and `None` keeps the `prefix_*` keys out of the line — a cancelled,
     /// failed, refused, or stop-string request logs no prefix keys, and neither does an executor
     /// without a prefix report.
     prefix: Option<PrefixReport>,
@@ -108,7 +97,6 @@ fn millis(time: Duration) -> f64 {
     (time.as_secs_f64() * 10_000.0).round() / 10.0
 }
 
-/// Tokens per second with two decimals. A rate needs at least one token and a span above zero.
 fn rate(tokens: u32, span: Duration) -> Option<f64> {
     if tokens == 0 || span.is_zero() {
         return None;
@@ -117,8 +105,7 @@ fn rate(tokens: u32, span: Duration) -> Option<f64> {
 }
 
 /// The log line without the final newline. `queue_wait_ms` is always `null`: the engine thread
-/// reports no start event, so the server cannot split the queue wait from the prefill. The four
-/// `prefix_*` keys appear only on a line whose request carried a prefix boundary.
+/// reports no start event, so the server cannot split the queue wait from the prefill.
 fn render(entry: &Entry<'_>) -> String {
     let mut line = json!({
         "request_id": entry.request_id,
@@ -232,7 +219,6 @@ fn render(entry: &Entry<'_>) -> String {
     line.to_string()
 }
 
-/// Follows one request from its prompt to its end and writes its line once.
 /// Fixed non-secret digest key. The prompt digests must stay stable across
 /// restarts so logs of different sessions compare, but they are obfuscation,
 /// not secrecy: anyone with the source can reproduce them from known text.
@@ -263,7 +249,6 @@ const RING_KEYS: [&str; 14] = [
     "decode_tokens_per_second",
 ];
 
-/// How many rows the ring keeps.
 pub(crate) const RING_CAP: usize = 64;
 
 /// The monitor's recent-request ring, owned by `AppState` like the log
@@ -305,7 +290,6 @@ impl RecentRing {
         ring.push_back(Value::Object(row));
     }
 
-    /// The rows, newest first, for the monitor route.
     pub(crate) fn rows_newest_first(&self) -> Vec<Value> {
         let ring = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         ring.iter().rev().cloned().collect()
@@ -325,7 +309,6 @@ fn digest(ids: &[u32]) -> String {
     finalize(state)
 }
 
-/// The finalizer of the rolling digest state.
 fn finalize(state: u64) -> String {
     let mut z = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -384,7 +367,6 @@ impl PromptDigest {
 
 pub(crate) struct RequestLog {
     sink: Sink,
-    /// Stamps the moments of the request.
     clock: Clock,
     model: String,
     stream: bool,
@@ -392,16 +374,12 @@ pub(crate) struct RequestLog {
     prompt_tokens: u32,
     /// Set when the queue admits the job. A stream sends its headers at that moment.
     admitted: Option<Instant>,
-    /// The arrival of the first batch with tokens, and its token count.
     first_batch: Option<(Instant, u32)>,
     last_batch: Option<Instant>,
     completion_tokens: u32,
     written: bool,
-    /// True after the handler marked a prefix boundary on this request: the line then carries
-    /// the four `prefix_*` keys when the job's report arrived.
+    /// True after the handler marked a prefix boundary on this request.
     prefix_boundary: bool,
-    /// The prefix report of the job, set only when the pump read the request's `Finished`
-    /// event. It stays `None` on a cancelled, failed, refused, or stop-string request.
     prefix: Option<PrefixReport>,
     /// The HTTP method and path that produced this request, and the prompt
     /// digests of the rendered prompt. Set by the handlers before any line
@@ -415,8 +393,6 @@ pub(crate) struct RequestLog {
 }
 
 impl RequestLog {
-    /// Starts the log of a request whose prompt has `prompt_tokens` tokens. `clock` stamps the
-    /// moments of the request: `default_clock` in a server, a fixed-step clock in a test.
     pub(crate) fn new(
         sink: Sink,
         clock: Clock,
@@ -447,29 +423,22 @@ impl RequestLog {
         }
     }
 
-    /// Wires the monitor's ring: this request's line then feeds it.
     pub(crate) fn set_ring(&mut self, ring: RecentRing) {
         self.ring = Some(ring);
     }
 
-    /// Records the prompt digests of the rendered prompt. `lcp_prev_request`
-    /// is the longest common token prefix with the previous request of the
-    /// same model, as measured by the server's own memory.
     pub(crate) fn set_prompt_digests(&mut self, ids: &[u32], lcp_prev_request: u32) {
         self.digests = Some(PromptDigest::of(ids, lcp_prev_request));
     }
 
-    /// Records the completion id of the reply.
     pub(crate) fn set_id(&mut self, id: &str) {
         self.request_id = Some(id.to_string());
     }
 
-    /// Records that the queue admitted the job.
     pub(crate) fn admit(&mut self) {
         self.admitted = Some((self.clock)());
     }
 
-    /// Records the arrival of a batch. A batch without tokens counts for nothing.
     pub(crate) fn batch(&mut self, tokens: u32) {
         if tokens == 0 {
             return;
@@ -480,17 +449,15 @@ impl RequestLog {
         self.completion_tokens = self.completion_tokens.saturating_add(tokens);
     }
 
-    /// Marks the request as one with a prefix boundary: its line then carries the four
+    /// Marks the request as one with a prefix boundary: its line then carries the
     /// `prefix_*` keys with the prefix report of its job, when the job's `Finished` event is
     /// read. A request without a boundary keeps the old line byte for byte.
     pub(crate) fn set_prefix_boundary(&mut self) {
         self.prefix_boundary = true;
     }
 
-    /// Writes the line of a reply that ended with `finish` and carried the prefix report
-    /// `prefix`, which the pump read from the job's `Finished` event. The report lands in the
-    /// line's `prefix_*` keys only when the request had a boundary and the report arrived;
-    /// `None` omits the keys.
+    /// The report lands in the line's `prefix_*` keys only when the request had a boundary and
+    /// the report arrived; `None` omits the keys.
     pub(crate) fn done(
         &mut self,
         finish: FinishReason,
@@ -514,8 +481,6 @@ impl RequestLog {
         self.write(Some(200), Outcome::Ok, None, None, 0);
     }
 
-    /// Writes the line of a request that failed. After the headers of a stream, the client got
-    /// status 200 and an error event. In every other case it got the status of the error.
     pub(crate) fn fail(&mut self, error: &ServerError) {
         let status = if self.headers_sent() {
             200
@@ -589,7 +554,6 @@ impl RequestLog {
 }
 
 impl Drop for RequestLog {
-    /// A request that ends with no line to its name was abandoned.
     fn drop(&mut self) {
         let status = self.headers_sent().then_some(200);
         self.write(status, Outcome::Cancelled, None, None, 0);
@@ -721,8 +685,8 @@ mod tests {
         "time_to_first_token_ms",
     ];
 
-    /// The keys of a line whose request carried a prefix boundary: the thirteen keys above plus
-    /// the four prefix keys, sorted.
+    /// The keys of a line whose request carried a prefix boundary: the keys above plus
+    /// the `prefix_*` keys, sorted.
     const PREFIX_KEYS: [&str; 31] = [
         "completion_tokens",
         "decode_tokens_per_second",
@@ -773,7 +737,6 @@ mod tests {
     }
 
     impl Capture {
-        /// The text of each write.
         fn writes(&self) -> Vec<String> {
             let writes = self.0.lock().expect("capture lock");
             writes
@@ -783,7 +746,7 @@ mod tests {
         }
 
         /// The lines as JSON. Each write must be one complete line whose keys are exactly the
-        /// thirteen keys of a request without a prefix boundary, so a stray prefix key fails
+        /// keys of a request without a prefix boundary, so a stray prefix key fails
         /// here. A caller whose requests carried a boundary and finished calls
         /// `lines_with_prefix` instead.
         fn lines(&self) -> Vec<Value> {
@@ -791,7 +754,7 @@ mod tests {
         }
 
         /// The lines as JSON of requests that carried a prefix boundary and finished: each
-        /// write must be one complete line whose keys are exactly the seventeen keys of a
+        /// write must be one complete line whose keys are exactly the keys of a
         /// boundary request.
         fn lines_with_prefix(&self) -> Vec<Value> {
             self.lines_with_keys(&PREFIX_KEYS)
@@ -818,7 +781,6 @@ mod tests {
             line
         }
 
-        /// The lines as JSON, each with exactly the `expected` key set, sorted.
         fn lines_with_keys(&self, expected: &[&str]) -> Vec<Value> {
             self.writes()
                 .iter()
@@ -840,7 +802,6 @@ mod tests {
         }
     }
 
-    /// A router over one engine named `e1` that serves `model-a`, and the capture of its request log.
     fn app(engine: &Engine, context_limit: u32) -> (Router, Capture) {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let capture = Capture::default();
@@ -874,7 +835,6 @@ mod tests {
         let (status, _headers, _bytes) =
             testkit::send(&app, testkit::post_json("/v1/messages", &body)).await;
         assert_eq!(status, StatusCode::OK);
-        // The route is bearer-authed like every /v1 route.
         let (status, _headers, _bytes) =
             testkit::send(&app, testkit::get("/v1/recent-requests", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -885,9 +845,6 @@ mod tests {
         let rows = reply["requests"].as_array().expect("requests array");
         assert_eq!(rows.len(), 1, "this server's ring holds exactly its row");
         let row = &rows[0];
-        // The exact allowlist is the contract — the digest,
-        // prefix_*, and shadow_* keys never reach the panel, and a key a
-        // future render() adds cannot leak automatically.
         let mut keys: Vec<&str> = row
             .as_object()
             .expect("object")
@@ -904,7 +861,6 @@ mod tests {
         assert_eq!(row["model"], model);
         assert_eq!(row["endpoint"], "/v1/messages");
         assert_eq!(row["outcome"], "ok");
-        // The route's answer and the state's ring agree (newest first).
         assert_eq!(&ring.rows_newest_first()[0], row);
     }
 
@@ -957,7 +913,6 @@ mod tests {
 
     #[test]
     fn the_ring_keeps_only_the_last_ring_cap_rows() {
-        // This ring is the test's own; nothing else can push to it.
         let ring = RecentRing::new();
         for i in 0..70u32 {
             ring.push(
@@ -1010,7 +965,6 @@ mod tests {
             line["prompt_hash_full"].is_string(),
             "the count carries the prompt digests too: a count_tokens prompt is exactly the next generation prompt"
         );
-        // The same count again: the second row's LCP is the whole prompt.
         let (_status, _headers, _bytes) =
             testkit::send(&app, testkit::post_json("/v1/messages/count_tokens", &body)).await;
         let lines = capture.lines_with_keys(&ROUTE_KEYS);
@@ -1234,8 +1188,6 @@ mod tests {
         assert_eq!(millis(Duration::from_micros(1999)), 2.0);
     }
 
-    /// The line of a request whose `batches` batches of one token arrive `step` apart on an
-    /// injected fixed-step clock: 21 prompt tokens, and a reply that ends with `Length`.
     fn stamped_line(step: Duration, batches: u32) -> Value {
         let capture = Capture::default();
         let mut log = RequestLog::new(
@@ -1258,7 +1210,6 @@ mod tests {
         lines.remove(0)
     }
 
-    /// The helper of the timing tests writes one line with the counts of its batches.
     #[test]
     fn a_stamped_line_holds_the_counts_of_its_batches() {
         let line = stamped_line(Duration::from_millis(2), 3);
@@ -1278,8 +1229,8 @@ mod tests {
         assert_eq!(flat["decode_tokens_per_second"], Value::Null, "{flat}");
     }
 
-    /// A line whose request carried a prefix boundary carries the four prefix keys with the
-    /// report of its job. The keys land after the thirteen old keys.
+    /// A line whose request carried a prefix boundary carries the prefix keys with the
+    /// report of its job.
     ///
     /// Mutation check (the keys-without-a-boundary patch): rendering the prefix keys
     /// unconditionally makes the byte-for-byte test of a boundary-free request fail.
@@ -1490,8 +1441,6 @@ mod tests {
         );
     }
 
-    /// A router over one engine at the prefix limits of two roots and six entries whose entry
-    /// has `prefix_reuse` on, and the capture of its request log.
     fn prefix_app(engine: &Engine) -> (Router, Capture) {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let capture = Capture::default();
@@ -1550,8 +1499,8 @@ mod tests {
             "two entries at 1,000 charged bytes each, {line}"
         );
         assert_eq!(line["prefix_uncached_shared"], 0, "{line}");
-        // The rendered line itself, not only its parsed keys: the thirteen old keys in
-        // their render order, then the four prefix keys in theirs, in one write.
+        // The rendered line itself, not only its parsed keys: the old keys in
+        // their render order, then the prefix keys in theirs, in one write.
         let want = json!({
             "request_id": reply["id"],
             "model": "model-a",
@@ -1625,7 +1574,7 @@ mod tests {
     /// stream that the client drops is cancelled, so the pump reads no report even though the
     /// request had a boundary and the engine had a store.
     ///
-    /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
+    /// Mutation check: emitting the prefix keys whenever the boundary flag is set (with a
     /// zeroed report) fails the keys row.
     #[tokio::test]
     async fn a_cancelled_request_with_a_boundary_logs_no_prefix_keys() {
@@ -1665,7 +1614,7 @@ mod tests {
     /// A request that the server refused before admission never ran a job, so it carries no
     /// prefix keys either, although its engine entry turns `prefix_reuse` on.
     ///
-    /// Mutation check: emitting the four keys whenever the boundary flag is set (with a
+    /// Mutation check: emitting the prefix keys whenever the boundary flag is set (with a
     /// zeroed report) fails the keys row.
     #[tokio::test]
     async fn a_refused_request_with_a_boundary_engine_logs_no_prefix_keys() {
@@ -1896,9 +1845,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_over_length_refusal_logs_prompt_too_long_not_the_wire_code() {
-        // The log keeps its own vocabulary: the wire says
-        // context_length_exceeded, the log line says prompt_too_long, so the
-        // two stay distinguishable in daily.log.
         let engine = testkit::refusing_engine(EngError::PromptTooLong {
             prompt_tokens: 118_930,
             limit_tokens: 110_000,

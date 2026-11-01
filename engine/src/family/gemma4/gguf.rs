@@ -32,7 +32,6 @@ const GGUF_I32: u32 = 5;
 const GGUF_BOOL: u32 = 7;
 const SUPPRESSED_TOKENS: [i32; 2] = [258_883, 258_882];
 
-/// Scalar integer metadata that must hold exactly the listed value.
 const INT_SCALARS: [(&str, u64); 16] = [
     ("gemma4.block_count", LAYERS as u64),
     ("gemma4.context_length", 262_144),
@@ -52,7 +51,6 @@ const INT_SCALARS: [(&str, u64); 16] = [
     ("tokenizer.ggml.unknown_token_id", 3),
 ];
 
-/// Scalar float metadata that must hold exactly the listed value.
 const FLOAT_SCALARS: [(&str, f64); 4] = [
     ("gemma4.rope.freq_base", 1_000_000.0),
     ("gemma4.rope.freq_base_swa", 10_000.0),
@@ -177,7 +175,6 @@ fn expected_inventory(kv: &[i32]) -> Vec<Expected> {
     expected
 }
 
-/// Checks the exact tensor set, then every tensor type and dimensions.
 fn check_inventory(header: &crate::weights::GgufHeader, kv: &[i32]) -> Result<(), EngError> {
     let mut expected = expected_inventory(kv);
     debug_assert_eq!(expected.len(), 667);
@@ -250,7 +247,6 @@ fn check_architecture(header: &crate::weights::GgufHeader) -> Result<(), EngErro
     }
 }
 
-/// Checks every integer scalar; only exact matches pass.
 fn check_int_scalars(header: &crate::weights::GgufHeader) -> Result<(), EngError> {
     for (key, want) in INT_SCALARS {
         let found = match header.meta(key) {
@@ -305,7 +301,6 @@ fn check_bool_scalar(
     }
 }
 
-/// Reads one i32 metadata array with a checked element type and length.
 fn read_i32_array(
     weights: &GgufWeights,
     header: &crate::weights::GgufHeader,
@@ -322,7 +317,6 @@ fn read_i32_array(
         .collect())
 }
 
-/// Reads one bool metadata array with a checked element type and length.
 fn read_bool_array(
     weights: &GgufWeights,
     header: &crate::weights::GgufHeader,
@@ -334,7 +328,6 @@ fn read_bool_array(
         .map(|bytes| bytes.iter().map(|byte| u8::from(*byte != 0)).collect())
 }
 
-/// Reads the element bytes of one metadata array through the checked seam.
 fn read_array_bytes(
     weights: &GgufWeights,
     header: &crate::weights::GgufHeader,

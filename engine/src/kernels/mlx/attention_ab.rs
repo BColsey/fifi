@@ -132,8 +132,6 @@ const TIMED_ROUNDS: usize = 10;
 const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 /// The agreement bound, derived in the module doc: 1e-5 relative to `max(1, |composite|)`.
 const TOLERANCE: f32 = 1e-5;
-/// The fixture seeds, one per role, mixed with the case length so each case holds its own
-/// arrays.
 const SEED_QUERIES: u64 = 0xa1;
 const SEED_KEYS: u64 = 0xa2;
 const SEED_VALUES: u64 = 0xa3;
@@ -173,7 +171,6 @@ fn create_out_dir(out: &str) -> PathBuf {
     Path::new(out).to_path_buf()
 }
 
-/// The sha256 of `bytes` as a hex string.
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -188,12 +185,10 @@ fn hash_f32(values: &[f32]) -> String {
     sha256_hex(&bytes)
 }
 
-/// The sha256 of the raw host bytes of a readback tensor: the exact bytes the device holds.
 fn sha256_of(tensor: &Tensor) -> String {
     sha256_hex(tensor.host_bytes().unwrap())
 }
 
-/// The F32 values of a host tensor, little-endian.
 fn values_of(tensor: &Tensor) -> Vec<f32> {
     tensor
         .host_bytes()
@@ -205,7 +200,6 @@ fn values_of(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-/// Imports one F32 host tensor of `shape` filled with `values`.
 fn import_f32(kernels: &mut MlxKernels, shape: Vec<u32>, values: &[f32]) -> ExecutionTensor {
     let bytes: Vec<u8> = values
         .iter()
@@ -215,20 +209,16 @@ fn import_f32(kernels: &mut MlxKernels, shape: Vec<u32>, values: &[f32]) -> Exec
     kernels.import_tensor(&host).unwrap()
 }
 
-/// One value in milliseconds rounded to three decimals, for the printed line and the report.
 fn millis3(ms: f64) -> f64 {
     (ms * 1000.0).round() / 1000.0
 }
 
-/// One quantized side of the cache: the three residents `quantize_rows` returns.
 struct QuantizedSide {
     codes: ExecutionTensor,
     scales: ExecutionTensor,
     biases: ExecutionTensor,
 }
 
-/// Everything one case holds: its shape, the queries, the two quantized sides the composite
-/// reads, and the packed copy of the key side - the bit-identity oracle of the direct entry.
 struct Case {
     len: u32,
     rows: u32,
@@ -265,7 +255,6 @@ fn quantized_side(kernels: &mut MlxKernels, source: &[f32], cap: u32) -> Quantiz
     }
 }
 
-/// Reads one quantized side back to host tensors, for the fixture hashes and the packed copy.
 fn read_side(kernels: &mut MlxKernels, side: &QuantizedSide) -> (Tensor, Tensor, Tensor) {
     (
         kernels.readback(&side.codes).unwrap(),
@@ -302,8 +291,7 @@ fn pack_side(
 }
 
 /// Dequantizes one quantized side of a case directly from its three residents through the
-/// test-only adapter entry - the call this A/B exists to time. The logical shape is the side's
-/// capacity form `[1, KVH, cap, D]`, the shape `grouped_attention_prefix` takes.
+/// test-only adapter entry - the call this A/B exists to time.
 fn dequant_side(
     kernels: &mut MlxKernels,
     side: &QuantizedKv<'_>,
@@ -313,10 +301,8 @@ fn dequant_side(
     kernels.dequantize_kv_for_test(side, &logical, GROUP, BITS)
 }
 
-/// Builds one case end to end: the hashed host fixtures, the imported queries, the two
-/// quantized sides through the real `quantize_rows`, the six residents evaluated so no measured
-/// round materialises setup work (the lesson of the view-cost run, native_kv8_ops.rs:786-792),
-/// their hashed readbacks, and the packed copy of the key side for the bit-identity oracle.
+/// Builds one case end to end; the six residents are evaluated here so no measured round
+/// materialises setup work (the lesson of the view-cost run, native_kv8_ops.rs:786-792).
 fn build_case(kernels: &mut MlxKernels, len: u32, rows: u32, cap: u32) -> Case {
     let query_count = HEADS as usize * rows as usize * WIDTH as usize;
     let side_count = KV_HEADS as usize * cap as usize * WIDTH as usize;
@@ -360,9 +346,8 @@ fn build_case(kernels: &mut MlxKernels, len: u32, rows: u32, cap: u32) -> Case {
     }
 }
 
-/// Runs `build` for the warm-up rounds and the timed rounds, every round closed by one
-/// `evaluate` of its output so the timed wall covers the GPU completion, and returns the mean
-/// wall milliseconds of one timed round with the last output for the agreement check.
+/// Runs `build` for the warm-up and timed rounds; every round closes with one `evaluate` of
+/// its output so the timed wall covers the GPU completion.
 fn mean_ms(
     kernels: &mut MlxKernels,
     mut build: impl FnMut(&mut MlxKernels) -> ExecutionTensor,
@@ -382,9 +367,8 @@ fn mean_ms(
     (per_round * 1e3, last)
 }
 
-/// Reads both outputs back, asserts the agreement bound, and returns the maximum absolute
-/// difference of the two paths. Both outputs must be F32 of the query shape first: the bound is
-/// an F32 argument, so a dtype drift must fail before the compare, not inside it.
+/// Both outputs must be F32 of the query shape before the compare: the bound is an F32
+/// argument, so a dtype drift must fail before the compare, not inside it.
 fn assert_agreement(
     kernels: &mut MlxKernels,
     case: &Case,
@@ -418,8 +402,7 @@ fn assert_agreement(
     max_abs_diff
 }
 
-/// The maximum absolute difference of two F32 host tensors of equal byte length, read as
-/// little-endian 4-byte lanes without materialising value vectors.
+/// The maximum absolute difference of two F32 host tensors of equal byte length.
 fn max_abs_diff_between(direct: &Tensor, packed: &Tensor) -> f32 {
     let direct_lanes = direct.host_bytes().unwrap().as_chunks::<4>().0;
     let packed_lanes = packed.host_bytes().unwrap().as_chunks::<4>().0;
@@ -433,10 +416,9 @@ fn max_abs_diff_between(direct: &Tensor, packed: &Tensor) -> f32 {
     max_abs_diff
 }
 
-/// Asserts the direct KV entry and the packed `dequantize` agree bit for bit on the key side of
-/// one case, and returns the maximum absolute difference of the two F32 outputs, 0.0 by the
-/// assertion. Both entries pin their own output shape and dtype, so the byte compare needs no
-/// shape preamble; the packed copy exists for this check alone.
+/// Asserts the direct KV entry and the packed `dequantize` agree bit for bit on the key side
+/// of one case; both entries pin their own output shape and dtype, so the byte compare needs
+/// no shape preamble.
 fn assert_packed_equality(kernels: &mut MlxKernels, case: &Case, keys: &QuantizedKv<'_>) -> f32 {
     let direct = dequant_side(kernels, keys, case.cap).unwrap();
     let packed = kernels.dequantize(&case.k_packed).unwrap();
@@ -451,7 +433,6 @@ fn assert_packed_equality(kernels: &mut MlxKernels, case: &Case, keys: &Quantize
     max_abs_diff_between(&direct_host, &packed_host)
 }
 
-/// Writes the JSON report of the run into `out_dir`.
 fn write_report(out_dir: &Path, cases: &[serde_json::Value], scale: f32) {
     let report = serde_json::json!({
         "test": "kernels::mlx::attention_ab::composite_versus_dequantized_attention",

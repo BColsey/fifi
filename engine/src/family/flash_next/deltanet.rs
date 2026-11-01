@@ -4,7 +4,6 @@ use super::math::{expect_len, sigmoid, silu, softplus};
 use crate::EngError;
 use crate::family::project::Projector;
 
-/// Checked DeltaNet dimensions.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeltaShape {
     key_heads: usize,
@@ -20,7 +19,6 @@ pub(crate) struct DeltaShape {
 }
 
 impl DeltaShape {
-    /// Checks the head counts, widths, kernel, hidden width, and epsilon.
     pub(crate) fn new(
         key_heads: u32,
         key_dim: u32,
@@ -69,23 +67,18 @@ impl DeltaShape {
         })
     }
 
-    /// Key heads.
     pub(crate) fn key_heads(&self) -> usize {
         self.key_heads
     }
-    /// Width of one key head.
     pub(crate) fn key_dim(&self) -> usize {
         self.key_dim
     }
-    /// Value heads.
     pub(crate) fn value_heads(&self) -> usize {
         self.value_heads
     }
-    /// Width of one value head.
     pub(crate) fn value_dim(&self) -> usize {
         self.value_dim
     }
-    /// Convolution kernel length.
     pub(crate) fn conv_kernel(&self) -> usize {
         self.conv_kernel
     }
@@ -93,13 +86,11 @@ impl DeltaShape {
     pub(crate) fn conv_dim(&self) -> usize {
         self.conv_dim
     }
-    /// RMS normalization epsilon.
     pub(crate) fn eps(&self) -> f32 {
         self.eps
     }
 }
 
-/// Returns `(conv_dim, state_len, ring_len)`, or `None` when a size overflows `usize`.
 fn checked_sizes(
     kh: usize,
     kd: usize,
@@ -114,9 +105,8 @@ fn checked_sizes(
     Some((conv_dim, state_len, ring_len))
 }
 
-/// Weights of one DeltaNet layer.
 pub(crate) struct DeltaWeights<'a, W> {
-    /// Fused query, key, and value projection `[conv_dim, hidden]`.
+    /// `[conv_dim, hidden]`.
     pub(crate) qkv: &'a W,
     /// Output gate projection `[value_heads * value_dim, hidden]`.
     pub(crate) z: &'a W,
@@ -128,15 +118,12 @@ pub(crate) struct DeltaWeights<'a, W> {
     pub(crate) out: &'a W,
     /// Convolution weights, length `conv_dim * conv_kernel`, row `c` at `c * conv_kernel`.
     pub(crate) conv: &'a [f32],
-    /// `A_log`, length `value_heads`.
     pub(crate) a_log: &'a [f32],
-    /// `dt_bias`, length `value_heads`.
     pub(crate) dt_bias: &'a [f32],
-    /// Output norm weight, length `value_dim`, shared by all value heads.
+    /// Output norm weight, shared by all value heads.
     pub(crate) norm: &'a [f32],
 }
 
-/// Recurrent state and convolution ring of one DeltaNet layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeltaState {
     rec: Vec<f32>,
@@ -144,7 +131,6 @@ pub(crate) struct DeltaState {
 }
 
 impl DeltaState {
-    /// Returns a zero state sized for `shape`.
     pub(crate) fn new(shape: &DeltaShape) -> Self {
         Self {
             rec: vec![0.0; shape.state_len],
@@ -152,7 +138,6 @@ impl DeltaState {
         }
     }
 
-    /// Host bytes held by the state.
     pub(crate) fn byte_len(&self) -> usize {
         (self.rec.len() + self.ring.len()) * 4
     }
@@ -171,7 +156,6 @@ impl DeltaState {
     }
 }
 
-/// Runs one decode step and returns the layer output of length `hidden`.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,
     shape: &DeltaShape,

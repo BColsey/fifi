@@ -62,14 +62,12 @@ fn vendored(s: &AttnPrepChunkShape) -> AttnPrepShape {
                     n_rot: s.n_rot, has_gate: true, slot: SlotMode::Position, rows: s.rows, ld: s.ld }
 }
 
-/// Which KV outputs a call uses.
 #[derive(Clone, Copy, PartialEq)]
 enum Out {
     Fp16,
     Rows,
 }
 
-/// Host inputs of one call.
 struct Data {
     proj: Vec<f32>,
     q_norm: Vec<f32>,
@@ -92,7 +90,6 @@ fn data(shape: &AttnPrepChunkShape, seed: u64, scale: f64) -> Data {
 
 /// One range of a call: buffer index, byte offset, bytes.
 type Slot = (usize, usize, usize);
-/// Slot order: proj, q_norm, k_norm, q, k_cache, v_cache, k_rows, v_rows, status.
 const NAMES: [&str; 9] = [
     "proj", "q_norm", "k_norm", "q", "k_cache", "v_cache", "k_rows", "v_rows", "status",
 ];
@@ -105,8 +102,6 @@ const VC: usize = 5;
 const KR: usize = 6;
 const VR: usize = 7;
 const STATUS: usize = 8;
-/// Buffer indexes: 0 proj, 1 q_norm, 2 k_norm, 3 q, 4 k cache, 5 v cache, 6 k rows, 7 v rows,
-/// 8 the status word, 9 a spare word buffer, 10 the StepParams block of the vendored entry.
 const WORD_BUF: usize = 9;
 const PARAMS_BUF: usize = 10;
 
@@ -212,7 +207,6 @@ impl Fx {
         })
     }
 
-    /// The call the slots describe, on this context.
     fn call(&self) -> Result<AttnPrepChunkCall<'_>, EngError> {
         let r = |i: usize| {
             let (index, offset, bytes) = self.slots[i];
@@ -266,7 +260,6 @@ impl Fx {
         })
     }
 
-    /// Queues the call and drains the stream when it was accepted.
     fn run(&self) -> Result<(), EngError> {
         self.ctx.attn_prep_chunk(&self.stream, self.call()?)?;
         self.stream.synchronize()?;
@@ -815,7 +808,6 @@ fn attn_prep_chunk_is_bit_equal_to_the_vendored_attn_prep_at_one_row() {
 /// The five outputs one run leaves: q, the K plane, the V plane, the k rows, the v rows.
 type Run = [Vec<u8>; 5];
 
-/// The bytes of one run, read back after the stream drained.
 fn read_run(fx: &Fx) -> Run {
     [
         fx.bytes(Q),

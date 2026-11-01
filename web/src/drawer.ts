@@ -1,8 +1,3 @@
-/**
- * Sampling and session settings drawer. Slides over a dimmed background,
- * traps focus, and returns focus on close. Values persist through store.ts.
- */
-
 import { defaultSettings, loadSettings, saveSettings, type DrawerSettings } from "./store";
 
 export class Drawer {

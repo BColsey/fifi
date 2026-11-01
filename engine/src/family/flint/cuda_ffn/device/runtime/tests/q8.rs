@@ -932,7 +932,6 @@ fn q8_tiled_runtime_attention_step_probe() {
 #[ignore = "requires admitted GPU; writer-plane tiled route entry proof"]
 fn q8_tiled_writer_route_entry_passes_oracle() {
     use std::process::Command;
-    // An --ignored run is an admitted device window: fail loudly without one.
     assert!(
         crate::kernels::cuda::device_present("q8_tiled_writer_route_entry_passes_oracle"),
         "--ignored run requires a CUDA device"

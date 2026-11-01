@@ -1,9 +1,7 @@
-//! Public-API smoke tests for the CUDA adapter.
-//!
 //! Tests that need a device print `SKIPPED` and return when no CUDA device is
 //! visible. A skipped run is not evidence that the GPU path works, so GPU gate
 //! runs set `INFERENCE_CUDA_REQUIRE_DEVICE=1`, which turns a missing device
-//! into a failure. Any value except empty or `0` counts as set.
+//! into a failure.
 
 #![cfg(all(feature = "native-cuda", target_os = "linux"))]
 
@@ -22,7 +20,6 @@ fn empty_inputs_return_empty_output_without_a_device_call() {
     assert!(sum.is_empty());
 }
 
-/// Returns whether a device is visible, failing when the gate requires one.
 fn device_present(test: &str) -> bool {
     let count = device_count().expect("CUDA device count query");
     println!("CUDA devices visible: {count}");

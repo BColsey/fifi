@@ -120,7 +120,6 @@ pub(super) fn block_bufs(
     })
 }
 
-/// The block's buffer set over `b` in `layout`.
 pub(super) fn moe_bufs(b: &BlockBufs, layout: WeightLayout) -> Result<MoeBuffers<'_>, EngError> {
     Ok(MoeBuffers {
         route: RouteBufs {

@@ -174,7 +174,6 @@ pub(crate) mod oracle {
         /// keys 2 and 3 only; the key at pos 1 is masked even though causal-visible.
         #[test]
         fn the_window_counts_self() {
-            // three keys at pos 0,1,2; query at pos 2
             let q = [1.0, 1.0];
             let k = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
             let v = [1.0, 0.0, 2.0, 0.0, 4.0, 0.0];

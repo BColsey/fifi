@@ -2,7 +2,6 @@
 :root {
   color-scheme: light;
 
-  /* Type */
   --fifi-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   --fifi-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --fifi-size-1: 12px;
@@ -13,7 +12,6 @@
   --fifi-size-5: 22px;
   --fifi-size-6: 28px;
 
-  /* Color */
   --fifi-accent: #0066cc;
   --fifi-accent-pressed: #004c99;
   --fifi-on-accent: #ffffff;
@@ -34,7 +32,6 @@
   --fifi-error: #d32127;
   --fifi-offline: #98989d;
 
-  /* Spacing */
   --fifi-space-1: 4px;
   --fifi-space-2: 8px;
   --fifi-space-3: 12px;
@@ -42,12 +39,10 @@
   --fifi-space-5: 24px;
   --fifi-space-6: 32px;
 
-  /* Radius */
   --fifi-radius-s: 8px;
   --fifi-radius-m: 12px;
   --fifi-radius-l: 18px;
 
-  /* Motion */
   --fifi-motion: 200ms;
   --fifi-motion-curve: cubic-bezier(0.2, 0.6, 0.3, 1);
 }

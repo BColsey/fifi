@@ -164,7 +164,6 @@ fn chunk_rows_refuse_each_bound() {
             "{p0}+{m}: {error:?} does not contain {want:?}"
         );
     };
-    // The accepting edges: m = m_sess, and p0 + m = cap.
     assert!(ChunkRows::new(972, m_sess, cap, m_sess).is_ok());
     assert!(ChunkRows::new(cap - m_sess, m_sess, cap, m_sess).is_ok());
     assert_eq!(

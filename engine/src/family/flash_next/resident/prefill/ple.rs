@@ -23,7 +23,6 @@ pub(super) struct PleRowsOut {
     pub(super) ring: ExecutionTensor,
 }
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
@@ -121,7 +120,6 @@ mod tests {
             .collect()
     }
 
-    /// Host results for `CHUNK` after the host ran `WARM`.
     struct Reference {
         ring_in: Vec<f32>,
         hyper_in: Vec<f32>,
@@ -212,7 +210,6 @@ mod tests {
         }
     }
 
-    /// One chunk of 1 token and one of 3 tokens, with the ring carried, equal the host over 4 tokens.
     #[test]
     fn block_rows_chunks_that_carry_the_ring_equal_one_run() {
         let _serial = crate::native_test_lock();

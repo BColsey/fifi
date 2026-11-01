@@ -116,7 +116,6 @@ fn regroup(vector: &Tensor, order: Option<&[usize]>) -> Result<Tensor, EngError>
     Tensor::try_from_host(vector.dtype(), vector.shape().to_vec(), moved)
 }
 
-/// Refuses an order that is not a permutation of `0..groups`.
 pub fn check_order(order: &[usize], groups: usize) -> Result<(), EngError> {
     let mut seen = vec![false; groups];
     let valid = order.len() == groups

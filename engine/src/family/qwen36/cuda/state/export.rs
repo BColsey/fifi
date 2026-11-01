@@ -34,7 +34,6 @@ pub(crate) struct KvExport {
     pub(crate) planes: Vec<Vec<u8>>,
 }
 
-/// A checkpoint of the committed session state, in layer order.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExportedState {
     pub(crate) identity: StateIdentity,
@@ -100,7 +99,6 @@ pub(crate) fn check_import(
     Ok(())
 }
 
-/// Bytes of each plane of one attention layer for `tokens` positions, in export order.
 pub(crate) fn plane_sizes(
     kv: &KvPool,
     ordinal: usize,

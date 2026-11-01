@@ -39,12 +39,10 @@ pub struct LinearAttention {
 }
 
 impl LinearAttention {
-    /// Query or key width across all key heads.
     pub fn key_dim(&self) -> Result<u32, EngError> {
         checked_product(self.key_heads, self.key_head_dim, "key dimension")
     }
 
-    /// Value width across all value heads.
     pub fn value_dim(&self) -> Result<u32, EngError> {
         checked_product(self.value_heads, self.value_head_dim, "value dimension")
     }
@@ -106,7 +104,6 @@ pub struct HyperConnection {
 }
 
 impl HyperConnection {
-    /// Total width of the widened residual stream.
     pub fn width(&self, hidden: u32) -> Result<u32, EngError> {
         self.branches
             .checked_mul(hidden)
@@ -114,7 +111,6 @@ impl HyperConnection {
     }
 }
 
-/// Dense feed-forward dimensions and the checkpoint's maximum context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseMlp {
     pub intermediate: u32,
@@ -149,7 +145,6 @@ pub struct FamilySpec {
     pub layers_attention: &'static [AttentionKind],
     /// Required when any layer uses `AttentionKind::DeltaNet`.
     pub linear: Option<LinearAttention>,
-    /// Hyper-connection widening of the residual stream, when the family uses it.
     pub hyper: Option<HyperConnection>,
 }
 
@@ -374,7 +369,6 @@ pub const QWEN3_8_FLASH_NEXT: FamilySpec = FamilySpec {
     }),
 };
 
-/// The Flash-Next family specification.
 pub fn qwen3_8_flash_next() -> FamilySpec {
     QWEN3_8_FLASH_NEXT
 }

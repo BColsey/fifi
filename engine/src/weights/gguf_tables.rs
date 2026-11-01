@@ -1970,7 +1970,6 @@ mod tests {
         }};
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn kmask_iq2xs_matches_pinned_sha256() {
         assert_eq!(KMASK_IQ2XS.len(), 8);
@@ -1980,7 +1979,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn ksigns_iq2xs_matches_pinned_sha256() {
         assert_eq!(KSIGNS_IQ2XS.len(), 128);
@@ -1990,7 +1988,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn iq2xxs_grid_matches_pinned_sha256() {
         assert_eq!(IQ2XXS_GRID.len(), 256);
@@ -2000,7 +1997,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn iq2xs_grid_matches_pinned_sha256() {
         assert_eq!(IQ2XS_GRID.len(), 512);
@@ -2010,7 +2006,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn iq2s_grid_matches_pinned_sha256() {
         assert_eq!(IQ2S_GRID.len(), 1024);
@@ -2020,7 +2015,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn iq3xxs_grid_matches_pinned_sha256() {
         assert_eq!(IQ3XXS_GRID.len(), 256);
@@ -2030,7 +2024,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn iq3s_grid_matches_pinned_sha256() {
         assert_eq!(IQ3S_GRID.len(), 512);
@@ -2040,7 +2033,6 @@ mod tests {
         );
     }
 
-    /// The little-endian bytes of the table match the pinned upstream file.
     #[test]
     fn kvalues_iq4nl_matches_pinned_sha256() {
         assert_eq!(KVALUES_IQ4NL.len(), 16);

@@ -342,7 +342,6 @@ mod tests {
         vals: Vec<Vec<f32>>,
     }
 
-    /// Runs the host attention of layer 1 over positions `0..count`.
     fn host_run(ckpt: &StreamedCheckpoint, oracle: &HostWeights, count: u32) -> HostRun {
         let shape = oracle.shape().clone();
         let view = oracle.view();

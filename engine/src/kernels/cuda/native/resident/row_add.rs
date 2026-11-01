@@ -46,7 +46,6 @@ const _: () = assert!(
         && offset_of!(RowAddArgsRepr, fused_publish) == 48
 );
 
-/// One row_add launch: n values of out, x and y.
 pub(in crate::kernels::cuda) struct RowAddRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -71,8 +70,7 @@ fn check_row_add(call: &RowAddRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// The flag takes atomicOr from every thread when the launch is fused: four aligned
-/// bytes that share nothing with the tensors.
+/// The flag takes atomicOr from every thread when the launch is fused.
 fn check_fused_flag(call: &RowAddRaw<'_>) -> Result<(), DeviceFailure> {
     if !call.fused {
         return Ok(());
@@ -96,7 +94,6 @@ fn check_fused_flag(call: &RowAddRaw<'_>) -> Result<(), DeviceFailure> {
     }
 }
 
-/// Queues the row_add of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn row_add_launch(
     stream: &RawStream,
     call: &RowAddRaw<'_>,
@@ -131,8 +128,6 @@ mod tests {
     use crate::kernels::cuda::native::STATUS_INVALID_ARGUMENT;
     use std::ptr::NonNull;
 
-    /// A fused flag that shares a byte with out, x or y is refused by the Rust checks and
-    /// by the C entry, with every other argument valid; a clear flag passes the Rust checks.
     #[test]
     fn a_fused_flag_that_shares_a_byte_with_a_tensor_is_refused_before_cuda() {
         let mut memory = vec![0u32; 4096];

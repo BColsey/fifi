@@ -1,12 +1,9 @@
-//! Bearer-token check for the protected routes.
-//!
 //! Contract: `api/openapi.yaml` (`securitySchemes.apiKey`). A route with an empty `security`
 //! array skips this check. The router applies it to the other routes.
 
 use super::error::ServerError;
 use axum::http::{HeaderMap, header};
 
-/// Accepts the request only when `Authorization` carries `Bearer <key>`.
 /// An empty key rejects every request, so a misconfigured server never runs open.
 pub(crate) fn check_bearer(headers: &HeaderMap, key: &[u8]) -> Result<(), ServerError> {
     let value = headers

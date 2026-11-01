@@ -65,7 +65,6 @@ fn trace_token(index: usize, id: u32) {
     eprintln!("nem35_token {index} {id} {seconds:.3}");
 }
 
-/// Cumulative per-token timestamps of the last run; `None` unless NEM35_TOKEN_TIMING=1.
 pub fn token_timing_seconds() -> Option<Vec<f64>> {
     TOKEN_TIMING.lock().ok().and_then(|guard| guard.clone())
 }

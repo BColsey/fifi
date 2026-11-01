@@ -4,34 +4,23 @@ use super::math::{dot, expect_len, rms0, rope_half, sigmoid};
 use crate::EngError;
 use crate::family::project::Projector;
 
-/// Unchecked QSA dimensions read from the configuration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QsaDims {
-    /// Query heads.
     pub(crate) heads_q: u32,
-    /// Key and value heads.
     pub(crate) heads_kv: u32,
-    /// Width of one attention head.
     pub(crate) head_dim: u32,
-    /// Indexer query heads.
     pub(crate) idx_heads: u32,
-    /// Width of one indexer head.
     pub(crate) idx_dim: u32,
     /// Positions per indexer block.
     pub(crate) ratio: u32,
     /// Indexer position budget.
     pub(crate) budget: u32,
-    /// Rotated dimensions per head.
     pub(crate) rotary_dim: u32,
-    /// RoPE base.
     pub(crate) theta: f32,
-    /// Model hidden width.
     pub(crate) hidden: u32,
-    /// RMS normalization epsilon.
     pub(crate) eps: f32,
 }
 
-/// Checked QSA dimensions.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QsaShape {
     dims: QsaDims,
@@ -48,7 +37,6 @@ pub(crate) struct QsaShape {
 }
 
 impl QsaShape {
-    /// Checks the dimensions.
     pub(crate) fn new(dims: QsaDims) -> Result<Self, EngError> {
         let counts = [
             dims.heads_q,
@@ -117,13 +105,11 @@ impl QsaShape {
         })
     }
 
-    /// The checked dimensions.
     pub(crate) fn dims(&self) -> QsaDims {
         self.dims
     }
 }
 
-/// Weights of one QSA layer.
 pub(crate) struct QsaWeights<'a, W> {
     /// Query and gate projection `[2 * heads_q * head_dim, hidden]`, interleaved per head.
     pub(crate) q: &'a W,
@@ -135,17 +121,15 @@ pub(crate) struct QsaWeights<'a, W> {
     pub(crate) o: &'a W,
     /// Indexer projection `[(idx_heads + 1) * idx_dim, hidden]`.
     pub(crate) idx: &'a W,
-    /// Query norm, length `head_dim`, shared by all heads.
+    /// Query norm, shared by all heads.
     pub(crate) q_norm: &'a [f32],
-    /// Key norm, length `head_dim`, shared by all heads.
+    /// Key norm, shared by all heads.
     pub(crate) k_norm: &'a [f32],
-    /// Indexer query norm, length `idx_dim`.
     pub(crate) idx_q_norm: &'a [f32],
-    /// Indexer key norm, length `idx_dim`.
     pub(crate) idx_k_norm: &'a [f32],
 }
 
-/// Keys, values, and indexer keys of one QSA layer, one entry per position.
+/// Keys, values, and indexer keys, one entry per position.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct QsaCache {
     k: Vec<f32>,
@@ -155,28 +139,23 @@ pub(crate) struct QsaCache {
 }
 
 impl QsaCache {
-    /// Returns an empty cache.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Number of cached positions.
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns true when the cache holds no positions.
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Host bytes held by the cache.
     pub(crate) fn byte_len(&self) -> usize {
         (self.k.len() + self.v.len() + self.ik.len()) * 4
     }
 }
 
-/// Runs one decode step at `pos` and returns the layer output of length `hidden`.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,
     shape: &QsaShape,
@@ -253,7 +232,6 @@ pub(crate) fn step<P: Projector>(
     }
 }
 
-/// Runs the indexer, block selection, and attention for the position just appended.
 fn attend<P: Projector>(
     projector: &mut P,
     shape: &QsaShape,

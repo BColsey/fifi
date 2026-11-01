@@ -136,7 +136,6 @@ struct ParkEntry {
 }
 
 impl ParkEntry {
-    /// Exact bytes this entry charges: the payload plus the key's bytes.
     fn charge(&self) -> u64 {
         self.key.byte_len() + self.payload.byte_len()
     }
@@ -193,7 +192,6 @@ impl ParkStore {
         if charge > self.budget {
             return false;
         }
-        // A re-park of the same key replaces the old payload.
         if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
             self.used -= self.entries[pos].charge();
             self.entries.remove(pos);
@@ -317,8 +315,6 @@ mod tests {
         let mut store = ParkStore::new(200);
         assert!(store.park(key(&[1], ParkProfile::F16), payload(60, 0)));
         let used = store.used_bytes();
-        // A charge that cannot fit even in an empty store is refused
-        // without evicting anything.
         assert!(!store.park(key(&[2], ParkProfile::F16), payload(120, 0)));
         assert_eq!(store.used_bytes(), used);
         assert_eq!(store.len(), 1);
@@ -348,7 +344,6 @@ mod tests {
         let mut store = ParkStore::new(400);
         assert!(store.park(key(&[1], ParkProfile::F16), payload(90, 0)));
         assert!(store.park(key(&[2], ParkProfile::F16), payload(90, 0)));
-        // Both resident. A new park must evict the LRU (first) entry.
         assert!(store.park(key(&[3], ParkProfile::F16), payload(90, 0)));
         assert_eq!(store.len(), 2);
         assert!(
@@ -367,8 +362,6 @@ mod tests {
             .restore(&[1, 2, 3, 4, 5], &ident(ParkProfile::F16))
             .expect("longest prefix wins");
         assert_eq!(matched, 4);
-        // A prompt that diverges from the longer entry mid-key still
-        // restores the shorter one (the shared prefix counts).
         let (matched, _) = store
             .restore(&[1, 2, 9], &ident(ParkProfile::F16))
             .expect("shorter entry matches the divergent prompt");
@@ -459,7 +452,6 @@ mod tests {
             payload(3, 1),
             "the imaged prompt must not restore the imageless park"
         );
-        // Each image side finds nothing when only the other side is parked.
         let mut only_imageless = ParkStore::new(10_000);
         assert!(only_imageless.park(key(&[1, 2], ParkProfile::F16), payload(1, 1)));
         assert!(
@@ -505,7 +497,6 @@ mod tests {
 
     #[test]
     fn payload_decode_rejects_impossible_lengths() {
-        // A state length of u64::MAX cannot be satisfied by any slice.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
@@ -519,11 +510,9 @@ mod tests {
             kv_rows: Vec::new(),
         }
         .encode();
-        // A flipped state length must not decode.
         let mut corrupt = bytes.clone();
         corrupt[0] ^= 0xFF;
         assert!(ParkedPayload::decode(&corrupt).is_err());
-        // Trailing bytes are rejected.
         let mut trailing = bytes;
         trailing.push(0);
         assert!(ParkedPayload::decode(&trailing).is_err());

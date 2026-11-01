@@ -17,7 +17,6 @@
 
 use crate::{EngError, kernels::cuda::resident::step_params::ResultPair};
 
-/// What `run_token` does with a result pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Decision {
     /// Hand the pair's status to `commit_step`. A clean status commits and yields `token`; a
@@ -44,7 +43,6 @@ pub(super) fn decide(pair: ResultPair, vocab: usize) -> Decision {
     }
 }
 
-/// The error for a clean status with a token the vocabulary does not have.
 pub(super) fn bad_token_error(token: i32) -> EngError {
     EngError::Backend {
         operation: "sample",
@@ -52,7 +50,6 @@ pub(super) fn bad_token_error(token: i32) -> EngError {
     }
 }
 
-/// What the caller does when a launch of the body failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailureAction {
     /// Nothing was queued: take the admitted step back (`cancel_enqueue`).

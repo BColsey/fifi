@@ -71,7 +71,6 @@ const CONV_TAPS: usize = 4;
 /// The DeltaNet gates an EXL3 pack keeps as plain matrices (see `MixerGeometry::plain_specs`).
 const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
 
-/// A dense (tiled) mixer weight: its role, output rows and input length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DenseSpec {
     pub(super) role: Role,
@@ -79,7 +78,6 @@ pub(super) struct DenseSpec {
     pub(super) k: usize,
 }
 
-/// A raw f32 vector of a layer: its role and its length in values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RawSpec {
     pub(super) role: Role,
@@ -231,7 +229,6 @@ impl MixerGeometry {
         }
     }
 
-    /// The raw f32 vectors of one layer of `kind`, the two layer norms included.
     pub(super) fn raw_specs(&self, kind: AttentionKind) -> Result<Vec<RawSpec>, EngError> {
         let (h, d, a) = (self.hidden, &self.delta, &self.attn);
         let spec = |role, values| RawSpec { role, values };

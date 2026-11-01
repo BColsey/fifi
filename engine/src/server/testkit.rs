@@ -1,5 +1,3 @@
-//! Shared test helpers for the server modules (test builds only).
-
 use super::fake::load_bundle;
 use super::state::EngineEntry;
 use crate::EngError;
@@ -19,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
-/// The bearer key of every test server.
 pub(super) const API_KEY: &str = "sk-test";
 
 /// The end-of-sequence id of the fixture tokenizer.
@@ -72,14 +69,12 @@ pub(super) fn ids(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
 }
 
-/// A fake executor script: one batch per byte of `text`, then a batch with the EOS id.
 pub(super) fn script(text: &str) -> Vec<Vec<u32>> {
     let mut batches: Vec<Vec<u32>> = ids(text).into_iter().map(|id| vec![id]).collect();
     batches.push(vec![EOS]);
     batches
 }
 
-/// Starts an engine thread on the scripted fake executor.
 pub(super) fn engine(script: Vec<Vec<u32>>) -> Engine {
     spawn_engine(512, move || {
         Ok((
@@ -90,8 +85,7 @@ pub(super) fn engine(script: Vec<Vec<u32>>) -> Engine {
     .expect("spawn engine")
 }
 
-/// Starts an engine thread on the scripted fake executor with the given prefix store limits
-/// (the default limits are zero roots and one entry).
+/// The default limits are zero roots and one entry.
 pub(super) fn engine_with_prefix_limits(
     script: Vec<Vec<u32>>,
     roots: usize,
@@ -105,7 +99,6 @@ pub(super) fn engine_with_prefix_limits(
     .expect("spawn engine")
 }
 
-/// Starts an engine whose load fails, so its state becomes `Error`.
 pub(super) fn failing_engine() -> Engine {
     spawn_engine::<FakeExecutor, _>(512, || {
         Err(EngError::Checkpoint("fixture load failure".to_string()))
@@ -113,7 +106,6 @@ pub(super) fn failing_engine() -> Engine {
     .expect("spawn engine")
 }
 
-/// Starts an engine whose load waits for the returned sender to drop, so submitted jobs queue.
 pub(super) fn gated_engine(script: Vec<Vec<u32>>) -> (Engine, std::sync::mpsc::Sender<()>) {
     let (gate, wait) = std::sync::mpsc::channel::<()>();
     let engine = spawn_engine(512, move || {
@@ -127,7 +119,6 @@ pub(super) fn gated_engine(script: Vec<Vec<u32>>) -> (Engine, std::sync::mpsc::S
     (engine, gate)
 }
 
-/// Builds the routing entry of an engine with the contract sampling defaults.
 pub(super) fn entry(id: &str, model: &str, engine: &Engine, context_limit: u32) -> EngineEntry {
     entry_with_defaults(
         id,
@@ -138,8 +129,6 @@ pub(super) fn entry(id: &str, model: &str, engine: &Engine, context_limit: u32) 
     )
 }
 
-/// Builds the routing entry of an engine with its own sampling defaults, the values that its
-/// model directory's `generation_config.json` gives.
 pub(super) fn entry_with_defaults(
     id: &str,
     model: &str,
@@ -159,7 +148,6 @@ pub(super) fn entry_with_defaults(
     }
 }
 
-/// Waits up to five seconds for an engine to reach `wanted`.
 pub(super) fn wait_for_state(handle: &EngineHandle, wanted: EngineState) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while handle.state() != wanted {
@@ -172,12 +160,10 @@ pub(super) fn wait_for_state(handle: &EngineHandle, wanted: EngineState) {
     }
 }
 
-/// A `GET` request. `key` becomes the bearer token when it is set.
 pub(super) fn get(uri: &str, key: Option<&str>) -> Request<Body> {
     request("GET", uri, key)
 }
 
-/// An empty-body request with the given method. `key` becomes the bearer token when it is set.
 pub(super) fn request(method: &str, uri: &str, key: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(key) = key {
@@ -186,7 +172,6 @@ pub(super) fn request(method: &str, uri: &str, key: Option<&str>) -> Request<Bod
     builder.body(Body::empty()).expect("build request")
 }
 
-/// Sends one request through a clone of the router and reads the whole body.
 pub(super) async fn send(
     router: &Router,
     request: Request<Body>,
@@ -203,12 +188,10 @@ pub(super) async fn send(
     (parts.status, parts.headers, bytes)
 }
 
-/// Parses a JSON body.
 pub(super) fn json_of(bytes: &Bytes) -> Value {
     serde_json::from_slice(bytes).expect("json body")
 }
 
-/// Starts an engine whose executor fails every `prefill` with `error`.
 pub(super) fn refusing_engine(error: EngError) -> Engine {
     spawn_engine(512, move || {
         Ok((RefusingExecutor(error), Default::default()))
@@ -253,7 +236,6 @@ pub(super) fn generation() -> GenerationState {
     GenerationState::new(IncrementalDecoder::new(bundle().tokenizer()))
 }
 
-/// A tool named `add` with an integer parameter `a` and a number parameter `b`.
 pub(super) fn add_tool() -> ToolSpec {
     ToolSpec(json!({"type": "function", "function": {
         "name": "add",
@@ -261,15 +243,11 @@ pub(super) fn add_tool() -> ToolSpec {
             "a": {"type": "integer"}, "b": {"type": "number"}}}}}))
 }
 
-/// How the job of an `ending_engine` ends after its text.
 pub(super) enum Ending {
-    /// The executor returns this error from `decode`.
     Error(EngError),
-    /// The executor reports a cancellation that nobody requested.
     Cancel,
 }
 
-/// An executor that decodes one byte of its text per `decode` call and then ends as told.
 struct Ends {
     ids: VecDeque<u32>,
     ending: Option<Ending>,
@@ -315,7 +293,6 @@ impl ExecutorOps for Ends {
     fn boundary(&mut self, _st: &mut ()) {}
 }
 
-/// Starts an engine whose first job decodes `text` one byte at a time and then ends as `ending` says.
 pub(super) fn ending_engine(text: &str, ending: Ending) -> Engine {
     let ids: VecDeque<u32> = ids(text).into();
     spawn_engine(512, move || {
@@ -330,9 +307,7 @@ pub(super) fn ending_engine(text: &str, ending: Ending) -> Engine {
     .expect("spawn engine")
 }
 
-/// An executor that records the prompt it receives and samples the ids 0 and 1 from the sampler.
 /// It never finishes on its own, so the output limit of the job or a stop string ends the reply.
-/// It sleeps `delay` before each decode and counts the decodes.
 struct Probe {
     prompt: Arc<Mutex<Vec<u32>>>,
     sampling: Arc<Mutex<Option<SamplingParams>>>,
@@ -406,29 +381,22 @@ impl ExecutorOps for Probe {
     fn boundary(&mut self, _st: &mut Vec<u32>) {}
 }
 
-/// A probe engine and the values that its executor shares with the test.
 pub(super) struct Probes {
     pub(super) engine: Engine,
-    /// Every prefilled token.
     pub(super) prompt: Arc<Mutex<Vec<u32>>>,
-    /// The sampling settings of the first job it decoded, if any.
     pub(super) sampling: Arc<Mutex<Option<SamplingParams>>>,
-    /// The number of `decode` calls.
     pub(super) decodes: Arc<AtomicUsize>,
 }
 
-/// Starts an engine on the probe executor. `delay` is the sleep before each decode.
 pub(super) fn probes(delay: Duration) -> Probes {
     probes_behind(delay, None)
 }
 
-/// Starts a probe engine whose load waits for the returned sender to drop, so submitted jobs queue.
 pub(super) fn gated_probes() -> (Probes, std::sync::mpsc::Sender<()>) {
     let (gate, wait) = std::sync::mpsc::channel::<()>();
     (probes_behind(Duration::ZERO, Some(wait)), gate)
 }
 
-/// Starts a probe engine. A gate delays the load until the gate drops.
 fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -> Probes {
     let prompt = Arc::new(Mutex::new(Vec::new()));
     let sampling = Arc::new(Mutex::new(None));
@@ -454,23 +422,15 @@ fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -
     }
 }
 
-/// Starts an engine on the probe executor without a delay. The second value collects every prefilled token.
 pub(super) fn probe_engine() -> (Engine, Arc<Mutex<Vec<u32>>>) {
     let probes = probes(Duration::ZERO);
     (probes.engine, probes.prompt)
 }
 
-/// Starts an engine on the probe executor without a delay. Besides every prefilled token, it
-/// shares the sampling settings of the first job the engine decodes, so an end-to-end test can
-/// observe the settings the chat handler resolved.
-/// Starts an engine on the probe executor without a delay, sharing everything the executor
-/// records: every prefilled token, the sampling settings of the first decoded job, and the
-/// decode count, so an end-to-end test can observe the settings the chat handler resolved.
 pub(super) fn probe_engine_with_sampling() -> Probes {
     probes(Duration::ZERO)
 }
 
-/// Waits up to five seconds until `condition` holds.
 pub(super) fn wait_until(what: &str, condition: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
@@ -479,12 +439,10 @@ pub(super) fn wait_until(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-/// A `POST` request with a JSON body and the test key.
 pub(super) fn post_json(uri: &str, body: &Value) -> Request<Body> {
     post_bytes(uri, Some(API_KEY), body.to_string().into_bytes())
 }
 
-/// A `POST` request with raw body bytes. `key` becomes the bearer token when it is set.
 pub(super) fn post_bytes(uri: &str, key: Option<&str>, body: Vec<u8>) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
@@ -496,7 +454,6 @@ pub(super) fn post_bytes(uri: &str, key: Option<&str>, body: Vec<u8>) -> Request
     builder.body(Body::from(body)).expect("build request")
 }
 
-/// One server-sent event: the optional `event:` name and the joined `data:` lines.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SseEvent {
     pub(super) name: Option<String>,
@@ -568,7 +525,6 @@ pub(super) fn child_env_check_raw(
     assert!(text.contains("1 passed"), "{mode} ran zero tests: {text}");
 }
 
-/// Splits a complete server-sent event stream into its events. Comment lines are skipped.
 pub(super) fn sse_events(bytes: &Bytes) -> Vec<SseEvent> {
     let text = std::str::from_utf8(bytes).expect("utf-8 stream");
     text.split("\n\n")

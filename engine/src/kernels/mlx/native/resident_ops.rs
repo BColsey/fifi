@@ -47,13 +47,10 @@ pub(super) const FLASH_DELTA_SOURCE: &str = concat!(include_str!("gated_delta_wy
 /// The NUL-terminated Metal source of the gdn_prep kernel (Q36_FUSED_PREFILL=1).
 pub(super) const GDN_PREP_SOURCE: &str = concat!(include_str!("gdn_prep.body.metal"), "\0");
 
-/// The NUL-terminated Metal source of the act_mul kernel.
 pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal"), "\0");
 
-/// The NUL-terminated Metal source of the gdn_post kernel.
 pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.metal"), "\0");
 
-/// The NUL-terminated Metal source of the attn_gate kernel.
 pub(super) const ATTN_GATE_SOURCE: &str = concat!(include_str!("attn_gate.body.metal"), "\0");
 
 /// The Metal source of the fused MoE combine (Q36_FUSED_PREFILL=1): the spike-validated
@@ -129,7 +126,6 @@ type BinaryElementwise = unsafe extern "C" fn(
 type ReduceAxis =
     unsafe extern "C" fn(*mut ffi::mlx_array, ffi::mlx_array, i32, bool, ffi::mlx_stream) -> i32;
 
-/// The expert ids of one gathered product.
 enum GatherIds<'a> {
     /// Clamp the ids to the last expert on the device, the rule of the public operations.
     Clamp(&'a ExecutionTensor),
@@ -141,7 +137,6 @@ enum GatherIds<'a> {
     },
 }
 
-/// The ids of one `take`.
 enum TakeIds<'a> {
     /// Clamp the ids to the last element of the axis, the rule of `take`.
     Clamp(&'a ExecutionTensor),
@@ -2460,7 +2455,6 @@ impl Context {
             promotes: false,
         };
         expected.complete(&q, built)?;
-        // The remaining five outputs complete against the same expectations pattern.
         let k_expected = ExpectedOutput {
             shape: &[rows, 16, 128],
             ..expected
@@ -3380,7 +3374,6 @@ fn dtype_from_native(dtype: ffi::mlx_dtype) -> Option<Dtype> {
     }
 }
 
-/// Whether an array has the dtype, rank, byte length, and shape that the caller expects.
 pub(super) fn native_output_valid(
     output: ffi::mlx_array,
     shape: &[u32],
@@ -3408,7 +3401,6 @@ pub(super) fn native_output_valid(
         .all(|(&actual, &expected)| actual >= 0 && actual as u32 == expected)
 }
 
-/// Rejects an input of another native owner, before any native call.
 fn check_owner(
     operation: &'static str,
     state: &State,
@@ -3457,7 +3449,6 @@ pub(super) fn check_f32_operand(
     Ok(())
 }
 
-/// Rejects a parameter that is not finite and positive, before any native call.
 fn check_positive(operation: &'static str, name: &str, value: f32) -> Result<(), EngError> {
     if value.is_finite() && value > 0.0 {
         return Ok(());
@@ -3467,7 +3458,6 @@ fn check_positive(operation: &'static str, name: &str, value: f32) -> Result<(),
     )))
 }
 
-/// Rejects an index input of another owner or a dtype other than U32, before any native call.
 fn check_index(
     operation: &'static str,
     state: &State,
@@ -3486,7 +3476,6 @@ fn check_index(
     Ok(())
 }
 
-/// Rejects a packed weight whose parts belong to another native owner, before any native call.
 fn check_packed(
     operation: &'static str,
     state: &State,
@@ -3505,7 +3494,6 @@ fn check_packed(
     Ok(())
 }
 
-/// Converts validated axes, counts, or dimensions to native `int` values.
 fn native_ints(operation: &'static str, values: &[u32]) -> Result<Vec<i32>, EngError> {
     values
         .iter()
@@ -3595,7 +3583,6 @@ mod rebind_tests {
             .unwrap()
     }
 
-    /// Where the injected fault strikes.
     #[derive(Clone, Copy)]
     enum Strike {
         /// The `k` build call fails, so `rope` fails and neither handle rebinds.
@@ -3743,7 +3730,6 @@ mod cast_tests {
         tensor::{Dtype, ExecutionTensor, Tensor},
     };
 
-    /// An F32 resident of `values` with shape `[1, n]`, imported with one synchronization.
     fn f32_resident(kernels: &mut MlxKernels, values: &[f32]) -> ExecutionTensor {
         let bytes: Vec<u8> = values
             .iter()
@@ -3756,7 +3742,6 @@ mod cast_tests {
             .unwrap()
     }
 
-    /// Reads an F32 resident back as values.
     fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
         kernels
             .readback(x)
@@ -3913,7 +3898,6 @@ mod f32_only_tests {
         tensor::{Dtype, ExecutionTensor, Tensor},
     };
 
-    /// An F32 resident of `values` with `shape`, imported with one synchronization.
     fn f32_resident(kernels: &mut MlxKernels, shape: &[u32], values: &[f32]) -> ExecutionTensor {
         let bytes: Vec<u8> = values
             .iter()
@@ -4188,7 +4172,6 @@ mod gather_sorted_tests {
             .unwrap()
     }
 
-    /// Imports `values` as the rank-one U32 index resident.
     fn indices(kernels: &mut MlxKernels, values: &[u32]) -> ExecutionTensor {
         let bytes: Vec<u8> = values
             .iter()
@@ -4227,7 +4210,6 @@ mod gather_sorted_tests {
         }
     }
 
-    /// Reads a BF16 resident back as its raw bit patterns.
     fn read_bf16_bits(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<u16> {
         let tensor = kernels.readback(x).unwrap();
         assert_eq!(
@@ -4488,7 +4470,6 @@ mod bounded_tests {
             .unwrap()
     }
 
-    /// Imports `values` as the rank-one U32 index resident.
     fn indices(kernels: &mut MlxKernels, values: &[u32]) -> ExecutionTensor {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         kernels
@@ -4503,7 +4484,6 @@ mod bounded_tests {
             .unwrap()
     }
 
-    /// Reads an F32 resident back as values.
     fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
         kernels
             .readback(x)
@@ -4792,7 +4772,6 @@ mod view_readback_tests {
         tensor::{Dtype, ExecutionTensor, Tensor},
     };
 
-    /// An F32 resident of `values` with `shape`.
     fn f32_resident(kernels: &mut MlxKernels, shape: &[u32], values: &[f32]) -> ExecutionTensor {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         kernels
@@ -4800,7 +4779,6 @@ mod view_readback_tests {
             .unwrap()
     }
 
-    /// Reads an F32 resident back as values.
     fn read_f32(kernels: &mut MlxKernels, x: &ExecutionTensor) -> Vec<f32> {
         kernels
             .readback(x)
@@ -4822,28 +4800,24 @@ mod view_readback_tests {
         let _serial = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
         let x = f32_resident(&mut kernels, &[3, 2], &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        // slice: rows [1, 3) of the table.
         let sliced = kernels.slice(&x, &[1, 0], &[3, 2]).unwrap();
         assert_eq!(
             read_f32(&mut kernels, &sliced),
             [2.0, 3.0, 4.0, 5.0],
             "the slice rows"
         );
-        // transpose of the slice: the two columns become rows.
         let transposed = kernels.transpose(&sliced, &[1, 0]).unwrap();
         assert_eq!(
             read_f32(&mut kernels, &transposed),
             [2.0, 4.0, 3.0, 5.0],
             "the transposed slice"
         );
-        // reshape OF a view: the transposed slice as one row.
         let reshaped = kernels.reshape(&transposed, &[4]).unwrap();
         assert_eq!(
             read_f32(&mut kernels, &reshaped),
             [2.0, 4.0, 3.0, 5.0],
             "the reshape of the view keeps the element order"
         );
-        // repeat of the slice along both axes.
         let repeated = kernels.repeat(&sliced, 2, 0).unwrap();
         let repeated = kernels.repeat(&repeated, 2, 1).unwrap();
         assert_eq!(
@@ -4853,7 +4827,6 @@ mod view_readback_tests {
             ],
             "the repeat follows numpy.repeat on both axes"
         );
-        // broadcast of one row to three.
         let row = f32_resident(&mut kernels, &[1, 3], &[7.0, 8.0, 9.0]);
         let broadcast = kernels.broadcast_rows(&row, 3).unwrap();
         assert_eq!(

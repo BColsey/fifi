@@ -119,7 +119,6 @@ pub(crate) struct KernelScratch {
 }
 
 impl KernelScratch {
-    /// The scratch of `rows` rows with the router size of `router_logits_bytes`.
     pub(crate) fn for_dims(
         dims: &StepDims,
         rows: usize,
@@ -168,14 +167,10 @@ impl KernelScratch {
         })
     }
 
-    /// The split `AttnPart` was sized with (the observation point of the Int8G32 sizing rule:
-    /// the byte counts of STAGE1 and Q8 coincide).
     pub(crate) fn attn_split(&self) -> AttnSplit {
         self.attn_split
     }
 
-    /// Refuses a scratch made for another row count, a router size below the shape's need, or a
-    /// split that does not belong to the KV mode.
     fn check(&self, dims: &StepDims, rows: usize, kv_mode: KvMode) -> Result<(), EngError> {
         let router_min = product(&[rows, dims.shape.moe.experts + 1, F32])?;
         let want = match kv_mode {
@@ -198,7 +193,6 @@ impl KernelScratch {
     }
 }
 
-/// One activation tensor of the step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Slot {
     ResidA,
@@ -270,7 +264,6 @@ pub(crate) enum Slot {
     /// write cannot interfere with the mixer's NormRow bytes whatever a later plan changes.
     FinalNormRow,
     Logits,
-    /// Argmax partials, live only in `ARGMAX`.
     ArgmaxPart,
 }
 
@@ -417,7 +410,6 @@ const FINAL_NORM: usize = Phase::FinalNorm as usize;
 const LM_HEAD: usize = Phase::LmHead as usize;
 const ARGMAX: usize = Phase::Argmax as usize;
 
-/// A slot with its size and closed lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlannedSlot {
     pub(crate) slot: Slot,
@@ -426,7 +418,6 @@ pub(crate) struct PlannedSlot {
     pub(crate) last: usize,
 }
 
-/// The activation arena of one step shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StepPlan {
     rows: usize,
@@ -444,8 +435,6 @@ fn product(parts: &[usize]) -> Result<usize, EngError> {
 }
 
 impl StepPlan {
-    /// Lists the tensors of a step of `rows` rows, places them with `plan_arena`, and records the
-    /// size without aliasing for the report.
     pub(crate) fn new(
         dims: &StepDims,
         rows: usize,
@@ -547,12 +536,10 @@ impl StepPlan {
         arena_tensors(&self.slots)
     }
 
-    /// Position of `slot` in [`Self::arena_tensors`], or `None` when the plan has no such slot.
     pub(crate) fn index(&self, slot: Slot) -> Option<usize> {
         self.slots.iter().position(|s| s.slot == slot)
     }
 
-    /// Byte offset of `slot` in the arena, or `None` when the plan has no such slot.
     pub(crate) fn offset(&self, slot: Slot) -> Option<usize> {
         self.arena.offsets.get(self.index(slot)?).copied()
     }
@@ -591,7 +578,6 @@ impl fmt::Display for StepPlan {
     }
 }
 
-/// The slots of one step under construction, with the helpers that size them.
 struct SlotList {
     rows: usize,
     slots: Vec<PlannedSlot>,
@@ -614,12 +600,10 @@ impl SlotList {
         Ok(())
     }
 
-    /// f32 values of `width` per row.
     fn row(&self, width: usize) -> Result<usize, EngError> {
         product(&[self.rows, width, F32])
     }
 
-    /// The fp16 pack buffer for `k` values per row.
     fn xf(&self, k: usize) -> Result<usize, EngError> {
         xf_bytes(self.rows, k)
             .ok_or_else(|| EngError::MemoryPlan("step plan: an xf size overflows".to_owned()))
@@ -702,7 +686,6 @@ fn list_slots(
     Ok(list.slots)
 }
 
-/// The residual stream and the tensors of the two mixers.
 fn list_mixers(
     list: &mut SlotList,
     dims: &StepDims,

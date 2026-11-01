@@ -55,7 +55,6 @@ pub(super) fn names_without_experts<'n>(names: &[&'n str]) -> Vec<&'n str> {
         .collect()
 }
 
-/// The bank geometry of the step dims.
 pub(super) fn geometry_of(dims: &StepDims) -> ExpertBankGeometry {
     ExpertBankGeometry {
         hidden: dims.shape.hidden,
@@ -100,7 +99,6 @@ pub(super) fn admit_banks(
     })
 }
 
-/// Allocates the banks and builds the host over a read-only mapping of the checkpoint `gguf`.
 pub(super) fn build_tiered(
     ctx: &CudaContext,
     (header, gguf): (&GgufHeader, &Path),

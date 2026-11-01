@@ -28,7 +28,6 @@ use crate::kernels::cuda::native::prefill::swiglu_rows::{
 
 /// The most rows of one call: 8 slot rows per token at the 2,048-row chunk cap.
 pub(crate) const MAX_ROWS: usize = 16_384;
-/// The most values of one half.
 pub(crate) const MAX_FF: usize = 32_768;
 /// `n_ff`, `up_off`, `ld_in` and `ld_out` are multiples of this: the kernel moves `float4`.
 pub(crate) const QUAD: usize = 4;
@@ -75,17 +74,14 @@ pub(crate) fn swiglu_rows_needs(shape: &SwigluRowsShape) -> Option<SwigluRowsNee
     })
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("swiglu_rows: {tag}: {detail}"))
 }
 
-/// `value` as `c_int` for the rule `tag`, or the "above i32::MAX" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
-/// The refusal for `tag` unless `value` is a multiple of [`QUAD`].
 fn require_quad(tag: &str, value: usize) -> Result<(), EngError> {
     if value.is_multiple_of(QUAD) {
         return Ok(());
@@ -96,7 +92,6 @@ fn require_quad(tag: &str, value: usize) -> Result<(), EngError> {
     ))
 }
 
-/// The refusal for `tag` unless `value >= least`.
 fn require_at_least(tag: &str, value: usize, least: usize, what: &str) -> Result<(), EngError> {
     if value >= least {
         return Ok(());

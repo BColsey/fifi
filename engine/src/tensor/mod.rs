@@ -68,8 +68,8 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    /// Stored bytes per element. The family code, the kernel validation code, and the native
-    /// adapter all use this one table.
+    /// The family code, the kernel validation code, and the native adapter all use this one
+    /// table.
     pub(crate) fn byte_width(self) -> u64 {
         match self {
             Self::U8 => 1,

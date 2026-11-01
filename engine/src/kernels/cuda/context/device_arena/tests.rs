@@ -20,7 +20,6 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request<T>(result: Result<T, EngError>, case: &str, needle: &str) {
     match result {
         Err(EngError::BadRequest(message)) => assert!(
@@ -85,7 +84,6 @@ fn arena_views_are_checked_and_planned_tensors_do_not_overlap() {
         "the reuse saves bytes"
     );
 
-    // The views: aligned, nonempty, inside the arena, no overflow.
     let total = arena.bytes();
     let view = arena.view(256, 512).expect("an aligned view inside");
     assert_eq!((view.offset(), view.bytes()), (256, 512));

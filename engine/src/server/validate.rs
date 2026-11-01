@@ -25,7 +25,6 @@ pub(crate) struct RequestedSampling {
     pub(crate) top_k: Option<u64>,
 }
 
-/// A chat request that passed validation.
 #[derive(Debug)]
 pub(crate) struct ChatInput {
     pub(crate) model: Option<String>,
@@ -146,8 +145,6 @@ fn grammar_unavailable(what: &str) -> ServerError {
     ))
 }
 
-/// Checks `response_format.json_schema`: a `name` string, an optional `schema` object, and an
-/// optional boolean `strict`.
 fn check_json_schema_shape(format: &Map<String, Value>) -> Result<(), ServerError> {
     let schema = format
         .get("json_schema")
@@ -169,7 +166,6 @@ fn check_json_schema_shape(format: &Map<String, Value>) -> Result<(), ServerErro
     Ok(())
 }
 
-/// Reads an optional number member.
 fn number(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, ServerError> {
     match object.get(field) {
         None => Ok(None),
@@ -178,7 +174,6 @@ fn number(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, Serve
     }
 }
 
-/// Reads an optional whole number member that must be at least `minimum`.
 fn count(
     object: &Map<String, Value>,
     field: &str,

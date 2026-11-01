@@ -513,7 +513,6 @@ pub(crate) type PackedProjection<'a, P> = dyn FnMut(&mut P, ExpertIndex, ExpertP
 pub(crate) type BatchedPackedProjection<'a, P> = dyn FnMut(&mut P, &[(ExpertIndex, ExpertProjection)], &[f32], &mut [f32]) -> Result<(), EngError>
     + 'a;
 
-/// Accumulates the selected experts through packed projections.
 pub(crate) fn apply_routed_experts_packed<P: Projector<Weight = Tensor>>(
     hidden: &Tensor,
     selection: &[Vec<RoutedExpert>],

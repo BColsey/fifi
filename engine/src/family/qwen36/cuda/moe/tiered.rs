@@ -76,7 +76,6 @@ pub(in crate::family::qwen36::cuda) struct TieredScratch {
 }
 
 impl TieredScratch {
-    /// Allocates the scratch for `hidden` values per row and `top_k` picks.
     pub(in crate::family::qwen36::cuda) fn new(
         ctx: &crate::kernels::cuda::CudaContext,
         hidden: usize,

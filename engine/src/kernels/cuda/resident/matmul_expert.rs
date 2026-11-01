@@ -55,8 +55,7 @@ pub(crate) struct ExpertStack<'a> {
     pub(crate) experts: usize,
 }
 
-/// The stack, the expert selection, and the packed input and output of `io.m` tokens. `io.y`
-/// holds `io.m` rows of one expert's rows.
+/// `io.y` holds `io.m` rows of one expert's rows.
 pub(crate) struct ExpertCall<'b> {
     pub(crate) stack: ExpertStack<'b>,
     pub(crate) select: ExpertSelect<'b>,
@@ -64,14 +63,6 @@ pub(crate) struct ExpertCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the matmul of `call.io.xf` against expert `ids[slot]` of the stack on `stream`,
-    /// writing `call.io.y`.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, for a stack that does not
-    /// split into `experts` experts of whole 8-row groups, for `count` outside `1..=experts`, for
-    /// an ids range that is short or misaligned, for `m` outside `1..=8` or a shape that splits
-    /// along k, for an `xf` or `y` range that is short or misaligned, and for a `y` that
-    /// overlaps `xf`, the experts' tiles or the ids.
     pub(crate) fn matmul_expert(
         &self,
         stream: &DeviceStream,
@@ -87,7 +78,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of an expert matmul, then the native view of its ranges.
     fn plan_expert<'b>(&self, call: &ExpertCall<'b>) -> Result<ExpertRaw<'b>, EngError> {
         let (ids, xf, y) = (&call.select.ids, &call.io.xf, &call.io.y);
         let (ids_raw, xf_raw, y_raw) = (
@@ -150,7 +140,6 @@ impl CudaContext {
     }
 }
 
-/// Rows of one expert: the weight split into `experts` equal experts of whole 8-row groups.
 fn expert_rows(weight: &TiledWeight, experts: usize) -> Result<usize, EngError> {
     let total = weight.n_rows();
     if experts < 1 || !total.is_multiple_of(experts) || !(total / experts).is_multiple_of(8) {
@@ -161,8 +150,6 @@ fn expert_rows(weight: &TiledWeight, experts: usize) -> Result<usize, EngError> 
     Ok(total / experts)
 }
 
-/// `BadRequest` unless `m` tokens against an expert of `rows` x `k` values of type `ty` are a
-/// decode shape.
 fn check_shape(ty: TiledType, m: usize, rows: usize, k: usize) -> Result<(), EngError> {
     if !(1..=MAX_EXPERT_TOKENS).contains(&m) {
         return Err(EngError::BadRequest(format!(
@@ -197,7 +184,6 @@ fn check_c_ints(values: &[(&str, usize)]) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Bytes of the tiles of one expert of `rows` rows.
 fn expert_bytes(weight: &TiledWeight, rows: usize) -> Result<usize, EngError> {
     let layout = weight.layout();
     let one = native::Tiled {

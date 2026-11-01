@@ -355,7 +355,6 @@ fn kv_and_delta_sizes() {
     );
     assert_eq!(lf.words.total, 768);
     assert_eq!(lf.bytes().unwrap(), 2_750_219_008);
-    // One whole K plane of the first attention layer, then the V plane right behind it.
     let (k, k_bytes) = lf.kv.plane_extent(0, Plane::K).unwrap();
     let (v, _) = lf.kv.plane_extent(0, Plane::V).unwrap();
     assert_eq!((k, v - k), (0, k_bytes));

@@ -249,7 +249,6 @@ pub(crate) fn expect_refusal<T: std::fmt::Debug>(result: Result<T, EngError>, ne
     }
 }
 
-/// Builds the tiny pack, applies `mutate`, and returns the audit's refusal message.
 pub(crate) fn refusal(mutate: impl FnOnce(&mut PackBuilder)) -> String {
     let mut pack = PackBuilder::tiny();
     mutate(&mut pack);
@@ -260,7 +259,6 @@ pub(crate) fn refusal(mutate: impl FnOnce(&mut PackBuilder)) -> String {
     }
 }
 
-/// As [`refusal`], asserting that the message contains `needle`.
 pub(crate) fn refuses(mutate: impl FnOnce(&mut PackBuilder), needle: &str) {
     let message = refusal(mutate);
     assert!(message.contains(needle), "{needle:?} not in {message:?}");

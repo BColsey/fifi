@@ -1,5 +1,3 @@
-//! The `enginesrv` entry point. All behavior lives in `inference_engine::server`.
-
 use std::process::ExitCode;
 
 fn main() -> ExitCode {

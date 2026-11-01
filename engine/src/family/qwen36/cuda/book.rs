@@ -47,7 +47,6 @@ use crate::{
     kernels::cuda::resident::step_params::{STATUS_EXL3_ARITHMETIC, StepStatus},
 };
 
-/// Whether the state may be trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Health {
     Valid,
@@ -73,14 +72,15 @@ pub(super) struct Admitted {
 /// variants change nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitRefusal {
-    /// The state was not `Valid` (the text names the health).
     NotValid,
-    /// No step is pending.
     NothingPending,
     /// The result pair carried a non-zero status word; the state is now `Poisoned`.
     Status(i32),
     /// Stage 1 commits whole steps only (module doc, rule 2); the state is now `Poisoned`.
-    Partial { advance: usize, accepted: usize },
+    Partial {
+        advance: usize,
+        accepted: usize,
+    },
 }
 
 /// The error of a non-zero status word, with the class of the wrapper (`StepStatus::error`,
@@ -136,7 +136,6 @@ impl From<CommitRefusal> for EngError {
     }
 }
 
-/// Why a start block was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartRefusal {
     NotValid,
@@ -175,7 +174,6 @@ impl From<StartRefusal> for EngError {
     }
 }
 
-/// The committed count, the pending steps, the health and the owning stream of one state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StateBook {
     capacity: usize,
@@ -269,20 +267,20 @@ impl StateBook {
         self.check_owner(stream_id, "join_branches")
     }
 
-    /// Guards of `Mixers::run_block`: the owning stream and a valid state.
+    /// Guards of `Mixers::run_block`.
     pub(super) fn begin_block(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "run_block")?;
         self.require_valid("run_block")
     }
 
-    /// Guards of `export_state`: the owning stream, a valid and idle state.
+    /// Guards of `export_state`.
     pub(super) fn begin_export(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "export_state")?;
         self.require_valid("export_state")?;
         self.require_idle("export_state")
     }
 
-    /// Guards of `reset`: the owning stream. The state is `Poisoned` until `finish_overwrite`.
+    /// Guards of `reset`: the owning stream.
     pub(super) fn begin_reset(&mut self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "reset")?;
         self.health = Health::Poisoned;
@@ -291,11 +289,10 @@ impl StateBook {
 
     /// Guards of `import_state` after `check_import` accepted the value: the owning stream, and
     /// `rewrites_words` - whether the import does ALL of reset's work (the words block rewritten
-    /// with `StepParams` and status zeroed, the other slots cleared). A `Poisoned` state is refused
-    /// unless it does; a `Valid` or `PrefillOpen` one may be replaced either way. The state is
-    /// `Poisoned` until `finish_overwrite`, so a failure after this call never leaves a partly
-    /// imported `Valid` state. `import_state` always passes `true` (`IMPORT_REWRITES_WORDS`), so
-    /// the `false` refusal below is unreachable in production: it is a guard for future callers
+    /// with `StepParams` and status zeroed, the other slots cleared). The state is `Poisoned`
+    /// until `finish_overwrite`, so a failure after this call never leaves a partly imported
+    /// `Valid` state. `import_state` always passes `true` (`IMPORT_REWRITES_WORDS`), so the
+    /// `false` refusal below is unreachable in production: it is a guard for future callers
     /// that import without rewriting the words.
     pub(super) fn begin_import(
         &mut self,
@@ -321,8 +318,6 @@ impl StateBook {
         Ok(())
     }
 
-    /// A reset or an import finished: `tokens` committed rows, nothing pending, `Valid`, and a
-    /// start block owed.
     pub(super) fn finish_overwrite(&mut self, tokens: usize) {
         self.tokens = tokens;
         self.pending.advances.clear();
@@ -330,7 +325,6 @@ impl StateBook {
         self.needs_start = true;
     }
 
-    /// The host wrote a start block that `begin_write_params` accepted.
     pub(super) fn params_written(&mut self) {
         self.needs_start = false;
     }
@@ -400,7 +394,6 @@ impl StateBook {
         self.health = Health::Poisoned;
     }
 
-    /// Enters `PrefillOpen` from `Valid` and idle.
     pub(super) fn begin_prefill(&mut self) -> Result<(), EngError> {
         self.require_valid("begin_prefill")?;
         self.require_idle("begin_prefill")?;
@@ -423,7 +416,6 @@ impl StateBook {
         self.require_prefill_open(what)
     }
 
-    /// `BadRequest` unless a prefill is in progress (`what` names the caller).
     fn require_prefill_open(&self, what: &str) -> Result<(), EngError> {
         if self.health == Health::PrefillOpen {
             return Ok(());
@@ -463,8 +455,6 @@ impl StateBook {
         Ok(())
     }
 
-    /// Guards of `write_step_params`: the owning stream, then the start block against the book
-    /// (stage 1 decode).
     pub(super) fn begin_write_params(
         &self,
         stream_id: u64,

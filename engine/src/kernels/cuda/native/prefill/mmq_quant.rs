@@ -95,7 +95,6 @@ pub(in crate::kernels::cuda) struct QuantInts {
     pub(in crate::kernels::cuda) ncols: c_int,
 }
 
-/// The converted integers of one scatter call.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::kernels::cuda) struct ScatterInts {
     pub(in crate::kernels::cuda) packing: c_int,
@@ -106,7 +105,6 @@ pub(in crate::kernels::cuda) struct ScatterInts {
     pub(in crate::kernels::cuda) top_k: c_int,
 }
 
-/// The ranges of one quantize call plus its converted integers.
 pub(in crate::kernels::cuda) struct MmqQuantizeRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) gather: Option<RawRange<'a>>,
@@ -114,7 +112,6 @@ pub(in crate::kernels::cuda) struct MmqQuantizeRaw<'a> {
     pub(in crate::kernels::cuda) ints: QuantInts,
 }
 
-/// The ranges of one scatter call plus its converted integers.
 pub(in crate::kernels::cuda) struct MmqQuantizeScatterRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) inv: RawRange<'a>,
@@ -122,14 +119,10 @@ pub(in crate::kernels::cuda) struct MmqQuantizeScatterRaw<'a> {
     pub(in crate::kernels::cuda) ints: ScatterInts,
 }
 
-/// `n` as `usize`, or an invalid-argument failure.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Proves a quantize call before the native call: the C sizes (source
-/// `(ncols - 1) * row_stride + k` floats, map `ncols` ints, `y` `q8_1_bytes` with the pad),
-/// the 16/4-byte alignments, and that `y` shares no byte with an input.
 fn check_quantize(io: &MmqQuantizeRaw<'_>) -> Result<(), DeviceFailure> {
     let ints = io.ints;
     let (k, stride, ncols) = (size(ints.k)?, size(ints.row_stride)?, size(ints.ncols)?);
@@ -164,7 +157,6 @@ fn check_quantize(io: &MmqQuantizeRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Proves a scatter call the same way (inverse map `m * top_k` ints).
 fn check_scatter(io: &MmqQuantizeScatterRaw<'_>) -> Result<(), DeviceFailure> {
     let ints = io.ints;
     let (k, stride) = (size(ints.k)?, size(ints.row_stride)?);
@@ -219,7 +211,6 @@ fn c_scatter(io: &MmqQuantizeScatterRaw<'_>) -> MmqQuantizeScatterArgsRaw {
     }
 }
 
-/// Queues the (optionally gathered) quantize on `stream`.
 pub(in crate::kernels::cuda) fn mmq_quantize_launch(
     stream: &RawStream,
     io: MmqQuantizeRaw<'_>,
@@ -237,7 +228,6 @@ pub(in crate::kernels::cuda) fn mmq_quantize_launch(
     checked(status, stage)
 }
 
-/// Queues the scatter quantize on `stream`.
 pub(in crate::kernels::cuda) fn mmq_quantize_scatter_launch(
     stream: &RawStream,
     io: MmqQuantizeScatterRaw<'_>,

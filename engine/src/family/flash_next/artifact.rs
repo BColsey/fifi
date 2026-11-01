@@ -11,7 +11,6 @@ fn manifest_error(message: String) -> EngError {
     EngError::Checkpoint(format!("artifact manifest: {message}"))
 }
 
-/// Reads the SHA-256 of `name` from the parsed manifest.
 fn digest(manifest: &Value, name: &str) -> Result<[u8; 32], EngError> {
     let text = manifest
         .get(name)
@@ -32,8 +31,8 @@ fn digest(manifest: &Value, name: &str) -> Result<[u8; 32], EngError> {
     Ok(out)
 }
 
-/// Builds the tokenizer pin from the artifact manifest. `vocab_size` is the vocabulary size of
-/// `tokenizer.json` with its added tokens (248,077 for the pinned Flash-Next artifact).
+/// `vocab_size` is the vocabulary size of `tokenizer.json` with its added tokens
+/// (248,077 for the pinned Flash-Next artifact).
 pub(crate) fn tokenizer_pin(manifest: &[u8], vocab_size: u32) -> Result<TokenizerPin, EngError> {
     let value: Value =
         serde_json::from_slice(manifest).map_err(|error| manifest_error(error.to_string()))?;

@@ -11,7 +11,6 @@ use super::{
 const DEFAULT_FULL_ATTENTION_INTERVAL: u32 = 4;
 
 impl FamilySpec {
-    /// Checks architecture before enforcing this family's quantization metadata.
     pub fn check_config(&self, config: &[u8]) -> Result<(), EngError> {
         self.check_architecture_config(config)?;
         self.check_quantization(config)
@@ -19,15 +18,9 @@ impl FamilySpec {
 
     /// Checks checkpoint architecture against this family, without a weight encoding.
     ///
-    /// Executor load paths call this before resolving weights. Any value that differs from
-    /// this constant, or that the configuration omits, returns `EngError::Checkpoint`.
-    /// The check reads `text_config` when it exists and the root object otherwise.
-    /// It rejects duplicate members and a null `head_dim`.
-    /// An absent `full_attention_interval` defaults to 4, as in the pinned reference, and a
-    /// present `layer_types` must equal the order that interval gives.
-    /// The configuration vocabulary names only `full_attention` and `linear_attention`, so a
-    /// family may execute the full-attention positions as `AttentionKind::Qsa`.
-    /// The `mtp` flag selects an execution mode and has no configuration field to check.
+    /// Executor load paths call this before resolving weights. It rejects duplicate
+    /// members and a null `head_dim` (a null value is not an absent value). The `mtp`
+    /// flag selects an execution mode and has no configuration field to check.
     ///
     /// TODO(S7): the check does not compare `partial_rotary_factor` or the rope dimension.
     /// The S7 lane owns that field and its correction.
@@ -84,7 +77,6 @@ impl FamilySpec {
         if fields.object.get("head_dim").is_some() {
             fields.expect_u32("head_dim", self.head_dim)?;
         } else {
-            // The reference derives an absent head dimension from the hidden and head counts.
             let derived = hidden.checked_div(heads_q);
             fields.mismatch("head_dim", derived.map(u64::from), u64::from(self.head_dim))?;
         }
@@ -191,7 +183,7 @@ impl FamilySpec {
 
     fn check_layer_kinds(&self, fields: &Fields) -> Result<(), EngError> {
         // The pinned reference derives the order from the interval alone and defaults the
-        // interval to 4 (qwen3_5.py:43,203). A present layer_types must equal that order.
+        // interval to 4 (qwen3_5.py:43,203).
         let interval = fields
             .optional_u32("full_attention_interval")?
             .unwrap_or(DEFAULT_FULL_ATTENTION_INTERVAL);
@@ -354,7 +346,7 @@ impl Fields<'_> {
 
     /// Reads `rope_parameters.rope_theta`, the only source the reference uses
     /// (`qwen3_5.py:54-61,72-82`). A missing nested value makes the reference fall back to
-    /// 1e5, so the check rejects it. A top-level copy must agree with the nested value.
+    /// 1e5, so the check rejects it.
     fn rope_theta(&self) -> Result<f64, EngError> {
         let nested = self
             .object

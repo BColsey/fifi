@@ -272,7 +272,6 @@ pub(in crate::family::qwen36::resident) fn embed_rows(
     to_act(ctx, &rows)
 }
 
-/// The last row of `h` `[T, H]` as `[1, H]`.
 fn last_row(
     ctx: &mut Ctx<'_>,
     h: &ExecutionTensor,
@@ -535,7 +534,6 @@ mod tests {
         result.unwrap()
     }
 
-    /// The value of an optional result that must be present.
     fn some<T>(value: Option<T>, what: &str) -> T {
         assert!(value.is_some(), "{what}: missing");
         value.unwrap()
@@ -715,7 +713,6 @@ mod tests {
             StepMode::Prompt,
         ];
         prefill_matches_the_host(8, 512, None, &modes);
-        // One row is a chunk too.
         prefill_matches_the_host(1, 512, None, &[StepMode::Record]);
     }
 

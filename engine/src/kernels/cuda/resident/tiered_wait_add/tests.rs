@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The sentinel byte of a buffer the kernel must not touch.
 const UNTOUCHED: u8 = 0x77;
 /// The quiet NaN the kernel poisons a failed row with.
 const QUIET_NAN: u32 = 0x7FC0_0000;
@@ -196,8 +195,6 @@ fn special_pairs() -> Vec<(f32, f32)> {
     ]
 }
 
-/// One served round's record: the kernel's row, the device combine's row over the same inputs,
-/// the host sum, the word and whether the server answered.
 struct Served {
     got: Vec<u32>,
     combine: Vec<u32>,
@@ -206,8 +203,6 @@ struct Served {
     answered: bool,
 }
 
-/// One served round at `hidden` with the special pairs: sequence 1 is answered with the special
-/// partial.
 fn special_rounds(hidden: usize) -> Result<Served, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -267,9 +262,6 @@ fn special_rounds(hidden: usize) -> Result<Served, EngError> {
     })
 }
 
-/// The kernel's sum is bitwise the host IEEE sum `r + (1.0 * p)` and the device combine's, over
-/// zero signs, subnormals, large magnitudes, infinities and NaN, at the Qwen3.6 width and a small
-/// one; a served round leaves the word alone.
 #[test]
 fn tiered_wait_add_equals_moe_combine_top_k_one_bitwise() {
     if !testkit::device_present("tiered_wait_add_equals_moe_combine_top_k_one_bitwise") {
@@ -300,8 +292,6 @@ fn tiered_wait_add_equals_moe_combine_top_k_one_bitwise() {
     }
 }
 
-/// The phase of the no-miss test: a sentinel row and word, miss count 0, a 1 ms budget and no
-/// server at all.
 fn untouched_phase(hidden: usize) -> Result<(Vec<u8>, Vec<u8>), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -315,7 +305,6 @@ fn untouched_phase(hidden: usize) -> Result<(Vec<u8>, Vec<u8>), EngError> {
     Ok((rig.row_bytes(&ctx, hidden)?, read(&ctx, &rig.word, 4)?))
 }
 
-/// With no miss the kernel writes nothing at all: the sentinel row and word stay byte for byte.
 #[test]
 fn tiered_wait_add_without_misses_writes_nothing() {
     if !testkit::device_present("tiered_wait_add_without_misses_writes_nothing") {
@@ -330,7 +319,6 @@ fn tiered_wait_add_without_misses_writes_nothing() {
     );
 }
 
-/// One unanswered wait at a 20 ms budget, starting from `start_word`.
 fn timeout_phase(hidden: usize, start_word: i32) -> Result<(i32, Vec<u32>, Duration), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -389,7 +377,6 @@ fn tiered_wait_add_times_out_with_its_bit_and_a_nan_row() {
     );
 }
 
-/// One round whose server answers `result` for sequence 1 after `delay`.
 fn answered_round(
     hidden: usize,
     result: Result<Vec<f32>, u32>,
@@ -430,7 +417,6 @@ fn answered_round(
     Ok((rig.word(&ctx)?, rig.row_bits(&ctx, hidden)?))
 }
 
-/// A server error (code 7) ORs bit 1 into the word (4 becomes 5) and nothing else, and poisons the row.
 #[test]
 fn tiered_wait_add_reports_a_server_error() {
     if !testkit::device_present("tiered_wait_add_reports_a_server_error") {
@@ -461,8 +447,6 @@ fn tiered_wait_add_accepts_an_answer_that_arrives_late() {
     assert_eq!(word, 4, "the word is untouched");
 }
 
-/// The phase of the stale-answer test: expect 5; the server first answers sequence 4 with a
-/// poisoned partial, then, 20 ms later, sequence 5 with the real one.
 fn stale_phase(hidden: usize) -> Result<(i32, Vec<u32>), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -497,8 +481,6 @@ fn stale_phase(hidden: usize) -> Result<(i32, Vec<u32>), EngError> {
     Ok((rig.word(&ctx)?, rig.row_bits(&ctx, hidden)?))
 }
 
-/// An answer for an older sequence is stale and never accepted: with expect 5 the kernel ignores a
-/// published sequence 4 with a poisoned partial and sums the real answer.
 #[test]
 fn tiered_wait_add_ignores_a_stale_answer() {
     if !testkit::device_present("tiered_wait_add_ignores_a_stale_answer") {
@@ -516,7 +498,6 @@ fn tiered_wait_add_ignores_a_stale_answer() {
     assert_eq!(word, 0, "the word is untouched");
 }
 
-/// The phase of the protocol-fault test: expect 3; the server answers sequence 4, an answer from the future.
 fn ahead_phase(hidden: usize) -> Result<(i32, Vec<u32>, Duration), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -568,7 +549,6 @@ fn tiered_wait_add_faults_on_an_answer_that_is_ahead() {
     );
 }
 
-/// What the stress phase saw, as plain data.
 #[derive(Default)]
 struct Rounds {
     done: u64,
@@ -659,8 +639,6 @@ fn rounds_phase(hidden: usize, rounds: u64) -> Result<Rounds, EngError> {
     Ok(seen)
 }
 
-/// Every one of 2,000 waits on one mailbox holds: the sequences rise, the server answers in order
-/// and each row equals the host sum bit for bit.
 #[test]
 fn tiered_wait_add_rounds_hold_over_2000_launches() {
     if !testkit::device_present("tiered_wait_add_rounds_hold_over_2000_launches") {

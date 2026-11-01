@@ -52,15 +52,12 @@ use crate::kernels::cuda::native::resident::gdn_delta::{
 pub(crate) const GDN_EPS: f32 = 1.0e-6_f32;
 /// Key and value head size, the vendored constant `kStateDim`.
 pub(crate) const GDN_HEAD_DIM: usize = 128;
-/// The most tokens one call takes.
 pub(crate) const GDN_DELTA_MAX_M: usize = 32768;
 /// The most key heads (policy; Qwen3.6 has 16).
 pub(crate) const GDN_MAX_K_HEADS: usize = 64;
 /// The most value heads (policy; Qwen3.6 has 32).
 pub(crate) const GDN_MAX_V_HEADS: usize = 128;
-/// The largest `conv_ld`.
 const MAX_CONV_LD: usize = 1 << 20;
-/// The largest `ld`; the offsets are bounded by it.
 const MAX_LD: usize = 1 << 22;
 
 /// Geometry of one call: `m` tokens, `n_k_heads` key heads and `n_v_heads` value heads (a
@@ -78,7 +75,6 @@ pub(crate) struct DeltaShape {
     pub(crate) alpha_off: usize,
 }
 
-/// The bytes each range of a call must hold, from [`delta_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeltaBytes {
     pub(crate) conv: usize,
@@ -114,12 +110,10 @@ pub(crate) struct DeltaCall<'b> {
     pub(crate) out: DeviceRange<'b>,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("gdn_delta: {tag}: {detail}"))
 }
 
-/// Product of the factors, or the "size overflow" refusal.
 fn product(factors: &[usize]) -> Result<usize, EngError> {
     factors
         .iter()
@@ -127,13 +121,11 @@ fn product(factors: &[usize]) -> Result<usize, EngError> {
         .ok_or_else(|| rule("size overflow", "a range size overflows"))
 }
 
-/// `a + b`, or the "size overflow" refusal.
 fn sum(a: usize, b: usize) -> Result<usize, EngError> {
     a.checked_add(b)
         .ok_or_else(|| rule("size overflow", "a range size overflows"))
 }
 
-/// The end column of `z`, of the beta logits and of the alpha logits in a `proj` row.
 fn proj_ends(shape: &DeltaShape) -> Result<[(&'static str, usize); 3], EngError> {
     let nv = shape.n_v_heads;
     Ok([
@@ -145,8 +137,6 @@ fn proj_ends(shape: &DeltaShape) -> Result<[(&'static str, usize); 3], EngError>
 
 /// The bytes each range of `shape` must hold: `conv` and `proj` reach
 /// `(m - 1) * row length + the columns read`, the rest follow from the head counts.
-///
-/// Returns `BadRequest` ("size overflow") when a product does not fit `usize`, and for `m` 0.
 pub(crate) fn delta_bytes(shape: DeltaShape) -> Result<DeltaBytes, EngError> {
     let before_last = shape
         .m
@@ -211,8 +201,7 @@ fn check_counts(shape: &DeltaShape, eps: f32) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Rule (1), the row lengths: `conv_ld` holds a whole conv row, `ld` reaches the end of `z`, of
-/// the beta logits and of the alpha logits, and both stay under their limits.
+/// Rule (1), the row lengths.
 fn check_rows(shape: &DeltaShape) -> Result<(), EngError> {
     let conv_cols = product(&[
         sum(shape.n_k_heads, sum(shape.n_k_heads, shape.n_v_heads)?)?,
@@ -255,7 +244,7 @@ fn convert_ints(shape: &DeltaShape) -> Result<GdnDeltaInts, EngError> {
     })
 }
 
-/// Rule (2), size and alignment, one `require_fit` per range (4-byte aligned).
+/// Rule (2), size and alignment.
 fn check_fit(call: &DeltaCall<'_>, need: &DeltaBytes) -> Result<(), EngError> {
     require_fit("conv", &call.conv, need.conv, 4)?;
     require_fit("proj", &call.proj, need.proj, 4)?;
@@ -266,8 +255,8 @@ fn check_fit(call: &DeltaCall<'_>, need: &DeltaBytes) -> Result<(), EngError> {
     require_fit("out", &call.out, need.out, 4)
 }
 
-/// Rule (3), disjointness: `state` and `out` are written, so each is apart from every other range
-/// (11 pairs); the five read ranges may share bytes.
+/// Rule (3), disjointness: `state` and `out` are written, so each is apart from every other
+/// range; the five read ranges may share bytes.
 fn check_apart(call: &DeltaCall<'_>, need: &DeltaBytes) -> Result<(), EngError> {
     let state = Claim::of("state", &call.state, need.state);
     let out = Claim::of("out", &call.out, need.out);

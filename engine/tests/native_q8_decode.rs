@@ -27,7 +27,6 @@ fn f32_input(shape: Vec<u32>, values: &[f32]) -> Tensor {
     .unwrap()
 }
 
-/// A deterministic F32 tensor of `shape` from a value function, without naming every value.
 fn f32_pattern(shape: &[u32], value: impl Fn(usize) -> f32) -> Tensor {
     let count: usize = shape.iter().map(|&dim| dim as usize).product();
     let values: Vec<f32> = (0..count).map(value).collect();
@@ -59,7 +58,6 @@ fn values_of(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-/// Decodes BF16 readback bytes to F32 (each BF16 value is the top half of an F32).
 fn bf16_values(tensor: &Tensor) -> Vec<f32> {
     tensor
         .host_bytes()
@@ -79,7 +77,6 @@ fn read(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Tensor {
     kernels.readback(tensor).unwrap()
 }
 
-/// Decodes a float readback of `dtype` (F32 or BF16) to F32 values.
 fn decode(dtype: Dtype, tensor: &Tensor) -> Vec<f32> {
     match dtype {
         Dtype::F32 => values_of(tensor),
@@ -100,7 +97,6 @@ fn assert_finite_readback(kernels: &mut MlxKernels, dtype: Dtype, got: &Executio
     }
 }
 
-/// The affine 8-bit spec of every test here: group `group`, bits 8.
 fn affine(group: u32) -> QuantizationSpec {
     QuantizationSpec {
         mode: QuantizationMode::Affine,
@@ -109,7 +105,6 @@ fn affine(group: u32) -> QuantizationSpec {
     }
 }
 
-/// The first `len` rows (axis two) of a rank-four host tensor, head by head.
 fn first_rows(tensor: &Tensor, len: u32) -> Tensor {
     let &[_, heads, cap, last] = tensor.shape() else {
         panic!(

@@ -6,7 +6,6 @@
 
 use crate::EngError;
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
@@ -20,7 +19,6 @@ const ROUTE_RANGES: u64 = 4;
 /// Bytes of one route word (`U32` or `F32`).
 const ROUTE_WORD_BYTES: u64 = 4;
 
-/// Rejects a wave cap of zero.
 fn check_wave_cap(wave_cap: u32) -> Result<(), EngError> {
     if wave_cap == 0 {
         return Err(bad("prefill wave cap must exceed zero"));
@@ -28,7 +26,6 @@ fn check_wave_cap(wave_cap: u32) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The routing of one prefill chunk after the per-token expert selection.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChunkRoute {
     /// The distinct selected experts of the chunk, ascending.
@@ -37,7 +34,6 @@ pub(crate) struct ChunkRoute {
     pub(crate) rank_idx: Vec<u32>,
     /// For each pair, its gate weight, in the same order.
     pub(crate) gates: Vec<f32>,
-    /// Experts selected per token.
     pub(crate) top_k: u32,
 }
 
@@ -93,18 +89,14 @@ pub(crate) fn union_and_remap(
 /// A run of consecutive expert ids that one positioned read can load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExpertRun {
-    /// The first expert id of the run.
     pub(crate) first: u32,
     /// The rank of that expert in the distinct list, which is its slot in the page set.
     pub(crate) rank: u32,
-    /// The number of experts in the run.
     pub(crate) len: u32,
 }
 
-/// Splits a strictly ascending expert list into runs of consecutive ids.
-///
-/// A run ends at a gap. The experts of a run are adjacent in the checkpoint stack and in the page
-/// set, so one read can fill them.
+/// The experts of a run are adjacent in the checkpoint stack and in the page set, so one read
+/// can fill them.
 pub(crate) fn coalesce_runs(distinct: &[u32]) -> Result<Vec<ExpertRun>, EngError> {
     if !distinct.is_sorted_by(|a, b| a < b) {
         return Err(bad("prefill experts must be strictly ascending"));
@@ -142,9 +134,7 @@ pub(crate) const PREFILL_RETIRE_CAP: u64 = 512 << 20;
 /// state, the outer product, and the replaced state.
 pub(crate) const DELTA_RETIRED_STATES: u64 = 3;
 
-/// Retired bytes of one chunk token in one DeltaNet layer: `3 * VH * KD * VD * 4` (F32 state).
-///
-/// A zero dimension or an overflow is a `BadRequest`.
+/// Retired bytes of one chunk token in one DeltaNet layer (F32 state).
 pub(crate) fn delta_retire_per_token(
     value_heads: u32,
     key_dim: u32,
@@ -159,9 +149,8 @@ pub(crate) fn delta_retire_per_token(
         .ok_or_else(|| bad("delta retire bytes are zero or overflow"))
 }
 
-/// Tokens per DeltaNet sub-chunk: `floor((cap - 64 MiB) / per_token)`, at least 1 and at most
-/// `tokens`. The layer state is evaluated between sub-chunks, so the retired bytes of one layer
-/// stay near `cap`. `tokens` and `per_token` must be positive.
+/// The layer state is evaluated between sub-chunks, so the retired bytes of one layer stay near
+/// `cap`.
 pub(crate) fn delta_subchunk(tokens: u32, cap: u64, per_token: u64) -> Result<u32, EngError> {
     if tokens == 0 || per_token == 0 {
         return Err(bad(
@@ -172,9 +161,6 @@ pub(crate) fn delta_subchunk(tokens: u32, cap: u64, per_token: u64) -> Result<u3
     Ok(u32::try_from(fit).unwrap_or(u32::MAX).clamp(1, tokens))
 }
 
-/// The token ranges `(start, stop)` of the DeltaNet sub-chunks of a chunk of `tokens` tokens, in
-/// order. Every range is non-empty, and together they cover `0..tokens` exactly. `tokens` and
-/// `sub` must be positive, so the caller never starts the DeltaNet chunk with an empty range.
 pub(crate) fn delta_ranges(tokens: u32, sub: u32) -> Result<Vec<(u32, u32)>, EngError> {
     if tokens == 0 || sub == 0 {
         return Err(bad("delta sub-chunk needs positive tokens and size"));
@@ -190,7 +176,6 @@ pub(crate) fn delta_ranges(tokens: u32, sub: u32) -> Result<Vec<(u32, u32)>, Eng
         .collect()
 }
 
-/// Planned extra synchronizations of one chunk: `delta_layers * (ceil(tokens / sub) - 1)`.
 pub(crate) fn delta_extra_syncs(delta_layers: u32, tokens: u32, sub: u32) -> Result<u64, EngError> {
     if sub == 0 || tokens == 0 {
         return Err(bad("delta sub-chunk count needs positive tokens and size"));
@@ -225,11 +210,9 @@ pub(crate) struct ChunkCost {
     /// Experts that one page set holds at most: the expert count of a MoE layer when the chunk runs
     /// in one wave, or the wave cap `U_w` after `with_wave_cap`.
     pub(crate) experts: u32,
-    /// Experts selected per token.
     pub(crate) top_k: u32,
     /// Bytes of one expert across the gate, up, and down stacks, including page rounding.
     pub(crate) expert_bytes: u64,
-    /// Expert page sets lent at the same time (two).
     pub(crate) sets: u32,
     /// Activation workspace bytes per chunk token.
     pub(crate) per_token: u64,
@@ -238,9 +221,6 @@ pub(crate) struct ChunkCost {
 }
 
 impl ChunkCost {
-    /// The cost of a chunk that runs its expert union in waves of at most `wave_cap` experts.
-    ///
-    /// A cap above the layer's expert count changes nothing. A cap of zero is a `BadRequest`.
     pub(crate) fn with_wave_cap(self, wave_cap: u32) -> Result<Self, EngError> {
         check_wave_cap(wave_cap)?;
         Ok(Self {
@@ -249,10 +229,6 @@ impl ChunkCost {
         })
     }
 
-    /// Experts that each page set must hold for a chunk of `tokens` tokens.
-    ///
-    /// A chunk selects at most `tokens * top_k` distinct experts, and a set holds at most
-    /// `experts`. The result is the smaller of the two.
     pub(crate) fn set_experts(&self, tokens: u32) -> Result<u32, EngError> {
         let overflow = || EngError::MemoryPlan("prefill workspace overflows u64".into());
         let pairs = u64::from(tokens)
@@ -261,10 +237,7 @@ impl ChunkCost {
         u32::try_from(pairs.min(u64::from(self.experts))).map_err(|_| overflow())
     }
 
-    /// Workspace bytes of a chunk of `tokens` tokens.
-    ///
-    /// A page set must hold every distinct expert the chunk can select in one wave. That count is
-    /// `set_experts(tokens)`.
+    /// A page set must hold every distinct expert the chunk can select in one wave.
     pub(crate) fn workspace(&self, tokens: u32) -> Result<u64, EngError> {
         let overflow = || EngError::MemoryPlan("prefill workspace overflows u64".into());
         let held = u64::from(self.set_experts(tokens)?);
@@ -280,8 +253,6 @@ impl ChunkCost {
             .ok_or_else(overflow)
     }
 
-    /// Adds the prefill retire cap to the cost: `PREFILL_RETIRE_CAP` (512 MiB) to `fixed`.
-    ///
     /// The cap is flat, so `per_token` does not change.
     pub(crate) fn with_retire_cap(self) -> Result<Self, EngError> {
         Ok(Self {
@@ -319,9 +290,6 @@ impl ChunkCost {
     }
 }
 
-/// Returns the largest candidate chunk size whose workspace is at most `remaining`, or `None`.
-///
-/// The candidates can come in any order. A candidate of zero tokens is a `BadRequest`.
 pub(crate) fn largest_chunk(
     cost: &ChunkCost,
     candidates: &[u32],
@@ -339,7 +307,6 @@ pub(crate) fn largest_chunk(
     Ok(best)
 }
 
-/// The candidate chunk sizes of the admission rule.
 pub(crate) const PREFILL_CANDIDATES: [u32; 11] = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1];
 
 /// Experts per wave, `U_w`. The first release runs one wave: 512 is the expert count of a layer.
@@ -406,18 +373,15 @@ pub(crate) fn prefill_remaining(
 pub(crate) struct PrefillTerms {
     /// The engine budget `B`.
     pub(crate) budget: u64,
-    /// The resident weights of this executor.
     pub(crate) weights: u64,
     /// The decode pool: an extra term beyond the admission rule.
     pub(crate) decode_pool: u64,
-    /// The S3 cache.
     pub(crate) s3_cache: u64,
     /// The session state, the MLX cache limit, and the pressure margin, as the caller summed them.
     pub(crate) session_reserve: u64,
 }
 
 impl PrefillTerms {
-    /// The bytes left for a chunk after every term (`prefill_remaining`).
     pub(crate) fn remaining(&self) -> u64 {
         prefill_remaining(
             self.budget,
@@ -440,18 +404,14 @@ impl std::fmt::Display for PrefillTerms {
     }
 }
 
-/// The result of one admission: the chunk size and the terms that were charged for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrefillPlan {
     /// The chunk size, or `None` when no size above one token fits.
     pub(crate) chunk: Option<u32>,
-    /// The terms that were charged.
     pub(crate) terms: PrefillTerms,
 }
 
-/// The chunk size that the prefill runs, or `None` when it runs one-token steps. It is the largest
-/// candidate that fits `remaining`. A chunk of one token is the one-token path, so a result of 1 is
-/// `None`.
+/// A chunk of one token is the one-token path, so a result of 1 is `None`.
 pub(crate) fn admitted_chunk(cost: &ChunkCost, remaining: u64) -> Result<Option<u32>, EngError> {
     Ok(largest_chunk(cost, &PREFILL_CANDIDATES, remaining)?.filter(|&tokens| tokens > 1))
 }
@@ -473,7 +433,6 @@ pub(crate) struct Wave {
     pub(crate) gates: Vec<f32>,
 }
 
-/// The waves of one chunk and the permutation that restores pair order.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WavePlan {
     /// The waves in rank order. Every wave holds at least one pair.
@@ -483,9 +442,6 @@ pub(crate) struct WavePlan {
     pub(crate) inverse: Vec<u32>,
 }
 
-/// Waves needed for `union` distinct experts when a wave holds at most `wave_cap` experts.
-///
-/// A cap of zero is a `BadRequest`.
 pub(crate) fn wave_count(union: u32, wave_cap: u32) -> Result<u32, EngError> {
     check_wave_cap(wave_cap)?;
     Ok(union.div_ceil(wave_cap))
@@ -528,10 +484,6 @@ pub(crate) fn split_waves(route: &ChunkRoute, wave_cap: u32) -> Result<WavePlan,
             gates: Vec::new(),
         });
     }
-    // The pairs in (rank, pair) order: a stable sort by rank keeps the pair index ascending inside
-    // one rank, so each wave receives its pairs already ordered by (local rank, pair index) and the
-    // concatenation of the wave pair lists is the (rank, pair) order that the inverse permutation
-    // inverts.
     let mut order: Vec<(u32, usize)> = route
         .rank_idx
         .iter()
@@ -591,10 +543,8 @@ pub(crate) fn require_sorted_ranks(ranks: &[u32]) -> Result<(), EngError> {
     }
 }
 
-/// Extra synchronizations that waves add to one chunk.
-///
-/// A layer with `w` waves adds `w - 1` evaluations. `waves_per_layer` holds the wave count of each
-/// MoE layer. Equal counts `w` over 48 layers give `48 * (w - 1)`. A count of zero is a `BadRequest`.
+/// `waves_per_layer` holds the wave count of each MoE layer; equal counts `w` over 48 layers give
+/// `48 * (w - 1)`.
 pub(crate) fn wave_syncs(waves_per_layer: &[u32]) -> Result<u64, EngError> {
     waves_per_layer.iter().try_fold(0u64, |total, &waves| {
         let extra = waves
@@ -1004,7 +954,6 @@ mod tests {
             let route = union_and_remap(&selections, 64).unwrap();
             let top_k = route.top_k as usize;
             let pairs = route.rank_idx.len();
-            // The token-major multiset of (token, gate, rank).
             let mut want: Vec<(u32, f32, u32)> = route
                 .rank_idx
                 .iter()
@@ -1412,7 +1361,6 @@ mod tests {
         assert!(is_bad_request(delta_extra_syncs(1, 0, 3)), "zero tokens");
     }
 
-    /// 4 tokens in parts of 3 or 2, 7 in parts of 3, and a part size above the chunk.
     #[test]
     fn the_delta_ranges_cover_the_chunk_without_empty_parts() {
         assert_eq!(delta_ranges(4, 3).unwrap(), [(0, 3), (3, 4)]);

@@ -1192,7 +1192,6 @@ fn the_exl3_list_is_the_exl3_slots_once_each_at_every_ladder_size() {
     }
 }
 
-/// Offsets from `plan_arena` for the list.
 fn exl3_offsets(tensors: &[(S, ArenaTensor)]) -> Vec<usize> {
     plan_arena(&only(tensors)).expect("plan").offsets
 }

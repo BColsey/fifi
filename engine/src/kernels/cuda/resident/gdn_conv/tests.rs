@@ -18,9 +18,7 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream}
 /// Class E1 (frozen): `max|d| <= 2^-20 * max(max|ref|, 1)` per output vector
 /// against an f64 reference; the conv is a 4-term dot plus `x / (1 + __expf(-x))`.
 const E1: f64 = 1.0 / 1_048_576.0;
-/// Floats of sentinel before and after every buffer's used bytes.
 const PAD: usize = 256;
-/// The NaN pattern of the sentinels.
 const SENT: u32 = 0x7fc0_dead;
 /// `l2` epsilon of ggml's `build_gdn_l2_norm`.
 const L2_EPS: f64 = 1e-6;
@@ -73,7 +71,6 @@ impl Padded {
         Self::new(ctx, &[&vec![f32::from_bits(SENT); floats]], 0)
     }
 
-    /// The range of `bytes` bytes that starts `skip` bytes into the data.
     fn range(&self, skip: usize, bytes: usize) -> DeviceRange<'_> {
         self.buf.range(self.lead + skip, bytes).expect("range")
     }
@@ -82,7 +79,6 @@ impl Padded {
         self.range(0, self.data_floats * 4)
     }
 
-    /// The data floats; the sentinels on both sides must be intact.
     fn read(&self, ctx: &CudaContext, what: &str) -> Vec<f32> {
         let total = self.lead + self.data_floats * 4 + PAD * 4;
         let all = testkit::floats(&testkit::read_bytes(ctx, &self.buf, total));
@@ -103,7 +99,6 @@ fn draw(rng: &mut Rng, n: usize, sd: f64) -> Vec<f32> {
     (0..n).map(|_| (rng.normal() * sd) as f32).collect()
 }
 
-/// `m` rows of `ld` floats: N(0, sd) in the first `channels`, NaN in the pad columns.
 fn proj_rows(rng: &mut Rng, shape: ConvShape, sd: f64) -> Vec<f32> {
     let mut rows = Vec::with_capacity(shape.m * shape.ld);
     for _ in 0..shape.m {
@@ -113,8 +108,6 @@ fn proj_rows(rng: &mut Rng, shape: ConvShape, sd: f64) -> Vec<f32> {
     rows
 }
 
-/// The f64 reference: `out[t][c] = silu(sum_k w[c][k] * window[k])` over the window
-/// `(s0, s1, s2, x)`, oldest first, and the state after the last token (the last three inputs).
 fn ref_conv(w: &[f32], state: &[f32], proj: &[f32], shape: ConvShape) -> (Vec<f64>, Vec<f32>) {
     let ConvShape { m, channels, ld } = shape;
     let mut out = vec![0.0; m * channels];
@@ -136,7 +129,6 @@ fn ref_conv(w: &[f32], state: &[f32], proj: &[f32], shape: ConvShape) -> (Vec<f6
     (out, last)
 }
 
-/// `max|d| / max(max|ref|, 1)` of one vector.
 fn e_form(dev: &[f32], reference: &[f64]) -> f64 {
     let scale = reference.iter().fold(1.0f64, |a, r| a.max(r.abs()));
     let worst = dev
@@ -150,7 +142,6 @@ fn e_form(dev: &[f32], reference: &[f64]) -> f64 {
     worst / scale
 }
 
-/// Worst `e_form` over the `m` rows of `out`.
 fn worst_rows(out: &[f32], reference: &[f64], channels: usize) -> f64 {
     out.chunks(channels)
         .zip(reference.chunks(channels))
@@ -158,7 +149,6 @@ fn worst_rows(out: &[f32], reference: &[f64], channels: usize) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// One launch on explicit ranges, drained.
 fn run_ranges(rig: &Rig, shape: ConvShape, ranges: [DeviceRange<'_>; 4]) -> Result<(), EngError> {
     let [proj, weights, state, out] = ranges;
     let call = ConvCall {
@@ -173,7 +163,6 @@ fn run_ranges(rig: &Rig, shape: ConvShape, ranges: [DeviceRange<'_>; 4]) -> Resu
     result
 }
 
-/// One launch on whole `Padded` buffers; returns `out`. `proj` is checked unchanged.
 fn run_padded(rig: &Rig, shape: ConvShape, bufs: [&Padded; 4], proj_host: &[f32]) -> Vec<f32> {
     let [proj, w, state, out] = bufs;
     let ranges = [proj.all(), w.all(), state.all(), out.all()];
@@ -201,7 +190,6 @@ fn case(rng: &mut Rng, (channels, ld, m): (usize, usize, usize), sd: f64) -> Cas
     }
 }
 
-/// Runs `c` once from its start state; returns `(out, state)`.
 fn run_case(rig: &Rig, c: &Case) -> (Vec<f32>, Vec<f32>) {
     let ctx = &rig.ctx;
     let (proj, w) = (
@@ -259,7 +247,6 @@ fn masked(layer: usize, decode_row: usize) -> bool {
         .any(|&(l, first, last)| l == layer && (first..=last).contains(&decode_row))
 }
 
-/// The dump rows of `name` for `phase`: `(rows of width)`.
 fn dump(dir: &Path, phase: &str, name: &str, layer: usize, width: usize) -> Vec<Vec<f32>> {
     let path = dir
         .join("cpu/dump/P4/dumps")
@@ -300,7 +287,6 @@ fn load_dumps(dir: &Path, phase: &str, layer: usize) -> Dumps {
     }
 }
 
-/// The kernel row widened to f64, then normalized and compared as `row_error` does.
 fn device_row_error(out_row: &[f32], d: &Dumps, row: usize) -> f64 {
     let wide: Vec<f64> = out_row.iter().map(|x| f64::from(*x)).collect();
     row_error(&wide, &d.q[row], &d.k[row], &d.v[row])
@@ -514,8 +500,6 @@ const W: usize = 1;
 const STATE: usize = 2;
 const OUT: usize = 3;
 
-/// A refusal case: the geometry, the byte size and the extra offset of each range, and what to
-/// share or take from the other context. Every case is one change from `Plan::base()`.
 struct Plan {
     shape: ConvShape,
     bytes: [usize; 4],
@@ -526,7 +510,6 @@ struct Plan {
 }
 
 impl Plan {
-    /// A valid call with `m >= 2` and `ld > channels`, every range exactly sized.
     fn base() -> Self {
         let mut plan = Self {
             shape: ConvShape {
@@ -649,8 +632,6 @@ fn refusals() -> Vec<Row> {
     ]
 }
 
-/// Runs a plan on zero-filled buffers; returns the result and the hash of every buffer before
-/// and after.
 /// What one launch attempt gives back: the call's result, the result of draining the stream
 /// (asserted by the caller after the row's own checks, so a mutant dies on its own assertion), and
 /// the hash of every buffer before and after.
@@ -782,7 +763,6 @@ fn conv_rejects_bad_calls_before_any_launch() {
     }
 }
 
-/// Calls at the exact boundary of every rule: all accepted and equal to the reference.
 #[test]
 fn conv_accepts_the_exact_sizes() {
     if !testkit::device_present("conv_accepts_the_exact_sizes") {
@@ -798,7 +778,6 @@ fn conv_accepts_the_exact_sizes() {
         assert!(error <= E1, "{label}: {error:e}");
         assert_eq!(bits(state), bits(&last), "{label}: state");
     };
-    // Exact sizes (ld > channels, m > 1) and proj, state and out at byte offset 4.
     let (out, state) = run_case(&rig, &c);
     check("exact sizes", &out, &state, &c);
     let (proj, w) = (

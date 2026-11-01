@@ -1,6 +1,3 @@
-//! First device-buffer drop after an unmapped real CUDA fault: the drop latches the backend
-//! terminal and keeps the allocation.
-
 use super::{
     CHILD_ENV, CUDA_ERROR_ILLEGAL_ADDRESS, CudaContext, DispatchGuard, EngError, Ordering,
     TERMINAL, assert_child_finishes, device_present, native,

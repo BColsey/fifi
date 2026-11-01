@@ -17,17 +17,14 @@
 use crate::EngError;
 use crate::tokenizer::TokenizerBundle;
 
-/// The pinned rewriting instruction.
 pub(crate) const INSTRUCTION: &str = "Rewrite the text below so it reads like a person wrote it, not a language model.\n\nReorganize it as you see fit. Vary sentence length on purpose. Cut hedging,\nthroat-clearing, and any sentence that only announces what comes next.\nPrefer the concrete word over the abstract one. It is fine to sound uneven.\n\nEvery fact, number, unit, date, name and quotation must survive unchanged.";
 
-/// The pinned separator between the draft and the continuation point.
 pub(crate) const SEPARATOR: &str = "\n\n### Rewritten:\n\n";
 
 /// The literal text of the beginning-of-sequence token in the pinned tokenizer.
 pub(crate) const BOS_TEXT: &str = "<bos>";
 
-/// Renders the pinned prompt for one draft: instruction, blank line, the stripped
-/// draft, then the separator. History and system messages do not enter this prompt.
+/// History and system messages do not enter this prompt.
 pub(crate) fn render(draft: &str) -> String {
     format!("{INSTRUCTION}\n\n{}{SEPARATOR}", draft.trim())
 }
@@ -153,7 +150,6 @@ mod tests {
         TokenizerBundle::load(dir.path(), &pin).expect("load bundle")
     }
 
-    /// The pinned prompt texts of the five recorded drafts, with their drafts.
     fn pinned_prompts() -> Vec<(String, String)> {
         let doc = cases();
         let rows = doc["cases"].as_array().expect("cases");
@@ -166,7 +162,6 @@ mod tests {
             .collect()
     }
 
-    /// The ids that a character-level tokenizer gives `<bos>` plus `prompt`.
     fn bos_then_chars(chars: &BTreeMap<char, u32>, prompt: &str) -> Vec<u32> {
         let mut ids = vec![BOS_ID];
         ids.extend(prompt.chars().map(|c| chars[&c]));

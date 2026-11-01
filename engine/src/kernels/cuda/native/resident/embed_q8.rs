@@ -41,7 +41,6 @@ const _: () = assert!(
         && offset_of!(EmbedQ8ArgsRepr, k) == 32
 );
 
-/// One embed_q8 launch.
 pub(in crate::kernels::cuda) struct EmbedQ8Raw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) w: RawRange<'a>,
@@ -81,7 +80,6 @@ fn check_embed_q8(call: &EmbedQ8Raw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gather of call on stream.
 pub(in crate::kernels::cuda) fn embed_q8_launch(
     stream: &RawStream,
     call: &EmbedQ8Raw<'_>,

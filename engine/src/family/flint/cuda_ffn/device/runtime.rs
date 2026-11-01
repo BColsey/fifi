@@ -1016,10 +1016,6 @@ fn abort_report(
     pending: Option<(EngError, usize)>,
     threshold: usize,
 ) -> EngError {
-    // An abort keeps the original refusal unless the rings hold a fault
-    // that executed strictly before it (ordinal < threshold); a later or
-    // concurrent parked word is a consequence, not the cause, and the
-    // original keeps its provenance.
     match pending {
         Some((error, ordinal)) if ordinal < threshold => error,
         _ => original,

@@ -377,7 +377,6 @@ fn active_splits(count: usize, max_splits: usize, min_keys: usize) -> usize {
     count.div_ceil(chunk)
 }
 
-/// The launch plan on the 3090 (82 SMs) with no window.
 fn launch_plan(m: usize, kv_len: usize) -> CpfAttnPlan {
     cpf_attn_launch_plan(q36(m), kv_len, 0, CPF_ATTN_SM_COUNT).expect("the launch plan")
 }
@@ -528,7 +527,6 @@ const GROUP: usize = 8;
 /// fp16 quiet NaN: the content of every cache cell no token may read (re-added with test 8).
 const F16_NAN: u16 = 0x7e00;
 
-/// Host inputs of one call: q f32, the fp16 cache bits and the optional projection rows.
 struct Data {
     q: Vec<f32>,
     k: Vec<u16>,
@@ -705,7 +703,6 @@ impl Fx {
         })
     }
 
-    /// The call the slots describe, on this context.
     fn call(&self) -> Result<AttnPrefillCall<'_>, EngError> {
         let r = |i: usize| {
             let (index, offset, bytes) = self.slots[i];
@@ -737,7 +734,6 @@ impl Fx {
         })
     }
 
-    /// Queues the call and drains the stream when it was accepted.
     fn run(&self) -> Result<(), EngError> {
         self.ctx.attn_prefill(&self.stream, self.call()?)?;
         self.stream.synchronize()?;
@@ -813,7 +809,6 @@ impl Fx {
         })
     }
 
-    /// Rewrites the whole output and part buffers to their fill bytes.
     fn reset_outputs(&self) -> Result<(), EngError> {
         let out = vec![OUT_FILL; self.shape.m * self.shape.n_head * self.shape.head_dim * 4];
         let (index, offset, bytes) = self.base[PART];
@@ -2433,7 +2428,6 @@ fn north_star_rig(split: CpfAttnSplit) {
     /// Rows of the random block a debug fill repeats: prime, so a wrong key row is almost
     /// never a copy of the right one.
     const DEBUG_PERIOD: usize = 4_099;
-    /// What the spot check reads once every device owner is gone.
     struct NorthStar {
         values: Vec<f32>,
         q: Vec<f32>,
@@ -2574,7 +2568,7 @@ fn report_north_star(
     mut launch: impl FnMut() -> Result<(), EngError>,
 ) -> Result<(), EngError> {
     for _ in 0..2 {
-        launch()?; // the warm-ups
+        launch()?;
     }
     let mut samples = Vec::new();
     for _ in 0..11 {

@@ -38,8 +38,6 @@ pub const WAIT_MARGIN_MS: u64 = 1000;
 /// it is kept as asked, because the caller asked for it.
 pub const MIN_SERVER_TIMEOUT_MS: u64 = 100;
 
-/// The pair of deadlines the tiered step runs with, in milliseconds: the CPU
-/// server's own timeout and the device deadline of `tiered_wait_add`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
     /// The CPU server's own timeout in milliseconds; it fires at least
@@ -51,24 +49,18 @@ pub struct Timeouts {
     pub device_ms: u64,
 }
 
-/// Why a requested server timeout cannot be run with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The caller asked for a zero timeout; nothing can be waited for.
     ZeroTimeout,
     /// The assumed watchdog limit leaves less than `min_server_ms` of server
     /// timeout under it, so the in-graph wait is refused in favour of the
     /// fallback path. Carries the largest server timeout in milliseconds that
     /// would have fit.
     NoRoom {
-        /// The largest server timeout that fits under the assumed watchdog
-        /// limit, in milliseconds; smaller than `min_server_ms`.
         server_cap_ms: u64,
     },
 }
 
-/// Pure; the constants above are the limits.
-///
 /// WHY: attach-time code knows only the watchdog boolean and the requested
 /// server timeout, and this function turns them into the deadline pair without
 /// touching the device or the clock, so it can be reasoned about and tested on
@@ -77,15 +69,7 @@ pub fn clamp_timeouts(requested_server_ms: u64, watchdog_on: bool) -> Result<Tim
     clamp_with(Limits::DEFAULT, requested_server_ms, watchdog_on)
 }
 
-/// The same with explicit limits (so tests can reach `NoRoom`):
-/// `(assumed_watchdog_ms, watchdog_margin_ms, wait_margin_ms, min_server_ms)`
-/// packed as [`Limits`]. Semantics: a zero request is refused; with the watchdog
-/// off the request is kept and the device waits one `wait_margin_ms` longer;
-/// with the watchdog on both deadlines sit at least `watchdog_margin_ms` below
-/// `assumed_watchdog_ms` (saturating, so no limit combination can panic), the
-/// server timeout at most `server_cap = assumed - watchdog_margin -
-/// wait_margin`, and a request below `min_server_ms` is kept as asked rather
-/// than rounded up, because the caller asked for it.
+/// The same with explicit limits, so tests can reach `NoRoom`.
 pub(crate) fn clamp_with(
     limits: Limits,
     requested_server_ms: u64,
@@ -116,26 +100,15 @@ pub(crate) fn clamp_with(
     })
 }
 
-/// The explicit limits [`clamp_with`] runs with; [`Limits::DEFAULT`] is the set
-/// the engine ships with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
-    /// The assumed watchdog limit in milliseconds ([`ASSUMED_WATCHDOG_MS`]).
     pub assumed_watchdog_ms: u64,
-    /// The distance kept below it in milliseconds ([`WATCHDOG_MARGIN_MS`]).
     pub watchdog_margin_ms: u64,
-    /// The distance the device deadline sits beyond the server timeout in
-    /// milliseconds ([`WAIT_MARGIN_MS`]).
     pub wait_margin_ms: u64,
-    /// The smallest server-timeout cap in milliseconds ([`MIN_SERVER_TIMEOUT_MS`]): a watchdog cap below it
-    /// refuses the in-graph wait; a request below it is kept as asked.
     pub min_server_ms: u64,
 }
 
 impl Limits {
-    /// The shipped limits: the four module constants. WHY: one place ties the
-    /// defaults together, so `clamp_timeouts` and the tests read the same
-    /// numbers.
     pub const DEFAULT: Limits = Limits {
         assumed_watchdog_ms: ASSUMED_WATCHDOG_MS,
         watchdog_margin_ms: WATCHDOG_MARGIN_MS,
@@ -186,7 +159,6 @@ mod tests {
             assert_eq!(t.device_ms, 1_500, "device for {requested}");
             assert_eq!(t.device_ms, t.server_ms + WAIT_MARGIN_MS);
         }
-        // A request below the cap is kept as asked; only the cap rounds down.
         let t = clamp_timeouts(300, true).unwrap();
         assert_eq!(
             t,
@@ -247,7 +219,6 @@ mod tests {
                 "requested {requested}"
             );
         }
-        // Exactly min_server_ms of room is accepted, at the boundary.
         let exact = Limits {
             assumed_watchdog_ms: 1_600,
             watchdog_margin_ms: 500,

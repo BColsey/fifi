@@ -91,12 +91,8 @@ impl ChatTemplate {
 
     /// The pure polarity of a default-on switch that FAILS SAFE, kept as a
     /// test-only seam over the lifted `crate::tokenizer::env_allows_value`
-    /// (production reads go through `env_allows_default_on`): absent keeps
-    /// the new default (on); once the variable is set, only the explicit
-    /// enable words ("1", "true", "on" — trimmed, case-folded) keep the
-    /// feature on, and anything else — "0", "false", "no", "FALSE",
-    /// a typo, trailing whitespace, a CRLF — rolls back to the reviewed
-    /// pre-feature bytes. A rollback can never silently fail.
+    /// (production reads go through `env_allows_default_on`). The policy
+    /// lives on the lifted function.
     #[cfg(test)]
     pub(super) fn env_allows_value(value: Option<&str>) -> bool {
         super::env_allows_value(value)
@@ -135,11 +131,6 @@ impl ChatTemplate {
         self.notice_toolwrap = true;
     }
 
-    /// Reads the fail-safe default-on switch (lifted to
-    /// `crate::tokenizer::env_allows_default_on`): absent keeps the new
-    /// default; once set, only the explicit enable words ("1"/"true"/"on",
-    /// trimmed, case-folded) keep the feature on and everything else rolls
-    /// back. The documented rollback is `ENGINESRV_THINK_REPLAY=0`.
     fn env_allows(name: &str) -> bool {
         super::env_allows_default_on(name)
     }
@@ -153,8 +144,8 @@ impl ChatTemplate {
         self.render_with(msgs, tools, thinking, true)
     }
 
-    /// Renders the messages without the generation prompt. For a template that appends its
-    /// generation prompt, this is the text up to the last message boundary.
+    /// For a template that appends its generation prompt, this is the text up
+    /// to the last message boundary.
     pub fn render_without_generation_prompt(
         &self,
         msgs: &[PromptMessage],

@@ -27,7 +27,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
@@ -201,7 +200,6 @@ mod tests {
         kernels::{HostPages, MlxKernels},
     };
 
-    /// Hidden width of the fixture.
     const HIDDEN: usize = 64;
     /// The router of layer 0 in the fixture checkpoint.
     const ROUTER: &str = "language_model.model.layers.0.mlp.gate.weight";
@@ -230,7 +228,6 @@ mod tests {
     /// in F32.
     const TOKENS: [(f32, usize); 4] = [(0.0625, 0), (-0.0625, 1), (0.0, 2), (0.0625, 2)];
 
-    /// Input row of token `index`.
     fn token(index: usize) -> Vec<f32> {
         let (c, s) = TOKENS[index];
         (0..HIDDEN)
@@ -266,7 +263,6 @@ mod tests {
         ),
     ];
 
-    /// Checks the output row of token `index` against `ANCHORS` within 1e-4 relative.
     fn assert_anchor(row: &[f32], index: usize, what: &str) {
         assert_eq!(row.len(), HIDDEN, "{what}: width");
         let (first, total) = ANCHORS[index];
@@ -284,7 +280,6 @@ mod tests {
         );
     }
 
-    /// Loads the tied fixture.
     fn load(kernels: &mut MlxKernels) -> (StreamedCheckpoint, ResidentWeights) {
         let ckpt = checkpoint_from(tied_entries());
         let flash = FlashWeights::load(&ckpt, &config()).unwrap();
@@ -292,7 +287,6 @@ mod tests {
         (ckpt, weights)
     }
 
-    /// The rows of the tokens `indices` as one `[T, 64]` resident.
     fn chunk_input(kernels: &mut MlxKernels, indices: &[usize]) -> ExecutionTensor {
         let rows: Vec<f32> = indices.iter().flat_map(|&i| token(i)).collect();
         import_f32(
@@ -302,7 +296,6 @@ mod tests {
         )
     }
 
-    /// A prefill pool for the layers of `weights`.
     fn pool_for(
         ckpt: &StreamedCheckpoint,
         weights: &ResidentWeights,
@@ -313,8 +306,7 @@ mod tests {
         PrefillPool::new(ckpt, layers, set_experts, pairs).unwrap()
     }
 
-    /// Runs `step_chunk` on layer 0 for the tokens `indices` and reads the output back, so the
-    /// next call may release the set of this one.
+    /// Reads the output back, so the next call may release the set of this one.
     fn run_chunk(
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
@@ -340,7 +332,6 @@ mod tests {
         ExpertSlots::new(POOL_SETS, layout.end).unwrap()
     }
 
-    /// One decode MoE call of layer 0 on token `index`, read back.
     fn decode_row(
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
@@ -523,14 +514,12 @@ mod tests {
         );
     }
 
-    /// The config of the tied fixture with `num_experts_per_tok` set to `top_k`.
     fn config_with_top_k(top_k: u32) -> Vec<u8> {
         let mut value: serde_json::Value = serde_json::from_slice(&config()).unwrap();
         value["text_config"]["num_experts_per_tok"] = serde_json::json!(top_k);
         serde_json::to_vec(&value).unwrap()
     }
 
-    /// Loads the tied fixture with `top_k` choices per token.
     fn load_with_top_k(
         kernels: &mut MlxKernels,
         top_k: u32,

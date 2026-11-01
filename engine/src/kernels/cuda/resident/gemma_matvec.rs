@@ -17,7 +17,6 @@ pub(crate) struct GemmaMatvecCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the gemma matvec of call on stream, writing call.y.
     pub(crate) fn gemma_matvec(
         &self,
         stream: &DeviceStream,
@@ -28,7 +27,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| gemma_matvec_launch(stream_raw, &raw))
     }
 
-    /// Every check of a call, then the native view of its ranges.
     fn plan_gemma_matvec<'b>(
         &self,
         call: &GemmaMatvecCall<'b>,

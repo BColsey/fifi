@@ -49,7 +49,6 @@ use super::{
     checked, invalid_argument, pack_bytes,
 };
 
-// One `pub(in crate::kernels::cuda) mod <n>;` line per kernel child module, alphabetical.
 pub(in crate::kernels::cuda) mod add_norm_pack;
 pub(in crate::kernels::cuda) mod add_rmsnorm_q8;
 pub(in crate::kernels::cuda) mod attn_decode;
@@ -89,24 +88,20 @@ pub(in crate::kernels::cuda) mod swiglu_q8;
 pub(in crate::kernels::cuda) mod tiered_classify;
 pub(in crate::kernels::cuda) mod tiered_wait_add;
 
-/// A non-blocking CUDA stream. Consumed by [`stream_destroy`].
 #[derive(Debug)]
 #[must_use = "a stream must be passed to stream_destroy"]
 pub(in crate::kernels::cuda) struct RawStream(NonNull<c_void>);
 
 impl RawStream {
-    /// The raw handle, for the launch entries of the kernel child modules.
     pub(in crate::kernels::cuda) fn as_ptr(&self) -> *mut c_void {
         self.0.as_ptr()
     }
 }
 
-/// A timing-free CUDA event. Consumed by [`event_destroy`].
 #[derive(Debug)]
 #[must_use = "an event must be passed to event_destroy"]
 pub(in crate::kernels::cuda) struct RawEvent(NonNull<c_void>);
 
-/// Page-locked host memory of `bytes` bytes. Consumed by [`pinned_free`].
 #[derive(Debug)]
 #[must_use = "pinned memory must be passed to pinned_free"]
 pub(in crate::kernels::cuda) struct RawPinned {
@@ -114,7 +109,6 @@ pub(in crate::kernels::cuda) struct RawPinned {
     bytes: usize,
 }
 
-/// `bytes` bytes of a live device allocation from `offset` on.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::kernels::cuda) struct RawRange<'a> {
     device: &'a RawDevice,
@@ -123,7 +117,6 @@ pub(in crate::kernels::cuda) struct RawRange<'a> {
 }
 
 impl<'a> RawRange<'a> {
-    /// The range, or `None` when it is empty or ends past the allocation.
     pub(in crate::kernels::cuda) fn new(
         device: &'a RawDevice,
         offset: usize,
@@ -145,12 +138,10 @@ impl RawRange<'_> {
         self.offset
     }
 
-    /// The length of the range in bytes.
     pub(in crate::kernels::cuda) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The device address of the first byte of the range.
     pub(in crate::kernels::cuda) fn address(&self) -> *mut c_void {
         // SAFETY: `RawRange::new` proved `offset + bytes <= device.bytes` with
         // `bytes > 0`, so the offset is inside the live allocation.
@@ -267,7 +258,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Creates a non-blocking stream.
 pub(in crate::kernels::cuda) fn stream_create() -> Result<RawStream, DeviceFailure> {
     let mut handle: *mut c_void = std::ptr::null_mut();
     let mut stage = STAGE_NONE;
@@ -290,7 +280,6 @@ pub(in crate::kernels::cuda) fn stream_destroy(stream: RawStream) -> Result<(), 
     checked(status, stage)
 }
 
-/// Blocks until all work queued on the stream has finished.
 pub(in crate::kernels::cuda) fn stream_synchronize(
     stream: &RawStream,
 ) -> Result<(), DeviceFailure> {
@@ -301,7 +290,6 @@ pub(in crate::kernels::cuda) fn stream_synchronize(
     checked(status, stage)
 }
 
-/// Creates an event with timing disabled.
 pub(in crate::kernels::cuda) fn event_create() -> Result<RawEvent, DeviceFailure> {
     let mut handle: *mut c_void = std::ptr::null_mut();
     let mut stage = STAGE_NONE;
@@ -314,7 +302,6 @@ pub(in crate::kernels::cuda) fn event_create() -> Result<RawEvent, DeviceFailure
         .ok_or_else(invalid_argument)
 }
 
-/// Destroys the event without waiting for it.
 pub(in crate::kernels::cuda) fn event_destroy(event: RawEvent) -> Result<(), DeviceFailure> {
     let mut stage = STAGE_NONE;
     // SAFETY: `event` came from `event_create` and is consumed here, so it is
@@ -324,7 +311,6 @@ pub(in crate::kernels::cuda) fn event_destroy(event: RawEvent) -> Result<(), Dev
     checked(status, stage)
 }
 
-/// Records the event on the stream after the work queued so far.
 pub(in crate::kernels::cuda) fn event_record(
     event: &RawEvent,
     stream: &RawStream,
@@ -378,7 +364,6 @@ pub(in crate::kernels::cuda) fn event_elapsed_ms(
     Ok(ms)
 }
 
-/// Makes the work queued later on `stream` wait for the last record of `event`.
 pub(in crate::kernels::cuda) fn stream_wait_event(
     stream: &RawStream,
     event: &RawEvent,
@@ -390,7 +375,6 @@ pub(in crate::kernels::cuda) fn stream_wait_event(
     checked(status, stage)
 }
 
-/// Blocks the host until the last record of `event` has completed.
 pub(in crate::kernels::cuda) fn event_synchronize(event: &RawEvent) -> Result<(), DeviceFailure> {
     let mut stage = STAGE_NONE;
     // SAFETY: `event` is a live handle for the whole call; `stage` is a live,
@@ -399,7 +383,7 @@ pub(in crate::kernels::cuda) fn event_synchronize(event: &RawEvent) -> Result<()
     checked(status, stage)
 }
 
-/// Allocates `bytes` of page-locked host memory. The adapter rejects 0 bytes.
+/// The adapter rejects a 0-byte request.
 pub(in crate::kernels::cuda) fn pinned_alloc(bytes: usize) -> Result<RawPinned, DeviceFailure> {
     if bytes == 0 {
         return Err(invalid_argument());
@@ -508,7 +492,6 @@ pub(in crate::kernels::cuda) fn copy_h2d_async_at(
     checked(status, stage)
 }
 
-/// Queues equal ranges from distinct device allocations on the explicit stream.
 pub(in crate::kernels::cuda) fn copy_d2d_async(
     source: RawRange<'_>,
     destination: RawRange<'_>,
@@ -757,7 +740,6 @@ pub(in crate::kernels::cuda) struct Span<'a> {
 }
 
 impl<'a> Span<'a> {
-    /// The span of the first `len` bytes of `range`.
     pub(in crate::kernels::cuda) fn of(range: &RawRange<'a>, len: usize) -> Self {
         Self {
             device: range.device,
@@ -775,9 +757,6 @@ impl<'a> Span<'a> {
     }
 }
 
-/// Proves a pack launch before the native call: shape, sizes, alignment (x 4,
-/// xf 16) and that `xf`, which the launch writes, does not overlap `x`. Returns
-/// `(m, k)` for the call.
 fn check_pack(call: &PackRaw<'_>) -> Result<(c_int, c_int), DeviceFailure> {
     let shape = (1..=MAX_DIM).contains(&call.m)
         && (1..=MAX_DIM).contains(&call.k)
@@ -798,10 +777,6 @@ fn check_pack(call: &PackRaw<'_>) -> Result<(c_int, c_int), DeviceFailure> {
     Ok((m, k))
 }
 
-/// Proves a matmul launch before the native call: shape, sizes, the weight tiles
-/// inside their allocation, alignment (weight 16, xf 16, y 4) and that `y`, which
-/// the launch writes, overlaps neither the weight nor `xf`. Returns
-/// `(m, n_rows, k)` for the call; `ldy` is `n_rows`.
 fn check_matmul(call: &MatmulRaw<'_>) -> Result<(c_int, c_int, c_int), DeviceFailure> {
     let (n_rows, k) = call.tiled.native_dims().ok_or_else(invalid_argument)?;
     if !(1..=MAX_DIM).contains(&call.m) {
@@ -836,7 +811,7 @@ fn check_matmul(call: &MatmulRaw<'_>) -> Result<(c_int, c_int, c_int), DeviceFai
 }
 
 /// Queues the pack of `x` into `xf` on `stream`: the zeroing of the whole `xf`
-/// when `m` is at most 16, then the pack kernel. Returns when both are queued.
+/// when `m` is at most 16, then the pack kernel.
 pub(in crate::kernels::cuda) fn pack_launch(
     stream: &RawStream,
     call: &PackRaw<'_>,
@@ -862,7 +837,7 @@ pub(in crate::kernels::cuda) fn pack_launch(
 }
 
 /// Queues the tiled matmul of `call` on `stream`: the split-K zeroing of `y` when
-/// the shape splits, then the kernel. Returns when both are queued.
+/// the shape splits, then the kernel.
 pub(in crate::kernels::cuda) fn matmul_launch(
     stream: &RawStream,
     call: &MatmulRaw<'_>,
@@ -950,7 +925,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one rows attention preparation reads and writes; `ints.rows` is the plane cell count.
+/// `ints.rows` is the plane cell count, not the rows-buffer row count.
 pub(in crate::kernels::cuda) struct AttnPrepRowsRaw<'a> {
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
     pub(in crate::kernels::cuda) q_norm: RawRange<'a>,
@@ -965,10 +940,7 @@ pub(in crate::kernels::cuda) struct AttnPrepRowsRaw<'a> {
     pub(in crate::kernels::cuda) rope_base: f32,
 }
 
-/// Proves a rows launch before the native call: sizes and alignment of the eight ranges (`q` and
-/// both rows buffers 16, the rest 4) and that the written extents (`q`, both rows buffers,
-/// `status`) share no byte with each other or with the reads. `cells` sizes nothing: the rows
-/// buffers hold `m` rows, not `cells`.
+/// `ints.rows` sizes nothing here: the rows buffers hold `m` rows, not plane cells.
 fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
     let cvt = |n: c_int| usize::try_from(n).map_err(|_| invalid_argument());
     let (m, ld) = (cvt(io.ints.m)?, cvt(io.ints.ld)?);
@@ -1017,7 +989,7 @@ fn check_attn_prep_rows(io: &AttnPrepRowsRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the f32 rows attention preparation kernel on `stream`: per-head RMSNorm of q and k,
-/// rope at the device position, the `q` output and the k/v f32 rows at `[t]`. Returns when queued.
+/// rope at the device position, the `q` output and the k/v f32 rows at `[t]`.
 pub(in crate::kernels::cuda) fn attn_prep_rows_launch(
     stream: &RawStream,
     call: AttnPrepRowsRaw<'_>,
@@ -1270,7 +1242,6 @@ mod tests {
         }
     }
 
-    /// Where the weight, xf and y ranges of a matmul fixture live.
     #[derive(Clone, Copy)]
     enum Layout {
         Apart,

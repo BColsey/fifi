@@ -67,7 +67,6 @@ pub(crate) struct DeviceEvent {
 }
 
 impl CudaContext {
-    /// Creates a non-blocking stream.
     pub(crate) fn stream(&self) -> Result<DeviceStream, EngError> {
         self.ensure_usable()?;
         ensure_closed("a stream creation")?;
@@ -88,7 +87,6 @@ impl CudaContext {
         })
     }
 
-    /// Creates an event with timing disabled.
     pub(crate) fn event(&self) -> Result<DeviceEvent, EngError> {
         self.ensure_usable()?;
         ensure_closed("an event creation")?;
@@ -185,7 +183,6 @@ impl DeviceStream {
             .ok_or_else(|| EngError::BadRequest("the CUDA stream was already destroyed".to_owned()))
     }
 
-    /// The lease of the adapter that made the stream.
     pub(super) fn lease(&self) -> &Rc<Lease> {
         &self.lease
     }
@@ -235,7 +232,6 @@ impl DeviceEvent {
         self.mark.get()
     }
 
-    /// The lease of the adapter that made the event.
     pub(super) fn lease(&self) -> &Rc<Lease> {
         &self.lease
     }

@@ -17,14 +17,12 @@ use crate::tensor::Dtype;
 /// The cache-key tag of the DeltaNet decode closure: the initial state of the mix, distinct from
 /// every other block tag, so a DeltaNet key and a MoE key never collide for equal field values.
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
-/// The cache-key tag of the device-routed MoE decode closure.
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
-/// The cache-key tag of the compiled Flint decode-tail closure.
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
 
-/// The cache-key discriminant of a dtype: the activation dtype and the scale dtype of every
-/// packed weight are part of the compile cache key, so the F32 and BF16 decoders never read each
-/// other's trace. Every dtype is its own key word.
+/// The activation dtype and the scale dtype of every packed weight are part of the compile
+/// cache key, so the F32 and BF16 decoders never read each other's trace. Every dtype is its
+/// own key word.
 pub(crate) fn dtype_key(dtype: Dtype) -> u64 {
     match dtype {
         Dtype::F32 => 0,
@@ -103,7 +101,6 @@ pub(crate) fn checked_delta_dims(dims: [u32; 6]) -> Result<[u32; 8], EngError> {
 /// mix order; every field is a baked constant of the closure body in `guard.cpp`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeltaBaked {
-    /// The hidden width `H`.
     pub(crate) hidden: u32,
     /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw): every
     /// dimension of the native seam's `dims`, as checked by [`checked_delta_dims`].
@@ -120,20 +117,15 @@ pub(crate) struct DeltaBaked {
     pub(crate) quant: [[i32; 3]; 5],
 }
 
-/// The baked constants of one compiled device-routed MoE decode step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MoeBaked {
-    /// The hidden width `H`.
     pub(crate) hidden: u32,
-    /// The expert count `E`.
     pub(crate) experts: u32,
-    /// The routing width `k`.
     pub(crate) top_k: u32,
     /// 1 when the gates renormalize over the selection, 0 otherwise.
     pub(crate) renorm: u32,
     /// The clamp bound of the expert ids, `experts - 1`: the ONE `mlx_minimum` clamp per layer.
     pub(crate) clamp: u32,
-    /// The activation dtype key of the step (`dtype_key`).
     pub(crate) act: u64,
     /// The scale dtype key of EACH packed weight, in the seam's weight order shared gate, up,
     /// down, then the gate, up, down expert stacks.
@@ -142,7 +134,6 @@ pub(crate) struct MoeBaked {
     pub(crate) quant: [[i32; 3]; 6],
 }
 
-/// The cache key of one compiled DeltaNet decode step: the FNV mix of every baked constant.
 pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
@@ -177,7 +168,6 @@ pub(crate) struct FlintTailBaked {
     pub(crate) quant: [[i32; 3]; 3],
 }
 
-/// The cache key of one compiled Flint decode tail: the FNV mix of every baked constant.
 pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
     let mut parts = Vec::with_capacity(16);
     parts.push(u64::from(baked.rows));
@@ -191,8 +181,6 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
     mix_fun_id(FLINT_TAIL_TAG, &parts)
 }
 
-/// The cache key of one compiled device-routed MoE decode step: the FNV mix of every baked
-/// constant.
 pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
@@ -225,9 +213,6 @@ pub(crate) struct ProgramRegistry {
 }
 
 impl ProgramRegistry {
-    /// Admits `id`. `Ok(true)` when this is the first call with this id (a new compiled
-    /// program), `Ok(false)` when the id is already registered, and `BadRequest` when the id is
-    /// new and this adapter already holds `PROGRAM_LIMIT` distinct programs.
     pub(crate) fn admit(&mut self, id: u64) -> Result<bool, EngError> {
         if self.seen.contains(&id) {
             return Ok(false);
@@ -308,7 +293,6 @@ mod tests {
     /// The row count of the delta table below: one row per scalar field, per dimension, per
     /// scale key, and per quantization value.
     const DELTA_ROWS: usize = 1 + 8 + 1 + 1 + 5 + 5 * 3;
-    /// The row count of the MoE table below.
     const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
     /// The row count of the Flint tail table below: one row per scalar field, per scale
     /// key, and per quantization value.
@@ -704,15 +688,11 @@ mod tests {
                 "the refusal names {want}: {message}"
             );
         };
-        // An input dimension beyond i32.
         refuse([16, 1 << 31, 1, 1, 4, 1], "kd exceeds i32");
-        // vh * vd beyond i32.
         refuse([1, 1, 1 << 16, 1 << 16, 4, 1], "vh * vd exceeds i32");
-        // kh * kd beyond i32.
         refuse([1 << 16, 1 << 16, 1, 1, 4, 1], "kw exceeds i32");
         // 2 * kw beyond i32 (kh * kd = 2^30, so kw2 = 2^31).
         refuse([1 << 15, 1 << 15, 1, 1, 4, 1], "kw2 exceeds i32");
-        // The fused-projection identity must hold exactly.
         refuse([1, 32, 2, 32, 129, 3], "must equal 2 * kw + vh * vd");
         refuse([1, 32, 2, 32, 127, 3], "must equal 2 * kw + vh * vd");
     }

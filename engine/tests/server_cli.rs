@@ -52,7 +52,6 @@ fn command(args: &[&str], key: Option<&str>) -> Command {
     command
 }
 
-/// Waits up to ten seconds for the child to exit. When the time is up, it kills the child.
 fn wait_for_exit(child: &mut Child) -> Option<ExitStatus> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

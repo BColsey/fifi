@@ -27,11 +27,6 @@ pub(super) struct ExpertShape {
     pub(super) k: usize,
 }
 
-/// Expected stored shapes for one layer's routed and shared experts.
-///
-/// Gate and up read the hidden width and produce the intermediate width; down
-/// reads the intermediate width and produces the hidden width. The router is
-/// one row per expert of the hidden width.
 pub(super) fn expert_shapes(moe: &MoeDims) -> ExpertPlan {
     let (hidden, inter, shared_inter) = (moe.hidden, moe.inter, moe.shared_inter);
     ExpertPlan {
@@ -64,7 +59,6 @@ pub(super) fn expert_shapes(moe: &MoeDims) -> ExpertPlan {
     }
 }
 
-/// The full set of shapes a layer's MoE block must match.
 pub(super) struct ExpertPlan {
     pub(super) gate: ExpertShape,
     pub(super) up: ExpertShape,
@@ -76,8 +70,6 @@ pub(super) struct ExpertPlan {
     pub(super) router_k: usize,
 }
 
-/// Refuse a source config whose MoE fields disagree with the loaded dims.
-///
 /// `model_config` is the checkpoint's config.json bytes; the MoE fields live
 /// under `text_config`, matching the attention source's contract.
 pub(super) fn check_moe_source_geometry(
@@ -124,14 +116,11 @@ pub(super) fn check_moe_source_geometry(
     Ok(())
 }
 
-/// A stored matrix's shape as `(rows, k)`, for checks against [`ExpertPlan`].
 #[cfg(test)]
 pub(super) fn stored_shape(rows: usize, k: usize) -> (usize, usize) {
     (rows, k)
 }
 
-/// The router, the shared gate, the three expert banks and the shared expert of `layer`, under
-/// the logical names of `table`.
 pub(super) fn moe_weights(
     reader: &PackReader<'_>,
     table: &LayerTable,

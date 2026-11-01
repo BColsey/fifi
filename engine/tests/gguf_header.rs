@@ -1,4 +1,3 @@
-//! Behavior tests for the GGUF header and tensor table reader.
 //! Fixtures are generated here from the GGUF v3 layout. No tensor payload is parsed.
 
 use inference_engine::{
@@ -113,7 +112,6 @@ impl Gguf {
         self.tensors.push(entry);
         self
     }
-    /// Header bytes only, with no padding and no payload.
     fn header(&self) -> Vec<u8> {
         let mut out = self.magic.to_vec();
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -132,7 +130,6 @@ impl Gguf {
         }
         out
     }
-    /// Header, zero padding to `align`, then `payload` zero bytes.
     fn file(&self, align: usize, payload: usize) -> Vec<u8> {
         let mut out = self.header();
         out.resize(out.len().div_ceil(align) * align, 0);
@@ -144,7 +141,6 @@ impl Gguf {
 fn parse(bytes: &[u8]) -> Result<GgufHeader, EngError> {
     GgufHeader::from_bytes(bytes, bytes.len() as u64, LIMIT)
 }
-/// Asserts a `Checkpoint` error whose message contains `expect`.
 fn assert_checkpoint(result: Result<GgufHeader, EngError>, expect: &str) {
     match result {
         Err(EngError::Checkpoint(message)) => assert!(
@@ -317,14 +313,12 @@ fn every_truncation_of_the_header_fails() {
     let file = g.file(32, 64);
     let header_len = g.header().len();
     for cut in 0..header_len {
-        // The prefix is short, but the file length claims the full file.
         let r = GgufHeader::from_bytes(&file[..cut], file.len() as u64, LIMIT);
         match r {
             Err(EngError::Checkpoint(m)) => assert!(m.contains("truncated"), "cut {cut}: {m}"),
             other => panic!("cut {cut}: {other:?}"),
         }
     }
-    // A file length below the header length also fails.
     assert_checkpoint(
         GgufHeader::from_bytes(&file, (header_len - 1) as u64, LIMIT),
         "truncated: header exceeds the file length",
@@ -351,7 +345,6 @@ fn header_limit_is_enforced() {
         GgufHeader::from_bytes(&file, file.len() as u64, len - 1),
         "header exceeds the header byte limit",
     );
-    // A string that crosses the limit fails at its length check.
     let g = Gguf::new().kv(kv_str("general.architecture", "test"));
     let file = g.file(32, 0);
     let len = g.header().len() as u64;
@@ -376,7 +369,6 @@ fn huge_counts_fail_before_allocation() {
 
 #[test]
 fn overlong_strings_are_rejected() {
-    // Declared length far above the limit, with no bytes behind it.
     let mut bad = u64::MAX.to_le_bytes().to_vec();
     bad.extend_from_slice(b"k");
     let mut entry = bad.clone();
@@ -489,7 +481,6 @@ fn every_metadata_value_type_parses() {
 
 #[test]
 fn arrays_and_nested_arrays_parse_and_record_their_extent() {
-    // Array of u32, array of strings, empty array, array of arrays of u16.
     let a_u32 = kv(
         "a.u32",
         9,
@@ -563,7 +554,6 @@ fn bad_metadata_values_are_rejected() {
         parse(&Gguf::new().kv(kv("k", 7, &[2])).file(32, 0)),
         "boolean value 2",
     );
-    // Array length larger than the bytes that can follow.
     let a = kv(
         "a",
         9,
@@ -582,7 +572,6 @@ fn bad_metadata_values_are_rejected() {
         parse(&Gguf::new().kv(a).file(32, 0)),
         "array length exceeds",
     );
-    // Unknown element type inside an array.
     let a = kv(
         "a",
         9,
@@ -592,7 +581,6 @@ fn bad_metadata_values_are_rejected() {
         parse(&Gguf::new().kv(a).file(32, 0)),
         "unknown array element type 77",
     );
-    // Bool array with an invalid element.
     let a = kv(
         "a",
         9,
@@ -602,7 +590,6 @@ fn bad_metadata_values_are_rejected() {
         parse(&Gguf::new().kv(a).file(32, 0)),
         "boolean array element",
     );
-    // Empty key.
     assert_checkpoint(
         parse(&Gguf::new().kv(kv_u32("", 1)).file(32, 0)),
         "metadata key is empty",
@@ -908,7 +895,6 @@ fn header_hash_covers_exactly_the_header_bytes() {
     assert_checkpoint_unit(h.check_header_sha256(&"g".repeat(64)), "64 hex digits");
 }
 
-/// Asserts a `Checkpoint` error whose message contains `expect`.
 fn assert_checkpoint_unit(r: Result<(), EngError>, expect: &str) {
     match r {
         Err(EngError::Checkpoint(message)) => assert!(
@@ -1042,7 +1028,6 @@ fn split_numbers_accept_every_integer_type() {
             "types {count_ty} {no_ty}"
         );
     }
-    // Negative values of each signed type are rejected by name.
     for (ty, bytes) in [
         (1u32, (-1i8).to_le_bytes().to_vec()),
         (3, (-1i16).to_le_bytes().to_vec()),

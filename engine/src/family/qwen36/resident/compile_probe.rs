@@ -53,7 +53,6 @@ fn lcg_values(seed: u64, count: usize, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Asserts that two readbacks hold exactly equal f32 bit patterns, element by element.
 fn assert_bits(actual: &[f32], expected: &[f32], what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length");
     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -119,7 +118,6 @@ fn gated_delta_traces_under_compile() {
         panic!("the import returned {} tensors", imported.len());
     };
     assert_eq!(rq.dtype(), Dtype::F32, "probe operand dtype");
-    // The uncompiled reference.
     let plain = kernels.gated_delta(rq, rk, rv, rg, rbeta, rstate).unwrap();
     kernels.evaluate(&[&plain.y, &plain.state]).unwrap();
     let plain_y = values(&mut kernels, &plain.y).unwrap();

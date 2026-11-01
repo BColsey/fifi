@@ -35,15 +35,11 @@ button, select, input, textarea {
   border-radius: 4px;
 }
 
-/* App frame */
-
 .app {
   display: grid;
   grid-template-columns: 260px 1fr;
   height: 100%;
 }
-
-/* Sidebar */
 
 .sidebar {
   display: flex;
@@ -187,8 +183,6 @@ button, select, input, textarea {
   padding: var(--fifi-space-2) 0;
 }
 
-/* Content column */
-
 .content {
   display: flex;
   flex-direction: column;
@@ -237,8 +231,6 @@ button, select, input, textarea {
   background: var(--fifi-content-bg);
 }
 
-/* Status pill */
-
 .pill {
   display: inline-flex;
   align-items: center;
@@ -260,15 +252,11 @@ button, select, input, textarea {
 .pill-error .dot { background: var(--fifi-error); }
 .pill-offline .dot { background: var(--fifi-offline); }
 
-/* Views */
-
 .main { position: relative; flex: 1; min-height: 0; display: flex; }
 
 .view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 
 .view[hidden] { display: none; }
-
-/* Chat */
 
 .view-chat { padding: 0; }
 
@@ -402,8 +390,6 @@ button, select, input, textarea {
   background: var(--fifi-text-tertiary);
 }
 
-/* Composer */
-
 .composer-wrap {
   padding: var(--fifi-space-2) var(--fifi-space-4) var(--fifi-space-4);
   background: var(--fifi-content-bg);
@@ -463,8 +449,6 @@ button, select, input, textarea {
   font-size: var(--fifi-size-1);
   color: var(--fifi-text-tertiary);
 }
-
-/* Monitor and About */
 
 .panel-scroll {
   flex: 1;
@@ -638,8 +622,6 @@ button, select, input, textarea {
   font-size: var(--fifi-size-2);
 }
 
-/* Storage-failure notices */
-
 .notice-host {
   position: fixed;
   left: 50%;
@@ -675,8 +657,6 @@ button, select, input, textarea {
   background: var(--fifi-content-bg);
   cursor: pointer;
 }
-
-/* Drawer */
 
 .drawer-backdrop {
   position: fixed;

@@ -243,7 +243,6 @@ fn the_pair_check_precedes_the_decision() {
 #[test]
 fn a_layout_mismatch_is_refused_before_any_context_work() {
     use crate::family::project::cuda::WeightLayout;
-    // The pure refusal: the options must agree with the loaded weights.
     assert!(super::step::agree_layout(WeightLayout::Native, WeightLayout::Native).is_ok());
     assert!(super::step::agree_layout(WeightLayout::Tiled, WeightLayout::Tiled).is_ok());
     for (weights, options) in [

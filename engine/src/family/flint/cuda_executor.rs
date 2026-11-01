@@ -118,7 +118,7 @@ pub(super) struct FlintExecutor {
     options: FlintOptions,
 }
 
-/// Expert-bank copies of one request, by phase; a bank that holds every expert has none.
+/// Expert-bank copies of one request, by phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BankTally {
     prefill_misses: u64,
@@ -127,7 +127,6 @@ struct BankTally {
     bytes: u64,
 }
 
-/// What one call added to the bank counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BankDelta {
     misses: u64,
@@ -148,7 +147,6 @@ impl BankDelta {
 }
 
 impl BankTally {
-    /// A new request starts from nothing, whatever the one before did or did not finish.
     fn begin(&mut self) {
         *self = Self::default();
     }
@@ -158,8 +156,7 @@ impl BankTally {
         self.bytes += delta.bytes;
     }
 
-    /// Adds one decode call. When it `finished` the request on a bank (`slots` is the bank's
-    /// resident count) the request's line comes back and the tally clears.
+    /// `slots` is the bank's resident count when the request runs on a bank.
     fn decoded(
         &mut self,
         delta: BankDelta,
@@ -200,7 +197,6 @@ struct Step<'a> {
 }
 
 impl Step<'_> {
-    /// The token-major walk: `rows`-token chunks, or single tokens at one row.
     fn feed_token_major(&mut self, tokens: &[u32], rows: usize) -> Result<()> {
         if rows == 1 {
             for &token in tokens {
@@ -230,9 +226,6 @@ impl TokenStepper for Step<'_> {
         let Some(piece_rows) = self.executor.layer_major else {
             return self.feed_token_major(tokens, rows);
         };
-        // Armed: a stretch taller than one narrow block is regrouped, one
-        // piece at a time; a stretch that fits a block has nothing to
-        // regroup and takes the token-major walk unchanged.
         for piece in tokens.chunks(piece_rows) {
             if piece.len() > rows {
                 // A jobs pass runs the whole piece as one block; the tile pass keeps narrow ones.
@@ -312,7 +305,6 @@ fn reserve_with(
     })
 }
 
-/// The startup note of a load that keeps part of the experts in host memory, and why.
 fn bank_note(context: u32, slots: usize, reason: &str) -> String {
     let why = match reason {
         "auto" => format!("context {context} does not fit with every expert on the GPU"),
@@ -396,7 +388,6 @@ fn resident_advice(
     })
 }
 
-/// Adds the advice of [`resident_advice`] to a refused load.
 fn explain_refusal(
     error: EngError,
     root: &Path,
@@ -420,10 +411,8 @@ fn explain_refusal(
     }
 }
 
-/// Working-memory ceiling of the layer-major mode: the declared demand of KV,
-/// shared work, layer staging, and headroom must stay inside a 21 GiB lease
-/// (21,504 MiB). Passed as a parameter so the admission tests can exercise
-/// the boundary without a device.
+/// `ceiling_bytes` is a parameter, not the const, so the admission tests can
+/// exercise the boundary without a device.
 fn layer_major_admission(
     switch: &str,
     kv_cache: u64,
@@ -464,8 +453,8 @@ fn prefill_hint(layer_major: Option<usize>, chunk: usize) -> usize {
     layer_major.unwrap_or(chunk)
 }
 
-/// Rows of one layer-major piece for a session of `context_rows`: as tall as
-/// the router and the pair gathers admit, never taller than the context.
+/// Rows of one layer-major piece: as tall as the router and the pair gathers
+/// admit.
 fn layer_major_piece_rows(context_rows: usize) -> usize {
     LAYER_MAJOR_PIECE_ROWS.min(context_rows)
 }
@@ -613,7 +602,7 @@ impl FlintExecutor {
             // refuses above the 21,504 MiB working ceiling with the figure
             // and the KV-cap remedy, before any weight is loaded. The charge
             // is what arming allocates, so the weights leave exactly the room
-            // the pass needs and long contexts pay only for one piece.
+            // the pass needs.
             layer_major_admission(
                 if mode == LayerMajor::Jobs {
                     "FIFI_EXL3_LAYER_MAJOR=jobs"
@@ -646,7 +635,6 @@ impl FlintExecutor {
             options.prefill_chunk_size as usize,
         )
         .map_err(|error| explain_refusal(error, root, options, free, cache_bytes))?;
-        // Weights are now live; recheck the remaining demand before session allocation.
         plan::admit(
             &plan::Demand {
                 tensors: 0,
@@ -706,7 +694,6 @@ impl FlintExecutor {
                 .map_or(String::new(), |(slots, reason)| {
                     format!(" expert_slots={slots} bank={reason}")
                 }),
-            // Printed only when armed, so the default load line is unchanged.
             if lazy_return {
                 " alloc_return=lazy"
             } else {
@@ -745,9 +732,6 @@ impl FlintExecutor {
                 // The one-entry tip store (the MLX mirror); serving default-off is
                 // the family gate in run.rs (flag + FIFI_FLINT_PREFIX_REUSE).
                 prefix: PrefixStore::with_limits(StoreLimits::default()),
-                // The restore facts of the CURRENT job (mirror of the MLX
-                // twin: no false zeros — the report shows
-                // what the last restore observed, not hardcoded 0s).
                 prefix_hit: PrefixHit::Miss,
                 prefix_uncached_shared: 0,
                 prefix_zero_committed_saves: 0,
@@ -775,8 +759,7 @@ impl FlintExecutor {
         CudaPrefixPath::now(&self.root, &self.options, env)
     }
 
-    /// The store arms only when the opt-in resolves against this engine's
-    /// kv profile default OFF stays bit-for-bit unobservable.
+    /// Default OFF stays bit-for-bit unobservable.
     fn prefix_armed(&self) -> bool {
         super::prefix_reuse_enabled_for(&self.options.kv_profile)
     }
@@ -905,8 +888,7 @@ impl ExecutorOps for FlintExecutor {
         // leaves nothing committed, and the committed-boundary check
         // would fail the REQUEST. Decline to cache instead — the boundary
         // request serves cold with no error — and count the decline
-        // executor-side so `save_refusals` shows it (the store never sees
-        // these, so the two counters cannot double-count).
+        // executor-side so `save_refusals` shows it.
         if st.state.fed() == 0 {
             self.prefix_zero_committed_saves = self.prefix_zero_committed_saves.saturating_add(1);
             return Ok(false);
@@ -937,10 +919,6 @@ impl ExecutorOps for FlintExecutor {
         let restored = core.restore_prefix(&mut self.prefix, prompt, path, |snapshot| {
             state.restore_prefix(ctx, stream, snapshot)
         })?;
-        // Capture the restore facts THIS job observed:
-        // the hit kind rides the restored entry's kind, and the uncached
-        // shared prefix is measured against the store as it was for this
-        // prompt — not a stale 0 in the report.
         self.prefix_hit = if restored > 0 {
             match self.prefix.restored_kind() {
                 Some(SaveKind::Root) => PrefixHit::Root,
@@ -954,13 +932,6 @@ impl ExecutorOps for FlintExecutor {
         Ok(restored)
     }
 
-    /// The store report: entries,
-    /// the host bytes the snapshots pin, the kind of the last restore, and
-    /// the store's lifetime counters. The shadow stays off for CUDA (the
-    /// block-match flag is not lifted for this store yet).
-    /// The store limits: the armed store (0 roots, 1 entry) only
-    /// when armed; otherwise a closed store (0, 0) so default OFF is
-    /// unobservable.
     fn prefix_limits(&self) -> StoreLimits {
         if self.prefix_armed() {
             StoreLimits::default()
@@ -979,9 +950,6 @@ impl ExecutorOps for FlintExecutor {
         let stored = self.prefix.roots_len() + self.prefix.entries_len();
         let hit = self.prefix_hit;
         let mut save_side = self.prefix.save_side_totals();
-        // Executor-side declines (zero-committed saves) ride the same
-        // counter next to the store's own budget refusals; the two never
-        // overlap, so the sum is exact.
         save_side.save_refusals = save_side
             .save_refusals
             .saturating_add(self.prefix_zero_committed_saves);
@@ -990,6 +958,8 @@ impl ExecutorOps for FlintExecutor {
             bytes: self.prefix.snapshots().map(|s| s.host_bytes()).sum(),
             hit,
             uncached_shared: self.prefix_uncached_shared,
+            // The shadow stays off for CUDA: the block-match flag is not
+            // lifted for this store yet.
             shadow: None,
             save_side,
             restore_drops: self.prefix.restore_drop_count(),
@@ -1000,8 +970,6 @@ impl ExecutorOps for FlintExecutor {
 
 #[cfg(test)]
 impl FlintExecutor {
-    /// Qualification-window constructor: the FLINT_QUAL_MODEL root (or
-    /// FLINT_QUAL_TOKENIZER), resolved straight on the open() path.
     pub(super) fn open_qualification(limit: u32, profile: &str) -> (Self, FlintSession) {
         let root = std::env::var_os("FLINT_QUAL_MODEL")
             .map_or_else(|| Path::new("/not-set").to_path_buf(), Into::into);
@@ -1084,7 +1052,6 @@ mod bank_tally_tests {
         let mut tally = BankTally::default();
         tally.prefilled(delta(100, 1_000));
         tally.prefilled(delta(20, 200));
-        // A decode call that does not finish the request prints nothing and keeps counting.
         assert_eq!(tally.decoded(delta(5, 50), 4, false, Some(224)), None);
         let line = tally.decoded(delta(3, 30), 2, true, Some(224)).unwrap();
         assert_eq!(
@@ -1092,7 +1059,6 @@ mod bank_tally_tests {
             "Flint expert bank: slots=224 prefill_misses=120 decode_tokens=6 decode_misses=8 \
              decode_misses_per_token=1.33 copied_bytes=1280"
         );
-        // Finishing cleared the tally: the next request does not inherit any of it.
         let line = tally.decoded(delta(1, 10), 1, true, Some(224)).unwrap();
         assert!(
             line.contains("prefill_misses=0 decode_tokens=1 decode_misses=1"),
@@ -1108,7 +1074,6 @@ mod bank_tally_tests {
         assert_eq!(tally.decoded(delta(2, 20), 3, false, Some(48)), None);
         tally.begin();
         assert_eq!(tally, BankTally::default());
-        // No bank: the counters stay at zero and a finished request prints no line.
         assert_eq!(tally.decoded(BankDelta::default(), 5, true, None), None);
         assert_eq!(tally.decode_tokens, 5);
         tally.begin();
@@ -1174,7 +1139,6 @@ mod resident_advice_tests {
         let f16 =
             largest_resident_context(&options(1, "f16"), 24_000_000_000, RESIDENT, cache_bytes);
         assert!((40_000..50_000).contains(&f16.unwrap()), "{f16:?}");
-        // Nothing fits when the weights alone fill the card.
         assert_eq!(
             largest_resident_context(&options(1, "f16"), RESIDENT, RESIDENT, cache_bytes),
             None
@@ -1207,7 +1171,6 @@ mod resident_advice_tests {
         );
         let none = resident_advice(true, "cuda admission: need 1 bytes", None, "q8").unwrap();
         assert!(none.contains("no context fits that way"), "{none}");
-        // A host that cannot hold the buffer is told how long a context runs without it.
         let refused = resident_advice(false, host, Some(45_315), "f16").unwrap();
         assert!(
             refused.contains("Without the host buffer") && refused.contains("45315 tokens"),
@@ -1217,7 +1180,6 @@ mod resident_advice_tests {
             !refused.contains("FIFI_FLINT_CUDA_EXPERT_CACHE=0"),
             "{refused}"
         );
-        // Any other refusal, and any refusal with the bank in use, gets nothing added.
         assert_eq!(
             resident_advice(false, "cuda admission: need 1 bytes", Some(7), "f16"),
             None
@@ -1246,7 +1208,6 @@ mod open_switch_tests {
             let text = format!("{error:?}");
             assert!(text.contains("FIFI_EXL3_SINGLE_GATHER"), "{bad}: {text}");
         }
-        // The layer-major refusal still comes through, and a good single-row value does not hide it.
         assert!(open(Some("1"), Some("2")).is_err());
         assert!(open(None, Some("")).is_err());
     }

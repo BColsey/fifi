@@ -34,14 +34,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// its fresh buffers.
 static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Resident state of one layer.
 pub(super) enum LayerState {
     /// DeltaNet state `[VH, VD, KD]` and convolution ring `[CD, CK - 1]`.
     Delta {
         rec: ExecutionTensor,
         ring: ExecutionTensor,
     },
-    /// Dense attention cache.
     Attn(KvCache),
 }
 
@@ -224,7 +222,6 @@ pub(super) struct ResidentSnapshot {
 }
 
 impl ResidentSnapshot {
-    /// Position of the next token after the saved prefix.
     pub(super) fn pos(&self) -> u32 {
         self.pos
     }
@@ -247,7 +244,6 @@ impl ResidentSnapshot {
     }
 }
 
-/// Resident state of one sequence.
 pub(super) struct ResidentState {
     layers: Vec<LayerState>,
     pos: u32,
@@ -342,12 +338,10 @@ impl ResidentState {
         })
     }
 
-    /// Position of the next token.
     pub(super) fn pos(&self) -> u32 {
         self.pos
     }
 
-    /// True after a failed step, until `reset`.
     pub(super) fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -701,7 +695,6 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Resident bytes of the layer states.
     pub(super) fn byte_len(&self) -> Result<u64, EngError> {
         let mut total = Bytes::default();
         for layer in &self.layers {
@@ -875,7 +868,6 @@ mod snapshot_tests {
         (range / 510.0, top)
     }
 
-    /// A decoder on `ckpt` whose session budget holds `cap` bytes.
     fn decoder_with_cap<'c>(
         ckpt: &'c StreamedCheckpoint,
         host: HostWeights,
@@ -1112,7 +1104,6 @@ mod snapshot_tests {
         );
     }
 
-    /// Suffix decoding after a snapshot restore matches a full recompute bitwise.
     #[test]
     fn a_restored_state_and_a_full_recompute_agree_bitwise_on_eight_suffix_tokens() {
         let _serial = crate::native_test_lock();

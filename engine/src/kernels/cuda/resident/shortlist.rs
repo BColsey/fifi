@@ -14,7 +14,6 @@ pub(crate) struct ShortlistCall<'a> {
     pub(crate) n: usize,
 }
 impl CudaContext {
-    /// Checks the full vocabulary and disjoint reusable scratch;queues stable top20.
     /// The caller orders the finite-input certificate/result read after this stream work.
     pub(crate) fn shortlist(
         &self,

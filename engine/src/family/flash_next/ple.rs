@@ -4,28 +4,19 @@ use super::math::{dot, expect_len, rms0, silu};
 use crate::EngError;
 use crate::family::project::Projector;
 
-/// Unchecked PLE dimensions read from the configuration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PleDims {
-    /// Residual branches.
     pub(crate) branches: u32,
-    /// Hidden width of one branch.
     pub(crate) hidden: u32,
-    /// N-gram size. Only 3 is supported.
+    /// Only 3 is supported.
     pub(crate) ngram: u32,
-    /// Heads per n-gram order.
     pub(crate) heads_per_ngram: u32,
-    /// Width of one n-gram head row.
     pub(crate) head_dim: u32,
-    /// Convolution kernel size.
     pub(crate) conv_kernel: u32,
-    /// End-of-sequence token id.
     pub(crate) eos: u32,
-    /// RMS normalization epsilon.
     pub(crate) eps: f32,
 }
 
-/// Checked PLE dimensions.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PleShape {
     dims: PleDims,
@@ -36,7 +27,6 @@ pub(crate) struct PleShape {
 }
 
 impl PleShape {
-    /// Checks the dimensions.
     pub(crate) fn new(dims: PleDims) -> Result<Self, EngError> {
         if dims.branches == 0 || dims.hidden == 0 || dims.heads_per_ngram == 0 || dims.head_dim == 0
         {
@@ -80,15 +70,12 @@ impl PleShape {
         })
     }
 
-    /// The checked dimensions.
     pub(crate) fn dims(&self) -> PleDims {
         self.dims
     }
 }
 
-/// Weights of the PLE block.
 pub(crate) struct PleWeights<'a, W> {
-    /// Hash multipliers, length `ngram`.
     pub(crate) multipliers: &'a [i64],
     /// Vocabulary size of each head, length `heads`.
     pub(crate) vocab: &'a [i64],
@@ -98,23 +85,18 @@ pub(crate) struct PleWeights<'a, W> {
     pub(crate) shards: &'a [W],
     /// Row count of each table, same length as `shards`.
     pub(crate) shard_rows: &'a [u64],
-    /// Scalar applied to every table row.
     pub(crate) weight_scale: f32,
     /// Key projection `[width, heads * head_dim]`.
     pub(crate) key: &'a W,
     /// Value projection `[hidden, heads * head_dim]`.
     pub(crate) value: &'a W,
-    /// Key norm, length `width`.
     pub(crate) norm_key: &'a [f32],
-    /// Query norm, length `width`.
     pub(crate) norm_query: &'a [f32],
-    /// Convolution input norm, length `width`.
     pub(crate) norm_conv: &'a [f32],
     /// Convolution weights, length `width * conv_kernel`, row `c` at `c * conv_kernel`.
     pub(crate) conv: &'a [f32],
 }
 
-/// Token history and convolution ring of the PLE block.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PleState {
     history: Vec<u32>,
@@ -122,7 +104,6 @@ pub(crate) struct PleState {
 }
 
 impl PleState {
-    /// Returns an empty history and a zero ring sized for `shape`.
     pub(crate) fn new(shape: &PleShape) -> Self {
         Self {
             history: Vec::new(),
@@ -130,7 +111,6 @@ impl PleState {
         }
     }
 
-    /// Host bytes held by the state.
     pub(crate) fn byte_len(&self) -> usize {
         self.history.len() * 4 + self.ring.len() * 4
     }
@@ -141,7 +121,6 @@ impl PleState {
         &self.ring
     }
 
-    /// The n-gram history (test observation only).
     #[cfg(test)]
     pub(crate) fn history(&self) -> &[u32] {
         &self.history
@@ -192,7 +171,6 @@ fn hash_rows(
     Ok(rows)
 }
 
-/// Finds the table index and local row of a global row.
 fn locate_row(shard_rows: &[u64], row: u64) -> Option<(usize, u64)> {
     let mut start = 0u64;
     for (p, &count) in shard_rows.iter().enumerate() {
@@ -205,7 +183,7 @@ fn locate_row(shard_rows: &[u64], row: u64) -> Option<(usize, u64)> {
     None
 }
 
-/// The table rows of one token and the n-gram history after it. Hashing stays on the host.
+/// Hashing stays on the host.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RowPlan {
     /// `(table index, local row)` for each head, in head order.
@@ -214,7 +192,6 @@ pub(crate) struct RowPlan {
     pub(crate) history: Vec<u32>,
 }
 
-/// Plans the table rows that `token` reads after `history`.
 pub(crate) fn plan_rows<W>(
     shape: &PleShape,
     weights: &PleWeights<'_, W>,
@@ -265,19 +242,13 @@ pub(crate) fn plan_rows<W>(
     Ok(RowPlan { rows, history })
 }
 
-/// The table rows of a run of tokens and the n-gram history after the last one.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ChunkPlan {
     /// The `(table index, local row)` pairs of each token, in token order.
     pub(crate) rows: Vec<Vec<(usize, u32)>>,
-    /// The history after the last token.
     pub(crate) history: Vec<u32>,
 }
 
-/// Plans the table rows of `tokens` in order, starting after `history`.
-///
-/// The history carries from one token to the next, and the end-of-sequence token clears it, as
-/// `plan_rows` does. The caller has to pass at least one token.
 pub(crate) fn plan_chunk_rows<W>(
     shape: &PleShape,
     weights: &PleWeights<'_, W>,
@@ -302,7 +273,7 @@ pub(crate) fn plan_chunk_rows<W>(
     })
 }
 
-/// Runs one decode step for `token` and returns the residual update of length `width`.
+/// Returns the residual update of length `width`.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,
     shape: &PleShape,

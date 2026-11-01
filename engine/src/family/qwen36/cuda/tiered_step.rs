@@ -98,7 +98,6 @@ impl BankDevice for BankFill<'_> {
     }
 }
 
-/// Everything the tiered step owns besides the plain step.
 pub(super) struct TieredRuntime<'w> {
     parts: Vec<LayerParts<'w>>,
     banks: Vec<ExpertBank>,
@@ -109,7 +108,6 @@ pub(super) struct TieredRuntime<'w> {
 }
 
 impl<'w> TieredRuntime<'w> {
-    /// Assembles the runtime; one bank and one set of parts per layer.
     pub(super) fn new(
         parts: Vec<LayerParts<'w>>,
         banks: Vec<ExpertBank>,
@@ -167,8 +165,6 @@ impl<'w> TieredRuntime<'w> {
         Ok(())
     }
 
-    /// Fills the banks before the first token (see `TieredHost::preload_all`) with blocking
-    /// writes on `stream`; returns the number of fills.
     pub(super) fn preload(&mut self, stream: &DeviceStream) -> Result<usize, EngError> {
         let mut fills = BankFill {
             banks: &self.banks,
@@ -177,8 +173,6 @@ impl<'w> TieredRuntime<'w> {
         self.host.preload_all(&mut fills).map_err(host_error)
     }
 
-    /// Drops what a failed token left in the host: the layer in flight, the routes and the
-    /// counters of the layers that ran (see `TieredHost::abort_token`).
     pub(super) fn abort_token(&mut self) {
         self.host.abort_token();
         self.syncs = HostSyncs::default();
@@ -189,8 +183,6 @@ impl<'w> TieredRuntime<'w> {
         std::mem::take(&mut self.syncs)
     }
 
-    /// Ends the token: policy P decides the swaps, the bank slots are filled with blocking
-    /// writes on `stream`, and the token's counters come back.
     pub(super) fn end_token(&mut self, stream: &DeviceStream) -> Result<TokenReport, EngError> {
         let mut fills = BankFill {
             banks: &self.banks,

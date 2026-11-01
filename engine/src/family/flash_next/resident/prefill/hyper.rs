@@ -21,12 +21,10 @@ pub(super) struct RowsRead {
     pub(super) gate: Option<ExecutionTensor>,
 }
 
-/// Returns a `BadRequest` with `message`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(message.into())
 }
 
-/// Checks that `h` is `[T, C, H]` with `T >= 1` and returns `T`.
 fn check_rows(shape: &HyperShape, h: &ExecutionTensor) -> Result<u32, EngError> {
     let c = dim(shape.branches())?;
     let hidden = dim(shape.hidden())?;
@@ -146,7 +144,6 @@ mod tests {
             .collect()
     }
 
-    /// Block rows: `b[d] = (((d + t) % 3) - 1) * 1e-7`.
     fn block_row(t: usize) -> Vec<f32> {
         (0..64)
             .map(|d| (((d + t) % 3) as f32 - 1.0) * 1.0e-7)
@@ -155,7 +152,6 @@ mod tests {
 
     const ROWS: usize = 3;
 
-    /// Loads the fixture checkpoint and imports its resident weights.
     fn load(kernels: &mut MlxKernels) -> (StreamedCheckpoint, FlashWeights, ResidentWeights) {
         let ckpt = checkpoint();
         let flash = FlashWeights::load(&ckpt, &config()).unwrap();

@@ -40,7 +40,6 @@ pub(super) fn split_conv(
     Ok((taps, last))
 }
 
-/// Transposes a row-major `[rows, cols]` matrix to `[cols, rows]`.
 pub(super) fn transpose(values: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, EngError> {
     if Some(values.len()) != rows.checked_mul(cols) {
         return Err(mismatch("matrix"));

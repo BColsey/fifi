@@ -32,21 +32,16 @@ use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 use crate::weights::{GgufType, GgufWeights};
 
-/// Decoder layers of the pinned checkpoint.
 pub(crate) const LAYERS: usize = 48;
 /// Values per hidden row.
 pub(crate) const HIDDEN: usize = 3840;
 /// Rows of the tied embedding and of the logit projection.
 pub(crate) const VOCAB: usize = 262_144;
-/// Query heads of every layer.
 pub(crate) const HEADS: usize = 16;
 /// KV cells held per head: the 8,192-token combined context of the goal.
 pub(crate) const CELLS: usize = 8192;
-/// Sliding window of a local layer.
 pub(crate) const LOCAL_WINDOW: usize = 1024;
-/// Logit softcap of the pinned checkpoint.
 pub(crate) const SOFT_CAP: f32 = 30.0;
-/// Feed-forward width.
 pub(crate) const FFN: usize = 15360;
 
 /// One Q8_0 matrix resident on the device, raw checkpoint blocks.
@@ -81,7 +76,6 @@ impl PackedMatrix {
     }
 }
 
-/// One F32 vector resident on the device.
 pub(crate) struct Vector {
     pub(crate) buf: DeviceBuffer,
     len: usize,
@@ -93,7 +87,6 @@ impl Vector {
     }
 }
 
-/// The four KV8 planes of one layer.
 pub(crate) struct Kv {
     k_codes: DeviceBuffer,
     k_scales: DeviceBuffer,
@@ -102,7 +95,6 @@ pub(crate) struct Kv {
     shape: Kv8Shape,
 }
 
-/// One decoder layer's weights and cache planes.
 pub(crate) struct Layer {
     attn_norm: Vector,
     q_norm: Vector,
@@ -151,7 +143,6 @@ pub(crate) struct Scratch {
     pub(crate) kv_len: DeviceBuffer,
 }
 
-/// The loaded model and its device state.
 pub(crate) struct Gemma {
     pub(crate) ctx: CudaContext,
     pub(crate) stream: DeviceStream,
@@ -165,7 +156,6 @@ pub(crate) struct Gemma {
     pub(crate) eps: f32,
 }
 
-/// Loads the pinned Humanizer Q8_0 checkpoint onto the device.
 pub(crate) fn load(path: &std::path::Path, header_sha256: Option<&str>) -> Result<Gemma, EngError> {
     let weights = super::open_humanizer_weights(path, header_sha256)?;
     let ctx = CudaContext::with_admission(&crate::family::project::cuda::served_admission())?;

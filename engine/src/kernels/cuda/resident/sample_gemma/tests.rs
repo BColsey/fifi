@@ -20,7 +20,6 @@ fn settings(
     }
 }
 
-/// Draws once and returns the token id.
 fn draw(ctx: &CudaContext, stream: &DeviceStream, logits: &[f32], params: SampleParams) -> u32 {
     let n = logits.len();
     let l = testkit::upload_f32(ctx, logits);
@@ -46,7 +45,6 @@ fn draw(ctx: &CudaContext, stream: &DeviceStream, logits: &[f32], params: Sample
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// A zero temperature takes the argmax, with the lowest id on a tie.
 #[test]
 fn zero_temperature_takes_the_lowest_argmax() {
     if !testkit::device_present("sampler greedy") {
@@ -63,7 +61,6 @@ fn zero_temperature_takes_the_lowest_argmax() {
     );
 }
 
-/// top_k 1 always takes the argmax when sampling.
 #[test]
 fn top_k_one_takes_the_argmax_for_every_position() {
     if !testkit::device_present("sampler top_k one") {
@@ -81,7 +78,6 @@ fn top_k_one_takes_the_argmax_for_every_position() {
     }
 }
 
-/// The same seed and position give the same token; distinct positions vary.
 #[test]
 fn draws_repeat_by_position_and_vary_across_positions() {
     if !testkit::device_present("sampler determinism") {
@@ -109,7 +105,6 @@ fn draws_repeat_by_position_and_vary_across_positions() {
     );
 }
 
-/// A peaked distribution lands on the dominant token at every position.
 #[test]
 fn a_peaked_distribution_selects_the_dominant_token() {
     if !testkit::device_present("sampler peaked") {
@@ -127,7 +122,6 @@ fn a_peaked_distribution_selects_the_dominant_token() {
     }
 }
 
-/// The wrapper refuses top_p outside (0, 1] before any native call.
 #[test]
 fn refuses_a_top_p_of_zero() {
     if !testkit::device_present("sampler refusal") {

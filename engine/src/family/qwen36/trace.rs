@@ -34,16 +34,12 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The output directory of one trace and its step counter.
 pub(super) struct LayerTrace {
     dir: Option<PathBuf>,
     steps: AtomicU32,
-    /// The prefill-piece counter of the CUDA chunk-size diagnostic (the module doc).
     prefill_pieces: AtomicU32,
 }
 
-/// Resolves the text of `Q36_LAYER_TRACE_DIR`: `Ok(None)` for unset or empty (off), `Ok(Some)`
-/// for an existing directory (on), and the warning that names the path when it is not one.
 fn resolve(raw: Option<OsString>) -> Result<Option<PathBuf>, String> {
     let Some(path) = raw.filter(|text| !text.is_empty()).map(PathBuf::from) else {
         return Ok(None);
@@ -85,16 +81,12 @@ impl LayerTrace {
         }
     }
 
-    /// Claims the index of the next traced step, or `None` when the trace is off. An off trace
-    /// claims nothing and touches no file.
     pub(super) fn begin_step(&self) -> Option<u32> {
         self.dir
             .is_some()
             .then(|| self.steps.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Writes one row as little-endian F32 to `step{step:04}_layer{layer:02}.f32` in the trace
-    /// directory. An off trace writes nothing. A write error names the step and the layer.
     pub(super) fn write_row(&self, step: u32, layer: usize, row: &[f32]) -> Result<(), EngError> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -109,15 +101,12 @@ impl LayerTrace {
         })
     }
 
-    /// Claims the index of the next traced prefill piece, or `None` when the trace is off.
     pub(super) fn begin_prefill(&self) -> Option<u32> {
         self.dir
             .is_some()
             .then(|| self.prefill_pieces.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Writes the rows of one prefill piece as little-endian F32 to
-    /// `prefill{piece:04}_layer{layer:02}.f32`, row-major. An off trace writes nothing.
     pub(super) fn write_prefill(
         &self,
         piece: u32,
@@ -137,8 +126,6 @@ impl LayerTrace {
         })
     }
 
-    /// Writes the logits row of one traced step as little-endian F32 to
-    /// `step{step:04}_logits.f32`. An off trace writes nothing.
     pub(super) fn write_logits(&self, step: u32, row: &[f32]) -> Result<(), EngError> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -154,10 +141,8 @@ impl LayerTrace {
     }
 }
 
-/// The variable that turns the trace on.
 const TRACE_DIR_VAR: &str = "Q36_LAYER_TRACE_DIR";
 
-/// The process trace: `Q36_LAYER_TRACE_DIR` is read once, on the first use.
 fn process_trace() -> &'static LayerTrace {
     static TRACE: OnceLock<LayerTrace> = OnceLock::new();
     TRACE.get_or_init(|| LayerTrace::from_env_value(std::env::var_os(TRACE_DIR_VAR)))
@@ -169,17 +154,14 @@ pub(in crate::family::qwen36) fn trace_enabled() -> bool {
     process_trace().dir.is_some()
 }
 
-/// Claims the next traced step index, or `None` when the trace is off.
 pub(in crate::family::qwen36) fn begin_step() -> Option<u32> {
     process_trace().begin_step()
 }
 
-/// Claims the next traced prefill-piece index, or `None` when the trace is off.
 pub(in crate::family::qwen36) fn begin_prefill() -> Option<u32> {
     process_trace().begin_prefill()
 }
 
-/// Writes one decode-step row (`step{S:04}_layer{L:02}.f32`); a no-op when off.
 pub(in crate::family::qwen36) fn write_step_row(
     step: u32,
     layer: usize,
@@ -188,7 +170,6 @@ pub(in crate::family::qwen36) fn write_step_row(
     process_trace().write_row(step, layer, row)
 }
 
-/// Writes one prefill piece's last rows (`prefill{P:04}_layer{L:02}.f32`); a no-op when off.
 pub(in crate::family::qwen36) fn write_prefill_rows(
     piece: u32,
     layer: usize,
@@ -235,7 +216,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Collects the file names of `dir`, sorted.
     fn file_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("the trace directory lists")
@@ -263,8 +243,6 @@ mod tests {
             .collect()
     }
 
-    /// With the variable unset or empty the trace is off and says nothing: no directory
-    /// resolves, no step is claimed, and a write succeeds without a file.
     #[test]
     fn an_unset_or_empty_variable_leaves_the_trace_off() {
         for raw in [None, Some(OsString::new())] {
@@ -279,9 +257,8 @@ mod tests {
         }
     }
 
-    /// A value that is not an existing directory turns the trace off, with a warning that names
-    /// the path, instead of failing every decode step later. A regular file and a missing path
-    /// are the two cases.
+    /// A value that is not an existing directory turns the trace off with a warning that names
+    /// the path, instead of failing every decode step later.
     #[test]
     fn a_value_that_is_not_a_directory_leaves_the_trace_off_with_a_warning() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -301,8 +278,6 @@ mod tests {
         assert_eq!(file_names(dir.path()), ["a-file"], "nothing was written");
     }
 
-    /// With the variable set to a directory, each traced step writes one file per layer named by
-    /// step and layer, and the files hold the rows bit for bit. Step indices count up from zero.
     #[test]
     fn a_named_directory_receives_one_file_per_layer_per_step() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -339,9 +314,6 @@ mod tests {
         assert_eq!(bits(&dir.path().join("step0001_layer00.f32")), second);
     }
 
-    /// The CUDA chunk-size diagnostic's files: prefill pieces count on their OWN counter (so a
-    /// `[295,5]` run's decode files still align with a `[300]` run's from `step0000`), and a
-    /// piece's file holds all of its rows row-major; the logits row lands beside the layer rows.
     #[test]
     fn prefill_pieces_and_logits_have_their_own_names_and_counters() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -369,8 +341,6 @@ mod tests {
         assert_eq!(bits(&dir.path().join("prefill0000_layer07.f32")), expected);
     }
 
-    /// A directory that disappears after the check still gives a `Backend` error that names the
-    /// step and the layer, not a silent loss of the row.
     #[test]
     fn a_directory_removed_after_the_check_is_a_backend_error_naming_the_row() {
         let dir = tempfile::tempdir().expect("a temporary directory");

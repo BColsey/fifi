@@ -1,5 +1,3 @@
-//! The engines that the server routes to, and the shared state of the routes.
-//!
 //! Routing rules: the scheduler design ("Request flow") and the server design
 //! ("Session handling"). The server has anonymous sessions only.
 
@@ -18,11 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The quiet time after which a stream sends a keep-alive comment (the server design).
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
-/// One engine as the routes see it.
 pub(crate) struct EngineEntry {
     /// The engine id of `x-engine`.
     pub(crate) id: String,
-    /// The model name of `model`.
     pub(crate) model: String,
     pub(crate) handle: EngineHandle,
     pub(crate) bundle: Arc<TokenizerBundle>,
@@ -46,7 +42,6 @@ pub(crate) struct EngineEntry {
     pub(crate) defaults: SamplingDefaults,
 }
 
-/// The state that every route shares.
 pub(crate) struct AppState {
     api_key: Vec<u8>,
     engines: Vec<EngineEntry>,
@@ -55,9 +50,7 @@ pub(crate) struct AppState {
     keep_alive: Duration,
     /// The ids of the engines whose failure text the log already holds.
     reported: Mutex<HashSet<String>>,
-    /// Receives each log line. The default writes it to standard error.
     log: Box<dyn Fn(&str) + Send + Sync>,
-    /// Receives the request log lines. The default is standard error.
     request_log: Sink,
     /// The monitor's recent-request ring, fed by the served routes' log
     /// lines and read by `GET /v1/recent-requests`.
@@ -66,7 +59,6 @@ pub(crate) struct AppState {
     prompt_memory: Arc<Mutex<HashMap<String, Vec<u32>>>>,
 }
 
-/// The current Unix time in seconds.
 pub(crate) fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -74,7 +66,7 @@ pub(crate) fn unix_seconds() -> u64 {
 }
 
 impl AppState {
-    /// Creates the state. The caller has checked that the key is not empty.
+    /// The caller has checked that the key is not empty.
     pub(crate) fn new(api_key: &str, engines: Vec<EngineEntry>) -> Self {
         Self {
             api_key: api_key.as_bytes().to_vec(),
@@ -100,12 +92,10 @@ impl AppState {
         lcp
     }
 
-    /// The sink of the request log lines.
     pub(crate) fn request_log(&self) -> Sink {
         Arc::clone(&self.request_log)
     }
 
-    /// Replaces the request log sink. Tests use this to read the request log lines.
     #[cfg(test)]
     pub(crate) fn with_request_log(mut self, sink: impl std::io::Write + Send + 'static) -> Self {
         self.request_log = Arc::new(Mutex::new(sink));
@@ -118,39 +108,32 @@ impl AppState {
         self.recent.clone()
     }
 
-    /// Replaces the log sink. Tests use this to read the log lines.
     #[cfg(test)]
     pub(crate) fn with_log(mut self, sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.log = Box::new(sink);
         self
     }
 
-    /// Changes the keep-alive interval. Tests use this to avoid a wait of 15 seconds.
+    /// Tests use this to avoid a wait of 15 seconds.
     #[cfg(test)]
     pub(crate) fn with_keep_alive(mut self, interval: Duration) -> Self {
         self.keep_alive = interval;
         self
     }
 
-    /// The quiet time after which a stream sends a keep-alive comment.
     pub(crate) fn keep_alive(&self) -> Duration {
         self.keep_alive
     }
 
-    /// The configured bearer key.
     pub(crate) fn api_key(&self) -> &[u8] {
         &self.api_key
     }
 
-    /// A new completion id that is unique in this process.
     pub(crate) fn next_completion_id(&self) -> String {
         let number = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         format!("chatcmpl-{number:016x}")
     }
 
-    /// Picks the engine of a request.
-    /// The server keeps no sessions, so every `x-session` value is `NotFound`.
-    /// Without a session, `x-engine` wins over `model`.
     pub(crate) fn resolve(
         &self,
         session: Option<&str>,
@@ -181,7 +164,6 @@ impl AppState {
         )))
     }
 
-    /// True when at least one engine can take a job now.
     pub(crate) fn is_ready(&self) -> bool {
         self.engines
             .iter()
@@ -202,8 +184,6 @@ impl AppState {
         format!("no engine is ready: {}", parts.join("; "))
     }
 
-    /// The failure texts that the log does not hold yet, one for each failed engine.
-    /// A second call returns nothing for an engine that the first call reported.
     fn new_failures(&self) -> Vec<String> {
         let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
         self.engines
@@ -217,14 +197,12 @@ impl AppState {
             .collect()
     }
 
-    /// Writes each new engine failure to the log, once for each failed engine.
     pub(crate) fn log_new_failures(&self) {
         for line in self.new_failures() {
             (self.log)(&line);
         }
     }
 
-    /// The `GET /v1/models` answer. Engines that hold one model share one entry.
     pub(crate) fn models(&self) -> ModelList {
         let mut models: Vec<Model> = Vec::new();
         for entry in &self.engines {

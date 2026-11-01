@@ -52,19 +52,11 @@ use crate::kernels::cuda::native::resident::swiglu_pack::{
 use crate::kernels::cuda::native::xf_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
-/// The most rows (tokens) one call takes.
 pub(crate) const MAX_TOKENS: c_int = 32_768;
-/// The most columns of one half row (`k_pad`).
 pub(crate) const MAX_WIDTH: c_int = 32_768;
 /// `k_pad` is a multiple of this (the vendored kernel packs blocks of 256 columns).
 const WIDTH_QUANTUM: c_int = 256;
 
-/// One SwiGLU pack call. Both ranges are device ranges of this context.
-///
-/// - `gu`: f32 `[m][2 * k_pad]`, 4-byte aligned; see the module doc. The tails are overwritten.
-/// - `xf`: the packed fp16 output, 16-byte aligned, `xf_bytes(m, k_pad)` bytes at least.
-/// - `m`: rows (tokens), `1..=32768`.
-/// - `n_ff`: live columns of each half, `1..=k_pad`.
 pub(crate) struct SwigluPackCall<'b> {
     pub(crate) gu: DeviceRange<'b>,
     pub(crate) xf: DeviceRange<'b>,
@@ -72,18 +64,16 @@ pub(crate) struct SwigluPackCall<'b> {
     pub(crate) n_ff: usize,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("swiglu_pack: {tag}: {detail}"))
 }
 
-/// `value` as `c_int`, or the "exceeds i32" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
-/// `value` as `c_int` when it lies in `low..=high`, else the refusal for `tag`. The range is
-/// tested on the converted integer, so the conversion is what refuses a value above `i32::MAX`.
+/// The range is tested on the converted integer, so the conversion is what refuses a value
+/// above `i32::MAX`.
 fn ranged(tag: &str, value: usize, low: c_int, high: c_int) -> Result<c_int, EngError> {
     let int = to_int(tag, value)?;
     if !(low..=high).contains(&int) {
@@ -111,19 +101,11 @@ pub(in crate::kernels::cuda) fn check_shape(
     Ok(SwigluInts { m, n_ff, k_pad })
 }
 
-/// Bytes `gu` must hold: `m` rows of `2 * k_pad` f32. `None` on overflow.
 pub(crate) fn gu_bytes(m: usize, k_pad: usize) -> Option<usize> {
     m.checked_mul(2)?.checked_mul(k_pad)?.checked_mul(4)
 }
 
 impl CudaContext {
-    /// Queues the SwiGLU pack of `call` on `stream` with `k_pad = call.n_ff` (no padding):
-    /// `xf = fp16(silu(gate) * up)` for every row of `gu`. Returns when the work is queued.
-    ///
-    /// Returns `BadRequest`, before any native call and with the backend unchanged, for a stream
-    /// or buffer of another context, a shape the kernel refuses (`n_ff` must be a multiple of 256
-    /// up to 32,768), a range that is too short or misaligned, and `gu` and `xf` ranges that
-    /// overlap.
     pub(crate) fn swiglu_pack(
         &self,
         stream: &DeviceStream,
@@ -133,10 +115,6 @@ impl CudaContext {
         self.launch(stream, call, k_pad)
     }
 
-    /// Queues the SwiGLU pack of `call` on `stream` with the padded width `k_pad >= call.n_ff`,
-    /// a multiple of 256 up to 32,768. Columns `n_ff..k_pad` of both halves of every `gu` row are
-    /// zeroed first (the call writes them), so the columns `n_ff..k_pad` of `xf` are exactly
-    /// `0x0000`. Refusals as for [`Self::swiglu_pack`].
     pub(crate) fn swiglu_pack_padded(
         &self,
         stream: &DeviceStream,
@@ -146,8 +124,6 @@ impl CudaContext {
         self.launch(stream, call, k_pad)
     }
 
-    /// Every check of a call, then the one native launch. The terminal latch is checked by
-    /// `launch_on`, after the arguments, so a bad argument is still reported as such.
     fn launch(
         &self,
         stream: &DeviceStream,

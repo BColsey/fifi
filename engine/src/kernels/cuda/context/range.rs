@@ -7,7 +7,6 @@
 use super::DeviceBuffer;
 use crate::EngError;
 
-/// A checked byte range of one device allocation.
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceRange<'b> {
     buffer: &'b DeviceBuffer,
@@ -44,17 +43,14 @@ impl DeviceBuffer {
 }
 
 impl<'b> DeviceRange<'b> {
-    /// Byte offset of the range inside its buffer.
     pub(crate) fn offset(&self) -> usize {
         self.offset
     }
 
-    /// Bytes of the range; never 0.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// The buffer the range lies in.
     pub(crate) fn buffer(&self) -> &'b DeviceBuffer {
         self.buffer
     }

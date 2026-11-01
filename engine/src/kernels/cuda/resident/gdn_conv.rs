@@ -41,7 +41,6 @@ use crate::kernels::cuda::native::resident::gdn_conv::{
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
-/// Bytes of one f32.
 const FLOAT: usize = size_of::<f32>();
 
 /// The geometry of one conv launch: `m` tokens, `channels` conv channels, and `ld` floats between
@@ -53,7 +52,6 @@ pub(crate) struct ConvShape {
     pub(crate) ld: usize,
 }
 
-/// Bytes each range of a conv launch must hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConvBytes {
     pub(crate) proj: usize,
@@ -73,9 +71,6 @@ pub(crate) struct ConvCall<'b> {
     pub(crate) out: DeviceRange<'b>,
 }
 
-/// The bytes a launch of `shape` reads and writes: `proj` reaches `(m - 1) * ld + channels`
-/// floats, `weights` is `channels` float4, `state` is three rows of `channels` floats and `out`
-/// is `m` rows of `channels` floats. Pure; `BadRequest` when `m` is 0 or a product overflows.
 pub(crate) fn conv_bytes(shape: ConvShape) -> Result<ConvBytes, EngError> {
     let overflow = || EngError::BadRequest(format!("the CUDA conv shape {shape:?} overflows"));
     let reach = shape
@@ -96,7 +91,6 @@ pub(crate) fn conv_bytes(shape: ConvShape) -> Result<ConvBytes, EngError> {
     })
 }
 
-/// `BadRequest` unless `shape` is inside the limits of the launch.
 fn check_shape(shape: ConvShape) -> Result<(), EngError> {
     let ConvShape { m, channels, ld } = shape;
     if !(1..=GDN_CONV_MAX_M).contains(&m) {
@@ -134,7 +128,6 @@ impl CudaContext {
         self.launch_on(stream, move |stream_raw| gdn_conv_launch(stream_raw, raw))
     }
 
-    /// Every check of a conv launch, then the native view of its ranges.
     fn plan_gdn_conv<'b>(&self, call: &ConvCall<'b>) -> Result<GdnConvRaw<'b>, EngError> {
         let shape = call.shape;
         check_shape(shape)?;

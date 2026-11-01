@@ -17,12 +17,11 @@ use crate::{
 };
 use std::path::Path;
 
-/// The family name of a Q36 engine entry. The family descriptor owns it.
+/// The family descriptor owns the name.
 pub(crate) const FAMILY: &str = QWEN3_6_35B_A3B.name;
 /// The dense family shares the factory, but not its dimensions or quantization defaults.
 pub(crate) const DENSE_FAMILY: &str = QWEN3_8_27B_DENSE.name;
 
-/// The descriptor selected by the server configuration.
 pub(crate) fn descriptor(family: &str) -> Option<FamilySpec> {
     match family {
         FAMILY => Some(QWEN3_6_35B_A3B),
@@ -31,11 +30,7 @@ pub(crate) fn descriptor(family: &str) -> Option<FamilySpec> {
     }
 }
 
-/// Starts the engine of one config entry. Reads `Q36_CACHE_LIMIT` as a fallback. The engine state
-/// is `Loading` until the weights are resident. `prefix_reuse` is the process-wide flag of the
-/// configuration file: when it is on, the MLX arm needs a session cap that covers the entry and
-/// the live session together (`Q36Settings::check_prefix_reuse_cap`). The CUDA arm keeps its
-/// entry in host RAM and has no such rule.
+/// The engine state is `Loading` until the weights are resident.
 pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,
@@ -53,7 +48,6 @@ pub(crate) fn start_engine(
     )
 }
 
-/// Starts a registered family with its selected descriptor.
 pub(crate) fn start_engine_for_family(
     family: &str,
     model_dir: &Path,
@@ -78,7 +72,6 @@ pub(crate) fn start_engine_for_family(
     )
 }
 
-/// The backend the settings read; a build with neither backend keeps the MLX reading.
 fn backend_of_build() -> Backend {
     if cfg!(all(
         feature = "native-mlx",
@@ -206,7 +199,6 @@ mod tests {
         .map(|_| ())
     }
 
-    /// Starts an entry with the process-wide `prefix_reuse` flag set to `flag`.
     fn start_with_reuse(
         options: Option<&Q36Options>,
         env: &Q36Env,
@@ -224,7 +216,6 @@ mod tests {
         .map(|_| ())
     }
 
-    /// The text of a refused start, whatever the check was.
     fn error_text(result: Result<(), EngError>) -> String {
         match result {
             Err(EngError::ModelOutput(text)) => text,
@@ -450,7 +441,6 @@ mod tests {
         assert!(!text.contains("no Q36 backend"), "{text}");
         // The fallback arm is not compiled in this build: its full text is pinned by equality
         // in `a_complete_entry_in_a_build_without_the_backend_names_both_features`, which runs
-        // on the no-backend build where the text IS the error (an include_str! pin of this
-        // file's own literals cannot fail).
+        // on the no-backend build where the text IS the error.
     }
 }

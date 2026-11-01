@@ -10,21 +10,15 @@
 
 use crate::{family::session::PrefixSlot, sched::job::PrefixReport};
 
-/// How the step body of a run was executed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum CaptureOutcome {
-    /// Every launch was queued one by one.
     #[default]
     Eager,
-    /// The body was captured into a graph and the graph was replayed.
     Captured,
-    /// A capture was requested and refused with a status on the closed list; the same body then
-    /// ran eagerly.
     RefusedFellBackToEager,
 }
 
 impl CaptureOutcome {
-    /// True only when the graph was captured and replayed: the gate's `captured` flag.
     pub(crate) const fn captured(self) -> bool {
         matches!(self, Self::Captured)
     }
@@ -44,24 +38,19 @@ impl CaptureOutcome {
 /// finished behind the queued work). A plain step adds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct HostSyncs {
-    /// Event waits.
     pub(super) waits: u32,
-    /// Blocking host-to-device writes.
     pub(super) writes: u32,
 }
 
 impl HostSyncs {
-    /// Adds the counts of `other` into `self`.
     pub(super) fn add(&mut self, other: HostSyncs) {
         self.waits += other.waits;
         self.writes += other.writes;
     }
 }
 
-/// The report of the last run of the step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RunReport {
-    /// How the body ran.
     pub(crate) capture: CaptureOutcome,
     /// Host waits for the run to finish, per token. A plain step makes one. A tiered token adds
     /// the waits of every layer's block and of its bank fills (see [`HostSyncs`]), each blocking
@@ -109,7 +98,6 @@ pub(crate) enum ChunkVerdictTag {
 }
 
 impl ChunkVerdictTag {
-    /// The job-line string of the verdict.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
@@ -121,7 +109,6 @@ impl ChunkVerdictTag {
         }
     }
 
-    /// The tag of the step verdict.
     pub(crate) const fn of(verdict: &super::step::ChunkVerdict) -> Self {
         match verdict {
             super::step::ChunkVerdict::Ready { .. } => Self::Ready,
@@ -142,7 +129,6 @@ pub(crate) enum PathTag {
 }
 
 impl PathTag {
-    /// The job-line string of the arm.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Chunk => "chunk",
@@ -151,7 +137,6 @@ impl PathTag {
     }
 }
 
-/// The bracket list of the job line: [a, b].
 fn bracket(items: &[String]) -> String {
     let mut text = String::from("[");
     for (at, item) in items.iter().enumerate() {
@@ -174,7 +159,6 @@ pub(crate) struct PrefillReport {
     n_fed: usize,
     segmented_parts: usize,
     start_rows: usize,
-    /// Whether a chunked call already recorded start_rows in this reset or import epoch.
     epoch_started: bool,
     piece_tokens: Vec<usize>,
     pieces: Vec<PieceRecord>,
@@ -210,8 +194,8 @@ impl PrefillReport {
         };
     }
 
-    /// Records one step: a chunk's rows count as prefilled, a feed's as fed. A step whose status
-    /// word was non-zero is still recorded: the record is pushed before the state is revalidated.
+    /// A step whose status word was non-zero is still recorded: the record is pushed before
+    /// the state is revalidated.
     pub(crate) fn push_step(&mut self, record: StepRecord) {
         match record.kind {
             StepKind::Chunk => self.n_prefilled += record.rows,
@@ -228,17 +212,14 @@ impl PrefillReport {
         self.segmented_parts
     }
 
-    /// The steps of the session, in order.
     pub(crate) fn steps(&self) -> &[StepRecord] {
         &self.steps
     }
 
-    /// Rows that went through a chunk.
     pub(crate) fn n_prefilled(&self) -> usize {
         self.n_prefilled
     }
 
-    /// Rows that went through the one-row feed.
     /// The arm the last feed_rows call took, once one has run.
     pub(crate) fn path_taken(&self) -> Option<PathTag> {
         self.path_taken
@@ -253,13 +234,10 @@ impl PrefillReport {
         self.start_rows
     }
 
-    /// Sets start_rows, called by the driver at the first chunked call of an epoch.
     pub(crate) fn set_start_rows(&mut self, rows: usize) {
         self.start_rows = rows;
     }
 
-    /// Records the committed rows at the FIRST chunked call of a reset or import epoch and
-    /// reports whether this call was that one.
     pub(crate) fn note_chunked_epoch_start(&mut self, rows: usize) -> bool {
         if self.epoch_started {
             return false;
@@ -269,23 +247,19 @@ impl PrefillReport {
         true
     }
 
-    /// The tokens of each ExecutorOps::prefill call.
     pub(crate) fn piece_tokens(&self) -> &[usize] {
         &self.piece_tokens
     }
 
-    /// One record per ExecutorOps::prefill call.
     pub(crate) fn pieces(&self) -> &[PieceRecord] {
         &self.pieces
     }
 
-    /// Records one ExecutorOps::prefill call: its tokens and its host wall time.
     pub(crate) fn record_piece(&mut self, tokens: usize, ns: u64) {
         self.piece_tokens.push(tokens);
         self.pieces.push(PieceRecord { tokens, ns });
     }
 
-    /// Records one feed_rows call and the verdict it routed on.
     pub(crate) fn note_feed_rows(&mut self, verdict: &super::step::ChunkVerdict, rows: usize) {
         self.verdict = Some(ChunkVerdictTag::of(verdict));
         self.path_taken = Some(match verdict {
@@ -299,13 +273,11 @@ impl PrefillReport {
         self.feed_rows_calls.push(rows);
     }
 
-    /// The rows of each feed_rows call.
     pub(crate) fn feed_rows_calls(&self) -> &[usize] {
         &self.feed_rows_calls
     }
 
-    /// Empties the session and refills the static fields, for a reset or an import: the report
-    /// of the previous epoch must not cross into the next one.
+    /// For a reset or an import: the report of the previous epoch must not cross into the next one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn refill(
         &mut self,
@@ -332,7 +304,6 @@ impl PrefillReport {
         self.logged = false;
     }
 
-    /// Takes the once-per-job line: Some once, then None until the next refill.
     pub(crate) fn take_job_line(&mut self) -> Option<String> {
         if self.logged {
             return None;
@@ -341,7 +312,6 @@ impl PrefillReport {
         Some(self.job_line())
     }
 
-    /// The one engine log line of a prefill job.
     pub(crate) fn job_line(&self) -> String {
         let m_sess = match self.m_sess {
             Some(rows) => rows.to_string(),

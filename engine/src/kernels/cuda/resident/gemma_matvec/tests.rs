@@ -29,7 +29,6 @@ fn act_quant(i: usize) -> i8 {
     ((i * 5) % 9) as i8 - 4
 }
 
-/// The host expectation: sum over blocks of both scales times the integer dot, in f64.
 fn reference() -> Vec<f64> {
     let blocks = K / 32;
     let mut out = Vec::with_capacity(ROWS);

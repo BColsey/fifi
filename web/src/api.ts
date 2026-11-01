@@ -1,12 +1,10 @@
 /**
- * Typed client for the shipped routes. This module owns every fetch.
- * Views never build URLs. Contract: api/openapi.yaml.
+ * This module owns every fetch; views never build URLs.
+ * Contract: api/openapi.yaml.
  */
 
 import { SseParser } from "./sse.js";
 import { loadSettings } from "./store.js";
-
-/* Contract types */
 
 export type EngineState = "loading" | "ready" | "busy" | "error" | "stopped" | "native-failed";
 
@@ -281,9 +279,7 @@ export async function chatCompletion(
 export interface StreamCallbacks {
   /** The server admitted the job. Headers and the role chunk arrived. */
   onRole?: () => void;
-  /** One text fragment: the answer, the think block, or a tool call piece. */
   onDelta?: (delta: { content?: string; reasoning?: string; toolCall?: ToolCallDelta }) => void;
-  /** The final chunk carried a finish reason and optional usage. */
   onFinish?: (reason: FinishReason, usage: Usage | undefined) => void;
 }
 
@@ -336,7 +332,7 @@ export async function chatStream(
     try {
       chunk = JSON.parse(ev.data) as ChatCompletionChunk;
     } catch {
-      return; // Ignore a malformed event, as a defensive measure.
+      return;
     }
     for (const choice of chunk.choices ?? []) {
       if (choice.delta.role !== undefined) callbacks.onRole?.();

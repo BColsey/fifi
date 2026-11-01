@@ -53,7 +53,6 @@ fn unregister(shared: &Shared, job: &Job) {
     lock(&shared.active).retain(|entry| !Arc::ptr_eq(&entry.cancel, &job.generation.cancel));
 }
 
-/// Fan out the same error without changing its contract variant.
 fn copy_error(error: &EngError) -> EngError {
     match error {
         EngError::ModelOutput(message) => EngError::ModelOutput(message.clone()),
@@ -629,7 +628,7 @@ pub(super) fn work<E: ExecutorOps>(
             }
         });
     }
-    // Shutdown needs no further executor calls and does not wait for any output receiver.
+    // Shutdown needs no further executor calls.
     for mut slot in slots {
         cancelled(&mut slot);
         unregister(shared, &slot.job);

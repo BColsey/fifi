@@ -135,10 +135,8 @@ impl ResidentDecoder<'_> {
             consts: &weights.consts,
             compile: compiled_rows,
         };
-        // The stacked activations.
         let mut h = super::prefill::step::embed_rows(&mut ctx, ckpt, &weights.embed, tokens)?;
         check_dtype("embedding stack", &h, ctx.consts.act)?;
-        // Per-slot next layer states, filled layer by layer.
         let mut nexts: Vec<Vec<LayerState>> = (0..rows).map(|_| Vec::new()).collect();
         let mut health: Option<ExecutionTensor> = None;
         for layer in weights.layers.iter() {
@@ -307,7 +305,6 @@ impl ResidentDecoder<'_> {
         } else {
             next
         };
-        // The dtype invariants of the committed state, every slot.
         for layers in &nexts {
             check_state_dtypes(layers, ctx.consts.act)?;
         }
@@ -656,7 +653,6 @@ mod tests {
         let ckpt_dir = env_path("Q36_CKPT_DIR");
         let real = open(&ckpt_dir);
         let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
-        // This diagnostic uses BF16; it is not a compiled daily-engine baseline.
         let mut decoder = ResidentDecoder::new_with_activation(
             MlxKernels::try_new().unwrap(),
             &real.ckpt,
@@ -803,7 +799,6 @@ mod tests {
             t = r.token.unwrap();
             solo_tokens.push(t);
         }
-        // B=1: the exact solo match through the fallback.
         {
             let host = HostWeights::load(&ckpt, &TINY_GQA, &config).unwrap();
             let mut dec =
@@ -819,7 +814,6 @@ mod tests {
                 t = got.token.unwrap();
             }
         }
-        // B=2/4/8: every slot steps the same stream; every slot must match solo.
         for b in [2usize, 4, 8] {
             let host = HostWeights::load(&ckpt, &TINY_GQA, &config).unwrap();
             let mut dec =

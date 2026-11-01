@@ -27,18 +27,12 @@ pub enum ReaderKind {
 /// zeroed `Slot` is a valid empty slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SlotState {
-    /// Empty; `begin_fill` may take it.
     #[default]
     Free,
-    /// A fill is in flight for its expert; not readable yet.
     Filling,
-    /// The fill landed; publication happens only at the token boundary.
     Ready,
-    /// Live: readers may acquire it and lookups find it.
     Published,
-    /// Unpublished but still read by leftover readers; frees when they finish.
     Draining,
-    /// A fill that missed its deadline; never published, only reclaimed.
     Poisoned,
 }
 
@@ -57,7 +51,6 @@ struct Slot {
 }
 
 impl Slot {
-    /// The total reader count of both kinds.
     fn readers(&self) -> u32 {
         self.copy_readers + self.cpu_readers
     }
@@ -68,32 +61,40 @@ impl Slot {
 pub enum ResidencyError {
     /// `begin_fill` found no Free slot in `layer`; a victim must first be
     /// unpublished and drained.
-    NoFreeSlot { layer: usize },
+    NoFreeSlot {
+        layer: usize,
+    },
     /// The expert already owns a slot of `layer` (filling, ready or published).
-    AlreadyResident { layer: usize, expert: u16 },
-    /// `unpublish` found no published slot holding `expert` in `layer`.
-    NotPublished { layer: usize, expert: u16 },
-    /// `layer` is outside `0..layers` of the config.
-    BadLayer { layer: usize },
-    /// `slot` is outside `0..bank_slots_per_layer` of the config.
-    BadSlot { layer: usize, slot: usize },
-    /// `expert` is outside `0..experts` of the config.
-    BadExpert { layer: usize, expert: u16 },
-    /// The slot is in a state that forbids the operation.
+    AlreadyResident {
+        layer: usize,
+        expert: u16,
+    },
+    NotPublished {
+        layer: usize,
+        expert: u16,
+    },
+    BadLayer {
+        layer: usize,
+    },
+    BadSlot {
+        layer: usize,
+        slot: usize,
+    },
+    BadExpert {
+        layer: usize,
+        expert: u16,
+    },
     BadState {
         layer: usize,
         slot: usize,
         state: SlotState,
     },
-    /// `release` would take the `kind` reader count of the slot below zero.
     ReaderUnderflow {
         layer: usize,
         slot: usize,
         kind: ReaderKind,
     },
-    /// No filling slot waits on the event: unknown, completed, or poisoned.
     UnknownEvent(EventId),
-    /// `check_partition` found a broken invariant; the string names it.
     Partition(String),
 }
 
@@ -114,7 +115,7 @@ pub struct ResidencyTable {
 }
 
 impl ResidencyTable {
-    /// Builds an all-Free table for `cfg`; the config should have passed `check`.
+    /// `cfg` should have passed `check`.
     pub fn new(cfg: &TieredConfig) -> Self {
         Self {
             cfg: cfg.clone(),
@@ -378,7 +379,6 @@ impl ResidencyTable {
         self.slot(layer, slot).map(|s| s.state)
     }
 
-    /// The slot row of `(layer, slot)` after range checks.
     fn slot(&self, layer: usize, slot: usize) -> Result<&Slot, ResidencyError> {
         self.check_layer(layer)?;
         self.slots[layer]
@@ -401,8 +401,6 @@ impl ResidencyTable {
         }
     }
 
-    /// Unpublished slot: Draining while readers hold it, Free the moment they are
-    /// done. The index entry must already be gone.
     fn retire(&mut self, layer: usize, slot: usize) {
         if self.slots[layer][slot].readers() == 0 {
             self.free(layer, slot);
@@ -411,7 +409,6 @@ impl ResidencyTable {
         }
     }
 
-    /// Clears a slot back to Free; the generation survives for the next expert.
     fn free(&mut self, layer: usize, slot: usize) {
         let s = &mut self.slots[layer][slot];
         s.state = SlotState::Free;
@@ -428,7 +425,6 @@ mod tests {
     use super::super::PolicyMode;
     use super::{ReaderKind, ResidencyError, ResidencyTable, SlotState, TieredConfig};
 
-    /// A small ledger config: 2 layers x 6 experts, banks of `slots` slots.
     fn table(slots: usize) -> ResidencyTable {
         let mut cfg = TieredConfig::qwen36(slots, PolicyMode::Adaptive);
         cfg.layers = 2;
@@ -436,7 +432,6 @@ mod tests {
         ResidencyTable::new(&cfg)
     }
 
-    /// Fills, completes and publishes `expert` in `layer` with no readers.
     fn publish(table: &mut ResidencyTable, layer: usize, expert: u16, event: u64) -> usize {
         let slot = table.begin_fill(layer, expert, event, u64::MAX).unwrap();
         table.event_complete(event).unwrap();
@@ -449,7 +444,6 @@ mod tests {
         let mut table = table(2);
         table.begin_fill(0, 3, 1, u64::MAX).unwrap();
         table.event_complete(1).unwrap();
-        // Ready, not live: a lookup misses until the boundary publishes it.
         assert_eq!(table.lookup(0, 3), None);
         assert_eq!(table.publish_ready(), &[(0, 3, 0, 1)]);
         assert_eq!(table.lookup(0, 3), Some((0, 1)));
@@ -459,12 +453,10 @@ mod tests {
     #[test]
     fn generations_increase_on_every_publication_of_a_slot() {
         let mut table = table(1);
-        // The one slot cycles experts; each publication raises its generation.
         for (round, expert) in [2u16, 5, 1].into_iter().enumerate() {
             publish(&mut table, 0, expert, round as u64 + 1);
             assert_eq!(table.lookup(0, expert), Some((0, round as u64 + 1)));
             table.unpublish(0, expert).unwrap();
-            // No readers, so the unpublish frees the slot at once.
             assert_eq!(table.slot_state(0, 0).unwrap(), SlotState::Free);
         }
     }
@@ -475,7 +467,6 @@ mod tests {
         publish(&mut table, 0, 2, 1);
         table.acquire(0, 0, ReaderKind::CpuJob).unwrap();
         table.unpublish(0, 2).unwrap();
-        // Draining under a CPU reader: not free, so no fill can take the slot.
         assert_eq!(table.slot_state(0, 0).unwrap(), SlotState::Draining);
         assert_eq!(
             table.begin_fill(0, 3, 2, u64::MAX),
@@ -509,7 +500,6 @@ mod tests {
         );
         table.publish_ready();
         table.acquire(0, 0, ReaderKind::CopySource).unwrap();
-        // The copy reader keeps the slot draining, but a new reader is refused.
         table.unpublish(0, 1).unwrap();
         assert_eq!(
             table.acquire(0, 0, ReaderKind::CpuJob),
@@ -527,7 +517,6 @@ mod tests {
         table.begin_fill(0, 4, 9, 100).unwrap();
         assert_eq!(table.expire(101), &[(0, 0)]);
         assert_eq!(table.slot_state(0, 0).unwrap(), SlotState::Poisoned);
-        // Never published, never looked up, and the late event is refused.
         assert!(table.publish_ready().is_empty());
         assert_eq!(table.lookup(0, 4), None);
         assert_eq!(
@@ -546,7 +535,6 @@ mod tests {
         table.acquire(1, 0, ReaderKind::CopySource).unwrap();
         assert_eq!(table.lookup(1, 4), Some((0, 1)));
         table.unpublish(1, 4).unwrap();
-        // The map entry is gone at once, even while the slot still drains.
         assert_eq!(table.lookup(1, 4), None);
         assert_eq!(table.slot_state(1, 0).unwrap(), SlotState::Draining);
         table.release(1, 0, ReaderKind::CopySource).unwrap();

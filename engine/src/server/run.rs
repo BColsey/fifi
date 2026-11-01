@@ -1,7 +1,6 @@
 //! Startup and shutdown of `enginesrv`.
 //!
-//! Order: read the command line, the configuration, and the key; bind the listener; start the
-//! engines; serve. `SIGTERM` or `SIGINT` stops the listener, lets the running requests finish,
+//! `SIGTERM` or `SIGINT` stops the listener, lets the running requests finish,
 //! stops the engine threads, and returns. The caller then exits with code 0.
 
 use std::io::Write as _;
@@ -24,7 +23,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-/// Runs the server. `args` are the command-line arguments after the program name.
+/// `args` are the command-line arguments after the program name.
 /// The call returns after a shutdown signal and the end of the running requests.
 pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     let path = config_path(args)?;
@@ -71,8 +70,6 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
     outcome(served, failures)
 }
 
-/// The result of a run: an error of the server comes first, then the failures that the engines
-/// reported at shutdown. A run without either succeeds.
 fn outcome(served: Result<(), StartupError>, failures: Vec<String>) -> Result<(), StartupError> {
     served?;
     if failures.is_empty() {
@@ -82,8 +79,6 @@ fn outcome(served: Result<(), StartupError>, failures: Vec<String>) -> Result<()
     }
 }
 
-/// Describes the failure that an engine reported at shutdown, such as a panic or a failed load.
-/// An engine without a failure gives `None`.
 fn shutdown_failure(id: &str, report: &ShutdownReport) -> Option<String> {
     report.failure.as_ref().map(|cause| {
         format!(
@@ -93,11 +88,6 @@ fn shutdown_failure(id: &str, report: &ShutdownReport) -> Option<String> {
     })
 }
 
-/// Starts every engine of the configuration. A failure names the engine. Every entry carries the
-/// `prefix_reuse` flag of the configuration file to the chat handler and to the Q36 engine
-/// start, whose session-cap rule reads it (`family::qwen36::settings::check_prefix_reuse_cap`),
-/// and the sampling defaults that its `generation_config.json` sets together with the flag of
-/// whether that file supplied them (the start line quotes both).
 /// Applies the per-entry replay opt-outs to a freshly built bundle and
 /// reports the effective state on stderr (the template's own load line
 /// shows the default resolution, before these overrides). Called while the
@@ -195,8 +185,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
                 describe(&error)
             ))
         })?;
-        // Per-entry opt-outs, applied while the bundle is still uniquely
-        // held. The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
+        // The env rollback (ENGINESRV_THINK_REPLAY=0) resolved inside
         // the template already wins over anything set here.
         apply_replay_overrides(&config.id, &mut bundle, config)?;
         let generation = config.model_dir.join("generation_config.json");
@@ -245,8 +234,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
 
 /// The start line of one engine: the effective sampling defaults and the file they came from.
 /// The line quotes the path of `generation_config.json` and the values in force, so a wrong
-/// default is visible before the first request. `from_file` comes from the loader result, so
-/// the label always agrees with the read.
+/// default is visible before the first request.
 fn defaults_line(
     id: &str,
     file: &std::path::Path,
@@ -477,8 +465,6 @@ fn describe(error: &EngError) -> String {
     }
 }
 
-/// Serves requests until `shutdown` completes. Then it stops the listener and waits for the
-/// running requests.
 pub(crate) async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -495,10 +481,9 @@ pub(crate) async fn serve(
         .map_err(|error| StartupError(format!("server failure: {error}")))
 }
 
-/// Installs the handlers for `SIGTERM` and `SIGINT` at once and returns the future that completes
-/// when one of them arrives. The call needs a running Tokio runtime. A signal that arrives before
-/// the first poll is not lost. When the process cannot install the handlers, the future waits for
-/// the interrupt signal alone.
+/// The call needs a running Tokio runtime. A signal that arrives before the first poll is not
+/// lost. When the process cannot install the handlers, the future waits for the interrupt
+/// signal alone.
 fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
     #[cfg(unix)]
     let streams = {
@@ -599,7 +584,6 @@ mod tests {
     fn flint_prefix_reuse_needs_the_env_opt_in() {
         let flint = crate::family::flint::FAMILY;
         let other = crate::family::qwen36::factory::FAMILY;
-        // The full 2x2x2 matrix (family x file flag x env opt-in).
         assert!(
             entry_prefix_reuse(other, true, false),
             "other families follow the flag"
@@ -801,7 +785,6 @@ mod tests {
         }
     }
 
-    /// Sends one raw HTTP request and reads the whole answer until the server closes the socket.
     fn exchange(address: std::net::SocketAddr, request: String) -> String {
         let mut socket = std::net::TcpStream::connect(address).expect("connect");
         socket
@@ -826,7 +809,6 @@ mod tests {
         )
     }
 
-    /// Starts a server on a free port with one fake engine that replies "abcdef".
     async fn start(
         delay_ms: u64,
     ) -> (
@@ -952,7 +934,6 @@ mod tests {
 
     #[test]
     fn prefix_reuse_is_accepted_for_other_families() {
-        // The flag reaches every entry of the fake family.
         let file = file_with(vec![engine_config("e1", None)], true);
         let (engines, entries) = start_engines(&file).expect("engines");
         assert!(entries[0].prefix_reuse);
@@ -1105,7 +1086,6 @@ mod tests {
         );
     }
 
-    /// A config entry of the fake family whose `model_dir` is a fresh temp directory.
     fn entry_with_model_dir(text: Option<&str>) -> (tempfile::TempDir, EngineConfig) {
         let dir = tempfile::tempdir().expect("temp dir");
         if let Some(text) = text {

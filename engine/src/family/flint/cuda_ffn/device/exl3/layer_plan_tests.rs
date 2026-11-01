@@ -48,8 +48,6 @@ fn tiles_split_evenly_into_the_fewest_tensor_height_runs() {
             next += tile.rows;
         }
         if rows > TILE_MAX_ROWS {
-            // A big expert never leaves a short remainder tile behind: that
-            // remainder would drop off the tensor-core kernel.
             assert_eq!(RowClass::of(low).unwrap(), RowClass::Tensor, "rows {rows}");
         }
     }
@@ -133,7 +131,6 @@ fn rounds_fill_to_capacity_and_split_only_when_the_slot_arena_is_smaller() {
     // With every expert resident there is nothing to round.
     let (_, whole) = plan_of(&ids, 256);
     assert_eq!(whole.rounds.len(), 1);
-    // A capacity of one makes every expert its own round.
     let (_, single) = plan_of(&routing(9, 3), 1);
     assert!(single.rounds.iter().all(|round| round.len() == 1));
 }

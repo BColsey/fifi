@@ -1,5 +1,3 @@
-/** Tests for the pure in-flight send gate (node:test; no DOM at runtime). */
-
 import { test } from "node:test";
 import { ok, strictEqual } from "node:assert";
 import { SendGate } from "./sendgate.js";

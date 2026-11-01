@@ -89,22 +89,18 @@ impl MailboxLayout {
         self.hidden * 4
     }
 
-    /// Byte offset of the row.
     pub(crate) fn row_offset(&self) -> usize {
         REQUEST_BYTES
     }
 
-    /// Byte offset of the answer line.
     pub(crate) fn answer_offset(&self) -> usize {
         REQUEST_BYTES + self.row_bytes().next_multiple_of(LINE)
     }
 
-    /// Byte offset of the partial.
     pub(crate) fn partial_offset(&self) -> usize {
         self.answer_offset() + ANSWER_BYTES
     }
 
-    /// Bytes of the whole mapping.
     pub(crate) fn total_bytes(&self) -> usize {
         self.partial_offset() + self.row_bytes().next_multiple_of(LINE)
     }
@@ -197,7 +193,6 @@ impl Mailbox {
         same_adapter(&ctx.lease, &self.lease, "mailbox")
     }
 
-    /// Where each part of this mailbox lives.
     pub(crate) fn layout(&self) -> MailboxLayout {
         self.layout
     }

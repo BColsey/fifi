@@ -30,10 +30,6 @@ pub enum ExpertProjection {
     Down,
 }
 
-/// Supplies host-backed, finite F32 tensors with `[out, in]` projection storage.
-/// Dense names are exact checkpoint names, including `language_model.` prefixes.
-/// Implementations must reject unknown, MTP, vision, and audio names with `Checkpoint`.
-/// Scalars and convolution parameters use `dense`; experts are fetched only after routing.
 /// One expert projection exactly as the checkpoint stores it.
 #[derive(Clone, Debug)]
 pub struct PackedExpert {
@@ -72,6 +68,10 @@ impl StoredWeight {
 }
 
 /// The loader lane owns checkpoint reading and dequantization behind this interface.
+/// Supplies host-backed, finite F32 tensors with `[out, in]` projection storage.
+/// Dense names are exact checkpoint names, including `language_model.` prefixes.
+/// Implementations must reject unknown, MTP, vision, and audio names with `Checkpoint`.
+/// Scalars and convolution parameters use `dense`; experts are fetched only after routing.
 pub trait WeightSource {
     fn dense(&mut self, name: &str) -> Result<Tensor, EngError>;
 
@@ -86,7 +86,6 @@ pub trait WeightSource {
         expert: ExpertIndex,
         projection: ExpertProjection,
     ) -> Result<Tensor, EngError>;
-    /// Reports whether this source can read experts as packed NVFP4 bytes.
     fn has_packed_experts(&self) -> bool {
         false
     }
@@ -137,7 +136,6 @@ pub trait WeightSource {
         let _ = layer;
         Ok(())
     }
-    /// Reads one expert projection as packed NVFP4 bytes. The default refuses.
     fn expert_packed(
         &mut self,
         layer: u32,
@@ -394,7 +392,6 @@ mod validate_tests {
             );
             assert!(read(tensor, &[2]).is_err(), "read accepted bad tensor");
         }
-        // Wrong dtype is refused by both even when byte content is irrelevant.
         let bytes = Tensor::try_from_host(Dtype::Bf16, vec![2], vec![0; 4]).unwrap();
         assert!(validate(&bytes, &[2]).is_err());
         assert!(read(&bytes, &[2]).is_err());

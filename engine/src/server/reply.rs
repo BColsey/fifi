@@ -13,12 +13,10 @@ use crate::EngError;
 use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefixReport};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, OutputAssembler};
 
-/// What the pump learned from one event.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// New parts for the client. The job continues. The list is never empty.
+    /// New parts for the client. The list is never empty.
     Pieces(Vec<Piece>),
-    /// The job ended. `pieces` are the last parts for the client.
     Done {
         pieces: Vec<Piece>,
         finish: FinishReason,
@@ -60,7 +58,7 @@ fn finish_reason(finish: DecodeFinish) -> Option<FinishReason> {
 }
 
 impl RunningJob {
-    /// Wraps a submitted job. The job carries its own output limit.
+    /// The job carries its own output limit.
     pub(crate) fn new(
         handle: JobHandle,
         assembler: OutputAssembler,
@@ -81,8 +79,7 @@ impl RunningJob {
         }
     }
 
-    /// The stop string that ended the reply, when one did. Read after `collect`
-    /// or a `Done` step: the assembler keeps the recorded match.
+    /// Read after `collect` or a `Done` step: the assembler keeps the recorded match.
     pub(crate) fn matched_stop(&self) -> Option<String> {
         self.assembler.matched_stop().map(str::to_string)
     }
@@ -93,7 +90,7 @@ impl RunningJob {
         self.prompt_tokens
     }
 
-    /// Waits for the next step. After `Done`, `Aborted`, or an error, the caller stops.
+    /// After `Done`, `Aborted`, or an error, the caller stops.
     /// `Done` and an error write the line of the request log.
     pub(crate) async fn next(&mut self) -> Result<Step, ServerError> {
         let step = self.read_step().await;
@@ -198,10 +195,8 @@ fn count_calls(pieces: &[Piece]) -> u32 {
     u32::try_from(calls).unwrap_or(u32::MAX)
 }
 
-/// Reads the job to its end and returns the pieces in arrival order, the finish
-/// reason, and the usage. The Anthropic route walks this so its content blocks
-/// stay interleaved as the model produced them. A job that ends without a finish
-/// is a backend failure for a reply that has no stream.
+/// The Anthropic route walks this so its content blocks stay interleaved as the model produced
+/// them. A job that ends without a finish is a backend failure for a reply that has no stream.
 pub(crate) async fn collect_pieces(
     job: &mut RunningJob,
 ) -> Result<(Vec<Piece>, FinishReason, Usage), ServerError> {
@@ -229,8 +224,6 @@ pub(crate) async fn collect_pieces(
     }
 }
 
-/// Reads the job to its end and returns the reply parts, the finish reason, and the usage.
-/// A job that ends without a finish is a backend failure for a reply that has no stream.
 pub(crate) async fn collect(
     job: &mut RunningJob,
 ) -> Result<(ReplyParts, FinishReason, Usage), ServerError> {
@@ -274,7 +267,6 @@ mod tests {
 
     const PROMPT: [u32; 3] = [104, 105, 33];
 
-    /// A request log that writes nowhere. The tests of the pump do not read the log.
     fn silent() -> RequestLog {
         RequestLog::new(
             Arc::new(Mutex::new(std::io::sink())),
@@ -287,7 +279,6 @@ mod tests {
         )
     }
 
-    /// A log sink that keeps every write, for the tests that read the request-log line.
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -306,7 +297,6 @@ mod tests {
     }
 
     impl Capture {
-        /// Everything written so far, as one line of text.
         fn text(&self) -> String {
             let bytes = self.0.lock().expect("capture lock");
             String::from_utf8(bytes.clone()).expect("utf-8 write")
@@ -322,12 +312,10 @@ mod tests {
         }
     }
 
-    /// Submits a three-token prompt with the output limit `budget` and wraps the job in a pump.
     fn run(engine: &Engine, stops: &[&str], budget: u32) -> (RunningJob, Arc<AtomicBool>) {
         submit(engine, stops, budget, None)
     }
 
-    /// Like `run`, with the first `boundary` prompt tokens marked as the reusable prefix.
     fn submit(
         engine: &Engine,
         stops: &[&str],
@@ -337,7 +325,6 @@ mod tests {
         submit_logged(engine, stops, budget, boundary, silent())
     }
 
-    /// `submit` with the pump's request log given by the caller.
     fn submit_logged(
         engine: &Engine,
         stops: &[&str],
@@ -381,7 +368,6 @@ mod tests {
         Piece::Content(text.to_string())
     }
 
-    /// All content text of the steps, in order.
     fn content_of(found: &[Step]) -> String {
         found
             .iter()

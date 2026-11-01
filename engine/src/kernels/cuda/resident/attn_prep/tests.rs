@@ -41,7 +41,6 @@ const EPS: f32 = 1e-6;
 const BASE: f32 = 1e7;
 const D: usize = HEAD_DIM;
 
-/// The model-scale group has input scale 1.7, the large-amplitude group 20.
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
     Model,
@@ -59,7 +58,6 @@ fn shape(n_head: usize, n_kv_head: usize, n_rot: usize, m: usize, rows: usize) -
 
 // ---- host models -------------------------------------------------------------------------
 
-/// The f64 reference of one head row: RMSNorm times weight, then NEOX rope at position `p`.
 fn ref_head(x: &[f32], w: &[f32], p: usize, n_rot: usize) -> Vec<f64> {
     let ss: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let rstd = 1.0 / (ss / D as f64 + f64::from(EPS)).sqrt();
@@ -79,7 +77,6 @@ fn ref_head(x: &[f32], w: &[f32], p: usize, n_rot: usize) -> Vec<f64> {
     out
 }
 
-/// The RP1 bound of element `d` at position `p`.
 fn rp1(reference: &[f64], d: usize, p: usize, n_rot: usize) -> f64 {
     let mut bound = 2f64.powi(-20) * reference[d].abs().max(1.0);
     if d < n_rot {
@@ -120,7 +117,6 @@ fn f16_value(bits: u16) -> f64 {
     f64::from(f16_to_f32(bits))
 }
 
-/// The unit in the last place of a binary16 value.
 fn ulp16(x: f64) -> f64 {
     let x = x.abs();
     if x < 2f64.powi(-14) {
@@ -129,8 +125,6 @@ fn ulp16(x: f64) -> f64 {
         2f64.powi(i32::try_from((x.to_bits() >> 52) & 0x7ff).expect("exponent") - 1023 - 10)
     }
 }
-
-// ---- report ------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 struct Worst {
@@ -150,8 +144,6 @@ fn band_of(p: usize) -> usize {
     }
 }
 
-/// The RP1 report: the worst ratio per position band and group, the q-only ratios and the K-tail
-/// numbers.
 #[derive(Default)]
 struct Report {
     all: [[Worst; 5]; 2],
@@ -188,8 +180,6 @@ impl Report {
     }
 }
 
-// ---- fixture -----------------------------------------------------------------------------
-
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -203,7 +193,6 @@ impl Rig {
     }
 }
 
-/// Host inputs of one call.
 struct Data {
     proj: Vec<f32>,
     q_norm: Vec<f32>,
@@ -221,7 +210,6 @@ fn data(s: &AttnPrepShape, seed: u64, scale: f64) -> Data {
 
 /// One range of a call: buffer index, byte offset, bytes.
 type Slot = (usize, usize, usize);
-/// Slot order: proj, q_norm, k_norm, q, k_cache, v_cache, pos, status.
 const NAMES: [&str; 8] = [
     "proj", "q_norm", "k_norm", "q", "k_cache", "v_cache", "pos", "status",
 ];
@@ -233,13 +221,10 @@ const KC: usize = 4;
 const VC: usize = 5;
 const POS: usize = 6;
 const STATUS: usize = 7;
-/// Buffer indexes: 0 proj, 1 q_norm, 2 k_norm, 3 q, 4 k cache, 5 v cache, 6 the StepParams block,
-/// 7 and 8 spare word buffers.
 const Q_BUF: usize = 3;
 const KC_BUF: usize = 4;
 const PARAMS_BUF: usize = 6;
 
-/// What one fixture needs: geometry, data, the position word and the status before the launch.
 struct Cfg {
     shape: AttnPrepShape,
     scale: f64,
@@ -314,8 +299,6 @@ impl Fx {
         Self { rig, bufs, slots, base: slots, shape: s, rope, admit: usize::try_from(cfg.word).unwrap_or(0), data }
     }
 
-    /// Queues the call on `stream`; `foreign` replaces the range of one slot by a range of a buffer
-    /// of another context.
     fn attempt(
         &self,
         stream: &DeviceStream,
@@ -344,7 +327,6 @@ impl Fx {
         self.rig.ctx.attn_prep(stream, call)
     }
 
-    /// Queues the call and drains the stream when it was accepted.
     fn run(&self) -> Result<(), EngError> {
         self.attempt(&self.rig.stream, None)?;
         self.rig.stream.synchronize().expect("drain");
@@ -368,8 +350,6 @@ impl Fx {
         start..start + cache_bytes(s.rows, s.n_kv_head)
     }
 
-    /// Every byte of both cache buffers, except the append rows `[first, first + m)`, is the
-    /// sentinel; with `first` None, no byte was written at all.
     fn caches_untouched(&self, written: Option<(usize, usize)>) -> bool {
         let row = self.shape.n_kv_head * D * 2;
         let skip = written.map(|(first, m)| {
@@ -393,7 +373,6 @@ impl Fx {
     }
 }
 
-/// How strictly `verify` holds each element.
 #[derive(Clone, Copy, PartialEq)]
 enum Bound {
     Rp1,
@@ -409,7 +388,6 @@ fn bound_of(kind: Bound, reference: &[f64], d: usize, p: usize, n_rot: usize) ->
     }
 }
 
-/// How a valid launch is judged: the report group, the bound and the status word it must leave.
 #[derive(Clone, Copy)]
 struct Mode {
     group: Group,
@@ -417,9 +395,6 @@ struct Mode {
     status: i32,
 }
 
-/// Checks a valid launch whose token 0 is at position `pos0`: q by the bound, K by the interval
-/// rule for every dimension, V bit equal, the rows outside the append and the canaries intact,
-/// and the status word as the mode says.
 #[rustfmt::skip]
 fn verify(fx: &Fx, pos0: usize, mode: Mode, rep: &mut Report) {
     let Mode { group, kind, status } = mode;
@@ -466,7 +441,6 @@ fn verify(fx: &Fx, pos0: usize, mode: Mode, rep: &mut Report) {
     assert!(fx.bytes(Q)[q_bytes(s.m, s.n_head)..].iter().all(|&b| b == Q_FILL), "the bytes after q changed");
 }
 
-/// Runs a valid case on a fresh fixture and verifies it.
 #[rustfmt::skip]
 fn case(cfg: &Cfg, group: Group, kind: Bound, rep: &mut Report) -> Fx {
     let fx = Fx::new(cfg);
@@ -653,7 +627,6 @@ fn row(label: &str, text: &str, edit: impl Fn(&mut Fx) + 'static) -> Row {
     (label.to_owned(), text.to_owned(), Box::new(edit))
 }
 
-/// Shape and scalar rows: the tag of the rule that must fire.
 #[rustfmt::skip]
 fn shape_rows() -> Vec<Row> {
     let mut rows = Vec::new();
@@ -682,7 +655,6 @@ fn shape_rows() -> Vec<Row> {
     rows
 }
 
-/// Size and alignment rows: the text of `require_fit`.
 #[rustfmt::skip]
 fn fit_rows() -> Vec<Row> {
     let mut rows = Vec::new();
@@ -697,9 +669,6 @@ fn fit_rows() -> Vec<Row> {
     rows
 }
 
-/// The 22 pairs `check_apart` compares: the written slots (q, k_cache, v_cache, status) pairwise,
-/// then each against the read slots (proj, q_norm, k_norm, pos). The later slot of a pair is moved
-/// onto the first one, in separate word buffers for `pos` and `status`.
 fn overlap_rows() -> Vec<Row> {
     let written = [Q, KC, VC, STATUS];
     let read = [PROJ, QN, KN, POS];
@@ -769,7 +738,6 @@ fn attn_prep_rejects_bad_arguments_before_any_launch() {
     for (buffer, bytes) in sizes.iter().enumerate() {
         assert!(fx.bufs[buffer].range(0, 0).is_err() && fx.bufs[buffer].range(1, *bytes).is_err());
     }
-    // Words and caches did not change; the backend is usable afterwards.
     assert!(before == (fx.bytes(PARAMS_BUF), fx.bytes(KC_BUF)));
     fx.run().expect("a good call after the refusals");
     controls(&mut fx);
@@ -876,7 +844,6 @@ fn golden_rope() {
     }
 }
 
-/// `rp1` on and off the rotated dimensions, `rn16` ties and subnormals, and the local f64 rounding.
 fn pinned_rounding() {
     let reference: Vec<f64> = (0..D)
         .map(|d| if d == 1 || d == 3 { 3.0 } else { 0.5 })
@@ -1013,8 +980,6 @@ fn attn_prep_inside_a_capture_equals_eager() {
 // only through `?` - no assert, expect or unwrap while a CUDA owner is alive - hands back plain
 // host bytes, and drops every owner at its return; only then do the assertions run.
 
-/// Buffer indexes of the rows fixture: 0 proj, 1 q_norm, 2 k_norm, 3 q, 4 k rows, 5 v rows,
-/// 6 the StepParams block, 7 and 8 spare word buffers, 9 and 10 the fp16 caches of test A.
 const KR: usize = 4;
 const VR: usize = 5;
 const KC_FP16: usize = 9;
@@ -1072,7 +1037,6 @@ impl RowsFx {
         self.bufs[index].range(offset, bytes)
     }
 
-    /// Queues the rows call; `foreign` replaces the range of one slot by a range of another context.
     fn attempt(&self, foreign: Option<(usize, &DeviceBuffer)>) -> Result<(), EngError> {
         let r = |i: usize| match foreign {
             Some((slot, other)) if slot == i => other.range(self.slots[i].1, self.slots[i].2),
@@ -1096,7 +1060,6 @@ impl RowsFx {
         )
     }
 
-    /// Queues the rows call and drains the stream when it was accepted.
     fn run_rows(&self) -> Result<(), EngError> {
         self.attempt(None)?;
         self.rig.stream.synchronize()?;
@@ -1137,7 +1100,6 @@ impl RowsFx {
     }
 }
 
-/// The status word of a pulled step block (host bytes only).
 fn rows_status_word(params: &[u8]) -> i32 {
     i32::from_le_bytes(
         params[OFFSET_STATUS..OFFSET_STATUS + 4]
@@ -1195,8 +1157,6 @@ fn attn_prep_rows_round_to_the_fp16_cache_bits_and_carry_the_f32_values() {
     assert!(rep.worst() <= 1.0);
 }
 
-/// The host data of test A's device phase: the fp16 launch's q and both caches, then the rows
-/// launch's q, both rows buffers and step block, and the fixture's shape and host data.
 struct RowsAOut {
     fp16_q: Vec<u8>,
     kc: Vec<u8>,
@@ -1254,8 +1214,6 @@ fn a_poisoned_word_writes_no_rows_and_reports_mask_4() {
     }
 }
 
-/// The host data of test B's device phase: the step block before the poisoned launch, then q,
-/// both rows buffers and the step block after it.
 struct RowsBOut {
     before: Vec<u8>,
     q: Vec<u8>,
@@ -1265,8 +1223,6 @@ struct RowsBOut {
     shape: AttnPrepShape,
 }
 
-/// Test B's device phase (the isolation split): the step block as it was, the poisoned launch,
-/// then the buffers its assertions read.
 fn rows_b_phase(fx: RowsFx) -> Result<RowsBOut, EngError> {
     let before = fx.pull(PARAMS_BUF)?;
     fx.run_rows()?;
@@ -1305,17 +1261,12 @@ fn attn_prep_rows_rejects_bad_arguments_before_any_launch() {
 /// One row of the refusal table: the label, the text its guard must name, and the edit.
 type RowsRow = (&'static str, &'static str, fn(&mut RowsFx));
 
-/// The host data of test C's device phase: the step block and a rows buffer before and after the
-/// refusal table, every refusal's own result, and the good call after them.
 struct RowsCOut {
     before: (Vec<u8>, Vec<u8>),
     after: (Vec<u8>, Vec<u8>),
     refused: Vec<(&'static str, &'static str, Result<(), EngError>)>,
 }
 
-/// Test C's device phase (the isolation split): the base call, every refusal edit with the base
-/// restored after it, the good call after the refusals, and the words and a rows buffer before
-/// and after. The refusal results are data; the assertions run in the test.
 fn rows_c_phase(mut fx: RowsFx) -> Result<RowsCOut, EngError> {
     fx.run_rows()?;
     let before = (fx.pull(PARAMS_BUF)?, fx.pull(KR)?);
@@ -1450,8 +1401,6 @@ fn reset_rows_to(fx: &RowsFx, word: i32) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The host data of the rows capture phase: the node count of the graph and the four buffers of
-/// each word, eager first, then replayed.
 struct RowsCaptureOut {
     nodes: usize,
     eager: Vec<[Vec<u8>; 4]>,

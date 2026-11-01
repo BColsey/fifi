@@ -29,7 +29,6 @@ unsafe extern "C" {
     fn mmq_device_facts_raw(out: *mut MmqFactsArgsRaw) -> c_int;
 }
 
-/// The facts as the wrapper reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kernels::cuda) struct MmqFactsRaw {
     pub(in crate::kernels::cuda) cc: c_int,

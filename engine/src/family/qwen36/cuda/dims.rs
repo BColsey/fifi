@@ -14,7 +14,6 @@ use crate::{
     },
 };
 
-/// How the KV cache stores K and V. Fixed for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KvMode {
     Fp16,
@@ -30,9 +29,8 @@ pub(crate) enum KvRequest {
 }
 
 impl KvRequest {
-    /// `Auto` takes `Fp16` when its KV bytes fit `budget`, else `Int8G32`. `budget` is the frozen
-    /// headroom of the host, passed by the admission caller; there is no default number here, and
-    /// `Auto` without a frozen budget is an error, not a guess.
+    /// `budget` is the frozen headroom of the host, passed by the admission caller; there is no
+    /// default number here, and `Auto` without a frozen budget is an error, not a guess.
     pub(crate) fn resolve(
         self,
         fp16_bytes: usize,
@@ -110,7 +108,6 @@ impl TieredPlan {
         }
     }
 
-    /// Refuses a plan the host or the policy cannot run, naming the field.
     pub(crate) fn check(&self) -> Result<(), EngError> {
         let bad = |what: String| Err(EngError::BadRequest(format!("tiered plan: {what}")));
         if self.slots_per_layer == 0 {
@@ -142,8 +139,6 @@ impl TieredPlan {
     }
 }
 
-/// The checked dimensions of the step: the layout record plus the widths of the fused
-/// projection outputs, read from the inventory.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StepDims {
     pub(crate) shape: HostShape,
@@ -154,7 +149,6 @@ pub(crate) struct StepDims {
 }
 
 impl StepDims {
-    /// Reads the projection widths from `inventory` and checks them against `shape`.
     pub(crate) fn new(shape: &HostShape, inventory: &Inventory) -> Result<Self, EngError> {
         shape.check()?;
         let d = &shape.delta;
@@ -203,8 +197,6 @@ impl StepDims {
     }
 }
 
-/// Output rows of the tensor of `role`: `dims[1]` of its GGUF dims, 1 for a vector. Every layer
-/// that holds the role must agree.
 fn role_rows(inventory: &Inventory, role: Role) -> Result<usize, EngError> {
     let mut found: Option<u64> = None;
     for tensor in inventory.tensors().iter().filter(|t| t.role == role) {

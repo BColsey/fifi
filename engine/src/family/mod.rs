@@ -15,9 +15,6 @@ pub mod gguf_model;
 pub mod keys;
 pub mod layer_weights;
 pub mod nemotron35;
-// Conversation parking: host-tier store mechanics and tests.
-// The device-side path (cut at the `keep` position, staging upload,
-// prefix adoption) does not exist yet, so only tests use the store.
 #[allow(
     dead_code,
     reason = "no engine path calls the store yet; only its tests do"

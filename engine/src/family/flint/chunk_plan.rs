@@ -11,9 +11,6 @@
 use crate::EngError;
 use std::ops::Range;
 
-/// Plans chunk row counts from a byte budget and a per-row cost. The cost is the
-/// biggest per-row intermediate the batch forward holds (the caller measures or
-/// plans it); the planner itself stays pure and portable.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FlintChunkPlanner {
     row_bytes: u64,
@@ -40,10 +37,6 @@ impl FlintChunkPlanner {
         })
     }
 
-    /// The rows of the next chunk for `remaining` rows under `budget_bytes` free
-    /// for prefill: the whole tail when it fits, else the budget-bound largest
-    /// count, else a MemoryPlan refusal (a prompt that cannot run one row at a
-    /// time cannot run at all).
     pub(crate) fn next_chunk(
         &self,
         remaining: usize,
@@ -64,7 +57,6 @@ impl FlintChunkPlanner {
         Ok(rows.min(remaining).min(self.max_rows))
     }
 
-    /// The full boundary list for a prompt of `rows` rows under `budget_bytes`.
     pub(crate) fn chunks(
         &self,
         rows: usize,

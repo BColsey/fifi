@@ -173,7 +173,6 @@ impl PinnedBuf {
         })
     }
 
-    /// Size of the buffer in bytes.
     pub(crate) fn len(&self) -> usize {
         self.bytes
     }

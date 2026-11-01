@@ -40,7 +40,6 @@ pub(in crate::kernels::cuda) fn butterfly32(lanes: &mut [f32; 32]) {
 pub(in crate::kernels::cuda) mod q8_ref {
     use super::*;
 
-    /// The 36 bytes of one block of 32 values.
     pub(in crate::kernels::cuda) fn block(values: &[f32; 32]) -> [u8; 36] {
         let amax = values.iter().fold(f32::NAN, |acc, v| acc.max(v.abs()));
         let d = amax / 127.0f32;
@@ -62,8 +61,6 @@ pub(in crate::kernels::cuda) mod q8_ref {
         bytes
     }
 
-    /// The padded `block_q8_1` row of `live` values (a multiple of 32): the live blocks, then
-    /// zero tail blocks up to `pad(len, 512)` values.
     pub(in crate::kernels::cuda) fn row(live: &[f32]) -> Vec<u8> {
         let padded = live.len().next_multiple_of(512);
         let mut out = Vec::with_capacity(padded / 32 * 36);
@@ -159,8 +156,6 @@ pub(in crate::kernels::cuda) fn as_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// One launch of the producer under test into canaried buffers: returns the read-back `h`,
-/// `norm_out` bytes and `q8` bytes.
 fn launch_mine(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -284,8 +279,6 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     for (name, h, delta, w) in cases {
         let (h_mine, norm_mine, q8_mine) =
             launch_mine(&ctx, &stream, h.len(), &h, delta.as_deref(), &w, eps);
-        // The delta add (and only it) touched h, in IEEE: byte-exact against the host sum, and
-        // without a delta h is untouched.
         let h_expected: Vec<f32> = match delta.as_deref() {
             Some(delta) => h.iter().zip(delta).map(|(value, d)| value + d).collect(),
             None => h.clone(),
@@ -325,8 +318,6 @@ fn add_rmsnorm_q8_matches_the_host_reference() {
     }
 }
 
-/// The byte counts `plan_add_rmsnorm_q8` checks a call against: `n` floats for each f32 range and
-/// the padded `block_q8_1` row for `q8`.
 #[test]
 fn add_rmsnorm_q8_needs_are_pure_and_exact() {
     let need = add_rmsnorm_q8_needs(2048).expect("sizes");
@@ -344,9 +335,6 @@ fn add_rmsnorm_q8_needs_are_pure_and_exact() {
     assert_eq!(add_rmsnorm_q8_needs(usize::MAX / 2), None);
 }
 
-/// The with/without-delta semantics: without `delta` nothing writes `h` and the norm is of `h`
-/// alone; with `delta` `h` becomes the sum in place and the norm is of the sum, byte-identical to
-/// a no-delta call on the pre-added row (the same values reach the kernel math).
 #[test]
 fn add_rmsnorm_q8_with_and_without_delta() {
     if !testkit::device_present("add_rmsnorm_q8_with_and_without_delta") {
@@ -386,9 +374,6 @@ fn add_rmsnorm_q8_with_and_without_delta() {
     assert_eq!(q8_pre, q8_yes, "the q8_1 rows of the two forms are equal");
 }
 
-/// NaN semantics: a NaN row reaches the producer; `norm_out` is NaN the way `add_norm_pack_k`
-/// writes it today (one NaN value poisons the sum of squares, so every norm value is NaN), the
-/// q8_1 blocks carry NaN scales (d and s) with zero codes, and nothing outside the outputs moves.
 #[test]
 fn add_rmsnorm_q8_propagates_a_nan_row() {
     if !testkit::device_present("add_rmsnorm_q8_propagates_a_nan_row") {
@@ -423,7 +408,6 @@ fn add_rmsnorm_q8_propagates_a_nan_row() {
     q8_ref::assert_nan_row(&q8_mine, n, "the NaN row's q8_1 bytes");
 }
 
-/// One refusal case of the wrapper: the numbers of the call and where its ranges live.
 #[derive(Clone, Copy)]
 struct Spec {
     n: usize,
@@ -449,15 +433,12 @@ enum NormIn {
     Weight,
 }
 
-/// Where `q8` of a case lies: its own buffer, or inside `h`'s.
 #[derive(Clone, Copy)]
 enum Q8In {
     Own,
     H,
 }
 
-/// Where `delta` of a case lies: its own buffer, or on `weight`'s (the two read ranges may
-/// legally share one allocation; the plan never compares them).
 #[derive(Clone, Copy)]
 enum DeltaIn {
     Own,
@@ -493,7 +474,6 @@ struct RefusalRig {
     ctx: CudaContext,
 }
 
-/// The second adapter: a stream and an h buffer that belong to another context.
 struct OtherContext {
     stream: DeviceStream,
     h: DeviceBuffer,
@@ -540,10 +520,6 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), cra
     )
 }
 
-/// For `plan_add_rmsnorm_q8`, every refusal is a `BadRequest` with the text of its own check,
-/// nothing is queued, the backend stays usable, the valid call of the same rig runs, and a second
-/// valid call with delta and weight on one buffer runs too (the plan never compares the two read
-/// ranges).
 #[test]
 fn add_rmsnorm_q8_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("add_rmsnorm_q8_rejects_unsound_calls_before_launching") {
@@ -696,8 +672,6 @@ fn add_rmsnorm_q8_rejects_unsound_calls_before_launching() {
     for (case, needle, spec) in cases {
         assert_bad_request(attempt(&rig, &other, spec), case, needle);
     }
-    // No refusal queued anything: the outputs are untouched, the backend works, and the valid
-    // call runs and writes q8; the shared delta/weight form follows below.
     rig.stream.synchronize().expect("drain");
     let norm = testkit::read_bytes(&rig.ctx, &rig.norm_out, 16_384);
     assert!(norm.iter().all(|&byte| byte == 0xAB), "norm_out untouched");
@@ -771,7 +745,6 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
         q8_ref::row(&norm),
         "the fused row is the IEEE host row"
     );
-    // The unfused `quantize_q8_1` of the same norm row.
     let need = add_rmsnorm_q8_needs(n).expect("sizes");
     let norm_dev = testkit::upload_bytes(&ctx, &norm_bytes);
     let unfused = testkit::upload_filled(&ctx, 0xA5, need.q8 + 64);
@@ -830,9 +803,6 @@ fn add_rmsnorm_q8_matches_unfused_quantize() {
     );
 }
 
-/// The end-to-end consumer check: `matvec_q` on the producer's q8_1 output equals `matvec_q` on
-/// the standalone quantize of the same `norm_out`, both within the matvec tolerance
-/// `64 * 2^-24 * sum(|term|)` of the f64 host reference, for a Q8_0 2048 -> 8192 projection.
 #[test]
 fn add_rmsnorm_q8_feeds_matvec_q() {
     if !testkit::device_present("add_rmsnorm_q8_feeds_matvec_q") {

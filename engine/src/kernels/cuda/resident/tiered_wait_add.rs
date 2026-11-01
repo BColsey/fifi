@@ -42,19 +42,16 @@ pub(crate) const MAX_TIMEOUT_NS: u64 = 120_000_000_000;
 /// Bytes of the control block the call reads: u64 `[0]` miss count, `[1]` expected sequence.
 pub(crate) const CTRL_BYTES: usize = 64;
 
-/// The sizes of one wait-add call. Qwen3.6 is `hidden` 2048; the timeout is the tiered plan's plus
-/// a margin.
+/// Qwen3.6 is `hidden` 2048; the timeout is the tiered plan's plus a margin.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WaitAddShape {
-    /// Width of the row, a multiple of 4 from 4 to 65536; it must equal the mailbox's.
+    /// Must equal the mailbox's `hidden`.
     pub(crate) hidden: usize,
-    /// The wait budget in nanoseconds, 1 to [`MAX_TIMEOUT_NS`].
     pub(crate) timeout_ns: u64,
 }
 
 /// One wait-add call. The layout of every range is in `native/resident/tiered_wait_add.h`.
 pub(crate) struct WaitAddCall<'b> {
-    /// Width of the row in floats, a multiple of 4 from 4 to 65536.
     pub(crate) hidden: usize,
     /// [`CTRL_BYTES`], 8-byte aligned: the layer's control block, written by classify.
     pub(crate) ctrl: DeviceRange<'b>,
@@ -64,11 +61,10 @@ pub(crate) struct WaitAddCall<'b> {
     pub(crate) resid: DeviceRange<'b>,
     /// The mailbox whose answer line and partial the kernel waits for; its `hidden` must match.
     pub(crate) mailbox: &'b Mailbox,
-    /// The wait budget in nanoseconds, 1 to [`MAX_TIMEOUT_NS`].
     pub(crate) timeout_ns: u64,
 }
 
-/// `BadRequest` unless every integer is inside its limit. Pure: no device is needed.
+/// Pure: no device is needed.
 pub(crate) fn check_shape(shape: &WaitAddShape) -> Result<(), EngError> {
     let WaitAddShape { hidden, timeout_ns } = *shape;
     let inside = (4..=MAX_HIDDEN).contains(&hidden)
@@ -84,8 +80,6 @@ pub(crate) fn check_shape(shape: &WaitAddShape) -> Result<(), EngError> {
     )))
 }
 
-/// One range of a call: its name, the bytes it must hold, its alignment, and whether the kernel
-/// writes it.
 struct Part<'x, 'b> {
     name: &'static str,
     range: &'x DeviceRange<'b>,
@@ -116,8 +110,6 @@ fn parts<'x, 'b>(call: &'x WaitAddCall<'b>) -> [Part<'x, 'b>; 3] {
     ]
 }
 
-/// Every range holds what the call uses at its alignment, and every range the kernel writes
-/// (`resid`, `word`) overlaps no other range (the written one named first in the refusal).
 fn check_ranges(call: &WaitAddCall<'_>) -> Result<(), EngError> {
     let parts = parts(call);
     for part in &parts {
@@ -146,10 +138,6 @@ fn to_int(value: usize) -> Result<c_int, EngError> {
 impl CudaContext {
     /// Queues the wait-add of one layer on `stream`. See the module doc and
     /// `native/resident/tiered_wait_add.h` for the semantics.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a shape outside
-    /// [`check_shape`], a `hidden` that differs from the mailbox's, a range that is short or
-    /// misaligned, and a written range that overlaps another range.
     pub(crate) fn tiered_wait_add(
         &self,
         stream: &DeviceStream,
@@ -162,7 +150,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of a wait-add call, then the native view of its ranges and ints.
     fn plan_wait_add<'b>(&self, call: &WaitAddCall<'b>) -> Result<WaitAddRaw<'b>, EngError> {
         call.mailbox.check_adapter(self)?;
         let (ctrl, word, resid) = (

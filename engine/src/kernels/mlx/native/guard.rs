@@ -25,7 +25,6 @@ use std::{
 use super::ffi;
 use crate::{EngError, tensor::OwnerKey};
 
-/// The most adapter leases that the process admits at once.
 const MAX_LEASES: usize = 2;
 
 static LIVE_OWNERS: AtomicUsize = AtomicUsize::new(0);
@@ -39,12 +38,10 @@ thread_local! {
     static DISPATCH_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Makes the native owner terminal for the rest of the process.
 pub(super) fn mark_failed() {
     RESIDENT_FAILED.store(true, Ordering::Release);
 }
 
-/// Whether the native owner is terminal. A terminal owner dispatches and releases nothing.
 pub(super) fn has_failed() -> bool {
     RESIDENT_FAILED.load(Ordering::Acquire)
 }
@@ -153,7 +150,6 @@ pub(super) fn selected_operation_count() -> u64 {
 pub(super) struct Lease;
 
 impl Lease {
-    /// Admits one more adapter, or reports why the process cannot.
     pub(super) fn acquire() -> Result<Rc<Self>, EngError> {
         if has_failed() {
             return Err(EngError::Backend {
@@ -182,7 +178,6 @@ impl Drop for Lease {
     }
 }
 
-/// Issues the identity of the next adapter generation.
 pub(super) fn next_owner() -> Result<OwnerKey, EngError> {
     NEXT_OWNER
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

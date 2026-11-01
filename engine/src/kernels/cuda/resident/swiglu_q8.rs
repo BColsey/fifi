@@ -26,20 +26,12 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::native::resident::swiglu_q8::{SwigluQ8Raw, swiglu_q8_launch};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
-/// The most values of one slot half.
 pub(crate) const MAX_FF: usize = 32_768;
 /// A slot half is a multiple of this (one q8_1 block).
 pub(crate) const FF_UNIT: usize = 32;
 /// Slots per call (top_k of the step).
 pub(crate) const MAX_SLOTS: usize = 8;
 
-/// One batched SwiGLU call. Both ranges are device ranges of this context.
-///
-/// - `gu`: f32 `[slots][y_slot_stride]` (read only the first `2 * n_ff` columns of each row).
-/// - `q8`: [`q8_1_bytes`]`(n_ff, slots)` bytes, 4-byte aligned.
-/// - `n_ff`: live values per half, a multiple of 32 in `32..=32768`.
-/// - `y_slot_stride`: elements between slot rows, at least `2 * n_ff`.
-/// - `slots`: expert slots, `1..=8`.
 pub(crate) struct SwigluQ8Call<'b> {
     pub(crate) gu: DeviceRange<'b>,
     pub(crate) q8: DeviceRange<'b>,
@@ -48,16 +40,12 @@ pub(crate) struct SwigluQ8Call<'b> {
     pub(crate) slots: usize,
 }
 
-/// Bytes of the two ranges a call uses. `None` on overflow or for `slots` 0.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SwigluQ8Needs {
     pub(crate) gu: usize,
     pub(crate) q8: usize,
 }
 
-/// The byte counts the wrapper checks a call against: `gu` the tight strided footprint
-/// `(slots - 1) * y_slot_stride + 2 * n_ff` floats, `q8` the padded `block_q8_1` rows. Pure: no
-/// context, no device.
 pub(crate) fn swiglu_q8_needs(
     n_ff: usize,
     y_slot_stride: usize,
@@ -74,12 +62,6 @@ pub(crate) fn swiglu_q8_needs(
 }
 
 impl CudaContext {
-    /// Queues the batched SwiGLU and q8_1 quantize of `call` on `stream`, writing `call.q8`.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, for `n_ff` that is not a
-    /// multiple of 32 in `32..=32768`, for `slots` outside `1..=8`, for a `y_slot_stride` below
-    /// `2 * n_ff`, for a `gu` or `q8` range that is short or misaligned, and for a `q8` that
-    /// overlaps `gu`.
     pub(crate) fn swiglu_q8(
         &self,
         stream: &DeviceStream,
@@ -90,7 +72,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| swiglu_q8_launch(stream_raw, &raw))
     }
 
-    /// Every check of a call, then the native view of its ranges.
     fn plan_swiglu_q8<'b>(&self, call: &SwigluQ8Call<'b>) -> Result<SwigluQ8Raw<'b>, EngError> {
         let (gu_raw, q8_raw) = (self.raw_range(&call.gu)?, self.raw_range(&call.q8)?);
         if call.n_ff < FF_UNIT || call.n_ff > MAX_FF {

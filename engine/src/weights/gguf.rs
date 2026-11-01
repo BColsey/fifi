@@ -87,7 +87,6 @@ pub enum GgufType {
 }
 
 impl GgufType {
-    /// Maps a ggml type id to a type. An unknown or unsupported id is an error.
     pub fn from_id(id: u32) -> Result<Self, EngError> {
         Ok(match id {
             0 => Self::F32,
@@ -267,18 +266,15 @@ pub enum MetaValue {
     Array(ArrayMeta),
 }
 
-/// The extent of a validated metadata array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayMeta {
     /// GGUF metadata type id of every element.
     pub elem_type: u32,
-    /// Element count.
     pub len: u64,
     /// File byte range of the element data, after the element type and count.
     pub byte_range: Range<u64>,
 }
 
-/// Split-file metadata of one shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitInfo {
     /// `split.count`: the number of shards.
@@ -289,7 +285,6 @@ pub struct SplitInfo {
     pub tensors_count: Option<u64>,
 }
 
-/// One tensor table entry with its checked byte range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GgufTensor {
     name: String,
@@ -429,7 +424,6 @@ impl<R: Read + ?Sized> Src<'_, R> {
         Ok(name)
     }
 
-    /// Reads and discards `len` fixed-size element bytes. Booleans must be 0 or 1.
     fn skip(&mut self, mut len: u64, check_bool: bool) -> Result<(), EngError> {
         let mut buf = [0u8; SKIP_CHUNK];
         while len > 0 {

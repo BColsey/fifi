@@ -74,7 +74,6 @@ fn shard_names(index: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A checkpoint directory opened for streaming, with the bytes of its configuration.
 pub(super) struct RealCheckpoint {
     pub(super) ckpt: StreamedCheckpoint,
     pub(super) config: Vec<u8>,
@@ -97,7 +96,6 @@ pub(super) fn open(dir: &Path) -> RealCheckpoint {
     RealCheckpoint { ckpt, config }
 }
 
-/// The current resident set size of this process in KiB.
 pub(super) fn rss_kb() -> u64 {
     crate::kernels::mlx::native::process_rss_bytes().expect("native process RSS query must succeed")
         / 1024
@@ -107,8 +105,6 @@ pub(super) fn rss_kb() -> u64 {
 mod tests {
     use super::*;
 
-    /// The cache-form knob parses the settings words, unset is the F32 control, and a bad word
-    /// names the variable and the accepted words.
     #[test]
     fn the_kv_dtype_knob_reuses_the_settings_words_and_unset_means_the_f32_control() {
         assert_eq!(parse_kv_dtype(None), Ok(KvDtype::F32));
@@ -120,9 +116,8 @@ mod tests {
         );
     }
 
-    /// The knob parses its words with the settings parser (one authority)
-    /// and keeps its own unset rule: unset means the F32 control, not the config default `bf16`,
-    /// so a plain run of the ignored tests is the frozen F32 gate run.
+    /// Unset means the F32 control, not the config default `bf16`, so a plain run of the
+    /// ignored tests is the frozen F32 gate run.
     #[test]
     fn the_activation_knob_reuses_the_settings_words_and_unset_means_the_f32_control() {
         assert_eq!(parse_activation(None), Ok(Activation::F32));

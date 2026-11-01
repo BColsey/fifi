@@ -17,7 +17,6 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// Output and replacement state of one DeltaNet chunk. Every tensor is lazy.
 pub(super) struct DeltaChunk {
     /// Layer output `[T, H]`.
     pub(super) out: ExecutionTensor,
@@ -45,7 +44,6 @@ fn overflow() -> EngError {
     EngError::BadRequest("resident delta dimensions overflow".into())
 }
 
-/// Returns `sqrt(sum(x * x) + 1e-6)` over the last axis of a `[T, heads, KD]` tensor, as `[T, heads, 1]`.
 fn l2_den(
     m: &mut MlxKernels,
     x: &ExecutionTensor,
@@ -229,7 +227,6 @@ mod tests {
     use super::super::{assert_parity, import_f32};
     use super::*;
 
-    /// The DeltaNet weights of resident layer 0.
     fn delta_weights(weights: &ResidentWeights) -> &RDelta {
         let RAttn::Delta(rw) = &weights.layers[0].attn else {
             panic!("resident layer 0 is not DeltaNet");
@@ -237,14 +234,12 @@ mod tests {
         rw
     }
 
-    /// Input row of token `t`: element `i` is `(((i + 3t) % 7) - 3) / 8` for `i` in `0..64` (H = 64).
     fn x_row(t: usize) -> Vec<f32> {
         (0..64)
             .map(|i| (((i + 3 * t) % 7) as f32 - 3.0) * 0.125)
             .collect()
     }
 
-    /// Imports the input rows of tokens `first..first + count` as `[count, 64]`.
     fn rows(kernels: &mut MlxKernels, first: usize, count: usize) -> ExecutionTensor {
         let data: Vec<f32> = (first..first + count).flat_map(x_row).collect();
         import_f32(kernels, vec![count as u32, 64], &data)
@@ -359,7 +354,6 @@ mod tests {
         assert_close(&got_state, &want_state, "state");
     }
 
-    /// A chunk of `T` tokens from a zero state equals `T` decode steps: outputs, `rec`, and `ring`.
     #[test]
     fn chunk_matches_decode_steps_for_each_chunk_length() {
         let _serial = crate::native_test_lock();

@@ -27,7 +27,6 @@ pub(super) const BLOCK_ROWS: usize = 1;
 
 const F32: usize = size_of::<f32>();
 
-/// One launch of a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockOp {
     /// `resid += delta` (when given), then `xf = pack(RMSNorm(resid) * weight)` and, when asked,
@@ -220,7 +219,6 @@ impl BlockOp {
         }
     }
 
-    /// The plan slots the launch writes.
     pub(super) fn writes(&self) -> Vec<Slot> {
         match *self {
             Self::NormPack { xf, norm_out, .. } => {
@@ -336,7 +334,6 @@ fn pack_op(
     }
 }
 
-/// The input norm of the mixer: the residual is normalized with the layer's input norm.
 fn prologue(layout: WeightLayout) -> BlockOp {
     match layout {
         WeightLayout::Tiled => BlockOp::NormPack {

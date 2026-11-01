@@ -339,8 +339,6 @@ fn the_native_plan_refuses_extra_rows_and_forked_packs() {
     }
 }
 
-// ---- the Int8G32 rows slots of the NATIVE plan -----------------------------------------------
-
 fn int8_options(layout: WeightLayout) -> StepOptions {
     StepOptions {
         kv_mode: KvMode::Int8G32,

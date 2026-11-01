@@ -4,7 +4,6 @@ use super::math::{dot, expect_len, sigmoid, silu};
 use crate::EngError;
 use crate::family::project::Projector;
 
-/// Checked MoE dimensions and routing rule.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MoeShape {
     experts: usize,
@@ -17,7 +16,6 @@ pub(crate) struct MoeShape {
 }
 
 impl MoeShape {
-    /// Checks the expert count, top-k, intermediate widths, and hidden width.
     pub(crate) fn new(
         experts: u32,
         top_k: u32,
@@ -50,21 +48,17 @@ impl MoeShape {
         })
     }
 
-    /// Expert count.
     pub(crate) fn experts(&self) -> usize {
         self.experts
     }
-    /// Experts selected per token.
     pub(crate) fn top_k(&self) -> usize {
         self.top_k
     }
-    /// Whether gates renormalize over the selection.
     pub(crate) fn renorm(&self) -> bool {
         self.renorm
     }
 }
 
-/// Weights of one MoE layer.
 pub(crate) struct MoeWeights<'a, W> {
     /// Host router matrix `[experts, hidden]`, row-major.
     pub(crate) router: &'a [f32],
@@ -126,7 +120,6 @@ pub(crate) fn select(shape: &MoeShape, probs: &[f32]) -> Result<Vec<(u32, f32)>,
         .collect())
 }
 
-/// Returns the selected experts in rank order with their gate weights.
 pub(crate) fn route(
     shape: &MoeShape,
     router: &[f32],
@@ -152,7 +145,6 @@ pub(crate) fn route(
     select(shape, &probs)
 }
 
-/// Runs one decode step and returns the layer output of length `hidden`.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,
     shape: &MoeShape,

@@ -57,7 +57,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// What one step computes and reads back.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepMode {
@@ -72,7 +71,6 @@ enum StepMode {
     Record,
 }
 
-/// Host results of one step.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, PartialEq)]
 struct StepResult {
@@ -102,7 +100,6 @@ struct ResidentDecoder<'c> {
     /// The engine's session budget. Each step charges its QSA growth here. The cap is `u64::MAX`
     /// until the executor sets the admitted value.
     budget: SessionBudget,
-    /// Tests only: the route recorder of the S3 trace. `None` records nothing.
     #[cfg(test)]
     route_trace: Option<trace::RouteTrace>,
 }
@@ -176,7 +173,6 @@ impl<'c> ResidentDecoder<'c> {
         self.budget = budget;
     }
 
-    /// Bytes charged to the session budget by the committed steps.
     #[cfg(test)]
     fn session_used(&self) -> u64 {
         self.budget.used()
@@ -198,7 +194,6 @@ impl<'c> ResidentDecoder<'c> {
         state.snapshot(&mut self.budget)
     }
 
-    /// Replaces `state` with `snapshot`. See `ResidentState::restore`.
     fn restore(
         &mut self,
         state: &mut ResidentState,
@@ -207,7 +202,6 @@ impl<'c> ResidentDecoder<'c> {
         state.restore(snapshot, &self.weights, &mut self.budget)
     }
 
-    /// Runs one token. See `step::step`.
     fn step(
         &mut self,
         state: &mut ResidentState,

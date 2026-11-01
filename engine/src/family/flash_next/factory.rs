@@ -13,7 +13,6 @@ use crate::{
 };
 use std::path::Path;
 
-/// The family name of a Flash-Next engine entry. The family descriptor owns it.
 pub(crate) const FAMILY: &str = QWEN3_8_FLASH_NEXT.name;
 
 /// The most tokens of prompt plus completion that the server accepts for this family
@@ -22,19 +21,14 @@ pub(crate) const FAMILY: &str = QWEN3_8_FLASH_NEXT.name;
 /// decoder limit stops the load instead of misleading the 409 check.
 pub(crate) const CONTEXT_LIMIT: u32 = 32_768;
 
-/// A started engine, the tokenizer bundle that renders and encodes its prompts, and its limit.
 pub(crate) struct StartedEngine {
     /// The engine thread. The caller stops it with `Engine::shutdown`.
     pub(crate) engine: Engine,
-    /// The pinned tokenizer, template, and EOS ids.
     pub(crate) bundle: TokenizerBundle,
-    /// The context limit that the server reports for this engine (`CONTEXT_LIMIT`).
     pub(crate) context_limit: u32,
 }
 
-/// Starts the engine of one config entry. Reads `FLASH_NEXT_ARTIFACT_MANIFEST` and
-/// `FLASH_NEXT_CACHE_LIMIT` as fallbacks. The engine state is `Loading` until the weights are
-/// resident.
+/// The engine state is `Loading` until the weights are resident.
 pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,

@@ -27,9 +27,7 @@ const LANES: u32 = 32;
 /// Largest element count of one operand. The kernel indexes with 32-bit integers.
 const MAX_ELEMENTS: u64 = i32::MAX as u64;
 
-/// What the native call needs after validation.
 pub(crate) struct GatedDeltaLayout {
-    /// Shape of `y`: `[B, T, Hv, Dv]`.
     pub(crate) y_shape: [u32; 4],
     pub(crate) y_byte_len: u64,
     /// The new state has the shape of the old state.
@@ -38,7 +36,6 @@ pub(crate) struct GatedDeltaLayout {
     pub(crate) dims: [i32; 6],
 }
 
-/// Checks the six operand shapes and returns the output layout.
 pub(crate) fn layout(
     q: &[u32],
     k: &[u32],
@@ -111,7 +108,6 @@ fn indexable_bytes(shape: &[u32]) -> Result<u64, EngError> {
     Ok(bytes)
 }
 
-/// Converts the dimensions to the native `int` values of the kernel call.
 fn native_dims(dims: [u32; 6]) -> Result<[i32; 6], EngError> {
     let mut native = [0i32; 6];
     for (slot, dimension) in native.iter_mut().zip(dims) {

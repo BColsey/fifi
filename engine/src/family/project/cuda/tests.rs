@@ -129,7 +129,6 @@ fn q8_0_blocks(rng: &mut Rng, groups: usize) -> Vec<u8> {
     out
 }
 
-/// One tensor for the fixture file.
 struct Entry {
     name: &'static str,
     ty: GgufType,
@@ -395,7 +394,6 @@ fn lane_of(row: usize, q: usize) -> usize {
     16 * (row / 4) + 4 * q + row % 4
 }
 
-/// Sixteen-byte vector `index` of a tile.
 fn vector(tile: &[u8], index: usize) -> &[u8] {
     &tile[16 * index..16 * index + 16]
 }
@@ -434,7 +432,6 @@ fn unpack_q8_0_blocks(tile: &[u8], row: usize, blocks: &mut [u8]) {
     }
 }
 
-/// The Q8_0 source bytes rebuilt from the device tiles.
 pub(super) fn decode_q8_0(tiles: &[u8], layout: Layout) -> Vec<u8> {
     let mut source = vec![0u8; layout.block_count() * layout.block_bytes];
     for row in 0..layout.n_rows {
@@ -447,7 +444,6 @@ pub(super) fn decode_q8_0(tiles: &[u8], layout: Layout) -> Vec<u8> {
     source
 }
 
-/// The source bytes rebuilt from the device tiles.
 pub(super) fn decode_q4k(tiles: &[u8], layout: Layout) -> Vec<u8> {
     let mut source = vec![0u8; layout.block_count() * layout.block_bytes];
     for row in 0..layout.n_rows {
@@ -498,7 +494,6 @@ fn stored_scale_bits(tile: &[u8], row: usize, element: usize) -> u16 {
     u16::from_le_bytes([tile[at], tile[at + 1]])
 }
 
-/// The 6-bit quants of every block, in source order, rebuilt from the tiles.
 pub(super) fn q6_quants_from_tiles(tiles: &[u8], layout: Layout) -> Vec<u8> {
     let mut quants = Vec::with_capacity(layout.block_count() * BLOCK_VALUES);
     for row in 0..layout.n_rows {
@@ -522,7 +517,6 @@ fn whole_chunks<T, const N: usize>(values: &[T]) -> &[[T; N]] {
     chunks
 }
 
-/// The reference 6-bit quants of every block, in source order.
 pub(super) fn q6_quants_of_source(source: &[u8]) -> Vec<u8> {
     whole_chunks::<u8, Q6K_BLOCK_BYTES>(source)
         .iter()
@@ -592,7 +586,6 @@ fn assert_bits_equal(label: &str, device: &[f32], expected: &[f32]) {
     }
 }
 
-/// The tile bytes of a weight, downloaded through the context.
 pub(super) fn download_tiles(projector: &CudaProjector, weight: &TiledWeight) -> Vec<u8> {
     let mut tiles = vec![0u8; weight.buffer().bytes()];
     projector
@@ -619,7 +612,6 @@ pub(super) fn tiled_of<'a>(loaded: &'a CudaWeights, name: &str) -> &'a TiledWeig
     }
 }
 
-/// Dense reference, one token at a time through the dense projector.
 fn dense_reference(weight: &DenseWeight, x: &[f32]) -> Vec<f32> {
     let mut reference = DenseProjector::default();
     whole_chunks::<f32, K>(x)
@@ -2732,7 +2724,6 @@ pub(super) fn meminfo_kb(text: &str, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("/proc/meminfo has no numeric {key} line"))
 }
 
-/// Prints device and host memory for one stage of one variant, one line per stage.
 fn report_memory(mode: PageCacheMode, stage: &str, projector: &CudaProjector) {
     let device = projector.memory_info().expect("query device memory");
     let host = host_memory();
@@ -2870,7 +2861,6 @@ fn info_len(tensor: &GgufTensor) -> u64 {
     8 + tensor.name().len() as u64 + 4 + 8 * tensor.dims().len() as u64 + 4 + 8
 }
 
-/// Writes one tensor-table entry for `tensor` at data offset `offset`.
 fn write_info(out: &mut impl Write, tensor: &GgufTensor, offset: u64) {
     let name = tensor.name().as_bytes();
     out.write_all(&(name.len() as u64).to_le_bytes())

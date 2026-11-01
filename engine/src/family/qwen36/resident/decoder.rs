@@ -26,7 +26,6 @@ use crate::{
 #[cfg(test)]
 type GraphProbe = Box<dyn FnMut(&mut MlxKernels, &[&ExecutionTensor]) -> Result<(), EngError>>;
 
-/// What one step computes and reads back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepMode {
     /// Greedy decoding: the head runs and the token id is read back.
@@ -39,7 +38,6 @@ pub(super) enum StepMode {
     Record,
 }
 
-/// Host results of one step.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct StepResult {
     /// The greedy next token, lowest index on ties. `None` in `Prompt`.
@@ -56,7 +54,6 @@ pub(super) struct StepResult {
     pub(super) probs: Option<Vec<Vec<f32>>>,
 }
 
-/// The default context limit.
 pub(super) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
 
 /// The retire cap of the decoder's adapter: 4 GiB. With device routing a token builds one graph and
@@ -65,10 +62,8 @@ pub(super) const DEFAULT_CONTEXT_LIMIT: u32 = 32_768;
 /// pending graph, so the flush would free nothing.
 pub(super) const DECODE_RETIRE_CAP: u64 = 4 << 30;
 
-/// The default rows of one prefill chunk.
 pub(super) const DEFAULT_CHUNK_ROWS: u32 = 512;
 
-/// The most rows that `set_chunk_rows` accepts.
 pub(super) const MAX_CHUNK_ROWS: u32 = 2_048;
 
 /// One resident Q36 model on its engine thread.

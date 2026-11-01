@@ -23,7 +23,6 @@ pub mod residency;
 pub mod server;
 pub mod watchdog;
 
-/// How the expert bank chooses its residents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyMode {
     /// The bank holds a fixed profile for the whole run and never swaps.
@@ -42,9 +41,7 @@ pub struct TieredConfig {
     pub experts: usize,
     /// Experts routed per token and layer (top-8 for Qwen3.6-35B-A3B).
     pub top_k: usize,
-    /// VRAM bank slots per layer; a layer bank holds at most this many experts.
     pub bank_slots_per_layer: usize,
-    /// The bank policy: a fixed profile or the adaptive popularity chase.
     pub mode: PolicyMode,
     /// Swap credit added per token; `floor` of the credit is the swap budget of a
     /// token boundary. Units: swaps per token (0.25 by default).
@@ -55,9 +52,6 @@ pub struct TieredConfig {
 }
 
 impl TieredConfig {
-    /// The Qwen3.6-35B-A3B decode shape: 40 MoE layers, 256 experts, top-8 routing,
-    /// the given bank size and mode, and the defaults of 0.25 swaps per token with a
-    /// 0.999 decay.
     pub fn qwen36(bank_slots_per_layer: usize, mode: PolicyMode) -> Self {
         Self {
             layers: 40,
@@ -70,9 +64,6 @@ impl TieredConfig {
         }
     }
 
-    /// Validates the invariants every consumer relies on: nonzero dimensions, a
-    /// routing and a bank that fit the expert count, a decay in `(0, 1]` and a
-    /// non-negative, finite swap rate. `Err` names the broken invariant.
     pub fn check(&self) -> Result<(), String> {
         if self.layers == 0 {
             return Err(String::from("tiered config: layers must be nonzero"));
@@ -173,7 +164,6 @@ mod tests {
         ] {
             assert!(bad.check().is_err(), "{bad:?} must be refused");
         }
-        // Boundary values that stay legal: decay of exactly 1 and a zero rate.
         assert_eq!(
             TieredConfig {
                 decay: 1.0,

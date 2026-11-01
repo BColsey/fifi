@@ -72,7 +72,6 @@ fn matrix(out: &mut Vec<Entry>, prefix: &str, (k, n): (u32, u32), (words, marker
     out.push(entry(&format!("{prefix}.{marker}"), "I32", &[]));
 }
 
-/// Every tensor of the small model, the experts at `WORDS` and the head at `HEAD_WORDS`.
 fn pack(shape: &HostShape) -> Vec<Entry> {
     let (h, v) = (shape.hidden as u32, shape.vocab as u32);
     let (m, d, a) = (&shape.moe, &shape.delta, &shape.attn);
@@ -181,8 +180,7 @@ fn pack(shape: &HostShape) -> Vec<Entry> {
     out
 }
 
-/// The device bytes counted from the entries alone: trellises and the embedding as stored, markers
-/// nothing, every other half-width tensor widened to F32.
+/// The device bytes counted from the entries alone, independently of the loader's walk.
 fn counted(entries: &[Entry]) -> u64 {
     entries
         .iter()

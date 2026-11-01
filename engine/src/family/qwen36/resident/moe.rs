@@ -30,7 +30,6 @@ use crate::{
     tensor::{ExecutionTensor, Tensor},
 };
 
-/// How a layer picks its experts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Routing {
     /// The host routes with `route_experts`: two synchronizations per layer. The parity reference.
@@ -57,7 +56,6 @@ pub(super) fn dense_rows(
     ctx.kernels.qmm(&hidden, &w.down)
 }
 
-/// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` as `[1, H]`.
 /// Whether the fused prefill kernels replace the composite ops. Default ON after their gate
 /// passed; Q36_FUSED_PREFILL=0 is the kill switch.
 pub(super) fn fused_prefill() -> bool {
@@ -278,7 +276,6 @@ pub(super) fn combine_rows(
     let x3 = ctx.kernels.reshape(&x3, &[pairs, 1, hidden])?;
     let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
     let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
-    // The act_mul fused kernel (Q36_FUSED_PREFILL=1) replaces silu+mul.
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
         && hg.dtype() == Dtype::Bf16

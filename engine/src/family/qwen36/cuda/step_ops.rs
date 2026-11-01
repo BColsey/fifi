@@ -26,7 +26,6 @@
 use super::step_plan::{Phase, Slot, writes_status};
 use crate::family::AttentionKind;
 
-/// One launch group of the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepOp {
     /// `step_begin`: clears `status`, flags an invalid step state with mask 4.
@@ -47,7 +46,6 @@ pub(super) enum StepOp {
     Advance,
 }
 
-/// The ops of one token for a model of `layers` layers, in queue order.
 pub(super) fn token_ops(layers: usize) -> Vec<StepOp> {
     let mut ops = vec![StepOp::Begin, StepOp::Embed];
     for layer in 0..layers {
@@ -110,7 +108,6 @@ impl StepOp {
         self.phases(kind).into_iter().any(writes_status)
     }
 
-    /// The layer of a mixer or MoE op.
     pub(super) fn layer(self) -> Option<usize> {
         match self {
             Self::Mixer(layer) | Self::Moe(layer) => Some(layer),
@@ -119,7 +116,6 @@ impl StepOp {
     }
 }
 
-/// The buffer layer `layer` reads its residual from (the embedding wrote layer 0's).
 pub(super) fn resid_in(layer: usize) -> Slot {
     if layer.is_multiple_of(2) {
         Slot::ResidA
@@ -128,12 +124,10 @@ pub(super) fn resid_in(layer: usize) -> Slot {
     }
 }
 
-/// The buffer the MoE block of `layer` writes the layer output into.
 pub(super) fn resid_out(layer: usize) -> Slot {
     resid_in(layer + 1)
 }
 
-/// The buffer the final norm reads after `layers` layers.
 pub(super) fn final_resid(layers: usize) -> Slot {
     match layers.checked_sub(1) {
         Some(last) => resid_out(last),

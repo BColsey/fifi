@@ -40,19 +40,16 @@ use crate::{
 
 use std::cell::RefCell;
 
-/// Rows of one decode step: the MoE block takes one row.
 pub(super) const STEP_ROWS: usize = 1;
 const F32: usize = size_of::<f32>();
 
-/// The bytes of `values` f32 values, refused (not wrapped) when the byte count overflows a
-/// `usize`: an unchecked `values * F32` would wrap and silently match a wrapped size.
+/// An unchecked `values * F32` would wrap and silently match a wrapped size.
 pub(super) fn f32_bytes(values: usize) -> Result<usize, EngError> {
     values
         .checked_mul(F32)
         .ok_or_else(|| EngError::BadRequest(format!("{values} f32 values do not fit a byte count")))
 }
 
-/// The shape of a stacked expert weight: `experts` matrices of `rows` rows of `k` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StackSpec {
     pub(super) experts: usize,
@@ -60,7 +57,6 @@ pub(super) struct StackSpec {
     pub(super) k: usize,
 }
 
-/// The shapes of the weights the MoE block reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MoeSpecs {
     /// f32 values of `ffn_gate_inp` and of `ffn_gate_inp_shexp`.
@@ -99,7 +95,6 @@ impl MoeSpecs {
     }
 }
 
-/// The dimensions the MoE block takes, from the layout record, for the one row of the step.
 pub(super) fn moe_dims(dims: &StepDims) -> MoeDims {
     MoeDims::new(dims, STEP_ROWS)
 }
@@ -124,8 +119,7 @@ pub(super) fn check_native_stack(
     Ok(())
 }
 
-/// Refuses a stacked weight whose rows, length or stack depth differ from `want`. `have` is the
-/// tile's total rows, its `k` and its stack depth.
+/// `have` is the tile's total rows, its `k` and its stack depth.
 pub(super) fn check_stack(
     name: &str,
     have: (usize, usize, Option<usize>),
@@ -142,7 +136,6 @@ pub(super) fn check_stack(
     Ok(())
 }
 
-/// The shapes of the embedding table, the output head and the output norm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GlobalSpecs {
     pub(super) embed: DenseSpec,
@@ -170,7 +163,6 @@ impl GlobalSpecs {
     }
 }
 
-/// The GGUF names of the three tensors that belong to no layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GlobalNames {
     pub(super) embed: String,
@@ -196,7 +188,6 @@ impl GlobalNames {
     }
 }
 
-/// Refuses unsupported paged execution without changing resident mode policy.
 pub(super) fn check_paged_modes(paged: bool, capture: bool, chunked: bool) -> Result<(), EngError> {
     if paged && (capture || chunked) {
         return Err(EngError::BadRequest(
@@ -370,8 +361,7 @@ pub(super) struct StepResources {
 }
 
 impl StepResources {
-    /// Plans one row, allocates the arena and builds the lookups. Allocation happens here and
-    /// never inside a token.
+    /// Allocation happens here and never inside a token.
     pub(super) fn new(
         context: &CudaContext,
         dims: StepDims,
@@ -461,9 +451,6 @@ fn dense<'w>(
     Ok(weight)
 }
 
-/// Resolves one expert stack in `layout`: the tiles (shape rule of `check_stack`) or the file's own
-/// blocks (the same shape rule plus the per-expert `rows % 4` of `check_native_stack`), and a
-/// tensor of the other layout is a `Checkpoint` naming it.
 fn stack_of<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -507,7 +494,6 @@ fn stack_of<'w>(
     }
 }
 
-/// The MoE weights of `layer`, shapes checked against `specs`, in the session's `layout`.
 pub(super) fn moe_layer_weights<'w>(
     table: &LayerTable,
     weights: &'w CudaWeights,
@@ -538,8 +524,7 @@ pub(super) fn moe_layer_weights<'w>(
     })
 }
 
-/// The router and shared-expert weights of `layer`, shapes checked against `specs`: what the
-/// tiered mode takes from the loaded model (the routed expert stacks are not loaded then).
+/// What the tiered mode takes from the loaded model (the routed expert stacks are not loaded then).
 pub(super) fn moe_layer_parts<'w>(
     table: &LayerTable,
     weights: &'w CudaWeights,
@@ -567,26 +552,20 @@ pub(super) fn moe_layer_parts<'w>(
     })
 }
 
-/// One of the two global gathers of the step: the tiles of the Tiled load or the file's own blocks
-/// of the Native load (the native embedding gather reads Q4_K blocks, the native head is one
-/// `matvec_q` over the Q6_K blocks).
+/// The native embedding gather reads Q4_K blocks; the native head is one `matvec_q` over the
+/// Q6_K blocks.
 #[derive(Clone, Copy)]
 pub(super) enum GlobalWeight<'w> {
     Tiled(&'w TiledWeight),
     Native(&'w NativeWeight),
-    /// The embedding table of an EXL3 pack, kept as stored: BF16 rows.
     Bf16(&'w DeviceBuffer),
-    /// The head of an EXL3 pack.
     Exl3(&'w Exl3Weight),
 }
 
-/// The embedding table of the step, either layout.
 pub(super) type EmbedWeight<'w> = GlobalWeight<'w>;
-/// The output head of the step, either layout.
 pub(super) type HeadWeight<'w> = GlobalWeight<'w>;
 
 impl GlobalWeight<'_> {
-    /// The tiles for the tiled gather (a native weight refuses by text).
     pub(super) fn tiled(&self) -> Result<&TiledWeight, EngError> {
         match self {
             Self::Tiled(weight) => Ok(weight),
@@ -601,7 +580,6 @@ impl GlobalWeight<'_> {
         }
     }
 
-    /// The native blocks for the native gather.
     pub(super) fn native(&self) -> Result<&NativeWeight, EngError> {
         match self {
             Self::Native(weight) => Ok(weight),
@@ -617,8 +595,6 @@ impl GlobalWeight<'_> {
     }
 }
 
-/// Refuses a NATIVE embedding table of a type the gather does not read: the native gather takes
-/// Q4_K blocks exactly.
 pub(super) fn check_native_embed(name: &str, quant: QuantType) -> Result<(), EngError> {
     if quant == QuantType::Q4K {
         return Ok(());
@@ -628,8 +604,6 @@ pub(super) fn check_native_embed(name: &str, quant: QuantType) -> Result<(), Eng
     )))
 }
 
-/// A global tensor of an EXL3 load: the head is an EXL3 matrix, the embedding the stored BF16
-/// table, each of the shape `spec` names.
 fn exl3_global<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -652,7 +626,6 @@ fn exl3_global<'w>(
     }
 }
 
-/// The embedding table, the output head and the output norm, in the session's `layout`.
 pub(super) struct GlobalWeights<'w> {
     pub(super) embed: GlobalWeight<'w>,
     pub(super) head: GlobalWeight<'w>,

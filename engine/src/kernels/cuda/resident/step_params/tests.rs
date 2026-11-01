@@ -83,7 +83,6 @@ fn valid_state(p: &StepParams) -> bool {
         && i64::from(p.kv_slot) == pos
 }
 
-/// `step_begin`: the status is 0, or 4 for an invalid state; nothing else changes.
 fn sim_begin(p: StepParams) -> StepParams {
     StepParams {
         status: if valid_state(&p) { 0 } else { 4 },
@@ -91,7 +90,6 @@ fn sim_begin(p: StepParams) -> StepParams {
     }
 }
 
-/// `step_advance`: all three words move, or all three become -1; the others never change.
 fn sim_advance(p: StepParams, m: i32) -> StepParams {
     let moved = i64::from(p.pos) + i64::from(m);
     let (pos, len, slot) = if valid_state(&p) && moved <= i64::from(POS_MAX) {
@@ -107,7 +105,6 @@ fn sim_advance(p: StepParams, m: i32) -> StepParams {
     }
 }
 
-/// A row of finite values that are all below -1.
 fn base_row(n: usize) -> Vec<f32> {
     (0..n).map(|i| -1.0 - (i % 7) as f32 * 0.25).collect()
 }
@@ -151,7 +148,6 @@ fn assert_backend(error: Option<EngError>, operation: &str, message: Option<&str
     }
 }
 
-/// One context and one stream.
 struct Fx {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -168,7 +164,6 @@ impl Fx {
         testkit::upload_bytes(&self.ctx, &bits(&p))
     }
 
-    /// Waits for the stream, then reads the block back.
     fn read_params(&self, buffer: &DeviceBuffer) -> StepParams {
         self.stream.synchronize().expect("synchronize");
         let bytes = testkit::read_bytes(&self.ctx, buffer, STEP_PARAMS_BYTES);
@@ -201,7 +196,6 @@ impl Fx {
         self.read_params(&buffer)
     }
 
-    /// Runs one argmax over `row` on a block `start`, with the scratch filled with `scratch`.
     fn argmax(&self, row: &[f32], start: StepParams, scratch: u8) -> (StepParams, ResultPair) {
         let logits = testkit::upload_f32(&self.ctx, row);
         let params = self.upload_params(start);
@@ -452,7 +446,6 @@ fn result_pair_at(fx: &Fx, row: &[f32], at: usize) {
     assert!(pair.matches_params(&fx.read_params(&params)));
 }
 
-/// An argmax call over `row` with the scratch and block in `scratch`.
 fn pair_call<'b>(
     n: usize,
     row: &'b DeviceBuffer,
@@ -637,7 +630,6 @@ fn exl3_flag_folds_into_the_status_and_the_result_pair() {
         let bytes = testkit::read_bytes(&fx.ctx, &words, 4);
         assert_eq!(bytes, [0; 4], "the word is consumed for seen {seen}");
     }
-    // The pair of the following argmax carries the folded status.
     let row = base_row(300);
     let params = fx.upload_params(block(SENTINEL, 11, 0));
     let flagged = testkit::upload_bytes(&fx.ctx, &1u32.to_le_bytes());
@@ -965,7 +957,6 @@ fn argmax_rows(c: &Calls<'_>) -> Vec<Case> {
         .collect()
 }
 
-/// A buffer or a stream of another context is refused, for each of the four ranges.
 fn foreign_rows(c: &Calls<'_>, other: &Fx) -> Vec<Case> {
     let foreign = testkit::upload_filled(&other.ctx, 0, ARENA);
     let mut rows: Vec<Case> = Vec::new();

@@ -1,6 +1,6 @@
 //! The request side of the canonical device sampler.
 //!
-//! The CUDA kernels (not yet landed) and the Rust reference in
+//! The CUDA kernels and the Rust reference in
 //! `reference_tests` are to implement ONE definition of a draw and agree bit for bit. This
 //! file holds the part the executor needs at run time: the exact encoding of a request's
 //! `temperature` and `top_p` that the start block carries to the device.

@@ -299,7 +299,6 @@ fn real_exl3_attention_mixer_capture() {
     );
     let result =
         capture(&checkpoint, &dims, &table, geometry, layer, &input).expect("capture mixer");
-    // Isolation split: no device owner remains when these host assertions execute.
     assert_eq!(result.exl3_flag, 0, "EXL3 arithmetic flag");
     assert_eq!(result.step_status, 0, "resident step status");
     let mut stage_manifest = Vec::new();

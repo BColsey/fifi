@@ -56,15 +56,12 @@ pub(in crate::kernels::cuda) struct ScatterColsInts {
     pub(in crate::kernels::cuda) col_off: c_int,
 }
 
-/// What one launch reads (`src`) and writes (`dst`), and its integers.
 pub(in crate::kernels::cuda) struct ScatterColsRaw<'a> {
     pub(in crate::kernels::cuda) src: RawRange<'a>,
     pub(in crate::kernels::cuda) dst: RawRange<'a>,
     pub(in crate::kernels::cuda) ints: ScatterColsInts,
 }
 
-/// The bytes of the two extents the kernel touches: `rows * n` floats of `src` and
-/// `(rows - 1) * ld + col_off + n` floats of `dst`.
 fn extents(ints: &ScatterColsInts) -> Result<(usize, usize), DeviceFailure> {
     let size = |value: c_int| usize::try_from(value).map_err(|_| invalid_argument());
     let (rows, n) = (size(ints.rows)?, size(ints.n)?);
@@ -94,7 +91,6 @@ fn check_scatter_cols(io: &ScatterColsRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the scatter on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn scatter_cols_launch(
     stream: &RawStream,
     io: ScatterColsRaw<'_>,

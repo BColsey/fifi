@@ -154,24 +154,19 @@ static PEAK_RETIRED: AtomicU64 = AtomicU64::new(0);
 /// process-wide. The `FORCED_FLUSHES` count never resets, so a window uses `FLUSH_COUNT`.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Nanoseconds inside the forced `mlx_synchronize` calls.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_SYNC_NS: AtomicU64 = AtomicU64::new(0);
-/// Nanoseconds that `flush_after_sync` took to free the retired arrays after a forced flush.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_FREE_NS: AtomicU64 = AtomicU64::new(0);
-/// Sum of the retired byte total at each forced flush.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_BYTES_SUM: AtomicU64 = AtomicU64::new(0);
 /// Minimum of the retired byte total at each forced flush. It starts at `u64::MAX`, so a fetch-min
 /// works; the accessor reports zero when no flush ran.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_BYTES_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
-/// Maximum of the retired byte total at each forced flush.
 #[cfg(feature = "native-fault-qualification")]
 static FLUSH_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 
-/// Returns the forced flush count and the peak retired bytes (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 pub(super) fn qualification_retire_stats() -> (u64, u64) {
     (
@@ -180,13 +175,11 @@ pub(super) fn qualification_retire_stats() -> (u64, u64) {
     )
 }
 
-/// Resets the peak retired bytes to zero (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 pub(super) fn qualification_reset_retire_peak() {
     PEAK_RETIRED.store(0, Ordering::Relaxed);
 }
 
-/// Reads the forced flush window (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 pub(super) fn qualification_flush_stats() -> QualificationFlushStats {
     let flushes = FLUSH_COUNT.load(Ordering::Relaxed);
@@ -204,7 +197,6 @@ pub(super) fn qualification_flush_stats() -> QualificationFlushStats {
     }
 }
 
-/// Sets the forced flush window to zero (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 pub(super) fn qualification_reset_flush_stats() {
     for value in [
@@ -219,8 +211,6 @@ pub(super) fn qualification_reset_flush_stats() {
     FLUSH_BYTES_MIN.store(u64::MAX, Ordering::Relaxed);
 }
 
-/// Adds one forced flush attempt: the retired `total` at the flush and the wall time of its
-/// synchronization (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 fn record_flush_sync(total: u64, elapsed: std::time::Duration) {
     FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +223,6 @@ fn record_flush_sync(total: u64, elapsed: std::time::Duration) {
     FLUSH_BYTES_MAX.fetch_max(total, Ordering::Relaxed);
 }
 
-/// Adds the wall time that a forced flush spent freeing its arrays (qualification builds only).
 #[cfg(feature = "native-fault-qualification")]
 fn record_flush_free(elapsed: std::time::Duration) {
     FLUSH_FREE_NS.fetch_add(
@@ -482,7 +471,6 @@ impl Drop for Resident {
     }
 }
 
-/// The byte length that the native array's element count implies for `dtype`.
 pub(super) fn native_byte_len(array: ffi::mlx_array, dtype: Dtype) -> Option<u64> {
     u64::try_from(unsafe { ffi::mlx_array_size(array) })
         .ok()?

@@ -42,7 +42,6 @@ const _: () = assert!(
         && offset_of!(EmbedBf16ArgsRepr, k) == 40
 );
 
-/// One embed_bf16 launch.
 pub(in crate::kernels::cuda) struct EmbedBf16Raw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) ids: RawRange<'a>,
@@ -87,7 +86,6 @@ fn check_embed_bf16(call: &EmbedBf16Raw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gather of call on stream.
 pub(in crate::kernels::cuda) fn embed_bf16_launch(
     stream: &RawStream,
     call: &EmbedBf16Raw<'_>,

@@ -564,15 +564,6 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
-    /// The flash-delta gated rule (Q36_FLASH_DELTA=1): the same contract as
-    /// `mlx_gated_delta` above - the same operands, dims, F32 outputs, and NUL-terminated
-    /// `source` - through the `gated_delta_wy` program (the placeholder body is the vendored
-    /// recurrent kernel; the chunked WY-form body lands in its place). Both outputs are lazy.
-    /// Faults strike `y`.
-    /// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
-    /// DeltaNet pre-recurrence chain. `dims` holds rows. All six outputs are lazy F32.
-    /// Faults strike `q_out`.
-    /// The act_mul fused kernel (Q36_FUSED_PREFILL=1): SwiGLU activation. Output is lazy bf16.
     /// The gdn_post fused kernel (Q36_FUSED_PREFILL=1): gated RMS norm and gate.
     #[link_name = "inference_mlx_gdn_post"]
     pub(super) fn mlx_gdn_post(
@@ -609,6 +600,7 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The act_mul fused kernel (Q36_FUSED_PREFILL=1): SwiGLU activation. Output is lazy bf16.
     #[link_name = "inference_mlx_act_mul"]
     pub(super) fn mlx_act_mul(
         h_out: *mut mlx_array,
@@ -618,6 +610,9 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
+    /// DeltaNet pre-recurrence chain. `dims` holds rows. All six outputs are lazy F32.
+    /// Faults strike `q_out`.
     #[link_name = "inference_mlx_gdn_prep"]
     pub(super) fn mlx_gdn_prep(
         q_out: *mut mlx_array,
@@ -640,6 +635,11 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The flash-delta gated rule (Q36_FLASH_DELTA=1): the same contract as
+    /// `mlx_gated_delta` above - the same operands, dims, F32 outputs, and NUL-terminated
+    /// `source` - through the `gated_delta_wy` program (the placeholder body is the vendored
+    /// recurrent kernel; the chunked WY-form body lands in its place). Both outputs are lazy.
+    /// Faults strike `y`.
     #[link_name = "inference_mlx_flash_delta"]
     pub(super) fn mlx_flash_delta(
         y: *mut mlx_array,

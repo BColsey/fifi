@@ -17,7 +17,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Device inputs of a chunk and the PLE history after it.
 pub(super) struct ChunkStart {
     /// Hyper state `[T, C, H]`: each token's embedding row repeated over the branches.
     pub(super) hyper: ExecutionTensor,

@@ -71,7 +71,6 @@ pub(crate) enum StepField {
 }
 
 impl StepField {
-    /// Byte offset inside `StepParams`, from the shared `StepParams` offset constants.
     pub(crate) const fn offset(self) -> usize {
         match self {
             Self::TokenId => OFFSET_TOKEN_ID,
@@ -82,7 +81,6 @@ impl StepField {
     }
 }
 
-/// What must match for a checkpoint to be importable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StateIdentity {
     pub(crate) layout: &'static str,
@@ -332,12 +330,10 @@ impl ResidentState {
         self.book.health()
     }
 
-    /// Committed rows.
     pub(crate) fn tokens(&self) -> usize {
         self.book.tokens()
     }
 
-    /// The recurrent state of the `ordinal`-th DeltaNet layer in `slot`, as a checked range.
     pub(crate) fn delta_rec(
         &self,
         slot: usize,
@@ -348,7 +344,6 @@ impl ResidentState {
         self.delta.range(pool.rec_offset(slot, ordinal)?, bytes)
     }
 
-    /// The convolution state of the same layer, as a checked range.
     pub(crate) fn delta_conv(
         &self,
         slot: usize,
@@ -369,7 +364,6 @@ impl ResidentState {
         self.resident_kv()?.range(offset, bytes)
     }
 
-    /// A persistent word, as a checked range of the bytes the kernels use.
     pub(crate) fn word(&self, word: Word) -> Result<DeviceRange<'_>, EngError> {
         self.words.range(word.offset(), word.bytes())
     }
@@ -526,7 +520,6 @@ impl ResidentState {
         Ok(())
     }
 
-    /// The guards of a block: `stream` owns the state and the state is valid.
     pub(crate) fn check_block(&self, stream: &DeviceStream) -> Result<(), EngError> {
         self.book.begin_block(stream.id())
     }
@@ -571,7 +564,6 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Zeroes the DeltaNet slots `first_slot..` (both the recurrent and the convolution state).
     fn clear_delta(&self, stream: &DeviceStream, first_slot: usize) -> Result<(), EngError> {
         let pool = self.layout.delta;
         if matches!(&self.kv, KvStorage::Paged { .. } | KvStorage::Cached { .. }) {
@@ -619,8 +611,6 @@ impl ResidentState {
         Ok(())
     }
 
-    /// Rewrites the whole words block with zeros: `StepParams` (an invalid block, `status` 0), the
-    /// result pair and the prefill status word.
     fn clear_words(&self, stream: &DeviceStream) -> Result<(), EngError> {
         self.words
             .write_at(stream, 0, &vec![0u8; self.layout.words.total])

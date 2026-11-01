@@ -35,15 +35,12 @@ use crate::{
     weights::exl3::Checkpoint,
 };
 
-/// The family the pack is loaded for: the descriptor, the checked dimensions and the inventory
-/// that names the tensors.
 pub(super) struct ModelFacts<'a> {
     pub(super) spec: &'a FamilySpec,
     pub(super) dims: &'a StepDims,
     pub(super) inventory: &'a Inventory,
 }
 
-/// Opens the pack in `dir` and loads it for the Qwen3.6 descriptor, keeping `reserve` free.
 pub(super) fn load_exl3_dir(
     projector: &CudaProjector,
     dir: &Path,
@@ -80,7 +77,6 @@ pub(super) fn load_exl3_dir_with_head(
     CudaWeights::from_exl3(weights)
 }
 
-/// Loads the whole pack through `reader`.
 pub(super) fn load_exl3_model(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,
@@ -166,7 +162,7 @@ fn model_weights(
     Ok(weights)
 }
 
-/// The embedding table (kept in its stored BF16), the output norm and the head.
+/// The embedding table is kept in its stored BF16.
 fn global_weights(
     reader: &PackReader<'_>,
     facts: &ModelFacts<'_>,

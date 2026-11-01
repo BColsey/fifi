@@ -57,7 +57,6 @@ fn matches_the_frozen_reference_at_position_8191() {
     }
 }
 
-/// The wrapper refuses a head_dim that does not match the mode.
 #[test]
 fn refuses_a_head_dim_that_does_not_match_the_mode() {
     if !testkit::device_present("rope_gemma dim refusal") {

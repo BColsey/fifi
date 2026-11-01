@@ -41,7 +41,6 @@ const _: () = assert!(
         && offset_of!(SoftcapArgsRepr, n) == 20
 );
 
-/// One softcap launch: n values of out and x and the cap.
 pub(in crate::kernels::cuda) struct SoftcapRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
@@ -64,7 +63,6 @@ fn check_softcap(call: &SoftcapRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the softcap of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn softcap_launch(
     stream: &RawStream,
     call: &SoftcapRaw<'_>,

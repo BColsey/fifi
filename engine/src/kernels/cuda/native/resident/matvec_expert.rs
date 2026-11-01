@@ -25,7 +25,7 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 use crate::kernels::cuda::resident::matvec_q::{QuantType, ROWS_MULTIPLE};
 
 /// Mirror of `inference_cuda_matvec_expert_args` (`matvec_expert.h`), field for field.
-/// The layout is pinned below and by the `static_assert` of the header.
+/// The layout is pinned as well by the `static_assert` of the header.
 #[repr(C)]
 struct ExpertArgsRepr {
     ty: c_int,
@@ -65,7 +65,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one expert matvec reads and writes.
 pub(in crate::kernels::cuda) struct ExpertMatvecRaw<'a> {
     pub(in crate::kernels::cuda) ty: QuantType,
     pub(in crate::kernels::cuda) w_stack: RawRange<'a>,
@@ -80,7 +79,6 @@ pub(in crate::kernels::cuda) struct ExpertMatvecRaw<'a> {
     pub(in crate::kernels::cuda) n_used: usize,
 }
 
-/// Bytes each range of a call must hold.
 struct Sizes {
     w_stack: usize,
     ids: usize,
@@ -105,9 +103,6 @@ fn call_sizes(call: &ExpertMatvecRaw<'_>) -> Option<Sizes> {
     })
 }
 
-/// Proves an expert matvec before the native call: the `matvec_q` shape rules, `n_used` in
-/// `1..=8` and at most `n_expert`, `y_slot_stride >= rows`, every range sized and 4-byte
-/// aligned, and `y` disjoint from `w_stack`, `x_q8` and `ids`.
 fn check_expert(call: &ExpertMatvecRaw<'_>) -> Result<(), DeviceFailure> {
     let need = call_sizes(call).ok_or_else(invalid_argument)?;
     let ints = [
@@ -147,7 +142,6 @@ fn check_expert(call: &ExpertMatvecRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the expert matvec of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn matvec_expert_launch(
     stream: &RawStream,
     call: &ExpertMatvecRaw<'_>,
@@ -235,9 +229,6 @@ mod tests {
         })
     }
 
-    /// Host only: the native check against the ranges of an unbacked allocation. The valid
-    /// layout passes; each case changes one thing and is refused, among them the strided
-    /// footprint of `y` and the checked `rows * n_expert`.
     #[test]
     fn check_expert_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 23);
@@ -311,8 +302,6 @@ mod tests {
         }
     }
 
-    /// The arguments of one launch as plain numbers; the addresses are made up and apart. Each
-    /// case changes one thing so the entry refuses before it reaches the device.
     #[derive(Clone, Copy)]
     struct Args {
         ty: c_int,
@@ -329,10 +318,8 @@ mod tests {
         stream: usize,
     }
 
-    /// GOOD is a call every check of the entry accepts, so each case below changes one thing and is
-    /// refused for that thing only. Its four ranges are pairwise apart (see the sizes below); `y`
-    /// used to lie inside the 9.4 MB stack range, which made every case fail the overlap check
-    /// whatever the check under test did.
+    /// GOOD is a call every check of the entry accepts, so each case below changes one thing and
+    /// is refused for that thing only. Its four ranges are pairwise apart (see the sizes below).
     const GOOD: Args = Args {
         ty: 12,
         w_stack: 0x10_0000,

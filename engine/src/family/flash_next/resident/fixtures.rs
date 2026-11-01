@@ -38,7 +38,6 @@ pub(super) enum Embedding {
 /// One stored tensor: name, safetensors dtype, shape, little-endian bytes.
 pub(super) type Entry = (String, &'static str, Vec<u32>, Vec<u8>);
 
-/// The `config.json` bytes of the synthetic model.
 pub(super) fn config() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "quantization": {"mode": "affine", "bits": 4, "group_size": 32},
@@ -58,7 +57,6 @@ pub(super) fn config() -> Vec<u8> {
     .unwrap()
 }
 
-/// Pushes `{stem}.weight`, `.scales`, and `.biases` for `logical` (last axis a multiple of 32).
 fn packed(out: &mut Vec<Entry>, stem: &str, logical: &[u32]) {
     let (&cols, lead) = logical.split_last().unwrap();
     let rows = lead.iter().product::<u32>() as usize;
@@ -82,7 +80,6 @@ fn packed(out: &mut Vec<Entry>, stem: &str, logical: &[u32]) {
     out.push((format!("{stem}.biases"), "BF16", group_shape, biases));
 }
 
-/// Pushes an F32 tensor.
 fn floats(out: &mut Vec<Entry>, key: &str, shape: Vec<u32>, values: &[f32]) {
     out.push((
         key.to_string(),
@@ -92,7 +89,6 @@ fn floats(out: &mut Vec<Entry>, key: &str, shape: Vec<u32>, values: &[f32]) {
     ));
 }
 
-/// Pushes an I64 vector.
 fn longs(out: &mut Vec<Entry>, key: &str, values: &[i64]) {
     let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     out.push((key.to_string(), "I64", vec![values.len() as u32], bytes));
@@ -218,7 +214,6 @@ pub(super) fn tensors() -> Vec<Entry> {
     tensors_with(Embedding::Flat)
 }
 
-/// Every tensor of the synthetic checkpoint with the given embedding table.
 pub(super) fn tensors_with(embedding: Embedding) -> Vec<Entry> {
     let mut out = Vec::new();
     packed(&mut out, &format!("{MODEL}embed_tokens"), &[8, 64]);
@@ -253,7 +248,6 @@ pub(super) fn checkpoint() -> StreamedCheckpoint {
     checkpoint_with(Embedding::Flat)
 }
 
-/// The synthetic checkpoint with the given embedding table.
 pub(super) fn checkpoint_with(embedding: Embedding) -> StreamedCheckpoint {
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
@@ -389,7 +383,6 @@ mod tests {
         logits
     }
 
-    /// The largest relative distance between two logits rows.
     fn relative_distance(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)

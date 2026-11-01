@@ -16,13 +16,9 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Root of every layer tensor name in a stock pack.
 const LAYER_ROOT: &str = "model.language_model.layers";
-/// Pack name of the embedding table.
 pub(super) const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
-/// Pack name of the output norm.
 pub(super) const NORM_NAME: &str = "model.language_model.norm.weight";
-/// Pack prefix of the output head.
 pub(super) const HEAD_PREFIX: &str = "lm_head";
 
 /// Root of every tensor name of the MTP head's layers in a stock pack.
@@ -95,7 +91,6 @@ pub(super) fn shared_name(layer: usize, part: ExpertPart) -> String {
     shared_name_in(Root::Layers, layer, part)
 }
 
-/// The three projections every expert owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExpertPart {
     Gate,
@@ -115,7 +110,6 @@ impl ExpertPart {
     }
 }
 
-/// What a header-only walk of a pack found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PackReport {
     /// Device bytes the load holds: trellises as stored, scales and plain vectors widened to
@@ -125,7 +119,6 @@ pub(super) struct PackReport {
     pub(super) matrices: usize,
     /// Matrices per rate, keyed by twice the bits per weight.
     pub(super) rates: BTreeMap<u8, usize>,
-    /// The codebook the matrices carry.
     pub(super) codebook: Marker,
 }
 
@@ -260,7 +253,6 @@ impl<'a> Inspector<'a> {
         Ok(rate)
     }
 
-    /// The marker tensor of the matrix: the whole pack carries one codebook.
     fn mark(&mut self, prefix: &str) -> Result<(), EngError> {
         let found = [("mul1", Marker::Mul1), ("mcg", Marker::Mcg)]
             .into_iter()
@@ -282,7 +274,6 @@ impl<'a> Inspector<'a> {
     }
 }
 
-/// Walks the pack headers against `shape`. See the module doc.
 pub(super) fn inspect_pack(
     source: &StreamedCheckpoint,
     shape: &HostShape,

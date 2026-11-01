@@ -475,7 +475,6 @@ fn a_denied_prefill_piece_restarts_the_slot_from_a_reset_session() {
     assert_eq!(
         trace.calls,
         vec![
-            // The seed session: piece 0 succeeds, piece 1 is denied.
             "reset",
             "boundary",
             "prefill:4",

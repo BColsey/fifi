@@ -9,7 +9,6 @@ use super::{Exl3IndexedCall, Exl3LinearCall};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
-/// Which kernel family a call runs on.
 #[derive(Clone, Copy, Debug)]
 enum Path {
     /// `exl3_linear_mode`: the shuffle single-call kernel.
@@ -20,7 +19,6 @@ enum Path {
     Wide(u32),
 }
 
-/// Device images of one projection: weights, scales, optional bias and the working spans.
 struct Rig {
     trellis: DeviceBuffer,
     trellis_offset: usize,
@@ -38,7 +36,6 @@ struct Rig {
     fused: bool,
 }
 
-/// What a call leaves behind.
 #[derive(Debug, PartialEq, Eq)]
 struct Written {
     xh: Vec<u8>,

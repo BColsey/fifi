@@ -11,7 +11,6 @@ use crate::{
     tensor::Dtype,
 };
 
-/// Reduction over `axis`. `keep_dims` keeps the axis with size 1; otherwise the axis is removed.
 pub(crate) fn reduce(
     operation: &'static str,
     shape: &[u32],
@@ -29,7 +28,6 @@ pub(crate) fn reduce(
     layout(operation, output)
 }
 
-/// Reshape to `target`, which must hold the same number of elements.
 pub(crate) fn reshape(
     operation: &'static str,
     shape: &[u32],
@@ -43,8 +41,6 @@ pub(crate) fn reshape(
     layout(operation, target.to_vec())
 }
 
-/// Transpose by `axes`, which must name every input axis exactly once.
-/// Output axis `i` takes input axis `axes[i]`.
 pub(crate) fn transpose(
     operation: &'static str,
     shape: &[u32],
@@ -67,7 +63,6 @@ pub(crate) fn transpose(
     layout(operation, output)
 }
 
-/// Inserts a size-1 axis at `axis`, which can be at most the input rank.
 pub(crate) fn expand_dims(
     operation: &'static str,
     shape: &[u32],
@@ -102,7 +97,6 @@ pub(crate) fn repeat(
     layout(operation, output)
 }
 
-/// Unit-stride slice `[start, stop)` on every axis. Each range must be non-empty and inside the input.
 pub(crate) fn slice(
     operation: &'static str,
     shape: &[u32],
@@ -123,7 +117,6 @@ pub(crate) fn slice(
     layout(operation, output)
 }
 
-/// Writes `update` into `target` at `start`. Returns the target layout and the stop bounds.
 pub(crate) fn slice_update(
     operation: &'static str,
     target: &[u32],
@@ -149,7 +142,6 @@ pub(crate) fn slice_update(
     Ok((layout(operation, target.to_vec())?, stop))
 }
 
-/// Joins `parts` along `axis`. Every other axis must match the first part.
 pub(crate) fn concatenate(
     operation: &'static str,
     parts: &[&[u32]],
@@ -312,7 +304,6 @@ pub(crate) fn gather_qmm(
     layout(operation, vec![count, rows, outputs])
 }
 
-/// Output layout of a dequantized weight: its logical shape.
 pub(crate) fn dequantize(
     operation: &'static str,
     logical: &[u32],
@@ -320,7 +311,6 @@ pub(crate) fn dequantize(
     layout(operation, logical.to_vec())
 }
 
-/// Output layout of an operation over the last axis that keeps the input shape.
 pub(crate) fn last_axis(
     operation: &'static str,
     shape: &[u32],
@@ -329,8 +319,7 @@ pub(crate) fn last_axis(
     layout(operation, shape.to_vec())
 }
 
-/// Output layout of a rotary embedding: the input shape. MLX needs rank at least three and
-/// an even, positive `dims` no larger than the last axis.
+/// MLX needs rank at least three and an even, positive `dims` no larger than the last axis.
 pub(crate) fn rope(
     operation: &'static str,
     shape: &[u32],
@@ -1047,18 +1036,14 @@ mod tests {
 
     #[test]
     fn take_along_axis_layout_takes_the_indices_shape() {
-        // x [3, 5] with indices [3, 2] on axis 1: the output is the indices shape [3, 2],
-        // 6 elements of 4 bytes.
         let columns = take_along_axis("take_along_axis", &[3, 5], &[3, 2], 1).unwrap();
         assert_eq!(columns.shape, [3, 2]);
         assert_eq!(columns.byte_len, 24);
 
-        // Axis 0: indices [2, 5] of x [3, 5] give the output [2, 5].
         let rows = take_along_axis("take_along_axis", &[3, 5], &[2, 5], 0).unwrap();
         assert_eq!(rows.shape, [2, 5]);
         assert_eq!(rows.byte_len, 40);
 
-        // A rank-one input works with rank-one indices.
         let flat = take_along_axis("take_along_axis", &[6], &[2], 0).unwrap();
         assert_eq!(flat.shape, [2]);
         assert_eq!(flat.byte_len, 8);
@@ -1254,8 +1239,6 @@ mod tests {
 
     #[test]
     fn attention_prefix_layout_bounds_len_by_the_capacity() {
-        // Queries [1, 16, 1, 64] over capacity buffers [1, 2, 8, 64]: the output is the query
-        // shape, 16 heads times 64 values of 4 bytes.
         let layout = attention_prefix(
             "grouped attention prefix",
             &[1, 16, 1, 64],
@@ -1267,7 +1250,6 @@ mod tests {
         assert_eq!(layout.shape, [1, 16, 1, 64]);
         assert_eq!(layout.byte_len, 4096);
 
-        // The full capacity is allowed.
         assert!(
             attention_prefix(
                 "grouped attention prefix",
@@ -1325,12 +1307,10 @@ mod tests {
 
     #[test]
     fn prefix_float_operands_follow_the_bf16_switch() {
-        // F32 passes with the switch off, and BF16 passes only after `allow_bf16`.
         assert!(float_operands("kv append", false, &[Dtype::F32, Dtype::F32]).is_ok());
         assert!(float_operands("grouped attention prefix", false, &[Dtype::F32; 3]).is_ok());
         assert!(float_operands("kv append", true, &[Dtype::F32, Dtype::Bf16]).is_ok());
         assert!(float_operands("grouped attention prefix", true, &[Dtype::Bf16; 3]).is_ok());
-        // An empty operand list holds no dtype to reject.
         assert!(float_operands("kv append", false, &[]).is_ok());
 
         rejects_unit(
@@ -1353,7 +1333,6 @@ mod tests {
 
     #[test]
     fn kv_append_operands_take_u32_rows_beside_the_floats() {
-        // The U32 codes of the quantized cache append beside F32, and BF16 still needs the switch.
         assert!(kv_append_operands("kv append", false, &[Dtype::F32, Dtype::F32]).is_ok());
         assert!(kv_append_operands("kv append", false, &[Dtype::U32, Dtype::U32]).is_ok());
         assert!(kv_append_operands("kv append", true, &[Dtype::Bf16, Dtype::Bf16]).is_ok());
@@ -1382,7 +1361,6 @@ mod tests {
         assert_eq!(layout.groups.shape, [1, 2, 8, 4]);
         assert_eq!(layout.groups.byte_len, 256);
 
-        // A rank-two input works: [8, 64] packs to [8, 16] codes and [8, 1] groups.
         let flat = quantize_rows("quantize rows", &[8, 64], 64, 8).unwrap();
         assert_eq!(flat.codes.shape, [8, 16]);
         assert_eq!(flat.groups.shape, [8, 1]);
@@ -1422,8 +1400,6 @@ mod tests {
 
     #[test]
     fn quantized_attention_prefix_layout_checks_the_buffers() {
-        // Queries [1, 16, 7, 256] over 8-bit buffers of group 64 at cap 16: the codes pack
-        // 64 words and the scales hold 4 groups per row; the output is the query shape.
         let layout = quantized_attention_prefix(
             "quantized attention prefix",
             &[1, 16, 7, 256],
@@ -1438,7 +1414,6 @@ mod tests {
         assert_eq!(layout.shape, [1, 16, 7, 256]);
         assert_eq!(layout.byte_len, 114688);
 
-        // The full capacity is allowed, and so is one position.
         assert!(
             quantized_attention_prefix(
                 "quantized attention prefix",
@@ -1484,7 +1459,6 @@ mod tests {
                 text,
             )
         };
-        // len 0 and len above the capacity.
         rejects_layout(
             kv8_buffers(),
             kv8_buffers(),
@@ -1501,7 +1475,6 @@ mod tests {
             8,
             "len must be at least one",
         );
-        // A head count that 16 query heads cannot share.
         let five_heads = [
             &[1u32, 5, 16, 64][..],
             &[1u32, 5, 16, 4][..],
@@ -1515,7 +1488,6 @@ mod tests {
             8,
             "query heads must be a multiple of key heads",
         );
-        // The codes width must be D * bits / 32 words.
         let narrow_codes = [
             &[1u32, 2, 16, 32][..],
             &[1u32, 2, 16, 4][..],
@@ -1529,7 +1501,6 @@ mod tests {
             8,
             "codes width must be D * bits / 32 words",
         );
-        // The scales and the biases must share the codes shape.
         let narrow_scales = [
             &[1u32, 2, 16, 64][..],
             &[1u32, 2, 16, 8][..],
@@ -1543,7 +1514,6 @@ mod tests {
             8,
             "scales and biases must match the codes shape",
         );
-        // The two sides must agree.
         rejects_layout(
             kv8_buffers(),
             [
@@ -1556,7 +1526,6 @@ mod tests {
             8,
             "value codes shape must match the key codes shape",
         );
-        // A batch that differs from the queries.
         let batch_two = [
             &[2u32, 2, 16, 64][..],
             &[2u32, 2, 16, 4][..],
@@ -1580,7 +1549,6 @@ mod tests {
             8,
             "group size must be nonzero",
         );
-        // A rank-three buffer.
         let rank_three = [
             &[1u32, 2, 16][..],
             &[1u32, 2, 16, 4][..],
@@ -1594,7 +1562,6 @@ mod tests {
             8,
             "quantized buffers must have rank four",
         );
-        // A wrong scales width against the group size.
         rejects_layout(
             kv8_buffers(),
             kv8_buffers(),
@@ -1642,7 +1609,6 @@ mod tests {
             ),
             "scales width must be D / group values",
         );
-        // The valid case of both sides at width 4 still passes.
         assert!(
             quantized_attention_prefix(
                 "quantized attention prefix",
@@ -1717,7 +1683,6 @@ mod tests {
             )
             .is_ok()
         );
-        // A BF16 cache after the switch.
         assert!(
             quantized_kv_operands(
                 "quantized attention prefix",
@@ -1996,7 +1961,6 @@ mod tests {
                 "decode head dim must be 64, 128, or 256",
             );
         }
-        // Lengths 0 and capacity + 1.
         refuses(
             &[1, 16, 1, 256],
             decode_side!(256, 4),

@@ -3,16 +3,7 @@
 //! Contract: the server design ("Streaming format"). The parser in `tokenizer::toolcall` owns
 //! the grammar: the think and call markers, the trimming of sections, the types of the
 //! arguments, and the check of a call body. This module owns only what the reply does with each
-//! parser event:
-//!
-//! - Reasoning and content events become reasoning and content parts.
-//! - A complete call becomes a call part. When the request lists no tool, the call becomes
-//!   content text instead, because the request did not allow it. A call to a function that is
-//!   not in the tool list of the request is still a call. A `number` argument written `2` stays
-//!   `2` in the call arguments.
-//! - A malformed call stays in the content as `<tool_call>`, the raw body, and `</tool_call>`.
-//! - A call left open at the end stays in the content as `<tool_call>` and the raw body. The
-//!   `length` limit drops it instead.
+//! parser event.
 
 use crate::tokenizer::ToolSpec;
 use crate::tokenizer::toolcall::{
@@ -21,10 +12,9 @@ use crate::tokenizer::toolcall::{
 };
 use serde_json::Value;
 
-/// One part of the reply, in order. The adapter never returns an empty text part.
+/// The adapter never returns an empty text part.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Piece {
-    /// Answer text.
     Content(String),
     /// Think text, without the tags.
     Reasoning(String),
@@ -33,8 +23,6 @@ pub(crate) enum Piece {
     Call(ToolCall),
 }
 
-/// Feeds the decoded text of one reply to the parser and returns reply parts.
-/// Feed the text of each step with `push` and end the reply with `finish`.
 pub(crate) struct ReplyParser {
     parser: ToolCallParser,
     grammar: ToolGrammar,
@@ -44,9 +32,7 @@ pub(crate) struct ReplyParser {
 }
 
 impl ReplyParser {
-    /// Creates the parser of one reply. `start` is `Start::Reasoning` when the prompt ended
-    /// inside a think block. `tools` are the tools of the request. `call_prefix` starts every
-    /// call id.
+    /// `start` is `Start::Reasoning` when the prompt ended inside a think block.
     #[cfg(test)]
     pub(crate) fn new(start: Start, tools: &[ToolSpec], call_prefix: &str) -> Self {
         Self::with_grammar(start, tools, call_prefix, ToolGrammar::Qwen)
@@ -80,7 +66,6 @@ impl ReplyParser {
         }
     }
 
-    /// Takes the next text of the reply and returns the parts that it completes.
     pub(crate) fn push(&mut self, text: &str) -> Vec<Piece> {
         if self.raw {
             return if text.is_empty() {
@@ -93,8 +78,7 @@ impl ReplyParser {
         self.convert(events, false)
     }
 
-    /// Ends the reply and returns the parts that remain. `cut_by_length` is true when the output
-    /// limit ended the reply: a call left open is then dropped.
+    /// `cut_by_length` is true when the output limit ended the reply.
     pub(crate) fn finish(&mut self, cut_by_length: bool) -> Vec<Piece> {
         if self.raw {
             return Vec::new();
@@ -123,11 +107,10 @@ impl ReplyParser {
     }
 }
 
-/// Writes a call as text in the form of the chat template. A request without tools allows no
-/// call, so the reply keeps the call as content. The text can differ from the model output in
-/// whitespace, because the parser keeps no raw text of a valid call. The template renders a
-/// non-string value with `tojson`. This function writes the compact `serde_json` form, so the
-/// separators of non-string values can differ from the template output too.
+/// Writes a call as text in the form of the chat template. The text can differ from the model
+/// output in whitespace, because the parser keeps no raw text of a valid call. The template
+/// renders a non-string value with `tojson`. This function writes the compact `serde_json`
+/// form, so the separators of non-string values can differ from the template output too.
 fn call_text(call: &ToolCall, grammar: ToolGrammar) -> String {
     let mut text = match grammar {
         ToolGrammar::Qwen => format!("<tool_call>\n<function={}>\n", call.name),
@@ -173,7 +156,6 @@ mod tests {
                 "note": {"type": "string"}}}}}))]
     }
 
-    /// Feeds the pieces of text one by one, ends the reply, and joins neighbours of one kind.
     fn run(start: Start, tools: &[ToolSpec], pushes: &[&str], cut_by_length: bool) -> Vec<Piece> {
         let mut parser = ReplyParser::new(start, tools, PREFIX);
         let mut pieces = Vec::new();

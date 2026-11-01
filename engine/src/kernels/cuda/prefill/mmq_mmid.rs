@@ -167,7 +167,6 @@ impl<'b> MmidIds<'b> {
 }
 
 impl MmidIds<'_> {
-    /// The shape the ids were made for.
     pub(crate) fn shape(&self) -> MmidShape {
         self.shape
     }
@@ -278,12 +277,10 @@ fn write_ints(
     range.buffer().write_at(stream, range.offset(), &bytes)
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("mmq_mmid: {tag}: {detail}"))
 }
 
-/// `value` as `c_int` when it lies in `low..=high`, else the refusal for `tag`.
 fn ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, EngError> {
     if !(low..=high).contains(&value) {
         return Err(rule(tag, &format!("{tag} is {value}, not {low} to {high}")));
@@ -472,7 +469,6 @@ pub(crate) fn check_launch_shape(s: &MmidLaunchShape) -> Result<(), EngError> {
 /// is the property pg1b pins.
 const GROUPED_TILE_MAX: i64 = 64;
 
-/// The columns one expert is expected to own: the average of the grouped launch.
 fn hint_cols(ne: usize, experts: usize) -> i64 {
     let per = ne.div_ceil(experts.max(1)).max(1);
     i64::try_from(per).unwrap_or(i64::MAX)
@@ -523,7 +519,6 @@ pub(in crate::kernels::cuda) fn set_hint_override(hint: Option<Option<i64>>) {
     HINT_OVERRIDE.with(|cell| cell.set(hint));
 }
 
-/// The operator hint, read once per process.
 fn cols_hint(s: &MmidLaunchShape) -> Option<i64> {
     static HINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     #[cfg(test)]
@@ -697,7 +692,6 @@ impl CudaContext {
         )
     }
 
-    /// Every check of a guard call, then the native view of its ranges.
     fn plan_ids_guard<'b>(&self, call: &IdsGuardCall<'b>) -> Result<IdsGuardRaw<'b>, EngError> {
         let raw = IdsGuardRaw {
             ids: self.raw_range(&call.ids)?,
@@ -714,7 +708,6 @@ impl CudaContext {
         Ok(raw)
     }
 
-    /// Every check of a builder call, then the native view of its ranges.
     fn plan_build_ids<'b>(
         &self,
         guard: &IdsGuardCall<'b>,
@@ -761,7 +754,6 @@ impl CudaContext {
         self.launch_on(stream, move |s| mmq_mmid_launch(s, raw))
     }
 
-    /// Every check of a grouped launch, then the native view of its ranges and its geometry.
     fn plan_mmid_launch<'b>(
         &self,
         call: &MmidLaunchCall<'b, '_>,

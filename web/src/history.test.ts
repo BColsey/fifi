@@ -1,5 +1,3 @@
-/** Tests for the pure request builder (node:test; no DOM at runtime). */
-
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { buildChatBody, buildMessages } from "./history.js";

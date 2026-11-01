@@ -34,9 +34,7 @@ use crate::{
 /// headroom. Extras include caller-owned allocations such as the device prefix tip.
 /// Fixed admission also checks fresh free VRAM before allocating its remaining buffers.
 pub(super) struct PrefillBudget {
-    /// Free device bytes after the load, less the headroom.
     pub(super) device_free: usize,
-    /// The admission's device extras.
     pub(super) extras: Vec<Extra>,
 }
 
@@ -60,20 +58,15 @@ pub(super) mod io {
     /// Device-to-host reads of intermediate buffers, which the I/O rule bans per chunk.
     pub(super) static D2H_READS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Zeroes the counters. Only the build-side counters exist yet; the chunk-side ones (the status
-    /// reads, the D2H reads) join when their bump sites land with the chunk protocol, which also
-    /// deletes their staging expects above.
     pub(in super::super) fn reset() {
         ALLOCS.store(0, Ordering::Relaxed);
         SPAN_WRITES.store(0, Ordering::Relaxed);
     }
 
-    /// One device allocation of the build side (the arena buffer, then `part`).
     pub(super) fn bump_alloc() {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One span write of the zero fill.
     pub(super) fn bump_span_write() {
         SPAN_WRITES.fetch_add(1, Ordering::Relaxed);
     }
@@ -653,32 +646,26 @@ impl PrefillArena {
         self.kv8_staging.as_ref().is_some_and(|(_, _, mode)| *mode)
     }
 
-    /// Bytes of the `part` allocation (`CPF_ATTN_PART_CAP`).
     pub(super) fn part_bytes(&self) -> usize {
         self.part.bytes()
     }
 
-    /// The tensor list of the admitted size, for the chunk-parts build.
     pub(super) fn list(&self) -> &[(ChunkSlot, ArenaTensor)] {
         &self.list
     }
 
-    /// The arena itself, for the chunk views.
     pub(super) fn arena(&self) -> &DeviceArena {
         &self.arena
     }
 
-    /// The `part` buffer, for the chunk buffers.
     pub(super) fn part(&self) -> &DeviceBuffer {
         &self.part
     }
 
-    /// The device facts of the admission, for the chunk buffers.
     pub(super) fn facts(&self) -> MmqFacts {
         self.facts
     }
 
-    /// The admission budget, for the run report.
     pub(super) fn budget(&self) -> usize {
         self.budget
     }

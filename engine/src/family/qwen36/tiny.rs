@@ -57,7 +57,6 @@ const fn model(
     }
 }
 
-/// Two layers: DeltaNet, then attention with 2 query heads and 1 key-value head.
 pub(super) const TINY: FamilySpec = model(
     "q36_tiny",
     2,
@@ -93,7 +92,6 @@ pub(super) const TINY_WIDE: FamilySpec = model(
     &[AttentionKind::DeltaNet, AttentionKind::Full],
 );
 
-/// Four layers: DeltaNet, attention, DeltaNet, attention, with 4 query heads and 2 key-value heads.
 pub(super) const TINY_GQA: FamilySpec = model(
     "q36_tiny_gqa",
     4,
@@ -108,9 +106,6 @@ pub(super) const TINY_GQA: FamilySpec = model(
     ],
 );
 
-/// Four layers like `TINY_GQA` with a head dimension of 64: the multiple of the Q8 cache group (64)
-/// that lets the 8-bit cache quantize its keys and values. The rotary dimension follows the
-/// config's partial factor of 0.5, so it is 32.
 pub(super) const TINY_KV8: FamilySpec = model(
     "q36_tiny_kv8",
     4,
@@ -403,8 +398,6 @@ mod tests {
         assert_eq!((attn.heads_q, attn.heads_kv, attn.rotary_dim), (4, 2, 16));
     }
 
-    /// The KV8 fixture: a head dimension of 64, the multiple of the Q8 cache group, with the rotary
-    /// dimension the config's partial factor gives (32).
     #[test]
     fn the_kv8_model_has_a_head_dimension_of_64() {
         let weights =

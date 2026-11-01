@@ -504,7 +504,6 @@ fn create_grid_exclusive(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Publish a finished temp receipt without ever replacing an existing file.
 fn publish(mut temp: tempfile::NamedTempFile, dest: &Path) -> std::io::Result<()> {
     temp.flush()?;
     temp.persist_noclobber(dest)
@@ -527,7 +526,6 @@ fn tf_gate_segment_plan_counts() {
             .sum::<usize>(),
         8448
     );
-    // The three classes cover distinct, contiguous id ranges with no overlap.
     assert_eq!(SegmentClass::S.start(), 0);
     assert_eq!(SegmentClass::M.start(), 8 * (1024 + SUFFIX));
     assert_eq!(SegmentClass::M.start(), 14_344);
@@ -538,12 +536,8 @@ fn tf_gate_segment_plan_counts() {
     assert_eq!(SegmentClass::L.start(), 24_074);
     assert_eq!(SegmentClass::L.start() + 8192 + SUFFIX, CORPUS_IDS);
     assert_eq!(24_576 + 11 * SUFFIX, CORPUS_IDS, "context + suffix ids");
-    // K geometry, spelled out: both classes end at the file end and share
-    // the same scored 768 positions; K32 nests K16's ids.
     assert_eq!(SegmentClass::K16.context(), 16_384);
     assert_eq!(SegmentClass::K32.context(), 32_768);
-    // KV sizing, pinned: K32's ring covers the 33,537 ids it reads plus
-    // chunk margin - 65,536 failed the f16 referee's device admission.
     assert_eq!(SegmentClass::K16.context_limit(), 32_768);
     assert_eq!(SegmentClass::K32.context_limit(), 36_864);
     assert_eq!(SegmentClass::K16.start(), 47_522 - (16_384 + SUFFIX));
@@ -551,15 +545,12 @@ fn tf_gate_segment_plan_counts() {
     assert_eq!(SegmentClass::K16.start(), 30_369);
     assert_eq!(SegmentClass::K32.start(), 13_985);
     assert!(SegmentClass::K32.start() < SegmentClass::K16.start());
-    // Scored positions are the file tail: fresh relative to every S/M/L leg
-    // (their scored suffixes all end at 33,035) and identical across K tiers.
     assert_eq!(K_END - SUFFIX, 46_753);
     const _: () = assert!(K_END - SUFFIX > CORPUS_IDS, "scored ids are fresh");
 }
 
-/// The REAL receipt serializer must publish the length of the ids the leg
-/// hashed: 33,035 for S/M/L, the 47,522 file end for both K classes. A
-/// revert to the CORPUS_IDS constant fails the K assertions below.
+/// A revert to the CORPUS_IDS constant for `corpus_ids_len` fails the K
+/// assertions below.
 #[test]
 fn tf_gate_receipt_header_publishes_the_hashed_length() {
     for (class, len) in [
@@ -615,7 +606,6 @@ fn tf_gate_logprob_and_kl_round_trip() {
     let kl = kl_validated(&row, &worse).unwrap();
     assert!(kl > 1e-4, "perturbed KL {kl}");
     assert_eq!(kl, kl_validated(&row, &worse).unwrap());
-    // The byte helpers round-trip exactly.
     let mut buffer = Vec::new();
     row_to_bytes(&row, &mut buffer);
     let mut back = Vec::new();
@@ -650,7 +640,6 @@ fn tf_gate_kl_direction_matches_hand_arithmetic() {
         "KL(Q||P) {kl_qp} vs {hand_qp}"
     );
     assert!((kl_pq - kl_qp).abs() > 1e-3, "direction must matter");
-    // Next-token log-probabilities agree with hand values on both sides.
     assert!((f64::from(p[0]) - row_lse(&p) - 0.6f64.ln()).abs() < 1e-6);
     assert!((f64::from(q[0]) - row_lse(&q) - 0.25f64.ln()).abs() < 1e-6);
 }
@@ -660,7 +649,6 @@ fn tf_gate_kl_rejects_degenerate_reference_rows() {
     let good = logprob_grid_row(&[0.5f32, 0.25, -0.25, -0.5]);
     // Zero support: every reference probability underflows to zero.
     let zero_row: Vec<f32> = vec![-890.0f32; 4];
-    // NaN and +inf reference values, and a row that is not a distribution.
     let mut nan_row = good.clone();
     nan_row[1] = f32::NAN;
     let mut inf_row = good.clone();
@@ -669,7 +657,6 @@ fn tf_gate_kl_rejects_degenerate_reference_rows() {
     for lp in &mut bad_mass {
         *lp += 0.7f64.ln() as f32;
     }
-    // Arm probability of exactly zero where the referee has mass.
     let mut starved = [0.0f32; 4];
     starved[0] = -890.0;
     for (name, row) in [
@@ -712,11 +699,9 @@ fn tf_gate_grid_create_is_exclusive_and_private() {
     drop(file);
     let mode = fs::metadata(&grid).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    // A destination created meanwhile is refused, never truncated.
     fs::write(&grid, b"existing").unwrap();
     assert!(create_grid_exclusive(&grid).is_err());
     assert_eq!(fs::read(&grid).unwrap(), b"existing");
-    // A dangling symlink destination is refused too (O_EXCL).
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
     assert!(create_grid_exclusive(&link).is_err());
@@ -836,7 +821,6 @@ fn tf_gate_grid_guard_removes_partial_on_failure() {
         !grid.exists(),
         "a failed referee run must leave no partial grid"
     );
-    // The success path disarms: the published grid survives.
     fs::write(&grid, b"complete-grid").unwrap();
     let guard = GridGuard(Some(grid.clone()));
     guard.disarm();
@@ -934,7 +918,6 @@ fn tf_gate_grid_stream_detects_corruption() {
     let mut buffer = vec![0u8; row_bytes];
     let mut row = Vec::new();
 
-    // The untouched grid streams and finishes cleanly.
     let mut stream = GridStream::open(&grid, positions, row_bytes, &digest).unwrap();
     for _ in 0..positions {
         stream.next_row(&mut buffer, &mut row);
@@ -952,7 +935,6 @@ fn tf_gate_grid_stream_detects_corruption() {
     }
     assert!(stream.finish().is_err(), "one changed byte must fail");
 
-    // Trailing extra row, short file, and a missing file are refused at open.
     let mut bytes = fs::read(&grid).unwrap();
     let head = bytes[..256].to_vec();
     bytes.extend_from_slice(&head);
@@ -964,16 +946,12 @@ fn tf_gate_grid_stream_detects_corruption() {
     assert!(GridStream::open(&short, positions, row_bytes, &digest).is_err());
     assert!(GridStream::open(&dir.path().join("absent"), positions, row_bytes, &digest).is_err());
 
-    // A declared digest that does not match the streamed bytes fails.
     let mut stream = GridStream::open(&grid, positions, row_bytes, "deadbeef").unwrap();
     for _ in 0..positions {
         stream.next_row(&mut buffer, &mut row);
     }
     assert!(stream.finish().is_err(), "digest mismatch must fail");
 
-    // A duplicate leg reads 2 of 8 segments, drains the rest, and the
-    // whole-grid digest + EOF still verify: clean grid passes; corruption
-    // in the UNREAD rows or a tampered digest fails.
     let partial = 2 * SCORED_PER_SEGMENT;
     let mut stream = GridStream::open(&grid, positions, row_bytes, &digest).unwrap();
     for _ in 0..partial {
@@ -1027,8 +1005,6 @@ fn tf_gate_grid_stream_detects_corruption() {
         "one byte appended after open must fail finish"
     );
 
-    // Exhausting the grid: read every declared row, then the next read
-    // must panic; finish must also refuse a stream with rows left.
     let mut stream = GridStream::open(&grid, positions, row_bytes, &digest).unwrap();
     for _ in 0..positions {
         stream.next_row(&mut buffer, &mut row);
@@ -1069,7 +1045,6 @@ fn tf_gate_corpus_tokenises_to_the_plan() {
     );
     let ids = corpus_ids(bundle.tokenizer());
     assert!(ids.len() >= CORPUS_IDS, "corpus {} ids", ids.len());
-    // K classes read to the file end; the binding must hold before any K leg.
     assert!(
         ids.len() >= K_END,
         "K classes need {K_END} ids, corpus has {}",
@@ -1175,8 +1150,6 @@ fn q8_tf_gate_teacher_forced_leg() {
         other => panic!("unknown FLINT_TF_GATE_ARM {other}"),
     };
     if let Some(armed) = armed_record {
-        // Effective arming: the receipt records the resolved route, not the
-        // requested one.
         assert_eq!(
             profile == "q8" && armed,
             arm == "tiled",

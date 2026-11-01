@@ -5,22 +5,16 @@
 //! Every failure is a `BadRequest` that names the field.
 //!
 //! `name` is not a member of `ChatMessage`, and the contract permits extra members.
-//! A string `name` reaches the template. A `name` of any other type is ignored.
-//!
-//! `content` is a string or an array of text parts. The parts are joined in order
-//! with no separator, so the template sees one string.
 
 use super::error::ServerError;
 use crate::EngError;
 use crate::tokenizer::{PromptMessage, Role, ToolCallSpec, ToolSpec};
 use serde_json::{Map, Value};
 
-/// A `BadRequest` with the given message.
 pub(super) fn bad(message: impl Into<String>) -> ServerError {
     ServerError::Eng(EngError::BadRequest(message.into()))
 }
 
-/// Reads an optional string member. An absent member gives `None`. Any other type fails.
 pub(super) fn optional_string(
     object: &Map<String, Value>,
     field: &str,
@@ -33,7 +27,6 @@ pub(super) fn optional_string(
     }
 }
 
-/// Reads a required string member.
 pub(super) fn required_string(
     object: &Map<String, Value>,
     field: &str,
@@ -42,7 +35,6 @@ pub(super) fn required_string(
     optional_string(object, field, at)?.ok_or_else(|| bad(format!("{at}{field} is required")))
 }
 
-/// Validates the `messages` array and converts it to the template input.
 pub(super) fn parse_messages(value: Option<&Value>) -> Result<Vec<PromptMessage>, ServerError> {
     let items = value
         .ok_or_else(|| bad("messages is required"))?
@@ -123,8 +115,6 @@ fn parse_message(index: usize, item: &Value) -> Result<PromptMessage, ServerErro
     })
 }
 
-// Joins the text of an array of content parts. Only text parts are supported; every
-// other shape names the message index, the part index, and the broken member.
 fn join_parts(parts: &[Value], at: &str) -> Result<String, ServerError> {
     let mut joined = String::new();
     for (part_index, part) in parts.iter().enumerate() {
@@ -179,7 +169,7 @@ fn parse_tool_calls(value: Option<&Value>, at: &str) -> Result<Vec<ToolCallSpec>
         .collect()
 }
 
-/// Validates `tools`. Each element passes to the template unchanged.
+/// Each element passes to the template unchanged.
 pub(super) fn parse_tools(value: Option<&Value>) -> Result<Vec<ToolSpec>, ServerError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -226,7 +216,7 @@ pub(super) fn parse_tools(value: Option<&Value>) -> Result<Vec<ToolSpec>, Server
         .collect()
 }
 
-/// Validates `tool_choice`. It returns true when the choice is `none`, which disables the tools.
+/// Returns true when the choice is `none`, which disables the tools.
 pub(super) fn parse_tool_choice(value: Option<&Value>) -> Result<bool, ServerError> {
     match value {
         None => Ok(false),
@@ -277,7 +267,6 @@ mod tests {
         message_of(messages(value).expect_err("must be rejected"))
     }
 
-    /// One text content part.
     fn text_part(text: &str) -> Value {
         json!({"type": "text", "text": text})
     }

@@ -1,5 +1,3 @@
-//! Checked host-paging sizes and device-first residency planning.
-
 use std::mem::size_of;
 
 use super::{dims::StepDims, state_layout::KvPool};

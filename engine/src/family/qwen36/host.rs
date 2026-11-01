@@ -20,7 +20,6 @@ use crate::family::spec::{AttentionKind, FamilySpec, Router};
 /// (`qwen3_5.py` line 174), not the configuration epsilon.
 const QK_RMS_EPS: f32 = 1e-6;
 
-/// DeltaNet dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeltaDims {
     pub(crate) key_heads: usize,
@@ -31,13 +30,11 @@ pub(crate) struct DeltaDims {
 }
 
 impl DeltaDims {
-    /// Channels of the fused query, key, and value projection.
     pub(crate) fn conv_dim(&self) -> usize {
         2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim
     }
 }
 
-/// Dense attention dimensions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AttnDims {
     pub(crate) heads_q: usize,
@@ -48,7 +45,6 @@ pub(crate) struct AttnDims {
     pub(crate) theta: f32,
 }
 
-/// Mixture-of-experts dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MoeDims {
     pub(crate) experts: usize,
@@ -58,7 +54,6 @@ pub(crate) struct MoeDims {
     pub(crate) renorm: bool,
 }
 
-/// Checked dimensions of the whole forward pass.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HostShape {
     pub(crate) hidden: usize,
@@ -85,7 +80,6 @@ fn to_usize(value: u32) -> usize {
 }
 
 impl HostShape {
-    /// Builds the shape from a family specification and the RoPE dimension the configuration gives.
     pub(crate) fn from_spec(spec: &FamilySpec, rotary_dim: u32) -> Result<Self, EngError> {
         let linear = spec
             .linear
@@ -125,7 +119,6 @@ impl HostShape {
         Ok(shape)
     }
 
-    /// Checks active dimensions and head ratios. Dense layers require zero MoE sentinels.
     pub(crate) fn check(&self) -> Result<(), EngError> {
         let d = &self.delta;
         let a = &self.attn;
@@ -175,7 +168,7 @@ impl HostShape {
     }
 }
 
-/// Weights of one DeltaNet layer. `W` is the projector's weight handle.
+/// `W` is the projector's weight handle.
 pub(crate) struct DeltaW<'a, W> {
     /// Fused projection `[conv_dim, hidden]`.
     pub(crate) qkv: &'a W,
@@ -197,7 +190,6 @@ pub(crate) struct DeltaW<'a, W> {
     pub(crate) norm: &'a [f32],
 }
 
-/// Weights of one dense attention layer.
 pub(crate) struct AttnW<'a, W> {
     /// Query and gate projection `[heads_q * head_dim * 2, hidden]`; each head holds its query rows, then its gate rows.
     pub(crate) q: &'a W,
@@ -213,7 +205,6 @@ pub(crate) struct AttnW<'a, W> {
     pub(crate) k_norm: &'a [f32],
 }
 
-/// Weights of one MoE layer.
 pub(crate) struct MoeW<'a, W> {
     /// Router `[experts, hidden]`.
     pub(crate) router: &'a W,
@@ -233,7 +224,6 @@ pub(crate) struct MoeW<'a, W> {
     pub(crate) shared_scalar: &'a W,
 }
 
-/// The token mixer of one layer.
 pub(crate) enum MixerW<'a, W> {
     /// A `linear_attention` layer.
     Delta(DeltaW<'a, W>),
@@ -253,7 +243,6 @@ pub(crate) enum FeedForwardW<'a, W> {
     Moe(MoeW<'a, W>),
 }
 
-/// Weights of one decoder layer.
 pub(crate) struct LayerW<'a, W> {
     /// Norm before the mixer, `hidden` values.
     pub(crate) input_norm: &'a [f32],
@@ -274,7 +263,6 @@ impl<'a, W> LayerW<'a, W> {
     }
 }
 
-/// Weights of the whole model.
 pub(crate) struct ModelW<'a, W> {
     /// Embedding table `[vocab, hidden]`.
     pub(crate) embed: &'a W,
@@ -285,7 +273,6 @@ pub(crate) struct ModelW<'a, W> {
     pub(crate) lm_head: &'a W,
 }
 
-/// Recurrent state and convolution ring of one DeltaNet layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeltaState {
     /// `[value_heads, value_dim, key_dim]` row-major, the layout of mlx-lm.
@@ -295,7 +282,6 @@ pub(crate) struct DeltaState {
 }
 
 impl DeltaState {
-    /// Returns a zero state.
     pub(crate) fn new(d: &DeltaDims) -> Self {
         Self {
             rec: vec![0.0; d.value_heads * d.value_dim * d.key_dim],
@@ -310,7 +296,6 @@ impl DeltaState {
     }
 }
 
-/// Keys and values of one dense attention layer, one entry per position.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct KvCache {
     /// `[positions, heads_kv, head_dim]` row-major, after the key norm and RoPE.
@@ -320,14 +305,12 @@ pub(crate) struct KvCache {
     positions: usize,
 }
 
-/// State of one layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LayerState {
     Delta(DeltaState),
     Attn(KvCache),
 }
 
-/// State of one sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HostState {
     layers: Vec<LayerState>,
@@ -336,7 +319,6 @@ pub(crate) struct HostState {
 }
 
 impl HostState {
-    /// Returns a fresh state whose layer kinds follow `shape`.
     pub(crate) fn new(shape: &HostShape) -> Self {
         let layers = shape
             .kinds
@@ -365,7 +347,6 @@ impl HostState {
     }
 }
 
-/// Dot product of two equal-length slices, accumulated in `f64`.
 fn dot64(a: &[f32], b: &[f32]) -> f64 {
     a.iter()
         .zip(b)
@@ -380,7 +361,7 @@ pub(crate) fn rms_unit(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|v| (f64::from(*v) * scale) as f32).collect()
 }
 
-/// `x / sqrt(mean(x^2) + eps) * weight`, with the weight applied as stored.
+/// `rms_unit` times `weight`, the weight applied as stored (no `1 +`).
 pub(crate) fn rms_plain(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, EngError> {
     expect_len(weight, x.len(), "rms norm weight")?;
     Ok(rms_unit(x, eps)
@@ -390,7 +371,6 @@ pub(crate) fn rms_plain(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>,
         .collect())
 }
 
-/// Softmax of `x` accumulated in `f64`.
 fn softmax(x: &[f32]) -> Vec<f32> {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f64> = x.iter().map(|v| f64::from(*v - max).exp()).collect();
@@ -434,8 +414,6 @@ fn delta_rule(
     out
 }
 
-/// Runs one DeltaNet decode step and returns the layer output of length `hidden`.
-///
 /// Rule (mlx-lm `GatedDeltaNet.__call__` with `gated_delta_ops`): project, causal depthwise
 /// convolution over the ring and the new row, SiLU, split into query, key, and value, normalize
 /// query and key, then per value head `S <- g S`, `delta = (v - S k) * beta`, `S <- S + delta (x) k`,
@@ -518,8 +496,6 @@ pub(crate) fn delta_step<P: Projector>(
     Ok(result)
 }
 
-/// Runs one dense attention decode step at position `pos` and returns the layer output.
-///
 /// Rule (mlx-lm `Qwen3NextAttention`): the query projection holds, per head, the query rows and then
 /// the gate rows. Query and key take a weighted RMS norm per head, then RoPE on the first
 /// `rotary_dim` dimensions (half-split pairs). Attention is causal with scale `head_dim^-0.5`, and
@@ -596,8 +572,6 @@ pub(crate) fn attn_step<P: Projector>(
     Ok(result)
 }
 
-/// Runs one MoE step and returns the layer output of length `hidden`.
-///
 /// Rule (mlx-lm `Qwen3NextSparseMoeBlock`): softmax over the router logits, the top `top_k`
 /// experts (the lowest index wins a tie), gates renormalized over the selection, each expert
 /// `down(silu(gate x) * up x)`, plus the shared expert times `sigmoid(shared_scalar x)`.
@@ -644,7 +618,6 @@ pub(crate) fn moe_step<P: Projector>(
     Ok(out)
 }
 
-/// Result of one decode step.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HostStep {
     /// Next-token logits, `vocab` values.
@@ -653,7 +626,6 @@ pub(crate) struct HostStep {
     pub(crate) layer_outputs: Vec<Vec<f32>>,
 }
 
-/// Runs one layer: `h = x + mixer(norm(x))`, then `h + moe(norm(h))`.
 fn layer_step<P: Projector>(
     projector: &mut P,
     shape: &HostShape,
@@ -678,8 +650,6 @@ fn layer_step<P: Projector>(
     Ok(h.iter().zip(&routed).map(|(a, b)| a + b).collect())
 }
 
-/// Runs one decode step for `token` at the position `state` holds and advances the state.
-///
 /// After an error the state is invalid: every later step returns `BadRequest`.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,

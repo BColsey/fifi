@@ -101,7 +101,6 @@ pub(in super::super) fn close(decoder: &mut ResidentDecoder<'_>) {
     }
 }
 
-/// The token count of a chunk. An empty chunk is a `BadRequest`.
 fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
     u32::try_from(tokens.len())
         .ok()
@@ -109,7 +108,6 @@ fn row_count(tokens: &[u32]) -> Result<u32, EngError> {
         .ok_or_else(|| bad("a prefill chunk needs between one and u32::MAX tokens"))
 }
 
-/// Checks that the page sets are open and serve a chunk of `rows` tokens.
 fn check_open(decoder: &ResidentDecoder<'_>, rows: u32) -> Result<(), EngError> {
     let open = decoder
         .prefill_pages
@@ -265,7 +263,6 @@ pub(in super::super) fn chunk_with_cap(
     result
 }
 
-/// The last row of the chunk residual `h` `[T, C, H]` as `[C, H]`.
 fn last_row(
     ctx: &mut Ctx<'_>,
     h: &ExecutionTensor,
@@ -282,7 +279,6 @@ fn last_row(
     ctx.kernels.reshape(&row, &[branches, hidden])
 }
 
-/// The output rows and the new state of one DeltaNet layer.
 struct DeltaLayer {
     out: ExecutionTensor,
     rec: ExecutionTensor,
@@ -333,7 +329,6 @@ fn delta_layer(
     Ok(DeltaLayer { out, rec, ring })
 }
 
-/// Builds the chunk graph, evaluates it once, reads back, and commits.
 fn run(
     decoder: &mut ResidentDecoder<'_>,
     state: &mut ResidentState,
@@ -531,13 +526,11 @@ mod tests {
         decoder
     }
 
-    /// Tokens `from..from + count` of the test prompt. The ids cycle through 1 to 7, because the
-    /// fixture embedding has 8 rows.
+    /// The ids cycle through 1 to 7, because the fixture embedding has 8 rows.
     fn prompt(from: u32, count: u32) -> Vec<u32> {
         (from..from + count).map(|i| i % 7 + 1).collect()
     }
 
-    /// The process-wide synchronization count in qualification builds.
     fn syncs(kernels: &MlxKernels) -> Option<u64> {
         #[cfg(feature = "native-fault-qualification")]
         {
@@ -550,7 +543,6 @@ mod tests {
         }
     }
 
-    /// Runs `tokens` as one-token `Prompt` steps.
     fn steps(decoder: &mut ResidentDecoder<'_>, state: &mut ResidentState, tokens: &[u32]) {
         for &token in tokens {
             decoder.step(state, token, StepMode::Prompt).unwrap();

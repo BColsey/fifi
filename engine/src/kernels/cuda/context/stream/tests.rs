@@ -18,7 +18,6 @@ use crate::kernels::cuda::{
 /// The 8 bytes a test copies into the word: token `0x04030201`, status `0x0A0B0C0D`.
 const WORD_BYTES: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x0D, 0x0C, 0x0B, 0x0A];
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request<T>(result: Result<T, EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");

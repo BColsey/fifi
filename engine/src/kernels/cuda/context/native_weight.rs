@@ -37,9 +37,7 @@ pub(crate) struct NativeWeight {
 /// short.
 #[derive(Clone, Copy)]
 struct RowChunkPlan {
-    /// Rows of the tensor.
     rows: usize,
-    /// Rows per chunk.
     per_chunk: usize,
 }
 
@@ -113,7 +111,6 @@ impl NativeWeight {
         self.n_rows
     }
 
-    /// Values per row (input values per token) of the weight.
     pub(crate) fn k(&self) -> usize {
         self.k
     }
@@ -124,7 +121,6 @@ impl NativeWeight {
         self.experts
     }
 
-    /// The quantized format of the blocks.
     pub(crate) fn quant(&self) -> QuantType {
         self.quant
     }

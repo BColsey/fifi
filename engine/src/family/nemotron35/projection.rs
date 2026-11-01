@@ -6,7 +6,6 @@ use crate::{
     tensor::{Dtype, Tensor},
 };
 
-/// Executes dense F32 projections for the portable Mamba caller.
 pub(crate) struct HostProjector;
 
 impl Projector for HostProjector {

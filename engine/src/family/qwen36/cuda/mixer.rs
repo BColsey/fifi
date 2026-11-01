@@ -59,7 +59,6 @@ use crate::{
 
 const F32: usize = size_of::<f32>();
 
-/// The ops of every supported layer kind, built once.
 struct KindOps {
     delta: Vec<BlockOp>,
     attn: Vec<BlockOp>,
@@ -152,7 +151,6 @@ impl<'a> MixerViews<'a> {
     }
 }
 
-/// The residual stream of one block and the position mirror.
 #[derive(Clone, Copy)]
 pub(super) struct BlockIo<'a> {
     /// `f32 [hidden]`; holds the residual on entry and, on exit, the residual after the mixer add
@@ -162,7 +160,6 @@ pub(super) struct BlockIo<'a> {
     pub(super) admit_pos: usize,
 }
 
-/// What a block runs against, bundled for the op executor.
 struct Run<'r> {
     stream: &'r DeviceStream,
     state: &'r ResidentState,
@@ -171,7 +168,6 @@ struct Run<'r> {
     io: BlockIo<'r>,
 }
 
-/// The pieces a session builds once.
 pub(super) struct MixerParts<'a> {
     pub(super) geometry: MixerGeometry,
     pub(super) table: &'a LayerTable,
@@ -207,7 +203,6 @@ pub(super) fn tail_extent(slot_bytes: usize, col: usize) -> Result<(usize, usize
     Ok((offset, slot_bytes - offset))
 }
 
-/// The tail of `range` from column `col`.
 fn tail<'b>(range: DeviceRange<'b>, col: usize) -> Result<DeviceRange<'b>, EngError> {
     let (offset, len) = tail_extent(range.bytes(), col)?;
     range.buffer().range(range.offset() + offset, len)
@@ -230,7 +225,7 @@ impl<'a> Mixers<'a> {
     }
 
     /// Queues layer `layer` on `stream` up to the MoE input. One row only (see
-    /// `mixer_geometry.rs`). Any `Err` after the owner and health guards means: poison the state.
+    /// `mixer_geometry.rs`).
     pub(super) fn run_block(
         &self,
         stream: &DeviceStream,

@@ -39,7 +39,7 @@
 //! a portable scalar fallback), the raw-pointer hand-off of one job to the workers, and the aligned
 //! scratch buffers. Each `unsafe` block carries its own SAFETY argument. The repo's third scoped
 //! unsafe module, confined to this file by the `unsafe_is_confined_to_the_avx2_module` test.
-//! The proposed unsafe scope still needs approval. It is not a general policy for unsafe code.
+//! It is not a general policy for unsafe code.
 //! Weight views borrow read-only `MappedFile` data. This module maps no files.
 
 use std::ops::Range;
@@ -65,17 +65,13 @@ const PASS_ROWS: usize = 4;
 /// Output rows of the up projection per chunk. A multiple of [`BLOCK`], so chunks write disjoint
 /// whole blocks of the permuted intermediate vector (no false sharing).
 const UP_CHUNK_ROWS: usize = 32;
-/// Output rows of the down projection per chunk.
 const DOWN_CHUNK_ROWS: usize = 8;
 
 /// Failure of a kernel call. Variants separate caller mistakes from weight-data refusals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Nvfp4CpuError {
-    /// A dimension, length or row count does not fit the expert geometry.
     Shape(String),
-    /// A non-finite activation, a malformed selection or a bad routing weight.
     Input(String),
-    /// A weight scale or projection result the reference would refuse.
     Weights(String),
     /// A worker failed (panic inside a chunk) or the pool could not start.
     Pool(String),
@@ -107,10 +103,6 @@ fn weights_err(message: impl Into<String>) -> Nvfp4CpuError {
     Nvfp4CpuError::Weights(message.into())
 }
 
-// ---------------------------------------------------------------------------------------------
-// Weight views
-// ---------------------------------------------------------------------------------------------
-
 /// One row-major NVFP4 matrix borrowed from the checkpoint mapping: `rows` x `cols`, packed two
 /// E2M1 codes per byte (even column in the low nibble), one E4M3FN scale byte per 16 columns.
 #[derive(Clone, Copy, Debug)]
@@ -123,7 +115,6 @@ pub struct Nvfp4Matrix<'a> {
 }
 
 impl<'a> Nvfp4Matrix<'a> {
-    /// Checks that the byte counts match the shape exactly, as the reference does.
     pub fn new(
         packed: &'a [u8],
         scales: &'a [u8],
@@ -331,11 +322,6 @@ impl Activation {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Instruction-set selection
-// ---------------------------------------------------------------------------------------------
-
-/// Which implementation of the row dot runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Isa {
     /// Portable Rust, the reference for the vector paths.
@@ -347,7 +333,6 @@ pub enum Isa {
 }
 
 impl Isa {
-    /// The best implementation this CPU supports.
     pub fn detect() -> Self {
         [Self::Avx512, Self::Avx2]
             .into_iter()
@@ -377,9 +362,7 @@ impl Isa {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
 // E4M3FN and E2M1 tables (scalar path and scale validation)
-// ---------------------------------------------------------------------------------------------
 
 /// E2M1 magnitudes for codes 0..8; bit 3 of a code is the sign.
 const E2M1: [f32; 16] = [
@@ -412,7 +395,6 @@ const fn e4m3_table() -> [f32; 256] {
     values
 }
 
-/// Refuses a matrix whose largest scale code is invalid or overflows once multiplied out.
 fn check_scale_extent(max_code: u8, weight_scale_2: f32) -> Result<(), Nvfp4CpuError> {
     if max_code > MAX_VALID_SCALE_CODE {
         return Err(weights_err("weight_scale must be finite and nonnegative"));
@@ -426,9 +408,7 @@ fn check_scale_extent(max_code: u8, weight_scale_2: f32) -> Result<(), Nvfp4CpuE
     Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
 // Permuted activation layout
-// ---------------------------------------------------------------------------------------------
 //
 // A vector of length k (a multiple of 16) is stored in blocks of 32: the 16 even-index elements
 // of the block, then its 16 odd-index elements. A weight byte holds elements (2i, 2i+1), so one
@@ -454,9 +434,7 @@ fn permute_row(src: &[f32], dst: &mut [f32]) {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
 // Row dots: dot(row, x_0..x_NX) for a range of matrix rows, per instruction set
-// ---------------------------------------------------------------------------------------------
 
 /// One result row: lane `n` is the dot with activation vector `n` of the pass.
 type RowResult = [f32; PASS_ROWS];
@@ -828,10 +806,6 @@ mod avx2 {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Aligned scratch
-// ---------------------------------------------------------------------------------------------
-
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct Line([f32; 16]);
@@ -874,9 +848,7 @@ impl AlignedBuf {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
 // One call: planning, chunk execution
-// ---------------------------------------------------------------------------------------------
 
 /// One distinct expert of a call and the rows that selected it.
 struct Work {
@@ -1014,11 +986,6 @@ impl Ctx<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Pool
-// ---------------------------------------------------------------------------------------------
-
-/// How an idle worker waits for the next call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitPolicy {
     /// Busy-wait forever (yielding the CPU now and then). Fastest wake-up, burns a core when idle,
@@ -1031,7 +998,6 @@ pub enum WaitPolicy {
     SpinThenPark(Duration),
 }
 
-/// Pool settings.
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
     /// Threads that compute a call, the calling thread included (`threads - 1` are spawned).
@@ -1188,7 +1154,6 @@ impl Shared {
         true
     }
 
-    /// Blocks until the epoch moves past `seen`; returns the new epoch, its job and the shutdown flag.
     fn next_job(&self, seen: u64) -> (u64, Option<Arc<JobCore>>, bool) {
         self.spin_for_epoch(seen);
         let mut slot = lock(&self.slot);
@@ -1304,7 +1269,6 @@ impl ExpertPool {
         }
     }
 
-    /// Threads that compute a call (workers plus the caller).
     pub fn threads(&self) -> usize {
         self.threads
     }
@@ -2027,8 +1991,6 @@ mod tests {
         assert!(out.iter().all(|&v| v == 0.0));
     }
 
-    // ----- refusals ---------------------------------------------------------------------------
-
     fn small_layer(rng: &mut Lcg) -> OwnedLayer {
         OwnedLayer::random(rng, 4, 32, 64)
     }
@@ -2294,8 +2256,6 @@ mod tests {
             "Weights",
         );
     }
-
-    // ----- pool -------------------------------------------------------------------------------
 
     #[test]
     fn every_wait_policy_serves_many_calls_and_shuts_down() {

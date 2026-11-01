@@ -4,7 +4,6 @@ use super::math::{expect_len, rms0, sigmoid, silu};
 use crate::EngError;
 use crate::family::project::Projector;
 
-/// Checked hyper-connection dimensions.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HyperShape {
     branches: usize,
@@ -14,7 +13,6 @@ pub(crate) struct HyperShape {
 }
 
 impl HyperShape {
-    /// Checks the branch count, hidden width, low rank, and epsilon.
     pub(crate) fn new(branches: u32, hidden: u32, rank: u32, eps: f32) -> Result<Self, EngError> {
         if branches == 0 || hidden == 0 || rank == 0 {
             return Err(EngError::Checkpoint(
@@ -44,30 +42,24 @@ impl HyperShape {
         self.branches * self.hidden
     }
 
-    /// Number of residual branches.
     pub(crate) fn branches(&self) -> usize {
         self.branches
     }
 
-    /// Hidden width of one branch.
     pub(crate) fn hidden(&self) -> usize {
         self.hidden
     }
 
-    /// Low rank of the mixing projections.
     pub(crate) fn rank(&self) -> usize {
         self.rank
     }
 
-    /// RMS normalization epsilon.
     pub(crate) fn eps(&self) -> f32 {
         self.eps
     }
 }
 
-/// Weights of one hyper-connection.
 pub(crate) struct HyperWeights<'a, W> {
-    /// Branch norm weights, length `width`.
     pub(crate) norm: &'a [f32],
     /// Low-rank down projection `[rank, width]`.
     pub(crate) down: &'a W,
@@ -77,7 +69,6 @@ pub(crate) struct HyperWeights<'a, W> {
     pub(crate) inject: Option<&'a W>,
 }
 
-/// Result of a hyper-connection read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HyperRead {
     /// Mixed block input, length `hidden`.
@@ -86,7 +77,6 @@ pub(crate) struct HyperRead {
     pub(crate) gate: Option<Vec<f32>>,
 }
 
-/// Normalizes the branches, mixes them, and computes the optional apply gate.
 pub(crate) fn read<P: Projector>(
     projector: &mut P,
     shape: &HyperShape,
@@ -142,7 +132,6 @@ pub(crate) fn read<P: Projector>(
     Ok(HyperRead { mixed, gate })
 }
 
-/// Adds `gate[b] * block[d]` to branch `b` of the residual.
 pub(crate) fn apply(
     shape: &HyperShape,
     hyper: &mut [f32],

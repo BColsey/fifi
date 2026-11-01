@@ -12,7 +12,6 @@ use crate::kernels::{PackedWeight, QuantizationMode};
 use crate::tensor::{Dtype, Tensor};
 use crate::weights::StreamedCheckpoint;
 
-/// Borrowed bytes of one packed matrix `[rows, cols]`.
 struct View<'a> {
     words: &'a [u8],
     scales: &'a [u8],
@@ -28,7 +27,6 @@ fn unsupported(message: &str) -> EngError {
     EngError::BadRequest(format!("cpu projector: {message}"))
 }
 
-/// The host bytes of an optional tensor.
 fn host_bytes(tensor: Option<&Tensor>) -> Result<&[u8], EngError> {
     tensor
         .and_then(Tensor::host_bytes)
@@ -75,7 +73,6 @@ impl<'a> View<'a> {
         }
     }
 
-    /// The code `q` of element `col` in row `row`.
     fn code(&self, row: usize, col: usize) -> u32 {
         let per_word = (32 / self.bits) as usize;
         let words_per_row = self.cols / per_word;
@@ -107,7 +104,6 @@ impl<'a> View<'a> {
         total as f32
     }
 
-    /// The dequantized values of one row.
     fn dequantize_row(&self, row: usize) -> Vec<f32> {
         let groups = self.cols / self.group;
         (0..self.cols)
@@ -119,8 +115,7 @@ impl<'a> View<'a> {
     }
 }
 
-/// Dequantizes a whole packed matrix `[rows, cols]` to row-major `f32` by the rule of [`View`]:
-/// `scale[g] * q + bias[g]`. The resident loader uses it for the small router and gate matrices.
+/// The resident loader uses it for the small router and gate matrices.
 pub(super) fn dequantize_matrix(weight: &PackedWeight) -> Result<Vec<f32>, EngError> {
     let view = View::new(weight)?;
     Ok((0..view.rows)
@@ -162,7 +157,6 @@ pub(crate) struct CpuProjector<'c> {
 }
 
 impl<'c> CpuProjector<'c> {
-    /// Creates a projector that splits matrix rows over `threads` threads (at least one).
     pub(crate) fn new(ckpt: &'c StreamedCheckpoint, threads: usize) -> Self {
         Self { ckpt, threads }
     }

@@ -1,7 +1,6 @@
 /**
- * The live speed panel's pure summary: medians over FINISHED-OK rows only
- * (the panel shows what a healthy request delivered; cancelled and failed
- * rows never feed a median). DOM-free so the node:test suite runs it.
+ * Medians over finished-ok rows only: the panel shows what a healthy
+ * request delivered. DOM-free so the node:test suite runs it.
  */
 
 export interface SpeedRow {

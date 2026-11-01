@@ -170,7 +170,6 @@ fn a_synthetic_snapshot_at_any_depth_up_to_the_capacity_passes_the_structure_che
     }
     // Structure only: values are never inspected, so non-finite values pass too (no finiteness check is promised).
     check_import(&layout, &id, &zero_export(&d, &layout, depth, f32::NAN)).unwrap();
-    // A larger allocation takes a shallower snapshot as well.
     let roomy = StateLayout::new(&d, &options(KvMode::Fp16, depth + 4_096)).unwrap();
     check_import(&roomy, &id, &zero_export(&d, &roomy, depth, 0.25)).unwrap();
 }
@@ -249,7 +248,6 @@ fn host_zeroed_of_zero_and_a_thousand_bytes() {
     );
 }
 
-/// The refusal is a `Checkpoint` error that names the rule.
 fn refused_with(result: Result<(), crate::EngError>, needle: &str) {
     match result {
         Err(crate::EngError::Checkpoint(text)) => assert!(text.contains(needle), "{text}"),

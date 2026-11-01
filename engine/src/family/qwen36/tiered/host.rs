@@ -36,21 +36,15 @@ pub enum HostError {
     /// A route the host refuses: a layer or expert out of range, a duplicate pick, a
     /// non-finite weight, or lists of different lengths. Nothing was started.
     BadRoute(String),
-    /// A call out of order, e.g. `finish_layer` for a layer that was not begun.
     Order(String),
-    /// The CPU pool refused or failed the layer.
     Pool(PoolError),
-    /// The residency ledger refused an operation.
     Residency(ResidencyError),
-    /// The locator could not name the bytes of an expert.
     Locator(LocatorError),
-    /// The device refused to fill a bank slot.
     Device(String),
     /// A bank fill failed earlier: the policy and the ledger no longer agree, so
     /// `end_token` refuses until the host is rebuilt. Classification still reads the
     /// ledger, so layers keep being served correctly (every unfilled pick on the CPU).
     Poisoned,
-    /// `check_consistency` found the policy and the ledger disagreeing.
     Inconsistent(String),
 }
 
@@ -97,7 +91,6 @@ pub struct LayerPlanHost {
     pub device_weights: Vec<f32>,
 }
 
-/// The CPU jobs of the layer in flight, tagged with their layer.
 struct InFlight {
     layer: usize,
     jobs: Option<PendingLayer>,
@@ -121,8 +114,6 @@ pub struct RouteLog {
 }
 
 impl RouteLog {
-    /// A log of `layers` layers of `top_k` picks each; `Err(BadRoute)` when `picks` is not exactly
-    /// `layers * top_k` long.
     pub fn new(layers: usize, top_k: usize, picks: Vec<(i32, f32)>) -> Result<Self, HostError> {
         if layers.checked_mul(top_k) != Some(picks.len()) {
             return Err(HostError::BadRoute(format!(
@@ -137,14 +128,12 @@ impl RouteLog {
         })
     }
 
-    /// The picks of `layer`, empty for a layer outside the log.
     fn layer(&self, layer: usize) -> &[(i32, f32)] {
         let at = layer.saturating_mul(self.top_k);
         self.picks.get(at..at + self.top_k).unwrap_or(&[])
     }
 }
 
-/// The host side of the tiered step.
 pub struct TieredHost {
     cfg: TieredConfig,
     locator: ExpertLocator,
@@ -494,8 +483,6 @@ impl TieredHost {
         Ok(fills)
     }
 
-    /// One bank change through the ledger: unpublish the victim, take a free slot for the
-    /// promoted expert, copy its bytes and complete the fill event.
     fn apply_swap(&mut self, device: &mut dyn BankDevice, swap: &Swap) -> Result<(), HostError> {
         let layer = usize::from(swap.layer);
         if let Some(evict) = swap.evict {
@@ -532,13 +519,10 @@ impl TieredHost {
         Ok(())
     }
 
-    /// Whether `expert` of `layer` is published in its bank.
     pub fn is_resident(&self, layer: usize, expert: u16) -> bool {
         self.table.lookup(layer, expert).is_some()
     }
 
-    /// Checks the ledger's partition invariants and that the policy and the ledger agree
-    /// on every layer's residents.
     pub fn check_consistency(&self) -> Result<(), HostError> {
         self.table.check_partition().map_err(HostError::Residency)?;
         for layer in 0..self.cfg.layers {
@@ -652,7 +636,6 @@ mod tests {
         let mut f = fixture();
         let s2 = install(&mut f.host, 1, 2, 1);
         let s5 = install(&mut f.host, 1, 5, 2);
-        // Mixed: resident 2, missed 3, router fault, resident 5.
         let plan = f
             .host
             .begin_layer(1, &[2, 3, -1, 5], &[0.4, 0.3, 0.0, 0.2], &f.hidden)
@@ -660,7 +643,6 @@ mod tests {
         assert_eq!(plan.slot_ids, vec![s2 as i32, 0, -1, s5 as i32]);
         assert_eq!(plan.device_weights, vec![0.4, 0.0, 0.0, 0.2]);
         assert!(f.host.finish_layer(1).unwrap().is_some());
-        // All resident: nothing for the CPU.
         let plan = f
             .host
             .begin_layer(1, &[5, 2], &[0.6, 0.4], &f.hidden)
@@ -668,14 +650,12 @@ mod tests {
         assert_eq!(plan.slot_ids, vec![s5 as i32, s2 as i32]);
         assert_eq!(plan.device_weights, vec![0.6, 0.4]);
         assert_eq!(f.host.finish_layer(1), Ok(None));
-        // All faulted: every id passes through, no job.
         let plan = f
             .host
             .begin_layer(0, &[-1, -1, -1, -1], &[0.0; 4], &f.hidden)
             .unwrap();
         assert_eq!(plan.slot_ids, vec![-1; 4]);
         assert_eq!(f.host.finish_layer(0), Ok(None));
-        // Nothing resident in layer 2: everything on the CPU through slot 0.
         let plan = f
             .host
             .begin_layer(2, &[0, 1], &[0.5, 0.5], &f.hidden)
@@ -846,7 +826,6 @@ mod tests {
         }
     }
 
-    /// Records the fills the host asks for; can fail the n-th one.
     #[derive(Default)]
     struct MockDevice {
         fills: Vec<(usize, usize, ExpertRanges)>,
@@ -882,7 +861,6 @@ mod tests {
         device.fills.iter().map(row).collect()
     }
 
-    /// One token: every layer's picks (equal weights), then the boundary.
     fn run_token(
         f: &mut Fixture,
         picks: &[Vec<i32>],
@@ -920,7 +898,6 @@ mod tests {
         );
         f.host.check_consistency().unwrap();
         assert!(f.host.is_resident(0, 2) && !f.host.is_resident(0, 3));
-        // The next token finds them resident.
         let report = run_token(&mut f, &picks, &mut device).unwrap();
         assert_eq!((report.bank_hits, report.cpu_served), (9, 3));
         f.host.check_consistency().unwrap();
@@ -972,15 +949,12 @@ mod tests {
         let picks = vec![vec![0, 1], vec![2], vec![3]];
         let err = run_token(&mut f, &picks, &mut device).unwrap_err();
         assert_eq!(err, HostError::Device(String::from("mock fill failure")));
-        // The ledger holds: the first fill landed and is published, the failed one is
-        // gone and its slot is free again.
         f.host.table.check_partition().unwrap();
         assert!(f.host.is_resident(0, 0) && !f.host.is_resident(0, 1));
         assert!(matches!(
             f.host.check_consistency(),
             Err(HostError::Inconsistent(_))
         ));
-        // The boundary refuses from now on, the layers are still served from the ledger.
         assert_eq!(f.host.end_token(&mut device), Err(HostError::Poisoned));
         let plan = f
             .host
@@ -1029,7 +1003,6 @@ mod tests {
     fn an_aborted_token_drops_its_routes_before_the_policy_sees_them() {
         let mut f = fixture();
         let mut device = MockDevice::default();
-        // The failed token routed experts 1 and 2 in layer 0 and then failed.
         f.host
             .begin_layer(0, &[1, 2], &[0.5, 0.5], &f.hidden)
             .unwrap();
@@ -1088,8 +1061,6 @@ mod tests {
 
     #[test]
     fn account_token_equals_the_per_layer_counters() {
-        // The same routes through the v1 path (begin_layer and finish_layer per layer) and through
-        // the log of the device: equal reports, equal swaps, equal slot rows, token after token.
         let (mut v1, mut logged) = (fixture(), fixture());
         let (mut dev_v1, mut dev_logged) = (MockDevice::default(), MockDevice::default());
         let mut rng = Lcg(0x7CA9_0004_0000_0001);
@@ -1434,7 +1405,6 @@ mod tests {
         );
         assert_eq!(plan.device_weights, vec![0.4, 0.3, 0.2, 0.1]);
         assert_eq!(f.host.finish_layer(1), Ok(None), "nothing runs on the CPU");
-        // With fewer slots the lowest-numbered experts fill, and a second preload is refused.
         let mut few = fixture();
         assert_eq!(
             few.host.preload_all(&mut MockDevice::default()).unwrap(),

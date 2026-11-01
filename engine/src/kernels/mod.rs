@@ -83,10 +83,6 @@ pub struct QuantizationSpec {
 }
 
 impl QuantizationSpec {
-    /// Checks the width and group size against the declared modes.
-    ///
-    /// Affine weights use 2, 3, 4, 5, 6, or 8 bits in groups of 32, 64, or 128.
-    /// MXFP4 uses 4 bits and MXFP8 uses 8 bits, both in groups of 32.
     /// Metadata parsing and packed-weight construction share this one rule.
     pub(crate) fn validate(&self) -> Result<(), EngError> {
         let bits_ok = match self.mode {

@@ -59,12 +59,10 @@ unsafe extern "C" {
     ) -> usize;
 }
 
-/// A fake device address; the entry compares addresses and never dereferences them.
 fn at(address: usize) -> *mut c_void {
     ptr::without_provenance_mut(address)
 }
 
-/// A valid call: Q8_0, K = 2,048, 512 rows, 64 columns, tight stride, ranges 256 MiB apart.
 fn base() -> MmqDenseArgsRaw {
     MmqDenseArgsRaw {
         w: at(0x1000_0000),
@@ -81,7 +79,6 @@ fn base() -> MmqDenseArgsRaw {
     }
 }
 
-/// The fill of `args`, or the entry's status.
 pub(super) fn fill(args: &MmqDenseArgsRaw) -> Result<ArgsViewRaw, c_int> {
     let mut view = ArgsViewRaw {
         x: ptr::null(),
@@ -105,9 +102,6 @@ pub(super) fn fill(args: &MmqDenseArgsRaw) -> Result<ArgsViewRaw, c_int> {
 
 #[test]
 fn the_dense_fill_pins_every_mmq_args_field() {
-    // Field order of `ints`: ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, nrows_dst,
-    // nchannels_x, nchannels_y, stride_channel_x/y/dst, nsamples_x, nsamples_y,
-    // stride_sample_x/y/dst, ncols_max, ncols_opt.
     let a = MmqDenseArgsRaw {
         n: 8192,
         m: 49,
@@ -344,14 +338,11 @@ fn the_dense_entry_refuses_each_bad_argument_at_its_own_guard() {
     for (name, args) in cases {
         assert_eq!(fill(&args).err(), Some(STATUS_INVALID_ARGUMENT), "{name}");
     }
-    // A NULL out pointer is refused before anything is written.
     // SAFETY: the entry checks `out` before it writes and reads `args` as a live struct.
     let status = unsafe { inference_cuda_mmq_dense_fill(&base(), ptr::null_mut()) };
     assert_eq!(status, STATUS_INVALID_ARGUMENT);
 }
 
-/// The C replica's fixup need for a dense call of `n` rows and `m` columns of `ggml_type`
-/// `ty`, on the device `facts`.
 fn c_fixup_need(ty: c_int, n: usize, m: usize, facts: &FactsRaw) -> usize {
     let n = c_int::try_from(n).expect("n fits");
     let args = MmqDenseArgsRaw {

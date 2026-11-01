@@ -155,7 +155,6 @@ pub(in crate::kernels::cuda) struct IdsShapeInts {
     pub(in crate::kernels::cuda) top_k: c_int,
 }
 
-/// What one guard launch reads (`ids`) and writes (`ids_g`, the optional status word).
 pub(in crate::kernels::cuda) struct IdsGuardRaw<'a> {
     pub(in crate::kernels::cuda) ids: RawRange<'a>,
     pub(in crate::kernels::cuda) ids_g: RawRange<'a>,
@@ -163,8 +162,7 @@ pub(in crate::kernels::cuda) struct IdsGuardRaw<'a> {
     pub(in crate::kernels::cuda) shape: IdsShapeInts,
 }
 
-/// What one builder launch reads and writes: the guard's ranges, then the three outputs of
-/// `mm_ids_helper`.
+/// The three new ranges are `mm_ids_helper`'s outputs.
 pub(in crate::kernels::cuda) struct BuildIdsRaw<'a> {
     pub(in crate::kernels::cuda) guard: IdsGuardRaw<'a>,
     pub(in crate::kernels::cuda) ids_src1: RawRange<'a>,
@@ -172,12 +170,10 @@ pub(in crate::kernels::cuda) struct BuildIdsRaw<'a> {
     pub(in crate::kernels::cuda) expert_bounds: RawRange<'a>,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Bytes of the `[m][top_k]` i32 id rows.
 fn rows_bytes(shape: &IdsShapeInts) -> Result<usize, DeviceFailure> {
     size(shape.m)?
         .checked_mul(size(shape.top_k)?)
@@ -191,7 +187,6 @@ fn aligned4(ranges: &[&RawRange<'_>]) -> bool {
     ranges.iter().all(|range| range.offset().is_multiple_of(4))
 }
 
-/// True when every written span shares no byte with any other span of the call.
 fn written_apart(written: &[Span<'_>], read: &[Span<'_>]) -> bool {
     written.iter().enumerate().all(|(i, span)| {
         written[i + 1..].iter().all(|other| span.apart(other))
@@ -199,8 +194,6 @@ fn written_apart(written: &[Span<'_>], read: &[Span<'_>]) -> bool {
     })
 }
 
-/// Proves a guard launch: `ids` and `ids_g` hold the rows, the status word 4 bytes, all are
-/// 4-byte aligned, and `ids_g` and the status word share no byte with each other or `ids`.
 fn check_guard(io: &IdsGuardRaw<'_>) -> Result<(), DeviceFailure> {
     let rows = rows_bytes(&io.shape)?;
     let sized = io.ids.bytes() >= rows
@@ -216,14 +209,12 @@ fn check_guard(io: &IdsGuardRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// The status pointer of the call: NULL when the call has none.
 fn status_ptr(status: Option<&RawRange<'_>>) -> *mut c_void {
     status.map_or(std::ptr::null_mut(), RawRange::address)
 }
 
 /// Queues the ids guard on `stream`: `ids_g` receives the router rows, every flagged row
-/// rewritten to `0..top_k`, and the status word the masks of `mmq_mmid.h`. Returns when the
-/// kernel is queued.
+/// rewritten to `0..top_k`, and the status word the masks of `mmq_mmid.h`.
 pub(in crate::kernels::cuda) fn mmq_ids_guard_launch(
     stream: &RawStream,
     io: IdsGuardRaw<'_>,
@@ -248,9 +239,6 @@ pub(in crate::kernels::cuda) fn mmq_ids_guard_launch(
     checked(status, stage)
 }
 
-/// Proves a builder launch: `ids`, `ids_g`, `ids_src1` and the written part of `ids_dst` hold
-/// the m * top_k ints, `expert_bounds` n_experts + 1 ints, the status word 4 bytes; all are
-/// 4-byte aligned, and every written range shares no byte with another range of the call.
 fn check_build(io: &BuildIdsRaw<'_>) -> Result<(), DeviceFailure> {
     let guard = &io.guard;
     let rows = rows_bytes(&guard.shape)?;
@@ -284,7 +272,7 @@ fn check_build(io: &BuildIdsRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the id builder on `stream`: the guard into `ids_g`, then `mm_ids_helper` on
-/// `ids_g` with the inverse map (contract in `mmq_mmid.h`). Returns when both are queued.
+/// `ids_g` with the inverse map (contract in `mmq_mmid.h`).
 pub(in crate::kernels::cuda) fn mmq_build_ids_launch(
     stream: &RawStream,
     io: BuildIdsRaw<'_>,
@@ -313,9 +301,7 @@ pub(in crate::kernels::cuda) fn mmq_build_ids_launch(
     checked(status, stage)
 }
 
-/// What one grouped launch reads (`x`, `y`, the two id ranges) and writes (`dst`, `fixup`), its
-/// geometry, and the SM count of the device facts the wrapper read (the fixup range holds the
-/// documented maximum of `nsm` slots).
+/// The fixup range holds the documented maximum of `nsm` slots of `mmq_mmid.h`.
 pub(in crate::kernels::cuda) struct MmidLaunchRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) y: RawRange<'a>,
@@ -328,8 +314,7 @@ pub(in crate::kernels::cuda) struct MmidLaunchRaw<'a> {
 }
 
 /// The bytes of each range of a grouped launch, in the order x, y, ids_dst, expert_bounds,
-/// dst, fixup, from the geometry by the rules of `mmq_mmid.h`. `None` for a negative field,
-/// an unglued type or an overflow.
+/// dst, fixup, from the geometry by the rules of `mmq_mmid.h`.
 fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
     let int = |value: i64| usize::try_from(value).ok();
     let block = match g.type_x {
@@ -358,9 +343,6 @@ fn launch_needs(g: &MmidGeometry, nsm: c_int) -> Option<[usize; 6]> {
     ])
 }
 
-/// Proves a grouped launch: every range holds its need and is aligned (x, y and fixup 16
-/// bytes, the rest 4), and the written `dst` and `fixup` share no byte with each other or the
-/// four read ranges.
 fn check_mmid(io: &MmidLaunchRaw<'_>) -> Result<(), DeviceFailure> {
     let need = launch_needs(&io.geometry, io.nsm).ok_or_else(invalid_argument)?;
     let ranges = [
@@ -387,8 +369,7 @@ fn check_mmid(io: &MmidLaunchRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues one grouped GEMM on `stream`: the vendored `mul_mat_q_case` of the weight type with
-/// the stream-k fixup when the launch needs it (contract in `mmq_mmid.h`). Returns when the
-/// kernels are queued.
+/// the stream-k fixup when the launch needs it (contract in `mmq_mmid.h`).
 pub(in crate::kernels::cuda) fn mmq_mmid_launch(
     stream: &RawStream,
     io: MmidLaunchRaw<'_>,

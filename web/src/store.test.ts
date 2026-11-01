@@ -1,5 +1,3 @@
-/** Tests for the pure settings coercion (node:test; no DOM at runtime). */
-
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { coerceSettings, defaultSettings } from "./store.js";

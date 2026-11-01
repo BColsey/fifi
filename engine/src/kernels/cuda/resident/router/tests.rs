@@ -37,8 +37,6 @@ fn shape(hidden: usize, n_expert: usize, top_k: usize, m: usize) -> RouterShape 
     }
 }
 
-// ---------------------------------------------------------------- host references
-
 struct HostRow {
     logits: Vec<f64>,
     /// Expert ids by logit descending, then lower index.
@@ -89,8 +87,6 @@ fn route_f32(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>, Vec<f32>) {
 fn ulp_apart(a: f32, b: f32) -> u32 {
     a.to_bits().abs_diff(b.to_bits())
 }
-
-// ---------------------------------------------------------------- device rig
 
 type Part<'a> = (&'a DeviceBuffer, usize, usize);
 
@@ -297,7 +293,7 @@ struct DeviceRow<'a> {
     gate: Option<f32>,
 }
 
-/// Check (1) and (2): the ids and weights against the f32 rule on the device logits.
+/// The ids and weights against the f32 rule on the device logits.
 fn check_f32_rule(case: &RowCase<'_>, dev: &DeviceRow<'_>, stats: &mut Stats) {
     let (ids, weights, probs) = route_f32(dev.logits, case.top_k);
     let got: Vec<usize> = dev
@@ -331,7 +327,7 @@ fn check_f32_rule(case: &RowCase<'_>, dev: &DeviceRow<'_>, stats: &mut Stats) {
     stats.weights_f32 += 1;
 }
 
-/// Checks (3) and (4): the margin-set rule and the weight by id against f64.
+/// The margin-set rule and the weight by id against f64.
 fn check_f64_rule(case: &RowCase<'_>, dev: &DeviceRow<'_>, host: &HostRow, stats: &mut Stats) {
     let k = case.top_k;
     let boundary = host.logits[host.order[k - 1]];
@@ -517,8 +513,6 @@ fn router_matches_the_host_references() {
         total.max_gate
     );
 }
-
-// ---------------------------------------------------------------- exact-logit helpers
 
 /// A rig whose logit `e` is exactly `values[e]`: `x` is ones and the router row `e` holds
 /// `values[e]` in column 0 and zeros elsewhere, so every dot is exact.
@@ -906,7 +900,6 @@ fn swept_row_counts(max: usize) -> Vec<usize> {
     counts
 }
 
-/// The first (row, column) where two logit images differ in any byte.
 fn first_logit_difference(a: &[u8], b: &[u8], columns: usize) -> Option<(usize, usize)> {
     assert_eq!(a.len(), b.len(), "logit images of different sizes");
     let word = a.iter().zip(b).position(|(l, r)| l != r)? / 4;
@@ -1032,7 +1025,6 @@ fn assert_refused(result: Result<(), EngError>, case: &str, needle: &str) {
     }
 }
 
-/// The limit and pairing rows for one base rig.
 fn refuse_limits(rig: &Rig<'_>) {
     let base = rig.shape;
     let limits = "the CUDA router takes";
@@ -1099,7 +1091,6 @@ fn refuse_pairing(rig: &Rig<'_>) {
     );
 }
 
-/// A part of `buffer` with `bytes` less than the full range.
 fn short(part: Part<'_>, by: usize) -> Part<'_> {
     (part.0, part.1, part.2 - by)
 }

@@ -52,7 +52,6 @@ fn a_path_binds_every_flag_it_reads() {
     let base = FlintPath::from_env_values(root, 32_768, bare());
     let same = FlintPath::from_env_values(root, 32_768, bare());
     assert_eq!(base, same, "same values = same path");
-    // Every input moves the fingerprint, one at a time, by name.
     for (name, moved) in [
         (
             "batch_prefill",
@@ -256,10 +255,10 @@ fn a_restored_prefix_is_bitwise_identical_to_a_cold_prefill() {
     let (mut warm, mut warm_session) = open_real(&root);
     let (mut cold, mut cold_session) = open_real(&root);
 
-    feed(&mut cold, &mut cold_session, prompt); // cold prefill
+    feed(&mut cold, &mut cold_session, prompt);
     let (cold_row, cold_draws) = row_and_greedy(&mut cold, &mut cold_session, 32);
 
-    feed(&mut warm, &mut warm_session, prompt); // warm prefill
+    feed(&mut warm, &mut warm_session, prompt);
     assert!(
         warm.save_prefix(&warm_session, prompt, SaveKind::Tip)
             .expect("save at the tip"),
@@ -307,7 +306,7 @@ fn an_appended_turn_restores_the_tip_and_prefills_only_the_new_tokens() {
     let (mut warm, mut warm_session) = open_real(&root);
     let (mut cold, mut cold_session) = open_real(&root);
 
-    feed(&mut warm, &mut warm_session, head); // head prefill
+    feed(&mut warm, &mut warm_session, head);
     assert!(
         warm.save_prefix(&warm_session, head, SaveKind::Tip)
             .expect("tip save")
@@ -319,9 +318,9 @@ fn an_appended_turn_restores_the_tip_and_prefills_only_the_new_tokens() {
         .restore_prefix(&mut warm_session, &tokens)
         .expect("restore head");
     assert_eq!(covered, head.len());
-    feed(&mut warm, &mut warm_session, tail); // prefill only the appended tokens
+    feed(&mut warm, &mut warm_session, tail);
 
-    feed(&mut cold, &mut cold_session, &tokens); // cold full prefill
+    feed(&mut cold, &mut cold_session, &tokens);
     assert_eq!(
         logits_row(&mut warm, &mut warm_session),
         logits_row(&mut cold, &mut cold_session),
@@ -345,7 +344,7 @@ fn a_diverged_tail_never_serves_the_tip_and_recomputes() {
     let (head, _) = tokens.split_at(4096);
 
     let (mut engine, mut session) = open_real(&root);
-    feed(&mut engine, &mut session, head); // head prefill
+    feed(&mut engine, &mut session, head);
     assert!(
         engine
             .save_prefix(&session, head, SaveKind::Tip)
@@ -365,7 +364,6 @@ fn a_diverged_tail_never_serves_the_tip_and_recomputes() {
         covered, 0,
         "a divergence before the tip must cover nothing: full recompute"
     );
-    // The diverged request still succeeds via ordinary piecewise prefill.
     feed(&mut engine, &mut session, &diverged);
 }
 
@@ -382,7 +380,7 @@ fn a_side_request_covers_zero_and_keeps_the_tip_intact() {
     let (head, tail) = tokens.split_at(4096);
 
     let (mut engine, mut session) = open_real(&root);
-    feed(&mut engine, &mut session, head); // head prefill
+    feed(&mut engine, &mut session, head);
     assert!(
         engine
             .save_prefix(&session, head, SaveKind::Tip)
@@ -398,7 +396,7 @@ fn a_side_request_covers_zero_and_keeps_the_tip_intact() {
         .restore_prefix(&mut session, &stranger)
         .expect("stranger lookup");
     assert_eq!(covered, 0, "a stranger conversation never mixes states");
-    feed(&mut engine, &mut session, &stranger); // stranger prefill
+    feed(&mut engine, &mut session, &stranger);
 
     engine.reset(&mut session).expect("reset");
     let recovered = engine
@@ -410,7 +408,7 @@ fn a_side_request_covers_zero_and_keeps_the_tip_intact() {
         boundary_row, recovered_row,
         "the tip changed while a stranger request ran on the same executor"
     );
-    feed(&mut engine, &mut session, tail); // append after restore
+    feed(&mut engine, &mut session, tail);
 }
 
 /// Gate 5 (variants): a tip save must not perturb the LIVE session. One
@@ -686,7 +684,6 @@ fn a_stored_entry_survives_a_continued_session() {
     feed(&mut e, &mut sess, &tokens[4096..4104]);
     let _ = row_and_greedy(&mut e, &mut sess, 1);
 
-    // Re-read the stored tip on a fresh session of the same executor.
     e.reset(&mut sess).expect("reset");
     let covered = e
         .restore_prefix(&mut sess, &tokens)

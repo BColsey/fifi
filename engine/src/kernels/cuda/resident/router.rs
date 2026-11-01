@@ -49,7 +49,6 @@ use crate::kernels::cuda::native::resident::router::{
     router_sigmoid_launch,
 };
 
-/// The bit of `status` that the router sets when any row is faulty.
 pub(crate) const ROUTER_STATUS_BIT: i32 = 1;
 
 const MAX_ROWS: usize = 4096;
@@ -57,20 +56,15 @@ const MAX_HIDDEN: usize = 65536;
 const MAX_EXPERTS: usize = 256;
 const MAX_TOP_K: usize = 32;
 
-/// The sizes of one router call. Qwen3.6 is `hidden` 2048, `n_expert` 256, `top_k` 8, `m` 1.
+/// Qwen3.6 is `hidden` 2048, `n_expert` 256, `top_k` 8, `m` 1.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouterShape {
-    /// Token rows, 1 to 4096.
     pub(crate) m: usize,
-    /// Width of a row of `x` and of the router matrix, a multiple of 4 from 4 to 65536.
     pub(crate) hidden: usize,
-    /// Experts, 1 to 256.
     pub(crate) n_expert: usize,
-    /// Experts chosen per row, 1 to the smaller of `n_expert` and 32.
     pub(crate) top_k: usize,
 }
 
-/// The router weights, both f32 and 16-byte aligned.
 pub(crate) struct RouterWeights<'b> {
     /// `[n_expert][hidden]`, expert-major (GGUF `ffn_gate_inp`).
     pub(crate) w: DeviceRange<'b>,
@@ -79,7 +73,6 @@ pub(crate) struct RouterWeights<'b> {
     pub(crate) w_shared: Option<DeviceRange<'b>>,
 }
 
-/// What the router writes.
 pub(crate) struct RouterOut<'b> {
     /// i32 `[m][top_k]` in rank order; -1 in every slot of a faulty row.
     pub(crate) ids: DeviceRange<'b>,
@@ -93,22 +86,17 @@ pub(crate) struct RouterOut<'b> {
     pub(crate) status: DeviceRange<'b>,
 }
 
-/// One router call.
 pub(crate) struct RouterCall<'b> {
-    /// The sizes of the call.
     pub(crate) shape: RouterShape,
     /// f32 `[m][hidden]`, 16-byte aligned: the normalized row, not its fp16 pack.
     pub(crate) x: DeviceRange<'b>,
-    /// The router weights.
     pub(crate) weights: RouterWeights<'b>,
     /// f32 scratch `[m][n_expert + 1]` ([`router_logits_bytes`] bytes); the last column holds the
     /// shared-gate dot.
     pub(crate) logits: DeviceRange<'b>,
-    /// The outputs.
     pub(crate) out: RouterOut<'b>,
 }
 
-/// The bytes each range of a call must hold.
 struct Bytes {
     x: usize,
     w: usize,
@@ -140,8 +128,6 @@ fn bytes_of(shape: &RouterShape) -> Result<Bytes, EngError> {
     })
 }
 
-/// The bytes of the logits scratch for `shape`: `4 * m * (n_expert + 1)`. 1,028 at Qwen3.6 with
-/// `m` 1. Returns `BadRequest` when the product overflows.
 pub(crate) fn router_logits_bytes(shape: RouterShape) -> Result<usize, EngError> {
     bytes_of(&shape).map(|bytes| bytes.logits)
 }
@@ -192,8 +178,6 @@ fn check_fit(call: &RouterCall<'_>, need: &Bytes) -> Result<(), EngError> {
     require_fit("status", &call.out.status, 4, 4)
 }
 
-/// Every range the launch writes (and the scratch) against the other outputs and the inputs, the
-/// written one named first in the refusal.
 fn check_apart<'b>(call: &RouterCall<'b>, need: &Bytes) -> Result<(), EngError> {
     let mut outputs = vec![
         Claim::of("ids", &call.out.ids, need.picks),
@@ -228,7 +212,6 @@ fn to_int(name: &str, value: usize) -> Result<std::ffi::c_int, EngError> {
 }
 
 impl CudaContext {
-    /// Every check of a router call, then the native view of its ranges and ints.
     fn plan_router<'b>(&self, call: &RouterCall<'b>) -> Result<RouterRaw<'b>, EngError> {
         let raw = |range: &DeviceRange<'b>| self.raw_range(range);
         let optional = |range: &Option<DeviceRange<'b>>| -> Result<Option<RawRange<'b>>, EngError> {
@@ -273,20 +256,7 @@ impl CudaContext {
     /// Queues the router of `call` on `stream`: the logits kernel, then the selection kernel (a
     /// warp per token row: softmax, the top `top_k` by probability then lower index,
     /// renormalization, the gate, the fault check). Returns when both are queued; it does not
-    /// wait. The logits kernel is chosen by `shape.m`: below 8 rows (decode) a warp per row of the
-    /// router matrix and per token, and one for `w_shared`; from 8 rows (a prefill chunk) a tiled
-    /// kernel in which a warp takes 4 rows of the matrix against 8 tokens. Both sum every dot
-    /// product in one fixed order, so the logits do not depend on the choice.
-    ///
-    /// The caller guarantees that `x` holds its data in stream order, that the device memory of
-    /// every range stays alive until the stream has drained, and that nothing else reads or writes
-    /// the outputs or the scratch until then. A faulty row is reported by ids -1, weights 0, gate 0
-    /// and [`ROUTER_STATUS_BIT`] in `status`, not by an error.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a shape outside the limits
-    /// of [`RouterShape`], `w_shared` and `shared_gate` that are not given together, a range that
-    /// is too short or misaligned (x, w and w_shared 16; the rest 4), and an output, the scratch
-    /// or `status` that overlaps another range of the call.
+    /// wait.
     pub(crate) fn router(
         &self,
         stream: &DeviceStream,

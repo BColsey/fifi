@@ -266,7 +266,6 @@ pub(super) mod tests {
         (0..64).map(|i| ((i % 5) as f32 - 2.0) * 0.25).collect()
     }
 
-    /// A pool sized for layer 0 of `weights`.
     fn pool(ckpt: &StreamedCheckpoint, weights: &ResidentWeights) -> ExpertSlots {
         let k = u32::try_from(weights.shape.moe.top_k()).unwrap();
         let layout =
@@ -274,7 +273,6 @@ pub(super) mod tests {
         ExpertSlots::new(POOL_SETS, layout.end).unwrap()
     }
 
-    /// Imports `x` as `[1, 64]`, runs the resident step on layer 0, and reads the output back.
     fn resident_step(
         kernels: &mut MlxKernels,
         weights: &ResidentWeights,
@@ -303,7 +301,6 @@ pub(super) mod tests {
         host
     }
 
-    /// Asserts cos >= 0.99999 and max |got - want| / max |want| <= 1e-4.
     fn assert_parity(got: &[f32], want: &[f32], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}: length");
         let (mut err, mut scale, mut dot, mut gg, mut ww) =

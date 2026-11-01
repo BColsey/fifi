@@ -22,17 +22,14 @@ pub(super) struct MarkedGroup {
     /// The layer whose mixer+MoE pair carries the timing pair (the second of the run, or the
     /// only layer of a singleton run).
     pub(super) layer: usize,
-    /// Layers of the run, the marked one included.
     pub(super) size: usize,
 }
 
-/// The timing marks of one captured token: one pair per run of identical layer kinds.
 #[derive(Debug, Clone)]
 pub(super) struct SectionPlan {
     pub(super) groups: Vec<MarkedGroup>,
 }
 
-/// One section reading, reconciled: the marked milliseconds plus the extrapolation.
 #[derive(Debug, Clone)]
 pub(super) struct SectionTimes {
     embed_ms: f32,
@@ -119,7 +116,6 @@ impl SectionPlan {
 }
 
 impl SectionTimes {
-    /// The embedding section as read, in milliseconds.
     pub(super) fn embed_ms(&self) -> f32 {
         self.embed_ms
     }

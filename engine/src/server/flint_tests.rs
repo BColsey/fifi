@@ -1,4 +1,3 @@
-//! Real pinned tokenizer through HTTP request conversion, decode, parsing, and wire replies.
 use super::{router::router, state::AppState, testkit};
 use crate::exec_fake::FakeExecutor;
 use crate::sched::worker::{Engine, EngineState, spawn_engine};

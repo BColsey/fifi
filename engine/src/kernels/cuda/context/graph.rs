@@ -71,7 +71,6 @@ thread_local! {
     static WINDOW: RefCell<Window> = const { RefCell::new(Window::new()) };
 }
 
-/// Whether a capture window is open on this thread.
 pub(super) fn window_open() -> bool {
     WINDOW.with(|window| window.borrow().open)
 }

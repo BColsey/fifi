@@ -1,5 +1,3 @@
-// Portable CPU adapter for the decision head.
-// Tests cross DecisionHead::predict only.
 use inference_engine::{
     EngError,
     kernels::decision::{DecisionHead, HeadConfig, HeadWeights},
@@ -160,8 +158,6 @@ fn try_new_rejects_an_output_count_beyond_the_native_int_range() {
 
 #[test]
 fn try_new_accepts_the_largest_native_int_dimension_before_checking_lengths() {
-    // The limit itself passes the dimension check, so a length mismatch is the
-    // only remaining rejection.
     let config = HeadConfig {
         input: 4,
         hidden: 2,

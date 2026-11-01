@@ -16,7 +16,6 @@ use crate::{
     tensor::{Backing, Dtype, Tensor},
 };
 
-/// A seekable byte source for one checkpoint shard.
 pub trait ShardIo: Read + Seek {}
 impl<T: Read + Seek> ShardIo for T {}
 
@@ -140,7 +139,6 @@ fn read_header(
     })
 }
 
-/// Requires the header keys and the index entries of one shard to be the same set.
 fn check_membership(
     name: &str,
     header: &ShardHeader,
@@ -171,7 +169,6 @@ fn check_membership(
     Ok(())
 }
 
-/// Lists the resident tensors of one shard and charges their bytes against both caps.
 fn plan_slots(
     name: &str,
     header: &ShardHeader,

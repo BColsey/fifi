@@ -56,7 +56,6 @@ fn k_partials(rows: usize, k: usize) -> usize {
     split
 }
 
-/// Packs `x` into `xf` and multiplies all rows of `weight` into `y`, on `stream`.
 fn queue_projection(
     ctx: &CudaContext,
     stream: &DeviceStream,

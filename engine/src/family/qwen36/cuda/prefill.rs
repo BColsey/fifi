@@ -144,23 +144,19 @@ impl ChunkRows {
         Ok(Self { p0, m })
     }
 
-    /// The chunk's first position.
     pub(super) fn p0(&self) -> usize {
         self.p0
     }
 
-    /// The chunk's rows.
     pub(super) fn m(&self) -> usize {
         self.m
     }
 
-    /// One past the chunk's last position.
     pub(super) fn end(&self) -> usize {
         self.p0 + self.m
     }
 }
 
-/// The index of `slot` in `slots`, or the `is not a view` refusal.
 pub(super) fn slot_position(slots: &[ChunkSlot], slot: ChunkSlot) -> Result<usize, EngError> {
     slots
         .iter()
@@ -168,7 +164,7 @@ pub(super) fn slot_position(slots: &[ChunkSlot], slot: ChunkSlot) -> Result<usiz
         .ok_or_else(|| not_a_view(slot))
 }
 
-/// The refusal of a slot the views do not hold: one text for the list lookup and the view lookup.
+/// One refusal text for the list lookup and the view lookup.
 fn not_a_view(slot: ChunkSlot) -> EngError {
     EngError::BadRequest(format!("prefill chunk: slots: {slot:?} is not a view"))
 }
@@ -265,7 +261,7 @@ impl<'a> ChunkViews<'a> {
         Ok(Self { views })
     }
 
-    /// Whether the views belong to an EXL3 arena, the list that carries the EXL3 flag slot.
+    /// The list that carries the EXL3 flag slot.
     pub(super) fn is_exl3(&self) -> bool {
         self.views
             .iter()
@@ -385,7 +381,6 @@ pub(super) fn resident_moe_stages() -> [MoeStage; 14] {
 
 /// The phase and slot columns of stage P1 (the embedding, before layer 0).
 pub(super) const EMBED_PHASE: Phase = Phase::Embed;
-/// Reads `IdsTok`, writes `Hidden`.
 pub(super) const EMBED_SLOTS: (&[ChunkSlot], &[ChunkSlot]) =
     (&[ChunkSlot::IdsTok], &[ChunkSlot::Hidden]);
 
@@ -410,7 +405,6 @@ pub(super) fn stage_phase(stage: Stage) -> Phase {
     }
 }
 
-/// The phase a MoE stage runs at.
 pub(super) fn moe_stage_phase(stage: MoeStage) -> Phase {
     match stage {
         MoeStage::SharedQuant
@@ -474,7 +468,6 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
     }
 }
 
-/// The arena slots a MoE stage reads and writes.
 pub(super) fn moe_stage_slots(stage: MoeStage) -> (&'static [ChunkSlot], &'static [ChunkSlot]) {
     match stage {
         MoeStage::SharedQuant => (&[ChunkSlot::X2], &[ChunkSlot::Q8X2]),
@@ -728,14 +721,10 @@ pub(super) fn routed_weight<'a>(
     })
 }
 
-/// The whole allocation behind a weight buffer, as its weight range.
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
 
-// ---- ChunkBufs and its check -----------------------------------------------------------------
-
-/// The plain facts `check_bufs` guards.
 pub(super) struct BufFacts {
     pub(super) m_sess: usize,
     pub(super) part_bytes: usize,
@@ -784,21 +773,17 @@ pub(super) fn check_bufs(f: &BufFacts) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The buffers the body runs on: the slot views, the attention `part` range, and the two facts the
-/// stages take from the device. The `part` range is the driver's allocation, never sized from
-/// `ChunkCost.part`.
+/// The `part` range is the driver's allocation, never sized from `ChunkCost.part`.
 pub(super) struct ChunkBufs<'a> {
     views: ChunkViews<'a>,
     part: DeviceRange<'a>,
     kv8_staging: Option<Kv8Staging<'a>>,
     /// `MmqFacts.nsm` of the constructor's facts; stage 5a's `sm_count`.
     nsm: usize,
-    /// The rows the arena was planned for.
     m_sess: usize,
 }
 
 impl<'a> ChunkBufs<'a> {
-    /// Runs [`check_bufs`] over the views, `part` and facts.
     pub(super) fn new(
         views: ChunkViews<'a>,
         part: DeviceRange<'a>,
@@ -833,7 +818,7 @@ impl<'a> ChunkBufs<'a> {
 
 // ---- the model, its facts and its check -------------------------------------------------------
 
-/// The plain facts of one routed expert stack: `None` is "not loaded Native".
+/// `None` is "not loaded Native".
 #[derive(Clone)]
 pub(super) struct StackFacts {
     pub(super) role: Role,
@@ -843,7 +828,6 @@ pub(super) struct StackFacts {
     pub(super) k: usize,
 }
 
-/// The plain facts of one layer.
 #[derive(Clone)]
 pub(super) struct LayerFacts {
     pub(super) kind: AttentionKind,
@@ -852,7 +836,7 @@ pub(super) struct LayerFacts {
     pub(super) shared: [(Role, Option<QuantType>); 3],
 }
 
-/// The plain facts `check_model` guards; the dims ride along for D8.
+/// The dims ride along for D8.
 #[derive(Clone)]
 pub(super) struct ModelFacts {
     pub(super) eps_bits: u32,
@@ -1040,8 +1024,6 @@ fn model_facts(
     })
 }
 
-/// The weights of the chunk body: the mixer weights, the MoE weights per layer and the token
-/// embedding, of a GGUF (Native) load or of an EXL3 pack.
 pub(super) enum ChunkWeights<'a, 'w> {
     /// The file's own blocks: the embedding is a Q4_K table.
     Native {
@@ -1057,8 +1039,6 @@ pub(super) enum ChunkWeights<'a, 'w> {
     },
 }
 
-/// Guards the first `layers` layers of `weights`: the GGUF facts of [`check_model`] for a Native
-/// load, [`check_exl3_model`] for an EXL3 pack.
 fn check_weights(
     table: &LayerTable,
     geometry: &MixerGeometry,
@@ -1137,19 +1117,16 @@ pub(super) fn check_exl3_columns(geometry: &MixerGeometry) -> Result<(), EngErro
     Ok(())
 }
 
-/// The checked model of the chunk body.
 pub(super) struct ChunkModel<'a, 'w> {
     table: &'a LayerTable,
     geometry: &'a MixerGeometry,
     moe_dims: MoeDims,
     weights: ChunkWeights<'a, 'w>,
     layers: usize,
-    /// Rows of the embedding table.
     vocab: usize,
 }
 
 impl<'a, 'w> ChunkModel<'a, 'w> {
-    /// `check_model` over every layer of the table.
     pub(super) fn new(
         table: &'a LayerTable,
         geometry: &'a MixerGeometry,
@@ -1187,7 +1164,6 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         })
     }
 
-    /// The MoE dims at `m` token rows.
     fn dims_at(&self, m: usize) -> MoeDims {
         MoeDims {
             rows: m,
@@ -1206,7 +1182,6 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
         Self::Native { mixer, moe, embed }
     }
 
-    /// The constructor of an EXL3 pack.
     pub(super) fn exl3(
         mixer: &'a MixerWeights<'w>,
         moe: &'a [Exl3MoeWeights<'w>],
@@ -1226,7 +1201,6 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
     }
 }
 
-/// The plain facts `check_run` guards.
 pub(super) struct RunFacts {
     pub(super) m: usize,
     pub(super) m_sess: usize,
@@ -1264,7 +1238,6 @@ pub(super) enum ChunkKernelClass {
     AllMmvq,
 }
 
-/// One run of the body: the state, the checked model, the buffers and the rows.
 pub(super) struct ChunkRun<'r, 'w> {
     state: &'r ResidentState,
     model: &'r ChunkModel<'r, 'w>,
@@ -1276,8 +1249,6 @@ pub(super) struct ChunkRun<'r, 'w> {
 }
 
 impl<'r, 'w> ChunkRun<'r, 'w> {
-    /// The production constructor: checks the rows against the buffers and the model against the
-    /// state.
     pub(super) fn new(
         state: &'r ResidentState,
         model: &'r ChunkModel<'r, 'w>,
@@ -1316,8 +1287,6 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
 // ---- the stage functions: P1 and the two mixer blocks ----------------------------------------
 
-/// What every stage of one layer needs: the launch, the weights, the ordinal, the index,
-/// the kind and the prefill word.
 struct LayerCtx<'a, 'w> {
     launch: &'a Launch<'a>,
     weights: &'a LayerWeights<'w>,
@@ -1328,7 +1297,6 @@ struct LayerCtx<'a, 'w> {
     status: DeviceRange<'a>,
 }
 
-/// The MoE weights of one layer, of either load.
 #[derive(Clone, Copy)]
 enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
@@ -1350,7 +1318,6 @@ impl ChunkRun<'_, '_> {
         self.bufs.views.get(slot)
     }
 
-    /// The scratch of the EXL3 projections of this chunk.
     fn exl3_scratch(&self) -> Result<exl3::Exl3Scratch<'_>, EngError> {
         Ok(exl3::Exl3Scratch {
             xh: self.v(ChunkSlot::Exl3Xh)?,
@@ -2143,8 +2110,6 @@ fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError
     )
 }
 
-// ---- the MoE block and the router -------------------------------------------------------------
-
 /// The native blocks of a MoE projection or stack; `check_model` refused every other load
 /// (D5, D6), so this only fails on a model that skipped its check.
 fn native_dense<'b>(weight: &'b DenseWeight<'_>) -> Result<&'b NativeWeight, EngError> {
@@ -2159,7 +2124,6 @@ fn native_dense<'b>(weight: &'b DenseWeight<'_>) -> Result<&'b NativeWeight, Eng
     }
 }
 
-/// The native blocks of an expert stack.
 fn native_stack<'b>(stack: &'b StackWeights<'_>) -> Result<&'b NativeWeight, EngError> {
     match stack {
         StackWeights::Native(weight) => Ok(weight),
@@ -2492,7 +2456,6 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
     run_chunk_moe(launch, ChunkMoe::Resident(moe), &io)
 }
 
-/// The MoE block of `layer` in a per-layer slice.
 fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
     blocks.get(layer).ok_or_else(|| {
         EngError::BadRequest(format!("prefill chunk: layer {layer} has no MoE block"))

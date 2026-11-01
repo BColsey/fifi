@@ -35,7 +35,6 @@ const _: () = assert!(
         && offset_of!(GemmaMatvecArgsRepr, ncols) == 40
 );
 
-/// What one gemma matvec launch reads and writes.
 pub(in crate::kernels::cuda) struct GemmaMatvecRaw<'a> {
     pub(in crate::kernels::cuda) w_qs: RawRange<'a>,
     pub(in crate::kernels::cuda) w_scales: RawRange<'a>,
@@ -46,7 +45,6 @@ pub(in crate::kernels::cuda) struct GemmaMatvecRaw<'a> {
     pub(in crate::kernels::cuda) ncols: usize,
 }
 
-/// Proves a gemma matvec launch before the native call.
 fn check_gemma_matvec(call: &GemmaMatvecRaw<'_>) -> Result<(), DeviceFailure> {
     if !(1..=(1usize << 20)).contains(&call.rows)
         || !(32..=65_536).contains(&call.k)
@@ -87,7 +85,6 @@ fn check_gemma_matvec(call: &GemmaMatvecRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gemma matvec of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn gemma_matvec_launch(
     stream: &RawStream,
     call: &GemmaMatvecRaw<'_>,

@@ -47,7 +47,6 @@ const ACT_FILL: u8 = 0xff;
 /// or moved range still lies inside its buffer, so a refusal row reaches its own guard.
 const PAD: usize = 256;
 const SLACK: usize = 4_096;
-/// The buffer and slot indices of the rig.
 const GU: usize = 0;
 const ACT: usize = 1;
 
@@ -171,18 +170,15 @@ impl Rig {
         })
     }
 
-    /// Queues the call the slots describe.
     fn attempt(&self) -> Result<(), EngError> {
         self.ctx.swiglu_rows(&self.stream, self.call()?)
     }
 
-    /// Queues the call and drains the stream.
     fn run(&self) -> Result<(), EngError> {
         self.attempt()?;
         self.stream.synchronize()
     }
 
-    /// The whole of buffer `index`.
     fn bytes(&self, index: usize) -> Result<Vec<u8>, EngError> {
         let mut out = vec![0u8; self.bufs[index].bytes()];
         self.ctx.download(&self.bufs[index], &mut out)?;
@@ -491,7 +487,6 @@ fn case(label: &str, text: &str, edit: impl Fn(&mut Rig) + 'static) -> Case {
     }
 }
 
-/// The outcome of every case of a table, in order.
 type Outcomes = Vec<Result<(), EngError>>;
 
 /// Hashes of both buffers after the first good call, after the refusals and after a last good

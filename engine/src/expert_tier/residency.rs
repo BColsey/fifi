@@ -8,9 +8,7 @@ use crate::EngError;
 /// The persistent home of an expert, not a temporary streaming bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
-    /// Device-resident weights.
     Gpu,
-    /// Host-resident weights computed by the CPU tier.
     Cpu,
     /// The read-only mapped tail, fetched on demand.
     Nvme,
@@ -85,7 +83,6 @@ impl Residency {
         }
     }
 
-    /// Splits a layer's picks (expert ids) into resident and cold ones.
     pub fn coverage(&self, layer: u32, picks: &[u32]) -> Coverage {
         let resident = |expert: u32| self.placement(ExpertId { layer, expert }) == Placement::Gpu;
         let hot = picks.iter().filter(|&&expert| resident(expert)).count();
@@ -103,7 +100,6 @@ impl Residency {
             .is_none_or(|flags| flags.iter().any(|&placement| placement != Placement::Gpu))
     }
 
-    /// The layers whose every expert is resident.
     pub fn full_layers(&self) -> Vec<u32> {
         self.layers
             .iter()

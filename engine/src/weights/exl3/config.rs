@@ -10,7 +10,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads the model config; conversion averages do not describe individual matrices.
+    /// Conversion averages do not describe individual matrices.
     pub fn from_json(bytes: &[u8]) -> Result<Self, EngError> {
         if bytes.len() > 1_048_576 {
             return Err(EngError::MemoryPlan("EXL3 config exceeds 1 MiB".into()));

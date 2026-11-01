@@ -42,16 +42,13 @@ pub(super) const OOM_RETRIES: u32 = 2;
 /// GiB/s on the Xavier), enough for reclaim to make progress.
 pub(super) const OOM_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// What a load does differently on an integrated GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LoadPolicy {
     /// Evict the whole model file before admission and after the scale scan.
     pub(super) evict_file: bool,
     /// Drop each tensor's pages after its upload even when the caller passed no file.
     pub(super) drop_each_tensor: bool,
-    /// Retries of one tensor's upload after a device out-of-memory.
     pub(super) oom_retries: u32,
-    /// Pause before each retry.
     pub(super) retry_pause: Duration,
 }
 
@@ -77,8 +74,6 @@ impl LoadPolicy {
         }
     }
 
-    /// The file to drop after each tensor: the caller's file when it passed one
-    /// (its choice wins), else the model file when the policy forces the drop.
     pub(super) fn drop_file<'a>(
         &self,
         own: &'a File,
@@ -102,17 +97,12 @@ pub(super) fn evict_model(file: &File) -> Result<(), EngError> {
     cuda::drop_page_cache(file, 0, 0)
 }
 
-/// The recovery between two attempts: evict, then give reclaim a moment.
 pub(super) fn recover(file: &File, pause: Duration) -> Result<(), EngError> {
     evict_model(file)?;
     std::thread::sleep(pause);
     Ok(())
 }
 
-/// Runs `attempt`. After a device out-of-memory it runs `between` and tries
-/// again, at most `policy.oom_retries` more times; every retry is counted in
-/// `retries`. Any other error, an exhausted budget and a failing `between`
-/// end the call with that error. `attempt` must own nothing when it fails.
 pub(super) fn retry_on_oom<T>(
     policy: &LoadPolicy,
     retries: &Cell<u32>,

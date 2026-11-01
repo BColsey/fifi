@@ -23,11 +23,9 @@ const TENSOR_MIN_ROWS: usize = 64;
 /// plan statistics both read it, so a threshold change shows up in both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RowClass {
-    /// 1..=8 rows: the split-K small-row kernels.
     Small,
     /// 9..=63 rows: the 16x16 SIMT tile.
     Tile,
-    /// 64..=144 rows: tensor cores.
     Tensor,
 }
 

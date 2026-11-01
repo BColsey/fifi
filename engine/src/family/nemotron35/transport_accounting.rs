@@ -60,7 +60,6 @@ pub(crate) fn record_upload(category: Category, bytes: usize) {
     DEVICE_CALLS[category.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Records one device call that reused resident bytes (no upload).
 pub(crate) fn record_resident_call(category: Category) {
     if !enabled() {
         return;
@@ -68,7 +67,6 @@ pub(crate) fn record_resident_call(category: Category) {
     DEVICE_CALLS[category.index()].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Snapshot of one category's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) h2d_bytes: u64,
@@ -96,12 +94,9 @@ mod tests {
 
     #[test]
     fn disabled_counters_stay_zero_and_enabled_counters_separate_categories() {
-        // Not enabled: nothing records.
         record_upload(Category::Dense, 100);
         assert_eq!(snapshot(Category::Dense).h2d_bytes, 0);
         assert_eq!(snapshot(Category::Dense).device_calls, 0);
-        // Enabled: bytes and calls accumulate per category, resident calls
-        // count calls without bytes.
         enable();
         record_upload(Category::Routed, 10);
         record_upload(Category::Routed, 5);

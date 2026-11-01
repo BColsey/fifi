@@ -17,7 +17,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Device inputs of one token and the PLE history after it.
 pub(super) struct TokenStart {
     /// Hyper state `[C, H]`: the embedding row repeated over the branches (step.rs:180-185).
     pub(super) hyper: ExecutionTensor,
@@ -121,7 +120,6 @@ pub(super) fn gate(ctx: &mut Ctx<'_>, d: &ExecutionTensor) -> Result<ExecutionTe
     ctx.kernels.unary(UnaryOp::Sigmoid, &shaped)
 }
 
-/// Runs the PLE block on `hyper` `[C, H]` with `emb` and `ring`, and returns the new hyper state and ring.
 pub(super) fn block(
     ctx: &mut Ctx<'_>,
     w: &RPle,
@@ -187,7 +185,6 @@ mod tests {
     use crate::family::project::Projector;
     use crate::kernels::MlxKernels;
 
-    /// Asserts cosine >= 0.99999 and max relative error <= 1e-4.
     fn assert_parity(got: &[f32], want: &[f32], what: &str) {
         let (mut err, mut scale, mut dot, mut gg, mut ww) =
             (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);

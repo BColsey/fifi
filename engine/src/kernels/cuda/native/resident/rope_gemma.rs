@@ -53,7 +53,6 @@ const _: () = assert!(
         && offset_of!(RopeGemmaArgsRepr, global_mode) == 52
 );
 
-/// One rope_gemma launch: q and k rows in place, the position word, and the factor table.
 pub(in crate::kernels::cuda) struct RopeGemmaRaw<'a> {
     pub(in crate::kernels::cuda) q: RawRange<'a>,
     pub(in crate::kernels::cuda) k: RawRange<'a>,
@@ -116,7 +115,6 @@ fn check_rope_gemma(call: &RopeGemmaRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the rope_gemma of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn rope_gemma_launch(
     stream: &RawStream,
     call: &RopeGemmaRaw<'_>,

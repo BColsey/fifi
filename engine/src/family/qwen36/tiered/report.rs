@@ -6,29 +6,24 @@
 //! report is plain data for the caller's accounting; the tiered host fills it and the
 //! gate prints it.
 
-/// Counters of one decode token in the tier split.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TokenReport {
-    /// Routed experts served from the VRAM bank of their layer.
     pub bank_hits: u32,
-    /// Routed experts served on the CPU because their layer bank missed.
     pub cpu_served: u32,
     /// CPU serves whose expert bytes were not in the OS page cache (SSD loads).
     pub ssd_misses: u32,
     /// Bank changes executed at the token boundary: warm-up fills plus swaps.
     pub swaps: u32,
-    /// Expert bytes read from the SSD for the misses above.
     pub ssd_bytes: u64,
     /// Router weight of every routed pick, in millionths (a weight of 0.25 adds 250,000): the weight mass the layer
     /// outputs are built from. WHY: the CPU share of PICKS says little when the popular experts are the missed ones.
     pub routed_weight_ppm: u64,
-    /// The part of `routed_weight_ppm` carried by the picks served on the CPU.
     pub cpu_weight_ppm: u64,
 }
 
 impl TokenReport {
-    /// Adds every counter of `other` into `self`, so a window sums its tokens. WHY:
-    /// the engine merges one report per layer and per step into the window total.
+    /// WHY: the engine merges one report per layer and per step into the window
+    /// total.
     pub fn merge(&mut self, other: &TokenReport) {
         let TokenReport {
             bank_hits,

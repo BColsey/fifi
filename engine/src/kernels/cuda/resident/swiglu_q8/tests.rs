@@ -10,8 +10,6 @@
 //! within one half code of the reference built from the f64 silu row — plus byte equality of
 //! the zero padding tail.
 
-/// The byte counts `plan_swiglu_q8` checks a call against: the tight footprint of `gu` and the
-/// padded `block_q8_1` rows of `q8`.
 #[test]
 fn swiglu_q8_needs_are_pure_and_exact() {
     // Qwen: n_ff 512, stride 1024 (exactly 2 * n_ff), 8 slots.
@@ -103,7 +101,6 @@ fn launch_swiglu(
     all[..need.q8].to_vec()
 }
 
-/// The stored row of one slot, as bytes, of the canaried buffer.
 fn slot_bytes(row: &[u8], slot: usize, blocks_per_slot: usize) -> &[u8] {
     &row[slot * blocks_per_slot * 36..(slot + 1) * blocks_per_slot * 36]
 }
@@ -206,7 +203,6 @@ fn swiglu_q8_matches_the_host_reference() {
     println!("swiglu_q8: worst code error {} of its slack", worst_q);
 }
 
-/// The number of padded blocks of one row of `n_ff` values (the q8_1 padding rule).
 fn q8_1_blocks(n_ff: usize) -> usize {
     n_ff.next_multiple_of(512) / 32
 }
@@ -303,7 +299,6 @@ use crate::EngError;
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::resident::matvec_q::tests::{Owner, assert_bad_request};
 
-/// One refusal case of the wrapper: the numbers of the call and where its ranges live.
 #[derive(Clone, Copy)]
 struct Spec {
     n_ff: usize,
@@ -350,7 +345,6 @@ struct RefusalRig {
     ctx: CudaContext,
 }
 
-/// The second adapter: a stream and a buffer that belong to another context.
 struct OtherContext {
     stream: DeviceStream,
     gu: DeviceBuffer,
@@ -384,9 +378,6 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// For `plan_swiglu_q8` and its shape rules, every refusal is a `BadRequest` with the text of its
-/// own check, nothing is queued, the backend stays usable, and the valid call of the same rig
-/// runs.
 #[test]
 fn swiglu_q8_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("swiglu_q8_rejects_unsound_calls_before_launching") {
@@ -526,7 +517,6 @@ fn swiglu_q8_rejects_unsound_calls_before_launching() {
     for (case, needle, spec) in cases {
         assert_bad_request(attempt(&rig, &other, spec), case, needle);
     }
-    // No refusal queued anything: q8 is untouched, the backend works, and the valid call runs.
     rig.stream.synchronize().expect("drain");
     let q8 = testkit::read_bytes(&rig.ctx, &rig.q8, 16_384);
     assert!(
@@ -545,8 +535,6 @@ fn swiglu_q8_rejects_unsound_calls_before_launching() {
     );
 }
 
-/// Both producers queued inside one graph capture produce byte-identical outputs to the eager
-/// launches, and the graph holds exactly their two kernel nodes.
 #[test]
 fn q8_producers_inside_a_capture_equal_eager() {
     if !testkit::device_present("q8_producers_inside_a_capture_equal_eager") {
@@ -801,7 +789,6 @@ fn q8_producers_write_only_their_range() {
     assert_eq!(gu_before, gu_after, "gu unchanged");
 }
 
-/// Uploads little-endian i32 ids.
 fn ids_buffer(ctx: &CudaContext, ids: &[i32]) -> DeviceBuffer {
     let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
     testkit::upload_bytes(ctx, &bytes)
@@ -978,7 +965,6 @@ fn swiglu_q8_feeds_the_dense_matvec_at_896() {
         ));
     }
     let q8_mine = launch_swiglu(&ctx, &stream, n_ff, stride, slots, &gu);
-    // The standalone quantize of the reference rows, one column per slot.
     let flat_ref: Vec<f32> = ref_rows
         .iter()
         .flat_map(|row| row.iter().copied())

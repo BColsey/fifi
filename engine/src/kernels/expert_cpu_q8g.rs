@@ -35,7 +35,6 @@ use super::expert_cpu_q8k::DotBackend;
 
 /// Activations per quantization group: one Q4_K sub-block.
 pub(crate) const GROUP: usize = 32;
-/// Groups per Q4_K block.
 pub(crate) const GROUPS_PER_BLOCK: usize = Q4K_BLOCK_VALUES / GROUP;
 
 /// One quantized activation row on the 32-value grid: a scale `d` and an exact sum `s` of the
@@ -44,15 +43,12 @@ pub(crate) const GROUPS_PER_BLOCK: usize = Q4K_BLOCK_VALUES / GROUP;
 pub struct Q8gRow {
     /// Per-group scale `d = amax / 127`.
     pub(crate) d: Vec<f32>,
-    /// One quantized activation per input value.
     pub(crate) q: Vec<i8>,
     /// Exact sum of the 32 `q` of each group (`|s| <= 4064`).
     pub(crate) s: Vec<i32>,
 }
 
 impl Q8gRow {
-    /// Allocates a zeroed row for `k` activations; `k` must be a positive multiple of
-    /// [`Q4K_BLOCK_VALUES`] (whole weight blocks), else `BadShape`.
     pub fn zeros(k: usize) -> Result<Self, ExpertCpuError> {
         if k == 0 || !k.is_multiple_of(Q4K_BLOCK_VALUES) {
             return Err(ExpertCpuError::BadShape(format!(
@@ -73,9 +69,6 @@ fn row_zeros(k: usize) -> Q8gRow {
     }
 }
 
-/// Quantizes `x` into `out` as described in the module doc. `x` must be finite, a positive
-/// multiple of [`Q4K_BLOCK_VALUES`] long and match `out`'s lengths; every violation is
-/// reported before a byte of `out` is written. Deterministic.
 pub fn quantize_q8g(x: &[f32], out: &mut Q8gRow) -> Result<(), ExpertCpuError> {
     if x.is_empty() || !x.len().is_multiple_of(Q4K_BLOCK_VALUES) {
         return Err(ExpertCpuError::BadShape(format!(
@@ -119,14 +112,12 @@ pub fn quantize_q8g(x: &[f32], out: &mut Q8gRow) -> Result<(), ExpertCpuError> {
     Ok(())
 }
 
-/// The fixed pairwise sum of eight products: `((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7))`.
-/// The AVX2 path produces the same order with two `hadd` steps and one lane add.
+/// The AVX2 path produces this order with two `hadd` steps and one lane add.
 pub(crate) fn tree8(p: [f32; GROUPS_PER_BLOCK]) -> f32 {
     ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]))
 }
 
-/// The float tail of one block, shared verbatim by the scalar and AVX2 paths: `d_w * t1 -
-/// dmin_w * t2`, each product rounded once.
+/// Shared verbatim by the scalar and AVX2 paths; each product is rounded once.
 pub(crate) fn q8g_block_value(d_w: f32, dmin_w: f32, t1: f32, t2: f32) -> f32 {
     d_w * t1 - dmin_w * t2
 }
@@ -159,7 +150,7 @@ pub fn q4k_q8g_row_dot_scalar(row: &[u8], xq: &Q8gRow) -> f32 {
     acc
 }
 
-/// One row through `backend`; the AVX2 arm re-checks the feature bit inside its module.
+/// The AVX2 arm re-checks the feature bit inside its module.
 fn row_dot(backend: DotBackend, row: &[u8], xq: &Q8gRow) -> f32 {
     if backend == DotBackend::scalar() {
         q4k_q8g_row_dot_scalar(row, xq)
@@ -181,7 +172,6 @@ fn row_dot_simd(row: &[u8], xq: &Q8gRow) -> f32 {
     q4k_q8g_row_dot_scalar(row, xq)
 }
 
-/// `BadLength` for the first `xq` buffer that does not describe exactly `k` values.
 fn xq_bad_length(xq: &Q8gRow, k: usize) -> Option<ExpertCpuError> {
     [
         ("xq.d", xq.d.len(), k / GROUP),
@@ -202,8 +192,7 @@ fn matvec_rows(backend: DotBackend, w: &[u8], k: usize, xq: &Q8gRow, out: &mut [
     }
 }
 
-/// Dots `rows` rows of `k` Q4_K weights with the quantized activation row `xq` through
-/// `backend`, writing `rows` f32 results to `out`. Contract of `q4k_q8k_matvec`: `k` a
+/// Contract of `q4k_q8k_matvec`: `k` a
 /// positive multiple of [`Q4K_BLOCK_VALUES`], `rows` nonzero, `w` exactly `rows * k / 256 * 144`
 /// bytes, `xq` describing exactly `k` values, `out` exactly `rows` long; every violation is
 /// reported before any output byte is touched.
@@ -270,10 +259,6 @@ impl ExpertScratchQ8g {
     }
 }
 
-/// Runs one expert through the per-32 integer path: quantize `x` (`hidden` values), gate and
-/// up rows against it, `h = silu(gate) * up` in f32 with the silu of the f32 reference
-/// (`x / (1 + exp(-x))`), quantize `h` (`inter` values), down rows into `out`.
-///
 /// Validation is the `expert_forward` contract (shape first, then every implied length, `out`
 /// untouched on error) plus the quantizer's refusal of non-finite `x`; with matching scratch a
 /// call allocates nothing.

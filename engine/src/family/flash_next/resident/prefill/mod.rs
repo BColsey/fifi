@@ -44,7 +44,6 @@ pub(super) fn assert_parity(actual: &[f32], expected: &[f32], what: &str) {
     assert!(rel <= 1e-4, "{what}: rel {rel}");
 }
 
-/// Imports `values` as a resident F32 tensor of `shape` (test helper).
 #[cfg(test)]
 pub(super) fn import_f32(
     kernels: &mut MlxKernels,

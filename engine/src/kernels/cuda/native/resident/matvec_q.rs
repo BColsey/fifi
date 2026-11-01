@@ -23,7 +23,7 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 use crate::kernels::cuda::resident::matvec_q::{QuantType, ROWS_MULTIPLE};
 
 /// Mirror of `inference_cuda_matvec_q_args` (`matvec_q.h`), field for field.
-/// The layout is pinned below and by the `static_assert` of the header.
+/// The layout is pinned as well by the `static_assert` of the header.
 #[repr(C)]
 struct MatvecArgsRepr {
     ty: c_int,
@@ -55,7 +55,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one dense matvec reads and writes.
 pub(in crate::kernels::cuda) struct MatvecRaw<'a> {
     pub(in crate::kernels::cuda) ty: QuantType,
     pub(in crate::kernels::cuda) w: RawRange<'a>,
@@ -66,7 +65,6 @@ pub(in crate::kernels::cuda) struct MatvecRaw<'a> {
     pub(in crate::kernels::cuda) ncols: usize,
 }
 
-/// Bytes each range of a call must hold.
 struct Sizes {
     w: usize,
     x_q8: usize,
@@ -82,9 +80,6 @@ fn call_sizes(ty: QuantType, k: usize, rows: usize, ncols: usize) -> Option<Size
     })
 }
 
-/// Proves a dense matvec before the native call: type, `k` a multiple of the block size, `rows` a
-/// positive multiple of 4, `ncols` in `1..=8`, every range sized and 4-byte aligned, and `y`
-/// disjoint from `w` and `x_q8`.
 pub(in crate::kernels::cuda) fn check_matvec(call: &MatvecRaw<'_>) -> Result<(), DeviceFailure> {
     let (k, rows, ncols) = (call.k, call.rows, call.ncols);
     let need = call_sizes(call.ty, k, rows, ncols).ok_or_else(invalid_argument)?;
@@ -114,7 +109,6 @@ pub(in crate::kernels::cuda) fn check_matvec(call: &MatvecRaw<'_>) -> Result<(),
     Ok(())
 }
 
-/// Queues the dense matvec of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn matvec_q_launch(
     stream: &RawStream,
     call: &MatvecRaw<'_>,
@@ -169,7 +163,6 @@ pub(in crate::kernels::cuda) fn event_elapsed_ms_raw(
     Ok(ms)
 }
 
-/// Test support: destroys one event of [`event_record_raw`].
 #[cfg(test)]
 pub(in crate::kernels::cuda) fn event_destroy_raw(event: *mut c_void) -> Result<(), DeviceFailure> {
     let mut stage = STAGE_NONE;
@@ -199,7 +192,6 @@ unsafe extern "C" {
     fn mem_info_raw(out_free: *mut usize, out_total: *mut usize, out_stage: *mut c_int) -> c_int;
 }
 
-/// Test support: free device memory in bytes, or `None` when the query fails.
 #[cfg(test)]
 pub(in crate::kernels::cuda) fn free_bytes_raw() -> Option<usize> {
     let (mut free, mut total) = (0usize, 0usize);
@@ -217,8 +209,6 @@ mod tests {
     use super::*;
     use crate::kernels::cuda::resident::matvec_q::QuantType;
 
-    /// The arguments of one launch as plain numbers; the addresses are made up and apart. Each
-    /// case changes one thing so the entry refuses before it reaches the device.
     #[derive(Clone, Copy)]
     struct Args {
         ty: c_int,
@@ -353,8 +343,6 @@ mod tests {
         })
     }
 
-    /// Host only: the native check against the ranges of an unbacked allocation. The valid
-    /// layout passes; each case changes one thing and is refused.
     #[test]
     fn check_matvec_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 20);
@@ -394,9 +382,7 @@ mod tests {
         }
     }
 
-    /// Host only: every case is refused by the entry's own checks before any CUDA call. The
-    /// table covers unknown type, k off the block grid, rows 0, ncols 0 and 9, misaligned
-    /// pointers, overlaps, short stream.
+    /// Host only: every case is refused by the entry's own checks before any CUDA call.
     #[test]
     fn matvec_arguments_are_checked_before_any_launch() {
         let cases: [Case; 17] = [

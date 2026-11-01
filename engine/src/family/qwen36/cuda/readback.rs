@@ -14,18 +14,14 @@
 //! `INFERENCE_CUDA_SYNC_EACH=1` makes the eager step synchronize after every launch, for
 //! compute-sanitizer. A synchronize inside a capture window is refused, so the mode and a capture
 //! exclude each other.
-//!
-//! The host waits once per token.
 
 use super::run_report::{CaptureOutcome, HostSyncs, RunReport};
 use crate::EngError;
 use crate::family::sampler::SamplingParams;
 
-/// The environment variable that makes the eager step synchronize after every launch.
 pub(super) const SYNC_EACH_VAR: &str = "INFERENCE_CUDA_SYNC_EACH";
 pub(super) const SHORTLIST_VAR: &str = "Q36_CUDA_DEVICE_SHORTLIST";
 
-/// Enabled by default; 0 is the kill switch, and other unknown explicit values stay off.
 pub(super) fn device_shortlist_enabled(value: Option<&str>) -> bool {
     value.is_none() || value == Some("1")
 }
@@ -38,11 +34,8 @@ pub(super) fn device_sampling_supported(
 ) -> bool {
     vocab_matches && (params.is_greedy() || (!sync_each && (1..=20).contains(&params.top_k())))
 }
-/// Blocking host-to-device copies before the launches of a token: the start block.
 const HOST_WRITES_PER_TOKEN: u32 = 1;
 
-/// Reads the value of `INFERENCE_CUDA_SYNC_EACH`: unset, empty or `0` is off, `1` is on, any
-/// other text is a `BadRequest`.
 pub(super) fn parse_sync_each(value: Option<&str>) -> Result<bool, EngError> {
     match value {
         None | Some("" | "0") => Ok(false),
@@ -53,8 +46,6 @@ pub(super) fn parse_sync_each(value: Option<&str>) -> Result<bool, EngError> {
     }
 }
 
-/// A synchronize inside a capture window is refused by the context, so the debug mode and the
-/// captured path exclude each other.
 pub(super) fn check_mode(sync_each: bool, capture_requested: bool) -> Result<(), EngError> {
     if sync_each && capture_requested {
         return Err(EngError::BadRequest(format!(
@@ -65,7 +56,6 @@ pub(super) fn check_mode(sync_each: bool, capture_requested: bool) -> Result<(),
     Ok(())
 }
 
-/// One host-side action of the read-back, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadStep {
     QueueShortlist,
@@ -76,16 +66,13 @@ pub(super) enum ReadStep {
     ReadPair,
 }
 
-/// What the host reads after the launches of a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReadbackPlan {
-    /// Bytes of the logits row, or `None` when the caller does not want it.
     pub(super) logits_bytes: Option<usize>,
     pub(super) shortlist: bool,
 }
 
 impl ReadbackPlan {
-    /// A plan for a head of `vocab` values (f32) and the caller's choice about the row.
     pub(super) fn new(vocab: usize, want_logits: bool) -> Result<Self, EngError> {
         if vocab == 0 {
             return Err(EngError::BadRequest(
@@ -106,14 +93,13 @@ impl ReadbackPlan {
         })
     }
 
-    /// A compact candidate read instead of the full vocabulary.
     pub(super) fn shortlist(vocab: usize) -> Result<Self, EngError> {
         let mut plan = Self::new(vocab, false)?;
         plan.shortlist = true;
         Ok(plan)
     }
 
-    /// The order of the actions. The pair copy is queued and its event recorded before any
+    /// The pair copy is queued and its event recorded before any
     /// blocking read, so the first blocking read waits for everything the token queued.
     pub(super) fn steps(&self) -> Vec<ReadStep> {
         let mut steps = Vec::new();
@@ -154,7 +140,6 @@ pub(super) fn with_host_syncs(mut report: RunReport, extra: HostSyncs) -> RunRep
     report
 }
 
-/// The report of a token that ran eagerly.
 pub(super) fn eager_report(plan: &ReadbackPlan) -> RunReport {
     RunReport {
         capture: CaptureOutcome::default(),
@@ -163,9 +148,8 @@ pub(super) fn eager_report(plan: &ReadbackPlan) -> RunReport {
     }
 }
 
-/// The report of a token whose body was captured into a graph and replayed: the outcome is
-/// `Captured`, and the waits and the start-block write stay one each (the read-back and the
-/// start block of a token are outside the graph).
+/// The read-back and the start block of a token are outside the graph, so capture changes
+/// neither the waits nor the host writes.
 pub(super) fn captured_report(plan: &ReadbackPlan) -> RunReport {
     RunReport {
         capture: CaptureOutcome::Captured,
@@ -174,8 +158,6 @@ pub(super) fn captured_report(plan: &ReadbackPlan) -> RunReport {
     }
 }
 
-/// The report of a token whose capture was refused and whose body then ran eagerly: the outcome
-/// is the sticky `RefusedFellBackToEager`.
 pub(super) fn refused_report(plan: &ReadbackPlan) -> RunReport {
     RunReport {
         capture: CaptureOutcome::RefusedFellBackToEager,

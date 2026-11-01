@@ -268,20 +268,19 @@ fn top_two(logits: &[f32]) -> Option<TopTwo> {
     })
 }
 
-/// Token-by-token Nemotron execution. Each successful step publishes one complete session state.
-/// Block math and state remain on the host; the selected projector runs matrix projections.
-/// Dense weights are retained once fetched for the stack lifetime; experts are fetched through
-/// the source on every use, so the source's cache alone bounds expert residency.
-/// Each expert projection is validated against the execution geometry once per run, not per use:
-/// the checkpoint is read-only and identity-bound at admission, so a key that validated once
-/// keeps immutable bytes for the whole run.
 /// One attention block's incremental key/value caches (mutable rows).
 struct AttentionCache {
     keys: Vec<f32>,
     values: Vec<f32>,
 }
 
-/// No backend activation quantization is performed.
+/// Token-by-token Nemotron execution. Each successful step publishes one complete session state.
+/// Block math and state remain on the host; the selected projector runs matrix projections.
+/// Dense weights are retained once fetched for the stack lifetime; experts are fetched through
+/// the source on every use, so the source's cache alone bounds expert residency.
+/// Each expert projection is validated against the execution geometry once per run, not per use:
+/// the checkpoint is read-only and identity-bound at admission, so a key that validated once
+/// keeps immutable bytes for the whole run. No backend activation quantization is performed.
 pub struct NemotronStack<S> {
     spec: NemotronExecSpec,
     source: S,
@@ -1439,7 +1438,6 @@ fn block_error(error: EngError) -> EngError {
 }
 
 impl StackProjector {
-    /// Reports whether this backend answers a packed NVFP4 projection.
     fn supports_packed(&self) -> bool {
         match self {
             StackProjector::Host(_) => true,

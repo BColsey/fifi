@@ -15,8 +15,6 @@
 
 use std::sync::Arc;
 
-/// One layer's guess inputs: the router matrix and the post-attention-norm
-/// weight, both shared and immutable.
 pub struct LayerRouter {
     /// The router matrix of the layer, `[experts][hidden]` f32, row-major (ggml
     /// ne0 = hidden fastest), shared because the guess only reads it.
@@ -28,7 +26,6 @@ pub struct LayerRouter {
 /// A validation failure of a guess input, reported before any output is written.
 #[derive(Debug, PartialEq)]
 pub enum GuessError {
-    /// A shape, range or finiteness invariant is broken; the string names it.
     BadInput(String),
 }
 
@@ -47,13 +44,8 @@ pub struct RouterGuess {
 }
 
 impl RouterGuess {
-    /// Validates and stores the guess inputs. Every `layers[l].router` must hold
-    /// exactly `experts * hidden` finite f32 values and every
-    /// `layers[l].norm_weight` exactly `hidden` finite values; `hidden` and
-    /// `experts` must be nonzero, `experts` at most 65,536 (the ids the callers
-    /// rank are u16); `eps` must be finite and positive. WHY: with every shape
-    /// and value checked once, the per-token `logits` call only re-checks the
-    /// lengths of the slices it is handed.
+    /// WHY: with every shape and value checked once, the per-token `logits`
+    /// call only re-checks the lengths of the slices it is handed.
     pub fn new(
         layers: Vec<LayerRouter>,
         hidden: usize,
@@ -117,7 +109,6 @@ impl RouterGuess {
         })
     }
 
-    /// The layer count, the upper bound `target_layer` is checked against.
     pub fn layers(&self) -> usize {
         self.layers.len()
     }
@@ -220,11 +211,8 @@ pub fn hits(guess: &[u16], actual: &[u16]) -> usize {
 /// running number reports prefetch quality without keeping the pairs around.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct RecallMeter {
-    /// The running sum of [`hits`] over every `add`.
     hits: u64,
-    /// The running sum of `actual.len()` over every `add`.
     total: u64,
-    /// How many (guess, actual) pairs were added.
     samples: u64,
 }
 
@@ -247,7 +235,6 @@ impl RecallMeter {
         }
     }
 
-    /// How many (guess, actual) pairs were added so far.
     pub fn samples(&self) -> u64 {
         self.samples
     }
@@ -297,7 +284,6 @@ mod tests {
             self.0 >> 11
         }
 
-        /// A uniform f32 in `[lo, hi)`.
         fn f32_between(&mut self, lo: f32, hi: f32) -> f32 {
             lo + (hi - lo) * (self.next() as f32 / (1u64 << 53) as f32)
         }
@@ -319,7 +305,6 @@ mod tests {
         }
     }
 
-    /// A guess of `layers` layers of random weights with the model's 1e-6 eps.
     fn random_guess(seed: u64, layers: usize, hidden: usize, experts: usize) -> RouterGuess {
         let mut rng = Lcg(seed);
         let made = (0..layers)
@@ -458,7 +443,6 @@ mod tests {
                 1e-6,
             )
         };
-        // Shapes: nonzero dims, experts within the u16 ids, exact slice lengths.
         for (hidden, experts, what) in [
             (0, 3, "hidden 0"),
             (4, 0, "experts 0"),
@@ -592,7 +576,6 @@ mod tests {
         let guess = RouterGuess::new(vec![layer], hidden, experts, 1e-6).unwrap();
         let top = guess.top_k(0, &h, 3).unwrap();
         assert_eq!(top, vec![17, 99, 3], "the planted rows win in logit order");
-        // End to end: a meter fed the advice against the planted truth reads 1.0.
         let mut meter = RecallMeter::default();
         meter.add(&top, &[17, 99, 3]);
         meter.add(&guess.top_k(0, &h, 1).unwrap(), &[17]);

@@ -375,10 +375,8 @@ fn prefill_flag(
 /// fixed admission uses its measured margin; `work: 0` is explained by `load_options`.
 const HEADROOM: u64 = 1 << 30;
 
-/// The process-wide one-engine flag: `true` from the first leak of a build onwards.
 pub(super) static CUDA_ENGINE_BUILT: AtomicBool = AtomicBool::new(false);
 
-/// The refusal of a second build in one process (the documented text).
 pub(super) fn already_built() -> EngError {
     EngError::BadRequest("engine config: the CUDA Q36 backend builds one engine per process: its weights are leaked for the process lifetime and an in-process restart would leak 20 GB again; configure a single qwen3_6_35b_a3b entry and restart the process to reload".to_string())
 }
@@ -464,8 +462,6 @@ pub(super) fn pinned_gguf(artifact: &Path) -> PathBuf {
     artifact.join(GGUF_NAME)
 }
 
-/// `true` when the environment asks for the full-file hash (`=1`); any other value is a typed
-/// refusal, so a misspelled `yes` cannot promise an unchecked check.
 pub(super) fn sha256_wanted(raw: Option<&str>) -> Result<bool, EngError> {
     match raw {
         None | Some("0") => Ok(false),
@@ -476,7 +472,6 @@ pub(super) fn sha256_wanted(raw: Option<&str>) -> Result<bool, EngError> {
     }
 }
 
-/// The SHA-256 of a file, one 4 MiB pass.
 pub(super) fn file_sha256(path: &Path) -> Result<String, EngError> {
     let read = |error: std::io::Error| {
         EngError::Checkpoint(format!("cuda checkpoint: {}: {error}", path.display()))
@@ -540,8 +535,6 @@ pub(super) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngEr
     Ok(())
 }
 
-/// The tiered plan the settings ask for, or `None` for the plain engine: tiered is never on without
-/// the member of the config.
 pub(super) fn tiered_plan_of(settings: &Q36Settings) -> Option<TieredPlan> {
     settings.tiered.map(|tiered| TieredPlan {
         timeout_ms: tiered.timeout_ms,
@@ -612,8 +605,7 @@ pub(super) fn step_options(
     })
 }
 
-/// The KV capacity in positions of `context_limit`, with its KV bytes checked: below 2 is
-/// refused. `start` validates the limit with this before any device work.
+/// `start` validates the limit with this before any device work.
 pub(super) fn context_tokens(context_limit: u32, kv_mode: KvMode) -> Result<usize, EngError> {
     if context_limit < 2 {
         return Err(EngError::BadRequest(format!(
@@ -668,7 +660,6 @@ pub(super) fn load_options(kv_cache: u64, fixed_admission: bool) -> LoadOptions<
     }
 }
 
-/// The pinned GGUF of the artifact directory, checked and opened, with its path.
 fn open_gguf(artifact: &Path, verify: bool) -> Result<(GgufModel, PathBuf), EngError> {
     let gguf = pinned_gguf(artifact);
     check_gguf_identity(&gguf, verify)?;

@@ -42,9 +42,6 @@ fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36R
         kv_dtype: settings.kv,
         compile: settings.compile,
         max_seqs: settings.max_seqs,
-        // The default stays six entries for every spec (an entry's real cost grows with its depth,
-        // so no budget-derived default ships before the replay measurement); the exact
-        // `prefix_store_entries` override reaches every spec through here.
         prefix_store: super::settings::prefix_store_limits_of(
             settings.prefix_reuse,
             settings.prefix_store_entries,
@@ -52,9 +49,9 @@ fn rules_of(settings: &Q36Settings, eos: Vec<u32>, sampler_vocab: usize) -> Q36R
     }
 }
 
-/// Loads and pins the tokenizer, then starts the engine thread. The thread loads the weights, so
-/// the engine state stays `Loading` until the weights are resident. Returns the engine and the
-/// pinned tokenizer bundle that renders and encodes its prompts.
+/// The thread loads the weights, so the engine state stays `Loading` until the weights are
+/// resident. Returns the engine and the pinned tokenizer bundle that renders and encodes its
+/// prompts.
 pub(crate) fn start(
     settings: &Q36Settings,
     ready_note: ReadyNote,

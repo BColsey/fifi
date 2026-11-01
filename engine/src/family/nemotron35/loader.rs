@@ -557,7 +557,6 @@ fn to_usize(value: u32) -> Result<usize, EngError> {
     usize::try_from(value).map_err(|_| bad("dimension exceeds host limits"))
 }
 
-/// Checks one NVFP4 projection against its expected `[rows, columns]` and returns its ranges.
 fn projection_ranges(
     reader: &NemotronShardReader,
     base: &str,

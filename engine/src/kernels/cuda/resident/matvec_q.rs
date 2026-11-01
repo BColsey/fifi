@@ -46,7 +46,6 @@ impl QuantType {
         }
     }
 
-    /// Values per block: 256 for the K-quants, 32 for the flat formats.
     pub(crate) fn block_size(self) -> usize {
         match self {
             Self::Q4K | Self::Q6K => 256,
@@ -64,8 +63,6 @@ impl QuantType {
         }
     }
 
-    /// Bytes of the native blocks of `rows` rows of `k` values. `None` on overflow or when `k`
-    /// is not a multiple of the block size.
     pub(crate) fn weight_bytes(self, rows: usize, k: usize) -> Option<usize> {
         if !k.is_multiple_of(self.block_size()) {
             return None;
@@ -91,16 +88,12 @@ pub(crate) struct MatvecCall<'b> {
     pub(crate) ncols: usize,
 }
 
-/// Bytes of the three ranges a dense matvec uses.
 struct MatvecNeeds {
     w: usize,
     x_q8: usize,
     y: usize,
 }
 
-/// What a dense matvec of `rows` x `k` against `ncols` activation rows reads and writes: the native
-/// blocks of `w`, the padded q8_1 rows of `x_q8` and the `rows * ncols` floats of `y`. `None` on
-/// overflow or when `k` is off the type's block grid.
 fn matvec_needs(ty: QuantType, k: usize, rows: usize, ncols: usize) -> Option<MatvecNeeds> {
     Some(MatvecNeeds {
         w: ty.weight_bytes(rows, k)?,
@@ -110,12 +103,6 @@ fn matvec_needs(ty: QuantType, k: usize, rows: usize, ncols: usize) -> Option<Ma
 }
 
 impl CudaContext {
-    /// Queues the dense matvec of `call` on `stream`, writing `call.y`.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, for `k` that is not a
-    /// multiple of the type's block size, for `rows` 0 or not a multiple of 4, for `ncols` outside
-    /// `1..=8`, for a `w`, `x_q8` or `y` range that is short or misaligned, and for a `y` that
-    /// overlaps `w` or `x_q8`.
     pub(crate) fn matvec_q(
         &self,
         stream: &DeviceStream,
@@ -126,7 +113,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| matvec_q_launch(stream_raw, &raw))
     }
 
-    /// Every check of a matvec, then the native view of its ranges.
     fn plan_matvec<'b>(&self, call: &MatvecCall<'b>) -> Result<MatvecRaw<'b>, EngError> {
         let (w_raw, x_raw, y_raw) = (
             self.raw_range(&call.w)?,
@@ -183,14 +169,12 @@ impl CudaContext {
         })
     }
 
-    /// Test support: the milliseconds between two `bench_mark` handles.
     #[cfg(test)]
     pub(crate) fn bench_elapsed_ms(&self, start: usize, end: usize) -> Result<f32, EngError> {
         native::resident::matvec_q::event_elapsed_ms_raw(start as *mut _, end as *mut _)
             .map_err(|failure| native_error(&TERMINAL, ADAPTER_OPERATION, failure.status))
     }
 
-    /// Test support: destroys one `bench_mark` handle.
     #[cfg(test)]
     pub(crate) fn bench_destroy(&self, event: usize) -> Result<(), EngError> {
         native::resident::matvec_q::event_destroy_raw(event as *mut _)

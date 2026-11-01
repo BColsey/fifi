@@ -119,7 +119,6 @@ fn group_of(geometry: CpfAttnGeometry) -> Result<usize, EngError> {
     Ok(geometry.n_head / geometry.n_kv_head)
 }
 
-/// Tiles of `q_tile` rows that cover `m` rows, rounded up.
 fn tiles(m: usize, q_tile: usize) -> Result<usize, EngError> {
     if q_tile == 0 {
         return Err(rule("q_tile", "q_tile is 0"));
@@ -378,7 +377,6 @@ impl AttnStrides {
     }
 }
 
-/// Byte layout of one read-only affine scale or bias plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttnScalarLayout {
     pub(crate) dtype: Dtype,
@@ -440,7 +438,6 @@ impl AttnKvStorage {
     }
 }
 
-/// Read-only KV payload and independently laid out affine parameter planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttnKvLayout {
     pub(crate) storage: AttnKvStorage,
@@ -675,7 +672,6 @@ pub(crate) struct AttnPrefillCall<'b> {
     pub(crate) sinks: Option<DeviceRange<'b>>,
 }
 
-/// The geometry view of a call for the sizing functions.
 fn geometry(shape: &AttnPrefillShape) -> CpfAttnGeometry {
     CpfAttnGeometry {
         m: shape.m,
@@ -685,7 +681,6 @@ fn geometry(shape: &AttnPrefillShape) -> CpfAttnGeometry {
     }
 }
 
-/// The plan view of a call's split values.
 fn plan_of(split: &CpfAttnSplit) -> CpfAttnPlan {
     CpfAttnPlan {
         q_tile: CPF_ATTN_Q_TILE,
@@ -694,7 +689,6 @@ fn plan_of(split: &CpfAttnSplit) -> CpfAttnPlan {
     }
 }
 
-/// `value` as `c_int` for the rule `tag`, or the "exceeds i32" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
@@ -1287,7 +1281,6 @@ impl CudaContext {
     }
 }
 
-/// `value` as `c_int` for the signed window and ring.
 fn i64_int(name: &str, value: i64) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule("exceeds i32", &format!("{name} is {value}")))
 }

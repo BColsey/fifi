@@ -143,7 +143,6 @@ fn a_release_store_publishes_the_words_written_before_it() {
     assert_eq!(bad, 0, "words of an older round were read");
 }
 
-/// What the device phase of the mapping test saw, as plain data.
 #[derive(Debug)]
 struct Aliased {
     caps: MailboxCaps,
@@ -154,8 +153,8 @@ struct Aliased {
     freed: bool,
 }
 
-/// The device phase: allocate, check the zeroing, write words, copy the device view back, free everything. Only `?`
-/// inside up to the copy; the frees run whatever the copy returned, and nothing asserts while a handle is alive.
+/// Only `?` inside up to the copy; the frees run whatever the copy returned, and nothing asserts
+/// while a handle is alive.
 fn alias_phase(pattern: &[u32]) -> Result<Aliased, DeviceFailure> {
     let empty_refused = mapped_alloc(0).is_err();
     let caps = mailbox_caps()?;
@@ -196,8 +195,6 @@ fn alias_phase(pattern: &[u32]) -> Result<Aliased, DeviceFailure> {
     })
 }
 
-/// Device test: the allocation is zeroed, the pointer the device uses aliases the host memory (a device-to-host
-/// copy of the device view returns what the host wrote through the atomic accessors), and the free works.
 #[test]
 fn the_mapping_is_zeroed_aliased_by_the_device_view_and_freed() {
     if !device_present("the_mapping_is_zeroed_aliased_by_the_device_view_and_freed") {

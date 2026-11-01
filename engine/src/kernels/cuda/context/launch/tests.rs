@@ -26,7 +26,6 @@ use crate::weights::{GgufType, dequantize};
 
 /// Bytes of the fixed fragment-order `xf` buffer.
 const XF_FRAGMENT: usize = 1_048_592;
-/// The 8 bytes a test copies into the pinned word.
 const WORD_BYTES: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x0D, 0x0C, 0x0B, 0x0A];
 const EXPECTED: WordValue = WordValue {
     token: 0x0403_0201,
@@ -37,7 +36,6 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");

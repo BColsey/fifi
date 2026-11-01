@@ -29,7 +29,6 @@ pub(super) struct Scan {
     pub(super) dead_vectors: Vec<String>,
 }
 
-/// Reads every non-trellis, non-bulk tensor of `specs` in batches of at most `batch_bytes`.
 pub(super) fn scan_small(
     source: &StreamedCheckpoint,
     specs: &[Spec],
@@ -74,7 +73,6 @@ impl Scan {
         Ok(())
     }
 
-    /// Counts zero and subnormal entries and refuses non-finite ones.
     fn count_halves(&mut self, spec: &Spec, tensor: &Tensor) -> Result<(), EngError> {
         let bytes = tensor
             .host_bytes()

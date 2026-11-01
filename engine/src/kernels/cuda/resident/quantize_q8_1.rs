@@ -27,7 +27,6 @@ use crate::kernels::cuda::native::resident::quantize_q8_1::{QuantizeRaw, quantiz
 /// Values per row are padded up to this (the vendored `MATRIX_ROW_PADDING`).
 pub(crate) const MATRIX_ROW_PADDING: usize = 512;
 
-/// One quantize call: `ncols` rows of `k` f32 values in `x`, the padded `block_q8_1` rows in `y`.
 pub(crate) struct QuantizeCall<'b> {
     pub(crate) x: DeviceRange<'b>,
     pub(crate) y: DeviceRange<'b>,
@@ -42,19 +41,12 @@ pub(crate) fn q8_1_bytes(k: usize, ncols: usize) -> Option<usize> {
     blocks.checked_div(32)?.checked_mul(36)?.checked_mul(ncols)
 }
 
-/// Bytes of the two ranges a quantize call uses: `x` holds `ncols` rows of `k` f32 values and `y`
-/// the padded `block_q8_1` rows ([`q8_1_bytes`]). `None` on overflow.
 fn quantize_needs(k: usize, ncols: usize) -> Option<(usize, usize)> {
     let x = k.checked_mul(ncols)?.checked_mul(4)?;
     Some((x, q8_1_bytes(k, ncols)?))
 }
 
 impl CudaContext {
-    /// Queues the q8_1 quantize of `call` on `stream`, writing `call.y`.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, for `k` that is not a
-    /// positive multiple of 32, for `ncols` outside `1..=8`, for an `x` or `y` range that is
-    /// short or misaligned, and for a `y` that overlaps `x`.
     pub(crate) fn quantize_q8_1(
         &self,
         stream: &DeviceStream,
@@ -65,7 +57,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| quantize_q8_1_launch(stream_raw, &raw))
     }
 
-    /// Every check of a quantize, then the native view of its ranges.
     fn plan_quantize<'b>(&self, call: &QuantizeCall<'b>) -> Result<QuantizeRaw<'b>, EngError> {
         let (x_raw, y_raw) = (self.raw_range(&call.x)?, self.raw_range(&call.y)?);
         if call.k == 0 || !call.k.is_multiple_of(32) {

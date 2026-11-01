@@ -21,7 +21,6 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::row_scale::{RowScaleRaw, row_scale_launch};
 
-/// One row-scale call: m rows of n f32 values in x, the scaled copy in out.
 pub(crate) struct RowScaleCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -31,11 +30,6 @@ pub(crate) struct RowScaleCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the row scale of call on stream, writing call.out.
-    ///
-    /// Returns BadRequest for a stream or buffer of another adapter, a non-finite
-    /// scale, m or n outside their ranges, a short or misaligned range, and an out
-    /// that overlaps x.
     pub(crate) fn row_scale(
         &self,
         stream: &DeviceStream,
@@ -46,7 +40,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| row_scale_launch(stream_raw, &raw))
     }
 
-    /// Every check of a row scale, then the native view of its ranges.
     fn plan_row_scale<'b>(&self, call: &RowScaleCall<'b>) -> Result<RowScaleRaw<'b>, EngError> {
         let (out_raw, x_raw) = (self.raw_range(&call.out)?, self.raw_range(&call.x)?);
         let bytes = call

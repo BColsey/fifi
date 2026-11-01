@@ -95,7 +95,6 @@ fn a_failure_after_the_leak_keeps_the_guard_committed() {
 
 #[test]
 fn ignored_mlx_keys_produce_a_start_line() {
-    // The settings record the ignored keys; the start logs exactly one line per name.
     let options = Q36Options {
         cache_limit_bytes: Some(64),
         session_cap_bytes: Some(1),
@@ -277,7 +276,6 @@ fn the_kv_bytes_per_position_is_the_pool_figure_of_the_pinned_shape_in_both_mode
             want,
             "{mode:?}"
         );
-        // And the admission term is that figure per position.
         assert_eq!(
             kv_cache_bytes(1, mode).expect("one position"),
             want,

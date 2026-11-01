@@ -322,7 +322,6 @@ fn flint_prefix_retention_cap_math_admits_and_fails_closed() {
     // whose COW doubles past it.
     assert!(!retention_admitted((1 << 30) + 1, 0, 2 << 30));
 
-    // Strict env parse: absent derives, unparsable or non-UTF-8 errs.
     use std::ffi::OsStr;
     assert_eq!(retention_cap_from_env(None), Ok(None));
     assert_eq!(
@@ -368,7 +367,6 @@ fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
         !probed.get(),
         "the probes must not run when the opt-in is off"
     );
-    // Opt-in ON: strict env wins, non-UTF-8 and unparsable both error.
     assert_eq!(
         retention_cap_for(
             true,
@@ -394,7 +392,6 @@ fn flint_prefix_cap_is_inert_when_the_opt_in_is_off() {
         panic!("an explicit zero budget must be a startup error");
     };
     assert!(text.contains("FIFI_FLINT_PREFIX_BUDGET_BYTES"), "{text}");
-    // Opt-in ON, env absent: derive; unknown physical fails closed.
     assert_eq!(
         retention_cap_for(true, None, || Some(64 << 30), || Ok(4 << 30)),
         Ok((64 << 30) - (4 << 30) - super::PREFIX_OS_FLOOR_BYTES)

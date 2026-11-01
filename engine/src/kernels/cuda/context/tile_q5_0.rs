@@ -25,9 +25,7 @@
 
 use crate::EngError;
 
-/// Rows of a tile; a group is one tile row.
 const ROWS: usize = 8;
-/// Blocks (32 values) per row of one tile.
 const BLOCKS_PER_TILE_ROW: usize = 4;
 const BLOCK_BYTES: usize = 22;
 const D_BYTES: usize = 2;
@@ -38,7 +36,6 @@ const D_AT: usize = 0;
 const QH_AT: usize = 64;
 const QS_AT: usize = 192;
 const TILE_BYTES: usize = 704;
-/// Values per row of one tile.
 const TILE_COLS: usize = 128;
 
 fn bad(message: String) -> EngError {

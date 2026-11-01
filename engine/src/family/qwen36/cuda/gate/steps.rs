@@ -31,7 +31,6 @@ pub(super) fn input_for(
     }
 }
 
-/// The engine's own logit for the reference token of row `j` (None when the token is outside the row).
 pub(super) fn logit_of(row: &[f32], token: u32) -> Option<f32> {
     row.get(token as usize).copied()
 }

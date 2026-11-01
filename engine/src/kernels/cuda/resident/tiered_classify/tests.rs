@@ -53,12 +53,10 @@ fn read(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-/// `bytes` bytes of `buffer` from `offset`.
 fn at(buffer: &DeviceBuffer, offset: usize, bytes: usize) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(offset, bytes)
 }
 
-/// One layer's inputs.
 #[derive(Clone)]
 struct Layer {
     layer: usize,
@@ -77,7 +75,6 @@ struct Planned {
     want_word: i32,
 }
 
-/// What the device wrote for one layer, decoded.
 struct Observed {
     classified: Classified,
     count: u64,
@@ -210,8 +207,6 @@ impl<'c> Rig<'c> {
     }
 }
 
-/// THE device phase of a script: a fresh context, stream and rig, the initial state, then every planned launch in
-/// order; everything is dropped before the records come back.
 fn drive(shape: ClassifyShape, script: &[Planned]) -> Result<(Observed, Vec<Observed>), EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -227,7 +222,6 @@ fn drive(shape: ClassifyShape, script: &[Planned]) -> Result<(Observed, Vec<Obse
     Ok((initial, seen))
 }
 
-/// Plans one launch: the oracle's answer for the layer, and the token's word after it.
 fn plan(shape: &ClassifyShape, input: Layer, set_word: Option<i32>, word: &mut i32) -> Planned {
     let want = classify_reference(&input.slot_row, shape.slots, &input.ids, &input.weights)
         .expect("equal lengths");
@@ -273,7 +267,6 @@ fn distinct(rng: &mut Rng, n_expert: usize, count: usize, pool: &[usize]) -> Vec
     ids
 }
 
-/// The categories of [`random_layer`], one in twelve each.
 const CATEGORIES: usize = 12;
 
 /// Random picks of one layer, by `route % 12`: 0 valid, 1 whole fault, 2 a fault among valid picks, 3 a pick
@@ -341,8 +334,7 @@ fn seeded_script(shape: &ClassifyShape, seed: u64, routes: usize) -> Vec<Planned
         .collect()
 }
 
-/// Seam 1: the kernel equals the host oracle bit for bit over seeded routes of two shapes, refused routes
-/// included, and publishes exactly when the layer has a miss.
+/// Refused routes included, and the kernel publishes exactly when the layer has a miss.
 #[test]
 fn tiered_classify_matches_the_reference_bit_for_bit() {
     if !testkit::device_present("tiered_classify_matches_the_reference_bit_for_bit") {
@@ -478,8 +470,6 @@ fn tiered_classify_matches_the_reference_bit_for_bit() {
     }
 }
 
-/// A scripted token: a layer with a miss, a layer with none, a layer with a miss again. The sequence counts
-/// the publications only, and the request line carries the layer.
 #[test]
 fn tiered_classify_publishes_only_with_misses_and_numbers_its_requests() {
     if !testkit::device_present(
@@ -549,8 +539,6 @@ fn tiered_classify_publishes_only_with_misses_and_numbers_its_requests() {
     );
 }
 
-/// The tiered word clears at layer 0 and ORs after: a refused route in layer 1 is still there after a clean
-/// layer 2, a bit another kernel set is kept by a later refused layer, and layer 0 of the next token starts over.
 #[test]
 fn the_tiered_word_clears_at_layer_zero_and_ors_after() {
     if !testkit::device_present("the_tiered_word_clears_at_layer_zero_and_ors_after") {
@@ -687,8 +675,7 @@ fn refusal_cases() -> Vec<(&'static str, Vec<Edit>, Option<&'static str>)> {
     ]
 }
 
-/// The device phase of the refusal test: each case is one call; the result is the error text, or `None` when the
-/// call went through. Then the two overlap cases, which need ranges in the same allocation.
+/// The two overlap cases need ranges in the same allocation.
 fn refusal_phase(shape: ClassifyShape) -> Result<Vec<Option<String>>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;

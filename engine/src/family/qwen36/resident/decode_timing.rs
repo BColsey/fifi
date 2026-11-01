@@ -136,7 +136,6 @@ use super::super::settings::{Activation, parse_activation};
 /// plus the warm-up.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 const MAX_TIMED_TOKENS: usize = 4096;
-/// The untimed warm-up tokens before the timed window of every case.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 const WARMUP_TOKENS: usize = 2;
 /// The seed of the case-C sampler. The executor's seeded tests use 7 too; the two warm-up draws
@@ -200,7 +199,6 @@ fn host_argmax(row: &[f32]) -> u32 {
     u32::try_from(best_index).unwrap_or(u32::MAX)
 }
 
-/// How one case picks the next token after a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 enum NextToken {
@@ -212,17 +210,12 @@ enum NextToken {
     HostSampler,
 }
 
-/// One row of the case table.
 #[derive(Clone, Copy)]
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 struct Case {
-    /// The report key of the case.
     key: &'static str,
-    /// The `StepMode` name the case drives, for the report.
     mode_name: &'static str,
-    /// How the next token is picked.
     next: NextToken,
-    /// True when the case reads the whole logits row back (B and C).
     reads_row: bool,
 }
 
@@ -382,7 +375,6 @@ pub(super) fn required_activation_from_env() -> Activation {
     required_activation(raw.as_deref()).unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// Reads `DT_IDS_SOURCE` through `parse_ids_source`: unset is the tool prompt.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn ids_source_from_env() -> IdsSource {
     match std::env::var("DT_IDS_SOURCE") {
@@ -392,7 +384,6 @@ fn ids_source_from_env() -> IdsSource {
     }
 }
 
-/// A duration in milliseconds.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 fn ms(elapsed: std::time::Duration) -> f64 {
     elapsed.as_secs_f64() * 1000.0
@@ -456,7 +447,6 @@ struct TokenTimes {
 /// MLX memory after the case, and the row runs the prefill fed.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 struct CaseRun {
-    /// One entry per timed token, in order.
     times: Vec<TokenTimes>,
     /// The evaluate calls per timed token. Qualification builds only.
     evaluate_calls: Option<f64>,
@@ -728,7 +718,6 @@ fn percentile_of(
     Some(percentile(&values, p))
 }
 
-/// One report phase: its name and its per-token value picker.
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 type PhasePicker<'a> = (&'a str, &'a dyn Fn(&TokenTimes) -> Option<f64>);
 
@@ -1061,7 +1050,6 @@ fn decode_phase_timing_by_mode() {
             );
         }
     }
-    // `QWEN36_G2A_COMPILE` switch and the compile counters after every case and depth.
     let (compile_switch, compile_counters) = super::compiled::switch_and_counters(&decoder.kernels);
     let report = serde_json::json!({
         "engine": "fifi",
@@ -1375,7 +1363,6 @@ mod tests {
         chunk: Option<u32>,
         /// The row runs fed so far, one entry per step or chunk.
         fed: Vec<usize>,
-        /// The positions fed so far.
         positions: usize,
     }
 

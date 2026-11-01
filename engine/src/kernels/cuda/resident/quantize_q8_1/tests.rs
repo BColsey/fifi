@@ -77,7 +77,6 @@ fn parse_block(bytes: &[u8]) -> (f32, f32, [i8; 32]) {
     (d, s, qs)
 }
 
-/// Half-code distance of a stored half from its reference value.
 fn half_codes_away(stored: f32, reference: f32) -> u16 {
     testkit::f64_to_f16_bits(stored as f64).abs_diff(testkit::f64_to_f16_bits(reference as f64))
 }
@@ -94,10 +93,8 @@ fn q8_1_bytes_is_pure_and_exact() {
     assert_eq!(q8_1_bytes(usize::MAX, 8), None);
 }
 
-/// The byte counts `plan_quantize` checks a call against.
 #[test]
 fn quantize_needs_are_pure_and_exact() {
-    // x: ncols rows of k f32 values; y: the padded block_q8_1 rows.
     assert_eq!(quantize_needs(2048, 2), Some((2048 * 2 * 4, 64 * 36 * 2)));
     // k 2304 pads to 2560: 80 blocks per row, not 72, on the y side only.
     assert_eq!(quantize_needs(2304, 3), Some((2304 * 3 * 4, 80 * 36 * 3)));
@@ -214,15 +211,12 @@ fn quantize_q8_1_matches_the_host_reference() {
     );
 }
 
-/// Where `y` of a quantize refusal case lies.
 #[derive(Clone, Copy)]
 enum YIn {
     Own,
     X,
 }
 
-/// One refusal case of the quantize wrapper: the numbers of the call and the (offset, bytes) of its
-/// ranges inside the rig's buffers.
 #[derive(Clone, Copy)]
 struct Spec {
     k: usize,
@@ -259,7 +253,6 @@ struct RefusalRig {
     ctx: CudaContext,
 }
 
-/// The second adapter: a stream and two buffers that belong to another context.
 struct OtherContext {
     stream: DeviceStream,
     x: DeviceBuffer,
@@ -292,8 +285,6 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// For `plan_quantize`, every refusal is a `BadRequest` with the text of its own check, nothing is
-/// queued, the backend stays usable, and the valid call of the same rig runs.
 #[test]
 fn quantize_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("quantize_rejects_unsound_calls_before_launching") {
@@ -424,7 +415,6 @@ fn quantize_rejects_unsound_calls_before_launching() {
     for (case, needle, spec) in cases {
         assert_bad_request(attempt(&rig, &other, spec), case, needle);
     }
-    // No refusal queued anything: y is untouched and the backend works; then the valid call runs.
     rig.stream.synchronize().expect("drain");
     let untouched = testkit::read_bytes(&rig.ctx, &rig.y, 16_384);
     assert!(untouched.iter().all(|&byte| byte == 0xAB), "y untouched");

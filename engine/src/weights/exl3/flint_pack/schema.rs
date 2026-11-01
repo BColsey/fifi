@@ -71,7 +71,6 @@ pub(crate) enum Kind {
     Bulk,
 }
 
-/// One expected stored tensor.
 #[derive(Debug, Clone)]
 pub(crate) struct Spec {
     pub(crate) name: String,

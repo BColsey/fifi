@@ -15,7 +15,6 @@ use crate::{
     family::nemotron35::cpu_experts::{CpuExperts, DEFAULT_THREADS},
 };
 
-/// Environment-selected hybrid configuration (`NEM35_CPU_EXPERTS=1` turns it on).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridConfig {
     pub cpu_threads: usize,
@@ -26,8 +25,6 @@ pub struct HybridConfig {
 }
 
 impl HybridConfig {
-    /// Reads `NEM35_CPU_EXPERTS`, `NEM35_GPU_MOE_LAYERS` and `NEM35_CPU_THREADS`.
-    /// `None` means the flag is off and the sequential path runs unchanged.
     pub fn from_env() -> Result<Option<Self>, EngError> {
         let read = |name: &str| std::env::var(name).ok();
         Self::parse(

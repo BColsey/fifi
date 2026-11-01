@@ -84,7 +84,6 @@ pub(crate) fn m_pos(p0: usize) -> usize {
     }
 }
 
-/// One step of a prefill run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefillStep {
     /// `rows >= 2` rows from position `p0` through the chunk layer loop.
@@ -347,7 +346,6 @@ pub(crate) enum Phase {
     Combine,
 }
 
-/// The arena tensors of one chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkSlot {
     Hidden,
@@ -411,10 +409,6 @@ type Row = (ChunkSlot, usize, Phase, Phase);
 fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngError> {
     use {ChunkSlot as S, Phase::*};
     let hidden = row_bytes(m, g.hidden).ok_or_else(overflow)?;
-    // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
-    // (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries the 1-row figure,
-    // or a smaller chunk of the session would not fit its slot (the prefix promise of
-    // `chunk_tensors`).
     // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
     // (65,537 * 16 B, `native.rs`), so each sink planned at `m` rows also carries the 1-row figure,
     // or a smaller chunk of the session would not fit its slot (the prefix promise of
@@ -530,7 +524,6 @@ pub(crate) const EXL3_TILE_ROWS: usize = 256;
 /// dozen rows of a chunk, and a wider CTA would decode no fewer weights and run mostly idle warps.
 pub(crate) const EXL3_EXPERT_TILE_ROWS: usize = 64;
 
-/// Words of one entry of the job table of the routed projections.
 pub(crate) const EXL3_JOB_WORDS: usize = 4;
 
 /// The most jobs of one routed pass over `routed` pairs and `experts` experts: one per expert
@@ -575,7 +568,6 @@ pub(crate) const EXL3_SLOTS: [ChunkSlot; 31] = [
     ChunkSlot::DenseJobs,
 ];
 
-/// The bytes of the arithmetic flag word.
 const EXL3_FLAG_BYTES: usize = 4;
 
 fn exl3_common_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
@@ -760,7 +752,6 @@ pub(crate) fn exl3_chunk_cost(
     })
 }
 
-/// The costs of every size of [`M_LADDER`] for an EXL3 chunk.
 pub(crate) fn exl3_chunk_costs(dims: &StepDims, nsm: usize) -> Result<Vec<ChunkCost>, EngError> {
     M_LADDER
         .iter()

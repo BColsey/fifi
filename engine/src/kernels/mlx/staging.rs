@@ -26,7 +26,6 @@ impl StagedBytes {
         Ok(Self::finish(words))
     }
 
-    /// Copies the values in memory order, as `copy_of` would copy their native-endian bytes.
     pub(super) fn from_f32(values: &[f32]) -> Result<Self, EngError> {
         let length = values
             .len()
@@ -57,7 +56,6 @@ impl StagedBytes {
         Self { words }
     }
 
-    /// The first `len` staged bytes, for tests that compare contents.
     #[cfg(test)]
     fn prefix(&self, len: usize) -> Vec<u8> {
         self.words
@@ -68,7 +66,6 @@ impl StagedBytes {
     }
 }
 
-/// Reserves the exact word count for `length` bytes, or reports a memory-plan failure.
 fn reserve(length: usize) -> Result<Vec<u64>, EngError> {
     let count = length
         .checked_add(size_of::<u64>() - 1)

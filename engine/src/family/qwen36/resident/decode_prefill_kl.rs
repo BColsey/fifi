@@ -582,7 +582,6 @@ mod mac {
         assert!(passed, "{pooled:?}");
     }
 
-    /// `name` as a usize, or `default`; a value that is not a number fails the run.
     fn env_usize(name: &str, default: usize) -> usize {
         std::env::var(name).map_or(default, |value| {
             value
@@ -591,7 +590,6 @@ mod mac {
         })
     }
 
-    /// `name` as an f64, or `default`; a value that is not a number fails the run.
     fn env_f64(name: &str, default: f64) -> f64 {
         std::env::var(name).map_or(default, |value| {
             value

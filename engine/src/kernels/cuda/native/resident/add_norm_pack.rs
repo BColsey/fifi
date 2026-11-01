@@ -65,8 +65,6 @@ pub(in crate::kernels::cuda) struct AddNormInts {
     pub(in crate::kernels::cuda) n: c_int,
 }
 
-/// What one fused add, norm and pack reads and writes: the converted ranges, the integers and
-/// `eps`. `delta` and `norm_out` are optional.
 pub(in crate::kernels::cuda) struct AddNormRaw<'a> {
     pub(in crate::kernels::cuda) h: RawRange<'a>,
     pub(in crate::kernels::cuda) weight: RawRange<'a>,
@@ -77,14 +75,12 @@ pub(in crate::kernels::cuda) struct AddNormRaw<'a> {
     pub(in crate::kernels::cuda) eps: f32,
 }
 
-/// The bytes each range must hold.
 struct Needs {
     row: usize,
     weight: usize,
     xf: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
@@ -99,12 +95,10 @@ fn needs(ints: &AddNormInts) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// Sizes and alignment of the ranges: `xf` and `norm_out` 16, the rest 4.
 fn check_fit(io: &AddNormRaw<'_>, need: &Needs) -> bool {
     fits(&io.h, need.row, 4)
         && fits(&io.weight, need.weight, 4)
@@ -113,9 +107,7 @@ fn check_fit(io: &AddNormRaw<'_>, need: &Needs) -> bool {
         && io.norm_out.is_none_or(|out| fits(&out, need.row, 16))
 }
 
-/// Proves a launch before the native call: the shape integers, sizes and alignment of every range
-/// and that the extents the kernel writes (`h`, `xf`, `norm_out`) share no byte with each other
-/// or with the ones it only reads (`delta`, `weight`). `delta` and `weight` may overlap.
+/// `delta` and `weight` may overlap; every extent the kernel writes must be apart.
 fn check_add_norm(io: &AddNormRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints)?;
     if !check_fit(io, &need) {
@@ -135,8 +127,7 @@ fn check_add_norm(io: &AddNormRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the fused add, RMSNorm and fp16 pack on `stream`: `h += delta` in place when `delta` is
-/// given, the f32 norm row into `norm_out` when given, and the packed fp16 row into `xf`. Returns
-/// when it is queued.
+/// given, the f32 norm row into `norm_out` when given, and the packed fp16 row into `xf`.
 pub(in crate::kernels::cuda) fn add_norm_pack_launch(
     stream: &RawStream,
     call: AddNormRaw<'_>,

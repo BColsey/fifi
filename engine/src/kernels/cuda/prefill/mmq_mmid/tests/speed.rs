@@ -33,7 +33,6 @@ const GATE_UP_NMSE: f64 = 1e-3;
 const DOWN_NMSE: f64 = 2e-3;
 /// Layers of the model: the per-layer time is multiplied by this for the comparison.
 const LAYERS: f64 = 40.0;
-/// Timed launches after the warm-up.
 const ITERS: usize = 20;
 
 /// What one M of the speed rows measured and left on the device.

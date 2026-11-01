@@ -14,7 +14,6 @@ fn error_text<T>(result: Result<T, EngError>) -> String {
     }
 }
 
-/// Asserts the error variant and that its message contains `needle`.
 fn assert_error<T>(result: Result<T, EngError>, kind: &str, needle: &str) {
     let text = error_text(result);
     assert!(

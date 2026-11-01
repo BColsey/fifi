@@ -89,8 +89,6 @@ impl OutputAssembler {
         Ok(OutputDelta { text, finish: None })
     }
 
-    /// The stop string that ended the output, when one did. EOS also finishes with
-    /// `Stop`, so only a recorded match reports one.
     pub fn matched_stop(&self) -> Option<&str> {
         self.matched.map(|index| self.stops[index].as_str())
     }

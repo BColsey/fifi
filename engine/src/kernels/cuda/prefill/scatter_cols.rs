@@ -21,9 +21,7 @@ use crate::kernels::cuda::native::prefill::scatter_cols::{
     ScatterColsInts, ScatterColsRaw, scatter_cols_launch,
 };
 
-/// The most rows of one call.
 pub(crate) const MAX_ROWS: usize = 16_384;
-/// The most values of one row block.
 pub(crate) const MAX_WIDTH: usize = 65_536;
 /// `n`, `col_off` and `ld` are multiples of this: the kernel moves `float4`.
 pub(crate) const QUAD: usize = 4;

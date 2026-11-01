@@ -23,7 +23,6 @@ pub(crate) const DEFAULT_THREADS: usize = 12;
 /// Workers spin this long after a call so consecutive CPU layers find them hot, then park.
 const SPIN_WINDOW: Duration = Duration::from_micros(500);
 
-/// The NVFP4 routed-expert kernel and its worker pool.
 pub(crate) struct Nvfp4Kernel {
     pool: ExpertPool,
 }
@@ -101,7 +100,6 @@ impl CpuExpertKernel for Nvfp4Kernel {
     }
 }
 
-/// The pool plus the mapped expert views of every CPU-served layer.
 pub(crate) type CpuExperts = CpuTier<Nvfp4Kernel>;
 
 pub(crate) fn new_cpu_experts(threads: usize) -> Result<CpuExperts, EngError> {
@@ -152,7 +150,6 @@ pub(crate) fn layer_experts_from_mapping(
     LayerExperts::new(views).map_err(cpu_error)
 }
 
-/// Timing of the CPU routed experts of one layer over repeated random calls.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuLayerTiming {
     pub layer: u32,
@@ -163,7 +160,6 @@ pub struct CpuLayerTiming {
 }
 
 impl CpuLayerTiming {
-    /// Median of the warm calls in milliseconds.
     pub fn p50_ms(&self) -> f64 {
         self.warm_ms
             .get(self.warm_ms.len() / 2)
@@ -171,7 +167,6 @@ impl CpuLayerTiming {
             .unwrap_or(f64::NAN)
     }
 
-    /// 90th percentile of the warm calls in milliseconds.
     pub fn p90_ms(&self) -> f64 {
         let last = self.warm_ms.len().saturating_sub(1);
         self.warm_ms
@@ -451,7 +446,6 @@ mod tests {
             Err(EngError::BadRequest(_))
         ));
         cpu.add_layer(3, layer_experts_from_mapping(&mapping).expect("views"));
-        // An expert id past the layer, and a non-finite activation, are input errors.
         let missing = [ExpertPick {
             expert: EXPERTS as u32,
             weight: 1.0,

@@ -1,25 +1,21 @@
 //! JSON shapes of the replies. The types are hand-written.
 //!
 //! Each type matches a schema of `api/openapi.yaml`, and the tests check the match.
-//! The types are private to the server module.
 
 use crate::sched::worker::EngineState;
 use serde::Serialize;
 use serde_json::json;
 
-/// The reason that a completion ended. It is the `finish_reason` of a choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FinishReason {
     /// End of sequence or a stop-sequence match.
     Stop,
     /// The `max_tokens` limit or the context limit.
     Length,
-    /// The model completed at least one tool call.
     ToolCalls,
 }
 
 impl FinishReason {
-    /// The wire name of the reason.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FinishReason::Stop => "stop",
@@ -39,7 +35,6 @@ pub(crate) struct Usage {
 }
 
 impl Usage {
-    /// Builds the usage of one request. `total_tokens` is the saturating sum.
     pub(crate) fn new(prompt_tokens: u32, completion_tokens: u32, reused_tokens: u32) -> Self {
         Self {
             prompt_tokens,
@@ -49,29 +44,23 @@ impl Usage {
         }
     }
 
-    /// The prompt tokens that stored state served.
     pub(crate) fn reused_tokens(&self) -> u32 {
         self.reused_tokens
     }
 
-    /// The prompt tokens the engine committed.
     pub(crate) fn prompt_tokens(&self) -> u32 {
         self.prompt_tokens
     }
 
-    /// The completion tokens the engine committed.
     pub(crate) fn completion_tokens(&self) -> u32 {
         self.completion_tokens
     }
 }
 
-/// The cache-usage switch's environment variable name.
 pub(crate) const CACHE_USAGE_VAR: &str = "ENGINESRV_CACHE_USAGE";
 
 /// The shipped default: the split is ON. A summary of the redone Claude
-/// Code receipts is in this slice's flip commit message (the first check
-/// was withdrawn: it counted count_tokens rows as shrinks and both
-/// sessions exited in autocompact thrashing). Every value other than the
+/// Code receipts is in this slice's flip commit message. Every value other than the
 /// exact 1/true/on
 /// — empty and non-Unicode included — still forces the legacy shapes.
 pub(crate) const CACHE_USAGE_DEFAULT: bool = true;
@@ -86,12 +75,10 @@ pub(crate) fn cache_fields_enabled(value: &str) -> bool {
 }
 
 /// Whether the cache usage fields are on: the on default, or the switch
-/// when it is set — any value other than the exact `1`/`true`/`on`
-/// (empty, `0`, `false`, `TRUE`, a non-Unicode value) forces legacy, so
-/// a compose file whose `${VAR}` interpolates to empty silently yields
-/// legacy, not the default. The environment is read once per process
-/// (`OnceLock`, the same convention as `shadow_block_lcp_enabled` in
-/// family/session.rs) so a request cannot observe the switch flipping
+/// when it is set — a compose file whose `${VAR}` interpolates to empty
+/// silently yields legacy, not the default. The environment is read once
+/// per process (`OnceLock`, the same convention as `shadow_block_lcp_enabled`
+/// in family/session.rs) so a request cannot observe the switch flipping
 /// mid-run.
 pub(crate) fn cache_fields_on() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -133,7 +120,6 @@ impl Serialize for Usage {
     }
 }
 
-/// The `ToolCall` schema: one completed call of a non-streaming reply.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ToolCall {
     id: String,
@@ -149,7 +135,7 @@ struct ToolCallFunction {
 }
 
 impl ToolCall {
-    /// Builds a call. `arguments` is a JSON object as text.
+    /// `arguments` is a JSON object as text.
     pub(crate) fn new(id: String, name: String, arguments: String) -> Self {
         Self {
             id,
@@ -159,14 +145,12 @@ impl ToolCall {
     }
 }
 
-/// The parts of a finished reply.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReplyParts {
     /// The answer text, without think blocks and tool call markup.
     pub(crate) content: String,
     /// The text of the think blocks, without the tags.
     pub(crate) reasoning: String,
-    /// The completed tool calls in order.
     pub(crate) tool_calls: Vec<ToolCall>,
 }
 
@@ -187,7 +171,6 @@ struct Choice {
     finish_reason: &'static str,
 }
 
-/// The `ChatCompletion` schema.
 #[derive(Serialize)]
 pub(crate) struct ChatCompletion {
     id: String,
@@ -200,8 +183,6 @@ pub(crate) struct ChatCompletion {
 }
 
 impl ChatCompletion {
-    /// Builds the reply of a non-streaming request. `content` is null when the reply holds tool
-    /// calls and no text. `reasoning_content` is absent when the reply has no think block.
     pub(crate) fn new(
         head: &ReplyHead,
         parts: ReplyParts,
@@ -303,7 +284,6 @@ pub(crate) struct ChatCompletionChunk {
 }
 
 impl ChatCompletionChunk {
-    /// The first chunk of a stream. It carries the role and sends at admission.
     pub(crate) fn role(head: &ReplyHead) -> Self {
         Self::build(
             head,
@@ -317,7 +297,6 @@ impl ChatCompletionChunk {
         )
     }
 
-    /// A chunk with answer text.
     pub(crate) fn content(head: &ReplyHead, text: String) -> Self {
         Self::build(
             head,
@@ -330,7 +309,6 @@ impl ChatCompletionChunk {
         )
     }
 
-    /// A chunk with think text.
     pub(crate) fn reasoning(head: &ReplyHead, text: String) -> Self {
         Self::build(
             head,
@@ -343,7 +321,6 @@ impl ChatCompletionChunk {
         )
     }
 
-    /// The first entry of a tool call: `id`, `type`, and the function name.
     pub(crate) fn tool_call_start(head: &ReplyHead, index: u32, id: String, name: String) -> Self {
         Self::tool_call(
             head,
@@ -359,7 +336,6 @@ impl ChatCompletionChunk {
         )
     }
 
-    /// The argument entry of a tool call. `arguments` is a JSON object as text.
     pub(crate) fn tool_call_arguments(head: &ReplyHead, index: u32, arguments: String) -> Self {
         Self::tool_call(
             head,
@@ -375,7 +351,6 @@ impl ChatCompletionChunk {
         )
     }
 
-    /// The final chunk. It has an empty delta, the finish reason, and the usage.
     pub(crate) fn last(head: &ReplyHead, finish: FinishReason, usage: Usage) -> Self {
         Self::build(
             head,
@@ -493,7 +468,6 @@ pub(crate) struct EngineInfo {
     pub(crate) state: &'static str,
 }
 
-/// The `Model` schema.
 #[derive(Serialize)]
 pub(crate) struct Model {
     pub(crate) id: String,
@@ -504,7 +478,6 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    /// Builds a model entry. Every model of this server belongs to `local`.
     pub(crate) fn new(id: String, created: u64, engines: Vec<EngineInfo>) -> Self {
         Self {
             id,
@@ -516,7 +489,6 @@ impl Model {
     }
 }
 
-/// The response of `GET /v1/models`.
 #[derive(Serialize)]
 pub(crate) struct ModelList {
     object: &'static str,
@@ -524,7 +496,6 @@ pub(crate) struct ModelList {
 }
 
 impl ModelList {
-    /// Wraps the model entries.
     pub(crate) fn new(data: Vec<Model>) -> Self {
         Self {
             object: "list",
@@ -533,7 +504,7 @@ impl ModelList {
     }
 }
 
-/// The `Engine.state` value of an engine state. The names follow `server.md`.
+/// The names follow `server.md`.
 pub(crate) fn state_name(state: EngineState) -> &'static str {
     match state {
         EngineState::Loading => "loading",
@@ -619,7 +590,6 @@ mod tests {
         );
     }
 
-    /// The env gate enables only on the exact enable values.
     #[test]
     fn the_cache_fields_enable_only_on_the_exact_values() {
         assert!(cache_fields_enabled("1"));

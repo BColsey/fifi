@@ -23,7 +23,6 @@ const SHAPE: ExpertShape = ExpertShape {
     hidden: 256,
     inter: 256,
 };
-/// The synthetic model: 3 layers of 8 experts.
 const LAYERS: usize = 3;
 const EXPERTS: usize = 8;
 /// Generous pool timeout, reached only if something is broken.
@@ -54,12 +53,10 @@ struct MockInner {
 }
 
 impl MockInner {
-    /// Publishes a request, as the device would.
     fn publish(&self, request: ServerRequest) {
         self.requests.lock().unwrap().push_back(request);
     }
 
-    /// The recorded answers, in order.
     fn answers(&self) -> Vec<Recorded> {
         self.answers.lock().unwrap().clone()
     }
@@ -71,7 +68,6 @@ impl MockInner {
 struct MockPort(Arc<MockInner>);
 
 impl MockPort {
-    /// A port whose rows are `row` (its width is the row's length).
     fn new(row: Vec<f32>) -> (MockPort, Arc<MockInner>) {
         let inner = Arc::new(MockInner {
             requests: Mutex::new(VecDeque::new()),
@@ -165,7 +161,6 @@ impl MappedRegion for CountingRegion {
     }
 }
 
-/// A synthetic expert file, the shared region over its bytes, and the normed row.
 fn fixture(seed: u64) -> (Vec<u8>, Arc<dyn MappedRegion>, Vec<f32>) {
     let mut rng = Lcg(seed);
     let ((bytes, _), _) = expert_file(&mut rng, LAYERS, EXPERTS, SHAPE);
@@ -236,8 +231,6 @@ fn server_answers_in_pick_order_with_the_pool_sum() {
     let pool = CpuPool::new(2, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row.clone());
     let server = LayerServer::spawn(port, locate(&bytes), region.clone(), pool, LONG).unwrap();
-    // Token 1: three misses in pick order [5, 1, 6]; the answer is the bits of the
-    // same jobs in that order through a fresh pool.
     let (a, wa) = ([5i32, 1, 6], [0.5f32, 0.25, -0.125]);
     let want_a = reference(&locate(&bytes), &region, 1, &a, &wa, &row);
     server.arm();
@@ -280,8 +273,6 @@ fn server_turns_a_pool_timeout_into_an_error_answer_and_a_typed_error() {
 
 #[test]
 fn server_ignores_a_stale_sequence_and_answers_each_request_once() {
-    // The mock pops 1, then 1 again, then an older 0, then 2: exactly the requests 1
-    // and 2 are answered, each once, and served counts two.
     let (bytes, region, row) = fixture(0x5EED_C0C5_0000_0003);
     let pool = CpuPool::new(2, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row.clone());
@@ -320,8 +311,6 @@ fn a_refused_answer_is_recorded_as_an_answer_error_and_never_retried() {
 
 #[test]
 fn dropping_the_handle_stops_and_joins_the_thread() {
-    // No shutdown: the Drop sets the stop flag, wakes the thread and joins it, so by the time the drop returns the thread has
-    // dropped its port (the mock's flag) - the server is gone before the caller drops the mailbox next.
     let (bytes, region, row) = fixture(0x5EED_C0C5_0000_0008);
     let pool = CpuPool::new(1, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row);
@@ -466,7 +455,6 @@ fn a_panic_while_serving_is_caught_answered_dead_and_the_next_request_is_served(
 
 #[test]
 fn collect_disarms_the_thread() {
-    // After collect the thread neither polls nor answers: a request published then stays unanswered until the next arm.
     let (bytes, region, row) = fixture(0x5EED_C0C5_0000_000B);
     let pool = CpuPool::new(1, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row);
@@ -751,7 +739,6 @@ fn server_refuses_a_bad_request_with_an_error_answer() {
     distinct.sort();
     distinct.dedup();
     assert_eq!(distinct.len(), 5, "{messages:?}");
-    // The final token: count 0, then a repeated id, then a good request.
     server.arm();
     inner.publish(request(8, 1, &[], &[]));
     inner.publish(request(9, 1, &[2, 2], &[0.5, 0.5]));
@@ -782,12 +769,10 @@ fn an_unarmed_server_serves_nothing_and_collect_reports_the_shortfall() {
     let pool = CpuPool::new(2, SHAPE).unwrap();
     let (port, inner) = MockPort::new(row);
     let server = LayerServer::spawn(port, locate(&bytes), region, pool, timeout).unwrap();
-    // Published but unarmed: the thread neither polls nor answers.
     inner.publish(request(1, 1, &[2, 4], &[0.5, 0.25]));
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(inner.polls.load(Ordering::Relaxed), 0);
     assert!(inner.answers().is_empty());
-    // Armed: the request is answered; collect(2) then reports the bounded shortfall.
     server.arm();
     let started = Instant::now();
     let token = server.collect(2);
@@ -829,7 +814,6 @@ fn error_codes_are_nonzero_and_distinct() {
     codes.sort();
     codes.dedup();
     assert_eq!(codes.len(), errors.len());
-    // The documented consts are exactly the variants' codes.
     assert_eq!(errors[0].code(), ERR_BAD_REQUEST);
     assert_eq!(errors[1].code(), ERR_ROW);
     assert_eq!(errors[2].code(), ERR_LOCATOR);

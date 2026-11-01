@@ -24,14 +24,10 @@ pub(in crate::kernels::cuda) const STEP_PARAMS_BYTES: usize = 32;
 pub(in crate::kernels::cuda) const ARGMAX_PART_BYTES: usize = 3072;
 /// Bytes of the result pair: the token, then the status.
 pub(in crate::kernels::cuda) const RESULT_PAIR_BYTES: usize = 8;
-/// Largest `m` of one `step_advance`.
 pub(in crate::kernels::cuda) const MAX_ADVANCE: usize = 4096;
-/// Largest number of logits of one argmax.
 pub(in crate::kernels::cuda) const MAX_LOGITS: usize = 1 << 30;
 
-/// Alignment of every `StepParams`, logits and scratch pointer.
 const WORD_ALIGN: usize = 4;
-/// Alignment of the result pair.
 const PAIR_ALIGN: usize = 8;
 
 /// Mirror of `inference_cuda_step_advance_args`.
@@ -87,7 +83,6 @@ unsafe extern "C" {
     fn argmax_raw(args: *const ArgmaxArgsRaw, stream: *mut c_void, out_stage: *mut c_int) -> c_int;
 }
 
-/// What one argmax reads and writes. `n` was bounded by the wrapper.
 pub(in crate::kernels::cuda) struct ArgmaxRaw<'a> {
     pub(in crate::kernels::cuda) logits: RawRange<'a>,
     pub(in crate::kernels::cuda) part: RawRange<'a>,
@@ -96,12 +91,10 @@ pub(in crate::kernels::cuda) struct ArgmaxRaw<'a> {
     pub(in crate::kernels::cuda) n: c_int,
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// Proves the `StepParams` range: 32 bytes, 4-byte aligned.
 fn check_params(params: &RawRange<'_>) -> Result<(), DeviceFailure> {
     if fits(params, STEP_PARAMS_BYTES, WORD_ALIGN) {
         return Ok(());
@@ -109,9 +102,6 @@ fn check_params(params: &RawRange<'_>) -> Result<(), DeviceFailure> {
     Err(invalid_argument())
 }
 
-/// Proves an argmax before the native call: sizes, alignment (`result` 8, the rest 4) and that
-/// `part`, `params` and `result`, which the kernels write, share no byte with each other or with
-/// `logits`. Returns `n` as a length.
 fn check_argmax(call: &ArgmaxRaw<'_>) -> Result<usize, DeviceFailure> {
     let n = usize::try_from(call.n)
         .ok()
@@ -144,7 +134,7 @@ fn check_argmax(call: &ArgmaxRaw<'_>) -> Result<usize, DeviceFailure> {
     Ok(n)
 }
 
-/// Queues `step_begin`: clears the status of the block and flags an invalid state.
+/// Clears the status of the block and flags an invalid state.
 pub(in crate::kernels::cuda) fn step_begin_launch(
     stream: &RawStream,
     params: RawRange<'_>,
@@ -159,7 +149,6 @@ pub(in crate::kernels::cuda) fn step_begin_launch(
     checked(status, stage)
 }
 
-/// Queues `step_advance` by `m` positions (`1..=4096`, bounded by the wrapper).
 pub(in crate::kernels::cuda) fn step_advance_launch(
     stream: &RawStream,
     params: RawRange<'_>,
@@ -183,10 +172,8 @@ pub(in crate::kernels::cuda) fn step_advance_launch(
     checked(status, stage)
 }
 
-/// Bytes of the EXL3 arithmetic flag word.
 const FLAG_BYTES: usize = 4;
 
-/// Queues the zeroing of the EXL3 arithmetic flag word (4 bytes, 4-byte aligned).
 pub(in crate::kernels::cuda) fn exl3_flag_clear_launch(
     stream: &RawStream,
     flag: RawRange<'_>,
@@ -232,7 +219,7 @@ pub(in crate::kernels::cuda) fn exl3_flag_fold_launch(
     checked(status, stage)
 }
 
-/// Queues the two argmax kernels. An absent `result` passes NULL.
+/// Queues the two argmax kernels.
 pub(in crate::kernels::cuda) fn argmax_launch(
     stream: &RawStream,
     call: &ArgmaxRaw<'_>,

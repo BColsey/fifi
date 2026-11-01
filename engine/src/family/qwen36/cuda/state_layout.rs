@@ -67,7 +67,6 @@ use crate::{
 pub(super) const STATE_ALIGN: usize = 256;
 /// Values per fp16 scale in the `Int8G32` format.
 pub(super) const KV8_GROUP: usize = 32;
-/// Bytes per fp16 value or fp16 scale.
 const HALF: usize = 2;
 
 fn overflow() -> EngError {
@@ -134,12 +133,10 @@ impl DeltaPool {
         Ok((slot * self.layers + ordinal) * self.layer_stride)
     }
 
-    /// Byte offset of the recurrent state of the `ordinal`-th DeltaNet layer in `slot`.
     pub(crate) fn rec_offset(&self, slot: usize, ordinal: usize) -> Result<usize, EngError> {
         self.base(slot, ordinal)
     }
 
-    /// Byte offset of the convolution state of the same layer.
     pub(crate) fn conv_offset(&self, slot: usize, ordinal: usize) -> Result<usize, EngError> {
         Ok(self.base(slot, ordinal)? + self.rec_region)
     }
@@ -154,7 +151,6 @@ pub(crate) enum Plane {
     VScales,
 }
 
-/// One contiguous run of a plane inside the KV pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CopyRange {
     pub(crate) plane: Plane,
@@ -321,10 +317,8 @@ impl KvPool {
     }
 }
 
-/// A persistent device word (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Word {
-    /// The `StepParams` block.
     StepParams,
     /// The result pair `{token, status}`; the host copies these 8 bytes after a step.
     ResultPair,
@@ -366,7 +360,6 @@ impl Word {
     }
 }
 
-/// The block of persistent words: the end of the last word's slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WordsBlock {
     pub(crate) total: usize,
@@ -380,7 +373,6 @@ impl WordsBlock {
     }
 }
 
-/// All persistent state of one session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StateLayout {
     pub(crate) delta: DeltaPool,

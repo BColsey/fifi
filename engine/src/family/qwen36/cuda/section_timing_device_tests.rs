@@ -48,8 +48,6 @@ const CONTEXT: usize = 1_024;
 const PROMPT: [u32; 8] = [128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384];
 const TOKENS: usize = 6;
 
-/// One token's section readings plus how the body ran and the wall time of the `run_token`
-/// call that produced them (report-only).
 struct Reading {
     token: usize,
     how: CaptureOutcome,
@@ -62,7 +60,6 @@ struct Reading {
     wall_ms: f32,
 }
 
-/// One token of the marks-off pair: how the body ran and the wall time (report-only).
 struct PlainToken {
     token: usize,
     how: CaptureOutcome,
@@ -201,7 +198,6 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
             wall_ms,
         });
     }
-    // Still no readings after the marks-off run: that step carries no marks at all.
     if let Some(times) = plain.section_times()? {
         return Err(EngError::Checkpoint(format!(
             "a marks-off step reported section readings after its run: {times:?}"
@@ -228,8 +224,6 @@ fn section_marks_time_the_captured_step() {
     assert_eq!(readings.len(), TOKENS);
     assert_eq!(plain_tokens.len(), TOKENS);
 
-    // Mechanics: the marked groups ARE the model's section plan (the second layer of each
-    // run of identical kinds, a singleton run its only layer).
     let expected_groups: Vec<(usize, usize)> = section_plan(&dims().unwrap().shape.kinds)
         .groups
         .iter()
@@ -238,9 +232,7 @@ fn section_marks_time_the_captured_step() {
     assert_eq!(marked_groups, expected_groups);
 
     for reading in &readings {
-        // Mechanics: the marks exist and every reading is finite; the whole-token pair is
-        // strictly positive (the pair around Begin..Advance measures a full decode step);
-        // token 1 runs eager (the warm-up), every later one the captured graph — a refused
+        // Token 1 runs eager (the warm-up), every later one the captured graph; a refused
         // capture would report its fallback instead.
         let expected = if reading.token == 1 {
             CaptureOutcome::Eager

@@ -327,13 +327,10 @@ impl CudaProjector {
         )
     }
 
-    /// Links a decoded F32 tensor pointer to its FP8-resident entry so
-    /// `linear` can route the compute through `f8_matvec` (no upload).
     pub(crate) fn link_f8_pointer(&mut self, pointer: usize, name: &str) {
         self.f8_pointer_map.insert(pointer, name.to_owned());
     }
 
-    /// Returns the FP8-resident name linked to this tensor, if any.
     pub(crate) fn f8_name_for(&self, weight: &Tensor) -> Option<&str> {
         let pointer = weight
             .host_bytes()
@@ -363,10 +360,6 @@ impl CudaProjector {
         self.cached_bytes
     }
 
-    /// Name-based linear compute on a device-resident weight (the qwen36
-    /// CudaWeights pattern: lookup by name, no host tensor needed).
-    /// Returns None when the name is not resident (the caller falls back
-    /// to the old pointer-based path).
     pub(crate) fn linear_by_name(
         &self,
         name: &str,
@@ -381,12 +374,10 @@ impl CudaProjector {
         })
     }
 
-    /// Whether a dense weight name is device-resident.
     pub(crate) fn is_dense_resident(&self, name: &str) -> bool {
         self.resident_f8.contains_key(name)
     }
 
-    /// The stored shape of a device-resident weight by name.
     pub(crate) fn resident_shape_of(&self, name: &str) -> Option<[usize; 2]> {
         self.resident_f8.get(name).map(|e| e.shape)
     }
@@ -406,8 +397,6 @@ impl CudaProjector {
             .set(self.device_mamba_steps.get() + 1);
     }
 
-    /// A borrowed view of one resident packed expert (the seam #5 uses
-    /// for the streaming tier's grouped callback).
     pub(crate) fn packed_expert_view(&self, key: u64) -> Option<PackedExpertView<'_>> {
         // Permanent residents take precedence, matching resident_entry.
         if let Some(entry) = self.resident_packed.get(&key) {
@@ -466,7 +455,6 @@ impl CudaProjector {
         Ok(())
     }
 
-    /// Computes one dense matvec on device-resident codes (FP8 or BF16).
     pub(crate) fn f8_linear(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, EngError> {
         let entry = self
             .resident_f8
@@ -624,13 +612,10 @@ impl CudaProjector {
         Ok(())
     }
 
-    /// Whether the key is a device-resident expert projection (never evicted, no host copy).
     pub(crate) fn is_resident(&self, key: u64) -> bool {
         self.resident_packed.contains_key(&key)
     }
 
-    /// One projection of a resident expert straight from its device buffers, or `None` when the
-    /// key is not resident.
     pub(crate) fn resident_nvfp4_matvec(
         &mut self,
         key: u64,
@@ -668,7 +653,6 @@ impl CudaProjector {
         u64::try_from(info.free).map_err(|_| invalid("free device memory exceeds u64"))
     }
 
-    /// Device bytes the pinned staging slot of the admitted maximum payload can take.
     pub(crate) fn stage_bytes(&self) -> u64 {
         self.stage_bytes
     }
@@ -795,8 +779,6 @@ impl Projector for CudaProjector {
 
     fn linear(&mut self, weight: &Tensor, input: &[f32]) -> Result<Vec<f32>, EngError> {
         let _timer = CallTimer::start(&self.clock);
-        // FP8-resident weights skip the F32 upload entirely (the pointer
-        // map routes to f8_matvec on device-resident codes).
         if let Some(name) = self.f8_name_for(weight) {
             return self.f8_linear(name, input);
         }
@@ -946,8 +928,6 @@ impl Projector for CudaProjector {
             ));
         }
         self.limits.check_pageable(codes.len())?;
-        // No residency yet: caller slices lack stable identity (loader wiring
-        // supplies checkpoint keys, as with the F8 path).
         let buffer = self.context.upload(codes)?;
         self.context.bf16_matvec(&buffer, [rows, columns], input)
     }

@@ -69,7 +69,6 @@ impl ToolGrammar {
     }
 }
 
-/// Where the generated text starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
     /// The text starts as content. The prompt ended with an empty think block or with no think block.
@@ -110,7 +109,6 @@ impl ToolSchemas {
         Self { string_params }
     }
 
-    /// Returns true when `tool` declares `parameter` as a string.
     fn is_string(&self, tool: &str, parameter: &str) -> bool {
         self.string_params
             .get(tool)
@@ -118,18 +116,15 @@ impl ToolSchemas {
     }
 }
 
-/// One complete tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     /// The call id: the parser prefix followed by the position of the call in this response.
     pub id: String,
-    /// The function name.
     pub name: String,
     /// The arguments as compact JSON object text, in the order the model wrote them.
     pub arguments: String,
 }
 
-/// Why a tool-call body is not a valid call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCallError {
     /// The body does not start with `<function=`.
@@ -150,10 +145,8 @@ pub enum ToolCallError {
     Unterminated,
 }
 
-/// A tool-call body that is not valid, with the text between the call tags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MalformedCall {
-    /// The reason.
     pub error: ToolCallError,
     /// The text between `<tool_call>` and `</tool_call>`, or after `<tool_call>` when unterminated.
     pub raw: String,
@@ -162,13 +155,10 @@ pub struct MalformedCall {
 /// One result of the parser, in output order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolEvent {
-    /// Reasoning text.
     Reasoning(String),
-    /// Content text.
     Content(String),
     /// A complete valid tool call.
     Call(ToolCall),
-    /// A tool-call body that is not valid.
     Malformed(MalformedCall),
 }
 
@@ -282,7 +272,6 @@ impl ToolCallParser {
         }
     }
 
-    /// Emits section text with the section trim rules.
     fn text(&mut self, events: &mut Vec<ToolEvent>, text: &str) {
         let mut text = text;
         if self.leading {
@@ -309,7 +298,6 @@ impl ToolCallParser {
         });
     }
 
-    /// Turns one call body into a call or a malformed event.
     fn call_event(&mut self, body: String) -> ToolEvent {
         let parsed = match self.grammar {
             ToolGrammar::Qwen => parse_body(&body, &self.schemas),
@@ -351,7 +339,6 @@ fn partial_marker_len(buffer: &str, markers: &[&str]) -> usize {
         .unwrap_or(0)
 }
 
-/// Checks a function or parameter name.
 fn check_name(name: &str) -> Result<(), ToolCallError> {
     if name.is_empty() || name.contains(char::is_whitespace) || name.contains('<') {
         return Err(ToolCallError::InvalidName);
@@ -359,7 +346,6 @@ fn check_name(name: &str) -> Result<(), ToolCallError> {
     Ok(())
 }
 
-/// Parses one call body into the function name and the typed arguments.
 fn parse_body(
     body: &str,
     schemas: &ToolSchemas,
@@ -448,21 +434,15 @@ fn parse_flint_body(
     }
 }
 
-/// The result of a whole-text parse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOutput {
-    /// The reasoning text.
     pub reasoning: String,
-    /// The content text.
     pub content: String,
-    /// The complete valid tool calls, in order.
     pub tool_calls: Vec<ToolCall>,
-    /// The invalid call bodies, in order.
     pub malformed: Vec<MalformedCall>,
 }
 
 impl ParsedOutput {
-    /// Folds parser events into one result. Text events of one kind are joined.
     pub fn from_events(events: impl IntoIterator<Item = ToolEvent>) -> Self {
         let mut output = Self::default();
         for event in events {
@@ -477,7 +457,6 @@ impl ParsedOutput {
     }
 }
 
-/// Parses a complete response text. This is the non-streaming path.
 pub fn parse_complete(
     text: &str,
     start: Start,
@@ -535,7 +514,6 @@ mod tests {
         format!("<tool_call>{body}</tool_call>")
     }
 
-    /// Asserts that `body` inside call tags is reported as `error` and nowhere else.
     fn assert_malformed(body: &str, error: ToolCallError) {
         let output = parse(&wrap(body), Start::Content);
         assert_eq!(output.content, "", "malformed body must not become content");

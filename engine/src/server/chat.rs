@@ -1,7 +1,6 @@
 //! The chat completion handler: `POST /v1/chat/completions`.
 //!
-//! Request flow: the server design ("Request lifecycle"). The handler reads the body, validates
-//! it, picks the engine, renders and tokenizes the prompt, submits the job, and writes the reply.
+//! Request flow: the server design ("Request lifecycle").
 //! The model runs on the engine thread. This module never touches model state.
 
 use super::error::ServerError;
@@ -31,13 +30,11 @@ use std::sync::Arc;
 /// The body cap of the contract: 16 MiB.
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// A request that passed every check and whose job the engine queue holds.
 pub(crate) struct Submitted {
     pub(crate) head: ReplyHead,
     pub(crate) running: RunningJob,
 }
 
-/// The route handler. Every failure before the reply is a JSON error.
 pub(crate) async fn chat(State(state): State<Arc<AppState>>, body: Body) -> Response {
     match reply(&state, body).await {
         Ok(response) => response,
@@ -67,8 +64,7 @@ async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
     Ok(Json(completion).into_response())
 }
 
-/// Resolves the engine, builds the prompt, and queues the job. The Anthropic route
-/// shares this path: its request became a `ChatInput` before it reached here.
+/// The Anthropic route shares this path: its request became a `ChatInput` before it reached here.
 pub(crate) async fn submit(
     state: &AppState,
     input: ChatInput,
@@ -312,8 +308,6 @@ pub(super) fn admit(
     })
 }
 
-/// Writes the request log line of a request that failed after its prompt was known.
-/// It returns the error for the caller to return.
 fn failed(log: &mut RequestLog, error: impl Into<ServerError>) -> ServerError {
     let error = error.into();
     log.fail(&error);
@@ -347,9 +341,9 @@ pub(crate) fn warm_flag_on() -> bool {
     crate::tokenizer::env_allows_default_on(WARM_TURNS_VAR)
 }
 
-/// Chooses where the parser starts in the reply. When the prompt ends inside an open think block,
-/// the template asked for thinking and the reply starts inside the reasoning. The template is the
-/// one authority: the check reads the end of the rendered prompt, not the request setting.
+/// When the prompt ends inside an open think block, the template asked for thinking and the
+/// reply starts inside the reasoning. The template is the one authority: the check reads the end
+/// of the rendered prompt, not the request setting.
 fn reply_start(bundle: &TokenizerBundle, prompt: &[u32]) -> Start {
     // The exact Flint template appends only <|assistant|>, never an open think block.
     // Tail decoding skips that special role token and could expose a historical <think>.
@@ -365,7 +359,6 @@ fn reply_start(bundle: &TokenizerBundle, prompt: &[u32]) -> Start {
     }
 }
 
-/// Maps a refused submission to its HTTP error.
 fn refusal(error: SubmitError) -> ServerError {
     match error {
         SubmitError::QueueFull => ServerError::Overloaded("the engine queue is full".to_string()),
@@ -405,21 +398,18 @@ mod tests {
     const COMPLETION: &str =
         "/paths/~1v1~1chat~1completions/post/responses/200/content/application~1json/schema";
 
-    /// A router over one engine named `e1` that serves `model-a`.
     fn app(engine: &Engine, context_limit: u32) -> Router {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let entry = testkit::entry("e1", "model-a", engine, context_limit);
         router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
     }
 
-    /// A router over one engine entry that carries its own sampling defaults.
     fn app_with_defaults(engine: &Engine, defaults: SamplingDefaults) -> Router {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let entry = testkit::entry_with_defaults("e1", "model-a", engine, 4_096, defaults);
         router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
     }
 
-    /// The sampling defaults of a model directory whose `generation_config.json` holds `text`.
     fn file_defaults(text: &str) -> SamplingDefaults {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("generation_config.json"), text)
@@ -740,7 +730,6 @@ mod tests {
         assert_eq!(reply["usage"]["completion_tokens"], 1);
     }
 
-    /// A router over one engine whose entry has the `prefix_reuse` flag set to `flag`.
     fn reuse_app(engine: &Engine, flag: bool) -> Router {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let mut entry = testkit::entry("e1", "model-a", engine, 4_096);
@@ -982,7 +971,6 @@ mod tests {
         println!("child-warm-env:{mode:?}");
     }
 
-    /// The derived-path reference ids of a request body, computed directly.
     fn derived_ids(bundle: &Arc<TokenizerBundle>, body: &Value) -> Vec<u32> {
         let request =
             crate::server::validate::parse_chat(&serde_json::to_vec(body).unwrap()).expect("parse");
@@ -998,9 +986,6 @@ mod tests {
             .0
     }
 
-    /// The shared state of one prefix-reuse engine that renders prompts with
-    /// `bundle`, plus the entry's warm-cache slot (shared `Arc`, so tests
-    /// can assert on it without an accessor).
     fn reuse_state_with_bundle(
         engine: &Engine,
         bundle: Arc<TokenizerBundle>,
@@ -1016,7 +1001,6 @@ mod tests {
         (Arc::new(AppState::new(testkit::API_KEY, vec![entry])), warm)
     }
 
-    /// A router over one engine whose entry reuses prefixes and renders prompts with `bundle`.
     fn reuse_app_with_bundle(engine: &Engine, bundle: Arc<TokenizerBundle>) -> Router {
         testkit::wait_for_state(&engine.handle(), EngineState::Ready);
         let mut entry = testkit::entry("e1", "model-a", engine, 4_096);
@@ -1025,7 +1009,6 @@ mod tests {
         router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
     }
 
-    /// A request with the given messages as (role, content) pairs.
     fn conversation(messages: &[(&str, &str)]) -> Value {
         let messages: Vec<Value> = messages
             .iter()
@@ -1041,7 +1024,6 @@ mod tests {
         json!({"model": "model-a", "messages": messages, "max_tokens": 8})
     }
 
-    /// Posts each conversation in order and returns `(prompt_tokens, reused_tokens)` of each reply.
     async fn usage_of(app: &Router, conversations: &[Value]) -> Vec<(u64, u64)> {
         let mut usage = Vec::new();
         for body in conversations {
@@ -1059,8 +1041,7 @@ mod tests {
         usage
     }
 
-    /// The first request of the prefix tests, and the same conversation with a reply and a new
-    /// question. The prompt of the second request starts with the prompt of the first without its
+    /// The prompt of the second request starts with the prompt of the first without its
     /// generation tail.
     fn first_and_follow_up() -> [Value; 2] {
         [

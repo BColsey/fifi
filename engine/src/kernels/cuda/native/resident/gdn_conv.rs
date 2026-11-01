@@ -26,7 +26,6 @@ use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, inval
 
 /// Largest `m` of one launch (`gdn_conv.h`).
 pub(in crate::kernels::cuda) const GDN_CONV_MAX_M: usize = 32768;
-/// Largest `channels` of one launch.
 pub(in crate::kernels::cuda) const GDN_CONV_MAX_CHANNELS: usize = 65536;
 /// Largest `ld` (the row stride of `proj`, in floats).
 pub(in crate::kernels::cuda) const GDN_CONV_MAX_LD: usize = 1 << 20;
@@ -81,7 +80,6 @@ pub(in crate::kernels::cuda) struct GdnConvRaw<'a> {
     pub(in crate::kernels::cuda) ld: usize,
 }
 
-/// Bytes each range of a call must hold.
 struct Sizes {
     proj: usize,
     w: usize,
@@ -117,14 +115,12 @@ fn call_sizes(call: &GdnConvRaw<'_>) -> Option<Sizes> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// Proves a conv launch before the native call: limits, sizes, alignment (`w` 16, the rest 4) and
-/// that `state` and `out`, which the kernel writes, share no byte with any other range. `proj`
-/// and `w` are read only and may overlap each other.
+/// `proj` and `w` are read only and may overlap each other; every range the kernel writes
+/// must be apart.
 fn check_gdn_conv(call: &GdnConvRaw<'_>) -> Result<(c_int, c_int, c_int), DeviceFailure> {
     let ints = call_ints(call).ok_or_else(invalid_argument)?;
     let need = call_sizes(call).ok_or_else(invalid_argument)?;
@@ -145,7 +141,6 @@ fn check_gdn_conv(call: &GdnConvRaw<'_>) -> Result<(c_int, c_int, c_int), Device
     Ok(ints)
 }
 
-/// Queues the conv step of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn gdn_conv_launch(
     stream: &RawStream,
     call: GdnConvRaw<'_>,

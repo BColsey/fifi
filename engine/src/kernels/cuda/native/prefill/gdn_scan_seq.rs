@@ -126,7 +126,6 @@ pub(in crate::kernels::cuda) struct GdnScanSeqRaw<'a> {
     pub(in crate::kernels::cuda) eps: f32,
 }
 
-/// The bytes each range must hold.
 struct Needs {
     conv: usize,
     proj: usize,
@@ -136,12 +135,10 @@ struct Needs {
     o_out: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -181,10 +178,6 @@ fn needs(ints: &GdnScanSeqInts) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// Proves a launch before the native call: size and 4-byte alignment of every range (the
-/// status word when given), and that `state` and `o_out`, which the kernels write, share no
-/// byte with any other range or each other, and that the status word, which the guard ORs,
-/// shares no byte with any range.
 fn check_scan(io: &GdnScanSeqRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints)?;
     let ranges = [
@@ -258,7 +251,7 @@ fn c_args(io: &GdnScanSeqRaw<'_>) -> GdnScanSeqArgsRaw {
 
 /// Queues the scan kernels on `stream`: the value-sliced sequential scan (the state updated
 /// in place, the pre-norm rows written), then the gated output RMSNorm in place on the same
-/// rows. Returns when both are queued.
+/// rows.
 pub(in crate::kernels::cuda) fn gdn_scan_seq_launch(
     stream: &RawStream,
     io: GdnScanSeqRaw<'_>,

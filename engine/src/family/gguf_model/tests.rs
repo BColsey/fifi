@@ -47,7 +47,6 @@ fn spec_counts(spec: &FamilySpec) -> [u32; 4] {
     [spec.layers, spec.hidden, spec.experts, spec.top_k]
 }
 
-/// `general.architecture` plus the four count keys of `spec`.
 fn metadata(architecture: &str, counts: [u32; 4]) -> Vec<Vec<u8>> {
     let mut kvs = vec![kv_string("general.architecture", architecture)];
     for (key, value) in COUNT_KEYS.iter().zip(counts) {
@@ -63,7 +62,6 @@ fn pattern(index: usize, count: usize) -> Vec<f32> {
         .collect()
 }
 
-/// One tensor of the fixture file.
 struct FileTensor {
     name: String,
     ty: GgufType,
@@ -103,7 +101,6 @@ fn file_tensors(spec: &FamilySpec) -> Vec<FileTensor> {
         .collect()
 }
 
-/// Swaps one tensor of the fixture for a different type and shape.
 fn replace(tensors: &mut [FileTensor], name: &str, ty: GgufType, dims: Vec<u64>) {
     let tensor = tensors
         .iter_mut()
@@ -148,7 +145,6 @@ fn open(kvs: &[Vec<u8>], tensors: &[FileTensor], spec: &FamilySpec) -> Result<Gg
     open_with_spec(&path, None, spec)
 }
 
-/// The `Checkpoint` message of a rejection, or a panic naming what came back.
 fn rejection(result: Result<GgufModel, EngError>) -> String {
     match result {
         Err(EngError::Checkpoint(message)) => message,

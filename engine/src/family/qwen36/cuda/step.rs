@@ -107,7 +107,6 @@ mod kv8_target;
 /// Capture settings of the step; distinct from `dims::StepOptions` (the dimensions options of
 /// `new`).
 pub(crate) struct CaptureConfig {
-    /// Whether the step should capture its body into a replayable graph.
     pub(crate) capture: bool,
     /// Whether the step records in-graph section-timing marks: a timing-event pair per section of
     /// the token body, recorded with the external-record flag so a capture turns them into
@@ -126,7 +125,6 @@ struct SectionMarks {
     whole_start: TimingEvent,
     embed_start: TimingEvent,
     embed_end: TimingEvent,
-    /// One (start, end) pair per marked group, in `plan` order.
     groups: Vec<(TimingEvent, TimingEvent)>,
     tail_start: TimingEvent,
     end: TimingEvent,
@@ -175,7 +173,6 @@ impl SectionMarks {
         stream.record_timing(event)
     }
 
-    /// Records the closing event of the section `op` ends, if it ends one.
     fn record_after(&self, op: StepOp, stream: &DeviceStream) -> Result<(), EngError> {
         let event = match op {
             StepOp::Embed => &self.embed_end,
@@ -185,7 +182,6 @@ impl SectionMarks {
                     None => Ok(()),
                 };
             }
-            // The tail's end is the whole token's end: one event closes both.
             StepOp::Advance => &self.end,
             StepOp::Begin
             | StepOp::Mixer(_)
@@ -196,7 +192,6 @@ impl SectionMarks {
         stream.record_timing(event)
     }
 
-    /// The index of `layer` in the marked groups, or `None` when the layer carries no pair.
     fn group_index(&self, layer: usize) -> Option<usize> {
         self.plan
             .groups
@@ -205,13 +200,9 @@ impl SectionMarks {
     }
 }
 
-/// How the body of this token will run (the dispatch discriminator of `run_token`).
 pub(super) enum Mode {
-    /// The stored graph replays.
     Replay,
-    /// The first capture is attempted (a warmed step that asked for it and never refused one).
     Capture,
-    /// The launches run one by one.
     Eager,
 }
 
@@ -250,14 +241,10 @@ pub(super) fn fold_capture<G>(
     }
 }
 
-/// How the body of one token ran (the discriminator `reported_outcome` maps to the outcome).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum HowRan {
-    /// The launches ran one by one (warm-up, fallback or plain session).
     Eager,
-    /// A capture succeeded and the graph ran this token.
     Captured,
-    /// A capture was refused and the body ran eagerly in the same token.
     Refused,
 }
 
@@ -312,7 +299,6 @@ pub(super) fn exl3_device_pick_refusal(
     Ok(())
 }
 
-/// The error of a token whose EXL3 projections flagged a nonfinite value or an invalid input.
 pub(super) fn exl3_flag_error() -> EngError {
     EngError::ModelOutput("EXL3 projection flagged invalid arithmetic".to_owned())
 }
@@ -325,7 +311,6 @@ pub(super) fn exl3_pair_refusal(layout: WeightLayout, pair: ResultPair) -> Optio
         .then(exl3_flag_error)
 }
 
-/// The environment value of `INFERENCE_CUDA_SYNC_EACH`, `None` when unset.
 fn sync_each_from_env() -> Result<bool, EngError> {
     match std::env::var(SYNC_EACH_VAR) {
         Ok(value) => parse_sync_each(Some(&value)),
@@ -336,7 +321,6 @@ fn sync_each_from_env() -> Result<bool, EngError> {
     }
 }
 
-/// The resident decode step of one session. See the module doc.
 pub(crate) struct QwenResidentStep<'a> {
     // Declaration order is drop order: the graph first, then the borrows, the stream last.
     /// The leaked pin slice of the weights and the arena slot: one leaked slice per new step (one
@@ -369,7 +353,6 @@ pub(crate) struct QwenResidentStep<'a> {
     tiered_parts: Option<Vec<LayerParts<'a>>>,
     /// The tiered runtime; interior mutability because the token body takes `&self`.
     tiered: Option<std::cell::RefCell<TieredRuntime<'a>>>,
-    /// The counters of the last token's boundary.
     tiered_report: TokenReport,
     globals: GlobalWeights<'a>,
     /// The layout the step runs: the loaded weights' own layout, checked against the options at
@@ -392,7 +375,6 @@ pub(crate) struct QwenResidentStep<'a> {
     /// Set only at the end of a fully successful eager token (a failed first token does not
     /// warm; the warm-up retries).
     warmed: bool,
-    /// The capture setting of `set_capture_config` (default false).
     capture_on: bool,
     /// An EXL3 step reads the router's picks on the device (no host read in the MoE block); set
     /// with the capture config, which needs a body that makes no host read.
@@ -422,8 +404,6 @@ pub(crate) struct QwenResidentStep<'a> {
     shortlist_on: bool,
     shortlist_bytes: [u8; shortlist::RESULT_BYTES],
     report: RunReport,
-    /// The prefill report of this session: the chunk and feed steps and the counts the serve
-    /// surface prints. Host values only.
     prefill_report: PrefillReport,
     /// The engine's one host-backed prefix entry.
     /// The pinned pool keeps its backing alive across entry eviction.
@@ -459,15 +439,12 @@ pub(super) enum ChunkVerdict {
     NoArena,
 }
 
-/// The chunk gate's inputs, fixed at step build: the session's layout, KV mode and tier flag,
-/// the Q6_K scan of the chunk's MMQ weights, the cap of `M_sess`, and the admitted arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ChunkFacts {
     pub(super) layout: WeightLayout,
     pub(super) kv_mode: KvMode,
     pub(super) kv8_chunked_prefill: bool,
     pub(super) tiered: bool,
-    /// True when any MMQ weight of the chunk is Q6_K (`any_chunk_weight_q6k`).
     pub(super) mmq_q6k: bool,
     /// The cap of `M_sess` (`qwen36.prefill_chunk` on the CUDA arm). It stays beside the
     /// admitted size: the run report needs both.
@@ -1082,12 +1059,10 @@ impl<'a> QwenResidentStep<'a> {
         self.tiered_report
     }
 
-    /// KV positions the session holds.
     pub(crate) fn context_limit(&self) -> usize {
         self.state.layout().kv.capacity
     }
 
-    /// Committed rows.
     pub(crate) fn tokens(&self) -> usize {
         self.state.tokens()
     }
@@ -1136,7 +1111,6 @@ impl<'a> QwenResidentStep<'a> {
         self.prefill.as_ref().is_some_and(PrefillArena::segmented)
     }
 
-    /// Records one one-row feed step of the prefill report.
     pub(super) fn record_feed(&mut self, p0: usize, ns: u64) {
         self.prefill_report.push_step(StepRecord {
             p0,
@@ -1254,30 +1228,23 @@ impl<'a> QwenResidentStep<'a> {
         self.tiered_mode
     }
 
-    /// The prefill report of this session.
     pub(crate) fn last_prefill_report(&self) -> &PrefillReport {
         &self.prefill_report
     }
 
-    /// Records one feed_rows call and the verdict it routed on.
     pub(super) fn note_feed_rows(&mut self, verdict: &ChunkVerdict, rows: usize) {
         self.prefill_report.note_feed_rows(verdict, rows);
     }
 
-    /// Takes the once-per-job prefill line.
     pub(super) fn take_job_line(&mut self) -> Option<String> {
         self.prefill_report.take_job_line()
     }
 
-    /// Records one ExecutorOps::prefill call with its host wall time.
     pub(super) fn record_prefill_piece(&mut self, tokens: usize, began: std::time::Instant) {
         let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.prefill_report.record_piece(tokens, ns);
     }
 
-    /// The static fields of the prefill report from the session as it stands: the cap, the
-    /// arena and its part buffer (absent before the admission), the budget, the cache mode, the
-    /// layout and the capture setting.
     fn refill_prefill_report(&mut self) {
         let (arena_bytes, part_bytes, budget_bytes) = match self.prefill.as_ref() {
             Some(arena) => (arena.bytes(), arena.part_bytes(), arena.budget()),
@@ -1317,7 +1284,6 @@ impl<'a> QwenResidentStep<'a> {
         self.state.export_state(&self.stream)
     }
 
-    /// Replaces the committed state.
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
         self.complete_prefix_save()?;
         self.state.import_state(&self.stream, exported)?;
@@ -1367,7 +1333,6 @@ impl<'a> QwenResidentStep<'a> {
         })
     }
 
-    /// The scratch of the EXL3 projections: rotated inputs, partials and the arithmetic flag.
     fn exl3_scratch(&self) -> Result<Scratch<'_>, EngError> {
         Ok(Scratch {
             xh: self.view(Slot::Exl3Xh)?,
@@ -1745,7 +1710,6 @@ impl<'a> QwenResidentStep<'a> {
         self.trace_row(launch, &bufs.route.resid_in, step, layer)
     }
 
-    /// The trace dump of one residual row `resid`.
     fn trace_row(
         &self,
         launch: &Launch<'_>,
@@ -1794,7 +1758,6 @@ impl<'a> QwenResidentStep<'a> {
                             m: STEP_ROWS,
                         },
                     ),
-                    // The native gather reads the file's own Q4_K blocks.
                     EmbedWeight::Native(weight) => ctx.embed_native(
                         s,
                         EmbedNativeCall {
@@ -1805,7 +1768,6 @@ impl<'a> QwenResidentStep<'a> {
                             m: STEP_ROWS,
                         },
                     ),
-                    // The table of an EXL3 pack, as stored.
                     EmbedWeight::Bf16(table) => ctx.embed_bf16(
                         s,
                         EmbedBf16Call {

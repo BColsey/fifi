@@ -107,7 +107,6 @@ fn pattern(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");
@@ -118,7 +117,6 @@ fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     );
 }
 
-/// The whole buffer, read through `stream`.
 fn read_all(buffer: &DeviceBuffer, stream: &DeviceStream) -> Vec<u8> {
     let mut bytes = vec![0u8; buffer.bytes()];
     buffer.read_at(stream, 0, &mut bytes).expect("read_at");
@@ -202,7 +200,6 @@ fn allocate_returns_a_buffer_of_the_asked_size_and_refuses_zero_bytes() {
     let buffer = ctx.allocate(4096).expect("allocate 4096");
     assert_eq!(buffer.bytes(), 4096);
     assert_eq!(ctx.live_bytes(), before + 4096);
-    // The allocation is usable as a buffer: bytes go in and the same bytes come out.
     let data = pattern(4096);
     buffer.write_at(&stream, 0, &data).expect("write_at");
     assert_eq!(read_all(&buffer, &stream), data);

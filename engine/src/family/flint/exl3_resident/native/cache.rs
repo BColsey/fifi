@@ -617,7 +617,6 @@ pub(super) enum BankRequest {
 }
 
 impl BankRequest {
-    /// The request from the environment.
     pub(super) fn from_env(value: Result<String, std::env::VarError>) -> Result<Self, EngError> {
         let value = match value {
             Ok(value) => Some(value),

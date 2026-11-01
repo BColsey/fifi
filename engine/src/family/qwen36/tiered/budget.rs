@@ -21,19 +21,15 @@ use super::TieredConfig;
 /// at load; none of them is guessed here). All fields are bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VramBudget {
-    /// VRAM the engine may use in total.
     pub usable: u64,
-    /// Non-expert model weights resident in VRAM.
     pub non_expert: u64,
     /// Engine state resident in VRAM (samplers, logits, graphs).
     pub state: u64,
     /// The kernel scratch arena.
     pub arena: u64,
-    /// VRAM kept free for the desktop and other processes.
     pub desktop_reserve: u64,
 }
 
-/// The KV cache of the configured context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvPlan {
     /// Context positions the caller configured (positions, not bytes).
@@ -46,18 +42,14 @@ pub struct KvPlan {
 /// The expert geometry: one expert size shared by every MoE layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertSize {
-    /// Bytes of one quantized expert.
     pub bytes: u64,
-    /// MoE layers; the bank is uniform over them, so one slot per layer costs
-    /// `bytes * layers` VRAM in total.
     pub layers: usize,
 }
 
 impl ExpertSize {
-    /// Takes the layer count from a [`TieredConfig`] and the expert size from
-    /// the caller's measurement. WHY: the split is only meaningful for the same
-    /// layer count the policy and residency tables index, so the geometry is
-    /// borrowed from the one config instead of being retyped (and drifting).
+    /// WHY: the split is only meaningful for the same layer count the policy
+    /// and residency tables index, so the geometry is borrowed from the one
+    /// config instead of being retyped (and drifting).
     pub fn from_config(cfg: &TieredConfig, bytes: u64) -> Self {
         Self {
             bytes,
@@ -71,14 +63,9 @@ impl ExpertSize {
 /// smaller context.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BudgetError {
-    /// A fixed commitment exceeded its pool: `needed` > `available` bytes of
-    /// `what`. A plan never borrows from a pool that is already overdrawn.
     Overcommitted {
-        /// The pool that lost, human-readable.
         what: &'static str,
-        /// Bytes the plan needed from the pool.
         needed: u64,
-        /// Bytes the pool had.
         available: u64,
     },
     /// The KV cache did not fit: it wants `kv_bytes`, VRAM grants
@@ -89,7 +76,6 @@ pub enum BudgetError {
         kv_bytes: u64,
         /// KV bytes VRAM grants after the minimum bank took its room.
         vram_for_kv: u64,
-        /// Host bytes the caller allows KV to spill to.
         host_allowed: u64,
     },
     /// A structurally invalid input (a zero size or dimension, or a sum that
@@ -97,10 +83,8 @@ pub enum BudgetError {
     BadInput(String),
 }
 
-/// The result of the VRAM split: where the KV lives and how big the bank is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VramPlan {
-    /// KV positions served from VRAM.
     pub kv_vram_positions: u64,
     /// KV positions spilled to host RAM. Invariant:
     /// `kv_vram_positions + kv_host_positions == KvPlan::positions`.
@@ -108,26 +92,16 @@ pub struct VramPlan {
     /// Bank slots per layer, uniform over the layers; at least the requested
     /// minimum whenever the plan is `Ok`.
     pub bank_slots_per_layer: usize,
-    /// VRAM the whole bank owns: `bank_slots_per_layer * layers * expert bytes`.
     pub bank_bytes: u64,
     /// VRAM left after KV and the bank: the floor remainder, always less than
     /// one bank slot (`layers * expert bytes`).
     pub vram_left: u64,
 }
 
-/// Splits the VRAM: KV first, the bank gets the rest (floored to whole slots,
-/// uniform over the layers). `min_bank_slots_per_layer` is kept by spilling KV
-/// positions to the host while `host_kv_allowed` bytes permit it, else the plan
-/// is refused. WHY: REV4 c.4 orders the tiers exactly this way — KV is 8-bit on
-/// every backend and takes VRAM first, the expert bank gets the remainder, and
-/// KV spills to host RAM only when it does not fit; a decode that started
-/// without its minimum bank would fall through to the CPU from the first token.
-///
-/// Refusals, all typed and byte-exact: commitments beyond `usable` (or a
-/// minimum bank beyond the free VRAM) are [`BudgetError::Overcommitted`]; a KV
-/// remainder the host may not take is [`BudgetError::KvDoesNotFit`]; zero sizes,
-/// zero layers or overflowing products are [`BudgetError::BadInput`]. The
-/// arithmetic is checked throughout, so no input wraps or panics.
+/// WHY: REV4 c.4 orders the tiers exactly this way — KV is 8-bit on every
+/// backend and takes VRAM first, the expert bank gets the remainder, and KV
+/// spills to host RAM only when it does not fit; a decode that started without
+/// its minimum bank would fall through to the CPU from the first token.
 pub fn plan_vram(
     v: &VramBudget,
     kv: &KvPlan,
@@ -221,7 +195,6 @@ pub fn plan_vram(
 /// bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostBudget {
-    /// Host RAM the engine may use in total.
     pub total: u64,
     /// RAM held by the OS, the loader and other processes; never returned.
     pub non_reclaimable: u64,
@@ -233,28 +206,19 @@ pub struct HostBudget {
     pub margin: u64,
 }
 
-/// The result of the host RAM split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostPlan {
     /// Bytes left for the OS page cache of the experts.
     pub page_cache: u64,
-    /// Whole experts the cache holds: `page_cache / expert_bytes`, floored.
     pub cached_experts: u64,
     /// The host KV bytes echoed back; each was taken from `page_cache`
     /// one-for-one (REV4 c.4).
     pub host_kv: u64,
 }
 
-/// Splits the host RAM: `page_cache = total - non_reclaimable - engine_heap -
-/// staging - margin - host_kv` (checked subtraction, never wraps), and
-/// `cached_experts` floors that cache to whole experts of `expert_bytes`. WHY:
-/// the OS page cache is what makes the CPU tier fast, so it owns the residual
-/// host RAM — but every host KV byte is taken from it one-for-one (REV4 c.4),
-/// which this plan makes explicit instead of accidental.
-///
-/// Refusals: commitments beyond `total` are [`BudgetError::Overcommitted`]
-/// naming the pool and both numbers; zero `expert_bytes` (and any sum
-/// overflowing `u64`) is [`BudgetError::BadInput`]. No input wraps or panics.
+/// WHY: the OS page cache is what makes the CPU tier fast, so it owns the
+/// residual host RAM — but every host KV byte is taken from it one-for-one
+/// (REV4 c.4), which this plan makes explicit instead of accidental.
 pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<HostPlan, BudgetError> {
     if expert_bytes == 0 {
         return Err(bad_input("budget: expert bytes must be nonzero"));
@@ -281,8 +245,6 @@ pub fn plan_host(h: &HostBudget, host_kv: u64, expert_bytes: u64) -> Result<Host
     })
 }
 
-/// Wraps `what` into a [`BudgetError::BadInput`]; private sugar for the many
-/// refusal arms of the checked arithmetic above.
 fn bad_input(what: &str) -> BudgetError {
     BudgetError::BadInput(String::from(what))
 }
@@ -317,7 +279,6 @@ mod tests {
         }
     }
 
-    /// A card with only `usable` and `non_expert` set: the zero-case helper.
     fn vbudget(usable: u64, non_expert: u64) -> VramBudget {
         VramBudget {
             usable,
@@ -328,12 +289,10 @@ mod tests {
         }
     }
 
-    /// The KV cache of `positions` positions at 8-bit KV.
     fn kv(positions: u64) -> KvPlan {
         kvz(positions, BYTES_PER_POSITION)
     }
 
-    /// The KV cache of `positions` positions at `bpp` bytes per position.
     fn kvz(positions: u64, bpp: u64) -> KvPlan {
         KvPlan {
             positions,
@@ -341,12 +300,10 @@ mod tests {
         }
     }
 
-    /// The geometry of `bytes`-byte experts over `layers` layers.
     fn geom(bytes: u64, layers: usize) -> ExpertSize {
         ExpertSize { bytes, layers }
     }
 
-    /// The expert geometry, layer count borrowed from the tiered config.
     fn experts() -> ExpertSize {
         ExpertSize::from_config(&TieredConfig::qwen36(1, PolicyMode::Static), EXPERT_BYTES)
     }
@@ -437,16 +394,13 @@ mod tests {
                         else {
                             continue;
                         };
-                        // Position counts round-trip exactly.
                         assert_eq!(plan.kv_vram_positions + plan.kv_host_positions, positions);
-                        // The bank is uniform whole slots and the minimum holds.
                         assert_eq!(
                             plan.bank_bytes,
                             u64::try_from(plan.bank_slots_per_layer).unwrap() * SLOT_COST
                         );
                         assert!(plan.bank_slots_per_layer >= min_slots);
                         assert!(plan.vram_left < SLOT_COST, "{plan:?}");
-                        // Every VRAM byte is accounted for: commitments + KV + bank + slack.
                         assert_eq!(
                             budget.usable,
                             fixed
@@ -454,7 +408,6 @@ mod tests {
                                 + plan.bank_bytes
                                 + plan.vram_left
                         );
-                        // The host spill stays inside what the caller allowed.
                         assert!(plan.kv_host_positions * BYTES_PER_POSITION <= host_allowed);
                         if plan.kv_host_positions > 0 {
                             spilled += 1;
@@ -484,7 +437,6 @@ mod tests {
             plan_vram(&over, &kv(1), &e, 0, 0),
             Err(BudgetError::BadInput(_))
         ));
-        // Commitments beyond the card name both numbers.
         match plan_vram(&vbudget(GIB, 2 * GIB), &kv(1), &e, 0, 0) {
             Err(BudgetError::Overcommitted {
                 needed, available, ..
@@ -493,7 +445,6 @@ mod tests {
             }
             other => panic!("expected Overcommitted, got {other:?}"),
         }
-        // A KV product that overflows, and the three zero geometries.
         let zero_card = vbudget(max, 0);
         assert!(matches!(
             plan_vram(&zero_card, &kvz(max, 2), &e, 0, 0),
@@ -517,7 +468,6 @@ mod tests {
             plan_vram(&zero_card, &kvz(4, BYTES_PER_POSITION), &geom(8, 0), 0, 0),
             Err(bad_input("budget: expert layers must be nonzero"))
         );
-        // A minimum bank that not even a full card holds.
         match plan_vram(&vbudget(2 * GIB, 0), &kv(0), &e, 41, max) {
             Err(BudgetError::Overcommitted {
                 needed, available, ..
@@ -526,7 +476,6 @@ mod tests {
             }
             other => panic!("expected Overcommitted, got {other:?}"),
         }
-        // The host side refuses the same way: overflowing commitments, zero size.
         let host_over = HostBudget {
             total: max,
             non_reclaimable: max / 2 + 1,
@@ -557,7 +506,6 @@ mod tests {
         for extra in 0..=4u64 {
             let plan = plan_host(&host(), extra * GIB, EXPERT_BYTES).unwrap();
             assert_eq!(plan.host_kv, extra * GIB);
-            // Exactly one GiB of cache per host KV GiB, one-for-one.
             assert_eq!(plan.page_cache, base.page_cache - extra * GIB);
         }
         let lost = base.cached_experts
@@ -583,7 +531,6 @@ mod tests {
             }
             other => panic!("expected Overcommitted, got {other:?}"),
         }
-        // The boundary itself is legal: the cache goes to zero, never below.
         let edge = plan_host(&budget, cache, EXPERT_BYTES).unwrap();
         assert_eq!(
             (edge.page_cache, edge.cached_experts, edge.host_kv),

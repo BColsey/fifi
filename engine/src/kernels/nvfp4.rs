@@ -83,8 +83,6 @@ pub struct WeightBlock<'a> {
 }
 
 impl WeightBlock<'_> {
-    /// Decodes to F32, or F16 when the existing native-mlx half support is enabled on Apple Silicon.
-    /// Each row must contain complete groups. Output bytes use little-endian tensor storage.
     pub fn decode(&self, shape: &[u32], dtype: Dtype) -> Result<Tensor, EngError> {
         let width = match dtype {
             Dtype::F32 => 4,
@@ -143,7 +141,7 @@ impl WeightBlock<'_> {
     /// Computes y[r] = sum over c of W[r, c] * x[c] without materializing the matrix.
     ///
     /// The row is walked in column order, so the sum matches a decoded row dotted
-    /// with x in the same order. Each group scale is validated once.
+    /// with x in the same order.
     pub fn matvec(
         &self,
         rows: usize,

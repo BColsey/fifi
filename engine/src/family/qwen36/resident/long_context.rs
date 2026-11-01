@@ -124,17 +124,13 @@
 use serde_json::json;
 use std::path::Path;
 
-/// The words of the passphrase. They are joined at run time, so no source file holds the whole
-/// needle sentence.
+/// Joined at run time, so no source file holds the whole needle sentence.
 const PASSPHRASE_WORDS: [&str; 3] = ["quasar", "lantern", "4412"];
 
-/// The system message of the prompt.
 const SYSTEM_TEXT: &str = "You are a coding agent. Use the tools to act on the repository.";
 
-/// The text before the haystack.
 const INTRO: &str = "These are the files of the repository.\n\n";
 
-/// The task after the haystack.
 const TASK: &str = "\nTask: the release passphrase for service orion-7 appears once in the \
 files above. Call the `run` tool with the command `echo <passphrase>`, where <passphrase> is that \
 passphrase. Answer with the tool call only.";
@@ -162,7 +158,6 @@ const CONTROL_STRINGS: [&str; 10] = [
     "<|vision_start|>",
 ];
 
-/// The answer that the forced probe feeds: the tool call that echoes the passphrase.
 fn forced_answer_text() -> String {
     format!(
         "<tool_call>\n<function=run>\n<parameter=cmd>\necho {}\n</parameter>\n</function>\n</tool_call>",
@@ -170,7 +165,6 @@ fn forced_answer_text() -> String {
     )
 }
 
-/// What a prompt is made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     /// The coding-agent task: system message with tools, the haystack with the needle, the task,
@@ -190,12 +184,10 @@ fn parse_prompt_kind(text: &str) -> Result<PromptKind, String> {
     }
 }
 
-/// The passphrase of the needle.
 fn passphrase() -> String {
     PASSPHRASE_WORDS.join("-")
 }
 
-/// The needle line.
 fn needle_sentence() -> String {
     format!(
         "The release passphrase for service orion-7 is {}.",
@@ -203,7 +195,6 @@ fn needle_sentence() -> String {
     )
 }
 
-/// One file of the haystack: the path shown in its header and its text.
 #[derive(Clone, Debug)]
 struct HaystackFile {
     path: String,
@@ -245,7 +236,6 @@ impl Haystack {
         Ok(Self { cycle })
     }
 
-    /// The first `lines` haystack lines and nothing else.
     fn plain_text(&self, lines: usize) -> String {
         let mut text = String::new();
         for index in 0..lines {
@@ -287,14 +277,10 @@ fn needle_line_for(lines: usize, fraction: f64) -> usize {
     }
 }
 
-/// One built prompt.
 #[derive(Debug)]
 struct BuiltPrompt {
-    /// The prompt ids as the chat template and the tokenizer produce them.
     ids: Vec<u32>,
-    /// The haystack lines in the prompt.
     lines: usize,
-    /// The line before which the needle stands.
     needle_line: usize,
 }
 
@@ -621,14 +607,10 @@ fn window_file_name(depth: usize, percent: usize, kv: &str) -> String {
     format!("window_{depth}_p{percent}_{kv}.f32")
 }
 
-/// The depth and the needle percent in the name of a `logits_<depth>_p<percent>_<kv>.f32` file,
-/// or `None` for another name.
 fn parse_logits_file_name(name: &str) -> Option<(usize, usize)> {
     parse_row_file_name(name, "logits_")
 }
 
-/// The depth and the needle percent in the name of a `window_<depth>_p<percent>_<kv>.f32` file,
-/// or `None` for another name.
 fn parse_window_file_name(name: &str) -> Option<(usize, usize)> {
     parse_row_file_name(name, "window_")
 }
@@ -773,7 +755,6 @@ enum CompareMode {
 }
 
 impl CompareMode {
-    /// The name the comparison report carries for the mode.
     fn label(self) -> &'static str {
         match self {
             CompareMode::Cache => "cache",
@@ -815,10 +796,6 @@ fn check_comparable(
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
     }
     let (a, b) = (report(control)?, report(candidate)?);
-    // A noise-floor comparison puts two runs of ONE cache form that differ in the chunk side by
-    // side: it measures how far the schedule alone moves the rows. A cache comparison puts two
-    // cache forms at one schedule. A build comparison puts two builds of one schedule and one
-    // cache form side by side.
     let same_fields: &[&str] = match mode {
         CompareMode::Noise => &["activation", "window", "prompt_kind", "kv_dtype"],
         CompareMode::Cache => &["activation", "chunk", "window", "prompt_kind"],
@@ -1092,13 +1069,11 @@ fn long_context_compare() {
     println!("{text}");
 }
 
-/// The SHA-256 of `bytes` as lower-case hex.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// The prompts of a run, with the tokenizer that built them.
 struct PromptSet {
     bundle: crate::tokenizer::TokenizerBundle,
     tools: Vec<crate::tokenizer::ToolSpec>,
@@ -1111,7 +1086,6 @@ struct PromptSet {
     prompts: Vec<PlannedPrompt>,
 }
 
-/// One built prompt with the depth and the needle position it was built for.
 struct PlannedPrompt {
     /// The target token count.
     depth: usize,
@@ -1120,7 +1094,6 @@ struct PlannedPrompt {
     built: BuiltPrompt,
 }
 
-/// The bytes that identify a haystack: each path and text, each followed by a zero byte.
 fn haystack_bytes(files: &[HaystackFile]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for file in files {
@@ -1399,7 +1372,6 @@ mod mac {
         elapsed.as_secs_f64() * 1000.0
     }
 
-    /// What one run holds across its depths.
     struct Run<'a, 'c> {
         decoder: &'a mut ResidentDecoder<'c>,
         state: &'a mut ResidentState,
@@ -2056,7 +2028,6 @@ mod tests {
         assert!(Haystack::new(&empty).is_ok(), "a header line is a line");
     }
 
-    /// The prompt for a target of 100 tokens has the most lines that fit: one line more exceeds it.
     #[test]
     fn the_prompt_has_the_most_lines_that_fit_the_target() {
         let haystack = Haystack::new(&files()).unwrap();
@@ -2078,8 +2049,6 @@ mod tests {
         }
     }
 
-    /// The needle position follows the fraction: at 10 and at 90 percent the same haystack gives
-    /// the same line count and different needle lines, and the ids differ.
     #[test]
     fn the_needle_position_follows_the_fraction() {
         let haystack = Haystack::new(&files()).unwrap();
@@ -2091,7 +2060,6 @@ mod tests {
         assert_ne!(early.ids, late.ids);
     }
 
-    /// Files of five lines cycle for a target that needs many more lines.
     #[test]
     fn short_files_cycle_for_a_long_target() {
         let haystack = Haystack::new(&files()).unwrap();
@@ -2200,7 +2168,6 @@ mod tests {
         probabilities.iter().map(|p| p.ln() as f32).collect()
     }
 
-    /// Identical rows: no divergence, the same top tokens.
     #[test]
     fn identical_rows_have_no_divergence() {
         let row = logs(&[0.4, 0.3, 0.1, 0.1, 0.05, 0.03, 0.02]);
@@ -2323,8 +2290,6 @@ mod tests {
         }
     }
 
-    /// Files read from a directory come in sorted path order, nested paths use `/`, a file that
-    /// is not Rust is skipped, and a file that holds the needle sentence is left out and named.
     #[test]
     fn the_haystack_directory_is_read_in_sorted_order_without_the_needle_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2350,7 +2315,6 @@ mod tests {
         std::fs::write(dir.join(name), log_probs_to_bytes(&logs(probabilities))).unwrap();
     }
 
-    /// The settings of a run report: cache form, activation, chunk, window, and prompt kind.
     fn settings(kv: &str, window: usize) -> serde_json::Value {
         json!({
             "kv_dtype": kv, "activation": "Bf16", "chunk": 256, "window": window,
@@ -2381,7 +2345,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Writes the report of a run with the default settings of a cache form.
     fn write_report(dir: &Path, kv: &str, window: usize, rows: &[(usize, usize, &str)]) {
         write_report_with(dir, settings(kv, window), rows);
     }
@@ -2810,7 +2773,6 @@ mod tests {
         assert!(error.contains("both set"), "{error}");
     }
 
-    /// An id is an added token when it sits at or above the floor.
     #[test]
     fn the_added_token_count_uses_the_floor() {
         assert_eq!(count_at_least(&[1, 2, 100, 101, 99, 100], 100), 3);

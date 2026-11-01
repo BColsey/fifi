@@ -47,7 +47,6 @@ use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
 pub(crate) struct CpfDnGeometry {
     /// f32 columns of one conv row (`(2 * n_k + n_v) * head_dim`).
     pub(crate) channels: usize,
-    /// Value heads of the scan (`n_v_heads`).
     pub(crate) value_heads: usize,
     /// Key/value head dimension (the compiled case is 128; the sizing stays generic).
     pub(crate) head_dim: usize,
@@ -61,11 +60,9 @@ pub(crate) struct CpfDnChunkBytes {
     /// The scan output rows, written pre-norm and gated in place: `m * value_heads *
     /// head_dim * 4`.
     pub(crate) scan_out: usize,
-    /// `conv_out + scan_out`.
     pub(crate) total: usize,
 }
 
-/// A `BadRequest` of this module.
 fn refuse(detail: &str) -> EngError {
     EngError::BadRequest(format!("cpf_dn: {detail}"))
 }
@@ -175,7 +172,6 @@ pub(crate) struct ScanBytes {
     pub(crate) o_out: usize,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("gdn_scan_seq: {tag}: {detail}"))
 }

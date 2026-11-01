@@ -1,5 +1,3 @@
-//! Mac MLX adapter for the Flash-Next projection seam, and oracle parity tests.
-
 use super::stored::{self, StoredWeight};
 use crate::family::project::Projector;
 use crate::{
@@ -9,14 +7,12 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Executes Flash-Next projections with MLX host operations over streamed checkpoint weights.
 pub(crate) struct MlxProjector<'c> {
     kernels: MlxKernels,
     ckpt: &'c StreamedCheckpoint,
 }
 
 impl<'c> MlxProjector<'c> {
-    /// Creates an adapter with its own MLX kernels.
     pub(crate) fn new(ckpt: &'c StreamedCheckpoint) -> Result<Self, EngError> {
         Ok(Self {
             kernels: MlxKernels::try_new()?,
@@ -32,7 +28,6 @@ fn backend(message: &str) -> EngError {
     }
 }
 
-/// Packs one activation vector as a `[1, len]` f32 host tensor.
 fn activation(x: &[f32]) -> Result<Tensor, EngError> {
     let len = u32::try_from(x.len())
         .map_err(|_| EngError::BadRequest("activation has too many values".into()))?;
@@ -40,7 +35,6 @@ fn activation(x: &[f32]) -> Result<Tensor, EngError> {
     Tensor::try_from_host(Dtype::F32, vec![1, len], bytes)
 }
 
-/// Reads an f32 projection output as values in row-major order.
 fn values(t: &Tensor) -> Result<Vec<f32>, EngError> {
     if t.dtype() != Dtype::F32 {
         return Err(backend("projection output is not f32"));
@@ -58,7 +52,6 @@ fn values(t: &Tensor) -> Result<Vec<f32>, EngError> {
         .collect())
 }
 
-/// Returns one logical dimension of a packed weight, or BadRequest when the axis is absent.
 fn logical_dim(weight: &PackedWeight, axis: usize) -> Result<usize, EngError> {
     weight
         .logical_shape()
@@ -67,7 +60,6 @@ fn logical_dim(weight: &PackedWeight, axis: usize) -> Result<usize, EngError> {
         .ok_or_else(|| EngError::BadRequest("packed weight has no such logical dimension".into()))
 }
 
-/// Returns the projection output when it holds exactly `want` values.
 fn check_output(out: Vec<f32>, want: usize) -> Result<Vec<f32>, EngError> {
     if out.len() == want {
         Ok(out)
@@ -154,7 +146,6 @@ pub(super) mod tests {
     pub(in crate::family::flash_next) const COS_END: f64 = 0.999;
     pub(in crate::family::flash_next) const REL_END: f64 = 0.05;
 
-    /// Accumulates gate lines and failing labels for one parity run.
     #[derive(Default)]
     pub(in crate::family::flash_next) struct Gate {
         pub(in crate::family::flash_next) report: String,
@@ -163,7 +154,6 @@ pub(super) mod tests {
     }
 
     impl Gate {
-        /// Compares one output with its oracle row and records the relative error and cosine.
         pub(in crate::family::flash_next) fn check(
             &mut self,
             label: &str,
@@ -204,7 +194,6 @@ pub(super) mod tests {
             }
         }
 
-        /// Returns the block value, or records its error under the label.
         pub(in crate::family::flash_next) fn take<T>(
             &mut self,
             label: &str,
@@ -221,7 +210,6 @@ pub(super) mod tests {
         }
     }
 
-    /// Attention state for one decoder layer.
     enum AttnState {
         Delta(DeltaState),
         Qsa(QsaCache),
@@ -231,7 +219,6 @@ pub(super) mod tests {
         PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set")))
     }
 
-    /// Returns the `weight_map` object of a safetensors index.
     fn weight_map(index: &[u8]) -> serde_json::Map<String, serde_json::Value> {
         let value: serde_json::Value = serde_json::from_slice(index).unwrap();
         value["weight_map"].as_object().unwrap().clone()
@@ -262,7 +249,6 @@ pub(super) mod tests {
         StreamedCheckpoint::open(&index, shards, 64 << 20).unwrap()
     }
 
-    /// Reads `{name}.f32` as five equal rows of little-endian f32 values.
     pub(in crate::family::flash_next) fn oracle(dir: &Path, name: &str) -> Vec<Vec<f32>> {
         let bytes = std::fs::read(dir.join(format!("{name}.f32"))).unwrap();
         assert!(
@@ -616,7 +602,6 @@ pub(super) mod tests {
         assert!(gate.failures.is_empty(), "{:?}", gate.failures);
     }
 
-    /// Builds an in-memory safetensors checkpoint from named tensors.
     fn checkpoint(tensors: &[(&str, &str, Vec<u32>, Vec<u8>)]) -> StreamedCheckpoint {
         let mut header = serde_json::Map::new();
         let mut payload = Vec::new();
@@ -659,7 +644,6 @@ pub(super) mod tests {
         ])
     }
 
-    /// Returns the affine int4 layout used by the stack checkpoint.
     fn affine4() -> QuantizationSpec {
         QuantizationSpec {
             mode: QuantizationMode::Affine,

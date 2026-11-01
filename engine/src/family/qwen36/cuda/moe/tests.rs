@@ -22,7 +22,6 @@ fn step_dims() -> StepDims {
     StepDims::new(&shape, &inventory).expect("checked dims")
 }
 
-/// The MoE block dims of the fixture at `rows` rows.
 pub(super) fn moe_dims(rows: usize) -> MoeDims {
     MoeDims::new(&step_dims(), rows)
 }
@@ -185,7 +184,6 @@ fn bytes_of(plan: &StepPlan, slot: Slot) -> (usize, usize) {
     )
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 pub(super) fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");
@@ -463,7 +461,6 @@ fn the_native_block_needs_the_q8_1_pack_sizes() {
         down: facts.expert.packs.down,
         shared: facts.expert.packs.shared,
     };
-    // The Q8 kind over the Tiled fp16 sizes is refused before any launch.
     assert_bad_request(
         check_block(&dims, &weight_facts(&dims), &facts),
         "fp16 sizes under the q8 kind",

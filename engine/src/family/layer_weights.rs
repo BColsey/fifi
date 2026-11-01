@@ -6,10 +6,8 @@ use crate::kernels::{PackedWeight, QuantizationMode, QuantizationSpec};
 use crate::tensor::{Dtype, Tensor};
 use crate::weights::WeightSource;
 
-/// One checked packed projection or expert stack.
-///
-/// The constructor validates payload, scale, and bias storage against the logical shape and the
-/// quantization the weight plan resolved. The checked `PackedWeight` is the only stored state.
+/// Validated at construction: payload, scale, and bias storage are checked against the
+/// logical shape and the quantization the weight plan resolved.
 #[derive(Debug)]
 pub struct ProjectionWeights {
     packed: PackedWeight,
@@ -370,8 +368,7 @@ mod tests {
     use serde_json::{Map, Value, json};
     use std::{io::Cursor, sync::Arc};
 
-    // Independent small geometry: H=64, I=128, Q=4, KV=2, D=16, affine 6-bit group-64.
-    // Only dense MLP, attention, and norm tensors exist; there is no router or expert stack.
+    // Independent small geometry, deliberately not any family's dimensions.
     fn dense_fixture() -> Vec<u8> {
         let mut header = Map::new();
         let mut body = Vec::new();

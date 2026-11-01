@@ -149,7 +149,6 @@ fn first_delta(weights: &super::weights::ResidentWeights) -> Result<&RDelta, Eng
         .ok_or_else(|| EngError::BadRequest("no DeltaNet layer".into()))
 }
 
-/// The weights of the first MoE layer.
 fn first_moe(weights: &super::weights::ResidentWeights) -> Result<&RMoe, EngError> {
     weights
         .layers
@@ -2574,7 +2573,6 @@ mod fault_tests {
         ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])
     }
 
-    /// Runs one compiled device-routed MoE step on the zero input of the tiny model.
     fn one_compiled_moe_step() -> Result<(), EngError> {
         let (ckpt, host) = tiny_host();
         let mut decoder = ResidentDecoder::new_with_activation(

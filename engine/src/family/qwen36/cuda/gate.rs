@@ -142,8 +142,6 @@ fn flag(v: &Value, key: &str) -> Result<bool, EngError> {
         .ok_or_else(|| EngError::BadRequest(format!("gate settings: {key} is not a boolean")))
 }
 
-/// The `kv_mode` member: "fp16" or "int8g32", anything else is a typed error naming the key; the
-/// legacy boolean `kv_fp16` of the stage-1 schema is refused pointing at `kv_mode`.
 fn kv_mode_member(v: &Value) -> Result<KvMode, EngError> {
     if v.get("kv_fp16").is_some() {
         return Err(EngError::BadRequest(
@@ -182,8 +180,6 @@ impl FromStr for GateSettings {
             capture: flag(&v, "capture")?,
             kv_mode: kv_mode_member(&v)?,
             deadline_secs: number(&v, "deadline_secs")?,
-            // The ONE optional key: absent means native (the qualified default), anything but
-            // "tiled" and "native" is a typed error naming the key.
             layout: match v.get("layout") {
                 None => WeightLayout::Native,
                 Some(value) => match value.as_str() {
@@ -413,8 +409,6 @@ mod tests {
         ] {
             rejects_naming(&GOOD.replace("\"kv_mode\":\"fp16\"", bad), "kv_mode");
         }
-        // The Int8G32 KV mode takes the native layout only: the Tiled pair is refused naming
-        // the mode and the layout, with the default (native) layout accepted above.
         let tiled_q8 = GOOD
             .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
             .replace("\"capture\":true", "\"capture\":true,\"layout\":\"tiled\"");

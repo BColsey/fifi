@@ -219,7 +219,6 @@ pub(crate) enum WeightFormat {
     Exl3,
 }
 
-/// The config text of `weight_format`.
 pub(crate) fn weight_format_name(format: WeightFormat) -> &'static str {
     match format {
         WeightFormat::Gguf => "gguf",
@@ -308,7 +307,6 @@ pub(crate) struct TieredOptions {
     pub(crate) preload: Option<bool>,
 }
 
-/// The checked tiered settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TieredSettings {
     pub(crate) slots: usize,
@@ -333,7 +331,6 @@ pub(crate) enum Activation {
     Bf16,
 }
 
-/// The config text of `activation`.
 pub(crate) fn activation_name(activation: Activation) -> &'static str {
     match activation {
         Activation::F32 => "f32",
@@ -442,7 +439,6 @@ pub(crate) fn parse_activation(text: &str) -> Result<Activation, EngError> {
     }
 }
 
-/// The activation dtype of `text`, the raw member value: `None` is the default `bf16`.
 pub(crate) fn activation_of(text: Option<&str>) -> Result<Activation, EngError> {
     match text {
         None => Ok(Activation::Bf16),
@@ -495,7 +491,6 @@ pub(crate) enum KvDtype {
     Q8,
 }
 
-/// The config text of `kv_dtype`.
 pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
     match kv {
         KvDtype::F32 => "f32",
@@ -504,8 +499,8 @@ pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
     }
 }
 
-/// Parses the `kv_dtype` member: `f32` or `q8`. Any other text is refused in the style of the
-/// numeric members.
+/// Parses the `kv_dtype` member: `f32`, `bf16`, or `q8`. Any other text is refused in the style
+/// of the numeric members.
 pub(crate) fn parse_kv_dtype(text: &str) -> Result<KvDtype, EngError> {
     match text {
         "f32" => Ok(KvDtype::F32),
@@ -606,7 +601,6 @@ fn bad(message: String) -> EngError {
     EngError::BadRequest(format!("engine config: {message}"))
 }
 
-/// `value` or `default`, which must lie in `low..=high`.
 fn ranged<T: Copy + PartialOrd + std::fmt::Display>(
     key: &str,
     value: Option<T>,
@@ -643,7 +637,6 @@ fn cache_limit(options: &Q36Options, env: &Q36Env) -> Result<u64, EngError> {
     Ok(limit)
 }
 
-/// `value` when it is set, which must be at least 1.
 fn at_least_one(key: &str, value: Option<u64>) -> Result<Option<u64>, EngError> {
     value
         .map(|value| ranged(key, Some(value), 1, 1, u64::MAX))
@@ -828,7 +821,6 @@ impl Q36Settings {
         )
     }
 
-    /// Reads the shared options for the selected descriptor. Dense execution is MLX-only.
     pub(crate) fn new_for_family(
         model_dir: &Path,
         tokenizer_dir: &Path,
@@ -1355,7 +1347,6 @@ mod tests {
         }
     }
 
-    /// The message of a refused call of any kind.
     fn error_text<T: std::fmt::Debug>(result: Result<T, EngError>) -> String {
         match result {
             Err(EngError::BadRequest(text)) => text,
@@ -1530,7 +1521,6 @@ mod tests {
                 format!("engine config: weight_format exl3 does not support {key}")
             );
         }
-        // The plain EXL3 entry passes the settings.
         let plain = settings_for(
             Some(&exl3_options(|_| ())),
             &Q36Env::default(),

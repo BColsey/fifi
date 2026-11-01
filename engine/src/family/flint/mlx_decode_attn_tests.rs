@@ -71,8 +71,7 @@ fn t1_decode_routing_follows_the_decode_attn_flag() {
     );
     // v2 note: with =1 the route is the VENDOR fused SDPA, so the logits hash
     // is no longer bitwise-equal to the flag-off flash hash; the oracle test
-    // below owns the tolerance contract (old v1 comment: the decode entry launches the
-    // same kernel, so the outputs are bit-identical).
+    // below owns the tolerance contract.
     let f32_out = k.cast(&out, Dtype::F32).unwrap();
     let host = k.readback(&f32_out).unwrap();
     let bytes = host.host_bytes().unwrap();
@@ -113,7 +112,6 @@ fn t1_f32_routing_follows_the_t1_flash_flag() {
     let value_planes = f32_planes(&mut k, true);
     let keys = k.reshape(&key_planes, &[1, 4, 64, 128]).unwrap();
     let values = k.reshape(&value_planes, &[1, 4, 64, 128]).unwrap();
-    // The F32 query row: the production per-token arm is F32, not BF16.
     let mut data = Vec::new();
     for head in 0..32u32 {
         for column in 0..128u32 {
@@ -217,7 +215,6 @@ fn flint_layer_compile_probe_host_time() {
     drop(eager_once(&mut k));
     let warm_compiled = compiled_once(&mut k);
 
-    // Bitwise identity of the two arms before any timing.
     let warm_eager = eager_once(&mut k);
     let read = |k: &mut MlxKernels, t: &ExecutionTensor| {
         let host = k.readback(t).unwrap();
@@ -352,7 +349,6 @@ fn ring_view_flag_polarity_and_routes() {
         one_row,
         chained,
     };
-    // Both polarities of the full route candidate, through the pure form.
     assert!(ring_view_routes_with(geo(true, false, true, true), true));
     assert!(!ring_view_routes_with(geo(true, false, true, true), false));
     assert!(

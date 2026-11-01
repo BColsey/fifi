@@ -170,14 +170,12 @@ fn run_jobs_at(
     })
 }
 
-/// The rows of one member through the single-matrix rows entry, padded to 64 rows.
 fn single(rig: (&CudaContext, &DeviceStream), bank: &Bank, member: usize, x: &[f32]) -> Vec<f32> {
     x.chunks(144 * bank.k)
         .flat_map(|rows| single_call(rig, bank, member, rows))
         .collect()
 }
 
-/// At most 144 rows: one call, padded to 64 rows.
 fn single_call(
     (ctx, stream): (&CudaContext, &DeviceStream),
     bank: &Bank,
@@ -326,7 +324,6 @@ fn every_job_equals_its_member_through_the_rows_entry_and_nothing_else_moves() {
                         }
                     }
                 }
-                // The columns outside the call's window keep their fill.
                 for row in 0..total {
                     for c in (0..col).chain(col + n..ld) {
                         assert_eq!(run.out[row * ld + c].to_bits(), canary(), "gap {row}/{c}");
@@ -764,7 +761,6 @@ fn a_job_outside_its_bounds_is_skipped_and_flags_the_call() {
         table[1] = bad;
         let run = run_jobs(rig, &bank, &table, &x, (N, 0)).expect("jobs");
         assert_eq!(run.flag & 1, 1, "{name}: the flag");
-        // The other jobs still equal their members.
         for index in [0usize, 2] {
             let job = jobs[index];
             let (row0, rows) = (job.row0 as usize, job.rows as usize);
@@ -793,7 +789,6 @@ fn a_job_outside_its_bounds_is_skipped_and_flags_the_call() {
             );
         }
     }
-    // A job taller than max_rows is refused by the device too.
     let tall = [
         Exl3Job {
             member: 0,

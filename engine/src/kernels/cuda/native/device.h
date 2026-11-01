@@ -80,7 +80,6 @@ template <typename T> struct DeviceBuffer {
     }
 };
 
-/* Writes stage to *out_stage when the caller asked for it. */
 static inline void report_stage(int *out_stage, int stage) {
     if (out_stage != NULL) {
         *out_stage = stage;

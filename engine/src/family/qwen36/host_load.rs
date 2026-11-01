@@ -22,7 +22,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Prefix of every language-model tensor name.
 const MODEL: &str = "language_model.model.";
 
 struct OwnedDelta {
@@ -80,7 +79,6 @@ struct OwnedLayer {
     feed_forward: OwnedFeedForward,
 }
 
-/// Owned weights of the host reference.
 pub(crate) struct HostWeights {
     shape: HostShape,
     embed: StoredWeight,
@@ -147,7 +145,6 @@ pub(crate) fn rotary_dim(config: &[u8], head_dim: u32) -> Result<u32, EngError> 
     Ok(rotary)
 }
 
-/// Reads checkpoint tensors through the quantization map and records each key read.
 struct Loader<'a> {
     ckpt: &'a StreamedCheckpoint,
     quant: QuantizationMap,
@@ -188,7 +185,6 @@ impl Loader<'_> {
         Ok(StoredWeight::Sliced(weight))
     }
 
-    /// A dense tensor of `len` elements as host `f32`.
     fn floats(&mut self, key: &str, len: usize) -> Result<Vec<f32>, EngError> {
         let values = stored::host_f32(self.ckpt, key, len)?;
         self.keys.insert(key.to_string());
@@ -201,7 +197,6 @@ fn dim(value: usize) -> Result<u32, EngError> {
 }
 
 impl HostWeights {
-    /// Checks `config` against `spec`, then loads the resident tensors from `ckpt`.
     pub(crate) fn load(
         ckpt: &StreamedCheckpoint,
         spec: &FamilySpec,
@@ -259,7 +254,6 @@ impl HostWeights {
         })
     }
 
-    /// The checked dimensions.
     pub(crate) fn shape(&self) -> &HostShape {
         &self.shape
     }

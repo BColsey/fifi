@@ -32,7 +32,6 @@ const PREFIX_ROWS: usize = 1_024;
 const QUANTUM: f64 = 1.0 / (1_u64 << 45) as f64;
 /// The unit scale: the host draw of the 53-bit unit U is `U * 2^-53`.
 const UNIT_SCALE: f64 = 1.0 / (1_u64 << 53) as f64;
-/// Row tags for the per-cell seeds.
 const TAG_RANDOM: u64 = 1;
 const TAG_SPREAD: u64 = 2;
 const TAG_TIES: u64 = 3;
@@ -344,7 +343,6 @@ fn spans_vanishing_tail(
     true
 }
 
-/// Tallies of one grid run.
 #[derive(Default, Debug)]
 struct Counts {
     draws: u64,
@@ -416,7 +414,6 @@ fn check_draw(
     let argmax = argmax_token(logits);
     let (host_token, host_keep) = pick(logits, temperature, top_p, top_k, unit, label);
     if top_k == 1 || top_p == 0.0 {
-        // Greedy cells return the argmax exactly on both sides; no certificate is allowed.
         assert_eq!(canonical_token, argmax, "canonical greedy token: {label}");
         assert_eq!(host_token, argmax, "host greedy token: {label}");
         assert_eq!(canonical_keep, 1, "canonical greedy keep: {label}");
@@ -852,7 +849,6 @@ fn run_full_size_cells(counts: &mut Counts) {
     }
 }
 
-/// Runs the default grid and returns its tallies.
 fn run_default_grid() -> Counts {
     let mut counts = Counts::default();
     run_hand_cases();

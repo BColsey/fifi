@@ -645,8 +645,6 @@ fn an_mxfp4_module_assembles_a_packed_weight() {
     assert!(packed.biases().is_none());
 }
 
-// Limit validation, header error context, and non-power-of-two widths.
-
 #[test]
 fn zero_limits_fail_with_bad_request() {
     let f = fixture();
@@ -732,7 +730,6 @@ fn a_header_key_that_the_plan_omits_fails_with_the_shard_and_key() {
     );
 }
 
-/// Fails every seek, as a broken device would.
 struct SeekFails;
 
 impl Read for SeekFails {
@@ -762,7 +759,6 @@ fn a_shard_whose_seek_fails_is_rejected_with_the_shard_name() {
     );
 }
 
-/// Seeks to the end, then fails the seek back to the start.
 struct SeekToStartFails;
 
 impl Read for SeekToStartFails {

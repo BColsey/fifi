@@ -84,7 +84,6 @@ impl WeightSource for IndexedWeights {
     }
 }
 
-/// Parses an index and maps each tensor key to its shard basename.
 pub(super) fn parse_weight_map(index: &[u8]) -> Result<BTreeMap<String, String>, EngError> {
     let index = serde_json::from_slice::<UniqueValue>(index)
         .map_err(|error| EngError::Checkpoint(format!("index JSON: {error}")))?
@@ -124,7 +123,6 @@ fn valid_shard_name(name: &str) -> bool {
             .any(|b| b.is_ascii_control() || b == b'/' || b == b'\\')
 }
 
-/// Requires the supplied shard names to equal the shard names the index references.
 pub(super) fn check_shard_set(
     weight_map: &BTreeMap<String, String>,
     supplied: &BTreeSet<&str>,

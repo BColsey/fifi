@@ -29,7 +29,6 @@ fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<DeviceBuffer, EngErro
     ctx.upload(bytes)
 }
 
-/// The fallible upload of `values` for the Result-only device phases.
 fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
     let bytes: Vec<u8> = values
         .iter()
@@ -38,12 +37,10 @@ fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngErro
     upload_bytes(ctx, &bytes)
 }
 
-/// The fallible upload of `len` bytes that all equal `byte`.
 fn upload_filled(ctx: &CudaContext, byte: u8, len: usize) -> Result<DeviceBuffer, EngError> {
     upload_bytes(ctx, &vec![byte; len])
 }
 
-/// The fallible download of the first `len` bytes of `buffer`.
 fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>, EngError> {
     let mut bytes = vec![0u8; len];
     ctx.download(buffer, &mut bytes)?;
@@ -76,7 +73,6 @@ const HEADROOM: f64 = 1.0 / 524_288.0;
 const F16_NAN: u16 = 0x7e00;
 const GROUP: usize = 8;
 
-/// One call: geometry, split plan, data parameters. `kv_len` is the device word.
 #[derive(Clone)]
 struct Spec {
     m: usize,
@@ -113,7 +109,6 @@ impl Spec {
             qsd: 1.2,
         }
     }
-    /// A windowed or ring cache of another head size, 16 query heads over 2 kv heads.
     fn other(head_dim: usize, window: i64, ring: i64, cells: usize, gate: bool) -> Self {
         Self {
             head_dim,
@@ -161,7 +156,6 @@ impl Spec {
             self.qsd
         )
     }
-    /// The positions token `t` sees: `p <= P` and, with a window, `P - p < window`.
     fn visible(&self, t: usize) -> std::ops::Range<i64> {
         let last = i64::from(self.kv_len) - 1 + t as i64;
         let first = if self.window > 0 {
@@ -171,11 +165,9 @@ impl Spec {
         };
         first..last + 1
     }
-    /// The cache cell of position `p`.
     fn cell_of(&self, p: i64) -> usize {
         usize::try_from(if self.ring > 0 { p % self.ring } else { p }).expect("a non-negative cell")
     }
-    /// Cells that some token reads.
     fn readable(&self) -> Vec<bool> {
         let mut cells = vec![false; self.cells];
         for t in 0..self.m {
@@ -187,7 +179,6 @@ impl Spec {
     }
 }
 
-/// Host data of one call: q, the gate rows, and the four KV8 planes.
 struct Problem {
     spec: Spec,
     q: Vec<f32>,
@@ -271,7 +262,6 @@ fn problem(spec: &Spec, all_finite: bool) -> Problem {
     }
 }
 
-/// How `part` starts: NaN, or finite values drawn from a seed.
 #[derive(Clone, Copy)]
 enum PartFill {
     Nan,
@@ -306,8 +296,6 @@ fn whole(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     b.range(0, b.bytes())
 }
 
-/// Uploads the problem, queues one call, waits and returns `out` through `?`. `out` starts as
-/// 0xFF bytes. Called only inside a Result-only device phase.
 fn launch(rig: &Rig, p: &Problem, fill: PartFill) -> Result<Vec<f32>, EngError> {
     let (ctx, s) = (&rig.ctx, &p.spec);
     let part_len = attn_q8_part_bytes(s.m, s.n_kv_head, s.head_dim, s.split.max_splits)?;
@@ -341,7 +329,6 @@ fn launch(rig: &Rig, p: &Problem, fill: PartFill) -> Result<Vec<f32>, EngError> 
     Ok(testkit::floats(&read_bytes(ctx, &out, out_len)?))
 }
 
-/// The dequantized value of `codes[cell * d + dim]` against `scales[cell * groups + dim / 32]`.
 fn value(codes: &[i8], scales: &[u16], cell: usize, dim: usize, head: usize, spec: &Spec) -> f64 {
     let (per_head_codes, groups) = (spec.cells * spec.head_dim, spec.head_dim / 32);
     let code = codes[head * per_head_codes + cell * spec.head_dim + dim];
@@ -349,7 +336,6 @@ fn value(codes: &[i8], scales: &[u16], cell: usize, dim: usize, head: usize, spe
     f64::from(code) * f64::from(f16_to_f32(bits))
 }
 
-/// The f64 reference of head `h` of token `t`.
 fn reference(p: &Problem, t: usize, h: usize) -> Vec<f64> {
     let s = &p.spec;
     let (d, kvh) = (s.head_dim, h / GROUP);
@@ -385,9 +371,6 @@ fn reference(p: &Problem, t: usize, h: usize) -> Vec<f64> {
     out
 }
 
-/// Worst `max|dev - ref| / max(max|ref|, 1)` over the head vectors of `heads` for every token,
-/// with the first non-finite head vector (none expected). The computation asserts nothing: the
-/// caller asserts after the device phase has dropped every owner.
 fn worst_error(p: &Problem, out: &[f32], heads: &[usize]) -> (f64, Option<(usize, usize)>) {
     let s = &p.spec;
     let mut worst = 0.0f64;
@@ -408,7 +391,6 @@ fn worst_error(p: &Problem, out: &[f32], heads: &[usize]) -> (f64, Option<(usize
     (worst, non_finite)
 }
 
-/// A device context and its stream, owned by one device phase.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -422,8 +404,6 @@ impl Rig {
     }
 }
 
-/// One measured device run: the spec label, the worst error, whether the case is a stress
-/// case, and the first non-finite head vector (none expected).
 struct RunOutcome {
     label: String,
     error: f64,
@@ -431,8 +411,7 @@ struct RunOutcome {
     non_finite: Option<(usize, usize)>,
 }
 
-/// Runs `spec` on the device and measures it against the host reference. Asserts nothing: the
-/// caller asserts after the device phase drops every owner.
+/// Asserts nothing: the caller asserts after the device phase drops every owner.
 fn run_case(rig: &Rig, spec: &Spec, heads: &[usize]) -> Result<RunOutcome, EngError> {
     let p = problem(spec, false);
     let (error, non_finite) = worst_error(&p, &launch(rig, &p, PartFill::Nan)?, heads);
@@ -478,13 +457,11 @@ fn reference_phase(specs: &[(Spec, Vec<usize>)]) -> Result<Vec<RunOutcome>, EngE
         .collect()
 }
 
-/// The device phase of the all-heads reference runs, for the geometry sweeps.
 fn reference_phase_all(specs: &[Spec]) -> Result<Vec<RunOutcome>, EngError> {
     let rig = Rig::new()?;
     specs.iter().map(|spec| run_all(&rig, spec)).collect()
 }
 
-/// Prints the in-range and the stress maxima, with the headroom and stress warnings.
 fn report(test: &str, outcomes: &[(f64, bool)]) {
     let top = |stress: bool| {
         outcomes
@@ -540,8 +517,6 @@ fn attn_decode_q8_matches_the_host_reference() {
             (0..16).collect(),
         )
     }));
-    // The long-context rows, one head per kv head: 32,768 and 131,072 keys (both inside one
-    // hold of the gate run).
     for kv_len in [32_768_u32, 131_072] {
         let spec = Spec {
             cells: kv_len as usize + 64,
@@ -604,15 +579,12 @@ fn attn_decode_q8_matches_the_reference_for_head_128_window_ring_and_no_gate() {
     );
 }
 
-/// One determinism outcome: the spec label and the `out` vectors of its two launches.
 struct PairOutcome {
     label: String,
     first: Vec<f32>,
     second: Vec<f32>,
 }
 
-/// The device phase of the determinism cases: two launches per spec (the `part` scratch drawn
-/// from two different seeds), every owner dropped before the plain vectors return.
 fn determinism_phase(specs: &[Spec]) -> Result<Vec<PairOutcome>, EngError> {
     let rig = Rig::new()?;
     let mut outcomes = Vec::new();
@@ -668,15 +640,11 @@ fn launch_finite(rig: &Rig, spec: &Spec) -> Result<Vec<f32>, EngError> {
     launch(rig, &problem(spec, true), PartFill::Nan)
 }
 
-/// One invalid-length outcome: its label and the device `out` of the launch.
 struct InvalidOutcome {
     label: String,
     out: Vec<f32>,
 }
 
-/// The device phase of the invalid-length cases: the linear and ring words that must mark the
-/// whole `out` NaN, then the two valid boundary runs, every owner dropped before the plain
-/// vectors return.
 fn invalid_length_phase(
     linear: &Spec,
     ring: &Spec,
@@ -808,7 +776,6 @@ fn attn_decode_q8_poison_reaches_the_heads_of_a_nan_stored_group() {
     p.k_scales[at] = F16_NAN;
     p.v_scales[at] = F16_NAN;
     let out = poison_device_phase(&p).expect("the device phase of the poison row");
-    // Host data only from here (the phase dropped every owner before it returned).
     for h in 0..spec.n_head {
         let row = &out[h * spec.head_dim..][..spec.head_dim];
         if h / GROUP == kvh {
@@ -845,8 +812,6 @@ fn attn_q8_part_bytes_pins_the_scratch_rule() {
     }
 }
 
-// ---- refusals before any launch ----
-
 /// Where a range lives: its buffer holds `offset + bytes` bytes. Slots: q, proj, k_codes,
 /// k_scales, v_codes, v_scales, kv_len, part, out.
 #[derive(Clone, Copy)]
@@ -865,7 +830,6 @@ const KV: usize = 6;
 const PART: usize = 7;
 const OUT: usize = 8;
 
-/// A call that one edit makes bad: the geometry, plus the byte layout of every range.
 #[derive(Clone)]
 struct Plan {
     spec: Spec,
@@ -880,7 +844,6 @@ struct Plan {
 }
 
 impl Plan {
-    /// A valid call: Qwen shape, one token, a 4-cell cache, every buffer exactly sized.
     fn base() -> Self {
         let spec = Spec {
             cells: 4,
@@ -934,9 +897,6 @@ impl Plan {
     }
 }
 
-/// Runs the call of `plan` (buffers sized by the slots; the length word is 1) and returns the
-/// result of the call and the `out` bytes afterwards through `?`. `other` supplies the foreign
-/// stream and buffer. Called only inside a Result-only device phase.
 fn attempt(
     rig: &Rig,
     other: &Rig,
@@ -1173,7 +1133,6 @@ fn refusals() -> Vec<Row> {
     ]
 }
 
-/// Calls that are valid at their boundary: each launches and gives finite output.
 fn accepted() -> Vec<(&'static str, Edit)> {
     vec![
         ("ring == cells", |p: &mut Plan| {
@@ -1288,8 +1247,6 @@ fn attn_decode_q8_rejects_bad_calls_before_any_launch() {
         "the base call after the refusals"
     );
 }
-
-// ---- the split-combine order, pinned bit-exactly against the kernel's own partials ----
 
 /// The gate value of every gate row of the pin: 0, so the sigmoid `1 / (1 + expf(-0))` is
 /// exactly 0.5 on the host and the device (the former value 30 made it exactly 1, which left
@@ -1540,8 +1497,6 @@ fn pin_host_combine(p: &Problem, t: usize, h: usize, part: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// One case of the pin on the device: geometry, the skewed split (none or 1), whether every
-/// split also holds a near-hot key, and the seed.
 struct PinCase {
     label: &'static str,
     spec: Spec,
@@ -1550,8 +1505,6 @@ struct PinCase {
     seed: u64,
 }
 
-/// One device result: the case label, its problem, the device `out`, the device `part`, and
-/// the f64 score gap the case opened (0.0 without a skew or near-hot fillers).
 struct PinOutcome {
     label: &'static str,
     problem: Problem,
@@ -2152,7 +2105,6 @@ fn attn_decode_q8_prefetch_arm_is_bit_equal() {
                 );
             }
         }
-        // Guards: a kernel that read or wrote past its buffers cannot pass this.
         assert_eq!(
             legacy.part_guard,
             vec![0xA5; GUARD],
@@ -2322,8 +2274,6 @@ fn attn_decode_q8_split_plan_pin_64_cap_at_64k_keys() {
         "one key past the edge, n_keys + chunk = INT_MAX + 1 overflows the addition"
     );
 
-    // Sweep: the host mirror must equal the pure-Rust model of the device arithmetic
-    // for every plausible key count and the four qualification caps.
     for cap in [1, 41, 61, 64, 128] {
         for keys in 1..=70_000 {
             let host = attn_decode_q8_split_plan(keys, cap, 64).expect("sweep host");

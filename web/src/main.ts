@@ -1,7 +1,6 @@
 /**
- * Boot, view routing, and event wiring. Views own their content; this
- * module owns the shell: routing, the status pill, the model picker, the
- * chat list.
+ * Views own their content; this module owns the shell: routing, the
+ * status pill, the model picker, the chat list.
  */
 
 import { ApiError, getHealth, getReady, listModels, type Model } from "./api";
@@ -60,8 +59,6 @@ function main(): void {
   const about = new AboutView(el<HTMLElement>("view-about"));
   const monitor = new MonitorView(el<HTMLElement>("view-monitor"));
   const drawer = new Drawer(el<HTMLElement>("drawer-root"));
-
-  /* Dismissible notices for storage failures */
 
   const noticeHost = document.createElement("div");
   noticeHost.className = "notice-host";
@@ -140,8 +137,6 @@ function main(): void {
     }
   );
 
-  /* Status pill */
-
   let serverReachable = false;
   let serverReady = false;
   let currentPill: PillState = "offline";
@@ -154,12 +149,8 @@ function main(): void {
     announce(pillLabels[state]);
   }
 
-  /* Models and picker */
-
   let models: Model[] | null = null;
   let modelsUnauthorized = false;
-  /** The view the user is on; the poll refreshes the Monitor only when
-   * it is on screen (the live speed panel). */
   let currentView: ViewName = "chat";
 
   function renderPicker(): void {
@@ -219,8 +210,6 @@ function main(): void {
     about.updateModels(models);
   }
 
-  /* Health and readiness poll */
-
   let pollOutstanding = false;
 
   async function poll(): Promise<void> {
@@ -268,8 +257,6 @@ function main(): void {
       pollOutstanding = false;
     }
   }
-
-  /* Chat list */
 
   async function renderChatList(): Promise<void> {
     let chats: ChatRecord[];
@@ -339,8 +326,6 @@ function main(): void {
     closeSidebar();
   });
 
-  /* Routing */
-
   const views: Record<ViewName, HTMLElement> = {
     chat: el<HTMLElement>("view-chat"),
     monitor: el<HTMLElement>("view-monitor"),
@@ -372,12 +357,8 @@ function main(): void {
 
   window.addEventListener("hashchange", () => showView(routeFromHash()));
 
-  /* Drawer */
-
   el<HTMLButtonElement>("drawer-button").addEventListener("click", () => drawer.open());
   document.addEventListener("keydown", (e) => drawer.handleKeydown(e));
-
-  /* Sidebar on narrow screens */
 
   function closeSidebar(): void {
     document.body.classList.remove("sidebar-open");
@@ -393,13 +374,9 @@ function main(): void {
   });
   sidebarBackdrop.addEventListener("click", closeSidebar);
 
-  /* Settings changes propagate to the picker and theme. */
-
   onSettingsChange((settings) => {
     applyTheme(settings.theme);
   });
-
-  /* Boot */
 
   showView(routeFromHash());
   void renderChatList();

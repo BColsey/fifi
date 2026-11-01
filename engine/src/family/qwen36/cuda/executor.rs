@@ -64,8 +64,6 @@ pub(super) enum ChunkPath {
     Chunked { m_sess: usize },
 }
 
-/// The prefill path of one chunk-gate verdict: the accept takes the chunk driver at its admitted
-/// `m_sess`, and every refusal keeps the per-token loop (see `ChunkPath`).
 pub(super) fn chunk_path_of(verdict: &ChunkVerdict) -> ChunkPath {
     match verdict {
         ChunkVerdict::Ready { m_sess } => ChunkPath::Chunked { m_sess: *m_sess },
@@ -97,9 +95,7 @@ impl TokenStepper for QwenResidentStep<'_> {
     }
 
     /// Feeds `tokens` in order as prompt rows, routed through the chunk gate, as in the Flash-Next
-    /// executor. A refusal takes the per-token arm — the default loop's own body — so the session
-    /// behaves exactly as the default `TokenStepper::feed_rows`; `chunk_path_of` is the one call
-    /// that sends the accept verdict to the chunk arm.
+    /// executor.
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
         let verdict = self.chunk_ready();
         self.note_feed_rows(&verdict, tokens.len());
@@ -234,10 +230,8 @@ impl ExecutorOps for QwenResidentStep<'_> {
         }
     }
 
-    /// Exports committed state into the bounded prefix store. Pinned CUDA stages Block and Tip
-    /// entries; the admitted limits determine how many entries remain. The caller supplies `kind`,
-    /// and the session rules validate the save point. A tiered step cannot save: its numbers follow
-    /// the bank state, so a restored turn would not match a cold one bitwise.
+    /// Pinned CUDA stages Block and Tip entries; the admitted limits determine how many entries
+    /// remain. The caller supplies `kind`, and the session rules validate the save point.
     fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
         if self.is_tiered() || self.prefix.limits().entries == 0 {
             return Ok(false);

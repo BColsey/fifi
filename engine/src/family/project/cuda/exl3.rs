@@ -308,7 +308,6 @@ impl Exl3Weight {
 }
 
 impl Exl3Bank {
-    /// Packed trellis bytes of one member.
     fn trellis_stride(&self) -> usize {
         self.shape[0] * self.shape[1] / 256 * usize::from(self.bits_twice) * 16
     }
@@ -352,7 +351,6 @@ impl Exl3Bank {
         })
     }
 
-    /// The whole bank for a job-table projection.
     pub(crate) fn members(&self) -> Result<Exl3Members<'_>, EngError> {
         let [k, n] = self.shape;
         let last = (self.count - 1) * self.scale_stride();

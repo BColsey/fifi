@@ -37,9 +37,7 @@ pub enum ExpertCpuError {
     BadLength {
         /// Which slice was rejected ("w", "x", "out", "gate", "up", "down", scratch).
         what: &'static str,
-        /// The length that was passed.
         got: usize,
-        /// The length the geometry requires.
         want: usize,
     },
 }
@@ -247,8 +245,6 @@ pub struct ExpertScratch {
 }
 
 impl ExpertScratch {
-    /// Allocates scratch sized for one expert of `shape`: value buffers `inter` long,
-    /// `sums` sized for the longer of `hidden` and `inter`.
     ///
     /// The buffers are zeroed so a reused scratch never leaks values of one call into
     /// the next.
@@ -359,7 +355,6 @@ mod tests {
         0x0001, 0x03ff, 0x0400, 0x3500, 0x3800, 0x3c00, 0x4000, 0x7bff, 0xbc00,
     ];
 
-    /// Writes one random Q4_K block: random scale/nibble bytes, finite d/dmin.
     fn random_block(rng: &mut Lcg, out: &mut [u8; 144], d_bits: &[u16]) {
         *out = [0; 144];
         for b in out[4..].iter_mut() {
@@ -487,7 +482,6 @@ mod tests {
         let x: Vec<f32> = (0..k).map(|_| rng.f32_between(-1.0, 1.0)).collect();
         let all_nan = |v: &[f32]| v.iter().all(|v| v.is_nan());
 
-        // q4k_matvec: shape violations.
         let mut out = vec![f32::NAN; rows];
         for bad_k in [0usize, 100, 384] {
             assert!(matches!(
@@ -501,7 +495,6 @@ mod tests {
         ));
         assert!(all_nan(&out), "a BadShape call must not touch out");
 
-        // q4k_matvec: length violations name their slice and leave out untouched.
         let bad = |what: &'static str, got: usize, want: usize| ExpertCpuError::BadLength {
             what,
             got,
@@ -532,7 +525,6 @@ mod tests {
             "length errors must not touch out"
         );
 
-        // expert_forward: shape violations first, on otherwise valid arguments.
         for sh in [shape(512, 256), shape(2048, 512)] {
             let side = sh.inter * sh.hidden / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
             let down = sh.hidden * sh.inter / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
@@ -594,7 +586,6 @@ mod tests {
                 assert!(all_nan(&oo[..checked]), "{what} case touched out");
             }
 
-            // The untouched valid case must succeed and fill every output.
             expert_forward(sh, &good, &x, &mut scratch, &mut out).unwrap();
             assert!(out.iter().all(|v| !v.is_nan()), "valid call must fill out");
         }
@@ -632,7 +623,6 @@ mod tests {
         };
         expert_forward(shape, &slices, &x, &mut scratch, &mut out).unwrap();
 
-        // Reference: dequantize the three slices, matvec in f64, silu in f64.
         let dequant = |raw: &[u8], values: usize| -> Vec<f32> {
             let mut w = vec![0.0f32; values];
             dequantize_into(GgufType::Q4K, raw, &mut w).unwrap();

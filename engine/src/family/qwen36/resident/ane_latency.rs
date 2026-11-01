@@ -203,7 +203,6 @@ fn percentile(values: &[f64], p: u32) -> f64 {
     sorted[rank - 1]
 }
 
-/// A duration in milliseconds, as `decode_timing` reports them.
 #[cfg(all(
     feature = "native-mlx",
     feature = "native-ane",
@@ -229,7 +228,6 @@ fn assert_positive(value: f64, what: &str) {
     );
 }
 
-/// One adapter's idle latencies: `warmup` untimed `predict` calls, then `calls` timed ones.
 #[cfg(all(
     feature = "native-mlx",
     feature = "native-ane",
@@ -359,11 +357,8 @@ fn decode_window(
     (ms(started.elapsed()), calls)
 }
 
-/// The ANE sidecar latency probe (packet ane-sidecar-1). Idle mode first: the exact head
-/// config and synthetic weights of the existing ANE gate, ANE p50/p90/p99 over `CALLS` timed
-/// calls, and the CPU adapter on the same weights and calls. Decode mode second: the same
-/// load, prefill, and greedy decode loop as `decode_timing`, timed once without the head and
-/// once with one serial head call between each pair of steps. Reports, gates no speed.
+/// The ANE sidecar latency probe (packet ane-sidecar-1), running the idle and decode modes
+/// described in the module doc. Reports figures only, gates no speed.
 #[test]
 #[ignore = "needs the real checkpoint and the ANE bridge on the Mac; run with --ignored"]
 #[cfg(all(

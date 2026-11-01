@@ -36,7 +36,6 @@ enum Scales {
     Zero,
 }
 
-/// An fp16 scale drawn from `class`.
 fn half_bits(rng: &mut Rng, class: Scales) -> u16 {
     let sign = if rng.below(2) == 0 { 0 } else { 0x8000_u16 };
     let mantissa = u16::try_from(rng.below(1023) + 1).expect("below 1024");
@@ -48,7 +47,6 @@ fn half_bits(rng: &mut Rng, class: Scales) -> u16 {
     }
 }
 
-/// A token embedding table: the ggml blocks, the tiled upload and the shape.
 struct Table {
     weight: TiledWeight,
     source: Vec<u8>,
@@ -112,7 +110,6 @@ impl Table {
         dequantize(self.ty, self.blocks(id)).expect("dequantize a row")
     }
 
-    /// Row `id` by the exact f64 formula (information only).
     fn exact_row(&self, id: usize) -> Vec<f64> {
         let half = |b: &[u8]| f64::from(testkit::f16_to_f32(u16::from_le_bytes([b[0], b[1]])));
         if self.ty == GgufType::Q80 {
@@ -163,14 +160,11 @@ impl Rig {
         Self { ctx, stream }
     }
 
-    /// `m` rows of `k` floats between two guard regions of 0x55.
     fn x_buffer(&self, m: usize, k: usize) -> DeviceBuffer {
         let rows = embed_x_bytes(m, k).expect("size");
         testkit::upload_filled(&self.ctx, 0x55, rows + 2 * GUARD_BYTES)
     }
 
-    /// Queues one gather into the rows of `x`, drains, and returns the rows; the guards must
-    /// still be 0x55.
     fn run(
         &self,
         table: &Table,
@@ -200,8 +194,6 @@ impl Rig {
         testkit::floats(&all[GUARD_BYTES..GUARD_BYTES + bytes])
     }
 
-    /// Gathers `ids` with the status word preset to `init` between two guard words; returns `x`
-    /// and the status word after the launch.
     fn gather(&self, table: &Table, ids: &[i32], init: i32) -> (Vec<f32>, i32) {
         let ids_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         let ids_buf = testkit::upload_bytes(&self.ctx, &ids_bytes);
@@ -227,8 +219,6 @@ impl Rig {
     }
 }
 
-/// Asserts bit equality of every row of `x` with the CPU dequantizer; returns the element count
-/// and the largest information ratio.
 fn check_rows(table: &Table, ids: &[i32], x: &[f32], case: &str) -> (usize, f64) {
     let mut ratio = 0.0_f64;
     for (t, &id) in ids.iter().enumerate() {
@@ -362,7 +352,6 @@ fn embed_shape_and_host_id_rules_need_no_device() {
     }
 }
 
-/// Asserts that each valid id of `ids` gave its CPU row and each bad id a row of NaN.
 fn assert_rows(table: &Table, ids: &[i32], x: &[f32], case: &str) {
     for (t, &id) in ids.iter().enumerate() {
         let row = &x[t * table.k..(t + 1) * table.k];
@@ -408,7 +397,6 @@ fn embed_bad_ids_write_nan_set_bit_4_and_stay_inside() {
     }
 }
 
-/// The word at byte `offset` of the 32-byte step block `buf`.
 fn word(rig: &Rig, buf: &DeviceBuffer, offset: usize) -> i32 {
     let bytes = testkit::read_bytes(&rig.ctx, buf, 32);
     i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
@@ -432,7 +420,6 @@ fn step_words(rig: &Rig, ty: GgufType) {
             1,
         )
     };
-    // (a) token and status are words of the uploaded block; nothing else changes.
     let params = StepParams::new(37, 5).expect("params");
     let block = upload(params);
     assert_rows(&table, &[37], &gather(&block), "(a)");
@@ -441,7 +428,6 @@ fn step_words(rig: &Rig, ty: GgufType) {
         params.to_bytes(),
         "(a) block"
     );
-    // (b) the token is word 0 of a result pair that sits at offset 8 of its buffer.
     let mut bytes = vec![0x77; 8];
     bytes.extend(21_i32.to_le_bytes().iter().chain(&[0; 4]));
     let pair = testkit::upload_bytes(&rig.ctx, &bytes);
@@ -459,7 +445,6 @@ fn step_words(rig: &Rig, ty: GgufType) {
         [0; 4],
         "(b) status"
     );
-    // (c) the poisoned block: a NaN row, status 4, the other words and the guards untouched.
     let poisoned = StepParams {
         token_id: -1,
         ..StepParams::poisoned()
@@ -469,7 +454,6 @@ fn step_words(rig: &Rig, ty: GgufType) {
     let mut want = poisoned.to_bytes();
     want[OFFSET_STATUS..OFFSET_STATUS + 4].copy_from_slice(&4_i32.to_le_bytes());
     assert_eq!(testkit::read_bytes(&rig.ctx, &block, 32), want, "(c) block");
-    // (d) the id is read when the kernel runs: rewrite it between launches.
     let block = upload(StepParams::new(3, 0).expect("params"));
     for (token, flag) in [(3_i32, 0), (9, 0), (-1, 4)] {
         block
@@ -478,7 +462,6 @@ fn step_words(rig: &Rig, ty: GgufType) {
         assert_rows(&table, &[token], &gather(&block), "(d)");
         assert_eq!(word(rig, &block, OFFSET_STATUS), flag, "(d) token {token}");
     }
-    // (e) an out-of-range id maps to the step_params error; a preset router bit stays.
     for (init, set) in [(0, 4), (1, 5)] {
         let bad = StepParams {
             token_id: 64,
@@ -528,7 +511,6 @@ fn q5_0_weight(ctx: &CudaContext) -> TiledWeight {
     .expect("upload of the Q5_0 weight")
 }
 
-/// The range of `bytes` bytes of `buffer` at `offset`.
 fn at(buffer: &DeviceBuffer, offset: usize, bytes: usize) -> DeviceRange<'_> {
     buffer.range(offset, bytes).expect("range")
 }
@@ -673,7 +655,6 @@ fn embed_rejects_bad_calls_before_any_launch() {
             "{case}: a refused call changed a buffer"
         );
     }
-    // Accepted controls: an ids range longer than 4 m, a status range of 8 bytes.
     try_call(w, 2, at(ids, 0, 16), x_ok, at(status, 0, 8), s)
         .expect("longer ids and status ranges");
     s.synchronize().expect("drain the controls");
@@ -887,7 +868,6 @@ fn the_native_gather_takes_only_q4_k_blocks() {
         return;
     }
     let rig = Rig::new();
-    // A Q8_0 native table is refused by the wrapper before any launch.
     let weight = q8_0_native(&rig.ctx);
     let k = weight.k();
     let ids_buf = testkit::upload_bytes(&rig.ctx, &1i32.to_le_bytes());
@@ -1135,8 +1115,6 @@ fn embed_native_rejects_bad_calls_before_any_launch() {
             "{case}: a refused call changed a buffer"
         );
     }
-    // Accepted controls: an ids range longer than 4 m, a status range of 8 bytes, and a
-    // gather that still runs after the refusals.
     try_call(w, 2, at(ids, 0, 16), x_ok, at(status, 0, 8), s)
         .expect("longer ids and status ranges");
     s.synchronize().expect("drain the controls");
@@ -1255,7 +1233,6 @@ fn embed_inside_a_capture_reads_the_new_id_between_replays() {
             ids_buf
                 .write_at(&rig.stream, 0, &id.to_le_bytes())
                 .expect("rewrite the id");
-            // The rig clears the status word between replays.
             status
                 .write_at(&rig.stream, 4, &0i32.to_le_bytes())
                 .expect("clear the status");

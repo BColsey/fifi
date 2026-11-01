@@ -148,8 +148,6 @@ pub(crate) fn msgs(pairs: &[(&str, &str)]) -> Vec<PromptMessage> {
         .collect()
 }
 
-/// The derived boundaries equal the three-pass boundaries on the fixture
-/// template whose generation prompt starts with an atomic token.
 #[test]
 fn derived_tip_equals_three_pass_on_atomic_boundary() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -168,8 +166,6 @@ fn derived_tip_equals_three_pass_on_atomic_boundary() {
     }
 }
 
-/// A corrupted suffix id forces the fallback, and the fallback result is
-/// the three-pass result, byte for byte.
 #[test]
 fn corrupted_suffix_falls_back_to_three_pass() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -194,9 +190,6 @@ fn corrupted_suffix_falls_back_to_three_pass() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Off-by-one sensitivity: a suffix one token short of the truth must NOT
-/// be accepted (the ends_with check fails) — and falls back — so an
-/// off-by-one derivation cannot silently ship.
 #[test]
 fn off_by_one_suffix_is_rejected() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -220,9 +213,6 @@ fn off_by_one_suffix_is_rejected() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// A non-atomic boundary (plain BPE text at the generation prompt start)
-/// must NOT derive: the atomicity guard routes it to the three-pass
-/// fallback, and the fallback result equals the three-pass result.
 #[test]
 fn non_atomic_boundary_falls_back_to_three_pass() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_PLAIN);
@@ -251,8 +241,6 @@ fn wrapped_generation_prompt_falls_back_to_three_pass() {
     let three = bundle
         .encode_prompt_with_boundary(&messages, &[], Thinking::Default)
         .expect("three-pass");
-    // An ATOMIC suffix that the prompt does not end with: atomicity alone
-    // must not be enough — the ends_with guard has to refuse and fall back.
     // <|end|> loads as id 15 (tokenizers remaps fixture ids); the wrapped
     // template has no derivable suffix (head is not a byte-prefix), so take
     // the boundary id from a direct encode.
@@ -280,8 +268,7 @@ fn wrapped_generation_prompt_falls_back_to_three_pass() {
 
 /// The real-corpus equivalence: recorded Claude Code conversation shapes
 /// (pure-append prefixes, tool results, tool_use, thinking) rendered with
-/// the REAL pinned template and tokenizer; requires the model dir (fails
-/// loudly when absent — the test host provides it).
+/// the REAL pinned template and tokenizer.
 #[test]
 fn derived_boundaries_match_three_pass_on_the_real_corpus() {
     // The model dir resolves through the shared helper (env override or
@@ -388,8 +375,7 @@ fn derived_boundaries_match_three_pass_on_the_real_corpus() {
                 "corpus case {} must derive on the real template ({thinking:?})",
                 conv["name"]
             );
-            // A system opener is the conversation root: the root boundary
-            // must exist for these real shapes.
+            // A system opener is the conversation root.
             assert!(
                 derived.root.is_some_and(|r| r > 0),
                 "corpus case {} must have a nonempty root ({thinking:?})",
@@ -449,9 +435,6 @@ fn lstrip_added_token_never_derives() {
     assert_eq!(three.1.root, derived.root);
 }
 
-/// Coverage: system/tool roles and multi-message conversations through
-/// the derived path WITHOUT suffix_override, counting that the suite sees
-/// both derived and fallback outcomes on the fixture template.
 #[test]
 fn system_and_tool_roles_cover_the_derived_path() {
     let (_d, bundle) = fixture_bundle(TEMPLATE_SPECIAL);
@@ -474,11 +457,7 @@ fn system_and_tool_roles_cover_the_derived_path() {
     assert_eq!(three.0, ids);
     assert_eq!(three.1.tip, derived.tip);
     assert_eq!(three.1.root, derived.root);
-    // A system message is the conversation root: the root boundary must
-    // be nonempty for these roles, pinning that the boundary exists at all.
     assert!(derived.root.is_some_and(|r| r > 0), "root must be nonempty");
-    // The special template's generation block is a trailing atomic block
-    // for these roles too — the fast path must fire.
     assert!(exact, "system/tool/multi-message conversations must derive");
 }
 
@@ -540,8 +519,7 @@ fn multibyte_seam_still_derives_with_byte_offsets() {
 }
 
 /// `rstrip=true` lets the matcher consume whitespace AFTER the token's
-/// text, so the split is not byte-faithful. Load-time eligibility must
-/// refuse; ids and boundaries still equal the three-pass.
+/// text, so the split is not byte-faithful.
 #[test]
 fn rstrip_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_RSTRIP, TEMPLATE_CONTENT);
@@ -563,8 +541,7 @@ fn rstrip_tokenizer_never_derives() {
 }
 
 /// A configured padding (Fixed) appends pad ids, so the id stream is not
-/// the plain encoding. Load-time eligibility must refuse; ids and
-/// boundaries still equal the three-pass.
+/// the plain encoding.
 #[test]
 fn padded_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_PADDED, TEMPLATE_CONTENT);
@@ -649,7 +626,7 @@ fn normalized_away_seam_bytes_never_derives() {
 
 /// `normalized=true` on the boundary token — normalized matching can
 /// rewrite the token's text (case folding and the like), so the split is
-/// not byte-faithful. Must fall back.
+/// not byte-faithful.
 #[test]
 fn normalized_added_token_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_NORMALIZED, TEMPLATE_CONTENT);
@@ -722,9 +699,8 @@ fn word_start_suffix_with_single_word_vocab_never_derives() {
 
 /// A single_word token IN THE HEAD — 'aa' matches at the head's end (word
 /// boundary), but the full string's following word char 'b' invalidates
-/// that match, so encode(full) != encode(head)++encode(suffix). The
-/// load-time eligibility (any single_word token disqualifies) must refuse
-/// the fast path: tip None, derived false.
+/// that match, so encode(full) != encode(head)++encode(suffix). Any
+/// single_word token anywhere disqualifies the fast path.
 #[test]
 fn single_word_head_token_never_derives() {
     // Added 'aa' with single_word=true (id 14 in the fixture vocab), 'b'
@@ -752,8 +728,7 @@ fn single_word_head_token_never_derives() {
 }
 
 /// A configured LEFT truncation rewrites the id stream (max_length 4), so
-/// suffix subtraction proves nothing. The load-time eligibility
-/// (truncation configured disqualifies) must refuse.
+/// suffix subtraction proves nothing.
 #[test]
 fn left_truncated_tokenizer_never_derives() {
     let (_d, bundle) = fixture_bundle_with(TOKENIZER_JSON_TRUNCATED, TEMPLATE_CONTENT);

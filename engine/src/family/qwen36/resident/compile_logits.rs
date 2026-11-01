@@ -72,11 +72,8 @@ pub(super) struct LogitComparison {
     /// Whether the two files hold the same bits (the strongest possible result: fusion changed
     /// nothing at all).
     pub(super) bits_equal: bool,
-    /// The number of rows each file holds.
     pub(super) rows: usize,
-    /// The row width (the vocabulary).
     pub(super) vocab: usize,
-    /// The largest absolute difference over every row and column.
     pub(super) max_abs_diff: f32,
     /// For each row, how many of the 5 largest logits of `a` are among the 5 largest of `b`
     /// (0 to 5).
@@ -208,7 +205,6 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// A temp path with a unique name for this test.
     fn temp(name: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("q36-compile-logits-{}-{name}", std::process::id()));

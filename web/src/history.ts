@@ -1,6 +1,5 @@
 /**
- * Pure request construction: stored history to contract messages and the
- * request body. No DOM and no storage access, so Node can unit test it.
+ * No DOM and no storage access, so Node can unit test this module.
  */
 
 import type { ChatMessage, ChatRequestBody } from "./api.js";
@@ -27,7 +26,6 @@ export function buildMessages(systemMessage: string, history: readonly HistoryTu
   return messages;
 }
 
-/** The chat request body with the contract's key names. */
 export function buildChatBody(settings: Settings, messages: ChatMessage[]): ChatRequestBody {
   return {
     model: settings.model === "" ? undefined : settings.model,

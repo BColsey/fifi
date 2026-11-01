@@ -49,7 +49,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Zeroed page-locked host memory mapped into the device address space. Consumed by [`mapped_free`].
+/// Zeroed page-locked host memory mapped into the device address space.
 #[derive(Debug)]
 #[must_use = "mapped memory must be passed to mapped_free"]
 pub(in crate::kernels::cuda) struct RawMapped {
@@ -63,7 +63,7 @@ unsafe impl Send for RawMapped {}
 // SAFETY: as for `Send`: every shared access is atomic.
 unsafe impl Sync for RawMapped {}
 
-/// What the mailbox needs to know of the current device (all three from `cudaDeviceGetAttribute`).
+/// All three from `cudaDeviceGetAttribute`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kernels::cuda) struct MailboxCaps {
     pub(in crate::kernels::cuda) can_map_host: bool,
@@ -72,7 +72,6 @@ pub(in crate::kernels::cuda) struct MailboxCaps {
     pub(in crate::kernels::cuda) kernel_exec_timeout: bool,
 }
 
-/// Allocates `bytes` (at least one) of zeroed mapped page-locked host memory.
 pub(in crate::kernels::cuda) fn mapped_alloc(bytes: usize) -> Result<RawMapped, DeviceFailure> {
     if bytes == 0 {
         return Err(invalid_argument());
@@ -106,7 +105,6 @@ pub(in crate::kernels::cuda) fn mapped_free(mapped: RawMapped) -> Result<(), Dev
     })
 }
 
-/// The attributes of the current device the mailbox depends on.
 pub(in crate::kernels::cuda) fn mailbox_caps() -> Result<MailboxCaps, DeviceFailure> {
     let (mut can_map, mut unified, mut timeout) = (0, 0, 0);
     let mut stage = STAGE_NONE;
@@ -126,8 +124,6 @@ impl RawMapped {
         &self.device
     }
 
-    /// The address of `words` words of `width` bytes at `offset`, or `None` unless they lie inside the
-    /// mapping and `offset` is a multiple of `width`.
     fn word_address(&self, offset: usize, words: usize, width: usize) -> Option<*mut u8> {
         let end = offset.checked_add(words.checked_mul(width)?)?;
         if end > self.device.bytes || !offset.is_multiple_of(width) {
@@ -137,16 +133,16 @@ impl RawMapped {
         Some(unsafe { self.host.as_ptr().cast::<u8>().add(offset) })
     }
 
-    /// The u64 at `offset` (a multiple of 8), loaded with acquire ordering: payload words the device wrote
-    /// before it released this word are visible to the loads that follow.
+    /// Payload words the device wrote before it released this word are visible to the loads that
+    /// follow.
     pub(in crate::kernels::cuda) fn load_acquire(&self, offset: usize) -> Option<u64> {
         let address = self.word_address(offset, 1, 8)?;
         // SAFETY: the address is inside the live mapping and 8-byte aligned; all access to it is atomic.
         Some(unsafe { AtomicU64::from_ptr(address.cast()) }.load(Ordering::Acquire))
     }
 
-    /// Stores `value` at `offset` (a multiple of 8) with release ordering: payload words written before it
-    /// are visible to the device once it loads this word with acquire ordering. `false` if out of bounds.
+    /// Payload words written before it are visible to the device once it loads this word with
+    /// acquire ordering.
     pub(in crate::kernels::cuda) fn store_release(&self, offset: usize, value: u64) -> bool {
         let Some(address) = self.word_address(offset, 1, 8) else {
             return false;
@@ -156,23 +152,18 @@ impl RawMapped {
         true
     }
 
-    /// Copies `out.len()` words from `offset` (a multiple of 4), one relaxed atomic load each. `false` if
-    /// out of bounds, in which case `out` is untouched.
     pub(in crate::kernels::cuda) fn read_words(&self, offset: usize, out: &mut [u32]) -> bool {
         self.read_converted(offset, out, |word| word)
     }
 
-    /// [`Self::read_words`] for floats: the words are the bits of the floats.
     pub(in crate::kernels::cuda) fn read_f32s(&self, offset: usize, out: &mut [f32]) -> bool {
         self.read_converted(offset, out, f32::from_bits)
     }
 
-    /// Copies `src` to `offset` (a multiple of 4), one relaxed atomic store each. `false` if out of bounds.
     pub(in crate::kernels::cuda) fn write_words(&self, offset: usize, src: &[u32]) -> bool {
         self.write_converted(offset, src, |word| word)
     }
 
-    /// [`Self::write_words`] for floats: the words are the bits of the floats.
     pub(in crate::kernels::cuda) fn write_f32s(&self, offset: usize, src: &[f32]) -> bool {
         self.write_converted(offset, src, f32::to_bits)
     }

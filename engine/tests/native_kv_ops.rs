@@ -1,6 +1,3 @@
-//! Native tests of three operations: the consuming `kv_append`, the prefix-view
-//! `grouped_attention_prefix`, and `evaluate_async`.
-
 #![cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 
 use std::{sync::Mutex, time::Instant};
@@ -25,7 +22,6 @@ fn f32_input(shape: Vec<u32>, values: &[f32]) -> Tensor {
     .unwrap()
 }
 
-/// A deterministic F32 tensor of `shape` from a value function, without naming every value.
 fn f32_pattern(shape: &[u32], value: impl Fn(usize) -> f32) -> Tensor {
     let count: usize = shape.iter().map(|&dim| dim as usize).product();
     let values: Vec<f32> = (0..count).map(value).collect();
@@ -43,7 +39,6 @@ fn values_of(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-/// Decodes BF16 readback bytes to F32 (each BF16 value is the top half of an F32).
 fn bf16_values(tensor: &Tensor) -> Vec<f32> {
     tensor
         .host_bytes()
@@ -278,7 +273,6 @@ fn kv_append_leaves_a_lazy_reader_built_before_it_on_the_old_rows() {
     );
 }
 
-/// One F32 row of the cache: `[1, 2, 1, 256]`.
 fn one_kv_row(kernels: &mut MlxKernels) -> ExecutionTensor {
     import(
         kernels,
@@ -638,7 +632,6 @@ fn grouped_attention_prefix_does_not_copy_the_prefix_at_half_capacity() {
     drop(control);
     let contiguous_peak = kernels.memory_stats().unwrap().peak.saturating_sub(base);
 
-    // The mean wall time of ten readback-complete rounds per path, after one warm-up round.
     let mut rounds = |build: &dyn Fn(&mut MlxKernels) -> ExecutionTensor| {
         let warm = build(&mut kernels);
         kernels.readback(&warm).unwrap();
@@ -842,7 +835,6 @@ fn evaluate_async_allocates_the_output_at_submission() {
         growth >= output_bytes - output_bytes / 8,
         "the submission allocated only {growth} bytes; about {output_bytes} were expected"
     );
-    // The submitted values are still the SiLU of the input.
     let read = kernels.readback(&lazy).unwrap();
     let values = values_of(&read);
     assert!(
@@ -955,7 +947,6 @@ fn evaluate_async_drop_then_blocking_evaluate_neither_crashes_nor_leaks() {
         // Drop the outputs of the pending async evaluation, and then the input.
     }
 
-    // A blocking evaluate of another graph completes the pending work.
     let other = import(&mut kernels, &f32_input(vec![4], &[4.0, 3.0, 2.0, 1.0]));
     let blocked = kernels.silu(&other).unwrap();
     kernels.evaluate(&[&blocked]).unwrap();
@@ -1020,7 +1011,6 @@ fn kv_append_keeps_bf16_buffers_and_rejects_mixed_dtypes() {
     let mut kernels = MlxKernels::try_new().unwrap();
     kernels.allow_bf16(true);
 
-    // A mixed dtype pair is rejected: the BF16 target with an F32 update row.
     let mixed_target = bf16_of(
         &mut kernels,
         &f32_pattern(&[1, 2, 8, 4], |index| ((index % 11) as f32) - 5.0),
@@ -1080,7 +1070,6 @@ fn sigmoid_of(value: f32) -> f32 {
     (1.0 / (1.0 + (-f64::from(value)).exp())) as f32
 }
 
-/// Reads F32 values out of raw readback bytes.
 fn values(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()

@@ -465,7 +465,6 @@ pub(super) fn section_of(source: &'static str, file: &str, start: &str) -> &'sta
     &source[line_start..end]
 }
 
-/// True when `line` opens a `fn` item behind any `pub` prefix.
 fn starts_fn_item(line: &str) -> bool {
     let rest = ["pub(crate) ", "pub(super) ", "pub "]
         .iter()
@@ -531,7 +530,6 @@ fn skip_block(bytes: &[u8], mut at: usize, mut depth: usize) -> usize {
     at
 }
 
-/// The index after the quoted literal (string or char) whose body starts at `at`.
 fn skip_quoted(bytes: &[u8], mut at: usize, quote: u8) -> usize {
     while at < bytes.len() {
         match bytes[at] {
@@ -543,7 +541,6 @@ fn skip_quoted(bytes: &[u8], mut at: usize, quote: u8) -> usize {
     at
 }
 
-/// True when the `'` at `at` opens a char literal rather than a lifetime.
 fn opens_char_literal(bytes: &[u8], at: usize) -> bool {
     matches!(
         (bytes.get(at + 1), bytes.get(at + 2)),

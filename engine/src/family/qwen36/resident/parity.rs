@@ -53,7 +53,6 @@ pub(super) const LAYERS_SHA256: &str =
     "5bc310d7accdc56fbdc464d86e50fc3e655773d338e173d5d964bbbf6b7aef02";
 pub(super) const LOGITS_SHA256: &str =
     "6b4973e208ec44aa91efb9d61ae72de941a3ac775e82b771a275227378052044";
-/// SHA-256 of the pinned `config.json`.
 pub(super) const CONFIG_SHA256: &str =
     "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767";
 

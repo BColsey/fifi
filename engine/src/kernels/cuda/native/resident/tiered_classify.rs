@@ -87,8 +87,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one classification launch reads and writes; the layout of every range is in
-/// `tiered_classify.h`.
+/// The layout of every range is in `tiered_classify.h`.
 pub(in crate::kernels::cuda) struct ClassifyRaw<'a> {
     pub(in crate::kernels::cuda) ids: RawRange<'a>,
     pub(in crate::kernels::cuda) weights: RawRange<'a>,
@@ -108,15 +107,14 @@ pub(in crate::kernels::cuda) struct ClassifyRaw<'a> {
     pub(in crate::kernels::cuda) layer: c_int,
 }
 
-/// The five integers of a call inside the limits of `valid()` in the `.cu` file, as `usize`.
+/// The integers of a call inside the limits of `valid()` in the `.cu` file.
 struct Shape {
     n_expert: usize,
     top_k: usize,
     hidden: usize,
 }
 
-/// The shape of the integers of `call`, or `None` outside the limits (the same test as `shapes_ok`
-/// of the `.cu` file).
+/// The shape limits, the same test as `shapes_ok` of the `.cu` file.
 fn shape(call: &ClassifyRaw<'_>) -> Option<Shape> {
     let [n_expert, slots, top_k, hidden, layer] = [
         call.n_expert,
@@ -144,7 +142,6 @@ fn shape(call: &ClassifyRaw<'_>) -> Option<Shape> {
 /// writes it.
 type Region<'c, 'a> = (&'c RawRange<'a>, usize, usize, bool);
 
-/// The eleven ranges of a call.
 fn regions<'c, 'a>(call: &'c ClassifyRaw<'a>, s: &Shape) -> [Region<'c, 'a>; 11] {
     let (top, row) = (s.top_k * 4, s.hidden * 4);
     [
@@ -162,8 +159,6 @@ fn regions<'c, 'a>(call: &'c ClassifyRaw<'a>, s: &Shape) -> [Region<'c, 'a>; 11]
     ]
 }
 
-/// Proves a classification launch before the native call: the limits, the size and alignment of
-/// every range, and that every range the kernel writes overlaps no other range.
 fn check_classify(call: &ClassifyRaw<'_>) -> Result<(), DeviceFailure> {
     let s = shape(call).ok_or_else(invalid_argument)?;
     let regions = regions(call, &s);
@@ -185,7 +180,6 @@ fn check_classify(call: &ClassifyRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the classification of `call` on `stream`: one kernel. Returns when it is queued.
 pub(in crate::kernels::cuda) fn tiered_classify_launch(
     stream: &RawStream,
     call: &ClassifyRaw<'_>,

@@ -1,5 +1,3 @@
-/** Number and time formatting. Tabular-friendly, locale aware. */
-
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 10_000) return Math.round(n / 1_000) + "k";

@@ -65,7 +65,6 @@ fn unix_ns() -> Result<u64, EngError> {
         .map_err(|_| bad("the wall clock is before the epoch"))
 }
 
-/// The mode the settings ask for: forced reference lists present means forced.
 fn mode_of(forced: &[Vec<u32>]) -> Mode {
     if forced.is_empty() {
         Mode::Free
@@ -99,9 +98,6 @@ fn check_settings(s: &GateSettings) -> Result<Mode, EngError> {
     ))
 }
 
-/// A gate run is never a debug run: `INFERENCE_CUDA_SYNC_EACH=1` synchronizes after every launch,
-/// which changes the timing the gate measures, so the gate refuses it unconditionally, capture or
-/// not.
 fn refuse_sync_each(sync_each: bool) -> Result<(), EngError> {
     if sync_each {
         return Err(bad(&format!(
@@ -111,7 +107,6 @@ fn refuse_sync_each(sync_each: bool) -> Result<(), EngError> {
     Ok(())
 }
 
-/// KV positions the session must hold: the longest prompt plus the 128 decode rows.
 fn context_tokens(longest: usize) -> Result<usize, EngError> {
     longest
         .checked_add(N_STEPS)
@@ -212,7 +207,6 @@ fn session_options(s: &GateSettings, layout: WeightLayout) -> Result<StepOptions
     })
 }
 
-/// Everything a session builds once: the checked dimensions of the pinned model and the arena.
 fn build_resources(
     context: &CudaContext,
     s: &GateSettings,
@@ -235,9 +229,8 @@ fn bundle_dir(gguf: &Path) -> Result<PathBuf, EngError> {
 }
 
 /// The pure seam of the tokenizer wiring: the eos ids and the sampler vocabulary come from the SAME
-/// loaded bundle — never hard-coded ids, never the padded head width — and the tokenizer directory
-/// is the GGUF's parent directory, never the GGUF path itself. `device_gate` calls this seam with
-/// the loaded bundle's own numbers.
+/// loaded bundle — never hard-coded ids, never the padded head width. `device_gate` calls this
+/// seam with the loaded bundle's own numbers.
 fn rules_from_bundle(
     eos: &[u32],
     vocab_size: usize,
@@ -285,7 +278,6 @@ struct RunInputs<'a> {
     forced: &'a [u32],
 }
 
-/// What one timed region produced, before the JSON assembly.
 struct Timed {
     timing: Timing,
     rows: Vec<Vec<u8>>,
@@ -427,8 +419,6 @@ fn tiered_json(sum: Option<&TokenReport>) -> Option<Value> {
     })
 }
 
-/// Every prompt and every run, then the raw document; the deadline expiry ends the call with
-/// the incomplete document and what was finished.
 fn run_all(
     step: &mut QwenResidentStep<'_>,
     s: &GateSettings,
@@ -480,8 +470,6 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     let mode = check_settings(s)?;
     let sync_each = parse_sync_each(std::env::var(SYNC_EACH_VAR).ok().as_deref())?;
     refuse_sync_each(sync_each)?;
-    // The tokenizer bundle and the rules come BEFORE any device work: a missing tokenizer file
-    // fails in seconds, not after a 20 GB upload.
     let head_rows = head_rows_of()?;
     let dir = bundle_dir(&s.gguf)?;
     let bundle = TokenizerBundle::load(&dir, &tokenizer_pin()?)?;
@@ -516,7 +504,6 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
         doc["refused"] = json!({ "kind": "memory", "free_after_load": after.free });
         return report(doc);
     }
-    // The step's layout comes from the loaded weights (the settings' member chose the LOAD).
     let layout = device.layout()?;
     let res = build_resources(projector.context(), s, layout)?;
     let mut step = build_step(&projector, &res, &device, rules, s, layout)?;
@@ -795,7 +782,6 @@ mod tests {
         &source[line_start..end]
     }
 
-    /// True when `line` opens a `fn` item behind any `pub` prefix.
     fn starts_fn_item(line: &str) -> bool {
         let rest = ["pub(crate) ", "pub(super) ", "pub "]
             .iter()
@@ -863,7 +849,6 @@ mod tests {
         at
     }
 
-    /// The index after the quoted literal (string or char) whose body starts at `at`.
     fn skip_quoted(bytes: &[u8], mut at: usize, quote: u8) -> usize {
         while at < bytes.len() {
             match bytes[at] {
@@ -1175,9 +1160,6 @@ mod tests {
 
     #[test]
     fn the_identities_and_the_session_echo_the_real_kv_mode() {
-        // The raw document echoes the mode the call runs, never a constant, and the session
-        // options carry the same mode (the fp16 control keeps its byte-for-byte text, pinned
-        // by the tests above).
         let q8: GateSettings = FREE
             .replace("\"kv_mode\":\"fp16\"", "\"kv_mode\":\"int8g32\"")
             .parse()

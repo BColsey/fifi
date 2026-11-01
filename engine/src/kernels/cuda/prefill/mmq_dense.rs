@@ -74,7 +74,6 @@ fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("mmq_dense: {tag}: {detail}"))
 }
 
-/// `value` as `c_int` for the rule `tag`, or the "exceeds i32" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }

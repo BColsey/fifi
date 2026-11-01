@@ -39,30 +39,23 @@ const MAX_HIDDEN: usize = 65536;
 const MAX_LAYER: usize = 1023;
 /// Bytes of the control block: u64 `[0]` miss count, `[1]` expected sequence, `[2]` sequence counter.
 pub(crate) const CTRL_BYTES: usize = 64;
-/// Bytes of the request line of the mailbox.
 pub(crate) const REQUEST_BYTES: usize = 128;
 /// Bytes of one logged pick: an i32 id and the f32 bits of its weight.
 pub(crate) const LOG_BYTES_PER_PICK: usize = 8;
 
-/// The sizes of one classification call. Qwen3.6 is `n_expert` 256, `top_k` 8 and `hidden` 2048;
-/// `slots` is the bank size of the layer.
+/// Qwen3.6 is `n_expert` 256, `top_k` 8 and `hidden` 2048; `slots` is the bank size of the layer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClassifyShape {
-    /// Experts of the layer, 1 to 4096.
     pub(crate) n_expert: usize,
-    /// Bank slots per layer, 1 to `n_expert`.
     pub(crate) slots: usize,
-    /// Picks per token, 1 to 8 (the request line holds eight).
     pub(crate) top_k: usize,
-    /// Width of the normed row, a multiple of 4 from 4 to 65536.
     pub(crate) hidden: usize,
-    /// The layer index, 0 to 1023; layer 0 starts a token (it clears the tiered word).
+    /// Layer 0 starts a token (it clears the tiered word).
     pub(crate) layer: usize,
 }
 
 /// One classification call. The layout of every range is in `native/resident/tiered_classify.h`.
 pub(crate) struct ClassifyCall<'b> {
-    /// The sizes of the call.
     pub(crate) shape: ClassifyShape,
     /// i32 `[top_k]`, 4-byte aligned: the router's picks.
     pub(crate) ids: DeviceRange<'b>,
@@ -88,7 +81,7 @@ pub(crate) struct ClassifyCall<'b> {
     pub(crate) mbox_row: DeviceRange<'b>,
 }
 
-/// `BadRequest` unless every integer is inside its limit. Pure: no device is needed.
+/// Pure: no device is needed.
 pub(crate) fn check_shape(shape: &ClassifyShape) -> Result<(), EngError> {
     let ClassifyShape {
         n_expert,
@@ -113,8 +106,6 @@ pub(crate) fn check_shape(shape: &ClassifyShape) -> Result<(), EngError> {
     )))
 }
 
-/// One range of a call: its name, the bytes it must hold, its alignment, and whether the kernel
-/// writes it.
 struct Part<'x, 'b> {
     name: &'static str,
     range: &'x DeviceRange<'b>,
@@ -123,7 +114,6 @@ struct Part<'x, 'b> {
     written: bool,
 }
 
-/// The eleven ranges of a call with what the kernel needs of each.
 fn parts<'x, 'b>(call: &'x ClassifyCall<'b>) -> [Part<'x, 'b>; 11] {
     let s = &call.shape;
     let (top, row) = (s.top_k * 4, s.hidden * 4);
@@ -155,8 +145,6 @@ fn parts<'x, 'b>(call: &'x ClassifyCall<'b>) -> [Part<'x, 'b>; 11] {
     ]
 }
 
-/// Every range holds what the call uses at its alignment, and every range the kernel writes
-/// overlaps no other range (the written one named first in the refusal).
 fn check_ranges(call: &ClassifyCall<'_>) -> Result<(), EngError> {
     let parts = parts(call);
     for part in &parts {
@@ -185,10 +173,6 @@ fn to_int(name: &str, value: usize) -> Result<c_int, EngError> {
 impl CudaContext {
     /// Queues the classification of one layer on `stream`. See the module doc and
     /// `native/resident/tiered_classify.h` for the semantics.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a shape outside
-    /// [`check_shape`], a range that is short or misaligned, and a written range that overlaps
-    /// another range.
     pub(crate) fn tiered_classify(
         &self,
         stream: &DeviceStream,
@@ -201,7 +185,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of a classification call, then the native view of its ranges and ints.
     fn plan_classify<'b>(&self, call: &ClassifyCall<'b>) -> Result<ClassifyRaw<'b>, EngError> {
         let raw = |range: &DeviceRange<'b>| self.raw_range(range);
         let ranges = (

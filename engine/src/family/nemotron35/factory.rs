@@ -24,10 +24,8 @@ use crate::{
 use serde::Deserialize;
 use std::{fs, path::Path};
 
-/// The family name of a Nemotron engine entry.
 pub(crate) const FAMILY: &str = "nemotron35";
 
-/// The options of one Nemotron engine entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NemotronOptions {
@@ -79,7 +77,6 @@ enum StackAdmission {
     Cuda(admission::cuda::CudaAdmission),
 }
 
-/// Starts the engine of one config entry.
 pub(crate) fn start_engine(
     model_dir: &Path,
     tokenizer_dir: &Path,

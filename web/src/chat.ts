@@ -1,7 +1,6 @@
 /**
- * Chat view: messages, composer, streaming render. Streaming text is
- * appended as text nodes through requestAnimationFrame. The conversation
- * is never re-rendered per token.
+ * Streaming text is appended as text nodes through requestAnimationFrame.
+ * The conversation is never re-rendered per token.
  */
 
 import {
@@ -61,7 +60,6 @@ export class ChatView {
   private offline = false;
   private readonly deadChats = new DeadChats();
 
-  // Stream buffers flushed on an animation frame.
   private pendingContent = "";
   private pendingReasoning = "";
   private flushHandle = 0;
@@ -127,7 +125,7 @@ export class ChatView {
     this.updateSendEnabled();
   }
 
-  /** Abort the in-flight stream, if any. The partial reply is kept. */
+  /** The partial reply is kept. */
   abort(): void {
     if (this.controller !== null) this.controller.abort();
   }
@@ -283,7 +281,6 @@ export class ChatView {
     this.scroll.scrollTop = this.scroll.scrollHeight;
   }
 
-  /** Build the request body from the chat as it stands and the drawer settings. */
   private buildBody(chat: ChatRecord): ChatRequestBody {
     const settings = loadSettings();
     return buildChatBody(
@@ -345,7 +342,6 @@ export class ChatView {
     }
   }
 
-  /** Reopen the composer after a send that never reached the stream. */
   private endPendingSend(controller: AbortController): void {
     if (this.controller === controller) this.controller = null;
     this.sendGate.end();
@@ -465,7 +461,6 @@ export class ChatView {
         arguments: c.args,
       }));
     }
-    // Tool text renders on flush.
     this.renderToolsNow();
   }
 

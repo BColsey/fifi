@@ -57,7 +57,6 @@ pub(super) struct PageCacheFailure {
     pub(super) errno: c_int,
 }
 
-/// A weight type the tiled matmul executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TiledType {
     Q4K,
@@ -124,7 +123,6 @@ impl TiledType {
     }
 }
 
-/// The shape of a tiled weight: `n_rows` rows of `k` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Tiled {
     pub(super) ty: TiledType,
@@ -197,7 +195,6 @@ impl Tiled {
 pub(super) struct TileVec(pub(super) [u8; 16]);
 
 impl TileVec {
-    /// Views tile vectors as their bytes.
     pub(super) fn as_bytes(vecs: &[Self]) -> &[u8] {
         // SAFETY: `TileVec` is `repr(C)` over `[u8; 16]` with no padding, so
         // the slice covers `16 * len` initialized bytes for its lifetime.
@@ -206,7 +203,6 @@ impl TileVec {
         }
     }
 
-    /// Views tile vectors as their bytes, writable.
     pub(super) fn as_bytes_mut(vecs: &mut [Self]) -> &mut [u8] {
         // SAFETY: as in `as_bytes`; the exclusive borrow of `vecs` passes to
         // the returned slice, and every byte pattern is a valid `[u8; 16]`.
@@ -296,7 +292,6 @@ impl Activations {
     }
 }
 
-/// A byte range inside the workspace allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Region {
     pub(super) offset: usize,
@@ -1510,7 +1505,6 @@ pub(super) fn fault_vendor_launch() -> Result<(), DeviceFailure> {
     checked(status, stage)
 }
 
-/// Returns the adapter's description of a status code.
 pub(super) fn status_message(status: c_int) -> String {
     // SAFETY: the adapter returns a pointer to a static, NUL-terminated string
     // for every status.
@@ -1670,7 +1664,6 @@ mod tests {
             Err(invalid_argument())
         );
         assert_eq!(run(usize::MAX - 15, &x, &mut y), Err(invalid_argument()));
-        // Wrong input and output lengths.
         assert_eq!(run(0, &x[1..], &mut y), Err(invalid_argument()));
         assert_eq!(run(0, &x, &mut y[1..]), Err(invalid_argument()));
         // A scratch region one float too short for the input.

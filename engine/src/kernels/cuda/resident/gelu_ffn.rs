@@ -18,7 +18,6 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::gelu_ffn::{GeluFfnRaw, gelu_ffn_launch};
 
-/// One gelu_ffn call: gate and up rows in, the activated product in out.
 pub(crate) struct GeluFfnCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) gate: DeviceRange<'b>,
@@ -28,7 +27,6 @@ pub(crate) struct GeluFfnCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the gelu_ffn of call on stream, writing call.out.
     pub(crate) fn gelu_ffn(
         &self,
         stream: &DeviceStream,

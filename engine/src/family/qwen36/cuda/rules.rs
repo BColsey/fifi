@@ -8,7 +8,6 @@
 use super::{dims::StepOptions, resources::check_stage1_options};
 use crate::EngError;
 use std::sync::Arc;
-/// The model facts of one engine that every `decode` call applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QwenRules {
     pub(crate) eos: Arc<[u32]>,
@@ -16,9 +15,7 @@ pub(crate) struct QwenRules {
 }
 
 impl QwenRules {
-    /// `sampler_vocab` must lie in `1..=head_vocab`, the width of the model head, and `eos`
-    /// must be a non-empty list of distinct ids inside `0..sampler_vocab`: an id the sampler
-    /// can never draw is not an end-of-sequence id.
+    /// An id the sampler can never draw is not an end-of-sequence id.
     pub(crate) fn new(
         eos: Vec<u32>,
         sampler_vocab: usize,
@@ -53,9 +50,8 @@ impl QwenRules {
     }
 }
 
-/// Refuses a model head narrower than the sampler vocabulary. The head tensor is padded to
-/// `head_rows` rows while the sampler draws from `sampler_vocab` ids, so `head_rows` must be at
-/// least `sampler_vocab`; the rows above it are padding.
+/// The head tensor is padded to `head_rows` rows while the sampler draws from `sampler_vocab`
+/// ids; the rows above it are padding.
 pub(super) fn check_vocab(head_rows: usize, sampler_vocab: usize) -> Result<(), EngError> {
     if head_rows < sampler_vocab {
         return Err(EngError::Checkpoint(format!(

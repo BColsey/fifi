@@ -123,7 +123,6 @@ impl ResidentSnapshot {
         self.pos
     }
 
-    /// Bytes that the snapshot charges to the session budget.
     pub(super) fn charged_bytes(&self) -> u64 {
         self.charge.retained_bytes()
     }
@@ -194,7 +193,6 @@ impl ResidentState {
         })
     }
 
-    /// Position of the next token.
     pub(super) fn pos(&self) -> u32 {
         self.pos
     }
@@ -283,7 +281,6 @@ impl ResidentState {
         std::mem::take(&mut self.layers)
     }
 
-    /// Bytes held by the permits of the committed steps.
     fn charged_bytes(&self) -> Result<u64, EngError> {
         self.permits
             .iter()
@@ -745,7 +742,6 @@ mod snapshot_tests {
         (ckpt, flash)
     }
 
-    /// A decoder on the synthetic checkpoint whose session budget holds `cap` bytes.
     fn decoder_with_cap<'c>(
         ckpt: &'c StreamedCheckpoint,
         flash: &FlashWeights,
@@ -757,7 +753,6 @@ mod snapshot_tests {
         decoder
     }
 
-    /// Runs `tokens` as `Prompt` steps.
     fn prefill(decoder: &mut ResidentDecoder<'_>, state: &mut ResidentState, tokens: &[u32]) {
         for &token in tokens {
             decoder.step(state, token, StepMode::Prompt).unwrap();
@@ -782,7 +777,6 @@ mod snapshot_tests {
         out
     }
 
-    /// The `len` of every QSA layer in `layers`, in model order.
     fn qsa_lens(layers: &[LayerState]) -> Vec<usize> {
         layers
             .iter()
@@ -793,7 +787,6 @@ mod snapshot_tests {
             .collect()
     }
 
-    /// Reads back every array in `list`.
     fn read(decoder: &mut ResidentDecoder<'_>, list: Vec<&ExecutionTensor>) -> Vec<Vec<f32>> {
         list.into_iter()
             .map(|tensor| values(&mut decoder.kernels, tensor).unwrap())

@@ -76,7 +76,6 @@ fn matches_the_frozen_reference() {
     }
 }
 
-/// The wrapper refuses a cap that is not above zero before any native call.
 #[test]
 fn refuses_a_cap_that_is_not_above_zero() {
     if !testkit::device_present("softcap cap refusal") {
@@ -100,7 +99,6 @@ fn refuses_a_cap_that_is_not_above_zero() {
     assert!(matches!(err, crate::EngError::BadRequest(_)), "{err:?}");
 }
 
-/// The wrapper refuses a width that is not a multiple of 32 before any native call.
 #[test]
 fn refuses_a_width_that_is_not_a_multiple_of_32() {
     if !testkit::device_present("softcap width refusal") {

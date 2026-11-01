@@ -162,7 +162,6 @@ fn read_index(dir: &Path) -> Result<BTreeMap<String, String>, EngError> {
     parse_weight_map(&bytes)
 }
 
-/// Every schema name is in the index and every index name is in the schema.
 fn check_names(specs: &[Spec], shard_of: &BTreeMap<String, String>) -> Result<(), EngError> {
     let expected: BTreeSet<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
     let missing: Vec<&str> = expected
@@ -215,7 +214,6 @@ fn check_headers(
     Ok(rates)
 }
 
-/// Each shard's file length must equal its prefix, header and the schema's tensor bytes.
 fn check_extents(
     dir: &Path,
     specs: &[Spec],
@@ -257,7 +255,6 @@ fn check_extents(
     Ok(extents)
 }
 
-/// Returns the payload length when it equals the bytes the schema's tensors occupy.
 pub(super) fn payload_matches(
     shard: &str,
     file_len: u64,

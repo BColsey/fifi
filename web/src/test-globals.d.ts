@@ -1,6 +1,7 @@
 /**
- * Minimal ambient declarations for the Node built-in test modules the unit
- * tests import. The devDependencies stay exactly typescript and vite.
+ * The devDependencies stay exactly typescript and vite: the unit tests
+ * get the Node built-ins they import from these minimal ambient
+ * declarations instead.
  */
 
 declare module "node:test" {

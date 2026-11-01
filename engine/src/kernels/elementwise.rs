@@ -5,18 +5,13 @@ pub(crate) struct ElementwiseLayout {
     pub(crate) byte_len: u64,
 }
 
-/// Facts about the operands of one elementwise call, computed by the caller.
 pub(crate) struct ElementwiseInputs<'a> {
-    /// Every operand belongs to the calling adapter's native owner.
     pub(crate) owners_match: bool,
-    /// Every operand has dtype `F32`.
     pub(crate) dtypes_f32: bool,
     pub(crate) shape: &'a [u32],
-    /// The second operand's shape for a binary operation.
     pub(crate) other_shape: Option<&'a [u32]>,
 }
 
-/// Whether the operation reduces over a last axis.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisRule {
     Any,
@@ -36,8 +31,7 @@ pub(crate) fn validate(
     })
 }
 
-/// NumPy broadcasting of two shapes, aligned from the last axis. Each axis pair must be equal,
-/// or one of them must be 1. A missing leading axis counts as 1. Returns the output shape.
+/// NumPy broadcasting of two shapes.
 pub(crate) fn broadcast_shape(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
     let rank = a.len().max(b.len());
     let mut shape = vec![0; rank];
@@ -59,7 +53,6 @@ pub(crate) fn broadcast_shape(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
     Some(shape)
 }
 
-/// Validates a broadcasting binary operation and returns the output layout.
 pub(crate) fn validate_broadcast(
     operation: &'static str,
     owners_match: bool,

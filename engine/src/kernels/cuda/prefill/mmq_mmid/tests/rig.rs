@@ -42,12 +42,10 @@ pub(super) fn small_qwen(m: usize) -> MmidShape {
     }
 }
 
-/// `values` as little-endian bytes.
 pub(super) fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// The little-endian f32 values of `bytes`.
 pub(super) fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()
@@ -57,12 +55,10 @@ pub(super) fn f32s(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// `n` f32 values, all the NaN prefill, as bytes.
 pub(super) fn nan_bytes(n: usize) -> Vec<u8> {
     f32_bytes(&vec![f32::from_bits(NAN_BITS); n])
 }
 
-/// `rows` rows of `k` standard normal f32 values from one seed.
 pub(super) fn normal_rows(rows: usize, k: usize, seed: u64) -> Vec<f32> {
     let mut rng = Rng::new(seed);
     (0..rows * k).map(|_| rng.normal() as f32).collect()
@@ -203,7 +199,6 @@ impl LaunchSpec<'_> {
     }
 }
 
-/// What one launch left on the device, as host values.
 pub(super) struct Launched {
     /// `ne * ld` outputs followed by `CANARY` floats, NaN-prefilled before the launch.
     pub(super) dst: Vec<f32>,

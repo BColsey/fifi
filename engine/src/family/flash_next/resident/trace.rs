@@ -14,7 +14,6 @@ pub(super) const TRACE_SCHEMA: &str = "s3-route-trace/1";
 /// Gate sums of a renormalized selection must be 1 within this bound.
 const GATE_SUM_TOLERANCE: f32 = 1e-5;
 
-/// The kind of a traced step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TraceMode {
     /// A prompt token whose logits are unused (`StepMode::Prompt`), written as `p`.
@@ -37,12 +36,10 @@ impl TraceMode {
 pub(super) struct TraceStep {
     /// The prompt id from the prompts file.
     pub(super) prompt: u32,
-    /// The position of the input token.
     pub(super) pos: u32,
     pub(super) mode: TraceMode,
 }
 
-/// One MoE layer of one step.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RouteRow {
     pub(super) step: TraceStep,
@@ -62,7 +59,6 @@ pub(super) struct RouteTrace {
 }
 
 impl RouteTrace {
-    /// Sets the step of the next rows.
     pub(super) fn begin(&mut self, step: TraceStep) {
         self.step = Some(step);
     }
@@ -86,7 +82,6 @@ impl RouteTrace {
         Ok(())
     }
 
-    /// Returns the rows pushed since the last `take` and clears the step.
     pub(super) fn take(&mut self) -> Vec<RouteRow> {
         self.step = None;
         std::mem::take(&mut self.rows)
@@ -208,14 +203,12 @@ mod tests {
         (vec![(2, 0.5 / 0.75), (0, 0.25 / 0.75)], probs)
     }
 
-    /// Layer 1 selects experts 1 and 3 with gates 0.75 and 0.25.
     fn layer1() -> (Vec<(u32, f32)>, Vec<f32>) {
         let probs = vec![0.125, 0.375, 0.375, 0.125];
         // Experts 1 and 2 tie at 0.375; the lower index ranks first, so the second pick is 2.
         (vec![(1, 0.5), (2, 0.5)], probs)
     }
 
-    /// One valid step of two layers, pushed through the recorder.
     fn traced_step() -> Vec<RouteRow> {
         let mut trace = RouteTrace::default();
         trace.begin(STEP);

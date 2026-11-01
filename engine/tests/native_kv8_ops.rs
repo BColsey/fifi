@@ -25,14 +25,12 @@ fn f32_input(shape: Vec<u32>, values: &[f32]) -> Tensor {
     .unwrap()
 }
 
-/// A deterministic F32 tensor of `shape` from a value function, without naming every value.
 fn f32_pattern(shape: &[u32], value: impl Fn(usize) -> f32) -> Tensor {
     let count: usize = shape.iter().map(|&dim| dim as usize).product();
     let values: Vec<f32> = (0..count).map(value).collect();
     f32_input(shape.to_vec(), &values)
 }
 
-/// A deterministic U32 tensor of `shape` from a value function.
 fn u32_pattern(shape: &[u32], value: impl Fn(usize) -> u32) -> Tensor {
     let count: usize = shape.iter().map(|&dim| dim as usize).product();
     Tensor::try_from_host(
@@ -56,7 +54,6 @@ fn values_of(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-/// Reads U32 values out of raw readback bytes.
 fn u32_from_bytes(bytes: &[u8]) -> Vec<u32> {
     bytes
         .as_chunks::<4>()
@@ -70,7 +67,6 @@ fn u32_values(tensor: &Tensor) -> Vec<u32> {
     u32_from_bytes(tensor.host_bytes().unwrap())
 }
 
-/// Decodes BF16 readback bytes to F32 (each BF16 value is the top half of an F32).
 fn bf16_values(tensor: &Tensor) -> Vec<f32> {
     tensor
         .host_bytes()
@@ -90,7 +86,6 @@ fn read(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Tensor {
     kernels.readback(tensor).unwrap()
 }
 
-/// Compares two f32 slices within 1e-5 relative to max(1, |expected|).
 fn assert_within(actual: &[f32], expected: &[f32], context: &str) {
     assert_eq!(actual.len(), expected.len(), "{context}: {actual:?}");
     for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
@@ -101,7 +96,6 @@ fn assert_within(actual: &[f32], expected: &[f32], context: &str) {
     }
 }
 
-/// The affine 8-bit spec of every test here: group `group`, bits 8.
 fn affine(group: u32) -> QuantizationSpec {
     QuantizationSpec {
         mode: QuantizationMode::Affine,
@@ -139,7 +133,6 @@ fn dequantized_block(
     read(kernels, &dequantized)
 }
 
-/// The first `len` rows (axis two) of a rank-four host tensor, head by head.
 fn first_rows(tensor: &Tensor, len: u32) -> Tensor {
     let &[_, heads, cap, last] = tensor.shape() else {
         panic!(
@@ -713,7 +706,6 @@ fn quantized_attention_prefix_round_trips_quantize_append_and_attention() {
     );
 }
 
-/// The mean wall time of ten readback-complete rounds of `build`, after one warm-up round.
 fn timed_rounds(
     kernels: &mut MlxKernels,
     label: &str,

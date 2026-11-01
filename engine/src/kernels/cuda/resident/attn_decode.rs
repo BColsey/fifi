@@ -45,17 +45,13 @@ use crate::kernels::cuda::native::resident::attn_decode::{
 
 /// Query heads per kv head; the lane layout of the kernel needs exactly 8.
 const GROUP: usize = 8;
-/// The most tokens one call takes.
 const MAX_TOKENS: usize = 16;
 /// The most kv heads (the kernel's grid and the part layout are sized for it).
 const MAX_KV_HEADS: usize = 64;
 /// The most splits (one thread per split in the combine statistics step).
 const MAX_SPLITS: usize = 128;
-/// The fewest keys per split is a multiple of this tile of keys.
 const TILE_KEYS: usize = 32;
-/// The largest `min_keys`.
 const MAX_MIN_KEYS: usize = 1 << 20;
-/// Exclusive upper bound of the score scale.
 const SCALE_LIMIT: f32 = 1e30;
 
 /// Geometry of one call: `m` tokens, `n_head` query heads over `n_kv_head` kv heads (exactly 8
@@ -135,14 +131,11 @@ pub(crate) struct AttnDecodeCall<'b> {
     pub(crate) out: DeviceRange<'b>,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("attn_decode: {tag}: {detail}"))
 }
 
 /// Bytes of the `part` scratch: `m * n_kv_head * max_splits * 8 * (2 + head_dim) * 4`.
-///
-/// Returns `BadRequest` ("size overflow") when the product does not fit `usize`.
 pub(crate) fn attn_part_bytes(
     m: usize,
     n_kv_head: usize,
@@ -158,12 +151,10 @@ pub(crate) fn attn_part_bytes(
         .ok_or_else(|| rule("size overflow", "the part scratch size overflows"))
 }
 
-/// `value` as `c_int`, or the "exceeds i32" refusal naming `name`.
 fn to_int(name: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule("exceeds i32", &format!("{name} is {value}")))
 }
 
-/// `value` as `c_int` for the signed window and ring.
 fn signed_int(name: &str, value: i64) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule("exceeds i32", &format!("{name} is {value}")))
 }
@@ -187,7 +178,7 @@ fn convert_ints(call: &AttnDecodeCall<'_>) -> Result<AttnInts, EngError> {
     })
 }
 
-/// Rule (3), geometry: tokens, heads, head size, row counts, the projection row.
+/// Rule (3), geometry.
 fn check_geometry(call: &AttnDecodeCall<'_>) -> Result<(), EngError> {
     let shape = &call.shape;
     if !(1..=MAX_TOKENS).contains(&shape.m) {
@@ -215,8 +206,7 @@ fn check_geometry(call: &AttnDecodeCall<'_>) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Rule (3), window and ring: a ring needs a window, holds the window plus the later tokens of
-/// the batch and fits the cache. The sum is in `i64`: `window` may be `i32::MAX`.
+/// Rule (3), window and ring. The sum is in `i64`: `window` may be `i32::MAX`.
 fn check_span(call: &AttnDecodeCall<'_>) -> Result<(), EngError> {
     let (span, shape) = (&call.span, &call.shape);
     if span.window < 0 {
@@ -262,7 +252,6 @@ fn check_plan(call: &AttnDecodeCall<'_>) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Bytes each range must hold, from checked arithmetic.
 struct Needs {
     q: usize,
     proj: usize,
@@ -271,7 +260,6 @@ struct Needs {
     out: usize,
 }
 
-/// Product of the factors, or the "size overflow" refusal.
 fn product(factors: &[usize]) -> Result<usize, EngError> {
     factors
         .iter()
@@ -279,7 +267,7 @@ fn product(factors: &[usize]) -> Result<usize, EngError> {
         .ok_or_else(|| rule("size overflow", "a range size overflows"))
 }
 
-/// Rules (4) and (5), the sizes: every product is checked.
+/// Rules (4) and (5), the sizes.
 fn needs(call: &AttnDecodeCall<'_>) -> Result<Needs, EngError> {
     let shape = &call.shape;
     let heads = product(&[shape.n_head, shape.head_dim])?;
@@ -301,7 +289,7 @@ fn needs(call: &AttnDecodeCall<'_>) -> Result<Needs, EngError> {
     })
 }
 
-/// Rules (4) and (5), size and alignment, one `require_fit` per range.
+/// Rules (4) and (5), size and alignment.
 fn check_fit(call: &AttnDecodeCall<'_>, need: &Needs) -> Result<(), EngError> {
     require_fit("q", &call.q, need.q, 16)?;
     if let Some(proj) = &call.proj {
@@ -314,8 +302,8 @@ fn check_fit(call: &AttnDecodeCall<'_>, need: &Needs) -> Result<(), EngError> {
     require_fit("out", &call.out, need.out, 4)
 }
 
-/// Rule (6), disjointness: `out` and `part` are written, so each is apart from every other range
-/// (11 pairs with `proj`); the inputs may overlap each other.
+/// Rule (6), disjointness: `out` and `part` are written, so each is apart from every other
+/// range; the inputs may overlap each other.
 fn check_apart(call: &AttnDecodeCall<'_>, need: &Needs) -> Result<(), EngError> {
     let out = Claim::of("out", &call.out, need.out);
     let part = Claim::of("part", &call.part, need.part);

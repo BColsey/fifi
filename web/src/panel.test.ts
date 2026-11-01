@@ -1,13 +1,8 @@
-/** Tests of the panel's recent-rows state under injected fakes (no
- * global mocks, no real timers), the probe merge, and the poll's per-tick
- * decision (node:test; no DOM). */
-
 import { test } from "node:test";
 import { ok, strictEqual } from "node:assert";
 import { applyProbe, pollPlan, refreshRecentRows } from "./panel.js";
 import type { RecentRequest } from "./api.js";
 
-/** A finished row with a speed, like the ring's. */
 function row(tokens: number): RecentRequest {
   return {
     model: "m",
@@ -23,8 +18,6 @@ function row(tokens: number): RecentRequest {
   };
 }
 
-/** A ring that answers; the signal is accepted so the abort path stays
- * honest. */
 const answers: (signal: AbortSignal) => Promise<{ requests: RecentRequest[] }> = (
   signal: AbortSignal
 ) => {
@@ -32,7 +25,6 @@ const answers: (signal: AbortSignal) => Promise<{ requests: RecentRequest[] }> =
   return Promise.resolve({ requests: [row(2)] });
 };
 
-/** A route that cannot be reached at all. */
 const rejects = () => Promise.reject(new TypeError("offline"));
 
 const frozenClock = () => 12345;
@@ -83,7 +75,6 @@ test("a hung route is cut by the abort and reported as unreachable", async () =>
 });
 
 test("a failed probe fully replaces the panel: no last-good ok survives a fresh timestamp", () => {
-  // A panel that was healthy a moment ago...
   const wasHealthy = applyProbe({
     healthOk: true,
     readyOk: true,
@@ -94,7 +85,6 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
     recentError: null,
   });
   ok(wasHealthy.healthOk && wasHealthy.readyOk && wasHealthy.recent !== null);
-  // ...the engine dies, the next full sweep finds nothing reachable:
   const now = applyProbe({
     healthOk: false,
     readyOk: false,

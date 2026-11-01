@@ -11,7 +11,6 @@ use crate::kernels::cuda::native::resident::expert_activation::{
     ReluSquaredRaw, relu_squared_launch,
 };
 
-/// One elementwise relu-squared: `values` f32, out disjoint from x.
 pub(crate) struct ReluSquaredCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) x: DeviceRange<'b>,
@@ -19,7 +18,6 @@ pub(crate) struct ReluSquaredCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the elementwise relu-squared of call on stream, writing call.out.
     pub(crate) fn relu_squared(
         &self,
         stream: &DeviceStream,

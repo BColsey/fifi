@@ -35,7 +35,6 @@ use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 /// The frozen NMSE bounds of the gate/up and down classes.
 const GATE_UP_NMSE: f64 = 1e-3;
 const DOWN_NMSE: f64 = 2e-3;
-/// Timed launches per pass.
 const SAMPLES: usize = 20;
 
 /// The expert column counts of a launch from its `expert_bounds`.

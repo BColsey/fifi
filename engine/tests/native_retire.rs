@@ -51,7 +51,6 @@ fn active_bytes() -> usize {
     active
 }
 
-/// Waits up to 200 ms for active memory to fall to at most `ceiling` bytes.
 fn assert_active_falls_to(ceiling: usize, context: &str) {
     for _ in 0..20 {
         if active_bytes() <= ceiling {
@@ -65,7 +64,6 @@ fn assert_active_falls_to(ceiling: usize, context: &str) {
     );
 }
 
-/// Asserts that `MlxKernels::try_new` refuses admission because two adapter leases are held.
 fn assert_admission_refused(context: &str) {
     match MlxKernels::try_new() {
         Err(EngError::Backend { message, .. }) => assert!(

@@ -107,7 +107,6 @@ pub(in crate::kernels::cuda) struct Kv8Ints {
     pub(in crate::kernels::cuda) code_scale: c_int,
 }
 
-/// The ranges every entry shares: the f32 k and v rows in, the four planes out.
 pub(in crate::kernels::cuda) struct Kv8DataRaw<'a> {
     pub(in crate::kernels::cuda) k: RawRange<'a>,
     pub(in crate::kernels::cuda) v: RawRange<'a>,
@@ -125,20 +124,18 @@ pub(in crate::kernels::cuda) struct Kv8WordsRaw<'a> {
     pub(in crate::kernels::cuda) status: RawRange<'a>,
 }
 
-/// The bytes each range must hold and the alignment of every start (4: the kernel reads f32
-/// words and 4-byte packets of int8 codes, and the fp16 scales start at a multiple of 64 bytes).
+/// Alignment 4: the kernel reads f32 words and 4-byte packets of int8 codes, and the fp16
+/// scales start at a multiple of 64 bytes.
 struct Needs {
     rows: usize,
     codes: usize,
     scales: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -161,14 +158,10 @@ fn needs(ints: &Kv8Ints) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of 4.
 fn fits(range: &RawRange<'_>, need: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(4)
 }
 
-/// Proves the six data ranges of both entries: sizes, alignment, and that the four written
-/// ranges (both code arrays, both scale arrays) share no byte with each other or with the two
-/// read ranges.
 fn check_data(io: &Kv8DataRaw<'_>) -> Result<(), DeviceFailure> {
     if !matches!(io.ints.code_scale, 1 | 2) {
         return Err(invalid_argument());
@@ -199,8 +192,6 @@ fn check_data(io: &Kv8DataRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Proves the two words of the decode entry: 4 bytes each, 4-aligned, and apart from every range
-/// the kernel writes.
 fn check_words(io: &Kv8DataRaw<'_>, words: &Kv8WordsRaw<'_>) -> Result<(), DeviceFailure> {
     if !(fits(&words.pos, 4) && fits(&words.status, 4)) {
         return Err(invalid_argument());
@@ -222,8 +213,6 @@ fn check_words(io: &Kv8DataRaw<'_>, words: &Kv8WordsRaw<'_>) -> Result<(), Devic
     Ok(())
 }
 
-/// Queues the decode append (m rows at the device position word) on `stream`. Returns when it
-/// is queued.
 pub(in crate::kernels::cuda) fn kv8_append_launch(
     stream: &RawStream,
     io: Kv8DataRaw<'_>,
@@ -259,8 +248,6 @@ pub(in crate::kernels::cuda) fn kv8_append_launch(
     checked(status, stage)
 }
 
-/// Queues the chunk append (t rows at the host base position `pos0`) on `stream`. Returns when
-/// it is queued.
 pub(in crate::kernels::cuda) fn kv8_chunk_launch(
     stream: &RawStream,
     io: Kv8DataRaw<'_>,

@@ -1,8 +1,4 @@
-//! Request failures and their HTTP form.
-//!
 //! The table "Error codes" in the server design is normative.
-//! `EngError` itself is defined in the engine crate. This wrapper adds the
-//! three variants that only the server needs.
 
 use crate::EngError;
 use axum::Json;
@@ -16,7 +12,6 @@ pub(crate) const BACKEND_MESSAGE: &str = "Model execution failed.";
 /// A failure that a route returns or that a stream reports after its headers.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServerError {
-    /// An engine failure.
     Eng(EngError),
     /// The bearer credential is missing or wrong.
     Unauthorized,
@@ -33,7 +28,6 @@ impl From<EngError> for ServerError {
 }
 
 impl ServerError {
-    /// The HTTP status of the failure.
     pub(crate) fn status(&self) -> StatusCode {
         match self {
             ServerError::Eng(EngError::BadRequest(_)) => StatusCode::BAD_REQUEST,
@@ -52,7 +46,6 @@ impl ServerError {
         }
     }
 
-    /// The `Error.code` value of the failure.
     pub(crate) fn code(&self) -> &'static str {
         match self {
             ServerError::Eng(EngError::BadRequest(_)) => "bad_request",
@@ -68,7 +61,7 @@ impl ServerError {
         }
     }
 
-    /// The client message. A `Backend` failure never shows its native diagnostic text.
+    /// A `Backend` failure never shows its native diagnostic text.
     pub(crate) fn message(&self) -> String {
         match self {
             ServerError::Eng(EngError::BadRequest(message))
@@ -87,12 +80,11 @@ impl ServerError {
         }
     }
 
-    /// The `Error` body of the contract. It also serves as the data of an `event: error`.
+    /// It also serves as the data of an `event: error`.
     pub(crate) fn body(&self) -> Value {
         json!({"error": {"message": self.message(), "code": self.code()}})
     }
 
-    /// Writes the native diagnostic text of a `Backend` failure to the local log.
     pub(crate) fn log(&self) {
         if let ServerError::Eng(EngError::Backend { operation, message }) = self {
             eprintln!("backend failure in {operation}: {message}");

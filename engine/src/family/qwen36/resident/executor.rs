@@ -96,7 +96,6 @@ const _: () = assert!(PREFILL_CANDIDATES[0] == MAX_CHUNK_ROWS);
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// The limits that the caller supplies.
 pub(crate) struct Q36Rules {
     /// Every id that ends generation (`TokenizerBundle::eos_token_ids`: 248046 and 248044).
     pub(crate) eos: Vec<u32>,
@@ -179,7 +178,6 @@ pub(crate) struct Q36Executor {
     log: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
-/// The mutable state of one session.
 pub(crate) struct Q36Session {
     state: ResidentState,
     /// The committed tokens, the pending token, and the finish flag.
@@ -251,7 +249,6 @@ impl TokenStepper for Q36Step<'_> {
     }
 }
 
-/// The number of positions that the native state has fed.
 fn fed_positions(state: &ResidentState) -> usize {
     usize::try_from(state.pos()).unwrap_or(usize::MAX)
 }
@@ -267,7 +264,6 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("{name}: {error}"))
 }
 
-/// Opens every shard of the checkpoint directory that the index names.
 fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
     let name = "model.safetensors.index.json";
     let index = std::fs::read(dir.join(name)).map_err(|error| io_error(name, &error))?;
@@ -581,7 +577,6 @@ impl Q36Executor {
         PrefillPath::of(self.chunk)
     }
 
-    /// The planned chunk size, or `None` when the prefill runs one-token steps.
     pub(crate) fn prefill_chunk(&self) -> Option<u32> {
         self.chunk
     }
@@ -2772,7 +2767,6 @@ mod tests {
         );
     }
 
-    /// A byte count from the environment variable `name`, or `default` when it is unset.
     fn env_u64(name: &str, default: Option<u64>) -> u64 {
         std::env::var(name).map_or_else(
             |_| default.unwrap_or_else(|| panic!("set {name}")),
@@ -3059,7 +3053,6 @@ mod tests {
 
     /// A prompt of 6 tokens whose first 4 tokens form the saved key.
     const PREFIX_PROMPT: [u32; 6] = [1, 2, 3, 4, 5, 6];
-    /// The key length of the prefix tests.
     const KEY: usize = 4;
     /// The context limit of the prefix tests: a 6-token prompt and 6 logits steps (the pending
     /// token and `FORCED`) feed 11 positions, and one more stays free.
@@ -3114,7 +3107,6 @@ mod tests {
             .unwrap()
     }
 
-    /// The largest absolute difference of two equal-length rows.
     fn max_gap(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)

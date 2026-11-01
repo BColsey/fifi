@@ -80,19 +80,16 @@ pub(in crate::kernels::cuda) struct EmbedRaw<'a> {
     pub(in crate::kernels::cuda) k: c_int,
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// Bytes each range of a gather must hold.
 struct Needs {
     tiles: usize,
     ids: usize,
     x: usize,
 }
 
-/// The sizes of a gather, or `None` for a type, shape or token count the kernel refuses.
 fn needs(call: &EmbedRaw<'_>) -> Option<Needs> {
     let m = usize::try_from(call.m).ok()?;
     let rows = usize::try_from(call.n_rows).ok()?;
@@ -118,9 +115,6 @@ fn needs(call: &EmbedRaw<'_>) -> Option<Needs> {
     })
 }
 
-/// Proves a gather before the native call: type, shape, `m`, sizes, alignment (tiles and `x` 16,
-/// ids and status 4) and that `x` and `status`, which the kernel writes, overlap none of the other
-/// ranges.
 fn check_embed(call: &EmbedRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(call).ok_or_else(invalid_argument)?;
     let sized = fits(&call.tiles, need.tiles, 16)
@@ -144,7 +138,6 @@ fn check_embed(call: &EmbedRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gather of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn embed_launch(
     stream: &RawStream,
     call: &EmbedRaw<'_>,
@@ -219,8 +212,7 @@ pub(in crate::kernels::cuda) struct EmbedNativeRaw<'a> {
     pub(in crate::kernels::cuda) k: c_int,
 }
 
-/// Bytes each range of a native gather must hold: Q4_K only, any row count from 1 up (no
-/// 8-row rule), `k` a multiple of 256. `None` for a shape or token count the kernel refuses.
+/// Q4_K only, any row count from 1 up (no 8-row rule), `k` a multiple of 256.
 struct NativeNeeds {
     blocks: usize,
     ids: usize,
@@ -246,9 +238,6 @@ fn native_needs(call: &EmbedNativeRaw<'_>) -> Option<NativeNeeds> {
     })
 }
 
-/// Proves a native gather before the native call: shape, `m`, sizes, alignment (blocks and `x`
-/// 16, ids and status 4) and that `x` and `status`, which the kernel writes, overlap none of the
-/// other ranges.
 fn check_embed_native(call: &EmbedNativeRaw<'_>) -> Result<(), DeviceFailure> {
     let need = native_needs(call).ok_or_else(invalid_argument)?;
     let sized = fits(&call.blocks, need.blocks, 16)
@@ -270,7 +259,6 @@ fn check_embed_native(call: &EmbedNativeRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the native Q4_K gather of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn embed_native_launch(
     stream: &RawStream,
     call: &EmbedNativeRaw<'_>,
@@ -544,8 +532,6 @@ mod tests {
             assert!(check_embed(&call).is_err(), "check_embed refuses {why}");
         }
     }
-
-    // --- The native twin ----------------------------------------------------------------
 
     const BLOCKS: usize = 0x50_0000;
 

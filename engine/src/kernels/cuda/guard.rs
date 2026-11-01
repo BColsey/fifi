@@ -20,7 +20,6 @@ use std::{
 
 use crate::EngError;
 
-/// The most adapter leases that the process admits at once.
 pub(super) const MAX_LEASES: usize = 2;
 
 static DISPATCH: Mutex<()> = Mutex::new(());

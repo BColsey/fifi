@@ -504,11 +504,9 @@ fn failed_import_synchronization_is_terminal() {
 const RETAINED_ELEMENTS: u32 = 1 << 20;
 const RETAINED_BYTES: usize = RETAINED_ELEMENTS as usize * 4;
 
-/// Resident inputs for one operation call.
 struct Operands {
     tensors: Vec<ExecutionTensor>,
     weight: Option<ResidentPackedWeight>,
-    /// A dense cache for the attention caller.
     cache: Option<KvStore>,
 }
 

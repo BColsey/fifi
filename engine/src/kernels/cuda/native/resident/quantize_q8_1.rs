@@ -29,7 +29,7 @@ unsafe extern "C" {
 }
 
 /// Mirror of `inference_cuda_quantize_q8_1_args` (`quantize_q8_1.h`), field for field.
-/// The layout is pinned below and by the `static_assert` of the header.
+/// The layout is pinned as well by the `static_assert` of the header.
 #[repr(C)]
 struct QuantizeArgsRepr {
     x: *const c_void,
@@ -46,8 +46,6 @@ const _: () = assert!(
         && offset_of!(QuantizeArgsRepr, ncols) == 20
 );
 
-/// What one quantize launch reads and writes: `x` holds `ncols` rows of `k` f32 values, `y`
-/// receives the `block_q8_1` rows of the padded width.
 pub(in crate::kernels::cuda) struct QuantizeRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) y: RawRange<'a>,
@@ -64,8 +62,6 @@ fn q8_1_bytes_native(k: usize, ncols: usize) -> Option<usize> {
     blocks.checked_mul(36)?.checked_mul(ncols)
 }
 
-/// Proves a quantize launch before the native call: `k` a multiple of 32, `ncols` in `1..=8`,
-/// `x` and `y` sized and 4-byte aligned, and `y` disjoint from `x`.
 fn check_quantize(call: &QuantizeRaw<'_>) -> Result<(), DeviceFailure> {
     let (k, ncols) = (call.k, call.ncols);
     let x_bytes = k
@@ -83,7 +79,6 @@ fn check_quantize(call: &QuantizeRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the q8_1 quantize of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn quantize_q8_1_launch(
     stream: &RawStream,
     call: &QuantizeRaw<'_>,
@@ -111,9 +106,6 @@ mod tests {
     use super::super::RawDevice;
     use super::*;
 
-    /// The arguments of one launch as plain numbers; the addresses are made up and apart. Each
-    /// case changes one thing so the entry refuses before it reaches the device, and a valid
-    /// call is never made (the CPU runner has no driver).
     #[derive(Clone, Copy)]
     struct Args {
         x: usize,
@@ -183,8 +175,6 @@ mod tests {
         })
     }
 
-    /// Host only: the native check against the ranges of an unbacked allocation. The valid
-    /// layout passes; each case changes one thing and is refused.
     #[test]
     fn check_quantize_refuses_short_unpadded_misaligned_and_overlapping_ranges() {
         let device = RawDevice::unbacked(1 << 20);

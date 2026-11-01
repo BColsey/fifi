@@ -28,9 +28,9 @@ use crate::kernels::cuda::context::{
 use crate::kernels::cuda::native::resident::add_rmsnorm_q8::{AddNormQ8Raw, add_rmsnorm_q8_launch};
 use crate::kernels::cuda::resident::quantize_q8_1::q8_1_bytes;
 
-/// `n` is a multiple of this (the vendored kernel's unit, as `add_norm_pack`).
+/// The vendored kernel's unit, as `add_norm_pack`.
 pub(crate) const NORM_WIDTH_UNIT: usize = 256;
-/// The widest row one call takes (the vendored `kern::kMaxK`).
+/// The vendored `kern::kMaxK`.
 pub(crate) const MAX_WIDTH: usize = 32_768;
 
 /// One fused add, norm and q8_1 quantize call of the resident step's row. All ranges are device
@@ -53,8 +53,6 @@ pub(crate) struct AddNormQ8Call<'b> {
     pub(crate) q8: DeviceRange<'b>,
 }
 
-/// Bytes of the ranges an `add_rmsnorm_q8` call uses: `n` floats for `h`, `delta`, `weight` and
-/// `norm_out`, and the padded `block_q8_1` row for `q8`. `None` on overflow.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AddNormQ8Needs {
     pub(crate) row: usize,
@@ -62,7 +60,6 @@ pub(crate) struct AddNormQ8Needs {
     pub(crate) q8: usize,
 }
 
-/// The byte counts the wrapper checks a call against. Pure: no context, no device.
 pub(crate) fn add_rmsnorm_q8_needs(n: usize) -> Option<AddNormQ8Needs> {
     Some(AddNormQ8Needs {
         row: n.checked_mul(4)?,
@@ -88,7 +85,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| add_rmsnorm_q8_launch(stream_raw, &raw))
     }
 
-    /// Every check of a call, then the native view of its ranges.
     fn plan_add_rmsnorm_q8<'b>(
         &self,
         call: &AddNormQ8Call<'b>,

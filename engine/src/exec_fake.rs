@@ -1,11 +1,6 @@
-//! The scripted test fake of the executor seam.
-//!
-//! The trait and `GenerationState` live in `crate::family::executor`.
-//!
 //! The fake keeps the real prefix rules: its session holds a real `DecodeSession` for the token
 //! side, and `save_prefix` / `restore_prefix` run through `DecodeSession::save_prefix` /
-//! `restore_prefix` and a real `PrefixStore`, the same code path the resident executors use. The
-//! saved state is `()`: the fake has no model, and the store never inspects a state.
+//! `restore_prefix` and a real `PrefixStore`, the same code path the resident executors use.
 
 use crate::EngError;
 use crate::family::executor::{ExecutorOps, GenerationState};
@@ -20,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// Locks the shared store. A poisoned lock means a test thread panicked while saving; the
-/// store is still readable, so the poison is cleared like every other lock in this crate.
+/// A poisoned lock means a test thread panicked while saving; the store is still readable, so
+/// the poison is cleared like every other lock in this crate.
 fn lock_store(
     store: &Mutex<PrefixStore<FakeSnapshot, u32>>,
 ) -> MutexGuard<'_, PrefixStore<FakeSnapshot, u32>> {
@@ -29,8 +24,7 @@ fn lock_store(
 }
 
 /// The saved state of a fake prefix entry: it holds the entry's budget permit, like the resident
-/// executors' snapshots, so dropping an entry releases its charge. Without a budget it holds
-/// nothing.
+/// executors' snapshots, so dropping an entry releases its charge.
 pub(crate) struct FakeSnapshot {
     #[allow(dead_code)]
     charge: Option<TestPermit>,
@@ -45,7 +39,6 @@ struct TestBudget {
     used: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// One charge against the fake's test budget. Dropping it releases the bytes.
 struct TestPermit {
     used: std::sync::Arc<std::sync::atomic::AtomicU64>,
     bytes: u64,
@@ -99,9 +92,8 @@ impl Drop for TestPermit {
     }
 }
 
-/// The fake's model side: it counts the fed positions and has no logits. It lives in the
-/// session, like the model state of the resident executors, so its positions reset with the
-/// session instead of surviving it.
+/// The fake's model side: it lives in the session, like the model state of the resident
+/// executors, so its positions reset with the session instead of surviving it.
 #[derive(Default)]
 struct CountingStepper {
     fed: usize,
@@ -138,7 +130,6 @@ pub(crate) struct FakeSession {
     /// prefix rules. The fake's scripted `decode` cannot enter it, because the real `decode`
     /// samples one token per call from logits, so the prompt tokens stay here and in `history`.
     core: DecodeSession,
-    /// The model side of the session: the count of fed positions.
     step: CountingStepper,
     /// The growth permits of the committed tokens: one per prefilled or decoded token batch, like
     /// the resident state's permits. `reset` and drop release them.
@@ -147,14 +138,12 @@ pub(crate) struct FakeSession {
 }
 
 /// Returns scripted token batches and applies the `decode` finish rules: EOS, output limit, and
-/// cancellation. It never matches stop strings. The output limit is the lower of the constructor
-/// cap and the job limit in `GenerationState`. Its prefix store is a real `PrefixStore` with the
-/// default limits (zero roots, one entry) or the limits that `with_prefix_limits` sets.
+/// cancellation. It never matches stop strings. Its prefix store is a real `PrefixStore` with
+/// the default limits (zero roots, one entry) or the limits that `with_prefix_limits` sets.
 pub(crate) struct FakeExecutor {
     script: VecDeque<Vec<u32>>,
     eos: Vec<u32>,
     remaining: u32,
-    /// The limits of the store, reported by `prefix_limits`.
     limits: StoreLimits,
     /// The real prefix store behind a lock, so a test can read it while the fake runs on the
     /// engine thread.
@@ -167,34 +156,22 @@ pub(crate) struct FakeExecutor {
     /// `deny_saves`, which the store degrades to a skipped save.
     deny_save_charge: bool,
     /// Denies the charge of the first `n` save calls only, so a test can deny one save point of a
-    /// job (a root) and let the later ones (the tip) run. A save call that the store serves as a
-    /// use of a duplicate key never reaches the snapshot closure but still counts.
+    /// job (a root) and let the later ones (the tip) run.
     deny_first_saves: usize,
     /// The number of save calls so far: one per `save_prefix` call, counted before the store
     /// decides whether a snapshot is needed. A save call that the store serves as a use of a
     /// duplicate key never reaches the snapshot closure but still counts.
     save_calls: usize,
-    /// Fails the next snapshot with this error, before the store sees its result.
     fail_snapshot: Option<EngError>,
-    /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`. A
-    /// reset clears it, so the report of a job without a boundary is a miss.
+    /// The kind of the entry that the last `restore_prefix` call restored, for `prefix_report`.
     prefix_hit: PrefixHit,
-    /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`;
-    /// a reset clears it too.
+    /// The `uncached_shared` count of the last `restore_prefix` call, for `prefix_report`.
     prefix_uncached: u32,
-    /// The session budget that prefill, decode, and prefix saves charge. `None` (the default) keeps
-    /// the uncharged behavior of earlier tests.
     budget: Option<TestBudget>,
-    /// The bytes one prefilled or decoded token charges when a budget is set.
     token_bytes: u64,
-    /// The bytes one stored prefix entry charges when a budget is set.
     entry_bytes: u64,
-    /// Whether the shadow block-LCP observation runs. A test turns it on with
-    /// `with_shadow_block_lcp`, which runs before the conversation, because it rebuilds the store
-    /// like `with_prefix_limits`.
     shadow_block_lcp: bool,
-    /// The shadow observation of the last `restore_prefix` call, for `prefix_report`; a reset
-    /// clears it, like `prefix_hit`.
+    /// The shadow observation of the last `restore_prefix` call, for `prefix_report`.
     prefix_shadow: Option<ShadowLcp>,
     /// The block prefix-match spacing: `None` keeps the save lattice unchanged; `Some(tokens)` cuts
     /// one rolling intermediate entry per lineage. A test sets it with `with_block_match` before
@@ -203,11 +180,7 @@ pub(crate) struct FakeExecutor {
     /// The reported `max_seqs`: the default 1 keeps the single-worker path - a test that wants its
     /// real store to run through the BATCH worker sets this above one before spawning the engine.
     max_seqs: usize,
-    /// `decode_window` calls so far: the single worker never advances a window, so a positive count
-    /// proves the batch branch ran.
     window_calls: Arc<std::sync::atomic::AtomicUsize>,
-    /// Denies the next restore's adoption once. Set through `deny_restore_once`; consumed by the
-    /// first restore whose closure runs.
     deny_restore_once: bool,
 }
 
@@ -276,8 +249,6 @@ impl FakeExecutor {
         self.entry_bytes = entry_bytes;
     }
 
-    /// Acquires `bytes` of growth from the installed budget, if any. A denial returns the
-    /// memory-plan error unchanged.
     fn charge(&mut self, bytes: u64) -> Result<Option<TestPermit>> {
         match &self.budget {
             Some(budget) => Ok(Some(budget.acquire(bytes)?)),
@@ -285,7 +256,6 @@ impl FakeExecutor {
         }
     }
 
-    /// Sets the limits of the prefix store. The default limits are zero roots and one entry.
     pub(crate) fn with_prefix_limits(&mut self, roots: usize, entries: usize) {
         self.limits = StoreLimits { roots, entries };
         *lock_store(&self.prefix) = PrefixStore::with_limits(self.limits);
@@ -300,8 +270,6 @@ impl FakeExecutor {
         *lock_store(&self.prefix) = store;
     }
 
-    /// The handle through which a test reads the store while the fake runs on its engine
-    /// thread.
     pub(crate) fn prefix_store(&self) -> Arc<Mutex<PrefixStore<FakeSnapshot, u32>>> {
         Arc::clone(&self.prefix)
     }
@@ -311,7 +279,7 @@ impl FakeExecutor {
         lock_store(&self.prefix).keys()
     }
 
-    /// Sets the numeric path revision. A saved prefix restores only under the revision that built it.
+    /// A saved prefix restores only under the revision that built it.
     pub(crate) fn set_numeric_revision(&mut self, revision: u32) {
         self.revision = revision;
     }
@@ -323,16 +291,10 @@ impl FakeExecutor {
         self.deny_saves = true;
     }
 
-    /// Denies the pool charge for a snapshot at the executor level, before the store's
-    /// graceful snapshot loop runs: the denial surfaces as a `MemoryPlan` error, unlike
-    /// `deny_saves`, which the store degrades to a skipped save.
     pub(crate) fn deny_save_charge(&mut self) {
         self.deny_save_charge = true;
     }
 
-    /// Denies the charge of the first `n` save calls only, so a test can deny one save point of a
-    /// job (a root) while the later ones (the tip) still run. A save call that the store serves as
-    /// a use of a duplicate key never reaches the snapshot closure but still counts.
     pub(crate) fn deny_first_saves(&mut self, n: usize) {
         self.deny_first_saves = n;
     }
@@ -396,8 +358,6 @@ impl ExecutorOps for FakeExecutor {
     }
 
     fn prefill(&mut self, st: &mut FakeSession, toks: &[u32]) -> Result<()> {
-        // The fake models no context limit, so every prompt fits. The growth charge runs before any
-        // session change, like the resident executor's pre-mutation rule.
         let bytes = u64::try_from(toks.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(self.token_bytes);
@@ -421,8 +381,6 @@ impl ExecutorOps for FakeExecutor {
         if st.history.is_empty() {
             return Err(EngError::BadRequest("decode before prefill".to_string()));
         }
-        // The growth charge for the batch runs before any history change, like the resident
-        // executor's pre-mutation rule.
         let permit = self.charge(self.token_bytes)?;
         if let Some(permit) = permit {
             st.permits.push(permit);
@@ -443,14 +401,12 @@ impl ExecutorOps for FakeExecutor {
                 tokens.push(id);
                 st.history.push(id);
                 if self.eos.contains(&id) {
-                    // The EOS id joins the consumed prefix and adds no text.
                     finish = Some(DecodeFinish::Stop);
                     break;
                 }
                 match generation.decoder.push(id) {
                     Ok(piece) => text.push_str(&piece),
                     Err(error) => {
-                        // An error resets the session.
                         let _ = self.reset(st);
                         return Err(error);
                     }
@@ -472,7 +428,6 @@ impl ExecutorOps for FakeExecutor {
                 }
             }
             if finish == Some(DecodeFinish::Cancelled) {
-                // A cancelled job resets the session.
                 let _ = self.reset(st);
             } else {
                 st.finished = true;
@@ -496,10 +451,8 @@ impl ExecutorOps for FakeExecutor {
         self.block_spacing
     }
 
-    /// The report of the fake's real store: the entries it holds, charged at a flat 1,000 bytes per
-    /// entry (the fake's saved state is `()`, so the charge is synthetic, but the plumbing that
-    /// sums and logs it is real), beside the kind of the entry the last restore took and the shared
-    /// tokens of that restore.
+    /// The report of the fake's real store: the entries it holds, charged at a flat 1,000 bytes
+    /// per entry. The charge is synthetic, but the plumbing that sums and reports it is real.
     fn prefix_report(&self) -> Option<PrefixReport> {
         let store = lock_store(&self.prefix);
         let entries = u32::try_from(store.roots_len() + store.entries_len()).unwrap_or(u32::MAX);
@@ -517,7 +470,7 @@ impl ExecutorOps for FakeExecutor {
 
     /// Evicts one LRU entry of the fake's real store per the incremental denial order and reports
     /// the bytes its permits released. Without an installed budget the eviction still runs; it
-    /// frees nothing to report. `None` when the store holds no LRU entry.
+    /// frees nothing to report.
     fn evict_one_prefix_entry(&mut self, protect: Option<u64>) -> Option<u64> {
         let before = self
             .budget
@@ -541,7 +494,6 @@ impl ExecutorOps for FakeExecutor {
         st.core.restored_anchor()
     }
 
-    /// The fake's own revision is its path, so the candidate is known without a session.
     fn restore_candidate(&self, prompt: &[u32]) -> Option<u64> {
         lock_store(&self.prefix).restore_candidate(prompt, &self.revision)
     }
@@ -560,8 +512,6 @@ impl ExecutorOps for FakeExecutor {
     }
 
     fn save_prefix(&mut self, st: &FakeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
-        // The committed tokens include every scripted token, so a save after a decode is
-        // refused before the session rules run.
         if st.history != key {
             return Err(EngError::BadRequest(
                 "prefix key differs from the committed tokens".to_string(),
@@ -621,7 +571,6 @@ impl ExecutorOps for FakeExecutor {
                 Ok(())
             })?;
         self.deny_restore_once = deny_once.load(Ordering::SeqCst);
-        // The restore facts of the report, read while the store is locked.
         self.prefix_hit = store.restored_kind().into();
         self.prefix_uncached = store.uncached_shared(prompt, covered);
         self.prefix_shadow = store.shadow_report();
@@ -653,7 +602,6 @@ mod tests {
         GenerationState::new(IncrementalDecoder::new(&tokenizer))
     }
 
-    /// A fake that holds `script` and a session that has prefilled one prompt token.
     fn prefilled(
         script: Vec<Vec<u32>>,
         cap: u32,
@@ -728,12 +676,6 @@ mod tests {
 
     #[test]
     fn a_decode_window_failure_is_outer_not_row_local() {
-        // The window contract permits an inner, row-local error only BEFORE that row feeds. This
-        // fake cannot classify where a row's decode failed, so `decode_window` must surface every
-        // failure as an OUTER error - an inner wrap would claim a clean row refusal for a row that
-        // may already have advanced (for example a mid-row vocab failure after consuming token 0).
-        // Two rows, the second un-prefilled: the result is one outer `Err`, never
-        // `Ok([Ok(..), Err(..)])`.
         use crate::family::executor::ExecutorOps;
         let (mut executor, mut first) = prefilled(vec![vec![0]], 100);
         let mut second = <FakeExecutor as ExecutorOps>::Session::default();
@@ -756,7 +698,6 @@ mod prefix_tests {
     use crate::family::session::{SaveKind, ShadowReason};
     use crate::sched::job::{PrefixHit, PrefixReport};
 
-    /// A fake with an empty script, and a session that holds `tokens` as its prefilled prompt.
     fn fake_with_prefilled(tokens: &[u32]) -> (FakeExecutor, FakeSession) {
         let mut executor = FakeExecutor::new(Vec::new(), &[9], 10);
         let mut session = FakeSession::default();
@@ -876,7 +817,6 @@ mod prefix_tests {
 
     #[test]
     fn a_denied_save_does_not_inherit_another_sessions_protected_entry() {
-        // Protection belongs to the restoring session, not another session's later save.
         let (mut executor, first) = fake_with_prefilled(&[1, 2]);
         executor
             .save_prefix(&first, &[1, 2], SaveKind::Tip)
@@ -905,8 +845,6 @@ mod prefix_tests {
 
     #[test]
     fn an_armed_snapshot_failure_waits_for_a_snapshot_call() {
-        // The second save repeats a stored key, so the store serves it as a use and never calls
-        // the snapshot. The armed failure must survive it and fail the next real snapshot.
         let (mut executor, first) = fake_with_prefilled(&[1, 2]);
         executor
             .save_prefix(&first, &[1, 2], SaveKind::Tip)
@@ -1009,8 +947,6 @@ mod prefix_tests {
             }),
             "the root hit; the tip shares exactly the restored four tokens"
         );
-        // A reset clears the restore facts: the report of the next job starts from a miss even
-        // though the job before it restored a root.
         executor.reset(&mut second).expect("reset");
         assert_eq!(
             executor.prefix_report(),
@@ -1030,9 +966,8 @@ mod prefix_tests {
 
     #[test]
     fn the_fake_saves_a_root_and_a_tip_through_the_real_store() {
-        // The limits hold two roots and six entries. A Root save of the key of a stored tip
-        // promotes that entry to a pinned root, so the store ends with one pinned root and no
-        // entry.
+        // A Root save of the key of a stored tip promotes that entry to a pinned root, so the
+        // store ends with one pinned root and no entry.
         let (mut executor, session) = fake_with_prefilled(&[1, 2, 3, 4]);
         executor.with_prefix_limits(2, 6);
         executor
@@ -1067,9 +1002,6 @@ mod prefix_tests {
         assert!(executor.stored_prefixes().is_empty(), "the store changed");
     }
 
-    /// The shadow knob: with the knob on, a restore stashes the shadow and the report carries
-    /// it; the restore itself is unchanged. The knob, like `with_prefix_limits`, resets the
-    /// store, so it runs before the conversation.
     #[test]
     fn the_shadow_knob_carries_the_shadow_into_the_report() {
         let (mut executor, mut session) = fake_with_prefilled(&[1]);
@@ -1092,7 +1024,6 @@ mod prefix_tests {
         assert_eq!(shadow.reason, ShadowReason::SameAsActual);
     }
 
-    /// The default is off: the report carries no shadow until the knob runs.
     #[test]
     fn the_report_has_no_shadow_by_default() {
         let (mut executor, mut session) = fake_with_prefilled(&[1]);

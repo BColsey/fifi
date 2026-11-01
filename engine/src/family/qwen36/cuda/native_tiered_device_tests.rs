@@ -85,7 +85,6 @@ fn full_bank(
     Ok(bank)
 }
 
-/// The block's weights with the bank stacks in place of the full stacks.
 fn bank_weights<'w>(real: &MoeLayerWeights<'w>, bank: &'w ExpertBank) -> MoeLayerWeights<'w> {
     MoeLayerWeights {
         router: real.router,
@@ -462,14 +461,12 @@ fn the_rule_c_bound_sits_between_the_per_32_and_the_q8_k_measurements() {
             "{n_cpu}: bound {bound} would accept the Q8_K kernel ({q8_k})"
         );
     }
-    // The pick cap: more CPU experts than picks add nothing.
     assert_eq!(rule_c_bound(16, 8), rule_c_bound(8, 8));
     assert!(rule_c_bound(4, 8) < rule_c_bound(8, 8));
 }
 
 /// The half bank: `HALF_SLOTS` slots for the 16 experts, the geometry the 4050 runs.
 const HALF_SLOTS: usize = 8;
-/// The seed of the half-bank test.
 const HALF_BANK_SEED: u64 = 0x7125_0008;
 /// The CPU picks (experts at or above `HALF_SLOTS`) of that seed's route; the pure test below pins the
 /// number on the host router, the device test checks it on the device route and bounds its error by it.
@@ -759,7 +756,6 @@ fn bank_fill_writes_the_slices_the_ranges_name_into_the_slot_and_refuses_the_res
     };
     let region: Arc<dyn MappedRegion> = Arc::new(region_bytes.clone());
     let slot = 3;
-    // The device phase has only `?` inside and hands out host data (the isolation split above).
     let (stacks, refusals) = {
         let ctx = CudaContext::new()?;
         let stream = ctx.stream()?;

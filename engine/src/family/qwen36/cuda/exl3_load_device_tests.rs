@@ -75,7 +75,6 @@ fn tensor_of(checkpoint: &Checkpoint, name: &str) -> Tensor {
     selected.tensor(name).unwrap()
 }
 
-/// The values of a stored half-width tensor as F32.
 pub(super) fn values_of(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
     let tensor = tensor_of(checkpoint, name);
     let count = tensor.shape().iter().map(|&d| d as usize).product();

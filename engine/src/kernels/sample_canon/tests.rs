@@ -58,8 +58,6 @@ impl SplitMix64 {
     }
 }
 
-// ---- Philox ----
-
 #[test]
 fn philox_matches_the_random123_known_answers() {
     let cases: [([u32; 4], [u32; 2], [u32; 4]); 3] = [
@@ -124,8 +122,6 @@ fn units_hold_53_bits_and_differ_across_positions_and_seeds() {
         }
     }
 }
-
-// ---- exp_canon and weight_q ----
 
 fn grid(i: u32) -> f64 {
     -32.0 + 32.0 * f64::from(i) / 100_000.0
@@ -192,8 +188,6 @@ fn weight_q_pins_the_cutoff_the_top_and_the_c_values() {
     assert_eq!(weight_q(-1.0e-9), 35_184_372_053_648);
 }
 
-// ---- 128-bit shifts ----
-
 #[test]
 fn shifts_match_u128_division_on_the_edges() {
     let mut random = SplitMix64::new();
@@ -222,8 +216,6 @@ fn shifts_match_u128_division_on_the_edges() {
         }
     }
 }
-
-// ---- derive ----
 
 /// `m * 2^-e`, built from exact power-of-two scalings so it does not share the encoder's bit
 /// arithmetic. Each step is exact because the final value is a double and `m` has 53 bits.
@@ -335,8 +327,6 @@ fn derive_refuses_top_p_outside_zero_to_one() {
     }
 }
 
-// ---- value and rank keys ----
-
 #[test]
 fn value_key_orders_like_the_values_and_merges_the_zeros() {
     let ascending = [-3.4e38_f32, -1.0, -1.0e-40, -0.0, 0.0, 1.0e-40, 1.0, 3.4e38];
@@ -360,8 +350,6 @@ fn value_key_orders_like_the_values_and_merges_the_zeros() {
         "a tie goes to the lower index"
     );
 }
-
-// ---- reference_sample ----
 
 const ZEROS4: [f32; 4] = [0.0; 4];
 
@@ -701,8 +689,6 @@ fn golden_draws_agree_with_the_c_reference() {
         );
     }
 }
-
-// ---- preconditions ----
 
 #[test]
 #[should_panic(expected = "logits are finite")]

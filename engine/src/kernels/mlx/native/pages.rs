@@ -77,7 +77,6 @@ pub struct HostPages {
     pins: RefCell<Vec<ExecutionTensor>>,
 }
 
-/// A page range after the checks that precede any native call.
 struct CheckedRange {
     offset: usize,
     end: usize,
@@ -95,9 +94,6 @@ impl HostPages {
         unsafe { ffi::inference_page_size() }
     }
 
-    /// Maps `len` bytes rounded up to the page size.
-    ///
-    /// Returns `BadRequest` for a zero or overflowing length and `MemoryPlan` when the mapping fails.
     pub fn try_new(len: usize) -> Result<Self, EngError> {
         let page = Self::page_size();
         if page == 0 {
@@ -177,7 +173,6 @@ impl HostPages {
         Some(unsafe { std::slice::from_raw_parts_mut(base, len) })
     }
 
-    /// Applies every check that precedes a native call. Returns `BadRequest` on failure.
     fn check(&self, range: &PageRange) -> Result<CheckedRange, EngError> {
         let page = Self::page_size();
         if page == 0 || !range.offset.is_multiple_of(page) {
@@ -236,7 +231,6 @@ impl HostPages {
         .map_err(as_bad_request)
     }
 
-    /// Checks the ranges of `weight` and its layout with the `PackedWeight` rules.
     pub(in crate::kernels::mlx) fn check_packed(
         &self,
         weight: &PackedPages,
@@ -277,7 +271,6 @@ unsafe extern "C" fn release_share(payload: *mut c_void) {
     drop(unsafe { Arc::from_raw(payload.cast_const().cast::<PageStorage>()) });
 }
 
-/// Whether the native array has the checked dtype, rank, shape, and byte length.
 fn native_layout_matches(array: ffi::mlx_array, range: &CheckedRange) -> bool {
     // SAFETY (each block in this function): `array` is a live, non-null handle that the caller
     // owns under the dispatch guard. The accessors only read its metadata and cannot throw.
@@ -301,7 +294,6 @@ fn native_layout_matches(array: ffi::mlx_array, range: &CheckedRange) -> bool {
     actual == range.native_shape.as_slice()
 }
 
-/// The data address of a page import, read through the accessor of its dtype.
 #[cfg(feature = "native-fault-qualification")]
 fn data_address(array: ffi::mlx_array, dtype: Dtype) -> usize {
     // SAFETY: `array` is a live, non-null handle owned under the dispatch guard. The accessor only
@@ -399,7 +391,6 @@ impl Context {
             .collect()
     }
 
-    /// Page imports that MLX served with its copy path since process start.
     #[cfg(feature = "native-fault-qualification")]
     pub(in crate::kernels::mlx) fn qualification_page_copies(&self) -> u64 {
         PAGE_COPIES.load(Ordering::Relaxed)

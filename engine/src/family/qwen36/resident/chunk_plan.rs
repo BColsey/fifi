@@ -26,9 +26,7 @@ const DELTA_RETIRED_STATES: u64 = 3;
 pub(super) struct PairPlan {
     /// The expert of each sorted pair, ascending.
     pub(super) experts: Vec<u32>,
-    /// The token row of each sorted pair.
     pub(super) tokens: Vec<u32>,
-    /// The gate of each sorted pair.
     pub(super) gates: Vec<f32>,
     /// For each pair `p` in token-major order, its position in the sorted lists. Taking the sorted
     /// rows at these positions restores token-major order.
@@ -200,7 +198,6 @@ impl ChunkCost {
         })
     }
 
-    /// Workspace bytes of a chunk of `rows` rows.
     pub(super) fn workspace(&self, rows: u32) -> Result<u64, EngError> {
         let overflow = || EngError::MemoryPlan("q36 prefill workspace overflows u64".into());
         let rows = u64::from(rows);
@@ -253,7 +250,6 @@ impl std::fmt::Display for PrefillTerms {
 pub(crate) struct PrefillPlan {
     /// The chunk size, or `None` when no size above one token fits and the prefill runs one-token steps.
     pub(crate) chunk: Option<u32>,
-    /// The terms that were charged.
     pub(crate) terms: PrefillTerms,
 }
 

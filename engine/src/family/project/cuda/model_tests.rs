@@ -441,7 +441,6 @@ fn case_names(cases: &[Case]) -> Vec<&str> {
     names
 }
 
-/// Rows, row length and byte offset of a case from the tensor dims.
 fn source_of(weights: &GgufWeights, case: &Case) -> Source {
     let tensor = weights
         .header()
@@ -555,7 +554,6 @@ fn top_two_margin(values: &[f32]) -> f32 {
     best - second
 }
 
-/// The worst NMSE per type, the comparison count and the smallest argmax margin.
 #[derive(Default)]
 struct Tally {
     worst: BTreeMap<&'static str, f64>,
@@ -1033,7 +1031,6 @@ fn the_page_cache_state_is_cold_warm_partial_or_unknown() {
     assert_eq!(classify_page_cache(10, 0), "unknown");
 }
 
-/// What one headroom stage reads, for the summary.
 struct Snapshot {
     dev_free: usize,
     mem_available_kb: u64,

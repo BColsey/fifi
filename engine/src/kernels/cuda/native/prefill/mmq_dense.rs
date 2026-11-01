@@ -61,7 +61,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// The ranges of one dense call plus its converted integers.
 pub(in crate::kernels::cuda) struct MmqDenseRaw<'a> {
     pub(in crate::kernels::cuda) w: RawRange<'a>,
     pub(in crate::kernels::cuda) y: RawRange<'a>,
@@ -70,12 +69,10 @@ pub(in crate::kernels::cuda) struct MmqDenseRaw<'a> {
     pub(in crate::kernels::cuda) ints: DenseInts,
 }
 
-/// `n` as `usize`, or an invalid-argument failure.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// The weight type of a `ggml_type` discriminant, for the three dense cases.
 fn quant_of(ggml: c_int) -> Result<QuantType, DeviceFailure> {
     [QuantType::Q80, QuantType::Q4K, QuantType::Q6K]
         .into_iter()
@@ -83,9 +80,6 @@ fn quant_of(ggml: c_int) -> Result<QuantType, DeviceFailure> {
         .ok_or_else(invalid_argument)
 }
 
-/// Proves a dense call before the native call: the C sizes (weight blocks, `y` with the
-/// constant pad, the destination reach), the alignments (w and y 16, dst 4, fixup 16), and
-/// that the two written ranges share no byte with another range.
 fn check_dense(io: &MmqDenseRaw<'_>) -> Result<(), DeviceFailure> {
     let ints = io.ints;
     let (k, n, m) = (size(ints.k)?, size(ints.n)?, size(ints.m)?);
@@ -143,7 +137,6 @@ fn c_dense(io: &MmqDenseRaw<'_>) -> MmqDenseArgsRaw {
     }
 }
 
-/// Queues the dense GEMM on `stream`.
 pub(in crate::kernels::cuda) fn mmq_dense_launch(
     stream: &RawStream,
     io: MmqDenseRaw<'_>,

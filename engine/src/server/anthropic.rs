@@ -44,10 +44,6 @@ pub(crate) async fn messages(state: State<Arc<AppState>>, body: Body) -> Respons
     }
 }
 
-/// The count_tokens handler: POST /v1/messages/count_tokens.
-/// It parses the same Anthropic body, resolves the engine the same way,
-/// renders and tokenizes the prompt, and returns the token count.
-/// No engine job is submitted.
 pub(crate) async fn count_tokens(state: State<Arc<AppState>>, body: Body) -> Response {
     match count_reply(&state, body).await {
         Ok(response) => response,
@@ -55,9 +51,6 @@ pub(crate) async fn count_tokens(state: State<Arc<AppState>>, body: Body) -> Res
     }
 }
 
-/// Walks the Anthropic body, resolves the engine, tokenizes the prompt,
-/// and returns the count. The body limit and parsing errors are the same
-/// as the messages route.
 async fn count_reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -146,15 +139,10 @@ async fn reply(state: &AppState, body: Body) -> Result<Response, ServerError> {
     };
     let mut input = parse_anthropic(&bytes)?.input;
     let stream = input.stream;
-    // The serving template decides whether resent thinking can replay; a
-    // template without think replay (every legacy or Flint one) keeps the
-    // exact bytes it rendered before the replay feature existed.
     let entry = state.resolve(None, input.engine.as_deref(), input.model.as_deref())?;
     gate_resent_reasoning(&entry.bundle, &mut input.messages);
     let mut submitted = chat::submit(state, input, "POST", "/v1/messages").await?;
     if stream {
-        // The event stream takes over after admission: every failure past
-        // this point is one `event: error`, not a JSON status.
         return Ok(sse_respond(
             submitted.head,
             submitted.running,
@@ -196,14 +184,8 @@ pub(crate) fn error_response(error: &ServerError) -> Response {
     (status, Json(anthropic_error_body(error))).into_response()
 }
 
-/// Logs the failure and builds the Anthropic error body. The stream's
-/// `event: error` sends the same shape after the headers.
 fn anthropic_error_body(error: &ServerError) -> Value {
     error.log();
-    // A checkpoint failure is a server-side fault (a tier mapping that did not
-    // load), so this route reports it as a 500 api_error with a generic
-    // message; the detail stays in the local log. The chat path keeps its own
-    // mapping untouched.
     if let ServerError::Eng(EngError::Checkpoint(detail)) = error {
         eprintln!("checkpoint failure on /v1/messages: {detail}");
     }
@@ -242,8 +224,7 @@ fn message_id(head: &ReplyHead) -> String {
     format!("msg_{}", head.id.trim_start_matches("chatcmpl-"))
 }
 
-/// The stop reason and stop sequence of the reply. A matched stop string
-/// wins over the plain end turn.
+/// A matched stop string wins over the plain end turn.
 fn stop_fields(finish: FinishReason, matched_stop: Option<&str>) -> (&'static str, Value) {
     match finish {
         FinishReason::Stop => match matched_stop {
@@ -262,14 +243,12 @@ fn tool_input(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
 }
 
-/// One block of the reply content array, in arrival order.
 enum OutBlock {
     Thinking(String),
     Text(String),
     ToolUse(Value),
 }
 
-/// Builds the non-streaming Message reply from the chat pipeline pieces.
 /// Consecutive pieces of one kind join into one block, so a reply that alternates
 /// text and tool calls keeps the order the model produced.
 fn message_body(
@@ -318,18 +297,12 @@ fn message_body(
     })
 }
 
-/// An Anthropic request that passed validation, expressed in the vocabulary of the chat
-/// pipeline. The reply translation reads the matched stop from the running job.
 #[derive(Debug)]
 pub(crate) struct AnthropicRequest {
-    /// The converted request for the chat pipeline.
     pub(crate) input: ChatInput,
 }
 
-/// Parses and validates one Anthropic request body.
-///
-/// The Anthropic vocabulary is checked here; every failure is a `BadRequest` that names
-/// the field. The result feeds the chat submit path unchanged.
+/// Every failure is a `BadRequest` that names the field.
 pub(crate) fn parse_anthropic(body: &[u8]) -> Result<AnthropicRequest, ServerError> {
     parse_body(body, ParseMode::Messages)
 }
@@ -343,9 +316,6 @@ enum ParseMode {
     CountTokens,
 }
 
-/// Parses a count_tokens body: every shared field behaves exactly as on
-/// /v1/messages; `max_tokens` may be omitted (a provided value is accepted
-/// and ignored) and `stream` is validated then ignored. Feeds `count_reply`.
 fn parse_count_tokens(body: &[u8]) -> Result<AnthropicRequest, ServerError> {
     parse_body(body, ParseMode::CountTokens)
 }
@@ -396,8 +366,6 @@ fn parse_body(body: &[u8], mode: ParseMode) -> Result<AnthropicRequest, ServerEr
         top_p: number(object, "top_p")?,
         top_k: count(object, "top_k", 0)?,
     };
-    // The same bounds as the chat path: the defaults of the engine that serves the
-    // request apply in the handler.
     SamplingParams::from_request(
         sampling.temperature,
         sampling.top_p,
@@ -518,7 +486,6 @@ fn anthropic_messages(
     Ok(messages)
 }
 
-/// The members of one message object that this endpoint reads.
 const MESSAGE_FIELDS: &[&str] = &["role", "content"];
 
 /// System content: a string, or an array of text blocks. Plain string
@@ -579,7 +546,6 @@ fn text_blocks(blocks: &[Value], at: &str) -> Result<String, ServerError> {
 const IMAGE_NOTE: &str = "[image omitted: this model reads text only]";
 const DOCUMENT_NOTE: &str = "[document omitted: this model reads text only]";
 
-/// A document with a text source carries its text; every other source becomes a note.
 fn document_note(object: &Map<String, Value>, at: &str) -> Result<String, ServerError> {
     let source = object
         .get("source")
@@ -876,8 +842,6 @@ fn anthropic_thinking(value: Option<&Value>) -> Result<Thinking, ServerError> {
         ));
     }
     match optional_string(object, "type", "thinking.")?.as_deref() {
-        // Claude Code's default mode is adaptive: the model decides. The
-        // engine's own thinking control owns the budget either way.
         Some("enabled" | "adaptive") => Ok(Thinking::On),
         Some("disabled") => Ok(Thinking::Off),
         Some(other) => Err(bad(format!(
@@ -908,7 +872,6 @@ fn stop_sequences(value: Option<&Value>) -> Result<Vec<String>, ServerError> {
     Ok(stops)
 }
 
-/// Reads an optional number member.
 fn number(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, ServerError> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -917,7 +880,6 @@ fn number(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, Serve
     }
 }
 
-/// Reads an optional whole number member that must be at least `minimum`.
 fn count(
     object: &Map<String, Value>,
     field: &str,
@@ -937,7 +899,6 @@ fn count(
     }
 }
 
-/// Reads the optional `stream` flag.
 fn flag(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(false),
@@ -946,14 +907,11 @@ fn flag(object: &Map<String, Value>, field: &str) -> Result<bool, ServerError> {
     }
 }
 
-/// The state of one Messages stream between two event batches.
 struct Streaming {
     head: ReplyHead,
     running: RunningJob,
     phase: Phase,
-    /// The index and kind of the open content block, if one is open.
     open: Option<(u64, BlockKind)>,
-    /// The index of the next content block.
     next_index: u64,
 }
 
@@ -992,7 +950,6 @@ fn sse_respond(head: ReplyHead, running: RunningJob, keep_alive: Duration) -> Re
         .into_response()
 }
 
-/// One batch of events per poll. The stream ends once the phase is Finished.
 async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
     let events = match state.phase {
         Phase::Finished => return None,
@@ -1027,14 +984,10 @@ async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
                 events
             }
             Ok(Step::Aborted) => {
-                // The engine ended the job without a finish (a cancel, an
-                // overflowed output): the client gets no more events.
                 state.phase = Phase::Finished;
                 Vec::new()
             }
             Err(error) => {
-                // The headers are out, so the failure is one event in the
-                // Anthropic error shape; the stream then ends.
                 state.phase = Phase::Finished;
                 vec![named("error", anthropic_error_body(&error))]
             }
@@ -1043,8 +996,8 @@ async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
     Some((events, state))
 }
 
-/// Maps pieces to content_block events. Consecutive pieces of one kind share
-/// one block, like the blocks of the non-streaming reply.
+/// Consecutive pieces of one kind share one block, like the blocks of the
+/// non-streaming reply.
 fn piece_events(state: &mut Streaming, pieces: &[Piece]) -> Vec<Event> {
     let mut events = Vec::new();
     for piece in pieces {
@@ -1106,7 +1059,6 @@ fn piece_events(state: &mut Streaming, pieces: &[Piece]) -> Vec<Event> {
     events
 }
 
-/// Opens a block of `kind`, closing the open one first when the kind changes.
 fn ensure_block(state: &mut Streaming, events: &mut Vec<Event>, kind: BlockKind) -> u64 {
     if let Some((index, open)) = state.open {
         if open == kind {
@@ -1134,7 +1086,6 @@ fn ensure_block(state: &mut Streaming, events: &mut Vec<Event>, kind: BlockKind)
     index
 }
 
-/// Closes the open block, if one is open.
 fn close_block(state: &mut Streaming, events: &mut Vec<Event>) {
     if let Some((index, _)) = state.open.take() {
         events.push(block_stop(index));
@@ -1159,9 +1110,7 @@ fn block_stop(index: u64) -> Event {
 /// that consumes `input_tokens` ALONE now sees less than the whole
 /// prompt — that is the contract, not a bug. The split is the shipped
 /// default (wire::CACHE_USAGE_DEFAULT; the redone Claude Code receipts
-/// are recorded in this slice's flip commit message); every value other
-/// than the exact 1/true/on forces the legacy two-field shape, empty
-/// and non-Unicode included.
+/// are recorded in this slice's flip commit message).
 fn anthropic_usage(usage: &Usage, cache_fields: bool) -> serde_json::Value {
     let output_tokens = usage.completion_tokens();
     if !cache_fields {
@@ -1198,8 +1147,8 @@ fn message_start_usage(input_tokens: u32, cache_fields: bool) -> serde_json::Val
     })
 }
 
-/// The message_start event. The input count is known when the job is
-/// accepted; the output count and the final totals arrive with message_delta.
+/// The input count is known when the job is accepted; the output count and the final
+/// totals arrive with message_delta.
 fn message_start(head: &ReplyHead, input_tokens: u32) -> Value {
     json!({
         "type": "message_start",
@@ -1216,9 +1165,8 @@ fn message_start(head: &ReplyHead, input_tokens: u32) -> Value {
     })
 }
 
-/// One named SSE event with a JSON body. The bodies are `json!` values, so
-/// serialization cannot fail in practice; the fallback keeps the event shape
-/// and logs like any other engine failure.
+/// The bodies are `json!` values, so serialization cannot fail in practice; the fallback
+/// keeps the event shape and logs like any other engine failure.
 fn named(name: &str, body: Value) -> Event {
     match Event::default().event(name).json_data(body) {
         Ok(event) => event,
@@ -1558,20 +1506,17 @@ mod tests {
 
     const CALL: &str = "<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call>";
 
-    /// A router over one engine named `e1` that serves `model-a`.
     fn app(engine: &Engine, context_limit: u32) -> Router {
         app_serving(engine, context_limit, "model-a")
     }
 
-    /// A router over one engine named `e1` that serves `model`. The captured
-    /// client fixtures name their own model; the replay binds it here.
+    /// The captured client fixtures name their own model; the replay binds it here.
     fn app_serving(engine: &Engine, context_limit: u32, model: &str) -> Router {
         testkit::wait_for_state(&engine.handle(), crate::sched::worker::EngineState::Ready);
         let entry = testkit::entry("e1", model, engine, context_limit);
         router(Arc::new(AppState::new(testkit::API_KEY, vec![entry])))
     }
 
-    /// The base request body with the fields of `extra` merged over it.
     fn request(extra: Value) -> Value {
         let mut body = json!({"model": "model-a", "max_tokens": 1_024,
             "messages": [{"role": "user", "content": "hi"}]});
@@ -1592,7 +1537,6 @@ mod tests {
         (status, body)
     }
 
-    /// Posts the body with `x-api-key` instead of the bearer header.
     async fn post_with_api_key(app: &Router, body: &Value) -> (StatusCode, Value) {
         let request = axum::http::Request::builder()
             .method("POST")
@@ -1663,7 +1607,6 @@ mod tests {
         );
     }
 
-    /// One message of the converted input.
     fn message(request: &AnthropicRequest, index: usize) -> &PromptMessage {
         &request.input.messages[index]
     }
@@ -1694,8 +1637,6 @@ mod tests {
 
     #[test]
     fn system_accepts_plain_string_items() {
-        // Plain string items in the system array are an accepted extension;
-        // they join like text blocks.
         let body = request(json!({
             "system": ["Be brief.", {"type": "text", "text": "stay calm"}]
         }));
@@ -1829,7 +1770,6 @@ mod tests {
             ]
         }));
         let mut messages = request.input.messages;
-        // Without the gate the flint render would carry the think block.
         let ungated = template
             .render(&messages, &[], Thinking::On)
             .expect("ungated flint render");
@@ -1837,7 +1777,6 @@ mod tests {
             ungated.contains("<think>"),
             "flint renders reasoning_content when it reaches the template:\n{ungated}"
         );
-        // The gate drops the field before the render.
         for message in &mut messages {
             message.reasoning_content = None;
         }
@@ -2401,8 +2340,6 @@ mod tests {
             let body = testkit::json_of(&bytes);
             assert_eq!(body["error"]["type"], kind, "type for status {status}");
         }
-        // The Backend diagnostic never reaches the client; the auth message names
-        // no specific header form.
         let backend = error_response(&ServerError::Eng(EngError::Backend {
             operation: "decode",
             message: "secret diagnostic".into(),
@@ -2412,8 +2349,6 @@ mod tests {
             .expect("body");
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(!text.contains("secret"), "diagnostic leaked: {text}");
-        // A checkpoint failure carries a server path in its detail; the client
-        // sees only the generic api_error message.
         let checkpoint = error_response(&ServerError::Eng(EngError::Checkpoint(
             "/models/tier/map.json: unreadable".to_string(),
         )));
@@ -2705,7 +2640,6 @@ mod tests {
         serde_json::from_str(&event.data).expect("event json")
     }
 
-    /// The events of one name, parsed.
     fn of(events: &[SseEvent], name: &str) -> Vec<Value> {
         events
             .iter()
@@ -2714,7 +2648,6 @@ mod tests {
             .collect()
     }
 
-    /// The text deltas of one block, joined.
     fn block_text(events: &[SseEvent], index: u64) -> String {
         of(events, "content_block_delta")
             .iter()
@@ -2723,7 +2656,6 @@ mod tests {
             .collect()
     }
 
-    /// The blocks the stream opened, as (index, block type).
     fn blocks(events: &[SseEvent]) -> Vec<(u64, String)> {
         of(events, "content_block_start")
             .iter()
@@ -3030,7 +2962,6 @@ mod tests {
 
     // ── captured client replays ──────────────────────────────────────
 
-    /// One fixture file of the captured-client directory, parsed.
     fn capture(name: &str, kind: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/server/testdata/anthropic")
@@ -3039,8 +2970,6 @@ mod tests {
             .expect("fixture json")
     }
 
-    /// Posts a captured request with its recorded headers plus the test key.
-    /// The redacted credential headers of the capture are skipped.
     async fn replay_post(
         app: &Router,
         body: &Value,
@@ -3635,7 +3564,6 @@ mod tests {
     fn assert_balanced_captures_rejects_orphan_headers() {
         let manifest = vec!["alpha".to_string()];
         let requests = vec!["alpha".to_string()];
-        // headers.json exists for "beta" but no beta.request.json.
         let headers = vec!["alpha".to_string(), "beta".to_string()];
         let expected = vec!["alpha".to_string()];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3649,7 +3577,6 @@ mod tests {
         let manifest = vec!["alpha".to_string()];
         let requests = vec!["alpha".to_string()];
         let headers = vec!["alpha".to_string()];
-        // expected.json exists for "beta" but no beta.request.json.
         let expected = vec!["alpha".to_string(), "beta".to_string()];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_balanced_captures(&requests, &headers, &expected, &manifest);
@@ -3663,14 +3590,12 @@ mod tests {
         let requests = names.clone();
         let headers = names.clone();
         let expected = names.clone();
-        // Panics if the sets differ or don't match manifest.
         assert_balanced_captures(&requests, &headers, &expected, &names);
     }
 
     #[test]
     fn assert_balanced_captures_rejects_request_without_headers() {
         let manifest = vec!["alpha".to_string(), "beta".to_string()];
-        // beta.request.json exists but beta.headers.json does not.
         let requests = vec!["alpha".to_string(), "beta".to_string()];
         let headers = vec!["alpha".to_string()];
         let expected = vec!["alpha".to_string(), "beta".to_string()];
@@ -3742,7 +3667,6 @@ mod tests {
 
     // ── count_tokens: integration tests ────────────────────────────────────
 
-    /// Posts to the count_tokens endpoint using the testkit helpers.
     async fn post_count_tokens(app: &Router, body: &Value) -> (StatusCode, Value) {
         let (status, _headers, bytes) =
             testkit::send(app, testkit::post_json("/v1/messages/count_tokens", body)).await;
@@ -3754,8 +3678,6 @@ mod tests {
         (status, body)
     }
 
-    /// Posts to the count_tokens endpoint with `x-api-key` instead of the
-    /// bearer header.
     async fn post_count_tokens_with_api_key(app: &Router, body: &Value) -> (StatusCode, Value) {
         let request = axum::http::Request::builder()
             .method("POST")
@@ -3813,7 +3735,6 @@ mod tests {
         let (status, reply) = post_count_tokens(&app, &body).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
         crate::server::contract::assert_schema("CountTokensResponse", &reply);
-        // Same body without max_tokens should give the same count.
         let body_no_max: Value =
             json!({"model": "model-a", "messages": [{"role": "user", "content": "hi"}]});
         let (status2, reply2) = post_count_tokens(&app, &body_no_max).await;
@@ -3828,7 +3749,6 @@ mod tests {
         let body = json!({"model": "model-a", "messages": [{"role": "user", "content": "hi"}]});
         let (status, _) = post_count_tokens_with_api_key(&app, &body).await;
         assert_eq!(status, StatusCode::OK);
-        // Wrong key: 401.
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/messages/count_tokens")
@@ -3843,7 +3763,6 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let body = testkit::json_of(&bytes);
         assert_eq!(body["error"]["type"], "authentication_error");
-        // No key: 401.
         let request = testkit::post_bytes(
             "/v1/messages/count_tokens",
             None,
@@ -3894,7 +3813,6 @@ mod tests {
         let (status, headers, bytes) =
             testkit::send(&app, testkit::post_json("/v1/messages/count_tokens", &body)).await;
         assert_eq!(status, StatusCode::OK);
-        // count_tokens never streams: the reply stays JSON, never the SSE media type.
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .expect("content type")

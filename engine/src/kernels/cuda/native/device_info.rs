@@ -20,7 +20,6 @@ unsafe extern "C" {
     fn device_integrated_raw(out_integrated: *mut c_int) -> c_int;
 }
 
-/// Whether the current device shares memory with the host, or the native status.
 pub(in crate::kernels::cuda) fn device_integrated() -> Result<bool, c_int> {
     let mut value: c_int = 0;
     // SAFETY: `value` is a live, writable c_int for the whole call; the adapter

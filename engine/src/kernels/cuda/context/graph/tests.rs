@@ -24,12 +24,10 @@ use crate::kernels::cuda::{
 };
 use crate::weights::GgufType;
 
-/// The text of every refusal inside a window.
 const WINDOW_TEXT: &str = "not allowed inside a capture window";
 /// Rows of one expert, and experts of the stack of the expert test.
 const EXPERT_ROWS: usize = 64;
 const EXPERTS: usize = 16;
-/// Bytes of the ids buffer of the expert test.
 const IDS_BYTES: usize = 256;
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -47,7 +45,6 @@ fn no_pins() -> CapturePlan<'static> {
     }
 }
 
-/// The error of a result that must be one.
 fn refusal<T>(result: Result<T, EngError>, case: &str) -> EngError {
     match result {
         Ok(_) => panic!("{case}: expected an error, got Ok"),
@@ -55,7 +52,6 @@ fn refusal<T>(result: Result<T, EngError>, case: &str) -> EngError {
     }
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request(error: &EngError, case: &str, needle: &str) {
     assert!(
         matches!(error, EngError::BadRequest(message) if message.contains(needle)),
@@ -176,7 +172,6 @@ impl Rig {
             .expect("restore the sentinel");
     }
 
-    /// Warms, then captures the pack and the matmul.
     fn capture(&self) -> GraphExec<'static> {
         self.warm();
         let (graph, ()) = self
@@ -512,7 +507,6 @@ impl ForkRig {
         }
     }
 
-    /// The bits of the sentinel in both outputs.
     fn sentinel(&self) -> (Vec<u32>, Vec<u32>) {
         let bits_of = |buffer: &DeviceBuffer| vec![u32::MAX; buffer.bytes() / 4];
         (bits_of(&self.y_a), bits_of(&self.y_b))

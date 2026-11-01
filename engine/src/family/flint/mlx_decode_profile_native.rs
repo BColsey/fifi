@@ -456,7 +456,7 @@ fn ring_view_boundary_sweep() -> io::Result<()> {
         // boundary, so the 8k timing sample runs
         // at 8064 - the last-128-rows-to-8191 boundary.
         let timed = matches!(prefix_len, 4096 | 8064);
-        let n = (if timed { 128 } else { 4 }).min(8193 - prefix_len); // legacy-8192 sweep bound
+        let n = (if timed { 128 } else { 4 }).min(8193 - prefix_len);
         model.kernels.reset_peak_memory().map_err(err)?;
         model.kernels.qualification_reset_retire_peak();
         let (flushes_before, _) = model.kernels.qualification_retire_stats();
@@ -480,7 +480,6 @@ fn ring_view_boundary_sweep() -> io::Result<()> {
         metadata(&out, &info)?;
     }
 
-    // Continuation: 4k prefix, decode, a 256-row multi-row chunk, decode.
     let mut state = State::new();
     let ids: Vec<u32> = (0..4096_u32).map(id).collect();
     chunked_prefix(&mut model, &mut state, &ids)?;
@@ -513,7 +512,6 @@ fn ring_view_boundary_sweep() -> io::Result<()> {
     });
     metadata(&out, &info)?;
 
-    // 600-token token-by-token prefill (one-row chunks from p0 = 0).
     let mut state = State::new();
     let ids: Vec<u32> = (0..600_u32).map(id).collect();
     for (i, token) in ids.iter().enumerate() {

@@ -109,10 +109,8 @@ fn rules() -> Result<super::rules::QwenRules, EngError> {
     super::rules::QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS)
 }
 
-// ---------------------------------------------------------------------------------------------
 // The host reference quantizer of phase A (kv8_append/tests.rs), written from the frozen
 // format, not from the kernel.
-// ---------------------------------------------------------------------------------------------
 
 /// The host reference quantizer of one group of 32 values: `(scale bits, codes)`. A group
 /// whose STORED scale is 0 — all-zero, or an amax below what an fp16 scale can carry — has
@@ -199,9 +197,7 @@ fn f16_bits(x: f32) -> u16 {
     sign | ((e as u16) << 10) | keep as u16
 }
 
-// ---------------------------------------------------------------------------------------------
 // (a) capture on equals capture off
-// ---------------------------------------------------------------------------------------------
 
 /// (a) The Int8G32 step with capture off and on over 32 tokens of P5: the captured replays'
 /// logits rows are bitwise the eager step's, and the device argmax agrees.
@@ -222,7 +218,6 @@ fn int8_step_capture_on_equals_capture_off_over_32_p5_tokens() {
         cap_rows,
         cap_toks,
     } = rows;
-    // Host data only from here (the isolation split).
     assert_eq!(eager_rows.len(), 32, "the eager step read 32 rows");
     assert_eq!(cap_rows.len(), 32, "the captured step read 32 rows");
     for (at, (eager, cap)) in eager_rows.iter().zip(&cap_rows).enumerate() {
@@ -240,7 +235,6 @@ fn int8_step_capture_on_equals_capture_off_over_32_p5_tokens() {
     }
 }
 
-/// What (a)'s device phase hands back: both steps' logits rows and argmax tokens.
 struct CaptureOnOff {
     eager_rows: Vec<Vec<u8>>,
     eager_toks: Vec<u32>,
@@ -289,9 +283,7 @@ fn capture_on_off_rows(ids: &[u32]) -> Result<CaptureOnOff, EngError> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
 // (b) the reset invariant
-// ---------------------------------------------------------------------------------------------
 
 /// (b) The reset invariant (design item 5): 64 tokens of prompt X, `reset_state`, then 32
 /// tokens of P5 are bitwise a FRESH session's 32 tokens of P5. The reset leaves the stale
@@ -311,7 +303,6 @@ fn int8_step_reset_leaves_a_fresh_sessions_rows() {
         Err(error) => panic!("the device phase failed: {error:?}"),
     };
     let (after_reset_rows, fresh_rows) = (rows.after_reset, rows.fresh);
-    // Host data only from here (the isolation split).
     assert_eq!(after_reset_rows.len(), 32, "the reset session read 32 rows");
     assert_eq!(fresh_rows.len(), 32, "the fresh session read 32 rows");
     for (at, row) in after_reset_rows.iter().chain(&fresh_rows).enumerate() {
@@ -325,15 +316,11 @@ fn int8_step_reset_leaves_a_fresh_sessions_rows() {
     }
 }
 
-/// What (b)'s device phase hands back: the 32 P5 rows of the session that reset (after its
-/// 64 tokens of prompt X) and of the fresh session.
 struct ResetPair {
     after_reset: Vec<Vec<u8>>,
     fresh: Vec<Vec<u8>>,
 }
 
-/// The device phase of (b): one load, two steps. The first runs prompt X, resets and runs
-/// P5; the second is the fresh session that runs P5 only.
 fn reset_rows(x: &[u32], p5: &[u32]) -> Result<ResetPair, EngError> {
     let (projector, weights) = load_full_native()?;
     let context = projector.context();
@@ -369,14 +356,10 @@ fn reset_rows(x: &[u32], p5: &[u32]) -> Result<ResetPair, EngError> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
 // (c) and (d): the one-layer rig
-// ---------------------------------------------------------------------------------------------
 
-/// The four planes of one attention layer in read order.
 const PLANES: [Plane; 4] = [Plane::K, Plane::KScales, Plane::V, Plane::VScales];
 
-/// The four whole planes of `ordinal`'s KV pool, read back as bytes.
 fn read_planes(
     stream: &DeviceStream,
     state: &ResidentState,
@@ -392,9 +375,6 @@ fn read_planes(
     Ok(planes)
 }
 
-/// The rig-wide pieces every append runs against: the stream, the mixers, the unaliased
-/// arena, the plan, the one full-attention layer's index, its residual slot index and the
-/// hidden width.
 struct Rig<'r, 'm> {
     stream: &'r DeviceStream,
     mixers: &'r Mixers<'m>,
@@ -454,8 +434,6 @@ fn rig_append(
     Ok(rows)
 }
 
-/// What the rig tests read back: the plane bytes, the f32 rows of every append and the
-/// attention geometry.
 struct RigData {
     planes: [Vec<u8>; 4],
     k_rows: Vec<Vec<f32>>,
@@ -468,7 +446,6 @@ struct RigData {
     poisoned: Vec<PoisonOutcome>,
 }
 
-/// One poisoned run's read-back.
 struct PoisonOutcome {
     status: i32,
     core: Vec<f32>,
@@ -512,7 +489,6 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
     let geometry = super::mixer_geometry::MixerGeometry::new(&dims)?;
     let mut state = ResidentState::allocate(&context, &stream, &dims, &options)?;
     state.write_step_params(&stream, &StepParams::new(0, 0)?)?;
-    // The first full-attention layer and its ordinal among the attention layers.
     let mut found = None;
     for l in 0..table.len() {
         if table.slot(l)?.kind == crate::family::AttentionKind::Full {
@@ -682,7 +658,6 @@ fn int8_planes_equal_the_host_quantizer_of_the_kernels_own_rows() {
     };
     let (heads, head_dim, cells) = (data.heads, data.head_dim, data.cells);
     let groups = head_dim / 32;
-    // Host data only from here (the isolation split).
     for (t, (k, v)) in data.k_rows.iter().zip(&data.v_rows).enumerate() {
         assert_finite(&format!("k rows {t}"), k);
         assert_finite(&format!("v rows {t}"), v);
@@ -744,7 +719,6 @@ fn a_bad_pos_word_poisons_the_int8_step() {
         Ok(data) => data,
         Err(error) => panic!("the device phase failed: {error:?}"),
     };
-    // Host data only from here (the isolation split).
     assert_eq!(data.poisoned.len(), 2, "the two poisoned runs");
     for (label, outcome) in [
         ("pos = -1", &data.poisoned[0]),
@@ -776,9 +750,7 @@ fn a_bad_pos_word_poisons_the_int8_step() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
 // (e) the reported row
-// ---------------------------------------------------------------------------------------------
 
 /// (e) The REPORTED row (never an assertion on the numbers): the Int8G32 and Fp16 steps on
 /// P5, teacher-forced on the Fp16 greedy tokens over 128 tokens. Prints the top-1 agreement
@@ -793,8 +765,8 @@ fn int8_vs_fp16_step_row_on_p5_is_reported() {
         Ok(report) => report,
         Err(error) => panic!("the device phase failed: {error:?}"),
     };
-    // Host data only from here (the isolation split). The finiteness of every compared row
-    // is asserted; the agreement numbers are REPORTED, never gated.
+    // The finiteness of every compared row is asserted; the agreement numbers are REPORTED,
+    // never gated.
     for (at, row) in report.fp16_rows.iter().enumerate() {
         assert_finite(&format!("fp16 row {at}"), &row_values(row));
     }
@@ -826,8 +798,6 @@ fn int8_vs_fp16_step_row_on_p5_is_reported() {
     );
 }
 
-/// What (e)'s device phase hands back: both steps' rows, the Fp16 greedy ids and the Int8G32
-/// step's argmax tokens.
 struct QualityRow {
     fp16_rows: Vec<Vec<u8>>,
     int8_rows: Vec<Vec<u8>>,
@@ -871,7 +841,6 @@ fn quality_row() -> Result<QualityRow, EngError> {
     }
     drop(fp16);
     drop(res_fp16);
-    // The Int8G32 step, teacher-forced on the Fp16 greedy ids.
     let int8_options = full_options(KvMode::Int8G32);
     let res_int8 =
         super::resources::StepResources::new(context, dims, &inventory_value, &int8_options)?;
@@ -900,7 +869,6 @@ fn quality_row() -> Result<QualityRow, EngError> {
     })
 }
 
-/// One logits row as f32 values.
 fn row_values(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()

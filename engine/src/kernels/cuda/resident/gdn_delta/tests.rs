@@ -30,7 +30,6 @@ const SELF_CHECK: f64 = 1.0 / 262_144.0;
 /// Steps from which a group counts toward x.
 const DOMAIN_START: usize = 128;
 const D: usize = GDN_HEAD_DIM;
-/// Bytes of sentinel (256 floats) before and after every device buffer.
 const PAD_BYTES: usize = 256 * 4;
 const SENTINEL: [u8; 4] = 0x7fc0_deadu32.to_le_bytes();
 const LIMIT: &str = "DeltaNet f32; E4 holds for rollouts of 128 to 1,152 steps only; not checked beyond 1,151 steps";
@@ -59,7 +58,6 @@ impl Layout {
         }
     }
 
-    /// Odd offsets and padded rows.
     fn odd(nk: usize, nv: usize) -> Self {
         let (alpha_off, z_off) = (3, 3 + nv + 5);
         let beta_off = z_off + nv * D + 7;
@@ -247,7 +245,6 @@ fn ref_step(s: &mut [f64], q: &[f64], k: &[f64], v: &[f64], (decay, beta): (f64,
     o
 }
 
-/// `x * scale / sqrt(sum(x^2) + eps)` in f64.
 fn l2(x: &[f32], eps: f64, scale: f64) -> Vec<f64> {
     let factor = scale / (x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() + eps).sqrt();
     x.iter().map(|&v| f64::from(v) * factor).collect()
@@ -308,7 +305,6 @@ fn ref_delta(inp: &Inputs, heads: &[usize], blind: Blind) -> RefRun {
 
 // ---- comparisons
 
-/// The worst of a group: value, step and head.
 #[derive(Clone, Copy, Default)]
 struct Stat {
     max: f64,
@@ -331,13 +327,11 @@ impl Stat {
     }
 }
 
-/// `|g - w|`, infinite for a NaN on either side.
 fn gap(g: f64, w: f64) -> f64 {
     let d = (g - w).abs();
     if d.is_nan() { f64::INFINITY } else { d }
 }
 
-/// E-form error of one step: `max |d| / max(max |want|, 1)` over the heads, and the head of the largest `|d|`.
 fn step_error(got: &[&[f32]], want: &[&[f64]], heads: &[usize]) -> (f64, usize) {
     let top = want
         .iter()
@@ -356,13 +350,11 @@ fn step_error(got: &[&[f32]], want: &[&[f64]], heads: &[usize]) -> (f64, usize) 
     (worst.0 / top, worst.1)
 }
 
-/// Device results: `out[(t * n_v + h) * 128 + j]` and the end state.
 struct Run {
     out: Vec<f32>,
     state: Vec<f32>,
 }
 
-/// Error of step `t` of `run` against the reference.
 fn run_step_error(inp: &Inputs, run: &Run, want: &RefRun, t: usize) -> (f64, usize) {
     let n = want.heads.len();
     let got: Vec<&[f32]> = want
@@ -376,7 +368,6 @@ fn run_step_error(inp: &Inputs, run: &Run, want: &RefRun, t: usize) -> (f64, usi
     step_error(&got, &exp, &want.heads)
 }
 
-/// End-state error: `(max |S - S_ref|, max |S_ref|)`; E-form divides by `max(max |S_ref|, 1)`.
 fn state_error(run: &Run, want: &RefRun) -> (f64, f64) {
     let max_ref = want.state.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     let mut diff = 0.0f64;
@@ -393,13 +384,11 @@ fn state_error(run: &Run, want: &RefRun) -> (f64, f64) {
     (diff, max_ref)
 }
 
-/// The worst over all steps and over the steps from 128 on.
 struct Group {
     all: Stat,
     late: Stat,
 }
 
-/// Compares `run` with the f64 reference on `heads`, prints one line and asserts E4 for the steps and the end state.
 fn judge(label: &str, inp: &Inputs, run: &Run, heads: &[usize]) -> Group {
     let want = ref_delta(inp, heads, Blind::default());
     let mut group = Group {
@@ -442,7 +431,6 @@ fn stop_rule(label: &str, x: f64) {
 
 // ---- device side
 
-/// A device context and its stream.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -511,7 +499,6 @@ impl Padded {
         self.buf.range(self.front + offset, bytes).expect("range")
     }
 
-    /// The data bytes, after asserting that both sentinel pads are unchanged; a read-only buffer must keep its data too.
     fn verify(&self, ctx: &CudaContext, read_only: bool, name: &str) -> Vec<u8> {
         let (now, end) = (
             testkit::read_bytes(ctx, &self.buf, self.image.len()),
@@ -533,7 +520,6 @@ impl Padded {
     }
 }
 
-/// The slots of a call, in this order.
 const CONV: usize = 0;
 const PROJ: usize = 1;
 const A: usize = 2;
@@ -552,7 +538,6 @@ struct Bufs {
 }
 
 impl Bufs {
-    /// Seven separate buffers of the inputs, every data region `skew` bytes past its pad.
     fn separate(ctx: &CudaContext, inp: &Inputs, skew: usize) -> Self {
         let out = vec![0xFFu8; inp.m * inp.nv * D * 4];
         let images = [
@@ -581,7 +566,6 @@ impl Bufs {
         self.pads[buffer].at(offset + extra, bytes)
     }
 
-    /// The call for `shape.m` tokens that start at token `row` of the sequence.
     fn call(&self, shape: DeltaShape, row: usize) -> DeltaCall<'_> {
         let need = exact_bytes(shape);
         DeltaCall {
@@ -599,7 +583,6 @@ impl Bufs {
         }
     }
 
-    /// Checks every sentinel and every read-only buffer; returns `out` and the end state.
     fn finish(&self, rig: &Rig) -> Run {
         let written = [self.at[STATE].0, self.at[OUT].0];
         let data: Vec<Vec<u8>> = self
@@ -625,7 +608,6 @@ impl Bufs {
     }
 }
 
-/// Runs `inp` as consecutive launches of the sizes in `split` (they sum to `inp.m`) on fresh buffers.
 fn launch_all(rig: &Rig, inp: &Inputs, split: &[usize]) -> Run {
     assert_eq!(split.iter().sum::<usize>(), inp.m);
     let bufs = Bufs::separate(&rig.ctx, inp, 0);
@@ -692,7 +674,6 @@ fn delta_matches_the_f64_reference_short() {
     }
 }
 
-/// The reference with grouped key heads, `sigmoid(z)` or the sign of `a` flipped differs from the real one by more than 1e-2.
 fn assert_not_blind(inp: &Inputs, run: &Run) {
     let variants = [
         (
@@ -727,7 +708,6 @@ fn assert_not_blind(inp: &Inputs, run: &Run) {
     }
 }
 
-/// One launch of `steps` tokens on the production layout; heads: four ordinary ones and the forced-decay heads 29 to 31.
 fn long_rollout(rig: &Rig, steps: usize, label: &str) -> Group {
     let inp = generate(
         16,
@@ -966,7 +946,6 @@ struct Slot {
     bytes: usize,
 }
 
-/// One refusal row: the geometry, the byte slots of the seven ranges, and what to break.
 #[derive(Clone)]
 struct Plan {
     shape: DeltaShape,
@@ -978,7 +957,6 @@ struct Plan {
 }
 
 impl Plan {
-    /// A valid call: Qwen3.6 geometry, two tokens, every buffer exactly sized.
     fn base() -> Self {
         let shape = Inputs::shape_of(16, 32, Layout::production(), 2);
         let mut plan = Self {
@@ -1023,8 +1001,6 @@ impl Plan {
     }
 }
 
-/// Runs the call of `plan` on zero-filled buffers (`out` is 0xFF); returns the result, whether every buffer is unchanged
-/// and the `out` bytes. `other` supplies the foreign stream and buffer.
 fn attempt(rig: &Rig, other: &Rig, plan: &Plan) -> (Result<(), EngError>, bool, Vec<u8>) {
     let ctx = &rig.ctx;
     let bufs: Vec<DeviceBuffer> = plan
@@ -1169,7 +1145,6 @@ fn refusals() -> Vec<(&'static str, &'static str, Edit)> {
     ]
 }
 
-/// The size, alignment and overlap rows: for each range one float short and 2 bytes in, and the 11 write/read pairs.
 fn slot_plans() -> Vec<(String, String, Plan)> {
     let mut rows = Vec::new();
     for (i, name) in NAMES.iter().enumerate() {

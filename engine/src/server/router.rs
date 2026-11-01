@@ -27,9 +27,7 @@ use axum::routing::{get, post};
 use serde_json::json;
 use std::sync::Arc;
 
-/// Builds the router. `/health` and `/ready` are public, as the contract marks them with an
-/// empty `security` array. Every other route needs the bearer key; the
-/// `/v1/messages` routes also accept the Anthropic `x-api-key` header.
+/// `/health` and `/ready` are public: the contract marks them with an empty `security` array.
 pub(crate) fn router(state: Arc<AppState>) -> Router {
     let bearer_routes = Router::new()
         .route("/v1/models", get(models))

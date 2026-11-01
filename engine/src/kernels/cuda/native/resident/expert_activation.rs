@@ -41,14 +41,12 @@ const _: () = assert!(
         && offset_of!(ElementArgsRepr, values) == 16
 );
 
-/// One elementwise relu-squared: out[i] = max(x[i], 0)^2 over `values` f32.
 pub(in crate::kernels::cuda) struct ReluSquaredRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) values: usize,
 }
 
-/// Queues the elementwise relu-squared on stream. Returns when queued.
 pub(in crate::kernels::cuda) fn relu_squared_launch(
     stream: &RawStream,
     call: &ReluSquaredRaw<'_>,

@@ -81,8 +81,7 @@ fn pinned_kv_device_f16_arm(state: &State) -> bool {
     selected
 }
 
-/// Ranged D2H reads of exactly `bytes` among the served reads. The host guard
-/// reads each layer's new K and V rows whole, rows * 2,048 B apiece.
+/// The host guard reads each layer's new K and V rows whole, rows * 2,048 B apiece.
 fn d2h_reads_in(reads: &std::collections::BTreeMap<usize, usize>, bytes: usize) -> usize {
     reads.get(&bytes).copied().unwrap_or(0)
 }
@@ -133,7 +132,6 @@ fn layer_major_staging_bytes_table_and_overflow() {
     }
     assert_eq!(State::layer_major_staging_bytes(8), Some(786_432));
     assert_eq!(State::layer_major_staging_bytes(4096), Some(402_653_184));
-    // A piece of usize::MAX rows must refuse, not wrap.
     assert_eq!(State::layer_major_staging_bytes(usize::MAX), None);
 }
 
@@ -1193,8 +1191,6 @@ fn control_cache_three_turn_append_only() {
 
     let bundle = crate::tokenizer::flint_tests::load_bundle();
     let (mut executor, mut session, enabled) = cache_single_state(4096, &bundle);
-    // Default OFF stays bit-for-bit unobservable: a
-    // closed store answers (0, 0) and no report at all.
     assert_eq!(executor.prefix_limits().roots, 0);
     assert_eq!(executor.prefix_limits().entries, 0);
     assert!(executor.prefix_report().is_none());
@@ -1454,7 +1450,6 @@ fn late_health_b8_commits_and_head_bitwise_probe() {
         test_health_observations() - before_bulk,
         if enabled { 49 } else { 0 }
     );
-    // The armed token gate adds one 4-byte read per compute.
     assert_eq!(
         executor.ctx.scalar_read_requests() - before_scalar,
         if enabled { 99 } else { 1128 } + usize::from(armed)

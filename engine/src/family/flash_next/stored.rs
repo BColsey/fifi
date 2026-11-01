@@ -17,7 +17,6 @@ pub(crate) struct SlicedWeight {
     cols: u32,
 }
 
-/// One stored projection weight.
 #[derive(Debug)]
 pub(crate) enum StoredWeight {
     /// A packed matrix read whole at load.
@@ -26,7 +25,6 @@ pub(crate) enum StoredWeight {
     Sliced(SlicedWeight),
 }
 
-/// Reads one stored tensor or one leading slice of it.
 pub(crate) fn fetch(
     ckpt: &StreamedCheckpoint,
     key: &str,
@@ -44,7 +42,6 @@ pub(crate) fn fetch(
     }
 }
 
-/// Reads a whole tensor whose element count is `len`.
 fn whole_with_len(ckpt: &StreamedCheckpoint, key: &str, len: usize) -> Result<Tensor, EngError> {
     let tensor = fetch(ckpt, key, Selection::Whole)?;
     let count = tensor
@@ -91,7 +88,6 @@ pub(crate) fn host_f32(
     }
 }
 
-/// Reads an I64 tensor of `len` elements.
 pub(crate) fn host_i64(
     ckpt: &StreamedCheckpoint,
     key: &str,
@@ -132,13 +128,11 @@ pub(crate) fn packed(
     PackedWeight::try_new(payload, scales, biases, vec![out, input], spec)
 }
 
-/// Returns the stored dtype and shape of `key`, or a checkpoint error when it is absent.
 fn stored_entry(ckpt: &StreamedCheckpoint, key: &str) -> Result<(Dtype, Vec<u32>), EngError> {
     ckpt.stored(key)
         .ok_or_else(|| EngError::Checkpoint(format!("missing tensor {key}")))
 }
 
-/// Checks the stored dtypes and shapes of a sliced module's payload, scales, and biases.
 fn check_layout(
     ckpt: &StreamedCheckpoint,
     stem: &str,
@@ -514,19 +508,14 @@ pub(crate) fn record_page_import(elapsed: std::time::Duration) {
 #[cfg(all(test, feature = "native-fault-qualification"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExpertReadStats {
-    /// `ckpt.read_slice_into` calls made by `read_stack_into`.
     pub(crate) slice_reads: u64,
-    /// Bytes that those calls read.
     pub(crate) read_bytes: u64,
-    /// Wall nanoseconds inside those calls.
     pub(crate) read_ns: u64,
     /// `import_packed_pages` calls of the prefill pool (one per wave).
     pub(crate) page_imports: u64,
-    /// Wall nanoseconds inside those calls.
     pub(crate) import_ns: u64,
 }
 
-/// Reads the expert counters (qualification test builds).
 #[cfg(all(test, feature = "native-fault-qualification"))]
 pub(crate) fn qualification_expert_reads() -> ExpertReadStats {
     use expert_counters::{IMPORT_NS, PAGE_IMPORTS, READ_BYTES, READ_NS, SLICE_READS};
@@ -540,7 +529,6 @@ pub(crate) fn qualification_expert_reads() -> ExpertReadStats {
     }
 }
 
-/// Sets the expert counters to zero (qualification test builds).
 #[cfg(all(test, feature = "native-fault-qualification"))]
 pub(crate) fn qualification_reset_expert_reads() {
     use expert_counters::{IMPORT_NS, PAGE_IMPORTS, READ_BYTES, READ_NS, SLICE_READS};

@@ -34,7 +34,6 @@ fn packed_of(weight: &StoredWeight) -> Result<&PackedWeight, EngError> {
     }
 }
 
-/// Returns the stream description of a sliced stack or table.
 fn sliced_of(weight: &StoredWeight) -> Result<SlicedWeight, EngError> {
     match weight {
         StoredWeight::Sliced(s) => Ok(s.clone()),
@@ -225,7 +224,6 @@ impl RAttn {
     }
 }
 
-/// The token mixer of one layer.
 pub(super) enum RMixer {
     Delta(RDelta),
     Attn(RAttn),
@@ -267,7 +265,6 @@ pub(super) enum RFeedForward {
     Moe(Box<RMoe>),
 }
 
-/// The non-expert part of the MoE weights, imported with the layer batch.
 struct MoeFront {
     router_t: ExecutionTensor,
     shared_gate: ResidentPackedWeight,
@@ -414,7 +411,6 @@ impl RMoe {
         Ok(())
     }
 
-    /// Mapped bytes under the three stacks.
     fn page_bytes(&self) -> Result<u64, EngError> {
         u64::try_from(self.pages.len())
             .map_err(|_| EngError::MemoryPlan("expert page bytes exceed u64".into()))
@@ -457,7 +453,6 @@ struct LayerFront {
     feed_forward: FeedForwardFront,
 }
 
-/// Resident Q36 weights.
 pub(super) struct ResidentWeights {
     pub(super) shape: HostShape,
     /// The embedding table, read one row per token from the checkpoint.
@@ -633,7 +628,6 @@ impl ResidentWeights {
         Ok(total.total())
     }
 
-    /// Mapped bytes of the expert pages of all layers.
     pub(super) fn expert_page_bytes(&self) -> Result<u64, EngError> {
         let mut total = Bytes::default();
         for layer in &self.layers {
@@ -754,7 +748,6 @@ mod tests {
     use crate::family::spec::FamilySpec;
     use crate::kernels::QuantizationMode;
 
-    /// A checkpoint of `spec` and a fresh host load of it.
     fn load(spec: &FamilySpec) -> (StreamedCheckpoint, HostWeights) {
         let ckpt = tiny::checkpoint(spec);
         let host = HostWeights::load(&ckpt, spec, &tiny::config(spec)).unwrap();

@@ -126,7 +126,6 @@ pub struct RouteFault {
     pub gap: Option<f32>,
 }
 
-/// The verdict of [`compare_top_k`] on one pair of selections.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopKComparison {
     /// Every beyond-tie difference of the pair. An empty vector accepts the pair.
@@ -136,14 +135,11 @@ pub struct TopKComparison {
     pub max_gap: f32,
 }
 
-/// The probability gap of experts `a` and `b` on `probs`, or `None` when the row cannot index
-/// one of them.
 fn probability_gap(probs: &[f32], a: u32, b: u32) -> Option<f32> {
     let (a, b) = (a as usize, b as usize);
     (a < probs.len() && b < probs.len()).then(|| (probs[a] - probs[b]).abs())
 }
 
-/// The experts of `ids` that `others` does not hold, in order.
 fn exclusive(ids: &[u32], others: &[u32]) -> Vec<u32> {
     ids.iter()
         .copied()
@@ -181,8 +177,6 @@ pub fn compare_top_k(
         });
         return comparison;
     }
-    // The set rule: every expert that one selection holds and the other does not must sit within
-    // `epsilon` of the nearest exchanged expert of the other selection.
     for (oracle_side, (mine, theirs)) in [(true, (oracle, routed)), (false, (routed, oracle))] {
         let exchanged = exclusive(theirs, mine);
         for id in exclusive(mine, theirs) {
@@ -216,7 +210,6 @@ pub fn compare_top_k(
             }
         }
     }
-    // The rank rule: a differing rank is a fault unless its two experts sit within `epsilon`.
     for (rank, (&a, &b)) in oracle.iter().zip(routed).enumerate() {
         if a == b {
             continue;
@@ -243,7 +236,6 @@ pub fn compare_top_k(
     comparison
 }
 
-/// The per-cell measurements of one differing top-k pair under the BF16 co-conditions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouteCellDeltas {
     /// The largest `|p_a - p_b| / max(p_a, p_b)` over the pair's differing positions, where
@@ -301,15 +293,12 @@ pub fn differing_fraction_passes(compared: usize, differing: usize, limit: f64) 
     differing as f64 / compared as f64 <= limit
 }
 
-/// True when the run's signed mean of the per-cell host-minus-device probability sums passes its
-/// gate. A NaN fails.
 pub fn signed_mean_passes(signed_mean: f64, limit: f64) -> bool {
     signed_mean.is_finite() && signed_mean.abs() <= limit
 }
 
 /// True for a finite cosine at or above `floor`: the shared NaN-rejecting form of the logits-cosine
-/// floors of the route gate, the exact 0.99999 floor for the `f32` control and 0.997 for BF16. A
-/// NaN fails both.
+/// floors of the route gate, the exact 0.99999 floor for the `f32` control and 0.997 for BF16.
 pub fn cosine_passes(cosine: f64, floor: f64) -> bool {
     cosine.is_finite() && cosine >= floor
 }
@@ -374,7 +363,7 @@ mod tests {
     #[test]
     fn the_health_check_rejects_a_non_finite_layer_and_passes_a_finite_stack() {
         // A finite stack of layer sums, as a healthy chunk of four layers reads back: every value
-        // is 1 within rounding and the check passes.
+        // is 1 within rounding.
         let healthy = [1.0, 0.9999999, 1.0000001, 1.0];
         assert_eq!(check_health(&healthy), Ok(()), "a finite stack passes");
         assert_eq!(check_health(&[]), Ok(()), "an empty stack passes");
@@ -406,7 +395,6 @@ mod tests {
     #[test]
     fn the_near_tie_rule_tolerates_only_ties() {
         let probs = row();
-        // Equal selections carry no fault and see no gap.
         let equal = compare_top_k(&[7, 3, 11, 5], &[7, 3, 11, 5], &probs, TIE_EPSILON);
         assert_eq!(
             equal,
@@ -415,16 +403,12 @@ mod tests {
                 max_gap: 0.0
             }
         );
-        // A rank swap of the near-tied 3 and 11, a 4e-3 gap, passes the production epsilon, and
-        // the report sees the gap.
         let swapped = compare_top_k(&[7, 3, 11, 5], &[7, 11, 3, 5], &probs, TIE_EPSILON);
         assert_eq!(swapped.faults, Vec::new(), "the near-tie swap is tolerated");
         assert!(
             (swapped.max_gap - tie_gap(&probs)).abs() <= 1e-9,
             "{swapped:?}"
         );
-        // The same swap on a 6e-3 gap is beyond the production epsilon: a fault at both of its
-        // ranks, so the gate fails for any gap above the epsilon.
         let mut wide = row();
         wide[11] = 0.2 - 6e-3;
         let beyond = compare_top_k(&[7, 3, 11, 5], &[7, 11, 3, 5], &wide, TIE_EPSILON);
@@ -446,7 +430,6 @@ mod tests {
             ],
             "a 6e-3 gap is beyond the epsilon"
         );
-        // The same 4e-3 swap against a smaller epsilon is a rank fault at both of its ranks.
         let strict = compare_top_k(&[7, 3, 11, 5], &[7, 11, 3, 5], &probs, 1e-5);
         assert_eq!(
             strict.faults,
@@ -466,7 +449,6 @@ mod tests {
             ],
             "beyond the epsilon the swap is a fault"
         );
-        // A swap of clearly separated experts (7 and 5) is a fault at both ranks.
         let clear_gap = (probs[7] - probs[5]).abs();
         let clear = compare_top_k(&[7, 3, 11, 5], &[5, 3, 11, 7], &probs, TIE_EPSILON);
         assert_eq!(
@@ -478,8 +460,6 @@ mod tests {
             vec![(Some(0), Some(clear_gap)), (Some(3), Some(clear_gap))],
             "a clear swap is a fault"
         );
-        // An exchanged expert at the selection boundary (5 leaves, 2 enters, gap 0.299) is a
-        // tolerated tie within a wide epsilon and three faults beyond a narrow one.
         let exchanged = compare_top_k(&[7, 3, 11, 5], &[7, 3, 11, 2], &probs, 1.0);
         assert_eq!(
             exchanged.faults,
@@ -497,11 +477,9 @@ mod tests {
             2,
             "one set fault per side"
         );
-        // An id the row cannot index is always a fault, whatever the epsilon.
         let outside = compare_top_k(&[7, 3, 11, 16], &[7, 3, 11, 5], &probs, 100.0);
         assert_eq!(outside.faults.len(), 3, "{outside:?}");
         assert!(outside.faults.iter().all(|fault| fault.gap.is_none()));
-        // A width mismatch is a fault of its own.
         let widths = compare_top_k(&[7, 3], &[7, 3, 11], &probs, 100.0);
         assert_eq!(widths.faults.len(), 1, "{widths:?}");
         assert_eq!(widths.faults[0].rank, None);
@@ -510,7 +488,6 @@ mod tests {
     #[test]
     fn the_cell_deltas_report_the_relative_gap_and_the_signed_bias() {
         let probs = row();
-        // Equal selections carry no relative gap and no signed bias.
         assert_eq!(
             route_cell_deltas(&[7, 3, 11, 5], &[7, 3, 11, 5], &probs),
             RouteCellDeltas {
@@ -518,8 +495,6 @@ mod tests {
                 signed_gap: 0.0
             }
         );
-        // The 3/11 near-tie swap: the relative gap of the swapped pair (4e-3 over 0.2) and no
-        // signed bias, because the two swapped positions carry opposite signs.
         let swapped = route_cell_deltas(&[7, 3, 11, 5], &[7, 11, 3, 5], &probs);
         assert!(
             (swapped.max_relative_gap - tie_gap(&probs) / probs[3]).abs() <= 1e-9,
@@ -530,8 +505,6 @@ mod tests {
             swapped.max_relative_gap <= RELATIVE_GAP_LIMIT,
             "the near tie passes the relative gate"
         );
-        // The 5/2 boundary exchange: a relative gap (0.299 over 0.3) above the 0.5 gate, and
-        // the host-minus-device probability of the exchange as its signed bias.
         let exchanged = route_cell_deltas(&[7, 3, 11, 5], &[7, 3, 11, 2], &probs);
         assert!(
             (exchanged.max_relative_gap - (probs[5] - probs[2]) / probs[5]).abs() <= 1e-6,
@@ -545,7 +518,6 @@ mod tests {
             exchanged.max_relative_gap > RELATIVE_GAP_LIMIT,
             "the exchange fails the relative gate"
         );
-        // A position whose ids the row cannot index is skipped: `compare_top_k` faults it.
         assert_eq!(
             route_cell_deltas(&[7, 3, 11, 5], &[7, 3, 11, 16], &probs),
             RouteCellDeltas {
@@ -557,8 +529,6 @@ mod tests {
 
     #[test]
     fn the_origin_rule_faults_only_layers_0_to_2_of_step_0() {
-        // The d1 BF16 run first mismatched at step 0 layer 3: the rule faults every differing cell
-        // before that and nothing else.
         for layer in 0..3 {
             assert!(
                 origin_fault(0, layer),
@@ -599,7 +569,6 @@ mod tests {
             differing_fraction_passes(0, 0, DIFFERING_FRACTION_LIMIT),
             "nothing compared differs in nothing"
         );
-        // The signed-mean gate is epsilon/5 = 1e-3 on the absolute value; a NaN fails it.
         assert!(signed_mean_passes(1e-3, SIGNED_MEAN_LIMIT));
         assert!(signed_mean_passes(-1e-3, SIGNED_MEAN_LIMIT));
         assert!(!signed_mean_passes(1.1e-3, SIGNED_MEAN_LIMIT));
@@ -609,23 +578,17 @@ mod tests {
 
     #[test]
     fn the_logits_cosine_floor_is_finite_and_above_the_floor_of_the_dtype() {
-        // The f32 control keeps the exact 0.99999 floor.
         assert!(cosine_passes(F32_LOGITS_FLOOR, F32_LOGITS_FLOOR));
         assert!(!cosine_passes(0.999_98, F32_LOGITS_FLOOR));
-        // The BF16 floor is 0.997: the d1 minimum 0.99864 passes with a 1.64e-3 margin, and a
-        // cosine below the floor fails.
         assert!(cosine_passes(0.998_64, BF16_LOGITS_FLOOR));
         assert!(cosine_passes(BF16_LOGITS_FLOOR, BF16_LOGITS_FLOOR));
         assert!(!cosine_passes(0.996_9, BF16_LOGITS_FLOOR));
-        // A NaN fails both floors.
         assert!(!cosine_passes(f64::NAN, F32_LOGITS_FLOOR));
         assert!(!cosine_passes(f64::NAN, BF16_LOGITS_FLOOR));
     }
 
     #[test]
     fn the_bf16_layer_floor_admits_the_d1_minimum_and_refuses_a_regression() {
-        // The d1 BF16 parity run saw a minimum layer cosine of 0.9799: it passes, and so does
-        // the exact 0.01 regression boundary under it.
         assert!(keeps_floored_anchor(
             D1_LAYER_MINIMUM,
             LAYER_FLOOR,
@@ -638,8 +601,6 @@ mod tests {
             D1_LAYER_MINIMUM,
             LAYER_REGRESSION
         ));
-        // A regression beyond 0.01 under the d1 minimum fails, and so does the 0.95 floor and
-        // a NaN.
         assert!(!keeps_floored_anchor(
             0.969_8,
             LAYER_FLOOR,

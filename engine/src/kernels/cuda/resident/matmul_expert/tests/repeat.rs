@@ -18,7 +18,6 @@ const SLOTS: usize = 8;
 /// Eight distinct experts, including the first and the last.
 const IDS: [i32; SLOTS] = [0, 255, 17, 128, 64, 200, 3, 99];
 
-/// One expert stack: `rows` per expert x `k`, Q4_K.
 struct Shape {
     name: &'static str,
     rows: usize,

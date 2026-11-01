@@ -293,7 +293,6 @@ mod tests {
         assert_eq!(super::context_limit_with(None), 32768);
         assert_eq!(super::context_limit_with(Some("8192")), 8192);
         assert_eq!(super::context_limit_with(Some("32768")), 32768);
-        // Fail-safe: an unrecognized SET value rolls back to 8192.
         assert_eq!(super::context_limit_with(Some("invalid")), 8192);
     }
 
@@ -302,7 +301,6 @@ mod tests {
         assert_eq!(super::cache_limit_with(None), 64 * 1024 * 1024);
         assert_eq!(super::cache_limit_with(Some("67108864")), 64 * 1024 * 1024);
         assert_eq!(super::cache_limit_with(Some("0")), 0);
-        // Fail-safe: an unrecognized SET value rolls back to the no-cache 0.
         assert_eq!(super::cache_limit_with(Some(" 0 ")), 0);
         assert_eq!(super::cache_limit_with(Some("64MiB")), 0);
         assert_eq!(super::cache_limit_with(Some("invalid")), 0);
@@ -386,12 +384,9 @@ mod tests {
         assert_eq!(super::prefill_chunk_rows(Some("512")), 512);
         assert_eq!(super::prefill_chunk_rows(Some("0")), 1);
         assert_eq!(super::prefill_chunk_rows(Some("0\n")), 1);
-        // SET but unrecognized (empty, mistyped, non-UTF-8): fail safe to
-        // the rollback size 512, never the 1024 default.
         assert_eq!(super::prefill_chunk_rows(Some("")), 512);
         assert_eq!(super::prefill_chunk_rows(Some("2048")), 512);
         assert_eq!(super::prefill_chunk_rows(Some("invalid")), 512);
-        // SET but non-UTF-8: "" is unrecognized => fail-safe 512.
         let invalid = OsStr::from_bytes(b"\xff512");
         assert_eq!(super::os_setting(Some(invalid)), Some(""));
         assert_eq!(

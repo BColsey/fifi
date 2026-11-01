@@ -24,11 +24,8 @@ use crate::weights::{GgufHeader, GgufTensor, GgufType};
 /// writes the layer index there).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertTensorNames {
-    /// Gate projection tensor name, `{layer}` inside.
     pub gate: String,
-    /// Up projection tensor name, `{layer}` inside.
     pub up: String,
-    /// Down projection tensor name, `{layer}` inside.
     pub down: String,
 }
 
@@ -45,10 +42,6 @@ impl ExpertTensorNames {
         }
     }
 
-    /// The same names with every `{layer}` replaced by `layer`. WHY: the tensor
-    /// table holds concrete names, one per layer index, so lookup is always by
-    /// the substituted spelling; a custom naming scheme keeps working because
-    /// every occurrence is replaced.
     pub fn for_layer(&self, layer: usize) -> Self {
         let fill = |name: &str| name.replace("{layer}", &layer.to_string());
         Self {
@@ -75,7 +68,6 @@ pub struct ExpertRanges {
 /// names the tensor or the arguments that lost, and nothing is half-indexed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LocatorError {
-    /// No tensor of this name in the header's tensor table.
     MissingTensor {
         /// The looked-up name, `{layer}` already replaced.
         name: String,
@@ -83,12 +75,7 @@ pub enum LocatorError {
     /// The tensor exists but is structurally unusable (wrong ggml type, wrong
     /// rank, a byte length that disagrees with its dims, a range beyond the
     /// file, or an overlap with a sibling of the same layer); `why` says which.
-    BadTensor {
-        /// The offending tensor's name.
-        name: String,
-        /// What is wrong with it.
-        why: String,
-    },
+    BadTensor { name: String, why: String },
     /// The geometry disagrees: a tensor's dims differ from the expected
     /// `[ne0, ne1, ne2]` (transposed, wrong extents, or `ne2 != experts`), or
     /// the locator arguments themselves are impossible. The string names the
@@ -96,12 +83,7 @@ pub enum LocatorError {
     ShapeMismatch(String),
     /// `ranges`/`job` asked for a layer outside `0..layers` or an expert
     /// outside `0..experts`; the numbers echo the arguments.
-    OutOfRange {
-        /// The layer index that was asked for.
-        layer: usize,
-        /// The expert index that was asked for.
-        expert: usize,
-    },
+    OutOfRange { layer: usize, expert: usize },
     /// A checked offset or size computation overflowed; nothing was indexed.
     Overflow,
 }
@@ -114,7 +96,6 @@ struct TensorSpan {
     per_expert: u64,
 }
 
-/// The placements of the three stacked tensors of one layer.
 #[derive(Debug)]
 struct LayerSpans {
     gate: TensorSpan,
@@ -201,7 +182,6 @@ impl ExpertLocator {
         })
     }
 
-    /// Looks a tensor up by name, failing with `name` when it is missing.
     fn require<'a>(header: &'a GgufHeader, name: &str) -> Result<&'a GgufTensor, LocatorError> {
         header
             .tensor(name)
@@ -332,7 +312,6 @@ impl ExpertLocator {
         self.expert_bytes
     }
 
-    /// The spans of `layer`, after the argument check of `ranges`/`job`.
     fn entry(&self, layer: usize, expert: usize) -> Result<&LayerSpans, LocatorError> {
         if layer >= self.spans.len() || expert >= self.experts {
             return Err(LocatorError::OutOfRange { layer, expert });
@@ -580,12 +559,10 @@ pub(crate) mod tests {
 
     #[test]
     fn locator_names_replace_the_layer_placeholder() {
-        // The placeholder becomes the layer number in every name...
         let l7 = ExpertTensorNames::llama_cpp().for_layer(7);
         assert_eq!(l7.gate, "blk.7.ffn_gate_exps.weight");
         assert_eq!(l7.up, "blk.7.ffn_up_exps.weight");
         assert_eq!(l7.down, "blk.7.ffn_down_exps.weight");
-        // ...in a custom scheme too, every occurrence, template untouched.
         let custom = ExpertTensorNames {
             gate: String::from("{layer}/g/{layer}"),
             up: String::from("{layer}/u"),

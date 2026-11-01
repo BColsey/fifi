@@ -9,8 +9,6 @@ use super::{
     spec::FamilySpec,
 };
 
-/// One checkpoint key with its storage tier and quantization.
-///
 /// Keys of packed projections carry `ModuleQuantization::Quantized`. Keys of dense tensors
 /// (norms, convolution weights, and recurrent auxiliaries) carry `Unquantized` whatever the
 /// configuration default or an incidental override says.

@@ -69,7 +69,6 @@ pub(in crate::kernels::cuda) mod reference {
         (lo4 as i32) | ((((qh >> (2 * quarter)) & 3) as i32) << 4)
     }
 
-    /// Dequantized weight value `i` of one block (d, dmin, scales, qs bytes at their offsets).
     pub(super) fn weight_value(ty: QuantType, block: &[u8], i: usize) -> f64 {
         match ty {
             QuantType::Q80 => half_at(block, 0) as f64 * (block[2 + i] as i8) as f64,
@@ -158,7 +157,6 @@ pub(in crate::kernels::cuda) mod reference {
         (sum, abs)
     }
 
-    /// Builds `rows` rows of `k` values of random native blocks of `ty` from `rng`.
     pub(in crate::kernels::cuda) fn build_weight(
         ty: QuantType,
         rows: usize,
@@ -228,7 +226,6 @@ fn read_f32(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Vec<f32> {
 
 #[test]
 fn quant_sizes_are_pure_and_exact() {
-    // Weight bytes per type: Q4_K 144 per 256, Q5_0 22 per 32, Q6_K 210 per 256, Q8_0 34 per 32.
     assert_eq!(QuantType::Q4K.block_size(), 256);
     assert_eq!(QuantType::Q4K.block_bytes(), 144);
     assert_eq!(QuantType::Q50.block_size(), 32);
@@ -248,7 +245,6 @@ fn quant_sizes_are_pure_and_exact() {
     assert_eq!(MATRIX_ROW_PADDING, 512);
 }
 
-/// The byte counts `plan_matvec` checks a call against.
 #[test]
 fn matvec_needs_are_pure_and_exact() {
     let need = matvec_needs(QuantType::Q4K, 2048, 512, 2).expect("sizes");
@@ -780,7 +776,6 @@ fn matvec_report_gbps() {
             .expect("matvec");
         };
         let warm_us = bench(&ctx, &stream, warm_iters, &launch);
-        // Cold: one launch behind the L2 flush read, timed alone, median of the cold passes.
         let mut cold = Vec::new();
         for _ in 0..cold_iters {
             flush();
@@ -838,7 +833,6 @@ fn matvec_report_gbps() {
         .expect("quantize");
         let y_bytes = rows * 8 * 4;
         let y = nan_filled(&ctx, y_bytes);
-        // 32 id sets, each a different random 8-subset of the experts.
         let id_sets: Vec<DeviceBuffer> = (0..32)
             .map(|_set| {
                 let ids: Vec<i32> = (0..8)
@@ -897,14 +891,12 @@ fn matvec_report_gbps() {
     }
 }
 
-/// Uploads eight little-endian ids (helper of the expert bench rows).
 fn ids_buffer(ctx: &CudaContext, ids: &[i32]) -> DeviceBuffer {
     let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
     testkit::upload_bytes(ctx, &bytes)
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`, so a refusal test fails when another
-/// check refuses the call instead of the one under test.
+/// Fails when another check refuses the call instead of the one under test.
 pub(in crate::kernels::cuda) fn assert_bad_request(
     result: Result<(), EngError>,
     case: &str,
@@ -927,7 +919,6 @@ pub(in crate::kernels::cuda) enum Owner {
     Other,
 }
 
-/// Where `y` of a dense refusal case lies.
 #[derive(Clone, Copy)]
 enum YIn {
     Own,
@@ -935,8 +926,6 @@ enum YIn {
     X,
 }
 
-/// One refusal case of the dense wrapper: the numbers of the call and the (offset, bytes) of its
-/// ranges inside the rig's buffers.
 #[derive(Clone, Copy)]
 struct Spec {
     k: usize,
@@ -977,7 +966,6 @@ struct RefusalRig {
     ctx: CudaContext,
 }
 
-/// The second adapter: a stream and a weight buffer that belong to another context.
 struct OtherContext {
     stream: DeviceStream,
     w: DeviceBuffer,
@@ -1012,8 +1000,6 @@ fn attempt(rig: &RefusalRig, other: &OtherContext, spec: Spec) -> Result<(), Eng
     )
 }
 
-/// For `plan_matvec`, every refusal is a `BadRequest` with the text of its own check, nothing is
-/// queued, the backend stays usable, and the valid call of the same rig launches.
 #[test]
 fn matvec_q_rejects_unsound_calls_before_launching() {
     if !testkit::device_present("matvec_q_rejects_unsound_calls_before_launching") {
@@ -1180,7 +1166,6 @@ fn matvec_q_rejects_unsound_calls_before_launching() {
     for (case, needle, spec) in cases {
         assert_bad_request(attempt(&rig, &other, spec), case, needle);
     }
-    // No refusal queued anything: y is untouched and the backend works; then the valid call runs.
     rig.stream.synchronize().expect("drain");
     let untouched = testkit::read_bytes(&rig.ctx, &rig.y, 4096);
     assert!(untouched.iter().all(|&byte| byte == 0xAB), "y untouched");
@@ -1215,7 +1200,6 @@ fn matvec_q_gdn_sibling_fusion_ab_bench() {
     let segments: [usize; 4] = [8192, 4096, 32, 32];
     let fused_rows: usize = segments.iter().sum();
 
-    // The load-time repack: four sibling tensors, row-concatenated into one weight buffer.
     let mut rng = testkit::Rng::new(0x5D6E_0001);
     let mut fused_host = Vec::new();
     let mut seg_off = Vec::new();
@@ -1278,7 +1262,6 @@ fn matvec_q_gdn_sibling_fusion_ab_bench() {
         .expect("fused matvec");
     };
 
-    // Bitwise gate: the fused launch's rows are the four segments' outputs, unchanged.
     let mut seg_ys = Vec::new();
     for &rows in &segments {
         seg_ys.push(testkit::upload_filled(&ctx, 0xAA, rows * 4));
@@ -1300,8 +1283,7 @@ fn matvec_q_gdn_sibling_fusion_ab_bench() {
         println!("segment {i} rows {rows}: bitwise OK");
     }
 
-    // Exclusive timing, interleaved A/B, 30 samples per arm (the mma bench's host-timer
-    // pattern: Instant around the launch train, sync inside the sample).
+    // The mma bench's host-timer pattern: Instant around the launch train, sync inside the sample.
     let mut a_ms = Vec::new();
     let mut b_ms = Vec::new();
     for rep in 0..60 {

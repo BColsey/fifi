@@ -2,7 +2,6 @@
 use super::*;
 use crate::kernels::cuda::{CudaContext, testkit};
 
-/// The gather of two rows equals the host dequantization of the same blocks.
 #[test]
 fn gathers_rows_against_the_host_dequantizer() {
     if !testkit::device_present("embed_q8 basic") {
@@ -51,7 +50,6 @@ fn gathers_rows_against_the_host_dequantizer() {
     }
 }
 
-/// The wrapper refuses a row count above the gather limit before any native call.
 #[test]
 fn refuses_too_many_rows() {
     if !testkit::device_present("embed_q8 row refusal") {

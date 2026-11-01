@@ -15,13 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// The reply of a fake engine whose configuration sets none.
 pub(crate) const DEFAULT_REPLY: &str = "Hello from the fake engine.";
 
-/// The context limit of a fake engine whose configuration sets none.
 pub(crate) const DEFAULT_CONTEXT_LIMIT: u32 = 4_096;
 
-/// The tokens that one session of the fake executor has produced so far.
 #[derive(Default)]
 pub(crate) struct ReplySession {
     history: Vec<u32>,
@@ -118,7 +115,6 @@ fn checkpoint(message: String) -> EngError {
     EngError::Checkpoint(message)
 }
 
-/// Loads the four tokenizer files of `dir`. The pin comes from the files themselves.
 pub(crate) fn load_bundle(dir: &Path) -> Result<TokenizerBundle, EngError> {
     let read = |name: &str| {
         std::fs::read(dir.join(name))
@@ -139,8 +135,8 @@ pub(crate) fn load_bundle(dir: &Path) -> Result<TokenizerBundle, EngError> {
     TokenizerBundle::load(dir, &pin)
 }
 
-/// A started fake engine, its tokenizer, and its context limit. Every family reports its own
-/// context limit this way, and the router uses it for the 409 check and for the output limit.
+/// Every family reports its own context limit this way, and the router uses it for the 409
+/// check and for the output limit.
 pub(crate) struct FakeEngine {
     pub(crate) engine: Engine,
     pub(crate) bundle: Arc<TokenizerBundle>,
@@ -151,7 +147,6 @@ pub(crate) struct FakeEngine {
 /// list).
 pub(crate) const FAMILY: &str = "fake";
 
-/// Starts the fake engine of a configuration entry.
 pub(crate) fn start(config: &EngineConfig, ready_note: ReadyNote) -> Result<FakeEngine, EngError> {
     let bundle = Arc::new(load_bundle(&config.tokenizer_dir)?);
     let options = config.fake.clone().unwrap_or_default();
@@ -205,7 +200,6 @@ mod tests {
         }
     }
 
-    /// Runs one job with a two-token prompt and returns its text and its events.
     fn run(fake: &FakeEngine) -> (String, Vec<JobEvent>) {
         let decoder = IncrementalDecoder::new(fake.bundle.tokenizer());
         run_with(fake, GenerationState::new(decoder))
@@ -362,7 +356,6 @@ mod tests {
         assert_eq!(fake.engine.handle().state(), EngineState::Ready);
     }
 
-    /// An executor over the fixture tokenizer that replies "ab", and a fresh session.
     fn executor_and_state() -> (ReplyExecutor, ReplySession, GenerationState) {
         let bundle = load_bundle(&tokenizer_dir()).expect("load");
         let executor = ReplyExecutor {

@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 pub struct RowHeader {
     pub slot: u32,
     pub pos: u32,
-    /// True when the slot finished and its row must not be scheduled again.
     pub finished: bool,
 }
 
@@ -30,15 +29,13 @@ pub struct BatchScheduler {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlotState {
-    /// Admitted, awaiting its next decode row.
     Active { pos: u32 },
-    /// Finished; the row is not scheduled until reset.
     Finished,
 }
 
 impl BatchScheduler {
     /// `max_seqs` DEFAULTS TO 1 (the M1 gate: B=1 bit-identical to the solo
-    /// path); the batch arms only when the caller raises it.
+    /// path).
     pub fn new() -> Self {
         Self::with_max_seqs(1)
     }
@@ -57,8 +54,7 @@ impl BatchScheduler {
         self.max_seqs
     }
 
-    /// Admits a new sequence at position 0. Fails cleanly (no state change)
-    /// when the slot budget is full.
+    /// Fails cleanly (no state change) when the slot budget is full.
     pub fn admit(&mut self) -> Result<u32, EngError> {
         if self
             .slots
@@ -77,13 +73,11 @@ impl BatchScheduler {
         Ok(slot)
     }
 
-    /// Cancels a slot outright (admission symmetry; the 1,000-cycle leak gate).
+    /// Admission symmetry (the 1,000-cycle leak gate).
     pub fn cancel(&mut self, slot: u32) {
         self.slots.remove(&slot);
     }
 
-    /// The next decode window: the row headers for the active slots, at most
-    /// `window` of them, in slot order. An empty window means no work.
     pub fn next_window(&mut self) -> Vec<RowHeader> {
         self.slots
             .iter()
@@ -100,8 +94,6 @@ impl BatchScheduler {
             .collect()
     }
 
-    /// Commits one stepped row: the slot's position advances (decode-only - one
-    /// position per step, prefill never rides this scheduler).
     pub fn commit_step(&mut self, slot: u32, finished: bool) {
         let Some(state) = self.slots.get_mut(&slot) else {
             return;
@@ -118,7 +110,6 @@ impl BatchScheduler {
         }
     }
 
-    /// Resets a finished slot for reuse (position back to 0).
     pub fn reset(&mut self, slot: u32) -> Result<(), EngError> {
         match self.slots.get(&slot) {
             Some(SlotState::Finished) => {}
@@ -138,7 +129,6 @@ impl BatchScheduler {
         Ok(())
     }
 
-    /// The active (schedulable) slot count - the leak gate's probe.
     pub fn active(&self) -> usize {
         self.slots
             .values()
@@ -153,10 +143,7 @@ impl Default for BatchScheduler {
     }
 }
 
-/// Binds the scheduler's decode window to a per-row step callback: the
-/// window's headers drive the calls in slot order, B=1 is exactly one call,
-/// and finished rows are never stepped. Portable - the mock proves the
-/// contract without any kernel.
+/// Portable: the mock proves the contract without any kernel.
 pub struct BatchRunner<'a, F> {
     pub sched: &'a mut BatchScheduler,
     pub step: F,
@@ -166,8 +153,6 @@ impl<'a, F> BatchRunner<'a, F>
 where
     F: FnMut(u32, u32) -> bool,
 {
-    /// Runs one decode step over the current window, calling `step(slot, pos)`
-    /// per row (true = finished). Returns the stepped slots in order.
     pub fn run(&mut self) -> Vec<u32> {
         let headers = self.sched.next_window();
         let mut stepped = Vec::with_capacity(headers.len());
@@ -189,7 +174,6 @@ mod tests {
         let mut sched = BatchScheduler::new();
         assert_eq!(sched.max_seqs(), 1, "max_seqs defaults to 1 (the M1 gate)");
         let slot = sched.admit().unwrap();
-        // the second admit refuses: a lone request never shares a window
         assert!(sched.admit().is_err());
         let window = sched.next_window();
         assert_eq!(window.len(), 1);
@@ -265,7 +249,6 @@ mod tests {
         let window = sched.next_window();
         assert_eq!(window.len(), 3, "the finished slot no longer batches");
         assert!(!window.iter().any(|h| h.slot == slots[3]));
-        // B=1 (the default scheduler): exactly one call, the solo path shape
         let mut solo = BatchScheduler::new();
         let slot = solo.admit().unwrap();
         let mut n = 0;
@@ -299,7 +282,6 @@ mod tests {
         }
         assert_eq!(sched.active(), 0, "no slot survives the cycles");
         assert!(sched.next_window().is_empty());
-        // the scheduler remains fully usable afterwards
         let fresh = sched.admit().unwrap();
         assert_eq!(sched.next_window().len(), 1);
         assert_eq!(fresh, 1_000, "slot ids keep advancing without reuse");
@@ -319,7 +301,6 @@ mod reset_capacity_tests {
         let a = sched.admit().unwrap();
         sched.commit_step(a, true);
         let b = sched.admit().unwrap();
-        // Capacity 1, slot b active: resetting slot a must refuse.
         let err = sched.reset(a).unwrap_err();
         assert!(matches!(err, crate::EngError::BadRequest(_)), "{err:?}");
         assert_eq!(sched.active(), 1);
@@ -327,7 +308,6 @@ mod reset_capacity_tests {
         sched.commit_step(b, false);
         assert!(sched.reset(b).is_err());
         assert_eq!(sched.next_window()[0].pos, 1);
-        // With the capacity free again the reset succeeds.
         sched.commit_step(b, true);
         sched.reset(a).unwrap();
         assert_eq!(sched.active(), 1);

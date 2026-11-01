@@ -24,7 +24,6 @@ pub(super) fn allowance_pages(pos: u32) -> u64 {
     (u64::from(pos) / PAGE_POSITIONS as u64 + 1).max(1)
 }
 
-/// The allowance in bytes: the page-table rows at the size of one `Page`.
 pub(super) fn allowance_bytes(pos: u32) -> u64 {
     allowance_pages(pos) * std::mem::size_of::<Page>() as u64
 }

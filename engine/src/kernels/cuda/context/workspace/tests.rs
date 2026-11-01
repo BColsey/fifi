@@ -391,7 +391,6 @@ fn dropping_a_context_returns_its_workspace_bytes_also_after_growth() {
     assert_eq!(anchor.live_bytes(), before);
 }
 
-/// One shape of 16 rows of `K` values.
 fn shape(n_rows: usize, k: usize, tokens: usize) -> WorkspaceShape {
     WorkspaceShape { n_rows, k, tokens }
 }

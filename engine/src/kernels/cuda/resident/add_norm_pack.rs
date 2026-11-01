@@ -35,13 +35,9 @@ use crate::kernels::cuda::native::resident::add_norm_pack::{
 use crate::kernels::cuda::native::xf_bytes;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
-/// The most tokens one call takes.
 pub(crate) const MAX_TOKENS: usize = 32_768;
-/// The widest row one call takes.
 pub(crate) const MAX_WIDTH: usize = 32_768;
-/// `n` is a multiple of this.
 pub(crate) const NORM_WIDTH_UNIT: usize = 256;
-/// Limits as C integers, for the checks on the converted values.
 const MAX_TOKENS_C: c_int = MAX_TOKENS as c_int;
 const MAX_WIDTH_C: c_int = MAX_WIDTH as c_int;
 const UNIT_C: c_int = NORM_WIDTH_UNIT as c_int;
@@ -69,13 +65,10 @@ pub(crate) struct AddNormCall<'b> {
     pub(crate) norm_out: Option<DeviceRange<'b>>,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("add_norm_pack: {tag}: {detail}"))
 }
 
-/// `value` as a C integer in `low..=high`, or the refusal for `tag`. The range is tested on the
-/// converted value, so a `usize` that wraps into range is refused too.
 fn ranged(tag: &str, value: usize, low: c_int, high: c_int) -> Result<c_int, EngError> {
     let refused = || rule(tag, &format!("{tag} is {value}, not {low} to {high}"));
     let int = c_int::try_from(value).map_err(|_| refused())?;
@@ -87,7 +80,7 @@ fn ranged(tag: &str, value: usize, low: c_int, high: c_int) -> Result<c_int, Eng
 }
 
 /// Checks `m` and `n` and converts them once, so that no conversion can fail inside the launch
-/// closure. Each refusal carries the tag `add_norm_pack: <rule>`.
+/// closure.
 pub(in crate::kernels::cuda) fn check_shape(m: usize, n: usize) -> Result<AddNormInts, EngError> {
     let m = ranged("m", m, 1, MAX_TOKENS_C)?;
     let n = ranged("n", n, UNIT_C, MAX_WIDTH_C)?;
@@ -100,7 +93,6 @@ pub(in crate::kernels::cuda) fn check_shape(m: usize, n: usize) -> Result<AddNor
     Ok(AddNormInts { m, n })
 }
 
-/// Checks `eps`: finite and above 0.
 pub(crate) fn check_eps(eps: f32) -> Result<(), EngError> {
     if eps.is_finite() && eps > 0.0 {
         Ok(())
@@ -109,7 +101,6 @@ pub(crate) fn check_eps(eps: f32) -> Result<(), EngError> {
     }
 }
 
-/// Bytes of `h`, `delta` and `norm_out`: `m` rows of `n` f32, or `None` on overflow.
 pub(crate) fn row_bytes(m: usize, n: usize) -> Option<usize> {
     m.checked_mul(n)?.checked_mul(size_of::<f32>())
 }
@@ -130,8 +121,6 @@ fn sizes(m: usize, n: usize) -> Result<Sizes, EngError> {
     })
 }
 
-/// Size and alignment of each range, one `require_fit` per range: `xf` and `norm_out` 16, the
-/// rest 4.
 fn check_fit(call: &AddNormCall<'_>, need: &Sizes) -> Result<(), EngError> {
     require_fit("h", &call.h, need.row, 4)?;
     if let Some(delta) = &call.delta {

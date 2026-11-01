@@ -45,7 +45,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// The integers of one router call, converted by the wrapper before the launch.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::kernels::cuda) struct RouterInts {
     pub(in crate::kernels::cuda) m: c_int,
@@ -54,8 +53,6 @@ pub(in crate::kernels::cuda) struct RouterInts {
     pub(in crate::kernels::cuda) top_k: c_int,
 }
 
-/// What one router launch reads and writes. `w_shared` and `shared_gate` are both given or both
-/// absent.
 pub(in crate::kernels::cuda) struct RouterRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
     pub(in crate::kernels::cuda) w: RawRange<'a>,
@@ -68,7 +65,6 @@ pub(in crate::kernels::cuda) struct RouterRaw<'a> {
     pub(in crate::kernels::cuda) ints: RouterInts,
 }
 
-/// The bytes each range must hold for the ints of a call.
 struct Need {
     x: usize,
     w: usize,
@@ -78,7 +74,6 @@ struct Need {
     gate: usize,
 }
 
-/// The byte needs of `ints`, or `None` when an int is not positive or a product overflows.
 fn needs(ints: &RouterInts) -> Option<Need> {
     let dim = |value: c_int| usize::try_from(value).ok().filter(|v| *v > 0);
     let (m, hidden) = (dim(ints.m)?, dim(ints.hidden)?);
@@ -94,17 +89,14 @@ fn needs(ints: &RouterInts) -> Option<Need> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// True when the optional range is absent, or present and fitting.
 fn fits_if_given(range: Option<&RawRange<'_>>, need: usize, align: usize) -> bool {
     range.is_none_or(|range| fits(range, need, align))
 }
 
-/// True when no range the launch writes shares a byte with another range of the call.
 fn outputs_apart(io: &RouterRaw<'_>, need: &Need) -> bool {
     let mut outputs = vec![
         Span::of(&io.logits, need.logits),
@@ -125,8 +117,6 @@ fn outputs_apart(io: &RouterRaw<'_>, need: &Need) -> bool {
     })
 }
 
-/// Proves a router launch before the native call: the optional pair, sizes, alignment (x, w and
-/// w_shared 16; the rest 4) and that nothing the launch writes overlaps another range.
 fn check_router(io: &RouterRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints).ok_or_else(invalid_argument)?;
     let paired = io.w_shared.is_some() == io.shared_gate.is_some();

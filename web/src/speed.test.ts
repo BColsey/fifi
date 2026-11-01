@@ -1,5 +1,3 @@
-/** Tests for the live speed panel's pure summary (node:test; no DOM). */
-
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
 import { speedSummary, type SpeedRow } from "./speed.js";

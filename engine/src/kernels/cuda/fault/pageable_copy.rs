@@ -1,4 +1,3 @@
-//! Real sticky faults test owned staging retention, not post-enqueue failure.
 use super::{
     CHILD_ENV, CUDA_ERROR_ILLEGAL_ADDRESS, CudaContext, EngError, Ordering, TERMINAL,
     assert_child_finishes, device_present, test_inject_unmapped_fault,

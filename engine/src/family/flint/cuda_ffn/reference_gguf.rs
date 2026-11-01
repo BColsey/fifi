@@ -1,5 +1,5 @@
-//! Pin-bound CPU artifact preparation using existing Flint source ranges and GGUF decoding.
-//! This does not broaden the generic Qwen GGUF reader's supported-type whitelist.
+//! Pin-bound CPU artifact preparation; does not broaden the generic Qwen GGUF
+//! reader's supported-type whitelist.
 
 use std::{
     fs::File,

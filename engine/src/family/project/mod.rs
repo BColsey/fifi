@@ -19,9 +19,6 @@ pub(crate) trait Projector {
     /// Projects one packed NVFP4 matrix against one activation row.
     ///
     /// The default refuses: only a backend that keeps the packed bytes on its
-    /// Projects one packed NVFP4 matrix against one activation row.
-    ///
-    /// The default refuses: only a backend that keeps the packed bytes on its
     /// device answers this without expanding the matrix on the host.
     fn nvfp4_matvec(
         &mut self,
@@ -95,7 +92,6 @@ pub(crate) trait Projector {
     /// The adapter's handle for one stored weight or stacked weight.
     type Weight;
 
-    /// Returns `x · Wᵀ` for a weight with logical shape `[out, in]`.
     fn linear(&mut self, weight: &Self::Weight, x: &[f32]) -> Result<Vec<f32>, EngError>;
 
     /// Name-based compute on a device-resident weight (the handle path
@@ -107,8 +103,6 @@ pub(crate) trait Projector {
         None
     }
 
-    /// The stored shape of a device-resident weight, by name. The default
-    /// returns None; only a backend with resident weights answers.
     fn resident_shape(&self, _name: &str) -> Option<[usize; 2]> {
         None
     }
@@ -199,7 +193,6 @@ pub(crate) struct DenseWeight {
 
 #[cfg(test)]
 impl DenseWeight {
-    /// Builds a `[rows, cols]` matrix. Panics in tests when the length is wrong.
     pub(crate) fn matrix(rows: usize, cols: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), rows * cols, "dense matrix length");
         Self {
@@ -210,7 +203,6 @@ impl DenseWeight {
         }
     }
 
-    /// Builds a `[depth, rows, cols]` stack. Panics in tests when the length is wrong.
     pub(crate) fn stack(depth: usize, rows: usize, cols: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), depth * rows * cols, "dense stack length");
         Self {
@@ -237,7 +229,6 @@ impl DenseWeight {
     }
 }
 
-/// Test adapter that multiplies dense matrices and counts calls.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct DenseProjector {

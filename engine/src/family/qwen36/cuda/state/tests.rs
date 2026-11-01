@@ -42,7 +42,6 @@ fn options(mode: KvMode, context_tokens: usize) -> StepOptions {
     }
 }
 
-/// A context and its owning stream.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -56,8 +55,6 @@ impl Rig {
     }
 }
 
-/// One plane read back from the zeroed pool: its ordinal, plane, the layout extent, the range's
-/// own extent on the device, and whether every byte read back was zero.
 struct PlaneProbe {
     ordinal: usize,
     plane: Plane,
@@ -66,8 +63,6 @@ struct PlaneProbe {
     zeroed: bool,
 }
 
-/// The host data of the zeroed Int8G32 pool after the phase returns (no device owner alive):
-/// the pinned per-token bytes, the pool sizes and modes, and every plane read back.
 struct ZeroedProbe {
     per_token: (usize, usize),
     layout_total: usize,
@@ -78,9 +73,6 @@ struct ZeroedProbe {
     planes: Vec<PlaneProbe>,
 }
 
-/// The Result-only device phase of the zeroed-allocation test: prime the allocator with a dirty
-/// block of the pool's size, allocate the state over it, read every plane back, and return
-/// plain host data through `?`. The context, its stream and the state drop before the asserts.
 fn zeroed_phase() -> Result<ZeroedProbe, EngError> {
     let rig = Rig::new()?;
     let d = dims()?;
@@ -102,7 +94,6 @@ fn zeroed_phase() -> Result<ZeroedProbe, EngError> {
         &d,
         &options(KvMode::Int8G32, capacity),
     )?;
-    // Every plane of every attention layer reads back zero: scale 0 and code 0 everywhere.
     let mut planes = Vec::new();
     for ordinal in 0..layout.kv.layers {
         for &plane in state.layout().kv.planes() {
@@ -157,8 +148,6 @@ fn int8g32_allocates_the_four_planes_zeroed_and_sized_by_the_layout() {
     }
 }
 
-/// The host data of the Fp16 allocation after the phase returns: the pool sizes and modes, the
-/// plane list and the zeroed status word.
 struct Fp16Probe {
     layout_total: usize,
     state_bytes: usize,
@@ -170,9 +159,6 @@ struct Fp16Probe {
     status: i32,
 }
 
-/// The Result-only device phase of the Fp16 test: allocate the Fp16 pool, read its layout and
-/// status word back, and return plain host data through `?`. The context, its stream and the
-/// state drop before the asserts.
 fn fp16_phase() -> Result<Fp16Probe, EngError> {
     let rig = Rig::new()?;
     let d = dims()?;
@@ -215,16 +201,12 @@ fn an_fp16_allocation_is_unchanged() {
     assert_eq!(probe.status, 0);
 }
 
-/// The host data of the Int8G32 allocation after the phase returns: the plane count and the two
-/// scale-plane lookups.
 struct Int8Probe {
     plane_count: usize,
     k_scales_ok: bool,
     v_scales_ok: bool,
 }
 
-/// The Result-only device phase of the refusal test: an `Int8G32` pool must allocate, not answer
-/// `BadRequest`. The context, its stream and the state drop before the asserts.
 fn int8g32_phase() -> Result<Int8Probe, EngError> {
     let rig = Rig::new()?;
     let d = dims()?;
@@ -256,8 +238,6 @@ fn backend_operation(verdict: &Result<(), EngError>) -> Option<&str> {
     }
 }
 
-/// The device phase: every fallible call is `?`, and the owners (the context, the stream, the
-/// state) die with this function, so no assert runs while one lives.
 fn word_protocol() -> Result<Vec<Phase>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -335,7 +315,6 @@ fn the_prefill_status_word_is_cleared_at_open_and_read_back_at_close() {
     if !device_present("the_prefill_status_word_is_cleared_at_open_and_read_back_at_close") {
         return;
     }
-    // Result-only device phase; the owners die inside `word_protocol`.
     let phases = word_protocol().expect("the word protocol of one chunk runs");
     let [stale, combined, router, clean] = phases.as_slice() else {
         panic!("four chunks were recorded, not {}", phases.len());
@@ -351,7 +330,6 @@ fn the_prefill_status_word_is_cleared_at_open_and_read_back_at_close() {
     );
     assert_eq!(router.read, 1, "bit 1 alone reaches revalidate unmasked");
     assert_eq!(clean.read, 0, "a clean chunk reads a zero word");
-    // The verdicts, in chunk order.
     assert!(
         stale.verdict.is_ok(),
         "a stale bit must not fail the next chunk: {:?}",
@@ -368,7 +346,6 @@ fn the_prefill_status_word_is_cleared_at_open_and_read_back_at_close() {
         "word 1 alone maps to route_experts"
     );
     assert!(clean.verdict.is_ok(), "{:?}", clean.verdict);
-    // The publish and poison rules the reader feeds.
     assert_eq!((stale.tokens, stale.health), (4, Health::Valid));
     assert_eq!(
         (combined.tokens, combined.health),

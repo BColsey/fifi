@@ -31,42 +31,30 @@ pub(crate) mod compile_stats {
         static CACHE_GENERATION: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Reads the calling thread's cache generation. Other threads and counter resets cannot change it.
     pub(crate) fn cache_generation() -> u64 {
         CACHE_GENERATION.with(Cell::get)
     }
 
-    /// The counters of one block kind.
     #[derive(Clone, Default)]
     pub struct Block {
-        /// The cache key of the first call, `None` before any call.
         pub(crate) fun_id: Option<u64>,
-        /// Every distinct cache key this block kind has run, in first-seen order.
         pub(crate) seen: Vec<u64>,
-        /// Compiled calls so far.
         pub(crate) calls: u64,
         /// Calls that entered the closure body (traced) instead of hitting the MLX cache: the
         /// native body-entry count, filled at every `read` (the stored value is stale between
         /// reads).
         pub(crate) traces: u64,
-        /// The seconds of the first calls, at most 8 entries.
         pub(crate) call_seconds: Vec<f64>,
     }
 
-    /// The counters of both block kinds and the cache control calls.
     #[derive(Clone, Default)]
     pub struct Stats {
-        /// The DeltaNet decode block.
         pub(crate) delta: Block,
-        /// The device-routed MoE decode block.
         pub(crate) moe: Block,
-        /// Cache clears through the seam.
         pub(crate) cache_clears: u64,
     }
 
     impl Stats {
-        /// The summed counters of both blocks: `calls`, `traces`, and `cache_hits = calls -
-        /// traces`. The reports of the test harness read it.
         #[cfg(test)]
         pub(crate) fn totals(&self) -> (u64, u64, u64) {
             let calls = self.delta.calls + self.moe.calls;
@@ -86,7 +74,6 @@ pub(crate) mod compile_stats {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Reads a copy of the counters with the native body-entry counts as `traces`.
     pub(crate) fn read() -> Stats {
         let mut stats = locked().clone();
         let (delta, moe) = super::native::compile::native_trace_counts();
@@ -104,9 +91,8 @@ pub(crate) mod compile_stats {
         super::native::compile::native_trace_reset();
     }
 
-    /// Records one compiled block call: the call count, the key (the first and the set of
-    /// distinct keys seen), and the seconds of the first calls. Whether the call TRACED is not
-    /// decided here — the native body-entry count is the authority, read at every `read`.
+    /// Whether the call TRACED is not decided here — the native body-entry count is the
+    /// authority, read at every `read`.
     pub(crate) fn record(delta: bool, fun_id: u64, seconds: f64) {
         let mut stats = locked();
         let block = if delta {
@@ -140,7 +126,6 @@ pub(crate) mod compile_stats {
 
 /// Wall time of the synchronizing calls. Qualification builds record it; other builds only run the call.
 mod timing {
-    /// The kind of synchronizing call.
     #[derive(Clone, Copy)]
     pub(super) enum Kind {
         Import,
@@ -151,7 +136,6 @@ mod timing {
     #[cfg(feature = "native-fault-qualification")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Calls and nanoseconds per kind, process-wide: `[calls, ns]` for import, readback, evaluate.
     #[cfg(feature = "native-fault-qualification")]
     static SLOTS: [[AtomicU64; 2]; 3] = [
         [AtomicU64::new(0), AtomicU64::new(0)],
@@ -159,7 +143,6 @@ mod timing {
         [AtomicU64::new(0), AtomicU64::new(0)],
     ];
 
-    /// Runs `call` and, in qualification builds, adds one call and its wall time to `kind`.
     pub(super) fn timed<T>(kind: Kind, call: impl FnOnce() -> T) -> T {
         #[cfg(feature = "native-fault-qualification")]
         {
@@ -208,7 +191,6 @@ mod timing {
         reset();
     }
 
-    /// Sets every count and time to zero.
     #[cfg(feature = "native-fault-qualification")]
     pub(super) fn reset() {
         for slot in &SLOTS {
@@ -228,10 +210,8 @@ pub struct QualificationTiming {
     /// `import_pages` calls (including each `import_packed_pages` call).
     pub import_calls: u64,
     pub import_ns: u64,
-    /// `readback` calls.
     pub readback_calls: u64,
     pub readback_ns: u64,
-    /// `evaluate` calls.
     pub evaluate_calls: u64,
     pub evaluate_ns: u64,
 }
@@ -245,7 +225,6 @@ pub struct QualificationTiming {
 #[cfg(feature = "native-fault-qualification")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QualificationFlushStats {
-    /// Forced flush attempts.
     pub flushes: u64,
     pub sync_ns: u64,
     pub free_ns: u64,
@@ -312,7 +291,6 @@ pub struct PackedPages {
     pub quantization: QuantizationSpec,
 }
 
-/// The metadata of one packed weight whose parts arrive as separate residents.
 struct PackedLayout {
     logical_shape: Vec<u32>,
     logical_elements: u64,
@@ -380,7 +358,6 @@ pub struct MemoryStats {
     pub peak: u64,
 }
 
-/// The outputs of [`MlxKernels::gated_delta`]. Both are lazy F32 residents.
 /// The six outputs of the `gdn_prep` fused kernel: the pre-recurrence DeltaNet
 /// chain in one call. All F32.
 pub struct GdnPrepOutput {
@@ -418,20 +395,14 @@ pub struct BoundedIndices {
 }
 
 impl BoundedIndices {
-    /// The clamped U32 resident. Every value is below `bound`.
     pub fn ids(&self) -> &ExecutionTensor {
         &self.ids
     }
 
-    /// The exclusive bound the ids were clamped below.
     pub fn bound(&self) -> u32 {
         self.bound
     }
 
-    /// Wraps ids that the caller already clamped below `bound` with its own ONE `mlx_minimum`
-    /// node: the compiled decode blocks clamp their expert ids inside the traced closure body
-    /// — exactly the clamp `bound_indices` builds — so the seam hands the ids straight to the
-    /// layer instead of clamping a second time. The caller owns the truth of the clamp.
     pub(crate) fn from_clamped(ids: ExecutionTensor, bound: u32) -> Self {
         Self { ids, bound }
     }
@@ -452,13 +423,12 @@ pub struct QuantizedKv<'a> {
     /// `group_size` lanes (MLX's affine definition, whose magnitude is close to
     /// `(max - min) / (2^bits - 1)` and whose sign can be negative).
     pub scales: &'a ExecutionTensor,
-    /// The affine biases, the shape of [`Self::scales`]: one per group.
     pub biases: &'a ExecutionTensor,
 }
 
 /// The immutable KV block of one shared-attention request, in the storage the
 /// family publishes: float (f16/bf16/f32, [1, Hkv, S, D] each) or Q8 affine
-/// (the `QuantizedKv` the cache holds). Q4 affine joins with its tolerance slice.
+/// (the `QuantizedKv` the cache holds).
 #[derive(Clone, Copy)]
 pub enum KvBlock<'a> {
     Float {
@@ -568,10 +538,8 @@ pub(crate) fn t1_flash_flagged() -> bool {
     })
 }
 
-/// The pure routing predicate of the T1-flash slice: only the exact
-/// production per-token shape (one row, F32, raw sinks) with the flag set
-/// reroutes. Host-unit-tested; the dispatch proof is the Mac counter test
-/// in `mlx_decode_attn_tests` (separate processes per flag state).
+/// The dispatch proof is the Mac counter test in `mlx_decode_attn_tests`
+/// (separate processes per flag state).
 fn t1_flash_routes(rows: u32, dtype: Dtype, has_sinks: bool, flagged: bool) -> bool {
     rows == 1 && dtype == Dtype::F32 && has_sinks && flagged
 }
@@ -609,10 +577,8 @@ impl MlxKernels {
         self.context.owner_key()
     }
 
-    /// Returns the process-wide native synchronization count in qualification builds.
-    ///
     /// This diagnostic reads the existing counter. It does not reset the counter or alter fault
-    /// selection. It is unavailable in the default production feature set.
+    /// selection.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_sync_count(&self) -> u64 {
         self.context.qualification_sync_count()
@@ -671,8 +637,6 @@ impl MlxKernels {
         self.context.qualification_reset_flush_stats();
     }
 
-    /// Call counts and wall nanoseconds of imports, readbacks, and evaluates since the last reset,
-    /// process-wide. Qualification builds only.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_timing(&self) -> QualificationTiming {
         let [import, readback, evaluate] = timing::read();
@@ -695,7 +659,6 @@ impl MlxKernels {
             .map_err(|message| EngError::BadRequest(message.into()))
     }
 
-    /// Sets the qualification timing to zero. Qualification builds only.
     #[cfg(feature = "native-fault-qualification")]
     pub fn qualification_reset_timing(&mut self) {
         timing::reset();
@@ -714,7 +677,6 @@ impl MlxKernels {
         self.context.qualification_graph_text(outputs)
     }
 
-    /// Reads the process-wide allocator counters.
     pub fn memory_stats(&self) -> Result<MemoryStats, EngError> {
         let (active, cache, peak) = self.context.memory_stats()?;
         let wide = |value: usize| {
@@ -1187,7 +1149,6 @@ impl MlxKernels {
         self.context.transpose(x, axes)
     }
 
-    /// Inserts a size-1 axis at `axis`. Returns an unevaluated F32 resident.
     pub fn expand_dims(
         &mut self,
         x: &ExecutionTensor,
@@ -1260,7 +1221,6 @@ impl MlxKernels {
         self.context.kv_zeros(capacity)
     }
 
-    /// Joins `parts` along `axis` in order. Returns an unevaluated F32 resident.
     pub fn concatenate(
         &mut self,
         parts: &[&ExecutionTensor],
@@ -1525,11 +1485,6 @@ impl MlxKernels {
     /// after `assert_sinks_bf16_exact`, up-cast bit-exactly here).
     /// None omits the float sink; Q8 retains its -1e30 sentinel.
     ///
-    /// ARMED CONTRACT (FIFI_FLINT_MLX_DECODE_ATTN, on by default): on the
-    /// vendor-eligible one-row BF16 shape, raw F32 sinks cost a HOST
-    /// READBACK and stream sync PER CALL and refuse loudly if any value is
-    /// not BF16-exact; families should store BF16 sinks at load (the Flint
-    /// loader does) to bypass both the readback and the refusal risk.
     /// Output is [1, Hq, T, D] in query dtype.
     pub fn shared_attention(
         &mut self,
@@ -1547,8 +1502,6 @@ impl MlxKernels {
                 "shared attention needs positive Hq/T and D in {64, 128, 256}".into(),
             ));
         }
-        // Position geometry must be total: the query span must not overflow, the
-        // origin ordering must hold, and a window of zero would mask every key.
         if req.query_start.checked_add(rows).is_none() || req.key_origin > req.query_start {
             return Err(EngError::BadRequest(
                 "shared attention geometry: key_origin <= query_start and no overflow".into(),
@@ -2049,9 +2002,6 @@ impl MlxKernels {
         Ok(GatedDeltaOutput { y, state })
     }
 
-    /// Graph-cache timing probe (test builds only): the fixed-shape rows=1
-    /// Flint layer-subgraph stand-in compiled with a fixed cache key; see the
-    /// `Context` method of the same name in `kernels/mlx/native/compile.rs`.
     /// Test-only per-kernel floor calibration: `m` back-to-back adds on `x`
     /// through one compiled closure with a fixed cache key.
     #[cfg(all(test, feature = "native-fault-qualification"))]
@@ -2137,8 +2087,6 @@ impl MlxKernels {
         compile_stats::read()
     }
 
-    /// Zeroes the process-wide compiled block counters, the stored ones and the native body-entry
-    /// counts. Test builds only: production code never resets a counter it read.
     #[cfg(test)]
     pub(crate) fn reset_compile_counters(&mut self) {
         compile_stats::reset()
@@ -2162,7 +2110,6 @@ impl MlxKernels {
     }
 }
 
-/// The element count of all logical axes of a packed weight.
 fn packed_logical_elements(logical_shape: &[u32]) -> Result<u64, EngError> {
     if logical_shape.len() < 2 {
         return Err(EngError::BadRequest("packed logical rank below two".into()));

@@ -51,7 +51,6 @@ use crate::{
 
 const I32: usize = size_of::<i32>();
 
-/// The ranges of one MoE block of a chunk of `dims.rows` rows.
 pub(super) struct Bufs<'b> {
     /// F32 `[m][hidden]`: the normalized rows, read only.
     pub(super) x2: DeviceRange<'b>,
@@ -84,7 +83,6 @@ pub(super) struct Bufs<'b> {
     pub(super) shared_out: DeviceRange<'b>,
 }
 
-/// The pairs of a chunk sorted by expert.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PairPlan {
     /// Pairs of each expert.
@@ -177,7 +175,6 @@ pub(super) fn plan_jobs(counts: &[usize]) -> Vec<Exl3Job> {
     jobs
 }
 
-/// Uploads the two lists of `plan` and the job table to `perm`.
 fn write_lists(
     projector: &Projector<'_>,
     perm: DeviceRange<'_>,
@@ -228,7 +225,6 @@ fn shared(
     )
 }
 
-/// The input, output and shape of one routed projection.
 struct Routed<'a, 'b> {
     bank: &'a Exl3Bank,
     x: DeviceRange<'b>,
@@ -248,7 +244,6 @@ struct Lists<'b> {
     out_rows: usize,
 }
 
-/// The jobs of the pass, their device table and the rows they cover.
 #[derive(Clone, Copy)]
 struct Table<'a, 'b> {
     jobs: &'a [Exl3Job],

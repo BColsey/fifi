@@ -760,7 +760,6 @@ fn output_assembler_stops_on_any_eos_id() {
     );
 }
 
-// A scripted executor yields the expected delta texts and finish.
 #[test]
 fn s8_t1_scripted_executor_yields_deltas_and_finish() {
     let mut j = job(
@@ -779,12 +778,10 @@ fn s8_t1_scripted_executor_yields_deltas_and_finish() {
             delta("a", STOP_FINISH)
         )
     );
-    // The EOS id belongs to the consumed prefix and to the session history.
     assert_eq!(j.executor.history(&j.session), &[1, 0, 0, 0, OUTPUT_EOS]);
 }
 
-// The stop text stays in the batch text and tokens. The assembler hides it. The tokens
-// after the stop stay committed until a later change defines the discard rule
+// The tokens after the stop stay committed until a later change defines the discard rule
 // (`family-descriptor.md`, consumed prefix).
 #[test]
 fn s8_t2_batch_keeps_the_stop_text_and_the_assembler_hides_it() {
@@ -796,7 +793,6 @@ fn s8_t2_batch_keeps_the_stop_text_and_the_assembler_hides_it() {
     assert_eq!(d, delta("a", STOP_FINISH));
 }
 
-// The batch text minus the stop text equals the concatenated delta texts.
 #[test]
 fn s8_t3_batch_text_minus_the_stop_equals_the_delta_texts() {
     let mut j = job(
@@ -1841,7 +1837,6 @@ fn replay_default_eligibility_is_the_pinned_qwen_template_only() {
         !ChatTemplate::replay_eligible("{{ messages[0].content }}"),
         "synthetic templates are not eligible"
     );
-    // A one-byte change to the pinned template loses eligibility.
     assert!(
         !ChatTemplate::replay_eligible(&format!(
             "{pinned}
@@ -3022,7 +3017,6 @@ fn string_affix_rejects_wrong_argument_counts() {
     );
 }
 
-/// Loads the toy tokenizer bundle with `template` as its chat template.
 fn bundle_with_template(template: &str) -> TokenizerBundle {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut pin = write_fixture(dir.path());
@@ -3191,7 +3185,6 @@ fn the_boundary_follows_the_thinking_mode_that_the_head_renders() {
     }
 }
 
-/// A system message with the given content.
 fn system_message(content: &str) -> PromptMessage {
     PromptMessage {
         reasoning_content: None,
@@ -3535,10 +3528,8 @@ fn non_chatml_template_keeps_literal_chatml_markers() {
     );
 }
 
-/// The end of every message in the pinned template.
 const IM_END: &str = "\u{3c}|im_end|\u{3e}\n";
 
-/// The user turn of `hi` under the pinned template.
 const USER_HI: &str = "\u{3c}|im_start|\u{3e}user\nhi\u{3c}|im_end|\u{3e}\n";
 
 #[test]

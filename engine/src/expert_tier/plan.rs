@@ -106,7 +106,6 @@ pub trait ExpertPayloadSource {
     }
 }
 
-/// The family's device-side store of resident experts.
 pub trait GpuExpertStore {
     /// Keeps one expert part on the device for the whole run, with no host copy.
     fn upload(

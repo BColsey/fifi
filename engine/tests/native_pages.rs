@@ -49,7 +49,6 @@ fn page() -> usize {
     size
 }
 
-/// Bytes of `count` pages.
 fn pages_of(count: usize) -> usize {
     count * page()
 }
@@ -84,7 +83,6 @@ fn xorshift(mut state: u32) -> u32 {
     state
 }
 
-/// Deterministic bytes that differ per `seed`.
 fn pattern(len: usize, seed: u32) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -129,7 +127,7 @@ fn u32_tensor(shape: Vec<u32>, values: &[u32]) -> Tensor {
     Tensor::try_from_host(Dtype::U32, shape, bytes).unwrap()
 }
 
-/// Writes `bytes` at `offset`. The pages must not be in use.
+/// The pages must not be in use.
 fn write(pages: &mut HostPages, offset: usize, bytes: &[u8]) {
     let target = pages.try_write().expect("pages are free before the import");
     target[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -164,7 +162,6 @@ fn writable_within(pages: &mut HostPages, timeout: Duration) -> bool {
     }
 }
 
-/// `len` F32 values `(i % 17 - 8) / 8`.
 fn ramp(len: usize) -> Vec<f32> {
     (0..len)
         .map(|index| (f32::from(u8::try_from(index % 17).unwrap()) - 8.0) / 8.0)
@@ -428,7 +425,6 @@ fn copied_weight(bytes: &[u8], weight: &PackedPages) -> PackedWeight {
     .unwrap()
 }
 
-/// `gather_qmm` over the stack and `qmm` over the matrix, read back.
 fn run_packed(
     kernels: &mut MlxKernels,
     stack: &ResidentPackedWeight,

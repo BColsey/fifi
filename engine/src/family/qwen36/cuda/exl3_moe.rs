@@ -40,7 +40,6 @@ use crate::{
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
 
-/// The weights of the MoE block of one layer of an EXL3 load.
 pub(super) struct Exl3MoeWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix.
     pub(super) router: &'w DeviceBuffer,
@@ -55,7 +54,6 @@ pub(super) struct Exl3MoeWeights<'w> {
 }
 
 impl<'w> Exl3MoeWeights<'w> {
-    /// Resolves layer `layer` in `weights`, checking every shape against `moe`.
     pub(super) fn resolve(
         weights: &'w CudaWeights,
         table: &LayerTable,
@@ -108,8 +106,6 @@ impl<'w> Exl3MoeWeights<'w> {
     }
 }
 
-/// The arena ranges of the block: the routing ranges of the GGUF block, the intermediates and
-/// the shared projection scratch.
 pub(super) struct Exl3MoeBufs<'b> {
     pub(super) route: RouteBufs<'b>,
     /// f32 `[top_k][gate | up]`.
@@ -139,7 +135,6 @@ fn refuse(detail: String) -> EngError {
     EngError::BadRequest(format!("EXL3 moe block: {detail}"))
 }
 
-/// Row `index` of `width` bytes of `range`.
 fn row<'b>(
     range: &DeviceRange<'b>,
     width: usize,
@@ -148,7 +143,6 @@ fn row<'b>(
     range.buffer().range(range.offset() + index * width, width)
 }
 
-/// The whole allocation behind a weight buffer, as a router weight range.
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
@@ -179,7 +173,6 @@ fn read_picks(
         .collect()
 }
 
-/// One pair of a grouped launch: a projection, the row it reads and where the pair's rows go.
 struct Pair<'a> {
     view: crate::family::project::cuda::Exl3MatrixView<'a>,
     x: DeviceRange<'a>,
@@ -248,7 +241,6 @@ fn grouped_indexed(
         .exl3_grouped_indexed(launch.stream, &calls, launch.ctx.exl3_indexed_cols(n)?)
 }
 
-/// The router: ids, pick weights and the shared gate on the device.
 fn route(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
@@ -304,7 +296,6 @@ fn swiglu(
     )
 }
 
-/// The routed experts: gate and up of every pick in one group, the SwiGLU, the down group.
 fn routed(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,

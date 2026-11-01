@@ -56,7 +56,6 @@ const _: () = assert!(
         && offset_of!(SampleGemmaArgsRepr, pos_hi) == 72
 );
 
-/// One sampler launch.
 pub(in crate::kernels::cuda) struct SampleGemmaRaw<'a> {
     pub(in crate::kernels::cuda) token: RawRange<'a>,
     pub(in crate::kernels::cuda) logprob: RawRange<'a>,
@@ -109,7 +108,6 @@ fn check(call: &SampleGemmaRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues one sample on stream.
 pub(in crate::kernels::cuda) fn sample_gemma_launch(
     stream: &RawStream,
     call: &SampleGemmaRaw<'_>,

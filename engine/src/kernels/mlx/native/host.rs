@@ -96,7 +96,6 @@ impl Context {
     }
 }
 
-/// Imports one host buffer into an empty slot as a native array of `dtype` and `shape`.
 fn import_array(
     slot: &mut Array,
     data: *const c_void,

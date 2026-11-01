@@ -353,7 +353,6 @@ impl<'c, 's> Frame<'c, 's> {
                 fused,
             },
         )?;
-        // The producer stored the published roundtrip; no publish kernel.
         if fused {
             return Ok(out);
         }
@@ -571,9 +570,6 @@ impl<'c, 's> Frame<'c, 's> {
     }
 
     fn finish(mut self, output: usize) -> Result<DeviceBuffer, EngError> {
-        // Only token-health frames may park: their word is read once by the
-        // token-end gate. Attention-owned deferred frames still owe their
-        // group observation and are refused here.
         if matches!(self.flag, FrameFlag::Parked(_)) {
             return Ok(self.buffers.swap_remove(output).0);
         }
@@ -801,7 +797,6 @@ pub(crate) fn forward(
             let plan = ExpertPlan::new(ctx, &vec![*weight; block.rows])?;
             let x = frame.input(call.x, shape)?;
             let output = frame.expert(&plan, x)?;
-            // finish checks late BF16 health before plan-owned descriptors may be freed.
             frame.finish(output)
         }
         FfnWeights::Moe { .. } => {

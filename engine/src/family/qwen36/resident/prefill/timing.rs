@@ -166,13 +166,11 @@ struct StageTimes {
     tail_s: f64,
 }
 
-/// One chunk's stage clocks plus the whole-chunk wall.
 struct ChunkTimes {
     stages: StageTimes,
     wall_s: f64,
 }
 
-/// One chunk of the report: where it started, how many rows it ran, and its stage clocks.
 struct ChunkRecord {
     start_pos: u32,
     rows: usize,

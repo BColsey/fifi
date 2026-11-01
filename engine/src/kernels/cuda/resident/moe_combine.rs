@@ -49,21 +49,16 @@ const MAX_N: usize = 65536;
 const MAX_TOP_K: usize = 32;
 const MAX_LD_DOWN: usize = 1 << 26;
 
-/// The sizes of one combine call. Qwen3.6 is `m` 1, `n` 2048 (the hidden size), `top_k` 8 and
-/// `ld_down` 2048.
+/// Qwen3.6 is `m` 1, `n` 2048 (the hidden size), `top_k` 8 and `ld_down` 2048.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CombineShape {
-    /// Token rows, 1 to 4096.
     pub(crate) m: usize,
-    /// Width of a row, a multiple of 4 from 4 to 65536.
     pub(crate) n: usize,
-    /// Picks per token, 1 to 32.
     pub(crate) top_k: usize,
-    /// Floats from the start of one `down` row to the next: `n` to 2^26, a multiple of 4.
+    /// Floats from the start of one `down` row to the next.
     pub(crate) ld_down: usize,
 }
 
-/// The gated shared-expert term: a gate and a row, given together or not at all.
 pub(crate) struct SharedTerm<'b> {
     /// f32 `[m]`, 4-byte aligned: the router's `shared_gate`, already a sigmoid, used as given.
     pub(crate) gate: DeviceRange<'b>,
@@ -71,17 +66,13 @@ pub(crate) struct SharedTerm<'b> {
     pub(crate) row: DeviceRange<'b>,
 }
 
-/// Where the sum goes.
 pub(crate) enum CombineOut<'b> {
-    /// Into `res`.
     InPlace,
-    /// Into this f32 `[m][n]` range, 16-byte aligned, which shares no byte with an input.
+    /// Into this f32 `[m][n]` range, 16-byte aligned.
     To(DeviceRange<'b>),
 }
 
-/// One combine call.
 pub(crate) struct CombineCall<'b> {
-    /// The sizes of the call.
     pub(crate) shape: CombineShape,
     /// f32 `[m][n]`, 16-byte aligned: the residual stream.
     pub(crate) res: DeviceRange<'b>,
@@ -92,11 +83,9 @@ pub(crate) struct CombineCall<'b> {
     pub(crate) weights: DeviceRange<'b>,
     /// The gated shared term, or `None` for a model without a shared expert.
     pub(crate) shared: Option<SharedTerm<'b>>,
-    /// Where the result goes.
     pub(crate) out: CombineOut<'b>,
 }
 
-/// The bytes each range of a call must hold.
 struct Need {
     rows: usize,
     down: usize,
@@ -142,8 +131,7 @@ fn needs(shape: &CombineShape) -> Result<Need, EngError> {
     })
 }
 
-/// `BadRequest` unless `m` is in `1..=4096`, `n` a multiple of 4 in `4..=65536`, `top_k` in
-/// `1..=32` and `ld_down` a multiple of 4 in `n..=2^26`. Pure: no device is needed.
+/// Pure: no device is needed.
 pub(crate) fn check_shape(shape: &CombineShape) -> Result<(), EngError> {
     let CombineShape {
         m,
@@ -181,8 +169,6 @@ fn check_fit(call: &CombineCall<'_>, need: &Need) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The range the launch writes (`out`, or `res` in place) against every input, the written one
-/// named first in the refusal.
 fn check_apart(call: &CombineCall<'_>, need: &Need) -> Result<(), EngError> {
     let res = Claim::of("res", &call.res, need.rows);
     let mut inputs = vec![
@@ -214,9 +200,6 @@ fn to_int(name: &str, value: usize) -> Result<c_int, EngError> {
 impl CudaContext {
     /// Queues `out = res + ((w_0 d_0 + ... + w_(k-1) d_(k-1)) + g * shared)` on `stream`, with
     /// the weights and the gate as given. See the module doc for the sequence and the NaN rule.
-    ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a shape outside
-    /// [`check_shape`], a range that is short or misaligned, and an `out` that overlaps an input.
     pub(crate) fn moe_combine(
         &self,
         stream: &DeviceStream,
@@ -227,7 +210,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| moe_combine_launch(stream_raw, &raw))
     }
 
-    /// Every check of a combine call, then the native view of its ranges and ints.
     fn plan_combine<'b>(&self, call: &CombineCall<'b>) -> Result<CombineRaw<'b>, EngError> {
         let raw = |range: &DeviceRange<'b>| self.raw_range(range);
         let res = raw(&call.res)?;

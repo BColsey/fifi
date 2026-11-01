@@ -21,12 +21,9 @@ use crate::kernels::cuda::{
 };
 use crate::weights::{GgufType, dequantize};
 
-/// Bytes of the fixed fragment-order `xf` buffer.
 const XF_FRAGMENT: usize = 1_048_592;
-/// Rows of one expert and experts of a stack.
 const ROWS: usize = 64;
 const EXPERTS: usize = 16;
-/// Bytes of the ids range a call selects from: four ints.
 const IDS_USED: usize = 16;
 /// Bytes of the ids buffer: it also has to hold a whole `y` for the overlap case.
 const IDS_BUFFER: usize = 256;
@@ -37,7 +34,6 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// Asserts a `BadRequest` whose message contains `needle`.
 fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     let Err(error) = result else {
         panic!("{case}: expected a BadRequest, got Ok");
@@ -48,14 +44,12 @@ fn assert_bad_request(result: Result<(), EngError>, case: &str, needle: &str) {
     );
 }
 
-/// A device buffer that holds `ids` as little-endian ints, zero padded to `total` bytes.
 fn ids_buffer(ctx: &CudaContext, ids: &[i32], total: usize) -> DeviceBuffer {
     let mut bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
     bytes.resize(total, 0);
     testkit::upload_bytes(ctx, &bytes)
 }
 
-/// A stack of `EXPERTS` experts of `ROWS` rows, one token batch already packed on the stream.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -69,15 +63,14 @@ struct Rig {
 }
 
 impl Rig {
-    /// Uploads the stack and `ids`, packs `m` tokens of `k` values and drains the stream.
     fn new(ty: GgufType, k: usize, m: usize, ids: &[i32]) -> Self {
         let ctx = CudaContext::new().expect("context");
         let weight = testkit::upload_weight(&ctx, ty, ROWS * EXPERTS, k);
         Self::with_weight(ctx, weight, testkit::input(m, k), k, ids)
     }
 
-    /// Packs `x` (rows of `k` values; a Q5_0 weight stages each row zero-padded to the 256 grid)
-    /// against `weight` and drains the stream.
+    /// Packs `x` (rows of `k` values) against `weight` and drains the stream; a Q5_0 weight
+    /// stages each row zero-padded to the 256 grid.
     fn with_weight(
         ctx: CudaContext,
         weight: TiledWeight,
@@ -127,7 +120,6 @@ impl Rig {
             .y
     }
 
-    /// Queues the expert matmul of `slot` into `y` and returns the wrapper's verdict.
     fn expert_into(&self, slot: usize, y: DeviceRange<'_>) -> Result<(), EngError> {
         let call = ExpertCall {
             stack: ExpertStack {
@@ -148,7 +140,6 @@ impl Rig {
         self.ctx.matmul_expert(&self.stream, call)
     }
 
-    /// The expert matmul of `slot` into a fresh `y` (all 0xFF), drained and read back.
     fn expert(&self, slot: usize) -> Vec<f32> {
         let y = testkit::upload_filled(&self.ctx, 0xFF, self.y_bytes());
         let range = y.range(0, self.y_bytes()).expect("y range");
@@ -156,7 +147,6 @@ impl Rig {
         self.read(&y)
     }
 
-    /// The direct matmul of expert `id`'s rows into a fresh `y`, drained and read back.
     fn direct(&self, id: usize) -> Vec<f32> {
         let y = testkit::upload_filled(&self.ctx, 0xFF, self.y_bytes());
         let projection = Projection {
@@ -223,9 +213,6 @@ fn matmul_expert_equals_the_direct_matmul_at_the_expert_offset() {
     }
 }
 
-/// One bad `id` (the only id of `rig`, `m` tokens): every output of the launch is NaN, the guard
-/// floats around `y` stay as they were, the backend is usable, and a valid id on the same buffers
-/// gives the direct result again.
 fn assert_bad_id_writes_nan(rig: &Rig, id: i32, m: usize) {
     let region = m * ROWS;
     let mut values = vec![0.5f32; GUARD];
@@ -256,7 +243,6 @@ fn assert_bad_id_writes_nan(rig: &Rig, id: i32, m: usize) {
     );
     rig.ctx.ensure_usable().expect("a bad id is not a failure");
 
-    // A valid id on the same buffers gives the direct result again.
     rig.set_ids(&[5]);
     rig.expert_into(0, range()).expect("queue the valid id");
     rig.stream.synchronize().expect("drain the valid id");
@@ -280,7 +266,6 @@ fn bad_ids_write_nan_and_read_no_weight() {
     }
 }
 
-/// Where the `y` range of a refusal case lies.
 #[derive(Clone, Copy)]
 enum YIn {
     Own,
@@ -289,7 +274,6 @@ enum YIn {
     Stack,
 }
 
-/// Whose stream or ids buffer a refusal case uses.
 #[derive(Clone, Copy)]
 enum Owner {
     Own,
@@ -526,7 +510,6 @@ fn assert_refusals(rig: &Rig) {
         assert_bad_request(attempt(rig, &y, &other, spec), case, needle);
     }
 
-    // No refusal queued anything: the sentinel is untouched and the backend works.
     rig.stream.synchronize().expect("drain");
     let bytes = testkit::read_bytes(&rig.ctx, &y, 1024);
     assert!(bytes.iter().all(|&byte| byte == 0xFF), "y untouched");
@@ -564,8 +547,6 @@ fn the_wrapper_rejects_unsound_calls_before_launching() {
         "64 rows of 2048 against direct"
     );
 }
-
-// ---- Q5_0: the own kernel behind `matmul_expert` ---------------------------------------------
 
 /// Class T3 (f16-input products): the NMSE bound per output vector.
 const NMSE_BOUND: f64 = 1e-5;
@@ -751,7 +732,6 @@ fn assert_big_q5_0_expert(m: usize) -> f64 {
         testkit::floats(&testkit::read_bytes(&ctx, &y, need.y))
     };
     let (expert, dense) = (run(true), run(false));
-    // Equal only while both paths use the same mma884 fragment and the same reduction order.
     assert_eq!(bits(&expert), bits(&dense), "m={m}: expert against dense");
     let rows_bytes = BIG_ROWS * (Q5_0_K / 32) * Q5_0_BLOCK;
     let reference = q5_0_reference(

@@ -127,7 +127,6 @@ pub(crate) fn test_inject_unmapped_fault() -> Result<(), c_int> {
     native::fault_illegal_address().map_err(|failure| failure.status)
 }
 
-/// Runs the child `test` and checks that it exited cleanly and printed its marker.
 pub(crate) fn assert_child_finishes(test: &str) {
     let output = run_child(test);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -339,7 +338,6 @@ fn trigger_vendor_launch() {
     );
 }
 
-/// The error every call returns once the backend is terminal.
 fn terminal_error() -> EngError {
     EngError::Backend {
         operation: "execute",

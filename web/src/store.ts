@@ -1,6 +1,6 @@
 /**
- * Persistence. Settings live in localStorage. Chats live in IndexedDB.
- * Views never touch localStorage or IndexedDB directly.
+ * Views never touch localStorage or IndexedDB directly; persistence
+ * goes through this module.
  */
 
 import type { FinishReason, ThinkingMode, Usage } from "./api.js";
@@ -60,8 +60,6 @@ export function coerceSettings(raw: unknown): Settings {
     theme: themeOf(root["theme"]),
     model: stringOf(root["model"], defaultSettings.model),
     drawer: {
-      // temperature number in [0, 2]; top_p number in [0, 1];
-      // top_k integer >= 0; max_tokens integer >= 1.
       temperature: boundedNumberOf(
         drawer["temperature"],
         defaultSettings.drawer.temperature,
@@ -97,13 +95,11 @@ function stringOf(value: unknown, fallback: string): string {
   return typeof value === "string" ? value : fallback;
 }
 
-/** A finite number inside [min, max]; anything else falls back. */
 function boundedNumberOf(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return value < min || value > max ? fallback : value;
 }
 
-/** An integer inside [min, max]; non-integers fall back, never clamp. */
 function boundedIntegerOf(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isInteger(value)) return fallback;
   return value < min || value > max ? fallback : value;
@@ -120,7 +116,6 @@ function thinkingOf(value: unknown): ThinkingMode {
 type SettingsListener = (s: Settings) => void;
 const listeners = new Set<SettingsListener>();
 
-/** Listener for settings persistence failures (for example a quota error). */
 type StorageErrorListener = (message: string) => void;
 const errorListeners = new Set<StorageErrorListener>();
 
@@ -142,12 +137,10 @@ export function onSettingsChange(cb: SettingsListener): void {
   listeners.add(cb);
 }
 
-/** Subscribe to saveSettings persistence failures. */
 export function onStorageError(cb: StorageErrorListener): void {
   errorListeners.add(cb);
 }
 
-/** One message as the interface holds it. */
 export interface UiToolCall {
   name: string;
   arguments: string;
@@ -248,7 +241,6 @@ export function newUiMessage(role: "user" | "assistant", content: string): UiMes
   return { id: crypto.randomUUID(), role, content, state: "complete", createdAt: Date.now() };
 }
 
-/** Short title from the first user message. */
 export function titleFromText(text: string): string {
   const clean = text.trim().replace(/\s+/g, " ");
   return clean.length <= 42 ? clean : clean.slice(0, 41) + "\u2026";

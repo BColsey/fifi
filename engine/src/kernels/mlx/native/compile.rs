@@ -56,7 +56,6 @@ const ADD_CHAIN_PROBE_FUN_ID: u64 = 0x0036_5147_a5a0_0003;
 #[cfg(all(test, feature = "native-fault-qualification"))]
 const FLINT_LAYER_PROBE_FUN_ID: u64 = 0x0036_5147_a5a0_0002;
 
-/// Checks one float dtype of the compile seam: the blocks run in F32 or BF16 only.
 fn check_float(label: &'static str, dtype: Dtype) -> Result<(), EngError> {
     if matches!(dtype, Dtype::F32 | Dtype::Bf16) {
         return Ok(());
@@ -99,8 +98,6 @@ pub(crate) fn quant_triple(weight: &ResidentPackedWeight) -> Result<[i32; 3], En
 }
 
 /// The quantization triples of `weights`, one `[mode, group, bits]` per packed weight, in the
-/// caller's weight order: both the native payload and the cache key read them.
-/// The quantization triples of `weights`, one `[mode, group, bits]` per packed weight, in the
 /// caller's weight order: the native payload, the cache key, and the load-time warm-up plan read
 /// them.
 pub(crate) fn quant_triples<const N: usize>(
@@ -128,11 +125,9 @@ pub(crate) struct CompileDeltaArgs<'a> {
     pub(crate) plain: [&'a ExecutionTensor; 5],
     /// zero, qk_eps, sqrt_kd.
     pub(crate) consts: [&'a ExecutionTensor; 3],
-    /// The hidden width `H`.
     pub(crate) hidden: u32,
     /// kh, kd, vh, vd, cd, taps.
     pub(crate) dims: [u32; 6],
-    /// The RMS norm epsilon.
     pub(crate) eps: f32,
     /// The activation dtype of the step: the dtype of the layer input and of the block output
     /// (`to_act` before the out projection), and part of the compile cache key.
@@ -170,11 +165,8 @@ pub(crate) struct CompileMoeArgs<'a> {
     pub(crate) shared_scalar_t: &'a ExecutionTensor,
     /// The expert gate, up, down stacks.
     pub(crate) stacks: [&'a ResidentPackedWeight; 3],
-    /// The hidden width `H`.
     pub(crate) hidden: u32,
-    /// The expert count `E`.
     pub(crate) experts: u32,
-    /// The routing width `k`.
     pub(crate) top_k: u32,
     /// Whether the gates renormalize over the selection.
     pub(crate) renorm: bool,
@@ -258,7 +250,6 @@ fn check_logical(
     Ok(())
 }
 
-/// A checked i32 dimension of a compile seam call.
 fn native_dim(label: &'static str, value: u32) -> Result<i32, EngError> {
     i32::try_from(value).map_err(|_| EngError::BadRequest(format!("{label} dimension exceeds i32")))
 }
@@ -457,9 +448,6 @@ impl Context {
                 "compile seam inputs differ from the delta plain operand shapes".into(),
             ));
         }
-        // The logical shapes of the five projections: qkv writes the fused [CD] projection, z
-        // writes [VH * VD], b and a write one value per value head [VH], and out reads [VH * VD]
-        // back to [H].
         for (what, weight, want) in [
             ("qkv", &args.packed[0], [cd, args.hidden]),
             ("z", &args.packed[1], [vh_vd, args.hidden]),
@@ -803,8 +791,6 @@ impl Context {
             ],
             quant: [sg, su, sd, xg, xu, xd],
         });
-        // The per-adapter program registry decides before any native call, exactly as for the
-        // delta block.
         adapter.programs.admit(fun_id)?;
         let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(21);
         inputs.push(args.x.storage.native_array());
@@ -1080,9 +1066,7 @@ pub(crate) struct FlintTailArgs<'a> {
     pub(crate) gamma: &'a ExecutionTensor,
     /// The dense SwiGLU gate, up, down weights.
     pub(crate) packed: [&'a ResidentPackedWeight; 3],
-    /// The hidden width `H`.
     pub(crate) hidden: u32,
-    /// The RMS norm epsilon.
     pub(crate) eps: f32,
 }
 
@@ -1192,8 +1176,6 @@ impl Context {
                 .map(|weight| compile_key::dtype_key(weight.scales().dtype())),
             quant: triples,
         });
-        // The per-adapter program registry decides before any native call, exactly as for the
-        // delta and MoE blocks.
         state.programs.admit(fun_id)?;
         let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(12);
         inputs.push(x.storage.native_array());

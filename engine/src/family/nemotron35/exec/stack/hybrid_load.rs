@@ -262,7 +262,6 @@ impl<S: WeightSource> NemotronStack<S> {
         };
         #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
         let device_shared: Option<Vec<f32>> = None;
-        // Only load F32 shared weights when the device path is unavailable.
         let skip_shared = device_shared.is_some();
         let shared_up = if skip_shared {
             super::tensor(&[1, 1], &[0.0])?

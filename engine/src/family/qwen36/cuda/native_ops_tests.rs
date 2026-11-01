@@ -237,8 +237,6 @@ fn native_lists_ascend_and_stay_inside_their_slot_lifetimes() {
     }
 }
 
-// ---- the Int8G32 attention op list --------------------------------------------------------
-
 /// The Int8G32 attention list, written out literally like the fixtures above: the NATIVE list with
 /// the fp16 attention core swapped for the KV8 triple (the rows entry, the append, the q8 decode at
 /// the Q8 split). Every field is pinned, so a wrong slot, word, plane, split or order fails here by

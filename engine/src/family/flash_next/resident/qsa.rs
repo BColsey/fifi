@@ -52,7 +52,6 @@ pub(super) const MAX_POSITIONS: u32 = 32_768;
 /// The additive attention mask of a dropped block. `exp` of it underflows to 0 in F32.
 pub(super) const MASK_OFF: f32 = -1.0e30;
 
-/// One resident QSA step: the layer output and the replacement layer state.
 pub(super) struct QsaStep {
     /// Layer output `[1, H]`.
     pub(super) out: ExecutionTensor,
@@ -927,7 +926,6 @@ mod tests {
         (0..64usize).map(|c| pattern[c % 8]).collect()
     }
 
-    /// Reads a U32 resident back as words.
     fn words(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u32> {
         let host = kernels.readback(tensor).unwrap();
         assert_eq!(host.dtype(), Dtype::U32, "readback dtype");
@@ -940,7 +938,6 @@ mod tests {
             .collect()
     }
 
-    /// The process-wide synchronization count in qualification builds. Other builds return `None`.
     fn syncs(kernels: &MlxKernels) -> Option<u64> {
         #[cfg(feature = "native-fault-qualification")]
         {
@@ -967,7 +964,6 @@ mod tests {
         }
     }
 
-    /// Resets the peak retired bytes in qualification builds. Other builds do nothing.
     fn reset_retire_peak(kernels: &mut MlxKernels) {
         #[cfg(feature = "native-fault-qualification")]
         {
@@ -996,7 +992,6 @@ mod tests {
         u32::try_from((n as u64 * 7919 + 760) % vocab as u64).unwrap()
     }
 
-    /// Reads a number from the environment, or returns `default` when the variable is unset.
     fn env_number(name: &str, default: Option<u64>) -> u64 {
         match std::env::var(name) {
             Ok(text) => text

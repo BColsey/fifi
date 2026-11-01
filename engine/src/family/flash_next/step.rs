@@ -14,13 +14,9 @@ use crate::family::project::Projector;
 pub(crate) struct ModelShape {
     /// Hyper-connection shape shared by every read and apply.
     pub(crate) hyper: HyperShape,
-    /// DeltaNet layer shape.
     pub(crate) delta: DeltaShape,
-    /// QSA layer shape.
     pub(crate) qsa: QsaShape,
-    /// MoE shape.
     pub(crate) moe: MoeShape,
-    /// PLE shape.
     pub(crate) ple: PleShape,
     /// Layer index whose attention read follows the PLE update.
     pub(crate) ple_layer: usize,
@@ -28,33 +24,24 @@ pub(crate) struct ModelShape {
     pub(crate) vocab: usize,
 }
 
-/// Attention weights of one layer.
 pub(crate) enum AttnWeights<'a, W> {
-    /// A DeltaNet layer.
     Delta(DeltaWeights<'a, W>),
-    /// A QSA layer.
     Qsa(QsaWeights<'a, W>),
 }
 
-/// Weights of one decoder layer.
 pub(crate) struct FlashLayerWeights<'a, W> {
-    /// Hyper-connection before the attention block.
     pub(crate) attn_hyper: HyperWeights<'a, W>,
-    /// Attention block.
     pub(crate) attn: AttnWeights<'a, W>,
     /// Hyper-connection before the MoE block.
     pub(crate) mlp_hyper: HyperWeights<'a, W>,
-    /// MoE block.
     pub(crate) moe: MoeWeights<'a, W>,
 }
 
-/// Weights of the whole model.
 pub(crate) struct ModelWeights<'a, W> {
     /// Embedding table `[vocab, hidden]`.
     pub(crate) embed: &'a W,
     /// Decoder layers in order.
     pub(crate) layers: Vec<FlashLayerWeights<'a, W>>,
-    /// PLE block.
     pub(crate) ple: PleWeights<'a, W>,
     /// Root mixer, without inject.
     pub(crate) mixer: HyperWeights<'a, W>,
@@ -62,16 +49,12 @@ pub(crate) struct ModelWeights<'a, W> {
     pub(crate) lm_head: &'a W,
 }
 
-/// Mutable state of one layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LayerState {
-    /// DeltaNet recurrent state.
     Delta(DeltaState),
-    /// QSA cache.
     Qsa(QsaCache),
 }
 
-/// Mutable state of one sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ModelState {
     layers: Vec<LayerState>,
@@ -99,12 +82,10 @@ impl ModelState {
         }
     }
 
-    /// Position of the next token.
     pub(crate) fn pos(&self) -> u32 {
         self.pos
     }
 
-    /// Replaces this state with a fresh state.
     pub(crate) fn reset<W>(&mut self, shape: &ModelShape, weights: &ModelWeights<'_, W>) {
         *self = Self::new(shape, weights);
     }
@@ -132,7 +113,6 @@ impl ModelState {
     }
 }
 
-/// Result of one decode step.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StepOutput {
     /// Next-token logits, length `vocab`.
@@ -141,7 +121,6 @@ pub(crate) struct StepOutput {
     pub(crate) layer_out: Option<Vec<Vec<f32>>>,
 }
 
-/// Runs one token through the model and returns its logits.
 pub(crate) fn step<P: Projector>(
     projector: &mut P,
     shape: &ModelShape,

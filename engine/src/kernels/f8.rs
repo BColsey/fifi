@@ -6,7 +6,6 @@ use crate::{
     tensor::{Dtype, Tensor},
 };
 
-/// E4M3FN weight bytes with one F32 weight scale and an optional retained input scale.
 #[derive(Debug, Clone, Copy)]
 pub struct WeightBlock<'a> {
     pub codes: &'a [u8],
@@ -17,7 +16,6 @@ pub struct WeightBlock<'a> {
 }
 
 impl WeightBlock<'_> {
-    /// Decodes E4M3FN weights to F32 and returns the parsed input scale unchanged.
     pub fn decode(&self, shape: &[u32]) -> Result<(Tensor, Option<f32>), EngError> {
         let weight_scale = parse_scale(self.weight_scale, "weight_scale")?;
         let input_scale = self

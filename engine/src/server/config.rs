@@ -1,7 +1,6 @@
 //! The `enginesrv` configuration file and command line.
 //!
-//! The file is one JSON object with the listen address, the name of the environment variable
-//! that holds the API key, and an `engines` array. The file carries no key.
+//! The file carries no key.
 
 use crate::family::flash_next::{factory::FAMILY as FLASH_FAMILY, settings::FlashOptions};
 use crate::family::flint::{FAMILY as FLINT_FAMILY, settings::FlintOptions};
@@ -38,19 +37,15 @@ pub(crate) const FAMILIES: [&str; 6] = [
     NEMOTRON_FAMILY,
 ];
 
-/// The family that takes the `context_limit` and `fake` members.
 const FAKE_FAMILY: &str = super::fake::FAMILY;
 
 /// The port of another service on the same Mac. The server never binds it.
 const REFUSED_PORT: u16 = 8788;
 
-/// The whole configuration file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// The address to listen on, for example `127.0.0.1:8100`.
     pub(crate) listen: String,
-    /// The name of the environment variable that holds the bearer key.
     pub(crate) api_key_env: String,
     /// True when the chat handler marks the last message boundary of each prompt, so that an
     /// engine can save and restore a prefix state. The default is false: the handler then sends
@@ -61,7 +56,6 @@ pub(crate) struct Config {
     pub(crate) engines: Vec<EngineConfig>,
 }
 
-/// One engine of the `engines` array.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EngineConfig {
@@ -69,21 +63,14 @@ pub(crate) struct EngineConfig {
     pub(crate) model_dir: PathBuf,
     pub(crate) tokenizer_dir: PathBuf,
     pub(crate) family: String,
-    /// The model name for the `model` field. The default is the family name.
     pub(crate) model: Option<String>,
     /// The context limit of the `fake` family. A real family reports its own limit when it
     /// starts, and the file does not set it.
     pub(crate) context_limit: Option<u32>,
-    /// Options of the `fake` family only.
     pub(crate) fake: Option<FakeOptions>,
-    /// Options of the `qwen3_8_flash_next` family only. The family reads the manifest, the cache
-    /// limit, the vocabulary size, and the prefill chunk from here.
     pub(crate) flash_next: Option<FlashOptions>,
     /// Options shared by `qwen3_6_35b_a3b` and `qwen3_8_27b_dense`.
-    /// They read the cache limit, context limit, session cap, and prefill chunk here.
     pub(crate) qwen36: Option<Q36Options>,
-    /// Options of the nemotron35 family only. The family reads the backend, the context
-    /// limit, the cache entries, and the prefill chunk from here.
     pub(crate) nemotron: Option<NemotronOptions>,
     /// Explicit CUDA pilot context and KV profile; absent on legacy MLX entries.
     pub(crate) flint: Option<FlintOptions>,
@@ -100,26 +87,21 @@ pub(crate) struct EngineConfig {
     pub(crate) notice_toolwrap: Option<bool>,
 }
 
-/// Options of the development engine.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FakeOptions {
-    /// The text that every job replies with.
     pub(crate) reply: Option<String>,
-    /// The sleep before each token, in milliseconds.
     #[serde(default)]
     pub(crate) token_delay_ms: u64,
 }
 
 impl EngineConfig {
-    /// The model name that clients put in the `model` field.
     pub(crate) fn model_name(&self) -> String {
         self.model.clone().unwrap_or_else(|| self.family.clone())
     }
 }
 
 impl Config {
-    /// Reads and checks the file at `path`.
     pub(crate) fn from_file(path: &Path) -> Result<Config, StartupError> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| StartupError(format!("cannot read {}: {error}", path.display())))?;
@@ -226,7 +208,6 @@ impl Config {
         Ok(())
     }
 
-    /// The parsed listen address. It must be a loopback address, and its port must not be 8788.
     pub(crate) fn listen_address(&self) -> Result<SocketAddr, StartupError> {
         let address: SocketAddr = self.listen.parse().map_err(|error| {
             StartupError(format!("listen {} is not an address: {error}", self.listen))
@@ -246,8 +227,7 @@ impl Config {
         Ok(address)
     }
 
-    /// Reads the bearer key from the variable that the file names. `lookup` reads one variable.
-    /// A missing or empty variable stops startup. The error never shows the value.
+    /// The error never shows the value.
     pub(crate) fn api_key(
         &self,
         lookup: impl Fn(&str) -> Option<String>,
@@ -262,7 +242,6 @@ impl Config {
     }
 }
 
-/// Reads the path after `--config` from the arguments that follow the program name.
 pub(crate) fn config_path(args: &[String]) -> Result<PathBuf, StartupError> {
     match args {
         [flag, path] if flag == "--config" => Ok(PathBuf::from(path)),

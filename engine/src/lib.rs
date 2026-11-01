@@ -16,9 +16,7 @@ mod test_paths;
 pub mod tokenizer;
 pub mod weights;
 
-/// Serializes the in-crate tests that hold MLX adapters. The process admits two adapter leases, so
-/// every library test module shares this one lock. A panicked test does not poison it for the
-/// others.
+/// The process admits two adapter leases, so every library test module shares this one lock.
 #[cfg(all(
     test,
     feature = "native-mlx",

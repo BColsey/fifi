@@ -28,7 +28,6 @@ use crate::kernels::cuda::native::resident::attn_decode_gemma::{
     AttnDecodeGemmaRaw, attn_decode_gemma_launch,
 };
 
-/// One attention call over the KV8 planes of one layer shape.
 pub(crate) struct AttnDecodeGemmaCall<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) status: Option<DeviceRange<'b>>,
@@ -48,7 +47,6 @@ pub(crate) struct AttnDecodeGemmaCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues the attention of call on stream, writing call.out.
     pub(crate) fn attn_decode_gemma(
         &self,
         stream: &DeviceStream,

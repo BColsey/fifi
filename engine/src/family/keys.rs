@@ -32,7 +32,6 @@ pub(crate) enum KeyClass {
     FinalNorm,
 }
 
-/// Whether a key belongs to a packed projection or to a dense tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRole {
     Packed,
@@ -226,7 +225,6 @@ fn classify_module(module: &str, spec: &FamilySpec) -> Result<Option<(KeyClass, 
     Ok(Some(pair))
 }
 
-/// Parses a layer index written in canonical decimal: digits only, with no sign or leading zero.
 fn canonical_index(text: &str) -> Option<u32> {
     let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     if !digits || (text.len() > 1 && text.starts_with('0')) {

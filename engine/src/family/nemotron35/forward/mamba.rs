@@ -328,7 +328,6 @@ fn checked_len(shape: &[u32]) -> Result<usize, EngError> {
         .ok_or_else(|| extent("tensor byte length exceeds host limits"))
 }
 
-/// Validates dtype, shape, extent and finiteness without allocating.
 fn checked_bytes<'a>(tensor: &'a Tensor, shape: &[u32]) -> Result<&'a [u8], EngError> {
     let expected = checked_len(shape)?;
     if tensor.dtype() != Dtype::F32 || tensor.shape() != shape {

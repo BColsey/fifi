@@ -177,7 +177,7 @@ fn the_window_edge_is_exactly_513_on_the_float_path() {
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();
     let (hq, hkv, t, d, s) = (2, 1, 1, 64, 520);
-    let p0 = (s - t) as u32; // 519; keys 0..519, origin 0
+    let p0 = (s - t) as u32;
     let mut seed = 0x513u64;
     let q: Vec<f32> = (0..hq * t * d).map(|_| lcg(&mut seed)).collect();
     let kv: Vec<f32> = (0..2 * hkv * s * d).map(|_| lcg(&mut seed)).collect();
@@ -263,7 +263,6 @@ fn per_head_sinks_differ_on_the_float_path() {
             "head {h}: closed form {want} vs {got_mean}"
         );
     }
-    // the within-group heads differ (a fold collapses them)
     let mean = |h: usize| -> f32 { got[h * d..(h + 1) * d].iter().sum::<f32>() / d as f32 };
     assert!(
         (mean(0) - mean(1)).abs() > 0.05,
@@ -436,7 +435,7 @@ fn flash_bf16_tiny_probabilities_survive_the_pt_staging() {
                 keys: &k_t,
                 values: &v_t,
             },
-            query_start: s as u32 - t as u32, // p0 = 0, origin 0
+            query_start: s as u32 - t as u32,
             key_origin: 0,
             window: None,
             sinks: Some(&sinks_2d),
@@ -837,7 +836,6 @@ fn flagged_sink_dtype_gates_decode_vendor() {
             .ok_or_else(|| EngError::BadRequest("sink readback empty".into()))?;
         Ok(bytes.to_vec())
     };
-    // BF16-stored sinks (the loader's storage): the vendor arm, no flash.
     crate::kernels::mlx::native::attn_dispatch::reset();
     let with_bf16 = run(Some(&sinks_bf16)).expect("BF16 sinks dispatch cleanly");
     let (flash, vendor) = crate::kernels::mlx::native::attn_dispatch::counts();
@@ -846,11 +844,9 @@ fn flagged_sink_dtype_gates_decode_vendor() {
         flash, 0,
         "the BF16-sink decode shape must not fall back to flash"
     );
-    // Exact raw F32 sinks: the API-side check promotes and the vendor arm
-    // still serves the shape (float flash serves only GQA 8; checked
-    // promotion is the only exact route for displaced GQA geometries) - and
-    // the promoted output must match the stored-BF16 output bitwise (same
-    // values, same kernel).
+    // Exact raw F32 sinks: the API-side check promotes (float flash serves
+    // only GQA 8; checked promotion is the only exact route for displaced
+    // GQA geometries).
     crate::kernels::mlx::native::attn_dispatch::reset();
     let with_f32 = run(Some(&sinks)).expect("BF16-exact F32 sinks promote cleanly");
     let (flash, vendor) = crate::kernels::mlx::native::attn_dispatch::counts();
@@ -863,7 +859,6 @@ fn flagged_sink_dtype_gates_decode_vendor() {
         with_f32, with_bf16,
         "promoted F32 sinks must match stored BF16 sinks bitwise"
     );
-    // NON-representable F32 sinks: loud refusal, nothing dispatched.
     crate::kernels::mlx::native::attn_dispatch::reset();
     let refused = run(Some(&sinks_inexact));
     let (flash, vendor) = crate::kernels::mlx::native::attn_dispatch::counts();
@@ -878,7 +873,6 @@ fn flagged_sink_dtype_gates_decode_vendor() {
         "refusal must be BadRequest: {err:?}"
     );
     assert!(format!("{err:?}").contains("BF16"), "diagnostic: {err:?}");
-    // The sink mass still moves the vendor output vs no sinks.
     let bare = run(None).expect("the no-sink shape dispatches cleanly");
     assert_ne!(
         with_bf16, bare,
@@ -901,7 +895,6 @@ fn gqa4_sink_promotion_keeps_vendor_route() {
     let _serial = crate::native_test_lock();
     let mut k = MlxKernels::try_new().unwrap();
     k.allow_bf16(true);
-    // 16 query heads over 4 KV heads = GQA 4; integer sinks are BF16-exact.
     let raw: Vec<f32> = (0..16).map(|h| 4.0 + (h % 8) as f32).collect();
     for &value in &raw {
         assert_eq!(
@@ -973,8 +966,6 @@ fn gqa4_sink_promotion_keeps_vendor_route() {
         matches!(err, EngError::BadRequest(_)),
         "refusal must be BadRequest: {err:?}"
     );
-    // The BadRequest must carry the helper's diagnostic VERBATIM: the
-    // provenance, the first offending head and value, and the =0 remedy.
     let text = format!("{err:?}");
     assert!(
         text.contains("shared_attention decode vendor"),
@@ -1017,7 +1008,6 @@ fn flash_route_bf16_sink_storage_upcasts_exactly() {
     }
     let sinks = import_f32(&mut k, vec![1, 32], &raw);
     let sinks_bf16 = k.cast(&sinks, Dtype::Bf16).unwrap();
-    // Multi-row flash tensors: rows=64 planes, queries at 0..64.
     let s = 64u32;
     let q = import_f32(
         &mut k,
@@ -1263,7 +1253,6 @@ fn rejections_are_bad_requests_and_the_owner_stays_usable() {
             Err(_) => false,
         }
     };
-    // a valid op works before any rejection
     assert!(valid(&mut k), "the valid op must work at the start");
 
     // (a) GQA != 8 refused on the FLASH arm; owner usable after. NOTE: the
@@ -1293,7 +1282,6 @@ fn rejections_are_bad_requests_and_the_owner_stays_usable() {
     );
     assert!(valid(&mut k), "owner usable after the GQA rejection");
 
-    // (b) dtype mismatch refused; owner usable after
     let f32_k = import_f32(&mut k, vec![1, hkv as u32, s as u32, d as u32], keys);
     let refused = k
         .shared_attention(SharedAttention {
@@ -1316,7 +1304,6 @@ fn rejections_are_bad_requests_and_the_owner_stays_usable() {
     );
     assert!(valid(&mut k), "owner usable after the dtype rejection");
 
-    // (c) the degenerate Some(0) window refused; owner usable after
     let refused = k
         .shared_attention(SharedAttention {
             q: &q_t,

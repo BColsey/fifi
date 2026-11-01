@@ -130,7 +130,6 @@ const EXECUTE_OPERATION: &str = "execute";
 /// `cudaErrorMemoryAllocation` from `cuda_runtime_api.h`.
 const CUDA_ERROR_MEMORY_ALLOCATION: c_int = 2;
 
-/// Set after the first terminal native failure in this process.
 static TERMINAL: AtomicBool = AtomicBool::new(false);
 
 /// Returns the number of CUDA devices the runtime can use.
@@ -277,7 +276,6 @@ fn require_device(count: usize) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Refuses every call after a terminal failure.
 fn ensure_usable(terminal: &AtomicBool) -> Result<(), EngError> {
     if terminal.load(Ordering::Acquire) {
         return Err(EngError::Backend {

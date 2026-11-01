@@ -67,7 +67,7 @@ pub(in crate::kernels::cuda) const MAX_DENSE_TOKENS: usize = 16;
 
 /// True when `m` tokens against `rows` x `k` Q5_0 values are a shape the launch accepts: `m` in
 /// `1..=8` for an expert call and `1..=16` for a dense one, `rows` a positive multiple of 8, `k` a
-/// positive multiple of 128 up to 32768. Host only, no CUDA call.
+/// positive multiple of 128 up to 32768.
 pub(in crate::kernels::cuda) fn q5_0_shape_ok(
     m: usize,
     rows: usize,
@@ -85,14 +85,12 @@ pub(in crate::kernels::cuda) fn q5_0_shape_ok(
     unsafe { q5_0_shape_ok_raw(m, rows, k, c_int::from(expert)) == 0 }
 }
 
-/// The integer arguments of a checked call.
 struct Dims {
     m: c_int,
     rows: c_int,
     k: c_int,
 }
 
-/// The shape of a Q5_0 call as C ints, or `None` for another type or a shape the kernel refuses.
 fn dims(ty: TiledType, rows: usize, k: usize, m: usize, expert: bool) -> Option<Dims> {
     let tiled = Tiled {
         ty,
@@ -109,8 +107,6 @@ fn dims(ty: TiledType, rows: usize, k: usize, m: usize, expert: bool) -> Option<
     })
 }
 
-/// Proves a dense launch before the native call: shape, sizes, the weight tiles inside their
-/// allocation, alignment (weight 16, xf 16, y 4) and that `y` overlaps neither the weight nor `xf`.
 fn check_dense(call: &MatmulRaw<'_>) -> Result<Dims, DeviceFailure> {
     let tiled = call.tiled;
     let dims = dims(tiled.ty, tiled.n_rows, tiled.k, call.m, false).ok_or_else(invalid_argument)?;
@@ -140,7 +136,6 @@ fn check_dense(call: &MatmulRaw<'_>) -> Result<Dims, DeviceFailure> {
     Ok(dims)
 }
 
-/// Queues the dense Q5_0 matmul of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn matmul_q5_0_launch(
     stream: &RawStream,
     call: &MatmulRaw<'_>,
@@ -175,7 +170,6 @@ pub(in crate::kernels::cuda) fn matmul_q5_0_launch(
     checked(status, stage)
 }
 
-/// Bytes each range of an expert call must hold.
 struct Sizes {
     stack: usize,
     ids: usize,
@@ -199,8 +193,6 @@ fn expert_sizes(call: &ExpertRaw<'_>) -> Option<Sizes> {
     })
 }
 
-/// Proves an expert launch before the native call: shape, sizes, alignment (stack and xf 16, ids
-/// and y 4) and that `y` overlaps none of the ranges the kernel reads.
 fn check_expert(call: &ExpertRaw<'_>) -> Result<(Dims, c_int, c_int), DeviceFailure> {
     let dims = dims(call.ty, call.rows, call.k, call.m, true).ok_or_else(invalid_argument)?;
     if call.count < 1 {
@@ -227,7 +219,6 @@ fn check_expert(call: &ExpertRaw<'_>) -> Result<(Dims, c_int, c_int), DeviceFail
     Ok((dims, slot, count))
 }
 
-/// Queues the Q5_0 expert matmul of `call` on `stream`. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn matmul_expert_q5_0_launch(
     stream: &RawStream,
     call: &ExpertRaw<'_>,

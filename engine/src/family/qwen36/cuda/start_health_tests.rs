@@ -424,7 +424,6 @@ fn cuda_engine_streams_the_gate_tokens() {
             JobEvent::Error(error) => panic!("the long job failed: {error:?}"),
         }
     }
-    // The long job ended BY THE CANCEL: its terminal batch says so.
     assert_eq!(
         long_finish,
         Some(DecodeFinish::Cancelled),

@@ -16,7 +16,6 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// Returns a `BadRequest` with the label `causal conv`.
 fn bad(message: &str) -> EngError {
     EngError::BadRequest(format!("causal conv: {message}"))
 }

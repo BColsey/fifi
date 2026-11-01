@@ -1,4 +1,4 @@
-// ANE adapter for the decision head. Unsafe is confined to this module's FFI.
+// Unsafe is confined to this module's FFI.
 //
 // The bridge functions stay `extern "C"`, not `extern "C-unwind"`. Every
 // bridge entry point is `noexcept` and converts Objective-C and C++

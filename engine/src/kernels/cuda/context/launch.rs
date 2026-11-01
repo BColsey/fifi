@@ -151,7 +151,6 @@ impl CudaContext {
             .ok_or_else(|| EngError::BadRequest("the CUDA launch range is not valid".to_owned()))
     }
 
-    /// Every check of a pack, then the native view of its ranges.
     fn plan_pack<'b>(&self, call: &PackCall<'b>) -> Result<PackRaw<'b>, EngError> {
         let x_raw = self.raw_range(&call.x)?;
         let xf_raw = self.raw_range(&call.xf)?;
@@ -178,7 +177,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of a matmul, then the native view of its weight and ranges.
     fn plan_matmul<'b>(
         &self,
         projection: &Projection<'b>,

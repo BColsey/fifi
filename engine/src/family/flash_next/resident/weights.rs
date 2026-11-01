@@ -20,7 +20,6 @@ use crate::{
     tensor::{ExecutionTensor, Tensor},
 };
 
-/// Returns `1 + w` for a zero-centered norm weight.
 fn one_plus(weight: &[f32]) -> Vec<f32> {
     weight.iter().map(|w| 1.0 + w).collect()
 }
@@ -45,7 +44,6 @@ fn split_conv(conv: &[f32], rows: usize, kernel: usize) -> Result<(Vec<f32>, Vec
     Ok((taps, last))
 }
 
-/// Transposes a row-major `[rows, cols]` matrix to `[cols, rows]`.
 fn transpose(values: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, EngError> {
     let mismatch = || EngError::BadRequest("matrix length does not match its shape".into());
     if Some(values.len()) != rows.checked_mul(cols) {
@@ -58,7 +56,6 @@ fn transpose(values: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>, EngEr
         .ok_or_else(mismatch)
 }
 
-/// Returns the stream description of a sliced stack or table.
 fn sliced(weight: &StoredWeight) -> Result<SlicedWeight, EngError> {
     match weight {
         StoredWeight::Sliced(s) => Ok(s.clone()),
@@ -397,13 +394,11 @@ impl RPle {
     }
 }
 
-/// Attention weights of one layer.
 pub(super) enum RAttn {
     Delta(RDelta),
     Qsa(RQsa),
 }
 
-/// Weights of one decoder layer.
 pub(super) struct RLayer {
     pub(super) attn_hyper: RHyper,
     pub(super) attn: RAttn,
@@ -477,7 +472,6 @@ impl ResidentWeights {
         })
     }
 
-    /// Resident bytes of all weights and constants.
     pub(super) fn byte_len(&self) -> Result<u64, EngError> {
         let mut total = Bytes::default();
         total.packed(&self.lm_head)?;
@@ -663,7 +657,6 @@ mod tests {
         assert_eq!(state.pos(), 0, "state position");
     }
 
-    /// Returns the `weight_map` object of a safetensors index.
     fn weight_map(index: &[u8]) -> serde_json::Map<String, serde_json::Value> {
         let value: serde_json::Value = serde_json::from_slice(index).unwrap();
         value["weight_map"].as_object().unwrap().clone()

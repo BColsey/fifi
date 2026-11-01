@@ -43,7 +43,6 @@ const _: () = assert!(
         && offset_of!(GeluFfnArgsRepr, n) == 28
 );
 
-/// One gelu_ffn launch: m rows of n values for each of out, gate and up.
 pub(in crate::kernels::cuda) struct GeluFfnRaw<'a> {
     pub(in crate::kernels::cuda) out: RawRange<'a>,
     pub(in crate::kernels::cuda) gate: RawRange<'a>,
@@ -73,7 +72,6 @@ fn check_gelu_ffn(call: &GeluFfnRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the gelu_ffn of call on stream. Returns when the kernel is queued.
 pub(in crate::kernels::cuda) fn gelu_ffn_launch(
     stream: &RawStream,
     call: &GeluFfnRaw<'_>,

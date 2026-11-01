@@ -21,9 +21,7 @@
 //!
 //! The defaults of an absent field belong to the engine, not to this module: every engine entry
 //! reads `temperature`, `top_p`, and `top_k` from `generation_config.json` in its model directory
-//! at start (`SamplingDefaults`). An absent file, an absent key, or an explicit JSON `null` for
-//! a key keeps the contract default, and a file that is malformed, out of range, not a regular
-//! file, or larger than 1 MiB stops the engine start.
+//! at start (`SamplingDefaults`).
 
 use crate::EngError;
 use crate::checkpoint_json::UniqueValue;
@@ -34,22 +32,16 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 
-/// The contract default for `temperature`.
 pub(crate) const DEFAULT_TEMPERATURE: f64 = 0.7;
 
-/// The contract default for `top_p`.
 pub(crate) const DEFAULT_TOP_P: f64 = 1.0;
 
 /// The contract maximum for `temperature` (the canonical request encoding of `kernels/sample_canon`
 /// names the same bound; a unit test pins the two together until they share one definition).
 pub(crate) const MAX_TEMPERATURE: f64 = 2.0;
 
-/// The size cap of `generation_config.json`: 1 MiB.
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 
-/// The sampling defaults of one engine entry: the `temperature`, `top_p`, and `top_k` that a
-/// chat request takes when it omits the field. They come from `generation_config.json` in the
-/// model directory of the engine; an absent file or key keeps the contract default of that key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SamplingDefaults {
     pub(crate) temperature: f64,
@@ -58,7 +50,6 @@ pub(crate) struct SamplingDefaults {
 }
 
 impl SamplingDefaults {
-    /// The contract defaults: `temperature` 0.7, `top_p` 1.0, and `top_k` off.
     pub(crate) const CONTRACT: Self = Self {
         temperature: DEFAULT_TEMPERATURE,
         top_p: DEFAULT_TOP_P,
@@ -146,8 +137,8 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, EngError> {
 }
 
 /// Reads one number member of `generation_config.json` and checks the contract bounds
-/// `[low, high]`. An absent key keeps `fallback`; so does an explicit JSON `null`, because a
-/// Hugging Face config carries `null` for an unset field. A wrong type names the JSON type.
+/// `[low, high]`. An absent key keeps `fallback`; so does an explicit JSON `null`.
+/// A wrong type names the JSON type.
 fn file_number(
     root: &serde_json::Value,
     key: &str,
@@ -215,13 +206,10 @@ fn file_top_k(root: &serde_json::Value) -> Result<u32, EngError> {
 /// this flag, so the label cannot disagree with the read (no second `exists` call, no race).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LoadedDefaults {
-    /// The effective defaults.
     pub(crate) values: SamplingDefaults,
-    /// True when a `generation_config.json` supplied the values; false when the file is absent.
     pub(crate) from_file: bool,
 }
 
-/// Checked sampling settings of one request.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SamplingParams {
     temperature: f64,
@@ -230,8 +218,6 @@ pub(crate) struct SamplingParams {
 }
 
 impl SamplingParams {
-    /// Checks the contract bounds: `temperature` in [0, 2] and `top_p` in [0, 1].
-    /// The error message names the field.
     pub(crate) fn new(temperature: f64, top_p: f64, top_k: u32) -> Result<Self, EngError> {
         if !(0.0..=MAX_TEMPERATURE).contains(&temperature) {
             return Err(EngError::BadRequest(format!(
@@ -250,7 +236,6 @@ impl SamplingParams {
         })
     }
 
-    /// Settings for greedy decoding.
     pub(crate) fn greedy() -> Self {
         Self {
             temperature: 0.0,
@@ -302,13 +287,11 @@ impl SamplingParams {
         self.top_k
     }
 
-    /// True when the settings select the largest logit without a random draw.
     pub(crate) fn is_greedy(&self) -> bool {
         self.temperature == 0.0
     }
 }
 
-/// A seed for one job from system randomness and the clock. It uses only `std`.
 pub(crate) fn entropy_seed() -> u64 {
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -342,7 +325,6 @@ impl SplitMix64 {
     }
 }
 
-/// Draws token ids from logits under checked settings and a seeded generator.
 pub(crate) struct Sampler {
     params: SamplingParams,
     #[cfg_attr(
@@ -354,7 +336,7 @@ pub(crate) struct Sampler {
 }
 
 impl Sampler {
-    /// A sampler with the given settings and an explicit seed. Tests and replays use this.
+    /// Tests and deterministic replays use the explicit seed.
     pub(crate) fn new(params: SamplingParams, seed: u64) -> Self {
         Self {
             params,
@@ -368,7 +350,6 @@ impl Sampler {
         Self::new(params, entropy_seed())
     }
 
-    /// True when the settings select greedily, so this sampler draws nothing.
     pub(crate) fn is_greedy(&self) -> bool {
         self.params.is_greedy()
     }
@@ -608,12 +589,10 @@ fn top_logit(logits: &[f32]) -> f64 {
     f64::from(top)
 }
 
-/// The unnormalised softmax weight `exp((logit - top) / temperature)` in the present arithmetic.
 fn weight(logit: f32, top: f64, temperature: f64) -> f64 {
     ((f64::from(logit) - top) / temperature).exp()
 }
 
-/// The vocabulary as `(index, logit)` pairs, ready to be ordered by `compare_ranked`.
 fn candidate_pairs(logits: &[f32]) -> Vec<(u32, f32)> {
     logits
         .iter()
@@ -622,7 +601,6 @@ fn candidate_pairs(logits: &[f32]) -> Vec<(u32, f32)> {
         .collect()
 }
 
-/// The present sort's order: larger logit first, a tie to the lower index.
 fn compare_ranked(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
     b.1.partial_cmp(&a.1)
         .unwrap_or(Ordering::Equal)
@@ -638,7 +616,6 @@ struct Entry {
 }
 
 impl Entry {
-    /// The entry as the `(index, logit)` pair the ranked helpers use.
     fn pair(self) -> (u32, f32) {
         (self.index, self.logit)
     }
@@ -742,7 +719,6 @@ fn ranked_prefix(logits: &[f32], rows: usize) -> Vec<(u32, f32)> {
         pairs.drain(..at);
     }
     pairs.sort_unstable_by_key(ranked_key);
-    // Ascending keys give (logit up, index down); reversed they give the ranked order.
     pairs.reverse();
     pairs
 }
@@ -809,12 +785,10 @@ mod sample_path {
         static FALLBACK: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Records that the ranked prefix answered a draw.
     pub(super) fn note_prefix() {
         PREFIX.with(|count| count.set(count.get() + 1));
     }
 
-    /// Records that the prefix did not close and the full ranked row answered.
     pub(super) fn note_fallback() {
         FALLBACK.with(|count| count.set(count.get() + 1));
     }
@@ -1246,7 +1220,6 @@ mod tests {
     "top_p": 0.95
 }"#;
 
-    /// A model directory that holds `text` as its `generation_config.json`.
     fn dir_with_generation_config(text: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("generation_config.json"), text)
@@ -1361,7 +1334,6 @@ mod tests {
                 from_file: false
             })
         );
-        // A file that lacks a key keeps the contract default of that key alone.
         let partial = dir_with_generation_config("{\"top_k\": 7}");
         assert_eq!(
             SamplingDefaults::from_model_dir(partial.path()),
@@ -1449,7 +1421,6 @@ mod tests {
             let typed = dir_with_generation_config(text);
             let message = checkpoint_message(SamplingDefaults::from_model_dir(typed.path()));
             assert!(message.contains(expected), "{text}: {message}");
-            // Only the JSON type name is echoed, never the value itself.
             assert!(
                 !message.contains(leaked),
                 "{text} leaked {leaked}: {message}"
@@ -1486,7 +1457,6 @@ mod tests {
     fn an_oversized_generation_config_is_an_error_that_names_the_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("generation_config.json");
-        // One byte over the 1 MiB cap; the content never reaches the parser.
         std::fs::write(&path, vec![b'{'; (1 << 20) + 1]).expect("write generation_config.json");
         let text = checkpoint_message(SamplingDefaults::from_model_dir(dir.path()));
         assert!(text.contains("larger than 1 MiB"), "{text}");
@@ -2353,7 +2323,6 @@ mod tests {
 
     // ---- Statistical audit of the host sampler: 200,000 draws per configuration ----
 
-    /// The draws of one audit configuration.
     const AUDIT_DRAWS: usize = 200_000;
 
     /// The draws of an audit whose outcome is deterministic (one kept token): no statistic is
@@ -2377,14 +2346,12 @@ mod tests {
         peaked_row(50, 0.99, 0.01)
     }
 
-    /// A flat top: 20 equal logits over 30 tail logits of -3.
     fn flat_logits() -> Vec<f32> {
         let mut logits = vec![0.0_f32; 20];
         logits.resize(50, -3.0);
         logits
     }
 
-    /// A long geometric tail: the logit of token `i` is `-0.1 * i`, for 100 tokens.
     fn tail_logits() -> Vec<f32> {
         (0..100).map(|i| -0.1 * i as f32).collect()
     }
@@ -2475,7 +2442,6 @@ mod tests {
     }
 
     impl Expect {
-        /// The expectation of an audit with the standard `AUDIT_DRAWS`.
         fn new(freedom: usize, critical: f64) -> Self {
             Self {
                 freedom,
@@ -2484,7 +2450,6 @@ mod tests {
             }
         }
 
-        /// The same expectation for a different number of draws.
         fn with_draws(self, draws: usize) -> Self {
             Self { draws, ..self }
         }

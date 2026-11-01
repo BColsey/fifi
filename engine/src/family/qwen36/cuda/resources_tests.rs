@@ -163,9 +163,6 @@ fn the_moe_block_gets_the_dimensions_of_the_layout_record() {
     );
 }
 
-/// The NATIVE stack guard: the shape rule passes first, then the per-expert `rows % 4` rule refuses
-/// a stack whose per-expert height is ragged (every earlier check satisfied), `experts: None`
-/// refuses as "not an expert stack", and the valid multiples-of-4 form passes.
 #[test]
 fn a_native_stack_with_ragged_per_expert_rows_is_refused() {
     let want = StackSpec {

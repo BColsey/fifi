@@ -19,7 +19,6 @@
 
 namespace {
 
-/* Reports the stage of the first failure and returns its status. */
 int finish(const Failure &failure, int *out_stage) {
     report_stage(out_stage, failure.stage);
     return (int)failure.err;

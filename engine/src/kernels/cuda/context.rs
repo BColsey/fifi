@@ -158,7 +158,6 @@ pub(crate) struct CudaContext {
     pinned_stage_admission: Option<pinned_stage::StageAdmission>,
 }
 
-/// One device allocation owned by a [`CudaContext`].
 pub(crate) struct DeviceBuffer {
     raw: Option<RawDevice>,
     lease: Rc<Lease>,
@@ -330,12 +329,10 @@ impl CudaContext {
         }
     }
 
-    /// Fails with `Backend` `execute` after a terminal failure.
     pub(crate) fn ensure_usable(&self) -> Result<(), EngError> {
         super::ensure_usable(&TERMINAL)
     }
 
-    /// Reports free and total device memory.
     pub(crate) fn memory_info(&self) -> Result<MemoryInfo, EngError> {
         graph::ensure_closed("a memory query")?;
         let _dispatch = self.enter()?;
@@ -361,15 +358,11 @@ impl CudaContext {
             .map_err(|status| native_error(&TERMINAL, "inference_cuda_module_loading_mode", status))
     }
 
-    /// Device bytes held by the live buffers of every context in the process.
-    /// The count is process-global, so tests compare it before and after.
     #[cfg(test)]
     pub(crate) fn live_bytes(&self) -> usize {
         LIVE_BYTES.load(Ordering::Acquire)
     }
 
-    /// Live streams, events and pinned bytes of every context in the process.
-    /// The counts are process-global, so tests compare them before and after.
     #[cfg(test)]
     pub(crate) fn live_owners(&self) -> OwnerCounts {
         OwnerCounts {
@@ -380,13 +373,11 @@ impl CudaContext {
         }
     }
 
-    /// Native destroy calls made so far by streams, events, pinned words and graphs.
     #[cfg(test)]
     pub(crate) fn destroy_calls(&self) -> usize {
         DESTROY_CALLS.load(Ordering::Acquire)
     }
 
-    /// Workspace allocations made so far, the first one included.
     #[cfg(test)]
     pub(crate) fn workspace_allocations(&self) -> usize {
         self.workspace_allocations.get()
@@ -398,7 +389,6 @@ impl CudaContext {
         self.successful_allocations.get()
     }
 
-    /// Bytes of the current workspace allocation.
     #[cfg(test)]
     pub(crate) fn workspace_bytes(&self) -> usize {
         self.workspace.borrow().buffer.bytes()
@@ -1014,7 +1004,6 @@ impl CudaContext {
         )
     }
 
-    /// Allocates `bytes` of uninitialized device memory.
     fn alloc(&self, bytes: usize) -> Result<DeviceBuffer, EngError> {
         let buffer = match &self.alloc_cache {
             Some(cache) if bytes <= cache.max_block() => cache.allocate(bytes)?,
@@ -1026,9 +1015,8 @@ impl CudaContext {
         Ok(buffer)
     }
 
-    /// Reads, repacks and uploads the groups of `plan` one chunk at a time
-    /// into `buffer`. The tiles are group-major, so each chunk lands at the
-    /// byte offset of its first group.
+    /// The tiles are group-major, so each chunk lands at the byte offset of
+    /// its first group.
     fn upload_groups(
         &self,
         plan: ChunkPlan<'_>,
@@ -1080,7 +1068,6 @@ impl CudaContext {
     }
 }
 
-/// Enters the dispatch guard, or fails with `execute` after a terminal failure.
 fn enter_dispatch() -> Result<DispatchGuard<'static>, EngError> {
     let dispatch = DispatchGuard::enter(&TERMINAL);
     super::ensure_usable(&TERMINAL)?;
@@ -1088,7 +1075,6 @@ fn enter_dispatch() -> Result<DispatchGuard<'static>, EngError> {
 }
 
 impl DeviceBuffer {
-    /// Bytes of the device allocation.
     pub(crate) fn bytes(&self) -> usize {
         self.raw.as_ref().map_or(0, RawDevice::bytes)
     }
@@ -1123,7 +1109,6 @@ impl DeviceBuffer {
         let _ = cache.free(raw);
     }
 
-    /// Takes ownership of a device allocation and counts its bytes as live.
     fn from_raw(lease: &Rc<Lease>, raw: RawDevice) -> Self {
         LIVE_BYTES.fetch_add(raw.bytes(), Ordering::AcqRel);
         Self {
@@ -1188,12 +1173,10 @@ fn release_buffer(raw: RawDevice) {
 }
 
 impl TiledWeight {
-    /// Rows (output values per token) of the weight.
     pub(crate) fn n_rows(&self) -> usize {
         self.tiled.n_rows
     }
 
-    /// Values per row (input values per token) of the weight.
     pub(crate) fn k(&self) -> usize {
         self.tiled.k
     }
@@ -1227,7 +1210,6 @@ pub(crate) fn drop_page_cache(file: &std::fs::File, offset: u64, len: u64) -> Re
     })
 }
 
-/// Maps a failed device call to the error of its stage.
 fn device_error(failure: DeviceFailure) -> EngError {
     native_error(&TERMINAL, graph::operation_of(&failure), failure.status)
 }
@@ -1240,7 +1222,6 @@ fn workspace_in_use() -> EngError {
     }
 }
 
-/// How a tensor splits into chunks of whole 8-row groups.
 #[derive(Clone, Copy)]
 struct ChunkPlan<'a> {
     tensor: QuantTensor<'a>,
@@ -1250,7 +1231,6 @@ struct ChunkPlan<'a> {
     /// of tile bytes. A group's source is never larger than its tiles, so the
     /// source chunk obeys the same limit.
     per_chunk: usize,
-    /// Source bytes of one group.
     group_src: usize,
     /// Device bytes of one group's tiles.
     group_bytes: usize,
@@ -1648,7 +1628,6 @@ mod group_stride_tests {
 
     #[test]
     fn each_expert_of_a_stacked_tensor_starts_where_the_upload_wrote_it() {
-        // Three experts of 16 rows stacked into one 3-D tensor of 48 rows.
         let (plan, tiled, tile_bytes) = plan_of(GgufType::Q6K, 48, 512);
         for expert in 0..3 {
             let (view, offset) = row_range(tiled, expert * 16, 16).expect("one expert");

@@ -65,8 +65,6 @@ pub(super) fn effective_norm_bytes(tensor: &Tensor, values: usize) -> Result<Vec
     Ok(output)
 }
 
-/// The values of a stored F16, BF16 or F32 tensor widened to F32. `values` is the element count
-/// the caller needs; a nonfinite value is refused.
 pub(super) fn widen_f32(tensor: &Tensor, values: usize, what: &str) -> Result<Vec<f32>, EngError> {
     let elements = tensor.shape().iter().try_fold(1usize, |count, &dim| {
         count.checked_mul(usize::try_from(dim).ok()?)
@@ -121,8 +119,7 @@ pub(super) fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// The decay a DeltaNet kernel reads from the pack's `A_log`: `-exp(A_log)`, as a GGUF file stores
-/// it. A log that overflows F32 is refused instead of loading an infinite decay.
+/// A log whose `-exp(A_log)` overflows F32 is refused rather than loaded as an infinite decay.
 pub(super) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngError> {
     let decay: Vec<f32> = log.iter().map(|a| -a.exp()).collect();
     if decay.iter().all(|a| a.is_finite()) {
@@ -133,9 +130,8 @@ pub(super) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngError> {
     ))
 }
 
-/// For each value head `t` of the kernel's tiled order, the head it takes from the pack's grouped
-/// order. Tiled head `t` belongs to key head `t % key_heads`; the pack stores the heads of key
-/// head `g` as `g * rep ..` with `rep = value_heads / key_heads`.
+/// For each value head `t` of the kernel's tiled order, the head it takes from the pack's
+/// grouped order.
 pub(super) fn tiled_head_order(
     key_heads: usize,
     value_heads: usize,
@@ -151,7 +147,6 @@ pub(super) fn tiled_head_order(
         .collect())
 }
 
-/// `values` as blocks of `block` entries, in the block order `order[0], order[1], ...`.
 pub(super) fn permute_blocks<T: Copy>(
     values: &[T],
     block: usize,

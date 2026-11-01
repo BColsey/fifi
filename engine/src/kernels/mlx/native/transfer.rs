@@ -16,7 +16,6 @@ use crate::{
 
 use super::super::staging::StagedBytes;
 
-/// The native shape and aligned copy of one tensor that is about to be imported.
 struct ImportData {
     shape: Vec<i32>,
     rank: i32,

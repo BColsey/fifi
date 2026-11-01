@@ -10,7 +10,6 @@ use std::path::Path;
 
 use serde_json::Value;
 
-/// A merge written as `"a b"` or as `["a", "b"]`, in the one string form.
 fn merge_text(merge: &Value) -> String {
     match merge {
         Value::String(text) => text.clone(),

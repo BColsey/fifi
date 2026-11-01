@@ -52,11 +52,8 @@ use crate::kernels::cuda::resident::attn_prep::{
 pub(crate) const HEAD_DIM: usize = 256;
 /// The most tokens one call takes (the grid's y extent).
 pub(crate) const MAX_TOKENS: usize = 65_535;
-/// The most query heads.
 pub(crate) const MAX_N_HEAD: usize = 256;
-/// The most kv heads.
 pub(crate) const MAX_N_KV_HEAD: usize = 64;
-/// The most cache rows: `2^30 - 1`.
 pub(crate) const MAX_ROWS: usize = (1 << 30) - 1;
 
 /// Geometry of one chunk preparation: `m` tokens at the positions `p0 .. p0 + m`, `n_head`
@@ -115,17 +112,14 @@ pub(crate) struct AttnPrepChunkCall<'b> {
     pub(crate) status: Option<DeviceRange<'b>>,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("attn_prep_chunk: {tag}: {detail}"))
 }
 
-/// `value` as `c_int` for the rule `tag`, or the "exceeds i32" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
-/// `value` as `c_int` when it lies in `low..=high`, else the refusal for `tag`.
 fn ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, EngError> {
     if !(low..=high).contains(&value) {
         return Err(rule(tag, &format!("{tag} is {value}, not {low} to {high}")));
@@ -188,7 +182,6 @@ pub(in crate::kernels::cuda) fn check_shape(
     })
 }
 
-/// Checks `eps` (finite, above 0) and `rope_base` (finite, above 1).
 pub(crate) fn check_rope(rope: &RopeParams) -> Result<(), EngError> {
     if !(rope.eps.is_finite() && rope.eps > 0.0) {
         return Err(rule("eps", "eps is not finite and above 0"));

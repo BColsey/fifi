@@ -76,7 +76,6 @@ fn matches_the_frozen_reference_in_both_geometries() {
     }
 }
 
-/// The wrapper refuses a head_dim outside 256 and 512 before any native call.
 #[test]
 fn refuses_an_unsupported_head_dim() {
     if !testkit::device_present("attn_decode_gemma dim refusal") {

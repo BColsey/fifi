@@ -30,7 +30,6 @@ use crate::kernels::expert_cpu::{
 use crate::kernels::expert_cpu_q8g::{ExpertScratchQ8g, expert_forward_q8g};
 use crate::kernels::expert_cpu_q8k::{DotBackend, ExpertScratchQ8k, expert_forward_q8k};
 
-/// Which expert kernel the workers run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpertKernel {
     /// The safe f32 reference kernel (what [`CpuPool::new`] uses).
@@ -47,29 +46,23 @@ pub enum ExpertKernel {
 /// One worker's whole kernel state: the scratch of exactly the kernel its pool
 /// runs and nothing else, so a worker never carries buffers it cannot use.
 enum Worker {
-    /// The f32 reference kernel with its [`ExpertScratch`].
     F32 {
-        /// Reusable f32 kernel scratch, sized for the pool shape.
         scratch: ExpertScratch,
     },
     /// The Q8_K integer kernel with its dot backend and its [`ExpertScratchQ8k`].
     Q8k {
         /// The scalar/AVX2 dispatch, fixed with the pool.
         backend: DotBackend,
-        /// Reusable Q8_K kernel scratch, sized for the pool shape.
         scratch: ExpertScratchQ8k,
     },
     /// The per-32 group integer kernel with its dot backend and its [`ExpertScratchQ8g`].
     Q8g {
-        /// The scalar/AVX2 dispatch, fixed with the pool.
         backend: DotBackend,
-        /// Reusable per-32 kernel scratch, sized for the pool shape.
         scratch: ExpertScratchQ8g,
     },
 }
 
 impl Worker {
-    /// Allocates the scratch of exactly `kernel` for `shape` (only that one).
     fn new(kernel: ExpertKernel, shape: ExpertShape) -> Self {
         match kernel {
             ExpertKernel::F32 => Self::F32 {
@@ -86,8 +79,8 @@ impl Worker {
         }
     }
 
-    /// Runs one expert through this worker's kernel; the errors are the kernel's
-    /// own, so both kernels' refusals surface per run as [`PoolError::Expert`].
+    /// The errors are the kernel's own, so a kernel refusal surfaces per run as
+    /// [`PoolError::Expert`].
     fn compute(
         &mut self,
         shape: ExpertShape,
@@ -125,7 +118,6 @@ impl<T: AsRef<[u8]> + Send + Sync + 'static> MappedRegion for T {
 /// (half-open byte offsets) and its router weight. The pool checks the ranges
 /// against its shape before any work starts.
 pub struct ExpertJob {
-    /// Shared mapped region holding this expert's weight bytes.
     pub region: Arc<dyn MappedRegion>,
     /// Gate projection bytes: `inter` rows over `hidden` inputs, Q4_K blocks.
     pub gate: Range<usize>,
@@ -146,18 +138,12 @@ pub enum PoolError {
     BadInput(String),
     /// [`expert_forward`](crate::kernels::expert_cpu::expert_forward) refused a job;
     /// `job` is the run's lowest failing index, whatever order failures arrived in.
-    Expert {
-        /// Index of the failing job in the submitted list.
-        job: usize,
-        /// The kernel's reason.
-        error: ExpertCpuError,
-    },
+    Expert { job: usize, error: ExpertCpuError },
     /// `pending` jobs never answered within the timeout; their late results are
     /// discarded, so the run had no outcome.
     Timeout {
         /// Whole milliseconds actually waited before giving up.
         waited_ms: u64,
-        /// Jobs of the run that never delivered a result.
         pending: usize,
     },
     /// A worker died on a panic, so its job can never answer; the pool keeps serving
@@ -171,7 +157,6 @@ struct TaskItem(usize, ExpertJob, Arc<[f32]>, Sender<JobOutcome>);
 enum JobOutcome {
     /// The unscaled `hidden`-long output; the ordered sum applies the weight.
     Done(usize, Vec<f32>),
-    /// The kernel refused the job.
     Failed(usize, ExpertCpuError),
     /// A worker panicked while holding a job of this run.
     Lost,
@@ -203,9 +188,6 @@ fn wait_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
     }
 }
 
-/// The worker main loop: take a job (waiting when idle), wait on the test gate if
-/// there is one, compute, report on the run's channel. A panic is caught, reported
-/// as `Lost`, and ends that worker; the survivors keep serving.
 fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
     loop {
         let item = {
@@ -252,9 +234,8 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
     }
 }
 
-/// The CPU expert pool: persistent host worker threads over one shared job queue,
-/// each owning the scratch of the pool's [`ExpertKernel`] (a run allocates no
-/// kernel scratch).
+/// A run allocates no kernel scratch: each worker owns the scratch of the
+/// pool's [`ExpertKernel`].
 pub struct CpuPool {
     threads: usize,
     shape: ExpertShape,
@@ -264,17 +245,14 @@ pub struct CpuPool {
 }
 
 impl CpuPool {
-    /// Creates a pool of `threads` workers for `shape` (`threads >= 1`) running the
-    /// safe f32 kernel; a shape the kernel refuses surfaces per run as
-    /// [`PoolError::Expert`].
+    /// `threads >= 1`; a shape the kernel refuses surfaces per run as
+    /// [`PoolError::Expert`], not at construction.
     pub fn new(threads: usize, shape: ExpertShape) -> Result<CpuPool, PoolError> {
         Self::build(threads, shape, ExpertKernel::F32, None)
     }
 
-    /// Creates a pool of `threads` workers for `shape` (`threads >= 1`) running
-    /// `kernel`: the f32 reference or the Q8_K integer kernel with its backend.
-    /// Each worker owns exactly that kernel's scratch; the run contract is the
-    /// `CpuPool::new` one, with the chosen kernel in place of `expert_forward`.
+    /// The run contract is the [`CpuPool::new`] one, with `kernel` in place of
+    /// the f32 reference.
     pub fn with_kernel(
         threads: usize,
         shape: ExpertShape,
@@ -283,24 +261,18 @@ impl CpuPool {
         Self::build(threads, shape, kernel, None)
     }
 
-    /// The worker count, fixed at construction.
     pub fn threads(&self) -> usize {
         self.threads
     }
 
-    /// The expert kernel the workers run, fixed at construction.
     pub fn kernel(&self) -> ExpertKernel {
         self.kernel
     }
 
-    /// The expert geometry the workers were built for, fixed at construction.
     pub fn shape(&self) -> ExpertShape {
         self.shape
     }
 
-    /// Builds the pool around a gate (`None` for real pools): spawns `threads`
-    /// workers, each with its own scratch for `kernel`; if a spawn fails, the
-    /// already-spawned workers are stopped and joined as [`PoolError::WorkerLost`].
     fn build(
         threads: usize,
         shape: ExpertShape,
@@ -352,8 +324,8 @@ impl CpuPool {
     /// bytes, down `hidden*inter/256*144`), `hidden` exactly `shape.hidden` long,
     /// finite weights; violations are [`PoolError::BadInput`] naming the job, and
     /// nothing is queued before every job passes. The result is the sum over jobs
-    /// IN JOB ORDER of `weight_j * <pool kernel>(job_j)` (f32 `expert_forward`, or
-    /// `expert_forward_q8k` through the pool's backend), f32 from +0.0, so the
+    /// IN JOB ORDER of `weight_j * <pool kernel>(job_j)` (f32 `expert_forward`,
+    /// `expert_forward_q8k` or `expert_forward_q8g` through the pool's backend), f32 from +0.0, so the
     /// bits never depend on which thread finished first; the wait is bounded by
     /// `timeout`, and late results die with the run's channel (one per run).
     pub fn run_layer(
@@ -439,7 +411,6 @@ impl CpuPool {
     }
 }
 
-/// The queued jobs of one layer: join them with [`PendingLayer::finish`].
 pub struct PendingLayer {
     rx: Receiver<JobOutcome>,
     weights: Vec<f32>,
@@ -497,7 +468,6 @@ impl PendingLayer {
             return Err(PoolError::Expert { job, error });
         }
 
-        // Every job answered: accumulate in job order (weight-scaled, from +0.0).
         let mut sum = vec![0.0f32; hidden];
         for (weight, out) in weights.into_iter().zip(outs) {
             let Some(out) = out else {
@@ -534,7 +504,6 @@ struct Gate {
 
 #[cfg(test)]
 impl Gate {
-    /// Opens the gate (one-shot): every waiting worker proceeds.
     fn open(&self) {
         let (flag, cv) = &*self.inner;
         *lock(flag) = true;
@@ -605,7 +574,6 @@ mod tests {
     /// Moderate f16 scale patterns; they keep the expert outputs finite and small.
     const F16_BITS: [u16; 4] = [0x3500, 0x3c00, 0x4000, 0xbc00];
 
-    /// `blocks` random Q4_K blocks with moderate, finite scales.
     fn random_blocks(rng: &mut Lcg, blocks: usize) -> Vec<u8> {
         let mut w = vec![0u8; blocks * Q4K_BLOCK_BYTES];
         for blk in w.as_chunks_mut::<Q4K_BLOCK_BYTES>().0 {
@@ -635,7 +603,6 @@ mod tests {
         region
     }
 
-    /// The `weights.len()` jobs over `region`, weights attached in expert order.
     fn jobs_over(region: &Arc<Vec<u8>>, shape: ExpertShape, weights: &[f32]) -> Vec<ExpertJob> {
         let region: Arc<dyn MappedRegion> = region.clone();
         let side = slice_len(shape.inter, shape.hidden);
@@ -676,7 +643,6 @@ mod tests {
         sum
     }
 
-    /// Region, activation row and weights for `n` experts of the real shape.
     fn setup(rng: &mut Lcg, n: usize, wlo: f32, whi: f32) -> (Arc<Vec<u8>>, Vec<f32>, Vec<f32>) {
         let region = Arc::new(expert_region(rng, REAL, n));
         let hidden = (0..REAL.hidden)
@@ -725,7 +691,6 @@ mod tests {
 
     #[test]
     fn cpu_pool_returns_none_for_no_jobs() {
-        // An empty job list answers None: the caller adds nothing (signed zeros).
         let shape = ExpertShape {
             hidden: 2048,
             inter: 512,
@@ -753,8 +718,6 @@ mod tests {
 
     #[test]
     fn cpu_pool_matches_a_serial_sum_of_expert_forward() {
-        // 8 random experts of the real shape; a 4-thread pool equals the serial
-        // ordered sum bitwise.
         let (region, hidden, weights) = setup(&mut Lcg(0x1B1E_55AD_EA7D_0001), 8, -0.5, 0.5);
         let jobs = jobs_over(&region, REAL, &weights);
         let want = serial_sum(&jobs, &[0, 1, 2, 3, 4, 5, 6, 7], &hidden);
@@ -768,7 +731,6 @@ mod tests {
         let (region, hidden, weights) = setup(&mut Lcg(0x00C0_FFEE_5EED_0002), 8, -0.6, 0.6);
         let jobs = jobs_over(&region, REAL, &weights);
         let want = serial_sum(&jobs, &[0, 1, 2, 3, 4, 5, 6, 7], &hidden);
-        // (a) asserted: identical bits for 1, 2, 3 and 8 workers.
         for threads in [1, 2, 3, 8] {
             let pool = CpuPool::new(threads, REAL).unwrap();
             assert_eq!(pool.threads(), threads);
@@ -810,8 +772,8 @@ mod tests {
             };
             let mut jobs = jobs_over(&region, REAL, &ws);
             match i {
-                0 => jobs[1].down.end = region.len() + 8, // job 1 leaves the region
-                1 => jobs[2].up.end -= 1,                 // job 2's up one byte short
+                0 => jobs[1].down.end = region.len() + 8,
+                1 => jobs[2].up.end -= 1,
                 _ => {}
             }
             let msg = match pool.run_layer(jobs, &row, LONG) {
@@ -939,8 +901,6 @@ mod tests {
 
     #[test]
     fn with_kernel_reports_its_kernel_and_new_is_f32() {
-        // `new` keeps meaning F32; `with_kernel` reports the kernel it was given,
-        // either kind, and refuses zero threads exactly like `new`.
         let f32_pool = CpuPool::new(2, REAL).unwrap();
         assert_eq!(f32_pool.kernel(), ExpertKernel::F32);
         let explicit = CpuPool::with_kernel(2, REAL, ExpertKernel::F32).unwrap();
@@ -957,9 +917,8 @@ mod tests {
 
     #[test]
     fn q8k_pool_matches_a_serial_sum_of_expert_forward_q8k() {
-        // 8 random experts of the real shape; a 4-thread Q8k(detect()) pool equals
-        // the serial ordered sum computed with expert_forward_q8k directly,
-        // bitwise (the pool's order contract does not depend on the kernel).
+        // The pool's order contract does not depend on the kernel: the bits equal
+        // the serial ordered sum computed with `expert_forward_q8k` directly.
         let (region, hidden, weights) = setup(&mut Lcg(0x1B1E_55AD_EA7D_0007), 8, -0.5, 0.5);
         let jobs = jobs_over(&region, REAL, &weights);
         let want = serial_sum_q8k(
@@ -1072,8 +1031,6 @@ mod tests {
 
     #[test]
     fn q8k_pool_reports_kernel_errors_and_timeouts_like_the_f32_pool() {
-        // A shape the kernel refuses (inter = 100) names job 0 through the Q8_K
-        // kernel, exactly as the f32 pool does.
         let shape = ExpertShape {
             hidden: 2048,
             inter: 100,
@@ -1091,8 +1048,6 @@ mod tests {
         };
         assert_eq!(job, 0);
         assert!(matches!(error, ExpertCpuError::BadShape(_)), "{error:?}");
-        // A gated Q8_K pool times out, and after the gate opens the next run is
-        // correct (late results of the first run never leak into it).
         let (region, hidden, weights) = setup(&mut Lcg(0x6A7E_D8C0_0000_000A), 8, -0.3, 0.3);
         let (pool, gate) = CpuPool::new_gated_kernel(4, REAL, kernel);
         let first = pool.run_layer(jobs_over(&region, REAL, &weights), &hidden, SHORT);

@@ -1224,7 +1224,6 @@ impl<'a, 'w> RoutedLayer<'a, 'w> {
         let scales = routing_weight_multiplier.to_ne_bytes().repeat(rows);
         let scale = frame.ctx.upload(&scales)?;
         let scale = frame.keep(scale, scales.len());
-        // The stored routed up weights stay /128; scale normalized gates before publication.
         ctx.row_multiply(
             stream,
             RowMulCall {

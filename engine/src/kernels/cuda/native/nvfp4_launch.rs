@@ -27,7 +27,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Setup only: upload pointers derived from live checked ranges, not user bytes.
 pub(in crate::kernels::cuda) fn upload_pointers(
     ranges: &[RawRange<'_>],
 ) -> Result<RawDevice, DeviceFailure> {
@@ -48,7 +47,7 @@ pub(in crate::kernels::cuda) fn upload_pointers(
     super::upload(&bytes)
 }
 
-/// Canonical byte geometry plus the grouped kernel's signed grid-x bound.
+/// The grouped kernel's grid-x is a signed c_int, which caps rows.
 pub(in crate::kernels::cuda) fn geometry(
     n: usize,
     shape: [usize; 2],

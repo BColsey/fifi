@@ -13,11 +13,6 @@ fn geometry() -> MixerGeometry {
     MixerGeometry::new(&dims()).expect("geometry")
 }
 
-/// The Qwen3.6 fused-row column offsets pinned as the matvec needs them: the geometry's offsets,
-/// and the construction of the Native lists (which runs `check_native_column` over exactly these
-/// pairs) passing both kinds. There is no alignment line: `col * 4 % 4 == 0` holds for every input
-/// by construction. The native embed guard: only Q4_K passes, every other type the loader can
-/// produce for the embedding table is refused naming the tensor and Q4_K.
 #[test]
 fn the_native_embed_takes_q4_k_blocks_only() {
     use super::resources::check_native_embed;

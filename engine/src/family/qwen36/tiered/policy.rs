@@ -13,7 +13,6 @@ use super::{PolicyMode, TieredConfig};
 /// The experts a [`PolicyMode::Static`] policy holds in every layer bank: at most
 /// `bank_slots_per_layer` ids per layer, ranked by a popularity profile.
 pub struct StaticProfile {
-    /// The held expert ids of each layer, ascending.
     held: Vec<Vec<u16>>,
 }
 
@@ -53,7 +52,6 @@ impl StaticProfile {
         Ok(Self { held })
     }
 
-    /// The held experts of `layer`, ascending; empty for an unknown layer.
     pub fn held(&self, layer: usize) -> &[u16] {
         self.held.get(layer).map_or(&[], Vec::as_slice)
     }
@@ -64,11 +62,8 @@ impl StaticProfile {
 /// a free slot (a warm-up fill).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Swap {
-    /// The layer whose bank changes.
     pub layer: u16,
-    /// The expert entering the bank.
     pub promote: u16,
-    /// The expert leaving the bank, or `None` for a fill into a free slot.
     pub evict: Option<u16>,
 }
 
@@ -339,8 +334,6 @@ mod tests {
         }
     }
 
-    /// A small adaptive config: 2 layers x 8 experts, top-2 routing, banks of
-    /// `slots` experts, `rate` swaps per token, decay 0.999.
     fn adaptive(slots: usize, rate: f64) -> TieredConfig {
         TieredConfig {
             layers: 2,
@@ -353,7 +346,6 @@ mod tests {
         }
     }
 
-    /// The expected shape of a warm-up fill into a free slot.
     fn fill(layer: u16, expert: u16) -> Swap {
         Swap {
             layer,
@@ -362,7 +354,6 @@ mod tests {
         }
     }
 
-    /// One random token for `cfg`: per layer `top_k` ids drawn from `Lcg`.
     fn routes(rng: &mut Lcg, cfg: &TieredConfig) -> Vec<Vec<u16>> {
         (0..cfg.layers)
             .map(|_| {
@@ -393,7 +384,6 @@ mod tests {
     fn a_victim_is_the_lowest_score_of_its_own_layer() {
         let cfg = adaptive(2, 1.0);
         let mut policy = ExpertPolicy::new(&cfg, None).unwrap();
-        // Token 1 warms both banks up: layer 0 with {0, 1}, layer 1 with {4, 5}.
         policy.observe(&[vec![0, 1], vec![4, 5]]);
         assert_eq!(
             policy.boundary(),
@@ -439,7 +429,6 @@ mod tests {
             vec![fill(0, 3), fill(0, 1), fill(1, 6), fill(1, 2)]
         );
         policy.observe(&[vec![5, 3], vec![6, 0]]);
-        // 3 and 6 are already resident; 5 and 0 take the last free slots.
         assert_eq!(policy.boundary(), vec![fill(0, 5), fill(1, 0)]);
         assert!(policy.is_resident(0, 1) && policy.is_resident(0, 3) && policy.is_resident(0, 5));
         assert!(policy.is_resident(1, 0) && policy.is_resident(1, 2) && policy.is_resident(1, 6));
@@ -627,7 +616,6 @@ mod tests {
             policy.preload(cfg.layers, 1).is_err()
                 && policy.preload(1, cfg.experts as u16).is_err()
         );
-        // The preloaded experts count as hits and are never touches.
         let mut routes = vec![Vec::new(); cfg.layers];
         routes[0] = vec![7, 9, 3];
         assert_eq!(policy.observe(&routes)[0], vec![true, true, false]);

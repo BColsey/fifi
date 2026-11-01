@@ -36,7 +36,6 @@ pub(super) enum DenseWeight<'w> {
     Exl3(&'w Exl3Weight),
 }
 
-/// The weights of one layer: dense projections and raw f32 vectors by role.
 pub(super) struct LayerWeights<'w> {
     dense: Vec<(Role, DenseWeight<'w>)>,
     raw: Vec<(Role, DeviceRange<'w>)>,
@@ -96,7 +95,6 @@ impl<'w> LayerWeights<'w> {
     }
 }
 
-/// The weights of every wanted layer.
 pub(super) struct MixerWeights<'w> {
     /// `None` for a layer that was not asked for (a device test loads two or three layers).
     layers: Vec<Option<LayerWeights<'w>>>,
@@ -149,7 +147,6 @@ impl<'w> MixerWeights<'w> {
         Self { layers }
     }
 
-    /// The weights of `layer`, or `BadRequest` when it was not resolved.
     pub(super) fn layer_weights(&self, layer: usize) -> Result<&LayerWeights<'w>, EngError> {
         self.layers
             .get(layer)

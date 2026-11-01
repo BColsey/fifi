@@ -2,7 +2,6 @@
 use super::*;
 use crate::kernels::cuda::{CudaContext, testkit};
 
-/// The sum of two rows matches the host reference bit for bit.
 #[test]
 fn adds_two_rows_against_the_host_reference() {
     if !testkit::device_present("row_add basic") {
@@ -34,7 +33,6 @@ fn adds_two_rows_against_the_host_reference() {
     }
 }
 
-/// The wrapper refuses an out that overlaps x before any native call.
 #[test]
 fn refuses_an_out_that_overlaps_an_input() {
     if !testkit::device_present("row_add alias refusal") {
@@ -61,8 +59,6 @@ fn refuses_an_out_that_overlaps_an_input() {
     assert!(matches!(err, crate::EngError::BadRequest(_)), "{err:?}");
 }
 
-/// A fused call whose flag shares a byte with out, x or y is refused before any native
-/// call although every other argument passes every guard; a clear flag is accepted.
 #[test]
 fn refuses_a_fused_flag_that_overlaps_a_tensor_and_accepts_a_clear_one() {
     if !testkit::device_present("row_add fused flag alias refusal") {

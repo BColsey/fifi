@@ -51,7 +51,6 @@ pub(super) struct Exl3Scratch<'b> {
     pub(super) jobs: DeviceRange<'b>,
 }
 
-/// Where the rows of a projection go.
 #[derive(Clone, Copy)]
 pub(super) enum Output<'b> {
     /// The destination is exactly `[rows][n]`.
@@ -68,7 +67,6 @@ fn refuse(detail: String) -> EngError {
     EngError::BadRequest(format!("prefill chunk: EXL3: {detail}"))
 }
 
-/// `bytes` of `range` from `offset`.
 fn window<'b>(
     range: DeviceRange<'b>,
     offset: usize,
@@ -112,8 +110,7 @@ pub(super) fn write_dense_jobs(
         .write_at(launch.stream, table.offset(), &bytes)
 }
 
-/// The projections of one chunk: the launch, the scratch and the rows of the chunk, for which the
-/// dense job table was written.
+/// The launch, scratch and rows of one chunk for which the dense job table was written.
 pub(super) struct Projector<'a> {
     pub(super) launch: &'a Launch<'a>,
     pub(super) scratch: Exl3Scratch<'a>,
@@ -121,7 +118,6 @@ pub(super) struct Projector<'a> {
 }
 
 impl Projector<'_> {
-    /// Projects the `rows` F32 rows of `x` (each `k` values) through `weight` into `out`.
     pub(super) fn project(
         &self,
         weight: &Exl3Weight,
@@ -207,7 +203,6 @@ mod device_tests;
 #[path = "prefill_exl3_moe.rs"]
 mod moe;
 
-/// The projector of a chunk run.
 pub(super) fn projector<'a>(
     run: &'a ChunkRun<'_, '_>,
     ctx: &'a LayerCtx<'_, '_>,
@@ -349,7 +344,6 @@ pub(in crate::family::qwen36::cuda) mod split {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     }
 
-    /// Starts timing on this thread.
     pub(in crate::family::qwen36::cuda) fn enable() {
         STATE.with(|state| *state.borrow_mut() = Some(State::default()));
     }
@@ -402,7 +396,6 @@ pub(in crate::family::qwen36::cuda) mod split {
         );
     }
 
-    /// Counts one call of `bucket`.
     pub(super) fn count(bucket: &'static str) {
         STATE.with(|state| {
             if let Some(state) = state.borrow_mut().as_mut() {

@@ -23,7 +23,6 @@ fn host_guard(value: f32) -> Option<u16> {
 /// round RNE on both sides (2^-24 -> 0x0001, 2^-20 -> 0x0010).
 #[test]
 fn kv_f16_rows_match_the_host_guard_bit_for_bit() {
-    // Host-twin self-consistency: hand-verified f16 facts.
     assert_eq!(
         host_guard(f32::from_bits(0x477ff000)),
         None,
@@ -66,7 +65,6 @@ fn kv_f16_rows_match_the_host_guard_bit_for_bit() {
     let stream = ctx.stream().unwrap();
     let baseline = ctx.live_bytes();
     {
-        // (f32 bits, label) — the expectation comes from host_guard(bits).
         let cases: [(u32, &str); 26] = [
             (0x00000000, "+0"),
             (0x80000000, "-0 (f16-exact accept)"),
@@ -150,16 +148,12 @@ fn kv_f16_rows_match_the_host_guard_bit_for_bit() {
                 None => assert_eq!(got, 0, "reject {label} {bits:#010x} at {i}"),
             }
         }
-        // The tail past the region stays untouched.
         assert!(written[half_bytes..].iter().all(|&byte| byte == 0xa5));
     }
     stream.synchronize().unwrap();
     assert_eq!(ctx.live_bytes(), baseline, "device allocations returned");
 }
 
-/// Exhaustive clean-input sweep: every f32 whose low 16 bits are zero
-/// (hi16 << 16 over the full 65,536-entry range) plus dirty low-bit samples
-/// (1, 0x8000, 0xf000, 0xffff on several exponents), all against host_guard.
 #[test]
 fn kv_f16_exhaustive_clean_sweep_matches_host() {
     // Host twin pinned on sweep corners before any device need.

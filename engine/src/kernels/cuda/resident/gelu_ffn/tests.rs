@@ -46,7 +46,6 @@ fn matches_the_frozen_reference() {
     }
 }
 
-/// The wrapper refuses a width that is not a multiple of 32 before any native call.
 #[test]
 fn refuses_a_width_that_is_not_a_multiple_of_32() {
     if !testkit::device_present("gelu_ffn width refusal") {

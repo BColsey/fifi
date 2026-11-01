@@ -108,7 +108,6 @@ fn batch_chunk_cache_preserves_union_and_final_ring_without_row_writes() {
         assert!(held.is_some());
         check(&mut k, &query_k, origin, start + rows - origin, false);
         check(&mut k, &query_v, origin, start + rows - origin, true);
-        // A subsequent block exposes the committed tail, without altering old published views.
         let next = start + rows;
         let next_plan = ChunkCachePlan::new(layer, next, 2, 8192).unwrap();
         let next_k = input(&mut k, next, 2, false);
@@ -129,9 +128,6 @@ fn batch_chunk_cache_preserves_union_and_final_ring_without_row_writes() {
     }
 }
 
-/// Growing a full plane must preserve every committed row and keep chunking
-/// across the old capacity identical to a plane that started big. The grown
-/// plane and the direct plane must read back equal.
 #[test]
 fn batch_chunk_cache_grow_preserves_rows_across_the_old_capacity() {
     let _serial = crate::native_test_lock();
@@ -550,10 +546,6 @@ fn chained_commit_matches_fenced_bytes_across_the_swa_wrap() {
                         .unwrap();
                 // Same armed-process guard as the fenced-bytes test: the
                 // consumer reads only the visible rows of the union.
-                // In an armed process the routed full planes hand out the
-                // WHOLE plane; slice the consumer's view to the visible rows
-                // so both arms compare the same bytes (the commits below
-                // keep the original views).
                 let visible = plan.p0 + plan.rows;
                 let (consumer_keys, consumer_values) = if union_keys.shape()[1] > visible {
                     (

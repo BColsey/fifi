@@ -156,7 +156,6 @@ pub(super) fn place(caps: Activations) -> Result<Placement, EngError> {
 }
 
 impl Workspace {
-    /// Allocates one workspace that holds `caps`, on the adapter of `lease`.
     pub(super) fn allocate(lease: &Rc<Lease>, caps: Activations) -> Result<Self, EngError> {
         let placement = place(caps)?;
         let buffer = DeviceBuffer::allocate(lease, placement.total)?;
@@ -168,7 +167,6 @@ impl Workspace {
         })
     }
 
-    /// Takes a hold on the current allocation.
     pub(super) fn hold(&self) -> ArenaHold {
         self.holds.take()
     }

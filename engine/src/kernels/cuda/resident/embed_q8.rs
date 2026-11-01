@@ -20,10 +20,8 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::embed_q8::{EmbedQ8Raw, embed_q8_launch};
 
-/// The most tokens one gather takes.
 pub(crate) const EMBED_Q8_MAX_TOKENS: usize = 4096;
 
-/// One gather call: the table blocks, the ids and the f32 output rows.
 pub(crate) struct EmbedQ8Call<'b> {
     pub(crate) out: DeviceRange<'b>,
     pub(crate) w: DeviceRange<'b>,
@@ -34,7 +32,6 @@ pub(crate) struct EmbedQ8Call<'b> {
 }
 
 impl CudaContext {
-    /// Queues the gather of call on stream, writing call.out.
     pub(crate) fn embed_q8(
         &self,
         stream: &DeviceStream,

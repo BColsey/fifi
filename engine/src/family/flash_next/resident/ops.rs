@@ -1,5 +1,3 @@
-//! Shared resident helpers: constants, the operation context, projections, and host tensors.
-
 use super::super::step::ModelShape;
 use super::qsa::{MASK_OFF, MAX_POSITIONS};
 use crate::{
@@ -8,7 +6,6 @@ use crate::{
     tensor::{Dtype, ExecutionTensor, Tensor},
 };
 
-/// Reports a batched import that returned a different tensor count than requested.
 pub(super) fn short_import() -> EngError {
     EngError::Backend {
         operation: "import_many",
@@ -16,12 +13,10 @@ pub(super) fn short_import() -> EngError {
     }
 }
 
-/// Converts a host dimension to a resident shape dimension.
 pub(super) fn dim(n: usize) -> Result<u32, EngError> {
     u32::try_from(n).map_err(|_| EngError::BadRequest("resident dimension exceeds u32".into()))
 }
 
-/// Builds an F32 host tensor. `Tensor::try_from_host` rejects a length that differs from the shape.
 pub(super) fn f32_tensor(shape: Vec<u32>, values: &[f32]) -> Result<Tensor, EngError> {
     Tensor::try_from_host(
         Dtype::F32,
@@ -30,7 +25,6 @@ pub(super) fn f32_tensor(shape: Vec<u32>, values: &[f32]) -> Result<Tensor, EngE
     )
 }
 
-/// Builds a U32 host tensor.
 pub(super) fn u32_tensor(shape: Vec<u32>, values: &[u32]) -> Result<Tensor, EngError> {
     Tensor::try_from_host(
         Dtype::U32,
@@ -39,7 +33,6 @@ pub(super) fn u32_tensor(shape: Vec<u32>, values: &[u32]) -> Result<Tensor, EngE
     )
 }
 
-/// Builds an F32 host tensor of zeros.
 pub(super) fn zeros(shape: Vec<u32>) -> Result<Tensor, EngError> {
     let bytes = shape
         .iter()
@@ -74,7 +67,6 @@ pub(super) fn values(
 pub(super) struct Bytes(u64);
 
 impl Bytes {
-    /// Adds `bytes`.
     pub(super) fn add(&mut self, bytes: u64) -> Result<(), EngError> {
         self.0 = self
             .0
@@ -82,11 +74,9 @@ impl Bytes {
             .ok_or_else(|| EngError::MemoryPlan("resident byte count overflows u64".into()))?;
         Ok(())
     }
-    /// Adds one resident tensor.
     pub(super) fn tensor(&mut self, tensor: &ExecutionTensor) -> Result<(), EngError> {
         self.add(tensor.byte_len())
     }
-    /// Adds the payload, scales, and biases of a packed weight.
     pub(super) fn packed(&mut self, weight: &ResidentPackedWeight) -> Result<(), EngError> {
         self.tensor(weight.payload())?;
         self.tensor(weight.scales())?;
@@ -95,7 +85,6 @@ impl Bytes {
         }
         Ok(())
     }
-    /// The total in bytes.
     pub(super) fn total(&self) -> u64 {
         self.0
     }
@@ -183,7 +172,6 @@ impl Consts {
             rank_keep: next()?,
         })
     }
-    /// Adds the constants' bytes to `total`.
     pub(super) fn bytes(&self, total: &mut Bytes) -> Result<(), EngError> {
         for tensor in [
             &self.zero,
@@ -205,7 +193,6 @@ impl Consts {
     }
 }
 
-/// The adapter and the constants that every resident block uses.
 pub(super) struct Ctx<'k> {
     pub(super) kernels: &'k mut MlxKernels,
     pub(super) consts: &'k Consts,
@@ -246,7 +233,6 @@ pub(super) fn rms0_rows(
     ctx.kernels.binary(BinaryOp::Mul, &unit, w1p)
 }
 
-/// Asserts element-wise closeness within 1e-5 (test helper).
 #[cfg(test)]
 pub(super) fn assert_close(actual: &[f32], expected: &[f32], what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length");

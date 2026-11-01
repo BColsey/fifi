@@ -59,7 +59,6 @@ pub(crate) use stream_nvfp4::project as project_nvfp4_batch;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) use stream_nvfp4::read_f32_rows as project_nvfp4_read;
 
-/// One routed expert of one MoE layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpertId {
     pub layer: u32,

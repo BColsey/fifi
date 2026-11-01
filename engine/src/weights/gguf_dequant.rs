@@ -483,7 +483,6 @@ pub fn repack_nvfp4_into(
     Ok(())
 }
 
-/// Dequantizes whole blocks of `ty` from `src` into a new vector.
 pub fn dequantize(ty: GgufType, src: &[u8]) -> Result<Vec<f32>, EngError> {
     let (_, _, _, values) = plan(ty, src.len())?;
     let mut out = vec![0f32; values];

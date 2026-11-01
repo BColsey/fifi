@@ -51,15 +51,12 @@ const I32: usize = size_of::<i32>();
 /// The width quantum of `swiglu_pack` (`k_pad`, the pack kernel's `WIDTH_QUANTUM`).
 const PACK_WIDTH: usize = 256;
 
-/// The dims of one MoE block: the row count of the step and the MoE geometry. No model number
-/// lives here; [`Self::new`] reads the checked step dims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MoeDims {
     /// Token rows; stage 1 runs this block at one row (verify windows need their own sizing).
     pub(super) rows: usize,
     /// Hidden size: the router and shared-projection width, the residual width.
     pub(super) hidden: usize,
-    /// Routed experts of the layer.
     pub(super) n_expert: usize,
     /// Experts picked per row.
     pub(super) top_k: usize,
@@ -70,7 +67,6 @@ pub(super) struct MoeDims {
 }
 
 impl MoeDims {
-    /// The block dims of the checked step `dims` at `rows` rows.
     pub(super) fn new(dims: &StepDims, rows: usize) -> Self {
         let moe = &dims.shape.moe;
         Self {
@@ -84,7 +80,6 @@ impl MoeDims {
     }
 }
 
-/// One launch of the MoE block, as data. The launcher dispatches on it; the tests check it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MoeOp {
     /// The router: ids, pick weights, shared gate, fault bit.
@@ -132,8 +127,7 @@ pub(super) enum MoeOp {
 /// combine. `top_k` slots make `3 * top_k + 14` ops.
 pub(super) fn moe_sequence(top_k: usize, layout: WeightLayout) -> Vec<MoeOp> {
     if layout == WeightLayout::Native {
-        // The router keeps the first place and its bytes (the tiered expert hook reads them there);
-        // the per-slot triples collapse to one merged launch each, so a Native block is 10 ops.
+        // The per-slot triples collapse to one merged launch each, so a Native block is 10 ops.
         return vec![
             MoeOp::Router,
             MoeOp::ExpertGateQ,
@@ -267,11 +261,8 @@ pub(super) fn op_slots(op: MoeOp) -> OpSlots {
 /// Ranges of different allocations never overlap, so `buffer` is compared by identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RangeFacts {
-    /// Byte offset inside the allocation.
     pub(super) offset: usize,
-    /// Bytes of the range.
     pub(super) bytes: usize,
-    /// Identity of the allocation.
     pub(super) buffer: usize,
 }
 
@@ -282,14 +273,12 @@ pub(super) struct StackFacts {
     pub(super) rows: usize,
     /// Values per row.
     pub(super) k: usize,
-    /// Experts of the stack.
     pub(super) experts: usize,
 }
 
 /// The geometry of one dense projection weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ProjFacts {
-    /// Rows of the weight.
     pub(super) rows: usize,
     /// Values per row.
     pub(super) k: usize,
@@ -297,25 +286,17 @@ pub(super) struct ProjFacts {
 
 /// The weights of the block as plain facts, for [`check_block`] without a device.
 pub(super) struct WeightFacts {
-    /// The raw F32 router matrix allocation.
     pub(super) router: RangeFacts,
     /// The raw F32 shared-gate vector allocation.
     pub(super) router_shared: RangeFacts,
-    /// The gate stack.
     pub(super) gate: StackFacts,
-    /// The up stack.
     pub(super) up: StackFacts,
-    /// The down stack.
     pub(super) down: StackFacts,
-    /// The shared expert's gate projection.
     pub(super) shared_gate: ProjFacts,
-    /// The shared expert's up projection.
     pub(super) shared_up: ProjFacts,
-    /// The shared expert's down projection.
     pub(super) shared_down: ProjFacts,
 }
 
-/// The routing and residual ranges of the block as plain facts.
 pub(super) struct RouteFacts {
     /// f32 `[hidden]`: the residual after the mixer add, the block input.
     pub(super) resid_in: RangeFacts,
@@ -335,7 +316,6 @@ pub(super) struct RouteFacts {
     pub(super) status: RangeFacts,
 }
 
-/// The expert ranges of the block as plain facts.
 pub(super) struct ExpertFacts {
     /// The input packs of the block (`xf_moe`/`xf_down`/`xf_shared` of the Tiled block, the
     /// q8_1 packs `Q8Moe`/`Q8Down`/`Q8Shared` of the Native block), with their kind.
@@ -367,7 +347,6 @@ pub(super) enum Packs<'b> {
     },
 }
 
-/// The kind of a pack view, for the pure size checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PackKind {
     Xf,
@@ -417,7 +396,6 @@ impl Packs<'_> {
     }
 }
 
-/// The pack views as plain facts: the kind beside the three ranges.
 pub(super) struct PackFacts {
     pub(super) kind: PackKind,
     pub(super) moe: RangeFacts,
@@ -703,11 +681,8 @@ pub(super) struct MoeLayerWeights<'w> {
     pub(super) up: StackWeights<'w>,
     /// The down stack of all routed experts.
     pub(super) down: StackWeights<'w>,
-    /// The shared expert's gate projection.
     pub(super) shared_gate: DenseWeight<'w>,
-    /// The shared expert's up projection.
     pub(super) shared_up: DenseWeight<'w>,
-    /// The shared expert's down projection.
     pub(super) shared_down: DenseWeight<'w>,
 }
 
@@ -1353,11 +1328,6 @@ fn launch_op(
     }
 }
 
-/// The MoE block of one layer at one token on the one stream: every pure refusal first
-/// ([`check_block`], so a captured block cannot be half queued), then the fixed list of
-/// [`moe_sequence`], one wrapper call per op. The function makes no allocation, copies nothing and
-/// never syncs; eager and captured steps call the same one, and no host value depends on device
-/// data.
 pub(super) fn run_moe_block(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,

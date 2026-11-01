@@ -1,8 +1,3 @@
-/**
- * Monitor view: engine state, models, and the live speed panel from the
- * shipped routes (the recent-requests server extension) .
- */
-
 import {
   ApiError,
   getHealth,

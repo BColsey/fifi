@@ -40,14 +40,10 @@ use crate::kernels::cuda::native::{TileVec, Tiled, TiledType};
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream, NativeWeight, TiledWeight};
 
-/// The most tokens one gather takes.
 pub(crate) const EMBED_MAX_TOKENS: usize = 4096;
-/// The most rows of the table.
 const EMBED_MAX_ROWS: usize = 1 << 28;
-/// The most values per row of the table.
 const EMBED_MAX_K: usize = 32768;
 
-/// The table, the token ids, the output rows and the step status word of one gather.
 pub(crate) struct EmbedCall<'b> {
     /// The tiled token embedding, Q4_K or Q8_0.
     pub(crate) weight: &'b TiledWeight,
@@ -57,19 +53,15 @@ pub(crate) struct EmbedCall<'b> {
     pub(crate) x: DeviceRange<'b>,
     /// The step status word (4-byte offset, at least 4 bytes); a bad id ORs bit 4 into it.
     pub(crate) status: DeviceRange<'b>,
-    /// Tokens: `1..=EMBED_MAX_TOKENS`.
     pub(crate) m: usize,
 }
 
-/// Bytes of the output of `m` rows of `k` floats: `4 * m * k`. `BadRequest` on overflow.
 pub(crate) fn embed_x_bytes(m: usize, k: usize) -> Result<usize, EngError> {
     m.checked_mul(k)
         .and_then(|values| values.checked_mul(size_of::<f32>()))
         .ok_or_else(|| EngError::BadRequest("the CUDA embedding output size overflows".to_owned()))
 }
 
-/// `BadRequest` unless the table is a gather shape: `n_rows` a multiple of 8 in `8..=2^28` and
-/// `k` a multiple of 256 in `256..=32768`.
 pub(crate) fn check_shape(n_rows: usize, k: usize) -> Result<(), EngError> {
     let rows_ok = (8..=EMBED_MAX_ROWS).contains(&n_rows) && n_rows.is_multiple_of(8);
     let k_ok = (256..=EMBED_MAX_K).contains(&k) && k.is_multiple_of(256);
@@ -107,7 +99,6 @@ pub(crate) struct EmbedNativeCall<'b> {
     pub(crate) x: DeviceRange<'b>,
     /// The step status word (4-byte offset, at least 4 bytes); a bad id ORs bit 4 into it.
     pub(crate) status: DeviceRange<'b>,
-    /// Tokens: `1..=EMBED_MAX_TOKENS`.
     pub(crate) m: usize,
 }
 
@@ -166,7 +157,6 @@ impl CudaContext {
         self.launch_on(stream, |stream_raw| embed_native_launch(stream_raw, &raw))
     }
 
-    /// Every check of a native gather, then the native view of its ranges.
     fn plan_embed_native<'b>(
         &self,
         call: &EmbedNativeCall<'b>,
@@ -224,7 +214,6 @@ impl CudaContext {
         })
     }
 
-    /// Every check of a gather, then the native view of its ranges.
     fn plan_embed<'b>(&self, call: &EmbedCall<'b>) -> Result<EmbedRaw<'b>, EngError> {
         let (ids_raw, x_raw, status_raw) = (
             self.raw_range(&call.ids)?,
@@ -275,7 +264,6 @@ impl CudaContext {
     }
 }
 
-/// Bytes of the tiles of the table.
 fn tile_bytes(layout: Tiled) -> Result<usize, EngError> {
     layout
         .tile_vecs()

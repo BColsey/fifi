@@ -22,11 +22,8 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// The role chunk is next.
     Role,
-    /// The job is running.
     Running,
-    /// The stream has ended.
     Finished,
 }
 
@@ -45,12 +42,9 @@ struct Streaming {
     running: RunningJob,
     shape: Shape,
     phase: Phase,
-    /// The number of tool calls sent so far.
     calls: u32,
 }
 
-/// Builds the streaming response of an admitted job. The stream starts with the role chunk at
-/// once. `keep_alive` is the quiet interval after which a comment goes out.
 /// Dropping the response drops the job, which cancels it.
 pub(crate) fn respond(head: ReplyHead, running: RunningJob, keep_alive: Duration) -> Response {
     start_stream(Shape::Chat, head, running, keep_alive)
@@ -86,7 +80,6 @@ fn start_stream(
         .into_response()
 }
 
-/// Produces the events of the next step. It returns no events for a step without news.
 async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
     let events = match state.phase {
         Phase::Finished => return None,
@@ -120,7 +113,6 @@ async fn advance(mut state: Streaming) -> Option<(Vec<Event>, Streaming)> {
     Some((events, state))
 }
 
-/// Turns reply parts into chunks. A tool call becomes a start entry and an arguments entry.
 fn piece_events(state: &mut Streaming, pieces: Vec<Piece>) -> Vec<Event> {
     let mut events = Vec::new();
     for piece in pieces {
@@ -236,7 +228,6 @@ mod tests {
         serde_json::from_str(&event.data).expect("chunk json")
     }
 
-    /// The `delta` objects of the data events, without the final `[DONE]`.
     fn deltas(events: &[SseEvent]) -> Vec<Value> {
         events
             .iter()

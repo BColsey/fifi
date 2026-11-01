@@ -34,9 +34,7 @@ impl SessionBudget {
         self.used.get()
     }
 
-    /// The bytes the budget can still charge: the cap over the used bytes.
-    /// Crate-visible only - this is the executors' pool-derived prompt ceiling, not public
-    /// API. The only caller is the Mac-only Q36 resident executor, so a non-Mac build
+    /// The only caller is the Mac-only Q36 resident executor, so a non-Mac build
     /// cannot see the use.
     #[allow(dead_code)]
     pub(crate) fn free(&self) -> u64 {
@@ -61,20 +59,16 @@ impl SessionBudget {
     }
 }
 
-/// One growth charge against a session budget. The charge is SHAREABLE: `share` produces a
-/// co-owned permit that holds the SAME bytes, and the budget counts those bytes exactly
-/// once no matter how many co-owners live - only the last one's drop releases them. The
-/// shared state carries the counter and the bytes as an Option taken by the last dropper.
+/// The charge is SHAREABLE: `share` produces a co-owned permit that holds the
+/// SAME bytes, and the budget counts those bytes exactly once no matter how many
+/// co-owners live - only the last one's drop releases them.
 pub struct GrowthPermit {
     shared: SharedCharge,
 }
 
-/// The budget counter and the charged bytes, co-owned by every share of one permit.
 type SharedCharge = Rc<RefCell<Option<(Rc<Cell<u64>>, u64)>>>;
 
 impl GrowthPermit {
-    /// A co-owned permit sharing this charge: the budget counts the bytes once while any
-    /// co-owner lives, and the last drop releases them.
     pub fn share(&self) -> Self {
         Self {
             shared: Rc::clone(&self.shared),
@@ -105,8 +99,6 @@ mod tests {
         Some(EngError::MemoryPlan(message.to_string()))
     }
 
-    /// A new budget has charged nothing, and each permit charges its bytes until it drops.
-    ///
     /// Mutation check: acquiring without `self.used.set(next)` leaves `used` at 0 after the
     /// first grant.
     #[test]
@@ -126,9 +118,6 @@ mod tests {
         );
     }
 
-    /// The cap is inclusive: growth that lands exactly on it is granted, one byte more is
-    /// refused, and the refusal names the request and what was left.
-    ///
     /// Mutation check: comparing with `next >= self.cap` refuses the grant that fills the
     /// budget.
     #[test]
@@ -152,9 +141,6 @@ mod tests {
         );
     }
 
-    /// A refused request charges nothing: the live permits still release exactly their own
-    /// bytes, so the budget returns to zero rather than underflowing.
-    ///
     /// Mutation check: setting `used` before the cap comparison leaves `used` at 101 after
     /// the refusal.
     #[test]
@@ -167,9 +153,6 @@ mod tests {
         assert_eq!(budget.used(), 0, "the one live permit released its 70");
     }
 
-    /// Dropping a permit returns exactly its bytes, in any drop order, and the freed room
-    /// can be granted again.
-    ///
     /// Mutation check: a `drop` that resets `used` to 0 instead of subtracting reports 0 after
     /// the first drop instead of 70.
     #[test]
@@ -189,9 +172,6 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// A zero-byte permit is granted even when the budget is full, and it charges and
-    /// releases nothing. A zero cap grants nothing else.
-    ///
     /// Mutation check: refusing when `next >= self.cap` fails the zero-byte grant on a full
     /// budget and on the zero cap.
     #[test]
@@ -215,9 +195,6 @@ mod tests {
         );
     }
 
-    /// Growth that would wrap `u64` is refused as an overflow, not as a cap miss, and
-    /// charges nothing. A cap of `u64::MAX` still admits a grant that lands on it.
-    ///
     /// Mutation check: `wrapping_add` instead of `checked_add` grants the request.
     #[test]
     fn growth_that_overflows_u64_is_refused_without_charging() {
@@ -238,9 +215,6 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// A permit holds its own share of the counter, so it may outlive the budget that issued
-    /// it and still release its bytes (the counter lives in the shared tuple that both the
-    /// budget and every permit hold, so dropping the budget keeps the count).
     #[test]
     fn a_permit_may_outlive_its_budget() {
         let mut budget = SessionBudget::new(10);
@@ -251,16 +225,14 @@ mod tests {
             10,
             "the charge outlives the budget"
         );
-        // The permit holds the counter Rc beside the dropped budget, so its drop
-        // releases without a dangling reference; the release itself is pinned by
+        // The release itself is pinned by
         // a_shared_permit_counts_once_and_releases_on_the_last_drop below, which
         // observes the same counter through a living budget.
         drop(permit);
     }
 
-    /// The shareable charge counts once and only the last drop releases it - the portable
-    /// pin of the shared-charge linchpin the snapshot permits and the session budget
-    /// arithmetic rest on.
+    /// The portable pin of the shared-charge linchpin the snapshot permits and
+    /// the session budget arithmetic rest on.
     #[test]
     fn a_shared_permit_counts_once_and_releases_on_the_last_drop() {
         let mut budget = SessionBudget::new(10);

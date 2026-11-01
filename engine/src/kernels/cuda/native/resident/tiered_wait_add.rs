@@ -66,7 +66,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one wait-add launch reads and writes; the layout of every range is in `tiered_wait_add.h`.
+/// The layout of every range is in `tiered_wait_add.h`.
 pub(in crate::kernels::cuda) struct WaitAddRaw<'a> {
     pub(in crate::kernels::cuda) ctrl: RawRange<'a>,
     pub(in crate::kernels::cuda) word: RawRange<'a>,
@@ -77,13 +77,12 @@ pub(in crate::kernels::cuda) struct WaitAddRaw<'a> {
     pub(in crate::kernels::cuda) timeout_ns: u64,
 }
 
-/// The integers of a call inside the limits of `valid()` in the `.cu` file, as `usize`.
+/// The integers of a call inside the limits of `valid()` in the `.cu` file.
 struct Shape {
     hidden: usize,
 }
 
-/// The shape of the integers of `call`, or `None` outside the limits (the same test as `shapes_ok`
-/// of the `.cu` file).
+/// The shape limits, the same test as `shapes_ok` of the `.cu` file.
 fn shape(call: &WaitAddRaw<'_>) -> Option<Shape> {
     let hidden = usize::try_from(call.hidden).ok()?;
     let inside = (4..=MAX_HIDDEN).contains(&hidden)
@@ -96,7 +95,6 @@ fn shape(call: &WaitAddRaw<'_>) -> Option<Shape> {
 /// writes it.
 type Region<'c, 'a> = (&'c RawRange<'a>, usize, usize, bool);
 
-/// The five ranges of a call.
 fn regions<'c, 'a>(call: &'c WaitAddRaw<'a>, s: &Shape) -> [Region<'c, 'a>; 5] {
     let row = s.hidden * 4;
     [
@@ -108,8 +106,6 @@ fn regions<'c, 'a>(call: &'c WaitAddRaw<'a>, s: &Shape) -> [Region<'c, 'a>; 5] {
     ]
 }
 
-/// Proves a wait-add launch before the native call: the limits, the size and alignment of every
-/// range, and that every range the kernel writes (`resid`, `word`) overlaps no other range.
 fn check_wait_add(call: &WaitAddRaw<'_>) -> Result<(), DeviceFailure> {
     let s = shape(call).ok_or_else(invalid_argument)?;
     let regions = regions(call, &s);
@@ -131,7 +127,6 @@ fn check_wait_add(call: &WaitAddRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the wait-add of `call` on `stream`: one kernel. Returns when it is queued.
 pub(in crate::kernels::cuda) fn tiered_wait_add_launch(
     stream: &RawStream,
     call: &WaitAddRaw<'_>,

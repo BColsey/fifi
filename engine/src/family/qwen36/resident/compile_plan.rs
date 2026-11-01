@@ -27,7 +27,6 @@ pub(super) struct WeightFacts {
 pub(super) struct DeltaLayerFacts {
     /// The layer index in the decoder's layer list (the refusal text and the warm-up name it).
     pub(super) layer: usize,
-    /// The hidden width `H`.
     pub(super) hidden: u32,
     /// The eight checked dimensions of the block (`compile_key::checked_delta_dims`).
     pub(super) dims: [u32; 8],
@@ -44,13 +43,9 @@ pub(super) struct DeltaLayerFacts {
 /// the seam's order.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MoeLayerFacts {
-    /// The layer index in the decoder's layer list.
     pub(super) layer: usize,
-    /// The hidden width `H`.
     pub(super) hidden: u32,
-    /// The expert count `E`.
     pub(super) experts: u32,
-    /// The routing width `k`.
     pub(super) top_k: u32,
     /// 1 when the gates renormalize over the selection, 0 otherwise.
     pub(super) renorm: u32,
@@ -191,7 +186,6 @@ mod tests {
         }
     }
 
-    /// The DeltaNet facts of one layer: index, block constants, and weights of one bit width.
     fn delta_layer(layer: usize, bits: i32) -> DeltaLayerFacts {
         DeltaLayerFacts {
             layer,
@@ -203,7 +197,6 @@ mod tests {
         }
     }
 
-    /// The MoE facts of one layer: index, block constants, and weights of one bit width.
     fn moe_layer(layer: usize, bits: i32) -> MoeLayerFacts {
         MoeLayerFacts {
             layer,

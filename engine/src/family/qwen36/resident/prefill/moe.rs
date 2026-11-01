@@ -39,7 +39,6 @@ use crate::{
     tensor::{ExecutionTensor, Tensor},
 };
 
-/// Shared expert `sigmoid(x · s) * down(silu(gate(x)) * up(x))` for `x` `[T, H]`, as `[T, H]`.
 /// The shared expert in kernel-ready parts: the down projection `so` `[T, H]` and the scalar
 /// logit `raw` `[T, 1]` (the fused MoE combine folds `sigmoid(raw) * so` itself).
 fn shared_parts(
@@ -621,7 +620,6 @@ mod tests {
         );
     }
 
-    /// Reads a U32 resident back as words.
     fn read_u32(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u32> {
         let host = kernels.readback(tensor).unwrap();
         assert_eq!(host.dtype(), Dtype::U32, "readback dtype");

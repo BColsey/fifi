@@ -55,13 +55,11 @@ const GENERATED: usize = 16;
 /// order may differ between the two arenas only in the last bits.
 const ROW_BOUND: f64 = 1e-3;
 
-/// What one greedy decode hands back: the chosen ids and the logits row each came from.
 struct Run {
     tokens: Vec<u32>,
     rows: Vec<Vec<u8>>,
 }
 
-/// Both decodes and the arena bytes each one ran on.
 struct Pair {
     planned: Run,
     wide: Run,

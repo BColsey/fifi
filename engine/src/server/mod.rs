@@ -1,6 +1,4 @@
-//! The HTTP server: authentication, validation, routing, and reply writers.
-//!
-//! Design: the server design. Contract: `api/openapi.yaml`.
+//! Contract: `api/openapi.yaml`.
 //! The server keeps a fixed dependency set, hand-written wire types, and one error wrapper.
 
 pub(crate) mod anthropic;

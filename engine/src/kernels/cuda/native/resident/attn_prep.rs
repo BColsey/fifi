@@ -80,8 +80,6 @@ pub(in crate::kernels::cuda) struct AttnInts {
     pub(in crate::kernels::cuda) ld: c_int,
 }
 
-/// What one attention preparation reads and writes: the converted ranges, the integers and the
-/// rope scalars.
 pub(in crate::kernels::cuda) struct AttnPrepRaw<'a> {
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
     pub(in crate::kernels::cuda) q_norm: RawRange<'a>,
@@ -96,7 +94,6 @@ pub(in crate::kernels::cuda) struct AttnPrepRaw<'a> {
     pub(in crate::kernels::cuda) rope_base: f32,
 }
 
-/// The bytes each range must hold.
 struct Needs {
     proj: usize,
     norm: usize,
@@ -104,12 +101,10 @@ struct Needs {
     cache: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -132,12 +127,10 @@ fn needs(ints: &AttnInts) -> Result<Needs, DeviceFailure> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// Sizes and alignment of the eight ranges: `q`, `k_cache` and `v_cache` 16, the rest 4.
 fn check_fit(io: &AttnPrepRaw<'_>, need: &Needs) -> bool {
     fits(&io.proj, need.proj, 4)
         && fits(&io.q_norm, need.norm, 4)
@@ -149,10 +142,8 @@ fn check_fit(io: &AttnPrepRaw<'_>, need: &Needs) -> bool {
         && fits(&io.status, 4, 4)
 }
 
-/// Proves a launch before the native call: the shape integers, sizes and alignment of every range
-/// and that the four ranges the kernel writes (`q`, both caches and `status`) share no byte with
-/// each other or with the four it reads. The touched extents are compared, not the whole ranges,
-/// so `pos` and `status` may sit in one block.
+/// The touched extents are compared, not the whole ranges, so `pos` and `status` may sit in
+/// one block.
 fn check_attn_prep(io: &AttnPrepRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(&io.ints)?;
     if !check_fit(io, &need) {
@@ -180,7 +171,7 @@ fn check_attn_prep(io: &AttnPrepRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the attention preparation kernel on `stream`: per-head RMSNorm of q and k, rope at the
-/// device position, the `q` output and the KV append. Returns when it is queued.
+/// device position, the `q` output and the KV append.
 pub(in crate::kernels::cuda) fn attn_prep_launch(
     stream: &RawStream,
     call: AttnPrepRaw<'_>,

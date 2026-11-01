@@ -14,7 +14,6 @@ pub(crate) const DEFAULT_VOCAB_SIZE: u32 = 248_077;
 /// Prompt tokens per `prefill` call. At 0.246 s per token a chunk of 16 takes about 4 s, which
 /// bounds how long a cancellation waits.
 pub(crate) const DEFAULT_PREFILL_CHUNK: u32 = 16;
-/// The largest accepted prefill chunk.
 pub(crate) const MAX_PREFILL_CHUNK: u32 = 512;
 
 /// The `flash_next` object of an engine entry. Every member is optional.
@@ -27,9 +26,8 @@ pub(crate) struct FlashOptions {
     /// The MLX allocator cache limit in bytes. Fallback: `FLASH_NEXT_CACHE_LIMIT`. There is no
     /// default.
     pub(crate) cache_limit_bytes: Option<u64>,
-    /// The vocabulary size of `tokenizer.json`. The default is 248,077.
     pub(crate) tokenizer_vocab_size: Option<u32>,
-    /// The prompt tokens per `prefill` call, from 1 to 512. The default is 16.
+    /// From 1 to 512.
     pub(crate) prefill_chunk: Option<u32>,
     /// Records speculative next-layer expert hints in one-token steps. The default is false.
     /// Hints do not stage storage or change routing.
@@ -45,7 +43,6 @@ pub(crate) struct FlashEnv {
     pub(crate) cache_limit: Option<String>,
 }
 
-/// The checked settings of one Flash-Next engine.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FlashSettings {
     /// The artifact directory with the safetensors shards and `config.json`.
@@ -53,13 +50,10 @@ pub(crate) struct FlashSettings {
     /// The directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, and
     /// `generation_config.json`.
     pub(crate) tokenizer_dir: PathBuf,
-    /// The artifact manifest that pins the tokenizer files.
     pub(crate) manifest: PathBuf,
     /// The MLX allocator cache limit in bytes.
     pub(crate) cache_limit: u64,
-    /// The vocabulary size of `tokenizer.json`.
     pub(crate) tokenizer_vocab_size: u32,
-    /// The prompt tokens per `prefill` call.
     pub(crate) prefill_chunk: u32,
     /// The default-off expert hint seam. It performs no prefetch I/O in this slice.
     pub(crate) expert_prefetch: bool,

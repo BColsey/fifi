@@ -1,12 +1,7 @@
 //! GGUF model opener for Qwen3.6-35B-A3B.
 //!
-//! `open_qwen3_6_35b_a3b` opens one single-file GGUF under the `LIMITS` header and tensor limits,
-//! checks `general.architecture` and the block, embedding, expert and used-expert counts, matches
-//! the tensor set against the `inventory` exactly, checks every tensor's type and dims, and checks
-//! the CUDA tile rules of the `DeviceTiled` tensors. The open is strict: a tensor of any type the
-//! role does not allow, an extra or missing tensor, or a wrong count fails and names the tensor or
-//! key. There is no skip mode. The public surface is `open_qwen3_6_35b_a3b`, `GgufModel`,
-//! `ModelPlan` and `TensorPath`.
+//! The open is strict: a tensor of any type the role does not allow, an extra or missing
+//! tensor, or a wrong count fails and names the tensor or key. There is no skip mode.
 
 use std::{
     collections::HashMap,
@@ -31,7 +26,6 @@ pub use inventory::TensorPath;
 
 /// `general.architecture` of the llama.cpp conversion of Qwen3.6-35B-A3B.
 const ARCHITECTURE: &str = "qwen35moe";
-/// The header and per-tensor size limits of the GGUF open.
 const LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 100_000_000,
     max_tensor_bytes: 1 << 30,
@@ -41,8 +35,6 @@ const TILE_ROWS: u64 = 8;
 const TILE_COLS: u64 = 256;
 const MAX_TILE_COLS: u64 = 32768;
 
-/// Opens a Qwen3.6-35B-A3B GGUF and plans its tensors.
-///
 /// The checks of this module (metadata, tensor set, type, dims, tile rules) fail as
 /// `EngError::Checkpoint` with the prefix `gguf model: `, and the message names the
 /// tensor or metadata key. Failures of `GgufWeights::open` pass through unchanged: a
@@ -55,7 +47,6 @@ pub fn open_qwen3_6_35b_a3b(
     open_with_spec(path, header_sha256, &QWEN3_6_35B_A3B)
 }
 
-/// One opened model: the checked weights, the plan of its tensors, and the path.
 #[derive(Debug)]
 pub struct GgufModel {
     /// The CUDA projector reads the planned tensors from this reader.
@@ -73,8 +64,8 @@ impl GgufModel {
         &self.path
     }
 
-    /// Reads every `DeviceF32` tensor of the plan to the host; F32 is copied as is. This is the
-    /// oracle copy of the tensors that also sit on the device; the CUDA load does not call it.
+    /// The oracle copy of the tensors that also sit on the device; the CUDA load does not
+    /// call it.
     pub fn read_host_f32(&self) -> Result<HashMap<String, Vec<f32>>, EngError> {
         let mut host = HashMap::new();
         for (name, path) in self.plan.tensors() {
@@ -95,7 +86,6 @@ pub struct ModelPlan {
 }
 
 impl ModelPlan {
-    /// Name and path of every tensor, in inventory order.
     pub fn tensors(&self) -> impl Iterator<Item = (&str, TensorPath)> {
         self.tensors
             .iter()
@@ -109,7 +99,6 @@ impl ModelPlan {
             .count()
     }
 
-    /// Source bytes in the file of all tensors with `path`.
     pub fn source_bytes(&self, path: TensorPath) -> u64 {
         self.tensors
             .iter()
@@ -118,7 +107,7 @@ impl ModelPlan {
             .sum()
     }
 
-    /// Names of every tensor of the plan, in inventory order: each one goes to the device.
+    /// Names of every tensor of the plan: each one goes to the device.
     pub fn device_names(&self) -> Vec<&str> {
         self.tensors
             .iter()
@@ -127,7 +116,6 @@ impl ModelPlan {
     }
 }
 
-/// One classified tensor: name, load path, and source bytes in the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedTensor {
     name: String,
@@ -135,8 +123,6 @@ struct PlannedTensor {
     source_bytes: u64,
 }
 
-/// Opens `path` against `spec`: the inventory, the header and metadata checks, the
-/// exact tensor set, then the classification of every tensor in inventory order.
 fn open_with_spec(
     path: &Path,
     header_sha256: Option<&str>,
@@ -157,13 +143,10 @@ fn open_with_spec(
     })
 }
 
-/// Every opener rejection shares this prefix, so callers can tell it from the header
-/// reader's own `gguf: ` errors.
 fn reject(message: impl Into<String>) -> EngError {
     EngError::Checkpoint(format!("gguf model: {}", message.into()))
 }
 
-/// Checks `general.architecture` and the four counts that fix the tensor shapes.
 fn check_metadata(header: &GgufHeader, spec: &FamilySpec) -> Result<(), EngError> {
     match header.meta("general.architecture") {
         Some(MetaValue::String(found)) if found == ARCHITECTURE => {}
@@ -193,7 +176,7 @@ fn check_metadata(header: &GgufHeader, spec: &FamilySpec) -> Result<(), EngError
     Ok(())
 }
 
-/// Reads one count key. Only u32 and u64 are accepted; the conversion writes u32.
+/// The llama.cpp conversion writes these count keys as u32.
 fn meta_count(header: &GgufHeader, key: &str) -> Result<u64, EngError> {
     match header.meta(key) {
         Some(MetaValue::U32(value)) => Ok(u64::from(*value)),
@@ -205,8 +188,6 @@ fn meta_count(header: &GgufHeader, key: &str) -> Result<u64, EngError> {
     }
 }
 
-/// Pairs every inventory tensor with its file entry. Extra file tensors fail first
-/// in file order, then missing inventory tensors in inventory order.
 fn match_tensors<'a>(
     header: &'a GgufHeader,
     inventory: &'a Inventory,
@@ -230,8 +211,6 @@ fn match_tensors<'a>(
     Ok(pairs)
 }
 
-/// Classifies one tensor: the type within the role's allowed types, the exact dims,
-/// then the tile rules for a `DeviceTiled` tensor.
 fn classify(expected: &ExpectedTensor, tensor: &GgufTensor) -> Result<PlannedTensor, EngError> {
     let ty = tensor.ggml_type();
     let allowed = expected.allowed_types();
@@ -267,10 +246,9 @@ fn classify(expected: &ExpectedTensor, tensor: &GgufTensor) -> Result<PlannedTen
     })
 }
 
-/// The CUDA tile rules: the row count a multiple of 8 and the row length a multiple
-/// of 256 up to 32768. A rank-3 expert stack also needs its output count a multiple
-/// of 8, so every expert slice starts on a tile row group. `dims` must be non-empty:
-/// `classify` calls this only after the dims equal the inventory's, which never has none.
+/// A rank-3 expert stack also needs its output count a multiple of `TILE_ROWS`, so every
+/// expert slice starts on a tile row group. `dims` must be non-empty: `classify` calls this
+/// only after the dims equal the inventory's, which never has none.
 fn check_tiles(name: &str, dims: &[u64]) -> Result<(), EngError> {
     let cols = dims[0];
     let rows = dims[1..].iter().product::<u64>();

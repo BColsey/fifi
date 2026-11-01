@@ -44,7 +44,6 @@ impl HoldCount {
         }
     }
 
-    /// Holds taken and not yet dropped.
     pub(super) fn active(&self) -> usize {
         self.0.get()
     }
@@ -63,7 +62,6 @@ impl Drop for ArenaHold {
     }
 }
 
-/// One device allocation that holds a planned set of tensors.
 pub(crate) struct DeviceArena {
     buffer: DeviceBuffer,
     plan: ArenaPlan,
@@ -94,7 +92,6 @@ impl CudaContext {
 }
 
 impl DeviceArena {
-    /// Bytes of the allocation.
     pub(crate) fn bytes(&self) -> usize {
         self.buffer.bytes()
     }
@@ -141,12 +138,10 @@ impl DeviceArena {
         self.buffer.range(offset, bytes)
     }
 
-    /// Takes a hold on this arena.
     pub(crate) fn hold(&self) -> ArenaHold {
         self.holds.take()
     }
 
-    /// Holds of this arena that are still alive.
     pub(crate) fn holds(&self) -> usize {
         self.holds.active()
     }

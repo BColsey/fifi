@@ -1,5 +1,3 @@
-//! Builds the Flash-Next model shape and weights from a streamed checkpoint.
-
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
@@ -21,7 +19,6 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-/// Prefix of every language-model tensor name.
 const MODEL: &str = "language_model.model.";
 
 /// Model shape and per-layer attention kind (true for QSA) read from `config.json`.
@@ -31,7 +28,6 @@ pub(crate) fn model_shape(config: &[u8]) -> Result<(ModelShape, Vec<bool>), EngE
     Ok((shape, dims.kinds))
 }
 
-/// Configuration values that the loader reads, parsed once from `text_config`.
 struct Dims {
     hidden: u32,
     eps: f32,
@@ -70,17 +66,14 @@ struct Dims {
     eos: u32,
 }
 
-/// Reports a config field that is absent or has the wrong type.
 fn invalid(name: &str) -> EngError {
     EngError::Checkpoint(format!("config field {name} is missing or invalid"))
 }
 
-/// Reports a derived dimension that overflows its integer type.
 fn overflow() -> EngError {
     EngError::Checkpoint("config dimension overflows".into())
 }
 
-/// Multiplies configuration dimensions with overflow checks.
 fn product(factors: &[u32]) -> Result<u32, EngError> {
     factors
         .iter()
@@ -88,14 +81,12 @@ fn product(factors: &[u32]) -> Result<u32, EngError> {
         .ok_or_else(overflow)
 }
 
-/// Looks up a dotted path such as `rope_parameters.rope_theta`.
 fn lookup<'a>(text: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
     let mut parts = path.split('.');
     let first = parts.next()?;
     parts.try_fold(text.get(first)?, |value, part| value.get(part))
 }
 
-/// Reads an unsigned integer field that fits `u32`.
 fn number(text: &Map<String, Value>, path: &str) -> Result<u32, EngError> {
     lookup(text, path)
         .and_then(Value::as_u64)
@@ -103,7 +94,6 @@ fn number(text: &Map<String, Value>, path: &str) -> Result<u32, EngError> {
         .ok_or_else(|| invalid(path))
 }
 
-/// Reads a numeric field as f64.
 fn real(text: &Map<String, Value>, path: &str) -> Result<f64, EngError> {
     lookup(text, path)
         .and_then(Value::as_f64)
@@ -111,7 +101,6 @@ fn real(text: &Map<String, Value>, path: &str) -> Result<f64, EngError> {
 }
 
 impl Dims {
-    /// Parses and checks every configuration value that the loader reads.
     fn read(config: &[u8]) -> Result<Self, EngError> {
         let root = serde_json::from_slice::<UniqueValue>(config)
             .map_err(|error| EngError::Checkpoint(format!("configuration JSON: {error}")))?
@@ -237,7 +226,6 @@ impl Dims {
         })
     }
 
-    /// Builds the checked block shapes from these values.
     fn model_shape(&self) -> Result<ModelShape, EngError> {
         Ok(ModelShape {
             hyper: HyperShape::new(self.branches, self.hidden, self.rank, self.eps)?,
@@ -287,7 +275,6 @@ impl Dims {
     }
 }
 
-/// Owned hyper-connection weights.
 struct OwnedHyper {
     norm: Vec<f32>,
     down: StoredWeight,
@@ -296,7 +283,6 @@ struct OwnedHyper {
 }
 
 impl OwnedHyper {
-    /// Borrows these weights for `step`.
     fn view(&self) -> HyperWeights<'_, StoredWeight> {
         HyperWeights {
             norm: &self.norm,
@@ -307,7 +293,6 @@ impl OwnedHyper {
     }
 }
 
-/// Owned DeltaNet weights.
 struct OwnedDelta {
     qkv: StoredWeight,
     z: StoredWeight,
@@ -321,7 +306,6 @@ struct OwnedDelta {
 }
 
 impl OwnedDelta {
-    /// Borrows these weights for `step`.
     fn view(&self) -> DeltaWeights<'_, StoredWeight> {
         DeltaWeights {
             qkv: &self.qkv,
@@ -337,7 +321,6 @@ impl OwnedDelta {
     }
 }
 
-/// Owned QSA weights.
 struct OwnedQsa {
     q: StoredWeight,
     k: StoredWeight,
@@ -351,7 +334,6 @@ struct OwnedQsa {
 }
 
 impl OwnedQsa {
-    /// Borrows these weights for `step`.
     fn view(&self) -> QsaWeights<'_, StoredWeight> {
         QsaWeights {
             q: &self.q,
@@ -367,15 +349,11 @@ impl OwnedQsa {
     }
 }
 
-/// Owned attention weights of one layer.
 enum OwnedAttn {
-    /// A DeltaNet layer.
     Delta(OwnedDelta),
-    /// A QSA layer.
     Qsa(OwnedQsa),
 }
 
-/// Owned MoE weights.
 struct OwnedMoe {
     router: Vec<f32>,
     gate: StoredWeight,
@@ -388,7 +366,6 @@ struct OwnedMoe {
 }
 
 impl OwnedMoe {
-    /// Borrows these weights for `step`.
     fn view(&self) -> MoeWeights<'_, StoredWeight> {
         MoeWeights {
             router: &self.router,
@@ -403,7 +380,6 @@ impl OwnedMoe {
     }
 }
 
-/// Owned PLE weights.
 struct OwnedPle {
     multipliers: Vec<i64>,
     vocab: Vec<i64>,
@@ -420,7 +396,6 @@ struct OwnedPle {
 }
 
 impl OwnedPle {
-    /// Borrows these weights for `step`.
     fn view(&self) -> PleWeights<'_, StoredWeight> {
         PleWeights {
             multipliers: &self.multipliers,
@@ -439,7 +414,6 @@ impl OwnedPle {
     }
 }
 
-/// Owned weights of one decoder layer.
 struct OwnedLayer {
     attn_hyper: OwnedHyper,
     attn: OwnedAttn,
@@ -447,7 +421,6 @@ struct OwnedLayer {
     moe: OwnedMoe,
 }
 
-/// Owned Flash-Next weights.
 pub(crate) struct FlashWeights {
     shape: ModelShape,
     embed: StoredWeight,
@@ -458,7 +431,6 @@ pub(crate) struct FlashWeights {
     keys: Vec<String>,
 }
 
-/// Reads checkpoint tensors through the quantization map and records each key read.
 struct Loader<'a> {
     ckpt: &'a StreamedCheckpoint,
     quant: &'a QuantizationMap,
@@ -466,7 +438,6 @@ struct Loader<'a> {
 }
 
 impl Loader<'_> {
-    /// Returns the quantization of a module that must be quantized.
     fn spec(&self, stem: &str) -> Result<QuantizationSpec, EngError> {
         match self.quant.resolve(stem)? {
             ModuleQuantization::Quantized(spec) => Ok(spec),
@@ -476,7 +447,6 @@ impl Loader<'_> {
         }
     }
 
-    /// Records the keys of one packed or sliced module.
     fn record_module(&mut self, stem: &str, spec: QuantizationSpec) {
         self.keys.insert(format!("{stem}.weight"));
         self.keys.insert(format!("{stem}.scales"));
@@ -501,14 +471,12 @@ impl Loader<'_> {
         Ok(StoredWeight::Sliced(weight))
     }
 
-    /// Reads a host f32 tensor of `len` elements.
     fn host_f32(&mut self, key: &str, len: usize) -> Result<Vec<f32>, EngError> {
         let values = stored::host_f32(self.ckpt, key, len)?;
         self.keys.insert(key.to_string());
         Ok(values)
     }
 
-    /// Reads a host i64 tensor of `len` elements.
     fn host_i64(&mut self, key: &str, len: usize) -> Result<Vec<i64>, EngError> {
         let values = stored::host_i64(self.ckpt, key, len)?;
         self.keys.insert(key.to_string());
@@ -516,7 +484,7 @@ impl Loader<'_> {
     }
 }
 
-/// Loads one hyper-connection. The mixer has no inject projection.
+/// The mixer has no inject projection.
 fn hyper(
     loader: &mut Loader<'_>,
     prefix: &str,
@@ -673,7 +641,6 @@ fn moe(loader: &mut Loader<'_>, prefix: &str, dims: &Dims) -> Result<OwnedMoe, E
     })
 }
 
-/// Loads the PLE block of the layer whose prefix is `layer`.
 fn ple(loader: &mut Loader<'_>, layer: &str, dims: &Dims) -> Result<OwnedPle, EngError> {
     let prefix = format!("{layer}ple.");
     let ngram = dims.ngram as usize;
@@ -829,12 +796,10 @@ impl FlashWeights {
         })
     }
 
-    /// The model shape.
     pub(crate) fn shape(&self) -> &ModelShape {
         &self.shape
     }
 
-    /// A borrowed view for `step::step`.
     pub(crate) fn view(&self) -> ModelWeights<'_, StoredWeight> {
         ModelWeights {
             embed: &self.embed,

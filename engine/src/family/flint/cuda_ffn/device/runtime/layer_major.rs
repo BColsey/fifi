@@ -44,8 +44,6 @@ pub(super) trait LayerPass {
     fn execute_layer_routed_ffn(&mut self, layer: usize, rows: Range<usize>) -> Result<()>;
 }
 
-/// The layer-major order: attention for all rows of a layer, then its FFN
-/// for all rows, before the next layer starts.
 pub(super) fn drive(pass: &mut impl LayerPass, layers: usize, rows: Range<usize>) -> Result<()> {
     for layer in 0..layers {
         pass.execute_layer_attention(layer, rows.clone())?;
@@ -54,7 +52,6 @@ pub(super) fn drive(pass: &mut impl LayerPass, layers: usize, rows: Range<usize>
     Ok(())
 }
 
-/// `rows` cut into runs of at most `height`, in order.
 pub(super) fn blocks(rows: Range<usize>, height: usize) -> impl Iterator<Item = Range<usize>> {
     let end = rows.end;
     rows.step_by(height.max(1))

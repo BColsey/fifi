@@ -1,5 +1,3 @@
-/// The position, base, and rotary width of one RoPE call.
-///
 /// `pos` is the position of token 0, so token `t` has position `pos + t`. `theta` is the base of
 /// the frequency table. `part` counts rotary dimensions, not pairs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,17 +35,14 @@ mod check {
     /// The largest value of `pos + T`. An F32 position is exact up to this value.
     const MAX_POSITION_END: u64 = 1 << 24;
 
-    /// Facts about the operands of one RoPE call, computed by the caller.
     pub(crate) struct RopeOperands<'a> {
-        /// Both tensors belong to the calling adapter's native owner.
         pub(crate) owners_match: bool,
-        /// Both tensors have dtype `F32`.
         pub(crate) dtypes_f32: bool,
         pub(crate) q_shape: &'a [u32],
         pub(crate) k_shape: &'a [u32],
     }
 
-    /// What the native call needs after validation. Each output has the shape of its input.
+    /// Each output has the shape of its input.
     pub(crate) struct RopeLayout {
         pub(crate) q_byte_len: u64,
         pub(crate) k_byte_len: u64,
@@ -79,7 +74,6 @@ mod check {
         if !step.theta.is_finite() || step.theta <= 0.0 {
             return Err(bad_request("theta must be finite and greater than zero"));
         }
-        // The kernel converts each position to F32, which is exact up to 2^24.
         let time = q[q.len() - 2];
         if u64::from(step.pos) + u64::from(time) > MAX_POSITION_END {
             return Err(bad_request(
@@ -116,8 +110,6 @@ mod check {
         Ok(())
     }
 
-    /// Checks every dimension and the product of time and head size, then sizes the tensor.
-    ///
     /// The pinned kernel multiplies the time and head-size extents as two native ints, so a
     /// product above `i32::MAX` reads outside the buffer on the device.
     fn checked_byte_len(shape: &[u32]) -> Result<u64, EngError> {
@@ -272,7 +264,6 @@ mod tests {
 
     #[test]
     fn rope_validation_bounds_time_times_head_size_and_the_byte_counts() {
-        // The pinned kernel multiplies time by head size as two native ints.
         let message = rejected_shapes(&[1, 46341, 46341], &[1, 46341, 46341]);
         assert!(message.contains("T * D"), "message: {message}");
         let message = rejected_shapes(&[2, 1 << 16, 1 << 16], &[2, 1 << 16, 1 << 16]);

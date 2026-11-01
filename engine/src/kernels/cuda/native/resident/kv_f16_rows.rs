@@ -58,7 +58,7 @@ const _: () = assert!(
 
 pub(in crate::kernels::cuda) struct KvF16RowsRaw<'a> {
     pub(in crate::kernels::cuda) x: RawRange<'a>,
-    /// f16-bit output range; `None` runs the guard without a written half-row.
+    /// `None` runs the guard without a written half-row.
     pub(in crate::kernels::cuda) y: Option<RawRange<'a>>,
     pub(in crate::kernels::cuda) flag: RawRange<'a>,
     pub(in crate::kernels::cuda) rows: usize,

@@ -30,22 +30,18 @@ use memmap2::{Mmap, MmapOptions};
 /// Why a mapping could not be made or trusted. Every variant leaves no mapping.
 #[derive(Debug, PartialEq)]
 pub enum MapError {
-    /// An open, stat or map failure; the message carries the local cause.
     Io(String),
     /// The file has zero bytes: an empty mapping would hide a wrong-path bug.
     Empty,
     /// The file length is not the `expected_len` the caller passed (the GGUF
     /// header's end of data); slicing expert ranges into it runs out of bounds.
     LengthMismatch {
-        /// Length the caller derived from the GGUF header, in bytes.
         expected: u64,
-        /// Length the file actually has, in bytes.
         actual: u64,
     },
     /// The length or mtime of the open handle differs from what was recorded
     /// at open, so the bytes cannot be trusted. `what` is `"length"` or `"mtime"`.
     Changed {
-        /// What moved: `"length"` or `"mtime"`.
         what: &'static str,
     },
     /// The length does not fit a `usize` on this host, so no slice can address it.
@@ -82,10 +78,6 @@ pub struct MappedFile {
 }
 
 impl MappedFile {
-    /// Opens `path` read-only, stats the open handle, refuses an empty file,
-    /// a length != `expected_len` and a length that cannot fit a `usize`
-    /// (`TooLarge`), maps the whole file read-only, then stats again: a
-    /// length or mtime that moved across the map is `Changed`.
     pub fn open(path: &Path, expected_len: u64) -> Result<MappedFile, MapError> {
         let file = File::open(path).map_err(io_err)?;
         let (len, mtime) = stat(&file)?;
@@ -127,7 +119,6 @@ impl MappedFile {
         })
     }
 
-    /// File length in bytes recorded at open; also the mapped length.
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -155,7 +146,6 @@ impl MappedFile {
     }
 }
 
-/// Wraps an I/O failure's message; every failure here leaves no mapping.
 fn io_err(error: std::io::Error) -> MapError {
     MapError::Io(error.to_string())
 }
@@ -168,7 +158,6 @@ fn stat(file: &File) -> Result<(u64, SystemTime), MapError> {
 }
 
 impl AsRef<[u8]> for MappedFile {
-    /// The whole mapping: the only view out of the module, read-only bytes.
     fn as_ref(&self) -> &[u8] {
         self.map.as_ref()
     }

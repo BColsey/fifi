@@ -12,7 +12,6 @@ use inference_engine::{
 const PAYLOAD: [u8; 6] = [10, 11, 12, 13, 14, 15];
 const SECOND: [u8; 4] = [20, 21, 22, 23];
 
-/// One safetensors shard: `U8` tensor `w` of shape `[2, 3]`, then `F16` tensor `v` of shape `[2]`.
 fn shard() -> Vec<u8> {
     let header = br#"{"w":{"dtype":"U8","shape":[2,3],"data_offsets":[0,6]},"v":{"dtype":"F16","shape":[2],"data_offsets":[6,10]}}"#;
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -77,7 +76,6 @@ fn absent_key_completes_missing() {
     assert!(matches!(store.wait(ticket), Ok(Completion::Missing)));
 }
 
-/// A read dependency that serves the header and fails every read in the data region.
 struct DataFailingReader {
     inner: Cursor<Vec<u8>>,
     data_start: u64,
@@ -257,7 +255,6 @@ fn leading_slice_of_a_scalar_is_a_bad_request() {
     );
 }
 
-/// One safetensors shard with the given header JSON and payload bytes.
 fn shard_with(header: &str, payload: &[u8]) -> Vec<u8> {
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend_from_slice(header.as_bytes());
@@ -286,7 +283,6 @@ fn checkpoint_with_budget(
     StreamedCheckpoint::open(index.as_bytes(), shards, max_header_bytes)
 }
 
-/// Shard `s1.safetensors` holds `a`, and shard `s2.safetensors` holds `b`.
 fn two_shards() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         (

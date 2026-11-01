@@ -64,16 +64,12 @@ pub(in crate::kernels::cuda) struct SwigluRowsInts {
     pub(in crate::kernels::cuda) ld_out: c_int,
 }
 
-/// What one launch reads (`gu`) and writes (`act`), and its integers.
 pub(in crate::kernels::cuda) struct SwigluRowsRaw<'a> {
     pub(in crate::kernels::cuda) gu: RawRange<'a>,
     pub(in crate::kernels::cuda) act: RawRange<'a>,
     pub(in crate::kernels::cuda) ints: SwigluRowsInts,
 }
 
-/// The bytes of the two extents the kernel touches: `(rows - 1) * ld_in + up_off + n_ff`
-/// floats of `gu` and `(rows - 1) * ld_out + n_ff` floats of `act`. A negative integer, zero
-/// rows or an overflow is an invalid-argument failure.
 fn extents(ints: &SwigluRowsInts) -> Result<(usize, usize), DeviceFailure> {
     let size = |n: c_int| usize::try_from(n).map_err(|_| invalid_argument());
     let before = size(ints.rows)?
@@ -96,8 +92,6 @@ fn extents(ints: &SwigluRowsInts) -> Result<(usize, usize), DeviceFailure> {
     ))
 }
 
-/// Proves a launch before the native call: both ranges hold their extents, start 16-byte
-/// aligned, and the written `act` extent shares no byte with the read `gu` extent.
 fn check_swiglu_rows(io: &SwigluRowsRaw<'_>) -> Result<(), DeviceFailure> {
     let (gu, act) = extents(&io.ints)?;
     let sized = io.gu.bytes() >= gu && io.act.bytes() >= act;
@@ -110,7 +104,7 @@ fn check_swiglu_rows(io: &SwigluRowsRaw<'_>) -> Result<(), DeviceFailure> {
 }
 
 /// Queues the SwiGLU kernel on `stream`: `act[r][c] = silu(gu[r][c]) * gu[r][up_off + c]`
-/// for every row and column `c < n_ff`. Returns when the kernel is queued.
+/// for every row and column `c < n_ff`.
 pub(in crate::kernels::cuda) fn swiglu_rows_launch(
     stream: &RawStream,
     io: SwigluRowsRaw<'_>,

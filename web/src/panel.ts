@@ -1,8 +1,6 @@
 /**
- * The speed panel's DOM-free state: the recent-rows fetch (driven by the
- * node:test suite with injected fakes — no global mocks, no real timers),
- * the probe merge, and the poll's per-tick decision. MonitorView renders
- * whatever these return.
+ * The speed panel's DOM-free state. MonitorView renders whatever these
+ * return.
  */
 
 import { ApiError, listRecentRequests, type Model, type RecentRequest } from "./api.js";
@@ -50,9 +48,8 @@ export async function refreshRecentRows(timeoutMs = 4000, deps: RecentDeps = {})
   return { recent, recentError, checkedAt: now() };
 }
 
-/** What one full sweep learned: the health/ready/models probe plus the
- * recent-rows fetch (null rows when the server was unreachable — the
- * sweep never fetches the ring from a dead process). */
+/** Null `recent` rows mean the server was unreachable — the sweep
+ *  never fetches the ring from a dead process. */
 export interface ProbeOutcome {
   healthOk: boolean;
   readyOk: boolean;

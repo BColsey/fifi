@@ -22,7 +22,6 @@ pub struct TokenSplit {
     pub upload_bytes: u64,
 }
 
-/// What the tier did, for a harness report.
 #[derive(Clone, Debug, Default)]
 pub struct TierReport {
     pub cpu_threads: usize,

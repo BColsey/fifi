@@ -17,8 +17,6 @@ pub(super) const ROTARY_DIM: u32 = 64;
 /// Less than this many bytes free after the load is a typed refusal, not an error.
 pub(super) const MIN_FREE_AFTER_LOAD: usize = 1 << 30;
 
-/// The head width of the pinned model from the host-side dimensions: no context, no device, so
-/// the rules can be checked before any device work.
 pub(super) fn head_rows_of() -> Result<usize, EngError> {
     let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;

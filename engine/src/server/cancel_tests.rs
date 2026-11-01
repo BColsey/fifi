@@ -36,9 +36,8 @@ fn request(extra: Value) -> Value {
 /// bound in about one second, inside the five second bound of `wait_until`.
 const RUN_ON_LIMIT: usize = 500;
 
-/// Waits until a job that has decoded at least once has ended, or until it has run on past
-/// `RUN_ON_LIMIT` decodes. Then it checks the engine state and the decode count, so a job that is
-/// not cancelled fails an assertion instead of the wait timeout.
+/// Then it checks the engine state and the decode count, so a job that is not
+/// cancelled fails an assertion instead of the wait timeout.
 fn wait_for_the_job_to_stop(probes: &Probes) {
     let handle = probes.engine.handle();
     testkit::wait_until("the job to stop or to run on", || {

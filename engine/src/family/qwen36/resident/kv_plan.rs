@@ -83,7 +83,6 @@ pub(super) fn flash_prefill_split(
 /// one block. A plain budget (`From<u64>`) is the unsliced bound of `SCORE_BUDGET_BYTES`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ScoreBound {
-    /// The most bytes the score matrix of one attention call may take.
     pub(super) budget: u64,
     /// The query rows of one attention call, or `None` when a call takes the whole chunk.
     pub(super) slice_rows: Option<u32>,
@@ -309,7 +308,6 @@ mod tests {
         // The tiny-model test quantum.
         assert_eq!(round_up(7, 3).unwrap(), 9);
         assert_eq!(round_up(6, 3).unwrap(), 6);
-        // No position needs no buffer.
         assert_eq!(round_up(0, 8).unwrap(), 0);
     }
 
@@ -360,7 +358,6 @@ mod tests {
         assert_eq!(logical_bytes(KV_STEP, 4_096).unwrap(), 1_048_576);
         // The session slack bound: one quantum per attention layer.
         assert_eq!(10 * logical_bytes(KV_STEP, 4_096).unwrap(), 10_485_760);
-        // An empty cache charges nothing.
         assert_eq!(logical_bytes(0, 4_096).unwrap(), 0);
     }
 
@@ -388,7 +385,6 @@ mod tests {
             session_bytes(10, KV_STEP, 4_096).unwrap(),
             KV_STEP as u64 * 40_960
         );
-        // A model without attention layers charges nothing, whatever the length.
         assert_eq!(session_bytes(0, 512, 4_096).unwrap(), 0);
     }
 

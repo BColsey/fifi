@@ -85,7 +85,6 @@ fn route(router: &[f32], gate: &[f32], x: &[f64], top_k: usize) -> (Vec<usize>, 
     (order, picks, 1.0 / (1.0 + (-dot(gate)).exp()))
 }
 
-/// The fixed inputs: the normalized row and the residual.
 fn inputs(hidden: usize) -> (Vec<f32>, Vec<f32>) {
     let row = (0..hidden)
         .map(|i| ((i * 7919 % 2003) as f32 - 1001.0) / 700.0)

@@ -41,13 +41,10 @@ pub(crate) const GROUP: usize = 32;
 pub(crate) const MIN_HEAD_DIM: usize = 32;
 /// The most values per head (the block size of the kernel).
 pub(crate) const MAX_HEAD_DIM: usize = 1024;
-/// The most kv heads.
 pub(crate) const MAX_N_KV_HEAD: usize = 64;
-/// The most rows of the decode entry.
 pub(crate) const MAX_DECODE_ROWS: usize = 16;
 /// The most rows of the chunk entry (the grid's y extent).
 pub(crate) const MAX_CHUNK_ROWS: usize = 65_535;
-/// The most cells per head: `2^30 - 1`.
 pub(crate) const MAX_CELLS: usize = (1 << 30) - 1;
 
 /// The denominator used to encode codes; reconstruction always uses the stored fp16 scale.
@@ -70,14 +67,12 @@ pub(crate) struct Kv8Shape {
 }
 
 impl Kv8Shape {
-    /// Bytes of one code array: `n_kv_head * cells * head_dim`.
     pub(crate) fn code_bytes(&self) -> usize {
         self.n_kv_head
             .saturating_mul(self.cells)
             .saturating_mul(self.head_dim)
     }
 
-    /// Bytes of one scale array: `n_kv_head * cells * head_dim / 32` fp16 values.
     pub(crate) fn scale_bytes(&self) -> usize {
         self.n_kv_head
             .saturating_mul(self.cells)
@@ -85,7 +80,6 @@ impl Kv8Shape {
             .saturating_mul(2)
     }
 
-    /// Bytes of one f32 row block: `rows * n_kv_head * head_dim` values.
     pub(crate) fn row_bytes(&self) -> usize {
         self.rows
             .saturating_mul(self.n_kv_head)
@@ -108,12 +102,10 @@ pub(crate) struct Kv8Data<'b> {
     pub(crate) v_scales: DeviceRange<'b>,
 }
 
-/// A `BadRequest` that names the rule that fired, under `tag`.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("{tag}: {detail}"))
 }
 
-/// `value` as `c_int`, or the "exceeds i32" refusal naming `tag`.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
@@ -167,8 +159,7 @@ fn check_shape(tag: &str, shape: &Kv8Shape, max_rows: usize) -> Result<Kv8Ints, 
     })
 }
 
-/// Size and alignment of the six data ranges, one `require_fit` per range. Only valid after
-/// `check_shape`, so the sizes cannot overflow.
+/// Only valid after [`check_shape`], so the sizes cannot overflow.
 fn check_fit(data: &Kv8Data<'_>, shape: &Kv8Shape) -> Result<(), EngError> {
     let (rows, codes, scales) = (shape.row_bytes(), shape.code_bytes(), shape.scale_bytes());
     require_fit("k", &data.k, rows, 4)?;
@@ -180,8 +171,7 @@ fn check_fit(data: &Kv8Data<'_>, shape: &Kv8Shape) -> Result<(), EngError> {
 }
 
 /// Disjointness of the touched extents: the four written ranges (both code arrays, both scale
-/// arrays) pairwise (6 pairs) and each against the two read ranges (8 pairs). The read ranges
-/// may overlap each other.
+/// arrays) pairwise and each against the two read ranges; the read ranges may overlap each other.
 fn check_apart(data: &Kv8Data<'_>, shape: &Kv8Shape) -> Result<(), EngError> {
     let (rows, codes, scales) = (shape.row_bytes(), shape.code_bytes(), shape.scale_bytes());
     let written = [
@@ -199,8 +189,7 @@ fn check_apart(data: &Kv8Data<'_>, shape: &Kv8Shape) -> Result<(), EngError> {
     Ok(())
 }
 
-/// The raw data ranges of a call with its converted integers, proved once. Only valid after
-/// `check_shape`, `check_fit` and `check_apart`.
+/// Only valid after [`check_shape`], [`check_fit`] and [`check_apart`].
 fn raw_data<'a>(
     context: &CudaContext,
     data: &Kv8Data<'a>,

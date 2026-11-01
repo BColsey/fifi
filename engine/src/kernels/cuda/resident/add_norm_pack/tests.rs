@@ -41,9 +41,7 @@ const fn group(name: &'static str, scale: f64) -> Group {
     Group { name, scale, eps: 1e-6, weight_top: 1.5, outliers: false }
 }
 
-/// The Qwen3.6 scale.
 const MODEL: Group = group("model", 1.0);
-/// The stress families: outliers, large, small, tiny, a big weight, zero, two other `eps`.
 #[rustfmt::skip]
 const STRESS: [Group; 8] = [
     Group { outliers: true, ..group("outliers", 1.0) }, group("large", 1e4), group("small", 1e-3),
@@ -64,7 +62,6 @@ impl Rig {
     }
 }
 
-/// Host inputs of one launch.
 struct Inputs {
     m: usize,
     n: usize,
@@ -90,7 +87,6 @@ fn inputs(group: Group, m: usize, n: usize, seed: u64) -> Inputs {
     Inputs { m, n, eps: group.eps, h, delta, weight }
 }
 
-/// The first `bytes` bytes of `buffer`.
 fn range(buffer: &DeviceBuffer, bytes: usize) -> DeviceRange<'_> {
     buffer.range(0, bytes).expect("range")
 }
@@ -104,15 +100,12 @@ fn tail(xf: &[u8]) -> [u8; 16] {
     out
 }
 
-/// What a launch left in `h`, `xf` and `norm_out`, as bytes.
 struct Output {
     h: Vec<u8>,
     xf: Vec<u8>,
     out: Vec<u8>,
 }
 
-/// One launch on fresh buffers: `xf` and `norm_out` start filled with `FILL`, the call is queued
-/// on the rig's stream, the stream is drained and the three outputs are read back.
 fn launch(rig: &Rig, inp: &Inputs, with_delta: bool, with_out: bool) -> Output {
     let ctx = &rig.ctx;
     let row = row_bytes(inp.m, inp.n).expect("row bytes");
@@ -141,7 +134,6 @@ fn launch(rig: &Rig, inp: &Inputs, with_delta: bool, with_out: bool) -> Output {
     }
 }
 
-/// The residual the kernel stores: `fl32(h + delta)`, or `h` unchanged.
 fn residual(inp: &Inputs, with_delta: bool) -> Vec<f32> {
     if !with_delta {
         return inp.h.clone();
@@ -149,7 +141,6 @@ fn residual(inp: &Inputs, with_delta: bool) -> Vec<f32> {
     inp.h.iter().zip(&inp.delta).map(|(h, d)| h + d).collect()
 }
 
-/// The f64 reference of every row of the stored residual `r`.
 fn ref_norm(r: &[f32], inp: &Inputs) -> Vec<f64> {
     let n = inp.n;
     let mut out = Vec::with_capacity(r.len());
@@ -165,7 +156,6 @@ fn ref_norm(r: &[f32], inp: &Inputs) -> Vec<f64> {
     out
 }
 
-/// E3 value: the worst over the rows of `max|d| / max(max|ref|, 1)`.
 fn e3_value(dev: &[f32], reference: &[f64], n: usize) -> f64 {
     let rows = dev.chunks(n).zip(reference.chunks(n));
     rows.map(|(d, r)| {
@@ -176,7 +166,6 @@ fn e3_value(dev: &[f32], reference: &[f64], n: usize) -> f64 {
     .fold(0.0, f64::max)
 }
 
-/// The E1 form, printed only: `max |d| / (2^-20 * max(|ref|, 1))` over the elements.
 fn e1_ratio(dev: &[f32], reference: &[f64]) -> f64 {
     dev.iter()
         .zip(reference)
@@ -184,7 +173,6 @@ fn e1_ratio(dev: &[f32], reference: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The maxima of one group.
 #[derive(Default)]
 struct Worst {
     e3: f64,
@@ -213,12 +201,9 @@ impl Report {
     }
 }
 
-/// Asserts everything the contract says about one launch and folds its statistics into `worst`.
-/// `with_out` says whether `norm_out` was passed, `label` names the case in a failure.
 fn check(label: &str, inp: &Inputs, run: (bool, bool), got: &Output, worst: &mut Worst) {
     let (with_delta, with_out) = run;
     let r = residual(inp, with_delta);
-    // `h` is fl32(h + delta), bit for bit; without a delta it is unchanged.
     let want_h: Vec<u8> = r.iter().flat_map(|v| v.to_le_bytes()).collect();
     let at = testkit::first_difference(&got.h, &want_h);
     assert_eq!(
@@ -240,8 +225,6 @@ fn check(label: &str, inp: &Inputs, run: (bool, bool), got: &Output, worst: &mut
     }
 }
 
-/// The `norm_out` assertions: finite, E3 against the reference, and `xf` is exactly the fp16
-/// rounding of the device `norm_out`.
 fn check_norm_out(
     label: &str,
     inp: &Inputs,
@@ -267,8 +250,6 @@ fn check_norm_out(
     }
 }
 
-/// Runs the four (delta, norm_out) combinations of `inp`, checks each, and checks that dropping
-/// `norm_out` leaves the `xf` bytes alone.
 fn sweep_combinations(rig: &Rig, label: &str, inp: &Inputs, worst: &mut Worst) {
     for with_delta in [true, false] {
         let with = launch(rig, inp, with_delta, true);
@@ -291,7 +272,6 @@ fn sweep_combinations(rig: &Rig, label: &str, inp: &Inputs, worst: &mut Worst) {
     }
 }
 
-/// Shapes `m` x `n` with the model data, all four combinations of `delta` and `norm_out`.
 fn sweep_shapes(rig: &Rig, report: &mut Report) {
     let worst = report.0.entry(MODEL.name).or_default();
     for m in [1, 2, 3, 7, 8, 9, 15, 16, 17, 33] {
@@ -302,7 +282,6 @@ fn sweep_shapes(rig: &Rig, report: &mut Report) {
     }
 }
 
-/// Every stress group at `m = 3`, `n = 2048`; the zero group must give all-zero outputs.
 fn sweep_groups(rig: &Rig, report: &mut Report) {
     for (i, group) in STRESS.iter().enumerate() {
         let inp = inputs(*group, 3, 2048, 0x4a10 + i as u64);
@@ -322,7 +301,6 @@ fn sweep_groups(rig: &Rig, report: &mut Report) {
     }
 }
 
-/// The widest row (`n = 32768`) and 100 seeds at the model shape `m = 1`, `n = 2048`.
 fn sweep_wide_and_seeds(rig: &Rig, report: &mut Report) {
     let worst = report.0.entry("wide").or_default();
     for m in [1, 17] {
@@ -337,8 +315,7 @@ fn sweep_wide_and_seeds(rig: &Rig, report: &mut Report) {
     }
 }
 
-/// Pinned, not a claim: a finite row whose sum of squares overflows f32 gives finite zeros, and
-/// one `+inf` among large values gives one NaN and zeros elsewhere.
+/// Pinned, not a claim.
 fn pin_overflow(rig: &Rig) {
     let mut inp = inputs(MODEL, 1, 256, 0x4a40);
     inp.h = vec![1e30; 256];
@@ -404,7 +381,6 @@ fn add_norm_pack_is_deterministic() {
 /// Rows of the weight that T2 multiplies with.
 const Y_ROWS: usize = 64;
 
-/// The `y` bytes of one matmul of `xf` against `weight`, after the stream drained.
 fn matmul_y(rig: &Rig, weight: &TiledWeight, xf: (&DeviceBuffer, usize), m: usize) -> Vec<u8> {
     let y_len = m * Y_ROWS * 4;
     let y = upload_filled(&rig.ctx, FILL, y_len);
@@ -423,8 +399,6 @@ fn matmul_y(rig: &Rig, weight: &TiledWeight, xf: (&DeviceBuffer, usize), m: usiz
     read_bytes(&rig.ctx, &y, y_len)
 }
 
-/// One shape: the fused `xf`, the `xf` that `pack` makes of the fused `norm_out`, and the matmul
-/// results of both.
 fn pack_and_matmul(rig: &Rig, m: usize, n: usize) {
     let ctx = &rig.ctx;
     let inp = inputs(MODEL, m, n, 0x4a60 + (m * 31 + n) as u64);
@@ -681,7 +655,6 @@ fn add_norm_pack_ignores_stale_padding_between_launches() {
     );
 }
 
-/// The text of a `BadRequest`, or a failure naming the unexpected result.
 fn bad_text<T: std::fmt::Debug>(result: Result<T, EngError>) -> String {
     match result {
         Err(EngError::BadRequest(text)) => text,
@@ -689,9 +662,8 @@ fn bad_text<T: std::fmt::Debug>(result: Result<T, EngError>) -> String {
     }
 }
 
-/// `check_shape`, `check_eps`, `row_bytes` and `xf_bytes` at the edge of every bound. The two
-/// wrapping values (`2^32 + 1`, `2^32 + 256`) would pass as `m` 1 and `n` 256 through an `as`
-/// conversion.
+/// The two wrapping values (`2^32 + 1`, `2^32 + 256`) would pass as `m` 1 and `n` 256 through an
+/// `as` conversion.
 fn pin_shape_bounds() {
     for (m, n) in [(1, 256), (32_768, 256), (1, 32_768), (7, 768)] {
         let ints = check_shape(m, n).expect("a shape at the limit");
@@ -802,7 +774,6 @@ fn pick(total: usize, count: usize) -> Vec<usize> {
     rows
 }
 
-/// The rows `idx` of the dump `key` of `phase` (f32 `[rows][2048]`, the token the slowest axis).
 fn dump_rows(phase: &str, key: &str, idx: &[usize]) -> Vec<f32> {
     let dir = std::env::var("QWEN36_ORACLE_DIR").expect("QWEN36_ORACLE_DIR");
     let path = std::path::Path::new(&dir).join(format!("cpu/dump/P4/dumps/{phase}/{key}.bin"));
@@ -946,7 +917,6 @@ fn add_norm_pack_matches_the_rd_m6_dump() {
     }
 }
 
-/// Where one range of a refusal case lives: buffer index, byte offset, bytes.
 #[derive(Clone, Copy)]
 struct Slot {
     buf: usize,
@@ -954,7 +924,6 @@ struct Slot {
     bytes: usize,
 }
 
-/// Slot order: h, delta, weight, xf, norm_out; each in its own buffer by default.
 const NAMES: [&str; 5] = ["h", "delta", "weight", "xf", "norm_out"];
 const H: usize = 0;
 const D: usize = 1;
@@ -962,7 +931,6 @@ const W: usize = 2;
 const X: usize = 3;
 const O: usize = 4;
 
-/// One call: the shape, `eps`, the five ranges and whether `delta` and `norm_out` are given.
 #[derive(Clone)]
 struct Spec {
     m: usize,
@@ -974,7 +942,6 @@ struct Spec {
 }
 
 impl Spec {
-    /// A valid call for `m` x `n` with exactly sized ranges.
     fn new(m: usize, n: usize) -> Self {
         let (row, xf) = (m * n * 4, xf_bytes(m, n).expect("xf bytes"));
         let slot = |buf, bytes| Slot {
@@ -998,14 +965,12 @@ impl Spec {
         }
     }
 
-    /// The same call with slot `i` changed by `edit`.
     fn with(&self, i: usize, edit: impl FnOnce(&mut Slot)) -> Self {
         let mut spec = self.clone();
         edit(&mut spec.slots[i]);
         spec
     }
 
-    /// The same call with slot `b` at offset 0 of the buffer of slot `a`: the two overlap.
     fn overlapping(&self, a: usize, b: usize) -> Self {
         self.with(b, |slot| (slot.buf, slot.offset) = (self.slots[a].buf, 0))
     }
@@ -1013,8 +978,6 @@ impl Spec {
 
 const EPS: f32 = 1e-6;
 
-/// Runs `spec` with every buffer filled with 0x11; slot `foreign` (if any) lives on `other`.
-/// Returns the result and whether every buffer is byte for byte unchanged.
 fn attempt(
     rig: &Rig,
     other: &CudaContext,
@@ -1058,7 +1021,6 @@ fn attempt(
     (result, digest() == before)
 }
 
-/// The refusals, each one change from the valid base `(2, 512)`: (name, text it must contain, call).
 #[rustfmt::skip]
 fn refusal_rows() -> Vec<(String, String, Spec)> {
     let base = Spec::new(2, 512);
@@ -1084,7 +1046,6 @@ fn refusal_rows() -> Vec<(String, String, Spec)> {
         let needle = format!("{} range starts at offset {offset}", NAMES[i]);
         add(&format!("{} at +{offset}", NAMES[i]), &needle, base.with(i, |s| s.offset = offset));
     }
-    // Claim order: the written ranges h, xf, norm_out, each against the later written and the read ones.
     for (a, b) in [(H, X), (H, O), (H, W), (H, D), (X, O), (X, W), (X, D), (O, W), (O, D)] {
         let needle = format!("{} and {} ranges overlap", NAMES[a], NAMES[b]);
         add(&format!("{} over {}", NAMES[b], NAMES[a]), &needle, base.overlapping(a, b));
@@ -1093,7 +1054,6 @@ fn refusal_rows() -> Vec<(String, String, Spec)> {
     rows
 }
 
-/// Calls that must be accepted: shared views, touching extents, larger ranges, the extremes.
 #[rustfmt::skip]
 fn control_specs() -> Vec<(&'static str, Spec)> {
     let base = Spec::new(2, 512);
@@ -1143,7 +1103,6 @@ fn add_norm_pack_rejects_bad_arguments_before_any_launch() {
         .expect("refusals leave the backend usable");
 }
 
-/// Five buffers for a call of `inp`: h, delta, weight, xf (0xFF) and norm_out (0xFF).
 fn buffers_for(ctx: &CudaContext, inp: &Inputs) -> [DeviceBuffer; 5] {
     let (row, xf_len) = (
         row_bytes(inp.m, inp.n).expect("row"),
@@ -1158,7 +1117,6 @@ fn buffers_for(ctx: &CudaContext, inp: &Inputs) -> [DeviceBuffer; 5] {
     ]
 }
 
-/// The call of `inp` on `b`, with `m` replaced when a bad shape is wanted.
 fn call_on<'b>(b: &'b [DeviceBuffer; 5], inp: &Inputs, m: usize) -> AddNormCall<'b> {
     let (row, xf_len) = (
         row_bytes(inp.m, inp.n).expect("row"),
@@ -1216,8 +1174,6 @@ fn add_norm_pack_reports_a_bad_range_before_a_latched_context() {
     println!("latch child: done");
 }
 
-/// One captured call replays to the bytes of the eager call, as one graph node (the kernel; no
-/// whole-buffer memset runs).
 #[test]
 fn add_norm_pack_inside_a_capture_equals_eager() {
     if !testkit::device_present("add_norm_pack_inside_a_capture_equals_eager") {

@@ -14,18 +14,14 @@ use std::cmp::Reverse;
 
 use crate::EngError;
 
-/// Offsets are multiples of this many bytes. `cudaMalloc` returns 256-byte
-/// aligned memory, so every offset keeps that alignment in the allocation.
+/// `cudaMalloc` returns 256-byte aligned memory, so every offset keeps
+/// that alignment in the allocation.
 pub(crate) const ARENA_ALIGN: usize = 256;
 
-/// One tensor of an arena: its size and the steps in which it is live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArenaTensor {
-    /// Size in bytes; never 0.
     pub(crate) bytes: usize,
-    /// First step in which the tensor is live.
     pub(crate) first: usize,
-    /// Last step in which the tensor is live; not before `first`.
     pub(crate) last: usize,
 }
 
@@ -35,7 +31,6 @@ impl ArenaTensor {
     }
 }
 
-/// Where each tensor lives, in input order, and the bytes the arena needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArenaPlan {
     pub(crate) offsets: Vec<usize>,
@@ -43,8 +38,6 @@ pub(crate) struct ArenaPlan {
     pub(crate) total: usize,
 }
 
-/// Plans `tensors` into one arena.
-///
 /// Returns `BadRequest` for a tensor of 0 bytes or one that ends before it
 /// starts, and `MemoryPlan` when an offset or the total overflows `usize`.
 pub(crate) fn plan_arena(tensors: &[ArenaTensor]) -> Result<ArenaPlan, EngError> {
@@ -69,8 +62,6 @@ pub(crate) fn plan_arena(tensors: &[ArenaTensor]) -> Result<ArenaPlan, EngError>
     Ok(ArenaPlan { offsets, total })
 }
 
-/// The lowest aligned offset at which tensor `index` avoids every tensor of
-/// `placed` that is live in one of its steps.
 fn lowest_offset(
     tensors: &[ArenaTensor],
     offsets: &[usize],
@@ -135,7 +126,6 @@ mod tests {
         *state
     }
 
-    /// 24 tensors of 1 to 20,000 bytes, each live for 1 to 5 of 8 steps.
     fn random_tensors(seed: u64) -> Vec<ArenaTensor> {
         let mut state = seed;
         let mut below = |limit: u64| usize::try_from(xorshift(&mut state) % limit).expect("small");

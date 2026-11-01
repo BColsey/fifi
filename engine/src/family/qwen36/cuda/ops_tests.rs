@@ -149,7 +149,6 @@ fn a_block_starts_with_the_input_norm_and_hands_the_moe_input_over() {
         assert_eq!(last.reads(), [Slot::MixOut]);
         assert_eq!(last.writes(), [Slot::XfMoe, Slot::NormRow]);
         assert_eq!(last.phase(), Phase::AddNorm);
-        // The mixer output reaches MixOut exactly once.
         let into_mix_out = ops
             .iter()
             .filter(|op| op.writes().contains(&Slot::MixOut))

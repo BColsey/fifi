@@ -10,7 +10,6 @@ use crate::{
     weights::GgufType,
 };
 
-/// Where a tensor lives after the open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorPath {
     /// Quantized matrix that the CUDA projector tiles on the device.
@@ -19,7 +18,6 @@ pub enum TensorPath {
     DeviceF32,
 }
 
-/// The role a GGUF tensor plays in the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     TokenEmbd,
@@ -202,13 +200,11 @@ fn linear(spec: &FamilySpec) -> Result<&LinearAttention, EngError> {
     })
 }
 
-/// One tensor that a GGUF file of the family must hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedTensor {
     /// GGUF tensor name, for example `blk.3.attn_q.weight`.
     pub(crate) name: String,
     pub(crate) role: Role,
-    /// Expected dims in GGUF order; `dims[0]` is the row length. Never empty.
     pub(crate) dims: Vec<u64>,
 }
 
@@ -221,7 +217,6 @@ impl ExpectedTensor {
         self.role.allowed_types()
     }
 
-    /// Source bytes of this tensor stored as `ty`.
     pub(crate) fn byte_len(&self, ty: GgufType) -> Result<u64, EngError> {
         let block = ty.block_elems();
         let row = self.dims[0];

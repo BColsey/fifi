@@ -35,10 +35,8 @@ fn msg(role: Role, content: &str) -> PromptMessage {
 const DEVELOPER_ROW: &str =
     "bit-exact continuation text, with the from-scratch reference at the same rendered prompt";
 
-/// A deterministic coding-agent conversation: system instructions, a
-/// task with code, a reasoning + tool-call reply, the tool result, a
-/// code answer, and follow-up turns. Every message shape the Flint
-/// template renders appears at least once.
+/// A deterministic coding-agent conversation in which every message shape
+/// the Flint template renders appears at least once.
 fn coding_transcript() -> Vec<PromptMessage> {
     vec![
         msg(
@@ -115,9 +113,7 @@ fn render(template: &ChatTemplate, msgs: &[PromptMessage], tools: &[ToolSpec]) -
 
 /// The generation boundaries of the transcript: the message slices the
 /// server actually renders and sends to the model (history plus the rows
-/// that arrived since the last generation). Turn 1 renders [system,
-/// task]; turn 2 renders through the tool result; turn 3 renders through
-/// the developer row and the follow-up.
+/// that arrived since the last generation).
 const GENERATION_BOUNDARIES: [usize; 3] = [2, 4, 7];
 
 #[test]
@@ -258,9 +254,6 @@ fn tool_preamble_rows_append_stably_and_developer_row_survives() {
 #[ignore = "requires FLINT_MODEL_DIR with the pinned publisher tokenizer"]
 #[test]
 fn flint_prompt_prefix_is_a_token_prefix_with_the_real_tokenizer() {
-    // The byte-prefix property with the real pinned tokenizer: the
-    // encoded ids of every turn are a prefix of the next turn's ids, and
-    // the delimiter encodes to exactly one added token id.
     let bundle = flint_tests::bundle();
     let template = ChatTemplate::from_str(FLINT_TEMPLATE).expect("pinned template parses");
     let msgs = coding_transcript();

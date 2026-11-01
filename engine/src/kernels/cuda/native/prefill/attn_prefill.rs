@@ -257,8 +257,7 @@ unsafe extern "C" {
 /// without a fixture build.
 pub(in crate::kernels::cuda) static Q8_TILED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
-/// Route-acceptance count: successful tile-kernel launches through the route entry
-/// (incremented only after a clean enqueue, so arm/launch errors are not counted).
+/// Route-acceptance count: successful tile-kernel launches through the route entry.
 /// Test-visible; kept live in production builds as telemetry on the same pattern as
 /// the fallback counter above: one relaxed add per accepted call on the tiled
 /// route (default ON, rollback via a rejected knob value).
@@ -282,7 +281,6 @@ pub(in crate::kernels::cuda) struct AttnPrefillInts {
     pub(in crate::kernels::cuda) ring: c_int,
 }
 
-/// Checked physical ranges and their explicit affine layout, borrowed until enqueue.
 pub(in crate::kernels::cuda) struct AttnKvRaw<'a> {
     pub(in crate::kernels::cuda) layout: AttnKvLayout,
     pub(in crate::kernels::cuda) payload: RawRange<'a>,
@@ -290,8 +288,7 @@ pub(in crate::kernels::cuda) struct AttnKvRaw<'a> {
     pub(in crate::kernels::cuda) bias: Option<RawRange<'a>>,
 }
 
-/// What one prefill attention launch reads and writes: the converted ranges, the optional
-/// projection (the output gate) and prefill status word, the integers and the score scale.
+/// `proj` is the output gate.
 pub(in crate::kernels::cuda) struct AttnPrefillRaw<'a> {
     pub(in crate::kernels::cuda) q: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: Option<RawRange<'a>>,
@@ -306,7 +303,6 @@ pub(in crate::kernels::cuda) struct AttnPrefillRaw<'a> {
     pub(in crate::kernels::cuda) scale: f32,
 }
 
-/// The bytes each range must hold and the alignment of its start.
 struct Needs {
     q: usize,
     proj: usize,
@@ -316,12 +312,10 @@ struct Needs {
     out: usize,
 }
 
-/// `n` as `usize`, or an invalid-argument failure for a negative value.
 fn size(n: c_int) -> Result<usize, DeviceFailure> {
     usize::try_from(n).map_err(|_| invalid_argument())
 }
 
-/// Product of the factors, or an invalid-argument failure on overflow.
 fn product(factors: &[usize]) -> Result<usize, DeviceFailure> {
     factors
         .iter()
@@ -526,9 +520,6 @@ fn c_views(io: &AttnPrefillRaw<'_>) -> Result<Option<AttnKvPairRaw>, DeviceFailu
     }
 }
 
-/// Proves range fit and writable non-overlap before the native call. Q/part/out need
-/// 16-byte alignment; caches need 16 bytes for F16 or one byte for Q8. Affine scalars
-/// use their own dtype alignment; projection, sinks and status need four bytes.
 fn check_attn(io: &AttnPrefillRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(io)?;
     let sized = io.q.bytes() >= need.q
@@ -584,7 +575,7 @@ fn check_attn(io: &AttnPrefillRaw<'_>) -> Result<(), DeviceFailure> {
     check_views(io, &need)
 }
 
-/// Legacy fields stay NULL/0; tagged metadata is copied synchronously by the C entry.
+/// Tagged metadata is copied synchronously by the C entry.
 fn c_args(io: &AttnPrefillRaw<'_>, views: Option<&AttnKvPairRaw>) -> AttnPrefillArgsRaw {
     let ints = &io.ints;
     AttnPrefillArgsRaw {
@@ -627,7 +618,6 @@ fn c_args(io: &AttnPrefillRaw<'_>, views: Option<&AttnKvPairRaw>) -> AttnPrefill
     }
 }
 
-/// Queues the selected prefill attention phase(s) on `stream` and returns after enqueue.
 pub(in crate::kernels::cuda) fn attn_prefill_launch(
     stream: &RawStream,
     io: AttnPrefillRaw<'_>,
@@ -702,7 +692,7 @@ pub(in crate::kernels::cuda) fn attn_prefill_fault_bad_bounds(
     check_attn(&io)?;
     let views = c_views(&io)?;
     let mut args = c_args(&io, views.as_ref());
-    args.p0 = -1; // Invalid for both linear and absolute ring positions.
+    args.p0 = -1;
     let mut stage = STAGE_NONE;
     // SAFETY: as `attn_prefill_launch`; the part kernel refuses before any partial write and
     // the combine's NaN write stays inside the proved `out` range.

@@ -21,7 +21,6 @@ use crate::kernels::cuda::context::{
 };
 use crate::kernels::cuda::native::resident::sample_gemma::{SampleGemmaRaw, sample_gemma_launch};
 
-/// Sampling settings of one draw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SampleParams {
     pub(crate) temperature: f32,
@@ -32,7 +31,6 @@ pub(crate) struct SampleParams {
     pub(crate) position: u64,
 }
 
-/// The row, the scratch row, the outputs and the settings of one draw.
 pub(crate) struct SampleGemmaCall<'b> {
     pub(crate) token: DeviceRange<'b>,
     pub(crate) logprob: DeviceRange<'b>,
@@ -44,7 +42,6 @@ pub(crate) struct SampleGemmaCall<'b> {
 }
 
 impl CudaContext {
-    /// Queues one draw of call on stream.
     pub(crate) fn sample_gemma(
         &self,
         stream: &DeviceStream,

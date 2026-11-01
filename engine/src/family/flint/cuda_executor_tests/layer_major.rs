@@ -22,10 +22,6 @@ fn options_for(context: usize, profile: &str) -> FlintOptions {
     .unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Admission and plumbing (no device).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn the_piece_is_as_tall_as_the_router_admits_and_never_taller_than_the_context() {
     assert_eq!(layer_major_piece_rows(262_144), 4096);
@@ -66,15 +62,12 @@ fn staging_charges_one_piece_not_the_whole_context() {
         State::layer_major_staging_bytes(576).unwrap()
             + State::layer_major_extra_bytes(576, false).unwrap()
     );
-    // The extras are the planes and tile scratch, a few hundred MiB at most.
     assert!(extra < GIB, "extra staging {extra}");
 }
 
 #[test]
 fn every_context_the_loader_can_build_is_admitted_armed() {
-    // The charge is one piece, so even the longest plan the loader builds
-    // admits: the mode never allocates faces for the whole context. The
-    // refusal itself is pinned by the admission test over explicit terms.
+    // The refusal itself is pinned by the admission test over explicit terms.
     for context in [4096, 32_768, 65_536, 262_144] {
         let plan = KvPlan::new(context, 8, true).unwrap();
         let staging = layer_major_staging_charge(layer_major_piece_rows(context), false).unwrap();
@@ -196,10 +189,6 @@ fn a_prefix_saved_in_one_mode_never_restores_in_another() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Device gates (need a GPU and the real pack).
-// ---------------------------------------------------------------------------
-
 fn pack_root() -> PathBuf {
     PathBuf::from(std::env::var_os("FLINT_EXL3_PACK").expect("opt-in real EXL3 pack"))
 }
@@ -267,14 +256,12 @@ fn armed_executor_with(
 // the layer-major pass commits every block of a layer before the next layer.
 // A test that asserts the second shape cannot pass on the first.
 
-/// End position of each chunk of `rows` rows fed from `start`.
 fn chunk_ends(start: usize, rows: usize, chunk: usize) -> Vec<usize> {
     (1..=rows.div_ceil(chunk))
         .map(|index| start + (index * chunk).min(rows))
         .collect()
 }
 
-/// The commit trace of the token-major walk.
 fn token_major_ends(start: usize, rows: usize, chunk: usize) -> Vec<usize> {
     chunk_ends(start, rows, chunk)
         .into_iter()
@@ -282,13 +269,11 @@ fn token_major_ends(start: usize, rows: usize, chunk: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The commit trace of the layer-major pass over its first `layers` layers.
 fn layer_major_ends(start: usize, rows: usize, chunk: usize, layers: usize) -> Vec<usize> {
     let ends = chunk_ends(start, rows, chunk);
     (0..layers).flat_map(|_| ends.clone()).collect()
 }
 
-/// The commits `call` makes, in order.
 fn commits_of<T>(call: impl FnOnce() -> T) -> (T, Vec<usize>) {
     let before = test_commit_ends().len();
     let result = call();
@@ -297,7 +282,6 @@ fn commits_of<T>(call: impl FnOnce() -> T) -> (T, Vec<usize>) {
 
 #[test]
 fn commit_traces_tell_the_two_walks_apart() {
-    // Nine rows: the first chunk of eight, then one.
     assert_eq!(
         layer_major_ends(0, 9, 8, LAYERS),
         [8, 9].repeat(LAYERS),
@@ -381,7 +365,6 @@ fn prefill_token_major(executor: &FlintExecutor, session: &mut FlintSession, tok
         .unwrap();
 }
 
-/// F16 plane bytes of one layer's live window as f32 values.
 fn plane_values(executor: &FlintExecutor, plane: &DeviceBuffer, rows: Range<usize>) -> Vec<f32> {
     canonical_plane(&executor.stream, plane, rows)
         .as_chunks::<2>()
@@ -391,8 +374,6 @@ fn plane_values(executor: &FlintExecutor, plane: &DeviceBuffer, rows: Range<usiz
         .collect()
 }
 
-/// Largest absolute and mean relative difference of two value lists, the
-/// relative figure taken against the reference's mean magnitude.
 fn difference(reference: &[f32], candidate: &[f32]) -> (f32, f32) {
     assert_eq!(reference.len(), candidate.len());
     let scale = reference.iter().map(|v| v.abs()).sum::<f32>() / reference.len() as f32;
@@ -542,7 +523,6 @@ fn armed_tails_track_the_token_major_walk_and_repeat_bitwise() {
             worst < 5e-2,
             "rows {rows}: KV drifted far from the walk it regroups"
         );
-        // The regrouped walk is deterministic: the same piece twice is bitwise equal.
         executor.reset(&mut armed).unwrap();
         executor.prefill(&mut armed, &prompt).unwrap();
         let again = next_logits(&executor, &mut armed);
@@ -622,7 +602,6 @@ fn armed_failure_poisons_until_reset_and_replays_bitwise() {
             .ctx
             .ensure_usable()
             .expect("a session failure is not a backend terminal");
-        // The poisoned session refuses further work until it is reset.
         assert!(matches!(
             executor.prefill(&mut armed, &prompt),
             Err(EngError::BadRequest(_))

@@ -23,7 +23,6 @@ fn upload_bytes(ctx: &CudaContext, bytes: &[u8]) -> Result<DeviceBuffer, EngErro
     ctx.upload(bytes)
 }
 
-/// The fallible upload of `values` for the Result-only device phases.
 fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
     let bytes: Vec<u8> = values
         .iter()
@@ -32,20 +31,16 @@ fn upload_f32(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngErro
     upload_bytes(ctx, &bytes)
 }
 
-/// The fallible upload of `len` bytes that all equal `byte`.
 fn upload_filled(ctx: &CudaContext, byte: u8, len: usize) -> Result<DeviceBuffer, EngError> {
     upload_bytes(ctx, &vec![byte; len])
 }
 
-/// The fallible download of the first `len` bytes of `buffer`.
 fn read_bytes(ctx: &CudaContext, buffer: &DeviceBuffer, len: usize) -> Result<Vec<u8>, EngError> {
     let mut bytes = vec![0u8; len];
     ctx.download(buffer, &mut bytes)?;
     Ok(bytes)
 }
 
-/// Adds the phase's row label to a device error, so a drain or upload failure names the row
-/// whose call hit it again.
 fn labelled(label: &str, error: EngError) -> EngError {
     match error {
         EngError::Backend { operation, message } => EngError::Backend {
@@ -56,16 +51,12 @@ fn labelled(label: &str, error: EngError) -> EngError {
     }
 }
 
-/// Sentinel byte of every unwritten code cell.
 const CODE_SENTINEL: u8 = 0x5a;
-/// Sentinel bits of every unwritten scale slot.
 const SCALE_SENTINEL: u16 = 0xabcd;
-/// Bytes of slack past each plane's extent (see the module doc).
 const SLACK: usize = 32;
 
 const CODE_SCALES: [Kv8CodeScale; 2] = [Kv8CodeScale::StoredHalf, Kv8CodeScale::UnroundedF32];
 
-/// A device context and its stream, owned by one device phase.
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -130,8 +121,6 @@ fn quant_rows(
     (codes, scales)
 }
 
-/// Copies one row block into a plane image at the case's base cell: every token of `n_kv_head`
-/// runs of `width` elements (bytes per element `element`).
 fn place(image: &mut [u8], element: usize, rows: &[u8], c: &Case, width: usize) {
     for kvh in 0..c.n_kv_head {
         for tt in 0..c.rows {
@@ -142,8 +131,6 @@ fn place(image: &mut [u8], element: usize, rows: &[u8], c: &Case, width: usize) 
     }
 }
 
-/// A pristine plane image: `n_kv_head * cells * width` elements of `element` bytes each, every
-/// element at its sentinel, plus the slack.
 fn plane_image(n_kv_head: usize, cells: usize, width: usize, element: usize) -> Vec<u8> {
     let total = n_kv_head * cells * width * element + SLACK;
     let sentinel: Vec<u8> = if element == 1 {
@@ -158,7 +145,6 @@ fn plane_image(n_kv_head: usize, cells: usize, width: usize, element: usize) -> 
     image
 }
 
-/// One append case: the shape, the k and v row blocks, and the base cell of token 0.
 #[derive(Clone)]
 struct Case {
     rows: usize,
@@ -201,8 +187,6 @@ impl Case {
         ]
     }
 
-    /// The plane images the case expects: the appended window written, every other cell at its
-    /// sentinel, plus the slack.
     fn expected(&self) -> [Vec<u8>; 4] {
         let groups = self.head_dim / GROUP;
         let (k_codes, k_scales) = quant_rows(
@@ -235,19 +219,17 @@ impl Case {
     }
 }
 
-/// The fixed value menu of the bit-equality test, per group of 32: a fixed case list.
 fn group_values(rng: &mut Rng, group: usize) -> Vec<f32> {
     let sub = 5.960_464_5e-8_f32; // 2^-24: the fp16 subnormal spacing
     match group % 8 {
-        0 => vec![0.0; GROUP], // all-zero group
+        0 => vec![0.0; GROUP],
         1 => {
-            // one outlier
             let mut g = vec![0.4; GROUP];
             g[7] = 100.0;
             g
         }
         2 => vec![65_504.0; GROUP], // the fp16 maximum
-        3 => (0..GROUP).map(|i| sub * (i as f32 + 1.0) / 8.0).collect(), // fp16 subnormals
+        3 => (0..GROUP).map(|i| sub * (i as f32 + 1.0) / 8.0).collect(),
         4 => {
             // a nonzero subnormal scale
             let mut g = vec![127.0 * sub; GROUP];
@@ -269,11 +251,10 @@ fn group_values(rng: &mut Rng, group: usize) -> Vec<f32> {
             g[9] = -2.0;
             g
         }
-        _ => (0..GROUP).map(|_| rng.normal() as f32).collect(), // random draws
+        _ => (0..GROUP).map(|_| rng.normal() as f32).collect(),
     }
 }
 
-/// One case of the fixed list: `rows` tokens, both head sizes, an offset position.
 fn case(rows: usize, head_dim: usize, pos: usize, seed: u64, code_scale: Kv8CodeScale) -> Case {
     let (n_kv_head, cells) = (2, pos + rows + 3);
     let mut rng = Rng::new(seed);
@@ -294,18 +275,14 @@ fn case(rows: usize, head_dim: usize, pos: usize, seed: u64, code_scale: Kv8Code
     }
 }
 
-/// The whole buffer as a range, or its range error (the Result-only phases use it through
-/// `?`; every owner drops before they return, so a failure must not panic).
 fn whole(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     b.range(0, b.bytes())
 }
 
-/// The buffer minus its sentinel slack, as the range of the call, or its range error.
 fn plane_range(b: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     b.range(0, b.bytes() - SLACK)
 }
 
-/// The four planes of a case on the device, holding the reference images.
 struct Planes([DeviceBuffer; 4]);
 
 impl Planes {
@@ -343,7 +320,6 @@ impl Planes {
     }
 }
 
-/// Asserts the four planes equal the reference images byte for byte.
 fn assert_planes(label: &str, got: &[Vec<u8>; 4], want: &[Vec<u8>; 4]) {
     let names = ["k_codes", "k_scales", "v_codes", "v_scales"];
     for ((&name, g), w) in names.iter().zip(got).zip(want) {
@@ -356,8 +332,6 @@ fn assert_planes(label: &str, got: &[Vec<u8>; 4], want: &[Vec<u8>; 4]) {
     }
 }
 
-/// Uploads the case, queues the decode append at the device word `word`, drains and reads the
-/// planes back through `?`. Called only inside a Result-only device phase.
 fn run_append(rig: &Rig, c: &Case, word: i32) -> Result<([Vec<u8>; 4], i32), EngError> {
     let planes = Planes::upload(&rig.ctx, &c.sentinel_planes())?;
     let k = upload_f32(&rig.ctx, &c.k)?;
@@ -380,8 +354,6 @@ fn run_append(rig: &Rig, c: &Case, word: i32) -> Result<([Vec<u8>; 4], i32), Eng
     ))
 }
 
-/// One append outcome: the case label with the reference images and the plane bytes the device
-/// wrote, as plain vectors.
 struct PlanesOutcome {
     label: String,
     got: [Vec<u8>; 4],
@@ -432,8 +404,6 @@ fn kv8_append_writes_bit_equal_codes_and_scales() {
     }
 }
 
-/// One chunk outcome: the case label, the plane bytes the valid chunk wrote against the
-/// reference, and the result of the pos0 refusal the test asserts afterwards.
 struct ChunkOutcome {
     label: String,
     got: [Vec<u8>; 4],
@@ -443,8 +413,6 @@ struct ChunkOutcome {
     pristine: [Vec<u8>; 4],
 }
 
-/// Refuse a bad pos0 on pristine buffers, read all four planes and slack, then launch a valid
-/// chunk on the same buffers. Every owner drops before the plain vectors return.
 fn chunk_phase(cases: &[Case]) -> Result<Vec<ChunkOutcome>, EngError> {
     let rig = Rig::new()?;
     let mut outcomes = Vec::new();
@@ -513,8 +481,6 @@ fn kv8_chunk_writes_bit_equal_codes_and_scales() {
     }
 }
 
-/// One invalid-word outcome: its label, the plane bytes after the append (which must stay
-/// pristine) and the status word the device OR-ed its mask 4 into.
 struct WordOutcome {
     label: String,
     got: [Vec<u8>; 4],
@@ -522,8 +488,6 @@ struct WordOutcome {
     status: i32,
 }
 
-/// The device phase of the invalid position words: the decode entry at every word, the Rig
-/// dropped with its buffers before the plain vectors return.
 fn bad_word_phase(c: &Case, words: &[(&'static str, i32)]) -> Result<Vec<WordOutcome>, EngError> {
     let rig = Rig::new()?;
     let mut outcomes = Vec::new();
@@ -593,8 +557,6 @@ fn kv8_append_refuses_a_bad_position_word_without_writing() {
     }
 }
 
-// ---- refusals before any launch ----
-
 /// Where a range lives: its buffer holds `offset + bytes` bytes. Slots in declaration order:
 /// k, v, k_codes, k_scales, v_codes, v_scales, pos, status.
 #[derive(Clone, Copy)]
@@ -613,8 +575,6 @@ const POS: usize = 6;
 const STATUS: usize = 7;
 const SLOTS: usize = 8;
 
-/// A call that one edit makes bad: the shape, the base position, the device word and the byte
-/// layout of every range.
 #[derive(Clone)]
 struct Plan {
     shape: Kv8Shape,
@@ -630,7 +590,6 @@ struct Plan {
 }
 
 impl Plan {
-    /// A valid decode call: both head sizes of the fixed list, every buffer exactly sized.
     fn base(head_dim: usize, code_scale: Kv8CodeScale) -> Self {
         let shape = Kv8Shape {
             rows: 2,
@@ -675,9 +634,6 @@ impl Plan {
     }
 }
 
-/// Runs the plan's call (the decode entry by default, the chunk entry for `chunk`) and returns
-/// the result of the call and the `k_codes` bytes afterwards through `?`. Called only inside a
-/// Result-only device phase.
 fn attempt(
     rig: &Rig,
     other: &Rig,
@@ -749,9 +705,8 @@ fn attempt(
 type Edit = fn(&mut Plan);
 type Row = (&'static str, &'static str, bool, Edit);
 
-/// Rows of the refusal test: label, text the refusal must contain, whether the chunk entry runs,
-/// and the edit. Every edit starts from `Plan::base` and sizes the buffers for the shape it
-/// changes (`fit`), so each refusal reaches its own guard with every earlier check satisfied.
+/// Every edit starts from `Plan::base` and sizes the buffers for the shape it changes (`fit`),
+/// so each refusal reaches its own guard with every earlier check satisfied.
 fn refusals() -> Vec<Row> {
     vec![
         ("rows 0", "kv8_append: rows", false, |p: &mut Plan| {
@@ -884,7 +839,7 @@ fn refusals() -> Vec<Row> {
     ]
 }
 
-/// Calls that are valid at their boundary: each launches and writes its codes.
+/// Calls that are valid at their boundary.
 fn accepted() -> Vec<(&'static str, Edit)> {
     vec![
         ("rows 16", |p: &mut Plan| {
@@ -910,18 +865,12 @@ fn accepted() -> Vec<(&'static str, Edit)> {
     ]
 }
 
-/// One attempted call: the result of the call, the `k_codes` bytes after it, and whether the
-/// plan aliased two ranges (whose launch may legally write the codes).
 struct Attempt {
     result: Result<(), EngError>,
     codes: Vec<u8>,
     aliased: bool,
 }
 
-/// The whole device phase of the refusal test: the base call, every refusal row (the decode or
-/// chunk entry as its row says) and every accepted row, then the base call again. Both rigs
-/// drop with every buffer before the plain attempts return, so the asserts below never run
-/// inside a live backend.
 struct RefusalPhase {
     first: Attempt,
     rows: Vec<Attempt>,
@@ -1011,8 +960,6 @@ fn kv8_append_rejects_bad_calls_before_any_launch() {
     }
 }
 
-// ---- the zero-scale groups of the format ----
-
 /// The rows of a zero-scale case: in every row block, group `g % 4 == 0` holds lanes that are
 /// ALL nonzero at an amax about 1e-40 (an f32 subnormal, far below the smallest fp16 scale),
 /// group `g % 4 == 1` mixes tiny nonzero lanes with exact zeros, and the other groups hold an
@@ -1051,8 +998,6 @@ struct ZeroScaleCase {
     v: Vec<f32>,
 }
 
-/// One device outcome: the entry label with the case, the device plane bytes and the reference
-/// images, as plain vectors.
 struct ZeroScaleOutcome {
     label: String,
     case: Case,
@@ -1060,8 +1005,6 @@ struct ZeroScaleOutcome {
     want: [Vec<u8>; 4],
 }
 
-/// Runs one case through one entry (the decode entry at its device word, the chunk entry at its
-/// host base position) and reads the planes back; every owner drops before the return.
 fn zero_scale_run(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -1096,9 +1039,6 @@ fn zero_scale_run(
     ])
 }
 
-/// The device phase of the zero-scale cases: every case through BOTH entries, the context and
-/// its stream dropped with the buffers before the plain vectors return, so the assertions below
-/// never run inside a live backend (a drop while panicking latches it).
 fn zero_scale_phase(cases: &[ZeroScaleCase]) -> Result<Vec<ZeroScaleOutcome>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -1130,8 +1070,6 @@ fn zero_scale_phase(cases: &[ZeroScaleCase]) -> Result<Vec<ZeroScaleOutcome>, En
     Ok(outcomes)
 }
 
-/// Asserts the stored scale bits and the codes of every zero-scale group (the `g % 4 < 2`
-/// groups of every kv head and appended cell) are 0 in both planes.
 fn assert_zero_scale(label: &str, c: &Case, got: &[Vec<u8>; 4]) {
     let groups = c.head_dim / GROUP;
     for (name, codes, scales) in [("k", &got[0], &got[1]), ("v", &got[2], &got[3])] {
@@ -1162,8 +1100,6 @@ fn kv8_append_writes_zero_codes_when_the_stored_scale_is_zero() {
     if !testkit::device_present("kv8_append_writes_zero_codes_when_the_stored_scale_is_zero") {
         return;
     }
-    // The setup pinned: group 0 is nonzero everywhere with amax about 5e-40, group 1 holds
-    // exact zeros beside tiny lanes, and the host reference maps both to scale bits 0, codes 0.
     let rows = zero_scale_rows(1, 1, 128, 1.0);
     let (all_nonzero, mixed) = (&rows[..GROUP], &rows[GROUP..2 * GROUP]);
     let amax = all_nonzero.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
@@ -1209,8 +1145,6 @@ fn kv8_append_writes_zero_codes_when_the_stored_scale_is_zero() {
     }
 }
 
-// ---- the NaN poison of a stored group scale (the NaN propagates) ----
-
 /// One poisoned group of a scenario: `plane` 0 is K, 1 is V; `row` is the row block whose cell
 /// is `pos + row`. `stamp` is written into the group-local `lanes`, and `scale_nan` says what
 /// the STORED scale must be (an fp16 NaN, or +Inf for the inf case).
@@ -1243,8 +1177,6 @@ fn stamped_case(c: &Case, marks: &[PoisonMark], value: Option<f32>) -> Case {
     out
 }
 
-/// One poison scenario: the clean case, the poisoned case (the same rows with the marked lanes
-/// stamped), the marks and the entry (`chunk`).
 struct PoisonScenario {
     clean: Case,
     poisoned: Case,
@@ -1270,8 +1202,6 @@ fn poison_scenario(
     }
 }
 
-/// One scenario's device outcome: the entry's four plane images for the clean and the poisoned
-/// run, plus the clean case and the marks. Plain data: every owner drops inside `poison_phase`.
 struct PoisonOutcome {
     label: String,
     case: Case,
@@ -1280,9 +1210,6 @@ struct PoisonOutcome {
     poisoned: [Vec<u8>; 4],
 }
 
-/// The device phase of the poison scenarios: both runs through the scenario's entry, and every
-/// owner (context, stream, buffers) dropped before the plain outcomes return (a drop while
-/// panicking latches the backend). No assertion runs here.
 fn poison_phase(scenarios: &[PoisonScenario]) -> Result<Vec<PoisonOutcome>, EngError> {
     let ctx = CudaContext::new()?;
     let stream = ctx.stream()?;
@@ -1322,9 +1249,6 @@ fn poison_phase(scenarios: &[PoisonScenario]) -> Result<Vec<PoisonOutcome>, EngE
     Ok(outcomes)
 }
 
-/// Asserts one outcome: the clean run is the host reference; every marked group's STORED scale
-/// is an fp16 NaN (or +Inf for an inf mark) and every dequantized value of the group is
-/// non-finite; every byte outside the marked groups is bit-equal to the clean run.
 fn assert_poison_outcome(o: &PoisonOutcome) {
     let c = &o.case;
     let groups = c.head_dim / GROUP;

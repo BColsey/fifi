@@ -124,10 +124,6 @@ impl Tokenizer {
         let vocab_size = u32::try_from(inner.get_vocab_size(true)).map_err(|_| {
             EngError::Checkpoint("tokenizer vocabulary size does not fit in u32".to_string())
         })?;
-        // Load-time boundary eligibility (see the struct doc): truncation
-        // and padding rewrite the id stream, and any added token with a
-        // contextual/text-altering matching flag can make an independent
-        // chunk split disagree with the whole-string encoding.
         // The one extra parse: a deterministic check for BPE dropout,
         // which the behavioral probe below cannot catch reliably at low
         // dropout rates (a 0.001 dropout agrees with itself ~92% of the
@@ -304,8 +300,6 @@ impl Tokenizer {
         Ok((encoding.get_ids().to_vec(), encoding.get_offsets().to_vec()))
     }
 
-    /// The load-time eligibility computed in `from_bytes` (see the struct
-    /// doc). Callers use it to gate the derived boundary path.
     pub fn boundary_eligible(&self) -> bool {
         self.boundary_eligible
     }

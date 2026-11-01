@@ -106,16 +106,15 @@ pub(in crate::family::flint) fn coalesce_residual_flagged() -> bool {
 /// silently. Pure mapping from the environment value to the flag, testable without
 /// poisoning the process-wide OnceLock: absent keeps the default ON; once set, only the
 /// explicit enable words stay on; non-UTF-8 and every other value roll back OFF (the
-/// `env_allows_default_on` polarity, so a mis-set rollback cannot silently fail).
+/// `env_allows_default_on` polarity).
 pub(in crate::family::flint) fn ring_view_env_flag(
     value: std::result::Result<String, std::env::VarError>,
 ) -> bool {
     crate::tokenizer::env_result_allows_default_on(value)
 }
 
-/// Reads FIFI_FLINT_MLX_RING_VIEW once per process (fail-safe: absent is
-/// the default ON; a set value survives only as the explicit enable words)
-/// and logs the one load line an operator needs to confirm a rollback.
+/// Reads FIFI_FLINT_MLX_RING_VIEW once per process and logs the one load
+/// line an operator needs to confirm a rollback.
 pub(in crate::family::flint) fn ring_view_flagged() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {

@@ -19,7 +19,6 @@ use crate::{
     tensor::ExecutionTensor,
 };
 
-/// One QSA chunk: the layer output rows and the replacement layer state.
 pub(super) struct QsaChunk {
     /// Layer output `[T, H]`.
     pub(super) out: ExecutionTensor,
@@ -250,7 +249,6 @@ mod tests {
         }
     }
 
-    /// One decode step at `pos` on the fixture input.
     fn decode_one(rig: &mut Rig, state: &LayerState, pos: u32) -> QsaStep {
         let x = rig
             .kernels
@@ -271,7 +269,6 @@ mod tests {
         .unwrap()
     }
 
-    /// One chunk of `rows` rows from position `pos` on the fixture inputs.
     fn chunk_one(rig: &mut Rig, state: &LayerState, pos: u32, rows: u32) -> QsaChunk {
         let flat: Vec<f32> = (pos..pos + rows).flat_map(input).collect();
         let x = rig

@@ -173,7 +173,6 @@ fn ane_rejections_carry_their_own_reason() {
 
 #[test]
 fn ane_serves_predictions_after_rejected_shapes() {
-    // A rejected shape leaves the process-global bridge state usable.
     let _serial = ANE_TEST.lock().unwrap();
     let rejected = HeadConfig {
         input: 64,

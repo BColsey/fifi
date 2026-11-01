@@ -54,7 +54,6 @@ fn flag_buffer(ctx: &CudaContext) -> DeviceBuffer {
     testkit::upload_bytes(ctx, &CLEAR)
 }
 
-/// The separate publish kernel over `count` contiguous values of `raw`.
 fn publish_separately(
     ctx: &CudaContext,
     stream: &DeviceStream,
@@ -600,7 +599,6 @@ fn fused_grouped_projection_publishes_exceptional_biases_like_the_separate_kerne
     let first_group_rows = GROUPED_MIXED[0].2;
     for gather in [false, true] {
         for (name, bias) in exceptional_biases() {
-            // Only the first group's column carries the value; every other bias is zero.
             let mut biases = vec![Some(vec![0.0f32; n]); GROUPED_MIXED.len()];
             biases[0].as_mut().unwrap()[column] = bias;
             let input = vec![0.0f32; total * k];
@@ -686,7 +684,6 @@ fn grouped_set_mixing_fused_arms_is_refused_without_latching_the_backend() {
     );
     stream.synchronize().unwrap();
     assert_eq!(testkit::read_bytes(&ctx, &flag, 4), CLEAR, "nothing ran");
-    // The same context still serves a valid grouped call, in both arms.
     let biases = vec![None; GROUPED_MIXED.len()];
     for gather in [false, true] {
         let [_, published, raw_flag, fused, fused_flag] =

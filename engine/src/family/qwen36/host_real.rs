@@ -49,7 +49,6 @@ fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| panic!("set {name}")))
 }
 
-/// The five largest logits as `(token, logit)`, the lowest token first on ties.
 fn top5(logits: &[f32]) -> Vec<(u32, f32)> {
     let mut ranked: Vec<(u32, f32)> = logits
         .iter()
@@ -65,7 +64,6 @@ fn top5(logits: &[f32]) -> Vec<(u32, f32)> {
 /// included at compile time, so the pins have one source and no copy in code.
 const ENVIRONMENT_RECORD: &str = include_str!("../../../testdata/mac-phase0a.json");
 
-/// Name, size in bytes, and SHA-256 of one checkpoint file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileId {
     name: String,
@@ -73,7 +71,6 @@ struct FileId {
     sha256: String,
 }
 
-/// The sorted shard names of an index.
 fn shard_names(index: &[u8]) -> Vec<String> {
     let map: serde_json::Value = serde_json::from_slice(index).unwrap();
     let mut names: Vec<String> = map["weight_map"]
@@ -87,7 +84,6 @@ fn shard_names(index: &[u8]) -> Vec<String> {
     names
 }
 
-/// Hashes a file in 1 MiB reads and returns its identity.
 fn hash_file(path: &Path, name: &str) -> FileId {
     let mut file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let (mut hasher, mut buffer, mut bytes) = (Sha256::new(), vec![0u8; 1 << 20], 0u64);
@@ -353,7 +349,6 @@ mod tests {
         assert!(sha("model-00004-of-00004.safetensors").ends_with("a5422"));
     }
 
-    /// The rejection message of `check_pins`; fails the test when the files are accepted.
     fn rejection(files: &[FileId]) -> String {
         let result = check_pins(ENVIRONMENT_RECORD, files);
         assert!(result.is_err(), "the files must be rejected");

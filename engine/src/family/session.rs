@@ -69,9 +69,7 @@ pub(crate) trait TokenStepper {
         let logits = self.logits(token)?;
         sample_logits(Self::OPERATION, &logits, sampler, sampler_vocab)
     }
-    /// The number of positions fed so far.
     fn fed(&self) -> usize;
-    /// Clears the model state of the session.
     fn reset(&mut self) -> Result<()>;
 }
 
@@ -91,7 +89,6 @@ pub(crate) fn sample_logits(
     sampler.sample(visible)
 }
 
-/// The limits of one engine that every `decode` call applies.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits<'a> {
     /// Every id that ends generation (`TokenizerBundle::eos_token_ids`).
@@ -103,7 +100,6 @@ pub(crate) struct Limits<'a> {
     pub(crate) context_limit: usize,
 }
 
-/// The token side of one session.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DecodeSession {
     /// Every committed token: the prompt and the sampled tokens, including a final EOS token.
@@ -127,22 +123,18 @@ pub(crate) enum DecodePreparation {
 }
 
 impl DecodeSession {
-    /// The committed tokens.
     pub(crate) fn history(&self) -> &[u32] {
         &self.history
     }
 
-    /// The number of leading history tokens that the prompt supplied.
     pub(crate) fn prompt_len(&self) -> usize {
         self.prompt_len
     }
 
-    /// The token that the next step feeds, or `None`.
     pub(crate) fn pending(&self) -> Option<u32> {
         self.pending
     }
 
-    /// True after a finish and before the next `reset`.
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
     }
@@ -587,7 +579,6 @@ pub(crate) enum SaveKind {
     Block,
 }
 
-/// The limits of a `PrefixStore`: how many pinned roots and how many LRU entries it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreLimits {
     /// The number of pinned roots (`SaveKind::Root` entries).
@@ -597,7 +588,6 @@ pub(crate) struct StoreLimits {
 }
 
 impl Default for StoreLimits {
-    /// Zero roots and one entry.
     fn default() -> Self {
         Self {
             roots: 0,
@@ -746,7 +736,6 @@ pub(crate) struct PrefixStore<S, P> {
     roots: Vec<Stored<S, P>>,
     /// The LRU entries, from the least to the most recently used.
     lru: Vec<Stored<S, P>>,
-    /// The limits of the store.
     limits: StoreLimits,
     /// CUDA pinned stores opt in; other executors keep the legacy eviction rules.
     protect_recent_longer: bool,
@@ -816,7 +805,6 @@ impl<S, P> Default for PrefixStore<S, P> {
 }
 
 impl<S, P> PrefixStore<S, P> {
-    /// A store with the given limits.
     pub(crate) fn with_limits(limits: StoreLimits) -> Self {
         Self {
             roots: Vec::new(),
@@ -863,17 +851,14 @@ impl<S, P> PrefixStore<S, P> {
             .map(|stored| stored.saved.key.len())
     }
 
-    /// The number of pinned roots.
     pub(crate) fn roots_len(&self) -> usize {
         self.roots.len()
     }
 
-    /// The number of LRU entries.
     pub(crate) fn entries_len(&self) -> usize {
         self.lru.len()
     }
 
-    /// The limits this store was built with.
     pub(crate) fn limits(&self) -> StoreLimits {
         self.limits
     }
@@ -886,13 +871,10 @@ impl<S, P> PrefixStore<S, P> {
         u32::try_from(self.restore_drops).unwrap_or(u32::MAX)
     }
 
-    /// The restore-side attribution twin of `restore_drop_count`.
     pub(crate) fn eviction_count(&self) -> u32 {
         u32::try_from(self.evictions).unwrap_or(u32::MAX)
     }
 
-    /// Save-side attribution: the counter snapshot for `PrefixReport` (flat lifetime totals; the
-    /// attribution rule is the field docs' - one sample per request line).
     pub(crate) fn save_side_totals(&self) -> SaveSideTotals {
         // u64 end-to-end: these are lifetime totals, and a clamped u32 readout would
         // silently stop reflecting the store's history once it saturates.
@@ -1434,15 +1416,11 @@ impl<S, P: PartialEq> PrefixStore<S, P> {
     }
 }
 
-/// One stored entry of a `PrefixStore`: the saved prefix plus its store id and its save kind.
 struct Stored<S, P> {
-    /// The id of this entry in its store. Ids are never reused.
     id: u64,
-    /// What kind of save produced this entry.
     kind: SaveKind,
     /// Requests since the last successful use, saturated rather than wrapped.
     requests_since_use: u8,
-    /// The key, the pending token, the numeric path, and the state.
     saved: SavedPrefix<S, P>,
 }
 
@@ -1527,7 +1505,6 @@ mod tests {
     /// A tokenizer whose id 0 is the first byte of a two-byte character (see `tokenizer/tests.rs`).
     const SPLIT_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{"id":4,"content":"<end>","special":true,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false}],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"Ã":0,"©":1,"Ã©":2,"a":3},"merges":[]}}"#;
 
-    /// The vocabulary of the fake model.
     const VOCAB: usize = 8;
 
     /// A scripted model: it records every call and has no native state. A logits step on token `t`
@@ -1540,18 +1517,15 @@ mod tests {
         resets: usize,
         /// `feed` fails for this token.
         fail_feed_on: Option<u32>,
-        /// `reset` fails.
         fail_reset: bool,
         /// The batches that `feed_rows` received, in call order.
         batches: Vec<Vec<u32>>,
-        /// `logits` fails.
         fail_logits: bool,
         /// The width of a logits row. A row wider than `VOCAB` ends with the value 100.0.
         width: usize,
     }
 
     impl Fake {
-        /// A model whose logits rows are `VOCAB` wide.
         fn new() -> Self {
             Self {
                 width: VOCAB,
@@ -1632,7 +1606,6 @@ mod tests {
         GenerationState::new(IncrementalDecoder::new(&tokenizer))
     }
 
-    /// The synthetic tokenizer cut to its first `size` ids.
     fn tokenizer_with_vocab(size: usize) -> Tokenizer {
         let full = r#""vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7}"#;
         let ids: Vec<String> = "abcdefgh"
@@ -2291,7 +2264,6 @@ mod tests {
     #[test]
     fn logits_one_short_of_the_sampler_vocabulary_give_a_backend_error() {
         assert_eq!(narrow_logits_result(VOCAB - 1), Err(narrow_logits_error()));
-        // A row of exactly the sampler width is accepted.
         let result = narrow_logits_result(VOCAB);
         assert_eq!(
             result.map(|b| b.tokens),
@@ -2611,7 +2583,6 @@ mod tests {
     /// and the numeric path is a small number.
     type Slot = PrefixStore<Vec<u32>, u8>;
 
-    /// A store with room for `roots` roots and `entries` LRU entries.
     fn store(roots: usize, entries: usize) -> Slot {
         PrefixStore::with_limits(StoreLimits { roots, entries })
     }
@@ -3159,7 +3130,6 @@ mod tests {
         assert_eq!(session.prompt_len(), 4, "restored prompt length");
         assert_eq!(session.pending(), Some(4), "restored pending token");
         assert!(!session.is_finished(), "finished");
-        // Three of the four key tokens are fed. The fourth is pending.
         assert_eq!(step.fed, vec![1, 2, 3], "fed tokens after the restore");
         session.prefill(&mut step, &prompt[4..], LIMIT).unwrap();
         assert_eq!(
@@ -3234,7 +3204,6 @@ mod tests {
         assert_save_rejected(&session, &step, &mut slot, &[1, 2], "a shorter key");
         assert_save_rejected(&session, &step, &mut slot, &[1, 2, 9], "a divergent key");
         assert_save_rejected(&session, &step, &mut slot, &[1, 2, 3, 4], "a longer key");
-        // The session now holds four tokens. The old key of three tokens is not the held prompt.
         session.prefill(&mut step, &[4], LIMIT).unwrap();
         assert_save_rejected(&session, &step, &mut slot, &[1, 2, 3], "a stale key");
         // A decoded token joins the history but not the held prompt, so even the full history
@@ -3412,8 +3381,6 @@ mod tests {
         let (mut step, mut session) = held(&[1, 2, 3]);
         let mut slot = Slot::default();
         assert_eq!(save(&session, &mut slot, &step, &[1, 2, 3], 1), Ok(true));
-        // A save of a new key drops the earlier entry before the snapshot runs, so the failure
-        // leaves the store empty.
         session.prefill(&mut step, &[4, 5], LIMIT).unwrap();
         let failed = session.save_prefix(
             &mut slot,
@@ -3528,7 +3495,6 @@ mod tests {
                 Ok(())
             }
         });
-        // The retried adoption covers the anchor's three tokens.
         assert_eq!(covered, Ok(3), "the retried candidate restores");
         // The eviction spent the kind-order victim - the dead TIP [1,2,3,4], tier 0 -
         // while the retried candidate survives: one victim, exactly.
@@ -3651,7 +3617,6 @@ mod tests {
             Ok(true),
             "the tip of 8 tokens"
         );
-        // A prompt that extends the tip restores the tip: 8 of its 9 tokens are covered.
         session.reset(&mut step).unwrap();
         let extends_tip = [1, 2, 3, 4, 5, 6, 7, 8, 9];
         assert_eq!(
@@ -3659,7 +3624,6 @@ mod tests {
             8,
             "the tip covers 8"
         );
-        // A prompt that diverges after the root restores the root: 4 of its 7 tokens.
         session.reset(&mut step).unwrap();
         let extends_root = [1, 2, 3, 4, 9, 10, 11];
         assert_eq!(
@@ -3690,8 +3654,6 @@ mod tests {
             ),
             Ok(true)
         );
-        // A second conversation: the same 4 system tokens, a different continuation. The tip of
-        // the first conversation is no prefix of it, so the root restores.
         session.reset(&mut step).unwrap();
         let second = [1, 2, 3, 4, 9, 9, 9, 9, 9];
         assert_eq!(
@@ -3720,7 +3682,6 @@ mod tests {
             vec![(3, false), (4, false), (2, false)],
             "least to most recently used"
         );
-        // A restore is a use: the first entry becomes the most recently used one.
         assert_eq!(
             restore(&mut a, &mut slot, &mut step_a, &[1, 2, 3, 4], 1).unwrap(),
             3,
@@ -3731,7 +3692,6 @@ mod tests {
             vec![(4, false), (2, false), (3, false)],
             "the restore made the first entry the most recently used"
         );
-        // The fourth save drops the least recently used entry: the second one.
         let (step_d, d) = held(&[3, 3, 3, 3, 3]);
         assert_eq!(save(&d, &mut slot, &step_d, &[3, 3, 3, 3, 3], 1), Ok(true));
         assert_eq!(
@@ -3761,7 +3721,6 @@ mod tests {
         }
         assert_eq!(slot.roots_len(), 1, "the root survived five tip saves");
         assert_eq!(slot.entries_len(), 2, "only the last two tips remain");
-        // A prompt that shares the root but no tip restores the root.
         session.reset(&mut step).unwrap();
         let other = [1, 2, 3, 4, 9, 9, 9];
         assert_eq!(
@@ -3783,7 +3742,6 @@ mod tests {
             4,
             "the entry restores"
         );
-        // The next turn extends the restored entry, so the tip replaces it.
         session.prefill(&mut step, &[5], LIMIT).unwrap();
         assert_eq!(
             save(&session, &mut slot, &step, &[1, 2, 3, 4, 5], 1),
@@ -4503,7 +4461,6 @@ mod tests {
             "another path restores nothing"
         );
         assert_eq!(slot.entries_len(), 1, "the entry stays for its own path");
-        // A save of the same key under the other path replaces the entry.
         let (mut step2, mut other) = held(&[1, 2, 3, 4]);
         assert_eq!(
             save_as(&other, &mut slot, &step2, &[1, 2, 3, 4], 2, SaveKind::Tip),
@@ -4586,7 +4543,6 @@ mod tests {
             "the root restores for a divergent continuation"
         );
         assert_eq!(slot.restored_kind(), Some(SaveKind::Root), "the root kind");
-        // A restore that matches nothing clears the kind.
         session.reset(&mut step).unwrap();
         assert_eq!(
             restore(&mut session, &mut slot, &mut step, &[9, 9, 9], 1).unwrap(),
@@ -4594,7 +4550,6 @@ mod tests {
             "nothing matches"
         );
         assert_eq!(slot.restored_kind(), None, "the kind is cleared");
-        // A tip restore names the tip, and the kind survives the lineage drop of that entry.
         session.reset(&mut step).unwrap();
         assert_eq!(
             restore(
@@ -4681,13 +4636,11 @@ mod tests {
             4,
             "the full tip key counts beyond a zero restore"
         );
-        // A restore that took the longest common prefix reports 0.
         assert_eq!(
             slot.uncached_shared(&[1, 2, 3, 4, 5], 4),
             0,
             "the restored key"
         );
-        // A shorter restore leaves the tip tokens uncached.
         assert_eq!(
             slot.uncached_shared(&[1, 2, 3, 4, 5], 2),
             2,

@@ -23,7 +23,6 @@ const ZERO_CHUNK_BYTES: usize = 8 << 20;
 /// The widest pick list the expert launch takes (`n_used` is 1 to 8).
 const MAX_TOP_K: usize = 8;
 
-/// The shape of one expert and the picks per token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExpertBankGeometry {
     /// Model hidden size: columns of gate and up, rows of down.
@@ -170,7 +169,6 @@ impl ExpertBank {
         &self.down
     }
 
-    /// Bytes of one expert's gate (or up) slice and of its down slice.
     pub(crate) fn slice_bytes(&self) -> Result<(usize, usize), EngError> {
         self.geometry.slice_bytes()
     }

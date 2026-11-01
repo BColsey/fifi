@@ -197,7 +197,6 @@ pub(super) fn sources(seed: u64) -> Sources {
     }
 }
 
-/// One buffer of f32 values, one of zeroed bytes.
 pub(super) fn f32_buf(ctx: &CudaContext, values: &[f32]) -> Result<DeviceBuffer, EngError> {
     ctx.upload(
         &values

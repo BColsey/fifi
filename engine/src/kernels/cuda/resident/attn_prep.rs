@@ -58,13 +58,9 @@ use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 pub(crate) const HEAD_DIM: usize = 256;
 /// The most tokens one call takes (the grid's y extent).
 pub(crate) const MAX_TOKENS: usize = 65_535;
-/// The most query heads.
 pub(crate) const MAX_N_HEAD: usize = 256;
-/// The most kv heads.
 pub(crate) const MAX_N_KV_HEAD: usize = 64;
-/// The most cache rows: `2^30 - 1`.
 pub(crate) const MAX_ROWS: usize = (1 << 30) - 1;
-/// Bytes of one norm weight vector: 256 f32.
 const NORM_BYTES: usize = HEAD_DIM * 4;
 
 /// Where row `*pos + t` of the cache lives.
@@ -132,12 +128,10 @@ pub(crate) struct AttnPrepCall<'b> {
     pub(crate) status: DeviceRange<'b>,
 }
 
-/// A `BadRequest` that names the rule that fired.
 fn rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("attn_prep: {tag}: {detail}"))
 }
 
-/// A `BadRequest` for a configuration that needs the Mellum kernel.
 fn needs_mel_k1(tag: &str, detail: &str) -> EngError {
     rule(
         tag,
@@ -145,12 +139,10 @@ fn needs_mel_k1(tag: &str, detail: &str) -> EngError {
     )
 }
 
-/// `value` as `c_int` for the rule `tag`, or the "exceeds i32" refusal.
 fn to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
-/// `value` as `c_int` when it lies in `low..=high`, else the refusal for `tag`.
 fn ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, EngError> {
     if !(low..=high).contains(&value) {
         return Err(rule(tag, &format!("{tag} is {value}, not {low} to {high}")));
@@ -174,14 +166,12 @@ pub(crate) fn proj_bytes(m: usize, ld: usize, row_w: usize) -> usize {
         .saturating_mul(4)
 }
 
-/// Bytes of each cache: `rows` rows of `n_kv_head` fp16 heads of 256.
 pub(crate) fn cache_bytes(rows: usize, n_kv_head: usize) -> usize {
     rows.saturating_mul(n_kv_head)
         .saturating_mul(HEAD_DIM)
         .saturating_mul(2)
 }
 
-/// Bytes of `q`: `m` rows of `n_head` f32 heads of 256.
 pub(crate) fn q_bytes(m: usize, n_head: usize) -> usize {
     m.saturating_mul(n_head)
         .saturating_mul(HEAD_DIM)
@@ -191,14 +181,12 @@ pub(crate) fn q_bytes(m: usize, n_head: usize) -> usize {
 /// The most tokens one rows call takes: the decode bound of `kv8_append`.
 pub(crate) const MAX_DECODE_ROWS: usize = 16;
 
-/// Bytes of each rows buffer: `m` rows of `n_kv_head` f32 heads of 256.
 pub(crate) fn rows_bytes(m: usize, n_kv_head: usize) -> usize {
     m.saturating_mul(n_kv_head)
         .saturating_mul(HEAD_DIM)
         .saturating_mul(4)
 }
 
-/// Checks the configuration rules (head size, gate, slot mode).
 fn check_configuration(shape: &AttnPrepShape) -> Result<(), EngError> {
     if shape.head_dim != HEAD_DIM {
         return Err(needs_mel_k1(
@@ -222,7 +210,7 @@ fn check_configuration(shape: &AttnPrepShape) -> Result<(), EngError> {
 }
 
 /// Checks every shape rule and converts the integers once, so that no conversion can fail inside
-/// the launch closure. Each refusal carries the tag `attn_prep: <rule>`.
+/// the launch closure.
 pub(in crate::kernels::cuda) fn check_shape(shape: &AttnPrepShape) -> Result<AttnInts, EngError> {
     check_configuration(shape)?;
     let n_head = ranged("n_head", shape.n_head, 1, MAX_N_HEAD)?;
@@ -254,7 +242,6 @@ pub(in crate::kernels::cuda) fn check_shape(shape: &AttnPrepShape) -> Result<Att
     })
 }
 
-/// Checks `eps` (finite, above 0) and `rope_base` (finite, above 1).
 pub(crate) fn check_rope(rope: &RopeParams) -> Result<(), EngError> {
     if !(rope.eps.is_finite() && rope.eps > 0.0) {
         return Err(rule("eps", "eps is not finite and above 0"));
@@ -265,8 +252,7 @@ pub(crate) fn check_rope(rope: &RopeParams) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Size and alignment of each range, one `require_fit` per range. Only valid after
-/// [`check_shape`], so the sizes cannot overflow.
+/// Only valid after [`check_shape`], so the sizes cannot overflow.
 fn check_fit(call: &AttnPrepCall<'_>) -> Result<(), EngError> {
     let shape = &call.shape;
     let row_w = row_width(shape.n_head, shape.n_kv_head);
@@ -329,17 +315,14 @@ pub(crate) struct AttnPrepRowsCall<'b> {
     pub(crate) status: DeviceRange<'b>,
 }
 
-/// A `BadRequest` that names the rule of the rows entry that fired.
 fn rows_rule(tag: &str, detail: &str) -> EngError {
     EngError::BadRequest(format!("attn_prep_rows: {tag}: {detail}"))
 }
 
-/// `value` as `c_int` for the rows rule `tag`, or the "exceeds i32" refusal.
 fn rows_to_int(tag: &str, value: usize) -> Result<c_int, EngError> {
     c_int::try_from(value).map_err(|_| rows_rule(tag, &format!("{tag} is {value}, above i32::MAX")))
 }
 
-/// `value` as `c_int` when it lies in `low..=high`, else the rows refusal for `tag`.
 fn rows_ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int, EngError> {
     if !(low..=high).contains(&value) {
         return Err(rows_rule(
@@ -352,7 +335,7 @@ fn rows_ranged(tag: &str, value: usize, low: usize, high: usize) -> Result<c_int
 
 /// Checks every shape rule of the rows entry and converts the integers once: the configuration
 /// rules are [`check_shape`]'s, `m` is bounded by the decode bound [`MAX_DECODE_ROWS`] and `rows`
-/// is the plane cell count. Each refusal carries the tag `attn_prep_rows: <rule>`.
+/// is the plane cell count.
 fn check_rows_shape(shape: &AttnPrepShape) -> Result<AttnInts, EngError> {
     check_configuration(shape)?;
     let n_head = rows_ranged("n_head", shape.n_head, 1, MAX_N_HEAD)?;
@@ -384,9 +367,6 @@ fn check_rows_shape(shape: &AttnPrepShape) -> Result<AttnInts, EngError> {
     })
 }
 
-/// Size and alignment of each range of a rows call: `proj`, the norms, `pos` and `status` as in
-/// [`check_fit`], `q` as in [`check_fit`], and `k_rows`/`v_rows` of [`rows_bytes`] each, 16-byte
-/// aligned.
 fn check_rows_fit(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
     let shape = &call.shape;
     let row_w = row_width(shape.n_head, shape.n_kv_head);
@@ -410,8 +390,6 @@ fn check_rows_fit(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
     require_fit("status", &call.status, 4, 4)
 }
 
-/// Disjointness of the touched extents of a rows call: as [`check_apart`], with the rows buffers
-/// in place of the caches.
 fn check_rows_apart(call: &AttnPrepRowsCall<'_>) -> Result<(), EngError> {
     let shape = &call.shape;
     let row_w = row_width(shape.n_head, shape.n_kv_head);

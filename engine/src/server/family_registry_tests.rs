@@ -1,4 +1,4 @@
-//! Family registry tests. The registry is a lookup — no starter runs here.
+//! The registry is a lookup — no starter runs here.
 
 use super::config::EngineConfig;
 use super::run::{StartedEngine, family_starter};

@@ -65,7 +65,6 @@ pub(super) fn all_ids() -> Vec<u32> {
         .collect()
 }
 
-/// Tokens of the first prompt.
 fn prompt_rows() -> usize {
     std::env::var("FIFI_PF_ROWS")
         .ok()

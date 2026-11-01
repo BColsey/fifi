@@ -1,7 +1,4 @@
-// Decision head for small baked-weight classifiers: CPU adapter now, ANE
-// adapter later. Checked weights carry their validated configuration, and the
-// adapters read it from there. Callers build weights, then call predict. The
-// two-layer SiLU math and the adapter dispatch stay inside.
+// Decision head for small baked-weight classifiers.
 use std::ffi::c_int;
 
 use crate::EngError;
@@ -25,8 +22,6 @@ impl HeadConfig {
         Ok(())
     }
 
-    /// The dimensions as the C int values that native adapters receive.
-    /// A value above `c_int::MAX` is a request error, never a silent wrap.
     fn native_dimensions(&self) -> Result<[c_int; 4], EngError> {
         let narrow = |name: &str, value: usize| {
             c_int::try_from(value).map_err(|_| {

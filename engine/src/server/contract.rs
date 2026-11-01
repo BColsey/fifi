@@ -14,7 +14,6 @@ fn fixture() -> &'static Value {
     PARSED.get_or_init(|| serde_json::from_str(FIXTURE).expect("parse openapi.json"))
 }
 
-/// Compiles the schema at `pointer` in the contract document, for example `/components/schemas/Error`.
 fn validator(pointer: &str) -> Validator {
     let document = fixture();
     let schema = json!({
@@ -32,7 +31,6 @@ fn errors(pointer: &str, instance: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Panics with every violation when `instance` does not match the component schema `name`.
 pub(super) fn assert_schema(name: &str, instance: &Value) {
     let found = errors(&format!("/components/schemas/{name}"), instance);
     assert!(
@@ -41,7 +39,6 @@ pub(super) fn assert_schema(name: &str, instance: &Value) {
     );
 }
 
-/// Panics with every violation when `instance` does not match the schema at `pointer`.
 pub(super) fn assert_pointer(pointer: &str, instance: &Value) {
     let found = errors(pointer, instance);
     assert!(
@@ -50,7 +47,6 @@ pub(super) fn assert_pointer(pointer: &str, instance: &Value) {
     );
 }
 
-/// True when `instance` matches the component schema `name`.
 pub(super) fn matches_schema(name: &str, instance: &Value) -> bool {
     errors(&format!("/components/schemas/{name}"), instance).is_empty()
 }

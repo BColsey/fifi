@@ -66,8 +66,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// What one combine launch reads and writes. `shared_gate` and `shared` are both given or both
-/// absent. The in-place case is `out` at the address of `res`.
 pub(in crate::kernels::cuda) struct CombineRaw<'a> {
     pub(in crate::kernels::cuda) res: RawRange<'a>,
     pub(in crate::kernels::cuda) down: RawRange<'a>,
@@ -90,7 +88,7 @@ struct Need {
 }
 
 /// The byte needs of the integers of `call`, or `None` outside the limits of `valid()` in the
-/// `.cu` file or when a product overflows.
+/// `.cu` file.
 fn needs(call: &CombineRaw<'_>) -> Option<Need> {
     let [m, n, top_k, ld_down] =
         [call.m, call.n, call.top_k, call.ld_down].map(|value| usize::try_from(value).ok());
@@ -114,17 +112,14 @@ fn needs(call: &CombineRaw<'_>) -> Option<Need> {
     })
 }
 
-/// True when `range` holds `need` bytes and starts at a multiple of `align`.
 fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
     range.bytes >= need && range.offset.is_multiple_of(align)
 }
 
-/// True when the range is absent, or present and fitting.
 fn fits_if_given(range: Option<&RawRange<'_>>, need: usize, align: usize) -> bool {
     range.is_none_or(|range| fits(range, need, align))
 }
 
-/// True when `out` shares no byte with an input, except that it may be exactly `res`.
 fn out_apart(call: &CombineRaw<'_>, need: &Need) -> bool {
     let out = Span::of(&call.out, need.rows);
     let in_place = ptr::eq(call.out.device, call.res.device) && call.out.offset == call.res.offset;
@@ -142,9 +137,6 @@ fn out_apart(call: &CombineRaw<'_>, need: &Need) -> bool {
     inputs.iter().all(|input| out.apart(input))
 }
 
-/// Proves a combine launch before the native call: the limits, the optional pair, sizes,
-/// alignment (`res`, `down`, `shared` and `out` 16; `weights` and `shared_gate` 4) and that `out`
-/// overlaps no input except exactly `res`.
 fn check_combine(call: &CombineRaw<'_>) -> Result<(), DeviceFailure> {
     let need = needs(call).ok_or_else(invalid_argument)?;
     let paired = call.shared_gate.is_some() == call.shared.is_some();
@@ -160,7 +152,6 @@ fn check_combine(call: &CombineRaw<'_>) -> Result<(), DeviceFailure> {
     Ok(())
 }
 
-/// Queues the combine of `call` on `stream`: one kernel. Returns when it is queued.
 pub(in crate::kernels::cuda) fn moe_combine_launch(
     stream: &RawStream,
     call: &CombineRaw<'_>,
@@ -202,7 +193,6 @@ mod tests {
     use super::super::super::{RawDevice, STATUS_INVALID_ARGUMENT};
     use super::*;
 
-    /// The arguments of one `inference_cuda_moe_combine_launch` call as plain numbers.
     #[derive(Clone, Copy)]
     struct Numbers {
         res: usize,
@@ -235,14 +225,12 @@ mod tests {
         stream: 0x1,
     };
 
-    /// A named edit of a valid argument set.
     type Case = (&'static str, fn(&mut Numbers));
 
     fn pointer<T>(address: usize) -> *mut T {
         ptr::without_provenance_mut(address)
     }
 
-    /// `(status, stage)` of the entry for `numbers`, or for a NULL argument struct.
     fn run_combine(numbers: Numbers, null_args: bool) -> (c_int, c_int) {
         let args = CombineArgsRaw {
             res: pointer::<c_void>(numbers.res).cast_const(),

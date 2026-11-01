@@ -1,4 +1,4 @@
-//! Dense attention over borrowed cache parts: the first resident caller of the cache module.
+//! Dense attention over borrowed cache parts.
 //!
 //! This is a resident path. Any native failure is terminal, and the state keeps the shared inputs
 //! and every temporary array alive (see "Native failure policy" in the kernels design).

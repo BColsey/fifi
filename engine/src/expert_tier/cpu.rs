@@ -116,7 +116,6 @@ impl<K: CpuExpertKernel> CpuTier<K> {
         self.kernel.routed(experts, x, picks, out)
     }
 
-    /// Rows through their picked experts of `layer`, one pick-set per row.
     pub fn routed_batch(
         &self,
         layer: u32,

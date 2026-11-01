@@ -356,7 +356,6 @@ fn native_mixer_block_matches_the_tiled_block() {
     }
     drop(stream);
     drop(ctx);
-    // Host data only from here (the isolation split).
     for (kind, sources, tiled, native) in runs {
         for run in [&tiled, &native] {
             assert_finite("resid_out", &run.resid_out);

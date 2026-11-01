@@ -33,7 +33,6 @@ use super::{DeviceFailure, RawStream, STAGE_NONE, checked, invalid_argument};
 /// capture, or in instantiating it.
 pub(in crate::kernels::cuda) const STAGE_CAPTURE: c_int = 5;
 
-/// An executable graph. Consumed by [`exec_destroy`].
 #[derive(Debug)]
 #[must_use = "an executable graph must be passed to exec_destroy"]
 pub(in crate::kernels::cuda) struct RawGraphExec(NonNull<c_void>);
@@ -108,7 +107,6 @@ pub(in crate::kernels::cuda) fn capture_end(
     Ok(Some((RawGraphExec(exec), nodes)))
 }
 
-/// Whether `stream` is capturing right now.
 pub(in crate::kernels::cuda) fn stream_is_capturing(
     stream: &RawStream,
 ) -> Result<bool, DeviceFailure> {
@@ -121,7 +119,6 @@ pub(in crate::kernels::cuda) fn stream_is_capturing(
     Ok(capturing != 0)
 }
 
-/// Queues one replay of `exec` on `stream`. The replay has not finished when the call returns.
 pub(in crate::kernels::cuda) fn graph_launch(
     exec: &RawGraphExec,
     stream: &RawStream,
