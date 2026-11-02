@@ -27,6 +27,73 @@ unsafe extern "C" {
     fn peer_can_access_raw(device: c_int, peer: c_int, out_can: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_peer_enable"]
     fn peer_enable_raw(device: c_int, peer: c_int) -> c_int;
+    #[link_name = "inference_cuda_device_profile"]
+    fn device_profile_raw(
+        device: c_int,
+        out_name: *mut u8,
+        name_cap: c_int,
+        out_total: *mut u64,
+        out_free: *mut u64,
+        out_multiprocessors: *mut c_int,
+        out_bus_width: *mut c_int,
+        out_memory_clock_hz: *mut u64,
+    ) -> c_int;
+}
+
+/// One device's raw placement facts, as the profile query reports them. The
+/// clock is the runtime's memory clock in HZ; the bandwidth derivation
+/// (bus width, double data rate) belongs to the family layer that decides
+/// placement, not to this raw adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::kernels::cuda) struct RawDeviceProfile {
+    pub(in crate::kernels::cuda) name: String,
+    pub(in crate::kernels::cuda) total_bytes: u64,
+    pub(in crate::kernels::cuda) free_bytes: u64,
+    pub(in crate::kernels::cuda) multiprocessors: u32,
+    pub(in crate::kernels::cuda) bus_width_bits: u32,
+    pub(in crate::kernels::cuda) memory_clock_hz: u64,
+}
+
+/// The placement facts of `device`, or the native status. The free figure is
+/// a snapshot at call time; the entry allocates nothing.
+pub(in crate::kernels::cuda) fn device_profile(device: c_int) -> Result<RawDeviceProfile, c_int> {
+    if device < 0 {
+        return Err(super::STATUS_INVALID_ARGUMENT);
+    }
+    let mut name = [0u8; 256];
+    let (mut total, mut free): (u64, u64) = (0, 0);
+    let (mut multiprocessors, mut bus_width): (c_int, c_int) = (0, 0);
+    let mut clock_hz: u64 = 0;
+    // SAFETY: every out pointer is a live, writable value for the whole call
+    // and the adapter keeps no pointer after it returns.
+    let status = unsafe {
+        device_profile_raw(
+            device,
+            name.as_mut_ptr(),
+            name.len() as c_int,
+            &mut total,
+            &mut free,
+            &mut multiprocessors,
+            &mut bus_width,
+            &mut clock_hz,
+        )
+    };
+    if status != super::STATUS_OK {
+        return Err(status);
+    }
+    let end = name
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(name.len());
+    let name = String::from_utf8_lossy(&name[..end]).into_owned();
+    Ok(RawDeviceProfile {
+        name,
+        total_bytes: total,
+        free_bytes: free,
+        multiprocessors: u32::try_from(multiprocessors).unwrap_or(0),
+        bus_width_bits: u32::try_from(bus_width).unwrap_or(0),
+        memory_clock_hz: clock_hz,
+    })
 }
 
 /// Makes `device` the calling thread's current device, or the native status.
@@ -114,6 +181,39 @@ mod tests {
         let mut major: c_int = 0;
         let status = unsafe { device_cc_raw(0, &mut major, std::ptr::null_mut()) };
         assert_eq!(status, STATUS_INVALID_ARGUMENT);
+        // SAFETY: the profile entry checks every out pointer the same way.
+        let mut name = [0u8; 4];
+        let (total, mut free): (u64, u64) = (0, 0);
+        let (mut sms, mut bus): (c_int, c_int) = (0, 0);
+        let mut clock: u64 = 0;
+        let status = unsafe {
+            device_profile_raw(
+                0,
+                name.as_mut_ptr(),
+                name.len() as c_int,
+                std::ptr::null_mut(),
+                &mut free,
+                &mut sms,
+                &mut bus,
+                &mut clock,
+            )
+        };
+        assert_eq!(status, STATUS_INVALID_ARGUMENT);
+        let _ = total;
+    }
+
+    #[test]
+    fn the_profile_of_device_zero_reports_sane_facts() {
+        if !device_present("the_profile_of_device_zero_reports_sane_facts") {
+            return;
+        }
+        let profile = device_profile(0).expect("profile device 0");
+        assert!(!profile.name.is_empty(), "the device carries a name");
+        assert!(profile.total_bytes > 0 && profile.free_bytes > 0);
+        assert!(profile.free_bytes <= profile.total_bytes);
+        assert!(profile.multiprocessors > 0);
+        assert!(profile.bus_width_bits > 0 && profile.bus_width_bits.is_multiple_of(8));
+        assert!(profile.memory_clock_hz > 0);
     }
 
     #[test]

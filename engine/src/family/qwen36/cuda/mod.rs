@@ -22,6 +22,9 @@ mod card_load;
 mod card_load_tests;
 #[cfg(test)]
 mod card_moe_device_tests;
+mod card_session;
+#[cfg(test)]
+mod card_session_device_tests;
 mod card_step;
 mod card_token;
 #[cfg(test)]

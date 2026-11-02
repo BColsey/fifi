@@ -522,9 +522,12 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         .collect();
 
     let admission = served_admission();
-    let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
-    for card in 0..2 {
-        stack.write_step_params(card, &StepParams::new(FIRST_TOKEN as i32, 0)?)?;
+    let (stack, mut states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    for (card, state) in states.iter_mut().enumerate() {
+        state.write_step_params(
+            &stack.streams()[card],
+            &StepParams::new(FIRST_TOKEN as i32, 0)?,
+        )?;
     }
     let ctx0 = &stack.contexts()[0];
     let stream0 = &stack.streams()[0];
@@ -883,7 +886,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         })
         .collect();
     let moe_refs: Vec<&[MoeLayerWeights<'_>]> = moe_sets.iter().map(|s| s.as_slice()).collect();
-    let heads: Vec<NativeWeight> = (0..2)
+    let head_owners: Vec<NativeWeight> = (0..2)
         .map(|card| {
             upload_native(
                 &stack.contexts()[card],
@@ -893,9 +896,11 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             )
         })
         .collect::<Result<_, _>>()?;
-    let output_norms: Vec<DeviceBuffer> = (0..2)
+    let heads: Vec<&NativeWeight> = head_owners.iter().collect();
+    let output_norm_owners: Vec<DeviceBuffer> = (0..2)
         .map(|card| stack.contexts()[card].upload(&f32_bytes(&output_norm)))
         .collect::<Result<_, _>>()?;
+    let output_norms: Vec<&DeviceBuffer> = output_norm_owners.iter().collect();
     let block_ops: Vec<Vec<&[CardOp]>> = ops_owned
         .iter()
         .map(|per_layer| per_layer.iter().map(|l| l.as_slice()).collect::<Vec<_>>())
@@ -1070,6 +1075,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         // The distributed step.
         run_card_token(
             &stack,
+            &states,
             &kinds,
             &ordinals,
             &block_ops_refs,
@@ -1084,10 +1090,10 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         )?;
         let mut card_reads = Vec::with_capacity(2);
         let mut boundaries = Vec::with_capacity(2);
-        for card in 0..2 {
+        for (card, state) in states.iter().enumerate() {
             stack.streams()[card].synchronize()?;
             let pair = {
-                let word = stack.shards()[card].state().word(Word::ResultPair)?;
+                let word = state.word(Word::ResultPair)?;
                 let mut bytes = [0u8; 8];
                 word.buffer()
                     .read_at(&stack.streams()[card], word.offset(), &mut bytes)?;
@@ -1147,11 +1153,9 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         };
         card_token = merged_id.max(0) as u32;
         if t + 1 < tokens {
-            for card in 0..2 {
+            for (card, state) in states.iter().enumerate() {
                 let stream = &stack.streams()[card];
-                let word = stack.shards()[card]
-                    .state()
-                    .step_field(StepField::TokenId)?;
+                let word = state.step_field(StepField::TokenId)?;
                 word.buffer().write_at(
                     stream,
                     word.offset(),
@@ -1173,7 +1177,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         ring_words.push(u32::from_le_bytes(word));
     }
     let mut kv_drift = Vec::with_capacity(2);
-    for card in 0..2 {
+    for (card, state) in states.iter().enumerate() {
         let mut per_kv = Vec::with_capacity(full_ordinals.len());
         for &ord in &full_ordinals {
             let mut planes = Vec::with_capacity(4);
@@ -1185,7 +1189,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                     bytes
                 };
                 let got = {
-                    let view = stack.shards()[card].state().kv_plane(ord, plane)?;
+                    let view = state.kv_plane(ord, plane)?;
                     let mut bytes = vec![0u8; view.bytes()];
                     view.buffer()
                         .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
@@ -1222,7 +1226,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                 bytes_f32(&cb)
             };
             let (rec_card, conv_card) = {
-                let state = stack.shards()[card].state();
+                let state = &states[card];
                 let rec = state.delta_rec(0, ord)?;
                 let conv = state.delta_conv(0, ord)?;
                 let mut rb = vec![0u8; rec.bytes()];

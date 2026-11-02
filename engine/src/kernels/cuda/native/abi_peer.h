@@ -38,6 +38,23 @@ int inference_cuda_peer_can_access(int device, int peer, int *out_can);
  * calling thread's current device is `device` when the call returns. */
 int inference_cuda_peer_enable(int device, int peer);
 
+/* Writes the placement facts of `device`: its name into out_name (a caller
+ * buffer of name_cap bytes, NUL-terminated), the total and currently free
+ * global memory (cudaMemGetInfo under a temporary device selection, with
+ * the thread's previous device restored), the SM count, the memory bus
+ * width in bits, and the memory clock in Hz (the runtime reports kHz).
+ * Zeroes every out value on failure. The free figure is a snapshot at call
+ * time; no allocation is made here. */
+int inference_cuda_device_profile(
+    int device,
+    char *out_name,
+    int name_cap,
+    unsigned long long *out_total,
+    unsigned long long *out_free,
+    int *out_multiprocessors,
+    int *out_bus_width,
+    unsigned long long *out_memory_clock_hz);
+
 #ifdef __cplusplus
 }
 #endif

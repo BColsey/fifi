@@ -1,3 +1,5 @@
+#include <cstdio>
+
 #include <cuda_runtime.h>
 
 #include "abi.h"
@@ -94,6 +96,69 @@ extern "C" int inference_cuda_peer_enable(int device, int peer) {
         cudaError_t err = cudaSetDevice(device);
         if (err == cudaSuccess) {
             err = cudaDeviceEnablePeerAccess(peer, 0);
+        }
+        return finish(err);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_device_profile(
+    int device,
+    char *out_name,
+    int name_cap,
+    unsigned long long *out_total,
+    unsigned long long *out_free,
+    int *out_multiprocessors,
+    int *out_bus_width,
+    unsigned long long *out_memory_clock_hz) {
+    try {
+        if (device < 0 || out_name == NULL || name_cap <= 0 || out_total == NULL ||
+            out_free == NULL || out_multiprocessors == NULL || out_bus_width == NULL ||
+            out_memory_clock_hz == NULL) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        out_name[0] = '\0';
+        *out_total = 0;
+        *out_free = 0;
+        *out_multiprocessors = 0;
+        *out_bus_width = 0;
+        *out_memory_clock_hz = 0;
+        (void)cudaGetLastError();
+        cudaDeviceProp prop;
+        cudaError_t err = cudaGetDeviceProperties(&prop, device);
+        if (err == cudaSuccess) {
+            int written = snprintf(out_name, (size_t)name_cap, "%s", prop.name);
+            if (written < 0) {
+                out_name[0] = '\0';
+            }
+            *out_total = (unsigned long long)prop.totalGlobalMem;
+            *out_multiprocessors = prop.multiProcessorCount;
+            *out_bus_width = prop.memoryBusWidth;
+            *out_memory_clock_hz = (unsigned long long)prop.memoryClockRate * 1000ULL;
+            // The free figure needs the device current; select it, read, and
+            // restore the thread's previous device so the caller's selection
+            // cache stays true.
+            int saved = 0;
+            err = cudaGetDevice(&saved);
+            if (err == cudaSuccess && saved != device) {
+                err = cudaSetDevice(device);
+            }
+            if (err == cudaSuccess) {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                err = cudaMemGetInfo(&free_bytes, &total_bytes);
+                if (err == cudaSuccess) {
+                    *out_free = (unsigned long long)free_bytes;
+                    *out_total = (unsigned long long)total_bytes;
+                }
+                if (saved != device) {
+                    const cudaError_t restore = cudaSetDevice(saved);
+                    if (err == cudaSuccess && restore != cudaSuccess) {
+                        err = restore;
+                    }
+                }
+            }
         }
         return finish(err);
     } catch (...) {

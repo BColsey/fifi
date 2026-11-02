@@ -167,7 +167,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
         .collect();
 
     let admission = served_admission();
-    let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let (stack, mut states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
     let ctx0 = &stack.contexts()[0];
     let stream0 = &stack.streams()[0];
 
@@ -282,8 +282,8 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
     // ---- The distributed block: per-card sliced weights, the card op
     // list, the `CardStack` execution.
     let table = ShardTable::new(&d.shape, 2, 32)?;
-    for card in 0..2 {
-        stack.write_step_params(card, &StepParams::new(0, 0)?)?;
+    for (card, state) in states.iter_mut().enumerate() {
+        state.write_step_params(&stack.streams()[card], &StepParams::new(0, 0)?)?;
         let stream = &stack.streams()[card];
         let resid_at = stack.plans()[card]
             .index(resid_slot)
@@ -403,6 +403,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops_gather: Vec<&[CardOp]> = ops.iter().map(|l| &l[..split]).collect();
     run_card_block(
         &stack,
+        &states,
         &mixers,
         layer,
         ordinal,
@@ -434,6 +435,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops_suffix: Vec<&[CardOp]> = ops.iter().map(|l| &l[split..]).collect();
     run_card_block(
         &stack,
+        &states,
         &mixers,
         layer,
         ordinal,
@@ -460,7 +462,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             .collect())
     };
     let read_card_plane = |card: usize, plane: Plane| -> Result<Vec<u8>, EngError> {
-        let view = stack.shards()[card].state().kv_plane(ordinal, plane)?;
+        let view = states[card].kv_plane(ordinal, plane)?;
         let mut bytes = vec![0u8; view.bytes()];
         view.buffer()
             .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
@@ -717,7 +719,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
         .collect();
 
     let admission = served_admission();
-    let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let (stack, mut states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
     let ctx0 = &stack.contexts()[0];
     let stream0 = &stack.streams()[0];
 
@@ -847,8 +849,8 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
     // ---- The distributed block: per-card sliced weights (the shard
     // table's own dealing), the card op list, the `CardStack` execution.
     let table = ShardTable::new(&d.shape, 2, 32)?;
-    for card in 0..2 {
-        stack.write_step_params(card, &StepParams::new(0, 0)?)?;
+    for (card, state) in states.iter_mut().enumerate() {
+        state.write_step_params(&stack.streams()[card], &StepParams::new(0, 0)?)?;
         let stream = &stack.streams()[card];
         let resid_at = stack.plans()[card]
             .index(resid_slot)
@@ -998,7 +1000,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
     };
     let read_card_state = |card: usize| -> Result<(Vec<f32>, Vec<f32>), EngError> {
         let stream = &stack.streams()[card];
-        let state = stack.shards()[card].state();
+        let state = &states[card];
         let rec = state.delta_rec(0, ordinal)?;
         let conv = state.delta_conv(0, ordinal)?;
         let read = |view: crate::kernels::cuda::DeviceRange<'_>| -> Result<Vec<f32>, EngError> {
@@ -1019,6 +1021,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
     for token in 0..TOKENS {
         run_card_block(
             &stack,
+            &states,
             &mixers,
             layer,
             ordinal,
@@ -1231,11 +1234,11 @@ fn a_deltanet_block_runs_distributed_and_matches_the_reference() {
 /// projector tests carry (`family/project/cuda/tests.rs`); extract both on
 /// the third use.
 #[derive(Clone)]
-struct FileEntry {
-    name: String,
-    ty: GgufType,
-    dims: Vec<u64>,
-    payload: Vec<u8>,
+pub(super) struct FileEntry {
+    pub(super) name: String,
+    pub(super) ty: GgufType,
+    pub(super) dims: Vec<u64>,
+    pub(super) payload: Vec<u8>,
 }
 
 /// A GGUF v3 file with no metadata; payloads 32-byte aligned like the
@@ -1264,7 +1267,11 @@ fn gguf_file_bytes(entries: &[FileEntry]) -> Vec<u8> {
     header
 }
 
-fn write_gguf(dir: &std::path::Path, file: &str, entries: &[FileEntry]) -> std::path::PathBuf {
+pub(super) fn write_gguf(
+    dir: &std::path::Path,
+    file: &str,
+    entries: &[FileEntry],
+) -> std::path::PathBuf {
     let path = dir.join(file);
     std::fs::write(&path, gguf_file_bytes(entries)).expect("write the fixture file");
     path
@@ -1358,7 +1365,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
     // cards' own contexts through the borrowed loader, so no third
     // adapter lease exists at any point.
     let admission = served_admission();
-    let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let (stack, mut states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
         ..LoadOptions::default()
@@ -1524,8 +1531,8 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
     );
 
     // ---- The distributed block over the loaded per-card weight sets.
-    for card in 0..2 {
-        stack.write_step_params(card, &StepParams::new(0, 0)?)?;
+    for (card, state) in states.iter_mut().enumerate() {
+        state.write_step_params(&stack.streams()[card], &StepParams::new(0, 0)?)?;
         let stream = &stack.streams()[card];
         let resid_at = stack.plans()[card]
             .index(resid_slot)
@@ -1588,6 +1595,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops_gather: Vec<&[CardOp]> = ops.iter().map(|l| &l[..split]).collect();
     run_card_block(
         &stack,
+        &states,
         &mixers,
         layer,
         ordinal,
@@ -1617,6 +1625,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops_suffix: Vec<&[CardOp]> = ops.iter().map(|l| &l[split..]).collect();
     run_card_block(
         &stack,
+        &states,
         &mixers,
         layer,
         ordinal,
@@ -1641,7 +1650,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             .collect())
     };
     let read_card_plane = |card: usize, plane: Plane| -> Result<Vec<u8>, EngError> {
-        let view = stack.shards()[card].state().kv_plane(ordinal, plane)?;
+        let view = states[card].kv_plane(ordinal, plane)?;
         let mut bytes = vec![0u8; view.bytes()];
         view.buffer()
             .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;

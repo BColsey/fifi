@@ -361,7 +361,7 @@ fn run_rig() -> Result<Evidence, EngError> {
 
     let s = sources(&full, 0x50E_FEED);
     let admission = served_admission();
-    let stack = CardStack::new(&d, &options(), &[0, 0], &admission)?;
+    let (stack, _states) = CardStack::new(&d, &options(), &[0, 0], &admission)?;
     let ctx0 = &stack.contexts()[0];
 
     // The reference: full widths, card 0's context. Its router rows serve

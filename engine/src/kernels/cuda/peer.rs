@@ -2,11 +2,13 @@
 //! whether each ordered pair may directly access the other's memory.
 //!
 //! The raw entries live in `native::peer_probe`; every call here runs under
-//! the process dispatch guard. Probing changes no device state.
-//! `enable_peer_access` is the one stateful call: it enables peer mappings for
-//! the process and restores device 0 of the set as the thread's current
-//! device through `context::select_device`, so the selection cache there
-//! stays true.
+//! the process dispatch guard. Probing changes no persistent device state:
+//! the free-memory figure of the profile query selects the device briefly
+//! and restores the thread's previous device, so the selection cache stays
+//! true. `enable_peer_access` is the one stateful call: it enables peer
+//! mappings for the process and restores device 0 of the set as the thread's
+//! current device through `context::select_device`, so the selection cache
+//! there stays true.
 
 use std::ffi::c_int;
 
@@ -22,6 +24,9 @@ pub(crate) const MAX_DEVICES: usize = 4;
 const PEER_ACCESS_ALREADY_ENABLED: c_int = 704;
 
 /// What one probed device is and which set members it may access directly.
+/// The memory figures and the name are the placement facts of the same
+/// probe: one loop answers both, so the caller never mixes snapshots of the
+/// same device taken at different times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeviceFacts {
     /// The CUDA device ordinal.
@@ -32,6 +37,20 @@ pub(crate) struct DeviceFacts {
     /// may directly access that member's memory. The diagonal is `true` by
     /// definition and is not queried.
     pub(crate) can_access: Vec<bool>,
+    /// The device name, as the runtime reports it.
+    pub(crate) name: String,
+    /// Total global memory of the device.
+    pub(crate) total_bytes: u64,
+    /// Free global memory at probe time, BEFORE any context of this process
+    /// exists: the figure the placement planner budgets against.
+    pub(crate) free_bytes: u64,
+    /// The SM count, a hardware fact of the share model.
+    pub(crate) multiprocessors: u32,
+    /// Memory bus width in bits and memory clock in Hz: the two facts the
+    /// bandwidth figure of the placement profile derives from (bus/8 x 2 x
+    /// clock, the double-data-rate peak, a device property, not a benchmark).
+    pub(crate) bus_width_bits: u32,
+    pub(crate) memory_clock_hz: u64,
 }
 
 /// Checks a requested device list against the visible count and returns the
@@ -124,6 +143,7 @@ pub(crate) fn probe_device_set(devices: &[usize]) -> Result<Vec<DeviceFacts>, En
     for &device in &ordinals {
         let (cc_major, cc_minor) =
             super::native::peer_probe::device_cc(device).map_err(probe_error)?;
+        let profile = super::native::peer_probe::device_profile(device).map_err(probe_error)?;
         let mut can_access = Vec::with_capacity(ordinals.len());
         for &peer in &ordinals {
             can_access.push(if peer == device {
@@ -137,6 +157,12 @@ pub(crate) fn probe_device_set(devices: &[usize]) -> Result<Vec<DeviceFacts>, En
             cc_major,
             cc_minor,
             can_access,
+            name: profile.name,
+            total_bytes: profile.total_bytes,
+            free_bytes: profile.free_bytes,
+            multiprocessors: profile.multiprocessors,
+            bus_width_bits: profile.bus_width_bits,
+            memory_clock_hz: profile.memory_clock_hz,
         });
     }
     Ok(facts)
@@ -206,6 +232,12 @@ mod tests {
             cc_major: cc.0,
             cc_minor: cc.1,
             can_access: can_access.to_vec(),
+            name: format!("device {device}"),
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            free_bytes: 20 * 1024 * 1024 * 1024,
+            multiprocessors: 82,
+            bus_width_bits: 384,
+            memory_clock_hz: 9_500_000_000,
         }
     }
 

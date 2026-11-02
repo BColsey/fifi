@@ -38,7 +38,7 @@ use crate::family::qwen36::cuda::shard::ShardTable;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::{KernelScratch, StepPlan};
 use crate::kernels::cuda::peer_ring::{PeerRing, RingMode};
-use crate::kernels::cuda::resident::step_params::StepParams;
+
 use crate::kernels::cuda::{
     Admission, CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
 };
@@ -48,30 +48,25 @@ use crate::kernels::cuda::{
 /// handle outliving the shard.
 pub(crate) struct CardShard {
     arena: DeviceArena,
-    state: ResidentState,
     ring_word: DeviceBuffer,
 }
 
 impl CardShard {
     /// The shard's allocations on `context` with `stream`: the arena over
-    /// `plan`'s tensor list, the full-size state, and a zeroed ring status
-    /// word.
+    /// `plan`'s tensor list and a zeroed ring status word. The card's
+    /// [`ResidentState`] is allocated beside it but returned separately:
+    /// the shared stack keeps only what the step's views borrow, the way
+    /// the single-device split leaks `StepResources` and keeps the state
+    /// mutable in the step.
     pub(crate) fn new(
         context: &CudaContext,
         stream: &DeviceStream,
         plan: &StepPlan,
-        dims: &StepDims,
-        options: &StepOptions,
     ) -> Result<Self, EngError> {
         let arena = context.arena(&plan.arena_tensors())?;
-        let state = ResidentState::allocate(context, stream, dims, options)?;
         let ring_word = context.allocate(4)?;
         ring_word.write_at(stream, 0, &0u32.to_le_bytes())?;
-        Ok(Self {
-            arena,
-            state,
-            ring_word,
-        })
+        Ok(Self { arena, ring_word })
     }
 
     /// The card's arena (the card block driver resolves its op slots
@@ -84,16 +79,6 @@ impl CardShard {
     /// plan's own offset and byte count.
     pub(crate) fn tensor(&self, index: usize) -> Result<DeviceRange<'_>, EngError> {
         self.arena.tensor(index)
-    }
-
-    pub(crate) fn state(&self) -> &ResidentState {
-        &self.state
-    }
-
-    /// The state mutably: the coordinator writes the step words of a token
-    /// before the block list runs (the book guards of the writes).
-    pub(crate) fn state_mut(&mut self) -> &mut ResidentState {
-        &mut self.state
     }
 
     /// The card's ring status word as the range the ring operations take.
@@ -133,7 +118,7 @@ impl CardStack {
         options: &StepOptions,
         devices: &[usize],
         admission: &Admission,
-    ) -> Result<Self, EngError> {
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
                 "the card stack needs at least one device".to_owned(),
@@ -153,27 +138,33 @@ impl CardStack {
         let ring = PeerRing::new(&contexts, dims.shape.hidden)?;
         let mut plans = Vec::with_capacity(devices.len());
         let mut shards = Vec::with_capacity(devices.len());
+        let mut states = Vec::with_capacity(devices.len());
         for (card, context) in contexts.iter().enumerate() {
             let plan = StepPlan::for_card(dims, &table, card, options, &scratch)?;
-            shards.push(CardShard::new(
+            shards.push(CardShard::new(context, &streams[card], &plan)?);
+            states.push(ResidentState::allocate(
                 context,
                 &streams[card],
-                &plan,
                 dims,
                 options,
             )?);
             plans.push(plan);
         }
-        Ok(Self {
-            ring,
-            shards,
-            table,
-            plans,
-            streams,
-            contexts,
-        })
+        Ok((
+            Self {
+                ring,
+                shards,
+                table,
+                plans,
+                streams,
+                contexts,
+            },
+            states,
+        ))
     }
 
+    /// The ring re-zero for a new turn: mailboxes and ring status words,
+    /// folded into `reset_states_and_ring`.
     pub(crate) fn ring(&self) -> &PeerRing {
         &self.ring
     }
@@ -195,18 +186,23 @@ impl CardStack {
         &self.contexts
     }
 
-    /// The ONE stream per card, in card order: the coordinator invariant.
-    /// Writes card `card`'s step words (the coordinator's per-token step
-    /// setup; the book guards of the writes live in the shard's state).
-    pub(crate) fn write_step_params(
-        &mut self,
-        card: usize,
-        params: &StepParams,
+    /// The turn reset: every card's state cleared and the ring re-zeroed.
+    /// Every stream is joined first - a reset never overtakes a running
+    /// token - and the first token of the next turn writes fresh step
+    /// params over the cleared word block. The states travel mutably by
+    /// parameter: the stack itself stays shared.
+    pub(crate) fn reset_states_and_ring(
+        &self,
+        states: &mut [ResidentState],
     ) -> Result<(), EngError> {
-        let stream = &self.streams[card];
-        self.shards[card]
-            .state_mut()
-            .write_step_params(stream, params)
+        for ((card, state), shard) in states.iter_mut().enumerate().zip(self.shards.iter()) {
+            self.streams[card].synchronize()?;
+            state.reset(&self.streams[card])?;
+            shard
+                .ring_word
+                .write_at(&self.streams[card], 0, &0u32.to_le_bytes())?;
+        }
+        self.ring.reset(&self.contexts, &self.streams)
     }
 
     pub(crate) fn streams(&self) -> &[DeviceStream] {
@@ -313,11 +309,12 @@ mod device_tests {
         }
         let d = dims();
         let admission = served_admission();
-        let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("shards");
+        let (stack, states) = CardStack::new(&d, &options(), &[0, 0], &admission).expect("shards");
         assert_eq!(stack.shards().len(), 2);
         assert_eq!(stack.plans().len(), 2);
         assert_eq!(stack.ring().cards(), 2);
         assert_eq!(stack.table().cards(), 2);
+        assert_eq!(states.len(), 2);
         for (card, shard) in stack.shards().iter().enumerate() {
             let plan = &stack.plans()[card];
             let tensors = plan.tensors();
@@ -337,15 +334,15 @@ mod device_tests {
                 );
             }
             // The state is full-size and shaped like every other card's.
-            assert!(shard.state().kv_bytes() > 0);
+            assert!(states[card].kv_bytes() > 0);
             assert_eq!(
-                shard.state().layout().delta.total,
-                stack.shards()[1 - card].state().layout().delta.total,
+                states[card].layout().delta.total,
+                states[1 - card].layout().delta.total,
                 "card {card}: delta state size"
             );
             assert_eq!(
-                shard.state().kv_bytes(),
-                stack.shards()[1 - card].state().kv_bytes(),
+                states[card].kv_bytes(),
+                states[1 - card].kv_bytes(),
                 "card {card}: kv state size"
             );
         }
@@ -375,7 +372,8 @@ mod device_tests {
         let d = dims();
         let admission = served_admission();
         {
-            let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("stack");
+            let (stack, _states) =
+                CardStack::new(&d, &options(), &[0, 0], &admission).expect("stack");
             let n = 64usize;
             let rounds = 8usize;
             // Auxiliary buffers after the stack, so they drop first.
@@ -418,7 +416,8 @@ mod device_tests {
             // No synchronize: the buffers and the stack drop as-is.
         }
         // The device must be healthy: a fresh stack exchanges exactly.
-        let stack = CardStack::new(&d, &options(), &[0, 0], &admission).expect("fresh stack");
+        let (stack, _states) =
+            CardStack::new(&d, &options(), &[0, 0], &admission).expect("fresh stack");
         let n = 64usize;
         let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
         let b: Vec<f32> = (0..n).map(|i| 100.0 - i as f32).collect();

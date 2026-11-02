@@ -16,6 +16,7 @@ use super::{
     moe::{MoeDims, MoeLayerWeights, StackWeights},
     paging_plan::PagingPlan,
     paging_store::device_first::DeviceCachePlan,
+    shard::ShardTable,
     state::PagedStatePlan,
     state_layout::StateLayout,
     step_plan::{KernelScratch, StepPlan},
@@ -91,6 +92,46 @@ impl MoeSpecs {
             shared_gate: dense(Role::FfnGateShexp, m.shared_inter, h),
             shared_up: dense(Role::FfnUpShexp, m.shared_inter, h),
             shared_down: dense(Role::FfnDownShexp, h, m.shared_inter),
+        })
+    }
+
+    /// The specs of `card` under `table`: every expert's and the shared
+    /// expert's intermediate width becomes the card's slice (gate/up rows,
+    /// down columns); the router, the residual width and the expert count
+    /// stay full, because routing and the residual row are replicated. The
+    /// checks then validate the CARD's loaded (sliced) shapes by name.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "staged for the multi-device step, its first production caller"
+        )
+    )]
+    pub(super) fn for_card(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+    ) -> Result<Self, EngError> {
+        let (h, m) = (dims.shape.hidden, &dims.shape.moe);
+        let inter = table.expert_inter(card)?.len();
+        let shared = table.shared_inter(card)?.len();
+        let stack = |rows, k| StackSpec {
+            experts: m.experts,
+            rows,
+            k,
+        };
+        let dense = |role, rows, k| DenseSpec { role, rows, k };
+        Ok(Self {
+            router_values: m.experts.checked_mul(h).ok_or_else(|| {
+                EngError::Checkpoint("moe specs: the router size overflows".to_owned())
+            })?,
+            shexp_values: h,
+            gate: stack(inter, h),
+            up: stack(inter, h),
+            down: stack(h, inter),
+            shared_gate: dense(Role::FfnGateShexp, shared, h),
+            shared_up: dense(Role::FfnUpShexp, shared, h),
+            shared_down: dense(Role::FfnDownShexp, h, shared),
         })
     }
 }
@@ -423,7 +464,7 @@ fn tiled<'w>(
     }
 }
 
-fn raw_buffer<'w>(
+pub(super) fn raw_buffer<'w>(
     weights: &'w CudaWeights,
     name: &str,
     values: usize,

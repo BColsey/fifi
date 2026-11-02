@@ -34,7 +34,7 @@ use crate::family::qwen36::cuda::mixer_ops::CardOp;
 use crate::family::qwen36::cuda::moe::{
     CardMoeOp, ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, RouteBufs, moe_sequence_card,
 };
-use crate::family::qwen36::cuda::state::StepField;
+use crate::family::qwen36::cuda::state::{ResidentState, StepField};
 use crate::family::qwen36::cuda::state_layout::Word;
 use crate::family::qwen36::cuda::step_ops::{final_resid, resid_in, resid_out};
 use crate::family::qwen36::cuda::step_plan::Slot;
@@ -92,6 +92,7 @@ pub(crate) fn merge_head_candidates(shards: &[&[f32]], starts: &[usize]) -> i32 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_card_token(
     stack: &CardStack,
+    states: &[ResidentState],
     kinds: &[crate::family::AttentionKind],
     ordinals: &[usize],
     block_ops: &[&[&[CardOp]]],
@@ -99,8 +100,8 @@ pub(crate) fn run_card_token(
     mixers: &[Mixers<'_>],
     moe: &[&[MoeLayerWeights<'_>]],
     embed: &NativeWeight,
-    output_norms: &[DeviceBuffer],
-    heads: &[NativeWeight],
+    output_norms: &[&DeviceBuffer],
+    heads: &[&NativeWeight],
     eps: f32,
     admit_pos: usize,
 ) -> Result<(), EngError> {
@@ -149,7 +150,7 @@ pub(crate) fn run_card_token(
     };
     let hidden = view(0, Slot::ResidA)?.bytes() / F32;
     let statuses: Vec<DeviceRange<'_>> = (0..cards)
-        .map(|card| stack.shards()[card].state().step_status())
+        .map(|card| states[card].step_status())
         .collect::<Result<_, _>>()?;
     let ring_statuses: Vec<DeviceRange<'_>> = (0..cards)
         .map(|card| stack.shards()[card].ring_status())
@@ -188,16 +189,14 @@ pub(crate) fn run_card_token(
     };
 
     // step_begin everywhere.
-    for card in 0..cards {
-        let params = stack.shards()[card].state().word(Word::StepParams)?;
+    for (card, state) in states.iter().enumerate() {
+        let params = state.word(Word::StepParams)?;
         stack.contexts()[card].step_begin(&stack.streams()[card], params)?;
     }
     // The embedding: card 0 embeds, the row rides one broadcast.
     {
         let card0 = 0;
-        let ids = stack.shards()[card0]
-            .state()
-            .step_field(StepField::TokenId)?;
+        let ids = states[card0].step_field(StepField::TokenId)?;
         stack.contexts()[card0].embed_native(
             &stack.streams()[card0],
             EmbedNativeCall {
@@ -221,6 +220,7 @@ pub(crate) fn run_card_token(
             .collect::<Result<_, _>>()?;
         run_card_block(
             stack,
+            states,
             mixers,
             layer,
             ordinals[layer],
@@ -241,7 +241,7 @@ pub(crate) fn run_card_token(
     for card in 0..cards {
         let ctx = &stack.contexts()[card];
         let stream = &stack.streams()[card];
-        let params = stack.shards()[card].state().word(Word::StepParams)?;
+        let params = states[card].word(Word::StepParams)?;
         let norm = output_norms[card].range(0, output_norms[card].bytes())?;
         ctx.add_rmsnorm_q8(
             stream,
@@ -255,7 +255,7 @@ pub(crate) fn run_card_token(
                 q8: view(card, Slot::Q8Final)?,
             },
         )?;
-        let head = &heads[card];
+        let head = heads[card];
         let rows = head.n_rows();
         ctx.matvec_q(
             stream,
@@ -276,7 +276,7 @@ pub(crate) fn run_card_token(
                 logits: view(card, Slot::Logits)?,
                 part: view(card, Slot::ArgmaxPart)?,
                 params,
-                result: Some(stack.shards()[card].state().word(Word::ResultPair)?),
+                result: Some(states[card].word(Word::ResultPair)?),
             },
         )?;
         ctx.step_advance(stream, params, 1)?;

@@ -13,6 +13,7 @@ use super::{
 use super::{
     mixer::MixerViews,
     mixer_geometry::MixerGeometry,
+    shard::ShardTable,
     state::PagedStatePlan,
     step_plan::{KernelScratch, StepPlan},
 };
@@ -135,6 +136,53 @@ fn moe_specs_follow_the_layout_record() {
             rows: d.shape.hidden,
             k: m.shared_inter
         }
+    );
+}
+
+#[test]
+fn moe_specs_for_card_slice_the_intermediate_widths_and_keep_the_rest_full() {
+    let d = dims();
+    let m = &d.shape.moe;
+    let table = ShardTable::new(&d.shape, 2, 256).expect("table");
+    for card in 0..2 {
+        let specs = MoeSpecs::for_card(&d, &table, card).expect("card specs");
+        // Routing and the residual width are replicated on every card.
+        assert_eq!(specs.router_values, m.experts * d.shape.hidden);
+        assert_eq!(specs.shexp_values, d.shape.hidden);
+        // The expert stacks carry the card's intermediate slice.
+        let inter = table.expert_inter(card).expect("inter").len();
+        let shared = table.shared_inter(card).expect("shared").len();
+        assert_eq!(
+            specs.gate,
+            StackSpec {
+                experts: m.experts,
+                rows: inter,
+                k: d.shape.hidden
+            }
+        );
+        assert_eq!(specs.up, specs.gate);
+        assert_eq!(
+            specs.down,
+            StackSpec {
+                experts: m.experts,
+                rows: d.shape.hidden,
+                k: inter
+            }
+        );
+        assert_eq!(specs.shared_gate.rows, shared);
+        assert_eq!(specs.shared_up.rows, shared);
+        assert_eq!(specs.shared_down.k, shared);
+        assert_eq!(specs.shared_down.rows, d.shape.hidden);
+        assert_eq!(specs.shared_gate.k, d.shape.hidden);
+    }
+    // Both cards' slices cover the full widths exactly once.
+    assert_eq!(
+        table.expert_inter(0).expect("i0").len() + table.expert_inter(1).expect("i1").len(),
+        m.inter
+    );
+    assert_eq!(
+        table.shared_inter(0).expect("s0").len() + table.shared_inter(1).expect("s1").len(),
+        m.shared_inter
     );
 }
 

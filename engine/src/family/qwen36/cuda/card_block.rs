@@ -34,6 +34,7 @@ use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
 use crate::family::qwen36::cuda::moe::{CardMoeOp, Launch, MoeBuffers, MoeLayerWeights, launch_op};
 use crate::family::qwen36::cuda::multi::fold_ring_status;
+use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::Slot;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::peer_ring::RingMode;
@@ -65,6 +66,7 @@ fn marker(op: &CardOp) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_card_block(
     stack: &CardStack,
+    states: &[ResidentState],
     mixers: &[Mixers<'_>],
     layer: usize,
     ordinal: usize,
@@ -111,7 +113,7 @@ pub(crate) fn run_card_block(
                     };
                     mixer.run_local_op(
                         &stack.streams()[card],
-                        stack.shards()[card].state(),
+                        &states[card],
                         layer,
                         ordinal,
                         BlockIo {

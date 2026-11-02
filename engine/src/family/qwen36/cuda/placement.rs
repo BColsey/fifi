@@ -16,6 +16,7 @@ use crate::family::qwen36::cuda::shard::{
     ATTN_Q_PER_KV_HEAD, ShardLoad, ShardRuns, ShardTable, VALUE_BLOCK, shard_loads,
 };
 use crate::family::qwen36::host::HostShape;
+use crate::kernels::cuda::peer::DeviceFacts;
 use crate::weights::GgufType;
 
 const MIB: u64 = 1024 * 1024;
@@ -48,6 +49,79 @@ pub(crate) struct DeviceProfile {
     pub(crate) multiprocessors: u32,
     pub(crate) memory_bandwidth_bytes: u64,
     pub(crate) can_access: Vec<bool>,
+}
+
+impl DeviceProfile {
+    /// One profile from one probed device's facts, in probe order. The
+    /// bandwidth figure is the double-data-rate peak of the two raw facts
+    /// (bus width in bits, memory clock in Hz): a device property, never a
+    /// measurement. A device that reports no bus width or clock (nothing
+    /// real does) yields zero bandwidth, which the planner treats as
+    /// indistinguishable — the conservative even deal, never a refusal.
+    pub(crate) fn from_facts(facts: &DeviceFacts) -> Self {
+        let memory_bandwidth_bytes =
+            u64::from(facts.bus_width_bits) / 8 * 2 * facts.memory_clock_hz;
+        Self {
+            device: facts.device,
+            name: facts.name.clone(),
+            total_bytes: facts.total_bytes,
+            free_bytes: facts.free_bytes,
+            multiprocessors: facts.multiprocessors,
+            memory_bandwidth_bytes,
+            can_access: facts.can_access.clone(),
+        }
+    }
+}
+
+/// Every profile of a probed set, in the set's order.
+pub(crate) fn profiles_from_facts(facts: &[DeviceFacts]) -> Vec<DeviceProfile> {
+    facts.iter().map(DeviceProfile::from_facts).collect()
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    fn facts(device: usize) -> DeviceFacts {
+        DeviceFacts {
+            device,
+            cc_major: 8,
+            cc_minor: 6,
+            can_access: vec![true, true],
+            name: format!("probe {device}"),
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            free_bytes: 20 * 1024 * 1024 * 1024,
+            multiprocessors: 82,
+            bus_width_bits: 384,
+            memory_clock_hz: 9_500_000_000,
+        }
+    }
+
+    #[test]
+    fn a_profile_carries_the_probe_facts_and_derives_the_ddr_peak_bandwidth() {
+        // 384 bit / 8 * 2 * 9.5 GHz = 912 GB/s: the RTX 3090's property peak.
+        let profile = DeviceProfile::from_facts(&facts(0));
+        assert_eq!(profile.name, "probe 0");
+        assert_eq!(profile.free_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(profile.memory_bandwidth_bytes, 912_000_000_000);
+        assert_eq!(profile.can_access, vec![true, true]);
+    }
+
+    #[test]
+    fn a_device_without_bus_facts_yields_zero_bandwidth_not_a_refusal() {
+        let mut bare = facts(1);
+        bare.bus_width_bits = 0;
+        assert_eq!(DeviceProfile::from_facts(&bare).memory_bandwidth_bytes, 0);
+    }
+
+    #[test]
+    fn profiles_keep_the_probe_order() {
+        let profiles = profiles_from_facts(&[facts(0), facts(1)]);
+        assert_eq!(
+            profiles.iter().map(|p| p.device).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
 }
 
 /// Planning knobs with defaults; the seam for future user configuration

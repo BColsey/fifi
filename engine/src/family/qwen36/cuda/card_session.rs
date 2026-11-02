@@ -1,0 +1,550 @@
+//! The multi-device serving session: the eager [`CardStack`] token driver
+//! behind the shared [`DecodeSession`] seam, and the start-level enum that
+//! keeps one executor type over the single-device and multi-device steps.
+//!
+//! v1 is deliberately the eager whole-token driver ([`run_card_token`]):
+//! per token, every card runs its mixer and MoE blocks with the ring
+//! exchanges inside, the tail head projection covers each card's vocabulary
+//! shard, and the host reads back the status words and the logits shards.
+//! The failure model of `multi.rs` is enforced at the read-back: every
+//! card's step-status word and ring status word fold BEFORE a token is
+//! handed out, and any nonzero word poisons the session irrevocably - no
+//! corrupted token is returned, and after a failure every later call
+//! refuses by name.
+//!
+//! What this session does not do (each is a refusal at start, not a silent
+//! degradation): chunked prefill (per-token feeding only), prefix
+//! save/restore, speculation, tiered experts, host-paged KV, EXL3.
+//!
+//! Lifetime: like `QwenResidentStep`, the owners the views borrow - the
+//! [`CardStack`], the per-card [`CudaWeights`] - are leaked for the process
+//! lifetime by the start, so every view the session holds is `'static`.
+
+use std::sync::Arc;
+
+use super::card_step::CardStack;
+use super::card_token::run_card_token;
+use super::dims::{StepDims, StepOptions};
+use super::layer_table::LayerTable;
+use super::mixer::{CardKindOps, MixerParts, MixerViews, Mixers};
+use super::mixer_geometry::{DenseSpec, MixerGeometry, check_native_dense};
+use super::mixer_ops::CardOp;
+use super::mixer_weights::MixerWeights;
+use super::moe::MoeLayerWeights;
+use super::multi::fold_ring_status;
+use super::resources::{GlobalNames, MoeSpecs, check_native_embed, moe_layer_weights, raw_buffer};
+use super::state::{ResidentState, StepField};
+use super::step_plan::Slot;
+
+use crate::EngError;
+use crate::family::AttentionKind;
+use crate::family::executor::{ExecutorOps, GenerationState};
+use crate::family::gguf_model::{Inventory, Role};
+use crate::family::project::cuda::{CudaWeight, CudaWeights, WeightLayout};
+use crate::family::qwen36::cuda::rules::check_token_id;
+use crate::family::session::{DecodeSession, Limits, TokenStepper, check_prompt};
+use crate::kernels::cuda::resident::step_params::StepParams;
+use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
+
+/// The whole eager distributed step: the stack, the per-card weight views,
+/// the card op lists, and the token book.
+pub(crate) struct CardSession {
+    stack: &'static CardStack,
+    /// The per-card resident states, owned mutably beside the shared
+    /// stack: the single-device split (leaked shared resources, step-owned
+    /// state) applied to the cards.
+    states: Vec<ResidentState>,
+    /// The per-card mixers, one per card over every layer.
+    mixers: Vec<Mixers<'static>>,
+    /// The MoE weights, one set per layer: `[layer][card]`.
+    moe: Vec<Vec<MoeLayerWeights<'static>>>,
+    /// The card op lists, one per card.
+    card_ops: Vec<CardKindOps>,
+    kinds: Vec<AttentionKind>,
+    ordinals: Vec<usize>,
+    kv_runs: Vec<std::ops::Range<usize>>,
+    embed: &'static NativeWeight,
+    output_norms: Vec<&'static DeviceBuffer>,
+    heads: Vec<&'static NativeWeight>,
+    /// The ascending global row starts of the cards' head shards.
+    logits_starts: Vec<usize>,
+    /// The full head row the concat of the shards rebuilds.
+    vocab: usize,
+    eps: f32,
+    context_limit: usize,
+    fed: usize,
+    poisoned: bool,
+    eos: Arc<[u32]>,
+    sampler_vocab: usize,
+}
+
+impl CardSession {
+    /// Resolves every view of the session from the leaked shared `stack`,
+    /// the `states` moved out beside it, and the loaded per-card weights.
+    /// Every shape check runs against the CARD's geometry, so a wrongly
+    /// sliced tensor refuses here, by name.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        stack: &'static CardStack,
+        states: Vec<ResidentState>,
+        weights: &'static [&'static CudaWeights],
+        table: &'static LayerTable,
+        inventory: &Inventory,
+        dims: &StepDims,
+        options: &StepOptions,
+        eos: Arc<[u32]>,
+        sampler_vocab: usize,
+    ) -> Result<Self, EngError> {
+        let cards = stack.shards().len();
+        if weights.len() != cards {
+            return Err(EngError::BadRequest(format!(
+                "card session: {cards} cards, {} weight sets",
+                weights.len()
+            )));
+        }
+        let shard = stack.table();
+        let layers: Vec<usize> = (0..table.len()).collect();
+        let mut kinds = Vec::with_capacity(table.len());
+        let mut ordinals = Vec::with_capacity(table.len());
+        for layer in 0..table.len() {
+            let slot = table.slot(layer)?;
+            kinds.push(slot.kind);
+            ordinals.push(slot.ordinal);
+        }
+        let names = GlobalNames::new(inventory)?;
+        let native = WeightLayout::Native;
+        let mut mixers = Vec::with_capacity(cards);
+        let mut card_ops = Vec::with_capacity(cards);
+        let mut output_norms = Vec::with_capacity(cards);
+        let mut heads = Vec::with_capacity(cards);
+        let mut logits_starts = Vec::with_capacity(cards);
+        let mut moe = Vec::with_capacity(table.len());
+        for _ in 0..table.len() {
+            moe.push(Vec::with_capacity(cards));
+        }
+        for (card, &weights_card_of) in weights.iter().enumerate() {
+            // The mixer views of every layer at this card's geometry.
+            let geometry = MixerGeometry::for_card(dims, shard, card)?;
+            let weights_card =
+                MixerWeights::new(&geometry, table, weights_card_of, &layers, native)?;
+            let ops = CardKindOps::new(shard, card, &geometry, options.kv_mode)?;
+            let views =
+                MixerViews::for_card(&stack.plans()[card], stack.shards()[card].arena(), &ops)?;
+            let parts = MixerParts {
+                geometry,
+                table,
+                weights: weights_card,
+                views,
+                layout: native,
+                kv_mode: options.kv_mode,
+                paged: None,
+            };
+            mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
+            card_ops.push(ops);
+            // The MoE weights of every layer on this card, at its narrowed
+            // expert widths.
+            let specs = MoeSpecs::for_card(dims, shard, card)?;
+            for (layer, set) in moe.iter_mut().enumerate() {
+                set.push(moe_layer_weights(
+                    table,
+                    weights_card_of,
+                    &specs,
+                    layer,
+                    native,
+                )?);
+            }
+            // The replicated final norm, at the same width as the
+            // single-device global.
+            output_norms.push(raw_buffer(weights[card], &names.norm, dims.shape.hidden)?);
+            // The card's vocabulary-shard head: the single-device check at
+            // the card's head width.
+            let head_rows = shard.head_rows(card)?;
+            logits_starts.push(head_rows.start);
+            let Some(CudaWeight::Native { weight, .. }) = weights[card].get(names.head.as_str())
+            else {
+                return Err(EngError::Checkpoint(format!(
+                    "card weights: {} is not a native tensor",
+                    names.head
+                )));
+            };
+            check_native_dense(
+                &names.head,
+                (weight.n_rows(), weight.k()),
+                &DenseSpec {
+                    role: Role::Output,
+                    rows: head_rows.len(),
+                    k: dims.shape.hidden,
+                },
+            )?;
+            heads.push(weight);
+        }
+        // Card 0's embedding table: the only card that holds one.
+        let Some(CudaWeight::Native { weight, .. }) = weights[0].get(names.embed.as_str()) else {
+            return Err(EngError::Checkpoint(format!(
+                "card weights: {} is not a native tensor",
+                names.embed
+            )));
+        };
+        check_native_dense(
+            &names.embed,
+            (weight.n_rows(), weight.k()),
+            &DenseSpec {
+                role: Role::TokenEmbd,
+                rows: dims.shape.vocab,
+                k: dims.shape.hidden,
+            },
+        )?;
+        check_native_embed(&names.embed, weight.quant())?;
+        let embed = weight;
+        let kv_runs = (0..cards)
+            .map(|card| shard.kv_rows(card))
+            .collect::<Result<Vec<_>, EngError>>()?;
+        // Every card's state carries the same KV capacity (one
+        // `ResidentState::allocate` shape); the session limit is that
+        // capacity, the same rule the single-device step uses.
+        let context_limit = states[0].layout().kv.capacity;
+        let vocab = logits_starts
+            .last()
+            .copied()
+            .zip(heads.last().map(|head| head.n_rows()))
+            .and_then(|(start, rows)| start.checked_add(rows))
+            .ok_or_else(|| {
+                EngError::Checkpoint("card session: the head shards overflow usize".into())
+            })?;
+        if states.len() != cards {
+            return Err(EngError::BadRequest(format!(
+                "card session: {cards} cards, {} states",
+                states.len()
+            )));
+        }
+        Ok(Self {
+            stack,
+            states,
+            mixers,
+            moe,
+            card_ops,
+            kinds,
+            ordinals,
+            kv_runs,
+            embed,
+            output_norms,
+            heads,
+            logits_starts,
+            vocab,
+            eps: dims.shape.eps,
+            context_limit,
+            fed: 0,
+            poisoned: false,
+            eos,
+            sampler_vocab,
+        })
+    }
+
+    pub(crate) fn context_limit(&self) -> usize {
+        self.context_limit
+    }
+
+    /// The one launch path of a token: run the whole distributed step, fold
+    /// the status words, and optionally read the concatenated logits row.
+    /// `fed` advances only when the token ran clean.
+    fn run_token(&mut self, token: u32, read_logits: bool) -> Result<Vec<f32>, EngError> {
+        if self.poisoned {
+            return Err(EngError::Backend {
+                operation: "qwen36_cards",
+                message: "the multi-device session is poisoned after an earlier failure".to_owned(),
+            });
+        }
+        check_token_id(token, self.sampler_vocab)?;
+        if self.fed >= self.context_limit {
+            return Err(EngError::BadRequest(format!(
+                "card session: position {} reaches the context limit {}",
+                self.fed, self.context_limit
+            )));
+        }
+        if self.fed == 0 {
+            // The cleared word block takes the full params: the token id
+            // and the restarted position.
+            let params = StepParams::new(card_token_id(token)?, 0)?;
+            for card in 0..self.stack.shards().len() {
+                self.states[card].write_step_params(&self.stack.streams()[card], &params)?;
+            }
+        } else {
+            // The next token comes from the HOST draw over the folded
+            // logits row, so the global id is injected explicitly on every
+            // card; the position advances on device.
+            self.write_token_words(token)?;
+        }
+        let cards = self.stack.shards().len();
+        let mut layer_ops: Vec<Vec<&[CardOp]>> = Vec::with_capacity(self.kinds.len());
+        for &kind in &self.kinds {
+            let list = (0..cards)
+                .map(|card| self.card_ops[card].of(kind))
+                .collect::<Result<Vec<_>, EngError>>()?;
+            layer_ops.push(list);
+        }
+        let ops: Vec<&[&[CardOp]]> = layer_ops.iter().map(|list| list.as_slice()).collect();
+        let moe_sets: Vec<&[MoeLayerWeights]> = self.moe.iter().map(|set| set.as_slice()).collect();
+        run_card_token(
+            self.stack,
+            &self.states,
+            &self.kinds,
+            &self.ordinals,
+            &ops,
+            &self.kv_runs,
+            &self.mixers,
+            &moe_sets,
+            self.embed,
+            &self.output_norms,
+            &self.heads,
+            self.eps,
+            self.fed,
+        )?;
+        // The read-back: every stream joined, then every status word folded
+        // BEFORE anything is handed out.
+        for card in 0..cards {
+            self.stack.streams()[card].synchronize()?;
+        }
+        self.fold_statuses()?;
+        let logits = if read_logits {
+            self.read_logits()?
+        } else {
+            Vec::new()
+        };
+        self.fed += 1;
+        Ok(logits)
+    }
+
+    /// Writes the global token id into every card's `TokenId` word.
+    fn write_token_words(&self, token: u32) -> Result<(), EngError> {
+        let bytes = card_token_id(token)?.to_le_bytes();
+        for card in 0..self.stack.shards().len() {
+            let stream = &self.stack.streams()[card];
+            let word = self.states[card].step_field(StepField::TokenId)?;
+            word.buffer().write_at(stream, word.offset(), &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reads and folds every card's step-status and ring-status words. Any
+    /// nonzero word poisons the session and returns a `Backend` error
+    /// naming the card and the words.
+    fn fold_statuses(&mut self) -> Result<(), EngError> {
+        let cards = self.stack.shards().len();
+        let mut step_words = Vec::with_capacity(cards);
+        let mut ring_words = Vec::with_capacity(cards);
+        for card in 0..cards {
+            let stream = &self.stack.streams()[card];
+            let mut bytes = [0u8; 4];
+            let step = self.states[card].step_status()?;
+            step.buffer().read_at(stream, step.offset(), &mut bytes)?;
+            step_words.push(u32::from_le_bytes(bytes));
+            self.stack.shards()[card]
+                .ring_word()
+                .read_at(stream, 0, &mut bytes)?;
+            ring_words.push(u32::from_le_bytes(bytes));
+        }
+        let folded = fold_ring_status(&ring_words);
+        let failed = step_words.iter().position(|&word| word != 0);
+        if folded != 0 || failed.is_some() {
+            self.poisoned = true;
+            let card = failed.unwrap_or(0);
+            return Err(EngError::Backend {
+                operation: "qwen36_cards",
+                message: format!(
+                    "card {card} reported step status {:#x}, ring fold {folded:#x} (step words \
+                     {step_words:?}, ring words {ring_words:?}); the session is poisoned",
+                    step_words[card],
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the cards' logits shards and rebuilds the full head row by
+    /// ascending shard order.
+    fn read_logits(&self) -> Result<Vec<f32>, EngError> {
+        let cards = self.stack.shards().len();
+        let mut row = Vec::with_capacity(self.vocab);
+        for card in 0..cards {
+            let index = self.stack.plans()[card]
+                .index(Slot::Logits)
+                .ok_or_else(|| {
+                    EngError::Checkpoint("card session: the plan holds no logits slot".into())
+                })?;
+            let view = self.stack.shards()[card].tensor(index)?;
+            let mut bytes = vec![0u8; view.bytes()];
+            view.buffer()
+                .read_at(&self.stack.streams()[card], view.offset(), &mut bytes)?;
+            row.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk)),
+            );
+        }
+        debug_assert_eq!(row.len(), self.vocab);
+        Ok(row)
+    }
+}
+
+/// The token id as the step word wants it: non-negative and i32-wide.
+fn card_token_id(token: u32) -> Result<i32, EngError> {
+    i32::try_from(token)
+        .map_err(|_| EngError::BadRequest(format!("token id {token} does not fit an i32")))
+}
+
+impl TokenStepper for CardSession {
+    const OPERATION: &'static str = "qwen36_cards";
+
+    fn feed(&mut self, token: u32) -> Result<(), EngError> {
+        self.run_token(token, false).map(|_| ())
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+        self.run_token(token, true)
+    }
+
+    fn fed(&self) -> usize {
+        self.fed
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        // The streams are joined inside; the fed book restarts.
+        self.stack.reset_states_and_ring(&mut self.states)?;
+        self.fed = 0;
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+impl ExecutorOps for CardSession {
+    type Session = DecodeSession;
+
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
+        check_prompt(prompt_tokens, self.context_limit)
+    }
+
+    fn history<'s>(&self, st: &'s DecodeSession) -> &'s [u32] {
+        st.history()
+    }
+
+    fn reset(&mut self, st: &mut DecodeSession) -> Result<(), EngError> {
+        st.reset(self)
+    }
+
+    fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<(), EngError> {
+        st.prefill(self, toks, self.context_limit)
+    }
+
+    fn decode(
+        &mut self,
+        st: &mut DecodeSession,
+        generation: &mut GenerationState,
+    ) -> Result<crate::tokenizer::DecodeBatch, EngError> {
+        // The ids are shared, so the limits do not borrow the session that
+        // `decode` borrows mutably.
+        let eos = Arc::clone(&self.eos);
+        let limits = Limits {
+            eos: &eos,
+            sampler_vocab: self.sampler_vocab,
+            context_limit: self.context_limit,
+        };
+        st.decode(self, generation, &limits)
+    }
+
+    fn boundary(&mut self, _st: &mut DecodeSession) {}
+}
+
+/// The one CUDA executor type of the start: the single-device resident step
+/// or the multi-device card session, switched once at `make`.
+// The single-device step is the fat variant by nature (it carries every
+// per-layer weight view inline); one instance lives per engine open, so
+// the size difference buys nothing by boxing it too.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Q36CudaStep {
+    Single(super::step::QwenResidentStep<'static>),
+    Cards(Box<CardSession>),
+}
+
+impl TokenStepper for Q36CudaStep {
+    const OPERATION: &'static str = "qwen36_cuda";
+
+    fn feed(&mut self, token: u32) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => step.feed(token),
+            Self::Cards(session) => session.feed(token),
+        }
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Single(step) => step.logits(token),
+            Self::Cards(session) => session.logits(token),
+        }
+    }
+
+    fn fed(&self) -> usize {
+        match self {
+            Self::Single(step) => step.fed(),
+            Self::Cards(session) => session.fed(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => TokenStepper::reset(step),
+            Self::Cards(session) => TokenStepper::reset(&mut **session),
+        }
+    }
+}
+
+impl ExecutorOps for Q36CudaStep {
+    type Session = DecodeSession;
+
+    fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => step.check_prompt(prompt_tokens),
+            Self::Cards(session) => session.check_prompt(prompt_tokens),
+        }
+    }
+
+    fn history<'s>(&self, st: &'s DecodeSession) -> &'s [u32] {
+        match self {
+            Self::Single(step) => step.history(st),
+            Self::Cards(session) => session.history(st),
+        }
+    }
+
+    fn reset(&mut self, st: &mut DecodeSession) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => ExecutorOps::reset(step, st),
+            Self::Cards(session) => ExecutorOps::reset(&mut **session, st),
+        }
+    }
+
+    fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<(), EngError> {
+        match self {
+            Self::Single(step) => step.prefill(st, toks),
+            Self::Cards(session) => session.prefill(st, toks),
+        }
+    }
+
+    fn decode(
+        &mut self,
+        st: &mut DecodeSession,
+        generation: &mut GenerationState,
+    ) -> Result<crate::tokenizer::DecodeBatch, EngError> {
+        match self {
+            Self::Single(step) => step.decode(st, generation),
+            Self::Cards(session) => session.decode(st, generation),
+        }
+    }
+
+    fn boundary(&mut self, st: &mut DecodeSession) {
+        match self {
+            Self::Single(step) => step.boundary(st),
+            Self::Cards(session) => session.boundary(st),
+        }
+    }
+}
