@@ -32,6 +32,16 @@ pub(crate) fn grouped_gather_selected(value: Option<&std::ffi::OsStr>) -> bool {
     default_on_selected(value)
 }
 
+/// FIFI_FLINT_CPU_MOE_OVERLAP: whether the CPU experts of a split/offload
+/// layer run concurrently with the layer's device pass (the device pass, the
+/// shared expert and the scaled gates enqueue while the CPU workers compute,
+/// instead of the host-serial serve). Default off; only read when a CPU MoE
+/// mode is armed, so the sequential path stays byte-identical without it.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn cpu_moe_overlap_selected(value: Option<&std::ffi::OsStr>) -> bool {
+    default_off_selected(value)
+}
+
 /// Which layer-major prefill pass an engine runs.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +228,15 @@ pub(crate) fn grouped_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         grouped_gather_selected(std::env::var_os("FIFI_FLINT_CUDA_GROUPED_GATHER").as_deref())
+    })
+}
+
+/// The CPU-MoE overlap switch, resolved once like the kernel switches above.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) fn cpu_moe_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cpu_moe_overlap_selected(std::env::var_os("FIFI_FLINT_CPU_MOE_OVERLAP").as_deref())
     })
 }
 

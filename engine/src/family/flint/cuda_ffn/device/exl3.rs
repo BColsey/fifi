@@ -994,6 +994,26 @@ fn moe(
         loans.router,
         picks_bank.is_some(),
     )?;
+    // The overlapped CPU/GPU layer (FIFI_FLINT_CPU_MOE_OVERLAP): when a CPU MoE mode
+    // serves some picks, compute them on the CPU workers while the device runs this
+    // layer's shared expert, scaled gates and resident routed picks, instead of the
+    // host-serial serve below.
+    if crate::family::flint::settings::cpu_moe_overlap_enabled()
+        && let Some(planned) = cpu_pairs::plan(experts, block, &routed.ids)?
+    {
+        let (ctx, stream) = (frame.ctx, frame.stream);
+        let output = moe_overlapped(
+            frame,
+            scratch,
+            loans.grouped,
+            experts,
+            (*shared, *routing_weight_multiplier),
+            (x, block),
+            (&routed, planned),
+        )?;
+        cpu_pairs::adapt(ctx, stream, experts, &routed.ids)?;
+        return Ok(output);
+    }
     let served = cpu_pairs::serve(&mut frame, experts, x, block, &routed.ids)?;
     if served.as_ref().is_some_and(cpu_pairs::Served::all)
         && let Some(served) = served
@@ -1060,7 +1080,29 @@ fn finish_moe(
     (x, gates, down): (usize, usize, usize),
     block: FfnBlock,
 ) -> Result<DeviceBuffer, EngError> {
-    let shared = expert(&mut frame, shared, x, scratch)?;
+    let (shared_out, scaled) = launch_shared_gates(
+        &mut frame,
+        scratch,
+        (shared, routing_weight_multiplier),
+        (x, gates),
+        block,
+    )?;
+    let output = frame.combine(down, scaled, shared_out, block)?;
+    frame.finish(output)
+}
+
+/// The GPU half of [`finish_moe`] that does not wait for the routed pair rows: the shared
+/// expert's projection and the normalized gates scaled by the routing weight multiplier.
+/// Independent of the routed pass, so the overlapped layer may enqueue it before the CPU
+/// experts finish.
+fn launch_shared_gates(
+    frame: &mut Frame<'_, '_>,
+    scratch: &mut Scratch,
+    (shared, routing_weight_multiplier): (FlintExpertView<'_>, f32),
+    (x, gates): (usize, usize),
+    block: FfnBlock,
+) -> Result<(usize, usize), EngError> {
+    let shared_out = expert(frame, shared, x, scratch)?;
     let shape = RowShape {
         rows: block.rows,
         columns: TOP_K,
@@ -1082,8 +1124,120 @@ fn finish_moe(
             fused: false,
         },
     )?;
-    let output = frame.combine(down, scaled, shared, block)?;
-    frame.finish(output)
+    Ok((shared_out, scaled))
+}
+
+/// The overlapped CPU/GPU MoE of one layer (`FIFI_FLINT_CPU_MOE_OVERLAP`): the planned CPU
+/// pairs compute on a scoped worker thread while the calling thread enqueues, and the device
+/// runs, the layer's independent GPU work — the shared expert, the scaled gates, and the
+/// routed pass over the resident picks. The activation rows cross the bus first, while the
+/// stream still holds only the router (its id readback already drained it). The join point
+/// publishes the CPU rows through the same bf16 rounding and the same combine order as the
+/// sequential serve, so the layer's output is bit-identical; only its schedule changes.
+fn moe_overlapped(
+    mut frame: Frame<'_, '_>,
+    scratch: &mut Scratch,
+    grouped: Option<&GroupedScratch>,
+    experts: &FlintExpertBank<'_>,
+    (shared, routing_weight_multiplier): (FlintExpertView<'_>, f32),
+    (x, block): (usize, FfnBlock),
+    (routed, planned): (&super::Routed, cpu_pairs::Planned),
+) -> Result<DeviceBuffer, EngError> {
+    let cpu = crate::family::flint::cpu_moe::active()
+        .ok_or_else(|| bad("the overlapped CPU pass lost its CpuMoe"))?;
+    let (ctx, stream) = (frame.ctx, frame.stream);
+    let ids = routed.ids.as_slice();
+    let row_pairs = planned.row_pairs(ids);
+    let mut raw = vec![0u8; block.rows * block.hidden * 4];
+    frame.buffers[x].0.read_at(frame.stream, 0, &mut raw)?;
+    let xs: Vec<f32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let pass = match planned.device() {
+        Some((device_ids, _)) => Some(experts.prepare_pass(ctx, stream, device_ids)?),
+        None => None,
+    };
+    let mut rows = vec![0.0f32; planned.pairs().len() * block.hidden];
+    let device_out = experts.cpu_experts(|source| {
+        let jobs: Vec<crate::kernels::exl3_cpu::PairJob<'_>> = row_pairs
+            .iter()
+            .map(|&(row, id)| {
+                Ok(crate::kernels::exl3_cpu::PairJob {
+                    expert: source.expert(id)?,
+                    row,
+                })
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        let (cpu_result, device_out) = std::thread::scope(|scope| {
+            let cpu_thread = scope.spawn({
+                let cpu = std::sync::Arc::clone(&cpu);
+                let (xs, jobs, rows) = (&xs, &jobs, &mut rows);
+                move || cpu.compute_jobs(xs, jobs, rows)
+            });
+            let device_out = (|| {
+                let (shared_out, scaled) = launch_shared_gates(
+                    &mut frame,
+                    scratch,
+                    (shared, routing_weight_multiplier),
+                    (x, routed.gates),
+                    block,
+                )?;
+                let down = match planned.device().zip(pass.as_ref()) {
+                    Some(((device_ids, grouping), pass)) => {
+                        let input = RoutedTensor::owned(&frame, x)?;
+                        let down = experts.with_snapshot(pass, |prepared| {
+                            routed::run(
+                                &mut RoutedCuda {
+                                    frame: &mut frame,
+                                    scratch,
+                                    grouped,
+                                    experts: prepared,
+                                    packed_pointwise:
+                                        crate::family::flint::settings::packed_pointwise_enabled(),
+                                    grouped_gather:
+                                        crate::family::flint::settings::grouped_gather_enabled(),
+                                    picks: None,
+                                },
+                                block,
+                                device_ids,
+                                grouping,
+                                input,
+                            )
+                        })?;
+                        Some(down.owned_index(&frame)?)
+                    }
+                    None => None,
+                };
+                Ok::<_, EngError>((shared_out, scaled, down))
+            })();
+            (cpu_thread.join(), device_out)
+        });
+        cpu_result
+            .map_err(|_| bad("the CPU expert thread panicked"))
+            .and_then(|result| result)?;
+        device_out
+    })?;
+    if rows.iter().any(|v| !v.is_finite()) {
+        return Err(bad("a CPU expert produced a non-finite value"));
+    }
+    let served = cpu_pairs::Served::from_rows(planned, rows, block.hidden);
+    let (shared_out, scaled, down_prepared) = device_out;
+    let down = match down_prepared {
+        Some(down) => {
+            served.overlay(&mut frame, down)?;
+            down
+        }
+        None => served.into_down(&mut frame)?,
+    };
+    let output = frame.combine(down, scaled, shared_out, block)?;
+    let output = frame.finish(output)?;
+    if pass.is_some() {
+        experts.end_pass();
+    }
+    Ok(output)
 }
 
 /// Rows of one layer-major piece: the router and the pair gathers are

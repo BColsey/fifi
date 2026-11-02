@@ -59,6 +59,12 @@ struct HostState {
     stream: u64,
 }
 
+/// One prepared expert pass whose consumer runs outside the model-cache borrow
+/// (see [`FlintExpertBank::prepare_pass`]): the demanded experts' device addresses.
+pub(crate) struct PreparedPass {
+    snapshot: [Option<usize>; EXPERTS],
+}
+
 fn refused(message: &str) -> EngError {
     EngError::BadRequest(format!("Flint host cache: {message}"))
 }
@@ -711,6 +717,49 @@ impl FlintExpertBank<'_> {
         self.owner.resident_experts(self.layer)
     }
 
+    /// Prepares this layer's pass for `ids` and releases the cache immediately, so the
+    /// consumer may also hold `cpu_experts`'s shared borrow while it runs. The host
+    /// poison latch stays set until [`Self::end_pass`] succeeds, so a consumer fault
+    /// fails closed exactly as a faulting `with_prepared` consumer does.
+    pub(crate) fn prepare_pass(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        ids: &[i32],
+    ) -> Result<PreparedPass, EngError> {
+        let Some(host) = &self.owner.host else {
+            return Err(refused("prepared passes need the host expert store"));
+        };
+        if host.poisoned.replace(true) {
+            return Err(refused("model cache is poisoned"));
+        }
+        let snapshot = self.pass_snapshot(context, stream, host, ids)?;
+        Ok(PreparedPass { snapshot })
+    }
+
+    /// Runs `consume` with this layer's bank view over a prepared pass's addresses. The
+    /// consumer must finish or enqueue all routed work on the pass's stream, exactly as a
+    /// `with_prepared` consumer; only the model-cache borrow differs.
+    pub(crate) fn with_snapshot<R>(
+        &self,
+        pass: &PreparedPass,
+        consume: impl for<'a> FnOnce(&FlintExpertBank<'a>) -> Result<R, EngError>,
+    ) -> Result<R, EngError> {
+        consume(&FlintExpertBank {
+            owner: self.owner,
+            indices: self.indices,
+            layer: self.layer,
+            prepared: Some(&pass.snapshot),
+        })
+    }
+
+    /// Clears the poison latch a [`Self::prepare_pass`] set, on the success path only.
+    pub(crate) fn end_pass(&self) {
+        if let Some(host) = &self.owner.host {
+            host.poisoned.set(false);
+        }
+    }
+
     pub(crate) fn swap(
         &self,
         context: &CudaContext,
@@ -741,6 +790,32 @@ impl FlintExpertBank<'_> {
         if host.poisoned.replace(true) {
             return Err(refused("model cache is poisoned"));
         }
+        context.ensure_usable()?;
+        let snapshot = self.pass_snapshot(context, stream, host, ids)?;
+        let output = consume(&FlintExpertBank {
+            owner: self.owner,
+            indices: self.indices,
+            layer: self.layer,
+            prepared: Some(&snapshot),
+        })?;
+        host.poisoned.set(false);
+        Ok(output)
+    }
+
+    /// The guarded half of [`Self::with_prepared`] for a consumer that runs outside the
+    /// model-cache borrow (the CPU-expert overlap: the consumer needs `cpu_experts` too,
+    /// and both borrows cannot be held at once). Prepares the pass, enqueues the miss
+    /// copies and resolves every demanded expert's device address; the cache pass is
+    /// RELEASED here, which is safe on the single engine thread exactly as a released
+    /// `with_prepared` consumer: any later pass of this layer queues its slot copies
+    /// behind the consumer kernels this pass enqueues on the same stream.
+    fn pass_snapshot(
+        &self,
+        context: &CudaContext,
+        stream: &DeviceStream,
+        host: &HostOwner,
+        ids: &[i32],
+    ) -> Result<[Option<usize>; EXPERTS], EngError> {
         context.ensure_usable()?;
         let mut state = host
             .state
@@ -789,16 +864,8 @@ impl FlintExpertBank<'_> {
             snapshot[usize::from(expert)] =
                 Some(host.arena_base.checked_add(relative).ok_or_else(overflow)?);
         }
-        let output = core.release(ready, stream.id(), || {
-            consume(&FlintExpertBank {
-                owner: self.owner,
-                indices: self.indices,
-                layer: self.layer,
-                prepared: Some(&snapshot),
-            })
-        })?;
-        host.poisoned.set(false);
-        Ok(output)
+        core.release(ready, stream.id(), || Ok(()))?;
+        Ok(snapshot)
     }
 }
 

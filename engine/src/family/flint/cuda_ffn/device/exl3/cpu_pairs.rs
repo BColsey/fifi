@@ -10,11 +10,7 @@
 use half::bf16;
 
 use super::{CudaContext, DeviceStream, FfnBlock, FlintExpertBank, Frame, TOP_K, bad};
-use crate::{
-    EngError,
-    family::flint::cpu_moe::{self, CpuMoe},
-    family::flint::cuda_ffn::plan::Grouping,
-};
+use crate::{EngError, family::flint::cpu_moe, family::flint::cuda_ffn::plan::Grouping};
 
 /// Picks the CPU serves for one layer and their computed rows.
 pub(super) struct Served {
@@ -77,6 +73,20 @@ pub(super) fn serve(
     block: FfnBlock,
     ids: &[i32],
 ) -> Result<Option<Served>, EngError> {
+    let Some(planned) = plan(experts, block, ids)? else {
+        return Ok(None);
+    };
+    let rows = compute(frame, experts, x, block, ids, planned.pairs())?;
+    Ok(Some(Served::from_rows(planned, rows, block.hidden)))
+}
+
+/// The host-only half of [`serve`]: which pair indices the CPU serves this layer and what the
+/// device pass runs for the rest. No device access, no readback.
+pub(super) fn plan(
+    experts: &FlintExpertBank<'_>,
+    block: FfnBlock,
+    ids: &[i32],
+) -> Result<Option<Planned>, EngError> {
     let Some(cpu) = cpu_moe::active() else {
         return Ok(None);
     };
@@ -95,24 +105,63 @@ pub(super) fn serve(
         let grouping = Grouping::new(&device_ids, block.rows, block.experts)?;
         Some((device_ids, grouping))
     };
-    let rows = compute(frame, &cpu, experts, x, block, ids, &pairs)?;
-    Ok(Some(Served {
-        pairs,
-        rows,
-        device,
-        hidden: block.hidden,
-    }))
+    Ok(Some(Planned { pairs, device }))
+}
+
+/// The layer split [`plan`] decided: CPU pair indices, and the device pass when it still has
+/// resident picks to run.
+pub(super) struct Planned {
+    pairs: Vec<usize>,
+    device: Option<(Vec<i32>, Grouping)>,
+}
+
+impl Planned {
+    pub(super) fn pairs(&self) -> &[usize] {
+        &self.pairs
+    }
+
+    pub(super) fn device(&self) -> Option<(&[i32], &Grouping)> {
+        self.device.as_ref().map(|(ids, g)| (ids.as_slice(), g))
+    }
+
+    /// `(row, expert id)` jobs for the CPU, in pair order.
+    pub(super) fn row_pairs(&self, ids: &[i32]) -> Vec<(usize, usize)> {
+        self.pairs
+            .iter()
+            .map(|&pair| (pair / TOP_K, ids[pair] as usize))
+            .collect()
+    }
+}
+
+impl Served {
+    /// The [`Served`] a finished CPU computation of `planned` produces: `rows.len()` must be
+    /// `planned.pairs().len() * hidden`.
+    pub(super) fn from_rows(planned: Planned, rows: Vec<f32>, hidden: usize) -> Self {
+        debug_assert_eq!(rows.len(), planned.pairs.len() * hidden);
+        Served {
+            pairs: planned.pairs,
+            rows,
+            device: planned.device,
+            hidden,
+        }
+    }
 }
 
 fn compute(
     frame: &mut Frame<'_, '_>,
-    cpu: &CpuMoe,
     experts: &FlintExpertBank<'_>,
     x: usize,
     block: FfnBlock,
     ids: &[i32],
     pairs: &[usize],
 ) -> Result<Vec<f32>, EngError> {
+    let Some(cpu) = cpu_moe::active() else {
+        return Err(bad("a planned CPU pass lost its CpuMoe"));
+    };
+    let jobs: Vec<(usize, usize)> = pairs
+        .iter()
+        .map(|&pair| (pair / TOP_K, ids[pair] as usize))
+        .collect();
     let mut raw = vec![0u8; block.rows * block.hidden * 4];
     frame.buffers[x].0.read_at(frame.stream, 0, &mut raw)?;
     let xs: Vec<f32> = raw
@@ -120,10 +169,6 @@ fn compute(
         .0
         .iter()
         .map(|b| f32::from_le_bytes(*b))
-        .collect();
-    let jobs: Vec<(usize, usize)> = pairs
-        .iter()
-        .map(|&p| (p / TOP_K, ids[p] as usize))
         .collect();
     let mut rows = vec![0.0f32; pairs.len() * block.hidden];
     experts.cpu_experts(|source| cpu.compute(source, &xs, &jobs, &mut rows))?;

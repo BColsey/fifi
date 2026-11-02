@@ -201,10 +201,22 @@ impl CpuMoe {
                 })
             })
             .collect::<Result<Vec<_>, EngError>>()?;
+        self.compute_jobs(xs, &jobs, out)
+    }
+
+    /// The compute half of [`Self::compute`] over jobs already built (their expert views read
+    /// the pinned host store in place, so they may cross a thread while the store's borrow is
+    /// held). Thread-count independent results, as `expert_pairs` guarantees.
+    pub(crate) fn compute_jobs(
+        &self,
+        xs: &[f32],
+        jobs: &[PairJob<'_>],
+        out: &mut [f32],
+    ) -> Result<(), EngError> {
         let started = std::time::Instant::now();
-        self.cpu.expert_pairs(xs, &jobs, out)?;
+        self.cpu.expert_pairs(xs, jobs, out)?;
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.pairs.fetch_add(pairs.len() as u64, Ordering::Relaxed);
+        self.pairs.fetch_add(jobs.len() as u64, Ordering::Relaxed);
         self.nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
