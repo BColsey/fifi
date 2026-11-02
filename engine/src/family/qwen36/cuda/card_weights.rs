@@ -12,7 +12,7 @@
 //! made is released — no partially usable card survives to a session.
 
 use crate::EngError;
-use crate::family::project::cuda::{CudaProjector, CudaWeights, LoadOptions, SliceSpec};
+use crate::family::project::cuda::{BorrowedLoader, CudaWeights, LoadOptions, SliceSpec};
 use crate::family::qwen36::cuda::card_load::CardLoad;
 use crate::family::qwen36::cuda::shard::ShardLoad;
 use crate::weights::GgufWeights;
@@ -48,8 +48,8 @@ pub(crate) fn card_upload_plan(load: &CardLoad, card: usize) -> CardUploadPlan {
 }
 
 /// Uploads `card`'s manifest from the GGUF file in one all-or-nothing
-/// `load_sliced` call (Native layout; the caller's admission governs the
-/// device).
+/// `load_sliced` call on the card's own context (Native layout; the
+/// context's admission governs the device).
 #[cfg_attr(
     not(test),
     expect(
@@ -58,7 +58,7 @@ pub(crate) fn card_upload_plan(load: &CardLoad, card: usize) -> CardUploadPlan {
     )
 )]
 pub(crate) fn load_card_weights(
-    projector: &CudaProjector,
+    loader: &BorrowedLoader<'_>,
     weights: &GgufWeights,
     load: &CardLoad,
     card: usize,
@@ -71,5 +71,5 @@ pub(crate) fn load_card_weights(
         .iter()
         .map(|(name, spec)| (name.as_str(), spec.clone()))
         .collect();
-    projector.load_sliced(weights, &names, options, &slices)
+    loader.load_sliced(weights, &names, options, &slices)
 }

@@ -1226,3 +1226,547 @@ fn a_deltanet_block_runs_distributed_and_matches_the_reference() {
         assert_eq!(*word, 0, "card {card}: ring clean");
     }
 }
+
+/// One tensor of a test GGUF file. A second minimal copy of the writer the
+/// projector tests carry (`family/project/cuda/tests.rs`); extract both on
+/// the third use.
+#[derive(Clone)]
+struct FileEntry {
+    name: String,
+    ty: GgufType,
+    dims: Vec<u64>,
+    payload: Vec<u8>,
+}
+
+/// A GGUF v3 file with no metadata; payloads 32-byte aligned like the
+/// projector fixture writer.
+fn gguf_file_bytes(entries: &[FileEntry]) -> Vec<u8> {
+    const ALIGN: usize = 32;
+    let mut header = b"GGUF".to_vec();
+    header.extend_from_slice(&3u32.to_le_bytes());
+    header.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    header.extend_from_slice(&0u64.to_le_bytes());
+    let mut data: Vec<u8> = Vec::new();
+    for entry in entries {
+        header.extend_from_slice(&(entry.name.len() as u64).to_le_bytes());
+        header.extend_from_slice(entry.name.as_bytes());
+        header.extend_from_slice(&(entry.dims.len() as u32).to_le_bytes());
+        for &dim in &entry.dims {
+            header.extend_from_slice(&dim.to_le_bytes());
+        }
+        header.extend_from_slice(&entry.ty.id().to_le_bytes());
+        data.resize(data.len().next_multiple_of(ALIGN), 0);
+        header.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        data.extend_from_slice(&entry.payload);
+    }
+    header.resize(header.len().next_multiple_of(ALIGN), 0);
+    header.extend_from_slice(&data);
+    header
+}
+
+fn write_gguf(dir: &std::path::Path, file: &str, entries: &[FileEntry]) -> std::path::PathBuf {
+    let path = dir.join(file);
+    std::fs::write(&path, gguf_file_bytes(entries)).expect("write the fixture file");
+    path
+}
+
+/// The real-file variant of [`run_rig`]: the SAME fixture bytes, but
+/// written into a GGUF-v3 file, opened through the production reader,
+/// sliced by the planner-selected manifests, uploaded by
+/// `load_card_weights`, and resolved per card by the production
+/// `MixerWeights::new` (the name+shape check runs against the CARD's
+/// geometry, so a wrongly sliced tensor refuses by name) - then run
+/// through the same `CardStack` launchers. The projector's context is
+/// dropped before the stack takes its two leases; the loaded `CudaWeights`
+/// hold their own device leases and survive it.
+fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
+    use crate::family::project::cuda::{BorrowedLoader, LoadOptions};
+    use crate::family::qwen36::cuda::card_load::{CardLoad, card_loads};
+    use crate::family::qwen36::cuda::card_weights::load_card_weights;
+    use crate::weights::{GgufLimits, GgufWeights};
+
+    let d = step_dims();
+    let inv = inventory();
+    let options = options();
+    let table_layers = LayerTable::new(&d, &inv)?;
+    let mut layer = None;
+    for l in 0..table_layers.len() {
+        if table_layers.slot(l)?.kind == AttentionKind::Full {
+            layer = Some(l);
+            break;
+        }
+    }
+    let layer = layer.ok_or_else(|| EngError::Checkpoint("no full-attention layer".into()))?;
+    let ordinal = table_layers.slot(layer)?.ordinal;
+    let resid_slot = if layer.is_multiple_of(2) {
+        Slot::ResidA
+    } else {
+        Slot::ResidB
+    };
+
+    // The same deterministic fixture as run_rig, kept as FILE entries.
+    let geometry = MixerGeometry::new(&d)?;
+    let mut rng = Rng::new(0xC0FFEE);
+    let dense_specs = geometry.dense_specs(WeightLayout::Native, AttentionKind::Full)?;
+    let raw_specs = geometry.raw_specs(AttentionKind::Full)?;
+    let mut entries: Vec<FileEntry> = Vec::new();
+    for spec in &dense_specs {
+        entries.push(FileEntry {
+            name: table_layers.name(layer, spec.role)?.to_owned(),
+            ty: GgufType::Q4K,
+            dims: vec![spec.k as u64, spec.rows as u64],
+            payload: q4k_rows(spec.rows, spec.k, &mut rng),
+        });
+    }
+    for spec in &raw_specs {
+        entries.push(FileEntry {
+            name: table_layers.name(layer, spec.role)?.to_owned(),
+            ty: GgufType::F32,
+            dims: vec![spec.values as u64],
+            payload: f32_bytes(&raw_values(&spec.role, spec.values)),
+        });
+    }
+    let resid: Vec<f32> = (0..d.shape.hidden)
+        .map(|i| ((i * 37) % 199) as f32 / 199.0 - 0.5)
+        .collect();
+
+    // The file on disk through the production reader.
+    let dir = tempfile::tempdir().map_err(|e| EngError::Checkpoint(e.to_string()))?;
+    let path = write_gguf(dir.path(), "layer.gguf", &entries);
+    let limits = GgufLimits {
+        max_header_bytes: 1 << 20,
+        max_tensor_bytes: 1 << 28,
+    };
+    let weights = GgufWeights::open(&path, limits, None)?;
+
+    // The manifests of the one- and two-card plans, narrowed to the file's
+    // tensors exactly the way the session narrows `wanted` layers; the
+    // placement decisions themselves are the manifest's, untouched.
+    let table_one = ShardTable::new(&d.shape, 1, 32)?;
+    let table = ShardTable::new(&d.shape, 2, 32)?;
+    let file_names: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.name.clone()).collect();
+    let narrow = |mut load: CardLoad| {
+        load.entries
+            .retain(|entry| file_names.contains(&entry.name));
+        load
+    };
+    let mut one_loads = card_loads(&table_one, &inv, GgufType::Q4K)?;
+    let mut loads = card_loads(&table, &inv, GgufType::Q4K)?;
+
+    // The stack owns both card contexts; every load below runs on the
+    // cards' own contexts through the borrowed loader, so no third
+    // adapter lease exists at any point.
+    let admission = served_admission();
+    let mut stack = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let load_options = LoadOptions {
+        layout: WeightLayout::Native,
+        ..LoadOptions::default()
+    };
+    let single_weights = load_card_weights(
+        &BorrowedLoader::new(&stack.contexts()[0])?,
+        &weights,
+        &narrow(one_loads.remove(0)),
+        0,
+        load_options,
+    )?;
+    let card_weights = [
+        load_card_weights(
+            &BorrowedLoader::new(&stack.contexts()[0])?,
+            &weights,
+            &narrow(loads.remove(0)),
+            0,
+            load_options,
+        )?,
+        load_card_weights(
+            &BorrowedLoader::new(&stack.contexts()[1])?,
+            &weights,
+            &narrow(loads.remove(0)),
+            1,
+            load_options,
+        )?,
+    ];
+
+    // A CONSISTENT file whose attn_q declares half the rows loads fine but
+    // must refuse at the production resolution: the card-local shape check
+    // names the tensor. This is the wrongly-sliced-tensor gate.
+    {
+        let mut wrong = entries.clone();
+        let q = wrong
+            .iter_mut()
+            .find(|entry| entry.name.contains("attn_q"))
+            .expect("attn_q in the fixture");
+        let per_row = (q.dims[0] as usize / 256) * 144;
+        q.dims[1] /= 2;
+        q.payload.truncate(per_row * q.dims[1] as usize);
+        let wrong_path = write_gguf(dir.path(), "wrong-shape.gguf", &wrong);
+        let wrong_weights = GgufWeights::open(&wrong_path, limits, None)?;
+        let wrong_loaded = load_card_weights(
+            &BorrowedLoader::new(&stack.contexts()[0])?,
+            &wrong_weights,
+            &narrow(card_loads(&table_one, &inv, GgufType::Q4K)?.remove(0)),
+            0,
+            load_options,
+        )?;
+        let err = match MixerWeights::new(
+            &geometry,
+            &table_layers,
+            &wrong_loaded,
+            &[layer],
+            WeightLayout::Native,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("the half-rows attn_q must refuse at resolution"),
+        };
+        assert!(
+            format!("{err:?}").contains("attn_q"),
+            "the refusal names the tensor: {err:?}"
+        );
+    }
+
+    // ---- From here the rig of run_rig, with the weights replaced by the
+    // production resolution over the loaded sets.
+    let ctx0 = &stack.contexts()[0];
+    let stream0 = &stack.streams()[0];
+    let scratch = KernelScratch::for_dims(&d, 1, options.kv_mode)?;
+    let plan_ref = StepPlan::new(&d, 1, &options, &scratch)?;
+    let arena_ref = ctx0.arena(&plan_ref.arena_tensors())?;
+    let mut state_ref = ResidentState::allocate(ctx0, stream0, &d, &options)?;
+    state_ref.write_step_params(stream0, &StepParams::new(0, 0)?)?;
+    let write_row =
+        |stream: &crate::kernels::cuda::DeviceStream,
+         view: &crate::kernels::cuda::DeviceRange<'_>,
+         bytes: &[u8]|
+         -> Result<(), EngError> { view.buffer().write_at(stream, view.offset(), bytes) };
+    write_row(
+        stream0,
+        &arena_ref.tensor(
+            plan_ref
+                .index(resid_slot)
+                .ok_or_else(|| EngError::Checkpoint("resid".into()))?,
+        )?,
+        &f32_bytes(&resid),
+    )?;
+    for slot in [Slot::Q8Mix, Slot::Q8DeltaOut, Slot::Q8AttnOut] {
+        if let Some(at) = plan_ref.index(slot) {
+            let view = arena_ref.tensor(at)?;
+            write_row(stream0, &view, &vec![0u8; view.bytes()])?;
+        }
+    }
+    let mixers_ref = Mixers::new(
+        ctx0,
+        MixerParts {
+            geometry: MixerGeometry::new(&d)?,
+            table: &table_layers,
+            weights: MixerWeights::new(
+                &geometry,
+                &table_layers,
+                &single_weights,
+                &[layer],
+                WeightLayout::Native,
+            )?,
+            views: MixerViews::new(
+                &plan_ref,
+                &arena_ref,
+                &geometry,
+                WeightLayout::Native,
+                options.kv_mode,
+            )?,
+            layout: WeightLayout::Native,
+            kv_mode: options.kv_mode,
+            paged: None,
+        },
+    )?;
+    let resid_view_ref = arena_ref.tensor(
+        plan_ref
+            .index(resid_slot)
+            .ok_or_else(|| EngError::Checkpoint("resid".into()))?,
+    )?;
+    mixers_ref.run_block(
+        stream0,
+        &state_ref,
+        layer,
+        BlockIo {
+            resid: resid_view_ref,
+            admit_pos: 0,
+        },
+    )?;
+    stream0.synchronize()?;
+    let read_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
+        let view = arena_ref.tensor(
+            plan_ref
+                .index(slot)
+                .ok_or_else(|| EngError::Checkpoint(format!("no {slot:?}")))?,
+        )?;
+        let mut bytes = vec![0u8; view.bytes()];
+        view.buffer().read_at(stream0, view.offset(), &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    };
+    let read_plane = |plane: Plane| -> Result<Vec<u8>, EngError> {
+        let view = state_ref.kv_plane(ordinal, plane)?;
+        let mut bytes = vec![0u8; view.bytes()];
+        view.buffer().read_at(stream0, view.offset(), &mut bytes)?;
+        Ok(bytes)
+    };
+    let mix_out_ref = read_slot(Slot::MixOut)?;
+    let resid_out_ref = read_slot(resid_slot)?;
+    let core_ref = read_slot(Slot::AttnCore)?;
+    let planes_ref = (
+        read_plane(Plane::K)?,
+        read_plane(Plane::KScales)?,
+        read_plane(Plane::V)?,
+        read_plane(Plane::VScales)?,
+    );
+
+    // ---- The distributed block over the loaded per-card weight sets.
+    for card in 0..2 {
+        stack.write_step_params(card, &StepParams::new(0, 0)?)?;
+        let stream = &stack.streams()[card];
+        let resid_at = stack.plans()[card]
+            .index(resid_slot)
+            .ok_or_else(|| EngError::Checkpoint("resid".into()))?;
+        write_row(
+            stream,
+            &stack.shards()[card].tensor(resid_at)?,
+            &f32_bytes(&resid),
+        )?;
+        for slot in [Slot::Q8Mix, Slot::Q8AttnOut] {
+            if let Some(at) = stack.plans()[card].index(slot) {
+                let view = stack.shards()[card].tensor(at)?;
+                write_row(stream, &view, &vec![0u8; view.bytes()])?;
+            }
+        }
+    }
+    let kv_runs = [table.kv_rows(0)?, table.kv_rows(1)?];
+    let head_runs = [table.query_heads(0)?, table.query_heads(1)?];
+    let mut mixers: Vec<Mixers<'_>> = Vec::with_capacity(2);
+    let mut ops_attn: Option<Vec<Vec<CardOp>>> = None;
+    for (card, card_weight) in card_weights.iter().enumerate() {
+        let g = MixerGeometry::for_card(&d, &table, card)?;
+        let weights = MixerWeights::new(
+            &g,
+            &table_layers,
+            card_weight,
+            &[layer],
+            WeightLayout::Native,
+        )?;
+        let ops = CardKindOps::new(&table, card, &g, options.kv_mode)?;
+        let views = MixerViews::for_card(&stack.plans()[card], stack.shards()[card].arena(), &ops)?;
+        ops_attn.get_or_insert_with(Vec::new).push(ops.attn.clone());
+        let parts = MixerParts {
+            geometry: g,
+            table: &table_layers,
+            weights,
+            views,
+            layout: WeightLayout::Native,
+            kv_mode: options.kv_mode,
+            paged: None,
+        };
+        mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
+    }
+    let resid_views: Vec<crate::kernels::cuda::DeviceRange<'_>> = (0..2)
+        .map(|card| {
+            let at = stack.plans()[card]
+                .index(resid_slot)
+                .ok_or_else(|| EngError::Checkpoint("resid".into()))?;
+            stack.shards()[card].tensor(at)
+        })
+        .collect::<Result<_, EngError>>()?;
+    let ops = ops_attn
+        .as_ref()
+        .ok_or_else(|| EngError::Checkpoint("ops".into()))?;
+    let split = ops[0]
+        .iter()
+        .position(|op| matches!(op, super::mixer_ops::CardOp::GatherV))
+        .ok_or_else(|| EngError::Checkpoint("no gather".into()))?
+        + 1;
+    let ops_gather: Vec<&[CardOp]> = ops.iter().map(|l| &l[..split]).collect();
+    run_card_block(
+        &stack,
+        &mixers,
+        layer,
+        ordinal,
+        &ops_gather,
+        &resid_views,
+        0,
+        &kv_runs,
+    )?;
+    let rows_after_gather = (0..2)
+        .map(|card| {
+            stack.streams()[card].synchronize()?;
+            let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
+                let view = mixers[card].slot_view(slot)?;
+                let mut bytes = vec![0u8; view.bytes()];
+                view.buffer()
+                    .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
+                Ok(bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect())
+            };
+            Ok((read(Slot::KRows)?, read(Slot::VRows)?))
+        })
+        .collect::<Result<Vec<_>, EngError>>()?;
+    let ops_suffix: Vec<&[CardOp]> = ops.iter().map(|l| &l[split..]).collect();
+    run_card_block(
+        &stack,
+        &mixers,
+        layer,
+        ordinal,
+        &ops_suffix,
+        &resid_views,
+        0,
+        &kv_runs,
+    )?;
+    for card in 0..2 {
+        stack.streams()[card].synchronize()?;
+    }
+    let read_card_slot = |card: usize, slot: Slot| -> Result<Vec<f32>, EngError> {
+        let view = mixers[card].slot_view(slot)?;
+        let mut bytes = vec![0u8; view.bytes()];
+        view.buffer()
+            .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect())
+    };
+    let read_card_plane = |card: usize, plane: Plane| -> Result<Vec<u8>, EngError> {
+        let view = stack.shards()[card].state().kv_plane(ordinal, plane)?;
+        let mut bytes = vec![0u8; view.bytes()];
+        view.buffer()
+            .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
+        Ok(bytes)
+    };
+    let mut words = Vec::with_capacity(2);
+    for card in 0..2 {
+        let mut word = [0u8; 4];
+        stack.shards()[card]
+            .ring_word()
+            .read_at(&stack.streams()[card], 0, &mut word)?;
+        words.push(u32::from_le_bytes(word));
+    }
+    let mix_out = (0..2)
+        .map(|c| read_card_slot(c, Slot::MixOut))
+        .collect::<Result<_, _>>()?;
+    let resid_out = (0..2)
+        .map(|c| {
+            let at = stack.plans()[c]
+                .index(resid_slot)
+                .ok_or_else(|| EngError::Checkpoint("resid".into()))?;
+            let view = stack.shards()[c].tensor(at)?;
+            let mut bytes = vec![0u8; view.bytes()];
+            view.buffer()
+                .read_at(&stack.streams()[c], view.offset(), &mut bytes)?;
+            Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect())
+        })
+        .collect::<Result<Vec<_>, EngError>>()?;
+    let core = (0..2)
+        .map(|c| read_card_slot(c, Slot::AttnCore))
+        .collect::<Result<_, _>>()?;
+    let mut planes = Vec::with_capacity(2);
+    for card in 0..2 {
+        planes.push((
+            read_card_plane(card, Plane::K)?,
+            read_card_plane(card, Plane::KScales)?,
+            read_card_plane(card, Plane::V)?,
+            read_card_plane(card, Plane::VScales)?,
+        ));
+    }
+    Ok(Evidence {
+        name,
+        mix_out_ref,
+        resid_out_ref,
+        core_ref,
+        planes_ref,
+        rows_after_gather,
+        mix_out,
+        resid_out,
+        core,
+        planes,
+        head_runs: head_runs.to_vec(),
+        words,
+    })
+}
+
+#[test]
+fn a_real_gguf_file_loads_the_distributed_block() {
+    const NAME: &str = "a_real_gguf_file_loads_the_distributed_block";
+    if !device_present(NAME) {
+        return;
+    }
+    let ev = run_gguf_rig(NAME).expect("the real-file rig");
+    // Exact: the KV cache planes byte for byte.
+    for card in 0..2 {
+        let got = &ev.planes[card];
+        let want = &ev.planes_ref;
+        for (plane, got_bytes, want_bytes) in [
+            ("K codes", &got.0, &want.0),
+            ("K scales", &got.1, &want.1),
+            ("V codes", &got.2, &want.2),
+            ("V scales", &got.3, &want.3),
+        ] {
+            assert!(
+                got_bytes == want_bytes,
+                "{NAME}: card {card} {plane}: {} differing bytes",
+                got_bytes
+                    .iter()
+                    .zip(want_bytes)
+                    .filter(|(g, w)| g != w)
+                    .count()
+            );
+        }
+    }
+    // Exact: the gathered rows agree across cards.
+    assert_eq!(
+        ev.rows_after_gather[0].0, ev.rows_after_gather[1].0,
+        "the gathered K row is bit-identical"
+    );
+    assert_eq!(
+        ev.rows_after_gather[0].1, ev.rows_after_gather[1].1,
+        "the gathered V row is bit-identical"
+    );
+    // Exact: the per-head decode against the reference's head slice.
+    let head_stride = ev.core_ref.len() / (ev.head_runs[0].len() + ev.head_runs[1].len());
+    for card in 0..2 {
+        let core = &ev.core[card];
+        let start = ev.head_runs[card].start * head_stride;
+        let slice = &ev.core_ref[start..start + core.len()];
+        assert_eq!(
+            max_abs_diff(core, slice),
+            0.0,
+            "{NAME}: card {card}: the per-head decode is expected exact"
+        );
+    }
+    // Numerical: the summed mixer output and the residual epilogue.
+    for card in 0..2 {
+        let diff = max_abs_diff(&ev.mix_out[card], &ev.mix_out_ref);
+        let bound = SPLIT_SUM_RELATIVE * max_abs(&ev.mix_out_ref).max(1.0);
+        println!("{NAME}: card {card} MixOut max |diff| = {diff:.3e} (bound {bound:.3e})");
+        assert!(
+            diff <= bound,
+            "{NAME}: card {card}: MixOut {diff} > {bound}"
+        );
+        let diff = max_abs_diff(&ev.resid_out[card], &ev.resid_out_ref);
+        let bound = SPLIT_SUM_RELATIVE * max_abs(&ev.resid_out_ref).max(1.0);
+        println!("{NAME}: card {card} resid max |diff| = {diff:.3e} (bound {bound:.3e})");
+        assert!(diff <= bound, "{NAME}: card {card}: resid {diff} > {bound}");
+    }
+    for (card, word) in ev.words.iter().enumerate() {
+        assert_eq!(*word, 0, "{NAME}: card {card}: ring clean");
+    }
+}
