@@ -14,8 +14,13 @@ use super::super::settings::{
     weight_format_name,
 };
 use super::{
+    card_load::card_loads,
+    card_session::{CardSession, Q36CudaStep},
+    card_step::CardStack,
+    card_weights::load_card_weights,
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     exl3_load::load_exl3_dir,
+    layer_table::LayerTable,
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
@@ -31,10 +36,14 @@ use crate::{
     EngError,
     family::{
         QWEN3_6_35B_A3B,
-        gguf_model::{GgufModel, Inventory, open_qwen3_6_35b_a3b},
-        project::cuda::{CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout},
+        gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
+        project::cuda::{
+            BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
+            served_admission,
+        },
         qwen36::host::HostShape,
         session::DecodeSession,
+        speculate::config::DraftMode,
     },
     kernels::cuda::peer::{check_peer_facts, enable_peer_access, probe_device_set},
     kernels::cuda::resident::exl3::SingleRow,
@@ -754,7 +763,13 @@ pub(crate) fn start(
     })?;
     let guard = BuildGuard::acquire()?;
     let owned = settings.clone();
-    let engine = spawn_engine_noted(piece, ready_note, move || make(owned, rules, plan, guard))?;
+    let engine = if owned.cuda_devices == [0] {
+        spawn_engine_noted(piece, ready_note, move || make(owned, rules, plan, guard))?
+    } else {
+        spawn_engine_noted(piece, ready_note, move || {
+            make_multi(owned, rules, plan, guard)
+        })?
+    };
     Ok((engine, bundle))
 }
 
@@ -763,19 +778,50 @@ pub(crate) fn start(
 /// options from the loaded layout, step resources, then the leaks, the step and the capture
 /// setting. The SHA-256 toggle arrives already resolved (`start()` validated it), so this
 /// thread never reads the environment.
-/// The device-set gate at the head of `make`: `[0]` (or an absent member,
-/// which settings already read as `[0]`) passes untouched. Any other list is
-/// probed for real — visibility, one compute capability, direct peer access
-/// for every ordered pair, and a shard table whose column cuts keep the
-/// 256-value K-quant blocks whole — and the probe result is printed, so the
-/// operator learns from this refusal whether the box can ever serve
-/// multi-device. The step then refuses: this build serves on device 0 only,
-/// and silently serving there after `--config` named other devices would
-/// hide the mismatch. The multi-device step replaces the final refusal and
-/// keeps everything above it.
-fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
-    if settings.cuda_devices == [0] {
-        return Ok(());
+/// The multi-device half of `make`: the eager whole-token driver behind the
+/// same `DecodeSession` seam. The order follows the single-device gate: the
+/// device-set probe and peer enablement (this used to be `check_device_set`,
+/// the probe-then-refuse gate), the GGUF identity, the shard table and
+/// per-card load plans, one context and one resident state per card, the
+/// per-card loads through the session's own contexts, the free-memory floor
+/// on every card, then the leaks, the `BuildGuard` commit and the session.
+///
+/// v1 refuses what the card path has no plan for: EXL3 packs, tiered expert
+/// banks, host-paged KV, graph capture and speculative decoding. The card
+/// kernels are native-layout only, so `kv_mode_of` sees `Native` exactly as
+/// the resident step's load does.
+fn make_multi(
+    settings: Q36Settings,
+    rules: QwenRules,
+    plan: StartupPlan,
+    mut guard: BuildGuard,
+) -> Result<(Q36CudaStep, DecodeSession), EngError> {
+    if let WeightFormat::Exl3 = settings.weights {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving takes the GGUF checkpoint; EXL3 packs are single-device"
+                .into(),
+        ));
+    }
+    if settings.tiered.is_some() {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving refuses the tiered expert banks".into(),
+        ));
+    }
+    if settings.kv_offload_host_bytes.is_some() {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving refuses host-paged KV (kv_offload_host_bytes)"
+                .into(),
+        ));
+    }
+    if settings.capture {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving refuses graph capture".into(),
+        ));
+    }
+    if settings.speculation.mode != DraftMode::Disabled {
+        return Err(EngError::BadRequest(
+            "cuda_devices: multi-device serving refuses speculative decoding".into(),
+        ));
     }
     check_fused_inproj(
         settings.cuda_devices.len(),
@@ -789,21 +835,84 @@ fn check_device_set(settings: &Q36Settings) -> Result<(), EngError> {
         ))
     })?;
     enable_peer_access(&settings.cuda_devices)?;
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
-    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
-    for card in 0..settings.cuda_devices.len() {
-        super::shard::shard_loads(&table, &inventory, card)?;
-    }
     let first = &facts[0];
     eprintln!(
-        "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full, shard table and per-device load plans admitted",
+        "q36 cuda: devices {:?} probed: compute capability {}.{} on every device, peer access full",
         settings.cuda_devices, first.cc_major, first.cc_minor
     );
-    Err(EngError::BadRequest(format!(
-        "cuda_devices {:?}: this build serves on device 0 only; multi-device serving is not implemented yet",
-        settings.cuda_devices
-    )))
+    let (model, _gguf) = open_gguf(&settings.artifact, plan.verify)?;
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
+    let dims = StepDims::new(&shape, &inventory)?;
+    let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
+    let options = step_options(settings.context_limit, WeightLayout::Native, kv_mode)?;
+    let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+    // The shard plans size each card's upload from the file's expert quant; layer 0's
+    // expert gate names the tensor that carries it.
+    let layers = LayerTable::new(&dims, &inventory)?;
+    let gate = layers.name(0, Role::FfnGateExps)?;
+    let quant = model
+        .weights
+        .header()
+        .tensor(gate)
+        .ok_or_else(|| {
+            EngError::Checkpoint(format!("gguf model: tensor {gate} is not in the file"))
+        })?
+        .ggml_type();
+    let loads = card_loads(&table, &inventory, quant)?;
+    let fixed_admission = plan.modes.fixed_admission;
+    // The load reserve keeps the single-device figure: it holds the KV bytes
+    // free during each card's upload, and over-reserving per card (the cards
+    // share the KV rows) only refuses a tight fit earlier, never corrupts it.
+    let load = load_options(plan.reserve, fixed_admission);
+    let (stack, states) =
+        CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
+    let mut loaded = Vec::with_capacity(loads.len());
+    for (card, set) in loads.iter().enumerate() {
+        let loader = BorrowedLoader::new(&stack.contexts()[card])?;
+        loaded.push(load_card_weights(&loader, &model.weights, set, card, load)?);
+    }
+    for (card, context) in stack.contexts().iter().enumerate() {
+        let info = context.memory_info()?;
+        if info.free < MIN_FREE_AFTER_LOAD {
+            return Err(EngError::MemoryPlan(format!(
+                "cuda admission: card {card} has {} bytes free after the load, below the {}-byte floor",
+                info.free, MIN_FREE_AFTER_LOAD
+            )));
+        }
+        eprintln!(
+            "q36 cuda: card {card} (device {}) weights resident ({} B), free after load {} B",
+            settings.cuda_devices[card],
+            loads[card].upload_bytes(),
+            info.free
+        );
+    }
+    // LEAK: the same lifetime pattern as the single-device `make` - the stack,
+    // the layer table and the weight sets are leaked for the process
+    // lifetime, giving the session its 'static views; `guard.commit()` below
+    // pins the one-engine flag, so any retry after this point is refused with
+    // the documented text.
+    let stack: &'static CardStack = Box::leak(Box::new(stack));
+    let layers: &'static LayerTable = Box::leak(Box::new(layers));
+    let loaded: &'static [CudaWeights] = Box::leak(loaded.into_boxed_slice());
+    let weights: &'static [&'static CudaWeights] =
+        Box::leak(loaded.iter().collect::<Vec<_>>().into_boxed_slice());
+    guard.commit();
+    let session = CardSession::new(
+        stack,
+        states,
+        weights,
+        layers,
+        &inventory,
+        &dims,
+        &options,
+        rules.eos,
+        rules.sampler_vocab,
+    )?;
+    Ok((
+        Q36CudaStep::Cards(Box::new(session)),
+        DecodeSession::default(),
+    ))
 }
 
 /// Multi-device serving refuses the GDN input-projection fusion: the fused
@@ -828,7 +937,6 @@ fn make(
     plan: StartupPlan,
     mut guard: BuildGuard,
 ) -> Result<(QwenResidentStep<'static>, DecodeSession), EngError> {
-    check_device_set(&settings)?;
     let kv_cache = plan.reserve;
     let verify = plan.verify;
     let fixed_admission = plan.modes.fixed_admission;

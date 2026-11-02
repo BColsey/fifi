@@ -518,13 +518,6 @@ impl StepPlan {
     /// projections and their activations over the card's head ranges, the expert gate/up packs
     /// over its inter rows. [`Slot::KRows`] and [`Slot::VRows`] exist under BOTH KV modes at the
     /// FULL row width: every card's buffer receives the whole gathered row, not its own extent.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the multi-device step, its first production caller"
-        )
-    )]
     pub(super) fn for_card(
         dims: &StepDims,
         table: &ShardTable,

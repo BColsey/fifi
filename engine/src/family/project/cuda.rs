@@ -424,13 +424,6 @@ pub(crate) struct BorrowedLoader<'a> {
 }
 
 impl<'a> BorrowedLoader<'a> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the two-device start, which loads per-card slice sets on the session's own contexts"
-        )
-    )]
     pub(crate) fn new(context: &'a CudaContext) -> Result<Self, EngError> {
         Ok(Self {
             context,
@@ -451,13 +444,6 @@ impl<'a> BorrowedLoader<'a> {
 
     /// The sliced load of [`CudaProjector::load_sliced`], on the caller's
     /// context.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the two-device start, which loads per-card slice sets on the session's own contexts"
-        )
-    )]
     pub(crate) fn load_sliced(
         &self,
         weights: &GgufWeights,

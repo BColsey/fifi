@@ -100,13 +100,6 @@ impl MoeSpecs {
     /// down columns); the router, the residual width and the expert count
     /// stay full, because routing and the residual row are replicated. The
     /// checks then validate the CARD's loaded (sliced) shapes by name.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the multi-device step, its first production caller"
-        )
-    )]
     pub(super) fn for_card(
         dims: &StepDims,
         table: &ShardTable,

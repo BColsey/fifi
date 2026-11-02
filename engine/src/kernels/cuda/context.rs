@@ -234,13 +234,6 @@ impl CudaContext {
     /// device 0. An ordinal at or above the visible device count is a
     /// `Backend` failure before any lease is taken. Every owner this context
     /// creates lives on `device` for its whole life.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the multi-device loader, which builds one context per device"
-        )
-    )]
     pub(crate) fn with_admission_on(
         device: usize,
         admission: &Admission,

@@ -722,13 +722,6 @@ pub(super) enum CardOp {
 /// offsets, the card prep (absolute `k_range` rows into the full row slots),
 /// the two gathers, the full-row append of the KV mode, and the decode over
 /// the card's query-head run against the replicated cache.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device step, its first production caller"
-    )
-)]
 fn attn_ops_card(
     g: &MixerGeometry,
     k_range: (usize, usize),
@@ -866,13 +859,6 @@ fn attn_ops_card(
 /// `check_fused_inproj` stops it at start, and the card path states it again
 /// so no caller can fuse its way past the shard table's four separate
 /// projections.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the multi-device step, its first production caller"
-    )
-)]
 pub(super) fn block_ops_card(
     kind: AttentionKind,
     g: &MixerGeometry,

@@ -50,13 +50,6 @@ pub(crate) fn card_upload_plan(load: &CardLoad, card: usize) -> CardUploadPlan {
 /// Uploads `card`'s manifest from the GGUF file in one all-or-nothing
 /// `load_sliced` call on the card's own context (Native layout; the
 /// context's admission governs the device).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "staged for the two-device start and the card block rigs, its first callers"
-    )
-)]
 pub(crate) fn load_card_weights(
     loader: &BorrowedLoader<'_>,
     weights: &GgufWeights,

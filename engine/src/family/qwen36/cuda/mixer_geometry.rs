@@ -162,13 +162,6 @@ impl MixerGeometry {
     /// of a K row) read `table.kv_rows(card)`, not this geometry's slice
     /// length. The full new K/V row reappears on every card through the
     /// ring gather before the cache append.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the multi-device step, its first production caller"
-        )
-    )]
     pub(super) fn for_card(
         dims: &StepDims,
         table: &ShardTable,

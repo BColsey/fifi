@@ -186,13 +186,6 @@ impl<'a> MixerViews<'a> {
     /// CARD op lists (whose gathers and fp16 append name KRows/VRows under both modes, which
     /// the single-device Fp16 list never does), resolved against the card plan
     /// `StepPlan::for_card` builds. Every card of the table builds its own views.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "staged for the multi-device step, its first production caller"
-        )
-    )]
     pub(super) fn for_card(
         plan: &StepPlan,
         arena: &'a DeviceArena,
