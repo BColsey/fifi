@@ -1,3 +1,4 @@
+pub mod capability;
 mod checkpoint_json;
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

@@ -72,7 +72,7 @@ pub(crate) fn start_engine_for_family(
     )
 }
 
-fn backend_of_build() -> Backend {
+pub(crate) fn backend_of_build() -> Backend {
     if cfg!(all(
         feature = "native-mlx",
         target_os = "macos",

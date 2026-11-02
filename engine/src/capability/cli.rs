@@ -1,0 +1,478 @@
+//! The diagnostic command line: `doctor`, `check`, and `config validate`.
+//!
+//! Parsing produces an `Action`; execution renders the same report
+//! structs every other surface will consume, as text or `--json`. The
+//! server path is deliberately not here: `server::run_cli` owns argv
+//! dispatch and hands anything that is not a serve invocation to
+//! `dispatch` below, so `--config` keeps its exact current meaning.
+
+use std::path::PathBuf;
+
+use super::{
+    Probe, gib,
+    preflight::{Candidate, PreflightReport, Verdict},
+    probe::HardwareFacts,
+};
+
+pub const USAGE: &str = "\
+usage:
+  enginesrv --config <path>            serve (same as `serve --config <path>`)
+  enginesrv doctor [--config <path>] [--json]
+  enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
+                    [--context <tokens>] [--kv <f32|bf16|q8>] [--json]
+  enginesrv config validate <path>
+  enginesrv --help | --version
+
+doctor  Report what this build can serve on this machine: compiled
+        backends, CUDA device and free VRAM, host RAM and threads.
+        With --config, also validate that configuration file.
+check   Preflight one model directory: compatibility verdict, the
+        checks behind it, and a memory estimate against the probed
+        free memory. Exit 0 when servable, 1 otherwise.
+config validate
+        Parse and validate a configuration file, including that the
+        environment variable named by api_key_env is set (its value is
+        never printed).
+";
+
+#[derive(Debug, PartialEq)]
+pub enum Action {
+    Help,
+    Version,
+    Doctor {
+        config: Option<PathBuf>,
+        json: bool,
+    },
+    Check {
+        model_dir: PathBuf,
+        tokenizer_dir: Option<PathBuf>,
+        candidate: Candidate,
+        json: bool,
+    },
+    ConfigValidate(PathBuf),
+}
+
+/// Parse the diagnostic commands. Returns `None` when argv is a serve
+/// invocation (`serve …`, `--config …`, or anything else): the caller
+/// keeps owning those, including their usage errors.
+pub fn parse(args: &[String]) -> Option<Result<Action, String>> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h" | "help") => Some(Ok(Action::Help)),
+        Some("--version" | "-V" | "version") => Some(Ok(Action::Version)),
+        Some("doctor") => Some(parse_doctor(&args[1..])),
+        Some("check") => Some(parse_check(&args[1..])),
+        Some("config") => Some(match args.get(1).map(String::as_str) {
+            Some("validate") => match args.get(2) {
+                Some(path) if args.len() == 3 => Ok(Action::ConfigValidate(PathBuf::from(path))),
+                _ => Err("usage: enginesrv config validate <path>".to_string()),
+            },
+            _ => Err("usage: enginesrv config validate <path>".to_string()),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_doctor(rest: &[String]) -> Result<Action, String> {
+    let mut config = None;
+    let mut json = false;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--config" => {
+                config = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("doctor: --config needs a path".to_string())?,
+                ))
+            }
+            other => return Err(format!("doctor: unknown argument {other:?}")),
+        }
+    }
+    Ok(Action::Doctor { config, json })
+}
+
+fn parse_check(rest: &[String]) -> Result<Action, String> {
+    let mut positional = None;
+    let mut tokenizer_dir = None;
+    let mut candidate = Candidate::default();
+    let mut json = false;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--tokenizer-dir" => {
+                tokenizer_dir = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("check: --tokenizer-dir needs a path".to_string())?,
+                ))
+            }
+            "--family" => {
+                candidate.family = Some(
+                    it.next()
+                        .ok_or("check: --family needs a name".to_string())?
+                        .clone(),
+                )
+            }
+            "--context" => {
+                let value = it
+                    .next()
+                    .ok_or("check: --context needs a token count".to_string())?;
+                candidate.context_limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("check: --context {value:?} is not a token count"))?,
+                );
+            }
+            "--kv" => {
+                candidate.kv_dtype = Some(
+                    it.next()
+                        .ok_or("check: --kv needs one of f32, bf16, q8".to_string())?
+                        .clone(),
+                )
+            }
+            other if !other.starts_with('-') && positional.is_none() => {
+                positional = Some(PathBuf::from(other));
+            }
+            other => return Err(format!("check: unknown argument {other:?}")),
+        }
+    }
+    match positional {
+        Some(model_dir) => Ok(Action::Check {
+            model_dir,
+            tokenizer_dir,
+            candidate,
+            json,
+        }),
+        None => Err("usage: enginesrv check <model_dir> [options]".to_string()),
+    }
+}
+
+/// Run one diagnostic action, printing to stdout. `Err` text is for the
+/// caller's `enginesrv: <error>` line and exit 1.
+pub fn run(action: &Action) -> Result<(), String> {
+    match action {
+        Action::Help => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        Action::Version => {
+            println!("enginesrv {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Action::Doctor { config, json } => {
+            let facts = super::probe::probe();
+            let validation = config.as_deref().map(validate_config);
+            if *json {
+                let value = serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "hardware": facts,
+                    "config": validation.as_ref().map(|lines| {
+                        serde_json::json!({"path": config, "result": lines})
+                    }),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", render_doctor(&facts));
+                if let (Some(path), Some(result)) = (config, &validation) {
+                    println!("config {}:", path.display());
+                    match result {
+                        Ok(lines) => lines.iter().for_each(|line| println!("  {line}")),
+                        Err(error) => println!("  INVALID: {error}"),
+                    }
+                }
+            }
+            match validation {
+                Some(Err(error)) => Err(format!("config is invalid: {error}")),
+                _ => Ok(()),
+            }
+        }
+        Action::Check {
+            model_dir,
+            tokenizer_dir,
+            candidate,
+            json,
+        } => {
+            let tokenizer = tokenizer_dir.as_deref().unwrap_or(model_dir.as_path());
+            let facts = super::probe::probe();
+            let report = super::preflight::preflight(model_dir, tokenizer, candidate, &facts)
+                .map_err(|error| super::describe_error(&error))?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", render_preflight(&report));
+            }
+            if report.verdict.servable() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "check: verdict {} for {}",
+                    report.verdict.name(),
+                    report.model_dir.display()
+                ))
+            }
+        }
+        Action::ConfigValidate(path) => match validate_config(path) {
+            Ok(lines) => {
+                println!("config {} is valid:", path.display());
+                lines.iter().for_each(|line| println!("  {line}"));
+                Ok(())
+            }
+            Err(error) => Err(format!("config {} is invalid: {error}", path.display())),
+        },
+    }
+}
+
+/// The server's own validation (`Config::from_file` runs the full check),
+/// plus the startup key presence rule. The key value is read exactly as
+/// startup reads it and never returned or printed.
+pub fn validate_config(path: &std::path::Path) -> Result<Vec<String>, String> {
+    use crate::server::config::Config;
+    let config = Config::from_file(path).map_err(|error| error.to_string())?;
+    config
+        .api_key(|name| std::env::var(name).ok())
+        .map_err(|error| error.to_string())?;
+    let mut lines = vec![format!(
+        "listen {}, {} engine(s), api key variable is set",
+        config.listen_address().map_err(|e| e.to_string())?,
+        config.engines.len()
+    )];
+    for engine in &config.engines {
+        lines.push(format!(
+            "engine {}: family {}, model {}, model_dir {}",
+            engine.id,
+            engine.family,
+            engine.model_name(),
+            engine.model_dir.display()
+        ));
+    }
+    Ok(lines)
+}
+
+fn probe_line<T>(label: &str, probe: &Probe<T>, render: impl Fn(&T) -> String) -> String {
+    match probe {
+        Probe::Measured(value) => format!("{label}: {}", render(value)),
+        Probe::Unavailable(reason) => format!("{label}: unavailable ({reason})"),
+    }
+}
+
+pub fn render_doctor(facts: &HardwareFacts) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("enginesrv {}\n", env!("CARGO_PKG_VERSION")));
+    let backends: Vec<&str> = [
+        (facts.backends.cuda, "CUDA"),
+        (facts.backends.mlx, "MLX (Apple Silicon)"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    out.push_str(&format!(
+        "backends compiled in: {}\n",
+        if backends.is_empty() {
+            "none (fake family only)".to_string()
+        } else {
+            backends.join(", ")
+        }
+    ));
+    out.push_str(&probe_line(
+        "CUDA devices (measured now)",
+        &facts.cuda.device_count,
+        |n| n.to_string(),
+    ));
+    out.push('\n');
+    out.push_str(&probe_line(
+        "device 0 shares memory with host",
+        &facts.cuda.first_device_integrated,
+        |v| {
+            if *v {
+                "yes (integrated)".into()
+            } else {
+                "no".into()
+            }
+        },
+    ));
+    out.push('\n');
+    out.push_str(&probe_line(
+        "device 0 VRAM free (measured now)",
+        &facts.cuda.first_device_free_bytes,
+        |b| gib(*b),
+    ));
+    out.push('\n');
+    out.push_str(&probe_line(
+        "device 0 VRAM total",
+        &facts.cuda.first_device_total_bytes,
+        |b| gib(*b),
+    ));
+    out.push('\n');
+    out.push_str(&probe_line(
+        "host RAM available (measured now)",
+        &facts.host.mem_available_bytes,
+        |b| gib(*b),
+    ));
+    out.push('\n');
+    out.push_str(&probe_line(
+        "host RAM total",
+        &facts.host.mem_total_bytes,
+        |b| gib(*b),
+    ));
+    out.push('\n');
+    out.push_str(&format!("host CPU threads: {}\n", facts.host.cpu_threads));
+    out
+}
+
+pub fn render_preflight(report: &PreflightReport) -> String {
+    use super::preflight::CheckStatus;
+    let mut out = String::new();
+    out.push_str(&format!("model_dir: {}\n", report.model_dir.display()));
+    out.push_str(&format!(
+        "family: {}\n",
+        report.family.as_deref().unwrap_or("(not identified)")
+    ));
+    out.push_str(&format!(
+        "compatibility: {:?} \u{b7} qualification: {:?} \u{b7} resource fit: {:?}\n",
+        report.dimensions.compatibility,
+        report.dimensions.qualification,
+        report.dimensions.resource_fit
+    ));
+    for check in &report.checks {
+        let mark = match check.status {
+            CheckStatus::Pass => "PASS",
+            CheckStatus::Warn => "WARN",
+            CheckStatus::Fail => "FAIL",
+            CheckStatus::Info => "INFO",
+        };
+        out.push_str(&format!("[{mark}] {}: {}\n", check.name, check.detail));
+    }
+    if let Some(estimate) = &report.estimate {
+        out.push_str(&format!(
+            "estimate (derived; workspace and residency policy not included): checkpoint files {} + KV {} ({} B/position x {}) + fixed state {} = {}\n",
+            gib(estimate.weight_bytes),
+            gib(estimate.kv_bytes),
+            estimate.kv_bytes_per_position,
+            estimate.context_limit,
+            super::mib(estimate.fixed_state_bytes),
+            gib(estimate.total_bytes),
+        ));
+        if let (Some(free), Some(limit)) = (estimate.budget_free_bytes, estimate.budget_limit_bytes)
+        {
+            out.push_str(&format!(
+                "budget: {} = {} free, admission limit {} ({} permille policy share)\n",
+                estimate.budget_kind,
+                gib(free),
+                gib(limit),
+                crate::memory::MemoryPolicy::default_share().share_permille(),
+            ));
+        } else {
+            out.push_str(&format!("budget: {}\n", estimate.budget_kind));
+        }
+        if let Some(fitting) = estimate.largest_fitting_context {
+            out.push_str(&format!(
+                "largest fitting context (proposal only): {fitting}\n"
+            ));
+        }
+    }
+    out.push_str(&format!("verdict: {}\n", verdict_label(report.verdict)));
+    out.push_str(&format!("next step: {}\n", report.next_step));
+    out
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Ready => "READY",
+        Verdict::ReadyWithAdjustments => "READY WITH ADJUSTMENTS",
+        Verdict::ResourceConstrained => "RESOURCE-CONSTRAINED",
+        Verdict::Experimental => "EXPERIMENTAL",
+        Verdict::Unsupported => "UNSUPPORTED",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, parse};
+
+    fn args(text: &[&str]) -> Vec<String> {
+        text.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn serve_invocations_are_not_diagnostic_actions() {
+        assert!(parse(&args(&["--config", "f.json"])).is_none());
+        assert!(parse(&args(&["serve", "--config", "f.json"])).is_none());
+        assert!(parse(&args(&[])).is_none());
+        assert!(parse(&args(&["--nonsense"])).is_none());
+    }
+
+    #[test]
+    fn help_and_version_are_actions() {
+        assert_eq!(parse(&args(&["--help"])), Some(Ok(Action::Help)));
+        assert_eq!(parse(&args(&["--version"])), Some(Ok(Action::Version)));
+    }
+
+    #[test]
+    fn check_parses_dir_and_overrides() {
+        let parsed = parse(&args(&[
+            "check",
+            "/m",
+            "--family",
+            "qwen3_6_35b_a3b",
+            "--context",
+            "131072",
+            "--kv",
+            "q8",
+            "--json",
+        ]))
+        .expect("action")
+        .expect("ok");
+        let Action::Check {
+            model_dir,
+            candidate,
+            json,
+            ..
+        } = parsed
+        else {
+            panic!("expected check action");
+        };
+        assert_eq!(model_dir.to_str(), Some("/m"));
+        assert_eq!(candidate.family.as_deref(), Some("qwen3_6_35b_a3b"));
+        assert_eq!(candidate.context_limit, Some(131_072));
+        assert_eq!(candidate.kv_dtype.as_deref(), Some("q8"));
+        assert!(json);
+    }
+
+    #[test]
+    fn check_refuses_missing_dir_and_bad_context() {
+        assert!(parse(&args(&["check"])).expect("action").is_err());
+        assert!(
+            parse(&args(&["check", "/m", "--context", "lots"]))
+                .expect("action")
+                .is_err()
+        );
+        assert!(
+            parse(&args(&["check", "/m", "--bogus"]))
+                .expect("action")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn doctor_and_config_validate_parse() {
+        assert_eq!(
+            parse(&args(&["doctor", "--json"])),
+            Some(Ok(Action::Doctor {
+                config: None,
+                json: true
+            }))
+        );
+        assert!(matches!(
+            parse(&args(&["config", "validate", "f.json"])),
+            Some(Ok(Action::ConfigValidate(_)))
+        ));
+        assert!(parse(&args(&["config", "validate"])).expect("a").is_err());
+        assert!(parse(&args(&["config", "print"])).expect("a").is_err());
+    }
+}

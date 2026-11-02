@@ -7,7 +7,7 @@ mod auth;
 mod cancel_tests;
 mod chat;
 mod completions;
-mod config;
+pub(crate) mod config;
 #[cfg(test)]
 mod contract;
 mod error;

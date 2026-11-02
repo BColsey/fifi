@@ -238,7 +238,7 @@ impl StartupPlan {
 /// both matching the pinned identity the qualification tool checks before every gated run. The
 /// full-file SHA-256 beside them is checked only when `Q36_VERIFY_GGUF_SHA256` is `1`: hashing
 /// 20 GB costs about 15-40 s per start (ESTIMATE) and the qualification script checks it.
-pub(super) const GGUF_NAME: &str = "Qwen3.6-35B-A3B-Q4_K_M.gguf";
+pub(crate) const GGUF_NAME: &str = "Qwen3.6-35B-A3B-Q4_K_M.gguf";
 pub(super) const GGUF_BYTES: u64 = 20_419_565_568;
 const GGUF_SHA256: &str = "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7";
 /// The full-file SHA-256 is checked only when this variable is EXACTLY `1`: unset or `0`
@@ -526,7 +526,7 @@ pub(super) fn check_sha256(path: &Path, expected: &str) -> Result<(), EngError> 
 /// SIZE always (the metadata alone), the full-file SHA-256 only when `verify` asks for it. The
 /// toggle value itself is resolved by the caller (`start()`), so a bad spelling is refused at
 /// startup, before any device work; unset stays OFF with no error.
-pub(super) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngError> {
+pub(crate) fn check_gguf_identity(path: &Path, verify: bool) -> Result<(), EngError> {
     let metadata = std::fs::metadata(path).map_err(|_| {
         EngError::Checkpoint(format!(
             "cuda checkpoint: {} is missing (pinned: {GGUF_NAME}, {GGUF_BYTES} bytes)",

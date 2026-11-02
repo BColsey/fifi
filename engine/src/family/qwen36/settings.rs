@@ -725,7 +725,7 @@ fn prefill_reserve(options: &Q36Options, budget: Option<u64>) -> Result<u64, Eng
 /// `[value_heads, value_head_dim, key_head_dim]` and the convolution ring
 /// `[conv_dim, conv_kernel - 1]`, F32. It is derived from the family spec, never a literal:
 /// `QWEN3_6_35B_A3B` holds 65,863,680 bytes in its 30 DeltaNet layers.
-fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
+pub(crate) fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
     let Some(linear) = spec.linear else {
         return Err(bad(
             "the model has no linear-attention state to reserve".into()
@@ -760,7 +760,7 @@ fn delta_state_bytes(spec: &FamilySpec) -> Result<u64, EngError> {
 /// authority). It is derived from the family spec, never a literal: `QWEN3_6_35B_A3B` adds 40,960
 /// bytes per position in its 10 attention layers in the F32 form, 10,880 at Q8 with BF16 scales,
 /// and 11,520 at Q8 with F32 scales.
-fn cache_growth_per_position(
+pub(crate) fn cache_growth_per_position(
     spec: &FamilySpec,
     kv: KvDtype,
     act: Activation,

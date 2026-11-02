@@ -25,7 +25,23 @@ use tokio::net::TcpListener;
 
 /// `args` are the command-line arguments after the program name.
 /// The call returns after a shutdown signal and the end of the running requests.
+///
+/// Diagnostic commands (`doctor`, `check`, `config validate`, `--help`,
+/// `--version`) are dispatched first and never start the server; see
+/// `capability::cli`. The probing they do can latch the CUDA backend on
+/// failure, which is safe only because they run instead of serving. A
+/// leading `serve` is stripped, so `enginesrv serve --config <path>` and
+/// `enginesrv --config <path>` are the same invocation.
 pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
+    if let Some(action) = crate::capability::cli::parse(args) {
+        return action
+            .and_then(|action| crate::capability::cli::run(&action))
+            .map_err(StartupError);
+    }
+    let args: &[String] = match args.first().map(String::as_str) {
+        Some("serve") => &args[1..],
+        _ => args,
+    };
     let path = config_path(args)?;
     let config = Config::from_file(&path)?;
     let key = config.api_key(|name| std::env::var(name).ok())?;

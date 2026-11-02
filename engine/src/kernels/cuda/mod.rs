@@ -170,6 +170,20 @@ pub(crate) fn device_is_integrated() -> Result<bool, EngError> {
         .map_err(|status| native_error(&TERMINAL, count_operation(status), status))
 }
 
+/// Free and total bytes of the first device, from `cudaMemGetInfo`, for
+/// short-lived diagnostic processes (`enginesrv doctor` / `check`). Like
+/// every query here, a native failure latches the backend terminal for the
+/// rest of the process, so a serving process must never call this; it reads
+/// memory through its context instead (`context::Context::memory_info`).
+pub(crate) fn memory_info_first_device() -> Result<(usize, usize), EngError> {
+    ensure_usable(&TERMINAL)?;
+    let _dispatch = guard::DispatchGuard::enter(&TERMINAL);
+    ensure_usable(&TERMINAL)?;
+    context::select_device(0)?;
+    native::memory_info()
+        .map_err(|status| native_error(&TERMINAL, memory_info_operation(status), status))
+}
+
 /// Adds two `f32` slices element by element on the first CUDA device.
 ///
 /// Returns `EngError::BadRequest` when the lengths differ. Empty inputs
