@@ -69,7 +69,12 @@ fn q4k_stack(experts: usize, rows: usize, k: usize, rng: &mut Rng) -> FileEntry 
     }
 }
 
+// One-per-process by design: the session keeps its stack, weights and states
+// leaked for its whole life (the 'static owner pattern), so its two CUDA
+// adapter leases never release and every later CUDA test in this process
+// would fail on lease admission. Run it with --ignored, alone.
 #[test]
+#[ignore = "holds its two CUDA adapter leases for the process lifetime; run with --ignored, one per process"]
 fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     const NAME: &str = "a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf";
     if !device_present(NAME) {
