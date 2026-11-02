@@ -21,6 +21,7 @@ usage:
   enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--json]
   enginesrv config validate <path>
+  enginesrv config effective <path> [--json]
   enginesrv --help | --version
 
 doctor  Report what this build can serve on this machine: compiled
@@ -33,6 +34,12 @@ config validate
         Parse and validate a configuration file, including that the
         environment variable named by api_key_env is set (its value is
         never printed).
+config effective
+        Print the resolved configuration with the origin of every
+        principal setting (config file, environment, derived,
+        default, ignored on this backend). Resolution is the same
+        code the server starts with; a file that would not start is
+        reported instead. The API key value is never printed.
 ";
 
 #[derive(Debug, PartialEq)]
@@ -50,6 +57,7 @@ pub enum Action {
         json: bool,
     },
     ConfigValidate(PathBuf),
+    ConfigEffective(PathBuf, bool),
 }
 
 /// Parse the diagnostic commands. Returns `None` when argv is a serve
@@ -66,7 +74,14 @@ pub fn parse(args: &[String]) -> Option<Result<Action, String>> {
                 Some(path) if args.len() == 3 => Ok(Action::ConfigValidate(PathBuf::from(path))),
                 _ => Err("usage: enginesrv config validate <path>".to_string()),
             },
-            _ => Err("usage: enginesrv config validate <path>".to_string()),
+            Some("effective") => match (args.get(2), args.get(3)) {
+                (Some(path), None) => Ok(Action::ConfigEffective(PathBuf::from(path), false)),
+                (Some(path), Some(flag)) if flag == "--json" && args.len() == 4 => {
+                    Ok(Action::ConfigEffective(PathBuf::from(path), true))
+                }
+                _ => Err("usage: enginesrv config effective <path> [--json]".to_string()),
+            },
+            _ => Err("usage: enginesrv config validate|effective <path>".to_string()),
         }),
         _ => None,
     }
@@ -217,6 +232,7 @@ pub fn run(action: &Action) -> Result<(), String> {
                 ))
             }
         }
+        Action::ConfigEffective(path, json) => run_config_effective(path, *json),
         Action::ConfigValidate(path) => match validate_config(path) {
             Ok(lines) => {
                 println!("config {} is valid:", path.display());
@@ -252,6 +268,119 @@ pub fn validate_config(path: &std::path::Path) -> Result<Vec<String>, String> {
         ));
     }
     Ok(lines)
+}
+
+/// The resolved configuration of one file, with origins. Resolution is
+/// the factories' own (`Q36Settings::new_for_family` for the Qwen3.6
+/// families), so what prints here is what the server would start with —
+/// and a file that would refuse to start reports that refusal.
+fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String> {
+    use crate::server::config::Config;
+    let config = Config::from_file(path).map_err(|error| error.to_string())?;
+    let key_set = config.api_key(|name| std::env::var(name).ok()).is_ok();
+    let mut rendered = String::new();
+    let mut json_engines = Vec::new();
+    rendered.push_str(&format!(
+        "listen: {}\napi_key_env: {} ({})\nprefix_reuse: {}\n",
+        config.listen_address().map_err(|e| e.to_string())?,
+        config.api_key_env,
+        if key_set { "set" } else { "NOT SET" },
+        config.prefix_reuse
+    ));
+    for engine in &config.engines {
+        let is_q36_family = engine.family == crate::family::qwen36::factory::FAMILY
+            || engine.family == crate::family::qwen36::factory::DENSE_FAMILY;
+        if !is_q36_family {
+            rendered.push_str(&format!(
+                "engine {} ({}): per-key origins are composed for the Qwen3.6 families only so far; model_dir {}\n",
+                engine.id,
+                engine.family,
+                engine.model_dir.display()
+            ));
+            json_engines.push(serde_json::json!({
+                "id": engine.id, "family": engine.family, "settings": [],
+            }));
+            continue;
+        }
+        use crate::family::qwen36::factory::backend_of_build;
+        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+        let env = Q36Env {
+            cache_limit: std::env::var("Q36_CACHE_LIMIT").ok(),
+        };
+        let backend = backend_of_build();
+        let spec = if engine.family == crate::family::qwen36::factory::DENSE_FAMILY {
+            crate::family::spec::QWEN3_8_27B_DENSE
+        } else {
+            crate::family::spec::QWEN3_6_35B_A3B
+        };
+        let settings = Q36Settings::new_for_family(
+            &engine.model_dir,
+            &engine.tokenizer_dir,
+            engine.qwen36.as_ref(),
+            &env,
+            backend,
+            spec,
+        )
+        .map_err(|error| {
+            format!(
+                "engine {} would not start: {}",
+                engine.id,
+                super::describe_error(&error)
+            )
+        })?;
+        if config.prefix_reuse {
+            settings
+                .check_prefix_reuse_cap(true)
+                .map_err(|error| super::describe_error(&error))?;
+        }
+        let default_options = crate::family::qwen36::settings::Q36Options::default();
+        let rows = super::effective::q36_effective(
+            engine.qwen36.as_ref().unwrap_or(&default_options),
+            env.cache_limit.as_deref(),
+            backend,
+            &settings,
+        );
+        rendered.push_str(&format!(
+            "engine {} ({}, model {}):\n",
+            engine.id,
+            engine.family,
+            engine.model_name()
+        ));
+        for row in &rows {
+            rendered.push_str(&format!(
+                "  {:32} {:>16}  ({})\n",
+                row.key,
+                row.value,
+                row.origin.name()
+            ));
+        }
+        json_engines.push(serde_json::json!({
+            "id": engine.id, "family": engine.family, "settings": rows,
+        }));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "listen": config.listen_address().map_err(|e| e.to_string())?.to_string(),
+                "api_key_env": config.api_key_env,
+                "api_key_set": key_set,
+                "prefix_reuse": config.prefix_reuse,
+                "engines": json_engines,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{rendered}");
+    }
+    if key_set {
+        Ok(())
+    } else {
+        Err(format!(
+            "environment variable {} is not set or is empty",
+            config.api_key_env
+        ))
+    }
 }
 
 fn probe_line<T>(label: &str, probe: &Probe<T>, render: impl Fn(&T) -> String) -> String {
@@ -472,6 +601,19 @@ mod tests {
             parse(&args(&["config", "validate", "f.json"])),
             Some(Ok(Action::ConfigValidate(_)))
         ));
+        assert!(matches!(
+            parse(&args(&["config", "effective", "f.json"])),
+            Some(Ok(Action::ConfigEffective(_, false)))
+        ));
+        assert!(matches!(
+            parse(&args(&["config", "effective", "f.json", "--json"])),
+            Some(Ok(Action::ConfigEffective(_, true)))
+        ));
+        assert!(
+            parse(&args(&["config", "effective"]))
+                .expect("action")
+                .is_err()
+        );
         assert!(parse(&args(&["config", "validate"])).expect("a").is_err());
         assert!(parse(&args(&["config", "print"])).expect("a").is_err());
     }

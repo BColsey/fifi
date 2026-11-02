@@ -16,7 +16,7 @@ use super::completions::completions;
 use super::error::ServerError;
 use super::state::AppState;
 use super::tokenize::{apply_template, decode, encode};
-use super::wire::ModelList;
+use super::wire::{ModelList, state_name};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Request, State};
@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub(crate) fn router(state: Arc<AppState>) -> Router {
     let bearer_routes = Router::new()
         .route("/v1/models", get(models))
+        .route("/v1/system", get(system))
         .route("/v1/recent-requests", get(recent_requests))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
@@ -184,6 +185,52 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
+/// `GET /v1/system` (authenticated): what this build and process are,
+/// without probing devices. Device facts deliberately stay in the
+/// short-lived `enginesrv doctor` process: a CUDA query here could
+/// latch the serving backend terminal on failure, and a detected
+/// device says nothing about what the loaded executors use. So this
+/// reports compiled-in backends, host memory and threads, and the
+/// engines with their resolved context limits — never a device list.
+async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    use crate::capability::Probe;
+    let host = crate::capability::probe::probe_host();
+    let backends = crate::capability::probe::CompiledBackends::of_this_build();
+    let mut compiled = Vec::new();
+    if backends.cuda {
+        compiled.push("cuda");
+    }
+    if backends.mlx {
+        compiled.push("mlx");
+    }
+    let probe_json = |probe: &Probe<u64>| match probe {
+        Probe::Measured(bytes) => serde_json::json!(bytes),
+        Probe::Unavailable(reason) => serde_json::json!({"unavailable": reason}),
+    };
+    let engines: Vec<serde_json::Value> = state
+        .entries()
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "id": entry.id,
+                "model": entry.model,
+                "state": state_name(entry.handle.state()),
+                "context_limit": entry.context_limit,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "backends_compiled": compiled,
+        "host": {
+            "cpu_threads": host.cpu_threads,
+            "mem_total_bytes": probe_json(&host.mem_total_bytes),
+            "mem_available_bytes": probe_json(&host.mem_available_bytes),
+        },
+        "engines": engines,
+    }))
+}
+
 async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
     Json(state.models())
 }
@@ -324,6 +371,41 @@ mod tests {
         assert_eq!(body["data"][0]["id"], "model-a");
         assert_eq!(body["data"][0]["engines"][0]["id"], "e1");
         assert_eq!(body["data"][0]["engines"][0]["state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn system_route_reports_process_facts_without_probing_devices() {
+        let (state, engine) = one_engine_state();
+        let app = router(state);
+        let _keep = &engine;
+        let (status, _h, _b) = testkit::send(&app, testkit::get("/v1/system", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _h, body) =
+            testkit::send(&app, testkit::get("/v1/system", Some(testkit::API_KEY))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !String::from_utf8_lossy(&body).contains(testkit::API_KEY),
+            "the api key must never appear"
+        );
+        let body = testkit::json_of(&body);
+        assert_pointer(
+            "/paths/~1v1~1system/get/responses/200/content/application~1json/schema",
+            &body,
+        );
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        // The CPU test build compiles no GPU backend, and says so.
+        assert!(
+            body["backends_compiled"]
+                .as_array()
+                .expect("array")
+                .is_empty()
+        );
+        assert!(body["host"]["cpu_threads"].as_u64().is_some_and(|n| n >= 1));
+        assert_eq!(body["engines"][0]["id"], "e1");
+        assert_eq!(body["engines"][0]["context_limit"], 4_096);
+        // No device claims of any kind from a serving process.
+        let text = body.to_string();
+        assert!(!text.contains("vram") && !text.contains("device"), "{text}");
     }
 
     #[tokio::test]

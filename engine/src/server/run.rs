@@ -802,7 +802,14 @@ mod tests {
         if cfg!(all(feature = "native-cuda", target_os = "linux")) {
             assert!(text.contains("qwen3_8_27b_dense requires the native-mlx backend"));
         } else {
-            assert!(text.contains("at least 9283698688 bytes"), "{text}");
+            // The dense session cap now derives instead of refusing, so
+            // the dispatch witness on this arm is the selected factory's
+            // next refusal: this build has no dense backend at all. It
+            // fires before any file access, which is the point here.
+            assert!(
+                text.contains("this build has no qwen3_8_27b_dense backend"),
+                "{text}"
+            );
         }
     }
 

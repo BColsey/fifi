@@ -246,6 +246,45 @@ components:
           description: >-
             The corrective action the code justifies, when one is known.
             Absent when no evidence-backed action exists.
+    SystemInfo:
+      type: object
+      required: [version, backends_compiled, host, engines]
+      properties:
+        version:
+          type: string
+        backends_compiled:
+          type: array
+          items:
+            type: string
+            enum: [cuda, mlx]
+          description: Empty when no GPU backend is compiled in.
+        host:
+          type: object
+          required: [cpu_threads, mem_total_bytes, mem_available_bytes]
+          properties:
+            cpu_threads:
+              type: integer
+              minimum: 1
+            mem_total_bytes:
+              description: Total RAM in bytes, or an unavailable object with the reason.
+            mem_available_bytes:
+              description: Available RAM in bytes at answer time, or an unavailable object with the reason.
+        engines:
+          type: array
+          items:
+            type: object
+            required: [id, model, state, context_limit]
+            properties:
+              id:
+                type: string
+              model:
+                type: string
+              state:
+                type: string
+                enum: [loading, ready, busy, error, stopped, native-failed]
+              context_limit:
+                type: integer
+                minimum: 0
     ChatRequest:
       type: object
       required: [messages]
@@ -1105,6 +1144,28 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Model"
+  /v1/system:
+    get:
+      operationId: getSystem
+      summary: Process and host facts (server extension)
+      description: >-
+        Server extension, not part of the OpenAI API. What this build
+        and process are: the crate version, the native backends
+        compiled in, host memory and CPU threads, and the engines
+        with their states and resolved context limits. The serving
+        process deliberately does not probe devices (a failed device
+        query can latch the backend); for device facts use the
+        short-lived `enginesrv doctor` command. Nothing here implies a
+        detected device or feature is used by a loaded executor.
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "200":
+          description: The system facts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemInfo"
   /v1/chat/completions:
     post:
       operationId: createChatCompletion

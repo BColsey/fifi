@@ -215,6 +215,13 @@ impl AppState {
         }
     }
 
+    /// Every engine entry once, in configuration order. For status
+    /// surfaces that need fields the models list does not carry,
+    /// such as the context limit.
+    pub(crate) fn entries(&self) -> Vec<&EngineEntry> {
+        self.engines.iter().collect()
+    }
+
     pub(crate) fn models(&self) -> ModelList {
         let mut models: Vec<Model> = Vec::new();
         for entry in &self.engines {

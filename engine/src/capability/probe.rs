@@ -137,7 +137,10 @@ fn probe_cuda() -> CudaFacts {
     }
 }
 
-fn probe_host() -> HostFacts {
+/// Host facts only. Unlike `probe`, this is safe inside a serving
+/// process: it reads `/proc/meminfo` and the CPU count, and makes no
+/// CUDA call that could latch the backend.
+pub(crate) fn probe_host() -> HostFacts {
     let (total, available) = read_meminfo().map_or_else(
         |reason| {
             (

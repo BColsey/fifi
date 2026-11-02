@@ -23,6 +23,7 @@
 //! through its own context at load time.
 
 pub mod cli;
+pub mod effective;
 pub mod inspect;
 pub mod preflight;
 pub mod probe;

@@ -54,6 +54,8 @@ export ENGINESRV_API_KEY=my-secret-key
 target/release/enginesrv --config config/qwen36-mac-studio-36gb.json
 ```
 
+Before starting, `enginesrv doctor` reports what this build can serve on this machine (compiled backends, free GPU memory, host RAM), `enginesrv check <model_dir> --family qwen3_6_35b_a3b` preflights one model directory against it, and `enginesrv config validate <file>` and `enginesrv config effective <file>` check a configuration and show the resolved values with their origins. `enginesrv --help` lists every command. To serve the web frontend too, build it (`npm run build` in `web/`) and set `web_dir` in the configuration file; it is then served at `/`.
+
 It listens on `http://127.0.0.1:18791`. Send the key as `Authorization: Bearer <key>`:
 
 ```sh
