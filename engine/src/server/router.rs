@@ -19,7 +19,7 @@ use super::tokenize::{apply_template, decode, encode};
 use super::wire::ModelList;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -45,14 +45,82 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_messages_auth,
         ));
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .merge(bearer_routes)
-        .merge(messages_routes)
-        .fallback(unknown_route)
+        .merge(messages_routes);
+    if state.web_dir().is_some() {
+        // The frontend shell, like `/health`, is public: it is static
+        // files with no data and no key. Only `/` and `/assets/` are
+        // ever served from disk, and the API routes above keep their
+        // authentication and precedence.
+        app = app
+            .route("/", get(web_index))
+            .route("/assets/{*path}", get(web_asset));
+    }
+    app.fallback(unknown_route)
         .method_not_allowed_fallback(unknown_route)
         .with_state(state)
+}
+
+/// One file of the built frontend, read from `web_dir`. The extension
+/// whitelist is what a Vite build emits; anything else is the JSON 404,
+/// so a stray file in the directory is never served by accident. The
+/// canonicalized path must stay inside the canonicalized directory:
+/// `..`, absolute paths, and symlink escapes all end at the 404.
+fn web_file(state: &AppState, relative: &std::path::Path) -> Option<(Vec<u8>, &'static str)> {
+    let content_type = match relative.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        _ => return None,
+    };
+    let root = state.web_dir()?.canonicalize().ok()?;
+    let path = root.join(relative).canonicalize().ok()?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return None;
+    }
+    std::fs::read(path).ok().map(|body| (body, content_type))
+}
+
+fn web_response(body: Vec<u8>, content_type: &'static str, cache: &'static str) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, cache),
+            (
+                axum::http::header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn web_index(State(state): State<Arc<AppState>>) -> Response {
+    match web_file(&state, std::path::Path::new("index.html")) {
+        // The shell names the hashed assets, so it is revalidated every
+        // load; a rebuilt frontend is never masked by a cached shell.
+        Some((body, content_type)) => web_response(body, content_type, "no-cache"),
+        None => unknown_route().await.into_response(),
+    }
+}
+
+async fn web_asset(State(state): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
+    let relative = std::path::Path::new("assets").join(&path);
+    match web_file(&state, &relative) {
+        // Vite asset names carry a content hash: cache them as such.
+        Some((body, content_type)) => {
+            web_response(body, content_type, "public, max-age=31536000, immutable")
+        }
+        None => unknown_route().await.into_response(),
+    }
 }
 
 async fn require_auth(
@@ -305,6 +373,85 @@ mod tests {
         let ready = &body["data"][1]["engines"][0];
         assert_eq!(ready["state"], "ready");
         assert!(ready.get("error").is_none(), "{ready}");
+    }
+
+    fn web_state() -> (
+        Arc<AppState>,
+        crate::sched::worker::Engine,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!("fifi-web-{}", std::process::id()));
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).expect("web dir");
+        std::fs::write(dir.join("index.html"), "<html>fifi shell</html>").expect("index");
+        std::fs::write(assets.join("app-abc123.js"), "console.log(1)").expect("asset");
+        std::fs::write(dir.join("secret.txt"), "not for serving").expect("decoy");
+        let engine = testkit::engine(Vec::new());
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let state = Arc::new(
+            AppState::new(
+                testkit::API_KEY,
+                vec![testkit::entry("e1", "model-a", &engine, 4_096)],
+            )
+            .with_web_dir(dir.clone()),
+        );
+        (state, engine, dir)
+    }
+
+    #[tokio::test]
+    async fn the_web_shell_and_hashed_assets_are_served_without_a_key() {
+        let (state, _engine, _dir) = web_state();
+        let app = router(state);
+        let (status, headers, body) = testkit::send(&app, testkit::get("/", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&body), "<html>fifi shell</html>");
+        assert_eq!(headers["cache-control"], "no-cache");
+        let (status, headers, body) =
+            testkit::send(&app, testkit::get("/assets/app-abc123.js", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&body), "console.log(1)");
+        assert!(
+            headers["cache-control"]
+                .to_str()
+                .expect("header")
+                .contains("immutable"),
+            "{headers:?}"
+        );
+        // The API behind the shell still demands the key.
+        let (status, _h, _b) = testkit::send(&app, testkit::get("/v1/models", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn web_serving_refuses_traversal_and_unlisted_extensions() {
+        let (state, _engine, _dir) = web_state();
+        let app = router(state);
+        for uri in [
+            "/assets/../secret.txt",
+            "/assets/%2e%2e/secret.txt",
+            "/assets/missing.js",
+            "/secret.txt",
+        ] {
+            let (status, _h, body) = testkit::send(&app, testkit::get(uri, None)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                testkit::json_of(&body)["error"]["code"],
+                "not_found",
+                "{uri}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&body).contains("not for serving"),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_web_dir_the_root_stays_a_json_404() {
+        let (state, _engine) = one_engine_state();
+        let (status, _h, body) = testkit::send(&router(state), testkit::get("/", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(testkit::json_of(&body)["error"]["code"], "not_found");
     }
 
     #[tokio::test]

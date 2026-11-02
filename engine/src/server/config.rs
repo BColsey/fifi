@@ -53,6 +53,11 @@ pub(crate) struct Config {
     /// process. An engine without prefix support ignores it.
     #[serde(default)]
     pub(crate) prefix_reuse: bool,
+    /// The built web frontend to serve at `/` (`web/dist` after
+    /// `npm run build`). Absent: no frontend routes, as before. The
+    /// shell and its hashed assets are public like `/health`; every API
+    /// route keeps its authentication.
+    pub(crate) web_dir: Option<PathBuf>,
     pub(crate) engines: Vec<EngineConfig>,
 }
 
@@ -115,6 +120,13 @@ impl Config {
         self.listen_address()?;
         if self.api_key_env.is_empty() {
             return Err(StartupError("api_key_env must name a variable".to_string()));
+        }
+        if self
+            .web_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            return Err(StartupError("web_dir must not be empty".to_string()));
         }
         if self.engines.is_empty() {
             return Err(StartupError(
@@ -370,6 +382,21 @@ mod tests {
         assert_eq!(config.engines[0].model_name(), "fake");
         assert_eq!(config.engines[0].context_limit, None);
         assert!(config.engines[0].fake.is_none());
+    }
+
+    #[test]
+    fn web_dir_is_absent_by_default_and_reads_a_path() {
+        assert_eq!(load(VALID).expect("valid").web_dir, None, "the default");
+        let with = VALID.replace(r#""listen""#, r#""web_dir": "web/dist", "listen""#);
+        assert_eq!(
+            load(&with).expect("valid").web_dir.as_deref(),
+            Some(Path::new("web/dist"))
+        );
+        let empty = VALID.replace(r#""listen""#, r#""web_dir": "", "listen""#);
+        assert!(
+            message(load(&empty)).contains("web_dir must not be empty"),
+            "an empty web_dir is refused"
+        );
     }
 
     #[test]

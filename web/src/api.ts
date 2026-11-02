@@ -15,11 +15,20 @@ export interface CacheStats {
   snapshot_bytes?: number;
 }
 
+export interface EngineErrorInfo {
+  code: string;
+  stage: string;
+  message: string;
+  retry: "after_correction" | "unknown" | string;
+  suggestion?: string;
+}
+
 export interface Engine {
   id: string;
   model: string;
   state: EngineState;
   cache?: CacheStats;
+  error?: EngineErrorInfo;
 }
 
 export interface Model {

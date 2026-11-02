@@ -145,10 +145,21 @@ export class AboutView {
       reason.hidden = false;
       reason.textContent = "Key saved in this browser.";
     });
-    keyRow.append(input, show, save);
+    const forget = document.createElement("button");
+    forget.className = "btn";
+    forget.type = "button";
+    forget.textContent = "Forget";
+    forget.addEventListener("click", () => {
+      const settings = loadSettings();
+      saveSettings({ ...settings, apiKey: "" });
+      input.value = "";
+      reason.hidden = false;
+      reason.textContent = "Key removed from this browser.";
+    });
+    keyRow.append(input, show, save, forget);
     const keyNote = document.createElement("p");
     keyNote.className = "sub";
-    keyNote.textContent = "The key lives in this browser only. It is sent as a bearer token to this origin.";
+    keyNote.textContent = "Stored in this browser's localStorage, readable by any script on this origin. Use Forget when done.";
 
     const themeLabel = document.createElement("label");
     themeLabel.className = "field-label";

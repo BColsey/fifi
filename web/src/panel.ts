@@ -3,7 +3,7 @@
  * return.
  */
 
-import { ApiError, listRecentRequests, type Model, type RecentRequest } from "./api.js";
+import { ApiError, listRecentRequests, type Engine, type Model, type RecentRequest } from "./api.js";
 
 /** The full panel state the view renders (re-exported as MonitorData). */
 export interface PanelData {
@@ -79,4 +79,25 @@ export function pollPlan(opts: {
 }): { refreshMonitor: boolean } {
   void opts.lastKnownServerReady;
   return { refreshMonitor: opts.monitorVisible };
+}
+
+/** The failure lines for one engine, formatted from the backend's
+ * structured error (api `EngineError`). Formatting only: every fact —
+ * code, stage, retryability, suggestion — is the server's; nothing is
+ * recomputed or reinterpreted here. */
+export function engineErrorLines(engine: Engine): string[] {
+  const error = engine.error;
+  if (error === undefined) return [];
+  const retry =
+    error.retry === "after_correction"
+      ? "fix the cause, then restart"
+      : "retrying is not known to help";
+  const lines = [
+    "failed (" + error.code + ", stage " + error.stage + "): " + error.message,
+    retry,
+  ];
+  if (error.suggestion !== undefined && error.suggestion !== "") {
+    lines.push(error.suggestion);
+  }
+  return lines;
 }

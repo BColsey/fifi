@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { ok, strictEqual } from "node:assert";
-import { applyProbe, pollPlan, refreshRecentRows } from "./panel.js";
-import type { RecentRequest } from "./api.js";
+import { applyProbe, engineErrorLines, pollPlan, refreshRecentRows } from "./panel.js";
+import type { Engine, RecentRequest } from "./api.js";
 
 function row(tokens: number): RecentRequest {
   return {
@@ -128,4 +128,43 @@ test("the poll refreshes the monitor whenever the view is visible — including 
       `visible=${row.monitorVisible} ready=${row.lastKnownServerReady}`
     );
   }
+});
+
+function failedEngine(): Engine {
+  return {
+    id: "e1",
+    model: "m",
+    state: "error",
+    error: {
+      code: "checkpoint_failure",
+      stage: "load",
+      message: "engine load failed: fixture load failure",
+      retry: "after_correction",
+      suggestion: "verify the model files",
+    },
+  };
+}
+
+test("engine error lines carry the backend structure verbatim", () => {
+  const lines = engineErrorLines(failedEngine());
+  strictEqual(lines.length, 3);
+  const joined = lines.join("\n");
+  ok(joined.includes("checkpoint_failure"), joined);
+  ok(joined.includes("stage load"), joined);
+  ok(joined.includes("fixture load failure"), joined);
+  ok(joined.includes("fix the cause"), joined);
+  ok(lines.includes("verify the model files"));
+});
+
+test("healthy engines and unknown retry render honestly", () => {
+  strictEqual(engineErrorLines({ id: "e", model: "m", state: "ready" }).length, 0);
+  const backend: Engine = {
+    id: "e",
+    model: "m",
+    state: "native-failed",
+    error: { code: "backend_error", stage: "cuda initialize", message: "x", retry: "unknown" },
+  };
+  const lines = engineErrorLines(backend);
+  strictEqual(lines.length, 2);
+  ok(lines.some((line) => line.includes("not known to help")));
 });

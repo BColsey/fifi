@@ -62,7 +62,22 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         shutdown_signal()
     };
     let (engines, entries) = start_engines(&config)?;
-    let state = Arc::new(AppState::new(&key, entries));
+    let mut state = AppState::new(&key, entries);
+    if let Some(web_dir) = &config.web_dir {
+        // Refuse at startup, with the path named, rather than serving a
+        // shell that 404s: a configured-but-missing frontend is a
+        // configuration error, not a runtime surprise.
+        let index = web_dir.join("index.html");
+        if !index.is_file() {
+            return Err(StartupError(format!(
+                "web_dir {} has no index.html; build the frontend first (npm run build in web/)",
+                web_dir.display()
+            )));
+        }
+        eprintln!("web UI: serving {} at /", web_dir.display());
+        state = state.with_web_dir(web_dir.clone());
+    }
+    let state = Arc::new(state);
     // One boot line for the warm-turn flip: the effective state and how to
     // roll it back. The polarity comes from the SAME function the request
     // path uses, so the banner can never disagree with the requests.
@@ -536,6 +551,7 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             api_key_env: "UNUSED".to_string(),
             prefix_reuse,
+            web_dir: None,
             engines,
         }
     }

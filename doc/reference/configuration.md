@@ -13,6 +13,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | `listen` | yes | | Address and port, for example `127.0.0.1:18791`. The address must be `127.0.0.1` or `::1`. Port 8788 is refused. |
 | `api_key_env` | yes | | Name of the environment variable that holds the API key. Startup fails if the variable is unset or empty. |
 | `prefix_reuse` | no | `false` | Keep finished conversation prefixes so that a follow-up turn only processes its new tokens. Applies to every engine that supports it. See [How conversation reuse works](../explanation/prefix-reuse.md). |
+| `web_dir` | no | | Directory with the built web frontend (`npm run build` in `web/` writes `web/dist`). When set, `GET /` serves its `index.html` and `GET /assets/...` its hashed assets; startup refuses a directory without `index.html`. The shell is public like `/health`; every API route keeps its key. |
 | `engines` | yes | | The engines to serve, one object each. |
 
 ## Engine entry

@@ -6,7 +6,7 @@ import {
   type Model,
 } from "./api";
 import { formatBytes, formatClock, formatDate, formatTokens } from "./format";
-import { applyProbe, refreshRecentRows, type PanelData } from "./panel";
+import { applyProbe, engineErrorLines, refreshRecentRows, type PanelData } from "./panel";
 import { speedSummary } from "./speed";
 
 export type MonitorData = PanelData;
@@ -245,6 +245,12 @@ export class MonitorView {
       chip.textContent = engine.state;
       row.append(id, chip);
       block.append(row);
+      for (const line of engineErrorLines(engine)) {
+        const failure = document.createElement("div");
+        failure.className = "cache-facts engine-error";
+        failure.textContent = line;
+        block.append(failure);
+      }
       if (engine.cache !== undefined) {
         const facts = document.createElement("div");
         facts.className = "cache-facts";

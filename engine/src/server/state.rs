@@ -57,6 +57,8 @@ pub(crate) struct AppState {
     recent: RecentRing,
     /// The previous prompt ids per model, for the request log's LCP row.
     prompt_memory: Arc<Mutex<HashMap<String, Vec<u32>>>>,
+    /// The built frontend directory served at `/`, when configured.
+    web_dir: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn unix_seconds() -> u64 {
@@ -79,7 +81,17 @@ impl AppState {
             request_log: default_sink(),
             recent: RecentRing::new(),
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
+            web_dir: None,
         }
+    }
+
+    pub(crate) fn with_web_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.web_dir = Some(dir);
+        self
+    }
+
+    pub(crate) fn web_dir(&self) -> Option<&std::path::Path> {
+        self.web_dir.as_deref()
     }
 
     pub(crate) fn note_prompt(&self, model: &str, ids: &[u32]) -> u32 {
