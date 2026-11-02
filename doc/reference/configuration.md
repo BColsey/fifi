@@ -46,7 +46,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `cache_limit_bytes` | MLX | none | MLX allocator cache limit. Falls back to `Q36_CACHE_LIMIT`; on MLX one of the two is required. |
 | `session_cap_bytes` | MLX | 4 GiB | Memory for the live session and saved prefixes. |
 | `prefill_budget_bytes` | MLX | off | Memory budget for processing the prompt in chunks. Without it, the prompt is processed one token per step. |
-| `prefill_session_reserve_bytes` | MLX | none | Memory that prompt processing leaves free. Required with `prefill_budget_bytes`, refused without it. |
+| `prefill_session_reserve_bytes` | MLX | derived | Memory that prompt processing leaves free. With `prefill_budget_bytes` and no reserve member, it is derived: the attention cache at `context_limit`, plus the DeltaNet state, plus `cache_limit_bytes`, plus a 1 GiB pressure margin (the shipped Mac profile's composition). An explicit value always wins. Refused without `prefill_budget_bytes`. |
 | `prefill_chunk` | MLX | 256 | Largest prompt chunk, 1 to 2,048 rows. The engine picks the largest chunk that fits the budget. |
 | `compile` | MLX | `false` | Compile the decode step with `mlx_compile`: 9.6 to 13% faster decoding. Logits differ from the uncompiled path by at most 5e-5. |
 | `max_seqs` | MLX | 1 | Sequences decoded at once, 1 to 8. Above 1 it needs `compile: true`, a `prefill_chunk` of at least 4, and a `prefill_budget_bytes` larger than both `prefill_session_reserve_bytes` and `session_cap_bytes`. |

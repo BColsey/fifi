@@ -36,7 +36,7 @@ Unified memory holds everything, so the plan is a budget split:
 - `prefill_budget_bytes` is the memory prompt processing may use. The engine picks the largest chunk (up to `prefill_chunk` rows) whose buffers fit the budget after the weights and `prefill_session_reserve_bytes`.
 
 The shipped Mac file sets a 30 GiB budget and a reserve of 8,286,699,520 bytes: the KV cache at 262,144 positions, the recurrent state, the 4 GiB allocator cache limit and a 1 GiB margin.
-Recompute the reserve if you change `context_limit`, `kv_dtype`, `activation_dtype` or `cache_limit_bytes`.
+An explicit reserve stays yours: recompute it if you change `context_limit`, `kv_dtype`, `activation_dtype` or `cache_limit_bytes`. Omitting the member derives exactly this sum from the resolved settings, so the shipped file resolves to the same bytes either way.
 
 ### On NVIDIA CUDA
 

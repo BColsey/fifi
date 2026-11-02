@@ -130,7 +130,7 @@ pub(crate) struct Q36Options {
     /// `prefill_chunk` rows whose workspace fits the budget after the weights and the reserve.
     pub(crate) prefill_budget_bytes: Option<u64>,
     /// The bytes that the planner keeps free for the session state, the MLX cache, and the
-    /// pressure margin. It has no default: it is required with `prefill_budget_bytes` and refused
+    /// pressure margin. Absent with `prefill_budget_bytes` it is derived (see `reserve_plan`) and refused
     /// without it. A value of 0 is allowed and admits a larger chunk than the memory plan allows.
     pub(crate) prefill_session_reserve_bytes: Option<u64>,
     /// The dtype of the decode activations: `f32` or `bf16`. The default is `bf16`. It also picks
@@ -704,21 +704,57 @@ fn at_least_one(key: &str, value: Option<u64>) -> Result<Option<u64>, EngError> 
         .transpose()
 }
 
-/// The reserve of the chunked prefill. A budget needs the member, because no default covers the
-/// session state, the MLX cache, and the pressure margin of the memory plan. A reserve without a
-/// budget is a mistake, because nothing would read it. With neither, the prefill runs one token
-/// at a time, nothing reads the reserve, and it stays 0.
-fn prefill_reserve(options: &Q36Options, budget: Option<u64>) -> Result<u64, EngError> {
+/// The pressure margin of a derived prefill reserve: the same 1 GiB the
+/// shipped Mac Studio profile carries on top of its plan sum (the
+/// constants test pins that sum byte for byte).
+const DERIVED_RESERVE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// What becomes of the chunked-prefill reserve. A reserve without a
+/// budget is a mistake, because nothing would read it. A budget without
+/// a reserve derives one (below) instead of demanding arithmetic the
+/// planner's own authorities already know: the attention cache at the
+/// context limit, the fixed DeltaNet state, the allocator cache limit,
+/// and the pressure margin — the composition the shipped profile was
+/// hand-summed from. An explicit member always wins, byte for byte.
+/// With neither, the prefill runs one token at a time, nothing reads
+/// the reserve, and it stays 0.
+enum ReservePlan {
+    Explicit(u64),
+    Derive,
+    Off,
+}
+
+fn reserve_plan(options: &Q36Options, budget: Option<u64>) -> Result<ReservePlan, EngError> {
     match (options.prefill_session_reserve_bytes, budget) {
         (Some(_), None) => Err(bad(
             "prefill_session_reserve_bytes needs prefill_budget_bytes".into(),
         )),
-        (None, Some(_)) => Err(bad(
-            "prefill_budget_bytes needs prefill_session_reserve_bytes".into(),
-        )),
-        (Some(reserve), Some(_)) => Ok(reserve),
-        (None, None) => Ok(0),
+        (None, Some(_)) => Ok(ReservePlan::Derive),
+        (Some(reserve), Some(_)) => Ok(ReservePlan::Explicit(reserve)),
+        (None, None) => Ok(ReservePlan::Off),
     }
+}
+
+/// The derived reserve. It is a plan sum, not a measurement: what the
+/// chunked prefill must keep free while it runs — one full session of
+/// cache growth, the recurrent state, the allocator's retained cache,
+/// and the margin. Checked throughout; an overflow refuses like the
+/// session-cap rules do.
+fn derived_reserve(
+    spec: &FamilySpec,
+    kv: KvDtype,
+    activation: Activation,
+    context_limit: u32,
+    cache_limit: u64,
+) -> Result<u64, EngError> {
+    let overflow = || bad("the derived prefill reserve overflows u64".into());
+    let fixed = delta_state_bytes(spec)?;
+    cache_growth_per_position(spec, kv, activation)?
+        .checked_mul(u64::from(context_limit))
+        .and_then(|cache| cache.checked_add(fixed))
+        .and_then(|sum| sum.checked_add(cache_limit))
+        .and_then(|sum| sum.checked_add(DERIVED_RESERVE_MARGIN_BYTES))
+        .ok_or_else(overflow)
 }
 
 /// The DeltaNet state bytes of one model: per DeltaNet layer the recurrent state
@@ -903,37 +939,43 @@ impl Q36Settings {
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
-        let (prefill_budget, prefill_reserve, activation, kv, cache_limit, ignored_mlx_keys) =
-            match backend {
-                Backend::Mlx => {
-                    let budget =
-                        at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
-                    let reserve = prefill_reserve(options, budget)?;
-                    let activation = activation_of(options.activation_dtype.as_deref())?;
-                    let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Mlx)?;
-                    (
-                        budget,
-                        reserve,
-                        activation,
-                        kv,
-                        cache_limit(options, env)?,
-                        Vec::new(),
-                    )
-                }
-                Backend::Cuda => {
-                    refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
-                    refuse_cuda_key(
-                        "prefill_session_reserve_bytes",
-                        options.prefill_session_reserve_bytes,
-                    )?;
-                    let activation = activation_of(options.activation_dtype.as_deref())?;
-                    // Unlike the MLX arm, the CUDA arm does NOT refuse `q8` here — the CUDA start
-                    // maps the parsed form onto the step's `KvMode` (F32 to the fp16 control cache,
-                    // Q8 to Int8G32) and refuses the Tiled layout there.
-                    let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
-                    (None, 0, activation, kv, 0, ignored_mlx_keys_of(options))
-                }
-            };
+        let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
+        {
+            Backend::Mlx => {
+                let budget = at_least_one("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                let reserve = reserve_plan(options, budget)?;
+                let activation = activation_of(options.activation_dtype.as_deref())?;
+                let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Mlx)?;
+                (
+                    budget,
+                    reserve,
+                    activation,
+                    kv,
+                    cache_limit(options, env)?,
+                    Vec::new(),
+                )
+            }
+            Backend::Cuda => {
+                refuse_cuda_key("prefill_budget_bytes", options.prefill_budget_bytes)?;
+                refuse_cuda_key(
+                    "prefill_session_reserve_bytes",
+                    options.prefill_session_reserve_bytes,
+                )?;
+                let activation = activation_of(options.activation_dtype.as_deref())?;
+                // Unlike the MLX arm, the CUDA arm does NOT refuse `q8` here — the CUDA start
+                // maps the parsed form onto the step's `KvMode` (F32 to the fp16 control cache,
+                // Q8 to Int8G32) and refuses the Tiled layout there.
+                let kv = kv_dtype_of(options.kv_dtype.as_deref(), Backend::Cuda)?;
+                (
+                    None,
+                    ReservePlan::Explicit(0),
+                    activation,
+                    kv,
+                    0,
+                    ignored_mlx_keys_of(options),
+                )
+            }
+        };
         // The MLX error order of the base: budget, reserve, activation_dtype, kv_dtype,
         // cache_limit, context_limit, session_cap, prefill_chunk. `cache_limit` is computed in the
         // match above, BEFORE `context_limit` and the second match, so a config with both faults
@@ -953,7 +995,13 @@ impl Q36Settings {
             spec.feed_forward
                 .map_or(u32::MAX, |dense| dense.context_limit),
         )?;
-        if spec.feed_forward.is_some() {
+        // The dense spec's session floor: one full session of cache
+        // growth plus the fixed state. An absent cap derives exactly
+        // this (the MoE default would not admit the dense session);
+        // an explicit cap below it is refused with the requirement, as
+        // before. With prefix_reuse the live-plus-entry rule in
+        // `check_prefix_reuse_cap` still applies on top.
+        let dense_required = if spec.feed_forward.is_some() {
             let cache = cache_growth_per_position(&spec, kv, activation)?
                 .checked_mul(u64::from(context_limit))
                 .ok_or_else(|| bad("the session cache bytes overflow u64".into()))?;
@@ -961,19 +1009,29 @@ impl Q36Settings {
             let required = cache
                 .checked_add(fixed)
                 .ok_or_else(|| bad("the session cap requirement overflows u64".into()))?;
-            if options.session_cap_bytes.is_none_or(|cap| cap < required) {
+            if options.session_cap_bytes.is_some_and(|cap| cap < required) {
                 return Err(bad(format!(
-                    "{} needs explicit session_cap_bytes of at least {required} bytes for context limit {context_limit}: {cache} attention cache bytes plus {fixed} DeltaNet bytes; set or raise session_cap_bytes",
+                    "{} needs session_cap_bytes of at least {required} bytes for context limit {context_limit}: {cache} attention cache bytes plus {fixed} DeltaNet bytes; set or raise session_cap_bytes",
                     spec.name
                 )));
             }
-        }
+            Some(required)
+        } else {
+            None
+        };
+        let prefill_reserve = match reserve {
+            ReservePlan::Explicit(reserve) => reserve,
+            ReservePlan::Off => 0,
+            ReservePlan::Derive => {
+                derived_reserve(&spec, kv, activation, context_limit, cache_limit)?
+            }
+        };
         let (session_cap, prefill_chunk) = match backend {
             Backend::Mlx => (
                 ranged(
                     "session_cap_bytes",
                     options.session_cap_bytes,
-                    DEFAULT_SESSION_CAP,
+                    dense_required.unwrap_or(DEFAULT_SESSION_CAP),
                     1,
                     u64::MAX,
                 )?,
@@ -1274,17 +1332,20 @@ mod tests {
     }
 
     #[test]
-    fn dense_requires_an_explicit_cap_covering_its_cache_and_delta_state() {
+    fn dense_derives_the_cap_covering_its_cache_and_delta_state() {
         let options = with_limit();
-        for cap in [None, Some(9_283_698_687)] {
-            let text = message(dense_settings(&Q36Options {
-                session_cap_bytes: cap,
-                ..options.clone()
-            }));
-            assert!(text.contains("at least 9283698688 bytes"), "{text}");
-            assert!(text.contains("9126805504 attention cache bytes"), "{text}");
-            assert!(text.contains("156893184 DeltaNet bytes"), "{text}");
-        }
+        // Absent: the cap derives byte for byte from the requirement the
+        // refusal used to name, instead of demanding the arithmetic.
+        let derived = dense_settings(&options).unwrap();
+        assert_eq!(derived.session_cap, 9_283_698_688);
+        // Explicit but too small: still refused, with the requirement.
+        let text = message(dense_settings(&Q36Options {
+            session_cap_bytes: Some(9_283_698_687),
+            ..options.clone()
+        }));
+        assert!(text.contains("at least 9283698688 bytes"), "{text}");
+        assert!(text.contains("9126805504 attention cache bytes"), "{text}");
+        assert!(text.contains("156893184 DeltaNet bytes"), "{text}");
         let settings = dense_settings(&Q36Options {
             session_cap_bytes: Some(9_283_698_688),
             ..options
@@ -2311,10 +2372,12 @@ mod tests {
             prefill_budget_bytes: Some(5),
             ..with_limit()
         };
-        assert_eq!(
-            message(settings(Some(&unreserved), &Q36Env::default())),
-            "engine config: prefill_budget_bytes needs prefill_session_reserve_bytes"
-        );
+        // A budget without a reserve derives one (and, like an explicit
+        // reserve above the budget, is accepted: the planner then plans
+        // no chunk, exactly as an explicit pair would).
+        let derived = settings(Some(&unreserved), &Q36Env::default()).unwrap();
+        assert_eq!(derived.prefill_budget, Some(5));
+        assert!(derived.prefill_reserve > 5, "derived, not zero");
         let both = Q36Options {
             prefill_budget_bytes: Some(1),
             prefill_session_reserve_bytes: Some(0),
@@ -2325,7 +2388,80 @@ mod tests {
     }
 
     #[test]
-    fn the_prefill_reserve_is_the_member_and_never_a_default() {
+    fn the_derived_reserve_reproduces_the_shipped_mac_profile() {
+        // `config/qwen36-mac-studio-36gb.json` with the reserve member
+        // removed must resolve to the file's hand-summed reserve.
+        let options = Q36Options {
+            cache_limit_bytes: Some(4_294_967_296),
+            context_limit: Some(262_144),
+            session_cap_bytes: Some(4_294_967_296),
+            prefill_budget_bytes: Some(32_212_254_720),
+            kv_dtype: Some("q8".into()),
+            activation_dtype: Some("bf16".into()),
+            ..Q36Options::default()
+        };
+        let derived = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(derived.prefill_reserve, 8_286_699_520);
+        // And with the member present, resolution is byte-identical.
+        let explicit = settings(
+            Some(&Q36Options {
+                prefill_session_reserve_bytes: Some(8_286_699_520),
+                ..options
+            }),
+            &Q36Env::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                explicit.prefill_budget,
+                explicit.prefill_reserve,
+                explicit.session_cap,
+                explicit.context_limit
+            ),
+            (
+                derived.prefill_budget,
+                derived.prefill_reserve,
+                derived.session_cap,
+                derived.context_limit
+            )
+        );
+    }
+
+    #[test]
+    fn the_shipped_config_files_resolve_unchanged() {
+        // Byte-for-byte parity for the configurations the repository
+        // ships: explicit files must not move when derivations exist.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        let mac: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("qwen36-mac-studio-36gb.json")).unwrap(),
+        )
+        .unwrap();
+        let options: Q36Options =
+            serde_json::from_value(mac["engines"][0]["qwen36"].clone()).unwrap();
+        let got = settings(Some(&options), &Q36Env::default()).unwrap();
+        assert_eq!(got.cache_limit, 4_294_967_296);
+        assert_eq!(got.context_limit, 262_144);
+        assert_eq!(got.session_cap, 4_294_967_296);
+        assert_eq!(got.prefill_budget, Some(32_212_254_720));
+        assert_eq!(got.prefill_reserve, 8_286_699_520);
+
+        let cuda: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("qwen36-cuda-3090-kv8-prefix-262k.json")).unwrap(),
+        )
+        .unwrap();
+        let options: Q36Options =
+            serde_json::from_value(cuda["engines"][0]["qwen36"].clone()).unwrap();
+        let got = settings_for(Some(&options), &Q36Env::default(), Backend::Cuda).unwrap();
+        assert_eq!(got.context_limit, 262_144);
+        assert_eq!(
+            (got.prefill_budget, got.prefill_reserve, got.session_cap),
+            (None, 0, 0)
+        );
+        assert_eq!(kv_dtype_name(got.kv), "q8");
+    }
+
+    #[test]
+    fn the_prefill_reserve_member_wins_over_the_derivation() {
         let off = settings(Some(&with_limit()), &Q36Env::default()).unwrap();
         assert_eq!((off.prefill_budget, off.prefill_reserve), (None, 0));
         let options = Q36Options {
