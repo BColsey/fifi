@@ -421,6 +421,32 @@ mod tests {
     }
 
     #[test]
+    fn cpu_moe_overlap_selector_is_fail_safe_default_off() {
+        use std::ffi::OsStr;
+
+        for (value, expected) in [
+            (None, false),
+            (Some("1"), true),
+            (Some(" TrUe "), true),
+            (Some("\u{2003}On\u{00a0}"), true),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("false"), false),
+            (Some(""), false),
+            (Some("yes"), false),
+            (Some("2"), false),
+            (Some("true!"), false),
+            (Some("on\0"), false),
+        ] {
+            assert_eq!(
+                cpu_moe_overlap_selected(value.map(OsStr::new)),
+                expected,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn packed_pointwise_selector_is_fail_safe_default_on() {
         use std::ffi::OsStr;
 
