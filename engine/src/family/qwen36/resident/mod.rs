@@ -114,6 +114,10 @@ mod long_context;
 /// registration is approved.
 #[cfg(test)]
 pub(super) mod m3_quality;
+/// Pure host math for the frozen gate's device loops; test-only like its only
+/// caller (`m3_run`), so the production lib and the release binary stay
+/// main-identical (Phase B integration criterion).
+#[cfg(test)]
 pub(super) mod m3_rows;
 #[cfg(test)]
 pub(super) mod m3_store;
