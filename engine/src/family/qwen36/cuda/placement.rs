@@ -344,7 +344,7 @@ fn delta_state_bytes(shape: &HostShape, layers: usize, slots: usize) -> Result<u
 /// it, else the role's first allowed type (norms and per-head vectors are
 /// never block-quantized). The load-time check owns the file's real
 /// types; this is the planning assumption the receipt stands behind.
-fn plan_type(allowed: &[GgufType], quant: GgufType) -> GgufType {
+pub(crate) fn plan_type(allowed: &[GgufType], quant: GgufType) -> GgufType {
     if allowed.contains(&quant) {
         quant
     } else {
