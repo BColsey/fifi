@@ -56,6 +56,40 @@ pub enum EngError {
 }
 
 impl EngError {
+    /// The stable machine code of this failure. The server's HTTP error
+    /// codes for engine failures are these strings (`server::error`
+    /// delegates here), and structured load diagnostics carry the same
+    /// code, so a client sees one vocabulary on every surface.
+    pub fn code(&self) -> &'static str {
+        match self {
+            EngError::BadRequest(_) => "bad_request",
+            EngError::MemoryPlan(_) => "memory_plan",
+            EngError::ContextLimit(_) => "context_limit",
+            EngError::PromptTooLong { .. } => "context_length_exceeded",
+            EngError::Checkpoint(_) => "checkpoint_failure",
+            EngError::ModelOutput(_) | EngError::Backend { .. } => "backend_error",
+        }
+    }
+
+    /// The full human-readable cause, for logs and authenticated
+    /// diagnostics. Inference responses do **not** use this for
+    /// `Backend`/`ModelOutput` failures: they show the fixed
+    /// `server::error::BACKEND_MESSAGE` instead.
+    pub fn describe(&self) -> String {
+        match self {
+            EngError::ModelOutput(message)
+            | EngError::Checkpoint(message)
+            | EngError::BadRequest(message)
+            | EngError::MemoryPlan(message)
+            | EngError::ContextLimit(message) => message.clone(),
+            EngError::PromptTooLong {
+                prompt_tokens,
+                limit_tokens,
+            } => EngError::prompt_too_long_message(*prompt_tokens, *limit_tokens),
+            EngError::Backend { operation, message } => format!("{operation}: {message}"),
+        }
+    }
+
     /// The wire form of the over-length refusal: the exact string Claude Code
     /// matches to auto-compact. One source for every surface that renders it.
     pub fn prompt_too_long_message(prompt_tokens: u64, limit_tokens: u64) -> String {

@@ -70,10 +70,72 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The state that the engine thread, its handles, and `shutdown` share.
+/// Whether retrying can succeed, as far as the recording site knows.
+/// `AfterCorrection`: the cause sits in files, configuration, or free
+/// resources, so fixing it and starting again is the retry (this build
+/// has no in-place engine restart). `Unknown`: no evidence either way;
+/// never presented as safely retryable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryClass {
+    AfterCorrection,
+    Unknown,
+}
+
+/// The structured form of the first recorded engine failure. `message`
+/// keeps the exact historical cause text (logs and shutdown reports are
+/// unchanged); `code` is the one vocabulary shared with HTTP errors
+/// (`EngError::code`, plus `internal_error` for panics and broken
+/// executor invariants, which no `EngError` describes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EngineFailure {
+    pub(crate) code: &'static str,
+    /// Where it failed: `load`, `admission`, `configuration`, `runtime`,
+    /// `internal`, or a backend operation name (for example
+    /// `cuda initialize`).
+    pub(crate) stage: String,
+    pub(crate) message: String,
+    pub(crate) retry: RetryClass,
+}
+
+impl EngineFailure {
+    /// Classify an engine error at its recording site. `phase` is the
+    /// stage for variants that do not name their own (`load` while the
+    /// executor is built, `runtime` afterwards).
+    pub(crate) fn from_error(error: &EngError, phase: &'static str, message: String) -> Self {
+        let stage = match error {
+            EngError::Backend { operation, .. } => operation.to_string(),
+            EngError::MemoryPlan(_) => "admission".to_string(),
+            EngError::BadRequest(_) | EngError::ContextLimit(_) => "configuration".to_string(),
+            _ => phase.to_string(),
+        };
+        let retry = match error {
+            EngError::Backend { .. } | EngError::ModelOutput(_) => RetryClass::Unknown,
+            _ => RetryClass::AfterCorrection,
+        };
+        Self {
+            code: error.code(),
+            stage,
+            message,
+            retry,
+        }
+    }
+
+    /// A failure no `EngError` describes: a panic, or an executor
+    /// invariant broken at `stage`.
+    fn internal(stage: &'static str, message: String) -> Self {
+        Self {
+            code: "internal_error",
+            stage: stage.to_string(),
+            message,
+            retry: RetryClass::Unknown,
+        }
+    }
+}
+
 struct Shared {
     state: AtomicU8,
     /// The first recorded cause of `Error` or `NativeFailed`, for `/ready` and the logs.
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<EngineFailure>>,
     /// Set by `shutdown`. The worker cancels every job that it has not finished.
     stop: AtomicBool,
     /// The cancel flag of the running job, so `shutdown` can cancel it.
@@ -107,14 +169,20 @@ impl Shared {
     }
 
     /// Keeps the first cause: later failures are consequences of it.
-    fn record_failure(&self, cause: String) {
+    fn record_failure(&self, cause: EngineFailure) {
         let mut slot = lock(&self.failure);
         if slot.is_none() {
             *slot = Some(cause);
         }
     }
 
+    /// The cause text, exactly as the logs and shutdown reports have
+    /// always carried it.
     fn failure(&self) -> Option<String> {
+        lock(&self.failure).as_ref().map(|f| f.message.clone())
+    }
+
+    fn failure_info(&self) -> Option<EngineFailure> {
         lock(&self.failure).clone()
     }
 }
@@ -152,6 +220,11 @@ impl EngineHandle {
 
     pub(crate) fn failure(&self) -> Option<String> {
         self.shared.failure()
+    }
+
+    /// The structured failure, for authenticated operator surfaces.
+    pub(crate) fn failure_info(&self) -> Option<EngineFailure> {
+        self.shared.failure_info()
     }
 
     /// Queues a job without waiting. A refused job is dropped, and its channel closes.
@@ -223,7 +296,7 @@ impl Engine {
             if shared.state() != EngineState::Error {
                 shared.set_state(EngineState::NativeFailed);
             }
-            shared.record_failure(cause.clone());
+            shared.record_failure(EngineFailure::internal("internal", cause.clone()));
             failure = Some(cause);
         }
         ShutdownReport {
@@ -377,7 +450,10 @@ fn run<E, F>(
         } else {
             EngineState::NativeFailed
         };
-        shared.record_failure(format!("engine thread panicked: {message}"));
+        shared.record_failure(EngineFailure::internal(
+            "internal",
+            format!("engine thread panicked: {message}"),
+        ));
         shared.set_state(next);
         if let Some(events) = current.take() {
             send_terminal(
@@ -413,11 +489,11 @@ fn work<E, F>(
     let (mut executor, mut session) = match make() {
         Ok(pair) => pair,
         Err(error) => {
-            let cause = format!("engine load failed: {error:?}");
+            let cause = format!("engine load failed: {}", error.describe());
             if let Some(note) = ready_note {
                 note(EngineNote::Failed(cause.clone()));
             }
-            shared.record_failure(cause);
+            shared.record_failure(EngineFailure::from_error(&error, "load", cause));
             shared.set_state(EngineState::Error);
             drain(jobs, reject);
             return;
@@ -429,7 +505,7 @@ fn work<E, F>(
         if let Some(note) = ready_note {
             note(EngineNote::Failed(cause.clone()));
         }
-        shared.record_failure(cause);
+        shared.record_failure(EngineFailure::internal("load", cause));
         shared.set_state(EngineState::Error);
         drain(jobs, reject);
         return;
@@ -934,7 +1010,11 @@ fn reset_state<E: ExecutorOps>(
     match executor.reset(session) {
         Ok(()) => EngineState::Ready,
         Err(error) => {
-            shared.record_failure(format!("session reset failed: {error:?}"));
+            shared.record_failure(EngineFailure::from_error(
+                &error,
+                "runtime",
+                format!("session reset failed: {}", error.describe()),
+            ));
             EngineState::NativeFailed
         }
     }
@@ -951,7 +1031,11 @@ fn fail<E: ExecutorOps>(
 ) -> EngineState {
     let native = matches!(error, EngError::Backend { .. });
     if native {
-        shared.record_failure(format!("native failure: {error:?}"));
+        shared.record_failure(EngineFailure::from_error(
+            &error,
+            "runtime",
+            format!("native failure: {}", error.describe()),
+        ));
     }
     send_terminal(events, JobEvent::Error(error));
     if native {
@@ -963,6 +1047,48 @@ fn fail<E: ExecutorOps>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failure_classification_names_code_stage_and_retry() {
+        use super::{EngineFailure, RetryClass};
+        let memory = EngineFailure::from_error(
+            &EngError::MemoryPlan("needs 100 bytes".into()),
+            "load",
+            "engine load failed".into(),
+        );
+        assert_eq!(memory.code, "memory_plan");
+        assert_eq!(memory.stage, "admission");
+        assert_eq!(memory.retry, RetryClass::AfterCorrection);
+
+        let checkpoint = EngineFailure::from_error(
+            &EngError::Checkpoint("missing file".into()),
+            "load",
+            "engine load failed".into(),
+        );
+        assert_eq!(checkpoint.code, "checkpoint_failure");
+        assert_eq!(checkpoint.stage, "load");
+        assert_eq!(checkpoint.retry, RetryClass::AfterCorrection);
+
+        let backend = EngineFailure::from_error(
+            &EngError::Backend {
+                operation: "cuda initialize",
+                message: "no driver".into(),
+            },
+            "runtime",
+            "native failure".into(),
+        );
+        assert_eq!(backend.code, "backend_error");
+        assert_eq!(backend.stage, "cuda initialize");
+        assert_eq!(backend.retry, RetryClass::Unknown);
+
+        let config = EngineFailure::from_error(
+            &EngError::BadRequest("kv_dtype must be f32, bf16, or q8".into()),
+            "load",
+            "engine load failed".into(),
+        );
+        assert_eq!(config.stage, "configuration");
+        assert_eq!(config.retry, RetryClass::AfterCorrection);
+    }
+
     use super::{EngineHandle, EngineState, ShutdownReport, SubmitError, spawn_engine};
     use crate::EngError;
     use crate::exec_fake::FakeExecutor;

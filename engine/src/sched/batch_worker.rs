@@ -76,7 +76,11 @@ fn copy_error(error: &EngError) -> EngError {
 
 /// No executor calls follow this transition, even for another active or queued job.
 fn native_failed(shared: &Shared, jobs: &Receiver<Message>, error: &EngError) {
-    shared.record_failure(format!("native failure: {error:?}"));
+    shared.record_failure(super::EngineFailure::from_error(
+        error,
+        "runtime",
+        format!("native failure: {}", error.describe()),
+    ));
     shared.set_state(EngineState::NativeFailed);
     for job in lock(&shared.active).drain(..) {
         job.cancel.store(true, Ordering::SeqCst);

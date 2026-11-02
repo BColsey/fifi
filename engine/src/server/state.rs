@@ -3,10 +3,10 @@
 
 use super::error::ServerError;
 use super::reqlog::{RecentRing, Sink, default_sink};
-use super::wire::{EngineInfo, Model, ModelList, state_name};
+use super::wire::{EngineErrorInfo, EngineInfo, Model, ModelList, state_name};
 use crate::EngError;
 use crate::family::sampler::SamplingDefaults;
-use crate::sched::worker::{EngineHandle, EngineState};
+use crate::sched::worker::{EngineHandle, EngineState, RetryClass};
 use crate::tokenizer::TokenizerBundle;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -210,6 +210,16 @@ impl AppState {
                 id: entry.id.clone(),
                 model: entry.model.clone(),
                 state: state_name(entry.handle.state()),
+                error: entry.handle.failure_info().map(|failure| EngineErrorInfo {
+                    code: failure.code,
+                    stage: failure.stage,
+                    message: failure.message,
+                    retry: match failure.retry {
+                        RetryClass::AfterCorrection => "after_correction",
+                        RetryClass::Unknown => "unknown",
+                    },
+                    suggestion: suggestion_for(failure.code),
+                }),
             };
             match models.iter_mut().find(|model| model.id == entry.model) {
                 Some(model) => model.engines.push(info),
@@ -217,6 +227,23 @@ impl AppState {
             }
         }
         ModelList::new(models)
+    }
+}
+
+/// The corrective action the recorded code justifies, and no more:
+/// codes without an evidence-backed user action get none.
+fn suggestion_for(code: &str) -> Option<&'static str> {
+    match code {
+        "memory_plan" => Some(
+            "free memory or lower the context, then restart; `enginesrv check <model_dir>` estimates the largest fitting context",
+        ),
+        "checkpoint_failure" => Some(
+            "verify the model and tokenizer files; `enginesrv check <model_dir>` runs the same file and pin checks",
+        ),
+        "bad_request" | "context_limit" => {
+            Some("correct the engine entry in the configuration file, then restart")
+        }
+        _ => None,
     }
 }
 

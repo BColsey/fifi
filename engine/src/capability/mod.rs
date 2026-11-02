@@ -61,19 +61,7 @@ impl<T> Probe<T> {
 /// `server::run::describe`); diagnostics use the message itself, with the
 /// backend operation kept because it names the failing subsystem.
 pub(crate) fn describe_error(error: &crate::EngError) -> String {
-    use crate::EngError;
-    match error {
-        EngError::ModelOutput(message)
-        | EngError::Checkpoint(message)
-        | EngError::BadRequest(message)
-        | EngError::MemoryPlan(message)
-        | EngError::ContextLimit(message) => message.clone(),
-        EngError::PromptTooLong {
-            prompt_tokens,
-            limit_tokens,
-        } => EngError::prompt_too_long_message(*prompt_tokens, *limit_tokens),
-        EngError::Backend { operation, message } => format!("{operation}: {message}"),
-    }
+    error.describe()
 }
 
 /// GiB with two decimals, the unit every rendered report uses for memory.

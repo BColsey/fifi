@@ -259,6 +259,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_route_reports_the_load_failure_to_an_authenticated_client() {
+        let broken = testkit::failing_engine();
+        let healthy = testkit::engine(Vec::new());
+        let entries = vec![
+            testkit::entry("e1", "model-a", &broken, 4_096),
+            testkit::entry("e2", "model-b", &healthy, 4_096),
+        ];
+        testkit::wait_for_state(&entries[0].handle, EngineState::Error);
+        testkit::wait_for_state(&entries[1].handle, EngineState::Ready);
+        let state = Arc::new(AppState::new(testkit::API_KEY, entries));
+        let app = router(state);
+
+        // Unauthenticated: the failure cause is not a public surface.
+        let (status, _h, body) = testkit::send(&app, testkit::get("/v1/models", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!String::from_utf8_lossy(&body).contains("fixture load failure"));
+
+        let request = testkit::get("/v1/models", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !text.contains(testkit::API_KEY),
+            "the api key must never appear: {text}"
+        );
+        let body = testkit::json_of(&body);
+        assert_pointer(
+            "/paths/~1v1~1models/get/responses/200/content/application~1json/schema",
+            &body,
+        );
+        let failed = &body["data"][0]["engines"][0];
+        assert_eq!(failed["state"], "error");
+        assert_eq!(failed["error"]["code"], "checkpoint_failure");
+        assert_eq!(failed["error"]["stage"], "load");
+        assert_eq!(failed["error"]["retry"], "after_correction");
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("fixture load failure")
+        );
+        assert!(failed["error"]["suggestion"].as_str().is_some());
+        // The healthy engine's status is neither hidden nor decorated.
+        let ready = &body["data"][1]["engines"][0];
+        assert_eq!(ready["state"], "ready");
+        assert!(ready.get("error").is_none(), "{ready}");
+    }
+
+    #[tokio::test]
     async fn a_route_that_the_server_does_not_ship_returns_a_json_404() {
         let (state, _engine) = one_engine_state();
         let app = router(state);

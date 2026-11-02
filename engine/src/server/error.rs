@@ -48,13 +48,7 @@ impl ServerError {
 
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            ServerError::Eng(EngError::BadRequest(_)) => "bad_request",
-            ServerError::Eng(EngError::MemoryPlan(_)) => "memory_plan",
-            ServerError::Eng(EngError::ContextLimit(_)) => "context_limit",
-            ServerError::Eng(EngError::PromptTooLong { .. }) => "context_length_exceeded",
-            ServerError::Eng(EngError::Checkpoint(_)) => "checkpoint_failure",
-            ServerError::Eng(EngError::ModelOutput(_)) => "backend_error",
-            ServerError::Eng(EngError::Backend { .. }) => "backend_error",
+            ServerError::Eng(error) => error.code(),
             ServerError::Unauthorized => "unauthorized",
             ServerError::NotFound(_) => "not_found",
             ServerError::Overloaded(_) => "overloaded",

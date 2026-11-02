@@ -460,12 +460,39 @@ impl Completion {
     }
 }
 
+/// The `EngineError` schema: why an engine is in state `error` or
+/// `native-failed`. This travels only on the authenticated models
+/// surface; inference error responses keep their opaque form
+/// (`server::error::BACKEND_MESSAGE`), and the public `/ready` route
+/// still names states without causes. The text is engine-generated
+/// (paths, byte counts, backend statuses): it never carries request
+/// content or credentials, which no load path receives.
+#[derive(Serialize)]
+pub(crate) struct EngineErrorInfo {
+    /// The stable code shared with HTTP error responses
+    /// (`EngError::code`), or `internal_error` for panics.
+    pub(crate) code: &'static str,
+    /// Where it failed: `load`, `admission`, `configuration`, `runtime`,
+    /// `internal`, or a backend operation name.
+    pub(crate) stage: String,
+    pub(crate) message: String,
+    /// `after_correction`: fix the named cause, then start again (this
+    /// build has no in-place engine restart). `unknown`: no evidence
+    /// retrying helps.
+    pub(crate) retry: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggestion: Option<&'static str>,
+}
+
 /// The `Engine` schema.
 #[derive(Serialize)]
 pub(crate) struct EngineInfo {
     pub(crate) id: String,
     pub(crate) model: String,
     pub(crate) state: &'static str,
+    /// Present only when a failure has been recorded for this engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<EngineErrorInfo>,
 }
 
 #[derive(Serialize)]
@@ -519,8 +546,9 @@ pub(crate) fn state_name(state: EngineState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletion, ChatCompletionChunk, EngineInfo, FinishReason, Model, ModelList, ReplyHead,
-        ReplyParts, ToolCall, Usage, cache_fields_enabled, state_name, usage_json_with,
+        ChatCompletion, ChatCompletionChunk, EngineErrorInfo, EngineInfo, FinishReason, Model,
+        ModelList, ReplyHead, ReplyParts, ToolCall, Usage, cache_fields_enabled, state_name,
+        usage_json_with,
     };
     use crate::sched::worker::EngineState;
     use crate::server::contract::{assert_pointer, assert_schema};
@@ -951,11 +979,42 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_engine_matches_the_engine_error_schema() {
+        let engines = vec![EngineInfo {
+            id: "e1".to_string(),
+            model: "fake-model".to_string(),
+            state: state_name(EngineState::Error),
+            error: Some(EngineErrorInfo {
+                code: "memory_plan",
+                stage: "admission".to_string(),
+                message: "engine load failed: needs 100 bytes".to_string(),
+                retry: "after_correction",
+                suggestion: Some("free memory or lower the context"),
+            }),
+        }];
+        let list = ModelList::new(vec![Model::new(
+            "fake-model".to_string(),
+            1_790_000_000,
+            engines,
+        )]);
+        let body = value(&list);
+        assert_pointer(
+            "/paths/~1v1~1models/get/responses/200/content/application~1json/schema",
+            &body,
+        );
+        assert_eq!(
+            body["data"][0]["engines"][0]["error"]["code"],
+            "memory_plan"
+        );
+    }
+
+    #[test]
     fn the_model_list_matches_the_models_response_schema() {
         let engines = vec![EngineInfo {
             id: "e1".to_string(),
             model: "fake-model".to_string(),
             state: state_name(EngineState::Ready),
+            error: None,
         }];
         let list = ModelList::new(vec![Model::new(
             "fake-model".to_string(),

@@ -467,18 +467,7 @@ where
 }
 
 fn describe(error: &EngError) -> String {
-    match error {
-        EngError::ModelOutput(message) => message.clone(),
-        EngError::Checkpoint(message)
-        | EngError::BadRequest(message)
-        | EngError::MemoryPlan(message)
-        | EngError::ContextLimit(message) => message.clone(),
-        EngError::PromptTooLong {
-            prompt_tokens,
-            limit_tokens,
-        } => EngError::prompt_too_long_message(*prompt_tokens, *limit_tokens),
-        EngError::Backend { operation, message } => format!("{operation}: {message}"),
-    }
+    error.describe()
 }
 
 pub(crate) async fn serve(

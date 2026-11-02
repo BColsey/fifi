@@ -203,6 +203,49 @@ components:
             down. native-failed: the native
             backend failed, and the engine takes no more jobs. A request to
             an engine in state error or native-failed gets 500 backend_error.
+        error:
+          $ref: "#/components/schemas/EngineError"
+    EngineError:
+      type: object
+      required: [code, stage, message, retry]
+      description: >-
+        Server extension. Why an engine failed, present only when a
+        failure has been recorded for it. This is an authenticated
+        operator surface: unlike inference error responses, which keep
+        backend failures opaque, the message carries the engine-generated
+        cause (paths, byte counts, backend statuses). It never carries
+        request content or credentials, which no load path receives. The
+        public /ready route still reports states without causes.
+      properties:
+        code:
+          type: string
+          description: >-
+            The stable code shared with HTTP error responses
+            (bad_request, memory_plan, context_limit,
+            context_length_exceeded, checkpoint_failure, backend_error),
+            or internal_error for panics and broken executor invariants.
+        stage:
+          type: string
+          description: >-
+            Where it failed: load, admission, configuration, runtime,
+            internal, or a backend operation name such as
+            "cuda initialize".
+        message:
+          type: string
+          description: The recorded cause, in the words the loader refused with.
+        retry:
+          type: string
+          enum: [after_correction, unknown]
+          description: >-
+            after_correction: the cause sits in files, configuration, or
+            free resources, so fixing it and starting again is the retry
+            (this build has no in-place engine restart). unknown: no
+            evidence retrying helps.
+        suggestion:
+          type: string
+          description: >-
+            The corrective action the code justifies, when one is known.
+            Absent when no evidence-backed action exists.
     ChatRequest:
       type: object
       required: [messages]
