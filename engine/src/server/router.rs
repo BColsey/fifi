@@ -216,6 +216,9 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 "model": entry.model,
                 "state": state_name(entry.handle.state()),
                 "context_limit": entry.context_limit,
+                // The retained rows the engine started with (empty where a
+                // family composes no per-key origins) — not a re-resolution.
+                "settings": entry.effective,
             })
         })
         .collect();
@@ -406,6 +409,37 @@ mod tests {
         // No device claims of any kind from a serving process.
         let text = body.to_string();
         assert!(!text.contains("vram") && !text.contains("device"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn system_route_reports_the_retained_effective_settings() {
+        use crate::capability::effective::{EffectiveSetting, Origin};
+        let engine = testkit::engine(Vec::new());
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let rows = vec![EffectiveSetting {
+            key: "context_limit",
+            value: "32768".to_string(),
+            origin: Origin::ConfigFile,
+        }];
+        let entry = testkit::entry_with_effective("e1", "model-a", &engine, 4_096, rows);
+        let state = Arc::new(AppState::new(testkit::API_KEY, vec![entry]));
+        let app = router(state);
+        let _keep = &engine;
+        let request = testkit::get("/v1/system", Some(testkit::API_KEY));
+        let (status, _headers, body) = testkit::send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        // The rows carry configuration, never credentials.
+        assert!(!String::from_utf8_lossy(&body).contains(testkit::API_KEY));
+        let body = testkit::json_of(&body);
+        assert_pointer(
+            "/paths/~1v1~1system/get/responses/200/content/application~1json/schema",
+            &body,
+        );
+        let rows = &body["engines"][0]["settings"];
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+        assert_eq!(rows[0]["key"], "context_limit");
+        assert_eq!(rows[0]["value"], "32768");
+        assert_eq!(rows[0]["origin"], "config_file");
     }
 
     #[tokio::test]

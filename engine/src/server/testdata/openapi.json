@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "9d4d9e37bf933acad53a8370603875623daa20172b28709c81ca5e5fadc59969",
+ "x-source-sha256": "0b04275b40ee95e5056d663588a1b99e036a52871a84d8d5b9a21ac19286b2e9",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -327,9 +327,44 @@
         "context_limit": {
          "type": "integer",
          "minimum": 0
+        },
+        "settings": {
+         "type": "array",
+         "description": "The retained per-key resolved configuration rows of this engine: the `config effective` view over the settings it actually started with, computed once at start. Empty for families whose per-key origins are not composed.",
+         "items": {
+          "$ref": "#/components/schemas/EffectiveSetting"
+         }
         }
        }
       }
+     }
+    }
+   },
+   "EffectiveSetting": {
+    "type": "object",
+    "required": [
+     "key",
+     "value",
+     "origin"
+    ],
+    "properties": {
+     "key": {
+      "type": "string"
+     },
+     "value": {
+      "type": "string",
+      "description": "The resolved value, rendered exactly (bytes stay bytes)."
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "config_file",
+       "environment",
+       "derived",
+       "default",
+       "ignored_on_this_backend"
+      ],
+      "description": "Where the resolved value came from."
      }
     }
    },

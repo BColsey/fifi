@@ -285,6 +285,33 @@ components:
               context_limit:
                 type: integer
                 minimum: 0
+              settings:
+                type: array
+                description: >-
+                  The retained per-key resolved configuration rows of this
+                  engine: the `config effective` view over the settings it
+                  actually started with, computed once at start. Empty for
+                  families whose per-key origins are not composed.
+                items:
+                  $ref: "#/components/schemas/EffectiveSetting"
+    EffectiveSetting:
+      type: object
+      required: [key, value, origin]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+          description: The resolved value, rendered exactly (bytes stay bytes).
+        origin:
+          type: string
+          enum:
+            - config_file
+            - environment
+            - derived
+            - default
+            - ignored_on_this_backend
+          description: Where the resolved value came from.
     ChatRequest:
       type: object
       required: [messages]

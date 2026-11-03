@@ -218,6 +218,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             engine,
             mut bundle,
             context_limit,
+            effective,
         } = starter(config, file.prefix_reuse, ready_note).map_err(|error| {
             StartupError(format!(
                 "engine {} failed to start: {}",
@@ -266,6 +267,7 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             prefix_reuse: entry_prefix_reuse(&config.family, file.prefix_reuse, flint_opt_in),
             warm: std::sync::Arc::new(std::sync::Mutex::new(None)),
             defaults: loaded.values,
+            effective,
         });
         engines.push(engine);
     }
@@ -306,11 +308,14 @@ fn check_staged_family(family: &str) -> Result<(), EngError> {
 }
 
 /// One family's start result: the uniform shape every factory already
-/// produces de facto (engine handle, tokenizer bundle, context limit).
+/// produces de facto (engine handle, tokenizer bundle, context limit),
+/// plus the resolved per-key configuration rows where a family composes
+/// them (empty otherwise).
 pub(crate) struct StartedEngine {
     pub(crate) engine: Engine,
     pub(crate) bundle: Arc<TokenizerBundle>,
     pub(crate) context_limit: u32,
+    pub(crate) effective: Vec<crate::capability::effective::EffectiveSetting>,
 }
 
 /// The uniform starter signature: one config entry, the process-wide
@@ -335,6 +340,7 @@ fn start_flint(
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -353,6 +359,7 @@ fn start_flash(
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -361,7 +368,7 @@ fn start_q36(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    let started = q36_factory::start_engine_for_family(
+    let (started, settings) = q36_factory::start_engine_for_family(
         &config.family,
         &config.model_dir,
         &config.tokenizer_dir,
@@ -369,10 +376,22 @@ fn start_q36(
         prefix_reuse,
         ready_note,
     )?;
+    // One resolution: the rows are the `config effective` view over the
+    // factory's own resolved settings, beside the same options and env it
+    // read (an environment variable cannot change inside the process), so
+    // the server cannot report a configuration it did not start with.
+    let default_options = crate::family::qwen36::settings::Q36Options::default();
+    let effective = crate::capability::effective::q36_effective(
+        config.qwen36.as_ref().unwrap_or(&default_options),
+        std::env::var("Q36_CACHE_LIMIT").ok().as_deref(),
+        q36_factory::backend_of_build(),
+        &settings,
+    );
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
+        effective,
     })
 }
 
@@ -391,6 +410,7 @@ fn start_nemotron(
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -404,6 +424,7 @@ fn start_fake(
         engine: started.engine,
         bundle: started.bundle,
         context_limit: started.context_limit,
+        effective: Vec::new(),
     })
 }
 
@@ -1406,6 +1427,93 @@ mod tests {
         assert_eq!(
             rx.recv().expect("a failed load prints its line"),
             "engine e failed: engine load failed: no executor"
+        );
+    }
+
+    /// The server retains effective rows from the factory's own resolution;
+    /// `config effective` renders an independent resolution. For every
+    /// shipped Q36-family config the two surfaces must agree — equal rows
+    /// when the build resolves them, the identical refusal otherwise — so
+    /// `GET /v1/system` can never report a configuration a start would not
+    /// have produced. The injected environment makes the comparison
+    /// deterministic; both surfaces receive it.
+    #[test]
+    fn retained_rows_match_the_config_effective_surface_for_shipped_configs() {
+        use crate::capability::effective::q36_effective;
+        use crate::family::qwen36::factory as q36_factory;
+        use crate::family::qwen36::settings::{Q36Env, Q36Settings};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("the shipped config directory exists")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        let mut checked = 0;
+        for path in paths {
+            let config = Config::from_file(&path).expect("a shipped config parses");
+            for engine in &config.engines {
+                let Some(spec) = q36_factory::descriptor(&engine.family) else {
+                    continue;
+                };
+                let env = Q36Env {
+                    cache_limit: Some("8589934592".to_string()),
+                };
+                let backend = q36_factory::backend_of_build();
+                let render = |settings: &Q36Settings| {
+                    q36_effective(
+                        engine.qwen36.as_ref().unwrap_or(&Q36Options::default()),
+                        env.cache_limit.as_deref(),
+                        backend,
+                        settings,
+                    )
+                };
+                // The CLI surface: exactly what `config effective` resolves.
+                let cli = Q36Settings::new_for_family(
+                    &engine.model_dir,
+                    &engine.tokenizer_dir,
+                    engine.qwen36.as_ref(),
+                    &env,
+                    backend,
+                    spec,
+                )
+                .map(|settings| render(&settings));
+                // The server surface: the factory's own pure builder.
+                let server = q36_factory::settings_with_prefix_reuse(
+                    &engine.model_dir,
+                    &engine.tokenizer_dir,
+                    engine.qwen36.as_ref(),
+                    &env,
+                    backend,
+                    false,
+                    spec,
+                )
+                .map(|settings| render(&settings));
+                match (cli, server) {
+                    (Ok(cli_rows), Ok(server_rows)) => assert_eq!(
+                        cli_rows,
+                        server_rows,
+                        "{}: rows drifted between the CLI and server surfaces",
+                        path.display()
+                    ),
+                    (Err(cli), Err(server)) => assert_eq!(
+                        format!("{cli:?}"),
+                        format!("{server:?}"),
+                        "{}: the surfaces refuse differently",
+                        path.display()
+                    ),
+                    (cli, server) => panic!(
+                        "{}: one surface resolved while the other refused: {cli:?} vs {server:?}",
+                        path.display()
+                    ),
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected the shipped Q36-family configs, exercised {checked}"
         );
     }
 }

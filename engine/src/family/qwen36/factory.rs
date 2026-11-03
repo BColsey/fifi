@@ -38,14 +38,15 @@ pub(crate) fn start_engine(
     prefix_reuse: bool,
     ready_note: ReadyNote,
 ) -> Result<StartedEngine, EngError> {
-    start_engine_for_family(
+    let (started, _settings) = start_engine_for_family(
         FAMILY,
         model_dir,
         tokenizer_dir,
         options,
         prefix_reuse,
         ready_note,
-    )
+    )?;
+    Ok(started)
 }
 
 pub(crate) fn start_engine_for_family(
@@ -55,7 +56,7 @@ pub(crate) fn start_engine_for_family(
     options: Option<&Q36Options>,
     prefix_reuse: bool,
     ready_note: ReadyNote,
-) -> Result<StartedEngine, EngError> {
+) -> Result<(StartedEngine, Q36Settings), EngError> {
     let spec = descriptor(family)
         .ok_or_else(|| EngError::BadRequest(format!("unsupported Q36-style family {family}")))?;
     let env = Q36Env {
@@ -90,8 +91,10 @@ pub(crate) fn backend_of_build() -> Backend {
 /// `Q36Settings::new` builds the checked settings and leaves the flag false, because no config
 /// member or environment key carries the process-wide flag, so the flag travels in the settings
 /// from here — the MLX `start` reads it into the `prefix_store` limits of the rules. The
-/// builder is pure: the factory and its test share it.
-fn settings_with_prefix_reuse(
+/// builder is pure: the factory and its test share it, and the server's
+/// effective-configuration parity test resolves through it so the retained
+/// rows cannot drift from what a start resolves.
+pub(crate) fn settings_with_prefix_reuse(
     model_dir: &Path,
     tokenizer_dir: &Path,
     options: Option<&Q36Options>,
@@ -116,7 +119,7 @@ fn start_engine_with(
     prefix_reuse: bool,
     spec: FamilySpec,
     ready_note: ReadyNote,
-) -> Result<StartedEngine, EngError> {
+) -> Result<(StartedEngine, Q36Settings), EngError> {
     let settings = settings_with_prefix_reuse(
         model_dir,
         tokenizer_dir,
@@ -128,11 +131,14 @@ fn start_engine_with(
     )?;
     settings.check_prefix_reuse_cap(prefix_reuse)?;
     let (engine, bundle) = launch(&settings, ready_note)?;
-    Ok(StartedEngine {
-        engine,
-        bundle,
-        context_limit: settings.context_limit,
-    })
+    Ok((
+        StartedEngine {
+            engine,
+            bundle,
+            context_limit: settings.context_limit,
+        },
+        settings,
+    ))
 }
 
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]

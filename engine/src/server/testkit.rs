@@ -136,6 +136,36 @@ pub(super) fn entry_with_defaults(
     context_limit: u32,
     defaults: crate::family::sampler::SamplingDefaults,
 ) -> EngineEntry {
+    entry_with(id, model, engine, context_limit, defaults, Vec::new())
+}
+
+/// An entry carrying retained effective-configuration rows, for the
+/// `/v1/system` rendering tests.
+pub(super) fn entry_with_effective(
+    id: &str,
+    model: &str,
+    engine: &Engine,
+    context_limit: u32,
+    effective: Vec<crate::capability::effective::EffectiveSetting>,
+) -> EngineEntry {
+    entry_with(
+        id,
+        model,
+        engine,
+        context_limit,
+        crate::family::sampler::SamplingDefaults::CONTRACT,
+        effective,
+    )
+}
+
+fn entry_with(
+    id: &str,
+    model: &str,
+    engine: &Engine,
+    context_limit: u32,
+    defaults: crate::family::sampler::SamplingDefaults,
+    effective: Vec<crate::capability::effective::EffectiveSetting>,
+) -> EngineEntry {
     EngineEntry {
         id: id.to_string(),
         model: model.to_string(),
@@ -145,6 +175,7 @@ pub(super) fn entry_with_defaults(
         context_limit,
         prefix_reuse: false,
         defaults,
+        effective,
     }
 }
 

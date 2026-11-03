@@ -40,6 +40,11 @@ pub(crate) struct EngineEntry {
     /// `model_dir/generation_config.json` sets, with the contract default for an absent file or
     /// key. The chat handler applies them to every field that a request omits.
     pub(crate) defaults: SamplingDefaults,
+    /// The resolved per-key configuration rows retained at start for
+    /// `GET /v1/system` (the `config effective` view over the settings the
+    /// engine actually started with — never a second resolution). Empty
+    /// for families whose per-key origins are not composed yet.
+    pub(crate) effective: Vec<crate::capability::effective::EffectiveSetting>,
 }
 
 pub(crate) struct AppState {
