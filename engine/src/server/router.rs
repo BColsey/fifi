@@ -462,7 +462,10 @@ mod tests {
         crate::sched::worker::Engine,
         std::path::PathBuf,
     ) {
-        let dir = std::env::temp_dir().join(format!("fifi-web-{}", std::process::id()));
+        // One directory per call: the web tests run in parallel in one
+        // process, and a shared fixture raced (an index read during
+        // another thread's rewrite came back empty).
+        let dir = tempfile::tempdir().expect("web dir").keep();
         let assets = dir.join("assets");
         std::fs::create_dir_all(&assets).expect("web dir");
         std::fs::write(dir.join("index.html"), "<html>fifi shell</html>").expect("index");
