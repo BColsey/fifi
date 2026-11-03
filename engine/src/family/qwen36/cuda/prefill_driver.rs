@@ -192,7 +192,8 @@ pub(super) fn admit_with_staging(
     Ok(best.map_or((fallback, None), |(m, plan)| (Some(m), Some(plan))))
 }
 
-pub(super) const FIXED_ADMISSION_MARGIN: usize = 256 << 20;
+pub(super) const FIXED_ADMISSION_MARGIN: usize =
+    crate::family::qwen36::admission_sketch::FIXED_ADMISSION_MARGIN_BYTES;
 
 pub(super) fn fixed_chunk_rows(capacity: usize, cap: usize) -> usize {
     // Below the stage tier the whole context fits one stage; above it the
@@ -206,12 +207,7 @@ pub(super) fn fixed_chunk_rows(capacity: usize, cap: usize) -> usize {
 }
 
 pub(super) fn fixed_staging_rows(capacity: usize) -> usize {
-    if capacity <= FULL_STAGE_TIER_ROWS {
-        capacity
-    } else {
-        // The complete 262K ledger plus 110 MiB variation cannot retain a 64K stage.
-        32_768
-    }
+    crate::family::qwen36::admission_sketch::fixed_staging_rows(capacity)
 }
 
 pub(super) fn admit_fixed(
@@ -245,7 +241,9 @@ pub(super) fn admit_fixed(
 /// the boundary above which `fixed_staging_rows` shrinks to the 32K tail — a
 /// staging tier bound, not a context cap. The wide CPF candidate is defined from
 /// this tier; retuning the candidate means retuning the tier deliberately.
-pub(super) const FULL_STAGE_TIER_ROWS: usize = 131_072;
+/// Canonical value and rule live in `admission_sketch`, shared with preflight.
+pub(super) const FULL_STAGE_TIER_ROWS: usize =
+    crate::family::qwen36::admission_sketch::FULL_STAGE_TIER_ROWS;
 
 /// The wide candidate applies only where it is actually wider than today's stage.
 pub(super) fn wide_stage_candidate(capacity: usize, wide_flag: bool) -> bool {

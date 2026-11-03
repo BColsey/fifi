@@ -122,8 +122,9 @@ impl Check {
 /// GGUF arm uploads the pinned file's tensors; tiered and host-offload
 /// modes deliberately do not) — so the weight term is an upper-bound
 /// planning figure, labeled as file bytes wherever rendered. Workspace, activations, and driver overhead are **not**
-/// in it; the budget comparison keeps the `MemoryPolicy` reserve for
-/// them, and load-time admission remains the authority.
+/// in `total_bytes`; on the CUDA path they enter through the runtime
+/// admission charges ([`Estimate::admission_charges_bytes`], modeled on the
+/// load-time ledger), and load-time admission remains the authority.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Estimate {
     pub weight_bytes: u64,
@@ -136,11 +137,31 @@ pub struct Estimate {
     /// (for example "free VRAM of device 0, measured now").
     pub budget_kind: String,
     pub budget_free_bytes: Option<u64>,
-    /// The `MemoryPolicy` share of the free bytes: the admission ceiling.
+    /// The admission ceiling the demand was compared against: the measured
+    /// free bytes on the CUDA path (the margin is inside the demand), the
+    /// `MemoryPolicy` share of them on the MLX path.
     pub budget_limit_bytes: Option<u64>,
+    /// Whether `budget_limit_bytes` is the `MemoryPolicy` share of the free
+    /// bytes (MLX) rather than the free bytes themselves (CUDA).
+    pub budget_limit_is_policy_share: bool,
     /// The largest context whose estimate fits the budget, when that is
     /// smaller than the requested one. A proposal, never applied.
     pub largest_fitting_context: Option<u32>,
+    /// The runtime admission demand charged after the weights on the CUDA
+    /// path: cache, fixed state, prefix device tip, staged KV8 rows, part
+    /// charge, spare minimum, admission margin, and the measured runtime
+    /// overhead floor. Zero on the MLX path, which the runtime budgets by
+    /// the memory policy share instead.
+    pub admission_charges_bytes: u64,
+    /// The named terms behind `admission_charges_bytes`, for the rendered
+    /// breakdown. Empty when the estimate has no charge model.
+    pub admission_charge_terms: Vec<(String, u64)>,
+    /// The estimate's own fit call against the measured budget.
+    pub fit: ResourceFit,
+    /// `true` when `fit` is `Unknown` because the demand lands inside the
+    /// measurement band around the budget boundary (±`ADMISSION_UNCERTAINTY_BAND_BYTES`):
+    /// load-time admission decides, not the estimate.
+    pub borderline: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -568,24 +589,41 @@ fn q36_preflight(
             return finish(checks, None, qualification);
         }
     };
-    match (estimate.budget_limit_bytes, estimate.largest_fitting_context) {
-        (Some(limit), _) if estimate.total_bytes <= limit => checks.push(Check::new(
+    let demand = estimate
+        .weight_bytes
+        .saturating_add(estimate.admission_charges_bytes);
+    match (estimate.fit, estimate.borderline) {
+        (ResourceFit::Fits, _) => checks.push(Check::new(
             "memory estimate",
             CheckStatus::Pass,
             format!(
-                "estimated {} bytes fit the {}-byte admission budget ({})",
-                estimate.total_bytes, limit, estimate.budget_kind
+                "estimated demand {} bytes (weights {} + runtime admission charges {}) fits the {} budget",
+                demand,
+                estimate.weight_bytes,
+                estimate.admission_charges_bytes,
+                estimate.budget_kind
             ),
         )),
-        (Some(limit), _) => checks.push(Check::new(
+        (ResourceFit::DoesNotFit, _) => checks.push(Check::new(
             "memory estimate",
             CheckStatus::Fail,
             format!(
-                "estimated {} bytes exceed the {}-byte admission budget ({}); workspace is not included and load-time admission is authoritative",
-                estimate.total_bytes, limit, estimate.budget_kind
+                "estimated demand {} bytes (weights {} + runtime admission charges {}) exceed the {} budget; load-time admission is authoritative",
+                demand,
+                estimate.weight_bytes,
+                estimate.admission_charges_bytes,
+                estimate.budget_kind
             ),
         )),
-        (None, _) => checks.push(Check::new(
+        (ResourceFit::Unknown, true) => checks.push(Check::new(
+            "memory estimate",
+            CheckStatus::Warn,
+            format!(
+                "estimated demand {} bytes lands inside the measurement band around the {} budget; load-time admission decides",
+                demand, estimate.budget_kind
+            ),
+        )),
+        (ResourceFit::Unknown, false) => checks.push(Check::new(
             "memory estimate",
             CheckStatus::Warn,
             format!(
@@ -670,11 +708,7 @@ fn q36_dimensions(
         .iter()
         .any(|c| c.status == CheckStatus::Fail && c.name != "memory estimate");
     let resource_fit = match estimate {
-        Some(estimate) => match estimate.budget_limit_bytes {
-            Some(limit) if estimate.total_bytes <= limit => ResourceFit::Fits,
-            Some(_) => ResourceFit::DoesNotFit,
-            None => ResourceFit::Unknown,
-        },
+        Some(estimate) => estimate.fit,
         None => ResourceFit::Unknown,
     };
     Dimensions {
@@ -694,8 +728,7 @@ fn q36_verdict(
     qualification: Qualification,
 ) -> (Verdict, String) {
     if let Some(estimate) = estimate
-        && let Some(limit) = estimate.budget_limit_bytes
-        && estimate.total_bytes > limit
+        && estimate.fit == ResourceFit::DoesNotFit
     {
         let next = match estimate.largest_fitting_context {
             Some(fitting) if fitting >= 2 => format!(
@@ -710,6 +743,14 @@ fn q36_verdict(
         return (
             Verdict::Unsupported,
             "Fix the failed checks above; preflight ran the same validators the loader runs, so it would refuse the same way.".to_string(),
+        );
+    }
+    if let Some(estimate) = estimate
+        && estimate.borderline
+    {
+        return (
+            Verdict::ReadyWithAdjustments,
+            "The estimate lands inside the measurement band around the budget, so load-time admission decides: try serving, or pick a smaller context for certainty.".to_string(),
         );
     }
     if qualification == Qualification::Experimental {
@@ -738,7 +779,10 @@ fn estimate_q36(
     backend: crate::family::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
-    use crate::family::qwen36::settings::{Backend, cache_growth_per_position, delta_state_bytes};
+    use crate::family::qwen36::admission_sketch as sketch;
+    use crate::family::qwen36::settings::{
+        Backend, KvDtype, cache_growth_per_position, delta_state_bytes,
+    };
 
     let per_position = cache_growth_per_position(spec, settings.kv, settings.activation)?;
     let kv_bytes = per_position
@@ -755,28 +799,109 @@ fn estimate_q36(
             crate::EngError::MemoryPlan("preflight total estimate overflows u64".to_string())
         })?;
 
-    let (budget_kind, free) = match backend {
+    let (budget_kind, free, limit_is_policy_share) = match backend {
         Backend::Cuda => (
-            "free VRAM of device 0, measured now".to_string(),
+            "free VRAM of device 0, measured now, minus the runtime admission charges below (estimate; load-time admission is authoritative)".to_string(),
             facts.cuda.first_device_free_bytes.clone(),
+            false,
         ),
         Backend::Mlx => (
             "available unified memory, measured now".to_string(),
             facts.host.mem_available_bytes.clone(),
+            true,
         ),
     };
     let policy = MemoryPolicy::default_share();
-    let (free_bytes, limit_bytes) = match &free {
-        Probe::Measured(free) => (Some(*free), Some(policy.limit(*free))),
-        Probe::Unavailable(_) => (None, None),
-    };
-    let largest_fitting = match limit_bytes {
-        Some(limit) if total > limit && per_position > 0 => {
-            let for_kv = limit.saturating_sub(weights.saturating_add(state_bytes));
-            let positions = for_kv / per_position;
-            Some(u32::try_from(positions).unwrap_or(u32::MAX))
+
+    // Staged KV8 rows and the device-tip prefix copy are the two runtime
+    // charges the closed-form figures above do not carry; only the Q8 cache
+    // dequants into a staging cache (F32 and Bf16 are read natively).
+    let staging_at = |context: u32| -> Result<u64, crate::EngError> {
+        if settings.kv != KvDtype::Q8 {
+            return Ok(0);
         }
-        _ => None,
+        let rows = sketch::fixed_staging_rows(usize::try_from(context).unwrap_or(usize::MAX));
+        u64::try_from(sketch::kv8_staging_bytes(
+            rows,
+            spec.heads_kv as usize,
+            spec.head_dim as usize,
+        )?)
+        .map_err(|_| crate::EngError::MemoryPlan("staging bytes exceed u64".to_string()))
+    };
+    let cuda_demand_at = |context: u32| -> Result<sketch::AdmissionSketch, crate::EngError> {
+        let kv = per_position
+            .checked_mul(u64::from(context))
+            .ok_or_else(|| {
+                crate::EngError::MemoryPlan("preflight KV estimate overflows u64".to_string())
+            })?;
+        Ok(sketch::admission_demand(
+            kv,
+            state_bytes,
+            state_bytes,
+            staging_at(context)?,
+        ))
+    };
+
+    let (free_bytes, limit_bytes, charges, charge_terms, fit, borderline) = match (&free, backend) {
+        (Probe::Measured(free), Backend::Cuda) => {
+            let demand = cuda_demand_at(settings.context_limit)?;
+            let charges = demand.total_after_weights()?;
+            let slack = i128::from(*free) - i128::from(weights) - i128::from(charges);
+            let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+            let (fit, borderline) = if slack >= band {
+                (ResourceFit::Fits, false)
+            } else if slack >= -band {
+                (ResourceFit::Unknown, true)
+            } else {
+                (ResourceFit::DoesNotFit, false)
+            };
+            (
+                Some(*free),
+                Some(*free),
+                charges,
+                vec![
+                    ("staged kv8 rows".to_string(), demand.staging_bytes),
+                    ("part charge".to_string(), demand.part_charge_bytes),
+                    ("spare minimum".to_string(), demand.spare_min_bytes),
+                    ("admission margin".to_string(), demand.margin_bytes),
+                    (
+                        "runtime overhead floor".to_string(),
+                        demand.overhead_floor_bytes,
+                    ),
+                ],
+                fit,
+                borderline,
+            )
+        }
+        (Probe::Measured(free), Backend::Mlx) => {
+            let limit = policy.limit(*free);
+            let fit = if total <= limit {
+                ResourceFit::Fits
+            } else {
+                ResourceFit::DoesNotFit
+            };
+            (Some(*free), Some(limit), 0, Vec::new(), fit, false)
+        }
+        (Probe::Unavailable(_), _) => (None, None, 0, Vec::new(), ResourceFit::Unknown, false),
+    };
+
+    // A proposal only when the requested context is not a confident fit; the
+    // search charges the same paper demand the runtime ledger charges, band
+    // included. Not even a minimal context fitting yields None, and the
+    // verdict then says so in its own words.
+    let proposal_needed = per_position > 0 && (fit == ResourceFit::DoesNotFit || borderline);
+    let largest_fitting = if !proposal_needed {
+        None
+    } else if backend == Backend::Cuda {
+        free_bytes.and_then(|free| {
+            largest_fitting_cuda(free, weights, &cuda_demand_at, settings.context_limit)
+        })
+    } else {
+        let for_kv = limit_bytes
+            .unwrap_or(0)
+            .saturating_sub(weights.saturating_add(state_bytes));
+        let positions = for_kv / per_position;
+        (positions >= 2).then_some(u32::try_from(positions).unwrap_or(u32::MAX))
     };
     Ok(Estimate {
         weight_bytes: weights,
@@ -791,8 +916,60 @@ fn estimate_q36(
         },
         budget_free_bytes: free_bytes,
         budget_limit_bytes: limit_bytes,
+        budget_limit_is_policy_share: limit_is_policy_share,
         largest_fitting_context: largest_fitting,
+        admission_charges_bytes: charges,
+        admission_charge_terms: charge_terms,
+        fit,
+        borderline,
     })
+}
+
+/// The largest context (a multiple of 1024, capped at the requested context)
+/// whose paper demand leaves at least the uncertainty band of slack against
+/// the measured budget. `None` when not even a minimal context fits — the
+/// honest answer the old division rule could not give (it proposed 0).
+fn largest_fitting_cuda(
+    free: u64,
+    weights: u64,
+    cuda_demand_at: &dyn Fn(
+        u32,
+    ) -> Result<
+        crate::family::qwen36::admission_sketch::AdmissionSketch,
+        crate::EngError,
+    >,
+    requested: u32,
+) -> Option<u32> {
+    use crate::family::qwen36::admission_sketch as sketch;
+    let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let fits = |context: u32| -> bool {
+        let Ok(demand) = cuda_demand_at(context) else {
+            return false;
+        };
+        let Ok(charges) = demand.total_after_weights() else {
+            return false;
+        };
+        i128::from(free) - i128::from(weights) - i128::from(charges) >= band
+    };
+    const MIN_CONTEXT: u32 = 1024;
+    const STEP: u32 = 1024;
+    if requested <= MIN_CONTEXT || !fits(MIN_CONTEXT) {
+        return None;
+    }
+    let mut low = MIN_CONTEXT;
+    let mut high = requested;
+    while high - low > STEP {
+        let mid = low + (high - low) / 2 / STEP * STEP;
+        if mid <= low {
+            break;
+        }
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some(low)
 }
 
 #[cfg(test)]
@@ -803,6 +980,11 @@ mod tests {
     };
 
     fn estimate(total: u64, limit: Option<u64>, fitting: Option<u32>) -> Estimate {
+        let fit = match limit {
+            Some(limit) if total <= limit => ResourceFit::Fits,
+            Some(_) => ResourceFit::DoesNotFit,
+            None => ResourceFit::Unknown,
+        };
         Estimate {
             weight_bytes: 100,
             kv_bytes_per_position: 10,
@@ -813,7 +995,12 @@ mod tests {
             budget_kind: "test budget".into(),
             budget_free_bytes: limit,
             budget_limit_bytes: limit,
+            budget_limit_is_policy_share: true,
             largest_fitting_context: fitting,
+            admission_charges_bytes: 0,
+            admission_charge_terms: Vec::new(),
+            fit,
+            borderline: false,
         }
     }
 
@@ -1014,9 +1201,122 @@ mod tests {
             est.total_bytes,
             20_000_000_000 + 40_960 * 32_768 + 65_863_680
         );
-        // 24 GiB free at the 850 permille policy share admits this plan.
-        assert!(est.total_bytes <= est.budget_limit_bytes.expect("limit"));
+        // 24 GiB free against the full runtime charge model is a confident
+        // fit for the 32K F32 default — the case the 850-permille share rule
+        // used to refuse even though load-time admission serves it.
+        assert_eq!(est.fit, ResourceFit::Fits);
+        assert!(!est.borderline);
         assert_eq!(est.largest_fitting_context, None);
+    }
+
+    #[test]
+    fn the_estimate_matches_the_gpu_qualification_receipts() {
+        use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
+        use std::path::Path;
+
+        // The 2026-11-03 qualification host: a display-attached RTX 3090,
+        // probe free 22.35 GiB, the pinned 19.02 GiB Q4_K_M checkpoint.
+        let free = 23_997_186_988u64;
+        let weights = 20_419_565_568u64;
+        let facts = cuda_facts(free);
+        let at = |context: u32, kv: &str| {
+            let options: Q36Options = serde_json::from_value(serde_json::json!({
+                "context_limit": context,
+                "kv_dtype": kv,
+            }))
+            .expect("options");
+            let settings = Q36Settings::new(
+                Path::new("m"),
+                Path::new("t"),
+                Some(&options),
+                &Q36Env::default(),
+                Backend::Cuda,
+            )
+            .expect("settings");
+            super::estimate_q36(&settings.spec, &settings, weights, Backend::Cuda, &facts)
+                .expect("estimate")
+        };
+
+        // The 32K F32 default is servable: the old rule called it
+        // resource-constrained; the runtime ledger admits it.
+        let est = at(32_768, "f32");
+        assert_eq!(est.fit, ResourceFit::Fits);
+        assert!(!est.borderline);
+        assert_eq!(est.largest_fitting_context, None);
+
+        // The shipped 262K Q8 profile on this host: the runtime refused with
+        // a 223 MiB shortfall and the estimate must agree, with a real
+        // proposal (never the old 0) inside the model's context bound.
+        let est = at(262_144, "q8");
+        assert_eq!(est.fit, ResourceFit::DoesNotFit);
+        assert!(!est.borderline);
+        let fitting = est.largest_fitting_context.expect("a proposal");
+        assert!(fitting >= 131_072, "{fitting}");
+        assert!(fitting < 262_144, "{fitting}");
+        assert_eq!(fitting % 1024, 0);
+        // The proposal must itself be a confident fit under the same rule.
+        let proposed = at(fitting, "q8");
+        assert_eq!(proposed.fit, ResourceFit::Fits);
+
+        // An oversized 1M F32 request: refused, but with a usable proposal
+        // instead of the degenerate 0 the old division rule produced.
+        let est = at(1_048_576, "f32");
+        assert_eq!(est.fit, ResourceFit::DoesNotFit);
+        let fitting = est.largest_fitting_context.expect("a proposal");
+        assert!(fitting >= 60_000, "{fitting}");
+
+        // A free figure landing the 262K Q8 demand inside the measurement
+        // band is borderline, not a claim either way.
+        let demand_262k_q8 = 3_855_868_032u64;
+        let facts = cuda_facts(weights + demand_262k_q8 - (64 << 20));
+        let options: Q36Options = serde_json::from_value(serde_json::json!({
+            "context_limit": 262_144,
+            "kv_dtype": "q8",
+        }))
+        .expect("options");
+        let settings = Q36Settings::new(
+            Path::new("m"),
+            Path::new("t"),
+            Some(&options),
+            &Q36Env::default(),
+            Backend::Cuda,
+        )
+        .expect("settings");
+        let est = super::estimate_q36(&settings.spec, &settings, weights, Backend::Cuda, &facts)
+            .expect("estimate");
+        assert_eq!(est.fit, ResourceFit::Unknown);
+        assert!(est.borderline);
+        let (verdict, next) = q36_verdict(&[], Some(&est), Qualification::Qualified);
+        assert_eq!(verdict, Verdict::ReadyWithAdjustments);
+        assert!(next.contains("measurement band"), "{next}");
+    }
+
+    #[test]
+    fn largest_fitting_search_is_none_when_nothing_fits() {
+        use crate::family::qwen36::admission_sketch;
+        // A paper demand proportional to context, as the real one is.
+        let demand = |context: u32| {
+            Ok(admission_sketch::admission_demand(
+                u64::from(context) * 1024,
+                0,
+                0,
+                0,
+            ))
+        };
+        // Beyond the fixed charges, free leaves the band plus 10 MiB of KV
+        // (10,240 positions at 1024 B each): the search proposes the largest
+        // multiple of 1024 whose slack still clears the band.
+        let free = admission_sketch::RUNTIME_OVERHEAD_FLOOR_BYTES
+            + admission_sketch::FIXED_ADMISSION_MARGIN_BYTES as u64
+            + admission_sketch::PREFILL_SPARE_MIN_BYTES as u64
+            + admission_sketch::PREFILL_PART_CHARGE_BYTES as u64
+            + admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES
+            + 10 * 1024 * 1024;
+        let got = super::largest_fitting_cuda(free, 0, &demand, 1_048_576);
+        assert!(got.is_some_and(|c| c % 1024 == 0 && (9_000..=10_240).contains(&c)));
+        // Weights alone beyond the budget: not even a minimal context fits.
+        let got = super::largest_fitting_cuda(free, free + 1, &demand, 1_048_576);
+        assert_eq!(got, None);
     }
 
     #[test]

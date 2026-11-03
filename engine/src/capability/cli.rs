@@ -492,18 +492,51 @@ pub fn render_preflight(report: &PreflightReport) -> String {
             super::mib(estimate.fixed_state_bytes),
             gib(estimate.total_bytes),
         ));
+        if !estimate.admission_charge_terms.is_empty() {
+            let terms: Vec<String> = estimate
+                .admission_charge_terms
+                .iter()
+                .map(|(name, bytes)| format!("{name} {}", super::mib(*bytes)))
+                .collect();
+            out.push_str(&format!(
+                "runtime admission charges (estimate): {} total = {}\n",
+                super::mib(estimate.admission_charges_bytes),
+                terms.join(" + ")
+            ));
+        }
         if let (Some(free), Some(limit)) = (estimate.budget_free_bytes, estimate.budget_limit_bytes)
         {
+            let share = if estimate.budget_limit_is_policy_share {
+                format!(
+                    " ({} permille policy share)",
+                    crate::memory::MemoryPolicy::default_share().share_permille()
+                )
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "budget: {} = {} free, admission limit {} ({} permille policy share)\n",
+                "budget: {} = {} free, admission ceiling {}{}\n",
                 estimate.budget_kind,
                 gib(free),
                 gib(limit),
-                crate::memory::MemoryPolicy::default_share().share_permille(),
+                share,
             ));
         } else {
             out.push_str(&format!("budget: {}\n", estimate.budget_kind));
         }
+        let fit_line = match (estimate.fit, estimate.borderline) {
+            (super::preflight::ResourceFit::Fits, _) => "estimated fit: fits the measured budget\n",
+            (super::preflight::ResourceFit::DoesNotFit, _) => {
+                "estimated fit: exceeds the measured budget\n"
+            }
+            (super::preflight::ResourceFit::Unknown, true) => {
+                "estimated fit: borderline (inside the measurement band); load-time admission decides\n"
+            }
+            (super::preflight::ResourceFit::Unknown, false) => {
+                "estimated fit: unverified (no budget probed)\n"
+            }
+        };
+        out.push_str(fit_line);
         if let Some(fitting) = estimate.largest_fitting_context {
             out.push_str(&format!(
                 "largest fitting context (proposal only): {fitting}\n"

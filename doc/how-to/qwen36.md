@@ -74,7 +74,7 @@ You need Linux with an NVIDIA driver, and:
    | --- | ---: | --- |
    | `qwen36-cuda-3090-kv8-prefix.json` | 180,224 | Default. Other programs use up to 1.5 GiB of GPU memory. |
    | `qwen36-cuda-3090-kv8-prefix-131k.json` | 131,072 | You want the fastest first reply on long prompts. |
-   | `qwen36-cuda-3090-kv8-prefix-262k.json` | 262,144 | You need the longest context and other programs use under 744 MiB of GPU memory. |
+   | `qwen36-cuda-3090-kv8-prefix-262k.json` | 262,144 | You need the longest context **and** other programs use under 744 MiB of GPU memory — a headless card; a desktop session alone is usually more, so use the 180,224 default there. |
    | `qwen36-rtx3090-24gb-fp16kv.json` | 98,304 | You want a 16-bit KV cache. |
 
    Check current GPU use with `nvidia-smi`. A desktop session alone often uses several hundred MiB.
