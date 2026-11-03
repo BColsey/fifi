@@ -43,8 +43,20 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         Some("serve") => &args[1..],
         _ => args,
     };
-    let path = config_path(args)?;
-    let config = Config::from_file(&path)?;
+    // The simplified startup is a front end to the same path: it builds
+    // a normal in-memory `Config` and everything downstream (key check,
+    // listen validation, engine start, serving) is the `--config` path.
+    let config = if args.first().map(String::as_str) == Some("--model") {
+        let parsed = crate::server::model_serve::parse_args(args)?;
+        let config = crate::server::model_serve::build_config(&parsed)?;
+        if parsed.print_config {
+            println!("{}", crate::server::model_serve::config_json(&config));
+            return Ok(());
+        }
+        config
+    } else {
+        Config::from_file(&config_path(args)?)?
+    };
     let key = config.api_key(|name| std::env::var(name).ok())?;
     let address = config.listen_address()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()

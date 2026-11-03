@@ -257,7 +257,10 @@ impl Config {
 pub(crate) fn config_path(args: &[String]) -> Result<PathBuf, StartupError> {
     match args {
         [flag, path] if flag == "--config" => Ok(PathBuf::from(path)),
-        _ => Err(StartupError("usage: enginesrv --config <path>".to_string())),
+        _ => Err(StartupError(
+            "usage: enginesrv --config <path> (or the simplified enginesrv serve --model <dir>)"
+                .to_string(),
+        )),
     }
 }
 

@@ -17,6 +17,11 @@ use super::{
 pub const USAGE: &str = "\
 usage:
   enginesrv --config <path>            serve (same as `serve --config <path>`)
+  enginesrv serve --model <dir>        simplified startup: discover the model,
+                    preflight it, and serve the qualified defaults
+                    ([--tokenizer-dir <dir>] [--family <name>]
+                    [--context <tokens>] [--kv <f32|bf16|q8>] [--listen <addr>]
+                    [--print-config])
   enginesrv doctor [--config <path>] [--json]
   enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--json]

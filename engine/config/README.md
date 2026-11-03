@@ -3,6 +3,10 @@
 Ready-made `enginesrv` configuration files for Qwen3.6-35B-A3B.
 Set `model_dir` and `tokenizer_dir` before use. All files read the API key from `ENGINESRV_API_KEY`.
 
+No config file is needed for the qualified defaults: `enginesrv serve --model <dir>` discovers the
+model, preflights it, and serves the family defaults (`--print-config` prints the equivalent
+configuration file).
+
 | File | Hardware | Context | KV cache | Port |
 | --- | --- | ---: | --- | ---: |
 | `qwen36-mac-studio-36gb.json` | Mac with Apple Silicon, 36 GB | 262,144 | 8-bit | 18791 |
