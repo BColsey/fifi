@@ -143,7 +143,7 @@ fn launch(
     let vocab = bundle.vocab_size() as usize;
     let root = model_dir.to_owned();
     let template_sha = pinned_template_sha();
-    let engine = spawn_engine_noted(1, ready_note, move || {
+    let engine = spawn_engine_noted(1, ready_note, move |_| {
         super::mlx_executor::FlintExecutor::open(&root, eos, vocab, template_sha)
     })?;
     Ok(StartedEngine {
@@ -184,7 +184,7 @@ fn launch(
     let vocab = bundle.vocab_size() as usize;
     let root = model_dir.to_owned();
     let template_sha = pinned_template_sha();
-    let engine = spawn_engine_noted(1, ready_note, move || {
+    let engine = spawn_engine_noted(1, ready_note, move |_| {
         super::cuda_executor::FlintExecutor::open(&root, &options, eos, vocab, template_sha)
     })?;
     Ok(StartedEngine {

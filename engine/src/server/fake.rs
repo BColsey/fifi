@@ -156,7 +156,8 @@ pub(crate) fn start(config: &EngineConfig, ready_note: ReadyNote) -> Result<Fake
         eos: bundle.eos_token_id(),
         delay: Duration::from_millis(options.token_delay_ms),
     };
-    let engine = spawn_engine_noted(512, ready_note, move || {
+    let engine = spawn_engine_noted(512, ready_note, move |stages| {
+        stages.begin("building the reply executor");
         Ok((executor, ReplySession::default()))
     })?;
     Ok(FakeEngine {

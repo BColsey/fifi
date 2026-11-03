@@ -136,6 +136,11 @@ struct Shared {
     state: AtomicU8,
     /// The first recorded cause of `Error` or `NativeFailed`, for `/ready` and the logs.
     failure: Mutex<Option<EngineFailure>>,
+    /// The loading stage the engine thread last announced, or `None`
+    /// once it has settled (ready or failed). Stages are names of the
+    /// phases the family's own start code actually performs — no
+    /// percentages, no invented sequence.
+    load_stage: Mutex<Option<&'static str>>,
     /// Set by `shutdown`. The worker cancels every job that it has not finished.
     stop: AtomicBool,
     /// The cancel flag of the running job, so `shutdown` can cancel it.
@@ -154,6 +159,7 @@ impl Shared {
         Shared {
             state: AtomicU8::new(EngineState::Loading as u8),
             failure: Mutex::new(None),
+            load_stage: Mutex::new(None),
             stop: AtomicBool::new(false),
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
@@ -174,6 +180,12 @@ impl Shared {
         if slot.is_none() {
             *slot = Some(cause);
         }
+    }
+
+    /// The stage is part of the settled record, so it leaves with the
+    /// state change: ready and failed engines report no loading stage.
+    fn clear_load_stage(&self) {
+        *lock(&self.load_stage) = None;
     }
 
     /// The cause text, exactly as the logs and shutdown reports have
@@ -216,6 +228,15 @@ pub(crate) struct EngineHandle {
 impl EngineHandle {
     pub(crate) fn state(&self) -> EngineState {
         self.shared.state()
+    }
+
+    /// The phase the engine's start code last announced, present only
+    /// while the engine is still loading.
+    pub(crate) fn load_stage(&self) -> Option<&'static str> {
+        if self.state() != EngineState::Loading {
+            return None;
+        }
+        *lock(&self.shared.load_stage)
     }
 
     pub(crate) fn failure(&self) -> Option<String> {
@@ -336,6 +357,24 @@ pub(crate) enum EngineNote {
 /// `record_failure` stores when `make` fails. `None` fires nothing.
 pub(crate) type ReadyNote = Option<Box<dyn FnOnce(EngineNote) + Send>>;
 
+/// The handle an engine's start closure uses to announce which of its
+/// own phases it is entering. Each announcement stores the stage for
+/// `/v1/models` (`load_stage`, present only while loading); nothing is
+/// printed here — presentation is the caller's poll (the CLI renders
+/// stage lines on stderr). A family that has no phase boundaries worth
+/// reporting simply never calls [`Stages::begin`].
+pub(crate) struct Stages<'a> {
+    shared: &'a Shared,
+}
+
+impl Stages<'_> {
+    /// Announces the phase the start code is entering now. Cheap by
+    /// construction: a mutex write per phase, a handful per engine.
+    pub(crate) fn begin(&self, stage: &'static str) {
+        *lock(&self.shared.load_stage) = Some(stage);
+    }
+}
+
 /// Starts the engine thread without a ready note; test callers only, so a
 /// new family cannot silently skip the note - production callers use
 /// [`spawn_engine_noted`]. `make` runs on that thread and builds the
@@ -348,7 +387,7 @@ pub(crate) type ReadyNote = Option<Box<dyn FnOnce(EngineNote) + Send>>;
 pub(crate) fn spawn_engine<E, F>(prefill_chunk: usize, make: F) -> Result<Engine, EngError>
 where
     E: ExecutorOps + 'static,
-    F: FnOnce() -> Result<(E, E::Session), EngError> + Send + 'static,
+    F: FnOnce(&Stages<'_>) -> Result<(E, E::Session), EngError> + Send + 'static,
 {
     spawn_engine_noted(prefill_chunk, None, make)
 }
@@ -365,7 +404,7 @@ pub(crate) fn spawn_engine_noted<E, F>(
 ) -> Result<Engine, EngError>
 where
     E: ExecutorOps + 'static,
-    F: FnOnce() -> Result<(E, E::Session), EngError> + Send + 'static,
+    F: FnOnce(&Stages<'_>) -> Result<(E, E::Session), EngError> + Send + 'static,
 {
     if prefill_chunk == 0 {
         return Err(EngError::BadRequest(
@@ -437,7 +476,7 @@ fn run<E, F>(
     prefill_chunk: usize,
 ) where
     E: ExecutorOps,
-    F: FnOnce() -> Result<(E, E::Session), EngError>,
+    F: FnOnce(&Stages<'_>) -> Result<(E, E::Session), EngError>,
 {
     let mut current: Option<mpsc::Sender<JobEvent>> = None;
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -455,6 +494,7 @@ fn run<E, F>(
             format!("engine thread panicked: {message}"),
         ));
         shared.set_state(next);
+        shared.clear_load_stage();
         if let Some(events) = current.take() {
             send_terminal(
                 &events,
@@ -484,9 +524,10 @@ fn work<E, F>(
     current: &mut Option<mpsc::Sender<JobEvent>>,
 ) where
     E: ExecutorOps,
-    F: FnOnce() -> Result<(E, E::Session), EngError>,
+    F: FnOnce(&Stages<'_>) -> Result<(E, E::Session), EngError>,
 {
-    let (mut executor, mut session) = match make() {
+    let stages = Stages { shared };
+    let (mut executor, mut session) = match make(&stages) {
         Ok(pair) => pair,
         Err(error) => {
             let cause = format!("engine load failed: {}", error.describe());
@@ -495,6 +536,7 @@ fn work<E, F>(
             }
             shared.record_failure(EngineFailure::from_error(&error, "load", cause));
             shared.set_state(EngineState::Error);
+            shared.clear_load_stage();
             drain(jobs, reject);
             return;
         }
@@ -507,10 +549,12 @@ fn work<E, F>(
         }
         shared.record_failure(EngineFailure::internal("load", cause));
         shared.set_state(EngineState::Error);
+        shared.clear_load_stage();
         drain(jobs, reject);
         return;
     }
     shared.set_state(EngineState::Ready);
+    shared.clear_load_stage();
     // The engine reports its own prefix capability to the one-shot note: the
     // built executor's store and spacing are the single source, so every
     // family reports correctly without a factory flag.
@@ -1359,7 +1403,7 @@ mod tests {
     }
 
     fn start_spy(chunk: usize, spy: Spy) -> super::Engine {
-        spawn_engine(chunk, move || {
+        spawn_engine(chunk, move |_| {
             Ok((spy, <FakeExecutor as ExecutorOps>::Session::default()))
         })
         .expect("spawn engine")
@@ -1372,6 +1416,64 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::yield_now();
         }
+    }
+
+    /// Stages are reported in the order the start code announces them,
+    /// are visible while the engine is loading, and leave with the
+    /// settle: a ready engine has no stage. Two gates make the sequence
+    /// deterministic — the engine cannot leave a phase until the test
+    /// releases it.
+    #[test]
+    fn load_stages_report_in_order_and_clear_on_ready() {
+        let (release_one, hold_one) = mpsc::channel::<()>();
+        let (release_two, hold_two) = mpsc::channel::<()>();
+        let engine = spawn_engine::<FakeExecutor, _>(8, move |stages| {
+            stages.begin("phase one");
+            let _ = hold_one.recv();
+            stages.begin("phase two");
+            let _ = hold_two.recv();
+            Ok((
+                FakeExecutor::new(vec![], &[EOS], 100_000),
+                <FakeExecutor as ExecutorOps>::Session::default(),
+            ))
+        })
+        .expect("spawn engine");
+        let handle = engine.handle();
+        wait_until("phase one to appear", || {
+            handle.load_stage() == Some("phase one")
+        });
+        release_one.send(()).expect("release one");
+        wait_until("phase two to appear", || {
+            handle.load_stage() == Some("phase two")
+        });
+        release_two.send(()).expect("release two");
+        wait_until("the engine to become ready", || {
+            handle.state() == super::EngineState::Ready
+        });
+        assert_eq!(handle.load_stage(), None, "a ready engine reports no stage");
+    }
+
+    /// A load that announced a stage and then failed leaves the stage
+    /// behind with the state change: the error surface keeps its own
+    /// failure stage (`load`), never the loading stage.
+    #[test]
+    fn a_failed_load_clears_its_loading_stage() {
+        let engine = spawn_engine::<FakeExecutor, _>(8, |stages| {
+            stages.begin("loading weights");
+            Err(EngError::Checkpoint("no weights".to_string()))
+        })
+        .expect("spawn engine");
+        let handle = engine.handle();
+        wait_until("the engine to fail", || {
+            handle.state() == super::EngineState::Error
+        });
+        assert_eq!(
+            handle.load_stage(),
+            None,
+            "a failed engine reports no stage"
+        );
+        let failure = handle.failure_info().expect("the failure is recorded");
+        assert_eq!(failure.stage, "load");
     }
 
     fn unavailable_event() -> JobEvent {
@@ -1963,7 +2065,7 @@ mod tests {
     #[test]
     fn a_failed_load_keeps_its_cause_and_fails_queued_and_later_jobs_as_backend() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let engine = spawn_engine::<Spy, _>(8, move || {
+        let engine = spawn_engine::<Spy, _>(8, move |_| {
             let _ = release_rx.recv();
             Err(EngError::Checkpoint("no weights".to_string()))
         })
@@ -1989,7 +2091,7 @@ mod tests {
     #[test]
     fn a_panic_in_make_sets_the_error_state_and_fails_the_queued_job() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let engine = spawn_engine::<Spy, _>(8, move || {
+        let engine = spawn_engine::<Spy, _>(8, move |_| {
             let _ = release_rx.recv();
             panic!("make exploded");
         })
@@ -2057,8 +2159,8 @@ mod tests {
                 panic!("payload dropped");
             }
         }
-        let engine =
-            spawn_engine::<Spy, _>(8, || std::panic::panic_any(PanicOnDrop)).expect("spawn engine");
+        let engine = spawn_engine::<Spy, _>(8, |_| std::panic::panic_any(PanicOnDrop))
+            .expect("spawn engine");
         let handle = engine.handle();
         wait_until("the load to end", || handle.state() != EngineState::Loading);
         drop(handle);
@@ -2392,7 +2494,7 @@ mod tests {
         let log = new_log();
         let spy = Spy::new(vec![vec![EOS]; 5], &log);
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let engine = spawn_engine(8, move || {
+        let engine = spawn_engine(8, move |_| {
             let _ = release_rx.recv();
             Ok((spy, <FakeExecutor as ExecutorOps>::Session::default()))
         })
@@ -3423,7 +3525,7 @@ mod tests {
         let note: super::ReadyNote = Some(Box::new(move |note| {
             let _ = tx.send(note);
         }));
-        let engine = super::spawn_engine_noted(2, note, move || {
+        let engine = super::spawn_engine_noted(2, note, move |_| {
             Ok((spy, <FakeExecutor as ExecutorOps>::Session::default()))
         })
         .expect("spawn engine");
@@ -3460,7 +3562,7 @@ mod tests {
     fn a_prefill_chunk_of_zero_is_refused() {
         let log = new_log();
         let spy = Spy::new(vec![], &log);
-        let error = spawn_engine(0, move || {
+        let error = spawn_engine(0, move |_| {
             Ok((spy, <FakeExecutor as ExecutorOps>::Session::default()))
         })
         .err()

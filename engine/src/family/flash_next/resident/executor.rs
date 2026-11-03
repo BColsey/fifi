@@ -1841,7 +1841,7 @@ mod tests {
             |prompt: &[u32]| oracle_with(table, prompt, COUNT, &mut seeded_sampler(), VOCAB);
         let (want_a, want_b, want_e) = (chain(&prompt_a), chain(&prompt_b), chain(&prompt_e));
         // The prefill chunk of 3 splits the 4 key tokens into two pieces.
-        let engine = spawn_engine(3, move || Ok(build_with(table, rules(vec![], VOCAB)))).unwrap();
+        let engine = spawn_engine(3, move |_| Ok(build_with(table, rules(vec![], VOCAB)))).unwrap();
         // Each round: the prompt, the boundary of the job, the expected tokens, and the expected
         // reused count.
         let rounds = [
@@ -2109,7 +2109,7 @@ mod tests {
         let want_b = oracle(&prompt_b, COUNT, &mut seeded_sampler(), VOCAB);
         let log = std::sync::Arc::new(std::sync::Mutex::new(ChunkLog::default()));
         let thread_log = std::sync::Arc::clone(&log);
-        let engine = spawn_engine(worker_chunk, move || {
+        let engine = spawn_engine(worker_chunk, move |_| {
             let (mut executor, session) = build(rules(vec![], VOCAB));
             executor.log = thread_log;
             if let Some(rows) = planned {

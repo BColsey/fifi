@@ -764,10 +764,12 @@ pub(crate) fn start(
     let guard = BuildGuard::acquire()?;
     let owned = settings.clone();
     let engine = if owned.cuda_devices == [0] {
-        spawn_engine_noted(piece, ready_note, move || make(owned, rules, plan, guard))?
+        spawn_engine_noted(piece, ready_note, move |stages| {
+            make(stages, owned, rules, plan, guard)
+        })?
     } else {
-        spawn_engine_noted(piece, ready_note, move || {
-            make_multi(owned, rules, plan, guard)
+        spawn_engine_noted(piece, ready_note, move |stages| {
+            make_multi(stages, owned, rules, plan, guard)
         })?
     };
     Ok((engine, bundle))
@@ -791,6 +793,7 @@ pub(crate) fn start(
 /// kernels are native-layout only, so `kv_mode_of` sees `Native` exactly as
 /// the resident step's load does.
 fn make_multi(
+    stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
     rules: QwenRules,
     plan: StartupPlan,
@@ -827,6 +830,7 @@ fn make_multi(
         settings.cuda_devices.len(),
         crate::family::project::cuda::gdn_fuse_inproj(),
     )?;
+    stages.begin("probing devices");
     let facts = probe_device_set(&settings.cuda_devices)?;
     check_peer_facts(&facts).map_err(|refusal| {
         EngError::BadRequest(format!(
@@ -846,6 +850,7 @@ fn make_multi(
     let dims = StepDims::new(&shape, &inventory)?;
     let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
     let options = step_options(settings.context_limit, WeightLayout::Native, kv_mode)?;
+    stages.begin("planning shards");
     let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
     // The shard plans size each card's upload from the file's expert quant; layer 0's
     // expert gate names the tensor that carries it.
@@ -867,11 +872,13 @@ fn make_multi(
     let load = load_options(plan.reserve, fixed_admission);
     let (stack, states) =
         CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
+    stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
         let loader = BorrowedLoader::new(&stack.contexts()[card])?;
         loaded.push(load_card_weights(&loader, &model.weights, set, card, load)?);
     }
+    stages.begin("checking memory floors");
     for (card, context) in stack.contexts().iter().enumerate() {
         let info = context.memory_info()?;
         if info.free < MIN_FREE_AFTER_LOAD {
@@ -932,6 +939,7 @@ fn check_fused_inproj(cards: usize, fused: bool) -> Result<(), EngError> {
 }
 
 fn make(
+    stages: &crate::sched::worker::Stages<'_>,
     settings: Q36Settings,
     rules: QwenRules,
     plan: StartupPlan,
@@ -940,8 +948,10 @@ fn make(
     let kv_cache = plan.reserve;
     let verify = plan.verify;
     let fixed_admission = plan.modes.fixed_admission;
+    stages.begin("initializing CUDA");
     let projector = CudaProjector::new()?;
     let before = projector.memory_info()?;
+    stages.begin("loading weights");
     let gguf = match settings.weights {
         WeightFormat::Gguf => Some(open_gguf(&settings.artifact, verify)?),
         WeightFormat::Exl3 => None,
@@ -981,6 +991,7 @@ fn make(
         }
     };
     let after = projector.memory_info()?;
+    stages.begin("admitting memory");
     if after.free < MIN_FREE_AFTER_LOAD {
         return Err(EngError::MemoryPlan(format!(
             "cuda admission: {} bytes free after the load is below the {}-byte floor",
@@ -1008,6 +1019,7 @@ fn make(
     // so the step's mode always agrees with the admission's.
     let layout = device.layout()?;
     let kv_mode = kv_mode_of(settings.kv, layout)?;
+    stages.begin("building the step");
     let mut options = step_options(settings.context_limit, layout, kv_mode)?;
     options.tiered = tiered;
     let res = match paged {

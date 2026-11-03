@@ -24,7 +24,7 @@ fn scripted_app(text: &str, eos: u32) -> (Engine, Router) {
         .collect();
     script.push(vec![eos]);
     let eos_ids = bundle.eos_token_ids().to_vec();
-    let engine = spawn_engine(512, move || {
+    let engine = spawn_engine(512, move |_| {
         Ok((
             FakeExecutor::new(script, &eos_ids, 4096),
             Default::default(),

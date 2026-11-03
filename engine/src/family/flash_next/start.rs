@@ -39,7 +39,7 @@ pub(crate) fn start(
         sampler_vocab,
         expert_prefetch: settings.expert_prefetch,
     };
-    let engine = spawn_engine_noted(prefill_chunk, ready_note, move || {
+    let engine = spawn_engine_noted(prefill_chunk, ready_note, move |_| {
         let (executor, session) = FlashExecutor::open(&artifact, cache_limit, rules)?;
         if usize::try_from(CONTEXT_LIMIT).ok() != Some(executor.context_limit()) {
             return Err(EngError::Checkpoint(format!(

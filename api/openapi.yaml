@@ -203,6 +203,14 @@ components:
             down. native-failed: the native
             backend failed, and the engine takes no more jobs. A request to
             an engine in state error or native-failed gets 500 backend_error.
+        load_stage:
+          type: string
+          description: >-
+            Server extension. The start phase the engine last announced
+            (for example "loading weights"), present only while state is
+            loading. The names come from the family's own start phases;
+            there is no percentage and no invented sequence, and a ready
+            or failed engine has no stage.
         error:
           $ref: "#/components/schemas/EngineError"
     EngineError:

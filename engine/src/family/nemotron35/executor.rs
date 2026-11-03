@@ -638,7 +638,7 @@ mod tests {
     fn worker_repeated_jobs_reuse_weights_and_usage_counts_consumed_eos() {
         let control = Arc::new(Mutex::new(Control::default()));
         let source_control = control.clone();
-        let engine = spawn_engine(1, move || {
+        let engine = spawn_engine(1, move |_| {
             NemotronExecutor::new(stack(8, source_control, false), vec![2])
         })
         .unwrap();

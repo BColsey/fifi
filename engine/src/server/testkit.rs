@@ -76,7 +76,7 @@ pub(super) fn script(text: &str) -> Vec<Vec<u32>> {
 }
 
 pub(super) fn engine(script: Vec<Vec<u32>>) -> Engine {
-    spawn_engine(512, move || {
+    spawn_engine(512, move |_| {
         Ok((
             FakeExecutor::new(script, &[EOS], 100_000),
             Default::default(),
@@ -91,7 +91,7 @@ pub(super) fn engine_with_prefix_limits(
     roots: usize,
     entries: usize,
 ) -> Engine {
-    spawn_engine(512, move || {
+    spawn_engine(512, move |_| {
         let mut executor = FakeExecutor::new(script, &[EOS], 100_000);
         executor.with_prefix_limits(roots, entries);
         Ok((executor, Default::default()))
@@ -100,7 +100,7 @@ pub(super) fn engine_with_prefix_limits(
 }
 
 pub(super) fn failing_engine() -> Engine {
-    spawn_engine::<FakeExecutor, _>(512, || {
+    spawn_engine::<FakeExecutor, _>(512, |_| {
         Err(EngError::Checkpoint("fixture load failure".to_string()))
     })
     .expect("spawn engine")
@@ -108,7 +108,7 @@ pub(super) fn failing_engine() -> Engine {
 
 pub(super) fn gated_engine(script: Vec<Vec<u32>>) -> (Engine, std::sync::mpsc::Sender<()>) {
     let (gate, wait) = std::sync::mpsc::channel::<()>();
-    let engine = spawn_engine(512, move || {
+    let engine = spawn_engine(512, move |_| {
         let _ = wait.recv();
         Ok((
             FakeExecutor::new(script, &[EOS], 100_000),
@@ -224,7 +224,7 @@ pub(super) fn json_of(bytes: &Bytes) -> Value {
 }
 
 pub(super) fn refusing_engine(error: EngError) -> Engine {
-    spawn_engine(512, move || {
+    spawn_engine(512, move |_| {
         Ok((RefusingExecutor(error), Default::default()))
     })
     .expect("spawn engine")
@@ -326,7 +326,7 @@ impl ExecutorOps for Ends {
 
 pub(super) fn ending_engine(text: &str, ending: Ending) -> Engine {
     let ids: VecDeque<u32> = ids(text).into();
-    spawn_engine(512, move || {
+    spawn_engine(512, move |_| {
         Ok((
             Ends {
                 ids,
@@ -438,7 +438,7 @@ fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -
         delay,
         decodes: Arc::clone(&decodes),
     };
-    let engine = spawn_engine(512, move || {
+    let engine = spawn_engine(512, move |_| {
         if let Some(wait) = gate {
             let _ = wait.recv();
         }

@@ -354,7 +354,7 @@ fn gate() -> (Gate, mpsc::Receiver<()>, mpsc::Sender<()>) {
 /// Hold factory completion until all initial jobs have entered the bounded queue.
 fn start(fake: WindowFake) -> (Engine, mpsc::Sender<()>) {
     let (release, held) = mpsc::channel();
-    let engine = spawn_engine(4, move || {
+    let engine = spawn_engine(4, move |_| {
         held.recv_timeout(WAIT).expect("release load");
         let session = Row::new(fake.script_tokens);
         Ok((fake, session))
@@ -1094,7 +1094,7 @@ fn a_denial_restart_restores_the_denied_jobs_own_tip_through_a_real_batch_store(
     // count at the end asserts the BATCH branch ran - the single worker never
     // advances a decode window.
     let windows = fake.window_counter();
-    let engine = spawn_engine(4, move || {
+    let engine = spawn_engine(4, move |_| {
         held.recv_timeout(WAIT).expect("release load");
         Ok((fake, FakeSession::default()))
     })
@@ -1219,7 +1219,7 @@ fn an_adoption_denial_evicts_one_victim_and_retries_the_same_candidate_on_the_en
     fake.deny_restore_once();
     let store = fake.prefix_store();
     let windows = fake.window_counter();
-    let engine = spawn_engine(4, move || {
+    let engine = spawn_engine(4, move |_| {
         held.recv_timeout(WAIT).expect("release load");
         Ok((fake, FakeSession::default()))
     })
@@ -1300,7 +1300,7 @@ fn a_noted_engine_reports_its_executors_real_store_capability() {
             let _ = cut_tx.send(capability);
         }
     }));
-    let capable_engine = spawn_engine_noted(4, capable_note, move || {
+    let capable_engine = spawn_engine_noted(4, capable_note, move |_| {
         Ok((capable, FakeSession::default()))
     })
     .expect("spawn");
@@ -1310,7 +1310,7 @@ fn a_noted_engine_reports_its_executors_real_store_capability() {
             let _ = plain_tx.send(capability);
         }
     }));
-    let plain_engine = spawn_engine_noted(4, plain_note, move || {
+    let plain_engine = spawn_engine_noted(4, plain_note, move |_| {
         Ok((
             FakeExecutor::new(vec![vec![7]], &[0], 1),
             FakeSession::default(),
@@ -1354,7 +1354,7 @@ fn a_failed_make_fires_the_note_with_the_failure_cause() {
     let fail_note: ReadyNote = Some(Box::new(move |note| {
         let _ = fail_tx.send(note);
     }));
-    let failed_engine = spawn_engine_noted(4, fail_note, || {
+    let failed_engine = spawn_engine_noted(4, fail_note, |_| {
         Err::<(FakeExecutor, FakeSession), EngError>(EngError::MemoryPlan("no executor".into()))
     })
     .expect("spawn");

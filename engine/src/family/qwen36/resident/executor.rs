@@ -2293,7 +2293,7 @@ mod tests {
         let _serial = crate::native_test_lock();
         let log: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = std::sync::Arc::default();
         let thread_log = std::sync::Arc::clone(&log);
-        let engine = spawn_engine(4, move || {
+        let engine = spawn_engine(4, move |_| {
             let (mut executor, session) = build(chunk_rules());
             executor.force_chunk(Some(4));
             executor.log = thread_log;
@@ -2390,7 +2390,7 @@ mod tests {
             std::sync::Arc::default();
         let thread_seen = std::sync::Arc::clone(&seen);
         let fallback = usize::try_from(NO_BUDGET_PIECE).unwrap();
-        let engine = spawn_engine(fallback, move || {
+        let engine = spawn_engine(fallback, move |_| {
             let (mut executor, session) = build(rules);
             let line = plan_prefill(&mut executor, &settings)?;
             *thread_seen.lock().unwrap() = (line, executor.prefill_chunk());
@@ -3870,7 +3870,7 @@ mod tests {
         let chain = |prompt: &[u32]| oracle(prompt, COUNT, &mut seeded_sampler(), VOCAB);
         let (want_a, want_b, want_e) = (chain(&prompt_a), chain(&prompt_b), chain(&prompt_e));
         // The worker piece of 3 splits the 4 key tokens into two pieces.
-        let engine = spawn_engine(3, move || Ok(build(prefix_rules()))).unwrap();
+        let engine = spawn_engine(3, move |_| Ok(build(prefix_rules()))).unwrap();
         // The report of a store with the one tip entry of `n` key tokens, which holds `n - 1` fed
         // positions and charges `FIXED_BYTES + TABLE` bytes. The save-side lifetime totals: the
         // one-entry store (tip-store limits) makes every later cross-key save spend the single

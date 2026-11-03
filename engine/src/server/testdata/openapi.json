@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "0b04275b40ee95e5056d663588a1b99e036a52871a84d8d5b9a21ac19286b2e9",
+ "x-source-sha256": "047436debadc24bb2dd0bdf03b305da4ffa54a07eb129590a7205072c9c2ece5",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -211,6 +211,10 @@
        "native-failed"
       ],
       "description": "loading: the engine is starting. ready: it is idle. busy: it is running a job. error: it failed to load. stopped: it has shut down. native-failed: the native backend failed, and the engine takes no more jobs. A request to an engine in state error or native-failed gets 500 backend_error."
+     },
+     "load_stage": {
+      "type": "string",
+      "description": "Server extension. The start phase the engine last announced (for example \"loading weights\"), present only while state is loading. The names come from the family's own start phases; there is no percentage and no invented sequence, and a ready or failed engine has no stage."
      },
      "error": {
       "$ref": "#/components/schemas/EngineError"

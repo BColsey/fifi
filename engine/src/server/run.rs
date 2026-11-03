@@ -75,6 +75,9 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         shutdown_signal()
     };
     let (engines, entries) = start_engines(&config)?;
+    if !cfg!(test) {
+        spawn_stage_reporter(&entries);
+    }
     let mut state = AppState::new(&key, entries);
     if let Some(web_dir) = &config.web_dir {
         // Refuse at startup, with the path named, rather than serving a
@@ -164,6 +167,57 @@ fn apply_replay_overrides(
             "engine {id} failed to start: the replay opt-out could not be applied (the bundle is already shared)"
         ))),
     }
+}
+
+/// Renders engine loading stages on stderr while any engine is still
+/// loading: one line per real stage transition (the family's own start
+/// code announces them; nothing is invented here), then one ready line
+/// with the elapsed time. Failure lines are NOT printed here — the
+/// existing failure log owns them — so this thread only ever reports
+/// what is true at the moment it polls: a stage only after the engine
+/// announced it, ready only after the state is `Ready`. Exits by itself
+/// once every engine has settled.
+fn spawn_stage_reporter(entries: &[super::state::EngineEntry]) {
+    let watched: Vec<(String, crate::sched::worker::EngineHandle)> = entries
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.handle.clone()))
+        .collect();
+    std::thread::Builder::new()
+        .name("stage-reporter".to_string())
+        .spawn(move || {
+            let began = std::time::Instant::now();
+            let mut printed: Vec<Option<&'static str>> = vec![None; watched.len()];
+            loop {
+                let mut any_loading = false;
+                for (index, (id, handle)) in watched.iter().enumerate() {
+                    let state = handle.state();
+                    let stage = handle.load_stage();
+                    match state {
+                        crate::sched::worker::EngineState::Loading => {
+                            any_loading = true;
+                            if printed[index] != stage && stage.is_some() {
+                                eprintln!("engine {id}: {}...", stage.unwrap_or_default());
+                                printed[index] = stage;
+                            }
+                        }
+                        crate::sched::worker::EngineState::Ready => {
+                            if printed[index].take().is_some() {
+                                eprintln!(
+                                    "engine {id}: ready in {:.1} s",
+                                    began.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        _ => printed[index] = None,
+                    }
+                }
+                if !any_loading {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        })
+        .ok();
 }
 
 /// Starts every engine of the configuration. A failure names the engine. Every entry carries the

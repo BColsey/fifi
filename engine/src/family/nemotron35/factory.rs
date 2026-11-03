@@ -93,7 +93,7 @@ pub(crate) fn start_engine(
     let context_limit = options.context_limit;
     let owned = options.clone();
     let model = model_dir.to_path_buf();
-    let engine = spawn_engine_noted(piece, ready_note, move || {
+    let engine = spawn_engine_noted(piece, ready_note, move |_| {
         let config = fs::read(model.join("config.json"))
             .map_err(|error| EngError::Checkpoint(format!("nemotron35 config.json: {error}")))?;
         let descriptor = NemotronTextSpec::from_config(&config)?;

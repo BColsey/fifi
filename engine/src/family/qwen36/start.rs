@@ -87,9 +87,11 @@ pub(crate) fn start(
             "q36: prefix_store_entries is set but prefix_reuse is off; the member is ignored"
         );
     }
-    let engine = spawn_engine_noted(fallback, ready_note, move || {
+    let engine = spawn_engine_noted(fallback, ready_note, move |stages| {
+        stages.begin("opening the model");
         let (mut executor, session) =
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?;
+        stages.begin("planning the prefill chunk");
         let (delta_warmup, moe_warmup) = executor.compile_warmup_seconds();
         if !delta_warmup.is_empty() || !moe_warmup.is_empty() {
             let total = |seconds: &[f64]| seconds.iter().sum::<f64>();

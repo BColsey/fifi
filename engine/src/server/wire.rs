@@ -490,6 +490,13 @@ pub(crate) struct EngineInfo {
     pub(crate) id: String,
     pub(crate) model: String,
     pub(crate) state: &'static str,
+    /// The phase the engine's start code last announced — present only
+    /// while `state` is `loading`; a ready or failed engine has no
+    /// stage. The names come from the family's own start phases (for
+    /// example `loading weights`); there is no percentage and no
+    /// invented sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_stage: Option<&'static str>,
     /// Present only when a failure has been recorded for this engine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<EngineErrorInfo>,
@@ -979,11 +986,53 @@ mod tests {
     }
 
     #[test]
+    fn a_loading_engine_carries_its_stage_and_ready_ones_do_not() {
+        let loading = vec![EngineInfo {
+            id: "e1".to_string(),
+            model: "fake-model".to_string(),
+            state: state_name(EngineState::Loading),
+            load_stage: Some("loading weights"),
+            error: None,
+        }];
+        let body = serde_json::to_value(ModelList::new(vec![Model::new(
+            "fake-model".to_string(),
+            1,
+            loading,
+        )]))
+        .expect("serialize");
+        assert_eq!(
+            body["data"][0]["engines"][0]["load_stage"],
+            "loading weights"
+        );
+        assert_schema("Engine", &body["data"][0]["engines"][0]);
+
+        let ready = vec![EngineInfo {
+            id: "e1".to_string(),
+            model: "fake-model".to_string(),
+            state: state_name(EngineState::Ready),
+            load_stage: None,
+            error: None,
+        }];
+        let body = serde_json::to_value(ModelList::new(vec![Model::new(
+            "fake-model".to_string(),
+            1,
+            ready,
+        )]))
+        .expect("serialize");
+        assert!(
+            body["data"][0]["engines"][0].get("load_stage").is_none(),
+            "a ready engine has no stage: {body}"
+        );
+        assert_schema("Engine", &body["data"][0]["engines"][0]);
+    }
+
+    #[test]
     fn a_failed_engine_matches_the_engine_error_schema() {
         let engines = vec![EngineInfo {
             id: "e1".to_string(),
             model: "fake-model".to_string(),
             state: state_name(EngineState::Error),
+            load_stage: None,
             error: Some(EngineErrorInfo {
                 code: "memory_plan",
                 stage: "admission".to_string(),
@@ -1014,6 +1063,7 @@ mod tests {
             id: "e1".to_string(),
             model: "fake-model".to_string(),
             state: state_name(EngineState::Ready),
+            load_stage: None,
             error: None,
         }];
         let list = ModelList::new(vec![Model::new(

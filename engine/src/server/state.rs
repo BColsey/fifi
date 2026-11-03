@@ -234,6 +234,7 @@ impl AppState {
                 id: entry.id.clone(),
                 model: entry.model.clone(),
                 state: state_name(entry.handle.state()),
+                load_stage: entry.handle.load_stage(),
                 error: entry.handle.failure_info().map(|failure| EngineErrorInfo {
                     code: failure.code,
                     stage: failure.stage,
