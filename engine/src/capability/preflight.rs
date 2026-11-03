@@ -432,6 +432,13 @@ fn q36_preflight(
             }
         ),
     ));
+    if backend == Backend::Cuda && facts.cuda.device_count.as_ref().is_some_and(|n| *n > 1) {
+        checks.push(Check::new(
+            "devices",
+            CheckStatus::Info,
+            "more than one CUDA device is present; this estimate is for device 0 alone (the default). A cuda_devices plan is admitted by its own placement planner at load, with per-device budgets this check does not reproduce".to_string(),
+        ));
+    }
     if backend == Backend::Cuda && facts.cuda.device_count.as_ref() == Some(&0) {
         checks.last_mut().expect("backend check").status = CheckStatus::Fail;
         return finish(checks, None, Qualification::Unverified);

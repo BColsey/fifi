@@ -451,6 +451,11 @@ pub fn render_doctor(facts: &HardwareFacts) -> String {
     ));
     out.push('\n');
     out.push_str(&format!("host CPU threads: {}\n", facts.host.cpu_threads));
+    if facts.cuda.device_count.as_ref().is_some_and(|n| *n > 1) {
+        out.push_str(
+            "note: memory above is device 0 only; a Qwen3.6 engine spans more devices only when its cuda_devices setting names them, under its own placement plan\n",
+        );
+    }
     out
 }
 

@@ -529,6 +529,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_serving_refuses_a_symlink_out_of_the_web_dir() {
+        let (state, _engine, dir) = web_state();
+        let outside =
+            std::env::temp_dir().join(format!("fifi-web-outside-{}.js", std::process::id()));
+        std::fs::write(&outside, "secret").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("assets/linked.js")).expect("symlink");
+        let app = router(state);
+        let (status, _h, body) = testkit::send(&app, testkit::get("/assets/linked.js", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[tokio::test]
     async fn without_a_web_dir_the_root_stays_a_json_404() {
         let (state, _engine) = one_engine_state();
         let (status, _h, body) = testkit::send(&router(state), testkit::get("/", None)).await;
