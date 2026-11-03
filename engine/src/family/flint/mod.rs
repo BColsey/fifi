@@ -54,8 +54,6 @@ mod mlx_state;
 ))]
 mod precision;
 #[cfg(test)]
-mod sparse_select;
-#[cfg(test)]
 mod tests;
 #[cfg(any(
     test,
