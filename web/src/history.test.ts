@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { buildChatBody, buildMessages } from "./history.js";
+import { buildChatBody, buildMessages, noModelNotice } from "./history.js";
 import { defaultSettings, type Settings, type UiMessage } from "./store.js";
 
 function msg(
@@ -165,4 +165,11 @@ test("the serialized body carries x-thinking and never x_thinking", () => {
   ) as Record<string, unknown>;
   strictEqual(sent["x-thinking"], "off");
   strictEqual(Object.hasOwn(sent, "x_thinking"), false);
+});
+
+test("noModelNotice names the missing selection and stays silent once set", () => {
+  const notice = noModelNotice("");
+  strictEqual(typeof notice, "string");
+  strictEqual((notice ?? "").includes("No model is selected yet"), true);
+  strictEqual(noModelNotice("fifi-q36"), null);
 });

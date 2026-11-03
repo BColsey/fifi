@@ -26,6 +26,17 @@ export function buildMessages(systemMessage: string, history: readonly HistoryTu
   return messages;
 }
 
+/** Why a send must not go out yet, or null when it may. The server
+ * requires a model (or x-engine/x-session, which this UI never sends),
+ * but buildChatBody omits the field while no model is selected — for
+ * example in the moment between saving an API key and the model list
+ * (which auto-selects the first model) landing. Sending then earned
+ * an opaque server 400 rendered as "Reply failed". */
+export function noModelNotice(model: string): string | null {
+  if (model !== "") return null;
+  return "No model is selected yet. Pick one in the model menu; if it is empty, the server has not reported a ready model.";
+}
+
 export function buildChatBody(settings: Settings, messages: ChatMessage[]): ChatRequestBody {
   return {
     model: settings.model === "" ? undefined : settings.model,

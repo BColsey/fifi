@@ -11,7 +11,7 @@ import {
   type ToolCallDelta,
   type Usage,
 } from "./api";
-import { buildChatBody, buildMessages } from "./history";
+import { buildChatBody, buildMessages, noModelNotice } from "./history";
 import {
   deleteChat,
   getChat,
@@ -292,6 +292,11 @@ export class ChatView {
   private async send(): Promise<void> {
     const text = this.input.value.trim();
     if (text === "" || this.offline) return;
+    const noModel = noModelNotice(loadSettings().model);
+    if (noModel !== null) {
+      this.hooks.onNotice(noModel);
+      return;
+    }
     // Close the gate and hold the controller before the first await, so a
     // second send, a chat switch, or a delete cannot start a second stream.
     if (!this.sendGate.tryBegin()) return;
