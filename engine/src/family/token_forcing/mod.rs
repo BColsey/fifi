@@ -58,6 +58,11 @@
 //! a duplicate audit, an audit of a token that is no event, or one file in two roles (the three
 //! labels must differ) is refused.
 //!
+//! Before a qualification, a probe (`probe`) measures on each task's reference output how far
+//! the injected fault reaches, so that the fault self-test is known to have power. Its file
+//! carries the SHA-256 of each output it read, and `probe::check_probe` refuses it for a
+//! reference that generated anything else.
+//!
 //! An independent reference, such as stock exllamav3 on the same pack, plugs in at that file
 //! boundary rather than as a model inside the engine: it writes the three scored files under
 //! its own scorer identity, and the offline verdict evaluates them. Its audits are optional, but
@@ -65,6 +70,7 @@
 //! unexplained.
 
 pub(crate) mod gate;
+pub(crate) mod probe;
 pub(crate) mod run;
 pub(crate) mod score;
 pub(crate) mod stats;

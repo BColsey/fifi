@@ -239,6 +239,15 @@ impl<M> LogitBiasFault<M> {
         }
     }
 
+    /// SpecPilot's fault from output position `from` on, so that a short device test reaches
+    /// it.
+    pub(crate) fn starting_at(inner: M, from: usize) -> Self {
+        Self {
+            from,
+            ..Self::specpilot(inner)
+        }
+    }
+
     /// `row` as the fault reads it at output position `position`.
     pub(crate) fn bias_at(&self, position: usize, mut row: Vec<f32>) -> Vec<f32> {
         if position >= self.from {

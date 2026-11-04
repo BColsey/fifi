@@ -5,8 +5,9 @@ use super::fixture::{Bug, LAG, RING, Toy, VOCAB, generate, prompt};
 use super::gate::{
     Audit, AuditPlan, EXECUTABLE_SHA256, EventStatus, ExecutionIdentity, GateConfig, Generation,
     MarginClass, Report, Reread, ScoredRequest, ScoredSystem, Verdict, audit_system, calibrate,
-    evaluate, score_system,
+    evaluate, ids_sha256, score_system,
 };
+use super::probe::{EVENT_FLOOR, ProbeFile, ProbeSettings, check_probe, probe_request};
 use super::run::{
     Candidate, Comparison, Identities, Outputs, Run, RunSettings, input_digests, read_scored,
     verdict_from_files, write_new_json,
@@ -1153,4 +1154,152 @@ fn the_reference_and_the_baseline_must_run_the_scorers_build() {
     let mut other_candidate = candidate;
     set(&mut other_candidate, EXECUTABLE_SHA256, &"0".repeat(64));
     assert!(judge(&reference, &baseline, &other_candidate).is_ok());
+}
+
+/// A model that reads out fixed rows: the first for the prompt, then one per step. It keeps
+/// the tokens it was fed.
+struct Rows {
+    rows: Vec<Vec<f32>>,
+    next: usize,
+    fed: Vec<u32>,
+}
+
+impl ForcedModel for Rows {
+    fn reset(&mut self) -> Result<(), crate::EngError> {
+        self.next = 0;
+        self.fed.clear();
+        Ok(())
+    }
+
+    fn prefill_logits(&mut self, _context: &[u32]) -> Result<Vec<f32>, crate::EngError> {
+        self.next = 1;
+        Ok(self.rows[0].clone())
+    }
+
+    fn step_logits(&mut self, token: u32) -> Result<Vec<f32>, crate::EngError> {
+        self.fed.push(token);
+        self.next += 1;
+        Ok(self.rows[self.next - 1].clone())
+    }
+}
+
+#[test]
+fn the_probe_counts_the_faults_reach_up_to_the_first_end_id() {
+    // Every 2nd id gains 1.5 from output position 2; id 3 ends an answer.
+    let mut fault = LogitBiasFault::starting_at((), 2);
+    assert_eq!((fault.from, fault.stride, fault.bias), (2, 7, 2.0));
+    (fault.stride, fault.bias) = (2, 1.5);
+    let rows = vec![
+        vec![0.0, 2.0, 1.4, -5.0], // 0: the bias would flip id 2 here, before its start
+        vec![0.0, 2.0, 0.0, -5.0], // 1
+        vec![1.3, 2.5, 0.0, -5.0], // 2: a flip to id 0 at margin 1.2, an event
+        vec![2.0, 2.3, 0.0, -5.0], // 3: a flip to id 0 at margin 0.3, no event
+        vec![2.0, 1.0, 0.0, -5.0], // 4: close, but the argmax is biased itself
+        vec![0.0, 1.0, 0.0, 5.0],  // 5: the end id
+        vec![1.3, 2.5, 0.0, -5.0], // 6: after the end, not counted
+    ];
+    let settings = ProbeSettings {
+        fault: &fault,
+        end_ids: &[3],
+        tokens: rows.len(),
+        vocab: 4,
+    };
+    let mut model = Rows {
+        rows: rows.clone(),
+        next: 0,
+        fed: Vec::new(),
+    };
+    let row = probe_request(&mut model, ("task", &[9, 9]), settings).unwrap();
+    let generated = [1, 1, 1, 1, 0, 3, 1];
+    // The probe feeds each greedy choice back, as the reference generates.
+    assert_eq!(model.fed, generated[..6]);
+    assert_eq!(row.generated_sha256, ids_sha256(&generated));
+    assert_eq!(
+        (row.prompt_sha256, row.prompt_tokens),
+        (ids_sha256(&[9, 9]), 2)
+    );
+    assert_eq!(row.first_end, Some(5));
+    let counts = (
+        row.late_tokens,
+        row.late_distinct,
+        row.late_close,
+        row.fault_flips,
+        row.fault_events,
+    );
+    assert_eq!(counts, (3, 2, 3, 2, 1));
+    // An end id before the fault's start leaves nothing to count.
+    let mut early_end = rows;
+    early_end[1] = vec![0.0, 1.0, 0.0, 5.0];
+    let mut model = Rows {
+        rows: early_end,
+        next: 0,
+        fed: Vec::new(),
+    };
+    let row = probe_request(&mut model, ("task", &[9, 9]), settings).unwrap();
+    assert_eq!(row.first_end, Some(1));
+    assert_eq!(
+        (row.late_tokens, row.fault_flips, row.fault_events),
+        (0, 0, 0)
+    );
+}
+
+/// The probe of every toy request on the exact model, as a run writes it.
+fn toy_probe(prompts: &[Vec<u32>], tokens: usize) -> ProbeFile {
+    let fault = LogitBiasFault::specpilot(());
+    let settings = ProbeSettings {
+        fault: &fault,
+        end_ids: &[],
+        tokens,
+        vocab: VOCAB,
+    };
+    let mut model = StepperModel(Toy::exact());
+    let rows = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let name = format!("request-{index}");
+            probe_request(&mut model, (&name, prompt), settings).unwrap()
+        })
+        .collect();
+    // The probe runs the reference's execution under its own label.
+    let mut system = identities().reference;
+    system.label = "probe".to_owned();
+    ProbeFile {
+        system,
+        tokens,
+        event_floor: EVENT_FLOOR,
+        rows,
+    }
+}
+
+#[test]
+fn a_probe_reads_the_reference_output_and_nothing_else() {
+    let tokens = 2100;
+    let prompts = prompts();
+    let outputs = outputs_of(Toy::exact(), &prompts, tokens);
+    let ids = identities();
+    let mut scorer = StepperModel(Toy::exact());
+    let reference =
+        score_system(&mut scorer, (&ids.reference, &ids.scorer), &outputs, VOCAB).unwrap();
+    let probe = toy_probe(&prompts, tokens);
+    assert_eq!(probe.rows[0].late_tokens, tokens - 2048);
+    check_probe(&probe, &reference).unwrap();
+    let refused = |probe: &ProbeFile| format!("{:?}", check_probe(probe, &reference).unwrap_err());
+    let mut other_build = probe.clone();
+    other_build
+        .system
+        .profile
+        .insert(EXECUTABLE_SHA256.to_owned(), "0".repeat(64));
+    assert!(refused(&other_build).contains("the probe ran"));
+    let shorter = toy_probe(&prompts, tokens - 1);
+    assert!(refused(&shorter).contains("another output"));
+    let mut other_output = probe.clone();
+    other_output.rows[2].generated_sha256 = ids_sha256(&[1]);
+    assert!(refused(&other_output).contains("another output"));
+    let mut other_prompt = probe.clone();
+    other_prompt.rows[1].prompt_sha256 = ids_sha256(&[1]);
+    assert!(refused(&other_prompt).contains("another prompt"));
+    let mut missing = probe;
+    missing.rows.remove(3);
+    assert!(refused(&missing).contains("no probe row"));
 }
