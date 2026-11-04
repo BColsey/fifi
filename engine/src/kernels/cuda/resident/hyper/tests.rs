@@ -1167,8 +1167,9 @@ fn check_code(what: &str, index: usize, dev: f32, r: &Bounded) {
 
 /// All 65536 codes of each dtype as norm weights (normal, subnormal, signed zero, infinite and
 /// NaN codes): `normed = x * (1 + w) / rms` with `x / rms` near one exposes the widened value of
-/// every code that `1 + w` does not absorb (every binary16 code above 2^-24, every bfloat16
-/// code above 2^-24), and the non-finite codes must give the infinity or NaN the formula gives.
+/// every code, and the non-finite codes must give the infinity or NaN the formula gives. In the
+/// norm `1 + w` absorbs a weight of at most 2^-24 (half an f32 ulp of 1), so the tiniest codes
+/// show only in the up-projection test.
 /// Only the norm stage is judged: the non-finite codes make every later stage NaN.
 #[test]
 fn every_weight_code_widens_exactly_in_the_norm() {

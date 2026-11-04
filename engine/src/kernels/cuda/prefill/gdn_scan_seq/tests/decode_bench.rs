@@ -11,6 +11,11 @@
 //! when launches overlap, the decode throughput figure), with the host time spent queueing the
 //! 36 layers recorded separately (the CPU launch overhead). The wall clock around a drained
 //! stream stands in for device events, which this tree does not time.
+//!
+//! Each of the 36 queued layers has its own recurrent state and conv ring, as a decode token's
+//! layers do: 36 Flash-Next states are 108 MiB, so a state is not still in the 3090's 6 MB L2
+//! when its layer comes round again. (Runs before 2026-11-04 reused one 3 MiB state for all 36,
+//! which stays L2-resident; their figures are L2-warm.)
 
 use super::forms::{FN_K, FN_V, opts_of};
 use super::{
@@ -30,8 +35,9 @@ const LAYERS: usize = 36;
 const ROUNDS: usize = 101;
 const WARMUPS: usize = 10;
 
-/// The buffers of one layer at m = 1: the conv weights and ring, the projection row, the conv
-/// output, the per-head weights, the state, and the outputs of both scans.
+/// The buffers of one geometry at m = 1: the conv weights, the projection row, the conv output,
+/// the per-head weights and the outputs of both scans, shared by the queued layers; and one conv
+/// ring and one state per queued layer.
 struct Layer {
     rig: Rig,
     lay: ScanLayout,
@@ -39,12 +45,12 @@ struct Layer {
     nv: usize,
     proj: DeviceBuffer,
     w: DeviceBuffer,
-    ring: DeviceBuffer,
+    rings: Vec<DeviceBuffer>,
     conv_out: DeviceBuffer,
     a: DeviceBuffer,
     dt: DeviceBuffer,
     nw: DeviceBuffer,
-    state: DeviceBuffer,
+    states: Vec<DeviceBuffer>,
     o_out: DeviceBuffer,
     d_out: DeviceBuffer,
 }
@@ -59,16 +65,21 @@ impl Layer {
         let channels = lay.conv_ld;
         let need = scan_bytes(inp.shape(1, 0, 1024))?;
         let dneed = delta_bytes(Self::delta_shape(lay, nk, nv))?;
+        let each = |values: &[f32]| {
+            (0..LAYERS)
+                .map(|_| up(values))
+                .collect::<Result<Vec<_>, _>>()
+        };
         Ok(Self {
             // The projection row holds the conv input in its first `channels` columns.
             proj: up(&inp.proj)?,
             w: up(&vec![0.25f32; channels * 4])?,
-            ring: up(&vec![0.0f32; 3 * channels])?,
+            rings: each(&vec![0.0f32; 3 * channels])?,
             conv_out: up(&inp.conv)?,
             a: up(&inp.a)?,
             dt: up(&inp.dt)?,
             nw: up(&inp.nw)?,
-            state: up(&inp.state0)?,
+            states: each(&inp.state0)?,
             o_out: ctx.upload(&vec![0u8; need.o_out])?,
             d_out: ctx.upload(&vec![0u8; dneed.out])?,
             rig,
@@ -91,7 +102,8 @@ impl Layer {
         }
     }
 
-    fn conv(&self) -> Result<(), EngError> {
+    /// The conv of queued layer `at`.
+    fn conv(&self, at: usize) -> Result<(), EngError> {
         let channels = self.lay.conv_ld;
         self.rig.ctx.gdn_conv(
             &self.rig.stream,
@@ -103,13 +115,14 @@ impl Layer {
                 },
                 proj: self.proj.range(0, channels * 4)?,
                 weights: self.w.range(0, channels * 16)?,
-                state: self.ring.range(0, 3 * channels * 4)?,
+                state: self.rings[at].range(0, 3 * channels * 4)?,
                 out: self.conv_out.range(0, channels * 4)?,
             },
         )
     }
 
-    fn scan(&self, form: GdnForm) -> Result<(), EngError> {
+    /// The scan of queued layer `at` in `form`.
+    fn scan(&self, form: GdnForm, at: usize) -> Result<(), EngError> {
         let shape = super::ScanShape {
             m: 1,
             p0: 0,
@@ -136,7 +149,7 @@ impl Layer {
                     dt_bias: self.dt.range(0, need.dt_bias)?,
                     norm_w: self.nw.range(0, need.norm_w)?,
                 },
-                state: self.state.range(0, need.state)?,
+                state: self.states[at].range(0, need.state)?,
                 o_out: self.o_out.range(0, need.o_out)?,
                 status: None,
             },
@@ -144,7 +157,8 @@ impl Layer {
         )
     }
 
-    fn delta(&self) -> Result<(), EngError> {
+    /// The vendored decode step of queued layer `at`.
+    fn delta(&self, at: usize) -> Result<(), EngError> {
         let shape = Self::delta_shape(self.lay, self.nk, self.nv);
         let need = delta_bytes(shape)?;
         self.rig.ctx.gdn_delta(
@@ -159,18 +173,23 @@ impl Layer {
                     dt_bias: self.dt.range(0, need.dt_bias)?,
                     norm_w: self.nw.range(0, need.norm_w)?,
                 },
-                state: self.state.range(0, need.state)?,
+                state: self.states[at].range(0, need.state)?,
                 out: self.d_out.range(0, need.out)?,
             },
         )
     }
 
-    /// The state after the timed rounds is finite (the rounds feed one token repeatedly).
-    fn state_is_finite(&self) -> Result<bool, EngError> {
+    /// Every state after the timed rounds is finite (the rounds feed one token repeatedly).
+    fn states_are_finite(&self) -> Result<bool, EngError> {
         self.rig.stream.synchronize()?;
-        let mut bytes = vec![0u8; self.state.bytes()];
-        self.state.read_at(&self.rig.stream, 0, &mut bytes)?;
-        Ok(testkit::floats(&bytes).iter().all(|v| v.is_finite()))
+        for state in &self.states {
+            let mut bytes = vec![0u8; state.bytes()];
+            state.read_at(&self.rig.stream, 0, &mut bytes)?;
+            if !testkit::floats(&bytes).iter().all(|v| v.is_finite()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -193,27 +212,29 @@ struct Arm {
     enqueue: Vec<f64>,
 }
 
-fn queue(layer: &Layer, step: Step) -> Result<(), EngError> {
+/// Queues `step` for queued layer `at` (its own ring and state).
+fn queue(layer: &Layer, step: Step, at: usize) -> Result<(), EngError> {
     match step {
-        Step::Conv => layer.conv(),
-        Step::Scan(form) => layer.scan(form),
-        Step::Delta => layer.delta(),
+        Step::Conv => layer.conv(at),
+        Step::Scan(form) => layer.scan(form, at),
+        Step::Delta => layer.delta(at),
         Step::ConvScan(form) => {
-            layer.conv()?;
-            layer.scan(form)
+            layer.conv(at)?;
+            layer.scan(form, at)
         }
         Step::ConvDelta => {
-            layer.conv()?;
-            layer.delta()
+            layer.conv(at)?;
+            layer.delta(at)
         }
     }
 }
 
-/// `n` layers queued, then a drain: (host queue time, total time), in microseconds.
+/// `n` layers queued, each on its own state, then a drain: (host queue time, total time), in
+/// microseconds.
 fn sample(layer: &Layer, step: Step, n: usize) -> Result<(f64, f64), EngError> {
     let t0 = std::time::Instant::now();
-    for _ in 0..n {
-        queue(layer, step)?;
+    for at in 0..n {
+        queue(layer, step, at)?;
     }
     let queued = t0.elapsed();
     layer.rig.stream.synchronize()?;
@@ -331,7 +352,7 @@ fn gdn_decode_bench_flash_next_against_the_vendored_decode() -> Result<(), EngEr
     run_rounds(&layers, &mut arms)?;
     report(&arms);
     for layer in &layers {
-        assert!(layer.state_is_finite()?, "a timed state went non-finite");
+        assert!(layer.states_are_finite()?, "a timed state went non-finite");
     }
     Ok(())
 }
