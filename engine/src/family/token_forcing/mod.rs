@@ -37,7 +37,7 @@
 //! A pass also needs enough evidence (`gate::GateConfig`): for qualification, four requests of
 //! 4,096 generated tokens each for the reference, the baseline and the candidate, a delta of at
 //! most 0.5 nats, and every baseline event audited; otherwise the verdict is inconclusive. The
-//! report (`gate::Report`, schema `fifi.token_forcing.v1`) carries the digests of its input
+//! report (`gate::Report`, schema `fifi.token_forcing.v2`) carries the digests of its input
 //! files, the counts, the bounds, a mismatch list with each margin class, and mismatch counts
 //! by output depth.
 //!

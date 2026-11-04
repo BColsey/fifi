@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 type Result<T> = std::result::Result<T, EngError>;
 
 /// The report format. A change to any field's meaning gets a new version.
-pub(crate) const REPORT_SCHEMA: &str = "fifi.token_forcing.v1";
+pub(crate) const REPORT_SCHEMA: &str = "fifi.token_forcing.v2";
 /// The rate rule: a candidate whose mismatch rate exceeds the baseline's by more than this,
 /// at one-sided 95% confidence, is rejected (SpecPilot, arXiv 2611.02501, section 3.3).
 pub(crate) const RATE_EXCESS_LIMIT: f64 = 0.005;
@@ -82,6 +82,11 @@ impl Audit {
     /// SpecPilot also excuses a position whose argmax merely changes with the prefill length.
     /// This gate does not: such a change shows that the reference is undecided between its own
     /// top tokens, not that the generated token is anywhere near them.
+    ///
+    /// The re-executions run the scorer's build, so a defect that the one-prefill path shares
+    /// with the candidate's path explains its own events. On a batch-invariant executor the
+    /// one-prefill row equals the step row bitwise, and only the baseline model can explain an
+    /// event.
     pub(crate) fn explains(&self, threshold: f64) -> bool {
         self.prefill.margin <= threshold
             || self
@@ -280,7 +285,20 @@ pub(crate) fn calibrate(reference: &ScoredSystem, baseline: &ScoredSystem) -> Re
             .iter()
             .zip(&right.records)
             .find(|(a, b)| a.generated != b.generated);
-        let Some((a, b)) = first else { continue };
+        let Some((a, b)) = first else {
+            // Equal tokens over unequal lengths hide where one execution stopped and the other
+            // went on, which is itself a departure the records cannot measure.
+            if left.records.len() != right.records.len() {
+                return Err(gate_error(format!(
+                    "request {}: the reference scored {} tokens and the baseline {}, equal up to \
+                     the shorter; calibration cannot see where they depart",
+                    left.name,
+                    left.records.len(),
+                    right.records.len()
+                )));
+            }
+            continue;
+        };
         if a.argmax != b.argmax || a.argmax_logprob != b.argmax_logprob {
             return Err(gate_error(format!(
                 "request {} position {}: the scorer gave two rows for one context; \
@@ -624,7 +642,7 @@ impl GateConfig {
     /// - Four requests of 4,096 generated tokens: twice SpecPilot's development length, so that
     ///   a fault that starts after 2,048 tokens is inside every request; 16,384 tokens a system.
     /// - Delta at most 0.5 nats: twice the 0.25 that SpecPilot's own calibration set, from a
-    ///   largest first-departure margin of 0.232 nats (arXiv 2611.02501, section 2).
+    ///   largest first-departure margin of 0.232 nats (arXiv 2611.02501, section 2.1).
     pub(crate) const QUALIFICATION: Self = Self {
         min_requests: 4,
         min_tokens_per_request: 4096,
@@ -836,7 +854,15 @@ fn check_roles(systems: [&ScoredSystem; 3]) -> Result<()> {
 /// and is checked when the system is summarised.
 fn validate(scored: &ScoredSystem) -> Result<()> {
     let label = &scored.system.label;
+    let mut prompts = std::collections::BTreeSet::new();
     for request in &scored.requests {
+        // A repeated prompt would count one piece of evidence twice towards the coverage rules.
+        if !prompts.insert(&request.prompt_sha256) {
+            return Err(gate_error(format!(
+                "{label}: request {} repeats the prompt of an earlier request",
+                request.name
+            )));
+        }
         let context =
             |message: String| gate_error(format!("{label} request {}: {message}", request.name));
         for (index, record) in request.records.iter().enumerate() {

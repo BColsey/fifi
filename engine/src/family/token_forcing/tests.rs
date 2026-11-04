@@ -593,7 +593,7 @@ fn the_verdict_is_reproducible_from_the_written_files() {
     assert_eq!(again, run.report);
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path("report.json")).unwrap()).unwrap();
-    assert_eq!(json["schema"], "fifi.token_forcing.v1");
+    assert_eq!(json["schema"], "fifi.token_forcing.v2");
     assert_eq!(json["inputs"]["baseline"].as_str().unwrap().len(), 64);
     assert_eq!(json["verdict"]["verdict"], "reject");
     assert_eq!(json["scorer"]["label"], "scorer-exact");
@@ -638,7 +638,7 @@ type Tamper = fn(&mut ScoredRequest);
 
 #[test]
 fn files_whose_records_or_audits_contradict_themselves_are_refused() {
-    let tampers: [(&str, Tamper); 10] = [
+    let tampers: [(&str, Tamper); 12] = [
         ("audited twice", |request| {
             let mut explaining = request.audits[0];
             explaining.prefill = Reread {
@@ -668,6 +668,20 @@ fn files_whose_records_or_audits_contradict_themselves_are_refused() {
         }),
         ("not a finite gap", |request| {
             request.audits[0].prefill.margin = -1.0;
+        }),
+        // A zero gap to a higher argmax: the lower generated id would have won the tie.
+        ("disagree about generated", |request| {
+            request.audits[0].prefill = Reread {
+                argmax: 7,
+                margin: 0.0,
+            };
+        }),
+        // The baseline reread is checked like the prefill one.
+        ("disagree about generated", |request| {
+            request.audits[0].baseline = Some(Reread {
+                argmax: 5,
+                margin: 1.0,
+            });
         }),
         // A raised log-probability that hides the event as a near tie.
         ("sits above the runner-up", |request| {
@@ -883,4 +897,109 @@ fn a_reread_explains_an_event_up_to_twice_delta_and_no_further() {
             "{margin}"
         );
     }
+}
+
+#[test]
+fn a_repeated_prompt_is_refused() {
+    let (reference, baseline, mut candidate) = synthetic();
+    let mut again = candidate.requests[0].clone();
+    again.name = "request-1".to_owned();
+    candidate.requests.push(again);
+    let error = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("repeats the prompt"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_departure_hidden_by_unequal_lengths_is_refused() {
+    let (reference, mut baseline, candidate) = synthetic();
+    // The baseline agrees with the reference on all four tokens and has a fifth.
+    baseline.requests[0].records[1] = record(1, 1, 1, -0.5, -0.5);
+    baseline.requests[0]
+        .records
+        .push(record(4, 2, 1, -0.5625, -0.5));
+    let error = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("cannot see where they depart"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn an_unaudited_baseline_event_makes_the_run_inconclusive() {
+    let (reference, mut baseline, mut candidate) = synthetic();
+    // A 3-nat baseline mismatch after the departure, never audited.
+    baseline.requests[0].records[3] = record(3, 6, 1, -3.5, -0.5);
+    candidate.requests[0].audits.clear();
+    candidate.requests[0].records[2] = record(2, 1, 1, -0.5, -0.5);
+    let report = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate).unwrap();
+    assert_eq!(report.baseline.unaudited_events, 1);
+    let Verdict::Inconclusive { reasons } = &report.verdict else {
+        panic!("{:#?}", report.verdict);
+    };
+    assert!(
+        reasons[0].contains("baseline events were not audited"),
+        "{reasons:?}"
+    );
+}
+
+/// A model whose every row is one fixed logits row.
+struct FixedRow(Vec<f32>);
+
+impl ForcedModel for FixedRow {
+    fn reset(&mut self) -> Result<(), crate::EngError> {
+        Ok(())
+    }
+
+    fn prefill_logits(&mut self, _context: &[u32]) -> Result<Vec<f32>, crate::EngError> {
+        Ok(self.0.clone())
+    }
+
+    fn step_logits(&mut self, _token: u32) -> Result<Vec<f32>, crate::EngError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn an_audit_records_each_re_execution_in_its_own_place() {
+    // The scorer prefers id 0 by 3 logits over id 1; the baseline model prefers id 1.
+    let mut scorer = FixedRow(vec![3.0, 0.0, -1.0, -1.0]);
+    let mut baseline_model = FixedRow(vec![0.0, 3.0, -1.0, -1.0]);
+    let generations = vec![Generation {
+        name: "request-0".to_owned(),
+        prompt: vec![2, 3],
+        generated: vec![0, 1],
+    }];
+    let ids = identities();
+    let mut scored =
+        score_system(&mut scorer, (&ids.baseline, &ids.scorer), &generations, 4).unwrap();
+    let plan = AuditPlan {
+        threshold: 0.25,
+        vocab: 4,
+        cap: AUDIT_CAP,
+    };
+    audit_system(
+        &mut scored,
+        (&mut scorer, Some(&mut baseline_model)),
+        &generations,
+        plan,
+    )
+    .unwrap();
+    let audits = &scored.requests[0].audits;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    let audit = audits[0];
+    assert_eq!(audit.position, 1);
+    // One prefill on the scorer still sees the 3-logit gap; the baseline model chooses id 1.
+    assert_eq!(audit.prefill.argmax, 0);
+    assert!((audit.prefill.margin - 3.0).abs() < 1e-6, "{audit:?}");
+    assert_eq!(
+        audit.baseline,
+        Some(Reread {
+            argmax: 1,
+            margin: 0.0
+        })
+    );
+    assert!(audit.explains(plan.threshold));
 }
