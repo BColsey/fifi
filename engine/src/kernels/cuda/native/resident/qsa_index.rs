@@ -75,6 +75,7 @@ struct QsaScoreArgsRaw {
     ratio: c_int,
     cap_blocks: c_int,
     pos0: c_int,
+    m: c_int,
 }
 
 const _: () = assert!(
@@ -82,6 +83,7 @@ const _: () = assert!(
         && offset_of!(QsaScoreArgsRaw, status) == 32
         && offset_of!(QsaScoreArgsRaw, heads) == 40
         && offset_of!(QsaScoreArgsRaw, pos0) == 56
+        && offset_of!(QsaScoreArgsRaw, m) == 60
 );
 
 unsafe extern "C" {
@@ -214,6 +216,8 @@ pub(in crate::kernels::cuda) struct QsaIndexRaw<'a> {
 
 pub(in crate::kernels::cuda) struct QsaScoreRaw<'a> {
     pub(in crate::kernels::cuda) dims: QsaDims,
+    /// Tokens scored, at positions pos0 .. pos0 + m.
+    pub(in crate::kernels::cuda) m: usize,
     pub(in crate::kernels::cuda) pos0: c_int,
     pub(in crate::kernels::cuda) queries: RawRange<'a>,
     pub(in crate::kernels::cuda) keys: RawRange<'a>,
@@ -317,19 +321,20 @@ pub(in crate::kernels::cuda) fn qsa_index_launch(
     checked(status, stage)
 }
 
-/// Queues the score kernel on `stream`: one score per block completed at the position.
+/// Queues the score kernel on `stream`: per token, one score per block completed at its position.
 pub(in crate::kernels::cuda) fn qsa_score_launch(
     stream: &RawStream,
     call: QsaScoreRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     let dims = call.dims;
-    if !dims.inside() {
+    if !dims.inside() || !(1..=QSA_MAX_M).contains(&call.m) {
         return Err(invalid_argument());
     }
+    // Inside the limits nothing overflows: the largest product is 2^15 * 2^24 * 4 bytes.
     let (queries, keys, scores) = (
-        dims.heads * dims.dim * FLOAT,
+        call.m * dims.heads * dims.dim * FLOAT,
         dims.keys_bytes(),
-        dims.cap_blocks * FLOAT,
+        call.m * dims.cap_blocks * FLOAT,
     );
     let mut written = vec![Span::of(&call.scores, scores)];
     written.extend(call.status.as_ref().map(|range| Span::of(range, FLOAT)));
@@ -356,6 +361,7 @@ pub(in crate::kernels::cuda) fn qsa_score_launch(
         ratio,
         cap_blocks,
         pos0: call.pos0,
+        m: c_int::try_from(call.m).map_err(|_| invalid_argument())?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: the checks above proved the ranges inside their live allocations, large enough,

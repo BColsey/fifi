@@ -105,10 +105,12 @@ pub(crate) struct QsaIndexCall<'b> {
     pub(crate) status: Option<DeviceRange<'b>>,
 }
 
-/// One score call for the token at the position: `queries` f32 `[heads][dim]` (that token's
-/// index output) against `keys`; `scores` f32 `[cap_blocks]` gets `[0, (position + 1) / ratio)`.
+/// One score call of `m` tokens from the position: `queries` f32 `[m][heads][dim]` (the index
+/// output) against `keys`; row t of `scores` f32 `[m][cap_blocks]` gets
+/// `[0, (position + t + 1) / ratio)`.
 pub(crate) struct QsaScoreCall<'b> {
     pub(crate) indexer: QsaIndexer,
+    pub(crate) m: usize,
     pub(crate) position: QsaPosition<'b>,
     pub(crate) queries: DeviceRange<'b>,
     pub(crate) keys: DeviceRange<'b>,
@@ -116,11 +118,12 @@ pub(crate) struct QsaScoreCall<'b> {
     pub(crate) status: Option<DeviceRange<'b>>,
 }
 
-/// One selection for the token at the position: `scores` f32 `[cap_blocks]` (its score
-/// output) is read; `blocks` i32 `[budget_blocks]` gets the chosen block indices in
-/// `[0, min((position + 1) / ratio, budget_blocks))`, ascending.
+/// One selection of `m` tokens from the position: `scores` f32 `[m][cap_blocks]` (the score
+/// output) is read; row t of `blocks` i32 `[m][budget_blocks]` gets the chosen block indices in
+/// `[0, min((position + t + 1) / ratio, budget_blocks))`, ascending.
 pub(crate) struct QsaSelectCall<'b> {
     pub(crate) indexer: QsaIndexer,
+    pub(crate) m: usize,
     pub(crate) budget_blocks: usize,
     pub(crate) position: QsaPosition<'b>,
     pub(crate) scores: DeviceRange<'b>,
@@ -137,6 +140,16 @@ fn check_dims(indexer: QsaIndexer) -> Result<(), EngError> {
          of 32 from 32 to {QSA_MAX_DIM}, at most {QSA_MAX_QUERY_FLOATS} query values, a block \
          ratio of 1 to {QSA_MAX_RATIO} and 1 to {QSA_MAX_CAP_BLOCKS} cache blocks, got \
          {indexer:?}"
+    )))
+}
+
+/// `m` inside the token limit of every QSA kernel.
+pub(super) fn check_tokens(m: usize) -> Result<(), EngError> {
+    if (1..=QSA_MAX_M).contains(&m) {
+        return Ok(());
+    }
+    Err(EngError::BadRequest(format!(
+        "the CUDA QSA kernels take 1 to {QSA_MAX_M} tokens, got {m}"
     )))
 }
 
@@ -205,11 +218,11 @@ impl CudaContext {
         self.launch_on(stream, move |stream_raw| qsa_index_launch(stream_raw, raw))
     }
 
-    /// Queues the block scores of one token on `stream`.
+    /// Queues the block scores of `call.m` tokens on `stream`.
     ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a geometry outside the
-    /// limits, a position outside the cache, a short or misaligned range, and a written range
-    /// that overlaps another range.
+    /// Returns `BadRequest` for a stream or buffer of another adapter, a geometry or token count
+    /// outside the limits, a position whose tokens do not fit the cache, a short or misaligned
+    /// range, and a written range that overlaps another range.
     pub(crate) fn qsa_score(
         &self,
         stream: &DeviceStream,
@@ -220,11 +233,11 @@ impl CudaContext {
         self.launch_on(stream, move |stream_raw| qsa_score_launch(stream_raw, raw))
     }
 
-    /// Queues the block selection of one token on `stream`.
+    /// Queues the block selection of `call.m` tokens on `stream`.
     ///
-    /// Returns `BadRequest` for a stream or buffer of another adapter, a geometry outside the
-    /// limits, a budget outside `1..=cap_blocks`, a position outside the cache, a short or
-    /// misaligned range, and a written range that overlaps another range.
+    /// Returns `BadRequest` for a stream or buffer of another adapter, a geometry or token count
+    /// outside the limits, a budget outside `1..=cap_blocks`, a position whose tokens do not fit
+    /// the cache, a short or misaligned range, and a written range that overlaps another range.
     pub(crate) fn qsa_select(
         &self,
         stream: &DeviceStream,
@@ -238,12 +251,7 @@ impl CudaContext {
     fn plan_qsa_index<'b>(&self, call: &QsaIndexCall<'b>) -> Result<QsaIndexRaw<'b>, EngError> {
         let indexer = call.indexer;
         check_dims(indexer)?;
-        if !(1..=QSA_MAX_M).contains(&call.m) {
-            return Err(EngError::BadRequest(format!(
-                "the CUDA QSA indexer takes 1 to {QSA_MAX_M} tokens, got {}",
-                call.m
-            )));
-        }
+        check_tokens(call.m)?;
         if !indexer.rope().valid_for(indexer.dim) {
             return Err(EngError::BadRequest(format!(
                 "the CUDA QSA indexer needs an even rotary size in 2..={}, a finite positive theta \
@@ -310,13 +318,15 @@ impl CudaContext {
     fn plan_qsa_score<'b>(&self, call: &QsaScoreCall<'b>) -> Result<QsaScoreRaw<'b>, EngError> {
         let indexer = call.indexer;
         check_dims(indexer)?;
-        let pos0 = admit(indexer, &call.position, 1)?;
+        check_tokens(call.m)?;
+        let pos0 = admit(indexer, &call.position, call.m)?;
         let pos = position_word(&call.position)?;
         let dims = indexer.dims();
+        // Inside the limits nothing overflows: the largest product is 2^15 * 2^24 * 4 bytes.
         let (queries, keys, scores) = (
-            dims.heads * dims.dim * 4,
+            call.m * dims.heads * dims.dim * 4,
             dims.keys_bytes(),
-            dims.cap_blocks * 4,
+            call.m * dims.cap_blocks * 4,
         );
         require_fit("queries", &call.queries, queries, 4)?;
         require_fit("keys", &call.keys, keys, 4)?;
@@ -334,6 +344,7 @@ impl CudaContext {
         require_all_apart(&written, &read)?;
         Ok(QsaScoreRaw {
             dims,
+            m: call.m,
             pos0,
             queries: self.raw_range(&call.queries)?,
             keys: self.raw_range(&call.keys)?,
@@ -350,7 +361,9 @@ impl CudaContext {
     fn plan_qsa_select<'b>(&self, call: &QsaSelectCall<'b>) -> Result<QsaSelectRaw<'b>, EngError> {
         let indexer = call.indexer;
         check_dims(indexer)?;
+        check_tokens(call.m)?;
         let dims = QsaSelectDims {
+            m: call.m,
             ratio: indexer.ratio,
             cap_blocks: indexer.cap_blocks,
             budget_blocks: call.budget_blocks,
@@ -361,9 +374,12 @@ impl CudaContext {
                 indexer.cap_blocks, call.budget_blocks
             )));
         }
-        let pos0 = admit(indexer, &call.position, 1)?;
+        let pos0 = admit(indexer, &call.position, call.m)?;
         let pos = position_word(&call.position)?;
-        let (scores, blocks) = (dims.cap_blocks * 4, dims.budget_blocks * 4);
+        let (scores, blocks) = (
+            call.m * dims.cap_blocks * 4,
+            call.m * dims.budget_blocks * 4,
+        );
         require_fit("scores", &call.scores, scores, 4)?;
         require_fit("blocks", &call.blocks, blocks, 4)?;
         if let Some(status) = &call.status {

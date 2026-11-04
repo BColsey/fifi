@@ -19,7 +19,7 @@ use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
-use crate::kernels::cuda::native::resident::qsa_index::{all_apart, optional};
+use crate::kernels::cuda::native::resident::qsa_index::{QSA_MAX_M, all_apart, optional};
 
 /// Limits of `qsa_attn.h`.
 pub(in crate::kernels::cuda) const QSA_ATTN_HEAD: usize = 256;
@@ -55,6 +55,7 @@ struct QsaAttnArgsRaw {
     max_splits: c_int,
     pos0: c_int,
     scale: f32,
+    m: c_int,
 }
 
 const _: () = assert!(
@@ -63,6 +64,7 @@ const _: () = assert!(
         && offset_of!(QsaAttnArgsRaw, ld) == 72
         && offset_of!(QsaAttnArgsRaw, pos0) == 100
         && offset_of!(QsaAttnArgsRaw, scale) == 104
+        && offset_of!(QsaAttnArgsRaw, m) == 108
 );
 
 unsafe extern "C" {
@@ -74,11 +76,12 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// The geometry of one call: `n_head` query heads over `n_kv_head` kv heads of 256, a cache of
-/// `rows` positions, blocks of `ratio`, at most `budget_blocks` chosen blocks, `max_splits` splits
-/// per kv head.
+/// The geometry of one call: `m` tokens, `n_head` query heads over `n_kv_head` kv heads of 256, a
+/// cache of `rows` positions, blocks of `ratio`, at most `budget_blocks` chosen blocks per token,
+/// `max_splits` splits per kv head and token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kernels::cuda) struct QsaAttnDims {
+    pub(in crate::kernels::cuda) m: usize,
     pub(in crate::kernels::cuda) n_head: usize,
     pub(in crate::kernels::cuda) n_kv_head: usize,
     pub(in crate::kernels::cuda) rows: usize,
@@ -87,7 +90,8 @@ pub(in crate::kernels::cuda) struct QsaAttnDims {
     pub(in crate::kernels::cuda) max_splits: usize,
 }
 
-/// The bytes each range of a call touches.
+/// The bytes each range of a call touches. `gates` is the query and gate columns of one
+/// projection row; `QsaAttnDims::proj_bytes` gives the extent of all `m` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kernels::cuda) struct QsaAttnBytes {
     pub(in crate::kernels::cuda) q: usize,
@@ -101,7 +105,8 @@ pub(in crate::kernels::cuda) struct QsaAttnBytes {
 impl QsaAttnDims {
     /// True when every dimension is inside the limits of `qsa_attn.h`.
     pub(in crate::kernels::cuda) fn inside(self) -> bool {
-        (1..=QSA_ATTN_MAX_KV_HEADS).contains(&self.n_kv_head)
+        (1..=QSA_MAX_M).contains(&self.m)
+            && (1..=QSA_ATTN_MAX_KV_HEADS).contains(&self.n_kv_head)
             && self.n_head >= self.n_kv_head
             && self.n_head.is_multiple_of(self.n_kv_head)
             && self.n_head / self.n_kv_head <= QSA_ATTN_MAX_GROUP
@@ -114,18 +119,29 @@ impl QsaAttnDims {
     /// The touched bytes, or `None` outside the limits. Inside them nothing overflows: the
     /// largest product is `2^30 * 64 * 256 * 2` bytes.
     pub(in crate::kernels::cuda) fn bytes(self) -> Option<QsaAttnBytes> {
+        let rows_of = |per_token: usize| self.m * per_token * FLOAT;
         self.inside().then(|| QsaAttnBytes {
-            q: self.n_head * QSA_ATTN_HEAD * FLOAT,
+            q: rows_of(self.n_head * QSA_ATTN_HEAD),
             gates: self.n_head * 2 * QSA_ATTN_HEAD * FLOAT,
             cache: self.rows * self.n_kv_head * QSA_ATTN_HEAD * 2,
-            chosen: self.budget_blocks * FLOAT,
-            part: self.n_head * self.max_splits * QSA_ATTN_PART_STRIDE * FLOAT,
-            out: self.n_head * QSA_ATTN_HEAD * FLOAT,
+            chosen: rows_of(self.budget_blocks),
+            part: rows_of(self.n_head * self.max_splits * QSA_ATTN_PART_STRIDE),
+            out: rows_of(self.n_head * QSA_ATTN_HEAD),
         })
     }
 
-    fn ints(self) -> Option<[c_int; 6]> {
+    /// The extent of `m` projection rows `ld` floats apart, or `None` outside the limits, for a
+    /// row narrower than the query and gate columns, or for an `ld` past `c_int`. Nothing
+    /// overflows: the largest product is `2^15 * 2^31 * 4` bytes.
+    pub(in crate::kernels::cuda) fn proj_bytes(self, ld: usize) -> Option<usize> {
+        let gates = self.bytes()?.gates;
+        let usable = ld * FLOAT >= gates && c_int::try_from(ld).is_ok();
+        usable.then(|| (self.m - 1) * ld * FLOAT + gates)
+    }
+
+    fn ints(self) -> Option<[c_int; 7]> {
         Some([
+            c_int::try_from(self.m).ok()?,
             c_int::try_from(self.n_head).ok()?,
             c_int::try_from(self.n_kv_head).ok()?,
             c_int::try_from(self.rows).ok()?,
@@ -158,12 +174,10 @@ fn fits(range: &RawRange<'_>, need: usize, align: usize) -> bool {
 
 fn check_attn(call: &QsaAttnRaw<'_>) -> Result<QsaAttnBytes, DeviceFailure> {
     let need = call.dims.bytes().ok_or_else(invalid_argument)?;
+    let proj = call.dims.proj_bytes(call.ld).ok_or_else(invalid_argument)?;
     let word_fits = |r: &Option<RawRange<'_>>| r.as_ref().is_none_or(|r| fits(r, FLOAT, FLOAT));
-    let shaped = call.ld >= call.dims.n_head * 2 * QSA_ATTN_HEAD
-        && c_int::try_from(call.ld).is_ok()
-        && call.scale.is_finite();
     let sized = fits(&call.q, need.q, WIDE)
-        && fits(&call.proj, need.gates, FLOAT)
+        && fits(&call.proj, proj, FLOAT)
         && fits(&call.k_cache, need.cache, WIDE)
         && fits(&call.v_cache, need.cache, WIDE)
         && fits(&call.chosen, need.chosen, FLOAT)
@@ -178,13 +192,13 @@ fn check_attn(call: &QsaAttnRaw<'_>) -> Result<QsaAttnBytes, DeviceFailure> {
     written.extend(call.status.as_ref().map(|range| Span::of(range, FLOAT)));
     let mut read = vec![
         Span::of(&call.q, need.q),
-        Span::of(&call.proj, need.gates),
+        Span::of(&call.proj, proj),
         Span::of(&call.k_cache, need.cache),
         Span::of(&call.v_cache, need.cache),
         Span::of(&call.chosen, need.chosen),
     ];
     read.extend(call.pos.as_ref().map(|range| Span::of(range, FLOAT)));
-    if !(shaped && sized && all_apart(&written, &read)) {
+    if !(call.scale.is_finite() && sized && all_apart(&written, &read)) {
         return Err(invalid_argument());
     }
     Ok(need)
@@ -196,7 +210,7 @@ pub(in crate::kernels::cuda) fn qsa_attn_launch(
     call: QsaAttnRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     check_attn(&call)?;
-    let [n_head, n_kv_head, rows, ratio, budget_blocks, max_splits] =
+    let [m, n_head, n_kv_head, rows, ratio, budget_blocks, max_splits] =
         call.dims.ints().ok_or_else(invalid_argument)?;
     let args = QsaAttnArgsRaw {
         q: call.q.address().cast_const(),
@@ -217,6 +231,7 @@ pub(in crate::kernels::cuda) fn qsa_attn_launch(
         max_splits,
         pos0: call.pos0,
         scale: call.scale,
+        m,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_attn` proved every range inside its live allocation (`RawRange::new`), large

@@ -1,13 +1,14 @@
 //! Device tests (3090) of the QSA indexer wrapper: every refusal answers `BadRequest` with its
 //! rule's text before any native call and writes nothing, and the device poison rule of a
-//! position word outside the cache writes NaN queries, no key, ring, score or selection, and
-//! raises status bits 4. The selection is checked against a host ranking at the 256K-token size
-//! (65536 blocks, budget 512) with ties at the threshold. The numerics against the host indexer
-//! are in `family::flash_next::qsa::cuda_tests`.
+//! position word outside the cache (or a chunk running past it) writes NaN queries, no key, ring,
+//! score or selection, and raises status bits 4. The selection is checked against a host ranking
+//! at the 256K-token size (65536 blocks, budget 512) with ties at the threshold, and one score and
+//! selection call of 32768 tokens equals 32768 single-token calls bit for bit. The numerics
+//! against the host indexer are in `family::flash_next::qsa::cuda_tests`.
 
 use super::{QsaIndexCall, QsaIndexer, QsaPosition, QsaScoreCall, QsaSelectCall};
 use crate::EngError;
-use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, device_present};
+use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, device_present};
 
 const HEADS: usize = 4;
 const DIM: usize = 128;
@@ -54,11 +55,16 @@ impl Rig {
         let ones: Vec<u8> = (0..M * LD)
             .flat_map(|i| (i as f32 / 997.0).to_le_bytes())
             .collect();
-        // Words: 0, the first position past the cache, -1.
-        let words: Vec<u8> = [0i32, (CAP_BLOCKS * RATIO) as i32, -1]
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        // Words: 0, the first position past the cache, -1, the last position of the cache.
+        let words: Vec<u8> = [
+            0i32,
+            (CAP_BLOCKS * RATIO) as i32,
+            -1,
+            (CAP_BLOCKS * RATIO - 1) as i32,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
         Self {
             proj: ctx.upload(&ones).expect("proj"),
             norm: ctx.upload(&vec![0u8; DIM * 4]).expect("norm"),
@@ -66,8 +72,9 @@ impl Rig {
             queries: filled(QUERY_BYTES + 16),
             ring: filled(RATIO * DIM * 4),
             keys: filled(CAP_BLOCKS * DIM * 4),
-            scores: filled(CAP_BLOCKS * 4),
-            chosen: filled(BUDGET_BLOCKS * 4),
+            // Room for two tokens, for the chunk that runs past the cache.
+            scores: filled(2 * CAP_BLOCKS * 4),
+            chosen: filled(2 * BUDGET_BLOCKS * 4),
             words: ctx.upload(&words).expect("words"),
             status: ctx.upload(&[0u8; 4]).expect("status"),
             ctx,
@@ -95,6 +102,7 @@ impl Rig {
     fn score(&self) -> QsaScoreCall<'_> {
         QsaScoreCall {
             indexer: indexer(),
+            m: 1,
             position: QsaPosition::Host(5),
             queries: self.queries.range(0, HEADS * DIM * 4).expect("range"),
             keys: self.keys.range(0, CAP_BLOCKS * DIM * 4).expect("range"),
@@ -106,6 +114,7 @@ impl Rig {
     fn select(&self) -> QsaSelectCall<'_> {
         QsaSelectCall {
             indexer: indexer(),
+            m: 1,
             budget_blocks: BUDGET_BLOCKS,
             position: QsaPosition::Host(5),
             scores: self.scores.range(0, CAP_BLOCKS * 4).expect("range"),
@@ -256,6 +265,33 @@ type ScoreCase = fn(&Rig) -> QsaScoreCall<'_>;
 
 const SCORE_CASES: &[(&str, ScoreCase, &str)] = &[
     (
+        "no tokens",
+        |r| QsaScoreCall { m: 0, ..r.score() },
+        "tokens",
+    ),
+    (
+        "too many tokens",
+        |r| QsaScoreCall {
+            m: 32769,
+            ..r.score()
+        },
+        "tokens",
+    ),
+    (
+        "tokens past the cache",
+        |r| QsaScoreCall {
+            m: 2,
+            position: QsaPosition::Host(CAP_BLOCKS * RATIO - 1),
+            ..r.score()
+        },
+        "exceeds the cache",
+    ),
+    (
+        "queries of one token for two",
+        |r| QsaScoreCall { m: 2, ..r.score() },
+        "queries range",
+    ),
+    (
         "short scores",
         |r| QsaScoreCall {
             scores: r.scores.range(0, CAP_BLOCKS * 4 - 4).expect("range"),
@@ -284,6 +320,33 @@ const SCORE_CASES: &[(&str, ScoreCase, &str)] = &[
 type SelectCase = fn(&Rig) -> QsaSelectCall<'_>;
 
 const SELECT_CASES: &[(&str, SelectCase, &str)] = &[
+    (
+        "no tokens",
+        |r| QsaSelectCall { m: 0, ..r.select() },
+        "tokens",
+    ),
+    (
+        "too many tokens",
+        |r| QsaSelectCall {
+            m: 32769,
+            ..r.select()
+        },
+        "tokens",
+    ),
+    (
+        "tokens past the cache",
+        |r| QsaSelectCall {
+            m: 2,
+            position: QsaPosition::Host(CAP_BLOCKS * RATIO - 1),
+            ..r.select()
+        },
+        "exceeds the cache",
+    ),
+    (
+        "scores of one token for two",
+        |r| QsaSelectCall { m: 2, ..r.select() },
+        "scores range",
+    ),
     (
         "no budget",
         |r| QsaSelectCall {
@@ -388,6 +451,39 @@ fn a_position_word_outside_the_cache_poisons_and_writes_no_key() -> Result<(), E
         rig.untouched(&rig.chosen, "blocks");
         assert_eq!(rig.status(), POISON_BITS, "word {index}: select status");
     }
+    // Word 3 is the last position: one token fits, a chunk of two runs past the cache.
+    let rig = Rig::new();
+    let score = QsaScoreCall {
+        m: 2,
+        position: rig.word(3, 5),
+        queries: rig.queries.range(0, 2 * HEADS * DIM * 4)?,
+        scores: rig.scores.range(0, 2 * CAP_BLOCKS * 4)?,
+        ..rig.score()
+    };
+    rig.ctx.qsa_score(&rig.stream, score)?;
+    rig.untouched(&rig.scores, "scores of the chunk past the cache");
+    assert_eq!(
+        rig.status(),
+        POISON_BITS,
+        "chunk past the cache: score status"
+    );
+    rig.ctx.upload_at(&rig.status, 0, &[0u8; 4])?;
+    let select = QsaSelectCall {
+        m: 2,
+        position: rig.word(3, 5),
+        scores: rig.scores.range(0, 2 * CAP_BLOCKS * 4)?,
+        blocks: rig.chosen.range(0, 2 * BUDGET_BLOCKS * 4)?,
+        ..rig.select()
+    };
+    rig.ctx.qsa_select(&rig.stream, select)?;
+    rig.untouched(&rig.chosen, "blocks of the chunk past the cache");
+    assert_eq!(
+        rig.status(),
+        POISON_BITS,
+        "chunk past the cache: select status"
+    );
+    // A process holds at most two adapter leases, so each rig goes before the next.
+    drop(rig);
     // Word 0 is in range: the same call writes the two completed blocks and no poison.
     let rig = Rig::new();
     let mut call = rig.index();
@@ -464,6 +560,7 @@ fn qsa_select_matches_the_host_ranking_at_256k_tokens() -> Result<(), EngError> 
             &stream,
             QsaSelectCall {
                 indexer,
+                m: 1,
                 budget_blocks: BUDGET,
                 position: QsaPosition::Host(pos),
                 scores: score_buf.range(0, BLOCKS * 4)?,
@@ -534,6 +631,7 @@ fn qsa_select_ranks_a_cache_of_2_pow_24_blocks() -> Result<(), EngError> {
         &stream,
         QsaSelectCall {
             indexer,
+            m: 1,
             budget_blocks: BUDGET,
             position: QsaPosition::Host(BLOCKS * RATIO - 1),
             scores: scores.range(0, BLOCKS * 4)?,
@@ -549,6 +647,134 @@ fn qsa_select_ranks_a_cache_of_2_pow_24_blocks() -> Result<(), EngError> {
     assert_eq!(
         got, expected,
         "the selection over 2^24 blocks differs from the host ranking"
+    );
+    Ok(())
+}
+
+fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    buffer.range(0, buffer.bytes())
+}
+
+/// Uniform values in `[-1, 1)` from an LCG, as f32 bytes.
+fn noise(state: &mut u64, count: usize) -> Vec<u8> {
+    (0..count)
+        .flat_map(|_| {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*state >> 40) as f32 / (1u64 << 23) as f32 - 1.0).to_le_bytes()
+        })
+        .collect()
+}
+
+/// One score and one selection call of the most tokens (32768, ratio 64, filling a cache of 512
+/// blocks, the position at a device word) against one call per token at a host position: every
+/// written score and block, and every byte left unwritten, must agree.
+#[test]
+fn qsa_score_and_select_of_32768_tokens_equal_single_token_calls() -> Result<(), EngError> {
+    if !device_present("qsa_score_and_select_of_32768_tokens_equal_single_token_calls") {
+        return Ok(());
+    }
+    const TOKENS: usize = 32_768;
+    const BLOCKS: usize = 512;
+    const BUDGET: usize = 8;
+    const D: usize = 32;
+    let indexer = QsaIndexer {
+        heads: 1,
+        dim: D,
+        rotary_dim: D,
+        ratio: 64,
+        cap_blocks: BLOCKS,
+        ..indexer()
+    };
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let mut state = 0x0b47_c4ed_u64;
+    let queries = ctx.upload(&noise(&mut state, TOKENS * D))?;
+    let keys = ctx.upload(&noise(&mut state, BLOCKS * D))?;
+    let word = ctx.upload(&0i32.to_le_bytes())?;
+    let filled = |bytes: usize| ctx.upload(&vec![SENT; bytes]);
+    let (scores, singles) = (filled(TOKENS * BLOCKS * 4)?, filled(TOKENS * BLOCKS * 4)?);
+    let (chosen, chosen_singles) = (filled(TOKENS * BUDGET * 4)?, filled(TOKENS * BUDGET * 4)?);
+    let position = QsaPosition::Device {
+        word: word.range(0, 4)?,
+        admit: 0,
+    };
+    ctx.qsa_score(
+        &stream,
+        QsaScoreCall {
+            indexer,
+            m: TOKENS,
+            position,
+            queries: whole(&queries)?,
+            keys: whole(&keys)?,
+            scores: whole(&scores)?,
+            status: None,
+        },
+    )?;
+    ctx.qsa_select(
+        &stream,
+        QsaSelectCall {
+            indexer,
+            m: TOKENS,
+            budget_blocks: BUDGET,
+            position: QsaPosition::Device {
+                word: word.range(0, 4)?,
+                admit: 0,
+            },
+            scores: whole(&scores)?,
+            blocks: whole(&chosen)?,
+            status: None,
+        },
+    )?;
+    for t in 0..TOKENS {
+        let score_row = singles.range(t * BLOCKS * 4, BLOCKS * 4)?;
+        ctx.qsa_score(
+            &stream,
+            QsaScoreCall {
+                indexer,
+                m: 1,
+                position: QsaPosition::Host(t),
+                queries: queries.range(t * D * 4, D * 4)?,
+                keys: whole(&keys)?,
+                scores: score_row,
+                status: None,
+            },
+        )?;
+        ctx.qsa_select(
+            &stream,
+            QsaSelectCall {
+                indexer,
+                m: 1,
+                budget_blocks: BUDGET,
+                position: QsaPosition::Host(t),
+                scores: singles.range(t * BLOCKS * 4, BLOCKS * 4)?,
+                blocks: chosen_singles.range(t * BUDGET * 4, BUDGET * 4)?,
+                status: None,
+            },
+        )?;
+    }
+    stream.synchronize()?;
+    let fetch = |b: &DeviceBuffer| -> Result<Vec<u8>, EngError> {
+        let mut out = vec![0u8; b.bytes()];
+        ctx.download(b, &mut out)?;
+        Ok(out)
+    };
+    let (batch, single) = (fetch(&scores)?, fetch(&singles)?);
+    assert!(
+        batch == single,
+        "the scores of one call differ from single-token calls"
+    );
+    // The last token has all 512 blocks completed, so every score row is written somewhere.
+    assert!(
+        batch[(TOKENS - 1) * BLOCKS * 4..]
+            .iter()
+            .any(|&b| b != SENT),
+        "the last token was not scored"
+    );
+    assert!(
+        fetch(&chosen)? == fetch(&chosen_singles)?,
+        "the selection of one call differs from single-token calls"
     );
     Ok(())
 }

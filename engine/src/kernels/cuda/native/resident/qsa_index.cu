@@ -1,7 +1,8 @@
 // The block indexer of Qwen3.8 Flash-Next QSA attention (see resident/qsa_index.h for the
 // formulas and the argument contract). index enqueues three kernels: the normalized and rotated
 // queries, the pooled keys of the blocks the chunk completes, then the raw-key ring of the open
-// block (after the keys, which read the ring). score enqueues one. Plain f32 arithmetic in the
+// block (after the keys, which read the ring). score enqueues one, a grid row per token. Plain
+// f32 arithmetic in the
 // host's expression order where it is a fixed order (the pooling); reductions are warp trees.
 #include <cuda_runtime.h>
 
@@ -88,16 +89,16 @@ bool valid_index(const inference_cuda_qsa_index_args &a, void *stream) {
 
 bool valid_score(const inference_cuda_qsa_score_args &a, void *stream) {
     if (stream == NULL || a.queries == NULL || a.keys == NULL || a.scores == NULL ||
-        !shape_ok(a.heads, a.dim, a.ratio, a.cap_blocks)) {
+        a.m < 1 || a.m > kMaxM || !shape_ok(a.heads, a.dim, a.ratio, a.cap_blocks)) {
         return false;
     }
     const void *ptrs[] = {a.queries, a.keys, a.scores, a.pos, a.status};
     for (const void *p : ptrs) {
         if (p != NULL && !aligned(p, 4)) return false;
     }
-    const size_t f = sizeof(float), dim = (size_t)a.dim;
-    const Span written[] = {{a.scores, (size_t)a.cap_blocks * f}, {a.status, f}};
-    const Span read[] = {{a.queries, (size_t)a.heads * dim * f},
+    const size_t f = sizeof(float), m = (size_t)a.m, dim = (size_t)a.dim;
+    const Span written[] = {{a.scores, m * a.cap_blocks * f}, {a.status, f}};
+    const Span read[] = {{a.queries, m * a.heads * dim * f},
                          {a.keys, (size_t)a.cap_blocks * dim * f},
                          {a.pos, f}};
     return disjoint(written, 2, read, 3);
@@ -211,23 +212,27 @@ struct ScoreArgs {
     float *scores;
     const int *pos;
     int *status;
-    int heads, dim, ratio, cap_blocks, pos0;
+    int heads, dim, ratio, cap_blocks, pos0, m;
 };
 
-// Warps stride over the completed blocks; each warp scores one block per trip.
+// Grid row y is token y. Warps stride over its completed blocks; each warp scores one block per
+// trip. A grid block with no completed block to score leaves before loading the queries.
 __global__ void __launch_bounds__(kScoreThreads) qsa_score_k(ScoreArgs a) {
     __shared__ float q[kMaxQueryFloats];
-    long long at;
-    if (!position(a.pos, a.pos0, 1, a.ratio, a.cap_blocks, &at)) {
-        if (a.status != NULL && blockIdx.x == 0 && threadIdx.x == 0) {
+    long long first;
+    if (!position(a.pos, a.pos0, a.m, a.ratio, a.cap_blocks, &first)) {
+        if (a.status != NULL && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
             atomicOr(a.status, kStatusBits);
         }
         return;
     }
     const int dim = a.dim;
-    for (int i = threadIdx.x; i < a.heads * dim; i += blockDim.x) q[i] = a.queries[i];
+    const long long blocks = (first + blockIdx.y + 1) / a.ratio;
+    if ((long long)blockIdx.x * kScoreWarps >= blocks) return;
+    const float *queries = a.queries + (size_t)blockIdx.y * a.heads * dim;
+    float *scores = a.scores + (size_t)blockIdx.y * a.cap_blocks;
+    for (int i = threadIdx.x; i < a.heads * dim; i += blockDim.x) q[i] = queries[i];
     __syncthreads();
-    const long long blocks = (at + 1) / a.ratio;
     const int lane = threadIdx.x % 32;
     const long long stride = (long long)gridDim.x * kScoreWarps;
     for (long long b = (long long)blockIdx.x * kScoreWarps + threadIdx.x / 32; b < blocks;
@@ -241,7 +246,7 @@ __global__ void __launch_bounds__(kScoreThreads) qsa_score_k(ScoreArgs a) {
             // fmaxf takes the number over a NaN, as the host's f64::max does.
             total += fmaxf(dot, 0.0f);
         }
-        if (lane == 0) a.scores[b] = total;
+        if (lane == 0) scores[b] = total;
     }
 }
 
@@ -298,8 +303,8 @@ extern "C" int inference_cuda_qsa_score_launch(const inference_cuda_qsa_score_ar
         const ScoreArgs k{(const float *)a.queries, (const float *)a.keys, (float *)a.scores,
                           (const int *)a.pos,       (int *)a.status,        a.heads,
                           a.dim,                    a.ratio,                a.cap_blocks,
-                          a.pos0};
-        qsa_score_k<<<grid, kScoreThreads, 0, (cudaStream_t)stream>>>(k);
+                          a.pos0,                   a.m};
+        qsa_score_k<<<dim3(grid, a.m), kScoreThreads, 0, (cudaStream_t)stream>>>(k);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

@@ -304,7 +304,9 @@ impl Device {
         })
     }
 
-    /// Indexes tokens `row0 .. row0 + m`, then scores and selects the scored ones among them.
+    /// Indexes tokens `row0 .. row0 + m`, then scores and selects the scored ones among them,
+    /// each run of consecutive scored tokens in one call (the whole chunk when every token is
+    /// scored).
     fn chunk(&self, row0: usize, m: usize, word: bool) -> Result<(), EngError> {
         let g = self.geom;
         let (ld, qw, dim) = (g.ld(), g.q_width(), g.dim);
@@ -325,26 +327,35 @@ impl Device {
                 status: None,
             },
         )?;
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
         for (row, t) in g.scored().into_iter().enumerate() {
-            if (row0..row0 + m).contains(&t) {
-                self.score(row, t, word)?;
+            if !(row0..row0 + m).contains(&t) {
+                continue;
             }
+            match runs.last_mut() {
+                Some((_, start, len)) if *start + *len == t => *len += 1,
+                _ => runs.push((row, t, 1)),
+            }
+        }
+        for (row, t, len) in runs {
+            self.score(row, t, len, word)?;
         }
         Ok(())
     }
 
-    /// Scores token `t` into scores row `row` and selects its blocks.
-    fn score(&self, row: usize, t: usize, word: bool) -> Result<(), EngError> {
+    /// Scores tokens `t .. t + len` into scores rows `row ..` and selects their blocks.
+    fn score(&self, row: usize, t: usize, len: usize, word: bool) -> Result<(), EngError> {
         let g = self.geom;
-        let (cap, budget) = (g.cap_blocks, g.budget_blocks);
+        let (cap, budget, qw) = (g.cap_blocks, g.budget_blocks, g.q_width());
         self.ctx.qsa_score(
             &self.stream,
             QsaScoreCall {
                 indexer: g.indexer(),
+                m: len,
                 position: self.position(t, word)?,
-                queries: self.queries.range(t * g.q_width() * 4, g.q_width() * 4)?,
+                queries: self.queries.range(t * qw * 4, len * qw * 4)?,
                 keys: self.keys.range(0, cap * g.dim * 4)?,
-                scores: self.scores.range(row * cap * 4, cap * 4)?,
+                scores: self.scores.range(row * cap * 4, len * cap * 4)?,
                 status: None,
             },
         )?;
@@ -352,10 +363,11 @@ impl Device {
             &self.stream,
             QsaSelectCall {
                 indexer: g.indexer(),
+                m: len,
                 budget_blocks: budget,
                 position: self.position(t, word)?,
-                scores: self.scores.range(row * cap * 4, cap * 4)?,
-                blocks: self.chosen.range(row * budget * 4, budget * 4)?,
+                scores: self.scores.range(row * cap * 4, len * cap * 4)?,
+                blocks: self.chosen.range(row * budget * 4, len * budget * 4)?,
                 status: None,
             },
         )

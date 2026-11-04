@@ -1,8 +1,8 @@
-// The sparse decode attention of Qwen3.8 Flash-Next QSA (see resident/qsa_attn.h). The split
-// kernel runs one block per (kv head, split) with one warp per query head of the group: the
+// The sparse attention of Qwen3.8 Flash-Next QSA (see resident/qsa_attn.h). The split kernel
+// runs one block per (kv head, split, token) with one warp per query head of the group: the
 // split's attended positions go through shared memory 32 at a time, fp16 keys and values in
 // 16-byte loads, and each warp keeps an online softmax (max, sum, 8 partial values per lane).
-// The combine kernel merges the splits per head and applies the sigmoid output gate.
+// The combine kernel merges the splits per (head, token) and applies the sigmoid output gate.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -16,6 +16,7 @@
 
 namespace {
 
+constexpr int kMaxM = 32768;
 constexpr int kHead = 256;
 constexpr int kLaneDims = kHead / 32;
 constexpr int kTile = 32;
@@ -46,7 +47,7 @@ bool shape_ok(const inference_cuda_qsa_attn_args &a) {
         a.n_head % a.n_kv_head != 0 || a.n_head / a.n_kv_head > kMaxGroup) {
         return false;
     }
-    return a.rows >= 1 && a.rows <= kMaxRows && a.ratio >= 1 && a.ratio <= kMaxRatio &&
+    return a.m >= 1 && a.m <= kMaxM && a.rows >= 1 && a.rows <= kMaxRows && a.ratio >= 1 && a.ratio <= kMaxRatio &&
            a.budget_blocks >= 1 && a.budget_blocks <= kMaxBudget && a.max_splits >= 1 &&
            a.max_splits <= kMaxSplits && (long long)a.ld >= (long long)a.n_head * 2 * kHead &&
            std::isfinite(a.scale);
@@ -65,14 +66,18 @@ bool valid(const inference_cuda_qsa_attn_args &a, void *stream) {
     for (const void *p : narrow) {
         if (p != NULL && !aligned(p, 4)) return false;
     }
-    const size_t f = 4, heads = (size_t)a.n_head;
+    const size_t f = 4, m = (size_t)a.m, heads = (size_t)a.n_head;
     const size_t cache = (size_t)a.rows * a.n_kv_head * kHead * 2;
-    const Span written[] = {{a.part, heads * a.max_splits * kPartStride * f},
-                            {a.out, heads * kHead * f},
+    const size_t proj = ((m - 1) * a.ld + heads * 2 * kHead) * f;
+    const Span written[] = {{a.part, m * heads * a.max_splits * kPartStride * f},
+                            {a.out, m * heads * kHead * f},
                             {a.status, f}};
-    const Span read[] = {{a.q, heads * kHead * f},       {a.proj, heads * 2 * kHead * f},
-                         {a.k_cache, cache},             {a.v_cache, cache},
-                         {a.chosen, (size_t)a.budget_blocks * f}, {a.pos, f}};
+    const Span read[] = {{a.q, m * heads * kHead * f},
+                         {a.proj, proj},
+                         {a.k_cache, cache},
+                         {a.v_cache, cache},
+                         {a.chosen, m * a.budget_blocks * f},
+                         {a.pos, f}};
     for (int i = 0; i < 3; ++i) {
         for (int j = i + 1; j < 3; ++j) {
             if (!apart(written[i], written[j])) return false;
@@ -90,20 +95,23 @@ struct AttnArgs {
     const int *chosen, *pos;
     float *part, *out;
     int *status;
-    int ld, n_head, n_kv, rows, ratio, budget, splits, pos0;
+    int ld, n_head, n_kv, rows, ratio, budget, splits, pos0, m;
     float scale;
 };
 
-/* The attended positions of the token: `count` of them, the chosen blocks' first. */
+/* The attended positions of token t: `count` of them, the chosen blocks' first. ok is false
+ * for every token when the chunk's positions do not fit the cache. */
 struct Window {
     bool ok;
     int blocks, take, count;
+    const int *chosen;
 };
 
-__device__ Window window_of(const AttnArgs &a) {
-    const long long p = a.pos != NULL ? (long long)*a.pos : (long long)a.pos0;
-    Window w{p >= 0 && p + 1 <= a.rows, 0, 0, 0};
+__device__ Window window_of(const AttnArgs &a, int t) {
+    const long long first = a.pos != NULL ? (long long)*a.pos : (long long)a.pos0;
+    Window w{first >= 0 && first + a.m <= a.rows, 0, 0, 0, a.chosen + (size_t)t * a.budget};
     if (!w.ok) return w;
+    const long long p = first + t;
     w.blocks = (int)((p + 1) / a.ratio);
     w.take = w.blocks < a.budget ? w.blocks : a.budget;
     w.count = w.take * a.ratio + (int)(p + 1 - (long long)w.blocks * a.ratio);
@@ -114,7 +122,7 @@ __device__ Window window_of(const AttnArgs &a) {
 __device__ int row_of(const AttnArgs &a, const Window &w, int j) {
     const int chosen_end = w.take * a.ratio;
     if (j >= chosen_end) return w.blocks * a.ratio + (j - chosen_end);
-    const int b = a.chosen[j / a.ratio];
+    const int b = w.chosen[j / a.ratio];
     return b >= 0 && b < w.blocks ? b * a.ratio + j % a.ratio : -1;
 }
 
@@ -168,20 +176,21 @@ __device__ void stage(const AttnArgs &a, const Window &w, int g, int t0, int n, 
     __syncthreads();
 }
 
-// One block per (kv head, split), group * 32 threads, warp w = query head g * group + w.
+// One block per (kv head, split, token), group * 32 threads, warp w = query head g * group + w.
 __global__ void __launch_bounds__(kMaxGroup * 32) qsa_attn_split_k(AttnArgs a) {
     __shared__ __align__(16) Tiles s;
-    const int g = blockIdx.x, split = blockIdx.y;
+    const int g = blockIdx.x, split = blockIdx.y, t = blockIdx.z;
     const int group = a.n_head / a.n_kv;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int h = g * group + warp;
-    const Window w = window_of(a);
+    const size_t th = (size_t)t * a.n_head + h;
+    const Window w = window_of(a, t);
     if (!w.ok) return;
     const int per = (w.count + a.splits - 1) / a.splits;
     const int lo = split * per;
     const int hi = lo + per < w.count ? lo + per : w.count;
     float q[kLaneDims], acc[kLaneDims];
-    const float4 *q4 = reinterpret_cast<const float4 *>(a.q + (size_t)h * kHead + lane * kLaneDims);
+    const float4 *q4 = reinterpret_cast<const float4 *>(a.q + th * kHead + lane * kLaneDims);
     const float4 qa = q4[0], qb = q4[1];
     q[0] = qa.x, q[1] = qa.y, q[2] = qa.z, q[3] = qa.w;
     q[4] = qb.x, q[5] = qb.y, q[6] = qb.z, q[7] = qb.w;
@@ -212,7 +221,7 @@ __global__ void __launch_bounds__(kMaxGroup * 32) qsa_attn_split_k(AttnArgs a) {
         }
         __syncthreads();
     }
-    float *part = a.part + ((size_t)h * a.splits + split) * kPartStride;
+    float *part = a.part + (th * a.splits + split) * kPartStride;
     if (lane == 0) {
         part[0] = s.bad ? __int_as_float(0x7fc00000) : m;
         part[1] = l;
@@ -221,18 +230,19 @@ __global__ void __launch_bounds__(kMaxGroup * 32) qsa_attn_split_k(AttnArgs a) {
     for (int i = 0; i < kLaneDims; ++i) part[2 + lane * kLaneDims + i] = acc[i];
 }
 
-// One block per query head, one thread per value.
+// One block per (query head, token), one thread per value.
 __global__ void __launch_bounds__(kHead) qsa_attn_combine_k(AttnArgs a) {
-    const int h = blockIdx.x, d = threadIdx.x;
-    const Window w = window_of(a);
+    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const size_t th = (size_t)t * a.n_head + h;
+    const Window w = window_of(a, t);
     bool poisoned = !w.ok;
     float top = -INFINITY;
     for (int sp = 0; !poisoned && sp < a.splits; ++sp) {
-        const float m = a.part[((size_t)h * a.splits + sp) * kPartStride];
+        const float m = a.part[(th * a.splits + sp) * kPartStride];
         poisoned = m != m;
         top = fmaxf(top, m);
     }
-    float *out = a.out + (size_t)h * kHead + d;
+    float *out = a.out + th * kHead + d;
     if (poisoned) {
         *out = __int_as_float(0x7fc00000);
         if (a.status != NULL && h == 0 && d == 0) atomicOr(a.status, kStatusBits);
@@ -240,14 +250,14 @@ __global__ void __launch_bounds__(kHead) qsa_attn_combine_k(AttnArgs a) {
     }
     float sum = 0.0f, value = 0.0f;
     for (int sp = 0; sp < a.splits; ++sp) {
-        const float *part = a.part + ((size_t)h * a.splits + sp) * kPartStride;
+        const float *part = a.part + (th * a.splits + sp) * kPartStride;
         if (part[1] > 0.0f) {
             const float f = expf(part[0] - top);
             sum += part[1] * f;
             value += part[2 + d] * f;
         }
     }
-    const float gate = a.proj[(size_t)h * 2 * kHead + kHead + d];
+    const float gate = a.proj[(size_t)t * a.ld + (size_t)h * 2 * kHead + kHead + d];
     *out = value / sum * (1.0f / (1.0f + expf(-gate)));
 }
 
@@ -266,14 +276,15 @@ extern "C" int inference_cuda_qsa_attn_launch(const inference_cuda_qsa_attn_args
                          (float *)x.part,         (float *)x.out,         (int *)x.status,
                          x.ld,                    x.n_head,               x.n_kv_head,
                          x.rows,                  x.ratio,                x.budget_blocks,
-                         x.max_splits,            x.pos0,                 x.scale};
+                         x.max_splits,            x.pos0,                 x.m,
+                         x.scale};
         const cudaStream_t s = (cudaStream_t)stream;
         const int group = x.n_head / x.n_kv_head;
         Failure failure;
-        qsa_attn_split_k<<<dim3(x.n_kv_head, x.max_splits), group * 32, 0, s>>>(a);
+        qsa_attn_split_k<<<dim3(x.n_kv_head, x.max_splits, x.m), group * 32, 0, s>>>(a);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.err == cudaSuccess) {
-            qsa_attn_combine_k<<<x.n_head, kHead, 0, s>>>(a);
+            qsa_attn_combine_k<<<dim3(x.n_head, x.m), kHead, 0, s>>>(a);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
         report_stage(out_stage, failure.stage);

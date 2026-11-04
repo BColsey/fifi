@@ -18,10 +18,11 @@
  *   ring[p % ratio] = raw(p) for the last min(m, ratio) positions of the chunk, so the ring holds
  *   the raw keys of the open block for the next call. The pooling order is the host's, so a
  *   pooled value equals the host's bits for the same raw keys.
- * score, for the token at position p (one token):
- *   scores[b] = sum over h, in head order, of max(queries[h] . keys[b], 0), a NaN dot taken as 0
- *   for b < (p + 1) / ratio. The host's 1 / sqrt(dim) is left out: a positive scale does not
- *   change the ranking, and the selection is the only consumer.
+ * score, for the m tokens at positions p0 .. p0 + m - 1 (token t at p = p0 + t):
+ *   scores[t][b] = sum over h, in head order, of max(queries[t][h] . keys[b], 0), a NaN dot
+ *   taken as 0, for b < (p + 1) / ratio. The host's 1 / sqrt(dim) is left out: a positive scale
+ *   does not change the ranking, and the selection is the only consumer. Token t reads only the
+ *   keys of blocks completed at its position, so a prefill chunk is scored after its index call.
  *
  * The position of token 0 is read from the device word `pos` when it is given (a decode graph
  * replays it), else it is the launch argument pos0. Poison rule (attn_prep's): if that position
@@ -65,9 +66,9 @@ typedef struct inference_cuda_qsa_index_args {
 } inference_cuda_qsa_index_args;
 
 typedef struct inference_cuda_qsa_score_args {
-    const void *queries; /* f32 [heads][dim], the token at the position */
+    const void *queries; /* f32 [m][heads][dim] */
     const void *keys;    /* f32 [cap_blocks][dim] */
-    void *scores;        /* f32 [cap_blocks], [0, (pos + 1) / ratio) written */
+    void *scores;        /* f32 [m][cap_blocks], row t: [0, (p0 + t + 1) / ratio) written */
     const void *pos;     /* device i32 position, or NULL for pos0 */
     void *status;        /* device i32, or NULL */
     int heads;
@@ -75,6 +76,7 @@ typedef struct inference_cuda_qsa_score_args {
     int ratio;
     int cap_blocks;
     int pos0;
+    int m;
 } inference_cuda_qsa_score_args;
 
 int inference_cuda_qsa_index_launch(const inference_cuda_qsa_index_args *args, void *stream,
@@ -98,7 +100,8 @@ static_assert(sizeof(inference_cuda_qsa_index_args) == 112 &&
 static_assert(sizeof(inference_cuda_qsa_score_args) == 64 &&
                   offsetof(inference_cuda_qsa_score_args, status) == 32 &&
                   offsetof(inference_cuda_qsa_score_args, heads) == 40 &&
-                  offsetof(inference_cuda_qsa_score_args, pos0) == 56,
+                  offsetof(inference_cuda_qsa_score_args, pos0) == 56 &&
+                  offsetof(inference_cuda_qsa_score_args, m) == 60,
               "inference_cuda_qsa_score_args layout");
 #endif
 

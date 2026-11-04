@@ -1,5 +1,5 @@
 // The block selection of Qwen3.8 Flash-Next QSA attention (see resident/qsa_select.h). One
-// block of 1024 threads: a radix select over the f32 bits of the scores (a nonnegative f32
+// block of 1024 threads per token: a radix select over the f32 bits of the scores (a nonnegative f32
 // orders as its bits) finds the take-th largest score T and how many scores equal to T are
 // kept, then one ordered pass writes the blocks above T and the lowest-indexed blocks equal
 // to T, so the result is the host's set and comes out in ascending order.
@@ -14,6 +14,7 @@
 
 namespace {
 
+constexpr int kMaxM = 32768;
 constexpr int kThreads = 1024;
 constexpr int kWarps = kThreads / 32;
 constexpr int kMaxRatio = 64;
@@ -32,7 +33,7 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 
 bool valid(const inference_cuda_qsa_select_args &a, void *stream) {
     if (stream == NULL || a.scores == NULL || a.blocks == NULL) return false;
-    if (a.ratio < 1 || a.ratio > kMaxRatio || a.cap_blocks < 1 || a.cap_blocks > kMaxCapBlocks ||
+    if (a.m < 1 || a.m > kMaxM || a.ratio < 1 || a.ratio > kMaxRatio || a.cap_blocks < 1 || a.cap_blocks > kMaxCapBlocks ||
         a.budget_blocks < 1 || a.budget_blocks > a.cap_blocks) {
         return false;
     }
@@ -40,7 +41,8 @@ bool valid(const inference_cuda_qsa_select_args &a, void *stream) {
     for (const void *p : ptrs) {
         if (p != NULL && !aligned(p)) return false;
     }
-    const size_t scores = (size_t)a.cap_blocks * 4, blocks = (size_t)a.budget_blocks * 4;
+    const size_t m = (size_t)a.m;
+    const size_t scores = m * a.cap_blocks * 4, blocks = m * a.budget_blocks * 4;
     return apart(a.blocks, blocks, a.scores, scores) && apart(a.blocks, blocks, a.pos, 4) &&
            apart(a.blocks, blocks, a.status, 4) && apart(a.status, 4, a.scores, scores) &&
            apart(a.status, 4, a.pos, 4);
@@ -71,20 +73,29 @@ __device__ int exclusive_count(bool flag, int *total) {
     return before + in_warp;
 }
 
-__global__ void __launch_bounds__(kThreads)
-    qsa_select_k(const float *scores, int *out, const int *pos, int *status, int ratio,
-                 int cap_blocks, int budget_blocks, int pos0) {
+struct SelectArgs {
+    const float *scores;
+    int *blocks;
+    const int *pos;
+    int *status;
+    int ratio, cap_blocks, budget_blocks, pos0, m;
+};
+
+// Grid block x selects for token x.
+__global__ void __launch_bounds__(kThreads) qsa_select_k(SelectArgs a) {
     __shared__ unsigned hist[kDigits];
     __shared__ unsigned s_prefix;
     __shared__ int s_need;
     const int tid = threadIdx.x;
-    const long long at = pos != NULL ? (long long)*pos : (long long)pos0;
-    if (at < 0 || at + 1 > (long long)cap_blocks * ratio) {
-        if (status != NULL && tid == 0) atomicOr(status, kStatusBits);
+    const long long first = a.pos != NULL ? (long long)*a.pos : (long long)a.pos0;
+    if (first < 0 || first + a.m > (long long)a.cap_blocks * a.ratio) {
+        if (a.status != NULL && blockIdx.x == 0 && tid == 0) atomicOr(a.status, kStatusBits);
         return;
     }
-    const int blocks = (int)((at + 1) / ratio);
-    const int take = blocks < budget_blocks ? blocks : budget_blocks;
+    const float *scores = a.scores + (size_t)blockIdx.x * a.cap_blocks;
+    int *out = a.blocks + (size_t)blockIdx.x * a.budget_blocks;
+    const int blocks = (int)((first + blockIdx.x + 1) / a.ratio);
+    const int take = blocks < a.budget_blocks ? blocks : a.budget_blocks;
     if (take == 0) return;
     // Radix select, most significant digit first: after the last pass `prefix` is T and `need`
     // is the number of scores equal to T inside the top `take`.
@@ -143,9 +154,10 @@ extern "C" int inference_cuda_qsa_select_launch(const inference_cuda_qsa_select_
         }
         const inference_cuda_qsa_select_args &a = *args;
         Failure failure;
-        qsa_select_k<<<1, kThreads, 0, (cudaStream_t)stream>>>(
-            (const float *)a.scores, (int *)a.blocks, (const int *)a.pos, (int *)a.status, a.ratio,
-            a.cap_blocks, a.budget_blocks, a.pos0);
+        const SelectArgs k{(const float *)a.scores, (int *)a.blocks, (const int *)a.pos,
+                           (int *)a.status,         a.ratio,         a.cap_blocks,
+                           a.budget_blocks,         a.pos0,          a.m};
+        qsa_select_k<<<a.m, kThreads, 0, (cudaStream_t)stream>>>(k);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

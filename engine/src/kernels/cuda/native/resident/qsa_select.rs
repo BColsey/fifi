@@ -20,7 +20,7 @@ use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 use crate::kernels::cuda::native::resident::qsa_index::{
-    QSA_MAX_CAP_BLOCKS, QSA_MAX_RATIO, all_apart, fits, optional,
+    QSA_MAX_CAP_BLOCKS, QSA_MAX_M, QSA_MAX_RATIO, all_apart, fits, optional,
 };
 
 const WORD: usize = 4;
@@ -35,13 +35,15 @@ struct QsaSelectArgsRaw {
     cap_blocks: c_int,
     budget_blocks: c_int,
     pos0: c_int,
+    m: c_int,
 }
 
 const _: () = assert!(
-    size_of::<QsaSelectArgsRaw>() == 48
+    size_of::<QsaSelectArgsRaw>() == 56
         && offset_of!(QsaSelectArgsRaw, status) == 24
         && offset_of!(QsaSelectArgsRaw, ratio) == 32
         && offset_of!(QsaSelectArgsRaw, pos0) == 44
+        && offset_of!(QsaSelectArgsRaw, m) == 48
 );
 
 unsafe extern "C" {
@@ -53,10 +55,11 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Blocks of `ratio` positions, a score array of `cap_blocks`, and at most `budget_blocks`
-/// selected blocks.
+/// `m` tokens, blocks of `ratio` positions, a score row of `cap_blocks` per token, and at most
+/// `budget_blocks` selected blocks per token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::kernels::cuda) struct QsaSelectDims {
+    pub(in crate::kernels::cuda) m: usize,
     pub(in crate::kernels::cuda) ratio: usize,
     pub(in crate::kernels::cuda) cap_blocks: usize,
     pub(in crate::kernels::cuda) budget_blocks: usize,
@@ -65,7 +68,8 @@ pub(in crate::kernels::cuda) struct QsaSelectDims {
 impl QsaSelectDims {
     /// True when every dimension is inside the limits of `qsa_select.h`.
     pub(in crate::kernels::cuda) fn inside(self) -> bool {
-        (1..=QSA_MAX_RATIO).contains(&self.ratio)
+        (1..=QSA_MAX_M).contains(&self.m)
+            && (1..=QSA_MAX_RATIO).contains(&self.ratio)
             && (1..=QSA_MAX_CAP_BLOCKS).contains(&self.cap_blocks)
             && (1..=self.cap_blocks).contains(&self.budget_blocks)
     }
@@ -85,7 +89,11 @@ fn check_select(call: &QsaSelectRaw<'_>) -> bool {
     if !dims.inside() {
         return false;
     }
-    let (scores, blocks) = (dims.cap_blocks * WORD, dims.budget_blocks * WORD);
+    // Inside the limits nothing overflows: the largest product is 2^15 * 2^24 * 4 bytes.
+    let (scores, blocks) = (
+        dims.m * dims.cap_blocks * WORD,
+        dims.m * dims.budget_blocks * WORD,
+    );
     let word_fits = |range: &Option<RawRange<'_>>| range.as_ref().is_none_or(|r| fits(r, WORD));
     let sized = fits(&call.scores, scores)
         && fits(&call.blocks, blocks)
@@ -98,8 +106,8 @@ fn check_select(call: &QsaSelectRaw<'_>) -> bool {
     sized && all_apart(&written, &read)
 }
 
-/// Queues the selection kernel on `stream`: the indices of the best blocks at the position, in
-/// ascending order.
+/// Queues the selection kernel on `stream`: per token, the indices of the best blocks at its
+/// position, in ascending order.
 pub(in crate::kernels::cuda) fn qsa_select_launch(
     stream: &RawStream,
     call: QsaSelectRaw<'_>,
@@ -118,6 +126,7 @@ pub(in crate::kernels::cuda) fn qsa_select_launch(
         cap_blocks: as_int(dims.cap_blocks)?,
         budget_blocks: as_int(dims.budget_blocks)?,
         pos0: call.pos0,
+        m: as_int(dims.m)?,
     };
     let mut stage = STAGE_NONE;
     // SAFETY: `check_select` proved every range inside its live allocation (`RawRange::new`),
