@@ -1088,25 +1088,47 @@ impl ScanRig {
     ) -> Result<(), EngError> {
         let shape = inp.shape(m, p0, ctx_tokens);
         let need = scan_bytes(shape)?;
-        self.rig.ctx.gdn_scan_seq(
-            &self.rig.stream,
-            GdnScanSeqCall {
-                shape,
-                eps: GDN_SCAN_EPS,
-                conv: self.conv.range(row0 * shape.conv_ld * 4, need.conv)?,
-                proj: self.proj.range(row0 * shape.ld * 4, need.proj)?,
-                weights: ScanWeights {
-                    a: self.a.range(0, need.a)?,
-                    dt_bias: self.dt.range(0, need.dt_bias)?,
-                    norm_w: self.nw.range(0, need.norm_w)?,
-                },
-                state: self.state.range(0, need.state)?,
-                o_out: self
-                    .o_out
-                    .range(row0 * shape.n_v_heads * D * 4, need.o_out)?,
-                status: None,
+        self.rig
+            .ctx
+            .gdn_scan_seq(&self.rig.stream, self.call(shape, &need, row0)?)
+    }
+
+    /// [`ScanRig::run`] with the rules of `form`.
+    fn run_form(
+        &self,
+        inp: &ScanInputs,
+        (m, p0, row0): (usize, i64, usize),
+        form: super::GdnForm,
+    ) -> Result<(), EngError> {
+        let shape = inp.shape(m, p0, inp.m.max(1024));
+        let need = scan_bytes(shape)?;
+        self.rig
+            .ctx
+            .gdn_scan_seq_form(&self.rig.stream, self.call(shape, &need, row0)?, form)
+    }
+
+    fn call(
+        &self,
+        shape: ScanShape,
+        need: &super::ScanBytes,
+        row0: usize,
+    ) -> Result<GdnScanSeqCall<'_>, EngError> {
+        Ok(GdnScanSeqCall {
+            shape,
+            eps: GDN_SCAN_EPS,
+            conv: self.conv.range(row0 * shape.conv_ld * 4, need.conv)?,
+            proj: self.proj.range(row0 * shape.ld * 4, need.proj)?,
+            weights: ScanWeights {
+                a: self.a.range(0, need.a)?,
+                dt_bias: self.dt.range(0, need.dt_bias)?,
+                norm_w: self.nw.range(0, need.norm_w)?,
             },
-        )
+            state: self.state.range(0, need.state)?,
+            o_out: self
+                .o_out
+                .range(row0 * shape.n_v_heads * D * 4, need.o_out)?,
+            status: None,
+        })
     }
 
     /// The gated rows, the state and the conv rows (read back so a test can prove the scan
@@ -1138,8 +1160,18 @@ struct RunOut {
 /// head) and the state, both relative to max(|ref|, 1). Printed for the lane-M report. Every
 /// value must be finite first (`assert_scan_finite`): the folds below drop NaN.
 fn judge_scan(inp: &ScanInputs, got: &[f32], state: &[f32], label: &str) -> (f64, f64) {
+    judge_scan_with(inp, (got, state), label, RefOpts::default())
+}
+
+/// [`judge_scan`] against the reference variant `opts`.
+fn judge_scan_with(
+    inp: &ScanInputs,
+    (got, state): (&[f32], &[f32]),
+    label: &str,
+    opts: RefOpts,
+) -> (f64, f64) {
     assert_scan_finite(label, inp, got, state);
-    let want = scan_reference(inp, RefOpts::default());
+    let want = scan_reference(inp, opts);
     let mut worst = (0.0f64, 0usize, 0usize);
     for t in 0..inp.m {
         for h in 0..inp.nv {
@@ -1968,6 +2000,7 @@ fn gdn_scan_seq_fault_bad_bounds_reports_bit_8() -> Result<(), EngError> {
             status: Some(rig.ctx.raw_range(&status.range(0, 4)?)?),
             ints,
             eps: GDN_SCAN_EPS,
+            form: 0,
         };
         rig.ctx
             .launch_on(&rig.stream, |raw| gdn_scan_seq_fault_bad_bounds(raw, io))?;
@@ -2716,3 +2749,7 @@ fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
     println!("SPEED spot check: 12 sampled values of the timed run inside E3");
     Ok(())
 }
+
+// ---- the form bits (Qwen3.8 Flash-Next) --------------------------------------------------
+
+mod forms;

@@ -38,7 +38,8 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
-    GdnScanSeqInts, GdnScanSeqRaw, gdn_scan_seq_launch,
+    FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GdnScanSeqInts, GdnScanSeqRaw,
+    gdn_scan_seq_launch,
 };
 
 /// The kernel-side geometry of one chunk: the conv channel count
@@ -120,8 +121,76 @@ const MAX_V_HEADS: usize = 128;
 const MAX_LD: usize = 1 << 22;
 const MAX_CTX: usize = (1 << 30) - 1;
 
+/// Which key head value head `h` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdnKeyHeads {
+    /// `h % n_k_heads`: the key heads repeat across the value heads (the GGUF layout).
+    Tiled,
+    /// `h / (n_v_heads / n_k_heads)`: consecutive value heads share a key head (the Hugging
+    /// Face layout).
+    Grouped,
+}
+
+/// The q/k L2 norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdnL2 {
+    /// `x * rsqrt(fmax(sum(x^2), eps^2))`, the ggml form.
+    Ggml,
+    /// `x * rsqrt(sum(x^2) + eps)`, the Hugging Face `l2norm`.
+    AddEps,
+}
+
+/// The output gate applied after the RMSNorm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdnGate {
+    /// `silu(z)`.
+    Silu,
+    /// `sigmoid(z)`.
+    Sigmoid,
+}
+
+/// The model rules of a scan call. The numerics of each rule are fixed by the header
+/// `native/prefill/gdn_scan_seq.h`; every combination is a kernel instance of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GdnForm {
+    pub(crate) key_heads: GdnKeyHeads,
+    pub(crate) l2: GdnL2,
+    pub(crate) gate: GdnGate,
+}
+
+impl GdnForm {
+    /// Qwen3.6 GGUF, the form of [`CudaContext::gdn_scan_seq`].
+    pub(crate) const QWEN36_GGUF: Self = Self {
+        key_heads: GdnKeyHeads::Tiled,
+        l2: GdnL2::Ggml,
+        gate: GdnGate::Silu,
+    };
+    /// Qwen3.8 Flash-Next: the Hugging Face head order and L2 norm, and a sigmoid gate.
+    pub(crate) const FLASH_NEXT: Self = Self {
+        key_heads: GdnKeyHeads::Grouped,
+        l2: GdnL2::AddEps,
+        gate: GdnGate::Sigmoid,
+    };
+
+    fn bits(self) -> c_int {
+        let heads = match self.key_heads {
+            GdnKeyHeads::Tiled => 0,
+            GdnKeyHeads::Grouped => FORM_GROUPED_HEADS,
+        };
+        let l2 = match self.l2 {
+            GdnL2::Ggml => 0,
+            GdnL2::AddEps => FORM_ADD_EPS_L2,
+        };
+        let gate = match self.gate {
+            GdnGate::Silu => 0,
+            GdnGate::Sigmoid => FORM_SIGMOID_GATE,
+        };
+        heads | l2 | gate
+    }
+}
+
 /// Geometry of one scan call: `m` tokens at position `p0` of `ctx_tokens`, `n_k_heads` key
-/// heads tiled over `n_v_heads` value heads of `head_dim`, the conv row length `conv_ld`, and
+/// heads shared by `n_v_heads` value heads of `head_dim` (as [`GdnKeyHeads`] says), the conv row length `conv_ld`, and
 /// the projection row length `ld` with its `z`/`beta`/`alpha` float offsets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScanShape {
@@ -356,9 +425,20 @@ fn check_apart(call: &GdnScanSeqCall<'_>, need: &ScanBytes) -> Result<(), EngErr
 }
 
 impl CudaContext {
-    /// Queues the sequential scan of `call` on `stream`: K1 (the value-sliced scan, the
-    /// state updated in place, the pre-norm rows written) then K2 (the gated output RMSNorm
-    /// in place on the same rows). No allocation, no copies, no synchronization.
+    /// Queues the sequential scan of `call` on `stream` in the Qwen3.6 GGUF form
+    /// ([`GdnForm::QWEN36_GGUF`]); see [`CudaContext::gdn_scan_seq_form`].
+    pub(crate) fn gdn_scan_seq(
+        &self,
+        stream: &DeviceStream,
+        call: GdnScanSeqCall<'_>,
+    ) -> Result<(), EngError> {
+        self.gdn_scan_seq_form(stream, call, GdnForm::QWEN36_GGUF)
+    }
+
+    /// Queues the sequential scan of `call` on `stream` with the rules of `form`: K1 (the
+    /// value-sliced scan, the state updated in place, the pre-norm rows written) then K2 (the
+    /// gated output RMSNorm in place on the same rows). No allocation, no copies, no
+    /// synchronization.
     ///
     /// If a layer launch faults mid-chunk, the in-place state is advanced only up to that
     /// layer, so the driver must poison the session, not resume it.
@@ -366,10 +446,11 @@ impl CudaContext {
     /// Returns `BadRequest`, before any native call, for a stream or buffer of another
     /// context, a shape the kernels refuse, a range too short or misaligned, and a
     /// `state`/`o_out`/status overlap.
-    pub(crate) fn gdn_scan_seq(
+    pub(crate) fn gdn_scan_seq_form(
         &self,
         stream: &DeviceStream,
         call: GdnScanSeqCall<'_>,
+        form: GdnForm,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         check_shape(&call.shape, call.eps)?;
@@ -390,6 +471,7 @@ impl CudaContext {
             .map(|r| self.raw_range(r))
             .transpose()?;
         let eps = call.eps;
+        let form = form.bits();
         self.launch_on(stream, move |raw| {
             gdn_scan_seq_launch(
                 raw,
@@ -404,6 +486,7 @@ impl CudaContext {
                     status,
                     ints,
                     eps,
+                    form,
                 },
             )
         })
