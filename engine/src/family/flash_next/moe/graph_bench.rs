@@ -89,7 +89,7 @@ use crate::{
         PinnedBuf, TimingEvent,
         prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
         resident::{
-            exl3::SingleRow,
+            exl3::{SINGLE_GATHER_VAR, SingleRow},
             moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
         },
@@ -1116,6 +1116,9 @@ fn token_cases(rig: &mut Rig<'_>) -> Res<()> {
 /// The kernel variants of the variants phase: the default (no setting: the gather kernel for the
 /// shared expert and one column tile per block for the id-indexed projections) and the existing
 /// wide kernels with 1, 2, 4 and 8 column tiles per block.
+///
+/// A served EXL3 pack starts on `wide1` (`qwen36::cuda::start`), so `wide1` is the baseline for a
+/// kernel decision; `default` against `wide1` isolates the shared expert's kernel.
 const VARIANTS: [(&str, SingleRow); 5] = [
     ("default", SingleRow::Legacy),
     ("wide1", SingleRow::Wide(1)),
@@ -1185,6 +1188,13 @@ fn token_with(rig: &mut Rig<'_>, queue: &dyn Fn(&Rig<'_>) -> Res<()>) -> Res<f64
 /// and 48 graph launches back to back. The variants take turns inside every trial, and the first
 /// trial is a warm-up, so slow clock drift spreads over all of them.
 fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
+    // The variable is read once per process and wins over every default, so all the variants
+    // would run one kernel under their own names.
+    if std::env::var_os(SINGLE_GATHER_VAR).is_some() {
+        return Err(fail(format!(
+            "the variants phase needs {SINGLE_GATHER_VAR} unset"
+        )));
+    }
     let graphs = variant_graphs(rig)?;
     let names = [
         "graph_isolated",
@@ -1193,14 +1203,24 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
         "graph_token48",
     ];
     let mut samples: Vec<[Vec<f64>; 4]> = VARIANTS.iter().map(|_| Default::default()).collect();
+    // Gated reps per variant where the host was still queueing when the gate opened.
+    let mut late = [0usize; VARIANTS.len()];
     for trial in 0..=VARIANT_TRIALS {
         clock_mark(&format!("variants_trial{trial}"));
-        for ((_, kernel), (graph, into)) in VARIANTS.iter().zip(graphs.iter().zip(&mut samples)) {
+        for (v, ((_, kernel), (graph, into))) in VARIANTS
+            .iter()
+            .zip(graphs.iter().zip(&mut samples))
+            .enumerate()
+        {
             let replay = |r: &Rig<'_>| graph.launch(&r.compute);
             let mut got: [Vec<f64>; 4] = Default::default();
             for _ in 0..VARIANT_REPS {
                 got[0].push(rep_with(rig, false, &replay)?.device);
-                got[1].push(rep_with(rig, true, &replay)?.device);
+                let gated = rep_with(rig, true, &replay)?;
+                got[1].push(gated.device);
+                if trial > 0 {
+                    late[v] += usize::from(gated.late);
+                }
             }
             rig.ctx.set_single_row_default(*kernel);
             for _ in 0..VARIANT_REPS {
@@ -1219,14 +1239,19 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
         }
     }
     rig.ctx.set_single_row_default(SingleRow::Legacy);
-    for ((name, _), got) in VARIANTS.iter().zip(&samples) {
+    for (((name, _), got), late) in VARIANTS.iter().zip(&samples).zip(late) {
         for (what, values) in names.iter().zip(got) {
+            let extra = if *what == "graph_gated" {
+                format!(",\"late\":{late}")
+            } else {
+                String::new()
+            };
             emit(
                 "graph_variants",
                 &format!("{name}_{what}"),
                 "us",
                 values,
-                "",
+                &extra,
             );
         }
     }

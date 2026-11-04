@@ -19,19 +19,23 @@
 //! with the DRAM traffic taken away, so the cold/warm gap bounds what memory costs.
 //!
 //! Each case runs `LAUNCHES` launches back to back, with a timing mark between launches.
-//! - The stream first runs a device copy (the gate, about 1 ms) while the host queues the
-//!   launches behind it, so the launches run back to back instead of at the host's pace. A case
-//!   whose queueing outlasted its gate counts as late: its samples may hold host gaps.
-//! - Every trial runs all four variants of a case one after another, so clock drift spreads over
-//!   them. The first trial is a warm-up.
-//! - Before timing, every variant's output rows are compared bit for bit with cols = 1 for one
-//!   pick set per launch. The rows are filled with NaN first, so a skipped write shows.
+//! - The stream first runs a device copy (the gate, about 2.5 ms) while the host queues the
+//!   launches behind it, so the launches run back to back instead of at the host's pace.
+//! - A run counts as late when the host finished queueing it after the device could have
+//!   reached its start; its sample may hold a host gap. The test is conservative: it can count a
+//!   clean run as late, never a gapped run as clean.
+//! - Every trial runs all four variants of a case one after another, in an order that rotates
+//!   from trial to trial, so clock drift and position spread over them. The first trial is a
+//!   warm-up.
+//! - Before timing, every variant's output rows are compared bit for bit with cols = 1 for the
+//!   first and last cold pick sets and the warm set, for every launch. The output rows, the
+//!   rotated inputs and the split-K partials are filled with NaN first, so a skipped write shows.
 //! - The arithmetic flag must stay 0.
 //!
-//! Each sample is the whole three-kernel chain of a launch, plus a timing mark. A profiled run
-//! (Nsight Systems) splits it into kernels.
+//! Each sample is one run of a case: its launches (three kernels each) plus a timing mark. A
+//! profiled run (Nsight Systems) splits it into kernels.
 
-use std::{ops::Range, time::Instant};
+use std::{collections::HashSet, ops::Range, time::Instant};
 
 use super::{
     exl3_cuda_tests::{Router, input, upload},
@@ -56,10 +60,11 @@ const LAUNCHES: usize = 48;
 const TRIALS: usize = 4;
 /// The most pairs one id-indexed launch takes.
 const MAX_PAIRS: usize = 16;
-/// Bytes of the gate's device copy: about 1 ms at the 3090's copy rate.
-const GATE_BYTES: usize = 384 << 20;
+/// Bytes of the gate's device copy: about 2.5 ms at the 3090's copy rate, longer than the host
+/// takes to queue the largest case.
+const GATE_BYTES: usize = 1 << 30;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Shape {
     GateUp,
     Down,
@@ -133,11 +138,11 @@ struct Rig<'a> {
     stream: DeviceStream,
 }
 
-/// The samples of one `Rig::time` call, whether its host queueing outlasted the gate, and the
-/// host's queueing time per launch.
+/// The samples of one `Rig::time` call, how many of them are late, and the host's queueing time
+/// per launch.
 struct Timed {
     samples: Vec<f64>,
-    late: bool,
+    late: usize,
     queue_us_per_launch: f64,
 }
 
@@ -176,13 +181,17 @@ impl Rig<'_> {
         self.ctx.exl3_grouped_indexed(&self.stream, &calls, cols)
     }
 
-    /// The output rows of one launch of `pairs` under `cols`, written over NaN.
-    fn outputs(&self, shape: Shape, pairs: &Range<usize>, cols: u32) -> Res<Vec<u8>> {
-        let (_, n, _) = self.dims_of(shape);
+    /// The output rows of one launch of `pairs` with the id set `set` under `cols`. The output
+    /// rows, rotated inputs and split-K partials are NaN beforehand, so a skipped write of any of
+    /// them reaches the output.
+    fn outputs(&self, shape: Shape, pairs: &Range<usize>, set: usize, cols: u32) -> Res<Vec<u8>> {
+        let (k, n, _) = self.dims_of(shape);
         let bytes = pairs.len() * n * F32;
-        let nan = f32::NAN.to_le_bytes().repeat(pairs.len() * n);
-        self.out.write_at(&self.stream, 0, &nan)?;
-        self.launch(shape, pairs, 0, cols)?;
+        let nan = |values: usize| f32::NAN.to_le_bytes().repeat(values);
+        self.out.write_at(&self.stream, 0, &nan(pairs.len() * n))?;
+        self.z.write_at(&self.stream, 0, &nan(pairs.len() * n))?;
+        self.xh.write_at(&self.stream, 0, &nan(pairs.len() * k))?;
+        self.launch(shape, pairs, set, cols)?;
         self.stream.synchronize()?;
         let mut got = vec![0u8; bytes];
         self.out.read_at(&self.stream, 0, &mut got)?;
@@ -199,14 +208,16 @@ impl Rig<'_> {
     /// `LAUNCHES` runs of `case` under `cols` back to back behind the gate; the device time of
     /// each run.
     fn time(&self, case: &Case, cols: u32, trial: usize) -> Res<Timed> {
-        self.stream.record_timing(&self.gate_mark)?;
+        // Taken before the gate's start mark is queued: the device cannot pass that mark earlier.
         let gate_queued = Instant::now();
+        self.stream.record_timing(&self.gate_mark)?;
         self.ctx.copy_device(
             &self.stream,
             self.gate_from.range(0, GATE_BYTES)?,
             self.gate_to.range(0, GATE_BYTES)?,
         )?;
         let queue_start = Instant::now();
+        let mut queued = Vec::with_capacity(LAUNCHES);
         for run in 0..LAUNCHES {
             self.stream.record_timing(&self.marks[run])?;
             let set = if case.warm {
@@ -217,32 +228,46 @@ impl Rig<'_> {
             for &(first, count) in case.launches {
                 self.launch(case.shape, &(first..first + count), set, cols)?;
             }
+            queued.push(Instant::now());
         }
-        let queued = Instant::now();
         self.stream.record_timing(&self.marks[LAUNCHES])?;
         self.stream.synchronize()?;
-        let late = queued.duration_since(gate_queued).as_secs_f64() * 1e6
-            >= device_us(&self.gate_mark, &self.marks[0])?;
+        // Run `run` is clean when the host had queued all of it before the device could reach
+        // its start mark, at the earliest `gate_queued` plus the device's offset of that mark.
+        let mut late = 0;
+        for (run, at) in queued.iter().enumerate().skip(1) {
+            let host = at.duration_since(gate_queued).as_secs_f64() * 1e6;
+            if host >= device_us(&self.gate_mark, &self.marks[run])? {
+                late += 1;
+            }
+        }
         let launches = LAUNCHES * case.launches.len();
+        let queue_us = queued[LAUNCHES - 1]
+            .duration_since(queue_start)
+            .as_secs_f64()
+            * 1e6;
         // The first run of a warm case still reads its weights from DRAM.
         Ok(Timed {
             samples: (1..LAUNCHES)
                 .map(|run| device_us(&self.marks[run], &self.marks[run + 1]))
                 .collect::<Res<_>>()?,
             late,
-            queue_us_per_launch: queued.duration_since(queue_start).as_secs_f64() * 1e6
-                / launches as f64,
+            queue_us_per_launch: queue_us / launches as f64,
         })
     }
 }
 
-/// `Err` unless every variant writes the bytes cols = 1 writes, for every launch of every case.
+/// `Err` unless every variant writes the bytes cols = 1 writes, for every launch of every case,
+/// with the first and last cold id sets and the warm set.
 fn check(rig: &Rig<'_>) -> Res<usize> {
     let mut compared = 0;
-    for case in &CASES {
+    for (case, set) in CASES
+        .iter()
+        .flat_map(|case| [0, SETS - 1, SETS].map(|set| (case, set)))
+    {
         for &(first, count) in case.launches {
             let pairs = &(first..first + count);
-            let want = rig.outputs(case.shape, pairs, 1)?;
+            let want = rig.outputs(case.shape, pairs, set, 1)?;
             if want
                 .as_chunks::<4>()
                 .0
@@ -250,14 +275,14 @@ fn check(rig: &Rig<'_>) -> Res<usize> {
                 .any(|b| !f32::from_le_bytes(*b).is_finite())
             {
                 return Err(fail(format!(
-                    "{}: cols 1 left a non-finite output",
+                    "{}: cols 1 left a non-finite output with id set {set}",
                     case.name
                 )));
             }
             for cols in &COLS[1..] {
-                if rig.outputs(case.shape, pairs, *cols)? != want {
+                if rig.outputs(case.shape, pairs, set, *cols)? != want {
                     return Err(fail(format!(
-                        "{}: cols {cols} differs from cols 1 for pairs {pairs:?}",
+                        "{}: cols {cols} differs from cols 1 for pairs {pairs:?}, id set {set}",
                         case.name
                     )));
                 }
@@ -288,11 +313,13 @@ fn timing(rig: &Rig<'_>) -> Res<()> {
     for trial in 0..=TRIALS {
         clock_mark(&format!("projection_trial{trial}"));
         for (case, into) in CASES.iter().zip(&mut pooled) {
-            for (cols, all) in COLS.iter().zip(into.iter_mut()) {
-                let got = rig.time(case, *cols, trial)?;
+            for turn in 0..COLS.len() {
+                let variant = (turn + trial) % COLS.len();
+                let got = rig.time(case, COLS[variant], trial)?;
                 if trial > 0 {
+                    let all = &mut into[variant];
                     all.samples.extend(got.samples);
-                    all.late += usize::from(got.late);
+                    all.late += got.late;
                     all.queue_us.push(got.queue_us_per_launch);
                 }
             }
@@ -303,7 +330,7 @@ fn timing(rig: &Rig<'_>) -> Res<()> {
         for (cols, all) in COLS.iter().zip(got) {
             let queue = all.queue_us.iter().sum::<f64>() / all.queue_us.len() as f64;
             let extra = format!(
-                ",\"pairs\":{pairs},\"launches\":{},\"warm\":{},\"late_trials\":{},\"host_queue_us_per_launch\":{queue:.2}",
+                ",\"pairs\":{pairs},\"launches\":{},\"warm\":{},\"late_runs\":{},\"host_queue_us_per_launch\":{queue:.2}",
                 case.launches.len(),
                 case.warm,
                 all.late
@@ -324,20 +351,27 @@ fn timing(rig: &Rig<'_>) -> Res<()> {
     Ok(())
 }
 
-/// `SETS` sets of `PICKS` distinct experts (a permutation of the bank, ten at a time), then the
-/// warm set, every pick expert 0.
-fn id_sets(n_expert: usize) -> Vec<u8> {
-    let cold = (0..SETS * PICKS).map(|i| (i * 37) % n_expert);
+/// `SETS` sets of `PICKS` experts, no expert twice over all of them, then the warm set, every
+/// pick expert 0. `Err` when the bank is too small for that.
+fn id_sets(n_expert: usize) -> Res<Vec<u8>> {
+    let cold: Vec<usize> = (0..SETS * PICKS).map(|i| (i * 37) % n_expert).collect();
+    if cold.iter().collect::<HashSet<_>>().len() != cold.len() {
+        return Err(fail(format!(
+            "{n_expert} experts cannot fill {SETS} cold sets of {PICKS} distinct experts"
+        )));
+    }
     let warm = std::iter::repeat_n(0, PICKS);
-    cold.chain(warm)
-        .flat_map(|id| i32::try_from(id).unwrap_or(-1).to_le_bytes())
-        .collect()
+    cold.into_iter()
+        .chain(warm)
+        .map(|id| i32::try_from(id).map_err(|_| fail("an expert id past i32")))
+        .collect::<Res<Vec<i32>>>()
+        .map(|ids| ids.iter().flat_map(|id| id.to_le_bytes()).collect())
 }
 
 // ------------------------------------------------------------------ the test
 
 #[test]
-#[ignore = "timing: needs an exclusive GPU window (3 GiB) and FIFI_FLASH_NEXT_EXL3_PACK"]
+#[ignore = "timing: needs an exclusive GPU window (4 GiB) and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn flash_next_exl3_projection_variants_microbench() {
     run().expect("the EXL3 projection variant microbenchmark");
 }
@@ -365,7 +399,7 @@ fn run() -> Res<()> {
         z: zeros(MAX_PAIRS * wide * F32)?,
         out: zeros(MAX_PAIRS * wide * F32)?,
         flag: zeros(F32)?,
-        ids: ctx.upload(&id_sets(moe.n_expert))?,
+        ids: ctx.upload(&id_sets(moe.n_expert)?)?,
         marks: (0..=LAUNCHES)
             .map(|_| ctx.event_timing())
             .collect::<Res<_>>()?,
