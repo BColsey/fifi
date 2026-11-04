@@ -1,4 +1,6 @@
 mod config;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod exl3_pack;
 #[allow(
     dead_code,
     reason = "the executors use the history call, the decoder and sampler fields, and the constructors; until they do, only the worker and tests use the seam"

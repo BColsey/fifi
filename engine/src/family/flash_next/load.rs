@@ -19,6 +19,9 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) mod exl3_pack;
+
 const MODEL: &str = "language_model.model.";
 
 /// Model shape and per-layer attention kind (true for QSA) read from `config.json`.
@@ -833,9 +836,10 @@ mod tests {
     use super::*;
     use crate::weights::ShardIo;
 
-    const CONFIG: &[u8] = include_bytes!("../../../tests/fixtures/qwen3_8_flash_next_config.json");
+    pub(super) const CONFIG: &[u8] =
+        include_bytes!("../../../tests/fixtures/qwen3_8_flash_next_config.json");
 
-    fn checkpoint(tensors: &[(&str, &str, Vec<u32>, Vec<u8>)]) -> StreamedCheckpoint {
+    pub(super) fn checkpoint(tensors: &[(&str, &str, Vec<u32>, Vec<u8>)]) -> StreamedCheckpoint {
         let mut header = serde_json::Map::new();
         let mut payload = Vec::new();
         let mut index = serde_json::Map::new();

@@ -9,7 +9,9 @@ use crate::{
 };
 
 pub(crate) const CONFIG_LIMIT: u64 = 1024 * 1024;
-const INDEX_LIMIT: u64 = 16 * 1024 * 1024;
+/// A pack that stores each routed expert as its own matrix names every one in its index: the
+/// Qwen3.8 Flash-Next 3.05 bpw index lists 304,105 tensors in 31 MiB.
+const INDEX_LIMIT: u64 = 64 * 1024 * 1024;
 const HEADER_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub(crate) struct Checkpoint {
