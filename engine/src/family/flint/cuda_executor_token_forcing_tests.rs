@@ -16,7 +16,9 @@
 //! outputs, and an early EOS would only shorten that evidence. The prompts are cut from the
 //! committed corpus snapshot of the teacher-forced gate (`tf_gate_tests`), so no download is
 //! needed. Audits run with the scorer only: a second executor does not fit beside it on a 24 GB
-//! card, so the baseline-model audit is absent from device reports.
+//! card, so the baseline-model audit is absent from device reports. Each audit is one prefill of
+//! the whole context up to its event; a low `TF_AUDIT_CAP` cannot help a faulty candidate pass,
+//! because an unaudited candidate event counts as unexplained.
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
@@ -30,6 +32,7 @@
 //! | `TF_REFERENCE_CHUNK` | prefill rows of the reference and the scorer, 1 to 8 | 8 |
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
 //! | `TF_CANDIDATE` | `serve`, `fault`, or the path of a generations file | `serve` |
+//! | `TF_AUDIT_CAP` | the most events audited per execution | 200, SpecPilot's count |
 //! | `TF_WRITE_GENERATIONS` | write this build's serving generations to this new file and stop | unset |
 //!
 //! ```text
@@ -55,9 +58,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-
-/// SpecPilot audited 200 events per sealed final.
-const AUDIT_CAP: usize = 200;
 
 /// The executor's eager path as the gate's reference model.
 struct Forced<'a> {
@@ -99,6 +99,7 @@ struct Plan {
     reference_chunk: u32,
     baseline_chunk: u32,
     candidate: String,
+    audit_cap: usize,
     write_generations: Option<PathBuf>,
 }
 
@@ -131,6 +132,7 @@ impl Plan {
             reference_chunk: chunk("TF_REFERENCE_CHUNK", 8),
             baseline_chunk: chunk("TF_BASELINE_CHUNK", 4),
             candidate: std::env::var("TF_CANDIDATE").unwrap_or_else(|_| "serve".to_owned()),
+            audit_cap: number("TF_AUDIT_CAP", 200),
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
             root,
         }
@@ -399,7 +401,7 @@ fn token_forcing_qualification() {
     let settings = RunSettings {
         config: GateConfig::QUALIFICATION,
         vocab,
-        audit_cap: AUDIT_CAP,
+        audit_cap: plan.audit_cap,
     };
     let run = qualify((&mut scorer, None), &identities, outputs, settings).expect("the gate runs");
     for (name, scored) in [

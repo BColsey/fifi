@@ -467,6 +467,47 @@ fn margin_classes_split_at_delta_and_twice_delta() {
     );
 }
 
+/// `tokens` matched records with near-tie mismatches (margin 1/16) at the first `mismatches`
+/// positions.
+fn near_ties(label: &str, tokens: usize, mismatches: usize) -> ScoredSystem {
+    let records = (0..tokens)
+        .map(|position| {
+            let generated = if position < mismatches { 2 } else { 1 };
+            record(
+                position,
+                generated,
+                1,
+                -0.5 - 0.0625 * f64::from(generated - 1),
+                -0.5,
+            )
+        })
+        .collect();
+    scored(label, records)
+}
+
+#[test]
+fn the_rate_rule_rejects_only_on_the_lower_bound() {
+    let config = GateConfig {
+        min_tokens_per_request: 1,
+    };
+    let reference = near_ties("reference", 10_000, 0);
+    let baseline = near_ties("baseline", 10_000, 10);
+    // 0.7% against 0.1%: the observed excess is above 0.5 points, but its one-sided 95% lower
+    // bound is not, so the rule does not reject.
+    let close = near_ties("candidate", 10_000, 70);
+    let report = evaluate(config, &reference, &baseline, &close).unwrap();
+    assert!(report.rate_rule.difference > report.rate_rule.limit);
+    assert!(report.rate_rule.lower_bound < report.rate_rule.limit);
+    assert!(!report.rate_rule.reject);
+    assert_eq!(report.verdict, Verdict::Pass);
+    // 1.5% against 0.1%: the lower bound clears the limit.
+    let far = near_ties("candidate", 10_000, 150);
+    let report = evaluate(config, &reference, &baseline, &far).unwrap();
+    assert!(report.rate_rule.lower_bound > report.rate_rule.limit);
+    assert!(report.rate_rule.reject && !report.event_rule.reject);
+    assert!(matches!(report.verdict, Verdict::Reject { .. }));
+}
+
 #[test]
 fn an_audit_explains_tokens_the_reference_itself_produces_or_cannot_decide() {
     let event = record(9, 4, 7, -3.0, -0.1);

@@ -121,20 +121,21 @@ pub(crate) struct AuditPlan {
 }
 
 /// Audits every mismatch above the plan's threshold, in request and position order, up to the
-/// cap. Events past the cap stay unaudited, and the gate counts them as unexplained for a
-/// candidate. Returns the number of events left unaudited.
+/// cap. Events past the cap stay unaudited: the report counts them, and the gate treats them as
+/// unexplained for a candidate and as an unknown baseline.
 pub(crate) fn audit_system(
     scored: &mut ScoredSystem,
     models: (&mut dyn ForcedModel, Option<&mut dyn ForcedModel>),
     generations: &[Generation],
     plan: AuditPlan,
-) -> Result<usize> {
+) -> Result<()> {
     let (scorer, mut baseline) = models;
     check_generations(scored, generations)?;
-    let mut audited = 0;
-    let mut skipped = 0;
-    for (request, generation) in scored.requests.iter_mut().zip(generations) {
+    for request in &mut scored.requests {
         request.audits.clear();
+    }
+    let mut audited = 0;
+    for (request, generation) in scored.requests.iter_mut().zip(generations) {
         let (prompt, generated) = (&generation.prompt, &generation.generated);
         let events = request
             .records
@@ -142,8 +143,7 @@ pub(crate) fn audit_system(
             .filter(|record| record.margin() > plan.threshold);
         for record in events {
             if audited == plan.cap {
-                skipped += 1;
-                continue;
+                return Ok(());
             }
             let at = record.position;
             let baseline_argmax = match baseline.as_deref_mut() {
@@ -158,7 +158,7 @@ pub(crate) fn audit_system(
             audited += 1;
         }
     }
-    Ok(skipped)
+    Ok(())
 }
 
 fn check_generations(scored: &ScoredSystem, generations: &[Generation]) -> Result<()> {
