@@ -19,22 +19,27 @@
 //! - the candidate: the execution under test.
 //!
 //! The near-tie threshold `delta` is the largest log-probability gap between the reference's
-//! and the baseline's tokens at their first departure, rounded up to a multiple of 1/8
-//! (`gate::calibrate`). The baseline is the comparison of both rules, because a lossless
-//! candidate's mismatches are near ties of the same kind. A candidate is rejected when
+//! and the baseline's tokens at their first departure, rounded up to a multiple of 1/8 nat
+//! (`gate::calibrate`). When they never depart, the legal margin measured is zero and delta
+//! takes 1/8, the strictest value. The reference must match its scorer at every token. The
+//! baseline is the comparison of both rules, because a lossless candidate's mismatches are near
+//! ties of the same kind. A candidate is rejected when
 //!
 //! - its mismatch rate exceeds the baseline's by more than 0.5 points at one-sided 95%
 //!   confidence (Newcombe's score interval for a difference of rates), or
 //! - its unexplained mismatches with a margin above `2 * delta` are more frequent than the
 //!   baseline's (exact conditional binomial test, one-sided, 0.05). An audit explains such an
 //!   event when one prefill of the whole context, or the baseline execution, gives the
-//!   generated token or an argmax other than the step path's (`gate::Audit`).
+//!   generated token a margin of at most `2 * delta`, so that it is no event there
+//!   (`gate::Audit`). At equal exposure and no baseline events, five unexplained events are
+//!   the fewest that reject (four give p = 1/16).
 //!
-//! A pass also needs every baseline and candidate request to reach the configured length
-//! (4,096 generated tokens for qualification) and every baseline event to be audited;
-//! otherwise the verdict is inconclusive. The report (`gate::Report`, schema
-//! `fifi.token_forcing.v1`) carries the counts, the bounds, a mismatch list with each margin
-//! class, and mismatch counts by output depth.
+//! A pass also needs enough evidence (`gate::GateConfig`): for qualification, four requests of
+//! 4,096 generated tokens each for the reference, the baseline and the candidate, a delta of at
+//! most 0.5 nats, and every baseline event audited; otherwise the verdict is inconclusive. The
+//! report (`gate::Report`, schema `fifi.token_forcing.v1`) carries the digests of its input
+//! files, the counts, the bounds, a mismatch list with each margin class, and mismatch counts
+//! by output depth.
 //!
 //! Scope. The gate compares executions of the same weights in the same format, and refuses
 //! anything else: the difference between two weight sets or formats is a quality question for
@@ -46,7 +51,10 @@
 //! execution's identity, the scorer's identity, and per request the name, prompt length,
 //! SHA-256 of the prompt ids (little-endian `u32`), one `score::TokenRecord` per generated
 //! token, and the audits of its large-margin mismatches. `run::verdict_from_files` recomputes
-//! the verdict from the three files on any host (`run::entry::token_forcing_verdict`).
+//! the verdict from the three files on any host (`run::entry::token_forcing_verdict`). It
+//! checks the numbers rather than trusting them: a record or an audit that contradicts itself,
+//! a duplicate audit, an audit of a token that is no event, or one file in two roles (the three
+//! labels must differ) is refused.
 //!
 //! An independent reference, such as stock exllamav3 on the same pack, plugs in at that file
 //! boundary rather than as a model inside the engine: it writes the three scored files under

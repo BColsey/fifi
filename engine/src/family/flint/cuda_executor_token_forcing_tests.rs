@@ -6,10 +6,16 @@
 //!   through its eager path (prompt prefill, then `qual_logits` steps, host argmax);
 //! - the reference: an executor opened with `TF_REFERENCE_CHUNK` rows generates the same way.
 //!   That executor is also the scorer, so its own rows judge every output;
-//! - the candidate (`TF_CANDIDATE`): `serve`, the same executor's serving loop (`decode` with
+//! - the candidates (`TF_CANDIDATE`, comma-separated, judged in that order against the one
+//!   scored reference and baseline): `serve`, the same executor's serving loop (`decode` with
 //!   the device sampler); `fault`, the reference path with SpecPilot's injected logit bias after
 //!   2,048 tokens, a self-test that must be rejected; or a generations file that another build
 //!   wrote with `TF_WRITE_GENERATIONS`, for an A/B between builds on one pack.
+//!
+//! Flint's prefill is batch-invariant: chunk 1 and chunk 8 agree bitwise
+//! (`context_2048_same_pack_bitwise_golden`). The baseline is then expected never to depart
+//! from the reference, and the calibration sets the smallest delta, 1/8 nat, the strictest
+//! gate.
 //!
 //! Every execution is opened with one EOS id that the head is not expected to choose (the last
 //! tokenizer id), so each request runs to `TF_TOKENS` tokens: the gate tests numerics over long
@@ -17,8 +23,9 @@
 //! committed corpus snapshot of the teacher-forced gate (`tf_gate_tests`), so no download is
 //! needed. Audits run with the scorer only: a second executor does not fit beside it on a 24 GB
 //! card, so the baseline-model audit is absent from device reports. Each audit is one prefill of
-//! the whole context up to its event; a low `TF_AUDIT_CAP` cannot help a faulty candidate pass,
-//! because an unaudited candidate event counts as unexplained.
+//! the whole context up to its event, so the `fault` self-test is not audited: its events
+//! count as unexplained, and auditing hundreds of them would take hours. A low `TF_AUDIT_CAP`
+//! cannot help a faulty candidate pass either, for the same reason.
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
@@ -31,26 +38,28 @@
 //! | `TF_TOKENS` | generated tokens per request | 4096 |
 //! | `TF_REFERENCE_CHUNK` | prefill rows of the reference and the scorer, 1 to 8 | 8 |
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
-//! | `TF_CANDIDATE` | `serve`, `fault`, or the path of a generations file | `serve` |
-//! | `TF_AUDIT_CAP` | the most events audited per execution | 200, SpecPilot's count |
+//! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated | `serve` |
+//! | `TF_AUDIT_CAP` | the most events audited per execution, `fault` excepted | 200, SpecPilot's count |
 //! | `TF_WRITE_GENERATIONS` | write this build's serving generations to this new file and stop | unset |
 //!
 //! ```text
-//! FLINT_QUAL_MODEL=<PACK> TF_OUT_DIR=<NEW_DIR> \
+//! FLINT_QUAL_MODEL=<PACK> TF_OUT_DIR=<NEW_DIR> TF_CANDIDATE=fault,serve \
 //! cargo test --release --features native-cuda --lib \
 //!   family::flint::cuda_executor::token_forcing_tests::token_forcing_qualification \
 //!   -- --ignored --exact --nocapture
 //! ```
 //!
-//! The run writes `reference.json`, `baseline.json`, `candidate.json` (scored outputs) and
-//! `report.json`; `family::token_forcing::run::entry::token_forcing_verdict` recomputes the
-//! verdict from the three scored files on any host.
+//! The run writes `reference.json` and `baseline.json`, then per candidate `<name>.json` (its
+//! scored outputs) and `report-<name>.json`, where the name is `serve`, `fault` or
+//! `file<index>`. `family::token_forcing::run::entry::token_forcing_verdict` recomputes a
+//! verdict from three scored files on any host. A `fault` that is not rejected for its own
+//! mismatches after 2,048 tokens stops the run before the next candidate.
 
 use super::super::{factory, park_identity::pack_fingerprint};
 use super::*;
 use crate::family::token_forcing::{
-    gate::{ExecutionIdentity, GateConfig, Generation, Verdict, ids_sha256},
-    run::{Identities, Outputs, RunSettings, qualify, write_new_json},
+    gate::{ExecutionIdentity, GateConfig, Generation, Report, Verdict, ids_sha256},
+    run::{Candidate, Comparison, Identities, Outputs, RunSettings, input_digests, write_new_json},
     score::{ForcedModel, LogitBiasFault, greedy_generate},
 };
 use crate::tokenizer::{IncrementalDecoder, TokenizerBundle};
@@ -98,7 +107,7 @@ struct Plan {
     tokens: usize,
     reference_chunk: u32,
     baseline_chunk: u32,
-    candidate: String,
+    candidates: Vec<String>,
     audit_cap: usize,
     write_generations: Option<PathBuf>,
 }
@@ -131,7 +140,11 @@ impl Plan {
             tokens: number("TF_TOKENS", 4096),
             reference_chunk: chunk("TF_REFERENCE_CHUNK", 8),
             baseline_chunk: chunk("TF_BASELINE_CHUNK", 4),
-            candidate: std::env::var("TF_CANDIDATE").unwrap_or_else(|_| "serve".to_owned()),
+            candidates: std::env::var("TF_CANDIDATE")
+                .unwrap_or_else(|_| "serve".to_owned())
+                .split(',')
+                .map(|name| name.trim().to_owned())
+                .collect(),
             audit_cap: number("TF_AUDIT_CAP", 200),
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
             root,
@@ -322,6 +335,36 @@ fn read_generations(
     (file.system, generations)
 }
 
+/// What a candidate run must show. The fault must be rejected for its own mismatches, all
+/// after 2,048 tokens; a lossless candidate must pass with every event audited.
+fn check_outcome(name: &str, report: &Report, path: &std::path::Path) {
+    if name == "fault" {
+        assert!(
+            matches!(report.verdict, Verdict::Reject { .. }),
+            "the injected fault was not rejected; see {}",
+            path.display()
+        );
+        let early: u64 = report.candidate.depth[..2]
+            .iter()
+            .map(|bin| bin.mismatches)
+            .sum();
+        assert_eq!(
+            early,
+            0,
+            "the fault candidate mismatched before 2,048 tokens; see {}",
+            path.display()
+        );
+        return;
+    }
+    assert_eq!(report.verdict, Verdict::Pass, "see {}", path.display());
+    assert_eq!(
+        report.candidate.unaudited_events,
+        0,
+        "see {}",
+        path.display()
+    );
+}
+
 #[test]
 #[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and an exclusive GPU lease"]
 fn token_forcing_qualification() {
@@ -362,75 +405,93 @@ fn token_forcing_qualification() {
         };
         generate_with(&mut model, &prompts, plan.tokens, vocab)
     };
-    let (candidate_identity, candidate) = match plan.candidate.as_str() {
-        "serve" => (
-            plan.identity("candidate-serve", plan.reference_chunk, "serving-decode"),
-            serve((&mut engine, &mut session), &bundle, &prompts, plan.tokens),
-        ),
-        "fault" => {
-            let mut model = LogitBiasFault::specpilot(Forced {
-                engine: &mut engine,
-                session: &mut session,
-            });
-            (
-                plan.identity(
-                    "candidate-fault",
-                    plan.reference_chunk,
-                    "eager-greedy-bias-fault",
-                ),
-                generate_with(&mut model, &prompts, plan.tokens, vocab),
-            )
-        }
-        path => read_generations(std::path::Path::new(path), &prompts),
-    };
     let identities = Identities {
         scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
         reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
         baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
-        candidate: candidate_identity,
-    };
-    let mut scorer = Forced {
-        engine: &mut engine,
-        session: &mut session,
-    };
-    let outputs = Outputs {
-        reference: &reference,
-        baseline: &baseline,
-        candidate: &candidate,
     };
     let settings = RunSettings {
         config: GateConfig::QUALIFICATION,
         vocab,
         audit_cap: plan.audit_cap,
     };
-    let run = qualify((&mut scorer, None), &identities, outputs, settings).expect("the gate runs");
-    for (name, scored) in [
-        ("reference.json", &run.reference),
-        ("baseline.json", &run.baseline),
-        ("candidate.json", &run.candidate),
-    ] {
-        write_new_json(&plan.out.join(name), scored).expect("a scored file");
-    }
-    let report_path = plan.out.join("report.json");
-    write_new_json(&report_path, &run.report).expect("the report");
-    println!(
-        "TOKEN_FORCING candidate={} verdict={} report={}",
-        plan.candidate,
-        serde_json::to_string(&run.report.verdict).expect("a verdict serializes"),
-        report_path.display()
-    );
-    if plan.candidate == "fault" {
-        assert!(
-            matches!(run.report.verdict, Verdict::Reject { .. }),
-            "the injected fault was not rejected; see {}",
+    let outputs = Outputs {
+        reference: &reference,
+        baseline: &baseline,
+    };
+    let mut scorer = Forced {
+        engine: &mut engine,
+        session: &mut session,
+    };
+    let comparison = Comparison::prepare((&mut scorer, None), &identities, outputs, settings)
+        .expect("the reference and the baseline calibrate");
+    let reference_sha256 = write_new_json(&plan.out.join("reference.json"), &comparison.reference)
+        .expect("the reference file");
+    let baseline_sha256 = write_new_json(&plan.out.join("baseline.json"), &comparison.baseline)
+        .expect("the baseline file");
+    for (index, kind) in plan.candidates.iter().enumerate() {
+        let (name, identity, generations, audit_cap) = match kind.as_str() {
+            "serve" => (
+                "serve".to_owned(),
+                plan.identity("candidate-serve", plan.reference_chunk, "serving-decode"),
+                serve((&mut engine, &mut session), &bundle, &prompts, plan.tokens),
+                plan.audit_cap,
+            ),
+            "fault" => {
+                let mut model = LogitBiasFault::specpilot(Forced {
+                    engine: &mut engine,
+                    session: &mut session,
+                });
+                (
+                    "fault".to_owned(),
+                    plan.identity(
+                        "candidate-fault",
+                        plan.reference_chunk,
+                        "eager-greedy-bias-fault",
+                    ),
+                    generate_with(&mut model, &prompts, plan.tokens, vocab),
+                    0,
+                )
+            }
+            path => {
+                let (identity, generations) =
+                    read_generations(std::path::Path::new(path), &prompts);
+                (
+                    format!("file{index}"),
+                    identity,
+                    generations,
+                    plan.audit_cap,
+                )
+            }
+        };
+        let mut scorer = Forced {
+            engine: &mut engine,
+            session: &mut session,
+        };
+        let candidate = Candidate {
+            identity: &identity,
+            generations: &generations,
+            audit_cap,
+        };
+        let mut run = comparison
+            .judge((&mut scorer, None), candidate)
+            .expect("the gate runs");
+        let candidate_sha256 =
+            write_new_json(&plan.out.join(format!("{name}.json")), &run.candidate)
+                .expect("a candidate file");
+        run.report.inputs = input_digests([
+            reference_sha256.clone(),
+            baseline_sha256.clone(),
+            candidate_sha256,
+        ]);
+        let report_path = plan.out.join(format!("report-{name}.json"));
+        write_new_json(&report_path, &run.report).expect("the report");
+        println!(
+            "TOKEN_FORCING candidate={name} verdict={} delta={} report={}",
+            serde_json::to_string(&run.report.verdict).expect("a verdict serializes"),
+            run.report.calibration.delta,
             report_path.display()
         );
-    } else {
-        assert_eq!(
-            run.report.verdict,
-            Verdict::Pass,
-            "see {}",
-            report_path.display()
-        );
+        check_outcome(&name, &run.report, &report_path);
     }
 }

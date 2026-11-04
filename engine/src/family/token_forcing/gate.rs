@@ -1,6 +1,6 @@
 //! Calibration, the two rejection rules, and the qualification report.
 
-use super::score::{ForcedModel, TokenRecord, prefill_argmax, score_sequence};
+use super::score::{ForcedModel, TokenRecord, prefill_record, score_sequence};
 use super::stats::{
     Interval, Z_ONE_SIDED_95, Z_TWO_SIDED_95, clustered_rate, newcombe_difference,
     rate_excess_p_value, wilson,
@@ -45,23 +45,48 @@ pub(crate) struct Generation {
     pub(crate) generated: Vec<u32>,
 }
 
+/// What one legal re-execution of the reference makes of an audited token.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Reread {
+    /// The re-executed row's argmax.
+    pub(crate) argmax: u32,
+    /// `log p(argmax) - log p(generated)` in the re-executed row, in nats; zero when that row
+    /// chooses the generated token.
+    pub(crate) margin: f64,
+}
+
+impl Reread {
+    fn of(record: &TokenRecord) -> Self {
+        Self {
+            argmax: record.argmax,
+            margin: record.margin(),
+        }
+    }
+}
+
 /// The audit of one large-margin mismatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Audit {
     pub(crate) position: usize,
-    /// The scorer's argmax when the whole context up to `position` is one prefill.
-    pub(crate) prefill_argmax: u32,
-    /// The argmax of the baseline execution on the same one-prefill context, when the harness
-    /// has a model of it.
-    pub(crate) baseline_argmax: Option<u32>,
+    /// The scorer with the whole context up to `position` as one prefill.
+    pub(crate) prefill: Reread,
+    /// The baseline execution on the same one-prefill context, when the harness has a model of
+    /// it.
+    pub(crate) baseline: Option<Reread>,
 }
 
 impl Audit {
-    /// An event is explained when the reference itself produces the token under another legal
-    /// execution, or when the reference's own choice there depends on the execution.
-    pub(crate) fn explains(&self, record: &TokenRecord) -> bool {
-        let fragile = |argmax: u32| argmax == record.generated || argmax != record.argmax;
-        fragile(self.prefill_argmax) || self.baseline_argmax.is_some_and(fragile)
+    /// An event is explained when a legal re-execution of the reference does not see it as an
+    /// event: the generated token is that execution's argmax, or within `threshold` of it.
+    ///
+    /// SpecPilot also excuses a position whose argmax merely changes with the prefill length.
+    /// This gate does not: such a change shows that the reference is undecided between its own
+    /// top tokens, not that the generated token is anywhere near them.
+    pub(crate) fn explains(&self, threshold: f64) -> bool {
+        self.prefill.margin <= threshold
+            || self
+                .baseline
+                .is_some_and(|reread| reread.margin <= threshold)
     }
 }
 
@@ -146,14 +171,17 @@ pub(crate) fn audit_system(
                 return Ok(());
             }
             let at = record.position;
-            let baseline_argmax = match baseline.as_deref_mut() {
-                Some(model) => Some(prefill_argmax(model, prompt, generated, at, plan.vocab)?),
+            let baseline_reread = match baseline.as_deref_mut() {
+                Some(model) => Some(Reread::of(&prefill_record(
+                    model, prompt, generated, at, plan.vocab,
+                )?)),
                 None => None,
             };
+            let prefill = prefill_record(scorer, prompt, generated, at, plan.vocab)?;
             request.audits.push(Audit {
                 position: at,
-                prefill_argmax: prefill_argmax(scorer, prompt, generated, at, plan.vocab)?,
-                baseline_argmax,
+                prefill: Reread::of(&prefill),
+                baseline: baseline_reread,
             });
             audited += 1;
         }
@@ -170,7 +198,11 @@ fn check_generations(scored: &ScoredSystem, generations: &[Generation]) -> Resul
             .all(|(request, generation)| {
                 request.name == generation.name
                     && request.prompt_sha256 == ids_sha256(&generation.prompt)
-                    && request.records.len() == generation.generated.len()
+                    && request
+                        .records
+                        .iter()
+                        .map(|record| record.generated)
+                        .eq(generation.generated.iter().copied())
             });
     if same {
         Ok(())
@@ -215,9 +247,32 @@ pub(crate) struct Calibration {
 /// reference (for example two prefill chunk sizes) generate from the same prompts; where they
 /// first depart, their histories still agree, so the scorer judges both tokens in one context,
 /// and the gap between their log-probabilities is a margin that reduction order alone produced.
-/// Without a departure there is no evidence to set a threshold, and calibration fails.
+///
+/// When no request departs, the legal executions agreed bitwise and the largest legal margin
+/// measured is zero. Delta then takes the first grid step, its smallest value, which is the
+/// strictest threshold: more mismatches count as events, and the baseline brings no mismatches
+/// and no events to either rule.
+///
+/// The reference runs the scorer's own numeric path, so it must match the scorer at every
+/// token. A reference mismatch means that generation and scoring did not run one deterministic
+/// path, and then no margin measures reduction order alone.
 pub(crate) fn calibrate(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<Calibration> {
+    validate(reference)?;
+    validate(baseline)?;
     check_pair(reference, baseline)?;
+    let reference_mismatches = reference
+        .requests
+        .iter()
+        .flat_map(|request| &request.records)
+        .filter(|record| !record.matched())
+        .count();
+    if reference_mismatches > 0 {
+        return Err(gate_error(format!(
+            "the reference {} disagrees with its own scorer at {reference_mismatches} tokens; \
+             calibration needs generation and scoring on one deterministic path",
+            reference.system.label
+        )));
+    }
     let mut departures = Vec::new();
     for (left, right) in reference.requests.iter().zip(&baseline.requests) {
         let first = left
@@ -244,16 +299,9 @@ pub(crate) fn calibrate(reference: &ScoredSystem, baseline: &ScoredSystem) -> Re
     let largest_margin = departures
         .iter()
         .map(|departure| departure.margin)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if departures.is_empty() {
-        return Err(gate_error(
-            "the reference and the baseline never departed; use executions that differ in \
-             reduction order, or more or longer requests"
-                .into(),
-        ));
-    }
-    // A zero margin is an exact tie; the threshold still takes the first grid step so that a
-    // legal tie is not a large-margin event.
+        .fold(0.0, f64::max);
+    // A zero margin is an exact tie or no departure at all; the threshold still takes the first
+    // grid step so that a legal tie is not a large-margin event.
     let steps = (largest_margin / DELTA_GRID).ceil().max(1.0);
     Ok(Calibration {
         delta: steps * DELTA_GRID,
@@ -390,20 +438,25 @@ impl SystemSummary {
         }
     }
 
+    /// Adds one request of a system that `validate` accepted.
     fn add_request(&mut self, request: &ScoredRequest, delta: f64) -> Result<()> {
         let audits: HashMap<usize, &Audit> = request
             .audits
             .iter()
             .map(|audit| (audit.position, audit))
             .collect();
-        let mut mismatches = 0;
-        for (index, record) in request.records.iter().enumerate() {
-            if record.position != index {
+        for &position in audits.keys() {
+            let record = &request.records[position];
+            if MarginClass::of(record.margin(), delta) != MarginClass::LargeMargin {
                 return Err(gate_error(format!(
-                    "request {}: record {index} names position {}",
-                    request.name, record.position
+                    "request {} position {position}: an audit names a token that is not a \
+                     large-margin event at delta {delta}",
+                    request.name
                 )));
             }
+        }
+        let mut mismatches = 0;
+        for (index, record) in request.records.iter().enumerate() {
             self.reference_near_ties += u64::from(record.top2_gap <= delta);
             let bin = self.depth.iter_mut().rev().find(|bin| bin.from <= index);
             let bin = bin.expect("the first depth bin starts at zero");
@@ -434,7 +487,7 @@ impl SystemSummary {
         let class = MarginClass::of(margin, delta);
         let event = (class == MarginClass::LargeMargin).then(|| match audit {
             None => EventStatus::Unaudited,
-            Some(audit) if audit.explains(record) => EventStatus::Explained,
+            Some(audit) if audit.explains(2.0 * delta) => EventStatus::Explained,
             Some(_) => EventStatus::Unexplained,
         });
         match class {
@@ -550,18 +603,32 @@ impl EventRule {
     }
 }
 
-/// What a run must cover before a pass means anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// What a run must cover before a pass means anything. The gate rejects only on evidence, so
+/// a thin run passes more easily; a run below any of these is inconclusive instead.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct GateConfig {
-    /// Every request of the baseline and the candidate must score at least this many tokens.
+    /// The fewest requests. With the length below, it also sets the fewest tokens per system.
+    pub(crate) min_requests: usize,
+    /// Every request of the reference, the baseline and the candidate must score at least this
+    /// many tokens.
     pub(crate) min_tokens_per_request: usize,
+    /// The largest near-tie threshold, in nats, that the calibration may set. A larger one
+    /// means that the baseline departs from the reference by more than reduction order
+    /// explains, and it would let large-margin events pass as near ties.
+    pub(crate) max_delta: f64,
 }
 
 impl GateConfig {
-    /// The qualification setting: 4,096 generated tokens, twice SpecPilot's development length,
-    /// so that a fault that starts after 2,048 tokens is inside every request.
+    /// The qualification setting.
+    ///
+    /// - Four requests of 4,096 generated tokens: twice SpecPilot's development length, so that
+    ///   a fault that starts after 2,048 tokens is inside every request; 16,384 tokens a system.
+    /// - Delta at most 0.5 nats: twice the 0.25 that SpecPilot's own calibration set, from a
+    ///   largest first-departure margin of 0.232 nats (arXiv 2611.02501, section 2).
     pub(crate) const QUALIFICATION: Self = Self {
+        min_requests: 4,
         min_tokens_per_request: 4096,
+        max_delta: 0.5,
     };
 }
 
@@ -578,6 +645,9 @@ pub(crate) struct Report {
     pub(crate) schema: &'static str,
     pub(crate) config: GateConfig,
     pub(crate) scorer: ExecutionIdentity,
+    /// The SHA-256 of each scored file the report was computed from, by role (`reference`,
+    /// `baseline`, `candidate`). Empty for a report of systems that were never written.
+    pub(crate) inputs: BTreeMap<String, String>,
     pub(crate) calibration: Calibration,
     pub(crate) reference: SystemSummary,
     pub(crate) baseline: SystemSummary,
@@ -596,12 +666,18 @@ pub(crate) struct Report {
 ///   It calibrates delta with the reference and is the baseline of both rules: a lossless
 ///   candidate's mismatches are near ties of the same kind.
 /// - `candidate` is the execution under test.
+///
+/// The three executions must carry distinct labels, so that one file cannot stand in for two
+/// roles. A candidate whose tokens equal the baseline's is still judged: a bitwise-identical
+/// execution is a legal candidate.
 pub(crate) fn evaluate(
     config: GateConfig,
     reference: &ScoredSystem,
     baseline: &ScoredSystem,
     candidate: &ScoredSystem,
 ) -> Result<Report> {
+    validate(candidate)?;
+    check_roles([reference, baseline, candidate])?;
     check_pair(baseline, candidate)?;
     let calibration = calibrate(reference, baseline)?;
     let delta = calibration.delta;
@@ -610,16 +686,26 @@ pub(crate) fn evaluate(
     let candidate_summary = SystemSummary::new(candidate, delta)?;
     let rate_rule = RateRule::new(&baseline_summary, &candidate_summary)?;
     let event_rule = EventRule::new(&baseline_summary, &candidate_summary, delta)?;
-    let verdict = verdict(
+    let rejections = rejections(&rate_rule, &event_rule);
+    let gaps = coverage_gaps(
         config,
-        (&baseline_summary, &candidate_summary),
-        &rate_rule,
-        &event_rule,
+        &calibration,
+        [&reference_summary, &baseline_summary, &candidate_summary],
     );
+    let verdict = if !rejections.is_empty() {
+        Verdict::Reject {
+            reasons: rejections,
+        }
+    } else if !gaps.is_empty() {
+        Verdict::Inconclusive { reasons: gaps }
+    } else {
+        Verdict::Pass
+    };
     Ok(Report {
         schema: REPORT_SCHEMA,
         config,
         scorer: reference.scorer.clone(),
+        inputs: BTreeMap::new(),
         calibration,
         reference: reference_summary,
         baseline: baseline_summary,
@@ -630,12 +716,7 @@ pub(crate) fn evaluate(
     })
 }
 
-fn verdict(
-    config: GateConfig,
-    (baseline, candidate): (&SystemSummary, &SystemSummary),
-    rate_rule: &RateRule,
-    event_rule: &EventRule,
-) -> Verdict {
+fn rejections(rate_rule: &RateRule, event_rule: &EventRule) -> Vec<String> {
     let mut rejections = Vec::new();
     if rate_rule.reject {
         rejections.push(format!(
@@ -657,13 +738,25 @@ fn verdict(
             event_rule.p_value
         ));
     }
-    if !rejections.is_empty() {
-        return Verdict::Reject {
-            reasons: rejections,
-        };
-    }
+    rejections
+}
+
+/// What keeps a run without a rejection from passing: too little evidence, an unknown event
+/// baseline, or a calibration that reduction order cannot explain.
+fn coverage_gaps(
+    config: GateConfig,
+    calibration: &Calibration,
+    [reference, baseline, candidate]: [&SystemSummary; 3],
+) -> Vec<String> {
     let mut gaps = Vec::new();
-    for summary in [baseline, candidate] {
+    // `check_pair` has made the request lists of the three systems the same.
+    if candidate.requests < config.min_requests {
+        gaps.push(format!(
+            "the run has {} requests, below the {} the gate requires",
+            candidate.requests, config.min_requests
+        ));
+    }
+    for summary in [reference, baseline, candidate] {
         if summary.shortest_request < config.min_tokens_per_request {
             gaps.push(format!(
                 "{}: a request scored {} tokens, below the {} the gate requires",
@@ -671,17 +764,20 @@ fn verdict(
             ));
         }
     }
+    if calibration.delta > config.max_delta {
+        gaps.push(format!(
+            "delta {} nats exceeds the {} the gate accepts: the baseline departs from the \
+             reference by more than reduction order explains (largest departure margin {} nats)",
+            calibration.delta, config.max_delta, calibration.largest_margin
+        ));
+    }
     if baseline.unaudited_events > 0 {
         gaps.push(format!(
             "{}: {} baseline events were not audited, so the event baseline is not known",
             baseline.system.label, baseline.unaudited_events
         ));
     }
-    if gaps.is_empty() {
-        Verdict::Pass
-    } else {
-        Verdict::Inconclusive { reasons: gaps }
-    }
+    gaps
 }
 
 /// Two scored systems are comparable when one reference scored both, on the same weights as the
@@ -719,6 +815,84 @@ fn check_pair(first: &ScoredSystem, second: &ScoredSystem) -> Result<()> {
             "{} and {} did not run the same prompts",
             first.system.label, second.system.label
         )));
+    }
+    Ok(())
+}
+
+fn check_roles(systems: [&ScoredSystem; 3]) -> Result<()> {
+    let [reference, baseline, candidate] = systems.map(|scored| &scored.system.label);
+    if reference == baseline || reference == candidate || baseline == candidate {
+        return Err(gate_error(format!(
+            "the reference ({reference}), the baseline ({baseline}) and the candidate \
+             ({candidate}) need three distinct labels"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a scored system whose records or audits contradict themselves, such as a file
+/// edited or damaged after the run: the verdict is recomputed from these numbers, so they are
+/// checked rather than trusted. Whether each audit names a large-margin event depends on delta
+/// and is checked when the system is summarised.
+fn validate(scored: &ScoredSystem) -> Result<()> {
+    let label = &scored.system.label;
+    for request in &scored.requests {
+        let context =
+            |message: String| gate_error(format!("{label} request {}: {message}", request.name));
+        for (index, record) in request.records.iter().enumerate() {
+            if record.position != index {
+                return Err(context(format!(
+                    "record {index} names position {}",
+                    record.position
+                )));
+            }
+            record
+                .check()
+                .map_err(|message| context(format!("position {index}: {message}")))?;
+        }
+        let mut audited = std::collections::BTreeSet::new();
+        for audit in &request.audits {
+            let record = request.records.get(audit.position).ok_or_else(|| {
+                context(format!(
+                    "an audit names position {}, past the {} records",
+                    audit.position,
+                    request.records.len()
+                ))
+            })?;
+            if !audited.insert(audit.position) {
+                return Err(context(format!(
+                    "position {} is audited twice",
+                    audit.position
+                )));
+            }
+            for reread in std::iter::once(&audit.prefill).chain(&audit.baseline) {
+                check_reread(reread, record.generated).map_err(|message| {
+                    context(format!(
+                        "the audit of position {}: {message}",
+                        audit.position
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_reread(reread: &Reread, generated: u32) -> std::result::Result<(), String> {
+    if !reread.margin.is_finite() || reread.margin < 0.0 {
+        return Err(format!("margin {} is not a finite gap", reread.margin));
+    }
+    let consistent = if reread.argmax == generated {
+        reread.margin == 0.0
+    } else {
+        // A tie goes to the lower id, so a zero gap needs the generated token above the argmax.
+        reread.margin > 0.0 || generated > reread.argmax
+    };
+    if !consistent {
+        return Err(format!(
+            "argmax {} and margin {} disagree about generated token {generated}",
+            reread.argmax, reread.margin
+        ));
     }
     Ok(())
 }

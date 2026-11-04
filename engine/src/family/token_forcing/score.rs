@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, EngError>;
 
+/// The f64 rounding allowed between a mismatch's margin and the top-two gap, in nats.
+const MARGIN_SLACK: f64 = 1e-9;
+
 /// The reference's judgement of one generated token.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TokenRecord {
@@ -34,6 +37,51 @@ impl TokenRecord {
     /// match.
     pub(crate) fn margin(&self) -> f64 {
         self.argmax_logprob - self.logprob
+    }
+
+    /// Checks that the numbers of a record agree with each other, as `from_logits` writes them.
+    /// A record read from a file can contradict itself, for example a mismatch whose log-
+    /// probability was raised to hide its margin.
+    pub(crate) fn check(&self) -> std::result::Result<(), String> {
+        let values = [self.logprob, self.argmax_logprob, self.top2_gap];
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("a value is not finite".into());
+        }
+        if self.runner_up == self.argmax {
+            return Err(format!("id {} is both argmax and runner-up", self.argmax));
+        }
+        if self.argmax_logprob > 0.0 || self.logprob > self.argmax_logprob {
+            return Err(format!(
+                "log p(generated) {} and log p(argmax) {} are not ordered below zero",
+                self.logprob, self.argmax_logprob
+            ));
+        }
+        if self.top2_gap < 0.0 {
+            return Err(format!("the top-two gap {} is negative", self.top2_gap));
+        }
+        if self.matched() {
+            if self.margin() != 0.0 {
+                return Err(format!("a matched token has margin {}", self.margin()));
+            }
+            return Ok(());
+        }
+        // A mismatched token is at best the runner-up. The slack covers the f64 rounding of
+        // the two normalised log-probabilities; logits are f32, far coarser.
+        if self.margin() + MARGIN_SLACK < self.top2_gap {
+            return Err(format!(
+                "a mismatch with margin {} sits above the runner-up at gap {}",
+                self.margin(),
+                self.top2_gap
+            ));
+        }
+        // A tie goes to the lower id, so a mismatch at zero margin names a higher id.
+        if self.margin() == 0.0 && self.generated < self.argmax {
+            return Err(format!(
+                "id {} ties argmax {} but would have won the tie",
+                self.generated, self.argmax
+            ));
+        }
+        Ok(())
     }
 
     /// Judges `generated` against one logits row of the reference. Only the first `vocab`
@@ -167,6 +215,9 @@ pub(crate) fn greedy_generate(
 /// SpecPilot's injected fault (section 6.2) around any model: from output position `from` on,
 /// every `stride`-th id gains `bias`. A harness self-test: a candidate that carries it must be
 /// rejected, and a task metric that reads only the start of each answer cannot see it.
+///
+/// It generates; it is not an audit model. Every prefill counts as the prompt and restarts at
+/// output position 0, so one prefill of a long context would be read without the fault.
 pub(crate) struct LogitBiasFault<M> {
     pub(crate) inner: M,
     pub(crate) from: usize,
@@ -217,32 +268,31 @@ impl<M: ForcedModel> ForcedModel for LogitBiasFault<M> {
     }
 }
 
-/// The reference's argmax for `generated[position]` when the prompt and every earlier generated
-/// token go through the prompt path in one prefill. An argmax that differs from the step path's
-/// marks a position whose choice depends on the prefill length.
-pub(crate) fn prefill_argmax(
+/// The model's judgement of `generated[position]` when the prompt and every earlier generated
+/// token go through the prompt path in one prefill: the same token in the same history as the
+/// step path judged it, read through another legal execution.
+pub(crate) fn prefill_record(
     model: &mut dyn ForcedModel,
     prompt: &[u32],
     generated: &[u32],
     position: usize,
     vocab: usize,
-) -> Result<u32> {
-    let earlier = generated.get(..position).ok_or_else(|| {
+) -> Result<TokenRecord> {
+    let &token = generated.get(position).ok_or_else(|| {
         score_error(format!(
             "position {position} is past the {} generated tokens",
             generated.len()
         ))
     })?;
-    let mut context = Vec::with_capacity(prompt.len() + earlier.len());
-    context.extend_from_slice(prompt);
-    context.extend_from_slice(earlier);
-    if context.is_empty() {
+    if prompt.is_empty() {
         return Err(score_error("token forcing needs a non-empty prompt".into()));
     }
+    let mut context = Vec::with_capacity(prompt.len() + position);
+    context.extend_from_slice(prompt);
+    context.extend_from_slice(&generated[..position]);
     model.reset()?;
     let row = model.prefill_logits(&context)?;
-    let (argmax, _) = top_two(visible_row(&row, vocab)?);
-    Ok(argmax as u32)
+    TokenRecord::from_logits(position, &row, token, vocab)
 }
 
 fn visible_row(logits: &[f32], vocab: usize) -> Result<&[f32]> {

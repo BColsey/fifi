@@ -1,4 +1,5 @@
-//! One qualification run end to end, and the offline verdict from the files a run wrote.
+//! A qualification run: the reference and the baseline scored and calibrated once, each
+//! candidate judged against them, and the offline verdict from the files a run wrote.
 
 use super::gate::{
     AuditPlan, ExecutionIdentity, GateConfig, Generation, Report, ScoredSystem, audit_system,
@@ -7,25 +8,25 @@ use super::gate::{
 use super::score::ForcedModel;
 use crate::EngError;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, EngError>;
 
-/// The identities of the scorer and the three executions.
+/// The identities of the scorer and of the two executions every candidate is compared with.
 #[derive(Clone, Debug)]
 pub(crate) struct Identities {
     pub(crate) scorer: ExecutionIdentity,
     pub(crate) reference: ExecutionIdentity,
     pub(crate) baseline: ExecutionIdentity,
-    pub(crate) candidate: ExecutionIdentity,
 }
 
-/// What each execution generated, request by request in one order.
+/// What the reference and the baseline generated, request by request in one order.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Outputs<'a> {
     pub(crate) reference: &'a [Generation],
     pub(crate) baseline: &'a [Generation],
-    pub(crate) candidate: &'a [Generation],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,99 +34,159 @@ pub(crate) struct RunSettings {
     pub(crate) config: GateConfig,
     /// The tokenizer-visible vocabulary (`TokenizerBundle::vocab_size`).
     pub(crate) vocab: usize,
-    /// The most events audited per execution.
+    /// The most baseline events audited.
     pub(crate) audit_cap: usize,
 }
 
-/// A finished run: the report and the three scored files behind it.
+/// The scorer and, when the harness has one, a model of the baseline execution for the audits.
+pub(crate) type Models<'m> = (&'m mut dyn ForcedModel, Option<&'m mut dyn ForcedModel>);
+
+/// One execution under test.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Candidate<'a> {
+    pub(crate) identity: &'a ExecutionIdentity,
+    pub(crate) generations: &'a [Generation],
+    /// The most events audited. Events past it count as unexplained.
+    pub(crate) audit_cap: usize,
+}
+
+/// The reference and the baseline of a run, scored, calibrated and audited once and shared by
+/// every candidate judged against them.
+#[derive(Clone, Debug)]
+pub(crate) struct Comparison {
+    pub(crate) reference: ScoredSystem,
+    pub(crate) baseline: ScoredSystem,
+    config: GateConfig,
+    vocab: usize,
+    /// Twice the calibrated delta: the margin above which a mismatch is audited.
+    threshold: f64,
+}
+
+/// One candidate's report and its scored file.
 #[derive(Clone, Debug)]
 pub(crate) struct Run {
     pub(crate) report: Report,
-    pub(crate) reference: ScoredSystem,
-    pub(crate) baseline: ScoredSystem,
     pub(crate) candidate: ScoredSystem,
 }
 
-/// Scores the three executions, calibrates delta, audits the baseline's and the candidate's
-/// large-margin mismatches, and evaluates the gate. `models` holds the scorer and, when the
-/// harness has one, a model of the baseline execution for the audits.
-pub(crate) fn qualify(
-    models: (&mut dyn ForcedModel, Option<&mut dyn ForcedModel>),
-    identities: &Identities,
-    outputs: Outputs<'_>,
-    settings: RunSettings,
-) -> Result<Run> {
-    let (scorer, mut baseline_model) = models;
-    let score = |model: &mut dyn ForcedModel, system: &ExecutionIdentity, generations| {
-        score_system(
-            model,
-            (system, &identities.scorer),
-            generations,
-            settings.vocab,
-        )
-    };
-    let reference = score(&mut *scorer, &identities.reference, outputs.reference)?;
-    let mut baseline = score(&mut *scorer, &identities.baseline, outputs.baseline)?;
-    let delta = calibrate(&reference, &baseline)?.delta;
-    let mut candidate = score(&mut *scorer, &identities.candidate, outputs.candidate)?;
-    let plan = AuditPlan {
-        threshold: 2.0 * delta,
-        vocab: settings.vocab,
-        cap: settings.audit_cap,
-    };
-    for (scored, generations) in [
-        (&mut baseline, outputs.baseline),
-        (&mut candidate, outputs.candidate),
-    ] {
-        // The cast shortens the trait object's lifetime to this reborrow; `as_deref_mut` cannot,
-        // because `&mut` is invariant in its target inside the `Option`.
-        let baseline_audit = baseline_model
-            .as_mut()
-            .map(|model| &mut **model as &mut dyn ForcedModel);
-        audit_system(scored, (&mut *scorer, baseline_audit), generations, plan)?;
+impl Comparison {
+    /// Scores the reference and the baseline, calibrates delta, and audits the baseline's
+    /// large-margin mismatches.
+    pub(crate) fn prepare(
+        models: Models<'_>,
+        identities: &Identities,
+        outputs: Outputs<'_>,
+        settings: RunSettings,
+    ) -> Result<Self> {
+        let (scorer, baseline_model) = models;
+        let score = |model: &mut dyn ForcedModel, system: &ExecutionIdentity, generations| {
+            score_system(
+                model,
+                (system, &identities.scorer),
+                generations,
+                settings.vocab,
+            )
+        };
+        let reference = score(&mut *scorer, &identities.reference, outputs.reference)?;
+        let mut baseline = score(&mut *scorer, &identities.baseline, outputs.baseline)?;
+        let threshold = 2.0 * calibrate(&reference, &baseline)?.delta;
+        let plan = AuditPlan {
+            threshold,
+            vocab: settings.vocab,
+            cap: settings.audit_cap,
+        };
+        audit_system(
+            &mut baseline,
+            (scorer, baseline_model),
+            outputs.baseline,
+            plan,
+        )?;
+        Ok(Self {
+            reference,
+            baseline,
+            config: settings.config,
+            vocab: settings.vocab,
+            threshold,
+        })
     }
-    let report = evaluate(settings.config, &reference, &baseline, &candidate)?;
-    Ok(Run {
-        report,
-        reference,
-        baseline,
-        candidate,
-    })
+
+    /// Scores and audits one candidate and evaluates the gate.
+    pub(crate) fn judge(&self, models: Models<'_>, candidate: Candidate<'_>) -> Result<Run> {
+        let (scorer, baseline_model) = models;
+        let mut scored = score_system(
+            &mut *scorer,
+            (candidate.identity, &self.reference.scorer),
+            candidate.generations,
+            self.vocab,
+        )?;
+        let plan = AuditPlan {
+            threshold: self.threshold,
+            vocab: self.vocab,
+            cap: candidate.audit_cap,
+        };
+        audit_system(
+            &mut scored,
+            (scorer, baseline_model),
+            candidate.generations,
+            plan,
+        )?;
+        let report = evaluate(self.config, &self.reference, &self.baseline, &scored)?;
+        Ok(Run {
+            report,
+            candidate: scored,
+        })
+    }
 }
 
 /// Recomputes the verdict from the scored files of a device run.
+/// The report names each file by the SHA-256 of its bytes.
 pub(crate) fn verdict_from_files(
     reference: &Path,
     baseline: &Path,
     candidate: &Path,
     config: GateConfig,
 ) -> Result<Report> {
-    evaluate(
-        config,
-        &read_scored(reference)?,
-        &read_scored(baseline)?,
-        &read_scored(candidate)?,
-    )
+    let (reference, reference_sha256) = read_scored(reference)?;
+    let (baseline, baseline_sha256) = read_scored(baseline)?;
+    let (candidate, candidate_sha256) = read_scored(candidate)?;
+    let mut report = evaluate(config, &reference, &baseline, &candidate)?;
+    report.inputs = input_digests([reference_sha256, baseline_sha256, candidate_sha256]);
+    Ok(report)
 }
 
-pub(crate) fn read_scored(path: &Path) -> Result<ScoredSystem> {
-    let text = std::fs::read_to_string(path).map_err(|error| io_error(path, &error.to_string()))?;
-    serde_json::from_str(&text).map_err(|error| io_error(path, &error.to_string()))
+/// The `Report::inputs` of three scored files, given in the order reference, baseline,
+/// candidate.
+pub(crate) fn input_digests(digests: [String; 3]) -> BTreeMap<String, String> {
+    ["reference", "baseline", "candidate"]
+        .into_iter()
+        .map(str::to_owned)
+        .zip(digests)
+        .collect()
 }
 
-/// Writes `value` as pretty JSON to a new file; an existing file is never replaced.
-pub(crate) fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+/// A scored file and the SHA-256 of its bytes.
+pub(crate) fn read_scored(path: &Path) -> Result<(ScoredSystem, String)> {
+    let bytes = std::fs::read(path).map_err(|error| io_error(path, &error.to_string()))?;
+    let scored =
+        serde_json::from_slice(&bytes).map_err(|error| io_error(path, &error.to_string()))?;
+    Ok((scored, format!("{:x}", Sha256::digest(&bytes))))
+}
+
+/// Writes `value` as pretty JSON to a new file, and returns the SHA-256 of the bytes written;
+/// an existing file is never replaced.
+pub(crate) fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<String> {
     use std::io::Write as _;
-    let text =
+    let mut text =
         serde_json::to_string_pretty(value).map_err(|error| io_error(path, &error.to_string()))?;
+    text.push('\n');
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|error| io_error(path, &error.to_string()))?;
     file.write_all(text.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .map_err(|error| io_error(path, &error.to_string()))
+        .map_err(|error| io_error(path, &error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(text.as_bytes())))
 }
 
 fn io_error(path: &Path, message: &str) -> EngError {
