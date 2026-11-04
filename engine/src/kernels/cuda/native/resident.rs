@@ -65,6 +65,7 @@ pub(in crate::kernels::cuda) mod gdn_delta;
 pub(in crate::kernels::cuda) mod gelu_ffn;
 pub(in crate::kernels::cuda) mod gemma_matvec;
 pub(in crate::kernels::cuda) mod graph;
+pub(in crate::kernels::cuda) mod hyper;
 pub(in crate::kernels::cuda) mod kv8_append;
 pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod kv_f16_rows;
