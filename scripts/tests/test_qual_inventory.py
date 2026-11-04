@@ -658,5 +658,105 @@ class ProcessGroupTimeoutTest(unittest.TestCase):
         self.fail(f"grandchild {grandchild} survived the timeout kill")
 
 
+class PackRegistryTest(unittest.TestCase):
+    """The pack registry binds to loader pins and the preflight mapping."""
+
+    @staticmethod
+    def _registry() -> dict:
+        return json.loads((ROOT / "scripts" / "pack_registry.json").read_text())
+
+    def setUp(self):
+        self._patches = (
+            mock.patch.object(qi, "gguf_pin_name", return_value="Qwen3.6-35B-A3B-Q4_K_M.gguf"),
+            mock.patch.object(qi, "tokenizer_pin_sha256s", return_value={
+                "tokenizer_json": "a" * 64,
+                "tokenizer_config_json": "b" * 64,
+                "chat_template_jinja": "c" * 64,
+                "generation_config_json": "d" * 64,
+            }),
+            mock.patch.object(qi, "weight_format_qualification",
+                              return_value={"gguf": "qualified", "exl3": "experimental"}),
+        )
+        for patch in self._patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _bound(self) -> dict:
+        """A registry whose gguf identity matches the patched source pins."""
+        registry = self._registry()
+        registry["packs"][0]["identity"]["tokenizer_pin_sha256"] = {
+            "tokenizer_json": "a" * 64,
+            "tokenizer_config_json": "b" * 64,
+            "chat_template_jinja": "c" * 64,
+            "generation_config_json": "d" * 64,
+        }
+        return registry
+
+    def test_committed_registry_validates_against_real_source(self):
+        # The real extractor functions run here (setUp patches only the
+        # fixtures below): the committed registry must bind to the loader
+        # constants and the preflight mapping.
+        for patch in self._patches:
+            patch.stop()
+        self.addCleanup(lambda: [p.start() for p in self._patches])
+        self.assertEqual(qi.cmd_packs(argparse.Namespace()), 0)
+
+    def test_bound_registry_resolves(self):
+        self.assertEqual(
+            qi.validate_pack_registry(self._bound()),
+            {"qwen36/gguf": "reference", "qwen36/exl3-4.00": "fail", "qwen36/exl3-4.50": "fail"},
+        )
+
+    def test_tokenizer_pin_drift_fails(self):
+        registry = self._bound()
+        registry["packs"][0]["identity"]["tokenizer_pin_sha256"]["tokenizer_json"] = "f" * 64
+        with self.assertRaisesRegex(qi.InventoryError, "tokenizer pin tokenizer_json drifted"):
+            qi.validate_pack_registry(registry)
+
+    def test_pinned_name_drift_fails(self):
+        registry = self._bound()
+        registry["packs"][0]["identity"]["pinned_gguf_name"] = "other.gguf"
+        with self.assertRaisesRegex(qi.InventoryError, "!= loader pin"):
+            qi.validate_pack_registry(registry)
+
+    def test_runtime_label_contradicting_preflight_fails(self):
+        registry = self._bound()
+        registry["packs"][0]["production_eligibility"]["runtime_label"] = "experimental"
+        with self.assertRaisesRegex(qi.InventoryError, "contradicts the preflight mapping"):
+            qi.validate_pack_registry(registry)
+
+    def test_missing_numerical_verdict_fails(self):
+        registry = self._bound()
+        del registry["packs"][1]["numerical_qualification"]
+        with self.assertRaisesRegex(qi.InventoryError, "numerical_qualification must have"):
+            qi.validate_pack_registry(registry)
+
+    def test_no_production_default_fails(self):
+        registry = self._bound()
+        for pack in registry["packs"]:
+            pack["production_eligibility"]["production_default"] = False
+        with self.assertRaisesRegex(qi.InventoryError, "exactly one production_default"):
+            qi.validate_pack_registry(registry)
+
+    def test_default_must_be_qualified_gguf(self):
+        registry = self._bound()
+        registry["packs"][0]["production_eligibility"]["production_default"] = False
+        registry["packs"][1]["production_eligibility"]["production_default"] = True
+        with self.assertRaisesRegex(qi.InventoryError, "qualified gguf pack"):
+            qi.validate_pack_registry(registry)
+
+    def test_reference_verdict_only_for_default(self):
+        registry = self._bound()
+        registry["packs"][2]["numerical_qualification"]["verdict"] = "reference"
+        with self.assertRaisesRegex(qi.InventoryError, "only the production default may be the reference"):
+            qi.validate_pack_registry(registry)
+
+    def test_failed_source_binding_is_not_a_silent_pass(self):
+        with mock.patch.object(qi, "gguf_pin_name",
+                               side_effect=qi.InventoryError("source gone")):
+            with self.assertRaisesRegex(qi.InventoryError, "source binding failed"):
+                qi.validate_pack_registry(self._bound())
+
+
 if __name__ == "__main__":
     unittest.main()

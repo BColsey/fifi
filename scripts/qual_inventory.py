@@ -448,6 +448,215 @@ def validate_policy(policy: dict, facts: dict) -> list[str]:
     return ids
 
 
+# --- pack registry --------------------------------------------------------------
+
+PACKS_REGISTRY_PATH = REPO_ROOT / "scripts" / "pack_registry.json"
+SETTINGS_PATH = ENGINE_ROOT / "src" / "family" / "qwen36" / "settings.rs"
+CUDA_START_PATH = ENGINE_ROOT / "src" / "family" / "qwen36" / "cuda" / "start.rs"
+PREFLIGHT_PATH = ENGINE_ROOT / "src" / "capability" / "preflight.rs"
+
+TOKENIZER_PIN_KEYS = {
+    "TOKENIZER_JSON": "tokenizer_json",
+    "TOKENIZER_CONFIG": "tokenizer_config_json",
+    "CHAT_TEMPLATE": "chat_template_jinja",
+    "GENERATION_CONFIG": "generation_config_json",
+}
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise InventoryError(f"missing file: {path}") from error
+
+
+def gguf_pin_name() -> str:
+    """The pinned GGUF checkpoint name the CUDA loader demands."""
+    match = re.search(r'const GGUF_NAME: &str = "([^"]+)"', _read(CUDA_START_PATH))
+    if not match:
+        raise InventoryError(f"{CUDA_START_PATH}: the pinned GGUF_NAME constant was not found")
+    return match.group(1)
+
+
+def tokenizer_pin_sha256s() -> dict[str, str]:
+    """The four tokenizer pin digests the loader refuses mismatches on."""
+    found = dict(re.findall(r"const (\w+)_SHA256: &str =\s*\"([0-9a-f]{64})\"", _read(SETTINGS_PATH)))
+    missing = sorted(set(TOKENIZER_PIN_KEYS) - set(found))
+    if missing:
+        raise InventoryError(f"{SETTINGS_PATH}: tokenizer pin constants missing: {missing}")
+    return {TOKENIZER_PIN_KEYS[name]: digest for name, digest in found.items()
+            if name in TOKENIZER_PIN_KEYS}
+
+
+def weight_format_qualification() -> dict[str, str]:
+    """The runtime qualification mapping (preflight.rs), lowercased."""
+    text = _read(PREFLIGHT_PATH)
+    mapping: dict[str, str] = {}
+    for fmt, label in re.findall(
+        r"WeightFormat::(Gguf|Exl3) => Qualification::(Qualified|Experimental|Unverified)", text
+    ):
+        mapping[fmt.lower()] = label.lower()
+    if "gguf" not in mapping or "exl3" not in mapping:
+        raise InventoryError(
+            f"{PREFLIGHT_PATH}: the WeightFormat -> Qualification mapping was not found"
+        )
+    return mapping
+
+
+PACK_TOP_KEYS = {"schema_version", "quality_standard", "packs"}
+PACK_KEYS = {"id", "family", "weights", "identity", "loads",
+             "numerical_qualification", "production_eligibility"}
+VERDICTS = {"reference", "pass", "fail", "not_run"}
+RUNTIME_LABELS = {"qualified", "experimental", "unverified"}
+MARGIN_KEYS = {"true_token_nll_nats", "top1_points", "exact_copy_points", "retrieval_points"}
+
+
+def validate_pack_registry(registry: dict) -> dict[str, str]:
+    """Check the registry against engine source; return pack id -> verdict.
+
+    Raises InventoryError listing every defect: unknown shapes, identity pins
+    that drifted from the loader constants, labels that contradict the
+    preflight mapping, or a missing/duplicated production default.
+    """
+    problems: list[str] = []
+    unknown_top = sorted(set(registry) - PACK_TOP_KEYS)
+    if unknown_top:
+        problems.append(f"unknown keys {unknown_top}")
+    if registry.get("schema_version") != 1:
+        problems.append("schema_version must be 1")
+    standard = registry.get("quality_standard", {})
+    if not isinstance(standard, dict) or set(standard) != {"description", "margins", "source"}:
+        problems.append("quality_standard must have exactly description, margins, source")
+    else:
+        margins = standard["margins"]
+        if not isinstance(margins, dict) or set(margins) != MARGIN_KEYS:
+            problems.append(f"quality_standard.margins must have exactly {sorted(MARGIN_KEYS)}")
+        elif not all(isinstance(v, (int, float)) and v > 0 for v in margins.values()):
+            problems.append("quality_standard.margins values must be positive numbers")
+
+    packs = registry.get("packs")
+    if not isinstance(packs, list) or not packs:
+        raise InventoryError("pack registry problems:\n  packs must be a non-empty list")
+
+    try:
+        pinned_name = gguf_pin_name()
+        tokenizer_pins = tokenizer_pin_sha256s()
+        runtime_mapping = weight_format_qualification()
+    except InventoryError as error:
+        raise InventoryError(f"pack registry problems:\n  source binding failed: {error}") from error
+
+    ids: list[str] = []
+    verdicts: dict[str, str] = {}
+    defaults: list[str] = []
+    for index, pack in enumerate(packs):
+        where = f"packs[{index}]"
+        if not isinstance(pack, dict):
+            problems.append(f"{where}: not an object")
+            continue
+        unknown = sorted(set(pack) - PACK_KEYS)
+        if unknown:
+            problems.append(f"{where}: unknown keys {unknown}")
+            continue
+        pid = pack.get("id")
+        if not isinstance(pid, str) or not pid:
+            problems.append(f"{where}: id must be a non-empty string")
+            continue
+        where = f"pack {pid!r}"
+        ids.append(pid)
+        weights = pack.get("weights")
+        if weights not in ("gguf", "exl3"):
+            problems.append(f"{where}: weights must be gguf or exl3")
+            continue
+        identity = pack.get("identity", {})
+        if weights == "gguf":
+            if not isinstance(identity, dict) or set(identity) != {"pinned_gguf_name", "tokenizer_pin_sha256"}:
+                problems.append(f"{where}: gguf identity needs pinned_gguf_name and tokenizer_pin_sha256")
+            else:
+                if identity["pinned_gguf_name"] != pinned_name:
+                    problems.append(
+                        f"{where}: pinned name {identity['pinned_gguf_name']!r} != loader pin {pinned_name!r}"
+                    )
+                pins = identity["tokenizer_pin_sha256"]
+                if not isinstance(pins, dict):
+                    problems.append(f"{where}: tokenizer_pin_sha256 must be an object")
+                else:
+                    for key, digest in tokenizer_pins.items():
+                        if pins.get(key) != digest:
+                            problems.append(f"{where}: tokenizer pin {key} drifted from the loader constant")
+                    extra = sorted(set(pins) - set(tokenizer_pins))
+                    if extra:
+                        problems.append(f"{where}: unknown tokenizer pins {extra}")
+        elif not isinstance(identity, dict) or set(identity) != {"bpw"} or not identity["bpw"]:
+            problems.append(f"{where}: exl3 identity needs a non-empty bpw")
+
+        loads = pack.get("loads", {})
+        if not isinstance(loads, dict) or set(loads) != {"status", "evidence"}:
+            problems.append(f"{where}: loads must have exactly status and evidence")
+        elif loads["status"] not in ("evidenced", "not_evidenced"):
+            problems.append(f"{where}: loads.status must be evidenced or not_evidenced")
+        elif loads["status"] == "evidenced" and not loads["evidence"]:
+            problems.append(f"{where}: evidenced loads need at least one evidence reference")
+
+        numerical = pack.get("numerical_qualification", {})
+        if not isinstance(numerical, dict) or set(numerical) != {"verdict", "gate", "evidence"}:
+            problems.append(f"{where}: numerical_qualification must have verdict, gate, evidence")
+        else:
+            verdict = numerical["verdict"]
+            if verdict not in VERDICTS:
+                problems.append(f"{where}: numerical verdict must be one of {sorted(VERDICTS)}")
+            elif not numerical["gate"] or not numerical["evidence"]:
+                problems.append(f"{where}: a recorded verdict needs its gate and evidence")
+            else:
+                verdicts[pid] = verdict
+
+        eligibility = pack.get("production_eligibility", {})
+        if not isinstance(eligibility, dict) or set(eligibility) != {"runtime_label", "production_default", "notes"}:
+            problems.append(f"{where}: production_eligibility needs runtime_label, production_default, notes")
+        else:
+            label = eligibility["runtime_label"]
+            if label not in RUNTIME_LABELS:
+                problems.append(f"{where}: runtime_label must be one of {sorted(RUNTIME_LABELS)}")
+            elif label != runtime_mapping.get(weights):
+                problems.append(
+                    f"{where}: runtime_label {label!r} contradicts the preflight "
+                    f"mapping {runtime_mapping.get(weights)!r} for weights {weights!r}"
+                )
+            if eligibility["production_default"] is True:
+                defaults.append(pid)
+
+    duplicates = {pid for pid in ids if ids.count(pid) > 1}
+    for pid in sorted(duplicates):
+        problems.append(f"duplicate pack id {pid!r}")
+    if len(defaults) != 1:
+        problems.append(f"exactly one production_default must be set (found {len(defaults)})")
+    else:
+        default = next(p for p in packs if isinstance(p, dict) and p.get("id") == defaults[0])
+        if default.get("weights") != "gguf" or default.get("production_eligibility", {}).get("runtime_label") != "qualified":
+            problems.append(
+                "the production default must be the qualified gguf pack "
+                "(GGUF stays the qualified Qwen3.6 default)"
+            )
+        if verdicts.get(defaults[0]) != "reference":
+            problems.append("the production default must carry the reference verdict")
+        for pid, verdict in verdicts.items():
+            if verdict == "reference" and pid != defaults[0]:
+                problems.append(f"pack {pid!r}: only the production default may be the reference")
+
+    if problems:
+        raise InventoryError("pack registry problems:\n  " + "\n  ".join(problems))
+    return verdicts
+
+
+def cmd_packs(args: argparse.Namespace) -> int:
+    registry = load_json_strict(PACKS_REGISTRY_PATH)
+    verdicts = validate_pack_registry(registry)
+    default = next(p["id"] for p in registry["packs"] if p["production_eligibility"]["production_default"])
+    print(f"packs: {len(registry['packs'])} entries validate against engine source; "
+          f"default = {default}; verdicts = "
+          + ", ".join(f"{pid}:{verdict}" for pid, verdict in sorted(verdicts.items())))
+    return 0
+
+
 # --- libtest parsing -----------------------------------------------------------
 
 
@@ -872,6 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("generate", help="scan sources and write scripts/qual_facts.json")
     sub.add_parser("validate", help="fail on facts drift or policy defects")
+    sub.add_parser("packs", help="validate the pack registry against engine source")
 
     collect = sub.add_parser("collect", help="run policy surfaces and write evidence")
     collect.add_argument("--surface", action="append",
@@ -885,6 +1095,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_generate(args)
         if args.command == "validate":
             return cmd_validate(args)
+        if args.command == "packs":
+            return cmd_packs(args)
         return cmd_collect(args)
     except InventoryError as error:
         print(f"qual_inventory: {error}", file=sys.stderr)

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "quality_standard": {
+    "description": "Real-task non-inferiority with registered margins (doc/explanation/status.md, 30 Oct 2026); earlier KL results stay recorded as failures; KL is a diagnostic.",
+    "margins": {
+      "true_token_nll_nats": 0.02,
+      "top1_points": 0.5,
+      "exact_copy_points": 1.0,
+      "retrieval_points": 2.0
+    },
+    "source": "doc/explanation/status.md"
+  },
+  "packs": [
+    {
+      "id": "qwen36/gguf",
+      "family": "qwen36",
+      "weights": "gguf",
+      "identity": {
+        "pinned_gguf_name": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+        "tokenizer_pin_sha256": {
+          "tokenizer_json": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+          "tokenizer_config_json": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+          "chat_template_jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+          "generation_config_json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+        }
+      },
+      "loads": {
+        "status": "evidenced",
+        "evidence": [
+          "doc/explanation/status.md: GGUF engine rows (the measured default engine, same-day comparisons against EXL3)"
+        ]
+      },
+      "numerical_qualification": {
+        "verdict": "reference",
+        "gate": "the GGUF path is the frozen reference every other path is judged against",
+        "evidence": [
+          "doc/explanation/status.md: quality standard (registered margins, 30 Oct 2026)"
+        ]
+      },
+      "production_eligibility": {
+        "runtime_label": "qualified",
+        "production_default": true,
+        "notes": "preflight maps WeightFormat::Gguf to Qualification::Qualified; the qualified Qwen3.6 operational default"
+      }
+    },
+    {
+      "id": "qwen36/exl3-4.00",
+      "family": "qwen36",
+      "weights": "exl3",
+      "identity": {
+        "bpw": "4.00"
+      },
+      "loads": {
+        "status": "evidenced",
+        "evidence": [
+          "doc/explanation/status.md: EXL3 4.00 bpw rows (merged serving stack c00c145fa, coherent text, chunked prefill 1de94e65d)"
+        ]
+      },
+      "numerical_qualification": {
+        "verdict": "fail",
+        "gate": "frozen O1 quality evaluation against the GGUF engine",
+        "evidence": [
+          "docs/plans/xinfer-adoption-audit.md:127-135 'EXL3 4.00 | 256K memory-admitted | NOT qualified (O1 failed)'",
+          "doc/explanation/status.md: quality standard note - quality against the GGUF engine applies"
+        ]
+      },
+      "production_eligibility": {
+        "runtime_label": "experimental",
+        "production_default": false,
+        "notes": "256K memory-admitted only; memory admission is not quality qualification"
+      }
+    },
+    {
+      "id": "qwen36/exl3-4.50",
+      "family": "qwen36",
+      "weights": "exl3",
+      "identity": {
+        "bpw": "4.50"
+      },
+      "loads": {
+        "status": "evidenced",
+        "evidence": [
+          "docs/plans/xinfer-adoption-audit.md:134 'EXL3 4.50 | 128K memory-admitted'"
+        ]
+      },
+      "numerical_qualification": {
+        "verdict": "fail",
+        "gate": "frozen O1 quality evaluation against the GGUF engine",
+        "evidence": [
+          "docs/plans/xinfer-adoption-audit.md:134-135 'EXL3 4.50 | 128K memory-admitted; 256K refused by 89.2 MB | NOT qualified (O1 failed)'"
+        ]
+      },
+      "production_eligibility": {
+        "runtime_label": "experimental",
+        "production_default": false,
+        "notes": "128K memory-admitted; 256K refused by 89.2 MB; memory admission is not quality qualification"
+      }
+    }
+  ]
+}
