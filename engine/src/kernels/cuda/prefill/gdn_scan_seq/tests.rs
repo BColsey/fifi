@@ -2752,4 +2752,5 @@ fn gdn_scan_seq_speed_rows() -> Result<(), EngError> {
 
 // ---- the form bits (Qwen3.8 Flash-Next) --------------------------------------------------
 
+mod decode_bench;
 mod forms;

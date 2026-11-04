@@ -5,20 +5,15 @@
 
 use super::{
     D, E3, RefOpts, Rig, ScanInputs, ScanLayout, ScanRig, assert_constraints, assert_scan_finite,
-    generate_scan, judge_scan_with, le_bytes, median_us, scan_reference, seed_of,
+    generate_scan, judge_scan_with, scan_reference, seed_of,
 };
 use crate::EngError;
-use crate::kernels::cuda::DeviceBuffer;
-use crate::kernels::cuda::prefill::gdn_scan_seq::{
-    GDN_SCAN_EPS, GdnForm, GdnGate, GdnKeyHeads, GdnL2, GdnScanSeqCall, ScanWeights, scan_bytes,
-};
-use crate::kernels::cuda::resident::gdn_conv::{ConvCall, ConvShape};
-use crate::kernels::cuda::resident::gdn_delta::{DeltaCall, DeltaShape, DeltaWeights, delta_bytes};
+use crate::kernels::cuda::prefill::gdn_scan_seq::{GdnForm, GdnGate, GdnKeyHeads, GdnL2};
 use crate::kernels::cuda::testkit;
 
 /// Flash-Next: 16 key heads, 48 value heads (`linear_num_key_heads`, `linear_num_value_heads`).
-const FN_K: usize = 16;
-const FN_V: usize = 48;
+pub(super) const FN_K: usize = 16;
+pub(super) const FN_V: usize = 48;
 
 /// The form with rule bits `bits` (1 grouped heads, 2 add-eps L2, 4 sigmoid gate; the C bits).
 fn form_of(bits: u8) -> GdnForm {
@@ -42,7 +37,7 @@ fn form_of(bits: u8) -> GdnForm {
 }
 
 /// The reference variant that models `form`.
-fn opts_of(form: GdnForm) -> RefOpts {
+pub(super) fn opts_of(form: GdnForm) -> RefOpts {
     RefOpts {
         mlx_key_map: form.key_heads == GdnKeyHeads::Grouped,
         decode_norm_form: form.l2 == GdnL2::AddEps,
@@ -220,129 +215,5 @@ fn gdn_scan_seq_flash_next_chunks_and_tokens_equal_one_chunk() -> Result<(), Eng
         bits(&tokens.state),
         "tokens: state differs"
     );
-    Ok(())
-}
-
-/// The decode question of the Flash-Next plan, measured: one decode token of one DeltaNet
-/// layer through this entry at m = 1 (conv then scan) against the vendored decode delta
-/// kernel at m = 1 on the same geometry. Reported, not gated. Each sample queues 36 layers
-/// (the Flash-Next DeltaNet layer count) back to back and synchronizes once; the median of 11
-/// samples after 2 warm-ups, divided by 36. Wall clock around a drained stream, host wrapper
-/// time included (the profile of the test build is printed).
-#[test]
-fn gdn_scan_seq_flash_next_decode_us() -> Result<(), EngError> {
-    if !testkit::device_present("gdn_scan_seq_flash_next_decode_us") {
-        return Ok(());
-    }
-    const LAYERS: usize = 36;
-    let lay = ScanLayout::of(FN_K, FN_V);
-    let inp = generate_scan(FN_K, FN_V, 1, lay, seed_of(FN_K, FN_V, 1, 0xf3));
-    let rig = Rig::new()?;
-    let ctx = &rig.ctx;
-    let channels = lay.conv_ld;
-    let upload = |values: &[f32]| ctx.upload(&le_bytes(values));
-    let (conv, proj) = (upload(&inp.conv)?, upload(&inp.proj)?);
-    let (a, dt, nw) = (upload(&inp.a)?, upload(&inp.dt)?, upload(&inp.nw)?);
-    let state = upload(&inp.state0)?;
-    let w: DeviceBuffer = upload(&vec![0.25f32; channels * 4])?;
-    let ring = upload(&vec![0.0f32; 3 * channels])?;
-    let need = scan_bytes(inp.shape(1, 0, 1024))?;
-    let (conv_out, o_out) = (
-        ctx.upload(&vec![0u8; need.conv])?,
-        ctx.upload(&vec![0u8; need.o_out])?,
-    );
-    let conv_shape = ConvShape {
-        m: 1,
-        channels,
-        ld: lay.ld,
-    };
-    let queue_conv = || {
-        ctx.gdn_conv(
-            &rig.stream,
-            ConvCall {
-                shape: conv_shape,
-                proj: proj.range(0, channels * 4)?,
-                weights: w.range(0, channels * 16)?,
-                state: ring.range(0, 3 * channels * 4)?,
-                out: conv_out.range(0, need.conv)?,
-            },
-        )
-    };
-    let queue_scan = || {
-        ctx.gdn_scan_seq_form(
-            &rig.stream,
-            GdnScanSeqCall {
-                shape: inp.shape(1, 0, 1024),
-                eps: GDN_SCAN_EPS,
-                conv: conv_out.range(0, need.conv)?,
-                proj: proj.range(0, need.proj)?,
-                weights: ScanWeights {
-                    a: a.range(0, need.a)?,
-                    dt_bias: dt.range(0, need.dt_bias)?,
-                    norm_w: nw.range(0, need.norm_w)?,
-                },
-                state: state.range(0, need.state)?,
-                o_out: o_out.range(0, need.o_out)?,
-                status: None,
-            },
-            GdnForm::FLASH_NEXT,
-        )
-    };
-    let delta_shape = DeltaShape {
-        m: 1,
-        n_k_heads: FN_K,
-        n_v_heads: FN_V,
-        conv_ld: lay.conv_ld,
-        ld: lay.ld,
-        z_off: lay.z_off,
-        beta_off: lay.beta_off,
-        alpha_off: lay.alpha_off,
-    };
-    let dneed = delta_bytes(delta_shape)?;
-    let dout = ctx.upload(&vec![0u8; dneed.out])?;
-    let queue_delta = || {
-        ctx.gdn_delta(
-            &rig.stream,
-            DeltaCall {
-                shape: delta_shape,
-                eps: GDN_SCAN_EPS,
-                conv: conv.range(0, dneed.conv)?,
-                proj: proj.range(0, dneed.proj)?,
-                weights: DeltaWeights {
-                    a: a.range(0, dneed.a)?,
-                    dt_bias: dt.range(0, dneed.dt_bias)?,
-                    norm_w: nw.range(0, dneed.norm_w)?,
-                },
-                state: state.range(0, dneed.state)?,
-                out: dout.range(0, dneed.out)?,
-            },
-        )
-    };
-    let per_layer = |queue: &dyn Fn() -> Result<(), EngError>| -> Result<f64, EngError> {
-        let us = median_us(11, 2, || {
-            for _ in 0..LAYERS {
-                queue()?;
-            }
-            rig.stream.synchronize()
-        })?;
-        Ok(us / LAYERS as f64)
-    };
-    let conv_us = per_layer(&queue_conv)?;
-    let scan_us = per_layer(&queue_scan)?;
-    let both_us = per_layer(&|| {
-        queue_conv()?;
-        queue_scan()
-    })?;
-    let delta_us = per_layer(&queue_delta)?;
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    println!(
-        "TIMING flash-next decode ({profile} test build, per DeltaNet layer at m = 1, 16 x 48 heads): conv {conv_us:.1} us, scan entry {scan_us:.1} us, conv + scan {both_us:.1} us; vendored decode delta {delta_us:.1} us; 36 layers conv + scan {:.2} ms per token",
-        both_us * LAYERS as f64 / 1e3
-    );
-    let _ = o_out.bytes();
     Ok(())
 }
