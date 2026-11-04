@@ -78,6 +78,9 @@ mod tests;
 #[cfg(test)]
 #[path = "cuda_executor_tf_gate_tests.rs"]
 mod tf_gate_tests;
+#[cfg(test)]
+#[path = "cuda_executor_token_forcing_tests.rs"]
+mod token_forcing_tests;
 
 pub(super) struct FlintExecutor {
     // Declared first so the host-plane snapshot store drops BEFORE the

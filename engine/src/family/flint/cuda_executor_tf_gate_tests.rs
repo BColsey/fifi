@@ -373,7 +373,7 @@ fn snapshot_bytes() -> &'static [u8] {
     bytes
 }
 
-fn corpus_ids(tokenizer: &crate::tokenizer::Tokenizer) -> Vec<u32> {
+pub(super) fn corpus_ids(tokenizer: &crate::tokenizer::Tokenizer) -> Vec<u32> {
     let text = std::str::from_utf8(snapshot_bytes()).expect("snapshot is valid UTF-8");
     tokenizer.encode(text).expect("corpus tokenisation")
 }
