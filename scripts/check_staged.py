@@ -64,8 +64,9 @@ HOST_DETAIL_PATTERNS = [
         r"\bfifi" + _SEP + r"(?:scr" + "ch|ledger|knowledge|wrk" + r"tr)\b", re.IGNORECASE
     ),
 ]
-# Vendored sources keep their pinned bytes, so the rule skips them.
-HOST_DETAIL_SKIPPED = re.compile(r"(?:^|/)vendor/")
+# Vendored sources and the pinned publisher copy keep their exact upstream
+# bytes, so the rule skips them.
+HOST_DETAIL_SKIPPED = re.compile(r"(?:^|/)(?:vendor/|qualification/publisher/)")
 
 
 class CheckError(Exception):

@@ -217,11 +217,14 @@ class StagedGateTests(unittest.TestCase):
     def test_staged_host_details_in_vendored_files_and_removed_lines_pass(self) -> None:
         owner = "da" + "n"
         self.write("engine/vendor/lib/note.txt", "/home/" + owner + "/x" + chr(10))
+        # The publisher package pins the live hook bytes verbatim, so a host
+        # name embedded in those bytes must not block committing the copy.
+        self.write("qualification/publisher/pinned.txt", "kub" + owner + "-msg" + chr(10))
         self.write("old.md", "/home/" + owner + "/x" + chr(10))
         self.git("add", "old.md")
         self.git("-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "seed")
         self.write("old.md", "clean" + chr(10))
-        self.stage("engine/vendor/lib/note.txt", "old.md")
+        self.stage("engine/vendor/lib/note.txt", "qualification/publisher/pinned.txt", "old.md")
 
         result = self.run_pre_commit()
 
