@@ -253,20 +253,43 @@ pub(crate) struct Calibration {
 /// first depart, their histories still agree, so the scorer judges both tokens in one context,
 /// and the gap between their log-probabilities is a margin that reduction order alone produced.
 ///
-/// When no request departs, the legal executions agreed bitwise and the largest legal margin
-/// measured is zero. Delta then takes the first grid step, its smallest value, which is the
-/// strictest threshold: more mismatches count as events, and the baseline brings no mismatches
-/// and no events to either rule.
+/// The contract:
 ///
-/// The reference runs the scorer's own numeric path, so it must match the scorer at every
-/// token. A reference mismatch means that generation and scoring did not run one deterministic
-/// path, and then no margin measures reduction order alone. A request whose two executions
-/// agree token for token but differ in length is refused too: where one stopped and the other
-/// went on is a departure that the records cannot measure.
+/// - Inputs: the scored reference and baseline, from one scorer, over the same prompts, both
+///   executions of the scorer's build (`check_builds`). The reference must match its scorer at
+///   every token, and the scorer must give one row for one context.
+/// - Delta is the largest first-departure margin over the requests, rounded up to a multiple
+///   of `DELTA_GRID`, and never below one step: `max(1, ceil(margin / 1/8)) / 8` nats.
+/// - No departure in any request: the largest margin measured is 0 and delta is 1/8, its
+///   smallest and strictest value. More mismatches count as events, and the baseline brings no
+///   mismatches and no events to either rule. A calibration with departures can only set a
+///   delta at least as large, so the floor never loosens the gate.
+/// - Refused: a reference mismatch (generation and scoring did not run one deterministic path,
+///   so no margin measures reduction order alone), two scorer rows for one context, and a
+///   request whose executions agree token for token but differ in length (where one stopped and
+///   the other went on is a departure that the records cannot measure).
+/// - Inconclusive, decided by the verdict: delta above `GateConfig::max_delta`.
+///
+/// What a calibration measures. Delta reads the scorer's log-probabilities at departure
+/// positions; it is a statement about tokens, not logits. No departure shows that the two
+/// executions chose the same token at every position; it does not show that their logits
+/// agree, nor how far apart they are. Delta then claims nothing about the logits and only takes
+/// its floor. Logit-level agreement is the subject of the executor's own bitwise tests; for
+/// Flint, `context_2048_same_pack_bitwise_golden` asserts that a chunk-1 and a chunk-8 prefill
+/// leave the same KV and give the same decode logits, by hash.
+///
+/// The first version refused a calibration without departures (d53774b8e). Flint's legal
+/// executions agree bitwise, so that rule made every Flint run unqualifiable; the floor
+/// replaced it (039ac221c). On such an executor the gate holds a candidate to the scorer's own
+/// path: against a baseline without mismatches, the rate rule rejects from 98 mismatches in
+/// 16,384 tokens (0.60%), and the event rule from five unexplained events above 0.25 nats at
+/// equal exposure. A lossless change that flips more near ties than that needs a baseline whose
+/// legal variation shows them, not a larger delta.
 pub(crate) fn calibrate(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<Calibration> {
     validate(reference)?;
     validate(baseline)?;
     check_pair(reference, baseline)?;
+    check_builds(reference, baseline)?;
     let reference_mismatches = reference
         .requests
         .iter()
@@ -834,6 +857,52 @@ fn check_pair(first: &ScoredSystem, second: &ScoredSystem) -> Result<()> {
         return Err(gate_error(format!(
             "{} and {} did not run the same prompts",
             first.system.label, second.system.label
+        )));
+    }
+    Ok(())
+}
+
+/// The profile entry that names how an execution generated; the reference's profile differs
+/// from its scorer's in this entry only.
+pub(crate) const GENERATION_PATH: &str = "generation_path";
+/// The profile entry that names the build, as the SHA-256 of the executable, when the harness
+/// records it.
+pub(crate) const EXECUTABLE_SHA256: &str = "executable_sha256";
+
+/// The reference and the baseline are legal executions of the scorer's own build: the same
+/// family and the same executable. The reference also runs the scorer's numeric path, so its
+/// profile equals the scorer's except for the generation path. Files that claim otherwise are
+/// refused even when their numbers agree, so a verdict never rests on files from two builds.
+/// The candidate may come from another build: an A/B between builds is what it is for.
+fn check_builds(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<()> {
+    let scorer = &reference.scorer;
+    let build = |identity: &ExecutionIdentity| {
+        (
+            identity.family.clone(),
+            identity.profile.get(EXECUTABLE_SHA256).cloned(),
+        )
+    };
+    for system in [&reference.system, &baseline.system] {
+        if build(system) != build(scorer) {
+            return Err(gate_error(format!(
+                "{} ran build {:?} but the scorer is build {:?}: the reference and the baseline \
+                 must be executions of the scorer's build",
+                system.label,
+                build(system),
+                build(scorer)
+            )));
+        }
+    }
+    let numeric_path = |identity: &ExecutionIdentity| {
+        let mut profile = identity.profile.clone();
+        profile.remove(GENERATION_PATH);
+        profile
+    };
+    if numeric_path(&reference.system) != numeric_path(scorer) {
+        return Err(gate_error(format!(
+            "the reference's profile {:?} differs from the scorer's {:?} in more than the \
+             generation path: the reference must run the scorer's numeric path",
+            reference.system.profile, scorer.profile
         )));
     }
     Ok(())

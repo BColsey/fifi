@@ -3,8 +3,9 @@
 
 use super::fixture::{Bug, LAG, RING, Toy, VOCAB, generate, prompt};
 use super::gate::{
-    Audit, AuditPlan, EventStatus, ExecutionIdentity, GateConfig, Generation, MarginClass, Report,
-    Reread, ScoredRequest, ScoredSystem, Verdict, audit_system, calibrate, evaluate, score_system,
+    Audit, AuditPlan, EXECUTABLE_SHA256, EventStatus, ExecutionIdentity, GateConfig, Generation,
+    MarginClass, Report, Reread, ScoredRequest, ScoredSystem, Verdict, audit_system, calibrate,
+    evaluate, score_system,
 };
 use super::run::{
     Candidate, Comparison, Identities, Outputs, Run, RunSettings, input_digests, read_scored,
@@ -18,13 +19,14 @@ const REQUESTS: u64 = 4;
 const TOKENS: usize = 4096;
 const AUDIT_CAP: usize = 200;
 
+/// One toy build: every execution differs from the others in its generation path only.
 fn identity(label: &str) -> ExecutionIdentity {
     ExecutionIdentity {
         label: label.to_owned(),
         family: "toy".to_owned(),
         weights: "toy-weights-1".to_owned(),
         weight_format: "toy-f32".to_owned(),
-        profile: BTreeMap::from([("execution".to_owned(), label.to_owned())]),
+        profile: BTreeMap::from([("generation_path".to_owned(), label.to_owned())]),
     }
 }
 
@@ -1116,4 +1118,39 @@ fn explained_events_stay_out_of_the_event_rule() {
     assert_eq!(unexplained.event_rule.candidate_unexplained, 6);
     assert!(unexplained.event_rule.reject && !unexplained.rate_rule.reject);
     assert!(matches!(unexplained.verdict, Verdict::Reject { .. }));
+}
+
+#[test]
+fn the_reference_and_the_baseline_must_run_the_scorers_build() {
+    let (reference, baseline, candidate) = synthetic();
+    let judge = |reference: &ScoredSystem, baseline: &ScoredSystem, candidate: &ScoredSystem| {
+        evaluate(ANY_COVERAGE, reference, baseline, candidate).map_err(|e| format!("{e:?}"))
+    };
+    let set = |system: &mut ScoredSystem, key: &str, value: &str| {
+        system
+            .system
+            .profile
+            .insert(key.to_owned(), value.to_owned());
+    };
+    // Another executable or family for the reference or the baseline is refused.
+    let mut other_build = baseline.clone();
+    set(&mut other_build, EXECUTABLE_SHA256, &"0".repeat(64));
+    let error = judge(&reference, &other_build, &candidate).unwrap_err();
+    assert!(error.contains("scorer's build"), "{error}");
+    let mut other_family = reference.clone();
+    other_family.system.family = "another-toy".to_owned();
+    let error = judge(&other_family, &baseline, &candidate).unwrap_err();
+    assert!(error.contains("scorer's build"), "{error}");
+    // The reference runs the scorer's numeric path; the baseline differs from it by design.
+    let mut other_path = reference.clone();
+    set(&mut other_path, "kv_profile", "q8");
+    let error = judge(&other_path, &baseline, &candidate).unwrap_err();
+    assert!(error.contains("numeric path"), "{error}");
+    let mut other_chunk = baseline.clone();
+    set(&mut other_chunk, "prefill_chunk_size", "4");
+    assert!(judge(&reference, &other_chunk, &candidate).is_ok());
+    // A candidate from another build is what an A/B between builds judges.
+    let mut other_candidate = candidate;
+    set(&mut other_candidate, EXECUTABLE_SHA256, &"0".repeat(64));
+    assert!(judge(&reference, &baseline, &other_candidate).is_ok());
 }

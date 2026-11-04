@@ -20,10 +20,12 @@
 //!
 //! The near-tie threshold `delta` is the largest log-probability gap between the reference's
 //! and the baseline's tokens at their first departure, rounded up to a multiple of 1/8 nat
-//! (`gate::calibrate`). When they never depart, the legal margin measured is zero and delta
-//! takes 1/8, the strictest value. The reference must match its scorer at every token. The
-//! baseline is the comparison of both rules, because a lossless candidate's mismatches are near
-//! ties of the same kind. A candidate is rejected when
+//! (`gate::calibrate`, which states the contract). When they never depart, the legal margin
+//! measured is zero and delta takes 1/8, the strictest value; token identity says nothing about
+//! the executions' logits, and delta then claims nothing about them. The reference and the
+//! baseline must be executions of the scorer's build, and the reference must match its scorer
+//! at every token. The baseline is the comparison of both rules, because a lossless
+//! candidate's mismatches are near ties of the same kind. A candidate is rejected when
 //!
 //! - its mismatch rate exceeds the baseline's by more than 0.5 points at one-sided 95%
 //!   confidence (Newcombe's score interval for a difference of rates), or
