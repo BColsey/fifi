@@ -1252,7 +1252,8 @@ pub(super) struct ChunkRun<'r, 'w> {
 }
 
 /// The sparse-attention handle of one chunk run: the session's `SparseExec` plus the
-/// per-layer sketch planes (one per supported full-attention layer, in layer order).
+/// per-layer sketch planes, indexed by the FULL-ATTENTION ordinal
+/// (`LayerSlot::ordinal` counts per kind; the n-th Full layer owns plane n).
 /// A run without sparse resources carries `None` and every layer runs dense.
 pub(super) struct ChunkSparse<'r> {
     exec: &'r SparseExec,
@@ -1261,10 +1262,9 @@ pub(super) struct ChunkSparse<'r> {
 
 impl<'r> ChunkSparse<'r> {
     pub(super) fn new(exec: &'r SparseExec, kinds: &[AttentionKind]) -> Self {
+        let full = kinds.iter().filter(|k| **k == AttentionKind::Full).count();
         Self {
-            planes: (0..kinds.len())
-                .map(|ord| super::sparse_exec::full_layer(kinds, ord))
-                .collect(),
+            planes: (0..full).map(|ord| exec.plane_of(ord)).collect(),
             exec,
         }
     }

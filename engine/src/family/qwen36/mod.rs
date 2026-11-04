@@ -39,7 +39,6 @@ pub(crate) mod settings;
 mod sparse_reference;
 #[cfg(test)]
 mod sparse_reference_tests;
-mod sparse_select;
 #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
 mod start;
 pub mod tiered;
