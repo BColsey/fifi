@@ -110,6 +110,15 @@ pub(super) fn emit(phase: &str, case: &str, unit: &str, samples: &[f64], extra: 
     );
 }
 
+/// Prints the wall-clock time in milliseconds, so that a GPU clock log taken beside the run can be
+/// matched to the cases that follow.
+pub(super) fn clock_mark(case: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    println!("RESBENCH {{\"phase\":\"clock_mark\",\"case\":\"{case}\",\"epoch_ms\":{ms}}}");
+}
+
 /// `MemAvailable` in GiB as a JSON number, `null` when `/proc/meminfo` cannot be read.
 fn mem_available_gib() -> String {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();

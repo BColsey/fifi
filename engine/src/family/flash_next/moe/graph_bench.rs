@@ -47,8 +47,15 @@
 //!   (`FIFI_FLASH_NEXT_MISS_TRACES`, `name=path,...`; one line per token, one count per layer), and
 //!   the same tokens with every expert resident. Per-token samples are printed for the report.
 //!
-//! `FIFI_GRAPH_BENCH_PHASES` (comma list of check, block, miss, trace; all by default) limits the
-//! phases; the build phase always runs. Run only inside an exclusive GPU window.
+//! - graph_variants (only when named in `FIFI_GRAPH_BENCH_PHASES`): the block under each existing
+//!   EXL3 kernel variant (the default, and the wide kernels with 1, 2, 4 and 8 column tiles per
+//!   block, chosen with `CudaContext::set_single_row_default`). Each variant's eager and graph
+//!   outputs must equal the default's bit for bit on 4 rows; then graph isolated, graph gated,
+//!   eager isolated and 48 graph launches back to back, the variants taking turns in every trial.
+//!   `FIFI_EXL3_SINGLE_GATHER` must be unset: an explicit value overrides every variant.
+//!
+//! `FIFI_GRAPH_BENCH_PHASES` (comma list of check, block, variants, miss, trace; all but variants
+//! by default) limits the phases; the build phase always runs. Run only inside an exclusive GPU window.
 //!
 //! What the numbers leave out: the classify kernel and the mailbox of a real miss path, the
 //! resident bank's eviction and the slot table; the other layers' attention and recurrent work
@@ -61,8 +68,8 @@ use std::{ops::Range, time::Instant};
 use super::{
     exl3_cuda_tests::{Router, input, upload},
     residency_bench::{
-        Block, EXPERT_BYTES, Res, device_us, emit, fail, open_layer, read_store, resolve_block, us,
-        whole,
+        Block, EXPERT_BYTES, Res, clock_mark, device_us, emit, fail, open_layer, read_store,
+        resolve_block, us, whole,
     },
 };
 use crate::{
@@ -82,6 +89,7 @@ use crate::{
         PinnedBuf, TimingEvent,
         prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
         resident::{
+            exl3::SingleRow,
             moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
         },
@@ -158,13 +166,13 @@ enum Piece {
 
 // ------------------------------------------------------------------ the split block
 
-/// The weights of the block as the split pieces read them.
-struct Parts<'w> {
+/// The weights of the block as the split pieces (and the projection benchmark) read them.
+pub(super) struct Parts<'w> {
     router: &'w DeviceBuffer,
     router_shared: &'w DeviceBuffer,
-    gate: &'w Exl3Bank,
-    up: &'w Exl3Bank,
-    down: &'w Exl3Bank,
+    pub(super) gate: &'w Exl3Bank,
+    pub(super) up: &'w Exl3Bank,
+    pub(super) down: &'w Exl3Bank,
     shared_gate: &'w Exl3Weight,
     shared_up: &'w Exl3Weight,
     shared_down: &'w Exl3Weight,
@@ -172,7 +180,7 @@ struct Parts<'w> {
 
 impl<'w> Parts<'w> {
     /// The tensors of `layer`, with the shape checks of `Exl3MoeWeights::resolve_by`.
-    fn resolve(weights: &'w CudaWeights, layer: usize, moe: &MoeDims) -> Res<Self> {
+    pub(super) fn resolve(weights: &'w CudaWeights, layer: usize, moe: &MoeDims) -> Res<Self> {
         let keys = super::exl3_cuda_tests::keys(layer);
         let get = |role: Role| -> Res<&'w CudaWeight> {
             let key = keys
@@ -968,11 +976,16 @@ struct BlockRep {
 }
 
 fn block_rep(rig: &mut Rig<'_>, exec: Exec, gated: bool) -> Res<BlockRep> {
+    rep_with(rig, gated, &|r| r.full(exec))
+}
+
+/// One rep of whatever `queue` queues on the compute stream, timed as `block_rep` times a block.
+fn rep_with(rig: &mut Rig<'_>, gated: bool, queue: &dyn Fn(&Rig<'_>) -> Res<()>) -> Res<BlockRep> {
     let start = Instant::now();
     let opened_from = if gated { Some(rig.gate()?) } else { None };
     rig.compute.record_timing(&rig.marks[START])?;
-    let queue = Instant::now();
-    rig.full(exec)?;
+    let queue_start = Instant::now();
+    queue(rig)?;
     let queued = Instant::now();
     rig.compute.record_timing(&rig.marks[END])?;
     rig.settle()?;
@@ -986,7 +999,7 @@ fn block_rep(rig: &mut Rig<'_>, exec: Exec, gated: bool) -> Res<BlockRep> {
     };
     Ok(BlockRep {
         device: rig.mark_us(START, END)?,
-        queue: queued.duration_since(queue).as_secs_f64() * 1e6,
+        queue: queued.duration_since(queue_start).as_secs_f64() * 1e6,
         wall,
         late,
     })
@@ -1096,6 +1109,126 @@ fn token_cases(rig: &mut Rig<'_>) -> Res<()> {
             &wall,
             "",
         );
+    }
+    Ok(())
+}
+
+/// The kernel variants of the variants phase: the default (no setting: the gather kernel for the
+/// shared expert and one column tile per block for the id-indexed projections) and the existing
+/// wide kernels with 1, 2, 4 and 8 column tiles per block.
+const VARIANTS: [(&str, SingleRow); 5] = [
+    ("default", SingleRow::Legacy),
+    ("wide1", SingleRow::Wide(1)),
+    ("wide2", SingleRow::Wide(2)),
+    ("wide4", SingleRow::Wide(4)),
+    ("wide8", SingleRow::Wide(8)),
+];
+const VARIANT_ROWS: usize = 4;
+const VARIANT_TRIALS: usize = 5;
+const VARIANT_REPS: usize = 40;
+const VARIANT_TOKENS: usize = 6;
+
+/// Captures the block under every variant and checks that the eager and graph outputs of each
+/// equal the default's eager outputs bit for bit on `VARIANT_ROWS` rows (NaN-poisoned runs).
+fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
+    let n_expert = rig.composed.dims.n_expert;
+    rig.ctx.set_single_row_default(SingleRow::Legacy);
+    let mut want = Vec::with_capacity(VARIANT_ROWS);
+    for seed in 0..VARIANT_ROWS {
+        rig.set_row(seed)?;
+        want.push(rig.run_once(|r| r.full(Exec::Eager))?);
+    }
+    let (mut graphs, mut agree) = (Vec::with_capacity(VARIANTS.len()), Agreement::default());
+    for (name, kernel) in VARIANTS {
+        rig.ctx.set_single_row_default(kernel);
+        // The variant's kernels load on their first eager launch; a capture refuses a first launch.
+        rig.full(Exec::Eager)?;
+        rig.settle()?;
+        let graph = capture(rig, queue_block)?.0;
+        for (seed, want) in want.iter().enumerate() {
+            rig.set_row(seed)?;
+            let eager = rig.run_once(|r| r.full(Exec::Eager))?;
+            let replay = rig.run_once(|r| graph.launch(&r.compute))?;
+            for got in [eager, replay] {
+                sound(&got, n_expert)?;
+                agree.add(want, &got);
+            }
+            if agree.exact != agree.compared {
+                return Err(fail(format!(
+                    "variant {name}: row {seed} differs from the default (worst relative L2 {:e})",
+                    agree.worst
+                )));
+            }
+        }
+        graphs.push(graph);
+    }
+    rig.set_row(0)?;
+    println!(
+        "RESBENCH {{\"phase\":\"graph_variants\",\"case\":\"equivalence\",\"rows\":{VARIANT_ROWS},\
+         \"variants\":{},\"against_default\":{}}}",
+        VARIANTS.len(),
+        agree.json()
+    );
+    Ok(graphs)
+}
+
+/// One token of whatever `queue` queues, device time from the first to the last mark.
+fn token_with(rig: &mut Rig<'_>, queue: &dyn Fn(&Rig<'_>) -> Res<()>) -> Res<f64> {
+    rig.compute.record_timing(&rig.marks[START])?;
+    queue(rig)?;
+    rig.compute.record_timing(&rig.marks[END])?;
+    rig.settle()?;
+    rig.mark_us(START, END)
+}
+
+/// Every variant's block: graph isolated and gated, eager isolated (under the variant's setting)
+/// and 48 graph launches back to back. The variants take turns inside every trial, and the first
+/// trial is a warm-up, so slow clock drift spreads over all of them.
+fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
+    let graphs = variant_graphs(rig)?;
+    let names = [
+        "graph_isolated",
+        "graph_gated",
+        "eager_isolated",
+        "graph_token48",
+    ];
+    let mut samples: Vec<[Vec<f64>; 4]> = VARIANTS.iter().map(|_| Default::default()).collect();
+    for trial in 0..=VARIANT_TRIALS {
+        clock_mark(&format!("variants_trial{trial}"));
+        for ((_, kernel), (graph, into)) in VARIANTS.iter().zip(graphs.iter().zip(&mut samples)) {
+            let replay = |r: &Rig<'_>| graph.launch(&r.compute);
+            let mut got: [Vec<f64>; 4] = Default::default();
+            for _ in 0..VARIANT_REPS {
+                got[0].push(rep_with(rig, false, &replay)?.device);
+                got[1].push(rep_with(rig, true, &replay)?.device);
+            }
+            rig.ctx.set_single_row_default(*kernel);
+            for _ in 0..VARIANT_REPS {
+                got[2].push(block_rep(rig, Exec::Eager, false)?.device);
+            }
+            for _ in 0..VARIANT_TOKENS {
+                got[3].push(token_with(rig, &|r| {
+                    (0..LAYERS).try_for_each(|_| replay(r))
+                })?);
+            }
+            if trial > 0 {
+                for (all, new) in into.iter_mut().zip(got) {
+                    all.extend(new);
+                }
+            }
+        }
+    }
+    rig.ctx.set_single_row_default(SingleRow::Legacy);
+    for ((name, _), got) in VARIANTS.iter().zip(&samples) {
+        for (what, values) in names.iter().zip(got) {
+            emit(
+                "graph_variants",
+                &format!("{name}_{what}"),
+                "us",
+                values,
+                "",
+            );
+        }
     }
     Ok(())
 }
@@ -1310,6 +1443,9 @@ fn run() -> Res<()> {
     drop(host);
     if want("block") {
         block_phase(&mut rig)?;
+    }
+    if want("variants") {
+        variants_phase(&mut rig)?;
     }
     if want("miss") {
         miss_phase(&mut rig)?;
