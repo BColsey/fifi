@@ -1,11 +1,11 @@
 mod config;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod exl3_pack;
 #[allow(
     dead_code,
     reason = "the executors use the history call, the decoder and sampler fields, and the constructors; until they do, only the worker and tests use the seam"
 )]
 pub(crate) mod executor;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod exl3_pack;
 #[allow(
     dead_code,
     reason = "an executor wires the Flash-Next step; until it does, only tests and the Mac parity tests call it"
