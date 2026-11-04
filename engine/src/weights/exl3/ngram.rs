@@ -111,43 +111,17 @@ impl NgramTable {
             byte_len,
             prefix_and_header.len() as u64,
         )?;
+        // ShardHeader keeps the tensor entries only, so the metadata is read from the JSON again.
         let metadata = read_metadata(prefix_and_header)?;
         let bits = parse_metadata(&metadata)?;
         let words = 1 + ROW_DIM * bits as usize / 16;
         let rows = metadata_number(&metadata, "rows")?;
         let shard_rows = metadata_number(&metadata, "shard_rows")?;
-        if shard_rows == 0 || rows == 0 || rows % shard_rows != 0 {
-            return Err(invalid(&format!(
-                "{rows} rows do not divide into shards of {shard_rows}"
-            )));
-        }
-        let shard_count = usize::try_from(rows / shard_rows)
-            .map_err(|_| invalid("the shard count does not fit the platform word size"))?;
-        let data_start = header.data_start();
-        let mut shards = Vec::with_capacity(shard_count);
-        for index in 0..shard_count {
-            let name = format!("{key}.shard_{index}.trellis");
-            let entry = expect_entry(&header, &name, Dtype::I16, &[shard_rows, words as u64])?;
-            shards.push(absolute(data_start, entry));
-        }
-        let heads = layout.heads as u64;
-        let shapes: [&[u64]; 4] = [
-            &[heads, ROW_DIM as u64],
-            &[heads],
-            &[heads],
-            &[layout.ngram as u64],
-        ];
-        let dtypes = [Dtype::F16, Dtype::I64, Dtype::I64, Dtype::I64];
-        let mut aux = [0..0, 0..0, 0..0, 0..0];
-        for (slot, ((which, dtype), shape)) in aux
-            .iter_mut()
-            .zip(NgramAux::ALL.iter().zip(dtypes).zip(shapes))
-        {
-            let name = format!("{key}.{}", which.suffix());
-            *slot = absolute(data_start, expect_entry(&header, &name, dtype, shape)?);
-        }
-        let expected_tensors = shard_count + NgramAux::ALL.len();
         let found = header.iter().count();
+        let shard_count = shard_count(rows, shard_rows, found)?;
+        let shards = shard_ranges(&header, key, (shard_rows, words as u64), shard_count)?;
+        let aux = aux_ranges(&header, key, layout)?;
+        let expected_tensors = shard_count + NgramAux::ALL.len();
         if found != expected_tensors {
             return Err(invalid(&format!(
                 "the file holds {found} tensors; the table needs exactly {expected_tensors}"
@@ -193,11 +167,8 @@ impl NgramTable {
 
     /// Absolute file byte range of one auxiliary tensor.
     pub(crate) fn aux_range(&self, which: NgramAux) -> Range<u64> {
-        let index = NgramAux::ALL
-            .iter()
-            .position(|&candidate| candidate == which)
-            .expect("NgramAux::ALL lists every variant");
-        self.aux[index].clone()
+        // NgramAux::ALL lists the variants in declaration order, so the discriminant indexes it.
+        self.aux[which as usize].clone()
     }
 }
 
@@ -209,6 +180,8 @@ pub(crate) struct NgramDecoder {
     rows: u64,
     /// First global row of each head.
     head_offsets: Vec<u64>,
+    /// One past the last global row of each head; rows between heads belong to none.
+    head_ends: Vec<u64>,
     /// `[heads, ROW_DIM]` row-major.
     head_bias: Vec<f32>,
 }
@@ -230,6 +203,7 @@ impl NgramDecoder {
             return Err(invalid("hash head tensors disagree with the head count"));
         }
         let mut offsets = Vec::with_capacity(heads);
+        let mut ends = Vec::with_capacity(heads);
         let mut next = 0u64;
         let misplaced =
             || invalid("hash head row ranges must be nonempty, ordered, and inside the table");
@@ -244,6 +218,7 @@ impl NgramDecoder {
                 return Err(misplaced());
             }
             offsets.push(offset);
+            ends.push(end);
             next = end;
         }
         let head_bias: Vec<f32> = head_bias
@@ -258,14 +233,17 @@ impl NgramDecoder {
             words: table.words,
             rows: table.rows,
             head_offsets: offsets,
+            head_ends: ends,
             head_bias,
         })
     }
 
-    /// The hash head whose row range holds `row`: the last head that starts at or before it.
+    /// The hash head whose row range holds `row`: the last head that starts at or before it, if
+    /// the row is before that head's end. A row past every head (the table's padding rows) or in
+    /// a gap between heads is refused.
     pub(crate) fn head_of(&self, row: u64) -> Result<usize, EngError> {
         let after = self.head_offsets.partition_point(|&offset| offset <= row);
-        if row >= self.rows || after == 0 {
+        if row >= self.rows || after == 0 || row >= self.head_ends[after - 1] {
             return Err(EngError::BadRequest(format!(
                 "n-gram row {row} belongs to no hash head"
             )));
@@ -349,11 +327,14 @@ fn metadata_text<'a>(metadata: &'a Map<String, Value>, name: &str) -> Result<&'a
         .ok_or_else(|| invalid(&format!("metadata field {name} is missing")))
 }
 
+/// A canonical decimal: digits only, no leading zero but for "0" itself, within u64.
 fn metadata_number(metadata: &Map<String, Value>, name: &str) -> Result<u64, EngError> {
     let text = metadata_text(metadata, name)?;
+    let canonical =
+        text.bytes().all(|byte| byte.is_ascii_digit()) && (text == "0" || !text.starts_with('0'));
     text.parse()
         .ok()
-        .filter(|_| text.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|_| canonical)
         .ok_or_else(|| invalid(&format!("metadata field {name} is not a decimal integer")))
 }
 
@@ -380,6 +361,69 @@ fn parse_metadata(metadata: &Map<String, Value>) -> Result<u32, EngError> {
         return Err(invalid(&format!("unsupported K {bits}")));
     }
     Ok(bits as u32)
+}
+
+/// The shard count of `rows` rows in shards of `shard_rows`, refused unless it divides exactly and
+/// fits in the `tensors` the header lists: the header is untrusted, and the count sizes a vector.
+fn shard_count(rows: u64, shard_rows: u64, tensors: usize) -> Result<usize, EngError> {
+    if shard_rows == 0 || rows == 0 || !rows.is_multiple_of(shard_rows) {
+        return Err(invalid(&format!(
+            "{rows} rows do not divide into shards of {shard_rows}"
+        )));
+    }
+    let count = rows / shard_rows;
+    if count > tensors as u64 {
+        return Err(invalid(&format!(
+            "{rows} rows in shards of {shard_rows} need {count} shard tensors; the header lists \
+             {tensors} tensors"
+        )));
+    }
+    // At most `tensors`, so it fits usize.
+    Ok(count as usize)
+}
+
+/// The byte ranges of the `count` shard tensors, `[shard_rows, words]` I16 each, in row order.
+fn shard_ranges(
+    header: &ShardHeader,
+    key: &str,
+    (shard_rows, words): (u64, u64),
+    count: usize,
+) -> Result<Vec<Range<u64>>, EngError> {
+    (0..count)
+        .map(|index| {
+            let name = format!("{key}.shard_{index}.trellis");
+            let entry = expect_entry(header, &name, Dtype::I16, &[shard_rows, words])?;
+            Ok(absolute(header.data_start(), entry))
+        })
+        .collect()
+}
+
+/// The byte ranges of the auxiliary tensors, in `NgramAux::ALL` order.
+fn aux_ranges(
+    header: &ShardHeader,
+    key: &str,
+    layout: NgramLayout,
+) -> Result<[Range<u64>; 4], EngError> {
+    let heads = layout.heads as u64;
+    let shapes: [&[u64]; 4] = [
+        &[heads, ROW_DIM as u64],
+        &[heads],
+        &[heads],
+        &[layout.ngram as u64],
+    ];
+    let dtypes = [Dtype::F16, Dtype::I64, Dtype::I64, Dtype::I64];
+    let mut aux = [0..0, 0..0, 0..0, 0..0];
+    for (slot, ((which, dtype), shape)) in aux
+        .iter_mut()
+        .zip(NgramAux::ALL.iter().zip(dtypes).zip(shapes))
+    {
+        let name = format!("{key}.{}", which.suffix());
+        *slot = absolute(
+            header.data_start(),
+            expect_entry(header, &name, dtype, shape)?,
+        );
+    }
+    Ok(aux)
 }
 
 fn expect_entry<'a>(

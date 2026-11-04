@@ -394,7 +394,12 @@ fn the_metadata_must_name_this_exact_format() {
         ("K", "9", "unsupported K"),
         ("K", "0", "unsupported K"),
         ("K", "+5", "not a decimal integer"),
+        ("K", "", "not a decimal integer"),
+        ("K", "05", "not a decimal integer"),
+        ("rows", "18446744073709551616", "not a decimal integer"),
         ("rows", "9", "do not divide"),
+        // A header whose counts would size a huge shard list is refused before the list exists.
+        ("rows", "4000000000000", "need 1000000000000 shard tensors"),
     ] {
         let mut synthetic = Synthetic::new(5, 4, 2);
         synthetic
@@ -403,6 +408,14 @@ fn the_metadata_must_name_this_exact_format() {
         let message = checkpoint_message(synthetic.table());
         assert!(message.contains(expected), "{field}={value}: {message}");
     }
+    let mut huge = Synthetic::new(5, 1, 2);
+    huge.metadata
+        .insert("rows".into(), Value::String(u64::MAX.to_string()));
+    let message = checkpoint_message(huge.table());
+    assert!(
+        message.contains("shard tensors"),
+        "rows u64::MAX: {message}"
+    );
     let mut synthetic = Synthetic::new(5, 4, 2);
     synthetic.metadata.remove("shard_rows");
     assert!(checkpoint_message(synthetic.table()).contains("shard_rows is missing"));
@@ -496,5 +509,17 @@ fn bad_rows_are_refused_before_any_value_is_written() {
     not_finite[..2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
     let error = decoder.decode_row(2, &not_finite, &mut out).unwrap_err();
     assert!(matches!(error, EngError::Checkpoint(m) if m.contains("not finite")));
+    assert!(out.iter().all(|&value| value == 7.0));
+    // Heads over rows 0..2 and 3..5 of 8: row 2 lies between them and rows 5..8 past both, as
+    // the real table's padding rows past its last head.
+    let gaps = NgramDecoder::new(&table, &[0, 3], &[2, 2], &vec![0u16; 2 * ROW_DIM]).unwrap();
+    for row in [2u64, 5, 7] {
+        let error = gaps.decode_row(row, &packed, &mut out).unwrap_err();
+        assert!(
+            matches!(&error, EngError::BadRequest(m) if m.contains("no hash head")),
+            "row {row}: {error:?}"
+        );
+    }
+    assert_eq!(gaps.head_of(4).unwrap(), 1);
     assert!(out.iter().all(|&value| value == 7.0));
 }
