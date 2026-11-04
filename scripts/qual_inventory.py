@@ -180,7 +180,8 @@ def load_json_strict(path: Path) -> dict:
 
 
 SURFACE_KEYS = {"id", "category", "hardware", "description", "cwd", "argv", "env",
-                "expect", "fixtures_required", "targets_included", "baseline_note"}
+                "expect", "fixtures_required", "targets_included", "baseline_note",
+                "timeout_sec"}
 
 
 def validate_policy(policy: dict, facts: dict) -> list[str]:
@@ -235,6 +236,10 @@ def validate_policy(policy: dict, facts: dict) -> list[str]:
                 expect["require_all_allowed_failures"], bool
             ):
                 problems.append(f"{where}: expect.require_all_allowed_failures must be a bool")
+            if "timeout_sec" in surface and (
+                not isinstance(surface["timeout_sec"], int) or surface["timeout_sec"] <= 0
+            ):
+                problems.append(f"{where}: timeout_sec must be a positive int")
         for key in ("fixtures_required", "targets_included"):
             value = surface.get(key, [])
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
@@ -436,11 +441,14 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
         -> tuple[str, list[str], dict | None, dict[str, int]]:
     """Judge one surface run: verdict, reasons, libtest summary, fixture skips.
 
-    The execution floor applies to ``effective_ran``: tests that skipped for a
-    missing fixture return early and pass, so their skip lines (visible only with
-    ``--nocapture``; libtest captures the output of passing tests) are subtracted
-    from the count. A skipped test prints at least one line, so subtracting the
-    line count can only understate the tests that truly exercised their body.
+    The execution floor applies to ``executed_effective`` — ``passed + failed``
+    minus fixture-skip lines. Ignored and filtered-out tests never executed, so
+    they cannot raise it; tests that skipped for a missing fixture returned early
+    and passed, so their skip lines (visible only with ``--nocapture``; libtest
+    captures the output of passing tests) are subtracted. A skipped test prints
+    at least one line, so subtracting the line count can only understate the
+    tests that truly exercised their body. Skip lines cannot be attributed to a
+    specific test binary, so the discount is global for the surface.
     """
     verdict = "PASS"
     reasons: list[str] = []
@@ -475,13 +483,25 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
     skip_lines = sum(skips.values())
     if summary is not None:
         summary = dict(summary)
-        summary["effective_ran"] = summary["totals"]["ran"] - skip_lines
+        totals = summary["totals"]
+        accounting = {
+            "discovered": totals["passed"] + totals["failed"] + totals["ignored"]
+                         + totals["filtered_out"],
+            "ignored": totals["ignored"],
+            "filtered_out": totals["filtered_out"],
+            "fixture_skipped": skip_lines,
+            "executed_effective": totals["passed"] + totals["failed"] - skip_lines,
+        }
+        summary["accounting"] = accounting
         min_ran = expect.get("min_ran")
-        if min_ran is not None and summary["effective_ran"] < min_ran:
+        if min_ran is not None and accounting["executed_effective"] < min_ran:
             verdict = "FAIL"
             reasons.append(
-                f"effective ran {summary['effective_ran']} "
-                f"(ran {summary['totals']['ran']} minus {skip_lines} fixture-skip lines) "
+                f"executed {accounting['executed_effective']} "
+                f"(passed {totals['passed']} + failed {totals['failed']} "
+                f"minus {skip_lines} fixture-skip lines; ignored "
+                f"{totals['ignored']} and filtered {totals['filtered_out']} "
+                "excluded) "
                 f"< min_ran {min_ran}"
             )
         known = bool(expect.get("allowed_failures")) and bool(summary["failures"])
@@ -510,7 +530,38 @@ def collect_surface(surface: dict, out_dir: Path) -> dict:
     env.setdefault("CARGO_TERM_COLOR", "never")
     argv = surface["argv"]
     started = datetime.datetime.now(datetime.timezone.utc)
-    proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, check=False)
+    timeout_sec = surface.get("timeout_sec")
+    try:
+        proc = subprocess.run(
+            argv, cwd=cwd, env=env, capture_output=True, text=True, check=False,
+            timeout=timeout_sec,
+        )
+        stdout, stderr, returncode = proc.stdout, proc.stderr, proc.returncode
+    except subprocess.TimeoutExpired as expired:
+        # The child is dead; an interrupted run must judge as a failure, with
+        # whatever output existed written out for inspection.
+        stdout = expired.stdout or ""
+        stderr = expired.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        returncode = -9
+        verdict, reasons, summary, skips = "FAIL", [f"timed out after {timeout_sec}s"], None, {}
+        stem = re.sub(rf"[^{UPPER}a-z0-9_.-]", "_", surface["id"])
+        (out_dir / f"{stem}.stdout").write_text(stdout, encoding="utf-8")
+        (out_dir / f"{stem}.stderr").write_text(stderr, encoding="utf-8")
+        record = {
+            "id": surface["id"], "category": surface["category"],
+            "hardware": surface["hardware"], "argv": argv, "cwd": surface["cwd"],
+            "env": surface.get("env", {}), "exit_code": returncode,
+            "started": started.isoformat(),
+            "ended": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "summary": None, "fixtures_skipped": {},
+            "expect": surface.get("expect", {}), "verdict": verdict,
+            "reasons": reasons,
+        }
+        return record
     ended = datetime.datetime.now(datetime.timezone.utc)
     stem = re.sub(rf"[^{UPPER}a-z0-9_.-]", "_", surface["id"])
     (out_dir / f"{stem}.stdout").write_text(proc.stdout, encoding="utf-8")
@@ -599,9 +650,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
         summary = record["summary"]
         if summary:
             totals = summary["totals"]
+            accounting = summary.get("accounting", {})
             print(
                 f"{record['id']}: {record['verdict']} "
-                f"(ran {totals['ran']}, passed {totals['passed']}, failed {totals['failed']}, "
+                f"(executed {accounting.get('executed_effective')} of "
+                f"{totals['ran']} ran, failed {totals['failed']}, "
                 f"ignored {totals['ignored']}, fixture-skips "
                 f"{sum(record['fixtures_skipped'].values())})"
             )

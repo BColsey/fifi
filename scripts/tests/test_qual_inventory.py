@@ -231,6 +231,12 @@ class PolicyValidationTest(unittest.TestCase):
                 self.policy(expect={"allowed_failures": ["no-separator"]}), self.facts()
             )
 
+    def test_timeout_sec_must_be_positive(self) -> None:
+        with self.assertRaises(qi.InventoryError):
+            qi.validate_policy(self.policy(timeout_sec=0), self.facts())
+        ids = qi.validate_policy(self.policy(timeout_sec=600), self.facts())
+        self.assertEqual(ids, ["host-portable"])
+
 
 class AllowedFailureVerdictTest(unittest.TestCase):
     """Verdict logic of judge_surface over synthetic libtest output."""
@@ -267,7 +273,7 @@ class AllowedFailureVerdictTest(unittest.TestCase):
         verdict, _ = self.judge({"min_ran": 1}, "", "", 101)
         self.assertEqual(verdict, "FAIL")
 
-    def test_fixture_skip_lines_deflate_effective_ran(self) -> None:
+    def test_fixture_skip_lines_deflate_executed_effective(self) -> None:
         stderr = self.STDERR + (
             "Q36_CUDA_MODEL_DIR is not set and has no entry in "
             "~/.config/fifi/test-paths.json: SKIPPING\n"
@@ -276,9 +282,53 @@ class AllowedFailureVerdictTest(unittest.TestCase):
             self.GOOD, stderr, 0, {"min_ran": 1}, []
         )
         assert summary is not None
-        self.assertEqual(summary["effective_ran"], 0)
+        self.assertEqual(summary["accounting"]["executed_effective"], 0)
         self.assertEqual(verdict, "FAIL")
-        self.assertTrue(any("effective ran 0" in r for r in reasons))
+        self.assertTrue(any("executed 0" in r for r in reasons))
+
+    def test_ignored_tests_never_count_toward_the_floor(self) -> None:
+        # The review case: 2988 passed, 1 failed, 36 ignored, 1 skip line.
+        # executed_effective must be 2988, not 3024: ignored tests did not run.
+        ignored = [f"test i{n} ... ignored" for n in range(36)]
+        lines = ["running 3025 tests"]
+        lines += ["test p ... ok"] * 2988
+        lines += ignored
+        lines += ["test baseline ... FAILED"]
+        lines += ["test result: FAILED. 2988 passed; 1 failed; 36 ignored; "
+                  "0 measured; 0 filtered out; finished in 1.0s"]
+        stderr = self.STDERR + (
+            "skipping: missing parity fixture /x/y (set FIFI_TEST_REQUIRE_DATA=1 "
+            "to fail instead)\n"
+        )
+        verdict, _reasons, summary, _skips = qi.judge_surface(
+            "\n".join(lines) + "\n", stderr, 101,
+            {"min_ran": 3000, "max_failed": 1,
+             "allowed_failures": ["lib::baseline"]}, [],
+        )
+        assert summary is not None
+        acc = summary["accounting"]
+        self.assertEqual(acc["executed_effective"], 2988)
+        self.assertEqual(acc["discovered"], 3025)
+        self.assertEqual(acc["ignored"], 36)
+        self.assertEqual(acc["fixture_skipped"], 1)
+        self.assertEqual(verdict, "FAIL")  # 2988 < 3000: the floor must bite
+
+    def test_floor_met_with_ignored_excluded(self) -> None:
+        ignored_block = "test i0 ... ignored, device only\n"
+        block = (
+            "running 3 tests\n"
+            "test a ... ok\n"
+            "test b ... ok\n"
+            + ignored_block +
+            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        verdict, _reasons, summary, _skips = qi.judge_surface(
+            block, self.STDERR, 0, {"min_ran": 2}, []
+        )
+        assert summary is not None
+        self.assertEqual(summary["accounting"]["executed_effective"], 2)
+        self.assertEqual(verdict, "PASS")
 
     def test_allowed_failure_reports_known_failure_verdict(self) -> None:
         expect = {"max_failed": 1, "allowed_failures": ["lib::b"]}
