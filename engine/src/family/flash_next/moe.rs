@@ -379,3 +379,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod cuda_tests;

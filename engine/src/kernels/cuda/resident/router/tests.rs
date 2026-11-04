@@ -462,6 +462,10 @@ fn router_matches_the_host_references() {
         shape(2048, 256, 32, 2),
         shape(128, 8, 8, 3),
         shape(2052, 100, 2, 5),
+        // Flash-Next: 512 experts, top 10, decode and a tiled prefill chunk.
+        shape(2560, 512, 10, 1),
+        shape(2560, 512, 10, 4),
+        shape(2560, 512, 10, 16),
     ];
     let both = [
         shape(2304, 64, 8, 3),
@@ -470,6 +474,10 @@ fn router_matches_the_host_references() {
         shape(2052, 7, 7, 3),
         shape(256, 31, 4, 2),
         shape(2048, 255, 8, 2),
+        // The first count of 16 experts per lane, a partial last slot, and top 32 of 511.
+        shape(2048, 257, 10, 3),
+        shape(256, 300, 10, 2),
+        shape(2560, 511, 32, 2),
     ];
     let mut cases: Vec<(RouterShape, bool)> = gated_only.iter().map(|s| (*s, true)).collect();
     for s in both {
@@ -586,6 +594,53 @@ fn router_breaks_ties_to_the_lower_index() {
     let rig = exact_rig(&ctx, &stream, &under, 8, false);
     expect_rank(&rig, &[100, 0, 1, 2, 3, 4, 5, 6], "underflow");
     assert_eq!(rig.read_weights()[0], 1.0, "underflow: weight of the first");
+}
+
+/// 512 experts (16 per lane): ties across lanes and across the two halves of a lane's slots go
+/// to the lower index, experts in the upper half are found, and a non-finite logit in the upper
+/// half or in the partial slot of 257 experts faults the row.
+#[test]
+fn router_ranks_and_flags_512_experts() {
+    if !testkit::device_present("router_ranks_and_flags_512_experts") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut tied = [0.0f32; 512];
+    for e in [511, 300, 40, 260, 3] {
+        tied[e] = 5.0;
+    }
+    expect_rank(
+        &exact_rig(&ctx, &stream, &tied, 10, true),
+        &[3, 40, 260, 300, 511, 0, 1, 2, 4, 5],
+        "512: tie across lanes and halves",
+    );
+    let mut upper = [0.0f32; 512];
+    for (rank, e) in [480usize, 256, 511, 287].into_iter().enumerate() {
+        upper[e] = 9.0 - rank as f32;
+    }
+    let rig = exact_rig(&ctx, &stream, &upper, 10, false);
+    expect_rank(
+        &rig,
+        &[480, 256, 511, 287, 0, 1, 2, 3, 4, 5],
+        "512: upper half",
+    );
+    let sum: f32 = rig.read_weights().iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "512: weights sum {sum}");
+    for (n_expert, at) in [(512usize, 300usize), (512, 511), (257, 256)] {
+        let mut values = vec![0.0f32; n_expert];
+        values[at] = f32::NAN;
+        let rig = exact_rig(&ctx, &stream, &values, 10, true);
+        rig.call().expect("router call");
+        assert_faulty_row(&rig, 0, &format!("{n_expert} experts: NaN at {at}"));
+    }
+    let mut partial = vec![0.0f32; 257];
+    partial[256] = 2.0;
+    expect_rank(
+        &exact_rig(&ctx, &stream, &partial, 10, false),
+        &[256, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+        "257: the expert of the partial slot",
+    );
 }
 
 // ---------------------------------------------------------------- T3
@@ -1049,9 +1104,9 @@ fn refuse_limits(rig: &Rig<'_>) {
             },
         ),
         (
-            "n_expert 257",
+            "n_expert 513",
             RouterShape {
-                n_expert: 257,
+                n_expert: 513,
                 ..base
             },
         ),

@@ -46,7 +46,7 @@ fn split_router_logits_c_abi_rejects_geometry_sizes_alignment_wrap_and_alias() {
         match case {
             0 => a.m = 0,
             1 => a.hidden = 5,
-            2 => a.n_expert = 257,
+            2 => a.n_expert = 513,
             3 => a.x_bytes = 15,
             4 => a.w_bytes = 127,
             5 => a.logits_bytes = 31,
