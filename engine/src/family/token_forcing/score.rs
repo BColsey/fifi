@@ -239,13 +239,18 @@ impl<M> LogitBiasFault<M> {
         }
     }
 
-    fn corrupt(&self, mut row: Vec<f32>) -> Vec<f32> {
-        if self.position >= self.from {
+    /// `row` as the fault reads it at output position `position`.
+    pub(crate) fn bias_at(&self, position: usize, mut row: Vec<f32>) -> Vec<f32> {
+        if position >= self.from {
             for logit in row.iter_mut().step_by(self.stride) {
                 *logit += self.bias;
             }
         }
         row
+    }
+
+    fn corrupt(&self, row: Vec<f32>) -> Vec<f32> {
+        self.bias_at(self.position, row)
     }
 }
 

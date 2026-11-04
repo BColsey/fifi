@@ -1,0 +1,42 @@
+[
+  {
+    "name": "scheme-interpreter",
+    "user": "Write a complete interpreter for a small Scheme dialect in Python. It needs a tokenizer, a reader that builds nested lists, environments with lexical scope, closures, define, lambda, if, cond, let, quote, set!, begin, proper tail calls, and a REPL. After the code, write unit tests for every special form and for tail calls at a depth of 100000, then walk through, step by step, how your evaluator runs (define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) on (fact 5). Give every file in full; do not abbreviate or elide any code."
+  },
+  {
+    "name": "red-black-map",
+    "user": "Implement an ordered map in Rust as a red-black tree with insert, remove, get, get_mut, first, last, range iteration in both directions, and a function that checks every red-black invariant. Before the code of each rebalancing case, explain the case and why the fix keeps the invariants. Then write tests that apply thousands of random inserts and removes, compare against std::collections::BTreeMap after each step, and call the invariant checker. Give the complete source; do not leave anything out."
+  },
+  {
+    "name": "segregated-allocator",
+    "user": "Write a general-purpose memory allocator in C that provides malloc, free, calloc and realloc on top of mmap. Use segregated free lists by size class, boundary tags, immediate coalescing of neighbours, splitting of large blocks, and a separate path for very large allocations. Explain the block layout and every invariant first. Then give the full implementation, a statistics function, and a stress test that checks every allocation for overlap and corruption. Write all the code; do not summarise any part."
+  },
+  {
+    "name": "raft-core",
+    "user": "Implement the core of the Raft consensus algorithm in Go: leader election with randomised timeouts, log replication with the consistency check, commit index advancement, application of committed entries, and persistence of term, vote and log through an interface. Explain each rule from the paper as you implement it. Then build an in-memory simulated network that can drop, delay and reorder messages and partition nodes, and write tests for election safety, log matching and leader completeness under failures. Give the complete code."
+  },
+  {
+    "name": "sql-engine",
+    "user": "Write a small SQL engine in TypeScript. It needs a lexer, a recursive-descent parser for SELECT with WHERE, inner and left JOIN, GROUP BY with COUNT, SUM, AVG, MIN and MAX, HAVING, ORDER BY and LIMIT, a logical planner, and an executor over in-memory tables. Explain the plan for each clause before its code. Then write tests that cover every clause, NULL handling and error messages for malformed queries. Give all the code in full."
+  },
+  {
+    "name": "regex-engine",
+    "user": "Implement a regular-expression engine in C++ by Thompson NFA construction with a lazily built DFA cache. Support concatenation, alternation, star, plus, question mark, character classes with ranges and negation, anchors, and counted repetition. Explain the construction and the simulation in detail, give the complete implementation, analyse its time and space complexity, and write tests that compare it against std::regex on several hundred patterns and inputs, including pathological ones."
+  },
+  {
+    "name": "rate-limiter-design",
+    "user": "Write a detailed design document for a multi-tenant rate-limiting service. Cover requirements, the API, the token bucket, sliding-window log, sliding-window counter and GCRA algorithms with a full implementation of each in Java, the storage layout in Redis with Lua scripts, clock skew, hot keys, failure modes and fail-open versus fail-closed policy, capacity planning with worked numbers, a test plan and a staged rollout. Be thorough and complete in every section."
+  },
+  {
+    "name": "expression-compiler",
+    "user": "Write a compiler in Rust from a small language with integers, booleans, let bindings, if expressions, while loops, functions and recursion to x86-64 assembly in AT&T syntax for Linux. It needs a lexer, a parser with precedence climbing, a type checker, a lowering to a stack-based intermediate form, and code generation that follows the System V calling convention. Explain each stage, give the complete source, and include example programs with the assembly your compiler produces for them."
+  },
+  {
+    "name": "rope-editor",
+    "user": "Implement a text buffer for an editor in Rust as a rope of balanced chunks. Support insert and delete at character offsets, conversion between character offsets and line and column positions, iteration over lines, undo and redo with grouping of consecutive edits, and correct handling of multi-byte UTF-8. Explain the tree balancing and the bookkeeping of line counts, give the complete code, and write randomised tests that compare every operation against a plain String."
+  },
+  {
+    "name": "probability-derivation",
+    "user": "A fair die is rolled repeatedly until the running total first reaches or exceeds 100. Derive, with full working, the probability distribution of the final total, the expected number of rolls, and the expected overshoot. Set up the recurrences exactly, solve them, and explain the limiting behaviour as the target grows. Then write a Python program that computes the exact answers with fractions and checks them by simulation, and discuss any differences."
+  }
+]

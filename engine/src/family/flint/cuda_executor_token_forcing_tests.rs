@@ -19,9 +19,20 @@
 //!
 //! Every execution is opened with one EOS id that the head is not expected to choose (the last
 //! tokenizer id), so each request runs to `TF_TOKENS` tokens: the gate tests numerics over long
-//! outputs, and an early EOS would only shorten that evidence. The prompts are cut from the
-//! committed corpus snapshot of the teacher-forced gate (`tf_gate_tests`), so no download is
-//! needed. Audits run with the scorer only: a second executor does not fit beside it on a 24 GB
+//! outputs, and an early EOS would only shorten that evidence.
+//!
+//! The prompts are the committed tasks of `testdata/token-forcing-tasks.json`, each one user
+//! turn through the pack's chat template, asking for a long coding or derivation answer.
+//! Raw-text continuations of the teacher-forced gate's corpus were tried first and cannot
+//! qualify anything: by 2,048 tokens every output had become a repetition loop (2 to 35
+//! distinct ids, median top-two gap 8.6 nats), the injected fault changed no token, and the
+//! self-test passed a faulty candidate. `TF_PROBE=1` measures that risk before a
+//! qualification: it generates the reference output of each selected task and counts, from
+//! the fault's start on, the distinct ids, the positions whose top two logits lie closer than
+//! the fault's bias, and the positions where the bias changes the argmax on that output's own
+//! history.
+//!
+//! Audits run with the scorer only: a second executor does not fit beside it on a 24 GB
 //! card, so the baseline-model audit is absent from device reports. Each audit is one prefill of
 //! the whole context up to its event, so the `fault` self-test is not audited: its events
 //! count as unexplained, and auditing hundreds of them would take hours. A low `TF_AUDIT_CAP`
@@ -33,8 +44,8 @@
 //! | `FLINT_QUAL_TOKENIZER` | the tokenizer directory | the pack root |
 //! | `TF_OUT_DIR` | a new directory for the scored files and the report | required |
 //! | `TF_KV` | the KV profile of every execution: `f16`, `q8` or `q8k` | `f16` |
-//! | `TF_PROMPTS` | requests | 4 |
-//! | `TF_PROMPT_TOKENS` | prompt length in tokens | 1024 |
+//! | `TF_TASKS` | task names, comma-separated, in request order | every task |
+//! | `TF_PROBE` | `1`: probe the selected tasks, write `probe.json`, and stop | unset |
 //! | `TF_TOKENS` | generated tokens per request | 4096 |
 //! | `TF_REFERENCE_CHUNK` | prefill rows of the reference and the scorer, 1 to 8 | 8 |
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
@@ -74,9 +85,9 @@ use crate::family::token_forcing::{
         Candidate, Comparison, Identities, Outputs, RunSettings, input_digests, read_scored,
         write_new_json,
     },
-    score::{ForcedModel, LogitBiasFault, greedy_generate},
+    score::{ForcedModel, LogitBiasFault, TokenRecord, greedy_generate},
 };
-use crate::tokenizer::{IncrementalDecoder, TokenizerBundle};
+use crate::tokenizer::{IncrementalDecoder, PromptMessage, Role, Thinking, TokenizerBundle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -116,8 +127,8 @@ struct Plan {
     tokenizer: PathBuf,
     out: PathBuf,
     kv: String,
-    prompts: usize,
-    prompt_tokens: usize,
+    tasks: Vec<String>,
+    probe: bool,
     tokens: usize,
     reference_chunk: u32,
     baseline_chunk: u32,
@@ -144,6 +155,14 @@ impl Plan {
             assert!((1..=8).contains(&rows), "{name} must be 1 to 8, not {rows}");
             rows as u32
         };
+        let list = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(|item| item.trim().to_owned())
+                .filter(|item| !item.is_empty())
+                .collect()
+        };
         Self {
             tokenizer: std::env::var_os("FLINT_QUAL_TOKENIZER")
                 .map_or_else(|| root.clone(), Into::into),
@@ -151,8 +170,8 @@ impl Plan {
                 .expect("TF_OUT_DIR must name a new directory")
                 .into(),
             kv: std::env::var("TF_KV").unwrap_or_else(|_| "f16".to_owned()),
-            prompts: number("TF_PROMPTS", 4),
-            prompt_tokens: number("TF_PROMPT_TOKENS", 1024),
+            tasks: list("TF_TASKS"),
+            probe: std::env::var("TF_PROBE").is_ok_and(|value| value == "1"),
             tokens: number("TF_TOKENS", 4096),
             reference_chunk: chunk("TF_REFERENCE_CHUNK", 8),
             baseline_chunk: chunk("TF_BASELINE_CHUNK", 4),
@@ -171,7 +190,7 @@ impl Plan {
     }
 
     fn context_limit(&self) -> u32 {
-        let rows = (self.prompt_tokens + self.tokens + 64).next_multiple_of(1024);
+        let rows = (PROMPT_ROOM + self.tokens + 64).next_multiple_of(1024);
         u32::try_from(rows).expect("the context limit fits u32")
     }
 
@@ -243,26 +262,154 @@ fn executable_sha256() -> String {
     .clone()
 }
 
-/// Requests cut from the committed corpus, `prompt_tokens` each, one generated span apart.
+/// The longest rendered prompt. The context limit leaves this room before the outputs.
+const PROMPT_ROOM: usize = 1024;
+
+/// One committed task: a user message that asks for a long answer.
+#[derive(Deserialize)]
+struct Task {
+    name: String,
+    user: String,
+}
+
+/// The tasks `TF_TASKS` names, in its order, or every task, each rendered by the pack's chat
+/// template as one user turn followed by the opening of the assistant's turn.
 /// The gate refuses a repeated prompt; checking here stops the run before any generation.
 fn prompts(plan: &Plan, bundle: &TokenizerBundle) -> Vec<(String, Vec<u32>)> {
-    let ids = super::tf_gate_tests::corpus_ids(bundle.tokenizer());
-    let stride = plan.prompt_tokens + plan.tokens;
-    let prompts: Vec<(String, Vec<u32>)> = (0..plan.prompts)
-        .map(|index| {
-            let start = index * stride;
-            let prompt = ids
-                .get(start..start + plan.prompt_tokens)
-                .unwrap_or_else(|| panic!("the corpus has no prompt {index} at id {start}"));
-            (format!("corpus-{start}"), prompt.to_vec())
+    let tasks: Vec<Task> = serde_json::from_str(include_str!("testdata/token-forcing-tasks.json"))
+        .expect("the committed task file");
+    let names: Vec<&str> = if plan.tasks.is_empty() {
+        tasks.iter().map(|task| task.name.as_str()).collect()
+    } else {
+        plan.tasks.iter().map(String::as_str).collect()
+    };
+    let prompts: Vec<(String, Vec<u32>)> = names
+        .into_iter()
+        .map(|name| {
+            let task = tasks
+                .iter()
+                .find(|task| task.name == name)
+                .unwrap_or_else(|| panic!("TF_TASKS names {name}, which is not a task"));
+            let message = PromptMessage {
+                role: Role::User,
+                content: Some(task.user.clone()),
+                reasoning_content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            };
+            let ids = bundle
+                .encode_prompt(&[message], &[], Thinking::Default)
+                .expect("the task renders");
+            assert!(
+                ids.len() <= PROMPT_ROOM,
+                "task {name} renders to {} ids, more than {PROMPT_ROOM}",
+                ids.len()
+            );
+            (name.to_owned(), ids)
         })
         .collect();
     let distinct: std::collections::BTreeSet<_> = prompts
         .iter()
         .map(|(_, prompt)| ids_sha256(prompt))
         .collect();
-    assert_eq!(distinct.len(), prompts.len(), "the corpus repeats a prompt");
+    assert_eq!(distinct.len(), prompts.len(), "TF_TASKS repeats a prompt");
     prompts
+}
+
+/// One task's reference output, read for what the fault self-test needs from the fault's
+/// start on: tokens that a +2 bias on every 7th id can change.
+#[derive(Serialize)]
+struct ProbeRow {
+    task: String,
+    prompt_tokens: usize,
+    /// The first output position whose argmax ends generation for the tokenizer. The run does
+    /// not stop there (see the module notes), so later tokens continue past the answer.
+    first_end: Option<usize>,
+    late_tokens: usize,
+    late_distinct: usize,
+    /// Late positions where the top two logits lie closer than the fault's bias.
+    late_close: usize,
+    /// Late positions where the fault's bias changes the argmax on this output's own history.
+    fault_flips: usize,
+}
+
+/// Generates one reference output on the eager path, as `greedy_generate` does, and reads
+/// every row of it for the probe.
+fn probe(
+    model: &mut dyn ForcedModel,
+    (name, prompt): &(String, Vec<u32>),
+    tokens: usize,
+    bundle: &TokenizerBundle,
+) -> ProbeRow {
+    let vocab = bundle.vocab_size() as usize;
+    let fault = LogitBiasFault::specpilot(());
+    let mut out = ProbeRow {
+        task: name.clone(),
+        prompt_tokens: prompt.len(),
+        first_end: None,
+        late_tokens: 0,
+        late_distinct: 0,
+        late_close: 0,
+        fault_flips: 0,
+    };
+    let mut late = std::collections::BTreeSet::new();
+    model.reset().expect("probe reset");
+    let mut row = model.prefill_logits(prompt).expect("probe prefill");
+    for position in 0..tokens {
+        let record = TokenRecord::from_logits(position, &row, 0, vocab).expect("a probe row");
+        let token = record.argmax;
+        if out.first_end.is_none() && bundle.eos_token_ids().contains(&token) {
+            out.first_end = Some(position);
+        }
+        if position >= fault.from {
+            late.insert(token);
+            out.late_tokens += 1;
+            out.late_close += usize::from(record.top2_gap < f64::from(fault.bias));
+            let biased = fault.bias_at(position, row.clone());
+            let flipped = TokenRecord::from_logits(position, &biased, token, vocab)
+                .expect("a biased probe row")
+                .argmax
+                != token;
+            out.fault_flips += usize::from(flipped);
+        }
+        if position + 1 < tokens {
+            row = model.step_logits(token).expect("probe step");
+        }
+    }
+    out.late_distinct = late.len();
+    out
+}
+
+/// Probes every selected task on the reference executor and writes `probe.json`.
+fn run_probe(plan: &Plan, bundle: &TokenizerBundle, prompts: &[(String, Vec<u32>)]) {
+    std::fs::create_dir(&plan.out).expect("TF_OUT_DIR must not exist yet");
+    let (mut engine, mut session) = plan.open(plan.reference_chunk, bundle);
+    let mut model = Forced {
+        engine: &mut engine,
+        session: &mut session,
+    };
+    let rows: Vec<ProbeRow> = prompts
+        .iter()
+        .map(|prompt| {
+            let row = probe(&mut model, prompt, plan.tokens, bundle);
+            println!(
+                "TOKEN_FORCING probe task={} prompt_tokens={} first_end={:?} late_tokens={} \
+                 late_distinct={} late_close={} fault_flips={}",
+                row.task,
+                row.prompt_tokens,
+                row.first_end,
+                row.late_tokens,
+                row.late_distinct,
+                row.late_close,
+                row.fault_flips
+            );
+            row
+        })
+        .collect();
+    let path = plan.out.join("probe.json");
+    write_new_json(&path, &rows).expect("the probe file");
+    println!("TOKEN_FORCING probe={}", path.display());
 }
 
 fn generate_with(
@@ -544,6 +691,10 @@ fn token_forcing_qualification() {
     let bundle = factory::load_tokenizer(&plan.tokenizer).expect("the qualification tokenizer");
     let vocab = bundle.vocab_size() as usize;
     let prompts = prompts(&plan, &bundle);
+    if plan.probe {
+        run_probe(&plan, &bundle, &prompts);
+        return;
+    }
     if let Some(path) = &plan.write_generations {
         let (mut engine, mut session) = plan.open(plan.reference_chunk, &bundle);
         let generations = serve((&mut engine, &mut session), &bundle, &prompts, plan.tokens);
