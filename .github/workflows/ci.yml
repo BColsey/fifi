@@ -49,5 +49,10 @@ jobs:
         run: cargo fmt --check
       - name: Clippy (CPU-only default features)
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Tests (CPU-only default features)
-        run: cargo test --locked
+      - name: Qualification inventory
+        run: python3 ../scripts/qual_inventory.py validate
+      - name: Tests (CPU-only default features, evidence and minimum-ran floor)
+        run: |
+          python3 ../scripts/qual_inventory.py collect \
+            --surface host-portable --out "$RUNNER_TEMP/qual-host-portable"
+          cat "$RUNNER_TEMP/qual-host-portable/evidence.json"
