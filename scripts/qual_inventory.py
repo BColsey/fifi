@@ -83,6 +83,10 @@ CRASH_RE = re.compile(r"process didn't exit successfully")
 SKIPPING_RE = re.compile(
     rf"^([{UPPER}][{UPPER}0-9_]+) is not set and has no entry in [^:]*: SKIPPING$"
 )
+# Some integration suites print their own skip notice for missing fixtures.
+SKIPPING_ALT_RE = re.compile(
+    r"^skipping: missing .* fixture .+ \(set FIFI_TEST_REQUIRE_DATA=1 to fail instead\)$"
+)
 
 
 class InventoryError(Exception):
@@ -368,12 +372,15 @@ def summarize_run(stdout: str, stderr: str) -> dict:
 
 
 def collect_skips(stderr: str) -> dict[str, int]:
-    """Count fixture-registry SKIPPING lines by fixture name."""
+    """Count fixture-skip lines by fixture name (the alt pattern counts as "")."""
     skips: dict[str, int] = {}
     for line in stderr.splitlines():
-        match = SKIPPING_RE.match(line.strip())
+        stripped = line.strip()
+        match = SKIPPING_RE.match(stripped)
         if match:
             skips[match.group(1)] = skips.get(match.group(1), 0) + 1
+        elif SKIPPING_ALT_RE.match(stripped):
+            skips[""] = skips.get("", 0) + 1
     return skips
 
 
@@ -427,7 +434,14 @@ def git_output(repo: Path, args: list[str]) -> str:
 def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
                   strict_fixtures: list[str]) \
         -> tuple[str, list[str], dict | None, dict[str, int]]:
-    """Judge one surface run: verdict, reasons, libtest summary, fixture skips."""
+    """Judge one surface run: verdict, reasons, libtest summary, fixture skips.
+
+    The execution floor applies to ``effective_ran``: tests that skipped for a
+    missing fixture return early and pass, so their skip lines (visible only with
+    ``--nocapture``; libtest captures the output of passing tests) are subtracted
+    from the count. A skipped test prints at least one line, so subtracting the
+    line count can only understate the tests that truly exercised their body.
+    """
     verdict = "PASS"
     reasons: list[str] = []
 
@@ -439,10 +453,6 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
         reasons.append(str(error))
     if summary is not None:
         totals = summary["totals"]
-        min_ran = expect.get("min_ran")
-        if min_ran is not None and totals["ran"] < min_ran:
-            verdict = "FAIL"
-            reasons.append(f"ran {totals['ran']} < min_ran {min_ran}")
         max_failed = expect.get("max_failed", 0)
         if totals["failed"] > max_failed:
             verdict = "FAIL"
@@ -462,6 +472,21 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
             verdict = "FAIL"
             reasons.append(f"ignored {totals['ignored']} > max_ignored {max_ignored}")
     skips = collect_skips(stderr)
+    skip_lines = sum(skips.values())
+    if summary is not None:
+        summary = dict(summary)
+        summary["effective_ran"] = summary["totals"]["ran"] - skip_lines
+        min_ran = expect.get("min_ran")
+        if min_ran is not None and summary["effective_ran"] < min_ran:
+            verdict = "FAIL"
+            reasons.append(
+                f"effective ran {summary['effective_ran']} "
+                f"(ran {summary['totals']['ran']} minus {skip_lines} fixture-skip lines) "
+                f"< min_ran {min_ran}"
+            )
+        known = bool(expect.get("allowed_failures")) and bool(summary["failures"])
+        if verdict == "PASS" and known:
+            verdict = "PASS_WITH_KNOWN_FAILURE"
     for name in strict_fixtures:
         if name in skips:
             verdict = "FAIL"
@@ -561,8 +586,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
             continue
         record = collect_surface(surface, out_dir)
         evidence["surfaces"].append(record)
-        if record["verdict"] != "PASS":
+        if record["verdict"] == "FAIL":
             evidence["verdict"] = "FAIL"
+        elif record["verdict"] == "PASS_WITH_KNOWN_FAILURE" \
+                and evidence["verdict"] == "PASS":
+            evidence["verdict"] = "PASS_WITH_KNOWN_FAILURE"
 
     evidence_path = out_dir / "evidence.json"
     evidence_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
@@ -580,7 +608,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         else:
             print(f"{record['id']}: {record['verdict']} ({'; '.join(record['reasons'])})")
     print(f"evidence: {evidence_path}")
-    return 0 if evidence["verdict"] == "PASS" else 1
+    return 0 if evidence["verdict"] in ("PASS", "PASS_WITH_KNOWN_FAILURE") else 1
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -121,6 +121,43 @@ class SummarizeRunTest(unittest.TestCase):
         summary = parse_run("", "")
         self.assertEqual(summary["totals"]["ran"], 0)
 
+    def test_phantom_running_line_from_test_output_fails_pairing(self) -> None:
+        # Under --nocapture a test could print a line shaped like a block header;
+        # the parser is start-anchored, so mid-line text is plain noise, but a
+        # line-start phantom opens a block whose summary never arrives.
+        noise_midline = "noise: running 1 tests\n" + OK_BLOCK
+        stderr = "     Running unittests src/lib.rs (x)\n"
+        summary = parse_run(noise_midline, stderr)
+        self.assertEqual(summary["totals"]["passed"], 2)
+        phantom_at_line_start = OK_BLOCK + "running 1 tests\n"
+        with self.assertRaises(qi.InventoryError):
+            parse_run(phantom_at_line_start, stderr)
+
+    def test_inflated_test_line_count_fails_against_summary(self) -> None:
+        # A stray line matching a test result inside an open block inflates the
+        # counted lines past the summary's own arithmetic.
+        poisoned = OK_BLOCK.replace(
+            "test result:", "test ghost ... ok\ntest result:"
+        )
+        stderr = "     Running unittests src/lib.rs (x)\n"
+        with self.assertRaises(qi.InventoryError):
+            parse_run(poisoned, stderr)
+
+    def test_duplicate_summary_line_is_noise_not_a_second_block(self) -> None:
+        duplicated = OK_BLOCK + OK_BLOCK.splitlines()[-1] + "\n"
+        stderr = "     Running unittests src/lib.rs (x)\n"
+        summary = parse_run(duplicated, stderr)
+        self.assertEqual(summary["totals"]["passed"], 2)
+
+    def test_malformed_summary_is_noise_and_block_stays_open(self) -> None:
+        malformed = (
+            "running 1 tests\n"
+            "test one ... ok\n"
+            "test result: ok. nonsense passed; 0 failed\n"
+        )
+        with self.assertRaises(qi.InventoryError):
+            qi.parse_stdout_blocks(malformed)
+
 
 class SkipsTest(unittest.TestCase):
     def test_skipping_lines_collected_by_name(self) -> None:
@@ -131,6 +168,11 @@ class SkipsTest(unittest.TestCase):
 
     def test_plain_lines_are_not_skips(self) -> None:
         self.assertEqual(qi.collect_skips("error: something else: SKIPPING\n"), {})
+
+    def test_integration_suite_skip_notice_counts(self) -> None:
+        line = ("skipping: missing parity fixture /a/b (set FIFI_TEST_REQUIRE_DATA=1 "
+                "to fail instead)\n")
+        self.assertEqual(qi.collect_skips(line), {"": 1})
 
 
 class PolicyValidationTest(unittest.TestCase):
@@ -213,7 +255,8 @@ class AllowedFailureVerdictTest(unittest.TestCase):
 
     def test_allowed_failure_passes_with_raised_max_failed(self) -> None:
         expect = {"max_failed": 1, "allowed_failures": ["lib::b"]}
-        self.assertEqual(self.judge(expect, self.BAD, self.STDERR, 101), ("PASS", []))
+        self.assertEqual(self.judge(expect, self.BAD, self.STDERR, 101),
+                         ("PASS_WITH_KNOWN_FAILURE", []))
 
     def test_allowed_failure_that_stops_failing_fails(self) -> None:
         expect = {"max_failed": 1, "allowed_failures": ["lib::b"]}
@@ -223,6 +266,31 @@ class AllowedFailureVerdictTest(unittest.TestCase):
     def test_min_ran_floor_fails_a_compile_error(self) -> None:
         verdict, _ = self.judge({"min_ran": 1}, "", "", 101)
         self.assertEqual(verdict, "FAIL")
+
+    def test_fixture_skip_lines_deflate_effective_ran(self) -> None:
+        stderr = self.STDERR + (
+            "Q36_CUDA_MODEL_DIR is not set and has no entry in "
+            "~/.config/fifi/test-paths.json: SKIPPING\n"
+        )
+        verdict, reasons, summary, _skips = qi.judge_surface(
+            self.GOOD, stderr, 0, {"min_ran": 1}, []
+        )
+        assert summary is not None
+        self.assertEqual(summary["effective_ran"], 0)
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("effective ran 0" in r for r in reasons))
+
+    def test_allowed_failure_reports_known_failure_verdict(self) -> None:
+        expect = {"max_failed": 1, "allowed_failures": ["lib::b"]}
+        verdict, _ = self.judge(expect, self.BAD, self.STDERR, 101)
+        self.assertEqual(verdict, "PASS_WITH_KNOWN_FAILURE")
+
+    def test_clean_run_stays_plain_pass(self) -> None:
+        expect = {"max_failed": 1, "allowed_failures": ["lib::b"]}
+        # The waiver exists but nothing failed; require-all already failed the
+        # verdict, so this cannot be misread as a clean PASS either.
+        verdict, _ = self.judge(expect, self.GOOD, self.STDERR, 0)
+        self.assertNotEqual(verdict, "PASS")
 
     def test_strict_fixture_skip_fails(self) -> None:
         stderr = self.STDERR + (

@@ -1,6 +1,7 @@
 name: ci
 
-# Portable checks only. GPU, CUDA and Mac qualification run on the hardware hosts, not here.
+# Portable checks only. GPU, CUDA and Mac qualification run on the hardware
+# hosts, not here.
 on:
   push:
     branches: [main]
@@ -42,7 +43,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      # With no arguments, rustup reads the toolchain and components from rust-toolchain.toml.
+      # With no arguments, rustup reads the toolchain and components from
+      # rust-toolchain.toml.
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Format

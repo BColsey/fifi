@@ -29,7 +29,7 @@
       "hardware": "cpu",
       "description": "Full default-feature host suite: lib target plus every integration target, CPU only. Fixture-gated tests skip on hosts without the named locations; the skips are recorded as evidence, and CI enforces a minimum-ran floor so a collection regression cannot pass silently.",
       "cwd": "engine",
-      "argv": ["cargo", "test", "--locked"],
+      "argv": ["cargo", "test", "--locked", "--", "--nocapture"],
       "env": {},
       "expect": {
         "min_ran": 3000,
