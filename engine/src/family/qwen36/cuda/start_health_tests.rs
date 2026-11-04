@@ -110,7 +110,7 @@ impl ExecutorOps for TerminalDecode {
 fn a_terminal_cuda_failure_is_process_scoped_for_the_worker() {
     // Requirement 4, the worker's rule: ANY Backend error ends the engine (NativeFailed),
     // the queued jobs are rejected, the late submit is refused, nothing hangs.
-    let engine = spawn_engine(8, || {
+    let engine = spawn_engine(8, |_| {
         let inner = FakeExecutor::new(vec![vec![0], vec![0], vec![EOS]], &[EOS], 100_000);
         Ok((
             TerminalDecode { inner },
@@ -161,7 +161,7 @@ fn a_load_failure_leaves_the_engine_in_error_with_the_message() {
     // and the queued jobs are rejected with LoadFailed.
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let engine = spawn_engine::<FakeExecutor, _>(16, move || {
+    let engine = spawn_engine::<FakeExecutor, _>(16, move |_| {
         entered_tx.send(()).expect("entered make");
         let _ = release_rx.recv();
         Err(EngError::MemoryPlan(

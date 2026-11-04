@@ -416,7 +416,7 @@ fn the_worker_feeds_m_sess_tokens_per_piece() {
     let seen: SeenCalls = Arc::new(Mutex::new(Vec::new()));
     let seen_in = Arc::clone(&seen);
 
-    let engine = spawn_engine(16, move || {
+    let engine = spawn_engine(16, move |_| {
         // The model is loaded INSIDE the engine thread: no CUDA value crosses a thread.
         let (projector, weights) = load().expect("load on the engine thread");
         let (mut step, free) = build(projector, weights).expect("step");
