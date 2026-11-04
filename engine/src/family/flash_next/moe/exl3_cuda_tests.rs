@@ -80,7 +80,7 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// The stored components of the matrix under `prefix`.
-fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Result<Matrix, EngError> {
+pub(super) fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Result<Matrix, EngError> {
     let names = COMPONENT_SUFFIXES.map(|suffix| format!("{prefix}.{suffix}"));
     let keys = names.each_ref().map(String::as_str);
     let selected = checkpoint.source.read_selected(&keys, 1 << 30)?;
@@ -93,7 +93,7 @@ fn bank_key(layer: usize, part: ExpertPart) -> String {
 }
 
 /// The key of each role the shared block resolves.
-fn keys(layer: usize) -> Vec<(Role, String)> {
+pub(super) fn keys(layer: usize) -> Vec<(Role, String)> {
     let root = Root::Layers;
     let mut keys = vec![
         (Role::FfnGateInp, router_name_in(root, layer)),
@@ -111,13 +111,17 @@ fn keys(layer: usize) -> Vec<(Role, String)> {
 }
 
 /// The host copies of the router matrix and the shared-gate row, widened to F32.
-struct Router {
+pub(super) struct Router {
     matrix: Vec<f32>,
     gate: Vec<f32>,
 }
 
 impl Router {
-    fn read(checkpoint: &Checkpoint, layer: usize, moe: &MoeDims) -> Result<Self, EngError> {
+    pub(super) fn read(
+        checkpoint: &Checkpoint,
+        layer: usize,
+        moe: &MoeDims,
+    ) -> Result<Self, EngError> {
         let root = Root::Layers;
         Ok(Self {
             matrix: host_f32(
@@ -136,7 +140,7 @@ impl Router {
 
 /// Uploads the block of `layer`: the router and the shared gate as F32, each routed projection
 /// as one bank of every expert in id order, and the shared expert's three matrices.
-fn upload(
+pub(super) fn upload(
     projector: &CudaProjector,
     checkpoint: &Checkpoint,
     (layer, router): (usize, &Router),
@@ -172,7 +176,7 @@ fn upload(
 }
 
 /// Input row `seed`: values in about [-1.4, 1.4], a different pattern per seed.
-fn input(hidden: usize, seed: usize) -> Vec<f32> {
+pub(super) fn input(hidden: usize, seed: usize) -> Vec<f32> {
     (0..hidden)
         .map(|i| (((i + 613 * seed) * 7919 % 2003) as f32 - 1001.0) / 700.0)
         .collect()

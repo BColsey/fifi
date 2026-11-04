@@ -384,3 +384,5 @@ mod tests {
 mod cuda_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod exl3_cuda_tests;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod residency_bench;

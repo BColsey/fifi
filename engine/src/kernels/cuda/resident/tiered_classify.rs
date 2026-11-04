@@ -231,4 +231,34 @@ impl CudaContext {
 }
 
 #[cfg(test)]
+impl CudaContext {
+    /// Test only: [`Self::tiered_classify`] with the request line and the row published into
+    /// `mailbox`, the mapped memory a CPU server polls. `call.mbox_req` and `call.mbox_row` are
+    /// checked as usual and then ignored. The tiered step that will publish into a mailbox does
+    /// not exist yet; the residency benchmark times the round trip through this entry.
+    pub(crate) fn tiered_classify_to_mailbox<'b>(
+        &self,
+        stream: &DeviceStream,
+        call: ClassifyCall<'b>,
+        mailbox: &'b crate::kernels::cuda::context::Mailbox,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        mailbox.check_adapter(self)?;
+        if mailbox.hidden() != call.shape.hidden {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA tiered classify takes the hidden width of its mailbox, {}; got {}",
+                mailbox.hidden(),
+                call.shape.hidden
+            )));
+        }
+        let mut raw = self.plan_classify(&call)?;
+        raw.mbox_req = mailbox.request_range()?;
+        raw.mbox_row = mailbox.row_range()?;
+        self.launch_on(stream, |stream_raw| {
+            tiered_classify_launch(stream_raw, &raw)
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests;
