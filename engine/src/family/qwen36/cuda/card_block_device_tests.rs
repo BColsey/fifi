@@ -231,6 +231,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
+        sparse: None,
     };
     let mixers_ref = Mixers::new(ctx0, parts)?;
     let resid_view_ref = arena_ref.tensor(
@@ -379,6 +380,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
+            sparse: None,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -783,6 +785,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
+        sparse: None,
     };
     let mixers_ref = Mixers::new(ctx0, parts)?;
     let read_ref_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -970,6 +973,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
+            sparse: None,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -1482,6 +1486,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
+            sparse: None,
         },
     )?;
     let resid_view_ref = arena_ref.tensor(
@@ -1573,6 +1578,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
+            sparse: None,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }

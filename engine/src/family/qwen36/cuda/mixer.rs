@@ -30,7 +30,8 @@ use super::{
     paging_store::{PageAttention, PageId, PageToken},
     resources::PagedResources,
     shard::ShardTable,
-    state::ResidentState,
+    sparse_exec::SparseExec,
+    state::{ResidentState, StepField},
     state_layout::{Plane, Word},
     step_plan::{Slot, StepPlan},
 };
@@ -55,6 +56,11 @@ use crate::{
             matvec_q::MatvecCall,
             quantize_q8_1::QuantizeCall,
             router::RouterLogitsCall,
+            sparse_decode::SparseDecodeData,
+            sparse_decode::SparseDecodeShape,
+            sparse_score::{SparseScoreData, SparseScoreShape},
+            sparse_sketch::{SparseSketchData, SparseSketchShape},
+            sparse_topk::{SparseTopkData, SparseTopkShape},
         },
     },
 };
@@ -294,6 +300,8 @@ pub(super) struct MixerParts<'a> {
     /// and the KV8 rows/append/q8-decode triple under `Int8G32`.
     pub(super) kv_mode: KvMode,
     pub(super) paged: Option<&'a PagedResources>,
+    /// Present only when armed and admitted: sparse decode resources, else every op runs dense.
+    pub(super) sparse: Option<&'a SparseExec>,
 }
 
 pub(super) struct Mixers<'a> {
@@ -715,7 +723,36 @@ impl<'a> Mixers<'a> {
                         },
                         run.state.step_field(pos)?,
                         run.state.step_field(status)?,
-                    )
+                    )?;
+                    // R1: the sketch is derived state written exactly once, right after the
+                    // one append, keyed by the same pos word; a refused launch sets the step
+                    // status mask and poisons the step, so no partially committed sketch is
+                    // ever consumed. Only full-attention layers carry a plane.
+                    if let Some(sp) = self.parts.sparse
+                        && let Some(plane) = sp.plane_of(run.ordinal)
+                    {
+                        ctx.sparse_sketch(
+                            stream,
+                            SparseSketchShape {
+                                rows: 1,
+                                n_kv_head: sp.n_kv_head(),
+                                head_dim: sp.head_dim(),
+                                rank: sp.rank(),
+                                cells: sp.cells(),
+                            },
+                            SparseSketchData {
+                                k: self.view(k)?,
+                                basis: sp.basis_range()?,
+                                sketch: sp.sketch_plane(plane)?,
+                            },
+                            run.state.step_field(pos)?,
+                            run.state.step_field(status)?,
+                        )?;
+                        // R3: the append op just enqueued this row's sketch cell; the
+                        // attention op of the same step checks sketch_covers against it.
+                        sp.note_appended(run.io.admit_pos);
+                    }
+                    Ok(())
                 }
             }
             BlockOp::AttnDecodeQ8 {
@@ -748,24 +785,128 @@ impl<'a> Mixers<'a> {
                         run.state.step_field(kv_len)?,
                     )
                 } else {
-                    ctx.attn_decode_q8(
-                        stream,
-                        AttnDecodeQ8Call {
-                            shape: attn_q8_shape(g, run.state.layout().kv.capacity),
-                            span: AttnSpan::FULL,
-                            split,
-                            scale: g.attn.scale,
-                            q: self.view(q)?,
-                            proj: Some(self.view(proj)?),
-                            k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
-                            k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
-                            v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
-                            v_scales: run.state.kv_plane(run.ordinal, v_scales)?,
-                            kv_len: run.state.step_field(kv_len)?,
-                            part: self.view(part)?,
-                            out: self.view(out)?,
-                        },
-                    )
+                    // The authoritative dense call, verbatim: the pre-launch bypass and the
+                    // post-refusal fallback share it (R2).
+                    let dense = || {
+                        ctx.attn_decode_q8(
+                            stream,
+                            AttnDecodeQ8Call {
+                                shape: attn_q8_shape(g, run.state.layout().kv.capacity),
+                                span: AttnSpan::FULL,
+                                split,
+                                scale: g.attn.scale,
+                                q: self.view(q)?,
+                                proj: Some(self.view(proj)?),
+                                k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
+                                k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
+                                v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
+                                v_scales: run.state.kv_plane(run.ordinal, v_scales)?,
+                                kv_len: run.state.step_field(kv_len)?,
+                                part: self.view(part)?,
+                                out: self.view(out)?,
+                            },
+                        )
+                    };
+                    // R2: the sparse chain replaces the dense call only when the resources
+                    // exist, the layer is full-attention, and the selection basis is valid for
+                    // the visible window. Otherwise the dense call runs, unmodified. Host-side
+                    // chain errors (status range, launches) do NOT fall back: they propagate
+                    // and poison the step — only the kernel's own refusal bit routes dense.
+                    let visible_keys = run.io.admit_pos.checked_add(1).ok_or_else(|| {
+                        EngError::BadRequest("resident KV position overflows".into())
+                    })?;
+                    // `cells` must equal the session's KV stride: the decode indexes the real
+                    // code/scale planes with it, so any drift reads misaligned rows.
+                    let sparse = match self.parts.sparse {
+                        Some(sp)
+                            if sp.cfg().basis_valid_for(visible_keys)
+                                && sp.sketch_covers(visible_keys)
+                                && sp.cells() == run.state.layout().kv.capacity =>
+                        {
+                            sp.plane_of(run.ordinal).map(|plane| (sp, plane))
+                        }
+                        _ => None,
+                    };
+                    match sparse {
+                        None => dense(),
+                        Some((sp, plane)) => {
+                            sp.note_launch(plane);
+                            let status = sp.status_range()?;
+                            sp.clear_status(stream)?;
+                            ctx.sparse_score(
+                                stream,
+                                SparseScoreShape {
+                                    n_q_head: sp.n_head(),
+                                    n_kv_head: sp.n_kv_head(),
+                                    head_dim: sp.head_dim(),
+                                    rank: sp.rank(),
+                                    cells: sp.cells(),
+                                    sink: sp.sink(),
+                                    recent: sp.recent(),
+                                    scale: g.attn.scale,
+                                },
+                                SparseScoreData {
+                                    q: self.view(q)?,
+                                    basis: sp.basis_range()?,
+                                    sketch: sp.sketch_plane(plane)?,
+                                    scores: sp.scores_range()?,
+                                },
+                                // The sparse kernels' device word is the POS of the token
+                                // being appended (kv_len = *pos + 1, the kv8_append word),
+                                // not the dense decode's kv_len count word.
+                                run.state.step_field(StepField::Pos)?,
+                                status,
+                            )?;
+                            ctx.sparse_topk(
+                                stream,
+                                SparseTopkShape {
+                                    n_kv_head: sp.n_kv_head(),
+                                    cells: sp.cells(),
+                                    top_k: sp.top_k(),
+                                    sink: sp.sink(),
+                                    recent: sp.recent(),
+                                },
+                                SparseTopkData {
+                                    scores: sp.scores_range()?,
+                                    indices: sp.indices_range()?,
+                                    counts: sp.counts_range()?,
+                                },
+                                run.state.step_field(StepField::Pos)?,
+                                status,
+                            )?;
+                            ctx.sparse_decode(
+                                stream,
+                                SparseDecodeShape {
+                                    n_kv_head: sp.n_kv_head(),
+                                    n_head: sp.n_head(),
+                                    head_dim: sp.head_dim(),
+                                    cells: sp.cells(),
+                                    row: sp.row(),
+                                    scale: g.attn.scale,
+                                },
+                                SparseDecodeData {
+                                    q: self.view(q)?,
+                                    k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
+                                    k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
+                                    v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
+                                    v_scales: run.state.kv_plane(run.ordinal, v_scales)?,
+                                    indices: sp.indices_range()?,
+                                    counts: sp.counts_range()?,
+                                    out: self.view(out)?,
+                                    proj: Some(self.view(proj)?),
+                                    status,
+                                },
+                            )?;
+                            // R2, transactional: a refused decode wrote nothing to `out`, and
+                            // this blocking readback orders the whole chain; the dense
+                            // overwrite below is complete before any consumer runs.
+                            if sp.decode_refused(stream)? {
+                                dense()
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    }
                 }
             }
             // The card q8 decode: THIS card's query heads over ITS kv-head

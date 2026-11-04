@@ -620,6 +620,13 @@ fn a_refused_capture_is_observable_and_the_eager_rerun_succeeds() {
         is_capture_refusal(&error),
         "a listed status is a refusal: {error:?}"
     );
+    // B2's arm: a window-policy BadRequest from ensure_closed is the same refusal.
+    assert!(
+        is_capture_refusal(&EngError::BadRequest(
+            "cuda capture: a ranged copy is not allowed inside a capture window".to_owned()
+        )),
+        "an ensure_closed window-policy refusal must degrade to eager, not poison"
+    );
     let other = [
         EngError::BadRequest("boom".to_owned()),
         EngError::Backend {

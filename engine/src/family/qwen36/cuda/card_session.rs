@@ -138,6 +138,9 @@ impl CardSession {
                 layout: native,
                 kv_mode: options.kv_mode,
                 paged: None,
+                // Card sessions run dense: no sparse exec is constructed on this
+                // path, so the sparse chain can never launch here.
+                sparse: None,
             };
             mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
             card_ops.push(ops);

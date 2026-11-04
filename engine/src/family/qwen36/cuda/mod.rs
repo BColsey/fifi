@@ -164,6 +164,9 @@ mod section_timing_tests;
 #[cfg(test)]
 mod shape_tests;
 mod shard;
+mod sparse_exec;
+#[cfg(test)]
+mod sparse_step_device_tests;
 #[cfg(test)]
 mod spec_window_device_tests;
 pub(crate) mod start;

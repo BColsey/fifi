@@ -669,6 +669,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
+        sparse: None,
     };
     let mixers_ref = Mixers::new(ctx0, parts_ref)?;
     // The reference MoE weights and buffers.
@@ -851,6 +852,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
+            sparse: None,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }

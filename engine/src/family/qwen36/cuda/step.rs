@@ -600,6 +600,7 @@ impl<'a> QwenResidentStep<'a> {
             layout: options.layout,
             kv_mode: options.kv_mode,
             paged: res.paged.as_ref(),
+            sparse: res.sparse.as_ref(),
         };
         let specs = MoeSpecs::new(&res.dims)?;
         let tiered_mode = options.tiered.is_some();
@@ -712,7 +713,13 @@ impl<'a> QwenResidentStep<'a> {
             ));
         }
         exl3_device_pick_refusal(self.layout, config.capture, self.moe_dims.top_k)?;
-        self.capture_on = config.capture;
+        // B2: the sparse chain clears and reads its status word with blocking, stream-
+        // ordered copies — a captured body forbids both. While sparse is admitted the
+        // session stays EAGER, so the chain is never silently absent from a replay graph.
+        if config.capture && self.res.sparse.is_some() {
+            eprintln!("q36 cuda: capture off — the sparse attention chain is admitted");
+        }
+        self.capture_on = config.capture && self.res.sparse.is_none();
         // A captured body cannot wait for the host inside a layer: the EXL3 MoE blocks read the
         // picks from device memory then.
         self.exl3_device_ids = config.capture && self.layout == WeightLayout::Exl3;
@@ -1272,6 +1279,11 @@ impl<'a> QwenResidentStep<'a> {
         self.complete_prefix_save()?;
         self.window = None;
         self.state.reset(&self.stream)?;
+        // R3: the position restarts at zero; the sketch-valid prefix follows (the
+        // re-appends rewrite every consumed cell, but the binding stays honest).
+        if let Some(sp) = self.res.sparse.as_ref() {
+            sp.note_restore(0);
+        }
         if let Some(pool) = self.prefix_pins.as_mut() {
             pool.invalidate()?;
         }
@@ -1287,6 +1299,12 @@ impl<'a> QwenResidentStep<'a> {
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
         self.complete_prefix_save()?;
         self.state.import_state(&self.stream, exported)?;
+        // R3: the checkpoint restored the KV planes and the position, but NOT the
+        // sparse sketch (it belongs to this session's SparseExec): the sketch-valid
+        // prefix rewinds with it, so a stale sketch cell is never selectable.
+        if let Some(sp) = self.res.sparse.as_ref() {
+            sp.note_restore(exported.tokens);
+        }
         if let Some(pool) = self.prefix_pins.as_mut() {
             pool.invalidate()?;
         }

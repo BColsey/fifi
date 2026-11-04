@@ -154,6 +154,10 @@ const MMQ_GLUE_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/prefill/mmq_mmid.cu",
     "src/kernels/cuda/native/prefill/mmq_quant.cu",
     "src/kernels/cuda/native/prefill/swiglu_rows.cu",
+    "src/kernels/cuda/native/resident/sparse_sketch.cu",
+    "src/kernels/cuda/native/resident/sparse_score.cu",
+    "src/kernels/cuda/native/resident/sparse_topk.cu",
+    "src/kernels/cuda/native/resident/sparse_decode.cu",
 ];
 /// Headers whose change reruns the build, one path per line, alphabetical. A resident kernel
 /// adds its `native/resident/<n>.h` here.
@@ -215,6 +219,10 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/router.h",
     "src/kernels/cuda/native/resident/shortlist.h",
     "src/kernels/cuda/native/resident/softcap.h",
+    "src/kernels/cuda/native/resident/sparse_score.h",
+    "src/kernels/cuda/native/resident/sparse_sketch.h",
+    "src/kernels/cuda/native/resident/sparse_topk.h",
+    "src/kernels/cuda/native/resident/sparse_decode.h",
     "src/kernels/cuda/native/resident/step_params.h",
     "src/kernels/cuda/native/resident/swiglu_pack.h",
     "src/kernels/cuda/native/resident/swiglu_q8.h",

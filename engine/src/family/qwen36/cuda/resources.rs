@@ -8,8 +8,9 @@
 //! One row only: the MoE block takes `m = 1`, so the plan, the arena and every launch of the step
 //! are made for [`STEP_ROWS`] row.
 
+use super::sparse_exec::{SparseConfig, SparseExec, SparseGeometry};
 use super::{
-    dims::{StepDims, StepOptions},
+    dims::{KvMode, StepDims, StepOptions},
     layer_table::LayerTable,
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
     mixer_weights::dense_weight,
@@ -24,6 +25,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::spec::AttentionKind,
     family::{
         gguf_model::{Inventory, Role},
         project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Weight},
@@ -392,6 +394,9 @@ pub(super) struct StepResources {
     pub(super) geometry: MixerGeometry,
     pub(super) names: GlobalNames,
     pub(super) paged: Option<PagedResources>,
+    /// The query-aware sparse decode resources, present only when the env flag armed them,
+    /// the KV mode is the q8 resident path, and VRAM admission passed (R3, fail-open).
+    pub(super) sparse: Option<SparseExec>,
 }
 
 impl StepResources {
@@ -409,6 +414,7 @@ impl StepResources {
         let table = LayerTable::new(&dims, inventory)?;
         let geometry = MixerGeometry::new(&dims)?;
         let names = GlobalNames::new(inventory)?;
+        let sparse = admit_sparse(context, &dims, options);
         Ok(Self {
             dims,
             plan,
@@ -417,6 +423,7 @@ impl StepResources {
             geometry,
             names,
             paged: None,
+            sparse,
         })
     }
 
@@ -439,7 +446,44 @@ impl StepResources {
                 scratch: RefCell::new(scratch),
                 options: planned.options,
             }),
+            sparse: None,
         })
+    }
+}
+
+/// VRAM kept free beyond the sparse planes when admitting them (probe value; 4e-3 measures it).
+const DEFAULT_SPARSE_HEADROOM: u64 = 2 << 30;
+
+/// R3 admission: exact geometry from the session shape, `context_tokens` as the cell capacity
+/// (never a reduced one), and a fail-open outcome — any refusal or error leaves dense Q8
+/// authoritative and the sparse path dark, loudly.
+fn admit_sparse(
+    context: &CudaContext,
+    dims: &StepDims,
+    options: &StepOptions,
+) -> Option<SparseExec> {
+    if !super::sparse_exec::armed() || options.kv_mode != KvMode::Int8G32 {
+        return None;
+    }
+    let attn = &dims.shape.attn;
+    let geom = SparseGeometry {
+        n_q_head: attn.heads_q,
+        n_kv_head: attn.heads_kv,
+        head_dim: attn.head_dim,
+        layers: dims.layers_of(AttentionKind::Full),
+        capacity: options.context_tokens,
+    };
+    match SparseExec::new(
+        context,
+        geom,
+        SparseConfig::default(),
+        DEFAULT_SPARSE_HEADROOM,
+    ) {
+        Ok(exec) => Some(exec),
+        Err(e) => {
+            eprintln!("qwen36: sparse attention not admitted, dense Q8 stays authoritative: {e:?}");
+            None
+        }
     }
 }
 

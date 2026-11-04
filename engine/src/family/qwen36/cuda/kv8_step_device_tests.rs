@@ -73,7 +73,7 @@ fn prompt_ids(name: &str) -> Vec<u32> {
 
 /// The pinned checkpoint loaded once, in the Native layout the Int8G32 step requires (the
 /// `r5_fmt.rs` path).
-fn load_full_native() -> Result<(CudaProjector, CudaWeights), EngError> {
+pub(super) fn load_full_native() -> Result<(CudaProjector, CudaWeights), EngError> {
     let dir = required_dir();
     let gguf_path = std::path::Path::new(&dir).join("Qwen3.6-35B-A3B-Q4_K_M.gguf");
     let gguf = open_qwen3_6_35b_a3b(&gguf_path, None)?;
@@ -93,7 +93,7 @@ fn load_full_native() -> Result<(CudaProjector, CudaWeights), EngError> {
 
 /// The full-model step options of the device tests: the Int8G32 KV mode (or Fp16, the
 /// control of the reported row) over the Native layout.
-fn full_options(kv_mode: KvMode) -> StepOptions {
+pub(super) fn full_options(kv_mode: KvMode) -> StepOptions {
     StepOptions {
         kv_mode,
         context_tokens: CONTEXT_TOKENS,
@@ -105,7 +105,7 @@ fn full_options(kv_mode: KvMode) -> StepOptions {
 }
 
 /// The rules of a full-model step (`r5_fmt.rs`'s own numbers).
-fn rules() -> Result<super::rules::QwenRules, EngError> {
+pub(super) fn rules() -> Result<super::rules::QwenRules, EngError> {
     super::rules::QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS)
 }
 
@@ -552,6 +552,7 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
         layout: WeightLayout::Native,
         kv_mode: KvMode::Int8G32,
         paged: None,
+        sparse: None,
     };
     let mixers = Mixers::new(&context, parts)?;
     let resid_slot = if layer.is_multiple_of(2) {

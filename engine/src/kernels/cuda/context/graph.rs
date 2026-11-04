@@ -114,7 +114,13 @@ pub(super) fn operation_of(failure: &DeviceFailure) -> &'static str {
 /// capture`. A caller that falls back to the eager path after a refused capture records
 /// `captured = false` on this answer, without matching the operation string. A `cuda capture`
 /// error that latched the backend (an unlisted status at the end of the capture) is not a refusal.
+/// A window-policy `BadRequest` from `ensure_closed` is the same refusal: the body queued a
+/// blocking or allocating op a capture forbids, so the caller must degrade to eager, not fail
+/// the token (B2).
 pub(crate) fn is_capture_refusal(error: &EngError) -> bool {
+    if matches!(error, EngError::BadRequest(message) if message.starts_with("cuda capture:")) {
+        return true;
+    }
     matches!(
         error,
         EngError::Backend {
