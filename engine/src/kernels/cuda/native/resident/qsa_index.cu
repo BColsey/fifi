@@ -2,8 +2,8 @@
 // formulas and the argument contract). index enqueues three kernels: the normalized and rotated
 // queries, the pooled keys of the blocks the chunk completes, then the raw-key ring of the open
 // block (after the keys, which read the ring). score enqueues one, a grid row per token. Plain
-// f32 arithmetic in the
-// host's expression order where it is a fixed order (the pooling); reductions are warp trees.
+// f32 arithmetic in the host's expression order where it is a fixed order (the pooling);
+// reductions are warp trees.
 #include <cuda_runtime.h>
 
 #include <cmath>

@@ -4,9 +4,10 @@
 //!
 //! [`CudaContext::qsa_attn`] queues, for each of `m` consecutive tokens (one in decode, a chunk in
 //! prefill), the gated attention of every query head over the positions its selection names: the
-//! `ratio` positions of each chosen block (`qsa_select`'s output) and the open tail. q comes from `attn_prep` (normed, rotated, not
-//! scaled), the keys and values from its fp16 cache, the gates from the projection row. The
-//! attended positions are split over `max_splits` blocks per kv head; `part` is their scratch.
+//! `ratio` positions of each chosen block (`qsa_select`'s output) and the open tail. q comes from
+//! `attn_prep` (normed, rotated, not scaled), the keys and values from its fp16 cache, the gates
+//! from the projection row. The attended positions are split over `max_splits` blocks per kv
+//! head; `part` is their scratch.
 //!
 //! The call allocates nothing, copies nothing and never synchronizes; a fault in the queued work
 //! surfaces at the next synchronize of the stream. The output is valid only to work queued later
@@ -128,8 +129,8 @@ impl CudaContext {
     ///
     /// Returns `BadRequest` for a stream or buffer of another adapter, a geometry or token count
     /// outside the limits, an `ld` below `n_head * 512` or past i32, a non-finite `scale`, a
-    /// position whose tokens do not fit the cache, a short or misaligned range (16 bytes for q and the caches, 4 for the rest),
-    /// and a written range that overlaps another range.
+    /// position whose tokens do not fit the cache, a short or misaligned range (16 bytes for q
+    /// and the caches, 4 for the rest), and a written range that overlaps another range.
     pub(crate) fn qsa_attn(
         &self,
         stream: &DeviceStream,

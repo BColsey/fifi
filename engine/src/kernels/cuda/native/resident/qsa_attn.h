@@ -26,9 +26,9 @@
  *
  * Limits: m in [1, 32768]; head size 256; n_kv_head in [1, 64] dividing n_head, group in
  * [1, 32]; rows in [1, 2^30 - 1]; ratio in [1, 64]; budget_blocks in [1, 2^24]; max_splits in
- * [1, 128]; ld >= n_head * 512; scale finite. q and the caches 16-byte aligned, the rest 4-byte aligned;
- * the written ranges (part, out, status) overlap no other range. The
- * entry enqueues two kernels on stream (not NULL) and returns INFERENCE_CUDA_INVALID_ARGUMENT
+ * [1, 128]; ld >= n_head * 512; scale finite. q and the caches 16-byte aligned, the rest
+ * 4-byte aligned; the written ranges (part, out, status) overlap no other range. The entry
+ * enqueues two kernels on stream (not NULL) and returns INFERENCE_CUDA_INVALID_ARGUMENT
  * before any launch for a bad argument. */
 #ifndef INFERENCE_CUDA_RESIDENT_QSA_ATTN_H
 #define INFERENCE_CUDA_RESIDENT_QSA_ATTN_H

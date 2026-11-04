@@ -1,8 +1,8 @@
 // The block selection of Qwen3.8 Flash-Next QSA attention (see resident/qsa_select.h). One
-// block of 1024 threads per token: a radix select over the f32 bits of the scores (a nonnegative f32
-// orders as its bits) finds the take-th largest score T and how many scores equal to T are
-// kept, then one ordered pass writes the blocks above T and the lowest-indexed blocks equal
-// to T, so the result is the host's set and comes out in ascending order.
+// block of 1024 threads per token: a radix select over the f32 bits of the scores (a
+// nonnegative f32 orders as its bits) finds the take-th largest score T and how many scores
+// equal to T are kept, then one ordered pass writes the blocks above T and the lowest-indexed
+// blocks equal to T, so the result is the host's set and comes out in ascending order.
 #include <cuda_runtime.h>
 
 #include <stddef.h>
@@ -33,7 +33,8 @@ bool apart(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
 
 bool valid(const inference_cuda_qsa_select_args &a, void *stream) {
     if (stream == NULL || a.scores == NULL || a.blocks == NULL) return false;
-    if (a.m < 1 || a.m > kMaxM || a.ratio < 1 || a.ratio > kMaxRatio || a.cap_blocks < 1 || a.cap_blocks > kMaxCapBlocks ||
+    if (a.m < 1 || a.m > kMaxM || a.ratio < 1 || a.ratio > kMaxRatio || a.cap_blocks < 1 ||
+        a.cap_blocks > kMaxCapBlocks ||
         a.budget_blocks < 1 || a.budget_blocks > a.cap_blocks) {
         return false;
     }

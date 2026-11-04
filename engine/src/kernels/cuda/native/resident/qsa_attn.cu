@@ -47,7 +47,8 @@ bool shape_ok(const inference_cuda_qsa_attn_args &a) {
         a.n_head % a.n_kv_head != 0 || a.n_head / a.n_kv_head > kMaxGroup) {
         return false;
     }
-    return a.m >= 1 && a.m <= kMaxM && a.rows >= 1 && a.rows <= kMaxRows && a.ratio >= 1 && a.ratio <= kMaxRatio &&
+    return a.m >= 1 && a.m <= kMaxM && a.rows >= 1 && a.rows <= kMaxRows && a.ratio >= 1 &&
+           a.ratio <= kMaxRatio &&
            a.budget_blocks >= 1 && a.budget_blocks <= kMaxBudget && a.max_splits >= 1 &&
            a.max_splits <= kMaxSplits && (long long)a.ld >= (long long)a.n_head * 2 * kHead &&
            std::isfinite(a.scale);

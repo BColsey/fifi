@@ -280,6 +280,14 @@ const CASES: &[(&str, Case, &str)] = &[
         "exceeds i32",
     ),
     (
+        "row of usize::MAX",
+        |r| QsaAttnCall {
+            ld: usize::MAX,
+            ..r.host(5)
+        },
+        "exceeds i32",
+    ),
+    (
         "heads not a multiple of the kv heads",
         |r| QsaAttnCall {
             shape: QsaAttnShape {

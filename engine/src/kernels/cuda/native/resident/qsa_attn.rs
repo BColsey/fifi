@@ -130,13 +130,13 @@ impl QsaAttnDims {
         })
     }
 
-    /// The extent of `m` projection rows `ld` floats apart, or `None` outside the limits, for a
-    /// row narrower than the query and gate columns, or for an `ld` past `c_int`. Nothing
-    /// overflows: the largest product is `2^15 * 2^31 * 4` bytes.
+    /// The extent of `m` projection rows `ld` floats apart, or `None` outside the limits, for an
+    /// `ld` past `c_int`, or for a row narrower than the query and gate columns. `ld` is bounded
+    /// first, so nothing overflows: the largest product is `2^15 * 2^31 * 4` bytes.
     pub(in crate::kernels::cuda) fn proj_bytes(self, ld: usize) -> Option<usize> {
         let gates = self.bytes()?.gates;
-        let usable = ld * FLOAT >= gates && c_int::try_from(ld).is_ok();
-        usable.then(|| (self.m - 1) * ld * FLOAT + gates)
+        c_int::try_from(ld).ok()?;
+        (ld * FLOAT >= gates).then(|| (self.m - 1) * ld * FLOAT + gates)
     }
 
     fn ints(self) -> Option<[c_int; 7]> {
