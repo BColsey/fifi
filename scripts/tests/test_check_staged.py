@@ -247,6 +247,9 @@ class StagedGateTests(unittest.TestCase):
         # the publisher package, and pinned-looking names elsewhere, stay gated.
         for path in ("qualification/publisher/notes.txt",
                      "qualification/publisher/tools.py",
+                     "qualification/publisher/sanitize.py.bak",
+                     "qualification/publisher/publish_commits.py.tmp",
+                     "qualification/publisher/hooks/sanitize.py",
                      "docs/sanitize.py"):
             with self.subTest(path=path):
                 self.git("reset", "-q")

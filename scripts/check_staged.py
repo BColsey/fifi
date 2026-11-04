@@ -66,9 +66,10 @@ HOST_DETAIL_PATTERNS = [
 ]
 # Vendored sources keep their pinned bytes, and the publisher package pins
 # the live hook files verbatim, so the rule skips exactly those two paths.
+# The publisher exemption is full-path anchored: no suffixes, no subdirectories.
 # New pinned files require an intentional update here plus a manifest entry.
 HOST_DETAIL_SKIPPED = re.compile(
-    r"(?:^|/)(?:vendor/|qualification/publisher/(?:publish_commits|sanitize)\.py)"
+    r"(?:^|/)vendor/|^qualification/publisher/(?:publish_commits|sanitize)\.py$"
 )
 
 
