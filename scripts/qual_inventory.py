@@ -736,7 +736,10 @@ def collect_surface(surface: dict, out_dir: Path) -> dict:
             stdout, stderr = proc.communicate(timeout=timeout_sec)
             returncode = proc.returncode
         except subprocess.TimeoutExpired as expired:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the group died between timeout and kill; just reap
             killed_out, killed_err = proc.communicate()
             raise _TimedOut(
                 killed_out or expired.stdout or "", killed_err or expired.stderr or ""
