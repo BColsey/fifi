@@ -142,6 +142,10 @@ fn a_lossless_candidate_passes_at_4096_tokens() {
     assert!(!report.rate_rule.reject && !report.event_rule.reject);
     assert!(report.rate_rule.lower_bound < report.rate_rule.limit);
     assert!(report.rate_rule.clustered.is_some());
+    // Both rules compare with the baseline execution, never with the scorer's own path.
+    assert_eq!(report.rate_rule.baseline_rate, report.baseline.rate);
+    assert_eq!(report.event_rule.baseline_tokens, report.baseline.tokens);
+    assert_ne!(report.rate_rule.baseline_rate, report.reference.rate);
 }
 
 #[test]
