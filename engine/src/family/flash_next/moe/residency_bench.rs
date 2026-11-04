@@ -54,7 +54,7 @@ use crate::{
     family::{
         exl3_pack::{ExpertPart, Root, expert_name_in},
         flash_next::load::{exl3_pack::inspect_flash_pack, model_shape},
-        project::cuda::CudaProjector,
+        project::cuda::{CudaProjector, CudaWeights},
         qwen36::cuda::{
             exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
             moe::{Launch, MoeDims, RouteBufs},
@@ -78,19 +78,19 @@ use crate::{
 };
 
 const F32: usize = 4;
-const EXPERT_BYTES: usize = 1_881_600;
+pub(super) const EXPERT_BYTES: usize = 1_881_600;
 const HANDOFF_PICKS: usize = 8;
 
-type Res<T> = Result<T, EngError>;
+pub(super) type Res<T> = Result<T, EngError>;
 
-fn fail(what: impl Into<String>) -> EngError {
+pub(super) fn fail(what: impl Into<String>) -> EngError {
     EngError::BadRequest(what.into())
 }
 
 // ------------------------------------------------------------------ statistics and output
 
 /// Nearest-rank percentiles of `samples`, printed as one JSON line.
-fn emit(phase: &str, case: &str, unit: &str, samples: &[f64], extra: &str) {
+pub(super) fn emit(phase: &str, case: &str, unit: &str, samples: &[f64], extra: &str) {
     let mut v = samples.to_vec();
     v.sort_by(f64::total_cmp);
     let n = v.len();
@@ -148,16 +148,16 @@ impl Rng {
 }
 
 /// The whole of `buffer` as one range.
-fn whole(buffer: &DeviceBuffer) -> Res<DeviceRange<'_>> {
+pub(super) fn whole(buffer: &DeviceBuffer) -> Res<DeviceRange<'_>> {
     buffer.range(0, buffer.bytes())
 }
 
 /// Device microseconds between two recorded timing events.
-fn device_us(from: &TimingEvent, to: &TimingEvent) -> Res<f64> {
+pub(super) fn device_us(from: &TimingEvent, to: &TimingEvent) -> Res<f64> {
     Ok(f64::from(from.elapsed_ms_since(to)?) * 1e3)
 }
 
-fn us(since: Instant) -> f64 {
+pub(super) fn us(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1e6
 }
 
@@ -166,7 +166,7 @@ fn us(since: Instant) -> f64 {
 /// Byte layout of one device-ready expert: per part (gate, up, down) its trellis, then `suh` and
 /// `svh` as f32.
 #[derive(Clone, Copy)]
-struct Layout {
+pub(super) struct Layout {
     hidden: usize,
     inter: usize,
     words: usize,
@@ -235,7 +235,11 @@ fn widened(tensor: &Tensor) -> Res<Vec<u8>> {
 }
 
 /// Every routed expert of `layer`, device-ready, in id order.
-fn read_store(checkpoint: &Checkpoint, layer: usize, moe: &MoeDims) -> Res<(Layout, Vec<u8>)> {
+pub(super) fn read_store(
+    checkpoint: &Checkpoint,
+    layer: usize,
+    moe: &MoeDims,
+) -> Res<(Layout, Vec<u8>)> {
     let mut layout = None;
     let mut host = Vec::new();
     for expert in 0..moe.n_expert {
@@ -276,14 +280,14 @@ fn read_store(checkpoint: &Checkpoint, layer: usize, moe: &MoeDims) -> Res<(Layo
 // ------------------------------------------------------------------ the resident GPU block
 
 /// The MoE block of one layer with persistent buffers, run with device picks.
-struct Block<'w> {
+pub(super) struct Block<'w> {
     weights: Exl3MoeWeights<'w>,
     owned: Vec<DeviceBuffer>,
     moe: MoeDims,
 }
 
 impl Block<'_> {
-    fn bufs(&self) -> Res<Exl3MoeBufs<'_>> {
+    pub(super) fn bufs(&self) -> Res<Exl3MoeBufs<'_>> {
         let r = |i: usize| self.owned[i].range(0, self.owned[i].bytes());
         Ok(Exl3MoeBufs {
             route: RouteBufs {
@@ -311,7 +315,7 @@ impl Block<'_> {
     }
 
     /// Queues the block on `stream`; nothing synchronizes.
-    fn queue(&self, ctx: &CudaContext, stream: &DeviceStream) -> Res<()> {
+    pub(super) fn queue(&self, ctx: &CudaContext, stream: &DeviceStream) -> Res<()> {
         let launch = Launch { ctx, stream };
         run_exl3_moe(&launch, &self.weights, &self.bufs()?, &self.moe, true)
     }
@@ -1150,12 +1154,15 @@ fn flash_next_expert_residency_microbench() {
     run().expect("the residency microbenchmark");
 }
 
-fn run() -> Res<()> {
+/// The local pack, the MoE layer and its dimensions named by the environment
+/// (`FIFI_FLASH_NEXT_EXL3_PACK`, `FIFI_FLASH_NEXT_EXL3_MOE_LAYER`); `what` names the benchmark
+/// that needs the GPU.
+pub(super) fn open_layer(what: &str) -> Res<(Checkpoint, usize, MoeDims)> {
     let dir = std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK")
         .ok_or_else(|| fail("FIFI_FLASH_NEXT_EXL3_PACK"))?;
     let layer = std::env::var("FIFI_FLASH_NEXT_EXL3_MOE_LAYER")
         .map_or(Ok(3), |v| v.parse().map_err(|_| fail("a layer number")))?;
-    if !device_present("Flash-Next residency microbenchmark") {
+    if !device_present(what) {
         return Err(fail("a GPU is required"));
     }
     let checkpoint = Checkpoint::open(Path::new(&dir))?;
@@ -1170,6 +1177,32 @@ fn run() -> Res<()> {
         inter: shape.inter,
         shared_inter: shape.shared_inter,
     };
+    Ok((checkpoint, layer, moe))
+}
+
+/// The block of `layer` over fresh zeroed buffers (the norm row is input seed 0), its weights
+/// found in `weights`.
+pub(super) fn resolve_block<'w>(
+    ctx: &CudaContext,
+    weights: &'w CudaWeights,
+    layer: usize,
+    moe: MoeDims,
+) -> Res<Block<'w>> {
+    let keys = keys(layer);
+    Ok(Block {
+        weights: Exl3MoeWeights::resolve_by(weights, layer, &moe, |role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .ok_or_else(|| fail(format!("no key for {role:?}")))
+        })?,
+        owned: block_buffers(ctx, &moe)?,
+        moe,
+    })
+}
+
+fn run() -> Res<()> {
+    let (checkpoint, layer, moe) = open_layer("Flash-Next residency microbenchmark")?;
     let start = Instant::now();
     let (layout, host) = read_store(&checkpoint, layer, &moe)?;
     println!(
@@ -1184,17 +1217,7 @@ fn run() -> Res<()> {
     let ctx = projector.context();
     let router = Router::read(&checkpoint, layer, &moe)?;
     let weights = upload(&projector, &checkpoint, (layer, &router), &moe)?;
-    let keys = keys(layer);
-    let block = Block {
-        weights: Exl3MoeWeights::resolve_by(&weights, layer, &moe, |role| {
-            keys.iter()
-                .find(|(candidate, _)| *candidate == role)
-                .map(|(_, key)| key.as_str())
-                .ok_or_else(|| fail(format!("no key for {role:?}")))
-        })?,
-        owned: block_buffers(ctx, &moe)?,
-        moe,
-    };
+    let block = resolve_block(ctx, &weights, layer, moe)?;
     let start = Instant::now();
     let mut pinned = ctx.pinned_buf(host.len())?;
     let alloc = start.elapsed().as_secs_f64();
