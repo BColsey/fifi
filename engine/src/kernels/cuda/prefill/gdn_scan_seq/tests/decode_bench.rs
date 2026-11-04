@@ -26,6 +26,11 @@
 //! device time of the pass and of every layer in it). Every warm-up round runs every arm's full
 //! pass. Effective bandwidth divides the bytes a layer must move (each range touched once, the
 //! state and the conv ring read and written) by the device time of the pass.
+//!
+//! The marks are not free: on the 3090 the marked pass's device time exceeds the plain pass's
+//! wall time by about 1.6 us per layer, and the event timer counts in 1.024 us steps. So the
+//! plain pass's wall time is the pass latency; the marked pass gives the spread across layers,
+//! and its bandwidth figures are low by the cost of the marks.
 
 use super::forms::{FN_K, FN_V, opts_of};
 use super::{
@@ -492,7 +497,7 @@ fn gdn_decode_bench_flash_next_against_the_vendored_decode() -> Result<(), EngEr
         wall: Vec::with_capacity(ROUNDS),
         enqueue: Vec::with_capacity(ROUNDS),
         device: Vec::with_capacity(ROUNDS),
-        per_layer: vec![Vec::with_capacity(ROUNDS); LAYERS],
+        per_layer: (0..LAYERS).map(|_| Vec::with_capacity(ROUNDS)).collect(),
     };
     let fnx = GdnForm::FLASH_NEXT;
     let q36 = GdnForm::QWEN36_GGUF;
