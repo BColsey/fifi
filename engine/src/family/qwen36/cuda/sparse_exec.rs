@@ -227,7 +227,9 @@ impl SparseConfig {
 /// one row at a time - an append past a hole (a checkpoint import into a fresh
 /// session, a prefill) leaves the prefix behind, fail-closed; `note_restore` rewinds
 /// it with the imported position (a same-session rewind keeps its own valid sketch,
-/// a fresh session stays at zero).
+/// a fresh session stays at zero); `note_prefill` grows it by a committed chunk that
+/// starts exactly at the prefix (an interrupted or gapped prefill leaves it behind,
+/// so a partially initialized sketch is never selectable).
 mod sketch_binding {
     use std::cell::Cell;
 
@@ -245,6 +247,12 @@ mod sketch_binding {
         pub(super) fn note_appended(&self, pos: usize) {
             if pos == self.0.get() {
                 self.0.set(pos + 1);
+            }
+        }
+
+        pub(super) fn note_prefill(&self, p0: usize, rows: usize) {
+            if p0 == self.0.get() {
+                self.0.set(p0 + rows);
             }
         }
 
@@ -473,6 +481,14 @@ impl SparseExec {
         self.sketch_prefix.note_appended(pos);
     }
 
+    /// R3 generation binding: a prefill chunk of `rows` tokens committed at `p0`
+    /// just queued its sketch cells (one per sparse-supported full-attention layer).
+    /// The prefix grows only when the chunk continues it exactly, so an interrupted
+    /// or gapped prefill leaves every unsketched cell outside the selection.
+    pub(crate) fn note_prefill(&self, p0: usize, rows: usize) {
+        self.sketch_prefix.note_prefill(p0, rows);
+    }
+
     /// R3 generation binding: a checkpoint import (or reset) rewound the session to
     /// `tokens`; the sketch-valid prefix can never exceed it.
     pub(crate) fn note_restore(&self, tokens: usize) {
@@ -580,6 +596,33 @@ mod tests {
         assert_eq!(q.get(), 0);
         q.note_appended(60);
         assert_eq!(q.get(), 0);
+    }
+
+    #[test]
+    fn sketch_prefix_grows_only_over_committed_contiguous_prefill() {
+        let p = sketch_binding::SketchPrefix::new();
+        p.note_prefill(0, 2048);
+        assert_eq!(p.get(), 2048, "a prefill from zero commits its rows");
+        // The next chunk continues exactly at the prefix: it grows.
+        p.note_prefill(2048, 512);
+        assert_eq!(p.get(), 2560);
+        // A gapped chunk (interrupted prefill resumed past a hole) never grows it.
+        p.note_prefill(4096, 512);
+        assert_eq!(p.get(), 2560);
+        // A chunk that rewinds below the prefix keeps the already-valid cells.
+        p.note_prefill(1024, 512);
+        assert_eq!(p.get(), 2560);
+        // Decode appends continue the last chunk contiguously.
+        p.note_appended(2560);
+        assert_eq!(p.get(), 2561);
+        // A restore below the prefix clamps it, and prefill alone cannot regrow
+        // past the restore without re-committing from there.
+        p.note_restore(2048);
+        assert_eq!(p.get(), 2048);
+        p.note_prefill(4096, 512);
+        assert_eq!(p.get(), 2048, "a prefill past the hole stays fail-closed");
+        p.note_prefill(2048, 256);
+        assert_eq!(p.get(), 2304);
     }
 
     #[test]

@@ -1134,7 +1134,8 @@ impl<'a> QwenResidentStep<'a> {
     pub(super) fn run_chunk(&mut self, p0: usize, rows: &[u32]) -> Result<(), EngError> {
         use super::moe::Launch;
         use super::prefill::{
-            ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkViews, ChunkWeights, run_chunk_body,
+            ChunkBufs, ChunkModel, ChunkRows, ChunkRun, ChunkSparse, ChunkViews, ChunkWeights,
+            run_chunk_body,
         };
         use super::prefill_driver::{check_chunk_start, chunk_ids};
         use super::prefill_plan::ChunkSlot;
@@ -1200,6 +1201,11 @@ impl<'a> QwenResidentStep<'a> {
                 .buffer()
                 .write_at(stream, ids_range.offset(), &bytes)?;
             let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
+            let run = run.with_sparse(
+                res.sparse
+                    .as_ref()
+                    .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
+            );
             #[cfg(test)]
             let run = run.with_kernel_class(kernel_class);
             run_chunk_body(
@@ -1227,6 +1233,12 @@ impl<'a> QwenResidentStep<'a> {
         state
             .revalidate(stream, p0 + m, status)
             .inspect_err(|_| state.poison())?;
+        // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
+        // selection-eligible prefix grows with it, but only when this chunk continues
+        // it exactly (interrupted or gapped prefill keeps the smaller prefix).
+        if let Some(sp) = res.sparse.as_ref() {
+            sp.note_prefill(p0, m);
+        }
         Ok(())
     }
 

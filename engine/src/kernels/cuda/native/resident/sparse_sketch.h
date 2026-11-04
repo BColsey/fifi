@@ -28,6 +28,7 @@
 #ifndef INFERENCE_CUDA_RESIDENT_SPARSE_SKETCH_H
 #define INFERENCE_CUDA_RESIDENT_SPARSE_SKETCH_H
 
+#include <assert.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -67,9 +68,9 @@ static_assert(alignof(inference_cuda_sparse_sketch_args) == 8 && sizeof(inferenc
 static_assert(alignof(inference_cuda_sparse_sketch_chunk_args) == 8 && sizeof(inference_cuda_sparse_sketch_chunk_args) == 48 && offsetof(inference_cuda_sparse_sketch_chunk_args, k) == 0 && offsetof(inference_cuda_sparse_sketch_chunk_args, basis) == 8 && offsetof(inference_cuda_sparse_sketch_chunk_args, sketch) == 16 && offsetof(inference_cuda_sparse_sketch_chunk_args, pos0) == 24 && offsetof(inference_cuda_sparse_sketch_chunk_args, t) == 28,
               "inference_cuda_sparse_sketch_chunk_args layout");
 #else
-_Static_assert(_Alignof(inference_cuda_sparse_sketch_args) == 8 && sizeof(inference_cuda_sparse_sketch_args) == 64 && offsetof(inference_cuda_sparse_sketch_args, k) == 0 && offsetof(inference_cuda_sparse_sketch_args, basis) == 8 && offsetof(inference_cuda_sparse_sketch_args, sketch) == 16 && offsetof(inference_cuda_sparse_sketch_args, pos) == 24 && offsetof(inference_cuda_sparse_sketch_args, status) == 32 && offsetof(inference_cuda_sparse_sketch_args, m) == 40,
+static_assert(alignof(inference_cuda_sparse_sketch_args) == 8 && sizeof(inference_cuda_sparse_sketch_args) == 64 && offsetof(inference_cuda_sparse_sketch_args, k) == 0 && offsetof(inference_cuda_sparse_sketch_args, basis) == 8 && offsetof(inference_cuda_sparse_sketch_args, sketch) == 16 && offsetof(inference_cuda_sparse_sketch_args, pos) == 24 && offsetof(inference_cuda_sparse_sketch_args, status) == 32 && offsetof(inference_cuda_sparse_sketch_args, m) == 40,
                "inference_cuda_sparse_sketch_args layout");
-_Static_assert(_Alignof(inference_cuda_sparse_sketch_chunk_args) == 8 && sizeof(inference_cuda_sparse_sketch_chunk_args) == 48 && offsetof(inference_cuda_sparse_sketch_chunk_args, k) == 0 && offsetof(inference_cuda_sparse_sketch_chunk_args, basis) == 8 && offsetof(inference_cuda_sparse_sketch_chunk_args, sketch) == 16 && offsetof(inference_cuda_sparse_sketch_chunk_args, pos0) == 24 && offsetof(inference_cuda_sparse_sketch_chunk_args, t) == 28,
+static_assert(alignof(inference_cuda_sparse_sketch_chunk_args) == 8 && sizeof(inference_cuda_sparse_sketch_chunk_args) == 48 && offsetof(inference_cuda_sparse_sketch_chunk_args, k) == 0 && offsetof(inference_cuda_sparse_sketch_chunk_args, basis) == 8 && offsetof(inference_cuda_sparse_sketch_chunk_args, sketch) == 16 && offsetof(inference_cuda_sparse_sketch_chunk_args, pos0) == 24 && offsetof(inference_cuda_sparse_sketch_chunk_args, t) == 28,
                "inference_cuda_sparse_sketch_chunk_args layout");
 #endif
 

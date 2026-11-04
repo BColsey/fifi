@@ -21,6 +21,7 @@ use super::{
     moe::{Launch, MoeDims, MoeLayerWeights, StackWeights},
     prefill_driver::Kv8Staging,
     prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
+    sparse_exec::SparseExec,
     state::ResidentState,
     state_layout::{Plane, Word},
     tiered_step::TieredRuntime,
@@ -63,6 +64,7 @@ use crate::{
             matvec_q::QuantType,
             moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
+            sparse_sketch::{SparseSketchData, SparseSketchShape},
         },
     },
 };
@@ -1243,9 +1245,33 @@ pub(super) struct ChunkRun<'r, 'w> {
     model: &'r ChunkModel<'r, 'w>,
     bufs: &'r ChunkBufs<'r>,
     rows: ChunkRows,
+    sparse: Option<ChunkSparse<'r>>,
     segmented_parts: std::cell::Cell<usize>,
     #[cfg(test)]
     kernel_class: ChunkKernelClass,
+}
+
+/// The sparse-attention handle of one chunk run: the session's `SparseExec` plus the
+/// per-layer sketch planes (one per supported full-attention layer, in layer order).
+/// A run without sparse resources carries `None` and every layer runs dense.
+pub(super) struct ChunkSparse<'r> {
+    exec: &'r SparseExec,
+    planes: Vec<Option<usize>>,
+}
+
+impl<'r> ChunkSparse<'r> {
+    pub(super) fn new(exec: &'r SparseExec, kinds: &[AttentionKind]) -> Self {
+        Self {
+            planes: (0..kinds.len())
+                .map(|ord| super::sparse_exec::full_layer(kinds, ord))
+                .collect(),
+            exec,
+        }
+    }
+
+    fn plane_for(&self, ord: usize) -> Option<usize> {
+        self.planes.get(ord).copied().flatten()
+    }
 }
 
 impl<'r, 'w> ChunkRun<'r, 'w> {
@@ -1266,6 +1292,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
             model,
             bufs,
             rows,
+            sparse: None,
             segmented_parts: std::cell::Cell::new(0),
             #[cfg(test)]
             kernel_class: ChunkKernelClass::ProductionMmq,
@@ -1274,6 +1301,13 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
     pub(super) fn segmented_parts(&self) -> usize {
         self.segmented_parts.get()
+    }
+
+    /// Attaches the session's sparse resources: every committed chunk row then also
+    /// sketches its k rows onto the sparse planes (see `attn_prep`).
+    pub(super) fn with_sparse(mut self, sparse: Option<ChunkSparse<'r>>) -> Self {
+        self.sparse = sparse;
+        self
     }
 
     /// Selects this run's diagnostic projections without changing another caller.
@@ -1775,6 +1809,33 @@ fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
             },
             run.rows.p0(),
         )?;
+        // The sketch of the just-committed rows: same stream, after the quantize, so it
+        // reads exactly the f32 k bytes `kv8_chunk` committed. `cell = position`, so the
+        // sketch rows of this chunk are [p0, p0 + m) and match the KV cells one to one.
+        // The host-side selection gate (sketch prefix) grows only when the whole chunk
+        // revalidates, so these cells are never selectable early; a failed launch fails
+        // the chunk (poison), never a partially initialized sketch.
+        if let Some(sp) = &run.sparse
+            && let Some(plane) = sp.plane_for(ctx.ord)
+        {
+            let exec = sp.exec;
+            launch.ctx.sparse_sketch_chunk(
+                launch.stream,
+                SparseSketchShape {
+                    rows: run.rows.m(),
+                    n_kv_head: exec.n_kv_head(),
+                    head_dim: exec.head_dim(),
+                    rank: exec.rank(),
+                    cells: exec.cells(),
+                },
+                SparseSketchData {
+                    k: parts.k,
+                    basis: exec.basis_range()?,
+                    sketch: exec.sketch_plane(plane)?,
+                },
+                run.rows.p0(),
+            )?;
+        }
     }
     Ok(())
 }
