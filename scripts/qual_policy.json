@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "surfaces": [
+    {
+      "id": "static-format",
+      "category": "static",
+      "hardware": "cpu",
+      "description": "rustfmt check over the engine crate (pinned toolchain)",
+      "cwd": "engine",
+      "argv": ["cargo", "fmt", "--check"],
+      "env": {},
+      "expect": {},
+      "fixtures_required": []
+    },
+    {
+      "id": "static-clippy",
+      "category": "static",
+      "hardware": "cpu",
+      "description": "Clippy with -D warnings over all targets, CPU default features",
+      "cwd": "engine",
+      "argv": ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+      "env": {},
+      "expect": {},
+      "fixtures_required": []
+    },
+    {
+      "id": "host-portable",
+      "category": "host",
+      "hardware": "cpu",
+      "description": "Full default-feature host suite: lib target plus every integration target, CPU only. Fixture-gated tests skip on hosts without the named locations; the skips are recorded as evidence, and CI enforces a minimum-ran floor so a collection regression cannot pass silently.",
+      "cwd": "engine",
+      "argv": ["cargo", "test", "--locked"],
+      "env": {},
+      "expect": {
+        "min_ran": 3000,
+        "max_failed": 1,
+        "allowed_failures": [
+          "published_text::published_files_carry_no_internal_plan_labels"
+        ],
+        "require_all_allowed_failures": true
+      },
+      "fixtures_required": [],
+      "baseline_note": "The allowed failure is pre-existing on main at ec0296ed9 (internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs); it stays listed until those labels are reworded, and this entry fails the moment the test starts passing again."
+    }
+  ]
+}

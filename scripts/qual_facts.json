@@ -1,0 +1,822 @@
+{
+  "schema_version": 1,
+  "targets": {
+    "lib": {
+      "path": "src/lib.rs",
+      "test_fns": 5486,
+      "ignored": 435,
+      "env_gates": [
+        "CUDA_MODULE_LOADING",
+        "DEFAULT_ON_CHILD",
+        "DT_CLASS_PARTITION",
+        "DT_DEPTHS",
+        "DT_IDS_SOURCE",
+        "ENGINESRV_PREFIX_BLOCK_MATCH",
+        "ENGINESRV_PREFIX_BLOCK_TOKENS",
+        "ENGINESRV_SHADOW_BLOCK_LCP",
+        "ENGINESRV_THINK_REPLAY",
+        "ENGINESRV_WARM_TURNS",
+        "FIFI_ADD_CHAIN_M",
+        "FIFI_DELTA_TRACE",
+        "FIFI_EXL3_CHECKPOINT",
+        "FIFI_EXL3_EXPECT_BYTES",
+        "FIFI_EXL3_GREEDY_IDS",
+        "FIFI_EXL3_JOBS_REG",
+        "FIFI_EXL3_LAYER_MAJOR",
+        "FIFI_EXL3_LEGACY",
+        "FIFI_EXL3_LOAD_REPORT",
+        "FIFI_EXL3_MIXER_CASE",
+        "FIFI_EXL3_MIXER_OUT",
+        "FIFI_EXL3_PROJECTION_OUT",
+        "FIFI_EXL3_REAL_CASES",
+        "FIFI_FLINT_CHAIN_ORACLE_DIR",
+        "FIFI_FLINT_CHAIN_ORACLE_SHA256",
+        "FIFI_FLINT_CONTROL_ARM",
+        "FIFI_FLINT_CONTROL_BOUNDARY",
+        "FIFI_FLINT_CONTROL_CASE",
+        "FIFI_FLINT_CPU_MOE_OVERLAP",
+        "FIFI_FLINT_CUDA_ALLOC_CACHE",
+        "FIFI_FLINT_CUDA_ALLOC_LAZY_RETURN",
+        "FIFI_FLINT_CUDA_EXPERT_CACHE",
+        "FIFI_FLINT_CUDA_EXPERT_SLOTS",
+        "FIFI_FLINT_CUDA_FUSED_PUBLISH",
+        "FIFI_FLINT_CUDA_GROUPED_GATHER",
+        "FIFI_FLINT_CUDA_KV_DEVICE_F16",
+        "FIFI_FLINT_CUDA_PACKED_POINTWISE",
+        "FIFI_FLINT_CUDA_Q8_TILED",
+        "FIFI_FLINT_CUDA_RESULT_DIR",
+        "FIFI_FLINT_DEVICE_PICKS",
+        "FIFI_FLINT_FETCH_INPUT",
+        "FIFI_FLINT_FULL_ORACLE",
+        "FIFI_FLINT_FULL_ORACLE_OUT",
+        "FIFI_FLINT_FULL_ORACLE_SHA256",
+        "FIFI_FLINT_GGUF",
+        "FIFI_FLINT_LATE_HEALTH",
+        "FIFI_FLINT_MLX_ASYNC_CHAIN",
+        "FIFI_FLINT_MLX_BATCH_PREFILL",
+        "FIFI_FLINT_MLX_CACHE_LIMIT",
+        "FIFI_FLINT_MLX_COMPILE_LAYER",
+        "FIFI_FLINT_MLX_CONTEXT_LIMIT",
+        "FIFI_FLINT_MLX_DECODE_ATTN",
+        "FIFI_FLINT_MLX_PREFILL_CHAIN",
+        "FIFI_FLINT_MLX_RING_VIEW",
+        "FIFI_FLINT_MLX_T1_FLASH",
+        "FIFI_FLINT_MMQ_BENCH_MODE",
+        "FIFI_FLINT_MMQ_INPUT",
+        "FIFI_FLINT_MODEL_IDENTITY",
+        "FIFI_FLINT_ORACLE_DIR",
+        "FIFI_FLINT_PREFIX_BUDGET_BYTES",
+        "FIFI_FLINT_PREFIX_REUSE",
+        "FIFI_FLINT_PREPARED_EXPERTS",
+        "FIFI_FLINT_QK_GOLDENS",
+        "FIFI_FLINT_QK_ORACLE_DIR",
+        "FIFI_FLINT_RCA_DEVICE_L0",
+        "FIFI_FLINT_RCA_RESULT_DIR",
+        "FIFI_FLINT_RCA_SAVED_M5",
+        "FIFI_FLINT_TEACHER_IDS",
+        "FIFI_FLINT_TOKEN_HEALTH",
+        "FIFI_MTP_CHECKPOINT",
+        "FIFI_PF_KV",
+        "FIFI_PF_PROMPT_IDS",
+        "FIFI_PF_ROWS",
+        "FIFI_PF_SPLIT",
+        "FIFI_PF_TIMING_ONLY",
+        "FIFI_SCRATCH_ROOT",
+        "FIFI_SPEC_ROWS",
+        "FIFI_SPEC_TEXT",
+        "FIFI_SPEC_TOKENIZER",
+        "FIFI_TEST_FUSED_WALK_CHILD",
+        "FIFI_TEST_REQUIRE_DATA",
+        "FLASH_NEXT_ARTIFACT",
+        "FLASH_NEXT_ARTIFACT_MANIFEST",
+        "FLASH_NEXT_CACHE_LIMIT",
+        "FLASH_NEXT_EXECUTOR_BUDGET",
+        "FLASH_NEXT_EXECUTOR_CHUNK",
+        "FLASH_NEXT_EXECUTOR_PREFILL_RETIRE_CAP",
+        "FLASH_NEXT_EXECUTOR_PREFILL_SUBCHUNK_CAP",
+        "FLASH_NEXT_EXECUTOR_PRESSURE_MARGIN",
+        "FLASH_NEXT_PREFIX_CHUNK",
+        "FLASH_NEXT_RESIDENT_REPORT",
+        "FLASH_NEXT_TRACE_FULL",
+        "FLASH_NEXT_TRACE_ONLY",
+        "FLINT_ATTRIB_DEPTH",
+        "FLINT_CONTEXT2048_GOLDEN",
+        "FLINT_CUDA_FFN_MMQ",
+        "FLINT_EXL3_PACK",
+        "FLINT_INTERIM_CASE",
+        "FLINT_INTERIM_INPUT_SEAL",
+        "FLINT_INTERIM_KV_PROFILE",
+        "FLINT_INTERIM_RECEIPT",
+        "FLINT_MODEL_DIR",
+        "FLINT_PUBLISHER_CPU_PROOF",
+        "FLINT_QUAL_BENCH_REPS",
+        "FLINT_QUAL_CHUNK_ROWS",
+        "FLINT_QUAL_DEPTHS",
+        "FLINT_QUAL_GO",
+        "FLINT_QUAL_INPUTS",
+        "FLINT_QUAL_KL_PREFIXES",
+        "FLINT_QUAL_LAYER_CAPTURE",
+        "FLINT_QUAL_MODEL",
+        "FLINT_QUAL_PP_TRACE",
+        "FLINT_QUAL_PROBE_PREFIXES",
+        "FLINT_QUAL_PROMPT",
+        "FLINT_QUAL_REPEATS",
+        "FLINT_QUAL_RESIDUALS",
+        "FLINT_QUAL_SPEED_MANIFEST",
+        "FLINT_QUAL_STAGE_SYNC",
+        "FLINT_QUAL_STREAM_TOKENS",
+        "FLINT_QUAL_TENSORS",
+        "FLINT_QUAL_TOKENIZER",
+        "FLINT_QUAL_TOKENS",
+        "FLINT_QUAL_TRACE_POSITIONS",
+        "FLINT_SPLIT_DEPTH",
+        "FLINT_SPLIT_ROWS",
+        "FLINT_TF_GATE_ARM",
+        "FLINT_TF_GATE_CLASS",
+        "FLINT_TF_GATE_GRID",
+        "FLINT_TF_GATE_RECEIPT",
+        "FLINT_TF_GATE_RUN",
+        "FLINT_TF_GATE_SEGMENTS",
+        "FLINT_WINDOW_TOKENS",
+        "FMT_IDS",
+        "FMT_LAYOUT",
+        "FMT_TIERED",
+        "FUSED_AB_ARM",
+        "GAP_TRIM_FREEZE",
+        "GEMMA4_BANDWIDTH_PROBE",
+        "GEMMA4_CONTEXT_TOKENS",
+        "GEMMA4_PROBE_K",
+        "GEMMA4_PROBE_ROWS",
+        "GEMMA4_Q8_FILE",
+        "GEMMA4_Q8_HEADER_SHA256",
+        "GEMMA4_TOKENIZER_DIR",
+        "GEMMA4_TOKENIZER_JSON",
+        "GEMMA4_VOCAB_SIZE",
+        "HEAD_FIXTURE_DIR",
+        "HOME",
+        "INFERENCE_CUDA_FAULT_CHILD",
+        "INFERENCE_CUDA_GDN_FUSE_INPROJ",
+        "INFERENCE_CUDA_KV8_ATTN_R1",
+        "INFERENCE_CUDA_LARGE_TENSOR_GGUF",
+        "INFERENCE_CUDA_MEASURE_DROP_PAGE_CACHE",
+        "INFERENCE_CUDA_MEASURE_GGUF",
+        "INFERENCE_CUDA_MEASURE_MAX_BYTES",
+        "INFERENCE_CUDA_MEASURE_SCAN_GGUF",
+        "INFERENCE_CUDA_MEASURE_TRIM_DIR",
+        "INFERENCE_CUDA_MEASURE_TRIM_ONLY",
+        "INFERENCE_CUDA_MMID_COLS_HINT",
+        "INFERENCE_CUDA_REQUIRE_DEVICE",
+        "INFERENCE_GEMMA_MATVEC_FIXTURES",
+        "KV_F16_ENV_PROBE",
+        "KV_GUARD_SCRATCH_PROBE",
+        "LC_COMPARE_BUILD",
+        "LC_COMPARE_NOISE",
+        "LC_DEPTHS",
+        "LC_DUMP_DIR",
+        "LC_NEEDLE_PERCENTS",
+        "LC_PROMPT",
+        "LC_TOKENIZER_DIR",
+        "NEM35_CHUNK_EXPERTS",
+        "NEM35_CUDA_CHUNK_PREFILL",
+        "NEM35_CUDA_GROUPED_EXPERTS",
+        "NEM35_DECODED_A_B",
+        "NEM35_DEVICE_CHAIN",
+        "NEM35_DIAG_TOP2",
+        "NEM35_NO_BATCH",
+        "NEM35_NO_F32_CACHE",
+        "NEM35_NO_PACKED_CACHE",
+        "NEM35_PHASE_TIMING",
+        "NEM35_RESIDENT_DENSE",
+        "NEM35_SUBOP_TIMING",
+        "NEM35_TOKEN_TIMING",
+        "NVCC",
+        "OFFT_TRACE",
+        "PREFIX_BLOCK_CHILD",
+        "PT_CHUNK",
+        "PT_DEPTHS",
+        "Q36_ACTIVATION",
+        "Q36_BANK_CONFIGS",
+        "Q36_CACHE_LIMIT",
+        "Q36_CHUNKS",
+        "Q36_COMPARE_A",
+        "Q36_COMPARE_B",
+        "Q36_CUDA_BENCH_INPUT_DIR",
+        "Q36_CUDA_BENCH_OUT",
+        "Q36_CUDA_CHUNK_PREFILL",
+        "Q36_CUDA_CHUNK_ROWS",
+        "Q36_CUDA_DEVICE_SHORTLIST",
+        "Q36_CUDA_KV8_FIXED_ADMISSION",
+        "Q36_CUDA_KV8_STAGE_CONTEXT",
+        "Q36_CUDA_MODEL_DIR",
+        "Q36_CUDA_PINNED_PREFIX",
+        "Q36_CUDA_REFERENCE",
+        "Q36_CUDA_STATE_ONLY_PREFIX",
+        "Q36_CUDA_TOKENIZER_DIR",
+        "Q36_FLASH_DELTA",
+        "Q36_FLASH_PREFILL",
+        "Q36_FORMAT_GATE",
+        "Q36_FUSED_PREFILL",
+        "Q36_G2_DUMP_DIR",
+        "Q36_G2_REF_DIR",
+        "Q36_GREEDY_TOKENS",
+        "Q36_HOST_REF",
+        "Q36_KV8_FUSED_MIN_LEN",
+        "Q36_KV_DTYPE",
+        "Q36_NO_ACTMUL",
+        "Q36_NO_ATTNGATE",
+        "Q36_NO_EMBEDDED",
+        "Q36_NO_GDNPOST",
+        "Q36_NO_GDNPREP",
+        "Q36_NO_MOECOMBINE",
+        "Q36_OUT_DIR",
+        "Q36_PREFILL_QUERY_SLICE",
+        "Q36_PROMPT",
+        "Q36_SCALE_DTYPE",
+        "Q36_SOURCE_COMMIT",
+        "Q36_SPEED_8K",
+        "Q36_SPEED_ROUTING",
+        "Q36_THREADS",
+        "Q36_WIDE_EQ_DUMP",
+        "Q8_TILED_ENV_PROBE",
+        "Q8_TILED_RUNTIME_STEP_PROBE",
+        "Q8_TILED_WRITER_ROUTE_PROBE",
+        "QWEN36_G2A_COMPILE",
+        "QWEN36_ORACLE_DIR",
+        "RD4A_FIXTURES",
+        "RD7A_FIXTURES",
+        "TCAP_STRESS_DEADLINE_SECS",
+        "TMPDIR",
+        "TOKEN_HEALTH_ENV_PROBE",
+        "WIDE_EQ_ARM"
+      ],
+      "fixtures": {
+        "FIFI_QWEN36_MODEL_DIR": {
+          "or_skip": 1,
+          "required": 0
+        },
+        "FIFI_SCRATCH_ROOT": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "FLINT_P01_GGUF_LOGITS": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "FMT_IDS": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "FMT_NL": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "FMT_OUT": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "INFERENCE_CUDA_MODEL_GGUF": {
+          "or_skip": 0,
+          "required": 1
+        },
+        "Q36_CUDA_COHORT_DIR": {
+          "or_skip": 0,
+          "required": 4
+        },
+        "Q36_CUDA_MODEL_DIR": {
+          "or_skip": 0,
+          "required": 11
+        }
+      }
+    },
+    "acquisition": {
+      "path": "tests/acquisition.rs",
+      "test_fns": 20,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "cuda_smoke": {
+      "path": "tests/cuda_smoke.rs",
+      "test_fns": 4,
+      "ignored": 0,
+      "env_gates": [
+        "INFERENCE_CUDA_REQUIRE_DEVICE"
+      ],
+      "fixtures": {}
+    },
+    "decision_ane": {
+      "path": "tests/decision_ane.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "decision_head": {
+      "path": "tests/decision_head.rs",
+      "test_fns": 9,
+      "ignored": 1,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "exl3_admission": {
+      "path": "tests/exl3_admission.rs",
+      "test_fns": 40,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "exl3_cpu_expert": {
+      "path": "tests/exl3_cpu_expert.rs",
+      "test_fns": 2,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "exl3_full_reference": {
+      "path": "tests/exl3_full_reference.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "exl3_reference": {
+      "path": "tests/exl3_reference.rs",
+      "test_fns": 7,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "exl3_weights": {
+      "path": "tests/exl3_weights.rs",
+      "test_fns": 4,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "f8_weight": {
+      "path": "tests/f8_weight.rs",
+      "test_fns": 2,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "family_mac": {
+      "path": "tests/family_mac.rs",
+      "test_fns": 2,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "family_recurrent": {
+      "path": "tests/family_recurrent.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "family_route": {
+      "path": "tests/family_route.rs",
+      "test_fns": 13,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "family_spec": {
+      "path": "tests/family_spec.rs",
+      "test_fns": 22,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "family_weights": {
+      "path": "tests/family_weights.rs",
+      "test_fns": 24,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "flash_next_family": {
+      "path": "tests/flash_next_family.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "gguf_dequant": {
+      "path": "tests/gguf_dequant.rs",
+      "test_fns": 10,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "gguf_header": {
+      "path": "tests/gguf_header.rs",
+      "test_fns": 33,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "gguf_nvfp4": {
+      "path": "tests/gguf_nvfp4.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "indexed_weights": {
+      "path": "tests/indexed_weights.rs",
+      "test_fns": 17,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "layer_parity": {
+      "path": "tests/layer_parity.rs",
+      "test_fns": 11,
+      "ignored": 0,
+      "env_gates": [
+        "LAYER_PARITY_FIXTURES",
+        "LAYER_PARITY_REPORT"
+      ],
+      "fixtures": {}
+    },
+    "native_elementwise": {
+      "path": "tests/native_elementwise.rs",
+      "test_fns": 9,
+      "ignored": 0,
+      "env_gates": [
+        "ELEMENTWISE_FIXTURES"
+      ],
+      "fixtures": {}
+    },
+    "native_failure": {
+      "path": "tests/native_failure.rs",
+      "test_fns": 27,
+      "ignored": 0,
+      "env_gates": [
+        "INFERENCE_NATIVE_FAILURE_CHILD",
+        "INFERENCE_NATIVE_HANG_CHILD",
+        "INFERENCE_NATIVE_NULL_STREAM_CHILD",
+        "INFERENCE_NATIVE_RELEASE_CHILD"
+      ],
+      "fixtures": {}
+    },
+    "native_fast": {
+      "path": "tests/native_fast.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_gated_delta": {
+      "path": "tests/native_gated_delta.rs",
+      "test_fns": 6,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_gather": {
+      "path": "tests/native_gather.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_import_packed": {
+      "path": "tests/native_import_packed.rs",
+      "test_fns": 3,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_kv8_ops": {
+      "path": "tests/native_kv8_ops.rs",
+      "test_fns": 14,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_kv_ops": {
+      "path": "tests/native_kv_ops.rs",
+      "test_fns": 16,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_matmul": {
+      "path": "tests/native_matmul.rs",
+      "test_fns": 18,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_memory": {
+      "path": "tests/native_memory.rs",
+      "test_fns": 5,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_ops": {
+      "path": "tests/native_ops.rs",
+      "test_fns": 7,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_pages": {
+      "path": "tests/native_pages.rs",
+      "test_fns": 12,
+      "ignored": 0,
+      "env_gates": [
+        "INFERENCE_NATIVE_PAGES_CHILD"
+      ],
+      "fixtures": {}
+    },
+    "native_q8_decode": {
+      "path": "tests/native_q8_decode.rs",
+      "test_fns": 17,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_quant": {
+      "path": "tests/native_quant.rs",
+      "test_fns": 10,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_retire": {
+      "path": "tests/native_retire.rs",
+      "test_fns": 23,
+      "ignored": 0,
+      "env_gates": [
+        "INFERENCE_NATIVE_RETIRE_CHILD"
+      ],
+      "fixtures": {}
+    },
+    "native_rms_norm": {
+      "path": "tests/native_rms_norm.rs",
+      "test_fns": 4,
+      "ignored": 0,
+      "env_gates": [
+        "RMS_NORM_FIXTURES"
+      ],
+      "fixtures": {}
+    },
+    "native_rope": {
+      "path": "tests/native_rope.rs",
+      "test_fns": 10,
+      "ignored": 0,
+      "env_gates": [
+        "ROPE_FIXTURES"
+      ],
+      "fixtures": {}
+    },
+    "native_rows": {
+      "path": "tests/native_rows.rs",
+      "test_fns": 5,
+      "ignored": 0,
+      "env_gates": [
+        "ROWS_FIXTURES"
+      ],
+      "fixtures": {}
+    },
+    "native_select": {
+      "path": "tests/native_select.rs",
+      "test_fns": 14,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "native_shapes": {
+      "path": "tests/native_shapes.rs",
+      "test_fns": 16,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nemotron35_attention": {
+      "path": "tests/nemotron35_attention.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nemotron35_config": {
+      "path": "tests/nemotron35_config.rs",
+      "test_fns": 25,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_COMPLETE_CONFIG",
+        "NEM35_COMPLETE_INDEX"
+      ],
+      "fixtures": {}
+    },
+    "nemotron35_loader": {
+      "path": "tests/nemotron35_loader.rs",
+      "test_fns": 9,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_MODEL_DIR"
+      ],
+      "fixtures": {}
+    },
+    "nemotron35_mamba": {
+      "path": "tests/nemotron35_mamba.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nemotron35_moe": {
+      "path": "tests/nemotron35_moe.rs",
+      "test_fns": 10,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nemotron35_runner": {
+      "path": "tests/nemotron35_runner.rs",
+      "test_fns": 2,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_MODEL_DIR"
+      ],
+      "fixtures": {}
+    },
+    "nemotron35_stack": {
+      "path": "tests/nemotron35_stack.rs",
+      "test_fns": 14,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nemotron35_streaming_generation": {
+      "path": "tests/nemotron35_streaming_generation.rs",
+      "test_fns": 1,
+      "ignored": 1,
+      "env_gates": [
+        "NEM35_MODEL_DIR"
+      ],
+      "fixtures": {}
+    },
+    "nemotron35_tokenizer": {
+      "path": "tests/nemotron35_tokenizer.rs",
+      "test_fns": 3,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_MODEL_DIR"
+      ],
+      "fixtures": {}
+    },
+    "nemotron_index": {
+      "path": "tests/nemotron_index.rs",
+      "test_fns": 4,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_INDEX"
+      ],
+      "fixtures": {}
+    },
+    "nemotron_shards": {
+      "path": "tests/nemotron_shards.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [
+        "NEM35_SHARD"
+      ],
+      "fixtures": {}
+    },
+    "nvfp4": {
+      "path": "tests/nvfp4.rs",
+      "test_fns": 11,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "nvfp4_matvec": {
+      "path": "tests/nvfp4_matvec.rs",
+      "test_fns": 2,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "oq_weights": {
+      "path": "tests/oq_weights.rs",
+      "test_fns": 16,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "parity_matrix": {
+      "path": "tests/parity_matrix.rs",
+      "test_fns": 3,
+      "ignored": 0,
+      "env_gates": [
+        "FIFI_TEST_REQUIRE_DATA",
+        "OQ04_PARITY_FIXTURES",
+        "OQ04_PARITY_REPORT"
+      ],
+      "fixtures": {}
+    },
+    "portable_loader": {
+      "path": "tests/portable_loader.rs",
+      "test_fns": 24,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "published_text": {
+      "path": "tests/published_text.rs",
+      "test_fns": 3,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "q36_real_config": {
+      "path": "tests/q36_real_config.rs",
+      "test_fns": 9,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "quantization": {
+      "path": "tests/quantization.rs",
+      "test_fns": 16,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "reader_loader": {
+      "path": "tests/reader_loader.rs",
+      "test_fns": 14,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "real_group_parity": {
+      "path": "tests/real_group_parity.rs",
+      "test_fns": 5,
+      "ignored": 0,
+      "env_gates": [
+        "FIFI_TEST_REQUIRE_DATA",
+        "REAL_GROUP_FIXTURES",
+        "REAL_GROUP_REPORT"
+      ],
+      "fixtures": {}
+    },
+    "resident_execution": {
+      "path": "tests/resident_execution.rs",
+      "test_fns": 1,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "server_cli": {
+      "path": "tests/server_cli.rs",
+      "test_fns": 8,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "server_flash_cli": {
+      "path": "tests/server_flash_cli.rs",
+      "test_fns": 9,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "server_log": {
+      "path": "tests/server_log.rs",
+      "test_fns": 1,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "server_q36_cli": {
+      "path": "tests/server_q36_cli.rs",
+      "test_fns": 23,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "tiered_weights": {
+      "path": "tests/tiered_weights.rs",
+      "test_fns": 30,
+      "ignored": 0,
+      "env_gates": [],
+      "fixtures": {}
+    },
+    "tokenizer_mac": {
+      "path": "tests/tokenizer_mac.rs",
+      "test_fns": 9,
+      "ignored": 0,
+      "env_gates": [
+        "INFERENCE_TOKENIZER_DIR"
+      ],
+      "fixtures": {}
+    }
+  }
+}
