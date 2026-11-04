@@ -48,7 +48,8 @@
         "test",
         "--locked",
         "--",
-        "--nocapture"
+        "--nocapture",
+        "--test-threads=1"
       ],
       "env": {},
       "expect": {
@@ -60,8 +61,8 @@
         "require_all_allowed_failures": true
       },
       "fixtures_required": [],
-      "baseline_note": "The allowed failure is pre-existing on main at ec0296ed9 (internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs); it stays listed until those labels are reworded, and this entry fails the moment the test starts passing again. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count.",
-      "timeout_sec": 3600
+      "baseline_note": "The allowed failure is pre-existing on main at ec0296ed9 (internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs); it stays listed until those labels are reworded, and this entry fails the moment the test starts passing again. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count. Test threads are serialized: under --nocapture with parallel threads, concurrent println writes tore two libtest result lines mid-line at the integrated main (REAL_ROW prints from the flash-next exl3-pack and flint real-quality tests), and the strict line/summary pairing correctly failed the collection; single-threaded runs cannot interleave mid-line. The >60-second libtest notices are unmatched noise lines and do not affect the count.",
+      "timeout_sec": 7200
     }
   ]
 }
