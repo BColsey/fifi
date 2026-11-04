@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use super::{
     super::exl3_pack::{ExpertPart, expert_name, router_name, shared_gate_name, shared_name},
     common_tests::{dims, inventory},
@@ -178,9 +180,13 @@ fn real_pack_moe_block_matches_the_fp64_reference() {
             );
         }
         let error = relative_l2(&got.out, &want.out);
+        // The digest of the output bytes pins the block across a refactor: an unchanged path
+        // prints the same digest.
+        let bytes: Vec<u8> = got.out.iter().flat_map(|v| v.to_le_bytes()).collect();
         println!(
-            "layer {layer}: picks {:?}, relative L2 {error:.3e}",
-            got.ids
+            "layer {layer}: picks {:?}, relative L2 {error:.3e}, output sha256 {:x}",
+            got.ids,
+            Sha256::digest(&bytes)
         );
         assert_eq!(got.flag, 0, "layer {layer}: arithmetic flag");
         assert!(error < 2e-5, "layer {layer}: {error}");
