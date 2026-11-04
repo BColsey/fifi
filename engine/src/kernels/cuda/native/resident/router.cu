@@ -484,8 +484,9 @@ extern "C" int inference_cuda_router_sigmoid_select_launch(const inference_cuda_
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!stream || !valid_split_select(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        const SelectArgs k{a->logits, a->ids, a->weights, NULL,       a->status,
-                           a->m,      a->n_expert, a->top_k, a->n_expert};
+        const SelectArgs k{a->logits, a->ids,      a->weights, NULL,
+                           a->status, a->m,        a->n_expert, a->top_k,
+                           a->n_expert};
         launch_select<true>(k, (cudaStream_t)stream);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
