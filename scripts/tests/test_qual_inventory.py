@@ -174,7 +174,6 @@ fn c() {
 #![cfg(all(feature = "native-cuda", target_os = "linux"))]
 #[cfg(feature = "native-mlx")]
 fn gated() {}
-fn not_a_gate() { let x = format!("feature = \"fake\""); }
 """
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "x.rs"
@@ -509,7 +508,7 @@ class DeviceSurfacePolicyTest(unittest.TestCase):
                      "--test=cuda_smoke"],
             "features": ["native-cuda"],
             "env": {"INFERENCE_CUDA_REQUIRE_DEVICE": "1"},
-            "expect": {},
+            "expect": {"min_ran": 4},
             "timeout_sec": 900,
         }
         surface.update(overrides)
@@ -529,6 +528,17 @@ class DeviceSurfacePolicyTest(unittest.TestCase):
     def test_cuda_surface_with_zero_require_device_fails(self) -> None:
         with self.assertRaises(qi.InventoryError):
             self.check(self.cuda_surface(env={"INFERENCE_CUDA_REQUIRE_DEVICE": "0"}))
+
+    def test_cuda_surface_without_min_ran_fails(self) -> None:
+        # A compiled-but-empty target (runtime gates, ignored tests) must fail on
+        # its own; feature validation alone cannot catch zero executed tests.
+        with self.assertRaises(qi.InventoryError) as caught:
+            self.check(self.cuda_surface(expect={}))
+        self.assertIn("min_ran", str(caught.exception))
+
+    def test_cuda_surface_with_zero_min_ran_fails(self) -> None:
+        with self.assertRaises(qi.InventoryError):
+            self.check(self.cuda_surface(expect={"min_ran": 0}))
 
     def test_undeclared_feature_fails(self) -> None:
         with self.assertRaises(qi.InventoryError):
@@ -550,6 +560,54 @@ class DeviceSurfacePolicyTest(unittest.TestCase):
         bad["targets"]["cuda_smoke"]["features"] = ["ghost-feature"]
         with self.assertRaises(qi.InventoryError):
             qi.validate_policy({"surfaces": [self.cuda_surface()]}, bad)
+
+
+class MultilineFeatureGateTest(unittest.TestCase):
+    """A formatting change must never silently weaken the gate census."""
+
+    def scan(self, source: str) -> set[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.rs"
+            path.write_text(source, encoding="utf-8")
+            return qi.scan_file(path)[3]
+
+    def test_multiline_cfg_attribute_is_counted(self) -> None:
+        source = (
+            "#![cfg(all(\n"
+            "    feature = \"native-cuda\",\n"
+            "    target_os = \"linux\",\n"
+            "))]\n"
+            "#[cfg(all(feature = \"native-mlx\",\n"
+            "           target_os = \"macos\"))]\n"
+            "fn gated() {}\n"
+        )
+        self.assertEqual(self.scan(source), {"native-cuda", "native-mlx"})
+
+    def test_cfg_macro_features_are_not_target_gates(self) -> None:
+        # The probe.rs shape: cfg!(...) evaluates at runtime and never gates
+        # target compilation, so it neither counts nor refuses.
+        source = (
+            "Self {\n"
+            "    cuda: cfg!(all(feature = \"native-cuda\", target_os = \"linux\")),\n"
+            "    mlx: cfg!(all(\n"
+            "        feature = \"native-mlx\",\n"
+            "        target_os = \"macos\",\n"
+            "        target_arch = \"aarch64\"\n"
+            "    )),\n"
+            "}\n"
+        )
+        self.assertEqual(self.scan(source), set())
+
+    def test_bare_feature_line_refuses_instead_of_undercounting(self) -> None:
+        # A raw string or odd formatting can put `feature = "x"` outside any
+        # recognizable attribute; refusing beats guessing a smaller census.
+        source = 'let note = r#"feature = "native-cuda""#;\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.rs"
+            path.write_text(source, encoding="utf-8")
+            with self.assertRaises(qi.InventoryError) as caught:
+                qi.scan_file(path)
+        self.assertIn("refusing", str(caught.exception))
 
 
 class SurfaceSelectionTest(unittest.TestCase):

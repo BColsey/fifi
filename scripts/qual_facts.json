@@ -512,7 +512,9 @@
         "INFERENCE_NATIVE_NULL_STREAM_CHILD",
         "INFERENCE_NATIVE_RELEASE_CHILD"
       ],
-      "features": [],
+      "features": [
+        "native-fault-qualification"
+      ],
       "fixtures": {}
     },
     "native_fast": {
@@ -650,7 +652,9 @@
       "env_gates": [
         "INFERENCE_NATIVE_RETIRE_CHILD"
       ],
-      "features": [],
+      "features": [
+        "native-fault-qualification"
+      ],
       "fixtures": {}
     },
     "native_rms_norm": {

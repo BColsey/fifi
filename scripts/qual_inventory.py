@@ -71,8 +71,13 @@ ENV_GATE_RE = re.compile(rf"\benv::var(?:_os)?\(\"([{UPPER}][{UPPER}0-9_]+)\"\)"
 FIXTURE_CALL_RE = re.compile(rf"\b(or_skip|required)\(\"([{UPPER}][{UPPER}0-9_]+)\"\)")
 # Compile-time backend gates, e.g. `#![cfg(all(feature = "native-cuda", target_os = "linux"))]`
 # or item-level `#[cfg(feature = "native-mlx")]`. Only attribute lines count: a bare
-# `feature = "x"` inside code is not a gate.
+# `feature = "x"` inside code is not a gate. Multiline attributes are tracked by
+# bracket depth so a `feature = ...` line inside them is still counted; a bare
+# `feature = "x"` outside any recognizable attribute is refused rather than
+# silently ignored (a formatting change must never weaken the census).
 FEATURE_GATE_RE = re.compile(rf"^\s*#!?\[.*cfg\(.*feature\s*=\s*\"([a-z0-9-]+)\"")
+ATTR_START_RE = re.compile(r"^\s*#!?\[")
+ATTR_FEATURE_RE = re.compile(r'feature\s*=\s*"([a-z0-9-]+)"')
 
 # The one env gate that turns a missing CUDA device into a failure instead of a
 # silent skip; without it a device run is not device evidence (see cuda_smoke.rs).
@@ -134,6 +139,61 @@ class TestTargetFacts:
     fixtures: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
+def _strip_cfg_macros(line: str, depth: int) -> tuple[str, int]:
+    """Remove cfg!( ... ) macro regions from a line, carrying paren depth.
+
+    `cfg!` evaluates a cfg at runtime as a boolean; it never gates target
+    compilation, so its feature mentions are neither gates nor refusals.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(line):
+        if depth > 0:
+            close = index
+            while close < len(line) and depth > 0:
+                if line[close] == "(":
+                    depth += 1
+                elif line[close] == ")":
+                    depth -= 1
+                close += 1
+            index = close
+            continue
+        start = line.find("cfg!(", index)
+        if start < 0:
+            out.append(line[index:])
+            break
+        out.append(line[index:start])
+        depth = 1
+        index = start + len("cfg!(")
+    return "".join(out), depth
+
+
+def scan_features(text: str, path: Path) -> set[str]:
+    """Feature names from cfg gates, refusing shapes the census cannot read."""
+    features: set[str] = set()
+    attr_depth = 0  # open square brackets of the attribute being scanned
+    macro_depth = 0  # open parens of a cfg!( ... ) macro expression
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.lstrip()
+        if stripped.startswith("//"):  # comments quote attributes; not code
+            continue
+        line = raw
+        if macro_depth or "cfg!(" in line:
+            line, macro_depth = _strip_cfg_macros(line, macro_depth)
+        if attr_depth == 0 and ATTR_START_RE.match(raw):
+            features.update(FEATURE_GATE_RE.findall(line))
+            attr_depth = line.count("[") - line.count("]")
+        elif attr_depth > 0:
+            features.update(ATTR_FEATURE_RE.findall(line))
+            attr_depth += line.count("[") - line.count("]")
+        elif ATTR_FEATURE_RE.search(line):
+            raise InventoryError(
+                f"{path}:{lineno}: 'feature = ...' outside a recognizable "
+                "attribute; refusing to guess the gate census"
+            )
+    return features
+
+
 def scan_file(
     path: Path,
 ) -> tuple[int, int, set[str], set[str], dict[str, dict[str, int]]]:
@@ -141,9 +201,7 @@ def scan_file(
     test_fns = len(TEST_ATTR_RE.findall(text))
     ignored = len(IGNORE_ATTR_RE.findall(text))
     gates = set(ENV_GATE_RE.findall(text))
-    features = set()
-    for line in text.splitlines():
-        features.update(FEATURE_GATE_RE.findall(line))
+    features = scan_features(text, path)
     fixtures: dict[str, dict[str, int]] = {}
     for kind, name in FIXTURE_CALL_RE.findall(text):
         entry = fixtures.setdefault(name, {"or_skip": 0, "required": 0})
@@ -341,6 +399,14 @@ def validate_policy(policy: dict, facts: dict) -> list[str]:
                     problems.append(
                         f"{where}: cuda-device surfaces must set "
                         f"{DEVICE_FAIL_CLOSED_GATE} truthy in env"
+                    )
+                # A compiled-but-empty target (runtime gates, ignored tests) must
+                # fail on its own, not ride on feature validation.
+                min_ran = expect.get("min_ran")
+                if not isinstance(min_ran, int) or min_ran < 1:
+                    problems.append(
+                        f"{where}: cuda-device surfaces must demand "
+                        "expect.min_ran >= 1"
                     )
             # Every --test target whose source gates on backend features must have
             # those features activated by this surface, or cargo compiles it empty.
