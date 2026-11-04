@@ -593,9 +593,12 @@ mod tests {
         assert!(error.0.contains("not a directory"), "{}", error.0);
     }
 
-    // Fails if `serve --model` can reach the weights of a network-mounted
-    // directory: discovery and the preflight both go through the inspection,
-    // which refuses before it lists the directory.
+    // Fails if discovery stops refusing a network-mounted model directory:
+    // `discover` calls the inspection, which refuses before it lists the
+    // directory. `build_config` runs `discover` first, so its refusal here is
+    // the same discovery refusal; the later preflight call is not what this
+    // test exercises, and the engine start is covered by the `start_engines`
+    // tests.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_model_directory_on_a_network_mount_is_refused_at_discovery() {
