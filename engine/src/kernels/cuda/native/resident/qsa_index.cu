@@ -206,33 +206,42 @@ __global__ void __launch_bounds__(kMaxDim) qsa_ring_k(IndexArgs a) {
     }
 }
 
+struct ScoreArgs {
+    const float *queries, *keys;
+    float *scores;
+    const int *pos;
+    int *status;
+    int heads, dim, ratio, cap_blocks, pos0;
+};
+
 // Warps stride over the completed blocks; each warp scores one block per trip.
-__global__ void __launch_bounds__(kScoreThreads)
-    qsa_score_k(const float *queries, const float *keys, float *scores, const int *pos,
-                int *status, int heads, int dim, int ratio, int cap_blocks, int pos0) {
+__global__ void __launch_bounds__(kScoreThreads) qsa_score_k(ScoreArgs a) {
     __shared__ float q[kMaxQueryFloats];
     long long at;
-    if (!position(pos, pos0, 1, ratio, cap_blocks, &at)) {
-        if (status != NULL && blockIdx.x == 0 && threadIdx.x == 0) atomicOr(status, kStatusBits);
+    if (!position(a.pos, a.pos0, 1, a.ratio, a.cap_blocks, &at)) {
+        if (a.status != NULL && blockIdx.x == 0 && threadIdx.x == 0) {
+            atomicOr(a.status, kStatusBits);
+        }
         return;
     }
-    for (int i = threadIdx.x; i < heads * dim; i += blockDim.x) q[i] = queries[i];
+    const int dim = a.dim;
+    for (int i = threadIdx.x; i < a.heads * dim; i += blockDim.x) q[i] = a.queries[i];
     __syncthreads();
-    const long long blocks = (at + 1) / ratio;
+    const long long blocks = (at + 1) / a.ratio;
     const int lane = threadIdx.x % 32;
     const long long stride = (long long)gridDim.x * kScoreWarps;
     for (long long b = (long long)blockIdx.x * kScoreWarps + threadIdx.x / 32; b < blocks;
          b += stride) {
-        const float *k = keys + (size_t)b * dim;
+        const float *k = a.keys + (size_t)b * dim;
         float total = 0.0f;
-        for (int h = 0; h < heads; ++h) {
+        for (int h = 0; h < a.heads; ++h) {
             float dot = 0.0f;
             for (int j = lane; j < dim; j += 32) dot += q[h * dim + j] * k[j];
             dot = warp_sum(dot);
             // fmaxf takes the number over a NaN, as the host's f64::max does.
             total += fmaxf(dot, 0.0f);
         }
-        if (lane == 0) scores[b] = total;
+        if (lane == 0) a.scores[b] = total;
     }
 }
 
@@ -286,9 +295,11 @@ extern "C" int inference_cuda_qsa_score_launch(const inference_cuda_qsa_score_ar
         int grid = (a.cap_blocks + kScoreWarps - 1) / kScoreWarps;
         grid = grid < kMaxScoreBlocks ? grid : kMaxScoreBlocks;
         Failure failure;
-        qsa_score_k<<<grid, kScoreThreads, 0, (cudaStream_t)stream>>>(
-            (const float *)a.queries, (const float *)a.keys, (float *)a.scores,
-            (const int *)a.pos, (int *)a.status, a.heads, a.dim, a.ratio, a.cap_blocks, a.pos0);
+        const ScoreArgs k{(const float *)a.queries, (const float *)a.keys, (float *)a.scores,
+                          (const int *)a.pos,       (int *)a.status,        a.heads,
+                          a.dim,                    a.ratio,                a.cap_blocks,
+                          a.pos0};
+        qsa_score_k<<<grid, kScoreThreads, 0, (cudaStream_t)stream>>>(k);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;

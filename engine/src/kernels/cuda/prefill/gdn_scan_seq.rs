@@ -27,7 +27,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "no caller yet: the chunk driver does not call this kernel; drop the expect when it does"
+        reason = "the Flash-Next form (gdn_scan_seq_form) waits for the Flash-Next CUDA step"
     )
 )]
 
@@ -190,8 +190,9 @@ impl GdnForm {
 }
 
 /// Geometry of one scan call: `m` tokens at position `p0` of `ctx_tokens`, `n_k_heads` key
-/// heads shared by `n_v_heads` value heads of `head_dim` (as [`GdnKeyHeads`] says), the conv row length `conv_ld`, and
-/// the projection row length `ld` with its `z`/`beta`/`alpha` float offsets.
+/// heads shared by `n_v_heads` value heads of `head_dim` (as [`GdnKeyHeads`] says), the conv
+/// row length `conv_ld`, and the projection row length `ld` with its `z`/`beta`/`alpha` float
+/// offsets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScanShape {
     pub(crate) m: usize,

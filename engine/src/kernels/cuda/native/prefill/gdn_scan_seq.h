@@ -50,10 +50,12 @@
  * an assertion inside a kernel); n_k_heads 1..64, n_v_heads
  * 1..128 and a multiple of n_k_heads; ld >= max(z_off + n_v*128, beta_off + n_v, alpha_off
  * + n_v) and <= 2^22, offsets >= 0; ctx_tokens 1..2^30 - 1 with p0 + m <= ctx_tokens (the
- * sum in 64 bits); eps exactly the f32 1e-6; form only the bits below. Every range 4-byte aligned (no float4 loads
- * here); status NULL or 4-byte aligned. state and o_out must overlap no other range, and
- * the status word, when given, must overlap no range either. Enqueues two kernels on stream
- * (not NULL); never synchronizes; no device word is read.
+ * sum in 64 bits); eps exactly the f32 1e-6, used both for the q/k L2 norms and for the
+ * gated RMSNorm (Qwen3.6 and Flash-Next both configure rms_norm_eps = 1e-6; a model with
+ * another value needs a second eps field); form only the bits below. Every range 4-byte
+ * aligned (no float4 loads here); status NULL or 4-byte aligned. state and o_out must overlap
+ * no other range, and the status word, when given, must overlap no range either. Enqueues
+ * two kernels on stream (not NULL); never synchronizes; no device word is read.
  */
 #ifndef INFERENCE_CUDA_PREFILL_GDN_SCAN_SEQ_H
 #define INFERENCE_CUDA_PREFILL_GDN_SCAN_SEQ_H

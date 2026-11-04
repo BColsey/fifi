@@ -17,10 +17,11 @@
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};
-use std::ptr;
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
-use crate::kernels::cuda::native::resident::qsa_index::{QSA_MAX_CAP_BLOCKS, QSA_MAX_RATIO};
+use crate::kernels::cuda::native::resident::qsa_index::{
+    QSA_MAX_CAP_BLOCKS, QSA_MAX_RATIO, all_apart, fits, optional,
+};
 
 const WORD: usize = 4;
 
@@ -79,16 +80,6 @@ pub(in crate::kernels::cuda) struct QsaSelectRaw<'a> {
     pub(in crate::kernels::cuda) status: Option<RawRange<'a>>,
 }
 
-fn fits(range: &RawRange<'_>, need: usize) -> bool {
-    range.bytes() >= need && range.offset().is_multiple_of(WORD)
-}
-
-fn optional(range: &Option<RawRange<'_>>) -> *mut c_void {
-    range
-        .as_ref()
-        .map_or(ptr::null_mut(), |range| range.address())
-}
-
 fn check_select(call: &QsaSelectRaw<'_>) -> bool {
     let dims = call.dims;
     if !dims.inside() {
@@ -104,11 +95,7 @@ fn check_select(call: &QsaSelectRaw<'_>) -> bool {
     written.extend(call.status.as_ref().map(|range| Span::of(range, WORD)));
     let mut read = vec![Span::of(&call.scores, scores)];
     read.extend(call.pos.as_ref().map(|range| Span::of(range, WORD)));
-    let apart = written.iter().enumerate().all(|(index, out)| {
-        read.iter().all(|input| out.apart(input))
-            && written[index + 1..].iter().all(|other| out.apart(other))
-    });
-    sized && apart
+    sized && all_apart(&written, &read)
 }
 
 /// Queues the selection kernel on `stream`: the indices of the best blocks at the position, in

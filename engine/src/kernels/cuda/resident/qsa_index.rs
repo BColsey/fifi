@@ -162,7 +162,9 @@ fn admit(
 }
 
 /// The device word of `position`, required 4 bytes at a 4-byte offset.
-fn word<'p, 'b>(position: &'p QsaPosition<'b>) -> Result<Option<&'p DeviceRange<'b>>, EngError> {
+pub(super) fn position_word<'p, 'b>(
+    position: &'p QsaPosition<'b>,
+) -> Result<Option<&'p DeviceRange<'b>>, EngError> {
     match position {
         QsaPosition::Host(_) => Ok(None),
         QsaPosition::Device { word, .. } => {
@@ -172,7 +174,8 @@ fn word<'p, 'b>(position: &'p QsaPosition<'b>) -> Result<Option<&'p DeviceRange<
     }
 }
 
-fn require_all_apart(written: &[Claim<'_>], read: &[Claim<'_>]) -> Result<(), EngError> {
+/// Every written claim apart from the other written claims and from every read claim.
+pub(super) fn require_all_apart(written: &[Claim<'_>], read: &[Claim<'_>]) -> Result<(), EngError> {
     for (index, out) in written.iter().enumerate() {
         for input in read {
             require_apart(out, input)?;
@@ -261,7 +264,7 @@ impl CudaContext {
             ))
         })?;
         let pos0 = admit(indexer, &call.position, call.m)?;
-        let pos = word(&call.position)?;
+        let pos = position_word(&call.position)?;
         require_fit("proj", &call.proj, need.proj, 4)?;
         require_fit("q_norm", &call.q_norm, need.norm, 4)?;
         require_fit("k_norm", &call.k_norm, need.norm, 4)?;
@@ -308,7 +311,7 @@ impl CudaContext {
         let indexer = call.indexer;
         check_dims(indexer)?;
         let pos0 = admit(indexer, &call.position, 1)?;
-        let pos = word(&call.position)?;
+        let pos = position_word(&call.position)?;
         let dims = indexer.dims();
         let (queries, keys, scores) = (
             dims.heads * dims.dim * 4,
@@ -359,7 +362,7 @@ impl CudaContext {
             )));
         }
         let pos0 = admit(indexer, &call.position, 1)?;
-        let pos = word(&call.position)?;
+        let pos = position_word(&call.position)?;
         let (scores, blocks) = (dims.cap_blocks * 4, dims.budget_blocks * 4);
         require_fit("scores", &call.scores, scores, 4)?;
         require_fit("blocks", &call.blocks, blocks, 4)?;

@@ -493,3 +493,62 @@ fn qsa_select_matches_the_host_ranking_at_256k_tokens() -> Result<(), EngError> 
     }
     Ok(())
 }
+
+/// The selection over the largest cache, 2^24 blocks at the last position. The scores take 2^20
+/// values, so about 16 blocks share each and the threshold is tied; the host ranking is a
+/// partial sort by (score descending, block ascending).
+#[test]
+fn qsa_select_ranks_a_cache_of_2_pow_24_blocks() -> Result<(), EngError> {
+    if !device_present("qsa_select_ranks_a_cache_of_2_pow_24_blocks") {
+        return Ok(());
+    }
+    const BLOCKS: usize = 1 << 24;
+    const BUDGET: usize = 512;
+    let indexer = QsaIndexer {
+        cap_blocks: BLOCKS,
+        ..indexer()
+    };
+    let mut state = 0x0bad_5eed_u64;
+    let scores_host: Vec<f32> = (0..BLOCKS)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 44) as f32 / 1024.0
+        })
+        .collect();
+    let bytes: Vec<u8> = scores_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut order: Vec<i32> = (0..i32::try_from(BLOCKS).expect("blocks")).collect();
+    let rank = |a: &i32, b: &i32| {
+        let score = |i: i32| scores_host[usize::try_from(i).expect("block")];
+        score(*b).total_cmp(&score(*a)).then(a.cmp(b))
+    };
+    order.select_nth_unstable_by(BUDGET - 1, rank);
+    let mut expected = order[..BUDGET].to_vec();
+    expected.sort_unstable();
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let scores = ctx.upload(&bytes)?;
+    let chosen = ctx.upload(&vec![SENT; BUDGET * 4])?;
+    ctx.qsa_select(
+        &stream,
+        QsaSelectCall {
+            indexer,
+            budget_blocks: BUDGET,
+            position: QsaPosition::Host(BLOCKS * RATIO - 1),
+            scores: scores.range(0, BLOCKS * 4)?,
+            blocks: chosen.range(0, BUDGET * 4)?,
+            status: None,
+        },
+    )?;
+    stream.synchronize()?;
+    let mut out = vec![0u8; BUDGET * 4];
+    ctx.download(&chosen, &mut out)?;
+    let (words, _) = out.as_chunks::<4>();
+    let got: Vec<i32> = words.iter().map(|w| i32::from_le_bytes(*w)).collect();
+    assert_eq!(
+        got, expected,
+        "the selection over 2^24 blocks differs from the host ranking"
+    );
+    Ok(())
+}

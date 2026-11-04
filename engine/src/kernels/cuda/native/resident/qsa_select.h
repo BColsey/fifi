@@ -4,8 +4,11 @@
  *
  * For the token at position p, with blocks = (p + 1) / ratio completed blocks and
  * take = min(blocks, budget_blocks), the selection is the `take` blocks with the largest scores
- * (qsa_score's output), a tie going to the lower block, as the host's ranking does. The entry
- * writes their indices to blocks[0 .. take) in ascending block order; the attention reads the
+ * (qsa_score's output), a tie of equal f32 scores going to the lower block, as the host's
+ * ranking does. The host ranks f64 sums of the same dots, so two blocks whose scores differ by a
+ * few f32 ulps at the budget boundary may rank the other way: a test can demand the host's
+ * selection only on data without such near ties. The entry writes the chosen indices to
+ * blocks[0 .. take) in ascending block order; the attention reads the
  * positions of those blocks and then the open tail, positions blocks * ratio .. p, and derives
  * `take` from the position itself. A score is compared by its f32 value; a negative or NaN score
  * (qsa_score writes neither) counts as +0.

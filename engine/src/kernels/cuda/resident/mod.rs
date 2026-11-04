@@ -100,6 +100,7 @@ pub(crate) mod matvec_expert;
 pub(crate) mod matvec_q;
 pub(crate) mod moe_combine;
 pub(crate) mod paged_position;
+pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;
 pub(crate) mod rope_gemma;

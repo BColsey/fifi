@@ -84,7 +84,7 @@ fn the_form_bits_are_the_header_bits() {
 /// test 3), and against the reference with each single rule flipped (more than E3 off), so a
 /// form whose launch reached the wrong instance, or a rule that does nothing, fails. The data
 /// gives every rule a visible effect: 4 key heads over 12 value heads (the tiled and grouped
-/// maps differ for every value head but 0 and 11... and 4 and 7), z ~ N(0, 3^2) (silu and
+/// maps h % 4 and h / 3 agree only at value heads 0, 5, 6 and 11), z ~ N(0, 3^2) (silu and
 /// sigmoid differ in sign and size), and key head 1's k row is `[1e-5, 0, ...]` on every step
 /// (sum 1e-10: the ggml form normalizes it to 1, the add-eps form to about 0.01, test 8's row).
 #[test]

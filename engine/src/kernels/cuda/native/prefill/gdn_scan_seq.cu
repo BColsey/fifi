@@ -489,8 +489,9 @@ Failure launch_gate(const ScanArgs &k, int form, void *stream) {
 
 template <bool kGrouped>
 Failure launch_l2(const ScanArgs &k, int form, void *stream) {
-    return (form & INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2) ? launch_gate<kGrouped, true>(k, form, stream)
-                                                       : launch_gate<kGrouped, false>(k, form, stream);
+    return (form & INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2)
+               ? launch_gate<kGrouped, true>(k, form, stream)
+               : launch_gate<kGrouped, false>(k, form, stream);
 }
 
 /* The instance of `form` (bits already validated). */

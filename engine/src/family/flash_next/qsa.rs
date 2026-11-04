@@ -242,39 +242,67 @@ fn attend<P: Projector>(
     ip: &[f32],
 ) -> Result<Vec<f32>, EngError> {
     let dims = shape.dims;
-    let heads_q = dims.heads_q as usize;
-    let heads_kv = dims.heads_kv as usize;
-    let head_dim = dims.head_dim as usize;
     let hidden = dims.hidden as usize;
-    let rd = dims.rotary_dim as usize;
-    let eps = dims.eps;
-    let theta = dims.theta;
 
     let queries = indexer_queries(dims, ip, weights.idx_q_norm, pos)?;
     let score = block_scores(dims, &queries, &cache.ik, weights.idx_k_norm, pos)?;
     let selected = select_positions(dims, &score, pos)?;
 
+    let heads = attend_selected(
+        dims,
+        qp,
+        weights.q_norm,
+        (&cache.k, &cache.v),
+        &selected,
+        pos,
+    )?;
+
+    let out = projector.linear(weights.o, &heads)?;
+    expect_len(&out, hidden, "qsa output projection")?;
+    Ok(out)
+}
+
+/// The gated attention of the token at `pos` over the cache positions `selected`, in that order:
+/// per query head, rms0 with the query norm and rope at `pos` of its slice of the query and gate
+/// projection `qp` (`[heads_q][q head_dim | gate head_dim]`), softmax over `q . k / sqrt(head_dim)`
+/// against the keys of its kv head (`h / (heads_q / heads_kv)`), the weighted sum of the values,
+/// times `sigmoid(gate)`. `kv` holds the keys and values `[position][heads_kv][head_dim]`.
+/// Returns `[heads_q][head_dim]`, the input of the output projection.
+pub(super) fn attend_selected(
+    dims: QsaDims,
+    qp: &[f32],
+    q_norm: &[f32],
+    kv: (&[f32], &[f32]),
+    selected: &[usize],
+    pos: u32,
+) -> Result<Vec<f32>, EngError> {
+    let (keys, values) = kv;
+    let heads_q = dims.heads_q as usize;
+    let heads_kv = dims.heads_kv as usize;
+    let head_dim = dims.head_dim as usize;
     let rep = heads_q / heads_kv;
     let scale = (head_dim as f32).sqrt();
-    let mut heads = Vec::with_capacity(shape.q_width);
+    let mut heads = Vec::with_capacity(heads_q * head_dim);
     for h in 0..heads_q {
-        let qraw = &qp[h * 2 * head_dim..(h + 1) * 2 * head_dim];
-        let mut qh = rms0(&qraw[..head_dim], weights.q_norm, eps)?;
-        rope_half(&mut qh, rd, pos, theta)?;
+        let qraw = qp
+            .get(h * 2 * head_dim..(h + 1) * 2 * head_dim)
+            .ok_or_else(|| EngError::BadRequest("qsa query projection is short".to_owned()))?;
+        let mut qh = rms0(&qraw[..head_dim], q_norm, dims.eps)?;
+        rope_half(&mut qh, dims.rotary_dim as usize, pos, dims.theta)?;
         let g = h / rep;
         let mut scores = Vec::with_capacity(selected.len());
-        for &j in &selected {
-            let key = &cache.k[(j * heads_kv + g) * head_dim..(j * heads_kv + g + 1) * head_dim];
-            scores.push(dot(&qh, key)? / scale);
+        for &j in selected {
+            scores.push(dot(&qh, kv_row(keys, (j * heads_kv + g) * head_dim, head_dim)?)? / scale);
         }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let mut oh = vec![0.0f32; head_dim];
-        for (&e, &j) in exps.iter().zip(&selected) {
+        for (&e, &j) in exps.iter().zip(selected) {
             let w = e / sum;
-            for (i, o) in oh.iter_mut().enumerate() {
-                *o += w * cache.v[(j * heads_kv + g) * head_dim + i];
+            let value = kv_row(values, (j * heads_kv + g) * head_dim, head_dim)?;
+            for (o, v) in oh.iter_mut().zip(value) {
+                *o += w * v;
             }
         }
         for (i, o) in oh.iter_mut().enumerate() {
@@ -282,10 +310,14 @@ fn attend<P: Projector>(
         }
         heads.extend_from_slice(&oh);
     }
+    Ok(heads)
+}
 
-    let out = projector.linear(weights.o, &heads)?;
-    expect_len(&out, hidden, "qsa output projection")?;
-    Ok(out)
+/// The `len` cached values from `at` on, refused when the cache is shorter.
+fn kv_row(cache: &[f32], at: usize, len: usize) -> Result<&[f32], EngError> {
+    cache
+        .get(at..at + len)
+        .ok_or_else(|| EngError::BadRequest(format!("qsa cache holds no row at {at}")))
 }
 
 /// The indexer queries of the token at `pos`, one per indexer head: rms0 of the head's slice of
@@ -309,21 +341,18 @@ pub(super) fn indexer_queries(
     Ok(queries)
 }
 
-/// The indexer key of block `b`: its `ratio` raw indexer keys of `ik` (`[position][idx_dim]`),
-/// each divided by `ratio` and summed in position order, then rms0 with the indexer key norm and
-/// rope at the block's first position.
+/// The indexer key of block `b` from its `ratio` raw indexer keys `raw` (`[r][idx_dim]`, the
+/// block's positions in order): each divided by `ratio` and summed in position order, then rms0
+/// with the indexer key norm and rope at the block's first position.
 pub(super) fn block_key(
     dims: QsaDims,
-    ik: &[f32],
+    raw: &[f32],
     b: usize,
     k_norm: &[f32],
 ) -> Result<Vec<f32>, EngError> {
     let ratio = dims.ratio as usize;
     let idx_dim = dims.idx_dim as usize;
-    let first = b * ratio;
-    let raw = ik
-        .get(first * idx_dim..(first + ratio) * idx_dim)
-        .ok_or_else(|| EngError::BadRequest(format!("qsa block {b} is not complete")))?;
+    expect_len(raw, ratio * idx_dim, "qsa block raw keys")?;
     let mut pool = vec![0.0f32; idx_dim];
     for r in 0..ratio {
         for (i, p) in pool.iter_mut().enumerate() {
@@ -331,6 +360,7 @@ pub(super) fn block_key(
         }
     }
     let mut pk = rms0(&pool, k_norm, dims.eps)?;
+    let first = b * ratio;
     let block_pos = u32::try_from(first)
         .map_err(|_| EngError::BadRequest(format!("qsa block position {first} exceeds u32")))?;
     rope_half(&mut pk, dims.rotary_dim as usize, block_pos, dims.theta)?;
@@ -349,7 +379,11 @@ pub(super) fn block_scores(
     let blocks = (pos as usize + 1) / dims.ratio as usize;
     let mut score = Vec::with_capacity(blocks);
     for b in 0..blocks {
-        let pk = block_key(dims, ik, b, k_norm)?;
+        let width = dims.ratio as usize * dims.idx_dim as usize;
+        let raw = ik
+            .get(b * width..(b + 1) * width)
+            .ok_or_else(|| EngError::BadRequest(format!("qsa block {b} is not complete")))?;
+        let pk = block_key(dims, raw, b, k_norm)?;
         let mut total = 0.0f64;
         for qi in queries {
             total += f64::from(dot(qi, &pk)?).max(0.0);
@@ -764,5 +798,7 @@ mod tests {
     }
 }
 
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod cuda_attn_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod cuda_tests;

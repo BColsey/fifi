@@ -222,7 +222,8 @@ pub(in crate::kernels::cuda) struct QsaScoreRaw<'a> {
     pub(in crate::kernels::cuda) status: Option<RawRange<'a>>,
 }
 
-fn fits(range: &RawRange<'_>, need: usize) -> bool {
+/// `range` holds `need` bytes and starts 4-byte aligned.
+pub(super) fn fits(range: &RawRange<'_>, need: usize) -> bool {
     range.bytes() >= need && range.offset().is_multiple_of(FLOAT)
 }
 
@@ -230,7 +231,8 @@ fn word_fits(range: &Option<RawRange<'_>>) -> bool {
     range.as_ref().is_none_or(|range| fits(range, FLOAT))
 }
 
-fn optional(range: &Option<RawRange<'_>>) -> *mut c_void {
+/// The address of an optional range, or null.
+pub(super) fn optional(range: &Option<RawRange<'_>>) -> *mut c_void {
     range
         .as_ref()
         .map_or(ptr::null_mut(), |range| range.address())
@@ -238,7 +240,7 @@ fn optional(range: &Option<RawRange<'_>>) -> *mut c_void {
 
 /// Every written span is apart from the other written spans and from every read span; read
 /// spans may share bytes.
-fn all_apart(written: &[Span<'_>], read: &[Span<'_>]) -> bool {
+pub(super) fn all_apart(written: &[Span<'_>], read: &[Span<'_>]) -> bool {
     written.iter().enumerate().all(|(index, out)| {
         read.iter().all(|input| out.apart(input))
             && written[index + 1..].iter().all(|other| out.apart(other))
