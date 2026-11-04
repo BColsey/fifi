@@ -511,7 +511,7 @@ mod macos {
             let error = super::super::require_local(&path, "model weights").unwrap_err();
             eprintln!("refusal: {}", error.describe());
             assert!(
-                error.describe().contains("local storage"),
+                error.describe().contains("must be on local storage"),
                 "{}",
                 error.describe()
             );
@@ -1052,7 +1052,7 @@ mod live_tests {
         };
         let error = require_local(&path, "model weights").unwrap_err();
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

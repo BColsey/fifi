@@ -593,6 +593,36 @@ mod tests {
         assert!(error.0.contains("not a directory"), "{}", error.0);
     }
 
+    // Fails if `serve --model` can reach the weights of a network-mounted
+    // directory: discovery and the preflight both go through the inspection,
+    // which refuses before it lists the directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_model_directory_on_a_network_mount_is_refused_at_discovery() {
+        let dir = model_dir(Some("qwen3_5_moe"), true, false);
+        let args = args_for(dir.path());
+        let error = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
+            (
+                discover(&args).map(|_| ()).unwrap_err(),
+                super::build_config(&args).map(|_| ()).unwrap_err(),
+            )
+        });
+        assert!(
+            error.0.0.contains("must be on local storage"),
+            "{}",
+            error.0.0
+        );
+        assert!(
+            error.1.0.contains("must be on local storage"),
+            "{}",
+            error.1.0
+        );
+        assert!(
+            discover(&args).is_ok(),
+            "the same directory is fine on a local filesystem"
+        );
+    }
+
     #[test]
     fn the_printed_config_round_trips_through_the_file_path() {
         let dir = model_dir(Some("qwen3_5_moe"), true, false);

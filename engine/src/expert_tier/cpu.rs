@@ -242,7 +242,7 @@ mod tests {
             map_read_only(&link, 4).expect_err("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

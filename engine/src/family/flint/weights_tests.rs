@@ -237,7 +237,7 @@ fn open_refuses_a_root_on_a_network_mount() {
         FlintCheckpoint::open(root.path()).err().expect("refused")
     });
     assert!(
-        refused.describe().contains("local storage"),
+        refused.describe().contains("must be on local storage"),
         "{}",
         refused.describe()
     );
@@ -259,7 +259,7 @@ fn open_refuses_a_shard_linked_into_a_network_mount() {
         FlintCheckpoint::open(root.path()).err().expect("refused")
     });
     assert!(
-        refused.describe().contains("local storage"),
+        refused.describe().contains("must be on local storage"),
         "{}",
         refused.describe()
     );

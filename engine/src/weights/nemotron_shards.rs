@@ -339,7 +339,7 @@ mod tests {
             NemotronShardReader::open(&link).expect_err("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

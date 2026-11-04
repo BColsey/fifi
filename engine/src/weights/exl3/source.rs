@@ -108,7 +108,7 @@ mod tests {
             Checkpoint::open(dir.path()).err().expect("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );
@@ -127,7 +127,7 @@ mod tests {
         };
         let error = Checkpoint::open(&path).err().expect("refused");
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );
@@ -147,7 +147,7 @@ mod tests {
             Checkpoint::open(dir.path()).err().expect("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

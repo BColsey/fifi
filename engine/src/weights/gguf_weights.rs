@@ -254,7 +254,7 @@ mod tests {
         };
         let error = GgufWeights::open(&path, LIMITS, None).expect_err("refused");
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );
@@ -271,7 +271,7 @@ mod tests {
             GgufWeights::open(&path, LIMITS, None).expect_err("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

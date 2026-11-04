@@ -216,7 +216,7 @@ mod tests {
         };
         let error = inspect(&path, &path).expect_err("refused");
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );
@@ -232,7 +232,7 @@ mod tests {
             inspect(&dir, &dir).expect_err("refused")
         });
         assert!(
-            error.describe().contains("local storage"),
+            error.describe().contains("must be on local storage"),
             "{}",
             error.describe()
         );

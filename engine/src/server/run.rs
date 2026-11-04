@@ -896,7 +896,7 @@ mod tests {
         let error = start_engines(&file_with(vec![config], false))
             .err()
             .expect("refused");
-        assert!(error.0.contains("local storage"), "{}", error.0);
+        assert!(error.0.contains("must be on local storage"), "{}", error.0);
     }
 
     // Fails if `start_engines` stops guarding the model directory: the fake
@@ -916,7 +916,7 @@ mod tests {
             "{}",
             error.0
         );
-        assert!(error.0.contains("local storage"), "{}", error.0);
+        assert!(error.0.contains("must be on local storage"), "{}", error.0);
     }
 
     #[test]
