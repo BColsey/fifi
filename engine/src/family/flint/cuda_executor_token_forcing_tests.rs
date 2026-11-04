@@ -40,6 +40,7 @@
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
 //! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated; empty for none | `serve` |
 //! | `TF_COMPARISON` | the directory of an earlier run whose `reference.json` and `baseline.json` this run reuses | unset |
+//! | `TF_COMPARISON_SHA256` | `<reference>,<baseline>`: the digests those files must have, as the earlier run printed them | unset |
 //! | `TF_AUDIT_CAP` | the most events audited per execution, `fault` excepted | 200, SpecPilot's count |
 //! | `TF_WRITE_GENERATIONS` | write this build's serving generations to this new file and stop | unset |
 //!
@@ -60,7 +61,10 @@
 //! `TF_COMPARISON`, a later run of the same test binary judges its candidates against the
 //! files of an earlier one, so a qualification splits into leases of under an hour: the
 //! comparison alone (`TF_CANDIDATE=`), then `fault`, then `serve`. The scorer of the later run
-//! must equal the one recorded in the files, executable digest included.
+//! must equal the one recorded in the files, executable digest included. Every run prints a
+//! `TOKEN_FORCING comparison` line with the files' digests, the calibration and the baseline's
+//! counts; a later run given those digests in `TF_COMPARISON_SHA256` refuses other files, which
+//! ties the leases of one qualification together.
 
 use super::super::{factory, park_identity::pack_fingerprint};
 use super::*;
@@ -121,6 +125,7 @@ struct Plan {
     audit_cap: usize,
     write_generations: Option<PathBuf>,
     comparison: Option<PathBuf>,
+    comparison_sha256: Option<String>,
 }
 
 impl Plan {
@@ -160,6 +165,7 @@ impl Plan {
             audit_cap: number("TF_AUDIT_CAP", 200),
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
             comparison: std::env::var_os("TF_COMPARISON").map(Into::into),
+            comparison_sha256: std::env::var("TF_COMPARISON_SHA256").ok(),
             root,
         }
     }
@@ -238,10 +244,11 @@ fn executable_sha256() -> String {
 }
 
 /// Requests cut from the committed corpus, `prompt_tokens` each, one generated span apart.
+/// The gate refuses a repeated prompt; checking here stops the run before any generation.
 fn prompts(plan: &Plan, bundle: &TokenizerBundle) -> Vec<(String, Vec<u32>)> {
     let ids = super::tf_gate_tests::corpus_ids(bundle.tokenizer());
     let stride = plan.prompt_tokens + plan.tokens;
-    (0..plan.prompts)
+    let prompts: Vec<(String, Vec<u32>)> = (0..plan.prompts)
         .map(|index| {
             let start = index * stride;
             let prompt = ids
@@ -249,7 +256,13 @@ fn prompts(plan: &Plan, bundle: &TokenizerBundle) -> Vec<(String, Vec<u32>)> {
                 .unwrap_or_else(|| panic!("the corpus has no prompt {index} at id {start}"));
             (format!("corpus-{start}"), prompt.to_vec())
         })
-        .collect()
+        .collect();
+    let distinct: std::collections::BTreeSet<_> = prompts
+        .iter()
+        .map(|(_, prompt)| ids_sha256(prompt))
+        .collect();
+    assert_eq!(distinct.len(), prompts.len(), "the corpus repeats a prompt");
+    prompts
 }
 
 fn generate_with(
@@ -448,6 +461,42 @@ fn loaded_comparison(
     (comparison, [reference_sha256, baseline_sha256], engine)
 }
 
+/// The comparison as one line: the digests that tie later leases to these files, the
+/// calibration, and the baseline counts that the rules compare every candidate with.
+fn comparison_line(comparison: &Comparison, [reference, baseline]: &[String; 2]) -> String {
+    let records = || comparison.baseline.requests.iter().flat_map(|r| &r.records);
+    let tokens = records().count();
+    let mismatches = records().filter(|record| !record.matched()).count();
+    let reference_mismatches = comparison
+        .reference
+        .requests
+        .iter()
+        .flat_map(|request| &request.records)
+        .filter(|record| !record.matched())
+        .count();
+    let mut events = 0;
+    let mut unaudited = 0;
+    for request in &comparison.baseline.requests {
+        for record in &request.records {
+            if record.margin() > comparison.threshold() {
+                events += 1;
+                let audited = request.audits.iter().any(|a| a.position == record.position);
+                unaudited += usize::from(!audited);
+            }
+        }
+    }
+    let calibration = &comparison.calibration;
+    format!(
+        "TOKEN_FORCING comparison reference_sha256={reference} baseline_sha256={baseline} \
+         delta={} largest_margin={} departures={} reference_mismatches={reference_mismatches} \
+         baseline_mismatches={mismatches}/{tokens} baseline_events={events} \
+         baseline_unaudited={unaudited}",
+        calibration.delta,
+        calibration.largest_margin,
+        calibration.departures.len()
+    )
+}
+
 /// Generates one candidate's outputs: its file name, identity, generations and audit cap.
 fn candidate_outputs(
     setup: &Setup<'_>,
@@ -527,11 +576,28 @@ fn token_forcing_qualification() {
             audit_cap: plan.audit_cap,
         },
     };
-    let (comparison, [reference_sha256, baseline_sha256], (mut engine, mut session)) =
-        match &plan.comparison {
-            Some(directory) => loaded_comparison(&setup, directory),
-            None => fresh_comparison(&setup),
-        };
+    let (comparison, digests, (mut engine, mut session)) = match &plan.comparison {
+        Some(directory) => loaded_comparison(&setup, directory),
+        None => {
+            assert!(
+                plan.comparison_sha256.is_none(),
+                "TF_COMPARISON_SHA256 names the files of TF_COMPARISON, which is unset"
+            );
+            fresh_comparison(&setup)
+        }
+    };
+    println!("{}", comparison_line(&comparison, &digests));
+    if let Some(expected) = &plan.comparison_sha256 {
+        assert_eq!(
+            *expected,
+            digests.join(","),
+            "the comparison files are not the ones TF_COMPARISON_SHA256 names"
+        );
+    }
+    if plan.candidates.is_empty() {
+        println!("TOKEN_FORCING candidates=none");
+    }
+    let [reference_sha256, baseline_sha256] = digests;
     for (index, kind) in plan.candidates.iter().enumerate() {
         let (name, identity, generations, audit_cap) =
             candidate_outputs(&setup, (&mut engine, &mut session), (index, kind));

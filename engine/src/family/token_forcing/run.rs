@@ -2,8 +2,8 @@
 //! candidate judged against them, and the offline verdict from the files a run wrote.
 
 use super::gate::{
-    AuditPlan, ExecutionIdentity, GateConfig, Generation, Report, ScoredSystem, audit_system,
-    calibrate, evaluate, score_system,
+    AuditPlan, Calibration, ExecutionIdentity, GateConfig, Generation, Report, ScoredSystem,
+    audit_system, calibrate, evaluate, score_system,
 };
 use super::score::ForcedModel;
 use crate::EngError;
@@ -58,8 +58,7 @@ pub(crate) struct Comparison {
     pub(crate) baseline: ScoredSystem,
     config: GateConfig,
     vocab: usize,
-    /// Twice the calibrated delta: the margin above which a mismatch is audited.
-    threshold: f64,
+    pub(crate) calibration: Calibration,
 }
 
 /// One candidate's report and its scored file.
@@ -121,14 +120,19 @@ impl Comparison {
                 reference.scorer.label, reference.scorer.profile, scorer.label, scorer.profile
             )));
         }
-        let threshold = 2.0 * calibrate(&reference, &baseline)?.delta;
+        let calibration = calibrate(&reference, &baseline)?;
         Ok(Self {
             reference,
             baseline,
             config: settings.config,
             vocab: settings.vocab,
-            threshold,
+            calibration,
         })
+    }
+
+    /// Twice the calibrated delta: the margin above which a mismatch is an event and audited.
+    pub(crate) fn threshold(&self) -> f64 {
+        2.0 * self.calibration.delta
     }
 
     /// Scores and audits one candidate and evaluates the gate.
@@ -141,7 +145,7 @@ impl Comparison {
             self.vocab,
         )?;
         let plan = AuditPlan {
-            threshold: self.threshold,
+            threshold: self.threshold(),
             vocab: self.vocab,
             cap: candidate.audit_cap,
         };

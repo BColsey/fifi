@@ -925,6 +925,17 @@ fn a_departure_hidden_by_unequal_lengths_is_refused() {
         format!("{error:?}").contains("cannot see where they depart"),
         "{error:?}"
     );
+    // The other way round: the reference is the longer one.
+    let (mut reference, mut baseline, candidate) = synthetic();
+    baseline.requests[0].records[1] = record(1, 1, 1, -0.5, -0.5);
+    reference.requests[0]
+        .records
+        .push(record(4, 1, 1, -0.5, -0.5));
+    let error = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("the reference scored 5 tokens and the baseline 4"),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -1002,4 +1013,45 @@ fn an_audit_records_each_re_execution_in_its_own_place() {
         })
     );
     assert!(audit.explains(plan.threshold));
+}
+
+#[test]
+fn explained_events_stay_out_of_the_event_rule() {
+    // 10,000 tokens a system, a baseline departure at 1/16 nat (delta 0.125), and six 3-nat
+    // candidate events: few enough to stay under the rate limit, enough for the event rule
+    // (p = 1/64 against none).
+    let matched = |position| record(position, 1, 1, -0.5, -0.5);
+    let reference = scored("reference", (0..10_000).map(matched).collect());
+    let mut records: Vec<_> = (0..10_000).map(matched).collect();
+    records[1] = record(1, 2, 1, -0.5625, -0.5);
+    let baseline = scored("baseline", records);
+    let events = [100, 200, 300, 400, 500, 600];
+    let candidate = |reread_margin: f64| {
+        let mut records: Vec<_> = (0..10_000).map(matched).collect();
+        for &position in &events {
+            records[position] = record(position, 5, 1, -3.5, -0.5);
+        }
+        let mut candidate = scored("candidate", records);
+        candidate.requests[0].audits = events
+            .iter()
+            .map(|&position| Audit {
+                position,
+                prefill: Reread {
+                    argmax: if reread_margin == 0.0 { 5 } else { 1 },
+                    margin: reread_margin,
+                },
+                baseline: None,
+            })
+            .collect();
+        candidate
+    };
+    let explained = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate(0.0)).unwrap();
+    assert_eq!(explained.candidate.explained_events, 6);
+    assert_eq!(explained.event_rule.candidate_unexplained, 0);
+    assert!(!explained.rate_rule.reject);
+    assert_eq!(explained.verdict, Verdict::Pass);
+    let unexplained = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate(3.0)).unwrap();
+    assert_eq!(unexplained.event_rule.candidate_unexplained, 6);
+    assert!(unexplained.event_rule.reject && !unexplained.rate_rule.reject);
+    assert!(matches!(unexplained.verdict, Verdict::Reject { .. }));
 }

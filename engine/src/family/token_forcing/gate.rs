@@ -260,7 +260,9 @@ pub(crate) struct Calibration {
 ///
 /// The reference runs the scorer's own numeric path, so it must match the scorer at every
 /// token. A reference mismatch means that generation and scoring did not run one deterministic
-/// path, and then no margin measures reduction order alone.
+/// path, and then no margin measures reduction order alone. A request whose two executions
+/// agree token for token but differ in length is refused too: where one stopped and the other
+/// went on is a departure that the records cannot measure.
 pub(crate) fn calibrate(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<Calibration> {
     validate(reference)?;
     validate(baseline)?;
