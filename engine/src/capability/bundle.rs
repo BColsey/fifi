@@ -134,7 +134,7 @@ pub(crate) fn build(inputs: &BundleInputs) -> Value {
         "hardware": hardware,
         "engines": engines,
         // Stages exist only while an engine is loading inside a live
-        // server (P1-3); this bundle is offline by design.
+        // server; this bundle is offline by design.
         "startup_stages": {
             "unavailable": "offline bundle: loading stages exist only in a running server"
         },

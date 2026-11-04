@@ -1,0 +1,648 @@
+{
+ "schema_version": 1,
+ "version": 1,
+ "description": "Authoritative public-vocabulary policy shared by the publisher sanitizer and the published_text gate. Every entry is classified; additions require a classification receipt.",
+ "allowed_tags": [
+  {
+   "tag": "AB-RESULT",
+   "class": "artifact-name",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "CAPACITY-RECEIPT",
+   "class": "artifact-name",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "DUMP-REPORT",
+   "class": "artifact-name",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "SWIGLU-REPORT",
+   "class": "artifact-name",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "A-00000001",
+   "class": "data-hex",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "A-0000003f",
+   "class": "data-hex",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "A-00000040",
+   "class": "data-hex",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "A-0000007f",
+   "class": "data-hex",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "A-00800000",
+   "class": "data-hex",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "ISO-8859-1",
+   "class": "encoding",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "UTF-16",
+   "class": "encoding",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "UTF-32",
+   "class": "encoding",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "UTF-8",
+   "class": "encoding",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "GSQ-RCO",
+   "class": "fixture-filename",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "FNV-1a",
+   "class": "hash",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "SHA-1",
+   "class": "hash",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "SHA-256",
+   "class": "hash",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "SHA-512",
+   "class": "hash",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "B-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "C-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "E-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "L-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "L-2",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "L-3",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "N-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "R-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "S-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "W-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "AIR-LLD",
+   "class": "library",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "AGPL-3",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "Apache-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BSD-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BSD-3",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BSD-4",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "EPL-1",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "EPL-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "GPL-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "GPL-3",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "LGPL-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "LGPL-3",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "LICENSE-2",
+   "class": "license",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "LICENSE-APACHE",
+   "class": "license",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "LICENSE-MIT",
+   "class": "license",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "MPL-1",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "MPL-2",
+   "class": "license",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "NON-INFRINGEMENT",
+   "class": "license",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "A3B-GGUF",
+   "class": "model",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "EXL3-4",
+   "class": "model",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "GGUF-BF16",
+   "class": "model",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "GGUF-v3",
+   "class": "model",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "GPT-2",
+   "class": "model",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "MLX-LM",
+   "class": "model",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "VL-120B-A12B-NVFP4",
+   "class": "model",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BF16-REPRESENTABLE",
+   "class": "numerics",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "BF16-ROUNDED",
+   "class": "numerics",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "CPU-FP64",
+   "class": "numerics",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "Z0-9",
+   "class": "regex-class",
+   "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "AVX-512",
+   "class": "standard",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "AVX2",
+   "class": "standard",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "IEEE-754",
+   "class": "standard",
+   "origin": "legacy legacy-published-text"
+  },
+  {
+   "tag": "ALL-SYSTEM",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "ARM-RECEIPTS-OK",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "ARM-REFUSED",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "AUTO-INSERTS",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BIT-EXACT",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "BIT-IDENTICAL",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "BYTE-EXACT",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "C-ABI",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "CONTENT-CONDITIONAL",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "CROSS-ROUTE",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "DEFAULT-ARMED",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "DERIVED-TIP",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "END-STATE",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "FIXTURE-LEGS-OK",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "FULL-SIZE",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "FUSED-WALK",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "HOST-RAM",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "HOST-ROUTED",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "LARGE-BATCH",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "MEAN-SQUARE",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "MEMSET-TRIM",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "NEAR-HOT",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "NON-EMPTY",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "NON-WRAPPED",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "NON-ZERO",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "NOT-BLIND",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "NOT-L2",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "OFF-GRID",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "ONE-ROW",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "OPT-IN",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "PATH-SCOPED",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "PER-EXPERT",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "PER-JOB",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "PER-LAYER",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "PER-QUERY-HEAD",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "PHASE-PROFILE",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "PLANNER-TOL",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "PRE-NORM",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "RE-TOKENIZE",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "READ-BACK",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "RING-STATE",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "ROLE-ONLY",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "ROW-SCALED",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "SAME-PACK",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "SELF-CHECK",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "SHORT-PREFIX",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "SINK-DROP",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "STOP-RULE",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "SYSTEM-FIRST",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "SYSTEM-ONLY",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "TEACHER-END",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "TEST-ONLY",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "TF-GATE",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "THREAD-LOCAL",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "VARIANTS-OK",
+   "class": "technical-english",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "WARM-UP",
+   "class": "technical-english",
+   "origin": "legacy legacy-sanitizer"
+  },
+  {
+   "tag": "KV8-B",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-2",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-3a",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-3b",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-3c",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-4",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-5",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-5-q4k",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-MV1",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "V-PACK1",
+   "class": "vendoring-patch",
+   "origin": "receipt 2026-11-02, legitimate"
+  },
+  {
+   "tag": "A-Z",
+   "class": "regex-class",
+   "origin": "regex character-class vocabulary in published Python scanners; never an internal plan code"
+  },
+  {
+   "tag": "A-Z0-9",
+   "class": "regex-class",
+   "origin": "regex character-class vocabulary in published Python scanners; never an internal plan code"
+  }
+ ],
+ "exceptions": []
+}

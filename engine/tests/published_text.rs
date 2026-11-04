@@ -35,26 +35,32 @@ const EXTENSIONS: &[&str] = &[
     "css", "py", "sh", "toml", "yaml", "yml", "json",
 ];
 
-/// Hyphenated uppercase words that are ordinary public vocabulary.
-const ALLOWED_TAGS: &[&str] = &[
-    "UTF-8",
-    "UTF-16",
-    "SHA-1",
-    "SHA-256",
-    "SHA-512",
-    "IEEE-754",
-    "FNV-1a",
-    "AVX-512",
-    "MLX-LM",
-    "GPT-2",
-    "NON-INFRINGEMENT",
-    "LICENSE-2",
-    "LICENSE-APACHE",
-    "LICENSE-MIT",
-    "BF16-ROUNDED",
-    "BF16-REPRESENTABLE",
-    "CPU-FP64",
-];
+/// Hyphenated uppercase words that are ordinary public vocabulary. Loaded from the
+/// shared policy (scripts/sanitize_policy.json) so the publisher sanitizer and this gate
+/// read one authority and cannot drift; the policy ships with the public source, so this
+/// test keeps working in a public checkout where internal-only directories are stripped.
+fn allowed_tags() -> &'static [String] {
+    static ALLOWED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ALLOWED.get_or_init(|| {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/sanitize_policy.json");
+        let text = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("shared policy unreadable at {}: {error}", path.display())
+        });
+        let policy: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("shared policy must be valid JSON: {error}"));
+        policy["allowed_tags"]
+            .as_array()
+            .expect("policy allowed_tags must be an array")
+            .iter()
+            .map(|entry| {
+                entry["tag"]
+                    .as_str()
+                    .expect("every policy entry names a tag")
+                    .to_string()
+            })
+            .collect()
+    })
+}
 
 /// Tells whether the text after a phrase starts the number or code that makes it a reference.
 type Follows = fn(&str) -> bool;
@@ -160,7 +166,14 @@ fn published_files(root: &Path) -> Vec<PathBuf> {
                 .is_some_and(|name| SKIPPED_DIRS.contains(&name))
         });
         // This file lists the phrases it looks for.
-        if !skipped && has_text_extension(path) && !path.ends_with("tests/published_text.rs") {
+        // The pinned/ publisher snapshots carry the live hook bytes verbatim:
+        // frozen, like vendored sources, so their regex and fixtures are not prose.
+        let pinned_archive = relative.starts_with("qualification/publisher/pinned/");
+        if !skipped
+            && !pinned_archive
+            && has_text_extension(path)
+            && !path.ends_with("tests/published_text.rs")
+        {
             files.push(root.join(path));
         }
     }
@@ -242,7 +255,7 @@ fn labels(line: &str) -> Vec<String> {
     found.extend(host_labels(line));
     let words = line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'));
     for word in words.map(|word| word.trim_matches('-')) {
-        if is_tag(word) && !ALLOWED_TAGS.contains(&word) {
+        if is_tag(word) && !allowed_tags().iter().any(|allowed| allowed == word) {
             found.push(word.to_string());
         }
     }
@@ -340,8 +353,9 @@ fn starts_with_digit(text: &str) -> bool {
 #[test]
 fn the_label_rules_match_codes_and_skip_ordinary_words() {
     assert_eq!(
+        // KV8-B is shared-policy ordinary vocabulary: detected shape, skipped.
         labels(concat!("see AB", "-7c and KV8", "-B")),
-        [concat!("AB", "-7c"), concat!("KV8", "-B")]
+        [concat!("AB", "-7c")]
     );
     assert_eq!(labels(concat!("KV", "-v1 rows")), [concat!("KV", "-v1")]);
     assert_eq!(

@@ -229,13 +229,13 @@ class StagedGateTests(unittest.TestCase):
 
     def test_staged_host_details_skip_only_pinned_publisher_snapshots(self) -> None:
         owner = "da" + "n"
-        # The two pinned snapshots carry upstream bytes and must pass.
-        self.write("qualification/publisher/publish_commits.py",
-                  'NOTE = "' + "/home/" + owner + '/x"' + chr(10))
-        self.write("qualification/publisher/sanitize.py",
+        host_line = 'NOTE = "' + "/home/" + owner + '/x"' + chr(10)
+        # The two archived snapshots carry the live hook bytes and must pass.
+        self.write("qualification/publisher/pinned/publish_commits.py", host_line)
+        self.write("qualification/publisher/pinned/sanitize.py",
                   'TOKEN = "' + "kub" + owner + '-msg"' + chr(10))
-        self.git("add", "-f", "--", "qualification/publisher/publish_commits.py",
-                 "qualification/publisher/sanitize.py")
+        self.git("add", "-f", "--", "qualification/publisher/pinned/publish_commits.py",
+                 "qualification/publisher/pinned/sanitize.py")
 
         result = self.run_pre_commit()
 
@@ -243,13 +243,15 @@ class StagedGateTests(unittest.TestCase):
 
     def test_staged_host_details_reject_unpinned_publisher_files(self) -> None:
         owner = "da" + "n"
-        # The carve-out is not a directory-level bypass: an unrelated file in
-        # the publisher package, and pinned-looking names elsewhere, stay gated.
+        # The carve-out is not a directory-level bypass: developed publisher
+        # files, suffix lookalikes, subdirectories and foreign paths stay gated.
         for path in ("qualification/publisher/notes.txt",
                      "qualification/publisher/tools.py",
-                     "qualification/publisher/sanitize.py.bak",
-                     "qualification/publisher/publish_commits.py.tmp",
-                     "qualification/publisher/hooks/sanitize.py",
+                     "qualification/publisher/sanitize.py",
+                     "qualification/publisher/publish_commits.py",
+                     "qualification/publisher/pinned/sanitize.py.bak",
+                     "qualification/publisher/pinned/hooks/sanitize.py",
+                     "qualification/publisher/pinned/extra.py",
                      "docs/sanitize.py"):
             with self.subTest(path=path):
                 self.git("reset", "-q")
