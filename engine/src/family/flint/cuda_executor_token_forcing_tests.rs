@@ -22,26 +22,33 @@
 //! outputs, and an early EOS would only shorten that evidence.
 //!
 //! The prompts are the committed tasks of `testdata/token-forcing-tasks.json`, each one user
-//! turn through the pack's chat template, asking for a long coding or derivation answer.
-//! Raw-text continuations of the teacher-forced gate's corpus were tried first and cannot
-//! qualify anything: by 2,048 tokens every output had become a repetition loop (2 to 35
+//! turn through the pack's chat template, asking for a long coding, design or derivation
+//! answer. Raw-text continuations of the teacher-forced gate's corpus were tried first and
+//! cannot qualify anything: by 2,048 tokens every output had become a repetition loop (2 to 35
 //! distinct ids, median top-two gap 8.6 nats), the injected fault changed no token, and the
 //! self-test passed a faulty candidate. `TF_PROBE=1` measures that risk before a
-//! qualification: it generates the reference output of each selected task and writes
-//! `probe.json`. From the fault's start up to the first id that would end the answer, it
-//! counts the distinct ids, the positions whose top two logits lie closer than the fault's
-//! bias, the positions where the bias changes the argmax (`fault_flips`), and those of them
-//! whose margin exceeds twice the largest delta the gate accepts (`fault_events`): events
-//! under any calibration, which the unaudited fault cannot explain. The counts read the
-//! reference's own history; the fault leaves it at its first flip, so they estimate its reach
-//! rather than predict its mismatches. They are zero when `TF_TOKENS` is at most 2,048, and
-//! text after an end id does not count, because the run continues past it (see above).
+//! qualification (`token_forcing::probe`): it generates the reference output of each selected
+//! task, counts the fault's reach in it from the fault's start up to the first end id, and
+//! writes `probe.json`. The counts are zero when `TF_TOKENS` is at most 2,048, and text after
+//! an end id does not count, because the run continues past it (see above). A later run given
+//! `TF_PROBE_FILE` judges no candidate unless the probe read exactly the outputs that its
+//! reference scored, on the same build, pack and profile.
 //!
 //! Audits run with the scorer only: a second executor does not fit beside it on a 24 GB
 //! card, so the baseline-model audit is absent from device reports. Each audit is one prefill of
 //! the whole context up to its event, so the `fault` self-test is not audited: its events
 //! count as unexplained, and auditing hundreds of them would take hours. A low `TF_AUDIT_CAP`
 //! cannot help a faulty candidate pass either, for the same reason.
+//!
+//! A second opt-in test, `token_forcing_audit_path`, runs the device audit, which a
+//! qualification need not reach: the serving candidate may have no events, and the fault
+//! self-test is not audited. It runs a short comparison (`TF_TOKENS`, 512 by default) and a
+//! candidate with the fault from output position 128, and audits up to `TF_AUDIT_CAP` of the
+//! candidate's events. It asserts that each audit is one prefill of the whole context up to
+//! its event; that the re-read row gives the step path's argmax and margin bitwise, because
+//! Flint's prefill is batch-invariant, so that no legal re-execution here explains an event;
+//! and that the report counts the audited events as unexplained and the rest as unaudited, and
+//! rejects. The cap must be at least 2 and below the number of events, so that both occur.
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
@@ -50,8 +57,9 @@
 //! | `TF_OUT_DIR` | a new directory for the scored files and the report | required |
 //! | `TF_KV` | the KV profile of every execution: `f16`, `q8` or `q8k` | `f16` |
 //! | `TF_TASKS` | task names, comma-separated, in request order | every task |
-//! | `TF_PROBE` | `1`: probe the selected tasks, write `probe.json`, and stop (about 4 min per task at 4,096 tokens) | unset |
-//! | `TF_TOKENS` | generated tokens per request | 4096 |
+//! | `TF_PROBE` | `1`: probe the selected tasks, write `probe.json`, and stop (about 80 s per task at 4,096 tokens) | unset |
+//! | `TF_PROBE_FILE` | a `probe.json` that must have read this run's reference outputs; checked before any candidate | unset |
+//! | `TF_TOKENS` | generated tokens per request | 4096; 512 for `token_forcing_audit_path` |
 //! | `TF_REFERENCE_CHUNK` | prefill rows of the reference and the scorer, 1 to 8 | 8 |
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
 //! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated; empty for none | `serve` |
@@ -85,9 +93,12 @@
 use super::super::{factory, park_identity::pack_fingerprint};
 use super::*;
 use crate::family::token_forcing::{
-    gate::{ExecutionIdentity, GateConfig, Generation, Report, Verdict, ids_sha256},
+    gate::{
+        Audit, ExecutionIdentity, GateConfig, Generation, Report, ScoredSystem, Verdict, ids_sha256,
+    },
+    probe::{EVENT_FLOOR, ProbeFile, ProbeRow, ProbeSettings, check_probe, probe_request},
     run::{
-        Candidate, Comparison, Identities, Outputs, RunSettings, input_digests, read_scored,
+        Candidate, Comparison, Identities, Outputs, Run, RunSettings, input_digests, read_scored,
         write_new_json,
     },
     score::{ForcedModel, LogitBiasFault, TokenRecord, greedy_generate},
@@ -142,10 +153,12 @@ struct Plan {
     write_generations: Option<PathBuf>,
     comparison: Option<PathBuf>,
     comparison_sha256: Option<String>,
+    probe_file: Option<PathBuf>,
 }
 
 impl Plan {
-    fn from_env() -> Self {
+    /// The plan the environment sets; `tokens` is the default of `TF_TOKENS`.
+    fn from_env(tokens: usize) -> Self {
         let root: PathBuf = std::env::var_os("FLINT_QUAL_MODEL")
             .expect("FLINT_QUAL_MODEL must name the EXL3 pack root")
             .into();
@@ -181,7 +194,7 @@ impl Plan {
                 Ok("1") => true,
                 Ok(other) => panic!("TF_PROBE must be 1 or unset, not {other}"),
             },
-            tokens: number("TF_TOKENS", 4096),
+            tokens: number("TF_TOKENS", tokens),
             reference_chunk: chunk("TF_REFERENCE_CHUNK", 8),
             baseline_chunk: chunk("TF_BASELINE_CHUNK", 4),
             candidates: std::env::var("TF_CANDIDATE")
@@ -194,6 +207,9 @@ impl Plan {
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
             comparison: std::env::var_os("TF_COMPARISON").map(Into::into),
             comparison_sha256: std::env::var("TF_COMPARISON_SHA256").ok(),
+            probe_file: std::env::var_os("TF_PROBE_FILE")
+                .filter(|path| !path.is_empty())
+                .map(Into::into),
             root,
         }
     }
@@ -343,90 +359,6 @@ fn prompts(plan: &Plan, bundle: &TokenizerBundle) -> Vec<(String, Vec<u32>)> {
     prompts
 }
 
-/// One task's reference output, read for what the fault self-test needs from the fault's
-/// start up to the first end id: tokens that the fault changes by more than any event
-/// threshold.
-#[derive(Serialize)]
-struct ProbeRow {
-    task: String,
-    prompt_sha256: String,
-    prompt_tokens: usize,
-    /// The first output position whose argmax ends generation for the tokenizer. The run does
-    /// not stop there (see the module notes), so later tokens continue past the answer.
-    first_end: Option<usize>,
-    late_tokens: usize,
-    late_distinct: usize,
-    /// Late positions where the top two logits lie closer than the fault's bias.
-    late_close: usize,
-    /// Late positions where the fault's bias changes the argmax.
-    fault_flips: usize,
-    /// Flips whose margin exceeds `EVENT_FLOOR`.
-    fault_events: usize,
-}
-
-/// The probe's file: what ran it, then one row per task in request order.
-#[derive(Serialize)]
-struct ProbeFile {
-    system: ExecutionIdentity,
-    tokens: usize,
-    event_floor: f64,
-    rows: Vec<ProbeRow>,
-}
-
-/// Twice the largest delta the gate accepts: a fault flip with a larger margin is an event
-/// under every calibration that qualifies.
-const EVENT_FLOOR: f64 = 2.0 * GateConfig::QUALIFICATION.max_delta;
-
-/// Generates one reference output on the eager path, as `greedy_generate` does, and reads
-/// every row of it for the probe.
-fn probe(
-    model: &mut dyn ForcedModel,
-    (name, prompt): &(String, Vec<u32>),
-    tokens: usize,
-    bundle: &TokenizerBundle,
-) -> ProbeRow {
-    let vocab = bundle.vocab_size() as usize;
-    let fault = LogitBiasFault::specpilot(());
-    let mut out = ProbeRow {
-        task: name.clone(),
-        prompt_sha256: ids_sha256(prompt),
-        prompt_tokens: prompt.len(),
-        first_end: None,
-        late_tokens: 0,
-        late_distinct: 0,
-        late_close: 0,
-        fault_flips: 0,
-        fault_events: 0,
-    };
-    let mut late = std::collections::BTreeSet::new();
-    model.reset().expect("probe reset");
-    let mut row = model.prefill_logits(prompt).expect("probe prefill");
-    for position in 0..tokens {
-        let record = TokenRecord::from_logits(position, &row, 0, vocab).expect("a probe row");
-        let token = record.argmax;
-        if out.first_end.is_none() && bundle.eos_token_ids().contains(&token) {
-            out.first_end = Some(position);
-        }
-        if position >= fault.from && out.first_end.is_none() {
-            late.insert(token);
-            out.late_tokens += 1;
-            out.late_close += usize::from(record.top2_gap < f64::from(fault.bias));
-            let departure = fault
-                .departure_at(position, &row, vocab)
-                .expect("a biased probe row");
-            if let Some(departure) = departure {
-                out.fault_flips += 1;
-                out.fault_events += usize::from(departure.margin() > EVENT_FLOOR);
-            }
-        }
-        if position + 1 < tokens {
-            row = model.step_logits(token).expect("probe step");
-        }
-    }
-    out.late_distinct = late.len();
-    out
-}
-
 /// Probes every selected task on the reference executor and writes `probe.json`.
 fn run_probe(plan: &Plan, bundle: &TokenizerBundle, prompts: &[(String, Vec<u32>)]) {
     std::fs::create_dir(&plan.out).expect("TF_OUT_DIR must not exist yet");
@@ -435,15 +367,24 @@ fn run_probe(plan: &Plan, bundle: &TokenizerBundle, prompts: &[(String, Vec<u32>
         engine: &mut engine,
         session: &mut session,
     };
+    let fault = LogitBiasFault::specpilot(());
+    let settings = ProbeSettings {
+        fault: &fault,
+        end_ids: bundle.eos_token_ids(),
+        tokens: plan.tokens,
+        vocab: bundle.vocab_size() as usize,
+    };
     let rows: Vec<ProbeRow> = prompts
         .iter()
-        .map(|prompt| {
-            let row = probe(&mut model, prompt, plan.tokens, bundle);
+        .map(|(name, prompt)| {
+            let row = probe_request(&mut model, (name, prompt), settings).expect("a probe");
             println!(
-                "TOKEN_FORCING probe task={} prompt_tokens={} first_end={:?} late_tokens={} \
-                 late_distinct={} late_close={} fault_flips={} fault_events={}",
+                "TOKEN_FORCING probe task={} prompt_tokens={} generated_sha256={} \
+                 first_end={:?} late_tokens={} late_distinct={} late_close={} fault_flips={} \
+                 fault_events={}",
                 row.task,
                 row.prompt_tokens,
+                row.generated_sha256,
                 row.first_end,
                 row.late_tokens,
                 row.late_distinct,
@@ -737,17 +678,75 @@ fn candidate_outputs(
     }
 }
 
+/// The scorer and the settings of a run, with the identities the files record.
+fn setup<'a>(
+    plan: &'a Plan,
+    bundle: &'a TokenizerBundle,
+    prompts: &'a [(String, Vec<u32>)],
+) -> Setup<'a> {
+    Setup {
+        plan,
+        bundle,
+        prompts,
+        identities: Identities {
+            scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
+            reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
+            baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
+        },
+        settings: RunSettings {
+            config: GateConfig::QUALIFICATION,
+            vocab: bundle.vocab_size() as usize,
+            audit_cap: plan.audit_cap,
+        },
+    }
+}
+
+/// Stops the run unless the probe file at `path` read the outputs this run's reference scored.
+fn check_probe_file(path: &std::path::Path, reference: &ScoredSystem) {
+    let bytes = std::fs::read(path).expect("the TF_PROBE_FILE probe");
+    let probe: ProbeFile = serde_json::from_slice(&bytes).expect("probe JSON");
+    check_probe(&probe, reference).unwrap_or_else(|error| panic!("{}: {error:?}", path.display()));
+    println!(
+        "TOKEN_FORCING probe_check=ok probe={} probe_sha256={:x}",
+        path.display(),
+        Sha256::digest(&bytes)
+    );
+}
+
+/// Writes one candidate's scored file and report, tied to the comparison files by digest, and
+/// returns the report's path.
+fn write_run(
+    plan: &Plan,
+    name: &str,
+    run: &mut Run,
+    [reference, baseline]: &[String; 2],
+) -> PathBuf {
+    let candidate = write_new_json(&plan.out.join(format!("{name}.json")), &run.candidate)
+        .expect("a candidate file");
+    run.report.inputs = input_digests([reference.clone(), baseline.clone(), candidate]);
+    let report_path = plan.out.join(format!("report-{name}.json"));
+    write_new_json(&report_path, &run.report).expect("the report");
+    println!(
+        "TOKEN_FORCING candidate={name} verdict={} delta={} report={}",
+        serde_json::to_string(&run.report.verdict).expect("a verdict serializes"),
+        run.report.calibration.delta,
+        report_path.display()
+    );
+    report_path
+}
+
 #[test]
 #[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and an exclusive GPU lease"]
 fn token_forcing_qualification() {
-    let plan = Plan::from_env();
+    let plan = Plan::from_env(4096);
     let bundle = factory::load_tokenizer(&plan.tokenizer).expect("the qualification tokenizer");
-    let vocab = bundle.vocab_size() as usize;
     let prompts = prompts(&plan, &bundle);
     if plan.probe {
         assert!(
-            plan.write_generations.is_none(),
-            "TF_PROBE and TF_WRITE_GENERATIONS are separate runs"
+            plan.write_generations.is_none()
+                && plan.comparison.is_none()
+                && plan.probe_file.is_none(),
+            "TF_PROBE runs alone: no TF_WRITE_GENERATIONS, TF_COMPARISON or TF_PROBE_FILE"
         );
         run_probe(&plan, &bundle, &prompts);
         return;
@@ -769,21 +768,7 @@ fn token_forcing_qualification() {
         return;
     }
     std::fs::create_dir(&plan.out).expect("TF_OUT_DIR must not exist yet");
-    let setup = Setup {
-        plan: &plan,
-        bundle: &bundle,
-        prompts: &prompts,
-        identities: Identities {
-            scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
-            reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
-            baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
-        },
-        settings: RunSettings {
-            config: GateConfig::QUALIFICATION,
-            vocab,
-            audit_cap: plan.audit_cap,
-        },
-    };
+    let setup = setup(&plan, &bundle, &prompts);
     let (comparison, digests, (mut engine, mut session)) = match &plan.comparison {
         Some(directory) => loaded_comparison(&setup, directory),
         None => {
@@ -802,10 +787,12 @@ fn token_forcing_qualification() {
             "the comparison files are not the ones TF_COMPARISON_SHA256 names"
         );
     }
+    if let Some(path) = &plan.probe_file {
+        check_probe_file(path, &comparison.reference);
+    }
     if plan.candidates.is_empty() {
         println!("TOKEN_FORCING candidates=none");
     }
-    let [reference_sha256, baseline_sha256] = digests;
     for (index, kind) in plan.candidates.iter().enumerate() {
         let (name, identity, generations, audit_cap) =
             candidate_outputs(&setup, (&mut engine, &mut session), (index, kind));
@@ -821,22 +808,155 @@ fn token_forcing_qualification() {
         let mut run = comparison
             .judge((&mut scorer, None), candidate)
             .expect("the gate runs");
-        let candidate_sha256 =
-            write_new_json(&plan.out.join(format!("{name}.json")), &run.candidate)
-                .expect("a candidate file");
-        run.report.inputs = input_digests([
-            reference_sha256.clone(),
-            baseline_sha256.clone(),
-            candidate_sha256,
-        ]);
-        let report_path = plan.out.join(format!("report-{name}.json"));
-        write_new_json(&report_path, &run.report).expect("the report");
-        println!(
-            "TOKEN_FORCING candidate={name} verdict={} delta={} report={}",
-            serde_json::to_string(&run.report.verdict).expect("a verdict serializes"),
-            run.report.calibration.delta,
-            report_path.display()
-        );
+        let report_path = write_run(&plan, &name, &mut run, &digests);
         check_outcome(&name, &run.report, &report_path);
     }
+}
+
+/// The output position where the audit-path test's fault starts: early, so that a short run
+/// has events to audit.
+const AUDIT_FAULT_FROM: usize = 128;
+
+/// A model that records the context length of every prefill it runs.
+struct Prefills<'a> {
+    inner: Forced<'a>,
+    contexts: Vec<usize>,
+}
+
+impl ForcedModel for Prefills<'_> {
+    fn reset(&mut self) -> Result<()> {
+        self.inner.reset()
+    }
+
+    fn prefill_logits(&mut self, context: &[u32]) -> Result<Vec<f32>> {
+        self.contexts.push(context.len());
+        self.inner.prefill_logits(context)
+    }
+
+    fn step_logits(&mut self, token: u32) -> Result<Vec<f32>> {
+        self.inner.step_logits(token)
+    }
+}
+
+/// What the audit-path test asserts about one judged faulty candidate; see the module notes.
+/// `contexts` are the prefills the scorer ran while judging it.
+fn check_audit_path(run: &Run, generations: &[Generation], contexts: &[usize], cap: usize) {
+    let threshold = run.report.event_rule.threshold;
+    let scored = &run.candidate;
+    // The events in request and position order, the order in which the audit walks them.
+    let events: Vec<(usize, &TokenRecord)> = scored
+        .requests
+        .iter()
+        .enumerate()
+        .flat_map(|(index, request)| {
+            let above = request.records.iter().filter(|r| r.margin() > threshold);
+            above.map(move |record| (index, record))
+        })
+        .collect();
+    let audited = events.len().min(cap);
+    assert!(
+        audited >= 2 && events.len() > audited,
+        "the fault made {} events; the test needs at least 2 audited and 1 past the cap {cap}",
+        events.len()
+    );
+    let records = scored.requests.iter().flat_map(|request| &request.records);
+    let mut early = records.filter(|record| record.position < AUDIT_FAULT_FROM);
+    assert!(
+        early.all(TokenRecord::matched),
+        "a mismatch before the fault's start"
+    );
+    let audits: Vec<(usize, &Audit)> = scored
+        .requests
+        .iter()
+        .enumerate()
+        .flat_map(|(index, request)| request.audits.iter().map(move |audit| (index, audit)))
+        .collect();
+    assert_eq!(audits.len(), audited, "one audit per event up to the cap");
+    // Scoring reads each prompt once; then each audit is one prefill of its whole context.
+    let mut expected: Vec<usize> = generations.iter().map(|g| g.prompt.len()).collect();
+    expected.extend(
+        events[..audited]
+            .iter()
+            .map(|&(index, record)| generations[index].prompt.len() + record.position),
+    );
+    assert_eq!(contexts, expected, "the prefills the scorer ran");
+    for (&(index, record), &(audit_index, audit)) in events.iter().zip(&audits) {
+        println!(
+            "TOKEN_FORCING audit request={} position={} context={} generated={} \
+             step_argmax={} step_margin={} reread_argmax={} reread_margin={}",
+            scored.requests[index].name,
+            record.position,
+            generations[index].prompt.len() + record.position,
+            record.generated,
+            record.argmax,
+            record.margin(),
+            audit.prefill.argmax,
+            audit.prefill.margin
+        );
+        assert_eq!((audit_index, audit.position), (index, record.position));
+        assert!(audit.baseline.is_none(), "the device has no baseline model");
+    }
+    for (&(_, record), &(_, audit)) in events.iter().zip(&audits) {
+        assert_eq!(
+            (audit.prefill.argmax, audit.prefill.margin.to_bits()),
+            (record.argmax, record.margin().to_bits()),
+            "position {}: one prefill of the whole context read another row than the step path",
+            record.position
+        );
+    }
+    let summary = &run.report.candidate;
+    let counts = (
+        summary.events,
+        summary.explained_events,
+        summary.unexplained_events,
+        summary.unaudited_events,
+    );
+    let (events, audited) = (events.len() as u64, audited as u64);
+    assert_eq!(counts, (events, 0, audited, events - audited));
+    assert_eq!(run.report.event_rule.candidate_unexplained, events);
+    assert!(matches!(run.report.verdict, Verdict::Reject { .. }));
+}
+
+#[test]
+#[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and a GPU lease"]
+fn token_forcing_audit_path() {
+    let plan = Plan::from_env(512);
+    assert!(
+        plan.tokens > AUDIT_FAULT_FROM,
+        "TF_TOKENS must pass the fault's start"
+    );
+    assert!(plan.audit_cap >= 2, "TF_AUDIT_CAP must allow two audits");
+    let bundle = factory::load_tokenizer(&plan.tokenizer).expect("the qualification tokenizer");
+    let prompts = prompts(&plan, &bundle);
+    std::fs::create_dir(&plan.out).expect("TF_OUT_DIR must not exist yet");
+    let setup = setup(&plan, &bundle, &prompts);
+    let (comparison, digests, (mut engine, mut session)) = fresh_comparison(&setup);
+    println!("{}", comparison_line(&comparison, &digests));
+    let generations = {
+        let forced = Forced {
+            engine: &mut engine,
+            session: &mut session,
+        };
+        let mut model = LogitBiasFault::starting_at(forced, AUDIT_FAULT_FROM);
+        generate_with(&mut model, &prompts, plan.tokens, setup.settings.vocab)
+    };
+    let path = format!("eager-greedy-bias-fault-from-{AUDIT_FAULT_FROM}");
+    let identity = plan.identity("candidate-fault", plan.reference_chunk, &path);
+    let mut scorer = Prefills {
+        inner: Forced {
+            engine: &mut engine,
+            session: &mut session,
+        },
+        contexts: Vec::new(),
+    };
+    let candidate = Candidate {
+        identity: &identity,
+        generations: &generations,
+        audit_cap: plan.audit_cap,
+    };
+    let mut run = comparison
+        .judge((&mut scorer, None), candidate)
+        .expect("the gate runs");
+    write_run(&plan, "fault", &mut run, &digests);
+    check_audit_path(&run, &generations, &scorer.contexts, plan.audit_cap);
 }
