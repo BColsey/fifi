@@ -11,9 +11,11 @@
 //!
 //! Device bytes count each tensor as the CUDA kernels read it: trellises as stored with `suh`
 //! and `svh` in F32 (the EXL3 kernels), hyper-connection weights in their stored half dtype
-//! (`resident/hyper`), the router and the shared-expert gate in F32 (`resident/router`), and the
-//! norms and DeltaNet vectors in F32. The embedding and the dense projections that have no CUDA
-//! kernel yet (`in_proj_a`, `in_proj_b`, the PLE projections) count as stored.
+//! (`kernels/cuda/resident/hyper.rs`), the router and the shared-expert gate in F32
+//! (`kernels/cuda/resident/router.rs`), and the norms and DeltaNet vectors in F32. The embedding
+//! and the dense projections that have no CUDA kernel yet (`in_proj_a`, `in_proj_b`, the PLE
+//! projections) count as stored. The embedding's dtype is open (any half dtype or F32) until the
+//! step's row gather fixes one; the real pack stores BF16.
 
 use super::Dims;
 use crate::{
