@@ -12,15 +12,22 @@
 //! The block feeds a hyper-connection apply in Flash-Next, not a residual add, so it runs on a
 //! zero residual and its output is the weighted picks plus the gated shared expert. Each of three
 //! input rows runs the block twice: with the picks read back (one grouped launch of the 20 gate
-//! and up pairs) and with the picks read on the device (id-indexed launches of 16 and 4 pairs).
-//! Both must write the same bytes: the output, and each of the 20 gate and up rows and the 10
-//! down rows. Every one of those rows of both paths must match its fp64 projection, so a pair that
-//! a launch skipped (it keeps its zeroed row) or wrote to the wrong row fails by name; pairs 16 to
-//! 19 (picks 8 and 9) are the second id-indexed launch. Against fp64: the ids in rank order, each pick weight and the
-//! shared gate within `2^-17` (the device router's class R1, as in `cuda_tests`), the block output
-//! within a relative L2 of 2e-5 (the bound of the Qwen3.6 block's real-pack test). The host `route` (f32) must pick the same ids, the
-//! arithmetic flag and the router status must stay clear, and some pick over the three rows must
-//! lie in the upper half of the 512-expert banks.
+//! and up pairs) and with the picks read on the device (id-indexed launches of 16 and 4 pairs;
+//! pairs 16 to 19, picks 8 and 9, are the second launch).
+//!
+//! Checked for each row:
+//! - each of the 20 gate and up rows and the 10 down rows of both paths against its fp64
+//!   projection, by pair, so a pair that a launch skipped (it keeps its zeroed row) or wrote to
+//!   the wrong row fails by name;
+//! - the same rows, and the output, byte for byte between the two paths;
+//! - the ids in rank order against fp64 and against the host `route` (f32), each pick weight and
+//!   the shared gate within `2^-17` (the device router's class R1, as in `cuda_tests`);
+//! - the block output within a relative L2 of 2e-5 of fp64 (the bound of the Qwen3.6 block's
+//!   real-pack test), and the tail picks' share of the output at least ten times that bound, so
+//!   a block that dropped picks 8 and 9 could not pass;
+//! - the arithmetic flag and the router status clear.
+//!
+//! Over the three rows some pick must lie in the upper half of the 512-expert banks.
 
 use std::path::Path;
 
@@ -423,6 +430,20 @@ fn check_pairs(tag: &str, run: &Device, want: &Reference, moe: &MoeDims) -> f64 
     worst
 }
 
+/// The picks of the second id-indexed launch (slot 8 on: the launch takes 16 pairs, two per
+/// pick): the relative L2 of their weighted down rows against the fp64 output.
+fn tail_share(want: &Reference, moe: &MoeDims) -> f64 {
+    let mut tail = vec![0.0f64; moe.hidden];
+    let rows = want.down.chunks_exact(moe.hidden).zip(&want.weights);
+    for (down, weight) in rows.skip(8) {
+        for (t, v) in tail.iter_mut().zip(down) {
+            *t += weight * v;
+        }
+    }
+    let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    norm(&tail) / norm(&want.out)
+}
+
 /// Runs both pick paths on input `seed` and checks them against fp64 and the host `route`;
 /// returns the picks.
 fn check_row(
@@ -436,6 +457,10 @@ fn check_row(
     let got = run_block(projector, block, (moe, &row), false).expect("block, read-back picks");
     let on_device = run_block(projector, block, (moe, &row), true).expect("block, device picks");
     let tag = format!("layer {layer} row {seed}");
+    let pairs = [&got, &on_device]
+        .map(|run| check_pairs(&tag, run, &want, moe))
+        .into_iter()
+        .fold(0.0f64, f64::max);
     assert_eq!(on_device.ids, got.ids, "{tag}: device picks, the ids");
     assert_eq!(
         on_device.out, got.out,
@@ -470,21 +495,23 @@ fn check_row(
         apart(got.gate, want.gate) < WEIGHT_BOUND,
         "{tag}: shared gate"
     );
-    let pairs = [&got, &on_device]
-        .map(|run| check_pairs(&tag, run, &want, moe))
-        .into_iter()
-        .fold(0.0f64, f64::max);
+    let tail = tail_share(&want, moe);
+    assert!(
+        tail > 10.0 * OUTPUT_BOUND,
+        "{tag}: the tail picks' share {tail} would hide under the output bound"
+    );
     let error = relative_l2(&floats(&got.out), &want.out);
     println!(
-        "{tag}: picks {:?}, rank-10 margin {:.3e}, shared gate {:.4}, worst pair row {pairs:.3e}, output relative L2 {error:.3e}",
+        "{tag}: picks {:?}, rank-10 margin {:.3e}, shared gate {:.4}, tail share {tail:.3e}",
         got.ids, want.margin, want.gate
     );
+    println!("{tag}: worst pair row {pairs:.3e}, output relative L2 {error:.3e}");
     assert!(error < OUTPUT_BOUND, "{tag}: relative L2 {error}");
     got.ids
 }
 
 #[test]
-#[ignore = "requires a GPU (2 GiB) and a local Flash-Next EXL3 pack with the layer's MoE payload in FIFI_FLASH_NEXT_EXL3_PACK"]
+#[ignore = "needs a GPU (2 GiB) and FIFI_FLASH_NEXT_EXL3_PACK, a local pack with the MoE"]
 fn a_real_flash_next_moe_layer_matches_the_fp64_reference() {
     let dir = std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK");
     let layer = std::env::var("FIFI_FLASH_NEXT_EXL3_MOE_LAYER")

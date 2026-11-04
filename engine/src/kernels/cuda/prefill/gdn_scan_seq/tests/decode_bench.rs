@@ -24,13 +24,15 @@
 //! 36-layer pass queued and drained (wall time, and the host time spent queueing it); and the
 //! same pass with a timing event recorded before the first layer and after each layer (the
 //! device time of the pass and of every layer in it). Every warm-up round runs every arm's full
-//! pass. Effective bandwidth divides the bytes a layer must move (each range touched once, the
-//! state and the conv ring read and written) by the device time of the pass.
+//! pass. Effective bandwidth divides the bytes the pass must move (each range touched once, the
+//! state and the conv ring read and written) by the plain pass's wall time; for the conv and
+//! scan arms the state figure counts the conv's time too.
 //!
 //! The marks are not free: on the 3090 the marked pass's device time exceeds the plain pass's
 //! wall time by about 1.6 us per layer, and the event timer counts in 1.024 us steps. So the
-//! plain pass's wall time is the pass latency; the marked pass gives the spread across layers,
-//! and its bandwidth figures are low by the cost of the marks.
+//! plain pass's wall time is the pass latency and the bandwidth basis; the marked pass gives the
+//! spread across layers, to the timer's step (the first layer's interval also holds the host's
+//! launch gap, which is where the largest values come from).
 
 use super::forms::{FN_K, FN_V, opts_of};
 use super::{
@@ -411,7 +413,7 @@ fn report_pass(arm: &Arm) {
 }
 
 /// The layer line of `arm`: the device time of a layer over every layer and round, the range of
-/// the per-layer medians, and the effective bandwidth of the median pass.
+/// the per-layer medians, and the effective bandwidth at the median wall time of the pass.
 fn report_layers(layer: &Layer, arm: &Arm) {
     let all: Vec<f64> = arm.per_layer.iter().flatten().copied().collect();
     let (l10, l50, l90) = spread(&all);
@@ -419,11 +421,15 @@ fn report_layers(layer: &Layer, arm: &Arm) {
     let medians: Vec<f64> = arm.per_layer.iter().map(|s| spread(s).1).collect();
     let lo = medians.iter().copied().fold(f64::INFINITY, f64::min);
     let hi = medians.iter().copied().fold(0.0, f64::max);
-    let pass = spread(&arm.device).1;
+    let pass = spread(&arm.wall).1;
     let (state, every) = layer.traffic(arm.step);
     let gbs = |bytes: f64| bytes * LAYERS as f64 / (pass * 1e-6) / 1e9;
     println!(
-        "BENCH {:<40}   per layer device {l50:.2} us [{l10:.2}, {l90:.2}] max {max:.2}; layer medians {lo:.2} to {hi:.2} us; state {:.0} GB/s, all ranges {:.0} GB/s",
+        "BENCH {:<40}   per layer device {l50:.1} us [{l10:.1}, {l90:.1}] max {max:.1}; layer medians {lo:.1} to {hi:.1} us",
+        "",
+    );
+    println!(
+        "BENCH {:<40}   state {:.0} GB/s, all ranges {:.0} GB/s over the wall time",
         "",
         gbs(state),
         gbs(every),
