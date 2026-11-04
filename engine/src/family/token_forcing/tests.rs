@@ -973,6 +973,68 @@ impl ForcedModel for FixedRow {
     }
 }
 
+/// A fault around one fixed row, biasing every 2nd id by 1.5 from output position 2 on.
+fn small_fault(row: &[f32]) -> LogitBiasFault<FixedRow> {
+    let mut fault = LogitBiasFault::specpilot(FixedRow(row.to_vec()));
+    fault.from = 2;
+    fault.stride = 2;
+    fault.bias = 1.5;
+    fault
+}
+
+#[test]
+fn the_fault_reads_each_row_at_its_output_position() {
+    // The prefill row is output position 0, and each step adds one.
+    let base = vec![0.0, 2.0, 1.0, -1.0];
+    let mut fault = small_fault(&base);
+    let mut rows = vec![fault.prefill_logits(&[3]).unwrap()];
+    for token in [1, 1, 1] {
+        rows.push(fault.step_logits(token).unwrap());
+    }
+    for (position, row) in rows.iter().enumerate() {
+        assert_eq!(
+            *row,
+            fault.bias_at(position, base.clone()),
+            "position {position}"
+        );
+    }
+    assert_eq!(rows[1], base);
+    assert_eq!(rows[2], vec![1.5, 2.0, 2.5, -1.0]);
+    // A new request starts at position 0 again.
+    assert_eq!(fault.prefill_logits(&[3]).unwrap(), base);
+}
+
+#[test]
+fn a_fault_departure_is_the_biased_choice_judged_by_the_unbiased_row() {
+    let row = [0.0, 2.0, 1.0, -1.0];
+    let fault = small_fault(&row);
+    // Before the fault's start the argmax stays chosen.
+    assert_eq!(fault.departure_at(1, &row, 4).unwrap(), None);
+    // From it on, id 2 gains 1.5 and passes id 1 by 0.5; the scorer reads it 1 nat below.
+    let departure = fault
+        .departure_at(2, &row, 4)
+        .unwrap()
+        .expect("a departure");
+    assert_eq!((departure.generated, departure.argmax), (2, 1));
+    assert!((departure.margin() - 1.0).abs() < 1e-9, "{departure:?}");
+    // A gap wider than the bias, or a biased argmax, leaves the choice alone.
+    assert_eq!(
+        fault.departure_at(2, &[0.0, 2.0, 0.4, -1.0], 4).unwrap(),
+        None
+    );
+    assert_eq!(
+        fault.departure_at(2, &[2.0, 1.0, 1.0, -1.0], 4).unwrap(),
+        None
+    );
+    // Only the tokenizer-visible ids count.
+    assert_eq!(
+        fault
+            .departure_at(2, &[0.0, 2.0, -9.0, 9.0, 0.9], 3)
+            .unwrap(),
+        None
+    );
+}
+
 #[test]
 fn an_audit_records_each_re_execution_in_its_own_place() {
     // The scorer prefers id 0 by 3 logits over id 1; the baseline model prefers id 1.

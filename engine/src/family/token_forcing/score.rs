@@ -249,6 +249,21 @@ impl<M> LogitBiasFault<M> {
         row
     }
 
+    /// What the fault does to the unbiased `row` at output position `position`: the token it
+    /// chooses instead of the row's argmax, judged by that row, so the record's margin is the
+    /// margin a scorer reads. `None` when the bias leaves the argmax chosen.
+    pub(crate) fn departure_at(
+        &self,
+        position: usize,
+        row: &[f32],
+        vocab: usize,
+    ) -> Result<Option<TokenRecord>> {
+        let biased = self.bias_at(position, row.to_vec());
+        let (choice, _) = top_two(visible_row(&biased, vocab)?);
+        let record = TokenRecord::from_logits(position, row, choice as u32, vocab)?;
+        Ok((!record.matched()).then_some(record))
+    }
+
     fn corrupt(&self, row: Vec<f32>) -> Vec<f32> {
         self.bias_at(self.position, row)
     }
