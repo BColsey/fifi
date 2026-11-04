@@ -38,7 +38,8 @@
 //! | `TF_TOKENS` | generated tokens per request | 4096 |
 //! | `TF_REFERENCE_CHUNK` | prefill rows of the reference and the scorer, 1 to 8 | 8 |
 //! | `TF_BASELINE_CHUNK` | prefill rows of the baseline, 1 to 8 | 4 |
-//! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated | `serve` |
+//! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated; empty for none | `serve` |
+//! | `TF_COMPARISON` | the directory of an earlier run whose `reference.json` and `baseline.json` this run reuses | unset |
 //! | `TF_AUDIT_CAP` | the most events audited per execution, `fault` excepted | 200, SpecPilot's count |
 //! | `TF_WRITE_GENERATIONS` | write this build's serving generations to this new file and stop | unset |
 //!
@@ -54,12 +55,21 @@
 //! `file<index>`. `family::token_forcing::run::entry::token_forcing_verdict` recomputes a
 //! verdict from three scored files on any host. A `fault` that is not rejected for its own
 //! mismatches after 2,048 tokens stops the run before the next candidate.
+//!
+//! The reference and the baseline take four of the six passes of a one-candidate run. With
+//! `TF_COMPARISON`, a later run of the same test binary judges its candidates against the
+//! files of an earlier one, so a qualification splits into leases of under an hour: the
+//! comparison alone (`TF_CANDIDATE=`), then `fault`, then `serve`. The scorer of the later run
+//! must equal the one recorded in the files, executable digest included.
 
 use super::super::{factory, park_identity::pack_fingerprint};
 use super::*;
 use crate::family::token_forcing::{
     gate::{ExecutionIdentity, GateConfig, Generation, Report, Verdict, ids_sha256},
-    run::{Candidate, Comparison, Identities, Outputs, RunSettings, input_digests, write_new_json},
+    run::{
+        Candidate, Comparison, Identities, Outputs, RunSettings, input_digests, read_scored,
+        write_new_json,
+    },
     score::{ForcedModel, LogitBiasFault, greedy_generate},
 };
 use crate::tokenizer::{IncrementalDecoder, TokenizerBundle};
@@ -110,6 +120,7 @@ struct Plan {
     candidates: Vec<String>,
     audit_cap: usize,
     write_generations: Option<PathBuf>,
+    comparison: Option<PathBuf>,
 }
 
 impl Plan {
@@ -144,9 +155,11 @@ impl Plan {
                 .unwrap_or_else(|_| "serve".to_owned())
                 .split(',')
                 .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
                 .collect(),
             audit_cap: number("TF_AUDIT_CAP", 200),
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
+            comparison: std::env::var_os("TF_COMPARISON").map(Into::into),
             root,
         }
     }
@@ -365,6 +378,116 @@ fn check_outcome(name: &str, report: &Report, path: &std::path::Path) {
     );
 }
 
+/// What every part of one run shares.
+struct Setup<'a> {
+    plan: &'a Plan,
+    bundle: &'a TokenizerBundle,
+    prompts: &'a [(String, Vec<u32>)],
+    identities: Identities,
+    settings: RunSettings,
+}
+
+type Engine = (FlintExecutor, FlintSession);
+
+/// Generates the baseline and the reference, scores and calibrates them, and writes their
+/// files. Returns the comparison, the files' digests and the scorer's engine.
+fn fresh_comparison(setup: &Setup<'_>) -> (Comparison, [String; 2], Engine) {
+    let (plan, vocab) = (setup.plan, setup.settings.vocab);
+    let baseline = {
+        let (mut engine, mut session) = plan.open(plan.baseline_chunk, setup.bundle);
+        let mut model = Forced {
+            engine: &mut engine,
+            session: &mut session,
+        };
+        generate_with(&mut model, setup.prompts, plan.tokens, vocab)
+    };
+    let (mut engine, mut session) = plan.open(plan.reference_chunk, setup.bundle);
+    let mut scorer = Forced {
+        engine: &mut engine,
+        session: &mut session,
+    };
+    let reference = generate_with(&mut scorer, setup.prompts, plan.tokens, vocab);
+    let outputs = Outputs {
+        reference: &reference,
+        baseline: &baseline,
+    };
+    let comparison = Comparison::prepare(
+        (&mut scorer, None),
+        &setup.identities,
+        outputs,
+        setup.settings,
+    )
+    .expect("the reference and the baseline calibrate");
+    let write = |role: &str, scored| {
+        write_new_json(&plan.out.join(format!("{role}.json")), scored).expect("a comparison file")
+    };
+    let digests = [
+        write("reference", &comparison.reference),
+        write("baseline", &comparison.baseline),
+    ];
+    (comparison, digests, (engine, session))
+}
+
+/// Reads the comparison an earlier run of this binary wrote to `directory`.
+fn loaded_comparison(
+    setup: &Setup<'_>,
+    directory: &std::path::Path,
+) -> (Comparison, [String; 2], Engine) {
+    let (reference, reference_sha256) =
+        read_scored(&directory.join("reference.json")).expect("the earlier reference file");
+    let (baseline, baseline_sha256) =
+        read_scored(&directory.join("baseline.json")).expect("the earlier baseline file");
+    let comparison = Comparison::from_scored(
+        reference,
+        baseline,
+        &setup.identities.scorer,
+        setup.settings,
+    )
+    .expect("the earlier comparison under this scorer");
+    let engine = setup.plan.open(setup.plan.reference_chunk, setup.bundle);
+    (comparison, [reference_sha256, baseline_sha256], engine)
+}
+
+/// Generates one candidate's outputs: its file name, identity, generations and audit cap.
+fn candidate_outputs(
+    setup: &Setup<'_>,
+    (engine, session): (&mut FlintExecutor, &mut FlintSession),
+    (index, kind): (usize, &str),
+) -> (String, ExecutionIdentity, Vec<Generation>, usize) {
+    let plan = setup.plan;
+    match kind {
+        "serve" => (
+            "serve".to_owned(),
+            plan.identity("candidate-serve", plan.reference_chunk, "serving-decode"),
+            serve((engine, session), setup.bundle, setup.prompts, plan.tokens),
+            plan.audit_cap,
+        ),
+        "fault" => {
+            let mut model = LogitBiasFault::specpilot(Forced { engine, session });
+            (
+                "fault".to_owned(),
+                plan.identity(
+                    "candidate-fault",
+                    plan.reference_chunk,
+                    "eager-greedy-bias-fault",
+                ),
+                generate_with(&mut model, setup.prompts, plan.tokens, setup.settings.vocab),
+                0,
+            )
+        }
+        path => {
+            let (identity, generations) =
+                read_generations(std::path::Path::new(path), setup.prompts);
+            (
+                format!("file{index}"),
+                identity,
+                generations,
+                plan.audit_cap,
+            )
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and an exclusive GPU lease"]
 fn token_forcing_qualification() {
@@ -389,81 +512,29 @@ fn token_forcing_qualification() {
         return;
     }
     std::fs::create_dir(&plan.out).expect("TF_OUT_DIR must not exist yet");
-    let baseline = {
-        let (mut engine, mut session) = plan.open(plan.baseline_chunk, &bundle);
-        let mut model = Forced {
-            engine: &mut engine,
-            session: &mut session,
+    let setup = Setup {
+        plan: &plan,
+        bundle: &bundle,
+        prompts: &prompts,
+        identities: Identities {
+            scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
+            reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
+            baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
+        },
+        settings: RunSettings {
+            config: GateConfig::QUALIFICATION,
+            vocab,
+            audit_cap: plan.audit_cap,
+        },
+    };
+    let (comparison, [reference_sha256, baseline_sha256], (mut engine, mut session)) =
+        match &plan.comparison {
+            Some(directory) => loaded_comparison(&setup, directory),
+            None => fresh_comparison(&setup),
         };
-        generate_with(&mut model, &prompts, plan.tokens, vocab)
-    };
-    let (mut engine, mut session) = plan.open(plan.reference_chunk, &bundle);
-    let reference = {
-        let mut model = Forced {
-            engine: &mut engine,
-            session: &mut session,
-        };
-        generate_with(&mut model, &prompts, plan.tokens, vocab)
-    };
-    let identities = Identities {
-        scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
-        reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
-        baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
-    };
-    let settings = RunSettings {
-        config: GateConfig::QUALIFICATION,
-        vocab,
-        audit_cap: plan.audit_cap,
-    };
-    let outputs = Outputs {
-        reference: &reference,
-        baseline: &baseline,
-    };
-    let mut scorer = Forced {
-        engine: &mut engine,
-        session: &mut session,
-    };
-    let comparison = Comparison::prepare((&mut scorer, None), &identities, outputs, settings)
-        .expect("the reference and the baseline calibrate");
-    let reference_sha256 = write_new_json(&plan.out.join("reference.json"), &comparison.reference)
-        .expect("the reference file");
-    let baseline_sha256 = write_new_json(&plan.out.join("baseline.json"), &comparison.baseline)
-        .expect("the baseline file");
     for (index, kind) in plan.candidates.iter().enumerate() {
-        let (name, identity, generations, audit_cap) = match kind.as_str() {
-            "serve" => (
-                "serve".to_owned(),
-                plan.identity("candidate-serve", plan.reference_chunk, "serving-decode"),
-                serve((&mut engine, &mut session), &bundle, &prompts, plan.tokens),
-                plan.audit_cap,
-            ),
-            "fault" => {
-                let mut model = LogitBiasFault::specpilot(Forced {
-                    engine: &mut engine,
-                    session: &mut session,
-                });
-                (
-                    "fault".to_owned(),
-                    plan.identity(
-                        "candidate-fault",
-                        plan.reference_chunk,
-                        "eager-greedy-bias-fault",
-                    ),
-                    generate_with(&mut model, &prompts, plan.tokens, vocab),
-                    0,
-                )
-            }
-            path => {
-                let (identity, generations) =
-                    read_generations(std::path::Path::new(path), &prompts);
-                (
-                    format!("file{index}"),
-                    identity,
-                    generations,
-                    plan.audit_cap,
-                )
-            }
-        };
+        let (name, identity, generations, audit_cap) =
+            candidate_outputs(&setup, (&mut engine, &mut session), (index, kind));
         let mut scorer = Forced {
             engine: &mut engine,
             session: &mut session,

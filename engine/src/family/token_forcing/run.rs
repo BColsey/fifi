@@ -101,6 +101,27 @@ impl Comparison {
             outputs.baseline,
             plan,
         )?;
+        Self::from_scored(reference, baseline, &identities.scorer, settings)
+    }
+
+    /// The comparison of an earlier run, rebuilt from its scored reference and baseline, so
+    /// that a later run judges more candidates without generating and scoring them again. The
+    /// audits are the ones the files carry. `scorer` is the scorer of the later run: it must be
+    /// the one that scored the files, because every candidate is scored under that identity.
+    pub(crate) fn from_scored(
+        reference: ScoredSystem,
+        baseline: ScoredSystem,
+        scorer: &ExecutionIdentity,
+        settings: RunSettings,
+    ) -> Result<Self> {
+        if reference.scorer != *scorer {
+            return Err(EngError::BadRequest(format!(
+                "token forcing: the comparison was scored by {} ({:?}), not by this run's {} \
+                 ({:?})",
+                reference.scorer.label, reference.scorer.profile, scorer.label, scorer.profile
+            )));
+        }
+        let threshold = 2.0 * calibrate(&reference, &baseline)?.delta;
         Ok(Self {
             reference,
             baseline,

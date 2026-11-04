@@ -819,3 +819,68 @@ fn a_one_prefill_reread_judges_an_existing_token_only() {
     let error = prefill_record(&mut scorer, &prompt, &generated, 32, VOCAB).unwrap_err();
     assert!(format!("{error:?}").contains("past the 32"), "{error:?}");
 }
+
+#[test]
+fn a_comparison_rebuilt_from_its_files_judges_like_the_original() {
+    let case = Case::new(Toy::rounded(2), TOKENS);
+    let (comparison, run) = case.qualify(GateConfig::QUALIFICATION, AUDIT_CAP);
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| directory.path().join(name);
+    write_new_json(&path("reference.json"), &comparison.reference).unwrap();
+    write_new_json(&path("baseline.json"), &comparison.baseline).unwrap();
+    let settings = RunSettings {
+        config: GateConfig::QUALIFICATION,
+        vocab: VOCAB,
+        audit_cap: AUDIT_CAP,
+    };
+    let reread = |name: &str| read_scored(&path(name)).unwrap().0;
+    let ids = identities();
+    let rebuild = |scorer: &ExecutionIdentity| {
+        Comparison::from_scored(
+            reread("reference.json"),
+            reread("baseline.json"),
+            scorer,
+            settings,
+        )
+    };
+    // Another scorer, such as another build, cannot judge against these files.
+    let mut other = ids.scorer.clone();
+    other
+        .profile
+        .insert("executable_sha256".to_owned(), "0".repeat(64));
+    let error = rebuild(&other).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("not by this run's"),
+        "{error:?}"
+    );
+    let rebuilt = rebuild(&ids.scorer).unwrap();
+    let mut scorer = StepperModel(Toy::exact());
+    let mut baseline_model = StepperModel(Toy::rounded(1));
+    let candidate = Candidate {
+        identity: &identity("candidate"),
+        generations: &case.candidate,
+        audit_cap: AUDIT_CAP,
+    };
+    let again = rebuilt
+        .judge((&mut scorer, Some(&mut baseline_model)), candidate)
+        .unwrap();
+    assert_eq!(again.report, run.report);
+    assert_eq!(again.report.verdict, Verdict::Pass);
+}
+
+#[test]
+fn a_reread_explains_an_event_up_to_twice_delta_and_no_further() {
+    // Delta 0.125: one prefill that brings the 3-nat event to 0.25 nats explains it; 0.375 nats,
+    // inside four delta but outside two, leaves it unexplained.
+    for (margin, explained) in [(0.25, 1), (0.375, 0)] {
+        let (reference, baseline, mut candidate) = synthetic();
+        candidate.requests[0].audits[0].prefill.margin = margin;
+        let report = evaluate(ANY_COVERAGE, &reference, &baseline, &candidate).unwrap();
+        assert_eq!(report.candidate.explained_events, explained, "{margin}");
+        assert_eq!(
+            report.candidate.unexplained_events,
+            1 - explained,
+            "{margin}"
+        );
+    }
+}
