@@ -64,9 +64,12 @@ HOST_DETAIL_PATTERNS = [
         r"\bfifi" + _SEP + r"(?:scr" + "ch|ledger|knowledge|wrk" + r"tr)\b", re.IGNORECASE
     ),
 ]
-# Vendored sources and the pinned publisher copy keep their exact upstream
-# bytes, so the rule skips them.
-HOST_DETAIL_SKIPPED = re.compile(r"(?:^|/)(?:vendor/|qualification/publisher/)")
+# Vendored sources keep their pinned bytes, and the publisher package pins
+# the live hook files verbatim, so the rule skips exactly those two paths.
+# New pinned files require an intentional update here plus a manifest entry.
+HOST_DETAIL_SKIPPED = re.compile(
+    r"(?:^|/)(?:vendor/|qualification/publisher/(?:publish_commits|sanitize)\.py)"
+)
 
 
 class CheckError(Exception):

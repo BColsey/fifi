@@ -217,18 +217,46 @@ class StagedGateTests(unittest.TestCase):
     def test_staged_host_details_in_vendored_files_and_removed_lines_pass(self) -> None:
         owner = "da" + "n"
         self.write("engine/vendor/lib/note.txt", "/home/" + owner + "/x" + chr(10))
-        # The publisher package pins the live hook bytes verbatim, so a host
-        # name embedded in those bytes must not block committing the copy.
-        self.write("qualification/publisher/pinned.txt", "kub" + owner + "-msg" + chr(10))
         self.write("old.md", "/home/" + owner + "/x" + chr(10))
         self.git("add", "old.md")
         self.git("-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "seed")
         self.write("old.md", "clean" + chr(10))
-        self.stage("engine/vendor/lib/note.txt", "qualification/publisher/pinned.txt", "old.md")
+        self.stage("engine/vendor/lib/note.txt", "old.md")
 
         result = self.run_pre_commit()
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_staged_host_details_skip_only_pinned_publisher_snapshots(self) -> None:
+        owner = "da" + "n"
+        # The two pinned snapshots carry upstream bytes and must pass.
+        self.write("qualification/publisher/publish_commits.py",
+                  'NOTE = "' + "/home/" + owner + '/x"' + chr(10))
+        self.write("qualification/publisher/sanitize.py",
+                  'TOKEN = "' + "kub" + owner + '-msg"' + chr(10))
+        self.git("add", "-f", "--", "qualification/publisher/publish_commits.py",
+                 "qualification/publisher/sanitize.py")
+
+        result = self.run_pre_commit()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_staged_host_details_reject_unpinned_publisher_files(self) -> None:
+        owner = "da" + "n"
+        # The carve-out is not a directory-level bypass: an unrelated file in
+        # the publisher package, and pinned-looking names elsewhere, stay gated.
+        for path in ("qualification/publisher/notes.txt",
+                     "qualification/publisher/tools.py",
+                     "docs/sanitize.py"):
+            with self.subTest(path=path):
+                self.git("reset", "-q")
+                self.write(path, 'NOTE = "' + "/home/" + owner + '/x"' + chr(10))
+                self.git("add", "-f", "--", path)
+
+                result = self.run_pre_commit()
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"host path or host name in {path}", result.stderr)
 
     def test_staged_host_detail_lookalikes_pass(self) -> None:
         self.write("notes.md", "/home/" + "dani" + "el/x and a spin" + "up of the pool" + chr(10))
@@ -403,7 +431,7 @@ class StagedGateTests(unittest.TestCase):
         no_python = self.root / "no-python-bin"
         no_python.mkdir()
         git_path = shutil.which("git")
-        self.assertIsNotNone(git_path)
+        assert git_path is not None, "git must be on PATH for this test"
         (no_python / "git").symlink_to(git_path)
         env = dict(os.environ)
         env["PATH"] = str(no_python)
