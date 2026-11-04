@@ -27,8 +27,40 @@ export interface Engine {
   id: string;
   model: string;
   state: EngineState;
+  /** Present only while `state` is `loading`: the loader's own name
+   * for the phase it is in. Absent once the engine is ready, failed,
+   * or stopped — never a percentage, never invented. */
+  load_stage?: string;
   cache?: CacheStats;
   error?: EngineErrorInfo;
+}
+
+export interface EffectiveSetting {
+  key: string;
+  value: string;
+  origin: string;
+}
+
+export interface SystemEngine {
+  id: string;
+  model: string;
+  state: EngineState;
+  context_limit: number;
+  /** The rows the engine started with, as `config effective` prints
+   * them — not a re-resolution. Empty where a family composes no
+   * per-key origins. */
+  settings: EffectiveSetting[];
+}
+
+export interface SystemInfo {
+  version: string;
+  backends_compiled: string[];
+  host: {
+    cpu_threads: number;
+    mem_total_bytes: number | { unavailable: string };
+    mem_available_bytes: number | { unavailable: string };
+  };
+  engines: SystemEngine[];
 }
 
 export interface Model {
@@ -235,6 +267,10 @@ export function getReady(signal?: AbortSignal): Promise<ReadyBody> {
 
 export function listModels(signal?: AbortSignal): Promise<ModelList> {
   return getJson<ModelList>("/v1/models", true, signal);
+}
+
+export function getSystem(signal?: AbortSignal): Promise<SystemInfo> {
+  return getJson<SystemInfo>("/v1/system", true, signal);
 }
 
 /** One row of the monitor's recent-request ring: the log line reduced to

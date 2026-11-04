@@ -3,7 +3,7 @@
  * return.
  */
 
-import { ApiError, listRecentRequests, type Engine, type Model, type RecentRequest } from "./api.js";
+import { ApiError, listRecentRequests, type Engine, type Model, type RecentRequest, type SystemInfo } from "./api.js";
 
 /** The full panel state the view renders (re-exported as MonitorData). */
 export interface PanelData {
@@ -12,6 +12,8 @@ export interface PanelData {
   notReadyCode: string | null;
   models: Model[] | null;
   modelsError: string | null;
+  system: SystemInfo | null;
+  systemError: string | null;
   recent: RecentRequest[] | null;
   recentError: string | null;
   checkedAt: number;
@@ -56,6 +58,8 @@ export interface ProbeOutcome {
   notReadyCode: string | null;
   models: Model[] | null;
   modelsError: string | null;
+  system: SystemInfo | null;
+  systemError: string | null;
   recent: RecentRequest[] | null;
   recentError: string | null;
 }
@@ -100,4 +104,32 @@ export function engineErrorLines(engine: Engine): string[] {
     lines.push(error.suggestion);
   }
   return lines;
+}
+
+/** The loading line for one engine: the loader's own stage name, shown
+ * verbatim while the engine loads. A stage that stops changing reads
+ * as stalled — that is the point of naming stages instead of guessing
+ * percentages. Null for every non-loading engine. */
+export function engineStageLine(engine: Engine): string | null {
+  if (engine.state !== "loading" || engine.load_stage === undefined) return null;
+  return "loading: " + engine.load_stage;
+}
+
+/** The system view's engine entry for one model-list engine id, or null
+ * when the sweep has no system answer. Matching by id is the whole
+ * join: the two routes describe the same engines. */
+export function systemEngineFor(system: SystemInfo | null, id: string): SystemEngineFor | null {
+  if (system === null) return null;
+  return system.engines.find((engine) => engine.id === id) ?? null;
+}
+
+export type SystemEngineFor = SystemInfo["engines"][number];
+
+/** One text line per retained setting row: key, value exactly as the
+ * resolver rendered it, and the origin that decided it. Formatting
+ * only — every fact is the server's. */
+export function settingsLines(engine: SystemEngineFor): string[] {
+  return engine.settings.map(
+    (row) => row.key + ": " + row.value + " (" + row.origin + ")"
+  );
 }

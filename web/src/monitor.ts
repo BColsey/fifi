@@ -2,11 +2,21 @@ import {
   ApiError,
   getHealth,
   getReady,
+  getSystem,
   listModels,
   type Model,
+  type SystemInfo,
 } from "./api";
 import { formatBytes, formatClock, formatDate, formatTokens } from "./format";
-import { applyProbe, engineErrorLines, refreshRecentRows, type PanelData } from "./panel";
+import {
+  applyProbe,
+  engineErrorLines,
+  engineStageLine,
+  refreshRecentRows,
+  settingsLines,
+  systemEngineFor,
+  type PanelData,
+} from "./panel";
 import { speedSummary } from "./speed";
 
 export type MonitorData = PanelData;
@@ -22,6 +32,8 @@ export class MonitorView {
     notReadyCode: null,
     models: null,
     modelsError: null,
+    system: null,
+    systemError: null,
     recent: null,
     recentError: null,
     checkedAt: 0,
@@ -76,6 +88,18 @@ export class MonitorView {
         modelsError = err instanceof ApiError ? err.code : "network";
       }
     }
+    // The system leg carries the retained settings rows; it degrades
+    // the same way the models leg does — null data plus a cause, never
+    // last-good rows beside a fresh timestamp.
+    let system: SystemInfo | null = null;
+    let systemError: string | null = null;
+    if (healthOk) {
+      try {
+        system = await getSystem(AbortSignal.timeout(4000));
+      } catch (err) {
+        systemError = err instanceof ApiError ? err.code : "network";
+      }
+    }
     // The recent-rows fetch-and-reduce is the panel module's one
     // implementation; the sweep calls it only from a reachable server —
     // a dead one gets null rows, and applyProbe's full replacement keeps
@@ -89,6 +113,8 @@ export class MonitorView {
       notReadyCode,
       models,
       modelsError,
+      system,
+      systemError,
       recent: panel.recent,
       recentError: panel.recentError,
     });
@@ -245,11 +271,35 @@ export class MonitorView {
       chip.textContent = engine.state;
       row.append(id, chip);
       block.append(row);
+      const stage = engineStageLine(engine);
+      if (stage !== null) {
+        const stageLine = document.createElement("div");
+        stageLine.className = "cache-facts";
+        stageLine.textContent = stage;
+        block.append(stageLine);
+      }
       for (const line of engineErrorLines(engine)) {
         const failure = document.createElement("div");
         failure.className = "cache-facts engine-error";
         failure.textContent = line;
         block.append(failure);
+      }
+      // The retained settings rows from /v1/system, joined by engine
+      // id: what this engine actually started with. Collapsed by
+      // default — it is reference material, not status.
+      const systemEngine = systemEngineFor(this.data.system, engine.id);
+      if (systemEngine !== null && systemEngine.settings.length > 0) {
+        const details = document.createElement("details");
+        details.className = "cache-facts engine-settings";
+        const summary = document.createElement("summary");
+        summary.textContent = "settings";
+        details.append(summary);
+        for (const line of settingsLines(systemEngine)) {
+          const setting = document.createElement("div");
+          setting.textContent = line;
+          details.append(setting);
+        }
+        block.append(details);
       }
       if (engine.cache !== undefined) {
         const facts = document.createElement("div");

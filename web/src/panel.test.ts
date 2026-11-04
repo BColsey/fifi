@@ -1,7 +1,15 @@
 import { test } from "node:test";
-import { ok, strictEqual } from "node:assert";
-import { applyProbe, engineErrorLines, pollPlan, refreshRecentRows } from "./panel.js";
-import type { Engine, RecentRequest } from "./api.js";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import {
+  applyProbe,
+  engineErrorLines,
+  engineStageLine,
+  pollPlan,
+  refreshRecentRows,
+  settingsLines,
+  systemEngineFor,
+} from "./panel.js";
+import type { Engine, RecentRequest, SystemInfo } from "./api.js";
 
 function row(tokens: number): RecentRequest {
   return {
@@ -81,6 +89,8 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
     notReadyCode: null,
     models: null,
     modelsError: null,
+    system: null,
+    systemError: null,
     recent: [row(1)],
     recentError: null,
   });
@@ -91,6 +101,8 @@ test("a failed probe fully replaces the panel: no last-good ok survives a fresh 
     notReadyCode: null,
     models: null,
     modelsError: null,
+    system: null,
+    systemError: null,
     recent: null,
     recentError: null,
   });
@@ -167,4 +179,60 @@ test("healthy engines and unknown retry render honestly", () => {
   const lines = engineErrorLines(backend);
   strictEqual(lines.length, 2);
   ok(lines.some((line) => line.includes("not known to help")));
+});
+
+test("loading engines show the loader's own stage, others show none", () => {
+  strictEqual(
+    engineStageLine({ id: "e", model: "m", state: "loading", load_stage: "loading weights" }),
+    "loading: loading weights"
+  );
+  // A loading engine before its first stage note has no line — the
+  // state chip already says loading; no invented stage.
+  strictEqual(engineStageLine({ id: "e", model: "m", state: "loading" }), null);
+  // A stage left over on a non-loading engine must never render.
+  strictEqual(
+    engineStageLine({ id: "e", model: "m", state: "ready", load_stage: "ready" }),
+    null
+  );
+});
+
+test("settings lines carry the resolver's facts verbatim", () => {
+  const system: SystemInfo = {
+    version: "0.1.0",
+    backends_compiled: ["cuda"],
+    host: {
+      cpu_threads: 24,
+      mem_total_bytes: 1,
+      mem_available_bytes: { unavailable: "why" },
+    },
+    engines: [
+      {
+        id: "q36",
+        model: "m",
+        state: "ready",
+        context_limit: 32768,
+        settings: [
+          { key: "kv_dtype", value: "q8", origin: "config_file" },
+          { key: "context_limit", value: "32768", origin: "default" },
+        ],
+      },
+    ],
+  };
+  strictEqual(systemEngineFor(null, "q36"), null);
+  strictEqual(systemEngineFor(system, "other"), null);
+  const engine = systemEngineFor(system, "q36");
+  if (engine === null) throw new Error("q36 must be in the system view");
+  deepStrictEqual(settingsLines(engine), [
+    "kv_dtype: q8 (config_file)",
+    "context_limit: 32768 (default)",
+  ]);
+  // Engines of families that compose no rows show an empty list, not
+  // an invented one.
+  const shallow: SystemInfo = {
+    ...system,
+    engines: [{ id: "f", model: "m", state: "ready", context_limit: 1, settings: [] }],
+  };
+  const flint = systemEngineFor(shallow, "f");
+  if (flint === null) throw new Error("f must be in the system view");
+  deepStrictEqual(settingsLines(flint), []);
 });

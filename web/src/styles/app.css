@@ -767,3 +767,14 @@ button, select, input, textarea {
     animation-duration: 0.01ms !important;
   }
 }
+
+/* The retained-settings disclosure under an engine row: reference
+   material, not status — collapsed until asked for. */
+details.engine-settings { display: block; }
+details.engine-settings summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--fifi-text-secondary);
+  font-size: var(--fifi-size-1);
+}
+details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
