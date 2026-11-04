@@ -43,6 +43,20 @@ __device__ __forceinline__ half decode_state(unsigned state, int book) {
                   __ushort_as_half(static_cast<unsigned short>(x >> 16)));
 }
 
+// Book 2 (MUL1) through one packed byte dot product: the bench-only prototype of the id-indexed
+// launch (`inference_cuda_exl3_grouped_indexed_prototype`), never the production kernels.
+// decode_state sums the four bytes of x and adds the F16 1024.0 (0x6400). The sum is at most
+// 4 * 255 = 1020, so 1024 + sum lies in [1024, 2044], where F16 values are the integers: the
+// result is exact and its bits are 0x6400 + sum. __dp4a with unsigned operands multiplies each
+// byte of x, as an unsigned value, by 1 and adds 0x6400, giving those bits in one instruction;
+// the top 16 bits of the result are 0. The scale and bias FMA is decode_state's.
+__device__ __forceinline__ half decode_book2_dp4a(unsigned state) {
+    const unsigned x = state * 0x83dcd12du;
+    const unsigned bits = __dp4a(x, 0x01010101u, 0x6400u);
+    const half value = __ushort_as_half(static_cast<unsigned short>(bits));
+    return __hfma(value, __ushort_as_half(0x1eee), __ushort_as_half(0xc931));
+}
+
 __device__ __forceinline__ unsigned word32(const uint16_t *tile, unsigned index) {
     return unsigned(tile[2 * index]) | (unsigned(tile[2 * index + 1]) << 16);
 }
@@ -790,7 +804,8 @@ __device__ __forceinline__ unsigned load_word(const uint16_t *tile, unsigned ind
 // word of the rate-8 pair table is a second load instead of a shuffle, so the loop carries no
 // warp-convergent shuffle. For book 1 at rate 8 the loop is 104 instructions per tile and lane
 // (115 before): the decode of the eight weights is 64 of them, the rest is loop and address work.
-template <int Book, int Bits, bool Aligned, class Args>
+// Dp4a (bench-only prototype) decodes book 2 with decode_book2_dp4a; the other books ignore it.
+template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false>
 __device__ __forceinline__ void grouped_projection_one_tile(
     const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16]) {
     const size_t row = size_t(blockIdx.y) - a.first;
@@ -857,7 +872,9 @@ __device__ __forceinline__ void grouped_projection_one_tile(
             } else {
                 state = __funnelshift_l(wtab[index + 1], wtab[index], shift) >> 16;
             }
-            if constexpr (Book == 2)
+            if constexpr (Book == 2 && Dp4a)
+                sums[col] = fmaf(x, __half2float(decode_book2_dp4a(state)), sums[col]);
+            else if constexpr (Book == 2)
                 sums[col] = fmaf(x, __half2float(decode_state(state, Book)), sums[col]);
             else
                 sums[col] = fmaf(x, decode_float<Book>(state, consts), sums[col]);
@@ -996,31 +1013,33 @@ __device__ __forceinline__ void grouped_projection_wide(
 }
 
 // The one-tile body with the loop copy that matches the trellis alignment.
-template <int Book, int Bits, class Args>
+template <int Book, int Bits, class Args, bool Dp4a = false>
 __device__ __forceinline__ void one_tile_by_alignment(const Args &p, const GroupEntry &a,
                                                       unsigned (&wtab)[128],
                                                       float (&partial)[8][16]) {
     if ((reinterpret_cast<uintptr_t>(a.trellis) & 3u) == 0)
-        grouped_projection_one_tile<Book, Bits, true>(p, a, wtab, partial);
+        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a>(p, a, wtab, partial);
     else
-        grouped_projection_one_tile<Book, Bits, false>(p, a, wtab, partial);
+        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a>(p, a, wtab, partial);
 }
 
 // 8 is 4.0 bpw (every projection of the Qwen3.6 pack except the head), 12 is 6.0 bpw (the
 // head); any other rate runs the generic body.
-template <int Book, int Cols, bool LeanAnyRate, class Args>
+template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false>
 __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
                                              unsigned (&wtab)[Cols][128],
                                              float (&partial)[8][16 * Cols]) {
+    // The DP4A prototype exists for the one-tile body of the id-indexed launch only.
+    static_assert(!Dp4a || (Cols == 1 && LeanAnyRate), "the DP4A decode runs one tile per block");
     if constexpr (Cols == 1) {
         switch (a.bits_twice) {
-            case 8: one_tile_by_alignment<Book, 8>(p, a, wtab[0], partial); break;
-            case 12: one_tile_by_alignment<Book, 12>(p, a, wtab[0], partial); break;
+            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a>(p, a, wtab[0], partial); break;
+            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a>(p, a, wtab[0], partial); break;
             default:
                 // The dense kernel keeps the generic body for the rates the model does not use:
                 // the lean body at an unknown rate spills there; the indexed kernel does not.
                 if constexpr (LeanAnyRate)
-                    one_tile_by_alignment<Book, 0>(p, a, wtab[0], partial);
+                    one_tile_by_alignment<Book, 0, Args, Dp4a>(p, a, wtab[0], partial);
                 else
                     grouped_projection_wide<Book, 1, 0>(p, a, wtab, partial);
                 break;
@@ -1260,6 +1279,8 @@ static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t coun
 // kernel of the same stream and the launch can be captured in a graph. Every pair is one row.
 // The arithmetic is the wide projection's, hence the grouped gather kernel's.
 constexpr size_t indexed_capacity = 16;
+// The bench-only prototype launch takes Flash-Next's 20 gate and up pairs at once.
+constexpr size_t indexed_prototype_capacity = 20;
 struct IndexInfo {
     const int32_t *ids;
     uint32_t slot, members;
@@ -1268,18 +1289,24 @@ struct IndexInfo {
     const uint32_t *offsets;  // optional byte offset of each member, replaces the strides
 };
 constexpr uint32_t absent_member = 0xffffffffu;
-struct IndexedArgs {
-    GroupEntry entries[indexed_capacity];  // member 0 of the bank, and the pair's spans
-    IndexInfo info[indexed_capacity];
+template <size_t Capacity>
+struct IndexedArgsOf {
+    static constexpr size_t capacity = Capacity;
+    GroupEntry entries[Capacity];  // member 0 of the bank, and the pair's spans
+    IndexInfo info[Capacity];
     uint32_t *flag;
     size_t k, n;
     uint32_t pairs, groups, fused_publish;
 };
-static_assert(sizeof(IndexInfo) == 40 && sizeof(IndexedArgs) <= 4096, "indexed launch parameters");
+using IndexedArgs = IndexedArgsOf<indexed_capacity>;
+using IndexedPrototypeArgs = IndexedArgsOf<indexed_prototype_capacity>;
+static_assert(sizeof(IndexInfo) == 40 && sizeof(IndexedPrototypeArgs) <= 4096,
+              "indexed launch parameters");
 
 // The pair of this block with its weights resolved; false for an id outside the bank, which also
 // raises the sticky flag (once per pair, from the first block of the grid).
-__device__ __forceinline__ bool resolve_indexed(const IndexedArgs &p, GroupEntry &a) {
+template <class P>
+__device__ __forceinline__ bool resolve_indexed(const P &p, GroupEntry &a) {
     a = p.entries[blockIdx.y];
     const IndexInfo &info = p.info[blockIdx.y];
     const int id = info.ids[info.slot];
@@ -1306,7 +1333,10 @@ __device__ __forceinline__ bool resolve_indexed(const IndexedArgs &p, GroupEntry
     return true;
 }
 
-__global__ void indexed_input_rotate(const __grid_constant__ IndexedArgs p) {
+// The kernel bodies of the id-indexed launch, for the production parameter block and the
+// prototype's.
+template <class P>
+__device__ __forceinline__ void indexed_input_rotate_body(const P &p) {
     __shared__ float values[128];
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
@@ -1315,21 +1345,21 @@ __global__ void indexed_input_rotate(const __grid_constant__ IndexedArgs p) {
     a.xh[index] = finite_or_flag(rotate128(value, values), p.flag);
 }
 
-template <int Cols>
-__global__ void __launch_bounds__(256, wide_min_blocks<Cols>) indexed_project_wide(
-    const __grid_constant__ IndexedArgs p) {
+template <int Cols, bool Dp4a, class P>
+__device__ __forceinline__ void indexed_project_body(const P &p) {
     __shared__ float partial[8][16 * Cols];
     __shared__ __align__(8) unsigned wtab[8][Cols][128];
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     switch (a.book) {
-        case 0: wide_by_rate<0, Cols, true>(p, a, wtab[threadIdx.x / 32], partial); break;
-        case 1: wide_by_rate<1, Cols, true>(p, a, wtab[threadIdx.x / 32], partial); break;
-        default: wide_by_rate<2, Cols, true>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 0: wide_by_rate<0, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
+        case 1: wide_by_rate<1, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
+        default: wide_by_rate<2, Cols, true, P, Dp4a>(p, a, wtab[threadIdx.x / 32], partial); break;
     }
 }
 
-__global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
+template <class P>
+__device__ __forceinline__ void indexed_output_rotate_body(const P &p) {
     __shared__ float values[128];
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
@@ -1342,6 +1372,58 @@ __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
     const float stored = p.fused_publish ?
         __bfloat162float(__float2bfloat16_rn(value)) : value;
     a.out[index] = finite_or_flag(stored, p.flag);
+}
+
+__global__ void indexed_input_rotate(const __grid_constant__ IndexedArgs p) {
+    indexed_input_rotate_body(p);
+}
+
+template <int Cols>
+__global__ void __launch_bounds__(256, wide_min_blocks<Cols>) indexed_project_wide(
+    const __grid_constant__ IndexedArgs p) {
+    indexed_project_body<Cols, false>(p);
+}
+
+__global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
+    indexed_output_rotate_body(p);
+}
+
+// The bench-only prototype kernels (`inference_cuda_exl3_grouped_indexed_prototype`): the same
+// bodies on parameter block P (16 or 20 pairs), one tile per block, with the DP4A decode when
+// Dp4a is set. No production path launches them.
+template <class P>
+__global__ void prototype_input_rotate(const __grid_constant__ P p) {
+    indexed_input_rotate_body(p);
+}
+
+template <class P, bool Dp4a>
+__global__ void __launch_bounds__(256, wide_min_blocks<1>) prototype_project(
+    const __grid_constant__ P p) {
+    indexed_project_body<1, Dp4a>(p);
+}
+
+template <class P>
+__global__ void prototype_output_rotate(const __grid_constant__ P p) {
+    indexed_output_rotate_body(p);
+}
+
+// Probe of the DP4A decode for its tests (`inference_cuda_exl3_book2_probe`). For each word x:
+// sums[2 i] is decode_state's byte sum of x (four masks and adds), sums[2 i + 1] the DP4A result
+// __dp4a(x, 0x01010101, 0x6400). For each of the 65536 states s: decoded[2 s] holds the bits of
+// decode_state(s, 2), decoded[2 s + 1] those of decode_book2_dp4a(s).
+__global__ void book2_probe_sums(const uint32_t *words, size_t count, uint32_t *sums) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const unsigned x = words[i];
+    sums[2 * i] = (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+    sums[2 * i + 1] = __dp4a(x, 0x01010101u, 0x6400u);
+}
+
+__global__ void book2_probe_states(uint16_t *decoded) {
+    const unsigned state = blockIdx.x * blockDim.x + threadIdx.x;
+    if (state > 0xffffu) return;
+    decoded[2 * state] = __half_as_ushort(decode_state(state, 2));
+    decoded[2 * state + 1] = __half_as_ushort(decode_book2_dp4a(state));
 }
 
 
@@ -1411,32 +1493,42 @@ static inline __attribute__((always_inline)) int grouped_launch(
         return int(failure.err);
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
+// Checks an id-indexed group of `count` calls (at most P::capacity, every n a multiple of
+// 16 * cols) and fills the parameter block; false refuses it.
+template <class P>
+static bool indexed_args(const inference_cuda_exl3_linear_args *calls,
+    const inference_cuda_exl3_index_args *index, size_t count, size_t cols, P &args) {
+    GroupArgs checked;
+    if (!index || count < 1 || count > P::capacity || !group_args(calls, count, checked) ||
+        checked.pairs != count || checked.n % (16 * cols)) return false;
+    args = {};
+    args.flag = checked.flag;
+    args.k = checked.k;
+    args.n = checked.n;
+    args.pairs = checked.pairs;
+    args.groups = checked.groups;
+    args.fused_publish = checked.fused_publish;
+    for (size_t i = 0; i < count; ++i) {
+        const auto &x = index[i];
+        if (!x.ids || x.ids_bytes < (size_t(x.slot) + 1) * 4 || uintptr_t(x.ids) % 4 ||
+            !x.members || calls[i].rows != 1 ||
+            (x.offsets ? uintptr_t(x.offsets) % 4 != 0
+                       : (!x.trellis_stride || !x.scale_stride)))
+            return false;
+        args.entries[i] = checked.entries[i];
+        args.info[i] = {x.ids, x.slot, x.members, x.trellis_stride, x.scale_stride, x.offsets};
+    }
+    return true;
+}
+
 template <int Cols>
 static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
     const inference_cuda_exl3_index_args *index, size_t count, void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
-        GroupArgs checked;
-        if (!stream || !index || count < 1 || count > indexed_capacity ||
-            !group_args(calls, count, checked) || checked.pairs != count ||
-            checked.n % (16 * size_t(Cols))) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        IndexedArgs args = {};
-        args.flag = checked.flag;
-        args.k = checked.k;
-        args.n = checked.n;
-        args.pairs = checked.pairs;
-        args.groups = checked.groups;
-        args.fused_publish = checked.fused_publish;
-        for (size_t i = 0; i < count; ++i) {
-            const auto &x = index[i];
-            if (!x.ids || x.ids_bytes < (size_t(x.slot) + 1) * 4 || uintptr_t(x.ids) % 4 ||
-                !x.members || calls[i].rows != 1 ||
-                (x.offsets ? uintptr_t(x.offsets) % 4 != 0
-                           : (!x.trellis_stride || !x.scale_stride)))
-                return INFERENCE_CUDA_INVALID_ARGUMENT;
-            args.entries[i] = checked.entries[i];
-            args.info[i] = {x.ids, x.slot, x.members, x.trellis_stride, x.scale_stride, x.offsets};
-        }
+        IndexedArgs args;
+        if (!stream || !indexed_args(calls, index, count, Cols, args))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
@@ -1446,6 +1538,31 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
                 const dim3 wide(grid.x / Cols, grid.y, grid.z);
                 indexed_project_wide<Cols><<<wide,block,0,(cudaStream_t)stream>>>(args);
             } else indexed_output_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            return failure.err == cudaSuccess;
+        });
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
+}
+
+// The bench-only prototype launch on parameter block P, one tile per block.
+template <class P, bool Dp4a>
+static int prototype_launch(const inference_cuda_exl3_linear_args *calls,
+    const inference_cuda_exl3_index_args *index, size_t count, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        P args;
+        if (!stream || !indexed_args(calls, index, count, 1, args))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure failure;
+        emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
+            const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
+            if (e.kind == LinearKind::Input)
+                prototype_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
+            else if (e.kind == LinearKind::Small)
+                prototype_project<P, Dp4a><<<grid,block,0,(cudaStream_t)stream>>>(args);
+            else prototype_output_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             return failure.err == cudaSuccess;
         });
@@ -1496,6 +1613,45 @@ extern "C" int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_lin
         case 8: return indexed_launch<8>(calls, index, count, stream, out_stage);
         default: return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
+}
+
+// Bench-only prototype of the id-indexed launch, one tile per block. `variant` bit 0 decodes
+// book 2 with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16). Variant 0 is the
+// production launch and is refused here.
+extern "C" int inference_cuda_exl3_grouped_indexed_prototype(
+    const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
+    size_t count, void *stream, int *out_stage, unsigned variant) {
+    switch (variant) {
+        case 1: return prototype_launch<IndexedArgs, true>(calls, index, count, stream, out_stage);
+        case 2:
+            return prototype_launch<IndexedPrototypeArgs, false>(calls, index, count, stream,
+                                                                 out_stage);
+        case 3:
+            return prototype_launch<IndexedPrototypeArgs, true>(calls, index, count, stream,
+                                                                out_stage);
+        default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+}
+
+// The DP4A decode probe (book2_probe_sums, book2_probe_states): `sums` holds 2 * count words,
+// `decoded` 2 * 65536 halves.
+extern "C" int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count,
+    uint32_t *sums, uint16_t *decoded, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !words || !count || !sums || !decoded)
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        Failure failure;
+        book2_probe_sums<<<unsigned((count + 255) / 256), 256, 0, (cudaStream_t)stream>>>(
+            words, count, sums);
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == cudaSuccess) {
+            book2_probe_states<<<256, 256, 0, (cudaStream_t)stream>>>(decoded);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
 extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))

@@ -1,35 +1,40 @@
-//! EXL3 projection-kernel variants for the routed experts of one real Qwen3.8 Flash-Next layer on
-//! one GPU. Measurement only: it adds no execution path and changes no executor, default or limit.
+//! The id-indexed EXL3 projection launch of the routed experts of one real Qwen3.8 Flash-Next
+//! layer on one GPU: the production launch against its bench-only prototypes (`IndexedPrototype`:
+//! the DP4A decode of book 2, one launch of the 20 gate and up pairs, both). Measurement only: the
+//! prototypes run in test builds alone and no executor, default or limit changes.
 //!
-//! The id-indexed projection launch (`CudaContext::exl3_grouped_indexed`: input rotation, the
-//! projection kernel, output rotation) is timed for the layer's two expert shapes:
+//! The launch (`CudaContext::exl3_grouped_indexed`: input rotation, the projection kernel, output
+//! rotation, one column tile per block) is timed for the layer's two expert shapes:
 //! - gate/up, 2560 to 640. The pairs alternate the gate and up matrices of each pick, as in the
 //!   MoE block.
 //! - down, 640 to 2560.
 //!
-//! Each shape is timed at 1, 2, 4 and 8 column tiles per block (`cols`: the existing wide
-//! variants), for several pair counts, and for the block's own launch sequences:
-//! - 16 + 4 gate/up pairs, the block's split;
-//! - 10 + 10 gate/up pairs, the even split;
-//! - 10 down pairs.
+//! Cases:
+//! - the pair sweeps (gate/up 2 to 16 pairs, the 4-pair tail, down 2 to 10 pairs), production
+//!   against DP4A;
+//! - `gateup_20`: the block's 20 gate and up pairs, as 16 + 4 production launches, 16 + 4 DP4A
+//!   launches, one 20-pair launch and one 20-pair DP4A launch, so the decode, the consolidation
+//!   and both are measured against the same baseline in the same trials;
+//! - warm gate/up 16 and down 10, production against DP4A.
 //!
 //! Cold launches read a new set of ten distinct experts each time. 51 sets rotate through the 512
 //! experts, so a launch never finds its weights in the 6 MB L2. Warm launches point every pick at
-//! one expert, whose matrices stay in L2 after the first launch. Warm runs the same instructions
-//! with the DRAM traffic taken away, so the cold/warm gap bounds what memory costs.
+//! one expert, whose matrices stay in L2 after the first launch, so they run the same instructions
+//! without the DRAM traffic.
 //!
-//! Each case runs `LAUNCHES` launches back to back, with a timing mark between launches.
+//! Each case runs `LAUNCHES` runs back to back, with a timing mark between runs.
 //! - The stream first runs a device copy (the gate, about 2.5 ms) while the host queues the
-//!   launches behind it, so the launches run back to back instead of at the host's pace.
+//!   runs behind it, so the runs follow each other instead of the host's pace.
 //! - A run counts as late when the host finished queueing it after the device could have
 //!   reached its start; its sample may hold a host gap. The test is conservative: it can count a
 //!   clean run as late, never a gapped run as clean.
-//! - Every trial runs all four variants of a case one after another, in an order that rotates
-//!   from trial to trial, so clock drift and position spread over them. The first trial is a
-//!   warm-up.
-//! - Before timing, every variant's output rows are compared bit for bit with cols = 1 for the
-//!   first and last cold pick sets and the warm set, for every launch. The output rows, the
-//!   rotated inputs and the split-K partials are filled with NaN first, so a skipped write shows.
+//! - Every trial runs all variants of a case one after another, in an order that rotates from
+//!   trial to trial, so clock drift and position spread over them. The first trial is a warm-up.
+//! - Before timing, every variant's output rows are compared bit for bit with the case's
+//!   production variant for the first and last cold pick sets and the warm set. The output rows,
+//!   the rotated inputs and the split-K partials are filled with NaN first, so a skipped write
+//!   shows. Each pair writes its own output row, so a 20-pair launch is compared row for row with
+//!   16 + 4 launches.
 //! - The arithmetic flag must stay 0.
 //!
 //! Each sample is one run of a case: its launches (three kernels each) plus a timing mark. A
@@ -47,19 +52,20 @@ use crate::{
         project::cuda::{CudaProjector, exl3::Exl3Io},
         qwen36::cuda::moe::MoeDims,
     },
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, TimingEvent},
+    kernels::cuda::{
+        CudaContext, DeviceBuffer, DeviceStream, TimingEvent, resident::exl3::IndexedPrototype,
+    },
 };
 
 const F32: usize = size_of::<f32>();
-const COLS: [u32; 4] = [1, 2, 4, 8];
 /// Picks per id set: the layer's top-k.
 const PICKS: usize = 10;
 /// Cold id sets of distinct experts; one more set, the last, points every pick at expert 0.
 const SETS: usize = 51;
 const LAUNCHES: usize = 48;
 const TRIALS: usize = 4;
-/// The most pairs one id-indexed launch takes.
-const MAX_PAIRS: usize = 16;
+/// The most pairs one case covers: the block's 20 gate and up pairs.
+const MAX_PAIRS: usize = 20;
 /// Bytes of the gate's device copy: about 2.5 ms at the 3090's copy rate, longer than the host
 /// takes to queue the largest case.
 const GATE_BYTES: usize = 1 << 30;
@@ -70,50 +76,68 @@ enum Shape {
     Down,
 }
 
-/// One timed case: launches of consecutive pairs (first pair, pair count; in pick order) on one
-/// shape.
+/// Launches of consecutive pairs: (first pair, pair count), in pick order.
+type Launches = &'static [(usize, usize)];
+
+/// One variant of a case: its name, the prototype it runs and its launches.
+type Variant = (&'static str, IndexedPrototype, Launches);
+
+/// One timed case on one shape. Its first variant is the production one, the reference of the
+/// check.
 struct Case {
     name: &'static str,
     shape: Shape,
-    launches: &'static [(usize, usize)],
+    variants: &'static [Variant],
     warm: bool,
 }
 
-const fn case(
-    name: &'static str,
-    shape: Shape,
-    launches: &'static [(usize, usize)],
-    warm: bool,
-) -> Case {
+const fn case(name: &'static str, shape: Shape, variants: &'static [Variant], warm: bool) -> Case {
     Case {
         name,
         shape,
-        launches,
+        variants,
         warm,
     }
 }
 
-const CASES: [Case; 15] = [
-    case("gateup_p2", Shape::GateUp, &[(0, 2)], false),
-    case("gateup_p4", Shape::GateUp, &[(0, 4)], false),
-    case("gateup_p8", Shape::GateUp, &[(0, 8)], false),
-    case("gateup_p12", Shape::GateUp, &[(0, 12)], false),
-    case("gateup_p16", Shape::GateUp, &[(0, 16)], false),
-    case("gateup_tail_p4", Shape::GateUp, &[(16, 4)], false),
-    case("gateup_seq_16_4", Shape::GateUp, &[(0, 16), (16, 4)], false),
+/// Production against DP4A over the same launches.
+macro_rules! decode {
+    ($launches:expr) => {
+        &[
+            ("base", IndexedPrototype::Off, $launches),
+            ("dp4a", IndexedPrototype::Dp4a, $launches),
+        ]
+    };
+}
+
+const SPLIT: Launches = &[(0, 16), (16, 4)];
+const SINGLE: Launches = &[(0, 20)];
+
+const CASES: [Case; 14] = [
+    case("gateup_p2", Shape::GateUp, decode!(&[(0, 2)]), false),
+    case("gateup_p4", Shape::GateUp, decode!(&[(0, 4)]), false),
+    case("gateup_p8", Shape::GateUp, decode!(&[(0, 8)]), false),
+    case("gateup_p12", Shape::GateUp, decode!(&[(0, 12)]), false),
+    case("gateup_p16", Shape::GateUp, decode!(&[(0, 16)]), false),
+    case("gateup_tail_p4", Shape::GateUp, decode!(&[(16, 4)]), false),
     case(
-        "gateup_seq_10_10",
+        "gateup_20",
         Shape::GateUp,
-        &[(0, 10), (10, 10)],
+        &[
+            ("base", IndexedPrototype::Off, SPLIT),
+            ("dp4a", IndexedPrototype::Dp4a, SPLIT),
+            ("pairs20", IndexedPrototype::Pairs20, SINGLE),
+            ("both", IndexedPrototype::Both, SINGLE),
+        ],
         false,
     ),
-    case("down_p2", Shape::Down, &[(0, 2)], false),
-    case("down_p4", Shape::Down, &[(0, 4)], false),
-    case("down_p8", Shape::Down, &[(0, 8)], false),
-    case("down_p10", Shape::Down, &[(0, 10)], false),
-    case("gateup_p16_warm", Shape::GateUp, &[(0, 16)], true),
-    case("gateup_p4_warm", Shape::GateUp, &[(0, 4)], true),
-    case("down_p10_warm", Shape::Down, &[(0, 10)], true),
+    case("down_p2", Shape::Down, decode!(&[(0, 2)]), false),
+    case("down_p4", Shape::Down, decode!(&[(0, 4)]), false),
+    case("down_p8", Shape::Down, decode!(&[(0, 8)]), false),
+    case("down_p10", Shape::Down, decode!(&[(0, 10)]), false),
+    case("gateup_p16_warm", Shape::GateUp, decode!(&[(0, 16)]), true),
+    case("gateup_20_warm", Shape::GateUp, decode!(SPLIT), true),
+    case("down_p10_warm", Shape::Down, decode!(&[(0, 10)]), true),
 ];
 
 struct Rig<'a> {
@@ -123,7 +147,8 @@ struct Rig<'a> {
     /// The gate/up input row (`hidden` values) and the down input row (`inter` values).
     x_up: DeviceBuffer,
     x_down: DeviceBuffer,
-    /// Per-pair rows of the rotated inputs, the split-K partials and the outputs.
+    /// Per-launch rows of the rotated inputs and the split-K partials (each launch starts at row
+    /// 0, as in the block) and per-pair rows of the outputs.
     xh: DeviceBuffer,
     z: DeviceBuffer,
     out: DeviceBuffer,
@@ -154,9 +179,10 @@ impl Rig<'_> {
         }
     }
 
-    /// Queues one id-indexed launch of the pairs `pairs` of `shape` with the id set `set`; pair
-    /// number `row` of the launch writes output row `row`.
-    fn launch(&self, shape: Shape, pairs: &Range<usize>, set: usize, cols: u32) -> Res<()> {
+    /// Queues one id-indexed launch of the pairs `pairs` of `shape` with the id set `set`, under
+    /// the context's prototype. Pair `p` writes output row `p` and, as call `p - pairs.start` of
+    /// the launch, that row of the rotated inputs and partials.
+    fn launch(&self, shape: Shape, pairs: &Range<usize>, set: usize) -> Res<()> {
         let (k, n, x) = self.dims_of(shape);
         let ids = self.ids.range(set * PICKS * 4, PICKS * 4)?;
         let flag = self.flag.range(0, F32)?;
@@ -170,7 +196,7 @@ impl Rig<'_> {
                 x: x.range(0, k * F32)?,
                 xh: self.xh.range(row * k * F32, k * F32)?,
                 z: self.z.range(row * n * F32, n * F32)?,
-                out: self.out.range(row * n * F32, n * F32)?,
+                out: self.out.range(pair * n * F32, n * F32)?,
                 flag,
                 rows: 1,
                 fused: false,
@@ -178,23 +204,38 @@ impl Rig<'_> {
             let slot = u32::try_from(slot).map_err(|_| fail("a pick slot past u32"))?;
             calls.push(bank.span()?.indexed_call(&io, ids, slot));
         }
-        self.ctx.exl3_grouped_indexed(&self.stream, &calls, cols)
+        self.ctx.exl3_grouped_indexed(&self.stream, &calls, 1)
     }
 
-    /// The output rows of one launch of `pairs` with the id set `set` under `cols`. The output
-    /// rows, rotated inputs and split-K partials are NaN beforehand, so a skipped write of any of
+    /// Queues the launches of `variant` under its prototype with the id set `set`.
+    fn run(&self, shape: Shape, variant: &Variant, set: usize) -> Res<()> {
+        let (_, prototype, launches) = variant;
+        self.ctx.set_indexed_prototype(*prototype);
+        for &(first, count) in *launches {
+            self.launch(shape, &(first..first + count), set)?;
+        }
+        Ok(())
+    }
+
+    /// The output rows of the pairs `variant` covers, written with the id set `set`. Every output
+    /// row, rotated input and split-K partial is NaN beforehand, so a skipped write of any of
     /// them reaches the output.
-    fn outputs(&self, shape: Shape, pairs: &Range<usize>, set: usize, cols: u32) -> Res<Vec<u8>> {
+    fn outputs(&self, shape: Shape, variant: &Variant, set: usize) -> Res<Vec<u8>> {
         let (k, n, _) = self.dims_of(shape);
-        let bytes = pairs.len() * n * F32;
+        let launches = variant.2;
+        let first = launches.iter().map(|&(first, _)| first).min();
+        let end = launches.iter().map(|&(first, count)| first + count).max();
+        let (Some(first), Some(end)) = (first, end) else {
+            return Err(fail("a variant without launches"));
+        };
         let nan = |values: usize| f32::NAN.to_le_bytes().repeat(values);
-        self.out.write_at(&self.stream, 0, &nan(pairs.len() * n))?;
-        self.z.write_at(&self.stream, 0, &nan(pairs.len() * n))?;
-        self.xh.write_at(&self.stream, 0, &nan(pairs.len() * k))?;
-        self.launch(shape, pairs, set, cols)?;
+        self.out.write_at(&self.stream, 0, &nan(MAX_PAIRS * n))?;
+        self.z.write_at(&self.stream, 0, &nan(MAX_PAIRS * n))?;
+        self.xh.write_at(&self.stream, 0, &nan(MAX_PAIRS * k))?;
+        self.run(shape, variant, set)?;
         self.stream.synchronize()?;
-        let mut got = vec![0u8; bytes];
-        self.out.read_at(&self.stream, 0, &mut got)?;
+        let mut got = vec![0u8; (end - first) * n * F32];
+        self.out.read_at(&self.stream, first * n * F32, &mut got)?;
         Ok(got)
     }
 
@@ -205,9 +246,10 @@ impl Rig<'_> {
         Ok(u32::from_le_bytes(raw))
     }
 
-    /// `LAUNCHES` runs of `case` under `cols` back to back behind the gate; the device time of
+    /// `LAUNCHES` runs of `variant` of `case` back to back behind the gate; the device time of
     /// each run.
-    fn time(&self, case: &Case, cols: u32, trial: usize) -> Res<Timed> {
+    fn time(&self, case: &Case, variant: &Variant, trial: usize) -> Res<Timed> {
+        self.ctx.set_indexed_prototype(variant.1);
         // Taken before the gate's start mark is queued: the device cannot pass that mark earlier.
         let gate_queued = Instant::now();
         self.stream.record_timing(&self.gate_mark)?;
@@ -225,9 +267,7 @@ impl Rig<'_> {
             } else {
                 (trial * LAUNCHES + run) % SETS
             };
-            for &(first, count) in case.launches {
-                self.launch(case.shape, &(first..first + count), set, cols)?;
-            }
+            self.run(case.shape, variant, set)?;
             queued.push(Instant::now());
         }
         self.stream.record_timing(&self.marks[LAUNCHES])?;
@@ -241,7 +281,7 @@ impl Rig<'_> {
                 late += 1;
             }
         }
-        let launches = LAUNCHES * case.launches.len();
+        let launches = LAUNCHES * variant.2.len();
         let queue_us = queued[LAUNCHES - 1]
             .duration_since(queue_start)
             .as_secs_f64()
@@ -257,39 +297,41 @@ impl Rig<'_> {
     }
 }
 
-/// `Err` unless every variant writes the bytes cols = 1 writes, for every launch of every case,
-/// with the first and last cold id sets and the warm set.
+/// `Err` unless every variant of every case writes the bytes its production variant writes, with
+/// the first and last cold id sets and the warm set.
 fn check(rig: &Rig<'_>) -> Res<usize> {
     let mut compared = 0;
     for (case, set) in CASES
         .iter()
         .flat_map(|case| [0, SETS - 1, SETS].map(|set| (case, set)))
     {
-        for &(first, count) in case.launches {
-            let pairs = &(first..first + count);
-            let want = rig.outputs(case.shape, pairs, set, 1)?;
-            if want
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|b| !f32::from_le_bytes(*b).is_finite())
-            {
+        let (base, others) = case
+            .variants
+            .split_first()
+            .ok_or_else(|| fail("a case without variants"))?;
+        let want = rig.outputs(case.shape, base, set)?;
+        if want
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|b| !f32::from_le_bytes(*b).is_finite())
+        {
+            return Err(fail(format!(
+                "{}: production left a non-finite output with id set {set}",
+                case.name
+            )));
+        }
+        for variant in others {
+            if rig.outputs(case.shape, variant, set)? != want {
                 return Err(fail(format!(
-                    "{}: cols 1 left a non-finite output with id set {set}",
-                    case.name
+                    "{}: {} differs from production with id set {set}",
+                    case.name, variant.0
                 )));
             }
-            for cols in &COLS[1..] {
-                if rig.outputs(case.shape, pairs, set, *cols)? != want {
-                    return Err(fail(format!(
-                        "{}: cols {cols} differs from cols 1 for pairs {pairs:?}, id set {set}",
-                        case.name
-                    )));
-                }
-                compared += 1;
-            }
+            compared += 1;
         }
     }
+    rig.ctx.set_indexed_prototype(IndexedPrototype::Off);
     let flag = rig.flag()?;
     if flag != 0 {
         return Err(fail(format!("the arithmetic flag is {flag}")));
@@ -308,16 +350,17 @@ struct Pooled {
 fn timing(rig: &Rig<'_>) -> Res<()> {
     let mut pooled: Vec<Vec<Pooled>> = CASES
         .iter()
-        .map(|_| vec![Pooled::default(); COLS.len()])
+        .map(|case| vec![Pooled::default(); case.variants.len()])
         .collect();
     for trial in 0..=TRIALS {
         clock_mark(&format!("projection_trial{trial}"));
         for (case, into) in CASES.iter().zip(&mut pooled) {
-            for turn in 0..COLS.len() {
-                let variant = (turn + trial) % COLS.len();
-                let got = rig.time(case, COLS[variant], trial)?;
+            let count = case.variants.len();
+            for turn in 0..count {
+                let v = (turn + trial) % count;
+                let got = rig.time(case, &case.variants[v], trial)?;
                 if trial > 0 {
-                    let all = &mut into[variant];
+                    let all = &mut into[v];
                     all.samples.extend(got.samples);
                     all.late += got.late;
                     all.queue_us.push(got.queue_us_per_launch);
@@ -325,19 +368,20 @@ fn timing(rig: &Rig<'_>) -> Res<()> {
             }
         }
     }
+    rig.ctx.set_indexed_prototype(IndexedPrototype::Off);
     for (case, got) in CASES.iter().zip(&pooled) {
-        let pairs: usize = case.launches.iter().map(|&(_, count)| count).sum();
-        for (cols, all) in COLS.iter().zip(got) {
+        for (variant, all) in case.variants.iter().zip(got) {
+            let pairs: usize = variant.2.iter().map(|&(_, count)| count).sum();
             let queue = all.queue_us.iter().sum::<f64>() / all.queue_us.len() as f64;
             let extra = format!(
                 ",\"pairs\":{pairs},\"launches\":{},\"warm\":{},\"late_runs\":{},\"host_queue_us_per_launch\":{queue:.2}",
-                case.launches.len(),
+                variant.2.len(),
                 case.warm,
                 all.late
             );
             emit(
                 "projection",
-                &format!("{}_c{cols}", case.name),
+                &format!("{}_{}", case.name, variant.0),
                 "us",
                 &all.samples,
                 &extra,
@@ -381,6 +425,12 @@ fn run() -> Res<()> {
     if moe.top_k != PICKS {
         return Err(fail("the cases assume ten picks"));
     }
+    if std::env::var_os(IndexedPrototype::VAR).is_some() {
+        return Err(fail(format!(
+            "the bench chooses its prototypes itself: {} must be unset",
+            IndexedPrototype::VAR
+        )));
+    }
     let projector = CudaProjector::new()?;
     let ctx = projector.context();
     let router = Router::read(&checkpoint, layer, &moe)?;
@@ -410,7 +460,7 @@ fn run() -> Res<()> {
     };
     let compared = check(&rig)?;
     println!(
-        "RESBENCH {{\"phase\":\"projection_check\",\"case\":\"variants_equal_cols1\",\"compared\":{compared}}}"
+        "RESBENCH {{\"phase\":\"projection_check\",\"case\":\"variants_equal_base\",\"compared\":{compared}}}"
     );
     timing(&rig)
 }

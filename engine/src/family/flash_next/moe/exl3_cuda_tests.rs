@@ -28,6 +28,11 @@
 //! - the arithmetic flag and the router status clear.
 //!
 //! Over the three rows some pick must lie in the upper half of the 512-expert banks.
+//!
+//! `FIFI_EXL3_INDEXED_PROTOTYPE` (`dp4a`, `pairs20`, `both`) runs the device-id path on a
+//! bench-only prototype of the id-indexed launch (`IndexedPrototype`); the read-back path keeps
+//! the production grouped launch, so the byte-for-byte check above compares the prototype with
+//! production on the real weights. `pairs20` queues the 20 gate and up pairs as one launch.
 
 use std::path::Path;
 
@@ -51,7 +56,10 @@ use crate::{
     },
     kernels::cuda::{
         DeviceBuffer, device_present,
-        resident::router::{RouterShape, router_logits_bytes},
+        resident::{
+            exl3::IndexedPrototype,
+            router::{RouterShape, router_logits_bytes},
+        },
     },
     weights::{
         GgufType,
@@ -547,6 +555,9 @@ fn a_real_flash_next_moe_layer_matches_the_fp64_reference() {
         shared_inter: shape.shared_inter,
     };
     let projector = CudaProjector::new().expect("projector");
+    let prototype = IndexedPrototype::from_env().expect("the indexed launch prototype");
+    projector.context().set_indexed_prototype(prototype);
+    eprintln!("indexed launch prototype: {}", prototype.name());
     let router = Router::read(&checkpoint, layer, &moe).expect("router");
     let weights = upload(&projector, &checkpoint, (layer, &router), &moe).expect("upload");
     let keys = keys(layer);

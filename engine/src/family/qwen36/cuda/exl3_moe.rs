@@ -15,9 +15,9 @@
 //! pairs contiguous in group order; `Scratch` places them.
 //!
 //! The block is shared with Qwen3.8 Flash-Next, which picks 10 of 512 experts: an id-indexed
-//! launch takes at most 16 pairs, so a group of more (Flash-Next's 20 gate and up pairs) is
-//! queued as consecutive launches of at most 16 in group order. Qwen3.6's 8 picks make one
-//! launch, as before.
+//! launch takes at most 16 pairs (`CudaContext::exl3_indexed_capacity`), so a group of more
+//! (Flash-Next's 20 gate and up pairs) is queued as consecutive launches of at most 16 in group
+//! order. Qwen3.6's 8 picks make one launch, as before.
 
 use super::{
     layer_table::LayerTable,
@@ -44,8 +44,6 @@ use crate::{
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
-/// The most pairs one id-indexed launch takes (`CudaContext::exl3_grouped_indexed`).
-const INDEXED_PAIRS: usize = 16;
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix.
@@ -228,7 +226,7 @@ struct IndexedPair<'a> {
 }
 
 /// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
-/// [`INDEXED_PAIRS`] pairs in group order. Each launch starts again at row 0 of the scratch; the
+/// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the scratch; the
 /// stream runs it after the previous launch has finished with those rows.
 fn grouped_indexed(
     launch: &Launch<'_>,
@@ -239,7 +237,7 @@ fn grouped_indexed(
     if pairs.is_empty() {
         return Err(refuse("an indexed launch without pairs".into()));
     }
-    for chunk in pairs.chunks(INDEXED_PAIRS) {
+    for chunk in pairs.chunks(launch.ctx.exl3_indexed_capacity()) {
         indexed_launch(launch, chunk, ids, scratch)?;
     }
     Ok(())

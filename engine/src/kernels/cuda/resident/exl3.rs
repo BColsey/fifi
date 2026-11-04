@@ -44,6 +44,84 @@ pub(crate) enum SingleRow {
     Wide(u32),
 }
 
+/// The most pairs one production id-indexed launch takes.
+const INDEXED_CAPACITY: usize = 16;
+
+/// Bench-only prototypes of the id-indexed launch: the DP4A decode of book 2, one launch of up to
+/// 20 pairs, or both. Test builds only, and off unless a test or bench selects one on its
+/// context; production never runs them. Every byte they write equals the production launch of
+/// the same calls.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum IndexedPrototype {
+    #[default]
+    Off,
+    Dp4a,
+    Pairs20,
+    Both,
+}
+
+#[cfg(test)]
+impl IndexedPrototype {
+    pub(crate) const ALL: [Self; 4] = [Self::Off, Self::Dp4a, Self::Pairs20, Self::Both];
+    /// The variable a test or bench process may read to select one: `off`, `dp4a`, `pairs20`
+    /// or `both`.
+    pub(crate) const VAR: &str = "FIFI_EXL3_INDEXED_PROTOTYPE";
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Dp4a => "dp4a",
+            Self::Pairs20 => "pairs20",
+            Self::Both => "both",
+        }
+    }
+
+    /// The prototype `VAR` names, `Off` when it is unset, or the refusal of a bad value.
+    pub(crate) fn from_env() -> Result<Self, EngError> {
+        Self::parse(std::env::var_os(Self::VAR).as_deref())
+    }
+
+    /// The prototype a value of `VAR` names (`None`: unset, `Off`).
+    fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, EngError> {
+        let Some(value) = value else {
+            return Ok(Self::Off);
+        };
+        let text = value.to_str().map(str::trim);
+        Self::ALL
+            .into_iter()
+            .find(|p| Some(p.name()) == text)
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "{} must be unset, \"off\", \"dp4a\", \"pairs20\" or \"both\"",
+                    Self::VAR
+                ))
+            })
+    }
+
+    fn dp4a(self) -> bool {
+        matches!(self, Self::Dp4a | Self::Both)
+    }
+
+    fn pairs20(self) -> bool {
+        matches!(self, Self::Pairs20 | Self::Both)
+    }
+
+    /// The most pairs one launch takes under this prototype.
+    fn capacity(self) -> usize {
+        if self.pairs20() { 20 } else { INDEXED_CAPACITY }
+    }
+
+    /// The native prototype variant for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair
+    /// block), or `None` when the launch is the production one: a 20-pair prototype changes only
+    /// the launches of more than 16 pairs.
+    fn variant(self, calls: usize) -> Option<u32> {
+        let wide = self.pairs20() && calls > INDEXED_CAPACITY;
+        let bits = u32::from(self.dp4a()) | (u32::from(wide) << 1);
+        (bits != 0).then_some(bits)
+    }
+}
+
 /// Parses the variable; an unset variable is the shuffle kernel.
 pub(crate) fn single_gather_from_env(value: Option<&std::ffi::OsStr>) -> Result<SingleRow, String> {
     let Some(value) = value else {
@@ -125,6 +203,42 @@ fn single_gather_explicit() -> Result<Option<SingleRow>, EngError> {
 }
 
 impl CudaContext {
+    /// The most pairs one id-indexed launch on this context takes: 16, or 20 in a test build
+    /// whose context runs a 20-pair prototype ([`IndexedPrototype`]).
+    pub(crate) fn exl3_indexed_capacity(&self) -> usize {
+        #[cfg(test)]
+        let capacity = self.exl3_indexed_prototype.get().capacity();
+        #[cfg(not(test))]
+        let capacity = INDEXED_CAPACITY;
+        capacity
+    }
+
+    /// Selects the bench-only prototype the id-indexed launches of this context run (test
+    /// builds only); `Off` restores the production launch.
+    #[cfg(test)]
+    pub(crate) fn set_indexed_prototype(&self, prototype: IndexedPrototype) {
+        self.exl3_indexed_prototype.set(prototype);
+    }
+
+    /// Runs the DP4A decode probe (`book2_probe` in the native layer) on `words` (u32 values),
+    /// writing two words per input word to `sums` and two halves per state to `decoded`.
+    #[cfg(test)]
+    pub(crate) fn exl3_book2_probe(
+        &self,
+        stream: &DeviceStream,
+        words: &DeviceRange<'_>,
+        sums: &DeviceRange<'_>,
+        decoded: &DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let (words, sums, decoded) = (
+            self.raw_range(words)?,
+            self.raw_range(sums)?,
+            self.raw_range(decoded)?,
+        );
+        self.launch_on(stream, |s| ffi::book2_probe(s, words, sums, decoded))
+    }
+
     /// Registers the kernel an unset `FIFI_EXL3_SINGLE_GATHER` selects for the EXL3 projections
     /// run on this context. The session that owns the context calls it before its first token;
     /// another context in the process is unaffected.
@@ -607,9 +721,11 @@ impl CudaContext {
     /// Enqueues the id-indexed grouped projection of one decode token: every call is one row of
     /// a member of an expert bank, chosen from device memory when the kernels run, so the ids may
     /// be written by an earlier kernel of this stream and the launch can be captured in a graph.
-    /// 1 to 16 calls of one `k`, `n` and flag; the spans of the calls are contiguous in call order
-    /// as for the grouped launches. An id outside `0..members` skips its pair and sets the sticky
-    /// flag. Every byte written equals the wide launch of the same members.
+    /// 1 to 16 calls of one `k`, `n` and flag (see [`Self::exl3_indexed_capacity`]); the spans of
+    /// the calls are contiguous in call order as for the grouped launches. An id outside
+    /// `0..members` skips its pair and sets the sticky flag. Every byte written equals the wide
+    /// launch of the same members. A test build may route the launch to a bench-only prototype
+    /// ([`IndexedPrototype`]), which writes the same bytes.
     pub(crate) fn exl3_grouped_indexed(
         &self,
         stream: &DeviceStream,
@@ -618,8 +734,10 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
-        if calls.is_empty() || calls.len() > 16 {
-            return Err(refuse("needs 1..=16 calls"));
+        if calls.is_empty() || calls.len() > self.exl3_indexed_capacity() {
+            return Err(refuse(
+                "needs 1..=16 calls (up to 20 under a 20-pair prototype)",
+            ));
         }
         if !matches!(cols, 1 | 2 | 4 | 8)
             || calls
@@ -709,6 +827,15 @@ impl CudaContext {
                     .as_ref()
                     .map(|table| self.raw_range(table))
                     .transpose()?,
+            });
+        }
+        #[cfg(test)]
+        if let Some(variant) = self.exl3_indexed_prototype.get().variant(calls.len()) {
+            if cols != 1 {
+                return Err(refuse("a prototype launch runs one tile per block"));
+            }
+            return self.launch_on(stream, |s| {
+                ffi::grouped_indexed_prototype(s, &raw, &index, variant)
             });
         }
         self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
@@ -892,6 +1019,8 @@ mod fused_publish_tests;
 mod jobs_tests;
 #[cfg(test)]
 mod linear_tests;
+#[cfg(test)]
+mod prototype_tests;
 #[cfg(test)]
 mod single_gather_tests;
 #[cfg(test)]

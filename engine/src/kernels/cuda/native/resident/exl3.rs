@@ -386,6 +386,24 @@ unsafe extern "C" {
         stage: *mut c_int,
         cols: u32,
     ) -> c_int;
+    #[cfg(test)]
+    fn inference_cuda_exl3_grouped_indexed_prototype(
+        args: *const LinearArgs,
+        index: *const IndexArgs,
+        count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        variant: u32,
+    ) -> c_int;
+    #[cfg(test)]
+    fn inference_cuda_exl3_book2_probe(
+        words: *const c_void,
+        count: usize,
+        sums: *mut c_void,
+        decoded: *mut c_void,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_exl3_grouped_wide(
         args: *const LinearArgs,
         count: usize,
@@ -437,11 +455,108 @@ pub(in crate::kernels::cuda) fn grouped_indexed(
     index: &[IndexRaw<'_>],
     cols: u32,
 ) -> Result<(), DeviceFailure> {
-    if calls.is_empty()
-        || calls.len() > 16
-        || calls.len() != index.len()
-        || !matches!(cols, 1 | 2 | 4 | 8)
+    if !matches!(cols, 1 | 2 | 4 | 8) {
+        return Err(invalid_argument());
+    }
+    let (args, indexes) = indexed_records(calls, index, 16)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: every call record has live bounded owners and validated local extents (member 0 of
+    // its bank), every id range is a live allocation of at least `slot + 1` aligned words, and C
+    // validates the group shapes, the contiguity of the working spans and their aliasing before
+    // any enqueue. The strides, the member counts and the offset tables (a live allocation of at least
+    // `members` aligned words) were bounded against the bank extents by the caller
+    // (`CudaContext::exl3_grouped_indexed`); a wrong id or an absent member is skipped by the
+    // kernels and sets the sticky flag. `cols` is 1, 2, 4 or 8.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_indexed(
+            args.as_ptr(),
+            indexes.as_ptr(),
+            args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            cols,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The bench-only prototype of [`grouped_indexed`], one tile per block: `variant` bit 0 decodes
+/// book 2 with DP4A, bit 1 admits up to 20 calls (else up to 16). Same validation and bytes.
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn grouped_indexed_prototype(
+    stream: &RawStream,
+    calls: &[LinearRaw<'_>],
+    index: &[IndexRaw<'_>],
+    variant: u32,
+) -> Result<(), DeviceFailure> {
+    let limit = match variant {
+        1 => 16,
+        2 | 3 => 20,
+        _ => return Err(invalid_argument()),
+    };
+    let (args, indexes) = indexed_records(calls, index, limit)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: as for `grouped_indexed`; the prototype kernels read and write exactly what the
+    // production kernels do, for up to 20 calls, which C bounds by the parameter block it fills.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_indexed_prototype(
+            args.as_ptr(),
+            indexes.as_ptr(),
+            args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            variant,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The DP4A decode probe: for each of the `words.bytes() / 4` words, two result words in `sums`
+/// (the byte sum, the DP4A result); for each of the 65536 states, two halves in `decoded` (the
+/// book-2 decode, its DP4A form).
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn book2_probe(
+    stream: &RawStream,
+    words: RawRange<'_>,
+    sums: RawRange<'_>,
+    decoded: RawRange<'_>,
+) -> Result<(), DeviceFailure> {
+    let count = words.bytes() / 4;
+    if count == 0
+        || !words.bytes().is_multiple_of(4)
+        || sums.bytes() < count * 8
+        || decoded.bytes() < 65536 * 4
+        || [&words, &sums, &decoded]
+            .iter()
+            .any(|r| !r.offset().is_multiple_of(4))
     {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: the three ranges are live, 4-byte aligned and large enough for what the probe
+    // kernels read (count words) and write (2 count words, 2 x 65536 halves).
+    let status = unsafe {
+        inference_cuda_exl3_book2_probe(
+            words.address().cast_const(),
+            count,
+            sums.address(),
+            decoded.address(),
+            stream.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
+/// The native records of an id-indexed group of 1 to `limit` calls, after the per-call checks C
+/// repeats.
+type IndexedRecords = (Vec<LinearArgs>, Vec<IndexArgs>);
+fn indexed_records(
+    calls: &[LinearRaw<'_>],
+    index: &[IndexRaw<'_>],
+    limit: usize,
+) -> Result<IndexedRecords, DeviceFailure> {
+    if calls.is_empty() || calls.len() > limit || calls.len() != index.len() {
         return Err(invalid_argument());
     }
     let mut args = Vec::with_capacity(calls.len());
@@ -487,25 +602,7 @@ pub(in crate::kernels::cuda) fn grouped_indexed(
                 .map_or(std::ptr::null(), |table| table.address().cast_const()),
         });
     }
-    let mut stage = STAGE_NONE;
-    // SAFETY: every call record has live bounded owners and validated local extents (member 0 of
-    // its bank), every id range is a live allocation of at least `slot + 1` aligned words, and C
-    // validates the group shapes, the contiguity of the working spans and their aliasing before
-    // any enqueue. The strides, the member counts and the offset tables (a live allocation of at least
-    // `members` aligned words) were bounded against the bank extents by the caller
-    // (`CudaContext::exl3_grouped_indexed`); a wrong id or an absent member is skipped by the
-    // kernels and sets the sticky flag. `cols` is 1, 2, 4 or 8.
-    let status = unsafe {
-        inference_cuda_exl3_grouped_indexed(
-            args.as_ptr(),
-            indexes.as_ptr(),
-            args.len(),
-            stream.as_ptr(),
-            &mut stage,
-            cols,
-        )
-    };
-    checked(status, stage)
+    Ok((args, indexes))
 }
 
 /// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
