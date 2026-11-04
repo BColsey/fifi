@@ -76,6 +76,8 @@ pub(in crate::kernels::cuda) mod matvec_expert;
 pub(in crate::kernels::cuda) mod matvec_q;
 pub(in crate::kernels::cuda) mod moe_combine;
 pub(in crate::kernels::cuda) mod paged_position;
+pub(in crate::kernels::cuda) mod qsa_index;
+pub(in crate::kernels::cuda) mod qsa_select;
 pub(in crate::kernels::cuda) mod quantize_q8_1;
 pub(in crate::kernels::cuda) mod rope_gemma;
 pub(in crate::kernels::cuda) mod router;

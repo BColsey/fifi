@@ -124,6 +124,8 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/peer_probe.cu",
     "src/kernels/cuda/native/peer_ring.cu",
     "src/kernels/cuda/native/resident/hyper.cu",
+    "src/kernels/cuda/native/resident/qsa_index.cu",
+    "src/kernels/cuda/native/resident/qsa_select.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -247,6 +249,8 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/nvfp4_gemv.h",
     "src/kernels/cuda/native/prefill/flint_qk.h",
     "src/kernels/cuda/native/resident/hyper.h",
+    "src/kernels/cuda/native/resident/qsa_index.h",
+    "src/kernels/cuda/native/resident/qsa_select.h",
 ];
 
 /// Compiles the CUDA adapter for the `native-cuda` feature on Linux.

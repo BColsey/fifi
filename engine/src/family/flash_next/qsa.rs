@@ -245,56 +245,14 @@ fn attend<P: Projector>(
     let heads_q = dims.heads_q as usize;
     let heads_kv = dims.heads_kv as usize;
     let head_dim = dims.head_dim as usize;
-    let idx_heads = dims.idx_heads as usize;
-    let idx_dim = dims.idx_dim as usize;
-    let ratio = dims.ratio as usize;
-    let budget = dims.budget as usize;
     let hidden = dims.hidden as usize;
     let rd = dims.rotary_dim as usize;
     let eps = dims.eps;
     let theta = dims.theta;
 
-    let mut indexer_queries = Vec::with_capacity(idx_heads);
-    for h in 0..idx_heads {
-        let mut qi = rms0(&ip[h * idx_dim..(h + 1) * idx_dim], weights.idx_q_norm, eps)?;
-        rope_half(&mut qi, rd, pos, theta)?;
-        indexer_queries.push(qi);
-    }
-
-    let visible = pos as usize + 1;
-    let blocks = visible / ratio;
-    let tail = blocks * ratio;
-    let take = blocks.min(budget / ratio);
-
-    let mut score = Vec::with_capacity(blocks);
-    for b in 0..blocks {
-        let mut pool = vec![0.0f32; idx_dim];
-        for r in 0..ratio {
-            for (i, p) in pool.iter_mut().enumerate() {
-                *p += cache.ik[(b * ratio + r) * idx_dim + i] / ratio as f32;
-            }
-        }
-        let mut pk = rms0(&pool, weights.idx_k_norm, eps)?;
-        let block_pos = u32::try_from(b * ratio).map_err(|_| {
-            EngError::BadRequest(format!("qsa block position {} exceeds u32", b * ratio))
-        })?;
-        rope_half(&mut pk, rd, block_pos, theta)?;
-        let mut total = 0.0f64;
-        for qi in &indexer_queries {
-            total += f64::from(dot(qi, &pk)?).max(0.0);
-        }
-        score.push(total / (idx_dim as f64).sqrt());
-    }
-
-    let mut order: Vec<usize> = (0..blocks).collect();
-    order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
-    let mut selected = Vec::new();
-    for &block in order.iter().take(take) {
-        for r in 0..ratio {
-            selected.push(block * ratio + r);
-        }
-    }
-    selected.extend(tail..visible);
+    let queries = indexer_queries(dims, ip, weights.idx_q_norm, pos)?;
+    let score = block_scores(dims, &queries, &cache.ik, weights.idx_k_norm, pos)?;
+    let selected = select_positions(dims, &score, pos)?;
 
     let rep = heads_q / heads_kv;
     let scale = (head_dim as f32).sqrt();
@@ -328,6 +286,108 @@ fn attend<P: Projector>(
     let out = projector.linear(weights.o, &heads)?;
     expect_len(&out, hidden, "qsa output projection")?;
     Ok(out)
+}
+
+/// The indexer queries of the token at `pos`, one per indexer head: rms0 of the head's slice of
+/// the indexer projection row `ip` with the indexer query norm, then rope at `pos`.
+pub(super) fn indexer_queries(
+    dims: QsaDims,
+    ip: &[f32],
+    q_norm: &[f32],
+    pos: u32,
+) -> Result<Vec<Vec<f32>>, EngError> {
+    let idx_dim = dims.idx_dim as usize;
+    let mut queries = Vec::with_capacity(dims.idx_heads as usize);
+    for h in 0..dims.idx_heads as usize {
+        let raw = ip.get(h * idx_dim..(h + 1) * idx_dim).ok_or_else(|| {
+            EngError::BadRequest("qsa indexer projection row is short".to_owned())
+        })?;
+        let mut qi = rms0(raw, q_norm, dims.eps)?;
+        rope_half(&mut qi, dims.rotary_dim as usize, pos, dims.theta)?;
+        queries.push(qi);
+    }
+    Ok(queries)
+}
+
+/// The indexer key of block `b`: its `ratio` raw indexer keys of `ik` (`[position][idx_dim]`),
+/// each divided by `ratio` and summed in position order, then rms0 with the indexer key norm and
+/// rope at the block's first position.
+pub(super) fn block_key(
+    dims: QsaDims,
+    ik: &[f32],
+    b: usize,
+    k_norm: &[f32],
+) -> Result<Vec<f32>, EngError> {
+    let ratio = dims.ratio as usize;
+    let idx_dim = dims.idx_dim as usize;
+    let first = b * ratio;
+    let raw = ik
+        .get(first * idx_dim..(first + ratio) * idx_dim)
+        .ok_or_else(|| EngError::BadRequest(format!("qsa block {b} is not complete")))?;
+    let mut pool = vec![0.0f32; idx_dim];
+    for r in 0..ratio {
+        for (i, p) in pool.iter_mut().enumerate() {
+            *p += raw[r * idx_dim + i] / ratio as f32;
+        }
+    }
+    let mut pk = rms0(&pool, k_norm, dims.eps)?;
+    let block_pos = u32::try_from(first)
+        .map_err(|_| EngError::BadRequest(format!("qsa block position {first} exceeds u32")))?;
+    rope_half(&mut pk, dims.rotary_dim as usize, block_pos, dims.theta)?;
+    Ok(pk)
+}
+
+/// The score of every block completed at `pos` (`b < (pos + 1) / ratio`): the f64 sum over the
+/// indexer heads of `max(query . key, 0)`, divided by `sqrt(idx_dim)`.
+pub(super) fn block_scores(
+    dims: QsaDims,
+    queries: &[Vec<f32>],
+    ik: &[f32],
+    k_norm: &[f32],
+    pos: u32,
+) -> Result<Vec<f64>, EngError> {
+    let blocks = (pos as usize + 1) / dims.ratio as usize;
+    let mut score = Vec::with_capacity(blocks);
+    for b in 0..blocks {
+        let pk = block_key(dims, ik, b, k_norm)?;
+        let mut total = 0.0f64;
+        for qi in queries {
+            total += f64::from(dot(qi, &pk)?).max(0.0);
+        }
+        score.push(total / (dims.idx_dim as f64).sqrt());
+    }
+    Ok(score)
+}
+
+/// The positions the token at `pos` attends to: the `budget / ratio` best blocks by `score`
+/// (descending, the lower block first on ties), each as its `ratio` positions in the ranked
+/// order, then the open tail of positions after the last completed block.
+pub(super) fn select_positions(
+    dims: QsaDims,
+    score: &[f64],
+    pos: u32,
+) -> Result<Vec<usize>, EngError> {
+    let ratio = dims.ratio as usize;
+    let visible = pos as usize + 1;
+    let blocks = visible / ratio;
+    if score.len() != blocks {
+        return Err(EngError::BadRequest(format!(
+            "qsa selection takes {blocks} block scores, got {}",
+            score.len()
+        )));
+    }
+    let tail = blocks * ratio;
+    let take = blocks.min(dims.budget as usize / ratio);
+    let mut order: Vec<usize> = (0..blocks).collect();
+    order.sort_by(|&a, &b| score[b].total_cmp(&score[a]).then(a.cmp(&b)));
+    let mut selected = Vec::new();
+    for &block in order.iter().take(take) {
+        for r in 0..ratio {
+            selected.push(block * ratio + r);
+        }
+    }
+    selected.extend(tail..visible);
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -703,3 +763,6 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod cuda_tests;
