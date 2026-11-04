@@ -53,6 +53,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Qualification inventory
         run: python3 ../scripts/qual_inventory.py validate
+      - name: Pack qualification registry
+        run: python3 ../scripts/qual_inventory.py packs
       - name: Tests (CPU-only default features, evidence and minimum-ran floor)
         run: |
           python3 ../scripts/qual_inventory.py collect \

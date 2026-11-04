@@ -757,6 +757,42 @@ class PackRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(qi.InventoryError, "source binding failed"):
                 qi.validate_pack_registry(self._bound())
 
+    def test_filename_cannot_be_reported_as_cryptographic(self):
+        registry = self._bound()
+        registry["identity_contract"]["fields"]["gguf_expected_filename"] = "cryptographically pinned"
+        with self.assertRaisesRegex(qi.InventoryError, "inflating identity assurance"):
+            qi.validate_pack_registry(registry)
+
+    def test_tensor_schema_cannot_be_reported_as_cryptographic(self):
+        registry = self._bound()
+        registry["identity_contract"]["fields"]["exl3_tensor_schema"] = "cryptographically pinned"
+        with self.assertRaisesRegex(qi.InventoryError, "exl3_tensor_schema must read"):
+            qi.validate_pack_registry(registry)
+
+    def test_exact_pack_contents_must_stay_unestablished(self):
+        registry = self._bound()
+        registry["identity_contract"]["fields"]["exl3_exact_pack_contents"] = "shape-validated"
+        with self.assertRaisesRegex(qi.InventoryError, "exl3_exact_pack_contents must read"):
+            qi.validate_pack_registry(registry)
+
+    def test_pack_cannot_claim_weight_digests(self):
+        # A pack asserting a weights sha256 would claim an identity the
+        # runtime never verifies; strict identity keys must refuse it.
+        registry = self._bound()
+        registry["packs"][2]["identity"]["weights_sha256"] = "f" * 64
+        with self.assertRaisesRegex(qi.InventoryError, "exl3 identity needs a non-empty bpw"):
+            qi.validate_pack_registry(registry)
+
+    def test_qualified_label_cannot_exceed_failed_evidence(self):
+        registry = self._bound()
+        registry["packs"][1]["production_eligibility"]["runtime_label"] = "qualified"
+        # The preflight mapping check fires first (exl3 maps to experimental
+        # in source); neutralize it so the evidence rule is what fails.
+        with mock.patch.object(qi, "weight_format_qualification",
+                               return_value={"gguf": "qualified", "exl3": "qualified"}):
+            with self.assertRaisesRegex(qi.InventoryError, "exceeds its recorded"):
+                qi.validate_pack_registry(registry)
+
 
 if __name__ == "__main__":
     unittest.main()

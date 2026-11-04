@@ -503,12 +503,24 @@ def weight_format_qualification() -> dict[str, str]:
     return mapping
 
 
-PACK_TOP_KEYS = {"schema_version", "quality_standard", "packs"}
+PACK_TOP_KEYS = {"schema_version", "identity_contract", "quality_standard", "packs"}
 PACK_KEYS = {"id", "family", "weights", "identity", "loads",
              "numerical_qualification", "production_eligibility"}
 VERDICTS = {"reference", "pass", "fail", "not_run"}
 RUNTIME_LABELS = {"qualified", "experimental", "unverified"}
 MARGIN_KEYS = {"true_token_nll_nats", "top1_points", "exact_copy_points", "retrieval_points"}
+
+# Identity assurance strengths the contract may declare. Only tokenizer
+# hashes are cryptographic: a matching filename, tensor shape, or bpw label
+# must never be reportable as verification of the weights themselves.
+CONTRACT_FIELDS = {
+    "family": "source-validated",
+    "gguf_expected_filename": "source-validated, not content-verified",
+    "tokenizer_hashes": "cryptographically pinned",
+    "exl3_tensor_schema": "shape-validated",
+    "exl3_bpw_label": "documentation-derived",
+    "exl3_exact_pack_contents": "not established by current loader pins",
+}
 
 
 def validate_pack_registry(registry: dict) -> dict[str, str]:
@@ -524,6 +536,25 @@ def validate_pack_registry(registry: dict) -> dict[str, str]:
         problems.append(f"unknown keys {unknown_top}")
     if registry.get("schema_version") != 1:
         problems.append("schema_version must be 1")
+    contract = registry.get("identity_contract", {})
+    if not isinstance(contract, dict) or set(contract) != {"statement", "fields"}:
+        problems.append("identity_contract must have exactly statement and fields")
+    else:
+        if not contract["statement"]:
+            problems.append("identity_contract.statement must state the assurance limits")
+        fields = contract["fields"]
+        if not isinstance(fields, dict) or set(fields) != set(CONTRACT_FIELDS):
+            problems.append(f"identity_contract.fields must have exactly {sorted(CONTRACT_FIELDS)}")
+        else:
+            # Exact strengths: the vocabulary contains exactly one cryptographic
+            # entry (tokenizer hashes), so a filename, tensor shape, or bpw label
+            # can never be reported as verification of the weights themselves.
+            for name, strength in CONTRACT_FIELDS.items():
+                if fields[name] != strength:
+                    problems.append(
+                        f"identity_contract.fields.{name} must read {strength!r}; "
+                        "inflating identity assurance is not allowed"
+                    )
     standard = registry.get("quality_standard", {})
     if not isinstance(standard, dict) or set(standard) != {"description", "margins", "source"}:
         problems.append("quality_standard must have exactly description, margins, source")
@@ -641,6 +672,15 @@ def validate_pack_registry(registry: dict) -> dict[str, str]:
         for pid, verdict in verdicts.items():
             if verdict == "reference" and pid != defaults[0]:
                 problems.append(f"pack {pid!r}: only the production default may be the reference")
+            # Production eligibility may not exceed the recorded evidence: a
+            # failed gate outranks a permissive runtime policy label.
+            if verdict == "fail" and next(
+                p for p in packs if isinstance(p, dict) and p.get("id") == pid
+            ).get("production_eligibility", {}).get("runtime_label") == "qualified":
+                problems.append(
+                    f"pack {pid!r}: runtime_label 'qualified' exceeds its recorded "
+                    "numerical verdict 'fail'"
+                )
 
     if problems:
         raise InventoryError("pack registry problems:\n  " + "\n  ".join(problems))

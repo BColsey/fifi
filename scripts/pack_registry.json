@@ -1,5 +1,16 @@
 {
   "schema_version": 1,
+  "identity_contract": {
+    "statement": "Registry identity binds source-declared compatibility facts (pinned filename, tokenizer pins, tensor-schema policy) to recorded evidence. It does not establish the cryptographic identity of an installed checkpoint: a matching model family, filename, tensor shape, or bpw label never implies that the currently loaded weights carry the recorded qualification. Exact pack contents are not verified by any current loader pin.",
+    "fields": {
+      "family": "source-validated",
+      "gguf_expected_filename": "source-validated, not content-verified",
+      "tokenizer_hashes": "cryptographically pinned",
+      "exl3_tensor_schema": "shape-validated",
+      "exl3_bpw_label": "documentation-derived",
+      "exl3_exact_pack_contents": "not established by current loader pins"
+    }
+  },
   "quality_standard": {
     "description": "Real-task non-inferiority with registered margins (doc/explanation/status.md, 30 Oct 2026); earlier KL results stay recorded as failures; KL is a diagnostic.",
     "margins": {
