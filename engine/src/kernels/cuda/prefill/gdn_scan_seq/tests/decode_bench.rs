@@ -14,8 +14,8 @@
 //!
 //! Each of the 36 queued layers has its own recurrent state and conv ring, as a decode token's
 //! layers do: 36 Flash-Next states are 108 MiB, so a state is not still in the 3090's 6 MB L2
-//! when its layer comes round again. (Runs before 2026-11-04 reused one 3 MiB state for all 36,
-//! which stays L2-resident; their figures are L2-warm.)
+//! when its layer comes round again. (Runs before this change, 1391e1790, reused one 3 MiB state
+//! for all 36, which stays L2-resident; their figures are L2-warm.)
 
 use super::forms::{FN_K, FN_V, opts_of};
 use super::{
