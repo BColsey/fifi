@@ -8,7 +8,10 @@
 //! inject projection with `2 * sigmoid`, the up projection, and the sigmoid-gated branch mean.
 //! [`CudaContext::hyper_apply`] queues the write `x[t][b][d] += gate[t][b] * block[t][d]`. The
 //! calls allocate nothing, copy nothing and never synchronize; a fault in the queued work
-//! surfaces at the next synchronize of the stream.
+//! surfaces at the next synchronize of the stream. The outputs are valid only to work queued
+//! later on the same stream, or after it is synchronized. A read writes the `gate` range that
+//! its apply consumes, so that range must not be handed to another read before the matching
+//! apply is queued on the same stream.
 //!
 //! The residual stream and every intermediate are f32. The weights stay in their stored dtype
 //! (binary16 for the EXL3 packs, bfloat16 for the official checkpoint) and are widened exactly to

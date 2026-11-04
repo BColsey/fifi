@@ -617,7 +617,7 @@ fn check_read(label: &str, c: &Case, got: &Read) {
     );
 }
 
-const READ_SPECS: [Spec; 7] = [
+const READ_SPECS: [Spec; 11] = [
     flash_next(1, HyperDtype::F16, true),
     flash_next(3, HyperDtype::Bf16, true),
     // The final mixer has no inject projection.
@@ -628,6 +628,12 @@ const READ_SPECS: [Spec; 7] = [
     // The branch limit; 7 + 16 down and inject rows end inside a block of 8 warps.
     small(1, (16, 300, 7), HyperDtype::F16),
     small(2, (2, 4096, 64), HyperDtype::Bf16),
+    // The limits: width 2^18 (the up grid y at 32768) at hidden 65536 and at 16 branches,
+    // rank 4096, and m 32768.
+    small(1, (4, 65536, 8), HyperDtype::F16),
+    small(1, (16, 16384, 4), HyperDtype::Bf16),
+    small(1, (2, 2048, 4096), HyperDtype::F16),
+    small(32768, (2, 3, 2), HyperDtype::Bf16),
 ];
 
 #[test]
@@ -914,9 +920,16 @@ enum Bad {
     MixedOverNormed,
     NormedOverX,
     GateOverLow,
+    MixOverNorm,
+    LowOverDown,
+    MixedOverUp,
+    GateOverInject,
+    MixedOverX,
+    GateOverMixed,
+    MixOverLow,
 }
 
-const BAD: [Bad; 14] = [
+const BAD: [Bad; 21] = [
     Bad::NegativeEps,
     Bad::NanEps,
     Bad::InfiniteEps,
@@ -931,6 +944,13 @@ const BAD: [Bad; 14] = [
     Bad::MixedOverNormed,
     Bad::NormedOverX,
     Bad::GateOverLow,
+    Bad::MixOverNorm,
+    Bad::LowOverDown,
+    Bad::MixedOverUp,
+    Bad::GateOverInject,
+    Bad::MixedOverX,
+    Bad::GateOverMixed,
+    Bad::MixOverLow,
 ];
 
 /// Applies `bad` to `call` and returns the text its refusal must contain.
@@ -941,6 +961,7 @@ fn spoil<'b>(
     o: &'b Outputs,
 ) -> &'static str {
     let gate = o.gate.as_ref().expect("gate");
+    let inject = i.inject.as_ref().expect("inject");
     match bad {
         Bad::NegativeEps => call.eps = -1e-6,
         Bad::NanEps => call.eps = f32::NAN,
@@ -956,6 +977,14 @@ fn spoil<'b>(
         Bad::MixedOverNormed => call.mixed = o.normed.at(4, o.mixed.len),
         Bad::NormedOverX => call.scratch.normed = i.x.all(),
         Bad::GateOverLow => call.gate = Some(o.low.at(0, gate.len)),
+        // The trailing sentinel of each host buffer holds the longer written range.
+        Bad::MixOverNorm => call.scratch.mix = i.norm.at(0, o.mix.len),
+        Bad::LowOverDown => call.scratch.low = i.down.at(0, o.low.len),
+        Bad::MixedOverUp => call.mixed = i.up.at(0, o.mixed.len),
+        Bad::GateOverInject => call.gate = Some(inject.at(0, gate.len)),
+        Bad::MixedOverX => call.mixed = i.x.at(0, o.mixed.len),
+        Bad::GateOverMixed => call.gate = Some(o.mixed.at(0, gate.len)),
+        Bad::MixOverLow => call.scratch.mix = o.low.at(0, o.mix.len),
     }
     match bad {
         Bad::NegativeEps | Bad::NanEps | Bad::InfiniteEps => "eps must be finite and nonnegative",
@@ -969,6 +998,13 @@ fn spoil<'b>(
         Bad::MixedOverNormed => "the CUDA normed and mixed ranges overlap",
         Bad::NormedOverX => "the CUDA normed and x ranges overlap",
         Bad::GateOverLow => "the CUDA low and gate ranges overlap",
+        Bad::MixOverNorm => "the CUDA mix and norm ranges overlap",
+        Bad::LowOverDown => "the CUDA low and down ranges overlap",
+        Bad::MixedOverUp => "the CUDA mixed and up ranges overlap",
+        Bad::GateOverInject => "the CUDA gate and inject ranges overlap",
+        Bad::MixedOverX => "the CUDA mixed and x ranges overlap",
+        Bad::GateOverMixed => "the CUDA mixed and gate ranges overlap",
+        Bad::MixOverLow => "the CUDA low and mix ranges overlap",
     }
 }
 
@@ -1074,4 +1110,163 @@ fn apply_refusals_name_the_argument_and_write_nothing() {
         bits(&c.x),
         "a refused apply wrote x"
     );
+}
+
+// ---- every weight code, saturation, and a large eps ---------------------------------------
+
+/// A read case of one branch of 65536 with rank 1, `x` all 0.5 (so `x / rms` is one, up to the
+/// eps), the norm weights `norm`, the down row all `2^-15` (so `dot / C` is near 2 and `low` near
+/// silu(2)), the up column `up`, and no inject.
+fn code_case(dtype: HyperDtype, norm: Vec<u16>, up: Vec<u16>) -> Case {
+    const HIDDEN: usize = 65536;
+    Case {
+        shape: HyperShape {
+            m: 1,
+            branches: 1,
+            hidden: HIDDEN,
+            rank: 1,
+        },
+        dtype,
+        eps: EPS,
+        x: vec![0.5; HIDDEN],
+        norm,
+        down: narrow(dtype, &vec![1.0 / 32768.0; HIDDEN]),
+        up,
+        inject: None,
+    }
+}
+
+fn all_codes() -> Vec<u16> {
+    (0..=u16::MAX).collect()
+}
+
+/// A device value against a reference that may be NaN, infinite or beyond the f32 range: NaN
+/// must stay NaN, an infinity or a value beyond f32::MAX must come back as the infinity of its
+/// sign, and a finite value must lie within `SLACK * bound` or within the f32 subnormal spacing
+/// 2^-149 (one rounding of a subnormal result).
+fn check_code(what: &str, index: usize, dev: f32, r: &Bounded) {
+    let near_max = f64::from(f32::MAX) * (1.0 - U);
+    if r.value.is_nan() {
+        assert!(dev.is_nan(), "{what}[{index}]: device {dev}, reference NaN");
+    } else if r.value.abs() > near_max && dev.is_infinite() {
+        assert!(
+            dev.is_sign_negative() == r.value.is_sign_negative(),
+            "{what}[{index}]: device {dev}, reference {}",
+            r.value
+        );
+    } else {
+        let diff = (f64::from(dev) - r.value).abs();
+        assert!(
+            dev.is_finite() && diff <= (SLACK * r.bound).max(f64::from(f32::from_bits(1))),
+            "{what}[{index}]: device {dev}, reference {} bound {}",
+            r.value,
+            r.bound
+        );
+    }
+}
+
+/// All 65536 codes of each dtype as norm weights (normal, subnormal, signed zero, infinite and
+/// NaN codes): `normed = x * (1 + w) / rms` with `x / rms` near one exposes the widened value of
+/// every code that `1 + w` does not absorb (every binary16 code above 2^-24, every bfloat16
+/// code above 2^-24), and the non-finite codes must give the infinity or NaN the formula gives.
+/// Only the norm stage is judged: the non-finite codes make every later stage NaN.
+#[test]
+fn every_weight_code_widens_exactly_in_the_norm() {
+    if !testkit::device_present("every_weight_code_widens_exactly_in_the_norm") {
+        return;
+    }
+    let rig = Rig::new();
+    for dtype in [HyperDtype::F16, HyperDtype::Bf16] {
+        let c = code_case(dtype, all_codes(), narrow(dtype, &[1.0; 65536]));
+        let got = run_read(&rig, &c, (0, 0));
+        for (index, (d, r)) in got.normed.iter().zip(ref_normed(&c)).enumerate() {
+            check_code(&format!("{dtype:?} normed"), index, *d, &r);
+        }
+    }
+}
+
+/// All 65536 codes of each dtype as the up column of rank 1: `mix[i] = up[i] * low[0]`, one
+/// product per value, so every code's widened value is exposed, subnormals included (no flush
+/// to zero), and a bfloat16 code near its maximum overflows f32 to the infinity of its sign.
+#[test]
+fn every_weight_code_widens_exactly_in_the_up_projection() {
+    if !testkit::device_present("every_weight_code_widens_exactly_in_the_up_projection") {
+        return;
+    }
+    let rig = Rig::new();
+    for dtype in [HyperDtype::F16, HyperDtype::Bf16] {
+        let c = code_case(dtype, narrow(dtype, &[0.0; 65536]), all_codes());
+        let got = run_read(&rig, &c, (0, 0));
+        assert!(
+            got.low[0].abs() > 1.0,
+            "{dtype:?}: low[0] is {}, too small to expose the codes",
+            got.low[0]
+        );
+        for (index, (d, r)) in got.mix.iter().zip(ref_mix(&c, &got.low)).enumerate() {
+            check_code(&format!("{dtype:?} mix"), index, *d, &r);
+        }
+    }
+}
+
+/// Down and inject rows 64 times their usual size put `dot / C` near +-96, past the f32
+/// overflow of `expf` at 88.7: SiLU must give -0 or the input and both sigmoids 0 or 1, never
+/// NaN, and every stage stays within its bound. The up rows are 64 times smaller so `mix`
+/// stays moderate. The case must reach the overflow: some `low` values and some gates must be
+/// exactly zero.
+#[test]
+fn saturated_projections_give_exact_limits_and_no_nan() {
+    if !testkit::device_present("saturated_projections_give_exact_limits_and_no_nan") {
+        return;
+    }
+    let rig = Rig::new();
+    let mut rng = Rng::new(0x4c0b_000b);
+    let mut c = Case::new(&mut rng, flash_next(2, HyperDtype::F16, true));
+    let rescale = |codes: &[u16], factor: f64| -> Vec<u16> {
+        let values: Vec<f32> = widen(HyperDtype::F16, codes)
+            .iter()
+            .map(|v| (v * factor) as f32)
+            .collect();
+        narrow(HyperDtype::F16, &values)
+    };
+    c.down = rescale(&c.down, 64.0);
+    c.up = rescale(&c.up, 1.0 / 64.0);
+    c.inject = c.inject.as_deref().map(|codes| rescale(codes, 64.0));
+    let got = run_read(&rig, &c, (0, 0));
+    check_read("saturated", &c, &got);
+    let zero_low = got.low.iter().filter(|v| **v == 0.0).count();
+    let gates = got.gate.as_deref().expect("gate");
+    let zero_gate = gates.iter().filter(|v| **v == 0.0).count();
+    eprintln!(
+        "saturated: {zero_low} of {} low values and {zero_gate} of {} gates are exactly zero",
+        got.low.len(),
+        gates.len()
+    );
+    assert!(zero_low > 0, "no low value reached the expf overflow");
+    assert!(zero_gate > 0, "no gate reached the expf overflow");
+}
+
+/// eps 1e-2 at the Flash-Next site, near the mean square of the quietest branch (0.0625): the
+/// eps sits inside the root, `sqrt(mean + eps)`. A kernel that adds it outside the root
+/// (`sqrt(mean) + eps`) would move that branch by about 3 percent, far beyond the norm bound;
+/// the host check below confirms the data separates the two forms before the device runs.
+#[test]
+fn a_large_eps_is_added_inside_the_root() {
+    let mut rng = Rng::new(0x4c0c_000c);
+    let mut c = Case::new(&mut rng, flash_next(2, HyperDtype::F16, true));
+    c.eps = 1e-2;
+    let hidden = c.shape.hidden;
+    let row = &c.x[..hidden];
+    let mean = row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / hidden as f64;
+    let inside = (mean + 1e-2).sqrt();
+    let outside = mean.sqrt() + 1e-2;
+    assert!(
+        (inside / outside - 1.0).abs() > 0.01,
+        "the data does not separate sqrt(mean + eps) from sqrt(mean) + eps"
+    );
+    if !testkit::device_present("a_large_eps_is_added_inside_the_root") {
+        return;
+    }
+    let rig = Rig::new();
+    let got = run_read(&rig, &c, (0, 0));
+    check_read("eps 1e-2", &c, &got);
 }
