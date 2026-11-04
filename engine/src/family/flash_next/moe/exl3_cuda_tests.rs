@@ -13,7 +13,10 @@
 //! zero residual and its output is the weighted picks plus the gated shared expert. Each of three
 //! input rows runs the block twice: with the picks read back (one grouped launch of the 20 gate
 //! and up pairs) and with the picks read on the device (id-indexed launches of 16 and 4 pairs).
-//! Both must write the same bytes. Against fp64: the ids in rank order, each pick weight and the
+//! Both must write the same bytes: the output, and each of the 20 gate and up rows and the 10
+//! down rows. Every one of those rows of both paths must match its fp64 projection, so a pair that
+//! a launch skipped (it keeps its zeroed row) or wrote to the wrong row fails by name; pairs 16 to
+//! 19 (picks 8 and 9) are the second id-indexed launch. Against fp64: the ids in rank order, each pick weight and the
 //! shared gate within `2^-17` (the device router's class R1, as in `cuda_tests`), the block output
 //! within a relative L2 of 2e-5 (the bound of the Qwen3.6 block's real-pack test). The host `route` (f32) must pick the same ids, the
 //! arithmetic flag and the router status must stay clear, and some pick over the three rows must
@@ -178,11 +181,12 @@ fn project(matrix: &Matrix, input: &[f64]) -> Result<Vec<f64>, EngError> {
     Ok(out)
 }
 
-/// One expert on `x`: `down(silu(gate x) * up x)`.
-fn expert(parts: &[Matrix], x: &[f64]) -> Result<Vec<f64>, EngError> {
+/// One expert's projections on `x`: `gate x`, `up x` and `down(silu(gate x) * up x)`.
+fn expert(parts: &[Matrix], x: &[f64]) -> Result<[Vec<f64>; 3], EngError> {
     let (gate, up) = (project(&parts[0], x)?, project(&parts[1], x)?);
     let act: Vec<f64> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-    project(&parts[2], &act)
+    let down = project(&parts[2], &act)?;
+    Ok([gate, up, down])
 }
 
 struct Reference {
@@ -191,6 +195,10 @@ struct Reference {
     gate: f64,
     /// The probability gap between the last pick and the best expert left out.
     margin: f64,
+    /// `[top_k][gate | up]` in pick order, the layout of the block's `expert_gu`.
+    gu: Vec<f64>,
+    /// `[top_k][hidden]`: each pick's down projection, unweighted, in pick order.
+    down: Vec<f64>,
     out: Vec<f64>,
 }
 
@@ -224,20 +232,25 @@ fn reference(
     let x: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
     let (ids, weights, gate, margin) = route_fp64(router, &x, moe.top_k);
     let mut out = vec![0.0f64; moe.hidden];
+    let (mut gu, mut downs) = (Vec::new(), Vec::new());
     for (&id, weight) in ids.iter().zip(&weights) {
         let parts = ExpertPart::ALL
             .map(|part| matrix(checkpoint, &expert_name_in(root, layer, id, part)))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-        for (o, v) in out.iter_mut().zip(expert(&parts, &x)?) {
+        let [g, u, down] = expert(&parts, &x)?;
+        for (o, v) in out.iter_mut().zip(&down) {
             *o += weight * v;
         }
+        gu.extend(g.into_iter().chain(u));
+        downs.extend(down);
     }
     let shared = ExpertPart::ALL
         .map(|part| matrix(checkpoint, &shared_name_in(root, layer, part)))
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    for (o, v) in out.iter_mut().zip(expert(&shared, &x)?) {
+    let [_, _, shared_down] = expert(&shared, &x)?;
+    for (o, v) in out.iter_mut().zip(&shared_down) {
         *o += gate * v;
     }
     Ok(Reference {
@@ -245,6 +258,8 @@ fn reference(
         weights,
         gate,
         margin,
+        gu,
+        down: downs,
         out,
     })
 }
@@ -255,6 +270,10 @@ struct Device {
     gate: f32,
     /// The block output's bytes, compared exactly between the two pick paths.
     out: Vec<u8>,
+    /// The bytes of `expert_gu`, `[top_k][gate | up]`.
+    gu: Vec<u8>,
+    /// The bytes of `expert_down`, `[top_k][hidden]`.
+    down: Vec<u8>,
     flag: u32,
     status: u32,
 }
@@ -349,6 +368,8 @@ fn run_block(
         weights: floats(&read(projector, &owned[5])?),
         gate: floats(&read(projector, &owned[6])?)[0],
         out: read(projector, &owned[1])?,
+        gu: read(projector, &owned[8])?,
+        down: read(projector, &owned[10])?,
         flag: word(&read(projector, &owned[16])?),
         status: word(&read(projector, &owned[7])?),
     })
@@ -365,6 +386,41 @@ fn relative_l2(actual: &[f32], expected: &[f64]) -> f64 {
 
 fn apart(actual: f32, expected: f64) -> f64 {
     (f64::from(actual) - expected).abs()
+}
+
+/// Every gate and up row and every down row of `run` against fp64, by pair; returns the largest
+/// relative L2.
+fn check_pairs(tag: &str, run: &Device, want: &Reference, moe: &MoeDims) -> f64 {
+    let (gu, down) = (floats(&run.gu), floats(&run.down));
+    let pairs = gu.len() / moe.inter;
+    assert_eq!(pairs, 2 * moe.top_k, "{tag}: gate and up rows");
+    let mut worst = 0.0f64;
+    let rows = gu
+        .chunks_exact(moe.inter)
+        .zip(want.gu.chunks_exact(moe.inter));
+    for (pair, (got, fp64)) in rows.enumerate() {
+        let error = relative_l2(got, fp64);
+        let half = if pair % 2 == 0 { "gate" } else { "up" };
+        assert!(
+            error < OUTPUT_BOUND,
+            "{tag}: pair {pair} (pick {}, {half}) relative L2 {error}",
+            pair / 2
+        );
+        worst = worst.max(error);
+    }
+    assert_eq!(down.len() / moe.hidden, moe.top_k, "{tag}: down rows");
+    let rows = down
+        .chunks_exact(moe.hidden)
+        .zip(want.down.chunks_exact(moe.hidden));
+    for (slot, (got, fp64)) in rows.enumerate() {
+        let error = relative_l2(got, fp64);
+        assert!(
+            error < OUTPUT_BOUND,
+            "{tag}: down of pick {slot} relative L2 {error}"
+        );
+        worst = worst.max(error);
+    }
+    worst
 }
 
 /// Runs both pick paths on input `seed` and checks them against fp64 and the host `route`;
@@ -384,6 +440,14 @@ fn check_row(
     assert_eq!(
         on_device.out, got.out,
         "{tag}: device picks, the output bytes"
+    );
+    assert_eq!(
+        on_device.gu, got.gu,
+        "{tag}: device picks, the gate and up rows"
+    );
+    assert_eq!(
+        on_device.down, got.down,
+        "{tag}: device picks, the down rows"
     );
     for run in [&got, &on_device] {
         assert_eq!(run.flag, 0, "{tag}: arithmetic flag");
@@ -406,9 +470,13 @@ fn check_row(
         apart(got.gate, want.gate) < WEIGHT_BOUND,
         "{tag}: shared gate"
     );
+    let pairs = [&got, &on_device]
+        .map(|run| check_pairs(&tag, run, &want, moe))
+        .into_iter()
+        .fold(0.0f64, f64::max);
     let error = relative_l2(&floats(&got.out), &want.out);
     println!(
-        "{tag}: picks {:?}, rank-10 margin {:.3e}, shared gate {:.4}, relative L2 {error:.3e}",
+        "{tag}: picks {:?}, rank-10 margin {:.3e}, shared gate {:.4}, worst pair row {pairs:.3e}, output relative L2 {error:.3e}",
         got.ids, want.margin, want.gate
     );
     assert!(error < OUTPUT_BOUND, "{tag}: relative L2 {error}");
