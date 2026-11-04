@@ -51,6 +51,9 @@ pub mod spec;
     reason = "the CUDA n-gram step reaches the repeat index, the accept rule, the window and the driver; the MTP chain, the calibrator and the hybrid and dynamic settings are reached only from tests until the MTP draft step exists"
 )]
 pub(crate) mod speculate;
+/// Qualification only: the device harnesses and the offline verdict are tests.
+#[cfg(test)]
+pub(crate) mod token_forcing;
 pub mod weight_plan;
 
 pub use keys::{KeyTier, TierAssignment};
