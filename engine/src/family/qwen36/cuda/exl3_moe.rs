@@ -49,15 +49,15 @@ const INDEXED_PAIRS: usize = 16;
 
 pub(in crate::family) struct Exl3MoeWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix.
-    pub(in crate::family) router: &'w DeviceBuffer,
+    pub(super) router: &'w DeviceBuffer,
     /// The raw F32 `[hidden]` shared-gate vector.
-    pub(in crate::family) router_shared: &'w DeviceBuffer,
-    pub(in crate::family) gate: &'w Exl3Bank,
-    pub(in crate::family) up: &'w Exl3Bank,
-    pub(in crate::family) down: &'w Exl3Bank,
-    pub(in crate::family) shared_gate: &'w Exl3Weight,
-    pub(in crate::family) shared_up: &'w Exl3Weight,
-    pub(in crate::family) shared_down: &'w Exl3Weight,
+    pub(super) router_shared: &'w DeviceBuffer,
+    pub(super) gate: &'w Exl3Bank,
+    pub(super) up: &'w Exl3Bank,
+    pub(super) down: &'w Exl3Bank,
+    pub(super) shared_gate: &'w Exl3Weight,
+    pub(super) shared_up: &'w Exl3Weight,
+    pub(super) shared_down: &'w Exl3Weight,
 }
 
 impl<'w> Exl3MoeWeights<'w> {
