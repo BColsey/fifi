@@ -72,6 +72,13 @@ FIXTURE_CALL_RE = re.compile(rf"\b(or_skip|required)\(\"([{UPPER}][{UPPER}0-9_]+
 # libtest output shapes, aligned with fifi_gate.py.
 RUNNING_RE = re.compile(r"^running (\d+) tests?$")
 TEST_LINE_RE = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored(?:, .*)?)$")
+# Under --nocapture, libtest writes the `test NAME ... ` prefix without a
+# newline; a test's own print! can then land glued after the status word
+# (`test NAME ... okPRINTED`) or push the status onto a later bare line. The
+# counted==summary invariant is unchanged: any miscount still fails the run.
+TORN_PREFIX_RE = re.compile(r"^test (.+?) \.\.\. (.+)$")
+BARE_STATUS_RE = re.compile(r"^(ok|FAILED|ignored(?:, .*)?)$")
+GLUED_STATUS_RE = re.compile(r"^(ok|FAILED|ignored(?:, .*?)?)\S+.*$")
 SUMMARY_RE = re.compile(
     r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out; finished in [0-9.]+s"
@@ -282,6 +289,7 @@ class BinaryBlock:
 def parse_stdout_blocks(stdout: str) -> list[BinaryBlock]:
     blocks: list[BinaryBlock] = []
     block: BinaryBlock | None = None
+    pending: list[str] = []  # names whose status word has not arrived yet
     for line in stdout.splitlines():
         if block is None:
             match = RUNNING_RE.match(line)
@@ -301,10 +309,22 @@ def parse_stdout_blocks(stdout: str) -> list[BinaryBlock]:
                 int(summary.group(6)),
             )
             block = None
+            pending = []
             continue
         test = TEST_LINE_RE.match(line)
         if test:
             block.lines.append((test.group(1), test.group(2)))
+            continue
+        torn = TORN_PREFIX_RE.match(line)
+        if torn and " ... " not in torn.group(2):
+            glued = GLUED_STATUS_RE.match(torn.group(2))
+            if glued:
+                block.lines.append((torn.group(1), glued.group(1)))
+            else:
+                pending.append(torn.group(1))
+            continue
+        if pending and BARE_STATUS_RE.match(line):
+            block.lines.append((pending.pop(0), line.split(",", 1)[0]))
     if block is not None:
         raise InventoryError("libtest block without a `test result:` summary (crashed binary?)")
     return blocks

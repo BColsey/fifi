@@ -45,6 +45,80 @@ def parse_run(stdout: str, stderr: str) -> dict:
     return qi.summarize_run(stdout, stderr)
 
 
+class TornResultLineTest(unittest.TestCase):
+    """Under --nocapture, test prints can tear libtest's result lines."""
+
+    STDERR = "     Running unittests src/lib.rs (x)\n"
+
+    def parse(self, body: str) -> dict:
+        return parse_run(body, self.STDERR)
+
+    def test_glued_status_still_counts(self) -> None:
+        # Real shape from the integrated main: `test NAME ... ok` with the test's
+        # REAL_ROW print glued onto the status word with no newline between.
+        block = (
+            "running 2 tests\n"
+            "test one ... ok\n"
+            "test pack::checks ... okREAL_ROW row=0 rel_l2=0.0 cosine=1.0\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        self.assertEqual(self.parse(block)["totals"]["passed"], 2)
+
+    def test_deferred_status_completed_by_bare_line(self) -> None:
+        # The print lands between libtest's `test NAME ... ` prefix and its
+        # status word, which then arrives alone on a later line.
+        block = (
+            "running 2 tests\n"
+            "test one ... ok\n"
+            "test quality::rows ... REAL_ROW row=1 rel_l2=1.0 cosine=0.0\n"
+            "REAL_ROW row=0 rel_l2=inf cosine=0.0\n"
+            "ok\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        self.assertEqual(self.parse(block)["totals"]["passed"], 2)
+
+    def test_parallel_pending_stack_completes_in_order(self) -> None:
+        block = (
+            "running 3 tests\n"
+            "test a ... PRINT mid-run output\n"
+            "test b ... ok\n"
+            "test c ... PRINT other output\n"
+            "ok\n"
+            "ok\n"
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        self.assertEqual(self.parse(block)["totals"]["passed"], 3)
+
+    def test_uncompleted_pending_still_fails_the_count(self) -> None:
+        # A torn line whose status never arrives must not silently pass.
+        block = (
+            "running 2 tests\n"
+            "test one ... ok\n"
+            "test lost ... PRINT and never finishes\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        with self.assertRaises(qi.InventoryError):
+            self.parse(block)
+
+    def test_phantom_full_result_line_still_overcounts(self) -> None:
+        # Tolerance for torn lines must not accept fabricated full results: the
+        # ghost line inflates the count past the summary's own arithmetic.
+        block = (
+            "running 2 tests\n"
+            "test one ... ok\n"
+            "test two ... ok\n"
+            "test ghost ... ok\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.0s\n"
+        )
+        with self.assertRaises(qi.InventoryError):
+            self.parse(block)
+
+
 class ScanFileTest(unittest.TestCase):
     def test_counts_tests_ignores_gates_and_fixtures(self) -> None:
         source = """\
