@@ -734,10 +734,9 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
-        if calls.is_empty() || calls.len() > self.exl3_indexed_capacity() {
-            return Err(refuse(
-                "needs 1..=16 calls (up to 20 under a 20-pair prototype)",
-            ));
+        let capacity = self.exl3_indexed_capacity();
+        if calls.is_empty() || calls.len() > capacity {
+            return Err(refuse(&format!("needs 1..={capacity} calls")));
         }
         if !matches!(cols, 1 | 2 | 4 | 8)
             || calls

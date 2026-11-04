@@ -1334,10 +1334,11 @@ __device__ __forceinline__ bool resolve_indexed(const P &p, GroupEntry &a) {
 }
 
 // The kernel bodies of the id-indexed launch, for the production parameter block and the
-// prototype's.
+// prototype's. Each kernel declares its own shared arrays and passes them in: a __shared__
+// variable declared in a body that two kernels instantiate is one variable for both, and ptxas
+// then reserves it for neither kernel.
 template <class P>
-__device__ __forceinline__ void indexed_input_rotate_body(const P &p) {
-    __shared__ float values[128];
+__device__ __forceinline__ void indexed_input_rotate_body(const P &p, float (&values)[128]) {
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
@@ -1346,9 +1347,8 @@ __device__ __forceinline__ void indexed_input_rotate_body(const P &p) {
 }
 
 template <int Cols, bool Dp4a, class P>
-__device__ __forceinline__ void indexed_project_body(const P &p) {
-    __shared__ float partial[8][16 * Cols];
-    __shared__ __align__(8) unsigned wtab[8][Cols][128];
+__device__ __forceinline__ void indexed_project_body(const P &p, float (&partial)[8][16 * Cols],
+                                                     unsigned (&wtab)[8][Cols][128]) {
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     switch (a.book) {
@@ -1359,8 +1359,7 @@ __device__ __forceinline__ void indexed_project_body(const P &p) {
 }
 
 template <class P>
-__device__ __forceinline__ void indexed_output_rotate_body(const P &p) {
-    __shared__ float values[128];
+__device__ __forceinline__ void indexed_output_rotate_body(const P &p, float (&values)[128]) {
     GroupEntry a;
     if (!resolve_indexed(p, a)) return;
     const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
@@ -1375,17 +1374,21 @@ __device__ __forceinline__ void indexed_output_rotate_body(const P &p) {
 }
 
 __global__ void indexed_input_rotate(const __grid_constant__ IndexedArgs p) {
-    indexed_input_rotate_body(p);
+    __shared__ float values[128];
+    indexed_input_rotate_body(p, values);
 }
 
 template <int Cols>
 __global__ void __launch_bounds__(256, wide_min_blocks<Cols>) indexed_project_wide(
     const __grid_constant__ IndexedArgs p) {
-    indexed_project_body<Cols, false>(p);
+    __shared__ float partial[8][16 * Cols];
+    __shared__ __align__(8) unsigned wtab[8][Cols][128];
+    indexed_project_body<Cols, false>(p, partial, wtab);
 }
 
 __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
-    indexed_output_rotate_body(p);
+    __shared__ float values[128];
+    indexed_output_rotate_body(p, values);
 }
 
 // The bench-only prototype kernels (`inference_cuda_exl3_grouped_indexed_prototype`): the same
@@ -1393,18 +1396,22 @@ __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
 // Dp4a is set. No production path launches them.
 template <class P>
 __global__ void prototype_input_rotate(const __grid_constant__ P p) {
-    indexed_input_rotate_body(p);
+    __shared__ float values[128];
+    indexed_input_rotate_body(p, values);
 }
 
 template <class P, bool Dp4a>
 __global__ void __launch_bounds__(256, wide_min_blocks<1>) prototype_project(
     const __grid_constant__ P p) {
-    indexed_project_body<1, Dp4a>(p);
+    __shared__ float partial[8][16];
+    __shared__ __align__(8) unsigned wtab[8][1][128];
+    indexed_project_body<1, Dp4a>(p, partial, wtab);
 }
 
 template <class P>
 __global__ void prototype_output_rotate(const __grid_constant__ P p) {
-    indexed_output_rotate_body(p);
+    __shared__ float values[128];
+    indexed_output_rotate_body(p, values);
 }
 
 // Probe of the DP4A decode for its tests (`inference_cuda_exl3_book2_probe`). For each word x:

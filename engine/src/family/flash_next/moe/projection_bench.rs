@@ -15,7 +15,8 @@
 //! - `gateup_20`: the block's 20 gate and up pairs, as 16 + 4 production launches, 16 + 4 DP4A
 //!   launches, one 20-pair launch and one 20-pair DP4A launch, so the decode, the consolidation
 //!   and both are measured against the same baseline in the same trials;
-//! - warm gate/up 16 and down 10, production against DP4A.
+//! - warm gate/up 16 and down 10, production against DP4A, and the warm 20 gate and up pairs
+//!   with all four variants.
 //!
 //! Cold launches read a new set of ten distinct experts each time. 51 sets rotate through the 512
 //! experts, so a launch never finds its weights in the 6 MB L2. Warm launches point every pick at
@@ -112,6 +113,14 @@ macro_rules! decode {
 
 const SPLIT: Launches = &[(0, 16), (16, 4)];
 const SINGLE: Launches = &[(0, 20)];
+/// The 20 gate and up pairs: production and DP4A as 16 + 4 launches, then one 20-pair launch
+/// without and with DP4A.
+const GATEUP_20: &[Variant] = &[
+    ("base", IndexedPrototype::Off, SPLIT),
+    ("dp4a", IndexedPrototype::Dp4a, SPLIT),
+    ("pairs20", IndexedPrototype::Pairs20, SINGLE),
+    ("both", IndexedPrototype::Both, SINGLE),
+];
 
 const CASES: [Case; 14] = [
     case("gateup_p2", Shape::GateUp, decode!(&[(0, 2)]), false),
@@ -120,23 +129,13 @@ const CASES: [Case; 14] = [
     case("gateup_p12", Shape::GateUp, decode!(&[(0, 12)]), false),
     case("gateup_p16", Shape::GateUp, decode!(&[(0, 16)]), false),
     case("gateup_tail_p4", Shape::GateUp, decode!(&[(16, 4)]), false),
-    case(
-        "gateup_20",
-        Shape::GateUp,
-        &[
-            ("base", IndexedPrototype::Off, SPLIT),
-            ("dp4a", IndexedPrototype::Dp4a, SPLIT),
-            ("pairs20", IndexedPrototype::Pairs20, SINGLE),
-            ("both", IndexedPrototype::Both, SINGLE),
-        ],
-        false,
-    ),
+    case("gateup_20", Shape::GateUp, GATEUP_20, false),
     case("down_p2", Shape::Down, decode!(&[(0, 2)]), false),
     case("down_p4", Shape::Down, decode!(&[(0, 4)]), false),
     case("down_p8", Shape::Down, decode!(&[(0, 8)]), false),
     case("down_p10", Shape::Down, decode!(&[(0, 10)]), false),
     case("gateup_p16_warm", Shape::GateUp, decode!(&[(0, 16)]), true),
-    case("gateup_20_warm", Shape::GateUp, decode!(SPLIT), true),
+    case("gateup_20_warm", Shape::GateUp, GATEUP_20, true),
     case("down_p10_warm", Shape::Down, decode!(&[(0, 10)]), true),
 ];
 

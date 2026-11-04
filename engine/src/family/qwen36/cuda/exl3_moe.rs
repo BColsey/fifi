@@ -226,8 +226,8 @@ struct IndexedPair<'a> {
 }
 
 /// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
-/// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the scratch; the
-/// stream runs it after the previous launch has finished with those rows.
+/// `exl3_indexed_capacity` pairs in group order. Each launch starts again at row 0 of the
+/// scratch; the stream runs it after the previous launch has finished with those rows.
 fn grouped_indexed(
     launch: &Launch<'_>,
     pairs: &[IndexedPair<'_>],
