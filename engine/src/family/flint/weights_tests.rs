@@ -228,6 +228,22 @@ fn sparse_checkpoint(change: impl FnOnce(&mut [Vec<Entry>])) -> tempfile::TempDi
     root
 }
 
+// Fails if `FlintCheckpoint::open` stops guarding the root and its shards.
+#[cfg(target_os = "linux")]
+#[test]
+fn open_refuses_a_checkpoint_on_a_network_mount() {
+    let root = sparse_checkpoint(|_| {});
+    let refused = crate::storage_guard::seam::with_nfs_at(root.path(), || {
+        FlintCheckpoint::open(root.path()).err().expect("refused")
+    });
+    assert!(
+        refused.describe().contains("local storage"),
+        "{}",
+        refused.describe()
+    );
+    assert!(FlintCheckpoint::open(root.path()).is_ok());
+}
+
 #[test]
 fn open_checks_complete_profile_without_reading_payloads() {
     let root = sparse_checkpoint(|_| {});

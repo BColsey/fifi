@@ -2,56 +2,328 @@
 //!
 //! Weights and caches are read on the inference path, where network latency
 //! and availability are not acceptable, and a network filesystem is neither a
-//! storage tier nor a fallback. [`require_local`] is the one check, called
-//! where the engine opens a model directory or weight file.
+//! storage tier nor a fallback. [`require_local`] checks one path;
+//! [`LocalGuard`] reads the platform's filesystem facts once and checks many,
+//! for a loader that opens a path per shard.
 //!
-//! The check finds the filesystem that owns a path from the kernel mount
-//! table (`/proc/self/mountinfo`): the mount point that is the longest prefix
-//! of the resolved path, the later table line winning a tie (an automount
-//! placeholder and the real mount stack at one mount point, and the real one
-//! is listed last). Only Linux is checked; on other platforms the function
-//! returns `Ok` without looking, because no std-only way to read the
-//! filesystem type exists there and the engine adds no unsafe code for it.
+//! Symlinks are resolved first, so a local shard that links into a network
+//! mount is refused, and a path that does not exist yet is judged by its
+//! nearest existing ancestor.
+//!
+//! On Linux the owner of a path comes from the kernel mount table
+//! (`/proc/self/mountinfo`): the mount point that is the longest prefix of the
+//! resolved path. Mounts stacked at one mount point (an automount placeholder
+//! under the real mount) resolve to the topmost one, the mount that no other
+//! mount at that point names as its parent. On macOS the owner is the
+//! filesystem `statfs` reports for the resolved path. Other platforms are not
+//! checked and every check returns `Ok`.
+//!
+//! What a filesystem type cannot reveal is not caught: a union filesystem
+//! such as mergerfs over network branches, and a FUSE mount whose source is
+//! a local-looking path. The tokenizer directory and the Flash-Next manifest
+//! hold small text files and are not checked.
 
 use std::path::Path;
 
 use crate::EngError;
 
-/// Refuses `path` when it lives on a network-backed filesystem. `what` names
-/// the stored thing in the refusal ("model weights", "prefix cache").
-///
-/// A path that does not exist yet is judged by its nearest existing ancestor,
-/// so a cache directory about to be created is checked too.
-#[cfg(target_os = "linux")]
-pub fn require_local(path: &Path, what: &str) -> Result<(), EngError> {
-    let resolved = linux::resolve(path).map_err(|error| unresolved(path, what, &error))?;
-    let table = std::fs::read(linux::MOUNTINFO)
-        .map_err(|error| unresolved(Path::new(linux::MOUNTINFO), what, &error))?;
-    let mounts = mounts::parse_mountinfo(&String::from_utf8_lossy(&table));
-    mounts::refuse_network(&mounts, &resolved, path, what)
-}
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod seam;
 
-/// Not checked on this platform: always `Ok`. See the module documentation.
-#[cfg(not(target_os = "linux"))]
-pub fn require_local(path: &Path, what: &str) -> Result<(), EngError> {
-    let _ = (path, what);
-    Ok(())
+/// The filesystem facts of one check, read once. Every
+/// [`LocalGuard::check`] after [`LocalGuard::new`] reuses them.
+#[cfg(target_os = "linux")]
+pub struct LocalGuard {
+    mounts: Vec<mounts::Entry>,
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+impl LocalGuard {
+    /// Reads the mount table. An unreadable table is an error: without it no
+    /// path can be confirmed local.
+    pub fn new() -> Result<Self, EngError> {
+        let table = linux::read_table()
+            .map_err(|error| unresolved(Path::new(linux::MOUNTINFO), "the mount table", &error))?;
+        Ok(Self {
+            mounts: mounts::parse_mountinfo(&table),
+        })
+    }
+
+    /// Refuses `path` when it lives on a network-backed filesystem. `what`
+    /// names the stored thing in the refusal ("model weights", "prefix
+    /// cache").
+    pub fn check(&self, path: &Path, what: &str) -> Result<(), EngError> {
+        let resolved = resolve::resolve(path).map_err(|error| unresolved(path, what, &error))?;
+        match mounts::owning_mount(&self.mounts, &resolved) {
+            Some(mount) => refuse(mount, &resolved, path, what),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `statfs` answers per path, so there is nothing to read ahead.
+#[cfg(target_os = "macos")]
+pub struct LocalGuard;
+
+#[cfg(target_os = "macos")]
+impl LocalGuard {
+    pub fn new() -> Result<Self, EngError> {
+        Ok(Self)
+    }
+
+    /// Refuses `path` when it lives on a network-backed filesystem. `what`
+    /// names the stored thing in the refusal ("model weights", "prefix
+    /// cache").
+    pub fn check(&self, path: &Path, what: &str) -> Result<(), EngError> {
+        let resolved = resolve::resolve(path).map_err(|error| unresolved(path, what, &error))?;
+        let mount = macos::owner(&resolved).map_err(|error| unresolved(path, what, &error))?;
+        refuse(&mount, &resolved, path, what)
+    }
+}
+
+/// Not checked on this platform: every check returns `Ok`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub struct LocalGuard;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl LocalGuard {
+    pub fn new() -> Result<Self, EngError> {
+        Ok(Self)
+    }
+
+    pub fn check(&self, path: &Path, what: &str) -> Result<(), EngError> {
+        let _ = (path, what);
+        Ok(())
+    }
+}
+
+/// [`LocalGuard::check`] for a caller with one path.
+pub fn require_local(path: &Path, what: &str) -> Result<(), EngError> {
+    LocalGuard::new()?.check(path, what)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unresolved(path: &Path, what: &str, error: &std::io::Error) -> EngError {
+    EngError::Checkpoint(format!(
+        "cannot confirm that {what} at {} is on local storage: {error}",
+        path.display()
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use filesystem::{Mount, refuse};
+
+/// What a filesystem is and which types the check refuses; shared by the
+/// Linux and the macOS owner lookups, and pure so it is tested everywhere.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+mod filesystem {
+    use std::path::{Path, PathBuf};
+
+    use crate::EngError;
+
+    /// Filesystem types the check refuses. Network filesystems put the bytes
+    /// behind a network. `autofs` is a placeholder with nothing mounted over
+    /// it, so what backs the path is unknown. The macOS names (`afpfs`,
+    /// `webdav`) sit beside the Linux ones. A FUSE mount whose source reads
+    /// `host:path` is also refused (see [`is_refused`]), which covers remote
+    /// FUSE filesystems missing from this list.
+    const REFUSED_FILESYSTEMS: &[&str] = &[
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "afpfs",
+        "webdav",
+        "9p",
+        "ceph",
+        "glusterfs",
+        "lustre",
+        "afs",
+        "ncpfs",
+        "davfs",
+        "gpfs",
+        "beegfs",
+        "wekafs",
+        "panfs",
+        "orangefs",
+        "sshfs",
+        "fuse.sshfs",
+        "fuse.rclone",
+        "fuse.s3fs",
+        "fuse.mount-s3",
+        "fuse.gcsfuse",
+        "fuse.glusterfs",
+        "fuse.ceph-fuse",
+        "fuse.juicefs",
+        "autofs",
+    ];
+
+    /// The mount that owns a path, reduced to what the check needs.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in crate::storage_guard) struct Mount {
+        pub(in crate::storage_guard) point: PathBuf,
+        pub(in crate::storage_guard) fstype: String,
+        pub(in crate::storage_guard) source: String,
+    }
+
+    /// The refusal for `mount` as the owner of `resolved`, or `Ok` when it is
+    /// local. `shown` is the path as the caller gave it.
+    pub(in crate::storage_guard) fn refuse(
+        mount: &Mount,
+        resolved: &Path,
+        shown: &Path,
+        what: &str,
+    ) -> Result<(), EngError> {
+        if !is_refused(mount) {
+            return Ok(());
+        }
+        let given = if shown == resolved {
+            String::new()
+        } else {
+            format!(" (given as {})", shown.display())
+        };
+        Err(EngError::Checkpoint(format!(
+            "{what} must be on local storage, but {}{given} is on a {} filesystem \
+             (mount {}, source {})",
+            resolved.display(),
+            mount.fstype,
+            mount.point.display(),
+            mount.source,
+        )))
+    }
+
+    pub(in crate::storage_guard) fn is_refused(mount: &Mount) -> bool {
+        let fstype = mount.fstype.to_ascii_lowercase();
+        if REFUSED_FILESYSTEMS.contains(&fstype.as_str()) {
+            return true;
+        }
+        // A remote FUSE filesystem names its server as `host:path` and a local
+        // one names a device or a program, never a colon-separated host.
+        let fuse = fstype.starts_with("fuse") || fstype == "macfuse" || fstype == "osxfuse";
+        fuse && !mount.source.starts_with('/') && mount.source.contains(':')
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn mount(fstype: &str, source: &str) -> Mount {
+            Mount {
+                point: "/m".into(),
+                fstype: fstype.into(),
+                source: source.into(),
+            }
+        }
+
+        // Fails if any listed type is dropped, or a local type is added.
+        #[test]
+        fn every_listed_type_is_refused_and_local_types_pass() {
+            // Spelled out, not read from the const, so dropping an entry fails.
+            for fstype in [
+                "nfs",
+                "nfs4",
+                "cifs",
+                "smb3",
+                "smbfs",
+                "afpfs",
+                "webdav",
+                "9p",
+                "ceph",
+                "glusterfs",
+                "lustre",
+                "afs",
+                "ncpfs",
+                "davfs",
+                "gpfs",
+                "beegfs",
+                "wekafs",
+                "panfs",
+                "orangefs",
+                "sshfs",
+                "fuse.sshfs",
+                "fuse.rclone",
+                "fuse.s3fs",
+                "fuse.mount-s3",
+                "fuse.gcsfuse",
+                "fuse.glusterfs",
+                "fuse.ceph-fuse",
+                "fuse.juicefs",
+                "autofs",
+                "NFS4",
+            ] {
+                assert!(is_refused(&mount(fstype, "/dev/x")), "{fstype}");
+            }
+            for fstype in [
+                "ext4",
+                "btrfs",
+                "xfs",
+                "zfs",
+                "tmpfs",
+                "overlay",
+                "apfs",
+                "hfs",
+                "devfs",
+                "fuseblk",
+                "f2fs",
+                "fuse.cephfs",
+            ] {
+                assert!(!is_refused(&mount(fstype, "/dev/x")), "{fstype}");
+            }
+        }
+
+        // Fails if the host:path rule is removed, applies to local FUSE, or
+        // misses the macOS FUSE type names.
+        #[test]
+        fn a_fuse_mount_with_a_host_source_is_network_and_a_device_source_is_not() {
+            assert!(is_refused(&mount("fuse.unknownfs", "user@box:/data")));
+            assert!(is_refused(&mount("macfuse", "user@box:/data")));
+            assert!(is_refused(&mount("osxfuse", "user@box:/data")));
+            assert!(!is_refused(&mount("macfuse", "/dev/disk4")));
+            assert!(!is_refused(&mount("fuse.unknownfs", "/dev/sdb1")));
+            assert!(!is_refused(&mount("fuse.gvfsd-fuse", "gvfsd-fuse")));
+            assert!(!is_refused(&mount("ext4", "a:b")));
+        }
+
+        // Fails if the message drops the resolved path, the filesystem type or
+        // `what`, repeats itself, or hides the path the caller gave.
+        #[test]
+        fn the_refusal_names_the_resolved_path_once_and_the_given_one() {
+            let nfs = Mount {
+                point: "/srv/shared".into(),
+                fstype: "nfs4".into(),
+                source: "nas:/shared".into(),
+            };
+            let resolved = Path::new("/srv/shared/cache");
+            let error = refuse(&nfs, resolved, resolved, "prefix cache").unwrap_err();
+            let text = error.describe();
+            assert!(text.contains("prefix cache"), "{text}");
+            assert!(text.contains("nfs4"), "{text}");
+            assert!(text.contains("nas:/shared"), "{text}");
+            assert_eq!(text.matches("/srv/shared/cache").count(), 1, "{text}");
+            assert_eq!(text.matches("prefix cache").count(), 1, "{text}");
+            assert!(!text.contains("given as"), "{text}");
+
+            let given = Path::new("link/cache");
+            let error = refuse(&nfs, resolved, given, "prefix cache").unwrap_err();
+            assert!(error.describe().contains("(given as link/cache)"));
+        }
+    }
+}
+
+/// The absolute path with its nearest existing prefix canonicalized (so
+/// symlinks resolve) and the not-yet-created rest appended lexically, where
+/// `..` can only cancel a missing directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod resolve {
     use std::{
         io,
         path::{Component, Path, PathBuf},
     };
 
-    pub(super) const MOUNTINFO: &str = "/proc/self/mountinfo";
-
-    /// The absolute path with its nearest existing prefix canonicalized (so
-    /// symlinks resolve) and the not-yet-created rest appended lexically,
-    /// where `..` can only cancel a missing directory. A prefix that exists
-    /// but cannot be canonicalized, such as a dangling symlink, is an error:
-    /// its target is unknown, and creating through it could land anywhere.
+    /// A prefix that exists but cannot be canonicalized, such as a dangling
+    /// symlink, is an error naming it: its target is unknown, and creating
+    /// through it could land anywhere.
     pub(super) fn resolve(path: &Path) -> io::Result<PathBuf> {
         let absolute = std::env::current_dir()?.join(path);
         let parts: Vec<Component> = absolute.components().collect();
@@ -60,7 +332,15 @@ mod linux {
             if std::fs::symlink_metadata(&existing).is_err() {
                 continue;
             }
-            let mut resolved = std::fs::canonicalize(&existing)?;
+            let mut resolved = std::fs::canonicalize(&existing).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{} exists but does not resolve (a dangling symlink?): {error}",
+                        existing.display()
+                    ),
+                )
+            })?;
             for part in &parts[split..] {
                 match part {
                     Component::ParentDir => {
@@ -79,134 +359,185 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn unresolved(path: &Path, what: &str, error: &std::io::Error) -> EngError {
-    EngError::Checkpoint(format!(
-        "cannot confirm that {what} at {} is on local storage: {error}",
-        path.display()
-    ))
-}
+/// The macOS owner lookup: `statfs` of the resolved path, or of its nearest
+/// existing ancestor when the path does not exist yet.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::{ffi::c_char, io, path::Path};
 
-/// The mount-table side of the check: pure text and path logic, so it is
-/// tested on fixtures on every platform.
-#[cfg(any(target_os = "linux", test))]
-mod mounts {
-    use std::path::{Path, PathBuf};
+    use super::Mount;
 
-    use crate::EngError;
-
-    /// Filesystem types that put the bytes behind a network. A `fuse` mount whose
-    /// source reads `host:path` is also refused (see [`is_network`]), which covers
-    /// remote FUSE filesystems missing from this list.
-    const NETWORK_FILESYSTEMS: &[&str] = &[
-        "nfs",
-        "nfs4",
-        "cifs",
-        "smb3",
-        "smbfs",
-        "9p",
-        "ceph",
-        "glusterfs",
-        "lustre",
-        "afs",
-        "ncpfs",
-        "davfs",
-        "sshfs",
-        "fuse.sshfs",
-        "fuse.rclone",
-        "fuse.s3fs",
-        "fuse.gcsfuse",
-        "fuse.glusterfs",
-        "fuse.cephfs",
-    ];
-
-    /// One entry of the kernel mount table, reduced to what the check needs.
-    #[derive(Debug, PartialEq, Eq)]
-    pub(super) struct Mount {
-        point: PathBuf,
-        fstype: String,
-        source: String,
-    }
-
-    /// The refusal for the mount that owns `resolved`, if it is network-backed.
-    pub(super) fn refuse_network(
-        mounts: &[Mount],
-        resolved: &Path,
-        shown: &Path,
-        what: &str,
-    ) -> Result<(), EngError> {
-        let Some(mount) = owning_mount(mounts, resolved).filter(|mount| is_network(mount)) else {
-            return Ok(());
-        };
-        Err(EngError::Checkpoint(format!(
-            "{what} must be on local storage, but {} is on a {} filesystem (mount {}, source {}); \
-             network-backed storage is not accepted for {what}",
-            shown.display(),
-            mount.fstype,
-            mount.point.display(),
-            mount.source,
-        )))
-    }
-
-    fn is_network(mount: &Mount) -> bool {
-        let fstype = mount.fstype.to_ascii_lowercase();
-        if NETWORK_FILESYSTEMS.contains(&fstype.as_str()) {
-            return true;
-        }
-        // A remote FUSE filesystem names its server as `host:path` and a local
-        // one names a device or a program, never a colon-separated host.
-        fstype.starts_with("fuse") && !mount.source.starts_with('/') && mount.source.contains(':')
-    }
-
-    /// The mount with the most path components that is a prefix of `path`; among
-    /// equally long mount points the later table line wins.
-    fn owning_mount<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-        let mut best: Option<(usize, &Mount)> = None;
-        for mount in mounts.iter().filter(|mount| path.starts_with(&mount.point)) {
-            let depth = mount.point.components().count();
-            if best.is_none_or(|(deepest, _)| depth >= deepest) {
-                best = Some((depth, mount));
+    /// A path that does not exist yet lives on the filesystem of its nearest
+    /// existing ancestor, which `statfs` can answer for.
+    pub(super) fn owner(resolved: &Path) -> io::Result<Mount> {
+        for candidate in resolved.ancestors() {
+            match rustix::fs::statfs(candidate) {
+                Ok(stat) => {
+                    return Ok(Mount {
+                        point: text(&stat.f_mntonname).into(),
+                        fstype: text(&stat.f_fstypename),
+                        source: text(&stat.f_mntfromname),
+                    });
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        best.map(|(_, mount)| mount)
+        Err(io::Error::from(io::ErrorKind::NotFound))
     }
 
-    /// Parses `mountinfo`. A line reads
+    /// A NUL-terminated C char array as text.
+    fn text(field: &[c_char]) -> String {
+        let bytes: Vec<u8> = field
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn text_stops_at_the_first_nul() {
+            let field: [c_char; 8] = [
+                b'n' as c_char,
+                b'f' as c_char,
+                b's' as c_char,
+                0,
+                7,
+                7,
+                0,
+                0,
+            ];
+            assert_eq!(text(&field), "nfs");
+        }
+
+        // Fails if the statfs lookup errors on, or refuses, the local root.
+        #[test]
+        fn the_root_filesystem_is_local() {
+            let mount = owner(Path::new("/")).unwrap();
+            assert!(!super::super::filesystem::is_refused(&mount), "{mount:?}");
+            assert!(super::super::require_local(Path::new("/"), "model weights").is_ok());
+        }
+
+        // Fails if the check skips symlink resolution or missing children.
+        #[test]
+        fn a_missing_child_of_a_local_directory_is_local() {
+            let dir = tempfile::tempdir().unwrap();
+            let missing = dir.path().join("cache").join("new");
+            assert!(super::super::require_local(&missing, "prefix cache").is_ok());
+        }
+    }
+}
+
+/// Where the Linux mount table comes from.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io;
+
+    pub(super) const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+    /// The kernel table, or the fixture a test installed for this thread.
+    pub(super) fn read_table() -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(table) = super::seam::installed() {
+            return Ok(table);
+        }
+        std::fs::read(MOUNTINFO)
+    }
+}
+
+/// The Linux owner lookup: the kernel mount table, as bytes.
+#[cfg(any(target_os = "linux", test))]
+mod mounts {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::Path};
+
+    use super::Mount;
+
+    /// One line of the table: the mount and its place in the stack.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Entry {
+        id: u32,
+        parent: u32,
+        mount: Mount,
+    }
+
+    /// The mount with the most path components that is a prefix of `path`.
+    /// Among mounts at that one point, the topmost wins: the one no other
+    /// mount there lists as its parent, else the later table line.
+    pub(super) fn owning_mount<'a>(entries: &'a [Entry], path: &Path) -> Option<&'a Mount> {
+        let prefixes = || {
+            entries
+                .iter()
+                .filter(|entry| path.starts_with(&entry.mount.point))
+        };
+        let depth = prefixes()
+            .map(|entry| entry.mount.point.components().count())
+            .max()?;
+        let stacked: Vec<&Entry> = prefixes()
+            .filter(|entry| entry.mount.point.components().count() == depth)
+            .collect();
+        let is_covered = |entry: &Entry| {
+            stacked
+                .iter()
+                .any(|other| other.parent == entry.id && other.id != entry.id)
+        };
+        stacked
+            .iter()
+            .rev()
+            .find(|entry| !is_covered(entry))
+            .or(stacked.last())
+            .map(|entry| &entry.mount)
+    }
+
+    /// Parses `mountinfo` as bytes, because a mount point may hold any byte
+    /// but NUL. A line reads
     /// `id parent major:minor root mount-point options [optional...] - fstype source super-options`;
     /// the lone `-` ends the optional fields, whose count varies. Lines that do
     /// not fit are skipped.
-    pub(super) fn parse_mountinfo(text: &str) -> Vec<Mount> {
-        text.lines().filter_map(parse_line).collect()
+    pub(super) fn parse_mountinfo(table: &[u8]) -> Vec<Entry> {
+        table
+            .split(|byte| *byte == b'\n')
+            .filter_map(parse_line)
+            .collect()
     }
 
-    fn parse_line(line: &str) -> Option<Mount> {
-        let (head, tail) = line.split_once(" - ")?;
-        let point = head.split(' ').nth(4)?;
-        let mut tail = tail.split(' ');
+    fn parse_line(line: &[u8]) -> Option<Entry> {
+        let separator = line.windows(3).position(|window| window == b" - ")?;
+        let mut head = line[..separator].split(|byte| *byte == b' ');
+        let id = number(head.next()?)?;
+        let parent = number(head.next()?)?;
+        let point = head.nth(2)?;
+        let mut tail = line[separator + 3..].split(|byte| *byte == b' ');
         let fstype = tail.next()?;
         let source = tail.next().unwrap_or_default();
-        Some(Mount {
-            point: unescape(point),
-            fstype: fstype.to_string(),
-            source: String::from_utf8_lossy(&unescape_bytes(source)).into_owned(),
+        Some(Entry {
+            id,
+            parent,
+            mount: Mount {
+                point: OsString::from_vec(unescape(point)).into(),
+                fstype: String::from_utf8_lossy(fstype).into_owned(),
+                source: String::from_utf8_lossy(&unescape(source)).into_owned(),
+            },
         })
     }
 
-    fn unescape(field: &str) -> PathBuf {
-        use std::os::unix::ffi::OsStringExt;
-        std::ffi::OsString::from_vec(unescape_bytes(field)).into()
+    fn number(field: &[u8]) -> Option<u32> {
+        std::str::from_utf8(field).ok()?.parse().ok()
     }
 
     /// Decodes the kernel's `\NNN` octal escapes (space is `\040`, tab `\011`,
     /// newline `\012`, backslash `\134`). A backslash not followed by three octal
     /// digits stays literal.
-    fn unescape_bytes(field: &str) -> Vec<u8> {
-        let bytes = field.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
+    fn unescape(field: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(field.len());
         let mut index = 0;
-        while index < bytes.len() {
-            let octal = bytes.get(index + 1..index + 4).filter(|digits| {
-                bytes[index] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+        while index < field.len() {
+            let octal = field.get(index + 1..index + 4).filter(|digits| {
+                field[index] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
             });
             match octal {
                 Some(digits) => {
@@ -217,7 +548,7 @@ mod mounts {
                     index += 4;
                 }
                 None => {
-                    out.push(bytes[index]);
+                    out.push(field[index]);
                     index += 1;
                 }
             }
@@ -228,9 +559,11 @@ mod mounts {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::EngError;
+        use crate::storage_guard::refuse;
 
-        /// The shape of a host with an automounted share: an automount placeholder and the real nfs4
-        /// mount stacked at one mount point, listed in that order.
+        /// The shape of a host with an automounted share: an automount
+        /// placeholder and the real nfs4 mount stacked at one mount point.
         const STACKED: &str = "\
     24 1 0:21 / / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,ssd\n\
     68 24 0:48 / /srv/shared rw,relatime shared:230 - autofs systemd-1 rw,fd=71,direct\n\
@@ -238,39 +571,73 @@ mod mounts {
     80 24 8:1 / /data rw,relatime shared:5 - ext4 /dev/nvme1n1 rw\n\
     ";
 
-        fn owner<'a>(mounts: &'a [Mount], path: &str) -> &'a Mount {
+        fn parse(text: &str) -> Vec<Entry> {
+            parse_mountinfo(text.as_bytes())
+        }
+
+        fn owner<'a>(mounts: &'a [Entry], path: &str) -> &'a Mount {
             owning_mount(mounts, Path::new(path)).expect("some mount owns the path")
         }
 
-        fn refusal(mounts: &[Mount], path: &str, what: &str) -> Result<(), EngError> {
-            refuse_network(mounts, Path::new(path), Path::new(path), what)
+        fn refusal(mounts: &[Entry], path: &str, what: &str) -> Result<(), EngError> {
+            let path = Path::new(path);
+            match owning_mount(mounts, path) {
+                Some(mount) => refuse(mount, path, path, what),
+                None => Ok(()),
+            }
         }
 
         // Fails if the parser reads the mount point from the wrong column.
         #[test]
-        fn the_parser_reads_point_type_and_source() {
-            let mounts = parse_mountinfo(STACKED);
+        fn the_parser_reads_ids_point_type_and_source() {
+            let mounts = parse(STACKED);
             assert_eq!(mounts.len(), 4);
-            assert_eq!(mounts[2].point, Path::new("/srv/shared"));
-            assert_eq!(mounts[2].fstype, "nfs4");
-            assert_eq!(mounts[2].source, "nas:/shared");
+            assert_eq!((mounts[2].id, mounts[2].parent), (77, 68));
+            assert_eq!(mounts[2].mount.point, Path::new("/srv/shared"));
+            assert_eq!(mounts[2].mount.fstype, "nfs4");
+            assert_eq!(mounts[2].mount.source, "nas:/shared");
         }
 
-        // Fails if a tie keeps the earlier line (the autofs placeholder) instead
-        // of the later nfs4 mount, or if the longest prefix is not chosen.
+        // Fails if the longest prefix is not chosen, or the stacked placeholder
+        // wins over the mount above it.
         #[test]
-        fn stacked_mounts_resolve_to_the_later_line_and_the_longest_prefix() {
-            let mounts = parse_mountinfo(STACKED);
+        fn stacked_mounts_resolve_to_the_topmost_and_the_longest_prefix() {
+            let mounts = parse(STACKED);
             assert_eq!(owner(&mounts, "/srv/shared/models/a").fstype, "nfs4");
             assert_eq!(owner(&mounts, "/srv/other-local").fstype, "btrfs");
             assert_eq!(owner(&mounts, "/data/x").fstype, "ext4");
+        }
+
+        // Fails if stacking follows line order instead of the parent ids: here
+        // the placeholder is listed last but the nfs4 mount sits above it.
+        #[test]
+        fn the_topmost_mount_is_found_by_parent_id_not_line_order() {
+            let reversed = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    77 68 0:91 / /srv/shared rw - nfs4 nas:/shared rw\n\
+    68 1 0:48 / /srv/shared rw - autofs systemd-1 rw\n\
+    ";
+            let mounts = parse(reversed);
+            assert_eq!(owner(&mounts, "/srv/shared/models").fstype, "nfs4");
+        }
+
+        // Fails if an autofs placeholder with nothing mounted over it passes.
+        #[test]
+        fn an_autofs_owner_alone_is_refused() {
+            let text = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    68 1 0:48 / /srv/shared rw - autofs systemd-1 rw\n\
+    ";
+            let mounts = parse(text);
+            let error = refusal(&mounts, "/srv/shared/models", "model weights").unwrap_err();
+            assert!(error.describe().contains("autofs"), "{}", error.describe());
         }
 
         // Fails if prefix matching is textual: /srv/shared2 is not below
         // /srv/shared.
         #[test]
         fn a_sibling_with_a_shared_name_prefix_is_not_below_the_mount() {
-            let mounts = parse_mountinfo(STACKED);
+            let mounts = parse(STACKED);
             assert_eq!(owner(&mounts, "/srv/shared2/models").fstype, "btrfs");
         }
 
@@ -281,24 +648,38 @@ mod mounts {
     30 24 0:40 / /mnt/my\\040models rw shared:1 master:2 - nfs 10.0.0.1:/m rw\n\
     31 24 0:41 / /mnt/plain rw - ext4 /dev/sdb rw\n\
     ";
-            let mounts = parse_mountinfo(text);
-            assert_eq!(mounts[0].point, Path::new("/mnt/my models"));
-            assert_eq!(mounts[0].fstype, "nfs");
-            assert_eq!(mounts[1].point, Path::new("/mnt/plain"));
+            let mounts = parse(text);
+            assert_eq!(mounts[0].mount.point, Path::new("/mnt/my models"));
+            assert_eq!(mounts[0].mount.fstype, "nfs");
+            assert_eq!(mounts[1].mount.point, Path::new("/mnt/plain"));
             assert!(refusal(&mounts, "/mnt/my models/q.gguf", "model weights").is_err());
             assert!(refusal(&mounts, "/mnt/plain/q.gguf", "model weights").is_ok());
         }
 
+        // Fails if the table is decoded as UTF-8 text: a lossy decode turns the
+        // 0xff byte into U+FFFD and the mount no longer matches its own path.
+        #[test]
+        fn a_mount_point_with_a_non_utf8_byte_still_matches() {
+            use std::os::unix::ffi::OsStrExt;
+            let mut table = b"1 0 0:1 / / rw - ext4 /dev/sda1 rw\n".to_vec();
+            table.extend_from_slice(b"2 1 0:2 / /mnt/\xff rw - nfs4 nas:/m rw\n");
+            let mounts = parse_mountinfo(&table);
+            let path = Path::new(std::ffi::OsStr::from_bytes(b"/mnt/\xff/models"));
+            let mount = owning_mount(&mounts, path).expect("the nfs mount owns the path");
+            assert_eq!(mount.fstype, "nfs4");
+            assert!(refuse(mount, path, path, "model weights").is_err());
+        }
+
         #[test]
         fn octal_escapes_decode_and_a_bare_backslash_stays() {
-            assert_eq!(unescape_bytes("a\\040b\\134c"), b"a b\\c");
-            assert_eq!(unescape_bytes("a\\04"), b"a\\04");
-            assert_eq!(unescape_bytes("a\\9zz"), b"a\\9zz");
+            assert_eq!(unescape(b"a\\040b\\134c"), b"a b\\c");
+            assert_eq!(unescape(b"a\\04"), b"a\\04");
+            assert_eq!(unescape(b"a\\9zz"), b"a\\9zz");
         }
 
         #[test]
         fn malformed_lines_are_skipped() {
-            assert!(parse_mountinfo("garbage\n\n1 2 3\n").is_empty());
+            assert!(parse("garbage\n\n1 2 3\n").is_empty());
         }
 
         // Fails if a bind mount of a network directory is judged by its parent
@@ -310,61 +691,10 @@ mod mounts {
     40 24 0:50 /export /srv/models rw - nfs4 nas:/export rw\n\
     41 40 8:2 /fast /srv/models/fast rw - ext4 /dev/nvme0n1 rw\n\
     ";
-            let mounts = parse_mountinfo(text);
+            let mounts = parse(text);
             assert!(refusal(&mounts, "/srv/models/q/w.gguf", "model weights").is_err());
             assert!(refusal(&mounts, "/srv/models/fast/w.gguf", "model weights").is_ok());
             assert!(refusal(&mounts, "/srv/other", "model weights").is_ok());
-        }
-
-        // Fails if the message drops the path, the filesystem type or `what`.
-        #[test]
-        fn the_refusal_names_the_path_the_type_and_the_stored_thing() {
-            let mounts = parse_mountinfo(STACKED);
-            let error = refusal(&mounts, "/srv/shared/cache", "prefix cache").unwrap_err();
-            let EngError::Checkpoint(text) = error else {
-                panic!("a refusal is a checkpoint error");
-            };
-            assert!(text.contains("/srv/shared/cache"), "{text}");
-            assert!(text.contains("nfs4"), "{text}");
-            assert!(text.contains("prefix cache"), "{text}");
-            assert!(text.contains("nas:/shared"), "{text}");
-        }
-
-        // Fails if any listed type is dropped, or a local type is added.
-        #[test]
-        fn every_listed_network_type_is_refused_and_local_types_pass() {
-            for fstype in NETWORK_FILESYSTEMS {
-                let mount = Mount {
-                    point: "/m".into(),
-                    fstype: (*fstype).into(),
-                    source: "/dev/x".into(),
-                };
-                assert!(is_network(&mount), "{fstype}");
-            }
-            for fstype in [
-                "ext4", "btrfs", "xfs", "zfs", "tmpfs", "overlay", "apfs", "fuseblk", "f2fs",
-            ] {
-                let mount = Mount {
-                    point: "/m".into(),
-                    fstype: fstype.into(),
-                    source: "/dev/x".into(),
-                };
-                assert!(!is_network(&mount), "{fstype}");
-            }
-        }
-
-        // Fails if the host:path rule is removed, or applies to local FUSE.
-        #[test]
-        fn a_fuse_mount_with_a_host_source_is_network_and_a_device_source_is_not() {
-            let fuse = |fstype: &str, source: &str| Mount {
-                point: "/m".into(),
-                fstype: fstype.into(),
-                source: source.into(),
-            };
-            assert!(is_network(&fuse("fuse.unknownfs", "user@box:/data")));
-            assert!(!is_network(&fuse("fuse.unknownfs", "/dev/sdb1")));
-            assert!(!is_network(&fuse("fuse.gvfsd-fuse", "gvfsd-fuse")));
-            assert!(!is_network(&fuse("ext4", "a:b")));
         }
     }
 }
@@ -373,57 +703,80 @@ mod mounts {
 mod live_tests {
     use super::*;
 
-    // Fails if a `..` after a missing directory is kept instead of cancelling
-    // it, which would let `<nfs>/missing/../..` be judged as a deeper path.
-    #[test]
-    fn dot_dot_cancels_a_missing_directory_and_symlinks_resolve() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
-        let resolved = linux::resolve(&dir.path().join("a").join("..").join("b")).unwrap();
-        assert_eq!(resolved, base.join("b"));
-        std::fs::create_dir(base.join("real")).unwrap();
-        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
-        let through = linux::resolve(&base.join("link").join("new")).unwrap();
-        assert_eq!(through, base.join("real").join("new"));
-    }
-
     // Fails if the real check stops resolving the path or rejects local disks.
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_root_and_a_missing_child_of_a_local_directory_pass() {
         assert!(require_local(Path::new("/"), "model weights").is_ok());
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("cache").join("..").join("new").join("x");
         assert!(require_local(&missing, "prefix cache").is_ok());
-        assert!(require_local(Path::new("relative/missing"), "prefix cache").is_ok());
+        // A relative path is judged where it lands, whatever the working
+        // directory (a checkout on a network share must not fail this test).
+        let relative = Path::new("relative/missing");
+        let absolute = std::env::current_dir().unwrap().join(relative);
+        assert_eq!(
+            require_local(relative, "prefix cache").is_ok(),
+            require_local(&absolute, "prefix cache").is_ok()
+        );
     }
 
-    #[cfg(target_os = "linux")]
+    // Fails if a dangling symlink passes, or its refusal does not name it.
     #[test]
-    fn a_dangling_symlink_is_refused_because_its_target_is_unknown() {
+    fn a_dangling_symlink_is_refused_and_named() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("cache");
         std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
-        assert!(require_local(&link.join("x"), "prefix cache").is_err());
+        let error = require_local(&link.join("x"), "prefix cache").unwrap_err();
+        let text = error.describe();
+        assert!(text.contains(&link.display().to_string()), "{text}");
+        assert!(text.contains("dangling symlink"), "{text}");
     }
 
-    // Fails if require_local does not consult the live mount table. Runs only
-    // where some nfs4 mount exists, found by reading /proc/self/mounts
-    // independently of the parser under test.
+    // Fails if a `..` after a missing directory is kept instead of cancelling
+    // it, which would let `<nfs>/missing/../..` be judged as a deeper path.
     #[test]
-    fn a_path_under_a_live_nfs4_mount_is_refused() {
-        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-        let nfs4_point = mounts.lines().find_map(|line| {
-            let mut fields = line.split(' ');
-            let point = fields.nth(1)?;
-            (fields.next() == Some("nfs4")).then_some(point.replace("\\040", " "))
+    fn dot_dot_cancels_a_missing_directory_and_symlinks_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let resolved = resolve::resolve(&dir.path().join("a").join("..").join("b")).unwrap();
+        assert_eq!(resolved, base.join("b"));
+        std::fs::create_dir(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let through = resolve::resolve(&base.join("link").join("new")).unwrap();
+        assert_eq!(through, base.join("real").join("new"));
+    }
+
+    // Fails if a symlink into a network mount is judged by where it lives
+    // instead of where it points (the shard layout of a downloaded snapshot).
+    #[test]
+    fn a_local_symlink_into_a_network_mount_is_refused() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        std::fs::write(share.path().join("shard.safetensors"), b"x").unwrap();
+        let link = local.path().join("shard.safetensors");
+        std::os::unix::fs::symlink(share.path().join("shard.safetensors"), &link).unwrap();
+        seam::with_nfs_at(share.path(), || {
+            let error = require_local(&link, "model weights").unwrap_err();
+            let text = error.describe();
+            assert!(text.contains("nfs4"), "{text}");
+            assert!(text.contains("(given as"), "{text}");
+            assert!(require_local(local.path(), "model weights").is_ok());
         });
-        let Some(point) = nfs4_point else {
-            eprintln!("skipped: no nfs4 mount on this host");
+    }
+
+    // Fails if require_local does not consult the live mount table. Skipped
+    // with a note on a host with no network mount.
+    #[test]
+    fn a_path_under_a_live_network_mount_is_refused() {
+        let Some(path) = seam::live_network_path() else {
+            eprintln!("skipped: no network mount on this host");
             return;
         };
-        let path = Path::new(&point).join("models/not-created-yet");
         let error = require_local(&path, "model weights").unwrap_err();
-        assert!(error.describe().contains("nfs4"), "{}", error.describe());
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
     }
 }

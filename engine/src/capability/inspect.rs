@@ -204,6 +204,41 @@ mod tests {
         tempfile::tempdir().unwrap().keep()
     }
 
+    // The real entry point on a real network mount: without the guard the
+    // error would be "not a directory". Skipped with a note on a host with no
+    // network mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspect_refuses_a_live_network_path() {
+        let Some(path) = crate::storage_guard::seam::live_network_path() else {
+            eprintln!("skipped: no network mount on this host");
+            return;
+        };
+        let error = inspect(&path, &path).expect_err("refused");
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
+    }
+
+    // Fails if `inspect` stops guarding the model directory: an empty
+    // directory would otherwise inspect without error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_model_directory_on_a_network_mount_is_refused() {
+        let dir = scratch("network");
+        let error = crate::storage_guard::seam::with_nfs_at(&dir, || {
+            inspect(&dir, &dir).expect_err("refused")
+        });
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
+        assert!(inspect(&dir, &dir).is_ok());
+    }
+
     #[test]
     fn a_missing_directory_is_an_error_not_a_report() {
         let dir = PathBuf::from("/nonexistent/fifi-model-dir");

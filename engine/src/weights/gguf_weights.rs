@@ -242,6 +242,41 @@ mod tests {
     };
     const ALIGN: usize = 32;
 
+    // The real entry point on a real network mount: without the guard the
+    // error would be the missing file. Skipped with a note on a host with no
+    // network mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gguf_open_refuses_a_live_network_path() {
+        let Some(path) = crate::storage_guard::seam::live_network_path() else {
+            eprintln!("skipped: no network mount on this host");
+            return;
+        };
+        let error = GgufWeights::open(&path, LIMITS, None).expect_err("refused");
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
+    }
+
+    // Fails if `GgufWeights::open` stops guarding the file: without the guard
+    // the error would be the missing file, not the storage refusal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gguf_file_on_a_network_mount_is_refused_before_it_is_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        let error = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
+            GgufWeights::open(&path, LIMITS, None).expect_err("refused")
+        });
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
+    }
+
     fn string(text: &str) -> Vec<u8> {
         let mut out = (text.len() as u64).to_le_bytes().to_vec();
         out.extend_from_slice(text.as_bytes());

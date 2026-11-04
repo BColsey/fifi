@@ -568,7 +568,7 @@ mod tests {
     fn engine_config(id: &str, options: Option<FakeOptions>) -> EngineConfig {
         EngineConfig {
             id: id.to_string(),
-            model_dir: PathBuf::from("unused"),
+            model_dir: std::env::temp_dir().join("fake-model-dir"),
             tokenizer_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("src/server/testdata/tokenizer"),
             family: "fake".to_string(),
@@ -792,6 +792,44 @@ mod tests {
             ),
             Ok(_) => panic!("staged Flint must refuse before sampling-default reads"),
         }
+    }
+
+    // The real startup path on a real network mount: without the guard the
+    // fake family would start. Skipped with a note on a host with no network
+    // mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_engines_refuses_a_live_network_model_directory() {
+        let Some(path) = crate::storage_guard::seam::live_network_path() else {
+            eprintln!("skipped: no network mount on this host");
+            return;
+        };
+        let mut config = engine_config("live-nfs", None);
+        config.model_dir = path;
+        let error = start_engines(&file_with(vec![config], false))
+            .err()
+            .expect("refused");
+        assert!(error.0.contains("local storage"), "{}", error.0);
+    }
+
+    // Fails if `start_engines` stops guarding the model directory: the fake
+    // family would otherwise start.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_engine_whose_model_directory_is_on_a_network_mount_does_not_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = engine_config("nfs-engine", None);
+        config.model_dir = dir.path().to_path_buf();
+        let file = file_with(vec![config], false);
+        let error = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
+            start_engines(&file).err().expect("refused")
+        });
+        assert!(
+            error.0.starts_with("engine nfs-engine failed to start: "),
+            "{}",
+            error.0
+        );
+        assert!(error.0.contains("local storage"), "{}", error.0);
     }
 
     #[test]
