@@ -186,3 +186,69 @@ mod tests {
         assert_eq!(check_fused_flag(&clear), Ok(()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::RawDevice;
+    use super::*;
+    use crate::kernels::cuda::native::STATUS_INVALID_ARGUMENT;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn a_fused_flag_that_shares_a_byte_with_a_tensor_is_refused_before_cuda() {
+        let mut memory = vec![0u32; 4096];
+        let device = RawDevice {
+            ptr: NonNull::new(memory.as_mut_ptr().cast()).unwrap(),
+            bytes: memory.len() * 4,
+        };
+        let range = |offset, bytes| RawRange::new(&device, offset, bytes).unwrap();
+        let call = |flag_offset| RowAddRaw {
+            out: range(0, 128),
+            x: range(1024, 128),
+            y: range(2048, 128),
+            n: 32,
+            flag: Some(range(flag_offset, 4)),
+            fused: true,
+        };
+        let stream = RawStream(NonNull::dangling());
+        let base = device.ptr.as_ptr().cast::<u8>();
+        for (name, offset) in [("out start", 0), ("out end", 124), ("x", 1040), ("y", 2048)] {
+            let aliased = call(offset);
+            assert!(check_row_add(&aliased).is_ok(), "{name}: other arguments");
+            assert_eq!(
+                check_fused_flag(&aliased),
+                Err(invalid_argument()),
+                "{name}"
+            );
+            assert_eq!(
+                row_add_launch(&stream, &aliased),
+                Err(invalid_argument()),
+                "{name}"
+            );
+            // SAFETY: only addresses inside the test allocation are formed, and the C entry
+            // refuses before any CUDA call.
+            let (status, stage) = unsafe {
+                let args = RowAddArgsRepr {
+                    out: base.cast(),
+                    x: base.add(1024).cast(),
+                    y: base.add(2048).cast(),
+                    n: 32,
+                    flag: base.add(offset).cast(),
+                    flag_bytes: 4,
+                    fused_publish: 1,
+                };
+                let mut stage = STAGE_NONE;
+                let status = row_add_launch_raw(&args, stream.0.as_ptr(), &mut stage);
+                (status, stage)
+            };
+            assert_eq!(
+                (status, stage),
+                (STATUS_INVALID_ARGUMENT, STAGE_NONE),
+                "{name}"
+            );
+        }
+        let clear = call(8192);
+        assert!(check_row_add(&clear).is_ok());
+        assert_eq!(check_fused_flag(&clear), Ok(()));
+    }
+}
