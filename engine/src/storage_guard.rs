@@ -18,10 +18,25 @@
 //! filesystem `statfs` reports for the resolved path. Other platforms are not
 //! checked and every check returns `Ok`.
 //!
+//! A mount hidden under a later mount on one of its parent directories is not
+//! visible to a path walk, so it is skipped and the visible mount judges the
+//! path. An `autofs` placeholder may be a local disk that has not mounted yet:
+//! resolving the path is what triggers the mount, so the table is read again
+//! once after resolving, and a path that still sits on a placeholder is
+//! refused.
+//!
 //! What a filesystem type cannot reveal is not caught: a union filesystem
 //! such as mergerfs over network branches, and a FUSE mount whose source is
 //! a local-looking path. The tokenizer directory and the Flash-Next manifest
 //! hold small text files and are not checked.
+//!
+//! Every loader that opens model weight files calls this module: the server
+//! start (all families), the inspection, the EXL3 and Flint checkpoint opens
+//! (directory and each shard), the GGUF open, the Nemotron shard reader and
+//! the read-only expert mapping. The Flash-Next and Qwen3.6 resident
+//! executors open their shards the same way, but they are built only for
+//! macOS with the MLX backend, so their guarded form is compiled and checked
+//! on a Mac and has no Linux test.
 
 use std::path::Path;
 
@@ -55,7 +70,19 @@ impl LocalGuard {
     pub fn check(&self, path: &Path, what: &str) -> Result<(), EngError> {
         let resolved = resolve::resolve(path).map_err(|error| unresolved(path, what, &error))?;
         match mounts::owning_mount(&self.mounts, &resolved) {
-            Some(mount) => refuse(mount, &resolved, path, what),
+            Some(mount) if mount.fstype == "autofs" => {
+                // Resolving may have just triggered the real mount that
+                // replaces the placeholder, which the table read before it
+                // cannot show. Judge against a fresh table.
+                Self::new()?.judge(&resolved, path, what)
+            }
+            _ => self.judge(&resolved, path, what),
+        }
+    }
+
+    fn judge(&self, resolved: &Path, shown: &Path, what: &str) -> Result<(), EngError> {
+        match mounts::owning_mount(&self.mounts, resolved) {
+            Some(mount) => refuse(mount, resolved, shown, what),
             None => Ok(()),
         }
     }
@@ -154,7 +181,9 @@ mod filesystem {
         "fuse.mount-s3",
         "fuse.gcsfuse",
         "fuse.glusterfs",
+        "fuse.ceph",
         "fuse.ceph-fuse",
+        "fuse.mountpoint-s3",
         "fuse.juicefs",
         "autofs",
     ];
@@ -247,7 +276,9 @@ mod filesystem {
                 "fuse.mount-s3",
                 "fuse.gcsfuse",
                 "fuse.glusterfs",
+                "fuse.ceph",
                 "fuse.ceph-fuse",
+                "fuse.mountpoint-s3",
                 "fuse.juicefs",
                 "autofs",
                 "NFS4",
@@ -379,7 +410,7 @@ mod macos {
                         source: text(&stat.f_mntfromname),
                     });
                 }
-                Err(rustix::io::Errno::NOENT) => {}
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -421,6 +452,26 @@ mod macos {
             let mount = owner(Path::new("/")).unwrap();
             assert!(!super::super::filesystem::is_refused(&mount), "{mount:?}");
             assert!(super::super::require_local(Path::new("/"), "model weights").is_ok());
+        }
+
+        // Fails if a real macOS autofs placeholder passes. macOS mounts one
+        // at this path (`map auto_home`); skipped with a note on a Mac
+        // without it. This Mac has no NFS or SMB volume to test with.
+        #[test]
+        fn an_autofs_placeholder_is_refused() {
+            let point = Path::new("/System/Volumes/Data/home");
+            let Ok(mount) = owner(point) else {
+                eprintln!("skipped: {} cannot be stat'ed", point.display());
+                return;
+            };
+            eprintln!("statfs reports {mount:?}");
+            if mount.fstype != "autofs" {
+                eprintln!("skipped: {} is not an autofs mount here", point.display());
+                return;
+            }
+            let child = point.join("storage-guard-test-absent");
+            let error = super::super::require_local(&child, "model weights").unwrap_err();
+            assert!(error.describe().contains("autofs"), "{}", error.describe());
         }
 
         // Fails if the check skips symlink resolution or missing children.
@@ -473,6 +524,7 @@ mod mounts {
             entries
                 .iter()
                 .filter(|entry| path.starts_with(&entry.mount.point))
+                .filter(|entry| !is_hidden(entries, entry))
         };
         let depth = prefixes()
             .map(|entry| entry.mount.point.components().count())
@@ -491,6 +543,17 @@ mod mounts {
             .find(|entry| !is_covered(entry))
             .or(stacked.last())
             .map(|entry| &entry.mount)
+    }
+
+    /// Whether a later mount (a higher id; the kernel numbers mounts in
+    /// creation order) on a parent directory of `entry` covers it. A path walk
+    /// then reaches the covering mount and never the covered one.
+    fn is_hidden(entries: &[Entry], entry: &Entry) -> bool {
+        entries.iter().any(|later| {
+            later.id > entry.id
+                && later.mount.point != entry.mount.point
+                && entry.mount.point.starts_with(&later.mount.point)
+        })
     }
 
     /// Parses `mountinfo` as bytes, because a mount point may hold any byte
@@ -633,6 +696,28 @@ mod mounts {
             assert!(error.describe().contains("autofs"), "{}", error.describe());
         }
 
+        // Fails if a mount hidden under a later mount on its parent directory
+        // still owns paths, which would pass an nfs4 mount laid over a local
+        // disk's mount point.
+        #[test]
+        fn a_mount_hidden_under_a_later_overmount_does_not_own_the_path() {
+            let hidden = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    10 1 8:2 / /srv/data/cache rw - ext4 /dev/sdb1 rw\n\
+    20 1 0:9 / /srv/data rw - nfs4 nas:/data rw\n\
+    ";
+            let mounts = parse(hidden);
+            assert_eq!(owner(&mounts, "/srv/data/cache/w.gguf").fstype, "nfs4");
+            // The reverse order is an ordinary nested mount: the child owns.
+            let nested = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    10 1 0:9 / /srv/data rw - nfs4 nas:/data rw\n\
+    20 10 8:2 / /srv/data/cache rw - ext4 /dev/sdb1 rw\n\
+    ";
+            let mounts = parse(nested);
+            assert_eq!(owner(&mounts, "/srv/data/cache/w.gguf").fstype, "ext4");
+        }
+
         // Fails if prefix matching is textual: /srv/shared2 is not below
         // /srv/shared.
         #[test]
@@ -761,6 +846,62 @@ mod live_tests {
             assert!(text.contains("nfs4"), "{text}");
             assert!(text.contains("(given as"), "{text}");
             assert!(require_local(local.path(), "model weights").is_ok());
+        });
+    }
+
+    /// A fixture table with `dir` as an autofs placeholder, plus `above` (a
+    /// mount line stacked on the placeholder) when given.
+    fn automount_table(dir: &Path, above: &str) -> String {
+        let point = std::fs::canonicalize(dir).unwrap().display().to_string();
+        let mut table = format!(
+            "1 0 0:1 / / rw - ext4 /dev/fixture rw\n2 1 0:2 / {point} rw - autofs systemd-1 rw\n"
+        );
+        if !above.is_empty() {
+            table.push_str(&format!("3 2 0:3 / {point} rw - {above}\n"));
+        }
+        table
+    }
+
+    // Fails if the table is read only before the path is resolved: resolving
+    // is what mounts an idle `x-systemd.automount` disk, so the first table
+    // still shows the placeholder.
+    #[test]
+    fn an_idle_automount_of_a_local_disk_is_judged_after_it_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = automount_table(dir.path(), "");
+        let mounted = automount_table(dir.path(), "ext4 /dev/fixture2 rw");
+        let path = dir.path().join("models");
+        seam::with_tables(&[idle.as_bytes(), mounted.as_bytes()], || {
+            assert!(require_local(&path, "model weights").is_ok());
+        });
+    }
+
+    // Fails if a real network automount stops being refused, or the refusal
+    // reports the placeholder instead of the filesystem behind it.
+    #[test]
+    fn a_network_automount_is_refused_with_its_real_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = automount_table(dir.path(), "");
+        let mounted = automount_table(dir.path(), "nfs4 nas:/fixture rw");
+        let path = dir.path().join("models");
+        seam::with_tables(&[idle.as_bytes(), mounted.as_bytes()], || {
+            let text = require_local(&path, "model weights")
+                .unwrap_err()
+                .describe();
+            assert!(text.contains("nfs4"), "{text}");
+        });
+    }
+
+    // Fails if a placeholder that never mounts anything passes.
+    #[test]
+    fn an_automount_that_never_mounts_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = automount_table(dir.path(), "");
+        seam::with_table(idle.as_bytes(), || {
+            let text = require_local(dir.path(), "model weights")
+                .unwrap_err()
+                .describe();
+            assert!(text.contains("autofs"), "{text}");
         });
     }
 

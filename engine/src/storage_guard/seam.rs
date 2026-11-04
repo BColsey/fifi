@@ -5,25 +5,40 @@
 use std::{cell::RefCell, path::Path};
 
 thread_local! {
-    static TABLE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static TABLES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The next fixture table, if one is installed: each read takes the next
+/// table of the sequence, and the last one repeats.
 pub(super) fn installed() -> Option<Vec<u8>> {
-    TABLE.with(|table| table.borrow().clone())
+    TABLES.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        match tables.len() {
+            0 => None,
+            1 => Some(tables[0].clone()),
+            _ => Some(tables.remove(0)),
+        }
+    })
 }
 
 struct Reset;
 
 impl Drop for Reset {
     fn drop(&mut self) {
-        TABLE.with(|table| *table.borrow_mut() = None);
+        TABLES.with(|tables| tables.borrow_mut().clear());
     }
 }
 
 /// Runs `run` with `table` as the mount table of this thread, restoring the
 /// real one afterwards even when `run` panics.
 pub(crate) fn with_table<R>(table: &[u8], run: impl FnOnce() -> R) -> R {
-    TABLE.with(|slot| *slot.borrow_mut() = Some(table.to_vec()));
+    with_tables(&[table], run)
+}
+
+/// Like [`with_table`], but each successive read of the table gets the next
+/// of `tables` (the last repeats): a mount that appears while the code runs.
+pub(crate) fn with_tables<R>(tables: &[&[u8]], run: impl FnOnce() -> R) -> R {
+    TABLES.with(|slot| *slot.borrow_mut() = tables.iter().map(|table| table.to_vec()).collect());
     let _reset = Reset;
     run()
 }

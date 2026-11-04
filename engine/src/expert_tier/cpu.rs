@@ -137,6 +137,7 @@ impl<K: CpuExpertKernel> CpuTier<K> {
 /// `MappedFile` does the mapping: no mlock, no madvise, and a refusal when the length is not the
 /// one the caller expects.
 pub fn map_read_only(path: &Path, expected_len: u64) -> Result<&'static [u8], EngError> {
+    crate::storage_guard::require_local(path, "model weights")?;
     let file = MappedFile::open(path, expected_len)
         .map_err(|error| EngError::Checkpoint(format!("map {}: {error}", path.display())))?;
     let file: &'static MappedFile = Box::leak(Box::new(file));
@@ -225,6 +226,27 @@ mod tests {
             ),
             Err(EngError::BadRequest(_))
         ));
+    }
+
+    // Fails if `map_read_only` stops guarding the file: the shard here is a
+    // local link to a file on the fixture network mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_weight_file_linked_into_a_network_mount_is_not_mapped() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        std::fs::write(share.path().join("experts.bin"), [1u8; 4]).unwrap();
+        let link = local.path().join("experts.bin");
+        std::os::unix::fs::symlink(share.path().join("experts.bin"), &link).unwrap();
+        let error = crate::storage_guard::seam::with_nfs_at(share.path(), || {
+            map_read_only(&link, 4).expect_err("refused")
+        });
+        assert!(
+            error.describe().contains("local storage"),
+            "{}",
+            error.describe()
+        );
+        assert_eq!(map_read_only(&link, 4).expect("local again"), [1; 4]);
     }
 
     #[test]
