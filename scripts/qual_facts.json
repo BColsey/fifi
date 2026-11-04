@@ -1,5 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "cargo_features": [
+    "cuda-arms-qualification",
+    "cuda-fault-qualification",
+    "cuda-q8-reference",
+    "default",
+    "native-ane",
+    "native-cuda",
+    "native-fault-qualification",
+    "native-mlx"
+  ],
   "targets": {
     "lib": {
       "path": "src/lib.rs",
@@ -251,6 +261,15 @@
         "TOKEN_HEALTH_ENV_PROBE",
         "WIDE_EQ_ARM"
       ],
+      "features": [
+        "cuda-arms-qualification",
+        "cuda-fault-qualification",
+        "cuda-q8-reference",
+        "native-ane",
+        "native-cuda",
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {
         "FIFI_QWEN36_MODEL_DIR": {
           "or_skip": 1,
@@ -295,6 +314,7 @@
       "test_fns": 20,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "cuda_smoke": {
@@ -304,6 +324,9 @@
       "env_gates": [
         "INFERENCE_CUDA_REQUIRE_DEVICE"
       ],
+      "features": [
+        "native-cuda"
+      ],
       "fixtures": {}
     },
     "decision_ane": {
@@ -311,6 +334,9 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-ane"
+      ],
       "fixtures": {}
     },
     "decision_head": {
@@ -318,6 +344,7 @@
       "test_fns": 9,
       "ignored": 1,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "exl3_admission": {
@@ -325,6 +352,7 @@
       "test_fns": 40,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "exl3_cpu_expert": {
@@ -332,6 +360,7 @@
       "test_fns": 2,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "exl3_full_reference": {
@@ -339,6 +368,7 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "exl3_reference": {
@@ -346,6 +376,7 @@
       "test_fns": 7,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "exl3_weights": {
@@ -353,6 +384,7 @@
       "test_fns": 4,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "f8_weight": {
@@ -360,6 +392,7 @@
       "test_fns": 2,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "family_mac": {
@@ -367,6 +400,9 @@
       "test_fns": 2,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "family_recurrent": {
@@ -374,6 +410,7 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "family_route": {
@@ -381,6 +418,7 @@
       "test_fns": 13,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "family_spec": {
@@ -388,6 +426,7 @@
       "test_fns": 22,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "family_weights": {
@@ -395,6 +434,7 @@
       "test_fns": 24,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "flash_next_family": {
@@ -402,6 +442,7 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "gguf_dequant": {
@@ -409,6 +450,7 @@
       "test_fns": 10,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "gguf_header": {
@@ -416,6 +458,7 @@
       "test_fns": 33,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "gguf_nvfp4": {
@@ -423,6 +466,7 @@
       "test_fns": 8,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "indexed_weights": {
@@ -430,6 +474,7 @@
       "test_fns": 17,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "layer_parity": {
@@ -440,6 +485,9 @@
         "LAYER_PARITY_FIXTURES",
         "LAYER_PARITY_REPORT"
       ],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_elementwise": {
@@ -448,6 +496,9 @@
       "ignored": 0,
       "env_gates": [
         "ELEMENTWISE_FIXTURES"
+      ],
+      "features": [
+        "native-mlx"
       ],
       "fixtures": {}
     },
@@ -461,6 +512,7 @@
         "INFERENCE_NATIVE_NULL_STREAM_CHILD",
         "INFERENCE_NATIVE_RELEASE_CHILD"
       ],
+      "features": [],
       "fixtures": {}
     },
     "native_fast": {
@@ -468,6 +520,9 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_gated_delta": {
@@ -475,6 +530,9 @@
       "test_fns": 6,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_gather": {
@@ -482,6 +540,9 @@
       "test_fns": 8,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_import_packed": {
@@ -489,6 +550,9 @@
       "test_fns": 3,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_kv8_ops": {
@@ -496,6 +560,10 @@
       "test_fns": 14,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_kv_ops": {
@@ -503,6 +571,10 @@
       "test_fns": 16,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_matmul": {
@@ -510,6 +582,9 @@
       "test_fns": 18,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_memory": {
@@ -517,6 +592,10 @@
       "test_fns": 5,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_ops": {
@@ -524,6 +603,9 @@
       "test_fns": 7,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_pages": {
@@ -533,6 +615,10 @@
       "env_gates": [
         "INFERENCE_NATIVE_PAGES_CHILD"
       ],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_q8_decode": {
@@ -540,6 +626,10 @@
       "test_fns": 17,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_quant": {
@@ -547,6 +637,10 @@
       "test_fns": 10,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-fault-qualification",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_retire": {
@@ -556,6 +650,7 @@
       "env_gates": [
         "INFERENCE_NATIVE_RETIRE_CHILD"
       ],
+      "features": [],
       "fixtures": {}
     },
     "native_rms_norm": {
@@ -564,6 +659,9 @@
       "ignored": 0,
       "env_gates": [
         "RMS_NORM_FIXTURES"
+      ],
+      "features": [
+        "native-mlx"
       ],
       "fixtures": {}
     },
@@ -574,6 +672,9 @@
       "env_gates": [
         "ROPE_FIXTURES"
       ],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_rows": {
@@ -583,6 +684,9 @@
       "env_gates": [
         "ROWS_FIXTURES"
       ],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_select": {
@@ -590,6 +694,9 @@
       "test_fns": 14,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "native_shapes": {
@@ -597,6 +704,9 @@
       "test_fns": 16,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "nemotron35_attention": {
@@ -604,6 +714,7 @@
       "test_fns": 8,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_config": {
@@ -614,6 +725,7 @@
         "NEM35_COMPLETE_CONFIG",
         "NEM35_COMPLETE_INDEX"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_loader": {
@@ -623,6 +735,7 @@
       "env_gates": [
         "NEM35_MODEL_DIR"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_mamba": {
@@ -630,6 +743,7 @@
       "test_fns": 8,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_moe": {
@@ -637,6 +751,7 @@
       "test_fns": 10,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_runner": {
@@ -646,6 +761,7 @@
       "env_gates": [
         "NEM35_MODEL_DIR"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_stack": {
@@ -653,6 +769,7 @@
       "test_fns": 14,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "nemotron35_streaming_generation": {
@@ -661,6 +778,9 @@
       "ignored": 1,
       "env_gates": [
         "NEM35_MODEL_DIR"
+      ],
+      "features": [
+        "native-cuda"
       ],
       "fixtures": {}
     },
@@ -671,6 +791,7 @@
       "env_gates": [
         "NEM35_MODEL_DIR"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nemotron_index": {
@@ -680,6 +801,7 @@
       "env_gates": [
         "NEM35_INDEX"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nemotron_shards": {
@@ -689,6 +811,7 @@
       "env_gates": [
         "NEM35_SHARD"
       ],
+      "features": [],
       "fixtures": {}
     },
     "nvfp4": {
@@ -696,6 +819,9 @@
       "test_fns": 11,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "nvfp4_matvec": {
@@ -703,6 +829,7 @@
       "test_fns": 2,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "oq_weights": {
@@ -710,6 +837,7 @@
       "test_fns": 16,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "parity_matrix": {
@@ -721,6 +849,9 @@
         "OQ04_PARITY_FIXTURES",
         "OQ04_PARITY_REPORT"
       ],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "portable_loader": {
@@ -728,6 +859,7 @@
       "test_fns": 24,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "published_text": {
@@ -735,6 +867,7 @@
       "test_fns": 3,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "q36_real_config": {
@@ -742,6 +875,7 @@
       "test_fns": 9,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "quantization": {
@@ -749,6 +883,7 @@
       "test_fns": 16,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "reader_loader": {
@@ -756,6 +891,7 @@
       "test_fns": 14,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "real_group_parity": {
@@ -767,6 +903,9 @@
         "REAL_GROUP_FIXTURES",
         "REAL_GROUP_REPORT"
       ],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "resident_execution": {
@@ -774,6 +913,9 @@
       "test_fns": 1,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "server_cli": {
@@ -781,6 +923,7 @@
       "test_fns": 8,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "server_flash_cli": {
@@ -788,6 +931,9 @@
       "test_fns": 9,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "server_log": {
@@ -795,6 +941,7 @@
       "test_fns": 1,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "server_q36_cli": {
@@ -802,6 +949,10 @@
       "test_fns": 23,
       "ignored": 0,
       "env_gates": [],
+      "features": [
+        "native-cuda",
+        "native-mlx"
+      ],
       "fixtures": {}
     },
     "tiered_weights": {
@@ -809,6 +960,7 @@
       "test_fns": 30,
       "ignored": 0,
       "env_gates": [],
+      "features": [],
       "fixtures": {}
     },
     "tokenizer_mac": {
@@ -818,6 +970,7 @@
       "env_gates": [
         "INFERENCE_TOKENIZER_DIR"
       ],
+      "features": [],
       "fixtures": {}
     }
   }

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -168,14 +170,20 @@ fn c() {
     let g = std::env::var("FLINT_QUAL_GO");
     let h = std::env::var_os("FIFI_FLINT_GGUF");
 }
+
+#![cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(feature = "native-mlx")]
+fn gated() {}
+fn not_a_gate() { let x = format!("feature = \"fake\""); }
 """
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "x.rs"
             path.write_text(source, encoding="utf-8")
-            fns, ignored, gates, fixtures = qi.scan_file(path)
+            fns, ignored, gates, features, fixtures = qi.scan_file(path)
         self.assertEqual(fns, 3)
         self.assertEqual(ignored, 1)
         self.assertEqual(gates, {"FLINT_QUAL_GO", "FIFI_FLINT_GGUF"})
+        self.assertEqual(features, {"native-cuda", "native-mlx"})
         self.assertEqual(
             fixtures,
             {
@@ -470,6 +478,126 @@ class FactsDriftTest(unittest.TestCase):
                 with self.assertRaises(qi.InventoryError) as caught:
                     qi.cmd_validate(argparse.Namespace())
                 self.assertIn("stale", str(caught.exception))
+
+
+class DeviceSurfacePolicyTest(unittest.TestCase):
+    """Slice 2: device surfaces are declarable, but only fail-closed."""
+
+    def facts(self) -> dict:
+        return {
+            "cargo_features": ["native-cuda", "native-mlx"],
+            "targets": {
+                "lib": {"path": "src/lib.rs", "test_fns": 1, "ignored": 0,
+                        "env_gates": ["INFERENCE_CUDA_REQUIRE_DEVICE"],
+                        "features": [], "fixtures": {}},
+                "cuda_smoke": {"path": "tests/cuda_smoke.rs", "test_fns": 4,
+                               "ignored": 0, "env_gates": ["INFERENCE_CUDA_REQUIRE_DEVICE"],
+                               "features": ["native-cuda"], "fixtures": {}},
+                "native_fast": {"path": "tests/native_fast.rs", "test_fns": 6,
+                                "ignored": 0, "env_gates": [],
+                                "features": ["native-mlx"], "fixtures": {}},
+            },
+        }
+
+    def cuda_surface(self, **overrides) -> dict:
+        surface = {
+            "id": "cuda-smoke", "category": "cuda-device",
+            "hardware": "nvidia-gpu",
+            "description": "seed device surface",
+            "cwd": "engine",
+            "argv": ["cargo", "test", "--locked", "--features", "native-cuda",
+                     "--test=cuda_smoke"],
+            "features": ["native-cuda"],
+            "env": {"INFERENCE_CUDA_REQUIRE_DEVICE": "1"},
+            "expect": {},
+            "timeout_sec": 900,
+        }
+        surface.update(overrides)
+        return surface
+
+    def check(self, surface: dict) -> None:
+        qi.validate_policy({"surfaces": [surface]}, self.facts())
+
+    def test_fail_closed_cuda_surface_resolves(self) -> None:
+        self.check(self.cuda_surface())
+
+    def test_cuda_surface_without_require_device_fails(self) -> None:
+        with self.assertRaises(qi.InventoryError) as caught:
+            self.check(self.cuda_surface(env={}))
+        self.assertIn("INFERENCE_CUDA_REQUIRE_DEVICE", str(caught.exception))
+
+    def test_cuda_surface_with_zero_require_device_fails(self) -> None:
+        with self.assertRaises(qi.InventoryError):
+            self.check(self.cuda_surface(env={"INFERENCE_CUDA_REQUIRE_DEVICE": "0"}))
+
+    def test_undeclared_feature_fails(self) -> None:
+        with self.assertRaises(qi.InventoryError):
+            self.check(self.cuda_surface(features=["native-cuda", "not-a-feature"]))
+
+    def test_argv_missing_target_feature_fails(self) -> None:
+        # cuda_smoke's source gates on native-cuda; a surface that runs it without
+        # the feature compiles the target empty and would report zero tests.
+        # (two-argument --test form)
+        with self.assertRaises(qi.InventoryError) as caught:
+            self.check(self.cuda_surface(features=["native-mlx"],
+                                         argv=["cargo", "test", "--locked",
+                                               "--features", "native-mlx",
+                                               "--test", "cuda_smoke"]))
+        self.assertIn("gates on", str(caught.exception))
+
+    def test_facts_feature_unknown_to_cargo_fails(self) -> None:
+        bad = self.facts()
+        bad["targets"]["cuda_smoke"]["features"] = ["ghost-feature"]
+        with self.assertRaises(qi.InventoryError):
+            qi.validate_policy({"surfaces": [self.cuda_surface()]}, bad)
+
+
+class SurfaceSelectionTest(unittest.TestCase):
+    def policy(self) -> dict:
+        cpu = {"id": "host-portable", "category": "host", "hardware": "cpu"}
+        gpu = {"id": "cuda-smoke", "category": "cuda-device", "hardware": "nvidia-gpu"}
+        return {"surfaces": [cpu, gpu]}
+
+    def test_default_selection_is_cpu_only(self) -> None:
+        # A leaseless `collect` must never launch GPU work by accident.
+        selected, skipped = qi.select_surfaces(self.policy(), None)
+        self.assertEqual(selected, ["host-portable"])
+        self.assertEqual(skipped, ["cuda-smoke"])
+
+    def test_explicit_selection_reaches_device_surfaces(self) -> None:
+        selected, skipped = qi.select_surfaces(self.policy(), ["cuda-smoke"])
+        self.assertEqual(selected, ["cuda-smoke"])
+        self.assertEqual(skipped, ["host-portable"])
+
+
+class ProcessGroupTimeoutTest(unittest.TestCase):
+    def test_timeout_kills_the_whole_process_group(self) -> None:
+        # The reviewer's rule: a timed-out run must not orphan the test binaries
+        # (or GPU work) that cargo spawned. The child spawns a grandchild sleeper
+        # in the same process group; the kill must take both.
+        child = (
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "print(p.pid, flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        surface = {
+            "id": "grp", "category": "host", "hardware": "cpu",
+            "cwd": "scripts", "argv": [sys.executable, "-c", child],
+            "env": {}, "timeout_sec": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            record = qi.collect_surface(surface, Path(tmp))
+            grandchild = int((Path(tmp) / "grp.stdout").read_text().strip())
+        self.assertEqual(record["verdict"], "FAIL")
+        self.assertTrue(any("timed out" in r for r in record["reasons"]))
+        for _ in range(50):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return  # the grandchild died with the group
+            time.sleep(0.1)
+        self.fail(f"grandchild {grandchild} survived the timeout kill")
 
 
 if __name__ == "__main__":

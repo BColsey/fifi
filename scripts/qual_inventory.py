@@ -40,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 
@@ -68,6 +69,14 @@ IGNORE_ATTR_RE = re.compile(r"#\[ignore")
 UPPER = "A" + "-Z"
 ENV_GATE_RE = re.compile(rf"\benv::var(?:_os)?\(\"([{UPPER}][{UPPER}0-9_]+)\"\)")
 FIXTURE_CALL_RE = re.compile(rf"\b(or_skip|required)\(\"([{UPPER}][{UPPER}0-9_]+)\"\)")
+# Compile-time backend gates, e.g. `#![cfg(all(feature = "native-cuda", target_os = "linux"))]`
+# or item-level `#[cfg(feature = "native-mlx")]`. Only attribute lines count: a bare
+# `feature = "x"` inside code is not a gate.
+FEATURE_GATE_RE = re.compile(rf"^\s*#!?\[.*cfg\(.*feature\s*=\s*\"([a-z0-9-]+)\"")
+
+# The one env gate that turns a missing CUDA device into a failure instead of a
+# silent skip; without it a device run is not device evidence (see cuda_smoke.rs).
+DEVICE_FAIL_CLOSED_GATE = "INFERENCE_CUDA_REQUIRE_DEVICE"
 
 # libtest output shapes, aligned with fifi_gate.py.
 RUNNING_RE = re.compile(r"^running (\d+) tests?$")
@@ -100,6 +109,19 @@ class InventoryError(Exception):
     """A required check could not validate its inputs."""
 
 
+class _TimedOut(Exception):
+    """A surface exceeded its timeout; the whole process group was killed."""
+
+    def __init__(self, stdout: str | bytes, stderr: str | bytes) -> None:
+        super().__init__("surface timed out")
+
+        def as_text(value: str | bytes) -> str:
+            return value.decode(errors="replace") if isinstance(value, bytes) else value
+
+        self.stdout = as_text(stdout or "")
+        self.stderr = as_text(stderr or "")
+
+
 @dataclass
 class TestTargetFacts:
     """Mechanical facts about one cargo test target, derived from source."""
@@ -108,30 +130,52 @@ class TestTargetFacts:
     test_fns: int = 0
     ignored: int = 0
     env_gates: list[str] = field(default_factory=list)
+    features: set[str] = field(default_factory=set)
     fixtures: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
-def scan_file(path: Path) -> tuple[int, int, set[str], dict[str, dict[str, int]]]:
+def scan_file(
+    path: Path,
+) -> tuple[int, int, set[str], set[str], dict[str, dict[str, int]]]:
     text = path.read_text(encoding="utf-8")
     test_fns = len(TEST_ATTR_RE.findall(text))
     ignored = len(IGNORE_ATTR_RE.findall(text))
     gates = set(ENV_GATE_RE.findall(text))
+    features = set()
+    for line in text.splitlines():
+        features.update(FEATURE_GATE_RE.findall(line))
     fixtures: dict[str, dict[str, int]] = {}
     for kind, name in FIXTURE_CALL_RE.findall(text):
         entry = fixtures.setdefault(name, {"or_skip": 0, "required": 0})
         entry[kind] += 1
-    return test_fns, ignored, gates, fixtures
+    return test_fns, ignored, gates, features, fixtures
 
 
 def merge_into(facts: TestTargetFacts, path: Path) -> None:
-    test_fns, ignored, gates, fixtures = scan_file(path)
+    test_fns, ignored, gates, features, fixtures = scan_file(path)
     facts.test_fns += test_fns
     facts.ignored += ignored
     facts.env_gates.extend(sorted(gates))
+    facts.features |= features
     for name, calls in fixtures.items():
         entry = facts.fixtures.setdefault(name, {"or_skip": 0, "required": 0})
         for kind, count in calls.items():
             entry[kind] += count
+
+
+def cargo_features() -> list[str]:
+    """Feature names declared in engine/Cargo.toml's [features] section."""
+    names: list[str] = []
+    in_features = False
+    for line in (ENGINE_ROOT / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("["):
+            in_features = line.strip() == "[features]"
+            continue
+        if in_features:
+            match = re.match(r"\s*([a-z0-9-]+)\s*=", line)
+            if match:
+                names.append(match.group(1))
+    return sorted(names)
 
 
 def build_facts() -> dict:
@@ -148,13 +192,15 @@ def build_facts() -> dict:
         targets[path.stem] = target
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "cargo_features": cargo_features(),
         "targets": {
             name: {
                 "path": facts.path,
                 "test_fns": facts.test_fns,
                 "ignored": facts.ignored,
                 "env_gates": sorted(set(facts.env_gates)),
+                "features": sorted(facts.features),
                 "fixtures": {
                     name_: {"or_skip": calls["or_skip"], "required": calls["required"]}
                     for name_, calls in sorted(facts.fixtures.items())
@@ -188,7 +234,20 @@ def load_json_strict(path: Path) -> dict:
 
 SURFACE_KEYS = {"id", "category", "hardware", "description", "cwd", "argv", "env",
                 "expect", "fixtures_required", "targets_included", "baseline_note",
-                "timeout_sec"}
+                "timeout_sec", "features"}
+
+
+def select_surfaces(policy: dict, requested: list[str] | None) -> tuple[list[str], list[str]]:
+    """Resolve the surface selection: explicit ids, or every cpu surface by default.
+
+    Device surfaces are never run by accident: hardware != cpu requires naming the
+    surface explicitly, so a leaseless `collect` cannot launch GPU work.
+    """
+    ids = [s["id"] for s in policy["surfaces"]]
+    if requested:
+        return requested, [sid for sid in ids if sid not in requested]
+    cpu = [s["id"] for s in policy["surfaces"] if s.get("hardware") == "cpu"]
+    return cpu, [sid for sid in ids if sid not in cpu]
 
 
 def validate_policy(policy: dict, facts: dict) -> list[str]:
@@ -196,6 +255,14 @@ def validate_policy(policy: dict, facts: dict) -> list[str]:
     problems: list[str] = []
     known_env_gates = {gate for t in facts["targets"].values() for gate in t["env_gates"]}
     known_fixtures = {name for t in facts["targets"].values() for name in t["fixtures"]}
+    declared_features = set(facts.get("cargo_features", []))
+    for t in facts["targets"].values():
+        for feature in t.get("features", []):
+            if feature not in declared_features:
+                problems.append(
+                    f"facts: target {t['path']} gates on feature {feature!r}, "
+                    "unknown to engine/Cargo.toml"
+                )
 
     surfaces = policy.get("surfaces")
     if not isinstance(surfaces, list) or not surfaces:
@@ -256,6 +323,47 @@ def validate_policy(policy: dict, facts: dict) -> list[str]:
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
         ):
             problems.append(f"{where}: env must map strings to strings")
+        features = surface.get("features", [])
+        if not isinstance(features, list) or not all(isinstance(v, str) for v in features):
+            problems.append(f"{where}: features must be a list of strings")
+        else:
+            unknown_features = sorted(set(features) - declared_features)
+            if unknown_features:
+                problems.append(
+                    f"{where}: features {unknown_features} are not declared "
+                    "in engine/Cargo.toml"
+                )
+            # A device surface without the fail-closed gate can skip every test and
+            # still look green; that is not device evidence.
+            if surface.get("category") == "cuda-device":
+                value = env.get(DEVICE_FAIL_CLOSED_GATE, "")
+                if not value or value == "0":
+                    problems.append(
+                        f"{where}: cuda-device surfaces must set "
+                        f"{DEVICE_FAIL_CLOSED_GATE} truthy in env"
+                    )
+            # Every --test target whose source gates on backend features must have
+            # those features activated by this surface, or cargo compiles it empty.
+            feature_set = set(features)
+            argv_strings = argv if isinstance(argv, list) else []
+            test_targets: list[str] = []
+            for index, arg in enumerate(argv_strings):
+                if not isinstance(arg, str):
+                    continue
+                if arg.startswith("--test="):
+                    test_targets.append(arg[len("--test="):])
+                elif arg == "--test" and index + 1 < len(argv_strings):
+                    test_targets.append(argv_strings[index + 1])
+            for target in test_targets:
+                if not isinstance(target, str):
+                    continue
+                required = set(facts["targets"].get(target, {}).get("features", []))
+                missing = sorted(required - feature_set)
+                if missing:
+                    problems.append(
+                        f"{where}: argv runs --test {target} which gates on "
+                        f"features {missing} the surface does not declare"
+                    )
         for name in surface.get("fixtures_required", []):
             if name not in known_fixtures:
                 problems.append(f"{where}: fixtures_required names {name!r}, unknown to the facts")
@@ -552,44 +660,45 @@ def collect_surface(surface: dict, out_dir: Path) -> dict:
     started = datetime.datetime.now(datetime.timezone.utc)
     timeout_sec = surface.get("timeout_sec")
     try:
-        proc = subprocess.run(
-            argv, cwd=cwd, env=env, capture_output=True, text=True, check=False,
-            timeout=timeout_sec,
+        # New session = own process group: a timeout must kill cargo AND the test
+        # binaries (and any GPU work) it spawned, not leave them orphaned.
+        proc = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
-        stdout, stderr, returncode = proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired as expired:
-        # The child is dead; an interrupted run must judge as a failure, with
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired as expired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            killed_out, killed_err = proc.communicate()
+            raise _TimedOut(
+                killed_out or expired.stdout or "", killed_err or expired.stderr or ""
+            ) from expired
+    except _TimedOut as timed_out:
+        # The whole group is dead; an interrupted run must judge as a failure, with
         # whatever output existed written out for inspection.
-        stdout = expired.stdout or ""
-        stderr = expired.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        returncode = -9
-        verdict, reasons, summary, skips = "FAIL", [f"timed out after {timeout_sec}s"], None, {}
         stem = re.sub(rf"[^{UPPER}a-z0-9_.-]", "_", surface["id"])
-        (out_dir / f"{stem}.stdout").write_text(stdout, encoding="utf-8")
-        (out_dir / f"{stem}.stderr").write_text(stderr, encoding="utf-8")
-        record = {
+        (out_dir / f"{stem}.stdout").write_text(timed_out.stdout, encoding="utf-8")
+        (out_dir / f"{stem}.stderr").write_text(timed_out.stderr, encoding="utf-8")
+        return {
             "id": surface["id"], "category": surface["category"],
             "hardware": surface["hardware"], "argv": argv, "cwd": surface["cwd"],
-            "env": surface.get("env", {}), "exit_code": returncode,
+            "env": surface.get("env", {}), "exit_code": -9,
             "started": started.isoformat(),
             "ended": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "summary": None, "fixtures_skipped": {},
-            "expect": surface.get("expect", {}), "verdict": verdict,
-            "reasons": reasons,
+            "expect": surface.get("expect", {}), "verdict": "FAIL",
+            "reasons": [f"timed out after {timeout_sec}s"],
         }
-        return record
     ended = datetime.datetime.now(datetime.timezone.utc)
     stem = re.sub(rf"[^{UPPER}a-z0-9_.-]", "_", surface["id"])
-    (out_dir / f"{stem}.stdout").write_text(proc.stdout, encoding="utf-8")
-    (out_dir / f"{stem}.stderr").write_text(proc.stderr, encoding="utf-8")
+    (out_dir / f"{stem}.stdout").write_text(stdout, encoding="utf-8")
+    (out_dir / f"{stem}.stderr").write_text(stderr, encoding="utf-8")
 
     expect = surface.get("expect", {})
     verdict, reasons, summary, skips = judge_surface(
-        proc.stdout, proc.stderr, proc.returncode, expect,
+        stdout, stderr, returncode, expect,
         list(surface.get("fixtures_required", [])),
     )
 
@@ -615,10 +724,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
     facts = load_json_strict(FACTS_PATH)
     policy = load_json_strict(POLICY_PATH)
     all_ids = validate_policy(policy, facts)
-    selected = args.surface or all_ids
+    selected, skipped = select_surfaces(policy, args.surface)
     unknown = [sid for sid in selected if sid not in all_ids]
     if unknown:
         raise InventoryError(f"unknown surface ids: {', '.join(unknown)}")
+    if skipped:
+        print("not selected (name them with --surface to run): " + ", ".join(skipped))
 
     out_dir = args.out.resolve()
     if out_dir.exists() and any(out_dir.iterdir()):
