@@ -46,7 +46,7 @@ mod exl3_device_tests;
 mod exl3_load;
 #[cfg(test)]
 mod exl3_load_device_tests;
-mod exl3_moe;
+pub(in crate::family) mod exl3_moe;
 #[cfg(test)]
 mod exl3_moe_device_tests;
 mod exl3_moe_source;
@@ -70,7 +70,7 @@ mod mixer_shapes;
 #[cfg(test)]
 mod mixer_tests;
 mod mixer_weights;
-mod moe;
+pub(in crate::family) mod moe;
 mod mtp_load;
 #[cfg(test)]
 mod mtp_load_device_tests;

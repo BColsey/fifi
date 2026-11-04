@@ -53,18 +53,18 @@ const I32: usize = size_of::<i32>();
 const PACK_WIDTH: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct MoeDims {
+pub(in crate::family) struct MoeDims {
     /// Token rows; stage 1 runs this block at one row (verify windows need their own sizing).
-    pub(super) rows: usize,
+    pub(in crate::family) rows: usize,
     /// Hidden size: the router and shared-projection width, the residual width.
-    pub(super) hidden: usize,
-    pub(super) n_expert: usize,
+    pub(in crate::family) hidden: usize,
+    pub(in crate::family) n_expert: usize,
     /// Experts picked per row.
-    pub(super) top_k: usize,
+    pub(in crate::family) top_k: usize,
     /// Rows of one expert's gate and up projections.
-    pub(super) inter: usize,
+    pub(in crate::family) inter: usize,
     /// Rows of the shared expert's gate and up projections.
-    pub(super) shared_inter: usize,
+    pub(in crate::family) shared_inter: usize,
 }
 
 impl MoeDims {
@@ -771,23 +771,23 @@ pub(super) struct MoeLayerWeights<'w> {
 }
 
 /// The routing and residual ranges of the block: views of the step arena and the status word.
-pub(super) struct RouteBufs<'b> {
+pub(in crate::family) struct RouteBufs<'b> {
     /// f32 `[hidden]`: the residual after the mixer add, the block input.
-    pub(super) resid_in: DeviceRange<'b>,
+    pub(in crate::family) resid_in: DeviceRange<'b>,
     /// f32 `[hidden]`: the other residual buffer, the block output.
-    pub(super) resid_out: DeviceRange<'b>,
+    pub(in crate::family) resid_out: DeviceRange<'b>,
     /// f32 `[hidden]`: the normalized row, the router input.
-    pub(super) norm_row: DeviceRange<'b>,
+    pub(in crate::family) norm_row: DeviceRange<'b>,
     /// The router's logits scratch (`RouterLogits`).
-    pub(super) logits: DeviceRange<'b>,
+    pub(in crate::family) logits: DeviceRange<'b>,
     /// i32 `[top_k]`: the pick ids, read on the device only.
-    pub(super) ids: DeviceRange<'b>,
+    pub(in crate::family) ids: DeviceRange<'b>,
     /// f32 `[top_k]`: the renormalized pick weights.
-    pub(super) weights: DeviceRange<'b>,
+    pub(in crate::family) weights: DeviceRange<'b>,
     /// f32: the shared gate, sigmoid-ed by the router.
-    pub(super) shared_gate: DeviceRange<'b>,
+    pub(in crate::family) shared_gate: DeviceRange<'b>,
     /// The status word the router ORs its fault bit into.
-    pub(super) status: DeviceRange<'b>,
+    pub(in crate::family) status: DeviceRange<'b>,
 }
 
 /// The expert and shared-expert ranges of the block: views of the step arena, the input packs
@@ -935,11 +935,11 @@ impl MoeBuffers<'_> {
 
 /// The context and the one owned stream the block queues on. Grouping them keeps every function
 /// of this file at four arguments or fewer (the project rules).
-pub(super) struct Launch<'a> {
+pub(in crate::family) struct Launch<'a> {
     /// The adapter that owns every buffer of the block.
-    pub(super) ctx: &'a CudaContext,
+    pub(in crate::family) ctx: &'a CudaContext,
     /// The one owned stream: every op queues on it, and none of them makes the host wait.
-    pub(super) stream: &'a DeviceStream,
+    pub(in crate::family) stream: &'a DeviceStream,
 }
 
 /// The block dims back from the facts [`check_block`] pins exactly, so that the launcher carries

@@ -759,6 +759,7 @@ fn the_device_pick_path_of_the_exl3_moe_block_never_waits_for_the_host() {
     for name in [
         "fn routed_on_device(",
         "fn grouped_indexed(",
+        "fn indexed_launch(",
         "fn route(",
         "fn shared(",
         "fn combine(",
@@ -772,9 +773,7 @@ fn the_device_pick_path_of_the_exl3_moe_block_never_waits_for_the_host() {
             assert!(!body.contains(forbidden), "{name} calls {forbidden}");
         }
     }
-    let block = source
-        .find("pub(super) fn run_exl3_moe(")
-        .expect("run_exl3_moe");
+    let block = source.find("fn run_exl3_moe(").expect("run_exl3_moe");
     let body = &source[block..];
     let device = body.find("if device_ids {").expect("the device branch");
     let host = body.find("read_picks(").expect("the host branch");

@@ -13,6 +13,11 @@
 //! the pairs `2 s` (gate) and `2 s + 1` (up), so each pick's `[gate | up]` row is contiguous for
 //! the SwiGLU. The grouped launch requires the rotated inputs, the partials and the outputs of its
 //! pairs contiguous in group order; `Scratch` places them.
+//!
+//! The block is shared with Qwen3.8 Flash-Next, which picks 10 of 512 experts: an id-indexed
+//! launch takes at most 16 pairs, so a group of more (Flash-Next's 20 gate and up pairs) is
+//! queued as consecutive launches of at most 16 in group order. Qwen3.6's 8 picks make one
+//! launch, as before.
 
 use super::{
     layer_table::LayerTable,
@@ -39,18 +44,20 @@ use crate::{
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
+/// The most pairs one id-indexed launch takes (`CudaContext::exl3_grouped_indexed`).
+const INDEXED_PAIRS: usize = 16;
 
-pub(super) struct Exl3MoeWeights<'w> {
+pub(in crate::family) struct Exl3MoeWeights<'w> {
     /// The raw F32 `[n_expert][hidden]` router matrix.
-    pub(super) router: &'w DeviceBuffer,
+    pub(in crate::family) router: &'w DeviceBuffer,
     /// The raw F32 `[hidden]` shared-gate vector.
-    pub(super) router_shared: &'w DeviceBuffer,
-    pub(super) gate: &'w Exl3Bank,
-    pub(super) up: &'w Exl3Bank,
-    pub(super) down: &'w Exl3Bank,
-    pub(super) shared_gate: &'w Exl3Weight,
-    pub(super) shared_up: &'w Exl3Weight,
-    pub(super) shared_down: &'w Exl3Weight,
+    pub(in crate::family) router_shared: &'w DeviceBuffer,
+    pub(in crate::family) gate: &'w Exl3Bank,
+    pub(in crate::family) up: &'w Exl3Bank,
+    pub(in crate::family) down: &'w Exl3Bank,
+    pub(in crate::family) shared_gate: &'w Exl3Weight,
+    pub(in crate::family) shared_up: &'w Exl3Weight,
+    pub(in crate::family) shared_down: &'w Exl3Weight,
 }
 
 impl<'w> Exl3MoeWeights<'w> {
@@ -60,7 +67,16 @@ impl<'w> Exl3MoeWeights<'w> {
         layer: usize,
         moe: &MoeDims,
     ) -> Result<Self, EngError> {
-        let name = |role| table.name(layer, role);
+        Self::resolve_by(weights, layer, moe, |role| table.name(layer, role))
+    }
+
+    /// The block of `layer` in `weights`, where `name` gives the key of each role's tensor.
+    pub(in crate::family) fn resolve_by<'n>(
+        weights: &'w CudaWeights,
+        layer: usize,
+        moe: &MoeDims,
+        name: impl Fn(Role) -> Result<&'n str, EngError>,
+    ) -> Result<Self, EngError> {
         let raw = |role, values: usize| -> Result<&'w DeviceBuffer, EngError> {
             match weights.get(name(role)?) {
                 Some(CudaWeight::Raw { buffer, .. }) if buffer.bytes() == values * F32 => {
@@ -106,29 +122,29 @@ impl<'w> Exl3MoeWeights<'w> {
     }
 }
 
-pub(super) struct Exl3MoeBufs<'b> {
-    pub(super) route: RouteBufs<'b>,
+pub(in crate::family) struct Exl3MoeBufs<'b> {
+    pub(in crate::family) route: RouteBufs<'b>,
     /// f32 `[top_k][gate | up]`.
-    pub(super) expert_gu: DeviceRange<'b>,
+    pub(in crate::family) expert_gu: DeviceRange<'b>,
     /// f32 `[top_k][inter]`: the SwiGLU of the picks.
-    pub(super) expert_act: DeviceRange<'b>,
+    pub(in crate::family) expert_act: DeviceRange<'b>,
     /// f32 `[top_k][hidden]`: the down outputs in pick order.
-    pub(super) expert_down: DeviceRange<'b>,
+    pub(in crate::family) expert_down: DeviceRange<'b>,
     /// f32 `[gate | up]` of the shared expert.
-    pub(super) shared_gu: DeviceRange<'b>,
+    pub(in crate::family) shared_gu: DeviceRange<'b>,
     /// f32 `[shared_inter]`.
-    pub(super) shared_act: DeviceRange<'b>,
-    pub(super) shared_out: DeviceRange<'b>,
+    pub(in crate::family) shared_act: DeviceRange<'b>,
+    pub(in crate::family) shared_out: DeviceRange<'b>,
     /// The rotated inputs, the split-K partials and the arithmetic flag of the projections.
-    pub(super) scratch: Scratch<'b>,
+    pub(in crate::family) scratch: Scratch<'b>,
 }
 
 /// The shared scratch of the EXL3 projections (see `Slot::Exl3Xh`, `Exl3Z`, `Exl3Flag`).
 #[derive(Clone, Copy)]
-pub(super) struct Scratch<'b> {
-    pub(super) xh: DeviceRange<'b>,
-    pub(super) z: DeviceRange<'b>,
-    pub(super) flag: DeviceRange<'b>,
+pub(in crate::family) struct Scratch<'b> {
+    pub(in crate::family) xh: DeviceRange<'b>,
+    pub(in crate::family) z: DeviceRange<'b>,
+    pub(in crate::family) flag: DeviceRange<'b>,
 }
 
 fn refuse(detail: String) -> EngError {
@@ -211,9 +227,27 @@ struct IndexedPair<'a> {
     out: DeviceRange<'a>,
 }
 
+/// Queues the id-indexed group `pairs`, all of one shape, as consecutive launches of at most
+/// [`INDEXED_PAIRS`] pairs in group order. Each launch starts again at row 0 of the scratch; the
+/// stream runs it after the previous launch has finished with those rows.
+fn grouped_indexed(
+    launch: &Launch<'_>,
+    pairs: &[IndexedPair<'_>],
+    ids: DeviceRange<'_>,
+    scratch: &Scratch<'_>,
+) -> Result<(), EngError> {
+    if pairs.is_empty() {
+        return Err(refuse("an indexed launch without pairs".into()));
+    }
+    for chunk in pairs.chunks(INDEXED_PAIRS) {
+        indexed_launch(launch, chunk, ids, scratch)?;
+    }
+    Ok(())
+}
+
 /// Queues one id-indexed launch of `pairs`, all of one shape: pair `p` gets row `p` of the scratch
 /// partial and rotated-input areas, and its member is `ids[slot]` read on the device.
-fn grouped_indexed(
+fn indexed_launch(
     launch: &Launch<'_>,
     pairs: &[IndexedPair<'_>],
     ids: DeviceRange<'_>,
@@ -417,7 +451,7 @@ fn combine(launch: &Launch<'_>, bufs: &Exl3MoeBufs<'_>, dims: &MoeDims) -> Resul
 
 /// The block of one layer on the one stream. With `device_ids` the picks stay on the device and
 /// the block makes no host read; otherwise it waits for the stream once, to read the ids.
-pub(super) fn run_exl3_moe(
+pub(in crate::family) fn run_exl3_moe(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
