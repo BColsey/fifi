@@ -1,0 +1,14 @@
+test family::flint::cuda_ffn::real_model::tests::pinned_prefixes_have_exact_rows_and_no_added_bos ... ok
+REAL_ROW row=0 rel_l2=1.000000000e0 cosine=1.000000000e0 max_abs=2.000000000e0
+test family::flint::cuda_ffn::real_quality::tests::collinear_amplitude_error_must_fail_even_with_cosine_one ... ok
+test family::flash_next::load::exl3_pack::tests::a_stock_pack_matches_the_config_and_an_independent_byte_sum ... okREAL_ROW row=0 rel_l2=1.414213562e0 cosine=0.000000000e0 max_abs=1.000000000e0
+
+REAL_ROW row=0 rel_l2=0.000000000e0 cosine=1.000000000e0 max_abs=0.000000000e0
+REAL_ROW row=1 rel_l2=1.000000000e0 cosine=1.000000000e0 max_abs=2.000000000e0
+test family::flint::cuda_ffn::real_quality::tests::direction_error_and_a_bad_later_row_fail ... ok
+REAL_ROW row=0 rel_l2=0.000000000e0 cosine=1.000000000e0 max_abs=0.000000000e0
+test family::flint::cuda_ffn::real_quality::tests::malformed_shapes_fail ... REAL_ROW row=1 rel_l2=0.000000000e0 cosine=1.000000000e0 max_abs=0.000000000e0
+ok
+REAL_ROW row=0 rel_l2=inf cosine=0.000000000e0 max_abs=1.000000000e0
+REAL_ROW row=0 rel_l2=1.000000000e0 cosine=0.000000000e0 max_abs=1.000000000e0
+test family::flint::cuda_ffn::real_quality::tests::matching_rows_and_exact_zero_norms_pass ... ok

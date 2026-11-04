@@ -1,0 +1,7 @@
+running 2 tests
+test generates_from_the_pinned_real_model_when_configured ... nemotron35_runner: skipping, NEM35_MODEL_DIR is not set
+ok
+test rejects_a_pinned_model_before_opening_the_loader_when_budget_is_too_small ... nemotron35_runner: skipping admission, NEM35_MODEL_DIR is not set
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

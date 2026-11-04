@@ -119,6 +119,38 @@ class TornResultLineTest(unittest.TestCase):
             self.parse(block)
 
 
+class CapturedTornOutputTest(unittest.TestCase):
+    """Permanent regression fixtures: verbatim fragments of the two real
+    integration runs whose torn result lines failed the collection
+    (run3/run4 at the slice-1 integration; REAL_ROW and runner prints from
+    the tests landed inside libtest's no-newline result prefixes)."""
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+    STDERR = "     Running unittests src/lib.rs (x)\n"
+
+    def test_glued_and_deferred_shapes_from_run3(self) -> None:
+        fragment = (self.FIXTURES / "torn_glue_defer.txt").read_text(encoding="utf-8")
+        names = {
+            line.split(" ... ")[0][len("test "):]
+            for line in fragment.splitlines()
+            if line.startswith("test ") and " ... " in line
+        }
+        block = f"running {len(names)} tests\n{fragment}" \
+                f"test result: ok. {len(names)} passed; 0 failed; 0 ignored; " \
+                "0 measured; 0 filtered out; finished in 0.0s\n"
+        summary = qi.summarize_run(block, self.STDERR)
+        counted = [name for name, _status in
+                   qi.parse_stdout_blocks(block)[0].lines]
+        self.assertEqual(len(counted), len(names))
+        self.assertEqual(set(counted), names)  # glued and deferred all recovered
+        self.assertEqual(summary["totals"]["passed"], len(names))
+
+    def test_concurrent_deferred_completions_from_run4(self) -> None:
+        fragment = (self.FIXTURES / "torn_concurrent.txt").read_text(encoding="utf-8")
+        summary = qi.summarize_run(fragment, self.STDERR)
+        self.assertEqual(summary["totals"]["passed"], 2)  # both bare `ok` lines landed
+
+
 class ScanFileTest(unittest.TestCase):
     def test_counts_tests_ignores_gates_and_fixtures(self) -> None:
         source = """\
