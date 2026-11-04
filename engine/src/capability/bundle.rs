@@ -16,7 +16,11 @@
 //! the allowlisted `Q36_CACHE_LIMIT` the effective rows already read;
 //! no request, log, or model content is an input) plus one recursive
 //! pass that replaces the home-directory prefix with `~` in every
-//! string of the finished document.
+//! string of the finished document. One allowlist edge, by design:
+//! the *value* of `Q36_CACHE_LIMIT` appears in the settings rows (it
+//! is a memory size in every legitimate use), and an invalid value can
+//! be quoted by that setting's refusal text — a name that is
+//! allowlisted, not a credential.
 
 use super::Probe;
 use super::preflight::{self, Candidate, PreflightReport};
@@ -425,29 +429,42 @@ fn os_release_pretty_name() -> Option<String> {
     Some(quoted.trim_matches('"').to_string())
 }
 
-/// Writes the bundle atomically: a `.part` sibling next to the
+/// Writes the bundle atomically: a fresh `.part` sibling next to the
 /// destination, one rename, and the partial file removed on any
-/// failure. An existing destination is refused, never overwritten.
+/// failure. An existing destination is refused, never overwritten —
+/// including one that is only a symlink, live or dangling
+/// (`symlink_metadata`, which does not follow). The `.part` file is
+/// created with `create_new` (`O_EXCL`), so a symlink planted at that
+/// path is refused instead of written through: no file outside the
+/// destination directory is ever opened for writing.
 pub(crate) fn write_atomically(path: &Path, body: &str) -> Result<(), String> {
-    if path.exists() {
+    if path.symlink_metadata().is_ok() {
         return Err(format!(
             "doctor: bundle destination {} already exists; refusing to overwrite",
             path.display()
         ));
     }
     let partial = path.with_extension("part");
-    let result = std::fs::write(&partial, body)
-        .map_err(|error| format!("doctor: cannot write {}: {error}", partial.display()))
-        .and_then(|()| {
-            std::fs::rename(&partial, path).map_err(|error| {
-                let _ = std::fs::remove_file(&partial);
-                format!("doctor: cannot place {}: {error}", path.display())
-            })
-        });
-    if result.is_err() {
+    // Failure cleanup removes only a `.part` this call created; a
+    // refused creation (EEXIST — including a planted symlink) leaves
+    // whatever was there untouched.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .map_err(|error| format!("doctor: cannot write {}: {error}", partial.display()))?;
+    if let Err(error) = std::io::Write::write_all(&mut file, body.as_bytes()) {
         let _ = std::fs::remove_file(&partial);
+        return Err(format!(
+            "doctor: cannot write {}: {error}",
+            partial.display()
+        ));
     }
-    result
+    if let Err(error) = std::fs::rename(&partial, path) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("doctor: cannot place {}: {error}", path.display()));
+    }
+    Ok(())
 }
 
 /// Builds and writes the bundle for the CLI, returning the summary
@@ -498,6 +515,7 @@ mod tests {
     use crate::capability::preflight::{self, Candidate};
     use crate::capability::probe::{CompiledBackends, CudaFacts, HardwareFacts, HostFacts};
     use serde_json::{Value, json};
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
 
     const HOME: &str = "/home/canary_user";
@@ -735,6 +753,55 @@ mod tests {
         assert!(write_atomically(&destination, "{}").is_err());
         assert!(!dir.path().join("missing-subdir.part").exists());
         assert!(!destination.exists());
+    }
+
+    /// A `.part` symlink planted next to the destination must be
+    /// refused, not written through: the bundle never opens a file
+    /// outside its own destination directory for writing.
+    #[test]
+    fn a_planted_part_symlink_is_refused_not_followed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let target = dir.path().join("sensitive.txt");
+        std::fs::write(&target, "do not touch").expect("target");
+        let destination = dir.path().join("bundle.json");
+        symlink(&target, dir.path().join("bundle.part")).expect("symlink");
+        let error = super::write_atomically(&destination, "{}").expect_err("refused");
+        assert!(error.contains("cannot write"), "{error}");
+        // The target was neither truncated nor replaced, and the
+        // planted symlink itself is untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not touch");
+        assert!(dir.path().join("bundle.part").symlink_metadata().is_ok());
+        assert!(destination.symlink_metadata().is_err());
+    }
+
+    /// A destination that is a dangling symlink still counts as
+    /// existing: `exists()` follows links and would miss it.
+    #[test]
+    fn a_dangling_destination_symlink_is_still_an_existing_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let destination = dir.path().join("bundle.json");
+        symlink(dir.path().join("nowhere"), &destination).expect("symlink");
+        let error = super::write_atomically(&destination, "{}").expect_err("refused");
+        assert!(error.contains("already exists"), "{error}");
+        // Still a symlink, not replaced by a bundle.
+        assert!(destination.symlink_metadata().is_ok());
+    }
+
+    /// An unwritable destination directory fails loudly with no
+    /// partial bundle and no stray `.part` left behind.
+    #[test]
+    fn an_unwritable_directory_produces_no_partial_success() {
+        let dir = tempfile::tempdir().expect("dir");
+        let readonly = dir.path().join("readonly");
+        std::fs::create_dir(&readonly).expect("dir");
+        let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&readonly, perms).expect("locked");
+        let destination = readonly.join("bundle.json");
+        let error = super::write_atomically(&destination, "{}").expect_err("refused");
+        assert!(error.contains("cannot write"), "{error}");
+        assert!(destination.symlink_metadata().is_err());
+        assert!(readonly.join("bundle.part").symlink_metadata().is_err());
     }
 
     #[test]
