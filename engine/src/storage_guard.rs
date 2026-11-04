@@ -30,13 +30,15 @@
 //! a local-looking path. The tokenizer directory and the Flash-Next manifest
 //! hold small text files and are not checked.
 //!
-//! Every loader that opens model weight files calls this module: the server
-//! start (all families), the inspection, the EXL3 and Flint checkpoint opens
-//! (directory and each shard), the GGUF open, the Nemotron shard reader and
-//! the read-only expert mapping. The Flash-Next and Qwen3.6 resident
-//! executors open their shards the same way, but they are built only for
-//! macOS with the MLX backend, so their guarded form is compiled and checked
-//! on a Mac and has no Linux test.
+//! Guarded entry points: the server start (the model directory of every
+//! family), the inspection, the EXL3 and Flint checkpoint opens (directory
+//! and each shard), the GGUF open, the Nemotron shard reader and the read-only
+//! expert mapping. The Flash-Next and Qwen3.6 resident executors open their
+//! shards the same way, but they are built only for macOS with the MLX
+//! backend, so their guarded form is compiled and checked on a Mac and has no
+//! Linux test. Other readers of weight files (the tiered file mapping, the
+//! optional GGUF identity hash) have no check of their own and rely on the
+//! entry point above that opened the same file first.
 
 use std::path::Path;
 
@@ -83,7 +85,14 @@ impl LocalGuard {
     fn judge(&self, resolved: &Path, shown: &Path, what: &str) -> Result<(), EngError> {
         match mounts::owning_mount(&self.mounts, resolved) {
             Some(mount) => refuse(mount, resolved, shown, what),
-            None => Ok(()),
+            // The root is a mount on an ordinary host. A table with no owner
+            // (empty, or a chroot layout) cannot show where the path lives, so
+            // it is not evidence of local storage.
+            None => Err(unresolved(
+                shown,
+                what,
+                &std::io::Error::other("no mount in the table owns the resolved path"),
+            )),
         }
     }
 }
@@ -474,6 +483,40 @@ mod macos {
             assert!(error.describe().contains("autofs"), "{}", error.describe());
         }
 
+        /// A path below a network mount that this Mac really has (from
+        /// `mount`, independent of the code under test), or `None`. The child
+        /// does not exist, so nothing is created or read there.
+        fn live_network_path() -> Option<std::path::PathBuf> {
+            let output = std::process::Command::new("/sbin/mount").output().ok()?;
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.lines().find_map(|line| {
+                let (_, rest) = line.split_once(" on ")?;
+                let (point, kind) = rest.rsplit_once(" (")?;
+                let kind = kind.split(',').next()?;
+                matches!(kind, "nfs" | "smbfs" | "afpfs" | "webdav")
+                    .then(|| Path::new(point).join("storage-guard-test-absent"))
+            })
+        }
+
+        // Fails if a real macOS network mount passes. Skipped with a note on
+        // a Mac with no network mount.
+        #[test]
+        fn a_path_under_a_live_network_mount_is_refused() {
+            let Some(path) = live_network_path() else {
+                eprintln!("skipped: no network mount on this Mac");
+                return;
+            };
+            let mount = owner(&path).unwrap();
+            eprintln!("statfs reports {mount:?}");
+            let error = super::super::require_local(&path, "model weights").unwrap_err();
+            eprintln!("refusal: {}", error.describe());
+            assert!(
+                error.describe().contains("local storage"),
+                "{}",
+                error.describe()
+            );
+        }
+
         // Fails if the check skips symlink resolution or missing children.
         #[test]
         fn a_missing_child_of_a_local_directory_is_local() {
@@ -545,14 +588,32 @@ mod mounts {
             .map(|entry| &entry.mount)
     }
 
-    /// Whether a later mount (a higher id; the kernel numbers mounts in
-    /// creation order) on a parent directory of `entry` covers it. A path walk
-    /// then reaches the covering mount and never the covered one.
+    /// Whether a path walk can no longer reach `entry`. It is covered when
+    /// another mount on the same parent mount sits at a strict ancestor
+    /// directory of its mount point (mounted over the directory that held it),
+    /// and it is lost with its parent when the parent mount is covered. The
+    /// parent ids are exact; mount ids are not in creation order (a root
+    /// moved in by the initramfs has a higher id than its children).
     fn is_hidden(entries: &[Entry], entry: &Entry) -> bool {
-        entries.iter().any(|later| {
-            later.id > entry.id
-                && later.mount.point != entry.mount.point
-                && entry.mount.point.starts_with(&later.mount.point)
+        let mut current = entry;
+        for _ in 0..entries.len() {
+            if is_covered_by_sibling(entries, current) {
+                return true;
+            }
+            match entries.iter().find(|parent| parent.id == current.parent) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn is_covered_by_sibling(entries: &[Entry], entry: &Entry) -> bool {
+        entries.iter().any(|cover| {
+            cover.parent == entry.parent
+                && cover.id != entry.id
+                && cover.mount.point != entry.mount.point
+                && entry.mount.point.starts_with(&cover.mount.point)
         })
     }
 
@@ -716,6 +777,65 @@ mod mounts {
     ";
             let mounts = parse(nested);
             assert_eq!(owner(&mounts, "/srv/data/cache/w.gguf").fstype, "ext4");
+        }
+
+        // Fails if hiding follows mount ids instead of parent ids: here the
+        // nfs4 mount has a lower id than the local mount it sits under (it was
+        // moved), yet it is the visible one.
+        #[test]
+        fn a_moved_network_mount_below_a_higher_id_is_still_visible() {
+            let moved = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    20 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n\
+    10 20 0:3 / /data/models rw - nfs4 nas:/models rw\n\
+    ";
+            let mounts = parse(moved);
+            assert_eq!(owner(&mounts, "/data/models/w.gguf").fstype, "nfs4");
+            assert!(refusal(&mounts, "/data/models/w.gguf", "model weights").is_err());
+            assert!(refusal(&mounts, "/data/other/w.gguf", "model weights").is_ok());
+        }
+
+        // Fails if a mount whose parent mount is covered still owns paths: the
+        // nfs4 mount covers /a, which held the local mounts at /a/b and /a/b/c.
+        #[test]
+        fn a_mount_inside_a_covered_mount_is_hidden_too() {
+            let covered = "\
+    1 0 0:1 / / rw - ext4 /dev/sda1 rw\n\
+    5 1 8:2 / /a/b rw - ext4 /dev/sdb1 rw\n\
+    6 5 8:3 / /a/b/c rw - ext4 /dev/sdc1 rw\n\
+    7 1 0:3 / /a rw - nfs4 nas:/a rw\n\
+    ";
+            let mounts = parse(covered);
+            assert_eq!(owner(&mounts, "/a/b/c/w.gguf").fstype, "nfs4");
+        }
+
+        /// The shape of this project's build host: the root (id 32) was moved
+        /// in after /sys, /proc, /dev and /run (ids 27-31), so ids do not
+        /// follow nesting, and /sys/kernel/security (26) is below /sys (27).
+        const ROOT_AFTER_CHILDREN: &str = "\
+    27 32 0:24 / /sys rw,nosuid shared:6 - sysfs sysfs rw\n\
+    28 32 0:25 / /proc rw,nosuid shared:12 - proc proc rw\n\
+    29 32 0:6 / /dev rw,nosuid shared:2 - devtmpfs udev rw\n\
+    30 29 0:26 / /dev/pts rw,nosuid shared:3 - devpts devpts rw\n\
+    31 32 0:27 / /run rw,nosuid shared:5 - tmpfs tmpfs rw\n\
+    32 2 0:23 /@ / rw,noatime shared:1 - btrfs /dev/nvme0n1p2 rw,ssd\n\
+    26 27 0:7 / /sys/kernel/security rw,nosuid shared:7 - securityfs securityfs rw\n\
+    ";
+
+        // Fails if ids are compared: the root has a higher id than /sys and
+        // /proc, so an id rule would hide them behind the root.
+        #[test]
+        fn a_root_with_a_higher_id_than_its_children_hides_none_of_them() {
+            let mounts = parse(ROOT_AFTER_CHILDREN);
+            assert_eq!(owner(&mounts, "/sys/class/net").fstype, "sysfs");
+            assert_eq!(owner(&mounts, "/proc/self/status").fstype, "proc");
+            assert_eq!(owner(&mounts, "/dev/pts/0").fstype, "devpts");
+            assert_eq!(
+                owner(&mounts, "/sys/kernel/security/x").fstype,
+                "securityfs"
+            );
+            assert_eq!(owner(&mounts, "/home/user/models").fstype, "btrfs");
+            assert!(refusal(&mounts, "/home/user/models", "model weights").is_ok());
         }
 
         // Fails if prefix matching is textual: /srv/shared2 is not below
@@ -903,6 +1023,23 @@ mod live_tests {
                 .describe();
             assert!(text.contains("autofs"), "{text}");
         });
+    }
+
+    // Fails if a path that no mount in the table owns is taken for local: an
+    // empty table, and a table that covers only an unrelated mount point.
+    #[test]
+    fn a_table_with_no_owner_for_the_path_is_not_proof_of_local_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = "2 1 0:2 / /unrelated-mount-point rw - ext4 /dev/fixture rw\n";
+        for table in ["", unrelated] {
+            seam::with_table(table.as_bytes(), || {
+                let text = require_local(dir.path(), "model weights")
+                    .unwrap_err()
+                    .describe();
+                assert!(text.contains("cannot confirm"), "{text}");
+                assert!(text.contains("no mount in the table"), "{text}");
+            });
+        }
     }
 
     // Fails if require_local does not consult the live mount table. Skipped
