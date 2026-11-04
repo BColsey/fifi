@@ -2656,7 +2656,7 @@ mod tests {
         let prompt_b = vec![6, 4, 7, 1];
         let want_a = oracle(&PROMPT, COUNT, &mut seeded_sampler(), VOCAB);
         let want_b = oracle(&prompt_b, COUNT, &mut seeded_sampler(), VOCAB);
-        let engine = spawn_engine(2, || Ok(build(rules(vec![], VOCAB)))).unwrap();
+        let engine = spawn_engine(2, |_| Ok(build(rules(vec![], VOCAB)))).unwrap();
         for (round, (prompt, want)) in [
             (PROMPT.to_vec(), &want_a),
             (prompt_b.clone(), &want_b),
