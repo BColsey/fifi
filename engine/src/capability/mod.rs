@@ -22,6 +22,7 @@
 //! serving process must not call `probe`; it already reads the same facts
 //! through its own context at load time.
 
+pub mod bundle;
 pub mod cli;
 pub mod effective;
 pub mod inspect;

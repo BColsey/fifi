@@ -22,7 +22,7 @@ usage:
                     ([--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--listen <addr>]
                     [--print-config])
-  enginesrv doctor [--config <path>] [--json]
+  enginesrv doctor [--config <path>] [--json] [--bundle <file>]
   enginesrv check <model_dir> [--tokenizer-dir <dir>] [--family <name>]
                     [--context <tokens>] [--kv <f32|bf16|q8>] [--json]
   enginesrv config validate <path>
@@ -32,6 +32,12 @@ usage:
 doctor  Report what this build can serve on this machine: compiled
         backends, CUDA device and free VRAM, host RAM and threads.
         With --config, also validate that configuration file.
+        With --bundle <file>, write a sanitized diagnostic support
+        bundle instead (one JSON file: platform, hardware, and — with
+        --config — per-engine preflights and effective settings, plus
+        a manifest of what was collected and a readable summary).
+        Home paths become ~, no secrets or prompts are collected, and
+        an existing file is never overwritten. Attach it to an issue.
 check   Preflight one model directory: compatibility verdict, the
         checks behind it, and a memory estimate against the probed
         free memory. Exit 0 when servable, 1 otherwise.
@@ -54,6 +60,7 @@ pub enum Action {
     Doctor {
         config: Option<PathBuf>,
         json: bool,
+        bundle: Option<PathBuf>,
     },
     Check {
         model_dir: PathBuf,
@@ -95,6 +102,7 @@ pub fn parse(args: &[String]) -> Option<Result<Action, String>> {
 fn parse_doctor(rest: &[String]) -> Result<Action, String> {
     let mut config = None;
     let mut json = false;
+    let mut bundle = None;
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -105,10 +113,25 @@ fn parse_doctor(rest: &[String]) -> Result<Action, String> {
                         .ok_or("doctor: --config needs a path".to_string())?,
                 ))
             }
+            "--bundle" => {
+                bundle = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("doctor: --bundle needs a destination path".to_string())?,
+                ))
+            }
             other => return Err(format!("doctor: unknown argument {other:?}")),
         }
     }
-    Ok(Action::Doctor { config, json })
+    if json && bundle.is_some() {
+        return Err(
+            "doctor: --bundle writes a file and --json prints one; pick either".to_string(),
+        );
+    }
+    Ok(Action::Doctor {
+        config,
+        json,
+        bundle,
+    })
 }
 
 fn parse_check(rest: &[String]) -> Result<Action, String> {
@@ -179,7 +202,18 @@ pub fn run(action: &Action) -> Result<(), String> {
             println!("enginesrv {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Action::Doctor { config, json } => {
+        Action::Doctor {
+            config,
+            json,
+            bundle,
+        } => {
+            if let Some(destination) = bundle {
+                println!(
+                    "{}\ninspect the bundle before sharing it: it is one JSON file with a summary",
+                    super::bundle::write_bundle(destination, config.as_deref())?
+                );
+                return Ok(());
+            }
             let facts = super::probe::probe();
             let validation = config.as_deref().map(validate_config);
             if *json {
@@ -566,6 +600,7 @@ fn verdict_label(verdict: Verdict) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Action, parse};
+    use std::path::PathBuf;
 
     fn args(text: &[&str]) -> Vec<String> {
         text.iter().map(|s| s.to_string()).collect()
@@ -637,8 +672,27 @@ mod tests {
             parse(&args(&["doctor", "--json"])),
             Some(Ok(Action::Doctor {
                 config: None,
-                json: true
+                json: true,
+                bundle: None
             }))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "doctor", "--bundle", "out.json", "--config", "f.json"
+            ])),
+            Some(Ok(Action::Doctor {
+                config: Some(PathBuf::from("f.json")),
+                json: false,
+                bundle: Some(PathBuf::from("out.json"))
+            }))
+        );
+        // The two output modes are mutually exclusive: a file that
+        // exists cannot be silently skipped for stdout.
+        assert_eq!(
+            parse(&args(&["doctor", "--bundle", "out.json", "--json"])),
+            Some(Err(
+                "doctor: --bundle writes a file and --json prints one; pick either".to_string()
+            ))
         );
         assert!(matches!(
             parse(&args(&["config", "validate", "f.json"])),
