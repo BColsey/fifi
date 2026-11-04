@@ -22,15 +22,19 @@
 //!   copies are queued only after the resident launches.
 //! - device: the transfer stream waits for the router on the device and the copies were queued
 //!   before. This is the lower bound with no host round trip; a real host cannot know the misses
-//!   before the router has run.
+//!   before the router has run. The host queues those copies before the resident piece, so their
+//!   queueing delays the resident launch in both arms.
 //!
 //! Phases (one `RESBENCH` JSON line per case; times in microseconds with mean, P50, P95, P99):
-//! - graph_build: capture plus instantiate time, node count and device memory of the block graph,
-//!   of a 48-block token graph and of the split pieces; the first replay.
-//! - graph_check: eager, graph, eager split and graph split outputs for 8 input rows (each picks
-//!   its own experts), 200 graph replays of one row, and the token graph. Bitwise equality and
-//!   relative L2 against arm A; the router status and the arithmetic flag stay 0. Any relative L2
-//!   above 1e-5 fails the run.
+//! - graph_build: capture plus instantiate time, node count and device memory (the drop in free
+//!   memory) of the block graph, of a 48-block token graph and of the split pieces; the first
+//!   replay, and the memory of all graphs after it.
+//! - graph_check: eager, graph, eager split and graph split outputs for 8 input rows, 200 graph
+//!   replays of one row, and the token graph. Before every run the output row is cleared, the ids
+//!   are set to -1 and every intermediate the block writes is set to NaN, so a skipped launch
+//!   shows. Bitwise equality and relative L2 against arm A; the router status and the arithmetic
+//!   flag stay 0. Any relative L2 above 1e-5, or rows that all pick the same experts, fail the run.
+//!   The gate's copy and one layer's ten miss copies are read back and compared with the store.
 //! - graph_block: one block, isolated (each block waits for the host to queue it) and gated (the
 //!   compute stream waits behind a 24-expert copy while the host queues, so the device runs the
 //!   queued kernels back to back: device work without host launch gaps; `late` counts the reps
@@ -49,6 +53,8 @@
 //! What the numbers leave out: the classify kernel and the mailbox of a real miss path, the
 //! resident bank's eviction and the slot table; the other layers' attention and recurrent work
 //! (a token here is 48 MoE blocks of the same layer); and copies into the slots the kernels read.
+//! The arms run in a fixed order (eager first in graph_block, graph first in graph_miss_layer and
+//! graph_trace), so slow clock or thermal drift falls on one side; the two runs of a window show it.
 
 use std::{ops::Range, time::Instant};
 
@@ -165,7 +171,8 @@ struct Parts<'w> {
 }
 
 impl<'w> Parts<'w> {
-    fn resolve(weights: &'w CudaWeights, layer: usize) -> Res<Self> {
+    /// The tensors of `layer`, with the shape checks of `Exl3MoeWeights::resolve_by`.
+    fn resolve(weights: &'w CudaWeights, layer: usize, moe: &MoeDims) -> Res<Self> {
         let keys = super::exl3_cuda_tests::keys(layer);
         let get = |role: Role| -> Res<&'w CudaWeight> {
             let key = keys
@@ -177,27 +184,34 @@ impl<'w> Parts<'w> {
                 .get(key)
                 .ok_or_else(|| fail(format!("no tensor {key}")))
         };
-        let raw = |role: Role| match get(role)? {
-            CudaWeight::Raw { buffer, .. } => Ok(buffer),
-            _ => Err(fail(format!("{role:?} is not a raw tensor"))),
+        let raw = |role: Role, values: usize| match get(role)? {
+            CudaWeight::Raw { buffer, .. } if buffer.bytes() == values * F32 => Ok(buffer),
+            _ => Err(fail(format!(
+                "{role:?} is not a raw F32 tensor of {values}"
+            ))),
         };
-        let bank = |role: Role| match get(role)? {
-            CudaWeight::Exl3Bank { bank, .. } => Ok(bank),
-            _ => Err(fail(format!("{role:?} is not an EXL3 bank"))),
+        let bank = |role: Role, shape: [usize; 2]| match get(role)? {
+            CudaWeight::Exl3Bank { bank, .. }
+                if bank.count() == moe.n_expert && bank.shape() == shape =>
+            {
+                Ok(bank)
+            }
+            _ => Err(fail(format!("{role:?} is not a bank of {shape:?}"))),
         };
-        let single = |role: Role| match get(role)? {
-            CudaWeight::Exl3 { weight, .. } => Ok(weight),
-            _ => Err(fail(format!("{role:?} is not an EXL3 matrix"))),
+        let single = |role: Role, shape: [usize; 2]| match get(role)? {
+            CudaWeight::Exl3 { weight, .. } if weight.shape == shape => Ok(weight),
+            _ => Err(fail(format!("{role:?} is not an EXL3 matrix of {shape:?}"))),
         };
+        let (h, i, s) = (moe.hidden, moe.inter, moe.shared_inter);
         Ok(Self {
-            router: raw(Role::FfnGateInp)?,
-            router_shared: raw(Role::FfnGateInpShexp)?,
-            gate: bank(Role::FfnGateExps)?,
-            up: bank(Role::FfnUpExps)?,
-            down: bank(Role::FfnDownExps)?,
-            shared_gate: single(Role::FfnGateShexp)?,
-            shared_up: single(Role::FfnUpShexp)?,
-            shared_down: single(Role::FfnDownShexp)?,
+            router: raw(Role::FfnGateInp, moe.n_expert * h)?,
+            router_shared: raw(Role::FfnGateInpShexp, h)?,
+            gate: bank(Role::FfnGateExps, [h, i])?,
+            up: bank(Role::FfnUpExps, [h, i])?,
+            down: bank(Role::FfnDownExps, [i, h])?,
+            shared_gate: single(Role::FfnGateShexp, [h, s])?,
+            shared_up: single(Role::FfnUpShexp, [h, s])?,
+            shared_down: single(Role::FfnDownShexp, [s, h])?,
         })
     }
 }
@@ -538,15 +552,18 @@ impl Rig<'_> {
     }
 
     /// Holds the compute stream behind one copy of 24 experts (about 1.7 ms) so that the work the
-    /// host queues next runs back to back once it opens; marks the copy's span.
-    fn gate(&mut self) -> Res<()> {
+    /// host queues next runs back to back once it opens; marks the copy's span. Returns the instant
+    /// just before the copy was queued: the copy cannot start earlier.
+    fn gate(&mut self) -> Res<Instant> {
         self.transfer.record_timing(&self.marks[COPY0])?;
         let dst = self.staging.range(0, GATE_EXPERTS * EXPERT_BYTES)?;
+        let queued = Instant::now();
         self.ctx
             .copy_from_pinned(&self.transfer, &mut self.pinned, 0, dst)?;
         self.transfer.record_timing(&self.marks[COPY1])?;
         self.transfer.record(&self.opened)?;
-        self.compute.wait(&self.opened)
+        self.compute.wait(&self.opened)?;
+        Ok(queued)
     }
 
     /// Waits for both streams.
@@ -568,15 +585,34 @@ impl Rig<'_> {
         row.buffer().write_at(&self.compute, row.offset(), &bytes)
     }
 
-    /// Clears the output row and the ids, runs `body`, waits and reads the outputs back.
+    /// Clears the output row, sets the ids to -1 and every intermediate the block writes (pick
+    /// weights, shared gate, expert and shared-expert rows) to NaN, runs `body`, waits and reads
+    /// the outputs back. A skipped launch leaves NaN or -1 behind, which `sound` refuses.
     fn run_once(&mut self, body: impl FnOnce(&mut Self) -> Res<()>) -> Res<Output> {
         let d = self.composed.dims;
-        let out = self.composed.bufs.route.resid_out;
+        let b = &self.composed.bufs;
+        let out = b.route.resid_out;
         out.buffer()
             .write_at(&self.compute, out.offset(), &vec![0u8; d.hidden * F32])?;
-        let ids = self.composed.bufs.route.ids;
+        let ids = b.route.ids;
         ids.buffer()
             .write_at(&self.compute, ids.offset(), &vec![0xffu8; d.top_k * 4])?;
+        let poisoned = [
+            b.route.weights,
+            b.route.shared_gate,
+            b.expert_gu,
+            b.expert_act,
+            b.expert_down,
+            b.shared_gu,
+            b.shared_act,
+            b.shared_out,
+        ];
+        for range in poisoned {
+            let nan = f32::NAN.to_le_bytes().repeat(range.bytes() / F32);
+            range
+                .buffer()
+                .write_at(&self.compute, range.offset(), &nan)?;
+        }
         body(self)?;
         self.settle()?;
         let b = &self.composed.bufs;
@@ -623,41 +659,63 @@ fn free_bytes(rig: &Rig<'_>) -> Res<usize> {
 
 // ------------------------------------------------------------------ phases
 
-fn build_phase(rig: &mut Rig<'_>) -> Res<()> {
-    let k = rig.composed.dims.top_k;
-    // A first launch loads its kernel's module, which a capture refuses: warm every piece first.
-    rig.full(Exec::Eager)?;
-    for m in 0..=k {
-        for piece in [Piece::Router, Piece::Resident(m), Piece::Tail(m)] {
-            rig.piece(Exec::Eager, piece)?;
-        }
-    }
-    rig.settle()?;
-    let block = |r: &Rig<'_>| r.block.queue(r.ctx, &r.compute);
+/// Captures `body` and returns the graph, the capture plus instantiate microseconds and the
+/// device memory it took (the drop in free memory).
+fn capture_measured(
+    rig: &Rig<'_>,
+    body: impl FnOnce(&Rig<'_>) -> Res<()>,
+) -> Res<(GraphExec<'static>, f64, usize)> {
     let before = free_bytes(rig)?;
-    let (full, first) = capture(rig, block)?;
-    let vram = before.saturating_sub(free_bytes(rig)?);
+    let (graph, took) = capture(rig, body)?;
+    Ok((graph, took, before.saturating_sub(free_bytes(rig)?)))
+}
+
+fn queue_block(r: &Rig<'_>) -> Res<()> {
+    r.block.queue(r.ctx, &r.compute)
+}
+
+/// The block graph, captured `CAPTURES` times for the capture cost; the first is kept.
+fn capture_block(rig: &Rig<'_>) -> Res<GraphExec<'static>> {
+    let (full, first, vram) = capture_measured(rig, queue_block)?;
     let mut times = vec![first];
     for _ in 1..CAPTURES {
-        times.push(capture(rig, block)?.1);
+        times.push(capture(rig, queue_block)?.1);
     }
+    let extra = format!(",\"nodes\":{},\"vram_bytes\":{vram}", full.nodes());
     emit(
         "graph_build",
         "block_capture_instantiate",
         "us",
         &times,
-        &format!(",\"nodes\":{},\"vram_bytes\":{vram}", full.nodes()),
+        &extra,
     );
-    let before = free_bytes(rig)?;
-    let (token, took) = capture(rig, |r| (0..LAYERS).try_for_each(|_| block(r)))?;
-    let vram = before.saturating_sub(free_bytes(rig)?);
+    Ok(full)
+}
+
+/// One graph of a token's 48 blocks.
+fn capture_token(rig: &Rig<'_>) -> Res<GraphExec<'static>> {
+    let (token, took, vram) =
+        capture_measured(rig, |r| (0..LAYERS).try_for_each(|_| queue_block(r)))?;
+    let extra = format!(",\"nodes\":{},\"vram_bytes\":{vram}", token.nodes());
     emit(
         "graph_build",
         "token48_capture_instantiate",
         "us",
         &[took],
-        &format!(",\"nodes\":{},\"vram_bytes\":{vram}", token.nodes()),
+        &extra,
     );
+    Ok(token)
+}
+
+/// The router graph and the resident and tail graphs for every miss count.
+fn capture_split(
+    rig: &Rig<'_>,
+) -> Res<(
+    GraphExec<'static>,
+    Vec<GraphExec<'static>>,
+    Vec<GraphExec<'static>>,
+)> {
+    let k = rig.composed.dims.top_k;
     let before = free_bytes(rig)?;
     let start = Instant::now();
     let piece = |piece: Piece| move |r: &Rig<'_>| queue_piece(&r.launch(), &r.composed, piece);
@@ -671,36 +729,55 @@ fn build_phase(rig: &mut Rig<'_>) -> Res<()> {
     let took = us(start);
     let vram = before.saturating_sub(free_bytes(rig)?);
     let nodes = |graphs: &[GraphExec<'static>]| {
-        graphs
-            .iter()
-            .map(|g| g.nodes().to_string())
-            .collect::<Vec<_>>()
-            .join(",")
+        let list: Vec<String> = graphs.iter().map(|g| g.nodes().to_string()).collect();
+        list.join(",")
     };
+    let extra = format!(
+        ",\"router_nodes\":{},\"resident_nodes\":[{}],\"tail_nodes\":[{}],\"vram_bytes\":{vram}",
+        router.nodes(),
+        nodes(&resident),
+        nodes(&tail)
+    );
     emit(
         "graph_build",
         "split_capture_instantiate_all",
         "us",
         &[took],
-        &format!(
-            ",\"router_nodes\":{},\"resident_nodes\":[{}],\"tail_nodes\":[{}],\"vram_bytes\":{vram}",
-            router.nodes(),
-            nodes(&resident),
-            nodes(&tail)
-        ),
+        &extra,
     );
+    Ok((router, resident, tail))
+}
+
+/// Warms every kernel, captures every graph, replays the block graph once (its first launch
+/// uploads it) and keeps the graphs in the rig.
+fn build_phase(rig: &mut Rig<'_>) -> Res<()> {
+    let k = rig.composed.dims.top_k;
+    // A first launch loads its kernel's module, which a capture refuses: warm every piece first.
+    rig.full(Exec::Eager)?;
+    for m in 0..=k {
+        for piece in [Piece::Router, Piece::Resident(m), Piece::Tail(m)] {
+            rig.piece(Exec::Eager, piece)?;
+        }
+    }
+    rig.settle()?;
+    let before = free_bytes(rig)?;
+    let full = capture_block(rig)?;
+    let token = capture_token(rig)?;
+    let (router, resident, tail) = capture_split(rig)?;
     let start = Instant::now();
     rig.compute.record_timing(&rig.marks[START])?;
     full.launch(&rig.compute)?;
     rig.compute.record_timing(&rig.marks[END])?;
     rig.settle()?;
     let wall = us(start);
+    let vram = before.saturating_sub(free_bytes(rig)?);
+    let extra = format!(",\"wall_us\":{wall:.1},\"vram_bytes_all_graphs_after\":{vram}");
     emit(
         "graph_build",
         "block_first_replay",
         "us",
         &[rig.mark_us(START, END)?],
-        &format!(",\"wall_us\":{wall:.1}"),
+        &extra,
     );
     rig.graphs = Some(Graphs {
         full,
@@ -736,8 +813,9 @@ impl Agreement {
                     let (a, b) = (f64::from(a), f64::from(b));
                     (d + (a - b) * (a - b), n + a * a)
                 });
-        let rel = if want.ids == got.ids {
-            (diff / norm.max(f64::MIN_POSITIVE)).sqrt()
+        let rel = (diff / norm.max(f64::MIN_POSITIVE)).sqrt();
+        let rel = if want.ids == got.ids && !rel.is_nan() {
+            rel
         } else {
             f64::INFINITY
         };
@@ -770,9 +848,10 @@ fn sound(out: &Output, n_expert: usize) -> Res<()> {
     Ok(())
 }
 
-fn check_phase(rig: &mut Rig<'_>) -> Res<()> {
+/// Arm agreement with arm A over the check rows, the repeats and the token graph, and the
+/// number of distinct pick sets the rows chose.
+fn equivalence(rig: &mut Rig<'_>) -> Res<([Agreement; 5], usize)> {
     let (k, n_expert) = (rig.composed.dims.top_k, rig.composed.dims.n_expert);
-    let names = ["graph", "split_eager", "split_graph", "repeat", "token"];
     let mut agree: [Agreement; 5] = Default::default();
     let mut pick_sets: Vec<Vec<i32>> = Vec::new();
     let mut check = |slot: usize, want: &Output, got: Output| -> Res<()> {
@@ -807,11 +886,52 @@ fn check_phase(rig: &mut Rig<'_>) -> Res<()> {
     for _ in 0..REPEATS {
         check(3, &first, rig.run_once(|r| r.full(Exec::Graph))?)?;
     }
-    check(
-        4,
-        &first,
-        rig.run_once(|r| r.graphs()?.token.launch(&r.compute))?,
-    )?;
+    let token = rig.run_once(|r| r.graphs()?.token.launch(&r.compute))?;
+    check(4, &first, token)?;
+    Ok((agree, pick_sets.len()))
+}
+
+/// Reads `experts` staged experts back from slot `slot` on and compares each with the store's
+/// expert `ids(j)`; `Err` on the first difference.
+fn compare_staged(
+    rig: &Rig<'_>,
+    host: &[u8],
+    experts: usize,
+    id: impl Fn(usize) -> usize,
+) -> Res<()> {
+    let mut got = vec![0u8; EXPERT_BYTES];
+    for j in 0..experts {
+        rig.staging
+            .read_at(&rig.compute, j * EXPERT_BYTES, &mut got)?;
+        let want = &host[id(j) * EXPERT_BYTES..(id(j) + 1) * EXPERT_BYTES];
+        if got != want {
+            return Err(fail(format!(
+                "copy check: staging slot {j} is not expert {}",
+                id(j)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The gate's copy and one layer's miss copies (host scheduling, every pick missed) land in the
+/// staging area byte for byte; returns the number of experts compared.
+fn copy_check(rig: &mut Rig<'_>, host: &[u8]) -> Res<usize> {
+    let (k, n) = (rig.composed.dims.top_k, rig.composed.dims.n_expert);
+    rig.gate()?;
+    rig.settle()?;
+    compare_staged(rig, host, GATE_EXPERTS, |j| j)?;
+    let first = rig.next;
+    rig.layer(Exec::Graph, Sched::Host, k, false)?;
+    rig.settle()?;
+    compare_staged(rig, host, k, |j| (first + j) % n)?;
+    Ok(GATE_EXPERTS + k)
+}
+
+fn check_phase(rig: &mut Rig<'_>, host: &[u8]) -> Res<()> {
+    let names = ["graph", "split_eager", "split_graph", "repeat", "token"];
+    let (agree, pick_sets) = equivalence(rig)?;
+    let copies = copy_check(rig, host)?;
     let fields: Vec<String> = names
         .iter()
         .zip(&agree)
@@ -819,70 +939,96 @@ fn check_phase(rig: &mut Rig<'_>) -> Res<()> {
         .collect();
     println!(
         "RESBENCH {{\"phase\":\"graph_check\",\"case\":\"equivalence\",\"rows\":{CHECK_ROWS},\
-         \"distinct_pick_sets\":{},{}}}",
-        pick_sets.len(),
+         \"distinct_pick_sets\":{pick_sets},\"copies_checked\":{copies},{}}}",
         fields.join(",")
     );
     if let Some((name, a)) = names
         .iter()
         .zip(&agree)
-        .find(|(_, a)| a.worst.is_nan() || a.worst > CHECK_LIMIT)
+        .find(|(_, a)| a.worst > CHECK_LIMIT)
     {
         return Err(fail(format!(
             "graph check: {name} is {:e} from arm A (limit {CHECK_LIMIT:e})",
             a.worst
         )));
     }
+    if pick_sets < 2 {
+        return Err(fail("graph check: every row picked the same experts"));
+    }
     Ok(())
+}
+
+/// One rep of one block: device interval, host queue time, wall time, and (gated) whether the
+/// host was still queueing when the gate opened.
+struct BlockRep {
+    device: f64,
+    queue: f64,
+    wall: f64,
+    late: bool,
+}
+
+fn block_rep(rig: &mut Rig<'_>, exec: Exec, gated: bool) -> Res<BlockRep> {
+    let start = Instant::now();
+    let opened_from = if gated { Some(rig.gate()?) } else { None };
+    rig.compute.record_timing(&rig.marks[START])?;
+    let queue = Instant::now();
+    rig.full(exec)?;
+    let queued = Instant::now();
+    rig.compute.record_timing(&rig.marks[END])?;
+    rig.settle()?;
+    let wall = us(start);
+    let late = match opened_from {
+        Some(gate) => {
+            let since_gate = queued.duration_since(gate).as_secs_f64() * 1e6;
+            since_gate >= rig.mark_us(COPY0, COPY1)?
+        }
+        None => false,
+    };
+    Ok(BlockRep {
+        device: rig.mark_us(START, END)?,
+        queue: queued.duration_since(queue).as_secs_f64() * 1e6,
+        wall,
+        late,
+    })
 }
 
 fn block_phase(rig: &mut Rig<'_>) -> Res<()> {
     for exec in [Exec::Eager, Exec::Graph] {
         for gated in [false, true] {
-            let (mut device, mut queued, mut wall, mut late) =
-                (Vec::new(), Vec::new(), Vec::new(), 0);
-            for rep in 0..WARM + BLOCK_REPS {
-                let start = Instant::now();
-                if gated {
-                    rig.gate()?;
-                }
-                rig.compute.record_timing(&rig.marks[START])?;
-                let queue = Instant::now();
-                rig.full(exec)?;
-                let (queue, issued) = (us(queue), us(start));
-                rig.compute.record_timing(&rig.marks[END])?;
-                rig.settle()?;
-                if rep < WARM {
-                    continue;
-                }
-                if gated && issued >= rig.mark_us(COPY0, COPY1)? {
-                    late += 1;
-                }
-                device.push(rig.mark_us(START, END)?);
-                queued.push(queue);
-                wall.push(us(start));
-            }
+            let reps = (0..WARM + BLOCK_REPS)
+                .map(|_| block_rep(rig, exec, gated))
+                .collect::<Res<Vec<_>>>()?;
+            let kept = &reps[WARM..];
+            let late = kept.iter().filter(|r| r.late).count();
+            let pick = |f: fn(&BlockRep) -> f64| kept.iter().map(f).collect::<Vec<_>>();
             let tag = format!(
                 "{}_{}",
                 exec.tag(),
                 if gated { "gated" } else { "isolated" }
             );
+            let extra = format!(",\"late\":{late}");
             emit(
                 "graph_block",
                 &format!("{tag}_device"),
                 "us",
-                &device,
-                &format!(",\"late\":{late}"),
+                &pick(|r| r.device),
+                &extra,
             );
             emit(
                 "graph_block",
                 &format!("{tag}_host_queue"),
                 "us",
-                &queued,
+                &pick(|r| r.queue),
                 "",
             );
             if !gated {
-                emit("graph_block", &format!("{tag}_wall"), "us", &wall, "");
+                emit(
+                    "graph_block",
+                    &format!("{tag}_wall"),
+                    "us",
+                    &pick(|r| r.wall),
+                    "",
+                );
             }
         }
     }
@@ -1053,7 +1199,7 @@ fn trace_phase(rig: &mut Rig<'_>, traces: &Traces) -> Res<()> {
     let resident = vec![vec![0usize; LAYERS]; tokens];
     let runs: [(Exec, &[Sched]); 2] = [
         (Exec::Graph, &[Sched::Host, Sched::Device]),
-        (Exec::Eager, &[Sched::Device]),
+        (Exec::Eager, &[Sched::Host, Sched::Device]),
     ];
     for (exec, scheds) in runs {
         let tag = format!("{}_resident", exec.tag());
@@ -1138,13 +1284,12 @@ fn run() -> Res<()> {
     let block = resolve_block(ctx, &weights, layer, moe)?;
     let mut pinned = ctx.pinned_buf(host.len())?;
     pinned.write(0, &host)?;
-    drop(host);
     let mut rig = Rig {
         graphs: None,
         ctx,
         block: &block,
         composed: Composed {
-            parts: Parts::resolve(&weights, layer)?,
+            parts: Parts::resolve(&weights, layer, &moe)?,
             bufs: block.bufs()?,
             dims: moe,
         },
@@ -1160,8 +1305,9 @@ fn run() -> Res<()> {
     };
     build_phase(&mut rig)?;
     if want("check") {
-        check_phase(&mut rig)?;
+        check_phase(&mut rig, &host)?;
     }
+    drop(host);
     if want("block") {
         block_phase(&mut rig)?;
     }
