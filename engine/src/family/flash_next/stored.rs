@@ -59,7 +59,8 @@ fn whole_with_len(ckpt: &StreamedCheckpoint, key: &str, len: usize) -> Result<Te
     }
 }
 
-/// Reads a BF16 or F32 tensor of `len` elements as host f32 values.
+/// Reads a BF16, F16 or F32 tensor of `len` elements as host f32 values (the EXL3 pack stores
+/// the router and the shared-expert gate in F16).
 pub(crate) fn host_f32(
     ckpt: &StreamedCheckpoint,
     key: &str,
@@ -75,6 +76,12 @@ pub(crate) fn host_f32(
             .0
             .iter()
             .map(|&pair| f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16))
+            .collect()),
+        Dtype::F16 => Ok(bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| half::f16::from_bits(u16::from_le_bytes(pair)).to_f32())
             .collect()),
         Dtype::F32 => Ok(bytes
             .as_chunks::<4>()
@@ -869,6 +876,18 @@ mod tests {
         ]);
         let w = packed(&ckpt, "t", spec4(), 3, 32).unwrap();
         assert_eq!(w.logical_shape(), [3, 32]);
+    }
+
+    #[test]
+    fn host_f32_converts_f16() {
+        // 1.0, -2.0, 0.5 and the smallest subnormal 2^-24, exact in F32.
+        let bytes = [0x3c00u16, 0xc000, 0x3800, 0x0001]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let ckpt = checkpoint(&[("h", "F16", vec![4], bytes)]);
+        let values = host_f32(&ckpt, "h", 4).unwrap();
+        assert_eq!(values, [1.0, -2.0, 0.5, 2f32.powi(-24)]);
     }
 
     #[test]
