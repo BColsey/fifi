@@ -12,8 +12,9 @@
 //! Phases:
 //! - pinned: page-locked allocation (with its zeroing) and the change in `MemAvailable`, and one
 //!   expert copied from ordinary memory against one copied from page-locked memory;
-//! - h2d_single: one expert per copy, device interval and host wall time, the first copy of each
-//!   expert (cold) and a repeat (warm);
+//! - h2d_single: one expert per copy, device interval and host wall time; cold is the first copy
+//!   of each of 256 experts in this process (after throwaway copies of other experts took the
+//!   one-time copy setup), warm is a second pass over the same 256 in the same order;
 //! - h2d_batch: k experts copied back to back, k from 1 to 48, and runs of 64 adjacent experts as
 //!   one copy against 64 copies;
 //! - cpu: the AVX-512 EXL3 kernel on 1, 2, 4 and 10 real experts at 1, 6, 8 and 12 threads, cold
@@ -27,15 +28,21 @@
 //!   answered at once, with misses computed by the CPU kernel, and with the GPU block between the
 //!   two kernels; plus a synchronous id read-back, a slot-table row write and the host bookkeeping
 //!   of a per-layer LRU;
-//! - prefill_ring: 135, 300 and 328 experts streamed through a two-half ring of 64 slots, alone and
-//!   behind GPU work, and a whole 328-expert set as 64-expert copies.
+//! - prefill_ring: 135, 300 and 328 experts copied one per copy into a single 128-slot device ring
+//!   that no kernel reads (the copy side of streaming only), alone and while 40 queued GPU blocks
+//!   run on the compute stream, and a whole 328-expert set as 64-expert copies.
+//!
+//! What the numbers leave out: the device intervals of gpu_pass, overlap and handoff time eager
+//! launches, so they include the host's launch gaps (production decode would replay a captured
+//! graph); and CPU calls run back to back, so the kernel's spin-then-park workers (500 us spin)
+//! stay awake and the cost of waking parked workers is not measured.
 //!
 //! The mailbox carries at most 8 misses (the tiered kernels' limit, kept); Flash-Next picks 10. Run
 //! only inside an exclusive GPU window: the numbers are timings.
 
 use std::{
     path::Path,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -103,13 +110,17 @@ fn emit(phase: &str, case: &str, unit: &str, samples: &[f64], extra: &str) {
     );
 }
 
-fn mem_available_gib() -> f64 {
+/// `MemAvailable` in GiB as a JSON number, `null` when `/proc/meminfo` cannot be read.
+fn mem_available_gib() -> String {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     text.lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kib| kib.parse::<f64>().ok())
-        .map_or(f64::NAN, |kib| kib / 1_048_576.0)
+        .map_or_else(
+            || "null".to_owned(),
+            |kib| format!("{:.2}", kib / 1_048_576.0),
+        )
 }
 
 /// A deterministic xorshift for expert choices.
@@ -372,8 +383,8 @@ impl Bench<'_> {
             .copy_from_pinned(&self.transfer, &mut self.pinned, id * EXPERT_BYTES, dst)
     }
 
+    /// Waits for every queued copy; the store may be written again after.
     fn settle(&mut self) -> Res<()> {
-        self.transfer.synchronize()?;
         self.pinned.synchronize(&self.transfer)
     }
 
@@ -396,7 +407,7 @@ impl Bench<'_> {
 
 fn new_cpu(threads: usize) -> Res<ExpertCpu> {
     let isa = Exl3Isa::detect();
-    if !isa.is_supported() || isa != Exl3Isa::Avx512 {
+    if isa != Exl3Isa::Avx512 {
         return Err(fail(
             "the AVX-512 EXL3 kernel is not available on this host",
         ));
@@ -433,8 +444,8 @@ fn pinned_phase(b: &mut Bench<'_>) -> Res<()> {
             "us",
             &[alloc],
             &format!(
-                ",\"free_us\":{free:.1},\"mem_available_before_gib\":{before:.2},\
-                 \"mem_available_after_gib\":{after:.2}"
+                ",\"free_us\":{free:.1},\"mem_available_before_gib\":{before},\
+                 \"mem_available_after_gib\":{after}"
             ),
         );
     }
@@ -469,6 +480,13 @@ fn pinned_phase(b: &mut Bench<'_>) -> Res<()> {
 
 fn h2d_single(b: &mut Bench<'_>) -> Res<()> {
     let order: Vec<usize> = (0..256).map(|i| (i * 149 + 11) % 512).collect();
+    // Throwaway copies of experts outside `order` take the process's one-time copy setup, so
+    // the cold case times only the first copy of each of its experts.
+    let spare: Vec<usize> = (0..512).filter(|id| !order.contains(id)).take(8).collect();
+    for (i, &id) in spare.iter().enumerate() {
+        b.copy(id, i, 1)?;
+        b.settle()?;
+    }
     for (case, rounds) in [("cold_first_copy", 1), ("warm_repeat", 2)] {
         let (mut device, mut wall) = (Vec::new(), Vec::new());
         for round in 0..rounds {
@@ -647,28 +665,36 @@ fn overlap_phase(b: &mut Bench<'_>, block: &Block<'_>) -> Res<()> {
         }
     }
     emit("overlap", "block_with_10_copies_gpu", "us", &gpu, "");
-    // The CPU kernel while experts stream to the device (DRAM shared with the copy engine).
+    // The CPU kernel while experts stream to the device (DRAM shared with the copy engine): a
+    // burst of 192 copies, CPU calls back to back for 25 ms, and only the calls that end within
+    // the burst's device span of the host's queueing start (the copies start after it, so they
+    // were still running) are kept.
     for count in [1usize, 4] {
-        let mut during = Vec::new();
+        let (mut during, mut spans, mut call) = (Vec::new(), Vec::new(), 0);
         for burst in 0..8 {
-            for j in 0..96 {
-                b.copy((burst * 96 + j) % 512, j % 128, 1)?;
+            let start = Instant::now();
+            b.transfer.record_timing(&b.marks[0])?;
+            for j in 0..192 {
+                b.copy((burst * 192 + j) % 512, j % 128, 1)?;
             }
-            for call in 0..10 {
-                during.push(b.cpu_forward(
-                    &cpu,
-                    &cold_ids(burst * 10 + call, count, 512),
-                    &mut out,
-                )?);
+            b.transfer.record_timing(&b.marks[1])?;
+            let mut ends = Vec::new();
+            while us(start) < 25_000.0 {
+                let t = b.cpu_forward(&cpu, &cold_ids(call, count, 512), &mut out)?;
+                ends.push((us(start), t));
+                call += 1;
             }
             b.settle()?;
+            let span = device_us(&b.marks[0], &b.marks[1])?;
+            spans.push(span);
+            during.extend(ends.iter().filter(|(end, _)| *end < span).map(|&(_, t)| t));
         }
         emit(
             "overlap",
             &format!("cpu_m{count}_while_copying"),
             "us",
             &during,
-            "",
+            &format!(",\"burst_span_mean_us\":{:.1}", mean(&spans)),
         );
     }
     Ok(())
@@ -680,9 +706,16 @@ struct Handoff {
     weights: DeviceBuffer,
     slot_row: DeviceBuffer,
     norm_row: DeviceBuffer,
-    /// slot_ids_out, weights_out, log_out, ctrl, word, resid, and two stand-ins that only pass
-    /// the range checks of the request line and the row (the request goes to the mailbox).
-    outs: [DeviceBuffer; 8],
+    slot_ids_out: DeviceBuffer,
+    weights_out: DeviceBuffer,
+    log_out: DeviceBuffer,
+    ctrl: DeviceBuffer,
+    word: DeviceBuffer,
+    resid: DeviceBuffer,
+    /// Pass only the range checks of the request line and the row: the classify publishes both
+    /// into the mailbox instead.
+    unused_req: DeviceBuffer,
+    unused_row: DeviceBuffer,
 }
 
 impl Handoff {
@@ -704,16 +737,14 @@ impl Handoff {
             weights: ctx.upload(&weights)?,
             slot_row: zeros(512 * 4)?,
             norm_row: ctx.upload(&row)?,
-            outs: [
-                zeros(HANDOFF_PICKS * 4)?,
-                zeros(HANDOFF_PICKS * 4)?,
-                zeros(HANDOFF_PICKS * 8)?,
-                zeros(CTRL_BYTES)?,
-                zeros(4)?,
-                zeros(hidden * F32)?,
-                zeros(REQUEST_BYTES)?,
-                zeros(hidden * F32)?,
-            ],
+            slot_ids_out: zeros(HANDOFF_PICKS * 4)?,
+            weights_out: zeros(HANDOFF_PICKS * 4)?,
+            log_out: zeros(HANDOFF_PICKS * 8)?,
+            ctrl: zeros(CTRL_BYTES)?,
+            word: zeros(4)?,
+            resid: zeros(hidden * F32)?,
+            unused_req: zeros(REQUEST_BYTES)?,
+            unused_row: zeros(hidden * F32)?,
         })
     }
 
@@ -730,7 +761,6 @@ impl Handoff {
 
     fn classify_call(&self, hidden: usize) -> Res<ClassifyCall<'_>> {
         let r = whole;
-        let [slot_ids_out, weights_out, log_out, ctrl, word, _, req, row] = &self.outs;
         Ok(ClassifyCall {
             shape: ClassifyShape {
                 n_expert: 512,
@@ -743,14 +773,21 @@ impl Handoff {
             weights: r(&self.weights)?,
             slot_row: r(&self.slot_row)?,
             norm_row: r(&self.norm_row)?,
-            slot_ids_out: r(slot_ids_out)?,
-            weights_out: r(weights_out)?,
-            log_out: r(log_out)?,
-            ctrl: r(ctrl)?,
-            word: r(word)?,
-            mbox_req: r(req)?,
-            mbox_row: r(row)?,
+            slot_ids_out: r(&self.slot_ids_out)?,
+            weights_out: r(&self.weights_out)?,
+            log_out: r(&self.log_out)?,
+            ctrl: r(&self.ctrl)?,
+            word: r(&self.word)?,
+            mbox_req: r(&self.unused_req)?,
+            mbox_row: r(&self.unused_row)?,
         })
+    }
+
+    /// The tiered word; layer 1 never clears it, so any bit set since the rig was made stays.
+    fn word(&self, stream: &DeviceStream) -> Res<i32> {
+        let mut bits = [0u8; 4];
+        self.word.read_at(stream, 0, &mut bits)?;
+        Ok(i32::from_le_bytes(bits))
     }
 }
 
@@ -758,54 +795,155 @@ impl Handoff {
 /// missed experts with the CPU kernel first.
 const SERVE_IMMEDIATE: u8 = 0;
 const SERVE_CPU: u8 = 1;
+const HANDOFF_REPS: usize = 230;
+const HANDOFF_WARMUP: usize = 30;
+
+/// One handoff case: its name, the misses it marks, how the server answers, and whether the GPU
+/// block runs between the classify and the wait-add.
+struct HandoffCase {
+    name: &'static str,
+    misses: usize,
+    serve: u8,
+    behind: bool,
+}
+
+const HANDOFF_CASES: [HandoffCase; 9] = {
+    const fn case(name: &'static str, misses: usize, serve: u8, behind: bool) -> HandoffCase {
+        HandoffCase {
+            name,
+            misses,
+            serve,
+            behind,
+        }
+    }
+    [
+        case("no_miss", 0, SERVE_IMMEDIATE, false),
+        case("miss1_immediate", 1, SERVE_IMMEDIATE, false),
+        case("miss8_immediate", 8, SERVE_IMMEDIATE, false),
+        case("miss1_cpu", 1, SERVE_CPU, false),
+        case("miss2_cpu", 2, SERVE_CPU, false),
+        case("miss4_cpu", 4, SERVE_CPU, false),
+        case("miss1_cpu_behind_block", 1, SERVE_CPU, true),
+        case("miss2_cpu_behind_block", 2, SERVE_CPU, true),
+        case("miss4_cpu_behind_block", 4, SERVE_CPU, true),
+    ]
+};
+
+/// What the bench thread tells the mailbox server about the current case.
+struct ServeState {
+    stop: AtomicBool,
+    mode: AtomicU8,
+    /// Every request of the case must name exactly `Handoff::IDS[..misses]`.
+    misses: AtomicUsize,
+}
+
+/// Sets `stop` when dropped, so the server thread ends even when the bench thread unwinds.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Refuses a request that is not the current case's misses at layer 1; returns its count.
+fn check_request(layer: u32, count: u32, ids: &[i32; 8], misses: usize) -> Res<usize> {
+    let count = count as usize;
+    if count > HANDOFF_PICKS
+        || count != misses
+        || layer != 1
+        || ids[..count] != Handoff::IDS[..misses]
+    {
+        return Err(fail(format!(
+            "an unexpected mailbox request: layer {layer}, count {count}, ids {ids:?}; the case \
+             marks {misses} misses at layer 1"
+        )));
+    }
+    Ok(count)
+}
+
+/// The CPU kernel's partial for the missed experts `ids` (unit weights) of `row`.
+fn cpu_partial(
+    cpu: &ExpertCpu,
+    (host, layout): (&[u8], Layout),
+    ids: &[i32],
+    row: &[f32],
+    partial: &mut [f32],
+) -> Res<()> {
+    let picks = ids
+        .iter()
+        .map(|&id| {
+            let at = id as usize * EXPERT_BYTES;
+            Ok(ExpertPick {
+                expert: layout.view(&host[at..at + EXPERT_BYTES])?,
+                weight: 1.0,
+            })
+        })
+        .collect::<Res<Vec<_>>>()?;
+    cpu.forward(row, &picks, partial)
+}
+
+/// Device microseconds of `HANDOFF_REPS` round trips (`round` queues one), the warm-up dropped,
+/// and the tiered word after them. Stops at the first sign of failure: the server thread ended,
+/// or a word bit set (read every 16 rounds, outside the timed interval).
+fn time_handoff(
+    b: &Bench<'_>,
+    rig: &Handoff,
+    round: &dyn Fn() -> Res<()>,
+    server_ended: &dyn Fn() -> bool,
+) -> Res<(Vec<f64>, i32)> {
+    let mut device = Vec::new();
+    for rep in 0..HANDOFF_REPS {
+        b.compute.record_timing(&b.marks[2])?;
+        round()?;
+        b.compute.record_timing(&b.marks[3])?;
+        b.compute.synchronize()?;
+        if server_ended() {
+            return Err(fail("the mailbox server ended during a case"));
+        }
+        if rep >= HANDOFF_WARMUP {
+            device.push(device_us(&b.marks[2], &b.marks[3])?);
+        }
+        if rep % 16 == 15 {
+            let bits = rig.word(&b.compute)?;
+            if bits != 0 {
+                return Ok((device, bits));
+            }
+        }
+    }
+    Ok((device, rig.word(&b.compute)?))
+}
 
 fn handoff_phase(b: &Bench<'_>, block: &Block<'_>) -> Res<()> {
     let hidden = b.layout.hidden;
     let rig = Handoff::new(b.ctx, hidden)?;
     let mailbox = b.ctx.mailbox(hidden)?;
     let port = mailbox.port()?;
-    let stop = AtomicBool::new(false);
-    let mode = AtomicU8::new(SERVE_IMMEDIATE);
-    let (host, layout) = (&b.host, b.layout);
-    let cases: [(&str, usize, u8, bool); 9] = [
-        ("no_miss", 0, SERVE_IMMEDIATE, false),
-        ("miss1_immediate", 1, SERVE_IMMEDIATE, false),
-        ("miss8_immediate", 8, SERVE_IMMEDIATE, false),
-        ("miss1_cpu", 1, SERVE_CPU, false),
-        ("miss2_cpu", 2, SERVE_CPU, false),
-        ("miss4_cpu", 4, SERVE_CPU, false),
-        ("miss1_cpu_behind_block", 1, SERVE_CPU, true),
-        ("miss2_cpu_behind_block", 2, SERVE_CPU, true),
-        ("miss4_cpu_behind_block", 4, SERVE_CPU, true),
-    ];
-    let [_, _, _, ctrl, word, resid, _, _] = &rig.outs;
+    let state = ServeState {
+        stop: AtomicBool::new(false),
+        mode: AtomicU8::new(SERVE_IMMEDIATE),
+        misses: AtomicUsize::new(0),
+    };
+    let store = (b.host.as_slice(), b.layout);
     let r = whole;
     std::thread::scope(|scope| -> Res<()> {
+        let _stop = StopOnDrop(&state.stop);
         let server = scope.spawn(|| -> Res<u64> {
             let cpu = new_cpu(6)?;
             let (mut row, mut partial) = (vec![0.0f32; hidden], vec![0.0f32; hidden]);
             let (mut after, mut served) = (0u64, 0u64);
-            while !stop.load(Ordering::Acquire) {
+            while !state.stop.load(Ordering::Acquire) {
                 let Some(request) = port.poll(after) else {
                     std::hint::spin_loop();
                     continue;
                 };
+                let misses = state.misses.load(Ordering::Acquire);
+                let count = check_request(request.layer, request.count, &request.ids, misses)?;
                 if !port.read_row(&mut row) {
                     return Err(fail("the mailbox row could not be read"));
                 }
-                if mode.load(Ordering::Acquire) == SERVE_CPU {
-                    let count = request.count as usize;
-                    let picks = request.ids[..count]
-                        .iter()
-                        .map(|&id| {
-                            let at = id as usize * EXPERT_BYTES;
-                            Ok(ExpertPick {
-                                expert: layout.view(&host[at..at + EXPERT_BYTES])?,
-                                weight: 1.0,
-                            })
-                        })
-                        .collect::<Res<Vec<_>>>()?;
-                    cpu.forward(&row, &picks, &mut partial)?;
+                if state.mode.load(Ordering::Acquire) == SERVE_CPU {
+                    cpu_partial(&cpu, store, &request.ids[..count], &row, &mut partial)?;
                 } else {
                     partial.fill(0.0);
                 }
@@ -818,56 +956,71 @@ fn handoff_phase(b: &Bench<'_>, block: &Block<'_>) -> Res<()> {
             Ok(served)
         });
         let rounds = || -> Res<()> {
-            for &(case, misses, serve, behind) in &cases {
-                rig.set_misses(&b.compute, misses)?;
-                mode.store(serve, Ordering::Release);
-                let mut device = Vec::new();
-                for rep in 0..230 {
-                    b.compute.record_timing(&b.marks[2])?;
-                    b.ctx.tiered_classify_to_mailbox(
-                        &b.compute,
-                        rig.classify_call(hidden)?,
-                        &mailbox,
-                    )?;
-                    if behind {
+            for case in &HANDOFF_CASES {
+                rig.set_misses(&b.compute, case.misses)?;
+                state.misses.store(case.misses, Ordering::Release);
+                state.mode.store(case.serve, Ordering::Release);
+                let round = || -> Res<()> {
+                    let call = rig.classify_call(hidden)?;
+                    b.ctx
+                        .tiered_classify_to_mailbox(&b.compute, call, &mailbox)?;
+                    if case.behind {
                         block.queue(b.ctx, &b.compute)?;
                     }
                     b.ctx.tiered_wait_add(
                         &b.compute,
                         WaitAddCall {
                             hidden,
-                            ctrl: r(ctrl)?,
-                            word: r(word)?,
-                            resid: r(resid)?,
+                            ctrl: r(&rig.ctrl)?,
+                            word: r(&rig.word)?,
+                            resid: r(&rig.resid)?,
                             mailbox: &mailbox,
                             timeout_ns: 2_000_000_000,
                         },
-                    )?;
-                    b.compute.record_timing(&b.marks[3])?;
-                    b.compute.synchronize()?;
-                    if rep >= 30 {
-                        device.push(device_us(&b.marks[2], &b.marks[3])?);
-                    }
-                }
-                let mut bits = [0u8; 4];
-                word.read_at(&b.compute, 0, &mut bits)?;
-                let bits = i32::from_le_bytes(bits);
-                emit("handoff", case, "us", &device, &format!(",\"word\":{bits}"));
-                if bits & 0b110 != 0 {
-                    return Err(fail(format!("{case}: the tiered word reports {bits}")));
+                    )
+                };
+                let (device, bits) = time_handoff(b, &rig, &round, &|| server.is_finished())?;
+                emit(
+                    "handoff",
+                    case.name,
+                    "us",
+                    &device,
+                    &format!(",\"word\":{bits}"),
+                );
+                if bits != 0 {
+                    return Err(fail(format!(
+                        "{}: the tiered word reports {bits}",
+                        case.name
+                    )));
                 }
             }
             Ok(())
         };
         let result = rounds();
-        stop.store(true, Ordering::Release);
+        state.stop.store(true, Ordering::Release);
         let served = server
             .join()
-            .map_err(|_| fail("the mailbox server panicked"))??;
-        println!("RESBENCH {{\"phase\":\"handoff\",\"case\":\"served\",\"requests\":{served}}}");
-        result
-    })?;
-    host_costs(b)
+            .map_err(|_| fail("the mailbox server panicked"))?;
+        // The bench-side error names the case; the server's names the request it refused.
+        let served = match (result, served) {
+            (Err(bench), Err(server)) => {
+                return Err(fail(format!("{bench:?}; the mailbox server: {server:?}")));
+            }
+            (Err(bench), Ok(_)) => return Err(bench),
+            (Ok(()), served) => served?,
+        };
+        let expected = HANDOFF_CASES.iter().filter(|c| c.misses > 0).count() * HANDOFF_REPS;
+        println!(
+            "RESBENCH {{\"phase\":\"handoff\",\"case\":\"served\",\"requests\":{served},\
+             \"expected\":{expected}}}"
+        );
+        if served != expected as u64 {
+            return Err(fail(format!(
+                "the mailbox server answered {served} requests, expected {expected}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// The host-side costs around a residency decision: a synchronous read-back of 10 ids, a
@@ -891,15 +1044,15 @@ fn host_costs(b: &Bench<'_>) -> Res<()> {
     }
     emit("handoff", "sync_readback_40b", "us", &read, "");
     emit("handoff", "slot_row_write_2kb", "us", &write, "");
+    let steps = 200_000usize;
+    let mut rng = Rng(3);
+    let all_picks: Vec<usize> = (0..steps).flat_map(|_| rng.distinct(10, 512)).collect();
     let mut last = vec![-1i64; 512];
     let mut resident = vec![false; 512];
-    let (mut count, mut rng) = (0usize, Rng(3));
-    let steps = 200_000usize;
+    let (mut count, mut misses) = (0usize, 0usize);
     let start = Instant::now();
-    let mut misses = 0usize;
-    for step in 0..steps {
-        let picks = rng.distinct(10, 512);
-        for &e in &picks {
+    for (step, picks) in all_picks.as_chunks::<10>().0.iter().enumerate() {
+        for &e in picks {
             if !resident[e] {
                 misses += 1;
                 if count == 184 {
@@ -981,7 +1134,10 @@ fn prefill_ring(b: &mut Bench<'_>, block: &Block<'_>) -> Res<()> {
         "stream328_as_64_expert_copies",
         "us",
         &device,
-        "",
+        &format!(
+            ",\"gb_per_s\":{:.2}",
+            328.0 * EXPERT_BYTES as f64 / (mean(&device) * 1e3)
+        ),
     );
     Ok(())
 }
@@ -1018,7 +1174,7 @@ fn run() -> Res<()> {
     let (layout, host) = read_store(&checkpoint, layer, &moe)?;
     println!(
         "RESBENCH {{\"phase\":\"setup\",\"case\":\"read_store\",\"seconds\":{:.1},\"bytes\":{},\
-         \"words\":{},\"mem_available_gib\":{:.2}}}",
+         \"words\":{},\"mem_available_gib\":{}}}",
         start.elapsed().as_secs_f64(),
         host.len(),
         layout.words,
@@ -1046,7 +1202,7 @@ fn run() -> Res<()> {
     pinned.write(0, &host)?;
     println!(
         "RESBENCH {{\"phase\":\"setup\",\"case\":\"pinned_store\",\"bytes\":{},\"alloc_zeroed_s\":{alloc:.3},\
-         \"fill_s\":{:.3},\"mem_available_gib\":{:.2}}}",
+         \"fill_s\":{:.3},\"mem_available_gib\":{}}}",
         host.len(),
         start.elapsed().as_secs_f64(),
         mem_available_gib()
@@ -1074,6 +1230,7 @@ fn run() -> Res<()> {
     gpu_pass(&mut bench, &block)?;
     overlap_phase(&mut bench, &block)?;
     handoff_phase(&bench, &block)?;
+    host_costs(&bench)?;
     prefill_ring(&mut bench, &block)?;
     Ok(())
 }
