@@ -79,6 +79,7 @@ fn checkpoint(message: String) -> EngError {
 /// Inspect `model_dir`; tokenizer presence is read from `tokenizer_dir`
 /// (pass the same path twice for the usual one-directory layout).
 pub fn inspect(model_dir: &Path, tokenizer_dir: &Path) -> Result<ModelInspection, EngError> {
+    crate::storage_guard::require_local(model_dir, "model weights")?;
     if !model_dir.is_dir() {
         return Err(checkpoint(format!(
             "{} is not a directory",

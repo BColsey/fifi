@@ -17,6 +17,7 @@ use crate::family::nemotron35::factory as nemotron_factory;
 use crate::family::qwen36::factory as q36_factory;
 use crate::family::sampler::SamplingDefaults;
 use crate::sched::worker::{Engine, EngineNote, ReadyNote, ShutdownReport};
+use crate::storage_guard;
 use crate::tokenizer::TokenizerBundle;
 use axum::serve::ListenerExt;
 use std::future::Future;
@@ -176,6 +177,14 @@ fn start_engines(file: &Config) -> Result<(Vec<Engine>, Vec<EngineEntry>), Start
             StartupError(format!(
                 "engine {} failed to start: family {} has no starter in this build",
                 config.id, config.family
+            ))
+        })?;
+        // Weights must be local; refuse before the first read of the directory.
+        storage_guard::require_local(&config.model_dir, "model weights").map_err(|error| {
+            StartupError(format!(
+                "engine {} failed to start: {}",
+                config.id,
+                describe(&error)
             ))
         })?;
         let loaded = SamplingDefaults::from_model_dir(&config.model_dir).map_err(|error| {

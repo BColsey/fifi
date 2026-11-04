@@ -60,6 +60,7 @@ impl GgufWeights {
         limits: GgufLimits,
         header_sha256: Option<&str>,
     ) -> Result<Self, EngError> {
+        crate::storage_guard::require_local(path, "model weights")?;
         let file = File::open(path).map_err(|e| io_error(path, &e))?;
         let file_len = current_len(&file)?;
         let header = GgufHeader::parse(

@@ -21,6 +21,7 @@ pub(crate) struct Checkpoint {
 impl Checkpoint {
     /// Checks bounded configuration, index, and shard headers without reading payloads.
     pub(crate) fn open(dir: &Path) -> Result<Self, EngError> {
+        crate::storage_guard::require_local(dir, "model weights")?;
         let model_config = read_metadata(&dir.join("config.json"), CONFIG_LIMIT)?;
         let config = Config::from_json(&model_config)?;
         let index = read_metadata(&dir.join("model.safetensors.index.json"), INDEX_LIMIT)?;
