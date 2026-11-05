@@ -688,5 +688,12 @@ mod layout_tests {
     }
 }
 
+/// Host-only capture-topology proof (qualification/flint-p0p4, P1 of
+/// DESIGN.md §0.1): drives `run` against a recording double, so it needs no
+/// device even under the native-cuda feature and stays ungated by it.
+#[cfg(test)]
+#[path = "routed/topology_tests.rs"]
+mod topology_tests;
+
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod tests;

@@ -279,3 +279,57 @@ fn experts_are_staged_and_remembered_by_the_last_row_that_picked_them() {
     let staged: Vec<u16> = recorder.rounds[0].iter().map(|&id| id as u16).collect();
     assert_eq!(staged, order);
 }
+
+#[test]
+fn rows1_plan_structure_is_invariant_under_the_routers_choices() {
+    // Decode shape: six distinct experts, one row each. The plan is one
+    // round of six single-row visits in expert-sorted order, whatever the
+    // router chose — the capture-relevant structure (round count, visit
+    // count, tile shapes) carries no route information.
+    let reference_ids = routing(1, 1);
+    let (_, reference_plan) = plan_of(&reference_ids, 256);
+    let reference_ids_sorted: Vec<usize> = {
+        let mut sorted: Vec<usize> = reference_ids.iter().map(|&id| id as usize).collect();
+        sorted.sort_unstable();
+        sorted
+    };
+    assert_eq!(reference_plan.pairs, TOP_K);
+    assert_eq!(reference_plan.rounds.len(), 1);
+    let visits = &reference_plan.rounds[0];
+    assert_eq!(visits.len(), TOP_K);
+    assert_eq!(
+        visits.iter().map(|visit| visit.id).collect::<Vec<_>>(),
+        reference_ids_sorted
+    );
+    for (index, visit) in visits.iter().enumerate() {
+        // Each expert owns one row at its position in the sorted pair order.
+        assert_eq!(
+            visit.tiles,
+            [Tile {
+                first: index,
+                rows: 1
+            }]
+        );
+    }
+    let mask = |plan: &LayerPlan| -> Vec<Vec<Vec<Tile>>> {
+        plan.rounds
+            .iter()
+            .map(|round| round.iter().map(|visit| visit.tiles.clone()).collect())
+            .collect()
+    };
+    for seed in 2..=32u64 {
+        let ids = routing(1, seed);
+        let (_, plan) = plan_of(&ids, 256);
+        // Same structure, only the ids moved.
+        assert_eq!(mask(&plan), mask(&reference_plan), "seed {seed}");
+    }
+    // Round count follows capacity, not the route: the minimal all-resident
+    // capacity is six, and three slots split the same six visits in two
+    // rounds of three.
+    let ids = routing(1, 4);
+    let (_, six) = plan_of(&ids, 6);
+    assert_eq!(six.rounds.len(), 1);
+    let (_, three) = plan_of(&ids, 3);
+    assert_eq!(three.rounds.len(), 2);
+    assert!(three.rounds.iter().all(|round| round.len() == 3));
+}
