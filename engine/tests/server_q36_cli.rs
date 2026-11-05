@@ -197,17 +197,29 @@ fn a_prefill_reserve_without_a_budget_is_refused_by_name_on_the_cuda_arm() {
     );
 }
 
+/// A budget without an explicit reserve is a VALID config: settings derive the reserve (the
+/// derive design replaced the old pair requirement), so startup passes the allocator checks and
+/// stops at the next step, which depends on the build exactly like the cache-limit twin above:
+/// the backend check without a native backend, the tokenizer load on the Mac build. The CUDA
+/// twin below keeps the named-refusal premise where it is true by design.
 #[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
 #[test]
-fn a_prefill_budget_without_a_reserve_stops_startup_and_names_both_keys() {
+fn a_prefill_budget_without_a_reserve_passes_the_allocator_checks() {
     let options = serde_json::json!({"cache_limit_bytes": 1024, "prefill_budget_bytes": 5});
     let output = run(&config("127.0.0.1:0", Some(options)), &[]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("prefill_budget_bytes needs prefill_session_reserve_bytes"),
-        "{}",
-        stderr(&output)
-    );
+    let text = stderr(&output);
+    assert!(text.contains("engine q36 failed to start"), "{text}");
+    // The derive design accepts a budget-only config: no allocator key is blamed.
+    assert!(!text.contains("prefill_budget_bytes"), "{text}");
+    assert!(!text.contains("prefill_session_reserve_bytes"), "{text}");
+    #[cfg(not(any(
+        all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
+        all(feature = "native-cuda", target_os = "linux")
+    )))]
+    assert!(text.contains("no Q36 backend"), "{text}");
+    #[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+    assert!(text.contains("tokenizer.json"), "{text}");
 }
 
 /// The CUDA twin: a budget alone is refused by the same named rule.
