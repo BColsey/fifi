@@ -11,6 +11,7 @@ pub mod kernels;
 pub mod memory;
 pub mod sched;
 pub mod server;
+pub mod storage_guard;
 pub mod tensor;
 #[cfg(test)]
 mod test_paths;

@@ -22,7 +22,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | --- | --- | --- |
 | `id` | yes | Engine name. Clients can select the engine with it (`x-engine`). |
 | `family` | yes | The model family; see [Models](models.md). |
-| `model_dir` | yes | Directory of the checkpoint. |
+| `model_dir` | yes | Directory of the checkpoint. It must be on local storage; see [Local storage](#local-storage). |
 | `tokenizer_dir` | yes | Directory with `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. For Qwen3.6, Flint and Nemotron, startup checks each file against the hashes of the tested release. |
 | `model` | no | The name clients send in the `model` field. Defaults to the family name. |
 | `qwen36` | no | [Qwen3.6 options](#qwen36). |
@@ -33,6 +33,10 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | `flash_next` | no | Options of `qwen3_8_flash_next`, which is not validated end to end. |
 | `think_replay` | no | `false` drops the reasoning that clients resend with earlier assistant turns from the prompt, for this engine only. `true` is refused; leave the key out for the default. |
 | `notice_toolwrap` | no | `false` renders system messages that follow an assistant turn as plain system text, for this engine only. `true` is refused. See `ENGINESRV_NOTICE_TOOLWRAP`. |
+
+### Local storage
+
+Model weights must be on local storage; network storage is not a tier or a fallback. The server refuses to start an engine whose `model_dir` is on a network filesystem (NFS, SMB, AFP, WebDAV, sshfs, Ceph and similar), or on an automount that has mounted nothing. The loaders also refuse a shard file that is a symlink into such a mount, because a symlink counts as where it points. The error reads `model weights must be on local storage, but <path> is on a <type> filesystem`. If the filesystem cannot be determined, the error reads `cannot confirm that model weights at <path> is on local storage` and the engine does not start. The tokenizer directory holds only small text files and is not checked.
 
 ## `qwen36`
 

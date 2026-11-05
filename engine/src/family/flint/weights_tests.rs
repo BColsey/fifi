@@ -228,6 +228,44 @@ fn sparse_checkpoint(change: impl FnOnce(&mut [Vec<Entry>])) -> tempfile::TempDi
     root
 }
 
+// Fails if `FlintCheckpoint::open` stops guarding the root directory.
+#[cfg(target_os = "linux")]
+#[test]
+fn open_refuses_a_root_on_a_network_mount() {
+    let root = sparse_checkpoint(|_| {});
+    let refused = crate::storage_guard::seam::with_nfs_at(root.path(), || {
+        FlintCheckpoint::open(root.path()).err().expect("refused")
+    });
+    assert!(
+        refused.describe().contains("local storage"),
+        "{}",
+        refused.describe()
+    );
+    assert!(FlintCheckpoint::open(root.path()).is_ok());
+}
+
+// Fails if `FlintCheckpoint::open` checks only the root and not each shard:
+// the root is local and one shard is a link to a file on the network mount.
+#[cfg(target_os = "linux")]
+#[test]
+fn open_refuses_a_shard_linked_into_a_network_mount() {
+    let root = sparse_checkpoint(|_| {});
+    let share = tempfile::tempdir().unwrap();
+    let shard = root.path().join("model-00002.safetensors");
+    let moved = share.path().join("model-00002.safetensors");
+    std::fs::rename(&shard, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &shard).unwrap();
+    let refused = crate::storage_guard::seam::with_nfs_at(share.path(), || {
+        FlintCheckpoint::open(root.path()).err().expect("refused")
+    });
+    assert!(
+        refused.describe().contains("local storage"),
+        "{}",
+        refused.describe()
+    );
+    assert!(FlintCheckpoint::open(root.path()).is_ok());
+}
+
 #[test]
 fn open_checks_complete_profile_without_reading_payloads() {
     let root = sparse_checkpoint(|_| {});
