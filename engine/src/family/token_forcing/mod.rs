@@ -15,7 +15,8 @@
 //! - the reference: generation on the scorer's own numeric path (SpecPilot's autoregressive
 //!   run). Its mismatch rate is near zero by construction;
 //! - the baseline: a second legal execution of the accepted build that differs from the scorer
-//!   in reduction order only, such as another prefill chunk size (SpecPilot's stock system);
+//!   in reduction order only: another prefill chunk size, the one setting it may change
+//!   (SpecPilot's stock system);
 //! - the candidate: the execution under test.
 //!
 //! The near-tie threshold `delta` is the largest log-probability gap between the reference's
@@ -23,8 +24,8 @@
 //! (`gate::calibrate`, which states the contract). When they never depart, the legal margin
 //! measured is zero and delta takes 1/8, the strictest value; token identity says nothing about
 //! the executions' logits, and delta then claims nothing about them. The reference and the
-//! baseline must be executions of the scorer's build, and the reference must match its scorer
-//! at every token. The baseline is the comparison of both rules, because a lossless
+//! baseline must be executions of the scorer's build and settings, recorded from the settings
+//! their executors were opened with, and the reference must match its scorer at every token. The baseline is the comparison of both rules, because a lossless
 //! candidate's mismatches are near ties of the same kind. A candidate is rejected when
 //!
 //! - its mismatch rate exceeds the baseline's by more than 0.5 points at one-sided 95%

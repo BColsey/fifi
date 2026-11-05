@@ -94,7 +94,8 @@ use super::super::{factory, park_identity::pack_fingerprint};
 use super::*;
 use crate::family::token_forcing::{
     gate::{
-        Audit, ExecutionIdentity, GateConfig, Generation, Report, ScoredSystem, Verdict, ids_sha256,
+        Audit, EXECUTABLE_SHA256, ExecutionIdentity, GENERATION_PATH, GateConfig, Generation,
+        PREFILL_CHUNK_SIZE, Report, ScoredSystem, Verdict, ids_sha256,
     },
     probe::{EVENT_FLOOR, ProbeFile, ProbeRow, ProbeSettings, check_probe, probe_request},
     run::{
@@ -238,34 +239,76 @@ impl Plan {
         )
         .expect("the qualification executor (loud by design)")
     }
+}
 
-    fn identity(&self, label: &str, chunk: u32, path: &str) -> ExecutionIdentity {
-        let fingerprint = pack_fingerprint(&self.root).expect("the pack fingerprint");
-        let env = |name: &str| std::env::var(name).unwrap_or_default();
-        let profile = BTreeMap::from([
-            ("kv_profile".to_owned(), self.kv.clone()),
-            ("prefill_chunk_size".to_owned(), chunk.to_string()),
-            ("context_limit".to_owned(), self.context_limit().to_string()),
-            ("generation_path".to_owned(), path.to_owned()),
-            (
-                "numeric_env".to_owned(),
-                format!("{:?}", frozen_prefix_env()),
-            ),
-            (
-                "FIFI_EXL3_LAYER_MAJOR".to_owned(),
-                env("FIFI_EXL3_LAYER_MAJOR"),
-            ),
-            (SINGLE_GATHER_VAR.to_owned(), env(SINGLE_GATHER_VAR)),
-            ("executable_sha256".to_owned(), executable_sha256()),
-        ]);
-        ExecutionIdentity {
-            label: label.to_owned(),
-            family: "flint-cuda".to_owned(),
-            weights: hex(&fingerprint),
-            weight_format: "exl3".to_owned(),
-            profile,
-        }
+/// The identity of one execution of `engine`, with its settings read from the executor (see
+/// [`effective_profile`]) and `path` naming how it generated.
+fn identity(label: &str, engine: &FlintExecutor, path: &str) -> ExecutionIdentity {
+    let fingerprint = pack_fingerprint(&engine.root).expect("the pack fingerprint");
+    let mut profile = effective_profile(engine);
+    profile.insert(GENERATION_PATH.to_owned(), path.to_owned());
+    ExecutionIdentity {
+        label: label.to_owned(),
+        family: "flint-cuda".to_owned(),
+        weights: hex(&fingerprint),
+        weight_format: "exl3".to_owned(),
+        profile,
     }
+}
+
+/// The scorer's identity: `engine`'s eager path reading each output teacher-forced.
+fn scorer_identity(engine: &FlintExecutor) -> ExecutionIdentity {
+    identity("scorer", engine, "eager-teacher-forced")
+}
+
+/// The settings `engine` runs with, read from the executor rather than from the plan or the
+/// environment, so that a profile cannot claim settings the run did not use: the options it
+/// was opened with, the effective selectors its numeric path binds (those of its prefix
+/// fingerprint, with its own layer-major mode), and the resolved kernel switches of its load
+/// line. `gate::check_builds` compares these entries: the baseline may differ from the scorer
+/// in the prefill chunk size only, so a q8 baseline beside an f16 scorer is refused.
+fn effective_profile(engine: &FlintExecutor) -> BTreeMap<String, String> {
+    let options = &engine.options;
+    let numeric_env = CudaPrefixEnv {
+        layer_major: engine.layer_mode,
+        ..frozen_prefix_env()
+    };
+    let switches = [
+        resolved_switch_suffix(
+            packed_pointwise_enabled(),
+            grouped_gather_enabled(),
+            resolved_q8_tiled(&options.kv_profile, q8_tiled_armed),
+            kv_device_f16_armed(),
+        ),
+        fused_publish_suffix(fused_publish_armed()),
+        engine.ctx.single_gather_suffix(),
+        format!(
+            " token_health={} device_picks={} layer_major_rows={:?}",
+            token_health_armed(),
+            device_picks_armed(),
+            engine.layer_major
+        ),
+    ]
+    .concat();
+    let cpu_moe = format!(
+        "offload_layers={} split_experts={} threads={}",
+        options.cpu_moe_offload_layers, options.cpu_moe_split_experts, options.cpu_moe_threads
+    );
+    BTreeMap::from([
+        ("kv_profile".to_owned(), options.kv_profile.clone()),
+        (
+            PREFILL_CHUNK_SIZE.to_owned(),
+            engine.prefill_chunk_size.to_string(),
+        ),
+        ("context_limit".to_owned(), engine.context_limit.to_string()),
+        ("cpu_moe".to_owned(), cpu_moe),
+        ("numeric_env".to_owned(), format!("{numeric_env:?}")),
+        (
+            "kernel_switches".to_owned(),
+            switches.trim_start().to_owned(),
+        ),
+        (EXECUTABLE_SHA256.to_owned(), executable_sha256()),
+    ])
 }
 
 /// The last tokenizer id: the head is not expected to choose it, so no request ends early.
@@ -396,7 +439,7 @@ fn run_probe(plan: &Plan, bundle: &TokenizerBundle, prompts: &[(String, Vec<u32>
         })
         .collect();
     let file = ProbeFile {
-        system: plan.identity("probe", plan.reference_chunk, "eager-greedy"),
+        system: identity("probe", &engine, "eager-greedy"),
         tokens: plan.tokens,
         event_floor: EVENT_FLOOR,
         rows,
@@ -537,7 +580,6 @@ struct Setup<'a> {
     plan: &'a Plan,
     bundle: &'a TokenizerBundle,
     prompts: &'a [(String, Vec<u32>)],
-    identities: Identities,
     settings: RunSettings,
 }
 
@@ -547,15 +589,22 @@ type Engine = (FlintExecutor, FlintSession);
 /// files. Returns the comparison, the files' digests and the scorer's engine.
 fn fresh_comparison(setup: &Setup<'_>) -> (Comparison, [String; 2], Engine) {
     let (plan, vocab) = (setup.plan, setup.settings.vocab);
-    let baseline = {
+    let (baseline, baseline_identity) = {
         let (mut engine, mut session) = plan.open(plan.baseline_chunk, setup.bundle);
+        let system = identity("baseline", &engine, "eager-greedy");
         let mut model = Forced {
             engine: &mut engine,
             session: &mut session,
         };
-        generate_with(&mut model, setup.prompts, plan.tokens, vocab)
+        let generations = generate_with(&mut model, setup.prompts, plan.tokens, vocab);
+        (generations, system)
     };
     let (mut engine, mut session) = plan.open(plan.reference_chunk, setup.bundle);
+    let identities = Identities {
+        scorer: scorer_identity(&engine),
+        reference: identity("reference", &engine, "eager-greedy"),
+        baseline: baseline_identity,
+    };
     let mut scorer = Forced {
         engine: &mut engine,
         session: &mut session,
@@ -565,13 +614,8 @@ fn fresh_comparison(setup: &Setup<'_>) -> (Comparison, [String; 2], Engine) {
         reference: &reference,
         baseline: &baseline,
     };
-    let comparison = Comparison::prepare(
-        (&mut scorer, None),
-        &setup.identities,
-        outputs,
-        setup.settings,
-    )
-    .expect("the reference and the baseline calibrate");
+    let comparison = Comparison::prepare((&mut scorer, None), &identities, outputs, setup.settings)
+        .expect("the reference and the baseline calibrate");
     let write = |role: &str, scored| {
         write_new_json(&plan.out.join(format!("{role}.json")), scored).expect("a comparison file")
     };
@@ -591,14 +635,14 @@ fn loaded_comparison(
         read_scored(&directory.join("reference.json")).expect("the earlier reference file");
     let (baseline, baseline_sha256) =
         read_scored(&directory.join("baseline.json")).expect("the earlier baseline file");
+    let engine = setup.plan.open(setup.plan.reference_chunk, setup.bundle);
     let comparison = Comparison::from_scored(
         reference,
         baseline,
-        &setup.identities.scorer,
+        &scorer_identity(&engine.0),
         setup.settings,
     )
     .expect("the earlier comparison under this scorer");
-    let engine = setup.plan.open(setup.plan.reference_chunk, setup.bundle);
     (comparison, [reference_sha256, baseline_sha256], engine)
 }
 
@@ -648,19 +692,16 @@ fn candidate_outputs(
     match kind {
         "serve" => (
             "serve".to_owned(),
-            plan.identity("candidate-serve", plan.reference_chunk, "serving-decode"),
+            identity("candidate-serve", engine, "serving-decode"),
             serve((engine, session), setup.bundle, setup.prompts, plan.tokens),
             plan.audit_cap,
         ),
         "fault" => {
+            let system = identity("candidate-fault", engine, "eager-greedy-bias-fault");
             let mut model = LogitBiasFault::specpilot(Forced { engine, session });
             (
                 "fault".to_owned(),
-                plan.identity(
-                    "candidate-fault",
-                    plan.reference_chunk,
-                    "eager-greedy-bias-fault",
-                ),
+                system,
                 generate_with(&mut model, setup.prompts, plan.tokens, setup.settings.vocab),
                 0,
             )
@@ -678,7 +719,8 @@ fn candidate_outputs(
     }
 }
 
-/// The scorer and the settings of a run, with the identities the files record.
+/// The plan, the prompts and the gate settings of a run. The identities the files record are
+/// read from each executor once it is open.
 fn setup<'a>(
     plan: &'a Plan,
     bundle: &'a TokenizerBundle,
@@ -688,11 +730,6 @@ fn setup<'a>(
         plan,
         bundle,
         prompts,
-        identities: Identities {
-            scorer: plan.identity("scorer", plan.reference_chunk, "eager-teacher-forced"),
-            reference: plan.identity("reference", plan.reference_chunk, "eager-greedy"),
-            baseline: plan.identity("baseline", plan.baseline_chunk, "eager-greedy"),
-        },
         settings: RunSettings {
             config: GateConfig::QUALIFICATION,
             vocab: bundle.vocab_size() as usize,
@@ -762,7 +799,7 @@ fn token_forcing_qualification() {
                 generated: generation.generated,
             })
             .collect();
-        let system = plan.identity("candidate-serve", plan.reference_chunk, "serving-decode");
+        let system = identity("candidate-serve", &engine, "serving-decode");
         write_new_json(path, &GenerationsFile { system, requests }).expect("generations file");
         println!("TOKEN_FORCING generations={}", path.display());
         return;
@@ -794,14 +831,14 @@ fn token_forcing_qualification() {
         println!("TOKEN_FORCING candidates=none");
     }
     for (index, kind) in plan.candidates.iter().enumerate() {
-        let (name, identity, generations, audit_cap) =
+        let (name, system, generations, audit_cap) =
             candidate_outputs(&setup, (&mut engine, &mut session), (index, kind));
         let mut scorer = Forced {
             engine: &mut engine,
             session: &mut session,
         };
         let candidate = Candidate {
-            identity: &identity,
+            identity: &system,
             generations: &generations,
             audit_cap,
         };
@@ -941,7 +978,7 @@ fn token_forcing_audit_path() {
         generate_with(&mut model, &prompts, plan.tokens, setup.settings.vocab)
     };
     let path = format!("eager-greedy-bias-fault-from-{AUDIT_FAULT_FROM}");
-    let identity = plan.identity("candidate-fault", plan.reference_chunk, &path);
+    let system = identity("candidate-fault", &engine, &path);
     let mut scorer = Prefills {
         inner: Forced {
             engine: &mut engine,
@@ -950,7 +987,7 @@ fn token_forcing_audit_path() {
         contexts: Vec::new(),
     };
     let candidate = Candidate {
-        identity: &identity,
+        identity: &system,
         generations: &generations,
         audit_cap: plan.audit_cap,
     };

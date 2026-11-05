@@ -249,15 +249,17 @@ pub(crate) struct Calibration {
 }
 
 /// Sets the near-tie threshold from the reference's own behaviour. Two legal executions of the
-/// reference (for example two prefill chunk sizes) generate from the same prompts; where they
-/// first depart, their histories still agree, so the scorer judges both tokens in one context,
-/// and the gap between their log-probabilities is a margin that reduction order alone produced.
+/// reference (two prefill chunk sizes) generate from the same prompts; where they first depart,
+/// their histories still agree, so the scorer judges both tokens in one context, and the gap
+/// between their log-probabilities is a margin that reduction order alone produced.
 ///
 /// The contract:
 ///
 /// - Inputs: the scored reference and baseline, from one scorer, over the same prompts, both
-///   executions of the scorer's build (`check_builds`). The reference must match its scorer at
-///   every token, and the scorer must give one row for one context.
+///   executions of the scorer's build and settings (`check_builds`): the reference's profile
+///   equals the scorer's except for the generation path, and the baseline's except for the
+///   generation path and the prefill chunk size. The reference must match its scorer at every
+///   token, and the scorer must give one row for one context.
 /// - Delta is the largest first-departure margin over the requests, rounded up to a multiple
 ///   of `DELTA_GRID`, and never below one step: `max(1, ceil(margin / 1/8)) / 8` nats.
 /// - No departure in any request: the largest margin measured is 0 and delta is 1/8, its
@@ -865,15 +867,24 @@ fn check_pair(first: &ScoredSystem, second: &ScoredSystem) -> Result<()> {
 /// The profile entry that names how an execution generated; the reference's profile differs
 /// from its scorer's in this entry only.
 pub(crate) const GENERATION_PATH: &str = "generation_path";
+/// The profile entry that names the prompt rows of one prefill pass. Besides the generation
+/// path, it is the one entry in which the baseline's profile may differ from its scorer's.
+pub(crate) const PREFILL_CHUNK_SIZE: &str = "prefill_chunk_size";
 /// The profile entry that names the build, as the SHA-256 of the executable, when the harness
 /// records it.
 pub(crate) const EXECUTABLE_SHA256: &str = "executable_sha256";
 
 /// The reference and the baseline are legal executions of the scorer's own build: the same
 /// family and the same executable. The reference also runs the scorer's numeric path, so its
-/// profile equals the scorer's except for the generation path. Files that claim otherwise are
-/// refused even when their numbers agree, so a verdict never rests on files from two builds.
-/// The candidate may come from another build: an A/B between builds is what it is for.
+/// profile equals the scorer's except for the generation path. The baseline runs the scorer's
+/// settings with another prefill chunk size, so its profile equals the scorer's except for the
+/// generation path and the chunk size: a baseline on another KV profile (a q8 baseline beside
+/// an f16 scorer), another context limit or another numeric switch is refused. Such a baseline
+/// would calibrate delta on a lossy change, and so let a lossy candidate pass. The harness
+/// records each profile from the settings its executor was opened with, so the entries name
+/// what ran. Files that claim otherwise are refused even when their numbers agree, so a verdict
+/// never rests on files from two builds or two configurations. The candidate may come from
+/// another build or configuration: an A/B between them is what it is for.
 fn check_builds(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<()> {
     let scorer = &reference.scorer;
     let build = |identity: &ExecutionIdentity| {
@@ -893,16 +904,27 @@ fn check_builds(reference: &ScoredSystem, baseline: &ScoredSystem) -> Result<()>
             )));
         }
     }
-    let numeric_path = |identity: &ExecutionIdentity| {
+    let without = |identity: &ExecutionIdentity, keys: &[&str]| {
         let mut profile = identity.profile.clone();
-        profile.remove(GENERATION_PATH);
+        for key in keys {
+            profile.remove(*key);
+        }
         profile
     };
-    if numeric_path(&reference.system) != numeric_path(scorer) {
+    if without(&reference.system, &[GENERATION_PATH]) != without(scorer, &[GENERATION_PATH]) {
         return Err(gate_error(format!(
             "the reference's profile {:?} differs from the scorer's {:?} in more than the \
              generation path: the reference must run the scorer's numeric path",
             reference.system.profile, scorer.profile
+        )));
+    }
+    let legal = [GENERATION_PATH, PREFILL_CHUNK_SIZE];
+    if without(&baseline.system, &legal) != without(scorer, &legal) {
+        return Err(gate_error(format!(
+            "the baseline's profile {:?} differs from the scorer's {:?} in more than the \
+             generation path and the prefill chunk size: the baseline must run the scorer's \
+             settings, not another KV profile, context limit or numeric switch",
+            baseline.system.profile, scorer.profile
         )));
     }
     Ok(())

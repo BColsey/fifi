@@ -4,8 +4,8 @@
 use super::fixture::{Bug, LAG, RING, Toy, VOCAB, generate, prompt};
 use super::gate::{
     Audit, AuditPlan, EXECUTABLE_SHA256, EventStatus, ExecutionIdentity, GateConfig, Generation,
-    MarginClass, Report, Reread, ScoredRequest, ScoredSystem, Verdict, audit_system, calibrate,
-    evaluate, ids_sha256, score_system,
+    MarginClass, PREFILL_CHUNK_SIZE, Report, Reread, ScoredRequest, ScoredSystem, Verdict,
+    audit_system, calibrate, evaluate, ids_sha256, score_system,
 };
 use super::probe::{EVENT_FLOOR, ProbeFile, ProbeSettings, check_probe, probe_request};
 use super::run::{
@@ -1154,6 +1154,75 @@ fn the_reference_and_the_baseline_must_run_the_scorers_build() {
     let mut other_candidate = candidate;
     set(&mut other_candidate, EXECUTABLE_SHA256, &"0".repeat(64));
     assert!(judge(&reference, &baseline, &other_candidate).is_ok());
+}
+
+#[test]
+fn the_baseline_runs_the_scorers_settings_with_another_chunk_size() {
+    // The entries the Flint harness records, the same on every execution of one run.
+    let digest = "a".repeat(64);
+    let settings = [
+        ("kv_profile", "f16"),
+        ("context_limit", "6144"),
+        (PREFILL_CHUNK_SIZE, "8"),
+        ("numeric_env", "alloc_cache: true"),
+        (EXECUTABLE_SHA256, digest.as_str()),
+    ];
+    let recorded = |mut scored: ScoredSystem| {
+        for identity in [&mut scored.system, &mut scored.scorer] {
+            for (key, value) in settings {
+                identity.profile.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        scored
+    };
+    let (reference, baseline, candidate) = synthetic();
+    let (reference, baseline, candidate) =
+        (recorded(reference), recorded(baseline), recorded(candidate));
+    let judge = |baseline: &ScoredSystem, candidate: &ScoredSystem| {
+        evaluate(ANY_COVERAGE, &reference, baseline, candidate).map_err(|e| format!("{e:?}"))
+    };
+    let changed = |changes: &[(&str, Option<&str>)]| {
+        let mut changed = baseline.clone();
+        for &(key, value) in changes {
+            match value {
+                Some(value) => changed
+                    .system
+                    .profile
+                    .insert(key.to_owned(), value.to_owned()),
+                None => changed.system.profile.remove(key),
+            };
+        }
+        changed
+    };
+    assert!(judge(&baseline, &candidate).is_ok());
+    // Another prefill chunk size is the baseline's legal variation.
+    let chunk_4 = changed(&[(PREFILL_CHUNK_SIZE, Some("4"))]);
+    assert!(judge(&chunk_4, &candidate).is_ok());
+    // A q8 baseline beside an f16 scorer is refused, with the scorer's chunk size or another;
+    // so are another context limit, another numeric switch and an entry the scorer has and
+    // the baseline does not.
+    let refused = [
+        changed(&[("kv_profile", Some("q8"))]),
+        changed(&[("kv_profile", Some("q8")), (PREFILL_CHUNK_SIZE, Some("4"))]),
+        changed(&[("context_limit", Some("4096"))]),
+        changed(&[("numeric_env", Some("alloc_cache: false"))]),
+        changed(&[("kv_profile", None)]),
+        changed(&[("kv_cache_rows", Some("8192"))]),
+    ];
+    for baseline in &refused {
+        let error = judge(baseline, &candidate).unwrap_err();
+        assert!(
+            error.contains("the baseline must run the scorer's settings"),
+            "{error}"
+        );
+    }
+    // A candidate on another KV profile is what the gate is for.
+    let mut q8_candidate = candidate.clone();
+    q8_candidate
+        .system
+        .profile
+        .insert("kv_profile".to_owned(), "q8".to_owned());
+    assert!(judge(&chunk_4, &q8_candidate).is_ok());
 }
 
 /// A model that reads out fixed rows: the first for the prompt, then one per step. It keeps
