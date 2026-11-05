@@ -236,6 +236,41 @@ def cargo_features() -> list[str]:
     return sorted(names)
 
 
+def cargo_bin_unittest_paths() -> list[Path]:
+    """Source files whose unit tests cargo runs as `unittests` targets.
+
+    Explicit ``[[bin]]`` path entries, bins autodiscovered in ``src/bin/``,
+    and the default ``src/main.rs``. Each yields one ``Running unittests``
+    line that the completeness check must account for.
+    """
+    explicit: list[str] = []
+    in_bin = False
+    for line in (ENGINE_ROOT / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("["):
+            in_bin = line.strip() == "[[bin]]"
+            continue
+        if in_bin:
+            match = re.match(r'\s*path\s*=\s*"([^"]+)"', line)
+            if match:
+                explicit.append(match.group(1))
+    paths = [ENGINE_ROOT / rel for rel in explicit if (ENGINE_ROOT / rel).is_file()]
+    bin_dir = ENGINE_ROOT / "src" / "bin"
+    if bin_dir.is_dir():
+        paths.extend(bin_dir.glob("*.rs"))
+    main = ENGINE_ROOT / "src" / "main.rs"
+    if main.is_file():
+        paths.append(main)
+    return sorted(set(paths))
+
+
+def live_target_names() -> list[str]:
+    """Target inventory implied by the tree right now (facts freshness)."""
+    names = {"lib", "doctest"}
+    names |= {p.stem for p in (ENGINE_ROOT / "tests").glob("*.rs")}
+    names |= {p.stem for p in cargo_bin_unittest_paths()}
+    return sorted(names)
+
+
 def build_facts() -> dict:
     targets: dict[str, TestTargetFacts] = {}
 
@@ -248,6 +283,20 @@ def build_facts() -> dict:
         target = TestTargetFacts(path=str(path.relative_to(ENGINE_ROOT)))
         merge_into(target, path)
         targets[path.stem] = target
+
+    for path in cargo_bin_unittest_paths():
+        if path.stem in targets:
+            raise InventoryError(
+                f"target name collision: bin {path} vs existing target "
+                f"{path.stem!r}"
+            )
+        target = TestTargetFacts(path=str(path.relative_to(ENGINE_ROOT)))
+        merge_into(target, path)
+        targets[path.stem] = target
+
+    # cargo always emits a Doc-tests run for the lib; it has no source file to
+    # scan, but the completeness check must expect it.
+    targets["doctest"] = TestTargetFacts(path="(doc-tests)")
 
     return {
         "schema_version": 2,
@@ -880,7 +929,8 @@ def git_output(repo: Path, args: list[str]) -> str:
 
 
 def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
-                  strict_fixtures: list[str]) \
+                  strict_fixtures: list[str],
+                  expected_targets: list[str]) \
         -> tuple[str, list[str], dict | None, dict[str, int]]:
     """Judge one surface run: verdict, reasons, libtest summary, fixture skips.
 
@@ -895,6 +945,27 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
     """
     verdict = "PASS"
     reasons: list[str] = []
+
+    # Coverage is judged from cargo's own Running lines, independent of the
+    # execution floor: a fail-fast abort (or a dropped stream) must refuse the
+    # verdict even when enough tests happened to run.
+    observed = parse_cargo_targets(stderr)
+    duplicates = sorted({n for n in observed if observed.count(n) > 1})
+    missing = [n for n in expected_targets if n not in observed]
+    unknown = sorted(set(observed) - set(expected_targets))
+    if missing:
+        verdict = "FAIL"
+        reasons.append(
+            "incomplete target coverage — cargo never ran: " + ", ".join(missing)
+        )
+    if duplicates:
+        verdict = "FAIL"
+        reasons.append("duplicate target blocks: " + ", ".join(duplicates))
+    if unknown:
+        verdict = "FAIL"
+        reasons.append(
+            "observed targets the facts do not declare: " + ", ".join(unknown)
+        )
 
     try:
         summary = summarize_run(stdout, stderr)
@@ -926,6 +997,13 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
     skip_lines = sum(skips.values())
     if summary is not None:
         summary = dict(summary)
+        summary["target_coverage"] = {
+            "expected": len(expected_targets),
+            "observed": len(observed),
+            "missing": missing,
+            "duplicates": duplicates,
+            "unknown": unknown,
+        }
         totals = summary["totals"]
         accounting = {
             "discovered": totals["passed"] + totals["failed"] + totals["ignored"]
@@ -962,7 +1040,8 @@ def judge_surface(stdout: str, stderr: str, returncode: int, expect: dict,
     return verdict, reasons, summary, dict(sorted(skips.items()))
 
 
-def collect_surface(surface: dict, out_dir: Path) -> dict:
+def collect_surface(surface: dict, out_dir: Path, facts: dict) -> dict:
+    expected_targets = sorted(surface.get("targets_included") or facts["targets"])
     cwd = (REPO_ROOT / surface["cwd"]).resolve()
     if not cwd.is_dir() or REPO_ROOT.resolve() not in cwd.parents:
         raise InventoryError(
@@ -1018,6 +1097,7 @@ def collect_surface(surface: dict, out_dir: Path) -> dict:
     verdict, reasons, summary, skips = judge_surface(
         stdout, stderr, returncode, expect,
         list(surface.get("fixtures_required", [])),
+        expected_targets,
     )
 
     return {
@@ -1041,6 +1121,14 @@ def collect_surface(surface: dict, out_dir: Path) -> dict:
 def cmd_collect(args: argparse.Namespace) -> int:
     facts = load_json_strict(FACTS_PATH)
     policy = load_json_strict(POLICY_PATH)
+    live = set(live_target_names())
+    recorded = set(facts["targets"])
+    if live != recorded:
+        raise InventoryError(
+            "scripts/qual_facts.json target inventory is stale for this tree; "
+            f"run generate first (missing from facts: {sorted(live - recorded)}; "
+            f"no longer in tree: {sorted(recorded - live)})"
+        )
     all_ids = validate_policy(policy, facts)
     selected, skipped = select_surfaces(policy, args.surface)
     unknown = [sid for sid in selected if sid not in all_ids]
@@ -1084,7 +1172,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
     for surface in policy["surfaces"]:
         if surface["id"] not in selected:
             continue
-        record = collect_surface(surface, out_dir)
+        record = collect_surface(surface, out_dir, facts)
         evidence["surfaces"].append(record)
         if record["verdict"] == "FAIL":
             evidence["verdict"] = "FAIL"

@@ -1,92 +1,93 @@
 {
-  "schema_version": 1,
-  "surfaces": [
-    {
-      "id": "static-format",
-      "category": "static",
-      "hardware": "cpu",
-      "description": "rustfmt check over the engine crate (pinned toolchain)",
-      "cwd": "engine",
-      "argv": [
-        "cargo",
-        "fmt",
-        "--check"
-      ],
-      "env": {},
-      "expect": {},
-      "fixtures_required": [],
-      "timeout_sec": 900
-    },
-    {
-      "id": "static-clippy",
-      "category": "static",
-      "hardware": "cpu",
-      "description": "Clippy with -D warnings over all targets, CPU default features",
-      "cwd": "engine",
-      "argv": [
-        "cargo",
-        "clippy",
-        "--locked",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings"
-      ],
-      "env": {},
-      "expect": {},
-      "fixtures_required": [],
-      "timeout_sec": 900
-    },
-    {
-      "id": "host-portable",
-      "category": "host",
-      "hardware": "cpu",
-      "description": "Full default-feature host suite: lib target plus every integration target, CPU only. Fixture-gated tests skip on hosts without the named locations; the skips are recorded as evidence, and the floor counts only executed tests (passed plus failed minus fixture-skip lines; ignored and filtered-out excluded) so a collection regression cannot pass silently.",
-      "cwd": "engine",
-      "argv": [
-        "cargo",
-        "test",
-        "--locked",
-        "--",
-        "--nocapture"
-      ],
-      "env": {},
-      "expect": {
-        "min_ran": 2950,
-        "max_failed": 0
-      },
-      "fixtures_required": [],
-      "baseline_note": "Waiver retired 2026-11-04: the historical allowed failure (published_text::published_files_carry_no_internal_plan_labels, pre-existing at ec0296ed9 from internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs) is reconciled by the shared sanitizer policy — the test passes and any regression now fails outright. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count. Under --nocapture, libtest writes the 'test NAME ... ' prefix without a newline, so prints from the test body can land on that line (glued status) or push the status onto a later bare line; the parser completes those torn shapes while keeping the counted==summary invariant (any miscount still fails). The >60-second libtest notices are noise lines and do not affect the count.",
-      "timeout_sec": 3600
-    },
-    {
-      "id": "cuda-smoke",
-      "category": "cuda-device",
-      "hardware": "nvidia-gpu",
-      "description": "Seed device surface: the cuda_smoke target (4 tests) under the native-cuda feature. INFERENCE_CUDA_REQUIRE_DEVICE=1 makes a missing device a failure instead of a silent skip, so a green run is device evidence. Requires an authorized GPU lease (fifi-gpu-run) plus the CUDA build container; never selected by default.",
-      "cwd": "engine",
-      "argv": [
-        "cargo",
-        "test",
-        "--locked",
-        "--features",
-        "native-cuda",
-        "--test=cuda_smoke",
-        "--",
-        "--nocapture"
-      ],
-      "features": [
-        "native-cuda"
-      ],
-      "env": {
-        "INFERENCE_CUDA_REQUIRE_DEVICE": "1"
-      },
-      "expect": {
-        "min_ran": 4
-      },
-      "fixtures_required": [],
-      "baseline_note": "PENDING: no device evidence collected yet; this branch is CPU-only and device collection waits for an authorized lease. The fast/extended device-gate surfaces (per-lane compositions under features like cuda-q8-reference, cuda-fault-qualification, cuda-arms-qualification) will be declared from the owning lanes' verified argv, not invented here.",
-      "timeout_sec": 1800
-    }
-  ]
+ "schema_version": 1,
+ "surfaces": [
+  {
+   "id": "static-format",
+   "category": "static",
+   "hardware": "cpu",
+   "description": "rustfmt check over the engine crate (pinned toolchain)",
+   "cwd": "engine",
+   "argv": [
+    "cargo",
+    "fmt",
+    "--check"
+   ],
+   "env": {},
+   "expect": {},
+   "fixtures_required": [],
+   "timeout_sec": 900
+  },
+  {
+   "id": "static-clippy",
+   "category": "static",
+   "hardware": "cpu",
+   "description": "Clippy with -D warnings over all targets, CPU default features",
+   "cwd": "engine",
+   "argv": [
+    "cargo",
+    "clippy",
+    "--locked",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+   ],
+   "env": {},
+   "expect": {},
+   "fixtures_required": [],
+   "timeout_sec": 900
+  },
+  {
+   "id": "host-portable",
+   "category": "host",
+   "hardware": "cpu",
+   "description": "Full default-feature host suite: lib target plus every integration target, CPU only. Fixture-gated tests skip on hosts without the named locations; the skips are recorded as evidence, and the floor counts only executed tests (passed plus failed minus fixture-skip lines; ignored and filtered-out excluded) so a collection regression cannot pass silently.",
+   "cwd": "engine",
+   "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "--no-fail-fast",
+    "--",
+    "--nocapture"
+   ],
+   "env": {},
+   "expect": {
+    "min_ran": 2950,
+    "max_failed": 0
+   },
+   "fixtures_required": [],
+   "baseline_note": "Waiver retired 2026-11-04: the historical allowed failure (published_text::published_files_carry_no_internal_plan_labels, pre-existing at ec0296ed9 from internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs) is reconciled by the shared sanitizer policy \u2014 the test passes and any regression now fails outright. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count. Under --nocapture, libtest writes the 'test NAME ... ' prefix without a newline, so prints from the test body can land on that line (glued status) or push the status onto a later bare line; the parser completes those torn shapes while keeping the counted==summary invariant (any miscount still fails). The >60-second libtest notices are noise lines and do not affect the count. Fail-fast removed 2026-11-05: cargo's default aborts the remaining test executables once one binary fails, silently shrinking coverage (the slice-3 receipt bound 386c469c3 ran 60 of 72 targets for exactly this reason); --no-fail-fast plus the collector's facts-reconciled target-coverage check now refuse any verdict whose observed Running lines miss a declared target.",
+   "timeout_sec": 3600
+  },
+  {
+   "id": "cuda-smoke",
+   "category": "cuda-device",
+   "hardware": "nvidia-gpu",
+   "description": "Seed device surface: the cuda_smoke target (4 tests) under the native-cuda feature. INFERENCE_CUDA_REQUIRE_DEVICE=1 makes a missing device a failure instead of a silent skip, so a green run is device evidence. Requires an authorized GPU lease (fifi-gpu-run) plus the CUDA build container; never selected by default.",
+   "cwd": "engine",
+   "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "--features",
+    "native-cuda",
+    "--test=cuda_smoke",
+    "--",
+    "--nocapture"
+   ],
+   "features": [
+    "native-cuda"
+   ],
+   "env": {
+    "INFERENCE_CUDA_REQUIRE_DEVICE": "1"
+   },
+   "expect": {
+    "min_ran": 4
+   },
+   "fixtures_required": [],
+   "baseline_note": "PENDING: no device evidence collected yet; this branch is CPU-only and device collection waits for an authorized lease. The fast/extended device-gate surfaces (per-lane compositions under features like cuda-q8-reference, cuda-fault-qualification, cuda-arms-qualification) will be declared from the owning lanes' verified argv, not invented here.",
+   "timeout_sec": 1800
+  }
+ ]
 }

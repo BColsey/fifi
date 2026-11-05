@@ -359,9 +359,11 @@ class AllowedFailureVerdictTest(unittest.TestCase):
     STDERR = "     Running unittests src/lib.rs (x)\n"
 
     def judge(self, expect: dict, stdout: str, stderr: str, returncode: int,
-              strict_fixtures: list[str] | None = None) -> tuple[str, list[str]]:
+              strict_fixtures: list[str] | None = None,
+              expected: list[str] | None = None) -> tuple[str, list[str]]:
         verdict, reasons, _summary, _skips = qi.judge_surface(
-            stdout, stderr, returncode, expect, strict_fixtures or []
+            stdout, stderr, returncode, expect, strict_fixtures or [],
+            expected or ["lib"],
         )
         return verdict, reasons
 
@@ -392,7 +394,7 @@ class AllowedFailureVerdictTest(unittest.TestCase):
             "~/.config/fifi/test-paths.json: SKIPPING\n"
         )
         verdict, reasons, summary, _skips = qi.judge_surface(
-            self.GOOD, stderr, 0, {"min_ran": 1}, []
+            self.GOOD, stderr, 0, {"min_ran": 1}, [], ["lib"]
         )
         assert summary is not None
         self.assertEqual(summary["accounting"]["executed_effective"], 0)
@@ -416,7 +418,7 @@ class AllowedFailureVerdictTest(unittest.TestCase):
         verdict, _reasons, summary, _skips = qi.judge_surface(
             "\n".join(lines) + "\n", stderr, 101,
             {"min_ran": 3000, "max_failed": 1,
-             "allowed_failures": ["lib::baseline"]}, [],
+             "allowed_failures": ["lib::baseline"]}, [], ["lib"],
         )
         assert summary is not None
         acc = summary["accounting"]
@@ -437,7 +439,7 @@ class AllowedFailureVerdictTest(unittest.TestCase):
             "0 filtered out; finished in 0.0s\n"
         )
         verdict, _reasons, summary, _skips = qi.judge_surface(
-            block, self.STDERR, 0, {"min_ran": 2}, []
+            block, self.STDERR, 0, {"min_ran": 2}, [], ["lib"]
         )
         assert summary is not None
         self.assertEqual(summary["accounting"]["executed_effective"], 2)
@@ -645,7 +647,7 @@ class ProcessGroupTimeoutTest(unittest.TestCase):
             "env": {}, "timeout_sec": 1,
         }
         with tempfile.TemporaryDirectory() as tmp:
-            record = qi.collect_surface(surface, Path(tmp))
+            record = qi.collect_surface(surface, Path(tmp), {"targets": {}})
             grandchild = int((Path(tmp) / "grp.stdout").read_text().strip())
         self.assertEqual(record["verdict"], "FAIL")
         self.assertTrue(any("timed out" in r for r in record["reasons"]))
@@ -792,6 +794,100 @@ class PackRegistryTest(unittest.TestCase):
                                return_value={"gguf": "qualified", "exl3": "qualified"}):
             with self.assertRaisesRegex(qi.InventoryError, "exceeds its recorded"):
                 qi.validate_pack_registry(registry)
+
+
+class TargetCoverageTest(unittest.TestCase):
+    """The completeness contract: a verdict must account for every target.
+
+    Regression suite for the fail-fast blind spot: the slice-3 host receipt
+    reported PASS_WITH_KNOWN_FAILURE while cargo's default fail-fast had
+    aborted nine-plus test executables that never ran. The floor alone must
+    never imply coverage.
+    """
+
+    OK = "running 1 tests\ntest a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n"
+
+    @staticmethod
+    def stderr(*names: str) -> str:
+        lines = ["     Compiling inference-engine v0.1.0"]
+        for name in names:
+            if name == "lib":
+                lines.append("     Running unittests src/lib.rs (x)")
+            elif name == "doctest":
+                lines.append("     Doc-tests inference_engine")
+            else:
+                lines.append(f"     Running tests/{name}.rs (x)")
+        return "\n".join(lines) + "\n"
+
+    def judge(self, expected: list[str], observed: list[str]):
+        stdout = "".join(self.OK for _ in observed)
+        return qi.judge_surface(
+            stdout, self.stderr(*observed), 0,
+            {"min_ran": 1}, [], expected,
+        )
+
+    def test_missing_target_refuses_even_above_the_floor(self) -> None:
+        # A suppressed executable: expected three targets, cargo ran two.
+        verdict, reasons, _summary, _skips = self.judge(
+            ["lib", "published_text", "doctest"], ["lib", "published_text"]
+        )
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("never ran: doctest" in r for r in reasons))
+
+    def test_fail_fast_abort_shape_is_the_slice3_regression(self) -> None:
+        # Exactly the historical defect: everything through the failing binary
+        # ran, the tail never launched, and the floor was still satisfied.
+        expected = ["lib", "published_text", "q36_real_config", "quantization",
+                    "server_q36_cli", "tiered_weights", "doctest"]
+        observed = ["lib", "published_text", "q36_real_config"]
+        verdict, reasons, summary, _skips = self.judge(expected, observed)
+        self.assertEqual(verdict, "FAIL")
+        self.assertIn("incomplete target coverage — cargo never ran: "
+                      "quantization, server_q36_cli, tiered_weights, doctest",
+                      reasons)
+        assert summary is not None
+        self.assertEqual(summary["target_coverage"]["missing"],
+                         ["quantization", "server_q36_cli", "tiered_weights",
+                          "doctest"])
+
+    def test_truncated_stream_fails_instead_of_pairing_survivors(self) -> None:
+        # Truncated stdout: a Running line lost its test block. The block/target
+        # pairing must refuse before any verdict can pass.
+        with self.assertRaises(qi.InventoryError):
+            qi.summarize_run(self.OK, self.stderr("lib", "acquisition"))
+
+    def test_duplicated_target_block_fails(self) -> None:
+        # A duplicated result: the same executable reported twice.
+        verdict, reasons, _summary, _skips = self.judge(
+            ["lib", "acquisition"], ["lib", "lib", "acquisition"]
+        )
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("duplicate target blocks: lib" in r for r in reasons))
+
+    def test_unknown_observed_target_fails(self) -> None:
+        verdict, reasons, _summary, _skips = self.judge(
+            ["lib"], ["lib", "mystery"]
+        )
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("facts do not declare: mystery" in r for r in reasons))
+
+    def test_complete_coverage_passes_and_is_recorded(self) -> None:
+        verdict, reasons, summary, _skips = self.judge(
+            ["lib", "acquisition", "doctest"], ["lib", "acquisition", "doctest"]
+        )
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        assert summary is not None
+        self.assertEqual(summary["target_coverage"],
+                         {"expected": 3, "observed": 3, "missing": [],
+                          "duplicates": [], "unknown": []})
+
+    def test_live_inventory_names_bins_and_doctests(self) -> None:
+        # The facts generator must derive the inventory from the tree, not a
+        # hardcoded list: bin unittests and doc-tests included.
+        names = qi.live_target_names()
+        for required in ("lib", "main", "doctest", "published_text",
+                         "server_q36_cli"):
+            self.assertIn(required, names)
 
 
 if __name__ == "__main__":

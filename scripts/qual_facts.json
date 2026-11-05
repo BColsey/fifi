@@ -868,7 +868,7 @@
     },
     "published_text": {
       "path": "tests/published_text.rs",
-      "test_fns": 3,
+      "test_fns": 4,
       "ignored": 0,
       "env_gates": [],
       "features": [],
@@ -974,6 +974,22 @@
       "env_gates": [
         "INFERENCE_TOKENIZER_DIR"
       ],
+      "features": [],
+      "fixtures": {}
+    },
+    "main": {
+      "path": "src/main.rs",
+      "test_fns": 0,
+      "ignored": 0,
+      "env_gates": [],
+      "features": [],
+      "fixtures": {}
+    },
+    "doctest": {
+      "path": "(doc-tests)",
+      "test_fns": 0,
+      "ignored": 0,
+      "env_gates": [],
       "features": [],
       "fixtures": {}
     }
