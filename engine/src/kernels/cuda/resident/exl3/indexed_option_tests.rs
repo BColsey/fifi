@@ -18,7 +18,8 @@ use std::ffi::OsStr;
 
 use super::{
     DP4A_VAR, Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, INDEXED_PAIRS_VAR, IndexedOptions,
-    SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_pairs_from_env,
+    SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_from_env,
+    indexed_pairs_from_env,
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
@@ -57,6 +58,27 @@ fn the_switches_parse_strictly() {
     }
 }
 
+/// The pair of switches the environment read goes through: unset is off, each switch selects
+/// its option alone, and a bad value of either refuses the pair and names that switch.
+#[test]
+fn the_two_switches_select_their_options_independently() {
+    let os = |v: &'static str| Some(OsStr::new(v));
+    assert_eq!(indexed_from_env(None, None), Ok(OFF));
+    assert_eq!(indexed_from_env(os("1"), None), Ok(DP4A));
+    assert_eq!(indexed_from_env(None, os("20")), Ok(PAIRS20));
+    assert_eq!(indexed_from_env(os("1"), os("20")), Ok(BOTH));
+    assert_eq!(indexed_from_env(os("0"), os("16")), Ok(OFF));
+    for (dp4a, pairs, var) in [
+        (os("on"), None, DP4A_VAR),
+        (os("1"), os("32"), INDEXED_PAIRS_VAR),
+        (None, os(""), INDEXED_PAIRS_VAR),
+        (os("2"), os("20"), DP4A_VAR),
+    ] {
+        let error = indexed_from_env(dp4a, pairs).expect_err("a bad value");
+        assert!(error.contains(var), "{dp4a:?} {pairs:?}: {error}");
+    }
+}
+
 #[test]
 fn an_option_changes_only_the_launches_it_names() {
     for calls in 1..=PAIRS {
@@ -90,12 +112,20 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
     }
     for kernel in [SingleRow::Wide(2), SingleRow::Wide(4)] {
         assert!(check_indexed_with(kernel, OFF).is_ok(), "{kernel:?}");
+        // The refusal names the switches that are on, and the kernel switch to change.
         for options in [DP4A, PAIRS20, BOTH] {
             let error = check_indexed_with(kernel, options).expect_err("a wide kernel");
             let text = format!("{error:?}");
-            for var in [DP4A_VAR, INDEXED_PAIRS_VAR, SINGLE_GATHER_VAR] {
-                assert!(text.contains(var), "{kernel:?} {options:?}: {text}");
-            }
+            assert!(
+                text.contains(SINGLE_GATHER_VAR),
+                "{kernel:?} {options:?}: {text}"
+            );
+            assert_eq!(text.contains(DP4A_VAR), options.dp4a, "{options:?}: {text}");
+            assert_eq!(
+                text.contains(INDEXED_PAIRS_VAR),
+                options.pairs20,
+                "{options:?}: {text}"
+            );
         }
     }
 }

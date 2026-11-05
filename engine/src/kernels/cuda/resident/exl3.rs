@@ -90,7 +90,8 @@ impl IndexedOptions {
     #[cfg(test)]
     pub(crate) const ALL: [Self; 4] = [Self::OFF, Self::DP4A, Self::PAIRS20, Self::BOTH];
 
-    /// A short label for logs and bench records: `off`, `dp4a`, `pairs20` or `both`.
+    /// A short label for test and bench records: `off`, `dp4a`, `pairs20` or `both`.
+    #[cfg(test)]
     pub(crate) fn name(self) -> &'static str {
         match (self.dp4a, self.pairs20) {
             (false, false) => "off",
@@ -160,19 +161,28 @@ pub(crate) fn indexed_pairs_from_env(
     }
 }
 
-/// The options the environment selects, or the refusal of a bad value. Read once per process;
-/// an unset switch is off.
+/// The options the values of [`DP4A_VAR`] and [`INDEXED_PAIRS_VAR`] select (`None`: unset, off),
+/// or the refusal of the first bad value.
+fn indexed_from_env(
+    dp4a: Option<&std::ffi::OsStr>,
+    pairs: Option<&std::ffi::OsStr>,
+) -> Result<IndexedOptions, String> {
+    Ok(IndexedOptions {
+        dp4a: dp4a_from_env(dp4a)?.unwrap_or(false),
+        pairs20: indexed_pairs_from_env(pairs)?.unwrap_or(false),
+    })
+}
+
+/// The options the environment selects, or the refusal of a bad value. Read once per process.
 fn indexed_explicit() -> Result<IndexedOptions, EngError> {
     static EXPLICIT: std::sync::OnceLock<Result<IndexedOptions, String>> =
         std::sync::OnceLock::new();
     EXPLICIT
         .get_or_init(|| {
-            let dp4a = dp4a_from_env(std::env::var_os(DP4A_VAR).as_deref())?;
-            let pairs20 = indexed_pairs_from_env(std::env::var_os(INDEXED_PAIRS_VAR).as_deref())?;
-            Ok(IndexedOptions {
-                dp4a: dp4a.unwrap_or(false),
-                pairs20: pairs20.unwrap_or(false),
-            })
+            indexed_from_env(
+                std::env::var_os(DP4A_VAR).as_deref(),
+                std::env::var_os(INDEXED_PAIRS_VAR).as_deref(),
+            )
         })
         .clone()
         .map_err(EngError::BadRequest)
@@ -181,13 +191,26 @@ fn indexed_explicit() -> Result<IndexedOptions, EngError> {
 /// Refuses options the single-row kernel `kernel` cannot run with: both options run one tile per
 /// block, so a wide setting of two or four tiles takes neither.
 fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), EngError> {
-    if options != IndexedOptions::OFF && matches!(kernel, SingleRow::Wide(cols) if cols > 1) {
-        return Err(EngError::BadRequest(format!(
-            "{DP4A_VAR}=1 and {INDEXED_PAIRS_VAR}=20 run one tile per block: \
-             set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \"wide1\" with them"
-        )));
+    if options == IndexedOptions::OFF || !matches!(kernel, SingleRow::Wide(cols) if cols > 1) {
+        return Ok(());
     }
-    Ok(())
+    let on: Vec<String> = [
+        (options.dp4a, format!("{DP4A_VAR}=1")),
+        (options.pairs20, format!("{INDEXED_PAIRS_VAR}=20")),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    let (verb, them) = if on.len() > 1 {
+        ("run", "them")
+    } else {
+        ("runs", "it")
+    };
+    Err(EngError::BadRequest(format!(
+        "{} {verb} one tile per block: set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \
+         \"wide1\" with {them}",
+        on.join(" and ")
+    )))
 }
 
 /// Parses the variable; an unset variable is the shuffle kernel.
@@ -809,8 +832,9 @@ impl CudaContext {
     /// 1 to 16 calls (20 under the 20-pair option, [`Self::exl3_indexed_capacity`]) of one `k`,
     /// `n` and flag; the spans of the calls are contiguous in call order as for the grouped
     /// launches. An id outside `0..members` skips its pair and sets the sticky flag. Every byte
-    /// written equals the wide launch of the same members. The opt-in options ([`IndexedOptions`]: the DP4A decode, up
-    /// to 20 calls in one launch) run one tile per block and write the same bytes.
+    /// written equals the wide launch of the same members. The opt-in options
+    /// ([`IndexedOptions`]: the DP4A decode, up to 20 calls in one launch) run one tile per block
+    /// and write the same bytes.
     pub(crate) fn exl3_grouped_indexed(
         &self,
         stream: &DeviceStream,
