@@ -19,6 +19,12 @@
 //! The walk also gathers and uploads no route indices at `rows == 1`, which
 //! the tests pin so a future change that adds per-token uploads fails loudly
 //! instead of silently breaking capture compatibility.
+//!
+//! Production decode defaults to BOTH publish paths armed (packed pointwise
+//! and fused publish: `settings.rs` selects them `default_on_selected`), so
+//! every topology claim below runs under both configurations — the
+//! production default and the fused-publish rollback
+//! (`FIFI_FLINT_CUDA_FUSED_PUBLISH=0`).
 
 use super::*;
 use crate::family::flint::cuda_ffn::plan::{FfnShape, TOP_K};
@@ -70,6 +76,12 @@ enum Op {
     Gather {
         rows: usize,
     },
+    /// The fused grouped projection: one launch publishing straight into
+    /// the per-group destinations, replacing the publish loop.
+    GroupedPublished {
+        weights: Vec<usize>,
+        columns: usize,
+    },
     Project {
         weight: usize,
         columns: usize,
@@ -81,10 +93,12 @@ enum Op {
 }
 
 /// Recording double: `Tensor` is a buffer id whose byte size is tracked,
-/// `Matrix` is `(weight descriptor, role, [k, n])`. Production decode runs
-/// with packed pointwise armed, so the double reports it armed too.
+/// `Matrix` is `(weight descriptor, role, [k, n])`. `fused` mirrors the
+/// production `default_on_selected` fused-publish setting; `false` is the
+/// `FIFI_FLINT_CUDA_FUSED_PUBLISH=0` rollback walk.
 struct Recorder {
     picks: bool,
+    fused: bool,
     next: usize,
     buffers: Vec<usize>,
     ops: Vec<Op>,
@@ -94,9 +108,17 @@ impl Recorder {
     fn new(picks: bool) -> Self {
         Self {
             picks,
+            fused: true,
             next: 1,
             buffers: vec![H * 4],
             ops: Vec::new(),
+        }
+    }
+
+    fn rollback(picks: bool) -> Self {
+        Self {
+            fused: false,
+            ..Self::new(picks)
         }
     }
 
@@ -116,6 +138,10 @@ impl Effects for Recorder {
 
     fn packed_pointwise(&self) -> bool {
         true
+    }
+
+    fn prefers_fused_publish(&self) -> bool {
+        self.fused
     }
 
     fn allocate(&mut self, shape: RowShape) -> Result<Self::Tensor, EngError> {
@@ -151,6 +177,10 @@ impl Effects for Recorder {
         &mut self,
         calls: &[Projection<Self::Matrix, Self::Tensor>],
     ) -> Result<(), EngError> {
+        // Rows are derived from the whole-buffer byte size, which is exact
+        // for every rows==1 assertion here (each call's input is one whole
+        // row); multi-row walks feed gathered views whose span offsets this
+        // double ignores, so do not reuse rows_per_call there.
         let mut weights = Vec::with_capacity(calls.len());
         let mut rows_per_call = Vec::with_capacity(calls.len());
         let mut columns = None;
@@ -177,6 +207,20 @@ impl Effects for Recorder {
             columns: columns.unwrap_or(0),
         });
         Ok(())
+    }
+
+    fn grouped_published(
+        &mut self,
+        calls: &[Projection<Self::Matrix, Self::Tensor>],
+        _outs: &[Self::Tensor],
+    ) -> Result<bool, EngError> {
+        if !self.fused {
+            return Ok(false);
+        }
+        let weights = calls.iter().map(|call| call.weight.0).collect();
+        let columns = calls.first().map(|call| call.weight.2[1]).unwrap_or(0);
+        self.ops.push(Op::GroupedPublished { weights, columns });
+        Ok(true)
     }
 
     fn indices(&mut self, values: &[i32]) -> Result<Self::Tensor, EngError> {
@@ -301,12 +345,30 @@ fn block(rows: usize) -> FfnBlock {
 }
 
 fn walk(picks: bool, rows: usize, seed: u64) -> Vec<Op> {
+    walk_with(&Recorder::new(picks), rows, seed)
+}
+
+fn walk_rollback(picks: bool, rows: usize, seed: u64) -> Vec<Op> {
+    walk_with(&Recorder::rollback(picks), rows, seed)
+}
+
+fn walk_with(template: &Recorder, rows: usize, seed: u64) -> Vec<Op> {
     let ids = routing(rows, seed);
     let grouping = Grouping::new(&ids, rows, EXPERTS).unwrap();
-    let mut recorder = Recorder::new(picks);
+    let mut recorder = Recorder {
+        picks: template.picks,
+        fused: template.fused,
+        next: 1,
+        buffers: vec![H * 4],
+        ops: Vec::new(),
+    };
     run(&mut recorder, block(rows), &ids, &grouping, 0).unwrap();
     recorder.ops
 }
+
+/// Every (production, rollback) publish configuration.
+const CONFIGS: [(&str, fn(bool, usize, u64) -> Vec<Op>); 2] =
+    [("production", walk), ("rollback", walk_rollback)];
 
 /// The topology: every identity datum (expert ids, pick descriptors) masked
 /// to one marker, so only launch structure remains.
@@ -324,130 +386,152 @@ fn masked(ops: &[Op]) -> Vec<Op> {
                 rows_per_call: rows_per_call.clone(),
                 columns: *columns,
             },
+            Op::GroupedPublished { weights, columns } => Op::GroupedPublished {
+                weights: vec![0; weights.len()],
+                columns: *columns,
+            },
             other => other.clone(),
         })
         .collect()
 }
 
-fn first_grouped(ops: &[Op]) -> &Op {
+/// The identity-bearing launches of a walk, in order: plain grouped in the
+/// rollback configuration, fused grouped in the production one.
+fn identity_launches(ops: &[Op]) -> Vec<Vec<usize>> {
     ops.iter()
-        .find(|op| matches!(op, Op::Grouped { .. }))
-        .expect("the walk always launches a grouped projection")
-}
-
-fn grouped_count(ops: &[Op]) -> usize {
-    ops.iter()
-        .filter(|op| matches!(op, Op::Grouped { .. }))
-        .count()
+        .filter_map(|op| match op {
+            Op::Grouped { weights, .. } | Op::GroupedPublished { weights, .. } => {
+                Some(weights.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
 fn rows1_topology_is_invariant_under_the_routers_choices() {
-    let reference = masked(&walk(false, 1, 1));
-    assert!(!reference.is_empty());
-    for seed in 2..=32u64 {
-        assert_eq!(
-            masked(&walk(false, 1, seed)),
-            reference,
-            "topology changed with the route, seed {seed}"
-        );
+    // Odd seeds only: routing() forces `seed | 1`, so even seeds would repeat
+    // the previous route. Seed 1 plus these sixteen gives seventeen distinct
+    // routes.
+    for (config, walk_fn) in CONFIGS {
+        let reference = masked(&walk_fn(false, 1, 1));
+        assert!(!reference.is_empty());
+        for seed in (3..=33u64).step_by(2) {
+            assert_eq!(
+                masked(&walk_fn(false, 1, seed)),
+                reference,
+                "topology changed with the route, {config}, seed {seed}"
+            );
+        }
+        // One launch per projection role (gate, up, down), six calls each,
+        // one row per call — and the two configurations must genuinely be
+        // different sequences, so both are pinned, not one twice.
+        let ops = walk_fn(false, 1, 1);
+        let launches = identity_launches(&ops);
+        assert_eq!(launches.len(), 3, "{config}: gate, up and down");
+        for weights in &launches {
+            assert_eq!(weights.len(), TOP_K, "{config}");
+        }
+        let grouped = ops.iter().filter(|op| matches!(op, Op::Grouped { .. }));
+        for op in grouped {
+            let Op::Grouped { rows_per_call, .. } = op else {
+                unreachable!();
+            };
+            assert!(rows_per_call.iter().all(|&rows| rows == 1), "{config}");
+        }
     }
-    // Three grouped launches per layer walk: gate, up, down.
-    let ops = walk(false, 1, 1);
-    assert_eq!(grouped_count(&ops), 3, "gate, up and down projections");
-    for op in ops.iter().filter(|op| matches!(op, Op::Grouped { .. })) {
-        let Op::Grouped {
-            weights,
-            rows_per_call,
-            ..
-        } = op
-        else {
-            unreachable!();
-        };
-        assert_eq!(weights.len(), TOP_K);
-        assert!(rows_per_call.iter().all(|&rows| rows == 1));
-    }
+    let production = walk(false, 1, 1);
+    let rollback = walk_rollback(false, 1, 1);
+    assert_ne!(
+        masked(&production),
+        masked(&rollback),
+        "the fused and rollback publish paths must differ"
+    );
+    assert!(
+        production
+            .iter()
+            .any(|op| matches!(op, Op::GroupedPublished { .. }))
+    );
+    assert!(
+        !rollback
+            .iter()
+            .any(|op| matches!(op, Op::GroupedPublished { .. }))
+    );
 }
 
 #[test]
 fn rows1_host_mode_identity_is_the_only_per_token_launch_datum() {
-    let ids = routing(1, 9);
-    let grouping = Grouping::new(&ids, 1, EXPERTS).unwrap();
-    let mut recorder = Recorder::new(false);
-    run(&mut recorder, block(1), &ids, &grouping, 0).unwrap();
-    let ops = recorder.ops;
-
-    // The host names each routed expert exactly once per layer walk...
-    let named: Vec<usize> = ops
-        .iter()
-        .filter_map(|op| match op {
-            Op::ExpertId(id) => Some(*id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(named, ids.iter().map(|&id| id as usize).collect::<Vec<_>>());
-    // ...and the first grouped launch (gate) names the same six descriptors
-    // in pair order.
-    let Op::Grouped { weights, .. } = first_grouped(&ops) else {
-        unreachable!();
-    };
-    assert_eq!(
-        *weights,
-        ids.iter().map(|&id| id as usize).collect::<Vec<_>>()
-    );
-
-    // A different route keeps the masked topology but moves the descriptors:
-    // the same launch sequence with different pointers, which is exactly what
-    // a graph capture would bake.
-    let other_ids = routing(1, 10);
-    let other_grouping = Grouping::new(&other_ids, 1, EXPERTS).unwrap();
-    let mut other = Recorder::new(false);
-    run(&mut other, block(1), &other_ids, &other_grouping, 0).unwrap();
-    assert_ne!(other.ops, ops);
-    assert_eq!(masked(&other.ops), masked(&ops));
+    for (config, walk_fn) in CONFIGS {
+        let ops = walk_fn(false, 1, 9);
+        let ids = routing(1, 9);
+        // The host names each routed expert exactly once per layer walk...
+        let named: Vec<usize> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::ExpertId(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            named,
+            ids.iter().map(|&id| id as usize).collect::<Vec<_>>(),
+            "{config}"
+        );
+        // ...and every identity-bearing launch (gate, up, down) names the
+        // same six descriptors in pair order.
+        let expected = ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        for weights in identity_launches(&ops) {
+            assert_eq!(weights, expected, "{config}");
+        }
+        // A different route keeps the masked topology but moves the
+        // descriptors: the same launch sequence with different pointers,
+        // which is exactly what a graph capture would bake.
+        let other = walk_fn(false, 1, 11);
+        assert_ne!(other, ops, "{config}: routes must differ");
+        assert_eq!(masked(&other), masked(&ops), "{config}");
+    }
 }
 
 #[test]
 fn rows1_picks_mode_is_replay_safe_with_the_same_topology() {
-    let host = walk(false, 1, 21);
-    let picks = walk(true, 1, 21);
-    // Same launch structure in both modes...
-    assert_eq!(masked(&picks), masked(&host));
-    // ...but the picks mode never asks the host for an id, never uploads
-    // indices, and every launch names the canonical bank descriptor (member
-    // 0); the device's id buffer selects the member, so replay is exact.
-    assert!(
-        picks
-            .iter()
-            .all(|op| !matches!(op, Op::ExpertId(_)) && !matches!(op, Op::Indices { .. }))
-    );
-    assert_eq!(
-        picks
-            .iter()
-            .filter(|op| matches!(op, Op::PickDescriptor))
-            .count(),
-        TOP_K
-    );
-    for op in picks.iter().filter(|op| matches!(op, Op::Grouped { .. })) {
-        let Op::Grouped { weights, .. } = op else {
-            unreachable!();
-        };
-        assert!(weights.iter().all(|&weight| weight == 0));
+    for (config, walk_fn) in CONFIGS {
+        let host = walk_fn(false, 1, 21);
+        let picks = walk_fn(true, 1, 21);
+        // Same launch structure in both modes...
+        assert_eq!(masked(&picks), masked(&host), "{config}");
+        // ...but the picks mode never asks the host for an id, never uploads
+        // indices, and every launch names the canonical bank descriptor
+        // (member 0); the device's id buffer selects the member, so replay
+        // is exact.
+        assert!(picks.iter().all(|op| !matches!(op, Op::ExpertId(_))));
+        assert_eq!(
+            picks
+                .iter()
+                .filter(|op| matches!(op, Op::PickDescriptor))
+                .count(),
+            TOP_K,
+            "{config}"
+        );
+        for weights in identity_launches(&picks) {
+            assert!(weights.iter().all(|&weight| weight == 0), "{config}");
+        }
     }
 }
 
 #[test]
 fn rows1_walk_uploads_no_route_indices_or_gathers() {
-    for picks in [false, true] {
-        let ops = walk(picks, 1, 5);
-        assert!(
-            ops.iter().all(|op| !matches!(op, Op::Gather { .. })),
-            "decode gather appeared, picks {picks}"
-        );
-        assert!(
-            ops.iter().all(|op| !matches!(op, Op::Indices { .. })),
-            "decode index upload appeared, picks {picks}"
-        );
+    for (config, walk_fn) in CONFIGS {
+        for picks in [false, true] {
+            let ops = walk_fn(picks, 1, 5);
+            assert!(
+                ops.iter().all(|op| !matches!(op, Op::Gather { .. })),
+                "decode gather appeared, {config}, picks {picks}"
+            );
+            assert!(
+                ops.iter().all(|op| !matches!(op, Op::Indices { .. })),
+                "decode index upload appeared, {config}, picks {picks}"
+            );
+        }
     }
     // The multi-row walk does gather and upload indices; the claim above is
     // deliberately decode-only.
