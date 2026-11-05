@@ -584,6 +584,10 @@ impl FlintExecutor {
         // A Flint session runs its single-row projections on the wide kernel unless the operator
         // names another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); same bytes, faster.
         ctx.set_single_row_default(SingleRow::Wide(1));
+        // The Qwen3.6 EXL3 start's check: a bad FIFI_EXL3_DP4A or FIFI_EXL3_INDEXED_PAIRS, or an
+        // id-indexed option with a wide kernel of two or four tiles, stops the open instead of the
+        // first routed launch.
+        ctx.check_single_gather()?;
         let stream = ctx.stream()?;
         let lazy_return = cache_enabled && alloc_lazy_return_armed();
         if let (LayerMajor::Jobs, Some(rows), true) = (mode, piece_rows, cache_enabled) {
@@ -1225,6 +1229,26 @@ mod open_switch_tests {
         assert!(
             !body.contains("layer_major_from_env("),
             "the open reads the switches only through open_switches"
+        );
+    }
+
+    /// The open checks the EXL3 launch switches against the session's single-row default, before
+    /// it allocates a stream.
+    #[test]
+    fn the_open_checks_the_launch_switches_before_the_stream() {
+        let source = include_str!("cuda_executor.rs");
+        let open = source.find("    fn open_with(").expect("open_with");
+        let body = &source[open..];
+        let default = body
+            .find("ctx.set_single_row_default(")
+            .expect("the single-row default in open_with");
+        let check = body
+            .find("ctx.check_single_gather()?")
+            .expect("the switch check in open_with");
+        let stream = body.find("ctx.stream()").expect("the stream in open_with");
+        assert!(
+            default < check && check < stream,
+            "check_single_gather() must follow set_single_row_default() and precede ctx.stream()"
         );
     }
 
