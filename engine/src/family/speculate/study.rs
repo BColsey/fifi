@@ -8,9 +8,11 @@
 //! future length shortens a draft or a window; a stream that stopped early ends the window at the
 //! stop token exactly as `accept_run` does.
 //!
-//! The decision rule is fixed in the protocol: `speedup = E[accepted + 1] / (W(k + 1) + k *
-//! c_head)` against a gate of 1.15. The Python reference with the same golden vectors is
-//! `analyze.py` in the study's scratch directory.
+//! The decision rule is fixed in the protocol: `speedup = E[accepted + 1] / (W(k + 1) + H(k))`
+//! against a gate of 1.15, with `H(k)` the cost of drafting the k-token chain. A window and head
+//! cost whose ceiling `(k + 1) / (W + H)` is below the gate is marked infeasible instead of being
+//! given an acceptance above 100 percent. The Python collector in `qualification/mtp-acceptance/`
+//! scores the same traces and uses the same golden vectors.
 
 use super::accept::accept_run;
 use crate::EngError;
@@ -75,14 +77,47 @@ pub(crate) fn mean_tokens(windows: &[WindowOutcome]) -> f64 {
     tokens as f64 / windows.len().max(1) as f64
 }
 
-/// `E[accepted + 1] / (W(k + 1) + k * c_head)`, all costs in solo decode steps.
-pub(crate) fn speedup(mean_tokens: f64, window_cost: f64, k: usize, c_head: f64) -> f64 {
-    mean_tokens / (window_cost + k as f64 * c_head)
+/// `E[accepted + 1] / (W(k + 1) + H(k))`: all costs in solo decode steps. `H(k)` is the cost of
+/// drafting the whole k-token chain (`k * c_head` when every chained step costs the same).
+pub(crate) fn speedup(mean_tokens: f64, window_cost: f64, draft_cost: f64) -> f64 {
+    mean_tokens / (window_cost + draft_cost)
 }
 
-/// The largest `W(k + 1)` that still reaches `GATE`.
-pub(crate) fn max_window_cost(mean_tokens: f64, k: usize, c_head: f64) -> f64 {
-    mean_tokens / GATE - k as f64 * c_head
+/// The largest `W(k + 1)` that still reaches the gate, or why no window can.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Budget {
+    Largest(f64),
+    /// The chain alone costs at least `E / GATE`: no window cost pays.
+    Infeasible,
+}
+
+pub(crate) fn max_window_cost(mean_tokens: f64, draft_cost: f64) -> Budget {
+    let budget = mean_tokens / GATE - draft_cost;
+    if budget <= 0.0 {
+        Budget::Infeasible
+    } else {
+        Budget::Largest(budget)
+    }
+}
+
+/// What a measured window cost asks of acceptance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Requirement {
+    /// `E[accepted + 1]` must reach `required_tokens`, which is at most `k + 1`.
+    Reachable { required_tokens: f64 },
+    /// Even at full acceptance (`k + 1` tokens per window) the speedup stays below the gate.
+    /// There is no acceptance to ask for, so none is reported.
+    Infeasible { ceiling_speedup: f64 },
+}
+
+pub(crate) fn requirement(k: usize, window_cost: f64, draft_cost: f64) -> Requirement {
+    let ceiling_speedup = (k + 1) as f64 / (window_cost + draft_cost);
+    if ceiling_speedup < GATE {
+        return Requirement::Infeasible { ceiling_speedup };
+    }
+    Requirement::Reachable {
+        required_tokens: GATE * (window_cost + draft_cost),
+    }
 }
 
 #[cfg(test)]
@@ -169,17 +204,73 @@ mod tests {
     #[test]
     fn the_registered_example_needs_a_window_of_1_52_solo_steps() {
         // k = 1, per-position acceptance 0.75, free head: E = 1.75, so W(2) <= 1.75 / 1.15.
-        let limit = max_window_cost(1.75, 1, 0.0);
+        let Budget::Largest(limit) = max_window_cost(1.75, 0.0) else {
+            panic!("a free head leaves a budget");
+        };
         assert!((limit - 1.521_739).abs() < 1e-6);
-        assert!((speedup(1.75, limit, 1, 0.0) - GATE).abs() < 1e-12);
+        assert!((speedup(1.75, limit, 0.0) - GATE).abs() < 1e-12);
     }
 
     #[test]
-    fn a_head_step_costs_window_budget_one_for_one() {
-        let free = max_window_cost(1.9, 1, 0.0);
-        let paid = max_window_cost(1.9, 1, 0.10);
+    fn drafting_cost_comes_off_the_window_budget_one_for_one() {
+        let (Budget::Largest(free), Budget::Largest(paid)) =
+            (max_window_cost(1.9, 0.0), max_window_cost(1.9, 0.10))
+        else {
+            panic!("both leave a budget");
+        };
         assert!((free - paid - 0.10).abs() < 1e-12);
-        // k chained steps pay k times.
-        assert!((max_window_cost(2.5, 3, 0.1) - (2.5 / GATE - 0.3)).abs() < 1e-12);
+        let Budget::Largest(chain) = max_window_cost(2.5, 3.0 * 0.1) else {
+            panic!("a three-step chain leaves a budget");
+        };
+        assert!((chain - (2.5 / GATE - 0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_chain_that_eats_the_whole_budget_is_infeasible() {
+        assert_eq!(max_window_cost(1.2, 1.1), Budget::Infeasible);
+    }
+
+    #[test]
+    fn a_window_that_cannot_reach_the_gate_even_at_full_acceptance_is_marked_infeasible() {
+        // W(2) = 1.65 with H(1) = 0.10: at most 2 / 1.75 = 1.143x even at p = 1.
+        match requirement(1, 1.65, 0.10) {
+            Requirement::Infeasible { ceiling_speedup } => {
+                assert!((ceiling_speedup - 2.0 / 1.75).abs() < 1e-12)
+            }
+            other => panic!("expected an infeasible combination, got {other:?}"),
+        }
+        // The Qwen3.6 EXL3 chunk entry cannot pay at any head cost.
+        for (k, window) in [(1, 3.16), (2, 3.35), (3, 3.69)] {
+            assert!(matches!(
+                requirement(k, window, 0.0),
+                Requirement::Infeasible { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_reachable_window_never_asks_for_more_than_full_acceptance() {
+        for k in 1..=3usize {
+            for window in [1.2, 1.4, 1.59, 1.82, 2.2, 2.7] {
+                for draft in [0.0, 0.05, 0.10, 0.15] {
+                    let h = draft * k as f64;
+                    match requirement(k, window, h) {
+                        Requirement::Reachable { required_tokens } => {
+                            assert!(
+                                required_tokens <= (k + 1) as f64 + 1e-12,
+                                "k {k} W {window} H {h}"
+                            )
+                        }
+                        Requirement::Infeasible { ceiling_speedup } => {
+                            assert!(ceiling_speedup < GATE)
+                        }
+                    }
+                }
+            }
+        }
+        let Requirement::Reachable { required_tokens } = requirement(1, 1.59, 0.10) else {
+            panic!("W(2) = 1.59 with H = 0.10 is reachable");
+        };
+        assert!((required_tokens - 1.15 * 1.69).abs() < 1e-12);
     }
 }
