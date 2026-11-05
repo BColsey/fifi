@@ -14,4 +14,6 @@ pub(crate) mod driver;
 pub(crate) mod mtp;
 pub(crate) mod repeat;
 pub(crate) mod stats;
+#[cfg(test)]
+mod study;
 pub(crate) mod window;
