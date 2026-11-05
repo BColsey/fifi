@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "version": 1,
+ "version": 2,
  "description": "Authoritative public-vocabulary policy shared by the publisher sanitizer and the published_text gate. Every entry is classified; additions require a classification receipt.",
  "allowed_tags": [
   {
@@ -642,6 +642,21 @@
    "tag": "A-Z0-9",
    "class": "regex-class",
    "origin": "regex character-class vocabulary in published Python scanners; never an internal plan code"
+  },
+  {
+   "tag": "RESOURCE-CONSTRAINED",
+   "class": "technical-english",
+   "origin": "public CLI verdict string in engine/src/capability/cli.rs"
+  },
+  {
+   "tag": "NOT-SELECTED",
+   "class": "technical-english",
+   "origin": "surface-selection status term in scripts/qual_inventory.py docstring"
+  },
+  {
+   "tag": "P0A-01",
+   "class": "fixture-data",
+   "origin": "task identifier recorded inside the published test fixture engine/testdata/mac-phase0a.json"
   }
  ],
  "exceptions": []

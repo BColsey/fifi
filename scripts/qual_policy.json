@@ -53,14 +53,10 @@
       "env": {},
       "expect": {
         "min_ran": 2950,
-        "max_failed": 1,
-        "allowed_failures": [
-          "published_text::published_files_carry_no_internal_plan_labels"
-        ],
-        "require_all_allowed_failures": true
+        "max_failed": 0
       },
       "fixtures_required": [],
-      "baseline_note": "The allowed failure is pre-existing on main at ec0296ed9 (internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs); it stays listed until those labels are reworded, and this entry fails the moment the test starts passing again. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count. Under --nocapture, libtest writes the 'test NAME ... ' prefix without a newline, so prints from the test body can land on that line (glued status) or push the status onto a later bare line; the parser completes those torn shapes while keeping the counted==summary invariant (any miscount still fails). The >60-second libtest notices are noise lines and do not affect the count.",
+      "baseline_note": "Waiver retired 2026-11-04: the historical allowed failure (published_text::published_files_carry_no_internal_plan_labels, pre-existing at ec0296ed9 from internal plan labels in docs/plans/q36-multigpu-pcie-ring.md, engine/src/capability/bundle.rs, engine/src/family/qwen36/cuda/card_block_device_tests.rs) is reconciled by the shared sanitizer policy — the test passes and any regression now fails outright. The floor counts only executed tests (passed plus failed minus fixture-skip lines): verified 2988 executed on a fixture-equipped host and 2975 on a fixture-less host at ec0296ed9; 2950 sits just below the fixture-less count. Under --nocapture, libtest writes the 'test NAME ... ' prefix without a newline, so prints from the test body can land on that line (glued status) or push the status onto a later bare line; the parser completes those torn shapes while keeping the counted==summary invariant (any miscount still fails). The >60-second libtest notices are noise lines and do not affect the count.",
       "timeout_sec": 3600
     },
     {

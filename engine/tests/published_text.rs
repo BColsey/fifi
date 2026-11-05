@@ -41,25 +41,30 @@ const EXTENSIONS: &[&str] = &[
 /// test keeps working in a public checkout where internal-only directories are stripped.
 fn allowed_tags() -> &'static [String] {
     static ALLOWED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    ALLOWED.get_or_init(|| {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/sanitize_policy.json");
-        let text = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("shared policy unreadable at {}: {error}", path.display())
-        });
-        let policy: serde_json::Value = serde_json::from_str(&text)
-            .unwrap_or_else(|error| panic!("shared policy must be valid JSON: {error}"));
-        policy["allowed_tags"]
-            .as_array()
-            .expect("policy allowed_tags must be an array")
-            .iter()
-            .map(|entry| {
-                entry["tag"]
-                    .as_str()
-                    .expect("every policy entry names a tag")
-                    .to_string()
-            })
-            .collect()
-    })
+    ALLOWED.get_or_init(|| read_policy_tags(&shared_policy_path()))
+}
+
+fn shared_policy_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/sanitize_policy.json")
+}
+
+/// Fails closed: a missing or malformed policy panics this gate, never skips.
+fn read_policy_tags(path: &Path) -> Vec<String> {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("shared policy unreadable at {}: {error}", path.display()));
+    let policy: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("shared policy must be valid JSON: {error}"));
+    policy["allowed_tags"]
+        .as_array()
+        .expect("policy allowed_tags must be an array")
+        .iter()
+        .map(|entry| {
+            entry["tag"]
+                .as_str()
+                .expect("every policy entry names a tag")
+                .to_string()
+        })
+        .collect()
 }
 
 /// Tells whether the text after a phrase starts the number or code that makes it a reference.
@@ -398,6 +403,19 @@ fn the_label_rules_match_codes_and_skip_ordinary_words() {
         labels("a decision tree, the lane width, Content-Type, sm_86, a fix for it").is_empty()
     );
     assert!(labels(concat!("PER-LAYER growth over C", "-1 rows")).is_empty());
+}
+
+#[test]
+fn a_missing_or_malformed_policy_fails_closed() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let missing = dir.path().join("no-such-policy.json");
+    let result = std::panic::catch_unwind(|| read_policy_tags(&missing));
+    assert!(result.is_err(), "a missing policy must panic, not skip");
+
+    let malformed = dir.path().join("bad-policy.json");
+    fs::write(&malformed, "{ not json").unwrap();
+    let result = std::panic::catch_unwind(|| read_policy_tags(&malformed));
+    assert!(result.is_err(), "a malformed policy must panic, not skip");
 }
 
 #[test]
