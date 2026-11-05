@@ -126,3 +126,95 @@ mod gemma4_reference_tests;
 
 #[cfg(test)]
 mod top_logits;
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod wrapper_completeness {
+    //! Guards the one silent list of the recipe above: a missing `pub(crate) mod <n>;` line here
+    //! compiles the wrapper file nowhere, so its tests vanish without a failure (a missing line
+    //! in `native/resident.rs` or `build.rs` fails the build instead).
+
+    use std::{fs, path::PathBuf};
+
+    /// Resident `.rs` files that are not modules of this directory (none today). Name a file
+    /// here when a new kind of non-module source joins the directory.
+    const NON_MODULE_FILES: &[&str] = &[];
+
+    #[test]
+    fn every_resident_source_file_has_an_active_module_declaration() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/kernels/cuda/resident");
+        let source = fs::read_to_string(dir.join("mod.rs")).expect("read resident/mod.rs");
+        let declared = active_module_names(&source);
+        let mut missing: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&dir).expect("read the resident directory") {
+            let entry = entry.expect("resident directory entry");
+            if !entry.file_type().expect("resident entry type").is_file() {
+                continue; // wrapper test directories such as resident/<n>/
+            }
+            let name = entry.file_name().into_string().expect("UTF-8 file name");
+            let Some(stem) = name.strip_suffix(".rs") else {
+                continue;
+            };
+            if stem != "mod"
+                && !NON_MODULE_FILES.contains(&name.as_str())
+                && !declared.iter().any(|declared| declared == stem)
+            {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "resident files without an active `mod` declaration in resident/mod.rs, so their \
+             tests silently vanish: {}",
+            missing.join(", ")
+        );
+    }
+
+    /// Names of the active `mod <n>;` and `pub(crate) mod <n>;` declarations of `source`, in
+    /// order. Commented-out declarations never count: the block-comment depth carries across
+    /// lines, because a block comment may open mid-line and nest, and a line counts only when
+    /// it starts outside a block comment with the declaration keyword. Odd spellings such as
+    /// `mod /* c */ n;` are rejected on purpose: the guard fails closed.
+    fn active_module_names(source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut block_depth = 0u32;
+        for line in source.lines() {
+            let bytes = line.as_bytes();
+            let start_depth = block_depth;
+            let mut at = 0;
+            while at < bytes.len() {
+                if block_depth == 0 && bytes[at] == b'/' && bytes.get(at + 1) == Some(&b'/') {
+                    break; // a line comment hides the rest of the line
+                }
+                if bytes[at] == b'/' && bytes.get(at + 1) == Some(&b'*') {
+                    block_depth += 1;
+                    at += 2;
+                    continue;
+                }
+                if block_depth > 0 && bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/') {
+                    block_depth -= 1;
+                    at += 2;
+                    continue;
+                }
+                at += 1;
+            }
+            if start_depth != 0 {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            let name = trimmed
+                .strip_prefix("pub(crate) mod ")
+                .or_else(|| trimmed.strip_prefix("mod "))
+                .and_then(|rest| rest.split(';').next())
+                .filter(|name| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                });
+            if let Some(name) = name {
+                names.push(name.to_string());
+            }
+        }
+        names
+    }
+}
