@@ -318,8 +318,6 @@ impl CudaContext {
         })
     }
 
-    /// Enqueues the zeroing of the sticky EXL3 arithmetic flag word `flag`. Runs right after
-
     /// Enqueues `step_advance` by `m` (`1..=MAX_ADVANCE`) on `stream`: `pos`, `kv_len` and
     /// `kv_slot` move together when the state is valid and `pos + m <= POS_MAX`; in every other
     /// case all three become -1. `token_id` and `status` are never written. Must be the last

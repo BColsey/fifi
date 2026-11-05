@@ -464,12 +464,6 @@ fn the_card_moe_sequence_aligns_its_markers_on_every_card() {
 /// On the native list: every slot an op touches is live in its phase in the NATIVE plan, and
 /// two slots that share bytes are never live at the same launch position (the aliasing rule,
 /// spelled over the merged ops).
-/// The card sequence keeps the Native order and inserts the two ring markers where the
-/// token plan of `multi.rs` places them: the picks broadcast right after the router on
-/// card 0 (and at the same place as a receive on every other card), the partial sum
-/// directly before the combine. Both cards run the SAME marker sequence, and the local
-/// ops between the markers are identical.
-#[test]
 #[test]
 fn native_moe_ops_stay_inside_their_slot_lifetimes() {
     let plan = plan_of(WeightLayout::Native);
