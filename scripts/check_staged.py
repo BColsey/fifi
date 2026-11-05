@@ -340,11 +340,51 @@ def run_pre_push() -> None:
     print("Pre-push main protection passed.")
 
 
+def staged_publisher_gate(root: Path) -> None:
+    """Publisher code can carry internal vocabulary that only the
+    published-text Rust suite catches (the v4.1 slice slipped exactly
+    that way past Python-only gates), so a commit touching publisher
+    files must pass that suite. First build in a cold worktree is the
+    cost of enforcing this at commit time."""
+    result = run_git(["diff", "--cached", "--name-only"], cwd=root)
+    staged = result.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    if not any(
+        path == "qualification/publisher" or path.startswith("qualification/publisher/")
+        for path in staged
+    ):
+        print("Staged publisher gate not required (no publisher files staged).")
+        return
+    engine = root / "engine"
+    if shutil.which("cargo") is None or not engine.is_dir():
+        raise CheckError(
+            "publisher files staged but cargo/engine is unavailable to run "
+            "the published-text gate"
+        )
+    try:
+        gate = subprocess.run(
+            ["cargo", "test", "--locked", "--test", "published_text", "--quiet"],
+            cwd=engine,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise CheckError(f"could not run the published-text gate: {error}") from error
+    if gate.returncode != 0:
+        details = gate.stderr.decode("utf-8", errors="backslashreplace").strip()
+        raise CheckError(
+            "published-text gate failed for staged publisher files"
+            + (f": {details[-800:]}" if details else "")
+        )
+    print("Staged publisher published-text gate passed.")
+
+
 def run_pre_commit() -> None:
     root = repository_root()
     staged_python_blobs(root)
     staged_secret_patterns(root)
     staged_host_details(root)
+    staged_publisher_gate(root)
     run_growth_report(root)
 
 

@@ -236,8 +236,13 @@ class StagedGateTests(unittest.TestCase):
                   'TOKEN = "' + "kub" + owner + '-msg"' + chr(10))
         self.git("add", "-f", "--", "qualification/publisher/pinned/publish_commits.py",
                  "qualification/publisher/pinned/sanitize.py")
+        # Publisher files are staged, so the published-text gate must be
+        # satisfiable in this fixture too.
+        self.fake_cargo()
+        self.write("engine/Cargo.toml", "[package]\n")
+        self.git("add", "--", "engine/Cargo.toml")
 
-        result = self.run_pre_commit()
+        result = self.run_hook("pre-commit", env=self.env_with(self.root / "fake-cargo-bin"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -431,6 +436,61 @@ class StagedGateTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("growth report schema", result.stderr)
+
+    def fake_cargo(self, exit_status: int = 0) -> Path:
+        """A PATH-directory holding a `cargo` stub that records its argv."""
+        stub_dir = self.root / "fake-cargo-bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "cargo"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'echo "$@" > "{stub_dir}/cargo-args"\n'
+            f"exit {exit_status}\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        return stub_dir
+
+    def env_with(self, stub_dir: Path) -> dict:
+        env = dict(os.environ)
+        env["PATH"] = str(stub_dir) + os.pathsep + env["PATH"]
+        return env
+
+    def test_publisher_files_stage_runs_the_published_text_gate(self) -> None:
+        self.fake_cargo()
+        self.write("qualification/publisher/reconcile.py", "x = 1\n")
+        self.write("engine/Cargo.toml", "[package]\n")
+        self.stage("qualification/publisher/reconcile.py", "engine/Cargo.toml")
+
+        result = self.run_hook("pre-commit", env=self.env_with(self.root / "fake-cargo-bin"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("published-text gate passed", result.stdout)
+        args = (self.root / "fake-cargo-bin" / "cargo-args").read_text().splitlines()
+        self.assertEqual(args, ["test --locked --test published_text --quiet"])
+
+    def test_publisher_gate_failure_blocks_the_commit(self) -> None:
+        self.fake_cargo(exit_status=1)
+        self.write("qualification/publisher/README.md", "text\n")
+        self.write("engine/Cargo.toml", "[package]\n")
+        self.stage("qualification/publisher/README.md", "engine/Cargo.toml")
+
+        result = self.run_hook("pre-commit", env=self.env_with(self.root / "fake-cargo-bin"))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published-text gate failed", result.stderr)
+
+    def test_commits_without_publisher_files_skip_the_gate(self) -> None:
+        # A failing stub proves the gate never runs when it is not required.
+        self.fake_cargo(exit_status=5)
+        self.write("app.py", "value = 2\n")
+        self.stage("app.py")
+
+        result = self.run_hook("pre-commit", env=self.env_with(self.root / "fake-cargo-bin"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no publisher files staged", result.stdout)
+        self.assertFalse((self.root / "fake-cargo-bin" / "cargo-args").exists())
 
     def test_pre_commit_reports_missing_python3(self) -> None:
         no_python = self.root / "no-python-bin"
