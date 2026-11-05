@@ -4,7 +4,8 @@
 //!
 //! The kernels are the vendored xavier-qwen per-token math restated in a value-sliced launch
 //! with the q/k L2 norms in the ggml form; the wrapper's tests pin both against an f64
-//! reference and against the decode kernel.
+//! reference and against the decode kernel. The `form` bits select the Hugging Face rules
+//! (grouped key heads, `rsqrt(sum + eps)` L2 norms, sigmoid output gate) per rule.
 //!
 //! Safety invariants this file relies on:
 //! - The launch entry is called only through `CudaContext::launch_on`, on the thread that
@@ -55,10 +56,11 @@ struct GdnScanSeqArgsRaw {
     n_v_heads: c_int,
     head_dim: c_int,
     eps: f32,
+    form: c_int,
 }
 
 const _: () = assert!(
-    size_of::<GdnScanSeqArgsRaw>() == 112
+    size_of::<GdnScanSeqArgsRaw>() == 120
         && offset_of!(GdnScanSeqArgsRaw, conv) == 0
         && offset_of!(GdnScanSeqArgsRaw, state) == 40
         && offset_of!(GdnScanSeqArgsRaw, status) == 56
@@ -71,7 +73,14 @@ const _: () = assert!(
         && offset_of!(GdnScanSeqArgsRaw, n_k_heads) == 96
         && offset_of!(GdnScanSeqArgsRaw, head_dim) == 104
         && offset_of!(GdnScanSeqArgsRaw, eps) == 108
+        && offset_of!(GdnScanSeqArgsRaw, form) == 112
 );
+
+/// The `INFERENCE_CUDA_GDN_FORM_*` bits of `gdn_scan_seq.h`.
+pub(in crate::kernels::cuda) const FORM_GROUPED_HEADS: c_int = 1;
+pub(in crate::kernels::cuda) const FORM_ADD_EPS_L2: c_int = 2;
+pub(in crate::kernels::cuda) const FORM_SIGMOID_GATE: c_int = 4;
+const FORM_ALL: c_int = FORM_GROUPED_HEADS | FORM_ADD_EPS_L2 | FORM_SIGMOID_GATE;
 
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_scan_seq_launch"]
@@ -112,7 +121,7 @@ pub(in crate::kernels::cuda) struct GdnScanSeqInts {
 /// What one scan launch reads and writes: `conv` the conv output rows, `proj` the projection
 /// rows (z, beta, alpha), the per-head weights, the in-place `state`, the `o_out` rows
 /// (written pre-norm by the scan kernel, rewritten in place by the out-gate kernel), the
-/// optional prefill status word and the integers.
+/// optional prefill status word, the integers and the form bits.
 pub(in crate::kernels::cuda) struct GdnScanSeqRaw<'a> {
     pub(in crate::kernels::cuda) conv: RawRange<'a>,
     pub(in crate::kernels::cuda) proj: RawRange<'a>,
@@ -124,6 +133,7 @@ pub(in crate::kernels::cuda) struct GdnScanSeqRaw<'a> {
     pub(in crate::kernels::cuda) status: Option<RawRange<'a>>,
     pub(in crate::kernels::cuda) ints: GdnScanSeqInts,
     pub(in crate::kernels::cuda) eps: f32,
+    pub(in crate::kernels::cuda) form: c_int,
 }
 
 struct Needs {
@@ -215,7 +225,7 @@ fn check_scan(io: &GdnScanSeqRaw<'_>) -> Result<(), DeviceFailure> {
                 && status.apart(&out)
                 && reads.iter().all(|read| status.apart(read))
         });
-    if !(fitted && apart) {
+    if !(fitted && apart) || io.form & !FORM_ALL != 0 {
         return Err(invalid_argument());
     }
     Ok(())
@@ -246,6 +256,7 @@ fn c_args(io: &GdnScanSeqRaw<'_>) -> GdnScanSeqArgsRaw {
         n_v_heads: io.ints.n_v_heads,
         head_dim: io.ints.head_dim,
         eps: io.eps,
+        form: io.form,
     }
 }
 

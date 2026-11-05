@@ -3,7 +3,16 @@
  *
  * What it computes, per value head h (key head kh = h % n_k_heads, tiled, the GGUF layout;
  * D = head_dim = 128), per token t of m, in this order (the vendored element order,
- * ops.cu:132-139, with the two forms this path deliberately differs in marked):
+ * ops.cu:132-139, with the two forms this path deliberately differs in marked). `form` 0 is
+ * this description exactly (the Qwen3.6 GGUF form); each form bit swaps one rule:
+ *   GROUPED_HEADS  kh = h / (n_v_heads / n_k_heads) (consecutive value heads share a key
+ *                  head, the Hugging Face layout) instead of the tiled h % n_k_heads;
+ *   ADD_EPS_L2     the q/k L2 norms take rsqrt(sum(x^2) + eps) (the Hugging Face l2norm)
+ *                  instead of the ggml rsqrt(fmax(sum(x^2), eps^2)); the q scale rsqrt(D)
+ *                  stays;
+ *   SIGMOID_GATE   the output gate is sigmoid(z) = 1 / (1 + expf(-z)) instead of silu(z).
+ * Qwen3.8 Flash-Next uses all three. Each form is its own template instance, so the form-0
+ * kernels are the same code as before the bits existed.
  *   1. qv/kv: the head's D values of the conv row t (layout q | k | v of gdn_delta.h);
  *      vv: the head's D values of the v plane.
  *   2. q/k L2 norms in the GGML form (norm.cu:273), NOT the decode rsqrt(sum + eps):
@@ -41,10 +50,12 @@
  * an assertion inside a kernel); n_k_heads 1..64, n_v_heads
  * 1..128 and a multiple of n_k_heads; ld >= max(z_off + n_v*128, beta_off + n_v, alpha_off
  * + n_v) and <= 2^22, offsets >= 0; ctx_tokens 1..2^30 - 1 with p0 + m <= ctx_tokens (the
- * sum in 64 bits); eps exactly the f32 1e-6. Every range 4-byte aligned (no float4 loads
- * here); status NULL or 4-byte aligned. state and o_out must overlap no other range, and
- * the status word, when given, must overlap no range either. Enqueues two kernels on stream
- * (not NULL); never synchronizes; no device word is read.
+ * sum in 64 bits); eps exactly the f32 1e-6, used both for the q/k L2 norms and for the
+ * gated RMSNorm (Qwen3.6 and Flash-Next both configure rms_norm_eps = 1e-6; a model with
+ * another value needs a second eps field); form only the bits below. Every range 4-byte
+ * aligned (no float4 loads here); status NULL or 4-byte aligned. state and o_out must overlap
+ * no other range, and the status word, when given, must overlap no range either. Enqueues
+ * two kernels on stream (not NULL); never synchronizes; no device word is read.
  */
 #ifndef INFERENCE_CUDA_PREFILL_GDN_SCAN_SEQ_H
 #define INFERENCE_CUDA_PREFILL_GDN_SCAN_SEQ_H
@@ -56,6 +67,11 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS 1
+#define INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2 2
+#define INFERENCE_CUDA_GDN_FORM_SIGMOID_GATE 4
+#define INFERENCE_CUDA_GDN_FORM_ALL 7
 
 typedef struct inference_cuda_gdn_scan_seq_args {
     const void *conv;
@@ -78,6 +94,7 @@ typedef struct inference_cuda_gdn_scan_seq_args {
     int n_v_heads;   /* 1..128, a multiple of n_k_heads */
     int head_dim;    /* 128 */
     float eps;       /* exactly 1e-6f */
+    int form;        /* INFERENCE_CUDA_GDN_FORM_* bits; 0 is the Qwen3.6 GGUF form */
 } inference_cuda_gdn_scan_seq_args;
 
 int inference_cuda_gdn_scan_seq_launch(const inference_cuda_gdn_scan_seq_args *args,
@@ -97,7 +114,7 @@ int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
 #endif
 
 #ifdef __cplusplus
-static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 112 &&
+static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, conv) == 0 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, state) == 40 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, status) == 56 &&
@@ -109,10 +126,11 @@ static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 112 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, z_off) == 84 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, n_k_heads) == 96 &&
                   offsetof(inference_cuda_gdn_scan_seq_args, head_dim) == 104 &&
-                  offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108,
+                  offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108 &&
+                  offsetof(inference_cuda_gdn_scan_seq_args, form) == 112,
               "inference_cuda_gdn_scan_seq_args layout");
 #else
-_Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 112 &&
+_Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 120 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, conv) == 0 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, state) == 40 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, status) == 56 &&
@@ -124,7 +142,8 @@ _Static_assert(sizeof(inference_cuda_gdn_scan_seq_args) == 112 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, z_off) == 84 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, n_k_heads) == 96 &&
                    offsetof(inference_cuda_gdn_scan_seq_args, head_dim) == 104 &&
-                   offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108,
+                   offsetof(inference_cuda_gdn_scan_seq_args, eps) == 108 &&
+                   offsetof(inference_cuda_gdn_scan_seq_args, form) == 112,
                "inference_cuda_gdn_scan_seq_args layout");
 #endif
 

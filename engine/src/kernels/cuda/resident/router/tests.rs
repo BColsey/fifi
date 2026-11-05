@@ -14,7 +14,8 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{CudaContext, DeviceRange, DeviceStream};
 use crate::kernels::cuda::resident::router::{
-    ROUTER_STATUS_BIT, RouterCall, RouterOut, RouterShape, RouterWeights, router_logits_bytes,
+    ROUTER_STATUS_BIT, RouterCall, RouterOut, RouterShape, RouterSigmoidCall, RouterWeights,
+    router_logits_bytes,
 };
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CapturePlan, DeviceBuffer};
@@ -462,6 +463,10 @@ fn router_matches_the_host_references() {
         shape(2048, 256, 32, 2),
         shape(128, 8, 8, 3),
         shape(2052, 100, 2, 5),
+        // Flash-Next: 512 experts, top 10, decode and a tiled prefill chunk.
+        shape(2560, 512, 10, 1),
+        shape(2560, 512, 10, 4),
+        shape(2560, 512, 10, 16),
     ];
     let both = [
         shape(2304, 64, 8, 3),
@@ -470,6 +475,10 @@ fn router_matches_the_host_references() {
         shape(2052, 7, 7, 3),
         shape(256, 31, 4, 2),
         shape(2048, 255, 8, 2),
+        // The first count of 16 experts per lane, a partial last slot, and top 32 of 511.
+        shape(2048, 257, 10, 3),
+        shape(256, 300, 10, 2),
+        shape(2560, 511, 32, 2),
     ];
     let mut cases: Vec<(RouterShape, bool)> = gated_only.iter().map(|s| (*s, true)).collect();
     for s in both {
@@ -586,6 +595,156 @@ fn router_breaks_ties_to_the_lower_index() {
     let rig = exact_rig(&ctx, &stream, &under, 8, false);
     expect_rank(&rig, &[100, 0, 1, 2, 3, 4, 5, 6], "underflow");
     assert_eq!(rig.read_weights()[0], 1.0, "underflow: weight of the first");
+}
+
+/// 512 experts (16 per lane): ties across lanes and across the two halves of a lane's slots go
+/// to the lower index, experts in the upper half are found, and a non-finite logit in the upper
+/// half or in the partial slot of 257 experts faults the row.
+#[test]
+fn router_ranks_and_flags_512_experts() {
+    if !testkit::device_present("router_ranks_and_flags_512_experts") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut tied = [0.0f32; 512];
+    for e in [511, 300, 40, 260, 3] {
+        tied[e] = 5.0;
+    }
+    expect_rank(
+        &exact_rig(&ctx, &stream, &tied, 10, true),
+        &[3, 40, 260, 300, 511, 0, 1, 2, 4, 5],
+        "512: tie across lanes and halves",
+    );
+    let mut upper = [0.0f32; 512];
+    for (rank, e) in [480usize, 256, 511, 287].into_iter().enumerate() {
+        upper[e] = 9.0 - rank as f32;
+    }
+    let rig = exact_rig(&ctx, &stream, &upper, 10, false);
+    expect_rank(
+        &rig,
+        &[480, 256, 511, 287, 0, 1, 2, 3, 4, 5],
+        "512: upper half",
+    );
+    let sum: f32 = rig.read_weights().iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "512: weights sum {sum}");
+    for (n_expert, at) in [(512usize, 300usize), (512, 511), (257, 256)] {
+        let mut values = vec![0.0f32; n_expert];
+        values[at] = f32::NAN;
+        let rig = exact_rig(&ctx, &stream, &values, 10, true);
+        rig.call().expect("router call");
+        assert_faulty_row(&rig, 0, &format!("{n_expert} experts: NaN at {at}"));
+    }
+    let mut partial = vec![0.0f32; 257];
+    partial[256] = 2.0;
+    expect_rank(
+        &exact_rig(&ctx, &stream, &partial, 10, false),
+        &[256, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+        "257: the expert of the partial slot",
+    );
+}
+
+fn whole_range(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+    buffer.range(0, buffer.bytes())
+}
+
+/// The f32 sigmoid rule of the split select: `p = 1 / (1 + exp(-x))`, the top `k` by `p` (the
+/// lower index on a tie), weights `p_i` over the sequential sum of the selected `p` in rank order.
+fn sigmoid_route(logits: &[f32], top_k: usize) -> (Vec<i32>, Vec<f32>) {
+    let p: Vec<f32> = logits.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+    let mut order: Vec<usize> = (0..p.len()).collect();
+    order.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    let picks = &order[..top_k];
+    let sum = picks.iter().fold(0.0f32, |s, &e| s + p[e]);
+    let ids = picks.iter().map(|&e| e as i32).collect();
+    (ids, picks.iter().map(|&e| p[e] / sum).collect())
+}
+
+/// The split sigmoid select (`router_sigmoid_select_rows`) above 256 experts, where a lane holds
+/// 16: three rows of distinct logits 1/64 apart at 300 and 512 experts against the f32 rule
+/// (ids equal in rank order, weights within the R1 bound), and a NaN logit at expert 299 or 511
+/// in row 1 faults that row only.
+#[test]
+fn router_sigmoid_select_ranks_and_flags_above_256_experts() -> Result<(), EngError> {
+    if !testkit::device_present("router_sigmoid_select_ranks_and_flags_above_256_experts") {
+        return Ok(());
+    }
+    let ctx = CudaContext::new()?;
+    let stream = ctx.stream()?;
+    let (m, top_k) = (3, 10);
+    for (n_expert, step) in [(300usize, 7usize), (512, 197)] {
+        let mut logits: Vec<f32> = (0..m * n_expert)
+            .map(|i| {
+                let (t, e) = (i / n_expert, i % n_expert);
+                ((e * step + t * 61) % n_expert) as f32 / 64.0 - 4.0
+            })
+            .collect();
+        let shape = RouterShape {
+            m,
+            hidden: 4,
+            n_expert,
+            top_k,
+        };
+        let run = |values: &[f32]| -> Result<(Vec<i32>, Vec<f32>, i32), EngError> {
+            let input = testkit::upload_bytes(&ctx, &bytes_of(values));
+            let ids = testkit::upload_bytes(&ctx, &vec![POISON; m * top_k * 4]);
+            let weights = testkit::upload_bytes(&ctx, &vec![POISON; m * top_k * 4]);
+            let status = testkit::upload_bytes(&ctx, &[0u8; 4]);
+            ctx.router_sigmoid_select_rows(
+                &stream,
+                RouterSigmoidCall {
+                    shape,
+                    logits: whole_range(&input)?,
+                    ids: whole_range(&ids)?,
+                    weights: whole_range(&weights)?,
+                    status: whole_range(&status)?,
+                },
+            )?;
+            stream.synchronize()?;
+            Ok((
+                ints(&testkit::read_bytes(&ctx, &ids, m * top_k * 4)),
+                testkit::floats(&testkit::read_bytes(&ctx, &weights, m * top_k * 4)),
+                ints(&testkit::read_bytes(&ctx, &status, 4))[0],
+            ))
+        };
+        let (ids, weights, status) = run(&logits)?;
+        assert_eq!(status, 0, "{n_expert}: status");
+        for t in 0..m {
+            let (want_ids, want_w) =
+                sigmoid_route(&logits[t * n_expert..(t + 1) * n_expert], top_k);
+            let slots = t * top_k..(t + 1) * top_k;
+            assert_eq!(ids[slots.clone()], want_ids, "{n_expert} row {t}: ids");
+            for (d, h) in weights[slots].iter().zip(&want_w) {
+                let err = (f64::from(*d) - f64::from(*h)).abs() / f64::from(*h);
+                assert!(err <= R1_WEIGHT, "{n_expert} row {t}: weight {d} vs {h}");
+            }
+        }
+        logits[n_expert + n_expert - 1] = f32::NAN;
+        let (ids, weights, status) = run(&logits)?;
+        assert_eq!(
+            status & ROUTER_STATUS_BIT,
+            ROUTER_STATUS_BIT,
+            "{n_expert}: NaN status"
+        );
+        assert_eq!(
+            ids[top_k..2 * top_k],
+            vec![-1; top_k],
+            "{n_expert}: NaN row ids"
+        );
+        assert_eq!(
+            weights[top_k..2 * top_k],
+            vec![0.0f32; top_k],
+            "{n_expert}: NaN row weights"
+        );
+        assert!(
+            ids[..top_k]
+                .iter()
+                .chain(&ids[2 * top_k..])
+                .all(|&i| i >= 0),
+            "{n_expert}: a healthy row was faulted"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- T3
@@ -1049,9 +1208,9 @@ fn refuse_limits(rig: &Rig<'_>) {
             },
         ),
         (
-            "n_expert 257",
+            "n_expert 513",
             RouterShape {
-                n_expert: 257,
+                n_expert: 513,
                 ..base
             },
         ),
