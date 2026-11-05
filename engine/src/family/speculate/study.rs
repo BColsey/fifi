@@ -6,18 +6,19 @@
 //! equal the draw (`accept_run`), and the next window starts at the last committed token. Every
 //! window costs its full `k + 1` rows, whatever the recorded stream does after it, so no recorded
 //! future length shortens a draft or a window; a stream that stopped early ends the window at the
-//! stop token exactly as `accept_run` does.
+//! stop token exactly as `accept_run` does. A window with no chain, or a chain shorter than `k`,
+//! is an error: it is never read as a window with fewer drafts.
 //!
 //! The decision rule is fixed in the protocol: `speedup = E[accepted + 1] / (W(k + 1) + H(k))`
 //! against a gate of 1.15, with `H(k)` the cost of drafting the k-token chain. A window and head
 //! cost whose ceiling `(k + 1) / (W + H)` is below the gate is marked infeasible instead of being
 //! given an acceptance above 100 percent. The Python collector in `qualification/mtp-acceptance/`
-//! scores the same traces and uses the same golden vectors.
+//! scores the same traces; its trace tests use the same hand-made vector as `golden()` below.
 
 use super::accept::accept_run;
 use crate::EngError;
 
-/// End-to-end gate Dan set on 2026-11-05.
+/// End-to-end gate set for the study.
 pub(crate) const GATE: f64 = 1.15;
 
 /// The target's greedy stream and the head's chains over it.
@@ -25,7 +26,8 @@ pub(crate) struct Trace<'a> {
     /// Tokens `s_0 ..` the target drew. Holds at least `scored + max_k + 1` tokens unless it ends
     /// with a stop token.
     pub(crate) stream: &'a [u32],
-    /// `chains[m][j - 1]` is the head's draft for `s_{m + j}`, with `s_m` pending.
+    /// `chains[m][j - 1]` is the head's draft for `s_{m + j}`, with `s_m` pending. Every scored
+    /// position needs a chain of at least `k` drafts.
     pub(crate) chains: &'a [Vec<u32>],
     /// Pending positions `0..scored` may start a window.
     pub(crate) scored: usize,
@@ -40,6 +42,20 @@ pub(crate) struct WindowOutcome {
     pub(crate) committed: usize,
 }
 
+/// The first `k` drafts of the chain at `pending`, or an error when there is no such chain.
+fn chain_of<'a>(trace: &Trace<'a>, pending: usize, k: usize) -> Result<&'a [u32], EngError> {
+    match trace.chains.get(pending) {
+        Some(chain) if chain.len() >= k => Ok(&chain[..k]),
+        Some(chain) => Err(EngError::BadRequest(format!(
+            "draft chain at position {pending} holds {} drafts, the window needs {k}",
+            chain.len()
+        ))),
+        None => Err(EngError::BadRequest(format!(
+            "no draft chain at position {pending}"
+        ))),
+    }
+}
+
 /// Renewing windows with `k` drafts over the trace, in order.
 pub(crate) fn renewing_windows(
     trace: &Trace<'_>,
@@ -49,8 +65,7 @@ pub(crate) fn renewing_windows(
     let mut out = Vec::new();
     let mut pending = 0;
     while pending < trace.scored {
-        let drafts = trace.chains.get(pending).map(Vec::as_slice).unwrap_or(&[]);
-        let drafts = &drafts[..k.min(drafts.len())];
+        let drafts = chain_of(trace, pending, k)?;
         let run = accept_run(
             drafts,
             usize::MAX,
@@ -87,12 +102,16 @@ pub(crate) fn speedup(mean_tokens: f64, window_cost: f64, draft_cost: f64) -> f6
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Budget {
     Largest(f64),
-    /// The chain alone costs at least `E / GATE`: no window cost pays.
+    /// The chain alone costs at least `E / gate`: no window cost pays.
     Infeasible,
 }
 
 pub(crate) fn max_window_cost(mean_tokens: f64, draft_cost: f64) -> Budget {
-    let budget = mean_tokens / GATE - draft_cost;
+    max_window_cost_at(GATE, mean_tokens, draft_cost)
+}
+
+fn max_window_cost_at(gate: f64, mean_tokens: f64, draft_cost: f64) -> Budget {
+    let budget = mean_tokens / gate - draft_cost;
     if budget <= 0.0 {
         Budget::Infeasible
     } else {
@@ -111,12 +130,16 @@ pub(crate) enum Requirement {
 }
 
 pub(crate) fn requirement(k: usize, window_cost: f64, draft_cost: f64) -> Requirement {
+    requirement_at(GATE, k, window_cost, draft_cost)
+}
+
+fn requirement_at(gate: f64, k: usize, window_cost: f64, draft_cost: f64) -> Requirement {
     let ceiling_speedup = (k + 1) as f64 / (window_cost + draft_cost);
-    if ceiling_speedup < GATE {
+    if ceiling_speedup < gate {
         return Requirement::Infeasible { ceiling_speedup };
     }
     Requirement::Reachable {
-        required_tokens: GATE * (window_cost + draft_cost),
+        required_tokens: gate * (window_cost + draft_cost),
     }
 }
 
@@ -130,7 +153,7 @@ mod tests {
         false
     }
 
-    /// Same vector as `GOLDEN_*` in `analyze.py`.
+    /// The hand-made vector the Python trace tests also use (`GOLD_STREAM` and `GOLD_CHAINS`).
     fn golden() -> (Vec<u32>, Vec<Vec<u32>>) {
         (
             vec![10, 11, 12, 13, 14, 15, 16, 17, 18],
@@ -202,27 +225,50 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_or_short_chain_is_an_error_not_a_window_with_fewer_drafts() {
+        let stream = [10, 11, 12, 13, 14, 15];
+        let missing = vec![vec![11, 12]];
+        let trace = Trace {
+            stream: &stream,
+            chains: &missing,
+            scored: 4,
+        };
+        // position 0 has a chain; the window commits 3 tokens and position 3 has none
+        let err = renewing_windows(&trace, 2, &not_a_stop).expect_err("no chain at position 3");
+        assert!(format!("{err:?}").contains("no draft chain at position 3"));
+        let short = vec![vec![11]];
+        let trace = Trace {
+            stream: &stream,
+            chains: &short,
+            scored: 1,
+        };
+        let err = renewing_windows(&trace, 2, &not_a_stop).expect_err("chain too short");
+        assert!(format!("{err:?}").contains("holds 1 drafts"));
+    }
+
+    #[test]
     fn the_registered_example_needs_a_window_of_1_52_solo_steps() {
         // k = 1, per-position acceptance 0.75, free head: E = 1.75, so W(2) <= 1.75 / 1.15.
-        let Budget::Largest(limit) = max_window_cost(1.75, 0.0) else {
-            panic!("a free head leaves a budget");
-        };
-        assert!((limit - 1.521_739).abs() < 1e-6);
-        assert!((speedup(1.75, limit, 0.0) - GATE).abs() < 1e-12);
+        assert_eq!(
+            max_window_cost(1.75, 0.0),
+            Budget::Largest(1.521_739_130_434_782_7)
+        );
+        // and a window of 1.5 steps then runs at 1.75 / 1.5
+        assert!((speedup(1.75, 1.5, 0.0) - 1.166_666_666_666_666_7).abs() < 1e-12);
     }
 
     #[test]
     fn drafting_cost_comes_off_the_window_budget_one_for_one() {
-        let (Budget::Largest(free), Budget::Largest(paid)) =
-            (max_window_cost(1.9, 0.0), max_window_cost(1.9, 0.10))
-        else {
-            panic!("both leave a budget");
+        // 1.9 / 1.15 = 1.652173913...; a draft cost of 0.10 leaves 1.552173913...
+        let Budget::Largest(paid) = max_window_cost(1.9, 0.10) else {
+            panic!("a draft cost of 0.10 leaves a budget");
         };
-        assert!((free - paid - 0.10).abs() < 1e-12);
-        let Budget::Largest(chain) = max_window_cost(2.5, 3.0 * 0.1) else {
+        assert!((paid - 1.552_173_913_043_478).abs() < 1e-12);
+        // a three-step chain of 0.1 each: 2.5 / 1.15 = 2.173913...; minus 0.3 leaves 1.873913...
+        let Budget::Largest(chain) = max_window_cost(2.5, 0.3) else {
             panic!("a three-step chain leaves a budget");
         };
-        assert!((chain - (2.5 / GATE - 0.3)).abs() < 1e-12);
+        assert!((chain - 1.873_913_043_478_261).abs() < 1e-12);
     }
 
     #[test]
@@ -231,11 +277,21 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_of_exactly_zero_is_infeasible_and_a_hair_above_it_is_not() {
+        // gate 1: 0.5 tokens at a draft cost of 0.5 leave exactly zero
+        assert_eq!(max_window_cost_at(1.0, 0.5, 0.5), Budget::Infeasible);
+        match max_window_cost_at(1.0, 0.5000001, 0.5) {
+            Budget::Largest(v) => assert!((v - 1e-7).abs() < 1e-12),
+            other => panic!("expected a tiny budget, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_window_that_cannot_reach_the_gate_even_at_full_acceptance_is_marked_infeasible() {
-        // W(2) = 1.65 with H(1) = 0.10: at most 2 / 1.75 = 1.143x even at p = 1.
+        // W(2) = 1.65 with H(1) = 0.10: at most 2 / 1.75 = 1.142857 even at p = 1.
         match requirement(1, 1.65, 0.10) {
             Requirement::Infeasible { ceiling_speedup } => {
-                assert!((ceiling_speedup - 2.0 / 1.75).abs() < 1e-12)
+                assert!((ceiling_speedup - 1.142_857_142_857_143).abs() < 1e-12)
             }
             other => panic!("expected an infeasible combination, got {other:?}"),
         }
@@ -249,28 +305,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reachable_window_never_asks_for_more_than_full_acceptance() {
-        for k in 1..=3usize {
-            for window in [1.2, 1.4, 1.59, 1.82, 2.2, 2.7] {
-                for draft in [0.0, 0.05, 0.10, 0.15] {
-                    let h = draft * k as f64;
-                    match requirement(k, window, h) {
-                        Requirement::Reachable { required_tokens } => {
-                            assert!(
-                                required_tokens <= (k + 1) as f64 + 1e-12,
-                                "k {k} W {window} H {h}"
-                            )
-                        }
-                        Requirement::Infeasible { ceiling_speedup } => {
-                            assert!(ceiling_speedup < GATE)
-                        }
-                    }
+    fn the_ceiling_equal_to_the_gate_is_reachable_only_at_full_acceptance() {
+        // k = 1, W + H = 1.0, gate 2.0: the ceiling is exactly the gate, so it is not infeasible
+        assert_eq!(
+            requirement_at(2.0, 1, 0.5, 0.5),
+            Requirement::Reachable {
+                required_tokens: 2.0
+            }
+        );
+        assert!(matches!(
+            requirement_at(2.0, 1, 0.5001, 0.5),
+            Requirement::Infeasible { .. }
+        ));
+    }
+
+    #[test]
+    fn requirements_match_hand_computed_values() {
+        // (k, W, H, required E[accepted + 1]) with the gate at 1.15
+        let table = [
+            (1, 1.59, 0.10, 1.9435), // 1.15 * 1.69
+            (1, 1.40, 0.00, 1.61),   // 1.15 * 1.40
+            (2, 1.82, 0.20, 2.323),  // 1.15 * 2.02
+            (3, 2.20, 0.30, 2.875),  // 1.15 * 2.50
+            (3, 2.70, 0.00, 3.105),  // 1.15 * 2.70
+        ];
+        for (k, w, h, want) in table {
+            match requirement(k, w, h) {
+                Requirement::Reachable { required_tokens } => {
+                    assert!((required_tokens - want).abs() < 1e-9, "k {k} W {w} H {h}")
                 }
+                other => panic!("k {k} W {w} H {h}: expected reachable, got {other:?}"),
             }
         }
-        let Requirement::Reachable { required_tokens } = requirement(1, 1.59, 0.10) else {
-            panic!("W(2) = 1.59 with H = 0.10 is reachable");
-        };
-        assert!((required_tokens - 1.15 * 1.69).abs() < 1e-12);
+        // (k, W, H) that cannot reach 1.15: ceilings 2/1.75, 3/2.65, 4/3.57
+        for (k, w, h) in [(1, 1.65, 0.10), (2, 2.40, 0.25), (3, 3.27, 0.30)] {
+            assert!(matches!(
+                requirement(k, w, h),
+                Requirement::Infeasible { .. }
+            ));
+        }
     }
 }
