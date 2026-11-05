@@ -1030,11 +1030,3 @@ fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngErro
     // to the first op that uses the flag.
     list.add(Slot::Exl3Flag, Ok(4), MIX_PACK, ARGMAX)
 }
-
-/// The card variant of [`list_mixers`] for the Native multi-device step: every width is the
-/// card's own (`MixerGeometry::for_card`) except the residual rows and the gathered K/V rows,
-/// which stay at the full shape's width (`Slot::KRows`'s card contract).
-/// The card variant of [`list_moe`] for the Native multi-device step: the router and top-k
-/// tensors stay full (the router runs once, its picks broadcast), the inter-width packs shrink
-/// to the card's expert rows, and the down/shared outputs stay full hidden width (each card's
-/// partial is summed by the ring exchange).
