@@ -617,6 +617,36 @@ class StagedGateTests(unittest.TestCase):
         self.assertIn("token-forcing driver tests failed", result.stderr)
         self.assertIn("qualify", result.stderr)
 
+    def test_a_driver_file_with_a_non_ascii_name_runs_the_driver_tests(self) -> None:
+        # git quotes such a path unless asked for NUL-separated output; the accented file is
+        # the only staged one, so a quoted path would skip the tests.
+        self.commit_driver_suite()
+        self.write(
+            "qualification/token-forcing/tests/test_é.py",
+            "import unittest\n\n\nclass Accent(unittest.TestCase):\n"
+            "    def test_accent(self):\n        self.fail('the accented test ran')\n",
+        )
+        self.stage("qualification/token-forcing/tests/test_é.py")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the accented test ran", result.stderr)
+
+    def test_an_unstaged_driver_file_with_a_non_ascii_name_is_named(self) -> None:
+        self.commit_driver_suite()
+        self.write("qualification/token-forcing/résumé.md", "first\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "test(staged-gates): add an accented driver file")
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 1\nEXTRA = 1\n")
+        self.stage("qualification/token-forcing/qualify.py")
+        self.write("qualification/token-forcing/résumé.md", "second\n")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qualification/token-forcing/résumé.md", result.stderr)
+
     def test_a_driver_directory_without_tests_names_the_cause(self) -> None:
         self.write("qualification/token-forcing/qualify.py", "VALUE = 1\n")
         self.write("qualification/token-forcing/tests/README", "no tests here\n")

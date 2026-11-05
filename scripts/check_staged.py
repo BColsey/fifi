@@ -403,13 +403,20 @@ def staged_publisher_gate(root: Path) -> None:
 TOKEN_FORCING_DRIVERS = "qualification/token-forcing"
 
 
+def git_paths(args: list[str], root: Path) -> list[str]:
+    """Paths from a git command run with -z: without it git quotes a non-ASCII path, and a
+    quoted path no longer starts with the directory it lies in. The flag follows the
+    subcommand, ahead of any `--` pathspec."""
+    output = run_git([args[0], "-z", *args[1:]], cwd=root).stdout
+    return [path.decode("utf-8", errors="backslashreplace") for path in output.split(b"\0") if path]
+
+
 def staged_token_forcing_gate(root: Path) -> None:
     """The token-forcing device drivers decide which tasks a GPU qualification runs and which
     files its later leases accept, and no GPU run tests them before they cost a lease. A commit
     touching them must pass their offline suite, which needs no device, weights or lease."""
     # Without rename detection a driver moved out of the directory still counts as staged.
-    result = run_git(["diff", "--cached", "--name-only", "--no-renames"], cwd=root)
-    staged = result.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    staged = git_paths(["diff", "--cached", "--name-only", "--no-renames"], root)
     drivers = [path for path in staged if path.startswith(TOKEN_FORCING_DRIVERS + "/")]
     if not drivers:
         print("Staged token-forcing driver tests not required (no driver files staged).")
@@ -417,18 +424,16 @@ def staged_token_forcing_gate(root: Path) -> None:
     # The suite runs on the working tree, but the commit records the index. Any unstaged or
     # untracked file in the directory, staged or not, could make the tests pass on content
     # the commit does not hold, so fail closed on all of them.
-    dirty = run_git(["diff", "--name-only", "--", TOKEN_FORCING_DRIVERS], cwd=root)
-    differing = dirty.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    differing = git_paths(["diff", "--name-only", "--", TOKEN_FORCING_DRIVERS], root)
     if differing:
         raise CheckError(
             "token-forcing driver files in the working tree differ from the index, so their "
             "tests would run on content other than the commit; stage or restore the unstaged "
             "changes first: " + ", ".join(differing)
         )
-    others = run_git(
-        ["ls-files", "--others", "--exclude-standard", "--", TOKEN_FORCING_DRIVERS], cwd=root
+    untracked = git_paths(
+        ["ls-files", "--others", "--exclude-standard", "--", TOKEN_FORCING_DRIVERS], root
     )
-    untracked = others.stdout.decode("utf-8", errors="backslashreplace").splitlines()
     if untracked:
         raise CheckError(
             "untracked files in the token-forcing driver directory would take part in its "
