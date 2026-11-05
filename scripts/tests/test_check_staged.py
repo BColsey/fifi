@@ -513,6 +513,56 @@ class StagedGateTests(unittest.TestCase):
         self.assertIn("differ from their working-tree versions", result.stderr)
         self.assertIn("qualification/publisher/reconcile.py", result.stderr)
 
+    def driver_suite(self, body: str) -> None:
+        """A token-forcing driver package whose one test runs `body`."""
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 1\n")
+        self.write(
+            "qualification/token-forcing/tests/test_driver.py",
+            "import unittest\n\n\nclass Driver(unittest.TestCase):\n"
+            f"    def test_driver(self):\n        {body}\n",
+        )
+
+    def test_token_forcing_driver_files_stage_runs_their_tests(self) -> None:
+        self.driver_suite("self.assertTrue(True)")
+        self.stage("qualification/token-forcing")
+
+        result = self.run_pre_commit()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("token-forcing driver tests passed", result.stdout)
+
+    def test_a_failing_driver_test_blocks_the_commit(self) -> None:
+        self.driver_suite("self.fail('the selection rule changed')")
+        self.stage("qualification/token-forcing")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("token-forcing driver tests failed", result.stderr)
+        self.assertIn("the selection rule changed", result.stderr)
+
+    def test_commits_without_driver_files_skip_the_driver_tests(self) -> None:
+        # A failing suite on disk proves the tests do not run when no driver file is staged.
+        self.driver_suite("self.fail('must not run')")
+        self.write("app.py", "value = 2\n")
+        self.stage("app.py")
+
+        result = self.run_pre_commit()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no driver files staged", result.stdout)
+
+    def test_partial_staging_cannot_conceal_a_staged_driver_change(self) -> None:
+        self.driver_suite("self.assertTrue(True)")
+        self.stage("qualification/token-forcing")
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 2\n")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differ from their working-tree versions", result.stderr)
+        self.assertIn("qualification/token-forcing/qualify.py", result.stderr)
+
     def test_integration_gate_requires_a_clean_worktree(self) -> None:
         self.write("qualification/publisher/reconcile.py", "x = 1\n")
         self.git("add", "--", "qualification/publisher/reconcile.py")

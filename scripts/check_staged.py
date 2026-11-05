@@ -400,12 +400,58 @@ def staged_publisher_gate(root: Path) -> None:
     )
 
 
+TOKEN_FORCING_DRIVERS = "qualification/token-forcing"
+
+
+def staged_token_forcing_gate(root: Path) -> None:
+    """The token-forcing device drivers decide which tasks a GPU qualification runs and which
+    files its later leases accept, and no GPU run tests them before they cost a lease. A commit
+    touching them must pass their offline suite, which needs no device, weights or lease."""
+    result = run_git(["diff", "--cached", "--name-only"], cwd=root)
+    staged = result.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    drivers = [path for path in staged if path.startswith(TOKEN_FORCING_DRIVERS + "/")]
+    if not drivers:
+        print("Staged token-forcing driver tests not required (no driver files staged).")
+        return
+    # The suite runs on the working tree, but the commit records the index; fail closed on
+    # any difference, as the publisher gate does.
+    dirty = run_git(["diff", "--name-only", "--", *drivers], cwd=root)
+    differing = dirty.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    if differing:
+        raise CheckError(
+            "token-forcing driver files staged differ from their working-tree versions, so "
+            "their tests would run on content other than the commit; commit or restore the "
+            "unstaged changes first: " + ", ".join(differing)
+        )
+    tests = root / TOKEN_FORCING_DRIVERS / "tests"
+    if not tests.is_dir():
+        raise CheckError(f"token-forcing driver files staged but {tests} is missing")
+    try:
+        suite = subprocess.run(
+            [sys.executable, "-I", "-m", "unittest", "discover", "-s", str(tests)],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as error:
+        raise CheckError(f"could not run the token-forcing driver tests: {error}") from error
+    if suite.returncode != 0:
+        tail = suite.stdout.decode("utf-8", errors="backslashreplace").strip()[-800:]
+        raise CheckError(
+            f"token-forcing driver tests failed with exit status {suite.returncode}"
+            + (f":\n{tail}" if tail else "")
+        )
+    print("Staged token-forcing driver tests passed.")
+
+
 def run_pre_commit() -> None:
     root = repository_root()
     staged_python_blobs(root)
     staged_secret_patterns(root)
     staged_host_details(root)
     staged_publisher_gate(root)
+    staged_token_forcing_gate(root)
     run_growth_report(root)
 
 

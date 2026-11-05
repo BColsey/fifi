@@ -18,7 +18,10 @@ __pycache__/
 /CLAUDE.md
 /CONVENTIONS.md
 /PLAN.md
-/qualification/
+/qualification/*
+# The token-forcing device drivers are tracked in place; the rest of qualification/ is
+# internal and force-added file by file.
+!/qualification/token-forcing/
 .pi-dsh/
 .pi-glla/
 engine/.pi-dsh/
