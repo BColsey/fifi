@@ -13,8 +13,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5489,
-      "ignored": 436,
+      "test_fns": 5536,
+      "ignored": 444,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -179,6 +179,7 @@
         "INFERENCE_CUDA_MMID_COLS_HINT",
         "INFERENCE_CUDA_REQUIRE_DEVICE",
         "INFERENCE_GEMMA_MATVEC_FIXTURES",
+        "INFERENCE_QWEN36_SPARSE_ATTN",
         "KV_F16_ENV_PROBE",
         "KV_GUARD_SCRATCH_PROBE",
         "LC_COMPARE_BUILD",
