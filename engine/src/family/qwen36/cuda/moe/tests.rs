@@ -470,53 +470,6 @@ fn the_card_moe_sequence_aligns_its_markers_on_every_card() {
 /// directly before the combine. Both cards run the SAME marker sequence, and the local
 /// ops between the markers are identical.
 #[test]
-fn the_card_moe_sequence_aligns_its_markers_on_every_card() {
-    let card0 = moe_sequence_card(true);
-    let card1 = moe_sequence_card(false);
-    let markers = |ops: &[CardMoeOp]| -> Vec<CardMoeOp> {
-        ops.iter()
-            .copied()
-            .filter(|op| !matches!(op, CardMoeOp::Local(_)))
-            .collect()
-    };
-    assert_eq!(
-        markers(&card0),
-        vec![CardMoeOp::RouteBroadcast, CardMoeOp::MoeSum],
-        "card 0 marker order"
-    );
-    assert_eq!(markers(&card1), markers(&card0), "both cards align");
-    // Card 0 runs the router, then the broadcast; the other card receives instead.
-    assert_eq!(
-        (&card0[0], &card0[1]),
-        (&CardMoeOp::Local(MoeOp::Router), &CardMoeOp::RouteBroadcast)
-    );
-    assert_eq!(card1[0], CardMoeOp::RouteBroadcast);
-    // The sum sits directly before the combine on both cards.
-    for card in [&card0, &card1] {
-        let at = card.len() - 2;
-        assert_eq!(
-            (card[at], card[at + 1]),
-            (CardMoeOp::MoeSum, CardMoeOp::Local(MoeOp::Combine))
-        );
-    }
-    // The local ops are the single-device list minus the router, in order, on every card.
-    let locals = |ops: &[CardMoeOp]| -> Vec<MoeOp> {
-        ops.iter()
-            .filter_map(|op| match op {
-                CardMoeOp::Local(op) => Some(*op),
-                _ => None,
-            })
-            .collect()
-    };
-    let single = moe_sequence(8, WeightLayout::Native);
-    assert_eq!(locals(&card0), single, "card 0 keeps the whole list");
-    assert_eq!(
-        locals(&card1),
-        single[1..],
-        "the other card skips the router"
-    );
-}
-
 #[test]
 fn native_moe_ops_stay_inside_their_slot_lifetimes() {
     let plan = plan_of(WeightLayout::Native);

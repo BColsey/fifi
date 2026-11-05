@@ -83,10 +83,6 @@ pub(super) struct Lease {
     device: std::ffi::c_int,
     /// Streams the adapter has created. One stream means all device work is ordered by it.
     streams: Cell<usize>,
-    /// The CUDA device ordinal every owner of this lease lives on. Fixed at
-    /// acquisition: an owner never migrates, and every native entry for an
-    /// owner of this lease selects this device first (`context::enter_on`).
-    device: std::ffi::c_int,
 }
 
 impl Lease {
