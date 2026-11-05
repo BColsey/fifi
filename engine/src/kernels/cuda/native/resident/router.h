@@ -7,7 +7,7 @@
  * weights f32 [m][top_k], shared_gate f32 [m] = sigmoid(dot(x, w_shared)) (NULL: not computed).
  * status is a device i32 word; bit 1 is OR-ed in when any row is faulty (a non-finite logit, or a
  * softmax or selected sum that is not finite and positive, or a non-finite gate dot). Limits: m in
- * [1, 4096], hidden a multiple of 4 up to 65536, n_expert in [1, 512], top_k in
+ * [1, 4096], hidden a multiple of 4 up to 65536, n_expert in [1, 256], top_k in
  * [1, min(n_expert, 32)]. Enqueues two kernels on stream (NULL: the default stream); returns
  * INFERENCE_CUDA_INVALID_ARGUMENT before any launch for a bad argument. The logits kernel is a
  * tiled one for m >= 8 and the decode one below; both give the same logit bits (but for the sign

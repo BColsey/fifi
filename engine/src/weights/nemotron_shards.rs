@@ -54,7 +54,6 @@ pub struct NemotronShardReader {
 
 impl NemotronShardReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EngError> {
-        crate::storage_guard::require_local(path.as_ref(), "model weights")?;
         let mut file = File::open(path.as_ref())
             .map_err(|error| EngError::Checkpoint(format!("open shard: {error}")))?;
         let file_len = file
@@ -318,32 +317,5 @@ fn dtype_info(dtype: StoredDtype) -> Option<(&'static str, u64)> {
         StoredDtype::U8 => Some(("U8", 1)),
         StoredDtype::I64 => Some(("I64", 8)),
         _ => None,
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::NemotronShardReader;
-
-    // Fails if `NemotronShardReader::open` stops guarding the shard: the shard
-    // is a local link to a file on the fixture network mount, and without the
-    // guard the open would get as far as reading the file.
-    #[test]
-    fn a_shard_linked_into_a_network_mount_is_refused() {
-        let local = tempfile::tempdir().unwrap();
-        let share = tempfile::tempdir().unwrap();
-        std::fs::write(share.path().join("s.safetensors"), [0u8; 4]).unwrap();
-        let link = local.path().join("s.safetensors");
-        std::os::unix::fs::symlink(share.path().join("s.safetensors"), &link).unwrap();
-        let error = crate::storage_guard::seam::with_nfs_at(share.path(), || {
-            NemotronShardReader::open(&link).expect_err("refused")
-        });
-        assert!(
-            error.describe().contains("local storage"),
-            "{}",
-            error.describe()
-        );
-        let local_error = NemotronShardReader::open(&link).expect_err("a 4-byte file is no shard");
-        assert!(!local_error.describe().contains("local storage"));
     }
 }

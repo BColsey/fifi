@@ -762,7 +762,6 @@ dependencies = [
  "memmap2",
  "minijinja",
  "mlx-sys",
- "rustix",
  "safetensors",
  "serde",
  "serde_json",

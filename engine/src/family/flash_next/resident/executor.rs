@@ -242,10 +242,6 @@ fn io_error(name: &str, error: &std::io::Error) -> EngError {
 }
 
 fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
-    // A shard can be a symlink into a network mount; one table read covers the
-    // directory and every shard.
-    let guard = crate::storage_guard::LocalGuard::new()?;
-    guard.check(dir, "model weights")?;
     let name = "model.safetensors.index.json";
     let index = std::fs::read(dir.join(name)).map_err(|error| io_error(name, &error))?;
     let value: serde_json::Value = serde_json::from_slice(&index)
@@ -259,7 +255,6 @@ fn open_checkpoint(dir: &Path) -> Result<StreamedCheckpoint> {
         .collect();
     let mut shards: Vec<(String, Box<dyn ShardIo + Send>, u64)> = Vec::with_capacity(names.len());
     for shard in names {
-        guard.check(&dir.join(&shard), "model weights")?;
         let file =
             std::fs::File::open(dir.join(&shard)).map_err(|error| io_error(&shard, &error))?;
         let len = file

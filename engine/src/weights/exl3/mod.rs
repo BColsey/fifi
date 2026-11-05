@@ -4,7 +4,6 @@ mod config;
 pub(crate) mod flint_pack;
 mod full;
 mod header;
-pub(crate) mod ngram;
 mod reference;
 mod reorder;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

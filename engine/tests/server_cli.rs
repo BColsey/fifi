@@ -12,12 +12,6 @@ use std::time::{Duration, Instant};
 const KEY: &str = "sk-cli-test-key-4711";
 const KEY_VARIABLE: &str = "ENGINESRV_CLI_TEST_KEY";
 
-/// A model directory under the temp dir, so the local-storage check passes whatever the working
-/// directory is (a checkout on a network share). The fake family reads nothing from it.
-fn model_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("fake-model-dir")
-}
-
 fn tokenizer_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/testdata/tokenizer")
 }
@@ -36,11 +30,10 @@ fn config_text(listen: &str, family: &str) -> String {
             "api_key_env": "{KEY_VARIABLE}",
             "engines": [{{
                 "id": "e1", "model": "demo", "family": "{family}",
-                "model_dir": "{model}", "tokenizer_dir": "{}"{fake}
+                "model_dir": "unused", "tokenizer_dir": "{}"{fake}
             }}]
         }}"#,
-        tokenizer_dir().display(),
-        model = model_dir().display()
+        tokenizer_dir().display()
     )
 }
 

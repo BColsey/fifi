@@ -39,7 +39,7 @@ fn packed_router_rejects_unlaunchable_geometry_before_sizing() {
             ..good
         },
         RouterShape {
-            n_expert: 513,
+            n_expert: 257,
             ..good
         },
         RouterShape { top_k: 0, ..good },

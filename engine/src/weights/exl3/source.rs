@@ -21,10 +21,6 @@ pub(crate) struct Checkpoint {
 impl Checkpoint {
     /// Checks bounded configuration, index, and shard headers without reading payloads.
     pub(crate) fn open(dir: &Path) -> Result<Self, EngError> {
-        // One mount-table read covers the directory and every shard: a shard
-        // can be a symlink into a network mount (a downloaded snapshot).
-        let guard = crate::storage_guard::LocalGuard::new()?;
-        guard.check(dir, "model weights")?;
         let model_config = read_metadata(&dir.join("config.json"), CONFIG_LIMIT)?;
         let config = Config::from_json(&model_config)?;
         let index = read_metadata(&dir.join("model.safetensors.index.json"), INDEX_LIMIT)?;
@@ -34,7 +30,6 @@ impl Checkpoint {
         let mut shards: Vec<(String, Box<dyn ShardIo + Send>, u64)> = Vec::new();
         for name in names {
             let path = dir.join(&name);
-            guard.check(&path, "model weights")?;
             let file = File::open(&path).map_err(|error| checkpoint_io(&path, error))?;
             let len = file
                 .metadata()
@@ -97,61 +92,6 @@ mod tests {
         file.write_all(&1f32.to_le_bytes()).unwrap();
         file.write_all(&2f32.to_le_bytes()).unwrap();
         (dir, data_start)
-    }
-
-    // Fails if `Checkpoint::open` stops guarding the directory.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_checkpoint_directory_on_a_network_mount_is_refused_before_any_read() {
-        let (dir, _) = fixture();
-        let error = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
-            Checkpoint::open(dir.path()).err().expect("refused")
-        });
-        assert!(
-            error.describe().contains("local storage"),
-            "{}",
-            error.describe()
-        );
-        assert!(Checkpoint::open(dir.path()).is_ok());
-    }
-
-    // The real entry point on a real network mount: without the guard the
-    // error would be the missing config file. Skipped with a note on a host
-    // with no network mount.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn checkpoint_open_refuses_a_live_network_path() {
-        let Some(path) = crate::storage_guard::seam::live_network_path() else {
-            eprintln!("skipped: no network mount on this host");
-            return;
-        };
-        let error = Checkpoint::open(&path).err().expect("refused");
-        assert!(
-            error.describe().contains("local storage"),
-            "{}",
-            error.describe()
-        );
-    }
-
-    // Fails if `Checkpoint::open` checks only the directory and not each
-    // shard: the shard here is a local link to a file on the network mount.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_shard_linked_into_a_network_mount_is_refused() {
-        let (dir, _) = fixture();
-        let share = tempfile::tempdir().unwrap();
-        let shard = dir.path().join("m.safetensors");
-        std::fs::rename(&shard, share.path().join("m.safetensors")).unwrap();
-        std::os::unix::fs::symlink(share.path().join("m.safetensors"), &shard).unwrap();
-        let error = crate::storage_guard::seam::with_nfs_at(share.path(), || {
-            Checkpoint::open(dir.path()).err().expect("refused")
-        });
-        assert!(
-            error.describe().contains("local storage"),
-            "{}",
-            error.describe()
-        );
-        assert!(Checkpoint::open(dir.path()).is_ok());
     }
 
     #[test]

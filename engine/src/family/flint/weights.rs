@@ -29,10 +29,6 @@ pub(super) struct FlintCheckpoint {
 
 impl FlintCheckpoint {
     pub(super) fn open(root: &Path) -> Result<Self, EngError> {
-        // One mount-table read covers the root and every shard (a shard can
-        // link into a network mount).
-        let guard = crate::storage_guard::LocalGuard::new()?;
-        guard.check(root, "model weights")?;
         check_apple_config(&read_config(root)?)?;
         let mut paths = std::fs::read_dir(root)
             .map_err(checkpoint_io)?
@@ -51,7 +47,6 @@ impl FlintCheckpoint {
         let mut shards: Vec<(String, Box<dyn ShardIo + Send>, u64)> = Vec::new();
         let mut routes = BTreeMap::new();
         for path in paths {
-            guard.check(&path, "model weights")?;
             let mut file = File::open(&path).map_err(checkpoint_io)?;
             let len = file.metadata().map_err(checkpoint_io)?.len();
             let header = ShardHeader::read(&mut file, len, HEADER_LIMIT)?;

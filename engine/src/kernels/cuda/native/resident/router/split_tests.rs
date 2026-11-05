@@ -46,7 +46,7 @@ fn split_router_logits_c_abi_rejects_geometry_sizes_alignment_wrap_and_alias() {
         match case {
             0 => a.m = 0,
             1 => a.hidden = 5,
-            2 => a.n_expert = 513,
+            2 => a.n_expert = 257,
             3 => a.x_bytes = 15,
             4 => a.w_bytes = 127,
             5 => a.logits_bytes = 31,
@@ -62,14 +62,10 @@ fn split_router_logits_c_abi_rejects_geometry_sizes_alignment_wrap_and_alias() {
 
 #[test]
 fn split_router_select_c_abi_rejects_geometry_short_align_wrap_and_alias() {
-    for case in 0..13 {
+    for case in 0..12 {
         let mut a = select();
         match case {
             0 => a.m = 4097,
-            12 => {
-                a.n_expert = 513;
-                a.logits_bytes = 513 * 4;
-            }
             1 => a.top_k = 9,
             2 => a.logits_bytes = 31,
             3 => a.ids_bytes = 23,

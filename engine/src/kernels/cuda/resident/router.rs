@@ -53,11 +53,10 @@ pub(crate) const ROUTER_STATUS_BIT: i32 = 1;
 
 const MAX_ROWS: usize = 4096;
 const MAX_HIDDEN: usize = 65536;
-const MAX_EXPERTS: usize = 512;
+const MAX_EXPERTS: usize = 256;
 const MAX_TOP_K: usize = 32;
 
-/// Qwen3.6 is `hidden` 2048, `n_expert` 256, `top_k` 8, `m` 1; Flash-Next is `hidden` 2560,
-/// `n_expert` 512, `top_k` 10.
+/// Qwen3.6 is `hidden` 2048, `n_expert` 256, `top_k` 8, `m` 1.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouterShape {
     pub(crate) m: usize,

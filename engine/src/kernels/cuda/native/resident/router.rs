@@ -262,7 +262,7 @@ fn split_needs(ints: &RouterInts) -> Option<Need> {
     if !(1..=4096).contains(&ints.m)
         || !(4..=65536).contains(&ints.hidden)
         || ints.hidden % 4 != 0
-        || !(1..=512).contains(&ints.n_expert)
+        || !(1..=256).contains(&ints.n_expert)
         || !(1..=ints.n_expert.min(32)).contains(&ints.top_k)
     {
         return None;

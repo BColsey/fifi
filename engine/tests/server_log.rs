@@ -23,12 +23,6 @@ impl Drop for Running {
     }
 }
 
-/// A model directory under the temp dir, so the local-storage check passes whatever the working
-/// directory is (a checkout on a network share). The fake family reads nothing from it.
-fn model_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("fake-model-dir")
-}
-
 fn config_text() -> String {
     let tokenizer = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/testdata/tokenizer");
     format!(
@@ -37,12 +31,11 @@ fn config_text() -> String {
             "api_key_env": "{KEY_VARIABLE}",
             "engines": [{{
                 "id": "e1", "model": "demo", "family": "fake",
-                "model_dir": "{model}", "tokenizer_dir": "{}",
+                "model_dir": "unused", "tokenizer_dir": "{}",
                 "fake": {{"reply": "Pong."}}
             }}]
         }}"#,
-        tokenizer.display(),
-        model = model_dir().display()
+        tokenizer.display()
     )
 }
 

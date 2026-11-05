@@ -12,7 +12,7 @@
  * take the top_k probabilities, larger first and the lower expert index first on a tie;
  * weight_i = p_i / (p_0 + ... + p_{k-1}), the sum taken sequentially in rank order. The
  * shared-expert gate is sigmoid(x . w_shared); it is optional (w_shared and shared_gate both NULL
- * for a family without a shared expert). n_expert (up to 512) and top_k (up to 32) are
+ * for a family without a shared expert). n_expert (up to 256) and top_k (up to 32) are
  * run-time values.
  *
  * Two launches on one stream:
@@ -25,8 +25,6 @@
  *                    tokens and each load of x serves 4 rows of W.
  *   router_select_k  grid m, 32 threads. One warp per row: softmax, top_k rounds of a warp-wide
  *                    best-of, renormalization, gate, fault check. No shared memory, no barrier.
- *                    Lane l holds experts l, l + 32, ...: 8 of them up to 256 experts (the
- *                    Qwen3.6 instance, unchanged), 16 up to 512 (Flash-Next).
  * Every reduction has a fixed order and there is no float atomic. The only atomic is an integer
  * OR of one status bit, which is order independent. Both logits kernels keep the order of
  * router_logits_k (see there), so a row's logits do not depend on the kernel or on the other rows
@@ -50,13 +48,13 @@
 
 namespace {
 
-constexpr int kRouterMaxExperts = 512;  // lane l owns experts l, l + 32, ... (16 per lane)
-constexpr int kNarrowExperts = 256;     // up to here a lane holds 8 (router_select_k<.., 8>)
+constexpr int kRouterMaxExperts = 256;  // lane l owns experts l, l + 32, ... (8 per lane)
 constexpr int kRouterMaxTop = 32;       // lane r keeps the winner of round r
 constexpr int kRouterMaxRows = 4096;
 constexpr int kRouterStatusBit = 1;     // OR-ed into *status for a faulty row
 constexpr int kLogitChunk = 16;         // float4 loads in flight per operand and lane
 constexpr int kLogitWarps = 2;          // rows of W per block; 2 was the fastest of 2, 4, 8
+constexpr int kPer = kRouterMaxExperts / 32;
 // router_logits_tiled_k: a warp tile is kTileExperts rows of W by kTileTokens rows of x, so the 32
 // lanes end with one output each; a block is kTileWarpsE by kTileWarpsT warp tiles. A step does 12
 // float4 loads for 128 fmaf, so the load pipe rather than the fma rate sets the speed, and the
@@ -251,18 +249,17 @@ __device__ inline bool before(float pa, int ia, float pb, int ib) {
     return pa > pb || (pa == pb && ia < ib);
 }
 
-// Per is the experts a lane holds: n_expert <= Per * 32.
-template <bool Sigmoid, int Per>
+template <bool Sigmoid>
 __global__ void __launch_bounds__(32)
 router_select_k(const float *logits, int *ids, float *weights, float *shared_gate, int *status,
                 int n_expert, int top_k, int logit_stride) {
     const int t = blockIdx.x, lane = threadIdx.x;
     const float *lg = logits + (size_t)t * logit_stride;
-    float p[Per];
+    float p[kPer];
     bool bad = false;
     float mx = -INFINITY;
 #pragma unroll
-    for (int k = 0; k < Per; ++k) {
+    for (int k = 0; k < kPer; ++k) {
         const int e = k * 32 + lane;
         p[k] = e < n_expert ? lg[e] : -INFINITY;
         bad |= e < n_expert && !isfinite(p[k]);
@@ -271,14 +268,14 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
     mx = warp_max_r(mx);
     float zsum = 0.f;
 #pragma unroll
-    for (int k = 0; k < Per; ++k) {
+    for (int k = 0; k < kPer; ++k) {
         p[k] = (k * 32 + lane) < n_expert
             ? (Sigmoid ? 1.f / (1.f + expf(-p[k])) : expf(p[k] - mx)) : 0.f;
         zsum += p[k];
     }
     const float z = warp_sum_r(zsum);
 #pragma unroll
-    for (int k = 0; k < Per; ++k) {
+    for (int k = 0; k < kPer; ++k) {
         // Sigmoid scores stay F32 and unnormalized until the selected-rank sum below.
         // Normalizing all scores here can create extra ties through F32 rounding.
         p[k] = (k * 32 + lane) < n_expert ? (Sigmoid ? p[k] : p[k] / z) : -1.f;
@@ -289,7 +286,7 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
         float bp = -2.f;
         int bi = 0x7fffffff;
 #pragma unroll
-        for (int k = 0; k < Per; ++k) {
+        for (int k = 0; k < kPer; ++k) {
             if (before(p[k], k * 32 + lane, bp, bi)) {
                 bp = p[k];
                 bi = k * 32 + lane;
@@ -310,7 +307,7 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
             my_i = bi;
         }
 #pragma unroll
-        for (int k = 0; k < Per; ++k) {
+        for (int k = 0; k < kPer; ++k) {
             if (bi == k * 32 + lane) {
                 p[k] = -1.f;  // the owner removes the winner
             }
@@ -330,30 +327,6 @@ router_select_k(const float *logits, int *ids, float *weights, float *shared_gat
         if (fault) {
             atomicOr(status, kRouterStatusBit);  // idempotent: the order of faulty rows is moot
         }
-    }
-}
-
-/* The selection kernel's operands. */
-struct SelectArgs {
-    const float *logits;
-    int *ids;
-    float *weights;
-    float *shared_gate;
-    int *status;
-    int m, n_expert, top_k, logit_stride;
-};
-
-/* Launches router_select_k with 8 experts per lane up to 256 experts, else 16. */
-template <bool Sigmoid>
-void launch_select(const SelectArgs &k, cudaStream_t s) {
-    if (k.n_expert <= kNarrowExperts) {
-        router_select_k<Sigmoid, kNarrowExperts / 32><<<k.m, 32, 0, s>>>(
-            k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
-            k.logit_stride);
-    } else {
-        router_select_k<Sigmoid, kRouterMaxExperts / 32><<<k.m, 32, 0, s>>>(
-            k.logits, k.ids, k.weights, k.shared_gate, k.status, k.n_expert, k.top_k,
-            k.logit_stride);
     }
 }
 
@@ -441,10 +414,9 @@ extern "C" int inference_cuda_router_launch(const inference_cuda_router_args *a,
         }
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {
-            const SelectArgs k{(const float *)a->logits, (int *)a->ids, (float *)a->weights,
-                               (float *)a->shared_gate, (int *)a->status, a->m, a->n_expert,
-                               a->top_k, a->n_expert + 1};
-            launch_select<false>(k, s);
+            router_select_k<false><<<a->m, 32, 0, s>>>((const float *)a->logits, (int *)a->ids,
+                                                (float *)a->weights, (float *)a->shared_gate,
+                                                (int *)a->status, a->n_expert, a->top_k, a->n_expert + 1);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
         report_stage(out_stage, failure.stage);
@@ -484,10 +456,8 @@ extern "C" int inference_cuda_router_sigmoid_select_launch(const inference_cuda_
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!stream || !valid_split_select(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
-        const SelectArgs k{a->logits, a->ids,      a->weights, NULL,
-                           a->status, a->m,        a->n_expert, a->top_k,
-                           a->n_expert};
-        launch_select<true>(k, (cudaStream_t)stream);
+        router_select_k<true><<<a->m, 32, 0, (cudaStream_t)stream>>>(
+            a->logits, a->ids, a->weights, NULL, a->status, a->n_expert, a->top_k, a->n_expert);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

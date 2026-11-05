@@ -490,6 +490,3 @@ mod tests {
         assert!(matches!(result, Err(EngError::BadRequest(_))));
     }
 }
-
-#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-mod cuda_tests;
