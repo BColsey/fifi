@@ -707,9 +707,10 @@ pub(crate) struct Report {
 /// - `reference` runs the scorer's own numeric path (SpecPilot's autoregressive run). Its
 ///   mismatch rate is near zero by construction, so it only calibrates delta.
 /// - `baseline` is a second legal execution of the accepted build that differs from the scorer
-///   in reduction order only, such as another prefill chunk size (SpecPilot's stock system).
-///   It calibrates delta with the reference and is the baseline of both rules: a lossless
-///   candidate's mismatches are near ties of the same kind.
+///   in reduction order only: another prefill chunk size, the one setting it may change
+///   (`check_builds`; SpecPilot's stock system). It calibrates delta with the reference and is
+///   the baseline of both rules: a lossless candidate's mismatches are near ties of the same
+///   kind.
 /// - `candidate` is the execution under test.
 ///
 /// The three executions must carry distinct labels, so that one file cannot stand in for two

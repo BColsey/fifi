@@ -45,11 +45,11 @@
 //! self-test is not audited. It runs a short comparison (`TF_TOKENS`, 512 by default) and a
 //! candidate with the fault from output position 128, and audits up to `TF_AUDIT_CAP` of the
 //! candidate's events. Its defaults are those of its passing device run (`AUDIT_PATH`), so it
-//! runs as intended with no settings. It asserts that each audit is one prefill of the whole context up to
-//! its event; that the re-read row gives the step path's argmax and margin bitwise, because
-//! Flint's prefill is batch-invariant, so that no legal re-execution here explains an event;
-//! and that the report counts the audited events as unexplained and the rest as unaudited, and
-//! rejects. The cap must be at least 2, and the events must exceed it by at least five
+//! runs as intended with no settings. It asserts that each audit is one prefill of the whole
+//! context up to its event; that the re-read row gives the step path's argmax and margin
+//! bitwise, because Flint's prefill is batch-invariant, so that no legal re-execution here
+//! explains an event; and that the report counts the audited events as unexplained and the rest
+//! as unaudited, and rejects. The cap must be at least 2, and the events must exceed it by at least five
 //! unaudited ones (`MIN_UNAUDITED`), so that the unaudited-event accounting carries as many
 //! events as the event rule needs to reject.
 //!
@@ -219,9 +219,12 @@ impl Plan {
                 .expect("TF_OUT_DIR must name a new directory")
                 .into(),
             kv: std::env::var("TF_KV").unwrap_or_else(|_| "f16".to_owned()),
-            tasks: Some(list("TF_TASKS"))
-                .filter(|tasks| !tasks.is_empty())
-                .unwrap_or_else(|| defaults.tasks.iter().map(|&task| task.to_owned()).collect()),
+            tasks: match list("TF_TASKS") {
+                tasks if tasks.is_empty() => {
+                    defaults.tasks.iter().map(|&task| task.to_owned()).collect()
+                }
+                tasks => tasks,
+            },
             probe: match std::env::var("TF_PROBE").as_deref() {
                 Err(_) | Ok("") => false,
                 Ok("1") => true,
@@ -299,6 +302,11 @@ fn scorer_identity(engine: &FlintExecutor) -> ExecutionIdentity {
 /// fingerprint, with its own layer-major mode), and the resolved kernel switches of its load
 /// line. `gate::check_builds` compares these entries: the baseline may differ from the scorer
 /// in the prefill chunk size only, so a q8 baseline beside an f16 scorer is refused.
+///
+/// Left out on purpose: the expert-bank split, because the work reserve grows with the prefill
+/// rows, so the bank can differ between a chunk-4 baseline and a chunk-8 scorer on one numeric
+/// path, and recording it would make a legal baseline refuse itself; and the lazy allocation
+/// return, which changes when a freed block may be reused, not what a kernel computes.
 fn effective_profile(engine: &FlintExecutor) -> BTreeMap<String, String> {
     let options = &engine.options;
     let numeric_env = CudaPrefixEnv {
