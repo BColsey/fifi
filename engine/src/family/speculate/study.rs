@@ -258,6 +258,14 @@ mod tests {
     }
 
     #[test]
+    fn speedup_divides_by_the_window_and_the_draft_cost_together() {
+        // E 2.0 over a window of 1.5 and a chain of 0.5 is exactly one solo step per solo step
+        assert!((speedup(2.0, 1.5, 0.5) - 1.0).abs() < 1e-12);
+        // 1.9 / (1.59 + 0.10) = 1.124260355...
+        assert!((speedup(1.9, 1.59, 0.10) - 1.124_260_355_029_586).abs() < 1e-12);
+    }
+
+    #[test]
     fn drafting_cost_comes_off_the_window_budget_one_for_one() {
         // 1.9 / 1.15 = 1.652173913...; a draft cost of 0.10 leaves 1.552173913...
         let Budget::Largest(paid) = max_window_cost(1.9, 0.10) else {
