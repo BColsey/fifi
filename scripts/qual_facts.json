@@ -13,8 +13,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5536,
-      "ignored": 444,
+      "test_fns": 5590,
+      "ignored": 447,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -258,6 +258,14 @@
         "RD4A_FIXTURES",
         "RD7A_FIXTURES",
         "TCAP_STRESS_DEADLINE_SECS",
+        "TF_CANDIDATE",
+        "TF_COMPARISON",
+        "TF_COMPARISON_SHA256",
+        "TF_KV",
+        "TF_OUT_DIR",
+        "TF_PROBE",
+        "TF_PROBE_FILE",
+        "TF_WRITE_GENERATIONS",
         "TMPDIR",
         "TOKEN_HEALTH_ENV_PROBE",
         "WIDE_EQ_ARM"
