@@ -386,14 +386,13 @@ unsafe extern "C" {
         stage: *mut c_int,
         cols: u32,
     ) -> c_int;
-    #[cfg(test)]
-    fn inference_cuda_exl3_grouped_indexed_prototype(
+    fn inference_cuda_exl3_grouped_indexed_option(
         args: *const LinearArgs,
         index: *const IndexArgs,
         count: usize,
         stream: *mut c_void,
         stage: *mut c_int,
-        variant: u32,
+        options: u32,
     ) -> c_int;
     #[cfg(test)]
     fn inference_cuda_exl3_book2_probe(
@@ -480,32 +479,31 @@ pub(in crate::kernels::cuda) fn grouped_indexed(
     checked(status, stage)
 }
 
-/// The bench-only prototype of [`grouped_indexed`], one tile per block: `variant` bit 0 decodes
-/// book 2 with DP4A, bit 1 admits up to 20 calls (else up to 16). Same validation and bytes.
-#[cfg(test)]
-pub(in crate::kernels::cuda) fn grouped_indexed_prototype(
+/// [`grouped_indexed`] with opt-in options, one tile per block: `options` bit 0 decodes book 2
+/// with DP4A, bit 1 admits up to 20 calls (else up to 16). Same validation and bytes.
+pub(in crate::kernels::cuda) fn grouped_indexed_option(
     stream: &RawStream,
     calls: &[LinearRaw<'_>],
     index: &[IndexRaw<'_>],
-    variant: u32,
+    options: u32,
 ) -> Result<(), DeviceFailure> {
-    let limit = match variant {
+    let limit = match options {
         1 => 16,
         2 | 3 => 20,
         _ => return Err(invalid_argument()),
     };
     let (args, indexes) = indexed_records(calls, index, limit)?;
     let mut stage = STAGE_NONE;
-    // SAFETY: as for `grouped_indexed`; the prototype kernels read and write exactly what the
-    // production kernels do, for up to 20 calls, which C bounds by the parameter block it fills.
+    // SAFETY: as for `grouped_indexed`; the option kernels read and write exactly what the
+    // default kernels do, for up to 20 calls, which C bounds by the parameter block it fills.
     let status = unsafe {
-        inference_cuda_exl3_grouped_indexed_prototype(
+        inference_cuda_exl3_grouped_indexed_option(
             args.as_ptr(),
             indexes.as_ptr(),
             args.len(),
             stream.as_ptr(),
             &mut stage,
-            variant,
+            options,
         )
     };
     checked(status, stage)

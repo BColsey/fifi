@@ -47,16 +47,17 @@
 //!   (`FIFI_FLASH_NEXT_MISS_TRACES`, `name=path,...`; one line per token, one count per layer), and
 //!   the same tokens with every expert resident. Per-token samples are printed for the report.
 //!
-//! - graph_variants (only when named in `FIFI_GRAPH_BENCH_PHASES`): the block under the production
-//!   id-indexed launch and each bench-only prototype of it (`IndexedPrototype`: the DP4A decode,
-//!   one launch of the 20 gate and up pairs, both), all on the served single-row kernel (`wide1`).
-//!   Each variant's eager and graph outputs must equal the production eager outputs bit for bit
-//!   on 4 rows; then graph isolated, graph gated, eager isolated and 48 graph launches back to
-//!   back, the variants taking turns in every trial. `FIFI_EXL3_SINGLE_GATHER` and
-//!   `FIFI_EXL3_INDEXED_PROTOTYPE` must be unset: the phase chooses the kernels itself.
+//! - graph_variants (only when named in `FIFI_GRAPH_BENCH_PHASES`): the block under the default
+//!   id-indexed launch and each opt-in option of it (`IndexedOptions`: the DP4A decode, one launch
+//!   of the 20 gate and up pairs, both), all on the served single-row kernel (`wide1`). Each
+//!   variant's eager and graph outputs must equal the default eager outputs bit for bit on 4
+//!   rows; then graph isolated, graph gated, eager isolated and 48 graph launches back to back,
+//!   the variants taking turns in every trial. `FIFI_EXL3_SINGLE_GATHER`, `FIFI_EXL3_DP4A` and
+//!   `FIFI_EXL3_INDEXED_PAIRS` must be unset: the phase chooses the kernels itself.
 //!
-//! `FIFI_EXL3_INDEXED_PROTOTYPE` (`dp4a`, `pairs20`, `both`) runs every other phase on that
-//! prototype, so its miss and trace costs can be set against a run without it.
+//! `FIFI_EXL3_DP4A=1` and `FIFI_EXL3_INDEXED_PAIRS=20` apply to every other phase as they would to
+//! a served engine, so their miss and trace costs can be set against a run without them; the
+//! options a run used are printed first (`graph_options`).
 //!
 //! `FIFI_GRAPH_BENCH_PHASES` (comma list of check, block, variants, miss, trace; all but variants
 //! by default) limits the phases; the build phase always runs. Run only inside an exclusive GPU window.
@@ -93,7 +94,7 @@ use crate::{
         PinnedBuf, TimingEvent,
         prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
         resident::{
-            exl3::{IndexedPrototype, SINGLE_GATHER_VAR, SingleRow},
+            exl3::{DP4A_VAR, INDEXED_PAIRS_VAR, IndexedOptions, SINGLE_GATHER_VAR, SingleRow},
             moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
             router::{RouterCall, RouterOut, RouterShape, RouterWeights},
         },
@@ -1116,14 +1117,14 @@ fn token_cases(rig: &mut Rig<'_>) -> Res<()> {
     Ok(())
 }
 
-/// The variants of the variants phase: the production id-indexed launch (`base`) and its
-/// bench-only prototypes. The existing wide kernels were measured slower (2026-11-04) and are
+/// The variants of the variants phase: the default id-indexed launch (`base`) and its opt-in
+/// options. The existing wide kernels were measured slower (2026-11-04) and are
 /// left out.
-const VARIANTS: [(&str, IndexedPrototype); 4] = [
-    ("base", IndexedPrototype::Off),
-    ("dp4a", IndexedPrototype::Dp4a),
-    ("pairs20", IndexedPrototype::Pairs20),
-    ("both", IndexedPrototype::Both),
+const VARIANTS: [(&str, IndexedOptions); 4] = [
+    ("base", IndexedOptions::OFF),
+    ("dp4a", IndexedOptions::DP4A),
+    ("pairs20", IndexedOptions::PAIRS20),
+    ("both", IndexedOptions::BOTH),
 ];
 /// The single-row kernel of every variant: a served EXL3 pack starts on it
 /// (`qwen36::cuda::start`).
@@ -1134,19 +1135,19 @@ const VARIANT_REPS: usize = 40;
 const VARIANT_TOKENS: usize = 6;
 
 /// Captures the block under every variant and checks that the eager and graph outputs of each
-/// equal the production eager outputs bit for bit on `VARIANT_ROWS` rows (NaN-poisoned runs).
+/// equal the default eager outputs bit for bit on `VARIANT_ROWS` rows (NaN-poisoned runs).
 fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
     let n_expert = rig.composed.dims.n_expert;
     rig.ctx.set_single_row_default(SERVED);
-    rig.ctx.set_indexed_prototype(IndexedPrototype::Off);
+    rig.ctx.set_indexed_options(Some(IndexedOptions::OFF));
     let mut want = Vec::with_capacity(VARIANT_ROWS);
     for seed in 0..VARIANT_ROWS {
         rig.set_row(seed)?;
         want.push(rig.run_once(|r| r.full(Exec::Eager))?);
     }
     let (mut graphs, mut agree) = (Vec::with_capacity(VARIANTS.len()), Agreement::default());
-    for (name, prototype) in VARIANTS {
-        rig.ctx.set_indexed_prototype(prototype);
+    for (name, options) in VARIANTS {
+        rig.ctx.set_indexed_options(Some(options));
         // The variant's kernels load on their first eager launch; a capture refuses a first launch.
         rig.full(Exec::Eager)?;
         rig.settle()?;
@@ -1161,7 +1162,7 @@ fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
             }
             if agree.exact != agree.compared {
                 return Err(fail(format!(
-                    "variant {name}: row {seed} differs from production (worst relative L2 {:e})",
+                    "variant {name}: row {seed} differs from the default launch (worst relative L2 {:e})",
                     agree.worst
                 )));
             }
@@ -1193,7 +1194,7 @@ fn token_with(rig: &mut Rig<'_>, queue: &dyn Fn(&Rig<'_>) -> Res<()>) -> Res<f64
 fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
     // The variable is read once per process and wins over every default, so all the variants
     // would run one kernel under their own names.
-    for var in [SINGLE_GATHER_VAR, IndexedPrototype::VAR] {
+    for var in [SINGLE_GATHER_VAR, DP4A_VAR, INDEXED_PAIRS_VAR] {
         if std::env::var_os(var).is_some() {
             return Err(fail(format!("the variants phase needs {var} unset")));
         }
@@ -1213,7 +1214,7 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
         // The order rotates from trial to trial, so no variant always follows the same one.
         for turn in 0..VARIANTS.len() {
             let v = (turn + trial) % VARIANTS.len();
-            let ((_, prototype), graph) = (&VARIANTS[v], &graphs[v]);
+            let ((_, options), graph) = (&VARIANTS[v], &graphs[v]);
             let replay = |r: &Rig<'_>| graph.launch(&r.compute);
             let mut got: [Vec<f64>; 4] = Default::default();
             for _ in 0..VARIANT_REPS {
@@ -1224,7 +1225,7 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
                     late[v] += usize::from(gated.late);
                 }
             }
-            rig.ctx.set_indexed_prototype(*prototype);
+            rig.ctx.set_indexed_options(Some(*options));
             for _ in 0..VARIANT_REPS {
                 got[2].push(block_rep(rig, Exec::Eager, false)?.device);
             }
@@ -1241,7 +1242,7 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
         }
     }
     rig.ctx.set_single_row_default(SingleRow::Legacy);
-    rig.ctx.set_indexed_prototype(IndexedPrototype::Off);
+    rig.ctx.set_indexed_options(None);
     for (((name, _), got), late) in VARIANTS.iter().zip(&samples).zip(late) {
         for (what, values) in names.iter().zip(got) {
             let extra = if *what == "graph_gated" {
@@ -1464,11 +1465,9 @@ fn run() -> Res<()> {
         compute: ctx.stream()?,
         transfer: ctx.stream()?,
     };
-    let prototype = IndexedPrototype::from_env()?;
-    ctx.set_indexed_prototype(prototype);
     println!(
-        "RESBENCH {{\"phase\":\"graph_prototype\",\"case\":\"{}\"}}",
-        prototype.name()
+        "RESBENCH {{\"phase\":\"graph_options\",\"case\":\"{}\"}}",
+        ctx.exl3_indexed_options()?.name()
     );
     build_phase(&mut rig)?;
     if want("check") {

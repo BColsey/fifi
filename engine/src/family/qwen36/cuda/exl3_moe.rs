@@ -15,9 +15,10 @@
 //! pairs contiguous in group order; `Scratch` places them.
 //!
 //! The block is shared with Qwen3.8 Flash-Next, which picks 10 of 512 experts: an id-indexed
-//! launch takes at most 16 pairs (`CudaContext::exl3_indexed_capacity`), so a group of more
-//! (Flash-Next's 20 gate and up pairs) is queued as consecutive launches of at most 16 in group
-//! order. Qwen3.6's 8 picks make one launch, as before.
+//! launch takes at most 16 pairs (`CudaContext::exl3_indexed_capacity`; 20 under the opt-in
+//! `FIFI_EXL3_INDEXED_PAIRS=20`), so a group of more (Flash-Next's 20 gate and up pairs) is
+//! queued as consecutive launches of at most that many in group order. Qwen3.6's 8 picks make
+//! one launch, as before.
 
 use super::{
     layer_table::LayerTable,

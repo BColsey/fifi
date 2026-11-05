@@ -1,65 +1,139 @@
-//! The bench-only prototypes of the id-indexed launch ([`IndexedPrototype`]) against the
-//! production launch.
+//! The opt-in options of the id-indexed launch ([`IndexedOptions`]) against the default launch.
 //!
+//! - The switches parse strictly; an option the single-row kernel cannot run with is refused at
+//!   the session start; the load line names exactly the options that are on.
 //! - The DP4A decode of book 2 must give the bits `decode_state` gives for every one of the 65536
 //!   states, and both must equal the host reference (`Codebook::Mul1`).
 //! - Its byte sum must be exact for every byte value in every lane, with the 0x6400 offset and
 //!   nothing above bit 15.
-//! - Every prototype launch must write the bytes of the production launch of the same 20 calls:
-//!   rotated inputs, partials, outputs and flag, for every codebook, several rates and an
-//!   unaligned bank.
+//! - Every option must write the bytes of the default launch of the same 20 calls: rotated
+//!   inputs, partials, outputs and flag, for every codebook, several rates and an unaligned bank.
 //! - An id outside the bank in the tail pairs (16 to 19, the 20-pair launch's own) skips exactly
 //!   those pairs and raises the flag.
 //!
-//! A host without a device skips the device tests.
+//! The device tests set the options on their context, which wins over the environment. A host
+//! without a device skips them.
 
 use std::ffi::OsStr;
 
-use super::{Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, IndexedPrototype};
+use super::{
+    DP4A_VAR, Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, INDEXED_PAIRS_VAR, IndexedOptions,
+    SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_pairs_from_env,
+};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
 /// The multiplier of book 2's hash (`decode_state`).
 const MUL1: u32 = 0x83dc_d12d;
 const PAIRS: usize = 20;
+const OFF: IndexedOptions = IndexedOptions::OFF;
+const DP4A: IndexedOptions = IndexedOptions::DP4A;
+const PAIRS20: IndexedOptions = IndexedOptions::PAIRS20;
+const BOTH: IndexedOptions = IndexedOptions::BOTH;
 
 #[test]
-fn the_prototype_names_parse_strictly() {
-    for prototype in IndexedPrototype::ALL {
-        let name = OsStr::new(prototype.name());
-        assert_eq!(IndexedPrototype::parse(Some(name)).unwrap(), prototype);
-        let padded = format!(" {} ", prototype.name());
+fn the_switches_parse_strictly() {
+    let parse =
+        |f: fn(Option<&OsStr>) -> Result<Option<bool>, String>, v: &str| f(Some(OsStr::new(v)));
+    assert_eq!(dp4a_from_env(None), Ok(None));
+    assert_eq!(indexed_pairs_from_env(None), Ok(None));
+    for (value, on) in [("0", false), ("1", true), (" 1 ", true)] {
+        assert_eq!(parse(dp4a_from_env, value), Ok(Some(on)), "{value:?}");
+    }
+    for (value, on) in [("16", false), ("20", true), (" 20 ", true)] {
         assert_eq!(
-            IndexedPrototype::parse(Some(OsStr::new(&padded))).unwrap(),
-            prototype
+            parse(indexed_pairs_from_env, value),
+            Ok(Some(on)),
+            "{value:?}"
         );
     }
-    assert_eq!(
-        IndexedPrototype::parse(None).unwrap(),
-        IndexedPrototype::Off
-    );
-    for bad in ["", "DP4A", "on", "1", "pairs16", "dp4a,pairs20"] {
-        assert!(
-            IndexedPrototype::parse(Some(OsStr::new(bad))).is_err(),
-            "{bad:?}"
-        );
+    for bad in ["", "on", "true", "2", "01", "dp4a"] {
+        let error = parse(dp4a_from_env, bad).expect_err(bad);
+        assert!(error.contains(DP4A_VAR), "{bad:?}: {error}");
+    }
+    for bad in ["", "1", "8", "32", "on", "pairs20"] {
+        let error = parse(indexed_pairs_from_env, bad).expect_err(bad);
+        assert!(error.contains(INDEXED_PAIRS_VAR), "{bad:?}: {error}");
     }
 }
 
 #[test]
-fn a_prototype_changes_only_the_launches_it_names() {
-    use IndexedPrototype::*;
+fn an_option_changes_only_the_launches_it_names() {
     for calls in 1..=PAIRS {
         let over = calls > INDEXED_CAPACITY;
-        assert_eq!(Off.variant(calls), None);
-        assert_eq!(Dp4a.variant(calls), Some(1));
-        assert_eq!(Pairs20.variant(calls), over.then_some(2));
-        assert_eq!(Both.variant(calls), Some(if over { 3 } else { 1 }));
+        assert_eq!(OFF.native(calls), None);
+        assert_eq!(DP4A.native(calls), Some(1));
+        assert_eq!(PAIRS20.native(calls), over.then_some(2));
+        assert_eq!(BOTH.native(calls), Some(if over { 3 } else { 1 }));
     }
-    for (prototype, capacity) in [(Off, 16), (Dp4a, 16), (Pairs20, 20), (Both, 20)] {
-        assert_eq!(prototype.capacity(), capacity, "{prototype:?}");
+    for (options, capacity, name) in [
+        (OFF, 16, "off"),
+        (DP4A, 16, "dp4a"),
+        (PAIRS20, 20, "pairs20"),
+        (BOTH, 20, "both"),
+    ] {
+        assert_eq!(options.capacity(), capacity, "{options:?}");
+        assert_eq!(options.name(), name);
     }
-    assert_eq!(IndexedPrototype::default(), Off);
+    assert_eq!(IndexedOptions::default(), OFF);
+}
+
+#[test]
+fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
+    for kernel in [SingleRow::Legacy, SingleRow::Gather, SingleRow::Wide(1)] {
+        for options in IndexedOptions::ALL {
+            assert!(
+                check_indexed_with(kernel, options).is_ok(),
+                "{kernel:?} {options:?}"
+            );
+        }
+    }
+    for kernel in [SingleRow::Wide(2), SingleRow::Wide(4)] {
+        assert!(check_indexed_with(kernel, OFF).is_ok(), "{kernel:?}");
+        for options in [DP4A, PAIRS20, BOTH] {
+            let error = check_indexed_with(kernel, options).expect_err("a wide kernel");
+            let text = format!("{error:?}");
+            for var in [DP4A_VAR, INDEXED_PAIRS_VAR, SINGLE_GATHER_VAR] {
+                assert!(text.contains(var), "{kernel:?} {options:?}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_load_line_names_exactly_the_options_that_are_on() {
+    assert_eq!(OFF.suffix(), "");
+    assert_eq!(DP4A.suffix(), " exl3_dp4a=on");
+    assert_eq!(PAIRS20.suffix(), " exl3_indexed_pairs=20");
+    assert_eq!(BOTH.suffix(), " exl3_dp4a=on exl3_indexed_pairs=20");
+}
+
+/// The session check and the load line read the context's options: a two-tile single-row kernel
+/// with an option on stops the start, and the line names the options after the kernel. Needs
+/// `FIFI_EXL3_SINGLE_GATHER` unset (an explicit value wins over the context's kernel).
+#[test]
+fn the_session_check_and_the_load_line_see_the_context_options() {
+    if !testkit::device_present("EXL3 indexed option session check") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    ctx.set_single_row_default(SingleRow::Wide(2));
+    ctx.set_indexed_options(Some(OFF));
+    assert!(ctx.check_single_gather().is_ok());
+    ctx.set_indexed_options(Some(DP4A));
+    assert!(ctx.check_single_gather().is_err(), "dp4a with two tiles");
+    ctx.set_single_row_default(SingleRow::Wide(1));
+    assert!(ctx.check_single_gather().is_ok());
+    ctx.set_indexed_options(Some(BOTH));
+    assert_eq!(
+        ctx.single_gather_suffix(),
+        " single_gather=on single_kernel=wide1 exl3_dp4a=on exl3_indexed_pairs=20"
+    );
+    ctx.set_indexed_options(Some(OFF));
+    assert_eq!(
+        ctx.single_gather_suffix(),
+        " single_gather=on single_kernel=wide1"
+    );
 }
 
 /// 1024 + s is an F16 integer for every byte sum s (0 to 1020), and its bits are 0x6400 + s:
@@ -286,8 +360,8 @@ fn pair_spans(written: &Written, p: usize, k: usize, n: usize) -> [&[u8]; 3] {
 }
 
 #[test]
-fn indexed_prototypes_write_the_bytes_of_the_production_launch() {
-    if !testkit::device_present("EXL3 indexed prototypes") {
+fn indexed_options_write_the_bytes_of_the_default_launch() {
+    if !testkit::device_present("EXL3 indexed options") {
         return;
     }
     let ctx = CudaContext::new().expect("context");
@@ -298,7 +372,7 @@ fn indexed_prototypes_write_the_bytes_of_the_production_launch() {
     let ids: [i32; PAIRS] = std::array::from_fn(|p| picks[p / 2]);
     // Book 2 at Flash-Next's rate (6), at the rates with their own bodies (8, 12), at an odd rate,
     // and with a bank 2 bytes into its buffer; the other books must be unchanged by the DP4A
-    // prototype too.
+    // option too.
     for kind in [
         (Codebook::Mul1, 6u8, 0usize),
         (Codebook::Mul1, 8, 0),
@@ -310,11 +384,11 @@ fn indexed_prototypes_write_the_bytes_of_the_production_launch() {
     ] {
         let bank = Bank::new(&ctx, &mut rng, kind);
         let (k, n) = (bank.k, bank.n);
-        ctx.set_indexed_prototype(IndexedPrototype::Off);
+        ctx.set_indexed_options(Some(OFF));
         let want = bank.run(&ctx, &stream, &ids);
-        assert_eq!(want.3, [0; 4], "{kind:?}: production flag");
-        // The production launches wrote every pair, the second launch's included, so equality
-        // below shows the prototypes wrote them too.
+        assert_eq!(want.3, [0; 4], "{kind:?}: default flag");
+        // The default launches wrote every pair, the second launch's included, so equality below
+        // shows the options wrote them too.
         for p in 0..PAIRS {
             for span in pair_spans(&want, p, k, n) {
                 assert!(
@@ -326,46 +400,42 @@ fn indexed_prototypes_write_the_bytes_of_the_production_launch() {
         let mut bad = ids;
         bad[17] = bank.members as i32;
         bad[19] = -1;
-        for prototype in [
-            IndexedPrototype::Dp4a,
-            IndexedPrototype::Pairs20,
-            IndexedPrototype::Both,
-        ] {
-            ctx.set_indexed_prototype(prototype);
+        for options in [DP4A, PAIRS20, BOTH] {
+            ctx.set_indexed_options(Some(options));
             let got = bank.run(&ctx, &stream, &ids);
-            assert_eq!(got, want, "{kind:?} {prototype:?}");
+            assert_eq!(got, want, "{kind:?} {options:?}");
             // Ids outside the bank in the tail: exactly those pairs are skipped, the flag is
             // raised, every other pair matches.
             let gapped = bank.run(&ctx, &stream, &bad);
-            assert_eq!(gapped.3, 1u32.to_le_bytes(), "{kind:?} {prototype:?}: flag");
+            assert_eq!(gapped.3, 1u32.to_le_bytes(), "{kind:?} {options:?}: flag");
             for p in 0..PAIRS {
                 let spans = pair_spans(&gapped, p, k, n);
                 if p == 17 || p == 19 {
                     for span in spans {
                         assert!(
                             span.iter().all(|&b| b == 0xff),
-                            "{kind:?} {prototype:?}: skipped pair {p} was written"
+                            "{kind:?} {options:?}: skipped pair {p} was written"
                         );
                     }
                 } else {
                     assert_eq!(
                         spans,
                         pair_spans(&want, p, k, n),
-                        "{kind:?} {prototype:?}: pair {p}"
+                        "{kind:?} {options:?}: pair {p}"
                     );
                 }
             }
         }
     }
-    ctx.set_indexed_prototype(IndexedPrototype::Off);
+    ctx.set_indexed_options(None);
 }
 
-/// One launch of 20 calls: refused by the production launch and the 16-pair DP4A prototype,
-/// taken by the 20-pair prototypes with the bytes of 16 + 4 production launches. A prototype
-/// refuses more than one tile per block.
+/// One launch of 20 calls: refused by the default launch and the DP4A option alone, taken by the
+/// 20-pair option with or without DP4A with the bytes of 16 + 4 default launches. A launch an
+/// option runs refuses more than one tile per block.
 #[test]
-fn only_a_twenty_pair_prototype_takes_twenty_calls_in_one_launch() {
-    if !testkit::device_present("EXL3 indexed prototype capacity") {
+fn only_the_twenty_pair_option_takes_twenty_calls_in_one_launch() {
+    if !testkit::device_present("EXL3 indexed option capacity") {
         return;
     }
     let ctx = CudaContext::new().expect("context");
@@ -373,22 +443,33 @@ fn only_a_twenty_pair_prototype_takes_twenty_calls_in_one_launch() {
     let mut rng = testkit::Rng::new(0x5347_0021);
     let bank = Bank::new(&ctx, &mut rng, (Codebook::Mul1, 6, 0));
     let ids: [i32; PAIRS] = std::array::from_fn(|p| (p * 5 % bank.members) as i32);
+    ctx.set_indexed_options(Some(OFF));
     let want = bank.run(&ctx, &stream, &ids);
-    for prototype in [IndexedPrototype::Off, IndexedPrototype::Dp4a] {
-        ctx.set_indexed_prototype(prototype);
+    for options in [OFF, DP4A] {
+        ctx.set_indexed_options(Some(options));
         assert_eq!(ctx.exl3_indexed_capacity(), INDEXED_CAPACITY);
         assert!(
             bank.run_in(&ctx, &stream, &ids, (PAIRS, 1)).is_err(),
-            "{prototype:?} took 20 calls"
+            "{options:?} took 20 calls"
         );
     }
-    for prototype in [IndexedPrototype::Pairs20, IndexedPrototype::Both] {
-        ctx.set_indexed_prototype(prototype);
+    for options in [PAIRS20, BOTH] {
+        ctx.set_indexed_options(Some(options));
         assert_eq!(ctx.exl3_indexed_capacity(), PAIRS);
         let got = bank.run_in(&ctx, &stream, &ids, (PAIRS, 1)).unwrap();
-        assert_eq!(got, want, "{prototype:?}");
+        assert_eq!(got, want, "{options:?}");
     }
-    ctx.set_indexed_prototype(IndexedPrototype::Dp4a);
-    assert!(bank.run_in(&ctx, &stream, &ids, (16, 2)).is_err());
-    ctx.set_indexed_prototype(IndexedPrototype::Off);
+    // DP4A runs one tile per block in every launch; the 20-pair option only in a launch of more
+    // than 16 calls, so its 16-call launches keep the default kernel at two tiles (same bytes).
+    for options in [DP4A, BOTH] {
+        ctx.set_indexed_options(Some(options));
+        assert!(
+            bank.run_in(&ctx, &stream, &ids, (16, 2)).is_err(),
+            "{options:?} took two tiles per block"
+        );
+    }
+    ctx.set_indexed_options(Some(PAIRS20));
+    assert!(bank.run_in(&ctx, &stream, &ids, (PAIRS, 2)).is_err());
+    assert_eq!(bank.run_in(&ctx, &stream, &ids, (16, 2)).unwrap(), want);
+    ctx.set_indexed_options(None);
 }

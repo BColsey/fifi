@@ -153,10 +153,11 @@ pub(crate) struct CudaContext {
     /// context: set by the session that owns it, so two engines in one process choose apart.
     pub(in crate::kernels::cuda) exl3_single_row_default:
         std::cell::Cell<Option<super::resident::exl3::SingleRow>>,
-    /// The bench-only prototype the id-indexed EXL3 launches of this context run (test builds).
+    /// The id-indexed launch options a test or bench set on this context (test builds); `None`
+    /// takes the environment's.
     #[cfg(test)]
-    pub(in crate::kernels::cuda) exl3_indexed_prototype:
-        std::cell::Cell<super::resident::exl3::IndexedPrototype>,
+    pub(in crate::kernels::cuda) exl3_indexed_options:
+        std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
     _thread_confined: PhantomData<*const ()>,
     alloc_cache: Option<Rc<alloc_cache::AllocCache>>,
     /// Keep this field last. It returns credit only after native owners finish cleanup.
@@ -370,7 +371,7 @@ impl CudaContext {
             alloc_cache: None,
             exl3_single_row_default: std::cell::Cell::new(None),
             #[cfg(test)]
-            exl3_indexed_prototype: std::cell::Cell::default(),
+            exl3_indexed_options: std::cell::Cell::new(None),
             pinned_stage_admission: None,
         }
     }

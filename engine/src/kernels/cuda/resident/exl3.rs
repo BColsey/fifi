@@ -44,82 +44,150 @@ pub(crate) enum SingleRow {
     Wide(u32),
 }
 
-/// The most pairs one production id-indexed launch takes.
+/// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
+/// The most pairs one launch takes under the 20-pair option (Flash-Next's ten picks).
+const INDEXED_OPTION_CAPACITY: usize = 20;
 
-/// Bench-only prototypes of the id-indexed launch: the DP4A decode of book 2, one launch of up to
-/// 20 pairs, or both. Test builds only, and off unless a test or bench selects one on its
-/// context; production never runs them. Every byte they write equals the production launch of
-/// the same calls.
-#[cfg(test)]
+/// Opt-in switch of the DP4A decode of book 2 in the id-indexed launch: unset or `0` keeps the
+/// default decode, `1` decodes with one packed byte dot product. Same bytes. Process-wide, read
+/// once, strict: any other value is refused.
+pub(crate) const DP4A_VAR: &str = "FIFI_EXL3_DP4A";
+/// Opt-in switch of the 20-pair id-indexed launch: unset or `16` keeps launches of at most 16
+/// pairs, `20` takes up to 20 pairs in one launch. Same bytes. Process-wide, read once, strict.
+pub(crate) const INDEXED_PAIRS_VAR: &str = "FIFI_EXL3_INDEXED_PAIRS";
+
+/// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
+/// book 2 ([`DP4A_VAR`]) and one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]). Both off is
+/// the default launch, which stays the fallback. Every byte an option writes equals the default
+/// launch of the same calls; both options run one tile per block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum IndexedPrototype {
-    #[default]
-    Off,
-    Dp4a,
-    Pairs20,
-    Both,
+pub(crate) struct IndexedOptions {
+    pub(crate) dp4a: bool,
+    pub(crate) pairs20: bool,
 }
 
-#[cfg(test)]
-impl IndexedPrototype {
-    pub(crate) const ALL: [Self; 4] = [Self::Off, Self::Dp4a, Self::Pairs20, Self::Both];
-    /// The variable a test or bench process may read to select one: `off`, `dp4a`, `pairs20`
-    /// or `both`.
-    pub(crate) const VAR: &str = "FIFI_EXL3_INDEXED_PROTOTYPE";
+impl IndexedOptions {
+    pub(crate) const OFF: Self = Self {
+        dp4a: false,
+        pairs20: false,
+    };
+    #[cfg(test)]
+    pub(crate) const DP4A: Self = Self {
+        dp4a: true,
+        pairs20: false,
+    };
+    #[cfg(test)]
+    pub(crate) const PAIRS20: Self = Self {
+        dp4a: false,
+        pairs20: true,
+    };
+    #[cfg(test)]
+    pub(crate) const BOTH: Self = Self {
+        dp4a: true,
+        pairs20: true,
+    };
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] = [Self::OFF, Self::DP4A, Self::PAIRS20, Self::BOTH];
 
+    /// A short label for logs and bench records: `off`, `dp4a`, `pairs20` or `both`.
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Dp4a => "dp4a",
-            Self::Pairs20 => "pairs20",
-            Self::Both => "both",
+        match (self.dp4a, self.pairs20) {
+            (false, false) => "off",
+            (true, false) => "dp4a",
+            (false, true) => "pairs20",
+            (true, true) => "both",
         }
     }
 
-    /// The prototype `VAR` names, `Off` when it is unset, or the refusal of a bad value.
-    pub(crate) fn from_env() -> Result<Self, EngError> {
-        Self::parse(std::env::var_os(Self::VAR).as_deref())
-    }
-
-    /// The prototype a value of `VAR` names (`None`: unset, `Off`).
-    fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, EngError> {
-        let Some(value) = value else {
-            return Ok(Self::Off);
-        };
-        let text = value.to_str().map(str::trim);
-        Self::ALL
-            .into_iter()
-            .find(|p| Some(p.name()) == text)
-            .ok_or_else(|| {
-                EngError::BadRequest(format!(
-                    "{} must be unset, \"off\", \"dp4a\", \"pairs20\" or \"both\"",
-                    Self::VAR
-                ))
-            })
-    }
-
-    fn dp4a(self) -> bool {
-        matches!(self, Self::Dp4a | Self::Both)
-    }
-
-    fn pairs20(self) -> bool {
-        matches!(self, Self::Pairs20 | Self::Both)
-    }
-
-    /// The most pairs one launch takes under this prototype.
+    /// The most pairs one launch takes under these options.
     fn capacity(self) -> usize {
-        if self.pairs20() { 20 } else { INDEXED_CAPACITY }
+        if self.pairs20 {
+            INDEXED_OPTION_CAPACITY
+        } else {
+            INDEXED_CAPACITY
+        }
     }
 
-    /// The native prototype variant for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair
-    /// block), or `None` when the launch is the production one: a 20-pair prototype changes only
-    /// the launches of more than 16 pairs.
-    fn variant(self, calls: usize) -> Option<u32> {
-        let wide = self.pairs20() && calls > INDEXED_CAPACITY;
-        let bits = u32::from(self.dp4a()) | (u32::from(wide) << 1);
+    /// The native options for a launch of `calls` pairs (bit 0 DP4A, bit 1 the 20-pair block), or
+    /// `None` for the default launch: the 20-pair option changes only launches of more than 16
+    /// pairs, so the launches of a 16-pair model keep the default kernels under it.
+    fn native(self, calls: usize) -> Option<u32> {
+        let wide = self.pairs20 && calls > INDEXED_CAPACITY;
+        let bits = u32::from(self.dp4a) | (u32::from(wide) << 1);
         (bits != 0).then_some(bits)
     }
+
+    /// The load-line suffix of the options: empty when both are off, so the default line is
+    /// unchanged.
+    fn suffix(self) -> String {
+        let mut suffix = String::new();
+        if self.dp4a {
+            suffix.push_str(" exl3_dp4a=on");
+        }
+        if self.pairs20 {
+            suffix.push_str(" exl3_indexed_pairs=20");
+        }
+        suffix
+    }
+}
+
+/// Parses [`DP4A_VAR`]: `None` when unset, else whether the DP4A decode is on.
+pub(crate) fn dp4a_from_env(value: Option<&std::ffi::OsStr>) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(format!("{DP4A_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
+
+/// Parses [`INDEXED_PAIRS_VAR`]: `None` when unset, else whether the 20-pair launch is on.
+pub(crate) fn indexed_pairs_from_env(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<bool>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("16") => Ok(Some(false)),
+        Some("20") => Ok(Some(true)),
+        _ => Err(format!(
+            "{INDEXED_PAIRS_VAR} must be unset, \"16\" or \"20\""
+        )),
+    }
+}
+
+/// The options the environment selects, or the refusal of a bad value. Read once per process;
+/// an unset switch is off.
+fn indexed_explicit() -> Result<IndexedOptions, EngError> {
+    static EXPLICIT: std::sync::OnceLock<Result<IndexedOptions, String>> =
+        std::sync::OnceLock::new();
+    EXPLICIT
+        .get_or_init(|| {
+            let dp4a = dp4a_from_env(std::env::var_os(DP4A_VAR).as_deref())?;
+            let pairs20 = indexed_pairs_from_env(std::env::var_os(INDEXED_PAIRS_VAR).as_deref())?;
+            Ok(IndexedOptions {
+                dp4a: dp4a.unwrap_or(false),
+                pairs20: pairs20.unwrap_or(false),
+            })
+        })
+        .clone()
+        .map_err(EngError::BadRequest)
+}
+
+/// Refuses options the single-row kernel `kernel` cannot run with: both options run one tile per
+/// block, so a wide setting of two or four tiles takes neither.
+fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), EngError> {
+    if options != IndexedOptions::OFF && matches!(kernel, SingleRow::Wide(cols) if cols > 1) {
+        return Err(EngError::BadRequest(format!(
+            "{DP4A_VAR}=1 and {INDEXED_PAIRS_VAR}=20 run one tile per block: \
+             set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \"wide1\" with them"
+        )));
+    }
+    Ok(())
 }
 
 /// Parses the variable; an unset variable is the shuffle kernel.
@@ -203,21 +271,29 @@ fn single_gather_explicit() -> Result<Option<SingleRow>, EngError> {
 }
 
 impl CudaContext {
-    /// The most pairs one id-indexed launch on this context takes: 16, or 20 in a test build
-    /// whose context runs a 20-pair prototype ([`IndexedPrototype`]).
+    /// The most pairs one id-indexed launch on this context takes: 16, or 20 under the 20-pair
+    /// option. A bad switch value gives 16 here; the launch itself refuses it.
     pub(crate) fn exl3_indexed_capacity(&self) -> usize {
-        #[cfg(test)]
-        let capacity = self.exl3_indexed_prototype.get().capacity();
-        #[cfg(not(test))]
-        let capacity = INDEXED_CAPACITY;
-        capacity
+        self.exl3_indexed_options()
+            .map_or(INDEXED_CAPACITY, IndexedOptions::capacity)
     }
 
-    /// Selects the bench-only prototype the id-indexed launches of this context run (test
-    /// builds only); `Off` restores the production launch.
+    /// The options the id-indexed launches of this context run with: the environment's
+    /// ([`DP4A_VAR`], [`INDEXED_PAIRS_VAR`]), or in a test build the options a test or bench set on
+    /// the context, which win over the environment.
+    pub(crate) fn exl3_indexed_options(&self) -> Result<IndexedOptions, EngError> {
+        #[cfg(test)]
+        if let Some(options) = self.exl3_indexed_options.get() {
+            return Ok(options);
+        }
+        indexed_explicit()
+    }
+
+    /// Sets the options of this context's id-indexed launches (test builds only); `None` returns
+    /// to the environment's.
     #[cfg(test)]
-    pub(crate) fn set_indexed_prototype(&self, prototype: IndexedPrototype) {
-        self.exl3_indexed_prototype.set(prototype);
+    pub(crate) fn set_indexed_options(&self, options: Option<IndexedOptions>) {
+        self.exl3_indexed_options.set(options);
     }
 
     /// Runs the DP4A decode probe (`book2_probe` in the native layer) on `words` (u32 values),
@@ -255,20 +331,29 @@ impl CudaContext {
         ))
     }
 
-    /// Refuses a bad `FIFI_EXL3_SINGLE_GATHER` value; a session start calls it.
+    /// Refuses a bad value of an EXL3 launch switch (`FIFI_EXL3_SINGLE_GATHER`, [`DP4A_VAR`],
+    /// [`INDEXED_PAIRS_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
+    /// session start calls it.
     pub(crate) fn check_single_gather(&self) -> Result<(), EngError> {
-        self.single_row_setting().map(|_| ())
+        check_indexed_with(self.single_row_setting()?, self.exl3_indexed_options()?)
     }
 
-    /// The load-line suffix of this context's kernel: empty for the shuffle kernel, so the
-    /// default line is unchanged; ` single_gather=on single_kernel=<name>` when armed.
+    /// The load-line suffix of this context's EXL3 launch switches: empty for the shuffle kernel
+    /// and the default id-indexed launch, so the default line is unchanged;
+    /// ` single_gather=on single_kernel=<name>` when the single-row switch is armed, then
+    /// ` exl3_dp4a=on` and ` exl3_indexed_pairs=20` for the id-indexed options that are on.
     pub(crate) fn single_gather_suffix(&self) -> String {
-        self.single_row_setting()
+        let single = self
+            .single_row_setting()
             .ok()
             .and_then(single_row_label)
             .map_or(String::new(), |name| {
                 format!(" single_gather=on single_kernel={name}")
-            })
+            });
+        let options = self
+            .exl3_indexed_options()
+            .map_or(String::new(), IndexedOptions::suffix);
+        single + &options
     }
 }
 
@@ -721,11 +806,11 @@ impl CudaContext {
     /// Enqueues the id-indexed grouped projection of one decode token: every call is one row of
     /// a member of an expert bank, chosen from device memory when the kernels run, so the ids may
     /// be written by an earlier kernel of this stream and the launch can be captured in a graph.
-    /// 1 to 16 calls of one `k`, `n` and flag (see [`Self::exl3_indexed_capacity`]); the spans of
-    /// the calls are contiguous in call order as for the grouped launches. An id outside
-    /// `0..members` skips its pair and sets the sticky flag. Every byte written equals the wide
-    /// launch of the same members. A test build may route the launch to a bench-only prototype
-    /// ([`IndexedPrototype`]), which writes the same bytes.
+    /// 1 to 16 calls (20 under the 20-pair option, [`Self::exl3_indexed_capacity`]) of one `k`,
+    /// `n` and flag; the spans of the calls are contiguous in call order as for the grouped
+    /// launches. An id outside `0..members` skips its pair and sets the sticky flag. Every byte
+    /// written equals the wide launch of the same members. The opt-in options ([`IndexedOptions`]: the DP4A decode, up
+    /// to 20 calls in one launch) run one tile per block and write the same bytes.
     pub(crate) fn exl3_grouped_indexed(
         &self,
         stream: &DeviceStream,
@@ -734,7 +819,8 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
-        let capacity = self.exl3_indexed_capacity();
+        let options = self.exl3_indexed_options()?;
+        let capacity = options.capacity();
         if calls.is_empty() || calls.len() > capacity {
             return Err(refuse(&format!("needs 1..={capacity} calls")));
         }
@@ -828,13 +914,14 @@ impl CudaContext {
                     .transpose()?,
             });
         }
-        #[cfg(test)]
-        if let Some(variant) = self.exl3_indexed_prototype.get().variant(calls.len()) {
+        if let Some(native) = options.native(calls.len()) {
             if cols != 1 {
-                return Err(refuse("a prototype launch runs one tile per block"));
+                return Err(refuse(
+                    "the DP4A and 20-pair options run one tile per block",
+                ));
             }
             return self.launch_on(stream, |s| {
-                ffi::grouped_indexed_prototype(s, &raw, &index, variant)
+                ffi::grouped_indexed_option(s, &raw, &index, native)
             });
         }
         self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
@@ -1015,11 +1102,11 @@ mod observer_tests {
 #[cfg(test)]
 mod fused_publish_tests;
 #[cfg(test)]
+mod indexed_option_tests;
+#[cfg(test)]
 mod jobs_tests;
 #[cfg(test)]
 mod linear_tests;
-#[cfg(test)]
-mod prototype_tests;
 #[cfg(test)]
 mod single_gather_tests;
 #[cfg(test)]

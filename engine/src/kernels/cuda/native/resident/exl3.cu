@@ -43,8 +43,8 @@ __device__ __forceinline__ half decode_state(unsigned state, int book) {
                   __ushort_as_half(static_cast<unsigned short>(x >> 16)));
 }
 
-// Book 2 (MUL1) through one packed byte dot product: the bench-only prototype of the id-indexed
-// launch (`inference_cuda_exl3_grouped_indexed_prototype`), never the production kernels.
+// Book 2 (MUL1) through one packed byte dot product: the opt-in DP4A option of the id-indexed
+// launch (`inference_cuda_exl3_grouped_indexed_option`); every other kernel keeps decode_state.
 // decode_state sums the four bytes of x and adds the F16 1024.0 (0x6400). The sum is at most
 // 4 * 255 = 1020, so 1024 + sum lies in [1024, 2044], where F16 values are the integers: the
 // result is exact and its bits are 0x6400 + sum. __dp4a with unsigned operands multiplies each
@@ -804,7 +804,8 @@ __device__ __forceinline__ unsigned load_word(const uint16_t *tile, unsigned ind
 // word of the rate-8 pair table is a second load instead of a shuffle, so the loop carries no
 // warp-convergent shuffle. For book 1 at rate 8 the loop is 104 instructions per tile and lane
 // (115 before): the decode of the eight weights is 64 of them, the rest is loop and address work.
-// Dp4a (bench-only prototype) decodes book 2 with decode_book2_dp4a; the other books ignore it.
+// Dp4a (the DP4A option of the id-indexed launch) decodes book 2 with decode_book2_dp4a; the
+// other books ignore it.
 template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false>
 __device__ __forceinline__ void grouped_projection_one_tile(
     const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16]) {
@@ -1029,7 +1030,7 @@ template <int Book, int Cols, bool LeanAnyRate, class Args, bool Dp4a = false>
 __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
                                              unsigned (&wtab)[Cols][128],
                                              float (&partial)[8][16 * Cols]) {
-    // The DP4A prototype exists for the one-tile body of the id-indexed launch only.
+    // The DP4A option exists for the one-tile body of the id-indexed launch only.
     static_assert(!Dp4a || (Cols == 1 && LeanAnyRate), "the DP4A decode runs one tile per block");
     if constexpr (Cols == 1) {
         switch (a.bits_twice) {
@@ -1279,8 +1280,8 @@ static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t coun
 // kernel of the same stream and the launch can be captured in a graph. Every pair is one row.
 // The arithmetic is the wide projection's, hence the grouped gather kernel's.
 constexpr size_t indexed_capacity = 16;
-// The bench-only prototype launch takes Flash-Next's 20 gate and up pairs at once.
-constexpr size_t indexed_prototype_capacity = 20;
+// The 20-pair option takes Flash-Next's 20 gate and up pairs in one launch.
+constexpr size_t indexed_option_capacity = 20;
 struct IndexInfo {
     const int32_t *ids;
     uint32_t slot, members;
@@ -1299,8 +1300,8 @@ struct IndexedArgsOf {
     uint32_t pairs, groups, fused_publish;
 };
 using IndexedArgs = IndexedArgsOf<indexed_capacity>;
-using IndexedPrototypeArgs = IndexedArgsOf<indexed_prototype_capacity>;
-static_assert(sizeof(IndexInfo) == 40 && sizeof(IndexedPrototypeArgs) <= 4096,
+using IndexedOptionArgs = IndexedArgsOf<indexed_option_capacity>;
+static_assert(sizeof(IndexInfo) == 40 && sizeof(IndexedOptionArgs) <= 4096,
               "indexed launch parameters");
 
 // The pair of this block with its weights resolved; false for an id outside the bank, which also
@@ -1333,8 +1334,8 @@ __device__ __forceinline__ bool resolve_indexed(const P &p, GroupEntry &a) {
     return true;
 }
 
-// The kernel bodies of the id-indexed launch, for the production parameter block and the
-// prototype's. Each kernel declares its own shared arrays and passes them in: a __shared__
+// The kernel bodies of the id-indexed launch, for the 16-pair parameter block and the 20-pair
+// one. Each kernel declares its own shared arrays and passes them in: a __shared__
 // variable declared in a body that two kernels instantiate is one variable for both, and ptxas
 // then reserves it for neither kernel.
 template <class P>
@@ -1391,17 +1392,17 @@ __global__ void indexed_output_rotate(const __grid_constant__ IndexedArgs p) {
     indexed_output_rotate_body(p, values);
 }
 
-// The bench-only prototype kernels (`inference_cuda_exl3_grouped_indexed_prototype`): the same
-// bodies on parameter block P (16 or 20 pairs), one tile per block, with the DP4A decode when
-// Dp4a is set. No production path launches them.
+// The kernels of the opt-in launch options (`inference_cuda_exl3_grouped_indexed_option`): the
+// same bodies on parameter block P (16 or 20 pairs), one tile per block, with the DP4A decode
+// when Dp4a is set. The launch above stays the default and the fallback.
 template <class P>
-__global__ void prototype_input_rotate(const __grid_constant__ P p) {
+__global__ void option_input_rotate(const __grid_constant__ P p) {
     __shared__ float values[128];
     indexed_input_rotate_body(p, values);
 }
 
 template <class P, bool Dp4a>
-__global__ void __launch_bounds__(256, wide_min_blocks<1>) prototype_project(
+__global__ void __launch_bounds__(256, wide_min_blocks<1>) option_project(
     const __grid_constant__ P p) {
     __shared__ float partial[8][16];
     __shared__ __align__(8) unsigned wtab[8][1][128];
@@ -1409,7 +1410,7 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) prototype_project(
 }
 
 template <class P>
-__global__ void prototype_output_rotate(const __grid_constant__ P p) {
+__global__ void option_output_rotate(const __grid_constant__ P p) {
     __shared__ float values[128];
     indexed_output_rotate_body(p, values);
 }
@@ -1553,9 +1554,9 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
-// The bench-only prototype launch on parameter block P, one tile per block.
+// The id-indexed launch of an option on parameter block P, one tile per block.
 template <class P, bool Dp4a>
-static int prototype_launch(const inference_cuda_exl3_linear_args *calls,
+static int option_launch(const inference_cuda_exl3_linear_args *calls,
     const inference_cuda_exl3_index_args *index, size_t count, void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -1566,10 +1567,10 @@ static int prototype_launch(const inference_cuda_exl3_linear_args *calls,
         emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
             if (e.kind == LinearKind::Input)
-                prototype_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
+                option_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             else if (e.kind == LinearKind::Small)
-                prototype_project<P, Dp4a><<<grid,block,0,(cudaStream_t)stream>>>(args);
-            else prototype_output_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
+                option_project<P, Dp4a><<<grid,block,0,(cudaStream_t)stream>>>(args);
+            else option_output_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
             return failure.err == cudaSuccess;
         });
@@ -1622,20 +1623,18 @@ extern "C" int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_lin
     }
 }
 
-// Bench-only prototype of the id-indexed launch, one tile per block. `variant` bit 0 decodes
-// book 2 with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16). Variant 0 is the
-// production launch and is refused here.
-extern "C" int inference_cuda_exl3_grouped_indexed_prototype(
+// The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
+// with DP4A; bit 1 takes up to 20 calls in one launch (else up to 16). Options 0 is the default
+// launch (inference_cuda_exl3_grouped_indexed) and is refused here.
+extern "C" int inference_cuda_exl3_grouped_indexed_option(
     const inference_cuda_exl3_linear_args *calls, const inference_cuda_exl3_index_args *index,
-    size_t count, void *stream, int *out_stage, unsigned variant) {
-    switch (variant) {
-        case 1: return prototype_launch<IndexedArgs, true>(calls, index, count, stream, out_stage);
+    size_t count, void *stream, int *out_stage, unsigned options) {
+    switch (options) {
+        case 1: return option_launch<IndexedArgs, true>(calls, index, count, stream, out_stage);
         case 2:
-            return prototype_launch<IndexedPrototypeArgs, false>(calls, index, count, stream,
-                                                                 out_stage);
+            return option_launch<IndexedOptionArgs, false>(calls, index, count, stream, out_stage);
         case 3:
-            return prototype_launch<IndexedPrototypeArgs, true>(calls, index, count, stream,
-                                                                out_stage);
+            return option_launch<IndexedOptionArgs, true>(calls, index, count, stream, out_stage);
         default: return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
 }

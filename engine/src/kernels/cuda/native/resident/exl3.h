@@ -130,14 +130,14 @@ int inference_cuda_exl3_grouped_indexed(const inference_cuda_exl3_linear_args *c
                                         const inference_cuda_exl3_index_args *index,
                                         size_t count, void *stream, int *out_stage,
                                         unsigned cols);
-/* Bench-only prototypes of the id-indexed launch (tests and benches; no production caller).
- * One tile per block. `variant` bit 0 decodes book 2 with one packed byte dot product (DP4A),
- * bit 1 takes up to 20 calls in one launch; variant 0 is refused. Every byte written equals the
- * production launch of the same calls. */
-int inference_cuda_exl3_grouped_indexed_prototype(const inference_cuda_exl3_linear_args *calls,
-                                                  const inference_cuda_exl3_index_args *index,
-                                                  size_t count, void *stream, int *out_stage,
-                                                  unsigned variant);
+/* The id-indexed launch with opt-in options, one tile per block. `options` bit 0 decodes book 2
+ * with one packed byte dot product (DP4A), bit 1 takes up to 20 calls in one launch (else up to
+ * 16); options 0 is refused (that is inference_cuda_exl3_grouped_indexed). Every byte written
+ * equals the default launch of the same calls. */
+int inference_cuda_exl3_grouped_indexed_option(const inference_cuda_exl3_linear_args *calls,
+                                               const inference_cuda_exl3_index_args *index,
+                                               size_t count, void *stream, int *out_stage,
+                                               unsigned options);
 /* Test probe of the DP4A decode: per word, the byte sum and the DP4A result (2 * count words);
  * per state 0..65535, the book-2 decode and its DP4A form (2 * 65536 halves). */
 int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count, uint32_t *sums,
