@@ -99,6 +99,11 @@ SUMMARY_RE = re.compile(
 )
 DOC_TESTS_RE = re.compile(r"^\s*Doc-tests (\S+)")
 RUNNING_TARGET_RE = re.compile(r"^\s*Running (?:unittests )?(\S+)")
+# Cargo can be forced to color its stderr (CARGO_TERM_COLOR=always, as CI
+# does); the labels are then wrapped in ANSI escapes that defeat the
+# line-anchored parsers. Strip them at the parser boundary - archived
+# stderr keeps the raw bytes.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 CRASH_RE = re.compile(r"process didn't exit successfully")
 # ``engine/src/test_paths.rs`` prints ``<NAME> is not set and has no entry in ...: SKIPPING``.
 SKIPPING_RE = re.compile(
@@ -805,7 +810,7 @@ def parse_stdout_blocks(stdout: str) -> list[BinaryBlock]:
 def parse_cargo_targets(stderr: str) -> list[str]:
     """Target names in cargo's stderr Running order; Doc-tests become ``doctest``."""
     names: list[str] = []
-    for line in stderr.splitlines():
+    for line in ANSI_ESCAPE_RE.sub("", stderr).splitlines():
         doc = DOC_TESTS_RE.match(line)
         if doc:
             names.append("doctest")
@@ -871,7 +876,7 @@ def summarize_run(stdout: str, stderr: str) -> dict:
 def collect_skips(stderr: str) -> dict[str, int]:
     """Count fixture-skip lines by fixture name (the alt pattern counts as "")."""
     skips: dict[str, int] = {}
-    for line in stderr.splitlines():
+    for line in ANSI_ESCAPE_RE.sub("", stderr).splitlines():
         stripped = line.strip()
         match = SKIPPING_RE.match(stripped)
         if match:

@@ -42,6 +42,17 @@ CARGO_STDERR = """   Compiling inference-engine v0.1.0
      Doc-tests inference_engine
 """
 
+# Byte-exact label shape cargo emits under CARGO_TERM_COLOR=always
+# (captured from a real run; bold + bright-green label, reset after).
+COLORED_CARGO_STDERR = (
+    "\x1b[0m\x1b[1m\x1b[92m   Compiling\x1b[0m inference-engine v0.1.0\n"
+    "\x1b[1m\x1b[92m     Running\x1b[0m unittests src/lib.rs "
+    "(target/debug/deps/inference_engine-abc)\n"
+    "\x1b[1m\x1b[92m     Running\x1b[0m tests/acquisition.rs "
+    "(target/debug/deps/acquisition-def)\n"
+    "\x1b[1m\x1b[92m   Doc-tests\x1b[0m inference_engine\n"
+)
+
 
 def parse_run(stdout: str, stderr: str) -> dict:
     return qi.summarize_run(stdout, stderr)
@@ -286,6 +297,28 @@ class SkipsTest(unittest.TestCase):
         line = ("skipping: missing parity fixture /a/b (set FIFI_TEST_REQUIRE_DATA=1 "
                 "to fail instead)\n")
         self.assertEqual(qi.collect_skips(line), {"": 1})
+
+    def test_skipping_lines_survive_cargo_term_color_always(self) -> None:
+        line = ("\x1b[1m\x1b[32mFIFI_QWEN36_MODEL_DIR\x1b[0m is not set and has "
+                "no entry in ~/.config/fifi/test-paths.json: SKIPPING\n")
+        self.assertEqual(qi.collect_skips(line), {"FIFI_QWEN36_MODEL_DIR": 1})
+
+
+class ColoredCargoStderrTest(unittest.TestCase):
+    """CI forces CARGO_TERM_COLOR=always; the GitHub-runner collector saw
+    72 stdout blocks and zero target headers until the escapes were
+    stripped at the parser boundary."""
+
+    def test_running_headers_parse_under_color(self) -> None:
+        self.assertEqual(qi.parse_cargo_targets(COLORED_CARGO_STDERR),
+                         ["lib", "acquisition", "doctest"])
+
+    def test_plain_stderr_unchanged(self) -> None:
+        self.assertEqual(qi.parse_cargo_targets(CARGO_STDERR),
+                         ["lib", "acquisition", "doctest"])
+
+    def test_strip_ansi_leaves_plain_text_untouched(self) -> None:
+        self.assertEqual(qi.ANSI_ESCAPE_RE.sub("", CARGO_STDERR), CARGO_STDERR)
 
 
 class PolicyValidationTest(unittest.TestCase):
