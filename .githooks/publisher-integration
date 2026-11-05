@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'publisher-integration: required tool python3 was not found on PATH' >&2
+    exit 127
+fi
+
+# Fail closed: a missing check script must block, never silently pass.
+if [ ! -f "scripts/check_staged.py" ]; then
+    printf '%s\n' 'publisher-integration: scripts/check_staged.py is missing; run from a checkout that tracks scripts/' >&2
+    exit 1
+fi
+exec python3 scripts/check_staged.py publisher-integration

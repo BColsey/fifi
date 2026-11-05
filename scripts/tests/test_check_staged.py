@@ -18,7 +18,12 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HOOK_PATHS = (".githooks/pre-commit", ".githooks/commit-msg", ".githooks/pre-push")
+HOOK_PATHS = (
+    ".githooks/pre-commit",
+    ".githooks/commit-msg",
+    ".githooks/pre-push",
+    ".githooks/publisher-integration",
+)
 COUNTER_REPORT = {
     "schema_version": 1,
     "basis": {
@@ -491,6 +496,69 @@ class StagedGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no publisher files staged", result.stdout)
         self.assertFalse((self.root / "fake-cargo-bin" / "cargo-args").exists())
+
+    def test_partial_staging_cannot_conceal_a_staged_publisher_change(self) -> None:
+        # Staged content carries a prohibited label; the working tree is
+        # cleaned so a suite evaluating the working tree would pass. The
+        # gate must refuse instead of testing content the commit lacks.
+        self.fake_cargo()
+        self.write("engine/Cargo.toml", "[package]\n")
+        self.write("qualification/publisher/reconcile.py", "VALUE = 'rule R1 R2'\n")
+        self.stage("qualification/publisher/reconcile.py", "engine/Cargo.toml")
+        self.write("qualification/publisher/reconcile.py", "VALUE = 'clean'\n")
+
+        result = self.run_hook("pre-commit", env=self.env_with(self.root / "fake-cargo-bin"))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differ from their working-tree versions", result.stderr)
+        self.assertIn("qualification/publisher/reconcile.py", result.stderr)
+
+    def test_integration_gate_requires_a_clean_worktree(self) -> None:
+        self.write("qualification/publisher/reconcile.py", "x = 1\n")
+        self.git("add", "--", "qualification/publisher/reconcile.py")
+        self.git("commit", "-q", "-m", "test(staged-gates): stage publisher change")
+        self.write("qualification/publisher/reconcile.py", "x = 2\n")  # dirty worktree
+
+        result = self.run_hook(
+            "publisher-integration", env=self.env_with(self.fake_cargo())
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean worktree", result.stderr)
+
+    def test_integration_gate_fail_closed_on_failing_check(self) -> None:
+        self.write("qualification/publisher/reconcile.py", "x = 1\n")
+        self.git("add", "--", "qualification/publisher/reconcile.py")
+        self.git("commit", "-q", "-m", "test(staged-gates): stage publisher change")
+        # Stub cargo fails, so the first mandated check refuses the gate.
+
+        result = self.run_hook(
+            "publisher-integration", env=self.env_with(self.fake_cargo(exit_status=1))
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('check "rust formatting" failed', result.stderr)
+
+    def test_integration_gate_mandates_the_full_qualification(self) -> None:
+        # The mandated set is policy, not implementation detail: full cargo
+        # test (which includes published_text) plus every Python and
+        # inventory gate, each fail-closed.
+        import check_staged as gate
+
+        self.assertEqual(
+            [(label, relative) for label, relative, _ in gate.PUBLISHER_INTEGRATION_CHECKS],
+            [
+                ("rust formatting", "engine"),
+                ("strict clippy", "engine"),
+                ("full rust suite including published_text", "engine"),
+                ("publisher python suite", "."),
+                ("scripts python suite", "."),
+                ("source inventory validation", "."),
+                ("pack registry validation", "."),
+            ],
+        )
+        full_suite = gate.PUBLISHER_INTEGRATION_CHECKS[2][2]
+        self.assertEqual(full_suite[:3], ["cargo", "test", "--locked"])
 
     def test_pre_commit_reports_missing_python3(self) -> None:
         no_python = self.root / "no-python-bin"

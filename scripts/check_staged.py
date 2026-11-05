@@ -360,6 +360,23 @@ def staged_publisher_gate(root: Path) -> None:
             "publisher files staged but cargo/engine is unavailable to run "
             "the published-text gate"
         )
+    # cargo evaluates the working tree, but the commit records the index;
+    # a partially staged publisher file would let the suite test different
+    # content than the commit contains. Fail closed on any difference.
+    publisher_staged = [
+        path
+        for path in staged
+        if path == "qualification/publisher" or path.startswith("qualification/publisher/")
+    ]
+    dirty = run_git(["diff", "--name-only", "--", *publisher_staged], cwd=root)
+    differing = dirty.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    if differing:
+        raise CheckError(
+            "publisher files staged differ from their working-tree versions, "
+            "so the published-text gate would test content other than the "
+            "commit; commit or restore the unstaged changes first: "
+            + ", ".join(differing)
+        )
     try:
         gate = subprocess.run(
             ["cargo", "test", "--locked", "--test", "published_text", "--quiet"],
@@ -376,7 +393,11 @@ def staged_publisher_gate(root: Path) -> None:
             "published-text gate failed for staged publisher files"
             + (f": {details[-800:]}" if details else "")
         )
-    print("Staged publisher published-text gate passed.")
+    print(
+        "Staged publisher published-text gate passed (vocabulary check only; "
+        "publisher integration qualification requires "
+        "scripts/check_staged.py publisher-integration)."
+    )
 
 
 def run_pre_commit() -> None:
@@ -437,6 +458,76 @@ def run_commit_message(path: str) -> None:
     print("Commit attribution check passed.")
 
 
+PUBLISHER_INTEGRATION_CHECKS: tuple[tuple[str, str, list[str]], ...] = (
+    # (label, working directory relative to the repository root, argv)
+    ("rust formatting", "engine", ["cargo", "fmt", "--check"]),
+    (
+        "strict clippy",
+        "engine",
+        ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+    ),
+    (
+        "full rust suite including published_text",
+        "engine",
+        ["cargo", "test", "--locked", "--quiet"],
+    ),
+    (
+        "publisher python suite",
+        ".",
+        ["python3", "-m", "unittest", "discover", "-s", "qualification/publisher/tests"],
+    ),
+    (
+        "scripts python suite",
+        ".",
+        ["python3", "-m", "unittest", "discover", "-s", "scripts/tests"],
+    ),
+    ("source inventory validation", ".", ["python3", "scripts/qual_inventory.py", "validate"]),
+    ("pack registry validation", ".", ["python3", "scripts/qual_inventory.py", "packs"]),
+)
+
+
+def run_publisher_integration(root: Path) -> None:
+    """Complete publisher integration qualification. The pre-commit
+    published-text gate is a fast vocabulary check only; a passing hook
+    never establishes this qualification. Run on a clean worktree so the
+    suites evaluate exactly the tree that would be integrated."""
+    status = run_git(["status", "--porcelain"], cwd=root)
+    if status.stdout.strip():
+        raise CheckError(
+            "publisher integration gate requires a clean worktree so the "
+            "qualification evaluates exactly the integrated tree; commit or "
+            "stash first"
+        )
+    for label, relative, argv in PUBLISHER_INTEGRATION_CHECKS:
+        if shutil.which(argv[0]) is None:
+            raise CheckError(
+                f"publisher integration check \"{label}\" cannot run: "
+                f"{argv[0]} was not found on PATH"
+            )
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(root / relative),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except OSError as error:
+            raise CheckError(f"publisher integration check \"{label}\" failed to start: {error}") from error
+        if result.returncode != 0:
+            tail = result.stdout.decode("utf-8", errors="backslashreplace").strip()[-800:]
+            raise CheckError(
+                f"publisher integration check \"{label}\" failed with exit status "
+                f"{result.returncode}" + (f":\n{tail}" if tail else "")
+            )
+        print(f"publisher integration check passed: {label}")
+    print(
+        "Publisher integration qualification PASSED (clean tree, all mandated "
+        "suites green). The pre-commit published-text gate alone does not "
+        "establish this qualification."
+    )
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="check", required=True)
@@ -446,6 +537,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     message_parser.add_argument("message_file")
     subparsers.add_parser("pre-push", help="block deletion and non-fast-forward pushes to main")
+    subparsers.add_parser(
+        "publisher-integration",
+        help="run the complete publisher integration qualification (clean worktree required)",
+    )
     return parser.parse_args(argv)
 
 
@@ -456,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
             run_pre_commit()
         elif args.check == "pre-push":
             run_pre_push()
+        elif args.check == "publisher-integration":
+            run_publisher_integration(repository_root())
         else:
             run_commit_message(args.message_file)
     except CheckError as error:
