@@ -44,11 +44,14 @@
 //! qualification need not reach: the serving candidate may have no events, and the fault
 //! self-test is not audited. It runs a short comparison (`TF_TOKENS`, 512 by default) and a
 //! candidate with the fault from output position 128, and audits up to `TF_AUDIT_CAP` of the
-//! candidate's events. It asserts that each audit is one prefill of the whole context up to
+//! candidate's events. Its defaults are those of its passing device run (`AUDIT_PATH`), so it
+//! runs as intended with no settings. It asserts that each audit is one prefill of the whole context up to
 //! its event; that the re-read row gives the step path's argmax and margin bitwise, because
 //! Flint's prefill is batch-invariant, so that no legal re-execution here explains an event;
 //! and that the report counts the audited events as unexplained and the rest as unaudited, and
-//! rejects. The cap must be at least 2 and below the number of events, so that both occur.
+//! rejects. The cap must be at least 2, and the events must exceed it by at least five
+//! unaudited ones (`MIN_UNAUDITED`), so that the unaudited-event accounting carries as many
+//! events as the event rule needs to reject.
 //!
 //! | Variable | Meaning | Default |
 //! | --- | --- | --- |
@@ -56,7 +59,7 @@
 //! | `FLINT_QUAL_TOKENIZER` | the tokenizer directory | the pack root |
 //! | `TF_OUT_DIR` | a new directory for the scored files and the report | required |
 //! | `TF_KV` | the KV profile of every execution: `f16`, `q8` or `q8k` | `f16` |
-//! | `TF_TASKS` | task names, comma-separated, in request order | every task |
+//! | `TF_TASKS` | task names, comma-separated, in request order | every task; `rate-limiter-design,probability-derivation` for `token_forcing_audit_path` |
 //! | `TF_PROBE` | `1`: probe the selected tasks, write `probe.json`, and stop (about 80 s per task at 4,096 tokens) | unset |
 //! | `TF_PROBE_FILE` | a `probe.json` that must have read this run's reference outputs; checked before any candidate | unset |
 //! | `TF_TOKENS` | generated tokens per request | 4096; 512 for `token_forcing_audit_path` |
@@ -65,7 +68,7 @@
 //! | `TF_CANDIDATE` | `serve`, `fault` or generations-file paths, comma-separated; empty for none | `serve` |
 //! | `TF_COMPARISON` | the directory of an earlier run whose `reference.json` and `baseline.json` this run reuses | unset |
 //! | `TF_COMPARISON_SHA256` | `<reference>,<baseline>`: the digests those files must have, as the earlier run printed them | unset |
-//! | `TF_AUDIT_CAP` | the most events audited per execution, `fault` excepted | 200, SpecPilot's count |
+//! | `TF_AUDIT_CAP` | the most events audited per execution, `fault` excepted | 200, SpecPilot's count; 8 for `token_forcing_audit_path` |
 //! | `TF_WRITE_GENERATIONS` | write this build's serving generations to this new file and stop | unset |
 //!
 //! ```text
@@ -157,9 +160,36 @@ struct Plan {
     probe_file: Option<PathBuf>,
 }
 
+/// What a test runs when the environment does not say.
+#[derive(Clone, Copy, Debug)]
+struct Defaults {
+    /// `TF_TOKENS`.
+    tokens: usize,
+    /// `TF_AUDIT_CAP`.
+    audit_cap: usize,
+    /// `TF_TASKS`; empty for every task.
+    tasks: &'static [&'static str],
+}
+
+/// The qualification: every task unless `TF_TASKS` names some (its driver names the four that
+/// the probe selects), 4,096 tokens per request, and SpecPilot's audit count.
+const QUALIFICATION: Defaults = Defaults {
+    tokens: 4096,
+    audit_cap: 200,
+    tasks: &[],
+};
+
+/// The audit-path test, as its passing device run ran it: two tasks whose faulty outputs give
+/// many more events than the cap (57 events, 8 audited, on the EXL3 4.0 pack).
+const AUDIT_PATH: Defaults = Defaults {
+    tokens: 512,
+    audit_cap: 8,
+    tasks: &["rate-limiter-design", "probability-derivation"],
+};
+
 impl Plan {
-    /// The plan the environment sets; `tokens` is the default of `TF_TOKENS`.
-    fn from_env(tokens: usize) -> Self {
+    /// The plan the environment sets, with `defaults` where it sets nothing.
+    fn from_env(defaults: Defaults) -> Self {
         let root: PathBuf = std::env::var_os("FLINT_QUAL_MODEL")
             .expect("FLINT_QUAL_MODEL must name the EXL3 pack root")
             .into();
@@ -189,13 +219,15 @@ impl Plan {
                 .expect("TF_OUT_DIR must name a new directory")
                 .into(),
             kv: std::env::var("TF_KV").unwrap_or_else(|_| "f16".to_owned()),
-            tasks: list("TF_TASKS"),
+            tasks: Some(list("TF_TASKS"))
+                .filter(|tasks| !tasks.is_empty())
+                .unwrap_or_else(|| defaults.tasks.iter().map(|&task| task.to_owned()).collect()),
             probe: match std::env::var("TF_PROBE").as_deref() {
                 Err(_) | Ok("") => false,
                 Ok("1") => true,
                 Ok(other) => panic!("TF_PROBE must be 1 or unset, not {other}"),
             },
-            tokens: number("TF_TOKENS", tokens),
+            tokens: number("TF_TOKENS", defaults.tokens),
             reference_chunk: chunk("TF_REFERENCE_CHUNK", 8),
             baseline_chunk: chunk("TF_BASELINE_CHUNK", 4),
             candidates: std::env::var("TF_CANDIDATE")
@@ -204,7 +236,7 @@ impl Plan {
                 .map(|name| name.trim().to_owned())
                 .filter(|name| !name.is_empty())
                 .collect(),
-            audit_cap: number("TF_AUDIT_CAP", 200),
+            audit_cap: number("TF_AUDIT_CAP", defaults.audit_cap),
             write_generations: std::env::var_os("TF_WRITE_GENERATIONS").map(Into::into),
             comparison: std::env::var_os("TF_COMPARISON").map(Into::into),
             comparison_sha256: std::env::var("TF_COMPARISON_SHA256").ok(),
@@ -775,7 +807,7 @@ fn write_run(
 #[test]
 #[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and an exclusive GPU lease"]
 fn token_forcing_qualification() {
-    let plan = Plan::from_env(4096);
+    let plan = Plan::from_env(QUALIFICATION);
     let bundle = factory::load_tokenizer(&plan.tokenizer).expect("the qualification tokenizer");
     let prompts = prompts(&plan, &bundle);
     if plan.probe {
@@ -854,6 +886,11 @@ fn token_forcing_qualification() {
 /// has events to audit.
 const AUDIT_FAULT_FROM: usize = 128;
 
+/// The fewest unaudited events the audit-path test accepts: five unexplained events are the
+/// fewest that the event rule rejects on at equal exposure and no baseline events (four give
+/// p = 1/16).
+const MIN_UNAUDITED: usize = 5;
+
 /// A model that records the context length of every prefill it runs.
 struct Prefills<'a> {
     inner: Forced<'a>,
@@ -892,8 +929,14 @@ fn check_audit_path(run: &Run, generations: &[Generation], contexts: &[usize], c
         .collect();
     let audited = events.len().min(cap);
     assert!(
-        audited >= 2 && events.len() > audited,
-        "the fault made {} events; the test needs at least 2 audited and 1 past the cap {cap}",
+        audited >= 2 && events.len() > cap,
+        "the fault made {} events; the test needs at least 2 audited and more than the cap {cap}",
+        events.len()
+    );
+    assert!(
+        events.len() - audited >= MIN_UNAUDITED,
+        "the fault made {} events and {audited} were audited; the test needs at least \
+         {MIN_UNAUDITED} unaudited events, and so at least {MIN_UNAUDITED} events",
         events.len()
     );
     let records = scored.requests.iter().flat_map(|request| &request.records);
@@ -957,7 +1000,7 @@ fn check_audit_path(run: &Run, generations: &[Generation], contexts: &[usize], c
 #[test]
 #[ignore = "needs the FLINT_QUAL_MODEL EXL3 pack and a GPU lease"]
 fn token_forcing_audit_path() {
-    let plan = Plan::from_env(512);
+    let plan = Plan::from_env(AUDIT_PATH);
     assert!(
         plan.tokens > AUDIT_FAULT_FROM,
         "TF_TOKENS must pass the fault's start"
