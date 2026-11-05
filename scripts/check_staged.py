@@ -407,21 +407,32 @@ def staged_token_forcing_gate(root: Path) -> None:
     """The token-forcing device drivers decide which tasks a GPU qualification runs and which
     files its later leases accept, and no GPU run tests them before they cost a lease. A commit
     touching them must pass their offline suite, which needs no device, weights or lease."""
-    result = run_git(["diff", "--cached", "--name-only"], cwd=root)
+    # Without rename detection a driver moved out of the directory still counts as staged.
+    result = run_git(["diff", "--cached", "--name-only", "--no-renames"], cwd=root)
     staged = result.stdout.decode("utf-8", errors="backslashreplace").splitlines()
     drivers = [path for path in staged if path.startswith(TOKEN_FORCING_DRIVERS + "/")]
     if not drivers:
         print("Staged token-forcing driver tests not required (no driver files staged).")
         return
-    # The suite runs on the working tree, but the commit records the index; fail closed on
-    # any difference, as the publisher gate does.
-    dirty = run_git(["diff", "--name-only", "--", *drivers], cwd=root)
+    # The suite runs on the working tree, but the commit records the index. Any unstaged or
+    # untracked file in the directory, staged or not, could make the tests pass on content
+    # the commit does not hold, so fail closed on all of them.
+    dirty = run_git(["diff", "--name-only", "--", TOKEN_FORCING_DRIVERS], cwd=root)
     differing = dirty.stdout.decode("utf-8", errors="backslashreplace").splitlines()
     if differing:
         raise CheckError(
-            "token-forcing driver files staged differ from their working-tree versions, so "
-            "their tests would run on content other than the commit; commit or restore the "
-            "unstaged changes first: " + ", ".join(differing)
+            "token-forcing driver files in the working tree differ from the index, so their "
+            "tests would run on content other than the commit; stage or restore the unstaged "
+            "changes first: " + ", ".join(differing)
+        )
+    others = run_git(
+        ["ls-files", "--others", "--exclude-standard", "--", TOKEN_FORCING_DRIVERS], cwd=root
+    )
+    untracked = others.stdout.decode("utf-8", errors="backslashreplace").splitlines()
+    if untracked:
+        raise CheckError(
+            "untracked files in the token-forcing driver directory would take part in its "
+            "tests but not in the commit; add or remove them first: " + ", ".join(untracked)
         )
     tests = root / TOKEN_FORCING_DRIVERS / "tests"
     if not tests.is_dir():
@@ -436,6 +447,9 @@ def staged_token_forcing_gate(root: Path) -> None:
         )
     except OSError as error:
         raise CheckError(f"could not run the token-forcing driver tests: {error}") from error
+    # unittest exits with status 5 when it found no tests to run.
+    if suite.returncode == 5:
+        raise CheckError(f"token-forcing driver tests failed: {tests} holds no tests")
     if suite.returncode != 0:
         tail = suite.stdout.decode("utf-8", errors="backslashreplace").strip()[-800:]
         raise CheckError(

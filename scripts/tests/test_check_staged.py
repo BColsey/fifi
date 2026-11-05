@@ -560,8 +560,72 @@ class StagedGateTests(unittest.TestCase):
         result = self.run_pre_commit()
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("differ from their working-tree versions", result.stderr)
+        self.assertIn("differ from the index", result.stderr)
         self.assertIn("qualification/token-forcing/qualify.py", result.stderr)
+
+    def commit_driver_suite(self) -> None:
+        """Drivers whose test checks `qualify.VALUE == 1`, committed."""
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 1\n")
+        self.write(
+            "qualification/token-forcing/tests/test_driver.py",
+            "import sys, unittest\nfrom pathlib import Path\n\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\nimport qualify\n\n\n"
+            "class Driver(unittest.TestCase):\n"
+            "    def test_driver(self):\n        self.assertEqual(qualify.VALUE, 1)\n",
+        )
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "test(staged-gates): add drivers")
+
+    def test_an_unstaged_change_to_another_driver_file_blocks_the_commit(self) -> None:
+        # The staged test passes only with the unstaged qualify.py, so the index tree fails it.
+        self.commit_driver_suite()
+        test = self.repo / "qualification/token-forcing/tests/test_driver.py"
+        self.write(
+            "qualification/token-forcing/tests/test_driver.py",
+            test.read_text(encoding="utf-8").replace("VALUE, 1", "VALUE, 2"),
+        )
+        self.stage("qualification/token-forcing/tests/test_driver.py")
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 2\n")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differ from the index", result.stderr)
+        self.assertIn("qualification/token-forcing/qualify.py", result.stderr)
+
+    def test_an_untracked_driver_file_blocks_the_commit(self) -> None:
+        self.commit_driver_suite()
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 1\nEXTRA = 1\n")
+        self.stage("qualification/token-forcing/qualify.py")
+        self.write("qualification/token-forcing/helper.py", "VALUE = 1\n")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untracked files in the token-forcing driver directory", result.stderr)
+        self.assertIn("qualification/token-forcing/helper.py", result.stderr)
+
+    def test_moving_a_driver_out_of_the_directory_runs_the_driver_tests(self) -> None:
+        self.commit_driver_suite()
+        self.git("mv", "qualification/token-forcing/qualify.py", "qualify.py")
+
+        result = self.run_pre_commit()
+
+        # Rename detection would list only the new path and skip the tests; the move removes
+        # the module the test imports, so the tests run and fail.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("token-forcing driver tests failed", result.stderr)
+        self.assertIn("qualify", result.stderr)
+
+    def test_a_driver_directory_without_tests_names_the_cause(self) -> None:
+        self.write("qualification/token-forcing/qualify.py", "VALUE = 1\n")
+        self.write("qualification/token-forcing/tests/README", "no tests here\n")
+        self.stage("qualification/token-forcing")
+
+        result = self.run_pre_commit()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("holds no tests", result.stderr)
 
     def test_integration_gate_requires_a_clean_worktree(self) -> None:
         self.write("qualification/publisher/reconcile.py", "x = 1\n")
