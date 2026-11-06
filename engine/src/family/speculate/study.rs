@@ -10,15 +10,16 @@
 //! is an error: it is never read as a window with fewer drafts.
 //!
 //! The decision rule is fixed in the protocol: `speedup = E[accepted + 1] / (W(k + 1) + H(k))`
-//! against a gate of 1.15, with `H(k)` the cost of drafting the k-token chain. A window and head
-//! cost whose ceiling `(k + 1) / (W + H)` is below the gate is marked infeasible instead of being
+//! against the 1.15 benchmark, with `H(k)` the cost of drafting the k-token chain. A window and head
+//! cost whose ceiling `(k + 1) / (W + H)` is below the benchmark is marked infeasible instead of being
 //! given an acceptance above 100 percent. The Python collector in `qualification/mtp-acceptance/`
 //! scores the same traces; its trace tests use the same hand-made vector as `golden()` below.
 
 use super::accept::accept_run;
 use crate::EngError;
 
-/// End-to-end gate set for the study.
+/// The 1.15x end-to-end speedup benchmark of the study: an optimization benchmark for performance claims, a
+/// characterization of value, not a correctness or integration requirement. The name `GATE` is historical.
 pub(crate) const GATE: f64 = 1.15;
 
 /// The target's greedy stream and the head's chains over it.
@@ -98,11 +99,11 @@ pub(crate) fn speedup(mean_tokens: f64, window_cost: f64, draft_cost: f64) -> f6
     mean_tokens / (window_cost + draft_cost)
 }
 
-/// The largest `W(k + 1)` that still reaches the gate, or why no window can.
+/// The largest `W(k + 1)` that still reaches the benchmark, or why no window can.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Budget {
     Largest(f64),
-    /// The chain alone costs at least `E / gate`: no window cost pays.
+    /// The chain alone costs at least `E / gate` (the benchmark): no window cost pays.
     Infeasible,
 }
 
@@ -124,7 +125,7 @@ fn max_window_cost_at(gate: f64, mean_tokens: f64, draft_cost: f64) -> Budget {
 pub(crate) enum Requirement {
     /// `E[accepted + 1]` must reach `required_tokens`, which is at most `k + 1`.
     Reachable { required_tokens: f64 },
-    /// Even at full acceptance (`k + 1` tokens per window) the speedup stays below the gate.
+    /// Even at full acceptance (`k + 1` tokens per window) the speedup stays below the benchmark.
     /// There is no acceptance to ask for, so none is reported.
     Infeasible { ceiling_speedup: f64 },
 }
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn requirements_match_hand_computed_values() {
-        // (k, W, H, required E[accepted + 1]) with the gate at 1.15
+        // (k, W, H, required E[accepted + 1]) with the benchmark at 1.15
         let table = [
             (1, 1.59, 0.10, 1.9435), // 1.15 * 1.69
             (1, 1.40, 0.00, 1.61),   // 1.15 * 1.40
