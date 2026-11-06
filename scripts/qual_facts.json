@@ -8,13 +8,14 @@
     "native-ane",
     "native-cuda",
     "native-fault-qualification",
-    "native-mlx"
+    "native-mlx",
+    "research-activation"
   ],
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5679,
-      "ignored": 461,
+      "test_fns": 5690,
+      "ignored": 462,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -26,6 +27,9 @@
         "ENGINESRV_SHADOW_BLOCK_LCP",
         "ENGINESRV_THINK_REPLAY",
         "ENGINESRV_WARM_TURNS",
+        "FIFI_ACTIVATION_ARTIFACT",
+        "FIFI_ACTIVATION_GPU_AUTH",
+        "FIFI_ACTIVATION_MANIFEST",
         "FIFI_ADD_CHAIN_M",
         "FIFI_D1_CAPTURE",
         "FIFI_D1_CONTEXT",
@@ -289,7 +293,8 @@
         "native-ane",
         "native-cuda",
         "native-fault-qualification",
-        "native-mlx"
+        "native-mlx",
+        "research-activation"
       ],
       "fixtures": {
         "FIFI_QWEN36_MODEL_DIR": {
