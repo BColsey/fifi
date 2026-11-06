@@ -55,6 +55,8 @@ enum Flaw {
     StaleLogits,
     /// The one-row step takes the highest id of a tie; the window and the rules take the lowest.
     OneRowTieHigh,
+    /// An armed fault never fires: the faulted call succeeds.
+    FaultNeverFires,
 }
 
 /// The state commit and rollback must restore.
@@ -143,6 +145,9 @@ impl Fake {
             return Ok(());
         }
         self.fault = None;
+        if self.flaw == Flaw::FaultNeverFires {
+            return Ok(());
+        }
         self.poisoned = self.flaw != Flaw::SilentFault;
         Err(refused("injected fault"))
     }
@@ -462,6 +467,15 @@ fn a_fault_that_leaves_a_partial_state_and_keeps_answering_is_caught() {
     let mut rig = Rig::new(Flaw::SilentFault, false);
     let failure = expect_violation(failure_recovery(&mut rig.fake, VOCAB, &rows(4)), "F");
     assert!(failure.detail.contains("silent partial state"), "{failure}");
+}
+
+#[test]
+fn a_fault_that_does_not_fail_the_call_is_caught_by_name() {
+    // The injection point never fires, so every call succeeds: F must say so, not wait for a
+    // later check to trip over a state it never made.
+    let mut rig = Rig::new(Flaw::FaultNeverFires, false);
+    let failure = expect_violation(failure_recovery(&mut rig.fake, VOCAB, &rows(4)), "F");
+    assert!(failure.detail.contains("did not fail the call"), "{failure}");
 }
 
 #[test]
