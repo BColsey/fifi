@@ -12,146 +12,360 @@ const WINDOW: &str = include_str!("window_logic.rs");
 const STATE: &str = include_str!("cuda/state.rs");
 const SLOTS: &str = include_str!("cuda/state/rollback.rs");
 
-/// The text of the function that starts at `signature`, up to the closing brace at `indent`.
-fn body<'a>(source: &'a str, signature: &str, indent: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("`{signature}` not found"));
-    let rest = &source[start..];
-    let end = rest
-        .find(&format!("\n{indent}}}\n"))
-        .unwrap_or_else(|| panic!("the end of `{signature}` not found"));
-    &rest[..end]
+/// The code of `source` as the pins compare it: comments removed, string and character literals
+/// emptied, raw strings emptied, and every whitespace character dropped. A commented-out call
+/// vanishes, a call inside a string is not a call, and a reformat that only moves whitespace
+/// (rustfmt splitting `f(x)?` over lines) leaves the text unchanged.
+fn code(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::new();
+    let mut at = 0;
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    while at < chars.len() {
+        let c = chars[at];
+        let next = chars.get(at + 1).copied();
+        if c == '/' && next == Some('/') {
+            while at < chars.len() && chars[at] != '\n' {
+                at += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            at += 2;
+            while at + 1 < chars.len() && !(chars[at] == '*' && chars[at + 1] == '/') {
+                at += 1;
+            }
+            at += 2;
+        } else if c == 'r' && matches!(next, Some('"' | '#')) && !(at > 0 && ident(chars[at - 1])) {
+            // A raw string: r"..." or r#"..."#.
+            let mut end = at + 1;
+            let mut hashes = 0;
+            while chars.get(end) == Some(&'#') {
+                hashes += 1;
+                end += 1;
+            }
+            if chars.get(end) != Some(&'"') {
+                out.push(c);
+                at += 1;
+                continue;
+            }
+            end += 1;
+            while end < chars.len() {
+                if chars[end] == '"' && (1..=hashes).all(|k| chars.get(end + k) == Some(&'#')) {
+                    end += hashes + 1;
+                    break;
+                }
+                end += 1;
+            }
+            out.push_str("\"\"");
+            at = end;
+        } else if c == '"' {
+            out.push_str("\"\"");
+            at += 1;
+            while at < chars.len() && chars[at] != '"' {
+                at += if chars[at] == '\\' { 2 } else { 1 };
+            }
+            at += 1;
+        } else if c == '\'' && (next == Some('\\') || chars.get(at + 2) == Some(&'\'')) {
+            // A character literal ('x' or '\n'), not a lifetime.
+            out.push_str("''");
+            at += 1;
+            while at < chars.len() && chars[at] != '\'' {
+                at += if chars[at] == '\\' { 2 } else { 1 };
+            }
+            at += 1;
+        } else {
+            if !c.is_whitespace() {
+                out.push(c);
+            }
+            at += 1;
+        }
+    }
+    // A trailing comma before a closing bracket is formatting, not meaning.
+    for close in [")", "]", "}"] {
+        out = out.replace(&format!(",{close}"), close);
+    }
+    out
 }
 
-/// `first` appears in `text`, and `then` appears after it.
-fn in_order(text: &str, first: &str, then: &str) {
-    let at = text
-        .find(first)
-        .unwrap_or_else(|| panic!("`{first}` missing in:\n{text}"));
-    let after = text[at..]
-        .find(then)
-        .unwrap_or_else(|| panic!("`{then}` does not follow `{first}` in:\n{text}"));
-    assert!(after > 0);
+/// The body of the function named `name` in `code` (already through [`code`]), without its outer
+/// braces. The first `fn name(` is taken.
+fn body<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = ["(", "<"]
+        .iter()
+        .filter_map(|next| code.find(&format!("fn{name}{next}")))
+        .min()
+        .unwrap_or_else(|| panic!("`fn {name}` not found"));
+    let open = code[start..]
+        .find('{')
+        .unwrap_or_else(|| panic!("no body for `{name}`"))
+        + start;
+    let mut depth = 0usize;
+    for (offset, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in `{name}`")
+}
+
+/// The brace depth of every byte of `text`.
+fn depths(text: &str) -> Vec<usize> {
+    let mut depth = 0usize;
+    text.bytes()
+        .map(|b| {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            depth
+        })
+        .collect()
+}
+
+/// Every offset of `needle` that is a STATEMENT of the function body: at brace depth zero (not
+/// inside an `if`, a closure, a loop or a block, so a dead branch such as `if false { call }`
+/// does not count) and starting a statement (after `;`, `{` or `}`, or at the start). `needle` is
+/// normalised like the code.
+fn statements(body: &str, needle: &str) -> Vec<usize> {
+    let needle = code(needle);
+    let depth = depths(body);
+    body.match_indices(&needle)
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            let starts = at == 0 || matches!(body.as_bytes()[at - 1], b';' | b'{' | b'}');
+            depth[at] == 0 && starts
+        })
+        .collect()
+}
+
+/// The offset of the first top-level statement `needle`; panics when there is none.
+fn statement(body: &str, needle: &str) -> usize {
+    *statements(body, needle)
+        .first()
+        .unwrap_or_else(|| panic!("`{needle}` is not a top-level statement of:\n{body}"))
+}
+
+/// `first` and `then` are both top-level statements, in that order.
+fn in_order(body: &str, first: &str, then: &str) {
+    let (a, b) = (statement(body, first), statement(body, then));
+    assert!(a < b, "`{first}` must precede `{then}` in:\n{body}");
+}
+
+/// `needle` occurs in `body` after offset `after` (anywhere: it may be part of a larger
+/// expression), as normalised code.
+fn occurs_after(body: &str, after: usize, needle: &str) {
+    let needle = code(needle);
+    assert!(
+        body[after..].contains(&needle),
+        "`{needle}` does not follow offset {after} in:\n{body}"
+    );
+}
+
+#[test]
+fn the_matcher_rejects_a_comment_a_dead_branch_a_closure_and_a_string_and_accepts_a_reformat() {
+    let ok = code("fn f(&mut self) { a(); window_logic::step_gate(self)?; b(); }");
+    statement(body(&ok, "f"), "window_logic::step_gate(self)?;");
+    // Equivalent reformatting keeps the pin.
+    let split = code("fn f() {\n    window_logic::step_gate(\n        self,\n    )?;\n}");
+    statement(body(&split, "f"), "window_logic::step_gate(self)?;");
+    for (what, wrong) in [
+        (
+            "a line comment",
+            "fn f() { // window_logic::step_gate(self)?;\n a(); }",
+        ),
+        (
+            "a block comment",
+            "fn f() { /* window_logic::step_gate(self)?; */ a(); }",
+        ),
+        (
+            "a dead branch",
+            "fn f() { if false { window_logic::step_gate(self)?; } a(); }",
+        ),
+        (
+            "a closure",
+            "fn f() { let c = || { window_logic::step_gate(self)?; }; a(); }",
+        ),
+        (
+            "a string",
+            "fn f() { log(\"window_logic::step_gate(self)?;\"); a(); }",
+        ),
+        (
+            "a non-statement",
+            "fn f() { let _ = a(window_logic::step_gate(self)?); }",
+        ),
+    ] {
+        let wrong = code(wrong);
+        let result = std::panic::catch_unwind(|| {
+            statement(body(&wrong, "f"), "window_logic::step_gate(self)?;");
+        });
+        assert!(result.is_err(), "{what} must fail the pin");
+    }
+    // The order is checked between statements, not between mentions.
+    let swapped = code("fn f() { b(); window_logic::step_gate(self)?; a(); }");
+    let result = std::panic::catch_unwind(|| {
+        in_order(
+            body(&swapped, "f"),
+            "a();",
+            "window_logic::step_gate(self)?;",
+        );
+    });
+    assert!(result.is_err());
 }
 
 #[test]
 fn the_decode_step_asks_the_gate_before_it_touches_the_state() {
-    let text = body(STEP, "    fn run_token_inner(", "    ");
-    in_order(text, "check_token_id(", "window_logic::step_gate(self)?;");
-    in_order(text, "window_logic::step_gate(self)?;", "self.write_start(");
+    let step = code(STEP);
+    let text = body(&step, "run_token_inner");
     in_order(
         text,
+        "check_token_id(token, self.widths.verdict)?;",
         "window_logic::step_gate(self)?;",
-        "self.readback_plan(",
     );
+    let gate = statement(text, "window_logic::step_gate(self)?;");
+    occurs_after(text, gate, "self.write_start(");
+    occurs_after(text, gate, "self.readback_plan(");
 }
 
 #[test]
 fn the_export_asks_the_gate_before_it_copies() {
-    let text = body(STEP, "    pub(crate) fn export_state(", "    ");
-    in_order(
-        text,
-        "window_logic::export_gate(self)?;",
-        "self.state.export_state(",
-    );
+    let step = code(STEP);
+    let text = body(&step, "export_state");
+    let gate = statement(text, "window_logic::export_gate(self)?;");
+    occurs_after(text, gate, "self.state.export_state(");
 }
 
 #[test]
 fn the_chunk_of_a_prefill_asks_state_usable_first() {
-    let text = body(STEP, "    pub(super) fn run_chunk(", "    ");
-    in_order(text, "self.state_usable()?;", "check_chunk_start(");
+    let step = code(STEP);
+    let text = body(&step, "run_chunk");
+    let gate = statement(text, "self.state_usable()?;");
+    occurs_after(text, gate, "check_chunk_start(");
+    // First: nothing but declarations (`use`) precede it.
+    assert!(
+        !text[..gate].contains("self.state"),
+        "no state access before the gate: {}",
+        &text[..gate]
+    );
 }
 
 #[test]
 fn import_state_is_the_window_modules_sequence() {
-    let text = body(STEP, "    pub(crate) fn import_state(", "    ");
-    assert!(
-        text.contains("window_logic::import_state(self, exported)"),
-        "{text}"
-    );
+    let step = code(STEP);
+    let text = body(&step, "import_state");
+    statement(text, "window_logic::import_state(self, exported)");
     // Inside it, the gate and the window close precede the first fallible call.
-    let text = body(WINDOW, "pub(crate) fn import_state<", "");
-    in_order(text, "restore_gate(host)?;", "host.complete_prefix_save()");
+    let window = code(WINDOW);
+    let text = body(&window, "import_state");
     in_order(
         text,
-        "host.complete_prefix_save()",
-        "host.check_import(saved)",
+        "restore_gate(host)?;",
+        "host.commit_fault(CommitPoint::PrefixSave)",
     );
-    in_order(text, "host.check_import(saved)", "host.resident_kv()");
-    in_order(text, "host.resident_kv()", "host.overwrite(saved)");
+    let save = statement(text, "host.commit_fault(CommitPoint::PrefixSave)");
+    occurs_after(text, save, "host.complete_prefix_save()");
+    let check = statement(text, "host.commit_fault(CommitPoint::CheckImport)");
+    occurs_after(text, check, "host.check_import(saved)");
+    let kv = statement(text, "host.commit_fault(CommitPoint::ResidentKv)");
+    occurs_after(text, kv, "host.resident_kv()");
+    in_order(
+        text,
+        "host.commit_fault(CommitPoint::ResidentKv)",
+        "host.commit_fault(CommitPoint::ImportDevice)",
+    );
+    let write = statement(text, "host.commit_fault(CommitPoint::ImportDevice)");
+    occurs_after(text, write, "host.overwrite(saved)");
 }
 
 #[test]
 fn the_pinned_prefix_restore_closes_the_window_before_its_first_fallible_call() {
-    let text = body(PREFIX, "    pub(crate) fn restore_pinned_prefix(", "    ");
+    let prefix = code(PREFIX);
+    let text = body(&prefix, "restore_pinned_prefix");
     in_order(
         text,
         "window_logic::restore_gate(self)?;",
         "self.complete_prefix_save()?;",
     );
-    in_order(text, "self.complete_prefix_save()?;", ".restore(");
+    let save = statement(text, "self.complete_prefix_save()?;");
+    occurs_after(text, save, ".restore(");
 }
 
 #[test]
 fn reset_is_exempt_and_clears_the_gate_after_the_state_was_zeroed() {
-    let text = body(STEP, "    pub(crate) fn reset_state(", "    ");
+    let step = code(STEP);
+    let text = body(&step, "reset_state");
     in_order(
         text,
         "window_logic::reset_prologue(self)?;",
-        "self.state.reset(",
+        "self.state.reset(&self.stream)?;",
     );
     in_order(
         text,
-        "self.state.reset(",
+        "self.state.reset(&self.stream)?;",
         "window_logic::reset_epilogue(self);",
     );
-    let code = text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"));
+    // Comments are gone from `text`: only code can ask `state_usable`.
     assert!(
-        !code.into_iter().any(|line| line.contains("state_usable")),
+        !text.contains("state_usable"),
         "reset must not ask state_usable:\n{text}"
     );
 }
 
 #[test]
 fn the_pinned_save_and_its_device_tip_capture_each_ask_state_usable() {
-    let text = body(PREFIX, "    pub(crate) fn stage_pinned_prefix(", "    ");
+    let prefix = code(PREFIX);
+    let text = body(&prefix, "stage_pinned_prefix");
     in_order(
         text,
         "self.state_usable()?;",
-        "session.prepare_prefix_save(",
+        "let frozen = session.prepare_prefix_save(key, fed)?;",
     );
-    in_order(
-        text,
-        "self.state_usable()?;\n        if let Some(device) = self.device_tip.as_mut() {",
-        "device.capture(",
+    // A second, separate gate immediately before the tip capture (the tip copies the live state).
+    let gates = statements(text, "self.state_usable()?;");
+    assert_eq!(gates.len(), 2, "two top-level gates in:\n{text}");
+    let tip = code("if let Some(device) = self.device_tip.as_mut() {");
+    let tip_at = text.find(&tip).expect("the tip branch");
+    assert!(
+        gates[0] < gates[1] && gates[1] < tip_at,
+        "the second gate precedes the tip branch"
     );
+    occurs_after(text, tip_at, "device.capture(");
 }
 
 #[test]
 fn the_finish_of_a_pending_save_asks_state_usable_before_it_takes_the_save() {
-    let text = body(PREFIX, "    pub(crate) fn complete_prefix_save(", "    ");
-    in_order(text, "self.state_usable()?;", "self.pending_prefix.take()");
+    let prefix = code(PREFIX);
+    let text = body(&prefix, "complete_prefix_save");
+    let gate = statement(text, "self.state_usable()?;");
+    occurs_after(text, gate, "self.pending_prefix.take()");
 }
 
 #[test]
 fn the_device_poison_route_clears_the_tip_and_the_slot_copy_poisons() {
     // `fail_window` poisons through `ResidentState::poison`, which drops the resident tip.
-    let text = body(STATE, "    pub(crate) fn poison(", "    ");
-    assert!(text.contains("self.resident_tip = None;"), "{text}");
-    assert!(text.contains("self.book.poison();"), "{text}");
+    let state = code(STATE);
+    let text = body(&state, "poison");
+    statement(text, "self.resident_tip = None;");
+    statement(text, "self.book.poison();");
     // The slot copy poisons on a guard failure, a verdict mismatch and a failed copy.
-    let text = body(SLOTS, "    pub(crate) fn finish(", "    ");
+    let slots = code(SLOTS);
+    let text = body(&slots, "finish");
     assert_eq!(text.matches("state.poison();").count(), 3, "{text}");
 }
 
 #[test]
 fn the_window_forwards_its_effects_to_the_module_of_decisions() {
-    let text = include_str!("cuda/eager_window.rs");
-    assert!(text.contains("window_logic::run_window(self, inputs)"));
-    assert!(text.contains("window_logic::commit_window(self, commit)"));
+    let eager = code(include_str!("cuda/eager_window.rs"));
+    let run = body(&eager, "run_window");
+    statement(run, "window_logic::run_window(self, inputs)");
+    let commit = body(&eager, "commit_window");
+    statement(commit, "window_logic::commit_window(self, commit)");
 }
 
 /// The call sites of `begin_import(` and `begin_reset(` outside tests under `qwen36/cuda`, as
@@ -189,14 +403,19 @@ fn the_restoring_entry_points_are_exactly_the_six_of_the_table() {
             .filter_map(|marker| source.rfind(marker))
             .max()
             .unwrap_or(source.len());
-        let live = &source[..cut];
-        for call in [".begin_import(", ".begin_reset("] {
-            for _ in live.matches(call) {
+        // Comments and strings do not count; a method call, a path call
+        // (`StateBook::begin_import(..)`) and a plain call all do. Only a definition does not.
+        let live = code(&source[..cut]);
+        for call in ["begin_import(", "begin_reset("] {
+            for (at, _) in live.match_indices(call) {
+                if live[..at].ends_with("fn") {
+                    continue;
+                }
                 let relative = path.strip_prefix(&root).expect("under root");
                 sites.push(format!(
                     "{} {}",
                     relative.display(),
-                    call.trim_matches(['.', '('])
+                    call.trim_end_matches('(')
                 ));
             }
         }
