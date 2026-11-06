@@ -8,6 +8,8 @@
 //! module: everything comes from the layout record (`HostShape`), the inventory roles and the
 //! kernel wrappers' own size functions.
 
+#[cfg(all(test, feature = "research-activation"))]
+mod activation_device_tests;
 mod book;
 #[cfg(test)]
 mod book_tests;

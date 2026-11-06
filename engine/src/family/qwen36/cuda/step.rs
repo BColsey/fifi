@@ -98,6 +98,10 @@ use crate::{
     },
 };
 
+#[cfg(feature = "research-activation")]
+#[path = "step_activation.rs"]
+mod activation;
+
 const F32: usize = size_of::<f32>();
 
 #[cfg(all(test, feature = "native-cuda"))]
@@ -331,6 +335,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// covers the state buffers by drop order -- they live inside the step and never move
     /// after they are built, so the pin list need not name them.
     graph: Option<GraphExec<'a>>,
+    #[cfg(feature = "research-activation")]
+    activation: std::cell::RefCell<Option<crate::family::qwen36::activation::Capture>>,
     /// The section-timing marks: `None` unless the capture config asked for them. Declared after
     /// the graph (which drops first, synchronizing the device) and before the stream: the timing
     /// events drop while the stream is still alive.
@@ -651,6 +657,8 @@ impl<'a> QwenResidentStep<'a> {
         let step = Self {
             pins,
             graph: None,
+            #[cfg(feature = "research-activation")]
+            activation: std::cell::RefCell::new(None),
             context,
             res,
             mixers: Mixers::new(context, parts)?,
@@ -1646,7 +1654,8 @@ impl<'a> QwenResidentStep<'a> {
     /// section marks: `record_timing` and its `is_capturing` query run in the body — inside a
     /// capture window the record becomes an event-record node of the graph, outside one an eager
     /// record. The start block is written before it and the read-back follows it. `entered` counts
-    /// the ops that were entered, the failing one included.
+    /// the ops that were entered, the failing one included. Opt-in research activation capture is
+    /// another eager-only exception: one synchronous read after Moe(19), before arena reuse.
     fn run_body(
         &self,
         admit_pos: usize,
@@ -1669,6 +1678,10 @@ impl<'a> QwenResidentStep<'a> {
                 marks.record_before(op, &self.stream)?;
             }
             self.run_op(op, admit_pos, bufs.as_ref(), params, trace_step)?;
+            #[cfg(feature = "research-activation")]
+            if let StepOp::Moe(crate::family::qwen36::activation::LAYER) = op {
+                self.capture_activation(admit_pos)?;
+            }
             if let Some(marks) = &self.marks {
                 marks.record_after(op, &self.stream)?;
             }

@@ -33,6 +33,7 @@ cc = "=1.4.7"
 
 [features]
 default = []
+research-activation = []
 native-ane = []
 native-cuda = []
 native-mlx = ["dep:mlx-sys"]
