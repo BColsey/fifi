@@ -5,6 +5,10 @@
     expect(dead_code, reason = "EXL3 M1, family routing stays off")
 )]
 use crate::EngError;
+// The pure selection logic lives where the host build compiles and tests it.
+pub(crate) use crate::kernels::single_row::{
+    SERVED_SINGLE_ROW, SingleRow, effective_single_row, single_row_label, single_row_name,
+};
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
@@ -34,26 +38,6 @@ fn midrows_enabled(rows: usize, legacy: Option<&std::ffi::OsStr>) -> bool {
 /// never a silent fallback (the rule of `FIFI_EXL3_LAYER_MAJOR`). It is process-wide and read
 /// once: a change after the first EXL3 call is ignored.
 pub(crate) const SINGLE_GATHER_VAR: &str = "FIFI_EXL3_SINGLE_GATHER";
-
-/// The kernel a single-row call runs on. The switch governs every grouped launch the Qwen3.6 EXL3
-/// step makes as well: see [`grouped_kernel_for`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SingleRow {
-    Legacy,
-    Gather,
-    Wide(u32),
-}
-
-/// The kernel the Qwen3.6 EXL3 start registers on its context (`family/qwen36/cuda/start.rs`), and
-/// that any harness which claims to measure or qualify the served step must register too. An
-/// explicit `FIFI_EXL3_SINGLE_GATHER` still wins over it.
-pub(crate) const SERVED_SINGLE_ROW: SingleRow = SingleRow::Wide(1);
-
-/// The name of a kernel in a record: unlike [`single_row_label`] the shuffle kernel has one, so a
-/// record never leaves the kernel unsaid.
-pub(crate) fn single_row_name(kernel: SingleRow) -> &'static str {
-    single_row_label(kernel).unwrap_or("legacy")
-}
 
 /// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
@@ -241,16 +225,6 @@ pub(crate) fn single_gather_from_env(value: Option<&std::ffi::OsStr>) -> Result<
     }
 }
 
-/// The kernel an unset variable leaves to the context: an explicit value of the variable always
-/// wins, then the default the session that owns the context registered on it
-/// ([`CudaContext::set_single_row_default`]), then the shuffle kernel.
-pub(crate) fn effective_single_row(
-    explicit: Option<SingleRow>,
-    context_default: Option<SingleRow>,
-) -> SingleRow {
-    explicit.or(context_default).unwrap_or(SingleRow::Legacy)
-}
-
 /// The kernel a call of `rows` rows at `split_k` runs on when the switch selects `kernel`: only
 /// the small-row split-2 shape the grouped kernels implement leaves the shuffle kernel.
 fn single_row_route(kernel: SingleRow, rows: usize, split_k: u32) -> SingleRow {
@@ -395,18 +369,6 @@ impl CudaContext {
             .exl3_indexed_options()
             .map_or(String::new(), IndexedOptions::suffix);
         single + &options
-    }
-}
-
-/// The load-line name of the kernel a switch value selects, `None` for the shuffle kernel.
-pub(crate) fn single_row_label(kernel: SingleRow) -> Option<&'static str> {
-    match kernel {
-        SingleRow::Legacy => None,
-        SingleRow::Gather => Some("gather"),
-        SingleRow::Wide(1) => Some("wide1"),
-        SingleRow::Wide(2) => Some("wide2"),
-        SingleRow::Wide(4) => Some("wide4"),
-        SingleRow::Wide(_) => Some("wide"),
     }
 }
 

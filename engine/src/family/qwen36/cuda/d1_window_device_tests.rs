@@ -74,7 +74,10 @@ use crate::{
             driver::WindowModel,
         },
     },
-    kernels::cuda::resident::exl3::SERVED_SINGLE_ROW,
+    kernels::{
+        cuda::resident::exl3::{SERVED_SINGLE_ROW, SINGLE_GATHER_VAR},
+        single_row::require_served_kernel,
+    },
     tokenizer::Tokenizer,
 };
 
@@ -140,6 +143,10 @@ pub(super) fn load_pack() -> Loaded {
         .context()
         .single_row_kernel_name()
         .expect("single-row kernel setting");
+    // A run on the shuffle kernel speaks for a kernel the served engine does not run: refuse it
+    // here, before anything is loaded or measured, unless the operator named a kernel.
+    require_served_kernel(kernel, std::env::var_os(SINGLE_GATHER_VAR).is_some())
+        .unwrap_or_else(|error| panic!("{error}"));
     let weights: &'static CudaWeights = Box::leak(Box::new(
         load_exl3_dir(projector, Path::new(&dir), Reserve::default()).expect("load"),
     ));
