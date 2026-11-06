@@ -9,7 +9,7 @@ use crate::family::{
     qwen36::cuda::{
         common_tests,
         dims::{KvMode, StepOptions},
-        state::{device_tip::DeviceTip, export::ExportedState},
+        state::{device_tip::DeviceTip, export::ExportedState, pinned::PrefixPinPool},
     },
 };
 use crate::kernels::cuda::resident::step_params::StepParams;
@@ -257,4 +257,45 @@ fn a_rolled_back_window_leaves_the_device_tip_below_it_valid() {
     let mut got = vec![0u8; tip.bytes()];
     state.delta.read_at(&stream, 0, &mut got).unwrap();
     assert!(got.iter().all(|&b| b == 9), "the tip restores its own state");
+}
+
+#[test]
+#[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+fn a_rejected_window_leaves_the_pinned_prefix_pool_able_to_finish_recycle_and_restore() {
+    let ctx = CudaContext::new().expect("native CUDA context");
+    let stream = ctx.stream().unwrap();
+    for mode in [KvMode::Fp16, KvMode::Int8G32] {
+        let mut state = state_in(&ctx, &stream, mode);
+        for _ in 0..3 {
+            row(&mut state, &stream, 9);
+        }
+        let mut pool = PrefixPinPool::new(&ctx, state.layout, 2).unwrap();
+        // A save staged at 3 rows, its KV copy still deferred.
+        let pending = pool.begin(&ctx, &stream, &state, None).unwrap();
+        let first = pool.finish(&ctx, &stream, &state, pending).unwrap();
+        assert_eq!(first.tokens(), 3);
+        // A window that keeps one row: the device path writes no KV byte below row 3 and does not
+        // invalidate the pool.
+        let mut slots = RollbackSlots::new(&ctx, &stream, &state, 4).unwrap();
+        slots.begin_window(&stream, &state, 4).unwrap();
+        for at in 0..4 {
+            row(&mut state, &stream, 20 + at as u8);
+            if at < 3 {
+                slots.capture(&ctx, &stream, &state, at).unwrap();
+            }
+        }
+        slots.finish(&ctx, &stream, &mut state, 1, 3 + 1).unwrap();
+        assert!(
+            pool.can_recycle(&stream, &state, &first),
+            "{mode:?}: the rollback keeps the pool's live source"
+        );
+        // The recycled save at 4 rows copies only the new KV and restores the one-row state.
+        let pending = pool.begin(&ctx, &stream, &state, Some(first)).unwrap();
+        let second = pool.finish(&ctx, &stream, &state, pending).unwrap();
+        assert_eq!(second.tokens(), 4);
+        let want = reference(&ctx, &stream, mode, 3, &[20]).remove(0);
+        state.reset(&stream).unwrap();
+        pool.restore(&ctx, &stream, &mut state, &second, None).unwrap();
+        assert_eq!(state.export_state(&stream).unwrap(), want, "{mode:?}");
+    }
 }
