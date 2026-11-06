@@ -13,6 +13,8 @@ use super::host_load::rotary_dim;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+use crate::family::speculate::driver::{RepeatDrafter, Speculator};
 use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -352,6 +354,30 @@ pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
         )));
     }
     Ok(())
+}
+
+/// The speculative step a config asks for. Free of any device so that the refusals are tested on
+/// the host. The settings parser refuses a window of more than 8 rows already; a step built from a
+/// hand-made config meets the same cap here, before the mode is looked at. The CUDA step's
+/// `set_speculation` is this function plus an assignment.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn speculator_of(
+    config: &SpecConfig,
+) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
+    check_window_rows(config)?;
+    match config.mode {
+        DraftMode::Disabled => Ok(None),
+        DraftMode::Ngram => Ok(Some(Speculator::new(
+            RepeatDrafter::new(
+                (config.ngram_match_min, config.hybrid_tokens),
+                (config.window_drafts(), config.hybrid_drafts()),
+            ),
+            config.max_rows - 1,
+        ))),
+        DraftMode::Mtp => Err(EngError::BadRequest(
+            "draft_mode mtp has no draft step yet".to_owned(),
+        )),
+    }
 }
 
 /// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
@@ -3175,6 +3201,62 @@ mod tests {
         assert_eq!(
             absent.prefix_store_entries, None,
             "absent stays the default cap"
+        );
+    }
+}
+
+/// The step-side half of the cap: `speculator_of` is what the CUDA step's `set_speculation` calls,
+/// and it needs no device, so its refusals run in the host test gate.
+#[cfg(test)]
+mod speculation_arming {
+    use super::speculator_of;
+    use crate::family::speculate::config::{SpecConfig, SpecOptions};
+
+    fn config(mode: &str, rows: u32) -> SpecConfig {
+        SpecConfig::new(&SpecOptions {
+            draft_mode: Some(mode.to_owned()),
+            draft_max_rows: Some(rows),
+            ..SpecOptions::default()
+        })
+        .expect("a generic-range config")
+    }
+
+    #[test]
+    fn a_window_of_more_than_eight_rows_is_refused_before_the_mode_is_read() {
+        for rows in [9, 16, 64] {
+            let error = speculator_of(&config("ngram", rows))
+                .err()
+                .expect("refused");
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(&format!("draft_max_rows {rows} exceeds 8")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_to_eight_rows_arm_the_ngram_step_and_a_disabled_config_arms_nothing() {
+        for rows in 2..=8 {
+            assert!(
+                speculator_of(&config("ngram", rows))
+                    .expect("armed")
+                    .is_some()
+            );
+        }
+        assert!(
+            speculator_of(&SpecConfig::default())
+                .expect("off")
+                .is_none()
+        );
+        let disabled = SpecConfig {
+            max_rows: 64,
+            ..SpecConfig::default()
+        };
+        assert!(
+            speculator_of(&disabled)
+                .expect("a disabled entry feeds no window")
+                .is_none()
         );
     }
 }

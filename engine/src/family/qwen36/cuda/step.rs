@@ -75,11 +75,11 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, check_window_rows},
+    family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::session::PrefixSlot,
     family::speculate::{
-        config::{DraftMode, SpecConfig},
+        config::SpecConfig,
         driver::{RepeatDrafter, Speculator},
     },
     family::{AttentionKind, gguf_model::Role, sampler::Sampler},
@@ -113,28 +113,6 @@ pub(crate) struct CaptureConfig {
     /// event-record nodes that every replay re-fires. Off by default; the default path queues
     /// nothing extra.
     pub(crate) section_marks: bool,
-}
-
-/// The speculative step a config asks for. Free of any device so that the refusals can be tested
-/// without one. The settings parser refuses a window of more than 8 rows already; a step built
-/// from a hand-made config meets the same cap here, before the mode is looked at.
-pub(super) fn speculator_of(
-    config: &SpecConfig,
-) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
-    check_window_rows(config)?;
-    match config.mode {
-        DraftMode::Disabled => Ok(None),
-        DraftMode::Ngram => Ok(Some(Speculator::new(
-            RepeatDrafter::new(
-                (config.ngram_match_min, config.hybrid_tokens),
-                (config.window_drafts(), config.hybrid_drafts()),
-            ),
-            config.max_rows - 1,
-        ))),
-        DraftMode::Mtp => Err(EngError::BadRequest(
-            "draft_mode mtp has no draft step yet".to_owned(),
-        )),
-    }
 }
 
 /// The timing events of the section marks, created by `set_capture_config` before the first token
