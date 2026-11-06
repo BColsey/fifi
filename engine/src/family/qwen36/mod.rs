@@ -36,6 +36,15 @@ mod mtp_pack_tests;
     all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
 ))]
 mod resident;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first callers: the device rollback slots and the window"
+    )
+)]
+pub(crate) mod rollback;
 pub(crate) mod settings;
 #[cfg(test)]
 mod sparse_reference;
