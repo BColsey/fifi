@@ -33,8 +33,19 @@
 //! `FIFI_D1_CAPTURE` (`1`, the serving default for an EXL3 entry, or `0` for the eager body),
 //! `FIFI_D1_NEAR_TIE_FIXTURE` (the fixture JSON, for `d1_e_near_tie_fixture`).
 //!
-//! Isolation matters: the stop tokens are not set in the driver-level check (D), so a stop id
-//! among the reference draws cannot cut a scripted window; stops have their own tests.
+//! Two behaviours the checks meet, stated so a failure is read correctly:
+//!
+//! * A failed window does not restore the state it exported. `run_window` returns the error with
+//!   the rows already fed still in the device state, and the injected fault poisons the state the
+//!   way a failed step does, so every later step and snapshot is refused until a reset or an
+//!   import. Check F therefore accepts a refusing model and a rolled-back state, and rejects only
+//!   a state that differs from the pre-window one and still answers.
+//! * The first one-row steps of a process may run the eager body, the capture and then graph
+//!   replays, while a window's rows may run later ones. If the eager body, the capture and the
+//!   replay differ bitwise, A fails on the first window; the failing row and element name it.
+//!
+//! The stop tokens are not set in the driver-level check (D), so a stop id among the reference
+//! draws cannot cut a scripted window; stops have their own tests.
 
 use std::path::Path;
 
@@ -317,43 +328,65 @@ fn report(test: &str, label: &str, verdict: Verdict<Tally>) {
     }
 }
 
-fn check_a(rig: &mut Rig) {
-    for &prefix in &rig.prefixes.clone() {
-        for rows in WINDOW_ROWS {
-            let _session = prefilled(&mut rig.step, &rig.stream[..prefix], rig.context);
-            let inputs = window_inputs(&rig.stream, prefix, rows);
-            let verdict = full_logits(&mut rig.step, &inputs);
-            report("A", &format!("prefix={prefix} rows={rows}"), verdict);
-        }
-    }
-}
-
 /// Replacement tokens of C: ids at both ends, a stop token, the sentinel, a repeat of row 0.
 fn alternatives(inputs: &[u32]) -> Vec<u32> {
     vec![0, 1, (SAMPLER_VOCAB - 1) as u32, EOS[0], 248_055, inputs[0]]
 }
 
-fn check_c(rig: &mut Rig) {
-    for &prefix in &rig.prefixes.clone() {
-        for rows in [4, 8] {
-            let _session = prefilled(&mut rig.step, &rig.stream[..prefix], rig.context);
-            let inputs = window_inputs(&rig.stream, prefix, rows);
-            let verdict = later_rows_isolated(&mut rig.step, &inputs, &alternatives(&inputs));
-            report("C", &format!("prefix={prefix} rows={rows}"), verdict);
-        }
-    }
+/// Which checks a test runs.
+#[derive(Clone, Copy)]
+struct Which {
+    a: bool,
+    c: bool,
+    d: bool,
+    e: bool,
+    f: bool,
 }
 
-fn check_d(rig: &mut Rig) {
+impl Which {
+    const NONE: Self = Self {
+        a: false,
+        c: false,
+        d: false,
+        e: false,
+        f: false,
+    };
+    const ALL: Self = Self {
+        a: true,
+        c: true,
+        d: true,
+        e: true,
+        f: true,
+    };
+}
+
+/// Prefills once, then runs the chosen checks from that state. Every check returns the step to
+/// the state it was given, so they share the prefill; the first check starts from the state the
+/// prefill built, the later ones from a copy of it that was imported back.
+fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
     let Rig {
         step,
         tokenizer,
         stream,
         context,
-        prefixes,
+        ..
     } = rig;
-    for &prefix in prefixes.iter() {
-        let session = prefilled(step, &stream[..prefix], *context);
+    let session = prefilled(step, &stream[..prefix], *context);
+    if which.a {
+        for rows in WINDOW_ROWS {
+            let inputs = window_inputs(stream, prefix, rows);
+            let verdict = full_logits(step, &inputs);
+            report("A", &format!("prefix={prefix} rows={rows}"), verdict);
+        }
+    }
+    if which.c {
+        for rows in [4, 8] {
+            let inputs = window_inputs(stream, prefix, rows);
+            let verdict = later_rows_isolated(step, &inputs, &alternatives(&inputs));
+            report("C", &format!("prefix={prefix} rows={rows}"), verdict);
+        }
+    }
+    if which.d {
         let setup = Setup {
             session: &session,
             tokenizer: &*tokenizer,
@@ -365,80 +398,96 @@ fn check_d(rig: &mut Rig) {
         };
         for drafts in DRAFTS {
             let greedy = accepted_prefix(step, &setup, drafts, &Sampler::greedy);
-            report(
-                "D",
-                &format!("prefix={prefix} drafts={drafts} greedy"),
-                greedy,
-            );
+            let label = format!("prefix={prefix} drafts={drafts}");
+            report("D", &format!("{label} greedy"), greedy);
             let sampled = accepted_prefix(step, &setup, drafts, &seeded);
-            report(
-                "D",
-                &format!("prefix={prefix} drafts={drafts} seeded"),
-                sampled,
-            );
+            report("D", &format!("{label} seeded"), sampled);
         }
     }
-}
-
-fn check_e(rig: &mut Rig) {
-    for &prefix in &rig.prefixes.clone() {
-        let _session = prefilled(&mut rig.step, &rig.stream[..prefix], rig.context);
-        let inputs = window_inputs(&rig.stream, prefix, 8);
-        let verdict = ties_break_low(&mut rig.step, SAMPLER_VOCAB, &inputs);
+    if which.e {
+        let inputs = window_inputs(stream, prefix, 8);
+        let verdict = ties_break_low(step, SAMPLER_VOCAB, &inputs);
         report("E", &format!("prefix={prefix} rows=8"), verdict);
     }
-}
-
-fn check_f(rig: &mut Rig) {
-    for &prefix in &rig.prefixes.clone() {
+    if which.f {
         for rows in [2, 4] {
-            let _session = prefilled(&mut rig.step, &rig.stream[..prefix], rig.context);
-            let inputs = window_inputs(&rig.stream, prefix, rows);
-            let verdict = failure_recovery(&mut rig.step, SAMPLER_VOCAB, &inputs);
+            let inputs = window_inputs(stream, prefix, rows);
+            let verdict = failure_recovery(step, SAMPLER_VOCAB, &inputs);
             report("F", &format!("prefix={prefix} rows={rows}"), verdict);
         }
+    }
+}
+
+fn check_prefixes(rig: &mut Rig, which: Which) {
+    for prefix in rig.prefixes.clone() {
+        check_prefix(rig, prefix, which);
     }
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_a_full_logits() {
-    check_a(&mut rig());
+    check_prefixes(
+        &mut rig(),
+        Which {
+            a: true,
+            ..Which::NONE
+        },
+    );
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_c_later_row_isolation() {
-    check_c(&mut rig());
+    check_prefixes(
+        &mut rig(),
+        Which {
+            c: true,
+            ..Which::NONE
+        },
+    );
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_d_accepted_prefix_commit_and_rollback() {
-    check_d(&mut rig());
+    check_prefixes(
+        &mut rig(),
+        Which {
+            d: true,
+            ..Which::NONE
+        },
+    );
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_e_ties() {
-    check_e(&mut rig());
+    check_prefixes(
+        &mut rig(),
+        Which {
+            e: true,
+            ..Which::NONE
+        },
+    );
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_f_failure_recovery() {
-    check_f(&mut rig());
+    check_prefixes(
+        &mut rig(),
+        Which {
+            f: true,
+            ..Which::NONE
+        },
+    );
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_all_checks() {
-    let mut rig = rig();
-    check_a(&mut rig);
-    check_c(&mut rig);
-    check_d(&mut rig);
-    check_e(&mut rig);
-    check_f(&mut rig);
+    check_prefixes(&mut rig(), Which::ALL);
     println!("D1_ALL_CHECKS_COMPLETE");
 }
 
