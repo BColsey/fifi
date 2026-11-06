@@ -327,13 +327,14 @@ fn cuda_devices_of(
 
 /// The most rows a Qwen3.6 speculative verify window may have, the pending token included.
 ///
-/// This is a CAP, not a qualification. The EXL3 projections switch from the rows kernel to the
+/// This is a CAP, not a qualification, and a precaution for a future K-row verify path. Today's
+/// eager window feeds every row through the one-row `run_token`, so it uses no multi-row
+/// projection kernel at any row count. The EXL3 projections switch from the rows kernel to the
 /// unsplit kernel at 9 or more rows (`exl3_linear`), and no test shows that path bitwise equal to
-/// a one-row step, so a larger window would leave the D1 contract (verify equals one-row decode)
-/// unexamined. Rows 2 to 8 are accepted by the config; whether they are D1-qualified is decided
-/// by the device tests of `speculate::d1_oracle`, which have not run on a device yet. The limit
-/// belongs to this family: the generic `SpecConfig` range (2 to 64), prefill and chunked feed are
-/// unchanged.
+/// a one-row step, so the limit keeps a K-row path from reaching it unexamined. Rows 2 to 8 are
+/// accepted by the config; whether they are D1-qualified is decided by the device tests of
+/// `speculate::d1_oracle`, which have not run on a device yet. The limit belongs to this family:
+/// the generic `SpecConfig` range (2 to 64), prefill and chunked feed are unchanged.
 pub(crate) const QWEN36_MAX_WINDOW_ROWS: usize = 8;
 
 /// Refuses an enabled speculative configuration whose windows could exceed
@@ -343,8 +344,10 @@ pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
     if config.enabled() && config.max_rows > QWEN36_MAX_WINDOW_ROWS {
         return Err(bad(format!(
             "draft_max_rows {} exceeds {QWEN36_MAX_WINDOW_ROWS}: Qwen3.6 verify windows are capped at \
-             {QWEN36_MAX_WINDOW_ROWS} rows (the EXL3 projections leave the rows kernel at 9 rows); \
-             the cap is not a qualification of {QWEN36_MAX_WINDOW_ROWS}-row windows",
+             {QWEN36_MAX_WINDOW_ROWS} rows. The cap is reserved for the K-row verify path (the EXL3 \
+             projections leave the rows kernel at 9 rows); the current window feeds one row at a \
+             time and does not use it. The cap is not a qualification of {QWEN36_MAX_WINDOW_ROWS}-row \
+             windows",
             config.max_rows
         )));
     }
