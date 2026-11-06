@@ -821,3 +821,54 @@ fn a_reset_on_a_usable_state_finishes_the_pending_save() {
     reset_prologue(&mut host).expect("reset");
     assert!(host.called("complete_prefix_save") && host.invalidations == 0);
 }
+
+// Q2, the device path: its failures go through the same poison route.
+
+fn device_window() -> Fake {
+    let mut host = Fake::new(10, true);
+    host.pending = true;
+    run_window(&mut host, &[1, 2, 3]).expect("run");
+    host.pending = true; // a save staged while the window waits
+    host.log.clear();
+    host
+}
+
+#[test]
+fn a_device_window_whose_completion_mark_fails_fails_closed() {
+    let mut host = Fake::new(10, true);
+    host.pending = true;
+    host.fail = Some("rollback_window_complete");
+    run_window(&mut host, &[1, 2]).expect_err("the mark fails");
+    assert!(host.poisoned && host.gate && host.window.is_none());
+    assert!(host.called("drop_pending_prefix") && host.invalidations == 1);
+}
+
+#[test]
+fn every_failure_of_a_device_commit_fails_it_closed() {
+    for failing in ["restore_fault", "rollback_finish"] {
+        let mut host = device_window();
+        host.fail = Some(failing);
+        commit_window(&mut host, &commit(10, 1, 3)).expect_err(failing);
+        assert_failed_closed(&host, failing);
+    }
+}
+
+#[test]
+fn a_device_commit_with_the_gate_set_is_refused_before_the_copy() {
+    let mut host = device_window();
+    host.gate = true;
+    commit_window(&mut host, &commit(10, 1, 3)).expect_err("the gate");
+    assert!(!host.called("rollback_finish") && host.poisoned);
+}
+
+#[test]
+fn a_successful_device_commit_poisons_nothing() {
+    for kept in [1, 2, 3] {
+        let mut host = device_window();
+        commit_window(&mut host, &commit(10, kept, 3)).expect("commit");
+        assert!(
+            !host.poisoned && !host.gate && !host.called("poison"),
+            "kept {kept}"
+        );
+    }
+}

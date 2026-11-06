@@ -448,7 +448,12 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
         return Err(row_failure(host, base, error));
     }
     // Every row ran: until the verdict a step or an export through the state is refused.
-    host.rollback_window_complete()?;
+    // `rollback_window_complete` can fail only if the window closed under it: all rows ran and
+    // the state would stay valid and ahead, so the error fails the window closed like every other
+    // error after the first row.
+    if let Err(error) = host.rollback_window_complete() {
+        return Err(failed(host, error));
+    }
     host.store_window(Window {
         base,
         inputs: inputs.to_vec(),
@@ -464,14 +469,23 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
 /// state that is ahead of the verdict.
 fn commit_window_device<H: WindowHost>(host: &mut H, commit: &Commit) -> Result<(), EngError> {
     host.trace_mark(Mark::CommitStart);
+    // The device restore is a consumer of the live state like every other: a set recovery gate
+    // refuses it (the book still awaits its verdict here, so only the gate is asked).
+    if host.needs_reset() {
+        return Err(failed(
+            host,
+            reset_first("commit_window found the recovery gate set"),
+        ));
+    }
     if commit.discarded_rows > 0
         && let Err(error) = host.restore_fault()
     {
-        host.rollback_discard();
-        return Err(error);
+        return Err(failed(host, error));
     }
-    if host.rollback_finish(commit.kept_rows, commit.committed_rows)? {
-        host.trace_mark(Mark::Imported);
+    match host.rollback_finish(commit.kept_rows, commit.committed_rows) {
+        Ok(true) => host.trace_mark(Mark::Imported),
+        Ok(false) => {}
+        Err(error) => return Err(failed(host, error)),
     }
     Ok(())
 }
