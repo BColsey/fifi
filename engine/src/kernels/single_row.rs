@@ -138,8 +138,8 @@ impl SingleRowLaunches {
 /// The execution-path check, separate from the selection check: a correct output can come from a
 /// fallback, so a receipt must also show that the intended kernel ran. `expected` is the kernel
 /// name the context reports (`wide1` when served). It must have launched at least once, and no
-/// routed call may have run the shuffle kernel (a silent fallback), unless the shuffle kernel is
-/// what was expected.
+/// routed call may have run any other variant (the shuffle kernel, the gather kernel or another
+/// wide kernel: a silent fallback), unless the shuffle kernel is what was expected.
 pub(crate) fn require_kernel_ran(counts: &SingleRowLaunches, expected: &str) -> Result<(), String> {
     let ran = counts
         .of(expected)
@@ -150,13 +150,21 @@ pub(crate) fn require_kernel_ran(counts: &SingleRowLaunches, expected: &str) -> 
             counts.describe()
         ));
     }
-    if expected != "legacy" && counts.legacy > 0 {
-        return Err(format!(
-            "{} routed calls ran the shuffle kernel although {expected} was selected ({}): a fallback \
-             path was exercised",
-            counts.legacy,
-            counts.describe()
-        ));
+    // Any other variant on the routed shape is a fallback: the shuffle kernel, the gather kernel
+    // (what a wide setting degrades to when a width is not a multiple of its tile span) or another
+    // wide variant. The shuffle kernel as the selected one is accepted with the others unchecked:
+    // a legacy setting routes its grouped launches to the gather kernel by design.
+    if expected != "legacy" {
+        for other in ["legacy", "gather", "wide1", "wide2", "wide4"] {
+            let count = counts.of(other).unwrap_or(0);
+            if other != expected && count > 0 {
+                return Err(format!(
+                    "{count} routed calls ran the {other} kernel although {expected} was selected ({}): \
+                     a fallback path was exercised",
+                    counts.describe()
+                ));
+            }
+        }
     }
     Ok(())
 }

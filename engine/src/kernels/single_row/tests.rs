@@ -116,6 +116,24 @@ fn the_execution_path_guard_rejects_a_fallback_and_a_kernel_that_never_ran() {
     });
     let error = require_kernel_ran(&fallback, "wide1").expect_err("a fallback");
     assert!(error.contains("fallback"), "{error}");
+    // A degrade to the gather kernel, or a mix of wide variants, is a fallback too.
+    let gather_mix = counts(|c| {
+        c.record(SingleRow::Wide(1));
+        c.record(SingleRow::Gather);
+    });
+    let error = require_kernel_ran(&gather_mix, "wide1").expect_err("gather beside wide1");
+    assert!(error.contains("gather kernel"), "{error}");
+    let wide_mix = counts(|c| {
+        c.record(SingleRow::Wide(1));
+        c.record(SingleRow::Wide(2));
+    });
+    assert!(require_kernel_ran(&wide_mix, "wide1").is_err());
+    assert!(
+        require_kernel_ran(&gather_mix, "gather").is_err(),
+        "wide1 beside gather when gather was selected"
+    );
+    let gather_only = counts(|c| c.record(SingleRow::Gather));
+    assert!(require_kernel_ran(&gather_only, "gather").is_ok());
     // Indexed expert launches run the wide kernel whatever the switch says: they never count as the
     // selected kernel having run.
     let only_indexed = counts(|c| c.record_indexed());
