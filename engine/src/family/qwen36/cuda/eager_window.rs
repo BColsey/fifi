@@ -237,6 +237,14 @@ impl WindowHost for QwenResidentStep<'_> {
         self.import_state(saved)
     }
 
+    fn window_awaits(&self) -> bool {
+        self.window_is_open()
+    }
+
+    fn capacity(&self) -> usize {
+        self.kv_capacity_rows()
+    }
+
     fn is_valid(&self) -> bool {
         self.state_is_valid()
     }
@@ -296,10 +304,6 @@ impl WindowHost for QwenResidentStep<'_> {
 
     fn rollback_discard(&mut self) {
         QwenResidentStep::rollback_discard(self);
-    }
-
-    fn rollback_poison(&mut self) {
-        QwenResidentStep::rollback_poison(self);
     }
 
     fn rollback_window_complete(&mut self) -> Result<(), EngError> {

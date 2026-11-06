@@ -23,6 +23,14 @@ pub(super) struct Fake {
     pub(super) pending: bool,
     /// How many times the pinned pool was invalidated.
     pub(super) invalidations: usize,
+    /// Rows the KV cache holds.
+    pub(super) capacity: usize,
+    /// The row index (counted in `run_row` calls of the current window) that is refused.
+    pub(super) fail_nth_row: Option<usize>,
+    /// A refused row also poisons the state, as a step that fails inside its launch does.
+    pub(super) poison_on_row_failure: bool,
+    /// Rows fed by the current window so far.
+    pub(super) fed_rows: usize,
 }
 
 impl Fake {
@@ -30,6 +38,7 @@ impl Fake {
         Self {
             tokens,
             device,
+            capacity: 4096,
             ..Self::default()
         }
     }
@@ -94,6 +103,13 @@ impl WindowHost for Fake {
     fn run_row(&mut self, token: u32) -> Result<(u32, u32), EngError> {
         self.note(format!("run_row {token}"));
         self.hit("run_row")?;
+        let nth = self.fed_rows;
+        self.fed_rows += 1;
+        if self.fail_nth_row == Some(nth) {
+            self.fail_nth_row = None;
+            self.poisoned |= self.poison_on_row_failure;
+            return Err(EngError::BadRequest("fake: row refused".into()));
+        }
         self.tokens += 1;
         Ok((token + 100, token + 200))
     }
@@ -109,6 +125,14 @@ impl WindowHost for Fake {
         self.step("import")?;
         self.tokens = *saved;
         Ok(())
+    }
+
+    fn window_awaits(&self) -> bool {
+        self.window.is_some()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
     }
 
     fn is_valid(&self) -> bool {
@@ -179,10 +203,6 @@ impl WindowHost for Fake {
         self.note("rollback_discard");
     }
 
-    fn rollback_poison(&mut self) {
-        self.note("rollback_poison");
-    }
-
     fn rollback_window_complete(&mut self) -> Result<(), EngError> {
         self.step("rollback_window_complete")
     }
@@ -194,6 +214,9 @@ impl WindowHost for Fake {
     }
 
     fn trace_mark(&mut self, mark: Mark) {
+        if mark == Mark::WindowStart {
+            self.fed_rows = 0;
+        }
         self.note(format!("{mark:?}"));
     }
 
@@ -242,7 +265,6 @@ fn pin_host_window_that_keeps_every_row() {
     assert_eq!(
         ran(&host),
         [
-            "clear_window",
             "WindowStart",
             "export",
             "Exported",
@@ -301,7 +323,6 @@ fn pin_device_window_that_keeps_every_row() {
     assert_eq!(
         ran(&host),
         [
-            "clear_window",
             "WindowStart",
             "require_armed",
             "complete_prefix_save",
@@ -365,10 +386,7 @@ fn a_device_window_fails_before_its_first_row_without_poisoning() {
         let mut host = Fake::new(10, true);
         host.fail = Some(early);
         assert!(run_window(&mut host, &[1, 2]).is_err(), "{early}");
-        assert!(
-            !host.log.iter().any(|call| call == "rollback_poison"),
-            "{early}"
-        );
+        assert!(!host.called("poison"), "{early}");
     }
 }
 
@@ -380,10 +398,11 @@ fn a_device_window_that_fails_after_a_row_poisons_and_drops_the_window() {
         // A failing first row ran nothing, a failing capture follows a row that ran.
         let result = run_window(&mut host, &[1, 2, 3]);
         assert!(result.is_err());
-        let poisoned = host.log.iter().any(|call| call == "rollback_poison");
+        let poisoned = host.called("poison");
         assert_eq!(poisoned, failing == "capture", "{failing}");
         assert!(host.log.iter().any(|call| call == "rollback_discard"));
         assert!(host.window.is_none());
+        assert_eq!(host.gate, failing == "capture", "{failing}");
     }
 }
 
@@ -533,4 +552,97 @@ fn the_window_remembers_the_rows_committed_when_it_began() {
     run_window(&mut host, &[1, 2]).expect("run");
     assert_eq!(host.window.as_ref().map(|window| window.base), Some(37));
     commit_window(&mut host, &commit(37, 1, 2)).expect("a verdict for base 37");
+}
+
+// Q2, the host run_window.
+
+#[test]
+fn a_window_over_a_window_that_awaits_its_verdict_poisons_and_is_refused() {
+    for device in [false, true] {
+        let mut host = Fake::new(10, device);
+        host.pending = true;
+        run_window(&mut host, &[1, 2]).expect("first window");
+        host.log.clear();
+        run_window(&mut host, &[5, 6]).expect_err("a leftover window");
+        assert_failed_closed(&host, "leftover window");
+        // Refused before everything else: no save finished, no export, no row, no replacement.
+        for later in [
+            "complete_prefix_save",
+            "export",
+            "run_row 5",
+            "require_armed",
+        ] {
+            assert!(!host.called(later), "device {device}: {later}");
+        }
+    }
+}
+
+#[test]
+fn a_window_with_the_recovery_gate_set_is_refused_without_touching_anything() {
+    for device in [false, true] {
+        let mut host = Fake::new(10, device);
+        host.gate = true;
+        run_window(&mut host, &[1, 2]).expect_err("the gate");
+        for later in ["export", "run_row 1", "complete_prefix_save", "poison"] {
+            assert!(!host.called(later), "device {device}: {later}");
+        }
+        assert_eq!(host.tokens, 10);
+    }
+}
+
+#[test]
+fn a_host_window_that_does_not_fit_the_cache_is_refused_before_the_export() {
+    let mut host = Fake::new(10, false);
+    host.capacity = 12;
+    let error = run_window(&mut host, &[1, 2, 3]).expect_err("13 rows in 12");
+    assert!(matches!(error, EngError::ContextLimit(_)));
+    assert!(!host.called("export") && !host.called("poison") && !host.gate);
+    assert_eq!(host.tokens, 10);
+    // The edge: the last row exactly fills the cache.
+    run_window(&mut host, &[1, 2]).expect("12 rows in 12");
+}
+
+#[test]
+fn the_host_capacity_edge_is_exact() {
+    for (capacity, fits) in [(12, true), (11, false), (13, true)] {
+        let mut host = Fake::new(10, false);
+        host.capacity = capacity;
+        assert_eq!(run_window(&mut host, &[1, 2]).is_ok(), fits, "{capacity}");
+    }
+}
+
+#[test]
+fn a_host_row_that_fails_after_the_first_poisons_and_sets_the_gate() {
+    // The fake fails the second run_row: the first already ran.
+    let mut host = Fake::new(10, false);
+    host.pending = true;
+    host.fail_nth_row = Some(1);
+    run_window(&mut host, &[1, 2, 3]).expect_err("row 1 refused");
+    assert_failed_closed(&host, "row 1 refused before launch");
+}
+
+#[test]
+fn a_host_row_that_fails_before_the_first_ran_leaves_the_state_valid() {
+    let mut host = Fake::new(10, false);
+    host.fail_nth_row = Some(0);
+    run_window(&mut host, &[1, 2, 3]).expect_err("row 0 refused");
+    assert!(!host.poisoned && !host.gate && !host.called("poison"));
+    assert_eq!(host.tokens, 10);
+}
+
+#[test]
+fn a_host_export_failure_leaves_the_state_valid() {
+    let mut host = Fake::new(10, false);
+    host.fail = Some("export");
+    run_window(&mut host, &[1, 2]).expect_err("export");
+    assert!(!host.poisoned && !host.gate && host.window.is_none());
+}
+
+#[test]
+fn a_row_that_poisons_the_state_without_moving_it_still_sets_the_gate() {
+    let mut host = Fake::new(10, false);
+    host.poison_on_row_failure = true;
+    host.fail_nth_row = Some(0);
+    run_window(&mut host, &[1, 2]).expect_err("row 0 failed and poisoned");
+    assert!(host.gate && host.poisoned);
 }

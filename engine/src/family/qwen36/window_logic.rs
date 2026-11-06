@@ -10,6 +10,7 @@
 //! with empty default bodies: only the step's test build overrides them, so a serving build adds
 //! no call.
 
+use super::rollback::check_window_fits;
 use crate::{EngError, family::speculate::window::Commit};
 
 /// The points of a window at which the trace of a test build reads the clock.
@@ -102,6 +103,10 @@ pub(crate) trait WindowHost {
     fn require_armed(&mut self) -> Result<(), EngError>;
     /// Finishes a pending pinned-prefix save.
     fn complete_prefix_save(&mut self) -> Result<(), EngError>;
+    /// Whether a window awaits its verdict: a stored window, host or device.
+    fn window_awaits(&self) -> bool;
+    /// Rows the KV cache can hold.
+    fn capacity(&self) -> usize;
     /// Whether the state is `Valid`.
     fn is_valid(&self) -> bool;
     /// The recovery gate: a failed or indeterminate commit set it; only a reset clears it.
@@ -126,8 +131,6 @@ pub(crate) trait WindowHost {
     fn capture(&mut self, row: usize) -> Result<(), EngError>;
     /// Drops an open device window and its slot marks.
     fn rollback_discard(&mut self);
-    /// Poisons the state.
-    fn rollback_poison(&mut self);
     /// Marks that every row ran.
     fn rollback_window_complete(&mut self) -> Result<(), EngError>;
     /// Applies the verdict through the slots; returns whether a slot was copied back.
@@ -178,6 +181,32 @@ pub(crate) fn fail_window<H: WindowHost>(host: &mut H) {
     host.close_window();
 }
 
+/// The one check of whether the live state may be used: refused while the recovery gate is set
+/// (a failed commit poisoned the state; only `reset_state` clears it) or while a window awaits its
+/// verdict (the state is ahead of the lineage).
+pub(crate) fn state_usable<H: WindowHost>(host: &H) -> Result<(), EngError> {
+    if host.needs_reset() {
+        return Err(reset_first("the recovery gate is set"));
+    }
+    if host.window_awaits() {
+        return Err(EngError::BadRequest(
+            "verify window: a window waits for its verdict; the state is ahead of it (reset first)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// What a failure of the rows of a window leaves. A failure before the first row ran (a refusal
+/// at the top) leaves the state valid and unchanged; once a row ran, or the state is no longer
+/// valid, the state is ahead of the lineage or half written: it fails closed.
+fn row_failure<H: WindowHost>(host: &mut H, base: usize, error: EngError) -> EngError {
+    if host.tokens() != base || !host.is_valid() {
+        fail_window(host);
+    }
+    error
+}
+
 /// `fail_window`, then the error to return.
 fn failed<H: WindowHost>(host: &mut H, error: EngError) -> EngError {
     fail_window(host);
@@ -224,24 +253,44 @@ fn check_verdict<H: WindowHost>(
 
 /// Runs the rows of a window (the model side of `WindowModel::run_window`).
 pub(crate) fn run_window<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), EngError> {
-    // A window that fails half way leaves rows fed and no verdict to apply: no window is
-    // pending, and the caller resets the session.
-    host.clear_window();
     host.trace_mark(Mark::WindowStart);
+    // A window that is still stored has no verdict: the state is ahead of the lineage and the
+    // window is indeterminate. It poisons and refuses instead of being replaced, and this check
+    // precedes everything else, `complete_prefix_save` included, so that a refused call never
+    // finishes a save from a state that is ahead.
+    if host.window_awaits() {
+        return Err(failed(
+            host,
+            EngError::BadRequest(
+                "verify window: the previous window has no verdict; the state is poisoned until \
+                 reset_state"
+                    .to_owned(),
+            ),
+        ));
+    }
+    state_usable(host)?;
     if host.device_wanted() {
         return run_window_device(host, inputs);
     }
+    // Refused before the export and before any row: the state stays valid and unchanged.
+    check_window_fits(host.tokens(), inputs.len(), host.capacity())?;
     let base = host.tokens();
     let saved = host.export()?;
     host.trace_mark(Mark::Exported);
     let mut rows = Vec::with_capacity(inputs.len());
     let mut argmax = Vec::with_capacity(inputs.len());
-    for (at, &token) in inputs.iter().enumerate() {
-        host.feed_fault(at)?;
-        let (drawn, row) = host.run_row(token)?;
-        argmax.push(drawn);
-        rows.push(row);
-        host.trace_mark(Mark::RowDone);
+    let ran = (|| -> Result<(), EngError> {
+        for (at, &token) in inputs.iter().enumerate() {
+            host.feed_fault(at)?;
+            let (drawn, row) = host.run_row(token)?;
+            argmax.push(drawn);
+            rows.push(row);
+            host.trace_mark(Mark::RowDone);
+        }
+        Ok(())
+    })();
+    if let Err(error) = ran {
+        return Err(row_failure(host, base, error));
     }
     host.store_window(Window {
         base,
@@ -344,10 +393,7 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
     })();
     if let Err(error) = ran {
         host.rollback_discard();
-        if host.tokens() != base {
-            host.rollback_poison();
-        }
-        return Err(error);
+        return Err(row_failure(host, base, error));
     }
     // Every row ran: until the verdict a step or an export through the state is refused.
     host.rollback_window_complete()?;

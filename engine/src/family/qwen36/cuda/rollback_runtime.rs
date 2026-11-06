@@ -156,12 +156,6 @@ impl QwenResidentStep<'_> {
         slots.finish(context, stream, state, kept, committed_rows)
     }
 
-    /// Marks the state untrustworthy: the window failed after a row ran, so the state is ahead of
-    /// the lineage and no verdict can come.
-    pub(crate) fn rollback_poison(&mut self) {
-        self.state.poison();
-    }
-
     /// Drops an open window and every slot mark: a reset, an import, a poison, a failed window.
     pub(crate) fn rollback_discard(&mut self) {
         if let Some(slots) = self.rollback.as_mut() {

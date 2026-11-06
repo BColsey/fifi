@@ -8,6 +8,21 @@ use super::QwenResidentStep;
 use crate::EngError;
 
 impl QwenResidentStep<'_> {
+    /// Whether a window awaits its verdict: the stored window (host or device), or a device
+    /// window that has run all its rows.
+    pub(crate) fn window_is_open(&self) -> bool {
+        self.window.is_some()
+            || self
+                .rollback
+                .as_ref()
+                .is_some_and(super::super::state::rollback::RollbackSlots::awaiting_verdict)
+    }
+
+    /// Rows the KV cache can hold.
+    pub(crate) fn kv_capacity_rows(&self) -> usize {
+        self.state.layout().kv.capacity
+    }
+
     /// Whether the state is `Valid`.
     pub(crate) fn state_is_valid(&self) -> bool {
         self.state.health() == Health::Valid
