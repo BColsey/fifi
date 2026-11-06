@@ -187,6 +187,9 @@ pub(crate) struct Transfer {
     pub(crate) d2h_calls: u64,
     pub(crate) h2d_bytes: u64,
     pub(crate) h2d_calls: u64,
+    /// Device-to-device copies (the rollback slots).
+    pub(crate) d2d_bytes: u64,
+    pub(crate) d2d_calls: u64,
 }
 
 impl Add for Transfer {
@@ -198,6 +201,8 @@ impl Add for Transfer {
             d2h_calls: self.d2h_calls + other.d2h_calls,
             h2d_bytes: self.h2d_bytes + other.h2d_bytes,
             h2d_calls: self.h2d_calls + other.h2d_calls,
+            d2d_bytes: self.d2d_bytes + other.d2d_bytes,
+            d2d_calls: self.d2d_calls + other.d2d_calls,
         }
     }
 }
@@ -207,6 +212,7 @@ impl Transfer {
         json!({
             "d2h_bytes": self.d2h_bytes, "d2h_calls": self.d2h_calls,
             "h2d_bytes": self.h2d_bytes, "h2d_calls": self.h2d_calls,
+            "d2d_bytes": self.d2d_bytes, "d2d_calls": self.d2d_calls,
         })
     }
 }
@@ -284,6 +290,7 @@ impl StateShape {
             d2h_calls: 1,
             h2d_bytes: self.start_block_bytes,
             h2d_calls: 1,
+            ..Transfer::default()
         }
     }
 
@@ -319,6 +326,8 @@ impl WindowTransfers {
             d2h_calls: one.d2h_calls * times,
             h2d_bytes: one.h2d_bytes * times,
             h2d_calls: one.h2d_calls * times,
+            d2d_bytes: one.d2d_bytes * times,
+            d2d_calls: one.d2d_calls * times,
         };
         Self {
             export: state.export(),
@@ -348,9 +357,80 @@ impl WindowTransfers {
     }
 }
 
+/// The copies of one window of `rows` rows whose verdict keeps `kept` rows under the device
+/// rollback: the same row steps and logits rows, one D2D copy of `slot_bytes` after each row but
+/// the last, and on a partial accept one D2D copy back plus the words block rewritten. No export,
+/// no import of the state, no replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceWindowTransfers {
+    pub(crate) rows: Transfer,
+    pub(crate) capture: Transfer,
+    pub(crate) restore: Transfer,
+}
+
+impl DeviceWindowTransfers {
+    pub(crate) fn new(state: &StateShape, slot_bytes: u64, rows: usize, kept: usize) -> Self {
+        let n = rows as u64;
+        let per_row = state.step() + state.logits_row();
+        let scaled = |one: Transfer, times: u64| Transfer {
+            d2h_bytes: one.d2h_bytes * times,
+            d2h_calls: one.d2h_calls * times,
+            h2d_bytes: one.h2d_bytes * times,
+            h2d_calls: one.h2d_calls * times,
+            d2d_bytes: one.d2d_bytes * times,
+            d2d_calls: one.d2d_calls * times,
+        };
+        let captures = n.saturating_sub(1);
+        Self {
+            rows: scaled(per_row, n),
+            capture: Transfer {
+                d2d_bytes: slot_bytes * captures,
+                d2d_calls: captures,
+                ..Transfer::default()
+            },
+            restore: if kept < rows {
+                Transfer {
+                    d2d_bytes: slot_bytes,
+                    d2d_calls: 1,
+                    h2d_bytes: state.words_bytes,
+                    h2d_calls: 1,
+                    ..Transfer::default()
+                }
+            } else {
+                Transfer::default()
+            },
+        }
+    }
+
+    pub(crate) fn total(&self) -> Transfer {
+        self.rows + self.capture + self.restore
+    }
+
+    pub(crate) fn to_json(self) -> Value {
+        json!({
+            "row_steps_and_logits": self.rows.to_json(),
+            "capture": self.capture.to_json(),
+            "restore": self.restore.to_json(),
+            "total": self.total().to_json(),
+            "basis": "computed from the slot size and the logits width, not counted at run time",
+        })
+    }
+}
+
+/// The minor and major page faults in the text of `/proc/self/stat`: fields 10 and 12, counted
+/// after the last `)` that closes the command name (which may itself hold spaces and parentheses).
+pub(crate) fn parse_stat_faults(stat: &str) -> Option<(u64, u64)> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    // After the name the fields start at field 3 (the state).
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let minor = fields.get(10 - 3)?.parse().ok()?;
+    let major = fields.get(12 - 3)?.parse().ok()?;
+    Some((minor, major))
+}
+
 /// Fields every record must carry before it is written, as a path list. A missing or empty
 /// identity makes the record unusable as evidence.
-const REQUIRED_IDENTITY: [&str; 9] = [
+const REQUIRED_IDENTITY: [&str; 10] = [
     "commit",
     "binary_sha256",
     "pack.manifest_sha256",
@@ -360,6 +440,7 @@ const REQUIRED_IDENTITY: [&str; 9] = [
     "token_ids.tokenizer_sha256",
     "token_ids.ids_sha256",
     "token_ids.source",
+    "single_row_kernel",
 ];
 
 /// Checks the identity block of a record: every required path exists and is not empty or null.

@@ -1,8 +1,8 @@
 //! Host tests of the window-cost arithmetic and identities.
 
 use super::window_cost::{
-    PackManifest, RECORD_SCHEMA, StateShape, Transfer, WindowTransfers, check_identity, ids_sha256,
-    median, sha256_file, sha256_hex, summary,
+    DeviceWindowTransfers, PackManifest, RECORD_SCHEMA, StateShape, Transfer, WindowTransfers,
+    check_identity, ids_sha256, median, parse_stat_faults, sha256_file, sha256_hex, summary,
 };
 use serde_json::json;
 
@@ -171,12 +171,17 @@ fn a_record_without_a_complete_identity_is_refused() {
         "schema": RECORD_SCHEMA,
         "identity": {
             "commit": "abc", "binary_sha256": "d", "kv_mode": "Fp16", "capture": true,
+            "single_row_kernel": "wide1",
             "pack": {"manifest_sha256": "e"},
             "token_ids": {"text_sha256": "f", "tokenizer_sha256": "g", "ids_sha256": "h", "source": "text"},
         }
     });
     check_identity(&complete).expect("complete");
-    for (path, patch) in [("commit", json!("")), ("binary_sha256", json!(null))] {
+    for (path, patch) in [
+        ("commit", json!("")),
+        ("binary_sha256", json!(null)),
+        ("single_row_kernel", json!(null)),
+    ] {
         let mut broken = complete.clone();
         broken["identity"][path] = patch;
         let error = check_identity(&broken).expect_err(path);
@@ -237,4 +242,38 @@ fn print_the_token_ids_identity() {
         sha256_file(std::path::Path::new(&text_path)).expect("text sha"),
         sha256_file(std::path::Path::new(&tokenizer_path)).expect("tokenizer sha"),
     );
+}
+
+#[test]
+fn a_device_rollback_window_copies_the_slots_and_never_the_state_to_the_host() {
+    let state = shape();
+    const SLOT: u64 = 65_863_680;
+    let all = DeviceWindowTransfers::new(&state, SLOT, 4, 4);
+    assert_eq!(all.capture.d2d_bytes, 3 * SLOT);
+    assert_eq!(all.capture.d2d_calls, 3);
+    assert_eq!(all.restore, Transfer::default(), "a full accept restores nothing");
+    let partial = DeviceWindowTransfers::new(&state, SLOT, 4, 1);
+    assert_eq!(partial.restore.d2d_bytes, SLOT);
+    assert_eq!(partial.restore.d2d_calls, 1);
+    assert_eq!(partial.restore.h2d_bytes, state.words_bytes, "the words block is rewritten");
+    // The rows are the host window's rows; the export, the import and the replay are gone.
+    let host = WindowTransfers::new(&state, 4, 1);
+    assert_eq!(partial.rows, host.rows);
+    let total = partial.total();
+    assert_eq!(total.d2d_bytes, 4 * SLOT);
+    assert_eq!(total.d2h_bytes, host.rows.d2h_bytes, "no state goes to the host");
+    assert!(total.d2h_bytes < host.total().d2h_bytes);
+    let two = DeviceWindowTransfers::new(&state, SLOT, 2, 1);
+    assert_eq!(two.capture.d2d_calls, 1);
+    assert_eq!(two.to_json()["total"]["d2d_bytes"], 2 * SLOT);
+}
+
+#[test]
+fn the_fault_counters_are_read_after_the_command_name() {
+    // Fields 10 and 12 of /proc/self/stat; the name may hold spaces and parentheses.
+    let stat = "4242 (a (weird) name) S 1 4242 4242 0 -1 4194304 12345 0 7 0 5 6 0 0 20 0 1";
+    assert_eq!(parse_stat_faults(stat), Some((12345, 7)));
+    assert_eq!(parse_stat_faults("no parenthesis"), None);
+    assert_eq!(parse_stat_faults("1 (x) S 1 2"), None, "too few fields");
+    assert_eq!(parse_stat_faults("1 (x) S 1 2 3 4 5 6 abc 8 9"), None, "not a number");
 }

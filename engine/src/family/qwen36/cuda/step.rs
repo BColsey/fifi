@@ -408,6 +408,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The host and device time of the last window, by part (test builds only).
     #[cfg(test)]
     pub(super) window_trace: super::eager_window::WindowTrace,
+    /// Drain the stream after each device-rollback capture, so the copy's time shows in the trace
+    /// (test builds only; the copy otherwise overlaps the host's next work).
+    #[cfg(test)]
+    pub(super) trace_sync_capture: bool,
     /// The speculative decode step, when the settings asked for one.
     pub(super) speculator: Option<Speculator<RepeatDrafter>>,
     #[cfg(test)]
@@ -715,6 +719,8 @@ impl<'a> QwenResidentStep<'a> {
             prefix: PrefixSlot::default(),
             prefix_pins: None,
             device_tip: None,
+            #[cfg(test)]
+            trace_sync_capture: false,
             rollback_wanted: false,
             rollback: None,
             pending_prefix: None,

@@ -150,9 +150,43 @@ impl QwenResidentStep<'_> {
     }
 }
 
-/// Test builds: what the single-row kernel dispatch launched on this step's context.
+/// Test builds: what the single-row kernel dispatch launched on this step's context, the switch
+/// between the two rollbacks that the cost harness rotates, and the copy microbenchmark.
 #[cfg(test)]
 impl QwenResidentStep<'_> {
+    /// Drains the owning stream (the capture drain of the cost trace).
+    pub(crate) fn drain_stream(&self) -> Result<(), EngError> {
+        self.stream.synchronize()
+    }
+
+    /// Switches the window between the device rollback (`on`, needs armed slots) and the host
+    /// rollback. The cost harness rotates both arms in one process so that drift hits both.
+    pub(crate) fn use_device_rollback(&mut self, on: bool) -> Result<(), EngError> {
+        if on && self.rollback.is_none() {
+            return Err(EngError::BadRequest(
+                "device rollback: no slots are armed".into(),
+            ));
+        }
+        self.rollback_wanted = on;
+        Ok(())
+    }
+
+    /// Times `copies` copies of one slot (slot 0 of the Delta pool into slot 0 of the buffer), each
+    /// followed by a stream drain, in ms: the calibration of the device copy time.
+    pub(crate) fn device_copy_microbench(&mut self, copies: usize) -> Result<Vec<f64>, EngError> {
+        let Self {
+            rollback,
+            stream,
+            state,
+            context,
+            ..
+        } = self;
+        let slots = rollback.as_mut().ok_or_else(|| {
+            EngError::BadRequest("device rollback: no slots are armed".into())
+        })?;
+        slots.bench_copy(context, stream, state, copies)
+    }
+
     pub(crate) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
         self.context.exl3_launch_counts()
     }

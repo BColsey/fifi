@@ -136,6 +136,10 @@ enum Mark {
     Imported,
     /// A kept row has been fed again.
     ReplayDone,
+    /// The device path has copied the state after a row into its slot.
+    Captured,
+    /// The saved host state has been dropped (the free or unmap of its buffers).
+    Dropped,
 }
 
 /// What one window cost on the host clock, by part, and what the device timeline says of each row.
@@ -153,12 +157,37 @@ pub(super) struct WindowTrace {
     pub(super) import_ms: f64,
     pub(super) replay_ms: Vec<f64>,
     pub(super) replay_gpu_ms: Vec<Option<f32>>,
+    /// The copy after each row but the last (device path): the host time from the row's mark to the
+    /// copy's enqueue, or to its completion when `trace_sync_capture` drained the stream.
+    pub(super) capture_ms: Vec<f64>,
+    /// The drop of the saved host state at the end of `commit_window` (host path).
+    pub(super) drop_ms: f64,
+    /// Host time spent inside `trace_mark` itself (the clock reads, the event queries, the fault
+    /// counter reads): the marks' own cost, so that it is not mistaken for unattributed time.
+    pub(super) mark_overhead_ms: f64,
+    /// Minor page faults of the process (`/proc/self/stat`) at the marks that sample them.
+    pub(super) minflt: Vec<(&'static str, u64)>,
+}
+
+/// The process's minor faults now, or `None` where `/proc/self/stat` cannot be read or parsed.
+#[cfg(test)]
+pub(super) fn minor_faults() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    crate::family::speculate::window_cost::parse_stat_faults(&stat).map(|(minor, _)| minor)
 }
 
 #[cfg(test)]
 impl QwenResidentStep<'_> {
     fn trace_mark(&mut self, mark: Mark) {
         let now = std::time::Instant::now();
+        let fault_label = match mark {
+            Mark::WindowStart => Some("window_start"),
+            Mark::Exported => Some("exported"),
+            Mark::CommitStart => Some("commit_start"),
+            Mark::Dropped => Some("dropped"),
+            _ => None,
+        };
+        let faults = fault_label.and_then(|label| Some((label, minor_faults()?)));
         let gpu = match mark {
             Mark::RowDone | Mark::ReplayDone => {
                 self.section_times().ok().flatten().map(|t| t.whole_ms())
@@ -171,6 +200,8 @@ impl QwenResidentStep<'_> {
             .map_or(0.0, |clock| (now - clock).as_secs_f64() * 1e3);
         match mark {
             Mark::WindowStart => *trace = WindowTrace::default(),
+            Mark::Captured => trace.capture_ms.push(since),
+            Mark::Dropped => trace.drop_ms = since,
             Mark::Exported => trace.export_ms = since,
             Mark::RowDone => {
                 trace.row_ms.push(since);
@@ -187,7 +218,11 @@ impl QwenResidentStep<'_> {
                 trace.replay_gpu_ms.push(gpu);
             }
         }
-        trace.clock = Some(std::time::Instant::now());
+        trace.minflt.extend(faults);
+        let end = std::time::Instant::now();
+        // The clock restarts after the mark's own work, which is accounted apart.
+        trace.mark_overhead_ms += (end - now).as_secs_f64() * 1e3;
+        trace.clock = Some(end);
     }
 }
 
@@ -241,6 +276,11 @@ impl WindowModel for QwenResidentStep<'_> {
             WindowSave::Device => return self.commit_window_device(commit),
         };
         if commit.discarded_rows == 0 {
+            #[cfg(test)]
+            {
+                drop(saved);
+                self.trace_mark(Mark::Dropped);
+            }
             return Ok(());
         }
         self.trace_mark(Mark::CommitStart);
@@ -250,6 +290,11 @@ impl WindowModel for QwenResidentStep<'_> {
             self.replay_fault(at)?;
             self.run_token(token, false)?;
             self.trace_mark(Mark::ReplayDone);
+        }
+        #[cfg(test)]
+        {
+            drop(saved);
+            self.trace_mark(Mark::Dropped);
         }
         Ok(())
     }
@@ -279,6 +324,11 @@ impl QwenResidentStep<'_> {
                 if at + 1 < inputs.len() {
                     self.capture_fault(at)?;
                     self.rollback_capture(at)?;
+                    #[cfg(test)]
+                    if self.trace_sync_capture {
+                        self.drain_stream()?;
+                    }
+                    self.trace_mark(Mark::Captured);
                 }
             }
             Ok(())

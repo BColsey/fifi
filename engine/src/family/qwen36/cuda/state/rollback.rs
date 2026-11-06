@@ -216,6 +216,37 @@ impl RollbackSlots {
         Ok(true)
     }
 
+    /// Test builds: `copies` timed copies of slot 0 into the first slot, each drained, in ms. The
+    /// first slot is overwritten; call it outside a window.
+    #[cfg(test)]
+    pub(crate) fn bench_copy(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        state: &ResidentState,
+        copies: usize,
+    ) -> Result<Vec<f64>, EngError> {
+        if self.book.is_open() {
+            return Err(EngError::BadRequest(
+                "device rollback: a window is open".into(),
+            ));
+        }
+        self.facts(stream, state).require_copyable("bench")?;
+        let bytes = self.book.plan().slot_bytes;
+        let mut times = Vec::with_capacity(copies);
+        for _ in 0..copies {
+            let began = std::time::Instant::now();
+            ctx.copy_device(
+                stream,
+                state.delta.range(0, bytes)?,
+                self.buffer.range(0, bytes)?,
+            )?;
+            stream.synchronize()?;
+            times.push(began.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(times)
+    }
+
     /// Drops the open window and every slot mark: a reset, an import, a poison or a failure.
     pub(crate) fn discard(&mut self) {
         self.book.discard();

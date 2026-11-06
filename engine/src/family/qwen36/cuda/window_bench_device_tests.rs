@@ -65,7 +65,18 @@
 //! (2,4), `FIFI_MRV_ROUNDS` (12), `FIFI_MRV_WARM_FROM` (2: rounds before this are cold and left
 //! out of the medians), `FIFI_MRV_MARKS` (1), `FIFI_MRV_DEADLINE_S` (780: after this many seconds
 //! from the test's start no new cell or round begins and the record says it stopped early),
-//! `FIFI_MRV_LEASE_VRAM_GIB` (21), `FIFI_D1_KV` (fp16), `FIFI_D1_CAPTURE` (1).
+//! `FIFI_MRV_LEASE_VRAM_GIB` (21), `FIFI_D1_KV` (fp16), `FIFI_D1_CAPTURE` (1),
+//! `FIFI_MRV_ROLLBACK` (`host`, the default; `device` or `both` arm the rollback slots and add the
+//! device arms `device_accept_all`, `device_reject_first`, `device_keep_middle`), `FIFI_MRV_SYNC_CAPTURE`
+//! (0; 1 drains the stream after each capture so the copy time shows in the trace).
+//!
+//! **Timing accounting.** Besides the phases, every window record carries `drop_wall_ms` (the drop of
+//! the saved host state, a `Dropped` mark in test builds), `mark_overhead_ms` (the marks' own cost),
+//! the minor page faults of the whole window (`minflt_window`, read outside the timed region), the
+//! faults at the marks, and `residual_ms`: the total minus every attributed phase. The record
+//! also carries the launch counts of each single-row EXL3 variant (`single_row_launches`) and
+//! `identity.single_row_kernel`; a cell fails if the selected kernel never launched or a routed
+//! call fell back to the shuffle kernel.
 
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -77,8 +88,9 @@ use super::{
         kv_mode_from_env, load_pack, step_options, text_stream,
     },
     dims::KvMode,
-    eager_window::WindowTrace,
+    eager_window::{WindowTrace, minor_faults},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
+    prefill_plan::Extra,
     start::prefill_headroom,
     state::export::ExportedState,
     state_layout::Word,
@@ -87,7 +99,10 @@ use super::{
 use crate::{
     EngError,
     family::{
-        qwen36::settings::DEFAULT_CUDA_PREFILL_CHUNK,
+        qwen36::{
+            rollback::Cover,
+            settings::DEFAULT_CUDA_PREFILL_CHUNK,
+        },
         sampler::Sampler,
         session::TokenStepper,
         speculate::{
@@ -95,11 +110,12 @@ use crate::{
             driver::WindowModel,
             window::Commit,
             window_cost::{
-                PackManifest, RECORD_SCHEMA, StateShape, WindowTransfers, check_identity,
-                ids_sha256, median, sha256_file, summary,
+                DeviceWindowTransfers, PackManifest, RECORD_SCHEMA, StateShape, WindowTransfers,
+                check_identity, ids_sha256, median, sha256_file, summary,
             },
         },
     },
+    kernels::single_row::require_kernel_ran,
 };
 
 const GIB: u64 = 1 << 30;
@@ -118,6 +134,37 @@ struct Config {
     marks: bool,
     deadline_s: f64,
     lease_gib: u64,
+    /// Which rollbacks the windows rotate through: `host` (the default), `device` (slots armed,
+    /// device arms only besides the single-row arm) or `both`.
+    rollback: BenchRollback,
+    /// Drain the stream after each capture so the copy's time shows in the trace.
+    sync_capture: bool,
+}
+
+/// `FIFI_MRV_ROLLBACK`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BenchRollback {
+    Host,
+    Device,
+    Both,
+}
+
+impl BenchRollback {
+    fn host(self) -> bool {
+        self != Self::Device
+    }
+
+    fn device(self) -> bool {
+        self != Self::Host
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Device => "device",
+            Self::Both => "both",
+        }
+    }
 }
 
 fn env_list(name: &str, default: &str) -> Vec<usize> {
@@ -155,6 +202,13 @@ impl Config {
             marks: env_num::<u8>("FIFI_MRV_MARKS", 1) == 1,
             deadline_s: env_num("FIFI_MRV_DEADLINE_S", 780.0),
             lease_gib: env_num("FIFI_MRV_LEASE_VRAM_GIB", 21),
+            rollback: match std::env::var("FIFI_MRV_ROLLBACK").as_deref() {
+                Ok("host") | Err(_) => BenchRollback::Host,
+                Ok("device") => BenchRollback::Device,
+                Ok("both") => BenchRollback::Both,
+                Ok(other) => panic!("FIFI_MRV_ROLLBACK must be host, device or both, got {other:?}"),
+            },
+            sync_capture: env_num::<u8>("FIFI_MRV_SYNC_CAPTURE", 0) == 1,
         };
         assert!(
             config.depths.windows(2).all(|w| w[0] < w[1]),
@@ -188,6 +242,7 @@ fn bench_step(
     context: usize,
     capture: bool,
     marks: bool,
+    device_rows: Option<usize>,
 ) -> Result<QwenResidentStep<'static>, EngError> {
     let mut step = build_step(
         loaded,
@@ -211,11 +266,24 @@ fn bench_step(
     };
     step.set_kv8_chunked_prefill(kv8)?;
     step.set_m_sess_cap(cap);
+    // The device rollback slots are armed before the arena admission and charged to it as an extra,
+    // as the served start does. The windows start on the host rollback; the device arms switch it.
+    let mut extras = Vec::new();
+    if let Some(rows) = device_rows {
+        step.request_device_rollback();
+        let bytes = step.enable_device_rollback(rows, Cover::Arena, 0)?;
+        step.use_device_rollback(false)?;
+        extras.push(Extra {
+            name: "device-rollback-slots",
+            fixed: bytes,
+            bytes_per_token: 0,
+        });
+    }
     let free = loaded.projector.memory_info()?.free;
     let verdict = step.admit_prefill(
         PrefillBudget {
             device_free: free.saturating_sub(headroom),
-            extras: Vec::new(),
+            extras,
         },
         flags.0,
         flags.1,
@@ -428,15 +496,21 @@ fn restoration(step: &mut QwenResidentStep<'_>, inputs: &[u32]) -> Verdict<Tally
 struct WindowRun {
     total_ms: f64,
     trace: WindowTrace,
+    /// Minor page faults of the process across the whole window, read outside the timed region.
+    minflt: Option<u64>,
 }
 
-/// One window of `tokens` keeping `kept` rows, with the greedy draws of the kept rows.
+/// One window of `tokens` keeping `kept` rows, with the greedy draws of the kept rows, on the host
+/// rollback (`device` false) or the device rollback.
 fn window_arm(
     step: &mut QwenResidentStep<'_>,
     tokens: &[u32],
     kept: usize,
+    device: bool,
 ) -> Result<WindowRun, EngError> {
+    step.use_device_rollback(device)?;
     let base = step.tokens();
+    let faults_before = minor_faults();
     let began = Instant::now();
     step.run_window(tokens)?;
     let mut greedy = Sampler::greedy();
@@ -449,9 +523,12 @@ fn window_arm(
         discarded_rows: tokens.len() - kept,
         state_slot: kept - 1,
     })?;
+    let total_ms = ms(began);
+    let minflt = faults_before.zip(minor_faults()).map(|(a, b)| b.saturating_sub(a));
     Ok(WindowRun {
-        total_ms: ms(began),
+        total_ms,
         trace: step.window_trace.clone(),
+        minflt,
     })
 }
 
@@ -479,6 +556,10 @@ enum Arm {
     Single,
     WindowAll,
     WindowFirst,
+    /// Device rollback: every row kept, the first row kept, the middle row kept.
+    DeviceAll,
+    DeviceFirst,
+    DeviceMid,
 }
 
 /// One round's numbers, by arm.
@@ -489,6 +570,9 @@ struct Rounds {
     single_total: Vec<f64>,
     all: Vec<WindowRun>,
     first: Vec<WindowRun>,
+    device_all: Vec<WindowRun>,
+    device_first: Vec<WindowRun>,
+    device_mid: Vec<WindowRun>,
     export_standalone: Vec<f64>,
     import_standalone: Vec<f64>,
 }
@@ -525,19 +609,87 @@ fn window_json(
         ),
         "import_wall_ms": summary(&col(&|w| w.trace.import_ms)),
         "replay_wall_ms": summary(&col(&|w| w.trace.replay_ms.iter().sum())),
+        "drop_wall_ms": summary(&col(&|w| w.trace.drop_ms)),
+        "mark_overhead_ms": summary(&col(&|w| w.trace.mark_overhead_ms)),
+        "minflt_window": summary(
+            &warm.iter().filter_map(|w| w.minflt.map(|f| f as f64)).collect::<Vec<_>>()
+        ),
+        "minflt_at_marks": warm.last().map_or(Value::Null, |w| json!(w.trace.minflt)),
+        "residual_ms": summary(&col(&|w| {
+            w.total_ms
+                - w.trace.export_ms
+                - w.trace.row_ms.iter().sum::<f64>()
+                - w.trace.import_ms
+                - w.trace.replay_ms.iter().sum::<f64>()
+                - w.trace.drop_ms
+                - w.trace.mark_overhead_ms
+        })),
         "replay_gpu_event_ms": summary(&gpu_replay),
         "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
         "transfers_per_window": WindowTransfers::new(shape, rows, kept).to_json(),
     })
 }
 
+/// The record of a device-rollback arm: the same phases, with the captures and the restore in place
+/// of the export, the import and the replay, and the D2D bytes computed from the slot size.
+fn device_window_json(
+    runs: &[WindowRun],
+    warm_from: usize,
+    rows: usize,
+    kept: usize,
+    shape: &StateShape,
+    slot_bytes: u64,
+) -> Value {
+    let warm = &runs[warm_from.min(runs.len())..];
+    let col = |f: &dyn Fn(&WindowRun) -> f64| -> Vec<f64> { warm.iter().map(f).collect() };
+    let gpu_rows = present(warm.iter().map(|w| sum_gpu(&w.trace.row_gpu_ms)));
+    json!({
+        "kept_rows": kept,
+        "total_wall_ms": summary(&col(&|w| w.total_ms)),
+        "rows_wall_ms": summary(&col(&|w| w.trace.row_ms.iter().sum())),
+        "rows_gpu_event_ms": summary(&gpu_rows),
+        "capture_wall_ms": summary(&col(&|w| w.trace.capture_ms.iter().sum())),
+        "restore_wall_ms": summary(&col(&|w| w.trace.import_ms)),
+        "mark_overhead_ms": summary(&col(&|w| w.trace.mark_overhead_ms)),
+        "minflt_window": summary(
+            &warm.iter().filter_map(|w| w.minflt.map(|f| f as f64)).collect::<Vec<_>>()
+        ),
+        "residual_ms": summary(&col(&|w| {
+            w.total_ms
+                - w.trace.row_ms.iter().sum::<f64>()
+                - w.trace.capture_ms.iter().sum::<f64>()
+                - w.trace.import_ms
+                - w.trace.mark_overhead_ms
+        })),
+        "capture_synced": "the captures are timed to their completion only with FIFI_MRV_SYNC_CAPTURE=1; otherwise to their enqueue",
+        "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
+        "transfers_per_window": DeviceWindowTransfers::new(shape, slot_bytes, rows, kept).to_json(),
+    })
+}
+
+/// The arms of one cell, in a fixed list that each round rotates.
+fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
+    let mut arms = vec![Arm::Single];
+    if config.rollback.host() {
+        arms.extend([Arm::WindowAll, Arm::WindowFirst]);
+    }
+    if config.rollback.device() {
+        arms.extend([Arm::DeviceAll, Arm::DeviceFirst]);
+        if rows >= 3 {
+            arms.push(Arm::DeviceMid);
+        }
+    }
+    arms
+}
+
 /// Rotates the arm order each round so that no arm always runs first.
-fn arm_order(round: usize) -> [Arm; 3] {
-    let all = [Arm::Single, Arm::WindowAll, Arm::WindowFirst];
-    [all[round % 3], all[(round + 1) % 3], all[(round + 2) % 3]]
+fn arm_order(arms: &[Arm], round: usize) -> Vec<Arm> {
+    (0..arms.len()).map(|i| arms[(round + i) % arms.len()]).collect()
 }
 
 struct Cell<'a> {
+    /// The single-row kernel the context reports; the launch counts must show it.
+    kernel: &'static str,
     text: &'a [u32],
     config: &'a Config,
     started: Instant,
@@ -561,13 +713,33 @@ fn run_cell(
 ) -> Result<Value, EngError> {
     let depth_start = step.tokens();
     let d1_inputs = cell.take(step, rows);
-    let d1_a = full_logits(step, &d1_inputs);
-    let d1_r = restoration(step, &d1_inputs);
-    let d1_pass = d1_a.is_ok() && d1_r.is_ok();
+    // The inline D1 checks run for every rollback in the cell: a window that is not equal to the
+    // one-row steps has no meaningful cost.
+    let mut modes = Vec::new();
+    if cell.config.rollback.host() {
+        modes.push(false);
+    }
+    if cell.config.rollback.device() {
+        modes.push(true);
+    }
+    let mut d1_pass = true;
+    let mut d1_modes = Vec::new();
+    for device in modes {
+        step.use_device_rollback(device)?;
+        let d1_a = full_logits(step, &d1_inputs);
+        let d1_r = restoration(step, &d1_inputs);
+        d1_pass &= d1_a.is_ok() && d1_r.is_ok();
+        d1_modes.push(json!({
+            "rollback": if device { "device" } else { "host" },
+            "full_logits": d1_a.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
+            "state_restoration": d1_r.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
+        }));
+    }
     let d1 = json!({
         "pass": d1_pass,
-        "full_logits": d1_a.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
-        "state_restoration": d1_r.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
+        "full_logits": d1_modes[0]["full_logits"],
+        "state_restoration": d1_modes[0]["state_restoration"],
+        "by_rollback": d1_modes,
     });
     println!("MRV_D1 depth={depth_start} rows={rows} {d1}");
     if !d1_pass {
@@ -578,11 +750,12 @@ fn run_cell(
     drop(exported);
     let mut rounds = Rounds::default();
     let mut completed = 0;
+    let arms = arms_of(cell.config, rows);
     for round in 0..cell.config.rounds {
         if cell.over_deadline() {
             break;
         }
-        for arm in arm_order(round) {
+        for arm in arm_order(&arms, round) {
             let tokens = cell.take(step, rows);
             match arm {
                 Arm::Single => {
@@ -596,8 +769,17 @@ fn run_cell(
                         rounds.single_step_gpu.push(gpu / rows as f64);
                     }
                 }
-                Arm::WindowAll => rounds.all.push(window_arm(step, &tokens, rows)?),
-                Arm::WindowFirst => rounds.first.push(window_arm(step, &tokens, 1)?),
+                Arm::WindowAll => rounds.all.push(window_arm(step, &tokens, rows, false)?),
+                Arm::WindowFirst => rounds.first.push(window_arm(step, &tokens, 1, false)?),
+                Arm::DeviceAll => rounds
+                    .device_all
+                    .push(window_arm(step, &tokens, rows, true)?),
+                Arm::DeviceFirst => rounds
+                    .device_first
+                    .push(window_arm(step, &tokens, 1, true)?),
+                Arm::DeviceMid => rounds
+                    .device_mid
+                    .push(window_arm(step, &tokens, rows / 2, true)?),
             }
         }
         let began = Instant::now();
@@ -608,6 +790,11 @@ fn run_cell(
         rounds.import_standalone.push(ms(began));
         completed += 1;
     }
+    // The execution-path half of the receipt: the selected kernel launched and nothing routed fell
+    // back to the shuffle kernel, for the reference steps and the windows of this cell.
+    let launches = step.kernel_launches();
+    println!("MRV_KERNEL_LAUNCHES depth={depth_start} rows={rows} {}", launches.describe());
+    require_kernel_ran(&launches, cell.kernel).unwrap_or_else(|error| panic!("{error}"));
     Ok(cell_json(
         cell,
         step,
@@ -631,6 +818,7 @@ fn cell_json(
     d1: Value,
     completed: usize,
 ) -> Value {
+    let slot_bytes = step.state_layout().delta.total as u64 / step.state_layout().delta.slots as u64;
     let warm_from = cell.config.warm_from;
     let warm = |v: &[f64]| v[warm_from.min(v.len())..].to_vec();
     let single = median(&warm(&rounds.single_step_wall));
@@ -665,7 +853,11 @@ fn cell_json(
             },
             "window_accept_all": window_json(&rounds.all, warm_from, rows, rows, shape),
             "window_reject_first": window_json(&rounds.first, warm_from, rows, 1, shape),
+            "device_accept_all": device_window_json(&rounds.device_all, warm_from, rows, rows, shape, slot_bytes),
+            "device_reject_first": device_window_json(&rounds.device_first, warm_from, rows, 1, shape, slot_bytes),
+            "device_keep_middle": device_window_json(&rounds.device_mid, warm_from, rows, rows / 2, shape, slot_bytes),
         },
+        "single_row_launches": step.kernel_launches().describe(),
         "standalone_at_this_state": {
             "export_wall_ms": summary(&warm(&rounds.export_standalone)),
             "import_wall_ms": summary(&warm(&rounds.import_standalone)),
@@ -673,6 +865,9 @@ fn cell_json(
         "ratios_measured": {
             "window_accept_all": ratio(&rounds.all),
             "window_reject_first": ratio(&rounds.first),
+            "device_accept_all": ratio(&rounds.device_all),
+            "device_reject_first": ratio(&rounds.device_first),
+            "device_keep_middle": ratio(&rounds.device_mid),
         },
     })
 }
@@ -769,7 +964,18 @@ fn verify_window_cost_record() {
     let baseline_used = loaded.baseline_used;
     let mut memory = Vec::new();
     let mut step =
-        bench_step(&loaded, kv, deepest + CONTEXT_SLACK, capture, config.marks).expect("step");
+        bench_step(
+            &loaded,
+            kv,
+            deepest + CONTEXT_SLACK,
+            capture,
+            config.marks,
+            config.rollback.device().then(|| {
+                config.rows.iter().copied().max().unwrap_or(2).max(2)
+            }),
+        )
+        .expect("step");
+    step.trace_sync_capture = config.sync_capture;
     memory.push(admit(
         &loaded,
         baseline_used,
@@ -777,6 +983,7 @@ fn verify_window_cost_record() {
         "after load, state and arena",
     ));
     let cell = Cell {
+        kernel: loaded.kernel,
         text,
         config: &config,
         started,
@@ -853,8 +1060,23 @@ fn cold_record(cell: &Cell<'_>, step: &mut QwenResidentStep<'static>, prefill_s:
     let one = cell.take(step, 1);
     let single = single_arm(step, &one).expect("cold single step");
     let two = cell.take(step, 2);
-    let window = window_arm(step, &two, 2).expect("cold window");
+    let device = cell.config.rollback == BenchRollback::Device;
+    let window = window_arm(step, &two, 2, device).expect("cold window");
+    // The calibration of the device copy: 200 drained copies of one slot (GPU, outside any window).
+    let copy = if cell.config.rollback.device() {
+        step.use_device_rollback(true).expect("armed");
+        let times = step.device_copy_microbench(200).expect("copy microbenchmark");
+        let slot = step.state_layout().delta.total as f64 / step.state_layout().delta.slots as f64;
+        json!({
+            "slot_bytes": slot,
+            "host_wall_ms_each_drained": summary(&times),
+            "gb_per_s_counting_the_copy_once": median(&times).filter(|m| *m > 0.0).map(|m| slot / 1e9 / (m / 1e3)),
+        })
+    } else {
+        Value::Null
+    };
     json!({
+        "d2d_slot_copy": copy,
         "first_prefill_wall_s": prefill_s,
         "first_single_row_step_ms": single.wall_ms[0],
         "first_window_2_rows_total_ms": window.total_ms,
