@@ -65,6 +65,12 @@ enum Mutant {
     OverlapKeepsValid,
     /// A guard failure other than health leaves the state valid.
     GuardFailureKeepsValid,
+    /// A snapshot is accepted through the recovery gate.
+    SnapshotIgnoresGate,
+    /// A snapshot and a decode step are both accepted through the recovery gate.
+    SnapshotAndStepIgnoreGate,
+    /// An import without a reset is accepted through the recovery gate.
+    ImportIgnoresGate,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -260,15 +266,19 @@ impl TokenStepper for SlotFake {
     const OPERATION: &'static str = "slot fake";
 
     fn feed(&mut self, token: u32) -> Result<()> {
-        self.live()?;
-        self.refuse_while_awaiting(true)?;
+        if self.mutant != Mutant::SnapshotAndStepIgnoreGate {
+            self.live()?;
+            self.refuse_while_awaiting(true)?;
+        }
         self.advance(token);
         Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
-        self.live()?;
-        self.refuse_while_awaiting(true)?;
+        if self.mutant != Mutant::SnapshotAndStepIgnoreGate {
+            self.live()?;
+            self.refuse_while_awaiting(true)?;
+        }
         Ok(self.advance(token))
     }
 
@@ -377,8 +387,13 @@ impl D1Subject for SlotFake {
     type State = SlotState;
 
     fn snapshot(&mut self) -> Result<SlotState> {
-        self.live()?;
-        self.refuse_while_awaiting(false)?;
+        if !matches!(
+            self.mutant,
+            Mutant::SnapshotIgnoresGate | Mutant::SnapshotAndStepIgnoreGate
+        ) {
+            self.live()?;
+            self.refuse_while_awaiting(false)?;
+        }
         Ok(SlotState {
             cells: self.cells[..self.len].to_vec(),
             recurrent: self.recurrent,
@@ -407,8 +422,12 @@ impl D1Subject for SlotFake {
         Ok(())
     }
 
+    fn models_recovery_gate(&self) -> bool {
+        true
+    }
+
     fn import_without_reset(&mut self, state: &SlotState) -> Option<Result<()>> {
-        if self.gate {
+        if self.gate && self.mutant != Mutant::ImportIgnoresGate {
             return Some(Err(refused("reset first")));
         }
         Some(self.restore(state))
@@ -593,9 +612,34 @@ fn a_failed_commit_that_leaves_the_state_valid_is_caught_by_the_failure_check() 
     // The recovery gate is checked after every fault: a failed commit that leaves a usable state is
     // refused there, ahead of the silent-partial-state rule.
     assert!(
-        failure.detail.contains("silent partial state")
-            || failure.detail.contains("after a failed commit"),
+        failure.detail.contains("a decode step was accepted"),
         "{failure}"
+    );
+}
+
+/// The detail of the violation that check F reports for the slot fake with `mutant`.
+fn f_detail(mutant: Mutant) -> String {
+    let mut rig = SlotRig::new(mutant, false);
+    let failure = caught(failure_recovery(&mut rig.fake, VOCAB, &rows(4)), "F");
+    assert!(failure.violation, "{failure}");
+    failure.detail
+}
+
+#[test]
+fn each_gate_assertion_of_check_f_has_a_flawed_slot_fake_that_only_it_reports() {
+    // The step assertion runs first, so a subject that accepts a step and a snapshot is reported
+    // for the step; dropping it would change the report.
+    assert!(
+        f_detail(Mutant::SnapshotAndStepIgnoreGate).contains("a decode step was accepted"),
+        "step"
+    );
+    assert!(
+        f_detail(Mutant::SnapshotIgnoresGate).contains("a snapshot was accepted"),
+        "snapshot"
+    );
+    assert!(
+        f_detail(Mutant::ImportIgnoresGate).contains("an import without a reset was accepted"),
+        "import"
     );
 }
 

@@ -297,6 +297,10 @@ impl D1Subject for QwenResidentStep<'_> {
         self.import_state(state)
     }
 
+    fn models_recovery_gate(&self) -> bool {
+        true
+    }
+
     fn import_without_reset(&mut self, state: &ExportedState) -> Option<Result<(), EngError>> {
         Some(self.import_state(state))
     }

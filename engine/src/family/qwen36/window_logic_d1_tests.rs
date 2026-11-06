@@ -40,6 +40,12 @@ enum Flaw {
     Sound,
     /// `restore` imports without the reset first (mutant: the oracle must fail on the gate).
     RestoreWithoutReset,
+    /// A snapshot is accepted through the gate (and a failed state answers it).
+    SnapshotIgnoresGate,
+    /// A snapshot and a decode step are both accepted through the gate.
+    SnapshotAndStepIgnoreGate,
+    /// An import without a reset is accepted through the gate.
+    ImportIgnoresGate,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,15 +129,19 @@ impl TokenStepper for HostFake {
     const OPERATION: &'static str = "host fake";
 
     fn feed(&mut self, token: u32) -> Result<()> {
-        step_gate(self)?;
-        self.live()?;
+        if self.flaw != Flaw::SnapshotAndStepIgnoreGate {
+            step_gate(self)?;
+            self.live()?;
+        }
         self.advance(token);
         Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
-        step_gate(self)?;
-        self.live()?;
+        if self.flaw != Flaw::SnapshotAndStepIgnoreGate {
+            step_gate(self)?;
+            self.live()?;
+        }
         Ok(self.advance(token))
     }
 
@@ -282,9 +292,18 @@ impl D1Subject for HostFake {
     type State = State;
 
     fn snapshot(&mut self) -> Result<State> {
-        export_gate(self)?;
-        self.live()?;
+        if !matches!(
+            self.flaw,
+            Flaw::SnapshotIgnoresGate | Flaw::SnapshotAndStepIgnoreGate
+        ) {
+            export_gate(self)?;
+            self.live()?;
+        }
         Ok(self.state.clone())
+    }
+
+    fn models_recovery_gate(&self) -> bool {
+        true
     }
 
     fn restore(&mut self, state: &State) -> Result<()> {
@@ -296,6 +315,9 @@ impl D1Subject for HostFake {
     }
 
     fn import_without_reset(&mut self, state: &State) -> Option<Result<()>> {
+        if self.flaw == Flaw::ImportIgnoresGate {
+            return Some(self.overwrite(state));
+        }
         Some(import_state(self, state))
     }
 
@@ -464,4 +486,32 @@ fn an_import_without_a_reset_is_refused_after_a_failed_commit_and_a_reset_recove
     rig.fake.reset().expect("reset");
     rig.fake.restore(&base).expect("restore");
     assert_eq!(rig.fake.state, base);
+}
+
+/// The detail of the violation that check F reports for a subject with `flaw`.
+fn f_detail(flaw: Flaw) -> String {
+    let mut rig = Rig::new(flaw, false);
+    let failure = failure_recovery(&mut rig.fake, VOCAB, &rows(4)).expect_err("the flaw");
+    assert!(failure.violation, "{failure}");
+    failure.detail
+}
+
+#[test]
+fn each_gate_assertion_of_check_f_has_a_flawed_subject_that_only_it_reports() {
+    // The step assertion runs first: a subject that accepts a step and a snapshot is reported for
+    // the step, so dropping the step assertion changes the report.
+    assert!(
+        f_detail(Flaw::SnapshotAndStepIgnoreGate).contains("a decode step was accepted"),
+        "step"
+    );
+    // A subject that refuses a step but answers a snapshot is reported for the snapshot only.
+    assert!(
+        f_detail(Flaw::SnapshotIgnoresGate).contains("a snapshot was accepted"),
+        "snapshot"
+    );
+    // A subject that refuses both but accepts an import without a reset: the import only.
+    assert!(
+        f_detail(Flaw::ImportIgnoresGate).contains("an import without a reset was accepted"),
+        "import"
+    );
 }

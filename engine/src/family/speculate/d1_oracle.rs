@@ -112,10 +112,15 @@ pub(crate) trait D1Subject: WindowModel {
         faults_for(rows)
     }
 
-    /// Imports `state` WITHOUT a reset first, for a subject whose failed commit sets a recovery
-    /// gate that only a reset clears. After a fault such a subject must refuse it. `None` (the
-    /// default) means the subject has no gate; `Some` also makes check F require that a snapshot
-    /// and a step are refused after every fault.
+    /// Whether a failed commit of this subject sets a recovery gate that only a reset clears.
+    /// When it does, check F requires, after every fault, that a step, a snapshot and an import
+    /// without a reset are all refused. The default is no gate.
+    fn models_recovery_gate(&self) -> bool {
+        false
+    }
+
+    /// Imports `state` WITHOUT a reset first. A subject that models the gate must refuse it after
+    /// a fault.
     fn import_without_reset(&mut self, _state: &Self::State) -> Option<Result<(), EngError>> {
         None
     }
@@ -946,14 +951,17 @@ fn require_gated<S: D1Subject>(
             format!("{fault:?}: {what} after a failed commit; only a reset may recover it"),
         )
     };
-    if subject.import_without_reset(base).is_none() {
+    if !subject.models_recovery_gate() {
         return Ok(());
+    }
+    // The order is the order of precedence of the messages: a subject that accepts a step and a
+    // snapshot is reported for the step, so each assertion has a flawed subject that only it
+    // (and not a later or earlier one) can report.
+    if subject.logits(token).is_ok() {
+        return Err(refused("a decode step was accepted"));
     }
     if subject.snapshot().is_ok() {
         return Err(refused("a snapshot was accepted"));
-    }
-    if subject.logits(token).is_ok() {
-        return Err(refused("a decode step was accepted"));
     }
     if matches!(subject.import_without_reset(base), Some(Ok(()))) {
         return Err(refused("an import without a reset was accepted"));
