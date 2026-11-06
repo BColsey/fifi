@@ -53,7 +53,25 @@
 //!   variant's eager and graph outputs must equal the default eager outputs bit for bit on 4
 //!   rows; then graph isolated, graph gated, eager isolated and 48 graph launches back to back,
 //!   the variants taking turns in every trial. `FIFI_EXL3_SINGLE_GATHER`, `FIFI_EXL3_DP4A` and
-//!   `FIFI_EXL3_INDEXED_PAIRS` must be unset: the phase chooses the kernels itself.
+//!   `FIFI_EXL3_INDEXED_PAIRS` must be unset: the phase chooses the kernels itself. Every
+//!   configuration turn prints a `clock_mark` just before and just after its loop of isolated and
+//!   gated graph reps (`variants_trial<t>_<variant>_gated_start` and `_gated_end`), so an external
+//!   sampler can be lined up with the gated reps.
+//!
+//! Three more variables narrow or lengthen a run; unset, each leaves the output as it was (the
+//! variants marks apart). A bad value is refused before any GPU work:
+//! - `FIFI_GRAPH_BENCH_VARIANT_SUSTAIN_MS` (positive integer): the loop of (isolated, gated) graph
+//!   rep pairs of a variants turn runs at least 40 times and then until its own wall time, counted
+//!   from just after the start mark, reaches that many milliseconds. Every rep is kept. The eager
+//!   and the 48-block token reps keep their counts and stay outside the marked span.
+//! - `FIFI_GRAPH_BENCH_VARIANT_ONLY` (`base`, `dp4a`, `pairs20` or `both`): the variants phase
+//!   times only that variant. The default eager outputs are still computed first and the variant's
+//!   eager and graph outputs are still checked against them bit for bit; the equivalence line then
+//!   reports `variants:1`.
+//! - `FIFI_GRAPH_BENCH_TRACE_CASES` (comma list): the trace phase runs only the named cases, by the
+//!   case name without its `_device` or `_wall` suffix (`graph_resident`, `eager_resident`,
+//!   `graph_device_<trace>`, `graph_host_<trace>`, `eager_device_<trace>`, `eager_host_<trace>`).
+//!   Unknown names, an empty list and duplicates are refused.
 //!
 //! `FIFI_EXL3_DP4A=1` and `FIFI_EXL3_INDEXED_PAIRS=20` apply to every other phase as they would to
 //! a served engine, so their miss and trace costs can be set against a run without them; the
@@ -68,7 +86,11 @@
 //! The arms run in a fixed order (eager first in graph_block, graph first in graph_miss_layer and
 //! graph_trace), so slow clock or thermal drift falls on one side; the two runs of a window show it.
 
-use std::{ops::Range, time::Instant};
+use std::{
+    ffi::OsStr,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use super::{
     exl3_cuda_tests::{Router, input, upload},
@@ -1134,9 +1156,10 @@ const VARIANT_TRIALS: usize = 5;
 const VARIANT_REPS: usize = 40;
 const VARIANT_TOKENS: usize = 6;
 
-/// Captures the block under every variant and checks that the eager and graph outputs of each
-/// equal the default eager outputs bit for bit on `VARIANT_ROWS` rows (NaN-poisoned runs).
-fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
+/// Captures the block under the `members` of `VARIANTS` and checks that the eager and graph
+/// outputs of each equal the default eager outputs bit for bit on `VARIANT_ROWS` rows
+/// (NaN-poisoned runs). The default outputs are computed whichever members are chosen.
+fn variant_graphs(rig: &mut Rig<'_>, members: &[usize]) -> Res<Vec<GraphExec<'static>>> {
     let n_expert = rig.composed.dims.n_expert;
     rig.ctx.set_single_row_default(SERVED);
     rig.ctx.set_indexed_options(Some(IndexedOptions::OFF));
@@ -1145,8 +1168,9 @@ fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
         rig.set_row(seed)?;
         want.push(rig.run_once(|r| r.full(Exec::Eager))?);
     }
-    let (mut graphs, mut agree) = (Vec::with_capacity(VARIANTS.len()), Agreement::default());
-    for (name, options) in VARIANTS {
+    let (mut graphs, mut agree) = (Vec::with_capacity(members.len()), Agreement::default());
+    for &member in members {
+        let (name, options) = VARIANTS[member];
         rig.ctx.set_indexed_options(Some(options));
         // The variant's kernels load on their first eager launch; a capture refuses a first launch.
         rig.full(Exec::Eager)?;
@@ -1173,7 +1197,7 @@ fn variant_graphs(rig: &mut Rig<'_>) -> Res<Vec<GraphExec<'static>>> {
     println!(
         "RESBENCH {{\"phase\":\"graph_variants\",\"case\":\"equivalence\",\"rows\":{VARIANT_ROWS},\
          \"variants\":{},\"against_base\":{}}}",
-        VARIANTS.len(),
+        members.len(),
         agree.json()
     );
     Ok(graphs)
@@ -1188,10 +1212,44 @@ fn token_with(rig: &mut Rig<'_>, queue: &dyn Fn(&Rig<'_>) -> Res<()>) -> Res<f64
     rig.mark_us(START, END)
 }
 
-/// Every variant's block: graph isolated and gated, eager isolated (under the variant's setting)
-/// and 48 graph launches back to back. The variants take turns inside every trial, in an order
-/// that rotates, and the first trial is a warm-up, so slow clock drift spreads over all of them.
-fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
+/// The graph reps of one variants turn: pairs of an isolated and a gated rep, at least
+/// `VARIANT_REPS` of them and, with `sustain_ms`, until the loop has run that long. Marks print
+/// around the loop; the clock for `sustain_ms` starts just after the start mark.
+struct GatedLoop {
+    isolated: Vec<f64>,
+    gated: Vec<f64>,
+    late: usize,
+}
+
+fn gated_loop(
+    rig: &mut Rig<'_>,
+    tag: &str,
+    sustain_ms: Option<u64>,
+    replay: &dyn Fn(&Rig<'_>) -> Res<()>,
+) -> Res<GatedLoop> {
+    let mut out = GatedLoop {
+        isolated: Vec::new(),
+        gated: Vec::new(),
+        late: 0,
+    };
+    clock_mark(&format!("{tag}_gated_start"));
+    let began = Instant::now();
+    let sustain = sustain_ms.map(Duration::from_millis);
+    while out.gated.len() < VARIANT_REPS || sustain.is_some_and(|min| began.elapsed() < min) {
+        out.isolated.push(rep_with(rig, false, replay)?.device);
+        let gated = rep_with(rig, true, replay)?;
+        out.gated.push(gated.device);
+        out.late += usize::from(gated.late);
+    }
+    clock_mark(&format!("{tag}_gated_end"));
+    Ok(out)
+}
+
+/// Every selected variant's block: graph isolated and gated, eager isolated (under the variant's
+/// setting) and 48 graph launches back to back. The variants take turns inside every trial, in an
+/// order that rotates, and the first trial is a warm-up, so slow clock drift spreads over all of
+/// them.
+fn variants_phase(rig: &mut Rig<'_>, knobs: &Knobs) -> Res<()> {
     // The variable is read once per process and wins over every default, so all the variants
     // would run one kernel under their own names.
     for var in [SINGLE_GATHER_VAR, DP4A_VAR, INDEXED_PAIRS_VAR] {
@@ -1199,33 +1257,34 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
             return Err(fail(format!("the variants phase needs {var} unset")));
         }
     }
-    let graphs = variant_graphs(rig)?;
+    let members = knobs.variant_members();
+    let graphs = variant_graphs(rig, &members)?;
     let names = [
         "graph_isolated",
         "graph_gated",
         "eager_isolated",
         "graph_token48",
     ];
-    let mut samples: Vec<[Vec<f64>; 4]> = VARIANTS.iter().map(|_| Default::default()).collect();
+    let mut samples: Vec<[Vec<f64>; 4]> = members.iter().map(|_| Default::default()).collect();
     // Gated reps per variant where the host was still queueing when the gate opened.
-    let mut late = [0usize; VARIANTS.len()];
+    let mut late = vec![0usize; members.len()];
     for trial in 0..=VARIANT_TRIALS {
         clock_mark(&format!("variants_trial{trial}"));
         // The order rotates from trial to trial, so no variant always follows the same one.
-        for turn in 0..VARIANTS.len() {
-            let v = (turn + trial) % VARIANTS.len();
-            let ((_, options), graph) = (&VARIANTS[v], &graphs[v]);
+        for turn in 0..members.len() {
+            let m = (turn + trial) % members.len();
+            let (name, options) = VARIANTS[members[m]];
+            let graph = &graphs[m];
             let replay = |r: &Rig<'_>| graph.launch(&r.compute);
+            let tag = format!("variants_trial{trial}_{name}");
+            let pairs = gated_loop(rig, &tag, knobs.sustain_ms, &replay)?;
             let mut got: [Vec<f64>; 4] = Default::default();
-            for _ in 0..VARIANT_REPS {
-                got[0].push(rep_with(rig, false, &replay)?.device);
-                let gated = rep_with(rig, true, &replay)?;
-                got[1].push(gated.device);
-                if trial > 0 {
-                    late[v] += usize::from(gated.late);
-                }
+            got[0] = pairs.isolated;
+            got[1] = pairs.gated;
+            if trial > 0 {
+                late[m] += pairs.late;
             }
-            rig.ctx.set_indexed_options(Some(*options));
+            rig.ctx.set_indexed_options(Some(options));
             for _ in 0..VARIANT_REPS {
                 got[2].push(block_rep(rig, Exec::Eager, false)?.device);
             }
@@ -1235,7 +1294,7 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
                 })?);
             }
             if trial > 0 {
-                for (all, new) in samples[v].iter_mut().zip(got) {
+                for (all, new) in samples[m].iter_mut().zip(got) {
                     all.extend(new);
                 }
             }
@@ -1243,7 +1302,8 @@ fn variants_phase(rig: &mut Rig<'_>) -> Res<()> {
     }
     rig.ctx.set_single_row_default(SingleRow::Legacy);
     rig.ctx.set_indexed_options(None);
-    for (((name, _), got), late) in VARIANTS.iter().zip(&samples).zip(late) {
+    for ((&member, got), late) in members.iter().zip(&samples).zip(late) {
+        let name = VARIANTS[member].0;
         for (what, values) in names.iter().zip(got) {
             let extra = if *what == "graph_gated" {
                 format!(",\"late\":{late}")
@@ -1356,22 +1416,67 @@ fn read_traces(top_k: usize) -> Res<Traces> {
     Ok(traces)
 }
 
-fn trace_phase(rig: &mut Rig<'_>, traces: &Traces) -> Res<()> {
-    let tokens = traces.first().map_or(0, |(_, t)| t.len());
-    let resident = vec![vec![0usize; LAYERS]; tokens];
-    let runs: [(Exec, &[Sched]); 2] = [
-        (Exec::Graph, &[Sched::Host, Sched::Device]),
-        (Exec::Eager, &[Sched::Host, Sched::Device]),
-    ];
-    for (exec, scheds) in runs {
-        let tag = format!("{}_resident", exec.tag());
-        token_run(rig, (exec, Sched::Device), &tag, &resident)?;
-        for (name, tokens) in traces {
-            for &sched in scheds {
-                let tag = format!("{}_{}_{name}", exec.tag(), sched.tag());
-                token_run(rig, (exec, sched), &tag, tokens)?;
+/// One case of the trace phase; its `tag` is the case name without the `_device` / `_wall` suffix.
+struct TraceCase {
+    exec: Exec,
+    sched: Sched,
+    /// Index into the traces; `None` for the all-resident run.
+    trace: Option<usize>,
+    tag: String,
+}
+
+/// Every case of the trace phase, in run order.
+fn trace_cases(traces: &Traces) -> Vec<TraceCase> {
+    let mut cases = Vec::new();
+    for exec in [Exec::Graph, Exec::Eager] {
+        cases.push(TraceCase {
+            exec,
+            sched: Sched::Device,
+            trace: None,
+            tag: format!("{}_resident", exec.tag()),
+        });
+        for (i, (name, _)) in traces.iter().enumerate() {
+            for sched in [Sched::Host, Sched::Device] {
+                cases.push(TraceCase {
+                    exec,
+                    sched,
+                    trace: Some(i),
+                    tag: format!("{}_{}_{name}", exec.tag(), sched.tag()),
+                });
             }
         }
+    }
+    cases
+}
+
+/// Refuses a `FIFI_GRAPH_BENCH_TRACE_CASES` name that no case of `traces` carries.
+fn check_trace_selection(selected: &[String], traces: &Traces) -> Res<()> {
+    let cases = trace_cases(traces);
+    match selected
+        .iter()
+        .find(|s| !cases.iter().any(|c| &c.tag == *s))
+    {
+        Some(unknown) => Err(fail(format!(
+            "{TRACE_CASES_VAR}: no trace case {unknown} (cases: {})",
+            cases
+                .iter()
+                .map(|c| c.tag.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn trace_phase(rig: &mut Rig<'_>, traces: &Traces, selected: Option<&[String]>) -> Res<()> {
+    let tokens = traces.first().map_or(0, |(_, t)| t.len());
+    let resident = vec![vec![0usize; LAYERS]; tokens];
+    for case in trace_cases(traces) {
+        if selected.is_some_and(|names| !names.contains(&case.tag)) {
+            continue;
+        }
+        let counts = case.trace.map_or(&resident, |i| &traces[i].1);
+        token_run(rig, (case.exec, case.sched), &case.tag, counts)?;
     }
     Ok(())
 }
@@ -1415,6 +1520,94 @@ fn token_run(
     Ok(())
 }
 
+// ------------------------------------------------------------------ run-shaping variables
+
+const SUSTAIN_VAR: &str = "FIFI_GRAPH_BENCH_VARIANT_SUSTAIN_MS";
+const ONLY_VAR: &str = "FIFI_GRAPH_BENCH_VARIANT_ONLY";
+const TRACE_CASES_VAR: &str = "FIFI_GRAPH_BENCH_TRACE_CASES";
+
+/// The settings of the variables above, parsed before any GPU work.
+struct Knobs {
+    /// Minimum wall time of a variants turn's graph loop, in milliseconds.
+    sustain_ms: Option<u64>,
+    /// Index into `VARIANTS` of the only variant to time.
+    only: Option<usize>,
+    /// Names of the trace cases to run.
+    trace_cases: Option<Vec<String>>,
+}
+
+impl Knobs {
+    fn from_env() -> Res<Self> {
+        Ok(Self {
+            sustain_ms: parse_sustain_ms(std::env::var_os(SUSTAIN_VAR).as_deref())?,
+            only: parse_variant_only(std::env::var_os(ONLY_VAR).as_deref())?,
+            trace_cases: parse_trace_cases(std::env::var_os(TRACE_CASES_VAR).as_deref())?,
+        })
+    }
+
+    /// The indexes into `VARIANTS` of the variants to time, in table order.
+    fn variant_members(&self) -> Vec<usize> {
+        self.only
+            .map_or_else(|| (0..VARIANTS.len()).collect(), |only| vec![only])
+    }
+}
+
+/// `value` as text; a value that is not UTF-8 is refused under `var`.
+fn utf8<'a>(var: &str, value: &'a OsStr) -> Res<&'a str> {
+    value
+        .to_str()
+        .ok_or_else(|| fail(format!("{var} is not UTF-8")))
+}
+
+/// `FIFI_GRAPH_BENCH_VARIANT_SUSTAIN_MS`: a positive integer written in digits.
+fn parse_sustain_ms(value: Option<&OsStr>) -> Res<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = utf8(SUSTAIN_VAR, value)?;
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u64>() {
+        Ok(ms) if digits && ms > 0 => Ok(Some(ms)),
+        _ => Err(fail(format!(
+            "{SUSTAIN_VAR} must be a positive integer of milliseconds, not {text:?}"
+        ))),
+    }
+}
+
+/// `FIFI_GRAPH_BENCH_VARIANT_ONLY`: the index in `VARIANTS` of the named variant.
+fn parse_variant_only(value: Option<&OsStr>) -> Res<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = utf8(ONLY_VAR, value)?;
+    match VARIANTS.iter().position(|(name, _)| *name == text) {
+        Some(index) => Ok(Some(index)),
+        None => Err(fail(format!(
+            "{ONLY_VAR} must be one of {}, not {text:?}",
+            VARIANTS.map(|(name, _)| name).join(", ")
+        ))),
+    }
+}
+
+/// `FIFI_GRAPH_BENCH_TRACE_CASES`: a comma list of distinct, non-empty case names. Whether each
+/// name is a case of the loaded traces is checked by `check_trace_selection`.
+fn parse_trace_cases(value: Option<&OsStr>) -> Res<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in utf8(TRACE_CASES_VAR, value)?.split(',') {
+        if name.is_empty() {
+            return Err(fail(format!("{TRACE_CASES_VAR} has an empty case name")));
+        }
+        if names.iter().any(|seen| seen == name) {
+            return Err(fail(format!("{TRACE_CASES_VAR} names {name} twice")));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(Some(names))
+}
+
 // ------------------------------------------------------------------ the test
 
 #[test]
@@ -1424,6 +1617,7 @@ fn flash_next_moe_graph_ab_microbench() {
 }
 
 fn run() -> Res<()> {
+    let knobs = Knobs::from_env()?;
     let phases = std::env::var("FIFI_GRAPH_BENCH_PHASES")
         .unwrap_or_else(|_| "check,block,miss,trace".to_owned());
     let want = |phase: &str| phases.split(',').any(|p| p == phase);
@@ -1434,7 +1628,11 @@ fn run() -> Res<()> {
         ));
     }
     let traces = if want("trace") {
-        read_traces(moe.top_k)?
+        let traces = read_traces(moe.top_k)?;
+        if let Some(selected) = &knobs.trace_cases {
+            check_trace_selection(selected, &traces)?;
+        }
+        traces
     } else {
         Vec::new()
     };
@@ -1478,13 +1676,136 @@ fn run() -> Res<()> {
         block_phase(&mut rig)?;
     }
     if want("variants") {
-        variants_phase(&mut rig)?;
+        variants_phase(&mut rig, &knobs)?;
     }
     if want("miss") {
         miss_phase(&mut rig)?;
     }
     if want("trace") {
-        trace_phase(&mut rig, &traces)?;
+        trace_phase(&mut rig, &traces, knobs.trace_cases.as_deref())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(text: &str) -> Option<&OsStr> {
+        Some(OsStr::new(text))
+    }
+
+    #[test]
+    fn sustain_ms_unset_and_positive_integers() {
+        assert_eq!(parse_sustain_ms(None).unwrap(), None);
+        assert_eq!(parse_sustain_ms(os("1")).unwrap(), Some(1));
+        assert_eq!(parse_sustain_ms(os("2500")).unwrap(), Some(2500));
+    }
+
+    #[test]
+    fn sustain_ms_refuses_everything_else() {
+        for bad in [
+            "",
+            "0",
+            "-5",
+            "+5",
+            "1.5",
+            "ten",
+            " 5",
+            "5 ",
+            "5ms",
+            "99999999999999999999",
+        ] {
+            assert!(parse_sustain_ms(os(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_values_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = OsStr::from_bytes(&[0x31, 0xff]);
+        assert!(parse_sustain_ms(Some(bad)).is_err());
+        assert!(parse_variant_only(Some(bad)).is_err());
+        assert!(parse_trace_cases(Some(bad)).is_err());
+    }
+
+    #[test]
+    fn variant_only_names_and_unset() {
+        assert_eq!(parse_variant_only(None).unwrap(), None);
+        for (index, (name, _)) in VARIANTS.iter().enumerate() {
+            assert_eq!(parse_variant_only(os(name)).unwrap(), Some(index));
+        }
+        assert_eq!(
+            VARIANTS.map(|(name, _)| name),
+            ["base", "dp4a", "pairs20", "both"]
+        );
+    }
+
+    #[test]
+    fn variant_only_refuses_unknown_names() {
+        for bad in ["", "BASE", "pairs", "dp4a,both", " base", "wide1"] {
+            assert!(parse_variant_only(os(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn variant_members_follow_the_selection() {
+        let all = Knobs {
+            sustain_ms: None,
+            only: None,
+            trace_cases: None,
+        };
+        assert_eq!(all.variant_members(), [0, 1, 2, 3]);
+        let one = Knobs {
+            only: Some(2),
+            ..all
+        };
+        assert_eq!(one.variant_members(), [2]);
+    }
+
+    #[test]
+    fn trace_cases_unset_and_lists() {
+        assert_eq!(parse_trace_cases(None).unwrap(), None);
+        assert_eq!(
+            parse_trace_cases(os("graph_resident")).unwrap(),
+            Some(vec!["graph_resident".to_owned()])
+        );
+        assert_eq!(
+            parse_trace_cases(os("graph_device_184,graph_device_143")).unwrap(),
+            Some(vec![
+                "graph_device_184".to_owned(),
+                "graph_device_143".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn trace_cases_refuse_empty_and_duplicates() {
+        for bad in ["", ",", "a,", ",a", "a,,b", "a,b,a", "a,a"] {
+            assert!(parse_trace_cases(os(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn trace_selection_is_checked_against_the_cases() {
+        let traces: Traces = vec![("184".to_owned(), Vec::new())];
+        let tags: Vec<String> = trace_cases(&traces).into_iter().map(|c| c.tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "graph_resident",
+                "graph_host_184",
+                "graph_device_184",
+                "eager_resident",
+                "eager_host_184",
+                "eager_device_184",
+            ]
+        );
+        let ok = ["graph_resident".to_owned(), "eager_device_184".to_owned()];
+        assert!(check_trace_selection(&ok, &traces).is_ok());
+        for bad in ["graph_device_143", "graph_resident_device", "184"] {
+            assert!(check_trace_selection(&[bad.to_owned()], &traces).is_err());
+        }
+    }
 }
