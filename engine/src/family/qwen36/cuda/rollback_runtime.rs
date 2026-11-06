@@ -104,28 +104,6 @@ impl QwenResidentStep<'_> {
         slots.mark_window_complete()
     }
 
-    /// Refuses a decode step or an export through a state whose window awaits its verdict: it
-    /// would continue from the speculative rows. A step (`poison` true) also poisons the state and
-    /// drops the window, since the lineage is then lost; an export only refuses.
-    pub(crate) fn refuse_while_window_awaits(&mut self, poison: bool) -> Result<(), EngError> {
-        let awaiting = self
-            .rollback
-            .as_ref()
-            .is_some_and(RollbackSlots::awaiting_verdict);
-        if !awaiting {
-            return Ok(());
-        }
-        if poison {
-            self.rollback_discard();
-            self.state.poison();
-        }
-        Err(EngError::BadRequest(
-            "verify window: a window waits for its verdict; a step or an export through the state \
-             would continue from its speculative rows (reset or import first)"
-                .into(),
-        ))
-    }
-
     /// Copies the state after row `row` into its slot.
     pub(crate) fn rollback_capture(&mut self, row: usize) -> Result<(), EngError> {
         let Self {

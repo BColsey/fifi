@@ -77,6 +77,7 @@ use crate::{
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
+    family::qwen36::window_logic,
     family::session::PrefixSlot,
     family::speculate::{
         config::SpecConfig,
@@ -1167,6 +1168,8 @@ impl<'a> QwenResidentStep<'a> {
         use super::prefill_driver::{check_chunk_start, chunk_ids};
         use super::prefill_plan::ChunkSlot;
 
+        // A chunk advances the live state: refused through a gated state or an awaiting window.
+        self.state_usable()?;
         #[cfg(test)]
         let kernel_class = self.chunk_kernel_class;
         let Self {
@@ -1315,13 +1318,13 @@ impl<'a> QwenResidentStep<'a> {
     /// Zeroes the session state (see `ResidentState::reset`) and leaves it `Valid`; only a device
     /// write that failed in the middle of the reset leaves it `Poisoned`.
     pub(crate) fn reset_state(&mut self) -> Result<(), EngError> {
-        self.complete_prefix_save()?;
-        self.window = None;
-        self.rollback_discard();
+        // Exempt from `state_usable`: the one recovery of a failed commit must not be refused by
+        // the state it recovers.
+        window_logic::reset_prologue(self)?;
         self.state.reset(&self.stream)?;
         // A reset is the one recovery of a failed window commit: the gate opens only when the
         // state really was zeroed.
-        self.needs_reset = false;
+        window_logic::reset_epilogue(self);
         // R3: the position restarts at zero; the sketch-valid prefix follows (the
         // re-appends rewrite every consumed cell, but the binding stays honest).
         if let Some(sp) = self.res.sparse.as_ref() {
@@ -1343,29 +1346,18 @@ impl<'a> QwenResidentStep<'a> {
 
     /// The committed state as a host value, for the checkpoint store.
     pub(crate) fn export_state(&self) -> Result<ExportedState, EngError> {
-        if self
-            .rollback
-            .as_ref()
-            .is_some_and(|slots| slots.awaiting_verdict())
-        {
-            return Err(EngError::BadRequest(
-                "verify window: a window waits for its verdict; an export now would copy its speculative rows"
-                    .into(),
-            ));
-        }
+        window_logic::export_gate(self)?;
         self.state.export_state(&self.stream)
     }
 
+    /// Replaces the committed state with `exported`: every restore goes through here. The order
+    /// and the refusals live in `window_logic::import_state`.
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
-        // A window that is still open describes a state this import replaces. The host
-        // `commit_window` has taken its window before it gets here, so for it this changes
-        // nothing; for a prefix restore the window is dead. It precedes the `complete_prefix_save`
-        // below so that a failing import never leaves a window over a state it did not restore;
-        // `reset_state` closes it after its own `complete_prefix_save` (same effect, the caller
-        // resets after any error).
-        self.window = None;
-        self.rollback_discard();
-        self.complete_prefix_save()?;
+        window_logic::import_state(self, exported)
+    }
+
+    /// The device writes of an import (see `window_gate`).
+    pub(super) fn overwrite_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
         self.state.import_state(&self.stream, exported)?;
         // R3: the checkpoint restored the KV planes and the position, but NOT the
         // sparse sketch (it belongs to this session's SparseExec): the sketch-valid
@@ -1517,10 +1509,9 @@ impl<'a> QwenResidentStep<'a> {
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
         check_token_id(token, self.widths.verdict)?;
-        // A window that waits for its verdict leaves the state ahead of the lineage: a decode step
-        // through it would continue from the speculative rows. Inert unless the device rollback
-        // holds an open window.
-        self.refuse_while_window_awaits(true)?;
+        // A window that waits for its verdict leaves the state ahead of the lineage, and a failed
+        // commit leaves the recovery gate set: a decode step through either is refused.
+        window_logic::step_gate(self)?;
         if self.tiered_mode && self.tiered.is_none() {
             return Err(EngError::BadRequest(
                 "step: a tiered step needs attach_tiered before its first token".to_owned(),

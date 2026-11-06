@@ -97,8 +97,9 @@ pub(crate) trait WindowHost {
     fn run_row(&mut self, token: u32) -> Result<(u32, Self::Row), EngError>;
     /// Feeds a kept row again, without logits.
     fn replay_row(&mut self, token: u32) -> Result<(), EngError>;
-    /// Replaces the committed state with `saved`.
-    fn import(&mut self, saved: &Self::Saved) -> Result<(), EngError>;
+    /// The device writes of an import: the state replaced by `saved`, the sparse sketch rewound,
+    /// the pinned pool invalidated. Everything that can be refused ran before it.
+    fn overwrite(&mut self, saved: &Self::Saved) -> Result<(), EngError>;
     /// Refuses a device window on a step that holds no slots.
     fn require_armed(&mut self) -> Result<(), EngError>;
     /// Finishes a pending pinned-prefix save.
@@ -113,6 +114,8 @@ pub(crate) trait WindowHost {
     fn needs_reset(&self) -> bool;
     /// Sets the recovery gate.
     fn set_needs_reset(&mut self);
+    /// Clears the recovery gate. Only a completed reset does.
+    fn clear_needs_reset(&mut self);
     /// Poisons the state (the state then refuses every step and snapshot).
     fn poison(&mut self);
     /// Drops a pending pinned-prefix save without finishing it.
@@ -195,6 +198,75 @@ pub(crate) fn state_usable<H: WindowHost>(host: &H) -> Result<(), EngError> {
         ));
     }
     Ok(())
+}
+
+/// `import_state` of the step: replaces the committed state with `saved`. Every restore goes
+/// through it, the window commit included. It refuses while the recovery gate is set, closes any
+/// open window (the import replaces the state it describes; a stale snapshot of a stale window is
+/// never imported), finishes a pending pinned save, runs the two refusals that precede every
+/// device write, then overwrites.
+pub(crate) fn import_state<H: WindowHost>(host: &mut H, saved: &H::Saved) -> Result<(), EngError> {
+    restore_gate(host)?;
+    host.commit_fault(CommitPoint::PrefixSave)
+        .and_then(|()| host.complete_prefix_save())?;
+    host.commit_fault(CommitPoint::CheckImport)
+        .and_then(|()| host.check_import(saved))?;
+    host.commit_fault(CommitPoint::ResidentKv)
+        .and_then(|()| host.resident_kv())?;
+    host.commit_fault(CommitPoint::ImportDevice)
+        .and_then(|()| host.overwrite(saved))
+}
+
+/// The gate of a decode step (`run_token`): refused while the recovery gate is set, and refused
+/// through a window that awaits its verdict, which would continue from its speculative rows. A step
+/// through such a window also fails the state closed: the lineage is then lost.
+pub(crate) fn step_gate<H: WindowHost>(host: &mut H) -> Result<(), EngError> {
+    if let Err(error) = state_usable(host) {
+        if !host.needs_reset() {
+            fail_window(host);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The gate of an export: the same refusal as a step, with no change to the state.
+pub(crate) fn export_gate<H: WindowHost>(host: &H) -> Result<(), EngError> {
+    state_usable(host)
+}
+
+/// The entry of every restoring wrapper (`import_state`, the pinned-prefix restore, and the
+/// `PrefixState` restore through `import_state`): refused with "reset first" while the recovery
+/// gate is set; otherwise any open window is closed, before the first fallible call, because the
+/// restore replaces the state the window describes.
+pub(crate) fn restore_gate<H: WindowHost>(host: &mut H) -> Result<(), EngError> {
+    if host.needs_reset() {
+        return Err(reset_first(
+            "a restore through a failed state is refused (reset first)",
+        ));
+    }
+    host.close_window();
+    Ok(())
+}
+
+/// The first half of `reset_state`, which is EXEMPT from `state_usable`: when the gate is set or a
+/// window awaits its verdict, the pending prefix save is dropped unfinished (and the pool
+/// invalidated) instead of finished, so the one recovery cannot be wedged by its own check. The
+/// window is closed either way.
+pub(crate) fn reset_prologue<H: WindowHost>(host: &mut H) -> Result<(), EngError> {
+    if state_usable(host).is_ok() {
+        host.complete_prefix_save()?;
+    } else {
+        host.drop_pending_prefix();
+        host.invalidate_pool();
+    }
+    host.close_window();
+    Ok(())
+}
+
+/// The second half of `reset_state`, after the state was zeroed: the gate opens.
+pub(crate) fn reset_epilogue<H: WindowHost>(host: &mut H) {
+    host.clear_needs_reset();
 }
 
 /// What a failure of the rows of a window leaves. A failure before the first row ran (a refusal
@@ -323,29 +395,9 @@ pub(crate) fn commit_window<H: WindowHost>(host: &mut H, commit: &Commit) -> Res
         return Ok(());
     }
     host.trace_mark(Mark::CommitStart);
-    // The three refusals before `begin_import`, then the import.
-    if let Err(error) = host
-        .commit_fault(CommitPoint::PrefixSave)
-        .and_then(|()| host.complete_prefix_save())
-    {
-        return Err(failed(host, error));
-    }
-    if let Err(error) = host
-        .commit_fault(CommitPoint::CheckImport)
-        .and_then(|()| host.check_import(&saved))
-    {
-        return Err(failed(host, error));
-    }
-    if let Err(error) = host
-        .commit_fault(CommitPoint::ResidentKv)
-        .and_then(|()| host.resident_kv())
-    {
-        return Err(failed(host, error));
-    }
-    if let Err(error) = host
-        .commit_fault(CommitPoint::ImportDevice)
-        .and_then(|()| host.import(&saved))
-    {
+    // The restore, run through the same entry point as every other import: the gate, the
+    // pending save, the two refusals before `begin_import`, then the overwrite.
+    if let Err(error) = import_state(host, &saved) {
         return Err(failed(host, error));
     }
     host.trace_mark(Mark::Imported);

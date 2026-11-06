@@ -121,7 +121,7 @@ impl WindowHost for Fake {
         Ok(())
     }
 
-    fn import(&mut self, saved: &usize) -> Result<(), EngError> {
+    fn overwrite(&mut self, saved: &usize) -> Result<(), EngError> {
         self.step("import")?;
         self.tokens = *saved;
         Ok(())
@@ -141,6 +141,11 @@ impl WindowHost for Fake {
 
     fn needs_reset(&self) -> bool {
         self.gate
+    }
+
+    fn clear_needs_reset(&mut self) {
+        self.note("clear_needs_reset");
+        self.gate = false;
     }
 
     fn set_needs_reset(&mut self) {
@@ -299,6 +304,7 @@ fn pin_host_window_that_keeps_some_rows() {
         [
             "take_window",
             "CommitStart",
+            "close_window",
             "complete_prefix_save",
             "check_import",
             "resident_kv",
@@ -645,4 +651,173 @@ fn a_row_that_poisons_the_state_without_moving_it_still_sets_the_gate() {
     host.fail_nth_row = Some(0);
     run_window(&mut host, &[1, 2]).expect_err("row 0 failed and poisoned");
     assert!(host.gate && host.poisoned);
+}
+
+// Q2, the consumers of the live state and the restoring entries.
+
+#[test]
+fn state_usable_refuses_the_gate_alone_and_an_awaiting_window_alone() {
+    let mut host = Fake::new(10, false);
+    state_usable(&host).expect("a fresh state is usable");
+    host.gate = true;
+    assert!(state_usable(&host).is_err(), "the gate alone");
+    host.gate = false;
+    run_window(&mut host, &[1, 2]).expect("run");
+    assert!(state_usable(&host).is_err(), "an awaiting window alone");
+    commit_window(&mut host, &commit(10, 2, 2)).expect("commit");
+    state_usable(&host).expect("usable again after the verdict");
+}
+
+#[test]
+fn a_step_through_the_gate_is_refused_and_through_an_awaiting_window_fails_closed() {
+    let mut host = Fake::new(10, false);
+    step_gate(&mut host).expect("a fresh state");
+    host.gate = true;
+    step_gate(&mut host).expect_err("the gate");
+    assert!(!host.called("poison"), "the gate needs no second poison");
+
+    let mut host = Fake::new(10, false);
+    host.pending = true;
+    run_window(&mut host, &[1, 2]).expect("run");
+    step_gate(&mut host).expect_err("an awaiting window");
+    assert_failed_closed(&host, "a step through an awaiting window");
+}
+
+#[test]
+fn an_export_through_the_gate_or_an_awaiting_window_is_refused_without_a_change() {
+    let mut host = Fake::new(10, false);
+    export_gate(&host).expect("a fresh state");
+    host.gate = true;
+    export_gate(&host).expect_err("the gate");
+    let mut host = Fake::new(10, false);
+    run_window(&mut host, &[1, 2]).expect("run");
+    export_gate(&host).expect_err("an awaiting window");
+    assert!(
+        host.window.is_some() && !host.poisoned,
+        "an export only refuses"
+    );
+}
+
+#[test]
+fn every_restoring_entry_closes_an_open_window_and_is_refused_by_the_gate() {
+    // The wrappers of the table in the specification all enter through `restore_gate` (the
+    // pinned-prefix restore and the `PrefixState` restore) or `import_state` (which calls it).
+    type Entry = fn(&mut Fake) -> Result<(), EngError>;
+    let entries: [(&str, Entry); 2] = [
+        ("restore_gate", restore_gate::<Fake>),
+        ("import_state", |host| import_state(host, &7)),
+    ];
+    for (name, entry) in entries {
+        let mut host = Fake::new(10, false);
+        run_window(&mut host, &[1, 2]).expect("run");
+        entry(&mut host).expect(name);
+        assert!(host.window.is_none(), "{name}: the window must be closed");
+
+        let mut host = Fake::new(10, false);
+        run_window(&mut host, &[1, 2]).expect("run");
+        host.gate = true;
+        host.log.clear();
+        entry(&mut host).expect_err(name);
+        assert!(
+            !host.called("close_window") && !host.called("import"),
+            "{name}"
+        );
+        assert!(
+            host.window.is_some(),
+            "{name}: a refused restore changes nothing"
+        );
+    }
+}
+
+#[test]
+fn the_window_is_closed_before_the_first_fallible_call_of_a_restore() {
+    // A restore that fails at its first fallible call still closed the window.
+    let mut host = Fake::new(10, false);
+    run_window(&mut host, &[1, 2]).expect("run");
+    host.fail = Some("complete_prefix_save");
+    import_state(&mut host, &7).expect_err("the pending save fails");
+    assert!(host.window.is_none(), "closed before the pending save ran");
+    let closed = host.log.iter().position(|call| call == "close_window");
+    let saved = host
+        .log
+        .iter()
+        .position(|call| call == "complete_prefix_save");
+    assert!(
+        closed < saved,
+        "close_window precedes complete_prefix_save: {:?}",
+        host.log
+    );
+}
+
+#[test]
+fn an_import_over_a_stale_host_window_drops_it_and_imports_only_the_given_state() {
+    // The stale window of an error path before a pageable prefix restore: its saved snapshot
+    // (the state at 10 rows) must never be written back.
+    let mut host = Fake::new(10, false);
+    run_window(&mut host, &[1, 2, 3]).expect("run");
+    assert_eq!(host.tokens, 13);
+    import_state(&mut host, &40).expect("the import of the prefix state");
+    assert!(host.window.is_none(), "the stale window is dropped");
+    assert_eq!(host.tokens, 40, "only the given state was imported");
+    assert_eq!(host.log.iter().filter(|call| *call == "import").count(), 1);
+    // The dropped window cannot commit: there is nothing left to restore from.
+    commit_window(&mut host, &commit(10, 1, 3)).expect_err("no window");
+    assert_eq!(host.tokens, 40);
+}
+
+#[test]
+fn an_import_over_a_stale_host_window_with_the_gate_set_is_refused() {
+    let mut host = Fake::new(10, false);
+    run_window(&mut host, &[1, 2, 3]).expect("run");
+    host.gate = true;
+    import_state(&mut host, &40).expect_err("the gate");
+    assert_eq!(host.tokens, 13, "nothing imported");
+    assert!(!host.called("import"));
+}
+
+#[test]
+fn reset_is_never_wedged_by_an_awaiting_window_with_a_pending_save() {
+    let mut host = Fake::new(10, false);
+    host.pending = true;
+    run_window(&mut host, &[1, 2]).expect("run");
+    host.pending = true; // a save staged before the window and still pending
+    host.log.clear();
+    reset_prologue(&mut host).expect("reset is exempt from the check");
+    reset_epilogue(&mut host);
+    assert!(!host.pending && host.window.is_none() && !host.gate);
+    assert!(
+        !host.called("complete_prefix_save"),
+        "dropped, not finished"
+    );
+    assert_eq!(host.invalidations, 1, "the pool is invalidated");
+    // The same window runs again afterwards.
+    host.tokens = 10;
+    run_window(&mut host, &[1, 2]).expect("the same window");
+    commit_window(&mut host, &commit(10, 2, 2)).expect("and commits");
+}
+
+#[test]
+fn reset_is_never_wedged_by_the_gate_of_a_failed_commit() {
+    let mut host = host_window();
+    host.fail = Some("check_import");
+    commit_window(&mut host, &commit(10, 2, 3)).expect_err("failed commit");
+    assert!(host.gate && host.poisoned);
+    host.pending = true;
+    host.log.clear();
+    reset_prologue(&mut host).expect("reset is exempt");
+    host.poisoned = false; // the state reset zeroes the state
+    reset_epilogue(&mut host);
+    assert!(!host.gate, "the reset opens the gate");
+    assert!(!host.called("complete_prefix_save"));
+    host.tokens = 10;
+    run_window(&mut host, &[1, 2, 3]).expect("the same window runs again");
+    commit_window(&mut host, &commit(10, 2, 3)).expect("and commits");
+}
+
+#[test]
+fn a_reset_on_a_usable_state_finishes_the_pending_save() {
+    let mut host = Fake::new(10, false);
+    host.pending = true;
+    reset_prologue(&mut host).expect("reset");
+    assert!(host.called("complete_prefix_save") && host.invalidations == 0);
 }

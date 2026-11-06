@@ -10,6 +10,7 @@ use super::super::{
 use super::QwenResidentStep;
 use crate::{
     EngError,
+    family::qwen36::window_logic,
     family::session::{DecodeSession, PrefixSlot, SaveKind, StoreLimits, shadow_block_lcp_enabled},
 };
 use std::time::Instant;
@@ -153,6 +154,7 @@ impl QwenResidentStep<'_> {
         kind: SaveKind,
         path: super::super::prefix::CudaPrefillPath,
     ) -> Result<bool, EngError> {
+        self.state_usable()?;
         let fed = self.tokens();
         let frozen = session.prepare_prefix_save(key, fed)?;
         self.complete_prefix_save()?;
@@ -182,6 +184,8 @@ impl QwenResidentStep<'_> {
             Err(EngError::MemoryPlan(_)) => return Ok(false),
             Err(error) => return Err(error),
         };
+        // The tip copies the live state: refused through a gated state or an awaiting window.
+        self.state_usable()?;
         if let Some(device) = self.device_tip.as_mut() {
             let key = device.capture(self.context, &self.stream, &mut self.state)?;
             state.attach_device_tip(key)?;
@@ -197,6 +201,7 @@ impl QwenResidentStep<'_> {
     }
 
     pub(crate) fn complete_prefix_save(&mut self) -> Result<(), EngError> {
+        self.state_usable()?;
         let Some(pending) = self.pending_prefix.take() else {
             return Ok(());
         };
@@ -237,6 +242,9 @@ impl QwenResidentStep<'_> {
     }
 
     pub(crate) fn restore_pinned_prefix(&mut self, saved: &PinnedSnapshot) -> Result<(), EngError> {
+        // The restore replaces the state a window describes: close it before the first fallible
+        // call, and refuse while the recovery gate is set.
+        window_logic::restore_gate(self)?;
         self.complete_prefix_save()?;
         let device = self
             .prefix_pins

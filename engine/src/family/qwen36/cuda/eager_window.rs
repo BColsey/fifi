@@ -233,8 +233,8 @@ impl WindowHost for QwenResidentStep<'_> {
         self.run_token(token, false).map(|_| ())
     }
 
-    fn import(&mut self, saved: &ExportedState) -> Result<(), EngError> {
-        self.import_state(saved)
+    fn overwrite(&mut self, saved: &ExportedState) -> Result<(), EngError> {
+        self.overwrite_state(saved)
     }
 
     fn window_awaits(&self) -> bool {
@@ -255,6 +255,10 @@ impl WindowHost for QwenResidentStep<'_> {
 
     fn set_needs_reset(&mut self) {
         self.set_recovery_gate();
+    }
+
+    fn clear_needs_reset(&mut self) {
+        self.clear_recovery_gate();
     }
 
     fn poison(&mut self) {

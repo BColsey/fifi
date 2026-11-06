@@ -5,7 +5,7 @@
 //! `reset_state` clears it.
 use super::super::{book::Health, state::export::ExportedState};
 use super::QwenResidentStep;
-use crate::EngError;
+use crate::{EngError, family::qwen36::window_logic};
 
 impl QwenResidentStep<'_> {
     /// Whether a window awaits its verdict: the stored window (host or device), or a device
@@ -34,6 +34,16 @@ impl QwenResidentStep<'_> {
 
     pub(crate) fn set_recovery_gate(&mut self) {
         self.needs_reset = true;
+    }
+
+    pub(crate) fn clear_recovery_gate(&mut self) {
+        self.needs_reset = false;
+    }
+
+    /// The one check that the live state may be used: `window_logic::state_usable`. Every
+    /// consumer of the live state calls it first; `reset_state` is exempt.
+    pub(crate) fn state_usable(&self) -> Result<(), EngError> {
+        window_logic::state_usable(self)
     }
 
     /// Poisons the state: it then refuses every step and snapshot.
