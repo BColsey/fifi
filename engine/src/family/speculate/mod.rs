@@ -21,3 +21,7 @@ pub(crate) mod stats;
 #[cfg(test)]
 mod study;
 pub(crate) mod window;
+#[cfg(test)]
+pub(crate) mod window_cost;
+#[cfg(test)]
+mod window_cost_tests;

@@ -399,6 +399,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// carries neither the field nor the check (see `eager_window::inject_fault`).
     #[cfg(test)]
     pub(super) window_fault: Option<crate::family::speculate::d1_oracle::Fault>,
+    /// The host and device time of the last window, by part (test builds only).
+    #[cfg(test)]
+    pub(super) window_trace: super::eager_window::WindowTrace,
     /// The speculative decode step, when the settings asked for one.
     pub(super) speculator: Option<Speculator<RepeatDrafter>>,
     #[cfg(test)]
@@ -686,6 +689,8 @@ impl<'a> QwenResidentStep<'a> {
             window: None,
             #[cfg(test)]
             window_fault: None,
+            #[cfg(test)]
+            window_trace: Default::default(),
             speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],

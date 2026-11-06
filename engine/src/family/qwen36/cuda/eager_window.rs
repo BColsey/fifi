@@ -67,7 +67,8 @@ impl QwenResidentStep<'_> {
     }
 }
 
-/// Outside test builds the fault points are empty inlined calls: no field, no branch.
+/// Outside test builds the fault points and the trace marks are empty inlined calls: no field, no
+/// branch, no clock read.
 #[cfg(not(test))]
 impl QwenResidentStep<'_> {
     #[inline(always)]
@@ -79,6 +80,79 @@ impl QwenResidentStep<'_> {
     fn replay_fault(&mut self, _row: usize) -> Result<(), EngError> {
         Ok(())
     }
+
+    #[inline(always)]
+    fn trace_mark(&mut self, _mark: Mark) {}
+}
+
+/// The points of a window at which the trace of a test build reads the clock.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// `run_window` begins.
+    WindowStart,
+    /// The pre-window state has been copied to the host.
+    Exported,
+    /// A window row has been fed and its logits row read back.
+    RowDone,
+    /// `commit_window` begins a rollback.
+    CommitStart,
+    /// The saved state has been written back.
+    Imported,
+    /// A kept row has been fed again.
+    ReplayDone,
+}
+
+/// What one window cost on the host clock, by part, and what the device timeline says of each row.
+/// Filled by the marks of a test build for the cost harness (`window_bench_device_tests`); a
+/// serving build has no such field. The host times are wall times between two marks, so a row's
+/// time includes its launch, the wait for the device and the logits read-back. The GPU time of a
+/// row is the in-graph event pair of the step (`section_marks`), absent when the marks are off.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(super) struct WindowTrace {
+    clock: Option<std::time::Instant>,
+    pub(super) export_ms: f64,
+    pub(super) row_ms: Vec<f64>,
+    pub(super) row_gpu_ms: Vec<Option<f32>>,
+    pub(super) import_ms: f64,
+    pub(super) replay_ms: Vec<f64>,
+    pub(super) replay_gpu_ms: Vec<Option<f32>>,
+}
+
+#[cfg(test)]
+impl QwenResidentStep<'_> {
+    fn trace_mark(&mut self, mark: Mark) {
+        let now = std::time::Instant::now();
+        let gpu = match mark {
+            Mark::RowDone | Mark::ReplayDone => {
+                self.section_times().ok().flatten().map(|t| t.whole_ms())
+            }
+            _ => None,
+        };
+        let trace = &mut self.window_trace;
+        let since = trace
+            .clock
+            .map_or(0.0, |clock| (now - clock).as_secs_f64() * 1e3);
+        match mark {
+            Mark::WindowStart => *trace = WindowTrace::default(),
+            Mark::Exported => trace.export_ms = since,
+            Mark::RowDone => {
+                trace.row_ms.push(since);
+                trace.row_gpu_ms.push(gpu);
+            }
+            Mark::CommitStart => {
+                trace.import_ms = 0.0;
+                trace.replay_ms.clear();
+                trace.replay_gpu_ms.clear();
+            }
+            Mark::Imported => trace.import_ms = since,
+            Mark::ReplayDone => {
+                trace.replay_ms.push(since);
+                trace.replay_gpu_ms.push(gpu);
+            }
+        }
+        trace.clock = Some(std::time::Instant::now());
+    }
 }
 
 impl WindowModel for QwenResidentStep<'_> {
@@ -86,13 +160,16 @@ impl WindowModel for QwenResidentStep<'_> {
         // A window that fails half way leaves rows fed and no verdict to apply: no window is
         // pending, and the caller resets the session.
         self.window = None;
+        self.trace_mark(Mark::WindowStart);
         let saved = self.export_state()?;
+        self.trace_mark(Mark::Exported);
         let mut rows = Vec::with_capacity(inputs.len());
         let mut argmax = Vec::with_capacity(inputs.len());
         for (at, &token) in inputs.iter().enumerate() {
             self.feed_fault(at)?;
             argmax.push(self.run_token(token, true)?);
             rows.push(self.logits_values());
+            self.trace_mark(Mark::RowDone);
         }
         self.window = Some(EagerWindow {
             inputs: inputs.to_vec(),
@@ -123,10 +200,13 @@ impl WindowModel for QwenResidentStep<'_> {
         if commit.discarded_rows == 0 {
             return Ok(());
         }
+        self.trace_mark(Mark::CommitStart);
         self.import_state(&window.saved)?;
+        self.trace_mark(Mark::Imported);
         for (at, &token) in window.inputs[..commit.kept_rows].iter().enumerate() {
             self.replay_fault(at)?;
             self.run_token(token, false)?;
+            self.trace_mark(Mark::ReplayDone);
         }
         Ok(())
     }

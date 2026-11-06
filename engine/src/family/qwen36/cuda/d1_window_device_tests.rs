@@ -102,16 +102,25 @@ pub(super) fn capture_from_env() -> bool {
 pub(super) struct Loaded {
     pub(super) projector: &'static CudaProjector,
     pub(super) weights: &'static CudaWeights,
+    /// VRAM in use on the card (by every process) when the projector came up, before the load:
+    /// what this process adds is measured against it.
+    pub(super) baseline_used: u64,
 }
 
 pub(super) fn load_pack() -> Loaded {
     let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
     let projector: &'static CudaProjector =
         Box::leak(Box::new(CudaProjector::new().expect("projector")));
+    let idle = projector.memory_info().expect("memory_info");
+    let baseline_used = (idle.total - idle.free) as u64;
     let weights: &'static CudaWeights = Box::leak(Box::new(
         load_exl3_dir(projector, Path::new(&dir), Reserve::default()).expect("load"),
     ));
-    Loaded { projector, weights }
+    Loaded {
+        projector,
+        weights,
+        baseline_used,
+    }
 }
 
 pub(super) fn step_options(kv_mode: KvMode, context_tokens: usize) -> StepOptions {

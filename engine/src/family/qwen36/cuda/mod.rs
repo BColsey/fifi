@@ -195,3 +195,5 @@ mod trace;
 mod verdict;
 #[cfg(test)]
 mod verdict_tests;
+#[cfg(test)]
+mod window_bench_device_tests;
