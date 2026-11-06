@@ -658,7 +658,9 @@ fn a_tie_check_that_met_no_tie_says_so() {
         exact_ties: 0,
     };
     assert_eq!(describe_pass("E", &tied), "PASS comparisons=4 exact_ties=4");
-    assert!(describe_pass("E", &untied).starts_with("PASS-TIE-RULE-NOT-EXERCISED"));
+    let line = describe_pass("E", &untied);
+    assert!(line.starts_with("NOT-EXERCISED-TIE-RULE"), "{line}");
+    assert!(!line.contains("PASS"), "a PASS grep must not count it: {line}");
     assert!(!describe_pass("E", &untied).starts_with("PASS comparisons"));
     // Other checks have no tie count to report.
     assert_eq!(

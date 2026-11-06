@@ -147,11 +147,12 @@ impl AddAssign for Tally {
 }
 
 /// The result line of a passed check. A tie check that met no exact tie did not exercise the tie
-/// rule, and says so instead of a plain PASS.
+/// rule, and says so instead of a plain PASS. The line does not start with `PASS`, so a grep or a
+/// prefix match for PASS never counts it; the test itself still succeeds.
 pub(crate) fn describe_pass(test: &str, tally: &Tally) -> String {
     if test == "E" && tally.exact_ties == 0 {
         return format!(
-            "PASS-TIE-RULE-NOT-EXERCISED comparisons={} exact_ties=0 (no row had an exact tie, \
+            "NOT-EXERCISED-TIE-RULE comparisons={} exact_ties=0 (no row had an exact tie, \
              so only agreement of the draws was shown)",
             tally.comparisons
         );
