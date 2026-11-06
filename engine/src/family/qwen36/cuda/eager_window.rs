@@ -8,6 +8,15 @@
 //! cost is `rows` steps, one export and (after a partial accept) one import: this path proves the
 //! accept and rollback rules on the real model, and a multi-row kernel path replaces its body.
 //!
+//! Device rollback (`draft_rollback = device`). The same rows run, and after each row but the last
+//! the DeltaNet state is copied into a slot of a dedicated device buffer (`state/rollback.rs`,
+//! bookkeeping in `family/qwen36/rollback.rs`). A verdict that keeps `kept` rows copies slot
+//! `kept - 1` back and truncates the KV frontier to `base + kept`; the KV cells above it are stale
+//! and unreachable. There is no export, no import and no replay. It is opt-in; the default is the
+//! host path below. Every failure of the device path leaves a state that refuses to go on (poisoned,
+//! or refused by the guard) and no window: there is no outcome in which a valid state is ahead of
+//! the verdict. The host path keeps the gap described next.
+//!
 //! Failure. A step that fails inside the window poisons the state, so the window ends with an
 //! error, no pending window and a state that refuses to go on until a reset or an import. A
 //! `commit_window` that fails earlier, in `complete_prefix_save` (`step.rs:1326`), `check_import`

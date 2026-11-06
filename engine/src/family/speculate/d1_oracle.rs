@@ -829,6 +829,10 @@ pub(crate) fn slot_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> 
 /// error from the executor ends in `reset_state` (`sched/worker.rs:1049`, called at `:832`, `:873`
 /// and `:897`; the policy is written at `qwen36/cuda/executor.rs:17`), which resets the session
 /// and the model before the next job.
+///
+/// The device rollback has no such gap: every failure of its `commit_window` poisons the state or
+/// finds it already refusing (`Fault::Restore`, `Fault::Capture`, a verdict that is not the window's;
+/// `qwen36/cuda/state/rollback.rs`). `D1Subject::fault_plan` lets it list its own fault points.
 pub(crate) fn failure_recovery<S: D1Subject>(
     subject: &mut S,
     vocab: usize,
