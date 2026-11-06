@@ -34,6 +34,8 @@ mod card_weights;
 mod card_weights_tests;
 #[cfg(test)]
 mod common_tests;
+#[cfg(test)]
+mod d1_window_device_tests;
 mod dims;
 mod eager_window;
 #[cfg(test)]

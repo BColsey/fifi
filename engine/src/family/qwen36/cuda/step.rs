@@ -395,6 +395,10 @@ pub(crate) struct QwenResidentStep<'a> {
     kv8_chunked_prefill: bool,
     /// The window that has run and awaits its verdict (see `eager_window`).
     pub(super) window: Option<super::eager_window::EagerWindow>,
+    /// A fault armed for the next window or commit: test builds only, so a serving build
+    /// carries neither the field nor the check (see `eager_window::inject_fault`).
+    #[cfg(test)]
+    pub(super) window_fault: Option<crate::family::speculate::d1_oracle::Fault>,
     /// The speculative decode step, when the settings asked for one.
     pub(super) speculator: Option<Speculator<RepeatDrafter>>,
     #[cfg(test)]
@@ -680,6 +684,8 @@ impl<'a> QwenResidentStep<'a> {
             chunk_q6k,
             kv8_chunked_prefill: false,
             window: None,
+            #[cfg(test)]
+            window_fault: None,
             speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
@@ -1304,6 +1310,13 @@ impl<'a> QwenResidentStep<'a> {
         }
         self.refill_prefill_report();
         Ok(())
+    }
+
+    /// Poisons the state as a failed step does. Test builds only: the fault injection of the
+    /// eager window uses it.
+    #[cfg(test)]
+    pub(super) fn poison_state(&mut self) {
+        self.state.poison();
     }
 
     /// The committed state as a host value, for the checkpoint store.

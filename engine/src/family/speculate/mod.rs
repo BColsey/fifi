@@ -10,6 +10,10 @@
 pub(crate) mod accept;
 pub(crate) mod calibrator;
 pub(crate) mod config;
+#[cfg(test)]
+pub(crate) mod d1_oracle;
+#[cfg(test)]
+mod d1_oracle_tests;
 pub(crate) mod driver;
 pub(crate) mod mtp;
 pub(crate) mod repeat;

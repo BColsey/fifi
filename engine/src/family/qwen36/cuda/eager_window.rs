@@ -9,6 +9,8 @@
 //! accept and rollback rules on the real model, and a multi-row kernel path replaces its body.
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
+#[cfg(test)]
+use crate::family::speculate::d1_oracle::Fault;
 use crate::{
     EngError,
     family::{
@@ -34,6 +36,51 @@ fn no_window() -> EngError {
     EngError::BadRequest("verify window: no window has run".to_owned())
 }
 
+/// Test hooks: the rows a window kept and the fault injection of the D1 oracle.
+#[cfg(test)]
+impl QwenResidentStep<'_> {
+    /// The complete logits row of every row of the window that `run_window` kept.
+    pub(super) fn window_logits_rows(&self) -> Result<Vec<Vec<f32>>, EngError> {
+        let window = self.window.as_ref().ok_or_else(no_window)?;
+        Ok(window.rows.clone())
+    }
+
+    /// Fires the armed fault when it is `at`: poisons the state the way a failed step does (the
+    /// state then refuses every step and snapshot until a reset or an import) and fails.
+    fn fault_at(&mut self, at: Fault) -> Result<(), EngError> {
+        if self.window_fault != Some(at) {
+            return Ok(());
+        }
+        self.window_fault = None;
+        self.poison_state();
+        Err(EngError::BadRequest(format!(
+            "verify window: injected fault {at:?}"
+        )))
+    }
+
+    fn feed_fault(&mut self, row: usize) -> Result<(), EngError> {
+        self.fault_at(Fault::Feed(row))
+    }
+
+    fn replay_fault(&mut self, row: usize) -> Result<(), EngError> {
+        self.fault_at(Fault::Replay(row))
+    }
+}
+
+/// Outside test builds the fault points are empty inlined calls: no field, no branch.
+#[cfg(not(test))]
+impl QwenResidentStep<'_> {
+    #[inline(always)]
+    fn feed_fault(&mut self, _row: usize) -> Result<(), EngError> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn replay_fault(&mut self, _row: usize) -> Result<(), EngError> {
+        Ok(())
+    }
+}
+
 impl WindowModel for QwenResidentStep<'_> {
     fn run_window(&mut self, inputs: &[u32]) -> Result<(), EngError> {
         // A window that fails half way leaves rows fed and no verdict to apply: no window is
@@ -42,7 +89,8 @@ impl WindowModel for QwenResidentStep<'_> {
         let saved = self.export_state()?;
         let mut rows = Vec::with_capacity(inputs.len());
         let mut argmax = Vec::with_capacity(inputs.len());
-        for &token in inputs {
+        for (at, &token) in inputs.iter().enumerate() {
+            self.feed_fault(at)?;
             argmax.push(self.run_token(token, true)?);
             rows.push(self.logits_values());
         }
@@ -76,7 +124,8 @@ impl WindowModel for QwenResidentStep<'_> {
             return Ok(());
         }
         self.import_state(&window.saved)?;
-        for &token in &window.inputs[..commit.kept_rows] {
+        for (at, &token) in window.inputs[..commit.kept_rows].iter().enumerate() {
+            self.replay_fault(at)?;
             self.run_token(token, false)?;
         }
         Ok(())

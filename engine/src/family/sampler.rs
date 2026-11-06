@@ -359,6 +359,14 @@ impl Sampler {
         Self::new(SamplingParams::greedy(), 0)
     }
 
+    /// The generator state: one word, so two samplers that drew the same number of times from
+    /// the same seed report the same value. Tests of the verify window compare it with the state
+    /// a one-row run leaves, because a window that draws a row too many or too few moves it.
+    #[cfg(test)]
+    pub(crate) fn rng_state(&self) -> u64 {
+        self.rng.state
+    }
+
     /// The settings in force. The server's end-to-end probe records them for its tests.
     pub(crate) fn params(&self) -> SamplingParams {
         self.params
