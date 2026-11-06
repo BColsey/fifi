@@ -190,7 +190,7 @@ impl Effects for Recorder {
                 .checked_mul(4)
                 .filter(|stride| *stride != 0)
                 .ok_or_else(|| bad("grouped input width overflows"))?;
-            if self.buffers[call.x] % stride != 0 {
+            if !self.buffers[call.x].is_multiple_of(stride) {
                 return Err(bad("grouped input is not row aligned"));
             }
             weights.push(call.weight.0);
@@ -367,8 +367,8 @@ fn walk_with(template: &Recorder, rows: usize, seed: u64) -> Vec<Op> {
 }
 
 /// Every (production, rollback) publish configuration.
-const CONFIGS: [(&str, fn(bool, usize, u64) -> Vec<Op>); 2] =
-    [("production", walk), ("rollback", walk_rollback)];
+type Walk = fn(bool, usize, u64) -> Vec<Op>;
+const CONFIGS: [(&str, Walk); 2] = [("production", walk), ("rollback", walk_rollback)];
 
 /// The topology: every identity datum (expert ids, pick descriptors) masked
 /// to one marker, so only launch structure remains.
