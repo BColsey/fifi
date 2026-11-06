@@ -4,9 +4,10 @@
 
 use super::{
     d1_oracle::{
-        D1Failure, D1Subject, FAKE_TOKENIZER_JSON, Fault, Setup, Tally, accepted_prefix,
-        failure_recovery, first_bit_difference, first_byte_difference, full_logits, host_greedy,
-        later_rows_isolated, near_tie, tied_at_maximum, ties_break_low,
+        D1Failure, D1Subject, FAKE_TOKENIZER_JSON, Fault, Observed, Setup, Tally, accepted_prefix,
+        describe_pass, failure_recovery, first_bit_difference, first_byte_difference, full_logits,
+        host_greedy, later_rows_isolated, near_tie, observed_difference, tied_at_maximum,
+        ties_break_low,
     },
     driver::WindowModel,
     window::Commit,
@@ -48,6 +49,12 @@ enum Flaw {
     ExtraDraw,
     /// A fault leaves the partial state in place and keeps answering.
     SilentFault,
+    /// After a commit the model reports one row more than it holds.
+    FedLies,
+    /// The first step after a partial commit answers from a stale logits row.
+    StaleLogits,
+    /// The one-row step takes the highest id of a tie; the window and the rules take the lowest.
+    OneRowTieHigh,
 }
 
 /// The state commit and rollback must restore.
@@ -73,6 +80,10 @@ struct Fake {
     window: Option<FakeWindow>,
     poisoned: bool,
     fault: Option<Fault>,
+    /// Set by a commit under `FedLies`: `fed` reports one row too many.
+    fed_lies: bool,
+    /// Set by a partial commit under `StaleLogits`: the next `logits` call is perturbed.
+    stale: bool,
 }
 
 fn refused(what: &str) -> EngError {
@@ -91,6 +102,8 @@ impl Fake {
             window: None,
             poisoned: false,
             fault: None,
+            fed_lies: false,
+            stale: false,
         }
     }
 
@@ -146,11 +159,27 @@ impl TokenStepper for Fake {
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
         self.live()?;
-        Ok(self.advance(token))
+        let mut row = self.advance(token);
+        if std::mem::take(&mut self.stale) {
+            row[0] += 0.01;
+        }
+        Ok(row)
+    }
+
+    fn next_token(&mut self, token: u32, sampler: &mut Sampler, vocab: usize) -> Result<u32> {
+        let row = self.logits(token)?;
+        if self.flaw == Flaw::OneRowTieHigh && sampler.is_greedy() {
+            let top = row[host_greedy(&row, vocab) as usize];
+            return Ok(row[..vocab]
+                .iter()
+                .rposition(|value| *value == top)
+                .unwrap() as u32);
+        }
+        sampler.sample(&row[..vocab])
     }
 
     fn fed(&self) -> usize {
-        self.state.kv.len()
+        self.state.kv.len() + usize::from(self.fed_lies)
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -158,6 +187,8 @@ impl TokenStepper for Fake {
         self.state.recurrent = [0.0; 3];
         self.window = None;
         self.poisoned = false;
+        self.fed_lies = false;
+        self.stale = false;
         Ok(())
     }
 }
@@ -208,9 +239,11 @@ impl WindowModel for Fake {
 
     fn commit_window(&mut self, commit: &Commit) -> Result<()> {
         let window = self.window.take().ok_or_else(|| refused("no window"))?;
+        self.fed_lies = self.flaw == Flaw::FedLies;
         if commit.discarded_rows == 0 {
             return Ok(());
         }
+        self.stale = self.flaw == Flaw::StaleLogits;
         match self.flaw {
             Flaw::KeepsDiscardedRows => return Ok(()),
             Flaw::KeepsRecurrent => {
@@ -240,6 +273,8 @@ impl D1Subject for Fake {
         self.state = state.clone();
         self.window = None;
         self.poisoned = false;
+        self.fed_lies = false;
+        self.stale = false;
         Ok(())
     }
 
@@ -536,4 +571,98 @@ fn the_fixture_file_holds_the_facts_the_constants_state() {
     assert_eq!(fixture.prompt.len(), near_tie::PROMPT_LEN);
     assert_eq!(fixture.forced_prefix.len(), near_tie::FORCED_PREFIX_LEN);
     assert!(fixture.prompt.iter().all(|&id| id < 248_320));
+}
+
+#[test]
+fn a_model_that_reports_a_wrong_row_count_after_a_commit_is_caught_by_rows_fed() {
+    let mut rig = Rig::new(Flaw::FedLies, false);
+    let (fake, setup) = rig.split();
+    let failure = expect_violation(accepted_prefix(fake, &setup, 3, &Sampler::greedy), "D");
+    assert!(failure.detail.contains("rows fed"), "{failure}");
+}
+
+#[test]
+fn a_stale_logits_row_after_a_partial_commit_is_caught_by_the_next_step_logits() {
+    let mut rig = Rig::new(Flaw::StaleLogits, false);
+    let (fake, setup) = rig.split();
+    let failure = expect_violation(accepted_prefix(fake, &setup, 3, &Sampler::greedy), "D");
+    assert!(failure.detail.contains("next-step logits"), "{failure}");
+}
+
+#[test]
+fn a_one_row_step_that_breaks_ties_high_is_caught_by_the_one_row_leg_of_e() {
+    // The window, the engine rule and the plain rule all say 2; only the one-row step says 6.
+    let mut rig = Rig::new(Flaw::OneRowTieHigh, true);
+    let failure = expect_violation(ties_break_low(&mut rig.fake, VOCAB, &rows(4)), "E");
+    assert!(failure.detail.contains("one-row draw 6"), "{failure}");
+    assert!(failure.detail.contains("window draw 2"), "{failure}");
+}
+
+/// A change to one field of an observation.
+type Change = fn(&mut Observed<FakeState>);
+
+fn observed() -> Observed<FakeState> {
+    let state = FakeState {
+        kv: vec![1, 2],
+        recurrent: [0.5; 3],
+    };
+    Observed {
+        tokens: vec![3, 4],
+        history: vec![1, 2, 3, 4],
+        pending: Some(4),
+        rng: 9,
+        remaining: Some(7),
+        fed: 5,
+        state: state.clone(),
+        next_logits: vec![0.25, 0.5],
+        state_after_next: state,
+    }
+}
+
+/// The comparator names the first field that differs. The pending token and the history are
+/// functions of the committed tokens in the real driver, so no model flaw moves them alone: each
+/// is tested here on the comparator itself.
+#[test]
+fn the_comparator_sees_each_field_alone() {
+    let fake = Fake::new(Flaw::Sound, false);
+    assert_eq!(observed_difference(&fake, &observed(), &observed()), None);
+    let cases: [(&str, Change); 9] = [
+        ("committed tokens", |o| o.tokens.push(1)),
+        ("session history", |o| o.history.push(1)),
+        ("pending token", |o| o.pending = Some(5)),
+        ("sampler generator state", |o| o.rng += 1),
+        ("remaining output budget", |o| o.remaining = Some(6)),
+        ("rows fed", |o| o.fed += 1),
+        ("committed state", |o| o.state.kv.push(9)),
+        ("next-step logits", |o| o.next_logits[1] = 0.75),
+        ("state after the next step", |o| {
+            o.state_after_next.recurrent[2] = 1.5
+        }),
+    ];
+    for (field, change) in cases {
+        let mut other = observed();
+        change(&mut other);
+        let found = observed_difference(&fake, &other, &observed()).expect(field);
+        assert!(found.contains(field), "{field}: {found}");
+    }
+}
+
+#[test]
+fn a_tie_check_that_met_no_tie_says_so() {
+    let tied = Tally {
+        comparisons: 4,
+        exact_ties: 4,
+    };
+    let untied = Tally {
+        comparisons: 4,
+        exact_ties: 0,
+    };
+    assert_eq!(describe_pass("E", &tied), "PASS comparisons=4 exact_ties=4");
+    assert!(describe_pass("E", &untied).starts_with("PASS-TIE-RULE-NOT-EXERCISED"));
+    assert!(!describe_pass("E", &untied).starts_with("PASS comparisons"));
+    // Other checks have no tie count to report.
+    assert_eq!(
+        describe_pass("A", &untied),
+        "PASS comparisons=4 exact_ties=0"
+    );
 }

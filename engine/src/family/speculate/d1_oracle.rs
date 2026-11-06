@@ -146,6 +146,22 @@ impl AddAssign for Tally {
     }
 }
 
+/// The result line of a passed check. A tie check that met no exact tie did not exercise the tie
+/// rule, and says so instead of a plain PASS.
+pub(crate) fn describe_pass(test: &str, tally: &Tally) -> String {
+    if test == "E" && tally.exact_ties == 0 {
+        return format!(
+            "PASS-TIE-RULE-NOT-EXERCISED comparisons={} exact_ties=0 (no row had an exact tie, \
+             so only agreement of the draws was shown)",
+            tally.comparisons
+        );
+    }
+    format!(
+        "PASS comparisons={} exact_ties={}",
+        tally.comparisons, tally.exact_ties
+    )
+}
+
 /// The first element whose bit pattern differs, or a length mismatch. Bitwise: `0.0` and `-0.0`
 /// differ, and two NaNs with the same payload are equal.
 pub(crate) fn first_bit_difference(left: &[f32], right: &[f32]) -> Option<String> {
@@ -389,17 +405,18 @@ impl Drafter for ExactAccept {
     }
 }
 
-/// Everything observable after `steps` committed tokens, plus the next step.
-struct Observed<St> {
-    tokens: Vec<u32>,
-    history: Vec<u32>,
-    pending: Option<u32>,
-    rng: u64,
-    remaining: Option<u32>,
-    fed: usize,
-    state: St,
-    next_logits: Vec<f32>,
-    state_after_next: St,
+/// Everything observable after `steps` committed tokens, plus the next step. Crate-visible so
+/// that the comparator can be tested field by field.
+pub(crate) struct Observed<St> {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) history: Vec<u32>,
+    pub(crate) pending: Option<u32>,
+    pub(crate) rng: u64,
+    pub(crate) remaining: Option<u32>,
+    pub(crate) fed: usize,
+    pub(crate) state: St,
+    pub(crate) next_logits: Vec<f32>,
+    pub(crate) state_after_next: St,
 }
 
 fn observe<S: D1Subject>(
@@ -447,7 +464,7 @@ fn one_row_tokens<S: D1Subject>(
 }
 
 /// The first difference between a one-row run and a window, by field.
-fn observed_difference<S: D1Subject>(
+pub(crate) fn observed_difference<S: D1Subject>(
     subject: &S,
     window: &Observed<S::State>,
     one_row: &Observed<S::State>,
@@ -605,6 +622,19 @@ fn faults_for(rows: usize) -> Vec<(Fault, Commit)> {
 /// Check F: each fault ends the call with an error, leaves no window to draw from or commit, and
 /// leaves either the pre-window state or a model that refuses to go on; restoring the pre-window
 /// state then lets the same window run again with the same rows.
+///
+/// **What this models and what it does not.** A fault is injected at a feed or replay row and
+/// poisons the state the way a failed step does, so the "refuses to go on" outcome is what the
+/// check sees on the real step. A real `commit_window` can also fail before any step runs, in
+/// `complete_prefix_save` (`step.rs:1326`), `check_import` (`state/export.rs:196`) or
+/// `resident_kv` (`state/export.rs:197`): those refuse before `begin_import`, so the state is NOT
+/// poisoned. It stays a valid state at the end of the window (the rows fed), the window is
+/// already taken (`eager_window.rs`, `commit_window`), and a later step would run from that state
+/// without error. No check here can show otherwise, and none claims to. This predates the branch
+/// and is not changed here (production behaviour is on hold). The safety net is the worker: an
+/// error from the executor ends in `reset_state` (`sched/worker.rs:1049`, called at `:832`, `:873`
+/// and `:897`; the policy is written at `qwen36/cuda/executor.rs:17`), which resets the session
+/// and the model before the next job.
 pub(crate) fn failure_recovery<S: D1Subject>(
     subject: &mut S,
     vocab: usize,

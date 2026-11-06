@@ -37,6 +37,15 @@
 //! window, is recorded beside it as `export_standalone_ms`, as is the import. The split of the
 //! export into device copy time and host allocation time is not available.
 //!
+//! **Asymmetries the record does not remove.** (1) With the marks on, the window arm reads the
+//! event times (`section_times`) inside its wall time, after every row and every replayed row: the
+//! read comes after the row's own clock read, so it is in `total_wall_ms` but in no row's time.
+//! The single-row arm reads them after its timed region, so it does not pay it. The cost is two
+//! event queries per row; `FIFI_MRV_MARKS=0` removes it from the window arm. (2) The state shape,
+//! and with it the computed bytes and call counts, is taken once at the start of a cell; the
+//! committed length then drifts by about `2r + 1` rows per round, under 1% of the depth over a
+//! cell, so the bytes are those of the depth at the start.
+//!
 //! **Bytes and calls** per window are COMPUTED from the state layout and the logits width
 //! (`speculate::window_cost`), not counted by a counter in the serving path; the harness
 //! checks the computed state bytes against the real exported state.
@@ -64,7 +73,7 @@ use serde_json::{Value, json};
 
 use super::{
     d1_window_device_tests::{
-        EOS, Loaded, SAMPLER_VOCAB, build_step, capture_from_env, exported_difference,
+        EOS, HEAD_ROWS, Loaded, SAMPLER_VOCAB, build_step, capture_from_env, exported_difference,
         kv_mode_from_env, load_pack, step_options, text_stream,
     },
     dims::KvMode,
@@ -72,6 +81,7 @@ use super::{
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     start::prefill_headroom,
     state::export::ExportedState,
+    state_layout::Word,
     step::{CaptureConfig, QwenResidentStep},
 };
 use crate::{
@@ -343,7 +353,16 @@ fn state_shape(
         conv_bytes: (layout.delta.conv_values * 4) as u64,
         kv_runs,
         words_bytes: layout.words.total as u64,
+        // The row buffer is allocated head-wide at build (`vec![0; f32_bytes(vocab)]`), and the
+        // read-back plan reads that many bytes when logits are wanted.
+        logits_row_values: (step.row_bytes().len() / 4) as u64,
+        start_block_bytes: Word::StepParams.bytes() as u64,
+        result_pair_bytes: Word::ResultPair.bytes() as u64,
     };
+    assert_eq!(
+        shape.logits_row_values, HEAD_ROWS as u64,
+        "the logits row the step reads back is the padded head width"
+    );
     assert_eq!(
         shape.state_bytes(),
         exported_bytes(exported),
@@ -507,7 +526,7 @@ fn window_json(
         "replay_wall_ms": summary(&col(&|w| w.trace.replay_ms.iter().sum())),
         "replay_gpu_event_ms": summary(&gpu_replay),
         "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
-        "transfers_per_window": WindowTransfers::new(shape, 248_320, rows, kept).to_json(),
+        "transfers_per_window": WindowTransfers::new(shape, rows, kept).to_json(),
     })
 }
 

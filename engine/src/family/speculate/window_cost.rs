@@ -10,10 +10,16 @@
 //! add code to a hot path to answer a measurement question. Every transfer of an eager window is
 //! fixed by sizes the harness can read from the state layout and the logits width, so the
 //! harness computes the totals from those and cross-checks them against the real exported state
-//! (the exported planes must add up to the computed bytes). No counter exists in serving code. The
-//! price: the call counts are those of the copy loops as read in `state/export.rs`, so a change
-//! to those loops must change this arithmetic, and the cross-check catches a changed byte total
-//! but not a changed call count. `export_calls_follow_the_copy_loops` pins the loop structure.
+//! (the exported planes must add up to the computed bytes), and the logits width and the step
+//! copy sizes are read from the step and from the state layout, not typed in here. No counter
+//! exists in serving code. The price: the call counts are those of the copy loops as read in
+//! `state/export.rs` (`export_state` at `:156`, `import_state` at `:191`: one device access per
+//! DeltaNet block and per non-empty KV run, one words-block write on import) and of `write_start`
+//! and `read_back` in `step.rs` (one start-block write and one result-pair read per step, one
+//! logits read when asked). The run cannot cross-check them: a changed copy loop changes the
+//! call counts without changing any byte total, and nothing in the record would show it. The KV
+//! run lengths do come from the real layout (`prefix_ranges`), so the number of KV copies is not
+//! guessed. A source-text test of the loops was tried and removed: it broke on any rustfmt change.
 //!
 //! **What the record can and cannot attribute.** The host wall times inside the window (export,
 //! each row, import, each replayed row) come from clock reads at marks in the eager window,
@@ -218,6 +224,12 @@ pub(crate) struct StateShape {
     pub(crate) kv_runs: Vec<Vec<Vec<u64>>>,
     /// The words block an import rewrites with zeros, in one copy.
     pub(crate) words_bytes: u64,
+    /// Values in the logits row a window row reads back (the head width), read from the step.
+    pub(crate) logits_row_values: u64,
+    /// The start block each step writes and the result pair each step reads, from the layout's
+    /// `Word` sizes.
+    pub(crate) start_block_bytes: u64,
+    pub(crate) result_pair_bytes: u64,
 }
 
 impl StateShape {
@@ -263,27 +275,25 @@ impl StateShape {
     }
 }
 
-/// The small copies every step makes: the start block written (32 bytes) and the result pair read
-/// back (8 bytes), one call each. Read from `write_start` and `read_back` in `step.rs`.
-pub(crate) const START_BLOCK_BYTES: u64 = 32;
-pub(crate) const RESULT_PAIR_BYTES: u64 = 8;
-
-/// One step without logits: the start block and the result pair.
-pub(crate) fn step_transfer() -> Transfer {
-    Transfer {
-        d2h_bytes: RESULT_PAIR_BYTES,
-        d2h_calls: 1,
-        h2d_bytes: START_BLOCK_BYTES,
-        h2d_calls: 1,
+impl StateShape {
+    /// One step without logits: the start block written and the result pair read back, one
+    /// call each.
+    pub(crate) fn step(&self) -> Transfer {
+        Transfer {
+            d2h_bytes: self.result_pair_bytes,
+            d2h_calls: 1,
+            h2d_bytes: self.start_block_bytes,
+            h2d_calls: 1,
+        }
     }
-}
 
-/// The extra read of one logits row (`head_rows` f32 values, one call).
-pub(crate) fn logits_transfer(head_rows: u64) -> Transfer {
-    Transfer {
-        d2h_bytes: head_rows * 4,
-        d2h_calls: 1,
-        ..Transfer::default()
+    /// The extra read of one logits row (one call).
+    pub(crate) fn logits_row(&self) -> Transfer {
+        Transfer {
+            d2h_bytes: self.logits_row_values * 4,
+            d2h_calls: 1,
+            ..Transfer::default()
+        }
     }
 }
 
@@ -299,9 +309,9 @@ pub(crate) struct WindowTransfers {
 }
 
 impl WindowTransfers {
-    pub(crate) fn new(state: &StateShape, head_rows: u64, rows: usize, kept: usize) -> Self {
+    pub(crate) fn new(state: &StateShape, rows: usize, kept: usize) -> Self {
         let n = rows as u64;
-        let per_row = step_transfer() + logits_transfer(head_rows);
+        let per_row = state.step() + state.logits_row();
         let rollback = kept < rows;
         let replayed = if rollback { kept as u64 } else { 0 };
         let scaled = |one: Transfer, times: u64| Transfer {
@@ -318,7 +328,7 @@ impl WindowTransfers {
             } else {
                 Transfer::default()
             },
-            replay: scaled(step_transfer(), replayed),
+            replay: scaled(state.step(), replayed),
         }
     }
 

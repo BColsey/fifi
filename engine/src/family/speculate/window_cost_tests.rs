@@ -2,7 +2,7 @@
 
 use super::window_cost::{
     PackManifest, RECORD_SCHEMA, StateShape, Transfer, WindowTransfers, check_identity, ids_sha256,
-    logits_transfer, median, sha256_file, sha256_hex, step_transfer, summary,
+    median, sha256_file, sha256_hex, summary,
 };
 use serde_json::json;
 
@@ -16,6 +16,9 @@ fn shape() -> StateShape {
         conv_bytes: 100,
         kv_runs: vec![vec![vec![400], vec![400]], vec![vec![400], vec![300, 100]]],
         words_bytes: 4_096,
+        logits_row_values: 248_320,
+        start_block_bytes: 32,
+        result_pair_bytes: 8,
     }
 }
 
@@ -130,29 +133,11 @@ fn the_state_copies_follow_the_layer_and_run_counts() {
     );
 }
 
-/// The call counts above assume the copy loops of `state/export.rs`: one read per DeltaNet
-/// block and one per non-empty KV run, one write for the words block on import. If the loops
-/// change, this test text and `StateShape::export` change with them.
-#[test]
-fn export_calls_follow_the_copy_loops() {
-    let source = include_str!("../qwen36/cuda/state/export.rs");
-    assert!(source.contains("self.read_f32(\n                        stream,\n                        pool.rec_offset(0, ordinal)?"));
-    assert!(source.contains("pool.conv_offset(0, ordinal)?, pool.conv_values"));
-    assert!(
-        source.contains("if range.bytes > 0 {"),
-        "empty runs make no call"
-    );
-    assert!(
-        source.contains("self.clear_words(stream)?;"),
-        "one words write per import"
-    );
-}
-
 #[test]
 fn a_window_costs_its_export_its_rows_and_after_a_partial_accept_an_import_and_a_replay() {
     let state = shape();
-    let head = 248_320;
-    let full = WindowTransfers::new(&state, head, 4, 4);
+    let head = state.logits_row_values;
+    let full = WindowTransfers::new(&state, 4, 4);
     assert_eq!(
         full.import,
         Transfer::default(),
@@ -162,19 +147,19 @@ fn a_window_costs_its_export_its_rows_and_after_a_partial_accept_an_import_and_a
     assert_eq!(full.rows.d2h_bytes, 4 * (8 + head * 4));
     assert_eq!(full.rows.d2h_calls, 4 * 2, "the pair and the logits row");
     assert_eq!(full.rows.h2d_calls, 4);
-    let partial = WindowTransfers::new(&state, head, 4, 1);
+    let partial = WindowTransfers::new(&state, 4, 1);
     assert_eq!(partial.export, full.export);
     assert_eq!(partial.import, state.import());
     assert_eq!(
         partial.replay,
-        step_transfer(),
+        state.step(),
         "one kept row fed again, no logits"
     );
     assert_eq!(
         partial.total().d2h_bytes,
         partial.export.d2h_bytes + partial.rows.d2h_bytes + 8
     );
-    assert_eq!(logits_transfer(head).d2h_bytes, 993_280);
+    assert_eq!(state.logits_row().d2h_bytes, 993_280);
     let json = partial.to_json();
     assert_eq!(json["total"]["h2d_calls"], partial.total().h2d_calls);
     assert!(json["basis"].as_str().unwrap().contains("computed"));

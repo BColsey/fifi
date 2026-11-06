@@ -7,6 +7,14 @@
 //! the kept rows again, which leaves exactly the state a one-row run of those rows would have. The
 //! cost is `rows` steps, one export and (after a partial accept) one import: this path proves the
 //! accept and rollback rules on the real model, and a multi-row kernel path replaces its body.
+//!
+//! Failure. A step that fails inside the window poisons the state, so the window ends with an
+//! error, no pending window and a state that refuses to go on until a reset or an import. A
+//! `commit_window` that fails earlier, in `complete_prefix_save` (`step.rs:1326`), `check_import`
+//! or `resident_kv` (`state/export.rs:196-197`), poisons nothing: the window has already been
+//! taken, and the state is the valid state at the end of the window. That predates this module and
+//! is unchanged; the worker's reset after any executor error (`sched/worker.rs:1049`, the policy
+//! at `executor.rs:17`) is what makes it safe. The D1 oracle's check F does not model it.
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
 #[cfg(test)]

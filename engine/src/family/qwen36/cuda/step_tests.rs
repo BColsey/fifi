@@ -805,3 +805,58 @@ fn tiered_step_refuses_capture_with_a_typed_error() {
         other => panic!("tiered with capture must be refused: {other:?}"),
     }
 }
+
+/// `set_speculation` is `speculator_of` plus an assignment, and `speculator_of` needs no device:
+/// the refusals of the step-side check are tested here, on the function the step calls.
+mod speculation_arming {
+    use super::super::step::speculator_of;
+    use crate::family::speculate::config::{SpecConfig, SpecOptions};
+
+    fn config(mode: &str, rows: u32) -> SpecConfig {
+        SpecConfig::new(&SpecOptions {
+            draft_mode: Some(mode.to_owned()),
+            draft_max_rows: Some(rows),
+            ..SpecOptions::default()
+        })
+        .expect("a generic-range config")
+    }
+
+    #[test]
+    fn a_window_of_more_than_eight_rows_is_refused_before_the_mode_is_read() {
+        for rows in [9, 16, 64] {
+            let error = speculator_of(&config("ngram", rows))
+                .err()
+                .expect("refused");
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(&format!("draft_max_rows {rows} exceeds 8")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_to_eight_rows_arm_the_ngram_step_and_a_disabled_config_arms_nothing() {
+        for rows in 2..=8 {
+            assert!(
+                speculator_of(&config("ngram", rows))
+                    .expect("armed")
+                    .is_some()
+            );
+        }
+        assert!(
+            speculator_of(&SpecConfig::default())
+                .expect("off")
+                .is_none()
+        );
+        let disabled = SpecConfig {
+            max_rows: 64,
+            ..SpecConfig::default()
+        };
+        assert!(
+            speculator_of(&disabled)
+                .expect("a disabled entry feeds no window")
+                .is_none()
+        );
+    }
+}

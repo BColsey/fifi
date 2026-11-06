@@ -32,7 +32,7 @@ fn options(mode: KvMode, ctx: usize) -> StepOptions {
     }
 }
 
-fn export_for(
+pub(super) fn export_for(
     d: &StepDims,
     mode: KvMode,
     cap: usize,

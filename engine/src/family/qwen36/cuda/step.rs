@@ -115,6 +115,28 @@ pub(crate) struct CaptureConfig {
     pub(crate) section_marks: bool,
 }
 
+/// The speculative step a config asks for. Free of any device so that the refusals can be tested
+/// without one. The settings parser refuses a window of more than 8 rows already; a step built
+/// from a hand-made config meets the same cap here, before the mode is looked at.
+pub(super) fn speculator_of(
+    config: &SpecConfig,
+) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
+    check_window_rows(config)?;
+    match config.mode {
+        DraftMode::Disabled => Ok(None),
+        DraftMode::Ngram => Ok(Some(Speculator::new(
+            RepeatDrafter::new(
+                (config.ngram_match_min, config.hybrid_tokens),
+                (config.window_drafts(), config.hybrid_drafts()),
+            ),
+            config.max_rows - 1,
+        ))),
+        DraftMode::Mtp => Err(EngError::BadRequest(
+            "draft_mode mtp has no draft step yet".to_owned(),
+        )),
+    }
+}
+
 /// The timing events of the section marks, created by `set_capture_config` before the first token
 /// so their addresses are stable across the capture and every replay. Pairs: the whole token, the
 /// embedding, one per marked run of identical layers (`section_timing::section_plan`), and the
@@ -746,26 +768,9 @@ impl<'a> QwenResidentStep<'a> {
 
     /// Arms the speculative decode step the settings ask for. Call it before the first token. The
     /// n-gram mode drafts from the committed tokens; the MTP mode has no draft step yet and is
-    /// refused.
+    /// refused. A window of more than 8 rows is refused (`check_window_rows`).
     pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<(), EngError> {
-        // The settings parser refuses this already; a step built from a hand-made config meets
-        // the same cap.
-        check_window_rows(config)?;
-        self.speculator = match config.mode {
-            DraftMode::Disabled => None,
-            DraftMode::Ngram => Some(Speculator::new(
-                RepeatDrafter::new(
-                    (config.ngram_match_min, config.hybrid_tokens),
-                    (config.window_drafts(), config.hybrid_drafts()),
-                ),
-                config.max_rows - 1,
-            )),
-            DraftMode::Mtp => {
-                return Err(EngError::BadRequest(
-                    "draft_mode mtp has no draft step yet".to_owned(),
-                ));
-            }
-        };
+        self.speculator = speculator_of(config)?;
         Ok(())
     }
 

@@ -66,9 +66,9 @@ use crate::{
         session::{DecodeSession, Limits, TokenStepper},
         speculate::{
             d1_oracle::{
-                D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, failure_recovery,
-                first_bit_difference, first_byte_difference, full_logits, host_greedy,
-                later_rows_isolated, near_tie, ties_break_low,
+                D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
+                failure_recovery, first_bit_difference, first_byte_difference, full_logits,
+                host_greedy, later_rows_isolated, near_tie, ties_break_low,
             },
             driver::WindowModel,
         },
@@ -318,11 +318,12 @@ fn seeded() -> Sampler {
 }
 
 /// Prints the result line and panics with the failure text. Called with no device work pending.
+/// A tie check that met no exact tie prints `PASS-TIE-RULE-NOT-EXERCISED`, not a plain PASS.
 fn report(test: &str, label: &str, verdict: Verdict<Tally>) {
     match verdict {
         Ok(tally) => println!(
-            "D1_RESULT test={test} {label} PASS comparisons={} exact_ties={}",
-            tally.comparisons, tally.exact_ties
+            "D1_RESULT test={test} {label} {}",
+            describe_pass(test, &tally)
         ),
         Err(failure) => panic!("D1_RESULT test={test} {label} FAIL {failure}"),
     }
@@ -561,5 +562,83 @@ fn near_tie_diagnostic(rig: &mut Rig, pending: u32) {
             "D1_NEAR_TIE_NOTE fifi's own one-row path draws {top}, not 494: the fixture's \
              expectation belongs to stock exllamav3's numbers; the D1 comparison above stands"
         );
+    }
+}
+
+/// `exported_difference` is the only comparator of real state, and it needs no device: an
+/// `ExportedState` is a host value, built here the way `export_tests` builds one. One bit flipped
+/// in any component must be seen, and a state equal to itself must not.
+#[cfg(test)]
+mod comparator_tests {
+    use super::super::{dims::KvMode, export_tests::export_for};
+    use super::exported_difference;
+
+    fn state() -> super::ExportedState {
+        // Fp16 KV at 10 committed rows: every attention layer has non-empty planes.
+        export_for(&super::dims(), KvMode::Fp16, 64, 10).2
+    }
+
+    fn named(difference: Option<String>, part: &str) {
+        let text = difference.unwrap_or_else(|| panic!("a flipped bit in {part} was not seen"));
+        assert!(text.contains(part), "{part}: {text}");
+    }
+
+    #[test]
+    fn equal_states_have_no_difference() {
+        assert_eq!(exported_difference(&state(), &state()), None);
+    }
+
+    #[test]
+    fn one_flipped_bit_is_seen_in_each_component() {
+        let base = state();
+        let mut m = base.clone();
+        m.delta[5].recurrent[3] = f32::from_bits(m.delta[5].recurrent[3].to_bits() ^ 1);
+        named(
+            exported_difference(&base, &m),
+            "DeltaNet layer 5 recurrent state",
+        );
+        let mut m = base.clone();
+        m.delta[2].conv[0] = f32::from_bits(m.delta[2].conv[0].to_bits() ^ 1);
+        named(
+            exported_difference(&base, &m),
+            "DeltaNet layer 2 convolution state",
+        );
+        let mut m = base.clone();
+        let last = m.kv.len() - 1;
+        let plane = m.kv[last].planes.len() - 1;
+        m.kv[last].planes[plane][0] ^= 1;
+        named(
+            exported_difference(&base, &m),
+            &format!("attention layer {last} KV plane {plane}"),
+        );
+        let mut m = base.clone();
+        m.tokens += 1;
+        named(exported_difference(&base, &m), "committed length");
+    }
+
+    #[test]
+    fn a_signed_zero_and_a_nan_payload_are_differences() {
+        let mut base = state();
+        base.delta[0].recurrent[0] = 0.0;
+        let mut m = base.clone();
+        m.delta[0].recurrent[0] = -0.0;
+        named(exported_difference(&base, &m), "recurrent state");
+        base.delta[0].conv[0] = f32::from_bits(0x7fc0_0001);
+        let mut m = base.clone();
+        m.delta[0].conv[0] = f32::from_bits(0x7fc0_0002);
+        named(exported_difference(&base, &m), "convolution state");
+        assert_eq!(
+            exported_difference(&base, &base.clone()),
+            None,
+            "equal NaN payloads agree"
+        );
+    }
+
+    #[test]
+    fn a_state_of_another_layer_count_is_a_difference() {
+        let base = state();
+        let mut m = base.clone();
+        m.delta.pop();
+        named(exported_difference(&base, &m), "layer counts");
     }
 }
