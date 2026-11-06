@@ -33,9 +33,26 @@ pub(crate) enum Mark {
     Dropped,
 }
 
+/// A point of the host commit at which the step's test build can inject a failure. A fault at
+/// one of the first three is a refusal before `begin_import` (the state stays valid); a fault at
+/// `ImportDevice` is a device failure after it (the state is poisoned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitPoint {
+    /// `complete_prefix_save` of the commit.
+    PrefixSave,
+    /// `check_import` of the saved state.
+    CheckImport,
+    /// The resident-KV check of the import.
+    ResidentKv,
+    /// A device write of the import, after `begin_import`.
+    ImportDevice,
+}
+
 /// A window that has run and awaits its verdict. `S` is the host copy of the committed state
 /// (`ExportedState` on the step) and `R` one logits row.
 pub(crate) struct Window<S, R> {
+    /// The committed rows when the window began.
+    pub(crate) base: usize,
     /// The tokens the window fed, in row order.
     pub(crate) inputs: Vec<u32>,
     /// The logits row after each fed token.
@@ -85,6 +102,24 @@ pub(crate) trait WindowHost {
     fn require_armed(&mut self) -> Result<(), EngError>;
     /// Finishes a pending pinned-prefix save.
     fn complete_prefix_save(&mut self) -> Result<(), EngError>;
+    /// Whether the state is `Valid`.
+    fn is_valid(&self) -> bool;
+    /// The recovery gate: a failed or indeterminate commit set it; only a reset clears it.
+    fn needs_reset(&self) -> bool;
+    /// Sets the recovery gate.
+    fn set_needs_reset(&mut self);
+    /// Poisons the state (the state then refuses every step and snapshot).
+    fn poison(&mut self);
+    /// Drops a pending pinned-prefix save without finishing it.
+    fn drop_pending_prefix(&mut self);
+    /// Invalidates the pinned prefix pool: no later save recycles a slot of the failed lineage.
+    fn invalidate_pool(&mut self);
+    /// Closes the stored window, host and device.
+    fn close_window(&mut self);
+    /// The import's layout and identity check of `saved`, before any device write.
+    fn check_import(&mut self, saved: &Self::Saved) -> Result<(), EngError>;
+    /// The import's resident-KV check, before any device write.
+    fn resident_kv(&mut self) -> Result<(), EngError>;
     /// Opens a device window over `rows` rows.
     fn rollback_begin(&mut self, rows: usize) -> Result<(), EngError>;
     /// Copies the state after row `row` into its slot.
@@ -98,6 +133,10 @@ pub(crate) trait WindowHost {
     /// Applies the verdict through the slots; returns whether a slot was copied back.
     fn rollback_finish(&mut self, kept: usize, committed_rows: usize) -> Result<bool, EngError>;
 
+    /// A failure injected at a point of the commit. Empty outside the step's test build.
+    fn commit_fault(&mut self, _at: CommitPoint) -> Result<(), EngError> {
+        Ok(())
+    }
     /// A trace mark. Empty outside the step's test build.
     fn trace_mark(&mut self, _mark: Mark) {}
     /// The fault point of feeding row `row`. Empty outside the step's test build.
@@ -122,6 +161,67 @@ pub(crate) fn no_window() -> EngError {
     EngError::BadRequest("verify window: no window has run".to_owned())
 }
 
+fn reset_first(what: &str) -> EngError {
+    EngError::BadRequest(format!(
+        "verify window: {what}; the state is poisoned until reset_state"
+    ))
+}
+
+/// The poison route of a failed or indeterminate window: the state is poisoned, the recovery gate
+/// is set (only `reset_state` clears it), a pending prefix save is dropped and never published,
+/// the pinned pool is invalidated and the window is closed.
+pub(crate) fn fail_window<H: WindowHost>(host: &mut H) {
+    host.poison();
+    host.set_needs_reset();
+    host.drop_pending_prefix();
+    host.invalidate_pool();
+    host.close_window();
+}
+
+/// `fail_window`, then the error to return.
+fn failed<H: WindowHost>(host: &mut H, error: EngError) -> EngError {
+    fail_window(host);
+    error
+}
+
+/// What a verdict must satisfy before any state changes: the state is `Valid` and not gated, the
+/// verdict keeps 1 to `rows` rows, names `base + kept` committed rows, and the state is at the end
+/// of the window (`base + rows`).
+fn check_verdict<H: WindowHost>(
+    host: &H,
+    base: usize,
+    rows: usize,
+    commit: &Commit,
+) -> Result<(), EngError> {
+    if !host.is_valid() {
+        return Err(reset_first("commit_window found a poisoned state"));
+    }
+    if host.needs_reset() {
+        return Err(reset_first("commit_window found the recovery gate set"));
+    }
+    let kept = commit.kept_rows;
+    if kept == 0 || kept > rows || commit.discarded_rows != rows - kept {
+        return Err(EngError::BadRequest(format!(
+            "verify window: a verdict keeps {kept} and discards {} of {rows} rows",
+            commit.discarded_rows
+        )));
+    }
+    if commit.committed_rows != base + kept {
+        return Err(EngError::BadRequest(format!(
+            "verify window: the verdict names {} committed rows, the window began at {} and keeps {kept}",
+            commit.committed_rows, base
+        )));
+    }
+    if host.tokens() != base + rows {
+        return Err(EngError::BadRequest(format!(
+            "verify window: the state holds {} rows, the window ends at {}",
+            host.tokens(),
+            base + rows
+        )));
+    }
+    Ok(())
+}
+
 /// Runs the rows of a window (the model side of `WindowModel::run_window`).
 pub(crate) fn run_window<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), EngError> {
     // A window that fails half way leaves rows fed and no verdict to apply: no window is
@@ -131,6 +231,7 @@ pub(crate) fn run_window<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<
     if host.device_wanted() {
         return run_window_device(host, inputs);
     }
+    let base = host.tokens();
     let saved = host.export()?;
     host.trace_mark(Mark::Exported);
     let mut rows = Vec::with_capacity(inputs.len());
@@ -143,6 +244,7 @@ pub(crate) fn run_window<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<
         host.trace_mark(Mark::RowDone);
     }
     host.store_window(Window {
+        base,
         inputs: inputs.to_vec(),
         rows,
         argmax,
@@ -158,6 +260,11 @@ pub(crate) fn commit_window<H: WindowHost>(host: &mut H, commit: &Commit) -> Res
         WindowSave::Host(saved) => saved,
         WindowSave::Device => return commit_window_device(host, commit),
     };
+    // The window is taken. From here every `Err` is a failed or indeterminate commit: it poisons
+    // the state and sets the recovery gate (`failed`), whatever step it came from.
+    if let Err(error) = check_verdict(host, window.base, window.inputs.len(), commit) {
+        return Err(failed(host, error));
+    }
     if commit.discarded_rows == 0 {
         #[cfg(test)]
         {
@@ -167,11 +274,36 @@ pub(crate) fn commit_window<H: WindowHost>(host: &mut H, commit: &Commit) -> Res
         return Ok(());
     }
     host.trace_mark(Mark::CommitStart);
-    host.import(&saved)?;
+    // The three refusals before `begin_import`, then the import.
+    if let Err(error) = host
+        .commit_fault(CommitPoint::PrefixSave)
+        .and_then(|()| host.complete_prefix_save())
+    {
+        return Err(failed(host, error));
+    }
+    if let Err(error) = host
+        .commit_fault(CommitPoint::CheckImport)
+        .and_then(|()| host.check_import(&saved))
+    {
+        return Err(failed(host, error));
+    }
+    if let Err(error) = host
+        .commit_fault(CommitPoint::ResidentKv)
+        .and_then(|()| host.resident_kv())
+    {
+        return Err(failed(host, error));
+    }
+    if let Err(error) = host
+        .commit_fault(CommitPoint::ImportDevice)
+        .and_then(|()| host.import(&saved))
+    {
+        return Err(failed(host, error));
+    }
     host.trace_mark(Mark::Imported);
     for (at, &token) in window.inputs[..commit.kept_rows].iter().enumerate() {
-        host.replay_fault(at)?;
-        host.replay_row(token)?;
+        if let Err(error) = host.replay_fault(at).and_then(|()| host.replay_row(token)) {
+            return Err(failed(host, error));
+        }
         host.trace_mark(Mark::ReplayDone);
     }
     #[cfg(test)]
@@ -220,6 +352,7 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
     // Every row ran: until the verdict a step or an export through the state is refused.
     host.rollback_window_complete()?;
     host.store_window(Window {
+        base,
         inputs: inputs.to_vec(),
         rows,
         argmax,

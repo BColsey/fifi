@@ -237,6 +237,42 @@ impl WindowHost for QwenResidentStep<'_> {
         self.import_state(saved)
     }
 
+    fn is_valid(&self) -> bool {
+        self.state_is_valid()
+    }
+
+    fn needs_reset(&self) -> bool {
+        self.recovery_gate_set()
+    }
+
+    fn set_needs_reset(&mut self) {
+        self.set_recovery_gate();
+    }
+
+    fn poison(&mut self) {
+        self.poison_window_state();
+    }
+
+    fn drop_pending_prefix(&mut self) {
+        QwenResidentStep::drop_pending_prefix(self);
+    }
+
+    fn invalidate_pool(&mut self) {
+        self.invalidate_prefix_pool();
+    }
+
+    fn close_window(&mut self) {
+        self.close_stored_window();
+    }
+
+    fn check_import(&mut self, saved: &ExportedState) -> Result<(), EngError> {
+        self.check_saved_state(saved)
+    }
+
+    fn resident_kv(&mut self) -> Result<(), EngError> {
+        self.check_resident_kv()
+    }
+
     fn require_armed(&mut self) -> Result<(), EngError> {
         self.require_armed_for_window()
     }

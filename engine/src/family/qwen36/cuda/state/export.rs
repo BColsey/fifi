@@ -179,6 +179,18 @@ impl ResidentState {
             kv,
         })
     }
+    /// The two refusals of `import_state` that precede every device write: the layout and identity
+    /// check of `exported`, and the resident-KV check. The window commit runs them first so that a
+    /// refusal poisons the state instead of leaving it valid at the end of the window.
+    pub(crate) fn check_exported(&self, exported: &ExportedState) -> Result<(), EngError> {
+        check_import(&self.layout, &self.identity, exported)
+    }
+
+    /// The resident-KV check alone (paged and cached KV has no plane to export or import).
+    pub(crate) fn check_resident_kv(&self) -> Result<(), EngError> {
+        self.resident_kv().map(|_| ())
+    }
+
     /// Replaces the committed state with `exported`, doing ALL of reset's work: the words block is
     /// rewritten with zeros (so `StepParams` and `status` are zeroed and a start block is owed:
     /// `write_step_params` must follow), the DeltaNet slots above 0 are cleared, slot 0 and the

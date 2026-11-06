@@ -437,6 +437,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// `Some`; the shared `Speculator` knows nothing of it.
     rollback: Option<super::state::rollback::RollbackSlots>,
     pending_prefix: Option<PendingPrefix>,
+    /// The recovery gate: a failed or indeterminate window commit set it. Only `reset_state`
+    /// clears it (see `window_gate`).
+    needs_reset: bool,
 }
 
 /// The typed verdict of the chunk gate: whether `feed_rows` may run the chunk path for this
@@ -728,6 +731,7 @@ impl<'a> QwenResidentStep<'a> {
             forked_experts: options.forked_experts,
             rollback: None,
             pending_prefix: None,
+            needs_reset: false,
         };
         let mut step = step;
         step.refill_prefill_report();
@@ -1315,6 +1319,9 @@ impl<'a> QwenResidentStep<'a> {
         self.window = None;
         self.rollback_discard();
         self.state.reset(&self.stream)?;
+        // A reset is the one recovery of a failed window commit: the gate opens only when the
+        // state really was zeroed.
+        self.needs_reset = false;
         // R3: the position restarts at zero; the sketch-valid prefix follows (the
         // re-appends rewrite every consumed cell, but the binding stays honest).
         if let Some(sp) = self.res.sparse.as_ref() {
@@ -2167,6 +2174,9 @@ mod prefix_runtime;
 
 #[path = "rollback_runtime.rs"]
 mod rollback_runtime;
+
+#[path = "window_gate.rs"]
+mod window_gate;
 
 #[cfg(test)]
 #[path = "prefix_quality_device_tests.rs"]
