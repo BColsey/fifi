@@ -396,7 +396,7 @@ fn seeded() -> Sampler {
 }
 
 /// Prints the result line and panics with the failure text. Called with no device work pending.
-/// A tie check that met no exact tie prints `NOT-EXERCISED-TIE-RULE` (no `PASS` in it), not a plain PASS.
+/// A tie check that met no exact tie prints `TIE RULE NOT EXERCISED` (no `PASS` in it), not a plain PASS.
 fn report(test: &str, label: &str, verdict: Verdict<Tally>) {
     match verdict {
         Ok(tally) => println!(

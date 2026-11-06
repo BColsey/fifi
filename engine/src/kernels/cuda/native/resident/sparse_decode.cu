@@ -77,8 +77,8 @@ __device__ inline float warp_sum_a(float v) {
     return v;
 }
 
-// One block per KV head: threads 0..D-1 own one output dimension, warps 0..G-1 each score
-// one query head, G = n_head / n_kv_head (1..8, the production GQA mapping).
+// One block per KV head: threads 0 up to D (exclusive) own one output dimension, warps 0 up to
+// G (exclusive) each score one query head, G = n_head / n_kv_head (1..8, the production GQA mapping).
 __global__ void __launch_bounds__(kThreads) sparse_decode_k(Args a) {
     const int kvh = blockIdx.x;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;

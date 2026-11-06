@@ -168,7 +168,7 @@ impl AddAssign for Tally {
 pub(crate) fn describe_pass(test: &str, tally: &Tally) -> String {
     if test == "E" && tally.exact_ties == 0 {
         return format!(
-            "NOT-EXERCISED-TIE-RULE comparisons={} exact_ties=0 (no row had an exact tie, \
+            "TIE RULE NOT EXERCISED comparisons={} exact_ties=0 (no row had an exact tie, \
              so only agreement of the draws was shown)",
             tally.comparisons
         );
