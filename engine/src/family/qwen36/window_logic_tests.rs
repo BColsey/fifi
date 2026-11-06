@@ -720,6 +720,15 @@ fn every_restoring_entry_is_refused_by_the_gate_and_by_an_unresolved_window() {
             host.window.is_some(),
             "{name}: a refused restore changes nothing"
         );
+        // The gate alone (the failed window already closed) refuses before any fallible call.
+        let mut host = Fake::new(10, false);
+        host.gate = true;
+        entry(&mut host).expect_err(name);
+        assert!(
+            host.log.is_empty(),
+            "{name}: refused before any call: {:?}",
+            host.log
+        );
         // An unresolved window refuses too, keeps the window, and sets the gate.
         let mut host = Fake::new(10, false);
         run_window(&mut host, &[1, 2]).expect("run");
