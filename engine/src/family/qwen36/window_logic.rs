@@ -495,3 +495,7 @@ mod tests;
 #[cfg(test)]
 #[path = "window_logic_d1_tests.rs"]
 mod d1_tests;
+
+#[cfg(test)]
+#[path = "window_pin_tests.rs"]
+mod pin_tests;
