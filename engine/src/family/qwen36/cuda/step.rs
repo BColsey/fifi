@@ -423,6 +423,12 @@ pub(crate) struct QwenResidentStep<'a> {
     pub(super) prefix: PrefixSlot<CudaSavedPrefix, CudaPrefillPath>,
     prefix_pins: Option<super::state::pinned::PrefixPinPool>,
     device_tip: Option<super::state::device_tip::DeviceTip>,
+    /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
+    /// A window on a step that wants it and holds no slots is refused before any state change.
+    rollback_wanted: bool,
+    /// The device rollback slots (see `rollback_runtime`), armed before the first token. Armed means
+    /// `Some`; the shared `Speculator` knows nothing of it.
+    rollback: Option<super::state::rollback::RollbackSlots>,
     pending_prefix: Option<PendingPrefix>,
 }
 
@@ -709,6 +715,8 @@ impl<'a> QwenResidentStep<'a> {
             prefix: PrefixSlot::default(),
             prefix_pins: None,
             device_tip: None,
+            rollback_wanted: false,
+            rollback: None,
             pending_prefix: None,
         };
         let mut step = step;
@@ -2123,6 +2131,9 @@ mod shortlist_bench;
 
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
+
+#[path = "rollback_runtime.rs"]
+mod rollback_runtime;
 
 #[cfg(test)]
 #[path = "prefix_quality_device_tests.rs"]

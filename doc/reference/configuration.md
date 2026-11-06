@@ -68,6 +68,7 @@ Options for `qwen3_6_35b_a3b`. "MLX" means Apple Silicon.
 | `hybrid_draft_tokens` | CUDA, `exl3` | 0 (off) | When the context repeats an earlier passage for at least this many tokens, draft that many tokens of the passage in one window. 0, or from `ngram_match_min` to 256. |
 | `ngram_match_min` | CUDA, `exl3` | 2 | The shortest repeated tail that an n-gram draft needs, 1 to 64. |
 | `mtp_model_dir` | CUDA, `exl3` | none | The pack directory that holds the `mtp.*` tensors. Required by `draft_mode` `mtp`, refused otherwise. |
+| `draft_rollback` | CUDA, `exl3` | `host` | How a verify window is undone after a partial accept. `host` copies the whole committed state to the host before the window, writes it back and feeds the kept rows again, so a window costs time proportional to the context. `device` keeps one copy of the DeltaNet state per row but the last in device memory (65,863,680 bytes each, so 62.8 MiB at 2 rows and 439.7 MiB at 8) and rolls the KV cache back by its length; it needs an enabled `draft_mode` and is refused with `kv_offload_host_bytes`. With `device`, start is refused when the slots cannot be allocated or do not fit the memory reserve; there is no fallback to `host`. Any other value is refused. `device` is opt-in and has not been run on a device yet. |
 
 CUDA refuses `prefill_budget_bytes` and `prefill_session_reserve_bytes`.
 It ignores `cache_limit_bytes`, `session_cap_bytes`, `prefill_chunk`, `compile` and `prefix_store_entries`, and logs one line for each.

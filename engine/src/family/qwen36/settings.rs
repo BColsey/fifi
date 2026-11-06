@@ -199,6 +199,62 @@ pub(crate) struct Q36Options {
     pub(crate) ngram_match_min: Option<u32>,
     /// The directory of the pack that holds the MTP head. Required by `draft_mode` `mtp`.
     pub(crate) mtp_model_dir: Option<PathBuf>,
+    /// How a verify window is rolled back after a partial accept: `host` (the default: the whole
+    /// committed state is copied to the host before the window and written back, then the kept rows
+    /// are fed again) or `device` (per-row copies of the DeltaNet state in device memory, no host
+    /// copy, no replay). `device` needs an enabled `draft_mode`; its slots take up to 440 MiB at 8
+    /// rows, and start is refused when they cannot be allocated.
+    pub(crate) draft_rollback: Option<String>,
+}
+
+/// How a verify window is rolled back (`draft_rollback`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RollbackMode {
+    /// Copy the committed state to the host, restore it, replay the kept rows.
+    #[default]
+    Host,
+    /// Device-resident per-row slots (`family/qwen36/rollback.rs`).
+    Device,
+}
+
+/// The config text of `draft_rollback`.
+pub(crate) fn rollback_mode_name(mode: RollbackMode) -> &'static str {
+    match mode {
+        RollbackMode::Host => "host",
+        RollbackMode::Device => "device",
+    }
+}
+
+/// Parses `draft_rollback` by exact match; absent is `host`. `device` needs an enabled speculative
+/// mode (the CUDA arm and an EXL3 pack are already required by that) and no host-paged KV, whose
+/// cache has no resident plane to truncate.
+fn rollback_of(
+    options: &Q36Options,
+    speculation: &SpecConfig,
+    kv_offload_host_bytes: Option<u64>,
+) -> Result<RollbackMode, EngError> {
+    let mode = match options.draft_rollback.as_deref() {
+        None | Some("host") => RollbackMode::Host,
+        Some("device") => RollbackMode::Device,
+        Some(other) => {
+            return Err(bad(format!(
+                "draft_rollback must be host or device, got {other:?}"
+            )));
+        }
+    };
+    if mode == RollbackMode::Device {
+        if !speculation.enabled() {
+            return Err(bad("draft_rollback device needs draft_mode ngram".into()));
+        }
+        if kv_offload_host_bytes.is_some() {
+            return Err(bad(
+                "draft_rollback device is refused with kv_offload_host_bytes: the host-paged KV has no \
+                 resident plane to truncate"
+                    .into(),
+            ));
+        }
+    }
+    Ok(mode)
 }
 
 impl Q36Options {
@@ -705,6 +761,8 @@ pub(crate) struct Q36Settings {
     pub(crate) weights: WeightFormat,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
     pub(crate) speculation: SpecConfig,
+    /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
+    pub(crate) draft_rollback: RollbackMode,
     /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
     /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
     pub(crate) cuda_devices: Vec<usize>,
@@ -996,6 +1054,7 @@ impl Q36Settings {
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
+        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes)?;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
             Backend::Mlx => {
@@ -1174,6 +1233,7 @@ impl Q36Settings {
             tiered,
             weights,
             speculation,
+            draft_rollback,
             cuda_devices,
             ignored_mlx_keys,
         })
@@ -1264,7 +1324,9 @@ mod tests {
         chunked_prefill_allowed, delta_state_bytes, digest, kv_dtype_name, kv_dtype_of,
         parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
-    use super::{QWEN36_MAX_WINDOW_ROWS, check_window_rows};
+    use super::{
+        QWEN36_MAX_WINDOW_ROWS, RollbackMode, check_window_rows, rollback_mode_name, rollback_of,
+    };
     use crate::EngError;
     use crate::family::session::StoreLimits;
     use crate::family::spec::QWEN3_6_35B_A3B;
@@ -1703,6 +1765,65 @@ mod tests {
     }
 
     #[test]
+    fn draft_rollback_is_host_unless_the_member_says_device() {
+        let cuda = |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            cuda(exl3_options(|_| {})).unwrap().draft_rollback,
+            RollbackMode::Host
+        );
+        assert_eq!(
+            cuda(exl3_options(|o| o.draft_rollback = Some("host".into())))
+                .unwrap()
+                .draft_rollback,
+            RollbackMode::Host
+        );
+        let device = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.draft_rollback = Some("device".into());
+        }))
+        .unwrap();
+        assert_eq!(device.draft_rollback, RollbackMode::Device);
+        assert_eq!(rollback_mode_name(device.draft_rollback), "device");
+        assert_eq!(rollback_mode_name(RollbackMode::default()), "host");
+    }
+
+    #[test]
+    fn draft_rollback_device_is_refused_without_speculation_and_with_an_unknown_value() {
+        let cuda = |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let text = message(cuda(exl3_options(|o| o.draft_rollback = Some("device".into()))));
+        assert!(text.contains("draft_rollback device needs draft_mode ngram"), "{text}");
+        for bad_value in ["Device", "gpu", "", "1"] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = Some(bad_value.into());
+            })));
+            assert!(
+                text.contains("draft_rollback must be host or device"),
+                "{bad_value:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_rollback_device_is_refused_with_the_host_paged_kv() {
+        let speculation = SpecConfig::new(&SpecOptions {
+            draft_mode: Some("ngram".into()),
+            ..SpecOptions::default()
+        })
+        .unwrap();
+        let options = Q36Options {
+            draft_rollback: Some("device".into()),
+            ..Q36Options::default()
+        };
+        let text = format!("{:?}", rollback_of(&options, &speculation, Some(1 << 30)).unwrap_err());
+        assert!(text.contains("kv_offload_host_bytes"), "{text}");
+        assert_eq!(
+            rollback_of(&options, &speculation, None).unwrap(),
+            RollbackMode::Device
+        );
+    }
+
+    #[test]
     fn the_cap_is_confined_to_enabled_qwen36_speculation() {
         let cuda =
             |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
@@ -2074,6 +2195,7 @@ mod tests {
                 tiered: None,
                 weights: super::WeightFormat::Gguf,
                 speculation: SpecConfig::default(),
+                draft_rollback: RollbackMode::Host,
                 ignored_mlx_keys: Vec::new(),
             }
         );

@@ -9,9 +9,10 @@
 //! flag before `spawn_engine`, commits it right after the leaks, and every retry in the same
 //! process is refused.
 
+use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
-    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, WeightFormat, tokenizer_pin,
-    weight_format_name,
+    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, WeightFormat,
+    tokenizer_pin, weight_format_name,
 };
 use super::{
     card_load::card_loads,
@@ -1058,6 +1059,13 @@ fn make(
     // snapshot less the selected headroom. Fixed mode also checks live free VRAM and refuses an
     // undersized plan; legacy mode may keep the per-token arm.
     if let Some(host_limit) = settings.kv_offload_host_bytes {
+        if settings.draft_rollback == RollbackMode::Device {
+            return Err(EngError::BadRequest(
+                "engine config: draft_rollback device needs the resident KV plane; kv_offload_host_bytes \
+                 is set"
+                    .into(),
+            ));
+        }
         if device_first {
             if let Some(rows) = res
                 .paged
@@ -1082,14 +1090,43 @@ fn make(
         if modes.prefix != PrefixMemory::Disabled {
             step.enable_pinned_prefix()?;
         }
+        let mut tip_bytes = 0;
         if modes.prefix == PrefixMemory::DeviceTip && step.pinned_prefix_enabled() {
+            tip_bytes = step.enable_device_tip()?;
             extras.push(Extra {
                 name: "device-prefix-delta",
-                fixed: step.enable_device_tip()?,
+                fixed: tip_bytes,
                 bytes_per_token: 0,
             });
         }
-        if arena_wanted(kv_mode, modes.chunk_off) {
+        // The rollback slots: charged as an extra when the prefill arena is admitted; otherwise
+        // (FP16 KV with chunk prefill off) nothing admits them and the load reserve that no arena
+        // consumes covers them, which `enable_device_rollback` enforces before it allocates. A
+        // refusal here refuses the start: there is no fallback to the host rollback.
+        let arena = arena_wanted(kv_mode, modes.chunk_off);
+        let mut rollback_cover = None;
+        if settings.draft_rollback == RollbackMode::Device {
+            let cover = if arena {
+                Cover::Arena
+            } else {
+                Cover::Reserve {
+                    headroom: prefill_headroom(modes.fixed_admission),
+                }
+            };
+            step.request_device_rollback();
+            let bytes =
+                step.enable_device_rollback(settings.speculation.max_rows, cover, tip_bytes)?;
+            if arena {
+                extras.push(Extra {
+                    name: "device-rollback-slots",
+                    fixed: bytes,
+                    bytes_per_token: 0,
+                });
+            }
+            rollback_cover = Some(cover);
+        }
+        let mut arena_admitted = None;
+        if arena {
             let device_free = after
                 .free
                 .saturating_sub(prefill_headroom(modes.fixed_admission));
@@ -1102,6 +1139,7 @@ fn make(
                 modes.fixed_admission,
                 modes.wide_stage,
             )?;
+            arena_admitted = Some(matches!(verdict, ChunkVerdict::Ready { .. }));
             let line = if kv_mode == KvMode::Int8G32 {
                 kv8_prefill_start_line(&verdict)
             } else {
@@ -1110,6 +1148,9 @@ fn make(
             eprintln!("{line}");
         } else {
             eprintln!("q36 cuda: prefill chunk off (Q36_CUDA_CHUNK_PREFILL=0): one token per step");
+        }
+        if let (Some(cover), Some(plan)) = (rollback_cover, step.device_rollback_plan()) {
+            eprintln!("{}", rollback_startup_line(&plan, cover, arena_admitted)?);
         }
     }
     if let Some(plan) = tiered {
