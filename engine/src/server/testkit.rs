@@ -106,6 +106,12 @@ pub(super) fn failing_engine() -> Engine {
     .expect("spawn engine")
 }
 
+/// An engine whose load is refused with `error` on the engine thread, the way a real family's
+/// `open` refuses at admission.
+pub(super) fn load_refused_engine(error: EngError) -> Engine {
+    spawn_engine::<FakeExecutor, _>(512, move |_| Err(error)).expect("spawn engine")
+}
+
 pub(super) fn gated_engine(script: Vec<Vec<u32>>) -> (Engine, std::sync::mpsc::Sender<()>) {
     let (gate, wait) = std::sync::mpsc::channel::<()>();
     let engine = spawn_engine(512, move |_| {

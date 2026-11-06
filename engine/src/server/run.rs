@@ -2,6 +2,11 @@
 //!
 //! `SIGTERM` or `SIGINT` stops the listener, lets the running requests finish,
 //! stops the engine threads, and returns. The caller then exits with code 0.
+//!
+//! The engines load on their own threads after the listener is bound. If every engine ends
+//! its load in a failed state (for example a refused CUDA admission), the server stops by
+//! itself and returns the engine's own failure, so the process exits non-zero with that
+//! message on stderr. One live engine keeps the server up.
 
 use std::io::Write as _;
 
@@ -581,11 +586,54 @@ fn describe(error: &EngError) -> String {
     error.describe()
 }
 
+/// How often the boot watch reads the engine states.
+const BOOT_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Resolves when startup has failed for good: every engine has left `Loading` and none of
+/// them can take a job. It never resolves once any engine is `Ready` or `Busy` (a server with
+/// one live engine keeps serving; `/ready` and `/v1/models` show the failed ones), and it
+/// never resolves for a server with no engines. The engine threads load in the background
+/// after the listener is bound, so without this watch a refused load (for example
+/// "cuda admission") leaves a process that is up and never ready.
+async fn boot_failed(handles: Vec<crate::sched::worker::EngineHandle>) {
+    use crate::sched::worker::EngineState;
+    if handles.is_empty() {
+        return std::future::pending().await;
+    }
+    loop {
+        let states: Vec<EngineState> = handles.iter().map(|handle| handle.state()).collect();
+        if states
+            .iter()
+            .any(|state| matches!(state, EngineState::Ready | EngineState::Busy))
+        {
+            return std::future::pending().await;
+        }
+        if !states.contains(&EngineState::Loading) {
+            return;
+        }
+        tokio::time::sleep(BOOT_WATCH_INTERVAL).await;
+    }
+}
+
+/// Serves until `shutdown` resolves or every engine has failed to load. In the second case
+/// the server drains and returns `Ok`; the caller's engine shutdown reports the recorded
+/// causes, so the process exits non-zero with the engine's own message on stderr.
 pub(crate) async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), StartupError> {
+    let handles: Vec<crate::sched::worker::EngineHandle> = state
+        .entries()
+        .iter()
+        .map(|entry| entry.handle.clone())
+        .collect();
+    let shutdown = async move {
+        tokio::select! {
+            () = shutdown => {}
+            () = boot_failed(handles) => {}
+        }
+    };
     let listener = listener.tap_io(|stream| {
         if let Err(error) = stream.set_nodelay(true) {
             eprintln!("enginesrv: cannot set TCP_NODELAY on an accepted connection: {error}");
@@ -1375,6 +1423,102 @@ mod tests {
         for engine in engines {
             engine.shutdown();
         }
+    }
+
+    /// Serves `entries` with a shutdown future that never fires, so only the boot watch can end it.
+    async fn serve_without_signal(
+        entries: Vec<crate::server::state::EngineEntry>,
+    ) -> tokio::task::JoinHandle<Result<(), StartupError>> {
+        let state = Arc::new(AppState::new(testkit::API_KEY, entries));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        tokio::spawn(serve(listener, state, std::future::pending()))
+    }
+
+    /// The 2026-11-06 defect: a load refused on the engine thread (for example
+    /// "cuda admission") left the listener up and the process never ready. When no
+    /// engine can serve, the server now stops by itself, and the shutdown report carries
+    /// the cause so the run fails with the engine's own message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_whose_only_engine_failed_to_load_stops_and_reports_the_cause() {
+        let broken = testkit::failing_engine();
+        let entry = testkit::entry("q36", "model-a", &broken, 4_096);
+        let task = serve_without_signal(vec![entry]).await;
+        let finished = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the server kept running after its only engine failed to load")
+            .expect("task");
+        assert!(finished.is_ok(), "{finished:?}");
+        let report = broken.shutdown();
+        let failure = shutdown_failure("q36", &report).expect("a failure line");
+        assert!(failure.contains("fixture load failure"), "{failure}");
+        let error = outcome(finished, vec![failure]).expect_err("a non-zero run");
+        assert!(
+            error.0.contains("engine q36 ended in state error"),
+            "{}",
+            error.0
+        );
+    }
+
+    /// The Flint expert-cache refusal of 2026-11-06 ("cuda admission ... Unset the variable ...
+    /// or lower context_limit") reaches the process the same way: the run fails and the
+    /// message, advice included, is the one on stderr.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flint_style_admission_refusal_ends_the_run_with_its_advice() {
+        let advice = "cuda admission: need 24463141520 bytes, device has 24005443584 free. \
+                      Unset the variable FIFI_FLINT_CUDA_EXPERT_CACHE or lower context_limit";
+        let refused = testkit::load_refused_engine(crate::EngError::MemoryPlan(advice.to_string()));
+        let entry = testkit::entry("flint", "model-a", &refused, 60_096);
+        let task = serve_without_signal(vec![entry]).await;
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the server kept running after the admission refusal")
+            .expect("task");
+        let report = refused.shutdown();
+        assert_eq!(report.state, EngineState::Error);
+        let failure = shutdown_failure("flint", &report).expect("a failure line");
+        let error = outcome(served, vec![failure]).expect_err("a non-zero run");
+        assert!(
+            error.0.contains("engine flint ended in state error"),
+            "{}",
+            error.0
+        );
+        assert!(error.0.contains("Unset the variable"), "{}", error.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_with_one_live_engine_keeps_serving_when_another_failed() {
+        let broken = testkit::failing_engine();
+        let live = testkit::engine(testkit::script("hi"));
+        let entries = vec![
+            testkit::entry("e1", "model-a", &broken, 4_096),
+            testkit::entry("e2", "model-b", &live, 4_096),
+        ];
+        testkit::wait_for_state(&entries[0].handle, EngineState::Error);
+        testkit::wait_for_state(&entries[1].handle, EngineState::Ready);
+        let task = serve_without_signal(entries).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "a live engine did not keep the server up"
+        );
+        task.abort();
+        broken.shutdown();
+        live.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_keeps_waiting_while_an_engine_is_still_loading() {
+        let (loading, gate) = testkit::gated_engine(testkit::script("hi"));
+        let entries = vec![testkit::entry("e1", "model-a", &loading, 4_096)];
+        let task = serve_without_signal(entries).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "the boot watch gave up on a loading engine"
+        );
+        task.abort();
+        drop(gate);
+        loading.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
