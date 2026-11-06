@@ -475,7 +475,10 @@ fn a_fault_that_does_not_fail_the_call_is_caught_by_name() {
     // later check to trip over a state it never made.
     let mut rig = Rig::new(Flaw::FaultNeverFires, false);
     let failure = expect_violation(failure_recovery(&mut rig.fake, VOCAB, &rows(4)), "F");
-    assert!(failure.detail.contains("did not fail the call"), "{failure}");
+    assert!(
+        failure.detail.contains("did not fail the call"),
+        "{failure}"
+    );
 }
 
 #[test]
@@ -674,7 +677,10 @@ fn a_tie_check_that_met_no_tie_says_so() {
     assert_eq!(describe_pass("E", &tied), "PASS comparisons=4 exact_ties=4");
     let line = describe_pass("E", &untied);
     assert!(line.starts_with("NOT-EXERCISED-TIE-RULE"), "{line}");
-    assert!(!line.contains("PASS"), "a PASS grep must not count it: {line}");
+    assert!(
+        !line.contains("PASS"),
+        "a PASS grep must not count it: {line}"
+    );
     assert!(!describe_pass("E", &untied).starts_with("PASS comparisons"));
     // Other checks have no tie count to report.
     assert_eq!(
