@@ -818,6 +818,70 @@ class PackRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(qi.InventoryError, "exl3 identity needs a non-empty bpw"):
             qi.validate_pack_registry(registry)
 
+    def test_scorer_margins_are_read_from_the_compiled_source(self):
+        compiled = qi.scorer_margins()
+        self.assertEqual(compiled["v6"], (0.02, -0.005, -0.01, -0.02))
+        self.assertEqual(compiled["v7"], (0.02, -0.005, 0.02, 0.02))
+
+    def test_registration_margin_drift_from_source_fails(self):
+        registry = self._bound()
+        registry["quality_standard"]["registrations"]["versions"]["v7"]["gates"]["copy"]["margin"] = 0.03
+        with self.assertRaisesRegex(qi.InventoryError, "declared margins"):
+            qi.validate_pack_registry(registry)
+
+    def test_v6_registration_stays_frozen_against_source(self):
+        registry = self._bound()
+        registry["quality_standard"]["registrations"]["versions"]["v6"]["gates"]["retrieval"]["margin"] = -0.07
+        with self.assertRaisesRegex(qi.InventoryError, "declared margins"):
+            qi.validate_pack_registry(registry)
+
+    def test_v7_cannot_change_the_nll_or_top1_gates(self):
+        registry = self._bound()
+        v7 = registry["quality_standard"]["registrations"]["versions"]["v7"]
+        v7["gates"]["nll"]["statistic"] = "something else"
+        with self.assertRaisesRegex(qi.InventoryError, "v7 nll gate must stay identical"):
+            qi.validate_pack_registry(registry)
+
+    def test_v7_must_change_the_probe_statistics(self):
+        registry = self._bound()
+        versions = registry["quality_standard"]["registrations"]["versions"]
+        versions["v7"]["gates"]["copy"]["statistic"] = versions["v6"]["gates"]["copy"]["statistic"]
+        with self.assertRaisesRegex(qi.InventoryError, "v7 must change the copy probe statistic"):
+            qi.validate_pack_registry(registry)
+
+    def test_unknown_registration_version_fails_closed(self):
+        registry = self._bound()
+        registry["quality_standard"]["registrations"]["versions"]["v8"] = {}
+        with self.assertRaisesRegex(qi.InventoryError, "versions must be exactly"):
+            qi.validate_pack_registry(registry)
+        registry = self._bound()
+        registry["quality_standard"]["registrations"]["current"] = "v8"
+        with self.assertRaisesRegex(qi.InventoryError, "current must name a declared version"):
+            qi.validate_pack_registry(registry)
+        registry = self._bound()
+        registry["packs"][1]["numerical_qualification"]["registered_under"] = "v5"
+        with self.assertRaisesRegex(qi.InventoryError, "registered_under must name a declared"):
+            qi.validate_pack_registry(registry)
+
+    def test_registered_under_needs_its_annotation(self):
+        registry = self._bound()
+        del registry["packs"][1]["numerical_qualification"]["annotation"]
+        with self.assertRaisesRegex(qi.InventoryError, "come together"):
+            qi.validate_pack_registry(registry)
+
+    def test_bootstrap_seed_and_draws_cannot_drift(self):
+        registry = self._bound()
+        registry["quality_standard"]["registrations"]["versions"]["v7"]["bootstrap"]["seed"] = 1
+        with self.assertRaisesRegex(qi.InventoryError, "frozen seed 20261031"):
+            qi.validate_pack_registry(registry)
+
+    def test_existing_exl3_verdicts_are_annotated_not_rejudged(self):
+        for pack in self._registry()["packs"][1:]:
+            numerical = pack["numerical_qualification"]
+            self.assertEqual(numerical["verdict"], "fail")
+            self.assertEqual(numerical["registered_under"], "v6")
+            self.assertIn("not re-judged", numerical["annotation"])
+
     def test_qualified_label_cannot_exceed_failed_evidence(self):
         registry = self._bound()
         registry["packs"][1]["production_eligibility"]["runtime_label"] = "qualified"

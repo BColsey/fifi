@@ -19,7 +19,98 @@
       "exact_copy_points": 1.0,
       "retrieval_points": 2.0
     },
-    "source": "doc/explanation/status.md"
+    "source": "doc/explanation/status.md",
+    "registrations": {
+      "current": "v7",
+      "scope": "A registration version applies to collections scored after it is registered. A verdict recorded under an earlier version is annotated, never re-judged.",
+      "selector": "m3_quality::Registration (M3_REGISTRATION=v6|v7 in the M3 compare step); an unknown version aborts before any math",
+      "versions": {
+        "v6": {
+          "status": "frozen",
+          "applies_to": "collections scored on build 82ca3d816 or 659b0028d (the 2026-11-02 P1/O1 campaign and the 2026-11-03 EXL3 4.50 run)",
+          "bootstrap": {
+            "method": "paired document-clustered bootstrap",
+            "rng": "xorshift64*",
+            "seed": 20261031,
+            "draws": 10000,
+            "bound": "one-sided nearest-rank 95%",
+            "probe_universe": "probe-bearing clusters, compacted"
+          },
+          "gates": {
+            "nll": {
+              "statistic": "true-token NLL difference, all scored positions",
+              "bound": "upper",
+              "margin": 0.02,
+              "unit": "nats"
+            },
+            "top1": {
+              "statistic": "top-1 accuracy difference, all scored positions",
+              "bound": "lower",
+              "margin": -0.005,
+              "unit": "fraction"
+            },
+            "copy": {
+              "statistic": "exact-match rate difference (all span tokens argmax-correct)",
+              "bound": "lower",
+              "margin": -0.01,
+              "unit": "fraction"
+            },
+            "retrieval": {
+              "statistic": "exact-match rate difference (all span tokens argmax-correct)",
+              "bound": "lower",
+              "margin": -0.02,
+              "unit": "fraction"
+            }
+          },
+          "known_limit": "The exact-match probe gates are underpowered: with n=174 retrieval and n=387 copy probes, two equal-quality packs pass all four gates about 10% of the time (P(pass | true difference 0) about 0.19 retrieval, 0.50 copy). A probe-gate failure under v6 is inconclusive unless the point estimate is itself adverse."
+        },
+        "v7": {
+          "status": "registered 2026-11-06 (Dan, option c); applies to future collections only; no data had been scored under it when it was fixed",
+          "bootstrap": {
+            "method": "paired document-clustered bootstrap",
+            "rng": "xorshift64*",
+            "seed": 20261031,
+            "draws": 10000,
+            "bound": "one-sided nearest-rank 95%",
+            "probe_universe": "probe-bearing clusters, compacted"
+          },
+          "gates": {
+            "nll": {
+              "statistic": "true-token NLL difference, all scored positions",
+              "bound": "upper",
+              "margin": 0.02,
+              "unit": "nats"
+            },
+            "top1": {
+              "statistic": "top-1 accuracy difference, all scored positions",
+              "bound": "lower",
+              "margin": -0.005,
+              "unit": "fraction"
+            },
+            "copy": {
+              "statistic": "probe-span NLL difference: per probe the mean true-token NLL over the span, pooled probe-weighted",
+              "bound": "upper",
+              "margin": 0.02,
+              "unit": "nats"
+            },
+            "retrieval": {
+              "statistic": "probe-span NLL difference: per probe the mean true-token NLL over the span, pooled probe-weighted",
+              "bound": "upper",
+              "margin": 0.02,
+              "unit": "nats"
+            }
+          },
+          "secondary_reported_not_gated": [
+            "exact-match rate difference, lower bound (copy and retrieval)",
+            "probe-span argmax accuracy difference, lower bound (copy and retrieval)"
+          ],
+          "power": "On the recorded layout (174 retrieval, 387 copy probes), P(pass | true difference 0) is about 0.97 or more per probe gate and about 0.96 or more for all four gates jointly under cross-format churn; P(pass | true harm = margin) is 0.054-0.068 (nominal 0.05); P(pass | harm 0.0225 nats) is at most 0.022. Source: qualification/o1-gate-v7/ANALYSIS.md.",
+          "evidence": [
+            "qualification/o1-gate-v7/ANALYSIS.md"
+          ]
+        }
+      }
+    }
   },
   "packs": [
     {
@@ -73,7 +164,9 @@
         "evidence": [
           "docs/plans/xinfer-adoption-audit.md:127-135 'EXL3 4.00 | 256K memory-admitted | NOT qualified (O1 failed)'",
           "doc/explanation/status.md: quality standard note - quality against the GGUF engine applies"
-        ]
+        ],
+        "registered_under": "v6",
+        "annotation": "Registered under v6; not re-judged. NLL gap is real (+0.0234 nats, upper bound +0.0284 > +0.02); the exact-match probe failures are inconclusive per the 2026-11-06 power analysis."
       },
       "production_eligibility": {
         "runtime_label": "experimental",
@@ -99,7 +192,9 @@
         "gate": "frozen O1 quality evaluation against the GGUF engine",
         "evidence": [
           "docs/plans/xinfer-adoption-audit.md:134-135 'EXL3 4.50 | 128K memory-admitted; 256K refused by 89.2 MB | NOT qualified (O1 failed)'"
-        ]
+        ],
+        "registered_under": "v6",
+        "annotation": "Registered under v6; not re-judged. NLL and top-1 gates passed; the exact-match probe failures are inconclusive per the 2026-11-06 power analysis."
       },
       "production_eligibility": {
         "runtime_label": "experimental",

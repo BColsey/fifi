@@ -12,7 +12,7 @@
 //! everything before it: every chunk self-describes the arm and build that
 //! produced it.
 
-use super::m3_quality::{Comparison, Margins, PositionRow, ProbeRow};
+use super::m3_quality::{ArmRowsRef, PositionRow, Registration, SpanRow, score};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -364,8 +364,8 @@ pub(in crate::family::qwen36) fn read_sidecar(
 struct ArmRows {
     identity: ArmIdentity,
     positions: Vec<PositionRow>,
-    retrieval: Vec<ProbeRow>,
-    copy: Vec<ProbeRow>,
+    retrieval: Vec<SpanRow>,
+    copy: Vec<SpanRow>,
 }
 
 fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
@@ -407,21 +407,25 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
     }
     // A probe span id is exact iff the arm's argmax matched the true id at
     // that position; span ids always lie inside their window's scored run.
-    let exact_at = |p: usize| -> Option<bool> {
+    // The row also carries the span's argmax share and mean NLL (v7); the
+    // v6 exact flag is computed by the same all-token rule as before.
+    let rows_at = |p: usize| -> Option<(f32, bool)> {
         window_rows
             .iter()
             .find(|(score_lo, rows)| p >= *score_lo && p - *score_lo < rows.len())
-            .map(|(score_lo, rows)| rows[p - score_lo].1)
+            .map(|(score_lo, rows)| (rows[p - score_lo].0, rows[p - score_lo].1))
     };
     let mut retrieval = Vec::new();
     let mut copy = Vec::new();
     for &(span_lo, span_hi, cluster, is_copy) in &layout.probes {
-        let mut exact = true;
+        let mut span = Vec::with_capacity(span_hi - span_lo);
         for p in span_lo..span_hi {
-            exact &= exact_at(p)
-                .ok_or_else(|| err(&format!("probe position {p} lies in no scored window")))?;
+            span.push(
+                rows_at(p)
+                    .ok_or_else(|| err(&format!("probe position {p} lies in no scored window")))?,
+            );
         }
-        let row = ProbeRow { cluster, exact };
+        let row = SpanRow::from_span(cluster, &span).map_err(|e| err(&e))?;
         if is_copy {
             copy.push(row);
         } else {
@@ -486,23 +490,36 @@ fn m3_compare() {
         cand.identity.1, reference.identity.1,
         "the two arms were scored on different builds"
     );
-    let comparison = Comparison::evaluate(
-        &cand.positions,
-        &reference.positions,
-        &cand.copy,
-        &reference.copy,
-        &cand.retrieval,
-        &reference.retrieval,
+    // M3_REGISTRATION selects the scoring rule: unset keeps the registered v6
+    // path; any value other than v6/v7 aborts before any math (fail closed).
+    let registration = match std::env::var("M3_REGISTRATION") {
+        Ok(text) => Registration::parse(&text).expect("M3_REGISTRATION"),
+        Err(std::env::VarError::NotPresent) => Registration::V6,
+        Err(e) => panic!("M3_REGISTRATION: {e}"),
+    };
+    let scored = score(
+        registration,
+        &ArmRowsRef {
+            positions: &cand.positions,
+            retrieval: &cand.retrieval,
+            copy: &cand.copy,
+        },
+        &ArmRowsRef {
+            positions: &reference.positions,
+            retrieval: &reference.retrieval,
+            copy: &reference.copy,
+        },
         N_CLUSTERS,
         DRAWS,
         SEED,
     );
-    let verdict = comparison.passes(&Margins::frozen());
+    let verdict = scored.passes();
     println!(
-        "m3 comparison {label}: cand arm {want_cand:?} ref arm {want_ref:?} build {:02x?}: {comparison:?} verdict={verdict}",
+        "m3 comparison {label}: registration={} cand arm {want_cand:?} ref arm {want_ref:?} build {:02x?}: {scored:?} verdict={verdict}",
+        registration.label(),
         cand.identity.1
     );
-    assert!(verdict, "the frozen margins failed: {comparison:?}");
+    assert!(verdict, "the registered margins failed: {scored:?}");
 }
 
 /// The arm-4 gate: the two trace legs' digest files (one sha256 per
@@ -578,6 +595,7 @@ fn m3_trace_compare() {
 
 #[cfg(test)]
 mod tests {
+    use super::super::m3_quality::{Comparison, Margins, ProbeRow};
     use super::*;
 
     /// The frozen v5 layout files load and match every REGISTERED digest and
@@ -758,5 +776,65 @@ mod tests {
                 "{name}: {err}"
             );
         }
+    }
+
+    /// The recorded v6 sidecars reproduce every REGISTERED v6 bound to the six
+    /// printed digits through the version-dispatched scorer, and the v6 path
+    /// still gives the registered verdicts (P1 FAIL on retrieval, O1 FAIL on
+    /// three gates). `M3_V6_REPRO_ROOT` holds arm1, arm2, arm2p and arm3
+    /// sidecar sets of the 82ca3d816 campaign (the registration's section 7
+    /// numbers); `M3_LAYOUT_DIR` holds the frozen layout.
+    #[test]
+    #[ignore = "needs the recorded v6 sidecars: M3_V6_REPRO_ROOT=score-v6 dir, M3_LAYOUT_DIR=layout dir"]
+    fn v6_registered_bounds_reproduce_on_recorded_sidecars() {
+        let layout = load_layout(&crate::test_paths::required("M3_LAYOUT_DIR")).expect("layout");
+        let root = crate::test_paths::required("M3_V6_REPRO_ROOT");
+        let arm = |name: &str| arm_rows(&root.join(name), &layout).expect("arm sidecars");
+        let run = |cand: &ArmRows, reference: &ArmRows| {
+            let r = |a: &ArmRows| (a.positions.clone(), a.retrieval.clone(), a.copy.clone());
+            let ((cp, cr, cc), (rp, rr, rc)) = (r(cand), r(reference));
+            match score(
+                Registration::V6,
+                &ArmRowsRef {
+                    positions: &cp,
+                    retrieval: &cr,
+                    copy: &cc,
+                },
+                &ArmRowsRef {
+                    positions: &rp,
+                    retrieval: &rr,
+                    copy: &rc,
+                },
+                N_CLUSTERS,
+                DRAWS,
+                SEED,
+            ) {
+                super::super::m3_quality::Scored::V6(c) => c,
+                other => panic!("v6 dispatch returned {other:?}"),
+            }
+        };
+        let six = |x: f64| (x * 1e6).round() / 1e6;
+        let p1 = run(&arm("arm3"), &arm("arm2"));
+        assert_eq!(
+            (
+                six(p1.nll_ub),
+                six(p1.top1_lb),
+                six(p1.probe_lb),
+                six(p1.retrieval_lb)
+            ),
+            (0.000271, -0.000272, -0.005051, -0.034091)
+        );
+        assert!(!p1.passes(&Margins::frozen()));
+        let o1 = run(&arm("arm2p"), &arm("arm1"));
+        assert_eq!(
+            (
+                six(o1.nll_ub),
+                six(o1.top1_lb),
+                six(o1.probe_lb),
+                six(o1.retrieval_lb)
+            ),
+            (0.028420, -0.002752, -0.012594, -0.062147)
+        );
+        assert!(!o1.passes(&Margins::frozen()));
     }
 }

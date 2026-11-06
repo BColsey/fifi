@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5943,
-      "ignored": 497,
+      "test_fns": 5952,
+      "ignored": 498,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -209,6 +209,7 @@
         "LC_PROMPT",
         "LC_TOKENIZER_DIR",
         "M3_COMPARE",
+        "M3_REGISTRATION",
         "M3_TRACE_COMPARE",
         "NEM35_CHUNK_EXPERTS",
         "NEM35_CUDA_CHUNK_PREFILL",
@@ -332,7 +333,11 @@
         },
         "M3_LAYOUT_DIR": {
           "or_skip": 2,
-          "required": 2
+          "required": 3
+        },
+        "M3_V6_REPRO_ROOT": {
+          "or_skip": 0,
+          "required": 1
         },
         "Q36_CUDA_COHORT_DIR": {
           "or_skip": 0,

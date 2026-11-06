@@ -20,7 +20,7 @@
 /// floors tolerate a small drop, matching the registered quality standard
 /// of 30 Oct 2026, recorded in `doc/explanation/status.md`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Margins {
+pub(in crate::family::qwen36) struct Margins {
     pub nll_ub: f64,
     pub top1_lb: f64,
     pub copy_lb: f64,
@@ -170,7 +170,7 @@ fn probe_rows(rows: &[ProbeRow]) -> Vec<f64> {
 /// The full verdict of one comparison from both arms' frozen rows. Pure: the
 /// device arms produce the rows, this decides.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Comparison {
+pub(in crate::family::qwen36) struct Comparison {
     pub nll_ub: f64,
     pub top1_lb: f64,
     pub probe_lb: f64,
@@ -269,6 +269,285 @@ impl Comparison {
             && self.top1_lb >= margins.top1_lb
             && self.probe_lb >= margins.copy_lb
             && self.retrieval_lb >= margins.retrieval_lb
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration v7 (2026-11-06): the probe gates use the probe-span NLL.
+//
+// v6 (everything above) is frozen: its exact-match probe gates are
+// underpowered (two equal-quality packs pass all four gates about 10% of the
+// time). v7 is a NEW code path selected by `Registration`; `Registration::V6`
+// delegates to `Comparison::evaluate` untouched, so every v6 result
+// reproduces bit-identically. v7 applies to FUTURE collections only.
+// ---------------------------------------------------------------------------
+
+/// The registration version that selects the scoring code path. Unknown
+/// versions are refused: a typo must never fall through to a default rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::family::qwen36) enum Registration {
+    V6,
+    V7,
+}
+
+impl Registration {
+    /// `"v6"` or `"v7"`; anything else is an error (fail closed).
+    pub(in crate::family::qwen36) fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "v6" => Ok(Registration::V6),
+            "v7" => Ok(Registration::V7),
+            other => Err(format!(
+                "unknown registration version {other:?}: this scorer knows v6 and v7 only"
+            )),
+        }
+    }
+
+    pub(in crate::family::qwen36) fn label(self) -> &'static str {
+        match self {
+            Registration::V6 => "v6",
+            Registration::V7 => "v7",
+        }
+    }
+}
+
+/// One probe of one arm with every per-token statistic the sidecar supports:
+/// the all-token-exact flag (v6 gate, v7 secondary), the share of span
+/// tokens whose argmax matched (secondary), and the mean true-token NLL over
+/// the span (v7 gate). Each is a probe-level value; the bootstrap pools them
+/// probe-weighted (every probe counts once, however long its span).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::family::qwen36) struct SpanRow {
+    pub cluster: u32,
+    pub exact: bool,
+    pub span_acc: f64,
+    pub span_nll: f64,
+}
+
+impl SpanRow {
+    /// Builds the row from the span's `(logprob_true, top1_correct)` pairs.
+    /// An empty span or a non-true log-probability (positive or non-finite)
+    /// is refused, as `nll_rows` refuses it for positions.
+    pub(in crate::family::qwen36) fn from_span(
+        cluster: u32,
+        span: &[(f32, bool)],
+    ) -> Result<Self, String> {
+        if span.is_empty() {
+            return Err("empty probe span".to_string());
+        }
+        let mut nll = 0.0_f64;
+        let mut correct = 0usize;
+        for &(logprob, ok) in span {
+            if logprob > 0.0 || !logprob.is_finite() {
+                return Err(format!(
+                    "span row with logprob {logprob:?}: not a true log-probability"
+                ));
+            }
+            nll -= f64::from(logprob);
+            correct += usize::from(ok);
+        }
+        let n = span.len() as f64;
+        Ok(SpanRow {
+            cluster,
+            exact: correct == span.len(),
+            span_acc: correct as f64 / n,
+            span_nll: nll / n,
+        })
+    }
+
+    fn exact_row(&self) -> ProbeRow {
+        ProbeRow {
+            cluster: self.cluster,
+            exact: self.exact,
+        }
+    }
+}
+
+/// The v7 gate margins. NLL and top-1 are the v6 values unchanged; the two
+/// probe gates are ceilings on the probe-span NLL difference (nats).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::family::qwen36) struct MarginsV7 {
+    pub nll_ub: f64,
+    pub top1_lb: f64,
+    pub retrieval_span_nll_ub: f64,
+    pub copy_span_nll_ub: f64,
+}
+
+impl MarginsV7 {
+    pub(in crate::family::qwen36) fn registered() -> Self {
+        MarginsV7 {
+            nll_ub: 0.02,
+            top1_lb: -0.005,
+            retrieval_span_nll_ub: 0.02,
+            copy_span_nll_ub: 0.02,
+        }
+    }
+}
+
+/// The v7 verdict inputs plus the reported-only secondary statistics. The
+/// secondary bounds never enter `passes`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::family::qwen36) struct ComparisonV7 {
+    pub nll_ub: f64,
+    pub top1_lb: f64,
+    pub retrieval_span_nll_ub: f64,
+    pub copy_span_nll_ub: f64,
+    /// Secondary (reported, not gated): lower bounds of the v6 exact-match
+    /// rates and of the probe-span argmax accuracy.
+    pub retrieval_exact_lb: f64,
+    pub copy_exact_lb: f64,
+    pub retrieval_span_acc_lb: f64,
+    pub copy_span_acc_lb: f64,
+}
+
+/// One arm's scored rows: positions plus both probe sets.
+pub(in crate::family::qwen36) struct ArmRowsRef<'a> {
+    pub positions: &'a [PositionRow],
+    pub retrieval: &'a [SpanRow],
+    pub copy: &'a [SpanRow],
+}
+
+/// The one-sided bound of the probe-level `pick` statistic over the
+/// probe-bearing cluster universe (the same compaction the v6 probe gates
+/// use, so no draw is event-free).
+fn span_bound(
+    cand: &[SpanRow],
+    refr: &[SpanRow],
+    pick: fn(&SpanRow) -> f64,
+    n_draws: usize,
+    seed: u64,
+    upper: bool,
+) -> f64 {
+    let mut universe: Vec<u32> = cand.iter().chain(refr).map(|row| row.cluster).collect();
+    universe.sort_unstable();
+    universe.dedup();
+    let c: Vec<u32> = cand
+        .iter()
+        .map(|row| universe.binary_search(&row.cluster).expect("compact") as u32)
+        .collect();
+    let cand_v: Vec<f64> = cand.iter().map(pick).collect();
+    let ref_v: Vec<f64> = refr.iter().map(pick).collect();
+    bootstrap_bound(
+        &cand_v,
+        &ref_v,
+        &c,
+        universe.len() as u32,
+        n_draws,
+        seed,
+        upper,
+    )
+}
+
+impl ComparisonV7 {
+    pub(in crate::family::qwen36) fn evaluate(
+        cand: &ArmRowsRef<'_>,
+        refr: &ArmRowsRef<'_>,
+        n_clusters: u32,
+        draws: usize,
+        seed: u64,
+    ) -> Self {
+        for (c_rows, r_rows) in [(cand.retrieval, refr.retrieval), (cand.copy, refr.copy)] {
+            assert!(
+                c_rows.len() == r_rows.len()
+                    && c_rows
+                        .iter()
+                        .zip(r_rows)
+                        .all(|(c, r)| c.cluster == r.cluster),
+                "reference probe rows are not aligned with candidate rows"
+            );
+        }
+        // Positions, top-1 and the v6 exact-match secondary bounds go through
+        // the frozen v6 evaluation unchanged; only the probe gates differ.
+        let exact = |rows: &[SpanRow]| rows.iter().map(SpanRow::exact_row).collect::<Vec<_>>();
+        let v6 = Comparison::evaluate(
+            cand.positions,
+            refr.positions,
+            &exact(cand.copy),
+            &exact(refr.copy),
+            &exact(cand.retrieval),
+            &exact(refr.retrieval),
+            n_clusters,
+            draws,
+            seed,
+        );
+        let nll = |r: &SpanRow| r.span_nll;
+        let acc = |r: &SpanRow| r.span_acc;
+        ComparisonV7 {
+            nll_ub: v6.nll_ub,
+            top1_lb: v6.top1_lb,
+            retrieval_span_nll_ub: span_bound(
+                cand.retrieval,
+                refr.retrieval,
+                nll,
+                draws,
+                seed,
+                true,
+            ),
+            copy_span_nll_ub: span_bound(cand.copy, refr.copy, nll, draws, seed, true),
+            retrieval_exact_lb: v6.retrieval_lb,
+            copy_exact_lb: v6.probe_lb,
+            retrieval_span_acc_lb: span_bound(
+                cand.retrieval,
+                refr.retrieval,
+                acc,
+                draws,
+                seed,
+                false,
+            ),
+            copy_span_acc_lb: span_bound(cand.copy, refr.copy, acc, draws, seed, false),
+        }
+    }
+
+    /// All four v7 gates must hold; the secondary statistics are not gates.
+    pub(in crate::family::qwen36) fn passes(&self, margins: &MarginsV7) -> bool {
+        self.nll_ub <= margins.nll_ub
+            && self.top1_lb >= margins.top1_lb
+            && self.retrieval_span_nll_ub <= margins.retrieval_span_nll_ub
+            && self.copy_span_nll_ub <= margins.copy_span_nll_ub
+    }
+}
+
+/// The result of scoring one comparison under a registration version.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::family::qwen36) enum Scored {
+    V6(Comparison),
+    V7(ComparisonV7),
+}
+
+impl Scored {
+    pub(in crate::family::qwen36) fn passes(&self) -> bool {
+        match self {
+            Scored::V6(c) => c.passes(&Margins::frozen()),
+            Scored::V7(c) => c.passes(&MarginsV7::registered()),
+        }
+    }
+}
+
+/// Scores one comparison under `registration`. `V6` is the frozen scorer
+/// (exact-match probe gates) with no change in arithmetic.
+pub(in crate::family::qwen36) fn score(
+    registration: Registration,
+    cand: &ArmRowsRef<'_>,
+    refr: &ArmRowsRef<'_>,
+    n_clusters: u32,
+    draws: usize,
+    seed: u64,
+) -> Scored {
+    match registration {
+        Registration::V6 => {
+            let exact = |rows: &[SpanRow]| rows.iter().map(SpanRow::exact_row).collect::<Vec<_>>();
+            Scored::V6(Comparison::evaluate(
+                cand.positions,
+                refr.positions,
+                &exact(cand.copy),
+                &exact(refr.copy),
+                &exact(cand.retrieval),
+                &exact(refr.retrieval),
+                n_clusters,
+                draws,
+                seed,
+            ))
+        }
+        Registration::V7 => Scored::V7(ComparisonV7::evaluate(cand, refr, n_clusters, draws, seed)),
     }
 }
 
@@ -653,6 +932,244 @@ mod tests {
         assert!(
             bad.probe_lb < -0.01 && !bad.passes(&Margins::frozen()),
             "{bad:?}"
+        );
+    }
+
+    // ---- registration v7 ----
+
+    fn span_rows(spec: &[(u32, bool, f64, f64)]) -> Vec<SpanRow> {
+        spec.iter()
+            .map(|&(cluster, exact, span_acc, span_nll)| SpanRow {
+                cluster,
+                exact,
+                span_acc,
+                span_nll,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unknown_registration_version_fails_closed() {
+        assert_eq!(Registration::parse("v6"), Ok(Registration::V6));
+        assert_eq!(Registration::parse("v7"), Ok(Registration::V7));
+        for bad in ["", "v5", "v8", "V7", "7", "v7 ", "latest", "v6,v7"] {
+            let err = Registration::parse(bad).expect_err(bad);
+            assert!(err.contains("unknown registration version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn span_row_statistics_on_a_small_case() {
+        // Four tokens: NLL 0.5, 1.0, 0.0, 1.5 -> mean 0.75; three argmax hits.
+        let row = SpanRow::from_span(7, &[(-0.5, true), (-1.0, true), (0.0, true), (-1.5, false)])
+            .unwrap();
+        assert_eq!(row.cluster, 7);
+        assert!(!row.exact);
+        assert_eq!(row.span_acc, 0.75);
+        assert_eq!(row.span_nll, 0.75);
+        let exact = SpanRow::from_span(1, &[(-0.25, true), (-0.75, true)]).unwrap();
+        assert!(exact.exact && exact.span_acc == 1.0 && exact.span_nll == 0.5);
+        // The v6 exact flag is the all-token rule, unchanged.
+        assert_eq!(
+            exact.exact_row(),
+            ProbeRow {
+                cluster: 1,
+                exact: true
+            }
+        );
+    }
+
+    #[test]
+    fn span_row_refuses_empty_positive_and_non_finite() {
+        assert!(SpanRow::from_span(0, &[]).is_err());
+        assert!(SpanRow::from_span(0, &[(0.5, true)]).is_err());
+        assert!(SpanRow::from_span(0, &[(f32::NAN, true)]).is_err());
+        assert!(SpanRow::from_span(0, &[(f32::NEG_INFINITY, true)]).is_err());
+    }
+
+    /// Small deterministic arms over three clusters, with probe spans.
+    fn v7_fixture(
+        retr_nll: f64,
+        copy_nll: f64,
+        retr_exact: bool,
+    ) -> (Vec<PositionRow>, Vec<SpanRow>, Vec<SpanRow>) {
+        let pos = rows(&[-1.0; 12], &[true; 12], 4);
+        let retr = span_rows(
+            &(0..6)
+                .map(|i| ((i % 3) as u32, retr_exact, 1.0, retr_nll))
+                .collect::<Vec<_>>(),
+        );
+        let copy = span_rows(
+            &(0..6)
+                .map(|i| ((i % 3) as u32, true, 1.0, copy_nll))
+                .collect::<Vec<_>>(),
+        );
+        (pos, retr, copy)
+    }
+
+    fn v7_eval(
+        cand: &(Vec<PositionRow>, Vec<SpanRow>, Vec<SpanRow>),
+        refr: &(Vec<PositionRow>, Vec<SpanRow>, Vec<SpanRow>),
+    ) -> ComparisonV7 {
+        ComparisonV7::evaluate(
+            &ArmRowsRef {
+                positions: &cand.0,
+                retrieval: &cand.1,
+                copy: &cand.2,
+            },
+            &ArmRowsRef {
+                positions: &refr.0,
+                retrieval: &refr.1,
+                copy: &refr.2,
+            },
+            3,
+            500,
+            20261031,
+        )
+    }
+
+    #[test]
+    fn v7_identical_arms_pass_with_zero_bounds() {
+        let a = v7_fixture(0.4, 0.3, true);
+        let cmp = v7_eval(&a, &a);
+        assert!(cmp.passes(&MarginsV7::registered()), "{cmp:?}");
+        assert!(cmp.retrieval_span_nll_ub.abs() < 1e-12 && cmp.copy_span_nll_ub.abs() < 1e-12);
+        assert!(cmp.retrieval_span_acc_lb.abs() < 1e-12 && cmp.copy_span_acc_lb.abs() < 1e-12);
+    }
+
+    /// Direction cases: span NLL worse by more than 0.02 nats fails each
+    /// probe gate on its own side; better passes with room.
+    #[test]
+    fn v7_probe_span_nll_direction_cases() {
+        let refr = v7_fixture(0.40, 0.30, true);
+        let m = MarginsV7::registered();
+        let retr_bad = v7_eval(&v7_fixture(0.45, 0.30, true), &refr);
+        assert!(
+            (retr_bad.retrieval_span_nll_ub - 0.05).abs() < 1e-9,
+            "{retr_bad:?}"
+        );
+        assert!(!retr_bad.passes(&m));
+        let copy_bad = v7_eval(&v7_fixture(0.40, 0.33, true), &refr);
+        assert!(
+            (copy_bad.copy_span_nll_ub - 0.03).abs() < 1e-9,
+            "{copy_bad:?}"
+        );
+        assert!(!copy_bad.passes(&m));
+        let better = v7_eval(&v7_fixture(0.35, 0.25, true), &refr);
+        assert!(better.retrieval_span_nll_ub < 0.0 && better.copy_span_nll_ub < 0.0);
+        assert!(better.passes(&m));
+        // Exactly inside the margin passes: +0.019 < +0.02.
+        assert!(v7_eval(&v7_fixture(0.419, 0.319, true), &refr).passes(&m));
+    }
+
+    /// Exact match is a reported secondary, not a gate: losing every exact
+    /// retrieval hit at an unchanged span NLL leaves v7 passing and shows up
+    /// only in the secondary bound; the v6 path fails the same data.
+    #[test]
+    fn v7_exact_match_is_reported_but_not_gated() {
+        let refr = v7_fixture(0.40, 0.30, true);
+        let cand = v7_fixture(0.40, 0.30, false);
+        let cmp = v7_eval(&cand, &refr);
+        assert!(cmp.passes(&MarginsV7::registered()), "{cmp:?}");
+        assert!(cmp.retrieval_exact_lb < -0.5, "{cmp:?}");
+        let v6 = score(
+            Registration::V6,
+            &ArmRowsRef {
+                positions: &cand.0,
+                retrieval: &cand.1,
+                copy: &cand.2,
+            },
+            &ArmRowsRef {
+                positions: &refr.0,
+                retrieval: &refr.1,
+                copy: &refr.2,
+            },
+            3,
+            500,
+            20261031,
+        );
+        assert!(!v6.passes(), "{v6:?}");
+    }
+
+    /// The v6 branch of `score` is the frozen evaluation with no change in
+    /// arithmetic: bit-identical to `Comparison::evaluate` on the same rows.
+    #[test]
+    fn v6_dispatch_is_bit_identical_to_the_frozen_evaluation() {
+        let a: Vec<PositionRow> = rows(
+            &[-1.0, -2.0, -1.5, -0.7, -1.2, -1.8, -0.3, -2.2, -0.9],
+            &[true, false, true, true, false, true, true, false, true],
+            3,
+        );
+        let b: Vec<PositionRow> = rows(
+            &[-1.1, -1.9, -1.6, -0.6, -1.3, -1.7, -0.4, -2.0, -1.0],
+            &[true, true, true, false, false, true, true, true, true],
+            3,
+        );
+        let probe = |flags: &[bool]| {
+            span_rows(
+                &flags
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &e)| ((i % 3) as u32, e, 0.5, 0.7))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (cr, rr) = (
+            probe(&[true, false, true, true, false, true]),
+            probe(&[true, true, true, false, false, true]),
+        );
+        let (cc, rc) = (
+            probe(&[false, false, true, true, true, true]),
+            probe(&[true, false, true, false, true, true]),
+        );
+        let exact = |rows: &[SpanRow]| rows.iter().map(SpanRow::exact_row).collect::<Vec<_>>();
+        let frozen = Comparison::evaluate(
+            &a,
+            &b,
+            &exact(&cc),
+            &exact(&rc),
+            &exact(&cr),
+            &exact(&rr),
+            3,
+            300,
+            20261031,
+        );
+        let routed = score(
+            Registration::V6,
+            &ArmRowsRef {
+                positions: &a,
+                retrieval: &cr,
+                copy: &cc,
+            },
+            &ArmRowsRef {
+                positions: &b,
+                retrieval: &rr,
+                copy: &rc,
+            },
+            3,
+            300,
+            20261031,
+        );
+        match routed {
+            Scored::V6(c) => {
+                assert_eq!(c.nll_ub.to_bits(), frozen.nll_ub.to_bits());
+                assert_eq!(c.top1_lb.to_bits(), frozen.top1_lb.to_bits());
+                assert_eq!(c.probe_lb.to_bits(), frozen.probe_lb.to_bits());
+                assert_eq!(c.retrieval_lb.to_bits(), frozen.retrieval_lb.to_bits());
+            }
+            other => panic!("v6 dispatched to {other:?}"),
+        }
+        assert_eq!(routed.passes(), frozen.passes(&Margins::frozen()));
+    }
+
+    #[test]
+    fn v7_margins_keep_nll_and_top1_unchanged() {
+        let v7 = MarginsV7::registered();
+        let v6 = Margins::frozen();
+        assert_eq!((v7.nll_ub, v7.top1_lb), (v6.nll_ub, v6.top1_lb));
+        assert_eq!(
+            (v7.retrieval_span_nll_ub, v7.copy_span_nll_ub),
+            (0.02, 0.02)
         );
     }
 }

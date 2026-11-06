@@ -563,6 +563,10 @@ PACK_KEYS = {"id", "family", "weights", "identity", "loads",
 VERDICTS = {"reference", "pass", "fail", "not_run"}
 RUNTIME_LABELS = {"qualified", "experimental", "unverified"}
 MARGIN_KEYS = {"true_token_nll_nats", "top1_points", "exact_copy_points", "retrieval_points"}
+M3_QUALITY_PATH = ENGINE_ROOT / "src" / "family" / "qwen36" / "resident" / "m3_quality.rs"
+REGISTRATION_VERSIONS = {"v6", "v7"}
+REGISTRATION_GATES = {"nll", "top1", "copy", "retrieval"}
+NUMERICAL_OPTIONAL_KEYS = {"registered_under", "annotation"}
 
 # Identity assurance strengths the contract may declare. Only tokenizer
 # hashes are cryptographic: a matching filename, tensor shape, or bpw label
@@ -575,6 +579,86 @@ CONTRACT_FIELDS = {
     "exl3_bpw_label": "documentation-derived",
     "exl3_exact_pack_contents": "not established by current loader pins",
 }
+
+
+def scorer_margins() -> dict[str, tuple[float, ...]]:
+    """The registered margins the Rust scorer compiles in (m3_quality.rs).
+
+    v6 order: nll_ub, top1_lb, copy_lb, retrieval_lb. v7 order: nll_ub,
+    top1_lb, copy span-NLL ceiling, retrieval span-NLL ceiling.
+    """
+    text = _read(M3_QUALITY_PATH)
+    number = r"(-?[0-9]+(?:\.[0-9]+)?)"
+    v6 = re.search(
+        r"fn frozen\(\) -> Self \{\s*Margins \{\s*nll_ub: " + number + r",\s*top1_lb: " + number
+        + r",\s*copy_lb: " + number + r",\s*retrieval_lb: " + number + r",",
+        text,
+    )
+    v7 = re.search(
+        r"fn registered\(\) -> Self \{\s*MarginsV7 \{\s*nll_ub: " + number + r",\s*top1_lb: " + number
+        + r",\s*retrieval_span_nll_ub: " + number + r",\s*copy_span_nll_ub: " + number + r",",
+        text,
+    )
+    if not v6 or not v7:
+        raise InventoryError(f"{M3_QUALITY_PATH}: the registered margin constants were not found")
+    n6 = tuple(float(g) for g in v6.groups())
+    n7 = tuple(float(g) for g in v7.groups())
+    # Reorder v7 to nll, top1, copy, retrieval to match v6.
+    return {"v6": n6, "v7": (n7[0], n7[1], n7[3], n7[2])}
+
+
+def validate_registrations(registrations: object, problems: list[str]) -> set[str]:
+    """Check the scorer registration versions; return the declared version names."""
+    if not isinstance(registrations, dict) or set(registrations) != {"current", "scope", "selector", "versions"}:
+        problems.append("quality_standard.registrations must have exactly current, scope, selector, versions")
+        return set()
+    versions = registrations["versions"]
+    if not isinstance(versions, dict) or set(versions) != REGISTRATION_VERSIONS:
+        problems.append(f"quality_standard.registrations.versions must be exactly {sorted(REGISTRATION_VERSIONS)}")
+        return set()
+    if registrations["current"] not in versions:
+        problems.append("quality_standard.registrations.current must name a declared version")
+    try:
+        compiled = scorer_margins()
+    except InventoryError as error:
+        problems.append(f"registrations: {error}")
+        compiled = {}
+    for name, entry in versions.items():
+        where = f"registrations.versions.{name}"
+        if not isinstance(entry, dict):
+            problems.append(f"{where}: not an object")
+            continue
+        gates = entry.get("gates")
+        if not isinstance(gates, dict) or set(gates) != REGISTRATION_GATES:
+            problems.append(f"{where}.gates must have exactly {sorted(REGISTRATION_GATES)}")
+            continue
+        for gate, spec in gates.items():
+            if (not isinstance(spec, dict) or set(spec) != {"statistic", "bound", "margin", "unit"}
+                    or spec["bound"] not in ("upper", "lower")
+                    or not isinstance(spec["margin"], (int, float))):
+                problems.append(f"{where}.gates.{gate} must have statistic, bound (upper or lower), numeric margin, unit")
+                continue
+            # An upper bound is a ceiling (positive margin), a lower bound a floor (negative).
+            if (spec["bound"] == "upper") != (spec["margin"] > 0):
+                problems.append(f"{where}.gates.{gate}: margin sign contradicts its {spec['bound']} bound")
+        bootstrap = entry.get("bootstrap")
+        if not isinstance(bootstrap, dict) or bootstrap.get("seed") != 20261031 or bootstrap.get("draws") != 10000:
+            problems.append(f"{where}.bootstrap must keep the frozen seed 20261031 and 10000 draws")
+        if name in compiled and all(isinstance(gates.get(g), dict) for g in REGISTRATION_GATES):
+            declared = tuple(float(gates[g]["margin"]) for g in ("nll", "top1", "copy", "retrieval"))
+            if declared != compiled[name]:
+                problems.append(
+                    f"{where}: declared margins {declared} != the margins compiled into m3_quality.rs {compiled[name]}"
+                )
+    v6, v7 = versions["v6"], versions["v7"]
+    if isinstance(v6, dict) and isinstance(v7, dict):
+        for gate in ("nll", "top1"):
+            if v6.get("gates", {}).get(gate) != v7.get("gates", {}).get(gate):
+                problems.append(f"registrations: the v7 {gate} gate must stay identical to v6")
+        for gate in ("copy", "retrieval"):
+            if v6.get("gates", {}).get(gate, {}).get("statistic") == v7.get("gates", {}).get(gate, {}).get("statistic"):
+                problems.append(f"registrations: v7 must change the {gate} probe statistic")
+    return set(versions)
 
 
 def validate_pack_registry(registry: dict) -> dict[str, str]:
@@ -610,14 +694,16 @@ def validate_pack_registry(registry: dict) -> dict[str, str]:
                         "inflating identity assurance is not allowed"
                     )
     standard = registry.get("quality_standard", {})
-    if not isinstance(standard, dict) or set(standard) != {"description", "margins", "source"}:
-        problems.append("quality_standard must have exactly description, margins, source")
+    registered_versions: set[str] = set()
+    if not isinstance(standard, dict) or set(standard) != {"description", "margins", "source", "registrations"}:
+        problems.append("quality_standard must have exactly description, margins, source, registrations")
     else:
         margins = standard["margins"]
         if not isinstance(margins, dict) or set(margins) != MARGIN_KEYS:
             problems.append(f"quality_standard.margins must have exactly {sorted(MARGIN_KEYS)}")
         elif not all(isinstance(v, (int, float)) and v > 0 for v in margins.values()):
             problems.append("quality_standard.margins values must be positive numbers")
+        registered_versions = validate_registrations(standard.get("registrations"), problems)
 
     packs = registry.get("packs")
     if not isinstance(packs, list) or not packs:
@@ -683,8 +769,15 @@ def validate_pack_registry(registry: dict) -> dict[str, str]:
             problems.append(f"{where}: evidenced loads need at least one evidence reference")
 
         numerical = pack.get("numerical_qualification", {})
-        if not isinstance(numerical, dict) or set(numerical) != {"verdict", "gate", "evidence"}:
+        if (not isinstance(numerical, dict)
+                or not {"verdict", "gate", "evidence"} <= set(numerical)
+                or set(numerical) - {"verdict", "gate", "evidence"} - NUMERICAL_OPTIONAL_KEYS):
             problems.append(f"{where}: numerical_qualification must have verdict, gate, evidence")
+        elif ("registered_under" in numerical) != ("annotation" in numerical):
+            problems.append(f"{where}: registered_under and annotation come together")
+        elif "registered_under" in numerical and (
+                numerical["registered_under"] not in registered_versions or not numerical["annotation"]):
+            problems.append(f"{where}: registered_under must name a declared registration version with an annotation")
         else:
             verdict = numerical["verdict"]
             if verdict not in VERDICTS:
