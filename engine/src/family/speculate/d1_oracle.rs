@@ -3,8 +3,7 @@
 //! device.
 //!
 //! D1 is fifi's contract that a verify window is bitwise identical to sequential one-row decode
-//! (the design is `D1-INVARIANCE-SPEC.md` of the `mtp-acceptance-prep` fixtures; its test letters
-//! are used here). The checks, by letter:
+//! (the test letters of its design study are used here). The checks, by letter:
 //!
 //! * **A** [`full_logits`]: every row's complete logits row equals the logits row of a one-row
 //!   step on the same prefix, bit for bit over the whole row.

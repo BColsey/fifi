@@ -10,7 +10,8 @@
 //! mode only, at the row counts and prefixes that ran; it says nothing about the K-row paths that
 //! do not exist yet, and nothing about 8-row windows in general (8 is a cap, not a qualification).
 //!
-//! Letters follow `D1-INVARIANCE-SPEC.md` (test B, per-layer taps, is not covered):
+//! Letters follow the D1 invariance design of the acceptance study (test B, per-layer taps,
+//! is not covered):
 //!
 //! | test | what | function |
 //! |---|---|---|
