@@ -2170,6 +2170,10 @@ mod rollback_runtime;
 mod window_gate;
 
 #[cfg(test)]
+#[path = "window_gate_device_tests.rs"]
+mod window_gate_device_tests;
+
+#[cfg(test)]
 #[path = "prefix_quality_device_tests.rs"]
 mod prefix_quality;
 

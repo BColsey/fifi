@@ -368,6 +368,181 @@ fn the_window_forwards_its_effects_to_the_module_of_decisions() {
     statement(commit, "window_logic::commit_window(self, commit)");
 }
 
+/// The block (without its braces) that opens after `marker` in `code`.
+fn block<'a>(code: &'a str, marker: &str) -> &'a str {
+    let marker = self::code(marker);
+    let start = code
+        .find(&marker)
+        .unwrap_or_else(|| panic!("`{marker}` not found"));
+    let open = start + marker.len() - 1;
+    assert_eq!(
+        &code[open..=open],
+        "{",
+        "the marker must end at the opening brace"
+    );
+    let mut depth = 0usize;
+    for (offset, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after `{marker}`")
+}
+
+/// The names of the functions declared directly in `block` (at brace depth zero).
+fn declared(block: &str) -> Vec<String> {
+    let depth = depths(block);
+    let mut names = Vec::new();
+    for (at, _) in block.match_indices("fn") {
+        let before_ok = at == 0 || !block.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let rest = &block[at + 2..];
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if before_ok && end > 0 && depth[at] == 0 && matches!(rest.as_bytes()[end], b'(' | b'<') {
+            names.push(rest[..end].to_owned());
+        }
+    }
+    names
+}
+
+/// Each `(function, statements)` row: the function exists in `block` and every statement is a
+/// top-level statement of its body.
+fn forwards(block: &str, table: &[(&str, &[&str])]) {
+    let mut expected: Vec<&str> = table.iter().map(|(name, _)| *name).collect();
+    let mut found = declared(block);
+    expected.sort_unstable();
+    found.sort_unstable();
+    assert_eq!(
+        found, expected,
+        "the forwards in the source and the table of the pin differ: a new or removed forward needs a row"
+    );
+    for (name, statements_of) in table {
+        let text = body(block, name);
+        for expected in *statements_of {
+            statement(text, expected);
+        }
+    }
+}
+
+#[test]
+fn the_step_forwards_every_primitive_of_the_window_host_to_the_right_effect() {
+    let eager = code(include_str!("cuda/eager_window.rs"));
+    let host = block(&eager, "impl WindowHost for QwenResidentStep<'_> {");
+    forwards(
+        host,
+        &[
+            ("device_wanted", &["self.device_rollback_wanted()"]),
+            ("tokens", &["QwenResidentStep::tokens(self)"]),
+            ("store_window", &["self.window = Some(window);"]),
+            ("take_window", &["self.window.take()"]),
+            ("export", &["self.export_state()"]),
+            (
+                "run_row",
+                &[
+                    "let drawn = self.run_token(token, true)?;",
+                    "Ok((drawn, self.logits_values()))",
+                ],
+            ),
+            ("replay_row", &["self.run_token(token, false).map(|_| ())"]),
+            ("overwrite", &["self.overwrite_state(saved)"]),
+            ("window_awaits", &["self.window_is_open()"]),
+            ("capacity", &["self.kv_capacity_rows()"]),
+            ("is_valid", &["self.state_is_valid()"]),
+            ("needs_reset", &["self.recovery_gate_set()"]),
+            ("set_needs_reset", &["self.set_recovery_gate();"]),
+            ("clear_needs_reset", &["self.clear_recovery_gate();"]),
+            ("poison", &["self.poison_window_state();"]),
+            (
+                "drop_pending_prefix",
+                &["QwenResidentStep::drop_pending_prefix(self);"],
+            ),
+            ("invalidate_pool", &["self.invalidate_prefix_pool();"]),
+            ("close_window", &["self.close_stored_window();"]),
+            ("check_import", &["self.check_saved_state(saved)"]),
+            ("resident_kv", &["self.check_resident_kv()"]),
+            ("require_armed", &["self.require_armed_for_window()"]),
+            (
+                "complete_prefix_save",
+                &["QwenResidentStep::complete_prefix_save(self)"],
+            ),
+            (
+                "rollback_begin",
+                &["QwenResidentStep::rollback_begin(self, rows)"],
+            ),
+            ("capture", &["self.rollback_capture(row)?;"]),
+            (
+                "rollback_discard",
+                &["QwenResidentStep::rollback_discard(self);"],
+            ),
+            (
+                "rollback_window_complete",
+                &["QwenResidentStep::rollback_window_complete(self)"],
+            ),
+            (
+                "rollback_finish",
+                &["QwenResidentStep::rollback_finish(self, kept, committed_rows)"],
+            ),
+            ("trace_mark", &["QwenResidentStep::trace_mark(self, mark);"]),
+            ("feed_fault", &["QwenResidentStep::feed_fault(self, row)"]),
+            (
+                "replay_fault",
+                &["QwenResidentStep::replay_fault(self, row)"],
+            ),
+            ("commit_fault", &["self.commit_point_fault(at)"]),
+            (
+                "capture_fault",
+                &["QwenResidentStep::capture_fault(self, row)"],
+            ),
+            ("restore_fault", &["QwenResidentStep::restore_fault(self)"]),
+        ],
+    );
+}
+
+#[test]
+fn the_effects_of_the_recovery_gate_on_the_step_are_what_the_window_logic_assumes() {
+    let gate = code(include_str!("cuda/window_gate.rs"));
+    let methods = block(&gate, "impl QwenResidentStep<'_> {");
+    forwards(
+        methods,
+        &[
+            (
+                "window_is_open",
+                &[
+                    "self.window.is_some() || self.rollback.as_ref().is_some_and(super::super::state::rollback::RollbackSlots::awaiting_verdict)",
+                ],
+            ),
+            ("kv_capacity_rows", &["self.state.layout().kv.capacity"]),
+            ("state_is_valid", &["self.state.health() == Health::Valid"]),
+            ("recovery_gate_set", &["self.needs_reset"]),
+            ("set_recovery_gate", &["self.needs_reset = true;"]),
+            ("clear_recovery_gate", &["self.needs_reset = false;"]),
+            ("state_usable", &["window_logic::state_usable(self)"]),
+            ("poison_window_state", &["self.state.poison();"]),
+            ("drop_pending_prefix", &["self.pending_prefix = None;"]),
+            (
+                "invalidate_prefix_pool",
+                &[
+                    "if let Some(pool) = self.prefix_pins.as_mut() { let _exhausted = pool.invalidate(); }",
+                ],
+            ),
+            (
+                "close_stored_window",
+                &["self.window = None;", "self.rollback_discard();"],
+            ),
+            ("check_saved_state", &["self.state.check_exported(saved)"]),
+            ("check_resident_kv", &["self.state.check_resident_kv()"]),
+        ],
+    );
+}
+
 /// The call sites of `begin_import(` and `begin_reset(` outside tests under `qwen36/cuda`, as
 /// (file, call). A new restoring site must be added to the table of the specification (17.2) and
 /// to this list together with its gate and its window close.
