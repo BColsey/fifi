@@ -80,11 +80,6 @@ impl WindowHost for Fake {
         self.tokens
     }
 
-    fn clear_window(&mut self) {
-        self.note("clear_window");
-        self.window = None;
-    }
-
     fn store_window(&mut self, window: Window<usize, u32>) {
         self.note("store_window");
         self.window = Some(window);

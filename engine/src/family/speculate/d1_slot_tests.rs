@@ -93,6 +93,9 @@ struct SlotFake {
     book: RollbackBook,
     open: Option<Open>,
     poisoned: bool,
+    /// The recovery gate: set with every poison, cleared by a reset or by `restore`, which is a
+    /// reset followed by the import. An import without the reset is refused while it is set.
+    gate: bool,
     fault: Option<Fault>,
     /// A step is pending: the device words are not the host's.
     busy: bool,
@@ -117,6 +120,7 @@ impl SlotFake {
             book: RollbackBook::new(plan),
             open: None,
             poisoned: false,
+            gate: false,
             fault: None,
             busy: false,
         }
@@ -154,6 +158,7 @@ impl SlotFake {
         self.open = None;
         self.book.discard();
         self.poisoned = true;
+        self.gate = true;
     }
 
     fn fires(&mut self, at: Fault) -> Result<()> {
@@ -162,6 +167,7 @@ impl SlotFake {
         }
         self.fault = None;
         self.poisoned = self.mutant != Mutant::NoPoisonOnError;
+        self.gate = self.poisoned;
         Err(refused("injected fault"))
     }
 
@@ -277,6 +283,7 @@ impl TokenStepper for SlotFake {
         self.open = None;
         self.book.discard();
         self.poisoned = false;
+        self.gate = false;
         Ok(())
     }
 }
@@ -318,6 +325,7 @@ impl WindowModel for SlotFake {
                 self.book.discard();
                 if self.mutant != Mutant::GuardFailureKeepsValid {
                     self.poisoned = true;
+                    self.gate = true;
                 }
                 return Err(error);
             }
@@ -391,11 +399,19 @@ impl D1Subject for SlotFake {
         self.recurrent = state.recurrent;
         self.conv = state.conv;
         self.poisoned = false;
+        self.gate = false;
         self.open = None;
         if self.mutant != Mutant::ImportKeepsWindow {
             self.book.discard();
         }
         Ok(())
+    }
+
+    fn import_without_reset(&mut self, state: &SlotState) -> Option<Result<()>> {
+        if self.gate {
+            return Some(Err(refused("reset first")));
+        }
+        Some(self.restore(state))
     }
 
     fn state_difference(&self, left: &SlotState, right: &SlotState) -> Option<String> {
@@ -574,7 +590,13 @@ fn the_cycle_check_catches_flaws_that_a_single_window_may_miss() {
 fn a_failed_commit_that_leaves_the_state_valid_is_caught_by_the_failure_check() {
     let mut rig = SlotRig::new(Mutant::NoPoisonOnError, false);
     let failure = caught(failure_recovery(&mut rig.fake, VOCAB, &rows(4)), "F");
-    assert!(failure.detail.contains("silent partial state"), "{failure}");
+    // The recovery gate is checked after every fault: a failed commit that leaves a usable state is
+    // refused there, ahead of the silent-partial-state rule.
+    assert!(
+        failure.detail.contains("silent partial state")
+            || failure.detail.contains("after a failed commit"),
+        "{failure}"
+    );
 }
 
 #[test]

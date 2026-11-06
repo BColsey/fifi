@@ -68,6 +68,20 @@ pub(crate) enum Fault {
     Capture(usize),
     /// While the device path copies a slot back at commit.
     Restore,
+    /// While the host commit finishes the pending prefix save, before the import (a refusal: the
+    /// state would stay valid at the end of the window without Q2).
+    PrefixSave,
+    /// While the host commit checks the saved state, before `begin_import` (a refusal).
+    CheckImport,
+    /// While the host commit checks the resident KV, before `begin_import` (a refusal).
+    ResidentKv,
+    /// While the host import writes the device, after `begin_import` (poisons).
+    ImportDevice,
+    /// While the commit replays kept row `i`: the row is refused before launch, which takes the
+    /// step back and leaves a valid state behind the verdict without Q2.
+    ReplayRefused(usize),
+    /// Not an injection: the plan commits a verdict whose committed rows are not the window's.
+    Verdict,
 }
 
 /// What the checks need from a model, on top of the window interface.
@@ -96,6 +110,14 @@ pub(crate) trait D1Subject: WindowModel {
     /// its own points.
     fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
         faults_for(rows)
+    }
+
+    /// Imports `state` WITHOUT a reset first, for a subject whose failed commit sets a recovery
+    /// gate that only a reset clears. After a fault such a subject must refuse it. `None` (the
+    /// default) means the subject has no gate; `Some` also makes check F require that a snapshot
+    /// and a step are refused after every fault.
+    fn import_without_reset(&mut self, _state: &Self::State) -> Option<Result<(), EngError>> {
+        None
     }
 }
 
@@ -813,6 +835,37 @@ pub(crate) fn slot_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> 
     faults
 }
 
+/// The fault points of a window of `rows` rows over `base` committed rows for the host path: the
+/// feed, the three refusals before `begin_import`, the device failure after it, the replay (a
+/// failure that poisons and a refusal before launch), and a verdict that is not the window's. Each
+/// is committed under a partial verdict (so that a rollback is attempted), named by the committed
+/// rows it keeps.
+pub(crate) fn host_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> {
+    let kept = rows.saturating_sub(1).max(1);
+    let under = |committed: usize| Commit {
+        committed_rows: committed,
+        kept_rows: kept,
+        discarded_rows: rows - kept,
+        state_slot: kept - 1,
+    };
+    let right = under(base + kept);
+    let mut faults = vec![(Fault::Feed(0), right), (Fault::Feed(rows - 1), right)];
+    if right.discarded_rows > 0 {
+        faults.extend([
+            (Fault::PrefixSave, right),
+            (Fault::CheckImport, right),
+            (Fault::ResidentKv, right),
+            (Fault::ImportDevice, right),
+            (Fault::Replay(0), right),
+            (Fault::Replay(kept - 1), right),
+            (Fault::ReplayRefused(0), right),
+            (Fault::ReplayRefused(kept - 1), right),
+            (Fault::Verdict, under(base + kept + 1)),
+        ]);
+    }
+    faults
+}
+
 /// Check F: each fault ends the call with an error, leaves no window to draw from or commit, and
 /// leaves either the pre-window state or a model that refuses to go on; restoring the pre-window
 /// state then lets the same window run again with the same rows.
@@ -868,6 +921,7 @@ pub(crate) fn failure_recovery<S: D1Subject>(
             ));
         }
         require_closed_or_rolled_back(subject, &base, inputs[0], fault)?;
+        require_gated(subject, &base, inputs[0], fault)?;
         subject.restore(&base).at(F)?;
         let rows = window_rows_of(subject, inputs, F)?;
         subject.restore(&base).at(F)?;
@@ -882,6 +936,37 @@ pub(crate) fn failure_recovery<S: D1Subject>(
         }
     }
     Ok(tally)
+}
+
+/// A subject with a recovery gate (`import_without_reset` answers) must refuse a snapshot, a step
+/// and an import that skips the reset after the fault. The pre-window-state outcome that
+/// `require_closed_or_rolled_back` accepts is not enough for it: a failed commit may not leave a
+/// usable state at all.
+fn require_gated<S: D1Subject>(
+    subject: &mut S,
+    base: &S::State,
+    token: u32,
+    fault: Fault,
+) -> Verdict<()> {
+    let refused = |what: &str| {
+        D1Failure::violation(
+            F,
+            format!("{fault:?}: {what} after a failed commit; only a reset may recover it"),
+        )
+    };
+    if subject.import_without_reset(base).is_none() {
+        return Ok(());
+    }
+    if subject.snapshot().is_ok() {
+        return Err(refused("a snapshot was accepted"));
+    }
+    if subject.logits(token).is_ok() {
+        return Err(refused("a decode step was accepted"));
+    }
+    if matches!(subject.import_without_reset(base), Some(Ok(()))) {
+        return Err(refused("an import without a reset was accepted"));
+    }
+    Ok(())
 }
 
 /// After a fault the state is the pre-window state, or the model refuses both a snapshot and a

@@ -30,7 +30,7 @@
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
 #[cfg(test)]
-use crate::family::qwen36::window_logic::Mark;
+use crate::family::qwen36::window_logic::{CommitPoint, Mark};
 #[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;
 use crate::{
@@ -82,7 +82,30 @@ impl QwenResidentStep<'_> {
     }
 
     fn replay_fault(&mut self, row: usize) -> Result<(), EngError> {
-        self.fault_at(Fault::Replay(row))
+        self.fault_at(Fault::Replay(row))?;
+        self.refusal_at(Fault::ReplayRefused(row))
+    }
+
+    /// Fires the armed fault when it is `at`, as a refusal before any device work: it fails and
+    /// leaves the state as it is (valid), the way `check_import`, `resident_kv`, a pending save
+    /// that cannot finish, or a row refused before launch (`cancel_enqueue`) do.
+    fn refusal_at(&mut self, at: Fault) -> Result<(), EngError> {
+        if self.window_fault != Some(at) {
+            return Ok(());
+        }
+        self.window_fault = None;
+        Err(EngError::BadRequest(format!(
+            "verify window: injected refusal {at:?}"
+        )))
+    }
+
+    fn commit_point_fault(&mut self, at: CommitPoint) -> Result<(), EngError> {
+        match at {
+            CommitPoint::PrefixSave => self.refusal_at(Fault::PrefixSave),
+            CommitPoint::CheckImport => self.refusal_at(Fault::CheckImport),
+            CommitPoint::ResidentKv => self.refusal_at(Fault::ResidentKv),
+            CommitPoint::ImportDevice => self.fault_at(Fault::ImportDevice),
+        }
     }
 }
 
@@ -208,10 +231,6 @@ impl WindowHost for QwenResidentStep<'_> {
         QwenResidentStep::tokens(self)
     }
 
-    fn clear_window(&mut self) {
-        self.window = None;
-    }
-
     fn store_window(&mut self, window: EagerWindow) {
         self.window = Some(window);
     }
@@ -331,6 +350,11 @@ impl WindowHost for QwenResidentStep<'_> {
     #[cfg(test)]
     fn replay_fault(&mut self, row: usize) -> Result<(), EngError> {
         QwenResidentStep::replay_fault(self, row)
+    }
+
+    #[cfg(test)]
+    fn commit_fault(&mut self, at: CommitPoint) -> Result<(), EngError> {
+        self.commit_point_fault(at)
     }
 
     #[cfg(test)]

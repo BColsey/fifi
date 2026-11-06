@@ -85,8 +85,6 @@ pub(crate) trait WindowHost {
     fn device_wanted(&self) -> bool;
     /// Committed rows now.
     fn tokens(&self) -> usize;
-    /// Forgets the stored window.
-    fn clear_window(&mut self);
     /// Stores the window that awaits its verdict.
     fn store_window(&mut self, window: Window<Self::Saved, Self::Row>);
     /// Takes the stored window, if any.
@@ -493,3 +491,7 @@ fn commit_window_device<H: WindowHost>(host: &mut H, commit: &Commit) -> Result<
 #[cfg(test)]
 #[path = "window_logic_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "window_logic_d1_tests.rs"]
+mod d1_tests;

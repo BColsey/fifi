@@ -72,8 +72,8 @@ use crate::{
         speculate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
-                failure_recovery, faults_for, first_bit_difference, first_byte_difference,
-                full_logits, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks,
+                failure_recovery, first_bit_difference, first_byte_difference, full_logits,
+                host_faults_for, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks,
                 slot_faults_for, ties_break_low,
             },
             driver::WindowModel,
@@ -290,9 +290,15 @@ impl D1Subject for QwenResidentStep<'_> {
     }
 
     fn restore(&mut self, state: &ExportedState) -> Result<(), EngError> {
-        // A window left over from before the restore describes a state that is gone.
-        self.window = None;
+        // A failed commit sets the recovery gate and only `reset_state` clears it, so the restore
+        // is a reset followed by the import. The reset also closes a window left over from before
+        // the restore (it describes a state that is gone).
+        self.reset_state()?;
         self.import_state(state)
+    }
+
+    fn import_without_reset(&mut self, state: &ExportedState) -> Option<Result<(), EngError>> {
+        Some(self.import_state(state))
     }
 
     fn state_difference(&self, left: &ExportedState, right: &ExportedState) -> Option<String> {
@@ -311,7 +317,7 @@ impl D1Subject for QwenResidentStep<'_> {
         if self.device_rollback_wanted() {
             slot_faults_for(self.tokens(), rows)
         } else {
-            faults_for(rows)
+            host_faults_for(self.tokens(), rows)
         }
     }
 }
