@@ -6,6 +6,8 @@
 )]
 use crate::EngError;
 // The pure selection logic lives where the host build compiles and tests it.
+#[cfg(test)]
+pub(crate) use crate::kernels::single_row::SingleRowLaunches;
 pub(crate) use crate::kernels::single_row::{
     SERVED_SINGLE_ROW, SingleRow, effective_single_row, single_row_label, single_row_name,
 };
@@ -337,6 +339,41 @@ impl CudaContext {
         self.single_row_setting().map(single_row_name)
     }
 
+    /// Test builds: counts one launch on `kernel`, where the dispatch decides it.
+    #[cfg(test)]
+    fn note_exl3_launch(&self, kernel: SingleRow) {
+        let mut counts = self.exl3_launches.get();
+        counts.record(kernel);
+        self.exl3_launches.set(counts);
+    }
+
+    /// Test builds: counts a projection call by the kernel it will run on, or apart when its shape
+    /// is not the routed one (those always run the shuffle kernel and are not a fallback).
+    #[cfg(test)]
+    fn note_exl3_single_row(&self, call: &Exl3LinearCall<'_>, route: SingleRow) {
+        if (1..=8).contains(&call.rows) && call.split_k == 2 {
+            let kernel = match route {
+                SingleRow::Legacy => SingleRow::Legacy,
+                routed => match grouped_kernel_for(routed, [call.n]) {
+                    GroupedKernel::Gather => SingleRow::Gather,
+                    GroupedKernel::Wide(cols) => SingleRow::Wide(cols),
+                },
+            };
+            self.note_exl3_launch(kernel);
+        } else {
+            let mut counts = self.exl3_launches.get();
+            counts.record_other_shape();
+            self.exl3_launches.set(counts);
+        }
+    }
+
+    /// Test builds: the launches of each single-row variant since the context was made or the
+    /// counts were last cleared. Replays of a captured graph do not count again.
+    #[cfg(test)]
+    pub(crate) fn exl3_launch_counts(&self) -> SingleRowLaunches {
+        self.exl3_launches.get()
+    }
+
     /// The kernel the single-row projections of this context run on, or the refusal of a bad
     /// value of the variable.
     fn single_row_setting(&self) -> Result<SingleRow, EngError> {
@@ -643,6 +680,8 @@ impl CudaContext {
         call: Exl3LinearCall<'_>,
     ) -> Result<(), EngError> {
         let route = single_row_route(self.single_row_setting()?, call.rows, call.split_k);
+        #[cfg(test)]
+        self.note_exl3_single_row(&call, route);
         if route != SingleRow::Legacy {
             let kernel = grouped_kernel_for(route, [call.n]);
             return self.grouped_by(stream, std::slice::from_ref(&call), kernel);
@@ -782,6 +821,11 @@ impl CudaContext {
         calls: &[Exl3LinearCall<'_>],
     ) -> Result<(), EngError> {
         let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
+        #[cfg(test)]
+        self.note_exl3_launch(match kernel {
+            GroupedKernel::Gather => SingleRow::Gather,
+            GroupedKernel::Wide(cols) => SingleRow::Wide(cols),
+        });
         self.grouped_by(stream, calls, kernel)
     }
 
@@ -822,6 +866,12 @@ impl CudaContext {
         cols: u32,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
+        #[cfg(test)]
+        {
+            let mut counts = self.exl3_launches.get();
+            counts.record_indexed();
+            self.exl3_launches.set(counts);
+        }
         let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
         let options = self.exl3_indexed_options()?;
         let capacity = options.capacity();

@@ -149,3 +149,11 @@ impl QwenResidentStep<'_> {
         self.armed_slots().map(|_| ())
     }
 }
+
+/// Test builds: what the single-row kernel dispatch launched on this step's context.
+#[cfg(test)]
+impl QwenResidentStep<'_> {
+    pub(crate) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        self.context.exl3_launch_counts()
+    }
+}

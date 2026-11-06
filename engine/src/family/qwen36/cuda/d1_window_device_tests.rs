@@ -73,7 +73,7 @@ use crate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
                 failure_recovery, faults_for, first_bit_difference, first_byte_difference,
-                full_logits, host_greedy, later_rows_isolated, near_tie, slot_faults_for,
+                full_logits, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks, slot_faults_for,
                 ties_break_low,
             },
             driver::WindowModel,
@@ -81,8 +81,8 @@ use crate::{
         },
     },
     kernels::{
-        cuda::resident::exl3::{SERVED_SINGLE_ROW, SINGLE_GATHER_VAR},
-        single_row::require_served_kernel,
+        cuda::resident::exl3::{SERVED_SINGLE_ROW, SINGLE_GATHER_VAR, SingleRow},
+        single_row::{require_kernel_ran, require_served_kernel},
     },
     tokenizer::Tokenizer,
 };
@@ -154,6 +154,13 @@ pub(super) struct Loaded {
 }
 
 pub(super) fn load_pack() -> Loaded {
+    load_pack_with(SERVED_SINGLE_ROW, true)
+}
+
+/// `load_pack` with the kernel registered on the context named by the caller, and the served-kernel
+/// guard optional: only the negative control registers the shuffle kernel and keeps the guard off
+/// so that it can show the guard's refusal.
+pub(super) fn load_pack_with(default: SingleRow, enforce_served: bool) -> Loaded {
     let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
     let projector: &'static CudaProjector =
         Box::leak(Box::new(CudaProjector::new().expect("projector")));
@@ -163,17 +170,17 @@ pub(super) fn load_pack() -> Loaded {
     // (`start.rs`, before `load_exl3_dir`). Without it an unset FIFI_EXL3_SINGLE_GATHER leaves
     // the shuffle kernel, which the served engine does not run. An explicit value of the variable
     // still wins, as it does in the served path.
-    projector
-        .context()
-        .set_single_row_default(SERVED_SINGLE_ROW);
+    projector.context().set_single_row_default(default);
     let kernel = projector
         .context()
         .single_row_kernel_name()
         .expect("single-row kernel setting");
     // A run on the shuffle kernel speaks for a kernel the served engine does not run: refuse it
     // here, before anything is loaded or measured, unless the operator named a kernel.
-    require_served_kernel(kernel, std::env::var_os(SINGLE_GATHER_VAR).is_some())
-        .unwrap_or_else(|error| panic!("{error}"));
+    if enforce_served {
+        require_served_kernel(kernel, std::env::var_os(SINGLE_GATHER_VAR).is_some())
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
     let weights: &'static CudaWeights = Box::leak(Box::new(
         load_exl3_dir(projector, Path::new(&dir), Reserve::default()).expect("load"),
     ));
@@ -315,6 +322,8 @@ struct Rig {
     stream: Vec<u32>,
     context: usize,
     prefixes: Vec<usize>,
+    /// The single-row kernel the context reports; the launch counts must show it.
+    kernel: &'static str,
 }
 
 fn prefix_rows_from_env() -> Vec<usize> {
@@ -360,6 +369,7 @@ fn rig() -> Rig {
         stream,
         context,
         prefixes,
+        kernel: loaded.kernel,
     }
 }
 
@@ -402,6 +412,16 @@ fn alternatives(inputs: &[u32]) -> Vec<u32> {
     vec![0, 1, (SAMPLER_VOCAB - 1) as u32, EOS[0], 248_055, inputs[0]]
 }
 
+/// The execution-path half of a receipt, apart from the output half: the kernel the context reports
+/// must have launched, and no routed call may have run the shuffle kernel. Printed as
+/// `D1_KERNEL_LAUNCHES` so the log and the record carry the counts. Counts are of launches
+/// enqueued or captured; a graph replay re-runs launches that were counted when they were captured.
+fn assert_kernel_ran(step: &QwenResidentStep<'_>, kernel: &str, phase: &str) {
+    let counts = step.kernel_launches();
+    println!("D1_KERNEL_LAUNCHES phase={phase} kernel={kernel} {}", counts.describe());
+    require_kernel_ran(&counts, kernel).unwrap_or_else(|error| panic!("{phase}: {error}"));
+}
+
 /// Which checks a test runs.
 #[derive(Clone, Copy)]
 struct Which {
@@ -410,6 +430,7 @@ struct Which {
     d: bool,
     e: bool,
     f: bool,
+    g: bool,
 }
 
 impl Which {
@@ -419,6 +440,7 @@ impl Which {
         d: false,
         e: false,
         f: false,
+        g: false,
     };
     const ALL: Self = Self {
         a: true,
@@ -426,6 +448,7 @@ impl Which {
         d: true,
         e: true,
         f: true,
+        g: true,
     };
 }
 
@@ -433,6 +456,7 @@ impl Which {
 /// the state it was given, so they share the prefill; the first check starts from the state the
 /// prefill built, the later ones from a copy of it that was imported back.
 fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
+    let kernel = rig.kernel;
     let Rig {
         step,
         tokenizer,
@@ -441,6 +465,9 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
         ..
     } = rig;
     let session = prefilled(step, &stream[..prefix], *context);
+    // The reference path: the prefill is one-row steps. A correct output can come from a fallback,
+    // so the path is checked apart from the output.
+    assert_kernel_ran(step, kernel, "reference");
     if which.a {
         for rows in WINDOW_ROWS {
             let inputs = window_inputs(stream, prefix, rows);
@@ -485,6 +512,22 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
             report("F", &format!("prefix={prefix} rows={rows}"), verdict);
         }
     }
+    if which.g {
+        let setup = Setup {
+            session: &session,
+            tokenizer: &*tokenizer,
+            limits: Limits {
+                eos: &[],
+                sampler_vocab: SAMPLER_VOCAB,
+                context_limit: *context,
+            },
+        };
+        for drafts in [3, 7] {
+            let verdict = repeated_rollbacks(step, &setup, drafts, &seeded, 100);
+            report("G", &format!("prefix={prefix} drafts={drafts} windows=100"), verdict);
+        }
+    }
+    assert_kernel_ran(step, kernel, "window and reference");
 }
 
 fn check_prefixes(rig: &mut Rig, which: Which) {
@@ -709,4 +752,61 @@ mod comparator_tests {
         m.delta.pop();
         named(exported_difference(&base, &m), "layer counts");
     }
+}
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_g_repeated_rollbacks() {
+    check_prefixes(
+        &mut rig(),
+        Which {
+            g: true,
+            ..Which::NONE
+        },
+    );
+}
+
+/// The negative control of the kernel guards: with the shuffle kernel registered on the context,
+/// the selection guard and the execution-path guard must both REJECT the run, and the counters must
+/// see the shuffle kernel (a counter that stays at zero would make the positive result worthless).
+/// A pass of this test is what makes "wide1 launched, nothing fell back" in the other tests mean
+/// something. Skipped when the operator named a kernel in FIFI_EXL3_SINGLE_GATHER: the variable
+/// would then win over the registration this test depends on.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_negative_control_the_shuffle_kernel_is_rejected() {
+    assert!(
+        std::env::var_os(SINGLE_GATHER_VAR).is_none(),
+        "unset {SINGLE_GATHER_VAR}: the variable would win over the registration of this control"
+    );
+    let loaded = load_pack_with(SingleRow::Legacy, false);
+    assert_eq!(loaded.kernel, "legacy", "the control must run the shuffle kernel");
+    let context = DEFAULT_CONTEXT;
+    let (_tokenizer, stream) = text_stream(80);
+    let mut step = build_step(
+        &loaded,
+        &step_options(kv_mode_from_env(), context),
+        CaptureConfig {
+            capture: capture_from_env(),
+            section_marks: false,
+        },
+    )
+    .expect("step");
+    let _session = prefilled(&mut step, &stream[..64], context);
+    let counts = step.kernel_launches();
+    println!("D1_NEGATIVE_CONTROL {}", counts.describe());
+    assert!(
+        require_served_kernel(loaded.kernel, false).is_err(),
+        "the selection guard must reject the shuffle kernel"
+    );
+    assert!(
+        require_kernel_ran(&counts, "wide1").is_err(),
+        "the execution-path guard must reject a run on the shuffle kernel"
+    );
+    assert!(
+        require_kernel_ran(&counts, "legacy").is_ok(),
+        "the counters must see the shuffle kernel they were forced onto: {}",
+        counts.describe()
+    );
+    assert_eq!(counts.wide1, 0, "{}", counts.describe());
 }

@@ -64,5 +64,105 @@ pub(crate) fn single_row_label(kernel: SingleRow) -> Option<&'static str> {
     }
 }
 
+/// How many launches of each single-row kernel one context has enqueued (or captured into a graph),
+/// per variant, counted where the dispatch decides. A replay of a captured graph does not count
+/// again: its launches were counted when they were captured, and a graph that was captured on the
+/// wrong kernel keeps that kernel in its counts for good. Only calls of the routed shape (rows 1 to
+/// 8 at split-K 2) are counted per variant; the others always run the shuffle kernel and are
+/// counted apart, so they never read as a fallback. Test builds only: the serving path counts
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SingleRowLaunches {
+    pub(crate) legacy: u64,
+    pub(crate) gather: u64,
+    pub(crate) wide1: u64,
+    pub(crate) wide2: u64,
+    pub(crate) wide4: u64,
+    /// Calls outside the routed shape: not a fallback.
+    pub(crate) other_shapes: u64,
+    /// Id-indexed expert launches of a captured step: they run the wide kernel whatever the switch
+    /// says, so they say nothing about which kernel was selected and are counted apart.
+    pub(crate) indexed: u64,
+}
+
+impl SingleRowLaunches {
+    /// Counts one launch of the routed shape on `kernel`.
+    pub(crate) fn record(&mut self, kernel: SingleRow) {
+        let slot = match kernel {
+            SingleRow::Legacy => &mut self.legacy,
+            SingleRow::Gather => &mut self.gather,
+            SingleRow::Wide(1) => &mut self.wide1,
+            SingleRow::Wide(2) => &mut self.wide2,
+            SingleRow::Wide(_) => &mut self.wide4,
+        };
+        *slot += 1;
+    }
+
+    /// Counts one call outside the routed shape.
+    pub(crate) fn record_other_shape(&mut self) {
+        self.other_shapes += 1;
+    }
+
+    /// Counts one id-indexed expert launch.
+    pub(crate) fn record_indexed(&mut self) {
+        self.indexed += 1;
+    }
+
+    /// The launches of the variant `name` (`legacy`, `gather`, `wide1`, `wide2`, `wide4`).
+    pub(crate) fn of(&self, name: &str) -> Option<u64> {
+        Some(match name {
+            "legacy" => self.legacy,
+            "gather" => self.gather,
+            "wide1" => self.wide1,
+            "wide2" => self.wide2,
+            "wide4" => self.wide4,
+            _ => return None,
+        })
+    }
+
+    /// One line for D1_CONFIG and the record.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "legacy={} gather={} wide1={} wide2={} wide4={} other_shapes={} indexed={}",
+            self.legacy,
+            self.gather,
+            self.wide1,
+            self.wide2,
+            self.wide4,
+            self.other_shapes,
+            self.indexed
+        )
+    }
+}
+
+/// The execution-path check, separate from the selection check: a correct output can come from a
+/// fallback, so a receipt must also show that the intended kernel ran. `expected` is the kernel
+/// name the context reports (`wide1` when served). It must have launched at least once, and no
+/// routed call may have run the shuffle kernel (a silent fallback), unless the shuffle kernel is
+/// what was expected.
+pub(crate) fn require_kernel_ran(
+    counts: &SingleRowLaunches,
+    expected: &str,
+) -> Result<(), String> {
+    let ran = counts
+        .of(expected)
+        .ok_or_else(|| format!("unknown kernel name {expected:?}"))?;
+    if ran == 0 {
+        return Err(format!(
+            "the {expected} kernel never launched ({}): the output does not come from it",
+            counts.describe()
+        ));
+    }
+    if expected != "legacy" && counts.legacy > 0 {
+        return Err(format!(
+            "{} routed calls ran the shuffle kernel although {expected} was selected ({}): a fallback \
+             path was exercised",
+            counts.legacy,
+            counts.describe()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

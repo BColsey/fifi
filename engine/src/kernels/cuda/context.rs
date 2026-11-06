@@ -153,6 +153,10 @@ pub(crate) struct CudaContext {
     /// context: set by the session that owns it, so two engines in one process choose apart.
     pub(in crate::kernels::cuda) exl3_single_row_default:
         std::cell::Cell<Option<super::resident::exl3::SingleRow>>,
+    /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
+    #[cfg(test)]
+    pub(in crate::kernels::cuda) exl3_launches:
+        std::cell::Cell<crate::kernels::single_row::SingleRowLaunches>,
     /// The id-indexed launch options a test or bench set on this context (test builds); `None`
     /// takes the environment's.
     #[cfg(test)]
@@ -370,6 +374,8 @@ impl CudaContext {
             _thread_confined: PhantomData,
             alloc_cache: None,
             exl3_single_row_default: std::cell::Cell::new(None),
+            #[cfg(test)]
+            exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]
             exl3_indexed_options: std::cell::Cell::new(None),
             pinned_stage_admission: None,

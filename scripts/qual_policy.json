@@ -61,6 +61,32 @@
    "timeout_sec": 3600
   },
   {
+   "id": "host-served-kernel",
+   "category": "host",
+   "hardware": "cpu",
+   "description": "The pure selection and execution-path logic of the single-row EXL3 kernel, run by name on the host: the served kernel is wide1, an explicit FIFI_EXL3_SINGLE_GATHER wins over the registered default, records name the kernel, a harness on the shuffle kernel is refused, and the launch-count guard rejects a run whose routed calls fell back to the shuffle kernel or never launched the intended one. A device receipt (D1 tests, cost harness) needs this selection AND the launch counts it checks; this surface is the host half, and the device negative control (d1_negative_control_the_shuffle_kernel_is_rejected) is the device half. min_ran pins the tests so that a deleted or renamed test cannot pass silently.",
+   "cwd": "engine",
+   "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "--lib",
+    "--no-fail-fast",
+    "--",
+    "kernels::single_row"
+   ],
+   "env": {},
+   "expect": {
+    "min_ran": 7,
+    "max_failed": 0
+   },
+   "fixtures_required": [],
+   "targets_included": [
+    "lib"
+   ],
+   "timeout_sec": 1800
+  },
+  {
    "id": "cuda-smoke",
    "category": "cuda-device",
    "hardware": "nvidia-gpu",
