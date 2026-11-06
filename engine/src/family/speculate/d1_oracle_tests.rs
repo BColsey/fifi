@@ -21,6 +21,9 @@ use crate::{
     tokenizer::Tokenizer,
 };
 
+#[path = "d1_slot_tests.rs"]
+mod slots;
+
 type Result<T> = std::result::Result<T, EngError>;
 
 const VOCAB: usize = 8;

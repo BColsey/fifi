@@ -159,7 +159,10 @@ fn a_window_cannot_open_over_an_open_one_and_discard_closes_it() {
 fn a_window_longer_than_the_slots_serve_is_refused() {
     let mut book = RollbackBook::new(plan(4));
     assert!(book.begin_window(0, 5).is_err());
-    assert!(book.begin_window(0, 1).is_err());
+    assert!(book.begin_window(0, 0).is_err());
+    // A one-row window has no slot to fill and keeps its row.
+    assert!(book.begin_window(0, 1).is_ok());
+    assert_eq!(book.finish_window(1, 1, 1).unwrap(), None);
     assert!(book.begin_window(0, 2).is_ok());
 }
 

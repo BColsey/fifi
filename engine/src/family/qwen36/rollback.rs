@@ -156,10 +156,10 @@ impl RollbackBook {
         if self.window.is_some() {
             return Err(refuse("begin_window", "the previous window has no verdict"));
         }
-        if rows < 2 || rows > self.plan.rows {
+        if rows < 1 || rows > self.plan.rows {
             return Err(refuse(
                 "begin_window",
-                &format!("{rows} rows, the slots serve 2 to {}", self.plan.rows),
+                &format!("{rows} rows, the slots serve 1 to {}", self.plan.rows),
             ));
         }
         self.window = Some(OpenWindow {

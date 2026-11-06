@@ -16,6 +16,10 @@
 //!   sampler's generator and the next step's logits.
 //! * **E** [`ties_break_low`]: the window's draw on exact ties is the one-row draw, which takes
 //!   the lowest id.
+//! * **G** [`repeated_rollbacks`] (not a letter of the spec; D1 spec section 5): many windows in a
+//!   row with varied accepted prefixes, including the same prefix twice and a full rejection right
+//!   after another, against a one-row loop of the same total length, with the whole observable
+//!   state compared after the first windows, in the middle and at the end.
 //! * **F** [`failure_recovery`] (not a letter of the spec): a fault injected mid-window or
 //!   mid-replay leaves the pre-window state or a refusing model, never a silent partial state.
 //!
@@ -48,6 +52,7 @@ const C: &str = "C later-row isolation";
 const D: &str = "D accepted prefix, commit and rollback";
 const E: &str = "E ties";
 const F: &str = "F failure recovery";
+const G: &str = "G repeated rollback cycles";
 
 /// The job limit of the oracle's generations: far above any window.
 const MAX_TOKENS: u32 = 4_096;
@@ -59,6 +64,10 @@ pub(crate) enum Fault {
     Feed(usize),
     /// While the commit replays kept row `i`.
     Replay(usize),
+    /// While the device path copies the state after row `i` into its slot.
+    Capture(usize),
+    /// While the device path copies a slot back at commit.
+    Restore,
 }
 
 /// What the checks need from a model, on top of the window interface.
@@ -80,6 +89,14 @@ pub(crate) trait D1Subject: WindowModel {
 
     /// Arms one fault for the next window or commit. A test hook: the fault fires once.
     fn inject_fault(&mut self, fault: Fault);
+
+    /// The fault points of a window of `rows` rows with the verdict each is committed under: the
+    /// fault is armed, the window runs, the verdict is committed, and the call must fail. The
+    /// default is the replay path (`Feed`, `Replay`); a model that rolls back another way lists
+    /// its own points.
+    fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
+        faults_for(rows)
+    }
 }
 
 /// A failed check.
@@ -563,6 +580,159 @@ pub(crate) fn accepted_prefix<S: D1Subject>(
     Ok(tally)
 }
 
+/// Drafts for a run of windows whose accepted prefixes follow `pattern`: window `w` is accepted
+/// exactly `pattern[w % len]` deep, the draft after it differs from the draw, and the rest are
+/// other tokens. The first `accepted` drafts are the draws of a one-row run.
+struct CycleAccept {
+    reference: Vec<u32>,
+    prompt_len: usize,
+    drafts: usize,
+    pattern: Vec<usize>,
+    vocab: u32,
+    window: usize,
+}
+
+impl Drafter for CycleAccept {
+    fn propose(&mut self, history: &[u32], room: usize) -> Result<Proposal, EngError> {
+        let emitted = history.len() - self.prompt_len;
+        let accepted = self.pattern[self.window % self.pattern.len()];
+        self.window += 1;
+        let tail = (self.window % 2) as u32;
+        let count = self.drafts.min(room);
+        let tokens = (0..count)
+            .map(|at| {
+                let draw = self.reference[emitted + at];
+                if at < accepted {
+                    return draw;
+                }
+                let offset = if at == accepted {
+                    1 + tail
+                } else {
+                    3 + tail * 5 + at as u32
+                };
+                (draw + offset) % self.vocab
+            })
+            .collect();
+        Ok(Proposal {
+            tokens,
+            scores: Vec::new(),
+        })
+    }
+
+    fn observe(&mut self, _window: &Window, _accepted: &Accepted) -> Result<(), EngError> {
+        Ok(())
+    }
+}
+
+/// The accepted prefixes of `windows` windows of `drafts` drafts: a full rejection twice, a full
+/// acceptance, the same middle prefix twice, a rejection right after an acceptance, then a fixed
+/// pseudo-random run over every depth (no clock, no entropy: the same run every time).
+fn rollback_pattern(drafts: usize, windows: usize) -> Vec<usize> {
+    let mid = drafts / 2;
+    let mut pattern = vec![0, 0, drafts, mid, mid, 0];
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    while pattern.len() < windows {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        pattern.push(((x >> 33) as usize) % (drafts + 1));
+    }
+    pattern.truncate(windows);
+    pattern
+}
+
+/// Runs `windows` speculative steps from the subject's current state and returns what was emitted
+/// per window, with the session and the generator they leave.
+fn run_cycles<S: D1Subject>(
+    subject: &mut S,
+    setup: &Setup<'_>,
+    make_sampler: &dyn Fn() -> Sampler,
+    reference: &[u32],
+    drafts: usize,
+    pattern: &[usize],
+) -> Verdict<(Vec<Vec<u32>>, DecodeSession, GenerationState)> {
+    let drafter = CycleAccept {
+        reference: reference.to_vec(),
+        prompt_len: setup.session.history().len(),
+        drafts,
+        pattern: pattern.to_vec(),
+        vocab: setup.limits.sampler_vocab as u32,
+        window: 0,
+    };
+    let mut speculator = Speculator::new(drafter, drafts);
+    let mut session = setup.session.clone();
+    let mut generation = setup.generation(make_sampler());
+    let mut emitted = Vec::new();
+    for (window, &accepted) in pattern.iter().enumerate() {
+        let batch = speculator
+            .decode(&mut session, subject, &mut generation, &setup.limits)
+            .at(G)?;
+        if batch.tokens.len() != accepted + 1 {
+            return Err(D1Failure::violation(
+                G,
+                format!(
+                    "window {window} was planned to accept {accepted} drafts and emitted {} tokens",
+                    batch.tokens.len()
+                ),
+            ));
+        }
+        emitted.push(batch.tokens);
+    }
+    Ok((emitted, session, generation))
+}
+
+/// Check G: `windows` speculative steps in a row, each accepted to the depth `rollback_pattern`
+/// says, leave the tokens, the history, the pending token, the generator and the model state of a
+/// one-row loop of the same total length, and so do the first 1, 2, 3 and `windows / 2` of them.
+/// No window is followed by an import or a reset: the rollbacks pile up on one state. The subject
+/// is in the prefilled state of `setup.session` on entry and on return.
+pub(crate) fn repeated_rollbacks<S: D1Subject>(
+    subject: &mut S,
+    setup: &Setup<'_>,
+    drafts: usize,
+    make_sampler: &dyn Fn() -> Sampler,
+    windows: usize,
+) -> Verdict<Tally> {
+    let pattern = rollback_pattern(drafts, windows);
+    let total: usize = pattern.iter().map(|accepted| accepted + 1).sum();
+    let base = subject.snapshot().at(G)?;
+    let (reference, ..) = one_row_tokens(subject, setup, make_sampler, total + drafts + 1)?;
+    subject.restore(&base).at(G)?;
+    let mut tally = Tally::default();
+    let mut checkpoints = vec![1, 2, 3, windows / 2, windows];
+    checkpoints.retain(|&count| count >= 1 && count <= windows);
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+    for count in checkpoints {
+        let prefix = &pattern[..count];
+        let steps: usize = prefix.iter().map(|accepted| accepted + 1).sum();
+        let (tokens, session, generation) = one_row_tokens(subject, setup, make_sampler, steps)?;
+        let one_row = observe(subject, &session, &generation, tokens)?;
+        subject.restore(&base).at(G)?;
+
+        let (emitted, session, generation) =
+            run_cycles(subject, setup, make_sampler, &reference, drafts, prefix)?;
+        let tokens: Vec<u32> = emitted.concat();
+        if tokens != reference[..steps] {
+            return Err(D1Failure::violation(
+                G,
+                format!("after {count} windows the emitted tokens differ from the one-row loop"),
+            ));
+        }
+        let window = observe(subject, &session, &generation, tokens)?;
+        subject.restore(&base).at(G)?;
+        tally.comparisons += 1;
+        if let Some(difference) = observed_difference(subject, &window, &one_row) {
+            return Err(D1Failure::violation(
+                G,
+                format!(
+                    "after {count} windows (accepted {prefix:?}): {difference} differs from the \
+                     one-row loop"
+                ),
+            ));
+        }
+    }
+    Ok(tally)
+}
+
 /// Check E: for every row of a window, the greedy draw of the window, the greedy draw of a
 /// one-row step, the engine's sampler and the plain statement of the rule all give one id, the
 /// lowest of the tied ones. `tally.exact_ties` counts the rows that had a tie, so a caller can
@@ -603,7 +773,7 @@ pub(crate) fn ties_break_low<S: D1Subject>(
 }
 
 /// The faults of check F for a window of `rows` rows.
-fn faults_for(rows: usize) -> Vec<(Fault, Commit)> {
+pub(crate) fn faults_for(rows: usize) -> Vec<(Fault, Commit)> {
     let kept = rows.saturating_sub(1).max(1);
     let commit = Commit {
         committed_rows: 0,
@@ -616,6 +786,30 @@ fn faults_for(rows: usize) -> Vec<(Fault, Commit)> {
         faults.push((Fault::Replay(0), commit));
         faults.push((Fault::Replay(kept - 1), commit));
     }
+    faults
+}
+
+/// The fault points of a window of `rows` rows over `base` committed rows for a model that rolls
+/// back through per-row state slots: a fault at the first and last feed, at the first and last
+/// capture, and at the restore under the verdict that keeps one row (slot 0) and the one that keeps
+/// all but one (the last slot). The verdicts name the committed rows, which the slot path checks.
+pub(crate) fn slot_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> {
+    let under = |kept: usize| Commit {
+        committed_rows: base + kept,
+        kept_rows: kept,
+        discarded_rows: rows - kept,
+        state_slot: kept - 1,
+    };
+    let mut faults = vec![
+        (Fault::Feed(0), under(1)),
+        (Fault::Feed(rows - 1), under(1)),
+        (Fault::Capture(0), under(1)),
+    ];
+    if rows > 2 {
+        faults.push((Fault::Capture(rows - 2), under(1)));
+        faults.push((Fault::Restore, under(rows - 1)));
+    }
+    faults.push((Fault::Restore, under(1)));
     faults
 }
 
@@ -644,7 +838,7 @@ pub(crate) fn failure_recovery<S: D1Subject>(
     let clean = window_rows_of(subject, inputs, F)?;
     subject.restore(&base).at(F)?;
     let mut tally = Tally::default();
-    for (fault, commit) in faults_for(inputs.len()) {
+    for (fault, commit) in subject.fault_plan(inputs.len()) {
         subject.restore(&base).at(F)?;
         subject.inject_fault(fault);
         let ran = subject.run_window(inputs).and_then(|()| {
