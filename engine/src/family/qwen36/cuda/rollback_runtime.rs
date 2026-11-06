@@ -34,7 +34,7 @@ impl QwenResidentStep<'_> {
 
     /// Allocates the slots for windows of up to `rows` rows and returns their bytes. Refused, with
     /// the step untouched, when: the step has run, it is tiered, a sparse sketch is armed, the KV
-    /// is not the resident plane, speculation is not armed, `rows` is outside 2 to 8, no admission
+    /// is not the resident plane, `rows` is outside 2 to 8, no admission
     /// charges the bytes and they do not fit the load reserve (`cover`), or the card cannot hold
     /// them (`MemoryPlan`). `tip_bytes` is the device tip that shares the reserve.
     pub(crate) fn enable_device_rollback(
@@ -53,9 +53,6 @@ impl QwenResidentStep<'_> {
         }
         if self.rollback.is_some() {
             return Err(refuse("the slots are already armed"));
-        }
-        if self.speculator.is_none() {
-            return Err(refuse("speculation is not armed"));
         }
         if self.is_tiered() {
             return Err(refuse("tiered experts keep a bank state the slots do not hold"));
@@ -132,6 +129,12 @@ impl QwenResidentStep<'_> {
             EngError::BadRequest("verify window: no rollback slots are armed".into())
         })?;
         slots.finish(context, stream, state, kept, committed_rows)
+    }
+
+    /// Marks the state untrustworthy: the window failed after a row ran, so the state is ahead of
+    /// the lineage and no verdict can come.
+    pub(crate) fn rollback_poison(&mut self) {
+        self.state.poison();
     }
 
     /// Drops an open window and every slot mark: a reset, an import, a poison, a failed window.

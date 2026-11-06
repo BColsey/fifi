@@ -62,16 +62,22 @@ use super::{
 use crate::{
     EngError,
     family::{
+        qwen36::{
+            rollback::Cover,
+            settings::{QWEN36_MAX_WINDOW_ROWS, RollbackMode, rollback_mode_name},
+        },
         project::cuda::{CudaProjector, CudaWeights, Reserve, WeightLayout},
         sampler::{Sampler, SamplingParams},
         session::{DecodeSession, Limits, TokenStepper},
         speculate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
-                failure_recovery, first_bit_difference, first_byte_difference, full_logits,
-                host_greedy, later_rows_isolated, near_tie, ties_break_low,
+                failure_recovery, faults_for, first_bit_difference, first_byte_difference,
+                full_logits, host_greedy, later_rows_isolated, near_tie, slot_faults_for,
+                ties_break_low,
             },
             driver::WindowModel,
+            window::Commit,
         },
     },
     kernels::{
@@ -111,6 +117,27 @@ pub(super) fn capture_from_env() -> bool {
         Ok("0") => false,
         Ok("1") | Err(_) => true,
         Ok(other) => panic!("FIFI_D1_CAPTURE must be 0 or 1, got {other:?}"),
+    }
+}
+
+/// `FIFI_D1_ROLLBACK`: `host` (the default: export, import, replay) or `device` (the per-row
+/// slots of `state/rollback.rs`).
+pub(super) fn rollback_from_env() -> RollbackMode {
+    match std::env::var("FIFI_D1_ROLLBACK").as_deref() {
+        Ok("device") => RollbackMode::Device,
+        Ok("host") | Err(_) => RollbackMode::Host,
+        Ok(other) => panic!("FIFI_D1_ROLLBACK must be host or device, got {other:?}"),
+    }
+}
+
+/// Arms the device rollback on a freshly built step (windows of up to the 8-row cap), as the
+/// served start does for `draft_rollback = device`. A test rig runs no prefill admission, so the
+/// slots are not charged to one.
+pub(super) fn arm_rollback(step: &mut QwenResidentStep<'_>, mode: RollbackMode) {
+    if mode == RollbackMode::Device {
+        step.request_device_rollback();
+        step.enable_device_rollback(QWEN36_MAX_WINDOW_ROWS, Cover::Arena, 0)
+            .expect("device rollback slots");
     }
 }
 
@@ -272,6 +299,14 @@ impl D1Subject for QwenResidentStep<'_> {
     fn inject_fault(&mut self, fault: Fault) {
         self.window_fault = Some(fault);
     }
+
+    fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
+        if self.device_rollback_wanted() {
+            slot_faults_for(self.tokens(), rows)
+        } else {
+            faults_for(rows)
+        }
+    }
 }
 
 struct Rig {
@@ -301,10 +336,12 @@ fn rig() -> Rig {
     let kv = kv_mode_from_env();
     let capture = capture_from_env();
     let loaded = load_pack();
+    let rollback = rollback_from_env();
     println!(
         "D1_CONFIG kv={kv:?} capture={capture} context={context} prefixes={prefixes:?} \
-         single_row_kernel={}",
-        loaded.kernel
+         single_row_kernel={} rollback={}",
+        loaded.kernel,
+        rollback_mode_name(rollback)
     );
     let step = build_step(
         &loaded,
@@ -315,6 +352,8 @@ fn rig() -> Rig {
         },
     )
     .expect("step");
+    let mut step = step;
+    arm_rollback(&mut step, rollback);
     Rig {
         step,
         tokenizer,
