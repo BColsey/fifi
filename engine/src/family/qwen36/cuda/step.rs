@@ -1303,6 +1303,7 @@ impl<'a> QwenResidentStep<'a> {
     pub(crate) fn reset_state(&mut self) -> Result<(), EngError> {
         self.complete_prefix_save()?;
         self.window = None;
+        self.rollback_discard();
         self.state.reset(&self.stream)?;
         // R3: the position restarts at zero; the sketch-valid prefix follows (the
         // re-appends rewrite every consumed cell, but the binding stays honest).
@@ -1329,6 +1330,11 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
+        // A window that is still open describes a state this import replaces. The host
+        // `commit_window` has taken its window before it gets here, so for it this changes
+        // nothing; for a prefix restore the window is dead. It precedes every fallible call.
+        self.window = None;
+        self.rollback_discard();
         self.complete_prefix_save()?;
         self.state.import_state(&self.stream, exported)?;
         // R3: the checkpoint restored the KV planes and the position, but NOT the
