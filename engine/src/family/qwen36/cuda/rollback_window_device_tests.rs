@@ -2,46 +2,70 @@
 //! checks do not name. Device tests that COMPILE on the host build of the CUDA container and RUN
 //! only on a device, one process per test on the GPU held exclusively. NONE HAS RUN.
 //!
+//! Each test loads the pack ONCE (`load_pack`, about 18 GiB on a 24 GB card) and builds its steps
+//! from that load with `build_step`, as the D1 `rig()` does. Never call `load_pack` twice in a
+//! process: the second load would not fit. A test builds at most two steps (the step under test and
+//! a baseline), each with its own state and arena.
+//!
 //! | test | what |
 //! |---|---|
 //! | `unarmed` | a step that wants the device rollback and holds no slots refuses a window before any change |
 //! | `small_reserve` | slots that no admission charges and the reserve cannot hold refuse arming and leave the step |
 //! | `cancel` | a reset with a window open discards it; the next job equals a fresh baseline |
+//! | `cancel_in_propose` | a cancel that arrives while a window is being built: the window commits, the next call is Cancelled and resets |
 //! | `late_poison` | a state poisoned between the window and its commit stays poisoned |
+//! | `abandoned_window` | a window without a verdict poisons the state at the next step, refuses an export, and poisons it at a new window |
+//! | `over_capacity` | a window that does not fit the KV capacity is refused before any row is fed |
+//! | `sparse_refused` | with sparse attention armed (`INFERENCE_QWEN36_SPARSE_ATTN=1`, Int8G32) arming is refused |
 //! | `sixteen_steps` | sixteen ordinary decode steps after a rejected window equal the uninterrupted baseline, bit for bit, and so does the exported state |
+//!
+//! The refusal with a paged KV cache is `state/rollback_tests.rs`, on a bare paged state.
 //!
 //! Environment as `d1_window_device_tests`: `FIFI_EXL3_CHECKPOINT`, `FIFI_SPEC_TEXT`,
 //! `FIFI_SPEC_TOKENIZER`, `FIFI_D1_KV`, `FIFI_D1_CAPTURE`.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use super::{
     d1_window_device_tests::{
-        arm_rollback, build_step, capture_from_env, exported_difference, kv_mode_from_env,
-        load_pack, step_options, text_stream,
+        EOS, Loaded, SAMPLER_VOCAB, arm_rollback, build_step, capture_from_env,
+        exported_difference, kv_mode_from_env, load_pack, step_options, text_stream,
     },
+    dims::KvMode,
     step::{CaptureConfig, QwenResidentStep},
 };
 use crate::{
     EngError,
     family::{
+        executor::GenerationState,
         qwen36::{
             rollback::Cover,
             settings::{QWEN36_MAX_WINDOW_ROWS, RollbackMode},
         },
         sampler::Sampler,
-        session::{DecodeSession, TokenStepper},
-        speculate::{d1_oracle::first_bit_difference, driver::WindowModel, window::Commit},
+        session::{DecodeSession, Limits, TokenStepper},
+        speculate::{
+            accept::Accepted,
+            d1_oracle::first_bit_difference,
+            driver::{Drafter, Proposal, Speculator, WindowModel},
+            window::{Commit, Window},
+        },
     },
+    tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
 };
 
 const CONTEXT: usize = 2_048;
 const PREFIX: usize = 600;
 const ROWS: usize = 4;
 
-fn fixture(mode: RollbackMode) -> (QwenResidentStep<'static>, Vec<u32>) {
-    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+/// A step over a pack that the test loaded once.
+fn step_in(loaded: &Loaded, mode: RollbackMode, context: usize) -> QwenResidentStep<'static> {
     let mut step = build_step(
-        &load_pack(),
-        &step_options(kv_mode_from_env(), CONTEXT),
+        loaded,
+        &step_options(kv_mode_from_env(), context),
         CaptureConfig {
             capture: capture_from_env(),
             section_marks: false,
@@ -49,24 +73,24 @@ fn fixture(mode: RollbackMode) -> (QwenResidentStep<'static>, Vec<u32>) {
     )
     .expect("step");
     arm_rollback(&mut step, mode);
-    (step, stream)
+    step
 }
 
-fn prefill(step: &mut QwenResidentStep<'static>, stream: &[u32]) -> DecodeSession {
+fn prefill(step: &mut QwenResidentStep<'static>, stream: &[u32], context: usize) -> DecodeSession {
     let mut session = DecodeSession::default();
     session.reset(step).expect("reset");
     session
-        .prefill(step, &stream[..PREFIX], CONTEXT)
+        .prefill(step, &stream[..PREFIX], context)
         .expect("prefill");
     session
 }
 
-/// A verdict that keeps `kept` of the window's rows.
-fn keeps(base: usize, kept: usize) -> Commit {
+/// A verdict that keeps `kept` of the window's `rows` rows.
+fn keeps(base: usize, kept: usize, rows: usize) -> Commit {
     Commit {
         committed_rows: base + kept,
         kept_rows: kept,
-        discarded_rows: ROWS - kept,
+        discarded_rows: rows - kept,
         state_slot: kept - 1,
     }
 }
@@ -74,9 +98,11 @@ fn keeps(base: usize, kept: usize) -> Commit {
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn unarmed_a_step_that_wants_the_device_rollback_refuses_a_window_before_any_change() {
-    let (mut step, stream) = fixture(RollbackMode::Host);
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Host, CONTEXT);
     step.request_device_rollback();
-    let _session = prefill(&mut step, &stream);
+    let _session = prefill(&mut step, &stream, CONTEXT);
     let before = step.export_state().expect("export");
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     let error = step.run_window(inputs).expect_err("no slots are armed");
@@ -93,10 +119,9 @@ fn unarmed_a_step_that_wants_the_device_rollback_refuses_a_window_before_any_cha
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn small_reserve_slots_that_no_admission_charges_and_the_reserve_cannot_hold_refuse_arming() {
-    let (mut step, stream) = fixture(RollbackMode::Host);
-    let _session = prefill_fresh_only(&mut step);
-    // The arming call of a fresh step: refused by the reserve check before any allocation.
-    let (mut fresh, _) = fixture(RollbackMode::Host);
+    let loaded = load_pack();
+    // A fresh step: the reserve check refuses before any allocation.
+    let mut fresh = step_in(&loaded, RollbackMode::Host, CONTEXT);
     let error = fresh
         .enable_device_rollback(
             QWEN36_MAX_WINDOW_ROWS,
@@ -106,55 +131,133 @@ fn small_reserve_slots_that_no_admission_charges_and_the_reserve_cannot_hold_ref
         .expect_err("a 1 MiB reserve cannot hold 7 slots");
     assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
     assert!(!fresh.device_rollback_armed(), "the step is untouched");
-    // And a step that has already run is not armed late.
-    let error = step
+    // A step that has already run is not armed late.
+    fresh.run_token(1, false).expect("one token");
+    let error = fresh
         .enable_device_rollback(QWEN36_MAX_WINDOW_ROWS, Cover::Arena, 0)
         .expect_err("armed after the first token");
     assert!(format!("{error:?}").contains("already run"), "{error:?}");
-    let _ = stream;
-}
-
-/// Runs one token so the step counts as started.
-fn prefill_fresh_only(step: &mut QwenResidentStep<'static>) -> u32 {
-    step.run_token(1, false).expect("one token")
 }
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn cancel_a_reset_with_a_window_open_discards_it_and_the_next_job_is_clean() {
-    let (mut step, stream) = fixture(RollbackMode::Device);
-    let _session = prefill(&mut step, &stream);
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Device, CONTEXT);
+    let _session = prefill(&mut step, &stream, CONTEXT);
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     step.run_window(inputs).expect("window");
     step.reset_state().expect("the cancel resets the session");
     let error = step
-        .commit_window(&keeps(PREFIX - 1, 2))
+        .commit_window(&keeps(PREFIX - 1, 2, ROWS))
         .expect_err("no window");
     assert!(format!("{error:?}").contains("no window"), "{error:?}");
     assert_eq!(step.tokens(), 0);
     // The next job: a window runs again over a fresh prefill and rolls back to the baseline.
-    let _next = prefill(&mut step, &stream);
+    let _next = prefill(&mut step, &stream, CONTEXT);
     let base = step.tokens();
     step.run_window(inputs).expect("a window on the next job");
-    step.commit_window(&keeps(base, 1)).expect("rollback");
+    step.commit_window(&keeps(base, 1, ROWS)).expect("rollback");
     let after = step.export_state().expect("export");
-    let (mut fresh, _) = fixture(RollbackMode::Host);
-    let _ = prefill(&mut fresh, &stream);
+    let mut fresh = step_in(&loaded, RollbackMode::Host, CONTEXT);
+    let _ = prefill(&mut fresh, &stream, CONTEXT);
     fresh.run_token(inputs[0], false).expect("one row");
     let want = fresh.export_state().expect("export");
     assert_eq!(exported_difference(&after, &want), None);
 }
 
+/// Proposes a fixed draft and raises the cancel flag while it does: the cancel arrives while the
+/// window is being built.
+struct CancelWhilePurposing {
+    cancel: Arc<AtomicBool>,
+    drafts: Vec<u32>,
+}
+
+impl Drafter for CancelWhilePurposing {
+    fn propose(&mut self, _history: &[u32], room: usize) -> Result<Proposal, EngError> {
+        self.cancel.store(true, Ordering::SeqCst);
+        let count = self.drafts.len().min(room);
+        Ok(Proposal {
+            tokens: self.drafts[..count].to_vec(),
+            scores: Vec::new(),
+        })
+    }
+
+    fn observe(&mut self, _window: &Window, _accepted: &Accepted) -> Result<(), EngError> {
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn cancel_in_propose_the_window_commits_and_the_next_call_is_cancelled_and_resets() {
+    let (tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Device, CONTEXT);
+    let mut session = prefill(&mut step, &stream, CONTEXT);
+    let base = step.tokens();
+    let mut generation = generation_of(&tokenizer);
+    let drafter = CancelWhilePurposing {
+        cancel: Arc::clone(&generation.cancel),
+        drafts: stream[PREFIX..PREFIX + 3].to_vec(),
+    };
+    let mut speculator = Speculator::new(drafter, 3);
+    let limits = Limits {
+        eos: &EOS,
+        sampler_vocab: SAMPLER_VOCAB,
+        context_limit: CONTEXT,
+    };
+    // The flag is raised inside `propose`, after `prepare_decode` has looked: the window runs to its
+    // verdict and commits; the state is exactly the one-row loop of the tokens it emitted.
+    let batch = speculator
+        .decode(&mut session, &mut step, &mut generation, &limits)
+        .expect("the window commits");
+    let emitted = batch.tokens.len();
+    assert!(emitted >= 1);
+    assert_eq!(step.tokens(), base + emitted);
+    let after = step.export_state().expect("a valid, committed state");
+    let mut reference = step_in(&loaded, RollbackMode::Host, CONTEXT);
+    let _ = prefill(&mut reference, &stream, CONTEXT);
+    for token in &stream[PREFIX - 1..PREFIX - 1 + emitted] {
+        reference.run_token(*token, false).expect("baseline row");
+    }
+    // The emitted tokens are the draws; the rows fed are the pending token and the accepted drafts.
+    let want = reference.export_state().expect("export");
+    assert_eq!(exported_difference(&after, &want), None);
+    // The next call sees the flag: Cancelled, and the session resets.
+    let next = speculator
+        .decode(&mut session, &mut step, &mut generation, &limits)
+        .expect("the cancel ends the job");
+    assert!(
+        matches!(next.finish, Some(DecodeFinish::Cancelled)),
+        "{:?}",
+        next.finish
+    );
+    assert_eq!(step.tokens(), 0, "the cancel reset the model");
+    assert!(
+        step.device_rollback_armed(),
+        "and the slots are still armed"
+    );
+}
+
+fn generation_of(tokenizer: &Tokenizer) -> GenerationState {
+    GenerationState::with_sampler(IncrementalDecoder::new(tokenizer), Sampler::greedy())
+        .with_max_tokens(64)
+}
+
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn late_poison_a_state_poisoned_between_the_window_and_its_commit_stays_poisoned() {
-    let (mut step, stream) = fixture(RollbackMode::Device);
-    let _session = prefill(&mut step, &stream);
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Device, CONTEXT);
+    let _session = prefill(&mut step, &stream, CONTEXT);
     let base = step.tokens();
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     step.run_window(inputs).expect("window");
     step.poison_state();
-    assert!(step.commit_window(&keeps(base, 2)).is_err());
+    assert!(step.commit_window(&keeps(base, 2, ROWS)).is_err());
     assert!(step.export_state().is_err(), "it was not healed");
     assert!(
         step.run_token(inputs[0], false).is_err(),
@@ -166,24 +269,100 @@ fn late_poison_a_state_poisoned_between_the_window_and_its_commit_stays_poisoned
 
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
-fn sixteen_steps_after_a_rejected_window_equal_the_uninterrupted_baseline() {
-    let (mut step, stream) = fixture(RollbackMode::Device);
-    let _session = prefill(&mut step, &stream);
+fn abandoned_window_a_state_ahead_of_its_verdict_cannot_be_used() {
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Device, CONTEXT);
+    let _session = prefill(&mut step, &stream, CONTEXT);
     let base = step.tokens();
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
+    // An export through the speculative rows is refused and changes nothing.
+    step.run_window(inputs).expect("window");
+    assert!(step.export_state().is_err(), "an export is refused");
+    // A decode step poisons the state: it would continue from the speculative rows.
+    assert!(step.run_token(inputs[0], false).is_err());
+    assert!(step.export_state().is_err(), "the state is poisoned");
+    assert!(
+        step.commit_window(&keeps(base, 2, ROWS)).is_err(),
+        "the window was dropped with it"
+    );
+    step.reset_state().expect("a reset is the way back");
+    // A new window over a window that never had its verdict poisons the state.
+    let _session = prefill(&mut step, &stream, CONTEXT);
+    step.run_window(inputs).expect("window");
+    assert!(
+        step.run_window(inputs).is_err(),
+        "a second window is refused"
+    );
+    assert!(step.export_state().is_err(), "and the state is poisoned");
+    step.reset_state().expect("a reset is the way back");
+    assert!(step.export_state().is_ok());
+}
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn over_capacity_a_window_that_does_not_fit_the_kv_is_refused_before_any_row() {
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    // Capacity PREFIX + 3 cells: 599 committed rows leave room for a window of 4 rows, not 5.
+    let context = PREFIX + 3;
+    let mut step = step_in(&loaded, RollbackMode::Device, context);
+    let _session = prefill(&mut step, &stream, context);
+    let before = step.export_state().expect("export");
+    let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS + 1];
+    let error = step.run_window(inputs).expect_err("5 rows do not fit");
+    assert!(matches!(error, EngError::ContextLimit(_)), "{error:?}");
+    let after = step
+        .export_state()
+        .expect("the state is untouched and valid");
+    assert_eq!(exported_difference(&before, &after), None);
+    step.run_window(&inputs[..ROWS]).expect("4 rows fit");
+}
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack; INFERENCE_QWEN36_SPARSE_ATTN=1 and FIFI_D1_KV=int8g32"]
+fn sparse_refused_arming_the_device_rollback_with_sparse_attention_armed_is_refused() {
+    assert_eq!(
+        kv_mode_from_env(),
+        KvMode::Int8G32,
+        "sparse attention is admitted for Int8G32 only: set FIFI_D1_KV=int8g32"
+    );
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Host, CONTEXT);
+    assert!(
+        step.sparse_attention_armed(),
+        "set INFERENCE_QWEN36_SPARSE_ATTN=1 and leave room for the sketch: the control needs sparse armed"
+    );
+    let error = step
+        .enable_device_rollback(QWEN36_MAX_WINDOW_ROWS, Cover::Arena, 0)
+        .expect_err("sparse attention is armed");
+    assert!(format!("{error:?}").contains("sparse"), "{error:?}");
+    assert!(!step.device_rollback_armed(), "the step is untouched");
+}
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn sixteen_steps_after_a_rejected_window_equal_the_uninterrupted_baseline() {
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    // One load, two steps: the step under test and the baseline, both reset between rounds.
+    let loaded = load_pack();
+    let mut step = step_in(&loaded, RollbackMode::Device, CONTEXT);
+    let mut reference = step_in(&loaded, RollbackMode::Host, CONTEXT);
+    let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     for kept in 1..ROWS {
-        let _session = prefill(&mut step, &stream);
+        let _session = prefill(&mut step, &stream, CONTEXT);
+        let base = step.tokens();
         step.run_window(inputs).expect("window");
         step.window_greedy_probe();
-        step.commit_window(&keeps(base, kept)).expect("rollback");
+        step.commit_window(&keeps(base, kept, ROWS))
+            .expect("rollback");
         let mut got = Vec::new();
         for token in &stream[PREFIX - 1 + kept..PREFIX - 1 + kept + 16] {
             got.push(step.logits(*token).expect("decode"));
         }
         let state = step.export_state().expect("export");
 
-        let (mut reference, _) = fixture(RollbackMode::Host);
-        let _ = prefill(&mut reference, &stream);
+        let _ = prefill(&mut reference, &stream, CONTEXT);
         for token in &inputs[..kept] {
             reference.run_token(*token, false).expect("baseline row");
         }
@@ -207,11 +386,7 @@ impl QwenResidentStep<'_> {
     /// Draws the greedy token of row 0 of the open window, as the driver does, to prove that
     /// the window answers before its verdict.
     fn window_greedy_probe(&mut self) {
-        let drawn = self.draw(
-            0,
-            &mut Sampler::greedy(),
-            super::d1_window_device_tests::SAMPLER_VOCAB,
-        );
+        let drawn = self.draw(0, &mut Sampler::greedy(), SAMPLER_VOCAB);
         assert!(drawn.is_ok(), "{drawn:?}");
     }
 }

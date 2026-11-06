@@ -59,6 +59,12 @@ enum Mutant {
     RowWritesBelowFrontier,
     /// An import leaves the window open.
     ImportKeepsWindow,
+    /// A decode step or an export is allowed while a window awaits its verdict.
+    RunsWhileAwaiting,
+    /// A window over an open one is refused but leaves the state valid.
+    OverlapKeepsValid,
+    /// A guard failure other than health leaves the state valid.
+    GuardFailureKeepsValid,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -88,6 +94,8 @@ struct SlotFake {
     open: Option<Open>,
     poisoned: bool,
     fault: Option<Fault>,
+    /// A step is pending: the device words are not the host's.
+    busy: bool,
 }
 
 fn refused(what: &str) -> EngError {
@@ -110,6 +118,7 @@ impl SlotFake {
             open: None,
             poisoned: false,
             fault: None,
+            busy: false,
         }
     }
 
@@ -117,7 +126,7 @@ impl SlotFake {
         StateFacts {
             owner: true,
             valid: !self.poisoned,
-            idle: true,
+            idle: !self.busy,
             resident_kv: true,
         }
     }
@@ -127,6 +136,18 @@ impl SlotFake {
             return Err(refused("the state is poisoned"));
         }
         Ok(())
+    }
+
+    /// The rule of the step: a decode step through a state whose window awaits its verdict poisons
+    /// it, and an export is refused.
+    fn refuse_while_awaiting(&mut self, poison: bool) -> Result<()> {
+        if self.mutant == Mutant::RunsWhileAwaiting || !self.book.awaiting_verdict() {
+            return Ok(());
+        }
+        if poison {
+            self.fail();
+        }
+        Err(refused("a window waits for its verdict"))
     }
 
     fn fail(&mut self) {
@@ -234,12 +255,14 @@ impl TokenStepper for SlotFake {
 
     fn feed(&mut self, token: u32) -> Result<()> {
         self.live()?;
+        self.refuse_while_awaiting(true)?;
         self.advance(token);
         Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
         self.live()?;
+        self.refuse_while_awaiting(true)?;
         Ok(self.advance(token))
     }
 
@@ -263,6 +286,13 @@ impl WindowModel for SlotFake {
         self.open = None;
         self.live()?;
         self.facts().require_copyable("run_window")?;
+        if self.book.is_open() {
+            // The previous window has no verdict: the state is ahead of the lineage.
+            if self.mutant != Mutant::OverlapKeepsValid {
+                self.fail();
+            }
+            return Err(refused("the previous window has no verdict"));
+        }
         self.book.begin_window(self.len, inputs.len())?;
         let result = self.window_body(inputs);
         let rows = self.failing(result)?;
@@ -270,6 +300,7 @@ impl WindowModel for SlotFake {
             inputs: inputs.to_vec(),
             rows,
         });
+        self.book.mark_complete()?;
         Ok(())
     }
 
@@ -285,6 +316,9 @@ impl WindowModel for SlotFake {
             // A poisoned state is refused here and stays poisoned; the window is dropped.
             if let Err(error) = self.facts().require_copyable("commit_window") {
                 self.book.discard();
+                if self.mutant != Mutant::GuardFailureKeepsValid {
+                    self.poisoned = true;
+                }
                 return Err(error);
             }
         }
@@ -336,6 +370,7 @@ impl D1Subject for SlotFake {
 
     fn snapshot(&mut self) -> Result<SlotState> {
         self.live()?;
+        self.refuse_while_awaiting(false)?;
         Ok(SlotState {
             cells: self.cells[..self.len].to_vec(),
             recurrent: self.recurrent,
@@ -627,4 +662,66 @@ fn the_slot_fake_keeps_stale_cells_above_the_frontier() {
     rig.fake.commit_window(&commit).unwrap();
     assert_eq!(rig.fake.len, before + 1);
     assert_eq!(rig.fake.cells.len(), before + 4, "the discarded cells stay");
+}
+
+#[test]
+fn a_step_or_an_export_through_a_window_that_awaits_its_verdict_is_refused() {
+    let mut rig = SlotRig::new(Mutant::Sound, false);
+    rig.fake.run_window(&rows(4)).unwrap();
+    assert!(rig.fake.snapshot().is_err(), "an export is refused");
+    assert!(!rig.fake.poisoned, "an export only refuses");
+    assert!(rig.fake.logits(1).is_err(), "a decode step is refused ...");
+    assert!(rig.fake.poisoned, "... and poisons the state");
+    assert!(!rig.fake.book.is_open(), "and drops the window");
+    // The way back is a restore.
+    let mut rig = SlotRig::new(Mutant::Sound, false);
+    let base = rig.fake.snapshot().unwrap();
+    rig.fake.run_window(&rows(4)).unwrap();
+    rig.fake.restore(&base).unwrap();
+    rig.fake.logits(1).expect("an import closes the window");
+}
+
+#[test]
+fn the_awaiting_rule_is_what_blocks_a_step_through_speculative_rows() {
+    let mut sound = SlotRig::new(Mutant::Sound, false);
+    sound.fake.run_window(&rows(4)).unwrap();
+    assert!(sound.fake.feed(1).is_err());
+    let mut flawed = SlotRig::new(Mutant::RunsWhileAwaiting, false);
+    flawed.fake.run_window(&rows(4)).unwrap();
+    assert!(
+        flawed.fake.feed(1).is_ok(),
+        "without the rule the step continues from the speculative rows: the sound fake differs"
+    );
+}
+
+#[test]
+fn a_window_over_an_open_one_poisons_the_state() {
+    for (mutant, poisoned) in [(Mutant::Sound, true), (Mutant::OverlapKeepsValid, false)] {
+        let mut rig = SlotRig::new(mutant, false);
+        rig.fake.run_window(&rows(4)).unwrap();
+        assert!(rig.fake.run_window(&rows(4)).is_err());
+        assert_eq!(rig.fake.poisoned, poisoned, "{mutant:?}");
+    }
+}
+
+#[test]
+fn a_guard_failure_of_any_fact_poisons_the_state_at_the_commit() {
+    for (mutant, poisoned) in [
+        (Mutant::Sound, true),
+        (Mutant::GuardFailureKeepsValid, false),
+    ] {
+        let mut rig = SlotRig::new(mutant, false);
+        let base = rig.fake.len;
+        rig.fake.run_window(&rows(4)).unwrap();
+        rig.fake.busy = true;
+        let commit = Commit {
+            committed_rows: base + 2,
+            kept_rows: 2,
+            discarded_rows: 2,
+            state_slot: 1,
+        };
+        assert!(rig.fake.commit_window(&commit).is_err());
+        assert_eq!(rig.fake.poisoned, poisoned, "{mutant:?}");
+        assert!(!rig.fake.book.is_open());
+    }
 }

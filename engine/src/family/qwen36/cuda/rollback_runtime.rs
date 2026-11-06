@@ -9,8 +9,17 @@ use super::super::state::rollback::{RollbackSlots, slot_bytes_of};
 use super::QwenResidentStep;
 use crate::{
     EngError,
-    family::qwen36::rollback::{Cover, RollbackPlan, check_uncharged_slots},
+    family::qwen36::rollback::{
+        ArmingFacts, Cover, RollbackPlan, check_arming, check_uncharged_slots,
+    },
 };
+
+/// The refusal of a window on a step that wants the device rollback and holds no slots.
+fn no_slots() -> EngError {
+    EngError::BadRequest(
+        "verify window: draft_rollback device is set and no rollback slots are armed".into(),
+    )
+}
 
 impl QwenResidentStep<'_> {
     /// Records that the settings asked for `draft_rollback = device`. Call it before
@@ -43,27 +52,14 @@ impl QwenResidentStep<'_> {
         cover: Cover,
         tip_bytes: usize,
     ) -> Result<usize, EngError> {
-        let refuse = |why: &str| {
-            EngError::BadRequest(format!(
-                "draft_rollback device: {why}; set draft_rollback to host"
-            ))
-        };
-        if self.started {
-            return Err(refuse("the step has already run"));
-        }
-        if self.rollback.is_some() {
-            return Err(refuse("the slots are already armed"));
-        }
-        if self.is_tiered() {
-            return Err(refuse(
-                "tiered experts keep a bank state the slots do not hold",
-            ));
-        }
-        if self.res.sparse.is_some() || self.res.paged.is_some() {
-            return Err(refuse(
-                "sparse attention or a paged KV cache is armed and the frontier is not proven for it",
-            ));
-        }
+        check_arming(ArmingFacts {
+            started: self.started,
+            armed: self.rollback.is_some(),
+            tiered: self.is_tiered(),
+            sparse: self.res.sparse.is_some(),
+            paged: self.res.paged.is_some(),
+            forked_experts: self.forked_experts,
+        })?;
         let plan = RollbackPlan::new(rows, slot_bytes_of(&self.state)?)?;
         if let Cover::Reserve { headroom } = cover {
             check_uncharged_slots(plan.total_bytes()?, tip_bytes, headroom)?;
@@ -76,15 +72,12 @@ impl QwenResidentStep<'_> {
 
     /// The slots, or the refusal of a window on a step that wants them and has none.
     fn armed_slots(&mut self) -> Result<&mut RollbackSlots, EngError> {
-        self.rollback.as_mut().ok_or_else(|| {
-            EngError::BadRequest(
-                "verify window: draft_rollback device is set and no rollback slots are armed"
-                    .into(),
-            )
-        })
+        self.rollback.as_mut().ok_or_else(no_slots)
     }
 
-    /// Opens a device window over the committed rows.
+    /// Opens a device window over the committed rows. A window that is still open means the state
+    /// is ahead of the lineage (rows ran, no verdict came): the state is poisoned and the window
+    /// dropped, then the call is refused.
     pub(crate) fn rollback_begin(&mut self, rows: usize) -> Result<(), EngError> {
         let Self {
             rollback,
@@ -92,13 +85,45 @@ impl QwenResidentStep<'_> {
             state,
             ..
         } = self;
-        let slots = rollback.as_mut().ok_or_else(|| {
-            EngError::BadRequest(
-                "verify window: draft_rollback device is set and no rollback slots are armed"
+        let slots = rollback.as_mut().ok_or_else(no_slots)?;
+        if slots.is_open() {
+            slots.discard();
+            state.poison();
+            return Err(EngError::BadRequest(
+                "verify window: the previous window has no verdict; the state is poisoned until a \
+                 reset or an import"
                     .into(),
-            )
-        })?;
+            ));
+        }
         slots.begin_window(stream, state, rows)
+    }
+
+    /// Marks that every row ran: from here until the verdict the state is ahead of the lineage.
+    pub(crate) fn rollback_window_complete(&mut self) -> Result<(), EngError> {
+        let slots = self.rollback.as_mut().ok_or_else(no_slots)?;
+        slots.mark_window_complete()
+    }
+
+    /// Refuses a decode step or an export through a state whose window awaits its verdict: it
+    /// would continue from the speculative rows. A step (`poison` true) also poisons the state and
+    /// drops the window, since the lineage is then lost; an export only refuses.
+    pub(crate) fn refuse_while_window_awaits(&mut self, poison: bool) -> Result<(), EngError> {
+        let awaiting = self
+            .rollback
+            .as_ref()
+            .is_some_and(RollbackSlots::awaiting_verdict);
+        if !awaiting {
+            return Ok(());
+        }
+        if poison {
+            self.rollback_discard();
+            self.state.poison();
+        }
+        Err(EngError::BadRequest(
+            "verify window: a window waits for its verdict; a step or an export through the state \
+             would continue from its speculative rows (reset or import first)"
+                .into(),
+        ))
     }
 
     /// Copies the state after row `row` into its slot.
@@ -110,9 +135,7 @@ impl QwenResidentStep<'_> {
             context,
             ..
         } = self;
-        let slots = rollback.as_mut().ok_or_else(|| {
-            EngError::BadRequest("verify window: no rollback slots are armed".into())
-        })?;
+        let slots = rollback.as_mut().ok_or_else(no_slots)?;
         slots.capture(context, stream, state, row)
     }
 
@@ -129,9 +152,7 @@ impl QwenResidentStep<'_> {
             context,
             ..
         } = self;
-        let slots = rollback.as_mut().ok_or_else(|| {
-            EngError::BadRequest("verify window: no rollback slots are armed".into())
-        })?;
+        let slots = rollback.as_mut().ok_or_else(no_slots)?;
         slots.finish(context, stream, state, kept, committed_rows)
     }
 
@@ -158,6 +179,11 @@ impl QwenResidentStep<'_> {
 /// between the two rollbacks that the cost harness rotates, and the copy microbenchmark.
 #[cfg(test)]
 impl QwenResidentStep<'_> {
+    /// Whether the sparse attention chain is admitted on this step (it refuses the device rollback).
+    pub(crate) fn sparse_attention_armed(&self) -> bool {
+        self.res.sparse.is_some()
+    }
+
     /// Drains the owning stream (the capture drain of the cost trace).
     pub(crate) fn drain_stream(&self) -> Result<(), EngError> {
         self.stream.synchronize()

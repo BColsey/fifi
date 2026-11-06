@@ -212,6 +212,11 @@ impl StateBook {
         self.tokens
     }
 
+    /// True when no step is pending (rule 4): the predicate of `require_idle`.
+    pub(super) fn is_idle(&self) -> bool {
+        self.pending.advances.is_empty()
+    }
+
     pub(super) fn pending_rows(&self) -> usize {
         self.pending.advances.iter().sum()
     }

@@ -13,9 +13,12 @@
 //! bookkeeping in `family/qwen36/rollback.rs`). A verdict that keeps `kept` rows copies slot
 //! `kept - 1` back and truncates the KV frontier to `base + kept`; the KV cells above it are stale
 //! and unreachable. There is no export, no import and no replay. It is opt-in; the default is the
-//! host path below. Every failure of the device path leaves a state that refuses to go on (poisoned,
-//! or refused by the guard) and no window: there is no outcome in which a valid state is ahead of
-//! the verdict. The host path keeps the gap described next.
+//! host path below. Every failure of the device path leaves a state that refuses to go on
+//! (poisoned) and no window. One case leaves a valid state ahead of the verdict for a while: a
+//! window that ran all its rows and has not had its verdict (an error between `run_window` and
+//! `commit_window`). Until the verdict that state cannot be used: a decode step through it poisons
+//! it, an export is refused, and a new window over it poisons it; a reset or an import closes the
+//! window. The host path keeps the gap described next.
 //!
 //! Failure. A step that fails inside the window poisons the state, so the window ends with an
 //! error, no pending window and a state that refuses to go on until a reset or an import. A
@@ -72,8 +75,7 @@ impl QwenResidentStep<'_> {
         Ok(window.rows.clone())
     }
 
-    /// Fires the armed fault when it is `at`: poisons the state the way a failed step does (the
-    /// state then refuses every step and snapshot until a reset or an import) and fails.
+    /// Fires the armed fault of the capture after row `row` (device rollback).
     fn capture_fault(&mut self, row: usize) -> Result<(), EngError> {
         self.fault_at(Fault::Capture(row))
     }
@@ -82,6 +84,8 @@ impl QwenResidentStep<'_> {
         self.fault_at(Fault::Restore)
     }
 
+    /// Fires the armed fault when it is `at`: poisons the state the way a failed step does (the
+    /// state then refuses every step and snapshot until a reset or an import) and fails.
     fn fault_at(&mut self, at: Fault) -> Result<(), EngError> {
         if self.window_fault != Some(at) {
             return Ok(());
@@ -349,6 +353,8 @@ impl QwenResidentStep<'_> {
             }
             return Err(error);
         }
+        // Every row ran: until the verdict a step or an export through the state is refused.
+        self.rollback_window_complete()?;
         self.window = Some(EagerWindow {
             inputs: inputs.to_vec(),
             rows,

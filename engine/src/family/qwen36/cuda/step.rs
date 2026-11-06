@@ -430,6 +430,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
     /// A window on a step that wants it and holds no slots is refused before any state change.
     rollback_wanted: bool,
+    /// The options asked for experts on branch streams (refused in stage 1 at resource creation,
+    /// and refused again when the device rollback is armed, which orders its copies on one stream).
+    forked_experts: bool,
     /// The device rollback slots (see `rollback_runtime`), armed before the first token. Armed means
     /// `Some`; the shared `Speculator` knows nothing of it.
     rollback: Option<super::state::rollback::RollbackSlots>,
@@ -722,6 +725,7 @@ impl<'a> QwenResidentStep<'a> {
             #[cfg(test)]
             trace_sync_capture: false,
             rollback_wanted: false,
+            forked_experts: options.forked_experts,
             rollback: None,
             pending_prefix: None,
         };
@@ -1332,13 +1336,26 @@ impl<'a> QwenResidentStep<'a> {
 
     /// The committed state as a host value, for the checkpoint store.
     pub(crate) fn export_state(&self) -> Result<ExportedState, EngError> {
+        if self
+            .rollback
+            .as_ref()
+            .is_some_and(|slots| slots.awaiting_verdict())
+        {
+            return Err(EngError::BadRequest(
+                "verify window: a window waits for its verdict; an export now would copy its speculative rows"
+                    .into(),
+            ));
+        }
         self.state.export_state(&self.stream)
     }
 
     pub(crate) fn import_state(&mut self, exported: &ExportedState) -> Result<(), EngError> {
         // A window that is still open describes a state this import replaces. The host
         // `commit_window` has taken its window before it gets here, so for it this changes
-        // nothing; for a prefix restore the window is dead. It precedes every fallible call.
+        // nothing; for a prefix restore the window is dead. It precedes the `complete_prefix_save`
+        // below so that a failing import never leaves a window over a state it did not restore;
+        // `reset_state` closes it after its own `complete_prefix_save` (same effect, the caller
+        // resets after any error).
         self.window = None;
         self.rollback_discard();
         self.complete_prefix_save()?;
@@ -1493,6 +1510,10 @@ impl<'a> QwenResidentStep<'a> {
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
         check_token_id(token, self.widths.verdict)?;
+        // A window that waits for its verdict leaves the state ahead of the lineage: a decode step
+        // through it would continue from the speculative rows. Inert unless the device rollback
+        // holds an open window.
+        self.refuse_while_window_awaits(true)?;
         if self.tiered_mode && self.tiered.is_none() {
             return Err(EngError::BadRequest(
                 "step: a tiered step needs attach_tiered before its first token".to_owned(),

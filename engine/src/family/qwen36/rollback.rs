@@ -127,6 +127,8 @@ struct OpenWindow {
     rows: usize,
     /// Slots written since the window opened: `0..captured`.
     captured: usize,
+    /// Every row has run: the window now waits for its verdict.
+    complete: bool,
 }
 
 /// The window state machine: which slots hold what, for the window that is open.
@@ -166,8 +168,26 @@ impl RollbackBook {
             base,
             rows,
             captured: 0,
+            complete: false,
         });
         Ok(())
+    }
+
+    /// Marks that every row of the open window has run. From here until the verdict the state is
+    /// ahead of the lineage: any step or export through it is refused (see `awaiting_verdict`).
+    pub(crate) fn mark_complete(&mut self) -> Result<(), EngError> {
+        let window = self
+            .window
+            .as_mut()
+            .ok_or_else(|| refuse("mark_complete", "no window is open"))?;
+        window.complete = true;
+        Ok(())
+    }
+
+    /// True while a window has run all its rows and no verdict has come. A decode step or an export
+    /// through the state in that time would continue from the speculative rows.
+    pub(crate) fn awaiting_verdict(&self) -> bool {
+        self.window.as_ref().is_some_and(|window| window.complete)
     }
 
     /// The slot that the copy after row `row` writes. Rows are captured in order, and the last row
@@ -258,6 +278,66 @@ impl RollbackBook {
     pub(crate) fn discard(&mut self) {
         self.window = None;
     }
+}
+
+/// Refuses a window whose rows do not fit the KV capacity, before any row is fed: row `i` writes
+/// cell `base + i`, so `base + rows` cells must exist.
+pub(crate) fn check_window_fits(base: usize, rows: usize, capacity: usize) -> Result<(), EngError> {
+    match base.checked_add(rows) {
+        Some(end) if end <= capacity => Ok(()),
+        _ => Err(EngError::ContextLimit(format!(
+            "device rollback: a window of {rows} rows over {base} committed rows exceeds the KV capacity {capacity}"
+        ))),
+    }
+}
+
+/// What the step knows when the device rollback is armed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArmingFacts {
+    /// The step has already run a token.
+    pub(crate) started: bool,
+    /// Slots are already armed.
+    pub(crate) armed: bool,
+    pub(crate) tiered: bool,
+    /// Sparse attention is armed: its sketch cells have a host prefix that a frontier truncation
+    /// does not rewind.
+    pub(crate) sparse: bool,
+    /// The KV is host-paged or device-first: no resident plane to truncate.
+    pub(crate) paged: bool,
+    /// Experts run on branch streams: the copies are ordered on one stream only.
+    pub(crate) forked_experts: bool,
+}
+
+/// The refusals of arming that need no device, in the order the step reports them. Every one is
+/// answered before the plan or the allocation, with the step untouched.
+pub(crate) fn check_arming(facts: ArmingFacts) -> Result<(), EngError> {
+    let refuse = |why: &str| {
+        EngError::BadRequest(format!(
+            "draft_rollback device: {why}; set draft_rollback to host"
+        ))
+    };
+    if facts.started {
+        return Err(refuse("the step has already run"));
+    }
+    if facts.armed {
+        return Err(refuse("the slots are already armed"));
+    }
+    if facts.tiered {
+        return Err(refuse(
+            "tiered experts keep a bank state the slots do not hold",
+        ));
+    }
+    if facts.forked_experts {
+        return Err(refuse(
+            "forked experts run on branch streams and the copies are ordered on one stream",
+        ));
+    }
+    if facts.sparse || facts.paged {
+        return Err(refuse(
+            "sparse attention or a paged KV cache is armed and the frontier is not proven for it",
+        ));
+    }
+    Ok(())
 }
 
 /// The memory check of the case no prefill admission charges the slots (`arena_wanted` false: the

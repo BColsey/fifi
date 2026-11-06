@@ -17,6 +17,8 @@ fn facts() -> StateFacts {
     }
 }
 
+/// Pins the constant of this file only; the pin against the real layout is native-only
+/// (`cuda/tests.rs`, `DeltaPool`).
 #[test]
 fn the_slot_of_the_production_state_is_65_863_680_bytes() {
     assert_eq!(SLOT, 65_863_680);
@@ -249,4 +251,109 @@ fn the_startup_line_names_the_cover_and_a_fallback_to_per_token_prefill() {
     );
     let fell_back = startup_line(&p, Cover::Arena, Some(false)).unwrap();
     assert!(fell_back.contains("per-token prefill"), "{fell_back}");
+}
+
+#[test]
+fn a_window_awaits_its_verdict_only_after_every_row_ran_and_until_it_is_closed() {
+    let mut book = RollbackBook::new(plan(4));
+    assert!(!book.awaiting_verdict(), "no window");
+    assert!(book.mark_complete().is_err(), "nothing to complete");
+    book.begin_window(100, 4).unwrap();
+    assert!(
+        !book.awaiting_verdict(),
+        "while its rows run the window is open, not awaiting: the rows are its own steps"
+    );
+    for row in 0..3 {
+        book.note_captured(row).unwrap();
+    }
+    book.mark_complete().unwrap();
+    assert!(book.awaiting_verdict());
+    assert!(
+        book.begin_window(100, 4).is_err(),
+        "no second window over it"
+    );
+    assert_eq!(book.finish_window(4, 104, 104).unwrap(), None);
+    assert!(!book.awaiting_verdict(), "a verdict closes it");
+    book.begin_window(104, 2).unwrap();
+    book.mark_complete().unwrap();
+    book.discard();
+    assert!(
+        !book.awaiting_verdict(),
+        "a reset, an import or a poison closes it"
+    );
+}
+
+#[test]
+fn a_window_that_does_not_fit_the_kv_capacity_is_refused_before_any_row() {
+    assert!(
+        check_window_fits(100, 4, 104).is_ok(),
+        "the last cell is exactly the capacity"
+    );
+    let error = check_window_fits(100, 4, 103).expect_err("one cell short");
+    assert!(matches!(error, EngError::ContextLimit(_)), "{error:?}");
+    assert!(check_window_fits(0, 8, 7).is_err());
+    assert!(
+        check_window_fits(usize::MAX, 2, usize::MAX).is_err(),
+        "overflow"
+    );
+}
+
+#[test]
+fn arming_is_refused_for_every_unsupported_state_and_forked_experts_by_name() {
+    assert!(check_arming(ArmingFacts::default()).is_ok());
+    for (name, facts, word) in [
+        (
+            "started",
+            ArmingFacts {
+                started: true,
+                ..ArmingFacts::default()
+            },
+            "already run",
+        ),
+        (
+            "armed",
+            ArmingFacts {
+                armed: true,
+                ..ArmingFacts::default()
+            },
+            "already armed",
+        ),
+        (
+            "tiered",
+            ArmingFacts {
+                tiered: true,
+                ..ArmingFacts::default()
+            },
+            "tiered",
+        ),
+        (
+            "sparse",
+            ArmingFacts {
+                sparse: true,
+                ..ArmingFacts::default()
+            },
+            "sparse",
+        ),
+        (
+            "paged",
+            ArmingFacts {
+                paged: true,
+                ..ArmingFacts::default()
+            },
+            "paged",
+        ),
+        (
+            "forked experts",
+            ArmingFacts {
+                forked_experts: true,
+                ..ArmingFacts::default()
+            },
+            "forked experts",
+        ),
+    ] {
+        let error = check_arming(facts).expect_err(name);
+        let text = format!("{error:?}");
+        assert!(text.contains(word), "{name}: {text}");
+        assert!(text.contains("draft_rollback"), "{name}: {text}");
+    }
 }

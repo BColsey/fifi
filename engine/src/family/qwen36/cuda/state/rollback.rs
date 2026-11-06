@@ -25,7 +25,9 @@ use super::{
 };
 use crate::{
     EngError,
-    family::qwen36::rollback::{Restore, RollbackBook, RollbackPlan, StateFacts},
+    family::qwen36::rollback::{
+        Restore, RollbackBook, RollbackPlan, StateFacts, check_window_fits,
+    },
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream},
 };
 
@@ -116,7 +118,7 @@ impl RollbackSlots {
         StateFacts {
             owner: same && stream.id() == self.owner && state.book.begin_join(stream.id()).is_ok(),
             valid: state.health() == Health::Valid,
-            idle: state.book.pending_rows() == 0,
+            idle: state.book.is_idle(),
             resident_kv: state.resident_kv().is_ok(),
         }
     }
@@ -130,7 +132,18 @@ impl RollbackSlots {
         rows: usize,
     ) -> Result<(), EngError> {
         self.facts(stream, state).require_copyable("run_window")?;
+        check_window_fits(state.tokens(), rows, state.layout.kv.capacity)?;
         self.book.begin_window(state.tokens(), rows)
+    }
+
+    /// Marks that every row ran: the window now waits for its verdict.
+    pub(crate) fn mark_window_complete(&mut self) -> Result<(), EngError> {
+        self.book.mark_complete()
+    }
+
+    /// True while the window has run and no verdict has come.
+    pub(crate) fn awaiting_verdict(&self) -> bool {
+        self.book.awaiting_verdict()
     }
 
     /// Copies slot 0 of the Delta pool into the slot of row `row`, queued on `stream` behind the
@@ -173,7 +186,11 @@ impl RollbackSlots {
         committed_rows: usize,
     ) -> Result<bool, EngError> {
         if let Err(error) = self.facts(stream, state).require_copyable("commit_window") {
+            // Whichever fact failed, the state may be ahead of the verdict: a state that is not
+            // valid is poisoned already, and any other failure poisons it here, so that no valid
+            // state is left behind a window that has no verdict.
             self.book.discard();
+            state.poison();
             return Err(error);
         }
         let restore = match self

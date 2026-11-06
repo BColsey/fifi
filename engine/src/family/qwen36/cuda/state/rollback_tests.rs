@@ -311,3 +311,23 @@ fn a_rejected_window_leaves_the_pinned_prefix_pool_able_to_finish_recycle_and_re
         assert_eq!(state.export_state(&stream).unwrap(), want, "{mode:?}");
     }
 }
+
+#[test]
+#[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+fn a_host_paged_kv_state_refuses_the_slots_and_is_left_alone() {
+    use super::super::paged_prefix_tests::{options, snapshot_budget};
+    let ctx = CudaContext::new().expect("native CUDA context");
+    let stream = ctx.stream().unwrap();
+    let opts = options();
+    let (_bytes, limit) = snapshot_budget(&common_tests::dims(), &opts).unwrap();
+    let state = ResidentState::allocate_paged(&ctx, &stream, &common_tests::dims(), &opts, limit)
+        .expect("a paged state");
+    match RollbackSlots::new(&ctx, &stream, &state, 4) {
+        Err(EngError::BadRequest(message)) => {
+            assert!(message.contains("paged"), "{message}");
+        }
+        Err(other) => panic!("a refusal naming the paged KV was expected: {other:?}"),
+        Ok(_) => panic!("a paged KV cache has no resident plane to truncate"),
+    }
+    assert_eq!(state.health(), Health::Valid);
+}
