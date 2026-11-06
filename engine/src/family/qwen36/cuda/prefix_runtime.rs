@@ -242,8 +242,8 @@ impl QwenResidentStep<'_> {
     }
 
     pub(crate) fn restore_pinned_prefix(&mut self, saved: &PinnedSnapshot) -> Result<(), EngError> {
-        // The restore replaces the state a window describes: close it before the first fallible
-        // call, and refuse while the recovery gate is set.
+        // Refused, before the first fallible call, while the recovery gate is set or a window is
+        // unresolved: only a reset recovers it (DESIGN 17.10).
         window_logic::restore_gate(self)?;
         self.complete_prefix_save()?;
         let device = self

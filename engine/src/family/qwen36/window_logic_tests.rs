@@ -694,7 +694,7 @@ fn an_export_through_the_gate_or_an_awaiting_window_is_refused_without_a_change(
 }
 
 #[test]
-fn every_restoring_entry_closes_an_open_window_and_is_refused_by_the_gate() {
+fn every_restoring_entry_is_refused_by_the_gate_and_by_an_unresolved_window() {
     // The wrappers of the table in the specification all enter through `restore_gate` (the
     // pinned-prefix restore and the `PrefixState` restore) or `import_state` (which calls it).
     type Entry = fn(&mut Fake) -> Result<(), EngError>;
@@ -703,11 +703,10 @@ fn every_restoring_entry_closes_an_open_window_and_is_refused_by_the_gate() {
         ("import_state", |host| import_state(host, &7)),
     ];
     for (name, entry) in entries {
+        // A usable state restores.
         let mut host = Fake::new(10, false);
-        run_window(&mut host, &[1, 2]).expect("run");
         entry(&mut host).expect(name);
-        assert!(host.window.is_none(), "{name}: the window must be closed");
-
+        // The gate refuses; nothing changes.
         let mut host = Fake::new(10, false);
         run_window(&mut host, &[1, 2]).expect("run");
         host.gate = true;
@@ -721,42 +720,53 @@ fn every_restoring_entry_closes_an_open_window_and_is_refused_by_the_gate() {
             host.window.is_some(),
             "{name}: a refused restore changes nothing"
         );
+        // An unresolved window refuses too, keeps the window, and sets the gate.
+        let mut host = Fake::new(10, false);
+        run_window(&mut host, &[1, 2]).expect("run");
+        host.log.clear();
+        entry(&mut host).expect_err(name);
+        assert!(host.window.is_some(), "{name}: the window stays unresolved");
+        assert!(host.gate, "{name}: the refusal sets the gate");
+        assert!(
+            !host.called("close_window") && !host.called("import"),
+            "{name}: {:?}",
+            host.log
+        );
     }
 }
 
 #[test]
-fn the_window_is_closed_before_the_first_fallible_call_of_a_restore() {
-    // A restore that fails at its first fallible call still closed the window.
+fn a_restore_through_an_unresolved_window_is_refused_before_its_first_fallible_call() {
     let mut host = Fake::new(10, false);
     run_window(&mut host, &[1, 2]).expect("run");
-    host.fail = Some("complete_prefix_save");
-    import_state(&mut host, &7).expect_err("the pending save fails");
-    assert!(host.window.is_none(), "closed before the pending save ran");
-    let closed = host.log.iter().position(|call| call == "close_window");
-    let saved = host
-        .log
-        .iter()
-        .position(|call| call == "complete_prefix_save");
+    host.log.clear();
+    import_state(&mut host, &7).expect_err("the window is unresolved");
     assert!(
-        closed < saved,
-        "close_window precedes complete_prefix_save: {:?}",
+        !host.called("complete_prefix_save") && !host.called("check_import"),
+        "{:?}",
         host.log
     );
 }
 
 #[test]
-fn an_import_over_a_stale_host_window_drops_it_and_imports_only_the_given_state() {
-    // The stale window of an error path before a pageable prefix restore: its saved snapshot
-    // (the state at 10 rows) must never be written back.
+fn an_import_over_an_unresolved_host_window_is_refused_and_imports_nothing() {
+    // The stale window of an error path before a pageable prefix restore (superseding the test
+    // that dropped it): its snapshot must never be written back, and the given state must not be
+    // imported either. Only a reset recovers.
     let mut host = Fake::new(10, false);
     run_window(&mut host, &[1, 2, 3]).expect("run");
     assert_eq!(host.tokens, 13);
-    import_state(&mut host, &40).expect("the import of the prefix state");
-    assert!(host.window.is_none(), "the stale window is dropped");
-    assert_eq!(host.tokens, 40, "only the given state was imported");
-    assert_eq!(host.log.iter().filter(|call| *call == "import").count(), 1);
-    // The dropped window cannot commit: there is nothing left to restore from.
-    commit_window(&mut host, &commit(10, 1, 3)).expect_err("no window");
+    import_state(&mut host, &40).expect_err("the window is unresolved");
+    assert!(host.window.is_some(), "the window stays unresolved");
+    assert!(host.gate, "and the gate is set");
+    assert_eq!(host.tokens, 13, "nothing imported");
+    assert!(!host.called("import"));
+    // The step stays unusable; the commit of the unresolved window is itself refused.
+    assert!(state_usable(&host).is_err());
+    // Reset, then the import: the explicit recovery.
+    reset_prologue(&mut host).expect("reset");
+    reset_epilogue(&mut host);
+    import_state(&mut host, &40).expect("an import after the reset");
     assert_eq!(host.tokens, 40);
 }
 
@@ -768,6 +778,14 @@ fn an_import_over_a_stale_host_window_with_the_gate_set_is_refused() {
     import_state(&mut host, &40).expect_err("the gate");
     assert_eq!(host.tokens, 13, "nothing imported");
     assert!(!host.called("import"));
+}
+
+#[test]
+fn a_confirmed_commit_resolves_the_window_and_a_restore_is_allowed_again() {
+    let mut host = Fake::new(10, false);
+    run_window(&mut host, &[1, 2]).expect("run");
+    commit_window(&mut host, &commit(10, 2, 2)).expect("confirmed");
+    import_state(&mut host, &7).expect("no window is unresolved");
 }
 
 #[test]

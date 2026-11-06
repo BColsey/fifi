@@ -27,9 +27,10 @@
 //! * A window that has run all its rows and has no verdict yet awaits it. Until then every
 //!   consumer of the live state refuses through `state_usable` (a decode step through it also
 //!   fails the state closed), and a new window over it poisons the state.
-//! * `reset_state` is the only recovery from a failed commit. It is exempt from `state_usable`.
-//!   `import_state` and the pinned-prefix restore are refused while the gate is set and otherwise
-//!   close an open window before their first fallible call.
+//! * `reset_state` is the only recovery from a failed commit or an unresolved window. It is
+//!   exempt from `state_usable`. `import_state` and the pinned-prefix restore are refused while
+//!   the gate is set or a window is unresolved (rows ran, no confirmed commit): they never close
+//!   such a window silently (DESIGN 17.10).
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
 #[cfg(test)]

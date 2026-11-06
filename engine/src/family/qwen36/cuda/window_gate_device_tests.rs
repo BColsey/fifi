@@ -113,3 +113,41 @@ fn a_failed_commit_leaves_a_step_that_only_a_reset_recovers() {
     step.run_window(inputs).expect("the same window runs again");
     step.commit_window(&keeps).expect("and commits");
 }
+
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT. COMPILED-ONLY, never run"]
+fn an_unresolved_window_refuses_every_restore_and_only_a_reset_recovers() {
+    let (_tokenizer, stream) = text_stream(PREFIX + 64);
+    let loaded = load_pack();
+    let mut step = build_step(
+        &loaded,
+        &step_options(kv_mode_from_env(), CONTEXT),
+        CaptureConfig {
+            capture: capture_from_env(),
+            section_marks: false,
+        },
+    )
+    .expect("step");
+    step.enable_pinned_prefix().expect("the pinned pool");
+    assert!(step.pinned_prefix_enabled(), "the pinned pool was refused");
+    let mut session = DecodeSession::default();
+    session.reset(&mut step).expect("reset");
+    session
+        .prefill(&mut step, &stream[..PREFIX], CONTEXT)
+        .expect("prefill");
+    let pinned = pinned_snapshot(&mut step).expect("a pinned snapshot");
+    let exported = step.export_state().expect("an exported state");
+    let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
+    // The rows ran and no verdict came (a draw failed in the driver, say): the window is
+    // unresolved. DESIGN 17.10: no restore closes it silently.
+    step.run_window(inputs).expect("the window runs");
+    refused_by_the_gate("an import", step.import_state(&exported));
+    refused_by_the_gate(
+        "the pinned-prefix restore",
+        step.restore_pinned_prefix(&pinned),
+    );
+    // Only a reset recovers it.
+    step.reset_state().expect("the reset");
+    step.import_state(&exported)
+        .expect("an import works after the reset");
+}

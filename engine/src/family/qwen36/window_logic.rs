@@ -199,9 +199,8 @@ pub(crate) fn state_usable<H: WindowHost>(host: &H) -> Result<(), EngError> {
 }
 
 /// `import_state` of the step: replaces the committed state with `saved`. Every restore goes
-/// through it, the window commit included. It refuses while the recovery gate is set, closes any
-/// open window (the import replaces the state it describes; a stale snapshot of a stale window is
-/// never imported), finishes a pending pinned save, runs the two refusals that precede every
+/// through it, the window commit included (which has taken its window first). It refuses while the
+/// recovery gate is set or a window is unresolved (`restore_gate`), finishes a pending pinned save, runs the two refusals that precede every
 /// device write, then overwrites.
 pub(crate) fn import_state<H: WindowHost>(host: &mut H, saved: &H::Saved) -> Result<(), EngError> {
     restore_gate(host)?;
@@ -234,15 +233,25 @@ pub(crate) fn export_gate<H: WindowHost>(host: &H) -> Result<(), EngError> {
 }
 
 /// The entry of every restoring wrapper (`import_state`, the pinned-prefix restore, and the
-/// `PrefixState` restore through `import_state`): refused with "reset first" while the recovery
-/// gate is set; otherwise any open window is closed, before the first fallible call, because the
-/// restore replaces the state the window describes.
+/// `PrefixState` restore through `import_state`). A restore is refused with "reset first" while
+/// the recovery gate is set AND while a window is unresolved (rows ran, no confirmed commit): it
+/// never closes such a window silently, because the window means the lineage is in doubt, and only
+/// `reset_state` is an explicit, validated recovery (DESIGN 17.10). The refusal through an
+/// unresolved window also sets the gate and leaves the window stored. The refusal precedes the
+/// first fallible call.
 pub(crate) fn restore_gate<H: WindowHost>(host: &mut H) -> Result<(), EngError> {
     if host.needs_reset() {
         return Err(reset_first(
             "a restore through a failed state is refused (reset first)",
         ));
     }
+    if host.window_awaits() {
+        host.set_needs_reset();
+        return Err(reset_first(
+            "a restore through a window that has no confirmed commit is refused (reset first)",
+        ));
+    }
+    // No unresolved window: only a stray open slot book (rows not yet complete) can remain.
     host.close_window();
     Ok(())
 }
