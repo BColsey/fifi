@@ -13,20 +13,23 @@
 //! bookkeeping in `family/qwen36/rollback.rs`). A verdict that keeps `kept` rows copies slot
 //! `kept - 1` back and truncates the KV frontier to `base + kept`; the KV cells above it are stale
 //! and unreachable. There is no export, no import and no replay. It is opt-in; the default is the
-//! host path below. Every failure of the device path leaves a state that refuses to go on
-//! (poisoned) and no window. One case leaves a valid state ahead of the verdict for a while: a
-//! window that ran all its rows and has not had its verdict (an error between `run_window` and
-//! `commit_window`). Until the verdict that state cannot be used: a decode step through it poisons
-//! it, an export is refused, and a new window over it poisons it; a reset or an import closes the
-//! window. The host path keeps the gap described next.
+//! host path above.
 //!
-//! Failure. A step that fails inside the window poisons the state, so the window ends with an
-//! error, no pending window and a state that refuses to go on until a reset or an import. A
-//! `commit_window` that fails earlier, in `complete_prefix_save` (`step.rs:1326`), `check_import`
-//! or `resident_kv` (`state/export.rs:196-197`), poisons nothing: the window has already been
-//! taken, and the state is the valid state at the end of the window. That predates this module and
-//! is unchanged; the worker's reset after any executor error (`sched/worker.rs:1049`, the policy
-//! at `executor.rs:17`) is what makes it safe. The D1 oracle's check F does not model it.
+//! The lifecycle (which effect runs, in which order, what a failure does) is
+//! `family/qwen36/window_logic.rs`, generic over `WindowHost`; this file implements the trait with
+//! one-line forwards and keeps the test hooks. Failure contract, both paths:
+//!
+//! * A failure before any row ran (a refusal at the top of `run_window`, the capacity check, a
+//!   failed export, a row refused before the first launch) leaves the state valid and unchanged.
+//! * A failure after a row ran, any failure of `commit_window` after its window was taken, and a
+//!   verdict that is not the window's poison the state, set the recovery gate (`needs_reset`),
+//!   drop a pending prefix save, invalidate the pinned pool and close the window.
+//! * A window that has run all its rows and has no verdict yet awaits it. Until then every
+//!   consumer of the live state refuses through `state_usable` (a decode step through it also
+//!   fails the state closed), and a new window over it poisons the state.
+//! * `reset_state` is the only recovery from a failed commit. It is exempt from `state_usable`.
+//!   `import_state` and the pinned-prefix restore are refused while the gate is set and otherwise
+//!   close an open window before their first fallible call.
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
 #[cfg(test)]

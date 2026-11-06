@@ -870,22 +870,14 @@ pub(crate) fn host_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> 
 /// leaves either the pre-window state or a model that refuses to go on; restoring the pre-window
 /// state then lets the same window run again with the same rows.
 ///
-/// **What this models and what it does not.** A fault is injected at a feed or replay row and
-/// poisons the state the way a failed step does, so the "refuses to go on" outcome is what the
-/// check sees on the real step. A real `commit_window` can also fail before any step runs, in
-/// `complete_prefix_save` (`step.rs:1326`), `check_import` (`state/export.rs:196`) or
-/// `resident_kv` (`state/export.rs:197`): those refuse before `begin_import`, so the state is NOT
-/// poisoned. It stays a valid state at the end of the window (the rows fed), the window is
-/// already taken (`eager_window.rs`, `commit_window`), and a later step would run from that state
-/// without error. No check here can show otherwise, and none claims to. This predates the branch
-/// and is not changed here (production behaviour is on hold). The safety net is the worker: an
-/// error from the executor ends in `reset_state` (`sched/worker.rs:1049`, called at `:832`, `:873`
-/// and `:897`; the policy is written at `qwen36/cuda/executor.rs:17`), which resets the session
-/// and the model before the next job.
-///
-/// The device rollback has no such gap: every failure of its `commit_window` poisons the state or
-/// finds it already refusing (`Fault::Restore`, `Fault::Capture`, a verdict that is not the window's;
-/// `qwen36/cuda/state/rollback.rs`). `D1Subject::fault_plan` lets it list its own fault points.
+/// **What this models.** A fault is injected at a feed or replay row, at a refusal before
+/// `begin_import` (`PrefixSave`, `CheckImport`, `ResidentKv`), at a device failure after it
+/// (`ImportDevice`), at a replay row refused before launch (`ReplayRefused`), at a capture or a
+/// restore (device), or as a verdict that is not the window's (`Verdict`). Every one of them must
+/// end the call with an error and leave a closed window. For a subject with a recovery gate
+/// (`D1Subject::import_without_reset`), a failed commit also leaves a state that refuses a
+/// snapshot, a step and an import without a reset: the safe recovery is `reset_state`, which
+/// `D1Subject::restore` performs before the import.
 pub(crate) fn failure_recovery<S: D1Subject>(
     subject: &mut S,
     vocab: usize,
