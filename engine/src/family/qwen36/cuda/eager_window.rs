@@ -30,41 +30,21 @@
 
 use super::{state::export::ExportedState, step::QwenResidentStep};
 #[cfg(test)]
+use crate::family::qwen36::window_logic::Mark;
+#[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;
 use crate::{
     EngError,
     family::{
+        qwen36::window_logic::{self, Window, WindowHost, no_window},
         sampler::Sampler,
         session::{TokenStepper, sample_logits},
         speculate::{driver::WindowModel, window::Commit},
     },
 };
 
-/// A window that has run and awaits its verdict.
-pub(super) struct EagerWindow {
-    /// The tokens the window fed, in row order.
-    inputs: Vec<u32>,
-    /// The logits row after each fed token.
-    rows: Vec<Vec<f32>>,
-    /// The token the device argmax chose after each fed token: what a one-row greedy run draws.
-    argmax: Vec<u32>,
-    /// How the committed state before the window is recovered on a partial accept.
-    saved: WindowSave,
-}
-
-/// What a window keeps to roll back with.
-enum WindowSave {
-    /// The default: the committed state copied to the host; a partial accept imports it and feeds
-    /// the kept rows again.
-    Host(ExportedState),
-    /// `draft_rollback = device`: per-row slots in device memory (`rollback_runtime`); a partial
-    /// accept copies one back and truncates the KV frontier, with no replay.
-    Device,
-}
-
-fn no_window() -> EngError {
-    EngError::BadRequest("verify window: no window has run".to_owned())
-}
+/// The window of the step: the host copy is an [`ExportedState`], a row is a logits vector.
+pub(super) type EagerWindow = Window<ExportedState, Vec<f32>>;
 
 /// Test hooks: the rows a window kept and the fault injection of the D1 oracle.
 #[cfg(test)]
@@ -104,55 +84,6 @@ impl QwenResidentStep<'_> {
     fn replay_fault(&mut self, row: usize) -> Result<(), EngError> {
         self.fault_at(Fault::Replay(row))
     }
-}
-
-/// Outside test builds the fault points and the trace marks are empty inlined calls: no field, no
-/// branch, no clock read.
-#[cfg(not(test))]
-impl QwenResidentStep<'_> {
-    #[inline(always)]
-    fn feed_fault(&mut self, _row: usize) -> Result<(), EngError> {
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn replay_fault(&mut self, _row: usize) -> Result<(), EngError> {
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn capture_fault(&mut self, _row: usize) -> Result<(), EngError> {
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn restore_fault(&mut self) -> Result<(), EngError> {
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn trace_mark(&mut self, _mark: Mark) {}
-}
-
-/// The points of a window at which the trace of a test build reads the clock.
-#[derive(Clone, Copy)]
-enum Mark {
-    /// `run_window` begins.
-    WindowStart,
-    /// The pre-window state has been copied to the host.
-    Exported,
-    /// A window row has been fed and its logits row read back.
-    RowDone,
-    /// `commit_window` begins a rollback.
-    CommitStart,
-    /// The saved state has been written back.
-    Imported,
-    /// A kept row has been fed again.
-    ReplayDone,
-    /// The device path has copied the state after a row into its slot.
-    Captured,
-    /// The saved host state has been dropped (the free or unmap of its buffers).
-    Dropped,
 }
 
 /// What one window cost on the host clock, by part, and what the device timeline says of each row.
@@ -241,30 +172,7 @@ impl QwenResidentStep<'_> {
 
 impl WindowModel for QwenResidentStep<'_> {
     fn run_window(&mut self, inputs: &[u32]) -> Result<(), EngError> {
-        // A window that fails half way leaves rows fed and no verdict to apply: no window is
-        // pending, and the caller resets the session.
-        self.window = None;
-        self.trace_mark(Mark::WindowStart);
-        if self.device_rollback_wanted() {
-            return self.run_window_device(inputs);
-        }
-        let saved = self.export_state()?;
-        self.trace_mark(Mark::Exported);
-        let mut rows = Vec::with_capacity(inputs.len());
-        let mut argmax = Vec::with_capacity(inputs.len());
-        for (at, &token) in inputs.iter().enumerate() {
-            self.feed_fault(at)?;
-            argmax.push(self.run_token(token, true)?);
-            rows.push(self.logits_values());
-            self.trace_mark(Mark::RowDone);
-        }
-        self.window = Some(EagerWindow {
-            inputs: inputs.to_vec(),
-            rows,
-            argmax,
-            saved: WindowSave::Host(saved),
-        });
-        Ok(())
+        window_logic::run_window(self, inputs)
     }
 
     fn draw(
@@ -283,101 +191,111 @@ impl WindowModel for QwenResidentStep<'_> {
     }
 
     fn commit_window(&mut self, commit: &Commit) -> Result<(), EngError> {
-        let window = self.window.take().ok_or_else(no_window)?;
-        let saved = match window.saved {
-            WindowSave::Host(saved) => saved,
-            WindowSave::Device => return self.commit_window_device(commit),
-        };
-        if commit.discarded_rows == 0 {
-            #[cfg(test)]
-            {
-                drop(saved);
-                self.trace_mark(Mark::Dropped);
-            }
-            return Ok(());
-        }
-        self.trace_mark(Mark::CommitStart);
-        self.import_state(&saved)?;
-        self.trace_mark(Mark::Imported);
-        for (at, &token) in window.inputs[..commit.kept_rows].iter().enumerate() {
-            self.replay_fault(at)?;
-            self.run_token(token, false)?;
-            self.trace_mark(Mark::ReplayDone);
-        }
-        #[cfg(test)]
-        {
-            drop(saved);
-            self.trace_mark(Mark::Dropped);
-        }
-        Ok(())
+        window_logic::commit_window(self, commit)
     }
 }
 
-/// The device rollback of a window (`draft_rollback = device`).
-impl QwenResidentStep<'_> {
-    /// Runs the rows and copies the state after each row but the last into its slot. Refused before
-    /// any state change when the slots are not armed, a window is still open or the state is not
-    /// valid and idle. After the first row ran, any failure poisons the state and drops the window:
-    /// the state is ahead of the lineage and no verdict can come.
-    fn run_window_device(&mut self, inputs: &[u32]) -> Result<(), EngError> {
-        self.require_armed_for_window()?;
-        // Device branch only: a pending prefix save finishes before the window mutates anything,
-        // and a failure here precedes every mutation.
-        self.complete_prefix_save()?;
-        let base = self.tokens();
-        self.rollback_begin(inputs.len())?;
-        let mut rows = Vec::with_capacity(inputs.len());
-        let mut argmax = Vec::with_capacity(inputs.len());
-        let ran = (|| -> Result<(), EngError> {
-            for (at, &token) in inputs.iter().enumerate() {
-                self.feed_fault(at)?;
-                argmax.push(self.run_token(token, true)?);
-                rows.push(self.logits_values());
-                self.trace_mark(Mark::RowDone);
-                if at + 1 < inputs.len() {
-                    self.capture_fault(at)?;
-                    self.rollback_capture(at)?;
-                    #[cfg(test)]
-                    if self.trace_sync_capture {
-                        self.drain_stream()?;
-                    }
-                    self.trace_mark(Mark::Captured);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = ran {
-            self.rollback_discard();
-            if self.tokens() != base {
-                self.rollback_poison();
-            }
-            return Err(error);
+/// The effects of a window on the step: one forward each (`window_logic` holds the decisions).
+impl WindowHost for QwenResidentStep<'_> {
+    type Saved = ExportedState;
+    type Row = Vec<f32>;
+
+    fn device_wanted(&self) -> bool {
+        self.device_rollback_wanted()
+    }
+
+    fn tokens(&self) -> usize {
+        QwenResidentStep::tokens(self)
+    }
+
+    fn clear_window(&mut self) {
+        self.window = None;
+    }
+
+    fn store_window(&mut self, window: EagerWindow) {
+        self.window = Some(window);
+    }
+
+    fn take_window(&mut self) -> Option<EagerWindow> {
+        self.window.take()
+    }
+
+    fn export(&mut self) -> Result<ExportedState, EngError> {
+        self.export_state()
+    }
+
+    fn run_row(&mut self, token: u32) -> Result<(u32, Vec<f32>), EngError> {
+        let drawn = self.run_token(token, true)?;
+        Ok((drawn, self.logits_values()))
+    }
+
+    fn replay_row(&mut self, token: u32) -> Result<(), EngError> {
+        self.run_token(token, false).map(|_| ())
+    }
+
+    fn import(&mut self, saved: &ExportedState) -> Result<(), EngError> {
+        self.import_state(saved)
+    }
+
+    fn require_armed(&mut self) -> Result<(), EngError> {
+        self.require_armed_for_window()
+    }
+
+    fn complete_prefix_save(&mut self) -> Result<(), EngError> {
+        QwenResidentStep::complete_prefix_save(self)
+    }
+
+    fn rollback_begin(&mut self, rows: usize) -> Result<(), EngError> {
+        QwenResidentStep::rollback_begin(self, rows)
+    }
+
+    fn capture(&mut self, row: usize) -> Result<(), EngError> {
+        self.rollback_capture(row)?;
+        #[cfg(test)]
+        if self.trace_sync_capture {
+            self.drain_stream()?;
         }
-        // Every row ran: until the verdict a step or an export through the state is refused.
-        self.rollback_window_complete()?;
-        self.window = Some(EagerWindow {
-            inputs: inputs.to_vec(),
-            rows,
-            argmax,
-            saved: WindowSave::Device,
-        });
         Ok(())
     }
 
-    /// Applies the verdict through the slots. Any failure leaves the state refusing (poisoned, or
-    /// already poisoned and refused by the guard) and the window closed; no failure leaves a valid
-    /// state that is ahead of the verdict.
-    fn commit_window_device(&mut self, commit: &Commit) -> Result<(), EngError> {
-        self.trace_mark(Mark::CommitStart);
-        if commit.discarded_rows > 0
-            && let Err(error) = self.restore_fault()
-        {
-            self.rollback_discard();
-            return Err(error);
-        }
-        if self.rollback_finish(commit.kept_rows, commit.committed_rows)? {
-            self.trace_mark(Mark::Imported);
-        }
-        Ok(())
+    fn rollback_discard(&mut self) {
+        QwenResidentStep::rollback_discard(self);
+    }
+
+    fn rollback_poison(&mut self) {
+        QwenResidentStep::rollback_poison(self);
+    }
+
+    fn rollback_window_complete(&mut self) -> Result<(), EngError> {
+        QwenResidentStep::rollback_window_complete(self)
+    }
+
+    fn rollback_finish(&mut self, kept: usize, committed_rows: usize) -> Result<bool, EngError> {
+        QwenResidentStep::rollback_finish(self, kept, committed_rows)
+    }
+
+    #[cfg(test)]
+    fn trace_mark(&mut self, mark: Mark) {
+        QwenResidentStep::trace_mark(self, mark);
+    }
+
+    #[cfg(test)]
+    fn feed_fault(&mut self, row: usize) -> Result<(), EngError> {
+        QwenResidentStep::feed_fault(self, row)
+    }
+
+    #[cfg(test)]
+    fn replay_fault(&mut self, row: usize) -> Result<(), EngError> {
+        QwenResidentStep::replay_fault(self, row)
+    }
+
+    #[cfg(test)]
+    fn capture_fault(&mut self, row: usize) -> Result<(), EngError> {
+        QwenResidentStep::capture_fault(self, row)
+    }
+
+    #[cfg(test)]
+    fn restore_fault(&mut self) -> Result<(), EngError> {
+        QwenResidentStep::restore_fault(self)
     }
 }

@@ -56,3 +56,5 @@ pub mod tiered;
 #[cfg(test)]
 mod tiny;
 mod trace;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod window_logic;
