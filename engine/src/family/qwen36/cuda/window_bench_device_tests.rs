@@ -99,10 +99,7 @@ use super::{
 use crate::{
     EngError,
     family::{
-        qwen36::{
-            rollback::Cover,
-            settings::DEFAULT_CUDA_PREFILL_CHUNK,
-        },
+        qwen36::{rollback::Cover, settings::DEFAULT_CUDA_PREFILL_CHUNK},
         sampler::Sampler,
         session::TokenStepper,
         speculate::{
@@ -206,7 +203,9 @@ impl Config {
                 Ok("host") | Err(_) => BenchRollback::Host,
                 Ok("device") => BenchRollback::Device,
                 Ok("both") => BenchRollback::Both,
-                Ok(other) => panic!("FIFI_MRV_ROLLBACK must be host, device or both, got {other:?}"),
+                Ok(other) => {
+                    panic!("FIFI_MRV_ROLLBACK must be host, device or both, got {other:?}")
+                }
             },
             sync_capture: env_num::<u8>("FIFI_MRV_SYNC_CAPTURE", 0) == 1,
         };
@@ -524,7 +523,9 @@ fn window_arm(
         state_slot: kept - 1,
     })?;
     let total_ms = ms(began);
-    let minflt = faults_before.zip(minor_faults()).map(|(a, b)| b.saturating_sub(a));
+    let minflt = faults_before
+        .zip(minor_faults())
+        .map(|(a, b)| b.saturating_sub(a));
     Ok(WindowRun {
         total_ms,
         trace: step.window_trace.clone(),
@@ -684,7 +685,9 @@ fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
 
 /// Rotates the arm order each round so that no arm always runs first.
 fn arm_order(arms: &[Arm], round: usize) -> Vec<Arm> {
-    (0..arms.len()).map(|i| arms[(round + i) % arms.len()]).collect()
+    (0..arms.len())
+        .map(|i| arms[(round + i) % arms.len()])
+        .collect()
 }
 
 struct Cell<'a> {
@@ -777,9 +780,11 @@ fn run_cell(
                 Arm::DeviceFirst => rounds
                     .device_first
                     .push(window_arm(step, &tokens, 1, true)?),
-                Arm::DeviceMid => rounds
-                    .device_mid
-                    .push(window_arm(step, &tokens, rows / 2, true)?),
+                Arm::DeviceMid => {
+                    rounds
+                        .device_mid
+                        .push(window_arm(step, &tokens, rows / 2, true)?)
+                }
             }
         }
         let began = Instant::now();
@@ -793,7 +798,10 @@ fn run_cell(
     // The execution-path half of the receipt: the selected kernel launched and nothing routed fell
     // back to the shuffle kernel, for the reference steps and the windows of this cell.
     let launches = step.kernel_launches();
-    println!("MRV_KERNEL_LAUNCHES depth={depth_start} rows={rows} {}", launches.describe());
+    println!(
+        "MRV_KERNEL_LAUNCHES depth={depth_start} rows={rows} {}",
+        launches.describe()
+    );
     require_kernel_ran(&launches, cell.kernel).unwrap_or_else(|error| panic!("{error}"));
     Ok(cell_json(
         cell,
@@ -818,7 +826,8 @@ fn cell_json(
     d1: Value,
     completed: usize,
 ) -> Value {
-    let slot_bytes = step.state_layout().delta.total as u64 / step.state_layout().delta.slots as u64;
+    let slot_bytes =
+        step.state_layout().delta.total as u64 / step.state_layout().delta.slots as u64;
     let warm_from = cell.config.warm_from;
     let warm = |v: &[f64]| v[warm_from.min(v.len())..].to_vec();
     let single = median(&warm(&rounds.single_step_wall));
@@ -964,18 +973,18 @@ fn verify_window_cost_record() {
     println!("MRV_CONFIG single_row_kernel={}", loaded.kernel);
     let baseline_used = loaded.baseline_used;
     let mut memory = Vec::new();
-    let mut step =
-        bench_step(
-            &loaded,
-            kv,
-            deepest + CONTEXT_SLACK,
-            capture,
-            config.marks,
-            config.rollback.device().then(|| {
-                config.rows.iter().copied().max().unwrap_or(2).max(2)
-            }),
-        )
-        .expect("step");
+    let mut step = bench_step(
+        &loaded,
+        kv,
+        deepest + CONTEXT_SLACK,
+        capture,
+        config.marks,
+        config
+            .rollback
+            .device()
+            .then(|| config.rows.iter().copied().max().unwrap_or(2).max(2)),
+    )
+    .expect("step");
     step.trace_sync_capture = config.sync_capture;
     memory.push(admit(
         &loaded,
@@ -1066,7 +1075,9 @@ fn cold_record(cell: &Cell<'_>, step: &mut QwenResidentStep<'static>, prefill_s:
     // The calibration of the device copy: 200 drained copies of one slot (GPU, outside any window).
     let copy = if cell.config.rollback.device() {
         step.use_device_rollback(true).expect("armed");
-        let times = step.device_copy_microbench(200).expect("copy microbenchmark");
+        let times = step
+            .device_copy_microbench(200)
+            .expect("copy microbenchmark");
         let slot = step.state_layout().delta.total as f64 / step.state_layout().delta.slots as f64;
         json!({
             "slot_bytes": slot,

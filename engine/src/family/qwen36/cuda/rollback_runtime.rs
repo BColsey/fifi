@@ -5,8 +5,8 @@
 //! (`rollback_wanted`) and holds no slots refuses every window before any state change; it never
 //! falls back to the host path. Start refuses when the slots cannot be allocated, so that state is
 //! reachable only through a bug, and the refusal is the fail-closed answer to it.
-use super::QwenResidentStep;
 use super::super::state::rollback::{RollbackSlots, slot_bytes_of};
+use super::QwenResidentStep;
 use crate::{
     EngError,
     family::qwen36::rollback::{Cover, RollbackPlan, check_uncharged_slots},
@@ -55,7 +55,9 @@ impl QwenResidentStep<'_> {
             return Err(refuse("the slots are already armed"));
         }
         if self.is_tiered() {
-            return Err(refuse("tiered experts keep a bank state the slots do not hold"));
+            return Err(refuse(
+                "tiered experts keep a bank state the slots do not hold",
+            ));
         }
         if self.res.sparse.is_some() || self.res.paged.is_some() {
             return Err(refuse(
@@ -76,7 +78,8 @@ impl QwenResidentStep<'_> {
     fn armed_slots(&mut self) -> Result<&mut RollbackSlots, EngError> {
         self.rollback.as_mut().ok_or_else(|| {
             EngError::BadRequest(
-                "verify window: draft_rollback device is set and no rollback slots are armed".into(),
+                "verify window: draft_rollback device is set and no rollback slots are armed"
+                    .into(),
             )
         })
     }
@@ -91,7 +94,8 @@ impl QwenResidentStep<'_> {
         } = self;
         let slots = rollback.as_mut().ok_or_else(|| {
             EngError::BadRequest(
-                "verify window: draft_rollback device is set and no rollback slots are armed".into(),
+                "verify window: draft_rollback device is set and no rollback slots are armed"
+                    .into(),
             )
         })?;
         slots.begin_window(stream, state, rows)
@@ -181,9 +185,9 @@ impl QwenResidentStep<'_> {
             context,
             ..
         } = self;
-        let slots = rollback.as_mut().ok_or_else(|| {
-            EngError::BadRequest("device rollback: no slots are armed".into())
-        })?;
+        let slots = rollback
+            .as_mut()
+            .ok_or_else(|| EngError::BadRequest("device rollback: no slots are armed".into()))?;
         slots.bench_copy(context, stream, state, copies)
     }
 

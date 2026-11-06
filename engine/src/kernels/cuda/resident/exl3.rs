@@ -6,15 +6,15 @@
 )]
 use crate::EngError;
 // The pure selection logic lives where the host build compiles and tests it.
+use crate::kernels::cuda::context::{
+    Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
+};
+use crate::kernels::cuda::native::resident::exl3 as ffi;
 #[cfg(test)]
 pub(crate) use crate::kernels::single_row::SingleRowLaunches;
 pub(crate) use crate::kernels::single_row::{
     SERVED_SINGLE_ROW, SingleRow, effective_single_row, single_row_label, single_row_name,
 };
-use crate::kernels::cuda::context::{
-    Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
-};
-use crate::kernels::cuda::native::resident::exl3 as ffi;
 use crate::weights::exl3::Codebook;
 
 /// `FIFI_EXL3_LEGACY`, read once per process: every launch of the rows entry asks.

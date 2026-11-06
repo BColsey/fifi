@@ -39,12 +39,12 @@ pub(crate) mod sample_canon;
 ))]
 mod shape;
 
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) mod single_row;
 pub mod decision;
 pub mod f8;
 pub mod nvfp4;
 pub mod nvfp4_cpu;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) mod single_row;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub mod cuda;

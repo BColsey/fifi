@@ -79,7 +79,15 @@ fn a_launch_is_counted_under_its_own_variant_and_other_shapes_apart() {
         c.record_indexed();
     });
     assert_eq!(
-        (c.wide1, c.wide2, c.wide4, c.gather, c.legacy, c.other_shapes, c.indexed),
+        (
+            c.wide1,
+            c.wide2,
+            c.wide4,
+            c.gather,
+            c.legacy,
+            c.other_shapes,
+            c.indexed
+        ),
         (2, 1, 1, 1, 1, 1, 1)
     );
     assert_eq!(c.of("wide1"), Some(2));

@@ -251,17 +251,27 @@ fn a_device_rollback_window_copies_the_slots_and_never_the_state_to_the_host() {
     let all = DeviceWindowTransfers::new(&state, SLOT, 4, 4);
     assert_eq!(all.capture.d2d_bytes, 3 * SLOT);
     assert_eq!(all.capture.d2d_calls, 3);
-    assert_eq!(all.restore, Transfer::default(), "a full accept restores nothing");
+    assert_eq!(
+        all.restore,
+        Transfer::default(),
+        "a full accept restores nothing"
+    );
     let partial = DeviceWindowTransfers::new(&state, SLOT, 4, 1);
     assert_eq!(partial.restore.d2d_bytes, SLOT);
     assert_eq!(partial.restore.d2d_calls, 1);
-    assert_eq!(partial.restore.h2d_bytes, state.words_bytes, "the words block is rewritten");
+    assert_eq!(
+        partial.restore.h2d_bytes, state.words_bytes,
+        "the words block is rewritten"
+    );
     // The rows are the host window's rows; the export, the import and the replay are gone.
     let host = WindowTransfers::new(&state, 4, 1);
     assert_eq!(partial.rows, host.rows);
     let total = partial.total();
     assert_eq!(total.d2d_bytes, 4 * SLOT);
-    assert_eq!(total.d2h_bytes, host.rows.d2h_bytes, "no state goes to the host");
+    assert_eq!(
+        total.d2h_bytes, host.rows.d2h_bytes,
+        "no state goes to the host"
+    );
     assert!(total.d2h_bytes < host.total().d2h_bytes);
     let two = DeviceWindowTransfers::new(&state, SLOT, 2, 1);
     assert_eq!(two.capture.d2d_calls, 1);
@@ -275,5 +285,9 @@ fn the_fault_counters_are_read_after_the_command_name() {
     assert_eq!(parse_stat_faults(stat), Some((12345, 7)));
     assert_eq!(parse_stat_faults("no parenthesis"), None);
     assert_eq!(parse_stat_faults("1 (x) S 1 2"), None, "too few fields");
-    assert_eq!(parse_stat_faults("1 (x) S 1 2 3 4 5 6 abc 8 9"), None, "not a number");
+    assert_eq!(
+        parse_stat_faults("1 (x) S 1 2 3 4 5 6 abc 8 9"),
+        None,
+        "not a number"
+    );
 }

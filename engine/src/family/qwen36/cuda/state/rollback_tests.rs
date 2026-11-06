@@ -37,7 +37,10 @@ fn row(state: &mut ResidentState, stream: &DeviceStream, value: u8) {
         .unwrap();
     state.enqueue_rows(1).unwrap();
     let bytes = slot_bytes_of(state).unwrap();
-    state.delta.write_at(stream, 0, &vec![value; bytes]).unwrap();
+    state
+        .delta
+        .write_at(stream, 0, &vec![value; bytes])
+        .unwrap();
     for layer in 0..state.layout.kv.layers {
         let old = state.layout.kv.prefix_ranges(layer, pos).unwrap();
         let new = state.layout.kv.prefix_ranges(layer, pos + 1).unwrap();
@@ -89,7 +92,10 @@ fn a_window_rolls_back_to_every_kept_prefix_in_both_kv_modes() {
             }
             let mut slots = RollbackSlots::new(&ctx, &stream, &state, values.len()).unwrap();
             assert_eq!(slots.plan().slots(), values.len() - 1);
-            assert_eq!(slots.bytes(), (values.len() - 1) * slot_bytes_of(&state).unwrap());
+            assert_eq!(
+                slots.bytes(),
+                (values.len() - 1) * slot_bytes_of(&state).unwrap()
+            );
             slots.begin_window(&stream, &state, values.len()).unwrap();
             for (at, &value) in values.iter().enumerate() {
                 row(&mut state, &stream, value);
@@ -97,7 +103,9 @@ fn a_window_rolls_back_to_every_kept_prefix_in_both_kv_modes() {
                     slots.capture(&ctx, &stream, &state, at).unwrap();
                 }
             }
-            let restored = slots.finish(&ctx, &stream, &mut state, kept, 3 + kept).unwrap();
+            let restored = slots
+                .finish(&ctx, &stream, &mut state, kept, 3 + kept)
+                .unwrap();
             assert_eq!(restored, kept < values.len(), "{mode:?} kept {kept}");
             assert_eq!(state.tokens(), 3 + kept);
             assert!(!slots.is_open());
@@ -256,7 +264,10 @@ fn a_rolled_back_window_leaves_the_device_tip_below_it_valid() {
     assert_eq!(state.tokens(), 3);
     let mut got = vec![0u8; tip.bytes()];
     state.delta.read_at(&stream, 0, &mut got).unwrap();
-    assert!(got.iter().all(|&b| b == 9), "the tip restores its own state");
+    assert!(
+        got.iter().all(|&b| b == 9),
+        "the tip restores its own state"
+    );
 }
 
 #[test]
@@ -295,7 +306,8 @@ fn a_rejected_window_leaves_the_pinned_prefix_pool_able_to_finish_recycle_and_re
         assert_eq!(second.tokens(), 4);
         let want = reference(&ctx, &stream, mode, 3, &[20]).remove(0);
         state.reset(&stream).unwrap();
-        pool.restore(&ctx, &stream, &mut state, &second, None).unwrap();
+        pool.restore(&ctx, &stream, &mut state, &second, None)
+            .unwrap();
         assert_eq!(state.export_state(&stream).unwrap(), want, "{mode:?}");
     }
 }

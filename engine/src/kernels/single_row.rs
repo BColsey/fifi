@@ -140,10 +140,7 @@ impl SingleRowLaunches {
 /// name the context reports (`wide1` when served). It must have launched at least once, and no
 /// routed call may have run the shuffle kernel (a silent fallback), unless the shuffle kernel is
 /// what was expected.
-pub(crate) fn require_kernel_ran(
-    counts: &SingleRowLaunches,
-    expected: &str,
-) -> Result<(), String> {
+pub(crate) fn require_kernel_ran(counts: &SingleRowLaunches, expected: &str) -> Result<(), String> {
     let ran = counts
         .of(expected)
         .ok_or_else(|| format!("unknown kernel name {expected:?}"))?;

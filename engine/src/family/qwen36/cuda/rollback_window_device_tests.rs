@@ -29,11 +29,7 @@ use crate::{
         },
         sampler::Sampler,
         session::{DecodeSession, TokenStepper},
-        speculate::{
-            d1_oracle::first_bit_difference,
-            driver::WindowModel,
-            window::Commit,
-        },
+        speculate::{d1_oracle::first_bit_difference, driver::WindowModel, window::Commit},
     },
 };
 
@@ -59,7 +55,9 @@ fn fixture(mode: RollbackMode) -> (QwenResidentStep<'static>, Vec<u32>) {
 fn prefill(step: &mut QwenResidentStep<'static>, stream: &[u32]) -> DecodeSession {
     let mut session = DecodeSession::default();
     session.reset(step).expect("reset");
-    session.prefill(step, &stream[..PREFIX], CONTEXT).expect("prefill");
+    session
+        .prefill(step, &stream[..PREFIX], CONTEXT)
+        .expect("prefill");
     session
 }
 
@@ -82,7 +80,10 @@ fn unarmed_a_step_that_wants_the_device_rollback_refuses_a_window_before_any_cha
     let before = step.export_state().expect("export");
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     let error = step.run_window(inputs).expect_err("no slots are armed");
-    assert!(format!("{error:?}").contains("no rollback slots"), "{error:?}");
+    assert!(
+        format!("{error:?}").contains("no rollback slots"),
+        "{error:?}"
+    );
     let after = step.export_state().expect("the state is still valid");
     assert_eq!(exported_difference(&before, &after), None);
     // The step goes on as a plain one-row step.
@@ -97,7 +98,11 @@ fn small_reserve_slots_that_no_admission_charges_and_the_reserve_cannot_hold_ref
     // The arming call of a fresh step: refused by the reserve check before any allocation.
     let (mut fresh, _) = fixture(RollbackMode::Host);
     let error = fresh
-        .enable_device_rollback(QWEN36_MAX_WINDOW_ROWS, Cover::Reserve { headroom: 1 << 20 }, 0)
+        .enable_device_rollback(
+            QWEN36_MAX_WINDOW_ROWS,
+            Cover::Reserve { headroom: 1 << 20 },
+            0,
+        )
         .expect_err("a 1 MiB reserve cannot hold 7 slots");
     assert!(matches!(error, EngError::MemoryPlan(_)), "{error:?}");
     assert!(!fresh.device_rollback_armed(), "the step is untouched");
@@ -122,7 +127,9 @@ fn cancel_a_reset_with_a_window_open_discards_it_and_the_next_job_is_clean() {
     let inputs = &stream[PREFIX - 1..PREFIX - 1 + ROWS];
     step.run_window(inputs).expect("window");
     step.reset_state().expect("the cancel resets the session");
-    let error = step.commit_window(&keeps(PREFIX - 1, 2)).expect_err("no window");
+    let error = step
+        .commit_window(&keeps(PREFIX - 1, 2))
+        .expect_err("no window");
     assert!(format!("{error:?}").contains("no window"), "{error:?}");
     assert_eq!(step.tokens(), 0);
     // The next job: a window runs again over a fresh prefill and rolls back to the baseline.
@@ -149,7 +156,10 @@ fn late_poison_a_state_poisoned_between_the_window_and_its_commit_stays_poisoned
     step.poison_state();
     assert!(step.commit_window(&keeps(base, 2)).is_err());
     assert!(step.export_state().is_err(), "it was not healed");
-    assert!(step.run_token(inputs[0], false).is_err(), "and it refuses steps");
+    assert!(
+        step.run_token(inputs[0], false).is_err(),
+        "and it refuses steps"
+    );
     step.reset_state().expect("a reset is the way back");
     assert!(step.export_state().is_ok());
 }
@@ -177,7 +187,10 @@ fn sixteen_steps_after_a_rejected_window_equal_the_uninterrupted_baseline() {
         for token in &inputs[..kept] {
             reference.run_token(*token, false).expect("baseline row");
         }
-        for (at, token) in stream[PREFIX - 1 + kept..PREFIX - 1 + kept + 16].iter().enumerate() {
+        for (at, token) in stream[PREFIX - 1 + kept..PREFIX - 1 + kept + 16]
+            .iter()
+            .enumerate()
+        {
             let want = reference.logits(*token).expect("baseline decode");
             assert_eq!(
                 first_bit_difference(&got[at], &want),
@@ -194,7 +207,11 @@ impl QwenResidentStep<'_> {
     /// Draws the greedy token of row 0 of the open window, as the driver does, to prove that
     /// the window answers before its verdict.
     fn window_greedy_probe(&mut self) {
-        let drawn = self.draw(0, &mut Sampler::greedy(), super::d1_window_device_tests::SAMPLER_VOCAB);
+        let drawn = self.draw(
+            0,
+            &mut Sampler::greedy(),
+            super::d1_window_device_tests::SAMPLER_VOCAB,
+        );
         assert!(drawn.is_ok(), "{drawn:?}");
     }
 }

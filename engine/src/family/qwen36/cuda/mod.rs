@@ -42,8 +42,6 @@ mod dims;
 mod eager_window;
 #[cfg(test)]
 mod eager_window_device_tests;
-#[cfg(test)]
-mod rollback_window_device_tests;
 mod executor;
 #[cfg(test)]
 mod executor_tests;
@@ -153,6 +151,8 @@ mod readback_tests;
 mod resources;
 #[cfg(test)]
 mod resources_tests;
+#[cfg(test)]
+mod rollback_window_device_tests;
 #[cfg(test)]
 mod router_tests;
 mod rules;

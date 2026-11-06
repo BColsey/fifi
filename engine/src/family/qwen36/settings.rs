@@ -1766,7 +1766,8 @@ mod tests {
 
     #[test]
     fn draft_rollback_is_host_unless_the_member_says_device() {
-        let cuda = |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
         assert_eq!(
             cuda(exl3_options(|_| {})).unwrap().draft_rollback,
             RollbackMode::Host
@@ -1789,9 +1790,15 @@ mod tests {
 
     #[test]
     fn draft_rollback_device_is_refused_without_speculation_and_with_an_unknown_value() {
-        let cuda = |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
-        let text = message(cuda(exl3_options(|o| o.draft_rollback = Some("device".into()))));
-        assert!(text.contains("draft_rollback device needs draft_mode ngram"), "{text}");
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        let text = message(cuda(exl3_options(|o| {
+            o.draft_rollback = Some("device".into())
+        })));
+        assert!(
+            text.contains("draft_rollback device needs draft_mode ngram"),
+            "{text}"
+        );
         for bad_value in ["Device", "gpu", "", "1"] {
             let text = message(cuda(exl3_options(|o| {
                 o.draft_mode = Some("ngram".into());
@@ -1815,7 +1822,10 @@ mod tests {
             draft_rollback: Some("device".into()),
             ..Q36Options::default()
         };
-        let text = format!("{:?}", rollback_of(&options, &speculation, Some(1 << 30)).unwrap_err());
+        let text = format!(
+            "{:?}",
+            rollback_of(&options, &speculation, Some(1 << 30)).unwrap_err()
+        );
         assert!(text.contains("kv_offload_host_bytes"), "{text}");
         assert_eq!(
             rollback_of(&options, &speculation, None).unwrap(),

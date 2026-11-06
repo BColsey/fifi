@@ -62,19 +62,19 @@ use super::{
 use crate::{
     EngError,
     family::{
+        project::cuda::{CudaProjector, CudaWeights, Reserve, WeightLayout},
         qwen36::{
             rollback::Cover,
             settings::{QWEN36_MAX_WINDOW_ROWS, RollbackMode, rollback_mode_name},
         },
-        project::cuda::{CudaProjector, CudaWeights, Reserve, WeightLayout},
         sampler::{Sampler, SamplingParams},
         session::{DecodeSession, Limits, TokenStepper},
         speculate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
                 failure_recovery, faults_for, first_bit_difference, first_byte_difference,
-                full_logits, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks, slot_faults_for,
-                ties_break_low,
+                full_logits, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks,
+                slot_faults_for, ties_break_low,
             },
             driver::WindowModel,
             window::Commit,
@@ -418,7 +418,10 @@ fn alternatives(inputs: &[u32]) -> Vec<u32> {
 /// enqueued or captured; a graph replay re-runs launches that were counted when they were captured.
 fn assert_kernel_ran(step: &QwenResidentStep<'_>, kernel: &str, phase: &str) {
     let counts = step.kernel_launches();
-    println!("D1_KERNEL_LAUNCHES phase={phase} kernel={kernel} {}", counts.describe());
+    println!(
+        "D1_KERNEL_LAUNCHES phase={phase} kernel={kernel} {}",
+        counts.describe()
+    );
     require_kernel_ran(&counts, kernel).unwrap_or_else(|error| panic!("{phase}: {error}"));
 }
 
@@ -524,7 +527,11 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
         };
         for drafts in [3, 7] {
             let verdict = repeated_rollbacks(step, &setup, drafts, &seeded, 100);
-            report("G", &format!("prefix={prefix} drafts={drafts} windows=100"), verdict);
+            report(
+                "G",
+                &format!("prefix={prefix} drafts={drafts} windows=100"),
+                verdict,
+            );
         }
     }
     assert_kernel_ran(step, kernel, "window and reference");
@@ -780,7 +787,10 @@ fn d1_negative_control_the_shuffle_kernel_is_rejected() {
         "unset {SINGLE_GATHER_VAR}: the variable would win over the registration of this control"
     );
     let loaded = load_pack_with(SingleRow::Legacy, false);
-    assert_eq!(loaded.kernel, "legacy", "the control must run the shuffle kernel");
+    assert_eq!(
+        loaded.kernel, "legacy",
+        "the control must run the shuffle kernel"
+    );
     let context = DEFAULT_CONTEXT;
     let (_tokenizer, stream) = text_stream(80);
     let mut step = build_step(

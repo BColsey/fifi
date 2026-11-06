@@ -16,9 +16,9 @@ use crate::{
         session::{DecodeSession, Limits, TokenStepper},
         speculate::{
             d1_oracle::{
-                D1Failure, D1Subject, Fault, Setup, Verdict, accepted_prefix, failure_recovery,
-                first_bit_difference, full_logits, later_rows_isolated, repeated_rollbacks,
-                slot_faults_for, ties_break_low, Tally,
+                D1Failure, D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix,
+                failure_recovery, first_bit_difference, full_logits, later_rows_isolated,
+                repeated_rollbacks, slot_faults_for, ties_break_low,
             },
             driver::WindowModel,
             window::Commit,
@@ -528,7 +528,10 @@ fn the_cycle_check_catches_flaws_that_a_single_window_may_miss() {
             repeated_rollbacks(fake, &setup, 3, &Sampler::greedy, 24),
             "G",
         );
-        assert!(failure.test.starts_with('G') || failure.test.starts_with('D'), "{failure}");
+        assert!(
+            failure.test.starts_with('G') || failure.test.starts_with('D'),
+            "{failure}"
+        );
     }
 }
 
@@ -551,7 +554,10 @@ fn an_import_that_leaves_the_window_open_is_caught() {
     let base = sound.fake.snapshot().unwrap();
     sound.fake.run_window(&rows(4)).unwrap();
     sound.fake.restore(&base).unwrap();
-    sound.fake.run_window(&rows(4)).expect("a window after an import");
+    sound
+        .fake
+        .run_window(&rows(4))
+        .expect("a window after an import");
     assert!(
         rig.fake.run_window(&rows(4)).is_err(),
         "the window left open by the import blocks the next one"
@@ -588,10 +594,7 @@ fn a_capture_or_restore_on_a_busy_or_poisoned_state_is_refused_by_the_guard() {
     let mut rig = SlotRig::new(Mutant::Sound, false);
     rig.fake.poisoned = true;
     assert!(rig.fake.run_window(&rows(4)).is_err());
-    assert!(
-        !rig.fake.book.is_open(),
-        "a refused window opens nothing"
-    );
+    assert!(!rig.fake.book.is_open(), "a refused window opens nothing");
 }
 
 #[test]
