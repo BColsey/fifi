@@ -1,4 +1,4 @@
-//! The recovery gate of a failed window commit on the REAL step. COMPILED-ONLY: this is a device
+//! The recovery gate of a failed window commit on the REAL step. Compile-only: this is a device
 //! test that builds in the CUDA container and runs only on a device, in a GPU window nobody has
 //! authorised yet. NONE HAS RUN.
 //!
@@ -53,7 +53,7 @@ fn refused_by_the_gate<T>(what: &str, result: Result<T, EngError>) {
 }
 
 #[test]
-#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT. COMPILED-ONLY, never run"]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT. compile-only, never run"]
 fn a_failed_commit_leaves_a_step_that_only_a_reset_recovers() {
     let (_tokenizer, stream) = text_stream(PREFIX + 64);
     let loaded = load_pack();
@@ -115,7 +115,7 @@ fn a_failed_commit_leaves_a_step_that_only_a_reset_recovers() {
 }
 
 #[test]
-#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT. COMPILED-ONLY, never run"]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT. compile-only, never run"]
 fn an_unresolved_window_refuses_every_restore_and_only_a_reset_recovers() {
     let (_tokenizer, stream) = text_stream(PREFIX + 64);
     let loaded = load_pack();
