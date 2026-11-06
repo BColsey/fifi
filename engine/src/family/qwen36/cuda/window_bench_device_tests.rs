@@ -897,6 +897,7 @@ fn record(
         "settings": {
             "depths": config.depths, "rows": config.rows, "rounds": config.rounds,
             "warm_from": config.warm_from, "deadline_s": config.deadline_s,
+            "rollback": config.rollback.name(), "sync_capture": config.sync_capture,
             "eos": EOS,
         },
         "memory": memory,
