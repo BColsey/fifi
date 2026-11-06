@@ -73,6 +73,7 @@ use crate::{
             driver::WindowModel,
         },
     },
+    kernels::cuda::resident::exl3::SERVED_SINGLE_ROW,
     tokenizer::Tokenizer,
 };
 
@@ -116,6 +117,9 @@ pub(super) struct Loaded {
     /// VRAM in use on the card (by every process) when the projector came up, before the load:
     /// what this process adds is measured against it.
     pub(super) baseline_used: u64,
+    /// The single-row EXL3 kernel the context runs (`wide1`, `legacy`, ...): recorded so that a
+    /// result never leaves the kernel unsaid.
+    pub(super) kernel: &'static str,
 }
 
 pub(super) fn load_pack() -> Loaded {
@@ -124,6 +128,17 @@ pub(super) fn load_pack() -> Loaded {
         Box::leak(Box::new(CudaProjector::new().expect("projector")));
     let idle = projector.memory_info().expect("memory_info");
     let baseline_used = (idle.total - idle.free) as u64;
+    // The kernel a served pack runs: the start registers wide1 on its context
+    // (`start.rs`, before `load_exl3_dir`). Without it an unset FIFI_EXL3_SINGLE_GATHER leaves
+    // the shuffle kernel, which the served engine does not run. An explicit value of the variable
+    // still wins, as it does in the served path.
+    projector
+        .context()
+        .set_single_row_default(SERVED_SINGLE_ROW);
+    let kernel = projector
+        .context()
+        .single_row_kernel_name()
+        .expect("single-row kernel setting");
     let weights: &'static CudaWeights = Box::leak(Box::new(
         load_exl3_dir(projector, Path::new(&dir), Reserve::default()).expect("load"),
     ));
@@ -131,6 +146,7 @@ pub(super) fn load_pack() -> Loaded {
         projector,
         weights,
         baseline_used,
+        kernel,
     }
 }
 
@@ -276,9 +292,14 @@ fn rig() -> Rig {
     let (tokenizer, stream) = text_stream(need);
     let kv = kv_mode_from_env();
     let capture = capture_from_env();
-    println!("D1_CONFIG kv={kv:?} capture={capture} context={context} prefixes={prefixes:?}");
+    let loaded = load_pack();
+    println!(
+        "D1_CONFIG kv={kv:?} capture={capture} context={context} prefixes={prefixes:?} \
+         single_row_kernel={}",
+        loaded.kernel
+    );
     let step = build_step(
-        &load_pack(),
+        &loaded,
         &step_options(kv, context),
         CaptureConfig {
             capture,

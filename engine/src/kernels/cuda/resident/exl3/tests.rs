@@ -269,3 +269,24 @@ fn both_grouped_entries_choose_through_the_kernel_function() {
         "{body}"
     );
 }
+
+/// The served start registers `wide1` and a harness must run the same kernel: the registered
+/// default is what an unset variable selects, an explicit value still wins, and the record name of
+/// the effective kernel is never empty (the shuffle kernel is `legacy`).
+#[test]
+fn the_served_single_row_kernel_is_wide1_and_named_in_records() {
+    use super::{SERVED_SINGLE_ROW, SingleRow, effective_single_row as effective, single_row_name};
+    assert_eq!(SERVED_SINGLE_ROW, SingleRow::Wide(1));
+    assert_eq!(
+        single_row_name(effective(None, Some(SERVED_SINGLE_ROW))),
+        "wide1"
+    );
+    assert_eq!(single_row_name(effective(None, None)), "legacy");
+    assert_eq!(
+        single_row_name(effective(Some(SingleRow::Legacy), Some(SERVED_SINGLE_ROW))),
+        "legacy"
+    );
+    assert_eq!(single_row_name(SingleRow::Gather), "gather");
+    assert_eq!(single_row_name(SingleRow::Wide(2)), "wide2");
+    assert_eq!(single_row_name(SingleRow::Wide(4)), "wide4");
+}

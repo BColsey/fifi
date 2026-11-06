@@ -197,7 +197,8 @@ fn bench_step(
             section_marks: marks,
         },
     )?;
-    // As `start::make`: the Q8 profile chunks at 1,024 rows with fixed admission; the fp16 profile
+    // As `start::make`: `load_pack` registers the served single-row kernel (wide1) on the context;
+    // the Q8 profile chunks at 1,024 rows with fixed admission; the fp16 profile
     // keeps the default chunk and the legacy headroom.
     let (kv8, cap, headroom, flags) = match kv {
         KvMode::Int8G32 => (true, 1_024, FIXED_ADMISSION_MARGIN, (true, true, false)),
@@ -759,8 +760,12 @@ fn verify_window_cost_record() {
     let need = deepest + CONTEXT_SLACK;
     let (_tokenizer, stream) = text_stream(need);
     let text = &stream[..need];
-    let identity = identity(&config, kv, capture, text);
+    let mut identity = identity(&config, kv, capture, text);
     let loaded = load_pack();
+    // The effective single-row kernel (registered default or explicit variable), so an unset
+    // variable never leaves it unsaid; `check_record.py` requires the field.
+    identity.json["single_row_kernel"] = Value::String(loaded.kernel.to_owned());
+    println!("MRV_CONFIG single_row_kernel={}", loaded.kernel);
     let baseline_used = loaded.baseline_used;
     let mut memory = Vec::new();
     let mut step =

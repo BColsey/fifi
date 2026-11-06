@@ -46,7 +46,7 @@ use crate::{
         speculate::config::DraftMode,
     },
     kernels::cuda::peer::{check_peer_facts, enable_peer_access, probe_device_set},
-    kernels::cuda::resident::exl3::SingleRow,
+    kernels::cuda::resident::exl3::SERVED_SINGLE_ROW,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::TokenizerBundle,
 };
@@ -966,7 +966,7 @@ fn make(
             // another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); bit-identical output.
             projector
                 .context()
-                .set_single_row_default(SingleRow::Wide(1));
+                .set_single_row_default(SERVED_SINGLE_ROW);
             let device = load_exl3_dir(&projector, &settings.artifact, reserve)?;
             eprintln!(
                 "q36 cuda: EXL3 weights loaded from {} in {:.1} s",

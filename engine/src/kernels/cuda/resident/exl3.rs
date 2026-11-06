@@ -44,6 +44,17 @@ pub(crate) enum SingleRow {
     Wide(u32),
 }
 
+/// The kernel the Qwen3.6 EXL3 start registers on its context (`family/qwen36/cuda/start.rs`), and
+/// that any harness which claims to measure or qualify the served step must register too. An
+/// explicit `FIFI_EXL3_SINGLE_GATHER` still wins over it.
+pub(crate) const SERVED_SINGLE_ROW: SingleRow = SingleRow::Wide(1);
+
+/// The name of a kernel in a record: unlike [`single_row_label`] the shuffle kernel has one, so a
+/// record never leaves the kernel unsaid.
+pub(crate) fn single_row_name(kernel: SingleRow) -> &'static str {
+    single_row_label(kernel).unwrap_or("legacy")
+}
+
 /// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
 /// The most pairs one launch takes under the 20-pair option (Flash-Next's ten picks).
@@ -343,6 +354,13 @@ impl CudaContext {
     /// another context in the process is unaffected.
     pub(crate) fn set_single_row_default(&self, kernel: SingleRow) {
         self.exl3_single_row_default.set(Some(kernel));
+    }
+
+    /// The name of the kernel the single-row projections of this context run on (`legacy`,
+    /// `gather`, `wide1`, ...): the explicit variable, else the registered default, else the
+    /// shuffle kernel. A bad value of the variable is refused.
+    pub(crate) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        self.single_row_setting().map(single_row_name)
     }
 
     /// The kernel the single-row projections of this context run on, or the refusal of a bad
