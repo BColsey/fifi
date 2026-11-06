@@ -101,7 +101,10 @@ The Mac profile leaves it off. To turn it on there, set `"prefix_reuse": true` a
 ## If the engine does not load
 
 The server starts listening before the model loads.
-If loading fails, `/ready` returns `503` with each engine's state, and the server log says why.
+If every engine fails to load, the server stops by itself within a second or so.
+The process exits with a non-zero code and prints the cause on standard error, and the server log has the same line.
+Scripts that wait for `/ready` should also watch the process: it is gone when loading failed.
+With more than one engine, the server keeps running while at least one engine is ready or busy; `/ready` stays `200`, and `/v1/models` shows the failed engine with its error.
 
 | Log message mentions | Cause | Fix |
 | --- | --- | --- |

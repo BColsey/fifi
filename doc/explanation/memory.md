@@ -4,7 +4,10 @@ fifi works out how much memory a model needs before it loads it.
 If the plan does not fit, the engine does not load, and the server log says which part did not fit.
 fifi never lowers the context limit or changes the cache format to make a model fit; you choose those in the [configuration file](../reference/configuration.md).
 
-The server starts listening before the engines load, so a refused load shows up as `/ready` returning `503` while `/health` still answers.
+The server starts listening before the engines load, but a refused load does not leave it waiting.
+If every engine fails to load, the process exits with a non-zero code and prints the refusal on standard error.
+The authenticated `/v1/models` error details are then no longer reachable, because the server is gone.
+With several engines, the server keeps running while at least one engine is ready or busy, and `/v1/models` reports the failed engine's error.
 
 ## What takes memory
 

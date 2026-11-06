@@ -459,6 +459,17 @@ fn probes_behind(delay: Duration, gate: Option<std::sync::mpsc::Receiver<()>>) -
     }
 }
 
+/// An engine that stays `Busy` until the returned job handle is cancelled or dropped: a probe
+/// engine with a decode delay, given one job that has no output limit. Returns once the
+/// engine is `Busy`.
+pub(super) fn busy_engine() -> (Engine, crate::sched::job::JobHandle) {
+    let probes = probes(Duration::from_millis(5));
+    let (job, handle) = crate::sched::job::Job::new(vec![104], generation()).expect("job");
+    probes.engine.handle().try_submit(job).expect("submit");
+    wait_for_state(&probes.engine.handle(), EngineState::Busy);
+    (probes.engine, handle)
+}
+
 pub(super) fn probe_engine() -> (Engine, Arc<Mutex<Vec<u32>>>) {
     let probes = probes(Duration::ZERO);
     (probes.engine, probes.prompt)

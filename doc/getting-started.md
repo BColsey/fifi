@@ -87,6 +87,7 @@ curl http://127.0.0.1:18791/ready
 ```
 
 `/ready` answers once at least one engine has loaded. It is one of the two routes that need no API key; the other is `/health`.
+If every engine fails to load, the server exits with a non-zero code and prints the cause on standard error instead of waiting.
 
 ## 6. Send a chat request
 

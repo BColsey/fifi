@@ -592,7 +592,10 @@ const BOOT_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Resolves when startup has failed for good: every engine has left `Loading` and none of
 /// them can take a job. It never resolves once any engine is `Ready` or `Busy` (a server with
 /// one live engine keeps serving; `/ready` and `/v1/models` show the failed ones), and it
-/// never resolves for a server with no engines. The engine threads load in the background
+/// never resolves for a server with no engines (which `Config` rejects; the guard is defensive).
+/// The watch samples every `BOOT_WATCH_INTERVAL`: an engine that is Ready for less than one
+/// sample and then fails natively is not seen as live. That needs a job queued during the
+/// load, and the cost is only an early exit of a server that was never useful. The engine threads load in the background
 /// after the listener is bound, so without this watch a refused load (for example
 /// "cuda admission") leaves a process that is up and never ready.
 async fn boot_failed(handles: Vec<crate::sched::worker::EngineHandle>) {
@@ -618,6 +621,11 @@ async fn boot_failed(handles: Vec<crate::sched::worker::EngineHandle>) {
 /// Serves until `shutdown` resolves or every engine has failed to load. In the second case
 /// the server drains and returns `Ok`; the caller's engine shutdown reports the recorded
 /// causes, so the process exits non-zero with the engine's own message on stderr.
+///
+/// In the second case the process is already ending with a failure, and the drain is short:
+/// no engine can take a job, so every in-flight request fails at once. A SIGTERM that arrives
+/// during that drain is absorbed by the installed handler and changes nothing, since the exit
+/// is already under way.
 pub(crate) async fn serve(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -1504,6 +1512,56 @@ mod tests {
         task.abort();
         broken.shutdown();
         live.shutdown();
+    }
+
+    /// `Busy` counts as live: the watch must not treat a working engine as failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_busy_engine_keeps_the_server_up_beside_a_failed_one() {
+        let broken = testkit::failing_engine();
+        let (working, job) = testkit::busy_engine();
+        let entries = vec![
+            testkit::entry("e1", "model-a", &broken, 4_096),
+            testkit::entry("e2", "model-b", &working, 4_096),
+        ];
+        testkit::wait_for_state(&entries[0].handle, EngineState::Error);
+        assert_eq!(entries[1].handle.state(), EngineState::Busy);
+        let task = serve_without_signal(entries).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "a busy engine did not keep the server up"
+        );
+        task.abort();
+        job.cancel();
+        broken.shutdown();
+        working.shutdown();
+    }
+
+    /// The latch: once the watch has seen an engine serve, a later failure of that engine (or of
+    /// all of them) is a runtime failure, not a boot failure, and does not stop the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_engine_that_fails_after_it_was_ready_does_not_stop_the_server() {
+        let failure = crate::EngError::Backend {
+            operation: "qmm",
+            message: "device lost".to_string(),
+        };
+        let engine = testkit::refusing_engine(failure);
+        testkit::wait_for_state(&engine.handle(), EngineState::Ready);
+        let entries = vec![testkit::entry("e1", "model-a", &engine, 4_096)];
+        let task = serve_without_signal(entries).await;
+        // Let the watch see Ready (it polls every BOOT_WATCH_INTERVAL).
+        tokio::time::sleep(super::BOOT_WATCH_INTERVAL * 4).await;
+        let (job, _events) =
+            crate::sched::job::Job::new(vec![104], testkit::generation()).expect("job");
+        engine.handle().try_submit(job).expect("submit");
+        testkit::wait_for_state(&engine.handle(), EngineState::NativeFailed);
+        tokio::time::sleep(super::BOOT_WATCH_INTERVAL * 5).await;
+        assert!(
+            !task.is_finished(),
+            "a failure after the engine was ready stopped the server"
+        );
+        task.abort();
+        engine.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

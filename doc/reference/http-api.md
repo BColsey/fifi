@@ -146,3 +146,6 @@ The Messages routes use the Anthropic error format instead.
 ## Engine states
 
 `/v1/models` and the `not_ready` message report each engine as `loading`, `ready`, `busy`, `error` (it failed to load), `stopped`, or `native-failed` (the GPU backend failed and the engine takes no more requests).
+
+If every engine fails to load, the server does not stay up to report it: the process exits with a non-zero code and prints each engine's cause on standard error.
+So `/ready` answering `503` with `error` states is seen while an engine is still loading, or after a failure that follows a successful start.
