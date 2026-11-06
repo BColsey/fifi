@@ -187,7 +187,8 @@ pub(crate) struct Q36Options {
     /// below 1. The default is 0.4. Used with `dynamic_draft_tokens`.
     pub(crate) draft_confidence: Option<f64>,
     /// The most rows of one verify window, the pending token included, from 2 to 64. The default
-    /// is 8.
+    /// is 8. An enabled `draft_mode` refuses more than 8 (`QWEN36_MAX_WINDOW_ROWS`); 8 is a cap,
+    /// not a D1 qualification.
     pub(crate) draft_max_rows: Option<u32>,
     /// When the context repeats an earlier passage for this many tokens, draft that many tokens of
     /// it in one window. 0 (the default) is off; otherwise from `ngram_match_min` to 256.
@@ -324,6 +325,32 @@ fn cuda_devices_of(
     Ok(list.iter().map(|&device| device as usize).collect())
 }
 
+/// The most rows a Qwen3.6 speculative verify window may have, the pending token included.
+///
+/// This is a CAP, not a qualification. The EXL3 projections switch from the rows kernel to the
+/// unsplit kernel at 9 or more rows (`exl3_linear`), and no test shows that path bitwise equal to
+/// a one-row step, so a larger window would leave the D1 contract (verify equals one-row decode)
+/// unexamined. Rows 2 to 8 are accepted by the config; whether they are D1-qualified is decided
+/// by the device tests of `speculate::d1_oracle`, which have not run on a device yet. The limit
+/// belongs to this family: the generic `SpecConfig` range (2 to 64), prefill and chunked feed are
+/// unchanged.
+pub(crate) const QWEN36_MAX_WINDOW_ROWS: usize = 8;
+
+/// Refuses an enabled speculative configuration whose windows could exceed
+/// [`QWEN36_MAX_WINDOW_ROWS`]. A disabled entry feeds no window and keeps its members unchecked
+/// beyond the generic range, so an existing config with `draft_mode` off still loads.
+pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
+    if config.enabled() && config.max_rows > QWEN36_MAX_WINDOW_ROWS {
+        return Err(bad(format!(
+            "draft_max_rows {} exceeds {QWEN36_MAX_WINDOW_ROWS}: Qwen3.6 verify windows are capped at \
+             {QWEN36_MAX_WINDOW_ROWS} rows (the EXL3 projections leave the rows kernel at 9 rows); \
+             the cap is not a qualification of {QWEN36_MAX_WINDOW_ROWS}-row windows",
+            config.max_rows
+        )));
+    }
+    Ok(())
+}
+
 /// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
 /// only verify window and the only MTP head the engine has.
 fn speculation_of(
@@ -342,6 +369,7 @@ fn speculation_of(
     if config.mode == DraftMode::Mtp {
         return Err(bad("draft_mode mtp has no draft step yet".into()));
     }
+    check_window_rows(&config)?;
     Ok(config)
 }
 
@@ -1207,10 +1235,11 @@ mod tests {
         chunked_prefill_allowed, delta_state_bytes, digest, kv_dtype_name, kv_dtype_of,
         parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
+    use super::{QWEN36_MAX_WINDOW_ROWS, check_window_rows};
     use crate::EngError;
     use crate::family::session::StoreLimits;
     use crate::family::spec::QWEN3_6_35B_A3B;
-    use crate::family::speculate::config::SpecConfig;
+    use crate::family::speculate::config::{SpecConfig, SpecOptions};
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
 
@@ -1601,6 +1630,73 @@ mod tests {
             o.mtp_model_dir = Some(PathBuf::from("/h"));
         })));
         assert_eq!(text, "engine config: draft_mode mtp has no draft step yet");
+    }
+
+    #[test]
+    fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        for rows in [9, 16, 64] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_max_rows = Some(rows);
+            })));
+            assert!(
+                text.starts_with(&format!(
+                    "engine config: draft_max_rows {rows} exceeds 8: Qwen3.6 verify windows are capped at 8 rows"
+                )),
+                "{text}"
+            );
+            assert!(text.contains("not a qualification"), "{text}");
+        }
+    }
+
+    #[test]
+    fn eight_rows_are_accepted_as_a_cap_not_as_a_qualification() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        for rows in 2..=8 {
+            let on = cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_max_rows = Some(rows);
+            }))
+            .unwrap();
+            assert!(on.speculation.enabled());
+            assert_eq!(on.speculation.max_rows, rows as usize);
+            assert!(on.speculation.window_drafts() < QWEN36_MAX_WINDOW_ROWS);
+        }
+        assert_eq!(QWEN36_MAX_WINDOW_ROWS, 8);
+        let default_on = cuda(exl3_options(|o| o.draft_mode = Some("ngram".into()))).unwrap();
+        assert_eq!(
+            default_on.speculation.max_rows, QWEN36_MAX_WINDOW_ROWS,
+            "the default row cap is the Qwen3.6 cap: speculation on by default needs no override"
+        );
+    }
+
+    #[test]
+    fn the_cap_is_confined_to_enabled_qwen36_speculation() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        // A disabled entry feeds no window: the generic 2..=64 range still applies and loads.
+        let off = cuda(exl3_options(|o| o.draft_max_rows = Some(64))).unwrap();
+        assert!(!off.speculation.enabled());
+        assert_eq!(off.speculation.max_rows, 64);
+        // The generic speculation range is not narrowed for other users of `SpecConfig`.
+        let wide = SpecConfig::new(&SpecOptions {
+            draft_mode: Some("ngram".into()),
+            draft_max_rows: Some(64),
+            ..SpecOptions::default()
+        })
+        .unwrap();
+        assert_eq!(wide.max_rows, 64);
+        // The step-side check is the same function, so a hand-made config meets the same cap.
+        assert!(check_window_rows(&wide).is_err());
+        assert!(check_window_rows(&SpecConfig::default()).is_ok());
+        let mut nine = wide.clone();
+        nine.max_rows = 9;
+        assert!(check_window_rows(&nine).is_err());
+        nine.max_rows = 8;
+        assert!(check_window_rows(&nine).is_ok());
     }
 
     #[test]

@@ -75,7 +75,7 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::settings::DEFAULT_CUDA_PREFILL_CHUNK,
+    family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, check_window_rows},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::session::PrefixSlot,
     family::speculate::{
@@ -737,6 +737,9 @@ impl<'a> QwenResidentStep<'a> {
     /// n-gram mode drafts from the committed tokens; the MTP mode has no draft step yet and is
     /// refused.
     pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<(), EngError> {
+        // The settings parser refuses this already; a step built from a hand-made config meets
+        // the same cap.
+        check_window_rows(config)?;
         self.speculator = match config.mode {
             DraftMode::Disabled => None,
             DraftMode::Ngram => Some(Speculator::new(
