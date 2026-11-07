@@ -503,14 +503,16 @@ impl Q36Executor {
         self.decoder.kernels.compile_counters()
     }
 
-    /// The seconds of THIS engine's load-time compile warm-up, delta first and moe second: the
-    /// seconds per traced program of each block kind, empty vectors when `qwen36.compile` is off.
-    /// They are measured inside this decoder's warm-up — not read from the process-wide counters —
-    /// so the start line reports this engine alone and labels each block kind correctly.
-    pub(crate) fn compile_warmup_seconds(&self) -> (&[f64], &[f64]) {
+    /// The seconds of THIS engine's load-time compile warm-up, delta, moe, and attn: the
+    /// seconds per traced program of each block kind, empty vectors when `qwen36.compile` is
+    /// off. They are measured inside this decoder's warm-up — not read from the process-wide
+    /// counters — so the start line reports this engine alone and labels each block kind
+    /// correctly.
+    pub(crate) fn compile_warmup_seconds(&self) -> (&[f64], &[f64], &[f64]) {
         (
             &self.decoder.compile_warmup.delta,
             &self.decoder.compile_warmup.moe,
+            &self.decoder.compile_warmup.attn,
         )
     }
 

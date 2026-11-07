@@ -19,6 +19,8 @@ use crate::tensor::Dtype;
 pub(crate) const DELTA_TAG: u64 = 0x0036_5147_a5a0_0002;
 pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
+/// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
+pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
 
 /// The activation dtype and the scale dtype of every packed weight are part of the compile
 /// cache key, so the F32 and BF16 decoders never read each other's trace. Every dtype is its
@@ -181,6 +183,45 @@ pub(crate) fn flint_tail_fun_id(baked: &FlintTailBaked) -> u64 {
     mix_fun_id(FLINT_TAIL_TAG, &parts)
 }
 
+/// The baked constants of one compiled attention pre-RoPE step: the q/k/v projections, the
+/// interleaved q/gate split, and the q/k RMS norms, up to (but excluding) the position-scaled
+/// RoPE, which stays eager because `mlx_fast_rope` takes the offset as a C++ int and a baked
+/// offset would retrace every position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttnPreBaked {
+    /// The hidden width `H` of the layer.
+    pub(crate) hidden: u32,
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The key/value head count (grouped-query attention).
+    pub(crate) kv_heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the q and k norms.
+    pub(crate) eps_bits: u32,
+    /// The activation dtype key of the step.
+    pub(crate) act: u64,
+    /// The scale dtype key of EACH packed weight, in the seam's weight order q, k, v.
+    pub(crate) scale_keys: [u64; 3],
+    /// The quantization triple of EACH packed weight, in the same order.
+    pub(crate) quant: [[i32; 3]; 3],
+}
+
+pub(crate) fn attn_pre_fun_id(baked: &AttnPreBaked) -> u64 {
+    let mut parts = Vec::with_capacity(16);
+    parts.push(u64::from(baked.hidden));
+    parts.push(u64::from(baked.heads));
+    parts.push(u64::from(baked.kv_heads));
+    parts.push(u64::from(baked.width));
+    parts.push(u64::from(baked.eps_bits));
+    parts.push(baked.act);
+    parts.extend(baked.scale_keys);
+    for triple in &baked.quant {
+        parts.extend(triple.iter().map(|&value| i64::from(value) as u64));
+    }
+    mix_fun_id(ATTN_PRE_TAG, &parts)
+}
+
 pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
@@ -196,11 +237,12 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     mix_fun_id(MOE_TAG, &parts)
 }
 
-/// The most baked keys that one adapter context may admit:
-/// DeltaNet and device-routed MoE in at most two activation dtypes need four keys. A fifth
-/// distinct key is an unapproved configuration change. This does not count MLX tapes: one
-/// MoE key permits B=1/2/4/8, so one adapter context can approve at most sixteen key/batch
-/// pairs. Other contexts, cache clears and other threads are not bounded by this registry.
+/// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
+/// attention pre-RoPE in one uniform model need three keys, and a fourth covers one extra
+/// distinct constant set (for example a second quantization). A fifth distinct key is an
+/// unapproved configuration change. This does not count MLX tapes: one MoE key permits
+/// B=1/2/4/8, so one adapter context can approve at most sixteen key/batch pairs. Other
+/// contexts, cache clears and other threads are not bounded by this registry.
 pub(crate) const PROGRAM_LIMIT: usize = 4;
 
 /// The compiled-program registry of ONE adapter context:
@@ -280,13 +322,115 @@ mod tests {
         }
     }
 
+    /// An attention pre-RoPE constant set of the real model (hidden 2048, 32 query heads,
+    /// 8 key/value heads, width 128, eps 1e-6) with the same affine quantization.
+    fn attn() -> AttnPreBaked {
+        AttnPreBaked {
+            hidden: 2048,
+            heads: 32,
+            kv_heads: 8,
+            width: 128,
+            eps_bits: 1e-6f32.to_bits(),
+            act: dtype_key(Dtype::F32),
+            scale_keys: [1, 1, 1],
+            quant: [[0, 64, 4]; 3],
+        }
+    }
+
     #[test]
     fn equal_constants_give_equal_keys() {
         assert_eq!(delta_fun_id(&delta()), delta_fun_id(&delta()));
         assert_eq!(moe_fun_id(&moe()), moe_fun_id(&moe()));
+        assert_eq!(attn_pre_fun_id(&attn()), attn_pre_fun_id(&attn()));
         assert_eq!(
             flint_tail_fun_id(&flint_tail()),
             flint_tail_fun_id(&flint_tail())
+        );
+    }
+
+    /// The attention keys of the three block kinds never collide, and every scalar field,
+    /// scale key, and quantization value of the attention block changes its key.
+    #[test]
+    fn every_single_attn_pre_constant_changes_the_key() {
+        let base = attn();
+        let rows: Vec<(&str, AttnPreBaked)> = vec![
+            (
+                "hidden",
+                AttnPreBaked {
+                    hidden: 2049,
+                    ..base
+                },
+            ),
+            ("heads", AttnPreBaked { heads: 33, ..base }),
+            (
+                "kv_heads",
+                AttnPreBaked {
+                    kv_heads: 9,
+                    ..base
+                },
+            ),
+            ("width", AttnPreBaked { width: 129, ..base }),
+            (
+                "eps_bits",
+                AttnPreBaked {
+                    eps_bits: base.eps_bits ^ 1,
+                    ..base
+                },
+            ),
+            (
+                "act",
+                AttnPreBaked {
+                    act: dtype_key(Dtype::Bf16),
+                    ..base
+                },
+            ),
+            (
+                "scale_keys[0]",
+                AttnPreBaked {
+                    scale_keys: [0, 1, 1],
+                    ..base
+                },
+            ),
+            (
+                "scale_keys[2]",
+                AttnPreBaked {
+                    scale_keys: [1, 1, 0],
+                    ..base
+                },
+            ),
+            (
+                "quant[1] mode",
+                AttnPreBaked {
+                    quant: [[0, 64, 4], [1, 64, 4], [0, 64, 4]],
+                    ..base
+                },
+            ),
+            (
+                "quant[2] bits",
+                AttnPreBaked {
+                    quant: [[0, 64, 4], [0, 64, 4], [0, 64, 8]],
+                    ..base
+                },
+            ),
+        ];
+        let base_id = attn_pre_fun_id(&base);
+        for (name, variant) in rows {
+            assert_ne!(
+                attn_pre_fun_id(&variant),
+                base_id,
+                "changing {name} must change the attention key"
+            );
+        }
+        assert_ne!(
+            base_id,
+            delta_fun_id(&delta()),
+            "distinct from the delta key"
+        );
+        assert_ne!(base_id, moe_fun_id(&moe()), "distinct from the moe key");
+        assert_ne!(
+            base_id,
+            flint_tail_fun_id(&flint_tail()),
+            "distinct from the flint tail key"
         );
     }
 

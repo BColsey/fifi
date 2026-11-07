@@ -83,9 +83,10 @@ pub(super) struct ResidentDecoder<'c> {
     pub(super) chunk_rows: u32,
     /// How the layers pick their experts. `Device` unless a parity run asks for `Host`.
     pub(super) routing: Routing,
-    /// `mlx_compile` on the DeltaNet and device-routed MoE decode blocks: the `qwen36.compile`
-    /// setting, false until `set_compile` turns it on. `step` copies it into its `Ctx`,
-    /// `delta::step` and `moe::step_device` read it, and no other path compiles.
+    /// `mlx_compile` on the DeltaNet, device-routed MoE, and attention pre-RoPE decode
+    /// blocks: the `qwen36.compile` setting, false until `set_compile` turns it on. `step`
+    /// copies it into its `Ctx`, `delta::step`, `attn::step`, and `moe::step_device` read
+    /// it, and no other path compiles.
     pub(super) compile: bool,
     /// The seconds of this decoder's load-time compile warm-up, per block kind: empty until
     /// `set_compile(true)` traces the programs. `WarmupSeconds` documents the shape.
@@ -104,15 +105,18 @@ pub(super) struct ResidentDecoder<'c> {
 }
 
 /// The seconds of the load-time compile warm-up, per block kind: `delta` holds one entry per traced
-/// DeltaNet program and `moe` one entry per traced device-routed MoE program, each covering the
-/// whole warm step (the trace call and its evaluation). They are measured inside THIS decoder, so
-/// the start line never reports another engine's seconds, and the two lists are labeled separately.
+/// DeltaNet program, `moe` one entry per traced device-routed MoE program, and `attn` one entry
+/// per traced attention pre-RoPE program, each covering the whole warm step (the trace call and
+/// its evaluation). They are measured inside THIS decoder, so the start line never reports
+/// another engine's seconds, and the three lists are labeled separately.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct WarmupSeconds {
     /// One entry per traced DeltaNet program, in plan order.
     pub(super) delta: Vec<f64>,
     /// One entry per traced device-routed MoE program, in plan order.
     pub(super) moe: Vec<f64>,
+    /// One entry per traced attention pre-RoPE program, in plan order.
+    pub(super) attn: Vec<f64>,
 }
 
 /// Dispatches the flash-prefill kernel once on a tiny synthetic call at engine startup: MLX
@@ -454,7 +458,7 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Dense(_) => None,
             })
             .collect::<Result<_, EngError>>()?;
-        let plan = super::compile_plan::model_warmup(true, true, &delta_facts, &moe_facts)?;
+        let plan = super::compile_plan::model_warmup(true, true, &delta_facts, &moe_facts, &[])?;
         if delta_facts.iter().any(|facts| facts.dims[5] <= 1) {
             return Err(EngError::BadRequest(
                 "compiled DeltaNet rows need more than one convolution tap".into(),
@@ -572,11 +576,22 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Dense(_) => None,
             })
             .collect::<Result<Vec<_>, EngError>>()?;
+        let attn_facts: Vec<super::compile_plan::AttnLayerFacts> = self
+            .weights
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, current)| match &current.mixer {
+                RMixer::Attn(w) => Some(super::compiled::attn_facts(layer, &shape, w, act, eps)),
+                RMixer::Delta(_) => None,
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
         let plan = super::compile_plan::model_warmup(
             self.compile,
             self.routing == Routing::Device,
             &delta_facts,
             &moe_facts,
+            &attn_facts,
         )
         .map_err(|error| match error {
             EngError::BadRequest(message) => EngError::Backend {
@@ -590,7 +605,7 @@ impl<'c> ResidentDecoder<'c> {
             .layers
             .iter()
             .any(|layer| matches!(&layer.feed_forward, RFeedForward::Dense(_)));
-        if plan.delta.is_empty() && plan.moe.is_empty() && !has_dense {
+        if plan.delta.is_empty() && plan.moe.is_empty() && plan.attn.is_empty() && !has_dense {
             return Ok(());
         }
         let mut ctx = Ctx {
@@ -640,7 +655,8 @@ impl<'c> ResidentDecoder<'c> {
         let x_zero = next()?;
         let act = ctx.consts.act;
         let x = cast_to(&mut ctx, &x_zero, act)?;
-        let (mut delta_seconds, mut moe_seconds) = (Vec::new(), Vec::new());
+        let (mut delta_seconds, mut moe_seconds, mut attn_seconds) =
+            (Vec::new(), Vec::new(), Vec::new());
         if !plan.delta.is_empty() {
             let rec = next()?;
             let ring = next()?;
@@ -683,6 +699,23 @@ impl<'c> ResidentDecoder<'c> {
                 RFeedForward::Dense(_) => {}
             }
         }
+        for (layer, _id) in &plan.attn {
+            let RMixer::Attn(w) = &self
+                .weights
+                .layers
+                .get(*layer)
+                .ok_or_else(|| EngError::BadRequest("the compile warm-up layer is missing".into()))?
+                .mixer
+            else {
+                return Err(EngError::BadRequest(
+                    "the compile warm-up found no attention layer",
+                ));
+            };
+            let started = std::time::Instant::now();
+            let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x)?;
+            ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
+            attn_seconds.push(started.elapsed().as_secs_f64());
+        }
         for layer in &self.weights.layers {
             if let RFeedForward::Dense(w) = &layer.feed_forward {
                 // Warm the primitives only. A compiled dense seam is a later optimization.
@@ -693,6 +726,7 @@ impl<'c> ResidentDecoder<'c> {
         self.compile_warmup = WarmupSeconds {
             delta: delta_seconds,
             moe: moe_seconds,
+            attn: attn_seconds,
         };
         Ok(())
     }

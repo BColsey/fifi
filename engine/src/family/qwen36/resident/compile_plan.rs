@@ -4,7 +4,7 @@
 //! middle of a request. The warm-up itself needs the Mac GPU and lives in `decoder.rs`.
 
 use crate::EngError;
-use crate::kernels::compile_key::{self, DeltaBaked, MoeBaked};
+use crate::kernels::compile_key::{self, AttnPreBaked, DeltaBaked, MoeBaked};
 
 /// The facts of one packed weight of a compiled block, as the load-time plan reads them: the
 /// scale dtype, the quantization, and whether the weight carries biases.
@@ -57,6 +57,25 @@ pub(super) struct MoeLayerFacts {
     pub(super) weights: [WeightFacts; 6],
 }
 
+/// The facts of one attention layer of the model: where the layer sits, the baked constants of
+/// its compiled pre-RoPE step, and the weight facts of the q, k, v projections in the seam's
+/// order.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AttnLayerFacts {
+    /// The layer index in the decoder's layer list (the refusal text and the warm-up name it).
+    pub(super) layer: usize,
+    pub(super) hidden: u32,
+    pub(super) heads: u32,
+    pub(super) kv_heads: u32,
+    pub(super) width: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the q and k norms.
+    pub(super) eps_bits: u32,
+    /// The activation dtype key (`compile_key::dtype_key`).
+    pub(super) act: u64,
+    /// The weight facts, in the seam's order q, k, v.
+    pub(super) weights: [WeightFacts; 3],
+}
+
 /// Which programs the load-time warm-up traces: one layer per DISTINCT cache key, because every
 /// layer with the same constants replays the same compiled program.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -65,6 +84,8 @@ pub(super) struct Warmup {
     pub(super) delta: Vec<(usize, u64)>,
     /// One entry per distinct device-routed MoE cache key: the first layer and the key.
     pub(super) moe: Vec<(usize, u64)>,
+    /// One entry per distinct attention pre-RoPE cache key: the first layer and the key.
+    pub(super) attn: Vec<(usize, u64)>,
 }
 
 /// Refuses a packed weight without biases, naming the layer and the weight.
@@ -97,6 +118,7 @@ pub(super) fn model_warmup(
     device_routing: bool,
     delta: &[DeltaLayerFacts],
     moe: &[MoeLayerFacts],
+    attn: &[AttnLayerFacts],
 ) -> Result<Warmup, EngError> {
     if !compile {
         return Ok(Warmup::default());
@@ -154,19 +176,39 @@ pub(super) fn model_warmup(
             }
         }
     }
-    let total = delta_plan.len() + moe_plan.len();
+    let mut attn_plan: Vec<(usize, u64)> = Vec::new();
+    for facts in attn {
+        refuse_biasless("attention", facts.layer, &facts.weights, ["q", "k", "v"])?;
+        let baked = AttnPreBaked {
+            hidden: facts.hidden,
+            heads: facts.heads,
+            kv_heads: facts.kv_heads,
+            width: facts.width,
+            eps_bits: facts.eps_bits,
+            act: facts.act,
+            scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
+            quant: facts.weights.each_ref().map(|weight| weight.quant),
+        };
+        let id = compile_key::attn_pre_fun_id(&baked);
+        if !attn_plan.iter().any(|&(_, seen)| seen == id) {
+            attn_plan.push((facts.layer, id));
+        }
+    }
+    let total = delta_plan.len() + moe_plan.len() + attn_plan.len();
     if total > compile_key::PROGRAM_LIMIT {
         return Err(EngError::BadRequest(format!(
-            "the model needs {total} distinct compiled programs ({} delta, {} moe); at most {} \
-             fit one adapter",
+            "the model needs {total} distinct compiled programs ({} delta, {} moe, {} attn); at \
+             most {} fit one adapter",
             delta_plan.len(),
             moe_plan.len(),
+            attn_plan.len(),
             compile_key::PROGRAM_LIMIT
         )));
     }
     Ok(Warmup {
         delta: delta_plan,
         moe: moe_plan,
+        attn: attn_plan,
     })
 }
 
@@ -210,6 +252,19 @@ mod tests {
         }
     }
 
+    fn attn_layer(layer: usize, bits: i32) -> AttnLayerFacts {
+        AttnLayerFacts {
+            layer,
+            hidden: 2048,
+            heads: 32,
+            kv_heads: 8,
+            width: 128,
+            eps_bits: 1e-6f32.to_bits(),
+            act: dtype_key(Dtype::F32),
+            weights: [affine(bits); 3],
+        }
+    }
+
     #[test]
     fn compile_off_needs_no_program_whatever_the_weights_hold() {
         // Five distinct ids and a biasless weight change nothing when the setting is off: no
@@ -226,7 +281,7 @@ mod tests {
         biasless_moe.weights[4].biases = false;
         let moe = [biasless_moe, moe_layer(1, 4)];
         assert_eq!(
-            model_warmup(false, true, &delta, &moe).unwrap(),
+            model_warmup(false, true, &delta, &moe, &[attn_layer(0, 4)]).unwrap(),
             Warmup::default(),
             "an engine with compile off traces no block at load"
         );
@@ -241,7 +296,7 @@ mod tests {
             moe_layer(2, 4),
             moe_layer(3, 4),
         ];
-        let plan = model_warmup(true, true, &delta, &moe).unwrap();
+        let plan = model_warmup(true, true, &delta, &moe, &[attn_layer(0, 4)]).unwrap();
         assert_eq!(
             plan.delta.len(),
             1,
@@ -261,7 +316,7 @@ mod tests {
         // Two DeltaNet bit widths and two MoE bit widths: four distinct ids, one layer each.
         let delta = [delta_layer(0, 4), delta_layer(2, 8)];
         let moe = [moe_layer(0, 4), moe_layer(1, 8)];
-        let plan = model_warmup(true, true, &delta, &moe).unwrap();
+        let plan = model_warmup(true, true, &delta, &moe, &[]).unwrap();
         assert_eq!(plan.delta.len(), 2, "two delta programs");
         assert_eq!(plan.moe.len(), 2, "two moe programs");
         assert_ne!(plan.delta[0].1, plan.delta[1].1, "the bit widths differ");
@@ -271,6 +326,7 @@ mod tests {
             true,
             &[delta_layer(0, 4), delta_layer(2, 8)],
             &[moe_layer(0, 4), moe_layer(1, 4)],
+            &[],
         )
         .unwrap();
         assert_eq!(plan.delta.len() + plan.moe.len(), 3, "3 ids");
@@ -280,7 +336,7 @@ mod tests {
     fn five_distinct_programs_are_refused() {
         let delta = [delta_layer(0, 4), delta_layer(1, 5), delta_layer(2, 6)];
         let moe = [moe_layer(0, 4), moe_layer(1, 8)];
-        let refused = model_warmup(true, true, &delta, &moe).unwrap_err();
+        let refused = model_warmup(true, true, &delta, &moe, &[]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the admission refusal is a BadRequest");
         };
@@ -293,7 +349,7 @@ mod tests {
             "the refusal names the limit: {message}"
         );
         // Four distinct ids still pass: the limit is exactly the program budget.
-        let four = model_warmup(true, true, &delta[..2], &moe).unwrap();
+        let four = model_warmup(true, true, &delta[..2], &moe, &[]).unwrap();
         assert_eq!(four.delta.len() + four.moe.len(), 4, "4 ids pass");
     }
 
@@ -301,7 +357,7 @@ mod tests {
     fn a_biasless_weight_is_refused_with_the_layer_name() {
         let mut facts = delta_layer(3, 4);
         facts.weights[1].biases = false;
-        let refused = model_warmup(true, true, &[facts], &[]).unwrap_err();
+        let refused = model_warmup(true, true, &[facts], &[], &[attn_layer(0, 4)]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the biasless refusal is a BadRequest");
         };
@@ -316,7 +372,7 @@ mod tests {
         // The MoE block refuses its own biasless weights on the device-routed path.
         let mut moe = moe_layer(5, 4);
         moe.weights[4].biases = false;
-        let refused = model_warmup(true, true, &[], &[moe]).unwrap_err();
+        let refused = model_warmup(true, true, &[], &[moe], &[]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the biasless refusal is a BadRequest");
         };
@@ -333,8 +389,52 @@ mod tests {
         // runs — and warms the DeltaNet blocks, whose step ignores the routing.
         let mut biasless_moe = moe_layer(0, 4);
         biasless_moe.weights[0].biases = false;
-        let plan = model_warmup(true, false, &[delta_layer(0, 4)], &[biasless_moe]).unwrap();
+        let plan = model_warmup(true, false, &[delta_layer(0, 4)], &[biasless_moe], &[]).unwrap();
         assert_eq!(plan.delta.len(), 1, "the DeltaNet blocks are warmed");
         assert!(plan.moe.is_empty(), "the host-routed MoE needs no program");
+    }
+    #[test]
+    fn attention_layers_share_one_program_and_join_the_budget() {
+        let delta = [delta_layer(0, 4)];
+        let moe = [moe_layer(0, 4)];
+        let attn = [attn_layer(0, 4), attn_layer(1, 4), attn_layer(2, 4)];
+        let plan = model_warmup(true, true, &delta, &moe, &attn).unwrap();
+        assert_eq!(
+            plan.attn.len(),
+            1,
+            "one attention program for the uniform model"
+        );
+        assert_eq!(plan.attn[0].0, 0, "the first attention layer");
+        assert_ne!(
+            plan.attn[0].1, plan.delta[0].1,
+            "distinct from the delta key"
+        );
+        // A biasless attention weight is refused with the layer name.
+        let mut biasless = attn_layer(3, 4);
+        biasless.weights[1].biases = false;
+        let refused = model_warmup(true, true, &delta, &moe, &[biasless]).unwrap_err();
+        let EngError::BadRequest(message) = refused else {
+            panic!("the biasless refusal is a BadRequest");
+        };
+        assert!(
+            message.contains("layer 3") && message.contains("the k weight has none"),
+            "the refusal names the layer and the weight: {message}"
+        );
+    }
+
+    #[test]
+    fn attention_programs_count_against_the_limit() {
+        // two delta quantizations + moe + two attention quantizations = five: refused.
+        let delta = [delta_layer(0, 4), delta_layer(1, 8)];
+        let moe = [moe_layer(0, 4)];
+        let attn = [attn_layer(0, 4), attn_layer(1, 8)];
+        let refused = model_warmup(true, true, &delta, &moe, &attn).unwrap_err();
+        let EngError::BadRequest(message) = refused else {
+            panic!("the limit refusal is a BadRequest");
+        };
+        assert!(
+            message.contains("needs 5 distinct compiled programs (2 delta, 1 moe, 2 attn)"),
+            "the refusal names all three kinds: {message}"
+        );
     }
 }

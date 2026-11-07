@@ -25,22 +25,28 @@
 //! one, or a fresh elementwise node), so later uncompiled code reads them directly and none goes
 //! through the readback net.
 //!
-//! What the seam does NOT compile, and why. The attention layers, the head, the embedding, and
-//! the whole prefill stay uncompiled: the attention layers bake the RoPE position as a scalar of
-//! each step (a different constant per token, so a compiled closure would retrace every position
-//! and the cache would never hit), the head and the embedding serve shapes the seam did not
-//! trace ([1, vocab] against the resident row reads), and the prefill runs chunk shapes that
-//! differ from the decode shapes (a shapeless trace would change the numerics the gates compare).
+//! What the seam does NOT compile, and why. The attention POSITION-dependent tail, the head,
+//! the embedding, and the whole prefill stay uncompiled. The attention pre-RoPE head — the
+//! projections, the q/gate split, and the q/k norms — compiles as one closure (B = 1 only),
+//! because none of its inputs varies per position; the RoPE, the cache append, and the core
+//! stay eager, because the RoPE bakes the position as a scalar of each step (a different
+//! constant per token, so a compiled closure would retrace every position and the cache would
+//! never hit) and the append bakes int slice bounds. The head and the embedding serve shapes
+//! the seam did not trace ([1, vocab] against the resident row reads), and the prefill runs
+//! chunk shapes that differ from the decode shapes (a shapeless trace would change the
+//! numerics the gates compare).
 
-use super::compile_plan::{DeltaLayerFacts, MoeLayerFacts, WeightFacts};
+use super::compile_plan::{AttnLayerFacts, DeltaLayerFacts, MoeLayerFacts, WeightFacts};
 use super::delta::DeltaStep;
 use super::moe::DeviceRoute;
 use super::ops::{Consts, Ctx, dim};
-use super::weights::{RDelta, RMoe};
+use super::weights::{RAttn, RDelta, RMoe};
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
-    kernels::mlx::native::compile::{CompileDeltaArgs, CompileMoeArgs, CompiledDeltaRows},
+    kernels::mlx::native::compile::{
+        CompileAttnPreArgs, CompileDeltaArgs, CompileMoeArgs, CompiledDeltaRows,
+    },
     kernels::{ResidentPackedWeight, compile_key},
     tensor::Dtype,
 };
@@ -127,6 +133,32 @@ pub(super) fn moe_facts(
     })
 }
 
+/// The load-time facts of one attention layer (index `layer`) for the warm-up plan: the baked
+/// constants of its compiled pre-RoPE step and the weight facts of the q, k, v projections.
+pub(super) fn attn_facts(
+    layer: usize,
+    shape: &HostShape,
+    w: &RAttn,
+    act: Dtype,
+    eps: f32,
+) -> Result<AttnLayerFacts, EngError> {
+    let a = &shape.attn;
+    Ok(AttnLayerFacts {
+        layer,
+        hidden: dim(shape.hidden)?,
+        heads: dim(a.heads_q)?,
+        kv_heads: dim(a.heads_kv)?,
+        width: dim(a.head_dim)?,
+        eps_bits: eps.to_bits(),
+        act: compile_key::dtype_key(act),
+        weights: [
+            weight_facts(&w.q)?,
+            weight_facts(&w.k)?,
+            weight_facts(&w.v)?,
+        ],
+    })
+}
+
 /// Whether this step runs its compiled form: the engine setting, or — in test builds only — the
 /// setting OR the `QWEN36_G2A_COMPILE` measurement override. A production build reads no
 /// environment variable here.
@@ -174,6 +206,31 @@ pub(super) fn delta_step(
         rec: got.rec,
         ring: got.ring,
     })
+}
+
+/// Runs the pre-RoPE head of one attention decode step (B = 1) through the compiled closure:
+/// the q, k, v projections, the q/gate split, the q/k RMS norms, and the `[1, heads, 1, D]`
+/// reshapes. The caller (`attn::step_compiled`) applies the position-scaled RoPE and the eager
+/// tail on the outputs.
+pub(super) fn attn_pre_step(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RAttn,
+    x: &crate::tensor::ExecutionTensor,
+) -> Result<crate::kernels::mlx::native::compile::CompiledAttnPre, EngError> {
+    let a = &shape.attn;
+    let args = CompileAttnPreArgs {
+        x,
+        packed: [&w.q, &w.k, &w.v],
+        norms: [&w.q_norm, &w.k_norm],
+        hidden: dim(shape.hidden)?,
+        heads: dim(a.heads_q)?,
+        kv_heads: dim(a.heads_kv)?,
+        width: dim(a.head_dim)?,
+        eps: shape.eps,
+        act: ctx.consts.act,
+    };
+    ctx.kernels.compiled_attn_pre(&args)
 }
 
 /// Runs B2/4/8 rows with distinct persistent state pairs in row order.
@@ -283,8 +340,9 @@ pub(super) fn moe_step_device(
 }
 
 /// The `compile_counters` object of the reports: the traced, cached, and
-/// total calls over both blocks, then the per-block rows (cache key, calls, traces, the seconds
-/// of the first calls) and the cache clears. `kernels` supplies the process-wide counters.
+/// total calls over the three block kinds, then the per-block rows (cache key, calls, traces,
+/// the seconds of the first calls) and the cache clears. `kernels` supplies the process-wide
+/// counters.
 #[cfg(test)]
 fn counters(kernels: &crate::kernels::MlxKernels) -> serde_json::Value {
     let stats = kernels.compile_counters();
@@ -304,6 +362,7 @@ fn counters(kernels: &crate::kernels::MlxKernels) -> serde_json::Value {
         "cache_hits": hits,
         "delta": block(&stats.delta),
         "moe": block(&stats.moe),
+        "attn": block(&stats.attn),
         "cache_clears": stats.cache_clears,
         "note": "traces are the native closure-body counts: a body entry means MLX traced the \
                  closure (or returned the uncompiled function, which runs the body on every \

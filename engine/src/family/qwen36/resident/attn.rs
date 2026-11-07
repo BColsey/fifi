@@ -560,6 +560,12 @@ pub(super) fn step(
     x: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
     check_cache(shape, &cache, pos)?;
+    // The compile seam replaces the projections, the q/gate split, and the q/k norms of the
+    // head with one compiled closure (B = 1 only); everything position- or length-dependent
+    // stays eager. The batched path (`batch::step_rows`) never compiles.
+    if super::compiled::step_requested(ctx.compile) {
+        return step_compiled(ctx, shape, w, cache, pos, x);
+    }
     // 1. The dense projections of the step: every one reads its weight in full
     // for one row, so the batched path (`batch::step_rows`) meets these three
     // weights in ONE qmm over `[B, hidden]` and only the core stays per slot.
@@ -567,6 +573,33 @@ pub(super) fn step(
     let kp = linear(ctx, &w.k, x)?;
     let vp = linear(ctx, &w.v, x)?;
     let (o, cache) = step_projected(ctx, shape, w, cache, pos, [&qp, &kp, &vp])?;
+    let out = linear(ctx, &w.o, &o)?;
+    Ok(AttnStep { out, cache })
+}
+
+/// The compiled B=1 path: the pre-RoPE head runs as one compiled closure (the projections,
+/// the q/gate split, the q/k norms, and the reshape of q/k/v to `[1, heads, 1, D]`), then the
+/// position-scaled RoPE, the cache append, the attention core, and the sigmoid gate stay eager
+/// — exactly the tail the eager path shares.
+fn step_compiled(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RAttn,
+    cache: KvCache,
+    pos: u32,
+    x: &ExecutionTensor,
+) -> Result<AttnStep, EngError> {
+    let pre = super::compiled::attn_pre_step(ctx, shape, w, x)?;
+    let a = &shape.attn;
+    let rope = RopeSpec {
+        dims: dim(a.rotary_dim)?,
+        base: a.theta,
+        scale: 1.0,
+        offset: pos,
+    };
+    let q = ctx.kernels.rope_scaled(&pre.q, &rope)?;
+    let k_new = ctx.kernels.rope_scaled(&pre.k, &rope)?;
+    let (o, cache) = step_tail(ctx, shape, w, cache, pos, &q, &k_new, &pre.v, &pre.gate)?;
     let out = linear(ctx, &w.o, &o)?;
     Ok(AttnStep { out, cache })
 }
@@ -602,10 +635,7 @@ pub(super) fn step_projected(
     let [qp, kp, vp] = projections;
     let a = &shape.attn;
     let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
-    let output_width = heads.checked_mul(width).ok_or_else(overflow)?;
-    let len = cache.len;
     let pair = width.checked_mul(2).ok_or_else(overflow)?;
-    let next_len = len.checked_add(1).ok_or_else(overflow)?;
     let rope = RopeSpec {
         dims: dim(a.rotary_dim)?,
         base: a.theta,
@@ -627,6 +657,31 @@ pub(super) fn step_projected(
     let k_new = ctx.kernels.rope_scaled(&k_new, &rope)?;
     // 4. New value.
     let v_new = ctx.kernels.reshape(vp, &[1, kv_heads, 1, width])?;
+    step_tail(ctx, shape, w, cache, pos, &q, &k_new, &v_new, &gate)
+}
+
+/// The shared tail after the RoPE: the cache-form casts, the cache append, the prefix/decode
+/// core, and the sigmoid output gate. Takes the ROPED query `[1, heads, 1, D]`, the ROPED new
+/// key `[1, KVH, 1, D]`, the new value `[1, KVH, 1, D]`, and the output gate `[heads, D]`;
+/// returns the gated attention output `[1, heads * width]` in the activation dtype, BEFORE
+/// `w.o` (so the batched path can stack all rows and project once).
+fn step_tail(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RAttn,
+    cache: KvCache,
+    pos: u32,
+    q: &ExecutionTensor,
+    k_new: &ExecutionTensor,
+    v_new: &ExecutionTensor,
+    gate: &ExecutionTensor,
+) -> Result<(ExecutionTensor, KvCache), EngError> {
+    check_cache(shape, &cache, pos)?;
+    let a = &shape.attn;
+    let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
+    let output_width = heads.checked_mul(width).ok_or_else(overflow)?;
+    let len = cache.len;
+    let next_len = len.checked_add(1).ok_or_else(overflow)?;
     // The cache form: the F32 control keeps its cast to F32 whatever the activation dtype, and
     // the Q8 form keeps the activation dtype, so the scales and biases of the quantization hold
     // it (BF16 in the serving default).

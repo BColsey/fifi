@@ -2852,6 +2852,156 @@ static int compile_moe_body(
   return status != 0 ? status : release;
 }
 
+// ===== Compiled attention pre-RoPE block =====
+// Replays the exact adapter-op sequence the eager attention decode step runs before the
+// position-scaled RoPE, at rows == 1: the q, k, v projections, the interleaved q/gate
+// split, and the q/k RMS norms. The RoPE itself stays eager because `mlx_fast_rope` takes
+// the offset as a C++ int, and a baked offset would retrace every position; the same rule
+// keeps the KV append (int slice bounds) eager. The body calls the same inference_mlx_*
+// entries the adapter exposes, in the same order as the eager path, so a replayed closure
+// must produce bit-identical outputs.
+// 12 inputs: x [1, hidden] in the activation dtype, then the q, k, v packed weights in the
+// (payload, scales, biases) triple order of the delta block, then q_norm and k_norm.
+// 4 outputs: q_normed [1, heads, 1, width], k_normed [1, kv_heads, 1, width],
+// v [1, kv_heads, 1, width], gate [heads, width], all in the activation dtype.
+static std::atomic<std::uint64_t> attn_pre_body_entries_{0};
+
+extern "C" std::uint64_t inference_mlx_compile_attn_pre_body_entries() noexcept {
+  return attn_pre_body_entries_.load(std::memory_order_relaxed);
+}
+
+struct CompileAttnPrePayload {
+  int hidden;
+  int heads, kv_heads, width;
+  float eps;
+  mlx_stream stream;
+  int mode[3];   // q, k, v projections
+  int group[3];
+  int bits[3];
+};
+
+static void compile_attn_pre_payload_free(void* raw) noexcept {
+  CompileAttnPrePayload* payload = static_cast<CompileAttnPrePayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+static int compile_attn_pre_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  attn_pre_body_entries_.fetch_add(1, std::memory_order_relaxed);
+  const CompileAttnPrePayload* p = static_cast<const CompileAttnPrePayload*>(raw);
+  compile_touching("attn pre closure input vector");
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 12) {
+    return 1;
+  }
+  compile_touching("attn pre closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 12; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  const int* x_shape = mlx_array_shape(in.values[0]);
+  if (mlx_array_ndim(in.values[0]) != 2 || x_shape == nullptr || x_shape[0] != 1 ||
+      x_shape[1] != p->hidden) {
+    return 1;
+  }
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) return 1;
+  const mlx_stream s = p->stream;
+  const int pair = p->width * 2;
+  const int one_hidden[2] = {1, p->hidden};
+  const int heads_pair[2] = {p->heads, pair};
+  const int heads_width[2] = {p->heads, p->width};
+  const int kv_width[2] = {p->kv_heads, p->width};
+  const int q4_shape[4] = {1, p->heads, 1, p->width};
+  const int k4_shape[4] = {1, p->kv_heads, 1, p->width};
+  const int q_start[2] = {0, 0};
+  const int q_stop[2] = {p->heads, p->width};
+  const int gate_start[2] = {0, p->width};
+  const int gate_stop[2] = {p->heads, pair};
+  const int strides2[2] = {1, 1};
+  CompileScopeArray x_flat, q_full, k_full, v_full, qp, q_raw, gate, q_normed, kp, k_normed;
+  CompileScopeArray q4, k4, v4;
+  int status = inference_mlx_reshape(&x_flat.value, in.values[0], one_hidden, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &q_full.value, x_flat.value, in.values[1], in.values[2], in.values[3], true,
+        compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
+        compile_quant_mode(p->mode[0]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &k_full.value, x_flat.value, in.values[4], in.values[5], in.values[6], true,
+        compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
+        compile_quant_mode(p->mode[1]), s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &v_full.value, x_flat.value, in.values[7], in.values[8], in.values[9], true,
+        compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
+        compile_quant_mode(p->mode[2]), s);
+  if (status == 0) status = inference_mlx_reshape(&qp.value, q_full.value, heads_pair, 2, s);
+  if (status == 0) status = inference_mlx_slice(&q_raw.value, qp.value, q_start, q_stop, strides2, 2, s);
+  if (status == 0) status = inference_mlx_slice(&gate.value, qp.value, gate_start, gate_stop, strides2, 2, s);
+  if (status == 0) status = inference_mlx_rms_norm(&q_normed.value, q_raw.value, in.values[10], p->eps, s);
+  if (status == 0) status = inference_mlx_reshape(&kp.value, k_full.value, kv_width, 2, s);
+  if (status == 0) status = inference_mlx_rms_norm(&k_normed.value, kp.value, in.values[11], p->eps, s);
+  if (status == 0) status = inference_mlx_reshape(&q4.value, q_normed.value, q4_shape, 4, s);
+  if (status == 0) status = inference_mlx_reshape(&k4.value, k_normed.value, k4_shape, 4, s);
+  if (status == 0) status = inference_mlx_reshape(&v4.value, v_full.value, k4_shape, 4, s);
+  compile_touching("attn pre body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, q4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, k4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, v4.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, gate.value);
+  compile_touching("attn pre closure result vector");
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// Compiles the attention pre-RoPE block under the fixed cache key `fun_id` (shapeless true
+// over the fixed B=1 shapes, like the delta block) and applies it once; the outputs are lazy.
+extern "C" int inference_mlx_compile_attn_pre_block(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* gate, const mlx_array* inputs,
+    size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(q, stream, [&]() noexcept {
+    if (inputs_num != 12) return 1;
+    CompileAttnPrePayload* payload =
+        static_cast<CompileAttnPrePayload*>(std::malloc(sizeof(CompileAttnPrePayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->heads = dims[1];
+    payload->kv_heads = dims[2];
+    payload->width = dims[3];
+    payload->eps = eps;
+    payload->stream = stream;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 3; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
+    const int status = compile_apply_block(
+        outputs, 4, compile_attn_pre_body, payload, compile_attn_pre_payload_free, inputs,
+        inputs_num, fun_id);
+    *q = outputs[0];
+    *k = outputs[1];
+    *v = outputs[2];
+    *gate = outputs[3];
+    return status;
+  });
+}
+
 // Builds a payload closure, compiles it under the fixed cache key `fun_id` (shapeless false),
 // applies it to `inputs`, checks the output count, extracts the outputs, and frees every handle
 // on every path. `outputs` holds the extracted arrays when the status is zero.
@@ -3365,15 +3515,19 @@ extern "C" int inference_mlx_compile_clear_cache() noexcept {
   return status;
 }
 
-// Reads the process-wide counts of compiled closure-body entries of the two block kinds: the
-// authoritative trace counts of the seam (see the statics above). Null pointers read nothing.
+// Reads the process-wide counts of compiled closure-body entries of the three block kinds:
+// the authoritative trace counts of the seam (see the statics above). Null pointers read
+// nothing.
 extern "C" void inference_mlx_compile_trace_counts(
-    uint64_t* delta, uint64_t* moe) noexcept {
+    uint64_t* delta, uint64_t* moe, uint64_t* attn) noexcept {
   if (delta != nullptr) {
     *delta = compile_delta_body_entries_.load(std::memory_order_relaxed);
   }
   if (moe != nullptr) {
     *moe = compile_moe_body_entries_.load(std::memory_order_relaxed);
+  }
+  if (attn != nullptr) {
+    *attn = attn_pre_body_entries_.load(std::memory_order_relaxed);
   }
 }
 
@@ -3382,4 +3536,5 @@ extern "C" void inference_mlx_compile_trace_counts(
 extern "C" void inference_mlx_compile_reset_trace_counts() noexcept {
   compile_delta_body_entries_.store(0, std::memory_order_relaxed);
   compile_moe_body_entries_.store(0, std::memory_order_relaxed);
+  attn_pre_body_entries_.store(0, std::memory_order_relaxed);
 }

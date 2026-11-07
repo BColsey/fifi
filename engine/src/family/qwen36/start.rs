@@ -92,16 +92,18 @@ pub(crate) fn start(
         let (mut executor, session) =
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?;
         stages.begin("planning the prefill chunk");
-        let (delta_warmup, moe_warmup) = executor.compile_warmup_seconds();
-        if !delta_warmup.is_empty() || !moe_warmup.is_empty() {
+        let (delta_warmup, moe_warmup, attn_warmup) = executor.compile_warmup_seconds();
+        if !delta_warmup.is_empty() || !moe_warmup.is_empty() || !attn_warmup.is_empty() {
             let total = |seconds: &[f64]| seconds.iter().sum::<f64>();
             eprintln!(
-                "q36 compile: warm-up traced {} delta program(s) in {:.3} s and {} moe program(s) \
-                 in {:.3} s",
+                "q36 compile: warm-up traced {} delta program(s) in {:.3} s, {} moe program(s) \
+                 in {:.3} s, and {} attn program(s) in {:.3} s",
                 delta_warmup.len(),
                 total(delta_warmup),
                 moe_warmup.len(),
-                total(moe_warmup)
+                total(moe_warmup),
+                attn_warmup.len(),
+                total(attn_warmup)
             );
         }
         if let Some(line) = plan_prefill(&mut executor, &owned)? {

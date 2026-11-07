@@ -187,6 +187,40 @@ pub(crate) struct CompiledMoe {
     pub(crate) health: ExecutionTensor,
 }
 
+/// The flat input list and the baked constants of one compiled attention pre-RoPE decode
+/// step. Every tensor must belong to this adapter.
+pub(crate) struct CompileAttnPreArgs<'a> {
+    /// The layer input `[1, H]` in the activation dtype (B = 1 only).
+    pub(crate) x: &'a ExecutionTensor,
+    /// The q (with interleaved gate), k, v packed weights.
+    pub(crate) packed: [&'a ResidentPackedWeight; 3],
+    /// The q and k norm weights, in the activation dtype.
+    pub(crate) norms: [&'a ExecutionTensor; 2],
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) width: u32,
+    pub(crate) eps: f32,
+    /// The activation dtype of the step and of all four outputs, and part of the compile cache
+    /// key.
+    pub(crate) act: Dtype,
+}
+
+/// The outputs of one compiled attention pre-RoPE step, all lazy: the q/k/v tensors after the
+/// projections, the q/gate split, and the q/k RMS norms, with the q/k reshaped to `[1, heads,
+/// 1, D]` for the eager RoPE that follows. RoPE, the cache append, and the attention core stay
+/// eager (position-dependent).
+pub(crate) struct CompiledAttnPre {
+    /// The normed query `[1, heads, 1, width]` in the activation dtype.
+    pub(crate) q: ExecutionTensor,
+    /// The normed new key `[1, kv_heads, 1, width]` in the activation dtype.
+    pub(crate) k: ExecutionTensor,
+    /// The new value `[1, kv_heads, 1, width]` in the activation dtype.
+    pub(crate) v: ExecutionTensor,
+    /// The output gate `[heads, width]` in the activation dtype.
+    pub(crate) gate: ExecutionTensor,
+}
+
 /// Checks one flat input list of a compiled block before admission. Every tensor must belong
 /// to `adapter`. `x` must carry the activation dtype of the step exactly, and the adapter must
 /// take that dtype — BF16 needs `allow_bf16`, the rule of the uncompiled `cast`. The F32
@@ -578,7 +612,11 @@ impl Context {
                 status
             }
         });
-        super::super::compile_stats::record(true, fun_id, started.elapsed().as_secs_f64());
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Delta,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
         // The layer output carries the activation dtype (the block ends in `to_act`); the
         // recurrence state and the ring stay F32.
         let hidden_bytes = u64::from(batch) * u64::from(args.hidden) * args.act.byte_width();
@@ -849,7 +887,11 @@ impl Context {
                 stream,
             )
         });
-        super::super::compile_stats::record(false, fun_id, started.elapsed().as_secs_f64());
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Moe,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
         // The layer output carries the activation dtype (the block ends in `to_act`); the route
         // stays exactly the uncompiled route: U32 ids, F32 gates, F32 health.
         // B is bounded by 8 and each width is u32, so these byte counts fit u64.
@@ -890,6 +932,199 @@ impl Context {
         })
     }
 
+    /// Runs the pre-RoPE head of one attention decode step (`attn.rs` `step` projections plus
+    /// the head of `step_projected`: the q, k, v projections, the q/gate split, the q/k RMS
+    /// norms) through one `mlx_compile`d closure and returns the normed q/k and the raw v,
+    /// reshaped to `[1, heads, 1, D]`, plus the gate, all lazy. RoPE, the cache append, the
+    /// attention core, and the sigmoid gate stay eager (position- or cache-length-dependent).
+    /// B = 1 only; the batched path stays eager.
+    ///
+    /// Inputs: `x` `[1, H]` in the activation dtype, the q, k, v packed weights with the logical
+    /// shapes `[heads*2*D, H]`, `[kv*D, H]`, `[kv*D, H]`, and the q and k norm weights
+    /// `[heads, D]`, `[kv, D]` in the activation dtype. Every tensor must belong to this
+    /// adapter; `check_operand` plus the logical shapes reject anything else before the first
+    /// native call.
+    ///
+    /// Baked constants: the four dimensions, the RMS norm epsilon, the activation dtype, and per
+    /// packed weight the scale dtype and the quantization triple. They form the compile cache
+    /// key (`compile_key::attn_pre_fun_id`); the per-adapter registry admits it BEFORE any
+    /// native call. No fallback: a failure is a native failure, with the same discipline as
+    /// [`Context::compiled_delta_step`].
+    pub(in crate::kernels::mlx) fn compiled_attn_pre_step(
+        &mut self,
+        args: &CompileAttnPreArgs<'_>,
+    ) -> Result<CompiledAttnPre, EngError> {
+        let label = "compiled attention pre block";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        check_float(label, args.act)?;
+        let adapter = self.state.as_mut().unwrap();
+        if args.heads == 0 || args.kv_heads == 0 || args.width == 0 || args.kv_heads > args.heads {
+            return Err(EngError::BadRequest(
+                "compile seam attention block needs heads >= kv_heads >= 1 and width >= 1".into(),
+            ));
+        }
+        let pair = args
+            .width
+            .checked_mul(2)
+            .ok_or_else(|| EngError::BadRequest("compile seam attention width overflows".into()))?;
+        let q_out = args
+            .heads
+            .checked_mul(pair)
+            .ok_or_else(|| EngError::BadRequest("compile seam attention dims overflow".into()))?;
+        let kv_out = args
+            .kv_heads
+            .checked_mul(args.width)
+            .ok_or_else(|| EngError::BadRequest("compile seam attention dims overflow".into()))?;
+        match args.x.shape() {
+            &[1, hidden] if hidden == args.hidden => (),
+            _ => {
+                return Err(EngError::BadRequest(
+                    "compile seam attention input must have shape [1, H]".into(),
+                ));
+            }
+        }
+        if args.norms[0].shape() != [args.heads, args.width]
+            || args.norms[1].shape() != [args.kv_heads, args.width]
+        {
+            return Err(EngError::BadRequest(
+                "compile seam inputs differ from the attention block norm shapes".into(),
+            ));
+        }
+        for (what, weight, want) in [
+            ("q", &args.packed[0], [q_out, args.hidden]),
+            ("k", &args.packed[1], [kv_out, args.hidden]),
+            ("v", &args.packed[2], [kv_out, args.hidden]),
+        ] {
+            check_logical(label, what, weight, &want)?;
+        }
+        check_block_inputs(
+            label,
+            adapter,
+            args.x,
+            args.act,
+            &[],
+            args.packed.as_slice(),
+        )?;
+        for norm in args.norms {
+            check_operand(label, adapter, norm)?;
+            if norm.dtype() != args.act {
+                return Err(EngError::BadRequest(format!(
+                    "{label}: a norm weight carries {:?}, the activation dtype is {:?}",
+                    norm.dtype(),
+                    args.act
+                )));
+            }
+        }
+        let dims: [i32; 4] = [
+            native_dim(label, args.hidden)?,
+            native_dim(label, args.heads)?,
+            native_dim(label, args.kv_heads)?,
+            native_dim(label, args.width)?,
+        ];
+        let triples = quant_triples(args.packed)?;
+        let quant: Vec<i32> = triples
+            .iter()
+            .flat_map(|triple| triple.iter().copied())
+            .collect();
+        let scale_keys = args
+            .packed
+            .each_ref()
+            .map(|weight| compile_key::dtype_key(weight.scales().dtype()));
+        let [tq, tk, tv] = triples;
+        let fun_id = compile_key::attn_pre_fun_id(&compile_key::AttnPreBaked {
+            hidden: args.hidden,
+            heads: args.heads,
+            kv_heads: args.kv_heads,
+            width: args.width,
+            eps_bits: args.eps.to_bits(),
+            act: compile_key::dtype_key(args.act),
+            scale_keys,
+            quant: [tq, tk, tv],
+        });
+        adapter.programs.admit(fun_id)?;
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(12);
+        inputs.push(args.x.storage.native_array());
+        for weight in args.packed {
+            inputs.push(weight.payload().storage.native_array());
+            inputs.push(weight.scales().storage.native_array());
+            inputs.push(
+                weight
+                    .biases()
+                    .map(|biases| biases.storage.native_array())
+                    .unwrap_or(ffi::NULL_ARRAY),
+            );
+        }
+        inputs.push(args.norms[0].storage.native_array());
+        inputs.push(args.norms[1].storage.native_array());
+        let mut keep: Vec<_> = [args.x, args.norms[0], args.norms[1]]
+            .into_iter()
+            .map(|tensor| tensor.share())
+            .collect();
+        for weight in args.packed {
+            keep.push(weight.payload().share());
+            keep.push(weight.scales().share());
+            if let Some(biases) = weight.biases() {
+                keep.push(biases.share());
+            }
+        }
+        clear_message();
+        let stream = adapter.stream.0;
+        let (mut q_a, mut k_a, mut v_a, mut gate_a) =
+            (Array::null(), Array::null(), Array::null(), Array::null());
+        let started = std::time::Instant::now();
+        let built = produce(&mut q_a, label, |slot| unsafe {
+            ffi::mlx_compile_attn_pre_block(
+                slot,
+                &mut k_a.0,
+                &mut v_a.0,
+                &mut gate_a.0,
+                inputs.as_ptr(),
+                inputs.len(),
+                dims.as_ptr(),
+                quant.as_ptr(),
+                args.eps,
+                native_dtype(args.act),
+                fun_id as usize,
+                stream,
+            )
+        });
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Attn,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
+        // All four outputs carry the activation dtype; the widths are u32 products that fit u64.
+        // The q and gate outputs hold heads*width elements each; k and v hold kv_heads*width.
+        let width = args.act.byte_width();
+        let q_bytes = u64::from(args.heads) * u64::from(args.width) * u64::from(width);
+        let kv_bytes = u64::from(kv_out) * u64::from(width);
+        let q_shape = vec![1, args.heads, 1, args.width];
+        let kv_shape = vec![1, args.kv_heads, 1, args.width];
+        let gate_shape = vec![args.heads, args.width];
+        let checked = built.and_then(|()| {
+            if native_output_valid(q_a.0, &q_shape, args.act, q_bytes)
+                && native_output_valid(k_a.0, &kv_shape, args.act, kv_bytes)
+                && native_output_valid(v_a.0, &kv_shape, args.act, kv_bytes)
+                && native_output_valid(gate_a.0, &gate_shape, args.act, q_bytes)
+            {
+                Ok(())
+            } else {
+                Err(failure(label))
+            }
+        });
+        if checked.is_err() {
+            mark_failed();
+        }
+        checked?;
+        Ok(CompiledAttnPre {
+            q: adapter.resident(q_a, args.act, q_shape, q_bytes),
+            k: adapter.resident(k_a, args.act, kv_shape.clone(), kv_bytes),
+            v: adapter.resident(v_a, args.act, kv_shape, kv_bytes),
+            gate: adapter.resident(gate_a, args.act, gate_shape, q_bytes),
+        })
+    }
+
     /// Clears the calling thread's MLX compile cache and counts it, so the first compiled call
     /// after the clear is a clean compile. The MLX compile cache is thread-local, so the clear
     /// covers the adapters of THIS thread. The measurement harness of the test builds uses this
@@ -914,12 +1149,12 @@ impl Context {
 /// counter read, so a retrace that the Rust-side key comparison cannot see (a shape or dtype
 /// drift under one key, `MLX_DISABLE_COMPILE`, a second engine thread's own thread-local
 /// cache) still shows in `traces`.
-pub(in crate::kernels::mlx) fn native_trace_counts() -> (u64, u64) {
-    let (mut delta, mut moe) = (0u64, 0u64);
+pub(in crate::kernels::mlx) fn native_trace_counts() -> (u64, u64, u64) {
+    let (mut delta, mut moe, mut attn) = (0u64, 0u64, 0u64);
     // Safe on any thread: the counts are static atomics in the native seam and the pointers
-    // point at the two locals above.
-    unsafe { ffi::mlx_compile_trace_counts(&mut delta, &mut moe) };
-    (delta, moe)
+    // point at the three locals above.
+    unsafe { ffi::mlx_compile_trace_counts(&mut delta, &mut moe, &mut attn) };
+    (delta, moe, attn)
 }
 
 /// Zeroes the native closure-body entry counts. Test builds only: `compile_stats::reset` calls

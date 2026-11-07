@@ -839,17 +839,37 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// The attention pre-RoPE block as one compiled closure (behind `qwen36.compile`).
+    /// `dims` holds hidden, heads, kv_heads, width; `quant` holds mode, group, bits per weight
+    /// for the q, k, v projections; `inputs` holds the 12 closure inputs (x, then the q, k, v
+    /// packed triples, then q_norm, k_norm); `eps` is the RMS norm epsilon. The four outputs
+    /// (q, k, v, gate) are lazy. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_compile_attn_pre_block"]
+    pub(super) fn mlx_compile_attn_pre_block(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        gate: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        eps: f32,
+        activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
     /// Clears the calling thread's MLX compile cache: the measurement harness between runs
     /// and the adapter teardown, after its pending work completed and before its stream and
     /// device are released. The cache is thread-local.
     #[link_name = "inference_mlx_compile_clear_cache"]
     pub(super) fn mlx_compile_clear_cache() -> i32;
-    /// Reads the process-wide counts of compiled closure-body entries of the two block kinds:
+    /// Reads the process-wide counts of compiled closure-body entries of the three block kinds:
     /// the authoritative trace counts of the seam. A body entry means MLX traced the closure
     /// (or returned the uncompiled function, which runs the body on every call); a cache hit
     /// replays the compiled tape without entering the body.
     #[link_name = "inference_mlx_compile_trace_counts"]
-    pub(super) fn mlx_compile_trace_counts(delta: *mut u64, moe: *mut u64);
+    pub(super) fn mlx_compile_trace_counts(delta: *mut u64, moe: *mut u64, attn: *mut u64);
     /// Zeroes the counts of [`mlx_compile_trace_counts`]. Test builds only, from the test-only
     /// counter reset of `compile_stats`.
     #[cfg(test)]

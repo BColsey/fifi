@@ -50,7 +50,7 @@ use super::executor::{Q36Executor, Q36Rules};
 use super::moe;
 use super::moe::Routing;
 use super::ops::{Ctx, cast_to, dim, f32_tensor, values};
-use super::weights::{RDelta, RMixer, RMoe};
+use super::weights::{RAttn, RDelta, RMixer, RMoe};
 use crate::EngError;
 use crate::family::qwen36::host::HostShape;
 use crate::family::qwen36::host_load::HostWeights;
@@ -147,6 +147,17 @@ fn first_delta(weights: &super::weights::ResidentWeights) -> Result<&RDelta, Eng
             RMixer::Attn(_) => None,
         })
         .ok_or_else(|| EngError::BadRequest("no DeltaNet layer".into()))
+}
+
+fn first_attn(weights: &super::weights::ResidentWeights) -> Result<&RAttn, EngError> {
+    weights
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.mixer {
+            RMixer::Attn(w) => Some(w),
+            RMixer::Delta(_) => None,
+        })
+        .ok_or_else(|| EngError::BadRequest("no attention layer".into()))
 }
 
 fn first_moe(weights: &super::weights::ResidentWeights) -> Result<&RMoe, EngError> {
@@ -630,7 +641,7 @@ fn compiled_delta_rows_refuse_one_tap_but_keep_solo_tiny() {
 /// Mutation check (the warm-up-skipped patch): with the warm-up removed, both counters read
 /// zero traces here and the test fails.
 #[test]
-fn the_warm_up_traces_both_blocks_once_before_the_first_token() {
+fn the_warm_up_traces_every_block_kind_once_before_the_first_token() {
     let _serial = crate::native_test_lock();
     reset_compile_state();
     let (ckpt, host) = tiny_host();
@@ -646,8 +657,10 @@ fn the_warm_up_traces_both_blocks_once_before_the_first_token() {
     let stats = decoder.kernels.compile_counters();
     assert_eq!(stats.delta.traces, 1, "the delta warm-up traced once");
     assert_eq!(stats.moe.traces, 1, "the moe warm-up traced once");
+    assert_eq!(stats.attn.traces, 1, "the attn warm-up traced once");
     assert_eq!(stats.delta.calls, 1, "one warm-up call per block kind");
     assert_eq!(stats.moe.calls, 1, "one warm-up call per block kind");
+    assert_eq!(stats.attn.calls, 1, "one warm-up call per block kind");
     assert_eq!(
         stats.delta.call_seconds.len(),
         1,
@@ -695,27 +708,44 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
         .unwrap();
     let after_chunks = decoder.kernels.compile_counters();
     assert_eq!(
-        (after_chunks.delta.traces, after_chunks.moe.traces),
-        (1, 1),
+        (
+            after_chunks.delta.traces,
+            after_chunks.moe.traces,
+            after_chunks.attn.traces
+        ),
+        (1, 1, 1),
         "only the load-time warm-up traced"
     );
     assert_eq!(
-        (after_chunks.delta.calls, after_chunks.moe.calls),
-        (1, 1),
+        (
+            after_chunks.delta.calls,
+            after_chunks.moe.calls,
+            after_chunks.attn.calls
+        ),
+        (1, 1, 1),
         "the chunked prefill made no compiled call"
     );
-    // One one-token step: the compiled decode path. The tiny model has two DeltaNet layers and
-    // four MoE layers, and `Prompt` skips the head and the LAST layer's MoE.
+    // One one-token step: the compiled decode path. The tiny model has two DeltaNet layers,
+    // two attention layers, and four MoE layers, and `Prompt` skips the head and the LAST
+    // layer's MoE.
     decoder.step(&mut state, 3, StepMode::Prompt).unwrap();
     let after_step = decoder.kernels.compile_counters();
     assert_eq!(
-        (after_step.delta.calls, after_step.moe.calls),
-        (3, 4),
-        "the one-token step ran 2 compiled delta and 3 compiled moe blocks"
+        (
+            after_step.delta.calls,
+            after_step.moe.calls,
+            after_step.attn.calls
+        ),
+        (3, 4, 3),
+        "the one-token step ran 2 compiled delta, 3 compiled moe, and 2 compiled attn blocks"
     );
     assert_eq!(
-        (after_step.delta.traces, after_step.moe.traces),
-        (1, 1),
+        (
+            after_step.delta.traces,
+            after_step.moe.traces,
+            after_step.attn.traces
+        ),
+        (1, 1, 1),
         "the one-token step traced nothing new"
     );
     reset_compile_state();
@@ -871,6 +901,74 @@ fn compiled_and_uncompiled_deltanet_blocks_agree_in_f32_tiny() {
     assert!(max_abs_diff(&p_out, &c_out) <= 5e-5, "tiny out differs");
     assert!(max_abs_diff(&p_rec, &c_rec) <= 5e-5, "tiny rec differs");
     assert!(max_abs_diff(&p_ring, &c_ring) <= 5e-5, "tiny ring differs");
+    reset_compile_state();
+}
+
+/// The attention half of the tiny-model gate, plain suite: `attn::step` through the compiled
+/// pre-RoPE closure (the whole compiled path: closure, eager RoPE, shared tail) agrees with the
+/// eager step — the layer output within 5e-5 in F32 at every position of a growing cache — and
+/// the compiled step counts one compiled call per layer. The two arms advance two caches that
+/// share no buffer, so the in-place append of one arm never feeds the other.
+#[test]
+fn compiled_and_uncompiled_attention_blocks_agree_in_f32_tiny() {
+    let _serial = crate::native_test_lock();
+    reset_compile_state();
+    assert!(
+        !compiled::requested(),
+        "the uncompiled arm must stay uncompiled (unset QWEN36_G2A_COMPILE)"
+    );
+    let (ckpt, host) = tiny_host();
+    let mut decoder = ResidentDecoder::new_with_activation(
+        MlxKernels::try_new().unwrap(),
+        &ckpt,
+        host,
+        64,
+        Activation::F32,
+    )
+    .unwrap();
+    let shape = decoder.weights.shape.clone();
+    let w = first_attn(&decoder.weights).unwrap();
+    let hidden = dim(shape.hidden).unwrap();
+    let mut cache = super::attn::KvCache::with_step(3);
+    for pos in 0u32..5 {
+        let x_values = lcg_values(0x5147_5157_u64.wrapping_add(u64::from(pos)), hidden, 0.5);
+        let hosts = [f32_tensor(vec![1, hidden], &x_values).unwrap()];
+        let x_zero = decoder.kernels.import_many(&[&hosts[0]]).unwrap()[0].share();
+        let mut ctx = Ctx {
+            kernels: &mut decoder.kernels,
+            consts: &decoder.weights.consts,
+            compile: false,
+        };
+        let x = cast_to(&mut ctx, &x_zero, Activation::F32.dtype()).unwrap();
+        // The eager arm: the uncompiled step on its own cache.
+        let eager_cache = cache.share();
+        let plain = super::attn::step(&mut ctx, &shape, w, eager_cache, pos, &x).unwrap();
+        // The compiled arm: the same step with the seam on, on the twin cache.
+        ctx.compile = true;
+        let twin = cache.share();
+        let compiled_run = super::attn::step(&mut ctx, &shape, w, twin, pos, &x).unwrap();
+        cache = compiled_run.cache;
+        assert_same_metadata("block output", &plain.out, &compiled_run.out);
+        ctx.kernels
+            .evaluate(&[&plain.out, &compiled_run.out])
+            .unwrap();
+        let (p, c) = (
+            values(ctx.kernels, &plain.out).unwrap(),
+            values(ctx.kernels, &compiled_run.out).unwrap(),
+        );
+        assert_finite(
+            "tiny f32 attention outputs",
+            &[&plain.out, &compiled_run.out],
+        );
+        assert!(
+            max_abs_diff(&p, &c) <= 5e-5,
+            "tiny attention out differs at pos {pos}: {}",
+            max_abs_diff(&p, &c)
+        );
+    }
+    // Five compiled calls, one trace: the first step traced the closure, the rest replayed it.
+    let stats = decoder.kernels.compile_counters();
+    assert_eq!((stats.attn.calls, stats.attn.traces), (5, 1));
     reset_compile_state();
 }
 

@@ -47,18 +47,27 @@ pub(crate) mod compile_stats {
         pub(crate) call_seconds: Vec<f64>,
     }
 
+    /// Which compiled block kind a call belongs to: the three counters of the seam.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Delta,
+        Moe,
+        Attn,
+    }
+
     #[derive(Clone, Default)]
     pub struct Stats {
         pub(crate) delta: Block,
         pub(crate) moe: Block,
+        pub(crate) attn: Block,
         pub(crate) cache_clears: u64,
     }
 
     impl Stats {
         #[cfg(test)]
         pub(crate) fn totals(&self) -> (u64, u64, u64) {
-            let calls = self.delta.calls + self.moe.calls;
-            let traces = self.delta.traces + self.moe.traces;
+            let calls = self.delta.calls + self.moe.calls + self.attn.calls;
+            let traces = self.delta.traces + self.moe.traces + self.attn.traces;
             (calls, traces, calls - traces)
         }
     }
@@ -76,9 +85,10 @@ pub(crate) mod compile_stats {
 
     pub(crate) fn read() -> Stats {
         let mut stats = locked().clone();
-        let (delta, moe) = super::native::compile::native_trace_counts();
+        let (delta, moe, attn) = super::native::compile::native_trace_counts();
         stats.delta.traces = delta;
         stats.moe.traces = moe;
+        stats.attn.traces = attn;
         stats
     }
 
@@ -93,12 +103,12 @@ pub(crate) mod compile_stats {
 
     /// Whether the call TRACED is not decided here — the native body-entry count is the
     /// authority, read at every `read`.
-    pub(crate) fn record(delta: bool, fun_id: u64, seconds: f64) {
+    pub(crate) fn record(kind: Kind, fun_id: u64, seconds: f64) {
         let mut stats = locked();
-        let block = if delta {
-            &mut stats.delta
-        } else {
-            &mut stats.moe
+        let block = match kind {
+            Kind::Delta => &mut stats.delta,
+            Kind::Moe => &mut stats.moe,
+            Kind::Attn => &mut stats.attn,
         };
         block.fun_id.get_or_insert(fun_id);
         if !block.seen.contains(&fun_id) {
@@ -2065,6 +2075,18 @@ impl MlxKernels {
         args: &native::compile::CompileMoeArgs<'_>,
     ) -> Result<native::compile::CompiledMoe, EngError> {
         self.context.compiled_moe_step(args)
+    }
+
+    /// The pre-RoPE head of one attention decode step (projections, q/gate split, q/k norms)
+    /// through one `mlx_compile`d closure: the `qwen36.compile` product seam behind the
+    /// resident decoder. The closure, its cache key, its inputs, its baked constants, its
+    /// dtype rules, and its no-fallback failure discipline are documented on the `Context`
+    /// method of the same name in `kernels/mlx/native/compile.rs`.
+    pub(crate) fn compiled_attn_pre(
+        &mut self,
+        args: &native::compile::CompileAttnPreArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPre, EngError> {
+        self.context.compiled_attn_pre_step(args)
     }
 
     /// The Flint decode tail (post-attention residual + RMS + dense SwiGLU) through one
