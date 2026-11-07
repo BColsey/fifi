@@ -68,6 +68,12 @@ fn launch(
     settings: &FlashSettings,
     ready_note: ReadyNote,
 ) -> Result<(Engine, TokenizerBundle), EngError> {
+    if settings.cuda.is_some() {
+        return Err(EngError::BadRequest(
+            "engine config: cuda_decode needs a build with --features native-cuda on Linux; this build serves Flash-Next on MLX"
+                .to_string(),
+        ));
+    }
     super::start::start(settings, ready_note)
 }
 
@@ -148,5 +154,23 @@ mod tests {
         };
         let text = message(start(Some(&options), &FlashEnv::default()));
         assert!(text.contains("native-mlx"), "{text}");
+    }
+
+    /// A CUDA build with the switch off names the switch (and the MLX alternative).
+    #[cfg(all(
+        feature = "native-cuda",
+        target_os = "linux",
+        not(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))
+    ))]
+    #[test]
+    fn a_cuda_build_with_the_switch_off_names_cuda_decode() {
+        use std::path::PathBuf;
+        let options = FlashOptions {
+            manifest: Some(PathBuf::from("/does/not/exist/download-manifest.json")),
+            cache_limit_bytes: Some(1024),
+            ..FlashOptions::default()
+        };
+        let text = message(start(Some(&options), &FlashEnv::default()));
+        assert!(text.contains("cuda_decode"), "{text}");
     }
 }

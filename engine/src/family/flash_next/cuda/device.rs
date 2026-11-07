@@ -26,6 +26,7 @@ use crate::{
             exl3_moe::Exl3MoeBufs,
             moe::{Launch, MoeDims},
         },
+        qwen36::exl3_tensors::f32_le_bytes,
     },
     kernels::cuda::resident::step_params::{StepParams, StepStatus},
 };
@@ -40,10 +41,6 @@ impl MoeBlock for SplitMoe<'_> {
     ) -> Result<(), EngError> {
         SplitMoe::run(self, launch, layer, bufs, dims)
     }
-}
-
-fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 pub(super) struct CardDevice {
@@ -86,7 +83,7 @@ impl StartSink for CardDevice {
         let range = self.step.slot(Slot::Stream)?;
         range
             .buffer()
-            .write_at(self.step.stream, range.offset(), &f32_bytes(stream))
+            .write_at(self.step.stream, range.offset(), &f32_le_bytes(stream))
     }
 
     /// The PLE projections stage their own embedding; the start needs no copy of it.
@@ -141,5 +138,9 @@ impl TokenDevice for CardDevice {
 
     fn reset(&mut self) -> Result<(), EngError> {
         self.step.reset()
+    }
+
+    fn bank_misses(&self) -> Option<u64> {
+        Some(CardDevice::bank_misses(self))
     }
 }

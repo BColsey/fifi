@@ -102,6 +102,55 @@ fn a_device_failure_poisons_the_driver_until_reset() {
     assert!(log.contains(&"params 2 0".to_string()), "{log:?}");
 }
 
+/// Every failure after the first write to the card poisons the driver, whichever call it is in.
+#[test]
+fn a_failure_at_any_device_call_after_the_first_write_poisons() {
+    for call in [
+        "params",
+        "stream",
+        "begin",
+        "layers",
+        "read_stream",
+        "write_back",
+        "health",
+    ] {
+        let mut driver = driver();
+        driver.device.fail = Some(call);
+        assert!(driver.feed(1).is_err(), "{call}");
+        assert_eq!(driver.fed(), 0, "{call}");
+        let again = driver.feed(1).unwrap_err();
+        assert!(
+            matches!(&again, EngError::BadRequest(text) if text.contains("needs a reset")),
+            "{call}: {again:?}"
+        );
+        driver.reset().unwrap();
+        driver.feed(1).unwrap();
+    }
+}
+
+#[test]
+fn a_failed_ple_update_poisons_and_keeps_the_position() {
+    let mut driver = driver();
+    driver.feeds.fail_update = true;
+    assert!(matches!(
+        driver.feed(1).unwrap_err(),
+        EngError::Checkpoint(_)
+    ));
+    assert_eq!(driver.fed(), 0);
+    assert!(driver.feed(1).is_err());
+    driver.reset().unwrap();
+    driver.feeds.fail_update = false;
+    driver.feed(1).unwrap();
+}
+
+#[test]
+fn the_phases_of_a_token_are_timed_and_a_fed_token_has_no_head_time() {
+    let mut driver = driver();
+    driver.feed(1).unwrap();
+    assert_eq!(driver.last_times().head, std::time::Duration::ZERO);
+    assert_eq!(driver.bank_misses(), None);
+}
+
 #[test]
 fn a_failed_health_check_poisons_and_does_not_advance() {
     let mut driver = driver();

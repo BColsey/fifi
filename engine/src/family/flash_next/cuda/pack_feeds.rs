@@ -17,9 +17,18 @@ use super::{
 use crate::{EngError, weights::StreamedCheckpoint};
 
 /// The gathered rows of the token being fed, with the token.
-struct Pending {
+struct Pending<T> {
     token: u32,
-    rows: Gathered,
+    rows: T,
+}
+
+/// Takes the pending rows for `token`; refuses rows read for another token or none at all.
+fn take_pending<T>(pending: &mut Option<Pending<T>>, token: u32) -> Result<T, EngError> {
+    pending
+        .take()
+        .filter(|pending| pending.token == token)
+        .map(|pending| pending.rows)
+        .ok_or_else(|| EngError::BadRequest(format!("no n-gram rows were read for token {token}")))
 }
 
 pub(super) struct PackFeeds {
@@ -27,7 +36,7 @@ pub(super) struct PackFeeds {
     ple: PleFeed,
     hidden: usize,
     branches: usize,
-    pending: Option<Pending>,
+    pending: Option<Pending<Gathered>>,
 }
 
 impl PackFeeds {
@@ -68,18 +77,45 @@ impl TokenFeeds for PackFeeds {
     }
 
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
-        let pending = self
-            .pending
-            .take()
-            .filter(|pending| pending.token == token)
-            .ok_or_else(|| {
-                EngError::BadRequest(format!("no n-gram rows were read for token {token}"))
-            })?;
-        self.ple.update(token, &pending.rows, stream)
+        let rows = take_pending(&mut self.pending, token)?;
+        self.ple.update(token, &rows, stream)
     }
 
     fn reset(&mut self) {
         self.pending = None;
         self.ple.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pending, take_pending};
+    use crate::EngError;
+
+    #[test]
+    fn pending_rows_serve_their_own_token_once() {
+        let mut pending = Some(Pending {
+            token: 7,
+            rows: "rows",
+        });
+        assert_eq!(take_pending(&mut pending, 7).unwrap(), "rows");
+        assert!(matches!(
+            take_pending(&mut pending, 7),
+            Err(EngError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rows_read_for_another_token_are_refused_and_dropped() {
+        let mut pending = Some(Pending {
+            token: 7,
+            rows: "rows",
+        });
+        assert!(matches!(
+            take_pending(&mut pending, 8),
+            Err(EngError::BadRequest(text)) if text.contains("token 8")
+        ));
+        assert!(pending.is_none());
+        assert!(take_pending::<()>(&mut None, 1).is_err());
     }
 }

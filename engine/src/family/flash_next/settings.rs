@@ -35,13 +35,13 @@ pub(crate) struct FlashOptions {
     pub(crate) expert_prefetch: Option<bool>,
     /// Serves the model on a CUDA card (a `native-cuda` Linux build). The default is false: the
     /// CUDA decoder is experimental and a CUDA build refuses to serve Flash-Next without it.
-    /// When true, `cache_limit_bytes` (an MLX allocator key) is not required and is ignored.
+    /// When true, `cache_limit_bytes` (an MLX allocator key) is not required and is refused if set.
     pub(crate) cuda_decode: Option<bool>,
     /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Default
     /// 4096. The load refuses a context the card cannot hold next to the trunk.
     pub(crate) context: Option<u32>,
     /// CUDA only: how the K/V is stored on the card. Default `f16`; `int8` has no attention
-    /// kernel yet and the load refuses it.
+    /// kernel yet and the settings refuse it.
     pub(crate) kv_format: Option<KvFormatName>,
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
@@ -66,7 +66,7 @@ impl KvFormatName {
 }
 
 /// The CUDA decoder's own settings, present only when `cuda_decode` is on.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CudaSettings {
     pub(crate) context: u32,
     pub(crate) kv_format: KvFormatName,
@@ -122,7 +122,10 @@ fn ranged(
     low: u32,
     high: u32,
 ) -> Result<u32, EngError> {
-    let value = value.unwrap_or(default);
+    bounded(key, value.unwrap_or(default), low, high)
+}
+
+fn bounded(key: &str, value: u32, low: u32, high: u32) -> Result<u32, EngError> {
     if (low..=high).contains(&value) {
         Ok(value)
     } else {
@@ -162,6 +165,18 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
             None => Ok(None),
         };
     }
+    if options.cache_limit_bytes.is_some() {
+        return Err(bad(
+            "cache_limit_bytes is an MLX allocator key and cannot be combined with cuda_decode"
+                .into(),
+        ));
+    }
+    let kv_format = options.kv_format.unwrap_or(KvFormatName::F16);
+    if kv_format == KvFormatName::Int8 {
+        return Err(bad(
+            "kv_format int8 has no attention kernel yet; use f16".into()
+        ));
+    }
     let context = ranged(
         "context",
         options.context,
@@ -176,11 +191,11 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
     }
     let slots = options
         .slots
-        .map(|slots| ranged("slots", Some(slots), slots, MIN_CUDA_SLOTS, MAX_CUDA_SLOTS))
+        .map(|slots| bounded("slots", slots, MIN_CUDA_SLOTS, MAX_CUDA_SLOTS))
         .transpose()?;
     Ok(Some(CudaSettings {
         context,
-        kv_format: options.kv_format.unwrap_or(KvFormatName::F16),
+        kv_format,
         slots,
     }))
 }
@@ -560,19 +575,33 @@ mod tests {
         let env = FlashEnv::default();
         let options: FlashOptions = serde_json::from_str(
             r#"{"manifest": "/m.json", "cuda_decode": true, "context": 65536,
-                "kv_format": "int8", "slots": 48}"#,
+                "kv_format": "f16", "slots": 48}"#,
         )
         .unwrap();
         assert_eq!(
             settings(Some(&options), &env).unwrap().cuda,
             Some(CudaSettings {
                 context: 65536,
-                kv_format: KvFormatName::Int8,
+                kv_format: KvFormatName::F16,
                 slots: Some(48),
             })
         );
         assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);
         for (options, want) in [
+            (
+                FlashOptions {
+                    kv_format: Some(KvFormatName::Int8),
+                    ..cuda_on()
+                },
+                "kv_format int8 has no attention kernel yet; use f16",
+            ),
+            (
+                FlashOptions {
+                    cache_limit_bytes: Some(1024),
+                    ..cuda_on()
+                },
+                "cache_limit_bytes is an MLX allocator key and cannot be combined with cuda_decode",
+            ),
             (
                 FlashOptions {
                     context: Some(3),

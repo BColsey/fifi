@@ -19,17 +19,18 @@
 //! the flag before the first leak, and a retry in the same process is refused.
 
 use std::{
+    cell::Cell,
     path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{
     bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
+        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
         ReplaceOnMissLru, device::DeviceBank,
     },
     bank_source::PackRecordSource,
@@ -131,11 +132,7 @@ pub(in crate::family::flash_next) fn start(
     let prefill_chunk = usize::try_from(settings.prefill_chunk)
         .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
     let artifact = settings.artifact.clone();
-    let wanted = CudaSettings {
-        context: cuda.context,
-        kv_format: cuda.kv_format,
-        slots: cuda.slots,
-    };
+    let wanted = cuda.clone();
     let guard = BuildGuard::acquire()?;
     let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
         make(stages, &artifact, &wanted, rules, guard)
@@ -187,11 +184,30 @@ fn read_meminfo() -> Result<(u64, u64), EngError> {
     Ok((memory.total, memory.available))
 }
 
-/// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host.
+/// A record source that adds up the time spent reading and packing records from the pack, so the
+/// load log can split the bank fill into the pack read and the pin and upload.
+struct TimedSource<'a> {
+    inner: &'a PackRecordSource<'a>,
+    spent: Cell<Duration>,
+    records: Cell<u64>,
+}
+
+impl RecordSource for TimedSource<'_> {
+    fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError> {
+        let opened = Instant::now();
+        let result = self.inner.record(layer, expert, out);
+        self.spent.set(self.spent.get() + opened.elapsed());
+        self.records.set(self.records.get() + 1);
+        result
+    }
+}
+
+/// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host,
+/// under the host plan the caller admitted.
 fn build_bank(
     projector: &CudaProjector,
-    checkpoint: &Checkpoint,
     geometry: BankGeometry,
+    plan: &HostPinPlan,
     source: &PackRecordSource<'_>,
 ) -> Result<DeviceBank, EngError> {
     let rows: Vec<Vec<i32>> = (0..geometry.layers)
@@ -212,16 +228,22 @@ fn build_bank(
     let counts = vec![(0..geometry.experts as u64).rev().collect::<Vec<u64>>(); geometry.layers];
     let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
     let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy)?;
-    let (total, available) = read_meminfo()?;
-    let plan = HostPinPlan::new(
-        &geometry,
-        HostMode::Exclusive,
-        &HostMemory { total, available },
-        &HostTerms::DEFAULT,
-    )?;
-    HostBudget::probe()?.admit_for(plan.process_bytes, "Flash-Next expert bank")?;
-    let _ = checkpoint;
-    DeviceBank::build(projector.context(), state, source, &plan)
+    let timed = TimedSource {
+        inner: source,
+        spent: Cell::new(Duration::ZERO),
+        records: Cell::new(0),
+    };
+    let opened = Instant::now();
+    let bank = DeviceBank::build(projector.context(), state, &timed, plan)?;
+    let total = opened.elapsed();
+    eprintln!(
+        "flash-next cuda: expert bank: {} records, pack read and pack {:.1} s, pin and upload {:.1} s, total {:.1} s",
+        timed.records.get(),
+        timed.spent.get().as_secs_f64(),
+        total.saturating_sub(timed.spent.get()).as_secs_f64(),
+        total.as_secs_f64()
+    );
+    Ok(bank)
 }
 
 fn make(
@@ -276,6 +298,8 @@ pub(super) fn build_driver(
         report.expert_bytes,
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
+    // `FlashLoadPlan::new` replaces the trunk and state bytes (the `(0, 0)`) and the K/V (the
+    // placeholder positions) with the numbers the pack and the context give.
     let card = TierInputs::measured(
         tier_shape,
         (0, 0),
@@ -311,6 +335,33 @@ pub(super) fn build_driver(
         )));
     }
 
+    // The host side is admitted before anything is uploaded: the pinned store of the bank, the
+    // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
+    // `PleVectors::read` holds in F32 (`HostTerms::engine_heap` does not count them).
+    let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
+    let geometry = BankGeometry::new(
+        layers,
+        model.moe.experts(),
+        model.moe.top_k(),
+        slots,
+        record_bytes,
+    )?;
+    let host_plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &HostMemory {
+            total: mem_total,
+            available: mem_available,
+        },
+        &HostTerms::DEFAULT,
+    )?;
+    let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
+    let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
+    HostBudget::probe()?.admit_for(
+        host_plan.process_bytes + ple_bytes,
+        "Flash-Next expert bank and PLE projections",
+    )?;
+
     // LEAK: the owners are leaked for the process lifetime, giving the step `'static` borrows.
     // From the first leak a failure leaves the card loaded, so the one-engine flag is pinned here.
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
@@ -332,14 +383,7 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     let source = PackRecordSource::new(checkpoint)?;
-    let geometry = BankGeometry::new(
-        layers,
-        model.moe.experts(),
-        model.moe.top_k(),
-        slots,
-        source.layout().record_bytes(),
-    )?;
-    let bank = build_bank(projector, checkpoint, geometry, &source)?;
+    let bank = build_bank(projector, geometry, &host_plan, &source)?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()

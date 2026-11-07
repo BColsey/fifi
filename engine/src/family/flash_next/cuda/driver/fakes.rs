@@ -126,6 +126,8 @@ pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     pub(in crate::family::flash_next::cuda) resets: usize,
     /// The token whose `begin` fails.
     pub(in crate::family::flash_next::cuda) fail_begin: Option<u32>,
+    /// Fails the PLE update.
+    pub(in crate::family::flash_next::cuda) fail_update: bool,
     /// The width of the update (the stream's, unless a test breaks it).
     pub(in crate::family::flash_next::cuda) update_width: Option<usize>,
 }
@@ -142,6 +144,9 @@ impl TokenFeeds for FakeFeeds {
     }
 
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
+        if self.fail_update {
+            return Err(EngError::Checkpoint("the PLE step failed".into()));
+        }
         self.updates.push((token, stream.to_vec()));
         Ok(vec![0.5; self.update_width.unwrap_or(stream.len())])
     }

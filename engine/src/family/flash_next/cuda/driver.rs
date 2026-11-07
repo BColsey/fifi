@@ -17,7 +17,7 @@
 //! The device half is [`TokenDevice`] (the decode step and its MoE block on a card), the host half is
 //! [`TokenFeeds`] (the pack's embedding and the PLE feed). The traits exist so that the sequence,
 //! the poison rule and the executor on top of it run in host tests against fakes; the card
-//! implementations are `device.rs` and `feeds_pack.rs`.
+//! implementations are `device.rs` and `pack_feeds.rs`.
 //!
 //! The fed rule of `TokenStepper`: `fed` advances when, and only when, the model state consumed the
 //! token. A failure anywhere after the first write to the card poisons the driver: every later
@@ -27,7 +27,10 @@
 //! `sample_logits` draws from the first `sampler_vocab` values, so the padded ids of the head
 //! (above the tokenizer's vocabulary) are never drawn and a greedy request is argmax.
 
-use std::ops::Range;
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use super::feeds::{StartShape, StartSink, write_start};
 use crate::{EngError, family::session::TokenStepper};
@@ -45,6 +48,32 @@ pub(super) struct DriverShape {
     pub(super) positions: usize,
     /// The sizes of one token start.
     pub(super) start: StartShape,
+}
+
+/// Where the wall time of the last token went. The layer launches are queued, but each MoE block
+/// waits on the host for its classify log, so a phase holds the device work it had to wait for; the
+/// work still queued when a phase ends is paid by the next call that waits (the stream read-back
+/// or the logits read-back).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TokenTimes {
+    /// The embedding row, the n-gram plan and the n-gram row reads.
+    pub(super) rows: Duration,
+    /// The start write: step parameters and stream.
+    pub(super) start: Duration,
+    /// The layers before the PLE layer.
+    pub(super) layers_before: Duration,
+    /// The stream read-back at the PLE layer: the wait for everything queued before it.
+    pub(super) ple_sync: Duration,
+    /// The host PLE step (convolution, projections, norms).
+    pub(super) ple_host: Duration,
+    /// The stream write-back.
+    pub(super) ple_write: Duration,
+    /// The layers from the PLE layer on.
+    pub(super) layers_after: Duration,
+    /// The final mixer, the head and the logits read-back (zero for a fed token).
+    pub(super) head: Duration,
+    /// The health read.
+    pub(super) health: Duration,
 }
 
 /// The start vectors of a token.
@@ -69,7 +98,8 @@ pub(super) trait TokenFeeds {
 
 /// The device side of a token. It is the sink of the token start.
 pub(super) trait TokenDevice: StartSink {
-    /// Clears the per-token flags. Called once, before the start is written.
+    /// Clears the per-token flags (the EXL3 flag and the status word). Called once per token, after
+    /// the start is written and before the first layer.
     fn begin_token(&mut self) -> Result<()>;
     /// Queues layers `range` for the token at `pos`.
     fn layers(&mut self, range: Range<usize>, pos: usize) -> Result<()>;
@@ -85,6 +115,10 @@ pub(super) trait TokenDevice: StartSink {
     fn check_health(&mut self) -> Result<()>;
     /// Zeroes the persistent state: a new sequence.
     fn reset(&mut self) -> Result<()>;
+    /// Expert bank misses so far, for a device with a bank.
+    fn bank_misses(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The token driver: a [`TokenStepper`] over a device and its feeds.
@@ -95,6 +129,7 @@ pub(super) struct TokenDriver<D: TokenDevice, F: TokenFeeds> {
     /// Tokens the state has consumed: the next position.
     pos: usize,
     poisoned: bool,
+    times: TokenTimes,
 }
 
 impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
@@ -111,7 +146,18 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
             shape,
             pos: 0,
             poisoned: false,
+            times: TokenTimes::default(),
         })
+    }
+
+    /// Where the last token's time went.
+    pub(super) fn last_times(&self) -> TokenTimes {
+        self.times
+    }
+
+    /// Expert bank misses so far.
+    pub(super) fn bank_misses(&self) -> Option<u64> {
+        self.device.bank_misses()
     }
 
     /// Positions the caches hold.
@@ -151,7 +197,12 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
             )));
         }
         // Host reads only: a failure here leaves the state as it was.
+        let opened = Instant::now();
         let start = self.feeds.begin(token)?;
+        self.times = TokenTimes {
+            rows: opened.elapsed(),
+            ..TokenTimes::default()
+        };
         let outcome = self.queue(token, &start, want_logits);
         match outcome {
             Ok(logits) => {
@@ -174,6 +225,12 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
     ) -> Result<Option<Vec<f32>>> {
         let pos = self.pos;
         let shape = self.shape;
+        let mut clock = Instant::now();
+        let mut lap = || {
+            let spent = clock.elapsed();
+            clock = Instant::now();
+            spent
+        };
         write_start(
             &mut self.device,
             &shape.start,
@@ -183,9 +240,13 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
             &start.ple_embedding,
         )?;
         self.device.begin_token()?;
+        self.times.start = lap();
         self.device.layers(0..shape.ple_layer, pos)?;
+        self.times.layers_before = lap();
         let mut stream = self.device.read_stream()?;
+        self.times.ple_sync = lap();
         let update = self.feeds.ple_update(token, &stream)?;
+        self.times.ple_host = lap();
         if update.len() != stream.len() {
             return Err(EngError::BadRequest(format!(
                 "Flash-Next driver: the PLE update has {} values for a stream of {}",
@@ -197,14 +258,19 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
             *value += delta;
         }
         self.device.write_stream_back(&stream)?;
+        self.times.ple_write = lap();
         self.device.layers(shape.ple_layer..shape.layers, pos)?;
+        self.times.layers_after = lap();
         let logits = if want_logits {
             self.device.head()?;
-            Some(self.device.read_logits()?)
+            let row = self.device.read_logits()?;
+            self.times.head = lap();
+            Some(row)
         } else {
             None
         };
         self.device.check_health()?;
+        self.times.health = lap();
         Ok(logits)
     }
 }
