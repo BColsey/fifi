@@ -17,10 +17,10 @@ fn real() -> SlotBankLayout {
 #[test]
 fn a_real_expert_record_is_1_881_600_bytes_in_the_order_gate_up_down() {
     let layout = real();
-    // Per part: (k/16)(n/16) tiles of 96 bytes; suh 4k and svh 4n bytes.
+    // Per part: (k/16)(n/16) tiles of 96 bytes; suh 4k and svh 4n bytes (k + n = 3200 for each of the three).
     let tiles = 160 * 40;
     assert_eq!(layout.record_bytes(), 1_881_600);
-    assert_eq!(layout.record_bytes(), 3 * tiles * 96 + 2 * 4 * (2560 + 640));
+    assert_eq!(layout.record_bytes(), 3 * tiles * 96 + 3 * 4 * (2560 + 640));
     let gate = layout.part(0);
     assert_eq!(gate.shape, [2560, 640]);
     assert_eq!(gate.trellis, 0..614_400);
