@@ -74,11 +74,18 @@ pub(super) enum RowsOp {
     /// `window_status_fold`: ORs every pair's bits and the EXL3 flag into the status word, once.
     /// The LAST status writer of the window.
     StatusFold,
+    /// `verify_greedy`: compares each pair's token with the next window id on the device and stores
+    /// the accepted run and the bonus token in the result table. Reads the pairs, writes no status.
+    VerifyGreedy,
+    /// `shortlist_rows`: the top-20 record of every logits row, stored contiguously after the
+    /// result table for the one read. Skipped when the one-row shortlist is switched off. Uses the
+    /// argmax partials of the K-row plan as scratch, so it runs after `ArgmaxRows`. Writes no status.
+    ShortlistRows,
 }
 
 /// The launches of one K-row verify window as DATA, the K-row twin of [`token_ops`]: the same
-/// body, then `argmax_rows` and `window_status_fold` in place of `argmax`, then the advance by
-/// `rows`. `rows` is the window's K, 2 to 8; the op list does not depend on it (K is the `m` of
+/// body, then `argmax_rows`, `window_status_fold`, `verify_greedy` and `shortlist_rows` in place of
+/// `argmax`, then the advance by `rows`. `rows` is the window's K, 2 to 8; the op list does not depend on it (K is the `m` of
 /// the launches and the number of chains), so it only gates the call.
 pub(super) fn token_ops_rows(layers: usize, rows: usize) -> Result<Vec<RowsOp>, EngError> {
     if !(2..=MAX_STEP_ROWS).contains(&rows) {
@@ -91,7 +98,12 @@ pub(super) fn token_ops_rows(layers: usize, rows: usize) -> Result<Vec<RowsOp>, 
     let advance = ops.pop();
     let argmax = ops.pop();
     debug_assert_eq!(argmax, Some(RowsOp::Step(StepOp::Argmax)));
-    ops.extend([RowsOp::ArgmaxRows, RowsOp::StatusFold]);
+    ops.extend([
+        RowsOp::ArgmaxRows,
+        RowsOp::StatusFold,
+        RowsOp::VerifyGreedy,
+        RowsOp::ShortlistRows,
+    ]);
     ops.extend(advance);
     Ok(ops)
 }
@@ -103,16 +115,18 @@ impl RowsOp {
     pub(super) fn phases(self, kind: AttentionKind) -> Vec<Phase> {
         match self {
             Self::Step(op) => op.phases(kind),
-            Self::ArgmaxRows | Self::StatusFold => vec![Phase::Argmax],
+            Self::ArgmaxRows | Self::StatusFold | Self::VerifyGreedy | Self::ShortlistRows => {
+                vec![Phase::Argmax]
+            }
         }
     }
 
     /// Whether any kernel of the op writes the shared status word. `argmax_rows` writes row-local
-    /// bits into the pairs only, so it does not.
+    /// bits into the pairs only, so it does not; neither do `verify_greedy` and `shortlist_rows`.
     pub(super) fn writes_status(self, kind: AttentionKind) -> bool {
         match self {
             Self::Step(op) => op.writes_status(kind),
-            Self::ArgmaxRows => false,
+            Self::ArgmaxRows | Self::VerifyGreedy | Self::ShortlistRows => false,
             Self::StatusFold => true,
         }
     }
@@ -120,7 +134,7 @@ impl RowsOp {
     pub(super) fn layer(self) -> Option<usize> {
         match self {
             Self::Step(op) => op.layer(),
-            Self::ArgmaxRows | Self::StatusFold => None,
+            Self::ArgmaxRows | Self::StatusFold | Self::VerifyGreedy | Self::ShortlistRows => None,
         }
     }
 }

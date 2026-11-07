@@ -215,6 +215,12 @@ impl WindowModel for QwenResidentStep<'_> {
         if sampler.is_greedy() {
             return window.argmax.get(row).copied().ok_or_else(no_window);
         }
+        // A K-row window whose logits stayed on the device draws from its report (the row's top-20
+        // record, or one row read on demand); every other window falls through to its host rows.
+        if let Some(drawn) = self.draw_from_krow_window(row, sampler, sampler_vocab) {
+            return drawn;
+        }
+        let window = self.window.as_ref().ok_or_else(no_window)?;
         let logits = window.rows.get(row).ok_or_else(no_window)?;
         sample_logits(Self::OPERATION, logits, sampler, sampler_vocab)
     }

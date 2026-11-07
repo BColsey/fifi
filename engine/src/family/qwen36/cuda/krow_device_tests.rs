@@ -18,7 +18,13 @@ use crate::{
         krow::{RowStatus, SINGLE_GATHER_NAME, check_krow_env, rows_verdict},
     },
     kernels::{
-        cuda::resident::argmax_rows::{WindowResult, window_result_bytes},
+        cuda::resident::{
+            argmax_rows::{
+                WindowReport, WindowResult, window_full_report_bytes, window_read_bytes,
+                window_report_bytes, window_result_bytes, window_shortlist_offset,
+            },
+            shortlist::RESULT_BYTES as RECORD_BYTES,
+        },
         row_launches::RowLaunches,
     },
 };
@@ -184,8 +190,11 @@ fn every_value_of_the_single_row_switch_and_the_merged_block_are_refused_and_say
 }
 
 fn counts(argmax: u64, fold: u64, pack: u64, conv: u64, delta: u64, router: u64) -> RowLaunches {
+    // The device verify and the shortlist run once per window, like the argmax.
     RowLaunches {
         argmax_rows: argmax,
+        verify_greedy: argmax,
+        shortlist_rows: argmax,
         status_fold: fold,
         pack_rows: pack,
         conv_snap: conv,
@@ -217,6 +226,40 @@ fn a_run_with_no_window_or_a_missing_kernel_family_fails_the_counter_check() {
     }
     // The argmax and the fold count exactly once per window: two folds in a window are wrong.
     assert!(require_krow_enqueued(&counts(3, 6, 120, 90, 90, 180), 3).is_err());
+}
+
+/// The device verify and the K-row shortlist run exactly once per window. (The shortlist count is
+/// asked while the one-row shortlist is on, the default; a run with `Q36_CUDA_DEVICE_SHORTLIST=0`
+/// asks it at zero instead.)
+#[test]
+fn the_device_verify_and_the_shortlist_are_each_counted_once_per_window() {
+    let ok = counts(3, 3, 120, 90, 90, 180);
+    require_krow_enqueued(&ok, 3).expect("one each per window");
+    let mut missing = ok;
+    missing.verify_greedy = 0;
+    assert!(require_krow_enqueued(&missing, 3).is_err(), "no verify");
+    let mut twice = ok;
+    twice.verify_greedy = 6;
+    assert!(require_krow_enqueued(&twice, 3).is_err(), "two verifies");
+    let mut missing = ok;
+    missing.shortlist_rows = 0;
+    assert!(require_krow_enqueued(&missing, 3).is_err(), "no shortlist");
+}
+
+#[test]
+fn the_eager_control_wants_the_device_verify_and_the_shortlist_at_zero() {
+    for run in [
+        RowLaunches {
+            verify_greedy: 1,
+            ..RowLaunches::default()
+        },
+        RowLaunches {
+            shortlist_rows: 1,
+            ..RowLaunches::default()
+        },
+    ] {
+        assert!(require_krow_idle(&run).is_err(), "{}", run.describe());
+    }
 }
 
 fn tap(layer: usize, after_moe: bool, rows: &[&[u8]]) -> LayerTap {
@@ -392,6 +435,142 @@ fn a_table_with_a_non_zero_pad_word_does_not_decode() {
     let at = bytes.len() - 4;
     bytes[at] = 1;
     assert!(WindowResult::from_bytes(&bytes, 2).is_none());
+}
+
+// ---- the device-to-host reads of a window ----
+
+/// The reads between two snapshots of the observer (`QwenResidentStep::d2h_reads`, which maps a read
+/// length in bytes to the number of reads of that length): the total bytes copied and the length of
+/// the widest single read. A read that happened is a count that grew; an observer that went down is a
+/// different step and is not a difference.
+pub(super) fn d2h_since(
+    before: &std::collections::BTreeMap<usize, usize>,
+    after: &std::collections::BTreeMap<usize, usize>,
+) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut widest = 0;
+    for (&len, &count) in after {
+        let earlier = before.get(&len).copied().unwrap_or(0);
+        if count > earlier {
+            bytes += (len * (count - earlier)) as u64;
+            widest = widest.max(len);
+        }
+    }
+    (bytes, widest)
+}
+
+#[test]
+fn the_device_reads_of_a_window_are_the_reads_that_grew_between_two_snapshots() {
+    use std::collections::BTreeMap;
+    let before: BTreeMap<usize, usize> = [(4, 3), (1488, 1)].into();
+    assert_eq!(d2h_since(&before, &before), (0, 0));
+    // One more report, two more scalars, and a logits row that was already counted before.
+    let after: BTreeMap<usize, usize> = [(4, 5), (1488, 2), (993_280, 1)].into();
+    assert_eq!(
+        d2h_since(&before, &after),
+        (2 * 4 + 1488 + 993_280, 993_280)
+    );
+    // Nothing read: no widest read.
+    assert_eq!(d2h_since(&BTreeMap::new(), &BTreeMap::new()), (0, 0));
+}
+
+// ---- the whole report of a window, decoded by the production code ----
+
+/// The bytes a K-row window leaves for its one read: the table, the two words of the device verify,
+/// padding to the next multiple of 16 (the device leaves those bytes alone: they hold garbage), then
+/// one record per row.
+fn report_bytes(
+    tokens: &[i32],
+    bits: &[i32],
+    (window, accepted, bonus): (i32, i32, i32),
+    records: &[[u8; RECORD_BYTES]],
+) -> Vec<u8> {
+    let mut bytes = table_bytes(tokens, bits, window);
+    bytes.extend(accepted.to_le_bytes());
+    bytes.extend(bonus.to_le_bytes());
+    bytes.resize(window_shortlist_offset(tokens.len()), 0xA5);
+    for record in records {
+        bytes.extend(record);
+    }
+    bytes
+}
+
+#[test]
+fn the_report_sizes_are_the_table_two_words_a_pad_to_16_and_a_record_per_row() {
+    for m in 1..=16 {
+        assert_eq!(window_report_bytes(m), window_result_bytes(m) + 8, "{m}");
+        assert_eq!(window_report_bytes(m), 8 * m + 16);
+        assert_eq!(
+            window_shortlist_offset(m) % 16,
+            0,
+            "a record is 16-byte aligned"
+        );
+        assert!(window_shortlist_offset(m) - window_report_bytes(m) < 16);
+        assert_eq!(
+            window_full_report_bytes(m),
+            window_shortlist_offset(m) + m * RECORD_BYTES
+        );
+        // What the host reads: the records when the shortlist ran, the table alone when it did not.
+        assert_eq!(window_read_bytes(m, true), window_full_report_bytes(m));
+        assert_eq!(window_read_bytes(m, false), window_report_bytes(m));
+    }
+    // The widest window of the K-row path reads about a kilobyte and a half, not 7.9 MB.
+    assert_eq!(window_full_report_bytes(8), 1488);
+    assert!(window_full_report_bytes(8) < 2048);
+    assert_eq!(
+        RECORD_BYTES,
+        crate::family::qwen36::krow::SHORTLIST_RECORD_BYTES
+    );
+}
+
+#[test]
+fn the_report_decodes_the_pairs_the_window_word_the_verify_words_and_the_records() {
+    for m in 2..=8usize {
+        let tokens: Vec<i32> = (0..m as i32).map(|i| 10 + i).collect();
+        let bits = vec![0; m];
+        let records: Vec<[u8; RECORD_BYTES]> =
+            (0..m).map(|i| [i as u8 + 1; RECORD_BYTES]).collect();
+        let bytes = report_bytes(&tokens, &bits, (0, 1, 11), &records);
+        assert_eq!(bytes.len(), window_full_report_bytes(m));
+        let report = WindowReport::from_bytes(&bytes, m, true).expect("decodes");
+        assert_eq!(report.table.tokens, tokens);
+        assert_eq!((report.accepted, report.bonus), (1, 11));
+        assert_eq!(report.shortlists, records, "{m} rows");
+        // Without the shortlist the report stops after the verify words.
+        let short = &bytes[..window_report_bytes(m)];
+        let report = WindowReport::from_bytes(short, m, false).expect("decodes");
+        assert!(report.shortlists.is_empty());
+        assert_eq!((report.accepted, report.bonus), (1, 11));
+    }
+}
+
+/// The mutant of the read length: a report sized for one row fewer than the window ran.
+#[test]
+fn a_report_read_for_one_row_fewer_does_not_decode() {
+    for m in 2..=8usize {
+        let tokens = vec![1; m];
+        let bytes = report_bytes(&tokens, &vec![0; m], (0, 0, 1), &vec![[0; RECORD_BYTES]; m]);
+        let short = &bytes[..window_full_report_bytes(m - 1)];
+        assert!(WindowReport::from_bytes(short, m, true).is_none(), "{m}");
+        assert!(WindowReport::from_bytes(&bytes[..bytes.len() - 1], m, true).is_none());
+        // The records are not optional when the shortlist ran.
+        assert!(WindowReport::from_bytes(&bytes[..window_report_bytes(m)], m, true).is_none());
+    }
+}
+
+#[test]
+fn the_padding_before_the_first_record_is_not_read() {
+    let m = 3;
+    let mut bytes = report_bytes(&[1, 2, 3], &[0; 3], (0, 2, 3), &[[7; RECORD_BYTES]; 3]);
+    for byte in &mut bytes[window_report_bytes(m)..window_shortlist_offset(m)] {
+        *byte ^= 0xFF;
+    }
+    let report = WindowReport::from_bytes(&bytes, m, true).expect("decodes");
+    assert_eq!(report.shortlists[0], [7; RECORD_BYTES]);
+    // A non-zero pad word of the table does not decode, as for the table alone.
+    let mut dirty = bytes.clone();
+    dirty[window_result_bytes(m) - 4] = 1;
+    assert!(WindowReport::from_bytes(&dirty, m, true).is_none());
 }
 
 fn stats(

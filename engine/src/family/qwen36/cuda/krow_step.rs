@@ -24,19 +24,25 @@
 //! * every other failure, and any non-zero status of a row or of the window, is a failure after
 //!   the launch: the window fails closed whatever the host counters say.
 //!
-//! What a later change to read the logits on the device must keep: the logits stay in the arena
-//! until `read_krow_rows` copies them (the only reader); the result table (pairs and window word)
-//! is one read of `8 K + 8` bytes; the window ids are written once and never read by the host;
-//! nothing runs on the host between the rows.
+//! The logits stay on the device. After the window the host makes ONE small read, the report
+//! (`WindowReport`, `1.5 KB` at K = 8): the pairs, the window word, the accepted run and bonus
+//! token that `verify_greedy` compared on the device, and one top-20 record per row from the
+//! K-row shortlist. The host re-derives the run and the bonus from the pairs and the window ids and
+//! fails the window closed on any difference, and checks every record against its pair
+//! (`krow::check_verify`, `krow::check_shortlists`). The window returns no logits rows: a draw
+//! gets what it needs from the report (greedy: the pair token; a seeded sampler that keeps 1 to 20
+//! candidates: the row's record, by the same `Sampler::sample_shortlist` the one-row step uses),
+//! and reads ONE full row from the arena (`read_krow_row`, 993,280 bytes) only for a sampler the
+//! record cannot serve. The test-only tap `want_logits` makes the window read all K rows after the
+//! verdict, as the checks of the D1 oracle need (`read_krow_rows`).
 //!
-//! Cost to remember when this body is timed. The window returns the full logits of every row
-//! (`RowsOut<Vec<f32>>`), so after the verdict `read_krow_rows` copies `K x 993,280` bytes to the
-//! host (about 7.9 MB at K = 8) and decodes them to f32. That copy is part of every window today.
-//! It is not the floor of a verifier that compares tokens on the device; the first timing of this
-//! body must not be read as that floor. Removing the copy is its own change.
+//! What this body must keep: the logits stay in the arena until `draw` or the tap reads them, so
+//! nothing may write the arena between the window and its verdict (`window_awaits` refuses every
+//! step, export and window until then, and no kernel runs after the list); the window ids are
+//! written once and never read by the host; nothing runs on the host between the rows.
 //!
 //! The row count of the window tail is checked when the argmax op runs (`tail_calls`), which is
-//! after the layers were enqueued. It is a guard by construction: both tail calls are built from
+//! after the layers were enqueued. It is a guard by construction: the tail calls are built from
 //! the one `k`. Moving the construction before the first launch is a later change.
 
 use super::super::{
@@ -46,7 +52,7 @@ use super::super::{
     mixer_shapes::{attn_decode_shape, attn_prep_shape, delta_shape, plain_shape},
     mixer_weights::LayerWeights,
     moe::{Launch, MoeDims, RouteBufs},
-    resources::{EmbedWeight, HeadWeight, f32_bytes},
+    resources::{EmbedWeight, HeadWeight},
     state::{StepField, rollback::SnapPart},
     state_layout::{Plane, Word},
     step_ops::{RowsOp, StepOp, final_resid, resid_in, resid_out, token_ops_rows},
@@ -59,20 +65,30 @@ use super::{
 };
 #[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;
+#[cfg(test)]
+use crate::kernels::cuda::resident::argmax_rows::WindowResult;
 use crate::{
     EngError,
     family::{
         project::cuda::{WeightLayout, exl3::Exl3Io},
         qwen36::{
-            krow::{self, ConfigFacts, RowStatus, RowsFacts, check_rows, rows_verdict},
-            window_logic::{RowsFailure, RowsOut},
+            krow::{
+                self, ConfigFacts, DeviceDraws, DrawSource, RowStatus, RowsFacts, check_rows,
+                check_shortlists, check_verify, draw_source, rows_verdict,
+            },
+            window_logic::{self, RowsFailure, RowsOut, WindowSave, no_window},
         },
+        sampler::Sampler,
+        session::{TokenStepper, sample_logits},
     },
     kernels::cuda::{
         CapturePlan, DeviceBuffer, DeviceRange, is_capture_refusal,
         resident::{
             add_norm_pack::AddNormCall,
-            argmax_rows::{ArgmaxRowsCall, WindowFoldCall, WindowResult, window_result_bytes},
+            argmax_rows::{
+                ArgmaxRowsCall, VerifyGreedyCall, WindowFoldCall, WindowReport, window_read_bytes,
+                window_report_bytes, window_result_bytes, window_shortlist_offset,
+            },
             attn_decode::{AttnDecodeCall, AttnShape, AttnSpan, AttnSplit},
             attn_prep::{AttnPrepCall, AttnPrepShape, RopeParams},
             embed_bf16::EmbedBf16Call,
@@ -81,7 +97,8 @@ use crate::{
             pack_rows::{PackRowsCall, PackSegment},
             router::RouterShape,
             router_rows::RouterLogitsStridedCall,
-            step_params::{RESULT_PAIR_BYTES, StepParams},
+            shortlist::{RESULT_BYTES as SHORTLIST_RECORD_BYTES, ShortlistRowsCall},
+            step_params::{ARGMAX_PART_BYTES, RESULT_PAIR_BYTES, StepParams},
         },
     },
 };
@@ -106,8 +123,11 @@ pub(super) struct KrowRuntime {
     ops: RowsKindOps,
     /// The longest window the buffers and the slots serve.
     rows: usize,
-    /// Host copy of the logits of the last window, `rows` rows of the head width.
+    /// Host copy of the logits rows the test tap reads, the head width each; grown on first use, so
+    /// a serving window allocates none.
     logits: Vec<u8>,
+    /// What the open window keeps for its draws; `None` when no K-row window is open.
+    draws: Option<DeviceDraws>,
     #[cfg(test)]
     test: TestState,
 }
@@ -120,8 +140,9 @@ struct TestState {
     /// K-row windows whose body was enqueued whole (a window that fails after its launch counts:
     /// its kernels ran, and the launch counters count them).
     windows: u64,
-    /// Return empty logits rows (the tap that a later device-side argmax keeps).
-    skip_logits: bool,
+    /// The tap: every window also reads all K logits rows to the host after the verdict (what the
+    /// D1 checks of the logits rows need). Off, a window reads the report and nothing else.
+    want_logits: bool,
     injection: Option<Injection>,
     /// The result table of the last window that got as far as the read, before any verdict.
     last_table: Option<WindowResult>,
@@ -201,25 +222,18 @@ impl<'a> QwenResidentStep<'a> {
         let mut pinned: Vec<&'a DeviceBuffer> = self.pins.to_vec();
         pinned.push(krow.arena.buffer());
         self.krow_pins = Box::leak(pinned.into_boxed_slice());
-        let logits = vec![
-            0;
-            f32_bytes(res.dims.shape.vocab)?
-                .checked_mul(rows)
-                .ok_or_else(|| {
-                    EngError::MemoryPlan("K-row window: the logits copy overflows".to_owned())
-                })?
-        ];
         self.krow = Some(KrowRuntime {
             io,
             layout,
             ops,
             rows,
-            logits,
+            logits: Vec::new(),
+            draws: None,
             #[cfg(test)]
             test: TestState {
                 path_off: false,
                 windows: 0,
-                skip_logits: false,
+                want_logits: false,
                 injection: None,
                 last_table: None,
             },
@@ -286,6 +300,11 @@ impl<'a> QwenResidentStep<'a> {
         inputs: &[u32],
     ) -> Result<RowsOut<Vec<f32>>, RowsFailure> {
         let k = inputs.len();
+        let base = self.state.tokens();
+        // A new window replaces what the one before kept for its draws.
+        if let Some(runtime) = self.krow.as_mut() {
+            runtime.draws = None;
+        }
         self.krow_prelaunch(inputs)
             .map_err(RowsFailure::StateDecides)?;
         #[cfg(test)]
@@ -304,7 +323,7 @@ impl<'a> QwenResidentStep<'a> {
         if let Err(error) = ran {
             return Err(self.fail_rows(entered, error));
         }
-        match self.krow_finish(k) {
+        match self.krow_finish(inputs, base) {
             Ok(out) => Ok(out),
             Err(error) => {
                 self.state.poison();
@@ -555,6 +574,10 @@ impl<'a> QwenResidentStep<'a> {
             }
             RowsOp::ArgmaxRows => ctx.argmax_rows(s, self.tail_calls(k)?.0),
             RowsOp::StatusFold => ctx.window_status_fold(s, self.tail_calls(k)?.1),
+            RowsOp::VerifyGreedy => ctx.verify_greedy(s, self.verify_call(k)?),
+            // Switched off with the one-row shortlist: the window then reads no records.
+            RowsOp::ShortlistRows if !self.shortlist_on => Ok(()),
+            RowsOp::ShortlistRows => ctx.shortlist_rows(s, self.shortlist_call(k)?),
             RowsOp::Step(StepOp::Advance) => ctx.step_advance(
                 s,
                 params,
@@ -584,6 +607,39 @@ impl<'a> QwenResidentStep<'a> {
         };
         check_tail_rows(argmax.m, fold.m)?;
         Ok((argmax, fold))
+    }
+
+    /// The device comparison of the pair tokens with the window ids of a `k`-row window.
+    fn verify_call(&self, k: usize) -> Result<VerifyGreedyCall<'_>, EngError> {
+        let runtime = self.krow_runtime()?;
+        Ok(VerifyGreedyCall {
+            m: k,
+            ids: runtime
+                .io
+                .range(runtime.layout.ids.offset, runtime.layout.ids.bytes(k))?,
+            result: runtime
+                .io
+                .range(runtime.layout.result.offset, window_report_bytes(k))?,
+        })
+    }
+
+    /// The K-row shortlist of a `k`-row window: the records go to the report, right after the
+    /// verify words, and the partials use the argmax partials of the K-row plan (each row's set is
+    /// `ARGMAX_PART_BYTES` apart and the argmax of the same window has finished with them).
+    fn shortlist_call(&self, k: usize) -> Result<ShortlistRowsCall<'_>, EngError> {
+        let runtime = self.krow_runtime()?;
+        Ok(ShortlistRowsCall {
+            m: k,
+            n: self.widths.verdict,
+            ld: self.res.dims.shape.vocab,
+            logits: self.kview(Slot::Logits)?,
+            scratch: self.kview(Slot::ArgmaxPart)?,
+            scratch_stride: ARGMAX_PART_BYTES,
+            out: runtime.io.range(
+                runtime.layout.result.offset + window_shortlist_offset(k),
+                k * SHORTLIST_RECORD_BYTES,
+            )?,
+        })
     }
 
     fn embed_rows(&self, k: usize) -> Result<(), EngError> {
@@ -869,64 +925,106 @@ impl<'a> QwenResidentStep<'a> {
             .exl3_linear(&self.stream, head.view()?.linear_call(&io))
     }
 
-    /// After the body: the one synchronization and read of the result table, the verdict on every
-    /// row and on the window word, the logits rows, the commit of the rows, and last the mark of
-    /// the slots the kernels stored. Any error is a failure after the launch (the caller poisons).
-    fn krow_finish(&mut self, k: usize) -> Result<RowsOut<Vec<f32>>, EngError> {
+    /// After the body: the one synchronization and read of the report, the verdict on every row and
+    /// on the window word, the device comparison and the records checked against the pairs, the
+    /// logits rows when the test tap asks for them, the commit of the rows, and last the mark of
+    /// the slots the kernels stored. What the draws need is kept for them. Any error is a failure
+    /// after the launch (the caller poisons).
+    fn krow_finish(&mut self, inputs: &[u32], base: usize) -> Result<RowsOut<Vec<f32>>, EngError> {
+        let k = inputs.len();
         #[cfg(test)]
         self.fault_at(Fault::KRowLaunch)?;
         #[cfg(test)]
         self.fault_at(Fault::KRowReadback)?;
-        let table = self.read_result_table(k)?;
+        let report = self.read_report(k)?;
         #[cfg(test)]
-        let table = self.status_fault(table);
+        let report = self.status_fault(report);
         #[cfg(test)]
-        self.record_table(&table);
+        let report = self.verify_fault(report);
+        #[cfg(test)]
+        self.record_table(&report.table);
         let status = RowStatus {
-            bits: table.bits.iter().map(|&bits| bits as u32).collect(),
-            window: table.window as u32,
+            bits: report.table.bits.iter().map(|&bits| bits as u32).collect(),
+            window: report.table.window as u32,
         };
-        let argmax = rows_verdict(&table.tokens, &status, self.widths.verdict)?;
-        let rows = self.read_krow_rows(k)?;
+        let argmax = rows_verdict(&report.table.tokens, &status, self.widths.verdict)?;
+        let (accepted, bonus) =
+            check_verify(&report.table.tokens, inputs, report.accepted, report.bonus)?;
+        let shortlists = if self.shortlist_on {
+            check_shortlists(
+                &report.table.tokens,
+                &report.table.bits,
+                &report.shortlists,
+                self.widths.verdict,
+            )?
+        } else {
+            Vec::new()
+        };
+        let rows = if self.krow_wants_logits() {
+            self.read_krow_rows(k)?
+        } else {
+            Vec::new()
+        };
         self.state.commit_step(k, 0)?;
         let Self {
             rollback,
             stream,
             state,
+            krow,
             ..
         } = self;
         rollback
             .as_mut()
             .ok_or_else(|| refuse("needs the device rollback slots"))?
             .mark_row_slots(stream, state, k - 1)?;
+        if let Some(runtime) = krow.as_mut() {
+            runtime.draws = Some(DeviceDraws {
+                base,
+                inputs: inputs.to_vec(),
+                accepted,
+                bonus,
+                shortlists,
+            });
+        }
         Ok(RowsOut { argmax, rows })
     }
 
-    /// The `8 K + 8` bytes of the result table: waits for the stream.
-    fn read_result_table(&self, k: usize) -> Result<WindowResult, EngError> {
+    /// The report of a `k`-row window, with one copy: waits for the stream. The records follow the
+    /// table when the shortlist ran.
+    fn read_report(&self, k: usize) -> Result<WindowReport, EngError> {
         let runtime = self.krow_runtime()?;
-        let mut bytes = vec![0u8; window_result_bytes(k)];
+        let with_records = self.shortlist_on;
+        let mut bytes = vec![0u8; window_read_bytes(k, with_records)];
         runtime
             .io
             .read_at(&self.stream, runtime.layout.result.offset, &mut bytes)?;
-        WindowResult::from_bytes(&bytes, k)
-            .ok_or_else(|| refuse("the result table does not decode (the pad word is not zero)"))
+        WindowReport::from_bytes(&bytes, k, with_records)
+            .ok_or_else(|| refuse("the report does not decode (the pad word is not zero)"))
+    }
+
+    /// Whether a window reads the logits rows of all its rows: only the test tap does.
+    fn krow_wants_logits(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.krow
+                .as_ref()
+                .is_some_and(|runtime| runtime.test.want_logits)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// The logits of the `k` rows, one vector of the head width per row.
     fn read_krow_rows(&mut self, k: usize) -> Result<Vec<Vec<f32>>, EngError> {
-        #[cfg(test)]
-        if self
-            .krow
-            .as_ref()
-            .is_some_and(|runtime| runtime.test.skip_logits)
-        {
-            return Ok(vec![Vec::new(); k]);
-        }
         let view = self.kview(Slot::Logits)?;
         let row_bytes = self.res.dims.shape.vocab * F32;
         let Self { krow, stream, .. } = self;
         let runtime = krow.as_mut().ok_or_else(not_armed)?;
+        if runtime.logits.len() < k * row_bytes {
+            runtime.logits.resize(k * row_bytes, 0);
+        }
         let out = &mut runtime.logits[..k * row_bytes];
         view.buffer().read_at(stream, view.offset(), out)?;
         Ok(out
@@ -938,6 +1036,92 @@ impl<'a> QwenResidentStep<'a> {
                     .map(|word| f32::from_le_bytes(*word))
                     .collect()
             })
+            .collect())
+    }
+}
+
+impl QwenResidentStep<'_> {
+    /// The draw of row `row` of an open K-row window whose logits stayed on the device, or `None`
+    /// when the open window is not one (the caller then takes the default path). Called only for a
+    /// sampler that is not greedy: a greedy draw is the pair token and needs nothing from here.
+    ///
+    /// The sampler draws from the row's top-20 record when the one-row step would (the record is
+    /// the one-row step's own selection, so the token stream and the generator are the same);
+    /// otherwise from the complete row: the test tap's copy when the tap read it, else one row read
+    /// from the arena. A failed read is a device failure after the launch: the window fails closed.
+    pub(crate) fn draw_from_krow_window(
+        &mut self,
+        row: usize,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Option<Result<u32, EngError>> {
+        let window = self.window.as_ref()?;
+        let draws = self.krow.as_ref()?.draws.as_ref()?;
+        if !matches!(window.saved, WindowSave::Device)
+            || !draws.belongs_to(window.base, &window.inputs)
+        {
+            return None;
+        }
+        if row >= draws.inputs.len() {
+            return Some(Err(no_window()));
+        }
+        let record = draws
+            .shortlists
+            .get(row)
+            .filter(|record| !record.is_empty());
+        match draw_source(
+            sampler.params(),
+            self.sync_each,
+            sampler_vocab == self.widths.verdict,
+            record.is_some(),
+        ) {
+            DrawSource::Shortlist => {
+                let candidates = record?;
+                Some(sampler.sample_shortlist(candidates, sampler_vocab))
+            }
+            DrawSource::Row => {
+                if let Some(values) = window.rows.get(row) {
+                    return Some(sample_logits(
+                        Self::OPERATION,
+                        values,
+                        sampler,
+                        sampler_vocab,
+                    ));
+                }
+                #[cfg(test)]
+                if let Err(error) = self.fault_at(Fault::KRowDraw) {
+                    window_logic::fail_window(self);
+                    return Some(Err(error));
+                }
+                match self.read_krow_row(row) {
+                    Ok(values) => Some(sample_logits(
+                        Self::OPERATION,
+                        &values,
+                        sampler,
+                        sampler_vocab,
+                    )),
+                    Err(error) => {
+                        window_logic::fail_window(self);
+                        Some(Err(error))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The complete logits row `row` of the last K-row window, read from the arena: one row of
+    /// the head width, waits for the stream.
+    fn read_krow_row(&self, row: usize) -> Result<Vec<f32>, EngError> {
+        let view = self.kview(Slot::Logits)?;
+        let row_bytes = self.res.dims.shape.vocab * F32;
+        let mut bytes = vec![0u8; row_bytes];
+        view.buffer()
+            .read_at(&self.stream, view.offset() + row * row_bytes, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<F32>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
             .collect())
     }
 }
@@ -958,12 +1142,19 @@ impl QwenResidentStep<'_> {
         }
     }
 
-    /// Returns empty logits rows from K-row windows (`true`): the tap a later change that reads
-    /// the logits on the device keeps.
-    pub(crate) fn set_krow_skip_logits(&mut self, skip: bool) {
+    /// The tap `want_logits`: with `true`, every K-row window also reads all K logits rows to the
+    /// host after the verdict (the D1 checks of the rows need them); with `false`, the default, a
+    /// window reads its report and nothing else, as in a serving build.
+    pub(crate) fn set_krow_want_logits(&mut self, want: bool) {
         if let Some(runtime) = self.krow.as_mut() {
-            runtime.test.skip_logits = skip;
+            runtime.test.want_logits = want;
         }
+    }
+
+    /// What the open K-row window keeps for its draws: the accepted run the device compared (and
+    /// the host checked), the token after it, and the decoded records.
+    pub(crate) fn krow_draws(&self) -> Option<DeviceDraws> {
+        self.krow.as_ref().and_then(|runtime| runtime.draws.clone())
     }
 
     /// Switches the K-row graphs off (`false`) or on: off, windows run the eager K-row body on a
@@ -1011,6 +1202,12 @@ impl QwenResidentStep<'_> {
             .as_ref()
             .ok_or_else(|| refuse("needs the device rollback slots"))?
             .slot_words(&self.stream)
+    }
+
+    /// The device-to-host reads this step's context has made so far: for each length in bytes, how
+    /// many reads of that length. The window tests take the difference across a window.
+    pub(crate) fn d2h_reads(&self) -> std::collections::BTreeMap<usize, usize> {
+        self.context.buffer_requests().ranged_d2h
     }
 
     /// The launches of the K-row kernel identities on this step's context.
@@ -1123,12 +1320,23 @@ impl QwenResidentStep<'_> {
     }
 
     /// The armed `KRowStatus` fault: the window word shows a router fault no pair shows.
-    fn status_fault(&mut self, mut table: WindowResult) -> WindowResult {
+    fn status_fault(&mut self, mut report: WindowReport) -> WindowReport {
         if self.window_fault == Some(Fault::KRowStatus) {
             self.window_fault = None;
-            table.window |= 1;
+            report.table.window |= 1;
         }
-        table
+        report
+    }
+
+    /// The armed `KRowVerify` fault: the device comparison says one more accepted row than the
+    /// pairs do (the run wraps to 0 for the longest run, so it always differs from the pairs').
+    fn verify_fault(&mut self, mut report: WindowReport) -> WindowReport {
+        if self.window_fault == Some(Fault::KRowVerify) {
+            self.window_fault = None;
+            let rows = report.table.tokens.len() as i32;
+            report.accepted = (report.accepted + 1) % rows;
+        }
+        report
     }
 }
 

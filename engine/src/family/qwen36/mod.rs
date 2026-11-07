@@ -10,6 +10,8 @@ pub(crate) mod admission_sketch;
 )]
 pub mod cuda;
 #[cfg(test)]
+mod default_path_pin_tests;
+#[cfg(test)]
 mod exl3_admission;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[cfg_attr(

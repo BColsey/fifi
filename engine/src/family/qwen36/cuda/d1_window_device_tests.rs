@@ -93,7 +93,7 @@ use crate::{
             },
         },
         sampler::{Sampler, SamplingParams},
-        session::{DecodeSession, Limits, TokenStepper},
+        session::{DecodeSession, Limits, TokenStepper, sample_logits},
         speculate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
@@ -476,6 +476,10 @@ fn rig_with(warm_graphs: bool) -> Rig {
     let mut step = step;
     arm_rollback(&mut step, rollback);
     arm_verify(&mut step, verify).unwrap_or_else(|error| panic!("{error:?}"));
+    // The checks of the logits rows (A, C, E, F, K, B) read them through the tap `want_logits`: a
+    // K-row window keeps its logits on the device and returns none unless the tap is on. D and G
+    // turn it off and draw from the report, as a serving window does.
+    step.set_krow_want_logits(true);
     step.use_krow_graphs(krow_graph);
     if verify == VerifyMode::Krow && krow_graph && warm_graphs {
         warm_krow_graphs(&mut step, &stream, context);
@@ -601,9 +605,11 @@ fn assert_kernel_ran(step: &QwenResidentStep<'_>, kernel: &str, phase: &str) {
 }
 
 /// Check H: which window path the counters say ran. The eager run shows every K-row counter at
-/// zero. The K-row run shows one `argmax_rows` and one `window_status_fold` per window it counted,
-/// at least one pack, snapshot and strided-router launch per window, and no window that fell back
-/// to the eager loop would be counted in `krow_windows`. Only the counters that observe the real
+/// zero. The K-row run shows one `argmax_rows`, one `window_status_fold` and one `verify_greedy`
+/// per window it counted, one `shortlist_rows` per window while the one-row shortlist is on (none
+/// when `Q36_CUDA_DEVICE_SHORTLIST=0` switched it off), at least one pack, snapshot and
+/// strided-router launch per window, and no window that fell back to the eager loop would be
+/// counted in `krow_windows`. Only the counters that observe the real
 /// enqueue count here; the projection counters echo the dispatch table and are printed for the
 /// record, not relied on.
 pub(super) fn require_krow_enqueued(
@@ -613,9 +619,23 @@ pub(super) fn require_krow_enqueued(
     if windows == 0 {
         return Err("no K-row window ran".to_owned());
     }
+    let shortlist = super::readback::device_shortlist_enabled(
+        std::env::var(super::readback::SHORTLIST_VAR)
+            .ok()
+            .as_deref(),
+    );
     for (name, count) in [
         ("argmax_rows", counts.argmax_rows),
         ("status_fold", counts.status_fold),
+        ("verify_greedy", counts.verify_greedy),
+        (
+            "shortlist_rows",
+            if shortlist {
+                counts.shortlist_rows
+            } else {
+                windows
+            },
+        ),
     ] {
         if count != windows {
             return Err(format!(
@@ -647,6 +667,8 @@ pub(super) fn require_krow_idle(
 ) -> Result<(), String> {
     let used = counts.argmax_rows
         + counts.status_fold
+        + counts.verify_greedy
+        + counts.shortlist_rows
         + counts.pack_rows
         + counts.conv_snap
         + counts.delta_snap
@@ -758,6 +780,7 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
         }
     }
     if which.d {
+        step.set_krow_want_logits(false);
         let setup = Setup {
             session: &session,
             tokenizer: &*tokenizer,
@@ -774,6 +797,7 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
             let sampled = accepted_prefix(step, &setup, drafts, &seeded);
             report("D", &format!("{label} seeded"), sampled);
         }
+        step.set_krow_want_logits(true);
     }
     if which.e {
         let inputs = window_inputs(stream, prefix, 8);
@@ -788,6 +812,7 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
         }
     }
     if which.g {
+        step.set_krow_want_logits(false);
         let setup = Setup {
             session: &session,
             tokenizer: &*tokenizer,
@@ -805,6 +830,7 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
                 verdict,
             );
         }
+        step.set_krow_want_logits(true);
     }
     assert_kernel_ran(step, kernel, "window and reference");
     assert_path_counters(step, verify, "windows");
@@ -1672,4 +1698,284 @@ fn d1_b_per_layer_taps() {
             ),
         }
     }
+}
+
+// ---- the logits stay on the device ----
+
+/// A sampler that keeps `top_k` candidates, seeded.
+fn seeded_keeping(top_k: u32, seed: u64) -> Sampler {
+    Sampler::new(SamplingParams::new(0.8, 0.95, top_k).expect("params"), seed)
+}
+
+/// What the scalar reads of a window (health words) may add to the report: a few hundred bytes.
+const SMALL_READS: u64 = 2_048;
+
+/// The windows' device reads: the bytes copied from the device to the host while `f` ran, and the
+/// largest single read.
+fn device_reads<T>(
+    step: &mut QwenResidentStep<'static>,
+    f: impl FnOnce(&mut QwenResidentStep<'static>) -> T,
+) -> (T, u64, usize) {
+    let before = step.d2h_reads();
+    let out = f(step);
+    let after = step.d2h_reads();
+    let (bytes, widest) = super::krow_device_tests::d2h_since(&before, &after);
+    (out, bytes, widest)
+}
+
+/// One window, its greedy draws of every row, and the verdict that keeps `kept` rows.
+fn window_draw_commit(
+    step: &mut QwenResidentStep<'static>,
+    inputs: &[u32],
+    kept: usize,
+    sampler: &mut Sampler,
+) -> Vec<u32> {
+    let base = step.tokens();
+    step.run_window(inputs).expect("the window");
+    let drawn: Vec<u32> = (0..kept)
+        .map(|row| step.draw(row, sampler, SAMPLER_VOCAB).expect("a draw"))
+        .collect();
+    step.commit_window(&Commit {
+        committed_rows: base + kept,
+        kept_rows: kept,
+        discarded_rows: inputs.len() - kept,
+        state_slot: kept - 1,
+    })
+    .expect("the verdict");
+    drawn
+}
+
+/// A window reads its report and nothing else: with the tap off, no read of the window, of its
+/// draws (greedy, and seeded with a sampler that keeps 20 candidates) or of its verdict is as wide
+/// as a logits row, and the bytes copied are the report's, a kilobyte and a half at 8 rows, against
+/// the 7.9 MB of the logits copy. With the tap on the same window copies all its rows. A sampler
+/// that keeps 40 candidates cannot be served by the record: it reads exactly one row per row it draws.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
+    use crate::kernels::cuda::resident::argmax_rows::window_full_report_bytes;
+    let (mut rig, _session, base, _inputs) = krow_rig(2);
+    let prefix = rig.prefixes[0];
+    let row_bytes = HEAD_ROWS * size_of::<f32>();
+    for rows in [2usize, 4, 8] {
+        let inputs = window_inputs(&rig.stream, prefix, rows);
+        let report = window_full_report_bytes(rows) as u64;
+        for kept in [1, rows / 2 + 1, rows] {
+            rig.step.set_krow_want_logits(false);
+            for (what, mut sampler) in [
+                ("greedy", Sampler::greedy()),
+                ("keeps 20", seeded_keeping(20, 7)),
+            ] {
+                let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+                    window_draw_commit(step, &inputs, kept, &mut sampler);
+                });
+                println!(
+                    "D1_D2H rows={rows} kept={kept} {what} tap=off bytes={bytes} widest={widest}"
+                );
+                assert!(
+                    widest < row_bytes,
+                    "{what}: a read of {widest} bytes is a logits row"
+                );
+                assert!(
+                    (report..=report + SMALL_READS).contains(&bytes),
+                    "{what}: {rows} rows copied {bytes} bytes, the report is {report}"
+                );
+                rig.step.restore(&base).expect("restore");
+            }
+            // The tap copies all the rows, once.
+            rig.step.set_krow_want_logits(true);
+            let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+                window_draw_commit(step, &inputs, kept, &mut Sampler::greedy());
+            });
+            println!("D1_D2H rows={rows} kept={kept} greedy tap=on bytes={bytes} widest={widest}");
+            assert_eq!(
+                widest,
+                rows * row_bytes,
+                "the tap reads the rows with one copy"
+            );
+            rig.step.restore(&base).expect("restore");
+            // A sampler the record cannot serve reads one row per drawn row.
+            rig.step.set_krow_want_logits(false);
+            let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+                window_draw_commit(step, &inputs, kept, &mut seeded_keeping(40, 7));
+            });
+            println!(
+                "D1_D2H rows={rows} kept={kept} keeps 40 tap=off bytes={bytes} widest={widest}"
+            );
+            assert_eq!(widest, row_bytes);
+            assert!(
+                bytes >= (kept * row_bytes) as u64
+                    && bytes <= (kept * row_bytes) as u64 + report + SMALL_READS,
+                "{kept} rows drawn from rows read one by one: {bytes} bytes"
+            );
+            rig.step.restore(&base).expect("restore");
+        }
+    }
+    rig.step.set_krow_want_logits(true);
+    println!("D1_RESULT test=D2H the logits stay on the device PASS");
+}
+
+/// The draws from the report are the draws from the full rows: for seeded samplers of several
+/// settings (a sampler that keeps 20, 5 or 1 candidate) and for the rows of a real window, drawing
+/// rows 0..d from the report gives the tokens that `Sampler::sample` gives on the tap's copy of
+/// the rows, and leaves the generator in the same state, for every d. A sampler that keeps 40
+/// candidates (read row by row from the device) gives the same too.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_draws_from_the_report_are_the_draws_from_the_full_rows() {
+    let (mut rig, _session, base, inputs) = krow_rig(8);
+    let step = &mut rig.step;
+    step.set_krow_want_logits(true);
+    step.run_window(&inputs).expect("the window with the tap");
+    let rows = step.window_logits_rows().expect("rows");
+    step.commit_window(&Commit {
+        committed_rows: base_tokens(&base) + inputs.len(),
+        kept_rows: inputs.len(),
+        discarded_rows: 0,
+        state_slot: inputs.len() - 1,
+    })
+    .expect("the verdict");
+    step.restore(&base).expect("restore");
+    for top_k in [20u32, 5, 1, 40] {
+        for seed in [0u64, 7, 12_345] {
+            for drawn in 1..=inputs.len() {
+                // The tap off: the record (or a row read on demand) answers.
+                step.set_krow_want_logits(false);
+                step.run_window(&inputs).expect("the window");
+                let mut device = seeded_keeping(top_k, seed);
+                let from_device: Vec<u32> = (0..drawn)
+                    .map(|row| step.draw(row, &mut device, SAMPLER_VOCAB).expect("a draw"))
+                    .collect();
+                step.commit_window(&Commit {
+                    committed_rows: base_tokens(&base) + drawn,
+                    kept_rows: drawn,
+                    discarded_rows: inputs.len() - drawn,
+                    state_slot: drawn - 1,
+                })
+                .expect("the verdict");
+                step.restore(&base).expect("restore");
+                let mut host = seeded_keeping(top_k, seed);
+                let from_host: Vec<u32> = (0..drawn)
+                    .map(|row| {
+                        sample_logits("host", &rows[row], &mut host, SAMPLER_VOCAB)
+                            .expect("a host draw")
+                    })
+                    .collect();
+                assert_eq!(
+                    from_device, from_host,
+                    "top_k {top_k} seed {seed} drawn {drawn}"
+                );
+                assert_eq!(
+                    device.rng_state(),
+                    host.rng_state(),
+                    "top_k {top_k} seed {seed} drawn {drawn}: the generator"
+                );
+            }
+        }
+    }
+    step.set_krow_want_logits(true);
+    println!("D1_RESULT test=draws report_equals_rows PASS");
+}
+
+/// The committed length a snapshot holds.
+fn base_tokens(base: &ExportedState) -> usize {
+    base.tokens
+}
+
+/// The device verify against the scripted acceptance: a window whose first `a` drafts are the
+/// model's own greedy tokens and whose next draft is not, for every `a` in 0..=drafts and the
+/// draft counts 1, 3 and 7. The accepted run the device stored (and the host checked against the
+/// pairs) is `a`, the bonus is the model's token after the run, and a greedy `accept_run` over the
+/// draws commits `a + 1` rows.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_the_device_verify_is_the_scripted_acceptance() {
+    use crate::family::speculate::accept::accept_run;
+    let (mut rig, _session, base, _inputs) = krow_rig(2);
+    let prefix = rig.prefixes[0];
+    let step = &mut rig.step;
+    let pending = rig.stream[prefix - 1];
+    // The model's own continuation from the pending token: reference[i] follows the i-th input.
+    let mut reference = Vec::new();
+    let mut token = pending;
+    for _ in 0..8 {
+        token = step.run_token(token, false).expect("a one-row step");
+        reference.push(token);
+    }
+    step.restore(&base).expect("restore");
+    for drafts in [1usize, 3, 7] {
+        for accepted in 0..=drafts {
+            let mut inputs = vec![pending];
+            inputs.extend_from_slice(&reference[..accepted]);
+            while inputs.len() < drafts + 1 {
+                // A draft that is not the model's token (the next id differs from the draw).
+                let wrong =
+                    (reference[inputs.len() - 1] + 1 + inputs.len() as u32) % SAMPLER_VOCAB as u32;
+                inputs.push(wrong);
+            }
+            step.set_krow_want_logits(false);
+            step.run_window(&inputs).expect("the window");
+            let draws = step.krow_draws().expect("the draws of the open window");
+            assert_eq!(
+                draws.accepted, accepted,
+                "{drafts} drafts, scripted {accepted}"
+            );
+            assert_eq!(
+                draws.bonus, reference[accepted],
+                "{drafts} drafts, scripted {accepted}: the bonus is the model's token after the run"
+            );
+            let run = accept_run(
+                &inputs[1..],
+                usize::MAX,
+                |row| step.draw(row, &mut Sampler::greedy(), SAMPLER_VOCAB),
+                |_| false,
+            )
+            .expect("the run");
+            assert_eq!(
+                run.rows_kept(),
+                accepted + 1,
+                "{drafts} drafts, scripted {accepted}"
+            );
+            assert_eq!(run.tokens, reference[..=accepted]);
+            step.commit_window(&Commit {
+                committed_rows: base_tokens(&base) + run.rows_kept(),
+                kept_rows: run.rows_kept(),
+                discarded_rows: inputs.len() - run.rows_kept(),
+                state_slot: run.rows_kept() - 1,
+            })
+            .expect("the verdict");
+            step.restore(&base).expect("restore");
+        }
+    }
+    step.set_krow_want_logits(true);
+    println!("D1_RESULT test=verify device_accepted_run_is_the_script PASS");
+}
+
+/// A full row that cannot be read at draw time fails the window closed: the state is poisoned, the
+/// gate is set, the window is closed, and only a reset recovers it. (The sampler keeps 40
+/// candidates, so the record cannot serve the draw and one row is read.)
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_a_failed_lazy_row_read_fails_the_window_closed() {
+    let (mut rig, _session, base, inputs) = krow_rig(4);
+    let step = &mut rig.step;
+    step.set_krow_want_logits(false);
+    step.run_window(&inputs).expect("the window");
+    step.inject_fault(Fault::KRowDraw);
+    let error = step
+        .draw(0, &mut seeded_keeping(40, 7), SAMPLER_VOCAB)
+        .expect_err("the read of the row fails");
+    println!("D1_RESULT test=K-draw injected failure: {error:?}");
+    // Fail closed: the state refuses a step and a snapshot, an import without a reset is refused,
+    // the window is gone, and a reset followed by an import recovers.
+    assert!(step.logits(inputs[0]).is_err(), "a step on a failed window");
+    assert!(step.snapshot().is_err(), "a snapshot of a failed window");
+    assert!(matches!(step.import_without_reset(&base), Some(Err(_))));
+    assert!(
+        step.draw(0, &mut seeded_keeping(40, 7), SAMPLER_VOCAB)
+            .is_err()
+    );
+    step.restore(&base).expect("a reset and an import recover");
+    step.set_krow_want_logits(true);
+    report("A", "after the failed draw", full_logits(step, &inputs));
 }

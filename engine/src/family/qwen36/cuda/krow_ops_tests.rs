@@ -258,7 +258,7 @@ fn the_buffer_regions_are_aligned_apart_and_as_wide_as_the_geometry() {
             );
             end = region.offset
                 + if name == "result" {
-                    window_result_bytes(rows)
+                    window_full_report_bytes(rows)
                 } else {
                     region.bytes(rows)
                 };
@@ -336,6 +336,16 @@ fn a_window_clears_the_status_word_first_and_the_fold_is_the_last_writer_of_it()
             .position(|op| *op == RowsOp::ArgmaxRows)
             .expect("argmax");
         assert_eq!(fold, argmax + 1, "{rows} rows");
-        assert_eq!(ops.len(), fold + 2, "only the advance follows the fold");
+        // Only the device verify, the shortlist (neither writes the status word) and the advance
+        // follow the fold.
+        assert_eq!(
+            ops[fold + 1..],
+            [
+                RowsOp::VerifyGreedy,
+                RowsOp::ShortlistRows,
+                RowsOp::Step(StepOp::Advance)
+            ],
+            "{rows} rows"
+        );
     }
 }

@@ -65,7 +65,7 @@ fn a_refusal_before_the_first_write_is_the_states_to_judge_and_nothing_after_the
             "self.krow_start(inputs).map_err(RowsFailure::StateDecides)?;",
             "self.run_krow_body(k, admit_pos, &mut entered)",
             "self.fail_rows(entered, error)",
-            "self.krow_finish(k)",
+            "self.krow_finish(inputs, base)",
             "RowsFailure::AfterLaunch(error)",
         ],
     );
@@ -114,7 +114,7 @@ fn the_prelaunch_checks_come_before_any_write_and_the_start_writes_ids_then_the_
 }
 
 #[test]
-fn after_the_launch_the_table_is_read_judged_and_the_logits_read_before_the_rows_commit() {
+fn after_the_launch_the_report_is_read_once_judged_and_only_the_tap_reads_the_logits() {
     let source = code(KROW);
     let finish = body(&source, "krow_finish");
     in_order(
@@ -122,18 +122,109 @@ fn after_the_launch_the_table_is_read_judged_and_the_logits_read_before_the_rows
         &[
             "self.fault_at(Fault::KRowLaunch)?;",
             "self.fault_at(Fault::KRowReadback)?;",
-            "let table = self.read_result_table(k)?;",
-            "let argmax = rows_verdict(&table.tokens, &status, self.widths.verdict)?;",
-            "let rows = self.read_krow_rows(k)?;",
+            "let report = self.read_report(k)?;",
+            "let argmax = rows_verdict(&report.table.tokens, &status, self.widths.verdict)?;",
+            "check_verify(",
+            "check_shortlists(",
+            "let rows = if self.krow_wants_logits() {",
+            "self.read_krow_rows(k)?",
             "self.state.commit_step(k, 0)?;",
             ".mark_row_slots(stream, state, k - 1)?;",
+            "runtime.draws = Some(DeviceDraws {",
         ],
     );
     // Every row's pair and the window word go to the verdict; none is dropped.
     assert!(finish.contains(&code(
-        "bits: table.bits.iter().map(|&bits| bits as u32).collect()"
+        "bits: report.table.bits.iter().map(|&bits| bits as u32).collect()"
     )));
-    assert!(finish.contains(&code("window: table.window as u32")));
+    assert!(finish.contains(&code("window: report.table.window as u32")));
+    // The device verify is checked against the pairs and the window ids.
+    assert!(finish.contains(&code("&report.table.tokens,\n inputs,")));
+    // The logits rows are read in one place, under the tap, and nowhere else in the window: not
+    // before the verdict, not in the read of the report, not on the replay.
+    assert_eq!(finish.matches("read_krow_rows(").count(), 1);
+    assert_eq!(
+        source.matches("read_krow_rows(").count(),
+        3,
+        "its definition, the call of the tap, and the test hook that reads a failed window's arena"
+    );
+    assert!(source.matches("fnread_krow_row(").count() == 1);
+    let tap = body(&source, "krow_wants_logits");
+    assert!(tap.contains(&code("runtime.test.want_logits")));
+    assert!(tap.contains("#[cfg(not(test))]{false}"));
+    // The report is one read of the table, the verify words and the records, from the result region.
+    let report = body(&source, "read_report");
+    in_order(
+        report,
+        &[
+            "let mut bytes = vec![0u8; window_read_bytes(k, with_records)];",
+            ".read_at(&self.stream, runtime.layout.result.offset, &mut bytes)?;",
+            "WindowReport::from_bytes(&bytes, k, with_records)",
+        ],
+    );
+    assert_eq!(report.matches("read_at(").count(), 1, "one copy");
+}
+
+#[test]
+fn the_window_tail_launches_the_device_verify_and_the_shortlist_from_the_one_row_count() {
+    let source = code(KROW);
+    let ops = body(&source, "run_op_rows");
+    in_order(
+        ops,
+        &[
+            "RowsOp::StatusFold => ctx.window_status_fold(s, self.tail_calls(k)?.1),",
+            "RowsOp::VerifyGreedy => ctx.verify_greedy(s, self.verify_call(k)?),",
+            "RowsOp::ShortlistRows if !self.shortlist_on => Ok(()),",
+            "RowsOp::ShortlistRows => ctx.shortlist_rows(s, self.shortlist_call(k)?),",
+        ],
+    );
+    let verify = body(&source, "verify_call");
+    in_order(
+        verify,
+        &[
+            "m: k,",
+            "runtime.layout.ids.offset, runtime.layout.ids.bytes(k)",
+            "runtime.layout.result.offset, window_report_bytes(k)",
+        ],
+    );
+    let shortlist = body(&source, "shortlist_call");
+    in_order(
+        shortlist,
+        &[
+            "m: k,",
+            "n: self.widths.verdict,",
+            "logits: self.kview(Slot::Logits)?,",
+            "scratch: self.kview(Slot::ArgmaxPart)?,",
+            "scratch_stride: ARGMAX_PART_BYTES,",
+            "runtime.layout.result.offset + window_shortlist_offset(k),",
+            "k * SHORTLIST_RECORD_BYTES,",
+        ],
+    );
+}
+
+#[test]
+fn a_draw_reads_one_row_only_when_the_record_cannot_serve_it_and_a_failed_read_fails_the_window() {
+    let source = code(KROW);
+    let draw = body(&source, "draw_from_krow_window");
+    in_order(
+        draw,
+        &[
+            "WindowSave::Device",
+            "draws.belongs_to(window.base, &window.inputs)",
+            "draw_source(",
+            "DrawSource::Shortlist =>",
+            "sampler.sample_shortlist(candidates, sampler_vocab)",
+            "DrawSource::Row =>",
+            "window.rows.get(row)",
+            "self.fault_at(Fault::KRowDraw)",
+            "window_logic::fail_window(self);",
+            "self.read_krow_row(row)",
+        ],
+    );
+    // The failed read closes the window on both routes (the injected fault and the real error).
+    assert_eq!(draw.matches("window_logic::fail_window(self);").count(), 2);
+    // A single row, not the window's rows.
+    assert!(body(&source, "read_krow_row").contains(&code("row * row_bytes")));
 }
 
 #[test]

@@ -25,7 +25,9 @@ use super::{
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role},
-    kernels::cuda::resident::{argmax_rows::window_result_bytes, step_params::RESULT_PAIR_BYTES},
+    kernels::cuda::resident::{
+        argmax_rows::window_full_report_bytes, step_params::RESULT_PAIR_BYTES,
+    },
 };
 
 const F32: usize = size_of::<f32>();
@@ -361,8 +363,14 @@ impl Region {
 pub(super) struct KrowIoLayout {
     /// `i32 [K]`: the tokens of the window, read by the embedding.
     pub(super) ids: Region,
-    /// The result table of the window: `K` pairs, the window word and a pad word
-    /// ([`window_result_bytes`]). Its `row_bytes` is one pair.
+    /// The report of the window, which the host reads with one copy ([`WindowReport`]): `K` pairs,
+    /// the window word and a pad word, the accepted run and the bonus token of the device verify,
+    /// then the shortlist record of each row at [`window_shortlist_offset`]. The region is sized for
+    /// the longest window ([`window_full_report_bytes`]); a window of `k` rows uses the first
+    /// `window_full_report_bytes(k)` bytes. Its `row_bytes` is one pair.
+    ///
+    /// [`WindowReport`]: crate::kernels::cuda::resident::argmax_rows::WindowReport
+    /// [`window_shortlist_offset`]: crate::kernels::cuda::resident::argmax_rows::window_shortlist_offset
     pub(super) result: Region,
     pub(super) qkv: Region,
     pub(super) z: Region,
@@ -393,7 +401,7 @@ impl KrowIoLayout {
         };
         let tight = |width: usize| width.checked_mul(F32).ok_or_else(overflow);
         let ids = place(size_of::<i32>(), rows * size_of::<i32>())?;
-        let result = place(RESULT_PAIR_BYTES, window_result_bytes(rows))?;
+        let result = place(RESULT_PAIR_BYTES, window_full_report_bytes(rows))?;
         let qkv_row = tight(g.delta.channels)?;
         let qkv = place(qkv_row, rows * qkv_row)?;
         let z_row = tight(g.delta.z_rows)?;

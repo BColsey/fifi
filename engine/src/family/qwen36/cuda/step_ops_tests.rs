@@ -213,7 +213,8 @@ fn the_body_op_list_is_pinned() {
 }
 
 #[test]
-fn a_k_row_window_is_the_body_then_argmax_rows_then_the_status_fold_then_advance() {
+fn a_k_row_window_is_the_body_then_argmax_rows_the_fold_the_device_verify_the_shortlist_then_advance()
+ {
     use StepOp::{Advance, Begin, Embed, FinalNorm, LmHead, Mixer, Moe};
     let want = [
         RowsOp::Step(Begin),
@@ -226,6 +227,8 @@ fn a_k_row_window_is_the_body_then_argmax_rows_then_the_status_fold_then_advance
         RowsOp::Step(LmHead),
         RowsOp::ArgmaxRows,
         RowsOp::StatusFold,
+        RowsOp::VerifyGreedy,
+        RowsOp::ShortlistRows,
         RowsOp::Step(Advance),
     ];
     for rows in 2..=8 {
@@ -267,6 +270,18 @@ fn the_status_fold_is_the_last_status_writer_of_a_k_row_window_and_argmax_rows_w
     assert_eq!(writers.first(), Some(&0), "step_begin clears status first");
     assert!(!writers.contains(&argmax), "row-local bits only");
     assert!(argmax < fold, "the fold ORs what the argmax stored");
+    // The device verify and the shortlist read what argmax_rows stored, write no status word, and
+    // come after the fold, so the fold stays the last status writer.
+    let verify = ops
+        .iter()
+        .position(|&op| op == RowsOp::VerifyGreedy)
+        .expect("verify greedy");
+    let shortlist = ops
+        .iter()
+        .position(|&op| op == RowsOp::ShortlistRows)
+        .expect("shortlist rows");
+    assert!(argmax < verify && fold < verify && argmax < shortlist);
+    assert!(!writers.contains(&verify) && !writers.contains(&shortlist));
     assert_eq!(ops.last(), Some(&RowsOp::Step(StepOp::Advance)));
     assert!(!ops.last().unwrap().writes_status(AttentionKind::Full));
 }
@@ -288,7 +303,11 @@ fn the_phases_of_a_k_row_window_ascend_and_every_phase_of_the_plan_is_run() {
             "{op:?} not ascending"
         );
         let starts_layer = matches!(op, RowsOp::Step(StepOp::Mixer(_)));
-        if let (Some(prev), false, false) = (last, starts_layer, op == RowsOp::StatusFold) {
+        let tail = matches!(
+            op,
+            RowsOp::StatusFold | RowsOp::VerifyGreedy | RowsOp::ShortlistRows
+        );
+        if let (Some(prev), false, false) = (last, starts_layer, tail) {
             assert!(
                 phases[0] > prev,
                 "{op:?} starts at {} after {prev}",
