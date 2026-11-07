@@ -931,7 +931,11 @@ fn compiled_and_uncompiled_attention_blocks_agree_in_f32_tiny() {
     let hidden = dim(shape.hidden).unwrap();
     let mut cache = super::attn::KvCache::with_step(3);
     for pos in 0u32..5 {
-        let x_values = lcg_values(0x5147_5157_u64.wrapping_add(u64::from(pos)), hidden, 0.5);
+        let x_values = lcg_values(
+            0x5147_5157_u64.wrapping_add(u64::from(pos)),
+            hidden as usize,
+            0.5,
+        );
         let hosts = [f32_tensor(vec![1, hidden], &x_values).unwrap()];
         let x_zero = decoder.kernels.import_many(&[&hosts[0]]).unwrap()[0].share();
         let mut ctx = Ctx {
@@ -956,10 +960,7 @@ fn compiled_and_uncompiled_attention_blocks_agree_in_f32_tiny() {
             values(ctx.kernels, &plain.out).unwrap(),
             values(ctx.kernels, &compiled_run.out).unwrap(),
         );
-        assert_finite(
-            "tiny f32 attention outputs",
-            &[&plain.out, &compiled_run.out],
-        );
+        assert_finite("tiny f32 attention outputs", &[&p, &c]);
         assert!(
             max_abs_diff(&p, &c) <= 5e-5,
             "tiny attention out differs at pos {pos}: {}",
@@ -1133,9 +1134,9 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
         (0, 0, 0, 0),
         "compile: false warms nothing"
     );
-    let (off_delta_seconds, off_moe_seconds) = off.compile_warmup_seconds();
+    let (off_delta_seconds, off_moe_seconds, off_attn_seconds) = off.compile_warmup_seconds();
     assert!(
-        off_delta_seconds.is_empty() && off_moe_seconds.is_empty(),
+        off_delta_seconds.is_empty() && off_moe_seconds.is_empty() && off_attn_seconds.is_empty(),
         "no warm-up seconds with the setting off"
     );
     drop(off);
@@ -1144,19 +1145,19 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
     drop(session);
     let stats = on.compile_counters();
     assert_eq!(
-        (stats.delta.calls, stats.moe.calls),
-        (1, 1),
+        (stats.delta.calls, stats.moe.calls, stats.attn.calls),
+        (1, 1, 1),
         "the uniform tiny model warms one call per block kind"
     );
     assert_eq!(
-        (stats.delta.traces, stats.moe.traces),
-        (1, 1),
-        "the warm-up traced both block kinds once (the native body counts)"
+        (stats.delta.traces, stats.moe.traces, stats.attn.traces),
+        (1, 1, 1),
+        "the warm-up traced every block kind once (the native body counts)"
     );
-    let (delta_seconds, moe_seconds) = on.compile_warmup_seconds();
+    let (delta_seconds, moe_seconds, attn_seconds) = on.compile_warmup_seconds();
     assert_eq!(
-        (delta_seconds.len(), moe_seconds.len()),
-        (1, 1),
+        (delta_seconds.len(), moe_seconds.len(), attn_seconds.len()),
+        (1, 1, 1),
         "this engine's warm-up seconds are labeled per block kind"
     );
     drop(on);
