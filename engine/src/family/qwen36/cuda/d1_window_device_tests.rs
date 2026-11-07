@@ -1426,8 +1426,45 @@ fn d1_krow_arming_refuses_a_set_single_row_switch() {
     println!("D1_RESULT test=K-switch {SINGLE_GATHER_VAR} refused: {text}");
 }
 
+/// How a deliberately broken window was caught, for the result line. Check A can catch it (the
+/// logits differ from the one-row steps: a D1 violation), or the host cross-check of the device
+/// verify can catch it first and fail the window closed (an engine error that names the device
+/// verify). In the second case the state must refuse every use: the recovery gate is set, the
+/// state is poisoned, and no window is left for a verdict to commit.
+fn how_the_break_was_caught(
+    step: &mut QwenResidentStep<'static>,
+    violation: bool,
+    detail: &str,
+) -> &'static str {
+    if violation {
+        return "check A";
+    }
+    assert!(
+        detail.contains("device verify says run"),
+        "an engine error other than the verify cross-check: {detail}"
+    );
+    let refused = step
+        .logits(0)
+        .expect_err("a step on a window that failed closed");
+    assert!(
+        format!("{refused:?}").contains("recovery gate"),
+        "the window did not fail closed: {refused:?}"
+    );
+    let base = step.tokens();
+    step.commit_window(&Commit {
+        committed_rows: base + 1,
+        kept_rows: 1,
+        discarded_rows: 0,
+        state_slot: 0,
+    })
+    .expect_err("nothing commits after a failed window");
+    assert_eq!(step.tokens(), base, "a failed window moved the counters");
+    "verify cross-check"
+}
+
 /// The deliberate-break control: run with `FIFI_KROW_BREAK=ids`, which changes row 1's token on
-/// the device after the host wrote the window ids, inside the K-row path only. Check A must FAIL.
+/// the device after the host wrote the window ids, inside the K-row path only. The break must be
+/// caught, by check A or by the cross-check of the device verify (which fails the window closed).
 /// A pass of this test shows that the K-row path is the one feeding the checks.
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
@@ -1440,8 +1477,8 @@ fn d1_krow_a_deliberately_broken_window_is_caught_by_check_a() {
     let (mut rig, _session, _base, inputs) = krow_rig(4);
     let failure = full_logits(&mut rig.step, &inputs)
         .expect_err("a window with a changed token must differ from the one-row steps");
-    println!("D1_RESULT test=K-break caught: {failure}");
-    assert!(failure.violation, "{failure}");
+    let caught = how_the_break_was_caught(&mut rig.step, failure.violation, &failure.detail);
+    println!("D1_RESULT test=K-break caught by {caught}: {failure}");
 }
 
 /// A token outside the sampler vocabulary in any row of a K-row window is refused before the ids
@@ -1629,8 +1666,9 @@ fn d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows() 
 /// The deliberate-break control of the replay: run with `FIFI_KROW_BREAK=ids-replay`, which changes
 /// row 1's token on the device just before a window launches a graph that an earlier window
 /// captured. The eager window and the window that captures are untouched and must pass check A;
-/// the next window replays the graph and check A must FAIL. A pass shows that the replay is the
-/// path feeding the checks, and that the device word the graph reads is read at the replay.
+/// the next window replays the graph and the break must be caught, by check A or by the
+/// cross-check of the device verify (which fails the window closed). A pass shows that the replay
+/// is the path feeding the checks, and that the device word the graph reads is read at the replay.
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_a_deliberately_broken_replay_is_caught_by_check_a() {
@@ -1655,8 +1693,8 @@ fn d1_krow_a_deliberately_broken_replay_is_caught_by_check_a() {
     let moved = moved_inputs(&mut rig, &base, prefix, 5, 4);
     let failure = full_logits(&mut rig.step, &moved)
         .expect_err("a replay with a changed token must differ from the one-row steps");
-    println!("D1_RESULT test=K-break-replay caught: {failure}");
-    assert!(failure.violation, "{failure}");
+    let caught = how_the_break_was_caught(&mut rig.step, failure.violation, &failure.detail);
+    println!("D1_RESULT test=K-break-replay caught by {caught}: {failure}");
     assert!(rig.step.krow_graph_stats().replays[4] >= 2);
 }
 
