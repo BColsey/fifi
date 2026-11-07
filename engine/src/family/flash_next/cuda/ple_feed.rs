@@ -131,7 +131,10 @@ pub(in crate::family) struct PleKeyValue {
 /// (`hidden x ple_embed`), applied to one embedding of `ple_embed` values. The step needs nothing
 /// else from the weights, so a route plugs in here: [`HostProjection`] is the F32 reference; the
 /// device route runs the same two matvecs on the card (one launch pair, one 44 KiB download).
-pub(in crate::family) trait PleProjection: Send {
+///
+/// Not `Send`: the step runs on one thread, and the device route holds the step's `Rc` handles to
+/// the CUDA context and stream, which cannot move between threads.
+pub(in crate::family) trait PleProjection {
     fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError>;
 }
 
