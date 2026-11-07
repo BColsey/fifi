@@ -26,11 +26,14 @@
 //! ISA tiers: the scalar reference works for every mul1 bit rate and is the fallback on CPUs
 //! without AVX2; the AVX2 + FMA tier (`exl3_cpu_avx2`) and the AVX-512 VBMI/VNNI tier
 //! (`exl3_cpu_avx512`) each handle every stored rate (1 to 8 bits, including the half-bit rates).
-//! The tier is chosen at run time: AVX-512 if the CPU has it, else AVX2, else scalar.
+//! The tier is chosen at run time: AVX-512 if the CPU has it, else AVX2, else scalar. The
+//! `FIFI_EXL3_CPU_ISA` setting (`auto`, `avx512`, `avx2`, `scalar`) forces one; a tier the CPU
+//! lacks is refused, never replaced.
 //!
 //! Threading: [`ExpertCpu`] owns an [`Exl3Pool`]; a layer runs as five short phases (rotate,
 //! project gate/up, activate and rotate, project down, rotate and scale), each a pool call.
 
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -52,6 +55,9 @@ const MUL1: u32 = 0x83dc_d12d;
 /// Tile columns one pool chunk projects: 2 columns read 256 bytes per k step, 32 KB in all for
 /// a 2048-deep matrix.
 const COLUMN_TILES_PER_CHUNK: usize = 2;
+
+/// Environment setting that forces the tier: `auto` (the default), `avx512`, `avx2` or `scalar`.
+pub const ISA_ENV: &str = "FIFI_EXL3_CPU_ISA";
 
 /// Instruction set tier of the column kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +120,40 @@ impl Exl3Isa {
 
     pub fn is_supported(self) -> bool {
         IsaSupport::host().allows(self)
+    }
+
+    /// The tier `FIFI_EXL3_CPU_ISA` asks for, or the best supported one when it is unset or
+    /// `auto`. A tier this CPU lacks, and any other value, is an error: nothing falls back.
+    pub fn from_env() -> Result<Self, EngError> {
+        resolve_isa(std::env::var_os(ISA_ENV).as_deref(), IsaSupport::host())
+    }
+}
+
+/// `None` for `auto` or an unset setting. Surrounding spaces and letter case are ignored.
+fn parse_isa_setting(value: Option<&OsStr>) -> Result<Option<Exl3Isa>, EngError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let text = raw.to_str().map(|s| s.trim().to_ascii_lowercase());
+    match text.as_deref() {
+        Some("auto") => Ok(None),
+        Some("avx512") => Ok(Some(Exl3Isa::Avx512)),
+        Some("avx2") => Ok(Some(Exl3Isa::Avx2)),
+        Some("scalar") => Ok(Some(Exl3Isa::Scalar)),
+        _ => Err(EngError::BadRequest(format!(
+            "{ISA_ENV} must be auto, avx512, avx2 or scalar, got {raw:?}"
+        ))),
+    }
+}
+
+fn resolve_isa(value: Option<&OsStr>, support: IsaSupport) -> Result<Exl3Isa, EngError> {
+    match parse_isa_setting(value)? {
+        None => Ok(support.best()),
+        Some(isa) if support.allows(isa) => Ok(isa),
+        Some(isa) => Err(EngError::BadRequest(format!(
+            "{ISA_ENV} asks for the {isa:?} tier, which this CPU does not support; \
+             use auto to take the best supported tier"
+        ))),
     }
 }
 
@@ -471,9 +511,13 @@ pub struct ExpertCpu {
 }
 
 impl ExpertCpu {
-    /// `threads` counts the calling thread. `isa` forces a tier; `None` picks the best supported.
+    /// `threads` counts the calling thread. `isa` forces a tier; `None` follows
+    /// `FIFI_EXL3_CPU_ISA` (the best supported tier when it is unset or `auto`).
     pub fn new(threads: usize, wait: WaitPolicy, isa: Option<Exl3Isa>) -> Result<Self, EngError> {
-        let isa = isa.unwrap_or_else(Exl3Isa::detect);
+        let isa = match isa {
+            Some(isa) => isa,
+            None => Exl3Isa::from_env()?,
+        };
         if !isa.is_supported() {
             return Err(EngError::BadRequest(format!(
                 "EXL3 CPU kernel tier {isa:?} is not supported by this CPU"

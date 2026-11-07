@@ -428,6 +428,10 @@ fn report_the_tiers_under_test() {
     assert_eq!(tiers.contains(&Exl3Isa::Avx512), IsaSupport::host().avx512);
 }
 
+fn os(text: &str) -> std::ffi::OsString {
+    text.into()
+}
+
 #[test]
 fn the_automatic_order_is_avx512_then_avx2_then_scalar() {
     for (avx512, avx2, want) in [
@@ -438,8 +442,112 @@ fn the_automatic_order_is_avx512_then_avx2_then_scalar() {
     ] {
         let support = IsaSupport { avx512, avx2 };
         assert_eq!(support.best(), want, "avx512={avx512} avx2={avx2}");
+        assert_eq!(resolve_isa(None, support), Ok(want));
+        assert_eq!(resolve_isa(Some(&os("auto")), support), Ok(want));
     }
-    assert!(Exl3Isa::Scalar.is_supported());
+}
+
+/// On a host with AVX-512 the default is the AVX-512 tier, as before the AVX2 tier existed, and
+/// it produces the bits of an explicitly requested AVX-512 engine.
+#[test]
+fn an_avx512_host_keeps_the_avx512_default() {
+    if std::env::var_os(ISA_ENV).is_some() || !IsaSupport::host().avx512 {
+        eprintln!("skipped: the setting is set or the host has no AVX-512");
+        return;
+    }
+    assert_eq!(Exl3Isa::detect(), Exl3Isa::Avx512);
+    assert_eq!(Exl3Isa::from_env(), Ok(Exl3Isa::Avx512));
+    let mut rng = Rng(0x3141_5926_5358_9793);
+    let shape = (256, 128);
+    let parts = random_experts(&mut rng, shape, 64);
+    let experts = expert_views(&parts, shape, 64);
+    let picks: Vec<_> = experts
+        .iter()
+        .map(|&expert| ExpertPick {
+            expert,
+            weight: 1.0,
+        })
+        .collect();
+    let x: Vec<f32> = (0..shape.0).map(|_| rng.unit()).collect();
+    let run = |isa: Option<Exl3Isa>| {
+        let cpu = ExpertCpu::new(2, WaitPolicy::Park, isa).unwrap();
+        let mut out = vec![0.0f32; shape.0];
+        cpu.forward(&x, &picks, &mut out).unwrap();
+        (cpu.isa(), out)
+    };
+    let (default_isa, default_out) = run(None);
+    let (_, forced_out) = run(Some(Exl3Isa::Avx512));
+    assert_eq!(default_isa, Exl3Isa::Avx512);
+    assert_eq!(default_out, forced_out);
+}
+
+#[test]
+fn the_setting_names_a_tier_or_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let all = IsaSupport {
+        avx512: true,
+        avx2: true,
+    };
+    for (text, want) in [
+        ("avx512", Exl3Isa::Avx512),
+        ("avx2", Exl3Isa::Avx2),
+        ("scalar", Exl3Isa::Scalar),
+        (" AVX2 ", Exl3Isa::Avx2),
+        ("Scalar", Exl3Isa::Scalar),
+    ] {
+        assert_eq!(resolve_isa(Some(&os(text)), all), Ok(want), "{text:?}");
+    }
+    let bad = [
+        os(""),
+        os(" "),
+        os("avx-512"),
+        os("avx"),
+        os("sse2"),
+        os("1"),
+        std::ffi::OsStr::from_bytes(b"avx2\xff").to_owned(),
+    ];
+    for value in &bad {
+        let err = resolve_isa(Some(value), all).unwrap_err();
+        assert!(
+            matches!(&err, EngError::BadRequest(m) if m.contains(ISA_ENV)),
+            "{value:?}: {err:?}"
+        );
+    }
+}
+
+/// A forced tier the CPU lacks is an error that names the setting; scalar is always available.
+#[test]
+fn a_forced_tier_the_cpu_lacks_is_refused_not_replaced() {
+    for support in [
+        IsaSupport {
+            avx512: false,
+            avx2: true,
+        },
+        IsaSupport {
+            avx512: false,
+            avx2: false,
+        },
+    ] {
+        let err = resolve_isa(Some(&os("avx512")), support).unwrap_err();
+        assert!(
+            matches!(&err, EngError::BadRequest(m) if m.contains(ISA_ENV) && m.contains("Avx512")),
+            "{err:?}"
+        );
+        assert_eq!(
+            resolve_isa(Some(&os("scalar")), support),
+            Ok(Exl3Isa::Scalar)
+        );
+    }
+    let none = IsaSupport {
+        avx512: false,
+        avx2: false,
+    };
+    let err = resolve_isa(Some(&os("avx2")), none).unwrap_err();
+    assert!(
+        matches!(&err, EngError::BadRequest(m) if m.contains("Avx2")),
+        "{err:?}"
+    );
+    assert!(!none.allows(Exl3Isa::Avx2) && !none.allows(Exl3Isa::Avx512));
 }
 
 fn median(mut samples: Vec<Duration>) -> Duration {
