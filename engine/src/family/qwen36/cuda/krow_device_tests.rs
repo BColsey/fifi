@@ -10,7 +10,7 @@ use std::ffi::OsString;
 
 use super::{
     d1_window_device_tests::{require_krow_enqueued, require_krow_idle},
-    step::LayerTap,
+    step::{GraphStats, LayerTap},
 };
 use crate::{
     family::qwen36::{
@@ -40,6 +40,62 @@ pub(super) fn switch_refusal(get: impl Fn(&str) -> Option<OsString>) -> Result<(
 /// [`switch_refusal`] over the process environment.
 pub(super) fn refuse_switches() -> Result<(), String> {
     switch_refusal(|name| std::env::var_os(name))
+}
+
+/// The windows that enqueued the K-row body whole: the eager windows and the capturing windows.
+/// The kernel counters count at the enqueue (or at the capture), never at a replay, so this is the
+/// number they must be compared with.
+pub(super) fn graph_enqueued_windows(stats: &GraphStats) -> u64 {
+    stats.eager_total() + stats.capture_total()
+}
+
+/// Check H for the graphs. `windows` are the K-row windows whose body completed; each of them ran
+/// the eager body or launched a graph (the window that captured launches it once). With the graphs
+/// off nothing may be captured or launched. A length is captured at most once, and a captured
+/// length launched at least once (its capturing window).
+pub(super) fn require_graph_counts(
+    windows: u64,
+    stats: &GraphStats,
+    graphs_on: bool,
+) -> Result<(), String> {
+    if !graphs_on {
+        if stats.capture_total() != 0 || stats.replay_total() != 0 {
+            return Err(format!(
+                "graphs are off and {} were captured, {} launched",
+                stats.capture_total(),
+                stats.replay_total()
+            ));
+        }
+        if windows != stats.eager_total() {
+            return Err(format!(
+                "{windows} K-row windows, {} eager",
+                stats.eager_total()
+            ));
+        }
+        return Ok(());
+    }
+    let ran = stats.eager_total() + stats.replay_total();
+    if windows != ran {
+        return Err(format!(
+            "{windows} K-row windows, {} eager and {} launched a graph",
+            stats.eager_total(),
+            stats.replay_total()
+        ));
+    }
+    for rows in 0..stats.captures.len() {
+        if stats.captures[rows] > 1 {
+            return Err(format!(
+                "the graph of {rows} rows was captured {} times",
+                stats.captures[rows]
+            ));
+        }
+        if stats.captures[rows] > stats.replays[rows] {
+            return Err(format!(
+                "the graph of {rows} rows was captured and never launched"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check B: the first difference between the per-layer taps of a K-row window and those of the
@@ -336,4 +392,59 @@ fn a_table_with_a_non_zero_pad_word_does_not_decode() {
     let at = bytes.len() - 4;
     bytes[at] = 1;
     assert!(WindowResult::from_bytes(&bytes, 2).is_none());
+}
+
+fn stats(
+    eager: &[(usize, u64)],
+    captures: &[(usize, u64)],
+    replays: &[(usize, u64)],
+) -> GraphStats {
+    let mut stats = GraphStats::default();
+    for &(rows, n) in eager {
+        stats.eager[rows] = n;
+    }
+    for &(rows, n) in captures {
+        stats.captures[rows] = n;
+    }
+    for &(rows, n) in replays {
+        stats.replays[rows] = n;
+    }
+    stats
+}
+
+#[test]
+fn the_graph_counters_of_a_run_with_graphs_add_up_to_the_windows() {
+    // 4 rows: one eager, one capture (which launches), five replays; 2 rows: one eager only.
+    let run = stats(&[(4, 1), (2, 1)], &[(4, 1)], &[(4, 6)]);
+    require_graph_counts(8, &run, true).expect("windows are eager plus launches");
+    assert_eq!(
+        graph_enqueued_windows(&run),
+        3,
+        "two eager and one capture enqueued the body"
+    );
+    assert!(
+        require_graph_counts(9, &run, true).is_err(),
+        "a window nothing accounts for"
+    );
+    assert!(
+        require_graph_counts(7, &run, true).is_err(),
+        "a counted window that did not run"
+    );
+}
+
+#[test]
+fn a_run_with_the_graphs_off_must_not_have_captured_or_launched_one() {
+    let eager_only = stats(&[(3, 4)], &[], &[]);
+    require_graph_counts(4, &eager_only, false).expect("an eager run");
+    let leaked = stats(&[(3, 3)], &[(3, 1)], &[(3, 1)]);
+    assert!(require_graph_counts(4, &leaked, false).is_err());
+    assert!(require_graph_counts(5, &eager_only, false).is_err());
+}
+
+#[test]
+fn a_length_captured_twice_or_never_launched_fails_the_graph_counter_check() {
+    let twice = stats(&[(5, 1)], &[(5, 2)], &[(5, 3)]);
+    assert!(require_graph_counts(4, &twice, true).is_err());
+    let never = stats(&[(5, 1)], &[(5, 1)], &[]);
+    assert!(require_graph_counts(1, &never, true).is_err());
 }

@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6116,
-      "ignored": 516,
+      "test_fns": 6157,
+      "ignored": 518,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -33,6 +33,7 @@
         "FIFI_ADD_CHAIN_M",
         "FIFI_D1_CAPTURE",
         "FIFI_D1_CONTEXT",
+        "FIFI_D1_KROW_GRAPH",
         "FIFI_D1_KROW_ROWS",
         "FIFI_D1_KV",
         "FIFI_D1_NEAR_TIE_FIXTURE",

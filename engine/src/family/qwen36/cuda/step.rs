@@ -342,13 +342,21 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The leaked pin slice of the weights and the arena slot: one leaked slice per new step (one
     /// step per session); the graph bakes their addresses in.
     pins: &'a [&'a DeviceBuffer],
+    /// The pins of a K-row graph: the pins above and the K-row arena. Leaked at `enable_krow`
+    /// (one slice per armed step); empty until then.
+    krow_pins: &'a [&'a DeviceBuffer],
     /// The replayable body, once a capture has succeeded. Declared BEFORE the state field: the
     /// graph (which keeps the arena holds and borrows the pin slice) drops first, and that
     /// covers the state buffers by drop order -- they live inside the step and never move
     /// after they are built, so the pin list need not name them.
     graph: Option<GraphExec<'a>>,
-    /// The K-row verify window (`draft_verify = krow`), once armed. Declared right after `graph`
-    /// and before the state: a captured K-row body bakes in the addresses of its small buffer, so
+    /// The graphs of the K-row body, one per window length (`krow_graph`). Declared right after
+    /// `graph` and before `krow`, `state` and `rollback`: a graph bakes in the addresses of the
+    /// K-row buffer, the state and the rollback slots, so every graph must drop first. A test
+    /// pins this order (`krow_graph_tests::the_k_row_graphs_are_declared_before_the_buffers_they_bake_in`).
+    krow_graphs: krow_graph::GraphTable<GraphExec<'a>>,
+    /// The K-row verify window (`draft_verify = krow`), once armed. Declared after the graphs and
+    /// before the state: a captured K-row body bakes in the addresses of its small buffer, so
     /// any graph of it must drop first.
     krow: Option<krow_step::KrowRuntime>,
     #[cfg(feature = "research-activation")]
@@ -724,7 +732,9 @@ impl<'a> QwenResidentStep<'a> {
             })?;
         let step = Self {
             pins,
+            krow_pins: &[],
             graph: None,
+            krow_graphs: krow_graph::GraphTable::default(),
             krow: None,
             #[cfg(feature = "research-activation")]
             activation: std::cell::RefCell::new(None),
@@ -2294,9 +2304,14 @@ mod shortlist_bench;
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
 
+#[path = "krow_graph.rs"]
+mod krow_graph;
+
 #[path = "krow_step.rs"]
 mod krow_step;
 
+#[cfg(test)]
+pub(super) use krow_graph::GraphStats;
 #[cfg(test)]
 pub(super) use krow_step::{Injection, LayerTap};
 

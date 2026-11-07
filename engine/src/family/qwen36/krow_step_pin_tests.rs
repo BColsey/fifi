@@ -63,7 +63,7 @@ fn a_refusal_before_the_first_write_is_the_states_to_judge_and_nothing_after_the
         &[
             "self.krow_prelaunch(inputs).map_err(RowsFailure::StateDecides)?;",
             "self.krow_start(inputs).map_err(RowsFailure::StateDecides)?;",
-            "self.run_body_rows(k, admit_pos, &mut entered)",
+            "self.run_krow_body(k, admit_pos, &mut entered)",
             "self.fail_rows(entered, error)",
             "self.krow_finish(k)",
             "RowsFailure::AfterLaunch(error)",
@@ -206,6 +206,76 @@ fn arming_checks_the_krow_rules_and_the_configuration_before_it_allocates() {
             "RowsKindOps::new(&res.geometry)",
             "KrowIoLayout::new(&res.geometry, rows)?",
             "self.context.allocate(layout.total)?",
+            "self.krow = Some(KrowRuntime {",
+        ],
+    );
+}
+
+#[test]
+fn the_window_runs_in_the_mode_of_its_own_length_and_a_launch_is_judged_after_the_launch() {
+    let source = code(KROW);
+    let run = body(&source, "run_krow_body");
+    in_order(
+        run,
+        &[
+            "self.krow_mode(k)?",
+            "Mode::Replay => self.replay_krow(k, entered, false)",
+            "Mode::Capture => self.capture_krow(k, admit_pos, entered)",
+            "Mode::Eager => self",
+            ".run_body_rows(k, admit_pos, entered)",
+        ],
+    );
+    // The mode comes from the table of the window's own length.
+    let mode = body(&source, "krow_mode");
+    assert!(mode.contains(&code("self.krow_graphs.mode(k, self.capture_on)")));
+    // A graph launch counts as a window past its first op, and the deliberate break of the replay
+    // comes before the launch, so it changes a device word after the capture.
+    let replay = body(&source, "replay_krow");
+    in_order(
+        replay,
+        &[
+            "*entered = ENTERED_BY_GRAPH;",
+            "break_one_id(runtime, &self.stream, \"ids-replay\")?;",
+            ".graph(k)?",
+            "graph.launch(stream)?;",
+            "krow_graphs.note_replay(k);",
+        ],
+    );
+    // The capture: the arena is held and pinned, the body is the K-row list of `k` rows, a refusal
+    // falls back to the same list run eagerly, and the graph is stored under `k` and launched.
+    let capture = body(&source, "capture_krow");
+    in_order(
+        capture,
+        &[
+            "krow.arena.hold()",
+            "self.context.capture(",
+            "pins: self.krow_pins,",
+            "|| self.run_body_rows(k, admit_pos, entered)",
+            "fold_capture(",
+            "self.krow_graphs.refused_mut()",
+            "self.krow_graphs.store(k, graph, facts)?;",
+            "self.replay_krow(k, entered, true)",
+            "self.run_body_rows(k, admit_pos, entered)?;",
+            "self.krow_graphs.note_eager(k);",
+        ],
+    );
+    // An eager body that was enqueued whole warms its length, and nothing else does: the warm
+    // flag is not set on the replay path or by a window that failed in its body.
+    assert_eq!(run.matches("note_eager(k)").count(), 1);
+    assert_eq!(capture.matches("note_eager(k)").count(), 1);
+    assert!(!body(&source, "replay_krow").contains("note_eager"));
+}
+
+#[test]
+fn arming_leaks_the_pins_of_the_graphs_with_the_k_row_arena_before_the_state_is_published() {
+    let source = code(KROW);
+    let enable = body(&source, "enable_krow");
+    in_order(
+        enable,
+        &[
+            "self.pins.to_vec()",
+            "pinned.push(krow.arena.buffer());",
+            "self.krow_pins = Box::leak(pinned.into_boxed_slice());",
             "self.krow = Some(KrowRuntime {",
         ],
     );

@@ -13,7 +13,13 @@
 //! * `window_accept_all`: one eager window of `r` rows, every row kept: the export, `r` steps with
 //!   a logits row read back each, the greedy draws, and no rollback;
 //! * `window_reject_first`: the same window with only row 0 kept: after the rows, the import of
-//!   the saved state and one replayed row.
+//!   the saved state and one replayed row;
+//! * `window_keep_middle`: the same with `r / 2` rows kept (windows of 3 rows or more);
+//! * the same three verdicts on the device rollback (`device_*`, the eager rows and the slot copies);
+//! * with `FIFI_MRV_KROW=1` (device rollback, the K-row path armed), the same three verdicts for the
+//!   K-row window as the eager K-row body (`krow_eager_*`) and as the K-row graph (`krow_graph_*`,
+//!   timed only after the length captured its graph and replays it; the counters of every timed
+//!   window are checked and a window that did not take its path stops the run).
 //!
 //! Text is teacher forced: every arm consumes the next tokens of the same fixed stream, so the
 //! routing is that of real code. The arms advance the committed length by different amounts, so
@@ -67,8 +73,21 @@
 //! from the test's start no new cell or round begins and the record says it stopped early),
 //! `FIFI_MRV_LEASE_VRAM_GIB` (21), `FIFI_D1_KV` (fp16), `FIFI_D1_CAPTURE` (1),
 //! `FIFI_MRV_ROLLBACK` (`host`, the default; `device` or `both` arm the rollback slots and add the
-//! device arms `device_accept_all`, `device_reject_first`, `device_keep_middle`), `FIFI_MRV_SYNC_CAPTURE`
-//! (0; 1 drains the stream after each capture so the copy time shows in the trace).
+//! device arms `device_accept_all`, `device_reject_first`, `device_keep_middle`; `single` runs the
+//! single-row arm alone, for the plain decode baseline), `FIFI_MRV_KROW` (0; 1 arms the K-row path
+//! and adds the K-row arms; needs `device` or `both`), `FIFI_MRV_SYNC_CAPTURE` (0; 1 drains the
+//! stream after each capture so the copy time shows in the trace).
+//!
+//! **The split of a window.** Every window record carries `run_window_wall_ms` (the verification:
+//! the rows, or the K-row launch, the sync and the logits read-back), `draw_wall_ms` (the greedy
+//! draws) and `commit_wall_ms` (the verdict: the rollback). The K-row arms copy the logits of every
+//! row to the host inside `run_window` (K x 993,280 bytes, about 7.9 MB at K = 8) until the
+//! device-side comparison exists, so their time is not the floor of that verifier.
+//!
+//! **The shared-expert block.** The single-row arm runs the block the step runs. A step armed for
+//! the K-row path runs the separate shared block (the merged default yields to it); a plain step
+//! runs the merged default unless `FIFI_EXL3_SHARED_IN_ROUTED=0`. The record names the block
+//! (`settings.shared_expert_block`), so the plain decode step is reported both ways by two runs.
 //!
 //! **Timing accounting.** Besides the phases, every window record carries `drop_wall_ms` (the drop of
 //! the saved host state, a `Dropped` mark in test builds), `mark_overhead_ms` (the marks' own cost),
@@ -84,8 +103,9 @@ use serde_json::{Value, json};
 
 use super::{
     d1_window_device_tests::{
-        EOS, HEAD_ROWS, Loaded, SAMPLER_VOCAB, build_step, capture_from_env, exported_difference,
-        kv_mode_from_env, load_pack, step_options, text_stream,
+        EOS, HEAD_ROWS, Loaded, SAMPLER_VOCAB, arm_verify, build_step_for, capture_from_env,
+        exported_difference, krow_graph_from_env, kv_mode_from_env, load_pack, step_options,
+        text_stream,
     },
     dims::KvMode,
     eager_window::{WindowTrace, minor_faults},
@@ -99,7 +119,10 @@ use super::{
 use crate::{
     EngError,
     family::{
-        qwen36::{rollback::Cover, settings::DEFAULT_CUDA_PREFILL_CHUNK},
+        qwen36::{
+            rollback::Cover,
+            settings::{DEFAULT_CUDA_PREFILL_CHUNK, VerifyMode},
+        },
         sampler::Sampler,
         session::TokenStepper,
         speculate::{
@@ -120,6 +143,8 @@ const GIB: u64 = 1 << 30;
 const MIN_FREE_AFTER_BUILD: u64 = GIB;
 /// Positions past the deepest depth that the cache holds, for the rounds of the last cell.
 const CONTEXT_SLACK: usize = 1_536;
+/// The depth the token ids of the identity run to, whatever the depths of the run.
+const IDENTITY_DEPTH: usize = 32_768;
 
 struct Config {
     depths: Vec<usize>,
@@ -136,6 +161,10 @@ struct Config {
     rollback: BenchRollback,
     /// Drain the stream after each capture so the copy's time shows in the trace.
     sync_capture: bool,
+    /// `FIFI_MRV_KROW`: the K-row path is armed and its arms are timed.
+    krow: bool,
+    /// The K-row graphs may be captured (`FIFI_D1_KROW_GRAPH`, which follows `FIFI_D1_CAPTURE`).
+    krow_graph: bool,
 }
 
 /// `FIFI_MRV_ROLLBACK`.
@@ -144,15 +173,17 @@ enum BenchRollback {
     Host,
     Device,
     Both,
+    /// The single-row arm alone: the plain decode baseline.
+    Single,
 }
 
 impl BenchRollback {
     fn host(self) -> bool {
-        self != Self::Device
+        matches!(self, Self::Host | Self::Both)
     }
 
     fn device(self) -> bool {
-        self != Self::Host
+        matches!(self, Self::Device | Self::Both)
     }
 
     fn name(self) -> &'static str {
@@ -160,6 +191,7 @@ impl BenchRollback {
             Self::Host => "host",
             Self::Device => "device",
             Self::Both => "both",
+            Self::Single => "single",
         }
     }
 }
@@ -203,12 +235,19 @@ impl Config {
                 Ok("host") | Err(_) => BenchRollback::Host,
                 Ok("device") => BenchRollback::Device,
                 Ok("both") => BenchRollback::Both,
+                Ok("single") => BenchRollback::Single,
                 Ok(other) => {
-                    panic!("FIFI_MRV_ROLLBACK must be host, device or both, got {other:?}")
+                    panic!("FIFI_MRV_ROLLBACK must be host, device, both or single, got {other:?}")
                 }
             },
             sync_capture: env_num::<u8>("FIFI_MRV_SYNC_CAPTURE", 0) == 1,
+            krow: env_num::<u8>("FIFI_MRV_KROW", 0) == 1,
+            krow_graph: krow_graph_from_env(capture_from_env()),
         };
+        assert!(
+            !config.krow || config.rollback.device(),
+            "FIFI_MRV_KROW=1 needs FIFI_MRV_ROLLBACK=device or both: the K-row window rolls back on the device"
+        );
         assert!(
             config.depths.windows(2).all(|w| w[0] < w[1]),
             "depths rise: the prefill continues"
@@ -243,12 +282,36 @@ pub(super) fn bench_step(
     marks: bool,
     device_rows: Option<usize>,
 ) -> Result<QwenResidentStep<'static>, EngError> {
-    let mut step = build_step(
+    bench_step_with(loaded, kv, context, capture, marks, device_rows, false)
+}
+
+/// [`bench_step`] with the K-row path armed when `krow` (it needs the device rollback slots): the
+/// resources hold the K-row arena, and the arming follows the served start (the request, then the
+/// slots, then `enable_krow`).
+pub(super) fn bench_step_with(
+    loaded: &Loaded,
+    kv: KvMode,
+    context: usize,
+    capture: bool,
+    marks: bool,
+    device_rows: Option<usize>,
+    krow: bool,
+) -> Result<QwenResidentStep<'static>, EngError> {
+    assert!(
+        !krow || device_rows.is_some(),
+        "the K-row path needs the device rollback slots"
+    );
+    let mut step = build_step_for(
         loaded,
         &step_options(kv, context),
         CaptureConfig {
             capture,
             section_marks: marks,
+        },
+        if krow {
+            VerifyMode::Krow
+        } else {
+            VerifyMode::Eager
         },
     )?;
     // As `start::make`: `load_pack` registers the served single-row kernel (wide1) on the context;
@@ -272,6 +335,9 @@ pub(super) fn bench_step(
         step.request_device_rollback();
         let bytes = step.enable_device_rollback(rows, Cover::Arena, 0)?;
         step.use_device_rollback(false)?;
+        if krow {
+            arm_verify(&mut step, VerifyMode::Krow)?;
+        }
         extras.push(Extra {
             name: "device-rollback-slots",
             fixed: bytes,
@@ -494,42 +560,155 @@ fn restoration(step: &mut QwenResidentStep<'_>, inputs: &[u32]) -> Verdict<Tally
 
 struct WindowRun {
     total_ms: f64,
+    /// `run_window`: the verification (the rows or the K-row launch, the sync, the logits read).
+    run_ms: f64,
+    /// The greedy draws of the kept rows.
+    draw_ms: f64,
+    /// `commit_window`: the verdict and the rollback.
+    commit_ms: f64,
     trace: WindowTrace,
     /// Minor page faults of the process across the whole window, read outside the timed region.
     minflt: Option<u64>,
+    /// K-row windows, eager K-row bodies, captures and graph launches this window caused.
+    krow: PathCounts,
 }
 
-/// One window of `tokens` keeping `kept` rows, with the greedy draws of the kept rows, on the host
-/// rollback (`device` false) or the device rollback.
+/// What a window did on the K-row path, from the counters before and after it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct PathCounts {
+    windows: u64,
+    eager: u64,
+    captures: u64,
+    replays: u64,
+}
+
+impl PathCounts {
+    fn now(step: &QwenResidentStep<'_>) -> Self {
+        let stats = step.krow_graph_stats();
+        Self {
+            windows: step.krow_windows(),
+            eager: stats.eager_total(),
+            captures: stats.capture_total(),
+            replays: stats.replay_total(),
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            windows: self.windows - before.windows,
+            eager: self.eager - before.eager,
+            captures: self.captures - before.captures,
+            replays: self.replays - before.replays,
+        }
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "krow_windows": self.windows, "eager_krow_bodies": self.eager,
+            "graph_captures": self.captures, "graph_launches": self.replays,
+        })
+    }
+}
+
+/// Which window a round times: the host rollback, the device rollback with the eager rows, or the
+/// K-row window as the eager body or as the graph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WindowPath {
+    Host,
+    Device,
+    KrowEager,
+    KrowGraph,
+}
+
+impl WindowPath {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Device => "device_eager",
+            Self::KrowEager => "krow_eager",
+            Self::KrowGraph => "krow_graph",
+        }
+    }
+
+    fn krow(self) -> bool {
+        matches!(self, Self::KrowEager | Self::KrowGraph)
+    }
+
+    /// Selects the path on a step: the rollback, the K-row body, the graphs.
+    fn select(self, step: &mut QwenResidentStep<'_>) -> Result<(), EngError> {
+        step.use_device_rollback(self != Self::Host)?;
+        step.use_krow(self.krow());
+        step.use_krow_graphs(self == Self::KrowGraph);
+        Ok(())
+    }
+
+    /// What the counters of one timed window must show for this path, or the reason they do not.
+    fn check(self, counts: PathCounts) -> Result<(), String> {
+        let expected = match self {
+            Self::Host | Self::Device => PathCounts::default(),
+            Self::KrowEager => PathCounts {
+                windows: 1,
+                eager: 1,
+                ..PathCounts::default()
+            },
+            Self::KrowGraph => PathCounts {
+                windows: 1,
+                replays: 1,
+                ..PathCounts::default()
+            },
+        };
+        if counts == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "a {} window counted {counts:?}, expected {expected:?}",
+                self.name()
+            ))
+        }
+    }
+}
+
+/// One window of `tokens` keeping `kept` rows, with the greedy draws of the kept rows, on the path
+/// `path`.
 fn window_arm(
     step: &mut QwenResidentStep<'_>,
     tokens: &[u32],
     kept: usize,
-    device: bool,
+    path: WindowPath,
 ) -> Result<WindowRun, EngError> {
-    step.use_device_rollback(device)?;
+    path.select(step)?;
     let base = step.tokens();
+    let counted = PathCounts::now(step);
     let faults_before = minor_faults();
     let began = Instant::now();
     step.run_window(tokens)?;
+    let run_ms = ms(began);
+    let drawing = Instant::now();
     let mut greedy = Sampler::greedy();
     for row in 0..kept {
         step.draw(row, &mut greedy, SAMPLER_VOCAB)?;
     }
+    let draw_ms = ms(drawing);
+    let committing = Instant::now();
     step.commit_window(&Commit {
         committed_rows: base + kept,
         kept_rows: kept,
         discarded_rows: tokens.len() - kept,
         state_slot: kept - 1,
     })?;
+    let commit_ms = ms(committing);
     let total_ms = ms(began);
     let minflt = faults_before
         .zip(minor_faults())
         .map(|(a, b)| b.saturating_sub(a));
     Ok(WindowRun {
         total_ms,
+        run_ms,
+        draw_ms,
+        commit_ms,
         trace: step.window_trace.clone(),
         minflt,
+        krow: PathCounts::now(step).since(counted),
     })
 }
 
@@ -552,15 +731,32 @@ fn single_arm(step: &mut QwenResidentStep<'_>, tokens: &[u32]) -> Result<SingleR
     Ok(run)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The verdict a window ends with: how many of its rows are kept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Keep {
+    /// Every row.
+    All,
+    /// Row 0 only.
+    First,
+    /// `rows / 2` rows (windows of 3 rows or more).
+    Middle,
+}
+
+impl Keep {
+    fn kept(self, rows: usize) -> usize {
+        match self {
+            Self::All => rows,
+            Self::First => 1,
+            Self::Middle => rows / 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Single,
-    WindowAll,
-    WindowFirst,
-    /// Device rollback: every row kept, the first row kept, the middle row kept.
-    DeviceAll,
-    DeviceFirst,
-    DeviceMid,
+    /// A window on a path, with a verdict.
+    Window(WindowPath, Keep),
 }
 
 /// One round's numbers, by arm.
@@ -569,13 +765,29 @@ struct Rounds {
     single_step_wall: Vec<f64>,
     single_step_gpu: Vec<f64>,
     single_total: Vec<f64>,
-    all: Vec<WindowRun>,
-    first: Vec<WindowRun>,
-    device_all: Vec<WindowRun>,
-    device_first: Vec<WindowRun>,
-    device_mid: Vec<WindowRun>,
+    windows: Vec<((WindowPath, Keep), Vec<WindowRun>)>,
     export_standalone: Vec<f64>,
     import_standalone: Vec<f64>,
+}
+
+impl Rounds {
+    fn runs(&self, path: WindowPath, verdict: Keep) -> &[WindowRun] {
+        self.windows
+            .iter()
+            .find(|(key, _)| *key == (path, verdict))
+            .map_or(&[], |(_, runs)| runs.as_slice())
+    }
+
+    fn push(&mut self, path: WindowPath, verdict: Keep, run: WindowRun) {
+        match self
+            .windows
+            .iter_mut()
+            .find(|(key, _)| *key == (path, verdict))
+        {
+            Some((_, runs)) => runs.push(run),
+            None => self.windows.push(((path, verdict), vec![run])),
+        }
+    }
 }
 
 fn present(values: impl Iterator<Item = Option<f64>>) -> Vec<f64> {
@@ -585,6 +797,24 @@ fn present(values: impl Iterator<Item = Option<f64>>) -> Vec<f64> {
 fn sum_gpu(values: &[Option<f32>]) -> Option<f64> {
     (!values.is_empty() && values.iter().all(Option::is_some))
         .then(|| values.iter().flatten().map(|v| f64::from(*v)).sum())
+}
+
+/// The three parts of a window the record splits, and what its path counters showed.
+fn split_json(warm: &[WindowRun]) -> Value {
+    let col = |f: &dyn Fn(&WindowRun) -> f64| -> Vec<f64> { warm.iter().map(f).collect() };
+    let sum = |f: &dyn Fn(&PathCounts) -> u64| -> u64 { warm.iter().map(|w| f(&w.krow)).sum() };
+    json!({
+        "run_window_wall_ms": summary(&col(&|w| w.run_ms)),
+        "draw_wall_ms": summary(&col(&|w| w.draw_ms)),
+        "commit_wall_ms": summary(&col(&|w| w.commit_ms)),
+        "path_counters_of_the_timed_windows": {
+            "windows": warm.len(),
+            "krow_windows": sum(&|c| c.windows),
+            "eager_krow_bodies": sum(&|c| c.eager),
+            "graph_captures": sum(&|c| c.captures),
+            "graph_launches": sum(&|c| c.replays),
+        },
+    })
 }
 
 fn window_json(
@@ -599,7 +829,7 @@ fn window_json(
     let gpu_rows = present(warm.iter().map(|w| sum_gpu(&w.trace.row_gpu_ms)));
     let gpu_replay = present(warm.iter().map(|w| sum_gpu(&w.trace.replay_gpu_ms)));
     let host_rows = col(&|w| w.trace.row_ms.iter().sum());
-    json!({
+    let mut record = json!({
         "kept_rows": kept,
         "total_wall_ms": summary(&col(&|w| w.total_ms)),
         "export_wall_ms": summary(&col(&|w| w.trace.export_ms)),
@@ -628,7 +858,16 @@ fn window_json(
         "replay_gpu_event_ms": summary(&gpu_replay),
         "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
         "transfers_per_window": WindowTransfers::new(shape, rows, kept).to_json(),
-    })
+    });
+    merge(&mut record, split_json(warm));
+    record
+}
+
+/// Adds the keys of `extra` to the object `record`.
+fn merge(record: &mut Value, extra: Value) {
+    if let (Some(into), Value::Object(from)) = (record.as_object_mut(), extra) {
+        into.extend(from);
+    }
 }
 
 /// The record of a device-rollback arm: the same phases, with the captures and the restore in place
@@ -644,7 +883,7 @@ fn device_window_json(
     let warm = &runs[warm_from.min(runs.len())..];
     let col = |f: &dyn Fn(&WindowRun) -> f64| -> Vec<f64> { warm.iter().map(f).collect() };
     let gpu_rows = present(warm.iter().map(|w| sum_gpu(&w.trace.row_gpu_ms)));
-    json!({
+    let mut record = json!({
         "kept_rows": kept,
         "total_wall_ms": summary(&col(&|w| w.total_ms)),
         "rows_wall_ms": summary(&col(&|w| w.trace.row_ms.iter().sum())),
@@ -665,19 +904,72 @@ fn device_window_json(
         "capture_synced": "the captures are timed to their completion only with FIFI_MRV_SYNC_CAPTURE=1; otherwise to their enqueue",
         "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
         "transfers_per_window": DeviceWindowTransfers::new(shape, slot_bytes, rows, kept).to_json(),
-    })
+    });
+    merge(&mut record, split_json(warm));
+    record
+}
+
+/// The record of a K-row arm: the split of the window, the total, and the transfers computed from
+/// sizes (the logits of every row come to the host inside `run_window`; the kernels store the slots,
+/// so a verdict that keeps fewer rows than the window copies one slot back and nothing else).
+fn krow_window_json(
+    runs: &[WindowRun],
+    warm_from: usize,
+    rows: usize,
+    kept: usize,
+    shape: &StateShape,
+    slot_bytes: u64,
+    path: WindowPath,
+) -> Value {
+    let warm = &runs[warm_from.min(runs.len())..];
+    let col = |f: &dyn Fn(&WindowRun) -> f64| -> Vec<f64> { warm.iter().map(f).collect() };
+    let mut record = json!({
+        "path": path.name(),
+        "kept_rows": kept,
+        "total_wall_ms": summary(&col(&|w| w.total_ms)),
+        "restore_wall_ms": summary(&col(&|w| w.trace.import_ms)),
+        "minflt_window": summary(
+            &warm.iter().filter_map(|w| w.minflt.map(|f| f as f64)).collect::<Vec<_>>()
+        ),
+        "raw_total_wall_ms_all_rounds": runs.iter().map(|w| w.total_ms).collect::<Vec<_>>(),
+        "raw_run_window_wall_ms_all_rounds": runs.iter().map(|w| w.run_ms).collect::<Vec<_>>(),
+        "transfers_per_window": {
+            "computed_from_sizes": true,
+            "logits_d2h_bytes": (rows * HEAD_ROWS * 4) as u64,
+            "result_table_d2h_bytes": (8 * rows + 8) as u64,
+            "window_ids_h2d_bytes": (4 * rows) as u64,
+            "start_block_h2d_bytes": shape.start_block_bytes,
+            "slot_d2d_copies_for_the_verdict": u64::from(kept < rows),
+            "slot_d2d_bytes": if kept < rows { slot_bytes } else { 0 },
+            "graph_launches": u64::from(path == WindowPath::KrowGraph),
+        },
+    });
+    merge(&mut record, split_json(warm));
+    record
 }
 
 /// The arms of one cell, in a fixed list that each round rotates.
 fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
     let mut arms = vec![Arm::Single];
+    let mut paths = Vec::new();
     if config.rollback.host() {
-        arms.extend([Arm::WindowAll, Arm::WindowFirst]);
+        paths.push(WindowPath::Host);
     }
     if config.rollback.device() {
-        arms.extend([Arm::DeviceAll, Arm::DeviceFirst]);
-        if rows >= 3 {
-            arms.push(Arm::DeviceMid);
+        paths.push(WindowPath::Device);
+    }
+    if config.krow {
+        paths.push(WindowPath::KrowEager);
+        if config.krow_graph {
+            paths.push(WindowPath::KrowGraph);
+        }
+    }
+    for path in paths {
+        for verdict in [Keep::All, Keep::First, Keep::Middle] {
+            if verdict == Keep::Middle && rows < 3 {
+                continue;
+            }
+            arms.push(Arm::Window(path, verdict));
         }
     }
     arms
@@ -696,6 +988,7 @@ struct Cell<'a> {
     text: &'a [u32],
     config: &'a Config,
     started: Instant,
+    loaded: &'a Loaded,
 }
 
 impl Cell<'_> {
@@ -707,6 +1000,80 @@ impl Cell<'_> {
         let at = step.tokens();
         self.text[at..at + rows].to_vec()
     }
+
+    /// Free device memory now, when the device answers.
+    fn free_vram(&self) -> Option<u64> {
+        self.loaded
+            .projector
+            .memory_info()
+            .ok()
+            .map(|info| info.free as u64)
+    }
+}
+
+/// The paths whose windows the inline D1 checks of a cell run, in order.
+fn d1_paths(config: &Config) -> Vec<WindowPath> {
+    let mut paths = Vec::new();
+    if config.rollback.host() {
+        paths.push(WindowPath::Host);
+    }
+    if config.rollback.device() {
+        paths.push(WindowPath::Device);
+    }
+    if config.krow {
+        paths.push(WindowPath::KrowEager);
+        if config.krow_graph {
+            paths.push(WindowPath::KrowGraph);
+        }
+    }
+    paths
+}
+
+/// Untimed K-row windows of `rows` rows until the next one replays the graph of its length: the
+/// first of a length is eager (it warms), the second captures and launches. Reports each window's
+/// mode and time, the nodes and the device bytes of the graph, and the drop in free memory over the
+/// windows. A length that already has its graph (an earlier, shallower cell) needs none.
+fn prepare_graph(
+    cell: &Cell<'_>,
+    step: &mut QwenResidentStep<'static>,
+    rows: usize,
+) -> Result<Value, EngError> {
+    let before = step.krow_graph_stats();
+    let free_before = cell.free_vram();
+    let mut windows = Vec::new();
+    while step.krow_next_mode(rows)? != "replay" {
+        assert!(
+            windows.len() < 3,
+            "the graph of {rows} rows needs more than three windows to replay"
+        );
+        let mode = step.krow_next_mode(rows)?;
+        let tokens = cell.take(step, rows);
+        let run = window_arm(step, &tokens, rows, WindowPath::KrowGraph)?;
+        windows.push(json!({
+            "mode": mode, "total_wall_ms": run.total_ms, "run_window_wall_ms": run.run_ms,
+            "counters": run.krow.to_json(),
+        }));
+    }
+    assert!(
+        !step.krow_graph_refused(),
+        "the capture of the {rows}-row graph was refused: the graph arm would time the eager body"
+    );
+    let after = step.krow_graph_stats();
+    let drop = free_before
+        .zip(cell.free_vram())
+        .map(|(then, now)| then.saturating_sub(now));
+    println!(
+        "MRV_GRAPH rows={rows} nodes={} capture_vram_bytes={} free_vram_drop_bytes={drop:?}",
+        after.nodes[rows], after.vram_bytes[rows]
+    );
+    Ok(json!({
+        "captured_in_this_cell": after.captures[rows] > before.captures[rows],
+        "windows_before_the_first_timed_replay": windows,
+        "nodes": after.nodes[rows],
+        "capture_instantiate_vram_bytes": after.vram_bytes[rows],
+        "free_vram_drop_over_these_windows_bytes": drop,
+        "refused": step.krow_graph_refused(),
+    }))
 }
 
 fn run_cell(
@@ -715,35 +1082,53 @@ fn run_cell(
     rows: usize,
 ) -> Result<Value, EngError> {
     let depth_start = step.tokens();
+    let graph_build = if cell.config.krow && cell.config.krow_graph {
+        prepare_graph(cell, step, rows)?
+    } else {
+        Value::Null
+    };
     let d1_inputs = cell.take(step, rows);
-    // The inline D1 checks run for every rollback in the cell: a window that is not equal to the
-    // one-row steps has no meaningful cost.
-    let mut modes = Vec::new();
-    if cell.config.rollback.host() {
-        modes.push(false);
-    }
-    if cell.config.rollback.device() {
-        modes.push(true);
-    }
+    // The inline D1 checks run for every path in the cell: a window that is not equal to the
+    // one-row steps has no meaningful cost. A K-row path must also have run K-row windows, and the
+    // graph path must have launched graphs and run no eager K-row body.
     let mut d1_pass = true;
     let mut d1_modes = Vec::new();
-    for device in modes {
-        step.use_device_rollback(device)?;
+    for path in d1_paths(cell.config) {
+        path.select(step)?;
+        let counted = PathCounts::now(step);
         let d1_a = full_logits(step, &d1_inputs);
         let d1_r = restoration(step, &d1_inputs);
-        d1_pass &= d1_a.is_ok() && d1_r.is_ok();
+        let seen = PathCounts::now(step).since(counted);
+        let ran = match path {
+            WindowPath::Host | WindowPath::Device => seen.windows == 0,
+            WindowPath::KrowEager => seen.windows > 0 && seen.replays == 0 && seen.captures == 0,
+            WindowPath::KrowGraph => {
+                seen.windows > 0
+                    && seen.eager == 0
+                    && seen.captures == 0
+                    && seen.replays == seen.windows
+            }
+        };
+        d1_pass &= d1_a.is_ok() && d1_r.is_ok() && ran;
         d1_modes.push(json!({
-            "rollback": if device { "device" } else { "host" },
+            "rollback": if path == WindowPath::Host { "host" } else { "device" },
+            "path": path.name(),
             "full_logits": d1_a.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
             "state_restoration": d1_r.as_ref().map(|t| t.comparisons).map_err(ToString::to_string),
+            "the_path_ran": ran,
+            "path_counters": seen.to_json(),
         }));
     }
-    let d1 = json!({
-        "pass": d1_pass,
-        "full_logits": d1_modes[0]["full_logits"],
-        "state_restoration": d1_modes[0]["state_restoration"],
-        "by_rollback": d1_modes,
-    });
+    let d1 = if d1_modes.is_empty() {
+        json!({"pass": true, "skipped": "single-row arm only"})
+    } else {
+        json!({
+            "pass": d1_pass,
+            "full_logits": d1_modes[0]["full_logits"],
+            "state_restoration": d1_modes[0]["state_restoration"],
+            "by_rollback": d1_modes,
+        })
+    };
     println!("MRV_D1 depth={depth_start} rows={rows} {d1}");
     if !d1_pass {
         return Ok(json!({"depth_start": depth_start, "rows": rows, "d1": d1, "timed": false}));
@@ -772,27 +1157,25 @@ fn run_cell(
                         rounds.single_step_gpu.push(gpu / rows as f64);
                     }
                 }
-                Arm::WindowAll => rounds.all.push(window_arm(step, &tokens, rows, false)?),
-                Arm::WindowFirst => rounds.first.push(window_arm(step, &tokens, 1, false)?),
-                Arm::DeviceAll => rounds
-                    .device_all
-                    .push(window_arm(step, &tokens, rows, true)?),
-                Arm::DeviceFirst => rounds
-                    .device_first
-                    .push(window_arm(step, &tokens, 1, true)?),
-                Arm::DeviceMid => {
-                    rounds
-                        .device_mid
-                        .push(window_arm(step, &tokens, rows / 2, true)?)
+                Arm::Window(path, keep) => {
+                    let run = window_arm(step, &tokens, keep.kept(rows), path)?;
+                    if let Err(why) = path.check(run.krow) {
+                        return Err(EngError::BadRequest(format!(
+                            "depth {depth_start}, {rows} rows, round {round}: {why}"
+                        )));
+                    }
+                    rounds.push(path, keep, run);
                 }
             }
         }
-        let began = Instant::now();
-        let state = step.export_state()?;
-        rounds.export_standalone.push(ms(began));
-        let began = Instant::now();
-        step.import_state(&state)?;
-        rounds.import_standalone.push(ms(began));
+        if cell.config.rollback.host() {
+            let began = Instant::now();
+            let state = step.export_state()?;
+            rounds.export_standalone.push(ms(began));
+            let began = Instant::now();
+            step.import_state(&state)?;
+            rounds.import_standalone.push(ms(began));
+        }
         completed += 1;
     }
     // The execution-path half of the receipt: the selected kernel launched and nothing routed fell
@@ -803,7 +1186,7 @@ fn run_cell(
         launches.describe()
     );
     require_kernel_ran(&launches, cell.kernel).unwrap_or_else(|error| panic!("{error}"));
-    Ok(cell_json(
+    let mut cell = cell_json(
         cell,
         step,
         rows,
@@ -812,7 +1195,9 @@ fn run_cell(
         &rounds,
         d1,
         completed,
-    ))
+    );
+    cell["graph_build"] = graph_build;
+    Ok(cell)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -844,6 +1229,37 @@ fn cell_json(
             _ => Value::Null,
         }
     };
+    let host = |keep: Keep| {
+        window_json(
+            rounds.runs(WindowPath::Host, keep),
+            warm_from,
+            rows,
+            keep.kept(rows),
+            shape,
+        )
+    };
+    let device = |keep: Keep| {
+        device_window_json(
+            rounds.runs(WindowPath::Device, keep),
+            warm_from,
+            rows,
+            keep.kept(rows),
+            shape,
+            slot_bytes,
+        )
+    };
+    let krow = |path: WindowPath, keep: Keep| {
+        krow_window_json(
+            rounds.runs(path, keep),
+            warm_from,
+            rows,
+            keep.kept(rows),
+            shape,
+            slot_bytes,
+            path,
+        )
+    };
+    let ratios = |path: WindowPath, keep: Keep| ratio(rounds.runs(path, keep));
     json!({
         "depth_start": depth_start,
         "depth_end": step.tokens(),
@@ -860,11 +1276,18 @@ fn cell_json(
                 "r_steps_wall_ms": summary(&warm(&rounds.single_total)),
                 "raw_step_wall_ms_all_rounds": rounds.single_step_wall,
             },
-            "window_accept_all": window_json(&rounds.all, warm_from, rows, rows, shape),
-            "window_reject_first": window_json(&rounds.first, warm_from, rows, 1, shape),
-            "device_accept_all": device_window_json(&rounds.device_all, warm_from, rows, rows, shape, slot_bytes),
-            "device_reject_first": device_window_json(&rounds.device_first, warm_from, rows, 1, shape, slot_bytes),
-            "device_keep_middle": device_window_json(&rounds.device_mid, warm_from, rows, rows / 2, shape, slot_bytes),
+            "window_accept_all": host(Keep::All),
+            "window_reject_first": host(Keep::First),
+            "window_keep_middle": host(Keep::Middle),
+            "device_accept_all": device(Keep::All),
+            "device_reject_first": device(Keep::First),
+            "device_keep_middle": device(Keep::Middle),
+            "krow_eager_accept_all": krow(WindowPath::KrowEager, Keep::All),
+            "krow_eager_reject_first": krow(WindowPath::KrowEager, Keep::First),
+            "krow_eager_keep_middle": krow(WindowPath::KrowEager, Keep::Middle),
+            "krow_graph_accept_all": krow(WindowPath::KrowGraph, Keep::All),
+            "krow_graph_reject_first": krow(WindowPath::KrowGraph, Keep::First),
+            "krow_graph_keep_middle": krow(WindowPath::KrowGraph, Keep::Middle),
         },
         "single_row_launches": step.kernel_launches().describe(),
         "standalone_at_this_state": {
@@ -872,11 +1295,18 @@ fn cell_json(
             "import_wall_ms": summary(&warm(&rounds.import_standalone)),
         },
         "ratios_measured": {
-            "window_accept_all": ratio(&rounds.all),
-            "window_reject_first": ratio(&rounds.first),
-            "device_accept_all": ratio(&rounds.device_all),
-            "device_reject_first": ratio(&rounds.device_first),
-            "device_keep_middle": ratio(&rounds.device_mid),
+            "window_accept_all": ratios(WindowPath::Host, Keep::All),
+            "window_reject_first": ratios(WindowPath::Host, Keep::First),
+            "window_keep_middle": ratios(WindowPath::Host, Keep::Middle),
+            "device_accept_all": ratios(WindowPath::Device, Keep::All),
+            "device_reject_first": ratios(WindowPath::Device, Keep::First),
+            "device_keep_middle": ratios(WindowPath::Device, Keep::Middle),
+            "krow_eager_accept_all": ratios(WindowPath::KrowEager, Keep::All),
+            "krow_eager_reject_first": ratios(WindowPath::KrowEager, Keep::First),
+            "krow_eager_keep_middle": ratios(WindowPath::KrowEager, Keep::Middle),
+            "krow_graph_accept_all": ratios(WindowPath::KrowGraph, Keep::All),
+            "krow_graph_reject_first": ratios(WindowPath::KrowGraph, Keep::First),
+            "krow_graph_keep_middle": ratios(WindowPath::KrowGraph, Keep::Middle),
         },
     })
 }
@@ -907,6 +1337,7 @@ fn record(
             "depths": config.depths, "rows": config.rows, "rounds": config.rounds,
             "warm_from": config.warm_from, "deadline_s": config.deadline_s,
             "rollback": config.rollback.name(), "sync_capture": config.sync_capture,
+            "krow": config.krow, "krow_graph": config.krow && config.krow_graph,
             "eos": EOS,
         },
         "memory": memory,
@@ -957,12 +1388,19 @@ fn admit(loaded: &Loaded, baseline_used: u64, lease_gib: u64, what: &str) -> Val
 fn verify_window_cost_record() {
     let started = Instant::now();
     let config = Config::from_env();
+    if config.krow {
+        // A K-row run is qualified without the switches that select another kernel or MoE body.
+        super::krow_device_tests::refuse_switches().unwrap_or_else(|error| panic!("{error}"));
+    }
     let kv = kv_mode_from_env();
     let capture = capture_from_env();
     let deepest = *config.depths.last().expect("a depth");
     // The text must outlast the deepest prefill and the drift of every cell: at most 17 rows per
     // round per cell, far under the slack.
-    let need = deepest + CONTEXT_SLACK;
+    // The ids hashed into the identity are the same whatever depths a run takes (a run of the
+    // shallow cells and a run of the deep cells carry one `ids_sha256`): the text is hashed to the
+    // deepest depth the plans use.
+    let need = deepest.max(IDENTITY_DEPTH) + CONTEXT_SLACK;
     let (_tokenizer, stream) = text_stream(need);
     let text = &stream[..need];
     let mut identity = identity(&config, kv, capture, text);
@@ -973,7 +1411,7 @@ fn verify_window_cost_record() {
     println!("MRV_CONFIG single_row_kernel={}", loaded.kernel);
     let baseline_used = loaded.baseline_used;
     let mut memory = Vec::new();
-    let mut step = bench_step(
+    let mut step = bench_step_with(
         &loaded,
         kv,
         deepest + CONTEXT_SLACK,
@@ -983,9 +1421,23 @@ fn verify_window_cost_record() {
             .rollback
             .device()
             .then(|| config.rows.iter().copied().max().unwrap_or(2).max(2)),
+        config.krow,
     )
     .expect("step");
     step.trace_sync_capture = config.sync_capture;
+    step.use_krow_graphs(config.krow_graph);
+    // The block the step runs, so the single-row figure is never read for the other block.
+    identity.json["shared_expert_block"] =
+        Value::String(step.shared_in_routed_suffix().trim().to_owned());
+    identity.json["krow"] = json!({
+        "armed": config.krow, "graphs": config.krow && step.krow_graphs_on(),
+    });
+    println!(
+        "MRV_CONFIG shared_expert_block={:?} krow={} krow_graphs={}",
+        step.shared_in_routed_suffix().trim(),
+        config.krow,
+        step.krow_graphs_on()
+    );
     memory.push(admit(
         &loaded,
         baseline_used,
@@ -997,6 +1449,7 @@ fn verify_window_cost_record() {
         text,
         config: &config,
         started,
+        loaded: &loaded,
     };
     let mut cells = Vec::new();
     let mut cold = Value::Null;
@@ -1046,6 +1499,12 @@ fn verify_window_cost_record() {
             }
         }
     }
+    memory.push(admit(
+        &loaded,
+        baseline_used,
+        config.lease_gib,
+        "after the cells (every K-row graph captured)",
+    ));
     write_record(
         &config,
         &record(
@@ -1070,8 +1529,13 @@ fn cold_record(cell: &Cell<'_>, step: &mut QwenResidentStep<'static>, prefill_s:
     let one = cell.take(step, 1);
     let single = single_arm(step, &one).expect("cold single step");
     let two = cell.take(step, 2);
-    let device = cell.config.rollback == BenchRollback::Device;
-    let window = window_arm(step, &two, 2, device).expect("cold window");
+    let path = if cell.config.rollback == BenchRollback::Device {
+        WindowPath::Device
+    } else {
+        WindowPath::Host
+    };
+    let window = (cell.config.rollback != BenchRollback::Single)
+        .then(|| window_arm(step, &two, 2, path).expect("cold window"));
     // The calibration of the device copy: 200 drained copies of one slot (GPU, outside any window).
     let copy = if cell.config.rollback.device() {
         step.use_device_rollback(true).expect("armed");
@@ -1091,8 +1555,115 @@ fn cold_record(cell: &Cell<'_>, step: &mut QwenResidentStep<'static>, prefill_s:
         "d2d_slot_copy": copy,
         "first_prefill_wall_s": prefill_s,
         "first_single_row_step_ms": single.wall_ms[0],
-        "first_window_2_rows_total_ms": window.total_ms,
-        "first_window_2_rows_export_ms": window.trace.export_ms,
+        "first_window_2_rows_total_ms": window.as_ref().map(|w| w.total_ms),
+        "first_window_2_rows_export_ms": window.as_ref().map(|w| w.trace.export_ms),
         "note": "the first single-row step captures the graph; the first window follows it",
     })
+}
+
+fn test_config(rollback: BenchRollback, krow: bool, krow_graph: bool) -> Config {
+    Config {
+        depths: vec![8192],
+        rows: vec![2],
+        rounds: 12,
+        warm_from: 2,
+        out: None,
+        commit: "test".to_owned(),
+        marks: false,
+        deadline_s: 1.0,
+        lease_gib: 21,
+        rollback,
+        sync_capture: false,
+        krow,
+        krow_graph,
+    }
+}
+
+#[test]
+fn the_verdicts_keep_all_the_first_or_the_middle_rows() {
+    for rows in 2..=8 {
+        assert_eq!(Keep::All.kept(rows), rows);
+        assert_eq!(Keep::First.kept(rows), 1);
+        assert_eq!(Keep::Middle.kept(rows), rows / 2);
+    }
+    // The middle verdict is only run where it differs from the first row.
+    assert_eq!(Keep::Middle.kept(3), 1);
+}
+
+#[test]
+fn a_cell_times_the_host_device_and_k_row_windows_with_every_verdict() {
+    let config = test_config(BenchRollback::Both, true, true);
+    let arms = arms_of(&config, 4);
+    // The single-row arm, and four paths with three verdicts each.
+    assert_eq!(arms.len(), 1 + 4 * 3);
+    for path in [
+        WindowPath::Host,
+        WindowPath::Device,
+        WindowPath::KrowEager,
+        WindowPath::KrowGraph,
+    ] {
+        for keep in [Keep::All, Keep::First, Keep::Middle] {
+            assert!(arms.contains(&Arm::Window(path, keep)));
+        }
+    }
+    // A 2-row window has no middle verdict.
+    let two = arms_of(&config, 2);
+    assert_eq!(two.len(), 1 + 4 * 2);
+    assert!(!two.contains(&Arm::Window(WindowPath::KrowGraph, Keep::Middle)));
+}
+
+#[test]
+fn the_graph_arm_exists_only_when_graphs_may_be_captured_and_the_single_arm_stands_alone() {
+    let eager_only = arms_of(&test_config(BenchRollback::Both, true, false), 3);
+    assert!(eager_only.contains(&Arm::Window(WindowPath::KrowEager, Keep::All)));
+    assert!(!eager_only.contains(&Arm::Window(WindowPath::KrowGraph, Keep::All)));
+    let single = arms_of(&test_config(BenchRollback::Single, false, true), 8);
+    assert_eq!(single, vec![Arm::Single]);
+    // No K-row arm without the K-row path.
+    let plain = arms_of(&test_config(BenchRollback::Both, false, true), 4);
+    assert!(
+        !plain
+            .iter()
+            .any(|arm| matches!(arm, Arm::Window(path, _) if path.krow()))
+    );
+}
+
+#[test]
+fn every_round_runs_every_arm_once_and_no_arm_always_first() {
+    let arms = arms_of(&test_config(BenchRollback::Both, true, true), 4);
+    for round in 0..arms.len() {
+        let order = arm_order(&arms, round);
+        assert_eq!(order.len(), arms.len());
+        for arm in &arms {
+            assert_eq!(order.iter().filter(|other| *other == arm).count(), 1);
+        }
+        assert_eq!(
+            order[0], arms[round],
+            "round {round} starts with arm {round}"
+        );
+    }
+}
+
+#[test]
+fn a_timed_window_must_show_the_counters_of_its_own_path() {
+    let one = |windows, eager, captures, replays| PathCounts {
+        windows,
+        eager,
+        captures,
+        replays,
+    };
+    // The host and device windows run no K-row window.
+    assert!(WindowPath::Host.check(PathCounts::default()).is_ok());
+    assert!(WindowPath::Device.check(PathCounts::default()).is_ok());
+    assert!(WindowPath::Device.check(one(1, 1, 0, 0)).is_err());
+    // The eager K-row body: one window, one eager body, nothing captured or launched.
+    assert!(WindowPath::KrowEager.check(one(1, 1, 0, 0)).is_ok());
+    assert!(WindowPath::KrowEager.check(PathCounts::default()).is_err());
+    assert!(WindowPath::KrowEager.check(one(1, 0, 0, 1)).is_err());
+    // The graph: one window, one launch, no eager body and no capture in the timed window. A
+    // window that fell back to the eager body, or that captured, is not a replay timing.
+    assert!(WindowPath::KrowGraph.check(one(1, 0, 0, 1)).is_ok());
+    assert!(WindowPath::KrowGraph.check(one(1, 1, 0, 0)).is_err());
+    assert!(WindowPath::KrowGraph.check(one(1, 0, 1, 1)).is_err());
+    assert!(WindowPath::KrowGraph.check(one(2, 0, 0, 2)).is_err());
 }

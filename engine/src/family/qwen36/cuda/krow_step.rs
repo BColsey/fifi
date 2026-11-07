@@ -1,6 +1,8 @@
 //! The K-row verify window of the step (`qwen36.draft_verify = krow`): `K` rows (2 to 8) enqueued as
 //! one launch list on the owned stream, one synchronization, one small read of the result table,
-//! and the logits of the `K` rows. This body runs eagerly (no graph).
+//! and the logits of the `K` rows. The list runs eagerly or as one CUDA graph per window length
+//! (`krow_graph`): the first window of a length is eager, the next captures the graph and launches
+//! it, later windows replay it. The graph is the same launch list, so the bytes are the same.
 //!
 //! The list is `step_ops::token_ops_rows`: the one-row body with every row-independent kernel
 //! launched once for all rows (`m = K`), the routed experts as one chain of launches per row on
@@ -51,7 +53,10 @@ use super::super::{
     step_plan::Slot,
     verdict::{FailureAction, action_for},
 };
-use super::QwenResidentStep;
+use super::{
+    Mode, QwenResidentStep,
+    krow_graph::{ENTERED_BY_GRAPH, Facts},
+};
 #[cfg(test)]
 use crate::family::speculate::d1_oracle::Fault;
 use crate::{
@@ -64,7 +69,7 @@ use crate::{
         },
     },
     kernels::cuda::{
-        DeviceBuffer, DeviceRange,
+        CapturePlan, DeviceBuffer, DeviceRange, is_capture_refusal,
         resident::{
             add_norm_pack::AddNormCall,
             argmax_rows::{ArgmaxRowsCall, WindowFoldCall, WindowResult, window_result_bytes},
@@ -188,6 +193,11 @@ impl<'a> QwenResidentStep<'a> {
         }
         let layout = KrowIoLayout::new(&res.geometry, rows)?;
         let io = self.context.allocate(layout.total)?;
+        // The pins of a K-row graph: the weights and the one-row arena of the step's own pins, and
+        // the K-row arena. The small buffer, the state and the slots are covered by drop order.
+        let mut pinned: Vec<&'a DeviceBuffer> = self.pins.to_vec();
+        pinned.push(krow.arena.buffer());
+        self.krow_pins = Box::leak(pinned.into_boxed_slice());
         let logits = vec![
             0;
             f32_bytes(res.dims.shape.vocab)?
@@ -279,7 +289,7 @@ impl<'a> QwenResidentStep<'a> {
         self.arm_injection();
         let admit_pos = self.krow_start(inputs).map_err(RowsFailure::StateDecides)?;
         let mut entered = 0;
-        let ran = self.run_body_rows(k, admit_pos, &mut entered);
+        let ran = self.run_krow_body(k, admit_pos, &mut entered);
         #[cfg(test)]
         self.take_injection();
         #[cfg(test)]
@@ -296,6 +306,117 @@ impl<'a> QwenResidentStep<'a> {
             Err(error) => {
                 self.state.poison();
                 Err(RowsFailure::AfterLaunch(error))
+            }
+        }
+    }
+
+    /// How the next window of `k` rows runs. Test builds run eagerly while an injection or the
+    /// per-layer taps are pending: both read or write the device inside the body, which a capture
+    /// forbids.
+    fn krow_mode(&self, k: usize) -> Result<Mode, EngError> {
+        #[cfg(test)]
+        if self.injection().is_some() || self.taps.borrow().is_some() {
+            return super::krow_graph::slot_of(k).map(|_| Mode::Eager);
+        }
+        self.krow_graphs.mode(k, self.capture_on)
+    }
+
+    /// The body of a window of `k` rows in the mode the graph table says: replay the graph of
+    /// exactly `k` rows, capture it, or enqueue the list eagerly. An eager body that was enqueued
+    /// whole has loaded every module it launches, which warms its length for the capture.
+    fn run_krow_body(
+        &mut self,
+        k: usize,
+        admit_pos: usize,
+        entered: &mut usize,
+    ) -> Result<(), EngError> {
+        match self.krow_mode(k)? {
+            Mode::Replay => self.replay_krow(k, entered, false),
+            Mode::Capture => self.capture_krow(k, admit_pos, entered),
+            Mode::Eager => self.run_body_rows(k, admit_pos, entered).map(|()| {
+                self.krow_graphs.note_eager(k);
+            }),
+        }
+    }
+
+    /// Launches the graph of `k` rows. The graph is the whole body, so the failure rule sees a
+    /// window that went past its first op: a failed launch poisons the state and fails the window
+    /// closed, it does not take the step back. `captured_now` is true for the window that has just
+    /// captured the graph.
+    fn replay_krow(
+        &mut self,
+        k: usize,
+        entered: &mut usize,
+        captured_now: bool,
+    ) -> Result<(), EngError> {
+        *entered = ENTERED_BY_GRAPH;
+        // The deliberate break of the replay: a device word changed after the capture, in a later
+        // window than the one that captured.
+        #[cfg(test)]
+        if !captured_now && let Some(runtime) = self.krow.as_ref() {
+            break_one_id(runtime, &self.stream, "ids-replay")?;
+        }
+        #[cfg(not(test))]
+        let _ = captured_now;
+        let Self {
+            krow_graphs,
+            stream,
+            ..
+        } = self;
+        let graph = krow_graphs
+            .graph(k)?
+            .ok_or_else(|| refuse(&format!("there is no graph of {k} rows to launch")))?;
+        graph.launch(stream)?;
+        krow_graphs.note_replay(k);
+        Ok(())
+    }
+
+    /// Captures the body of `k` rows, stores the graph under `k` and launches it (a capture
+    /// records and does not run). A refused capture discards the attempt's op count, sets the
+    /// sticky refusal and runs the body eagerly in the same window; any other error is the
+    /// caller's to fail on.
+    fn capture_krow(
+        &mut self,
+        k: usize,
+        admit_pos: usize,
+        entered: &mut usize,
+    ) -> Result<(), EngError> {
+        let res: &'a super::StepResources = self.res;
+        let krow = res.krow.as_ref().ok_or_else(not_armed)?;
+        let holds = vec![krow.arena.hold(), self.context.workspace_hold()?];
+        #[cfg(test)]
+        let free_before = self.context.memory_info().ok().map(|info| info.free);
+        let attempt = self.context.capture(
+            &self.stream,
+            CapturePlan {
+                pins: self.krow_pins,
+                holds,
+            },
+            || self.run_body_rows(k, admit_pos, entered),
+        );
+        match super::fold_capture(
+            attempt,
+            is_capture_refusal,
+            entered,
+            self.krow_graphs.refused_mut(),
+        )? {
+            Some(graph) => {
+                #[cfg(test)]
+                let facts = Facts {
+                    nodes: graph.nodes(),
+                    vram_bytes: free_before
+                        .zip(self.context.memory_info().ok().map(|info| info.free))
+                        .map_or(0, |(before, after)| before.saturating_sub(after) as u64),
+                };
+                #[cfg(not(test))]
+                let facts = Facts {};
+                self.krow_graphs.store(k, graph, facts)?;
+                self.replay_krow(k, entered, true)
+            }
+            None => {
+                self.run_body_rows(k, admit_pos, entered)?;
+                self.krow_graphs.note_eager(k);
+                Ok(())
             }
         }
     }
@@ -352,7 +473,7 @@ impl<'a> QwenResidentStep<'a> {
             .io
             .write_at(stream, runtime.layout.ids.offset, &ids)?;
         #[cfg(test)]
-        break_one_id(runtime, stream)?;
+        break_one_id(runtime, stream, "ids")?;
         // The start block carries the first token only because the block has the field; the
         // embedding reads the window ids.
         state.write_step_params(stream, &StepParams::new(first, pos)?)?;
@@ -842,6 +963,38 @@ impl QwenResidentStep<'_> {
         }
     }
 
+    /// Switches the K-row graphs off (`false`) or on: off, windows run the eager K-row body on a
+    /// step that captures, so the two bodies can be timed and compared on one set of weights.
+    /// Graphs already captured are kept and used again once the graphs are on.
+    pub(crate) fn use_krow_graphs(&mut self, on: bool) {
+        self.krow_graphs.set_on(on);
+    }
+
+    /// Whether K-row windows may use graphs (the switch above; the step must also capture).
+    pub(crate) fn krow_graphs_on(&self) -> bool {
+        self.capture_on && self.krow_graphs.is_on()
+    }
+
+    /// The counters of the K-row graphs: per window length, eager windows, captures, windows that
+    /// ran the graph, nodes and the device bytes of the capture.
+    pub(crate) fn krow_graph_stats(&self) -> super::krow_graph::GraphStats {
+        self.krow_graphs.stats().clone()
+    }
+
+    /// Whether a capture of a K-row graph was refused on this step.
+    pub(crate) fn krow_graph_refused(&self) -> bool {
+        self.krow_graphs.refused()
+    }
+
+    /// How a window of `k` rows would run next: `replay`, `capture` or `eager`.
+    pub(crate) fn krow_next_mode(&self, k: usize) -> Result<&'static str, EngError> {
+        Ok(match self.krow_mode(k)? {
+            Mode::Replay => "replay",
+            Mode::Capture => "capture",
+            Mode::Eager => "eager",
+        })
+    }
+
     /// Makes a value of the next K-row window non-finite inside its body.
     pub(crate) fn inject_krow(&mut self, injection: Injection) {
         if let Some(runtime) = self.krow.as_mut() {
@@ -978,13 +1131,17 @@ impl QwenResidentStep<'_> {
 
 /// Test builds: the deliberate-break control. `FIFI_KROW_BREAK=ids` makes row 1's token on the
 /// device differ from the host's after the ids were written, inside the K-row path only, so a D1
-/// run that still passes did not run the K-row path.
+/// run that still passes did not run the K-row path. `FIFI_KROW_BREAK=ids-replay` does it only
+/// for a window that launches a graph captured by an earlier window, just before the launch: the
+/// device word changes after the capture, so the break tests the replay and not the capture.
+/// `variant` names the value of the variable the call applies to.
 #[cfg(test)]
 fn break_one_id(
     runtime: &KrowRuntime,
     stream: &crate::kernels::cuda::DeviceStream,
+    variant: &str,
 ) -> Result<(), EngError> {
-    if std::env::var("FIFI_KROW_BREAK").as_deref() != Ok("ids") {
+    if std::env::var("FIFI_KROW_BREAK").as_deref() != Ok(variant) {
         return Ok(());
     }
     let at = runtime.layout.ids.offset + runtime.layout.ids.row_bytes;
