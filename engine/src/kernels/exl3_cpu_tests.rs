@@ -417,6 +417,42 @@ fn every_rate_is_thread_count_independent_and_agrees_across_tiers() {
     }
 }
 
+/// The experts of a layer are combined in pick order: `forward` equals the sequential f32
+/// accumulation of `weight * output` over the picks, bit for bit, on every tier.
+#[test]
+fn picked_experts_are_combined_in_pick_order() {
+    let mut rng = Rng(0x2468_ace0_1357_9bdf);
+    let shape = (256, 128);
+    let h = shape.0;
+    let parts = random_experts(&mut rng, shape, 64);
+    let experts = expert_views(&parts, shape, 64);
+    let weights = [0.3f32, 1.7, 0.45];
+    let x: Vec<f32> = (0..h).map(|_| rng.unit()).collect();
+    for tier in pool_isa() {
+        let cpu = ExpertCpu::new(4, WaitPolicy::Park, Some(tier)).unwrap();
+        let jobs: Vec<_> = experts
+            .iter()
+            .map(|&expert| PairJob { expert, row: 0 })
+            .collect();
+        let mut each = vec![0.0f32; jobs.len() * h];
+        cpu.expert_pairs(&x, &jobs, &mut each).unwrap();
+        let mut want = vec![0.0f32; h];
+        for (y, weight) in each.chunks_exact(h).zip(weights) {
+            for (acc, value) in want.iter_mut().zip(y) {
+                *acc += weight * value;
+            }
+        }
+        let picks: Vec<_> = experts
+            .iter()
+            .zip(weights)
+            .map(|(&expert, weight)| ExpertPick { expert, weight })
+            .collect();
+        let mut got = vec![0.0f32; h];
+        cpu.forward(&x, &picks, &mut got).unwrap();
+        assert_eq!(got, want, "{tier:?}");
+    }
+}
+
 /// Names the tiers the other tests loop over, so a run on a CPU without a tier shows it in the
 /// log (`--nocapture`) instead of passing those loops without a SIMD tier.
 #[test]
