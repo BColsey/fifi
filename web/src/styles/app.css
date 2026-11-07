@@ -831,3 +831,96 @@ details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
   padding: 1px 5px;
   font-variant-numeric: tabular-nums;
 }
+
+/* Sampler trace (per-reply token alternatives) */
+
+.drawer-check {
+  display: flex;
+  align-items: center;
+  gap: var(--fifi-space-2);
+}
+
+.drawer-check input {
+  width: auto;
+}
+
+.msg-trace-btn {
+  margin-top: var(--fifi-space-1);
+  font-size: var(--fifi-size-2);
+  padding: 2px 10px;
+  border: 1px solid var(--fifi-separator);
+  border-radius: 6px;
+  background: none;
+  color: var(--fifi-accent);
+  cursor: pointer;
+}
+
+.trace-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--fifi-space-2);
+  padding: 2px 0;
+  font-size: var(--fifi-size-2);
+}
+
+.trace-i {
+  color: var(--fifi-text-tertiary);
+  min-width: 4ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-piece {
+  font-family: var(--fifi-mono);
+  background: var(--fifi-code-bg);
+  border-radius: 4px;
+  padding: 0 5px;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-field {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--fifi-separator);
+  white-space: nowrap;
+}
+
+.trace-field-reasoning {
+  color: var(--fifi-accent);
+  border-color: var(--fifi-accent);
+}
+
+.trace-field-none {
+  color: var(--fifi-text-tertiary);
+}
+
+.trace-p {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-cands {
+  color: var(--fifi-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-cand {
+  margin-right: var(--fifi-space-2);
+}
+
+.trace-cand-sel {
+  color: var(--fifi-text);
+  font-weight: 600;
+}

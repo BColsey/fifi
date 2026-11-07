@@ -169,6 +169,23 @@ export class Drawer {
     this.syncOnOpen.set("thinking", () => (thinkingSelect.value = loadSettings().drawer.thinking));
     thinkingRow.append(thinkingLabel, thinkingSelect);
 
+    const traceRow = document.createElement("div");
+    traceRow.className = "drawer-check";
+    traceRow.title =
+      "Sends x-sample-trace with new replies. The server must be started with its sample_trace setting on; otherwise the request fails.";
+    const traceBox = document.createElement("input");
+    traceBox.type = "checkbox";
+    traceBox.id = "drawer-record-trace";
+    const traceLabel = document.createElement("label");
+    traceLabel.className = "field-label";
+    traceLabel.htmlFor = traceBox.id;
+    traceLabel.textContent = "Trace sampling alternatives";
+    traceBox.addEventListener("change", () => {
+      this.update({ recordTrace: traceBox.checked });
+    });
+    this.syncOnOpen.set("recordTrace", () => (traceBox.checked = loadSettings().drawer.recordTrace));
+    traceRow.append(traceBox, traceLabel);
+
     const systemRow = document.createElement("div");
     const systemLabel = document.createElement("label");
     systemLabel.className = "field-label";
@@ -204,6 +221,7 @@ export class Drawer {
       this.number("Top k (0 is unset)", "topK", 0, "0"),
       this.number("Max tokens", "maxTokens", 1, "2048"),
       thinkingRow,
+      traceRow,
       systemRow,
       actions
     );

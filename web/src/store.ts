@@ -12,6 +12,9 @@ export interface DrawerSettings {
   maxTokens: number;
   thinking: ThinkingMode;
   systemMessage: string;
+  /** Sends `x-sample-trace` on new replies. No effect — the request
+   * fails with 400 — when the server's sample_trace setting is off. */
+  recordTrace: boolean;
 }
 
 export type ThemeChoice = "system" | "light" | "dark";
@@ -34,6 +37,7 @@ export const defaultSettings: Settings = {
     maxTokens: 2048,
     thinking: "default",
     systemMessage: "",
+    recordTrace: false,
   },
 };
 
@@ -81,6 +85,7 @@ export function coerceSettings(raw: unknown): Settings {
       ),
       thinking: thinkingOf(drawer["thinking"]),
       systemMessage: stringOf(drawer["systemMessage"], defaultSettings.drawer.systemMessage),
+      recordTrace: drawer["recordTrace"] === true,
     },
   };
 }
@@ -146,6 +151,16 @@ export interface UiToolCall {
   arguments: string;
 }
 
+/** One piece of the reply's raw text, as the GUI received it: which of
+ * the three rendered regions the piece belongs to and its UTF-8 byte
+ * length. Enough to map any trace offset to a region without storing
+ * the piece text again (the packet carries it). Only recorded when
+ * trace capture is armed for the reply. */
+export interface TraceSeg {
+  field: "content" | "reasoning" | "tool";
+  bytes: number;
+}
+
 export type UiMessageState = "complete" | "streaming" | "stopped" | "error";
 
 export interface UiMessage {
@@ -160,6 +175,10 @@ export interface UiMessage {
   usage?: Usage;
   durationMs?: number;
   createdAt: number;
+  /** The server reply id — the key for /v1/sampler-trace. */
+  replyId?: string;
+  /** Present only when capture was armed; see TraceSeg. */
+  traceSegs?: TraceSeg[];
 }
 
 export interface ChatRecord {

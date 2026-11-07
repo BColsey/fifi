@@ -12,6 +12,7 @@ import { fixture as routingFixture } from "./internals.fixture";
 import { MonitorView } from "./monitor";
 import { noticeList } from "./notices";
 import { pollPlan } from "./panel";
+import { TraceView } from "./trace";
 import {
   deleteChat,
   listChats,
@@ -22,7 +23,7 @@ import {
   type ChatRecord,
 } from "./store";
 
-type ViewName = "chat" | "monitor" | "internals" | "about";
+type ViewName = "chat" | "monitor" | "internals" | "trace" | "about";
 type PillState = "offline" | "starting" | "ready" | "busy" | "error";
 
 const pillLabels: Record<PillState, string> = {
@@ -136,6 +137,10 @@ function main(): void {
       onChatsChanged: () => void renderChatList(),
       onNotice: (text) => showNotice(text),
       onAnnounce: (text) => announce(text),
+      onShowTrace: (message) => {
+        new TraceView(el<HTMLElement>("view-trace"), message);
+        showView("trace");
+      },
     }
   );
 
@@ -332,12 +337,14 @@ function main(): void {
     chat: el<HTMLElement>("view-chat"),
     monitor: el<HTMLElement>("view-monitor"),
     internals: el<HTMLElement>("view-internals"),
+    trace: el<HTMLElement>("view-trace"),
     about: el<HTMLElement>("view-about"),
   };
   const viewTitles: Record<ViewName, string> = {
     chat: "Chat",
     monitor: "Monitor",
     internals: "Internals",
+    trace: "Token trace",
     about: "About",
   };
   new InternalsView(views.internals, routingFixture);

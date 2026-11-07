@@ -20,6 +20,7 @@ import {
   newUiMessage,
   putChat,
   type ChatRecord,
+  type TraceSeg,
   type UiMessage,
 } from "./store";
 import { formatDuration, formatSpeed, formatTokens } from "./format";
@@ -33,6 +34,21 @@ export interface ChatHooks {
   onNotice(text: string): void;
   /** One polite announcement per stream lifecycle event, never per token. */
   onAnnounce(text: string): void;
+  /** The user asked to inspect a reply's sampler trace. */
+  onShowTrace(message: UiMessage): void;
+}
+
+const utf8 = new TextEncoder();
+
+/** Appends one piece to the reply's raw→field map, merging consecutive
+ * pieces of the same field so the stored array stays small. Byte lengths
+ * because the packet's offsets are UTF-8 bytes into the raw text. */
+function appendSeg(segs: TraceSeg[], field: TraceSeg["field"], text: string): void {
+  if (text === "") return;
+  const bytes = utf8.encode(text).length;
+  const last = segs[segs.length - 1];
+  if (last !== undefined && last.field === field) last.bytes += bytes;
+  else segs.push({ field, bytes });
 }
 
 interface StreamDom {
@@ -215,8 +231,20 @@ export class ChatView {
       err.textContent = m.errorMessage;
       root.append(err);
     }
+    if (m.replyId !== undefined && m.traceSegs !== undefined) {
+      root.append(this.buildTraceButton(m));
+    }
     root.append(this.buildMeta(m));
     return root;
+  }
+
+  private buildTraceButton(m: UiMessage): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msg-trace-btn";
+    btn.textContent = "Token trace";
+    btn.addEventListener("click", () => this.hooks.onShowTrace(m));
+    return btn;
   }
 
   private buildThinking(reasoning: string, closed: boolean): HTMLDetailsElement {
@@ -355,6 +383,9 @@ export class ChatView {
 
   private startStream(chat: ChatRecord, assistant: UiMessage, controller: AbortController): void {
     const body = this.buildBody(chat);
+    // Arming is pre-generation: the segment map is recorded only for
+    // replies the server was asked to trace.
+    if (body["x-sample-trace"] === true) assistant.traceSegs = [];
     this.controller = controller;
     this.streamDom = this.createStreamDom();
     this.streamChat = chat;
@@ -370,6 +401,9 @@ export class ChatView {
       if (dom !== null) {
         dom.waiting.remove();
         dom.text.parentElement?.classList.remove("caret");
+        if (assistant.replyId !== undefined && assistant.traceSegs !== undefined) {
+          dom.root.insertBefore(this.buildTraceButton(assistant), dom.meta);
+        }
       }
       // Keep the placeholder; the error line carries the reason.
       assistant.state = state;
@@ -404,18 +438,36 @@ export class ChatView {
           if (dom !== null) dom.waiting.textContent =
             "Admitted. Prefilling \u2014 this can take a while.";
         },
+        onReplyId: (id) => {
+          const msg = this.streamMessage;
+          if (msg !== null) msg.replyId = id;
+        },
         onDelta: (delta) => {
           const msg = this.streamMessage;
           if (msg === null) return;
           if (delta.reasoning !== undefined) {
             msg.reasoning = (msg.reasoning ?? "") + delta.reasoning;
             this.pendingReasoning += delta.reasoning;
+            if (msg.traceSegs !== undefined) appendSeg(msg.traceSegs, "reasoning", delta.reasoning);
           }
           if (delta.content !== undefined) {
             msg.content += delta.content;
             this.pendingContent += delta.content;
+            if (msg.traceSegs !== undefined) appendSeg(msg.traceSegs, "content", delta.content);
           }
           if (delta.toolCall !== undefined) {
+            // Tool-call pieces are part of the raw text the packet's
+            // offsets run over, so they need a segment of their own —
+            // otherwise every later offset would shift. The wire's name +
+            // argument fragments carry the same text the pieces decoded
+            // to (drift only for malformed calls, where the parser rewraps).
+            if (msg.traceSegs !== undefined) {
+              appendSeg(
+                msg.traceSegs,
+                "tool",
+                (delta.toolCall.function?.name ?? "") + (delta.toolCall.function?.arguments ?? "")
+              );
+            }
             this.mergeToolCall(delta.toolCall);
           }
           this.scheduleFlush();

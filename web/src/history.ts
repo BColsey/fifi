@@ -46,5 +46,6 @@ export function buildChatBody(settings: Settings, messages: ChatMessage[]): Chat
     top_k: settings.drawer.topK > 0 ? settings.drawer.topK : undefined,
     max_tokens: settings.drawer.maxTokens,
     "x-thinking": settings.drawer.thinking,
+    "x-sample-trace": settings.drawer.recordTrace ? true : undefined,
   };
 }

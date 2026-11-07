@@ -10,6 +10,7 @@ const baseDrawer = {
   maxTokens: 64,
   thinking: "on",
   systemMessage: "s",
+  recordTrace: true,
 } as const;
 
 test("valid stored settings pass through unchanged", () => {
@@ -24,6 +25,7 @@ test("valid stored settings pass through unchanged", () => {
       maxTokens: 512,
       thinking: "on",
       systemMessage: "be brief",
+      recordTrace: true,
     },
   };
   deepStrictEqual(coerceSettings(raw), {
@@ -37,6 +39,7 @@ test("valid stored settings pass through unchanged", () => {
       maxTokens: 512,
       thinking: "on",
       systemMessage: "be brief",
+      recordTrace: true,
     },
   });
 });
@@ -141,4 +144,13 @@ test("the exact contract boundary values are accepted", () => {
   const upper = coerceSettings({ drawer: { ...baseDrawer, temperature: 2, topP: 1 } });
   strictEqual(upper.drawer.temperature, 2);
   strictEqual(upper.drawer.topP, 1);
+});
+
+test("recordTrace coerces strictly: only true is true", () => {
+  strictEqual(coerceSettings({ drawer: { ...baseDrawer, recordTrace: true } }).drawer.recordTrace, true);
+  strictEqual(coerceSettings({ drawer: { ...baseDrawer, recordTrace: undefined } }).drawer.recordTrace, false);
+  strictEqual(
+    coerceSettings({ drawer: { ...baseDrawer, recordTrace: "true" } }).drawer.recordTrace,
+    false
+  );
 });

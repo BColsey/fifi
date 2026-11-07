@@ -109,6 +109,9 @@ export interface ChatRequestBody {
   top_k?: number;
   max_tokens?: number;
   "x-thinking"?: ThinkingMode;
+  /** Arms sampler-trace capture for this one reply. The server refuses
+   * the request with 400 unless its sample_trace setting permits it. */
+  "x-sample-trace"?: boolean;
   stop?: string[];
 }
 
@@ -301,6 +304,49 @@ export function listRecentRequests(signal?: AbortSignal): Promise<RecentRequestB
   return getJson<RecentRequestBody>("/v1/recent-requests", true, signal);
 }
 
+export interface SamplerCandidate {
+  token_id: number;
+  prob: number;
+}
+
+/** One sampled decode position, ids and probabilities only. `offset` is
+ * the piece's byte offset into the raw generated text; null when the
+ * replay never reached this position (early stop or alignment error). */
+export interface SamplerPosition {
+  token_id: number;
+  rank: number;
+  kept: number;
+  greedy: boolean;
+  selected_prob: number;
+  candidates: SamplerCandidate[];
+  offset: number | null;
+  piece: string | null;
+}
+
+/** Packet v2 of GET /v1/sampler-trace?id=<reply id> — api/openapi.yaml. */
+export interface SamplerTracePacket {
+  packet: 2;
+  reply_id: string;
+  model: string;
+  sampling: { temperature: number; top_p: number; top_k: number };
+  capture_scope: string;
+  truncated: boolean;
+  captured_positions: number;
+  raw_byte_len: number;
+  aligned_positions: number;
+  alignment_error: string | null;
+  trailer: string;
+  positions: SamplerPosition[];
+}
+
+export function getSamplerTrace(replyId: string, signal?: AbortSignal): Promise<SamplerTracePacket> {
+  return getJson<SamplerTracePacket>(
+    "/v1/sampler-trace?id=" + encodeURIComponent(replyId),
+    true,
+    signal
+  );
+}
+
 export async function chatCompletion(
   body: ChatRequestBody,
   signal?: AbortSignal
@@ -324,6 +370,9 @@ export async function chatCompletion(
 export interface StreamCallbacks {
   /** The server admitted the job. Headers and the role chunk arrived. */
   onRole?: () => void;
+  /** The reply id, once, from the first chunk that carries it. This is
+   * the id that keys /v1/sampler-trace for the finished reply. */
+  onReplyId?: (id: string) => void;
   onDelta?: (delta: { content?: string; reasoning?: string; toolCall?: ToolCallDelta }) => void;
   onFinish?: (reason: FinishReason, usage: Usage | undefined) => void;
 }
@@ -352,6 +401,7 @@ export async function chatStream(
 
   let done = false;
   let streamError: ApiError | null = null;
+  let replyId: string | null = null;
 
   const parser = new SseParser((ev) => {
     if (ev.event === "error") {
@@ -378,6 +428,10 @@ export async function chatStream(
       chunk = JSON.parse(ev.data) as ChatCompletionChunk;
     } catch {
       return;
+    }
+    if (replyId === null && typeof chunk.id === "string" && chunk.id !== "") {
+      replyId = chunk.id;
+      callbacks.onReplyId?.(chunk.id);
     }
     for (const choice of chunk.choices ?? []) {
       if (choice.delta.role !== undefined) callbacks.onRole?.();
