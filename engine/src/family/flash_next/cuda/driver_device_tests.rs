@@ -369,6 +369,24 @@ struct FollowStep {
     overlap: usize,
 }
 
+/// Writes `rows` x `width` float32 values as a version 1.0 `.npy` file, C order.
+fn write_npy(path: &Path, values: &[f32], rows: usize, width: usize) {
+    assert_eq!(values.len(), rows * width);
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {width}), }}");
+    // Magic, version and length take 10 bytes; the header ends in a newline and the whole is a
+    // multiple of 64.
+    while !(10 + header.len() + 1).is_multiple_of(64) {
+        header.push(' ');
+    }
+    header.push('\n');
+    let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+    bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+    std::fs::write(path, bytes).expect("write npy");
+}
+
 fn mean_max(values: &[f64]) -> (f64, f64) {
     if values.is_empty() {
         return (0.0, 0.0);
@@ -451,6 +469,9 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
 
     let (mut feed_ms, mut step_ms) = (60.0f64, 50.0f64);
     let mut summaries = Vec::new();
+    // The run in the oracle's schema, for its comparer: one record per prompt, the first
+    // `full_steps` full rows beside it.
+    let mut engine_prompts = Vec::new();
     let (mut all_steps, mut all_agree) = (0usize, 0usize);
     let (mut all_kl20, mut all_klfull) = (Vec::new(), Vec::new());
     let dir = oracle_path.parent().expect("dir");
@@ -488,6 +509,8 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         feed_ms = began.elapsed().as_secs_f64() * 1e3 / head.len().max(1) as f64;
         let began = std::time::Instant::now();
         let mut steps: Vec<FollowStep> = Vec::with_capacity(count);
+        let mut engine_steps = Vec::with_capacity(count);
+        let mut full_rows: Vec<f32> = Vec::new();
         for i in 0..count {
             let input = if i == 0 { *last } else { generated[i - 1] };
             let row = driver
@@ -506,7 +529,16 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
                 .map(|t| t[1].as_f64().expect("logit"))
                 .collect();
             let our_at_oracle: Vec<f64> = oracle_ids.iter().map(|&t| f64::from(ours[t])).collect();
-            let our_top20: Vec<usize> = top(ours, 20).iter().map(|t| t.0).collect();
+            let ours_top = top(ours, 20);
+            let our_top20: Vec<usize> = ours_top.iter().map(|t| t.0).collect();
+            engine_steps.push(serde_json::json!({
+                "i": i, "token": generated[i], "argmax": order[0].0,
+                "top": ours_top.iter().map(|(t, v)| serde_json::json!([t, v])).collect::<Vec<_>>(),
+                "margin": f64::from(order[0].1 - order[1].1),
+            }));
+            if i < full_steps {
+                full_rows.extend_from_slice(&row);
+            }
             let kl_full = (i < full_steps).then(|| {
                 let oracle_row = &rows[i * width..i * width + actual_vocab];
                 kl_of_logits(&widen(oracle_row), &widen(ours))
@@ -526,6 +558,23 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
             });
         }
         step_ms = began.elapsed().as_secs_f64() * 1e3 / count.max(1) as f64;
+        if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
+            let parts = PathBuf::from(out).join("engine-follow.parts");
+            std::fs::create_dir_all(&parts).expect("parts dir");
+            write_npy(
+                &parts.join(format!("{id}.logits.npy")),
+                &full_rows,
+                full_steps,
+                width,
+            );
+        }
+        engine_prompts.push(serde_json::json!({
+            "id": id, "kind": record["kind"], "mode": "follow", "prompt_ids": prompt,
+            "prompt_len": prompt.len(), "generated": generated, "forced_tokens": generated,
+            "n_generated": count, "steps": engine_steps,
+            "full_logits": {"file": format!("engine-follow.parts/{id}.logits.npy"),
+                            "steps": full_steps, "width": width, "dtype": "float32"},
+        }));
         let agree = steps
             .iter()
             .filter(|s| s.oracle_argmax == s.our_argmax)
@@ -596,5 +645,15 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
             .expect("json"),
         )
         .expect("write follow.json");
+        std::fs::write(
+            out.join("engine-follow.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "fifi-flash-next-oracle/1", "role": "engine",
+                "complete": engine_prompts.len() == oracle["prompts"].as_array().unwrap().len(),
+                "prompts": engine_prompts,
+            }))
+            .expect("json"),
+        )
+        .expect("write engine-follow.json");
     }
 }
