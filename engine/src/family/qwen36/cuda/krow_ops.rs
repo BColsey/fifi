@@ -1,6 +1,6 @@
 //! The launches of one mixer block of a K-row verify window as DATA, and the layout of the small
 //! device buffer the K-row path owns. Pure host code, like `mixer_ops.rs`: the device runner
-//! (`step/krow_step.rs`) executes these lists, and the CPU tests check them against the K-row plan.
+//! (`cuda/krow_step.rs`) executes these lists, and the CPU tests check them against the K-row plan.
 //!
 //! A K-row block differs from the one-row block in where the projections write. The EXL3 rows
 //! kernel writes each role's `K` output rows tight, `[K][n]` f32. The kernels downstream read ONE
@@ -430,6 +430,12 @@ impl KrowIoLayout {
 /// The one row count of the window tail: `argmax_rows` and `window_status_fold` each take their
 /// own `m`, and a fold over more rows than the argmax wrote would read stale pairs. The step
 /// builds both calls from one count and this check refuses a pair that disagrees.
+///
+/// It is a guard by construction, not a refusal before the launch: it runs when the argmax op
+/// runs, after the layers were enqueued, and the two calls cannot disagree because they take the
+/// same `k`. A mismatch would therefore fail the window after its launch (the window fails
+/// closed). Building the tail calls before the first launch, so that a mismatch is a clean
+/// refusal, is a later change.
 pub(super) fn check_tail_rows(argmax_rows: usize, fold_rows: usize) -> Result<(), EngError> {
     if argmax_rows != fold_rows {
         return Err(EngError::BadRequest(format!(

@@ -1220,12 +1220,15 @@ fn d1_krow_a_corrupt_hidden_state_fails_the_window_and_leaves_the_rows_before_it
     }
 }
 
-/// A window after a failed one on the same result table: a clean 3-row window after an 8-row
-/// window that left a bad pair and a window word reads none of the old bits, and after a clean
-/// 8-row window a 3-row window agrees with the one-row steps.
+/// A short window after a long one on the same result table reads no stale pairs: a clean 3-row
+/// window after an 8-row window that left a bad pair and a window word reads none of the old bits,
+/// and after a clean 8-row window a 3-row window agrees with the one-row steps. (It does not test
+/// the clearing of the status word: the start block, written whole before every window, already
+/// carries status 0, so a window without `step_begin` passes here. Only the source pin on the body
+/// sees that; `step_begin` still raises mask 4 for an invalid pos, kv_len or kv_slot word.)
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
-fn d1_krow_a_short_window_after_a_long_one_reads_no_stale_status() {
+fn d1_krow_a_short_window_after_a_long_one_reads_no_stale_pairs() {
     let (mut rig, _session, base, inputs) = krow_rig(8);
     let table = failed_window_table(&mut rig.step, &inputs, super::step::Injection::LogitsNan(6));
     assert_eq!(table.bits[6], 2);

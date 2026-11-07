@@ -26,6 +26,16 @@
 //! until `read_krow_rows` copies them (the only reader); the result table (pairs and window word)
 //! is one read of `8 K + 8` bytes; the window ids are written once and never read by the host;
 //! nothing runs on the host between the rows.
+//!
+//! Cost to remember when this body is timed. The window returns the full logits of every row
+//! (`RowsOut<Vec<f32>>`), so after the verdict `read_krow_rows` copies `K x 993,280` bytes to the
+//! host (about 7.9 MB at K = 8) and decodes them to f32. That copy is part of every window today.
+//! It is not the floor of a verifier that compares tokens on the device; the first timing of this
+//! body must not be read as that floor. Removing the copy is its own change.
+//!
+//! The row count of the window tail is checked when the argmax op runs (`tail_calls`), which is
+//! after the layers were enqueued. It is a guard by construction: both tail calls are built from
+//! the one `k`. Moving the construction before the first launch is a later change.
 
 use super::super::{
     exl3_moe::{Exl3MoeBufs, Scratch, run_exl3_moe_rows},
@@ -83,7 +93,9 @@ fn not_armed() -> EngError {
 
 /// What the K-row path owns on a step; built by [`QwenResidentStep::enable_krow`].
 pub(super) struct KrowRuntime {
-    /// Window ids, result table and tight projection rows.
+    /// Window ids, result table and tight projection rows. Under 1 MB, allocated at arming; it is
+    /// not part of the admission figure (`decode_arena` counts the K-row arena only) and sits in
+    /// the headroom.
     io: DeviceBuffer,
     layout: KrowIoLayout,
     ops: RowsKindOps,
