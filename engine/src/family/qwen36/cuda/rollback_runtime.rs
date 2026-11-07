@@ -12,6 +12,7 @@ use crate::{
     family::{
         project::cuda::WeightLayout,
         qwen36::{
+            exl3_merge_plan::{Intent, SHARED_IN_ROUTED_VAR, Source},
             krow::{KrowFacts, SINGLE_GATHER_NAME, check_krow_arming},
             rollback::{ArmingFacts, Cover, RollbackPlan, check_arming, check_uncharged_slots},
         },
@@ -75,9 +76,20 @@ impl QwenResidentStep<'_> {
     }
 
     /// Records that the settings asked for `draft_verify = krow`: from now on the merged MoE block
-    /// is refused, including through the test hook that builds it (`set_shared_in_routed`).
+    /// is refused, including through the test hook that builds it (`set_shared_in_routed`). A
+    /// merged block the DEFAULT built (the variable unset) yields to krow: it is dropped here, before
+    /// the first token and any capture, and the reference block runs, with the reason logged; the
+    /// K-row path takes one-row MoE launches only. A block an explicit `=1` asked for stays, and
+    /// `check_krow_arming` then refuses it.
     pub(crate) fn request_krow_verify(&mut self) {
         self.krow_wanted = true;
+        if self.merge_intent == Intent::Default && self.exl3_merge.is_some() {
+            eprintln!(
+                "q36 cuda: {SHARED_IN_ROUTED_VAR} unset and draft_verify is krow, using the reference block (krow takes one-row MoE launches only)"
+            );
+            self.exl3_merge = None;
+            self.merge_source = Source::Krow;
+        }
     }
 
     /// The arming refusals of the K-row path (`family/qwen36/krow.rs`) over this step's own fields:

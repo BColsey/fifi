@@ -137,32 +137,34 @@ impl SharedMerge {
         Ok(Self { buffer, layout })
     }
 
-    /// The merged block a load runs under `intent`: the working buffer, or `None` for the reference
-    /// block. `Intent::Default` (variable unset) falls back to the reference block, logging the
-    /// reason, when [`Self::check`] refuses: a default must never turn a loadable model into a
-    /// failure. `Intent::Explicit` (`=1`) keeps the refusal. `Intent::Off` checks nothing.
+    /// The merged block a load runs under `intent`, and where that mode came from: the working
+    /// buffer, or `None` for the reference block. `Intent::Default` (variable unset) falls back to
+    /// the reference block, logging the reason, when [`Self::check`] refuses: a default must never
+    /// turn a loadable model into a failure. `Intent::Explicit` (`=1`) keeps the refusal.
+    /// `Intent::Off` checks nothing. The decision itself is the pure [`resolve`].
     pub(in crate::family) fn choose(
         ctx: &CudaContext,
         dims: &MoeDims,
         layers: &[Exl3MoeWeights<'_>],
         intent: Intent,
-    ) -> Result<Option<Self>, EngError> {
+    ) -> Result<(Option<Self>, Source), EngError> {
         let check = if intent == Intent::Off {
             Ok(())
         } else {
             Self::check(ctx, dims, layers)
         };
-        match decide(intent, check) {
-            Decision::Merge => Self::new(ctx, dims, layers).map(Some),
-            Decision::Reference => Ok(None),
-            Decision::Fallback(reason) => {
-                eprintln!(
-                    "q36 cuda: {SHARED_IN_ROUTED_VAR} unset and the merged shared-expert block cannot run on this load, using the reference block: {reason}"
-                );
-                Ok(None)
-            }
-            Decision::Refuse(reason) => Err(EngError::BadRequest(reason)),
+        let resolved = resolve(intent, check)?;
+        if let Some(reason) = &resolved.fallback_reason {
+            eprintln!(
+                "q36 cuda: {SHARED_IN_ROUTED_VAR} unset and the merged shared-expert block cannot run on this load, using the reference block: {reason}"
+            );
         }
+        let merge = if resolved.merge {
+            Some(Self::new(ctx, dims, layers)?)
+        } else {
+            None
+        };
+        Ok((merge, resolved.source))
     }
 
     fn ranges(&self) -> Result<Ranges<'_>, EngError> {

@@ -62,9 +62,39 @@ pub(in crate::family) fn shared_in_routed_explicit() -> Result<Option<bool>, Eng
         .map_err(EngError::BadRequest)
 }
 
-/// The load-line suffix: empty when the merged block is not running.
-pub(in crate::family) fn load_suffix(on: bool) -> &'static str {
-    if on { " exl3_shared_in_routed=on" } else { "" }
+/// Where the mode of the merged block came from, for the load line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family) enum Source {
+    /// The variable is unset and the load can run the block.
+    Default,
+    /// The variable is set: `1` (on) or `0` (off).
+    Explicit,
+    /// The variable is unset and the load cannot run the block: the reference block runs.
+    Fallback,
+    /// The variable is unset and `draft_verify = krow` took the block off for this run.
+    Krow,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Explicit => "explicit",
+            Self::Fallback => "fallback",
+            Self::Krow => "krow",
+        }
+    }
+}
+
+/// The load-line suffix of an EXL3 load: the resolved mode and where it came from, e.g.
+/// ` exl3_shared_in_routed=on source=default`. (A GGUF load prints nothing.) The `=on` token is
+/// what the GPU scripts count.
+pub(in crate::family) fn load_suffix(running: bool, source: Source) -> String {
+    format!(
+        " exl3_shared_in_routed={} source={}",
+        if running { "on" } else { "off" },
+        source.name()
+    )
 }
 
 /// What a MoE block must satisfy for the shared expert to ride in the routed launches.
@@ -407,5 +437,45 @@ pub(in crate::family) fn decide(intent: Intent, check: Result<(), String>) -> De
         (_, Ok(())) => Decision::Merge,
         (Intent::Default, Err(reason)) => Decision::Fallback(reason),
         (Intent::Explicit, Err(reason)) => Decision::Refuse(reason),
+    }
+}
+
+/// What a load does about the merged block once the intent and the check are known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::family) struct Resolved {
+    /// Allocate the working buffer and run the merged block.
+    pub(in crate::family) merge: bool,
+    pub(in crate::family) source: Source,
+    /// Set when the default could not be honoured: the reason to log.
+    pub(in crate::family) fallback_reason: Option<String>,
+}
+
+/// [`decide`] turned into what the load does: the refusal of an explicit `1` is the error, the
+/// fallback of the default is a successful reference run with its reason.
+pub(in crate::family) fn resolve(
+    intent: Intent,
+    check: Result<(), String>,
+) -> Result<Resolved, EngError> {
+    match decide(intent, check) {
+        Decision::Merge => Ok(Resolved {
+            merge: true,
+            source: if intent == Intent::Explicit {
+                Source::Explicit
+            } else {
+                Source::Default
+            },
+            fallback_reason: None,
+        }),
+        Decision::Reference => Ok(Resolved {
+            merge: false,
+            source: Source::Explicit,
+            fallback_reason: None,
+        }),
+        Decision::Fallback(reason) => Ok(Resolved {
+            merge: false,
+            source: Source::Fallback,
+            fallback_reason: Some(reason),
+        }),
+        Decision::Refuse(reason) => Err(EngError::BadRequest(reason)),
     }
 }

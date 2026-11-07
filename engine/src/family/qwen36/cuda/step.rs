@@ -79,7 +79,9 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::exl3_merge_plan::{load_suffix, resolve_switch, shared_in_routed_explicit},
+    family::qwen36::exl3_merge_plan::{
+        Intent, Source, load_suffix, resolve_switch, shared_in_routed_explicit,
+    },
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
@@ -361,6 +363,12 @@ pub(crate) struct QwenResidentStep<'a> {
     /// Declared after `graph`, so the graph drops first: a captured body bakes in this buffer's
     /// address and its replay must never outlive the buffer.
     exl3_merge: Option<SharedMerge>,
+    /// What `FIFI_EXL3_SHARED_IN_ROUTED` asked of this load, as resolved at the build
+    /// (`Intent::Off` for every layout but EXL3). `request_krow_verify` reads it to tell a merged
+    /// block built by the default (which yields to krow) from an explicit `1` (which krow refuses).
+    merge_intent: Intent,
+    /// Where the mode of the merged block came from, for the load line.
+    merge_source: Source,
     /// The tiered mode: the options asked for it. The routed expert stacks are then not loaded,
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
     /// token syncs with the host: about 0.8 ms per token over the plain step when every expert is
@@ -661,11 +669,13 @@ impl<'a> QwenResidentStep<'a> {
         // falls back to the reference block with a logged reason), off with
         // `FIFI_EXL3_SHARED_IN_ROUTED=0`, refused if `=1` cannot be honoured. A bad value of the
         // switch stops the start, not the first token.
-        let exl3_merge = if options.layout == WeightLayout::Exl3 {
+        let (exl3_merge, merge_intent, merge_source) = if options.layout == WeightLayout::Exl3 {
             let intent = resolve_switch(shared_in_routed_explicit(), true)?;
-            SharedMerge::choose(context, &moe_dims(&res.dims), &exl3_moe, intent)?
+            let (merge, source) =
+                SharedMerge::choose(context, &moe_dims(&res.dims), &exl3_moe, intent)?;
+            (merge, intent, source)
         } else {
-            None
+            (None, Intent::Off, Source::Explicit)
         };
         let (moe, tiered_parts) = if tiered_mode {
             let parts = layers
@@ -706,6 +716,8 @@ impl<'a> QwenResidentStep<'a> {
             moe,
             exl3_moe,
             exl3_merge,
+            merge_intent,
+            merge_source,
             tiered_mode,
             tiered_parts,
             tiered: None,
@@ -765,9 +777,14 @@ impl<'a> QwenResidentStep<'a> {
         Ok(step)
     }
 
-    /// The load-line suffix of the merged MoE block: empty unless it is running.
-    pub(crate) fn shared_in_routed_suffix(&self) -> &'static str {
-        load_suffix(self.exl3_merge.is_some())
+    /// The load-line suffix of the merged MoE block: the resolved mode and its source on an EXL3
+    /// load (` exl3_shared_in_routed=on source=default`), nothing on any other layout.
+    pub(crate) fn shared_in_routed_suffix(&self) -> String {
+        if self.layout == WeightLayout::Exl3 {
+            load_suffix(self.exl3_merge.is_some(), self.merge_source)
+        } else {
+            String::new()
+        }
     }
 
     /// Test builds: puts the shared expert in the routed launches (or back) on this step, which
@@ -789,6 +806,8 @@ impl<'a> QwenResidentStep<'a> {
             // The same refusal as the variable: the K-row path is qualified without the block.
             crate::family::qwen36::krow::check_krow_switches(None, true)?;
         }
+        self.merge_source = Source::Explicit;
+        self.merge_intent = if on { Intent::Explicit } else { Intent::Off };
         self.exl3_merge = if on {
             Some(SharedMerge::new(
                 self.context,

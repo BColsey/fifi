@@ -1211,7 +1211,7 @@ fn make(
             KvMode::Int8G32 => "int8g32",
         },
         if settings.capture { "on" } else { "off" },
-        projector.context().single_gather_suffix() + step.shared_in_routed_suffix()
+        projector.context().single_gather_suffix() + &step.shared_in_routed_suffix()
     );
     Ok((step, DecodeSession::default()))
 }

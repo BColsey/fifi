@@ -96,12 +96,16 @@ pub(crate) fn check_krow_switches(
 }
 
 /// [`check_krow_switches`] from the environment values: `shared` is the raw value of
-/// [`SHARED_IN_ROUTED_VAR`]. A bad value is the refusal of the variable's own parser.
+/// [`SHARED_IN_ROUTED_VAR`]. A bad value is the refusal of the variable's own parser; only `1`
+/// refuses (unset is the default and yields to krow).
 pub(crate) fn check_krow_env(
     single_gather: Option<&OsStr>,
     shared: Option<&OsStr>,
 ) -> Result<(), EngError> {
-    let shared_in_routed = shared_in_routed_from_env(shared).map_err(EngError::BadRequest)?;
+    // Only an explicit `1` is a refusal here: unset is the default, which yields to krow at
+    // `request_krow_verify`, and `0` is off.
+    let shared_in_routed =
+        shared_in_routed_from_env(shared).map_err(EngError::BadRequest)? == Some(true);
     check_krow_switches(single_gather, shared_in_routed)
 }
 

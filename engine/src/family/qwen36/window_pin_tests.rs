@@ -719,6 +719,37 @@ fn the_start_refuses_krow_before_the_weights_and_keeps_the_step_checks_behind_th
     );
 }
 
+/// A merged block the DEFAULT built yields to krow: dropped before the first token with the reason
+/// logged and the source recorded; an explicit `1` is left for `check_krow_arming` to refuse.
+#[test]
+fn a_default_merged_block_yields_to_krow_and_an_explicit_one_stays_to_be_refused() {
+    let runtime = code(RUNTIME);
+    let request = body(&runtime, "request_krow_verify");
+    for part in [
+        "self.krow_wanted = true;",
+        "if self.merge_intent == Intent::Default && self.exl3_merge.is_some() {",
+        "self.exl3_merge = None;",
+        "self.merge_source = Source::Krow;",
+    ] {
+        assert!(
+            request.contains(&code(part)),
+            "`{part}` missing from request_krow_verify"
+        );
+    }
+    // The drop is conditioned on the default intent only, so an explicit `1` is not touched.
+    assert!(!request.contains(&code("Intent::Explicit")));
+    assert!(
+        request.find(&code("self.krow_wanted = true;")).unwrap()
+            < request.find(&code("self.exl3_merge = None;")).unwrap()
+    );
+    // The reason is logged (a string literal, so it is read from the raw source).
+    assert!(RUNTIME.contains("unset and draft_verify is krow, using the reference block"));
+    // The step keeps the resolved intent that decision reads.
+    let step = code(STEP);
+    assert!(step.contains(&code("merge_intent: Intent,")));
+    assert!(step.contains(&code("merge_source: Source,")));
+}
+
 #[test]
 fn the_step_reads_the_merged_block_from_its_own_field_and_the_hook_meets_the_same_refusal() {
     let runtime = code(RUNTIME);

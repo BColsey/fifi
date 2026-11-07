@@ -77,9 +77,9 @@ fn leg(
     // The merged block must really be in this step: the load-line suffix is the proof the
     // comparison of a merged leg is not reference against reference.
     let want = if merged {
-        " exl3_shared_in_routed=on"
+        " exl3_shared_in_routed=on source=explicit"
     } else {
-        ""
+        " exl3_shared_in_routed=off source=explicit"
     };
     assert_eq!(step.shared_in_routed_suffix(), want, "the block of the leg");
     step.set_capture_config(CaptureConfig {

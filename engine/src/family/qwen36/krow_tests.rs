@@ -38,6 +38,17 @@ fn the_qualified_configuration_arms() {
     check_krow_env(None, Some(&os("0"))).expect("the merged block is off at 0");
 }
 
+/// Unset is the default of the merged block and yields to krow at `request_krow_verify`; only an
+/// explicit `1` is an environment-level refusal.
+#[test]
+fn only_an_explicit_one_refuses_from_the_environment() {
+    check_krow_env(None, None).expect("unset yields, it does not refuse");
+    check_krow_env(None, Some(&os(" 0 "))).expect("0 is off");
+    let text = message(check_krow_env(None, Some(&os("1"))));
+    assert!(text.contains("FIFI_EXL3_SHARED_IN_ROUTED=1"), "{text}");
+    assert!(text.contains("unset it"), "{text}");
+}
+
 #[test]
 fn any_value_of_the_single_row_switch_refuses_and_the_message_says_unset_it() {
     // Deliberate: an explicit wide1 is the served kernel, and it is refused

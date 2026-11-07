@@ -12,8 +12,8 @@ use std::ffi::OsStr;
 
 use super::exl3_merge_plan::{
     Decision, IdWord, Input, Intent, Member, MergeLayout, PairSpans, PlanDims, PlannedPair, Proj,
-    SHARED_IN_ROUTED_VAR, SharedFacts, Span, block_plan, check_merge, decide, load_suffix,
-    reference_kernel_launches, resolve_switch, shared_in_routed_from_env,
+    SHARED_IN_ROUTED_VAR, SharedFacts, Source, Span, block_plan, check_merge, decide, load_suffix,
+    reference_kernel_launches, resolve, resolve_switch, shared_in_routed_from_env,
 };
 use crate::{EngError, kernels::single_row::SingleRow};
 
@@ -53,9 +53,37 @@ fn the_switch_parses_strictly_and_reports_unset_apart_from_zero() {
 }
 
 #[test]
-fn the_load_line_names_the_switch_only_when_it_is_on() {
-    assert_eq!(load_suffix(false), "");
-    assert_eq!(load_suffix(true), " exl3_shared_in_routed=on");
+fn the_load_line_names_the_resolved_mode_and_its_source() {
+    assert_eq!(
+        load_suffix(true, Source::Default),
+        " exl3_shared_in_routed=on source=default"
+    );
+    assert_eq!(
+        load_suffix(true, Source::Explicit),
+        " exl3_shared_in_routed=on source=explicit"
+    );
+    assert_eq!(
+        load_suffix(false, Source::Explicit),
+        " exl3_shared_in_routed=off source=explicit"
+    );
+    assert_eq!(
+        load_suffix(false, Source::Fallback),
+        " exl3_shared_in_routed=off source=fallback"
+    );
+    assert_eq!(
+        load_suffix(false, Source::Krow),
+        " exl3_shared_in_routed=off source=krow"
+    );
+    // The `=on` token is what the GPU scripts count: only a running block carries it.
+    for source in [
+        Source::Default,
+        Source::Explicit,
+        Source::Fallback,
+        Source::Krow,
+    ] {
+        assert!(load_suffix(true, source).contains("exl3_shared_in_routed=on"));
+        assert!(!load_suffix(false, source).contains("exl3_shared_in_routed=on"));
+    }
 }
 
 /// The reference block, stated independently of the executor: gate and up of pick `s` are pairs
@@ -359,7 +387,7 @@ fn the_step_reaches_the_merged_block_only_through_the_switch() {
     // explicit refuses); every other layout gets `None`.
     assert!(
         squeezed.contains(
-            "letexl3_merge=ifoptions.layout==WeightLayout::Exl3{letintent=resolve_switch(shared_in_routed_explicit(),true)?;SharedMerge::choose(context,&moe_dims(&res.dims),&exl3_moe,intent)?}else{None};"
+            "let(exl3_merge,merge_intent,merge_source)=ifoptions.layout==WeightLayout::Exl3{letintent=resolve_switch(shared_in_routed_explicit(),true)?;let(merge,source)=SharedMerge::choose(context,&moe_dims(&res.dims),&exl3_moe,intent)?;(merge,intent,source)}else{(None,Intent::Off,Source::Explicit)};"
         ),
         "the merge exists only for the EXL3 layout, chosen from the resolved intent"
     );
@@ -734,21 +762,43 @@ fn every_refusal_of_the_check_falls_back_by_default_and_refuses_when_explicit() 
     );
 }
 
-/// The load chooses through `decide`: fallback logs and returns None, refuse is an error, and the
-/// check is skipped when off.
+/// The behaviour of the load's choice, on the pure `resolve`: what each case does and says.
 #[test]
-fn the_load_chooses_through_the_decision_with_a_logged_fallback() {
+fn the_load_resolves_each_case_to_a_run_a_logged_fallback_or_a_refusal() {
+    let no = || Err("it needs wide1".to_owned());
+    // Everything fine.
+    let r = resolve(Intent::Default, Ok(())).unwrap();
+    assert!(r.merge && r.source == Source::Default && r.fallback_reason.is_none());
+    let r = resolve(Intent::Explicit, Ok(())).unwrap();
+    assert!(r.merge && r.source == Source::Explicit && r.fallback_reason.is_none());
+    let r = resolve(Intent::Off, Ok(())).unwrap();
+    assert!(!r.merge && r.source == Source::Explicit && r.fallback_reason.is_none());
+    // The default cannot be honoured: a SUCCESSFUL reference run that carries the reason to log.
+    let r = resolve(Intent::Default, no()).expect("a fallback is not an error");
+    assert!(!r.merge);
+    assert_eq!(r.source, Source::Fallback);
+    assert_eq!(r.fallback_reason.as_deref(), Some("it needs wide1"));
+    // An explicit request that cannot be honoured is the error, with the reason.
+    let error = resolve(Intent::Explicit, no()).expect_err("an explicit 1 is refused");
+    assert!(format!("{error:?}").contains("it needs wide1"), "{error:?}");
+    // Off never looks at the check.
+    let r = resolve(Intent::Off, no()).unwrap();
+    assert!(!r.merge && r.fallback_reason.is_none());
+}
+
+/// `choose` acts on `resolve` and on nothing else: it logs the reason, allocates only when told to,
+/// and returns the source.
+#[test]
+fn the_load_acts_on_the_resolution_and_logs_the_fallback_reason() {
     let merge = include_str!("cuda/exl3_moe/merge.rs");
     let choose = squeeze(section(merge, "pub(in crate::family) fn choose("));
     for part in [
         "letcheck=ifintent==Intent::Off{Ok(())}else{Self::check(ctx,dims,layers)};",
-        "matchdecide(intent,check){",
-        "Decision::Merge=>Self::new(ctx,dims,layers).map(Some)",
-        "Decision::Reference=>Ok(None)",
-        "Decision::Fallback(reason)=>{eprintln!(",
+        "letresolved=resolve(intent,check)?;",
+        "ifletSome(reason)=&resolved.fallback_reason{eprintln!(",
         "usingthereferenceblock:{reason}",
-        "Ok(None)",
-        "Decision::Refuse(reason)=>Err(EngError::BadRequest(reason))",
+        "letmerge=ifresolved.merge{Some(Self::new(ctx,dims,layers)?)}else{None};",
+        "Ok((merge,resolved.source))",
     ] {
         assert!(choose.contains(part), "{part}: {choose}");
     }
