@@ -53,10 +53,14 @@ mod exl3_load_device_tests;
 pub(in crate::family) mod exl3_moe;
 #[cfg(test)]
 mod exl3_moe_device_tests;
+#[cfg(test)]
+mod exl3_moe_merge_device_tests;
 mod exl3_moe_source;
 mod exl3_source;
 #[cfg(test)]
 mod exl3_step_device_tests;
+#[cfg(test)]
+mod exl3_step_merge_device_tests;
 #[cfg(test)]
 mod export_tests;
 pub mod gate;

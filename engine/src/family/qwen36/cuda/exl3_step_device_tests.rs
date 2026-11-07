@@ -41,12 +41,12 @@ use crate::{
 };
 
 /// The sampler vocabulary, the padded head width and the stop ids of the pinned model.
-const SAMPLER_VOCAB: usize = 248_077;
-const HEAD_ROWS: usize = 248_320;
-const EOS: [u32; 2] = [248_046, 248_044];
+pub(super) const SAMPLER_VOCAB: usize = 248_077;
+pub(super) const HEAD_ROWS: usize = 248_320;
+pub(super) const EOS: [u32; 2] = [248_046, 248_044];
 /// The chat-templated user turn "Explain in three sentences what a hash map is and why lookups
 /// are fast." ending at the assistant header, in the ids of the model's tokenizer.
-const PROMPT: [u32; 25] = [
+pub(super) const PROMPT: [u32; 25] = [
     248045, 846, 198, 814, 20139, 303, 2250, 22157, 1092, 264, 5010, 2336, 369, 321, 3069, 1353,
     8339, 513, 4778, 13, 248046, 198, 248045, 74455, 198,
 ];
@@ -67,7 +67,7 @@ struct Pair {
     wide_arena_bytes: usize,
 }
 
-fn options() -> StepOptions {
+pub(super) fn options() -> StepOptions {
     StepOptions {
         kv_mode: KvMode::Int8G32,
         context_tokens: PROMPT.len() + GENERATED + 1,
@@ -154,7 +154,7 @@ fn both_runs(dir: &Path) -> Result<Pair, EngError> {
     })
 }
 
-fn row_values(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn row_values(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()
         .0
