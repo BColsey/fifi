@@ -235,7 +235,8 @@ impl RollbackSlots {
         let mut slots = Vec::with_capacity(plan.slots());
         for slot in 0..plan.slots() {
             let mut bytes = vec![0u8; plan.slot_bytes];
-            self.buffer.read_at(stream, plan.offset(slot)?, &mut bytes)?;
+            self.buffer
+                .read_at(stream, plan.offset(slot)?, &mut bytes)?;
             slots.push(
                 bytes
                     .as_chunks::<4>()

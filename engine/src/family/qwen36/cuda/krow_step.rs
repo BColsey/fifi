@@ -27,7 +27,6 @@
 //! is one read of `8 K + 8` bytes; the window ids are written once and never read by the host;
 //! nothing runs on the host between the rows.
 
-use super::QwenResidentStep;
 use super::super::{
     exl3_moe::{Exl3MoeBufs, Scratch, run_exl3_moe_rows},
     krow_ops::{KrowIoLayout, Place, RowsBlockOp, RowsKindOps, check_tail_rows},
@@ -42,6 +41,9 @@ use super::super::{
     step_plan::Slot,
     verdict::{FailureAction, action_for},
 };
+use super::QwenResidentStep;
+#[cfg(test)]
+use crate::family::speculate::d1_oracle::Fault;
 use crate::{
     EngError,
     family::{
@@ -68,8 +70,6 @@ use crate::{
         },
     },
 };
-#[cfg(test)]
-use crate::family::speculate::d1_oracle::Fault;
 
 const F32: usize = size_of::<f32>();
 
@@ -164,9 +164,14 @@ impl<'a> QwenResidentStep<'a> {
         }
         let layout = KrowIoLayout::new(&res.geometry, rows)?;
         let io = self.context.allocate(layout.total)?;
-        let logits = vec![0; f32_bytes(res.dims.shape.vocab)?.checked_mul(rows).ok_or_else(|| {
-            EngError::MemoryPlan("K-row window: the logits copy overflows".to_owned())
-        })?];
+        let logits = vec![
+            0;
+            f32_bytes(res.dims.shape.vocab)?
+                .checked_mul(rows)
+                .ok_or_else(|| {
+                    EngError::MemoryPlan("K-row window: the logits copy overflows".to_owned())
+                })?
+        ];
         self.krow = Some(KrowRuntime {
             io,
             layout,
@@ -188,9 +193,14 @@ impl<'a> QwenResidentStep<'a> {
     /// The configuration the K-row body is built for.
     fn check_krow_configuration(&self) -> Result<(), EngError> {
         if self.state.layout().kv.mode != super::KvMode::Fp16 {
-            return Err(refuse("runs the fp16 KV cache; the int8 cache is not built"));
+            return Err(refuse(
+                "runs the fp16 KV cache; the int8 cache is not built",
+            ));
         }
-        if self.tiered_mode || self.sync_each || self.forked_experts || self.layout != WeightLayout::Exl3
+        if self.tiered_mode
+            || self.sync_each
+            || self.forked_experts
+            || self.layout != WeightLayout::Exl3
         {
             return Err(refuse(
                 "needs the plain EXL3 step: not tiered, not in per-op synchronization, no forked experts",
@@ -254,9 +264,7 @@ impl<'a> QwenResidentStep<'a> {
             .map_err(RowsFailure::StateDecides)?;
         #[cfg(test)]
         self.arm_injection();
-        let admit_pos = self
-            .krow_start(inputs)
-            .map_err(RowsFailure::StateDecides)?;
+        let admit_pos = self.krow_start(inputs).map_err(RowsFailure::StateDecides)?;
         let mut entered = 0;
         let ran = self.run_body_rows(k, admit_pos, &mut entered);
         #[cfg(test)]
@@ -305,13 +313,20 @@ impl<'a> QwenResidentStep<'a> {
         let too_big = |what| EngError::BadRequest(format!("step: the {what} does not fit an i32"));
         let mut ids = Vec::with_capacity(inputs.len() * size_of::<i32>());
         for &token in inputs {
-            ids.extend(i32::try_from(token).map_err(|_| too_big("token"))?.to_le_bytes());
+            ids.extend(
+                i32::try_from(token)
+                    .map_err(|_| too_big("token"))?
+                    .to_le_bytes(),
+            );
         }
         let first = i32::try_from(inputs[0]).map_err(|_| too_big("token"))?;
         let pos = i32::try_from(self.state.tokens()).map_err(|_| too_big("position"))?;
         self.started = true;
         let Self {
-            krow, stream, state, ..
+            krow,
+            stream,
+            state,
+            ..
         } = self;
         let runtime = krow.as_ref().ok_or_else(not_armed)?;
         runtime
@@ -397,10 +412,7 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The two calls of the window tail, built from the one row count `k`.
-    fn tail_calls(
-        &self,
-        k: usize,
-    ) -> Result<(ArgmaxRowsCall<'_>, WindowFoldCall<'_>), EngError> {
+    fn tail_calls(&self, k: usize) -> Result<(ArgmaxRowsCall<'_>, WindowFoldCall<'_>), EngError> {
         let runtime = self.krow_runtime()?;
         let table = runtime.layout.result.offset;
         let argmax = ArgmaxRowsCall {
@@ -459,11 +471,7 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     /// The slots' snapshot ranges of layer `run.ordinal` for the part `part`.
-    fn snap_of(
-        &self,
-        run: &RowsRun<'_>,
-        part: SnapPart,
-    ) -> Result<SnapRows<'_>, EngError> {
+    fn snap_of(&self, run: &RowsRun<'_>, part: SnapPart) -> Result<SnapRows<'_>, EngError> {
         self.rollback
             .as_ref()
             .ok_or_else(|| refuse("needs the device rollback slots"))?
@@ -471,12 +479,7 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     fn block_op_rows(&self, run: &RowsRun<'_>, op: &RowsBlockOp) -> Result<(), EngError> {
-        let (ctx, s, g, k) = (
-            self.context,
-            &self.stream,
-            &self.res.geometry,
-            run.k,
-        );
+        let (ctx, s, g, k) = (self.context, &self.stream, &self.res.geometry, run.k);
         let capacity = self.state.layout().kv.capacity;
         match op {
             RowsBlockOp::NormPack {
@@ -511,7 +514,9 @@ impl<'a> QwenResidentStep<'a> {
                 };
                 ctx.exl3_linear(s, weight.linear_call(&io))
             }
-            RowsBlockOp::Gate { role, x, y, col, .. } => {
+            RowsBlockOp::Gate {
+                role, x, y, col, ..
+            } => {
                 let shape = plain_shape(g, *role)?;
                 let dst = self.kview(*y)?;
                 let (offset, len) = tail_extent(dst.bytes(), *col)?;
@@ -762,7 +767,11 @@ impl<'a> QwenResidentStep<'a> {
     /// The logits of the `k` rows, one vector of the head width per row.
     fn read_krow_rows(&mut self, k: usize) -> Result<Vec<Vec<f32>>, EngError> {
         #[cfg(test)]
-        if self.krow.as_ref().is_some_and(|runtime| runtime.test.skip_logits) {
+        if self
+            .krow
+            .as_ref()
+            .is_some_and(|runtime| runtime.test.skip_logits)
+        {
             return Ok(vec![Vec::new(); k]);
         }
         let view = self.kview(Slot::Logits)?;
@@ -844,7 +853,9 @@ impl QwenResidentStep<'_> {
     }
 
     fn injection(&self) -> Option<Injection> {
-        self.krow.as_ref().and_then(|runtime| runtime.test.injection)
+        self.krow
+            .as_ref()
+            .and_then(|runtime| runtime.test.injection)
     }
 
     /// Writes a quiet NaN into element 0 of the embedding of row `j` (after the embedding op).

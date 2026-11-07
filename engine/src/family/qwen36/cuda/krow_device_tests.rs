@@ -68,14 +68,7 @@ fn every_value_of_the_single_row_switch_and_the_merged_block_are_refused_and_say
     assert!(error.contains("unset it"), "{error}");
 }
 
-fn counts(
-    argmax: u64,
-    fold: u64,
-    pack: u64,
-    conv: u64,
-    delta: u64,
-    router: u64,
-) -> RowLaunches {
+fn counts(argmax: u64, fold: u64, pack: u64, conv: u64, delta: u64, router: u64) -> RowLaunches {
     RowLaunches {
         argmax_rows: argmax,
         status_fold: fold,

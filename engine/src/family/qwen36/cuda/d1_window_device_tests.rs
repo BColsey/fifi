@@ -77,8 +77,7 @@ use crate::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
                 failure_recovery, first_bit_difference, first_byte_difference, full_logits,
                 host_faults_for, host_greedy, krow_faults_for, krow_matches_eager,
-                later_rows_isolated, near_tie, repeated_rollbacks, slot_faults_for,
-                ties_break_low,
+                later_rows_isolated, near_tie, repeated_rollbacks, slot_faults_for, ties_break_low,
             },
             driver::WindowModel,
             window::Commit,
@@ -158,7 +157,10 @@ pub(super) fn arm_rollback(step: &mut QwenResidentStep<'_>, mode: RollbackMode) 
 /// Arms the K-row window on a step whose resources hold the K-row arena and whose device rollback
 /// is armed, as the served start does for `draft_verify = krow`. The arming's own refusals are
 /// the start's: `Err` when a refused switch is set.
-pub(super) fn arm_verify(step: &mut QwenResidentStep<'_>, verify: VerifyMode) -> Result<(), EngError> {
+pub(super) fn arm_verify(
+    step: &mut QwenResidentStep<'_>,
+    verify: VerifyMode,
+) -> Result<(), EngError> {
     if verify == VerifyMode::Krow {
         step.request_krow_verify();
         step.check_krow_arming(QWEN36_MAX_WINDOW_ROWS)?;
@@ -537,7 +539,9 @@ fn assert_path_counters(step: &QwenResidentStep<'_>, verify: VerifyMode, phase: 
         counts.describe()
     );
     let verdict = match verify {
-        VerifyMode::Eager if windows != 0 => Err(format!("{windows} K-row windows in an eager run")),
+        VerifyMode::Eager if windows != 0 => {
+            Err(format!("{windows} K-row windows in an eager run"))
+        }
         VerifyMode::Eager => counts.require_krow_idle(),
         VerifyMode::Krow => require_krow_enqueued(&counts, windows),
     };
@@ -959,7 +963,7 @@ impl Arm {
 }
 
 impl TokenStepper for Arm {
-    const OPERATION: &'static str = QwenResidentStep::OPERATION;
+    const OPERATION: &'static str = <QwenResidentStep<'static> as TokenStepper>::OPERATION;
 
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         self.with(|step| step.feed(token))
@@ -1129,11 +1133,8 @@ fn d1_krow_only_the_bad_row_reports_its_bit_over_100_windows() {
     let (mut rig, _session, base, inputs) = krow_rig(8);
     for j in [0, 3, 7] {
         for window in 0..100 {
-            let table = failed_window_table(
-                &mut rig.step,
-                &inputs,
-                super::step::Injection::LogitsNan(j),
-            );
+            let table =
+                failed_window_table(&mut rig.step, &inputs, super::step::Injection::LogitsNan(j));
             for (row, bits) in table.bits.iter().enumerate() {
                 assert_eq!(
                     *bits,
@@ -1141,7 +1142,11 @@ fn d1_krow_only_the_bad_row_reports_its_bit_over_100_windows() {
                     "window {window} bad row {j}: pair {row}"
                 );
             }
-            assert_eq!(table.window & 2, 2, "window {window} bad row {j}: window word");
+            assert_eq!(
+                table.window & 2,
+                2,
+                "window {window} bad row {j}: window word"
+            );
             rig.step.restore(&base).expect("restore");
         }
     }
@@ -1155,11 +1160,8 @@ fn d1_krow_only_the_bad_row_reports_its_bit_over_100_windows() {
 fn d1_krow_a_corrupt_hidden_state_spreads_to_later_rows_only() {
     let (mut rig, _session, base, inputs) = krow_rig(4);
     for j in 0..4 {
-        let table = failed_window_table(
-            &mut rig.step,
-            &inputs,
-            super::step::Injection::HiddenNan(j),
-        );
+        let table =
+            failed_window_table(&mut rig.step, &inputs, super::step::Injection::HiddenNan(j));
         for (row, bits) in table.bits.iter().enumerate() {
             assert_eq!(
                 *bits != 0,
@@ -1179,11 +1181,7 @@ fn d1_krow_a_corrupt_hidden_state_spreads_to_later_rows_only() {
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_a_short_window_after_a_long_one_reads_no_stale_status() {
     let (mut rig, _session, base, inputs) = krow_rig(8);
-    let table = failed_window_table(
-        &mut rig.step,
-        &inputs,
-        super::step::Injection::LogitsNan(6),
-    );
+    let table = failed_window_table(&mut rig.step, &inputs, super::step::Injection::LogitsNan(6));
     assert_eq!(table.bits[6], 2);
     rig.step.restore(&base).expect("restore");
     let step = &mut rig.step;
@@ -1256,4 +1254,36 @@ fn d1_krow_a_deliberately_broken_window_is_caught_by_check_a() {
         .expect_err("a window with a changed token must differ from the one-row steps");
     println!("D1_RESULT test=K-break caught: {failure}");
     assert!(failure.violation, "{failure}");
+}
+
+/// A token outside the sampler vocabulary in any row of a K-row window is refused before the ids
+/// are written or anything is enqueued: the state stays valid and unchanged, no window opens, and
+/// the next window runs. Without the host check the id reaches the embedding kernel, sets status
+/// 4 and poisons the state.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_an_out_of_vocabulary_id_is_refused_before_anything_is_enqueued() {
+    let (mut rig, _session, base, inputs) = krow_rig(4);
+    let windows = rig.step.krow_windows();
+    for bad in [SAMPLER_VOCAB as u32, HEAD_ROWS as u32, u32::MAX] {
+        for row in 0..inputs.len() {
+            let mut window = inputs.clone();
+            window[row] = bad;
+            rig.step
+                .run_window(&window)
+                .expect_err("an id outside the vocabulary must be refused");
+            let after = rig.step.snapshot().expect("the state stays valid");
+            assert_eq!(
+                exported_difference(&after, &base),
+                None,
+                "id {bad} in row {row} moved the state"
+            );
+            assert_eq!(rig.step.krow_windows(), windows, "no window ran");
+        }
+    }
+    report(
+        "A",
+        "after the refusals",
+        full_logits(&mut rig.step, &inputs),
+    );
 }

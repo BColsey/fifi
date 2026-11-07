@@ -66,7 +66,10 @@ fn every_slot_of_every_op_is_in_the_k_row_plan_and_live_in_the_phase_of_the_op()
 fn the_phases_never_go_back_and_the_lists_open_and_close_with_the_norms() {
     for (name, list) in lists() {
         let phases: Vec<usize> = list.iter().map(|op| op.phase() as usize).collect();
-        assert!(phases.windows(2).all(|w| w[0] <= w[1]), "{name}: {phases:?}");
+        assert!(
+            phases.windows(2).all(|w| w[0] <= w[1]),
+            "{name}: {phases:?}"
+        );
         assert!(matches!(
             list.first(),
             Some(RowsBlockOp::NormPack {
@@ -94,7 +97,10 @@ fn every_place_is_written_before_it_is_read() {
         let mut written = vec![Place::Slot(Slot::Exl3Flag)];
         for op in &list {
             for read in op.reads() {
-                assert!(written.contains(&read), "{name}: {op:?} reads {read:?} first");
+                assert!(
+                    written.contains(&read),
+                    "{name}: {op:?} reads {read:?} first"
+                );
             }
             written.extend(op.writes());
         }
@@ -142,7 +148,15 @@ fn the_delta_list_fills_the_row_the_delta_kernel_reads_and_the_conv_reads_the_ti
     );
     let conv = delta
         .iter()
-        .position(|op| matches!(op, RowsBlockOp::Conv { proj: Tight::Qkv, .. }))
+        .position(|op| {
+            matches!(
+                op,
+                RowsBlockOp::Conv {
+                    proj: Tight::Qkv,
+                    ..
+                }
+            )
+        })
         .expect("conv over the tight qkv");
     let rule = delta
         .iter()
@@ -152,7 +166,10 @@ fn the_delta_list_fills_the_row_the_delta_kernel_reads_and_the_conv_reads_the_ti
         .iter()
         .position(|op| matches!(op, RowsBlockOp::Pack { .. }))
         .expect("pack");
-    assert!(pack < conv && conv < rule, "pack {pack} conv {conv} delta {rule}");
+    assert!(
+        pack < conv && conv < rule,
+        "pack {pack} conv {conv} delta {rule}"
+    );
     let roles: Vec<Role> = delta
         .iter()
         .filter_map(|op| match op {
@@ -235,7 +252,10 @@ fn the_buffer_regions_are_aligned_apart_and_as_wide_as_the_geometry() {
         for (name, region, row_bytes) in regions {
             assert_eq!(region.row_bytes, row_bytes, "{rows} rows: {name}");
             assert_eq!(region.offset % 256, 0, "{rows} rows: {name} alignment");
-            assert!(region.offset >= end, "{rows} rows: {name} overlaps the one before");
+            assert!(
+                region.offset >= end,
+                "{rows} rows: {name} overlaps the one before"
+            );
             end = region.offset
                 + if name == "result" {
                     window_result_bytes(rows)
@@ -271,7 +291,10 @@ fn the_tail_takes_one_row_count_for_both_kernels() {
     for rows in 2..=MAX_STEP_ROWS {
         check_tail_rows(rows, rows).expect("equal counts");
         // The mutant: a fold over more rows than the argmax wrote reads stale pairs.
-        let text = format!("{:?}", check_tail_rows(rows, rows + 1).expect_err("refused"));
+        let text = format!(
+            "{:?}",
+            check_tail_rows(rows, rows + 1).expect_err("refused")
+        );
         assert!(text.contains("argmax_rows takes"), "{text}");
         assert!(check_tail_rows(rows + 1, rows).is_err());
     }
@@ -299,7 +322,11 @@ fn a_window_clears_the_status_word_first_and_the_fold_is_the_last_writer_of_it()
             .position(|op| *op == RowsOp::StatusFold)
             .expect("fold");
         assert_eq!(writers.last(), Some(&fold), "{rows} rows");
-        assert_eq!(writers.first(), Some(&0), "{rows} rows: the clear is the first writer");
+        assert_eq!(
+            writers.first(),
+            Some(&0),
+            "{rows} rows: the clear is the first writer"
+        );
         // The argmax and the fold come in this order and nothing is between them.
         let argmax = ops
             .iter()

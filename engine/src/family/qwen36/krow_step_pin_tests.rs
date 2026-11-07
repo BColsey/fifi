@@ -72,7 +72,10 @@ fn a_refusal_before_the_first_write_is_the_states_to_judge_and_nothing_after_the
     // The poison on a failed finish is local and unconditional.
     in_order(
         window,
-        &["self.state.poison();", "Err(RowsFailure::AfterLaunch(error))"],
+        &[
+            "self.state.poison();",
+            "Err(RowsFailure::AfterLaunch(error))",
+        ],
     );
     // `StateDecides` appears only for the two steps before the launch.
     assert_eq!(window.matches("StateDecides").count(), 2);
@@ -127,7 +130,9 @@ fn after_the_launch_the_table_is_read_judged_and_the_logits_read_before_the_rows
         ],
     );
     // Every row's pair and the window word go to the verdict; none is dropped.
-    assert!(finish.contains(&code("bits: table.bits.iter().map(|&bits| bits as u32).collect()")));
+    assert!(finish.contains(&code(
+        "bits: table.bits.iter().map(|&bits| bits as u32).collect()"
+    )));
     assert!(finish.contains(&code("window: table.window as u32")));
 }
 
@@ -147,7 +152,9 @@ fn the_body_is_the_k_row_list_and_the_tail_is_built_from_one_row_count() {
             "ctx.exl3_flag_clear(s, self.kview(Slot::Exl3Flag)?)",
         ],
     );
-    assert!(ops.contains(&code("RowsOp::ArgmaxRows => ctx.argmax_rows(s, self.tail_calls(k)?.0)")));
+    assert!(ops.contains(&code(
+        "RowsOp::ArgmaxRows => ctx.argmax_rows(s, self.tail_calls(k)?.0)"
+    )));
     assert!(ops.contains(&code(
         "RowsOp::StatusFold => ctx.window_status_fold(s, self.tail_calls(k)?.1)"
     )));
@@ -180,7 +187,10 @@ fn the_slot_stores_and_the_head_are_the_k_row_launches_and_the_per_row_chains_ar
     ] {
         assert!(block.contains(&code(call)), "{call}");
     }
-    assert!(body(&source, "moe_rows").contains(&code("run_exl3_moe_rows(&launch, weights, &bufs, &dims)")));
+    assert!(
+        body(&source, "moe_rows")
+            .contains(&code("run_exl3_moe_rows(&launch, weights, &bufs, &dims)"))
+    );
     assert!(body(&source, "lm_head_rows").contains(&code("rows: k,")));
 }
 

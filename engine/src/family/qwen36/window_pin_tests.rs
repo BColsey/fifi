@@ -723,7 +723,9 @@ fn the_start_checks_the_krow_switches_before_the_weights_and_arms_the_k_row_path
     assert!(at("settings.draft_verify == VerifyMode::Krow") < at("check_krow_env("));
     assert!(at("check_krow_env(") < at("load_exl3_dir(&projector"));
     // The K-row arena is added to the resources only for a K-row session, before they are leaked.
-    assert!(at("res.with_krow(") < at("let res: &'static StepResources = Box::leak(Box::new(res));"));
+    assert!(
+        at("res.with_krow(") < at("let res: &'static StepResources = Box::leak(Box::new(res));")
+    );
     // After the slots are armed: ask for krow, check the step, arm the path.
     let armed = at("step.enable_device_rollback(");
     assert!(armed < at("step.request_krow_verify();"));
