@@ -397,6 +397,18 @@ bool valid_split_logits(const inference_cuda_router_logits_args *a) {
            split_apart(a->logits, y, a->x, x) && split_apart(a->logits, y, a->w, w);
 }
 
+bool valid_strided_logits(const inference_cuda_router_logits_strided_args *a) {
+    if (!a || a->m < 1 || a->m >= kTiledMinRows || a->hidden < 4 || a->hidden > 65536 || a->hidden % 4 ||
+        a->n_expert < 1 || a->n_expert > kRouterMaxExperts || a->logit_stride < a->n_expert ||
+        a->logit_stride > (1 << 20)) return false;
+    const size_t x = size_t(a->m) * a->hidden * 4;
+    const size_t w = size_t(a->n_expert) * a->hidden * 4;
+    const size_t y = (size_t(a->m - 1) * a->logit_stride + a->n_expert) * 4;
+    return split_span(a->x, a->x_bytes, x, 16) && split_span(a->w, a->w_bytes, w, 16) &&
+           split_span(a->logits, a->logits_bytes, y, 4) &&
+           split_apart(a->logits, y, a->x, x) && split_apart(a->logits, y, a->w, w);
+}
+
 bool valid_split_select(const inference_cuda_router_sigmoid_args *a) {
     if (!a || a->m < 1 || a->m > kRouterMaxRows || a->n_expert < 1 ||
         a->n_expert > kRouterMaxExperts || a->top_k < 1 ||
@@ -470,6 +482,24 @@ extern "C" int inference_cuda_router_logits_launch(const inference_cuda_router_l
             router_logits_k<<<grid, kLogitWarps * 32, 0, s>>>(
                 a->x, a->w, NULL, a->logits, a->hidden, a->n_expert, a->n_expert);
         }
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_router_logits_strided_launch(const inference_cuda_router_logits_strided_args *a,
+                                                           void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!stream || !valid_strided_logits(a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const cudaStream_t s = (cudaStream_t)stream;
+        const dim3 grid((a->n_expert + kLogitWarps - 1) / kLogitWarps, a->m);
+        router_logits_k<<<grid, kLogitWarps * 32, 0, s>>>(
+            a->x, a->w, NULL, a->logits, a->hidden, a->n_expert, a->logit_stride);
         Failure failure;
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

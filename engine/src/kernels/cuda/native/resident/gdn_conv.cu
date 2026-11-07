@@ -49,6 +49,25 @@ bool valid(const inference_cuda_gdn_conv_args &a, void *stream) {
            apart(a.out, out_bytes, a.w, w_bytes);
 }
 
+// The snapshot range of the strided entry: [snap, snap + snap_bytes) shares no byte with any range
+// the kernel reads or writes, and holds the m - 1 snapshots of 12 * channels bytes at snap_stride.
+bool valid_snap(const inference_cuda_gdn_conv_snap_args &s) {
+    const inference_cuda_gdn_conv_args &a = s.conv;
+    const size_t n = (size_t)a.channels;
+    const size_t row = 3 * n * sizeof(float);
+    if (s.snap == NULL || a.m < 2 || !aligned(s.snap, 4) || s.snap_stride % 4 != 0 ||
+        s.snap_stride < row) {
+        return false;
+    }
+    const size_t reach = ((size_t)a.m - 2) * s.snap_stride + row;
+    if (s.snap_bytes < reach) {
+        return false;
+    }
+    const size_t proj_bytes = (((size_t)a.m - 1) * (size_t)a.ld + n) * sizeof(float);
+    return apart(s.snap, reach, a.state, row) && apart(s.snap, reach, a.out, (size_t)a.m * n * sizeof(float)) &&
+           apart(s.snap, reach, a.proj, proj_bytes) && apart(s.snap, reach, a.w, n * 4 * sizeof(float));
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args,
@@ -62,6 +81,27 @@ extern "C" int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args
         kern::ConvArgs call = {(const float *)args->proj, args->ld,   args->m,
                                args->channels,            (const float *)args->w,
                                (float *)args->state,      NULL,       (float *)args->out};
+        Failure failure;
+        failure.record(kern::conv_silu(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gdn_conv_snap_launch(const inference_cuda_gdn_conv_snap_args *args,
+                                                   void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(args->conv, stream) || !valid_snap(*args)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const inference_cuda_gdn_conv_args &a = args->conv;
+        kern::ConvArgs call = {(const float *)a.proj, a.ld,  a.m,
+                               a.channels,            (const float *)a.w,
+                               (float *)a.state,      (float *)args->snap, (float *)a.out,
+                               args->snap_stride};
         Failure failure;
         failure.record(kern::conv_silu(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);

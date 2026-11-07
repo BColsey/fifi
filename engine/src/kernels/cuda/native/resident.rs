@@ -51,6 +51,7 @@ use super::{
 
 pub(in crate::kernels::cuda) mod add_norm_pack;
 pub(in crate::kernels::cuda) mod add_rmsnorm_q8;
+pub(in crate::kernels::cuda) mod argmax_rows;
 pub(in crate::kernels::cuda) mod attn_decode;
 pub(in crate::kernels::cuda) mod attn_decode_gemma;
 pub(in crate::kernels::cuda) mod attn_decode_q8;
@@ -75,6 +76,7 @@ pub(in crate::kernels::cuda) mod matmul_q5_0;
 pub(in crate::kernels::cuda) mod matvec_expert;
 pub(in crate::kernels::cuda) mod matvec_q;
 pub(in crate::kernels::cuda) mod moe_combine;
+pub(in crate::kernels::cuda) mod pack_rows;
 pub(in crate::kernels::cuda) mod paged_position;
 pub(in crate::kernels::cuda) mod qsa_attn;
 pub(in crate::kernels::cuda) mod qsa_index;
@@ -82,6 +84,7 @@ pub(in crate::kernels::cuda) mod qsa_select;
 pub(in crate::kernels::cuda) mod quantize_q8_1;
 pub(in crate::kernels::cuda) mod rope_gemma;
 pub(in crate::kernels::cuda) mod router;
+pub(in crate::kernels::cuda) mod router_rows;
 pub(in crate::kernels::cuda) mod row_add;
 pub(in crate::kernels::cuda) mod row_scale;
 pub(in crate::kernels::cuda) mod sample_gemma;

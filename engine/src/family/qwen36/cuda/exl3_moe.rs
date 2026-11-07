@@ -160,6 +160,15 @@ fn row<'b>(
     range.buffer().range(range.offset() + index * width, width)
 }
 
+/// The first `bytes` bytes of `range`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+fn leading<'b>(range: &DeviceRange<'b>, bytes: usize) -> Result<DeviceRange<'b>, EngError> {
+    range.buffer().range(range.offset(), bytes)
+}
+
 fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
     buffer.range(0, buffer.bytes())
 }
@@ -399,7 +408,7 @@ pub(super) fn routed_on_device(
 }
 
 /// The shared expert: gate and up in one group, the SwiGLU, the down projection.
-fn shared(
+pub(super) fn shared(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
@@ -425,6 +434,89 @@ fn shared(
         out: bufs.shared_out,
     }];
     grouped(launch, &down, &bufs.scratch)
+}
+
+/// The three matrices of the shared expert.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+pub(in crate::family) struct SharedWeights<'w> {
+    pub(in crate::family) gate: &'w Exl3Weight,
+    pub(in crate::family) up: &'w Exl3Weight,
+    pub(in crate::family) down: &'w Exl3Weight,
+}
+
+/// The ranges of the shared expert of a `rows`-row window. `norm_row` holds `rows` rows of the
+/// hidden width; `gu` holds `rows` rows of `[gate | up]` (`2 * shared_inter` values each), `act`
+/// `rows` rows of `shared_inter` and `out` `rows` rows of the hidden width.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+pub(in crate::family) struct SharedRowsIo<'b> {
+    pub(in crate::family) norm_row: DeviceRange<'b>,
+    pub(in crate::family) gu: DeviceRange<'b>,
+    pub(in crate::family) act: DeviceRange<'b>,
+    pub(in crate::family) out: DeviceRange<'b>,
+    pub(in crate::family) scratch: Scratch<'b>,
+}
+
+/// The shared expert of a K-row verify window, `rows` in 2 to 8 (option B of the K-row design).
+///
+/// Gate and up are `2 * rows` one-row groups in ONE grouped launch, ordered
+/// `[gate_0, up_0, gate_1, up_1, ...]` like the routed block (row `r` owns the pairs `2 r` and
+/// `2 r + 1`), so each row's `[gate | up]` is contiguous and ONE `swiglu_rows` over `rows` rows
+/// reads it with `ld_in = 2 s`, `up_off = s`, the layout of the one-row block: no relaxation of the
+/// SwiGLU's validation. Every pair is exactly the one-row computation (a group of one row, the
+/// one-tile wide body). The down projection is one group of `rows` rows, the rows kernel. Two
+/// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
+/// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
+///
+/// The one-row block [`shared`] is untouched; the unit test compares this one to `rows` runs of it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+pub(in crate::family) fn shared_rows(
+    launch: &Launch<'_>,
+    weights: &SharedWeights<'_>,
+    io: &SharedRowsIo<'_>,
+    (hidden, shared_inter, rows): (usize, usize, usize),
+) -> Result<(), EngError> {
+    if !(2..=8).contains(&rows) {
+        return Err(refuse(format!(
+            "the K-row shared expert takes 2 to 8 rows, got {rows}"
+        )));
+    }
+    let s = shared_inter;
+    let mut group = Vec::with_capacity(2 * rows);
+    for r in 0..rows {
+        for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
+            group.push(Pair {
+                view: weight.view()?,
+                x: row(&io.norm_row, hidden * F32, r)?,
+                out: row(&io.gu, s * F32, 2 * r + half)?,
+            });
+        }
+    }
+    grouped(launch, &group, &io.scratch)?;
+    swiglu(launch, io.gu, io.act, (rows, s))?;
+    // One group of `rows` rows: the rotated input and the partials of all rows are contiguous.
+    let view = weights.down.view()?;
+    let [k, n] = view.shape;
+    let down = Exl3Io {
+        x: io.act,
+        xh: leading(&io.scratch.xh, rows * k * F32)?,
+        z: leading(&io.scratch.z, rows * n * F32)?,
+        out: io.out,
+        flag: io.scratch.flag,
+        rows,
+        fused: false,
+    };
+    launch
+        .ctx
+        .exl3_grouped_step(launch.stream, &[view.linear_call(&down)])
 }
 
 /// `resid_out = resid_in + (picks in pick order + gate * shared)`, as the GGUF block combines.

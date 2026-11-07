@@ -43,6 +43,9 @@ struct ConvArgs {
   float* state;
   float* snap;  // [m - 1][3][channels] or null
   float* out;   // [m][channels]
+  // GDN-snap-stride: 0 keeps the contiguous snap layout above. Non-zero (with a non-null snap): bytes
+  // between the snapshots of two tokens, snap[t] at `snap + t * snap_stride`; a multiple of 4.
+  size_t snap_stride = 0;
 };
 // w is [channels][4] f32, 16-byte aligned (one float4 per channel).
 cudaError_t conv_silu(const ConvArgs& a, cudaStream_t stream = nullptr);
@@ -61,6 +64,9 @@ struct DeltaArgs {
   float* out;            // [m][n_v_heads * 128]
   int m, n_k_heads, n_v_heads;
   float eps;
+  // GDN-snap-stride: 0 keeps the contiguous snap layout above. Non-zero (with a non-null snap): bytes
+  // between the snapshots of two tokens, token t's [n_v_heads][128][128] state at `snap + t * snap_stride`.
+  size_t snap_stride = 0;
 };
 // Value head h reads key head h % n_k_heads (the GGUF layout, tiled), so n_v_heads % n_k_heads
 // must be 0; the gate is silu(z).

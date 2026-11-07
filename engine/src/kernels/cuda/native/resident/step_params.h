@@ -113,6 +113,59 @@ _Static_assert(sizeof(inference_cuda_argmax_args) == 40 && offsetof(inference_cu
                "inference_cuda_argmax_args layout");
 #endif
 
+/* The row-batched greedy argmax of a K-row verify window, and the kernel that folds the window's
+ * status once. The single-row argmax above is unchanged.
+ *   argmax_rows: row r of the m logits rows (n f32 values each, row r at logits + r * ld floats)
+ *     gets the token of the single-row argmax (the largest value, the lowest index on a tie, a NaN
+ *     never wins, a row with no comparable value gives -1: the same code and the same grid shape per
+ *     row, so the same token for every row) in result[2 r], and its OWN status bits in result[2 r + 1]:
+ *     mask 2 when any of the row's n values is not finite, otherwise 0. The pair is stored whole
+ *     (not OR-ed), so every window rewrites every pair. Nothing is written to params: the single-row
+ *     kernel stores `before | bits`, the return value of atomicOr on the shared status word, which
+ *     with m rows in flight depends on block scheduling; here no atomic runs and a pair can show no
+ *     other row's bits. params->token_id is not written either (the rows take their ids from the
+ *     window-ids buffer). part is scratch of m * 3072 bytes (m * ARGMAX_PART_BYTES), 4-byte aligned,
+ *     no initialization. result is 8-byte aligned and holds 2 m ints. m in [1, 16], n in [1, 2^30],
+ *     ld >= n. Enqueues two kernels (256 x m blocks of 256 threads, then m blocks).
+ *   window_status_fold: one thread, after all rows and after every other status writer. ORs
+ *     result[2 r + 1] for r < m and the EXL3 arithmetic flag (bit 0 of the u32 flag word, which it
+ *     zeroes) into params->status exactly once (mask 16 for the flag, as exl3_flag_fold does), then
+ *     stores the window word w = params->status after the OR in result[2 m] and 0 in result[2 m + 1].
+ *     It only reads the pairs and clears none: the pairs and w are rewritten whole by every window,
+ *     so the host reads 2 m + 2 ints (8 m + 8 bytes) after one synchronization and needs no
+ *     preparation of the buffer. Mask 1 (router), mask 4 (invalid state) and mask 16 are window-level
+ *     bits that live in w only. params, flag and result must overlap no other range. */
+typedef struct inference_cuda_argmax_rows_args {
+    const void *logits;
+    void *part;
+    void *result;
+    long long ld;
+    int n;
+    int m;
+} inference_cuda_argmax_rows_args;
+int inference_cuda_argmax_rows_launch(const inference_cuda_argmax_rows_args *args, void *stream,
+                                      int *out_stage);
+
+typedef struct inference_cuda_window_fold_args {
+    void *params;
+    void *flag;
+    void *result;
+    int m;
+} inference_cuda_window_fold_args;
+int inference_cuda_window_status_fold_launch(const inference_cuda_window_fold_args *args, void *stream,
+                                             int *out_stage);
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_argmax_rows_args) == 40 && offsetof(inference_cuda_argmax_rows_args, logits) == 0 && offsetof(inference_cuda_argmax_rows_args, part) == 8 && offsetof(inference_cuda_argmax_rows_args, result) == 16 && offsetof(inference_cuda_argmax_rows_args, ld) == 24 && offsetof(inference_cuda_argmax_rows_args, n) == 32 && offsetof(inference_cuda_argmax_rows_args, m) == 36,
+              "inference_cuda_argmax_rows_args layout");
+static_assert(sizeof(inference_cuda_window_fold_args) == 32 && offsetof(inference_cuda_window_fold_args, params) == 0 && offsetof(inference_cuda_window_fold_args, flag) == 8 && offsetof(inference_cuda_window_fold_args, result) == 16 && offsetof(inference_cuda_window_fold_args, m) == 24,
+              "inference_cuda_window_fold_args layout");
+#else
+_Static_assert(sizeof(inference_cuda_argmax_rows_args) == 40 && offsetof(inference_cuda_argmax_rows_args, logits) == 0 && offsetof(inference_cuda_argmax_rows_args, part) == 8 && offsetof(inference_cuda_argmax_rows_args, result) == 16 && offsetof(inference_cuda_argmax_rows_args, ld) == 24 && offsetof(inference_cuda_argmax_rows_args, n) == 32 && offsetof(inference_cuda_argmax_rows_args, m) == 36,
+               "inference_cuda_argmax_rows_args layout");
+_Static_assert(sizeof(inference_cuda_window_fold_args) == 32 && offsetof(inference_cuda_window_fold_args, params) == 0 && offsetof(inference_cuda_window_fold_args, flag) == 8 && offsetof(inference_cuda_window_fold_args, result) == 16 && offsetof(inference_cuda_window_fold_args, m) == 24,
+               "inference_cuda_window_fold_args layout");
+#endif
+
 #ifdef __cplusplus
 }
 #endif

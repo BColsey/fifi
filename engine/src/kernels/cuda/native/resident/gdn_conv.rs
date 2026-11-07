@@ -58,10 +58,33 @@ const _: () = assert!(
         && offset_of!(GdnConvArgsRaw, channels) == 40
 );
 
+/// Mirror of `inference_cuda_gdn_conv_snap_args`: the conv arguments, then the snapshot range.
+#[repr(C)]
+struct GdnConvSnapArgsRaw {
+    conv: GdnConvArgsRaw,
+    snap: *mut c_void,
+    snap_stride: usize,
+    snap_bytes: usize,
+}
+
+const _: () = assert!(
+    size_of::<GdnConvSnapArgsRaw>() == 72
+        && offset_of!(GdnConvSnapArgsRaw, conv) == 0
+        && offset_of!(GdnConvSnapArgsRaw, snap) == 48
+        && offset_of!(GdnConvSnapArgsRaw, snap_stride) == 56
+        && offset_of!(GdnConvSnapArgsRaw, snap_bytes) == 64
+);
+
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_conv_launch"]
     fn gdn_conv_raw(
         args: *const GdnConvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gdn_conv_snap_launch"]
+    fn gdn_conv_snap_raw(
+        args: *const GdnConvSnapArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -164,5 +187,89 @@ pub(in crate::kernels::cuda) fn gdn_conv_launch(
     // only during the call: the kernel arguments are copied at launch, so nothing keeps the
     // pointer. `stream` is a live handle for the call, and `stage` is a live, writable c_int.
     let status = unsafe { gdn_conv_raw(&args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The per-token snapshots of a strided conv launch: token `t < m - 1` stores the planar state
+/// `[3][channels]` at byte `t * stride` of `range`.
+pub(in crate::kernels::cuda) struct GdnConvSnapRaw<'a> {
+    pub(in crate::kernels::cuda) range: RawRange<'a>,
+    pub(in crate::kernels::cuda) stride: usize,
+}
+
+/// The bytes the snapshots reach: `(m - 2) * stride` to the last snapshot, plus its 12 * channels.
+fn snap_reach(call: &GdnConvRaw<'_>, stride: usize) -> Option<usize> {
+    call.m
+        .checked_sub(2)?
+        .checked_mul(stride)?
+        .checked_add(call.channels.checked_mul(3 * size_of::<f32>())?)
+}
+
+/// `check_gdn_conv`, plus the snapshot range: `m >= 2`, a stride that is a multiple of 4 and holds
+/// one snapshot, the range long enough and aligned, and apart from every other range.
+fn check_gdn_conv_snap(
+    call: &GdnConvRaw<'_>,
+    snap: &GdnConvSnapRaw<'_>,
+) -> Result<(c_int, c_int, c_int), DeviceFailure> {
+    let ints = check_gdn_conv(call)?;
+    let row = call
+        .channels
+        .checked_mul(3 * size_of::<f32>())
+        .ok_or_else(invalid_argument)?;
+    let reach = snap_reach(call, snap.stride).ok_or_else(invalid_argument)?;
+    if call.m < 2
+        || !snap.stride.is_multiple_of(WORD_ALIGN)
+        || snap.stride < row
+        || !fits(&snap.range, reach, WORD_ALIGN)
+    {
+        return Err(invalid_argument());
+    }
+    let need = call_sizes(call).ok_or_else(invalid_argument)?;
+    let span = Span::of(&snap.range, reach);
+    let others = [
+        Span::of(&call.state, need.state),
+        Span::of(&call.out, need.out),
+        Span::of(&call.proj, need.proj),
+        Span::of(&call.w, need.w),
+    ];
+    if !others.iter().all(|other| span.apart(other)) {
+        return Err(invalid_argument());
+    }
+    Ok(ints)
+}
+
+/// The conv launch that also stores the state after each token but the last at a stride (the
+/// `kSnap` instantiation of `conv_silu_k`).
+pub(in crate::kernels::cuda) fn gdn_conv_snap_launch(
+    stream: &RawStream,
+    call: GdnConvRaw<'_>,
+    snap: GdnConvSnapRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let (m, ld, channels) = check_gdn_conv_snap(&call, &snap)?;
+    let args = GdnConvSnapArgsRaw {
+        conv: GdnConvArgsRaw {
+            proj: call.proj.address().cast_const(),
+            w: call.w.address().cast_const(),
+            state: call.state.address(),
+            out: call.out.address(),
+            m,
+            ld,
+            channels,
+        },
+        snap: snap.range.address(),
+        snap_stride: snap.stride,
+        snap_bytes: snap.range.bytes,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_gdn_conv_snap` proved the five ranges inside their live allocations, large
+    // enough for the call (`proj` for `(m - 1) * ld + channels` floats, `snap` for `(m - 2) *
+    // stride + 12 * channels` bytes), aligned (`w` to 16, the rest to 4), `m >= 2`, a stride that
+    // is a multiple of 4 and holds a snapshot, and that `state`, `out` and `snap`, which the
+    // kernel writes, share no byte with another range; the entry repeats these checks on the
+    // addresses. The allocations outlive the queued work (`inference_cuda_free` synchronizes
+    // first). `args` is a live local that the entry reads only during the call: the kernel
+    // arguments are copied at launch, so nothing keeps the pointer. `stream` is a live handle for
+    // the call, and `stage` is a live, writable c_int.
+    let status = unsafe { gdn_conv_snap_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }

@@ -78,6 +78,12 @@ __global__ void rmsnorm_k(const float* x, const float* w, int n, float eps, floa
     out[(size_t)blockIdx.x * n + i] = row[i] * rstd * w[i];
 }
 
+// kSnap (GDN-snap-stride) selects how the per-token state snapshots are stored. kSnap = false is
+// the original kernel unchanged: snapshots, when asked for, are contiguous [m - 1][3][channels].
+// kSnap = true stores the snapshot of token t at `snap + t * snap_stride` bytes, so a K-row window
+// can write each row's state straight into its rollback slot. Both only add stores; the loads,
+// the arithmetic and the order of both are the same.
+template <bool kSnap>
 __global__ void conv_silu_k(ConvArgs a) {
   int c = blockIdx.x * blockDim.x + threadIdx.x, n = a.channels;
   if (c >= n) return;
@@ -90,7 +96,14 @@ __global__ void conv_silu_k(ConvArgs a) {
     s0 = s1;
     s1 = s2;
     s2 = x;
-    if (a.snap && t < a.m - 1) {
+    if (kSnap) {
+      if (a.snap && t < a.m - 1) {
+        float* sn = reinterpret_cast<float*>(reinterpret_cast<char*>(a.snap) + (size_t)t * a.snap_stride);
+        sn[c] = s0;
+        sn[n + c] = s1;
+        sn[2 * n + c] = s2;
+      }
+    } else if (a.snap && t < a.m - 1) {
       float* sn = a.snap + (size_t)t * 3 * n;
       sn[c] = s0;
       sn[n + c] = s1;
@@ -103,7 +116,10 @@ __global__ void conv_silu_k(ConvArgs a) {
 }
 
 // One block per v head; thread j owns column j of the head's 128x128 state
-// S[i][j] (i over keys), kept in registers across the m tokens.
+// S[i][j] (i over keys), kept in registers across the m tokens. kSnap as in conv_silu_k: false is
+// the original kernel (contiguous [m - 1][state] snapshots), true stores token t's snapshot at
+// `snap + t * snap_stride` bytes.
+template <bool kSnap>
 __global__ void __launch_bounds__(kStateDim) gated_delta_k(DeltaArgs a) {
   constexpr int D = kStateDim;
   __shared__ float qs[D], ks[D];
@@ -141,7 +157,14 @@ __global__ void __launch_bounds__(kStateDim) gated_delta_k(DeltaArgs a) {
     float rstd = rsqrtf(block_sum(o * o) / D + a.eps);
     float z = p[a.z_off + h * D + j];
     a.out[(size_t)t * a.n_v_heads * D + h * D + j] = o * rstd * a.norm_w[j] * silu(z);
-    if (a.snap && t < a.m - 1) {
+    if (kSnap) {
+      if (a.snap && t < a.m - 1) {
+        float* sn = reinterpret_cast<float*>(reinterpret_cast<char*>(a.snap) + (size_t)t * a.snap_stride) +
+                    (size_t)h * D * D;
+#pragma unroll
+        for (int i = 0; i < D; ++i) sn[i * D + j] = s[i];
+      }
+    } else if (a.snap && t < a.m - 1) {
       float* sn = a.snap + ((size_t)t * a.n_v_heads + h) * D * D;
 #pragma unroll
       for (int i = 0; i < D; ++i) sn[i * D + j] = s[i];
@@ -226,13 +249,21 @@ cudaError_t swiglu_pack(const float* gu, int m, int n_ff, uint4* xf, cudaStream_
   return cudaGetLastError();
 }
 
+// The kSnap = true instantiation runs only for a non-null snap with a non-zero snap_stride; every
+// other call, the default path included, runs the original kernel.
 cudaError_t conv_silu(const ConvArgs& a, cudaStream_t stream) {
-  conv_silu_k<<<(a.channels + 255) / 256, 256, 0, stream>>>(a);
+  if (a.snap && a.snap_stride)
+    conv_silu_k<true><<<(a.channels + 255) / 256, 256, 0, stream>>>(a);
+  else
+    conv_silu_k<false><<<(a.channels + 255) / 256, 256, 0, stream>>>(a);
   return cudaGetLastError();
 }
 
 cudaError_t gated_delta(const DeltaArgs& a, cudaStream_t stream) {
-  gated_delta_k<<<a.n_v_heads, kStateDim, 0, stream>>>(a);
+  if (a.snap && a.snap_stride)
+    gated_delta_k<true><<<a.n_v_heads, kStateDim, 0, stream>>>(a);
+  else
+    gated_delta_k<false><<<a.n_v_heads, kStateDim, 0, stream>>>(a);
   return cudaGetLastError();
 }
 

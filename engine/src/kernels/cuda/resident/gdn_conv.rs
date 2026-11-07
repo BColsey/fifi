@@ -37,7 +37,8 @@
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::gdn_conv::{
-    GDN_CONV_MAX_CHANNELS, GDN_CONV_MAX_LD, GDN_CONV_MAX_M, GdnConvRaw, gdn_conv_launch,
+    GDN_CONV_MAX_CHANNELS, GDN_CONV_MAX_LD, GDN_CONV_MAX_M, GdnConvRaw, GdnConvSnapRaw,
+    gdn_conv_launch, gdn_conv_snap_launch,
 };
 use crate::kernels::cuda::{CudaContext, DeviceRange, DeviceStream};
 
@@ -58,6 +59,20 @@ pub(crate) struct ConvBytes {
     pub(crate) weights: usize,
     pub(crate) state: usize,
     pub(crate) out: usize,
+}
+
+/// Where a K-row window stores the state after each of its rows but the last (patch
+/// GDN-snap-stride): token `t < m - 1` writes its state at byte `t * stride` of `range`, in the
+/// layout of the live state (the planar `[3][channels]` window for the conv, `[n_v_heads][128][128]`
+/// for the delta). `stride` is the byte distance between two rollback slots, so the range starts at
+/// the first slot's copy of this layer's state and reaches into the later slots.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+pub(crate) struct SnapRows<'b> {
+    pub(crate) range: DeviceRange<'b>,
+    pub(crate) stride: usize,
 }
 
 /// The four device ranges of one conv launch and its geometry. `proj` is f32 `[m][ld]`, `weights`
@@ -157,5 +172,78 @@ impl CudaContext {
     }
 }
 
+/// Rule of the strided snapshots, shared with the delta wrapper: `m >= 2`, a stride that is a
+/// multiple of 4 and holds one snapshot of `row` bytes. Returns the bytes the snapshots reach,
+/// `(m - 2) * stride + row`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "staged for the K-row verify body")
+)]
+pub(in crate::kernels::cuda::resident) fn snap_reach(
+    m: usize,
+    stride: usize,
+    row: usize,
+) -> Result<usize, EngError> {
+    let rule = |detail: String| EngError::BadRequest(format!("gdn snap: {detail}"));
+    if m < 2 {
+        return Err(rule(format!("needs at least 2 tokens, got {m}")));
+    }
+    if !stride.is_multiple_of(4) || stride < row {
+        return Err(rule(format!(
+            "the stride must be a multiple of 4 and at least one snapshot ({row} bytes), got {stride}"
+        )));
+    }
+    (m - 2)
+        .checked_mul(stride)
+        .and_then(|bytes| bytes.checked_add(row))
+        .ok_or_else(|| rule("the snapshot extent overflows".to_owned()))
+}
+
+impl CudaContext {
+    /// [`Self::gdn_conv`] that also stores the state after each token but the last at
+    /// `snap.stride` bytes between tokens, so the state after row `t` of a K-row window lands in
+    /// rollback slot `t`. The snapshot stores are all it adds: `out` and `state` are the bytes of
+    /// the plain call (the `kSnap` instantiation of `conv_silu_k`; the plain call keeps the
+    /// original one).
+    ///
+    /// Refused as `BadRequest`, besides the rules of the plain call: fewer than 2 tokens, a stride
+    /// that is not a multiple of 4 or does not hold one `[3][channels]` window, a `snap` range
+    /// that is short, misaligned or overlaps another range of the call.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the K-row verify body")
+    )]
+    pub(crate) fn gdn_conv_snap(
+        &self,
+        stream: &DeviceStream,
+        call: ConvCall<'_>,
+        snap: SnapRows<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let raw = self.plan_gdn_conv(&call)?;
+        let row =
+            call.shape.channels.checked_mul(3 * FLOAT).ok_or_else(|| {
+                EngError::BadRequest("the CUDA conv snap row overflows".to_owned())
+            })?;
+        let reach = snap_reach(call.shape.m, snap.stride, row)?;
+        require_fit("snap", &snap.range, reach, 4)?;
+        let need = conv_bytes(call.shape)?;
+        let claim = Claim::of("snap", &snap.range, reach);
+        require_apart(&claim, &Claim::of("state", &call.state, need.state))?;
+        require_apart(&claim, &Claim::of("out", &call.out, need.out))?;
+        require_apart(&claim, &Claim::of("proj", &call.proj, need.proj))?;
+        require_apart(&claim, &Claim::of("weights", &call.weights, need.weights))?;
+        let snap_raw = GdnConvSnapRaw {
+            range: self.raw_range(&snap.range)?,
+            stride: snap.stride,
+        };
+        self.launch_on(stream, move |stream_raw| {
+            gdn_conv_snap_launch(stream_raw, raw, snap_raw)
+        })
+    }
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod snap_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

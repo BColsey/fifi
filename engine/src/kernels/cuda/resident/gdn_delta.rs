@@ -45,8 +45,9 @@ use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::resident::gdn_delta::{
-    GdnDeltaInts, GdnDeltaRaw, gdn_delta_launch,
+    GdnDeltaInts, GdnDeltaRaw, GdnDeltaSnapRaw, gdn_delta_launch, gdn_delta_snap_launch,
 };
+use crate::kernels::cuda::resident::gdn_conv::{SnapRows, snap_reach};
 
 /// The one `eps` the kernel is validated for: the GGUF rms eps, the f32 `1e-6`.
 pub(crate) const GDN_EPS: f32 = 1.0e-6_f32;
@@ -328,5 +329,82 @@ impl CudaContext {
     }
 }
 
+impl CudaContext {
+    /// [`Self::gdn_delta`] that also stores the whole state after each token but the last at
+    /// `snap.stride` bytes between tokens, so the state after row `t` of a K-row window lands in
+    /// rollback slot `t`. The snapshot stores are all it adds: `out` and `state` are the bytes of
+    /// the plain call (the `kSnap` instantiation of `gated_delta_k`; the plain call keeps the
+    /// original one).
+    ///
+    /// Refused as `BadRequest`, besides the rules of the plain call: fewer than 2 tokens, a stride
+    /// that is not a multiple of 4 or does not hold one state, a `snap` range that is short,
+    /// misaligned or overlaps another range of the call.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged for the K-row verify body")
+    )]
+    pub(crate) fn gdn_delta_snap(
+        &self,
+        stream: &DeviceStream,
+        call: DeltaCall<'_>,
+        snap: SnapRows<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        check_counts(&call.shape, call.eps)?;
+        check_rows(&call.shape)?;
+        let ints = convert_ints(&call.shape)?;
+        let need = delta_bytes(call.shape)?;
+        check_fit(&call, &need)?;
+        check_apart(&call, &need)?;
+        let reach = snap_reach(call.shape.m, snap.stride, need.state)?;
+        require_fit("snap", &snap.range, reach, 4)?;
+        let claim = Claim::of("snap", &snap.range, reach);
+        require_apart(&claim, &Claim::of("state", &call.state, need.state))?;
+        require_apart(&claim, &Claim::of("out", &call.out, need.out))?;
+        require_apart(&claim, &Claim::of("conv", &call.conv, need.conv))?;
+        require_apart(&claim, &Claim::of("proj", &call.proj, need.proj))?;
+        require_apart(&claim, &Claim::of("a", &call.weights.a, need.a))?;
+        require_apart(
+            &claim,
+            &Claim::of("dt_bias", &call.weights.dt_bias, need.dt_bias),
+        )?;
+        require_apart(
+            &claim,
+            &Claim::of("norm_w", &call.weights.norm_w, need.norm_w),
+        )?;
+        let snap_raw = GdnDeltaSnapRaw {
+            range: self.raw_range(&snap.range)?,
+            stride: snap.stride,
+        };
+        let conv = self.raw_range(&call.conv)?;
+        let proj = self.raw_range(&call.proj)?;
+        let a = self.raw_range(&call.weights.a)?;
+        let dt_bias = self.raw_range(&call.weights.dt_bias)?;
+        let norm_w = self.raw_range(&call.weights.norm_w)?;
+        let state = self.raw_range(&call.state)?;
+        let out = self.raw_range(&call.out)?;
+        let eps = call.eps;
+        self.launch_on(stream, move |raw| {
+            gdn_delta_snap_launch(
+                raw,
+                GdnDeltaRaw {
+                    conv,
+                    proj,
+                    a,
+                    dt_bias,
+                    norm_w,
+                    state,
+                    out,
+                    ints,
+                    eps,
+                },
+                snap_raw,
+            )
+        })
+    }
+}
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod snap_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

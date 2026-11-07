@@ -55,6 +55,8 @@ pub(in crate::family) mod exl3_moe;
 mod exl3_moe_device_tests;
 #[cfg(test)]
 mod exl3_moe_merge_device_tests;
+#[cfg(test)]
+mod exl3_moe_rows_device_tests;
 mod exl3_moe_source;
 mod exl3_source;
 #[cfg(test)]

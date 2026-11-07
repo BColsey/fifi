@@ -367,6 +367,37 @@ impl CudaContext {
         }
     }
 
+    /// Test builds: counts the projection kernel a wide launch with a largest group of `max_rows`
+    /// rows runs, as the native dispatch answers it.
+    #[cfg(all(test, target_os = "linux"))]
+    fn note_projection_rows(&self, max_rows: usize) {
+        use crate::kernels::row_launches::rows_kernel_from_native;
+        let native = u32::try_from(max_rows).map_or(0, ffi::launch_observer::rows_kernel);
+        if let Some(kernel) = rows_kernel_from_native(native) {
+            let mut counts = self.row_launches.get();
+            counts.record_projection(kernel);
+            self.row_launches.set(counts);
+        }
+    }
+
+    /// Test builds: counts one launch of a K-row kernel.
+    #[cfg(test)]
+    pub(in crate::kernels::cuda) fn note_row_kernel(
+        &self,
+        kernel: crate::kernels::row_launches::RowKernel,
+    ) {
+        let mut counts = self.row_launches.get();
+        counts.record(kernel);
+        self.row_launches.set(counts);
+    }
+
+    /// Test builds: the launches of each K-row kernel identity since the context was made.
+    /// Replays of a captured graph do not count again.
+    #[cfg(test)]
+    pub(crate) fn row_launch_counts(&self) -> crate::kernels::row_launches::RowLaunches {
+        self.row_launches.get()
+    }
+
     /// Test builds: the launches of each single-row variant since the context was made or the
     /// counts were last cleared. Replays of a captured graph do not count again.
     #[cfg(test)]
@@ -833,6 +864,10 @@ impl CudaContext {
             )));
         }
         let raw = self.grouped_raw(calls)?;
+        #[cfg(all(test, target_os = "linux"))]
+        if cols == 1 {
+            self.note_projection_rows(calls.iter().map(|call| call.rows).max().unwrap_or(0));
+        }
         self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols))
     }
 
@@ -1212,6 +1247,8 @@ mod indexed_option_tests;
 mod jobs_tests;
 #[cfg(test)]
 mod linear_tests;
+#[cfg(test)]
+mod rows_wide1_tests;
 #[cfg(test)]
 mod single_gather_tests;
 #[cfg(test)]

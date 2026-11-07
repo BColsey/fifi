@@ -117,6 +117,7 @@ SOFTWARE.
 |---|---|
 | `LICENSE` | `56dc032b18ae6211f3a3589f625e362118f81b90e79c038af865829b9def1e74` |
 | `check_patches.py` | `32ac1faa954f5a4e3966c1327ab3f2ea9de227b0a6103578941268f4734a6ea6` |
+| `patches/GDN-snap-stride.patch` | `b4c262a566d998baf5244423819badfc1e08520adf613a471bb07898ebc5bae1` |
 | `patches/KV8-B-attn-prep-rows.patch` | `c1104535893522a018b4815a78bc0e638b6d81164253529695e3b30d324d3c4d` |
 | `patches/MEMSET-TRIM-xf-zero-tail.patch` | `c2bf9e1d840dfe5295a8382dc193c53e1a472652277a418b110cd3ac4b29ad82` |
 | `patches/RD-0-explicit-stream.patch` | `2f0b5543b42c4fd1cb98865c8447078ca9dd42b1ac5e8762e584de81f4fc752d` |
@@ -126,14 +127,14 @@ SOFTWARE.
 | `patches/RD-4V-norm-out.patch` | `bf673a95dab1b4b50bc6aac943e75d9078629256af3a15eb5e9aaa4ee0551cd3` |
 | `patches/RD-4V-stream-and-errors.patch` | `872ea6326e91176d275bd399afac899c01d8394e89bf16fe92e06c215f1fadff` |
 | `patches/RD-8a-attn-prep-poison.patch` | `c40f399614d261f8bd3c1692ca4d4f8bce538287e33400528096e2ff6ccd26d9` |
-| `provenance.json` | `49c003f42d178d1c6b45711936ce54844f43a00ee6f2e1e9d1d306123f610ae1` |
+| `provenance.json` | `f9b95a8f3ea8795ba647b3cad7a110132a671caac2eadc1942f779c0965b7871` |
 | `src/frag_layout.cuh` | `b566a419e9896c30251116d6ff6613680f8cf9eff304cbddd81e9d14c86fd1bc` |
 | `src/gemm.cuh` | `0ef3adf1a5a6be9893f900be1f0d54daa5b351a1e7c86f7e93537ca17dd58f6c` |
 | `src/kernels.cu` | `b86627a78f879ae19de7020b9b4813ba33f570ea12d67c2d34c15d794b6083ee` |
 | `src/kernels.h` | `6ca18bbc586cd02adf9c4103e87bade584159bb20be6300f657debed0b71f643` |
 | `src/mma884.cuh` | `506043e1c8a2a32b1feea806107acf5c1b0545bea342f27ec02a037e53d8bfae` |
-| `src/ops.cu` | `12ed2ca756a03886f68769432a5d11085a4d11781ee9387561624eceb03a2c50` |
-| `src/ops.h` | `d5205048817aed7312589dcb9e0d77bcbd47293bafb8354e42ebbd4f92d05033` |
+| `src/ops.cu` | `6bd2cb60b292432ec9c8c3eaa75776d26238fab143604b26fec50be4c9f3bb59` |
+| `src/ops.h` | `6a9557d8d432fba86982c2894077ca68d93569e758f2a80cc3fd49a5618ad7ae` |
 | `src/repack.cu` | `c80b8ff352664bbc12f8f3d8f08490949974cd523fea6ea399578f25522f20c5` |
 | `src/repack.h` | `4cda8ee5aa5ae1a4ce0c99d8a2f46b8806b6184d12146fa8f3b0890959fa922a` |
 

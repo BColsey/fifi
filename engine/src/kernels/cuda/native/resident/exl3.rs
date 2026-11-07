@@ -1092,6 +1092,7 @@ pub(in crate::kernels::cuda) mod launch_observer {
             launches: *mut u64,
             variant: *mut u32,
         ) -> c_int;
+        fn inference_cuda_exl3_rows_kernel(max_rows: u32) -> c_int;
         fn inference_cuda_exl3_linear_observed(
             args: *const LinearArgs,
             split_k: u32,
@@ -1100,6 +1101,14 @@ pub(in crate::kernels::cuda) mod launch_observer {
             stage: *mut c_int,
             launches: *mut u64,
         ) -> c_int;
+    }
+
+    /// The projection kernel a wide launch whose largest group has `max_rows` rows runs, as the
+    /// native dispatch decides it (`rows_kernel_for` in `exl3.cu`): 1 the one-row body, 2, 4 and 8
+    /// the rows kernels, 0 for a count the launch refuses.
+    pub(in crate::kernels::cuda) fn rows_kernel(max_rows: u32) -> i32 {
+        // SAFETY: a pure function of its argument; it reads no pointer and touches no device.
+        unsafe { inference_cuda_exl3_rows_kernel(max_rows) }
     }
 
     pub(in crate::kernels::cuda) fn grouped_emissions(

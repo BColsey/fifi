@@ -22,6 +22,8 @@
 #ifndef INFERENCE_CUDA_RESIDENT_GDN_DELTA_H
 #define INFERENCE_CUDA_RESIDENT_GDN_DELTA_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,7 +50,32 @@ typedef struct inference_cuda_gdn_delta_args {
 int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args, void *stream,
                                     int *out_stage);
 
+/* The same step with per-token state snapshots stored at a stride (the K-row verify window). After
+ * token t < m - 1 the whole state [n_v_heads][128][128] is also stored at snap + t * snap_stride
+ * bytes, in the layout of `state`, so a K-row window writes the state after each row straight into
+ * its rollback slot. The kernel is the kSnap = true instantiation of the vendored gated_delta_k
+ * (patch GDN-snap-stride); the entry above keeps launching the original instantiation. The
+ * snapshots are stores only: out and state are the bytes of the entry above. Needs m >= 2, snap
+ * 4-byte aligned, snap_stride a multiple of 4 and at least n_v_heads * 128 * 128 * 4 bytes, and
+ * snap_bytes >= (m - 2) * snap_stride + n_v_heads * 128 * 128 * 4. snap must overlap no other
+ * range. */
+typedef struct inference_cuda_gdn_delta_snap_args {
+    inference_cuda_gdn_delta_args delta;
+    void *snap;
+    size_t snap_stride;
+    size_t snap_bytes;
+} inference_cuda_gdn_delta_snap_args;
+
+int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args, void *stream,
+                                         int *out_stage);
+
 #ifdef __cplusplus
+static_assert(sizeof(inference_cuda_gdn_delta_args) == 96 &&
+                  sizeof(inference_cuda_gdn_delta_snap_args) == 120 &&
+                  offsetof(inference_cuda_gdn_delta_snap_args, snap) == 96 &&
+                  offsetof(inference_cuda_gdn_delta_snap_args, snap_stride) == 104 &&
+                  offsetof(inference_cuda_gdn_delta_snap_args, snap_bytes) == 112,
+              "inference_cuda_gdn_delta_snap_args layout");
 }
 #endif
 

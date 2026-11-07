@@ -1461,6 +1461,25 @@ static inline __attribute__((always_inline)) bool emit_grouped(
 }
 
 
+// The projection kernel the wide launch (Cols == 1) runs for a launch whose largest group has
+// `max_rows` rows: 1 is grouped_project_small_wide<1> (every group has one row), 2, 4 and
+// grouped_max_rows are grouped_project_rows<R>. One function decides the launch and, through
+// inference_cuda_exl3_rows_kernel, the launch counters of the test builds.
+static inline int rows_kernel_for(uint32_t max_rows) {
+    if (max_rows <= 1) return 1;
+    if (max_rows <= 2) return 2;
+    if (max_rows <= 4) return 4;
+    return int(grouped_max_rows);
+}
+
+// Test builds only (see the note above inference_cuda_exl3_linear_observed): which projection
+// kernel a wide launch runs for a largest group of `max_rows` rows, 0 for a row count the launch
+// refuses.
+extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))
+int inference_cuda_exl3_rows_kernel(uint32_t max_rows) {
+    return max_rows >= 1 && max_rows <= grouped_max_rows ? rows_kernel_for(max_rows) : 0;
+}
+
 template<bool Observe = false, bool Gather = false, int Cols = 0>
 static inline __attribute__((always_inline)) int grouped_launch(
     const inference_cuda_exl3_linear_args *calls, size_t count,
@@ -1484,11 +1503,12 @@ static inline __attribute__((always_inline)) int grouped_launch(
                             max_rows = args.entries[g].rows > max_rows ? args.entries[g].rows : max_rows;
                         const dim3 by_group(grid.x, args.groups, grid.z);
                         static_assert(grouped_max_rows == 8, "rows kernel bounds: 2, 4 and 8");
-                        if (max_rows == 1) {
+                        const int which = rows_kernel_for(max_rows);
+                        if (which == 1) {
                             grouped_project_small_wide<1><<<wide,block,0,(cudaStream_t)stream>>>(args);
-                        } else if (max_rows <= 2) {
+                        } else if (which == 2) {
                             grouped_project_rows<2><<<by_group,block,0,(cudaStream_t)stream>>>(args);
-                        } else if (max_rows <= 4) {
+                        } else if (which == 4) {
                             grouped_project_rows<4><<<by_group,block,0,(cudaStream_t)stream>>>(args);
                         } else {
                             grouped_project_rows<grouped_max_rows><<<by_group,block,0,(cudaStream_t)stream>>>(args);

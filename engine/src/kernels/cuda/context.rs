@@ -157,6 +157,10 @@ pub(crate) struct CudaContext {
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
         std::cell::Cell<crate::kernels::single_row::SingleRowLaunches>,
+    /// Launches per K-row kernel identity (test builds; see `kernels/row_launches.rs`).
+    #[cfg(test)]
+    pub(in crate::kernels::cuda) row_launches:
+        std::cell::Cell<crate::kernels::row_launches::RowLaunches>,
     /// The id-indexed launch options a test or bench set on this context (test builds); `None`
     /// takes the environment's.
     #[cfg(test)]
@@ -376,6 +380,8 @@ impl CudaContext {
             exl3_single_row_default: std::cell::Cell::new(None),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
+            #[cfg(test)]
+            row_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]
             exl3_indexed_options: std::cell::Cell::new(None),
             pinned_stage_admission: None,

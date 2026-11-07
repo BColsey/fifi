@@ -17,6 +17,7 @@
 //!   file. Nothing is re-exported.
 
 use std::ffi::{c_int, c_void};
+use std::mem::{offset_of, size_of};
 
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
@@ -44,10 +45,33 @@ struct GdnDeltaArgsRaw {
     eps: f32,
 }
 
+/// Mirror of `inference_cuda_gdn_delta_snap_args`: the delta arguments, then the snapshot range.
+#[repr(C)]
+struct GdnDeltaSnapArgsRaw {
+    delta: GdnDeltaArgsRaw,
+    snap: *mut c_void,
+    snap_stride: usize,
+    snap_bytes: usize,
+}
+
+const _: () = assert!(
+    size_of::<GdnDeltaArgsRaw>() == 96
+        && size_of::<GdnDeltaSnapArgsRaw>() == 120
+        && offset_of!(GdnDeltaSnapArgsRaw, snap) == 96
+        && offset_of!(GdnDeltaSnapArgsRaw, snap_stride) == 104
+        && offset_of!(GdnDeltaSnapArgsRaw, snap_bytes) == 112
+);
+
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_delta_launch"]
     fn gdn_delta_launch_raw(
         args: *const GdnDeltaArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gdn_delta_snap_launch"]
+    fn gdn_delta_snap_launch_raw(
+        args: *const GdnDeltaSnapArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
@@ -199,5 +223,93 @@ pub(in crate::kernels::cuda) fn gdn_delta_launch(
     // nothing keeps the pointer). `stage` is a live writable `c_int`. `stream` is live for the
     // call.
     let status = unsafe { gdn_delta_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The per-token snapshots of a strided delta launch: token `t < m - 1` stores the whole state at
+/// byte `t * stride` of `range`, in the layout of `state`.
+pub(in crate::kernels::cuda) struct GdnDeltaSnapRaw<'a> {
+    pub(in crate::kernels::cuda) range: RawRange<'a>,
+    pub(in crate::kernels::cuda) stride: usize,
+}
+
+/// `check_delta`, plus the snapshot range: `m >= 2`, a stride that is a multiple of 4 and holds
+/// one state, the range long enough and aligned, and apart from every other range.
+fn check_delta_snap(io: &GdnDeltaRaw<'_>, snap: &GdnDeltaSnapRaw<'_>) -> Result<(), DeviceFailure> {
+    check_delta(io)?;
+    let need = needs(&io.ints)?;
+    let m = size(io.ints.m)?;
+    let reach = m
+        .checked_sub(2)
+        .and_then(|rows| rows.checked_mul(snap.stride))
+        .and_then(|bytes| bytes.checked_add(need.state))
+        .ok_or_else(invalid_argument)?;
+    if m < 2
+        || !snap.stride.is_multiple_of(4)
+        || snap.stride < need.state
+        || snap.range.bytes < reach
+        || !snap.range.offset.is_multiple_of(4)
+    {
+        return Err(invalid_argument());
+    }
+    let span = Span::of(&snap.range, reach);
+    let others = [
+        Span::of(&io.state, need.state),
+        Span::of(&io.out, need.out),
+        Span::of(&io.conv, need.conv),
+        Span::of(&io.proj, need.proj),
+        Span::of(&io.a, need.head_vec),
+        Span::of(&io.dt_bias, need.head_vec),
+        Span::of(&io.norm_w, need.norm_w),
+    ];
+    if !others.iter().all(|other| span.apart(other)) {
+        return Err(invalid_argument());
+    }
+    Ok(())
+}
+
+/// The delta launch that also stores the state after each token but the last at a stride (the
+/// `kSnap` instantiation of `gated_delta_k`).
+pub(in crate::kernels::cuda) fn gdn_delta_snap_launch(
+    stream: &RawStream,
+    io: GdnDeltaRaw<'_>,
+    snap: GdnDeltaSnapRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    check_delta_snap(&io, &snap)?;
+    let ints = io.ints;
+    let args = GdnDeltaSnapArgsRaw {
+        delta: GdnDeltaArgsRaw {
+            conv: io.conv.address().cast_const(),
+            proj: io.proj.address().cast_const(),
+            a: io.a.address().cast_const(),
+            dt_bias: io.dt_bias.address().cast_const(),
+            norm_w: io.norm_w.address().cast_const(),
+            state: io.state.address(),
+            out: io.out.address(),
+            m: ints.m,
+            conv_ld: ints.conv_ld,
+            ld: ints.ld,
+            z_off: ints.z_off,
+            beta_off: ints.beta_off,
+            alpha_off: ints.alpha_off,
+            n_k_heads: ints.n_k_heads,
+            n_v_heads: ints.n_v_heads,
+            eps: io.eps,
+        },
+        snap: snap.range.address(),
+        snap_stride: snap.stride,
+        snap_bytes: snap.range.bytes,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `check_delta_snap` proved every range inside its live allocation, large enough for
+    // the call and 4-byte aligned (`snap` for `(m - 2) * stride + state` bytes), `m >= 2`, a stride
+    // that is a multiple of 4 and holds a state, and that `state`, `out` and `snap`, which the
+    // kernel writes, share no byte with another range; the C entry repeats these checks on the
+    // addresses. The allocations stay valid until the queued work finishes because
+    // `inference_cuda_free` synchronizes the device first. `args` lives across the call and is
+    // read only during it (the kernel arguments are copied at launch). `stage` is a live writable
+    // `c_int`. `stream` is live for the call.
+    let status =
+        unsafe { gdn_delta_snap_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }

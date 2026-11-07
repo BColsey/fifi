@@ -78,6 +78,7 @@
 // One `pub(crate) mod <n>;` line per kernel, alphabetical, below this line.
 pub(crate) mod add_norm_pack;
 pub(crate) mod add_rmsnorm_q8;
+pub(crate) mod argmax_rows;
 pub(crate) mod attn_decode;
 pub(crate) mod attn_decode_gemma;
 pub(crate) mod attn_decode_q8;
@@ -99,12 +100,14 @@ pub(crate) mod matmul_expert;
 pub(crate) mod matvec_expert;
 pub(crate) mod matvec_q;
 pub(crate) mod moe_combine;
+pub(crate) mod pack_rows;
 pub(crate) mod paged_position;
 pub(crate) mod qsa_attn;
 pub(crate) mod qsa_index;
 pub(crate) mod quantize_q8_1;
 pub(crate) mod rope_gemma;
 pub(crate) mod router;
+pub(crate) mod router_rows;
 pub(crate) mod row_add;
 pub(crate) mod row_scale;
 pub(crate) mod sample_gemma;
@@ -122,6 +125,12 @@ pub(crate) mod tiered_wait_add;
 
 #[cfg(test)]
 mod gemma4_reference_tests;
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod krow_attention_tests;
+
+#[cfg(all(test, feature = "native-cuda"))]
+mod krow_rows_tests;
 
 #[cfg(test)]
 mod top_logits;

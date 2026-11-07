@@ -82,6 +82,40 @@ bool valid(const inference_cuda_gdn_delta_args &a, void *stream) {
     return true;
 }
 
+// The snapshot range of the strided entry: shares no byte with any range the kernel reads or
+// writes, and holds the m - 1 snapshots of one state each at snap_stride.
+bool valid_snap(const inference_cuda_gdn_delta_snap_args &s) {
+    const inference_cuda_gdn_delta_args &a = s.delta;
+    const size_t m = (size_t)a.m, nv = (size_t)a.n_v_heads, nk = (size_t)a.n_k_heads;
+    const size_t f = sizeof(float);
+    const size_t row = nv * D * D * f;
+    if (s.snap == NULL || a.m < 2 || !aligned(s.snap, 4) || s.snap_stride % 4 != 0 || s.snap_stride < row) {
+        return false;
+    }
+    const size_t reach = (m - 2) * s.snap_stride + row;
+    if (s.snap_bytes < reach) {
+        return false;
+    }
+    const size_t conv_cols = (2 * nk + nv) * D;
+    const size_t z_end = (size_t)a.z_off + nv * D, b_end = (size_t)a.beta_off + nv, al_end = (size_t)a.alpha_off + nv;
+    size_t proj_cols = z_end > b_end ? z_end : b_end;
+    proj_cols = proj_cols > al_end ? proj_cols : al_end;
+    const Span snap = {s.snap, reach};
+    const Span others[] = {{a.state, row},
+                           {a.out, m * nv * D * f},
+                           {a.conv, ((m - 1) * (size_t)a.conv_ld + conv_cols) * f},
+                           {a.proj, ((m - 1) * (size_t)a.ld + proj_cols) * f},
+                           {a.a, nv * f},
+                           {a.dt_bias, nv * f},
+                           {a.norm_w, D * f}};
+    for (const Span &o : others) {
+        if (!apart(snap, o)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args,
@@ -110,6 +144,42 @@ extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_ar
         call.n_k_heads = args->n_k_heads;
         call.n_v_heads = args->n_v_heads;
         call.eps = args->eps;
+        Failure failure;
+        failure.record(kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args,
+                                                    void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(args->delta, stream) || !valid_snap(*args)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const inference_cuda_gdn_delta_args &a = args->delta;
+        kern::DeltaArgs call = {};
+        call.conv = (const float *)a.conv;
+        call.conv_ld = a.conv_ld;
+        call.proj = (const float *)a.proj;
+        call.ld = a.ld;
+        call.z_off = a.z_off;
+        call.beta_off = a.beta_off;
+        call.alpha_off = a.alpha_off;
+        call.a = (const float *)a.a;
+        call.dt_bias = (const float *)a.dt_bias;
+        call.norm_w = (const float *)a.norm_w;
+        call.state = (float *)a.state;
+        call.snap = (float *)args->snap;
+        call.snap_stride = args->snap_stride;
+        call.out = (float *)a.out;
+        call.m = a.m;
+        call.n_k_heads = a.n_k_heads;
+        call.n_v_heads = a.n_v_heads;
+        call.eps = a.eps;
         Failure failure;
         failure.record(kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
