@@ -67,7 +67,7 @@ const MAX_THREADS: usize = 128;
 /// start before layer 0; a prefill chunk reads one chunk ahead of its
 /// compute. A warm page is a bonus, not a requirement, so the pinned expert store may take the RAM
 /// and the kernel keeps whatever rows fit. A reserve is justified only by a measured low hit rate
-/// on real transcripts (the trace study M-N2 was not run).
+/// on real transcripts (the access-distribution study was not run).
 pub(in crate::family) const NGRAM_PAGE_CACHE_RESERVE_BYTES: u64 = 0;
 
 /// Host memory a read of `rows` distinct rows holds while in flight: the decoded F32 block and its

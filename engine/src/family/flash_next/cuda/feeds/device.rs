@@ -15,7 +15,7 @@
 //! the host product took 1.57 ms at best and 2.6 ms at p50 (p99 7.6 ms), 4-5 ms at p50 on 1-4
 //! threads, and it reads 65 MiB (131 MiB as F32) from host memory per token, which competes
 //! with the pinned expert copies and keeps 8 host threads busy. The kernel reads the 65 MiB on the
-//! device in well under 0.1 ms (the S0 figure; the route's own time, with the copies and the
+//! device in well under 0.1 ms (the kernel's own measured time; the route's own time, with the copies and the
 //! read-back, is not measured yet). The rest of the PLE block (norms, gate, convolution ring, about
 //! 100 us) stays on the host in `ple::step`, which takes the downloaded keys and value in place of
 //! its two `linear` calls.

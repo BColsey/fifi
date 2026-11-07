@@ -4,11 +4,11 @@ Measured 2026-11-07 on the real table, `ngram_embedding.safetensors` of the 3.05
 320,001,536 rows of 102 bytes, rev 69e33439), on `/home` (btrfs, Samsung 990 PRO, PCIe 4.0 x4,
 mount options `noatime,ssd,discard=async,autodefrag`). `fincore` showed 0 bytes of the file in the
 page cache after the bench runs (read at the terminal, not logged) and before and after each
-production-reader run (logged in `results.log`).
+production-reader run (logged in `results.txt`).
 
 ## Method
 
-- Program: `doc/flash-next-ngram-bench/ngram_bench.rs` (raw output in `results.log`; `ple_matvec_bench.rs` is the PLE host matvec test) (std only, no profiling, built with `rustc -O -C target-cpu=native`),
+- Program: `doc/flash-next-ngram-bench/ngram_bench.rs` (raw output in `results.txt`; `ple_matvec_bench.rs` is the PLE host matvec test) (std only, no profiling, built with `rustc -O -C target-cpu=native`),
   run as `taskset -c 16-23 ./ngram_bench <file> qd|token|chunk`. Buffered `pread` of 102 bytes
   (`FileExt::read_exact_at`, the call `NgramFile::read_row` makes) at uniformly random rows with
   `posix_fadvise(POSIX_FADV_RANDOM)` on the descriptor. Random uniform rows are the worst case: real
@@ -89,7 +89,7 @@ through `NgramFile::read_row` and `NgramDecoder::decode_row`: 400 random tokens 
 the fourth largest sample) with the 2,560-value embedding assembly, then chunks of 256 and 4096
 tokens. Release build, CPU only, `taskset -c 16-23`, load average 7, three runs. The test drops no
 pages itself; I dropped the file's pages with `posix_fadvise(DONTNEED)` before each run and `fincore`
-showed 0 resident before every run (`results.log`). Within a run, "cold" is fresh random rows and
+showed 0 resident before every run (`results.txt`). Within a run, "cold" is fresh random rows and
 "warm" is the same 16 rows read again at once.
 
 | case | run 1 | run 2 | run 3 |
@@ -115,5 +115,5 @@ min 1.57 ms, p50 2.62 ms, p99 7.6 ms; F32 on 8 threads min 2.72 ms, p50 3.41 ms;
 p50 4.1-5.4 ms, p99 6-14 ms on 2-16 threads (61-70 ms on one). The 2.6-5 ms figures were taken under that load; the best case
 is 1.57 ms with all 8 pinned cores busy and 65 MiB read from memory per token. The device route is
 chosen for that traffic and those cores, and because the host product must finish while the card
-runs layers 0 and 1 (about 1 ms); the kernel time is the S0 figure, and the route's own time
+runs layers 0 and 1 (about 1 ms); the kernel time is the figure measured with the kernel itself, and the route's own time
 (pageable copies, two launches, a 44 KiB read-back) is not measured yet.

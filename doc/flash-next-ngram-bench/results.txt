@@ -1,0 +1,79 @@
+advice: POSIX_FADV_RANDOM
+row read QD1 cold                              n=20000   p50=     52.4 p99=     72.5 max=     295.5 mean=     54.8 us (mixed iops=34776)
+row read QD1 warm                              n=20000   p50=      0.7 p99=     51.4 max=     382.7 mean=      2.5 us
+row read QD4 cold                              n=40000   p50=     49.6 p99=     71.9 max=    1458.3 mean=     50.8 us (mixed iops=154286)
+row read QD4 warm                              n=40000   p50=      0.7 p99=      1.3 max=      30.1 mean=      0.8 us
+row read QD16 cold                             n=100000  p50=     55.8 p99=    101.8 max=    1284.9 mean=     59.2 us (mixed iops=521759)
+row read QD16 warm                             n=100000  p50=      0.8 p99=      1.8 max=     496.0 mean=      1.0 us
+row read QD32 cold                             n=100000  p50=     65.2 p99=    262.9 max=    1782.1 mean=     73.0 us (mixed iops=800914)
+row read QD32 warm                             n=100000  p50=      1.0 p99=     12.9 max=     474.9 mean=      1.5 us
+advice: POSIX_FADV_RANDOM
+row read QD1 cold                              n=20000   p50=     51.5 p99=     66.2 max=    2414.8 mean=     53.0 us (mixed iops=36670)
+row read QD1 warm                              n=20000   p50=      0.7 p99=     45.1 max=      62.9 mean=      1.4 us
+row read QD4 cold                              n=40000   p50=     50.3 p99=     72.3 max=    1488.8 mean=     51.4 us (mixed iops=115902)
+row read QD4 warm                              n=40000   p50=      0.9 p99=     61.6 max=     226.0 mean=     17.2 us
+row read QD16 cold                             n=100000  p50=     55.0 p99=    103.8 max=    2112.0 mean=     58.6 us (mixed iops=529524)
+row read QD16 warm                             n=100000  p50=      0.8 p99=      1.8 max=     297.7 mean=      1.0 us
+row read QD32 cold                             n=100000  p50=     63.9 p99=    336.5 max=    2074.4 mean=     77.2 us (mixed iops=702436)
+row read QD32 warm                             n=100000  p50=      1.0 p99=      5.7 max=    1265.3 mean=      1.4 us
+advice: POSIX_FADV_RANDOM
+token (16 rows) threads=1 cold                 n=2000    p50=    836.8 p99=   1349.8 max=    2341.0 mean=    866.7 us
+token (16 rows) threads=1 warm                 n=2000    p50=      7.7 p99=     14.0 max=      33.1 mean=      8.2 us
+token (16 rows) threads=4 cold                 n=2000    p50=    247.2 p99=    492.2 max=    1490.8 mean=    261.1 us
+token (16 rows) threads=4 warm                 n=2000    p50=     17.9 p99=     36.9 max=    2121.9 mean=     21.2 us
+token (16 rows) threads=8 cold                 n=2000    p50=    146.6 p99=    302.4 max=     964.6 mean=    154.3 us
+token (16 rows) threads=8 warm                 n=2000    p50=     18.5 p99=     53.4 max=    1898.9 mean=     22.5 us
+token (16 rows) threads=16 cold                n=2000    p50=    111.2 p99=    336.1 max=    1895.2 mean=    120.8 us
+token (16 rows) threads=16 warm                n=2000    p50=     34.6 p99=     77.8 max=    1059.2 mean=     38.2 us
+advice: POSIX_FADV_RANDOM
+token (16 rows) threads=1 cold                 n=2000    p50=    817.1 p99=   2356.0 max=    5639.4 mean=    902.3 us
+token (16 rows) threads=1 warm                 n=2000    p50=      7.5 p99=     15.1 max=      31.9 mean=      8.2 us
+token (16 rows) threads=4 cold                 n=2000    p50=    219.5 p99=    363.5 max=     963.6 mean=    223.6 us
+token (16 rows) threads=4 warm                 n=2000    p50=     12.3 p99=     21.1 max=      45.4 mean=     12.7 us
+token (16 rows) threads=8 cold                 n=2000    p50=    139.4 p99=    232.1 max=    1701.4 mean=    143.5 us
+token (16 rows) threads=8 warm                 n=2000    p50=     18.6 p99=     32.1 max=    1194.4 mean=     20.0 us
+token (16 rows) threads=16 cold                n=2000    p50=    109.1 p99=    323.6 max=    2794.8 mean=    118.3 us
+token (16 rows) threads=16 warm                n=2000    p50=     31.1 p99=     52.4 max=     999.3 mean=     32.4 us
+advice: POSIX_FADV_RANDOM
+chunk   256 tokens (4096 rows, 4096 uniq, sorted) threads=16 cold: 14.9 ms = 274870 rows/s
+chunk   256 tokens (4096 rows, 4096 uniq, sorted) threads=16 warm: 1.0 ms = 4111913 rows/s
+chunk   256 tokens (4096 rows, 4096 uniq, sorted) threads=32 cold: 10.4 ms = 395091 rows/s
+chunk   256 tokens (4096 rows, 4096 uniq, sorted) threads=32 warm: 1.3 ms = 3107833 rows/s
+chunk  4096 tokens (65536 rows, 65532 uniq, sorted) threads=16 cold: 226.1 ms = 289801 rows/s
+chunk  4096 tokens (65536 rows, 65532 uniq, sorted) threads=16 warm: 12.8 ms = 5117560 rows/s
+chunk  4096 tokens (65536 rows, 65528 uniq, sorted) threads=32 cold: 142.1 ms = 461223 rows/s
+chunk  4096 tokens (65536 rows, 65528 uniq, sorted) threads=32 warm: 12.8 ms = 5127494 rows/s
+advice: default (read-around on)
+row read QD1 cold                              n=5000    p50=     57.4 p99=     72.6 max=     222.7 mean=     57.4 us (mixed iops=29037)
+row read QD1 warm                              n=5000    p50=      0.6 p99=     64.4 max=      92.2 mean=     11.3 us
+f32 threads=1  p50=4.62 ms p99=69.78 ms min=3.62 ms
+f16 threads=1  p50=5.41 ms p99=61.25 ms min=3.26 ms
+f32 threads=2  p50=4.81 ms p99=7.45 ms min=3.29 ms
+f16 threads=2  p50=4.91 ms p99=6.48 ms min=2.99 ms
+f32 threads=4  p50=4.98 ms p99=7.38 ms min=3.39 ms
+f16 threads=4  p50=4.10 ms p99=6.17 ms min=2.18 ms
+f32 threads=8  p50=3.41 ms p99=8.68 ms min=2.72 ms
+f16 threads=8  p50=2.62 ms p99=7.59 ms min=1.57 ms
+f32 threads=16 p50=4.48 ms p99=6.95 ms min=2.90 ms
+f16 threads=16 p50=3.53 ms p99=14.01 ms min=2.08 ms
+# s2 production reader run 2026-11-07T19:50:41Z, load: 7.10 7.66 7.51
+fincore before run 1:
+ 0B     0 30.4G <pack>/ngram_embedding.safetensors
+token (16 rows) reader threads=32, n=400: cold p50 200 us p99 323 us; warm p50 36 us p99 49 us
+chunk of 256 tokens: 4096 distinct rows; plan 0.1 ms, read+decode 14.9 ms, embeddings 0.2 ms, total 15.3 ms (checksum 0.27292842)
+chunk of 4096 tokens: 65529 distinct rows; plan 1.9 ms, read+decode 233.6 ms, embeddings 8.8 ms, total 244.2 ms (checksum 5.2117825)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3140 filtered out; finished in 0.36s
+fincore before run 2:
+ 0B     0 30.4G <pack>/ngram_embedding.safetensors
+token (16 rows) reader threads=32, n=400: cold p50 163 us p99 255 us; warm p50 41 us p99 63 us
+chunk of 256 tokens: 4096 distinct rows; plan 0.1 ms, read+decode 14.9 ms, embeddings 0.3 ms, total 15.3 ms (checksum 0.27292842)
+chunk of 4096 tokens: 65529 distinct rows; plan 1.9 ms, read+decode 230.3 ms, embeddings 9.5 ms, total 241.7 ms (checksum 5.2117825)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3140 filtered out; finished in 0.36s
+fincore before run 3:
+ 0B     0 30.4G <pack>/ngram_embedding.safetensors
+token (16 rows) reader threads=32, n=400: cold p50 160 us p99 238 us; warm p50 36 us p99 54 us
+chunk of 256 tokens: 4096 distinct rows; plan 0.1 ms, read+decode 15.2 ms, embeddings 0.4 ms, total 15.6 ms (checksum 0.27292842)
+chunk of 4096 tokens: 65529 distinct rows; plan 1.7 ms, read+decode 232.5 ms, embeddings 9.3 ms, total 243.6 ms (checksum 5.2117825)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3140 filtered out; finished in 0.35s
+fincore after final drop:
+ 0B     0 30.4G <pack>/ngram_embedding.safetensors
