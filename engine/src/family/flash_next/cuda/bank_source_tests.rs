@@ -6,7 +6,6 @@ use std::{fs::File, os::unix::fs::FileExt, path::PathBuf};
 
 use super::{bank::RecordSource, bank_source::PackRecordSource};
 use crate::{
-    EngError,
     family::{
         exl3_pack::{ExpertPart, Root, expert_name_in},
         flash_next::load::pack_files::FlashPackFiles,
@@ -114,6 +113,7 @@ fn the_records_equal_the_pack_bytes_at_the_offsets_of_the_shard_headers() {
 mod device_tests {
     use super::*;
     use crate::{
+        EngError,
         family::{
             flash_next::cuda::bank::{
                 BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
