@@ -73,8 +73,8 @@ use crate::{
         project::cuda::{WeightLayout, exl3::Exl3Io},
         qwen36::{
             krow::{
-                self, ConfigFacts, DeviceDraws, DrawSource, RowStatus, RowsFacts, check_rows,
-                check_shortlists, check_verify, draw_source, rows_verdict,
+                self, ConfigFacts, DeviceDraws, DrawFacts, DrawRoute, RowStatus, RowsFacts,
+                check_rows, check_shortlists, check_verify, draw_route, rows_verdict,
             },
             window_logic::{self, RowsFailure, RowsOut, WindowSave, no_window},
         },
@@ -1056,32 +1056,29 @@ impl QwenResidentStep<'_> {
         sampler_vocab: usize,
     ) -> Option<Result<u32, EngError>> {
         let window = self.window.as_ref()?;
-        // Only a window that the K-row path ran has records: an eager window (the path switched off,
-        // or one row) with the same base and inputs as an earlier K-row window is not served theirs.
-        if !self.krow_runs(window.inputs.len()) {
-            return None;
-        }
-        let draws = self.krow.as_ref()?.draws.as_ref()?;
-        if !matches!(window.saved, WindowSave::Device)
-            || !draws.belongs_to(window.base, &window.inputs)
-        {
-            return None;
-        }
-        if row >= draws.inputs.len() {
-            return Some(Err(no_window()));
-        }
-        let record = draws
-            .shortlists
-            .get(row)
-            .filter(|record| !record.is_empty());
-        match draw_source(
-            sampler.params(),
-            self.sync_each,
-            sampler_vocab == self.widths.verdict,
-            record.is_some(),
-        ) {
-            DrawSource::Shortlist => {
-                let candidates = record?;
+        let route = draw_route(&DrawFacts {
+            // Only a window that the K-row path ran has records: an eager window (the path switched
+            // off, or one row) with the same base and inputs as an earlier K-row window is not
+            // served theirs.
+            krow_runs: self.krow_runs(window.inputs.len()),
+            device_window: matches!(window.saved, WindowSave::Device),
+            draws: self
+                .krow
+                .as_ref()
+                .and_then(|runtime| runtime.draws.as_ref()),
+            base: window.base,
+            inputs: &window.inputs,
+            row,
+            tap_row: window.rows.get(row).is_some(),
+            params: sampler.params(),
+            sync_each: self.sync_each,
+            vocab_matches: sampler_vocab == self.widths.verdict,
+        });
+        match route {
+            DrawRoute::NotKrow => None,
+            DrawRoute::OutOfWindow => Some(Err(no_window())),
+            DrawRoute::Shortlist => {
+                let candidates = self.krow.as_ref()?.draws.as_ref()?.shortlists.get(row)?;
                 let drawn = sampler.sample_shortlist(candidates, sampler_vocab);
                 // The report was judged entry by entry when it was read (`check_shortlists`), so an
                 // error here is a record that changed since: the window fails closed.
@@ -1090,15 +1087,16 @@ impl QwenResidentStep<'_> {
                 }
                 Some(drawn)
             }
-            DrawSource::Row => {
-                if let Some(values) = window.rows.get(row) {
-                    return Some(sample_logits(
-                        Self::OPERATION,
-                        values,
-                        sampler,
-                        sampler_vocab,
-                    ));
-                }
+            DrawRoute::TapRow => {
+                let values = window.rows.get(row)?;
+                Some(sample_logits(
+                    Self::OPERATION,
+                    values,
+                    sampler,
+                    sampler_vocab,
+                ))
+            }
+            DrawRoute::DeviceRow => {
                 #[cfg(test)]
                 if let Err(error) = self.fault_at(Fault::KRowDraw) {
                     window_logic::fail_window(self);

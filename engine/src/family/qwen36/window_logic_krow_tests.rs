@@ -17,7 +17,7 @@ use crate::{
     EngError,
     family::{
         qwen36::{
-            krow::{self, DeviceDraws, DrawSource, RowStatus, RowsFacts},
+            krow::{self, DeviceDraws, DrawFacts, DrawRoute, RowStatus, RowsFacts},
             rollback::{RollbackBook, RollbackPlan, StateFacts},
         },
         sampler::{Sampler, SamplingParams},
@@ -96,6 +96,9 @@ enum Flaw {
     /// Entry 7 of the record of row 0 repeats the id of entry 3 (the first entry and the
     /// non-finite word are right, so only a check of every entry can see it).
     CorruptRecordEntry,
+    /// The draw hook serves the records of the last K-row window to any window with the same base
+    /// and inputs, also when the K-row path does not run it.
+    ServesStaleDraws,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -151,6 +154,8 @@ struct DevFake {
     device_rows: Vec<Vec<f32>>,
     /// Full rows read from the device at draw time.
     row_reads: usize,
+    /// Draws made from a shortlist record.
+    shortlist_draws: usize,
     /// Windows that copied their logits rows to the host.
     logit_copies: usize,
     /// What the open K-row window keeps for its draws.
@@ -291,6 +296,7 @@ impl DevFake {
             want_logits: true,
             device_rows: Vec::new(),
             row_reads: 0,
+            shortlist_draws: 0,
             logit_copies: 0,
             draws: None,
         }
@@ -762,36 +768,54 @@ impl WindowModel for DevFake {
         }
         // A K-row window that kept its logits on the device draws from its report (the shortlist
         // record) or reads the one row it needs, as the step does; the routing is production's.
-        let open = self
-            .draws
-            .as_ref()
-            .filter(|draws| draws.belongs_to(window.base, &window.inputs))
-            .map(|draws| draws.shortlists.get(row).cloned());
-        if let Some(record) = open {
-            let record = record.filter(|record| !record.is_empty());
-            match krow::draw_source(sampler.params(), false, vocab == VOCAB, record.is_some()) {
-                DrawSource::Shortlist => {
-                    return sampler.sample_shortlist(&record.expect("a record"), vocab);
-                }
-                DrawSource::Row => {
-                    if let Some(values) = window.rows.get(row) {
-                        return sampler.sample(&values[..vocab]);
+        let krow_runs = self.flaw == Flaw::ServesStaleDraws
+            || (self.path == Path::Krow
+                && self.flaw != Flaw::EagerWhileClaimingKrow
+                && krow::uses_krow(window.inputs.len()));
+        let route = krow::draw_route(&DrawFacts {
+            krow_runs,
+            device_window: true,
+            draws: self.draws.as_ref(),
+            base: window.base,
+            inputs: &window.inputs,
+            row,
+            tap_row: window.rows.get(row).is_some(),
+            params: sampler.params(),
+            sync_each: false,
+            vocab_matches: vocab == VOCAB,
+        });
+        match route {
+            DrawRoute::NotKrow => {}
+            DrawRoute::OutOfWindow => return Err(refused("no such row")),
+            DrawRoute::Shortlist => {
+                let record = self
+                    .draws
+                    .as_ref()
+                    .and_then(|draws| draws.shortlists.get(row))
+                    .cloned()
+                    .ok_or_else(|| refused("no record"))?;
+                self.shortlist_draws += 1;
+                return sampler.sample_shortlist(&record, vocab);
+            }
+            DrawRoute::TapRow => {
+                let values = window.rows.get(row).ok_or_else(|| refused("no such row"))?;
+                return sampler.sample(&values[..vocab]);
+            }
+            DrawRoute::DeviceRow => {
+                self.row_reads += 1;
+                if self.fault == Some(Fault::KRowDraw) {
+                    self.fault = None;
+                    if self.flaw != Flaw::LazyReadNotGated {
+                        fail_window(self);
                     }
-                    self.row_reads += 1;
-                    if self.fault == Some(Fault::KRowDraw) {
-                        self.fault = None;
-                        if self.flaw != Flaw::LazyReadNotGated {
-                            fail_window(self);
-                        }
-                        return Err(refused("injected failure of the row read"));
-                    }
-                    let values = self
-                        .device_rows
-                        .get(row)
-                        .cloned()
-                        .ok_or_else(|| refused("no such row"))?;
-                    return sampler.sample(&values[..vocab]);
+                    return Err(refused("injected failure of the row read"));
                 }
+                let values = self
+                    .device_rows
+                    .get(row)
+                    .cloned()
+                    .ok_or_else(|| refused("no such row"))?;
+                return sampler.sample(&values[..vocab]);
             }
         }
         let logits = window.rows.get(row).ok_or_else(|| refused("no such row"))?;
@@ -1644,4 +1668,36 @@ fn a_record_with_a_corrupt_later_entry_fails_the_window_closed_when_the_report_i
     let error = rig.fake.run_window(&rows(4)).expect_err("a corrupt record");
     assert!(format!("{error:?}").contains("row 0"), "{error:?}");
     assert!(rig.fake.poisoned && rig.fake.gate && rig.fake.window.is_none());
+}
+
+#[test]
+fn an_eager_window_with_the_base_and_inputs_of_a_k_row_window_is_not_served_its_records() {
+    let run = |flaw: Flaw| {
+        let mut rig = Rig::krow(flaw);
+        rig.fake.want_logits = false;
+        let base = rig.fake.snapshot().expect("snapshot");
+        let first = serve(&mut rig.fake, 4, 4, &mut keeping(5, 7));
+        assert_eq!(rig.fake.shortlist_draws, 4, "the K-row window draws from its records");
+        // The same base and inputs, run by the eager loop: the records of the first window are
+        // still stored, and must not be used.
+        rig.fake.restore(&base).expect("restore");
+        rig.fake.path = Path::Eager;
+        let second = serve(&mut rig.fake, 4, 4, &mut keeping(5, 7));
+        assert_eq!(first, second, "the same draws either way");
+        rig.fake.shortlist_draws
+    };
+    assert_eq!(run(Flaw::Sound), 4, "the eager window drew from its own rows");
+    assert_eq!(run(Flaw::ServesStaleDraws), 8, "the flaw serves the stale records");
+}
+
+#[test]
+fn with_the_k_row_path_off_a_draw_takes_the_one_row_path_and_the_draws_are_never_consulted() {
+    let mut eager = Rig::new(Path::Eager, Flaw::Sound, false);
+    for n in [2, 5, 8] {
+        let tokens = serve(&mut eager.fake, n, n, &mut keeping(5, 7));
+        assert_eq!(tokens.len(), n);
+    }
+    assert!(eager.fake.draws.is_none(), "an eager window stores no draws");
+    assert_eq!((eager.fake.shortlist_draws, eager.fake.row_reads), (0, 0));
+    assert_eq!(eager.fake.logit_copies, 0);
 }

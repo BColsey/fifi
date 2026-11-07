@@ -452,6 +452,73 @@ pub(crate) fn draw_source(
     }
 }
 
+/// What the draw hook of an open window knows when one non-greedy draw is asked for. The step and
+/// the fake model of the tests build it from their own state and take their route from
+/// [`draw_route`], so that the routing is one function, tested on the host.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrawFacts<'a> {
+    /// The K-row path runs a window of the stored window's length (armed, not switched off).
+    pub(crate) krow_runs: bool,
+    /// The stored window keeps its state in the device slots (`WindowSave::Device`).
+    pub(crate) device_window: bool,
+    /// What the last K-row window kept for its draws, if any.
+    pub(crate) draws: Option<&'a DeviceDraws>,
+    /// The committed rows when the stored window began, and its inputs.
+    pub(crate) base: usize,
+    pub(crate) inputs: &'a [u32],
+    /// The row asked for.
+    pub(crate) row: usize,
+    /// The window holds a host copy of this row's logits (the test tap read them).
+    pub(crate) tap_row: bool,
+    /// The sampler's settings, whether the step synchronizes after every launch, and whether the
+    /// sampler vocabulary is the width the shortlist covers.
+    pub(crate) params: SamplingParams,
+    pub(crate) sync_each: bool,
+    pub(crate) vocab_matches: bool,
+}
+
+/// Where one non-greedy draw of a stored window gets its values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrawRoute {
+    /// Not a window of the K-row path, or not the one `draws` belongs to: the default path draws.
+    NotKrow,
+    /// The row is past the window.
+    OutOfWindow,
+    /// The row's top-20 record.
+    Shortlist,
+    /// The host copy of the row's logits that the test tap read.
+    TapRow,
+    /// One row read from the device.
+    DeviceRow,
+}
+
+/// The route of one non-greedy draw (a greedy draw is the pair token and never asks). Only a window
+/// that the K-row path ran, whose records are those of this window (same base and inputs), is
+/// served by the K-row routes; anything else is the default path's.
+pub(crate) fn draw_route(facts: &DrawFacts<'_>) -> DrawRoute {
+    let Some(draws) = facts.draws else {
+        return DrawRoute::NotKrow;
+    };
+    if !facts.krow_runs
+        || !facts.device_window
+        || !draws.belongs_to(facts.base, facts.inputs)
+    {
+        return DrawRoute::NotKrow;
+    }
+    if facts.row >= draws.inputs.len() {
+        return DrawRoute::OutOfWindow;
+    }
+    let record = draws
+        .shortlists
+        .get(facts.row)
+        .is_some_and(|record| !record.is_empty());
+    match draw_source(facts.params, facts.sync_each, facts.vocab_matches, record) {
+        DrawSource::Shortlist => DrawRoute::Shortlist,
+        DrawSource::Row if facts.tap_row => DrawRoute::TapRow,
+        DrawSource::Row => DrawRoute::DeviceRow,
+    }
+}
+
 #[cfg(test)]
 #[path = "krow_tests.rs"]
 mod tests;

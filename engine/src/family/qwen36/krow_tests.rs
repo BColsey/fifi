@@ -583,6 +583,119 @@ fn the_draws_belong_to_the_window_that_began_at_their_base_over_their_ids() {
     assert!(!draws.belongs_to(12, &[1, 2]));
 }
 
+// ---- the route of a draw ----
+
+fn draws_of(base: usize, inputs: &[u32], rows_with_record: usize) -> DeviceDraws {
+    DeviceDraws {
+        base,
+        inputs: inputs.to_vec(),
+        accepted: 0,
+        bonus: 0,
+        shortlists: (0..inputs.len())
+            .map(|row| {
+                if row < rows_with_record {
+                    vec![(row as u32, 1.0)]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect(),
+    }
+}
+
+fn route_facts<'a>(draws: Option<&'a DeviceDraws>, inputs: &'a [u32]) -> DrawFacts<'a> {
+    DrawFacts {
+        krow_runs: true,
+        device_window: true,
+        draws,
+        base: 12,
+        inputs,
+        row: 0,
+        tap_row: false,
+        params: SamplingParams::new(0.8, 0.95, 20).unwrap(),
+        sync_each: false,
+        vocab_matches: true,
+    }
+}
+
+#[test]
+fn a_draw_goes_to_the_record_the_tap_copy_or_one_device_row() {
+    let inputs = [1u32, 2, 3];
+    let draws = draws_of(12, &inputs, 3);
+    let facts = route_facts(Some(&draws), &inputs);
+    assert_eq!(draw_route(&facts), DrawRoute::Shortlist);
+    // A sampler that keeps 1 to 20 candidates is served by the record, tap or not.
+    for top_k in [1, 5, 20] {
+        let params = SamplingParams::new(0.8, 0.95, top_k).unwrap();
+        for tap_row in [false, true] {
+            let served = DrawFacts { params, tap_row, ..facts };
+            assert_eq!(draw_route(&served), DrawRoute::Shortlist, "{top_k} {tap_row}");
+        }
+    }
+    // A sampler the record cannot serve reads the tap's copy when there is one, else one row.
+    for top_k in [0, 21, 64] {
+        let params = SamplingParams::new(0.8, 0.95, top_k).unwrap();
+        assert_eq!(draw_route(&DrawFacts { params, ..facts }), DrawRoute::DeviceRow);
+        let tapped = DrawFacts { params, tap_row: true, ..facts };
+        assert_eq!(draw_route(&tapped), DrawRoute::TapRow);
+    }
+    // The other reasons the record does not serve it.
+    assert_eq!(
+        draw_route(&DrawFacts { sync_each: true, ..facts }),
+        DrawRoute::DeviceRow
+    );
+    assert_eq!(
+        draw_route(&DrawFacts { vocab_matches: false, ..facts }),
+        DrawRoute::DeviceRow
+    );
+    assert_eq!(
+        draw_route(&DrawFacts { vocab_matches: false, tap_row: true, ..facts }),
+        DrawRoute::TapRow
+    );
+    // A row without a record (the shortlist is off, or the window has none for it).
+    let none = draws_of(12, &inputs, 0);
+    assert_eq!(
+        draw_route(&route_facts(Some(&none), &inputs)),
+        DrawRoute::DeviceRow
+    );
+    let first_only = draws_of(12, &inputs, 1);
+    let second = DrawFacts { row: 1, ..route_facts(Some(&first_only), &inputs) };
+    assert_eq!(draw_route(&second), DrawRoute::DeviceRow);
+    assert_eq!(
+        draw_route(&DrawFacts { row: 0, ..route_facts(Some(&first_only), &inputs) }),
+        DrawRoute::Shortlist
+    );
+}
+
+#[test]
+fn a_row_past_the_window_is_refused_and_a_window_the_k_row_path_did_not_run_takes_the_default_path() {
+    let inputs = [1u32, 2, 3];
+    let draws = draws_of(12, &inputs, 3);
+    let facts = route_facts(Some(&draws), &inputs);
+    for row in [3, 4, 100] {
+        assert_eq!(draw_route(&DrawFacts { row, ..facts }), DrawRoute::OutOfWindow, "{row}");
+    }
+    // The default path: the path is off for this window (an eager window with the same base and
+    // inputs as the window the records belong to), the state is not in the slots, there are no
+    // records, or the records are another window's.
+    for (what, other) in [
+        ("the path does not run it", DrawFacts { krow_runs: false, ..facts }),
+        ("host rollback", DrawFacts { device_window: false, ..facts }),
+        ("no records", DrawFacts { draws: None, ..facts }),
+        ("another base", DrawFacts { base: 13, ..facts }),
+        ("other inputs", DrawFacts { inputs: &[1, 2, 4], ..facts }),
+        ("a shorter window", DrawFacts { inputs: &[1, 2], ..facts }),
+    ] {
+        assert_eq!(draw_route(&other), DrawRoute::NotKrow, "{what}");
+        // And a row past the window of such a window is the default path's business too.
+        assert_eq!(
+            draw_route(&DrawFacts { row: 50, ..other }),
+            DrawRoute::NotKrow,
+            "{what}"
+        );
+    }
+}
+
 // ---- a seeded draw from the K shortlists is the one-row draw ----
 
 /// For fixed rows and seeds, drawing row after row from the top-20 records gives the tokens and
