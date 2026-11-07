@@ -16,6 +16,7 @@ use half::f16;
 
 use super::{
     route,
+    slot_bank::SlotBankLayout,
     tier_plan::{RouteCounts, SlotTable, TierInputs, TierPlan, TierShape, position_bytes},
 };
 use crate::{
@@ -416,4 +417,76 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
     eprintln!("two weighted picks: exact {to_exact:.3e}, rounded {to_rounded:.3e}");
     assert!(to_exact <= EXACT_BOUND, "{to_exact:.3e}");
     assert!(to_rounded <= rounded_bound(), "{to_rounded:.3e}");
+}
+
+#[test]
+#[ignore = "reads real experts of layer 3 in FIFI_FLASH_NEXT_EXL3_PACK (about 6 MiB) and needs AVX-512"]
+fn a_packed_slot_record_of_a_real_expert_runs_on_the_cpu_kernel_like_its_matrices() {
+    if Exl3Isa::detect() != Exl3Isa::Avx512 {
+        eprintln!("skipped: no AVX-512 on this host");
+        return;
+    }
+    let (checkpoint, layer) = open();
+    let (shape, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let moe = shape.moe;
+    let root = Root::Layers;
+    let cpu = ExpertCpu::new(
+        4,
+        WaitPolicy::SpinThenPark(Duration::from_micros(500)),
+        Some(Exl3Isa::Avx512),
+    )
+    .expect("the CPU kernel");
+    let layout = SlotBankLayout::new(moe.hidden, moe.inter, [48, 48, 48]).expect("the layout");
+    assert_eq!(
+        layout.record_bytes(),
+        1_881_600,
+        "the size the tier plan assumes"
+    );
+    let x = input(moe.hidden, 11);
+    let x64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+    for expert in [1usize, 256, 510] {
+        let parts = ExpertPart::ALL
+            .map(|part| matrix(&checkpoint, &expert_name_in(root, layer, expert, part)));
+        let record = layout
+            .pack_matrices([&parts[0], &parts[1], &parts[2]])
+            .expect("a record");
+        let reference = stored(
+            &checkpoint,
+            ExpertPart::ALL.map(|part| expert_name_in(root, layer, expert, part)),
+        );
+        let run = |view: ExpertView<'_>| {
+            let mut out = vec![0.0f32; moe.hidden];
+            cpu.forward(
+                &x,
+                &[ExpertPick {
+                    expert: view,
+                    weight: 1.0,
+                }],
+                &mut out,
+            )
+            .expect("the CPU forward");
+            out
+        };
+        let from_record = run(layout.view(&record).expect("a view"));
+        let from_matrices = run(reference.view());
+        assert_eq!(
+            from_record.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            from_matrices
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "expert {expert}: a record and the matrices give the same bits"
+        );
+        let error = relative_l2(&from_record, &reference.fp64(&x64));
+        eprintln!("expert {expert} from its record: relative L2 {error:.3e}");
+        assert!(error <= CPU_BOUND, "expert {expert}: {error:.3e}");
+    }
+    // A matrix of another rate than the layout is refused.
+    let shared =
+        ExpertPart::ALL.map(|part| matrix(&checkpoint, &shared_name_in(root, layer, part)));
+    assert!(
+        layout
+            .pack_matrices([&shared[0], &shared[1], &shared[2]])
+            .is_err()
+    );
 }
