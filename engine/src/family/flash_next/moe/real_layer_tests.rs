@@ -35,9 +35,11 @@ use crate::{
 };
 
 const GIB: u64 = 1 << 30;
-/// Relative L2 bound of the CPU kernel against fp64 on one expert block (f32 sums, no activation
-/// quantization; the Qwen3.6 device block's real-pack bound is 2e-5).
-const CPU_BOUND: f64 = 5e-5;
+/// Relative L2 bound of the CPU kernel against fp64 on one expert block. The fp64 oracle takes the
+/// codebook weights rounded to binary16 once (the device kernels' rule); the CPU kernel evaluates the
+/// exact affine value, so the two differ by that rounding: about 2^-12 per weight, which averages to a
+/// few times 1e-4 of the output (measured 3.5e-4 on a real 3 bpw expert). The bound is 1e-3.
+const CPU_BOUND: f64 = 1e-3;
 
 pub(super) fn open() -> (Checkpoint, usize) {
     let dir = std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK");
