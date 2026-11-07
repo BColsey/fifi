@@ -205,7 +205,7 @@ fn hard_rows(n: usize, rng: &mut Rng) -> Vec<Vec<f32>> {
     let mut rows = vec![
         tied_row(n, &[0, 255, 256]),
         tied_row(n, &[last, last - 1, 65_535.min(last), 65_536.min(last)]),
-        tied_row(n, &[3, 65_536.min(last) + 3, last]),
+        tied_row(n, &[3, (65_536 + 3).min(last), last]),
         vec![0.5; n],
         random_row(rng, n),
     ];
@@ -218,7 +218,7 @@ fn hard_rows(n: usize, rng: &mut Rng) -> Vec<Vec<f32>> {
     only_inf[n / 2] = f32::INFINITY;
     rows.push(only_inf);
     rows.push(vec![f32::NEG_INFINITY; n]);
-    let mut nan_over_tie = tied_row(n, &[10, 300]);
+    let mut nan_over_tie = tied_row(n, &[10, 300.min(last)]);
     nan_over_tie[5] = NAN;
     rows.push(nan_over_tie);
     rows
