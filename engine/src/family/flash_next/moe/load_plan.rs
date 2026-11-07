@@ -40,11 +40,11 @@ fn refuse(detail: String) -> EngError {
 
 /// The sizes of one pack and the context-independent part of its memory plan.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct FlashLoadPlan {
+pub(in crate::family::flash_next) struct FlashLoadPlan {
     pub(super) shape: TierShape,
     /// Device bytes of the trunk: attention, DeltaNet, router, shared experts, hyper-connections
     /// and the head (the header walk's total less the routed experts and the embedding).
-    pub(super) trunk_bytes: u64,
+    pub(in crate::family::flash_next) trunk_bytes: u64,
     /// The token embedding, gathered on the host.
     pub(super) embedding_bytes: u64,
     /// The recurrent state and conv ring of every DeltaNet layer.

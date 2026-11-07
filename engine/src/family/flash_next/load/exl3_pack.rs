@@ -12,15 +12,19 @@
 //! Device bytes count each tensor as the CUDA kernels read it: trellises as stored with `suh`
 //! and `svh` in F32 (the EXL3 kernels), hyper-connection weights in their stored half dtype
 //! (`kernels/cuda/resident/hyper.rs`), the router and the shared-expert gate in F32
-//! (`kernels/cuda/resident/router.rs`), and the norms and DeltaNet vectors in F32. The embedding
-//! and the dense projections that have no CUDA kernel yet (`in_proj_a`, `in_proj_b`, the PLE
-//! projections) count as stored. The embedding's dtype is open (any half dtype or F32) until the
-//! step's row gather fixes one; the real pack stores BF16.
+//! (`kernels/cuda/resident/router.rs`), and the norms and DeltaNet vectors in F32. `in_proj_a` and
+//! `in_proj_b` are F32 on the device as well: the gates are plain F32 projections, and the
+//! Qwen3.6 step reads its own beta and alpha the same way (widened at upload, exact). The
+//! embedding and the PLE projections count as stored; the PLE norms and convolution, which the host
+//! PLE step reads, count as zero. The embedding's dtype is open (any half
+//! dtype or F32) until the step's row gather fixes one; the real pack stores BF16.
+//! [`inspect_flash_pack_listing`] also returns every visited tensor with the bytes counted for
+//! it, which the CUDA trunk loader (`flash_next::cuda::load`) takes as its tensor list.
 
 use super::Dims;
 use crate::{
     EngError,
-    family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, PackReport, Root},
+    family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, PackReport, Root, Visit},
     tensor::Dtype,
     weights::StreamedCheckpoint,
 };
@@ -45,8 +49,28 @@ pub(in crate::family) fn inspect_flash_pack(
     source: &StreamedCheckpoint,
     config: &[u8],
 ) -> Result<FlashPackReport, EngError> {
+    walk_flash_pack(source, config, false).map(|(report, _)| report)
+}
+
+/// [`inspect_flash_pack`] and the list of every tensor it visited, in walk order, each with the
+/// device bytes counted for it. The CUDA trunk loader reads its tensor list from here.
+pub(in crate::family) fn inspect_flash_pack_listing(
+    source: &StreamedCheckpoint,
+    config: &[u8],
+) -> Result<(FlashPackReport, Vec<Visit>), EngError> {
+    walk_flash_pack(source, config, true)
+}
+
+fn walk_flash_pack(
+    source: &StreamedCheckpoint,
+    config: &[u8],
+    record: bool,
+) -> Result<(FlashPackReport, Vec<Visit>), EngError> {
     let dims = Dims::read(config)?;
     let mut walk = Inspector::new(source, Root::Layers);
+    if record {
+        walk = walk.recording();
+    }
     let (h, vocab) = (dims.hidden as usize, dims.vocab as usize);
     walk.plain(EMBED_NAME, &[dims.vocab, dims.hidden], true)?;
     walk.matrix(HEAD_PREFIX, h, vocab)?;
@@ -72,10 +96,8 @@ pub(in crate::family) fn inspect_flash_pack(
         hyper(&mut walk, &at("mlp_hyper_connection"), &dims, true)?;
         expert_bytes += walk.moe_block(layer, block)?;
     }
-    Ok(FlashPackReport {
-        pack: walk.report()?,
-        expert_bytes,
-    })
+    let (pack, visits) = walk.report_with_visits()?;
+    Ok((FlashPackReport { pack, expert_bytes }, visits))
 }
 
 /// One hyper-connection site under `prefix`: every weight in one half dtype, which the kernel
@@ -130,7 +152,7 @@ fn delta(walk: &mut Inspector<'_>, prefix: &str, dims: &Dims) -> Result<(), EngE
     }
     for role in ["in_proj_a", "in_proj_b"] {
         let name = format!("{prefix}.{role}.weight");
-        walk.plain(&name, &[dims.value_heads, dims.hidden], true)?;
+        walk.plain(&name, &[dims.value_heads, dims.hidden], false)?;
     }
     let conv = u32::try_from(conv_dim).map_err(|_| refuse(format!("{prefix}: conv width")))?;
     for (role, shape) in [
@@ -185,13 +207,14 @@ fn ple(walk: &mut Inspector<'_>, prefix: &str, dims: &Dims) -> Result<(), EngErr
         &[dims.hidden, dims.ple_embed],
         true,
     )?;
+    // The norms and the convolution are read by the host PLE step (`ple::step` applies `1 + w`
+    // itself); only the two projections are device weights.
     for norm in ["norm_conv", "norm_key", "norm_query"] {
-        walk.plain(&format!("{prefix}.{norm}.weight"), &[dims.width], false)?;
+        walk.host_plain(&format!("{prefix}.{norm}.weight"), &[dims.width])?;
     }
-    walk.plain(
+    walk.host_plain(
         &format!("{prefix}.conv1d.weight"),
         &[dims.width, 1, dims.ple_conv],
-        false,
     )?;
     Ok(())
 }

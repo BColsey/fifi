@@ -107,6 +107,32 @@ pub(in crate::family) struct PackReport {
     pub(in crate::family) codebook: Marker,
 }
 
+/// What kind of tensor a walk visited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::family) enum VisitKind {
+    /// A quantized matrix under `name` (its prefix), `k` inputs by `n` outputs, at `rate` (twice
+    /// the bits per weight).
+    Matrix { k: usize, n: usize, rate: u8 },
+    /// A plain tensor with its stored dtype and shape; `keep` is the walk's rule for its device
+    /// form: as stored (`true`) or widened to F32 (`false`).
+    Plain {
+        dtype: Dtype,
+        shape: Vec<u32>,
+        keep: bool,
+    },
+    /// A plain tensor the device does not hold: a host feed reads it from the pack. Checked like
+    /// any plain tensor, counted as zero device bytes.
+    Host { dtype: Dtype, shape: Vec<u32> },
+}
+
+/// One tensor a recording walk visited, with the device bytes the walk counted for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::family) struct Visit {
+    pub(in crate::family) name: String,
+    pub(in crate::family) kind: VisitKind,
+    pub(in crate::family) bytes: u64,
+}
+
 /// The codebook marker tensor a matrix carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family) enum Marker {
@@ -126,6 +152,7 @@ pub(in crate::family) struct Inspector<'a> {
     matrices: usize,
     rates: BTreeMap<u8, usize>,
     marker: Option<Marker>,
+    visits: Option<Vec<Visit>>,
 }
 
 impl<'a> Inspector<'a> {
@@ -138,6 +165,24 @@ impl<'a> Inspector<'a> {
             matrices: 0,
             rates: BTreeMap::new(),
             marker: None,
+            visits: None,
+        }
+    }
+
+    /// Records every tensor the walk visits, in order, for [`Self::report_with_visits`]. A loader
+    /// that consumes the list cannot drift from the walk that checked the pack.
+    pub(in crate::family) fn recording(mut self) -> Self {
+        self.visits = Some(Vec::new());
+        self
+    }
+
+    fn record(&mut self, name: &str, kind: VisitKind, bytes: u64) {
+        if let Some(visits) = &mut self.visits {
+            visits.push(Visit {
+                name: name.to_owned(),
+                kind,
+                bytes,
+            });
         }
     }
 
@@ -156,6 +201,14 @@ impl<'a> Inspector<'a> {
                 .marker
                 .ok_or_else(|| refuse("the pack has no matrix".into()))?,
         })
+    }
+
+    /// [`Self::report`] and the visits of a [`Self::recording`] walk (empty for a plain one).
+    pub(in crate::family) fn report_with_visits(
+        mut self,
+    ) -> Result<(PackReport, Vec<Visit>), EngError> {
+        let visits = self.visits.take().unwrap_or_default();
+        Ok((self.report()?, visits))
     }
 
     fn stored(&self, name: &str, want: &[u32]) -> Result<Dtype, EngError> {
@@ -188,7 +241,39 @@ impl<'a> Inspector<'a> {
             return Err(refuse(format!("{name} has dtype {dtype:?}")));
         }
         let values = shape.iter().map(|&d| u64::from(d)).product::<u64>();
-        self.add(values * if keep { dtype.byte_width() } else { 4 });
+        let bytes = values * if keep { dtype.byte_width() } else { 4 };
+        self.add(bytes);
+        self.record(
+            name,
+            VisitKind::Plain {
+                dtype,
+                shape: shape.to_vec(),
+                keep,
+            },
+            bytes,
+        );
+        Ok(dtype)
+    }
+
+    /// A plain tensor that stays off the device because a host feed reads it (the PLE norms and
+    /// convolution): checked against `shape` like [`Self::plain`], counted as zero bytes.
+    pub(in crate::family) fn host_plain(
+        &mut self,
+        name: &str,
+        shape: &[u32],
+    ) -> Result<Dtype, EngError> {
+        let dtype = self.stored(name, shape)?;
+        if !matches!(dtype, Dtype::F16 | Dtype::Bf16 | Dtype::F32) {
+            return Err(refuse(format!("{name} has dtype {dtype:?}")));
+        }
+        self.record(
+            name,
+            VisitKind::Host {
+                dtype,
+                shape: shape.to_vec(),
+            },
+            0,
+        );
         Ok(dtype)
     }
 
@@ -241,9 +326,11 @@ impl<'a> Inspector<'a> {
         }
         self.mark(prefix)?;
         let trellis = u64::from(tiles_k) * u64::from(tiles_n) * u64::from(words) * 2;
-        self.add(trellis + (k as u64 + n as u64) * 4);
+        let bytes = trellis + (k as u64 + n as u64) * 4;
+        self.add(bytes);
         self.matrices += 1;
         let rate = (words / 8) as u8;
+        self.record(prefix, VisitKind::Matrix { k, n, rate }, bytes);
         *self.rates.entry(rate).or_default() += 1;
         Ok(rate)
     }

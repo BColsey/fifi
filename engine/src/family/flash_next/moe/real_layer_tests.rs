@@ -7,7 +7,7 @@
 //!   and the classifier oracle on routes outside the profile.
 //! - The CPU cold-expert kernel (`ExpertCpu`, AVX-512) on real routed experts at 3 bpw and on the
 //!   shared expert at 5 bpw, against an fp64 evaluation of the same stored matrices.
-//! - The pack's trunk bytes against the plan's 3.59 GiB.
+//! - The pack's trunk bytes against the plan's 3,872,376,320 (3.61 GiB).
 
 use std::path::Path;
 use std::time::Duration;
@@ -129,13 +129,14 @@ fn the_real_router_picks_ten_and_the_tier_classifies_routes_outside_its_profile(
     assert_eq!(tier.expert_bytes, 1_881_600);
 
     // The trunk the plan assumes: everything on the device but the experts and the embedding
-    // (which the host gathers), against the plan doc's 3.59 GiB.
+    // (which the host gathers) and the tensors a host feed reads, against the exact figure of the
+    // plan doc (3.61 GiB).
     let embedding = shape.vocab as u64 * moe.hidden as u64 * 2;
     let trunk = report.pack.device_bytes - report.expert_bytes - embedding;
     eprintln!("trunk bytes {trunk} ({:.3} GiB)", trunk as f64 / GIB as f64);
-    assert!(
-        trunk.abs_diff((3.59 * GIB as f64) as u64) < GIB / 50,
-        "trunk {trunk}"
+    assert_eq!(
+        trunk, 3_872_376_320,
+        "the trunk bytes of the pack's header walk"
     );
 
     let router = host_f32(

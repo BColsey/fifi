@@ -48,15 +48,15 @@ fn head_groups(order: &[usize], groups_per_head: usize) -> Vec<usize> {
         .collect()
 }
 
-pub(super) struct PackReader<'a> {
+pub(in crate::family) struct PackReader<'a> {
     projector: &'a CudaProjector,
-    pub(super) checkpoint: &'a Checkpoint,
+    pub(in crate::family) checkpoint: &'a Checkpoint,
     reserve: Reserve,
     root: Root,
 }
 
 impl<'a> PackReader<'a> {
-    pub(super) fn new(
+    pub(in crate::family) fn new(
         projector: &'a CudaProjector,
         checkpoint: &'a Checkpoint,
         reserve: Reserve,
@@ -70,24 +70,24 @@ impl<'a> PackReader<'a> {
     }
 
     /// Reads the layers from `root` instead of the model's own: the MTP head's block.
-    pub(super) fn under(mut self, root: Root) -> Self {
+    pub(in crate::family) fn under(mut self, root: Root) -> Self {
         self.root = root;
         self
     }
 
     /// Where the layers of this pack are named.
-    pub(super) fn root(&self) -> Root {
+    pub(in crate::family) fn root(&self) -> Root {
         self.root
     }
 
     /// Admits `bytes` of weights against the free device memory and the reserve of the load.
-    pub(super) fn admit(&self, bytes: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn admit(&self, bytes: u64) -> Result<(), EngError> {
         self.projector.admit(bytes, self.reserve)
     }
 
     /// The stored components of the matrix under `prefix`. Unsupported old representations are
     /// selected too, so `Matrix::load` can refuse them.
-    pub(super) fn matrix(&self, prefix: &str) -> Result<Matrix, EngError> {
+    pub(in crate::family) fn matrix(&self, prefix: &str) -> Result<Matrix, EngError> {
         let names = COMPONENT_SUFFIXES.map(|suffix| format!("{prefix}.{suffix}"));
         let keys = names.each_ref().map(String::as_str);
         let selected = self
@@ -125,7 +125,17 @@ impl<'a> PackReader<'a> {
             Some((axis, order)) => matrix.reorder_groups(axis, order)?,
             None => matrix,
         };
-        let weight = self.projector.upload_exl3(&matrix, self.reserve)?;
+        self.upload(name, &matrix)
+    }
+
+    /// Uploads `matrix` as it is stored (no geometry check, no reorder): the caller has checked
+    /// its shape, as the Flash-Next trunk does through the pack's header walk.
+    pub(in crate::family) fn upload(
+        &self,
+        name: String,
+        matrix: &Matrix,
+    ) -> Result<CudaWeight, EngError> {
+        let weight = self.projector.upload_exl3(matrix, self.reserve)?;
         Ok(CudaWeight::Exl3 { name, weight })
     }
 
@@ -154,7 +164,7 @@ impl<'a> PackReader<'a> {
     }
 
     /// Uploads the zero-centered norm `source` as `name` with one added in F32.
-    pub(super) fn norm(
+    pub(in crate::family) fn norm(
         &self,
         name: String,
         source: &str,
@@ -174,7 +184,7 @@ impl<'a> PackReader<'a> {
         self.raw_bytes(name, &effective_norm_bytes(&tensor, values)?)
     }
 
-    pub(super) fn vector(
+    pub(in crate::family) fn vector(
         &self,
         name: String,
         source: &str,
@@ -187,7 +197,7 @@ impl<'a> PackReader<'a> {
         self.raw_bytes(name, &f32_le_bytes(&values))
     }
 
-    pub(super) fn table(
+    pub(in crate::family) fn table(
         &self,
         name: String,
         source: &str,

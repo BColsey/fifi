@@ -11,8 +11,8 @@ use crate::{
     weights::exl3::ngram::{NgramAux, NgramDecoder, NgramLayout, NgramTable, ROW_DIM},
 };
 
-const KEY: &str = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
-const LAYOUT: NgramLayout = NgramLayout {
+pub(crate) const KEY: &str = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+pub(crate) const LAYOUT: NgramLayout = NgramLayout {
     heads: 16,
     row_dim: 160,
     ngram: 3,
@@ -24,12 +24,12 @@ const MANIFEST: &[u8] =
     include_bytes!("../../../tests/fixtures/flash_next_exl3_ngram/manifest.json");
 const PACKED: &[u8] =
     include_bytes!("../../../tests/fixtures/flash_next_exl3_ngram/packed_u16.bin");
-const DECODED: &[u8] =
+pub(crate) const DECODED: &[u8] =
     include_bytes!("../../../tests/fixtures/flash_next_exl3_ngram/decoded_f32.bin");
 const BIAS: &[u8] =
     include_bytes!("../../../tests/fixtures/flash_next_exl3_ngram/head_bias_f16.bin");
 
-fn manifest_integers(name: &str) -> Vec<i64> {
+pub(crate) fn manifest_integers(name: &str) -> Vec<i64> {
     let manifest: serde_json::Value = serde_json::from_slice(MANIFEST).unwrap();
     manifest[name]
         .as_array()
@@ -44,7 +44,7 @@ fn le(values: &[i64]) -> Vec<u8> {
 }
 
 /// The sparse file: header, auxiliary tensors and the 80 recorded rows in place; holes elsewhere.
-fn write_table(path: &Path) {
+pub(crate) fn write_table(path: &Path) {
     let mut file = File::create(path).unwrap();
     file.write_all(HEADER).unwrap();
     file.set_len(REAL_FILE_BYTES).unwrap();

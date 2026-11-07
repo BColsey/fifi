@@ -152,4 +152,4 @@ impl NgramFile {
 
 #[cfg(test)]
 #[path = "ngram_file_tests.rs"]
-mod tests;
+pub(crate) mod tests;

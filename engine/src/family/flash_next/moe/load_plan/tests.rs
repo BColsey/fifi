@@ -142,7 +142,7 @@ fn the_real_pack_headers_give_the_documented_plan() {
     let report = inspect_flash_pack(&checkpoint.source, &checkpoint.model_config).unwrap();
     let plan =
         FlashLoadPlan::new(&report, &checkpoint.model_config, 32_640_183_408, card()).unwrap();
-    assert_eq!(plan.trunk_bytes, 3_854_968_320);
+    assert_eq!(plan.trunk_bytes, 3_872_376_320);
     for (context, lo, hi) in [(32_768, 204, 212), (131_072, 178, 184), (262_144, 140, 146)] {
         let line = plan.at_context(context, KvFormat::F16, 100).unwrap();
         let slots = line.context.plan.slots_per_layer();

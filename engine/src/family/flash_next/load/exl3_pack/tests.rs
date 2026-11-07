@@ -7,8 +7,12 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::super::tests::{CONFIG, checkpoint};
-use super::inspect_flash_pack;
-use crate::{EngError, family::exl3_pack::Marker, weights::exl3::Checkpoint};
+use super::{inspect_flash_pack, inspect_flash_pack_listing};
+use crate::{
+    EngError,
+    family::exl3_pack::{Marker, VisitKind},
+    weights::exl3::Checkpoint,
+};
 
 /// Expert and indexer matrices at 3 bits per weight, the rest at 5, as in the 3.05 pack.
 const LOW: u32 = 48;
@@ -209,17 +213,13 @@ fn width(dtype: &str) -> u64 {
 
 /// The device bytes of one entry by the module's rule, decided from the name alone: trellises
 /// and the tensors the kernels take as stored count as stored, `suh`, `svh` and the remaining
-/// plain tensors as F32, markers not at all.
+/// plain tensors as F32, markers and the host-only PLE norms and convolution not at all.
 fn device_bytes(name: &str, dtype: &str, shape: &[u32]) -> u64 {
     let values = shape.iter().map(|&d| u64::from(d)).product::<u64>();
-    let kept = [
-        "embed_tokens",
-        "hyper_connection",
-        "in_proj_a",
-        "in_proj_b",
-        "_proj.weight",
-    ];
-    if name.ends_with(".mul1") {
+    let kept = ["embed_tokens", "hyper_connection", "_proj.weight"];
+    // The host PLE step reads these: no device bytes.
+    let host_only = name.contains(".ple.norm_") || name.contains(".ple.conv1d");
+    if name.ends_with(".mul1") || host_only {
         0
     } else if name.ends_with(".trellis") || kept.iter().any(|part| name.contains(part)) {
         values * width(dtype)
@@ -273,6 +273,43 @@ fn a_stock_pack_matches_the_config_and_an_independent_byte_sum() {
         ]
     );
     assert_eq!(report.pack.codebook, Marker::Mul1);
+}
+
+/// The recording walk returns the report of the plain walk, and its list is the pack: every
+/// tensor name of the pack is a visited plain tensor or a component of a visited matrix, and the
+/// visits' bytes add up to the device bytes.
+#[test]
+fn the_listing_is_the_pack_and_adds_up_to_the_report() {
+    let entries = pack();
+    let source = open(&entries);
+    let plain_report = inspect_flash_pack(&source, &config()).unwrap();
+    let (report, visits) = inspect_flash_pack_listing(&source, &config()).unwrap();
+    assert_eq!(report, plain_report);
+    assert_eq!(
+        visits.iter().map(|v| v.bytes).sum::<u64>(),
+        report.pack.device_bytes
+    );
+    let matrices = visits
+        .iter()
+        .filter(|v| matches!(v.kind, VisitKind::Matrix { .. }))
+        .count();
+    assert_eq!(matrices, report.pack.matrices);
+    let visited: std::collections::BTreeSet<&str> =
+        visits.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(visited.len(), visits.len(), "a tensor visited twice");
+    for (name, ..) in &entries {
+        let owner = name
+            .rsplit_once('.')
+            .filter(|(_, suffix)| ["trellis", "suh", "svh", "mul1"].contains(suffix))
+            .map_or(name.as_str(), |(prefix, _)| prefix);
+        assert!(visited.contains(owner), "{name} is not in the listing");
+    }
+    // The gates are F32 on the device now.
+    let gate = visits
+        .iter()
+        .find(|v| v.name.ends_with("in_proj_a.weight"))
+        .expect("in_proj_a");
+    assert!(matches!(gate.kind, VisitKind::Plain { keep: false, .. }));
 }
 
 /// Each case changes one fact of the stock pack; the refusal names it.

@@ -1,0 +1,453 @@
+//! The PLE feed: the host step that turns a token's n-gram rows and the residual stream into the
+//! stream update that layer `ple_layer` adds before its attention read.
+//!
+//! WHAT: [`NgramRows`] takes the pack's n-gram file (opened by `FlashPackFiles` through the
+//! local-storage guard) and reads and decodes global rows (16 per token, 102 bytes each, random
+//! positions in a 30 GiB file on local NVMe). [`PleFeed`] holds the host copies of the PLE projections, norms and convolution from the
+//! pack and runs the existing host step (`ple::step`) with a projector over those weights, so the
+//! numbers are the host reference's. The update is `branches * hidden` F32 values (40 KiB); the
+//! device copy is `stream_io`.
+//! WHY three calls ([`PleFeed::plan`], [`PleFeed::gather`], [`PleFeed::update`]): the rows depend on
+//! the token history only, not on the residual stream, so a caller may gather on another thread
+//! while the device runs the layers before `ple_layer`; `gather` takes `&self` and no lock. Only
+//! `update` needs the stream (the query side of the gate) and mutates the convolution ring.
+//!
+//! The pack carries no `weight_scale` for the EXL3 n-gram table (the scale is inside each row's
+//! decode), so the step runs with scale 1. Hashing is `ple::plan_rows`, unchanged.
+//!
+//! Host cost: the key projection is `width x ple_embed` (10,240 x 2,560) F32 and the value
+//! projection `hidden x ple_embed`, about 33 M multiply-adds per token on `threads` host threads.
+
+use crate::{
+    EngError,
+    family::{
+        exl3_pack::Root,
+        flash_next::{
+            ple::{self, PleShape, PleState, PleWeights, RowPlan},
+            stored::host_f32,
+        },
+        project::Projector,
+    },
+    weights::{
+        StreamedCheckpoint,
+        exl3::ngram::{NgramAux, NgramDecoder, ROW_DIM},
+        exl3::ngram_file::NgramFile,
+    },
+};
+
+/// The scale of the n-gram rows in the step. The EXL3 table has none (see the module doc).
+const WEIGHT_SCALE: f32 = 1.0;
+
+fn le_i64(bytes: &[u8], what: &str) -> Result<Vec<i64>, EngError> {
+    let (words, rest) = bytes.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(EngError::Checkpoint(format!(
+            "n-gram {what} is not a whole number of I64 values"
+        )));
+    }
+    Ok(words.iter().map(|w| i64::from_le_bytes(*w)).collect())
+}
+
+/// The n-gram file with its decoder and hash tensors: global row to values. `Sync`, so the rows of
+/// the next token can be gathered on another thread while the card works (asserted below).
+pub(in crate::family) struct NgramRows {
+    file: NgramFile,
+    decoder: NgramDecoder,
+    multipliers: Vec<i64>,
+    vocab: Vec<i64>,
+    offsets: Vec<i64>,
+}
+
+impl NgramRows {
+    /// Takes the table `FlashPackFiles::open` opened through the guard (the key and layout were
+    /// checked there) and reads its small hash tensors.
+    pub(in crate::family) fn new(file: NgramFile) -> Result<Self, EngError> {
+        let offsets = le_i64(&file.read_aux(NgramAux::HeadOffsets)?, "head offsets")?;
+        let vocab = le_i64(
+            &file.read_aux(NgramAux::HeadVocabSizes)?,
+            "head vocabulary sizes",
+        )?;
+        let multipliers = le_i64(
+            &file.read_aux(NgramAux::LayerMultipliers)?,
+            "layer multipliers",
+        )?;
+        let bias: Vec<u16> = file
+            .read_aux(NgramAux::HeadBias)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        let decoder = NgramDecoder::new(file.table(), &offsets, &vocab, &bias)?;
+        Ok(Self {
+            file,
+            decoder,
+            multipliers,
+            vocab,
+            offsets,
+        })
+    }
+
+    /// Rows in the table, the single virtual table the step addresses.
+    fn rows(&self) -> u64 {
+        self.file.table().rows()
+    }
+
+    /// Reads and decodes the rows of `plan`, in plan order. Takes `&self` and no lock, so it may
+    /// run on another thread while the device works: the rows depend on the token history only.
+    pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
+        let rows = plan
+            .rows
+            .iter()
+            .map(|&(_, row)| {
+                let row = u64::from(row);
+                Ok((row, self.row(row)?))
+            })
+            .collect::<Result<Vec<_>, EngError>>()?;
+        Ok(Gathered { rows })
+    }
+
+    /// Reads and decodes global row `row`.
+    pub(in crate::family) fn row(&self, row: u64) -> Result<Vec<f32>, EngError> {
+        let mut packed = vec![0u8; self.file.table().row_bytes()];
+        self.file.read_row(row, &mut packed)?;
+        let mut values = [0f32; ROW_DIM];
+        self.decoder.decode_row(row, &packed, &mut values)?;
+        Ok(values.to_vec())
+    }
+}
+
+/// The keys and the value the PLE block projects from a token's gathered embedding.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::family) struct PleKeyValue {
+    /// `branches * hidden` values (`key_proj`).
+    pub(in crate::family) keys: Vec<f32>,
+    /// `hidden` values (`value_proj`).
+    pub(in crate::family) value: Vec<f32>,
+}
+
+/// The two projections of the PLE block, `key_proj` (`width x ple_embed`) and `value_proj`
+/// (`hidden x ple_embed`), applied to one embedding of `ple_embed` values. The step needs nothing
+/// else from the weights, so a route plugs in here: [`HostProjection`] is the F32 reference; the
+/// device route runs the same two matvecs on the card (one launch pair, one 44 KiB download).
+pub(in crate::family) trait PleProjection: Send {
+    fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError>;
+}
+
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<NgramRows>();
+};
+
+/// A dense row-major `[rows, cols]` F32 matrix on the host.
+pub(in crate::family) struct HostMatrix {
+    rows: usize,
+    cols: usize,
+    data: Vec<f32>,
+}
+
+impl HostMatrix {
+    pub(in crate::family) fn new(
+        rows: usize,
+        cols: usize,
+        data: Vec<f32>,
+    ) -> Result<Self, EngError> {
+        if rows.checked_mul(cols) != Some(data.len()) {
+            return Err(EngError::Checkpoint(format!(
+                "PLE projection of {} values is not {rows} x {cols}",
+                data.len()
+            )));
+        }
+        Ok(Self { rows, cols, data })
+    }
+
+    /// `self * x`, rows split across `threads` (the row split of `qwen36::host_cpu`), each row
+    /// summed in order.
+    fn matvec(&self, x: &[f32], threads: usize) -> Result<Vec<f32>, EngError> {
+        if x.len() != self.cols {
+            return Err(EngError::BadRequest(format!(
+                "PLE projection input has {} values, expected {}",
+                x.len(),
+                self.cols
+            )));
+        }
+        let cols = self.cols;
+        let mut out = vec![0.0f32; self.rows];
+        let chunk = self.rows.div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|scope| {
+            for (index, part) in out.chunks_mut(chunk).enumerate() {
+                let data = &self.data;
+                scope.spawn(move || {
+                    for (offset, slot) in part.iter_mut().enumerate() {
+                        let row = (index * chunk + offset) * cols;
+                        *slot = data[row..row + cols]
+                            .iter()
+                            .zip(x)
+                            .map(|(w, v)| w * v)
+                            .sum();
+                    }
+                });
+            }
+        });
+        Ok(out)
+    }
+}
+
+/// The host route: both projections as F32 matvecs on `threads` threads.
+pub(in crate::family) struct HostProjection {
+    key: HostMatrix,
+    value: HostMatrix,
+    threads: usize,
+}
+
+impl HostProjection {
+    pub(in crate::family) fn new(key: HostMatrix, value: HostMatrix, threads: usize) -> Self {
+        Self {
+            key,
+            value,
+            threads,
+        }
+    }
+}
+
+impl PleProjection for HostProjection {
+    fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        Ok(PleKeyValue {
+            keys: self.key.matvec(embedding, self.threads)?,
+            value: self.value.matvec(embedding, self.threads)?,
+        })
+    }
+}
+
+/// What the host step's `Projector` calls address: the two projections and the n-gram table.
+pub(in crate::family) enum FeedWeight {
+    Key,
+    Value,
+    /// The table the step's `rows` calls address; the rows themselves are in [`Gathered`].
+    Table,
+}
+
+/// The decoded rows of one token, keyed by global row.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::family) struct Gathered {
+    rows: Vec<(u64, Vec<f32>)>,
+}
+
+impl Gathered {
+    pub(in crate::family) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The decoded values of global row `row`, if it was gathered.
+    pub(in crate::family) fn get(&self, row: u64) -> Option<&[f32]> {
+        self.rows
+            .iter()
+            .find(|(global, _)| *global == row)
+            .map(|(_, values)| values.as_slice())
+    }
+}
+
+/// The projector the host step runs on: the key and value calls go to the [`PleProjection`] (one
+/// `project` call serves both, the step asks for the keys first and the value second on the same
+/// embedding) and table rows are served from a [`Gathered`].
+struct FeedProjector<'g> {
+    gathered: &'g Gathered,
+    projection: &'g mut dyn PleProjection,
+    value: Option<Vec<f32>>,
+}
+
+impl Projector for FeedProjector<'_> {
+    type Weight = FeedWeight;
+
+    fn linear(&mut self, weight: &FeedWeight, x: &[f32]) -> Result<Vec<f32>, EngError> {
+        match weight {
+            FeedWeight::Key => {
+                let both = self.projection.project(x)?;
+                self.value = Some(both.value);
+                Ok(both.keys)
+            }
+            FeedWeight::Value => match self.value.take() {
+                Some(value) => Ok(value),
+                None => Ok(self.projection.project(x)?.value),
+            },
+            FeedWeight::Table => Err(EngError::BadRequest("linear needs a projection".into())),
+        }
+    }
+
+    fn expert_linear(&mut self, _: &FeedWeight, _: u32, _: &[f32]) -> Result<Vec<f32>, EngError> {
+        Err(EngError::BadRequest(
+            "the PLE feed has no expert stack".into(),
+        ))
+    }
+
+    fn rows(&mut self, table: &FeedWeight, rows: &[u32]) -> Result<Vec<f32>, EngError> {
+        if !matches!(table, FeedWeight::Table) {
+            return Err(EngError::BadRequest("rows needs the n-gram table".into()));
+        }
+        let mut out = Vec::with_capacity(rows.len() * ROW_DIM);
+        for &row in rows {
+            let values = self.gathered.get(u64::from(row)).ok_or_else(|| {
+                EngError::BadRequest(format!("n-gram row {row} was not gathered"))
+            })?;
+            out.extend_from_slice(values);
+        }
+        Ok(out)
+    }
+}
+
+/// The PLE vectors of the pack, on the host: the three norms and the convolution, as stored
+/// (`ple::step` applies `1 + w` itself).
+pub(in crate::family) struct PleVectors {
+    norm_key: Vec<f32>,
+    norm_query: Vec<f32>,
+    norm_conv: Vec<f32>,
+    conv: Vec<f32>,
+}
+
+impl PleVectors {
+    /// Reads the vectors of the PLE block of `layer` from the pack, and the host route over its
+    /// two projections on `threads` threads. Widths come from `shape`.
+    pub(in crate::family) fn read(
+        source: &StreamedCheckpoint,
+        layer: usize,
+        shape: &PleShape,
+        threads: usize,
+    ) -> Result<(Self, HostProjection), EngError> {
+        let dims = shape.dims();
+        let (hidden, branches) = (dims.hidden as usize, dims.branches as usize);
+        let width = hidden * branches;
+        let embed = shape.embed();
+        let at = |suffix: &str| Root::Layers.name(layer, &format!("ple.{suffix}"));
+        let matrix = |suffix: &str, rows: usize| {
+            HostMatrix::new(rows, embed, host_f32(source, &at(suffix), rows * embed)?)
+        };
+        let projection = HostProjection::new(
+            matrix("key_proj.weight", width)?,
+            matrix("value_proj.weight", hidden)?,
+            threads,
+        );
+        let vectors = Self {
+            norm_key: host_f32(source, &at("norm_key.weight"), width)?,
+            norm_query: host_f32(source, &at("norm_query.weight"), width)?,
+            norm_conv: host_f32(source, &at("norm_conv.weight"), width)?,
+            conv: host_f32(
+                source,
+                &at("conv1d.weight"),
+                width * dims.conv_kernel as usize,
+            )?,
+        };
+        Ok((vectors, projection))
+    }
+}
+
+/// The weights `ple::step` and `ple::plan_rows` read, borrowed field by field so that the
+/// projection can be borrowed mutably beside them.
+fn step_weights<'a>(
+    rows: &'a NgramRows,
+    vectors: &'a PleVectors,
+    table: &'a [FeedWeight; 1],
+    table_rows: &'a [u64; 1],
+) -> PleWeights<'a, FeedWeight> {
+    PleWeights {
+        multipliers: &rows.multipliers,
+        vocab: &rows.vocab,
+        offsets: &rows.offsets,
+        shards: table,
+        shard_rows: table_rows,
+        weight_scale: WEIGHT_SCALE,
+        key: &FeedWeight::Key,
+        value: &FeedWeight::Value,
+        norm_key: &vectors.norm_key,
+        norm_query: &vectors.norm_query,
+        norm_conv: &vectors.norm_conv,
+        conv: &vectors.conv,
+    }
+}
+
+/// The host PLE step with its state.
+pub(in crate::family) struct PleFeed {
+    shape: PleShape,
+    rows: NgramRows,
+    vectors: PleVectors,
+    projection: Box<dyn PleProjection>,
+    table: [FeedWeight; 1],
+    table_rows: [u64; 1],
+    state: PleState,
+}
+
+impl PleFeed {
+    pub(in crate::family) fn new(
+        shape: PleShape,
+        rows: NgramRows,
+        vectors: PleVectors,
+        projection: Box<dyn PleProjection>,
+    ) -> Self {
+        let table_rows = [rows.rows()];
+        Self {
+            state: PleState::new(&shape),
+            shape,
+            rows,
+            vectors,
+            projection,
+            table: [FeedWeight::Table],
+            table_rows,
+        }
+    }
+
+    /// The n-gram table, which a caller may read from another thread (`NgramRows` is `Sync`).
+    pub(in crate::family) fn rows(&self) -> &NgramRows {
+        &self.rows
+    }
+
+    fn weights(&self) -> PleWeights<'_, FeedWeight> {
+        step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows)
+    }
+
+    /// The rows `token` needs after the tokens already fed.
+    pub(in crate::family) fn plan(&self, token: u32) -> Result<RowPlan, EngError> {
+        ple::plan_rows(&self.shape, &self.weights(), self.state.history(), token)
+    }
+
+    /// Reads and decodes the rows of `plan` (see [`NgramRows::gather`]).
+    pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
+        self.rows.gather(plan)
+    }
+
+    /// The residual update of `token`: `stream` is the residual stream (`branches * hidden`) at the
+    /// PLE layer's input, `gathered` the rows of [`Self::plan`] for the same token. Advances the
+    /// history and the convolution ring. On an error the state is unchanged.
+    pub(in crate::family) fn update(
+        &mut self,
+        token: u32,
+        gathered: &Gathered,
+        stream: &[f32],
+    ) -> Result<Vec<f32>, EngError> {
+        let mut next = self.state.clone();
+        let out = {
+            let mut projector = FeedProjector {
+                gathered,
+                projection: self.projection.as_mut(),
+                value: None,
+            };
+            let weights = step_weights(&self.rows, &self.vectors, &self.table, &self.table_rows);
+            ple::step(
+                &mut projector,
+                &self.shape,
+                &weights,
+                &mut next,
+                token,
+                stream,
+            )?
+        };
+        self.state = next;
+        Ok(out)
+    }
+
+    /// Forgets the history and zeroes the ring (a new sequence).
+    pub(in crate::family) fn reset(&mut self) {
+        self.state = PleState::new(&self.shape);
+    }
+}
+
+#[cfg(test)]
+mod tests;

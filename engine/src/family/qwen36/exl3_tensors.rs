@@ -65,7 +65,11 @@ pub(super) fn effective_norm_bytes(tensor: &Tensor, values: usize) -> Result<Vec
     Ok(output)
 }
 
-pub(super) fn widen_f32(tensor: &Tensor, values: usize, what: &str) -> Result<Vec<f32>, EngError> {
+pub(in crate::family) fn widen_f32(
+    tensor: &Tensor,
+    values: usize,
+    what: &str,
+) -> Result<Vec<f32>, EngError> {
     let elements = tensor.shape().iter().try_fold(1usize, |count, &dim| {
         count.checked_mul(usize::try_from(dim).ok()?)
     });
@@ -112,7 +116,7 @@ pub(super) fn widen_f32(tensor: &Tensor, values: usize, what: &str) -> Result<Ve
 }
 
 /// Little-endian bytes of F32 values, the form the device copy takes.
-pub(super) fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+pub(in crate::family) fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -120,7 +124,7 @@ pub(super) fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// A log whose `-exp(A_log)` overflows F32 is refused rather than loaded as an infinite decay.
-pub(super) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngError> {
+pub(in crate::family) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngError> {
     let decay: Vec<f32> = log.iter().map(|a| -a.exp()).collect();
     if decay.iter().all(|a| a.is_finite()) {
         return Ok(decay);

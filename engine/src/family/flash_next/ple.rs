@@ -73,6 +73,11 @@ impl PleShape {
     pub(crate) fn dims(&self) -> PleDims {
         self.dims
     }
+
+    /// Width `heads * head_dim` of the gathered n-gram embedding that the projections read.
+    pub(crate) fn embed(&self) -> usize {
+        self.embed
+    }
 }
 
 pub(crate) struct PleWeights<'a, W> {
@@ -121,7 +126,7 @@ impl PleState {
         &self.ring
     }
 
-    #[cfg(test)]
+    /// The last tokens fed, at most two; empty at the start of a sequence and after end-of-sequence.
     pub(crate) fn history(&self) -> &[u32] {
         &self.history
     }

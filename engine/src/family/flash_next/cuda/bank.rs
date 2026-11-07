@@ -227,8 +227,8 @@ pub(super) struct HostTerms {
     /// The least page cache the n-gram table's random reads must keep. A floor, not a target: all
     /// RAM the plan leaves free is page cache. PROVISIONAL: the default of 8 GiB (a quarter of the
     /// 30.4 GiB table) came from the author's choice, not from a measurement. The coordinator
-    /// accepted it as provisional; it is to be set from the row-read latency measurement on the
-    /// 990 PRO (M-N1) once that exists.
+    /// accepted it as provisional; it is to be set once the n-gram read latency on the 990 PRO is
+    /// measured.
     pub(super) ngram_cache_min: u64,
     /// Metadata allowance charged to each of the two stream-bank slots besides the payload.
     pub(super) stream_slot_metadata: u64,
