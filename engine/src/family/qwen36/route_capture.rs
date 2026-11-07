@@ -60,7 +60,8 @@ pub(in crate::family::qwen36) fn record(picks: LayerPicks) {
     }
 }
 
-/// A snapshot of the staged step, for the device test and the bench probe.
+/// A snapshot of the staged step (currently consumed only by the bench-side sanity log; a
+/// device test that asserts pick sanity would read it too).
 pub(in crate::family::qwen36) fn staged() -> Option<(u32, Vec<LayerPicks>)> {
     STAGED.lock().ok().and_then(|guard| guard.clone())
 }

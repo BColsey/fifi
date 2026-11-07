@@ -1845,7 +1845,9 @@ impl<'a> QwenResidentStep<'a> {
     /// capture window the record becomes an event-record node of the graph, outside one an eager
     /// record. The start block is written before it and the read-back follows it. `entered` counts
     /// the ops that were entered, the failing one included. Opt-in research activation capture is
-    /// another eager-only exception: one synchronous read after Moe(19), before arena reuse.
+    /// another eager-only exception: one synchronous read after Moe(19), before arena reuse. The
+    /// routing readback spike (`Q36_ROUTE_CAPTURE`, `route_capture`) is the last one: three
+    /// synchronous reads after every plain-MoE block, so a step with it on stays EAGER.
     fn run_body(
         &self,
         admit_pos: usize,
