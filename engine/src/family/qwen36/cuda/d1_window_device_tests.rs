@@ -1216,8 +1216,8 @@ fn d1_krow_the_step_runs_the_reference_shared_expert_block() {
     let suffix = rig.step.shared_in_routed_suffix();
     println!("D1_KROW_LOAD_SUFFIX {suffix:?}");
     assert!(
-        suffix.is_empty() || suffix.contains("exl3_shared_in_routed=off source=krow"),
-        "a K-row step must not run the merged block: {suffix:?}"
+        suffix.contains("exl3_shared_in_routed=off source=krow"),
+        "a K-row step must report the reference block and why: {suffix:?}"
     );
 }
 
