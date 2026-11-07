@@ -90,7 +90,8 @@ impl TierShape {
 
 /// K/V and indexer-key bytes of one context position: per QSA layer a K row and a V row of
 /// `heads_kv * head_dim` values of `kv_elem_bytes`, and one f32 indexer key of `idx_dim` per `ratio`
-/// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes yet.
+/// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes here; `KvGeometry::position_bytes`
+/// (`context_budget.rs`) adds the f32 row scales and is what the step's budget uses.
 pub(super) fn position_bytes(
     qsa_layers: u64,
     heads_kv: u64,
@@ -117,11 +118,57 @@ pub(super) struct TierInputs {
 }
 
 impl TierInputs {
-    /// The RTX 3090 (24 GiB) with a 62 GiB host. The reserves are chosen so the slot counts match the residency cost model: 64 MiB of engine state,
-    /// 512 MiB of kernel scratch and 1400 MiB for the desktop and the allocator. They are
-    /// a stand-in: the CUDA step replaces them with measurements.
-    /// The host keeps Flint's 8 GiB OS floor, 2 GiB of engine heap, 1 GiB of staging and a 1 GiB margin.
-    pub(super) fn rtx3090(
+    /// The inputs of a load, from what the machine reports: `free_vram` is the device's free memory
+    /// measured after the context exists and before any weight is resident (the desktop and other
+    /// processes are already excluded), `(mem_total, mem_available)` is `/proc/meminfo`
+    /// (`capability::probe`). The device reserves are the fixed admission ledger of Qwen3.6's
+    /// `enginesrv check` (`qwen36::admission_sketch`): the measured runtime overhead floor for the
+    /// kernel arena and the CUDA context, and the admission margin, the minimum spare and the
+    /// uncertainty band as the margin, plus 64 MiB of engine state. The host keeps the larger of
+    /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
+    /// heap, 1 GiB of staging and a 1 GiB margin. Prefill transients (the hyper stream, QSA scratch
+    /// and expert streaming planes) are not charged yet; the step's arena plan supplies them.
+    pub(super) fn measured(
+        shape: TierShape,
+        (trunk_bytes, state_bytes): (u64, u64),
+        kv: KvPlan,
+        free_vram: u64,
+        (mem_total, mem_available): (u64, u64),
+    ) -> Self {
+        use crate::family::qwen36::admission_sketch::{
+            ADMISSION_UNCERTAINTY_BAND_BYTES, FIXED_ADMISSION_MARGIN_BYTES,
+            PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
+        };
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        Self {
+            shape,
+            vram: VramBudget {
+                usable: free_vram,
+                non_expert: trunk_bytes + state_bytes,
+                state: 64 * MIB,
+                arena: RUNTIME_OVERHEAD_FLOOR_BYTES,
+                desktop_reserve: FIXED_ADMISSION_MARGIN_BYTES as u64
+                    + PREFILL_SPARE_MIN_BYTES as u64
+                    + ADMISSION_UNCERTAINTY_BAND_BYTES,
+            },
+            kv,
+            host: HostBudget {
+                total: mem_total,
+                non_reclaimable: mem_total.saturating_sub(mem_available).max(8 * GIB),
+                engine_heap: 2 * GIB,
+                staging: GIB,
+                margin: GIB,
+            },
+        }
+    }
+
+    /// The cost model's card: an RTX 3090 (24 GiB) with a 62 GiB host and fixed reserves of 64 MiB of
+    /// engine state, 512 MiB of kernel scratch and 1400 MiB for the desktop and the allocator,
+    /// chosen so the slot counts match the residency cost model (142, 180 and 208 slots at 262,144,
+    /// 131,072 and 32,768 positions). A test fixture: the load uses [`Self::measured`].
+    #[cfg(test)]
+    pub(super) fn cost_model_3090(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
         kv: KvPlan,

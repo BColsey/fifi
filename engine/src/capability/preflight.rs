@@ -1685,25 +1685,7 @@ fn largest_fitting_cuda(
         };
         i128::from(free) - i128::from(weights) - i128::from(charges) >= band
     };
-    const MIN_CONTEXT: u32 = 1024;
-    const STEP: u32 = 1024;
-    if requested <= MIN_CONTEXT || !fits(MIN_CONTEXT) {
-        return None;
-    }
-    let mut low = MIN_CONTEXT;
-    let mut high = requested;
-    while high - low > STEP {
-        let mid = low + (high - low) / 2 / STEP * STEP;
-        if mid <= low {
-            break;
-        }
-        if fits(mid) {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    Some(low)
+    sketch::largest_fitting_context(requested, &fits)
 }
 
 #[cfg(test)]

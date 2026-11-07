@@ -24,7 +24,7 @@ fn position(elem: u64) -> u64 {
 }
 
 fn inputs(positions: u64, elem: u64) -> TierInputs {
-    TierInputs::rtx3090(
+    TierInputs::cost_model_3090(
         shape(),
         (TRUNK_BYTES, STATE_BYTES),
         KvPlan {
@@ -279,4 +279,47 @@ fn route_counts_record_picks_and_refuse_ids_outside_the_layer() {
     assert_eq!(counts.counts()[0][0], 1);
     assert!(counts.record(2, &[0]).is_err());
     assert!(counts.record(0, &[8]).is_err());
+}
+
+#[test]
+fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_memory() {
+    // A 24,576 MiB card with 1,160 MiB held by the desktop, and the 62 GiB host with 8 GiB in use.
+    let free = 23_416 * MIB;
+    let kv = KvPlan {
+        positions: 262_144,
+        bytes_per_position: position(2),
+    };
+    let measured = |free: u64, available: u64| {
+        TierInputs::measured(
+            shape(),
+            (TRUNK_BYTES, STATE_BYTES),
+            kv,
+            free,
+            (62 * GIB, available),
+        )
+    };
+    let base = measured(free, 54 * GIB);
+    // The ledger of `enginesrv check`: 64 MiB of state, the 384 MiB runtime floor, and the 256 MiB
+    // admission margin + 64 MiB spare + 128 MiB band.
+    assert_eq!(base.vram.usable, free);
+    assert_eq!(
+        (base.vram.state, base.vram.arena, base.vram.desktop_reserve),
+        (64 * MIB, 384 * MIB, 448 * MIB)
+    );
+    let plan = TierPlan::new(&base).unwrap();
+    let slots = plan.slots_per_layer();
+    assert!((138..=146).contains(&slots), "{slots}");
+    // Ten slots of free memory more or less move the count by ten: the plan follows the machine.
+    let slot = shape().slot_cost();
+    let ten_more = TierPlan::new(&measured(free + 10 * slot, 54 * GIB)).unwrap();
+    assert_eq!(ten_more.slots_per_layer(), slots + 10);
+    let ten_fewer = TierPlan::new(&measured(free - 10 * slot, 54 * GIB)).unwrap();
+    assert_eq!(ten_fewer.slots_per_layer(), slots - 10);
+    // A busy host: 32 GiB in use leaves 26 GiB of page cache for 31 GiB of cold experts.
+    let text = TierPlan::new(&measured(free, 30 * GIB))
+        .unwrap_err()
+        .describe();
+    assert!(text.contains("pinned host bytes"), "{text}");
+    // A quiet host keeps the 8 GiB OS floor.
+    assert_eq!(measured(free, 62 * GIB).host.non_reclaimable, 8 * GIB);
 }

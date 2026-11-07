@@ -39,6 +39,35 @@ pub(crate) const PREFILL_PART_CHARGE_BYTES: usize = 64 * 1024 * 1024;
 /// a staging tier bound, not a context cap. Canonical value.
 pub(crate) const FULL_STAGE_TIER_ROWS: usize = 131_072;
 
+/// The step of the context search, and the least context it tries.
+pub(crate) const CONTEXT_SEARCH_STEP: u32 = 1024;
+
+/// The largest context, a multiple of [`CONTEXT_SEARCH_STEP`] and below `requested`, for which
+/// `fits` holds; `None` when not even one step fits (or `requested` is at most one step). `fits`
+/// must be monotone (a longer context never fits where a shorter one does not) and `requested` is
+/// assumed not to fit: it is never asked. Shared by the `enginesrv check` proposal and the Flash-Next
+/// expert budget, so both bisect the same way.
+pub(crate) fn largest_fitting_context(requested: u32, fits: &dyn Fn(u32) -> bool) -> Option<u32> {
+    const STEP: u32 = CONTEXT_SEARCH_STEP;
+    if requested <= STEP || !fits(STEP) {
+        return None;
+    }
+    let mut low = STEP;
+    let mut high = requested;
+    while high - low > STEP {
+        let mid = low + (high - low) / 2 / STEP * STEP;
+        if mid <= low {
+            break;
+        }
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some(low)
+}
+
 /// The staged KV8 rows a context of `context_limit` positions pins at boot:
 /// the whole context below the tier, the 32K tail above it. Matches
 /// `cuda::prefill_driver::fixed_staging_rows` by construction (it delegates
