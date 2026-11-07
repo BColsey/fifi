@@ -91,7 +91,6 @@ struct Ranges<'b> {
     z: DeviceRange<'b>,
     gu: DeviceRange<'b>,
     act: DeviceRange<'b>,
-    down: DeviceRange<'b>,
     zero: DeviceRange<'b>,
 }
 
@@ -136,7 +135,6 @@ impl SharedMerge {
             z: span(self.layout.z)?,
             gu: span(self.layout.gu)?,
             act: span(self.layout.act)?,
-            down: span(self.layout.down)?,
             zero: span(self.layout.zero)?,
         })
     }
