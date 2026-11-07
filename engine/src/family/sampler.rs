@@ -325,6 +325,70 @@ impl SplitMix64 {
     }
 }
 
+/** What the sampler actually considered when it chose one token: the leading kept
+ * candidates' probabilities over the post-filter (temperature, top_k, top_p) kept
+ * mass in ranked order, plus the selected entry's rank — the selected entry is
+ * always present, appended when its rank falls outside the shown prefix. Greedy
+ * rows carry no probabilities. Capture is a write-only observation of values
+ * `draw_kept` already computed, so it cannot change any decision or draw. */
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SampleObservation {
+    pub(crate) selected: u32,
+    /// The selected entry's rank in the ranked order, 0-based.
+    pub(crate) selected_rank: u32,
+    /// The size of the post-top_p kept set the draw walked.
+    pub(crate) kept: u32,
+    pub(crate) greedy: bool,
+    /// At most `CANDIDATES_SHOWN` kept candidates plus the selected entry when its
+    /// rank is outside them. The probabilities sum to at most 1: they are the kept
+    /// distribution, never a renormalised display set.
+    pub(crate) candidates: Vec<(u32, f64)>,
+}
+
+/// How many leading kept candidates an observation carries.
+const CANDIDATES_SHOWN: usize = 5;
+
+impl SampleObservation {
+    /// Fill from the values the walk already computed. Write-only: called after the
+    /// decision, and only from `draw_kept`, so every sampling path observes the same
+    /// numbers it walked.
+    fn fill_sampled(
+        &mut self,
+        ranked: &[(u32, f32)],
+        weights: &[f64],
+        mass: f64,
+        keep: usize,
+        rank: usize,
+    ) {
+        self.selected = ranked[rank].0;
+        self.selected_rank = rank as u32;
+        self.kept = keep as u32;
+        self.greedy = false;
+        let shown = keep.min(CANDIDATES_SHOWN);
+        self.candidates.clear();
+        self.candidates.extend(
+            ranked
+                .iter()
+                .zip(weights)
+                .take(shown)
+                .map(|(entry, &w)| (entry.0, w / mass)),
+        );
+        if rank >= shown {
+            self.candidates.push((self.selected, weights[rank] / mass));
+        }
+    }
+
+    /// A greedy row has no distribution to observe: the argmax token, one kept
+    /// candidate, no probabilities.
+    fn fill_greedy(&mut self, token: u32) {
+        self.selected = token;
+        self.selected_rank = 0;
+        self.kept = 1;
+        self.greedy = true;
+        self.candidates.clear();
+    }
+}
+
 pub(crate) struct Sampler {
     params: SamplingParams,
     #[cfg_attr(
@@ -393,7 +457,25 @@ impl Sampler {
     /// count can hide behind the same token for a whole row.
     fn sample_with_keep(&mut self, logits: &[f32]) -> Result<(u32, usize), EngError> {
         let rng = &mut self.rng;
-        pick_row(self.params, logits, || rng.next_unit())
+        pick_row(self.params, logits, || rng.next_unit(), None)
+    }
+
+    /// The next token id with the observation of the decision that chose it. The walk
+    /// and the generator behave exactly as `sample`; the observation is write-only, so
+    /// capture cannot change the token stream — the equivalence tests assert it with
+    /// the generator state included.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the request capture lifecycle stage")
+    )]
+    pub(crate) fn sample_observed(
+        &mut self,
+        logits: &[f32],
+    ) -> Result<(u32, SampleObservation), EngError> {
+        let mut obs = SampleObservation::default();
+        let rng = &mut self.rng;
+        let (token, _) = pick_row(self.params, logits, || rng.next_unit(), Some(&mut obs))?;
+        Ok((token, obs))
     }
 
     /// Draws from the complete stable top-20 of a device-validated finite vocabulary.
@@ -407,6 +489,21 @@ impl Sampler {
         ranked: &[(u32, f32)],
         vocab: usize,
     ) -> Result<u32, EngError> {
+        Ok(self.sample_shortlist_observed(ranked, vocab)?.0)
+    }
+
+    /// `sample_shortlist` with the decision's observation, filled by the same walk.
+    /// The validation, weights, and generator use are identical, so the compact token
+    /// stream is unchanged.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        expect(dead_code, reason = "used by the CUDA device shortlist")
+    )]
+    pub(crate) fn sample_shortlist_observed(
+        &mut self,
+        ranked: &[(u32, f32)],
+        vocab: usize,
+    ) -> Result<(u32, SampleObservation), EngError> {
         if self.params.is_greedy() || !(1..=20).contains(&self.params.top_k) {
             return Err(EngError::BadRequest(
                 "device shortlist requires non-greedy top_k 1 through 20".to_owned(),
@@ -428,8 +525,17 @@ impl Sampler {
         let ranked = &ranked[..vocab.min(self.params.top_k as usize)];
         let top = f64::from(ranked[0].1);
         let (weights, total) = ranked_weights(ranked, top, self.params.temperature);
+        let mut obs = SampleObservation::default();
         let rng = &mut self.rng;
-        Ok(draw_kept(self.params, ranked, &weights, total, || rng.next_unit())?.0)
+        let (token, _) = draw_kept(
+            self.params,
+            ranked,
+            &weights,
+            total,
+            || rng.next_unit(),
+            Some(&mut obs),
+        )?;
+        Ok((token, obs))
     }
 
     /// The token and the number of kept candidates that `sample_with_keep` returns when the
@@ -451,22 +557,28 @@ impl Sampler {
                 "the sampling unit must be in [0, 1), got {unit}"
             )));
         }
-        pick_row(self.params, logits, || unit)
+        pick_row(self.params, logits, || unit, None)
     }
 }
 
 /// The token and kept count of one row under `params`. The path is the sampler's whole decision:
 /// `check_logits`, the greedy argmax, the prefix path, and the ranked paths. `draw` supplies the
 /// call's one random unit and runs exactly once, inside `draw_kept` after the path is decided;
-/// a greedy row and an error path never call it.
+/// a greedy row and an error path never call it. `obs`, when given, is filled by the walk after
+/// the decision — a write-only observation that cannot change the outcome.
 fn pick_row(
     params: SamplingParams,
     logits: &[f32],
     draw: impl FnOnce() -> f64,
+    mut obs: Option<&mut SampleObservation>,
 ) -> Result<(u32, usize), EngError> {
     check_logits(logits)?;
     if params.is_greedy() {
-        return Ok((argmax(logits), 1));
+        let token = argmax(logits);
+        if let Some(obs) = &mut obs {
+            obs.fill_greedy(token);
+        }
+        return Ok((token, 1));
     }
     let temperature = params.temperature;
     let top = top_logit(logits);
@@ -483,7 +595,7 @@ fn pick_row(
         if closed {
             #[cfg(test)]
             sample_path::note_prefix();
-            return draw_kept(params, &prefix, &weights, total, draw);
+            return draw_kept(params, &prefix, &weights, total, draw, obs);
         }
         #[cfg(test)]
         sample_path::note_fallback();
@@ -502,7 +614,7 @@ fn pick_row(
         ranked
     };
     let (weights, total) = ranked_weights(&ranked, top, temperature);
-    draw_kept(params, &ranked, &weights, total, draw)
+    draw_kept(params, &ranked, &weights, total, draw, obs)
 }
 
 /// The one keep and cumulative walk every path draws through: `weights` are the weights of
@@ -517,6 +629,7 @@ fn draw_kept(
     weights: &[f64],
     total: f64,
     draw: impl FnOnce() -> f64,
+    mut obs: Option<&mut SampleObservation>,
 ) -> Result<(u32, usize), EngError> {
     let threshold = params.top_p * total;
     let mut keep = 0_usize;
@@ -530,15 +643,22 @@ fn draw_kept(
     }
     let target = draw() * mass;
     let mut cumulative = 0.0_f64;
-    for (entry, &w) in ranked.iter().zip(weights).take(keep) {
+    for (rank, (entry, &w)) in ranked.iter().zip(weights).enumerate().take(keep) {
         cumulative += w;
         if cumulative > target {
+            if let Some(obs) = &mut obs {
+                obs.fill_sampled(ranked, weights, mass, keep, rank);
+            }
             return Ok((entry.0, keep));
         }
     }
     // Rounding can leave `target` at the total. The last kept token is the answer then.
+    let last = keep.saturating_sub(1);
+    if let Some(obs) = &mut obs {
+        obs.fill_sampled(ranked, weights, mass, keep, last);
+    }
     ranked
-        .get(keep.saturating_sub(1))
+        .get(last)
         .map(|entry| (entry.0, keep))
         .ok_or_else(|| invalid_logits("no candidate token"))
 }
@@ -812,9 +932,10 @@ mod sample_path {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TEMPERATURE, LoadedDefaults, PREFIX_ROWS, Sampler, SamplingDefaults,
-        SamplingParams, SplitMix64, argmax, check_logits, entropy_seed, invalid_logits,
-        ranked_prefix, ranked_row, ranked_weights, ranked_weights_prefix, sample_path, top_logit,
+        CANDIDATES_SHOWN, DEFAULT_TEMPERATURE, LoadedDefaults, PREFIX_ROWS, Sampler,
+        SamplingDefaults, SamplingParams, SplitMix64, argmax, check_logits, entropy_seed,
+        invalid_logits, ranked_prefix, ranked_row, ranked_weights, ranked_weights_prefix,
+        sample_path, top_logit,
     };
     use crate::EngError;
     use std::cmp::Ordering;
@@ -2648,5 +2769,174 @@ mod tests {
             picked.iter().all(|&draw| draw == (0, 1)),
             "a draw left the single kept token or kept more than one candidate"
         );
+    }
+
+    // ---- Capture observation (P1-A) --------------------------------------------
+
+    /// The top `limit` kept token ids in ranked order, per the reference: descending
+    /// probability, ties by token id.
+    fn reference_top_ids(probs: &[f64], limit: usize) -> Vec<u32> {
+        let mut order: Vec<usize> = (0..probs.len()).filter(|&id| probs[id] > 0.0).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        order.truncate(limit);
+        order.iter().map(|&id| id as u32).collect()
+    }
+
+    #[test]
+    fn observed_sampling_preserves_tokens_and_generator_state() {
+        let rows = [
+            peaked_logits(),
+            flat_logits(),
+            tail_logits(),
+            random_row(&mut SplitMix64::new(97), 64),
+            random_row(&mut SplitMix64::new(98), PREFIX_ROWS + 64),
+        ];
+        let mut settings = grid();
+        settings.push((0.0, 1.0, 0)); // greedy: never draws
+        for (temperature, top_p, top_k) in settings {
+            let setting = params(temperature, top_p, top_k);
+            for seed in [0u64, 7, 42] {
+                let mut plain = Sampler::new(setting, seed);
+                let mut observed = Sampler::new(setting, seed);
+                for row in &rows {
+                    for _ in 0..16 {
+                        let expected = plain.sample(row).expect("plain sample");
+                        let (token, _) = observed.sample_observed(row).expect("observed sample");
+                        assert_eq!(token, expected, "settings {setting:?} seed {seed}");
+                    }
+                }
+                assert_eq!(
+                    plain.rng_state(),
+                    observed.rng_state(),
+                    "capture must not move the generator: {setting:?} seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observation_matches_the_reference_distribution() {
+        for (temperature, top_p, top_k) in grid() {
+            let setting = params(temperature, top_p, top_k);
+            for row in [peaked_logits(), flat_logits(), tail_logits()] {
+                let (probs, keep) = reference_distribution(&row, setting);
+                let mut sampler = Sampler::new(setting, 0x5EED);
+                let (token, obs) = sampler.sample_observed(&row).expect("observed sample");
+                assert_eq!(token, obs.selected);
+                assert_eq!(obs.kept as usize, keep, "settings {setting:?}");
+                assert!(!obs.greedy);
+                let shown = keep.min(CANDIDATES_SHOWN);
+                let expected_len = shown + usize::from(obs.selected_rank as usize >= shown);
+                assert_eq!(obs.candidates.len(), expected_len, "settings {setting:?}");
+                let top_ids = reference_top_ids(&probs, shown);
+                for (slot, &(id, prob)) in obs.candidates.iter().enumerate() {
+                    let expected_id = if slot < shown {
+                        top_ids[slot]
+                    } else {
+                        obs.selected
+                    };
+                    assert_eq!(id, expected_id, "settings {setting:?} slot {slot}");
+                    assert!(
+                        (prob - probs[id as usize]).abs() < 1e-9,
+                        "settings {setting:?} id {id}: {prob} vs {}",
+                        probs[id as usize]
+                    );
+                }
+                assert!(
+                    obs.candidates.iter().map(|&(_, prob)| prob).sum::<f64>() <= 1.0 + 1e-12,
+                    "the shown set is a subset of the kept distribution, never renormalised"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_observation_has_no_probabilities() {
+        let row = random_row(&mut SplitMix64::new(77), 64);
+        let mut sampler = Sampler::greedy();
+        let before = sampler.rng_state();
+        let (token, obs) = sampler.sample_observed(&row).expect("observed sample");
+        assert_eq!(token, argmax(&row));
+        assert!(obs.greedy);
+        assert!(obs.candidates.is_empty());
+        assert_eq!(obs.kept, 1);
+        assert_eq!(
+            sampler.rng_state(),
+            before,
+            "greedy never draws, captured or not"
+        );
+    }
+
+    #[test]
+    fn selected_outside_the_shown_prefix_is_appended_with_its_probability() {
+        // A flat head draws broadly, so some seed selects rank >= CANDIDATES_SHOWN.
+        let row = flat_logits();
+        let setting = params(1.0, 1.0, 0);
+        let (probs, _) = reference_distribution(&row, setting);
+        for seed in 0..64_u64 {
+            let mut sampler = Sampler::new(setting, seed);
+            let (token, obs) = sampler.sample_observed(&row).expect("observed sample");
+            assert_eq!(token, obs.selected);
+            if obs.selected_rank as usize >= CANDIDATES_SHOWN {
+                assert_eq!(obs.candidates.len(), CANDIDATES_SHOWN + 1);
+                let appended = obs.candidates.last().expect("appended selected entry");
+                assert_eq!(appended.0, obs.selected);
+                assert!((appended.1 - probs[obs.selected as usize]).abs() < 1e-9);
+                return;
+            }
+        }
+        panic!("no seed selected outside the shown prefix; widen the loop");
+    }
+
+    #[test]
+    fn observed_shortlist_matches_plain_and_reports_the_kept_distribution() {
+        let row = random_row(&mut SplitMix64::new(21), 1_031);
+        let mut ranked = ranked_row(&row);
+        ranked.truncate(20);
+        let setting = params(0.9, 1.0, 8);
+        let (probs, keep) = reference_distribution(&row, setting);
+        assert_eq!(keep, 8, "top_p 1.0 keeps the truncated top-k set");
+        let mut plain = Sampler::new(setting, 3);
+        let mut observed = Sampler::new(setting, 3);
+        for _ in 0..32 {
+            let expected = plain.sample_shortlist(&ranked, row.len()).expect("plain");
+            let (token, obs) = observed
+                .sample_shortlist_observed(&ranked, row.len())
+                .expect("observed");
+            assert_eq!(token, expected);
+            assert_eq!(obs.kept as usize, keep);
+            for &(id, prob) in &obs.candidates {
+                assert!((prob - probs[id as usize]).abs() < 1e-9, "id {id}");
+            }
+        }
+        assert_eq!(plain.rng_state(), observed.rng_state());
+    }
+
+    #[test]
+    fn prefix_path_observation_matches_the_full_row_reference() {
+        // A row longer than PREFIX_ROWS with a dominant head answers on the prefix path;
+        // the observation must still match the reference walk over the full row.
+        let mut row = random_row(&mut SplitMix64::new(303), PREFIX_ROWS + 64);
+        row[0] = 30.0;
+        row[1] = 20.0;
+        let setting = params(0.7, 1.0, 0);
+        let (probs, _) = reference_distribution(&row, setting);
+        let mut sampler = Sampler::new(setting, 0xD1CE);
+        let _ = sample_path::take(); // reset the counters
+        let (token, obs) = sampler.sample_observed(&row).expect("observed sample");
+        assert_eq!(sample_path::take().0, 1, "the prefix path answered");
+        assert_eq!(token, obs.selected);
+        for &(id, prob) in &obs.candidates {
+            assert!(
+                (prob - probs[id as usize]).abs() < 1e-9,
+                "id {id}: {prob} vs {}",
+                probs[id as usize]
+            );
+        }
     }
 }
