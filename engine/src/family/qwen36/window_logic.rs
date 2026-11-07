@@ -80,6 +80,20 @@ pub(crate) struct RowsOut<R> {
     pub(crate) rows: Vec<R>,
 }
 
+/// How `run_rows` failed. The two kinds differ in who decides whether the window fails closed.
+#[derive(Debug)]
+pub(crate) enum RowsFailure {
+    /// The existing rule decides ([`row_failure`]): the window fails closed only when the committed
+    /// rows moved or the state is no longer valid, and a refusal before anything ran leaves the
+    /// state valid and unchanged. The eager rows return only this kind, so the eager window is
+    /// exactly what it was.
+    StateDecides(EngError),
+    /// A failure after the window's launch: the device is ahead of the committed rows whatever
+    /// the host counters say (a lost read-back leaves `tokens()` at the base and the state valid),
+    /// so the window fails closed unconditionally ([`fail_window`]).
+    AfterLaunch(EngError),
+}
+
 /// The primitive effects of a window. Every method is one forward on the step.
 pub(crate) trait WindowHost {
     /// The host copy of the committed state.
@@ -148,13 +162,14 @@ pub(crate) trait WindowHost {
     /// per row, so the eager window is the reference and the fallback of any override. An override
     /// (`draft_verify = krow`) runs the K rows as one window and, once the window synchronized and
     /// its results were read, marks the slots (`RollbackBook::mark_captured_range`). It must
-    /// refuse before any enqueue (state valid, unchanged) or fail with the state poisoned or
-    /// advanced: `run_window_device` closes the window either way.
-    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Self::Row>, EngError>
+    /// refuse before any enqueue with [`RowsFailure::StateDecides`] (state valid, unchanged), and
+    /// report every failure after the launch as [`RowsFailure::AfterLaunch`], which fails the window
+    /// closed whatever the host counters say. `run_window_device` closes the window either way.
+    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Self::Row>, RowsFailure>
     where
         Self: Sized,
     {
-        eager_rows(self, inputs)
+        eager_rows(self, inputs).map_err(RowsFailure::StateDecides)
     }
 
     /// A failure injected at a point of the commit. Empty outside the step's test build.
@@ -476,12 +491,15 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
     host.complete_prefix_save()?;
     let base = host.tokens();
     host.rollback_begin(inputs.len())?;
-    let ran = host.run_rows(inputs);
-    let RowsOut { argmax, rows } = match ran {
+    let RowsOut { argmax, rows } = match host.run_rows(inputs) {
         Ok(out) => out,
-        Err(error) => {
+        Err(RowsFailure::StateDecides(error)) => {
             host.rollback_discard();
             return Err(row_failure(host, base, error));
+        }
+        Err(RowsFailure::AfterLaunch(error)) => {
+            host.rollback_discard();
+            return Err(failed(host, error));
         }
     };
     // Every row ran: until the verdict a step or an export through the state is refused.

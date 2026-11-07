@@ -226,6 +226,8 @@ impl RollbackBook {
     /// result read, so a slot is never marked readable on an enqueue alone. Refused unless the
     /// window is open and still has no slot marked, not complete, and `count` is exactly one slot
     /// per row but the last: a partial mark would leave a verdict that names an unwritten slot.
+    /// A one-row window has no slot, so `mark_captured_range(0)` is accepted on it and, marking
+    /// nothing, can be called again; that is harmless.
     pub(crate) fn mark_captured_range(&mut self, count: usize) -> Result<(), EngError> {
         let window = self
             .window
@@ -240,7 +242,7 @@ impl RollbackBook {
                 ),
             ));
         }
-        if count + 1 != window.rows {
+        if window.rows.checked_sub(1) != Some(count) {
             return Err(refuse(
                 "mark_captured_range",
                 &format!("{count} slots marked for a window of {} rows", window.rows),

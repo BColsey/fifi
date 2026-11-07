@@ -3,9 +3,8 @@
 //! `krow` runs one verify window of K rows (2 to 8) as one captured K-row graph instead of K
 //! one-row steps. This file holds what needs no device: the arming refusals, the check that
 //! precedes every enqueue, and the row-status rules. The eager window stays the reference and the
-//! fallback (`WindowHost::run_rows` defaults to the eager loop); the K-row device path (stage S2)
-//! is not built, so a start that asks for `krow` is refused after these checks pass
-//! ([`not_built`]).
+//! fallback (`WindowHost::run_rows` defaults to the eager loop); the K-row device path is not
+//! built, so a start that asks for `krow` is refused after these checks pass ([`not_built`]).
 //!
 //! Arming. `krow` is one qualified configuration: the served `wide1` single-row kernel, the
 //! reference MoE block, the device rollback. Everything that selects another kernel or another MoE
@@ -22,7 +21,7 @@
 //!   a K-row body over it would be a second body with its own tests. The step reads its own
 //!   field, not only the environment, so the hook meets the same refusal as the variable.
 //!
-//! The KV8 switches belong to stage S4 and are not decided here.
+//! The KV8 switches belong to the long-context stage and are not decided here.
 
 use std::ffi::OsStr;
 
@@ -57,7 +56,8 @@ pub(crate) struct KrowFacts<'a> {
 }
 
 /// The refusals of arming the K-row path, in the order the step reports them. Every one is
-/// answered before any allocation, with the step untouched.
+/// answered before any window runs, with the step untouched (the slots are already armed when
+/// the step asks).
 pub(crate) fn check_krow_arming(facts: KrowFacts<'_>) -> Result<(), EngError> {
     if !facts.rollback_armed {
         return Err(refuse(
@@ -105,11 +105,11 @@ pub(crate) fn check_krow_env(
     check_krow_switches(single_gather, shared_in_routed)
 }
 
-/// The refusal of a start that asks for `krow` while the K-row device path does not exist (stage
-/// S0 ships the seam only). The step is never built on this setting.
+/// The refusal of a start that asks for `krow` while the K-row device path does not exist (only
+/// the host seam does). The step is never built on this setting.
 pub(crate) fn not_built() -> EngError {
     refuse(
-        "the K-row device path is not built in this engine (stage S0 is the host seam); set draft_verify to eager",
+        "the K-row device path is not built in this engine (only the host seam exists); set draft_verify to eager",
     )
 }
 

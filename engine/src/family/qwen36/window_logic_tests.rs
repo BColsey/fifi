@@ -31,6 +31,16 @@ pub(super) struct Fake {
     pub(super) poison_on_row_failure: bool,
     /// Rows fed by the current window so far.
     pub(super) fed_rows: usize,
+    /// `run_rows` fails with this kind of failure before anything moves (state valid, counters at
+    /// the base); `None` runs the trait default.
+    pub(super) rows_failure: Option<RowsFailureKind>,
+}
+
+/// Which `RowsFailure` the fake's `run_rows` returns.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RowsFailureKind {
+    StateDecides,
+    AfterLaunch,
 }
 
 impl Fake {
@@ -185,6 +195,21 @@ impl WindowHost for Fake {
         // The pending save is taken before it can fail.
         self.pending = false;
         self.hit("complete_prefix_save")
+    }
+
+    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<u32>, RowsFailure> {
+        let error = || EngError::BadRequest("fake: rows failed".into());
+        match self.rows_failure {
+            Some(RowsFailureKind::StateDecides) => {
+                self.note("run_rows failed");
+                Err(RowsFailure::StateDecides(error()))
+            }
+            Some(RowsFailureKind::AfterLaunch) => {
+                self.note("run_rows failed");
+                Err(RowsFailure::AfterLaunch(error()))
+            }
+            None => eager_rows(self, inputs).map_err(RowsFailure::StateDecides),
+        }
     }
 
     fn rollback_begin(&mut self, rows: usize) -> Result<(), EngError> {
@@ -893,4 +918,60 @@ fn a_successful_device_commit_poisons_nothing() {
             "kept {kept}"
         );
     }
+}
+
+// ---- how a failed run_rows closes the window ----
+
+fn failing_rows(kind: RowsFailureKind) -> Fake {
+    let mut host = Fake::new(10, true);
+    host.rows_failure = Some(kind);
+    host
+}
+
+#[test]
+fn a_failure_after_the_launch_gates_the_state_even_with_the_counters_at_the_base_and_the_state_valid()
+ {
+    let mut host = failing_rows(RowsFailureKind::AfterLaunch);
+    assert!(host.is_valid() && host.tokens() == 10);
+    run_window(&mut host, &[1, 2, 3]).expect_err("fails");
+    assert!(host.poisoned && host.gate, "gated");
+    assert!(host.window.is_none());
+    for call in [
+        "rollback_discard",
+        "poison",
+        "set_needs_reset",
+        "close_window",
+    ] {
+        assert!(host.called(call), "{call} in {:?}", host.log);
+    }
+}
+
+#[test]
+fn a_state_decided_failure_with_the_counters_at_the_base_and_the_state_valid_stays_a_clean_refusal()
+{
+    let mut host = failing_rows(RowsFailureKind::StateDecides);
+    run_window(&mut host, &[1, 2, 3]).expect_err("refused");
+    assert!(
+        !host.poisoned && !host.gate,
+        "the old rule: nothing moved, nothing gated"
+    );
+    assert!(host.called("rollback_discard"));
+    assert!(!host.called("poison") && !host.called("set_needs_reset"));
+}
+
+#[test]
+fn a_state_decided_failure_after_a_row_ran_or_on_a_poisoned_state_still_fails_closed() {
+    // The rule the eager rows always had.
+    let mut host = Fake::new(10, true);
+    host.fail_nth_row = Some(1);
+    run_window(&mut host, &[1, 2, 3]).expect_err("second row refused");
+    assert!(
+        host.poisoned || host.gate,
+        "a row ran: the window fails closed"
+    );
+    let mut host = Fake::new(10, true);
+    host.fail_nth_row = Some(0);
+    host.poison_on_row_failure = true;
+    run_window(&mut host, &[1, 2, 3]).expect_err("first row fails the step");
+    assert!(host.gate, "a poisoned state fails closed");
 }

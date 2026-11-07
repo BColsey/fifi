@@ -22,7 +22,7 @@
 //!   state compared after the first windows, in the middle and at the end.
 //! * **F** [`failure_recovery`] (not a letter of the spec): a fault injected mid-window or
 //!   mid-replay leaves the pre-window state or a refusing model, never a silent partial state.
-//! * **K** [`krow_matches_eager`] (not a letter of the spec; krow design 6.1): the same prefix and
+//! * **K** [`krow_matches_eager`] (not a letter of the spec): the same prefix and
 //!   inputs run once on the K-row path and once on the eager device window give the same logits
 //!   rows, the same slots, and after every verdict the same committed state and next step.
 //!
@@ -1082,7 +1082,7 @@ fn require_closed_or_rolled_back<S: D1Subject>(
     }
 }
 
-/// Check K (krow design 6.1): the K-row path against the eager device window, on the same prefix
+/// Check K: the K-row path against the eager device window, on the same prefix
 /// and inputs. `krow` and `eager` are two subjects of one model, one running each path; `eager`
 /// is brought to `krow`'s state first. Both run the window; every logits row and the state slots
 /// must be bit-identical. Then, for every verdict that keeps `kept`
@@ -1168,6 +1168,12 @@ fn compare_paths<S: D1Subject>(
             return Err(violation(format!("logits row {row}: {difference}")));
         }
     }
+    // The slot and next-step comparisons below are equivalent to the committed-state comparison
+    // in a fake whose whole state is what a verdict restores: every slot is read by some verdict,
+    // so a slot difference always shows in the committed state first. On a device they are not
+    // redundant (slots can hold bytes the restore does not read, and the next step reads state
+    // the snapshot does not carry), so they stay, and a device subject needs its own mutants
+    // that only these comparisons can kill.
     match (&got.slots, &want.slots) {
         (None, None) => {}
         (Some(a), Some(b)) if a == b => {}

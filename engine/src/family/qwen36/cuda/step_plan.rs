@@ -478,7 +478,7 @@ impl StepPlan {
     /// another layout, forked experts, and a scratch that was not sized for the window
     /// ([`KernelScratch::for_verify`]: one `argmax_part` set per row). Host planning only: the
     /// sizes follow the K-row design (dense and head launches take K rows, the routed experts and
-    /// the attention chain K one-row launches); the device checks them in stage S2.
+    /// the attention chain K one-row launches); the device checks them when the K-row step exists.
     pub(crate) fn new_verify(
         dims: &StepDims,
         rows: usize,

@@ -40,7 +40,7 @@ fn the_qualified_configuration_arms() {
 
 #[test]
 fn any_value_of_the_single_row_switch_refuses_and_the_message_says_unset_it() {
-    // Deliberate (design 4.4): an explicit wide1 is the served kernel, and it is refused
+    // Deliberate: an explicit wide1 is the served kernel, and it is refused
     // too, so that exactly one configuration is qualified.
     for value in ["off", "1", "wide1", "wide2", "wide4", "", "bogus"] {
         let value = os(value);

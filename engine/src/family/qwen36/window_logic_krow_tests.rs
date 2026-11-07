@@ -7,11 +7,11 @@
 //! What this proves: the order of the effects, the fail-closed routes at each new fault point, the
 //! row-local status rules, the A/B equality of the two paths on the same model, and that every
 //! flaw below is caught by the check meant to catch it. What it cannot prove: the kernels, the
-//! slot byte layout and the stream order (device-only, stages S1 to S3).
+//! slot byte layout and the stream order (device-only, in the later kernel and graph stages).
 
 use super::{
-    RowsOut, WindowHost, commit_window, eager_rows, export_gate, import_state, reset_epilogue,
-    reset_prologue, run_window, state_usable, step_gate,
+    RowsFailure, RowsOut, WindowHost, commit_window, eager_rows, export_gate, import_state,
+    reset_epilogue, reset_prologue, run_window, state_usable, step_gate,
 };
 use crate::{
     EngError,
@@ -56,25 +56,25 @@ enum Path {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flaw {
     Sound,
-    /// M3: the snapshot of row `t` goes into slot `t + 1` (slot 0 is never written).
+    /// The snapshot of row `t` goes into slot `t + 1` (slot 0 is never written).
     SnapShifted,
-    /// M4: a partial accept restores slot `kept` instead of `kept - 1`.
+    /// A partial accept restores slot `kept` instead of `kept - 1`.
     SlotOffByOne,
-    /// M5: the frontier after a rollback is one row too far.
+    /// The frontier after a rollback is one row too far.
     FrontierPlusOne,
-    /// M14: the first K-row graph is replayed for every later window, whatever its K.
+    /// The first K-row graph is replayed for every later window, whatever its K.
     StaleGraph,
-    /// M15: the fake claims the K-row path but runs the eager default.
+    /// The fake claims the K-row path but runs the eager default.
     EagerWhileClaimingKrow,
-    /// M17: the pair of a row stores the OR of the rows before it too (the `atomicOr` return).
+    /// The pair of a row stores the OR of the rows before it too (the `atomicOr` return).
     RacyStatus,
-    /// M13: the window keeps going after a non-zero status.
+    /// The window keeps going after a non-zero status.
     IgnoresStatus,
-    /// M18a: the host looks at the last row's pair only.
+    /// The host looks at the last row's pair only.
     LastPairOnly,
-    /// M18b: the host looks at the pairs only and ignores the window word.
+    /// The host looks at the pairs only and ignores the window word.
     PairsOnly,
-    /// M19: no host token check before the enqueue.
+    /// No host token check before the enqueue.
     NoTokenCheck,
     /// The switch re-check before every window is missing.
     NoSwitchRecheck,
@@ -86,6 +86,14 @@ struct SlotState {
     cells: Vec<u32>,
     recurrent: [f32; 3],
     conv: [f32; 2],
+}
+
+/// What the K-row body leaves: the logits rows, the window word and the live state after the last
+/// row (recurrent, convolution, committed rows), not yet committed.
+struct Body {
+    logits: Vec<Vec<f32>>,
+    word: u32,
+    after: ([f32; 3], [f32; 2], usize),
 }
 
 /// How often each path ran: the negative control that the K-row path really was the one used.
@@ -280,18 +288,38 @@ impl DevFake {
         Err(refused("injected refusal"))
     }
 
-    /// Any failure after the K-row launch: the state is ahead of the lineage, so it is poisoned.
-    fn after_launch<T>(&mut self, result: Result<T>) -> Result<T> {
-        if result.is_err() {
-            self.poisoned = true;
+    /// A fault that fails without touching the state: what the host sees when a read-back or a
+    /// launch error comes back. The window's own rule must gate the state, not the fake.
+    fn plain_fault(&mut self, at: Fault) -> Result<()> {
+        if self.fault != Some(at) {
+            return Ok(());
         }
-        result
+        self.fault = None;
+        Err(refused("injected failure"))
     }
 
-    /// The K-row window: one body for all rows, the snapshots stored straight into the slots, the
-    /// pairs and the window word read back once, the slots marked after that.
-    fn krow_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Vec<f32>>> {
+    /// The K-row window. Before the launch every failure is a state-decided refusal; from the
+    /// launch on, every failure is `AfterLaunch`. The live state is committed only after the
+    /// results were read and judged (as the step commits after its read-back), so a lost
+    /// read-back leaves `tokens()` at the base and the state valid: only the unconditional
+    /// fail-closed of `AfterLaunch` gates it.
+    fn krow_rows(&mut self, inputs: &[u32]) -> std::result::Result<RowsOut<Vec<f32>>, RowsFailure> {
+        self.krow_checks(inputs)
+            .map_err(RowsFailure::StateDecides)?;
         let rows = inputs.len();
+        self.counters.krow_windows += 1;
+        self.counters.krow_replays[rows] += 1;
+        let executed = if self.flaw == Flaw::StaleGraph {
+            (*self.graph_k.get_or_insert(rows)).min(rows)
+        } else {
+            rows
+        };
+        self.krow_launched(&inputs[..executed], rows)
+            .map_err(RowsFailure::AfterLaunch)
+    }
+
+    /// Everything that precedes the enqueue: the host rules of `krow.rs`, then the refusal fault.
+    fn krow_checks(&mut self, inputs: &[u32]) -> Result<()> {
         let token_check = |token: u32| {
             if self.flaw == Flaw::NoTokenCheck {
                 Ok(())
@@ -306,17 +334,18 @@ impl DevFake {
             merged_block: merged,
         };
         krow::check_rows(inputs, token_check, &facts)?;
-        self.refusal_at(Fault::KRowRefusal)?;
-        // Launch.
-        self.counters.krow_windows += 1;
-        self.counters.krow_replays[rows] += 1;
-        let executed = if self.flaw == Flaw::StaleGraph {
-            (*self.graph_k.get_or_insert(rows)).min(rows)
-        } else {
-            rows
-        };
-        let (mut logits, mut word) = self.krow_body(&inputs[..executed], rows);
-        self.fires(Fault::KRowLaunch)?;
+        self.refusal_at(Fault::KRowRefusal)
+    }
+
+    /// The launch and what follows it: the body, the read-back, the status judgement, the slot
+    /// mark, and last the commit of the live state.
+    fn krow_launched(&mut self, inputs: &[u32], window: usize) -> Result<RowsOut<Vec<f32>>> {
+        let Body {
+            mut logits,
+            mut word,
+            after,
+        } = self.krow_body(inputs, window);
+        self.plain_fault(Fault::KRowLaunch)?;
         // The logits stage is over; the argmax stage has not begun.
         if let Some(Fault::KRowRowPair(j)) = self.fault
             && let Some(row) = logits.get_mut(j)
@@ -334,25 +363,24 @@ impl DevFake {
             bits: bits.clone(),
             window: word,
         });
-        let read = self.fires(Fault::KRowReadback);
-        self.after_launch(read)?;
+        self.plain_fault(Fault::KRowReadback)?;
         let seen = self.host_view(bits, word);
         if self.flaw != Flaw::IgnoresStatus {
-            let verdict = krow::check_status(&seen);
-            self.after_launch(verdict)?;
+            krow::check_status(&seen)?;
         }
-        let marked = self.book.mark_captured_range(executed.saturating_sub(1));
-        self.after_launch(marked)?;
+        self.book
+            .mark_captured_range(inputs.len().saturating_sub(1))?;
+        (self.recurrent, self.conv, self.len) = after;
         Ok(RowsOut {
             argmax: tokens,
             rows: logits,
         })
     }
 
-    /// The K-row body: the state stays in locals across the rows, each row's snapshot goes to its
-    /// slot, the live state is written once at the end. Returns the logits rows and the window
-    /// word (bit 4 for an id outside the vocabulary, as the embedding kernel sets it).
-    fn krow_body(&mut self, inputs: &[u32], window: usize) -> (Vec<Vec<f32>>, u32) {
+    /// The K-row body: the state stays in locals across the rows and each row's snapshot goes to
+    /// its slot. Returns the logits rows, the window word (bit 4 for an id outside the vocabulary,
+    /// as the embedding kernel sets it) and the live state after the last row, NOT yet committed.
+    fn krow_body(&mut self, inputs: &[u32], window: usize) -> Body {
         let (mut recurrent, mut conv) = (self.recurrent, self.conv);
         let base = self.len;
         let mut logits = Vec::with_capacity(inputs.len());
@@ -382,10 +410,11 @@ impl DevFake {
                 }
             }
         }
-        self.recurrent = recurrent;
-        self.conv = conv;
-        self.len = base + inputs.len();
-        (logits, word)
+        Body {
+            logits,
+            word,
+            after: (recurrent, conv, base + inputs.len()),
+        }
     }
 
     /// `argmax_rows`: row `i`'s token and its own status bits (2 for a non-finite logit). The
@@ -582,7 +611,7 @@ impl WindowHost for DevFake {
         Ok(true)
     }
 
-    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Vec<f32>>> {
+    fn run_rows(&mut self, inputs: &[u32]) -> std::result::Result<RowsOut<Vec<f32>>, RowsFailure> {
         let krow = self.path == Path::Krow
             && self.flaw != Flaw::EagerWhileClaimingKrow
             && krow::uses_krow(inputs.len());
@@ -590,7 +619,7 @@ impl WindowHost for DevFake {
             return self.krow_rows(inputs);
         }
         self.counters.eager_windows += 1;
-        eager_rows(self, inputs)
+        eager_rows(self, inputs).map_err(RowsFailure::StateDecides)
     }
 
     fn feed_fault(&mut self, row: usize) -> Result<()> {
@@ -902,7 +931,6 @@ fn f_catches(flaw: Flaw, n: usize) -> D1Failure {
 
 #[test]
 fn a_k_row_window_that_continues_after_a_non_zero_status_is_caught_by_check_f() {
-    // M13.
     let failure = f_catches(Flaw::IgnoresStatus, 4);
     assert!(failure.violation, "{failure}");
     assert!(
@@ -921,7 +949,7 @@ fn fails_closed(flaw: Flaw, fault: Fault, n: usize) -> bool {
 
 #[test]
 fn a_host_that_looks_at_the_last_pair_only_misses_a_bad_row_before_the_last() {
-    // M18a. The sound host fails the window for every row; the flawed one only for the last.
+    // The sound host fails the window for every row; the flawed one only for the last.
     for n in 2..=8 {
         for j in 0..n {
             assert!(
@@ -944,7 +972,7 @@ fn a_host_that_looks_at_the_last_pair_only_misses_a_bad_row_before_the_last() {
 
 #[test]
 fn a_host_that_ignores_the_window_word_misses_a_status_that_lives_in_the_word_only() {
-    // M18b. Mask 16 (and 1, 4) are in the window word and in no pair. A host that checks the word
+    // Mask 16 (and 1, 4) are in the window word and in no pair. A host that checks the word
     // only would NOT be a mutant: the word is the OR of every pair, so it still fails closed.
     assert!(fails_closed(Flaw::Sound, Fault::KRowStatus, 4));
     assert!(!fails_closed(Flaw::PairsOnly, Fault::KRowStatus, 4));
@@ -989,7 +1017,7 @@ fn only_the_pair_of_the_bad_row_reports_it_and_the_window_word_holds_the_fold() 
 
 #[test]
 fn a_pair_that_stores_the_return_of_the_shared_or_shows_one_row_in_another_pair() {
-    // M17, deterministic: the flawed fake folds in index order, so the pair after the bad row
+    // Deterministic: the flawed fake folds in index order, so the pair after the bad row
     // always carries its bit. No dependence on scheduling, no 100-window lottery.
     assert!(!pairs_are_row_local(Flaw::RacyStatus));
     for n in 2..=8 {
@@ -1044,7 +1072,7 @@ fn an_out_of_vocabulary_id_is_a_clean_refusal_with_the_state_valid_and_nothing_e
 
 #[test]
 fn without_the_host_token_check_the_bad_id_reaches_the_device_and_poisons_the_state() {
-    // M19: the embedding sets status 4 on the device, the window fails closed.
+    // The embedding sets status 4 on the device, the window fails closed.
     let mut inputs = rows(4);
     inputs[2] = VOCAB as u32;
     let mut rig = Rig::krow(Flaw::NoTokenCheck);
@@ -1103,7 +1131,6 @@ fn d_catches(flaw: Flaw) -> D1Failure {
 
 #[test]
 fn a_snapshot_stored_in_the_wrong_slot_is_caught_by_check_d_and_by_check_k() {
-    // M3.
     let failure = d_catches(Flaw::SnapShifted);
     assert!(failure.test.starts_with('D'), "{failure}");
     let mut krow = Rig::krow(Flaw::SnapShifted);
@@ -1119,7 +1146,6 @@ fn a_snapshot_stored_in_the_wrong_slot_is_caught_by_check_d_and_by_check_k() {
 
 #[test]
 fn a_wrong_restore_slot_or_frontier_is_caught_by_check_d() {
-    // M4 and M5.
     for flaw in [Flaw::SlotOffByOne, Flaw::FrontierPlusOne] {
         let failure = d_catches(flaw);
         assert!(failure.test.starts_with('D'), "{flaw:?}: {failure}");
@@ -1128,7 +1154,7 @@ fn a_wrong_restore_slot_or_frontier_is_caught_by_check_d() {
 
 #[test]
 fn a_graph_replayed_for_another_row_count_is_caught_by_check_a_at_every_row_count() {
-    // M14: the graph of the first window (2 rows) is replayed for every later window.
+    // The graph of the first window (2 rows) is replayed for every later window.
     let stale = |n: usize| {
         let mut rig = Rig::krow(Flaw::StaleGraph);
         rig.fake.graph_k = Some(2);
@@ -1142,7 +1168,7 @@ fn a_graph_replayed_for_another_row_count_is_caught_by_check_a_at_every_row_coun
 
 #[test]
 fn a_fake_that_claims_krow_and_runs_the_eager_loop_is_caught_by_the_counters() {
-    // M15: the bytes are equal, so only the counters tell.
+    // The bytes are equal, so only the counters tell.
     let mut claimed = Rig::krow(Flaw::EagerWhileClaimingKrow);
     let mut eager = Rig::new(Path::Eager, Flaw::Sound, false);
     let at = claimed.fake.len;
@@ -1154,9 +1180,29 @@ fn a_fake_that_claims_krow_and_runs_the_eager_loop_is_caught_by_the_counters() {
 
 #[test]
 fn the_eager_default_of_run_rows_is_the_pinned_eager_device_window() {
-    // The eager fake overrides nothing but delegates to the same function the trait default
-    // calls: its fault points are the old ones and a capture fault at row i still poisons.
+    // The eager fake overrides `run_rows` only to count the window, then delegates to the function
+    // the trait default calls (`eager_rows`): its fault points are the old ones and a capture
+    // fault at row i still poisons.
     let mut rig = Rig::new(Path::Eager, Flaw::Sound, false);
     let tally = failure_recovery(&mut rig.fake, VOCAB, &rows(4)).expect("F, eager");
     assert_eq!(tally.comparisons, slot_faults_for(rig.fake.len, 4).len());
+}
+
+#[test]
+fn a_lost_read_back_leaves_the_counters_at_the_base_and_the_window_still_gates() {
+    // The step commits its rows only after the read-back, so a failed read-back leaves tokens() at
+    // the base and the state valid. The old rule alone would let that window go; the unconditional
+    // fail-closed of a failure after the launch gates it.
+    for fault in [Fault::KRowLaunch, Fault::KRowReadback, Fault::KRowStatus] {
+        let mut rig = Rig::krow(Flaw::Sound);
+        let base = rig.fake.len;
+        rig.fake.inject_fault(fault);
+        rig.fake.run_window(&rows(4)).expect_err("fails");
+        assert_eq!(rig.fake.len, base, "{fault:?}: nothing was committed");
+        assert!(rig.fake.poisoned && rig.fake.gate, "{fault:?}: gated");
+        assert!(
+            rig.fake.window.is_none() && !rig.fake.book.is_open(),
+            "{fault:?}"
+        );
+    }
 }

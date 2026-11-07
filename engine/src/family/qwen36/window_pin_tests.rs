@@ -612,13 +612,12 @@ fn the_restoring_entry_points_are_exactly_the_six_of_the_table() {
     );
 }
 
-// ---- the K-row seam (stage S0) ----
+// ---- the K-row seam ----
 
 #[test]
 fn the_device_window_runs_its_rows_through_run_rows_and_not_through_a_loop_of_its_own() {
     let window = code(WINDOW);
     let device = body(&window, "run_window_device");
-    statement(device, "let ran = host.run_rows(inputs);");
     for gone in [
         "host.run_row(",
         "host.capture(",
@@ -630,30 +629,48 @@ fn the_device_window_runs_its_rows_through_run_rows_and_not_through_a_loop_of_it
             "`{gone}` belongs to the eager default of run_rows, not to the window"
         );
     }
-    // Either way a failed run closes the book first, then decides valid-or-failed.
-    let failure = block(device, "Err(error)=>{");
+    statement(
+        device,
+        "let RowsOut { argmax, rows } = match host.run_rows(inputs) {",
+    );
+    // A state-decided failure closes the book, then the old rule decides.
+    let decides = block(device, "Err(RowsFailure::StateDecides(error)) => {");
     in_order(
-        failure,
+        decides,
         "host.rollback_discard();",
-        "return Err(row_failure(host,base,error));",
+        "return Err(row_failure(host, base, error));",
+    );
+    // A failure after the launch closes the book, then fails closed unconditionally.
+    let launched = block(device, "Err(RowsFailure::AfterLaunch(error)) => {");
+    in_order(
+        launched,
+        "host.rollback_discard();",
+        "return Err(failed(host, error));",
+    );
+    assert!(
+        !launched.contains(&code("row_failure")),
+        "a failure after the launch must not go through the counters rule"
     );
     // The completion mark and the store stay in the window, after the rows, for both paths.
-    in_order(
-        device,
-        "let ran = host.run_rows(inputs);",
-        "host.store_window(Window{",
-    );
-    let complete = device
-        .find(&code("host.rollback_window_complete()"))
-        .expect("complete");
-    assert!(complete > device.find(&code("host.run_rows(inputs)")).expect("rows"));
+    let at = |needle: &str| {
+        device
+            .find(&code(needle))
+            .unwrap_or_else(|| panic!("`{needle}`"))
+    };
+    assert!(at("host.run_rows(inputs)") < at("host.rollback_window_complete()"));
+    assert!(at("host.rollback_window_complete()") < at("host.store_window(Window{"));
 }
 
 #[test]
 fn the_default_of_run_rows_is_the_eager_loop_with_its_capture_after_every_row_but_the_last() {
     let window = code(WINDOW);
     let default = body(&window, "run_rows");
-    statement(default, "eager_rows(self, inputs)");
+    // The eager rows report only state-decided failures: the default path keeps today's rule.
+    statement(
+        default,
+        "eager_rows(self, inputs).map_err(RowsFailure::StateDecides)",
+    );
+    assert!(!default.contains(&code("AfterLaunch")));
     let eager = body(&window, "eager_rows");
     let at = |needle: &str| {
         eager
@@ -671,7 +688,7 @@ fn the_default_of_run_rows_is_the_eager_loop_with_its_capture_after_every_row_bu
 }
 
 #[test]
-fn the_step_does_not_override_run_rows_in_stage_s0() {
+fn the_step_does_not_override_run_rows_in_this_stage() {
     // The step's `WindowHost` block is pinned by the forwards table above, which lists no
     // `run_rows`: the eager window is the only window the step runs until the K-row body exists.
     let eager = code(include_str!("cuda/eager_window.rs"));
@@ -680,20 +697,26 @@ fn the_step_does_not_override_run_rows_in_stage_s0() {
 }
 
 #[test]
-fn the_start_checks_the_krow_switches_before_the_weights_and_the_step_checks_its_own_fields() {
+fn the_start_refuses_krow_before_the_weights_and_keeps_the_step_checks_behind_the_refusal() {
     let start = code(START);
     let at = |needle: &str| {
         start
             .find(&code(needle))
             .unwrap_or_else(|| panic!("`{needle}`"))
     };
+    // The early block: guard, the switches, then the refusal; all before the first weight read.
     assert!(at("settings.draft_verify == VerifyMode::Krow") < at("check_krow_env("));
-    assert!(at("check_krow_env(") < at("load_exl3_dir(&projector"));
-    // After the slots are armed: ask for krow, check the step, then the stub refusal.
+    assert!(at("check_krow_env(") < at("return Err(not_built());"));
+    assert!(at("return Err(not_built());") < at("load_exl3_dir(&projector"));
+    assert!(at("return Err(not_built());") < at("Box::leak"));
+    // After the slots are armed: ask for krow, then check the step, and no second refusal needed.
     let armed = at("step.enable_device_rollback(");
     assert!(armed < at("step.request_krow_verify();"));
     assert!(at("step.request_krow_verify();") < at("step.check_krow_arming("));
-    assert!(at("step.check_krow_arming(") < at("return Err(not_built());"));
+    assert!(
+        start.matches(&code("not_built()")).count() >= 2,
+        "the early refusal and the late one"
+    );
 }
 
 #[test]
@@ -750,7 +773,7 @@ fn the_captured_graphs_are_declared_before_the_buffers_whose_addresses_they_bake
         at("graph") < at("exl3_merge"),
         "the precedent: the merged block's buffer"
     );
-    // The per-K graphs (stage S3) obey the same rule as soon as they exist.
+    // The per-K graphs obey the same rule as soon as they exist.
     if let Some(krow) = field_at(fields, "krow_graphs") {
         assert!(krow < at("state") && krow < at("rollback"));
     }

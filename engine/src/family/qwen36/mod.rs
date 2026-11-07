@@ -43,7 +43,7 @@ mod host_real;
     not(test),
     allow(
         dead_code,
-        reason = "stage S0 is the host seam; the K-row step (S2) is the first caller of most of it"
+        reason = "only the host seam of the K-row verifier exists; the K-row step is the first caller of most of it"
     )
 )]
 pub(crate) mod krow;

@@ -701,13 +701,17 @@ pub(crate) fn start(
         shared_in_routed_explicit(),
         matches!(settings.weights, WeightFormat::Exl3),
     )?;
-    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read;
-    // the step checks its own fields again once it exists (below).
+    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read.
+    // The K-row device path is not built yet, so a configuration that passes is refused here as
+    // well, before the load, the leaked step resources and the build guard commit. The later
+    // wiring below (the step's own check of its fields) is what the K-row stage keeps; that
+    // stage removes this early refusal.
     if settings.draft_verify == VerifyMode::Krow {
         check_krow_env(
             std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
             std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
         )?;
+        return Err(not_built());
     }
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
@@ -1143,9 +1147,9 @@ fn make(
             }
             rollback_cover = Some(cover);
         }
-        // `draft_verify = krow` needs the armed slots above. The K-row device path is not built
-        // (stage S0 is the host seam), so a configuration that passes every check is refused
-        // too; the refusal is the stub, and `eager` never reaches it.
+        // `draft_verify = krow` needs the armed slots above. Unreachable while the early refusal
+        // stands (the K-row device path is not built); the K-row stage removes that refusal and
+        // this block then runs the step's own checks, with `eager` never reaching it.
         if settings.draft_verify == VerifyMode::Krow {
             step.request_krow_verify();
             step.check_krow_arming(settings.speculation.max_rows)?;
