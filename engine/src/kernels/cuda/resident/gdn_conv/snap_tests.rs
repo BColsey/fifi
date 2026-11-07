@@ -1,6 +1,6 @@
-//! Tests of the strided state snapshots of the DeltaNet conv step (unit test 4 of the K-row
-//! design, `kSnap = true` instantiation of `conv_silu_k`) and of the in-place read of the qkv
-//! output (unit test 10): one call of `m = K` rows with [`CudaContext::gdn_conv_snap`] writes the
+//! Tests of the strided state snapshots of the DeltaNet conv step (`kSnap = true`
+//! instantiation of `conv_silu_k`) and of the in-place read of the qkv
+//! output: one call of `m = K` rows with [`CudaContext::gdn_conv_snap`] writes the
 //! bytes of K separate single-row `gdn_conv` calls, snapshot `t` is the window after the `t + 1`-th
 //! single-row call at `t * stride` bytes into a buffer laid out like the rollback slots, and a
 //! projection read through its own row stride (`ld = channels`, the tight qkv output of the rows
@@ -108,7 +108,7 @@ fn per_row(
     )
 }
 
-/// Unit test 4 (conv): m = K against K single-row calls, outputs, final window and every
+/// m = K against K single-row calls, outputs, final window and every
 /// snapshot, at the real slot stride and conv offsets and at the contiguous stride.
 #[test]
 fn the_snapshots_are_the_windows_after_each_row_and_the_rest_is_unchanged() {
@@ -171,7 +171,7 @@ fn the_snapshots_are_the_windows_after_each_row_and_the_rest_is_unchanged() {
     }
 }
 
-/// Unit test 10 (conv half): the qkv output of the rows kernel is tight, `[K][8192]`, and the conv
+/// The conv half: the qkv output of the rows kernel is tight, `[K][8192]`, and the conv
 /// kernel reads it through its own `ld = channels`. The same values in rows of a wider
 /// projection (`ld = 12352`, the rest not read) give the same outputs and window, and both equal K
 /// single-row calls.

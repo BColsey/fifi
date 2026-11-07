@@ -1,11 +1,11 @@
-//! Unit tests 1, 2 and 7 of the K-row design for the kernels that are already row-batched: a
+//! The kernels that are already row-batched, for K-row windows: a
 //! launch of `m = K` rows against K launches of `m = 1`, byte for byte. The K-row verifier relies
 //! on this for the embedding gather, the add-and-norm (`add_norm_pack`), the SwiGLU and the MoE
 //! combine, which it runs once per layer for the whole window; nothing in those kernels depends on
 //! the row count, and these tests are the device proof of that (mutants: a launch whose rows
 //! are not independent, a row stride that is not the row's own, a status that mixes rows).
 //!
-//! Plus the layout rule of the shared expert (mutant M21): the interleaved
+//! Plus the layout rule of the shared expert, against the two-group mutant: the interleaved
 //! `[gate_0, up_0, gate_1, up_1, ...]` layout is accepted by the SwiGLU's shape check with
 //! `ld_in = 2 s`, and the two-groups layout `[gate K rows][up K rows]` is refused. That test
 //! needs no device. A host without a device skips the others.
@@ -52,7 +52,7 @@ fn words_i32(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-// ---- unit test 1: embed_bf16
+// ---- embed_bf16
 
 /// One embed launch of `ids` (m = ids.len()) into a fresh output; the rows and the status word.
 fn embed(rig: &Rig, table: &DeviceBuffer, n_rows: usize, ids: &[i32]) -> (Vec<u8>, i32) {
@@ -78,7 +78,7 @@ fn embed(rig: &Rig, table: &DeviceBuffer, n_rows: usize, ids: &[i32]) -> (Vec<u8
     (rig.read(&x, m * HIDDEN * 4), word)
 }
 
-/// Unit test 1: K ids in one launch give the rows of K one-id launches, including an
+/// K ids in one launch give the rows of K one-id launches, including an
 /// out-of-range id in row j (that row is NaN, the others are not, the status word has bit 4).
 #[test]
 fn embed_on_k_rows_equals_k_single_row_launches() {
@@ -132,7 +132,7 @@ fn embed_on_k_rows_equals_k_single_row_launches() {
     }
 }
 
-// ---- unit test 2: add_norm_pack
+// ---- add_norm_pack
 
 struct NormRun {
     h: Vec<u8>,
@@ -173,7 +173,7 @@ fn norm(rig: &Rig, h: &[f32], delta: Option<&[f32]>, weight: &[f32], m: usize) -
     }
 }
 
-/// Unit test 2: `add_norm_pack` of K rows (the residual add path and the plain norm) equals K
+/// `add_norm_pack` of K rows (the residual add path and the plain norm) equals K
 /// launches of one row: the updated residual, the f32 normalized row and the fp16 pack, row by row.
 #[test]
 fn add_norm_pack_on_k_rows_equals_k_single_row_launches() {
@@ -222,7 +222,7 @@ fn add_norm_pack_on_k_rows_equals_k_single_row_launches() {
     }
 }
 
-// ---- unit test 7: swiglu_rows, moe_combine, the shared-expert layout
+// ---- swiglu_rows, moe_combine, the shared-expert layout
 
 fn swiglu(
     rig: &Rig,
@@ -282,7 +282,7 @@ fn swiglu_on_k_rows_equals_k_single_row_launches() {
     }
 }
 
-/// Mutant M21: gate and up written as two K-row groups land as `[gate K rows][up K rows]`; one
+/// A mutant that writes gate and up as K-row groups: they land as `[gate K rows][up K rows]`; one
 /// SwiGLU over that would need `up_off = K s` with `ld_in = s`, which the shape check refuses
 /// (`ld_in` must reach `up_off + n_ff`), whatever the `ld_in`. The interleaved layout is accepted
 /// at `ld_in = 2 s`, `up_off = s` for every K. No device is needed.

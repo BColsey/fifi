@@ -4,7 +4,7 @@
 //! The router logits kernel is one warp per dot product for `m < 8` and a tiled kernel (a warp
 //! tile of 4 rows of the matrix by 8 tokens) for `m >= 8`; the two give the same logit bits on the
 //! real routers (`router.cu`, with one documented sign-of-zero exception at `hidden / 4` not a
-//! multiple of 512), but the K-row design does not rely on that: a window of 8 rows runs two 4-row
+//! multiple of 512), but the K-row window does not rely on that: a window of 8 rows runs two 4-row
 //! launches, so the decode kernel runs for every row at every `K`. [`CudaContext::router_rows`] is
 //! [`CudaContext::router`] with that chunking; [`CudaContext::router_logits_rows_strided`] is the
 //! plain F32 projection (the GDN beta and alpha gates) writing row `t`'s values at
@@ -12,7 +12,7 @@
 //! with no copy, and chunks the same way.
 //!
 //! A window of at most 7 rows is one launch; 8 rows (`router.cu`, `kTiledMinRows`) are two
-//! launches of 4. The measured costs of the two forms are in the K-row design (section 3.1).
+//! launches of 4. Both forms give the same bytes; this file does not compare their cost.
 #![cfg_attr(
     not(test),
     expect(dead_code, reason = "staged for the K-row verify body")

@@ -1,5 +1,5 @@
 //! The K-row verifier's rows kernel against the production single-row launch, on the real
-//! Qwen3.6 shapes (unit test 3 of the K-row verifier design, section 6.2).
+//! Qwen3.6 shapes.
 //!
 //! One group of K rows (K = 2 to 8) through `exl3_grouped_step` runs `grouped_project_rows<R>`
 //! (R = 2 for K = 2, 4 for K = 3 and 4, 8 for K = 5 to 8, so K = 3 runs R = 4 with one masked row
@@ -17,7 +17,7 @@
 //! launch counters: the K-row launch must count exactly one launch of the rows kernel of its
 //! row count, and the K one-row launches exactly K launches of `wide1`, nothing else.
 //!
-//! Mutants this kills: M8 (the rows kernel sums rows in reverse tile order for R >= 4, which
+//! Mutants this kills: a rows kernel that sums rows in reverse tile order for R >= 4, which
 //! changes only the low bits and shows only on real data and real shapes, where the tile count
 //! per column is large enough for the order to matter), a wrong row-count to kernel dispatch
 //! (K = 3 on the R = 2 kernel, K = 5 to 7 on the R = 4 kernel), a K-row call that runs K one-row
@@ -346,7 +346,7 @@ fn the_rows_kernel_matches_the_production_wide1_launch_on_the_real_dense_shapes(
 /// The LM head (2048x248320, rate 12 = 6.0 bits per weight, about 381 MB of trellis built once
 /// and reused for every K) at K = 2..=8, bitwise equal to K launches of `wide1`. It is the
 /// largest matrix, so the largest tile count per column: the shape on which a reversed tile
-/// order (mutant M8) changes the low bits most reliably.
+/// order (the reversed-order mutant) changes the low bits most reliably.
 #[test]
 fn the_rows_kernel_matches_the_production_wide1_launch_on_the_head() {
     if !testkit::device_present("EXL3 rows kernel vs wide1, head") {

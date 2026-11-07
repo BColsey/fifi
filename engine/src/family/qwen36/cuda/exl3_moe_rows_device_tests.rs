@@ -1,12 +1,13 @@
-//! Unit tests 7 and 9 of the K-row design: the MoE block of a K-row verify window against K
+//! The MoE block of a K-row verify window against K
 //! single-row blocks, byte for byte, on synthetic EXL3 banks of the real Qwen3.6 shapes (hidden
 //! 2048, experts 2048 x 512 and 512 x 2048, a shared expert of the same shapes; 32 experts instead
 //! of 256 and the same top 8, so the bank is small).
 //!
 //! The K-row body of the verifier runs the router for all K rows at once (4-row chunks from 8
 //! rows), then one chain of id-indexed launches per row (the routed experts read different weights
-//! per row, so D1 forbids sharing a launch), the shared expert for all K rows at once in the
-//! interleaved layout (option B), and one combine. The test builds exactly that from the pieces:
+//! per row, so one launch cannot serve them all), the shared expert for all K rows at once in the
+//! interleaved layout (gate and up as 2K one-row groups), and one combine. The test builds
+//! exactly that from the pieces:
 //!
 //! * `router_rows`, then `routed_on_device` called once per row with row-offset ranges of the K-row
 //!   buffers (`ids`, `expert_gu`, `expert_act`, `expert_down` offset per row so that every row's
@@ -15,10 +16,10 @@
 //!   buffers.
 //!
 //! Every intermediate (ids, pick weights, shared gate, the routed `down` rows, the shared expert's
-//! output) and the block output are compared, so a failure names the stage. Mutants killed: M7 (a
-//! row's chain uses row 0's ids), M20 (all rows share one `expert_down` or `ids` slice), M21 (the
-//! shared-expert layout), and any row-offset mistake of the K-row body. A host without a device
-//! skips them.
+//! output) and the block output are compared, so a failure names the stage. Mutants killed: a row
+//! whose chain uses row 0's ids, all rows sharing one `expert_down` or `ids` slice, a shared expert
+//! laid out as two K-row groups, and any row-offset mistake of the K-row body. A host without a
+//! device skips them.
 
 use std::collections::HashMap;
 
@@ -406,7 +407,7 @@ fn stages(b: &Buffers) -> [(&'static str, &DeviceBuffer); 6] {
     ]
 }
 
-/// Unit tests 7 and 9: a K-row window of the MoE block equals K single-row blocks, stage by
+/// A K-row window of the MoE block equals K single-row blocks, stage by
 /// stage, for K = 2 to 8.
 #[test]
 fn the_moe_block_of_k_rows_equals_k_single_row_blocks() {
@@ -461,7 +462,7 @@ fn the_moe_block_of_k_rows_equals_k_single_row_blocks() {
     }
 }
 
-/// Unit test 7: the shared expert in option B (`2K` one-row groups in one launch, one SwiGLU at
+/// The shared expert with gate and up as `2K` one-row groups in one launch, one SwiGLU at
 /// `ld_in = 2 s`, one K-row down group) equals K runs of the one-row `shared()` block, and the
 /// launch is accepted unchanged (the SwiGLU's shape check is not relaxed).
 #[test]

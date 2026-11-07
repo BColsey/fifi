@@ -1,5 +1,5 @@
-//! Tests of the router launches of a K-row verify window (unit tests 6 and 10 of the K-row
-//! design): the 4-row chunking and the strided logits launch against K single-row launches, bit
+//! Tests of the router launches of a K-row verify window: the 4-row chunking and the strided
+//! logits launch against K single-row launches, bit
 //! for bit, at the shapes of the real Qwen3.6 routers (the MoE router, 2048 x 256 with a shared
 //! gate, and the GDN beta and alpha gates, 2048 x 32). The chunk table is a host test; the rest
 //! needs a device and is skipped without one.
@@ -138,7 +138,7 @@ fn run_router(
     }
 }
 
-/// Unit test 6: the MoE router on m = 1 to 8 rows (8 as two 4-row launches) writes the bytes of m
+/// The MoE router on m = 1 to 8 rows (8 as two 4-row launches) writes the bytes of m
 /// single-row launches: logits, ids, weights, shared gate and status.
 #[test]
 fn the_router_on_k_rows_equals_k_single_row_launches() {
@@ -157,7 +157,7 @@ fn the_router_on_k_rows_equals_k_single_row_launches() {
     }
 }
 
-/// The control of the design (6.2, unit 6): the single 8-row launch, which runs the tiled
+/// The control: the single 8-row launch, which runs the tiled
 /// kernel, writes the same logit bits as the chunked decode kernel on these routers (hidden / 4 is
 /// a multiple of 512), so the choice of two 4-row launches is about identity by construction and
 /// speed, not about a known mismatch.
@@ -238,7 +238,7 @@ fn run_strided(rig: &Rig, x: &[f32], w: &[f32], m: usize, (ld, off): (usize, usi
         .collect()
 }
 
-/// Unit test 10: beta and alpha written straight into the `[K][ld]` row. Row t's 32 values sit at
+/// Beta and alpha written straight into the `[K][ld]` row. Row t's 32 values sit at
 /// `t * ld + off`, equal bit for bit to the single-row tight launch on that row, and no other
 /// column of the destination is written, for K = 1 to 8 (8 as two 4-row launches) and the real
 /// column offsets (beta 12288, alpha 12320 of a 12352-wide row).

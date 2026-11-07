@@ -1,8 +1,8 @@
-//! Tests of the row-batched argmax and the window status fold (unit test 8 of the K-row design).
+//! Tests of the row-batched argmax and the window status fold.
 //!
 //! The device tests compare `argmax_rows` of m rows with m separate launches of the single-row
 //! `argmax` on the same rows, pair for pair (token and status bits), and run the status rules the
-//! design relies on: each pair carries only its own row's bits, the step parameters are not
+//! kernel depends on: each pair carries only its own row's bits, the step parameters are not
 //! written by `argmax_rows`, the fold ORs the pairs and the EXL3 flag into the status word exactly
 //! once and leaves the pairs alone. A host without a device skips them. The tests without a device
 //! (the table decoder, the sizes, the refusals that are decided before any native call) run
@@ -51,7 +51,8 @@ fn the_sizes_are_one_set_of_partials_per_row_and_a_pair_per_row_plus_the_window_
 
 /// The scratch of a shortlist launch shares the argmax partials slot of the plan
 /// (`Slot::ArgmaxPart`); a K-row plan sizes it as `rows * ARGMAX_PART_BYTES`, so each row's
-/// shortlist scratch (one per row, step 2) fits its own set of partials.
+/// shortlist scratch (one per row, for a later change that keeps the logits on the device) fits
+/// its own set of partials.
 #[test]
 fn a_shortlist_scratch_fits_one_set_of_partials() {
     use crate::kernels::cuda::resident::shortlist::SCRATCH_BYTES;
@@ -224,7 +225,7 @@ fn hard_rows(n: usize, rng: &mut Rng) -> Vec<Vec<f32>> {
     rows
 }
 
-/// Unit test 8a: every row's pair equals the pair of the single-row kernel on that row, at the
+/// Every row's pair equals the pair of the single-row kernel on that row, at the
 /// real vocabulary width and at a short one, for 1 to 16 rows and for a padded row stride.
 #[test]
 fn argmax_rows_pairs_equal_the_single_row_kernel_on_every_row() {
@@ -253,7 +254,7 @@ fn argmax_rows_pairs_equal_the_single_row_kernel_on_every_row() {
     }
 }
 
-/// Unit test 8b: ties go to the lowest index, a NaN never wins, nothing is comparable gives -1, in
+/// Ties go to the lowest index, a NaN never wins, nothing is comparable gives -1, in
 /// the rows kernel as the rule says (the host model, not only the single-row kernel).
 #[test]
 fn argmax_rows_follow_the_tie_and_nan_rules() {
@@ -282,7 +283,8 @@ fn argmax_rows_follow_the_tie_and_nan_rules() {
     assert_eq!(table.window, STATUS_NON_FINITE_LOGITS);
 }
 
-/// Unit test 8c, the row-local bits under concurrency (mutant M17): one NaN row among eight, 100
+/// The row-local bits under concurrency, against a mutant that stores the `atomicOr` return value
+/// in its pair: one NaN row among eight, 100
 /// windows. Only that row's pair carries the bit, in every window; the window word carries it once.
 /// A pair that stored the return value of `atomicOr` on the shared status word would show the bit
 /// in some earlier-scheduled row in some window.

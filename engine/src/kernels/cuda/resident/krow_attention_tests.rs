@@ -1,4 +1,4 @@
-//! Unit test 5 of the K-row verifier design: the attention of a window of `K` rows, launched once
+//! The attention of a window of `K` rows, launched once
 //! with `m = K`, against `K` launches with `m = 1`, byte for byte.
 //!
 //! The K-row path runs `attn_prep` (RMSNorm of q and k, rope, KV append) and `attn_decode` once
@@ -17,11 +17,12 @@
 //!
 //! Two mutants must die here:
 //!
-//! - M1: `attn_decode` (or `attn_decode_q8`) uses `n_keys = kv_len + t + 1`. Row `t` of the
+//! - A mutant of `attn_decode` (or `attn_decode_q8`) with `n_keys = kv_len + t + 1`. Row `t` of the
 //!   `m = K` call then reads the cell of row `t + 1`, which the single-row call of step `t` has
 //!   not written yet (it still holds the sentinel), so `out` differs from row 1 on.
-//! - M2: `attn_prep` writes row `t` at `pos` instead of `pos + t`. The window cells above `p`
-//!   keep the sentinel (checked directly) and the cache planes differ from the single-row runs.
+//! - A mutant of `attn_prep` that writes row `t` at `pos` instead of `pos + t`. The window
+//!   cells above `p` keep the sentinel (checked directly) and the cache planes differ from the
+//!   single-row runs.
 //!
 //! Cases: `K` in 2..=8 and 16, and window starts `p` such that `n_keys` takes each of 1, 31, 32,
 //! 33, 2047, 2048, 2049, 4095, 4096, 4097 (the edges of the 32-key tile, of the 64-split plan
@@ -764,7 +765,7 @@ fn split_plan(n_keys: usize, split: AttnSplit, tile: usize) -> (usize, usize) {
     (chunk, n_keys.div_ceil(chunk))
 }
 
-/// Host check, no device: the case matrix reaches every key count the design names, the
+/// Host check, no device: the case matrix reaches every key count the module doc lists, the
 /// geometry constants are the mixer's, and a window crosses the plan change of each split plan.
 #[test]
 fn krow_attention_case_matrix_covers_the_boundary_key_counts() {
@@ -810,8 +811,8 @@ fn krow_attention_case_matrix_covers_the_boundary_key_counts() {
 /// Proves, for the fp16 KV planes and the Qwen3.6 attention shape, that `attn_prep` and
 /// `attn_decode` with `m = K` leave the same bytes as `K` launches with `m = 1` whose `pos` and
 /// `kv_len` words advance by one per step: `q`, both cache planes (the cells above the window
-/// stay at the sentinel), the `part` scratch and `out`. Kills M1 (row `t` sees `kv_len + t + 1`
-/// keys) and M2 (row `t` is written at `pos`).
+/// stay at the sentinel), the `part` scratch and `out`. Kills the first mutant (row `t` sees
+/// `kv_len + t + 1` keys) and the second (row `t` is written at `pos`).
 #[test]
 fn attention_on_k_rows_equals_k_single_row_launches_fp16() {
     if !testkit::device_present("attention_on_k_rows_equals_k_single_row_launches_fp16") {
@@ -834,8 +835,8 @@ fn attention_on_k_rows_equals_k_single_row_launches_fp16() {
 /// Proves the same for the Int8G32 KV path: `attn_prep_rows` (f32 K/V rows), `kv8_append` and
 /// `attn_decode_q8` with `m = K` against `K` single-row groups: `q`, the f32 rows, the code and
 /// scale planes (cells above the window stay at the sentinel), `part` and `out`, under the `Q8`
-/// split plan. Kills M1 and M2 on the KV8 kernels (`kv8_append` writing row `t` at `pos` is the
-/// M2 of the append).
+/// split plan. Kills both mutants on the KV8 kernels (`kv8_append` writing row `t` at `pos` is
+/// the append half of the second).
 #[test]
 fn attention_on_k_rows_equals_k_single_row_launches_kv8() {
     if !testkit::device_present("attention_on_k_rows_equals_k_single_row_launches_kv8") {

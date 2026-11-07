@@ -1,4 +1,4 @@
-//! Tests of the pack kernel of a K-row verify window (unit test 10 of the K-row design): the
+//! Tests of the pack kernel of a K-row verify window: the
 //! `[K][ld]` rows come out byte for byte, for the two layouts the step uses (z of a DeltaNet layer
 //! beside the beta/alpha columns, q/k/v of an attention layer), with NaN payloads, signed zeros and
 //! denormals among the data; the columns no segment covers are not written; every refusal is a
@@ -128,7 +128,7 @@ fn check(rig: &Rig, rng: &mut Rng, m: usize, ld: usize, layout: &[(usize, usize)
     );
 }
 
-/// Unit test 10: the bytes of the `[K][ld]` rows, for K = 1 to 8 and 16.
+/// The bytes of the `[K][ld]` rows, for K = 1 to 8 and 16.
 #[test]
 fn the_pack_writes_the_rows_byte_for_byte() {
     if !testkit::device_present("pack_rows bytes") {

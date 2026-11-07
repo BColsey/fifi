@@ -1,5 +1,5 @@
-//! Tests of the strided state snapshots of the DeltaNet step (unit test 4 of the K-row design,
-//! `kSnap = true` instantiation of `gated_delta_k`): one call of `m = K` rows with
+//! Tests of the strided state snapshots of the DeltaNet step (`kSnap = true`
+//! instantiation of `gated_delta_k`): one call of `m = K` rows with
 //! [`CudaContext::gdn_delta_snap`] writes the bytes of K separate single-row `gdn_delta` calls
 //! (outputs and final state), and snapshot `t` (`t < K - 1`) is the state after the `t + 1`-th
 //! single-row call, stored at `t * stride` bytes into a buffer laid out like the rollback slots.
@@ -178,7 +178,7 @@ fn snapped(
     )
 }
 
-/// Unit test 4 (delta): m = K against K single-row calls, outputs, final state and every
+/// m = K against K single-row calls, outputs, final state and every
 /// snapshot, for K = 2 to 8, at the real slot stride and layer offsets (the first and the last
 /// layer of a slot) and at the contiguous stride.
 #[test]

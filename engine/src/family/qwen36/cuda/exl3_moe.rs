@@ -462,7 +462,7 @@ pub(in crate::family) struct SharedRowsIo<'b> {
     pub(in crate::family) scratch: Scratch<'b>,
 }
 
-/// The shared expert of a K-row verify window, `rows` in 2 to 8 (option B of the K-row design).
+/// The shared expert of a K-row verify window, `rows` in 2 to 8.
 ///
 /// Gate and up are `2 * rows` one-row groups in ONE grouped launch, ordered
 /// `[gate_0, up_0, gate_1, up_1, ...]` like the routed block (row `r` owns the pairs `2 r` and
@@ -473,7 +473,7 @@ pub(in crate::family) struct SharedRowsIo<'b> {
 /// groups of `rows` rows each (`[gate rows][up rows]`) would land as `[gate K rows][up K rows]`
 /// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
 ///
-/// The one-row block [`shared`] is untouched; the unit test compares this one to `rows` runs of it.
+/// The one-row block [`shared`] is untouched; the test compares this one to `rows` runs of it.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "staged for the K-row verify body")

@@ -55,7 +55,8 @@ constexpr int kMaxAdvance = 4096;
 constexpr int kMaskNonFinite = INFERENCE_CUDA_STATUS_NONFINITE_LOGITS;
 constexpr int kMaskInvalidState = INFERENCE_CUDA_STATUS_INVALID_STEP_STATE;
 constexpr int kMaskExl3 = INFERENCE_CUDA_STATUS_EXL3_ARITHMETIC;
-static_assert(kBlocks == kThreads, "argmax_final_k reads one partial per thread");constexpr int kPartBytes = 3072;  // ARGMAX_PART_BYTES: kBlocks values, indices and flags of 4 bytes
+static_assert(kBlocks == kThreads, "argmax_final_k reads one partial per thread");
+constexpr int kPartBytes = 3072;  // ARGMAX_PART_BYTES: kBlocks values, indices and flags of 4 bytes
 constexpr size_t kRowPartFloats = kPartBytes / sizeof(float);
 constexpr int kMaxRows = 16;      // rows of one argmax_rows launch (a verify window has at most 8)
 static_assert(3 * kBlocks * 4 == kPartBytes, "one set of partials is ARGMAX_PART_BYTES");
