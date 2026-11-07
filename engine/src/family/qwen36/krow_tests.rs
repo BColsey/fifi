@@ -340,8 +340,10 @@ fn the_accepted_run_is_the_leading_rows_whose_token_is_the_next_window_id() {
         greedy_run(&tokens, &[0, 11, 12, 13, 99, 15, 16, 17]),
         (3, 14)
     );
-    // A row without a token never matches an id.
+    // A row without a token never matches an id, also an id that holds the same bits (as the
+    // kernel: the comparison needs a token of at least 0).
     assert_eq!(greedy_run(&[4, -1, 6], &[0, 4, 0]), (1, -1));
+    assert_eq!(greedy_run(&[4, -1, 6], &[0, 4, u32::MAX]), (1, -1));
 }
 
 #[test]
@@ -370,6 +372,9 @@ fn the_device_verify_is_enforced_against_the_pairs_and_any_difference_is_an_erro
     assert!(check_verify(&[], &[], 0, 0).is_err());
     // A device that agrees with its pairs on a token the host cannot use is refused.
     assert!(check_verify(&[7, -1], &[0, 7], 1, -1).is_err());
+    // A device that let a row without a token extend the run (the bits of -1 equal that id) is not
+    // the host's rule: the run stops at that row.
+    assert!(check_verify(&[4, -1, 6], &[0, 4, u32::MAX], 2, 6).is_err());
 }
 
 // ---- the shortlist records ----

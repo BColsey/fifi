@@ -261,12 +261,14 @@ const SHORTLIST_NON_FINITE_AT: usize = 160;
 
 /// The accepted run of a greedy window and the token after it, as a host reference of
 /// `verify_greedy`: `accepted` is the number of leading rows `i < K - 1` whose token equals the
-/// next window id (`ids[i + 1]`), and `bonus` is the token of row `accepted`. `tokens` and `ids`
-/// have one entry per row (`K >= 1`).
+/// next window id (`ids[i + 1]`), and `bonus` is the token of row `accepted`. A row with no token
+/// (negative) never extends the run, whatever the window ids hold, as in the kernel. `tokens` and
+/// `ids` have one entry per row (`K >= 1`).
 pub(crate) fn greedy_run(tokens: &[i32], ids: &[u32]) -> (usize, i32) {
     let mut accepted = 0;
     while accepted + 1 < tokens.len()
-        && u32::try_from(tokens[accepted]).is_ok_and(|token| token == ids[accepted + 1])
+        && tokens[accepted] >= 0
+        && tokens[accepted] as u32 == ids[accepted + 1]
     {
         accepted += 1;
     }

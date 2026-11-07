@@ -220,10 +220,11 @@ __global__ void window_status_fold_k(inference_cuda_step_params *p, uint32_t *fl
  * Both words are stored whole after the window word and its pad: result[2 m + 2] = a and
  * result[2 m + 3] = bonus. The pairs are only read and the status word is not touched, so the
  * kernel can run before or after window_status_fold. A row with no comparable value (token -1)
- * never equals a window id (ids are not negative) and ends the run. */
+ * never extends the run, whatever the window ids hold: the comparison needs token >= 0, so the run
+ * does not depend on ids being non-negative. */
 __global__ void verify_greedy_k(const int *ids, int *result, int m) {
     int a = 0;
-    while (a < m - 1 && result[2 * a] == ids[a + 1]) ++a;
+    while (a < m - 1 && result[2 * a] >= 0 && result[2 * a] == ids[a + 1]) ++a;
     result[2 * m + 2] = a;
     result[2 * m + 3] = result[2 * a];
 }
