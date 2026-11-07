@@ -48,7 +48,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Health {
+pub(in crate::family) enum Health {
     Valid,
     /// A prefill chunk is writing the pools in place.
     PrefillOpen,
@@ -64,8 +64,8 @@ struct PendingWork {
 
 /// What `enqueue` hands back: the host mirror of the device `pos` word at the start of the step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Admitted {
-    pub(super) admit_pos: usize,
+pub(in crate::family) struct Admitted {
+    pub(in crate::family) admit_pos: usize,
 }
 
 /// Why a commit was refused. A status report and a `Partial` commit poison the book; the other
@@ -137,7 +137,7 @@ impl From<CommitRefusal> for EngError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StartRefusal {
+pub(in crate::family) enum StartRefusal {
     NotValid,
     NotIdle,
     Token(i32),
@@ -175,7 +175,7 @@ impl From<StartRefusal> for EngError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StateBook {
+pub(in crate::family) struct StateBook {
     capacity: usize,
     tokens: usize,
     pending: PendingWork,
@@ -193,7 +193,7 @@ fn refuse(what: &str, why: &str) -> EngError {
 impl StateBook {
     /// A book for a state of `capacity` KV rows owned by stream `owner`. It starts `Poisoned`:
     /// the buffers are uninitialized until the first reset finishes.
-    pub(super) fn new(capacity: usize, owner: u64) -> Self {
+    pub(in crate::family) fn new(capacity: usize, owner: u64) -> Self {
         Self {
             capacity,
             tokens: 0,
@@ -204,24 +204,24 @@ impl StateBook {
         }
     }
 
-    pub(super) fn health(&self) -> Health {
+    pub(in crate::family) fn health(&self) -> Health {
         self.health
     }
 
-    pub(super) fn tokens(&self) -> usize {
+    pub(in crate::family) fn tokens(&self) -> usize {
         self.tokens
     }
 
     /// True when no step is pending (rule 4): the predicate of `require_idle`.
-    pub(super) fn is_idle(&self) -> bool {
+    pub(in crate::family) fn is_idle(&self) -> bool {
         self.pending.advances.is_empty()
     }
 
-    pub(super) fn pending_rows(&self) -> usize {
+    pub(in crate::family) fn pending_rows(&self) -> usize {
         self.pending.advances.iter().sum()
     }
 
-    pub(super) fn needs_start(&self) -> bool {
+    pub(in crate::family) fn needs_start(&self) -> bool {
         self.needs_start
     }
 
@@ -268,25 +268,25 @@ impl StateBook {
     }
 
     /// Guards of `join_branches`: `main` is the owning stream (a poisoned state may be joined).
-    pub(super) fn begin_join(&self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_join(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "join_branches")
     }
 
     /// Guards of `Mixers::run_block`.
-    pub(super) fn begin_block(&self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_block(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "run_block")?;
         self.require_valid("run_block")
     }
 
     /// Guards of `export_state`.
-    pub(super) fn begin_export(&self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_export(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "export_state")?;
         self.require_valid("export_state")?;
         self.require_idle("export_state")
     }
 
     /// Guards of `reset`: the owning stream.
-    pub(super) fn begin_reset(&mut self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_reset(&mut self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "reset")?;
         self.health = Health::Poisoned;
         Ok(())
@@ -299,7 +299,7 @@ impl StateBook {
     /// `Valid` state. `import_state` always passes `true` (`IMPORT_REWRITES_WORDS`), so the
     /// `false` refusal below is unreachable in production: it is a guard for future callers
     /// that import without rewriting the words.
-    pub(super) fn begin_import(
+    pub(in crate::family) fn begin_import(
         &mut self,
         stream_id: u64,
         rewrites_words: bool,
@@ -317,25 +317,28 @@ impl StateBook {
 
     /// Guards of `poison_device`: the owning stream (checked BEFORE the state is poisoned, so a
     /// wrong-stream caller cannot poison it). Poisons.
-    pub(super) fn begin_poison_device(&mut self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_poison_device(
+        &mut self,
+        stream_id: u64,
+    ) -> Result<(), EngError> {
         self.check_owner(stream_id, "poison_device")?;
         self.health = Health::Poisoned;
         Ok(())
     }
 
-    pub(super) fn finish_overwrite(&mut self, tokens: usize) {
+    pub(in crate::family) fn finish_overwrite(&mut self, tokens: usize) {
         self.tokens = tokens;
         self.pending.advances.clear();
         self.health = Health::Valid;
         self.needs_start = true;
     }
 
-    pub(super) fn params_written(&mut self) {
+    pub(in crate::family) fn params_written(&mut self) {
         self.needs_start = false;
     }
 
     /// Admits a step of `advance` rows (rule 1).
-    pub(super) fn enqueue(&mut self, advance: usize) -> Result<Admitted, EngError> {
+    pub(in crate::family) fn enqueue(&mut self, advance: usize) -> Result<Admitted, EngError> {
         self.require_valid("enqueue_rows")?;
         if self.needs_start {
             return Err(refuse(
@@ -361,7 +364,7 @@ impl StateBook {
     /// Takes back the newest pending step, for a step whose enqueue is to be undone before any
     /// launch was queued (a failure before `run_block`). After `run_block` returned an error the
     /// caller poisons instead: queued kernels may have run.
-    pub(super) fn cancel_last(&mut self) -> Result<(), EngError> {
+    pub(in crate::family) fn cancel_last(&mut self) -> Result<(), EngError> {
         self.pending
             .advances
             .pop()
@@ -372,7 +375,11 @@ impl StateBook {
     /// Commits the oldest pending step after the host read its result pair, whose status word is
     /// `status` (rule 2). Validates before it changes anything, except that a non-zero status and
     /// a `Partial` commit poison.
-    pub(super) fn commit(&mut self, accepted: usize, status: i32) -> Result<(), CommitRefusal> {
+    pub(in crate::family) fn commit(
+        &mut self,
+        accepted: usize,
+        status: i32,
+    ) -> Result<(), CommitRefusal> {
         if self.health != Health::Valid {
             return Err(CommitRefusal::NotValid);
         }
@@ -395,11 +402,11 @@ impl StateBook {
     /// Enters `Poisoned` (rule 3): the caller's verdict that the state cannot be trusted (any
     /// non-zero status bit, any `Err` from `run_block`). Pending steps stay counted until a reset
     /// or an import.
-    pub(super) fn poison(&mut self) {
+    pub(in crate::family) fn poison(&mut self) {
         self.health = Health::Poisoned;
     }
 
-    pub(super) fn begin_prefill(&mut self) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_prefill(&mut self) -> Result<(), EngError> {
         self.require_valid("begin_prefill")?;
         self.require_idle("begin_prefill")?;
         self.health = Health::PrefillOpen;
@@ -408,7 +415,7 @@ impl StateBook {
 
     /// Guards of `revalidate`: the owning stream and an open prefill. Checked BEFORE the caller
     /// synchronizes the stream, so a refused call neither waits nor poisons.
-    pub(super) fn begin_revalidate(&self, stream_id: u64) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_revalidate(&self, stream_id: u64) -> Result<(), EngError> {
         self.check_owner(stream_id, "revalidate")?;
         self.require_prefill_open("revalidate")
     }
@@ -416,7 +423,11 @@ impl StateBook {
     /// Guards of the prefill status word copies (`what` names the caller): the owning stream and an
     /// open prefill chunk, so the word is zeroed at chunk open and read at chunk close, inside the
     /// chunk only.
-    pub(super) fn begin_prefill_word(&self, stream_id: u64, what: &str) -> Result<(), EngError> {
+    pub(in crate::family) fn begin_prefill_word(
+        &self,
+        stream_id: u64,
+        what: &str,
+    ) -> Result<(), EngError> {
         self.check_owner(stream_id, what)?;
         self.require_prefill_open(what)
     }
@@ -437,7 +448,7 @@ impl StateBook {
     /// Leaves `PrefillOpen` after a chunk whose prefill status word was `prefill_status` and
     /// publishes `tokens` rows (it may be fewer than before: a prefill that restarts). A
     /// non-zero status poisons. A start block is owed afterwards.
-    pub(super) fn revalidate(
+    pub(in crate::family) fn revalidate(
         &mut self,
         tokens: usize,
         prefill_status: i32,
@@ -460,7 +471,7 @@ impl StateBook {
         Ok(())
     }
 
-    pub(super) fn begin_write_params(
+    pub(in crate::family) fn begin_write_params(
         &self,
         stream_id: u64,
         params: &StepParams,
@@ -470,7 +481,7 @@ impl StateBook {
         Ok(())
     }
 
-    pub(super) fn check_start(&self, params: &StepParams) -> Result<(), StartRefusal> {
+    pub(in crate::family) fn check_start(&self, params: &StepParams) -> Result<(), StartRefusal> {
         if self.health != Health::Valid {
             return Err(StartRefusal::NotValid);
         }

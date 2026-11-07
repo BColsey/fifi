@@ -10,7 +10,7 @@
 
 #[cfg(all(test, feature = "research-activation"))]
 mod activation_device_tests;
-mod book;
+pub(in crate::family) mod book;
 #[cfg(test)]
 mod book_tests;
 mod card_attn;
@@ -199,7 +199,7 @@ mod start_pins;
 #[cfg(test)]
 mod start_tests;
 mod state;
-mod state_layout;
+pub(in crate::family) mod state_layout;
 mod step;
 mod step_ops;
 #[cfg(test)]

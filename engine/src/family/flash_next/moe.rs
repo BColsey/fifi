@@ -54,6 +54,20 @@ impl MoeShape {
     pub(crate) fn top_k(&self) -> usize {
         self.top_k
     }
+    #[cfg_attr(
+        not(all(feature = "native-cuda", target_os = "linux")),
+        allow(dead_code, reason = "the CUDA step plan is the caller")
+    )]
+    pub(crate) fn inter(&self) -> usize {
+        self.inter
+    }
+    #[cfg_attr(
+        not(all(feature = "native-cuda", target_os = "linux")),
+        allow(dead_code, reason = "the CUDA step plan is the caller")
+    )]
+    pub(crate) fn shared_inter(&self) -> usize {
+        self.shared_inter
+    }
     pub(crate) fn renorm(&self) -> bool {
         self.renorm
     }
@@ -380,7 +394,7 @@ mod tests {
     }
 }
 
-mod context_budget;
+pub(in crate::family::flash_next) mod context_budget;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod cuda_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]

@@ -44,7 +44,7 @@ fn refuse(detail: String) -> EngError {
 
 /// How the K/V of the attention layers is stored on the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum KvFormat {
+pub(in crate::family::flash_next) enum KvFormat {
     /// Two-byte elements: the format of the QSA kernels (`qsa_attn` reads an fp16 cache).
     F16,
     /// One-byte elements and one f32 scale per cached K or V row of a key-value head.
@@ -52,7 +52,7 @@ pub(super) enum KvFormat {
 }
 
 impl KvFormat {
-    fn element_bytes(self) -> u64 {
+    pub(in crate::family::flash_next) fn element_bytes(self) -> u64 {
         match self {
             Self::F16 => 2,
             Self::Int8 => 1,
@@ -68,7 +68,7 @@ impl KvFormat {
     }
 
     /// True once a QSA kernel reads this format.
-    pub(super) fn has_kernels(self) -> bool {
+    pub(in crate::family::flash_next) fn has_kernels(self) -> bool {
         matches!(self, Self::F16)
     }
 }
@@ -76,20 +76,23 @@ impl KvFormat {
 /// The attention layers' share of the per-position memory: K and V rows of the key-value heads, and
 /// the indexer's pooled keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct KvGeometry {
+pub(in crate::family::flash_next) struct KvGeometry {
     /// Layers that cache K/V and indexer keys (12 of 48 in Flash-Next).
-    pub(super) cached_layers: u64,
-    pub(super) heads_kv: u64,
-    pub(super) head_dim: u64,
+    pub(in crate::family::flash_next) cached_layers: u64,
+    pub(in crate::family::flash_next) heads_kv: u64,
+    pub(in crate::family::flash_next) head_dim: u64,
     /// Width of one f32 pooled indexer key.
-    pub(super) idx_dim: u64,
+    pub(in crate::family::flash_next) idx_dim: u64,
     /// Positions pooled into one indexer key.
-    pub(super) ratio: u64,
+    pub(in crate::family::flash_next) ratio: u64,
 }
 
 impl KvGeometry {
     /// Bytes one context position costs in `format`.
-    pub(super) fn position_bytes(&self, format: KvFormat) -> Result<u64, EngError> {
+    pub(in crate::family::flash_next) fn position_bytes(
+        &self,
+        format: KvFormat,
+    ) -> Result<u64, EngError> {
         let base = position_bytes(
             self.cached_layers,
             self.heads_kv,
