@@ -1744,7 +1744,8 @@ fn window_draw_commit(
 /// A window reads its report and nothing else. With the tap off, a window, its draws (greedy, and
 /// seeded with a sampler that keeps 20 candidates) and its verdict make exactly one read of the
 /// report (`window_read_bytes`, a kilobyte and a half at 8 rows with the shortlist on, 8 rows x 8
-/// bytes plus 16 with it off) and no other read of 64 bytes or more, against the 7.9 MB of the logits
+/// bytes plus 16 with it off; windows of 2, 4 and 8 rows, or of 6 and 8 with the shortlist off,
+/// whose report the check can count) and no other read of 64 bytes or more, against the 7.9 MB of the logits
 /// copy: a second read of the report, or a read of a row, fails the check. With the tap on the same
 /// window adds one read of all its rows. A sampler that keeps 40 candidates cannot be served by the
 /// record: it reads exactly one row per row it draws. With the shortlist switched off
@@ -1752,7 +1753,7 @@ fn window_draw_commit(
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
-    use super::krow_device_tests::check_window_reads;
+    use super::krow_device_tests::{check_window_reads, d2h_checked_rows};
     use crate::kernels::cuda::resident::argmax_rows::window_read_bytes;
     let shortlist_on = super::readback::device_shortlist_enabled(
         std::env::var(super::readback::SHORTLIST_VAR)
@@ -1762,7 +1763,7 @@ fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
     let (mut rig, _session, base, _inputs) = krow_rig(2);
     let prefix = rig.prefixes[0];
     let row_bytes = HEAD_ROWS * size_of::<f32>();
-    for rows in [2usize, 4, 8] {
+    for &rows in d2h_checked_rows(shortlist_on) {
         let inputs = window_inputs(&rig.stream, prefix, rows);
         let report = window_read_bytes(rows, shortlist_on);
         for kept in [1, rows / 2 + 1, rows] {

@@ -443,6 +443,14 @@ fn a_table_with_a_non_zero_pad_word_does_not_decode() {
 /// for by name.
 const SCALAR_READ_LIMIT: usize = 64;
 
+/// The window lengths the read check runs. A window's report must be at least [`SCALAR_READ_LIMIT`]
+/// bytes for the check to see a second read of it: with the shortlist off it is `(rows + 2) * 8`
+/// bytes, 32 at 2 rows and 48 at 4, which the check would not count, so that case runs 6 and 8 rows
+/// (64 and 80 bytes).
+pub(super) fn d2h_checked_rows(shortlist_on: bool) -> &'static [usize] {
+    if shortlist_on { &[2, 4, 8] } else { &[6, 8] }
+}
+
 /// How many more reads of each length there are in `after` than in `before` (two snapshots of
 /// `QwenResidentStep::d2h_reads`, which maps a read length in bytes to the number of reads of that
 /// length). Only lengths that grew appear.
@@ -487,6 +495,23 @@ pub(super) fn check_window_reads(
         }
     }
     Ok(())
+}
+
+#[test]
+fn the_window_lengths_of_the_read_check_have_a_report_the_check_can_see() {
+    use crate::kernels::cuda::resident::argmax_rows::window_read_bytes;
+    for shortlist_on in [true, false] {
+        for &rows in d2h_checked_rows(shortlist_on) {
+            let report = window_read_bytes(rows, shortlist_on);
+            assert!(
+                report >= SCALAR_READ_LIMIT,
+                "{rows} rows, shortlist {shortlist_on}: a report of {report} bytes is not counted"
+            );
+        }
+    }
+    // The premise: the shortest windows without records are below the limit, and are left out.
+    assert!(window_read_bytes(2, false) < SCALAR_READ_LIMIT);
+    assert!(window_read_bytes(4, false) < SCALAR_READ_LIMIT);
 }
 
 #[test]
