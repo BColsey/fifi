@@ -465,6 +465,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The bytes of the last logits row read back (little-endian f32).
     logits_bytes: Vec<u8>,
     shortlist_on: bool,
+    /// The routing readback spike (`Q36_ROUTE_CAPTURE=1`, `route_capture`): when on, each
+    /// decode step runs EAGER and reads the router picks back after every MoE block. A
+    /// diagnostic measurement opt-in, not a serving feature (see `route_capture`).
+    route_capture: bool,
     shortlist_bytes: [u8; shortlist::RESULT_BYTES],
     report: RunReport,
     prefill_report: PrefillReport,
@@ -789,6 +793,11 @@ impl<'a> QwenResidentStep<'a> {
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
             shortlist_on: device_shortlist_enabled(std::env::var(SHORTLIST_VAR).ok().as_deref()),
+            route_capture: crate::family::qwen36::route_capture::enabled(
+                std::env::var(crate::family::qwen36::route_capture::VAR)
+                    .ok()
+                    .as_deref(),
+            ),
             shortlist_bytes: [0; shortlist::RESULT_BYTES],
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
@@ -1630,6 +1639,14 @@ impl<'a> QwenResidentStep<'a> {
                 "step: a tiered step needs attach_tiered before its first token".to_owned(),
             ));
         }
+        // The spike instruments the plain gguf MoE arm only, so it refuses the layouts it
+        // cannot record (silently partial picks would poison the measurement).
+        if self.route_capture && (self.layout == WeightLayout::Exl3 || self.tiered_mode) {
+            return Err(EngError::BadRequest(
+                "step: Q36_ROUTE_CAPTURE covers the plain MoE arm only, not EXL3 or tiered"
+                    .to_owned(),
+            ));
+        }
         let mut plan = self.readback_plan(want_logits)?;
         if want_shortlist {
             plan = ReadbackPlan::shortlist(self.res.dims.shape.vocab)?;
@@ -1645,13 +1662,17 @@ impl<'a> QwenResidentStep<'a> {
         let admitted = self.state.enqueue_rows(STEP_ROWS)?;
         let mut entered = 0;
         // The layer trace needs per-layer readbacks, which cannot live inside a captured
-        // graph: a traced run stays EAGER and claims one step index for its layers.
+        // graph: a traced run stays EAGER and claims one step index for its layers. The
+        // routing spike readback is eager for the same reason.
         let trace_step = if crate::family::qwen36::trace::trace_enabled() {
             crate::family::qwen36::trace::begin_step()
         } else {
             None
         };
-        let mode = if trace_step.is_some() {
+        if self.route_capture {
+            crate::family::qwen36::route_capture::begin_step();
+        }
+        let mode = if trace_step.is_some() || self.route_capture {
             Mode::Eager
         } else {
             next_mode(
@@ -1922,6 +1943,48 @@ impl<'a> QwenResidentStep<'a> {
         crate::family::qwen36::trace::write_step_row(step, layer, &row)
     }
 
+    /// The routing spike readback of one MoE block: the pick ids, pick weights and shared gate
+    /// of `route`, each copied out with one stream-ordered `read_at` (so the first syncs the
+    /// block, the next two read final data). The caller gates on `route_capture` and a block
+    /// that ran clean; the picks land in the staged slot in launch order.
+    fn capture_route_picks(
+        &self,
+        stream: &DeviceStream,
+        route: &super::moe::RouteBufs<'_>,
+        top_k: usize,
+    ) -> Result<(), EngError> {
+        let read = |range: &DeviceRange<'_>, bytes: usize| -> Result<Vec<u8>, EngError> {
+            let mut raw = vec![0u8; bytes];
+            range.buffer().read_at(stream, range.offset(), &mut raw)?;
+            Ok(raw)
+        };
+        let ids = read(&route.ids, top_k * size_of::<i32>())?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| i32::from_le_bytes(*word))
+            .collect();
+        let weights = read(&route.weights, top_k * size_of::<f32>())?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        let shared_gate = f32::from_le_bytes(
+            read(&route.shared_gate, size_of::<f32>())?
+                .as_chunks::<4>()
+                .0[0],
+        );
+        crate::family::qwen36::route_capture::record(
+            crate::family::qwen36::route_capture::LayerPicks {
+                ids,
+                weights,
+                shared_gate,
+            },
+        );
+        Ok(())
+    }
+
     fn run_op(
         &self,
         op: StepOp,
@@ -2058,7 +2121,11 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
-                run_moe_block(&launch, weights, bufs, &self.moe_dims)
+                let block = run_moe_block(&launch, weights, bufs, &self.moe_dims);
+                if self.route_capture && block.is_ok() {
+                    self.capture_route_picks(s, &bufs.route, self.moe_dims.top_k)?;
+                }
+                block
             }
             StepOp::FinalNorm => self.final_norm(),
             StepOp::LmHead => self.lm_head(),
