@@ -366,6 +366,118 @@ __device__ __forceinline__ void midrows_projection(const inference_cuda_exl3_lin
         }
     }
 }
+// Opt-in hi/lo variant of midrows_projection (FIFI_EXL3_TALL_HILO, 64 rows x 16 columns per CTA, W = 4): the
+// F32 activation x is staged as two F16 tiles, hi = F16(x) and lo = F16((x - hi) * 2048), and each K step
+// multiplies both against the SAME decoded weight tile (one trellis decode per tile, as before) into two F32
+// accumulators; the output is sum_hi + sum_lo / 2048. The operand error falls from 2^-11 |x| to about
+// 2^-22 |x|, with the range of F16 unchanged for hi and kept for lo by the scale. The default kernel above
+// is untouched; this body is a copy with the staging and the accumulators changed.
+template <int Book>
+__device__ __forceinline__ void midrows_projection_hilo(const inference_cuda_exl3_linear_args &a,
+                                                        half2 *inputs2, half2 *inputs2_lo,
+                                                        unsigned *weights32, float *result) {
+    constexpr int W = 4;
+    namespace wmma = nvcuda::wmma;
+    const half *inputs = reinterpret_cast<const half *>(inputs2);
+    const half *inputs_lo = reinterpret_cast<const half *>(inputs2_lo);
+    const half *weights = reinterpret_cast<const half *>(weights32);
+    const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const unsigned steps = unsigned(a.k / 16);
+    constexpr unsigned block_rows = 16 * W;
+    const size_t first_row = size_t(blockIdx.y) * block_rows + warp * 16;
+    const bool live = first_row < a.rows;
+    const bool decoder = W == 4 || threadIdx.x < 128;
+    const MidrowsStates states =
+        midrows_states(decoder ? threadIdx.x : 0u, unsigned(a.bits_twice));
+
+    const size_t tile_halves = size_t(a.bits_twice) * 8, step_halves = size_t(a.n / 16) * tile_halves;
+    const uint16_t *tile = a.trellis + size_t(blockIdx.x) * tile_halves;
+    const uint16_t *lead = tile + 2 * size_t(states.lead_word);
+    const uint16_t *tail = tile + 2 * size_t(states.tail_word);
+    // This lane stages rows 4 apart. One running pointer and one stride keep the register
+    // count low (see project_midrows); a row past the end is not loaded. A lane with no such
+    // row still forms source and steps row past the end of the input: those pointers are never
+    // dereferenced (formally undefined behavior). Forming none cost either a 49th register (room
+    // for 9 CTAs per SM, not 10) or about 7% more static K-loop instructions, so they stay.
+    const size_t lane_row = first_row + (lane >> 3);
+    const float *source = a.xh + lane_row * a.k + 2 * (lane & 7);
+    const unsigned row_stride = unsigned(4 * a.k);
+    const bool valid0 = live && lane_row < a.rows, valid1 = live && lane_row + 4 < a.rows,
+               valid2 = live && lane_row + 8 < a.rows, valid3 = live && lane_row + 12 < a.rows;
+
+    float x[8] = {};
+    unsigned halves[4] = {};
+    auto fetch = [&]() {
+        const float *row = source;   // may point past the input; only dereferenced under its valid guard
+        if (valid0) { x[0] = row[0]; x[1] = row[1]; }
+        row += row_stride;
+        if (valid1) { x[2] = row[0]; x[3] = row[1]; }
+        row += row_stride;
+        if (valid2) { x[4] = row[0]; x[5] = row[1]; }
+        row += row_stride;
+        if (valid3) { x[6] = row[0]; x[7] = row[1]; }
+        if (decoder) {
+            halves[0] = lead[0]; halves[1] = lead[1]; halves[2] = tail[0]; halves[3] = tail[1];
+        }
+    };
+    auto stage = [&]() {
+        if (live) {
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                // x = hi + lo / 2048: hi is the F16 cast, the difference is exact in F32 (hi and x
+                // are within a factor of two), the scale is a power of two, so lo keeps its own 11
+                // bits whatever the size of x (no underflow of a small residual).
+                const half2 hi = __floats2half2_rn(x[2 * j], x[2 * j + 1]);
+                const float2 back = __half22float2(hi);
+                inputs2[warp * 128 + 32 * j + lane] = hi;
+                inputs2_lo[warp * 128 + 32 * j + lane] =
+                    __floats2half2_rn((x[2 * j] - back.x) * 2048.0f, (x[2 * j + 1] - back.y) * 2048.0f);
+            }
+        }
+        if (decoder) weights32[states.slot] = midrows_weight_pair<Book>(states, halves, a.flag);
+    };
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> sum, sum_lo;
+    wmma::fill_fragment(sum, 0.0f);
+    wmma::fill_fragment(sum_lo, 0.0f);
+    fetch();
+    #pragma unroll 1
+    for (unsigned step = 0; step < steps; ++step) {
+        stage();
+        if (step + 1 < steps) {
+            source += 16;
+            lead += step_halves;
+            tail += step_halves;
+            fetch();
+        }
+        __syncthreads();
+        if (live) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> xf;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> wf;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> xl;
+            wmma::load_matrix_sync(xf, inputs + warp * 256, 16);
+            wmma::load_matrix_sync(xl, inputs_lo + warp * 256, 16);
+            wmma::load_matrix_sync(wf, weights, 16);
+            wmma::mma_sync(sum, xf, wf, sum);
+            wmma::mma_sync(sum_lo, xl, wf, sum_lo);
+        }
+        __syncthreads();
+    }
+    if (live) {
+        // The two accumulators are separate so the small lo terms are not lost to the alignment of a large
+        // running sum; they meet here, in F32, with the exact power-of-two scale.
+        #pragma unroll
+        for (int i = 0; i < sum.num_elements; ++i) sum.x[i] += sum_lo.x[i] * (1.0f / 2048.0f);
+        wmma::store_matrix_sync(result + warp * 256, sum, 16, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < 256 * W; i += 32 * W) {
+        const size_t row = size_t(blockIdx.y) * block_rows + i / 16;
+        if (row < a.rows) {
+            a.z[row * a.n + size_t(blockIdx.x) * 16 + i % 16] = finite_or_flag(result[i], a.flag);
+        }
+    }
+}
 // The launcher fixes 128 threads per CTA. Registers are not bounded here: ptxas (nvcc 12.6, sm_86
 // and sm_89) allocates 47 without spills in the harness build and 48 in the production build, so
 // 10 CTAs fit an SM and the occupancy is unchanged from the previous body. That is a measurement,
@@ -381,6 +493,17 @@ __global__ void __launch_bounds__(128) project_midrows(inference_cuda_exl3_linea
         case 0: midrows_projection<0>(a, inputs2, weights32, result); break;
         case 1: midrows_projection<1>(a, inputs2, weights32, result); break;
         default: midrows_projection<2>(a, inputs2, weights32, result); break;
+    }
+}
+__global__ void __launch_bounds__(128) project_midrows_hilo(inference_cuda_exl3_linear_args a) {
+    __shared__ __align__(32) half2 inputs2[512];
+    __shared__ __align__(32) half2 inputs2_lo[512];
+    __shared__ __align__(32) unsigned weights32[128];
+    __shared__ __align__(32) float result[1024];
+    switch (a.book) {
+        case 0: midrows_projection_hilo<0>(a, inputs2, inputs2_lo, weights32, result); break;
+        case 1: midrows_projection_hilo<1>(a, inputs2, inputs2_lo, weights32, result); break;
+        default: midrows_projection_hilo<2>(a, inputs2, inputs2_lo, weights32, result); break;
     }
 }
 __global__ void project_small(inference_cuda_exl3_linear_args a, uint32_t split_k) {
@@ -529,7 +652,7 @@ static inline __attribute__((always_inline)) bool emit_linear(
 template<bool Observe = false>
 static inline __attribute__((always_inline)) int linear_launch(
     const inference_cuda_exl3_linear_args *a, uint32_t split_k,
-    bool midrows, void *stream, int *out_stage, uint64_t *launches = nullptr) {
+    bool midrows, void *stream, int *out_stage, uint64_t *launches = nullptr, bool hilo = false) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!a || !stream ||
@@ -541,7 +664,10 @@ static inline __attribute__((always_inline)) int linear_launch(
             switch (e.kind) {
                 case LinearKind::Input: input_rotate<<<grid,block,0,(cudaStream_t)stream>>>(*a); break;
                 case LinearKind::Small: project_small<<<grid,block,0,(cudaStream_t)stream>>>(*a, split_k); break;
-                case LinearKind::Midrows: project_midrows<<<grid,block,0,(cudaStream_t)stream>>>(*a); break;
+                case LinearKind::Midrows:
+                    if (hilo) project_midrows_hilo<<<grid,block,0,(cudaStream_t)stream>>>(*a);
+                    else project_midrows<<<grid,block,0,(cudaStream_t)stream>>>(*a);
+                    break;
                 case LinearKind::Large: project<<<grid,block,0,(cudaStream_t)stream>>>(*a); break;
                 case LinearKind::Output: output_rotate<<<grid,block,0,(cudaStream_t)stream>>>(*a, split_k); break;
             }
@@ -559,6 +685,11 @@ static inline __attribute__((always_inline)) int linear_launch(
 extern "C" int inference_cuda_exl3_linear_midrows(const inference_cuda_exl3_linear_args *a,
                                                  void *stream, int *out_stage) {
     return linear_launch<>(a, 2, true, stream, out_stage);
+}
+
+extern "C" int inference_cuda_exl3_linear_midrows_hilo(const inference_cuda_exl3_linear_args *a,
+                                                      void *stream, int *out_stage) {
+    return linear_launch<>(a, 2, true, stream, out_stage, nullptr, true);
 }
 
 extern "C" int inference_cuda_exl3_linear_split(const inference_cuda_exl3_linear_args *a,

@@ -149,6 +149,13 @@ int inference_cuda_exl3_book2_probe(const uint32_t *words, size_t count, uint32_
  * is required. No default dispatch change. */
 int inference_cuda_exl3_linear_midrows(const inference_cuda_exl3_linear_args *args,
                                        void *stream, int *out_stage);
+/* Opt-in variant of inference_cuda_exl3_linear_midrows (FIFI_EXL3_TALL_HILO): same contract, geometry,
+ * launch grid and emissions; the F32 activations are staged as an F16 high part and a scaled F16 residual
+ * and multiplied against the same decoded weight tile into two F32 accumulators (sum_hi + sum_lo / 2048),
+ * so the operand rounding error is about 2^-22 of each element instead of 2^-11. The entry above is
+ * unchanged. Not an FP32-equivalence guarantee: the accumulation is the tensor core's. */
+int inference_cuda_exl3_linear_midrows_hilo(const inference_cuda_exl3_linear_args *args,
+                                            void *stream, int *out_stage);
 /* Job-table projection for rows 1..256 per job: one launch per stage (input rotation,
  * tensor-core projection, output rotation) over any number of row blocks ("jobs"), each of
  * which reads one member of a bank of same-shaped, same-rate matrices. The prefill MoE runs

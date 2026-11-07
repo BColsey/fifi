@@ -55,7 +55,6 @@ pub(crate) struct Stats {
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static LAYER: Cell<usize> = const { Cell::new(0) };
-    static PIECE: Cell<usize> = const { Cell::new(0) };
     static STATS: RefCell<BTreeMap<(usize, usize, usize), Stats>> = const { RefCell::new(BTreeMap::new()) };
 }
 
@@ -70,10 +69,6 @@ pub(crate) fn armed() -> bool {
 
 pub(crate) fn set_layer(layer: usize) {
     LAYER.with(|current| current.set(layer));
-}
-
-pub(crate) fn set_piece(piece: usize) {
-    PIECE.with(|current| current.set(piece));
 }
 
 /// The statistics by (layer, k, n), draining the probe.

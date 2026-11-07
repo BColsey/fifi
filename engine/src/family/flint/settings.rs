@@ -75,6 +75,39 @@ pub(crate) fn layer_major_from_env(
     }
 }
 
+/// The opt-in switch of the hi/lo activation split of the tall projections of the jobs pass.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) const TALL_HILO_VAR: &str = "FIFI_EXL3_TALL_HILO";
+
+/// FIFI_EXL3_TALL_HILO, strict: unset and `0` keep the F16 cast of the tall projection inputs (the
+/// default, unchanged); `1` splits each activation into an F16 high part and a scaled F16 residual
+/// (two tensor-core products against one decoded weight tile, summed in F32). Surrounding spaces are
+/// ignored; every other value, including an empty or non-UTF-8 one, is an error at executor open.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn tall_hilo_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(EngError::BadRequest(
+            "FIFI_EXL3_TALL_HILO must be unset, \"0\" or \"1\"".into(),
+        )),
+    }
+}
+
+/// FIFI_EXL3_TALL_HILO, read once per process; the executor open refuses a bad value before any
+/// tall projection asks, so a value that is not `1` reads as off here.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) fn tall_hilo_armed() -> bool {
+    use std::sync::OnceLock;
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| {
+        tall_hilo_from_env(std::env::var_os(TALL_HILO_VAR).as_deref()).unwrap_or(false)
+    })
+}
+
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn q8_tiled_selected(value: Option<&std::ffi::OsStr>) -> bool {
     default_on_selected(value)
@@ -536,6 +569,39 @@ mod tests {
         {
             use std::os::unix::ffi::OsStrExt;
             assert!(!grouped_gather_selected(Some(OsStr::from_bytes(b"on\xff"))));
+        }
+    }
+
+    #[test]
+    fn tall_hilo_env_is_strict_and_default_off() {
+        use std::ffi::OsStr;
+
+        assert!(!tall_hilo_from_env(None).unwrap());
+        for (value, want) in [
+            ("0", false),
+            (" 0 ", false),
+            ("1", true),
+            (" 1\n", true),
+            ("\u{2003}1", true),
+        ] {
+            assert_eq!(
+                tall_hilo_from_env(Some(OsStr::new(value))).unwrap(),
+                want,
+                "{value:?}"
+            );
+        }
+        for value in [
+            "", " ", "on", "true", "yes", "2", "01", "+1", "off", "hilo", "1.0", "-1",
+        ] {
+            assert!(
+                tall_hilo_from_env(Some(OsStr::new(value))).is_err(),
+                "{value:?} must be refused"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(tall_hilo_from_env(Some(OsStr::from_bytes(b"\xff"))).is_err());
         }
     }
 

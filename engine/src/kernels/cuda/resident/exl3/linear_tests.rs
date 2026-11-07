@@ -617,6 +617,167 @@ fn midrows_opt_in_preserves_f32_stages_and_subnormal_scales() {
     }
 }
 
+/// The hi/lo split of the tall projection (`exl3_linear_midrows_hilo`, `FIFI_EXL3_TALL_HILO`) against an FP64 projection of
+/// the very F32 activations the kernel rotated, and against the single F16 cast of `exl3_linear_midrows` on the same call.
+///
+/// The bound, derived before any device run. Per output element `z_j = sum_i x_i w_ij` with the F32 rotated activation `x_i`
+/// and the F16 weight `w_ij`, and `S_j = sum_i |x_i| |w_ij|`:
+///  * Operand error. `hi = RN16(x)` has `|x - hi| <= 2^-11 |x|` (normal range). The residual `lo = RN16(2048 (x - hi))` has
+///    relative error `2^-11` of `|2048 (x - hi)| <= 2^-11 * 2048 |x|`, so `|x - (hi + lo / 2048)| <= 2^-11 * 2^-11 |x| = 2^-22 |x|`
+///    while `|2048 (x - hi)| >= 2^-14`; below that `lo` is subnormal and the error is at most `2^-25 / 2048 = 2^-36` absolute.
+///    `x - hi` is exact in F32 (hi and x are within a factor of two), the scale is a power of two, and the products of two F16
+///    values are exact in the tensor core (Sun et al. 2022, section 8: FP16-initialised multiplication and inner-product addition show
+///    no error). So the operand part of the error of `z_j` is at most `2^-22 S_j + 2^-36 sum_i |w_ij|`.
+///  * Accumulation. One `mma` adds 16 products into an F32 accumulator; its alignment truncates at about `2^-23` of the larger
+///    magnitude, so one step adds at most `2^-23 S_j` and the `K / 16` steps at most `(K / 16) 2^-23 S_j` (a deterministic worst case,
+///    much larger than the usual random-walk error). The two accumulators are combined in F32 with one more rounding, `2^-24 |z_j|
+///    <= 2^-24 S_j`; allow `2^-23 S_j`.
+///
+/// So `|z_j - ref_j| <= B_j = (2^-22 + (K / 16 + 1) 2^-23) S_j + 2^-36 sum_i |w_ij|`, checked for every element.
+///
+/// The second check is the point of the change: on the same inputs the relative L2 error of the split result must be at least
+/// 20 times below that of the single cast (the single cast has about `2^-11 / sqrt(3)` per element, 2.8e-4; the split about 1e-6).
+#[test]
+fn midrows_hilo_stays_inside_the_derived_bound_and_beats_the_single_cast() {
+    if !testkit::device_present("EXL3 midrows hi/lo projection") {
+        return;
+    }
+    let (rows, k, n) = (128usize, 1024usize, 384usize);
+    if !super::midrows_enabled(rows, std::env::var_os("FIFI_EXL3_LEGACY").as_deref()) {
+        eprintln!("FIFI_EXL3_LEGACY=1 routes the rows to the F32 path: nothing to compare");
+        return;
+    }
+    let ctx = CudaContext::new().unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut rng = testkit::Rng::new(0x4849_4c4f);
+    for book in [Codebook::ThreeInst, Codebook::Mcg, Codebook::Mul1] {
+        let matrix = fixture(false, book, 8, (k, n));
+        // Row classes: unit scale, 2^-8 (small inputs, where the residual is subnormal without the scale), 2^8 with a heavy tail.
+        let input: Vec<f32> = (0..rows * k)
+            .map(|index| {
+                let base = (rng.below(65537) as f32 - 32768.0) / 32768.0;
+                match (index / k) % 4 {
+                    0 => base,
+                    1 => base * (1.0 / 256.0),
+                    2 => base * 256.0,
+                    _ => base * if rng.below(64) == 0 { 4096.0 } else { 0.25 },
+                }
+            })
+            .collect();
+        let mut weights = vec![0u16; k * n];
+        matrix
+            .codebook()
+            .reconstruct_into(matrix.trellis(), &mut weights)
+            .unwrap();
+        let bytes = matrix.trellis().host_bytes().unwrap();
+        let packed = testkit::upload_bytes(&ctx, bytes);
+        let suh = upload_scales(&ctx, matrix.suh());
+        let svh = upload_scales(&ctx, matrix.svh());
+        let x = testkit::upload_f32(&ctx, &input);
+        let run = |hilo: bool| {
+            let xh = testkit::upload_filled(&ctx, 0xff, rows * k * 4);
+            let z = testkit::upload_filled(&ctx, 0xa5, rows * n * 4);
+            let out = testkit::upload_filled(&ctx, 0xff, rows * n * 4);
+            let flag = testkit::upload_bytes(&ctx, &8u32.to_le_bytes());
+            let call = Exl3LinearCall {
+                trellis: packed.range(0, bytes.len()).unwrap(),
+                suh: suh.range(0, k * 4).unwrap(),
+                svh: svh.range(0, n * 4).unwrap(),
+                bias: None,
+                x: x.range(0, rows * k * 4).unwrap(),
+                xh: xh.range(0, rows * k * 4).unwrap(),
+                z: z.range(0, rows * n * 4).unwrap(),
+                out: out.range(0, rows * n * 4).unwrap(),
+                flag: flag.range(0, 4).unwrap(),
+                rows,
+                split_k: 2,
+                k,
+                n,
+                bits_twice: matrix.bitrate_twice(),
+                book: matrix.codebook(),
+                fused: false,
+            };
+            if hilo {
+                ctx.exl3_linear_midrows_hilo(&stream, call).unwrap();
+            } else {
+                ctx.exl3_linear_midrows(&stream, call).unwrap();
+            }
+            stream.synchronize().unwrap();
+            assert_eq!(
+                testkit::read_bytes(&ctx, &flag, 4),
+                8u32.to_le_bytes(),
+                "hilo={hilo}: no flag raised"
+            );
+            (
+                testkit::read_bytes(&ctx, &xh, rows * k * 4),
+                testkit::read_bytes(&ctx, &z, rows * n * 4),
+            )
+        };
+        let (xh_single, z_single) = run(false);
+        let (xh_split, z_split) = run(true);
+        assert_eq!(xh_single, xh_split, "both calls rotate the input alike");
+        let operands: Vec<f64> = xh_split
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f64::from(f32::from_le_bytes(*b)))
+            .collect();
+        let reference = reference_project(&operands, &weights, (k, n), 0..k);
+        // S_j and sum |w_ij|.
+        let mut magnitude = vec![0.0f64; rows * n];
+        let mut weight_sum = vec![0.0f64; n];
+        for i in 0..k {
+            for j in 0..n {
+                weight_sum[j] += f16::from_bits(weights[i * n + j]).to_f64().abs();
+            }
+        }
+        for (row, x) in operands.chunks_exact(k).enumerate() {
+            for (i, xi) in x.iter().enumerate() {
+                for j in 0..n {
+                    magnitude[row * n + j] +=
+                        xi.abs() * f16::from_bits(weights[i * n + j]).to_f64().abs();
+                }
+            }
+        }
+        let floats = |bytes: &[u8]| -> Vec<f64> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f64::from(f32::from_le_bytes(*b)))
+                .collect()
+        };
+        let (single, split) = (floats(&z_single), floats(&z_split));
+        let coefficient = 2f64.powi(-22) + ((k / 16 + 1) as f64) * 2f64.powi(-23);
+        let mut worst = 0f64;
+        for index in 0..rows * n {
+            let bound = coefficient * magnitude[index] + 2f64.powi(-36) * weight_sum[index % n];
+            let error = (split[index] - reference[index]).abs();
+            worst = worst.max(error / bound.max(f64::MIN_POSITIVE));
+            assert!(
+                error <= bound,
+                "{book:?} element {index}: error {error:e} above the bound {bound:e}"
+            );
+        }
+        let relative = |values: &[f64]| {
+            let (mut e, mut s) = (0.0, 0.0);
+            for (v, r) in values.iter().zip(&reference) {
+                e += (v - r).powi(2);
+                s += r.powi(2);
+            }
+            (e / s).sqrt()
+        };
+        let (single_error, split_error) = (relative(&single), relative(&split));
+        eprintln!(
+            "{book:?}: single cast relL2 {single_error:e}, hi/lo relL2 {split_error:e}, worst error / bound {worst:.3}"
+        );
+        assert!(
+            split_error * 20.0 <= single_error,
+            "{book:?}: the split must be 20x closer: {split_error:e} against {single_error:e}"
+        );
+    }
+}
+
 #[test]
 fn gemv_and_batched_projection_keep_subnormal_scales_in_f32() {
     projection_cases(false);

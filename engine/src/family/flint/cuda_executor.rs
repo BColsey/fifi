@@ -561,6 +561,10 @@ impl FlintExecutor {
         // Layer-major prefill: the selection parses strictly now (unset, "1" or "jobs"); the
         // admission check below runs after the reserve is sized.
         let mode = layer_major()?;
+        // The hi/lo split of the tall projections parses strictly too (unset, "0" or "1").
+        super::settings::tall_hilo_from_env(
+            std::env::var_os(super::settings::TALL_HILO_VAR).as_deref(),
+        )?;
         let cpu_moe = CpuMoeConfig::new(
             options.cpu_moe_offload_layers,
             options.cpu_moe_split_experts,
@@ -658,7 +662,7 @@ impl FlintExecutor {
         }
         let sampling = SamplingScratch::new(&ctx)?;
         eprintln!(
-            "Flint CUDA V/{}-write {}: context={} kv={} kv_bytes={} work_reserve={} headroom={} weights={} alloc_cache={} late_health={} token_health={}{}{}{}{}{}{}",
+            "Flint CUDA V/{}-write {}: context={} kv={} kv_bytes={} work_reserve={} headroom={} weights={} alloc_cache={} late_health={} token_health={}{}{}{}{}{}{}{}",
             options.kv_profile.to_ascii_uppercase(),
             if options.kv_profile == "q8" || options.kv_profile == "q8k" {
                 "native"
@@ -694,6 +698,12 @@ impl FlintExecutor {
                 };
                 format!(" layer_major={rows}{jobs}")
             }),
+            // Printed only when armed, so the default load line is unchanged.
+            if super::settings::tall_hilo_armed() {
+                " tall_hilo=on"
+            } else {
+                ""
+            },
             ctx.single_gather_suffix(),
             model
                 .banked_experts()

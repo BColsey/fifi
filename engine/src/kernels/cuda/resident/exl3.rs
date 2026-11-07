@@ -756,6 +756,27 @@ impl CudaContext {
         self.exl3_linear_mode(stream, call, true)
     }
 
+    /// [`Self::exl3_linear_midrows`] with the F32 activations split into an F16 high part and a scaled
+    /// F16 residual that meet in two F32 accumulators (`FIFI_EXL3_TALL_HILO`, opt-in). The rows
+    /// 64..=144 that take the tensor-core projection take this one; every other row count, and
+    /// `FIFI_EXL3_LEGACY=1`, take the same F32 path as `exl3_linear_midrows`. The operand error is about
+    /// 2^-22 of each element instead of 2^-11; the accumulation is still the tensor core's.
+    pub(crate) fn exl3_linear_midrows_hilo(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3LinearCall<'_>,
+    ) -> Result<(), EngError> {
+        let raw = self.exl3_linear_raw(&call, true)?;
+        let tensor = midrows_enabled(call.rows, legacy_variable());
+        self.launch_on(stream, |s| {
+            if tensor {
+                ffi::linear_midrows_hilo(s, &raw)
+            } else {
+                ffi::linear(s, &raw)
+            }
+        })
+    }
+
     fn exl3_linear_raw<'a>(
         &self,
         call: &Exl3LinearCall<'a>,

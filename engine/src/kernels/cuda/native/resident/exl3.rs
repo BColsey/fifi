@@ -223,6 +223,11 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+    fn inference_cuda_exl3_linear_midrows_hilo(
+        args: *const LinearArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
     fn inference_cuda_exl3_linear_split(
         args: *const LinearArgs,
         split_k: u32,
@@ -262,6 +267,21 @@ pub(in crate::kernels::cuda) fn linear_midrows(
     call: &LinearRaw<'_>,
 ) -> Result<(), DeviceFailure> {
     linear_mode(stream, call, true)
+}
+
+/// [`linear_midrows`] with the activations staged as an F16 high part and a scaled F16 residual
+/// (`FIFI_EXL3_TALL_HILO`): same arguments, extents and launch grid, one more entry in the library.
+pub(in crate::kernels::cuda) fn linear_midrows_hilo(
+    stream: &RawStream,
+    call: &LinearRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let args = linear_args(call, true)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: as in `linear_mode`: extents, alignment and disjoint writes are checked above and
+    // repeated in C; the explicit live stream is protected by the dispatch guard.
+    let status =
+        unsafe { inference_cuda_exl3_linear_midrows_hilo(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
 }
 
 fn linear_args(call: &LinearRaw<'_>, midrows: bool) -> Result<LinearArgs, DeviceFailure> {

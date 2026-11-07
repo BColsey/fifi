@@ -76,7 +76,11 @@ pub(in crate::family::flint::cuda_ffn::device) fn linear_rows(
             rows: count,
             fused: false,
         };
-        ctx.exl3_linear_midrows(stream, weight.linear_call(&part))?;
+        if crate::family::flint::settings::tall_hilo_armed() {
+            ctx.exl3_linear_midrows_hilo(stream, weight.linear_call(&part))?;
+        } else {
+            ctx.exl3_linear_midrows(stream, weight.linear_call(&part))?;
+        }
     }
     #[cfg(test)]
     if crate::family::flint::cuda_ffn::device::castprobe::armed() {
@@ -107,5 +111,29 @@ mod tests {
         assert_eq!(row_slices(0), []);
         assert_eq!(row_slices(1024).len(), 8);
         assert_eq!(row_slices(145), [(0, 73), (73, 72)]);
+    }
+
+    /// The hi/lo entry is reached only through the opt-in switch; unset keeps the call it always made.
+    #[test]
+    fn the_hilo_entry_sits_behind_the_switch_and_unset_keeps_the_rows_entry() {
+        let source = include_str!("tall.rs");
+        let start = source
+            .find("pub(in crate::family::flint::cuda_ffn::device) fn linear_rows(")
+            .unwrap();
+        let body = &source[start..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let armed = body
+            .find("settings::tall_hilo_armed()")
+            .expect("the switch is read");
+        let hilo = body
+            .find("exl3_linear_midrows_hilo(")
+            .expect("the hi/lo entry is called");
+        let plain = body
+            .find("exl3_linear_midrows(stream")
+            .expect("the rows entry is called");
+        assert!(
+            armed < hilo && hilo < plain,
+            "the hi/lo call sits in the armed branch, the rows entry in the else"
+        );
+        assert_eq!(body.matches("exl3_linear_midrows_hilo(").count(), 1);
     }
 }
