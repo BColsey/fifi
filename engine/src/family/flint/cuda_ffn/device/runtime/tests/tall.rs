@@ -539,3 +539,93 @@ fn projections_against_ideal_f64() {
         }
     }
 }
+
+/// What the F16 cast loses at the inputs of the tall single-matrix projections of the jobs pass, on real activations: for each of
+/// `FLINT_PROBE_WINDOWS` (default 3) windows of `FLINT_PROBE_TOKENS` (default 4096) tokens of the repository corpus, one jobs prefill in pieces
+/// of 1,024 rows with the probe armed. Prints, per projection shape and for the worst layers, the range classes (overflow, subnormal, flushed),
+/// the relative L2 error of the cast and what 10 mantissa bits alone predict, and the same figures for BF16, F16 after a per-row power-of-two
+/// scale and a hi/lo split. The result picks the fix (range or mantissa); it asserts only that the probe saw the projections it is for.
+#[test]
+#[ignore = "requires admitted GPU and the full EXL3 pack; a few minutes in release"]
+fn the_f16_cast_loss_at_the_tall_projection_inputs_on_real_activations() {
+    use crate::family::flint::cuda_ffn::device::castprobe;
+    let windows: usize = std::env::var("FLINT_PROBE_WINDOWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let tokens_per_window: usize = std::env::var("FLINT_PROBE_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096);
+    assert!(tokens_per_window.is_multiple_of(1024) && windows >= 1);
+    let root = std::path::PathBuf::from(std::env::var_os("FLINT_EXL3_PACK").expect("opt-in pack"));
+    let bundle = crate::family::flint::factory::load_tokenizer(&root).expect("tokenizer");
+    let text = std::str::from_utf8(include_bytes!("../../../../testdata/tf-gate-corpus.txt"))
+        .expect("corpus is UTF-8");
+    let ids = bundle.tokenizer().encode(text).expect("corpus ids");
+    assert!(
+        ids.len() >= windows * tokens_per_window,
+        "the corpus holds {} ids",
+        ids.len()
+    );
+    let ctx = CudaContext::new().expect("real weights need CUDA");
+    let stream = ctx.stream().unwrap();
+    let plan = KvPlan::new(tokens_per_window + 8, 1024, true).unwrap();
+    let model = load_real_model(&ctx, &stream, &[&plan]);
+    let decoder = Decoder::new(&ctx, &stream, &model).unwrap();
+    let mut state = State::new(&ctx, plan).unwrap();
+    state.arm_layer_major(&ctx, 1024, true).unwrap();
+    let mut total: std::collections::BTreeMap<(usize, usize), castprobe::Stats> =
+        Default::default();
+    let mut worst_layers: Vec<(f64, usize, usize, usize, String)> = Vec::new();
+    for window in 0..windows {
+        let start =
+            window * (ids.len() - tokens_per_window) / windows.max(2).saturating_sub(1).max(1);
+        let tokens = &ids[start..start + tokens_per_window];
+        state.reset(&stream).unwrap();
+        castprobe::arm();
+        for piece in tokens.chunks(1024) {
+            decoder
+                .feed_rows_layer_major(&mut state, piece, 1024)
+                .unwrap();
+        }
+        let by_layer = castprobe::take();
+        println!(
+            "CAST window {window}: tokens {start}..{} ({} observed projection shapes x layers)",
+            start + tokens_per_window,
+            by_layer.len()
+        );
+        for (&(layer, k, n), stats) in &by_layer {
+            total.entry((k, n)).or_default().merge(stats);
+            worst_layers.push((
+                stats.worst_row,
+                window,
+                layer,
+                k * 100_000 + n,
+                stats.line(),
+            ));
+        }
+    }
+    assert!(
+        !total.is_empty(),
+        "the probe saw no tall projection: the hook did not run"
+    );
+    println!("CAST summary by projection shape (k x n), all windows and layers:");
+    for (&(k, n), stats) in &total {
+        println!("CAST shape {k} x {n}: {}", stats.line());
+    }
+    let mut all = castprobe::Stats::default();
+    for stats in total.values() {
+        all.merge(stats);
+    }
+    println!("CAST all shapes: {}", all.line());
+    worst_layers.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("CAST the 8 (window, layer, shape) cells with the worst row:");
+    for (worst, window, layer, shape, line) in worst_layers.iter().take(8) {
+        println!(
+            "CAST worst {worst:.3e} window {window} layer {layer} shape {}x{}: {line}",
+            shape / 100_000,
+            shape % 100_000
+        );
+    }
+}

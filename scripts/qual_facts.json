@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6110,
-      "ignored": 515,
+      "test_fns": 6113,
+      "ignored": 516,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -150,6 +150,9 @@
         "FLINT_INTERIM_KV_PROFILE",
         "FLINT_INTERIM_RECEIPT",
         "FLINT_MODEL_DIR",
+        "FLINT_PROBE_ROW_STRIDE",
+        "FLINT_PROBE_TOKENS",
+        "FLINT_PROBE_WINDOWS",
         "FLINT_PUBLISHER_CPU_PROOF",
         "FLINT_QUAL_BENCH_REPS",
         "FLINT_QUAL_CHUNK_ROWS",

@@ -215,6 +215,8 @@ impl LayerPass for Pass<'_, '_> {
         // router; an abort here may replace its refusal with an earlier ring
         // fault, never a later one.
         self.progress.set(3 * layer + 1);
+        #[cfg(test)]
+        super::super::castprobe::set_layer(layer);
         let d = self.decoder;
         let view = d.model.layer(layer)?;
         let State {
@@ -276,6 +278,8 @@ impl LayerPass for Pass<'_, '_> {
     }
 
     fn execute_layer_routed_ffn(&mut self, layer: usize, rows: Range<usize>) -> Result<()> {
+        #[cfg(test)]
+        super::super::castprobe::set_layer(layer);
         let d = self.decoder;
         let view = d.model.layer(layer)?;
         let moe = matches!(view.ffn, FlintFfnView::Moe { .. });

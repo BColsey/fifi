@@ -78,6 +78,10 @@ pub(in crate::family::flint::cuda_ffn::device) fn linear_rows(
         };
         ctx.exl3_linear_midrows(stream, weight.linear_call(&part))?;
     }
+    #[cfg(test)]
+    if crate::family::flint::cuda_ffn::device::castprobe::armed() {
+        crate::family::flint::cuda_ffn::device::castprobe::observe(stream, io.xh, io.rows, k, n)?;
+    }
     Ok(())
 }
 

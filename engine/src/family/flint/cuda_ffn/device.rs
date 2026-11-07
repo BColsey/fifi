@@ -809,6 +809,8 @@ pub(crate) fn forward(
 #[cfg(test)]
 mod streaming;
 
+#[cfg(test)]
+pub(crate) mod castprobe;
 pub(crate) mod exl3;
 #[cfg(test)]
 mod exl3_dispatch_tests;
