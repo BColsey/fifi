@@ -53,9 +53,9 @@ pub(crate) struct CudaPrefixEnv {
 }
 
 /// The numeric-path fingerprint a stored CUDA prefix binds: context limit,
-/// prefill chunk size, kv profile, the six effective selectors (alloc
+/// prefill chunk size, kv profile, the seven effective selectors (alloc
 /// cache, late health, packed pointwise, midrows legacy, expert cache,
-/// layer-major), and the model root. Mirrors the MLX `FlintPath` contract.
+/// layer-major, the hi/lo split), and the model root. Mirrors the MLX `FlintPath` contract.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CudaPrefixPath {
     limit: u32,

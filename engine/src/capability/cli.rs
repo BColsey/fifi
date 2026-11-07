@@ -334,6 +334,7 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
             let rows = super::effective::flint_effective(
                 engine.flint.as_ref().unwrap_or(&default_options),
                 &crate::family::flint::budget::FlintEnv::capture(),
+                None,
             );
             rendered.push_str(&format!(
                 "engine {} ({}, model {}):\n",

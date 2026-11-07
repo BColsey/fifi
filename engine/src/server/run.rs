@@ -414,6 +414,8 @@ fn start_flint(
     let effective = crate::capability::effective::flint_effective(
         config.flint.as_ref().unwrap_or(&default_options),
         &flint::budget::FlintEnv::capture(),
+        // The order the open actually served, so a retried load reports the token-major walk.
+        flint::prefill_order::served().as_ref(),
     );
     Ok(StartedEngine {
         engine: started.engine,

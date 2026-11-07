@@ -621,9 +621,11 @@ impl FlintExecutor {
         // jobs pass reserves more memory and the early check sees only the static ceiling, so a
         // defaulted jobs open that fails for want of memory is retried once on the token-major
         // walk (an explicit value is never retried).
-        open_with_default_fallback(
+        let ran = std::cell::Cell::new(order.mode);
+        let opened = open_with_default_fallback(
             &order,
             |mode| {
+                ran.set(mode);
                 Self::open_resolved(
                     root,
                     options,
@@ -639,7 +641,10 @@ impl FlintExecutor {
                 )
             },
             |line| eprintln!("{line}"),
-        )
+        )?;
+        // What the running server reports as its effective settings is what actually opened.
+        super::prefill_order::record_served(&order.with_mode(ran.get()));
+        Ok(opened)
     }
 
     /// The open for a resolved prefill order: plans the memory, loads the weights and arms the
@@ -1397,6 +1402,7 @@ mod open_switch_tests {
             "alloc_cache_selected(),",
             "jobs_default_admitted(options),",
             "open_with_default_fallback(",
+            "record_served(",
             "hilo: mode == LayerMajor::Jobs && order.hilo,",
             "order.with_mode(mode).load_suffix()",
             "tall_hilo_from_env(",

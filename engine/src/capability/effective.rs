@@ -195,6 +195,7 @@ pub(crate) fn q36_effective(
 pub(crate) fn flint_effective(
     options: &crate::family::flint::settings::FlintOptions,
     env: &crate::family::flint::budget::FlintEnv,
+    served: Option<&crate::family::flint::prefill_order::PrefillOrder>,
 ) -> Vec<EffectiveSetting> {
     use crate::family::flint::{
         budget::{BankRequest, ExpertCacheMode, LayerMajor},
@@ -308,14 +309,22 @@ pub(crate) fn flint_effective(
         options.cpu_moe_threads,
     )
     .unwrap_or_default();
-    let (layer_major, hilo) = match env.prefill_order(options, &cpu_moe) {
+    // A running engine reports the order its open actually served (a retry reads as the token-major walk);
+    // a diagnostic with no engine resolves it from the environment, assuming the jobs reserve is admitted.
+    let resolved = match served {
+        Some(order) => Ok(order.clone()),
+        None => env.prefill_order(options, &cpu_moe),
+    };
+    let (layer_major, hilo) = match resolved {
         Ok(order) => {
             let name = match order.mode {
                 LayerMajor::Off => "off (token-major)",
                 LayerMajor::Tiles => "tiles (1)",
                 LayerMajor::Jobs => "jobs",
             };
-            let source = if order.defaulted {
+            let source = if order.fell_back {
+                "default-fallback"
+            } else if order.defaulted {
                 "default"
             } else {
                 "explicit"
@@ -382,7 +391,8 @@ mod tests {
         use crate::family::flint::budget::FlintEnv;
         use crate::family::flint::settings::FlintOptions;
 
-        let rows = super::flint_effective(&FlintOptions::cuda_default(), &FlintEnv::default());
+        let rows =
+            super::flint_effective(&FlintOptions::cuda_default(), &FlintEnv::default(), None);
         assert_eq!(origin(&rows, "context_limit"), Origin::Default);
         let context = rows.iter().find(|r| r.key == "context_limit").unwrap();
         assert_eq!(context.value, "131072");
@@ -408,7 +418,7 @@ mod tests {
             layer_major: Some(std::ffi::OsString::from("jobs")),
             ..FlintEnv::default()
         };
-        let rows = super::flint_effective(&options, &env);
+        let rows = super::flint_effective(&options, &env, None);
         assert_eq!(origin(&rows, "kv_profile"), Origin::ConfigFile);
         assert_eq!(origin(&rows, "cpu_moe_threads"), Origin::ConfigFile);
         assert_eq!(origin(&rows, "expert_slots"), Origin::Environment);
@@ -423,9 +433,42 @@ mod tests {
             layer_major: Some(std::ffi::OsString::from("yes")),
             ..FlintEnv::default()
         };
-        let rows = super::flint_effective(&FlintOptions::cuda_default(), &env);
+        let rows = super::flint_effective(&FlintOptions::cuda_default(), &env, None);
         let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
         assert!(major.value.starts_with("refused:"), "{}", major.value);
+    }
+
+    /// A running engine reports the order its open served: a defaulted jobs open that fell back to the token-major
+    /// walk reads as that walk, with no split, not as the environment's default.
+    #[test]
+    fn a_served_fallback_is_reported_as_the_token_major_walk() {
+        use crate::family::flint::budget::{FlintEnv, LayerMajor};
+        use crate::family::flint::prefill_order::{OrderInputs, resolve_prefill_order};
+        use crate::family::flint::settings::FlintOptions;
+        let options = FlintOptions::cuda_default();
+        let none = crate::family::flint::budget::CpuMoeConfig::default();
+        let jobs = resolve_prefill_order(
+            None,
+            None,
+            &OrderInputs::for_options(&options, &none, true, true),
+        )
+        .unwrap();
+        let fell = jobs.with_mode(LayerMajor::Off);
+        let rows = super::flint_effective(&options, &FlintEnv::default(), Some(&fell));
+        let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
+        assert!(
+            major
+                .value
+                .starts_with("off (token-major) (default-fallback"),
+            "{}",
+            major.value
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "tall_hilo" && r.value == "off")
+        );
+        let rows = super::flint_effective(&options, &FlintEnv::default(), Some(&jobs));
+        assert!(rows.iter().any(|r| r.key == "tall_hilo" && r.value == "on"));
     }
 
     /// The Flint prefill order and its hi/lo split are Flint settings: a Qwen3.6 load reports neither,

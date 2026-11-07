@@ -113,7 +113,8 @@ mod tests {
         assert_eq!(row_slices(145), [(0, 73), (73, 72)]);
     }
 
-    /// The hi/lo entry is reached only through the opt-in switch; unset keeps the call it always made. The exact text of the branch
+    /// The hi/lo entry is reached only when the resolved state is on (the jobs pass with the split, the default); a state that
+    /// is off keeps the rows entry it always made. The exact text of the branch
     /// is asserted, so an inverted condition fails.
     #[test]
     fn the_hilo_entry_sits_behind_the_switch_and_unset_keeps_the_rows_entry() {

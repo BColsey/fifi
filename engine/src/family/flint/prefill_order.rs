@@ -61,6 +61,9 @@ pub(crate) struct PrefillOrder {
     pub(crate) hilo_defaulted: bool,
     /// The operator asked for the hi/lo split but the order is not the jobs pass, so it has no effect.
     pub(crate) hilo_inactive: bool,
+    /// The open fell back from a defaulted jobs open to the token-major walk, so the load line must not read as an
+    /// ordinary default token-major load.
+    pub(crate) fell_back: bool,
 }
 
 impl PrefillOrder {
@@ -81,13 +84,19 @@ impl PrefillOrder {
             hilo: false,
             hilo_defaulted: true,
             hilo_inactive: false,
+            fell_back: true,
         }
     }
 
     /// The load-line tokens for the order: the source of the mode, and the hi/lo state with its source.
     pub(crate) fn load_suffix(&self) -> String {
         let source = |defaulted: bool| if defaulted { "default" } else { "explicit" };
-        let mut line = format!(" prefill_order_source={}", source(self.defaulted));
+        let mode_source = if self.fell_back {
+            "default-fallback"
+        } else {
+            source(self.defaulted)
+        };
+        let mut line = format!(" prefill_order_source={mode_source}");
         if self.hilo {
             line.push_str(&format!(
                 " tall_hilo=on tall_hilo_source={}",
@@ -202,12 +211,17 @@ pub(crate) fn resolve_prefill_order(
         hilo: jobs && hilo.unwrap_or(true),
         hilo_defaulted: hilo.is_none(),
         hilo_inactive: !jobs && hilo == Some(true),
+        fell_back: false,
     })
 }
 
 /// Whether a jobs open the engine chose by default failed for want of memory, so that the
 /// token-major walk may be tried: a memory-plan refusal, or a device allocation that ran out.
 /// Any other failure (a bad checkpoint, a bad switch) is not about the order and stays a failure.
+///
+/// The `Backend` arm only logs and fails fast: a native failure other than a clean allocation
+/// refusal latches the process terminal, so the second open ends in the generic terminal
+/// error. The `MemoryPlan` arm is the case a retry can serve.
 pub(crate) fn retry_token_major(error: &EngError) -> bool {
     match error {
         EngError::MemoryPlan(_) => true,
@@ -238,6 +252,25 @@ pub(crate) fn open_with_default_fallback<T>(
         }
         opened => opened,
     }
+}
+
+/// The order the last Flint open actually served (after a fallback, the token-major walk), kept for
+/// the effective settings the running server reports. One Flint engine per process.
+static SERVED: std::sync::Mutex<Option<PrefillOrder>> = std::sync::Mutex::new(None);
+
+/// Records the order a successful open served.
+pub(crate) fn record_served(order: &PrefillOrder) {
+    *SERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(order.clone());
+}
+
+/// The order the last successful Flint open served, if one has opened in this process.
+pub(crate) fn served() -> Option<PrefillOrder> {
+    SERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 #[cfg(test)]
@@ -513,7 +546,54 @@ mod tests {
             "{}",
             fell.why
         );
-        assert_eq!(fell.load_suffix(), " prefill_order_source=default");
+        assert!(fell.fell_back && !jobs.fell_back);
+        assert_eq!(fell.load_suffix(), " prefill_order_source=default-fallback");
+    }
+
+    /// The served order is what the running server reports: a recorded fallback reads back as the token-major walk.
+    #[test]
+    fn the_served_order_reads_back_what_the_open_recorded() {
+        let jobs = resolve_prefill_order(None, None, &inputs("f16", &none())).unwrap();
+        record_served(&jobs.with_mode(LayerMajor::Off));
+        let served = served().expect("recorded");
+        assert_eq!(served.mode, LayerMajor::Off);
+        assert!(served.fell_back && !served.hilo);
+    }
+
+    /// The one line that links the resolved hi/lo state to the kernels: `open_resolved` hands `hilo` to
+    /// `set_tall_hilo` before it touches the device, un-negated and not as a literal, and the open records
+    /// the order it served. Deleting or inverting either fails here on the host.
+    #[test]
+    fn the_open_hands_the_resolved_hilo_state_to_the_kernels() {
+        let source = include_str!("cuda_executor.rs");
+        let start = source
+            .find("    fn open_resolved(")
+            .expect("open_resolved exists");
+        let body = &source[start..start + 1600];
+        let set = body
+            .find("super::settings::set_tall_hilo(hilo);")
+            .expect("open_resolved calls set_tall_hilo(hilo)");
+        let device = body
+            .find("CudaContext::")
+            .expect("open_resolved opens the context");
+        assert!(set < device, "the state is set before any device work");
+        assert!(
+            body.contains("            hilo,\n"),
+            "hilo comes from the resolved state"
+        );
+        for wrong in [
+            "set_tall_hilo(!hilo)",
+            "set_tall_hilo(true)",
+            "set_tall_hilo(false)",
+        ] {
+            assert!(!source.contains(wrong), "{wrong}");
+        }
+        let open = source.find("    fn open_with(").expect("open_with exists");
+        let open_body = &source[open..start];
+        assert!(
+            open_body.contains("record_served(&order.with_mode("),
+            "the open records the order it served"
+        );
     }
 
     fn order(mode: LayerMajor, defaulted: bool) -> PrefillOrder {
@@ -524,6 +604,7 @@ mod tests {
             hilo: false,
             hilo_defaulted: true,
             hilo_inactive: false,
+            fell_back: false,
         }
     }
 

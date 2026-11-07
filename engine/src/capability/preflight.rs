@@ -1234,14 +1234,19 @@ fn flint_estimate(
                     crate::family::flint::budget::LayerMajor::Jobs => "jobs",
                 };
                 format!(
-                    "{name} ({}: {}){}",
+                    "{name} ({}: {}){}{}",
                     if order.defaulted {
                         "default"
                     } else {
                         "explicit"
                     },
                     order.why,
-                    if order.hilo { ", hi/lo split on" } else { "" }
+                    if order.hilo { ", hi/lo split on" } else { "" },
+                    if order.mode == crate::family::flint::budget::LayerMajor::Jobs {
+                        "; the fit estimate does not include the jobs pass's extra work reserve (about 0.6 GB); an open that does not fit retries on the token-major walk"
+                    } else {
+                        ""
+                    }
                 )
             },
             alternatives: Vec::new(),
