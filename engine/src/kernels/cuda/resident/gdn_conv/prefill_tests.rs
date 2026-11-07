@@ -11,6 +11,7 @@ use super::{
     prefill_rows,
 };
 use crate::EngError;
+use crate::kernels::cuda::gdn_mutants::quick;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream};
 
@@ -245,14 +246,21 @@ fn the_prefill_kernel_writes_the_bytes_of_the_original() {
     let rig = Rig::new();
     // 1 (decode), 2, 3 (K - 1), 4 (K), 5, a row count off every tile edge, the tile edges and
     // their neighbours, and the chunk sizes of the prefill.
-    let rows = [
-        1usize, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 1024, 2048,
-    ];
+    let rows: &[usize] = if quick() {
+        &[1, 2, 3, 17, 70, 200]
+    } else {
+        &[
+            1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 1024, 2048,
+        ]
+    };
     for (i, &m) in rows.iter().enumerate() {
         let inp = inputs(QWEN36.0, QWEN36.1, m, 0x6c01_0000 + i as u64);
         check_one_piece(&rig, &inp, &format!("qwen36 m {m}"));
         let inp = inputs(FLASH_NEXT.0, FLASH_NEXT.1, m, 0x6c02_0000 + i as u64);
         check_one_piece(&rig, &inp, &format!("flash-next m {m}"));
+    }
+    if quick() {
+        return;
     }
     // 4,096 plus an odd tail.
     let inp = inputs(QWEN36.0, QWEN36.1, 4099, 0x6c03_0001);
@@ -284,14 +292,24 @@ fn pieces_carry_the_window_across_launches_and_across_kernels() {
         return;
     }
     let rig = Rig::new();
-    let inp = inputs(QWEN36.0, QWEN36.1, 4099, 0x6c05_0001);
+    let total = if quick() { 300 } else { 4099 };
+    let inp = inputs(QWEN36.0, QWEN36.1, total, 0x6c05_0001);
     let want = run_pieces(&rig, &inp, &[(inp.m, Kernel::Original)]);
-    let cuts: [&[usize]; 4] = [
-        &[2048, 1024, 1024, 3],
-        &[2048, 2048, 3],
-        &[1, 2, 4091, 5],
-        &[1024, 1024, 1024, 1024, 3],
-    ];
+    let cuts: [&[usize]; 4] = if quick() {
+        [
+            &[128, 100, 70, 2],
+            &[150, 150],
+            &[1, 2, 290, 7],
+            &[64, 64, 64, 64, 44],
+        ]
+    } else {
+        [
+            &[2048, 1024, 1024, 3],
+            &[2048, 2048, 3],
+            &[1, 2, 4091, 5],
+            &[1024, 1024, 1024, 1024, 3],
+        ]
+    };
     for cut in cuts {
         let plans: [Vec<(usize, Kernel)>; 4] = [
             cut.iter().map(|&r| (r, Kernel::Original)).collect(),
@@ -337,7 +355,7 @@ fn decode_after_a_prefill_on_the_prefill_kernel_reads_the_window_it_left() {
     }
     let rig = Rig::new();
     for (channels, ld) in [QWEN36, FLASH_NEXT] {
-        let m = 2048 + 7;
+        let m = (if quick() { 300 } else { 2048 }) + 7;
         let inp = inputs(channels, ld, m, 0x6c06_0000 + channels as u64);
         let want = run_pieces(
             &rig,
@@ -527,5 +545,125 @@ fn conv_prefill_kernel_timing() {
                 );
             }
         }
+    }
+}
+
+/// Each deliberately wrong variant of the conv prefill kernel and of its switch code must turn the
+/// byte-identity or switch test that guards it red, and the unmutated control must pass the same short
+/// shape lists. Needs the `cuda-gdn-mutants` build and a device for the kernel mutants;
+/// run with `--test-threads=1`.
+#[cfg(feature = "cuda-gdn-mutants")]
+mod mutants {
+    use super::*;
+    use crate::kernels::cuda::gdn_mutants::{self as gm, select};
+
+    /// The mutant `id` must make `body` panic.
+    fn killed(id: u32, name: &str, body: fn()) {
+        let _selected = select(id);
+        let outcome = std::panic::catch_unwind(body);
+        assert!(
+            outcome.is_err(),
+            "mutant {name} (id {id}) survived its test"
+        );
+    }
+
+    #[test]
+    fn mutant_control_without_a_mutant_passes_the_short_lists() {
+        let _selected = select(0);
+        the_switch_value_is_strict();
+        only_a_long_launch_under_a_set_switch_takes_the_prefill_kernel();
+        the_prefill_kernel_writes_the_bytes_of_the_original();
+        pieces_carry_the_window_across_launches_and_across_kernels();
+        the_switch_routes_only_long_launches_to_the_prefill_kernel();
+    }
+
+    #[test]
+    fn mutant_conv_plain_expression_is_killed() {
+        killed(
+            1,
+            "plain expression",
+            the_prefill_kernel_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_window_words_swapped_is_killed() {
+        killed(
+            2,
+            "window words swapped",
+            the_prefill_kernel_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_state_rows_reversed_is_killed() {
+        killed(
+            3,
+            "state rows reversed",
+            the_prefill_kernel_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_window_written_by_the_wrong_cta_row_is_killed() {
+        killed(
+            4,
+            "window from the wrong CTA row",
+            the_prefill_kernel_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_last_row_not_stored_is_killed() {
+        killed(
+            5,
+            "last row not stored",
+            the_prefill_kernel_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_routing_ignored_is_killed() {
+        killed(
+            gm::ROUTE_IGNORED,
+            "routing ignored",
+            the_switch_routes_only_long_launches_to_the_prefill_kernel,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_threshold_one_is_killed() {
+        killed(
+            gm::MIN_ROWS_ONE,
+            "threshold one",
+            only_a_long_launch_under_a_set_switch_takes_the_prefill_kernel,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_one_selects_sixteen_is_killed() {
+        killed(
+            gm::ONE_IS_SIXTEEN,
+            "1 selects 16",
+            the_switch_value_is_strict,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_value_not_trimmed_is_killed() {
+        killed(
+            gm::CONV_NO_TRIM,
+            "value not trimmed",
+            the_switch_value_is_strict,
+        );
+    }
+
+    #[test]
+    fn mutant_conv_accepts_eight_is_killed() {
+        killed(
+            gm::CONV_ACCEPTS_EIGHT,
+            "accepts 8",
+            the_switch_value_is_strict,
+        );
     }
 }

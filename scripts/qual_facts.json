@@ -4,6 +4,7 @@
     "cuda-arms-qualification",
     "cuda-exl3-rotate-mutants",
     "cuda-fault-qualification",
+    "cuda-gdn-mutants",
     "cuda-q8-reference",
     "default",
     "native-ane",
@@ -15,7 +16,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6597,
+      "test_fns": 6617,
       "ignored": 574,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -339,6 +340,7 @@
         "cuda-arms-qualification",
         "cuda-exl3-rotate-mutants",
         "cuda-fault-qualification",
+        "cuda-gdn-mutants",
         "cuda-q8-reference",
         "native-ane",
         "native-cuda",

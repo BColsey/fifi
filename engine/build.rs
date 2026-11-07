@@ -212,6 +212,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/gdn_conv.h",
     "src/kernels/cuda/native/resident/gdn_delta.h",
     "src/kernels/cuda/native/resident/gdn_delta_partition.cuh",
+    "src/kernels/cuda/native/resident/gdn_mutants.h",
     "src/kernels/cuda/native/resident/graph.h",
     "src/kernels/cuda/native/resident/kv8_append.h",
     "src/kernels/cuda/native/resident/kv_f16_append.h",
@@ -343,6 +344,11 @@ fn build_cuda() {
     // The deliberately wrong input-rotation variants of the EXL3 job-table mutation tests.
     if std::env::var_os("CARGO_FEATURE_CUDA_EXL3_ROTATE_MUTANTS").is_some() {
         build.define("INFERENCE_CUDA_EXL3_ROTATE_MUTANTS", None);
+    }
+    // The deliberately wrong variants of the conv prefill and narrow-block scan kernels of the GDN mutation
+    // tests (resident/gdn_mutants.h). Without the feature no kernel contains a mutant branch.
+    if std::env::var_os("CARGO_FEATURE_CUDA_GDN_MUTANTS").is_some() {
+        build.define("INFERENCE_CUDA_GDN_MUTANTS", None);
     }
     let archs = cuda_archs();
     gencode(&mut build, &archs);

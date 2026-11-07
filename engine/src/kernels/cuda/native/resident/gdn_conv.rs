@@ -322,3 +322,21 @@ pub(in crate::kernels::cuda) fn gdn_conv_snap_launch(
     let status = unsafe { gdn_conv_snap_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
+
+#[cfg(all(test, feature = "cuda-gdn-mutants"))]
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_mutant_select"]
+    fn gdn_mutant_select_raw(id: c_int) -> c_int;
+}
+
+/// Makes the kernel mutant `id` (0 is none; 1 to 11, `native/resident/gdn_mutants.h`) the one the next
+/// conv prefill and narrow-block scan launches run. Mutation tests only; returns whether the id was accepted.
+#[cfg(all(test, feature = "cuda-gdn-mutants"))]
+pub(in crate::kernels::cuda) fn select_gdn_mutant(id: u32) -> bool {
+    let Ok(id) = c_int::try_from(id) else {
+        return false;
+    };
+    // SAFETY: the entry stores one integer in a process-wide atomic and touches no pointer, device
+    // or stream; it refuses an id outside 0 to 11.
+    unsafe { gdn_mutant_select_raw(id) == 0 }
+}

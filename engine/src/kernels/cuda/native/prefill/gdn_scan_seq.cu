@@ -18,6 +18,7 @@
 
 #include "abi.h"
 #include "device.h"
+#include "resident/gdn_mutants.h"
 
 namespace {
 
@@ -60,6 +61,9 @@ struct ScanArgs {
     int *status;
     int m, p0, ctx_tokens, conv_ld, ld, z_off, beta_off, alpha_off, n_k_heads, n_v_heads;
     float eps;
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+    int mutant;  // the active mutant of resident/gdn_mutants.h; 0 is none
+#endif
 };
 
 bool aligned(const void *p, size_t a) { return (uintptr_t)p % a == 0; }
@@ -178,6 +182,9 @@ ScanArgs to_args(const inference_cuda_gdn_scan_seq_args *a) {
     k.n_k_heads = a->n_k_heads;
     k.n_v_heads = a->n_v_heads;
     k.eps = a->eps;
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+    k.mutant = gdn_mutant_current();
+#endif
     return k;
 }
 
@@ -457,6 +464,11 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
 template <int kW, bool kGrouped, bool kAddEps>
 __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(ScanArgs a) {
     constexpr int kCols = kW * 4;
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+    const int mutant = a.mutant;
+#else
+    constexpr int mutant = 0;  // a mutant branch is the constant false and compiles away
+#endif
     constexpr int kSlots = kTile / kW;  // slots staged by each warp
     static_assert(kTile % kW == 0 && kW >= 2 && kW <= 8, "kW warps must tile kTile and hold warp 1");
     __shared__ float4 qk_s[kTile][2][D / 4];
@@ -466,7 +478,7 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
     const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
     const int lane = threadIdx.x, w = threadIdx.y;
     const int g = lane & 7, cg = lane >> 3;
-    const int col = blockIdx.z * kCols + w * 4 + cg;
+    const int col = blockIdx.z * (mutant == 6 ? 32 : kCols) + w * 4 + cg;
     float *st = a.state + (size_t)h * D * D;
     if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
         if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0 &&
@@ -496,7 +508,7 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
         // before the first shuffle of the norms, as in gdn_scan_seq_k. The row pointer is
         // clamped to the last conv row so that a dead slot never forms a pointer past the object.
         float qv[kSlots][4], kv[kSlots][4], vv_l[kSlots];
-        const int v_base = 2 * a.n_k_heads * D + h * D + blockIdx.z * kCols;
+        const int v_base = 2 * a.n_k_heads * D + h * D + blockIdx.z * (mutant == 7 ? 32 : kCols);
 #pragma unroll
         for (int i = 0; i < kSlots; ++i) {
             const int slot = w + i * kW;
@@ -544,7 +556,7 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
 #pragma unroll
         for (int i = 0; i < kSlots; ++i) {
             const int slot = w + i * kW;
-            if (slot < len && lane < kCols) v_s[slot][lane] = vv_l[i];
+            if (slot < len && lane < kCols && !(mutant == 8 && i != 0)) v_s[slot][lane] = vv_l[i];
         }
         __syncthreads();
         for (int j = 0; j < len; ++j) {
@@ -573,7 +585,8 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
                     acc[c] += s[k][c] * khat[k][c];
                 }
             }
-            const float sk = group_sum((acc[0] + acc[1]) + (acc[2] + acc[3]));
+            const float sk = group_sum(mutant == 10 ? (acc[0] + acc[2]) + (acc[1] + acc[3])
+                                                  : (acc[0] + acc[1]) + (acc[2] + acc[3]));
             const float d = (vv - sk) * gb.y;
             float oacc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -593,7 +606,8 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
     for (int k = 0; k < 4; ++k) {
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-            st[(size_t)(32 * k + 4 * g + c) * D + col] = s[k][c];
+            st[(size_t)(32 * k + 4 * g + c) * D + col] =
+                (mutant == 11 && kW == 4 && h == 0) ? 0.f : s[k][c];
         }
     }
 }
@@ -619,12 +633,19 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
     row[j] = o * rstd * a.norm_w[j] * out_gate<kSigmoid>(p[a.z_off + h * D + j]);
 }
 
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+bool host_mutant_nine(const ScanArgs &k) { return k.mutant == 9; }
+#else
+constexpr bool host_mutant_nine(const ScanArgs &) { return false; }
+#endif
+
 // The scan launch of `cols` value columns per block: 0 is the original kernel gdn_scan_seq_k,
 // 8, 16 and 32 are gdn_scan_seq_cols_k (the caller has checked the value).
 template <int kW, bool kGrouped, bool kAddEps>
 void launch_cols(const ScanArgs &k, void *stream) {
     gdn_scan_seq_cols_k<kW, kGrouped, kAddEps>
-        <<<dim3(k.n_v_heads, 1, D / (4 * kW)), dim3(kLanes, kW, 1), 0, (cudaStream_t)stream>>>(k);
+        <<<dim3(k.n_v_heads, 1, D / (host_mutant_nine(k) ? 32 : 4 * kW)), dim3(kLanes, kW, 1), 0,
+          (cudaStream_t)stream>>>(k);
 }
 
 template <bool kGrouped, bool kAddEps>

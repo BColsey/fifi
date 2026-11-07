@@ -42,6 +42,7 @@ cuda-fault-qualification = ["native-cuda"]
 cuda-q8-reference = ["native-cuda"]
 cuda-arms-qualification = ["native-cuda"]
 cuda-exl3-rotate-mutants = ["native-cuda"]
+cuda-gdn-mutants = ["native-cuda"]
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 mlx-sys = { version = "=0.6.0", optional = true, default-features = false, features = ["accelerate", "metal"] }

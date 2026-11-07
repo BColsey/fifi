@@ -10,6 +10,7 @@
 #include "device.h"
 #include "ops.h"
 #include "resident/gdn_conv.h"
+#include "resident/gdn_mutants.h"
 
 namespace {
 
@@ -88,7 +89,10 @@ __device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x))
 template <int R>
 __global__ void __launch_bounds__(kBlock)
 conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
-                 const float4 *__restrict__ w, float *state, float *__restrict__ out) {
+                 const float4 *__restrict__ w, float *state, float *__restrict__ out GDN_MUTANT_PARAM) {
+#ifndef INFERENCE_CUDA_GDN_MUTANTS
+    constexpr int mutant = 0;  // a mutant branch is the constant false and compiles away
+#endif
     static_assert(R >= 3, "a CTA row after the first must find its window in proj");
     const int c = blockIdx.x * kBlock + threadIdx.x;
     if (c >= n) return;
@@ -99,7 +103,8 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const int r = t0 - 3 + k;
-        x[k] = r >= 0 ? proj[(size_t)r * ld + c] : state[(size_t)(3 + r) * n + c];
+        x[k] = r >= 0 ? proj[(size_t)r * ld + c]
+                      : state[(size_t)(mutant == 3 ? -r - 1 : 3 + r) * n + c];
     }
 #pragma unroll
     for (int j = 0; j < R; ++j) {
@@ -113,13 +118,14 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
             // out: the first product rounded, then three fused multiply-adds in tap order. As a
             // plain expression the compiler fuses the second product first in this kernel, which
             // rounds differently.
-            const float v = __fmaf_rn(x[j + 3], wc.w,
-                                      __fmaf_rn(x[j + 2], wc.z,
-                                                __fmaf_rn(x[j + 1], wc.y, __fmul_rn(x[j], wc.x))));
-            out[(size_t)(t0 + j) * n + c] = silu_f(v);
+            float v = __fmaf_rn(x[j + 3], wc.w,
+                                __fmaf_rn(x[j + 2], wc.z,
+                                          __fmaf_rn(x[j + 1], wc.y, __fmul_rn(x[j], wc.x))));
+            if (mutant == 1) v = x[j] * wc.x + x[j + 1] * wc.y + x[j + 2] * wc.z + x[j + 3] * wc.w;
+            if (!(mutant == 5 && j == rows - 1)) out[(size_t)(t0 + j) * n + c] = silu_f(v);
         }
     }
-    if (blockIdx.y != 0) return;
+    if (mutant == 4 ? blockIdx.y == 0 : blockIdx.y != 0) return;
     float f0, f1, f2;
     if (m >= 3) {
         f0 = proj[(size_t)(m - 3) * ld + c];
@@ -134,6 +140,11 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
         f1 = x[2];
         f2 = proj[c];
     }
+    if (mutant == 2) {
+        const float swapped = f0;
+        f0 = f1;
+        f1 = swapped;
+    }
     state[c] = f0;
     state[n + c] = f1;
     state[2 * n + c] = f2;
@@ -144,7 +155,7 @@ cudaError_t launch_rows(const inference_cuda_gdn_conv_args &a, cudaStream_t stre
     const dim3 grid((a.channels + kBlock - 1) / kBlock, (a.m + R - 1) / R);
     conv_silu_rows_k<R><<<grid, kBlock, 0, stream>>>(
         (const float *)a.proj, a.ld, a.m, a.channels, (const float4 *)a.w, (float *)a.state,
-        (float *)a.out);
+        (float *)a.out GDN_MUTANT_ARG);
     return cudaGetLastError();
 }
 
@@ -214,3 +225,15 @@ extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
+
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+std::atomic<int> g_gdn_mutant{0};
+
+extern "C" int inference_cuda_gdn_mutant_select(int id) {
+    if (id < 0 || id > 11) {
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    }
+    g_gdn_mutant.store(id, std::memory_order_relaxed);
+    return INFERENCE_CUDA_OK;
+}
+#endif

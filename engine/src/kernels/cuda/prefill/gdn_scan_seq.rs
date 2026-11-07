@@ -38,6 +38,7 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
+use crate::kernels::cuda::gdn_mutants::{SCAN_ACCEPTS_FOUR, SCAN_NO_TRIM, mutated};
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
     FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
     GdnScanSeqRaw, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
@@ -431,7 +432,14 @@ fn check_apart(call: &GdnScanSeqCall<'_>, need: &ScanBytes) -> Result<(), EngErr
 /// value, including empty and non-UTF-8, keep the original kernel (32 columns per block, 128 blocks
 /// for Qwen3.6).
 pub(crate) fn parse_scan_cols(value: Option<&OsStr>) -> Option<usize> {
-    match value?.to_str()?.trim() {
+    let text = value?.to_str()?;
+    let text = if mutated(SCAN_NO_TRIM) {
+        text
+    } else {
+        text.trim()
+    };
+    match text {
+        "4" if mutated(SCAN_ACCEPTS_FOUR) => Some(4),
         "8" => Some(8),
         "16" => Some(16),
         "32" => Some(32),

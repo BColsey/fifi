@@ -40,6 +40,9 @@ use std::sync::OnceLock;
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
+use crate::kernels::cuda::gdn_mutants::{
+    CONV_ACCEPTS_EIGHT, CONV_NO_TRIM, MIN_ROWS_ONE, ONE_IS_SIXTEEN, ROUTE_IGNORED, mutated,
+};
 use crate::kernels::cuda::native::resident::gdn_conv::{
     GDN_CONV_MAX_CHANNELS, GDN_CONV_MAX_LD, GDN_CONV_MAX_M, GDN_CONV_ROWS_PER_THREAD, GdnConvRaw,
     GdnConvSnapRaw, gdn_conv_launch, gdn_conv_rows_launch, gdn_conv_snap_launch,
@@ -123,8 +126,19 @@ pub(crate) const PREFILL_DEFAULT_ROWS: usize = 32;
 /// `32` and `64` that many (surrounding spaces ignored). Unset and every other value, including
 /// empty and non-UTF-8, keep the original kernel.
 pub(crate) fn parse_prefill_setting(value: Option<&OsStr>) -> Option<usize> {
-    match value?.to_str()?.trim() {
-        "1" => Some(PREFILL_DEFAULT_ROWS),
+    let text = value?.to_str()?;
+    let text = if mutated(CONV_NO_TRIM) {
+        text
+    } else {
+        text.trim()
+    };
+    match text {
+        "1" => Some(if mutated(ONE_IS_SIXTEEN) {
+            16
+        } else {
+            PREFILL_DEFAULT_ROWS
+        }),
+        "8" if mutated(CONV_ACCEPTS_EIGHT) => Some(8),
         "16" => Some(16),
         "32" => Some(32),
         "64" => Some(64),
@@ -142,7 +156,12 @@ fn prefill_setting() -> Option<usize> {
 /// Rows per thread of the prefill kernel for a launch of `m` rows under `setting`, or `None` for
 /// the original kernel.
 pub(crate) fn prefill_rows(setting: Option<usize>, m: usize) -> Option<usize> {
-    setting.filter(|_| m >= PREFILL_MIN_ROWS)
+    let min = if mutated(MIN_ROWS_ONE) {
+        1
+    } else {
+        PREFILL_MIN_ROWS
+    };
+    setting.filter(|_| m >= min)
 }
 
 fn check_shape(shape: ConvShape) -> Result<(), EngError> {
@@ -191,6 +210,11 @@ impl CudaContext {
         call: ConvCall<'_>,
         setting: Option<usize>,
     ) -> Result<(), EngError> {
+        let setting = if mutated(ROUTE_IGNORED) {
+            None
+        } else {
+            setting
+        };
         match prefill_rows(setting, call.shape.m) {
             Some(rows) => self.gdn_conv_rows(stream, call, rows),
             None => self.gdn_conv_original(stream, call),

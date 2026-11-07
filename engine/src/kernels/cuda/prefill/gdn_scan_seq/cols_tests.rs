@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 
 use super::{GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, parse_scan_cols, scan_bytes};
 use crate::EngError;
+use crate::kernels::cuda::gdn_mutants::quick;
 use crate::kernels::cuda::testkit::{self, Rng};
 use crate::kernels::cuda::{CudaContext, DeviceStream};
 
@@ -238,7 +239,11 @@ fn the_narrow_block_scan_writes_the_bytes_of_the_original() {
         return;
     }
     let rig = Rig::new();
-    let rows = [1usize, 2, 7, 8, 9, 15, 16, 17, 31, 33, 100];
+    let rows: &[usize] = if quick() {
+        &[1, 17, 33]
+    } else {
+        &[1, 2, 7, 8, 9, 15, 16, 17, 31, 33, 100]
+    };
     // (name, key heads, value heads, form): the two models' head counts, a tiled and a grouped
     // small geometry, and a geometry whose value heads are not a power of two per key head.
     let geometries = [
@@ -247,11 +252,19 @@ fn the_narrow_block_scan_writes_the_bytes_of_the_original() {
         ("small-tiled", 2, 4, GdnForm::QWEN36_GGUF),
         ("small-grouped", 3, 6, GdnForm::FLASH_NEXT),
     ];
+    let geometries: &[_] = if quick() {
+        &geometries[..1]
+    } else {
+        &geometries
+    };
     for (g, &(name, n_k, n_v, form)) in geometries.iter().enumerate() {
         for (i, &m) in rows.iter().enumerate() {
             let c = case(n_k, n_v, m, form, 0x5c01_0000 + (g * 100 + i) as u64);
             check_widths(&rig, &c, &format!("{name} m {m}"));
         }
+    }
+    if quick() {
+        return;
     }
     // The chunk sizes of the prefill.
     for (name, n_k, n_v, form) in [
@@ -271,14 +284,20 @@ fn pieces_carry_the_state_across_launches_and_across_kernels() {
         return;
     }
     let rig = Rig::new();
-    for (form, n_v) in [(GdnForm::QWEN36_GGUF, 32usize), (GdnForm::FLASH_NEXT, 48)] {
-        let c = case(16, n_v, 1500, form, 0x5c03_0000 + n_v as u64);
+    let forms = [(GdnForm::QWEN36_GGUF, 32usize), (GdnForm::FLASH_NEXT, 48)];
+    for &(form, n_v) in if quick() { &forms[..1] } else { &forms[..] } {
+        let total = if quick() { 300 } else { 1500 };
+        let c = case(16, n_v, total, form, 0x5c03_0000 + n_v as u64);
         let want = run_pieces(&rig, &c, &[(c.m, None)]);
-        let cuts: [&[usize]; 3] = [
-            &[1024, 300, 176],
-            &[1, 2, 1497],
-            &[512, 512, 512, 16, 1, 3, 4],
-        ];
+        let cuts: [&[usize]; 3] = if quick() {
+            [&[200, 99, 1], &[1, 2, 297], &[100, 100, 64, 16, 1, 3, 16]]
+        } else {
+            [
+                &[1024, 300, 176],
+                &[1, 2, 1497],
+                &[512, 512, 512, 16, 1, 3, 4],
+            ]
+        };
         for cut in cuts {
             let plans: [Vec<(usize, Option<usize>)>; 4] = [
                 cut.iter().map(|&r| (r, None)).collect(),
@@ -410,5 +429,105 @@ fn scan_cols_kernel_timing() {
                 );
             }
         }
+    }
+}
+
+/// Each deliberately wrong variant of the narrow-block scan kernel and of its switch code must turn the
+/// byte-identity or switch test that guards it red, and the unmutated control must pass the same short
+/// shape lists. Needs the `cuda-gdn-mutants` build and a device for the kernel mutants;
+/// run with `--test-threads=1`.
+#[cfg(feature = "cuda-gdn-mutants")]
+mod mutants {
+    use super::*;
+    use crate::kernels::cuda::gdn_mutants::{self as gm, select};
+
+    /// The mutant `id` must make `body` panic.
+    fn killed(id: u32, name: &str, body: fn()) {
+        let _selected = select(id);
+        let outcome = std::panic::catch_unwind(body);
+        assert!(
+            outcome.is_err(),
+            "mutant {name} (id {id}) survived its test"
+        );
+    }
+
+    #[test]
+    fn mutant_control_without_a_mutant_passes_the_short_lists() {
+        let _selected = select(0);
+        the_scan_columns_value_is_strict();
+        the_narrow_block_scan_writes_the_bytes_of_the_original();
+        pieces_carry_the_state_across_launches_and_across_kernels();
+    }
+
+    #[test]
+    fn mutant_scan_column_offset_is_killed() {
+        killed(
+            6,
+            "column offset",
+            the_narrow_block_scan_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_v_offset_is_killed() {
+        killed(
+            7,
+            "v offset",
+            the_narrow_block_scan_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_v_staged_for_one_slot_is_killed() {
+        killed(
+            8,
+            "v staged for one slot",
+            the_narrow_block_scan_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_grid_too_small_is_killed() {
+        killed(
+            9,
+            "grid too small",
+            the_narrow_block_scan_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_sum_order_is_killed() {
+        killed(
+            10,
+            "sum order",
+            the_narrow_block_scan_writes_the_bytes_of_the_original,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_state_store_dropped_is_killed() {
+        killed(
+            11,
+            "state store dropped",
+            pieces_carry_the_state_across_launches_and_across_kernels,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_accepts_four_is_killed() {
+        killed(
+            gm::SCAN_ACCEPTS_FOUR,
+            "accepts 4",
+            the_scan_columns_value_is_strict,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_value_not_trimmed_is_killed() {
+        killed(
+            gm::SCAN_NO_TRIM,
+            "value not trimmed",
+            the_scan_columns_value_is_strict,
+        );
     }
 }
