@@ -442,6 +442,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// each block, so it is valid for the eager body only (test builds only).
     #[cfg(test)]
     pub(super) moe_pick_tap: std::cell::RefCell<Option<Vec<MoePicks>>>,
+    /// The per-layer residual taps of the next eager body, when a test turned them on (test
+    /// builds only; the bisect aid of the K-row checks, absent from the serving path).
+    #[cfg(test)]
+    taps: std::cell::RefCell<Option<Vec<krow_step::LayerTap>>>,
     /// Drain the stream after each device-rollback capture, so the copy's time shows in the trace
     /// (test builds only; the copy otherwise overlaps the host's next work).
     #[cfg(test)]
@@ -769,6 +773,7 @@ impl<'a> QwenResidentStep<'a> {
             window_trace: Default::default(),
             #[cfg(test)]
             moe_pick_tap: Default::default(),
+            taps: Default::default(),
             speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
@@ -1814,6 +1819,8 @@ impl<'a> QwenResidentStep<'a> {
                 marks.record_before(op, &self.stream)?;
             }
             self.run_op(op, admit_pos, bufs.as_ref(), params, trace_step)?;
+            #[cfg(test)]
+            self.tap_after(op, 1, false)?;
             #[cfg(feature = "research-activation")]
             if let StepOp::Moe(crate::family::qwen36::activation::LAYER) = op {
                 self.capture_activation(admit_pos)?;
@@ -2290,7 +2297,7 @@ mod prefix_runtime;
 mod krow_step;
 
 #[cfg(test)]
-pub(super) use krow_step::Injection;
+pub(super) use krow_step::{Injection, LayerTap};
 
 #[path = "rollback_runtime.rs"]
 mod rollback_runtime;

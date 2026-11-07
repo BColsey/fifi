@@ -119,6 +119,17 @@ pub(crate) enum Injection {
     HiddenNan(usize),
 }
 
+/// Test builds only: the residual rows after one op of a layer. `after_moe` false is the residual
+/// after the mixer (the MoE block's input), true the layer's output.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LayerTap {
+    pub(crate) layer: usize,
+    pub(crate) after_moe: bool,
+    /// The bytes of each row of the residual, `hidden` f32 values per row.
+    pub(crate) rows: Vec<Vec<u8>>,
+}
+
 /// What the ops of one block share.
 struct RowsRun<'r> {
     weights: &'r LayerWeights<'r>,
@@ -391,8 +402,18 @@ impl<'a> QwenResidentStep<'a> {
                 self.inject_hidden()?;
                 Ok(())
             }
-            RowsOp::Step(StepOp::Mixer(layer)) => self.mixer_rows(layer, k, admit_pos),
-            RowsOp::Step(StepOp::Moe(layer)) => self.moe_rows(layer, k),
+            RowsOp::Step(StepOp::Mixer(layer)) => {
+                self.mixer_rows(layer, k, admit_pos)?;
+                #[cfg(test)]
+                self.tap_after(StepOp::Mixer(layer), k, true)?;
+                Ok(())
+            }
+            RowsOp::Step(StepOp::Moe(layer)) => {
+                self.moe_rows(layer, k)?;
+                #[cfg(test)]
+                self.tap_after(StepOp::Moe(layer), k, true)?;
+                Ok(())
+            }
             RowsOp::Step(StepOp::FinalNorm) => self.final_norm_rows(k),
             RowsOp::Step(StepOp::LmHead) => {
                 self.lm_head_rows(k)?;
@@ -843,6 +864,48 @@ impl QwenResidentStep<'_> {
             self.window_fault = None;
             self.inject_krow(Injection::LogitsNan(row));
         }
+    }
+
+    /// Turns the per-layer taps on for the next eager body (one-row or K-row): after every mixer
+    /// and every MoE block the residual rows are read back (a synchronization, so the body must
+    /// not be captured).
+    pub(crate) fn start_taps(&self) {
+        *self.taps.borrow_mut() = Some(Vec::new());
+    }
+
+    /// The taps of the body that ran since [`Self::start_taps`], in launch order; turns them off.
+    pub(crate) fn take_taps(&self) -> Vec<LayerTap> {
+        self.taps.borrow_mut().take().unwrap_or_default()
+    }
+
+    /// Records the residual rows after `op` when taps are on. `krow` selects the K-row arena.
+    pub(super) fn tap_after(&self, op: StepOp, rows: usize, krow: bool) -> Result<(), EngError> {
+        if self.taps.borrow().is_none() {
+            return Ok(());
+        }
+        let (layer, after_moe, slot) = match op {
+            StepOp::Mixer(layer) => (layer, false, resid_in(layer)),
+            StepOp::Moe(layer) => (layer, true, resid_out(layer)),
+            _ => return Ok(()),
+        };
+        let view = if krow {
+            self.kview(slot)?
+        } else {
+            self.view(slot)?
+        };
+        let row_bytes = self.res.geometry.hidden * F32;
+        let mut bytes = vec![0u8; rows * row_bytes];
+        view.buffer()
+            .read_at(&self.stream, view.offset(), &mut bytes)?;
+        let tap = LayerTap {
+            layer,
+            after_moe,
+            rows: bytes.chunks_exact(row_bytes).map(<[u8]>::to_vec).collect(),
+        };
+        if let Some(taps) = self.taps.borrow_mut().as_mut() {
+            taps.push(tap);
+        }
+        Ok(())
     }
 
     /// The injection is for one window: it is gone when the body has run.

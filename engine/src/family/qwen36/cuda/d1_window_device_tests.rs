@@ -1287,3 +1287,43 @@ fn d1_krow_an_out_of_vocabulary_id_is_refused_before_anything_is_enqueued() {
         full_logits(&mut rig.step, &inputs),
     );
 }
+
+/// Check B: the residual after every mixer block and every MoE block of a K-row window against the
+/// same residual of the one-row steps of the same rows, byte for byte. It is the bisect aid for a
+/// failure of A, C, D or K: the first differing tap names the layer, the block and the row. Needs
+/// the eager body (`FIFI_D1_CAPTURE=0`: the taps read the device inside the body) and
+/// `FIFI_D1_VERIFY=krow`. Off by default and absent from the serving path.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_b_per_layer_taps() {
+    assert!(
+        !capture_from_env(),
+        "check B reads the device inside the body: set FIFI_D1_CAPTURE=0"
+    );
+    let (mut rig, _session, base, _inputs) = krow_rig(2);
+    let prefix = rig.prefixes[0];
+    for rows in [2, 4, 8] {
+        let inputs = window_inputs(&rig.stream, prefix, rows);
+        rig.step.start_taps();
+        rig.step.run_window(&inputs).expect("the K-row window");
+        let window = rig.step.take_taps();
+        rig.step.restore(&base).expect("restore");
+        let mut steps = Vec::with_capacity(rows);
+        for &token in &inputs {
+            rig.step.start_taps();
+            rig.step.logits(token).expect("a one-row step");
+            steps.push(rig.step.take_taps());
+        }
+        rig.step.restore(&base).expect("restore");
+        let verdict = super::krow_device_tests::tap_difference(&window, &steps);
+        match verdict {
+            None => println!(
+                "D1_RESULT test=B prefix={prefix} rows={rows} PASS taps={} per row",
+                window.len()
+            ),
+            Some(difference) => panic!(
+                "D1_RESULT test=B prefix={prefix} rows={rows} FAIL first differing tap: {difference}"
+            ),
+        }
+    }
+}
