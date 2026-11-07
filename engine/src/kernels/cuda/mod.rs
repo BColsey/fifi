@@ -67,7 +67,6 @@ pub(crate) mod resident;
 #[cfg(test)]
 mod testkit;
 
-pub(crate) use arena::ARENA_ALIGN;
 pub(crate) use context::{
     Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
     Nvfp4WeightRange, PINNED_STAGE_LIMIT_BYTES, PinnedBuf, QuantTensor, TiledWeight,

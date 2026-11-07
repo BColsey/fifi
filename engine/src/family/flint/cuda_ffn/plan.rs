@@ -140,3 +140,16 @@ impl Grouping {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // The host-side bank floor in `family::flint::budget` is defined as
+    // this module's device TOP_K; keep the two pinned together.
+    #[test]
+    fn budget_floor_uses_the_device_top_k() {
+        assert_eq!(
+            crate::family::flint::budget::cache_prefill_floor(7).unwrap(),
+            super::TOP_K * 7
+        );
+    }
+}

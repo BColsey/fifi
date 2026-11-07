@@ -1,6 +1,10 @@
 //! Single-session CUDA adapter. The shared session owns generation and publication.
 
 use super::{
+    budget::{
+        ALLOC_CACHE_VAR, FLINT_HEADROOM_BYTES, MODEL_CONTEXT_LIMIT, bank_note,
+        work_reserve_closed_form,
+    },
     cpu_moe::{self, CpuMoeConfig},
     cuda_ffn::device::runtime::{Decoder, LAYER_MAJOR_PIECE_ROWS, State, VOCAB},
     cuda_prefix::{CudaPrefixEnv, CudaPrefixPath, CudaPrefixSnapshot},
@@ -33,8 +37,6 @@ use crate::{
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, EngError>;
-
-const ALLOC_CACHE_VAR: &str = "FIFI_FLINT_CUDA_ALLOC_CACHE";
 
 /// Layer-major working-memory ceiling: a 21 GiB lease (21,504 MiB).
 const LAYER_MAJOR_CEILING_BYTES: u64 = 21 << 30;
@@ -282,10 +284,11 @@ impl TokenStepper for Step<'_> {
 }
 
 fn work_reserve(plan: &super::kv_plan::KvPlan, chunk_rows: u32, cache_bytes: u64) -> Result<u64> {
-    // Six routed + one shared expert retain <16 MiB per extra row at width <=32768.
-    ((512 + 16 * (u64::from(chunk_rows) - 1)) << 20)
+    // The closed-form per-row charge plus the device scratch the state
+    // owns (see `budget` for why the scratch stays here): the same sum the
+    // load charges, kept in one place per term.
+    work_reserve_closed_form(chunk_rows, cache_bytes)?
         .checked_add(State::scratch_bytes(plan)?)
-        .and_then(|bytes| bytes.checked_add(cache_bytes))
         .ok_or_else(|| EngError::MemoryPlan("Flint workspace reserve overflows".into()))
 }
 
@@ -304,25 +307,12 @@ fn reserve_with(
     Ok(Reserve {
         kv_cache: kv.bytes(k_row + v_row)? as u64,
         work: work_reserve(kv, options.prefill_chunk_size, cache_bytes)?,
-        headroom: 512 << 20,
+        headroom: FLINT_HEADROOM_BYTES,
     })
 }
 
-fn bank_note(context: u32, slots: usize, reason: &str) -> String {
-    let why = match reason {
-        "auto" => format!("context {context} does not fit with every expert on the GPU"),
-        "override" => "FIFI_FLINT_CUDA_EXPERT_SLOTS asks for a smaller bank".to_owned(),
-        _ => "FIFI_FLINT_CUDA_EXPERT_CACHE=1 asks for the host buffer".to_owned(),
-    };
-    format!(
-        "Flint expert bank: {why}. {slots} of 256 experts per layer stay on the GPU and all 256 sit in \
-         pinned host memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
-    )
-}
-
 /// The model's own context limit, which no profile exceeds.
-const MODEL_CONTEXT_LIMIT: u32 = 262_144;
-
+///
 /// The largest context for which a load with every expert on the GPU (`resident` weight bytes) is
 /// admitted into `free` device bytes, or `None` when not even one token fits. KV cache and work
 /// both grow with the context, so the admitted contexts form a prefix.

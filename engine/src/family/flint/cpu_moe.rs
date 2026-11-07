@@ -28,75 +28,11 @@ use crate::EngError;
 use crate::kernels::exl3_cpu::{ExpertCpu, ExpertView, PairJob};
 use crate::kernels::nvfp4_cpu::WaitPolicy;
 
-/// The offload count that names every routed layer, as in the TabbyAPI key.
-pub(crate) const ALL_LAYERS: usize = 999;
-
-/// Routed experts per layer in the published Flint packs.
-pub(crate) const EXPERTS: usize = 256;
-
-/// Worker threads when the options leave `cpu_moe_threads` at 0: the expert kernels are
-/// DRAM-bound, so more threads than this do not help.
-pub(crate) const DEFAULT_THREADS: usize = 6;
-
-/// Which routed experts the CPU serves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CpuMoeConfig {
-    offload_layers: usize,
-    split_experts: usize,
-    threads: usize,
-}
-
-impl CpuMoeConfig {
-    /// Validates the three option values. An offload count of [`ALL_LAYERS`] or more means every
-    /// routed layer, whatever the model's layer count.
-    pub(crate) fn new(
-        offload_layers: u32,
-        split_experts: u32,
-        threads: u32,
-    ) -> Result<Self, EngError> {
-        let bad = |what: &str| Err(EngError::BadRequest(format!("Flint CPU MoE: {what}")));
-        if offload_layers != 0 && split_experts != 0 {
-            return bad("cpu_moe_offload_layers and cpu_moe_split_experts are exclusive");
-        }
-        // The device keeps the experts of one prefill piece; the bank sizing enforces the floor.
-        if split_experts as usize >= EXPERTS {
-            return bad("cpu_moe_split_experts must be below 256");
-        }
-        if threads > 256 {
-            return bad("cpu_moe_threads must be at most 256");
-        }
-        Ok(Self {
-            offload_layers: offload_layers as usize,
-            split_experts: split_experts as usize,
-            threads: if threads == 0 {
-                DEFAULT_THREADS
-            } else {
-                threads as usize
-            },
-        })
-    }
-
-    pub(crate) fn enabled(&self) -> bool {
-        self.offload_layers != 0 || self.split_experts != 0
-    }
-
-    pub(crate) fn offload_layers(&self) -> usize {
-        self.offload_layers
-    }
-
-    pub(crate) fn split_experts(&self) -> usize {
-        self.split_experts
-    }
-
-    pub(crate) fn threads(&self) -> usize {
-        self.threads
-    }
-
-    /// Whether every routed expert of the `ordinal`-th routed layer runs on the CPU.
-    pub(crate) fn offloads(&self, ordinal: usize) -> bool {
-        ordinal < self.offload_layers
-    }
-}
+// The pure CPU-expert configuration lives in `family::flint::budget`
+// (host-buildable plan inventory); re-exported here for the layer walk.
+#[cfg(test)]
+use crate::family::flint::budget::DEFAULT_THREADS;
+pub(crate) use crate::family::flint::budget::{ALL_LAYERS, CpuMoeConfig, EXPERTS};
 
 /// Host-side access to the stored bytes of the routed experts of one layer.
 pub(crate) trait ExpertSource {

@@ -15,8 +15,12 @@ use std::cmp::Reverse;
 use crate::EngError;
 
 /// `cudaMalloc` returns 256-byte aligned memory, so every offset keeps
-/// that alignment in the allocation.
-pub(crate) const ARENA_ALIGN: usize = 256;
+/// that alignment in the allocation. The definition lives in
+/// [`crate::kernels`] because host-side planning (the Flint EXL3 pack
+/// placement) places with the same rule without a device; re-exported
+/// here so the historical `kernels::cuda::ARENA_ALIGN` path keeps
+/// resolving.
+pub(crate) use crate::kernels::ARENA_ALIGN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArenaTensor {

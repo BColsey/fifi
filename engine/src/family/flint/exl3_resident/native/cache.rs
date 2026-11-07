@@ -1,9 +1,19 @@
 //! CPU cache policy used by the model-owned native pinned store.
 //! This proves no VRAM freed, physical pinning, or GPU completion.
 
-use crate::{EngError, family::flint::cpu_moe::CpuMoeConfig};
+use crate::EngError;
 
-pub(super) const EXPERTS: usize = 256;
+// The pure bank policy lives in `family::flint::budget` so host builds
+// compose the same decisions; re-exported here because the native loader
+// and its tests historically reach it through this module.
+#[cfg(test)]
+use crate::family::flint::budget::CpuMoeConfig;
+#[cfg(test)]
+pub(super) use crate::family::flint::budget::choose_slots;
+pub(super) use crate::family::flint::budget::{
+    BankBudget, BankPlan, BankReason, BankRequest, CACHE_VAR, EXPERTS, ExpertCacheMode, SLOTS_VAR,
+    cpu_moe_bank, plan_bank,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ByteRange {
@@ -491,227 +501,6 @@ impl LayerCache {
         self.phase = Phase::Initial;
         Ok(())
     }
-}
-
-/// Operator override of the resident experts per layer; unset means "as many as fit".
-pub(super) const SLOTS_VAR: &str = "FIFI_FLINT_CUDA_EXPERT_SLOTS";
-
-/// The switch that selects the bank.
-pub(super) const CACHE_VAR: &str = "FIFI_FLINT_CUDA_EXPERT_CACHE";
-
-/// What `FIFI_FLINT_CUDA_EXPERT_CACHE` asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExpertCacheMode {
-    /// Unset: every expert stays on the GPU when that fits, otherwise the bank takes over.
-    Auto,
-    /// `1`, `true`, `on`: always use the bank.
-    On,
-    /// `0`, `false`, `off`: every expert on the GPU, or a refusal.
-    Off,
-}
-
-impl ExpertCacheMode {
-    /// Exactly the listed words; a mistyped value is refused rather than guessed, because the
-    /// unset default is no longer "off".
-    pub(super) fn from_env(value: Result<String, std::env::VarError>) -> Result<Self, EngError> {
-        let text = match value {
-            Ok(text) => text,
-            Err(std::env::VarError::NotPresent) => return Ok(Self::Auto),
-            Err(std::env::VarError::NotUnicode(_)) => String::from("(not UTF-8)"),
-        };
-        match text.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" => Ok(Self::On),
-            "0" | "false" | "off" => Ok(Self::Off),
-            _ => Err(cache_error(&format!(
-                "{CACHE_VAR} must be unset, 1, true or on (always use the host buffer), or 0, false \
-                 or off (every expert on the GPU); got {text:?}"
-            ))),
-        }
-    }
-}
-
-/// Why the bank is in use, for the load line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BankReason {
-    /// The context does not fit with every expert on the GPU.
-    Auto,
-    /// The operator asked for the bank.
-    Forced,
-    /// The operator asked for a resident count.
-    Override,
-}
-
-impl BankReason {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Forced => "forced",
-            Self::Override => "override",
-        }
-    }
-}
-
-/// How a load keeps its experts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BankPlan {
-    /// Every expert on the GPU, the load that needs no host buffer.
-    Resident,
-    Bank(BankReason),
-}
-
-/// The load for `mode` and `request`. `resident_fits` is whether the plain resident load would be
-/// admitted; only the unset default looks at it, so a context that fits keeps today's exact path.
-pub(super) fn plan_bank(
-    mode: ExpertCacheMode,
-    request: BankRequest,
-    resident_fits: bool,
-) -> Result<BankPlan, EngError> {
-    match (mode, request) {
-        (ExpertCacheMode::Off, BankRequest::Fit) => Ok(BankPlan::Resident),
-        (ExpertCacheMode::Off, BankRequest::Exactly(_)) => Err(cache_error(&format!(
-            "{SLOTS_VAR} asks for a bank, but {CACHE_VAR}=0 keeps every expert on the GPU"
-        ))),
-        (_, BankRequest::Exactly(_)) => Ok(BankPlan::Bank(BankReason::Override)),
-        (ExpertCacheMode::On, BankRequest::Fit) => Ok(BankPlan::Bank(BankReason::Forced)),
-        (ExpertCacheMode::Auto, BankRequest::Fit) if resident_fits => Ok(BankPlan::Resident),
-        (ExpertCacheMode::Auto, BankRequest::Fit) => Ok(BankPlan::Bank(BankReason::Auto)),
-    }
-}
-
-/// CPU-served experts need the pinned host store: the offload mode forces the bank on, and the
-/// split mode also sizes it to the experts the device keeps, so it refuses an explicit slot count
-/// that would contradict that.
-pub(super) fn cpu_moe_bank(
-    config: Option<CpuMoeConfig>,
-    mode: ExpertCacheMode,
-    request: BankRequest,
-) -> Result<(ExpertCacheMode, BankRequest), EngError> {
-    let Some(config) = config else {
-        return Ok((mode, request));
-    };
-    if mode == ExpertCacheMode::Off {
-        return Err(EngError::BadRequest(
-            "Flint CPU experts need the host expert store: unset or enable the expert cache switch"
-                .into(),
-        ));
-    }
-    if config.split_experts() != 0 {
-        if request != BankRequest::Fit {
-            return Err(EngError::BadRequest(format!(
-                "cpu_moe_split_experts sets the resident experts per layer: unset {SLOTS_VAR}"
-            )));
-        }
-        let device = EXPERTS - config.split_experts();
-        return Ok((ExpertCacheMode::On, BankRequest::Exactly(device)));
-    }
-    Ok((ExpertCacheMode::On, request))
-}
-
-/// How many experts per layer a load asks to keep on the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BankRequest {
-    /// The largest bank the device budget leaves room for, capped at all 256.
-    Fit,
-    /// An explicit count; a count that does not fit refuses the load rather than shrinking.
-    Exactly(usize),
-}
-
-impl BankRequest {
-    pub(super) fn from_env(value: Result<String, std::env::VarError>) -> Result<Self, EngError> {
-        let value = match value {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(cache_error(&format!("{SLOTS_VAR} is not valid UTF-8")));
-            }
-        };
-        Self::parse(value.as_deref())
-    }
-
-    // Plain decimal digits only: no sign, no leading zero, no spaces.
-    fn parse(value: Option<&str>) -> Result<Self, EngError> {
-        let value = value.unwrap_or("");
-        if value.is_empty() {
-            return Ok(Self::Fit);
-        }
-        let plain = value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0');
-        plain
-            .then(|| value.parse::<usize>().ok())
-            .flatten()
-            .filter(|count| (1..=EXPERTS).contains(count))
-            .map(Self::Exactly)
-            .ok_or_else(|| cache_error(&format!("{SLOTS_VAR} must be a whole number in 1..=256")))
-    }
-}
-
-/// Device bytes the bank leaves free beyond the declared reserve, for every count it considers,
-/// all 256 included. A bank that filled the card to its last expert let the whole card, desktop
-/// included, peak 61 to 71 MiB past 22,900 MiB. One more expert in every routed layer costs 72 MiB
-/// (47 layers of 1,603,584 B), so 160 MiB is a little over two experts per layer and brings the
-/// peak under that bound.
-pub(super) const BANK_MARGIN_BYTES: u64 = 160 << 20;
-
-/// What a device has for the expert bank: `free` bytes, of which `fixed` (non-routed weights,
-/// KV cache, work, headroom and the bank margin) are spoken for, and `per_slot` bytes for one
-/// more resident expert in every routed layer.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct BankBudget {
-    pub(super) free: u64,
-    pub(super) fixed: u64,
-    pub(super) per_slot: u64,
-}
-
-impl BankBudget {
-    fn room(&self) -> u64 {
-        self.free.saturating_sub(self.fixed)
-    }
-
-    /// Experts per layer that fit, capped at all 256.
-    fn fitting(&self) -> usize {
-        let count = (self.room() / self.per_slot.max(1)).min(EXPERTS as u64);
-        usize::try_from(count).unwrap_or(EXPERTS)
-    }
-
-    fn refusal(&self, what: String, floor: usize, advice: &str) -> EngError {
-        EngError::MemoryPlan(format!(
-            "Flint expert bank: {what}. After {} bytes of non-routed weights, KV cache, work, \
-             headroom and the {} MiB bank margin, {} of {} free device bytes remain, room for \
-             {} resident experts per layer ({} bytes each across the routed layers); a prefill \
-             piece needs {floor}. {advice}.",
-            self.fixed,
-            BANK_MARGIN_BYTES >> 20,
-            self.room(),
-            self.free,
-            self.fitting(),
-            self.per_slot
-        ))
-    }
-}
-
-/// Resident experts per layer for `request`. `floor` is what one prefill piece can route in a
-/// single layer: a smaller bank could not hold the piece's experts at once.
-pub(super) fn choose_slots(
-    request: BankRequest,
-    budget: BankBudget,
-    floor: usize,
-) -> Result<usize, EngError> {
-    let slots = match request {
-        BankRequest::Fit => budget.fitting(),
-        BankRequest::Exactly(count) if count > budget.fitting() => {
-            let what = format!("{SLOTS_VAR}={count} does not fit");
-            return Err(budget.refusal(what, floor, "Lower the count or context_limit"));
-        }
-        BankRequest::Exactly(count) => count,
-    };
-    if slots < floor {
-        let what = format!("{slots} resident experts per layer is too few");
-        let advice = match request {
-            BankRequest::Fit => "Lower context_limit or prefill_chunk_size",
-            BankRequest::Exactly(_) => "Raise the count or lower prefill_chunk_size",
-        };
-        return Err(budget.refusal(what, floor, advice));
-    }
-    Ok(slots)
 }
 
 fn cache_overflow() -> EngError {

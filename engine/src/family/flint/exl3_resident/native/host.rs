@@ -9,11 +9,13 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+use super::super::cache::choose_slots;
 use super::super::{
     FfnRoles, FlintResidentLimits, ResidentPlan,
     cache::{
-        BANK_MARGIN_BYTES, BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode,
-        HostBudget, HostStore, LayerCache, LayerLayout, MissCopy, choose_slots, plan_bank,
+        BankBudget, BankPlan, BankReason, BankRequest, EXPERTS, ExpertCacheMode, HostBudget,
+        HostStore, LayerCache, LayerLayout, MissCopy, plan_bank,
     },
     plan::plan_resident,
 };
@@ -149,30 +151,26 @@ fn bank_budget(
     per_slot: u64,
     reserve: &Reserve,
 ) -> Result<BankBudget, EngError> {
-    let fixed = [
+    crate::family::flint::budget::bank_budget(
+        free,
+        arena_base as u64,
+        per_slot,
         reserve.kv_cache,
         reserve.work,
         reserve.headroom,
-        BANK_MARGIN_BYTES,
-    ]
-    .into_iter()
-    .try_fold(arena_base as u64, u64::checked_add)
-    .ok_or_else(overflow)?;
-    Ok(BankBudget {
-        free,
-        fixed,
-        per_slot,
-    })
+    )
 }
 
-/// Experts per layer for this device, KV cache, work reserve and prefill piece.
+/// Experts per layer for this device, KV cache, work reserve and prefill
+/// piece; the count and whether the CPU-expert rule lowered a full bank.
 fn choose_bank(
     context: &CudaContext,
     audit: &CachedAudit,
     limits: &FlintResidentLimits,
     ask: &BankAsk,
     offloaded: usize,
-) -> Result<usize, EngError> {
+    cpu_active: bool,
+) -> Result<(usize, bool), EngError> {
     let floor = crate::family::flint::cuda_ffn::device::exl3::cache_prefill_floor(ask.rows)?;
     let free = u64::try_from(context.memory_info()?.free).map_err(|_| overflow())?;
     let budget = bank_budget(
@@ -181,7 +179,7 @@ fn choose_bank(
         audit.per_slot_bytes(offloaded)?,
         &limits.reserve,
     )?;
-    choose_slots(ask.request, budget, floor)
+    crate::family::flint::budget::banked_slots(ask.request, budget, floor, cpu_active)
 }
 
 impl HostOwner {
@@ -244,17 +242,15 @@ pub(super) fn load_banked(
     // The layers whose experts run on the CPU keep no device slots.
     let cpu = crate::family::flint::cpu_moe::active();
     let offloaded = cpu.as_ref().map_or(0, |moe| moe.config().offload_layers());
-    let slots = choose_bank(context, &audit, &limits, &ask, offloaded)?;
-    // CPU-served experts read the pinned host store, which a bank of all 256 never builds.
-    let slots = if cpu.is_some() && slots == EXPERTS {
+    let (slots, lowered) = choose_bank(context, &audit, &limits, &ask, offloaded, cpu.is_some())?;
+    if lowered {
+        // CPU-served experts read the pinned host store, which a bank of
+        // all 256 never builds.
         eprintln!(
             "Flint CPU MoE: a bank of all {EXPERTS} experts is lowered to {} so the pinned host store exists",
             EXPERTS - 1
         );
-        EXPERTS - 1
-    } else {
-        slots
-    };
+    }
     if slots == EXPERTS {
         return super::load::load_planned(context, stream, checkpoint, roles, limits);
     }
@@ -872,6 +868,7 @@ impl FlintExpertBank<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::family::flint::budget::BANK_MARGIN_BYTES;
     use crate::kernels::cuda::plan::{Demand, admit};
 
     // Distinct nonzero terms, so a dropped or doubled term changes which bank fits.

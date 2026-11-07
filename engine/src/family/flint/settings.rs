@@ -42,38 +42,11 @@ pub(crate) fn cpu_moe_overlap_selected(value: Option<&std::ffi::OsStr>) -> bool 
     default_off_selected(value)
 }
 
-/// Which layer-major prefill pass an engine runs.
+// The layer-major switch and its parse live in `family::flint::budget`
+// (host-buildable plan inventory); re-exported under the same gate the
+// CUDA executor historically imported it under.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LayerMajor {
-    /// The token-major walk of eight-row chunks.
-    Off,
-    /// Layer-major with the routed experts as tall tiles (`FIFI_EXL3_LAYER_MAJOR=1`).
-    Tiles,
-    /// Layer-major with tall projections and job-table experts (`FIFI_EXL3_LAYER_MAJOR=jobs`).
-    Jobs,
-}
-
-/// FIFI_EXL3_LAYER_MAJOR, strict-parse switch for the layer-major prefill
-/// mode. Unset is OFF (byte-identical walk to today); `1` selects the tile
-/// pass and `jobs` the job-table pass; every other value — including a
-/// non-UTF-8 one — is an error at executor open, never a silent fallback,
-/// mirroring `prefill_window_from_env`'s strictness rule for opt-in knobs.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) fn layer_major_from_env(
-    value: Option<&std::ffi::OsStr>,
-) -> Result<LayerMajor, EngError> {
-    let Some(value) = value else {
-        return Ok(LayerMajor::Off);
-    };
-    match value.to_str().map(str::trim) {
-        Some("1") => Ok(LayerMajor::Tiles),
-        Some("jobs") => Ok(LayerMajor::Jobs),
-        _ => Err(EngError::BadRequest(
-            "FIFI_EXL3_LAYER_MAJOR must be unset, \"1\" or \"jobs\"".into(),
-        )),
-    }
-}
+pub(crate) use crate::family::flint::budget::{LayerMajor, layer_major_from_env};
 
 /// The opt-in switch of the hi/lo activation split of the tall projections of the jobs pass.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
@@ -336,12 +309,10 @@ pub(crate) struct FlintOptions {
 
 /// Context of a CUDA Flint engine configured without a `flint` object. It needs the expert bank
 /// on a 24 GB card; shorter contexts keep every expert on the GPU.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) const DEFAULT_CUDA_CONTEXT: u32 = 131_072;
 
 impl FlintOptions {
     /// The options of a CUDA engine with no `flint` object: the f16 profile, never q8.
-    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
     pub(crate) fn cuda_default() -> Self {
         Self {
             context_limit: DEFAULT_CUDA_CONTEXT,

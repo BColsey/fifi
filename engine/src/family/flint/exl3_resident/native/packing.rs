@@ -1,10 +1,17 @@
-use super::PackedRange;
 use crate::{
     EngError,
     family::flint::exl3_resident::FlintResidentLimits,
-    kernels::cuda::{ARENA_ALIGN, CHUNK_LIMIT},
+    kernels::{ARENA_ALIGN, CHUNK_LIMIT},
     weights::exl3::flint_pack::Plan,
 };
+
+/// One aligned byte range of the packed arena; the native owner and the
+/// host store both address their copies through these.
+#[derive(Clone, Copy)]
+pub(super) struct PackedRange {
+    pub(super) offset: usize,
+    pub(super) bytes: usize,
+}
 
 pub(super) struct Packing {
     pub(super) matrices: Vec<[PackedRange; 3]>,
@@ -25,17 +32,23 @@ pub(super) struct CachedAudit {
 
 pub(super) struct CachedPacking {
     pub(super) packing: Packing,
-    pub(super) layout: super::super::cache::HostLayout,
+    pub(super) layout: super::cache::HostLayout,
     pub(super) arena_base: usize,
     pub(super) routed: Vec<Option<(usize, u16)>>,
     pub(super) layers: Vec<usize>,
-    pub(super) reason: super::super::cache::BankReason,
+    pub(super) reason: super::cache::BankReason,
 }
 
 impl CachedAudit {
     /// Device bytes where the bank starts: the non-routed weights, aligned.
     pub(super) fn arena_base(&self) -> usize {
         self.arena_base
+    }
+
+    /// Device bytes one more resident expert costs per routed layer, in load order; the
+    /// header-level audit mirrors the sums this backs.
+    pub(super) fn strides(&self) -> &[usize] {
+        &self.strides
     }
 
     /// Device bytes one more resident expert costs, summed over the routed layers that keep
@@ -50,16 +63,21 @@ impl CachedAudit {
             .ok_or_else(overflow)
     }
 
+    /// Routed layers that keep device slots.
+    pub(super) fn routed_layers(&self) -> usize {
+        self.layers.len()
+    }
+
     /// Sizes the bank to `slot_count` resident experts per layer, in use for `reason`.
     pub(super) fn with_slots(
         self,
         slot_count: usize,
         offloaded: usize,
-        reason: super::super::cache::BankReason,
+        reason: super::cache::BankReason,
         limits: &FlintResidentLimits,
     ) -> Result<CachedPacking, EngError> {
         let layout =
-            super::super::cache::HostLayout::with_offloaded(&self.strides, slot_count, offloaded)?;
+            super::cache::HostLayout::with_offloaded(&self.strides, slot_count, offloaded)?;
         let mut packing = self.packing;
         packing.bytes = self
             .arena_base
@@ -88,7 +106,7 @@ fn audit_layer_stride(
     experts: &[[usize; 3]],
     ordinal: usize,
 ) -> Result<usize, EngError> {
-    if experts.len() != super::super::cache::EXPERTS {
+    if experts.len() != super::cache::EXPERTS {
         return Err(EngError::Checkpoint(
             "Flint host cache requires all 256 experts".into(),
         ));
@@ -124,7 +142,7 @@ impl Packing {
         roles: &super::ResidentPlan,
         limits: &FlintResidentLimits,
     ) -> Result<CachedAudit, EngError> {
-        use super::super::FfnRoles;
+        use super::FfnRoles;
         let mut audit_limits = *limits;
         audit_limits.max_weight_bytes = u64::MAX;
         let mut packing = Self::new(&roles.layout, &audit_limits)?;
@@ -266,12 +284,23 @@ fn allocation(error: std::collections::TryReserveError) -> EngError {
 mod tests {
     use std::io::Write;
 
-    use super::super::super::cache::BankReason;
+    use super::super::cache::BankReason;
     use super::*;
-    use crate::{
-        family::project::cuda::Reserve,
-        weights::exl3::flint_pack::{Geometry, PackBuilder},
-    };
+    use crate::weights::exl3::flint_pack::{Geometry, PackBuilder};
+
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+    use crate::family::project::cuda::Reserve;
+
+    /// Host-build limits for the pure packing arithmetic; the reserve
+    /// field only exists where the device planner does.
+    fn limits() -> FlintResidentLimits {
+        FlintResidentLimits {
+            max_staging_bytes: u64::MAX,
+            max_weight_bytes: u64::MAX,
+            #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+            reserve: Reserve::default(),
+        }
+    }
 
     #[test]
     fn published_pack_reports_expected_resident_admission_bytes() {
@@ -281,11 +310,7 @@ mod tests {
         ));
         let geometry = Geometry::published(config).unwrap();
         let layout = geometry.plan();
-        let mut limits = FlintResidentLimits {
-            max_staging_bytes: u64::MAX,
-            max_weight_bytes: u64::MAX,
-            reserve: Reserve::default(),
-        };
+        let mut limits = limits();
         let packing = Packing::new(&layout, &limits).unwrap();
         let payload: usize = packing
             .matrices
@@ -313,15 +338,32 @@ mod tests {
     }
 
     #[test]
+    fn audit_plan_reads_a_full_pack_and_refuses_a_truncated_one() {
+        // A full 256-expert pack on tiny layers: the header-level audit the
+        // diagnostic surfaces quote, taken end to end without a device.
+        let dir = PackBuilder::full().write();
+        let audit = crate::family::flint::exl3_resident::audit_plan(dir.path(), u64::MAX)
+            .expect("full pack audits");
+        assert_eq!(audit.routed_layers, 2);
+        assert!(audit.per_slot(0).unwrap() > 0);
+        // The resident load is exactly the bank base plus every expert's slot.
+        assert_eq!(
+            audit.resident_bytes,
+            audit.arena_base + 256 * audit.per_slot(0).unwrap()
+        );
+        // A pack missing its last expert's gate trellis is refused.
+        let mut truncated = PackBuilder::full();
+        truncated.remove("model.layers.2.mlp.experts.255.gate_proj.trellis");
+        let dir = truncated.write();
+        assert!(crate::family::flint::exl3_resident::audit_plan(dir.path(), u64::MAX).is_err());
+    }
+
+    #[test]
     fn packed_ranges_are_all_live_aligned_and_both_caps_include_copy_staging() {
         let pack = PackBuilder::tiny();
         let geometry = Geometry::from_config(&serde_json::to_vec(&pack.config).unwrap()).unwrap();
         let layout = geometry.plan();
-        let mut limits = FlintResidentLimits {
-            max_staging_bytes: u64::MAX,
-            max_weight_bytes: u64::MAX,
-            reserve: Reserve::default(),
-        };
+        let mut limits = limits();
         let packing = Packing::new(&layout, &limits).unwrap();
         let mut end = 0;
         for range in packing.matrices.iter().flatten().chain(&packing.plain) {
@@ -355,7 +397,7 @@ mod tests {
     }
 
     fn published_roles() -> super::super::ResidentPlan {
-        use super::super::super::{FfnRoles, LayerRoles, ResidentPlan};
+        use super::super::{FfnRoles, LayerRoles, ResidentPlan};
         let config = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/flint-exl3/config-4.0-e7ab1124.json"
@@ -417,11 +459,7 @@ mod tests {
     #[test]
     fn bank_cost_scales_with_the_resident_count_and_a_full_bank_matches_the_resident_load() {
         let roles = published_roles();
-        let limits = FlintResidentLimits {
-            max_weight_bytes: u64::MAX,
-            max_staging_bytes: u64::MAX,
-            reserve: Reserve::default(),
-        };
+        let limits = limits();
         let audit = Packing::audit_cached(&roles, &limits).unwrap();
         let (base, per_slot) = (audit.arena_base(), audit.per_slot_bytes(0).unwrap());
         // 47 routed layers at one 1,603,584-byte expert each.
@@ -448,11 +486,7 @@ mod tests {
     #[test]
     fn cached_placement_reduces_real_allocation_and_enforces_exact_cap() {
         let roles = published_roles();
-        let mut limits = FlintResidentLimits {
-            max_weight_bytes: u64::MAX,
-            max_staging_bytes: u64::MAX,
-            reserve: Reserve::default(),
-        };
+        let mut limits = limits();
         let off = Packing::new(&roles.layout, &limits).unwrap();
         let cached = cached_packing(&roles, &limits, 224).unwrap();
         assert_eq!(
@@ -506,16 +540,12 @@ mod tests {
     fn cached_placement_audits_nonzero_experts_in_every_projection() {
         for projection in 0..3 {
             let mut roles = published_roles();
-            let super::super::super::FfnRoles::Moe { experts, .. } = &roles.layers[2].ffn else {
+            let super::super::FfnRoles::Moe { experts, .. } = &roles.layers[2].ffn else {
                 panic!("routed layer required")
             };
             let index = experts[193][projection];
             roles.layout.modules[index].words += 16;
-            let limits = FlintResidentLimits {
-                max_weight_bytes: u64::MAX,
-                max_staging_bytes: u64::MAX,
-                reserve: Reserve::default(),
-            };
+            let limits = limits();
             assert!(matches!(
                 Packing::audit_cached(&roles, &limits),
                 Err(EngError::Checkpoint(_))

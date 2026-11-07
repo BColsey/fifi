@@ -407,11 +407,19 @@ fn start_flint(
         config.flint.as_ref(),
         ready_note,
     )?;
+    // The same resolution the engine started with: the options (the
+    // factory's CUDA default when the config has no flint object) and
+    // the environment switches read once, here, exactly as at load.
+    let default_options = flint::settings::FlintOptions::cuda_default();
+    let effective = crate::capability::effective::flint_effective(
+        config.flint.as_ref().unwrap_or(&default_options),
+        &flint::budget::FlintEnv::capture(),
+    );
     Ok(StartedEngine {
         engine: started.engine,
         bundle: Arc::new(started.bundle),
         context_limit: started.context_limit,
-        effective: Vec::new(),
+        effective,
     })
 }
 

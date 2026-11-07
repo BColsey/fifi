@@ -66,23 +66,35 @@ impl PackBuilder {
         Self::tiny_with_bits(4)
     }
 
+    /// As [`Self::tiny`] but every routed layer carries all 256 experts,
+    /// the count the Flint host cache requires; layers and dimensions
+    /// stay tiny so a full pack costs megabytes, not gigabytes.
+    pub(crate) fn full() -> Self {
+        Self::build(4, 256)
+    }
+
     /// As [`Self::tiny`] with `bits` bits per weight in every body projection.
     pub(crate) fn tiny_with_bits(bits: u32) -> Self {
+        Self::build(bits, 4)
+    }
+
+    fn build(bits: u32, experts: u32) -> Self {
         let mut pack = Self {
             config: tiny_config(),
             tensors: BTreeMap::new(),
         };
         pack.config["quantization_config"]["bits"] = json!(f64::from(bits));
+        pack.config["num_experts"] = json!(experts);
         pack.plain("model.embed_tokens.weight", "BF16", &[256, 128], 0x3f80);
         pack.plain("model.norm.weight", "BF16", &[128], 0x3f80);
         pack.matrix("lm_head", 128, 256, 5);
         for layer in 0..3 {
-            pack.layer(layer, bits);
+            pack.layer(layer, bits, experts);
         }
         pack
     }
 
-    fn layer(&mut self, layer: usize, bits: u32) {
+    fn layer(&mut self, layer: usize, bits: u32, experts: u32) {
         let p = format!("model.layers.{layer}");
         self.plain(
             &format!("{p}.input_layernorm.weight"),
@@ -124,7 +136,7 @@ impl PackBuilder {
             self.matrix(&format!("{p}.mlp.down_proj"), 256, 128, bits);
             return;
         }
-        self.plain(&format!("{p}.mlp.gate.weight"), "F16", &[4, 128], 0);
+        self.plain(&format!("{p}.mlp.gate.weight"), "F16", &[experts, 128], 0);
         for projection in ["gate", "up", "down"] {
             self.matrix(
                 &format!("{p}.mlp.shared_expert.{projection}_proj"),
@@ -132,7 +144,7 @@ impl PackBuilder {
                 128,
                 bits,
             );
-            for expert in 0..4 {
+            for expert in 0..experts {
                 let prefix = format!("{p}.mlp.experts.{expert}.{projection}_proj");
                 self.matrix(&prefix, 128, 128, bits);
             }

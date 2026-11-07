@@ -173,8 +173,52 @@ pub struct PreflightReport {
     pub dimensions: Dimensions,
     pub checks: Vec<Check>,
     pub estimate: Option<Estimate>,
+    /// The planned decisions behind the estimate: what each choice landed
+    /// on, the alternatives the plan weighed, and whether the choice is
+    /// fixed at engine start or re-decided at load. Empty for families
+    /// whose estimate does not yet compose decisions (Qwen3.6); Flint
+    /// EXL3 fills these from the same pure functions its loader runs.
+    pub decisions: Vec<PlanDecision>,
     /// The single most useful next action, in one sentence.
     pub next_step: String,
+}
+
+/// When a planned decision is settled: at engine start (from the
+/// configuration) or at load (from the measured device budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanFixity {
+    /// Settled when the engine starts: changing it needs a new config.
+    Start,
+    /// Re-decided at load against the measured free device bytes.
+    Load,
+}
+
+impl PlanFixity {
+    pub fn name(self) -> &'static str {
+        match self {
+            PlanFixity::Start => "engine start",
+            PlanFixity::Load => "load",
+        }
+    }
+}
+
+/// One alternative a planned decision weighed.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PlanAlternative {
+    pub option: String,
+    /// `chosen`, `fits`, `does not fit`, or `refused`.
+    pub verdict: String,
+    pub reason: String,
+}
+
+/// One planned decision the estimate embodies.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PlanDecision {
+    pub name: String,
+    pub chosen: String,
+    pub alternatives: Vec<PlanAlternative>,
+    pub fixed_at: PlanFixity,
 }
 
 /// The candidate settings a preflight evaluates. `None` fields take the
@@ -234,7 +278,30 @@ fn evaluate(
             checks,
         );
     }
+    if family_name == Some(crate::family::flint::FAMILY) {
+        return flint_preflight(
+            model_dir,
+            tokenizer_dir,
+            inspection,
+            candidate,
+            facts,
+            flint_cuda_backend(),
+            checks,
+        );
+    }
     shallow_preflight(model_dir, tokenizer_dir, inspection, family, checks)
+}
+
+/// Whether this build can serve Flint on CUDA at all. The estimate's
+/// deep branch needs the same build; tests inject `true`.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+fn flint_cuda_backend() -> bool {
+    crate::family::flint::factory::check_backend().is_ok()
+}
+
+#[cfg(not(all(feature = "native-cuda", target_os = "linux")))]
+fn flint_cuda_backend() -> bool {
+    false
 }
 
 fn inventory_checks(inspection: &ModelInspection, checks: &mut Vec<Check>) {
@@ -398,6 +465,7 @@ fn shallow_preflight(
         verdict,
         dimensions,
         checks,
+        decisions: Vec::new(),
         estimate: None,
         next_step,
     }
@@ -425,6 +493,7 @@ fn q36_preflight(
             verdict,
             dimensions,
             checks,
+            decisions: Vec::new(),
             estimate,
             next_step,
         }
@@ -633,6 +702,545 @@ fn q36_preflight(
         )),
     }
     finish(checks, Some(estimate), qualification)
+}
+
+/// The Flint deep path: the only family with a three-way load decision
+/// (all experts resident, an automatically sized bank, or a refusal), so
+/// its preflight composes the placement the loader would choose from the
+/// same pure functions (`family::flint::budget` and the header-level
+/// resident audit) and reports it as decisions. `cuda_backend` is this
+/// build's own; tests inject.
+fn flint_preflight(
+    model_dir: &Path,
+    tokenizer_dir: &Path,
+    _inspection: &ModelInspection,
+    candidate: &Candidate,
+    facts: &HardwareFacts,
+    cuda_backend: bool,
+    mut checks: Vec<Check>,
+) -> PreflightReport {
+    use crate::family::flint::settings::FlintOptions;
+
+    let family = Some(crate::family::flint::FAMILY.to_string());
+    let finish = |checks: Vec<Check>,
+                  estimate: Option<Estimate>,
+                  decisions: Vec<PlanDecision>,
+                  qualification: Qualification| {
+        let dimensions = q36_dimensions(&checks, estimate.as_ref(), qualification);
+        let (verdict, next_step) = q36_verdict(&checks, estimate.as_ref(), qualification);
+        PreflightReport {
+            model_dir: model_dir.to_path_buf(),
+            tokenizer_dir: tokenizer_dir.to_path_buf(),
+            family: family.clone(),
+            verdict,
+            dimensions,
+            checks,
+            decisions,
+            estimate,
+            next_step,
+        }
+    };
+
+    if !cuda_backend {
+        checks.push(Check::new(
+            "backend",
+            CheckStatus::Fail,
+            "no CUDA backend is compiled into this build (build with --features native-cuda on Linux); this binary cannot serve Flint".to_string(),
+        ));
+        return finish(checks, None, Vec::new(), Qualification::Unverified);
+    }
+    checks.push(Check::new(
+        "backend",
+        CheckStatus::Pass,
+        match facts.cuda.device_count.as_ref() {
+            Some(count) if *count > 0 => {
+                format!("CUDA backend is compiled in; {count} device(s) present")
+            }
+            Some(_) => "CUDA backend is compiled in, but no CUDA device is present".to_string(),
+            None => "CUDA backend is compiled in".to_string(),
+        },
+    ));
+    if facts.cuda.device_count.as_ref() == Some(&0) {
+        checks.last_mut().expect("backend check").status = CheckStatus::Fail;
+        return finish(checks, None, Vec::new(), Qualification::Unverified);
+    }
+
+    // The candidate settings resolve exactly as a config file would: the
+    // CUDA default plus the overrides, validated by the factory's own
+    // plan resolution (context cap, kv profile, chunk range).
+    let mut options = FlintOptions::cuda_default();
+    if let Some(context) = candidate.context_limit {
+        options.context_limit = context;
+    }
+    if let Some(profile) = &candidate.kv_dtype {
+        options.kv_profile = profile.clone();
+    }
+    match options.plan() {
+        Ok(_) => checks.push(Check::new(
+            "settings",
+            CheckStatus::Pass,
+            format!(
+                "context {}, kv_profile {}, prefill_chunk_size {} resolve under the Flint CUDA rules",
+                options.context_limit, options.kv_profile, options.prefill_chunk_size
+            ),
+        )),
+        Err(error) => {
+            checks.push(Check::new(
+                "settings",
+                CheckStatus::Fail,
+                format!(
+                    "the engine would refuse these settings: {}",
+                    super::describe_error(&error)
+                ),
+            ));
+            return finish(checks, None, Vec::new(), Qualification::Unverified);
+        }
+    }
+
+    // The tokenizer verdict is the loader's: bundle load under the
+    // family's pin refuses any file that differs from the tested release.
+    match crate::tokenizer::TokenizerBundle::load(
+        tokenizer_dir,
+        &crate::family::flint::factory::tokenizer_pin(),
+    ) {
+        Ok(_) => checks.push(Check::new(
+            "tokenizer pin",
+            CheckStatus::Pass,
+            "all four tokenizer files match the tested release (SHA-256 pin)".to_string(),
+        )),
+        Err(error) => checks.push(Check::new(
+            "tokenizer pin",
+            CheckStatus::Fail,
+            format!(
+                "the tokenizer would be refused at load: {}",
+                super::describe_error(&error)
+            ),
+        )),
+    }
+
+    // Qualification: the served receipts in doc/explanation/status.md
+    // cover this combination (default boot, 131072/f16, banked).
+    let qualification = Qualification::Qualified;
+
+    if any_failed(&checks) {
+        return finish(checks, None, Vec::new(), qualification);
+    }
+
+    // The environment switches, read once here exactly as the loader
+    // reads them at load.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        allow(unused_variables)
+    )]
+    let env = crate::family::flint::budget::FlintEnv::capture();
+    // The resident audit needs a build with the CUDA weights layer (or a
+    // test build); a default-feature build never reaches here because its
+    // backend check failed above, but the pair stays typed either way.
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    let pair = crate::family::flint::exl3_resident::audit_plan(model_dir, u64::MAX)
+        .and_then(|audit| flint_estimate(&audit, &options, &env, facts));
+    #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
+    let pair: Result<(Estimate, Vec<PlanDecision>), crate::EngError> = Err(
+        crate::EngError::BadRequest(
+            "this build cannot compose the Flint memory estimate; build with --features native-cuda on Linux".into(),
+        ),
+    );
+    let (estimate, decisions) = match pair {
+        Ok(pair) => pair,
+        Err(error) => {
+            checks.push(Check::new(
+                "memory estimate",
+                CheckStatus::Fail,
+                format!(
+                    "the estimate could not be computed: {}",
+                    super::describe_error(&error)
+                ),
+            ));
+            return finish(checks, None, Vec::new(), qualification);
+        }
+    };
+    let demand = estimate
+        .weight_bytes
+        .saturating_add(estimate.admission_charges_bytes);
+    match (estimate.fit, estimate.borderline) {
+        (ResourceFit::Fits, _) => checks.push(Check::new(
+            "memory estimate",
+            CheckStatus::Pass,
+            format!(
+                "estimated demand {} bytes (weights {} + runtime admission charges {}) fits the {} budget",
+                demand,
+                estimate.weight_bytes,
+                estimate.admission_charges_bytes,
+                estimate.budget_kind
+            ),
+        )),
+        (ResourceFit::DoesNotFit, _) => checks.push(Check::new(
+            "memory estimate",
+            CheckStatus::Fail,
+            format!(
+                "estimated demand {} bytes (weights {} + runtime admission charges {}) exceed the {} budget; load-time admission is authoritative",
+                demand,
+                estimate.weight_bytes,
+                estimate.admission_charges_bytes,
+                estimate.budget_kind
+            ),
+        )),
+        (ResourceFit::Unknown, true) => checks.push(Check::new(
+            "memory estimate",
+            CheckStatus::Warn,
+            format!(
+                "estimated demand {} bytes lands inside the measurement band around the {} budget; load-time admission decides",
+                demand, estimate.budget_kind
+            ),
+        )),
+        (ResourceFit::Unknown, false) => checks.push(Check::new(
+            "memory estimate",
+            CheckStatus::Warn,
+            format!(
+                "estimated {} bytes; no budget could be probed ({}), so fit is unverified",
+                estimate.total_bytes, estimate.budget_kind
+            ),
+        )),
+    }
+    finish(checks, Some(estimate), decisions, qualification)
+}
+
+/// The Flint estimate and its decisions, from the same pure functions the
+/// loader runs: the header-level resident audit for the weight terms, the
+/// KV plan and the closed-form work reserve for the charges, and the
+/// budget switch parsers for the request. Only a CUDA-capable build (or
+/// a test build) has the resident audit; the fallback below keeps the
+/// default-feature build honest.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn flint_estimate(
+    audit: &crate::family::flint::exl3_resident::AuditPlan,
+    options: &crate::family::flint::settings::FlintOptions,
+    env: &crate::family::flint::budget::FlintEnv,
+    facts: &HardwareFacts,
+) -> Result<(Estimate, Vec<PlanDecision>), crate::EngError> {
+    use crate::family::flint::budget::{
+        self, BankPlan, BankReason, BankRequest, CpuMoeConfig, FLINT_HEADROOM_BYTES,
+        MODEL_CONTEXT_LIMIT,
+    };
+
+    let plan = options.plan()?;
+    let (k_row, v_row) = plan.per_plane_row_bytes();
+    let row_bytes = k_row + v_row;
+    let kv_bytes = u64::try_from(plan.bytes(row_bytes)?)
+        .map_err(|_| crate::EngError::MemoryPlan("Flint KV estimate overflows u64".to_string()))?;
+    let work = budget::work_reserve_closed_form(
+        options.prefill_chunk_size,
+        budget::alloc_cache_reserve(env.alloc_cache_enabled()),
+    )?;
+    let headroom = FLINT_HEADROOM_BYTES;
+
+    // The request the loader composes: the config's CPU-expert split
+    // (from the options) and the operator's environment switches.
+    let cpu = CpuMoeConfig::new(
+        options.cpu_moe_offload_layers,
+        options.cpu_moe_split_experts,
+        options.cpu_moe_threads,
+    )?;
+    let (mode, request) = budget::cpu_moe_bank(
+        cpu.enabled().then_some(cpu),
+        env.expert_cache_mode()?,
+        env.bank_request()?,
+    )?;
+    // The offload rule the loader charges: CPU-expert layers keep no
+    // device slots, and an active CPU expert path lowers a full bank by
+    // one (see `budget::banked_slots`).
+    let cpu_active = cpu.enabled();
+    let offloaded = if cpu_active { cpu.offload_layers() } else { 0 };
+    let estimate_overflow =
+        || crate::EngError::MemoryPlan("Flint estimate byte count overflows u64".into());
+
+    let free = match &facts.cuda.first_device_free_bytes {
+        Probe::Measured(free) => Some(*free),
+        Probe::Unavailable(_) => None,
+    };
+    let kv_at = |context: u32| -> Result<u64, crate::EngError> {
+        let mut probe = options.clone();
+        probe.context_limit = context;
+        u64::try_from(probe.plan()?.bytes(row_bytes)?)
+            .map_err(|_| crate::EngError::MemoryPlan("Flint KV estimate overflows u64".into()))
+    };
+    let resident_admits_at = |context: u32, free: u64| -> bool {
+        let kv = kv_at(context).ok();
+        kv.is_some_and(|kv| budget::admits(audit.resident_bytes, kv, work, headroom, free).is_ok())
+    };
+    let resident_fits = free
+        .map(|free| resident_admits_at(options.context_limit, free))
+        .unwrap_or(false);
+    let placement = budget::plan_bank(mode, request, resident_fits)?;
+
+    // Whether the CPU-expert rule lowered a full bank (surfaces in the
+    // placement decision text, as the loader's own load note does).
+    let mut lowered = false;
+    let (weight_bytes, slots, margin, bank_reason) = match placement {
+        BankPlan::Resident => (audit.resident_bytes, None, 0, None),
+        BankPlan::Bank(reason) => {
+            let free = free.ok_or_else(|| {
+                crate::EngError::BadRequest(
+                    "the bank plan needs the measured free bytes of device 0".into(),
+                )
+            })?;
+            let per_slot = audit.per_slot(offloaded)?;
+            let bank =
+                budget::bank_budget(free, audit.arena_base, per_slot, kv_bytes, work, headroom)?;
+            let floor =
+                budget::cache_prefill_floor(crate::family::flint::settings::PREFILL_MAX_ROWS)?;
+            let (slots, cap) = budget::banked_slots(request, bank, floor, cpu_active)?;
+            lowered = cap;
+            let weight_bytes = audit
+                .arena_base
+                .checked_add(
+                    u64::try_from(slots)
+                        .map_err(|_| estimate_overflow())?
+                        .checked_mul(per_slot)
+                        .ok_or_else(estimate_overflow)?,
+                )
+                .ok_or_else(estimate_overflow)?;
+            (
+                weight_bytes,
+                Some(slots),
+                budget::BANK_MARGIN_BYTES,
+                Some(reason),
+            )
+        }
+    };
+
+    let charge_terms = |margin: u64| {
+        let mut terms = vec![
+            ("kv cache".to_string(), kv_bytes),
+            ("work reserve".to_string(), work),
+            ("load headroom".to_string(), headroom),
+            ("bank margin".to_string(), margin),
+            (
+                "device scratch (excluded here; charged at load)".to_string(),
+                0,
+            ),
+        ];
+        if margin == 0 {
+            terms.retain(|(name, _)| name != "bank margin");
+        }
+        terms
+    };
+    let charges = [kv_bytes, work, headroom, margin]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(estimate_overflow)?;
+    let total = weight_bytes
+        .checked_add(charges)
+        .ok_or_else(estimate_overflow)?;
+
+    let band =
+        i128::from(crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let (fit, borderline, largest_fitting) = match free {
+        None => (ResourceFit::Unknown, false, None),
+        Some(free) => {
+            let slack = i128::from(free) - i128::from(weight_bytes) - i128::from(charges);
+            let (fit, borderline) = if slack >= band {
+                (ResourceFit::Fits, false)
+            } else if slack >= -band {
+                (ResourceFit::Unknown, true)
+            } else {
+                (ResourceFit::DoesNotFit, false)
+            };
+            // The receipt sentence for an automatically banked load: the
+            // largest context the all-resident plan would have admitted.
+            let largest_fitting = if matches!(placement, BankPlan::Bank(BankReason::Auto)) {
+                largest_resident_context(options, &resident_admits_at, free)
+            } else {
+                None
+            };
+            (fit, borderline, largest_fitting)
+        }
+    };
+
+    let mib = super::mib;
+    let expert_placement = match (slots, bank_reason) {
+        // A banked placement always carries its reason; the pair cannot
+        // be split by construction.
+        (Some(_), None) => unreachable!("bank placement without a reason"),
+        (None, _) => PlanDecision {
+            name: "expert_placement".to_string(),
+            chosen: format!(
+                "resident: all 256 experts per layer on the GPU ({} weights)",
+                mib(audit.resident_bytes)
+            ),
+            alternatives: vec![PlanAlternative {
+                option: "bank".to_string(),
+                verdict: "not needed".to_string(),
+                reason: "the all-resident plan fits the measured free bytes".to_string(),
+            }],
+            fixed_at: PlanFixity::Load,
+        },
+        (Some(slots), Some(reason)) => PlanDecision {
+            name: "expert_placement".to_string(),
+            chosen: format!(
+                "bank: {slots} of 256 experts per layer on the GPU, all 256 in pinned host memory ({}{})",
+                budget::bank_note(options.context_limit, slots, reason.as_str()),
+                if lowered {
+                    "; lowered from 256 so the pinned host store exists"
+                } else {
+                    ""
+                }
+            ),
+            alternatives: largest_fitting
+                .map(|context| PlanAlternative {
+                    option: "resident".to_string(),
+                    verdict: "does not fit at this context".to_string(),
+                    reason: format!(
+                        "all-resident would admit at most {context} tokens at this profile"
+                    ),
+                })
+                .into_iter()
+                .chain(std::iter::once(PlanAlternative {
+                    option: "resident".to_string(),
+                    verdict: if resident_fits {
+                        "fits"
+                    } else {
+                        "does not fit"
+                    }
+                    .to_string(),
+                    reason: format!(
+                        "all-resident weights {} + charges {} vs free {}",
+                        mib(audit.resident_bytes),
+                        mib(kv_bytes + work + headroom),
+                        mib(free.unwrap_or(0)),
+                    ),
+                }))
+                .collect(),
+            fixed_at: PlanFixity::Load,
+        },
+    };
+    let decisions = vec![
+        expert_placement,
+        PlanDecision {
+            name: "expert_cache".to_string(),
+            chosen: format!(
+                "{} ({CACHE_OR_DEFAULT})",
+                match mode {
+                    crate::family::flint::budget::ExpertCacheMode::Auto => "auto",
+                    crate::family::flint::budget::ExpertCacheMode::On => "on",
+                    crate::family::flint::budget::ExpertCacheMode::Off => "off",
+                },
+                CACHE_OR_DEFAULT = if env.expert_cache.is_some() {
+                    crate::family::flint::budget::CACHE_VAR
+                } else {
+                    "unset"
+                }
+            ),
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "expert_slots".to_string(),
+            chosen: match request {
+                BankRequest::Fit => "fit: as many as the device budget leaves".to_string(),
+                BankRequest::Exactly(count) => format!("exactly {count}"),
+            },
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "context_limit".to_string(),
+            chosen: options.context_limit.to_string(),
+            alternatives: vec![PlanAlternative {
+                option: MODEL_CONTEXT_LIMIT.to_string(),
+                verdict: "cap".to_string(),
+                reason: "the model's own context limit; no profile exceeds it".to_string(),
+            }],
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "kv_profile".to_string(),
+            chosen: format!("{} ({} B/position)", options.kv_profile, row_bytes),
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "prefill_chunk_size".to_string(),
+            chosen: format!(
+                "{} (bank floor {} experts per layer)",
+                options.prefill_chunk_size,
+                budget::FLOOR_EXPERTS_PER_ROW * options.prefill_chunk_size as usize
+            ),
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "cpu_moe".to_string(),
+            chosen: if cpu.enabled() {
+                format!(
+                    "on: {} offloaded layers, {} split experts, {} threads",
+                    cpu.offload_layers(),
+                    cpu.split_experts(),
+                    cpu.threads()
+                )
+            } else {
+                "off".to_string()
+            },
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+        PlanDecision {
+            name: "layer_major".to_string(),
+            chosen: match env.layer_major()? {
+                crate::family::flint::budget::LayerMajor::Off => "off (default)".to_string(),
+                crate::family::flint::budget::LayerMajor::Tiles => "tiles".to_string(),
+                crate::family::flint::budget::LayerMajor::Jobs => "jobs".to_string(),
+            },
+            alternatives: Vec::new(),
+            fixed_at: PlanFixity::Start,
+        },
+    ];
+
+    let estimate = Estimate {
+        weight_bytes,
+        kv_bytes_per_position: row_bytes as u64,
+        context_limit: options.context_limit,
+        kv_bytes,
+        fixed_state_bytes: 0,
+        total_bytes: total,
+        budget_kind: match &facts.cuda.first_device_free_bytes {
+            Probe::Measured(_) => "free VRAM of device 0, measured now, minus the runtime admission charges below (estimate; load-time admission is authoritative)".to_string(),
+            Probe::Unavailable(reason) => format!(
+                "free VRAM of device 0; unavailable: {reason}"
+            ),
+        },
+        budget_free_bytes: free,
+        budget_limit_bytes: free,
+        budget_limit_is_policy_share: false,
+        largest_fitting_context: largest_fitting,
+        admission_charges_bytes: charges,
+        admission_charge_terms: charge_terms(margin),
+        fit,
+        borderline,
+    };
+    Ok((estimate, decisions))
+}
+
+/// The largest context (a multiple of 1024, capped at the requested
+/// context) whose all-resident plan fits `free` under the same admission
+/// mirror the estimate uses. `None` when not even a minimal context fits.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn largest_resident_context(
+    options: &crate::family::flint::settings::FlintOptions,
+    resident_admits_at: &dyn Fn(u32, u64) -> bool,
+    free: u64,
+) -> Option<u32> {
+    let mut largest = None;
+    let mut context = 1024;
+    while context <= options.context_limit {
+        if resident_admits_at(context, free) {
+            largest = Some(context);
+        } else {
+            break;
+        }
+        context += 1024;
+    }
+    largest
 }
 
 /// The pinned CUDA checkpoint check, through the loader's own gate
@@ -1123,6 +1731,161 @@ mod tests {
         assert_eq!(check_named(&report, "settings").status, CheckStatus::Fail);
         assert!(report.estimate.is_none());
         assert_eq!(report.dimensions.resource_fit, ResourceFit::Unknown);
+    }
+
+    #[test]
+    fn flint_without_a_cuda_build_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let inspection = crate::capability::inspect::inspect(&dir, &dir).unwrap();
+        let report = super::flint_preflight(
+            &dir,
+            &dir,
+            &inspection,
+            &super::Candidate::default(),
+            &cuda_facts(24 << 30),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(report.verdict, Verdict::Unsupported);
+        assert_eq!(report.dimensions.qualification, Qualification::Unverified);
+        assert!(report.decisions.is_empty());
+    }
+
+    /// The estimate composes the loader's own placement from the same
+    /// pure functions: the bank formula behind the 131072/f16 receipt
+    /// (doc/explanation/status.md: 226 of 256 slots on a 24 GB card) is
+    /// `floor((free - arena - fixed) / per_slot)` capped at 256; one byte
+    /// less is one slot less.
+    #[test]
+    fn flint_estimate_predicts_the_bank_exactly_and_names_the_alternative() {
+        use crate::family::flint::budget as flint_budget;
+        use crate::family::flint::exl3_resident::AuditPlan;
+        use crate::family::flint::settings::FlintOptions;
+
+        // Twelve routed layers at 2 MiB a slot: per_slot(0) is 24 MiB, and
+        // offloading 8 of them leaves 8 MiB — both figures tiny enough that
+        // the free-bytes fixtures below stay readable.
+        let audit = AuditPlan {
+            arena_base: 1 << 30,
+            strides: vec![2 << 20; 12],
+            routed_layers: 12,
+            resident_bytes: 7 << 30,
+        };
+        let per_slot = audit.per_slot(0).unwrap();
+        let options = FlintOptions::cuda_default();
+        let env = flint_budget::FlintEnv::default();
+        let plan = options.plan().unwrap();
+        let (k_row, v_row) = plan.per_plane_row_bytes();
+        let kv = plan.bytes(k_row + v_row).unwrap() as u64;
+        let work = flint_budget::work_reserve_closed_form(
+            options.prefill_chunk_size,
+            flint_budget::alloc_cache_reserve(env.alloc_cache_enabled()),
+        )
+        .unwrap();
+        let fixed =
+            kv + work + flint_budget::FLINT_HEADROOM_BYTES + flint_budget::BANK_MARGIN_BYTES;
+
+        // Free bytes that cover the arena, the fixed charges and exactly
+        // 226 slots: the estimate must bank 226, land on the budget line
+        // (inside the measurement band), and name the resident ceiling.
+        let free = audit.arena_base + fixed + 226 * per_slot;
+        let (estimate, decisions) =
+            super::flint_estimate(&audit, &options, &env, &cuda_facts(free)).unwrap();
+        let placement = decisions
+            .iter()
+            .find(|decision| decision.name == "expert_placement")
+            .expect("expert placement decision");
+        assert!(
+            placement.chosen.contains("bank: 226 of 256"),
+            "{}",
+            placement.chosen
+        );
+        assert!(
+            placement.chosen.contains("pinned host memory"),
+            "{}",
+            placement.chosen
+        );
+        assert!(estimate.fit == ResourceFit::Unknown && estimate.borderline);
+        assert_eq!(estimate.weight_bytes, audit.arena_base + 226 * per_slot);
+        let resident_alternative = placement
+            .alternatives
+            .iter()
+            .find(|alternative| alternative.option == "resident")
+            .expect("resident alternative");
+        assert!(
+            resident_alternative
+                .reason
+                .contains("all-resident would admit at most"),
+            "{}",
+            resident_alternative.reason
+        );
+        let largest = estimate
+            .largest_fitting_context
+            .expect("the banked load proposes the resident ceiling");
+        assert!(largest >= 1024 && largest < options.context_limit);
+        assert_eq!(largest % 1024, 0);
+
+        // One byte less is one slot less; the refusal side of the same
+        // formula, not a different rule.
+        let (estimate, _) =
+            super::flint_estimate(&audit, &options, &env, &cuda_facts(free - 1)).unwrap();
+        assert_eq!(estimate.weight_bytes, audit.arena_base + 225 * per_slot);
+
+        // The offload rule mirrors the loader exactly: CPU-expert layers
+        // keep no device slots (per-slot is the sum over the rest), and a
+        // huge free device still lands at 255 — never a full bank beside
+        // CPU experts — with the lowering named in the decision.
+        let offloaded = 8;
+        let per_slot_after = audit.per_slot(offloaded).unwrap();
+        let mut offload_options = FlintOptions::cuda_default();
+        offload_options.cpu_moe_offload_layers = offloaded as u32;
+        let free = audit.arena_base + fixed + 200 * per_slot_after;
+        let (estimate, _) =
+            super::flint_estimate(&audit, &offload_options, &env, &cuda_facts(free)).unwrap();
+        assert_eq!(
+            estimate.weight_bytes,
+            audit.arena_base + 200 * per_slot_after
+        );
+        let (estimate, decisions) =
+            super::flint_estimate(&audit, &offload_options, &env, &cuda_facts(1 << 44)).unwrap();
+        let placement = decisions
+            .iter()
+            .find(|decision| decision.name == "expert_placement")
+            .expect("expert placement decision");
+        assert!(
+            placement.chosen.contains("bank: 255 of 256"),
+            "{}",
+            placement.chosen
+        );
+        assert!(
+            placement.chosen.contains("lowered from 256"),
+            "{}",
+            placement.chosen
+        );
+        assert_eq!(
+            estimate.weight_bytes,
+            audit.arena_base + 255 * per_slot_after
+        );
+
+        // Free bytes that cover the all-resident plan keep every expert
+        // on the GPU: the auto decision's other arm.
+        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
+        let resident_free =
+            audit.resident_bytes + kv + work + flint_budget::FLINT_HEADROOM_BYTES + band + 1;
+        let (estimate, decisions) =
+            super::flint_estimate(&audit, &options, &env, &cuda_facts(resident_free)).unwrap();
+        let placement = decisions
+            .iter()
+            .find(|decision| decision.name == "expert_placement")
+            .expect("expert placement decision");
+        assert!(
+            placement.chosen.contains("resident"),
+            "{}",
+            placement.chosen
+        );
+        assert_eq!(estimate.weight_bytes, audit.resident_bytes);
+        assert_eq!(estimate.fit, ResourceFit::Fits);
+        assert!(estimate.largest_fitting_context.is_none());
     }
 
     #[test]

@@ -104,8 +104,10 @@ pub(crate) struct OwnerCounts {
 /// its source). Source blocks are read, repacked and uploaded in chunks of
 /// whole 8-row groups, so the host holds at most two such buffers, 128 MiB,
 /// however large the tensor is. A single group is the floor: one group of the
-/// widest row (`k` = 32768) is under 300 KB.
-pub(crate) const CHUNK_LIMIT: usize = 64 << 20;
+/// widest row (`k` = 32768) is under 300 KB. The definition lives in
+/// [`crate::kernels`] because host-side pack planning bounds its staging
+/// with the same figure without a device.
+pub(crate) use crate::kernels::CHUNK_LIMIT;
 
 /// The largest finite fp16 value. Repacked Q6_K stores `d * scale` as fp16.
 const F16_MAX: f32 = 65504.0;

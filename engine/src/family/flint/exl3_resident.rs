@@ -7,6 +7,12 @@
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 #[path = "exl3_resident/native/cache.rs"]
 mod cache;
+// The packing audit is pure arithmetic over the plan and the re-homed
+// arena consts, so host tests build it too; the file stays beside its
+// native consumers (same #[path] arrangement as the cache module).
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[path = "exl3_resident/native/packing.rs"]
+mod packing;
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) use cache::HostBudget;
 mod plan;
@@ -33,7 +39,69 @@ pub(crate) use native::{
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 use crate::family::project::cuda::Reserve;
-use crate::weights::exl3::flint_pack::Plan;
+use crate::{EngError, weights::exl3::flint_pack::Plan};
+
+/// The header-level resident audit a diagnostic surface can quote without a
+/// device: what the banked placement costs per term, from the same pure
+/// arithmetic the native loader charges at load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuditPlan {
+    /// Device bytes where the bank starts: the non-routed weights, aligned.
+    pub(crate) arena_base: u64,
+    /// Device bytes one more resident expert costs, per routed layer, in
+    /// load order; private so the skip-`offloaded` sums stay here.
+    pub(crate) strides: Vec<u64>,
+    /// Routed layers that keep device slots.
+    pub(crate) routed_layers: usize,
+    /// The plain resident load's weight bytes (every expert on the device).
+    pub(crate) resident_bytes: u64,
+}
+
+impl AuditPlan {
+    /// Device bytes one more resident expert costs summed over the routed
+    /// layers that keep device slots — all but the first `offloaded`, the
+    /// CPU-expert layers, exactly as the native bank budget charges it.
+    pub(crate) fn per_slot(&self, offloaded: usize) -> Result<u64, EngError> {
+        self.strides
+            .iter()
+            .skip(offloaded)
+            .try_fold(0u64, |sum, &stride| sum.checked_add(stride))
+            .ok_or_else(|| EngError::MemoryPlan("Flint resident audit byte count overflows".into()))
+    }
+}
+
+/// Audit `directory` as a Flint EXL3 checkpoint: reads headers and small
+/// ranges only. `max_weight_bytes` caps the resident load's weight bytes.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn audit_plan(
+    directory: &std::path::Path,
+    max_weight_bytes: u64,
+) -> Result<AuditPlan, EngError> {
+    let checkpoint = crate::weights::exl3::Checkpoint::open(directory)?;
+    let geometry =
+        crate::weights::exl3::flint_pack::Geometry::from_config(&checkpoint.model_config)?;
+    let limits = FlintResidentLimits {
+        max_staging_bytes: u64::MAX,
+        max_weight_bytes,
+        #[cfg(all(feature = "native-cuda", target_os = "linux"))]
+        reserve: Default::default(),
+    };
+    let roles = plan::plan_resident(directory, &checkpoint, &geometry, limits)?;
+    let audit = packing::Packing::audit_cached(&roles, &limits)?;
+    let overflow = || EngError::MemoryPlan("Flint resident audit byte count overflows".into());
+    let strides = audit
+        .strides()
+        .iter()
+        .map(|&stride| u64::try_from(stride).map_err(|_| overflow()))
+        .collect::<Result<Vec<u64>, EngError>>()?;
+    Ok(AuditPlan {
+        arena_base: u64::try_from(audit.arena_base()).map_err(|_| overflow())?,
+        strides,
+        routed_layers: audit.routed_layers(),
+        resident_bytes: u64::try_from(packing::Packing::new(&roles.layout, &limits)?.bytes)
+            .map_err(|_| overflow())?,
+    })
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct FlintResidentLimits {

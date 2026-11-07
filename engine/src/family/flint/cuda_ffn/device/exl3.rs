@@ -114,12 +114,10 @@ pub(crate) use wide::PairFaces;
 use wide::{Slot as Face, WideCuda};
 
 /// Resident experts per layer that one prefill piece of `rows` rows can demand at once: the
-/// smallest bank that can serve the piece.
-pub(crate) fn cache_prefill_floor(rows: usize) -> Result<usize, EngError> {
-    rows.checked_mul(TOP_K)
-        .filter(|&pairs| pairs > 0)
-        .ok_or_else(|| bad("EXL3 expert cache requires a nonzero row count"))
-}
+/// smallest bank that can serve the piece. The definition lives in
+/// `family::flint::budget` (host-buildable plan inventory); re-exported
+/// here for the loader and the device tests.
+pub(crate) use crate::family::flint::budget::cache_prefill_floor;
 
 pub(super) fn row_shape(bytes: usize, columns: usize) -> Result<RowShape, EngError> {
     row_shape_to(bytes, columns, PREFILL_MAX_ROWS)

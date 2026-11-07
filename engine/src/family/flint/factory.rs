@@ -211,21 +211,29 @@ fn launch(
 
 /// The pinned chat-template digest: also the park-identity `template`
 /// field, so engines and parks agree on one template identity.
-#[cfg(any(
-    test,
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-    all(feature = "native-cuda", target_os = "linux")
-))]
 const CHAT_TEMPLATE_JINJA_DIGEST: &[u8; 64] =
     b"7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466";
 
-#[cfg(any(
-    test,
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-    all(feature = "native-cuda", target_os = "linux")
-))]
 pub(super) fn pinned_template_sha() -> [u8; 32] {
     digest(CHAT_TEMPLATE_JINJA_DIGEST)
+}
+
+/// The tested tokenizer release for this family, SHA-256 pinned file by
+/// file: RecursiveSI/flint-int4 revision 3b93f905, publisher manifest
+/// flint-int4.json. Shared by the loader and the diagnostic surfaces so
+/// both refuse the same files.
+pub(crate) fn tokenizer_pin() -> crate::tokenizer::TokenizerPin {
+    crate::tokenizer::TokenizerPin {
+        tokenizer_json: digest(b"a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68"),
+        tokenizer_config_json: digest(
+            b"159ac88217e90ffd0a4a294726048bb302829e82e1958dc85bb203aa79138fbf",
+        ),
+        chat_template_jinja: pinned_template_sha(),
+        generation_config_json: digest(
+            b"a499c71895e008abd572558a5ad5904feaed92cf2a3b6e2cb0e9cabf03b96ed3",
+        ),
+        vocab_size: 150_144,
+    }
 }
 
 #[cfg(any(
@@ -234,31 +242,9 @@ pub(super) fn pinned_template_sha() -> [u8; 32] {
     all(feature = "native-cuda", target_os = "linux")
 ))]
 pub(super) fn load_tokenizer(dir: &Path) -> Result<TokenizerBundle, EngError> {
-    use crate::tokenizer::TokenizerPin;
-    // RecursiveSI/flint-int4 revision 3b93f905, publisher manifest flint-int4.json.
-    TokenizerBundle::load(
-        dir,
-        &TokenizerPin {
-            tokenizer_json: digest(
-                b"a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68",
-            ),
-            tokenizer_config_json: digest(
-                b"159ac88217e90ffd0a4a294726048bb302829e82e1958dc85bb203aa79138fbf",
-            ),
-            chat_template_jinja: pinned_template_sha(),
-            generation_config_json: digest(
-                b"a499c71895e008abd572558a5ad5904feaed92cf2a3b6e2cb0e9cabf03b96ed3",
-            ),
-            vocab_size: 150_144,
-        },
-    )
+    TokenizerBundle::load(dir, &tokenizer_pin())
 }
 
-#[cfg(any(
-    test,
-    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"),
-    all(feature = "native-cuda", target_os = "linux")
-))]
 const fn digest(hex: &[u8; 64]) -> [u8; 32] {
     const fn nibble(c: u8) -> u8 {
         match c {

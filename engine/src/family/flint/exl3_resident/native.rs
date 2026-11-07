@@ -2,7 +2,8 @@
 
 mod host;
 mod load;
-mod packing;
+
+use super::packing;
 
 pub(crate) use host::BankStats;
 
@@ -42,11 +43,7 @@ struct PickEntry {
 
 type PickLayout = (Vec<u32>, [(usize, usize); 9]);
 
-#[derive(Clone, Copy)]
-struct PackedRange {
-    offset: usize,
-    bytes: usize,
-}
+pub(super) use super::packing::PackedRange;
 
 #[derive(Clone, Copy)]
 struct PackedMatrix {

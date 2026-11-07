@@ -21,6 +21,11 @@
 //! is a memory size in every legitimate use), and an invalid value can
 //! be quoted by that setting's refusal text — a name that is
 //! allowlisted, not a credential.
+//!
+//! Schema history: /1 added the per-engine `preflight.decisions` array
+//! (the execution-plan inventory; empty for families whose estimate does
+//! not compose decisions yet). Additive only — every earlier /1 field is
+//! unchanged.
 
 use super::Probe;
 use super::preflight::{self, Candidate, PreflightReport};
@@ -160,6 +165,24 @@ fn preflight_json(report: &PreflightReport) -> Value {
                 "name": check.name,
                 "status": serde_json::to_value(check.status).unwrap_or(Value::Null),
                 "detail": check.detail,
+            }))
+            .collect::<Vec<_>>(),
+        "decisions": report
+            .decisions
+            .iter()
+            .map(|decision| json!({
+                "name": decision.name,
+                "chosen": decision.chosen,
+                "alternatives": decision
+                    .alternatives
+                    .iter()
+                    .map(|alternative| json!({
+                        "option": alternative.option,
+                        "verdict": alternative.verdict,
+                        "reason": alternative.reason,
+                    }))
+                    .collect::<Vec<_>>(),
+                "fixed_at": serde_json::to_value(decision.fixed_at).unwrap_or(Value::Null),
             }))
             .collect::<Vec<_>>(),
         "next_step": report.next_step,
@@ -387,6 +410,17 @@ fn effective_rows(
 ) -> Result<Vec<Value>, String> {
     use crate::family::qwen36::factory::{DENSE_FAMILY, FAMILY, backend_of_build};
     use crate::family::qwen36::settings::Q36Settings;
+    if engine.family == crate::family::flint::FAMILY {
+        let default_options = crate::family::flint::settings::FlintOptions::cuda_default();
+        let options = engine.flint.as_ref().unwrap_or(&default_options);
+        return Ok(super::effective::flint_effective(
+            options,
+            &crate::family::flint::budget::FlintEnv::capture(),
+        )
+        .iter()
+        .map(|row| json!({"key": row.key, "value": row.value, "origin": row.origin.name()}))
+        .collect());
+    }
     if engine.family != FAMILY && engine.family != DENSE_FAMILY {
         return Ok(vec![json!({
             "unavailable":

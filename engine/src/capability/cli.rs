@@ -329,6 +329,35 @@ fn run_config_effective(path: &std::path::Path, json: bool) -> Result<(), String
     for engine in &config.engines {
         let is_q36_family = engine.family == crate::family::qwen36::factory::FAMILY
             || engine.family == crate::family::qwen36::factory::DENSE_FAMILY;
+        if engine.family == crate::family::flint::FAMILY {
+            let default_options = crate::family::flint::settings::FlintOptions::cuda_default();
+            let rows = super::effective::flint_effective(
+                engine.flint.as_ref().unwrap_or(&default_options),
+                &crate::family::flint::budget::FlintEnv::capture(),
+            );
+            rendered.push_str(&format!(
+                "engine {} ({}, model {}):\n",
+                engine.id,
+                engine.family,
+                engine.model_name()
+            ));
+            for row in &rows {
+                rendered.push_str(&format!(
+                    "  {:32} {:>16}  ({})\n",
+                    row.key,
+                    row.value,
+                    row.origin.name()
+                ));
+            }
+            json_engines.push(serde_json::json!({
+                "id": engine.id,
+                "family": engine.family,
+                "settings": rows.iter().map(|row| serde_json::json!({
+                    "key": row.key, "value": row.value, "origin": row.origin.name()
+                })).collect::<Vec<_>>(),
+            }));
+            continue;
+        }
         if !is_q36_family {
             rendered.push_str(&format!(
                 "engine {} ({}): per-key origins are composed for the Qwen3.6 families only so far; model_dir {}\n",
@@ -520,6 +549,20 @@ pub fn render_preflight(report: &PreflightReport) -> String {
             CheckStatus::Info => "INFO",
         };
         out.push_str(&format!("[{mark}] {}: {}\n", check.name, check.detail));
+    }
+    for decision in &report.decisions {
+        out.push_str(&format!(
+            "decision {}: {} (fixed at {})\n",
+            decision.name,
+            decision.chosen,
+            decision.fixed_at.name()
+        ));
+        for alternative in &decision.alternatives {
+            out.push_str(&format!(
+                "  alternative {}: {} — {}\n",
+                alternative.option, alternative.verdict, alternative.reason
+            ));
+        }
     }
     if let Some(estimate) = &report.estimate {
         out.push_str(&format!(

@@ -1,5 +1,9 @@
 //! Flint metadata, pinned startup, and the initial MLX execution path.
 
+/// Pure budget and policy layer for the EXL3 serving profile: the bank
+/// plan, the admission mirror and the switch parsers, host-buildable so
+/// the diagnostic surfaces compose the same decisions without a device.
+pub(crate) mod budget;
 pub(crate) mod chunk_plan;
 mod config;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

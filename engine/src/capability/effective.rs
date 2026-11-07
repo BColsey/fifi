@@ -185,6 +185,147 @@ pub(crate) fn q36_effective(
     ]
 }
 
+/// The principal Flint settings with origins, in the same three-part
+/// shape as the Qwen3.6 rows: the `flint` config object (a field set
+/// there versus the CUDA default), the family's environment switches
+/// (`FlintEnv`, read by the caller so diagnostic processes and tests
+/// inject rather than capture), and the resolved values the switches
+/// produce. Flint's MLX path ignores the `flint` object; these rows are
+/// the CUDA view.
+pub(crate) fn flint_effective(
+    options: &crate::family::flint::settings::FlintOptions,
+    env: &crate::family::flint::budget::FlintEnv,
+) -> Vec<EffectiveSetting> {
+    use crate::family::flint::{
+        budget::{BankRequest, ExpertCacheMode, LayerMajor},
+        settings::FlintOptions,
+    };
+
+    // A config field counts as set when it differs from the no-`flint`
+    // default; FlintOptions has no Option fields because a present
+    // `flint` object must stay explicit.
+    let defaults = FlintOptions::cuda_default();
+    let from_config = |value: &str, default: &str| {
+        if value == default {
+            Origin::Default
+        } else {
+            Origin::ConfigFile
+        }
+    };
+
+    let mut rows = vec![
+        row(
+            "context_limit",
+            options.context_limit.to_string(),
+            if options.context_limit == defaults.context_limit {
+                Origin::Default
+            } else {
+                Origin::ConfigFile
+            },
+        ),
+        row(
+            "kv_profile",
+            options.kv_profile.clone(),
+            from_config(&options.kv_profile, &defaults.kv_profile),
+        ),
+        row(
+            "prefill_chunk_size",
+            options.prefill_chunk_size.to_string(),
+            if options.prefill_chunk_size == defaults.prefill_chunk_size {
+                Origin::Default
+            } else {
+                Origin::ConfigFile
+            },
+        ),
+        row(
+            "cpu_moe_offload_layers",
+            options.cpu_moe_offload_layers.to_string(),
+            if options.cpu_moe_offload_layers == 0 {
+                Origin::Default
+            } else {
+                Origin::ConfigFile
+            },
+        ),
+        row(
+            "cpu_moe_split_experts",
+            options.cpu_moe_split_experts.to_string(),
+            if options.cpu_moe_split_experts == 0 {
+                Origin::Default
+            } else {
+                Origin::ConfigFile
+            },
+        ),
+        row(
+            "cpu_moe_threads",
+            if options.cpu_moe_threads == 0 {
+                "default (6)".to_owned()
+            } else {
+                options.cpu_moe_threads.to_string()
+            },
+            if options.cpu_moe_threads == 0 {
+                Origin::Default
+            } else {
+                Origin::ConfigFile
+            },
+        ),
+    ];
+    // The environment switches resolve or refuse; an invalid value shows
+    // as the refusal text rather than a made-up setting.
+    let switch = |set: bool| {
+        if set {
+            Origin::Environment
+        } else {
+            Origin::Default
+        }
+    };
+    let mode = env
+        .expert_cache_mode()
+        .map(ExpertCacheMode::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|error| format!("refused: {error:?}"));
+    rows.push(row(
+        "expert_cache",
+        mode,
+        switch(env.expert_cache.is_some()),
+    ));
+    let request = env.bank_request().map_or_else(
+        |error| format!("refused: {error:?}"),
+        |request| match request {
+            BankRequest::Fit => "fit".to_owned(),
+            BankRequest::Exactly(count) => format!("exactly {count}"),
+        },
+    );
+    rows.push(row(
+        "expert_slots",
+        request,
+        switch(env.expert_slots.is_some()),
+    ));
+    let layer_major = env.layer_major().map_or_else(
+        |error| format!("refused: {error:?}"),
+        |major| match major {
+            LayerMajor::Off => "off".to_owned(),
+            LayerMajor::Tiles => "tiles (1)".to_owned(),
+            LayerMajor::Jobs => "jobs".to_owned(),
+        },
+    );
+    rows.push(row(
+        "layer_major",
+        layer_major,
+        switch(env.layer_major.is_some()),
+    ));
+    rows.push(row(
+        "alloc_cache",
+        if env.alloc_cache_enabled() {
+            "on"
+        } else {
+            "off"
+        }
+        .to_owned(),
+        switch(env.alloc_cache.is_some()),
+    ));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Origin, q36_effective};
@@ -207,6 +348,51 @@ mod tests {
             .find(|r| r.key == key)
             .unwrap_or_else(|| panic!("no row {key}"))
             .origin
+    }
+
+    #[test]
+    fn flint_rows_name_config_env_and_default_origins() {
+        use crate::family::flint::budget::FlintEnv;
+        use crate::family::flint::settings::FlintOptions;
+
+        let rows = super::flint_effective(&FlintOptions::cuda_default(), &FlintEnv::default());
+        assert_eq!(origin(&rows, "context_limit"), Origin::Default);
+        let context = rows.iter().find(|r| r.key == "context_limit").unwrap();
+        assert_eq!(context.value, "131072");
+        assert_eq!(origin(&rows, "kv_profile"), Origin::Default);
+        // The alloc cache is default-on; the row says so without a var set.
+        assert_eq!(origin(&rows, "alloc_cache"), Origin::Default);
+        assert!(
+            rows.iter()
+                .any(|r| r.key == "alloc_cache" && r.value == "on")
+        );
+
+        let mut options = FlintOptions::cuda_default();
+        options.kv_profile = "q8".to_owned();
+        options.cpu_moe_threads = 4;
+        let env = FlintEnv {
+            expert_slots: Some("226".to_owned()),
+            layer_major: Some(std::ffi::OsString::from("jobs")),
+            ..FlintEnv::default()
+        };
+        let rows = super::flint_effective(&options, &env);
+        assert_eq!(origin(&rows, "kv_profile"), Origin::ConfigFile);
+        assert_eq!(origin(&rows, "cpu_moe_threads"), Origin::ConfigFile);
+        assert_eq!(origin(&rows, "expert_slots"), Origin::Environment);
+        let slots = rows.iter().find(|r| r.key == "expert_slots").unwrap();
+        assert_eq!(slots.value, "exactly 226");
+        assert_eq!(origin(&rows, "layer_major"), Origin::Environment);
+        let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
+        assert_eq!(major.value, "jobs");
+
+        // A refused switch value renders as the refusal, not a setting.
+        let env = FlintEnv {
+            layer_major: Some(std::ffi::OsString::from("yes")),
+            ..FlintEnv::default()
+        };
+        let rows = super::flint_effective(&FlintOptions::cuda_default(), &env);
+        let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
+        assert!(major.value.starts_with("refused:"), "{}", major.value);
     }
 
     #[test]
