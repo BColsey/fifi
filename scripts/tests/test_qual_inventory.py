@@ -821,7 +821,7 @@ class PackRegistryTest(unittest.TestCase):
     def test_scorer_margins_are_read_from_the_compiled_source(self):
         compiled = qi.scorer_margins()
         self.assertEqual(compiled["v6"], (0.02, -0.005, -0.01, -0.02))
-        self.assertEqual(compiled["v7"], (0.02, -0.005, 0.02, 0.02))
+        self.assertEqual(compiled["v7"], (0.02, -0.005, 0.019, 0.019))
 
     def test_registration_margin_drift_from_source_fails(self):
         registry = self._bound()

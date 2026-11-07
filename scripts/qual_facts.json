@@ -14,7 +14,7 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5952,
+      "test_fns": 5955,
       "ignored": 498,
       "env_gates": [
         "CUDA_MODULE_LOADING",
@@ -333,7 +333,7 @@
         },
         "M3_LAYOUT_DIR": {
           "or_skip": 2,
-          "required": 3
+          "required": 2
         },
         "M3_V6_REPRO_ROOT": {
           "or_skip": 0,

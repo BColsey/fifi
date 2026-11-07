@@ -442,27 +442,44 @@ fn arm_rows(dir: &Path, layout: &Layout) -> Result<ArmRows, String> {
 }
 
 /// The frozen comparisons of two sidecar sets. `M3_COMPARE=P1:cand:ref`
-/// or `O1:cand:ref` (plus M3_LAYOUT_DIR): the pair's expected sidecar
+/// or `O1:cand:ref` (plus M3_LAYOUT_DIR and `M3_REGISTRATION=v6|v7`, which
+/// has no default: every verdict names its registration version): the
+/// pair's expected sidecar
 /// identities are registered HERE, so a swapped or mismatched pair aborts
 /// before any math, and the two arms must be scored on the SAME build.
 /// Writes the four margins and the verdict to stdout and panics on any
 /// incomplete or mismatching arm (crash rule).
 #[test]
-#[ignore = "needs two complete arm sidecar sets: M3_COMPARE=P1|O1:cand_dir:ref_dir M3_LAYOUT_DIR=dir"]
+#[ignore = "needs two complete arm sidecar sets: M3_COMPARE=P1|O1:cand_dir:ref_dir M3_REGISTRATION=v6|v7 M3_LAYOUT_DIR=dir"]
 fn m3_compare() {
-    let layout_dir = crate::test_paths::required("M3_LAYOUT_DIR");
-    let (pair, cand_dir, ref_dir) = {
-        let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=P1|O1:cand:ref");
-        let parts: Vec<&str> = spec.split(':').collect();
-        assert!(parts.len() == 3, "spec is PAIR:cand_dir:ref_dir");
-        (
-            parts[0].to_string(),
-            PathBuf::from(parts[1]),
-            PathBuf::from(parts[2]),
-        )
-    };
+    let registration = std::env::var("M3_REGISTRATION").ok();
+    let spec = std::env::var("M3_COMPARE").expect("M3_COMPARE=P1|O1:cand:ref");
+    // The registration is resolved before the layout path or any sidecar is
+    // touched: an unset or unknown version aborts first.
+    let layout_dir = crate::test_paths::lookup("M3_LAYOUT_DIR");
+    let (line, verdict) = run_compare(&spec, registration.as_deref(), layout_dir.as_deref())
+        .unwrap_or_else(|e| panic!("{e}"));
+    println!("{line}");
+    assert!(verdict, "the registered margins failed: {line}");
+}
+
+/// The comparison behind `m3_compare`, with its inputs passed explicitly so
+/// the version rule is testable: the registration version is resolved FIRST
+/// (no default; unset or unknown is an error naming the valid values) and
+/// nothing is read from disk before that succeeds.
+fn run_compare(
+    spec: &str,
+    registration: Option<&str>,
+    layout_dir: Option<&Path>,
+) -> Result<(String, bool), String> {
+    let registration = Registration::from_env_value(registration)?;
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 3 {
+        return Err("spec is PAIR:cand_dir:ref_dir".to_string());
+    }
+    let (pair, cand_dir, ref_dir) = (parts[0], PathBuf::from(parts[1]), PathBuf::from(parts[2]));
     // [gguf, kv-q8, chunked]: P1 = arm3 vs arm2 (q8); O1 = arm2' vs arm1 (f16).
-    let (want_cand, want_ref, label) = match pair.as_str() {
+    let (want_cand, want_ref, label) = match pair {
         "P1" => (
             [0, 1, 1],
             [0, 1, 0],
@@ -473,30 +490,21 @@ fn m3_compare() {
             [1, 0, 1],
             "O1: EXL3 f16 chunked vs GGUF f16 chunked",
         ),
-        other => panic!("unknown comparison {other}: P1 or O1"),
+        other => return Err(format!("unknown comparison {other}: P1 or O1")),
     };
-    let layout = load_layout(&layout_dir).expect("layout");
-    let cand = arm_rows(&cand_dir, &layout).expect("candidate arm");
-    let reference = arm_rows(&ref_dir, &layout).expect("reference arm");
-    assert_eq!(
-        cand.identity.0, want_cand,
-        "candidate sidecar carries the wrong arm"
-    );
-    assert_eq!(
-        reference.identity.0, want_ref,
-        "reference sidecar carries the wrong arm"
-    );
-    assert_eq!(
-        cand.identity.1, reference.identity.1,
-        "the two arms were scored on different builds"
-    );
-    // M3_REGISTRATION selects the scoring rule: unset keeps the registered v6
-    // path; any value other than v6/v7 aborts before any math (fail closed).
-    let registration = match std::env::var("M3_REGISTRATION") {
-        Ok(text) => Registration::parse(&text).expect("M3_REGISTRATION"),
-        Err(std::env::VarError::NotPresent) => Registration::V6,
-        Err(e) => panic!("M3_REGISTRATION: {e}"),
-    };
+    let layout_dir = layout_dir.ok_or_else(|| "M3_LAYOUT_DIR is not set".to_string())?;
+    let layout = load_layout(layout_dir)?;
+    let cand = arm_rows(&cand_dir, &layout)?;
+    let reference = arm_rows(&ref_dir, &layout)?;
+    if cand.identity.0 != want_cand {
+        return Err("candidate sidecar carries the wrong arm".to_string());
+    }
+    if reference.identity.0 != want_ref {
+        return Err("reference sidecar carries the wrong arm".to_string());
+    }
+    if cand.identity.1 != reference.identity.1 {
+        return Err("the two arms were scored on different builds".to_string());
+    }
     let scored = score(
         registration,
         &ArmRowsRef {
@@ -514,12 +522,14 @@ fn m3_compare() {
         SEED,
     );
     let verdict = scored.passes();
-    println!(
-        "m3 comparison {label}: registration={} cand arm {want_cand:?} ref arm {want_ref:?} build {:02x?}: {scored:?} verdict={verdict}",
-        registration.label(),
-        cand.identity.1
-    );
-    assert!(verdict, "the registered margins failed: {scored:?}");
+    Ok((
+        format!(
+            "m3 comparison {label}: registration={} cand arm {want_cand:?} ref arm {want_ref:?} build {:02x?}: {scored:?} verdict={verdict}",
+            registration.label(),
+            cand.identity.1
+        ),
+        verdict,
+    ))
 }
 
 /// The arm-4 gate: the two trace legs' digest files (one sha256 per
@@ -720,6 +730,38 @@ mod tests {
         );
     }
 
+    /// No default registration: an unset, empty or unknown version is refused
+    /// by the compare step BEFORE the layout or any sidecar is read, with the
+    /// valid values named; a valid version proceeds to the layout and fails
+    /// there instead, which proves the order.
+    #[test]
+    fn compare_refuses_unset_or_unknown_registration_before_any_read() {
+        let spec = "P1:/no/such/cand:/no/such/ref";
+        let no_dir = Some(Path::new("/no/such/layout"));
+        let unset = run_compare(spec, None, no_dir).expect_err("unset");
+        assert!(
+            unset.contains("M3_REGISTRATION") && unset.contains("v6 or v7"),
+            "{unset}"
+        );
+        for bad in ["", "v5", "v8", "V7", "7", "latest", "v6,v7", " v7"] {
+            let err = run_compare(spec, Some(bad), no_dir).expect_err(bad);
+            assert!(
+                err.contains("unknown registration version") && err.contains("v6 and v7"),
+                "{bad:?}: {err}"
+            );
+            assert!(
+                !err.contains("layout") && !err.contains("sidecar"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["v6", "v7"] {
+            let err = run_compare(spec, Some(good), no_dir).expect_err(good);
+            assert!(err.contains("layout json does not read"), "{good}: {err}");
+            let err = run_compare(spec, Some(good), None).expect_err(good);
+            assert!(err.contains("M3_LAYOUT_DIR is not set"), "{good}: {err}");
+        }
+    }
+
     /// The sidecar round-trips and read_sidecar rejects tampering, a wrong
     /// window, and wrong geometry.
     #[test]
@@ -787,6 +829,11 @@ mod tests {
     #[test]
     #[ignore = "needs the recorded v6 sidecars: M3_V6_REPRO_ROOT=score-v6 dir, M3_LAYOUT_DIR=layout dir"]
     fn v6_registered_bounds_reproduce_on_recorded_sidecars() {
+        // The run names its version explicitly (no default): v6 only.
+        let registration =
+            Registration::from_env_value(std::env::var("M3_REGISTRATION").ok().as_deref())
+                .expect("M3_REGISTRATION=v6");
+        assert_eq!(registration, Registration::V6, "this repro runs under v6");
         let layout = load_layout(&crate::test_paths::required("M3_LAYOUT_DIR")).expect("layout");
         let root = crate::test_paths::required("M3_V6_REPRO_ROOT");
         let arm = |name: &str| arm_rows(&root.join(name), &layout).expect("arm sidecars");
@@ -794,7 +841,7 @@ mod tests {
             let r = |a: &ArmRows| (a.positions.clone(), a.retrieval.clone(), a.copy.clone());
             let ((cp, cr, cc), (rp, rr, rc)) = (r(cand), r(reference));
             match score(
-                Registration::V6,
+                registration,
                 &ArmRowsRef {
                     positions: &cp,
                     retrieval: &cr,

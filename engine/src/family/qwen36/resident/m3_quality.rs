@@ -302,6 +302,19 @@ impl Registration {
         }
     }
 
+    /// Resolves the `M3_REGISTRATION` value. There is no default: every
+    /// scoring run names its registration version explicitly, so an unset
+    /// variable is refused with the valid values named.
+    pub(in crate::family::qwen36) fn from_env_value(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            Some(text) => Self::parse(text),
+            None => Err(
+                "M3_REGISTRATION is not set: name the registration version explicitly (v6 or v7)"
+                    .to_string(),
+            ),
+        }
+    }
+
     pub(in crate::family::qwen36) fn label(self) -> &'static str {
         match self {
             Registration::V6 => "v6",
@@ -363,7 +376,10 @@ impl SpanRow {
 }
 
 /// The v7 gate margins. NLL and top-1 are the v6 values unchanged; the two
-/// probe gates are ceilings on the probe-span NLL difference (nats).
+/// probe gates are ceilings on the probe-span NLL difference (nats). The
+/// tolerated harm stays 0.02 nats; the 0.019 ceiling at the 95% bound keeps
+/// the size at that harm at or below 0.05 (the percentile bootstrap
+/// undercovers slightly at a 0.02 ceiling).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::family::qwen36) struct MarginsV7 {
     pub nll_ub: f64,
@@ -377,8 +393,8 @@ impl MarginsV7 {
         MarginsV7 {
             nll_ub: 0.02,
             top1_lb: -0.005,
-            retrieval_span_nll_ub: 0.02,
-            copy_span_nll_ub: 0.02,
+            retrieval_span_nll_ub: 0.019,
+            copy_span_nll_ub: 0.019,
         }
     }
 }
@@ -1037,7 +1053,7 @@ mod tests {
         assert!(cmp.retrieval_span_acc_lb.abs() < 1e-12 && cmp.copy_span_acc_lb.abs() < 1e-12);
     }
 
-    /// Direction cases: span NLL worse by more than 0.02 nats fails each
+    /// Direction cases: span NLL worse by more than 0.019 nats fails each
     /// probe gate on its own side; better passes with room.
     #[test]
     fn v7_probe_span_nll_direction_cases() {
@@ -1058,8 +1074,10 @@ mod tests {
         let better = v7_eval(&v7_fixture(0.35, 0.25, true), &refr);
         assert!(better.retrieval_span_nll_ub < 0.0 && better.copy_span_nll_ub < 0.0);
         assert!(better.passes(&m));
-        // Exactly inside the margin passes: +0.019 < +0.02.
-        assert!(v7_eval(&v7_fixture(0.419, 0.319, true), &refr).passes(&m));
+        // Inside the 0.019 ceiling passes, just outside fails.
+        assert!(v7_eval(&v7_fixture(0.4185, 0.3185, true), &refr).passes(&m));
+        assert!(!v7_eval(&v7_fixture(0.4195, 0.30, true), &refr).passes(&m));
+        assert!(!v7_eval(&v7_fixture(0.40, 0.3195, true), &refr).passes(&m));
     }
 
     /// Exact match is a reported secondary, not a gate: losing every exact
@@ -1116,11 +1134,13 @@ mod tests {
         };
         let (cr, rr) = (
             probe(&[true, false, true, true, false, true]),
-            probe(&[true, true, true, false, false, true]),
+            probe(&[true, true, false, false, false, true]),
         );
+        // Non-degenerate copy rows: per-cluster paired differences are
+        // -1, -1, +1, so swapping candidate and reference changes the bound.
         let (cc, rc) = (
-            probe(&[false, false, true, true, true, true]),
-            probe(&[true, false, true, false, true, true]),
+            probe(&[false, true, true, true, false, true]),
+            probe(&[true, true, false, true, true, true]),
         );
         let exact = |rows: &[SpanRow]| rows.iter().map(SpanRow::exact_row).collect::<Vec<_>>();
         let frozen = Comparison::evaluate(
@@ -1160,6 +1180,117 @@ mod tests {
             other => panic!("v6 dispatched to {other:?}"),
         }
         assert_eq!(routed.passes(), frozen.passes(&Margins::frozen()));
+        // Cand/ref are not interchangeable: with the swap every bound moves,
+        // so a dispatcher that fed the wrong rows could not match bit for bit.
+        let swapped = Comparison::evaluate(
+            &b,
+            &a,
+            &exact(&rc),
+            &exact(&cc),
+            &exact(&rr),
+            &exact(&cr),
+            3,
+            300,
+            20261031,
+        );
+        assert_ne!(swapped.nll_ub.to_bits(), frozen.nll_ub.to_bits());
+        assert_ne!(swapped.top1_lb.to_bits(), frozen.top1_lb.to_bits());
+        assert_ne!(swapped.probe_lb.to_bits(), frozen.probe_lb.to_bits());
+        assert_ne!(
+            swapped.retrieval_lb.to_bits(),
+            frozen.retrieval_lb.to_bits()
+        );
+        // Copy and retrieval rows are not interchangeable either.
+        let crossed = Comparison::evaluate(
+            &a,
+            &b,
+            &exact(&cr),
+            &exact(&rr),
+            &exact(&cc),
+            &exact(&rc),
+            3,
+            300,
+            20261031,
+        );
+        assert_ne!(crossed.probe_lb.to_bits(), frozen.probe_lb.to_bits());
+    }
+
+    /// Nine probes over three clusters whose per-probe NLL differences vary
+    /// WITHIN each cluster (the bootstrap bounds then differ by side). The
+    /// reference span NLL is `base`; the candidate adds `diffs[i]`.
+    fn v7_varied(base: f64, diffs: [f64; 9]) -> Vec<SpanRow> {
+        span_rows(
+            &diffs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| ((i % 3) as u32, true, 1.0, base + d))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    const RETR_DIFFS: [f64; 9] = [0.01, 0.05, 0.02, 0.09, 0.00, 0.03, 0.04, 0.06, 0.01];
+    const COPY_DIFFS: [f64; 9] = [0.06, 0.01, 0.04, 0.00, 0.09, 0.02, 0.03, 0.01, 0.05];
+
+    /// `score(V7, ...)` is the v7 path: it returns the V7 variant with the
+    /// v7 values (not the v6 evaluation), and the retrieval and copy span
+    /// bounds are the UPPER side of their own rows. Cluster means of the
+    /// differences are 0.047/0.0333/0.02 (retrieval) so the upper bound lies
+    /// above the point difference 0.0344 and the lower bound below it.
+    #[test]
+    fn score_v7_dispatches_to_the_v7_path_with_upper_side_span_bounds() {
+        let pos = rows(&[-1.0; 12], &[true; 12], 4);
+        let reference_retr = v7_varied(0.40, [0.0; 9]);
+        let reference_copy = v7_varied(0.30, [0.0; 9]);
+        let cand_retr = v7_varied(0.40, RETR_DIFFS);
+        let cand_copy = v7_varied(0.30, COPY_DIFFS);
+        let cand = ArmRowsRef {
+            positions: &pos,
+            retrieval: &cand_retr,
+            copy: &cand_copy,
+        };
+        let refr = ArmRowsRef {
+            positions: &pos,
+            retrieval: &reference_retr,
+            copy: &reference_copy,
+        };
+        let scored = score(Registration::V7, &cand, &refr, 3, 500, 20261031);
+        let Scored::V7(v7) = scored else {
+            panic!("V7 dispatched to {scored:?}");
+        };
+        let nll = |r: &SpanRow| r.span_nll;
+        let upper =
+            |c: &[SpanRow], r: &[SpanRow], up: bool| span_bound(c, r, nll, 500, 20261031, up);
+        let mean = |d: &[f64; 9]| d.iter().sum::<f64>() / 9.0;
+        let (retr_point, copy_point) = (mean(&RETR_DIFFS), mean(&COPY_DIFFS));
+        // Retrieval: strictly above its point difference, within the largest
+        // cluster mean; the lower side sits strictly below the point.
+        assert_eq!(
+            v7.retrieval_span_nll_ub,
+            upper(&cand_retr, &reference_retr, true)
+        );
+        assert!(
+            v7.retrieval_span_nll_ub > retr_point + 1e-6
+                && v7.retrieval_span_nll_ub <= 0.047 + 1e-9,
+            "{v7:?}"
+        );
+        assert!(upper(&cand_retr, &reference_retr, false) < retr_point - 1e-6);
+        // Copy: the same, on its own rows (not the retrieval rows).
+        assert_eq!(
+            v7.copy_span_nll_ub,
+            upper(&cand_copy, &reference_copy, true)
+        );
+        assert!(
+            v7.copy_span_nll_ub > copy_point + 1e-6 && v7.copy_span_nll_ub <= 0.0467,
+            "{v7:?}"
+        );
+        assert!(upper(&cand_copy, &reference_copy, false) < copy_point - 1e-6);
+        assert_ne!(v7.retrieval_span_nll_ub, v7.copy_span_nll_ub);
+        // Both span gates are far over the 0.019 ceiling: the V7 verdict fails.
+        assert!(!scored.passes());
+        // The position gates came from the unchanged v6 evaluation.
+        assert_eq!((v7.nll_ub, v7.top1_lb), (0.0, 0.0));
+        // The secondary exact bound is the v6 statistic (all exact: zero).
+        assert_eq!(v7.retrieval_exact_lb, 0.0);
     }
 
     #[test]
@@ -1169,7 +1300,27 @@ mod tests {
         assert_eq!((v7.nll_ub, v7.top1_lb), (v6.nll_ub, v6.top1_lb));
         assert_eq!(
             (v7.retrieval_span_nll_ub, v7.copy_span_nll_ub),
-            (0.02, 0.02)
+            (0.019, 0.019)
         );
+    }
+
+    #[test]
+    fn registration_from_env_value_has_no_default() {
+        assert_eq!(
+            Registration::from_env_value(Some("v6")),
+            Ok(Registration::V6)
+        );
+        assert_eq!(
+            Registration::from_env_value(Some("v7")),
+            Ok(Registration::V7)
+        );
+        let unset = Registration::from_env_value(None).expect_err("unset is refused");
+        assert!(
+            unset.contains("M3_REGISTRATION") && unset.contains("v6 or v7"),
+            "{unset}"
+        );
+        for bad in ["", "v8", "V6", "v6 "] {
+            assert!(Registration::from_env_value(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 }

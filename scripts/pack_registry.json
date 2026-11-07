@@ -23,7 +23,7 @@
     "registrations": {
       "current": "v7",
       "scope": "A registration version applies to collections scored after it is registered. A verdict recorded under an earlier version is annotated, never re-judged.",
-      "selector": "m3_quality::Registration (M3_REGISTRATION=v6|v7 in the M3 compare step); an unknown version aborts before any math",
+      "selector": "m3_quality::Registration (M3_REGISTRATION=v6|v7 in the M3 compare step). There is no default: an unset or unknown version aborts before any sidecar is read, and every scoring run and verdict names its version.",
       "versions": {
         "v6": {
           "status": "frozen",
@@ -90,13 +90,13 @@
             "copy": {
               "statistic": "probe-span NLL difference: per probe the mean true-token NLL over the span, pooled probe-weighted",
               "bound": "upper",
-              "margin": 0.02,
+              "margin": 0.019,
               "unit": "nats"
             },
             "retrieval": {
               "statistic": "probe-span NLL difference: per probe the mean true-token NLL over the span, pooled probe-weighted",
               "bound": "upper",
-              "margin": 0.02,
+              "margin": 0.019,
               "unit": "nats"
             }
           },
@@ -104,10 +104,11 @@
             "exact-match rate difference, lower bound (copy and retrieval)",
             "probe-span argmax accuracy difference, lower bound (copy and retrieval)"
           ],
-          "power": "On the recorded layout (174 retrieval, 387 copy probes), P(pass | true difference 0) is about 0.97 or more per probe gate and about 0.96 or more for all four gates jointly under cross-format churn; P(pass | true harm = margin) is 0.054-0.068 (nominal 0.05); P(pass | harm 0.0225 nats) is at most 0.022. Source: qualification/o1-gate-v7/ANALYSIS.md.",
+          "power": "On the recorded layout (174 retrieval, 387 copy probes), under cross-format churn: P(pass | true difference 0) is 0.95-1.00 per probe gate and 0.94-1.00 for all four gates jointly; the size at the tolerated harm of 0.02 nats is 0.02-0.045 (the ceiling is 0.019 because the percentile bootstrap undercovers slightly at 0.02, size 0.052-0.069). The joint figure ANDs independent simulated sign flips per gate; positive association between the gates would make the true joint rate higher, so the figure is conservative for power. Source: qualification/o1-gate-v7/ANALYSIS.md.",
           "evidence": [
             "qualification/o1-gate-v7/ANALYSIS.md"
-          ]
+          ],
+          "tolerated_harm_nats": 0.02
         }
       }
     }
@@ -166,7 +167,7 @@
           "doc/explanation/status.md: quality standard note - quality against the GGUF engine applies"
         ],
         "registered_under": "v6",
-        "annotation": "Registered under v6; not re-judged. NLL gap is real (+0.0234 nats, upper bound +0.0284 > +0.02); the exact-match probe failures are inconclusive per the 2026-11-06 power analysis."
+        "annotation": "Registered under v6; not re-judged. NLL gap is real (+0.0234 nats, upper bound +0.0284 > +0.02). Exact-match probe failures are inconclusive per the 2026-11-06 power analysis, but the point estimates (retrieval -1.7 pp, copy -0.3 pp) are adverse and unresolved. v7 span NLL, exploratory: retrieval +0.0037, copy +0.0241 (point +0.0143)."
       },
       "production_eligibility": {
         "runtime_label": "experimental",
@@ -194,7 +195,7 @@
           "docs/plans/xinfer-adoption-audit.md:134-135 'EXL3 4.50 | 128K memory-admitted; 256K refused by 89.2 MB | NOT qualified (O1 failed)'"
         ],
         "registered_under": "v6",
-        "annotation": "Registered under v6; not re-judged. NLL and top-1 gates passed; the exact-match probe failures are inconclusive per the 2026-11-06 power analysis."
+        "annotation": "Registered under v6; not re-judged. NLL and top-1 gates passed. Exact-match probe failures are inconclusive per the 2026-11-06 power analysis, but the point estimates (retrieval -2.9 pp, copy -0.5 pp) are adverse and unresolved. v7 span NLL, exploratory: +0.0069 retrieval, +0.0083 copy."
       },
       "production_eligibility": {
         "runtime_label": "experimental",
