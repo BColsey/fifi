@@ -2914,7 +2914,6 @@ static int compile_attn_pre_body(
   const int pair = p->width * 2;
   const int one_hidden[2] = {1, p->hidden};
   const int heads_pair[2] = {p->heads, pair};
-  const int heads_width[2] = {p->heads, p->width};
   const int kv_width[2] = {p->kv_heads, p->width};
   const int q4_shape[4] = {1, p->heads, 1, p->width};
   const int k4_shape[4] = {1, p->kv_heads, 1, p->width};
@@ -2959,47 +2958,6 @@ static int compile_attn_pre_body(
   if (status == 0) status = mlx_vector_array_set(res, results);
   const int release = mlx_vector_array_free(results);
   return status != 0 ? status : release;
-}
-
-// Compiles the attention pre-RoPE block under the fixed cache key `fun_id` (shapeless true
-// over the fixed B=1 shapes, like the delta block) and applies it once; the outputs are lazy.
-extern "C" int inference_mlx_compile_attn_pre_block(
-    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* gate, const mlx_array* inputs,
-    size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
-    uintptr_t fun_id, mlx_stream stream) noexcept {
-  return run_selected_operation(q, stream, [&]() noexcept {
-    if (inputs_num != 12) return 1;
-    CompileAttnPrePayload* payload =
-        static_cast<CompileAttnPrePayload*>(std::malloc(sizeof(CompileAttnPrePayload)));
-    if (payload == nullptr) {
-      return 1;
-    }
-    payload->hidden = dims[0];
-    payload->heads = dims[1];
-    payload->kv_heads = dims[2];
-    payload->width = dims[3];
-    payload->eps = eps;
-    payload->stream = stream;
-    int stream_status = compile_copy_stream(&payload->stream, stream);
-    if (stream_status != 0) {
-      std::free(payload);
-      return stream_status;
-    }
-    for (int i = 0; i < 3; ++i) {
-      payload->mode[i] = quant[3 * i];
-      payload->group[i] = quant[3 * i + 1];
-      payload->bits[i] = quant[3 * i + 2];
-    }
-    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
-    const int status = compile_apply_block(
-        outputs, 4, compile_attn_pre_body, payload, compile_attn_pre_payload_free, inputs,
-        inputs_num, fun_id);
-    *q = outputs[0];
-    *k = outputs[1];
-    *v = outputs[2];
-    *gate = outputs[3];
-    return status;
-  });
 }
 
 // Builds a payload closure, compiles it under the fixed cache key `fun_id` (shapeless false),
@@ -3098,6 +3056,49 @@ static int compile_delta_apply(
       , partial_output
 #endif
       );
+}
+
+// Compiles the attention pre-RoPE block under the fixed cache key `fun_id` (shapeless true
+// over the fixed B=1 shapes, like the delta block) and applies it once; the outputs are lazy.
+// Defined after compile_apply_block, which it calls.
+extern "C" int inference_mlx_compile_attn_pre_block(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* gate, const mlx_array* inputs,
+    size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(q, stream, [&]() noexcept {
+    (void)activation;  // The activation dtype rides in the cache key; the body needs no cast.
+    if (inputs_num != 12) return 1;
+    CompileAttnPrePayload* payload =
+        static_cast<CompileAttnPrePayload*>(std::malloc(sizeof(CompileAttnPrePayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->hidden = dims[0];
+    payload->heads = dims[1];
+    payload->kv_heads = dims[2];
+    payload->width = dims[3];
+    payload->eps = eps;
+    payload->stream = stream;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    for (int i = 0; i < 3; ++i) {
+      payload->mode[i] = quant[3 * i];
+      payload->group[i] = quant[3 * i + 1];
+      payload->bits[i] = quant[3 * i + 2];
+    }
+    mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
+    const int status = compile_apply_block(
+        outputs, 4, compile_attn_pre_body, payload, compile_attn_pre_payload_free, inputs,
+        inputs_num, fun_id);
+    *q = outputs[0];
+    *k = outputs[1];
+    *v = outputs[2];
+    *gate = outputs[3];
+    return status;
+  });
 }
 
 // ===== Flint layer-subgraph compile probe =====
