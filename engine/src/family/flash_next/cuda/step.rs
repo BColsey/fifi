@@ -27,10 +27,10 @@
 //! stream before the attention read of the PLE layer; the caller does it on
 //! the host between two calls, with the stream read back and written again. A range of layers that
 //! would run the PLE layer after an earlier layer of the same call therefore has the wrong stream
-//! from the PLE layer on, and [`FlashStep::run_layers`] refuses it: call it for the layers before
-//! the PLE layer, apply the update, then call it (or [`FlashStep::run_layer`] one layer at a time)
-//! from the PLE layer on. A range that starts at the PLE layer is the caller's promise that the
-//! update was applied. The layer and head tests of `step_tests.rs` run without PLE on both sides, on
+//! from the PLE layer on, and [`FlashStep::run_layers`] refuses it: call it with `0..ple_layer`,
+//! apply the update, then call it with `ple_layer..layers` (or [`FlashStep::run_layer`] one layer
+//! at a time, which does not check). A range that starts at the PLE layer is the caller's promise
+//! that the update was applied. The layer and head tests of `step_tests.rs` run without PLE on both sides, on
 //! purpose, through `run_layers_without_ple`, a test-only entry point.
 //!
 //! Errors: after any error in a launch call the step is poisoned (its stream or state may be half
@@ -503,10 +503,10 @@ impl<'a> FlashStep<'a> {
     }
 
     /// Reads the status word and the EXL3 flag behind the queued work (so it drains the stream's
-    /// work up to here) and turns a fault into an error: a nonzero status word or EXL3 flag
-    /// poisons the step. Call it after the last launch of a token, `head` included.
+    /// work up to here) and turns a fault into an error: a nonzero status word or EXL3 flag, or a
+    /// failed read, poisons the step. Call it after the last launch of a token, `head` included.
     pub(super) fn finish_token(&self) -> Result<(), EngError> {
-        let (status, flag) = self.health()?;
+        let (status, flag) = self.poison_on(self.health())?;
         if status != 0 || flag != 0 {
             self.poisoned.set(true);
             return Err(EngError::ModelOutput(format!(
@@ -534,26 +534,46 @@ impl<'a> FlashStep<'a> {
         Ok(())
     }
 
-    /// Queues the layers of the window for the token at `pos`. Refuses a window that crosses the
-    /// PLE layer (see the module doc).
-    pub(super) fn run_layers(&self, pos: usize, moe: &mut dyn MoeBlock) -> Result<(), EngError> {
-        self.check_ple(&self.layers)?;
-        self.run_range(pos, moe)
+    /// Queues `range` of the window's layers for the token at `pos`. Refuses a range outside the
+    /// window, and a range that crosses the PLE layer (see the module doc): the real path is two
+    /// calls, `0..ple_layer` and `ple_layer..layers`, with the host update between them.
+    pub(super) fn run_layers(
+        &self,
+        range: std::ops::Range<usize>,
+        pos: usize,
+        moe: &mut dyn MoeBlock,
+    ) -> Result<(), EngError> {
+        if range.start >= range.end
+            || range.start < self.layers.start
+            || range.end > self.layers.end
+        {
+            return Err(refuse(format!(
+                "layers {}..{} are not inside the step's window {}..{}",
+                range.start, range.end, self.layers.start, self.layers.end
+            )));
+        }
+        self.check_ple(&range)?;
+        self.run_range(range, pos, moe)
     }
 
-    /// `run_layers` for the tests, which run a window across the PLE layer without the
-    /// update on both sides, host reference and device.
+    /// `run_layers` over the whole window, for the tests, which run a window across the PLE layer
+    /// without the update on both sides, host reference and device.
     #[cfg(test)]
     pub(super) fn run_layers_without_ple(
         &self,
         pos: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
-        self.run_range(pos, moe)
+        self.run_range(self.layers.clone(), pos, moe)
     }
 
-    fn run_range(&self, pos: usize, moe: &mut dyn MoeBlock) -> Result<(), EngError> {
-        for layer in self.layers.clone() {
+    fn run_range(
+        &self,
+        range: std::ops::Range<usize>,
+        pos: usize,
+        moe: &mut dyn MoeBlock,
+    ) -> Result<(), EngError> {
+        for layer in range {
             self.run_layer(layer, pos, moe)?;
         }
         Ok(())

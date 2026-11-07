@@ -1057,6 +1057,11 @@ fn the_composed_layers_equal_the_stepped_layers_bit_for_bit() {
         ..Spec::new(&layers, MoeKind::Resident)
     });
     assert_eq!(stepped.streams.len(), composed.streams.len());
+    assert!(
+        !stepped.states.is_empty(),
+        "the window {layers:?} has no DeltaNet layer: the state comparison would pass vacuously \
+         (use FIFI_FLASH_NEXT_STEP_LAYERS=0,1,2,3)"
+    );
     assert_eq!(stepped.states.len(), composed.states.len());
     for (index, (a, b)) in stepped.states.iter().zip(&composed.states).enumerate() {
         let equal = a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
@@ -1148,11 +1153,19 @@ fn a_failed_call_poisons_the_step_until_reset() {
     )
     .expect("a window across the PLE layer");
     let error = crossing
-        .run_layers(0, &mut moe)
-        .expect_err("a window across the PLE layer");
+        .run_layers((ple - 1)..(ple + 1), 0, &mut moe)
+        .expect_err("a range across the PLE layer");
     let text = format!("{error:?}");
     println!("PLE: {text}");
     assert!(text.contains(&format!("PLE layer {ple}")), "{text}");
+    assert!(!crossing.is_poisoned());
+    // A range outside the window refuses too, and does not poison.
+    let outside = crossing
+        .run_layers(ple..(ple + 5), 0, &mut moe)
+        .expect_err("a range outside the window");
+    let text = format!("{outside:?}");
+    println!("outside: {text}");
+    assert!(text.contains("not inside"), "{text}");
     assert!(!crossing.is_poisoned());
 }
 
