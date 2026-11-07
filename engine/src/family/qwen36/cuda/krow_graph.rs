@@ -15,6 +15,13 @@
 //! eager K-row body, which is the same kernels in the same order, so the bytes are the same and
 //! only the speed is lost.
 //!
+//! A failed launch. The graph is the whole body, so a failure of `graph.launch` is judged as a failure
+//! after the launch: [`ENTERED_BY_GRAPH`] makes the failure rule poison the state and fail the window
+//! closed, never take the step back. That rule is pinned by the constant (`krow_graph_tests`) and by a
+//! source pin on `replay_krow` (`krow_step_pin_tests`); the failure after the launch of either body is
+//! run on the device by the launch fault of the failure check. No fault is injected at the launch call
+//! itself, so a failing graph launch is not run on a device.
+//!
 //! Counters (test builds; the serving path keeps none): per length, the windows that ran the
 //! eager body, the captures, the windows that ran the graph (`replays`; the window that captured
 //! launches its graph once and counts there), and the node count of the graph. The host counts the

@@ -25,7 +25,7 @@
 //! | K | the K-row window against the eager device window: rows, every armed slot, committed state, next step | `d1_k_krow_against_eager` |
 //! | H | which path ran, from counters that observe the enqueue (printed as `D1_KROW_LAUNCHES`) | the end of every check |
 //! | B | the residual after every mixer and MoE block, K-row window against the one-row steps | `d1_b_per_layer_taps` |
-//! | G2 | per window length: the eager, the capturing and the replaying K-row window equal the one-row steps and each other | `d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows` |
+//! | graph lengths | per window length: the eager, the capturing and the replaying K-row window equal the one-row steps and each other, also when the replay starts at another position with other ids | `d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows` |
 //! | all | A, C, D, E, F and G in one process, one pack load | `d1_all_checks` |
 //!
 //! The K-row window has further tests beside them: the row-local status bits over 100 windows, the
@@ -35,8 +35,8 @@
 //! same word only in a window that launches a graph captured earlier, so it tests the replay).
 //! Check B reads the device inside the body and needs `FIFI_D1_CAPTURE=0`; the others run at either
 //! setting. With the K-row graphs on, the rig first runs three windows of every length (eager,
-//! capture, replay), so every check after it meets graph windows; the test named G2 starts without
-//! that warm-up and follows each length through the three modes.
+//! capture, replay), so every check after it meets graph windows; the graph-lengths test starts
+//! without that warm-up and follows each length through the three modes.
 //!
 //! State compared in D and F is the whole `ExportedState`: the recurrent state and the
 //! convolution state of every DeltaNet layer, the KV planes of every attention layer for the
@@ -1450,6 +1450,23 @@ fn d1_krow_an_out_of_vocabulary_id_is_refused_before_anything_is_enqueued() {
     );
 }
 
+/// Moves the state `shift` tokens on from `base` with one-row steps and returns the inputs of a
+/// window of `rows` rows from there: other positions (`pos`, `kv_len`) and other ids than the window
+/// at `base`, so a graph that baked either in at its capture cannot reproduce the one-row steps.
+fn moved_inputs(
+    rig: &mut Rig,
+    base: &ExportedState,
+    prefix: usize,
+    shift: usize,
+    rows: usize,
+) -> Vec<u32> {
+    rig.step.restore(base).expect("restore");
+    for &token in &rig.stream[prefix - 1..prefix - 1 + shift] {
+        rig.step.logits(token).expect("a one-row step");
+    }
+    window_inputs(&rig.stream, prefix + shift, rows)
+}
+
 /// The rig with the K-row graphs on and not warmed, prefilled to its first prefix.
 fn graph_rig() -> (Rig, DecodeSession, ExportedState) {
     super::krow_device_tests::refuse_switches().unwrap_or_else(|error| panic!("{error}"));
@@ -1517,6 +1534,39 @@ fn d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows() 
             graph_slots == eager_slots,
             "{rows} rows: a slot of the replay differs from the eager window"
         );
+        // The same graph at another position with other ids: check A against the one-row steps,
+        // then the replay against the eager window of those inputs, rows and slots. A graph that
+        // had baked in `pos`, `kv_len` or the ids of the capture could not pass this.
+        let moved = moved_inputs(&mut rig, &base, prefix, rows + 1, rows);
+        assert_ne!(moved, inputs, "{rows} rows: the moved window has other ids");
+        assert_eq!(rig.step.krow_next_mode(rows).expect("mode"), "replay");
+        report(
+            "A",
+            &format!("prefix={prefix} rows={rows} replay at another position"),
+            full_logits(&mut rig.step, &moved),
+        );
+        let after_shift = rig.step.snapshot().expect("snapshot");
+        rig.step.use_krow_graphs(false);
+        rig.step.run_window(&moved).expect("the eager window");
+        let eager_rows = rig.step.window_logits_rows().expect("rows");
+        let eager_slots = rig.step.rollback_slot_words().expect("slots");
+        rig.step.restore(&after_shift).expect("restore");
+        rig.step.use_krow_graphs(true);
+        rig.step.run_window(&moved).expect("the replayed window");
+        let graph_rows = rig.step.window_logits_rows().expect("rows");
+        let graph_slots = rig.step.rollback_slot_words().expect("slots");
+        for (row, (graph, eager)) in graph_rows.iter().zip(&eager_rows).enumerate() {
+            assert_eq!(
+                first_bit_difference(graph, eager),
+                None,
+                "{rows} rows: row {row} of the replay at another position differs from the eager window"
+            );
+        }
+        assert!(
+            graph_slots == eager_slots,
+            "{rows} rows: a slot of the replay at another position differs from the eager window"
+        );
+        rig.step.restore(&base).expect("restore");
         let stats = rig.step.krow_graph_stats();
         println!(
             "D1_KROW_GRAPH rows={rows} nodes={} capture_vram_bytes={} eager={} captures={} replays={}",
@@ -1526,12 +1576,13 @@ fn d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows() 
             stats.captures[rows],
             stats.replays[rows]
         );
-        // One eager window of the warm rule plus the eager reference; one capture; the capturing
-        // window and two replays launch the graph (the third full_logits window and the compared one).
-        assert_eq!(stats.eager[rows], 2, "{rows} rows: eager windows");
+        // Eager: the warm-rule window and the two eager references (at the capture position and at
+        // the moved one). One capture. Launches: the capturing window, the replay window of check
+        // A, the compared replay, and the same two at the moved position.
+        assert_eq!(stats.eager[rows], 3, "{rows} rows: eager windows");
         assert_eq!(stats.captures[rows], 1, "{rows} rows: captures");
         assert_eq!(
-            stats.replays[rows], 3,
+            stats.replays[rows], 5,
             "{rows} rows: windows that launched the graph"
         );
         assert!(
@@ -1546,7 +1597,7 @@ fn d1_krow_graph_each_length_is_equal_in_its_eager_capture_and_replay_windows() 
     }
     assert!(!rig.step.krow_graph_refused());
     assert_path_counters(&rig.step, rig.verify, "graph lengths");
-    println!("D1_RESULT test=G2 krow_graph_lengths 2..={QWEN36_MAX_WINDOW_ROWS} PASS");
+    println!("D1_RESULT test=graph-lengths krow_graph_lengths 2..={QWEN36_MAX_WINDOW_ROWS} PASS");
 }
 
 /// The deliberate-break control of the replay: run with `FIFI_KROW_BREAK=ids-replay`, which changes
@@ -1562,7 +1613,7 @@ fn d1_krow_a_deliberately_broken_replay_is_caught_by_check_a() {
         Ok("ids-replay"),
         "set FIFI_KROW_BREAK=ids-replay for this control"
     );
-    let (mut rig, _session, _base) = graph_rig();
+    let (mut rig, _session, base) = graph_rig();
     let prefix = rig.prefixes[0];
     let inputs = window_inputs(&rig.stream, prefix, 4);
     for expected in ["eager", "capture"] {
@@ -1574,7 +1625,9 @@ fn d1_krow_a_deliberately_broken_replay_is_caught_by_check_a() {
         );
     }
     assert_eq!(rig.step.krow_next_mode(4).expect("mode"), "replay");
-    let failure = full_logits(&mut rig.step, &inputs)
+    // The replay starts at another position with other ids than the capture did.
+    let moved = moved_inputs(&mut rig, &base, prefix, 5, 4);
+    let failure = full_logits(&mut rig.step, &moved)
         .expect_err("a replay with a changed token must differ from the one-row steps");
     println!("D1_RESULT test=K-break-replay caught: {failure}");
     assert!(failure.violation, "{failure}");

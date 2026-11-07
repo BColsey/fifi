@@ -193,8 +193,11 @@ impl<'a> QwenResidentStep<'a> {
         }
         let layout = KrowIoLayout::new(&res.geometry, rows)?;
         let io = self.context.allocate(layout.total)?;
-        // The pins of a K-row graph: the weights and the one-row arena of the step's own pins, and
-        // the K-row arena. The small buffer, the state and the slots are covered by drop order.
+        // The pins of a K-row graph: the step's own pins (the weights and the one-row arena) and the
+        // K-row arena. The K-row body does not touch the one-row arena; it is carried along because
+        // the slice is the step's own and a pin is a lifetime borrow, not a check against the body
+        // (`CapturePlan::pins`), so one more buffer in the list costs nothing. The small buffer, the
+        // state and the slots are covered by drop order.
         let mut pinned: Vec<&'a DeviceBuffer> = self.pins.to_vec();
         pinned.push(krow.arena.buffer());
         self.krow_pins = Box::leak(pinned.into_boxed_slice());

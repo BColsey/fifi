@@ -232,7 +232,7 @@ fn the_k_row_graphs_are_declared_before_the_buffers_they_bake_in() {
             .unwrap_or_else(|| panic!("the field {name:?} is not declared in the step struct"))
     };
     let graphs = declared("krow_graphs");
-    for later in ["krow", "state", "rollback"] {
+    for later in ["krow", "state", "rollback", "context", "stream"] {
         assert!(
             graphs < declared(later),
             "krow_graphs must be declared before {later}: it drops first"

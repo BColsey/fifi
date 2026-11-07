@@ -14,7 +14,8 @@
 //!   a logits row read back each, the greedy draws, and no rollback;
 //! * `window_reject_first`: the same window with only row 0 kept: after the rows, the import of
 //!   the saved state and one replayed row;
-//! * `window_keep_middle`: the same with `r / 2` rows kept (windows of 3 rows or more);
+//! * `window_keep_middle`: the same with `r / 2` rows kept (windows of 4 rows or more: with 3 rows
+//!   `r / 2` is 1, the reject-first verdict);
 //! * the same three verdicts on the device rollback (`device_*`, the eager rows and the slot copies);
 //! * with `FIFI_MRV_KROW=1` (device rollback, the K-row path armed), the same three verdicts for the
 //!   K-row window as the eager K-row body (`krow_eager_*`) and as the K-row graph (`krow_graph_*`,
@@ -141,7 +142,11 @@ use crate::{
 const GIB: u64 = 1 << 30;
 /// Free VRAM that must remain after the build and the arena, for the exports and the graph.
 const MIN_FREE_AFTER_BUILD: u64 = GIB;
-/// Positions past the deepest depth that the cache holds, for the rounds of the last cell.
+/// Positions past the deepest depth that the cache holds. Every cell starts at its depth and every
+/// round returns to the position the cell started its rounds at (`run_cell`), so a cell reaches at
+/// most its depth, the rows of its prepare windows, one round of every arm and one more window of
+/// look-ahead: under 100 rows for 8 rows and four window paths. The slack is far above that, and
+/// `a_cell_stays_inside_the_cache_and_the_text` pins the arithmetic with the real arms.
 const CONTEXT_SLACK: usize = 1_536;
 /// The depth the token ids of the identity run to, whatever the depths of the run.
 const IDENTITY_DEPTH: usize = 32_768;
@@ -738,7 +743,7 @@ enum Keep {
     All,
     /// Row 0 only.
     First,
-    /// `rows / 2` rows (windows of 3 rows or more).
+    /// `rows / 2` rows (windows of 4 rows or more; with 3 rows it equals the first-row verdict).
     Middle,
 }
 
@@ -807,6 +812,9 @@ fn split_json(warm: &[WindowRun]) -> Value {
         "run_window_wall_ms": summary(&col(&|w| w.run_ms)),
         "draw_wall_ms": summary(&col(&|w| w.draw_ms)),
         "commit_wall_ms": summary(&col(&|w| w.commit_ms)),
+        // The total without the host draws: the greedy draws read the copied logits on the host,
+        // work that a device-side comparison removes, so the K-row figure is also given without it.
+        "total_without_draws_wall_ms": summary(&col(&|w| w.total_ms - w.draw_ms)),
         "path_counters_of_the_timed_windows": {
             "windows": warm.len(),
             "krow_windows": sum(&|c| c.windows),
@@ -966,7 +974,7 @@ fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
     }
     for path in paths {
         for verdict in [Keep::All, Keep::First, Keep::Middle] {
-            if verdict == Keep::Middle && rows < 3 {
+            if verdict == Keep::Middle && rows < 4 {
                 continue;
             }
             arms.push(Arm::Window(path, verdict));
@@ -975,11 +983,19 @@ fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
     arms
 }
 
-/// Rotates the arm order each round so that no arm always runs first.
+/// The arm order of a round: the list rotated by one step every second round and walked backwards
+/// on odd rounds, so no arm always runs first and no arm always follows the same arm (a plain
+/// rotation keeps every neighbour fixed, so whatever one arm leaves behind would always land on
+/// the same next arm).
 fn arm_order(arms: &[Arm], round: usize) -> Vec<Arm> {
-    (0..arms.len())
-        .map(|i| arms[(round + i) % arms.len()])
-        .collect()
+    let turn = round / 2;
+    let mut order: Vec<Arm> = (0..arms.len())
+        .map(|i| arms[(turn + i) % arms.len()])
+        .collect();
+    if round % 2 == 1 {
+        order.reverse();
+    }
+    order
 }
 
 struct Cell<'a> {
@@ -1133,9 +1149,10 @@ fn run_cell(
     if !d1_pass {
         return Ok(json!({"depth_start": depth_start, "rows": rows, "d1": d1, "timed": false}));
     }
-    let exported = step.export_state()?;
-    let shape = state_shape(step, &exported)?;
-    drop(exported);
+    // The cell's start: every round returns to it, so each round measures at the same depth and the
+    // cache and the text never run out (see `CONTEXT_SLACK`).
+    let base = step.export_state()?;
+    let shape = state_shape(step, &base)?;
     let mut rounds = Rounds::default();
     let mut completed = 0;
     let arms = arms_of(cell.config, rows);
@@ -1176,6 +1193,7 @@ fn run_cell(
             step.import_state(&state)?;
             rounds.import_standalone.push(ms(began));
         }
+        step.restore(&base)?;
         completed += 1;
     }
     // The execution-path half of the receipt: the selected kernel launched and nothing routed fell
@@ -1395,8 +1413,8 @@ fn verify_window_cost_record() {
     let kv = kv_mode_from_env();
     let capture = capture_from_env();
     let deepest = *config.depths.last().expect("a depth");
-    // The text must outlast the deepest prefill and the drift of every cell: at most 17 rows per
-    // round per cell, far under the slack.
+    // The text must outlast the deepest prefill and the rows a cell reaches past its depth (under
+    // 100, see `CONTEXT_SLACK`).
     // The ids hashed into the identity are the same whatever depths a run takes (a run of the
     // shallow cells and a run of the deep cells carry one `ids_sha256`): the text is hashed to the
     // deepest depth the plans use.
@@ -1467,6 +1485,9 @@ fn verify_window_cost_record() {
             config.lease_gib,
             &format!("after prefill to {depth}"),
         ));
+        // The state at the depth: every cell of the depth starts from it, so each cell is measured
+        // at its stated depth and the cells do not push each other past the cache.
+        let depth_base = step.export_state().expect("the state at the depth");
         if cold.is_null() {
             cold = cold_record(&cell, &mut step, prefill_s);
         }
@@ -1475,6 +1496,7 @@ fn verify_window_cost_record() {
                 stopped_early = true;
                 break 'depths;
             }
+            step.restore(&depth_base).expect("back to the depth");
             let value = run_cell(&cell, &mut step, rows).expect("cell");
             if value["timed"] == json!(false) {
                 failed = Some(format!(
@@ -1606,10 +1628,13 @@ fn a_cell_times_the_host_device_and_k_row_windows_with_every_verdict() {
             assert!(arms.contains(&Arm::Window(path, keep)));
         }
     }
-    // A 2-row window has no middle verdict.
-    let two = arms_of(&config, 2);
-    assert_eq!(two.len(), 1 + 4 * 2);
-    assert!(!two.contains(&Arm::Window(WindowPath::KrowGraph, Keep::Middle)));
+    // Windows of 2 and 3 rows have no middle verdict: with 3 rows it keeps one row, the first-row
+    // verdict.
+    for rows in [2, 3] {
+        let short = arms_of(&config, rows);
+        assert_eq!(short.len(), 1 + 4 * 2);
+        assert!(!short.contains(&Arm::Window(WindowPath::KrowGraph, Keep::Middle)));
+    }
 }
 
 #[test]
@@ -1629,18 +1654,102 @@ fn the_graph_arm_exists_only_when_graphs_may_be_captured_and_the_single_arm_stan
 }
 
 #[test]
-fn every_round_runs_every_arm_once_and_no_arm_always_first() {
+fn every_round_runs_every_arm_once_and_no_arm_keeps_its_neighbour() {
     let arms = arms_of(&test_config(BenchRollback::Both, true, true), 4);
-    for round in 0..arms.len() {
+    let rounds = 12;
+    let mut firsts = std::collections::HashSet::new();
+    let mut followers: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for round in 0..rounds {
         let order = arm_order(&arms, round);
         assert_eq!(order.len(), arms.len());
         for arm in &arms {
             assert_eq!(order.iter().filter(|other| *other == arm).count(), 1);
         }
-        assert_eq!(
-            order[0], arms[round],
-            "round {round} starts with arm {round}"
+        firsts.insert(format!("{:?}", order[0]));
+        for pair in order.windows(2) {
+            followers
+                .entry(format!("{:?}", pair[0]))
+                .or_default()
+                .insert(format!("{:?}", pair[1]));
+        }
+    }
+    assert!(firsts.len() >= 4, "the first arm changes: {firsts:?}");
+    // No arm always follows the same arm: a cyclic shift would leave every arm exactly one
+    // follower (the carry-over of one arm would always land on the same next arm).
+    for (arm, after) in followers {
+        if arm != format!("{:?}", arms[arms.len() - 1]) {
+            assert!(after.len() >= 2, "{arm} always precedes {after:?}");
+        }
+    }
+}
+
+/// The rows a round advances the committed length by, summed over the arms of a cell: the single-row
+/// arm runs `rows` steps, a window commits the rows it keeps.
+fn rows_per_round(arms: &[Arm], rows: usize) -> usize {
+    arms.iter()
+        .map(|arm| match arm {
+            Arm::Single => rows,
+            Arm::Window(_, keep) => keep.kept(rows),
+        })
+        .sum()
+}
+
+/// The furthest position a cell reaches under the policy of the run (every round returns to the
+/// start of the cell): it starts at its depth plus the rows of its prepare windows (three windows of
+/// `rows` rows at most), one round advances `rows_per_round`, and the last window of the round
+/// needs `rows` more positions of look-ahead.
+fn cell_extent(depth: usize, arms: &[Arm], rows: usize) -> usize {
+    depth + 3 * rows + rows_per_round(arms, rows) + rows
+}
+
+/// The old defect, computed with the real arms: cells run back to back, every round continuing from
+/// the last, the position of the next cell being the end of the previous one. At 8K the 8-row cell
+/// then starts about 100 positions before the end of the cache and runs out of it within two rounds.
+#[test]
+fn without_the_return_to_the_start_the_cells_of_a_depth_overrun_the_cache() {
+    let config = test_config(BenchRollback::Both, true, true);
+    for depth in [8_192_usize, 32_768] {
+        let capacity = depth + CONTEXT_SLACK;
+        let mut at = depth;
+        let mut over = false;
+        for rows in [2_usize, 3, 4, 6, 8] {
+            let arms = arms_of(&config, rows);
+            at += 3 * rows + config.rounds * rows_per_round(&arms, rows);
+            over |= at + rows > capacity;
+        }
+        assert!(
+            over,
+            "depth {depth}: the continuing cells end at {at}, capacity {capacity}"
         );
+    }
+}
+
+/// The policy of the run: every cell starts at its depth and every round returns to the start of
+/// the cell. Each cell then stays inside the cache and inside the text the identity run hashes.
+#[test]
+fn a_cell_stays_inside_the_cache_and_the_text() {
+    let config = test_config(BenchRollback::Both, true, true);
+    let text = IDENTITY_DEPTH.max(32_768) + CONTEXT_SLACK;
+    for depth in [8_192_usize, 32_768] {
+        let capacity = depth + CONTEXT_SLACK;
+        for rows in [2_usize, 3, 4, 6, 8] {
+            let arms = arms_of(&config, rows);
+            let extent = cell_extent(depth, &arms, rows);
+            assert!(
+                extent <= capacity,
+                "depth {depth}, {rows} rows: {extent} against {capacity}"
+            );
+            assert!(
+                extent <= text,
+                "depth {depth}, {rows} rows: {extent} against {text} ids"
+            );
+            assert!(
+                extent - depth < 100,
+                "depth {depth}, {rows} rows: reaches {} past its depth",
+                extent - depth
+            );
+        }
     }
 }
 
