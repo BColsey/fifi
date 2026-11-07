@@ -230,7 +230,7 @@ fn run_strided(rig: &Rig, x: &[f32], w: &[f32], m: usize, (ld, off): (usize, usi
             },
         )
         .expect("router_logits_rows_strided");
-    rig.read(&out, total)
+    rig.read(&out, total * 4)
         .as_chunks::<4>()
         .0
         .iter()

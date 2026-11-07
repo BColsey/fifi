@@ -12,8 +12,10 @@
 //! Both runs start from byte-identical inputs and caches (history in the cells below `p`, a
 //! sentinel byte above) and must end with byte-identical `q`, byte-identical cache planes (fp16
 //! planes, or the f32 K/V rows plus the code and scale planes of the KV8 path), byte-identical
-//! `part` scratch and byte-identical `out`. The whole buffers are compared, so a cell above the
-//! window that a launch touched, or a partial a launch did not write, shows as a difference.
+//! `out`. The whole buffers are compared, so a cell above the window that a launch touched shows as
+//! a difference. The `part` scratch is not compared: the kernel lays it out as all `(max, sum)`
+//! pairs of the launch followed by all accumulators, so its byte layout depends on `m` by design
+//! (found on the first device run: row 0 differs at the start of the accumulator block).
 //!
 //! Two mutants must die here:
 //!
@@ -294,8 +296,8 @@ fn single_step(w: Window, t: usize) -> Step {
     }
 }
 
-/// The buffers both paths share. `part` holds `K` row slices of `part_row` bytes: row `t` of the
-/// `m = K` call and the single-row call of step `t` write the same slice.
+/// The buffers both paths share. `part` holds `K` row slices of `part_row` bytes, scratch for the
+/// launches (its layout depends on `m`, so it is not compared).
 struct Common {
     proj: DeviceBuffer,
     q_norm: DeviceBuffer,
@@ -483,7 +485,6 @@ impl<'r> Fp16Run<'r> {
                 ("q", &c.q),
                 ("k_cache", &self.k_cache),
                 ("v_cache", &self.v_cache),
-                ("part", &c.part),
                 ("out", &c.out),
             ],
             &c.params,
@@ -694,7 +695,6 @@ impl<'r> Kv8Run<'r> {
                 ("k_scales", &self.k_scales),
                 ("v_codes", &self.v_codes),
                 ("v_scales", &self.v_scales),
-                ("part", &c.part),
                 ("out", &c.out),
             ],
             &c.params,
