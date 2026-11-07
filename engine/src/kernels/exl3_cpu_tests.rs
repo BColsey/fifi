@@ -664,3 +664,60 @@ fn real_flint_expert_latency() {
         }
     }
 }
+
+/// Random weights in the shape of a Flint 4.0 expert (2048 x 512, three projections) at every
+/// stored rate, six experts per layer drawn from a pool of 30 so the weights leave the caches.
+/// Times the SIMD tiers only; the scalar tier needs about 20 ms per expert.
+///
+/// Run: `cargo test --release --lib flint_shape_rate_latency -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing run"]
+fn flint_shape_rate_latency() {
+    let (h, f) = (2048, 512);
+    let mut rng = Rng(0x1357_9bdf_2468_ace0);
+    let x: Vec<f32> = (0..h).map(|_| rng.unit()).collect();
+    for words in ALL_WORDS {
+        let parts: Vec<_> = (0..5)
+            .map(|_| {
+                let owned = random_experts(&mut rng, (h, f), words);
+                // Six experts per layer: two sets of three.
+                let second = random_experts(&mut rng, (h, f), words);
+                (owned, second)
+            })
+            .collect();
+        let layers: Vec<Vec<ExpertPick<'_>>> = parts
+            .iter()
+            .map(|(a, b)| {
+                expert_views(a, (h, f), words)
+                    .into_iter()
+                    .chain(expert_views(b, (h, f), words))
+                    .map(|expert| ExpertPick {
+                        expert,
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        for tier in pool_isa().into_iter().filter(|t| *t != Exl3Isa::Scalar) {
+            for threads in [1usize, 6] {
+                let cpu = ExpertCpu::new(threads, WaitPolicy::Spin, Some(tier)).unwrap();
+                let mut out = vec![0.0f32; h];
+                let mut samples = Vec::new();
+                for round in 0..140 {
+                    let start = Instant::now();
+                    cpu.forward(&x, &layers[round % layers.len()], &mut out)
+                        .unwrap();
+                    if round >= 20 {
+                        samples.push(start.elapsed());
+                    }
+                }
+                let t = median(samples);
+                println!(
+                    "{tier:?} words={words:3} threads={threads:2}: median {:8.1} us/layer, {:7.1} us/expert",
+                    t.as_secs_f64() * 1e6,
+                    t.as_secs_f64() * 1e6 / 6.0
+                );
+            }
+        }
+    }
+}
