@@ -34,12 +34,27 @@ use crate::kernels::cuda::native::resident::tiered_classify::{
 };
 
 const MAX_EXPERT: usize = 4096;
-const MAX_TOP_K: usize = 8;
+/// Picks one launch may classify. Flash-Next selects 10; Qwen3.6 selects 8.
+pub(crate) const MAX_TOP_K: usize = 12;
+/// Picks whose entries sit in the first half of the request line, where they always sat. A launch of
+/// more picks also fills the tail entries (see [`request_pick_at`]); a launch of at most this many leaves the tail alone.
+pub(crate) const BASE_PICKS: usize = 8;
 const MAX_HIDDEN: usize = 65536;
 const MAX_LAYER: usize = 1023;
 /// Bytes of the control block: u64 `[0]` miss count, `[1]` expected sequence, `[2]` sequence counter.
 pub(crate) const CTRL_BYTES: usize = 64;
 pub(crate) const REQUEST_BYTES: usize = 128;
+/// Byte offsets inside the request line of pick `index` (`0..MAX_TOP_K`): its expert id and its router weight.
+/// Picks 0 to 7 are `ids[8]` at byte 16 and `weights[8]` at byte 48; picks 8 to 11 are `ids[4]` at byte 80 and
+/// `weights[4]` at byte 96. `native/resident/tiered_classify.h` is the other copy of this table.
+pub(crate) const fn request_pick_at(index: usize) -> (usize, usize) {
+    if index < BASE_PICKS {
+        (16 + 4 * index, 48 + 4 * index)
+    } else {
+        (80 + 4 * (index - BASE_PICKS), 96 + 4 * (index - BASE_PICKS))
+    }
+}
+
 /// Bytes of one logged pick: an i32 id and the f32 bits of its weight.
 pub(crate) const LOG_BYTES_PER_PICK: usize = 8;
 

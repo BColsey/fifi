@@ -29,7 +29,7 @@ use std::mem::offset_of;
 use super::{DeviceFailure, RawRange, RawStream, STAGE_NONE, Span, checked, invalid_argument};
 
 const MAX_EXPERT: usize = 4096;
-const MAX_TOP_K: usize = 8;
+const MAX_TOP_K: usize = 12;
 const MAX_HIDDEN: usize = 65536;
 const MAX_LAYER: usize = 1023;
 const LOG_BYTES_PER_PICK: usize = 8;

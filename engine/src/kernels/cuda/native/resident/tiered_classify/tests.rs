@@ -118,7 +118,7 @@ fn the_native_classify_entry_refuses_bad_arguments_before_any_device_call() {
         ("slots 0", |n| n.slots = 0),
         ("slots past n_expert", |n| n.slots = 257),
         ("top_k 0", |n| n.top_k = 0),
-        ("top_k 9", |n| n.top_k = 9),
+        ("top_k 13", |n| n.top_k = 13),
         ("hidden 0", |n| n.hidden = 0),
         ("hidden 6", |n| n.hidden = 6),
         ("hidden 65540", |n| n.hidden = 65540),
@@ -239,9 +239,9 @@ fn check_classify_refuses_limits_short_ranges_misalignment_and_overlap() {
             },
         ),
         (
-            "top_k 9",
+            "top_k 13",
             ClassifyRaw {
-                top_k: 9,
+                top_k: 13,
                 ..raw_base(&d)
             },
         ),

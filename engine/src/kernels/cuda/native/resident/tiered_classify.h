@@ -30,11 +30,13 @@
  *   ctrl         64 bytes, 8-byte aligned: u64 [0] miss count, [1] expected sequence, [2] sequence counter
  *   word         i32, 4-byte aligned: the tiered word
  *   mbox_req     128 bytes, 8-byte aligned: u64 [0] seq (written last, release), u64 [1] layer | count << 32,
- *                i32 ids[8] at byte 16, f32 weights[8] at byte 48
+ *                i32 ids[8] at byte 16, f32 weights[8] at byte 48; a launch with top_k > 8 also writes i32 ids[4] at
+ *                byte 80 and f32 weights[4] at byte 96 (picks 8 to 11, unused entries -1 and 0.0f), a launch with
+ *                top_k <= 8 leaves bytes 80 to 111 alone
  *   mbox_row     f32 [hidden], 16-byte aligned (mapped page-locked memory in production)
  * Every written range (slot_ids_out, weights_out, log_out, ctrl, word, mbox_req, mbox_row) is disjoint from every
  * other range; the four inputs may alias each other.
- * n_expert in [1, 4096], slots in [1, n_expert], top_k in [1, 8], hidden a multiple of 4 in [4, 65536], layer in
+ * n_expert in [1, 4096], slots in [1, n_expert], top_k in [1, 12], hidden a multiple of 4 in [4, 65536], layer in
  * [0, 1023]. stream must not be NULL. A rejected argument returns INFERENCE_CUDA_INVALID_ARGUMENT before any CUDA
  * call; otherwise the launch status of the kernel (one launch).
  */

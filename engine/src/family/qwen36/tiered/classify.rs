@@ -75,7 +75,7 @@ impl Classified {
 /// listed and still published: `[1, 1]` with expert 1 missing lists `(1, w0)` AND sets
 /// [`ROUTE_INVALID`] for the repeat, because the token fails on the word later and the kernel does
 /// not look ahead. `Err` when the lists differ in length. The function does not bound the number of
-/// picks: the kernel takes `top_k <= 8` as a launch argument, so the device test passes at most 8.
+/// picks: the kernel takes `top_k <= 12` as a launch argument (8 for Qwen3.6, 10 for Flash-Next).
 pub fn classify_reference(
     slot_row: &[i32],
     slots: usize,
@@ -152,6 +152,28 @@ mod tests {
         assert_eq!(got.log, vec![(4, 0.4), (1, 0.3), (0, 0.2), (5, 0.1)]);
         assert_eq!(got.word, 0);
         assert_eq!(got.weights[1].to_bits(), 0.0f32.to_bits(), "+0.0, not -0.0");
+    }
+
+    /// Flash-Next: 512 experts, 10 picks. The reference does not bound the picks, so ten classify like eight.
+    #[test]
+    fn ten_picks_over_512_experts_classify_by_the_same_rule() {
+        let mut row = vec![-1i32; 512];
+        for (slot, expert) in [3usize, 100, 257, 511].into_iter().enumerate() {
+            row[expert] = slot as i32;
+        }
+        let ids = [511, 7, 3, 100, 8, 257, 9, 10, 11, 12];
+        let weights: Vec<f32> = (1..=10).map(|k| k as f32 / 100.0).collect();
+        let got = classify_reference(&row, 4, &ids, &weights).unwrap();
+        assert_eq!(got.slot_ids, vec![3, 0, 0, 1, 0, 2, 0, 0, 0, 0]);
+        let expected_weights = [0.01f32, 0.0, 0.03, 0.04, 0.0, 0.06, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(got.weights.len(), 10);
+        for (got, want) in got.weights.iter().zip(expected_weights) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+        let missed: Vec<i32> = got.misses.iter().map(|&(id, _)| id).collect();
+        assert_eq!(missed, vec![7, 8, 9, 10, 11, 12], "misses in pick order");
+        assert_eq!(got.log.len(), 10);
+        assert_eq!(got.word, 0);
     }
 
     #[test]

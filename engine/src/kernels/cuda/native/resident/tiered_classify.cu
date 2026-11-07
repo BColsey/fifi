@@ -2,7 +2,7 @@
  * The tiered classification of one layer. Semantics: see tiered_classify.h; the host oracle is
  * family/qwen36/tiered/classify.rs. Original CUDA C.
  *
- * One block, 256 threads. Thread 0 does the classification (top_k <= 8 picks, a handful of integer compares, in pick
+ * One block, 256 threads. Thread 0 does the classification (top_k <= 12 picks, a handful of integer compares, in pick
  * order, so the result cannot depend on scheduling) into registers and shared memory; the block then copies the normed
  * row into the mailbox when there is a miss. The mailbox memory is written by plain stores and made visible to the
  * host server by a system-scope fence per writing thread, a block barrier, and a RELEASE store of the sequence number
@@ -19,7 +19,11 @@
 namespace {
 
 constexpr int kThreads = 256;
-constexpr int kMaxTop = 8;
+constexpr int kMaxTop = 12;
+/* The first kBaseTop picks of the request line keep their original place (ids at byte 16, weights at byte 48); picks
+ * kBaseTop to kMaxTop - 1 use the tail of the line (ids at byte 80, weights at byte 96) and are written only by a launch
+ * with top_k > kBaseTop, so a launch with top_k <= 8 writes the same bytes as before the tail existed. */
+constexpr int kBaseTop = 8;
 constexpr int kMaxExpert = 4096;
 constexpr int kMaxHidden = 65536;
 constexpr int kMaxLayer = 1023;
@@ -95,9 +99,17 @@ __global__ void __launch_bounds__(kThreads) tiered_classify_k(const inference_cu
         int32_t *ids_line = reinterpret_cast<int32_t *>(a.mbox_req) + 4;   /* byte 16 */
         float *weights_line = reinterpret_cast<float *>(a.mbox_req) + 12;  /* byte 48 */
         a.mbox_req[1] = ((uint64_t)(uint32_t)count << 32) | (uint64_t)(uint32_t)a.layer;
-        for (int k = 0; k < kMaxTop; ++k) {
+        for (int k = 0; k < kBaseTop; ++k) {
             ids_line[k] = k < count ? s_miss_id[k] : -1;
             weights_line[k] = k < count ? s_miss_w[k] : 0.0f;
+        }
+        if (a.top_k > kBaseTop) {
+            int32_t *ids_tail = reinterpret_cast<int32_t *>(a.mbox_req) + 20;   /* byte 80 */
+            float *weights_tail = reinterpret_cast<float *>(a.mbox_req) + 24;   /* byte 96 */
+            for (int k = kBaseTop; k < kMaxTop; ++k) {
+                ids_tail[k - kBaseTop] = k < count ? s_miss_id[k] : -1;
+                weights_tail[k - kBaseTop] = k < count ? s_miss_w[k] : 0.0f;
+            }
         }
         __threadfence_system();
         const uint64_t seq = a.ctrl[2] + 1;

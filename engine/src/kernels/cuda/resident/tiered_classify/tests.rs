@@ -185,9 +185,10 @@ impl<'c> Rig<'c> {
             .collect();
         let request = rd(&self.mbox_req, REQUEST_BYTES)?;
         let count = (u64_at(&request, 1) >> 32) as usize;
-        let ids = i32s(&request[16..48]);
-        let weights = testkit::floats(&request[48..80]);
-        let misses = (0..count.min(8)).map(|k| (ids[k], weights[k])).collect();
+        let (ids, weights) = pick_lines(&request, top);
+        let misses = (0..count.min(ids.len()))
+            .map(|k| (ids[k], weights[k]))
+            .collect();
         let ctrl = rd(&self.ctrl, CTRL_BYTES)?;
         let classified = Classified {
             slot_ids: i32s(&rd(&self.slot_ids_out, top * 4)?),
@@ -321,6 +322,18 @@ fn random_layer(rng: &mut Rng, shape: &ClassifyShape, route: usize) -> Layer {
     }
 }
 
+/// The ids and weights of the request line's pick entries: the first eight, and for a launch of more than eight picks
+/// the four of the tail (bytes 80 and 96).
+fn pick_lines(request: &[u8], top_k: usize) -> (Vec<i32>, Vec<f32>) {
+    let mut ids = i32s(&request[16..48]);
+    let mut weights = testkit::floats(&request[48..80]);
+    if top_k > 8 {
+        ids.extend(i32s(&request[80..96]));
+        weights.extend(testkit::floats(&request[96..112]));
+    }
+    (ids, weights)
+}
+
 /// The seeded script of `routes` routes: every seventh route first sets a bit another kernel would have set.
 fn seeded_script(shape: &ClassifyShape, seed: u64, routes: usize) -> Vec<Planned> {
     let mut rng = Rng::new(seed);
@@ -360,6 +373,27 @@ fn tiered_classify_matches_the_reference_bit_for_bit() {
                 layer: 0,
             },
             0x7CA9_0102,
+        ),
+        // Flash-Next: 512 experts, 10 picks, the 2560-wide row.
+        (
+            ClassifyShape {
+                n_expert: 512,
+                slots: 184,
+                top_k: 10,
+                hidden: 2560,
+                layer: 0,
+            },
+            0x7CA9_0103,
+        ),
+        (
+            ClassifyShape {
+                n_expert: 64,
+                slots: 20,
+                top_k: 12,
+                hidden: 256,
+                layer: 0,
+            },
+            0x7CA9_0104,
         ),
     ];
     for (shape, seed) in shapes {
@@ -434,10 +468,16 @@ fn tiered_classify_matches_the_reference_bit_for_bit() {
                     .all(|(g, w)| g.0 == w.0 && g.1.to_bits() == w.1.to_bits()),
                 "{at}: miss list in pick order"
             );
-            let tail_ids = i32s(&got.request[16 + 4 * want.misses.len()..48]);
-            let tail_weights = bits(&testkit::floats(
-                &got.request[48 + 4 * want.misses.len()..80],
-            ));
+            let (all_ids, all_weights) = pick_lines(&got.request, shape.top_k);
+            let tail_ids = &all_ids[want.misses.len()..];
+            let tail_weights = bits(&all_weights[want.misses.len()..]);
+            if shape.top_k <= 8 {
+                // Qwen3.6 sizes: the tail of the line is not written, as before it existed.
+                assert!(
+                    got.request[80..112].iter().all(|&b| b == UNTOUCHED),
+                    "{at}: a launch of at most 8 picks leaves bytes 80 to 111 alone"
+                );
+            }
             assert!(
                 tail_ids.iter().all(|&id| id == -1),
                 "{at}: unused ids are -1"
@@ -768,7 +808,7 @@ fn check_shape_refuses_every_limit_and_names_the_values() {
         ("slots 0", ClassifyShape { slots: 0, ..good }),
         ("slots past n_expert", ClassifyShape { slots: 257, ..good }),
         ("top_k 0", ClassifyShape { top_k: 0, ..good }),
-        ("top_k 9", ClassifyShape { top_k: 9, ..good }),
+        ("top_k 13", ClassifyShape { top_k: 13, ..good }),
         ("hidden 0", ClassifyShape { hidden: 0, ..good }),
         ("hidden 6", ClassifyShape { hidden: 6, ..good }),
         (
@@ -807,6 +847,21 @@ fn check_shape_refuses_every_limit_and_names_the_values() {
         );
     }
     let edge_ok = [
+        // Flash-Next: 512 experts, 10 picks. The request line holds up to 12 picks.
+        ClassifyShape {
+            n_expert: 512,
+            slots: 184,
+            top_k: 10,
+            hidden: 2560,
+            layer: 47,
+        },
+        ClassifyShape {
+            n_expert: 512,
+            slots: 12,
+            top_k: 12,
+            hidden: 2560,
+            layer: 47,
+        },
         ClassifyShape {
             n_expert: 4096,
             slots: 4096,

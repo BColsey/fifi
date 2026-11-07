@@ -4,6 +4,7 @@
 //!
 //! ```text
 //!   0    request line, 128 B   seq u64 (the release word) | layer u32 | count u32 | ids i32[8] @16 | weights f32[8] @48
+//!                          | ids i32[4] @80 | weights f32[4] @96 (picks 8 to 11, written by a launch of more than 8 picks)
 //!   128  row, 4 * hidden B     the normed row (the device writes it before it releases `seq`)
 //!   ...  answer line, 128 B    done u64 (the release word, written by the host) | code u32 @8
 //!   ...  partial, 4 * hidden B the CPU experts' partial sum (the host writes it before it releases `done`)
@@ -50,7 +51,9 @@ use crate::EngError;
 use crate::kernels::cuda::guard::Lease;
 use crate::kernels::cuda::native::resident::RawRange;
 use crate::kernels::cuda::native::resident::mailbox::{self as raw, RawMapped};
-use crate::kernels::cuda::resident::tiered_classify::REQUEST_BYTES;
+use crate::kernels::cuda::resident::tiered_classify::{
+    BASE_PICKS, MAX_TOP_K, REQUEST_BYTES, request_pick_at,
+};
 
 /// Bytes of the answer line; every line starts on a 128-byte boundary.
 const ANSWER_BYTES: usize = 128;
@@ -58,9 +61,10 @@ const LINE: usize = 128;
 const MAX_HIDDEN: usize = 65536;
 /// Byte offsets inside the request line.
 const LAYER_AT: usize = 8;
-const IDS_AT: usize = 16;
-/// Words of the request header that follow `seq`: layer, count, 8 ids, 8 weights.
-const HEADER_WORDS: usize = 18;
+/// Words of the request header that follow `seq`: layer, count, 8 ids, 8 weights, 4 tail ids, 4 tail weights.
+const HEADER_WORDS: usize = 26;
+/// Picks held by the tail of the line.
+const TAIL_PICKS: usize = MAX_TOP_K - BASE_PICKS;
 /// Offset of `code` inside the answer line.
 const CODE_AT: usize = 8;
 
@@ -127,12 +131,35 @@ pub(crate) struct Request {
     pub(crate) seq: u64,
     /// The layer that asked.
     pub(crate) layer: u32,
-    /// Number of valid entries of `ids` and `weights`; a value above 8 is a device bug the server must refuse.
+    /// Number of valid entries of `ids` and `weights`, then `tail_ids` and `tail_weights`; a value above
+    /// [`MAX_TOP_K`] is a device bug the server must refuse.
     pub(crate) count: u32,
-    /// The expert ids of the misses in pick order, -1 after the first `count`.
+    /// The expert ids of the first eight misses in pick order, -1 after the first `count`.
     pub(crate) ids: [i32; 8],
-    /// The router weights of the misses in pick order, 0.0 after the first `count`.
+    /// The router weights of the first eight misses in pick order, 0.0 after the first `count`.
     pub(crate) weights: [f32; 8],
+    /// The ids of misses 8 to 11. Written only by a launch of more than 8 picks; otherwise stale, so read
+    /// them only when `count` is above 8.
+    pub(crate) tail_ids: [i32; TAIL_PICKS],
+    /// The router weights of misses 8 to 11, with the same rule as `tail_ids`.
+    pub(crate) tail_weights: [f32; TAIL_PICKS],
+}
+
+impl Request {
+    /// Miss `index` as `(expert id, router weight)`, `None` at or past `count`.
+    pub(crate) fn miss(&self, index: usize) -> Option<(i32, f32)> {
+        if index >= (self.count as usize).min(MAX_TOP_K) {
+            return None;
+        }
+        Some(if index < BASE_PICKS {
+            (self.ids[index], self.weights[index])
+        } else {
+            (
+                self.tail_ids[index - BASE_PICKS],
+                self.tail_weights[index - BASE_PICKS],
+            )
+        })
+    }
 }
 
 /// The server's handle on a mailbox: poll, read the row, answer. Holds no CUDA type.
@@ -245,8 +272,16 @@ impl MailboxPort {
             seq,
             layer: words[0],
             count: words[1],
-            ids: array::from_fn(|i| words[(IDS_AT - LAYER_AT) / 4 + i] as i32),
-            weights: array::from_fn(|i| f32::from_bits(words[10 + i])),
+            ids: array::from_fn(|i| words[(request_pick_at(i).0 - LAYER_AT) / 4] as i32),
+            weights: array::from_fn(|i| {
+                f32::from_bits(words[(request_pick_at(i).1 - LAYER_AT) / 4])
+            }),
+            tail_ids: array::from_fn(|i| {
+                words[(request_pick_at(BASE_PICKS + i).0 - LAYER_AT) / 4] as i32
+            }),
+            tail_weights: array::from_fn(|i| {
+                f32::from_bits(words[(request_pick_at(BASE_PICKS + i).1 - LAYER_AT) / 4])
+            }),
         })
     }
 

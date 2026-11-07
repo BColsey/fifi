@@ -98,6 +98,74 @@ fn the_layout_puts_every_line_on_a_boundary_and_refuses_bad_widths() {
     }
 }
 
+/// The request line's pick table: picks 0 to 7 sit where they always sat (Qwen3.6 reads them there), picks 8 to 11
+/// use the tail of the 128-byte line, and no two entries share a word.
+#[test]
+fn the_request_line_keeps_the_first_eight_picks_in_place_and_adds_four_in_the_tail() {
+    for index in 0..8 {
+        assert_eq!(request_pick_at(index), (16 + 4 * index, 48 + 4 * index));
+    }
+    assert_eq!(request_pick_at(8), (80, 96));
+    assert_eq!(request_pick_at(11), (92, 108));
+    let mut words: Vec<usize> = (0..MAX_TOP_K)
+        .flat_map(|index| {
+            let (id, weight) = request_pick_at(index);
+            [id, weight]
+        })
+        .collect();
+    words.sort_unstable();
+    words.dedup();
+    assert_eq!(words.len(), 2 * MAX_TOP_K, "no word is shared");
+    assert!(words.iter().all(|&at| (16..REQUEST_BYTES).contains(&at)));
+    assert_eq!(
+        HEADER_WORDS * 4 + LAYER_AT,
+        request_pick_at(MAX_TOP_K - 1).1 + 4,
+        "the polled header ends with the last weight"
+    );
+}
+
+#[test]
+fn the_port_polls_ten_misses_in_pick_order() {
+    let mut backing = vec![0u64; 600];
+    let port = host_port(&mut backing, 256);
+    let raw = &port.shared.raw;
+    assert!(raw.write_f32s(port.shared.layout.row_offset(), &pattern_vec(0, 1, 256)));
+    let mut header = vec![0u32; HEADER_WORDS];
+    header[0] = 5;
+    header[1] = 10;
+    for index in 0..10 {
+        let (id_at, weight_at) = request_pick_at(index);
+        header[(id_at - LAYER_AT) / 4] = 100 + index as u32;
+        header[(weight_at - LAYER_AT) / 4] = (0.5f32 + index as f32).to_bits();
+    }
+    assert!(raw.write_words(LAYER_AT, &header));
+    assert!(raw.store_release(0, 1));
+    let request = port.poll(0).expect("the request");
+    assert_eq!((request.layer, request.count), (5, 10));
+    for index in 0..10 {
+        assert_eq!(
+            request.miss(index),
+            Some((100 + index as i32, 0.5 + index as f32)),
+            "miss {index}"
+        );
+    }
+    assert_eq!(request.miss(10), None, "past count");
+}
+
+#[test]
+fn a_count_above_the_line_is_not_indexed() {
+    let mut backing = vec![0u64; 600];
+    let port = host_port(&mut backing, 256);
+    let raw = &port.shared.raw;
+    let mut header = vec![0u32; HEADER_WORDS];
+    header[1] = u32::MAX;
+    assert!(raw.write_words(LAYER_AT, &header));
+    assert!(raw.store_release(0, 1));
+    let request = port.poll(0).expect("the request");
+    assert!(request.miss(MAX_TOP_K - 1).is_some());
+    assert_eq!(request.miss(MAX_TOP_K), None, "the table ends at MAX_TOP_K");
+}
+
 #[test]
 fn the_port_polls_the_header_once_per_sequence_and_answers_with_the_partial_or_a_code() {
     let mut backing = vec![0u64; 600];
