@@ -1,51 +1,31 @@
 //! The card implementation of [`TokenDevice`]: the decode step (`step.rs`) with the split MoE block
 //! (`moe_block.rs`) over the expert bank.
 //!
-//! WHAT: [`CardDevice`] owns a [`FlashStep`] and a [`SplitMoe`] and maps the driver's calls onto the
+//! WHAT: [`CardDevice`] owns a [`FlashStep`] and a [`SplitMoeAt`] and maps the driver's calls onto the
 //! step's launches. The token start is written with synchronous copies on the step's stream (the
 //! step parameters in the words block, the stream in the step arena), so they are ordered before the
 //! first layer. The stream read-back at the PLE layer and the logits read-back wait for the queued
 //! work.
 //!
-//! The split block is the step's MoE seam: `impl MoeBlock for SplitMoe` delegates to the block's own
-//! `run`, which has the seam's signature.
+//! The split block is the step's MoE seam: `SplitMoeAt` (in `step.rs`) maps a model layer to the bank
+//! row and delegates to the block's own `run`.
 
 use std::ops::Range;
 
 use super::{
     driver::TokenDevice,
     feeds::StartSink,
-    step::{FlashStep, MoeBlock},
+    step::{FlashStep, SplitMoeAt},
     step_plan::Slot,
 };
 use crate::{
-    EngError,
-    family::{
-        flash_next::cuda::moe_block::SplitMoe,
-        qwen36::cuda::{
-            exl3_moe::Exl3MoeBufs,
-            moe::{Launch, MoeDims},
-        },
-        qwen36::exl3_tensors::f32_le_bytes,
-    },
-    kernels::cuda::resident::step_params::{StepParams, StepStatus},
+    EngError, family::qwen36::exl3_tensors::f32_le_bytes,
+    kernels::cuda::resident::step_params::StepParams,
 };
-
-impl MoeBlock for SplitMoe<'_> {
-    fn run(
-        &mut self,
-        launch: &Launch<'_>,
-        layer: usize,
-        bufs: &Exl3MoeBufs<'_>,
-        dims: &MoeDims,
-    ) -> Result<(), EngError> {
-        SplitMoe::run(self, launch, layer, bufs, dims)
-    }
-}
 
 pub(super) struct CardDevice {
     step: FlashStep<'static>,
-    moe: SplitMoe<'static>,
+    moe: SplitMoeAt<'static>,
     /// `branches * hidden`.
     stream_width: usize,
     /// The width of the head's output (the padded vocabulary).
@@ -53,7 +33,7 @@ pub(super) struct CardDevice {
 }
 
 impl CardDevice {
-    pub(super) fn new(step: FlashStep<'static>, moe: SplitMoe<'static>) -> Self {
+    pub(super) fn new(step: FlashStep<'static>, moe: SplitMoeAt<'static>) -> Self {
         let stream_width = step.geometry.branches * step.geometry.hidden;
         let logits_width = step.model.vocab;
         Self {
@@ -66,7 +46,7 @@ impl CardDevice {
 
     /// The bank's statistics line for the load log and the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
-        self.moe.bank().state().stats().misses
+        self.moe.inner.bank().state().stats().misses
     }
 }
 
@@ -98,10 +78,10 @@ impl TokenDevice for CardDevice {
     }
 
     fn layers(&mut self, range: Range<usize>, pos: usize) -> Result<(), EngError> {
-        for layer in range {
-            self.step.run_layer(layer, pos, &mut self.moe)?;
+        if range.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.step.run_layers(range, pos, &mut self.moe)
     }
 
     fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {
@@ -122,18 +102,10 @@ impl TokenDevice for CardDevice {
             .read_f32(self.step.slot(Slot::Logits)?, self.logits_width)
     }
 
+    /// Drains the token's work and refuses a nonzero status word or EXL3 flag (the step poisons
+    /// itself, and the driver poisons with it).
     fn check_health(&mut self) -> Result<(), EngError> {
-        let (status, flag) = self.step.health()?;
-        if let Some(error) = StepStatus(status).error() {
-            return Err(error);
-        }
-        if flag != 0 {
-            return Err(EngError::Backend {
-                operation: "exl3_linear",
-                message: "an EXL3 projection reported a non-finite value".to_string(),
-            });
-        }
-        Ok(())
+        self.step.finish_token()
     }
 
     fn reset(&mut self) -> Result<(), EngError> {

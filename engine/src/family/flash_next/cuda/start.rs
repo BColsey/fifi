@@ -42,7 +42,7 @@ use super::{
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
     ple_feed::{NgramRows, PleFeed, PleVectors},
-    step::FlashStep,
+    step::{FlashStep, SplitMoeAt},
 };
 use crate::{
     EngError,
@@ -399,13 +399,15 @@ pub(super) fn build_driver(
         wanted.context as usize,
         0..layers,
     )?;
-    let moe = SplitMoe::new(
+    let block = SplitMoe::new(
         ctx,
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
         &step.moe_dims(),
     )?;
+    let model_layers: Vec<usize> = (0..layers).collect();
+    let moe = SplitMoeAt::new(block, &model_layers)?;
     let device = CardDevice::new(step, moe);
 
     stage("opening the n-gram table");
