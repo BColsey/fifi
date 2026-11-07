@@ -231,7 +231,7 @@ fn packet(reply_id: &str, meta: &TraceMeta, buffer: &CaptureBuffer) -> Value {
                     .iter()
                     .map(|&(id, prob)| json!({ "token_id": id, "prob": prob }))
                     .collect::<Vec<_>>(),
-                // The alignment pair (P1-C): null until the replay reaches
+                // The alignment pair: null until the replay reaches
                 // this position, or forever when alignment stopped early.
                 "offset": recorded.offset,
                 "piece": recorded.piece,
@@ -255,7 +255,7 @@ fn packet(reply_id: &str, meta: &TraceMeta, buffer: &CaptureBuffer) -> Value {
         "capture_scope": "decode",
         "truncated": buffer.truncated,
         "captured_positions": buffer.positions.len(),
-        // Alignment (P1-C): offsets are bytes into the raw generated text
+        // Alignment: offsets are bytes into the raw generated text
         // (the concatenation of pieces); the GUI maps raw offsets into the
         // reply's fields by replaying the piece stream it receives.
         "raw_byte_len": buffer.raw_len,
@@ -591,7 +591,7 @@ mod tests {
                     0
                 );
             }
-            // Alignment (P1-C): every position carries its piece, the pieces
+            // Alignment: every position carries its piece, the pieces
             // concatenate to exactly the reply's content text, and the
             // offsets walk it byte by byte — the guarantee the GUI highlights
             // against.

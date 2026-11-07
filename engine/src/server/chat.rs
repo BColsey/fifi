@@ -286,7 +286,7 @@ pub(super) fn admit(
         // and register in the ring at submit, so in-progress captures count
         // against its budgets from the first token on. The aligner replays
         // the batches through the same tokenizer, attaching each position's
-        // piece and raw offset (P1-C).
+        // piece and raw offset.
         let params = sampler.params();
         let buffer = sampler.arm_capture(super::sampler_trace::PER_REQUEST_POSITION_LIMIT);
         state.register_trace(

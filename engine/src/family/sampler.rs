@@ -2913,7 +2913,7 @@ mod tests {
         );
     }
 
-    // ---- Capture observation (P1-A) --------------------------------------------
+    // ---- Capture observation --------------------------------------------
 
     /// The top `limit` kept token ids in ranked order, per the reference: descending
     /// probability, ties by token id.
@@ -3082,7 +3082,7 @@ mod tests {
         }
     }
 
-    // ---- Armed capture (P1-B) ---------------------------------------------------
+    // ---- Armed capture ---------------------------------------------------
 
     #[test]
     fn armed_capture_preserves_the_token_stream_and_generator_state() {
