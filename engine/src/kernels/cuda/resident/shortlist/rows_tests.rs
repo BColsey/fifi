@@ -71,6 +71,33 @@ impl Rig {
     }
 }
 
+/// The number the header gives `INFERENCE_CUDA_SHORTLIST_<name>`.
+fn header_value(name: &str) -> usize {
+    const HEADER: &str = include_str!("../../native/resident/shortlist.h");
+    let key = format!("INFERENCE_CUDA_SHORTLIST_{name} =");
+    let line = HEADER
+        .lines()
+        .find(|line| line.trim_start().starts_with(&key))
+        .unwrap_or_else(|| panic!("{key} is not in the header"));
+    line.split('=')
+        .nth(1)
+        .and_then(|value| value.trim().trim_end_matches(',').parse().ok())
+        .unwrap_or_else(|| panic!("no number in `{line}`"))
+}
+
+/// The sizes the Rust side mirrors from the header (and the K-row limit the kernel and the Rust
+/// refusal both use) are the header's numbers. A host test: it needs no device.
+#[test]
+fn the_rust_constants_are_those_of_the_header() {
+    use crate::kernels::cuda::native::resident::shortlist as raw;
+    assert_eq!(header_value("K"), K);
+    assert_eq!(header_value("PART_BYTES"), RESULT_BYTES);
+    assert_eq!(header_value("RESULT_OFFSET"), RESULT_OFFSET);
+    assert_eq!(header_value("SCRATCH_BYTES"), SCRATCH_BYTES);
+    assert_eq!(header_value("MAX_ROWS"), raw::MAX_ROWS);
+    assert_eq!(header_value("TILES") * RESULT_BYTES, PARTS_BYTES);
+}
+
 fn random_row(rng: &mut Rng, n: usize) -> Vec<f32> {
     (0..n).map(|_| (rng.normal() * 3.0) as f32).collect()
 }
