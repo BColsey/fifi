@@ -599,7 +599,7 @@ fn step_compiled(
     };
     let q = ctx.kernels.rope_scaled(&pre.q, &rope)?;
     let k_new = ctx.kernels.rope_scaled(&pre.k, &rope)?;
-    let (o, cache) = step_tail(ctx, shape, w, cache, pos, &q, &k_new, &pre.v, &pre.gate)?;
+    let (o, cache) = step_tail(ctx, shape, cache, pos, &q, &k_new, &pre.v, &pre.gate)?;
     let out = linear(ctx, &w.o, &o)?;
     Ok(AttnStep { out, cache })
 }
@@ -657,7 +657,7 @@ pub(super) fn step_projected(
     let k_new = ctx.kernels.rope_scaled(&k_new, &rope)?;
     // 4. New value.
     let v_new = ctx.kernels.reshape(vp, &[1, kv_heads, 1, width])?;
-    step_tail(ctx, shape, w, cache, pos, &q, &k_new, &v_new, &gate)
+    step_tail(ctx, shape, cache, pos, &q, &k_new, &v_new, &gate)
 }
 
 /// The shared tail after the RoPE: the cache-form casts, the cache append, the prefix/decode
@@ -668,7 +668,6 @@ pub(super) fn step_projected(
 fn step_tail(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
-    w: &RAttn,
     cache: KvCache,
     pos: u32,
     q: &ExecutionTensor,
