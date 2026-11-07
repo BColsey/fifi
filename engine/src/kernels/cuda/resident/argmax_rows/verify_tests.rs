@@ -17,10 +17,11 @@ struct Rig {
 }
 
 /// The accepted run and the bonus of a window, from the plain statement of the rule: the leading
-/// rows `i < m - 1` whose token equals the next window id, and the token of the row after them.
+/// rows `i < m - 1` whose token (at least 0: a row without a token never extends the run) equals the
+/// next window id, and the token of the row after them.
 fn reference(tokens: &[i32], ids: &[i32]) -> (i32, i32) {
     let mut run = 0;
-    while run + 1 < tokens.len() && tokens[run] == ids[run + 1] {
+    while run + 1 < tokens.len() && tokens[run] >= 0 && tokens[run] == ids[run + 1] {
         run += 1;
     }
     (run as i32, tokens[run])
@@ -202,7 +203,8 @@ fn verify_greedy_stops_at_a_row_without_a_token() {
 }
 
 /// 600 random windows over a small alphabet (so matches are common and the first mismatch lands
-/// everywhere), 1 to 8 rows: the same answer as the host rule.
+/// everywhere), 1 to 8 rows, with -1 among the tokens and among the window ids (so that a row
+/// without a token meets an id holding the same bits): the same answer as the host rule.
 #[test]
 fn verify_greedy_matches_the_host_rule_on_random_windows() {
     if !testkit::device_present("verify_greedy random windows") {
@@ -212,8 +214,8 @@ fn verify_greedy_matches_the_host_rule_on_random_windows() {
     let mut rng = Rng::new(0x5635_0001);
     for case in 0..600 {
         let m = 1 + rng.below(8) as usize;
-        let tokens: Vec<i32> = (0..m).map(|_| rng.below(3) as i32).collect();
-        let ids: Vec<i32> = (0..m).map(|_| rng.below(3) as i32).collect();
+        let tokens: Vec<i32> = (0..m).map(|_| rng.below(4) as i32 - 1).collect();
+        let ids: Vec<i32> = (0..m).map(|_| rng.below(4) as i32 - 1).collect();
         let report = decode(&rig.verify(&tokens, &ids, 0), m);
         let (run, bonus) = reference(&tokens, &ids);
         assert_eq!(
