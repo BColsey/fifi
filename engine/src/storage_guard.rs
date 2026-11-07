@@ -32,8 +32,9 @@
 //!
 //! Guarded entry points: the server start (the model directory of every
 //! family), the inspection, the EXL3 and Flint checkpoint opens (directory
-//! and each shard), the GGUF open, the Nemotron shard reader and the read-only
-//! expert mapping. The Flash-Next and Qwen3.6 resident executors open their
+//! and each shard), the Flash-Next n-gram table file (`ngram_embedding.safetensors`, outside the
+//! weight index, opened by `weights::exl3::ngram_file::NgramFile::open`), the GGUF open, the Nemotron
+//! shard reader and the read-only expert mapping. The Flash-Next and Qwen3.6 resident executors open their
 //! shards the same way, but they are built only for macOS with the MLX
 //! backend, so their guarded form is compiled and checked on a Mac and has no
 //! Linux test. Other readers of weight files (the tiered file mapping, the
