@@ -389,6 +389,9 @@ fn parse_body(body: &[u8], mode: ParseMode) -> Result<AnthropicRequest, ServerEr
                 (ParseMode::Messages, stream) => stream,
                 (ParseMode::CountTokens, _) => false,
             },
+            // The Anthropic route has no capture field; the GUI arms
+            // capture on the chat route.
+            sample_trace: false,
         },
     })
 }

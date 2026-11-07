@@ -151,6 +151,9 @@ async fn submit(state: &AppState, input: CompletionInput) -> Result<Submitted, S
         assembler,
         max_tokens: input.max_tokens,
         stream: input.stream,
+        // The raw-completions route never arms capture; the field is a
+        // chat extension.
+        sample_trace: false,
         reply: ReplyMode::Raw,
         method: "POST",
         endpoint: "/v1/completions",

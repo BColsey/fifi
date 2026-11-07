@@ -37,6 +37,10 @@ pub(crate) struct ChatInput {
     pub(crate) sampling: RequestedSampling,
     pub(crate) max_tokens: u32,
     pub(crate) stream: bool,
+    /// Arms sampler-trace capture for this reply (`x-sample-trace`). The
+    /// server refuses the field with 400 unless its `sample_trace` setting
+    /// permits capture — see `submit`.
+    pub(crate) sample_trace: bool,
 }
 
 /// Parses a request body as one JSON object. The caller has already checked the size cap.
@@ -71,6 +75,9 @@ pub(crate) fn parse_chat(body: &[u8]) -> Result<ChatInput, ServerError> {
         sampling,
         max_tokens,
         stream: flag(object, "stream")?,
+        // A boolean extension field, absent meaning false: `flag` gives the
+        // same 400 on a non-boolean value as every other boolean field.
+        sample_trace: flag(object, "x-sample-trace")?,
     })
 }
 

@@ -3,9 +3,10 @@
 
 use super::error::ServerError;
 use super::reqlog::{RecentRing, Sink, default_sink};
+use super::sampler_trace::{SamplerTraceRing, TraceMeta};
 use super::wire::{EngineErrorInfo, EngineInfo, Model, ModelList, state_name};
 use crate::EngError;
-use crate::family::sampler::SamplingDefaults;
+use crate::family::sampler::{CaptureHandle, SamplingDefaults};
 use crate::sched::worker::{EngineHandle, EngineState, RetryClass};
 use crate::tokenizer::TokenizerBundle;
 use std::collections::{HashMap, HashSet};
@@ -60,6 +61,12 @@ pub(crate) struct AppState {
     /// The monitor's recent-request ring, fed by the served routes' log
     /// lines and read by `GET /v1/recent-requests`.
     recent: RecentRing,
+    /// Whether the process permits sampler-trace capture: the config's
+    /// `sample_trace` setting, checked before a request arms a sampler.
+    sample_trace: bool,
+    /// The sampler-trace ring, fed by submit when a request arms capture
+    /// and read by `GET /v1/sampler-trace`.
+    traces: SamplerTraceRing,
     /// The previous prompt ids per model, for the request log's LCP row.
     prompt_memory: Arc<Mutex<HashMap<String, Vec<u32>>>>,
     /// The built frontend directory served at `/`, when configured.
@@ -85,9 +92,32 @@ impl AppState {
             log: Box::new(|line| eprintln!("error: {line}")),
             request_log: default_sink(),
             recent: RecentRing::new(),
+            sample_trace: false,
+            traces: SamplerTraceRing::default(),
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
             web_dir: None,
         }
+    }
+
+    /// Builder: run.rs applies the config's `sample_trace` setting.
+    pub(crate) fn with_sample_trace(mut self, on: bool) -> Self {
+        self.sample_trace = on;
+        self
+    }
+
+    pub(crate) fn sample_trace_enabled(&self) -> bool {
+        self.sample_trace
+    }
+
+    /// Registers one reply's capture buffer at submit: in-progress captures
+    /// count against the ring's budgets from the first token on.
+    pub(crate) fn register_trace(&self, id: &str, meta: TraceMeta, buffer: CaptureHandle) {
+        self.traces.register(id, meta, buffer);
+    }
+
+    /// One reply's trace metadata and buffer, when the ring still holds it.
+    pub(crate) fn sampler_trace(&self, id: &str) -> Option<(TraceMeta, CaptureHandle)> {
+        self.traces.get(id)
     }
 
     pub(crate) fn with_web_dir(mut self, dir: std::path::PathBuf) -> Self {

@@ -211,6 +211,9 @@ pub(crate) enum SubmitError {
     Unavailable,
 }
 
+// The sampler's capture handle grew Job past the large-variant floor; the
+// queue stays flat (one Arc worth of growth) rather than boxing every job.
+#[allow(clippy::large_enum_variant)]
 enum Message {
     Job(Job),
     /// Ends the loop after the jobs ahead of it. `shutdown` sends it so that the thread stops

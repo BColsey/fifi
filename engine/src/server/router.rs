@@ -3,8 +3,9 @@
 //! Routes: `GET /health`, `GET /ready`, `GET /v1/models`, `POST /v1/chat/completions`,
 //! `POST /v1/completions`, `POST /v1/messages`, `POST /v1/messages/count_tokens`, and the server
 //! extensions `POST /v1/token/encode`, `POST /v1/token/decode`, `POST /v1/apply-template`, and
-//! `GET /v1/recent-requests` (the GUI's live speed panel). The extensions are not in the client
-//! contract.
+//! `GET /v1/recent-requests` (the GUI's live speed panel) and `GET /v1/sampler-trace` (one
+//! reply's armed sampler-trace packet; see `sampler_trace.rs`). The extensions are not in the
+//! client contract.
 //! A route that the contract does not define, or that this server does not ship, gives a JSON 404.
 //! A method that a served path does not accept counts as an undefined route, because the contract
 //! defines no 405. `HEAD` on a `GET` route stays as axum serves it.
@@ -14,6 +15,7 @@ use super::auth::{check_bearer, check_messages};
 use super::chat::chat;
 use super::completions::completions;
 use super::error::ServerError;
+use super::sampler_trace::get_sampler_trace;
 use super::state::AppState;
 use super::tokenize::{apply_template, decode, encode};
 use super::wire::{ModelList, state_name};
@@ -33,6 +35,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/system", get(system))
         .route("/v1/recent-requests", get(recent_requests))
+        .route("/v1/sampler-trace", get(get_sampler_trace))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/v1/token/encode", post(encode))

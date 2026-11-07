@@ -260,29 +260,20 @@ impl SamplingParams {
         )
     }
 
-    /// The softmax temperature; 0 selects greedy decoding.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler")
-    )]
+    /// The softmax temperature; 0 selects greedy decoding. Submit reads it
+    /// for the trace packet's metadata.
     pub(crate) fn temperature(&self) -> f64 {
         self.temperature
     }
 
-    /// The cumulative mass kept by nucleus sampling.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the CUDA device sampler")
-    )]
+    /// The cumulative mass kept by nucleus sampling. Submit reads it for
+    /// the trace packet's metadata.
     pub(crate) fn top_p(&self) -> f64 {
         self.top_p
     }
 
-    /// The number of best candidates kept; 0 keeps every token.
-    #[cfg_attr(
-        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
-        expect(dead_code, reason = "staged for the CUDA device sampler")
-    )]
+    /// The number of best candidates kept; 0 keeps every token. Submit
+    /// reads it for the trace packet's metadata.
     pub(crate) fn top_k(&self) -> u32 {
         self.top_k
     }
@@ -389,8 +380,33 @@ impl SampleObservation {
     }
 }
 
+/// One recorded sampling decision: what the sampler considered when it chose
+/// `token`. The selected entry's probability is absent on greedy rows.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RecordedSample {
+    pub(crate) token: u32,
+    pub(crate) rank: u32,
+    pub(crate) kept: u32,
+    pub(crate) greedy: bool,
+    pub(crate) selected_prob: Option<f64>,
+    pub(crate) candidates: Vec<(u32, f64)>,
+}
+
+/// The buffer an armed sampler appends to: one request's positions under an
+/// absolute limit, with the truncation flag the trace packet reports. Data
+/// only — no invariant lives here, so a poisoned lock recovers with the data.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureBuffer {
+    pub(crate) positions: Vec<RecordedSample>,
+    pub(crate) truncated: bool,
+    limit: usize,
+}
+
+pub(crate) type CaptureHandle = std::sync::Arc<std::sync::Mutex<CaptureBuffer>>;
+
 pub(crate) struct Sampler {
     params: SamplingParams,
+    capture: Option<CaptureHandle>,
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "staged for the CUDA device sampler")
@@ -404,6 +420,7 @@ impl Sampler {
     pub(crate) fn new(params: SamplingParams, seed: u64) -> Self {
         Self {
             params,
+            capture: None,
             seed,
             rng: SplitMix64::new(seed),
         }
@@ -448,7 +465,15 @@ impl Sampler {
     /// Returns the next token id. `logits` holds one finite value per vocabulary entry.
     /// Empty, oversized, or non-finite logits fail with `Backend`, because they mean that the
     /// forward pass produced invalid numbers.
+    ///
+    /// An armed sampler also records the decision (see [`Sampler::arm_capture`]);
+    /// arming changes no decision and no draw.
     pub(crate) fn sample(&mut self, logits: &[f32]) -> Result<u32, EngError> {
+        if self.capture.is_some() {
+            let (token, obs) = self.sample_observed(logits)?;
+            self.record(&obs);
+            return Ok(token);
+        }
         Ok(self.sample_with_keep(logits)?.0)
     }
 
@@ -464,10 +489,6 @@ impl Sampler {
     /// and the generator behave exactly as `sample`; the observation is write-only, so
     /// capture cannot change the token stream — the equivalence tests assert it with
     /// the generator state included.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the request capture lifecycle stage")
-    )]
     pub(crate) fn sample_observed(
         &mut self,
         logits: &[f32],
@@ -489,7 +510,54 @@ impl Sampler {
         ranked: &[(u32, f32)],
         vocab: usize,
     ) -> Result<u32, EngError> {
-        Ok(self.sample_shortlist_observed(ranked, vocab)?.0)
+        let (token, obs) = self.sample_shortlist_observed(ranked, vocab)?;
+        if self.capture.is_some() {
+            self.record(&obs);
+        }
+        Ok(token)
+    }
+
+    /// Arms capture for this request and returns the buffer the sampler appends
+    /// to. `limit` is the absolute per-request position budget: the buffer stops
+    /// growing and reports `truncated` beyond it. Arming must happen before
+    /// generation begins — nothing is recorded retroactively — and changes no
+    /// decision and no draw (the equivalence tests assert the token stream and
+    /// the generator state stay identical, armed or not).
+    pub(crate) fn arm_capture(&mut self, limit: usize) -> CaptureHandle {
+        let handle: CaptureHandle = std::sync::Arc::new(std::sync::Mutex::new(CaptureBuffer {
+            positions: Vec::new(),
+            truncated: false,
+            limit,
+        }));
+        self.capture = Some(std::sync::Arc::clone(&handle));
+        handle
+    }
+
+    /// Appends one recorded decision. The selected entry's probability comes from
+    /// the observation's own candidates — the selected entry is always present
+    /// there — so no walk is repeated.
+    pub(crate) fn record(&self, obs: &SampleObservation) {
+        let Some(handle) = &self.capture else { return };
+        let mut buffer = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buffer.positions.len() >= buffer.limit {
+            buffer.truncated = true;
+            return;
+        }
+        let selected_prob = obs
+            .candidates
+            .iter()
+            .find(|&&(id, _)| id == obs.selected)
+            .map(|&(_, prob)| prob);
+        buffer.positions.push(RecordedSample {
+            token: obs.selected,
+            rank: obs.selected_rank,
+            kept: obs.kept,
+            greedy: obs.greedy,
+            selected_prob,
+            candidates: obs.candidates.clone(),
+        });
     }
 
     /// `sample_shortlist` with the decision's observation, filled by the same walk.
@@ -2938,5 +3006,92 @@ mod tests {
                 probs[id as usize]
             );
         }
+    }
+
+    // ---- Armed capture (P1-B) ---------------------------------------------------
+
+    #[test]
+    fn armed_capture_preserves_the_token_stream_and_generator_state() {
+        let rows = [peaked_logits(), flat_logits(), tail_logits()];
+        for (temperature, top_p, top_k) in grid() {
+            let setting = params(temperature, top_p, top_k);
+            for seed in [0u64, 9] {
+                let mut plain = Sampler::new(setting, seed);
+                let mut armed = Sampler::new(setting, seed);
+                let buffer = armed.arm_capture(1_024);
+                for row in &rows {
+                    for _ in 0..16 {
+                        let expected = plain.sample(row).expect("plain");
+                        let token = armed.sample(row).expect("armed");
+                        assert_eq!(token, expected, "settings {setting:?} seed {seed}");
+                    }
+                }
+                assert_eq!(
+                    plain.rng_state(),
+                    armed.rng_state(),
+                    "arming must not move the generator: {setting:?} seed {seed}"
+                );
+                let buffer = buffer.lock().expect("buffer lock");
+                assert_eq!(buffer.positions.len(), rows.len() * 16);
+                assert!(!buffer.truncated);
+            }
+        }
+    }
+
+    #[test]
+    fn armed_capture_records_the_observation_of_each_decision() {
+        let row = peaked_logits();
+        let setting = params(0.7, 1.0, 0);
+        let mut sampler = Sampler::new(setting, 5);
+        let buffer = sampler.arm_capture(64);
+        for _ in 0..8 {
+            let (token, obs) = sampler.sample_observed(&row).expect("observed");
+            sampler.record(&obs);
+            let buffer = buffer.lock().expect("buffer lock");
+            let recorded = buffer.positions.last().expect("recorded");
+            assert_eq!(recorded.token, token);
+            assert_eq!(recorded.rank, obs.selected_rank);
+            assert_eq!(recorded.kept, obs.kept);
+            assert_eq!(recorded.greedy, obs.greedy);
+            assert_eq!(recorded.candidates, obs.candidates);
+            let expected_prob = obs
+                .candidates
+                .iter()
+                .find(|&&(id, _)| id == token)
+                .map(|&(_, prob)| prob);
+            assert_eq!(recorded.selected_prob, expected_prob);
+        }
+    }
+
+    #[test]
+    fn capture_stops_at_the_absolute_limit_and_marks_truncation() {
+        let row = flat_logits();
+        let setting = params(1.0, 1.0, 0);
+        let mut sampler = Sampler::new(setting, 4);
+        let buffer = sampler.arm_capture(4);
+        for _ in 0..10 {
+            sampler.sample(&row).expect("sample");
+        }
+        let buffer = buffer.lock().expect("buffer lock");
+        assert_eq!(buffer.positions.len(), 4, "the absolute position budget");
+        assert!(buffer.truncated);
+    }
+
+    #[test]
+    fn armed_greedy_capture_records_without_probabilities() {
+        let row = random_row(&mut SplitMix64::new(88), 32);
+        let mut sampler = Sampler::greedy();
+        let buffer = sampler.arm_capture(8);
+        let before = sampler.rng_state();
+        for _ in 0..3 {
+            let token = sampler.sample(&row).expect("greedy sample");
+            let buffer = buffer.lock().expect("buffer lock");
+            let recorded = buffer.positions.last().expect("recorded");
+            assert_eq!(recorded.token, token);
+            assert!(recorded.greedy);
+            assert_eq!(recorded.selected_prob, None);
+            assert!(recorded.candidates.is_empty());
+        }
+        assert_eq!(sampler.rng_state(), before);
     }
 }

@@ -168,6 +168,7 @@ pub(crate) async fn submit(
         assembler,
         max_tokens: input.max_tokens,
         stream,
+        sample_trace: input.sample_trace,
         reply,
         method,
         endpoint,
@@ -192,6 +193,8 @@ pub(super) struct Admission {
     pub(super) assembler: OutputAssembler,
     pub(super) max_tokens: u32,
     pub(super) stream: bool,
+    /// Whether the request armed sampler-trace capture (`x-sample-trace`).
+    pub(super) sample_trace: bool,
     pub(super) reply: ReplyMode,
     pub(super) method: &'static str,
     pub(super) endpoint: &'static str,
@@ -211,6 +214,7 @@ pub(super) fn admit(
         assembler,
         max_tokens: requested_tokens,
         stream,
+        sample_trace,
         reply,
         method,
         endpoint,
@@ -265,7 +269,34 @@ pub(super) fn admit(
         ReplyMode::Raw => ReplyParser::raw(),
     };
     let decoder = IncrementalDecoder::new(entry.bundle.tokenizer());
-    let sampler = Sampler::from_entropy(sampling);
+    let mut sampler = Sampler::from_entropy(sampling);
+    if sample_trace {
+        // Fail closed: the request asked for capture the process forbids.
+        // The refusal is a request error, like an unknown x-thinking value.
+        if !state.sample_trace_enabled() {
+            return Err(failed(
+                &mut log,
+                EngError::BadRequest(
+                    "x-sample-trace requires the server's sample_trace setting".to_owned(),
+                ),
+            ));
+        }
+        // Arm before generation begins — nothing is captured retroactively —
+        // and register in the ring at submit, so in-progress captures count
+        // against its budgets from the first token on.
+        let params = sampler.params();
+        let buffer = sampler.arm_capture(super::sampler_trace::PER_REQUEST_POSITION_LIMIT);
+        state.register_trace(
+            &head.id,
+            super::sampler_trace::TraceMeta {
+                model: head.model.clone(),
+                temperature: params.temperature(),
+                top_p: params.top_p(),
+                top_k: params.top_k(),
+            },
+            buffer,
+        );
+    }
     let generation = GenerationState::with_sampler(decoder, sampler).with_max_tokens(max_tokens);
     let (mut job, handle) =
         Job::new(prompt, generation).map_err(|error| failed(&mut log, error))?;

@@ -84,6 +84,7 @@ pub fn run_cli(args: &[String]) -> Result<(), StartupError> {
         spawn_stage_reporter(&entries);
     }
     let mut state = AppState::new(&key, entries);
+    state = state.with_sample_trace(config.sample_trace);
     if let Some(web_dir) = &config.web_dir {
         // Refuse at startup, with the path named, rather than serving a
         // shell that 404s: a configured-but-missing frontend is a
@@ -715,6 +716,7 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             api_key_env: "UNUSED".to_string(),
             prefix_reuse,
+            sample_trace: false,
             web_dir: None,
             engines,
         }

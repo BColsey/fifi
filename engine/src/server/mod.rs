@@ -23,6 +23,7 @@ mod reply;
 mod reqlog;
 mod router;
 mod run;
+mod sampler_trace;
 mod sse;
 mod state;
 #[cfg(test)]

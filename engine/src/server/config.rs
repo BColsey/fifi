@@ -53,6 +53,13 @@ pub(crate) struct Config {
     /// process. An engine without prefix support ignores it.
     #[serde(default)]
     pub(crate) prefix_reuse: bool,
+    /// True when requests may arm sampler-trace capture with `x-sample-trace:
+    /// true`. The default is false: no request is traced, and the field is
+    /// refused (400) at submit unless this setting permits it. One value
+    /// serves every engine of the process; the trace route and budgets are
+    /// `sampler_trace.rs`'s contract.
+    #[serde(default)]
+    pub(crate) sample_trace: bool,
     /// The built web frontend to serve at `/` (`web/dist` after
     /// `npm run build`). Absent: no frontend routes, as before. The
     /// shell and its hashed assets are public like `/health`; every API

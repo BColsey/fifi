@@ -237,6 +237,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
         api_key_env: DEFAULT_API_KEY_ENV.to_string(),
         prefix_reuse: false,
+        sample_trace: false,
         web_dir: None,
         engines: vec![EngineConfig {
             id: "q36".to_string(),

@@ -392,6 +392,15 @@ components:
             enable_thinking true acts as x-thinking on, and false as
             x-thinking off. Any other key gets 400. An enable_thinking value
             that disagrees with an x-thinking of on or off gets 400.
+        x-sample-trace:
+          type: boolean
+          default: false
+          description: >-
+            Server extension. Arms sampler-trace capture for this reply: the
+            server records each sampled token's kept candidates and
+            probabilities and serves the packet at GET /v1/sampler-trace with
+            this reply's id. Refused with 400 unless the server's
+            sample_trace setting permits capture.
         stop:
           description: Stop strings. They match on the decoded text.
           type: array
