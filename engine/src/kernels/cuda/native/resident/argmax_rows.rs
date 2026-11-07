@@ -1,5 +1,6 @@
-//! Raw entries of the row-batched argmax of a K-row verify window: `argmax_rows` and
-//! `window_status_fold`, both in `native/resident/step_params.cu` (declared in `step_params.h`).
+//! Raw entries of the row-batched argmax of a K-row verify window: `argmax_rows`,
+//! `window_status_fold` and `verify_greedy`, all in `native/resident/step_params.cu` (declared in
+//! `step_params.h`).
 //! Child module of `native/resident.rs`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
 //! Safety invariants this file relies on:
@@ -38,6 +39,14 @@ struct ArgmaxRowsArgsRaw {
     m: c_int,
 }
 
+/// Mirror of `inference_cuda_verify_greedy_args`.
+#[repr(C)]
+struct VerifyGreedyArgsRaw {
+    ids: *const c_void,
+    result: *mut c_void,
+    m: c_int,
+}
+
 /// Mirror of `inference_cuda_window_fold_args`.
 #[repr(C)]
 struct WindowFoldArgsRaw {
@@ -63,7 +72,19 @@ const _: () = assert!(
         && offset_of!(WindowFoldArgsRaw, result) == 16
         && offset_of!(WindowFoldArgsRaw, m) == 24
 );
+const _: () = assert!(
+    size_of::<VerifyGreedyArgsRaw>() == 24
+        && offset_of!(VerifyGreedyArgsRaw, ids) == 0
+        && offset_of!(VerifyGreedyArgsRaw, result) == 8
+        && offset_of!(VerifyGreedyArgsRaw, m) == 16
+);
 unsafe extern "C" {
+    #[link_name = "inference_cuda_verify_greedy_launch"]
+    fn verify_greedy_raw(
+        args: *const VerifyGreedyArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_argmax_rows_launch"]
     fn argmax_rows_raw(
         args: *const ArgmaxRowsArgsRaw,
@@ -195,6 +216,52 @@ pub(in crate::kernels::cuda) fn window_status_fold_launch(
     // outlive the queued work (`inference_cuda_free` synchronizes first). `args` is a live local
     // that the entry reads only during the call. `stream` is a live handle for the call.
     let status = unsafe { window_status_fold_raw(&args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// What one `verify_greedy` launch reads and writes: the `m` window ids, and the result table (the
+/// `m` pairs are read; the two words after the window word and its pad are written).
+pub(in crate::kernels::cuda) struct VerifyGreedyRaw<'a> {
+    pub(in crate::kernels::cuda) ids: RawRange<'a>,
+    pub(in crate::kernels::cuda) result: RawRange<'a>,
+    pub(in crate::kernels::cuda) m: c_int,
+}
+
+/// Bytes of the table `verify_greedy` works on: `m` pairs, the window word and its pad, and the
+/// two words it stores.
+fn report_table_bytes(m: usize) -> usize {
+    pair_table_bytes(m + 2)
+}
+
+/// Queues the device-side greedy comparison of a window.
+pub(in crate::kernels::cuda) fn verify_greedy_launch(
+    stream: &RawStream,
+    call: &VerifyGreedyRaw<'_>,
+) -> Result<(), DeviceFailure> {
+    let m = rows_in_range(call.m).ok_or_else(invalid_argument)?;
+    let ids_bytes = m * WORD_ALIGN;
+    let table_bytes = report_table_bytes(m);
+    let ids = Span::of(&call.ids, ids_bytes);
+    let table = Span::of(&call.result, table_bytes);
+    if !(fits(&call.ids, ids_bytes, WORD_ALIGN)
+        && fits(&call.result, table_bytes, PAIR_ALIGN)
+        && ids.apart(&table))
+    {
+        return Err(invalid_argument());
+    }
+    let args = VerifyGreedyArgsRaw {
+        ids: call.ids.address().cast_const(),
+        result: call.result.address(),
+        m: call.m,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: `rows_in_range`, `fits` and `apart` proved `m` in range, `ids` (`m` words) and the
+    // result table (`m + 2` pairs) inside their live allocations, aligned as the entry requires (4
+    // and 8), and the two extents disjoint, so the two stored words cannot alias the ids; the entry
+    // repeats the alignment checks on the addresses. The allocations outlive the queued work
+    // (`inference_cuda_free` synchronizes first). `args` is a live local that the entry reads only
+    // during the call. `stream` is a live handle for the call.
+    let status = unsafe { verify_greedy_raw(&args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 

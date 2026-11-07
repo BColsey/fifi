@@ -166,6 +166,29 @@ _Static_assert(sizeof(inference_cuda_window_fold_args) == 32 && offsetof(inferen
                "inference_cuda_window_fold_args layout");
 #endif
 
+/* The device-side comparison of a greedy K-row window (see verify_greedy_k in step_params.cu).
+ *   After argmax_rows: a = the number of leading rows i < m - 1 with result[2 i] == ids[i + 1], and
+ *   bonus = result[2 a]. Stored whole in result[2 m + 2] (a) and result[2 m + 3] (bonus), after the
+ *   window word and its pad (result[2 m], result[2 m + 1]) that window_status_fold stores. The pairs
+ *   are only read and nothing else is written: no status, no token chaining. ids holds the window
+ *   ids (m int32, 4-byte aligned, the first is the pending token, the others the drafts); result is
+ *   8-byte aligned and holds 2 m + 4 ints. The two ranges overlap no other. m in [1, 16].
+ *   One launch of one thread. */
+typedef struct inference_cuda_verify_greedy_args {
+    const void *ids;
+    void *result;
+    int m;
+} inference_cuda_verify_greedy_args;
+int inference_cuda_verify_greedy_launch(const inference_cuda_verify_greedy_args *args, void *stream,
+                                        int *out_stage);
+#ifdef __cplusplus
+static_assert(sizeof(inference_cuda_verify_greedy_args) == 24 && offsetof(inference_cuda_verify_greedy_args, ids) == 0 && offsetof(inference_cuda_verify_greedy_args, result) == 8 && offsetof(inference_cuda_verify_greedy_args, m) == 16,
+              "inference_cuda_verify_greedy_args layout");
+#else
+_Static_assert(sizeof(inference_cuda_verify_greedy_args) == 24 && offsetof(inference_cuda_verify_greedy_args, ids) == 0 && offsetof(inference_cuda_verify_greedy_args, result) == 8 && offsetof(inference_cuda_verify_greedy_args, m) == 16,
+               "inference_cuda_verify_greedy_args layout");
+#endif
+
 #ifdef __cplusplus
 }
 #endif

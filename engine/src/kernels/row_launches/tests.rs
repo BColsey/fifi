@@ -118,6 +118,8 @@ fn the_eager_control_shows_every_k_row_counter_at_zero() {
         RowKernel::ConvSnap,
         RowKernel::DeltaSnap,
         RowKernel::RouterStrided,
+        RowKernel::VerifyGreedy,
+        RowKernel::ShortlistRows,
     ] {
         let mut used = RowLaunches::default();
         used.record(kernel);
@@ -142,6 +144,8 @@ fn the_line_names_every_counter() {
         "conv_snap",
         "delta_snap",
         "router_strided",
+        "verify_greedy",
+        "shortlist_rows",
     ] {
         assert!(line.contains(name), "{name} in {line}");
     }

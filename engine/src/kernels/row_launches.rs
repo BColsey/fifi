@@ -70,6 +70,10 @@ pub(crate) enum RowKernel {
     /// `router_logits_k` with a logit stride other than `n_expert` (beta and alpha written into the
     /// `[K][ld]` row).
     RouterStrided,
+    /// `verify_greedy_k`: the device-side comparison of the pair tokens with the window ids.
+    VerifyGreedy,
+    /// `shortlist_parts_rows_k` and `shortlist_final_rows_k`: one launch of the K-row shortlist.
+    ShortlistRows,
 }
 
 /// How many launches of each kernel identity one context has enqueued since it was made.
@@ -85,6 +89,8 @@ pub(crate) struct RowLaunches {
     pub(crate) conv_snap: u64,
     pub(crate) delta_snap: u64,
     pub(crate) router_strided: u64,
+    pub(crate) verify_greedy: u64,
+    pub(crate) shortlist_rows: u64,
 }
 
 impl RowLaunches {
@@ -108,6 +114,8 @@ impl RowLaunches {
             RowKernel::ConvSnap => &mut self.conv_snap,
             RowKernel::DeltaSnap => &mut self.delta_snap,
             RowKernel::RouterStrided => &mut self.router_strided,
+            RowKernel::VerifyGreedy => &mut self.verify_greedy,
+            RowKernel::ShortlistRows => &mut self.shortlist_rows,
         };
         *slot += 1;
     }
@@ -131,7 +139,7 @@ impl RowLaunches {
     pub(crate) fn describe(&self) -> String {
         format!(
             "small_wide1={} rows2={} rows4={} rows8={} argmax_rows={} status_fold={} pack_rows={} \
-             conv_snap={} delta_snap={} router_strided={}",
+             conv_snap={} delta_snap={} router_strided={} verify_greedy={} shortlist_rows={}",
             self.small_wide1,
             self.rows2,
             self.rows4,
@@ -141,7 +149,9 @@ impl RowLaunches {
             self.pack_rows,
             self.conv_snap,
             self.delta_snap,
-            self.router_strided
+            self.router_strided,
+            self.verify_greedy,
+            self.shortlist_rows
         )
     }
 
@@ -197,7 +207,9 @@ impl RowLaunches {
             + self.pack_rows
             + self.conv_snap
             + self.delta_snap
-            + self.router_strided;
+            + self.router_strided
+            + self.verify_greedy
+            + self.shortlist_rows;
         if used == 0 {
             Ok(())
         } else {

@@ -18,14 +18,23 @@
 //! invalid-state (mask 4) and arithmetic (mask 16) bits live in `w` only; the host refuses a
 //! window with any non-zero pair bit or a non-zero `w` (`family::qwen36::krow::check_status`).
 //!
-//! Order of a K-row window's tail: `lm_head`, `argmax_rows`, `window_status_fold`, the advance.
-//! The fold must be the last kernel that writes the status word.
+//! `verify_greedy` runs after `argmax_rows` and compares the pair tokens with the window ids on the
+//! device: the accepted run `a` (the leading rows `i < m - 1` whose token equals `ids[i + 1]`) and
+//! the bonus (the token of row `a`) are stored after the window word and its pad, as words
+//! `2 m + 2` and `2 m + 3`. The report of a window is therefore `8 m + 16` bytes, and the shortlist
+//! records of the K-row shortlist (`resident::shortlist`) follow it at the next multiple of 16, so
+//! the host reads all of it with one copy ([`WindowReport`]).
+//!
+//! Order of a K-row window's tail: `lm_head`, `argmax_rows`, `window_status_fold`, `verify_greedy`,
+//! the K-row shortlist, the advance. The fold must be the last kernel that writes the status word;
+//! the two after it write no status.
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};
 use crate::kernels::cuda::native::resident::argmax_rows::{
-    self as raw, ArgmaxRowsRaw, WindowFoldRaw,
+    self as raw, ArgmaxRowsRaw, VerifyGreedyRaw, WindowFoldRaw,
 };
+use crate::kernels::cuda::resident::shortlist::RESULT_BYTES as SHORTLIST_RECORD_BYTES;
 use crate::kernels::cuda::resident::step_params::{
     ARGMAX_PART_BYTES, MAX_LOGITS, RESULT_PAIR_BYTES, STEP_PARAMS_BYTES,
 };
@@ -37,6 +46,32 @@ pub(crate) const MAX_ARGMAX_ROWS: usize = raw::MAX_ARGMAX_ROWS;
 /// Bytes of the result table of an `m`-row window: `m` pairs, then the window word and a zero pad.
 pub(crate) fn window_result_bytes(m: usize) -> usize {
     (m + 1) * RESULT_PAIR_BYTES
+}
+
+/// Bytes of the report of an `m`-row window: the table and the two `verify_greedy` words.
+pub(crate) fn window_report_bytes(m: usize) -> usize {
+    (m + 2) * RESULT_PAIR_BYTES
+}
+
+/// Byte offset, from the start of the table, of the first shortlist record of an `m`-row window:
+/// the report rounded up to the 16 bytes a record needs.
+pub(crate) fn window_shortlist_offset(m: usize) -> usize {
+    window_report_bytes(m).next_multiple_of(16)
+}
+
+/// Bytes the host reads for an `m`-row window with the shortlist records.
+pub(crate) fn window_full_report_bytes(m: usize) -> usize {
+    window_shortlist_offset(m) + m * SHORTLIST_RECORD_BYTES
+}
+
+/// Bytes the host reads for an `m`-row window: the whole report with the shortlist records, or the
+/// table and the verify words alone when the shortlist did not run.
+pub(crate) fn window_read_bytes(m: usize, with_shortlist: bool) -> usize {
+    if with_shortlist {
+        window_full_report_bytes(m)
+    } else {
+        window_report_bytes(m)
+    }
 }
 
 /// Bytes of the argmax scratch of `m` rows: one set of partials per row.
@@ -73,6 +108,16 @@ pub(crate) struct WindowFoldCall<'b> {
     pub(crate) result: DeviceRange<'b>,
 }
 
+/// The arguments of one `verify_greedy`.
+pub(crate) struct VerifyGreedyCall<'b> {
+    pub(crate) m: usize,
+    /// The window ids: `m` int32 words, 4-byte aligned. Read only.
+    pub(crate) ids: DeviceRange<'b>,
+    /// The result table of [`window_report_bytes`] bytes, 8-byte aligned: the `m` pairs are read,
+    /// the two words after the window word and its pad are written.
+    pub(crate) result: DeviceRange<'b>,
+}
+
 /// One window's result table as the host reads it after the window's synchronization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WindowResult {
@@ -101,6 +146,49 @@ impl WindowResult {
             tokens: (0..m).map(|row| words[2 * row]).collect(),
             bits: (0..m).map(|row| words[2 * row + 1]).collect(),
             window: words[2 * m],
+        })
+    }
+}
+
+/// One window's whole report as the host reads it with one copy after the window's
+/// synchronization: the table, the two `verify_greedy` words and, when the K-row shortlist ran, one
+/// record per row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WindowReport {
+    pub(crate) table: WindowResult,
+    /// The accepted run the device compared: leading rows `i < m - 1` with `token[i] == ids[i + 1]`.
+    pub(crate) accepted: i32,
+    /// The token of row `accepted`.
+    pub(crate) bonus: i32,
+    /// The shortlist record of each row (empty when the shortlist did not run).
+    pub(crate) shortlists: Vec<[u8; SHORTLIST_RECORD_BYTES]>,
+}
+
+impl WindowReport {
+    /// Decodes the report of an `m`-row window: [`window_report_bytes`] bytes without the
+    /// shortlist, [`window_full_report_bytes`] with it. `None` for any other length or a table whose
+    /// pad word is not zero. The bytes between the report and the first record are padding and are
+    /// not read.
+    pub(crate) fn from_bytes(bytes: &[u8], m: usize, shortlist: bool) -> Option<Self> {
+        if bytes.len() != window_read_bytes(m, shortlist) {
+            return None;
+        }
+        let table = WindowResult::from_bytes(&bytes[..window_result_bytes(m)], m)?;
+        let word = |at: usize| i32::from_le_bytes(bytes[at..at + 4].try_into().expect("a word"));
+        let verify = window_result_bytes(m);
+        let shortlists: Vec<[u8; SHORTLIST_RECORD_BYTES]> = if shortlist {
+            bytes[window_shortlist_offset(m)..]
+                .chunks_exact(SHORTLIST_RECORD_BYTES)
+                .map(|record| record.try_into().expect("a record"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            table,
+            accepted: word(verify),
+            bonus: word(verify + 4),
+            shortlists,
         })
     }
 }
@@ -218,7 +306,37 @@ impl CudaContext {
             raw::window_status_fold_launch(raw_stream, &raw_call)
         })
     }
+
+    /// Enqueues `verify_greedy` on `stream`: the device-side comparison of the pair tokens with
+    /// the window ids. See the module doc for what it reads and writes.
+    pub(crate) fn verify_greedy(
+        &self,
+        stream: &DeviceStream,
+        call: VerifyGreedyCall<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        let m = check_m(call.m)?;
+        let ids = self.raw_range(&call.ids)?;
+        let result = self.raw_range(&call.result)?;
+        let ids_bytes = call.m * size_of::<i32>();
+        let table = window_report_bytes(call.m);
+        require_fit("ids", &call.ids, ids_bytes, 4)?;
+        require_fit("result", &call.result, table, 8)?;
+        require_apart(
+            &Claim::of("ids", &call.ids, ids_bytes),
+            &Claim::of("result", &call.result, table),
+        )?;
+        #[cfg(test)]
+        self.note_row_kernel(crate::kernels::row_launches::RowKernel::VerifyGreedy);
+        let raw_call = VerifyGreedyRaw { ids, result, m };
+        self.launch_on(stream, move |raw_stream| {
+            raw::verify_greedy_launch(raw_stream, &raw_call)
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod verify_tests;

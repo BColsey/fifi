@@ -213,6 +213,21 @@ __global__ void window_status_fold_k(inference_cuda_step_params *p, uint32_t *fl
     result[2 * m + 1] = 0;
 }
 
+/* The device-side comparison of a greedy K-row window. One thread, after argmax_rows: the accepted
+ * run a is the number of leading rows i < m - 1 whose token equals the next window id
+ * (result[2 i] == ids[i + 1]), and the bonus is the token of row a (the model's own token after the
+ * accepted drafts; with every draft accepted, a = m - 1 and the bonus is the last row's token).
+ * Both words are stored whole after the window word and its pad: result[2 m + 2] = a and
+ * result[2 m + 3] = bonus. The pairs are only read and the status word is not touched, so the
+ * kernel can run before or after window_status_fold. A row with no comparable value (token -1)
+ * never equals a window id (ids are not negative) and ends the run. */
+__global__ void verify_greedy_k(const int *ids, int *result, int m) {
+    int a = 0;
+    while (a < m - 1 && result[2 * a] == ids[a + 1]) ++a;
+    result[2 * m + 2] = a;
+    result[2 * m + 3] = result[2 * a];
+}
+
 /* The state a step may start from (see the header comment). pos is tested first, so pos + 1 does
  * not overflow. */
 __device__ __forceinline__ bool step_state_valid(int pos, int kv_len, int kv_slot) {
@@ -276,6 +291,11 @@ bool valid_fold(const inference_cuda_window_fold_args *a) {
     return a != NULL && a->params != NULL && a->flag != NULL && a->result != NULL && a->m >= 1 &&
            a->m <= kMaxRows && aligned_to(a->params, 4) && aligned_to(a->flag, 4) &&
            aligned_to(a->result, 8);
+}
+
+bool valid_verify(const inference_cuda_verify_greedy_args *a) {
+    return a != NULL && a->ids != NULL && a->result != NULL && a->m >= 1 && a->m <= kMaxRows &&
+           aligned_to(a->ids, 4) && aligned_to(a->result, 8);
 }
 
 int launch_status(int *out_stage) {
@@ -401,6 +421,20 @@ extern "C" int inference_cuda_window_status_fold_launch(const inference_cuda_win
         }
         window_status_fold_k<<<1, 1, 0, (cudaStream_t)stream>>>((inference_cuda_step_params *)a->params,
                                                                 (uint32_t *)a->flag, (int *)a->result, a->m);
+        return launch_status(out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_verify_greedy_launch(const inference_cuda_verify_greedy_args *a,
+                                                   void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!valid_verify(a)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        verify_greedy_k<<<1, 1, 0, (cudaStream_t)stream>>>((const int *)a->ids, (int *)a->result, a->m);
         return launch_status(out_stage);
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
