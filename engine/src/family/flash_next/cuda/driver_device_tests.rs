@@ -329,3 +329,272 @@ fn the_first_real_tokens_match_the_oracle() {
         std::fs::write(out.join("step0.logits.f32"), raw).expect("write logits");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Teacher-forced follow mode over the oracle prompts.
+
+fn softmax(logits: &[f64]) -> Vec<f64> {
+    let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = logits.iter().map(|v| (v - top).exp()).sum();
+    logits.iter().map(|v| (v - top).exp() / sum).collect()
+}
+
+/// KL(p || q) of the softmaxes of two logit vectors over one support.
+fn kl_of_logits(p: &[f64], q: &[f64]) -> f64 {
+    let (p, q) = (softmax(p), softmax(q));
+    p.iter()
+        .zip(&q)
+        .filter(|(p, _)| **p > 0.0)
+        .map(|(p, q)| p * (p / q).ln())
+        .sum()
+}
+
+fn widen(row: &[f32]) -> Vec<f64> {
+    row.iter().map(|v| f64::from(*v)).collect()
+}
+
+/// One step of a teacher-forced prompt.
+struct FollowStep {
+    oracle_argmax: usize,
+    our_argmax: usize,
+    oracle_margin: f64,
+    our_margin: f64,
+    /// Our logit of the oracle's token and of ours.
+    our_logit_oracle_token: f64,
+    our_logit_top: f64,
+    /// KL over the oracle's stored top-20 tokens, both sides renormalized on those 20.
+    kl_top20: f64,
+    /// KL over the whole vocabulary, where the oracle stored the full row.
+    kl_full: Option<f64>,
+    overlap: usize,
+}
+
+fn mean_max(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    (
+        values.iter().sum::<f64>() / values.len() as f64,
+        values.iter().copied().fold(0.0, f64::max),
+    )
+}
+
+/// All the oracle prompts, teacher-forced with the oracle's tokens, in one process: the bank is
+/// loaded once and the driver is reset between prompts. Prompts run shortest first, and a prompt
+/// that would not finish inside `FIFI_FLASH_NEXT_DRIVER_BUDGET_SEC` (default 700) of wall time is
+/// skipped and named, so a slow run still ends with a complete report of what it did.
+///
+/// Reported per prompt: steps, top-1 agreement, mean and max KL(oracle || ours) over the oracle's
+/// stored top-20 tokens (every step) and over the whole vocabulary (the steps with a stored full
+/// row), top-20 overlap, and every disagreement with both margins.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
+    assert!(
+        device_present("Flash-Next token driver follow mode"),
+        "a GPU is required"
+    );
+    let opened = std::time::Instant::now();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"]
+        .as_u64()
+        .expect("actual_vocab") as usize;
+    let filter: Option<Vec<String>> = var("FIFI_FLASH_NEXT_DRIVER_PROMPTS")
+        .map(|v| v.split(',').map(|id| id.trim().to_string()).collect());
+    let budget: f64 =
+        var("FIFI_FLASH_NEXT_DRIVER_BUDGET_SEC").map_or(700.0, |v| v.parse().expect("budget"));
+    let mut records: Vec<&serde_json::Value> = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .filter(|p| {
+            filter
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|id| p["id"] == id.as_str()))
+        })
+        .collect();
+    records.sort_by_key(|p| p["prompt_len"].as_u64().expect("prompt_len"));
+    let need = records
+        .iter()
+        .map(|p| p["prompt_len"].as_u64().unwrap() + p["steps"].as_array().unwrap().len() as u64)
+        .max()
+        .expect("a prompt") as u32
+        + 8;
+    let context: u32 = var("FIFI_FLASH_NEXT_DRIVER_CONTEXT")
+        .map_or(need.next_multiple_of(4), |v| v.parse().expect("context"));
+    assert!(
+        context >= need,
+        "the context {context} is below the {need} needed"
+    );
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
+    };
+    let mut driver = build_driver(
+        &|stage| println!("stage: {stage}"),
+        &pack,
+        &wanted,
+        actual_vocab,
+        None,
+    )
+    .expect("build the driver");
+    println!(
+        "load: {:.1} s; context {context}; {} prompts",
+        opened.elapsed().as_secs_f64(),
+        records.len()
+    );
+
+    let (mut feed_ms, mut step_ms) = (60.0f64, 50.0f64);
+    let mut summaries = Vec::new();
+    let (mut all_steps, mut all_agree) = (0usize, 0usize);
+    let (mut all_kl20, mut all_klfull) = (Vec::new(), Vec::new());
+    let dir = oracle_path.parent().expect("dir");
+    for record in records {
+        let id = record["id"].as_str().expect("id").to_string();
+        let ids = |key: &str| -> Vec<u32> {
+            record[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("no {key}"))
+                .iter()
+                .map(|v| v.as_u64().expect("an id") as u32)
+                .collect()
+        };
+        let (prompt, generated) = (ids("prompt_ids"), ids("generated"));
+        let oracle_steps = record["steps"].as_array().expect("steps");
+        let count = oracle_steps.len();
+        let estimate = (prompt.len() as f64 * feed_ms + count as f64 * step_ms) * 1.25 / 1e3;
+        if opened.elapsed().as_secs_f64() + estimate > budget {
+            println!(
+                "skipped {id}: about {estimate:.0} s more would pass the {budget:.0} s budget"
+            );
+            summaries
+                .push(serde_json::json!({"id": id, "skipped": true, "estimate_sec": estimate}));
+            continue;
+        }
+        let rows = read_npy(&dir.join(record["full_logits"]["file"].as_str().expect("file")));
+        let width = record["full_logits"]["width"].as_u64().expect("width") as usize;
+        let full_steps = record["full_logits"]["steps"].as_u64().expect("steps") as usize;
+        driver.reset().expect("reset");
+        let began = std::time::Instant::now();
+        let (last, head) = prompt.split_last().expect("a prompt");
+        for &token in head {
+            driver.feed(token).expect("feed a prompt token");
+        }
+        feed_ms = began.elapsed().as_secs_f64() * 1e3 / head.len().max(1) as f64;
+        let began = std::time::Instant::now();
+        let mut steps: Vec<FollowStep> = Vec::with_capacity(count);
+        for i in 0..count {
+            let input = if i == 0 { *last } else { generated[i - 1] };
+            let row = driver
+                .logits(input)
+                .unwrap_or_else(|e| panic!("{id} step {i}: {e:?}"));
+            let ours = &row[..actual_vocab];
+            let order = top(ours, 2);
+            let oracle = &oracle_steps[i];
+            let oracle_top = oracle["top"].as_array().expect("top");
+            let oracle_ids: Vec<usize> = oracle_top
+                .iter()
+                .map(|t| t[0].as_u64().expect("id") as usize)
+                .collect();
+            let oracle_logits: Vec<f64> = oracle_top
+                .iter()
+                .map(|t| t[1].as_f64().expect("logit"))
+                .collect();
+            let our_at_oracle: Vec<f64> = oracle_ids.iter().map(|&t| f64::from(ours[t])).collect();
+            let our_top20: Vec<usize> = top(ours, 20).iter().map(|t| t.0).collect();
+            let kl_full = (i < full_steps).then(|| {
+                let oracle_row = &rows[i * width..i * width + actual_vocab];
+                kl_of_logits(&widen(oracle_row), &widen(ours))
+            });
+            steps.push(FollowStep {
+                oracle_argmax: oracle["argmax"].as_u64().expect("argmax") as usize,
+                our_argmax: order[0].0,
+                oracle_margin: oracle["margin"].as_f64().expect("margin"),
+                our_margin: f64::from(order[0].1 - order[1].1),
+                our_logit_oracle_token: f64::from(
+                    ours[oracle["argmax"].as_u64().unwrap() as usize],
+                ),
+                our_logit_top: f64::from(order[0].1),
+                kl_top20: kl_of_logits(&oracle_logits, &our_at_oracle),
+                kl_full,
+                overlap: oracle_ids.iter().filter(|t| our_top20.contains(t)).count(),
+            });
+        }
+        step_ms = began.elapsed().as_secs_f64() * 1e3 / count.max(1) as f64;
+        let agree = steps
+            .iter()
+            .filter(|s| s.oracle_argmax == s.our_argmax)
+            .count();
+        let (kl20_mean, kl20_max) = mean_max(&steps.iter().map(|s| s.kl_top20).collect::<Vec<_>>());
+        let full: Vec<f64> = steps.iter().filter_map(|s| s.kl_full).collect();
+        let (klf_mean, klf_max) = mean_max(&full);
+        let overlap = steps.iter().map(|s| s.overlap).sum::<usize>() as f64 / count as f64;
+        println!(
+            "{id}: {count} steps, top-1 {agree}/{count} ({:.4}), KL top-20 mean {kl20_mean:.3e} max {kl20_max:.3e}, \
+             KL full-vocab ({} rows) mean {klf_mean:.3e} max {klf_max:.3e}, top-20 overlap mean {overlap:.2}/20, \
+             prompt {:.1} ms/token, steps {step_ms:.1} ms/token",
+            agree as f64 / count as f64,
+            full.len(),
+            feed_ms
+        );
+        let mut flips = Vec::new();
+        for (i, s) in steps.iter().enumerate() {
+            if s.oracle_argmax != s.our_argmax {
+                println!(
+                    "  disagreement {id} step {i}: oracle {} (margin {:.4}, our logit {:.4}) vs ours {} (margin {:.4}, our logit {:.4})",
+                    s.oracle_argmax,
+                    s.oracle_margin,
+                    s.our_logit_oracle_token,
+                    s.our_argmax,
+                    s.our_margin,
+                    s.our_logit_top
+                );
+                flips.push(serde_json::json!({
+                    "step": i, "oracle": s.oracle_argmax, "ours": s.our_argmax,
+                    "oracle_margin": s.oracle_margin, "our_margin": s.our_margin,
+                    "our_logit_of_oracle_token": s.our_logit_oracle_token,
+                    "our_logit_top": s.our_logit_top,
+                }));
+            }
+        }
+        all_steps += count;
+        all_agree += agree;
+        all_kl20.extend(steps.iter().map(|s| s.kl_top20));
+        all_klfull.extend(full.iter().copied());
+        summaries.push(serde_json::json!({
+            "id": id, "steps": count, "top1_agree": agree, "kl_top20_mean": kl20_mean,
+            "kl_top20_max": kl20_max, "kl_full_rows": full.len(), "kl_full_mean": klf_mean,
+            "kl_full_max": klf_max, "top20_overlap_mean": overlap, "disagreements": flips,
+            "prompt_ms_per_token": feed_ms, "step_ms_per_token": step_ms,
+        }));
+    }
+    let (m20, x20) = mean_max(&all_kl20);
+    let (mf, xf) = mean_max(&all_klfull);
+    println!(
+        "ALL: {all_agree}/{all_steps} top-1 ({:.4}); KL top-20 mean {m20:.3e} max {x20:.3e} over {} steps; \
+         KL full-vocab mean {mf:.3e} max {xf:.3e} over {} rows; {:.0} s",
+        all_agree as f64 / all_steps.max(1) as f64,
+        all_kl20.len(),
+        all_klfull.len(),
+        opened.elapsed().as_secs_f64()
+    );
+    if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).expect("out dir");
+        std::fs::write(
+            out.join("follow.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mode": "teacher-forced", "context": context, "prompts": summaries,
+                "all": {"steps": all_steps, "top1_agree": all_agree, "kl_top20_mean": m20,
+                        "kl_top20_max": x20, "kl_full_mean": mf, "kl_full_max": xf},
+            }))
+            .expect("json"),
+        )
+        .expect("write follow.json");
+    }
+}

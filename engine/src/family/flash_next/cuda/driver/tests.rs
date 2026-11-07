@@ -128,6 +128,20 @@ fn a_failure_at_any_device_call_after_the_first_write_poisons() {
     }
 }
 
+/// The head and its read-back run only for a logits token.
+#[test]
+fn a_failure_at_the_head_or_the_logits_read_poisons_a_logits_token() {
+    for call in ["head", "read_logits"] {
+        let mut driver = driver();
+        driver.device.fail = Some(call);
+        assert!(driver.logits(1).is_err(), "{call}");
+        assert_eq!(driver.fed(), 0, "{call}");
+        assert!(driver.feed(1).is_err(), "{call}: poisoned");
+        driver.reset().unwrap();
+        assert_eq!(driver.logits(1).unwrap().len(), super::fakes::LOGITS);
+    }
+}
+
 #[test]
 fn a_failed_ple_update_poisons_and_keeps_the_position() {
     let mut driver = driver();
