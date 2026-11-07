@@ -1816,60 +1816,59 @@ fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
 }
 
 /// The draws from the report are the draws from the full rows: for seeded samplers of several
-/// settings (a sampler that keeps 20, 5 or 1 candidate) and for the rows of a real window, drawing
-/// rows 0..d from the report gives the tokens that `Sampler::sample` gives on the tap's copy of
-/// the rows, and leaves the generator in the same state, for every d. A sampler that keeps 40
-/// candidates (read row by row from the device) gives the same too.
+/// settings (a sampler that keeps 20, 5 or 1 candidate, which the record serves; one that keeps 0
+/// (no limit), 21 or 40, which reads a row on demand), windows of 2, 3, 5 and 8 rows (odd lengths
+/// with their padded record and report offsets included) and the rows of a real window, drawing
+/// rows 0..d gives the tokens that `Sampler::sample` gives on the tap's copy of the rows, and
+/// leaves the generator in the same state, for every d.
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_draws_from_the_report_are_the_draws_from_the_full_rows() {
-    let (mut rig, _session, base, inputs) = krow_rig(8);
+    let (mut rig, _session, base, _inputs) = krow_rig(2);
+    let prefix = rig.prefixes[0];
     let step = &mut rig.step;
-    step.set_krow_want_logits(true);
-    step.run_window(&inputs).expect("the window with the tap");
-    let rows = step.window_logits_rows().expect("rows");
-    step.commit_window(&Commit {
-        committed_rows: base_tokens(&base) + inputs.len(),
-        kept_rows: inputs.len(),
-        discarded_rows: 0,
-        state_slot: inputs.len() - 1,
-    })
-    .expect("the verdict");
-    step.restore(&base).expect("restore");
-    for top_k in [20u32, 5, 1, 40] {
-        for seed in [0u64, 7, 12_345] {
-            for drawn in 1..=inputs.len() {
-                // The tap off: the record (or a row read on demand) answers.
-                step.set_krow_want_logits(false);
-                step.run_window(&inputs).expect("the window");
-                let mut device = seeded_keeping(top_k, seed);
-                let from_device: Vec<u32> = (0..drawn)
-                    .map(|row| step.draw(row, &mut device, SAMPLER_VOCAB).expect("a draw"))
-                    .collect();
-                step.commit_window(&Commit {
-                    committed_rows: base_tokens(&base) + drawn,
-                    kept_rows: drawn,
-                    discarded_rows: inputs.len() - drawn,
-                    state_slot: drawn - 1,
-                })
-                .expect("the verdict");
-                step.restore(&base).expect("restore");
-                let mut host = seeded_keeping(top_k, seed);
-                let from_host: Vec<u32> = (0..drawn)
-                    .map(|row| {
-                        sample_logits("host", &rows[row], &mut host, SAMPLER_VOCAB)
-                            .expect("a host draw")
+    for window_rows in [2usize, 3, 5, 8] {
+        let inputs = window_inputs(&rig.stream, prefix, window_rows);
+        step.set_krow_want_logits(true);
+        step.run_window(&inputs).expect("the window with the tap");
+        let rows = step.window_logits_rows().expect("rows");
+        step.commit_window(&Commit {
+            committed_rows: base_tokens(&base) + inputs.len(),
+            kept_rows: inputs.len(),
+            discarded_rows: 0,
+            state_slot: inputs.len() - 1,
+        })
+        .expect("the verdict");
+        step.restore(&base).expect("restore");
+        for top_k in [20u32, 5, 1, 0, 21, 40] {
+            for seed in [7u64, 12_345] {
+                for drawn in 1..=inputs.len() {
+                    // The tap off: the record (or a row read on demand) answers.
+                    step.set_krow_want_logits(false);
+                    step.run_window(&inputs).expect("the window");
+                    let mut device = seeded_keeping(top_k, seed);
+                    let from_device: Vec<u32> = (0..drawn)
+                        .map(|row| step.draw(row, &mut device, SAMPLER_VOCAB).expect("a draw"))
+                        .collect();
+                    step.commit_window(&Commit {
+                        committed_rows: base_tokens(&base) + drawn,
+                        kept_rows: drawn,
+                        discarded_rows: inputs.len() - drawn,
+                        state_slot: drawn - 1,
                     })
-                    .collect();
-                assert_eq!(
-                    from_device, from_host,
-                    "top_k {top_k} seed {seed} drawn {drawn}"
-                );
-                assert_eq!(
-                    device.rng_state(),
-                    host.rng_state(),
-                    "top_k {top_k} seed {seed} drawn {drawn}: the generator"
-                );
+                    .expect("the verdict");
+                    step.restore(&base).expect("restore");
+                    let mut host = seeded_keeping(top_k, seed);
+                    let from_host: Vec<u32> = (0..drawn)
+                        .map(|row| {
+                            sample_logits("host", &rows[row], &mut host, SAMPLER_VOCAB)
+                                .expect("a host draw")
+                        })
+                        .collect();
+                    let which = format!("{window_rows} rows, top_k {top_k} seed {seed} drawn {drawn}");
+                    assert_eq!(from_device, from_host, "{which}");
+                    assert_eq!(device.rng_state(), host.rng_state(), "{which}: the generator");
+                }
             }
         }
     }
