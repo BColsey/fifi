@@ -66,10 +66,8 @@ impl Rig {
                 },
             )
             .expect("K-row shortlist");
-        testkit::read_bytes(&self.ctx, &out, m * RESULT_BYTES)
-            .chunks_exact(RESULT_BYTES)
-            .map(|record| record.try_into().expect("a record"))
-            .collect()
+        let bytes = testkit::read_bytes(&self.ctx, &out, m * RESULT_BYTES);
+        bytes.as_chunks::<RESULT_BYTES>().0.to_vec()
     }
 }
 

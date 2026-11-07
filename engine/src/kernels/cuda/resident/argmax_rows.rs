@@ -178,9 +178,9 @@ impl WindowReport {
         let verify = window_result_bytes(m);
         let shortlists: Vec<[u8; SHORTLIST_RECORD_BYTES]> = if shortlist {
             bytes[window_shortlist_offset(m)..]
-                .chunks_exact(SHORTLIST_RECORD_BYTES)
-                .map(|record| record.try_into().expect("a record"))
-                .collect()
+                .as_chunks::<SHORTLIST_RECORD_BYTES>()
+                .0
+                .to_vec()
         } else {
             Vec::new()
         };
