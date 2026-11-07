@@ -7,11 +7,12 @@
 //! a design argument, not a measurement. The checks themselves are the host-tested functions of
 //! `speculate::d1_oracle`, which are shown on a fake model to pass a sound model and to fail
 //! each flawed one. A pass here would qualify the eager window on this pack, KV mode and capture
-//! mode only, at the row counts and prefixes that ran; it says nothing about the K-row paths that
-//! do not exist yet, and nothing about 8-row windows in general (8 is a cap, not a qualification).
+//! mode only, at the row counts and prefixes that ran, and nothing about 8-row windows in general
+//! (8 is a cap, not a qualification). With `FIFI_D1_VERIFY=krow` (and `FIFI_D1_ROLLBACK=device`)
+//! the same checks run the K-row window instead; that path is equally unrun, and the checks K and
+//! H below exist for it only.
 //!
-//! Letters follow the D1 invariance design of the acceptance study (test B, per-layer taps,
-//! is not covered):
+//! Letters follow the D1 invariance design of the acceptance study:
 //!
 //! | test | what | function |
 //! |---|---|---|
@@ -20,7 +21,17 @@
 //! | D | for every accepted prefix `a`: state, tokens, pending, generator, next logits | `d1_d_accepted_prefix_commit_and_rollback` |
 //! | E | greedy draws on rows and on the near-tie fixture | `d1_e_ties`, `d1_e_near_tie_fixture` |
 //! | F | an injected fault leaves the pre-window state or a refusing model | `d1_f_failure_recovery` |
-//! | all | A, C, D, E and F in one process, one pack load | `d1_all_checks` |
+//! | G | repeated rollback cycles | `d1_g_repeated_rollbacks` |
+//! | K | the K-row window against the eager device window: rows, every armed slot, committed state, next step | `d1_k_krow_against_eager` |
+//! | H | which path ran, from counters that observe the enqueue (printed as `D1_KROW_LAUNCHES`) | the end of every check |
+//! | B | the residual after every mixer and MoE block, K-row window against the one-row steps | `d1_b_per_layer_taps` |
+//! | all | A, C, D, E, F and G in one process, one pack load | `d1_all_checks` |
+//!
+//! The K-row window has further tests beside them: the row-local status bits over 100 windows, the
+//! rows before a corrupt hidden state, a short window after a long one on the same result table,
+//! an out-of-vocabulary id, the load line, the arming refusal of a set switch, and the deliberate
+//! break (`FIFI_KROW_BREAK=ids`, which check A must catch). Check B reads the device inside the
+//! body and needs `FIFI_D1_CAPTURE=0`; the others run at either setting.
 //!
 //! State compared in D and F is the whole `ExportedState`: the recurrent state and the
 //! convolution state of every DeltaNet layer, the KV planes of every attention layer for the
@@ -32,7 +43,9 @@
 //! lengths, default 600; use 255,256,257 and 4095,4096,4097 for page and chunk boundaries with
 //! `FIFI_D1_CONTEXT` raised), `FIFI_D1_KV` (`fp16`, the current CUDA default, or `int8g32`),
 //! `FIFI_D1_CAPTURE` (`1`, the serving default for an EXL3 entry, or `0` for the eager body),
-//! `FIFI_D1_NEAR_TIE_FIXTURE` (the fixture JSON, for `d1_e_near_tie_fixture`).
+//! `FIFI_D1_ROLLBACK` (`host` or `device`), `FIFI_D1_VERIFY` (`eager` or `krow`),
+//! `FIFI_D1_KROW_ROWS` (the window lengths of check K), `FIFI_KROW_BREAK` (`ids`, the break
+//! control), `FIFI_D1_NEAR_TIE_FIXTURE` (the fixture JSON, for `d1_e_near_tie_fixture`).
 //!
 //! Two behaviours the checks meet, stated so a failure is read correctly:
 //!
