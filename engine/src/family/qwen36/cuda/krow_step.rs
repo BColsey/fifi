@@ -49,7 +49,7 @@ use crate::{
     family::{
         project::cuda::{WeightLayout, exl3::Exl3Io},
         qwen36::{
-            krow::{RowStatus, RowsFacts, check_rows, rows_verdict},
+            krow::{self, ConfigFacts, RowStatus, RowsFacts, check_rows, rows_verdict},
             window_logic::{RowsFailure, RowsOut},
         },
     },
@@ -201,28 +201,17 @@ impl<'a> QwenResidentStep<'a> {
         Ok(())
     }
 
-    /// The configuration the K-row body is built for.
+    /// The configuration the K-row body is built for (`krow::check_krow_configuration`).
     fn check_krow_configuration(&self) -> Result<(), EngError> {
-        if self.state.layout().kv.mode != super::KvMode::Fp16 {
-            return Err(refuse(
-                "runs the fp16 KV cache; the int8 cache is not built",
-            ));
-        }
-        if self.tiered_mode
-            || self.sync_each
-            || self.forked_experts
-            || self.layout != WeightLayout::Exl3
-        {
-            return Err(refuse(
-                "needs the plain EXL3 step: not tiered, not in per-op synchronization, no forked experts",
-            ));
-        }
-        if !matches!(self.globals.embed, EmbedWeight::Bf16(_))
-            || !matches!(self.globals.head, HeadWeight::Exl3(_))
-        {
-            return Err(refuse("needs the bf16 embedding table and the EXL3 head"));
-        }
-        Ok(())
+        krow::check_krow_configuration(ConfigFacts {
+            fp16_kv: self.state.layout().kv.mode == super::KvMode::Fp16,
+            plain_step: !(self.tiered_mode
+                || self.sync_each
+                || self.forked_experts
+                || self.layout != WeightLayout::Exl3),
+            bf16_embedding: matches!(self.globals.embed, EmbedWeight::Bf16(_)),
+            exl3_head: matches!(self.globals.head, HeadWeight::Exl3(_)),
+        })
     }
 
     /// Whether a window of `rows` rows runs the K-row body: armed, and a K-row length. (Test
@@ -235,7 +224,7 @@ impl<'a> QwenResidentStep<'a> {
         if runtime.test.path_off {
             return false;
         }
-        crate::family::qwen36::krow::uses_krow(rows) && rows <= runtime.rows
+        krow::uses_krow(rows) && rows <= runtime.rows
     }
 
     fn krow_runtime(&self) -> Result<&KrowRuntime, EngError> {

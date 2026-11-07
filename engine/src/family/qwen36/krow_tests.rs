@@ -323,3 +323,50 @@ fn a_host_that_reads_more_rows_than_the_window_ran_sees_stale_bits() {
     // sit, and the old bit 2 of row 6.
     assert_eq!(words[2 * 6 + 1], 2);
 }
+
+fn config() -> ConfigFacts {
+    ConfigFacts {
+        fp16_kv: true,
+        plain_step: true,
+        bf16_embedding: true,
+        exl3_head: true,
+    }
+}
+
+#[test]
+fn the_one_configuration_the_body_is_written_for_arms_and_each_departure_is_refused_by_name() {
+    check_krow_configuration(config()).expect("the plain EXL3 step on the fp16 cache");
+    for (facts, needle) in [
+        (
+            ConfigFacts {
+                fp16_kv: false,
+                ..config()
+            },
+            "fp16 KV",
+        ),
+        (
+            ConfigFacts {
+                plain_step: false,
+                ..config()
+            },
+            "plain EXL3 step",
+        ),
+        (
+            ConfigFacts {
+                bf16_embedding: false,
+                ..config()
+            },
+            "bf16 embedding",
+        ),
+        (
+            ConfigFacts {
+                exl3_head: false,
+                ..config()
+            },
+            "EXL3 head",
+        ),
+    ] {
+        let text = message(check_krow_configuration(facts));
+        assert!(text.contains(needle), "{facts:?}: {text}");
+    }
+}

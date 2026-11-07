@@ -109,6 +109,38 @@ pub(crate) fn check_krow_env(
     check_krow_switches(single_gather, shared_in_routed)
 }
 
+/// What the step knows of its own build beyond [`KrowFacts`]: the K-row body is written for one
+/// configuration only.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConfigFacts {
+    /// The KV is the fp16 plane (the int8 cache has no K-row attention path yet).
+    pub(crate) fp16_kv: bool,
+    /// The step is neither tiered, nor in the per-op synchronization mode, nor forked.
+    pub(crate) plain_step: bool,
+    /// The embedding is the pack's bf16 table.
+    pub(crate) bf16_embedding: bool,
+    /// The head is an EXL3 matrix.
+    pub(crate) exl3_head: bool,
+}
+
+/// The refusals of the build the K-row body does not cover, in the order the step reports them.
+pub(crate) fn check_krow_configuration(facts: ConfigFacts) -> Result<(), EngError> {
+    if !facts.fp16_kv {
+        return Err(refuse(
+            "runs the fp16 KV cache; the int8 cache is not built",
+        ));
+    }
+    if !facts.plain_step {
+        return Err(refuse(
+            "needs the plain EXL3 step: not tiered, not in per-op synchronization, no forked experts",
+        ));
+    }
+    if !facts.bf16_embedding || !facts.exl3_head {
+        return Err(refuse("needs the bf16 embedding table and the EXL3 head"));
+    }
+    Ok(())
+}
+
 /// Whether a window of `rows` rows runs as a K-row window when `draft_verify` is `krow`. A one-row
 /// window is the single-row step, which has its own captured graph, and runs the eager loop.
 pub(crate) fn uses_krow(rows: usize) -> bool {
