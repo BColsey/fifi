@@ -14,10 +14,6 @@
 //! - The C argument struct is a live local that the entry reads only during the call. Its `repr(C)`
 //!   mirror is private here and pinned by a `const` assert to the `static_assert` of `pack_rows.h`.
 //!   No raw pointer and no unsafe function leaves this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 
 use std::ffi::{c_int, c_void};
 use std::mem::{offset_of, size_of};

@@ -347,6 +347,10 @@ pub(crate) struct QwenResidentStep<'a> {
     /// covers the state buffers by drop order -- they live inside the step and never move
     /// after they are built, so the pin list need not name them.
     graph: Option<GraphExec<'a>>,
+    /// The K-row verify window (`draft_verify = krow`), once armed. Declared right after `graph`
+    /// and before the state: a captured K-row body bakes in the addresses of its small buffer, so
+    /// any graph of it must drop first.
+    krow: Option<krow_step::KrowRuntime>,
     #[cfg(feature = "research-activation")]
     activation: std::cell::RefCell<Option<crate::family::qwen36::activation::Capture>>,
     /// The section-timing marks: `None` unless the capture config asked for them. Declared after
@@ -717,6 +721,7 @@ impl<'a> QwenResidentStep<'a> {
         let step = Self {
             pins,
             graph: None,
+            krow: None,
             #[cfg(feature = "research-activation")]
             activation: std::cell::RefCell::new(None),
             context,
@@ -940,7 +945,7 @@ impl<'a> QwenResidentStep<'a> {
         }
         let mut admit = AdmitFacts {
             budget: budget.device_free,
-            decode_arena: self.res.arena.bytes(),
+            decode_arena: self.res.arena.bytes() + self.res.krow_arena_bytes(),
             state_planned: state_bytes(
                 &self.res.dims,
                 layout.kv.mode,
@@ -2280,6 +2285,12 @@ mod shortlist_bench;
 
 #[path = "prefix_runtime.rs"]
 mod prefix_runtime;
+
+#[path = "krow_step.rs"]
+mod krow_step;
+
+#[cfg(test)]
+pub(super) use krow_step::Injection;
 
 #[path = "rollback_runtime.rs"]
 mod rollback_runtime;

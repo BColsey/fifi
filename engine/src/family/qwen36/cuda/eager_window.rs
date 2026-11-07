@@ -40,7 +40,9 @@ use crate::family::speculate::d1_oracle::Fault;
 use crate::{
     EngError,
     family::{
-        qwen36::window_logic::{self, Window, WindowHost, no_window},
+        qwen36::window_logic::{
+            self, RowsFailure, RowsOut, Window, WindowHost, eager_rows, no_window,
+        },
         sampler::Sampler,
         session::{TokenStepper, sample_logits},
         speculate::{driver::WindowModel, window::Commit},
@@ -70,7 +72,7 @@ impl QwenResidentStep<'_> {
 
     /// Fires the armed fault when it is `at`: poisons the state the way a failed step does (the
     /// state then refuses every step and snapshot until a reset or an import) and fails.
-    fn fault_at(&mut self, at: Fault) -> Result<(), EngError> {
+    pub(super) fn fault_at(&mut self, at: Fault) -> Result<(), EngError> {
         if self.window_fault != Some(at) {
             return Ok(());
         }
@@ -93,7 +95,7 @@ impl QwenResidentStep<'_> {
     /// Fires the armed fault when it is `at`, as a refusal before any device work: it fails and
     /// leaves the state as it is (valid), the way `check_import`, `resident_kv`, a pending save
     /// that cannot finish, or a row refused before launch (`cancel_enqueue`) do.
-    fn refusal_at(&mut self, at: Fault) -> Result<(), EngError> {
+    pub(super) fn refusal_at(&mut self, at: Fault) -> Result<(), EngError> {
         if self.window_fault != Some(at) {
             return Ok(());
         }
@@ -327,6 +329,15 @@ impl WindowHost for QwenResidentStep<'_> {
             self.drain_stream()?;
         }
         Ok(())
+    }
+
+    /// A K-row window (`draft_verify = krow`, armed) runs the K-row body; every other window runs
+    /// the eager loop, the default of the trait.
+    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Vec<f32>>, RowsFailure> {
+        if self.krow_runs(inputs.len()) {
+            return self.run_krow_window(inputs);
+        }
+        eager_rows(self, inputs).map_err(RowsFailure::StateDecides)
     }
 
     fn rollback_discard(&mut self) {

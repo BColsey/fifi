@@ -48,7 +48,7 @@
 //! The stop tokens are not set in the driver-level check (D), so a stop id among the reference
 //! draws cannot cut a scripted window; stops have their own tests.
 
-use std::path::Path;
+use std::{cell::RefCell, path::Path, rc::Rc};
 
 use super::{
     common_tests::{dims, inventory},
@@ -65,7 +65,10 @@ use crate::{
         project::cuda::{CudaProjector, CudaWeights, Reserve, WeightLayout},
         qwen36::{
             rollback::Cover,
-            settings::{QWEN36_MAX_WINDOW_ROWS, RollbackMode, rollback_mode_name},
+            settings::{
+                QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, rollback_mode_name,
+                verify_mode_name,
+            },
         },
         sampler::{Sampler, SamplingParams},
         session::{DecodeSession, Limits, TokenStepper},
@@ -73,8 +76,9 @@ use crate::{
             d1_oracle::{
                 D1Subject, Fault, Setup, Tally, Verdict, accepted_prefix, describe_pass,
                 failure_recovery, first_bit_difference, first_byte_difference, full_logits,
-                host_faults_for, host_greedy, later_rows_isolated, near_tie, repeated_rollbacks,
-                slot_faults_for, ties_break_low,
+                host_faults_for, host_greedy, krow_faults_for, krow_matches_eager,
+                later_rows_isolated, near_tie, repeated_rollbacks, slot_faults_for,
+                ties_break_low,
             },
             driver::WindowModel,
             window::Commit,
@@ -130,6 +134,16 @@ pub(super) fn rollback_from_env() -> RollbackMode {
     }
 }
 
+/// `FIFI_D1_VERIFY`: `eager` (the default: the eager window) or `krow` (the K-row window, which
+/// needs `FIFI_D1_ROLLBACK=device`).
+pub(super) fn verify_from_env() -> VerifyMode {
+    match std::env::var("FIFI_D1_VERIFY").as_deref() {
+        Ok("krow") => VerifyMode::Krow,
+        Ok("eager") | Err(_) => VerifyMode::Eager,
+        Ok(other) => panic!("FIFI_D1_VERIFY must be eager or krow, got {other:?}"),
+    }
+}
+
 /// Arms the device rollback on a freshly built step (windows of up to the 8-row cap), as the
 /// served start does for `draft_rollback = device`. A test rig runs no prefill admission, so the
 /// slots are not charged to one.
@@ -139,6 +153,18 @@ pub(super) fn arm_rollback(step: &mut QwenResidentStep<'_>, mode: RollbackMode) 
         step.enable_device_rollback(QWEN36_MAX_WINDOW_ROWS, Cover::Arena, 0)
             .expect("device rollback slots");
     }
+}
+
+/// Arms the K-row window on a step whose resources hold the K-row arena and whose device rollback
+/// is armed, as the served start does for `draft_verify = krow`. The arming's own refusals are
+/// the start's: `Err` when a refused switch is set.
+pub(super) fn arm_verify(step: &mut QwenResidentStep<'_>, verify: VerifyMode) -> Result<(), EngError> {
+    if verify == VerifyMode::Krow {
+        step.request_krow_verify();
+        step.check_krow_arming(QWEN36_MAX_WINDOW_ROWS)?;
+        step.enable_krow()?;
+    }
+    Ok(())
 }
 
 /// The pack on the device: loaded once, leaked for the process.
@@ -209,12 +235,22 @@ pub(super) fn build_step(
     opts: &StepOptions,
     config: CaptureConfig,
 ) -> Result<QwenResidentStep<'static>, EngError> {
-    let res: &'static StepResources = Box::leak(Box::new(StepResources::new(
-        loaded.projector.context(),
-        dims(),
-        &inventory(),
-        opts,
-    )?));
+    build_step_for(loaded, opts, config, VerifyMode::Eager)
+}
+
+/// [`build_step`] with the K-row arena added to the resources when `verify` is `Krow`. The step
+/// still has to be armed (`arm_rollback`, then `arm_verify`).
+pub(super) fn build_step_for(
+    loaded: &Loaded,
+    opts: &StepOptions,
+    config: CaptureConfig,
+    verify: VerifyMode,
+) -> Result<QwenResidentStep<'static>, EngError> {
+    let mut resources = StepResources::new(loaded.projector.context(), dims(), &inventory(), opts)?;
+    if verify == VerifyMode::Krow {
+        resources = resources.with_krow(loaded.projector.context(), opts)?;
+    }
+    let res: &'static StepResources = Box::leak(Box::new(resources));
     let mut step = QwenResidentStep::new(
         loaded.projector.context(),
         res,
@@ -317,8 +353,14 @@ impl D1Subject for QwenResidentStep<'_> {
         self.window_fault = Some(fault);
     }
 
+    fn window_slots(&self) -> Option<Vec<Vec<u32>>> {
+        self.rollback_slot_words().ok()
+    }
+
     fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
-        if self.device_rollback_wanted() {
+        if self.krow_runs(rows) {
+            krow_faults_for(self.tokens(), rows)
+        } else if self.device_rollback_wanted() {
             slot_faults_for(self.tokens(), rows)
         } else {
             host_faults_for(self.tokens(), rows)
@@ -334,6 +376,8 @@ struct Rig {
     prefixes: Vec<usize>,
     /// The single-row kernel the context reports; the launch counts must show it.
     kernel: &'static str,
+    /// How the windows of the step run: the eager window or the K-row window.
+    verify: VerifyMode,
 }
 
 fn prefix_rows_from_env() -> Vec<usize> {
@@ -356,23 +400,31 @@ fn rig() -> Rig {
     let capture = capture_from_env();
     let loaded = load_pack();
     let rollback = rollback_from_env();
+    let verify = verify_from_env();
+    assert!(
+        verify == VerifyMode::Eager || rollback == RollbackMode::Device,
+        "FIFI_D1_VERIFY=krow needs FIFI_D1_ROLLBACK=device"
+    );
     println!(
         "D1_CONFIG kv={kv:?} capture={capture} context={context} prefixes={prefixes:?} \
-         single_row_kernel={} rollback={}",
+         single_row_kernel={} rollback={} verify={}",
         loaded.kernel,
-        rollback_mode_name(rollback)
+        rollback_mode_name(rollback),
+        verify_mode_name(verify)
     );
-    let step = build_step(
+    let step = build_step_for(
         &loaded,
         &step_options(kv, context),
         CaptureConfig {
             capture,
             section_marks: false,
         },
+        verify,
     )
     .expect("step");
     let mut step = step;
     arm_rollback(&mut step, rollback);
+    arm_verify(&mut step, verify).unwrap_or_else(|error| panic!("{error}"));
     Rig {
         step,
         tokenizer,
@@ -380,6 +432,7 @@ fn rig() -> Rig {
         context,
         prefixes,
         kernel: loaded.kernel,
+        verify,
     }
 }
 
@@ -435,6 +488,62 @@ fn assert_kernel_ran(step: &QwenResidentStep<'_>, kernel: &str, phase: &str) {
     require_kernel_ran(&counts, kernel).unwrap_or_else(|error| panic!("{phase}: {error}"));
 }
 
+/// Check H: which window path the counters say ran. The eager run shows every K-row counter at
+/// zero. The K-row run shows one `argmax_rows` and one `window_status_fold` per window it counted,
+/// at least one pack, snapshot and strided-router launch per window, and no window that fell back
+/// to the eager loop would be counted in `krow_windows`. Only the counters that observe the real
+/// enqueue count here; the projection counters echo the dispatch table and are printed for the
+/// record, not relied on.
+pub(super) fn require_krow_enqueued(
+    counts: &crate::kernels::row_launches::RowLaunches,
+    windows: u64,
+) -> Result<(), String> {
+    if windows == 0 {
+        return Err("no K-row window ran".to_owned());
+    }
+    for (name, count) in [
+        ("argmax_rows", counts.argmax_rows),
+        ("status_fold", counts.status_fold),
+    ] {
+        if count != windows {
+            return Err(format!(
+                "{name} ran {count} times in {windows} K-row windows ({})",
+                counts.describe()
+            ));
+        }
+    }
+    for (name, count) in [
+        ("pack_rows", counts.pack_rows),
+        ("conv_snap", counts.conv_snap),
+        ("delta_snap", counts.delta_snap),
+        ("router_strided", counts.router_strided),
+    ] {
+        if count < windows {
+            return Err(format!(
+                "{name} ran {count} times in {windows} K-row windows ({})",
+                counts.describe()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_path_counters(step: &QwenResidentStep<'_>, verify: VerifyMode, phase: &str) {
+    let counts = step.row_launches();
+    let windows = step.krow_windows();
+    println!(
+        "D1_KROW_LAUNCHES phase={phase} verify={} krow_windows={windows} {}",
+        verify_mode_name(verify),
+        counts.describe()
+    );
+    let verdict = match verify {
+        VerifyMode::Eager if windows != 0 => Err(format!("{windows} K-row windows in an eager run")),
+        VerifyMode::Eager => counts.require_krow_idle(),
+        VerifyMode::Krow => require_krow_enqueued(&counts, windows),
+    };
+    verdict.unwrap_or_else(|error| panic!("{phase}: {error}"));
+}
+
 /// Which checks a test runs.
 #[derive(Clone, Copy)]
 struct Which {
@@ -470,6 +579,7 @@ impl Which {
 /// prefill built, the later ones from a copy of it that was imported back.
 fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
     let kernel = rig.kernel;
+    let verify = rig.verify;
     let Rig {
         step,
         tokenizer,
@@ -545,6 +655,7 @@ fn check_prefix(rig: &mut Rig, prefix: usize, which: Which) {
         }
     }
     assert_kernel_ran(step, kernel, "window and reference");
+    assert_path_counters(step, verify, "windows");
 }
 
 fn check_prefixes(rig: &mut Rig, which: Which) {
@@ -829,4 +940,320 @@ fn d1_negative_control_the_shuffle_kernel_is_rejected() {
         counts.describe()
     );
     assert_eq!(counts.wide1, 0, "{}", counts.describe());
+}
+
+/// One path of one step: the K-row window or the eager device window on the same weights and the
+/// same device state. The two arms share the step, so check K compares the paths on one set of
+/// weights (a second copy of the pack would not fit the card). Every call selects the arm first.
+struct Arm {
+    step: Rc<RefCell<QwenResidentStep<'static>>>,
+    krow: bool,
+}
+
+impl Arm {
+    fn with<T>(&self, f: impl FnOnce(&mut QwenResidentStep<'static>) -> T) -> T {
+        let mut step = self.step.borrow_mut();
+        step.use_krow(self.krow);
+        f(&mut step)
+    }
+}
+
+impl TokenStepper for Arm {
+    const OPERATION: &'static str = QwenResidentStep::OPERATION;
+
+    fn feed(&mut self, token: u32) -> Result<(), EngError> {
+        self.with(|step| step.feed(token))
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+        self.with(|step| step.logits(token))
+    }
+
+    fn fed(&self) -> usize {
+        self.with(|step| step.fed())
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        self.with(|step| step.reset())
+    }
+}
+
+impl WindowModel for Arm {
+    fn run_window(&mut self, inputs: &[u32]) -> Result<(), EngError> {
+        self.with(|step| step.run_window(inputs))
+    }
+
+    fn draw(
+        &mut self,
+        row: usize,
+        sampler: &mut Sampler,
+        sampler_vocab: usize,
+    ) -> Result<u32, EngError> {
+        self.with(|step| step.draw(row, sampler, sampler_vocab))
+    }
+
+    fn commit_window(&mut self, commit: &Commit) -> Result<(), EngError> {
+        self.with(|step| step.commit_window(commit))
+    }
+}
+
+impl D1Subject for Arm {
+    type State = ExportedState;
+
+    fn snapshot(&mut self) -> Result<ExportedState, EngError> {
+        self.with(|step| step.snapshot())
+    }
+
+    fn restore(&mut self, state: &ExportedState) -> Result<(), EngError> {
+        self.with(|step| step.restore(state))
+    }
+
+    fn state_difference(&self, left: &ExportedState, right: &ExportedState) -> Option<String> {
+        exported_difference(left, right)
+    }
+
+    fn window_rows(&self) -> Result<Vec<Vec<f32>>, EngError> {
+        self.with(|step| step.window_rows())
+    }
+
+    fn window_slots(&self) -> Option<Vec<Vec<u32>>> {
+        self.with(|step| step.window_slots())
+    }
+
+    fn inject_fault(&mut self, fault: Fault) {
+        self.with(|step| step.inject_fault(fault));
+    }
+
+    fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
+        self.with(|step| step.fault_plan(rows))
+    }
+
+    fn models_recovery_gate(&self) -> bool {
+        true
+    }
+
+    fn import_without_reset(&mut self, state: &ExportedState) -> Option<Result<(), EngError>> {
+        self.with(|step| step.import_without_reset(state))
+    }
+}
+
+/// `FIFI_D1_KROW_ROWS`: the window lengths check K runs (comma separated, default 2,3,4,8).
+fn krow_rows_from_env() -> Vec<usize> {
+    std::env::var("FIFI_D1_KROW_ROWS")
+        .unwrap_or_else(|_| "2,3,4,8".to_owned())
+        .split(',')
+        .map(|part| part.trim().parse().expect("a window length"))
+        .collect()
+}
+
+/// Check K: the K-row window against the eager device window on the same prefix and inputs, every
+/// logits row, every armed slot and, after each verdict, the committed state and the next step,
+/// bit for bit. Needs `FIFI_D1_VERIFY=krow` and `FIFI_D1_ROLLBACK=device`.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_k_krow_against_eager() {
+    super::krow_device_tests::refuse_switches().unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        verify_from_env(),
+        VerifyMode::Krow,
+        "check K needs FIFI_D1_VERIFY=krow"
+    );
+    let Rig {
+        step,
+        stream,
+        context,
+        prefixes,
+        kernel,
+        verify,
+        ..
+    } = rig();
+    let mut step = step;
+    for prefix in prefixes {
+        let _session = prefilled(&mut step, &stream[..prefix], context);
+        assert_kernel_ran(&step, kernel, "reference");
+        let base_rows = step.tokens();
+        let shared = Rc::new(RefCell::new(step));
+        let mut krow = Arm {
+            step: Rc::clone(&shared),
+            krow: true,
+        };
+        let mut eager = Arm {
+            step: Rc::clone(&shared),
+            krow: false,
+        };
+        for rows in krow_rows_from_env() {
+            let inputs = window_inputs(&stream, prefix, rows);
+            let verdict = krow_matches_eager(&mut krow, &mut eager, &inputs, base_rows);
+            report("K", &format!("prefix={prefix} rows={rows}"), verdict);
+        }
+        drop((krow, eager));
+        step = Rc::try_unwrap(shared)
+            .unwrap_or_else(|_| panic!("the arms were dropped"))
+            .into_inner();
+        assert_path_counters(&step, verify, "check K");
+    }
+}
+
+/// A K-row window of `rows` rows with `injection` made non-finite inside its body. The window must
+/// fail closed; returns the table the host read.
+fn failed_window_table(
+    step: &mut QwenResidentStep<'static>,
+    inputs: &[u32],
+    injection: super::step::Injection,
+) -> crate::kernels::cuda::resident::argmax_rows::WindowResult {
+    step.inject_krow(injection);
+    step.run_window(inputs)
+        .expect_err("a non-finite value must fail the window closed");
+    step.last_krow_table().expect("the table was read")
+}
+
+/// Needs a prefilled K-row step; returns it with its session, the pre-window state and the inputs.
+fn krow_rig(rows: usize) -> (Rig, DecodeSession, ExportedState, Vec<u32>) {
+    super::krow_device_tests::refuse_switches().unwrap_or_else(|error| panic!("{error}"));
+    let mut rig = rig();
+    assert_eq!(rig.verify, VerifyMode::Krow, "needs FIFI_D1_VERIFY=krow");
+    let prefix = rig.prefixes[0];
+    let session = prefilled(&mut rig.step, &rig.stream[..prefix], rig.context);
+    let base = rig.step.snapshot().expect("snapshot");
+    let inputs = window_inputs(&rig.stream, prefix, rows);
+    (rig, session, base, inputs)
+}
+
+/// The row-local status rule on the device: a non-finite value made in logits row `j` alone
+/// shows in pair `j` and nowhere else, the window word carries it, and the window fails closed.
+/// A pair that stored the return value of an `atomicOr` on a shared word would show the bit in
+/// rows after `j` in some of the 100 windows.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_only_the_bad_row_reports_its_bit_over_100_windows() {
+    let (mut rig, _session, base, inputs) = krow_rig(8);
+    for j in [0, 3, 7] {
+        for window in 0..100 {
+            let table = failed_window_table(
+                &mut rig.step,
+                &inputs,
+                super::step::Injection::LogitsNan(j),
+            );
+            for (row, bits) in table.bits.iter().enumerate() {
+                assert_eq!(
+                    *bits,
+                    if row == j { 2 } else { 0 },
+                    "window {window} bad row {j}: pair {row}"
+                );
+            }
+            assert_eq!(table.window & 2, 2, "window {window} bad row {j}: window word");
+            rig.step.restore(&base).expect("restore");
+        }
+    }
+    println!("D1_RESULT test=K-status krow_row_local_bits PASS windows=300");
+}
+
+/// The causal spread: a value made non-finite in the embedding of row `j` reaches the rows after
+/// `j` through the cache and the DeltaNet state, never the rows before it.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_a_corrupt_hidden_state_spreads_to_later_rows_only() {
+    let (mut rig, _session, base, inputs) = krow_rig(4);
+    for j in 0..4 {
+        let table = failed_window_table(
+            &mut rig.step,
+            &inputs,
+            super::step::Injection::HiddenNan(j),
+        );
+        for (row, bits) in table.bits.iter().enumerate() {
+            assert_eq!(
+                *bits != 0,
+                row >= j,
+                "bad row {j}: pair {row} has bits {bits:#x}"
+            );
+        }
+        assert_eq!(table.window & 2, 2, "bad row {j}: window word");
+        rig.step.restore(&base).expect("restore");
+    }
+}
+
+/// A window after a failed one on the same result table: a clean 3-row window after an 8-row
+/// window that left a bad pair and a window word reads none of the old bits, and after a clean
+/// 8-row window a 3-row window agrees with the one-row steps.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_a_short_window_after_a_long_one_reads_no_stale_status() {
+    let (mut rig, _session, base, inputs) = krow_rig(8);
+    let table = failed_window_table(
+        &mut rig.step,
+        &inputs,
+        super::step::Injection::LogitsNan(6),
+    );
+    assert_eq!(table.bits[6], 2);
+    rig.step.restore(&base).expect("restore");
+    let step = &mut rig.step;
+    report("A", "long then short, after a failed window", {
+        let short = &inputs[..3];
+        full_logits(step, short)
+    });
+    report("A", "8 rows, clean", full_logits(step, &inputs));
+    report("A", "3 rows, after 8", full_logits(step, &inputs[..3]));
+    let clean = step.last_krow_table().expect("table");
+    assert_eq!(clean.window, 0);
+    assert!(clean.bits.iter().all(|bits| *bits == 0));
+}
+
+/// The step reports the reference shared-expert block on a K-row step: the merged block is not
+/// built (or was taken off by `request_krow_verify`), and the load line says so.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_the_step_runs_the_reference_shared_expert_block() {
+    let (rig, _session, _base, _inputs) = krow_rig(2);
+    let suffix = rig.step.shared_in_routed_suffix();
+    println!("D1_KROW_LOAD_SUFFIX {suffix:?}");
+    assert!(
+        suffix.is_empty() || suffix.contains("exl3_shared_in_routed=off source=krow"),
+        "a K-row step must not run the merged block: {suffix:?}"
+    );
+}
+
+/// The refusal of a kernel switch at arming: with a refused switch set, arming fails and no K-row
+/// window can run. Run once per value of the matrix with the variable set.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_arming_refuses_a_set_single_row_switch() {
+    assert!(
+        std::env::var_os(SINGLE_GATHER_VAR).is_some(),
+        "set {SINGLE_GATHER_VAR} to one of off, 1, wide1, wide2, wide4 for this control"
+    );
+    let loaded = load_pack();
+    let mut step = build_step_for(
+        &loaded,
+        &step_options(kv_mode_from_env(), DEFAULT_CONTEXT),
+        CaptureConfig {
+            capture: capture_from_env(),
+            section_marks: false,
+        },
+        VerifyMode::Krow,
+    )
+    .expect("step");
+    arm_rollback(&mut step, RollbackMode::Device);
+    let error = arm_verify(&mut step, VerifyMode::Krow).expect_err("arming must be refused");
+    let text = format!("{error:?}");
+    assert!(text.contains("unset it"), "{text}");
+    assert_eq!(step.krow_windows(), 0);
+    println!("D1_RESULT test=K-switch {SINGLE_GATHER_VAR} refused: {text}");
+}
+
+/// The deliberate-break control: run with `FIFI_KROW_BREAK=ids`, which changes row 1's token on
+/// the device after the host wrote the window ids, inside the K-row path only. Check A must FAIL.
+/// A pass of this test shows that the K-row path is the one feeding the checks.
+#[test]
+#[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
+fn d1_krow_a_deliberately_broken_window_is_caught_by_check_a() {
+    assert_eq!(
+        std::env::var("FIFI_KROW_BREAK").as_deref(),
+        Ok("ids"),
+        "set FIFI_KROW_BREAK=ids for this control"
+    );
+    let (mut rig, _session, _base, inputs) = krow_rig(4);
+    let failure = full_logits(&mut rig.step, &inputs)
+        .expect_err("a window with a changed token must differ from the one-row steps");
+    println!("D1_RESULT test=K-break caught: {failure}");
+    assert!(failure.violation, "{failure}");
 }

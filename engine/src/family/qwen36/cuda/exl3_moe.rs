@@ -1,4 +1,6 @@
-//! The MoE block of ONE layer of the EXL3 step at ONE token (`m = 1`).
+//! The MoE block of ONE layer of the EXL3 step at ONE token (`m = 1`), and the block of a K-row
+//! verify window ([`run_exl3_moe_rows`]), which is the same block run once per row where the rows
+//! cannot share a launch.
 //!
 //! The router writes the ids, the pick weights and the shared gate on the device, as in the GGUF
 //! block. The block has two ways to turn the ids into launches. Built without graph capture it
@@ -161,10 +163,6 @@ fn row<'b>(
 }
 
 /// The first `bytes` bytes of `range`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 fn leading<'b>(range: &DeviceRange<'b>, bytes: usize) -> Result<DeviceRange<'b>, EngError> {
     range.buffer().range(range.offset(), bytes)
 }
@@ -437,10 +435,6 @@ pub(super) fn shared(
 }
 
 /// The three matrices of the shared expert.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 pub(in crate::family) struct SharedWeights<'w> {
     pub(in crate::family) gate: &'w Exl3Weight,
     pub(in crate::family) up: &'w Exl3Weight,
@@ -450,10 +444,6 @@ pub(in crate::family) struct SharedWeights<'w> {
 /// The ranges of the shared expert of a `rows`-row window. `norm_row` holds `rows` rows of the
 /// hidden width; `gu` holds `rows` rows of `[gate | up]` (`2 * shared_inter` values each), `act`
 /// `rows` rows of `shared_inter` and `out` `rows` rows of the hidden width.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 pub(in crate::family) struct SharedRowsIo<'b> {
     pub(in crate::family) norm_row: DeviceRange<'b>,
     pub(in crate::family) gu: DeviceRange<'b>,
@@ -474,10 +464,6 @@ pub(in crate::family) struct SharedRowsIo<'b> {
 /// and need `up_off = K s` with `ld_in = s`, which `valid_shape` refuses.
 ///
 /// The one-row block [`shared`] is untouched; the test compares this one to `rows` runs of it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 pub(in crate::family) fn shared_rows(
     launch: &Launch<'_>,
     weights: &SharedWeights<'_>,
@@ -580,5 +566,104 @@ pub(in crate::family) fn run_exl3_moe(
         routed(launch, weights, bufs, (&picks, dims))?;
     }
     shared(launch, weights, bufs, dims)?;
+    combine(launch, bufs, dims)
+}
+
+/// The ranges of row `index` of the K-row buffers, as the one-row block takes them: every
+/// per-row buffer offset by `index` rows. The scratch and the status word are shared (the rows run
+/// in stream order).
+fn row_bufs<'b>(
+    bufs: &Exl3MoeBufs<'b>,
+    dims: &MoeDims,
+    index: usize,
+) -> Result<Exl3MoeBufs<'b>, EngError> {
+    let (h, i, s, k) = (dims.hidden, dims.inter, dims.shared_inter, dims.top_k);
+    let route = &bufs.route;
+    Ok(Exl3MoeBufs {
+        route: RouteBufs {
+            resid_in: row(&route.resid_in, h * F32, index)?,
+            resid_out: row(&route.resid_out, h * F32, index)?,
+            norm_row: row(&route.norm_row, h * F32, index)?,
+            logits: row(&route.logits, (dims.n_expert + 1) * F32, index)?,
+            ids: row(&route.ids, k * I32, index)?,
+            weights: row(&route.weights, k * F32, index)?,
+            shared_gate: row(&route.shared_gate, F32, index)?,
+            status: route.status,
+        },
+        expert_gu: row(&bufs.expert_gu, k * 2 * i * F32, index)?,
+        expert_act: row(&bufs.expert_act, k * i * F32, index)?,
+        expert_down: row(&bufs.expert_down, k * h * F32, index)?,
+        shared_gu: row(&bufs.shared_gu, 2 * s * F32, index)?,
+        shared_act: row(&bufs.shared_act, s * F32, index)?,
+        shared_out: row(&bufs.shared_out, h * F32, index)?,
+        scratch: bufs.scratch,
+    })
+}
+
+/// The block of one layer of a K-row verify window (`dims.rows` rows, 2 to 8) on the one stream.
+/// `bufs` holds the K-row buffers: row `r` of each per-row buffer is at `r` rows from its start.
+///
+/// The router runs once for all rows (the decode kernel at every row count: below 8 rows one
+/// launch, from 8 rows chunks of 4). The routed experts differ per row, so each row runs its own
+/// chain of id-indexed launches on its own ranges, exactly the launches of the one-row block with
+/// other pointers; the results of every row stay in their own buffers until the combine. The
+/// shared expert and the combine take all rows at once. The picks stay on the device, so the block
+/// waits for nothing.
+pub(in crate::family) fn run_exl3_moe_rows(
+    launch: &Launch<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
+    let rows = dims.rows;
+    if !(2..=8).contains(&rows) {
+        return Err(refuse(format!(
+            "the K-row block takes 2 to 8 rows, got {rows}"
+        )));
+    }
+    let route = &bufs.route;
+    launch.ctx.router_rows(
+        launch.stream,
+        RouterCall {
+            shape: RouterShape {
+                m: rows,
+                hidden: dims.hidden,
+                n_expert: dims.n_expert,
+                top_k: dims.top_k,
+            },
+            x: route.norm_row,
+            weights: RouterWeights {
+                w: whole(weights.router)?,
+                w_shared: Some(whole(weights.router_shared)?),
+            },
+            logits: route.logits,
+            out: RouterOut {
+                ids: route.ids,
+                weights: route.weights,
+                shared_gate: Some(route.shared_gate),
+                status: route.status,
+            },
+        },
+    )?;
+    let one = MoeDims { rows: 1, ..*dims };
+    for index in 0..rows {
+        routed_on_device(launch, weights, &row_bufs(bufs, dims, index)?, &one)?;
+    }
+    shared_rows(
+        launch,
+        &SharedWeights {
+            gate: weights.shared_gate,
+            up: weights.shared_up,
+            down: weights.shared_down,
+        },
+        &SharedRowsIo {
+            norm_row: route.norm_row,
+            gu: bufs.shared_gu,
+            act: bufs.shared_act,
+            out: bufs.shared_out,
+            scratch: bufs.scratch,
+        },
+        (dims.hidden, dims.shared_inter, rows),
+    )?;
     combine(launch, bufs, dims)
 }

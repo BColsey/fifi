@@ -71,6 +71,9 @@ mod geometry_tests;
 #[cfg(test)]
 mod krow_alpha_device_tests;
 #[cfg(test)]
+mod krow_device_tests;
+mod krow_ops;
+#[cfg(test)]
 mod krow_step_device_tests;
 #[cfg(test)]
 mod kv8_step_device_tests;

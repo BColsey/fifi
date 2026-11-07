@@ -461,6 +461,13 @@ fn the_step_forwards_every_primitive_of_the_window_host_to_the_right_effect() {
             ("needs_reset", &["self.recovery_gate_set()"]),
             ("set_needs_reset", &["self.set_recovery_gate();"]),
             ("clear_needs_reset", &["self.clear_recovery_gate();"]),
+            (
+                "run_rows",
+                &[
+                    "if self.krow_runs(inputs.len()) { return self.run_krow_window(inputs); }",
+                    "eager_rows(self, inputs).map_err(RowsFailure::StateDecides)",
+                ],
+            ),
             ("poison", &["self.poison_window_state();"]),
             (
                 "drop_pending_prefix",
@@ -688,35 +695,42 @@ fn the_default_of_run_rows_is_the_eager_loop_with_its_capture_after_every_row_bu
 }
 
 #[test]
-fn the_step_does_not_override_run_rows_in_this_stage() {
-    // The step's `WindowHost` block is pinned by the forwards table above, which lists no
-    // `run_rows`: the eager window is the only window the step runs until the K-row body exists.
+fn the_step_runs_the_k_row_body_for_an_armed_window_and_the_eager_loop_for_every_other() {
     let eager = code(include_str!("cuda/eager_window.rs"));
     let host = block(&eager, "impl WindowHost for QwenResidentStep<'_> {");
-    assert!(!declared(host).iter().any(|name| name == "run_rows"));
+    assert!(declared(host).iter().any(|name| name == "run_rows"));
+    let rows = body(host, "run_rows");
+    in_order(
+        rows,
+        "if self.krow_runs(inputs.len()) { return self.run_krow_window(inputs); }",
+        "eager_rows(self, inputs).map_err(RowsFailure::StateDecides)",
+    );
 }
 
 #[test]
-fn the_start_refuses_krow_before_the_weights_and_keeps_the_step_checks_behind_the_refusal() {
+fn the_start_checks_the_krow_switches_before_the_weights_and_arms_the_k_row_path_after_the_slots() {
     let start = code(START);
     let at = |needle: &str| {
         start
             .find(&code(needle))
             .unwrap_or_else(|| panic!("`{needle}`"))
     };
-    // The early block: guard, the switches, then the refusal; all before the first weight read.
+    assert!(
+        !start.contains(&code("not_built")),
+        "no start refuses a K-row session any more"
+    );
+    // The early block: guard, then the switches; all before the first weight read.
     assert!(at("settings.draft_verify == VerifyMode::Krow") < at("check_krow_env("));
-    assert!(at("check_krow_env(") < at("return Err(not_built());"));
-    assert!(at("return Err(not_built());") < at("load_exl3_dir(&projector"));
-    assert!(at("return Err(not_built());") < at("Box::leak"));
-    // After the slots are armed: ask for krow, then check the step, and no second refusal needed.
+    assert!(at("check_krow_env(") < at("load_exl3_dir(&projector"));
+    // The K-row arena is added to the resources only for a K-row session, before they are leaked.
+    assert!(at("res.with_krow(") < at("let res: &'static StepResources = Box::leak(Box::new(res));"));
+    // After the slots are armed: ask for krow, check the step, arm the path.
     let armed = at("step.enable_device_rollback(");
     assert!(armed < at("step.request_krow_verify();"));
     assert!(at("step.request_krow_verify();") < at("step.check_krow_arming("));
-    assert!(
-        start.matches(&code("not_built()")).count() >= 2,
-        "the early refusal and the late one"
-    );
+    assert!(at("step.check_krow_arming(") < at("step.enable_krow()?;"));
+    // The load line is built after the request, so it names the block the step really runs.
+    assert!(at("step.enable_krow()?;") < at("step.shared_in_routed_suffix()"));
 }
 
 /// A merged block the DEFAULT built yields to krow: dropped before the first token with the reason
@@ -818,6 +832,9 @@ fn the_captured_graphs_are_declared_before_the_buffers_whose_addresses_they_bake
         at("graph") < at("exl3_merge"),
         "the precedent: the merged block's buffer"
     );
+    // The K-row runtime holds the buffer a captured K-row body bakes in: it sits with the graph,
+    // before the state and the slots.
+    assert!(at("graph") < at("krow") && at("krow") < at("state") && at("krow") < at("rollback"));
     // The per-K graphs obey the same rule as soon as they exist.
     if let Some(krow) = field_at(fields, "krow_graphs") {
         assert!(krow < at("state") && krow < at("rollback"));

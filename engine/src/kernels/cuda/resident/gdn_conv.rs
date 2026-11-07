@@ -66,10 +66,6 @@ pub(crate) struct ConvBytes {
 /// layout of the live state (the planar `[3][channels]` window for the conv, `[n_v_heads][128][128]`
 /// for the delta). `stride` is the byte distance between two rollback slots, so the range starts at
 /// the first slot's copy of this layer's state and reaches into the later slots.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 pub(crate) struct SnapRows<'b> {
     pub(crate) range: DeviceRange<'b>,
     pub(crate) stride: usize,
@@ -175,10 +171,6 @@ impl CudaContext {
 /// Rule of the strided snapshots, shared with the delta wrapper: `m >= 2`, a stride that is a
 /// multiple of 4 and holds one snapshot of `row` bytes. Returns the bytes the snapshots reach,
 /// `(m - 2) * stride + row`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 pub(in crate::kernels::cuda::resident) fn snap_reach(
     m: usize,
     stride: usize,
@@ -209,10 +201,6 @@ impl CudaContext {
     /// Refused as `BadRequest`, besides the rules of the plain call: fewer than 2 tokens, a stride
     /// that is not a multiple of 4 or does not hold one `[3][channels]` window, a `snap` range
     /// that is short, misaligned or overlaps another range of the call.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the K-row verify body")
-    )]
     pub(crate) fn gdn_conv_snap(
         &self,
         stream: &DeviceStream,
@@ -237,6 +225,8 @@ impl CudaContext {
             range: self.raw_range(&snap.range)?,
             stride: snap.stride,
         };
+        #[cfg(test)]
+        self.note_row_kernel(crate::kernels::row_launches::RowKernel::ConvSnap);
         self.launch_on(stream, move |stream_raw| {
             gdn_conv_snap_launch(stream_raw, raw, snap_raw)
         })

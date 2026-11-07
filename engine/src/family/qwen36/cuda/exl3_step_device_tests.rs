@@ -106,6 +106,7 @@ fn unaliased_resources(
         plan,
         paged: None,
         sparse: None,
+        krow: None,
     })
 }
 

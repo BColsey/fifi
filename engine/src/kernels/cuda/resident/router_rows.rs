@@ -13,10 +13,6 @@
 //!
 //! A window of at most 7 rows is one launch; 8 rows (`router.cu`, `kTiledMinRows`) are two
 //! launches of 4. Both forms give the same bytes; this file does not compare their cost.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

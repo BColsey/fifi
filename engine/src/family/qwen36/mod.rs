@@ -43,10 +43,12 @@ mod host_real;
     not(test),
     allow(
         dead_code,
-        reason = "only the host seam of the K-row verifier exists; the K-row step is the first caller of most of it"
+        reason = "the K-row step, built with the native CUDA backend only, is the caller of most of it"
     )
 )]
 pub(crate) mod krow;
+#[cfg(test)]
+mod krow_step_pin_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod mtp_pack;
 #[cfg(test)]

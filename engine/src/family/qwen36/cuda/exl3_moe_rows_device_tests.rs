@@ -27,8 +27,8 @@ use half::f16;
 
 use super::{
     exl3_moe::{
-        Exl3MoeBufs, Exl3MoeWeights, Scratch, SharedRowsIo, SharedWeights, routed_on_device,
-        run_exl3_moe, shared, shared_rows,
+        Exl3MoeBufs, Exl3MoeWeights, Scratch, SharedRowsIo, SharedWeights, run_exl3_moe,
+        run_exl3_moe_rows, shared, shared_rows,
     },
     moe::{Launch, MoeDims, RouteBufs},
 };
@@ -37,10 +37,7 @@ use crate::{
     family::project::cuda::{CudaProjector, Reserve, exl3::Exl3Bank},
     kernels::cuda::{
         CudaContext, DeviceBuffer, DeviceRange, DeviceStream, device_present,
-        resident::{
-            moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
-            router::{RouterCall, RouterOut, RouterShape, RouterWeights, router_logits_bytes},
-        },
+        resident::router::{RouterShape, router_logits_bytes},
     },
     tensor::{Dtype, Tensor},
     weights::{
@@ -313,6 +310,31 @@ impl Buffers {
     }
 }
 
+impl Buffers {
+    /// The first `rows` rows of every buffer, as the K-row block takes them.
+    fn rows(&self, rows: usize) -> Exl3MoeBufs<'_> {
+        Exl3MoeBufs {
+            route: RouteBufs {
+                resid_in: rows_of(&self.resid_in, HIDDEN * F32, 0, rows),
+                resid_out: rows_of(&self.resid_out, HIDDEN * F32, 0, rows),
+                norm_row: rows_of(&self.norm_row, HIDDEN * F32, 0, rows),
+                logits: rows_of(&self.logits, (EXPERTS + 1) * F32, 0, rows),
+                ids: rows_of(&self.ids, TOP_K * 4, 0, rows),
+                weights: rows_of(&self.weights, TOP_K * F32, 0, rows),
+                shared_gate: rows_of(&self.gate, F32, 0, rows),
+                status: whole(&self.status),
+            },
+            expert_gu: rows_of(&self.expert_gu, TOP_K * 2 * INTER * F32, 0, rows),
+            expert_act: rows_of(&self.expert_act, TOP_K * INTER * F32, 0, rows),
+            expert_down: rows_of(&self.expert_down, TOP_K * HIDDEN * F32, 0, rows),
+            shared_gu: rows_of(&self.shared_gu, 2 * INTER * F32, 0, rows),
+            shared_act: rows_of(&self.shared_act, INTER * F32, 0, rows),
+            shared_out: rows_of(&self.shared_out, HIDDEN * F32, 0, rows),
+            scratch: self.scratch(),
+        }
+    }
+}
+
 fn block<'w>(w: &'w Weights) -> Exl3MoeWeights<'w> {
     Exl3MoeWeights {
         router: &w.router,
@@ -326,73 +348,10 @@ fn block<'w>(w: &'w Weights) -> Exl3MoeWeights<'w> {
     }
 }
 
-/// The K-row body of a verify window: the router for the K rows, one routed chain per row on
-/// row-offset ranges, the shared expert for the K rows, one combine.
+/// The K-row block of a verify window, the function the step runs: the router for the K rows, one
+/// routed chain per row on row-offset ranges, the shared expert for the K rows, one combine.
 fn run_rows(launch: &Launch<'_>, w: &Weights, b: &Buffers, rows: usize) -> Result<(), EngError> {
-    let ctx = launch.ctx;
-    ctx.router_rows(
-        launch.stream,
-        RouterCall {
-            shape: RouterShape {
-                m: rows,
-                hidden: HIDDEN,
-                n_expert: EXPERTS,
-                top_k: TOP_K,
-            },
-            x: rows_of(&b.norm_row, HIDDEN * F32, 0, rows),
-            weights: RouterWeights {
-                w: whole(&w.router),
-                w_shared: Some(whole(&w.router_shared)),
-            },
-            logits: whole(&b.logits),
-            out: RouterOut {
-                ids: rows_of(&b.ids, TOP_K * 4, 0, rows),
-                weights: rows_of(&b.weights, TOP_K * F32, 0, rows),
-                shared_gate: Some(rows_of(&b.gate, F32, 0, rows)),
-                status: whole(&b.status),
-            },
-        },
-    )?;
-    let weights = block(w);
-    let one = dims(1);
-    for r in 0..rows {
-        routed_on_device(launch, &weights, &b.row(r), &one)?;
-    }
-    shared_rows(
-        launch,
-        &SharedWeights {
-            gate: &w.shared_gate,
-            up: &w.shared_up,
-            down: &w.shared_down,
-        },
-        &SharedRowsIo {
-            norm_row: rows_of(&b.norm_row, HIDDEN * F32, 0, rows),
-            gu: rows_of(&b.shared_gu, 2 * INTER * F32, 0, rows),
-            act: rows_of(&b.shared_act, INTER * F32, 0, rows),
-            out: rows_of(&b.shared_out, HIDDEN * F32, 0, rows),
-            scratch: b.scratch(),
-        },
-        (HIDDEN, INTER, rows),
-    )?;
-    ctx.moe_combine(
-        launch.stream,
-        CombineCall {
-            shape: CombineShape {
-                m: rows,
-                n: HIDDEN,
-                top_k: TOP_K,
-                ld_down: HIDDEN,
-            },
-            res: rows_of(&b.resid_in, HIDDEN * F32, 0, rows),
-            down: rows_of(&b.expert_down, TOP_K * HIDDEN * F32, 0, rows),
-            weights: rows_of(&b.weights, TOP_K * F32, 0, rows),
-            shared: Some(SharedTerm {
-                gate: rows_of(&b.gate, F32, 0, rows),
-                row: rows_of(&b.shared_out, HIDDEN * F32, 0, rows),
-            }),
-            out: CombineOut::To(rows_of(&b.resid_out, HIDDEN * F32, 0, rows)),
-        },
-    )
+    run_exl3_moe_rows(launch, &block(w), &b.rows(rows), &dims(rows))
 }
 
 /// One stage of a block, as the bytes of its buffers.

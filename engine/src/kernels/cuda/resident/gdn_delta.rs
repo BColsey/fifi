@@ -339,10 +339,6 @@ impl CudaContext {
     /// Refused as `BadRequest`, besides the rules of the plain call: fewer than 2 tokens, a stride
     /// that is not a multiple of 4 or does not hold one state, a `snap` range that is short,
     /// misaligned or overlaps another range of the call.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "staged for the K-row verify body")
-    )]
     pub(crate) fn gdn_delta_snap(
         &self,
         stream: &DeviceStream,
@@ -384,6 +380,8 @@ impl CudaContext {
         let state = self.raw_range(&call.state)?;
         let out = self.raw_range(&call.out)?;
         let eps = call.eps;
+        #[cfg(test)]
+        self.note_row_kernel(crate::kernels::row_launches::RowKernel::DeltaSnap);
         self.launch_on(stream, move |raw| {
             gdn_delta_snap_launch(
                 raw,

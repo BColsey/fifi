@@ -196,3 +196,130 @@ fn status_is_clean_only_when_every_pair_and_the_window_word_are_zero() {
         assert!(text.contains("window word"), "{word}: {text}");
     }
 }
+
+fn clean(rows: usize) -> RowStatus {
+    RowStatus {
+        bits: vec![0; rows],
+        window: 0,
+    }
+}
+
+#[test]
+fn the_tokens_of_a_clean_window_are_the_verdict_and_each_must_be_in_the_sampler_vocabulary() {
+    assert_eq!(
+        rows_verdict(&[3, 0, 7], &clean(3), 8).expect("clean"),
+        vec![3, 0, 7]
+    );
+    // A row with no comparable value (-1), an id at the vocabulary width and a huge id are
+    // refused, and the message names the row.
+    for (tokens, row) in [
+        (vec![1, -1, 2], 1),
+        (vec![1, 2, 8], 2),
+        (vec![i32::MAX, 0, 0], 0),
+    ] {
+        let text = message(rows_verdict(&tokens, &clean(3), 8).map(|_| ()));
+        assert!(text.contains(&format!("row {row}")), "{tokens:?}: {text}");
+    }
+}
+
+#[test]
+fn a_status_bit_anywhere_fails_the_window_before_any_token_is_looked_at() {
+    // The tokens are valid; the pairs or the word are not. The status judgement comes first, so
+    // the error is the status's, whichever row or word carries the bit.
+    let tokens = [1, 2, 3, 4];
+    for row in 0..4 {
+        let mut bits = vec![0; 4];
+        bits[row] = 2;
+        let text = message(rows_verdict(&tokens, &RowStatus { bits, window: 0 }, 8).map(|_| ()));
+        assert!(text.contains(&format!("row {row} reports")), "{text}");
+    }
+    for word in [1, 2, 4, 16] {
+        let status = RowStatus {
+            bits: vec![0; 4],
+            window: word,
+        };
+        let text = message(rows_verdict(&tokens, &status, 8).map(|_| ()));
+        assert!(text.contains("window word"), "{word}: {text}");
+    }
+}
+
+#[test]
+fn a_table_that_disagrees_with_its_status_is_refused() {
+    let text = message(rows_verdict(&[1, 2, 3], &clean(2), 8).map(|_| ()));
+    assert!(text.contains("3 tokens and 2 status words"), "{text}");
+}
+
+/// The 8 K + 8 bytes the device leaves for a K-row window: K pairs, the window word and a zero
+/// pad word, each a little-endian i32. A table is written whole by every window, and a window
+/// reads exactly its own length.
+fn table_bytes(tokens: &[i32], bits: &[i32], window: i32) -> Vec<u8> {
+    let mut words = Vec::new();
+    for (token, own) in tokens.iter().zip(bits) {
+        words.extend([*token, *own]);
+    }
+    words.extend([window, 0]);
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// What the host takes from a buffer that holds `bytes` of the current window followed by stale
+/// bytes of an earlier, longer one: only the first `8 K + 8` bytes are read.
+fn host_read(buffer: &[u8], rows: usize) -> (Vec<i32>, RowStatus) {
+    let table = &buffer[..8 * rows + 8];
+    let words: Vec<i32> = table
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| i32::from_le_bytes(*word))
+        .collect();
+    assert_eq!(words[2 * rows + 1], 0, "the pad word is zero");
+    (
+        (0..rows).map(|row| words[2 * row]).collect(),
+        RowStatus {
+            bits: (0..rows).map(|row| words[2 * row + 1] as u32).collect(),
+            window: words[2 * rows] as u32,
+        },
+    )
+}
+
+#[test]
+fn a_short_window_after_a_long_one_on_the_same_table_reads_none_of_the_long_one() {
+    // Window 1: 8 rows, a bad bit in row 6 and a window word with bit 4. Window 2: 3 rows, clean.
+    // The device writes the new pairs, the new window word and the pad over the table; the bytes
+    // after them are the old window's. The host reads 8 * 3 + 8 bytes and sees a clean window.
+    let long = table_bytes(&[5, 5, 5, 5, 5, 5, 5, 5], &[0, 0, 0, 0, 0, 0, 2, 0], 4);
+    let mut buffer = long.clone();
+    let short = table_bytes(&[1, 2, 3], &[0, 0, 0], 0);
+    buffer[..short.len()].copy_from_slice(&short);
+    assert!(
+        buffer[short.len()..]
+            .iter()
+            .zip(&long[short.len()..])
+            .all(|(a, b)| a == b),
+        "the old window's bytes are still there past the new table"
+    );
+    let (tokens, status) = host_read(&buffer, 3);
+    assert_eq!(tokens, vec![1, 2, 3]);
+    assert_eq!(status, clean(3));
+    rows_verdict(&tokens, &status, 8).expect("a clean window after a bad one");
+    // The long window itself fails, so the control is not vacuous.
+    let (tokens, status) = host_read(&long, 8);
+    assert!(rows_verdict(&tokens, &status, 8).is_err());
+}
+
+#[test]
+fn a_host_that_reads_more_rows_than_the_window_ran_sees_stale_bits() {
+    // The mutant of the read length: the 3-row window read as the 8-row table of before.
+    let long = table_bytes(&[5; 8], &[0, 0, 0, 0, 0, 0, 2, 0], 4);
+    let mut buffer = long;
+    let short = table_bytes(&[1, 2, 3], &[0, 0, 0], 0);
+    buffer[..short.len()].copy_from_slice(&short);
+    let words: Vec<i32> = buffer
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| i32::from_le_bytes(*word))
+        .collect();
+    // Reading eight pairs from the buffer finds row 3's pair where the new window word and pad
+    // sit, and the old bit 2 of row 6.
+    assert_eq!(words[2 * 6 + 1], 2);
+}

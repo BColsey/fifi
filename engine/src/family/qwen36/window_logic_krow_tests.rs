@@ -78,6 +78,12 @@ enum Flaw {
     NoTokenCheck,
     /// The switch re-check before every window is missing.
     NoSwitchRecheck,
+    /// The snapshot kernel stores one row too many: it writes the slot after the last snapshot of
+    /// the window, which no verdict of the window restores.
+    SnapWritesPastTheWindow,
+    /// A failure after the launch is reported as a state-decided one, so only the host counters
+    /// and the validity of the state decide whether the window fails closed.
+    AfterLaunchAsStateDecides,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -113,8 +119,6 @@ struct DevFake {
     recurrent: [f32; 3],
     conv: [f32; 2],
     slots: Vec<([f32; 3], [f32; 2])>,
-    /// Rows of the last window: the slots `0..last_rows - 1` are the ones it wrote.
-    last_rows: usize,
     book: RollbackBook,
     window: Option<super::Window<SlotState, Vec<f32>>>,
     poisoned: bool,
@@ -215,7 +219,6 @@ impl DevFake {
             conv: [0.0; 2],
             // Garbage, not zeros: a slot that was never written must not look right.
             slots: vec![([7.5; 3], [7.5; 2]); plan.slots()],
-            last_rows: 0,
             book: RollbackBook::new(plan),
             window: None,
             poisoned: false,
@@ -314,8 +317,11 @@ impl DevFake {
         } else {
             rows
         };
-        self.krow_launched(&inputs[..executed], rows)
-            .map_err(RowsFailure::AfterLaunch)
+        let ran = self.krow_launched(&inputs[..executed], rows);
+        if self.flaw == Flaw::AfterLaunchAsStateDecides {
+            return ran.map_err(RowsFailure::StateDecides);
+        }
+        ran.map_err(RowsFailure::AfterLaunch)
     }
 
     /// Everything that precedes the enqueue: the host rules of `krow.rs`, then the refusal fault.
@@ -409,6 +415,11 @@ impl DevFake {
                     *slot = (recurrent, conv);
                 }
             }
+        }
+        if self.flaw == Flaw::SnapWritesPastTheWindow
+            && let Some(slot) = self.slots.get_mut(window.saturating_sub(1))
+        {
+            *slot = ([-1.0; 3], [-1.0; 2]);
         }
         Body {
             logits,
@@ -572,7 +583,6 @@ impl WindowHost for DevFake {
         Ok(())
     }
     fn rollback_begin(&mut self, rows: usize) -> Result<()> {
-        self.last_rows = rows;
         self.book.begin_window(self.len, rows)
     }
     fn capture(&mut self, row: usize) -> Result<()> {
@@ -703,8 +713,8 @@ impl D1Subject for DevFake {
     }
 
     fn window_slots(&self) -> Option<Vec<Vec<u32>>> {
-        let used = self.last_rows.saturating_sub(1);
-        Some(self.slots[..used].iter().map(slot_bits).collect())
+        // Every armed slot, not only the ones the window wrote: a store past the window shows.
+        Some(self.slots.iter().map(slot_bits).collect())
     }
 
     fn inject_fault(&mut self, fault: Fault) {
@@ -1205,4 +1215,47 @@ fn a_lost_read_back_leaves_the_counters_at_the_base_and_the_window_still_gates()
             "{fault:?}"
         );
     }
+}
+
+#[test]
+fn a_failure_after_the_launch_that_is_judged_by_the_counters_leaves_a_usable_state() {
+    // The mutant: the read-back is lost after the launch, the host counters stay at the base and
+    // the state stays valid. Reported as a state-decided failure, the window would not fail
+    // closed; reported as after-launch (the sound fake) it does.
+    for fault in [Fault::KRowLaunch, Fault::KRowReadback, Fault::KRowStatus] {
+        assert!(fails_closed(Flaw::Sound, fault, 4), "{fault:?}");
+        assert!(
+            !fails_closed(Flaw::AfterLaunchAsStateDecides, fault, 4),
+            "{fault:?}: the mutant must leave the gate open"
+        );
+    }
+}
+
+#[test]
+fn a_failure_after_the_launch_judged_by_the_counters_is_caught_by_check_f() {
+    let failure = f_catches(Flaw::AfterLaunchAsStateDecides, 4);
+    assert!(failure.violation, "{failure}");
+    assert!(failure.detail.contains("was accepted"), "{failure}");
+}
+
+#[test]
+fn a_snapshot_stored_past_the_window_is_caught_by_the_slot_comparison_of_check_k_alone() {
+    // The slot after the window's last snapshot is restored by no verdict of the window, so the
+    // committed state, the rows and the next step all agree with the eager window. Only the
+    // comparison of the slots sees it.
+    let mut rig = Rig::krow(Flaw::SnapWritesPastTheWindow);
+    let (fake, setup) = rig.split();
+    assert!(
+        accepted_prefix(fake, &setup, 3, &Sampler::greedy).is_ok(),
+        "check D cannot see a store no verdict restores"
+    );
+    let mut krow = Rig::krow(Flaw::SnapWritesPastTheWindow);
+    let mut eager = Rig::new(Path::Eager, Flaw::Sound, false);
+    let at = krow.fake.len;
+    let failure = caught(
+        krow_matches_eager(&mut krow.fake, &mut eager.fake, &rows(4), at),
+        "K",
+    );
+    assert!(failure.violation, "{failure}");
+    assert!(failure.detail.contains("state slots differ"), "{failure}");
 }

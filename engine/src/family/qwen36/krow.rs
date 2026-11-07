@@ -3,8 +3,8 @@
 //! `krow` runs one verify window of K rows (2 to 8) as one captured K-row graph instead of K
 //! one-row steps. This file holds what needs no device: the arming refusals, the check that
 //! precedes every enqueue, and the row-status rules. The eager window stays the reference and the
-//! fallback (`WindowHost::run_rows` defaults to the eager loop); the K-row device path is not
-//! built, so a start that asks for `krow` is refused after these checks pass ([`not_built`]).
+//! fallback (`WindowHost::run_rows` defaults to the eager loop); the step overrides it with the
+//! K-row body when `krow` is armed.
 //!
 //! Arming. `krow` is one qualified configuration: the served `wide1` single-row kernel, the
 //! reference MoE block, the device rollback. Everything that selects another kernel or another MoE
@@ -109,14 +109,6 @@ pub(crate) fn check_krow_env(
     check_krow_switches(single_gather, shared_in_routed)
 }
 
-/// The refusal of a start that asks for `krow` while the K-row device path does not exist (only
-/// the host seam does). The step is never built on this setting.
-pub(crate) fn not_built() -> EngError {
-    refuse(
-        "the K-row device path is not built in this engine (only the host seam exists); set draft_verify to eager",
-    )
-}
-
 /// Whether a window of `rows` rows runs as a K-row window when `draft_verify` is `krow`. A one-row
 /// window is the single-row step, which has its own captured graph, and runs the eager loop.
 pub(crate) fn uses_krow(rows: usize) -> bool {
@@ -183,6 +175,40 @@ pub(crate) fn check_status(status: &RowStatus) -> Result<(), EngError> {
         )));
     }
     Ok(())
+}
+
+/// The tokens a K-row window drew, once the one read of its result table is judged: the pairs'
+/// own bits and the window word are checked first ([`check_status`], so one bad row or one word
+/// bit fails the whole window), then every token must lie inside the sampler vocabulary. `tokens`
+/// are the table's token words, one per row (-1 for a row with no comparable value). The caller
+/// treats any error as a failure after the launch.
+pub(crate) fn rows_verdict(
+    tokens: &[i32],
+    status: &RowStatus,
+    sampler_vocab: usize,
+) -> Result<Vec<u32>, EngError> {
+    if tokens.len() != status.bits.len() {
+        return Err(refuse(&format!(
+            "the result table holds {} tokens and {} status words",
+            tokens.len(),
+            status.bits.len()
+        )));
+    }
+    check_status(status)?;
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(row, &token)| {
+            u32::try_from(token)
+                .ok()
+                .filter(|&id| (id as usize) < sampler_vocab)
+                .ok_or_else(|| {
+                    refuse(&format!(
+                        "row {row} drew token {token}, outside the sampler vocabulary of {sampler_vocab}"
+                    ))
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]

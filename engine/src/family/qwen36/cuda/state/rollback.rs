@@ -28,8 +28,17 @@ use crate::{
     family::qwen36::rollback::{
         Restore, RollbackBook, RollbackPlan, StateFacts, check_window_fits,
     },
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, resident::gdn_conv::SnapRows},
 };
+
+/// Which per-layer state of a DeltaNet layer a K-row snapshot range addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapPart {
+    /// The recurrent state, `[n_v_heads][128][128]` f32.
+    Recurrent,
+    /// The convolution window, `[3][channels]` f32.
+    Conv,
+}
 
 pub(crate) struct RollbackSlots {
     buffer: DeviceBuffer,
@@ -165,6 +174,78 @@ impl RollbackSlots {
             self.buffer.range(self.book.plan().offset(slot)?, bytes)?,
         )?;
         self.book.note_captured(row)
+    }
+
+    /// Where the K-row kernels of the DeltaNet layer `ordinal` store the state after each of the
+    /// first `rows - 1` rows of a window: slot `t` of this buffer holds the copy of the Delta
+    /// pool's slot 0 that a one-row capture after row `t` would make, so the layer's part sits at
+    /// the same offset inside every slot and the stride between two rows is one slot. The range
+    /// starts at that offset in the first slot and reaches the end of the part in slot `rows - 2`.
+    pub(crate) fn snap_rows(
+        &self,
+        state: &ResidentState,
+        ordinal: usize,
+        part: SnapPart,
+        rows: usize,
+    ) -> Result<SnapRows<'_>, EngError> {
+        let plan = self.book.plan();
+        if rows < 2 || rows > plan.rows {
+            return Err(EngError::BadRequest(format!(
+                "device rollback: snapshots for a window of {rows} rows, the slots serve 2 to {}",
+                plan.rows
+            )));
+        }
+        let pool = state.layout.delta;
+        let (offset, bytes) = match part {
+            SnapPart::Recurrent => (
+                pool.rec_offset(0, ordinal)?,
+                pool.rec_values * size_of::<f32>(),
+            ),
+            SnapPart::Conv => (
+                pool.conv_offset(0, ordinal)?,
+                pool.conv_values * size_of::<f32>(),
+            ),
+        };
+        let reach = (rows - 2) * plan.slot_bytes + bytes;
+        Ok(SnapRows {
+            range: self.buffer.range(plan.offset(0)? + offset, reach)?,
+            stride: plan.slot_bytes,
+        })
+    }
+
+    /// Marks the slots `0..count` readable after a K-row window ran, was synchronized and its
+    /// results were read and judged and its rows committed: the kernels stored them. `state` must
+    /// be valid and idle (the guard of every copy), so a window whose rows are not committed
+    /// marks nothing, and a verdict that names an unmarked slot is refused.
+    pub(crate) fn mark_row_slots(
+        &mut self,
+        stream: &DeviceStream,
+        state: &ResidentState,
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.facts(stream, state).require_copyable("run_rows")?;
+        self.book.mark_captured_range(count)
+    }
+
+    /// Test builds: the bytes of every armed slot as words, for the comparison of two paths. A
+    /// slot that no window wrote holds whatever an earlier window or the allocation left.
+    #[cfg(test)]
+    pub(crate) fn slot_words(&self, stream: &DeviceStream) -> Result<Vec<Vec<u32>>, EngError> {
+        let plan = self.book.plan();
+        let mut slots = Vec::with_capacity(plan.slots());
+        for slot in 0..plan.slots() {
+            let mut bytes = vec![0u8; plan.slot_bytes];
+            self.buffer.read_at(stream, plan.offset(slot)?, &mut bytes)?;
+            slots.push(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| u32::from_le_bytes(*word))
+                    .collect(),
+            );
+        }
+        Ok(slots)
     }
 
     /// Applies the verdict: `kept` rows stay, and the state was `committed_rows` after them in the

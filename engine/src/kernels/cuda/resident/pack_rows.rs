@@ -19,10 +19,6 @@
 //! outside 1..=16, 1..=3 segments, a segment of 0 or more than 65536 columns, a column range that
 //! ends past `ld` or overlaps another segment's, a range that is short or not 4-byte aligned, and a
 //! source that overlaps the destination.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

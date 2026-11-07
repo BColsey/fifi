@@ -20,10 +20,6 @@
 //!
 //! Order of a K-row window's tail: `lm_head`, `argmax_rows`, `window_status_fold`, the advance.
 //! The fold must be the last kernel that writes the status word.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "staged for the K-row verify body")
-)]
 
 use crate::EngError;
 use crate::kernels::cuda::context::{Claim, require_apart, require_fit};

@@ -12,7 +12,7 @@
 use super::super::exl3_merge_plan::{
     SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
 };
-use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env, not_built};
+use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
     DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, VerifyMode,
@@ -702,16 +702,12 @@ pub(crate) fn start(
         matches!(settings.weights, WeightFormat::Exl3),
     )?;
     // `draft_verify = krow`: the one qualified configuration is checked before any weight is read.
-    // The K-row device path is not built yet, so a configuration that passes is refused here as
-    // well, before the load, the leaked step resources and the build guard commit. The later
-    // wiring below (the step's own check of its fields) is what the K-row stage keeps; that
-    // stage removes this early refusal.
+    // The step's own checks of its fields run later, once the slots are armed.
     if settings.draft_verify == VerifyMode::Krow {
         check_krow_env(
             std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
             std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
         )?;
-        return Err(not_built());
     }
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
@@ -1047,7 +1043,14 @@ fn make(
     options.tiered = tiered;
     let res = match paged {
         Some(plan) => StepResources::allocate_paged(projector.context(), plan)?,
-        None => StepResources::new(projector.context(), dims, &inventory, &options)?,
+        None => {
+            let res = StepResources::new(projector.context(), dims, &inventory, &options)?;
+            if settings.draft_verify == VerifyMode::Krow {
+                res.with_krow(projector.context(), &options)?
+            } else {
+                res
+            }
+        }
     };
     // LEAK: the three owners are leaked for the process lifetime, giving
     // `QwenResidentStep<'static>`; an owning `Arc` variant would rewrite the qualified step
@@ -1147,13 +1150,12 @@ fn make(
             }
             rollback_cover = Some(cover);
         }
-        // `draft_verify = krow` needs the armed slots above. Unreachable while the early refusal
-        // stands (the K-row device path is not built); the K-row stage removes that refusal and
-        // this block then runs the step's own checks, with `eager` never reaching it.
+        // `draft_verify = krow` needs the armed slots above: ask for it, check the step's own
+        // fields against the one qualified configuration, then arm the K-row path.
         if settings.draft_verify == VerifyMode::Krow {
             step.request_krow_verify();
             step.check_krow_arming(settings.speculation.max_rows)?;
-            return Err(not_built());
+            step.enable_krow()?;
         }
         let mut arena_admitted = None;
         if arena {
