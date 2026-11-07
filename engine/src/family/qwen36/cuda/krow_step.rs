@@ -1056,6 +1056,11 @@ impl QwenResidentStep<'_> {
         sampler_vocab: usize,
     ) -> Option<Result<u32, EngError>> {
         let window = self.window.as_ref()?;
+        // Only a window that the K-row path ran has records: an eager window (the path switched off,
+        // or one row) with the same base and inputs as an earlier K-row window is not served theirs.
+        if !self.krow_runs(window.inputs.len()) {
+            return None;
+        }
         let draws = self.krow.as_ref()?.draws.as_ref()?;
         if !matches!(window.saved, WindowSave::Device)
             || !draws.belongs_to(window.base, &window.inputs)

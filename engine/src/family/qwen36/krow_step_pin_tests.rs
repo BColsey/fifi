@@ -209,6 +209,8 @@ fn a_draw_reads_one_row_only_when_the_record_cannot_serve_it_and_a_failed_read_f
     in_order(
         draw,
         &[
+            "if !self.krow_runs(window.inputs.len()) {",
+            "return None;",
             "WindowSave::Device",
             "draws.belongs_to(window.base, &window.inputs)",
             "draw_source(",
