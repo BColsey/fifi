@@ -350,6 +350,30 @@ export function getSamplerTrace(replyId: string, signal?: AbortSignal): Promise<
   );
 }
 
+/** One MoE layer of a live routing step: the picked expert ids in choice
+ * order, their renormalized gates, and the shared-expert gate. */
+export interface RouteTraceLayer {
+  ids: number[];
+  weights: number[];
+  gate: number;
+}
+
+/** Packet v1 of GET /v1/route-trace — a server extension, not in
+ * api/openapi.yaml. Steps are decode steps, oldest first; the shape fields
+ * are the engine's build-time facts (null when no stage ever ran). */
+export interface RouteTracePacket {
+  packet: 1;
+  ring_capacity: number;
+  layers: number | null;
+  top_k: number | null;
+  experts: number | null;
+  steps: { step: number; layers: RouteTraceLayer[] }[];
+}
+
+export function getRouteTrace(signal?: AbortSignal): Promise<RouteTracePacket> {
+  return getJson<RouteTracePacket>("/v1/route-trace", true, signal);
+}
+
 export async function chatCompletion(
   body: ChatRequestBody,
   signal?: AbortSignal

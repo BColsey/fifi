@@ -14,6 +14,7 @@
 use super::route_capture::LayerPicks;
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The env opt-in: `1` arms the stage, any other value (including unset) leaves it off.
@@ -26,6 +27,21 @@ pub(crate) const RING_STEPS: usize = 16;
 /// The parse of [`VAR`], separate from the env read so tests can cover it.
 pub(crate) fn enabled(value: Option<&str>) -> bool {
     value == Some("1")
+}
+
+/// The stage's build-time facts (MoE layer count, top-k, expert count), set once when the stage
+/// is allocated: the server packet reports them so the view's color scale and summaries do not
+/// guess them from the ids. First engine wins; one process does not serve two qwen36 shapes.
+static FACTS: OnceLock<(usize, usize, usize)> = OnceLock::new();
+
+/// Records the facts alongside stage allocation.
+pub(crate) fn set_facts(layers: usize, top_k: usize, experts: usize) {
+    let _ = FACTS.set((layers, top_k, experts));
+}
+
+/// The recorded facts, `None` while no stage was ever allocated in this process.
+pub(crate) fn facts() -> Option<(usize, usize, usize)> {
+    FACTS.get().copied()
 }
 
 /// Process-wide step counter, advanced once per decode step that stages its picks.

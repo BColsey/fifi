@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import { deepStrictEqual, strictEqual } from "node:assert";
 import {
+  liveRoutingPacket,
   cellColor,
   heatRow,
   tokenColumn,
@@ -100,4 +101,74 @@ test("an out-of-range token index yields empty pick lists, never a throw", () =>
     9
   );
   deepStrictEqual(col, [{ layer: 0, picks: [] }]);
+});
+
+function livePacket(overrides?: Partial<import("./api.js").RouteTracePacket>): import("./api.js").RouteTracePacket {
+  return {
+    packet: 1,
+    ring_capacity: 16,
+    layers: 2,
+    top_k: 2,
+    experts: 8,
+    steps: [
+      {
+        step: 7,
+        layers: [
+          { ids: [3, 4], weights: [0.6, 0.4], gate: 0.5 },
+          { ids: [1, 2], weights: [0.8, 0.2], gate: 1.0 },
+        ],
+      },
+      {
+        step: 8,
+        layers: [
+          { ids: [5, 3], weights: [0.7, 0.3], gate: 0.5 },
+          { ids: [1, 6], weights: [0.9, 0.1], gate: 1.0 },
+        ],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+test("liveRoutingPacket transposes steps into per-layer token rows", () => {
+  const adapted = liveRoutingPacket(livePacket());
+  if (adapted === null) throw new Error("adapter returned null");
+  strictEqual(adapted.summary.tokens, 2);
+  strictEqual(adapted.summary.layers, 2);
+  strictEqual(adapted.summary.top_k, 2);
+  strictEqual(adapted.summary.experts, 8);
+  deepStrictEqual(adapted.layer_rows[0]?.ids, [
+    [3, 4],
+    [5, 3],
+  ]);
+  deepStrictEqual(adapted.layer_rows[1]?.gates, [
+    [0.8, 0.2],
+    [0.9, 0.1],
+  ]);
+});
+
+test("liveRoutingPacket rebuilds the expert histogram over every pick", () => {
+  const adapted = liveRoutingPacket(livePacket());
+  if (adapted === null) throw new Error("adapter returned null");
+  // 3 appears twice (step 7 layer 0 and step 8 layer 0), 1 twice (both steps of layer 1).
+  deepStrictEqual(adapted.summary.expert_histogram, {
+    "3": 2,
+    "4": 1,
+    "1": 2,
+    "2": 1,
+    "5": 1,
+    "6": 1,
+  });
+  strictEqual(adapted.summary.experts_seen, 6);
+});
+
+test("liveRoutingPacket returns null without facts, steps, or matching layer rows", () => {
+  strictEqual(liveRoutingPacket(livePacket({ layers: null })), null);
+  strictEqual(liveRoutingPacket(livePacket({ top_k: null })), null);
+  strictEqual(liveRoutingPacket(livePacket({ experts: null })), null);
+  strictEqual(liveRoutingPacket(livePacket({ steps: [] })), null);
+  // A step missing layer rows (shape disagreement) refuses rather than rendering holes.
+  const ragged = livePacket();
+  ragged.steps[0]!.layers = [ragged.steps[0]!.layers[0]!];
+  strictEqual(liveRoutingPacket(ragged), null);
 });

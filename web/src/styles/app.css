@@ -944,3 +944,17 @@ details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
   margin-left: var(--fifi-space-2);
   white-space: nowrap;
 }
+
+.live-toggle {
+  font-size: var(--fifi-size-1);
+  color: var(--fifi-text-secondary);
+  background: none;
+  border: 1px solid var(--fifi-separator);
+  border-radius: 8px;
+  padding: 0 8px;
+  margin-left: var(--fifi-space-2);
+  cursor: pointer;
+}
+.live-toggle:hover {
+  border-color: var(--fifi-text-tertiary);
+}

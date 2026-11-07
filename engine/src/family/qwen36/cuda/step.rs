@@ -814,11 +814,9 @@ impl<'a> QwenResidentStep<'a> {
         // is not even allocated for them.
         let route_stage = if route_stage_on && options.layout != WeightLayout::Exl3 && !tiered_mode
         {
-            Some(new_route_stage(
-                context,
-                layers.len(),
-                moe_dims(&res.dims).top_k,
-            )?)
+            let dims = moe_dims(&res.dims);
+            crate::family::qwen36::route_stage::set_facts(layers.len(), dims.top_k, dims.n_expert);
+            Some(new_route_stage(context, layers.len(), dims.top_k)?)
         } else {
             None
         };

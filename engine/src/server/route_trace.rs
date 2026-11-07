@@ -25,10 +25,13 @@ use crate::family::qwen36::route_stage;
 /// each with one layer entry per MoE layer in launch order (ids as u16: expert indices of the
 /// supported models are far below 65536, and the router-fault `-1` serializes as 65535;
 /// weights and the shared gate as f32).
-fn packet(steps: &[(u32, Vec<LayerPicks>)]) -> Value {
+fn packet(steps: &[(u32, Vec<LayerPicks>)], facts: Option<(usize, usize, usize)>) -> Value {
     json!({
         "packet": 1,
         "ring_capacity": route_stage::RING_STEPS,
+        "layers": facts.map(|(layers, _, _)| layers),
+        "top_k": facts.map(|(_, top_k, _)| top_k),
+        "experts": facts.map(|(_, _, experts)| experts),
         "steps": steps.iter().map(|(step, layers)| json!({
             "step": step,
             "layers": layers.iter().map(|picks| json!({
@@ -49,7 +52,7 @@ pub(crate) async fn get_route_trace() -> Result<Response, ServerError> {
             "route stage off: start the engine with Q36_ROUTE_STAGE=1".into(),
         ));
     }
-    let body = packet(&route_stage::snapshot());
+    let body = packet(&route_stage::snapshot(), route_stage::facts());
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
@@ -76,7 +79,7 @@ mod tests {
             (7_u32, vec![picks(3, 0.25, 0.5); 2]),
             (8_u32, vec![picks(500, 0.75, 1.0); 2]),
         ];
-        let body = packet(&steps);
+        let body = packet(&steps, Some((2, 2, 8)));
         assert_eq!(body["packet"], 1);
         assert_eq!(body["ring_capacity"], route_stage::RING_STEPS);
         let steps = body["steps"].as_array().expect("steps array");
@@ -93,15 +96,27 @@ mod tests {
     #[test]
     fn router_fault_ids_serialize_as_u16_max() {
         let steps = vec![(1_u32, vec![picks(-1, 0.0, 0.0)])];
-        let body = packet(&steps);
+        let body = packet(&steps, Some((1, 2, 8)));
         assert_eq!(body["steps"][0]["layers"][0]["ids"], json!([65535, 0]));
     }
 
     #[test]
-    fn empty_ring_serializes_an_empty_steps_array() {
-        let body = packet(&[]);
+    fn empty_ring_serializes_an_empty_steps_array_and_null_facts() {
+        let body = packet(&[], None);
         assert_eq!(body["steps"], json!([]));
         assert_eq!(body["packet"], 1);
+        assert_eq!(body["layers"], serde_json::Value::Null);
+        assert_eq!(body["top_k"], serde_json::Value::Null);
+        assert_eq!(body["experts"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn facts_fill_the_shape_fields_when_present() {
+        let steps = vec![(1_u32, vec![picks(0, 0.5, 1.0)])];
+        let body = packet(&steps, Some((40, 8, 512)));
+        assert_eq!(body["layers"], 40);
+        assert_eq!(body["top_k"], 8);
+        assert_eq!(body["experts"], 512);
     }
 
     #[tokio::test]

@@ -3,10 +3,13 @@
  * section is the router — which experts each layer picked for each
  * token, and with what gate weight. The packet is family-neutral (any
  * MoE family routes top-k over N experts; dense families simply have
- * no routing packet), and its shape is the shape a future
- * /v1/telemetry endpoint would return. Phase 0 renders a recorded
- * fixture (internals.fixture.ts); nothing here talks to the server.
+ * no routing packet). Phase 0 renders a recorded fixture
+ * (internals.fixture.ts); the Live toggle switches to the engine's
+ * routing ring via GET /v1/route-trace (Q36_ROUTE_STAGE), transposed
+ * into the same shape — decode steps are the tokens.
  */
+
+import { getRouteTrace, ApiError, type RouteTracePacket } from "./api.js";
 
 /** One layer of the trace: per token, the picked expert ids in choice
  * order and their renormalized gates, same order. */
@@ -58,6 +61,53 @@ export function totalPicks(histogram: Record<string, number>): number {
   let total = 0;
   for (const picks of Object.values(histogram)) total += picks;
   return total;
+}
+
+/** Adapts the live /v1/route-trace ring into the packet shape this view
+ * renders: decode steps become tokens, per-step layer rows are
+ * transposed into per-layer token rows, and the histogram is rebuilt.
+ * Null when the view cannot render it — no facts (stage never
+ * allocated), no steps yet, or a step whose layer rows do not match the
+ * facts. */
+export function liveRoutingPacket(live: RouteTracePacket): RoutingTracePacket | null {
+  if (live.layers === null || live.top_k === null || live.experts === null) return null;
+  if (live.steps.length === 0) return null;
+  const histogram: Record<string, number> = {};
+  const layer_rows: RoutingLayerRow[] = [];
+  for (let l = 0; l < live.layers; l++) {
+    const ids: number[][] = [];
+    const gates: number[][] = [];
+    for (const step of live.steps) {
+      const row = step.layers[l];
+      if (row === undefined) return null;
+      ids.push(row.ids);
+      gates.push(row.weights);
+      for (const id of row.ids) histogram[id] = (histogram[id] ?? 0) + 1;
+    }
+    layer_rows.push({ layer: l, ids, gates });
+  }
+  return {
+    packet: "route-trace/1",
+    family: "live",
+    checkpoint: "engine routing ring",
+    activation_dtype: "-",
+    kv_dtype: "-",
+    routing: "top-" + live.top_k,
+    step_mode: "decode",
+    path_note:
+      "Live routing ring (Q36_ROUTE_STAGE): the last " +
+      live.steps.length +
+      " decode steps, engine-wide. The recorded fixture shows one full reply instead.",
+    layer_rows,
+    summary: {
+      tokens: live.steps.length,
+      layers: live.layers,
+      top_k: live.top_k,
+      experts: live.experts,
+      experts_seen: Object.keys(histogram).length,
+      expert_histogram: histogram,
+    },
+  };
 }
 
 /** One heatmap cell: the layer's first-choice expert for a token and
@@ -112,12 +162,79 @@ function div(cls: string): HTMLElement {
 export class InternalsView {
   private selectedToken = 0;
   private detail: HTMLElement | null = null;
+  private packet: RoutingTracePacket;
+  private readonly fixture: RoutingTracePacket;
+  private badge: HTMLElement | null = null;
+  private toggle: HTMLButtonElement | null = null;
+  private live = false;
+  private polling: number | null = null;
+  private fetching = false;
 
   constructor(
     private readonly section: HTMLElement,
-    private readonly packet: RoutingTracePacket
+    fixture: RoutingTracePacket
   ) {
+    this.fixture = fixture;
+    this.packet = fixture;
     this.render();
+  }
+
+  /** Switches to the live routing ring and polls it every 2 s. Errors
+   * keep the last good packet and show the reason in the badge (the
+   * stage-off 404 carries the enabling hint). */
+  async goLive(): Promise<void> {
+    this.live = true;
+    this.startPolling();
+    await this.refreshLive();
+  }
+
+  /** Back to the recorded fixture; stops the poll. */
+  useFixture(): void {
+    this.live = false;
+    this.stopPolling();
+    this.packet = this.fixture;
+    this.selectedToken = 0;
+    this.render();
+  }
+
+  private startPolling(): void {
+    if (this.polling === null)
+      this.polling = window.setInterval(() => void this.refreshLive(), 2000);
+  }
+
+  private stopPolling(): void {
+    if (this.polling !== null) {
+      window.clearInterval(this.polling);
+      this.polling = null;
+    }
+  }
+
+  private async refreshLive(): Promise<void> {
+    if (!this.live || this.fetching) return;
+    this.fetching = true;
+    try {
+      try {
+        const live = await getRouteTrace();
+        const packet = liveRoutingPacket(live);
+        if (packet === null) {
+          this.setBadge("Live \u2014 ring empty (no decode steps yet)");
+        } else {
+          this.packet = packet;
+          this.selectedToken = Math.min(this.selectedToken, packet.summary.tokens - 1);
+          this.render();
+          this.setBadge("Live \u2014 last " + packet.summary.tokens + " decode steps");
+        }
+      } catch (err) {
+        const note = err instanceof ApiError ? err.message : "server unreachable";
+        this.setBadge("Live unavailable \u2014 " + note);
+      }
+    } finally {
+      this.fetching = false;
+    }
+  }
+
+  private setBadge(text: string): void {
+    if (this.badge !== null) this.badge.textContent = text;
   }
 
   private card(title: string): { card: HTMLElement; body: HTMLElement } {
@@ -152,7 +269,17 @@ export class InternalsView {
     const badge = document.createElement("span");
     badge.className = "fixture-badge";
     badge.textContent = "Recorded fixture \u2014 not live";
-    head.append(h2, badge);
+    this.badge = badge;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "live-toggle";
+    toggle.textContent = "Go live";
+    toggle.addEventListener("click", () => {
+      if (this.live) this.useFixture();
+      else void this.goLive();
+    });
+    this.toggle = toggle;
+    head.append(h2, badge, toggle);
     column.append(head);
 
     const { summary } = this.packet;
@@ -241,6 +368,7 @@ export class InternalsView {
   }
 
   private renderDetail(): void {
+    this.renderToggleState();
     const node = this.detail;
     if (node === null) return;
     node.replaceChildren();
@@ -269,6 +397,16 @@ export class InternalsView {
     }
     for (const btn of Array.from(this.section.querySelectorAll<HTMLButtonElement>(".hc"))) {
       if (btn.dataset.t === String(this.selectedToken)) btn.classList.add("sel");
+    }
+  }
+
+  /** The toggle text follows the mode; called after renders and clicks. */
+  private renderToggleState(): void {
+    if (this.toggle !== null) {
+      this.toggle.textContent = this.live ? "Back to fixture" : "Go live";
+    }
+    if (!this.live && this.badge !== null) {
+      this.badge.textContent = "Recorded fixture \u2014 not live";
     }
   }
 }
