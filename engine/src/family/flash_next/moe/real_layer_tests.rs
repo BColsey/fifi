@@ -42,9 +42,10 @@ const GIB: u64 = 1 << 30;
 /// rounding). The two differ only by f32 accumulation and the f32 SiLU: about 1e-6; the bound is 1e-5.
 const EXACT_BOUND: f64 = 1e-5;
 
-/// The same bound for a tier. The vector tiers keep per-lane partial sums and measure 1e-6 to 3e-6
-/// on real layer-3 experts; the scalar reference adds each column in one f32 chain over 2560 terms
-/// and measures up to about 1.2e-5, so it gets three times the bound.
+/// The same bound for a tier. The vector tiers keep per-lane partial sums and measure up to 4.5e-6
+/// (AVX2) and 3.2e-6 (AVX-512) on real layer-3 experts; the scalar reference adds each column in
+/// one f32 chain over 2560 terms and measures up to 1.3e-5 (1.27e-5), so it gets three times the
+/// bound.
 fn exact_bound(tier: Exl3Isa) -> f64 {
     if tier == Exl3Isa::Scalar {
         3.0 * EXACT_BOUND

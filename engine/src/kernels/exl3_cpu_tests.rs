@@ -543,6 +543,8 @@ fn child_reports_the_engine_tier_for_its_environment() {
 /// Runs this test binary again, with `FIFI_EXL3_CPU_ISA` set to `setting` (removed for `None`) in
 /// the child's environment only, and returns the child's report.
 fn child_result(setting: Option<&str>) -> String {
+    // Coupled to this module's path; fails closed: after a rename the child runs zero tests and
+    // the parent panics on the missing report.
     let crate_relative = module_path!().split_once("::").expect("a crate path").1;
     let name = format!("{crate_relative}::child_reports_the_engine_tier_for_its_environment");
     let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
