@@ -445,6 +445,159 @@ __global__ void __launch_bounds__(kLanes * kWarps, 2) gdn_scan_seq_k(ScanArgs a)
     }
 }
 
+// The same scan with a selectable block width: a block owns C = 4 * kW value columns of one
+// head, one warp per 4 columns, so C = 32 is the launch above and C = 16 and C = 8 split each head
+// into 8 and 16 blocks. Per column nothing changes: the lane mapping (g = lane & 7, cg = lane >> 3),
+// the 16 state entries per lane, the order of every product and sum and the two group_sum trees
+// are those of gdn_scan_seq_k, so the state and o_out bytes are the same for every C. What C
+// changes is the grid (more, smaller blocks, which the scheduler can spread over the SMs more
+// evenly) and the staging: a block stages the same kTile tokens with fewer warps, so each warp
+// stages kTile / kW slots (slot = w + i * kW) and a narrower block re-reads each q/k row once
+// per block of its head.
+template <int kW, bool kGrouped, bool kAddEps>
+__global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(ScanArgs a) {
+    constexpr int kCols = kW * 4;
+    constexpr int kSlots = kTile / kW;  // slots staged by each warp
+    static_assert(kTile % kW == 0 && kW >= 2 && kW <= 8, "kW warps must tile kTile and hold warp 1");
+    __shared__ float4 qk_s[kTile][2][D / 4];
+    __shared__ float v_s[kTile][kCols];
+    __shared__ float2 g_s[kTile];
+    float *const qk_f = reinterpret_cast<float *>(qk_s);
+    const int h = blockIdx.x, kh = key_head<kGrouped>(h, a);
+    const int lane = threadIdx.x, w = threadIdx.y;
+    const int g = lane & 7, cg = lane >> 3;
+    const int col = blockIdx.z * kCols + w * 4 + cg;
+    float *st = a.state + (size_t)h * D * D;
+    if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
+        if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0 &&
+            threadIdx.y == 0) {
+            atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
+        }
+        if (g == 0) {
+            for (int t = 0; t < a.m; ++t) {
+                a.o_out[((size_t)t * a.n_v_heads + h) * D + col] =
+                    __int_as_float(0x7fc00000);
+            }
+        }
+        return;
+    }
+    const float a_h = a.a[h], dt_h = a.dt_bias[h];
+    float s[4][4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            s[k][c] = st[(size_t)(32 * k + 4 * g + c) * D + col];
+        }
+    }
+    for (int t0 = 0; t0 < a.m; t0 += kTile) {
+        const int len = min(kTile, a.m - t0);
+        // Slot i of this warp is token t0 + w + i * kW. Every global load of the tile is issued
+        // before the first shuffle of the norms, as in gdn_scan_seq_k. The row pointer is
+        // clamped to the last conv row so that a dead slot never forms a pointer past the object.
+        float qv[kSlots][4], kv[kSlots][4], vv_l[kSlots];
+        const int v_base = 2 * a.n_k_heads * D + h * D + blockIdx.z * kCols;
+#pragma unroll
+        for (int i = 0; i < kSlots; ++i) {
+            const int slot = w + i * kW;
+            const float *row = a.conv + (size_t)min(t0 + slot, a.m - 1) * a.conv_ld;
+            if (slot < len) {
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    qv[i][r] = row[kh * D + r * kLanes + lane];
+                    kv[i][r] = row[(a.n_k_heads + kh) * D + r * kLanes + lane];
+                }
+            }
+            vv_l[i] = 0.f;
+            if (slot < len && lane < kCols) vv_l[i] = row[v_base + lane];
+        }
+        float alpha_l = 0.f, beta_l = 0.f;
+        if (w == 1 && lane < len) {
+            const float *p = a.proj + (size_t)(t0 + lane) * a.ld;
+            alpha_l = p[a.alpha_off + h];
+            beta_l = p[a.beta_off + h];
+        }
+#pragma unroll
+        for (int i = 0; i < kSlots; ++i) {
+            const int slot = w + i * kW;
+            if (slot < len) {
+                float sq = 0.f, ss = 0.f;
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    sq += qv[i][r] * qv[i][r];
+                    ss += kv[i][r] * kv[i][r];
+                }
+                const float qmul =
+                    rsqrtf(l2_den<kAddEps>(warp_sum(sq), a.eps)) * rsqrtf((float)D);
+                const float kmul = rsqrtf(l2_den<kAddEps>(warp_sum(ss), a.eps));
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    qk_f[(slot * 2) * D + r * kLanes + lane] = qv[i][r] * qmul;
+                    qk_f[(slot * 2 + 1) * D + r * kLanes + lane] = kv[i][r] * kmul;
+                }
+            }
+        }
+        if (w == 1 && lane < len) {
+            g_s[lane] = make_float2(expf(softplus_e(alpha_l + dt_h) * a_h),
+                                    1.f / (1.f + expf(-beta_l)));
+        }
+#pragma unroll
+        for (int i = 0; i < kSlots; ++i) {
+            const int slot = w + i * kW;
+            if (slot < len && lane < kCols) v_s[slot][lane] = vv_l[i];
+        }
+        __syncthreads();
+        for (int j = 0; j < len; ++j) {
+            const float2 gb = g_s[j];
+            const float vv = v_s[j][w * 4 + cg];
+            float khat[4][4], qhat[4][4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float4 kf = qk_s[j][1][8 * k + g];
+                const float4 qf = qk_s[j][0][8 * k + g];
+                khat[k][0] = kf.x;
+                khat[k][1] = kf.y;
+                khat[k][2] = kf.z;
+                khat[k][3] = kf.w;
+                qhat[k][0] = qf.x;
+                qhat[k][1] = qf.y;
+                qhat[k][2] = qf.z;
+                qhat[k][3] = qf.w;
+            }
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    s[k][c] *= gb.x;
+                    acc[c] += s[k][c] * khat[k][c];
+                }
+            }
+            const float sk = group_sum((acc[0] + acc[1]) + (acc[2] + acc[3]));
+            const float d = (vv - sk) * gb.y;
+            float oacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    s[k][c] += khat[k][c] * d;
+                    oacc[c] += s[k][c] * qhat[k][c];
+                }
+            }
+            const float o = group_sum((oacc[0] + oacc[1]) + (oacc[2] + oacc[3]));
+            if (g == 0) a.o_out[((size_t)(t0 + j) * a.n_v_heads + h) * D + col] = o;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            st[(size_t)(32 * k + 4 * g + c) * D + col] = s[k][c];
+        }
+    }
+}
+
 // The gated output RMSNorm of m rows, in place on the o_out rows gdn_scan_seq_k wrote (the
 // vendored mean+eps form, ops.cu:141; the ggml L2 form applies to the q/k norms only). One
 // block per (token, head), one thread per column; each block reads its D values before
@@ -466,12 +619,31 @@ __global__ void gdn_out_gate_k(ScanArgs a) {
     row[j] = o * rstd * a.norm_w[j] * out_gate<kSigmoid>(p[a.z_off + h * D + j]);
 }
 
+// The scan launch of `cols` value columns per block: 0 is the original kernel gdn_scan_seq_k,
+// 8, 16 and 32 are gdn_scan_seq_cols_k (the caller has checked the value).
+template <int kW, bool kGrouped, bool kAddEps>
+void launch_cols(const ScanArgs &k, void *stream) {
+    gdn_scan_seq_cols_k<kW, kGrouped, kAddEps>
+        <<<dim3(k.n_v_heads, 1, D / (4 * kW)), dim3(kLanes, kW, 1), 0, (cudaStream_t)stream>>>(k);
+}
+
+template <bool kGrouped, bool kAddEps>
+void launch_scan_kernel(const ScanArgs &k, int cols, void *stream) {
+    switch (cols) {
+    case 8: launch_cols<2, kGrouped, kAddEps>(k, stream); break;
+    case 16: launch_cols<4, kGrouped, kAddEps>(k, stream); break;
+    case 32: launch_cols<8, kGrouped, kAddEps>(k, stream); break;
+    default:
+        gdn_scan_seq_k<kGrouped, kAddEps>
+            <<<dim3(k.n_v_heads, 1, D / kBlockCols), dim3(kLanes, kWarps, 1), 0,
+               (cudaStream_t)stream>>>(k);
+    }
+}
+
 template <bool kGrouped, bool kAddEps, bool kSigmoid>
-Failure launch_form(const ScanArgs &k, void *stream) {
+Failure launch_form(const ScanArgs &k, int cols, void *stream) {
     Failure failure;
-    gdn_scan_seq_k<kGrouped, kAddEps>
-        <<<dim3(k.n_v_heads, 1, D / kBlockCols), dim3(kLanes, kWarps, 1), 0,
-           (cudaStream_t)stream>>>(k);
+    launch_scan_kernel<kGrouped, kAddEps>(k, cols, stream);
     failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
     if (failure.err == cudaSuccess) {
         gdn_out_gate_k<kSigmoid><<<dim3(k.n_v_heads, k.m), D, 0, (cudaStream_t)stream>>>(k);
@@ -481,23 +653,25 @@ Failure launch_form(const ScanArgs &k, void *stream) {
 }
 
 template <bool kGrouped, bool kAddEps>
-Failure launch_gate(const ScanArgs &k, int form, void *stream) {
+Failure launch_gate(const ScanArgs &k, int form, int cols, void *stream) {
     return (form & INFERENCE_CUDA_GDN_FORM_SIGMOID_GATE)
-               ? launch_form<kGrouped, kAddEps, true>(k, stream)
-               : launch_form<kGrouped, kAddEps, false>(k, stream);
+               ? launch_form<kGrouped, kAddEps, true>(k, cols, stream)
+               : launch_form<kGrouped, kAddEps, false>(k, cols, stream);
 }
 
 template <bool kGrouped>
-Failure launch_l2(const ScanArgs &k, int form, void *stream) {
+Failure launch_l2(const ScanArgs &k, int form, int cols, void *stream) {
     return (form & INFERENCE_CUDA_GDN_FORM_ADD_EPS_L2)
-               ? launch_gate<kGrouped, true>(k, form, stream)
-               : launch_gate<kGrouped, false>(k, form, stream);
+               ? launch_gate<kGrouped, true>(k, form, cols, stream)
+               : launch_gate<kGrouped, false>(k, form, cols, stream);
 }
 
-/* The instance of `form` (bits already validated). */
-Failure launch_scan(const ScanArgs &k, int form, void *stream) {
-    return (form & INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS) ? launch_l2<true>(k, form, stream)
-                                                          : launch_l2<false>(k, form, stream);
+/* The instance of `form` (bits already validated) with `cols` value columns per block (0: the
+ * original kernel). */
+Failure launch_scan(const ScanArgs &k, int form, int cols, void *stream) {
+    return (form & INFERENCE_CUDA_GDN_FORM_GROUPED_HEADS)
+               ? launch_l2<true>(k, form, cols, stream)
+               : launch_l2<false>(k, form, cols, stream);
 }
 
 }  // namespace
@@ -509,7 +683,23 @@ extern "C" int inference_cuda_gdn_scan_seq_launch(
         if (args == NULL || !valid(*args, stream)) {
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
-        const Failure failure = launch_scan(to_args(args), args->form, stream);
+        const Failure failure = launch_scan(to_args(args), args->form, 0, stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gdn_scan_seq_cols_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage, int block_cols) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(*args, stream) ||
+            (block_cols != 8 && block_cols != 16 && block_cols != 32)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        const Failure failure = launch_scan(to_args(args), args->form, block_cols, stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
@@ -534,7 +724,7 @@ extern "C" int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
         }
         ScanArgs k = to_args(args);
         k.p0 = k.ctx_tokens;  // ctx_tokens + m > ctx_tokens: the violation, p0 still an int
-        const Failure failure = launch_scan(k, args->form, stream);
+        const Failure failure = launch_scan(k, args->form, 0, stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

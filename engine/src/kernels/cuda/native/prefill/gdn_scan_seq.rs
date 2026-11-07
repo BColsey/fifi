@@ -91,6 +91,19 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_scan_seq_cols_launch"]
+    fn gdn_scan_seq_cols_launch_raw(
+        args: *const GdnScanSeqArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        block_cols: c_int,
+    ) -> c_int;
+}
+
+/// Value columns per block that `gdn_scan_seq_cols_k` is instantiated for (`gdn_scan_seq.h`).
+pub(in crate::kernels::cuda) const GDN_SCAN_BLOCK_COLS: [usize; 3] = [8, 16, 32];
+
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 unsafe extern "C" {
     #[link_name = "inference_cuda_gdn_scan_seq_fault_bad_bounds_launch"]
@@ -279,6 +292,31 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_launch(
     // the entry copies it before returning. `stage` is a live writable `c_int`. `stream` is
     // live for the call.
     let status = unsafe { gdn_scan_seq_launch_raw(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The same launch with `gdn_scan_seq_cols_k` owning `block_cols` value columns per block (one of
+/// [`GDN_SCAN_BLOCK_COLS`]; the entry refuses any other value). Same checks, same bytes written as
+/// [`gdn_scan_seq_launch`].
+pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_launch(
+    stream: &RawStream,
+    io: GdnScanSeqRaw<'_>,
+    block_cols: usize,
+) -> Result<(), DeviceFailure> {
+    check_scan(&io)?;
+    if !GDN_SCAN_BLOCK_COLS.contains(&block_cols) {
+        return Err(invalid_argument());
+    }
+    let args = c_args(&io);
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_scan_seq_launch`: `check_scan` proved every range inside its live
+    // allocation, large enough, 4-byte aligned, and `state` and `o_out` disjoint from every other
+    // range; the entry repeats the checks on the addresses. `block_cols` is one of the three
+    // instantiated values and the entry refuses any other. `args` lives across the call, `stage`
+    // is a live writable `c_int` and `stream` is live for the call.
+    let status = unsafe {
+        gdn_scan_seq_cols_launch_raw(&args, stream.as_ptr(), &mut stage, block_cols as c_int)
+    };
     checked(status, stage)
 }
 

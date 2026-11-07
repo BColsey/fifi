@@ -31,15 +31,16 @@
     )
 )]
 
-use std::ffi::c_int;
+use std::ffi::{OsStr, c_int};
+use std::sync::OnceLock;
 
 use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
-    FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GdnScanSeqInts, GdnScanSeqRaw,
-    gdn_scan_seq_launch,
+    FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
+    GdnScanSeqRaw, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
 };
 
 /// The kernel-side geometry of one chunk: the conv channel count
@@ -425,6 +426,25 @@ fn check_apart(call: &GdnScanSeqCall<'_>, need: &ScanBytes) -> Result<(), EngErr
     Ok(())
 }
 
+/// The value of `FIFI_GDN_SCAN_COLS`: `8`, `16` or `32` (surrounding spaces ignored) selects the
+/// scan kernel `gdn_scan_seq_cols_k` with that many value columns per block; unset and every other
+/// value, including empty and non-UTF-8, keep the original kernel (32 columns per block, 128 blocks
+/// for Qwen3.6).
+pub(crate) fn parse_scan_cols(value: Option<&OsStr>) -> Option<usize> {
+    match value?.to_str()?.trim() {
+        "8" => Some(8),
+        "16" => Some(16),
+        "32" => Some(32),
+        _ => None,
+    }
+}
+
+/// The setting of this process, read once: restart to change.
+fn scan_cols_setting() -> Option<usize> {
+    static SETTING: OnceLock<Option<usize>> = OnceLock::new();
+    *SETTING.get_or_init(|| parse_scan_cols(std::env::var_os("FIFI_GDN_SCAN_COLS").as_deref()))
+}
+
 impl CudaContext {
     /// Queues the sequential scan of `call` on `stream` in the Qwen3.6 GGUF form
     /// ([`GdnForm::QWEN36_GGUF`]); see [`CudaContext::gdn_scan_seq_form`].
@@ -447,13 +467,37 @@ impl CudaContext {
     /// Returns `BadRequest`, before any native call, for a stream or buffer of another
     /// context, a shape the kernels refuse, a range too short or misaligned, and a
     /// `state`/`o_out`/status overlap.
+    ///
+    /// `FIFI_GDN_SCAN_COLS` (see [`parse_scan_cols`]) selects the scan kernel with narrower
+    /// blocks; unset, the original kernel runs. Both write the same bytes.
     pub(crate) fn gdn_scan_seq_form(
         &self,
         stream: &DeviceStream,
         call: GdnScanSeqCall<'_>,
         form: GdnForm,
     ) -> Result<(), EngError> {
+        self.gdn_scan_seq_cols(stream, call, form, scan_cols_setting())
+    }
+
+    /// [`Self::gdn_scan_seq_form`] with an explicit kernel: `None` is the original
+    /// `gdn_scan_seq_k`, `Some(cols)` is `gdn_scan_seq_cols_k` with `cols` value columns per
+    /// block (8, 16 or 32; another value is a `BadRequest`). The checks, the refusals and the bytes
+    /// written are the same.
+    pub(crate) fn gdn_scan_seq_cols(
+        &self,
+        stream: &DeviceStream,
+        call: GdnScanSeqCall<'_>,
+        form: GdnForm,
+        cols: Option<usize>,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
+        if let Some(cols) = cols
+            && !GDN_SCAN_BLOCK_COLS.contains(&cols)
+        {
+            return Err(EngError::BadRequest(format!(
+                "the CUDA scan takes {GDN_SCAN_BLOCK_COLS:?} value columns per block, got {cols}"
+            )));
+        }
         check_shape(&call.shape, call.eps)?;
         let ints = scan_ints(&call.shape)?;
         let need = scan_bytes(call.shape)?;
@@ -473,26 +517,27 @@ impl CudaContext {
             .transpose()?;
         let eps = call.eps;
         let form = form.bits();
-        self.launch_on(stream, move |raw| {
-            gdn_scan_seq_launch(
-                raw,
-                GdnScanSeqRaw {
-                    conv,
-                    proj,
-                    a,
-                    dt_bias,
-                    norm_w,
-                    state,
-                    o_out,
-                    status,
-                    ints,
-                    eps,
-                    form,
-                },
-            )
+        let io = GdnScanSeqRaw {
+            conv,
+            proj,
+            a,
+            dt_bias,
+            norm_w,
+            state,
+            o_out,
+            status,
+            ints,
+            eps,
+            form,
+        };
+        self.launch_on(stream, move |raw| match cols {
+            Some(cols) => gdn_scan_seq_cols_launch(raw, io, cols),
+            None => gdn_scan_seq_launch(raw, io),
         })
     }
 }
 
+#[cfg(all(test, feature = "native-cuda"))]
+mod cols_tests;
 #[cfg(all(test, feature = "native-cuda"))]
 mod tests;

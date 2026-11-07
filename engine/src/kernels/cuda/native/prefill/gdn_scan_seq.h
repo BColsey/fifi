@@ -100,6 +100,14 @@ typedef struct inference_cuda_gdn_scan_seq_args {
 int inference_cuda_gdn_scan_seq_launch(const inference_cuda_gdn_scan_seq_args *args,
                                        void *stream, int *out_stage);
 
+/* The same launch with the scan kernel gdn_scan_seq_cols_k, which owns block_cols (8, 16 or 32;
+ * any other value is INVALID_ARGUMENT) value columns per block instead of 32 with the value-column
+ * arithmetic unchanged: state and o_out bytes equal those of the entry above for every valid
+ * call. The gated output RMSNorm is the same kernel. Arguments, limits and overlap rules are
+ * those of the entry above. */
+int inference_cuda_gdn_scan_seq_cols_launch(const inference_cuda_gdn_scan_seq_args *args,
+                                            void *stream, int *out_stage, int block_cols);
+
 #ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
 /* Qualified fault path (the device re-check): validates every rule of the entry EXCEPT the
  * p0/m bound, then overrides p0 so the bound is violated, so the KERNELS' own device guard
