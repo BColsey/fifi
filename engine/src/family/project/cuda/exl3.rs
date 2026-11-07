@@ -188,6 +188,47 @@ impl<'a> Exl3Members<'a> {
     }
 }
 
+impl<'a> Exl3MatrixView<'a> {
+    /// The id-indexed call that projects `io`'s row with this one matrix: a bank of ONE member, so
+    /// `ids[slot]` must read 0 when the launch runs (the kernels add `id * stride` to the
+    /// matrix's own addresses, and 0 adds nothing). The strides are the matrix's own sizes, which
+    /// the launch only needs non-zero; they are never multiplied by a nonzero id. A matrix with a
+    /// bias keeps it: the kernels add `bias[col]` of the call, not of a member.
+    pub(in crate::family) fn indexed_call(
+        self,
+        io: &Exl3Io<'a>,
+        ids: DeviceRange<'a>,
+        slot: u32,
+    ) -> Exl3IndexedCall<'a> {
+        Exl3IndexedCall {
+            call: Exl3LinearCall {
+                trellis: self.trellis,
+                suh: self.suh,
+                svh: self.svh,
+                bias: self.bias,
+                x: io.x,
+                xh: io.xh,
+                z: io.z,
+                out: io.out,
+                flag: io.flag,
+                rows: io.rows,
+                split_k: 2,
+                k: self.shape[0],
+                n: self.shape[1],
+                bits_twice: self.bits_twice,
+                book: self.book,
+                fused: io.fused,
+            },
+            ids,
+            slot,
+            members: 1,
+            trellis_stride: self.trellis.bytes(),
+            scale_stride: self.suh.bytes() / size_of::<f32>(),
+            offsets: None,
+        }
+    }
+}
+
 impl Exl3MatrixView<'_> {
     /// Reads F32 directly, before either the q8_1 or tiled fp16 activation pack.
     pub(crate) fn project(

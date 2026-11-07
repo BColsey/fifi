@@ -376,7 +376,7 @@ impl CudaContext {
 
     /// The kernel the single-row projections of this context run on, or the refusal of a bad
     /// value of the variable.
-    fn single_row_setting(&self) -> Result<SingleRow, EngError> {
+    pub(crate) fn single_row_setting(&self) -> Result<SingleRow, EngError> {
         Ok(effective_single_row(
             single_gather_explicit()?,
             self.exl3_single_row_default.get(),
@@ -865,6 +865,32 @@ impl CudaContext {
         calls: &[Exl3IndexedCall<'_>],
         cols: u32,
     ) -> Result<(), EngError> {
+        self.grouped_indexed_by(stream, calls, cols, false)
+    }
+
+    /// [`Self::exl3_grouped_indexed`] with the 20-pair launch available whatever the environment
+    /// says: a group of 17 to 20 calls runs the 20-pair kernels (`option_*` in `exl3.cu`, the
+    /// same bodies on the larger parameter block), a group of at most 16 runs the default launch
+    /// (or the DP4A one when that option is on). It writes the bytes of the same calls split
+    /// into launches of at most 16. The shared expert of the Qwen3.6 MoE block rides in the
+    /// gate/up launch of the routed experts through this entry (`FIFI_EXL3_SHARED_IN_ROUTED`).
+    pub(crate) fn exl3_grouped_indexed_wide(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3IndexedCall<'_>],
+        cols: u32,
+    ) -> Result<(), EngError> {
+        self.grouped_indexed_by(stream, calls, cols, true)
+    }
+
+    /// The id-indexed launch; `widen` adds the 20-pair option to the environment's options.
+    fn grouped_indexed_by(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3IndexedCall<'_>],
+        cols: u32,
+        widen: bool,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
         #[cfg(test)]
         {
@@ -873,7 +899,8 @@ impl CudaContext {
             self.exl3_launches.set(counts);
         }
         let refuse = |what: &str| EngError::BadRequest(format!("EXL3 indexed launch: {what}"));
-        let options = self.exl3_indexed_options()?;
+        let mut options = self.exl3_indexed_options()?;
+        options.pairs20 |= widen;
         let capacity = options.capacity();
         if calls.is_empty() || calls.len() > capacity {
             return Err(refuse(&format!("needs 1..={capacity} calls")));
