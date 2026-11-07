@@ -387,6 +387,8 @@ mod cuda_tests;
 mod exl3_cuda_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod graph_bench;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod load_plan;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod projection_bench;
 #[cfg(test)]
