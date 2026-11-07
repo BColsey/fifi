@@ -1,0 +1,790 @@
+//! The MoE block of one Flash-Next layer on a device hidden row, with the routed experts in the
+//! expert bank (`bank.rs`) instead of all resident. One call per layer and token.
+//!
+//! WHAT, in launch order on the one stream:
+//!
+//! 1. The router (shared kernel) writes the picks, their renormalized weights and the shared gate.
+//! 2. The layer's slot row goes to the device and `tiered_classify` maps every pick to its bank
+//!    slot: a resident pick to its slot, a missed pick to slot 0 with weight +0.0 (the filler
+//!    rule). The classify log (ten ids and weights, 80 bytes) comes back to the host.
+//! 3. The resident pass is queued: gate and up of the ten slots (id-indexed launches over the bank
+//!    buffer), SwiGLU, down, the shared expert, and the combine with the classified weights.
+//! 4. The bank plans and runs the copies for the picks (`DeviceBank::step`, all ten picks, hits
+//!    included, so the policy sees every use). The copies run on the bank's own stream, which is
+//!    not ordered with the block's stream: they overlap the resident pass, and the host waits for
+//!    them before it queues the miss pass.
+//! 5. With at least one miss, the miss pass is queued: the same launches over the slot row after
+//!    the copies, with the missed picks on their new slots at their true weights and every other
+//!    pick on the filler at +0.0 ([`miss_pass_inputs`]); the combine adds it to the resident
+//!    result.
+//!
+//! WHY this shape: the resident pass needs nothing a miss brings, so it runs while the host
+//! plans and waits for the copies. The overlap is safe because of one rule of the bank's policy:
+//! the slot of every pick and slot 0 are never victims in a pass, so a copy only writes a slot
+//! that neither the resident pass (the picks' slots and the filler slot 0) nor anything earlier
+//! reads. The slot-row upload at the start of the call waits for the block's stream, so no
+//! launch of an earlier layer or token is still reading this layer's slots when a copy starts.
+//! The shared expert rides in the first pass because it never misses. A layer without a miss is one pass whose result goes straight to the output. The two
+//! passes together touch every pick exactly once: the weights of the two passes add to the
+//! router's weights bit for bit.
+//!
+//! The split result is not bit-identical to one launch over an all-resident bank: the resident
+//! picks and the missed picks are summed in two groups, so the floating-point association
+//! differs. Every product is the same. The tests state the tolerance.
+//!
+//! The filler rule multiplies slot 0's expert output by +0.0. If that output held an infinity or
+//! a NaN the product would be NaN and would poison the sum. With the check off (the default) a
+//! non-finite slot 0 output turns the whole block output, and so the token, into NaN with no
+//! error; [`SplitMoe::verify_finite_filler`] reads the filler rows back and refuses it, at the
+//! price of a wait on the stream before the copies start, which removes the overlap of step 4.
+//!
+//! The pure parts (the classify oracle, the log parser, the spans of the bank buffer and the
+//! private scratch layout) are host code with host tests; the launches are native-cuda only.
+
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::ops::Range;
+
+use super::bank::miss_pass_inputs;
+use crate::{
+    EngError,
+    family::{
+        flash_next::moe::slot_bank::{PARTS, SlotBankLayout},
+        qwen36::tiered::classify::{Classified, ROUTE_INVALID, classify_reference},
+    },
+};
+
+const F32: usize = size_of::<f32>();
+const I32: usize = size_of::<i32>();
+/// Bytes of one entry of the classify log: the id and the bits of the weight.
+const LOG_ENTRY: usize = 8;
+/// Control block, request line: the sizes the classify kernel writes whether or not it is read.
+const CTRL_BYTES: usize = 64;
+const REQUEST_BYTES: usize = 128;
+/// Every scratch region starts at a multiple of this (the arena alignment).
+const REGION_ALIGN: usize = 256;
+
+fn refuse(detail: String) -> EngError {
+    EngError::BadRequest(format!("Flash-Next split MoE block: {detail}"))
+}
+
+fn align_up(value: usize) -> usize {
+    value.next_multiple_of(REGION_ALIGN)
+}
+
+/// The block's private device scratch: the slot row, the classify outputs and the second pass's
+/// inputs. One allocation, regions at aligned offsets. About 24 KiB at the real sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ScratchLayout {
+    /// i32 `[n_expert]`: the layer's slot row, uploaded before each classification.
+    pub(super) slot_row: usize,
+    /// i32 `[top_k]`: the bank slot of each pick for the resident pass.
+    pub(super) slot_ids: usize,
+    /// f32 `[top_k]`: the resident pass's combine weights.
+    pub(super) weights: usize,
+    /// `8 * top_k` bytes: the raw picks (id, weight bits).
+    pub(super) log: usize,
+    pub(super) ctrl: usize,
+    pub(super) word: usize,
+    pub(super) mbox_req: usize,
+    /// f32 `[hidden]`: the classify kernel copies the row here when a pick misses.
+    pub(super) mbox_row: usize,
+    /// i32 `[top_k]` and f32 `[top_k]`: the miss pass's slots and weights.
+    pub(super) miss_ids: usize,
+    pub(super) miss_weights: usize,
+    /// f32 `[hidden]`: the resident pass's result while a miss pass is still to come.
+    pub(super) partial: usize,
+    pub(super) total: usize,
+}
+
+impl ScratchLayout {
+    pub(super) fn new(n_expert: usize, top_k: usize, hidden: usize) -> Result<Self, EngError> {
+        let overflow = || refuse("the scratch size overflows".into());
+        let regions = [
+            n_expert.checked_mul(I32),
+            top_k.checked_mul(I32),
+            top_k.checked_mul(F32),
+            top_k.checked_mul(LOG_ENTRY),
+            Some(CTRL_BYTES),
+            Some(I32),
+            Some(REQUEST_BYTES),
+            hidden.checked_mul(F32),
+            top_k.checked_mul(I32),
+            top_k.checked_mul(F32),
+            hidden.checked_mul(F32),
+        ];
+        let mut offsets = [0usize; 11];
+        let mut at = 0usize;
+        for (offset, size) in offsets.iter_mut().zip(regions) {
+            *offset = at;
+            at = size
+                .ok_or_else(overflow)?
+                .checked_next_multiple_of(REGION_ALIGN)
+                .and_then(|size| at.checked_add(size))
+                .ok_or_else(overflow)?;
+        }
+        let [
+            slot_row,
+            slot_ids,
+            weights,
+            log,
+            ctrl,
+            word,
+            mbox_req,
+            mbox_row,
+            miss_ids,
+            miss_weights,
+            partial,
+        ] = offsets;
+        Ok(Self {
+            slot_row,
+            slot_ids,
+            weights,
+            log,
+            ctrl,
+            word,
+            mbox_req,
+            mbox_row,
+            miss_ids,
+            miss_weights,
+            partial,
+            total: at,
+        })
+    }
+}
+
+/// The picks of the classify log: `(ids, weights)` in rank order.
+pub(super) fn parse_log(raw: &[u8], top_k: usize) -> Result<(Vec<i32>, Vec<f32>), EngError> {
+    if raw.len() != top_k * LOG_ENTRY {
+        return Err(refuse(format!(
+            "the classify log has {} bytes, {top_k} picks need {}",
+            raw.len(),
+            top_k * LOG_ENTRY
+        )));
+    }
+    let (mut ids, mut weights) = (Vec::with_capacity(top_k), Vec::with_capacity(top_k));
+    for entry in raw.as_chunks::<LOG_ENTRY>().0 {
+        let (id, weight) = entry.split_at(I32);
+        ids.push(i32::from_le_bytes(id.try_into().expect("four bytes")));
+        weights.push(f32::from_le_bytes(weight.try_into().expect("four bytes")));
+    }
+    Ok((ids, weights))
+}
+
+/// The host's classification of the router's picks against `slot_row` before the copies: what the
+/// device kernel computed (the kernel equals this oracle bit for bit). Refuses a route the
+/// kernel flagged and a router fault, which have no second pass.
+pub(super) fn classify_picks(
+    slot_row: &[i32],
+    slots: usize,
+    ids: &[i32],
+    weights: &[f32],
+) -> Result<Classified, EngError> {
+    let classified = classify_reference(slot_row, slots, ids, weights)
+        .map_err(|error| refuse(format!("pick lists of different lengths: {error:?}")))?;
+    if classified.word & ROUTE_INVALID != 0 {
+        return Err(refuse(format!("the router's picks are invalid: {ids:?}")));
+    }
+    if let Some(at) = ids.iter().position(|&id| id < 0) {
+        return Err(refuse(format!(
+            "the router faulted on pick {at} (id {}); non-finite logits",
+            ids[at]
+        )));
+    }
+    Ok(classified)
+}
+
+/// Where the three parts of an expert sit in a bank buffer of `slots` slots, as the id-indexed
+/// launch addresses them: member `i` of a part is the component at its start plus `i` strides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SlotSpans {
+    pub(super) slots: usize,
+    /// Bytes between the trellises of two slots.
+    pub(super) trellis_stride: usize,
+    /// F32 values between the `suh` (and the `svh`) of two slots.
+    pub(super) scale_stride: usize,
+    pub(super) parts: [PartSpan; PARTS],
+}
+
+/// One part's ranges of the bank buffer, from the start of its component in slot 0 to its end in
+/// the last slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PartSpan {
+    pub(super) trellis: Range<usize>,
+    pub(super) suh: Range<usize>,
+    pub(super) svh: Range<usize>,
+    /// `[k, n]` of the matrix.
+    pub(super) shape: [usize; 2],
+    pub(super) bits_twice: u8,
+}
+
+impl SlotSpans {
+    pub(super) fn new(layout: &SlotBankLayout, slots: usize) -> Result<Self, EngError> {
+        let mut parts = Vec::with_capacity(PARTS);
+        for index in 0..PARTS {
+            let part = layout.part(index);
+            let [trellis, suh, svh] = layout.bank_ranges(index, slots)?;
+            let bits_twice = u8::try_from(part.words / 8)
+                .ok()
+                .filter(|&bits| usize::from(bits) * 8 == part.words)
+                .ok_or_else(|| {
+                    refuse(format!("{} words per tile is not a whole rate", part.words))
+                })?;
+            parts.push(PartSpan {
+                trellis,
+                suh,
+                svh,
+                shape: part.shape,
+                bits_twice,
+            });
+        }
+        let record = layout.record_bytes();
+        if layout.trellis_stride_bytes() != record || layout.scale_stride_floats() * F32 != record {
+            return Err(refuse(
+                "the trellis and scale strides of a slot differ from the record size".into(),
+            ));
+        }
+        Ok(Self {
+            slots,
+            trellis_stride: layout.trellis_stride_bytes(),
+            scale_stride: layout.scale_stride_floats(),
+            parts: parts
+                .try_into()
+                .map_err(|_| refuse("three parts expected".into()))?,
+        })
+    }
+}
+
+/// The first pick whose weight is +0.0 (a filler pick) and whose down row holds an infinity or a NaN:
+/// `rows` holds `weights.len()` rows of `hidden` f32 values. The product of such a row with +0.0 is
+/// NaN, which would reach every column of the sum.
+pub(super) fn first_poisoned_filler(rows: &[u8], hidden: usize, weights: &[f32]) -> Option<usize> {
+    let width = hidden * F32;
+    if width == 0 {
+        return None;
+    }
+    rows.chunks_exact(width)
+        .zip(weights)
+        .position(|(bytes, &weight)| {
+            weight == 0.0
+                && !bytes
+                    .as_chunks::<F32>()
+                    .0
+                    .iter()
+                    .all(|b| f32::from_le_bytes(*b).is_finite())
+        })
+}
+
+/// The two passes of a layer, as the host decided them: how the router's picks split between the
+/// resident pass and the miss pass.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PassInputs {
+    /// Slots and weights of the miss pass (`None` without a miss).
+    pub(super) miss: Option<(Vec<i32>, Vec<f32>)>,
+    pub(super) misses: usize,
+}
+
+/// The miss pass's inputs after the copies, from the classification made before them.
+pub(super) fn plan_second_pass(
+    ids: &[i32],
+    weights: &[f32],
+    classified: &Classified,
+    slot_row_after: &[i32],
+) -> Result<PassInputs, EngError> {
+    let misses = classified.misses.len();
+    if misses == 0 {
+        return Ok(PassInputs { miss: None, misses });
+    }
+    let inputs = miss_pass_inputs(ids, weights, classified, slot_row_after)?;
+    Ok(PassInputs {
+        miss: Some(inputs),
+        misses,
+    })
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[allow(unused_imports, reason = "the decode step is the first caller")]
+pub(in crate::family::flash_next) use device::{SplitMoe, SplitMoeTrunk};
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod device {
+    use super::{
+        CTRL_BYTES, F32, I32, LOG_ENTRY, REQUEST_BYTES, ScratchLayout, SlotSpans, classify_picks,
+        first_poisoned_filler, parse_log, plan_second_pass, refuse,
+    };
+    use crate::{
+        EngError,
+        family::{
+            flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
+            project::cuda::exl3::Exl3Weight,
+            qwen36::cuda::{
+                exl3_moe::{Exl3MoeBufs, Scratch, SharedWeights, shared_of},
+                moe::{Launch, MoeDims},
+            },
+        },
+        kernels::cuda::{
+            CudaContext, DeviceBuffer, DeviceRange,
+            prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
+            resident::{
+                exl3::{Exl3IndexedCall, Exl3LinearCall},
+                moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
+                router::{RouterCall, RouterOut, RouterShape, RouterWeights},
+                tiered_classify::{ClassifyCall, ClassifyShape},
+            },
+        },
+        weights::exl3::Codebook,
+    };
+
+    /// The trunk weights of one layer's MoE block: the router, the shared expert's gate row, and
+    /// the shared expert's three matrices. The caller borrows them from the loaded weights.
+    pub(in crate::family::flash_next) struct SplitMoeTrunk<'w> {
+        /// Raw F32 `[n_expert][hidden]`.
+        pub(in crate::family::flash_next) router: &'w DeviceBuffer,
+        /// Raw F32 `[hidden]`: the shared expert's gate row.
+        pub(in crate::family::flash_next) router_shared: &'w DeviceBuffer,
+        pub(in crate::family::flash_next) shared_gate: &'w Exl3Weight,
+        pub(in crate::family::flash_next) shared_up: &'w Exl3Weight,
+        pub(in crate::family::flash_next) shared_down: &'w Exl3Weight,
+    }
+
+    /// The block of every layer: one trunk per layer, the bank and the private scratch.
+    pub(in crate::family::flash_next) struct SplitMoe<'w> {
+        trunks: Vec<SplitMoeTrunk<'w>>,
+        bank: DeviceBank,
+        spans: SlotSpans,
+        layout: ScratchLayout,
+        scratch: DeviceBuffer,
+        book: Codebook,
+        verify_finite_filler: bool,
+    }
+
+    /// One pass over the bank.
+    struct Pass<'a> {
+        layer: usize,
+        /// i32 `[top_k]`: the bank slot of each pick.
+        ids: DeviceRange<'a>,
+        /// f32 `[top_k]`: the combine weight of each pick.
+        weights: DeviceRange<'a>,
+        /// Whether the shared expert rides in this pass.
+        shared: bool,
+        /// f32 `[hidden]`: the residual the combine adds to.
+        res: DeviceRange<'a>,
+        out: DeviceRange<'a>,
+    }
+
+    /// One pair of an id-indexed launch: the part, the pick whose slot id chooses the member, the
+    /// input row and the output row.
+    struct Item<'a> {
+        part: usize,
+        pick: u32,
+        x: DeviceRange<'a>,
+        out: DeviceRange<'a>,
+    }
+
+    fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
+        buffer.range(0, buffer.bytes())
+    }
+
+    fn row<'b>(
+        range: &DeviceRange<'b>,
+        width: usize,
+        index: usize,
+    ) -> Result<DeviceRange<'b>, EngError> {
+        range.buffer().range(range.offset() + index * width, width)
+    }
+
+    fn le_i32(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn le_f32(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    impl<'w> SplitMoe<'w> {
+        /// `trunks[layer]` is layer `layer`'s trunk; `bank` has one row per layer. `layout` is the
+        /// bank's record layout, the one its records were packed with. Allocates the private
+        /// scratch (about 24 KiB), zeroed.
+        pub(in crate::family::flash_next) fn new(
+            ctx: &CudaContext,
+            trunks: Vec<SplitMoeTrunk<'w>>,
+            bank: DeviceBank,
+            layout: &SlotBankLayout,
+            dims: &MoeDims,
+        ) -> Result<Self, EngError> {
+            let geometry = *bank.state().geometry();
+            if trunks.len() != geometry.layers {
+                return Err(refuse(format!(
+                    "{} trunks for a bank of {} layers",
+                    trunks.len(),
+                    geometry.layers
+                )));
+            }
+            if geometry.experts != dims.n_expert
+                || geometry.top_k != dims.top_k
+                || geometry.record_bytes != layout.record_bytes()
+            {
+                return Err(refuse(format!(
+                    "the bank ({} experts, {} picks, {} byte records) does not match the block \
+                     ({} experts, {} picks, {} byte records)",
+                    geometry.experts,
+                    geometry.top_k,
+                    geometry.record_bytes,
+                    dims.n_expert,
+                    dims.top_k,
+                    layout.record_bytes()
+                )));
+            }
+            let (gate, down) = (layout.part(0).shape, layout.part(2).shape);
+            if gate != [dims.hidden, dims.inter] || down != [dims.inter, dims.hidden] {
+                return Err(refuse(format!(
+                    "the record holds {gate:?} and {down:?} matrices; the block is {} wide with \
+                     an inner width of {}",
+                    dims.hidden, dims.inter
+                )));
+            }
+            let spans = SlotSpans::new(layout, geometry.slots)?;
+            let book = trunks
+                .first()
+                .ok_or_else(|| refuse("a block without layers".into()))?
+                .shared_gate
+                .view()?
+                .book;
+            let scratch_layout = ScratchLayout::new(dims.n_expert, dims.top_k, dims.hidden)?;
+            let scratch = ctx.upload(&vec![0u8; scratch_layout.total])?;
+            Ok(Self {
+                trunks,
+                bank,
+                spans,
+                layout: scratch_layout,
+                scratch,
+                book,
+                verify_finite_filler: false,
+            })
+        }
+
+        pub(in crate::family::flash_next) fn bank(&self) -> &DeviceBank {
+            &self.bank
+        }
+
+        /// When set, every pass reads the down rows back and refuses a filler pick (weight +0.0)
+        /// whose expert output is not finite. Off by default: it adds a read of
+        /// `top_k * hidden` floats to every pass.
+        pub(in crate::family::flash_next) fn verify_finite_filler(&mut self, on: bool) {
+            self.verify_finite_filler = on;
+        }
+
+        /// Queues layer `layer`'s MoE block on `launch.stream`. Reads `bufs.route.norm_row` (f32
+        /// `[hidden]`, the hyper-mixed row) and `bufs.route.resid_in` (a zero row); writes the
+        /// block output, the weighted picks plus the gated shared expert and no residual, to
+        /// `bufs.route.resid_out`. A `resid_in` that is not zero is added into the result. Returns
+        /// after every launch of the block is queued. It waits on the stream for the slot row, for
+        /// the classify log and, on a miss, for the bank copies. With the filler check off, a
+        /// non-finite output of slot 0 makes the block output NaN without an error.
+        pub(in crate::family::flash_next) fn run(
+            &mut self,
+            launch: &Launch<'_>,
+            layer: usize,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+        ) -> Result<(), EngError> {
+            if dims.rows != 1 {
+                return Err(refuse(format!(
+                    "the block takes one row, got {}",
+                    dims.rows
+                )));
+            }
+            let geometry = *self.bank.state().geometry();
+            if dims.n_expert != geometry.experts
+                || dims.top_k != geometry.top_k
+                || layer >= geometry.layers
+            {
+                return Err(refuse(format!(
+                    "layer {layer} with {} experts and {} picks does not fit a bank of {} layers, \
+                     {} experts and {} picks",
+                    dims.n_expert, dims.top_k, geometry.layers, geometry.experts, geometry.top_k
+                )));
+            }
+            let (ctx, stream) = (launch.ctx, launch.stream);
+            let sc = self.layout;
+            let (h, k) = (dims.hidden, dims.top_k);
+            let slot_row_before: Vec<i32> = self.bank.state().slot_row(layer).to_vec();
+            let scratch = &self.scratch;
+            let slot_ids = scratch.range(sc.slot_ids, k * I32)?;
+            let slot_weights = scratch.range(sc.weights, k * F32)?;
+            let partial = scratch.range(sc.partial, h * F32)?;
+
+            scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row_before))?;
+            let trunk = &self.trunks[layer];
+            ctx.router(
+                stream,
+                RouterCall {
+                    shape: RouterShape {
+                        m: 1,
+                        hidden: h,
+                        n_expert: dims.n_expert,
+                        top_k: k,
+                    },
+                    x: bufs.route.norm_row,
+                    weights: RouterWeights {
+                        w: whole(trunk.router)?,
+                        w_shared: Some(whole(trunk.router_shared)?),
+                    },
+                    logits: bufs.route.logits,
+                    out: RouterOut {
+                        ids: bufs.route.ids,
+                        weights: bufs.route.weights,
+                        shared_gate: Some(bufs.route.shared_gate),
+                        status: bufs.route.status,
+                    },
+                },
+            )?;
+            ctx.tiered_classify(
+                stream,
+                ClassifyCall {
+                    shape: ClassifyShape {
+                        n_expert: dims.n_expert,
+                        slots: geometry.slots,
+                        top_k: k,
+                        hidden: h,
+                        layer,
+                    },
+                    ids: bufs.route.ids,
+                    weights: bufs.route.weights,
+                    slot_row: scratch.range(sc.slot_row, dims.n_expert * I32)?,
+                    norm_row: bufs.route.norm_row,
+                    slot_ids_out: slot_ids,
+                    weights_out: slot_weights,
+                    log_out: scratch.range(sc.log, k * LOG_ENTRY)?,
+                    ctrl: scratch.range(sc.ctrl, CTRL_BYTES)?,
+                    word: scratch.range(sc.word, I32)?,
+                    mbox_req: scratch.range(sc.mbox_req, REQUEST_BYTES)?,
+                    mbox_row: scratch.range(sc.mbox_row, h * F32)?,
+                },
+            )?;
+            let mut raw = vec![0u8; k * LOG_ENTRY];
+            scratch.read_at(stream, sc.log, &mut raw)?;
+            let (ids, weights) = parse_log(&raw, k)?;
+            let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
+
+            // The resident pass. With a miss its result waits in the partial buffer; without one
+            // it is the block's output.
+            let first_out = if classified.misses.is_empty() {
+                bufs.route.resid_out
+            } else {
+                partial
+            };
+            self.pass(
+                launch,
+                bufs,
+                dims,
+                Pass {
+                    layer,
+                    ids: slot_ids,
+                    weights: slot_weights,
+                    shared: true,
+                    res: bufs.route.resid_in,
+                    out: first_out,
+                },
+            )?;
+            if self.verify_finite_filler {
+                self.check_filler(launch, bufs, dims, &classified.weights)?;
+            }
+
+            // The copies for every pick, hits included; they run behind the resident pass.
+            self.bank.step(ctx, layer, &ids)?;
+            let slot_row_after = self.bank.state().slot_row(layer).to_vec();
+            let second = plan_second_pass(&ids, &weights, &classified, &slot_row_after)?;
+            if let Some((miss_slots, miss_weights)) = second.miss {
+                let scratch = &self.scratch;
+                scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))?;
+                scratch.write_at(stream, sc.miss_weights, &le_f32(&miss_weights))?;
+                self.pass(
+                    launch,
+                    bufs,
+                    dims,
+                    Pass {
+                        layer,
+                        ids: scratch.range(sc.miss_ids, k * I32)?,
+                        weights: scratch.range(sc.miss_weights, k * F32)?,
+                        shared: false,
+                        res: scratch.range(sc.partial, h * F32)?,
+                        out: bufs.route.resid_out,
+                    },
+                )?;
+                if self.verify_finite_filler {
+                    self.check_filler(launch, bufs, dims, &miss_weights)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Reads the down rows back and refuses a non-finite row whose pick weight is zero.
+        fn check_filler(
+            &self,
+            launch: &Launch<'_>,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+            weights: &[f32],
+        ) -> Result<(), EngError> {
+            let mut raw = vec![0u8; dims.top_k * dims.hidden * F32];
+            bufs.expert_down.buffer().read_at(
+                launch.stream,
+                bufs.expert_down.offset(),
+                &mut raw,
+            )?;
+            match first_poisoned_filler(&raw, dims.hidden, weights) {
+                Some(pick) => Err(refuse(format!(
+                    "the filler expert (slot 0) gave a non-finite output on pick {pick}; \
+                     0.0 times it would poison the sum"
+                ))),
+                None => Ok(()),
+            }
+        }
+
+        /// One id-indexed launch group over the bank buffer of `layer`, chunked at the launch
+        /// capacity; every chunk starts again at row 0 of the scratch.
+        fn grouped<'a>(
+            &'a self,
+            launch: &Launch<'_>,
+            layer: usize,
+            items: &[Item<'a>],
+            (ids, scratch): (DeviceRange<'a>, &Scratch<'a>),
+        ) -> Result<(), EngError> {
+            let bank = self
+                .bank
+                .slots(layer)
+                .ok_or_else(|| refuse(format!("layer {layer} is outside the bank")))?;
+            let first = items
+                .first()
+                .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
+            let [k, n] = self.spans.parts[first.part].shape;
+            let members = u32::try_from(self.spans.slots)
+                .map_err(|_| refuse("the bank has too many slots".into()))?;
+            for chunk in items.chunks(launch.ctx.exl3_indexed_capacity()) {
+                let mut calls = Vec::with_capacity(chunk.len());
+                for (index, item) in chunk.iter().enumerate() {
+                    let span = &self.spans.parts[item.part];
+                    if span.shape != [k, n] {
+                        return Err(refuse("a launch group mixes matrix shapes".into()));
+                    }
+                    calls.push(Exl3IndexedCall {
+                        call: Exl3LinearCall {
+                            trellis: bank.range(span.trellis.start, span.trellis.len())?,
+                            suh: bank.range(span.suh.start, span.suh.len())?,
+                            svh: bank.range(span.svh.start, span.svh.len())?,
+                            bias: None,
+                            x: item.x,
+                            xh: row(&scratch.xh, k * F32, index)?,
+                            z: row(&scratch.z, n * F32, index)?,
+                            out: item.out,
+                            flag: scratch.flag,
+                            rows: 1,
+                            split_k: 2,
+                            k,
+                            n,
+                            bits_twice: span.bits_twice,
+                            book: self.book,
+                            fused: false,
+                        },
+                        ids,
+                        slot: item.pick,
+                        members,
+                        trellis_stride: self.spans.trellis_stride,
+                        scale_stride: self.spans.scale_stride,
+                        offsets: None,
+                    });
+                }
+                launch.ctx.exl3_grouped_indexed(
+                    launch.stream,
+                    &calls,
+                    launch.ctx.exl3_indexed_cols(n)?,
+                )?;
+            }
+            Ok(())
+        }
+
+        /// One pass over the bank of `pass.layer`: gate and up of the picks, SwiGLU, down, the
+        /// shared expert when asked, and the combine of `pass.weights` on top of `pass.res`.
+        fn pass(
+            &self,
+            launch: &Launch<'_>,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+            pass: Pass<'_>,
+        ) -> Result<(), EngError> {
+            let (h, i, k) = (dims.hidden, dims.inter, dims.top_k);
+            let mut items = Vec::with_capacity(2 * k);
+            for pick in 0..k {
+                for part in 0..2usize {
+                    items.push(Item {
+                        part,
+                        pick: pick as u32,
+                        x: bufs.route.norm_row,
+                        out: row(&bufs.expert_gu, i * F32, 2 * pick + part)?,
+                    });
+                }
+            }
+            self.grouped(launch, pass.layer, &items, (pass.ids, &bufs.scratch))?;
+            launch.ctx.swiglu_rows(
+                launch.stream,
+                SwigluRowsCall {
+                    shape: SwigluRowsShape {
+                        rows: k,
+                        n_ff: i,
+                        up_off: i,
+                        ld_in: 2 * i,
+                        ld_out: i,
+                    },
+                    gu: bufs.expert_gu,
+                    act: bufs.expert_act,
+                },
+            )?;
+            let mut items = Vec::with_capacity(k);
+            for pick in 0..k {
+                items.push(Item {
+                    part: 2,
+                    pick: pick as u32,
+                    x: row(&bufs.expert_act, i * F32, pick)?,
+                    out: row(&bufs.expert_down, h * F32, pick)?,
+                });
+            }
+            self.grouped(launch, pass.layer, &items, (pass.ids, &bufs.scratch))?;
+            let shared = if pass.shared {
+                let trunk = &self.trunks[pass.layer];
+                shared_of(
+                    launch,
+                    &SharedWeights {
+                        gate: trunk.shared_gate,
+                        up: trunk.shared_up,
+                        down: trunk.shared_down,
+                    },
+                    bufs,
+                    dims,
+                )?;
+                Some(SharedTerm {
+                    gate: bufs.route.shared_gate,
+                    row: bufs.shared_out,
+                })
+            } else {
+                None
+            };
+            launch.ctx.moe_combine(
+                launch.stream,
+                CombineCall {
+                    shape: CombineShape {
+                        m: 1,
+                        n: h,
+                        top_k: k,
+                        ld_down: h,
+                    },
+                    res: pass.res,
+                    down: bufs.expert_down,
+                    weights: pass.weights,
+                    shared,
+                    out: CombineOut::To(pass.out),
+                },
+            )
+        }
+    }
+}

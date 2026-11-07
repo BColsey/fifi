@@ -398,7 +398,7 @@ pub(in crate::family::flash_next) mod context_budget;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod cuda_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
-mod exl3_cuda_tests;
+pub(in crate::family::flash_next) mod exl3_cuda_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod graph_bench;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

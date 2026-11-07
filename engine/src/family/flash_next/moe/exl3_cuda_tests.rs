@@ -66,7 +66,7 @@ use crate::{
 };
 
 const F32: usize = 4;
-const OUTPUT_BOUND: f64 = 2e-5;
+pub(in crate::family::flash_next) const OUTPUT_BOUND: f64 = 2e-5;
 /// The bound on a pick weight and on the shared gate, `2^-17` (the router's class R1).
 const WEIGHT_BOUND: f64 = 1.0 / 131_072.0;
 /// The input rows the block runs on.
@@ -76,7 +76,7 @@ fn le_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-fn floats(bytes: &[u8]) -> Vec<f32> {
+pub(in crate::family::flash_next) fn floats(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()
         .0
@@ -86,7 +86,10 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// The stored components of the matrix under `prefix`.
-pub(super) fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Result<Matrix, EngError> {
+pub(in crate::family::flash_next) fn matrix(
+    checkpoint: &Checkpoint,
+    prefix: &str,
+) -> Result<Matrix, EngError> {
     let names = COMPONENT_SUFFIXES.map(|suffix| format!("{prefix}.{suffix}"));
     let keys = names.each_ref().map(String::as_str);
     let selected = checkpoint.source.read_selected(&keys, 1 << 30)?;
@@ -99,7 +102,7 @@ fn bank_key(layer: usize, part: ExpertPart) -> String {
 }
 
 /// The key of each role the shared block resolves.
-pub(super) fn keys(layer: usize) -> Vec<(Role, String)> {
+pub(in crate::family::flash_next) fn keys(layer: usize) -> Vec<(Role, String)> {
     let root = Root::Layers;
     let mut keys = vec![
         (Role::FfnGateInp, router_name_in(root, layer)),
@@ -117,13 +120,13 @@ pub(super) fn keys(layer: usize) -> Vec<(Role, String)> {
 }
 
 /// The host copies of the router matrix and the shared-gate row, widened to F32.
-pub(super) struct Router {
+pub(in crate::family::flash_next) struct Router {
     matrix: Vec<f32>,
     gate: Vec<f32>,
 }
 
 impl Router {
-    pub(super) fn read(
+    pub(in crate::family::flash_next) fn read(
         checkpoint: &Checkpoint,
         layer: usize,
         moe: &MoeDims,
@@ -146,7 +149,7 @@ impl Router {
 
 /// Uploads the block of `layer`: the router and the shared gate as F32, each routed projection
 /// as one bank of every expert in id order, and the shared expert's three matrices.
-pub(super) fn upload(
+pub(in crate::family::flash_next) fn upload(
     projector: &CudaProjector,
     checkpoint: &Checkpoint,
     (layer, router): (usize, &Router),
@@ -182,7 +185,7 @@ pub(super) fn upload(
 }
 
 /// Input row `seed`: values in about [-1.4, 1.4], a different pattern per seed.
-pub(super) fn input(hidden: usize, seed: usize) -> Vec<f32> {
+pub(in crate::family::flash_next) fn input(hidden: usize, seed: usize) -> Vec<f32> {
     (0..hidden)
         .map(|i| (((i + 613 * seed) * 7919 % 2003) as f32 - 1001.0) / 700.0)
         .collect()
@@ -206,17 +209,17 @@ fn expert(parts: &[Matrix], x: &[f64]) -> Result<[Vec<f64>; 3], EngError> {
     Ok([gate, up, down])
 }
 
-struct Reference {
-    ids: Vec<usize>,
-    weights: Vec<f64>,
-    gate: f64,
+pub(in crate::family::flash_next) struct Reference {
+    pub(in crate::family::flash_next) ids: Vec<usize>,
+    pub(in crate::family::flash_next) weights: Vec<f64>,
+    pub(in crate::family::flash_next) gate: f64,
     /// The probability gap between the last pick and the best expert left out.
     margin: f64,
     /// `[top_k][gate | up]` in pick order, the layout of the block's `expert_gu`.
     gu: Vec<f64>,
     /// `[top_k][hidden]`: each pick's down projection, unweighted, in pick order.
     down: Vec<f64>,
-    out: Vec<f64>,
+    pub(in crate::family::flash_next) out: Vec<f64>,
 }
 
 /// The routing in fp64: softmax over all logits, the top `top_k` by probability then by the
@@ -239,7 +242,7 @@ fn route_fp64(router: &Router, x: &[f64], top_k: usize) -> (Vec<usize>, Vec<f64>
 
 /// The block in fp64 on `row`: every pick's and the shared expert's projections through the fp64
 /// reference of the stored matrices.
-fn reference(
+pub(in crate::family::flash_next) fn reference(
     checkpoint: &Checkpoint,
     (layer, router): (usize, &Router),
     moe: &MoeDims,
@@ -392,7 +395,7 @@ fn run_block(
     })
 }
 
-fn relative_l2(actual: &[f32], expected: &[f64]) -> f64 {
+pub(in crate::family::flash_next) fn relative_l2(actual: &[f32], expected: &[f64]) -> f64 {
     let (mut error, mut norm) = (0.0f64, 0.0f64);
     for (a, e) in actual.iter().zip(expected) {
         error += (f64::from(*a) - e).powi(2);

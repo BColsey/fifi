@@ -412,12 +412,25 @@ pub(super) fn shared(
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
+    let matrices = SharedWeights {
+        gate: weights.shared_gate,
+        up: weights.shared_up,
+        down: weights.shared_down,
+    };
+    shared_of(launch, &matrices, bufs, dims)
+}
+
+/// The shared expert of [`shared`] over its three matrices alone, for a block whose routed experts
+/// do not come from an [`Exl3Bank`] (the Flash-Next bank of records).
+pub(in crate::family) fn shared_of(
+    launch: &Launch<'_>,
+    weights: &SharedWeights<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
     let s = dims.shared_inter;
     let mut group = Vec::with_capacity(2);
-    for (half, weight) in [weights.shared_gate, weights.shared_up]
-        .into_iter()
-        .enumerate()
-    {
+    for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
         group.push(Pair {
             view: weight.view()?,
             x: bufs.route.norm_row,
@@ -427,7 +440,7 @@ pub(super) fn shared(
     grouped(launch, &group, &bufs.scratch)?;
     swiglu(launch, bufs.shared_gu, bufs.shared_act, (1, s))?;
     let down = [Pair {
-        view: weights.shared_down.view()?,
+        view: weights.down.view()?,
         x: bufs.shared_act,
         out: bufs.shared_out,
     }];
