@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6401,
-      "ignored": 550,
+      "test_fns": 6419,
+      "ignored": 551,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
