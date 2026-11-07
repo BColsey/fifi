@@ -58,13 +58,16 @@ pub(crate) fn refused_switches(names: impl IntoIterator<Item = String>) -> Vec<S
         .collect()
 }
 
-/// The whole startup check of a measurement process: no refused variable, and the shared expert
-/// not inside the routed launches (`shared` is the process-wide reading of
-/// `FIFI_EXL3_SHARED_IN_ROUTED`: `Ok(false)` is off, `Ok(true)` on, `Err` a bad value). An `Err`
-/// names every reason.
+/// The whole startup check of a measurement process: no refused variable, and no explicit request
+/// for the shared expert inside the routed launches. `shared` is the process-wide reading of
+/// `FIFI_EXL3_SHARED_IN_ROUTED`: `Ok(None)` unset (the engine's default is ON for an EXL3 load, and
+/// the step tests force the separate block with `set_shared_in_routed(false)` before the first
+/// token), `Ok(Some(true))` an explicit request for the merged block, `Ok(Some(false))` an explicit
+/// `0` (a set variable, which the name rule refuses anyway), `Err` a bad value. An `Err` names every
+/// reason.
 pub(crate) fn check_default_path(
     names: impl IntoIterator<Item = String>,
-    shared: Result<bool, String>,
+    shared: Result<Option<bool>, String>,
 ) -> Result<(), String> {
     let mut reasons = Vec::new();
     let refused = refused_switches(names);
@@ -74,8 +77,8 @@ pub(crate) fn check_default_path(
         ));
     }
     match shared {
-        Ok(false) => {}
-        Ok(true) => reasons.push("FIFI_EXL3_SHARED_IN_ROUTED is on".to_owned()),
+        Ok(None | Some(false)) => {}
+        Ok(Some(true)) => reasons.push("FIFI_EXL3_SHARED_IN_ROUTED=1 is set".to_owned()),
         Err(error) => reasons.push(format!("FIFI_EXL3_SHARED_IN_ROUTED: {error}")),
     }
     if reasons.is_empty() {
@@ -83,6 +86,18 @@ pub(crate) fn check_default_path(
     } else {
         Err(reasons.join("; "))
     }
+}
+
+/// The mode a step's load-line suffix reports (` exl3_shared_in_routed=on source=default`): `Some(true)`
+/// for `=on`, `Some(false)` for `=off`, `None` for any other text (a GGUF load prints nothing).
+pub(crate) fn shared_in_routed_mode(suffix: &str) -> Option<bool> {
+    suffix.split_whitespace().find_map(|token| {
+        match token.strip_prefix("exl3_shared_in_routed=")? {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    })
 }
 
 /// The receipt code of a launch of `rows` rows run as separate single-row launches

@@ -58,7 +58,9 @@
 //! (`FIFI_EXL3_`, `INFERENCE_CUDA_`, `INFERENCE_QWEN36_`, `INFERENCE_Q36_`, `Q36_`,
 //! `FIFI_GRAPH_BENCH_`) or `FIFI_DELTA_TRACE` is set, except the two allowed ones
 //! (`FIFI_EXL3_CHECKPOINT`, `INFERENCE_CUDA_REQUIRE_DEVICE`), or if `FIFI_EXL3_SHARED_IN_ROUTED`
-//! is on (`refuse_switches`).
+//! is set to `1` (`refuse_switches`; any set value, even `0`, is already refused by the
+//! `FIFI_EXL3_` name rule). Unset is the engine default (the shared expert inside the routed
+//! launches); this test builds no MoE block, and the step tests force the separate block.
 
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -199,10 +201,10 @@ const FLUSH_BYTES: usize = 128 << 20;
 // Guards, identity and the timing primitives shared with `krow_step_device_tests`.
 // ---------------------------------------------------------------------------------------------
 
-/// Refuses to run unless the process is on the default path: none of the kernel, numerics or
-/// diagnostic switches of `krow_measure::REFUSED_PREFIXES` / `REFUSED_EXACT` is set (the single-row
-/// kernel is then the registered `wide1`, the shared expert is not inside the routed launches, and
-/// no gather, dp4a, indexed-pair, GDN input-projection fusion, sparse attention, KV8 variant,
+/// Refuses to run unless none of the kernel, numerics or diagnostic switches of
+/// `krow_measure::REFUSED_PREFIXES` / `REFUSED_EXACT` is set (the single-row kernel is then the
+/// registered `wide1`, `FIFI_EXL3_SHARED_IN_ROUTED` is unset, which the step tests turn into the
+/// separate shared block by hook, and no gather, dp4a, indexed-pair, GDN input-projection fusion, sparse attention, KV8 variant,
 /// device shortlist, Q36 ablation or per-op sync option is on). Only `krow_measure::ALLOWED_VARS`
 /// may stay set.
 pub(super) fn refuse_switches() {
@@ -220,8 +222,9 @@ fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 /// The identity block of a record: the commit the runner names, the SHA-256 of this binary, the
-/// pack manifest, the KV mode and capture mode, the effective single-row kernel and the effective
-/// value of `FIFI_EXL3_SHARED_IN_ROUTED` (nothing is stamped with a time: the runner uses `date -u`).
+/// pack manifest, the KV mode and capture mode, the effective single-row kernel, the process
+/// reading of `FIFI_EXL3_SHARED_IN_ROUTED` (`process_reading`) and the shared block that was measured
+/// (`measured_block`; the step tests add `forced_off_by_hook` and `step_mode`) (nothing is stamped with a time: the runner uses `date -u`).
 pub(super) fn identity(kv_mode: &str, capture: bool, kernel: &str) -> Value {
     let commit = std::env::var("FIFI_KROW_COMMIT").unwrap_or_default();
     assert!(
@@ -262,7 +265,15 @@ pub(super) fn identity(kv_mode: &str, capture: bool, kernel: &str) -> Value {
         "single_row_kernel": kernel,
         "shared_in_routed": {
             "env": std::env::var("FIFI_EXL3_SHARED_IN_ROUTED").ok(),
-            "effective": shared_in_routed_explicit().unwrap_or(true),
+            "process_reading": match shared_in_routed_explicit() {
+                Ok(None) => "unset (the engine default is on for an EXL3 step)",
+                Ok(Some(true)) => "1",
+                Ok(Some(false)) => "0",
+                Err(_) => "error",
+            },
+            "measured_block": "the separate shared block (the one-row reference MoE launches, as the K-row path uses); a step test forces it with set_shared_in_routed(false) before the first token, the alpha test builds no MoE block",
+            "forced_off_by_hook": false,
+            "step_mode": Value::Null,
         },
         "refused_prefixes": REFUSED_PREFIXES,
         "refused_exact": REFUSED_EXACT,
@@ -1315,7 +1326,7 @@ fn krow_alpha_record() {
         "moe_router_chunk4": family_json(&ops, &configs, &router, How::Chunk4),
     });
     let kernel = loaded.kernel;
-    let mut record = json!({
+    let record = json!({
         "schema": 1,
         "kind": "krow_alpha",
         "identity": identity("n/a (no KV in this test)", false, kernel),
@@ -1335,7 +1346,6 @@ fn krow_alpha_record() {
         "bitwise_mismatch_total": all_mismatches.len(),
         "wall_s": began.elapsed().as_secs_f64(),
     });
-    record["identity"]["shared_in_routed"]["step_effective"] = Value::Null;
     emit(&record);
     drop(configs);
     assert!(

@@ -27,11 +27,14 @@
 //!   experts (no weight overlap between the rows).
 //!
 //! The record carries the identity of the run (commit, binary, pack, KV mode, capture, the
-//! effective single-row kernel and the effective `FIFI_EXL3_SHARED_IN_ROUTED`); both tests refuse
+//! effective single-row kernel and the shared-expert mode of the step); both tests refuse
 //! to start if any variable under the refused prefixes of `krow_measure` (`FIFI_EXL3_`,
 //! `INFERENCE_CUDA_`, `INFERENCE_QWEN36_`, `INFERENCE_Q36_`, `Q36_`, `FIFI_GRAPH_BENCH_`) or
 //! `FIFI_DELTA_TRACE` is set, except `FIFI_EXL3_CHECKPOINT` and `INFERENCE_CUDA_REQUIRE_DEVICE`, or if
-//! the shared expert is inside the routed launches.
+//! `FIFI_EXL3_SHARED_IN_ROUTED=1` is set (any set value, even `0`, is refused by the `FIFI_EXL3_` name rule). The engine now loads the shared expert inside the routed launches by
+//! default; these tests measure the separate shared block that the K-row path runs, so each step is
+//! forced to it with `set_shared_in_routed(false)` before its first token, and the record names the
+//! step's reported mode.
 //!
 //! Environment: `FIFI_EXL3_CHECKPOINT`, `FIFI_SPEC_TEXT`, `FIFI_SPEC_TOKENIZER`, `FIFI_KROW_COMMIT`
 //! (required), `FIFI_KROW_OUT` (the JSON path), `FIFI_KROW_PACK_MANIFEST_SHA256` and
@@ -57,7 +60,8 @@ use super::{
     window_bench_device_tests::bench_step,
 };
 use crate::family::speculate::krow_measure::{
-    Inputs, Reading, UNION_CAVEAT, depth_json, f32_bytes, mean, rotated, union_json,
+    Inputs, Reading, UNION_CAVEAT, depth_json, f32_bytes, mean, rotated, shared_in_routed_mode,
+    union_json,
 };
 use crate::{
     family::{
@@ -114,9 +118,31 @@ fn token_identity(ids: &[u32]) -> Value {
     })
 }
 
-/// A step is on the default path when the shared expert is not inside the routed launches.
-fn shared_in_routed_effective(step: &super::step::QwenResidentStep<'_>) -> bool {
-    !step.shared_in_routed_suffix().is_empty()
+/// The shared-expert mode the step itself reports in its load-line suffix: `Some(false)` for the
+/// separate block, `Some(true)` for the shared expert inside the routed launches.
+fn shared_in_routed_mode_of(step: &super::step::QwenResidentStep<'_>) -> Option<bool> {
+    shared_in_routed_mode(&step.shared_in_routed_suffix())
+}
+
+/// The engine loads the shared expert inside the routed launches by default; the K-row path runs the
+/// separate block, so the measurement forces it before the first token and checks the step's own
+/// reported mode.
+fn force_separate_shared_block(step: &mut super::step::QwenResidentStep<'_>) {
+    step.set_shared_in_routed(false)
+        .expect("force the separate shared block");
+    assert_eq!(
+        shared_in_routed_mode_of(step),
+        Some(false),
+        "the step must report the separate shared block: {}",
+        step.shared_in_routed_suffix()
+    );
+}
+
+/// Records the forced mode in the identity. `forced_off_by_hook` is true because
+/// `force_separate_shared_block` ran and asserted the step's reported mode first.
+fn record_shared_block(id: &mut Value, step: &super::step::QwenResidentStep<'_>) {
+    id["shared_in_routed"]["forced_off_by_hook"] = json!(true);
+    id["shared_in_routed"]["step_mode"] = json!(step.shared_in_routed_suffix().trim());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -152,10 +178,7 @@ fn krow_phase_record() {
         None,
     )
     .expect("step");
-    assert!(
-        !shared_in_routed_effective(&step),
-        "the shared expert is inside the routed launches: not the default path"
-    );
+    force_separate_shared_block(&mut step);
     let kinds = dims().shape.kinds.clone();
     let plan: Vec<(usize, usize, AttentionKind)> = step
         .marked_groups()
@@ -217,7 +240,7 @@ fn krow_phase_record() {
     let launches = step.kernel_launches();
     let kernel_check = require_kernel_ran(&launches, loaded.kernel);
     let mut id = identity("Fp16", true, loaded.kernel);
-    id["shared_in_routed"]["step_effective"] = json!(shared_in_routed_effective(&step));
+    record_shared_block(&mut id, &step);
     id["token_ids"] = token_identity(text);
     let record = json!({
         "schema": 1,
@@ -370,10 +393,7 @@ fn krow_union_record() {
         None,
     )
     .expect("step");
-    assert!(
-        !shared_in_routed_effective(&step),
-        "the shared expert is inside the routed launches: not the default path"
-    );
+    force_separate_shared_block(&mut step);
     let layers = dims().shape.kinds.len();
     let began = Instant::now();
     step.feed_rows(&text[..prefix]).expect("prefill");
@@ -509,7 +529,7 @@ fn krow_union_record() {
     }
 
     let mut id = identity("Fp16", false, loaded.kernel);
-    id["shared_in_routed"]["step_effective"] = json!(shared_in_routed_effective(&step));
+    record_shared_block(&mut id, &step);
     id["token_ids"] = token_identity(text);
     let record = json!({
         "schema": 1,

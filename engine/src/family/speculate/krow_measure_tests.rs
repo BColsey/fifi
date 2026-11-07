@@ -141,7 +141,7 @@ fn every_measurement_test_refuses_the_switches_first() {
         alpha.contains("check_default_path("),
         "the guard reads the shared check"
     );
-    assert!(alpha.contains("FIFI_EXL3_SHARED_IN_ROUTED") && alpha.contains("\"effective\""));
+    assert!(alpha.contains("FIFI_EXL3_SHARED_IN_ROUTED") && alpha.contains("\"process_reading\""));
     assert!(
         alpha.contains("FIFI_EXL3_CHECKPOINT"),
         "the one switch the guard allows"
@@ -304,7 +304,7 @@ fn each_refused_switch_alone_stops_the_start() {
         "FIFI_DELTA_TRACE",
     ] {
         let env = ["FIFI_EXL3_CHECKPOINT", "FIFI_KROW_OUT", name].map(str::to_owned);
-        let error = check_default_path(env, Ok(false)).expect_err(name);
+        let error = check_default_path(env, Ok(None)).expect_err(name);
         assert!(error.contains(name), "{name}: {error}");
     }
     let clean = [
@@ -313,23 +313,43 @@ fn each_refused_switch_alone_stops_the_start() {
         "FIFI_KROW_OUT",
     ]
     .map(str::to_owned);
-    assert_eq!(check_default_path(clean.clone(), Ok(false)), Ok(()));
+    assert_eq!(check_default_path(clean.clone(), Ok(None)), Ok(()));
 }
 
 #[test]
-fn the_shared_in_routed_reading_stops_the_start_whatever_the_names() {
+fn the_shared_in_routed_reading_stops_the_start_only_when_it_asks_for_the_merged_block() {
     let clean = ["FIFI_EXL3_CHECKPOINT".to_owned()];
-    let on = check_default_path(clean.clone(), Ok(true)).unwrap_err();
-    assert!(on.contains("SHARED_IN_ROUTED is on"), "{on}");
+    // Unset is the engine default (on); the step tests force the separate block, so it starts.
+    assert_eq!(check_default_path(clean.clone(), Ok(None)), Ok(()));
+    let on = check_default_path(clean.clone(), Ok(Some(true))).unwrap_err();
+    assert!(on.contains("SHARED_IN_ROUTED=1 is set"), "{on}");
     let bad =
         check_default_path(clean.clone(), Err("must be unset, \"0\" or \"1\"".into())).unwrap_err();
     assert!(bad.contains("FIFI_EXL3_SHARED_IN_ROUTED"), "{bad}");
     // Both reasons are named together.
-    let both = check_default_path(["Q36_NO_ACTMUL".to_owned()], Ok(true)).unwrap_err();
+    let both = check_default_path(["Q36_NO_ACTMUL".to_owned()], Ok(Some(true))).unwrap_err();
     assert!(
-        both.contains("Q36_NO_ACTMUL") && both.contains("is on"),
+        both.contains("Q36_NO_ACTMUL") && both.contains("=1 is set"),
         "{both}"
     );
+    // A set variable, even 0, is refused by name.
+    let zero =
+        check_default_path(["FIFI_EXL3_SHARED_IN_ROUTED".to_owned()], Ok(Some(false))).unwrap_err();
+    assert!(zero.contains("FIFI_EXL3_SHARED_IN_ROUTED"), "{zero}");
+}
+
+#[test]
+fn the_step_mode_is_read_from_the_load_line_suffix() {
+    use super::krow_measure::shared_in_routed_mode as mode;
+    assert_eq!(mode(" exl3_shared_in_routed=on source=default"), Some(true));
+    assert_eq!(
+        mode(" exl3_shared_in_routed=off source=explicit"),
+        Some(false)
+    );
+    assert_eq!(mode(" exl3_shared_in_routed=off source=krow"), Some(false));
+    assert_eq!(mode(""), None);
+    assert_eq!(mode(" exl3_shared_in_routed=maybe source=default"), None);
+    assert_eq!(mode(" other=on"), None);
 }
 
 #[test]
