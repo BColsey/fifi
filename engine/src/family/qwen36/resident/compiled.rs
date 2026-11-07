@@ -158,6 +158,7 @@ pub(super) fn attn_facts(
             weight_facts(&w.q)?,
             weight_facts(&w.k)?,
             weight_facts(&w.v)?,
+            weight_facts(&w.o)?,
         ],
     })
 }

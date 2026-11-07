@@ -1206,7 +1206,7 @@ impl Context {
             args.gate,
             args.act,
             &[],
-            std::slice::from_ref(args.packed),
+            std::slice::from_ref(&args.packed),
         )?;
         let dims: [i32; 3] = [
             native_dim(label, args.heads)?,
