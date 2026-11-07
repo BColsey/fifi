@@ -1707,20 +1707,16 @@ fn seeded_keeping(top_k: u32, seed: u64) -> Sampler {
     Sampler::new(SamplingParams::new(0.8, 0.95, top_k).expect("params"), seed)
 }
 
-/// What the scalar reads of a window (health words) may add to the report: a few hundred bytes.
-const SMALL_READS: u64 = 2_048;
-
-/// The windows' device reads: the bytes copied from the device to the host while `f` ran, and the
-/// largest single read.
+/// The reads of one call: how many more reads of each length the observer of the context counts
+/// after `f` than before (`QwenResidentStep::d2h_reads`).
 fn device_reads<T>(
     step: &mut QwenResidentStep<'static>,
     f: impl FnOnce(&mut QwenResidentStep<'static>) -> T,
-) -> (T, u64, usize) {
+) -> (T, std::collections::BTreeMap<usize, usize>) {
     let before = step.d2h_reads();
     let out = f(step);
     let after = step.d2h_reads();
-    let (bytes, widest) = super::krow_device_tests::d2h_since(&before, &after);
-    (out, bytes, widest)
+    (out, super::krow_device_tests::d2h_growth(&before, &after))
 }
 
 /// One window, its greedy draws of every row, and the verdict that keeps `kept` rows.
@@ -1745,69 +1741,68 @@ fn window_draw_commit(
     drawn
 }
 
-/// A window reads its report and nothing else: with the tap off, no read of the window, of its
-/// draws (greedy, and seeded with a sampler that keeps 20 candidates) or of its verdict is as wide
-/// as a logits row, and the bytes copied are the report's, a kilobyte and a half at 8 rows, against
-/// the 7.9 MB of the logits copy. With the tap on the same window copies all its rows. A sampler
-/// that keeps 40 candidates cannot be served by the record: it reads exactly one row per row it draws.
+/// A window reads its report and nothing else. With the tap off, a window, its draws (greedy, and
+/// seeded with a sampler that keeps 20 candidates) and its verdict make exactly one read of the
+/// report (`window_read_bytes`, a kilobyte and a half at 8 rows with the shortlist on, 8 rows x 8
+/// bytes plus 16 with it off) and no other read of 64 bytes or more, against the 7.9 MB of the logits
+/// copy: a second read of the report, or a read of a row, fails the check. With the tap on the same
+/// window adds one read of all its rows. A sampler that keeps 40 candidates cannot be served by the
+/// record: it reads exactly one row per row it draws. With the shortlist switched off
+/// (`Q36_CUDA_DEVICE_SHORTLIST=0`) the report holds no records and every seeded draw reads a row.
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
-    use crate::kernels::cuda::resident::argmax_rows::window_full_report_bytes;
+    use crate::kernels::cuda::resident::argmax_rows::window_read_bytes;
+    use super::krow_device_tests::check_window_reads;
+    let shortlist_on = super::readback::device_shortlist_enabled(
+        std::env::var(super::readback::SHORTLIST_VAR)
+            .ok()
+            .as_deref(),
+    );
     let (mut rig, _session, base, _inputs) = krow_rig(2);
     let prefix = rig.prefixes[0];
     let row_bytes = HEAD_ROWS * size_of::<f32>();
     for rows in [2usize, 4, 8] {
         let inputs = window_inputs(&rig.stream, prefix, rows);
-        let report = window_full_report_bytes(rows) as u64;
+        let report = window_read_bytes(rows, shortlist_on);
         for kept in [1, rows / 2 + 1, rows] {
             rig.step.set_krow_want_logits(false);
-            for (what, mut sampler) in [
-                ("greedy", Sampler::greedy()),
-                ("keeps 20", seeded_keeping(20, 7)),
+            // (what, sampler, the rows a draw reads on demand)
+            for (what, mut sampler, row_reads) in [
+                ("greedy", Sampler::greedy(), 0),
+                // The record serves it; with the shortlist off every draw reads a row.
+                ("keeps 20", seeded_keeping(20, 7), if shortlist_on { 0 } else { kept }),
             ] {
-                let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+                let ((), grown) = device_reads(&mut rig.step, |step| {
                     window_draw_commit(step, &inputs, kept, &mut sampler);
                 });
-                println!(
-                    "D1_D2H rows={rows} kept={kept} {what} tap=off bytes={bytes} widest={widest}"
-                );
-                assert!(
-                    widest < row_bytes,
-                    "{what}: a read of {widest} bytes is a logits row"
-                );
-                assert!(
-                    (report..=report + SMALL_READS).contains(&bytes),
-                    "{what}: {rows} rows copied {bytes} bytes, the report is {report}"
-                );
+                println!("D1_D2H rows={rows} kept={kept} {what} tap=off reads={grown:?}");
+                let extra: Vec<(usize, usize)> = if row_reads == 0 {
+                    Vec::new()
+                } else {
+                    vec![(row_bytes, row_reads)]
+                };
+                check_window_reads(&grown, report, &extra)
+                    .unwrap_or_else(|why| panic!("{what}, {rows} rows, kept {kept}: {why}"));
                 rig.step.restore(&base).expect("restore");
             }
             // The tap copies all the rows, once.
             rig.step.set_krow_want_logits(true);
-            let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+            let ((), grown) = device_reads(&mut rig.step, |step| {
                 window_draw_commit(step, &inputs, kept, &mut Sampler::greedy());
             });
-            println!("D1_D2H rows={rows} kept={kept} greedy tap=on bytes={bytes} widest={widest}");
-            assert_eq!(
-                widest,
-                rows * row_bytes,
-                "the tap reads the rows with one copy"
-            );
+            println!("D1_D2H rows={rows} kept={kept} greedy tap=on reads={grown:?}");
+            check_window_reads(&grown, report, &[(rows * row_bytes, 1)])
+                .unwrap_or_else(|why| panic!("the tap, {rows} rows, kept {kept}: {why}"));
             rig.step.restore(&base).expect("restore");
             // A sampler the record cannot serve reads one row per drawn row.
             rig.step.set_krow_want_logits(false);
-            let ((), bytes, widest) = device_reads(&mut rig.step, |step| {
+            let ((), grown) = device_reads(&mut rig.step, |step| {
                 window_draw_commit(step, &inputs, kept, &mut seeded_keeping(40, 7));
             });
-            println!(
-                "D1_D2H rows={rows} kept={kept} keeps 40 tap=off bytes={bytes} widest={widest}"
-            );
-            assert_eq!(widest, row_bytes);
-            assert!(
-                bytes >= (kept * row_bytes) as u64
-                    && bytes <= (kept * row_bytes) as u64 + report + SMALL_READS,
-                "{kept} rows drawn from rows read one by one: {bytes} bytes"
-            );
+            println!("D1_D2H rows={rows} kept={kept} keeps 40 tap=off reads={grown:?}");
+            check_window_reads(&grown, report, &[(row_bytes, kept)])
+                .unwrap_or_else(|why| panic!("keeps 40, {rows} rows, kept {kept}: {why}"));
             rig.step.restore(&base).expect("restore");
         }
     }

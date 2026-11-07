@@ -439,39 +439,89 @@ fn a_table_with_a_non_zero_pad_word_does_not_decode() {
 
 // ---- the device-to-host reads of a window ----
 
-/// The reads between two snapshots of the observer (`QwenResidentStep::d2h_reads`, which maps a read
-/// length in bytes to the number of reads of that length): the total bytes copied and the length of
-/// the widest single read. A read that happened is a count that grew; an observer that went down is a
-/// different step and is not a difference.
-pub(super) fn d2h_since(
+/// Reads shorter than this are the scalar health words of a step; every longer read is accounted
+/// for by name.
+const SCALAR_READ_LIMIT: usize = 64;
+
+/// How many more reads of each length there are in `after` than in `before` (two snapshots of
+/// `QwenResidentStep::d2h_reads`, which maps a read length in bytes to the number of reads of that
+/// length). Only lengths that grew appear.
+pub(super) fn d2h_growth(
     before: &std::collections::BTreeMap<usize, usize>,
     after: &std::collections::BTreeMap<usize, usize>,
-) -> (u64, usize) {
-    let mut bytes = 0u64;
-    let mut widest = 0;
-    for (&len, &count) in after {
-        let earlier = before.get(&len).copied().unwrap_or(0);
-        if count > earlier {
-            bytes += (len * (count - earlier)) as u64;
-            widest = widest.max(len);
+) -> std::collections::BTreeMap<usize, usize> {
+    after
+        .iter()
+        .filter_map(|(&len, &count)| {
+            let earlier = before.get(&len).copied().unwrap_or(0);
+            (count > earlier).then_some((len, count - earlier))
+        })
+        .collect()
+}
+
+/// The reads a K-row window may make, against the reads it made (`grown`, from [`d2h_growth`]):
+/// exactly one read of `report` bytes, exactly the `extra` reads (length, count) the case asks for,
+/// and no other read of [`SCALAR_READ_LIMIT`] bytes or more. A second read of the report, a read of
+/// a row nobody asked for, or a missing report is an error.
+pub(super) fn check_window_reads(
+    grown: &std::collections::BTreeMap<usize, usize>,
+    report: usize,
+    extra: &[(usize, usize)],
+) -> Result<(), String> {
+    let mut expected = std::collections::BTreeMap::<usize, usize>::new();
+    *expected.entry(report).or_default() += 1;
+    for &(len, count) in extra {
+        *expected.entry(len).or_default() += count;
+    }
+    let lengths: std::collections::BTreeSet<usize> = grown
+        .keys()
+        .chain(expected.keys())
+        .copied()
+        .filter(|len| *len >= SCALAR_READ_LIMIT)
+        .collect();
+    for len in lengths {
+        let got = grown.get(&len).copied().unwrap_or(0);
+        let want = expected.get(&len).copied().unwrap_or(0);
+        if got != want {
+            return Err(format!("{got} reads of {len} bytes, expected {want}"));
         }
     }
-    (bytes, widest)
+    Ok(())
 }
 
 #[test]
-fn the_device_reads_of_a_window_are_the_reads_that_grew_between_two_snapshots() {
+fn the_reads_of_a_window_are_the_reads_that_grew_between_two_snapshots() {
     use std::collections::BTreeMap;
     let before: BTreeMap<usize, usize> = [(4, 3), (1488, 1)].into();
-    assert_eq!(d2h_since(&before, &before), (0, 0));
-    // One more report, two more scalars, and a logits row that was already counted before.
+    assert!(d2h_growth(&before, &before).is_empty());
+    // One more report, two more scalars, and a logits row that was not read before.
     let after: BTreeMap<usize, usize> = [(4, 5), (1488, 2), (993_280, 1)].into();
-    assert_eq!(
-        d2h_since(&before, &after),
-        (2 * 4 + 1488 + 993_280, 993_280)
-    );
-    // Nothing read: no widest read.
-    assert_eq!(d2h_since(&BTreeMap::new(), &BTreeMap::new()), (0, 0));
+    let grown = d2h_growth(&before, &after);
+    assert_eq!(grown, [(4, 2), (1488, 1), (993_280, 1)].into());
+    assert!(d2h_growth(&BTreeMap::new(), &BTreeMap::new()).is_empty());
+}
+
+#[test]
+fn a_window_reads_its_report_once_and_what_the_case_asks_for_and_nothing_else() {
+    use std::collections::BTreeMap;
+    let row = 993_280;
+    let reads = |pairs: &[(usize, usize)]| -> BTreeMap<usize, usize> { pairs.iter().copied().collect() };
+    // The report alone, with scalar health words around it.
+    check_window_reads(&reads(&[(4, 41), (1488, 1)]), 1488, &[]).expect("the report only");
+    // A sampler the record cannot serve: one row per drawn row.
+    check_window_reads(&reads(&[(1488, 1), (row, 3)]), 1488, &[(row, 3)]).expect("three rows");
+    // The tap: all the rows in one copy.
+    check_window_reads(&reads(&[(1488, 1), (8 * row, 1)]), 1488, &[(8 * row, 1)]).expect("the tap");
+    // A second read of the report passes a byte bound but not this check.
+    let twice = check_window_reads(&reads(&[(1488, 2)]), 1488, &[]).expect_err("two reports");
+    assert!(twice.contains("2 reads of 1488"), "{twice}");
+    // No report at all, a row nobody asked for, a missing row, a read of the wrong size.
+    assert!(check_window_reads(&reads(&[(4, 1)]), 1488, &[]).is_err());
+    assert!(check_window_reads(&reads(&[(1488, 1), (row, 1)]), 1488, &[]).is_err());
+    assert!(check_window_reads(&reads(&[(1488, 1), (row, 2)]), 1488, &[(row, 3)]).is_err());
+    assert!(check_window_reads(&reads(&[(1488, 1), (2 * row, 1)]), 1488, &[(row, 2)]).is_err());
+    // A report of another size (the K - 1 mutant, or the shortlist on when it is off) fails.
+    assert!(check_window_reads(&reads(&[(1312, 1)]), 1488, &[]).is_err());
 }
 
 // ---- the whole report of a window, decoded by the production code ----
