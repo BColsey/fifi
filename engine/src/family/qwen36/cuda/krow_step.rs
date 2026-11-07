@@ -932,6 +932,12 @@ impl QwenResidentStep<'_> {
         Ok(())
     }
 
+    /// The logits rows of the last K-row window read straight from the arena, also when the window
+    /// failed after its launch (the production path reads them only after the verdict).
+    pub(crate) fn last_krow_rows(&mut self, k: usize) -> Result<Vec<Vec<f32>>, EngError> {
+        self.read_krow_rows(k)
+    }
+
     fn record_table(&mut self, table: &WindowResult) {
         if let Some(runtime) = self.krow.as_mut() {
             runtime.test.last_table = Some(table.clone());

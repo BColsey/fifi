@@ -1153,23 +1153,34 @@ fn d1_krow_only_the_bad_row_reports_its_bit_over_100_windows() {
     println!("D1_RESULT test=K-status krow_row_local_bits PASS windows=300");
 }
 
-/// The causal spread: a value made non-finite in the embedding of row `j` reaches the rows after
-/// `j` through the cache and the DeltaNet state, never the rows before it.
+/// A value made non-finite in the embedding of row `j` fails the window closed through the window
+/// word (the EXL3 projections turn a non-finite input into zeros and raise the arithmetic flag, so
+/// the pairs need not show it) and never reaches the rows before `j`: their logits equal those of
+/// the clean window bit for bit.
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
-fn d1_krow_a_corrupt_hidden_state_spreads_to_later_rows_only() {
+fn d1_krow_a_corrupt_hidden_state_fails_the_window_and_leaves_the_rows_before_it_clean() {
     let (mut rig, _session, base, inputs) = krow_rig(4);
+    rig.step.run_window(&inputs).expect("the clean window");
+    let clean = rig.step.window_logits_rows().expect("the clean rows");
+    rig.step.restore(&base).expect("restore");
     for j in 0..4 {
         let table =
             failed_window_table(&mut rig.step, &inputs, super::step::Injection::HiddenNan(j));
-        for (row, bits) in table.bits.iter().enumerate() {
+        assert_ne!(
+            table.window & 16,
+            0,
+            "bad row {j}: the arithmetic flag is in the window word ({:#x})",
+            table.window
+        );
+        let rows = rig.step.last_krow_rows(inputs.len()).expect("the rows");
+        for row in 0..j {
             assert_eq!(
-                *bits != 0,
-                row >= j,
-                "bad row {j}: pair {row} has bits {bits:#x}"
+                first_bit_difference(&rows[row], &clean[row]),
+                None,
+                "bad row {j}: row {row} before it moved"
             );
         }
-        assert_eq!(table.window & 2, 2, "bad row {j}: window word");
         rig.step.restore(&base).expect("restore");
     }
 }
