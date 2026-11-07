@@ -41,7 +41,7 @@ mod step_plan_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod embedding;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-mod load;
+pub(in crate::family::flash_next) mod load;
 #[cfg(test)]
 mod load_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

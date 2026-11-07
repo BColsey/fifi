@@ -276,7 +276,10 @@ fn the_list_bytes_are_the_walks_trunk_bytes() {
 mod device {
     use half::{bf16, f16};
 
-    use super::super::load::{TrunkList, TrunkTensor, upload::layer_weights};
+    use super::super::load::{
+        TrunkList, TrunkTensor,
+        upload::{layer_weights, root_weights},
+    };
     use super::pack;
     use crate::{
         family::{
@@ -413,32 +416,22 @@ mod device {
         vec![checksum(&f32_bytes(values.into_iter()))]
     }
 
-    #[test]
-    #[ignore = "needs a GPU (about 60 MiB) and FIFI_FLASH_NEXT_EXL3_PACK with the payload of layer 3"]
-    fn layer_three_uploads_under_its_pack_names_and_reads_back_the_host_bytes() {
-        assert!(
-            device_present("Flash-Next trunk upload"),
-            "a GPU is required"
-        );
-        let checkpoint = pack();
-        let list = TrunkList::new(&checkpoint.source, &checkpoint.model_config).expect("list");
-        let layer = std::env::var("FIFI_FLASH_NEXT_EXL3_MOE_LAYER")
-            .map_or(3, |value| value.parse().expect("a layer number"));
-        let tensors = list.layer(layer).expect("layer");
-        assert!(
-            tensors.iter().any(|t| t.name.ends_with("self_attn.q_proj")),
-            "layer {layer} is not a QSA layer"
-        );
-
-        let projector = CudaProjector::new().expect("projector");
-        let reader = PackReader::new(&projector, &checkpoint, Reserve::default());
-        let loaded = layer_weights(&reader, &list, layer).expect("upload layer");
-        assert_eq!(loaded.len(), tensors.len());
+    /// Uploads `tensors` and compares every device buffer with the expectation of its kernel's
+    /// contract; the device bytes must equal the bytes the walk counted for them.
+    fn check(
+        projector: &CudaProjector,
+        checkpoint: &Checkpoint,
+        what: &str,
+        tensors: &[TrunkTensor],
+        upload: impl FnOnce(&PackReader<'_>) -> Vec<CudaWeight>,
+    ) {
+        let reader = PackReader::new(projector, checkpoint, Reserve::default());
+        let loaded = upload(&reader);
+        assert_eq!(loaded.len(), tensors.len(), "{what}: tensor count");
         let weights = CudaWeights::from_exl3(loaded).expect("weights");
-
         let context = projector.context();
         for tensor in tensors {
-            let want = expected(&reader, &checkpoint, tensor);
+            let want = expected(&reader, checkpoint, tensor);
             let got: Vec<u64> = device_buffers(&weights, &tensor.name)
                 .into_iter()
                 .map(|buffer| device_checksum(context, buffer))
@@ -449,11 +442,83 @@ mod device {
         assert_eq!(
             weights.device_bytes() as u64,
             counted,
-            "device bytes against the walk"
+            "{what}: device bytes against the walk"
         );
-        eprintln!(
-            "layer {layer}: {} tensors, {counted} device bytes",
-            tensors.len()
+        eprintln!("{what}: {} tensors, {counted} device bytes", tensors.len());
+    }
+
+    fn open() -> (Checkpoint, TrunkList, CudaProjector) {
+        assert!(
+            device_present("Flash-Next trunk upload"),
+            "a GPU is required"
         );
+        let checkpoint = pack();
+        let list = TrunkList::new(&checkpoint.source, &checkpoint.model_config).expect("list");
+        (checkpoint, list, CudaProjector::new().expect("projector"))
+    }
+
+    fn has(tensors: &[TrunkTensor], suffix: &str) -> bool {
+        tensors.iter().any(|t| t.name.ends_with(suffix))
+    }
+
+    #[test]
+    #[ignore = "needs a GPU (about 60 MiB) and FIFI_FLASH_NEXT_EXL3_PACK with the payload of layer 3"]
+    fn layer_three_uploads_under_its_pack_names_and_reads_back_the_host_bytes() {
+        let (checkpoint, list, projector) = open();
+        let layer = std::env::var("FIFI_FLASH_NEXT_EXL3_MOE_LAYER")
+            .map_or(3, |value| value.parse().expect("a layer number"));
+        let tensors = list.layer(layer).expect("layer");
+        assert!(
+            has(tensors, "self_attn.q_proj"),
+            "layer {layer} is not a QSA layer"
+        );
+        assert!(
+            has(tensors, "self_attn.q_norm.weight") && has(tensors, "indexer.q_layernorm.weight")
+        );
+        check(
+            &projector,
+            &checkpoint,
+            &format!("layer {layer}"),
+            tensors,
+            |reader| layer_weights(reader, &list, layer).expect("upload layer"),
+        );
+    }
+
+    /// Layer 1 is a DeltaNet layer and the PLE layer: `-exp(A_log)`, the F32 gates `in_proj_a` and
+    /// `in_proj_b`, `dt_bias`, the convolution and the gated norm, and the two PLE projections as
+    /// stored half. The PLE norms and convolution are host-only and must not be on the card.
+    #[test]
+    #[ignore = "needs a GPU (about 120 MiB) and the full pack in FIFI_FLASH_NEXT_EXL3_PACK"]
+    fn the_deltanet_ple_layer_uploads_and_reads_back_the_host_bytes() {
+        let (checkpoint, list, projector) = open();
+        let tensors = list.layer(1).expect("layer");
+        for suffix in [
+            "linear_attn.A_log",
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+            "linear_attn.dt_bias",
+            "linear_attn.conv1d.weight",
+            "linear_attn.norm.weight",
+            "ple.key_proj.weight",
+            "ple.value_proj.weight",
+        ] {
+            assert!(has(tensors, suffix), "{suffix} is missing from layer 1");
+        }
+        assert!(!has(tensors, "ple.norm_key.weight") && !has(tensors, "ple.conv1d.weight"));
+        check(&projector, &checkpoint, "layer 1", tensors, |reader| {
+            layer_weights(reader, &list, 1).expect("upload layer")
+        });
+    }
+
+    /// The mixer that feeds `lm_head` (three stored half tensors) and `lm_head` itself.
+    #[test]
+    #[ignore = "needs a GPU (under 1 GiB) and the full pack in FIFI_FLASH_NEXT_EXL3_PACK"]
+    fn the_root_tensors_upload_and_read_back_the_host_bytes() {
+        let (checkpoint, list, projector) = open();
+        let tensors = list.root();
+        assert!(has(tensors, "lm_head") && has(tensors, "hyper_connection_mixer.hc_norm.weight"));
+        check(&projector, &checkpoint, "root", tensors, |reader| {
+            root_weights(reader, &list).expect("upload root")
+        });
     }
 }

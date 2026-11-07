@@ -415,3 +415,5 @@ pub(in crate::family::flash_next) mod slot_bank;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod tier_cuda_tests;
 pub(in crate::family::flash_next) mod tier_plan;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod trunk_cuda_tests;

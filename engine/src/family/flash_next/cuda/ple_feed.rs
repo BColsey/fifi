@@ -3,12 +3,13 @@
 //!
 //! WHAT: [`NgramRows`] takes the pack's n-gram file (opened by `FlashPackFiles` through the
 //! local-storage guard) and reads and decodes global rows (16 per token, 102 bytes each, random
-//! positions in a 30 GiB file on local NVMe). [`PleFeed`] holds the host copies of the PLE projections, norms and convolution from the
-//! pack and runs the existing host step (`ple::step`) with a projector over those weights, so the
-//! numbers are the host reference's. The update is `branches * hidden` F32 values (40 KiB); the
-//! device copy is `stream_io`.
-//! WHY three calls ([`PleFeed::plan`], [`PleFeed::gather`], [`PleFeed::update`]): the rows depend on
-//! the token history only, not on the residual stream, so a caller may gather on another thread
+//! positions in a 30 GiB file on local NVMe). [`PleFeed`] holds the PLE vectors from the pack (the
+//! norms and the convolution, which the device does not hold) and a [`PleProjection`] for the two
+//! projections, and runs the existing host step (`ple::step`) over them, so the numbers are the
+//! host reference's. The update is `branches * hidden` F32 values (40 KiB); the device copy is
+//! `stream_io`.
+//! WHY three calls ([`PleFeed::plan`], [`PleFeed::gather`], [`PleFeed::update`]): the rows depend
+//! on the token history only, not on the residual stream, so a caller may gather on another thread
 //! while the device runs the layers before `ple_layer`; `gather` takes `&self` and no lock. Only
 //! `update` needs the stream (the query side of the gate) and mutates the convolution ring.
 //!
