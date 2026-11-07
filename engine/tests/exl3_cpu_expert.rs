@@ -139,11 +139,10 @@ fn errors(reference: &[f64], actual: &[f32]) -> (f64, f64) {
 }
 
 fn tiers() -> Vec<Exl3Isa> {
-    let mut tiers = vec![Exl3Isa::Scalar];
-    if Exl3Isa::Avx512.is_supported() {
-        tiers.push(Exl3Isa::Avx512);
-    }
-    tiers
+    [Exl3Isa::Scalar, Exl3Isa::Avx2, Exl3Isa::Avx512]
+        .into_iter()
+        .filter(|tier| tier.is_supported())
+        .collect()
 }
 
 fn check(label: &str, reference: &[f64], actual: &[f32]) {
@@ -169,6 +168,9 @@ fn projections_match_the_fp64_oracle_for_every_bit_rate_and_tier() {
         (128, 256, 80),
         (256, 128, 96),
         (128, 128, 112),
+        (384, 640, 96),
+        (640, 128, 24),
+        (128, 384, 16),
     ] {
         let m = matrix(&mut rng, k, n, words);
         let parts = Parts::of(&m);

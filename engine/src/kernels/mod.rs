@@ -16,6 +16,7 @@ pub(crate) mod compile_key;
 ))]
 mod elementwise;
 pub mod exl3_cpu;
+mod exl3_cpu_avx2;
 mod exl3_cpu_avx512;
 mod exl3_cpu_pool;
 pub mod expert_cpu;

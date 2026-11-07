@@ -26,11 +26,10 @@ impl Rng {
 const ALL_WORDS: [usize; 11] = [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128];
 
 fn pool_isa() -> Vec<Exl3Isa> {
-    let mut tiers = vec![Exl3Isa::Scalar];
-    if Exl3Isa::Avx512.is_supported() {
-        tiers.push(Exl3Isa::Avx512);
-    }
-    tiers
+    [Exl3Isa::Scalar, Exl3Isa::Avx2, Exl3Isa::Avx512]
+        .into_iter()
+        .filter(|tier| tier.is_supported())
+        .collect()
 }
 
 #[test]
@@ -92,47 +91,62 @@ fn random_projection(
     (trellis, suh, svh)
 }
 
+/// Every SIMD tier against the scalar column sums for one shape and stored rate: one-hot
+/// activations (each sum is a single exact integer product, so the tiers must agree bit for bit)
+/// at the first, second and last k tiles, then random activations under the rounding tolerance.
+fn assert_tiers_match_scalar(rng: &mut Rng, (k, n): (usize, usize), words: usize) {
+    let table: Vec<AtomicU32> = (0..2 * k).map(|_| AtomicU32::new(0)).collect();
+    let (trellis, suh, svh) = random_projection(rng, k, n, words);
+    let proj = Exl3Projection::new([k, n], words, &trellis, &suh, &svh).unwrap();
+    let hot = (0..64).chain(2 * k - 32..2 * k);
+    // The first, a middle and the last tile column; the random activations below cover all.
+    let sampled = [0, n / TILE / 2, n / TILE - 1];
+    for tier in pool_isa().into_iter().filter(|t| *t != Exl3Isa::Scalar) {
+        for hot in hot.clone() {
+            table.iter().for_each(|a| a.store(0, Ordering::Relaxed));
+            store(&table, hot, 1.0);
+            for nt in sampled {
+                assert_eq!(
+                    column_sums(tier, &proj, &table, nt),
+                    column_sums(Exl3Isa::Scalar, &proj, &table, nt),
+                    "{tier:?} [{k},{n}] words={words} hot={hot} nt={nt}"
+                );
+            }
+        }
+        for i in 0..table.len() {
+            store(&table, i, rng.unit() * 4.0);
+        }
+        for nt in 0..n / TILE {
+            let got = column_sums(tier, &proj, &table, nt);
+            let want = column_sums(Exl3Isa::Scalar, &proj, &table, nt);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= 1e-5 * scale,
+                    "{tier:?} [{k},{n}] words={words} nt={nt}: {g} vs {w}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn every_tier_agrees_with_the_scalar_column_sums() {
     let mut rng = Rng(0x1234_5678_9abc_def1);
-    let (k, n) = (256, 384);
-    let table: Vec<AtomicU32> = (0..2 * k).map(|_| AtomicU32::new(0)).collect();
     for words in ALL_WORDS {
-        let (trellis, suh, svh) = random_projection(&mut rng, k, n, words);
-        let proj = Exl3Projection::new([k, n], words, &trellis, &suh, &svh).unwrap();
-        let tiers: Vec<_> = pool_isa()
-            .into_iter()
-            .filter(|t| *t != Exl3Isa::Scalar)
-            .collect();
-        // One-hot activations make every sum a single exact integer product. The first, second
-        // and last k tiles cover all 32 lane vectors and the last tile of the buffer.
-        let hot = (0..64).chain(2 * k - 32..2 * k);
-        for tier in &tiers {
-            for hot in hot.clone() {
-                table.iter().for_each(|a| a.store(0, Ordering::Relaxed));
-                store(&table, hot, 1.0);
-                for nt in 0..n / TILE {
-                    assert_eq!(
-                        column_sums(*tier, &proj, &table, nt),
-                        column_sums(Exl3Isa::Scalar, &proj, &table, nt),
-                        "{tier:?} words={words} hot={hot} nt={nt}"
-                    );
-                }
-            }
-            for i in 0..table.len() {
-                store(&table, i, rng.unit() * 4.0);
-            }
-            for nt in 0..n / TILE {
-                let got = column_sums(*tier, &proj, &table, nt);
-                let want = column_sums(Exl3Isa::Scalar, &proj, &table, nt);
-                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-                for (g, w) in got.iter().zip(want) {
-                    assert!(
-                        (g - w).abs() <= 1e-5 * scale,
-                        "{tier:?} words={words} nt={nt}: {g} vs {w}"
-                    );
-                }
-            }
+        assert_tiers_match_scalar(&mut rng, (256, 384), words);
+    }
+}
+
+/// Shapes with one k tile row of eight, odd counts of 128-wide blocks on either side (3 and 5
+/// blocks leave a single tile column pair for the last pool chunk), and the tall down-projection
+/// shape, for every stored rate.
+#[test]
+fn every_tier_agrees_with_the_scalar_on_odd_and_tall_shapes() {
+    let mut rng = Rng(0x0f0f_1e1e_2d2d_3c3c);
+    for shape in [(128, 128), (384, 128), (128, 640), (640, 256), (768, 384)] {
+        for words in ALL_WORDS {
+            assert_tiers_match_scalar(&mut rng, shape, words);
         }
     }
 }
@@ -305,6 +319,127 @@ fn malformed_projections_and_spans_are_refused() {
     let cpu = ExpertCpu::new(2, WaitPolicy::Park, None).unwrap();
     assert!(cpu.project(&proj, &[0.0; 127], &mut [0.0; 128]).is_err());
     assert!(cpu.project(&proj, &[0.0; 128], &mut [0.0; 127]).is_err());
+}
+
+/// Three experts of `words` words per tile and the `h x f` shape, owned.
+fn random_experts(rng: &mut Rng, (h, f): (usize, usize), words: usize) -> Vec<[Parts; 3]> {
+    (0..3)
+        .map(|_| {
+            [
+                random_projection(rng, h, f, words),
+                random_projection(rng, h, f, words),
+                random_projection(rng, f, h, words),
+            ]
+        })
+        .collect()
+}
+
+type Parts = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn expert_views(parts: &[[Parts; 3]], (h, f): (usize, usize), words: usize) -> Vec<ExpertView<'_>> {
+    parts
+        .iter()
+        .map(|[g, u, d]| ExpertView {
+            gate: Exl3Projection::new([h, f], words, &g.0, &g.1, &g.2).unwrap(),
+            up: Exl3Projection::new([h, f], words, &u.0, &u.1, &u.2).unwrap(),
+            down: Exl3Projection::new([f, h], words, &d.0, &d.1, &d.2).unwrap(),
+        })
+        .collect()
+}
+
+/// Whole experts for every stored rate: one row on 1, 2, 5 and 12 threads gives the same bits
+/// within a tier, the tiers agree with the scalar reference under the rounding tolerance, and
+/// `expert_pairs` over several rows and a shared expert equals the single-row forward bit for bit.
+#[test]
+fn every_rate_is_thread_count_independent_and_agrees_across_tiers() {
+    let mut rng = Rng(0xa5a5_5a5a_c3c3_3c3c);
+    let shape = (384, 256);
+    let h = shape.0;
+    for words in ALL_WORDS {
+        let parts = random_experts(&mut rng, shape, words);
+        let experts = expert_views(&parts, shape, words);
+        let picks: Vec<_> = experts
+            .iter()
+            .zip([0.75f32, 1.25, 0.5])
+            .map(|(&expert, weight)| ExpertPick { expert, weight })
+            .collect();
+        let xs: Vec<f32> = (0..2 * h).map(|_| rng.unit()).collect();
+        let forward = |threads: usize, tier: Exl3Isa| {
+            let cpu = ExpertCpu::new(threads, WaitPolicy::Park, Some(tier)).unwrap();
+            let mut out = vec![0.0f32; h];
+            cpu.forward(&xs[..h], &picks, &mut out).unwrap();
+            out
+        };
+        let base = forward(1, Exl3Isa::Scalar);
+        assert!(base.iter().all(|v| v.is_finite()) && base.iter().any(|v| *v != 0.0));
+        let scale = base.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for tier in pool_isa() {
+            let single = forward(1, tier);
+            for threads in [2, 5, 12] {
+                assert_eq!(
+                    forward(threads, tier),
+                    single,
+                    "{tier:?} words={words} threads={threads}"
+                );
+            }
+            for (a, b) in single.iter().zip(&base) {
+                assert!(
+                    (a - b).abs() <= 1e-4 * scale,
+                    "{tier:?} words={words}: {a} vs {b}"
+                );
+            }
+            let pairs = [(2usize, 1usize), (0, 0), (2, 0), (1, 1)];
+            let jobs: Vec<_> = pairs
+                .iter()
+                .map(|&(e, row)| PairJob {
+                    expert: experts[e],
+                    row,
+                })
+                .collect();
+            let cpu = ExpertCpu::new(3, WaitPolicy::Park, Some(tier)).unwrap();
+            let mut got = vec![0.0f32; jobs.len() * h];
+            cpu.expert_pairs(&xs, &jobs, &mut got).unwrap();
+            for (i, &(e, row)) in pairs.iter().enumerate() {
+                let pick = ExpertPick {
+                    expert: experts[e],
+                    weight: 1.0,
+                };
+                let mut want = vec![0.0f32; h];
+                cpu.forward(&xs[row * h..(row + 1) * h], &[pick], &mut want)
+                    .unwrap();
+                assert_eq!(
+                    &got[i * h..(i + 1) * h],
+                    &want[..],
+                    "{tier:?} words={words} pair {i}"
+                );
+            }
+        }
+    }
+}
+
+/// Names the tiers the other tests loop over, so a run on a CPU without a tier shows it in the
+/// log (`--nocapture`) instead of passing those loops without a SIMD tier.
+#[test]
+fn report_the_tiers_under_test() {
+    let tiers = pool_isa();
+    println!("exl3 cpu tiers under test: {tiers:?}");
+    assert!(tiers.contains(&Exl3Isa::Scalar));
+    assert_eq!(tiers.contains(&Exl3Isa::Avx2), IsaSupport::host().avx2);
+    assert_eq!(tiers.contains(&Exl3Isa::Avx512), IsaSupport::host().avx512);
+}
+
+#[test]
+fn the_automatic_order_is_avx512_then_avx2_then_scalar() {
+    for (avx512, avx2, want) in [
+        (true, true, Exl3Isa::Avx512),
+        (true, false, Exl3Isa::Avx512),
+        (false, true, Exl3Isa::Avx2),
+        (false, false, Exl3Isa::Scalar),
+    ] {
+        let support = IsaSupport { avx512, avx2 };
+        assert_eq!(support.best(), want, "avx512={avx512} avx2={avx2}");
+    }
+    assert!(Exl3Isa::Scalar.is_supported());
 }
 
 fn median(mut samples: Vec<Duration>) -> Duration {

@@ -993,6 +993,7 @@ mod tests {
                 5usize,
             ),
             ("nvfp4_cpu.rs", include_str!("nvfp4_cpu.rs"), 25usize),
+            ("exl3_cpu_avx2.rs", include_str!("exl3_cpu_avx2.rs"), 4usize),
             (
                 "exl3_cpu_avx512.rs",
                 include_str!("exl3_cpu_avx512.rs"),

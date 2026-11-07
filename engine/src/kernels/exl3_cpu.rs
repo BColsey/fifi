@@ -24,8 +24,9 @@
 //! rounding.
 //!
 //! ISA tiers: the scalar reference works for every mul1 bit rate and is the fallback on CPUs
-//! without AVX-512; the AVX-512 VBMI/VNNI tier (`exl3_cpu_avx512`) handles every stored rate
-//! (1 to 8 bits, including the half-bit rates) and is chosen at run time.
+//! without AVX2; the AVX2 + FMA tier (`exl3_cpu_avx2`) and the AVX-512 VBMI/VNNI tier
+//! (`exl3_cpu_avx512`) each handle every stored rate (1 to 8 bits, including the half-bit rates).
+//! The tier is chosen at run time: AVX-512 if the CPU has it, else AVX2, else scalar.
 //!
 //! Threading: [`ExpertCpu`] owns an [`Exl3Pool`]; a layer runs as five short phases (rotate,
 //! project gate/up, activate and rotate, project down, rotate and scale), each a pool call.
@@ -36,6 +37,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use half::{bf16, f16};
 
 use crate::EngError;
+#[cfg(target_arch = "x86_64")]
+use crate::kernels::exl3_cpu_avx2 as avx2;
 #[cfg(target_arch = "x86_64")]
 use crate::kernels::exl3_cpu_avx512 as avx512;
 use crate::kernels::exl3_cpu_pool::Exl3Pool;
@@ -54,24 +57,63 @@ const COLUMN_TILES_PER_CHUNK: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exl3Isa {
     Scalar,
+    /// AVX2 and FMA.
+    Avx2,
     /// AVX-512 F/BW/VL/VBMI/VNNI.
     Avx512,
+}
+
+/// The tiers a CPU can run, kept apart from the host query so the choice can be tested for CPUs
+/// other than the one the tests run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IsaSupport {
+    avx512: bool,
+    avx2: bool,
+}
+
+impl IsaSupport {
+    fn host() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {
+                avx512: avx512::supported(),
+                avx2: avx2::supported(),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self {
+                avx512: false,
+                avx2: false,
+            }
+        }
+    }
+
+    fn allows(self, isa: Exl3Isa) -> bool {
+        match isa {
+            Exl3Isa::Scalar => true,
+            Exl3Isa::Avx2 => self.avx2,
+            Exl3Isa::Avx512 => self.avx512,
+        }
+    }
+
+    /// The automatic order: AVX-512, then AVX2, then scalar.
+    fn best(self) -> Exl3Isa {
+        [Exl3Isa::Avx512, Exl3Isa::Avx2]
+            .into_iter()
+            .find(|&isa| self.allows(isa))
+            .unwrap_or(Exl3Isa::Scalar)
+    }
 }
 
 impl Exl3Isa {
     /// The best tier this CPU supports.
     pub fn detect() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if avx512::supported() {
-                return Self::Avx512;
-            }
-        }
-        Self::Scalar
+        IsaSupport::host().best()
     }
 
     pub fn is_supported(self) -> bool {
-        self == Self::Scalar || Self::detect() == Self::Avx512
+        IsaSupport::host().allows(self)
     }
 }
 
@@ -332,11 +374,12 @@ fn simd_column_sums(
     nt: usize,
     out: &mut [f32; TILE],
 ) -> bool {
-    if isa != Exl3Isa::Avx512 {
-        return false;
-    }
     let shape = (proj.n_tiles(), proj.k_tiles());
-    avx512::column_tile(proj.trellis, proj.words / 8, shape, nt, table, out);
+    match isa {
+        Exl3Isa::Scalar => return false,
+        Exl3Isa::Avx2 => avx2::column_tile(proj.trellis, proj.words / 8, shape, nt, table, out),
+        Exl3Isa::Avx512 => avx512::column_tile(proj.trellis, proj.words / 8, shape, nt, table, out),
+    }
     true
 }
 
