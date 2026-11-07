@@ -5,6 +5,7 @@
 //! its environment fallback. This file only reads and checks values. It opens no file and starts
 //! no thread.
 
+use super::moe::context_budget::KvFormat;
 use crate::EngError;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -32,7 +33,56 @@ pub(crate) struct FlashOptions {
     /// Records speculative next-layer expert hints in one-token steps. The default is false.
     /// Hints do not stage storage or change routing.
     pub(crate) expert_prefetch: Option<bool>,
+    /// Serves the model on a CUDA card (a `native-cuda` Linux build). The default is false: the
+    /// CUDA decoder is experimental and a CUDA build refuses to serve Flash-Next without it.
+    /// When true, `cache_limit_bytes` (an MLX allocator key) is not required and is ignored.
+    pub(crate) cuda_decode: Option<bool>,
+    /// CUDA only: the positions the K/V caches hold, a multiple of 4 from 4 to 262144. Default
+    /// 4096. The load refuses a context the card cannot hold next to the trunk.
+    pub(crate) context: Option<u32>,
+    /// CUDA only: how the K/V is stored on the card. Default `f16`; `int8` has no attention
+    /// kernel yet and the load refuses it.
+    pub(crate) kv_format: Option<KvFormatName>,
+    /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
+    /// load plan leaves at the context.
+    pub(crate) slots: Option<u32>,
 }
+
+/// The K/V storage formats a `kv_format` value names.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum KvFormatName {
+    F16,
+    Int8,
+}
+
+impl KvFormatName {
+    pub(in crate::family::flash_next) fn format(self) -> KvFormat {
+        match self {
+            Self::F16 => KvFormat::F16,
+            Self::Int8 => KvFormat::Int8,
+        }
+    }
+}
+
+/// The CUDA decoder's own settings, present only when `cuda_decode` is on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CudaSettings {
+    pub(crate) context: u32,
+    pub(crate) kv_format: KvFormatName,
+    /// `None`: the load plan decides.
+    pub(crate) slots: Option<u32>,
+}
+
+/// Default positions of the CUDA K/V caches.
+pub(crate) const DEFAULT_CUDA_CONTEXT: u32 = 4096;
+/// Largest `context` value of the CUDA decoder.
+pub(crate) const MAX_CUDA_CONTEXT: u32 = 262_144;
+/// The attention indexer's block ratio: the caches hold whole blocks.
+const CUDA_CONTEXT_MULTIPLE: u32 = 4;
+/// Fewest expert slots: ten picks and the filler slot.
+pub(crate) const MIN_CUDA_SLOTS: u32 = 11;
+const MAX_CUDA_SLOTS: u32 = 512;
 
 /// The environment fallbacks, read by the caller so that this file stays pure.
 #[derive(Debug, Default)]
@@ -51,12 +101,14 @@ pub(crate) struct FlashSettings {
     /// `generation_config.json`.
     pub(crate) tokenizer_dir: PathBuf,
     pub(crate) manifest: PathBuf,
-    /// The MLX allocator cache limit in bytes.
+    /// The MLX allocator cache limit in bytes (0 with the CUDA decoder, which ignores it).
     pub(crate) cache_limit: u64,
     pub(crate) tokenizer_vocab_size: u32,
     pub(crate) prefill_chunk: u32,
     /// The default-off expert hint seam. It performs no prefetch I/O in this slice.
     pub(crate) expert_prefetch: bool,
+    /// The CUDA decoder, when `cuda_decode` is on.
+    pub(crate) cuda: Option<CudaSettings>,
 }
 
 fn bad(message: String) -> EngError {
@@ -96,6 +148,43 @@ fn manifest_path(options: &FlashOptions, env: &FlashEnv) -> Result<PathBuf, EngE
         })
 }
 
+/// The CUDA keys. Absent when `cuda_decode` is off; the keys are then refused if present, so a
+/// misspelt switch cannot leave an operator believing the card is in use.
+fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngError> {
+    if !options.cuda_decode.unwrap_or(false) {
+        let stray = [
+            ("context", options.context.is_some()),
+            ("kv_format", options.kv_format.is_some()),
+            ("slots", options.slots.is_some()),
+        ];
+        return match stray.iter().find(|(_, set)| *set) {
+            Some((key, _)) => Err(bad(format!("{key} needs cuda_decode set to true"))),
+            None => Ok(None),
+        };
+    }
+    let context = ranged(
+        "context",
+        options.context,
+        DEFAULT_CUDA_CONTEXT,
+        CUDA_CONTEXT_MULTIPLE,
+        MAX_CUDA_CONTEXT,
+    )?;
+    if !context.is_multiple_of(CUDA_CONTEXT_MULTIPLE) {
+        return Err(bad(format!(
+            "context must be a multiple of {CUDA_CONTEXT_MULTIPLE}, found {context}"
+        )));
+    }
+    let slots = options
+        .slots
+        .map(|slots| ranged("slots", Some(slots), slots, MIN_CUDA_SLOTS, MAX_CUDA_SLOTS))
+        .transpose()?;
+    Ok(Some(CudaSettings {
+        context,
+        kv_format: options.kv_format.unwrap_or(KvFormatName::F16),
+        slots,
+    }))
+}
+
 fn cache_limit(options: &FlashOptions, env: &FlashEnv) -> Result<u64, EngError> {
     let limit = match options.cache_limit_bytes {
         Some(value) => value,
@@ -126,11 +215,17 @@ impl FlashSettings {
     ) -> Result<Self, EngError> {
         let default = FlashOptions::default();
         let options = options.unwrap_or(&default);
+        let cuda = cuda_settings(options)?;
         Ok(Self {
             artifact: model_dir.to_path_buf(),
             tokenizer_dir: tokenizer_dir.to_path_buf(),
             manifest: manifest_path(options, env)?,
-            cache_limit: cache_limit(options, env)?,
+            // An MLX allocator key: the CUDA decoder has no use for it.
+            cache_limit: if cuda.is_some() {
+                0
+            } else {
+                cache_limit(options, env)?
+            },
             tokenizer_vocab_size: ranged(
                 "tokenizer_vocab_size",
                 options.tokenizer_vocab_size,
@@ -146,14 +241,16 @@ impl FlashSettings {
                 MAX_PREFILL_CHUNK,
             )?,
             expert_prefetch: options.expert_prefetch.unwrap_or(false),
+            cuda,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FlashEnv, FlashOptions, FlashSettings};
+    use super::{CudaSettings, FlashEnv, FlashOptions, FlashSettings, KvFormatName};
     use crate::EngError;
+    use crate::family::flash_next::moe::context_budget::KvFormat;
     use std::path::{Path, PathBuf};
 
     fn full() -> FlashOptions {
@@ -163,6 +260,7 @@ mod tests {
             tokenizer_vocab_size: Some(1000),
             prefill_chunk: Some(8),
             expert_prefetch: Some(true),
+            ..FlashOptions::default()
         }
     }
 
@@ -190,6 +288,7 @@ mod tests {
                 tokenizer_vocab_size: 1000,
                 prefill_chunk: 8,
                 expert_prefetch: true,
+                cuda: None,
             }
         );
     }
@@ -211,6 +310,7 @@ mod tests {
                 tokenizer_vocab_size: 248_077,
                 prefill_chunk: 16,
                 expert_prefetch: false,
+                cuda: None,
             }
         );
     }
@@ -375,7 +475,7 @@ mod tests {
                 cache_limit_bytes: Some(7),
                 tokenizer_vocab_size: None,
                 prefill_chunk: Some(4),
-                expert_prefetch: None,
+                ..FlashOptions::default()
             }
         );
         let error = serde_json::from_str::<FlashOptions>(r#"{"context_limit": 9}"#).unwrap_err();
@@ -383,5 +483,137 @@ mod tests {
             error.to_string().contains("unknown field `context_limit`"),
             "{error}"
         );
+    }
+
+    fn cuda_on() -> FlashOptions {
+        FlashOptions {
+            manifest: Some(PathBuf::from("/art/download-manifest.json")),
+            cuda_decode: Some(true),
+            ..FlashOptions::default()
+        }
+    }
+
+    #[test]
+    fn the_cuda_decoder_is_off_by_default_and_its_keys_need_the_switch() {
+        let env = FlashEnv::default();
+        assert_eq!(settings(Some(&full()), &env).unwrap().cuda, None);
+        for (options, key) in [
+            (
+                FlashOptions {
+                    context: Some(8192),
+                    ..full()
+                },
+                "context",
+            ),
+            (
+                FlashOptions {
+                    kv_format: Some(KvFormatName::F16),
+                    ..full()
+                },
+                "kv_format",
+            ),
+            (
+                FlashOptions {
+                    slots: Some(64),
+                    ..full()
+                },
+                "slots",
+            ),
+        ] {
+            assert_eq!(
+                message(settings(Some(&options), &env)),
+                format!("engine config: {key} needs cuda_decode set to true")
+            );
+        }
+        let off = FlashOptions {
+            cuda_decode: Some(false),
+            ..full()
+        };
+        assert_eq!(settings(Some(&off), &env).unwrap().cuda, None);
+    }
+
+    #[test]
+    fn the_cuda_decoder_takes_defaults_and_needs_no_cache_limit() {
+        let got = settings(Some(&cuda_on()), &FlashEnv::default()).unwrap();
+        assert_eq!(got.cache_limit, 0);
+        assert_eq!(
+            got.cuda,
+            Some(CudaSettings {
+                context: 4096,
+                kv_format: KvFormatName::F16,
+                slots: None,
+            })
+        );
+        // The manifest is still required: it pins the tokenizer.
+        let no_manifest = FlashOptions {
+            manifest: None,
+            ..cuda_on()
+        };
+        assert!(
+            message(settings(Some(&no_manifest), &FlashEnv::default()))
+                .contains("manifest is missing")
+        );
+    }
+
+    #[test]
+    fn the_cuda_keys_are_read_checked_and_bounded() {
+        let env = FlashEnv::default();
+        let options: FlashOptions = serde_json::from_str(
+            r#"{"manifest": "/m.json", "cuda_decode": true, "context": 65536,
+                "kv_format": "int8", "slots": 48}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings(Some(&options), &env).unwrap().cuda,
+            Some(CudaSettings {
+                context: 65536,
+                kv_format: KvFormatName::Int8,
+                slots: Some(48),
+            })
+        );
+        assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);
+        for (options, want) in [
+            (
+                FlashOptions {
+                    context: Some(3),
+                    ..cuda_on()
+                },
+                "context must be between 4 and 262144, found 3",
+            ),
+            (
+                FlashOptions {
+                    context: Some(4098),
+                    ..cuda_on()
+                },
+                "context must be a multiple of 4, found 4098",
+            ),
+            (
+                FlashOptions {
+                    context: Some(262_148),
+                    ..cuda_on()
+                },
+                "context must be between 4 and 262144, found 262148",
+            ),
+            (
+                FlashOptions {
+                    slots: Some(10),
+                    ..cuda_on()
+                },
+                "slots must be between 11 and 512, found 10",
+            ),
+            (
+                FlashOptions {
+                    slots: Some(513),
+                    ..cuda_on()
+                },
+                "slots must be between 11 and 512, found 513",
+            ),
+        ] {
+            assert_eq!(
+                message(settings(Some(&options), &env)),
+                format!("engine config: {want}")
+            );
+        }
+        assert!(serde_json::from_str::<FlashOptions>(r#"{"kv_format": "fp8"}"#).is_err());
     }
 }

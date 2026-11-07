@@ -1,0 +1,396 @@
+//! Starts the Flash-Next CUDA engine of one `enginesrv` config entry: the tokenizer bundle and the
+//! rules on the calling thread, then the engine thread builds everything CUDA inside `make` (no
+//! CUDA value crosses a thread boundary). It follows `qwen36/cuda/start.rs`.
+//!
+//! Load order inside `make`, each stage announced to the engine state:
+//! 1. the CUDA context, and the card's free memory before any weight is resident;
+//! 2. the pack, opened through one local-storage guard (`FlashPackFiles`);
+//! 3. the memory plan for the configured context (`FlashLoadPlan::at_context`): the expert slots
+//!    per layer that fit next to the trunk and the K/V, or a refusal that names the longest context;
+//! 4. the trunk, uploaded in the order of the walk (`trunk_weights`);
+//! 5. the expert bank: device slots per layer filled with the first experts of each layer, and the
+//!    rest pinned in host RAM (`DeviceBank::build`), after the host plan and the cgroup check;
+//! 6. the decode step and the split MoE block over the bank;
+//! 7. the host feeds: the embedding table and the PLE block (host projections), the n-gram table.
+//!
+//! Lifetime: `spawn_engine` needs an executor without a lifetime and the step borrows its owners, so
+//! the projector, the stream, the checkpoint and the weights are `Box::leak`ed once per engine.
+//! ONE CUDA engine is built per process (the same rule as the Qwen3.6 CUDA engine): a guard pins
+//! the flag before the first leak, and a retry in the same process is refused.
+
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
+
+use super::{
+    bank::{
+        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
+        ReplaceOnMissLru, device::DeviceBank,
+    },
+    bank_source::PackRecordSource,
+    device::CardDevice,
+    driver::{DriverShape, TokenDriver},
+    executor::{CudaRules, FlashCudaExecutor},
+    feeds::StartShape,
+    load::{TrunkList, upload::trunk_weights},
+    moe_block::{SplitMoe, SplitMoeTrunk},
+    pack_feeds::PackFeeds,
+    ple_feed::{NgramRows, PleFeed, PleVectors},
+    step::FlashStep,
+};
+use crate::{
+    EngError,
+    family::{
+        exl3_pack::layer_name,
+        flash_next::{
+            artifact::tokenizer_pin,
+            load::{
+                model_shape,
+                pack_files::{FlashPackFiles, NGRAM_FILE},
+            },
+            moe::{
+                load_plan::FlashLoadPlan,
+                tier_plan::{TierInputs, TierShape},
+            },
+            settings::{CudaSettings, FlashSettings},
+        },
+        flint::exl3_resident::HostBudget,
+        project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
+        qwen36::{cuda::exl3_source::PackReader, tiered::budget::KvPlan},
+        session::DecodeSession,
+    },
+    kernels::cuda::DeviceBuffer,
+    sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
+    tokenizer::TokenizerBundle,
+    weights::exl3::Checkpoint,
+};
+
+/// Threads of the host PLE projections (rows split over them).
+const PLE_THREADS: usize = 8;
+
+static CUDA_ENGINE_BUILT: AtomicBool = AtomicBool::new(false);
+
+fn already_built() -> EngError {
+    EngError::BadRequest(
+        "engine config: the Flash-Next CUDA backend builds one engine per process: its weights are leaked for the process lifetime; configure a single qwen3_8_flash_next entry and restart the process to reload"
+            .to_string(),
+    )
+}
+
+/// Takes the one-engine flag; released on drop unless committed (a failure before the first leak
+/// owns nothing on the card).
+pub(super) struct BuildGuard {
+    committed: bool,
+}
+
+impl BuildGuard {
+    fn acquire() -> Result<Self, EngError> {
+        CUDA_ENGINE_BUILT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| already_built())?;
+        Ok(Self { committed: false })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            CUDA_ENGINE_BUILT.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Loads and pins the tokenizer, then starts the engine thread, which loads the pack. The engine
+/// state stays `Loading` until the executor exists.
+pub(in crate::family::flash_next) fn start(
+    settings: &FlashSettings,
+    ready_note: ReadyNote,
+) -> Result<(Engine, TokenizerBundle), EngError> {
+    let cuda = settings.cuda.as_ref().ok_or_else(|| {
+        EngError::BadRequest("engine config: the CUDA decoder is not enabled".to_string())
+    })?;
+    let manifest = std::fs::read(&settings.manifest).map_err(|error| {
+        EngError::Checkpoint(format!("{}: {error}", settings.manifest.display()))
+    })?;
+    let pin = tokenizer_pin(&manifest, settings.tokenizer_vocab_size)?;
+    let bundle = TokenizerBundle::load(&settings.tokenizer_dir, &pin)?;
+    let rules = CudaRules {
+        eos: Arc::from(bundle.eos_token_ids()),
+        sampler_vocab: usize::try_from(bundle.vocab_size())
+            .map_err(|_| EngError::Checkpoint("tokenizer vocabulary exceeds usize".to_string()))?,
+    };
+    let prefill_chunk = usize::try_from(settings.prefill_chunk)
+        .map_err(|_| EngError::BadRequest("engine config: prefill_chunk exceeds usize".into()))?;
+    let artifact = settings.artifact.clone();
+    let wanted = CudaSettings {
+        context: cuda.context,
+        kv_format: cuda.kv_format,
+        slots: cuda.slots,
+    };
+    let guard = BuildGuard::acquire()?;
+    let engine = spawn_engine_noted(prefill_chunk, ready_note, move |stages| {
+        make(stages, &artifact, &wanted, rules, guard)
+    })?;
+    Ok((engine, bundle))
+}
+
+fn raw<'w>(weights: &'w CudaWeights, name: &str) -> Result<&'w DeviceBuffer, EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Raw { buffer, .. }) => Ok(buffer),
+        _ => Err(EngError::Checkpoint(format!(
+            "Flash-Next start: {name} is not an uploaded raw tensor"
+        ))),
+    }
+}
+
+fn exl3<'w>(weights: &'w CudaWeights, name: &str) -> Result<&'w Exl3Weight, EngError> {
+    match weights.get(name) {
+        Some(CudaWeight::Exl3 { weight, .. }) => Ok(weight),
+        _ => Err(EngError::Checkpoint(format!(
+            "Flash-Next start: {name} is not an uploaded EXL3 matrix"
+        ))),
+    }
+}
+
+/// The trunk of the split MoE block of every layer, borrowed from the uploaded weights.
+fn moe_trunks(
+    weights: &'static CudaWeights,
+    layers: usize,
+) -> Result<Vec<SplitMoeTrunk<'static>>, EngError> {
+    (0..layers)
+        .map(|layer| {
+            let at = |suffix: &str| layer_name(layer, suffix);
+            Ok(SplitMoeTrunk {
+                router: raw(weights, &at("mlp.gate.weight"))?,
+                router_shared: raw(weights, &at("mlp.shared_expert_gate.weight"))?,
+                shared_gate: exl3(weights, &at("mlp.shared_expert.gate_proj"))?,
+                shared_up: exl3(weights, &at("mlp.shared_expert.up_proj"))?,
+                shared_down: exl3(weights, &at("mlp.shared_expert.down_proj"))?,
+            })
+        })
+        .collect()
+}
+
+fn read_meminfo() -> Result<(u64, u64), EngError> {
+    let text = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| EngError::MemoryPlan(format!("/proc/meminfo: {error}")))?;
+    let memory = HostMemory::from_meminfo(&text)?;
+    Ok((memory.total, memory.available))
+}
+
+/// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host.
+fn build_bank(
+    projector: &CudaProjector,
+    checkpoint: &Checkpoint,
+    geometry: BankGeometry,
+    source: &PackRecordSource<'_>,
+) -> Result<DeviceBank, EngError> {
+    let rows: Vec<Vec<i32>> = (0..geometry.layers)
+        .map(|_| {
+            (0..geometry.experts)
+                .map(|expert| {
+                    if expert < geometry.slots {
+                        expert as i32
+                    } else {
+                        -1
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
+    // No popularity profile: lower ids count as hotter, so the first experts are the last evicted.
+    let counts = vec![(0..geometry.experts as u64).rev().collect::<Vec<u64>>(); geometry.layers];
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
+    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy)?;
+    let (total, available) = read_meminfo()?;
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &HostMemory { total, available },
+        &HostTerms::DEFAULT,
+    )?;
+    HostBudget::probe()?.admit_for(plan.process_bytes, "Flash-Next expert bank")?;
+    let _ = checkpoint;
+    DeviceBank::build(projector.context(), state, source, &plan)
+}
+
+fn make(
+    stages: &Stages<'_>,
+    artifact: &Path,
+    wanted: &CudaSettings,
+    rules: CudaRules,
+    guard: BuildGuard,
+) -> Result<(FlashCudaExecutor<CardDevice, PackFeeds>, DecodeSession), EngError> {
+    let driver = build_driver(
+        &|name| stages.begin(name),
+        artifact,
+        wanted,
+        rules.sampler_vocab,
+        Some(guard),
+    )?;
+    FlashCudaExecutor::new(driver, rules)
+}
+
+/// Loads the pack and builds the token driver. `guard` pins the one-engine flag at the first leak;
+/// a device test passes none.
+pub(super) fn build_driver(
+    stage: &dyn Fn(&'static str),
+    artifact: &Path,
+    wanted: &CudaSettings,
+    sampler_vocab: usize,
+    mut guard: Option<BuildGuard>,
+) -> Result<TokenDriver<CardDevice, PackFeeds>, EngError> {
+    let began = Instant::now();
+    stage("initializing CUDA");
+    let projector = CudaProjector::new()?;
+    let free_vram = projector.memory_info()?.free as u64;
+
+    stage("opening the pack");
+    let files = FlashPackFiles::open(artifact)?;
+    let FlashPackFiles {
+        checkpoint,
+        ngram,
+        report,
+    } = files;
+    let (model, kinds) = model_shape(&checkpoint.model_config)?;
+    let layers = kinds.len();
+    let ngram_bytes = std::fs::metadata(artifact.join(NGRAM_FILE))
+        .map_err(|error| EngError::Checkpoint(format!("{NGRAM_FILE}: {error}")))?
+        .len();
+
+    stage("planning memory");
+    let tier_shape = TierShape::from_pack(
+        layers,
+        model.moe.experts(),
+        model.moe.top_k(),
+        report.expert_bytes,
+    )?;
+    let (mem_total, mem_available) = read_meminfo()?;
+    let card = TierInputs::measured(
+        tier_shape,
+        (0, 0),
+        KvPlan {
+            positions: 1,
+            bytes_per_position: 1,
+        },
+        free_vram,
+        (mem_total, mem_available),
+    );
+    let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
+    let load = load_plan.at_context(
+        u64::from(wanted.context),
+        wanted.kv_format.format(),
+        model.moe.top_k() + 1,
+    )?;
+    let planned_slots = load.context.plan.slots_per_layer();
+    let slots = match wanted.slots {
+        None => planned_slots,
+        Some(asked) if (asked as usize) <= planned_slots => asked as usize,
+        Some(asked) => {
+            return Err(EngError::MemoryPlan(format!(
+                "Flash-Next start: slots {asked} per layer asked, the memory plan at context {} leaves {planned_slots}",
+                wanted.context
+            )));
+        }
+    };
+    eprintln!("{load}; serving {slots} slots per layer");
+    if sampler_vocab == 0 || sampler_vocab > model.vocab {
+        return Err(EngError::Checkpoint(format!(
+            "sampler vocabulary {} is outside 1..={}, the width of the model head",
+            sampler_vocab, model.vocab
+        )));
+    }
+
+    // LEAK: the owners are leaked for the process lifetime, giving the step `'static` borrows.
+    // From the first leak a failure leaves the card loaded, so the one-engine flag is pinned here.
+    let projector: &'static CudaProjector = Box::leak(Box::new(projector));
+    let checkpoint: &'static Checkpoint = Box::leak(Box::new(checkpoint));
+    if let Some(guard) = guard.as_mut() {
+        guard.commit();
+    }
+    let ctx = projector.context();
+
+    stage("loading weights");
+    let list = TrunkList::new(&checkpoint.source, &checkpoint.model_config)?;
+    let reader = PackReader::new(projector, checkpoint, Reserve::default());
+    let weights: &'static CudaWeights =
+        Box::leak(Box::new(trunk_weights(&reader, &list, &load_plan)?));
+    eprintln!(
+        "flash-next cuda: trunk uploaded in {:.1} s",
+        began.elapsed().as_secs_f64()
+    );
+
+    stage("filling the expert bank");
+    let source = PackRecordSource::new(checkpoint)?;
+    let geometry = BankGeometry::new(
+        layers,
+        model.moe.experts(),
+        model.moe.top_k(),
+        slots,
+        source.layout().record_bytes(),
+    )?;
+    let bank = build_bank(projector, checkpoint, geometry, &source)?;
+    eprintln!(
+        "flash-next cuda: expert bank filled at {:.1} s",
+        began.elapsed().as_secs_f64()
+    );
+
+    stage("building the step");
+    let stream = Box::leak(Box::new(ctx.stream()?));
+    let step = FlashStep::new(
+        ctx,
+        stream,
+        weights,
+        &checkpoint.model_config,
+        wanted.context as usize,
+        0..layers,
+    )?;
+    let moe = SplitMoe::new(
+        ctx,
+        moe_trunks(weights, layers)?,
+        bank,
+        source.layout(),
+        &step.moe_dims(),
+    )?;
+    let device = CardDevice::new(step, moe);
+
+    stage("opening the n-gram table");
+    let (vectors, projection) =
+        PleVectors::read(&checkpoint.source, model.ple_layer, &model.ple, PLE_THREADS)?;
+    let ple = PleFeed::new(
+        model.ple,
+        NgramRows::new(ngram)?,
+        vectors,
+        Box::new(projection),
+    );
+    let hidden = model.hyper.hidden();
+    let branches = model.hyper.branches();
+    let ple_embed = model.ple.embed();
+    let feeds = PackFeeds::new(&checkpoint.source, ple, hidden, branches);
+    let shape = DriverShape {
+        layers,
+        ple_layer: model.ple_layer,
+        positions: wanted.context as usize,
+        start: StartShape {
+            sampler_vocab,
+            stream: branches * hidden,
+            ple_embed,
+        },
+    };
+    let driver = TokenDriver::new(device, feeds, shape)?;
+    eprintln!(
+        "flash-next cuda: ready in {:.1} s",
+        began.elapsed().as_secs_f64()
+    );
+    Ok(driver)
+}

@@ -101,3 +101,21 @@ mod mixer;
 mod step;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod step_tests;
+
+// The token driver and the executor on top of it. The driver runs against fakes in host tests;
+// the card implementations and the engine start need the native CUDA backend.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+mod device;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
+mod driver;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod driver_device_tests;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
+mod executor;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(not(test), allow(dead_code, reason = "staged for the engine start"))]
+mod pack_feeds;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family::flash_next) mod start;

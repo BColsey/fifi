@@ -41,14 +41,14 @@ fn refuse(detail: String) -> EngError {
 /// The sizes of one pack and the context-independent part of its memory plan.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::family::flash_next) struct FlashLoadPlan {
-    pub(super) shape: TierShape,
+    pub(in crate::family::flash_next) shape: TierShape,
     /// Device bytes of the trunk: attention, DeltaNet, router, shared experts, hyper-connections
     /// and the head (the header walk's total less the routed experts and the embedding).
     pub(in crate::family::flash_next) trunk_bytes: u64,
     /// The token embedding, gathered on the host.
     pub(super) embedding_bytes: u64,
     /// The recurrent state and conv ring of every DeltaNet layer.
-    pub(super) delta_state_bytes: u64,
+    pub(in crate::family::flash_next) delta_state_bytes: u64,
     /// The n-gram table, read from local NVMe.
     pub(super) ngram_bytes: u64,
     budget: ContextBudget,
@@ -58,7 +58,7 @@ impl FlashLoadPlan {
     /// `card` carries the VRAM and host numbers (`TierInputs::measured` from the machine; the tests use
     /// the cost-model fixture); its `shape`,
     /// `vram.non_expert` and `kv` fields are replaced by what the pack says.
-    pub(super) fn new(
+    pub(in crate::family::flash_next) fn new(
         report: &FlashPackReport,
         model_config: &[u8],
         ngram_bytes: u64,
@@ -118,7 +118,7 @@ impl FlashLoadPlan {
 
     /// The plan for `requested` positions, or the refusal that names the longest context with
     /// `min_slots`.
-    pub(super) fn at_context(
+    pub(in crate::family::flash_next) fn at_context(
         &self,
         requested: u64,
         format: KvFormat,
@@ -139,12 +139,12 @@ impl FlashLoadPlan {
 
 /// A settled load: the context, its expert placement and the bytes of every part.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct LoadPlan {
-    pub(super) context: ContextPlan,
-    pub(super) trunk_bytes: u64,
-    pub(super) embedding_bytes: u64,
-    pub(super) ngram_bytes: u64,
-    pub(super) kv_bytes: u64,
+pub(in crate::family::flash_next) struct LoadPlan {
+    pub(in crate::family::flash_next) context: ContextPlan,
+    pub(in crate::family::flash_next) trunk_bytes: u64,
+    pub(in crate::family::flash_next) embedding_bytes: u64,
+    pub(in crate::family::flash_next) ngram_bytes: u64,
+    pub(in crate::family::flash_next) kv_bytes: u64,
 }
 
 impl fmt::Display for LoadPlan {

@@ -112,10 +112,10 @@ impl KvGeometry {
 
 /// A context the card can serve, with the expert placement it leaves room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ContextPlan {
-    pub(super) positions: u64,
-    pub(super) format: KvFormat,
-    pub(super) plan: TierPlan,
+pub(in crate::family::flash_next) struct ContextPlan {
+    pub(in crate::family::flash_next) positions: u64,
+    pub(in crate::family::flash_next) format: KvFormat,
+    pub(in crate::family::flash_next) plan: TierPlan,
 }
 
 /// The plan's inputs with the context left open.
