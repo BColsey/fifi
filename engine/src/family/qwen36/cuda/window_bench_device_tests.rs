@@ -136,9 +136,7 @@ use crate::{
             },
         },
     },
-    kernels::{
-        cuda::resident::argmax_rows::window_read_bytes, single_row::require_kernel_ran,
-    },
+    kernels::{cuda::resident::argmax_rows::window_read_bytes, single_row::require_kernel_ran},
 };
 
 const GIB: u64 = 1 << 30;

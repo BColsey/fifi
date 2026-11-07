@@ -499,10 +499,7 @@ pub(crate) fn draw_route(facts: &DrawFacts<'_>) -> DrawRoute {
     let Some(draws) = facts.draws else {
         return DrawRoute::NotKrow;
     };
-    if !facts.krow_runs
-        || !facts.device_window
-        || !draws.belongs_to(facts.base, facts.inputs)
-    {
+    if !facts.krow_runs || !facts.device_window || !draws.belongs_to(facts.base, facts.inputs) {
         return DrawRoute::NotKrow;
     }
     if facts.row >= draws.inputs.len() {

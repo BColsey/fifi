@@ -1752,8 +1752,8 @@ fn window_draw_commit(
 #[test]
 #[ignore = "the GPU, held exclusively: loads the real 4.00 bpw pack in FIFI_EXL3_CHECKPOINT"]
 fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
-    use crate::kernels::cuda::resident::argmax_rows::window_read_bytes;
     use super::krow_device_tests::check_window_reads;
+    use crate::kernels::cuda::resident::argmax_rows::window_read_bytes;
     let shortlist_on = super::readback::device_shortlist_enabled(
         std::env::var(super::readback::SHORTLIST_VAR)
             .ok()
@@ -1771,7 +1771,11 @@ fn d1_krow_a_window_copies_its_report_and_never_the_logits_without_the_tap() {
             for (what, mut sampler, row_reads) in [
                 ("greedy", Sampler::greedy(), 0),
                 // The record serves it; with the shortlist off every draw reads a row.
-                ("keeps 20", seeded_keeping(20, 7), if shortlist_on { 0 } else { kept }),
+                (
+                    "keeps 20",
+                    seeded_keeping(20, 7),
+                    if shortlist_on { 0 } else { kept },
+                ),
             ] {
                 let ((), grown) = device_reads(&mut rig.step, |step| {
                     window_draw_commit(step, &inputs, kept, &mut sampler);
@@ -1860,9 +1864,14 @@ fn d1_krow_draws_from_the_report_are_the_draws_from_the_full_rows() {
                                 .expect("a host draw")
                         })
                         .collect();
-                    let which = format!("{window_rows} rows, top_k {top_k} seed {seed} drawn {drawn}");
+                    let which =
+                        format!("{window_rows} rows, top_k {top_k} seed {seed} drawn {drawn}");
                     assert_eq!(from_device, from_host, "{which}");
-                    assert_eq!(device.rng_state(), host.rng_state(), "{which}: the generator");
+                    assert_eq!(
+                        device.rng_state(),
+                        host.rng_state(),
+                        "{which}: the generator"
+                    );
                 }
             }
         }

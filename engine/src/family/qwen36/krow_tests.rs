@@ -474,7 +474,11 @@ fn a_shortlist_that_disagrees_with_its_pair_is_an_error_and_a_bad_row_is_not_rea
 
 /// The ways entry `at` of a record can be corrupt that a later entry-by-entry check must find and
 /// the first entry and the non-finite word cannot show.
-fn corruptions(good: &[(u32, f32)], at: usize, vocab: usize) -> Vec<(&'static str, Vec<(u32, f32)>)> {
+fn corruptions(
+    good: &[(u32, f32)],
+    at: usize,
+    vocab: usize,
+) -> Vec<(&'static str, Vec<(u32, f32)>)> {
     let mut out = Vec::new();
     let mut repeated = good.to_vec();
     repeated[at].0 = good[at - 4].0;
@@ -500,7 +504,9 @@ fn corruptions(good: &[(u32, f32)], at: usize, vocab: usize) -> Vec<(&'static st
 fn a_corrupt_later_entry_fails_the_check_that_reads_the_report_with_the_predicate_of_the_sampler() {
     use crate::family::sampler::check_shortlist;
     let vocab = 40;
-    let row: Vec<f32> = (0..vocab).map(|i| ((i * 7 + 3) % 29) as f32 - 9.0).collect();
+    let row: Vec<f32> = (0..vocab)
+        .map(|i| ((i * 7 + 3) % 29) as f32 - 9.0)
+        .collect();
     let good = ranked_top(&row, SHORTLIST_K);
     let token = good[0].0 as i32;
     let params = SamplingParams::new(0.9, 0.95, 20).unwrap();
@@ -516,17 +522,26 @@ fn a_corrupt_later_entry_fails_the_check_that_reads_the_report_with_the_predicat
         // check can find it.
         let rec = [record(&bad, 0)];
         let text = format!("{:?}", check_shortlists(&[token], &[0], &rec, vocab));
-        assert!(text.starts_with("Err") && text.contains("row 0"), "{what}: {text}");
+        assert!(
+            text.starts_with("Err") && text.contains("row 0"),
+            "{what}: {text}"
+        );
         // And it is the predicate the sampler applies: the two agree on every corruption.
         assert!(check_shortlist(&bad, vocab).is_err(), "{what}");
         assert!(
-            Sampler::new(params, 1).sample_shortlist(&bad, vocab).is_err(),
+            Sampler::new(params, 1)
+                .sample_shortlist(&bad, vocab)
+                .is_err(),
             "{what}"
         );
     }
     // A record of fewer entries than the vocabulary allows is the wrong length for both.
     assert!(check_shortlist(&good[..19], vocab).is_err());
-    assert!(Sampler::new(params, 1).sample_shortlist(&good[..19], vocab).is_err());
+    assert!(
+        Sampler::new(params, 1)
+            .sample_shortlist(&good[..19], vocab)
+            .is_err()
+    );
 }
 
 // ---- which draws need a full row ----
@@ -628,28 +643,53 @@ fn a_draw_goes_to_the_record_the_tap_copy_or_one_device_row() {
     for top_k in [1, 5, 20] {
         let params = SamplingParams::new(0.8, 0.95, top_k).unwrap();
         for tap_row in [false, true] {
-            let served = DrawFacts { params, tap_row, ..facts };
-            assert_eq!(draw_route(&served), DrawRoute::Shortlist, "{top_k} {tap_row}");
+            let served = DrawFacts {
+                params,
+                tap_row,
+                ..facts
+            };
+            assert_eq!(
+                draw_route(&served),
+                DrawRoute::Shortlist,
+                "{top_k} {tap_row}"
+            );
         }
     }
     // A sampler the record cannot serve reads the tap's copy when there is one, else one row.
     for top_k in [0, 21, 64] {
         let params = SamplingParams::new(0.8, 0.95, top_k).unwrap();
-        assert_eq!(draw_route(&DrawFacts { params, ..facts }), DrawRoute::DeviceRow);
-        let tapped = DrawFacts { params, tap_row: true, ..facts };
+        assert_eq!(
+            draw_route(&DrawFacts { params, ..facts }),
+            DrawRoute::DeviceRow
+        );
+        let tapped = DrawFacts {
+            params,
+            tap_row: true,
+            ..facts
+        };
         assert_eq!(draw_route(&tapped), DrawRoute::TapRow);
     }
     // The other reasons the record does not serve it.
     assert_eq!(
-        draw_route(&DrawFacts { sync_each: true, ..facts }),
+        draw_route(&DrawFacts {
+            sync_each: true,
+            ..facts
+        }),
         DrawRoute::DeviceRow
     );
     assert_eq!(
-        draw_route(&DrawFacts { vocab_matches: false, ..facts }),
+        draw_route(&DrawFacts {
+            vocab_matches: false,
+            ..facts
+        }),
         DrawRoute::DeviceRow
     );
     assert_eq!(
-        draw_route(&DrawFacts { vocab_matches: false, tap_row: true, ..facts }),
+        draw_route(&DrawFacts {
+            vocab_matches: false,
+            tap_row: true,
+            ..facts
+        }),
         DrawRoute::TapRow
     );
     // A row without a record (the shortlist is off, or the window has none for it).
@@ -659,32 +699,73 @@ fn a_draw_goes_to_the_record_the_tap_copy_or_one_device_row() {
         DrawRoute::DeviceRow
     );
     let first_only = draws_of(12, &inputs, 1);
-    let second = DrawFacts { row: 1, ..route_facts(Some(&first_only), &inputs) };
+    let second = DrawFacts {
+        row: 1,
+        ..route_facts(Some(&first_only), &inputs)
+    };
     assert_eq!(draw_route(&second), DrawRoute::DeviceRow);
     assert_eq!(
-        draw_route(&DrawFacts { row: 0, ..route_facts(Some(&first_only), &inputs) }),
+        draw_route(&DrawFacts {
+            row: 0,
+            ..route_facts(Some(&first_only), &inputs)
+        }),
         DrawRoute::Shortlist
     );
 }
 
 #[test]
-fn a_row_past_the_window_is_refused_and_a_window_the_k_row_path_did_not_run_takes_the_default_path() {
+fn a_row_past_the_window_is_refused_and_a_window_the_k_row_path_did_not_run_takes_the_default_path()
+{
     let inputs = [1u32, 2, 3];
     let draws = draws_of(12, &inputs, 3);
     let facts = route_facts(Some(&draws), &inputs);
     for row in [3, 4, 100] {
-        assert_eq!(draw_route(&DrawFacts { row, ..facts }), DrawRoute::OutOfWindow, "{row}");
+        assert_eq!(
+            draw_route(&DrawFacts { row, ..facts }),
+            DrawRoute::OutOfWindow,
+            "{row}"
+        );
     }
     // The default path: the path is off for this window (an eager window with the same base and
     // inputs as the window the records belong to), the state is not in the slots, there are no
     // records, or the records are another window's.
     for (what, other) in [
-        ("the path does not run it", DrawFacts { krow_runs: false, ..facts }),
-        ("host rollback", DrawFacts { device_window: false, ..facts }),
-        ("no records", DrawFacts { draws: None, ..facts }),
+        (
+            "the path does not run it",
+            DrawFacts {
+                krow_runs: false,
+                ..facts
+            },
+        ),
+        (
+            "host rollback",
+            DrawFacts {
+                device_window: false,
+                ..facts
+            },
+        ),
+        (
+            "no records",
+            DrawFacts {
+                draws: None,
+                ..facts
+            },
+        ),
         ("another base", DrawFacts { base: 13, ..facts }),
-        ("other inputs", DrawFacts { inputs: &[1, 2, 4], ..facts }),
-        ("a shorter window", DrawFacts { inputs: &[1, 2], ..facts }),
+        (
+            "other inputs",
+            DrawFacts {
+                inputs: &[1, 2, 4],
+                ..facts
+            },
+        ),
+        (
+            "a shorter window",
+            DrawFacts {
+                inputs: &[1, 2],
+                ..facts
+            },
+        ),
     ] {
         assert_eq!(draw_route(&other), DrawRoute::NotKrow, "{what}");
         // And a row past the window of such a window is the default path's business too.

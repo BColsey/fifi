@@ -505,7 +505,8 @@ fn the_reads_of_a_window_are_the_reads_that_grew_between_two_snapshots() {
 fn a_window_reads_its_report_once_and_what_the_case_asks_for_and_nothing_else() {
     use std::collections::BTreeMap;
     let row = 993_280;
-    let reads = |pairs: &[(usize, usize)]| -> BTreeMap<usize, usize> { pairs.iter().copied().collect() };
+    let reads =
+        |pairs: &[(usize, usize)]| -> BTreeMap<usize, usize> { pairs.iter().copied().collect() };
     // The report alone, with scalar health words around it.
     check_window_reads(&reads(&[(4, 41), (1488, 1)]), 1488, &[]).expect("the report only");
     // A sampler the record cannot serve: one row per drawn row.

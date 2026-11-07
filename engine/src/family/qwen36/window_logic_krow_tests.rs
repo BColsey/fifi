@@ -1677,7 +1677,10 @@ fn an_eager_window_with_the_base_and_inputs_of_a_k_row_window_is_not_served_its_
         rig.fake.want_logits = false;
         let base = rig.fake.snapshot().expect("snapshot");
         let first = serve(&mut rig.fake, 4, 4, &mut keeping(5, 7));
-        assert_eq!(rig.fake.shortlist_draws, 4, "the K-row window draws from its records");
+        assert_eq!(
+            rig.fake.shortlist_draws, 4,
+            "the K-row window draws from its records"
+        );
         // The same base and inputs, run by the eager loop: the records of the first window are
         // still stored, and must not be used.
         rig.fake.restore(&base).expect("restore");
@@ -1686,8 +1689,16 @@ fn an_eager_window_with_the_base_and_inputs_of_a_k_row_window_is_not_served_its_
         assert_eq!(first, second, "the same draws either way");
         rig.fake.shortlist_draws
     };
-    assert_eq!(run(Flaw::Sound), 4, "the eager window drew from its own rows");
-    assert_eq!(run(Flaw::ServesStaleDraws), 8, "the flaw serves the stale records");
+    assert_eq!(
+        run(Flaw::Sound),
+        4,
+        "the eager window drew from its own rows"
+    );
+    assert_eq!(
+        run(Flaw::ServesStaleDraws),
+        8,
+        "the flaw serves the stale records"
+    );
 }
 
 #[test]
@@ -1697,7 +1708,10 @@ fn with_the_k_row_path_off_a_draw_takes_the_one_row_path_and_the_draws_are_never
         let tokens = serve(&mut eager.fake, n, n, &mut keeping(5, 7));
         assert_eq!(tokens.len(), n);
     }
-    assert!(eager.fake.draws.is_none(), "an eager window stores no draws");
+    assert!(
+        eager.fake.draws.is_none(),
+        "an eager window stores no draws"
+    );
     assert_eq!((eager.fake.shortlist_draws, eager.fake.row_reads), (0, 0));
     assert_eq!(eager.fake.logit_copies, 0);
 }
