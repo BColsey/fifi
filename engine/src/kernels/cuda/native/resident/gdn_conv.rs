@@ -1,8 +1,9 @@
 //! Raw FFI to `inference_cuda_gdn_conv_launch` of `native/resident/gdn_conv.cu` (declared in
-//! `native/resident/gdn_conv.h`): the launch shim of the vendored `conv_silu_k`. Child of
+//! `native/resident/gdn_conv.h`): the launch shim of the vendored `conv_silu_k`, and the entry of
+//! the prefill variant `conv_silu_rows_k` that runs the same arithmetic over row blocks. Child of
 //! `native::resident`, so it inherits the `allow(unsafe_code)` of `native.rs`.
 //!
-//! The kernel is vendored xavier-qwen code.
+//! `conv_silu_k` is vendored xavier-qwen code; `conv_silu_rows_k` is ours.
 //!
 //! Safety invariants this file relies on:
 //! - The entry is called only through `CudaContext::launch_on`, on the owning thread and under the
@@ -81,6 +82,13 @@ unsafe extern "C" {
         args: *const GdnConvArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
+    ) -> c_int;
+    #[link_name = "inference_cuda_gdn_conv_rows_launch"]
+    fn gdn_conv_rows_raw(
+        args: *const GdnConvArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        rows_per_thread: c_int,
     ) -> c_int;
     #[link_name = "inference_cuda_gdn_conv_snap_launch"]
     fn gdn_conv_snap_raw(
@@ -187,6 +195,47 @@ pub(in crate::kernels::cuda) fn gdn_conv_launch(
     // only during the call: the kernel arguments are copied at launch, so nothing keeps the
     // pointer. `stream` is a live handle for the call, and `stage` is a live, writable c_int.
     let status = unsafe { gdn_conv_raw(&args, stream.0.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Rows per thread that `conv_silu_rows_k` is instantiated for (`gdn_conv.h`).
+pub(in crate::kernels::cuda) const GDN_CONV_ROWS_PER_THREAD: [usize; 3] = [16, 32, 64];
+
+/// The same launch on the prefill kernel, `rows_per_thread` rows per thread (one of
+/// [`GDN_CONV_ROWS_PER_THREAD`]; the entry refuses any other value). Same checks, same bytes
+/// written as [`gdn_conv_launch`].
+pub(in crate::kernels::cuda) fn gdn_conv_rows_launch(
+    stream: &RawStream,
+    call: GdnConvRaw<'_>,
+    rows_per_thread: usize,
+) -> Result<(), DeviceFailure> {
+    let (m, ld, channels) = check_gdn_conv(&call)?;
+    if !GDN_CONV_ROWS_PER_THREAD.contains(&rows_per_thread) {
+        return Err(invalid_argument());
+    }
+    let args = GdnConvArgsRaw {
+        proj: call.proj.address().cast_const(),
+        w: call.w.address().cast_const(),
+        state: call.state.address(),
+        out: call.out.address(),
+        m,
+        ld,
+        channels,
+    };
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_conv_launch`: `check_gdn_conv` proved the four ranges inside their live
+    // allocations, large enough, aligned and apart where the kernel writes, and the entry repeats
+    // the checks on the addresses. `rows_per_thread` is one of the three instantiated values, and
+    // the entry refuses any other. `args` is a live local the entry reads only during the call,
+    // `stream` is a live handle for the call, and `stage` is a live, writable c_int.
+    let status = unsafe {
+        gdn_conv_rows_raw(
+            &args,
+            stream.0.as_ptr(),
+            &mut stage,
+            rows_per_thread as c_int,
+        )
+    };
     checked(status, stage)
 }
 

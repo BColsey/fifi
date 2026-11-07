@@ -1,6 +1,6 @@
 /* The DeltaNet causal conv step, per-kernel header (native/resident/gdn_conv.h). Included by
  * gdn_conv.cu and read by the Rust FFI mirror; nothing else. Wraps the vendored kern::conv_silu
- * (engine/vendor/xavier-qwen/src/ops.cu) and adds no kernel.
+ * (engine/vendor/xavier-qwen/src/ops.cu) and adds the prefill variant conv_silu_rows_k.
  *
  * out[t][c] = silu(w[c][0]*s0 + w[c][1]*s1 + w[c][2]*s2 + w[c][3]*x) with x = proj[t][c] and
  * (s0, s1, s2) the three previous inputs of channel c, oldest first; the window then shifts. The
@@ -34,6 +34,14 @@ typedef struct inference_cuda_gdn_conv_args {
 
 int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args, void *stream,
                                    int *out_stage);
+
+/* The same step on the prefill kernel (conv_silu_rows_k of gdn_conv.cu): bytes of out and state
+ * identical to the entry above for every valid call. Each thread owns one channel for
+ * rows_per_thread rows (16, 32 or 64; any other value is INVALID_ARGUMENT), so a call of many
+ * rows runs on many more CTAs than the original kernel's one thread per channel. It takes no
+ * snapshot range. The arguments, limits and overlap rules are those of the entry above. */
+int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args, void *stream,
+                                        int *out_stage, int rows_per_thread);
 
 /* The same step with per-token state snapshots stored at a stride (the K-row verify window). After
  * token t < m - 1 the planar state [3][channels] is also stored at snap + t * snap_stride bytes, so

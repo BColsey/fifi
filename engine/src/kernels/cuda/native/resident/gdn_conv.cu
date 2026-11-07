@@ -1,6 +1,7 @@
-// Launch shim for the vendored conv_silu_k (kern::conv_silu in ops.cu). No kernel is added;
-// this file only proves the arguments the kernel does not check and makes one extern "C" call.
-// The kernel is vendored xavier-qwen code.
+// Launch shim for the vendored conv_silu_k (kern::conv_silu in ops.cu): it proves the arguments
+// the kernel does not check and makes one extern "C" call. The kernel is vendored xavier-qwen
+// code. The one kernel of this file, conv_silu_rows_k, is the prefill variant of it: the same
+// per-element arithmetic, split over rows so that a long prefill launch fills the device.
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -68,6 +69,85 @@ bool valid_snap(const inference_cuda_gdn_conv_snap_args &s) {
            apart(s.snap, reach, a.proj, proj_bytes) && apart(s.snap, reach, a.w, n * 4 * sizeof(float));
 }
 
+constexpr int kBlock = 256;
+
+// silu as in the vendored ops.cu (the same expression, so the same instructions under the same
+// build flags); the device tests compare the two kernels bit for bit.
+__device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
+
+// The prefill variant of conv_silu_k. One thread owns channel c for the rows [t0, t0 + R) of its
+// CTA row, t0 = blockIdx.y * R. The window entering row t is the three inputs of rows t - 3 .. t - 1,
+// which are proj rows (or, before row 0, the state), so the rows need no carried register chain:
+// a thread loads its R inputs and the three before them, then computes the R outputs with the
+// expression of conv_silu_k, term for term. Every output element therefore sees the same four
+// products in the same order as in the original kernel.
+//
+// The state after the m rows is the last three inputs (or the state shifted, for m < 3). Only the
+// CTA row 0 reads the state (R >= 3 gives every other CTA row a full window in proj), and the same
+// thread of that CTA row writes it back, after reading it, so no CTA reads what another writes.
+template <int R>
+__global__ void __launch_bounds__(kBlock)
+conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
+                 const float4 *__restrict__ w, float *state, float *__restrict__ out) {
+    static_assert(R >= 3, "a CTA row after the first must find its window in proj");
+    const int c = blockIdx.x * kBlock + threadIdx.x;
+    if (c >= n) return;
+    const int t0 = blockIdx.y * R;
+    const int rows = min(R, m - t0);
+    float x[R + 3];
+    // x[0..2]: the inputs of rows t0 - 3 .. t0 - 1; a negative row is a state row (3 + row).
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int r = t0 - 3 + k;
+        x[k] = r >= 0 ? proj[(size_t)r * ld + c] : state[(size_t)(3 + r) * n + c];
+    }
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        if (j < rows) x[3 + j] = proj[(size_t)(t0 + j) * ld + c];
+    }
+    const float4 wc = w[c];
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+        if (j < rows) {
+            // conv_silu_k's expression, with the contraction it gets from the compiler written
+            // out: the first product rounded, then three fused multiply-adds in tap order. As a
+            // plain expression the compiler fuses the second product first in this kernel, which
+            // rounds differently.
+            const float v = __fmaf_rn(x[j + 3], wc.w,
+                                      __fmaf_rn(x[j + 2], wc.z,
+                                                __fmaf_rn(x[j + 1], wc.y, __fmul_rn(x[j], wc.x))));
+            out[(size_t)(t0 + j) * n + c] = silu_f(v);
+        }
+    }
+    if (blockIdx.y != 0) return;
+    float f0, f1, f2;
+    if (m >= 3) {
+        f0 = proj[(size_t)(m - 3) * ld + c];
+        f1 = proj[(size_t)(m - 2) * ld + c];
+        f2 = proj[(size_t)(m - 1) * ld + c];
+    } else if (m == 2) {
+        f0 = x[2];
+        f1 = proj[c];
+        f2 = proj[(size_t)ld + c];
+    } else {
+        f0 = x[1];
+        f1 = x[2];
+        f2 = proj[c];
+    }
+    state[c] = f0;
+    state[n + c] = f1;
+    state[2 * n + c] = f2;
+}
+
+template <int R>
+cudaError_t launch_rows(const inference_cuda_gdn_conv_args &a, cudaStream_t stream) {
+    const dim3 grid((a.channels + kBlock - 1) / kBlock, (a.m + R - 1) / R);
+    conv_silu_rows_k<R><<<grid, kBlock, 0, stream>>>(
+        (const float *)a.proj, a.ld, a.m, a.channels, (const float4 *)a.w, (float *)a.state,
+        (float *)a.out);
+    return cudaGetLastError();
+}
+
 }  // namespace
 
 extern "C" int inference_cuda_gdn_conv_launch(const inference_cuda_gdn_conv_args *args,
@@ -104,6 +184,30 @@ extern "C" int inference_cuda_gdn_conv_snap_launch(const inference_cuda_gdn_conv
                                args->snap_stride};
         Failure failure;
         failure.record(kern::conv_silu(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv_args *args,
+                                                   void *stream, int *out_stage,
+                                                   int rows_per_thread) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid(*args, stream)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        cudaError_t launched;
+        switch (rows_per_thread) {
+        case 16: launched = launch_rows<16>(*args, (cudaStream_t)stream); break;
+        case 32: launched = launch_rows<32>(*args, (cudaStream_t)stream); break;
+        case 64: launched = launch_rows<64>(*args, (cudaStream_t)stream); break;
+        default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(launched, INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
