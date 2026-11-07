@@ -1032,6 +1032,17 @@ pub(super) fn miss_pass_inputs(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The record source.
+// ---------------------------------------------------------------------------------------------
+
+/// Where the bytes of an expert record come from (the pack through `SlotBankLayout`, see
+/// `bank_source::PackRecordSource`). The device owner reads every record once at build.
+pub(in crate::family::flash_next) trait RecordSource {
+    /// Writes the record of `expert` in `layer` into `out` (exactly one record).
+    fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError>;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The device owner.
 // ---------------------------------------------------------------------------------------------
 
@@ -1042,17 +1053,13 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
-    use super::{BankGeometry, ExpertBankState, HostPinPlan, PassCopies, ReplaceOnMissLru};
+    use super::{
+        BankGeometry, ExpertBankState, HostPinPlan, PassCopies, RecordSource, ReplaceOnMissLru,
+    };
     use crate::{
         EngError,
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
     };
-
-    /// Where the bytes of an expert record come from (the pack through `SlotBankLayout`).
-    pub(in crate::family::flash_next) trait RecordSource {
-        /// Writes the record of `expert` in `layer` into `out` (exactly one record).
-        fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError>;
-    }
 
     pub(in crate::family::flash_next) struct DeviceBank {
         state: ExpertBankState<ReplaceOnMissLru>,

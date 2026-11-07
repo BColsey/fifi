@@ -995,7 +995,7 @@ fn the_policy_reproduces_the_recorded_lru_hit_rates_on_the_t0_trace() {
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::super::bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
+        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
         ReplaceOnMissLru, device::*,
     };
     use crate::{EngError, family::project::cuda::CudaProjector, kernels::cuda::device_present};
