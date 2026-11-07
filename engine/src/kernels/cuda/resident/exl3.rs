@@ -9,6 +9,8 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
+use crate::kernels::cuda::native::DeviceFailure;
+use crate::kernels::cuda::native::resident::RawStream;
 use crate::kernels::cuda::native::resident::exl3 as ffi;
 #[cfg(test)]
 pub(crate) use crate::kernels::single_row::SingleRowLaunches;
@@ -40,6 +42,30 @@ fn midrows_enabled(rows: usize, legacy: Option<&std::ffi::OsStr>) -> bool {
 /// never a silent fallback (the rule of `FIFI_EXL3_LAYER_MAJOR`). It is process-wide and read
 /// once: a change after the first EXL3 call is ignored.
 pub(crate) const SINGLE_GATHER_VAR: &str = "FIFI_EXL3_SINGLE_GATHER";
+
+/// Opt-in switch of the warp-wide input rotation of the job-table projections: unset or `0` keeps the
+/// one-thread-per-value kernel, `1` rotates each 128-value group with one warp (registers and lane
+/// exchanges, no block barriers). Same bytes. Every other value is refused, never a silent
+/// fallback. Process-wide, read once: a change after the first job-table call is ignored.
+pub(crate) const JOBS_WARP_ROTATE_VAR: &str = "FIFI_EXL3_JOBS_WARP_ROTATE";
+
+/// Parses [`JOBS_WARP_ROTATE_VAR`]: unset and `0` are off, `1` is on.
+pub(crate) fn jobs_warp_rotate_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    match value.map(|text| text.to_str()) {
+        None | Some(Some("0")) => Ok(false),
+        Some(Some("1")) => Ok(true),
+        _ => Err(format!("{JOBS_WARP_ROTATE_VAR} must be unset, \"0\" or \"1\"")),
+    }
+}
+
+/// The switch of the environment, or the refusal of a bad value. Read once per process.
+fn jobs_warp_rotate_setting() -> Result<bool, EngError> {
+    static SETTING: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    SETTING
+        .get_or_init(|| jobs_warp_rotate_from_env(std::env::var_os(JOBS_WARP_ROTATE_VAR).as_deref()))
+        .clone()
+        .map_err(EngError::BadRequest)
+}
 
 /// The most pairs one default id-indexed launch takes.
 const INDEXED_CAPACITY: usize = 16;
@@ -441,9 +467,10 @@ impl CudaContext {
     }
 
     /// Refuses a bad value of an EXL3 launch switch (`FIFI_EXL3_SINGLE_GATHER`, [`DP4A_VAR`],
-    /// [`INDEXED_PAIRS_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
+    /// [`INDEXED_PAIRS_VAR`], [`JOBS_WARP_ROTATE_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
     /// session start calls it.
     pub(crate) fn check_single_gather(&self) -> Result<(), EngError> {
+        jobs_warp_rotate_setting()?;
         check_indexed_with(self.single_row_setting()?, self.exl3_indexed_options()?)
     }
 
@@ -672,7 +699,8 @@ impl CudaContext {
         stream: &DeviceStream,
         call: Exl3JobsCall<'_>,
     ) -> Result<(), EngError> {
-        self.exl3_jobs_mode(stream, call, None)
+        jobs_warp_rotate_setting()?;
+        self.exl3_jobs_with(stream, call, ffi::jobs)
     }
 
     /// [`Self::exl3_jobs`] with the fused-output-rotation request made explicit, for the device
@@ -684,14 +712,55 @@ impl CudaContext {
         call: Exl3JobsCall<'_>,
         fused_out: bool,
     ) -> Result<(), EngError> {
-        self.exl3_jobs_mode(stream, call, Some(fused_out))
+        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_fused(s, raw, fused_out))
     }
 
-    fn exl3_jobs_mode(
+    /// [`Self::exl3_jobs`] with both requests explicit (the fused output rotation and the
+    /// warp-wide input rotation), for the device tests; neither reads the environment.
+    #[cfg(test)]
+    pub(crate) fn exl3_jobs_modes(
         &self,
         stream: &DeviceStream,
         call: Exl3JobsCall<'_>,
-        fused_out: Option<bool>,
+        (fused_out, wide_input): (bool, bool),
+    ) -> Result<(), EngError> {
+        self.exl3_jobs_with(stream, call, |s, raw| {
+            ffi::jobs_modes(s, raw, fused_out, wide_input)
+        })
+    }
+
+    /// Whether `call` would take the warp-wide input rotation under the request `enabled`: the
+    /// alignment rules alone, so a test can tell the wide kernel from its fallback.
+    #[cfg(test)]
+    pub(crate) fn exl3_jobs_wide_input_usable(
+        &self,
+        call: &Exl3JobsCall<'_>,
+        enabled: bool,
+    ) -> Result<bool, EngError> {
+        self.ensure_usable()?;
+        let raw = self.jobs_raw(call)?;
+        ffi::jobs_wide_input_usable(&raw, enabled).map_err(|_| {
+            EngError::BadRequest("EXL3 jobs: the call is refused by its checks".into())
+        })
+    }
+
+    /// The input rotation of `call` by the deliberately wrong variant `mutant` (1 to 5), alone:
+    /// the projection and output rotation do not run. For the mutation tests.
+    #[cfg(feature = "cuda-exl3-rotate-mutants")]
+    pub(crate) fn exl3_jobs_rotate_mutant(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3JobsCall<'_>,
+        mutant: i32,
+    ) -> Result<(), EngError> {
+        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_rotate_mutant(s, raw, mutant))
+    }
+
+    fn exl3_jobs_with(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3JobsCall<'_>,
+        launch: impl FnOnce(&RawStream, &ffi::JobsRaw<'_>) -> Result<(), DeviceFailure>,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.jobs_raw(&call)?;
@@ -747,10 +816,7 @@ impl CudaContext {
                 )?;
             }
         }
-        self.launch_on(stream, |s| match fused_out {
-            Some(fused) => ffi::jobs_fused(s, &raw, fused),
-            None => ffi::jobs(s, &raw),
-        })
+        self.launch_on(stream, |s| launch(s, &raw))
     }
 }
 

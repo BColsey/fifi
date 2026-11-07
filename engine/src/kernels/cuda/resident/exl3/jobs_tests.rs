@@ -13,6 +13,8 @@ use crate::EngError;
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
+mod rotate;
+
 const K: usize = 256;
 const N: usize = 384;
 const MEMBERS: usize = 5;

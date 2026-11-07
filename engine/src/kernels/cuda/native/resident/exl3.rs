@@ -779,6 +779,23 @@ unsafe extern "C" {
         stage: *mut c_int,
         fused_out: c_int,
     ) -> c_int;
+    fn inference_cuda_exl3_jobs_modes(
+        args: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        fused_out: c_int,
+        wide_input: c_int,
+    ) -> c_int;
+    fn inference_cuda_exl3_jobs_wide_input_kernel(args: *const JobsArgs, enabled: c_int) -> c_int;
+    #[cfg(test)]
+    fn inference_cuda_exl3_jobs_wide_input_setting(text: *const std::ffi::c_char) -> c_int;
+    #[cfg(feature = "cuda-exl3-rotate-mutants")]
+    fn inference_cuda_exl3_jobs_rotate_mutant(
+        args: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        mutant: c_int,
+    ) -> c_int;
     fn inference_cuda_exl3_jobs_kernel(
         args: *const JobsArgs,
         capability_major: c_int,
@@ -1037,6 +1054,63 @@ pub(in crate::kernels::cuda) fn jobs_fused(
     // the register-decode kernel.
     let status = unsafe {
         inference_cuda_exl3_jobs_fused_out(&args, stream.as_ptr(), &mut stage, fused_out as c_int)
+    };
+    checked(status, stage)
+}
+
+/// The same launches with the fused output rotation and the warp-wide input rotation both
+/// explicit, for the device tests.
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn jobs_modes(
+    stream: &RawStream,
+    call: &JobsRaw<'_>,
+    fused_out: bool,
+    wide_input: bool,
+) -> Result<(), DeviceFailure> {
+    let args = jobs_args(call)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the same checked argument block as jobs; the requests only select kernels that give
+    // the same bytes.
+    let status = unsafe {
+        inference_cuda_exl3_jobs_modes(
+            &args,
+            stream.as_ptr(),
+            &mut stage,
+            fused_out as c_int,
+            wide_input as c_int,
+        )
+    };
+    checked(status, stage)
+}
+
+/// Whether the call would take the warp-wide input rotation under the request `enabled` (`exl3.h`).
+#[cfg(test)]
+pub(in crate::kernels::cuda) fn jobs_wide_input_usable(
+    call: &JobsRaw<'_>,
+    enabled: bool,
+) -> Result<bool, DeviceFailure> {
+    let args = jobs_args(call)?;
+    // SAFETY: a checked argument block; the entry only reads its pointers' values and integers.
+    match unsafe { inference_cuda_exl3_jobs_wide_input_kernel(&args, enabled as c_int) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_argument()),
+    }
+}
+
+/// The input rotation alone, by the deliberately wrong variant `mutant` (1 to 5).
+#[cfg(feature = "cuda-exl3-rotate-mutants")]
+pub(in crate::kernels::cuda) fn jobs_rotate_mutant(
+    stream: &RawStream,
+    call: &JobsRaw<'_>,
+    mutant: i32,
+) -> Result<(), DeviceFailure> {
+    let args = jobs_args(call)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the same checked argument block as jobs; the entry launches one kernel over the rows
+    // of the table and writes only xh and the flag.
+    let status = unsafe {
+        inference_cuda_exl3_jobs_rotate_mutant(&args, stream.as_ptr(), &mut stage, mutant)
     };
     checked(status, stage)
 }
@@ -1413,6 +1487,55 @@ mod tests {
             unsafe { inference_cuda_exl3_jobs_kernel(std::ptr::null(), 8, 86, 1) },
             -1
         );
+    }
+
+    #[test]
+    fn the_warp_rotation_is_chosen_by_request_and_alignment() {
+        // The decision reads pointer values and integers only, so the block needs no device.
+        let usable = |x: usize, suh: usize, xh: usize, members: usize, stride: usize, enabled: c_int| {
+            let args = JobsArgs {
+                x: x as *const f32,
+                suh: suh as *const f32,
+                scale_stride: stride,
+                ..selector_args(xh, 0x20_0000, 4096, members, 2048)
+            };
+            // SAFETY: the entry reads the integers of the block; no pointer is dereferenced.
+            unsafe { inference_cuda_exl3_jobs_wide_input_kernel(&args, enabled) }
+        };
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 5, 2560, 1), 1);
+        // Not requested.
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 5, 2560, 0), 0);
+        // x or suh off a 16-byte boundary, xh off an 8-byte boundary, a member stride of the
+        // scales that is not a multiple of 4 floats.
+        assert_eq!(usable(0x10_0008, 0x30_0000, 0x40_0000, 5, 2560, 1), 0);
+        assert_eq!(usable(0x10_0000, 0x30_0004, 0x40_0000, 5, 2560, 1), 0);
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0004, 5, 2560, 1), 0);
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 5, 2562, 1), 0);
+        // xh on an 8-byte boundary is enough; one member ignores the stride.
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0008, 5, 2560, 1), 1);
+        assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 1, 2562, 1), 1);
+        // A null block is refused.
+        assert_eq!(
+            // SAFETY: a null block is refused before any read.
+            unsafe { inference_cuda_exl3_jobs_wide_input_kernel(std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn the_warp_rotation_switch_text_is_read_strictly() {
+        let read = |text: Option<&str>| {
+            let owned = text.map(|t| std::ffi::CString::new(t).expect("no NUL"));
+            let pointer = owned.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+            // SAFETY: a null pointer or a NUL-terminated string that outlives the call.
+            unsafe { inference_cuda_exl3_jobs_wide_input_setting(pointer) }
+        };
+        assert_eq!(read(None), 0);
+        assert_eq!(read(Some("0")), 0);
+        assert_eq!(read(Some("1")), 1);
+        for bad in ["", "2", "01", "10", "on", "true", " 1", "1 ", "-1", "warp"] {
+            assert_eq!(read(Some(bad)), -1, "{bad:?}");
+        }
     }
 
     #[test]

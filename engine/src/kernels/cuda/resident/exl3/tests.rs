@@ -269,3 +269,21 @@ fn both_grouped_entries_choose_through_the_kernel_function() {
         "{body}"
     );
 }
+
+#[test]
+fn the_warp_rotation_switch_accepts_unset_zero_and_one_only() {
+    use std::ffi::OsStr;
+    let parse = |value: &str| super::jobs_warp_rotate_from_env(Some(OsStr::new(value)));
+    assert_eq!(super::jobs_warp_rotate_from_env(None), Ok(false));
+    assert_eq!(parse("0"), Ok(false));
+    assert_eq!(parse("1"), Ok(true));
+    for bad in ["", "2", "01", "on", "true", "off", " 1", "1 ", "warp"] {
+        let refusal = parse(bad).expect_err(bad);
+        assert!(refusal.contains("FIFI_EXL3_JOBS_WARP_ROTATE"), "{bad}: {refusal}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(super::jobs_warp_rotate_from_env(Some(OsStr::from_bytes(b"\xff"))).is_err());
+    }
+}

@@ -201,6 +201,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/embed_bf16.h",
     "src/kernels/cuda/native/resident/embed_q8.h",
     "src/kernels/cuda/native/resident/exl3.h",
+    "src/kernels/cuda/native/resident/exl3_rotate_wide.h",
     "src/kernels/cuda/native/resident/gdn_conv.h",
     "src/kernels/cuda/native/resident/gdn_delta.h",
     "src/kernels/cuda/native/resident/graph.h",
@@ -330,6 +331,10 @@ fn build_cuda() {
     // turns it on DOES contain the arm and its receipt.
     if std::env::var_os("CARGO_FEATURE_CUDA_ARMS_QUALIFICATION").is_some() {
         build.define("INFERENCE_CUDA_ARMS_QUALIFICATION", None);
+    }
+    // The deliberately wrong input-rotation variants of the EXL3 job-table mutation tests.
+    if std::env::var_os("CARGO_FEATURE_CUDA_EXL3_ROTATE_MUTANTS").is_some() {
+        build.define("INFERENCE_CUDA_EXL3_ROTATE_MUTANTS", None);
     }
     let archs = cuda_archs();
     gencode(&mut build, &archs);

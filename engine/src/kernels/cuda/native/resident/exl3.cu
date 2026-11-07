@@ -1872,11 +1872,15 @@ constexpr uint32_t jobs_row_cap = 256;
 // A job the table may not run: outside the bank, outside the rows of the buffers, or taller than
 // the grid was sized for. Every thread of a block evaluates the same job, so a refusal ends the
 // whole block before any barrier.
-__device__ bool job_runs(const inference_cuda_exl3_jobs_args &p,
-                         const inference_cuda_exl3_job &job) {
-    const bool inside = job.member >= 0 && size_t(job.member) < p.members && job.row0 >= 0 &&
+__device__ __forceinline__ bool job_in_bounds(const inference_cuda_exl3_jobs_args &p,
+                                              const inference_cuda_exl3_job &job) {
+    return job.member >= 0 && size_t(job.member) < p.members && job.row0 >= 0 &&
         job.rows >= 1 && uint32_t(job.rows) <= p.max_rows &&
         size_t(job.row0) + size_t(job.rows) <= p.total_rows;
+}
+__device__ bool job_runs(const inference_cuda_exl3_jobs_args &p,
+                         const inference_cuda_exl3_job &job) {
+    const bool inside = job_in_bounds(p, job);
     if (!inside && blockIdx.x == 0 && threadIdx.x == 0) {
         atomicOr(p.flag, 1u);
     }
@@ -1903,6 +1907,8 @@ __global__ void jobs_input_rotate(const __grid_constant__ inference_cuda_exl3_jo
     // half the bytes to re-read per column group.
     p.xh[index] = __half_as_ushort(__float2half_rn(finite_or_flag(rotate128(value, values), p.flag)));
 }
+
+#include "exl3_rotate_wide.h"
 
 // The rows of one job, as the rows kernel (midrows_projection) takes them, with the activations
 // already F16 (two per word) and NT column tiles per CTA: a CTA of 16 * W rows by 16 * NT columns.
@@ -2467,15 +2473,25 @@ bool jobs_use_registers(const inference_cuda_exl3_jobs_args &a, DeviceSupport su
 }
 } // namespace
 
+// What a job-table call is asked to do besides the default: the fused output rotation and the
+// warp-wide input rotation, each already resolved from the environment or an explicit request.
+struct JobsModes {
+    bool fused_out;
+    bool wide_input;
+};
+
 static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream,
-                            int *out_stage, bool fused_request) {
+                            int *out_stage, JobsModes modes) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!a || !stream || !jobs_views(*a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
         const cudaStream_t s = (cudaStream_t)stream;
         const unsigned jobs = a->jobs_count;
-        jobs_input_rotate<<<dim3(unsigned(a->max_rows * a->k / 128), jobs), 128, 0, s>>>(*a);
+        if (jobs_wide_input_usable(*a, modes.wide_input))
+            launch_wide_input<wide_exact>(*a, s);
+        else
+            jobs_input_rotate<<<dim3(unsigned(a->max_rows * a->k / 128), jobs), 128, 0, s>>>(*a);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         // The fused epilogue exists only on the register-decode kernel; a call that falls back
         // to the shared-memory kernels keeps the separate output rotation.
@@ -2485,7 +2501,7 @@ static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream
             // row block, so a table of short jobs does not pay for wide CTAs.
             const unsigned tiles = unsigned(a->n / 16);
             if (jobs_use_registers(*a, device_support(), jobs_registers_enabled())) {
-                fused = fused_request;
+                fused = modes.fused_out;
                 if (fused)
                     jobs_project_reg_fused<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
                 else
@@ -2510,15 +2526,61 @@ static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream
 
 extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
                                        void *stream, int *out_stage) {
-    return exl3_jobs_launch(a, stream, out_stage, jobs_fused_out_enabled());
+    return exl3_jobs_launch(a, stream, out_stage,
+                            {jobs_fused_out_enabled(), jobs_wide_input_enabled()});
 }
 
 // The same launches with an explicit fused-output request, for the device tests and the GPU
 // qualification (an env flip would race the other tests of the process).
 extern "C" int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *a,
                                                  void *stream, int *out_stage, int fused_out) {
-    return exl3_jobs_launch(a, stream, out_stage, fused_out != 0);
+    return exl3_jobs_launch(a, stream, out_stage, {fused_out != 0, jobs_wide_input_enabled()});
 }
+
+// The same launches with both requests explicit, for the device tests and the GPU qualification.
+extern "C" int inference_cuda_exl3_jobs_modes(const inference_cuda_exl3_jobs_args *a, void *stream,
+                                              int *out_stage, int fused_out, int wide_input) {
+    return exl3_jobs_launch(a, stream, out_stage, {fused_out != 0, wide_input != 0});
+}
+
+// Whether the warp-wide input rotation would run for a call with the request `enabled` (the
+// alignment rules of jobs_wide_input_usable); -1 for a null block.
+extern "C" int inference_cuda_exl3_jobs_wide_input_kernel(const inference_cuda_exl3_jobs_args *a,
+                                                          int enabled) {
+    if (!a) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    return jobs_wide_input_usable(*a, enabled != 0) ? 1 : 0;
+}
+
+// The reading of the FIFI_EXL3_JOBS_WARP_ROTATE text: 1 on, 0 off (also for a null text), -1 for a
+// value that is neither (which the launch treats as off).
+extern "C" int inference_cuda_exl3_jobs_wide_input_setting(const char *text) {
+    return jobs_wide_input_setting(text);
+}
+
+#ifdef INFERENCE_CUDA_EXL3_ROTATE_MUTANTS
+// The input rotation of a job-table call by a deliberately wrong variant (WideMutant, 1 to 5),
+// then the unchanged projection and output rotation, for the mutation tests only.
+extern "C" int inference_cuda_exl3_jobs_rotate_mutant(const inference_cuda_exl3_jobs_args *a,
+                                                      void *stream, int *out_stage, int mutant) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (!a || !stream || !jobs_views(*a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        const cudaStream_t s = (cudaStream_t)stream;
+        switch (mutant) {
+            case wide_reversed_butterfly: launch_wide_input<wide_reversed_butterfly>(*a, s); break;
+            case wide_drop_suh: launch_wide_input<wide_drop_suh>(*a, s); break;
+            case wide_contract: launch_wide_input<wide_contract>(*a, s); break;
+            case wide_gather_row: launch_wide_input<wide_gather_row>(*a, s); break;
+            case wide_tail: launch_wide_input<wide_tail>(*a, s); break;
+            default: return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
+}
+#endif
 
 extern "C" int inference_cuda_exl3_jobs_kernel(const inference_cuda_exl3_jobs_args *a,
                                                int capability_major, int ptx_version,
