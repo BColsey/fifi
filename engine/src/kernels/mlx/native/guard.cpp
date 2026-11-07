@@ -3101,6 +3101,118 @@ extern "C" int inference_mlx_compile_attn_pre_block(
   });
 }
 
+// ===== Attention post-core compile block =====
+// The attention post-core tail as one compiled closure (behind `qwen36.compile`): the
+// sigmoid output gate, the gated multiply, the cast to the activation dtype, and the output
+// projection, from the attention core output to the projected row. The cache append and the
+// attention core stay eager (they read the position-dependent prefix length). The body calls
+// the same inference_mlx_* entries in the same order as the eager tail, relying on MLX's
+// binary promotion exactly as the eager multiply does, so a replayed closure must produce
+// bit-identical outputs.
+// 5 inputs: att [1, heads, 1, width] in F32 or the activation dtype, the gate [heads, width]
+// in the activation dtype, then the packed output projection weight (payload, scales,
+// biases). 1 output: the projected row [1, hidden] in the activation dtype.
+static std::atomic<std::uint64_t> attn_post_body_entries_{0};
+
+struct CompileAttnPostPayload {
+  int heads, width, hidden;
+  mlx_dtype act;
+  mlx_stream stream;
+  int mode, group, bits;  // the output projection weight
+};
+
+static void compile_attn_post_payload_free(void* raw) noexcept {
+  CompileAttnPostPayload* payload = static_cast<CompileAttnPostPayload*>(raw);
+  if (payload != nullptr) {
+    mlx_stream_free(payload->stream);
+    std::free(payload);
+  }
+}
+
+static int compile_attn_post_body(
+    mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
+  attn_post_body_entries_.fetch_add(1, std::memory_order_relaxed);
+  compile_touching("attn post closure input vector");
+  const CompileAttnPostPayload* p = static_cast<const CompileAttnPostPayload*>(raw);
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 5) {
+    return 1;
+  }
+  compile_touching("attn post closure input element");
+  CompileScopeInputs in;
+  for (; in.count < 5; ++in.count) {
+    if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
+      return 1;
+    }
+  }
+  const int* att_shape = mlx_array_shape(in.values[0]);
+  if (mlx_array_ndim(in.values[0]) != 4 || att_shape == nullptr || att_shape[0] != 1 ||
+      att_shape[1] != p->heads || att_shape[2] != 1 || att_shape[3] != p->width) {
+    return 1;
+  }
+  const int* gate_shape = mlx_array_shape(in.values[1]);
+  if (mlx_array_ndim(in.values[1]) != 2 || gate_shape == nullptr || gate_shape[0] != p->heads ||
+      gate_shape[1] != p->width) {
+    return 1;
+  }
+  mlx_vector_array results = mlx_vector_array_new();
+  if (results.ctx == nullptr) return 1;
+  const mlx_stream s = p->stream;
+  const int heads_width[2] = {p->heads, p->width};
+  const int one_row[2] = {1, p->heads * p->width};
+  CompileScopeArray att2, sig, gated, gated_act, row, out;
+  int status = inference_mlx_reshape(&att2.value, in.values[0], heads_width, 2, s);
+  if (status == 0) status = inference_mlx_sigmoid(&sig.value, in.values[1], s);
+  if (status == 0)
+    status = inference_mlx_multiply(&gated.value, att2.value, sig.value, s);
+  // The cast lands in the activation dtype of the step; when the multiply already produced
+  // it (the quantized-cache path) this astype is an identity, exactly the values the eager
+  // tail's conditional cast leaves untouched.
+  if (status == 0)
+    status = inference_mlx_astype(&gated_act.value, gated.value, p->act, s);
+  if (status == 0) status = inference_mlx_reshape(&row.value, gated_act.value, one_row, 2, s);
+  if (status == 0)
+    status = inference_mlx_quantized_matmul(
+        &out.value, row.value, in.values[2], in.values[3], in.values[4], true,
+        compile_quant_optional(p->group), compile_quant_optional(p->bits),
+        compile_quant_mode(p->mode), s);
+  compile_touching("attn post body output vector");
+  if (status == 0) status = mlx_vector_array_append_value(results, out.value);
+  if (status == 0) status = mlx_vector_array_set(res, results);
+  const int release = mlx_vector_array_free(results);
+  return status != 0 ? status : release;
+}
+
+// Compiles the attention post-core block under the fixed cache key `fun_id` and applies it
+// once; the output is lazy. `dims` holds heads, width, hidden; `quant` holds mode, group,
+// bits of the output projection weight.
+extern "C" int inference_mlx_compile_attn_post_block(
+    mlx_array* out, const mlx_array* inputs, size_t inputs_num, const int* dims,
+    const int* quant, mlx_dtype activation, uintptr_t fun_id, mlx_stream stream) noexcept {
+  return run_selected_operation(out, stream, [&]() noexcept {
+    if (inputs_num != 5) return 1;
+    CompileAttnPostPayload* payload =
+        static_cast<CompileAttnPostPayload*>(std::malloc(sizeof(CompileAttnPostPayload)));
+    if (payload == nullptr) {
+      return 1;
+    }
+    payload->heads = dims[0];
+    payload->width = dims[1];
+    payload->hidden = dims[2];
+    payload->act = activation;
+    int stream_status = compile_copy_stream(&payload->stream, stream);
+    if (stream_status != 0) {
+      std::free(payload);
+      return stream_status;
+    }
+    payload->mode = quant[0];
+    payload->group = quant[1];
+    payload->bits = quant[2];
+    return compile_apply_block(
+        out, 1, compile_attn_post_body, payload, compile_attn_post_payload_free, inputs,
+        inputs_num, fun_id);
+  });
+}
+
 // ===== Flint layer-subgraph compile probe =====
 // Test builds only: the whole probe region (both probes + their counter and
 // entry points) sits behind the qualification define so production MLX
@@ -3528,7 +3640,9 @@ extern "C" void inference_mlx_compile_trace_counts(
     *moe = compile_moe_body_entries_.load(std::memory_order_relaxed);
   }
   if (attn != nullptr) {
-    *attn = attn_pre_body_entries_.load(std::memory_order_relaxed);
+    *attn =
+        attn_pre_body_entries_.load(std::memory_order_relaxed) +
+        attn_post_body_entries_.load(std::memory_order_relaxed);
   }
 }
 
@@ -3538,4 +3652,5 @@ extern "C" void inference_mlx_compile_reset_trace_counts() noexcept {
   compile_delta_body_entries_.store(0, std::memory_order_relaxed);
   compile_moe_body_entries_.store(0, std::memory_order_relaxed);
   attn_pre_body_entries_.store(0, std::memory_order_relaxed);
+  attn_post_body_entries_.store(0, std::memory_order_relaxed);
 }

@@ -72,8 +72,8 @@ pub(super) struct AttnLayerFacts {
     pub(super) eps_bits: u32,
     /// The activation dtype key (`compile_key::dtype_key`).
     pub(super) act: u64,
-    /// The weight facts, in the seam's order q, k, v.
-    pub(super) weights: [WeightFacts; 3],
+    /// The weight facts, in the seam's order q, k, v, o (the last for the post-core closure).
+    pub(super) weights: [WeightFacts; 4],
 }
 
 /// Which programs the load-time warm-up traces: one layer per DISTINCT cache key, because every
@@ -178,7 +178,12 @@ pub(super) fn model_warmup(
     }
     let mut attn_plan: Vec<(usize, u64)> = Vec::new();
     for facts in attn {
-        refuse_biasless("attention", facts.layer, &facts.weights, ["q", "k", "v"])?;
+        refuse_biasless(
+            "attention",
+            facts.layer,
+            &facts.weights,
+            ["q", "k", "v", "o"],
+        )?;
         let baked = AttnPreBaked {
             hidden: facts.hidden,
             heads: facts.heads,
@@ -186,22 +191,33 @@ pub(super) fn model_warmup(
             width: facts.width,
             eps_bits: facts.eps_bits,
             act: facts.act,
-            scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
-            quant: facts.weights.each_ref().map(|weight| weight.quant),
+            scale_keys: [
+                facts.weights[0].scale_key,
+                facts.weights[1].scale_key,
+                facts.weights[2].scale_key,
+            ],
+            quant: [
+                facts.weights[0].quant,
+                facts.weights[1].quant,
+                facts.weights[2].quant,
+            ],
         };
         let id = compile_key::attn_pre_fun_id(&baked);
         if !attn_plan.iter().any(|&(_, seen)| seen == id) {
             attn_plan.push((facts.layer, id));
         }
     }
-    let total = delta_plan.len() + moe_plan.len() + attn_plan.len();
+    // Every distinct attention constant set needs TWO programs (the pre-RoPE and post-core
+    // closures); the post key's attention-core dtype is fixed per decoder (one cache form),
+    // so it is one post program per set however the cache form is configured.
+    let total = delta_plan.len() + moe_plan.len() + 2 * attn_plan.len();
     if total > compile_key::PROGRAM_LIMIT {
         return Err(EngError::BadRequest(format!(
             "the model needs {total} distinct compiled programs ({} delta, {} moe, {} attn); at \
              most {} fit one adapter",
             delta_plan.len(),
             moe_plan.len(),
-            attn_plan.len(),
+            2 * attn_plan.len(),
             compile_key::PROGRAM_LIMIT
         )));
     }
@@ -261,7 +277,7 @@ mod tests {
             width: 128,
             eps_bits: 1e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
-            weights: [affine(bits); 3],
+            weights: [affine(bits); 4],
         }
     }
 
@@ -333,24 +349,25 @@ mod tests {
     }
 
     #[test]
-    fn five_distinct_programs_are_refused() {
+    fn more_than_five_distinct_programs_are_refused() {
         let delta = [delta_layer(0, 4), delta_layer(1, 5), delta_layer(2, 6)];
         let moe = [moe_layer(0, 4), moe_layer(1, 8)];
-        let refused = model_warmup(true, true, &delta, &moe, &[]).unwrap_err();
+        // Five distinct ids pass: the limit is exactly the program budget.
+        let five = model_warmup(true, true, &delta, &moe, &[]).unwrap();
+        assert_eq!(five.delta.len() + five.moe.len(), 5, "5 ids pass");
+        // A sixth program (one attention set = pre + post) exceeds it.
+        let refused = model_warmup(true, true, &delta, &moe, &[attn_layer(0, 4)]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the admission refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 5 distinct compiled programs"),
+            message.contains("needs 7 distinct compiled programs (3 delta, 2 moe, 2 attn)"),
             "the refusal names the count: {message}"
         );
         assert!(
-            message.contains("at most 4"),
+            message.contains("at most 5"),
             "the refusal names the limit: {message}"
         );
-        // Four distinct ids still pass: the limit is exactly the program budget.
-        let four = model_warmup(true, true, &delta[..2], &moe, &[]).unwrap();
-        assert_eq!(four.delta.len() + four.moe.len(), 4, "4 ids pass");
     }
 
     #[test]
@@ -424,7 +441,8 @@ mod tests {
 
     #[test]
     fn attention_programs_count_against_the_limit() {
-        // two delta quantizations + moe + two attention quantizations = five: refused.
+        // two delta quantizations + moe + two attention quantizations (pre + post each)
+        // = seven programs: refused.
         let delta = [delta_layer(0, 4), delta_layer(1, 8)];
         let moe = [moe_layer(0, 4)];
         let attn = [attn_layer(0, 4), attn_layer(1, 8)];
@@ -433,7 +451,7 @@ mod tests {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 5 distinct compiled programs (2 delta, 1 moe, 2 attn)"),
+            message.contains("needs 7 distinct compiled programs (2 delta, 1 moe, 4 attn)"),
             "the refusal names all three kinds: {message}"
         );
     }

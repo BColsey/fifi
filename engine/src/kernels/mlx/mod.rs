@@ -2089,6 +2089,18 @@ impl MlxKernels {
         self.context.compiled_attn_pre_step(args)
     }
 
+    /// The post-core tail of one attention decode step (sigmoid gate, gated multiply, cast,
+    /// output projection) through one `mlx_compile`d closure: the `qwen36.compile` product
+    /// seam behind the resident decoder. The closure, its cache key, its inputs, its baked
+    /// constants, its dtype rules, and its no-fallback failure discipline are documented on
+    /// the `Context` method of the same name in `kernels/mlx/native/compile.rs`.
+    pub(crate) fn compiled_attn_post(
+        &mut self,
+        args: &native::compile::CompileAttnPostArgs<'_>,
+    ) -> Result<native::compile::CompiledAttnPost, EngError> {
+        self.context.compiled_attn_post_step(args)
+    }
+
     /// The Flint decode tail (post-attention residual + RMS + dense SwiGLU) through one
     /// `mlx_compile`d closure (graph-cache slice 1): the `FIFI_FLINT_MLX_COMPILE_LAYER` seam
     /// of the Flint decoder. The closure, its cache key, its inputs, its baked constants, and

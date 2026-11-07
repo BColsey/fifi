@@ -25,10 +25,12 @@
 //! one, or a fresh elementwise node), so later uncompiled code reads them directly and none goes
 //! through the readback net.
 //!
-//! What the seam does NOT compile, and why. The attention POSITION-dependent tail, the head,
+//! What the seam does NOT compile, and why. The attention POSITION-dependent middle, the head,
 //! the embedding, and the whole prefill stay uncompiled. The attention pre-RoPE head — the
-//! projections, the q/gate split, and the q/k norms — compiles as one closure (B = 1 only),
-//! because none of its inputs varies per position; the RoPE, the cache append, and the core
+//! projections, the q/gate split, and the q/k norms — and the attention post-core tail — the
+//! sigmoid gate, the gated multiply, the cast, and the output projection — compile as two
+//! closures (B = 1 only), because none of their inputs varies per position; the RoPE, the
+//! cache append, and the core
 //! stay eager, because the RoPE bakes the position as a scalar of each step (a different
 //! constant per token, so a compiled closure would retrace every position and the cache would
 //! never hit) and the append bakes int slice bounds. The head and the embedding serve shapes
@@ -45,7 +47,8 @@ use crate::{
     EngError,
     family::qwen36::host::HostShape,
     kernels::mlx::native::compile::{
-        CompileAttnPreArgs, CompileDeltaArgs, CompileMoeArgs, CompiledDeltaRows,
+        CompileAttnPostArgs, CompileAttnPreArgs, CompileDeltaArgs, CompileMoeArgs,
+        CompiledDeltaRows,
     },
     kernels::{ResidentPackedWeight, compile_key},
     tensor::Dtype,
@@ -231,6 +234,32 @@ pub(super) fn attn_pre_step(
         act: ctx.consts.act,
     };
     ctx.kernels.compiled_attn_pre(&args)
+}
+
+/// Runs the post-core tail of one attention decode step (B = 1) through the compiled closure:
+/// the sigmoid output gate, the gated multiply, the cast to the activation dtype, and the
+/// output projection. The caller (`attn::step_compiled`) supplies the attention core output
+/// and the gate of the pre closure; the returned row `[1, hidden]` replaces the eager tail
+/// and the eager `linear` of `w.o`.
+pub(super) fn attn_post_step(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    w: &RAttn,
+    att: &crate::tensor::ExecutionTensor,
+    gate: &crate::tensor::ExecutionTensor,
+) -> Result<crate::tensor::ExecutionTensor, EngError> {
+    let a = &shape.attn;
+    let args = CompileAttnPostArgs {
+        att,
+        gate,
+        packed: &w.o,
+        hidden: dim(shape.hidden)?,
+        heads: dim(a.heads_q)?,
+        width: dim(a.head_dim)?,
+        act: ctx.consts.act,
+    };
+    let got = ctx.kernels.compiled_attn_post(&args)?;
+    Ok(got.out)
 }
 
 /// Runs B2/4/8 rows with distinct persistent state pairs in row order.

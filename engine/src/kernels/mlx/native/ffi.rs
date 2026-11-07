@@ -859,6 +859,23 @@ unsafe extern "C" {
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
+    /// The attention post-core block as one compiled closure (behind `qwen36.compile`).
+    /// `dims` holds heads, width, hidden; `quant` holds mode, group, bits of the output
+    /// projection weight; `inputs` holds the 5 closure inputs (the attention core output
+    /// `[1, heads, 1, width]`, the gate `[heads, width]`, then the packed output weight
+    /// triple). The single output is lazy. A non-zero status is a native failure of the
+    /// adapter.
+    #[link_name = "inference_mlx_compile_attn_post_block"]
+    pub(super) fn mlx_compile_attn_post_block(
+        out: *mut mlx_array,
+        inputs: *const mlx_array,
+        inputs_num: usize,
+        dims: *const i32,
+        quant: *const i32,
+        activation: mlx_dtype,
+        fun_id: usize,
+        stream: mlx_stream,
+    ) -> i32;
     /// Clears the calling thread's MLX compile cache: the measurement harness between runs
     /// and the adapter teardown, after its pending work completed and before its stream and
     /// device are released. The cache is thread-local.

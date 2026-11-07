@@ -10,10 +10,10 @@
 //! uncompiled run issue the same MLX calls in the same order in both activation dtypes.
 //! Activation and packed-weight scale dtypes belong to the compile cache key
 //! (`kernels::compile_key`), keeping the F32 and BF16 decoders on distinct baked keys. One
-//! adapter context admits at most 4 keys before any native call; its `ProgramRegistry` dies
+//! adapter context admits at most 5 keys before any native call; its `ProgramRegistry` dies
 //! with it. B>1 MoE vectorizes its sequence. Staged B>1 DeltaNet batches
 //! five projections and keeps one recurrence/ring core per slot; taps<=1 stays B1-only.
-//! Each block key permits B=1/2/4/8 where supported: one context admits at most sixteen key/batch
+//! Each block key permits B=1/2/4/8 where supported: one context admits at most twenty key/batch
 //! pairs. This is not a per-thread or global bound: other contexts can admit other keys, and
 //! cache clears or other threads can cause further closure-body entries.
 //!
@@ -219,6 +219,30 @@ pub(crate) struct CompiledAttnPre {
     pub(crate) v: ExecutionTensor,
     /// The output gate `[heads, width]` in the activation dtype.
     pub(crate) gate: ExecutionTensor,
+}
+
+/// The flat input list and the baked constants of one compiled attention post-core decode
+/// step. Every tensor must belong to this adapter.
+pub(crate) struct CompileAttnPostArgs<'a> {
+    /// The attention core output `[1, heads, 1, width]`: F32 over the F32 cache, the
+    /// activation dtype over the quantized cache. The dtype joins the compile cache key.
+    pub(crate) att: &'a ExecutionTensor,
+    /// The output gate `[heads, width]` in the activation dtype.
+    pub(crate) gate: &'a ExecutionTensor,
+    /// The packed output projection weight.
+    pub(crate) packed: &'a ResidentPackedWeight,
+    pub(crate) hidden: u32,
+    pub(crate) heads: u32,
+    pub(crate) width: u32,
+    /// The activation dtype of the step and of the output, and part of the compile cache
+    /// key.
+    pub(crate) act: Dtype,
+}
+
+/// The output of one compiled attention post-core step: the projected row `[1, hidden]` in the
+/// activation dtype, lazy.
+pub(crate) struct CompiledAttnPost {
+    pub(crate) out: ExecutionTensor,
 }
 
 /// Checks one flat input list of a compiled block before admission. Every tensor must belong
@@ -1120,6 +1144,142 @@ impl Context {
             k: adapter.resident(k_a, args.act, kv_shape.clone(), kv_bytes),
             v: adapter.resident(v_a, args.act, kv_shape, kv_bytes),
             gate: adapter.resident(gate_a, args.act, gate_shape, q_bytes),
+        })
+    }
+
+    /// The attention post-core step as one compiled closure under a fixed cache key
+    /// (`compile_key::attn_post_fun_id`); the per-adapter registry admits it BEFORE any
+    /// native call. No fallback: a failure is a native failure, with the same discipline as
+    /// [`Context::compiled_delta_step`].
+    pub(in crate::kernels::mlx) fn compiled_attn_post_step(
+        &mut self,
+        args: &CompileAttnPostArgs<'_>,
+    ) -> Result<CompiledAttnPost, EngError> {
+        let label = "compiled attention post block";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        check_float(label, args.act)?;
+        let adapter = self.state.as_mut().unwrap();
+        if args.heads == 0 || args.width == 0 || args.hidden == 0 {
+            return Err(EngError::BadRequest(
+                "compile seam attention post block needs heads, width, hidden >= 1".into(),
+            ));
+        }
+        let rows = args.heads.checked_mul(args.width).ok_or_else(|| {
+            EngError::BadRequest("compile seam attention post dims overflow".into())
+        })?;
+        match args.att.shape() {
+            &[1, heads, 1, width] if heads == args.heads && width == args.width => (),
+            _ => {
+                return Err(EngError::BadRequest(
+                    "compile seam attention post input must have shape [1, heads, 1, width]".into(),
+                ));
+            }
+        }
+        if args.gate.shape() != [args.heads, args.width] {
+            return Err(EngError::BadRequest(
+                "compile seam attention post gate must have shape [heads, width]".into(),
+            ));
+        }
+        check_logical(label, "o", args.packed, &[args.hidden, rows])?;
+        check_operand(label, adapter, args.att)?;
+        check_operand(label, adapter, args.gate)?;
+        if args.gate.dtype() != args.act {
+            return Err(EngError::BadRequest(format!(
+                "{label}: the gate carries {:?}, the activation dtype is {:?}",
+                args.gate.dtype(),
+                args.act
+            )));
+        }
+        // The att operand may be F32 (the F32 cache), BF16 (the BF16 cache, which needs
+        // `allow_bf16`), or the activation dtype (the quantized cache); the body's multiply
+        // promotes exactly as the eager tail does and the astype lands the step's activation
+        // dtype, so no equality with `act` is required — only that the adapter takes the dtype.
+        if args.att.dtype() != Dtype::F32 {
+            check_float(label, args.att.dtype())?;
+        }
+        check_block_inputs(
+            label,
+            adapter,
+            // `x` only carries the adapter/dtype gate for the ACTIVATION input; the att operand
+            // above already validated its own dtype rule, so pass the gate in its place.
+            args.gate,
+            args.act,
+            &[],
+            std::slice::from_ref(args.packed),
+        )?;
+        let dims: [i32; 3] = [
+            native_dim(label, args.heads)?,
+            native_dim(label, args.width)?,
+            native_dim(label, args.hidden)?,
+        ];
+        let [triple] = quant_triples([args.packed])?;
+        let fun_id = compile_key::attn_post_fun_id(&compile_key::AttnPostBaked {
+            heads: args.heads,
+            width: args.width,
+            hidden: args.hidden,
+            act: compile_key::dtype_key(args.act),
+            att: compile_key::dtype_key(args.att.dtype()),
+            scale_key: compile_key::dtype_key(args.packed.scales().dtype()),
+            quant: triple,
+        });
+        adapter.programs.admit(fun_id)?;
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(5);
+        inputs.push(args.att.storage.native_array());
+        inputs.push(args.gate.storage.native_array());
+        inputs.push(args.packed.payload().storage.native_array());
+        inputs.push(args.packed.scales().storage.native_array());
+        inputs.push(
+            args.packed
+                .biases()
+                .map(|biases| biases.storage.native_array())
+                .unwrap_or(ffi::NULL_ARRAY),
+        );
+        let mut keep: Vec<_> = [args.att, args.gate]
+            .into_iter()
+            .map(|tensor| tensor.share())
+            .collect();
+        keep.push(args.packed.payload().share());
+        keep.push(args.packed.scales().share());
+        if let Some(biases) = args.packed.biases() {
+            keep.push(biases.share());
+        }
+        clear_message();
+        let stream = adapter.stream.0;
+        let mut out_a = Array::null();
+        let started = std::time::Instant::now();
+        let built = produce(&mut out_a, label, |slot| unsafe {
+            ffi::mlx_compile_attn_post_block(
+                slot,
+                inputs.as_ptr(),
+                inputs.len(),
+                dims.as_ptr(),
+                triple.as_ptr(),
+                native_dtype(args.act),
+                fun_id as usize,
+                stream,
+            )
+        });
+        super::super::compile_stats::record(
+            super::super::compile_stats::Kind::Attn,
+            fun_id,
+            started.elapsed().as_secs_f64(),
+        );
+        let out_shape = vec![1, args.hidden];
+        let out_bytes = u64::from(args.hidden) * u64::from(args.act.byte_width());
+        let checked = built.and_then(|()| {
+            if native_output_valid(out_a.0, &out_shape, args.act, out_bytes) {
+                Ok(())
+            } else {
+                Err(failure(label))
+            }
+        });
+        if checked.is_err() {
+            mark_failed();
+        }
+        checked?;
+        Ok(CompiledAttnPost {
+            out: adapter.resident(out_a, args.act, out_shape, out_bytes),
         })
     }
 

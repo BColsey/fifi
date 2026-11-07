@@ -21,6 +21,7 @@ pub(crate) const MOE_TAG: u64 = 0x0036_5147_a5a0_0003;
 pub(crate) const FLINT_TAIL_TAG: u64 = 0x0036_5147_a5a0_0004;
 /// The cache-key tag of the attention pre-RoPE closure (projections, q/gate split, q/k norms).
 pub(crate) const ATTN_PRE_TAG: u64 = 0x0036_5147_a5a0_0005;
+pub(crate) const ATTN_POST_TAG: u64 = 0x0036_5147_a5a0_0006;
 
 /// The activation dtype and the scale dtype of every packed weight are part of the compile
 /// cache key, so the F32 and BF16 decoders never read each other's trace. Every dtype is its
@@ -222,6 +223,45 @@ pub(crate) fn attn_pre_fun_id(baked: &AttnPreBaked) -> u64 {
     mix_fun_id(ATTN_PRE_TAG, &parts)
 }
 
+/// The baked constants of one compiled attention post-core step: the sigmoid output gate, the
+/// gated multiply, the cast to the activation dtype, and the output projection, from the
+/// attention core output to the projected row. The cache append and the attention core stay
+/// eager because they read the position-dependent prefix length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttnPostBaked {
+    /// The query head count.
+    pub(crate) heads: u32,
+    /// The head width `D`.
+    pub(crate) width: u32,
+    /// The hidden width `H` of the output projection.
+    pub(crate) hidden: u32,
+    /// The activation dtype key of the step.
+    pub(crate) act: u64,
+    /// The dtype key of the attention core output operand: it is F32 over the F32 cache and
+    /// the query dtype over the quantized cache, so it joins the key even though the body
+    /// relies on MLX's runtime promotion instead of branching on it.
+    pub(crate) att: u64,
+    /// The scale dtype key of the packed output weight.
+    pub(crate) scale_key: u64,
+    /// The quantization triple of the packed output weight.
+    pub(crate) quant: [i32; 3],
+}
+
+pub(crate) fn attn_post_fun_id(baked: &AttnPostBaked) -> u64 {
+    let parts = [
+        u64::from(baked.heads),
+        u64::from(baked.width),
+        u64::from(baked.hidden),
+        baked.act,
+        baked.att,
+        baked.scale_key,
+        i64::from(baked.quant[0]) as u64,
+        i64::from(baked.quant[1]) as u64,
+        i64::from(baked.quant[2]) as u64,
+    ];
+    mix_fun_id(ATTN_POST_TAG, &parts)
+}
+
 pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
@@ -238,12 +278,12 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
 }
 
 /// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
-/// attention pre-RoPE in one uniform model need three keys, and a fourth covers one extra
-/// distinct constant set (for example a second quantization). A fifth distinct key is an
-/// unapproved configuration change. This does not count MLX tapes: one MoE key permits
-/// B=1/2/4/8, so one adapter context can approve at most sixteen key/batch pairs. Other
-/// contexts, cache clears and other threads are not bounded by this registry.
-pub(crate) const PROGRAM_LIMIT: usize = 4;
+/// the attention pre-RoPE and post-core closures of a uniform model need four keys, and a
+/// fifth covers one extra distinct constant set (for example a second quantization). A sixth
+/// distinct key is an unapproved configuration change. This does not count MLX tapes: one MoE
+/// key permits B=1/2/4/8, so one adapter context can approve at most twenty key/batch pairs.
+/// Other contexts, cache clears and other threads are not bounded by this registry.
+pub(crate) const PROGRAM_LIMIT: usize = 5;
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
@@ -337,11 +377,29 @@ mod tests {
         }
     }
 
+    /// An attention post-core constant set of the same model: the output projection of
+    /// 32 heads of width 128 back to hidden 2048, F32 step, F32 attention core output.
+    fn attn_post() -> AttnPostBaked {
+        AttnPostBaked {
+            heads: 32,
+            width: 128,
+            hidden: 2048,
+            act: dtype_key(Dtype::F32),
+            att: dtype_key(Dtype::F32),
+            scale_key: 1,
+            quant: [0, 64, 4],
+        }
+    }
+
     #[test]
     fn equal_constants_give_equal_keys() {
         assert_eq!(delta_fun_id(&delta()), delta_fun_id(&delta()));
         assert_eq!(moe_fun_id(&moe()), moe_fun_id(&moe()));
         assert_eq!(attn_pre_fun_id(&attn()), attn_pre_fun_id(&attn()));
+        assert_eq!(
+            attn_post_fun_id(&attn_post()),
+            attn_post_fun_id(&attn_post())
+        );
         assert_eq!(
             flint_tail_fun_id(&flint_tail()),
             flint_tail_fun_id(&flint_tail())
@@ -421,6 +479,91 @@ mod tests {
                 "changing {name} must change the attention key"
             );
         }
+        assert_ne!(
+            base_id,
+            delta_fun_id(&delta()),
+            "distinct from the delta key"
+        );
+        assert_ne!(base_id, moe_fun_id(&moe()), "distinct from the moe key");
+        assert_ne!(
+            base_id,
+            flint_tail_fun_id(&flint_tail()),
+            "distinct from the flint tail key"
+        );
+    }
+
+    /// Every scalar field, the two dtype keys, the scale key, and every quantization value of
+    /// the attention post-core block changes its key, and the post key never collides with
+    /// the keys of the other block kinds.
+    #[test]
+    fn every_single_attn_post_constant_changes_the_key() {
+        let base = attn_post();
+        let rows: Vec<(&str, AttnPostBaked)> = vec![
+            ("heads", AttnPostBaked { heads: 33, ..base }),
+            ("width", AttnPostBaked { width: 129, ..base }),
+            (
+                "hidden",
+                AttnPostBaked {
+                    hidden: 2049,
+                    ..base
+                },
+            ),
+            (
+                "act",
+                AttnPostBaked {
+                    act: dtype_key(Dtype::Bf16),
+                    ..base
+                },
+            ),
+            (
+                "att",
+                AttnPostBaked {
+                    att: dtype_key(Dtype::Bf16),
+                    ..base
+                },
+            ),
+            (
+                "scale_key",
+                AttnPostBaked {
+                    scale_key: 0,
+                    ..base
+                },
+            ),
+            (
+                "quant mode",
+                AttnPostBaked {
+                    quant: [1, 64, 4],
+                    ..base
+                },
+            ),
+            (
+                "quant group",
+                AttnPostBaked {
+                    quant: [0, 32, 4],
+                    ..base
+                },
+            ),
+            (
+                "quant bits",
+                AttnPostBaked {
+                    quant: [0, 64, 8],
+                    ..base
+                },
+            ),
+        ];
+        let base_id = attn_post_fun_id(&base);
+        for (name, variant) in rows {
+            assert_ne!(
+                attn_post_fun_id(&variant),
+                base_id,
+                "changing {name} must change the attention post key"
+            );
+        }
+        assert_ne!(
+            base_id,
+            attn_pre_fun_id(&attn()),
+            "distinct from the attention pre key"
+        );
         assert_ne!(
             base_id,
             delta_fun_id(&delta()),
@@ -842,7 +985,7 @@ mod tests {
     }
 
     /// The registry of one adapter context holds the limit rule as a plain function of the ids
-    /// seen: four distinct ids register, a repeat is a cache hit, and the FIFTH distinct id is
+    /// seen: five distinct ids register, a repeat is a cache hit, and the SIXTH distinct id is
     /// refused with `BadRequest` naming the limit — reaching the limit through the ids, not
     /// through the constant.
     #[test]
@@ -855,12 +998,12 @@ mod tests {
         assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
         // A repeat of a registered id is fine: it is a cache hit, not a new program.
         assert_eq!(registry.admit(8), Ok(false));
-        let fifth = registry.admit(11);
-        let EngError::BadRequest(message) = fifth.unwrap_err() else {
+        let sixth = registry.admit(16);
+        let EngError::BadRequest(message) = sixth.unwrap_err() else {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("at most 4 compiled programs per adapter"),
+            message.contains("at most 5 compiled programs per adapter"),
             "the refusal names the limit: {message}"
         );
         // The refused id was not registered, so the registry still holds exactly the limit and

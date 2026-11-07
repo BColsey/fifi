@@ -714,6 +714,22 @@ impl<'c> ResidentDecoder<'c> {
             let started = std::time::Instant::now();
             let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x)?;
             ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
+            // The post-core closure warms on the attention core output dtype this cache form
+            // produces: F32 over the F32 cache, BF16 over the BF16 cache, the activation
+            // dtype over the Q8 cache. The roped q output is a stand-in of exactly that
+            // shape; a wrong guess at most compiles the right key lazily at the first use.
+            let att_dtype = match self.weights.kv {
+                KvDtype::F32 => Dtype::F32,
+                KvDtype::Bf16 => Dtype::Bf16,
+                KvDtype::Q8 => act,
+            };
+            let att = if got.q.dtype() == att_dtype {
+                got.q.share()
+            } else {
+                ctx.kernels.cast(&got.q, att_dtype)?
+            };
+            let out = super::compiled::attn_post_step(&mut ctx, &shape, w, &att, &got.gate)?;
+            ctx.kernels.evaluate(&[&out])?;
             attn_seconds.push(started.elapsed().as_secs_f64());
         }
         for layer in &self.weights.layers {

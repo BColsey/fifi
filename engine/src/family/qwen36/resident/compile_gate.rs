@@ -33,7 +33,7 @@
 //! `the_chunked_prefill_never_compiles_and_a_one_token_step_does`; the executor-ignores-rules patch
 //! by `rules_with_compile_true_warm_the_decoder_at_open`; the start-passes-false patch by the
 //! `start` rules test; the limit patch by
-//! `the_fifth_distinct_compiled_program_is_refused_before_any_native_call` and the Linux registry
+//! `the_sixth_distinct_compiled_program_is_refused_before_any_native_call` and the Linux registry
 //! test; the teardown-clear patch by `dropping_the_adapter_clears_the_compile_cache`; the eps patch
 //! and the seam `eps_bits: 0` patch by `compiled_and_uncompiled_deltanet_blocks_agree_in_f32_tiny`
 //! and `two_eps_values_and_two_activation_dtypes_trace_distinct_programs`; the clamp patch
@@ -657,10 +657,16 @@ fn the_warm_up_traces_every_block_kind_once_before_the_first_token() {
     let stats = decoder.kernels.compile_counters();
     assert_eq!(stats.delta.traces, 1, "the delta warm-up traced once");
     assert_eq!(stats.moe.traces, 1, "the moe warm-up traced once");
-    assert_eq!(stats.attn.traces, 1, "the attn warm-up traced once");
+    assert_eq!(
+        stats.attn.traces, 2,
+        "the attn warm-up traced pre and post once"
+    );
     assert_eq!(stats.delta.calls, 1, "one warm-up call per block kind");
     assert_eq!(stats.moe.calls, 1, "one warm-up call per block kind");
-    assert_eq!(stats.attn.calls, 1, "one warm-up call per block kind");
+    assert_eq!(
+        stats.attn.calls, 2,
+        "one warm-up call per attention closure"
+    );
     assert_eq!(
         stats.delta.call_seconds.len(),
         1,
@@ -675,6 +681,7 @@ fn the_warm_up_traces_every_block_kind_once_before_the_first_token() {
         "no delta trace after the first token"
     );
     assert_eq!(stats.moe.traces, 1, "no moe trace after the first token");
+    assert_eq!(stats.attn.traces, 2, "no attn trace after the first token");
     assert!(
         stats.delta.calls > 1 && stats.moe.calls > 1,
         "the first token ran through the compiled blocks"
@@ -713,7 +720,7 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
             after_chunks.moe.traces,
             after_chunks.attn.traces
         ),
-        (1, 1, 1),
+        (1, 1, 2),
         "only the load-time warm-up traced"
     );
     assert_eq!(
@@ -722,7 +729,7 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
             after_chunks.moe.calls,
             after_chunks.attn.calls
         ),
-        (1, 1, 1),
+        (1, 1, 2),
         "the chunked prefill made no compiled call"
     );
     // One one-token step: the compiled decode path. The tiny model has two DeltaNet layers,
@@ -736,8 +743,8 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
             after_step.moe.calls,
             after_step.attn.calls
         ),
-        (3, 4, 3),
-        "the one-token step ran 2 compiled delta, 3 compiled moe, and 2 compiled attn blocks"
+        (3, 4, 6),
+        "the one-token step ran 2 compiled delta, 3 compiled moe, and 2 compiled attn layers x 2 closures"
     );
     assert_eq!(
         (
@@ -745,7 +752,7 @@ fn the_chunked_prefill_never_compiles_and_a_one_token_step_does() {
             after_step.moe.traces,
             after_step.attn.traces
         ),
-        (1, 1, 1),
+        (1, 1, 2),
         "the one-token step traced nothing new"
     );
     reset_compile_state();
@@ -809,14 +816,14 @@ fn dropping_the_adapter_clears_the_compile_cache() {
     reset_compile_state();
 }
 
-/// The program limit of one adapter context: four seam calls with four distinct epsilon constants
-/// register four programs of THIS adapter, and a call whose key is a FIFTH distinct one is refused
+/// The program limit of one adapter context: five seam calls with five distinct epsilon constants
+/// register five programs of THIS adapter, and a call whose key is a SIXTH distinct one is refused
 /// with `BadRequest` BEFORE any native call, so the counters do not move. The portable registry
 /// logic carries its own Linux test; this one runs the refusal through the real seam. Mutation
-/// check (the registry-limit patch): with the limit raised to 5, the fifth call succeeds and the
+/// check (the registry-limit patch): with the limit raised to 6, the sixth call succeeds and the
 /// `unwrap_err` fails.
 #[test]
-fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
+fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
     let _serial = crate::native_test_lock();
     reset_compile_state();
     let (ckpt, host) = tiny_host();
@@ -832,21 +839,21 @@ fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
     let w = first_delta(&decoder.weights).unwrap();
     let (x, rec, ring) = zero_delta_inputs(&mut decoder.kernels, &shape, Dtype::F32).unwrap();
     let inputs = (&x, &rec, &ring);
-    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6] {
+    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6] {
         let args = delta_seam_args(&shape, w, &decoder.weights.consts, inputs, eps, Dtype::F32);
         decoder.kernels.compiled_delta_step(&args).unwrap();
     }
     let warmed = compile_stats::read();
     assert_eq!(
-        warmed.delta.traces, 4,
-        "four distinct epsilons traced four programs (the native body count)"
+        warmed.delta.traces, 5,
+        "five distinct epsilons traced five programs (the native body count)"
     );
     let refused = decoder.kernels.compiled_delta_step(&delta_seam_args(
         &shape,
         w,
         &decoder.weights.consts,
         inputs,
-        5e-6,
+        6e-6,
         Dtype::F32,
     ));
     let message = match refused {
@@ -855,7 +862,7 @@ fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
         Ok(_) => panic!("expected BadRequest, got a successful step"),
     };
     assert!(
-        message.contains("at most 4 compiled programs per adapter"),
+        message.contains("at most 5 compiled programs per adapter"),
         "the refusal names the limit: {message}"
     );
     let stats = compile_stats::read();
@@ -864,7 +871,7 @@ fn the_fifth_distinct_compiled_program_is_refused_before_any_native_call() {
         "the refused call reached no native call"
     );
     assert_eq!(
-        stats.delta.traces, 4,
+        stats.delta.traces, 5,
         "the refused call traced nothing (the native body count stayed)"
     );
     reset_compile_state();
@@ -967,9 +974,10 @@ fn compiled_and_uncompiled_attention_blocks_agree_in_f32_tiny() {
             max_abs_diff(&p, &c)
         );
     }
-    // Five compiled calls, one trace: the first step traced the closure, the rest replayed it.
+    // Five pre + five post compiled calls, two traces: the first step traced each closure,
+    // the rest replayed it.
     let stats = decoder.kernels.compile_counters();
-    assert_eq!((stats.attn.calls, stats.attn.traces), (5, 1));
+    assert_eq!((stats.attn.calls, stats.attn.traces), (10, 2));
     reset_compile_state();
 }
 
@@ -1146,13 +1154,13 @@ fn rules_with_compile_true_warm_the_decoder_at_open() {
     let stats = on.compile_counters();
     assert_eq!(
         (stats.delta.calls, stats.moe.calls, stats.attn.calls),
-        (1, 1, 1),
-        "the uniform tiny model warms one call per block kind"
+        (1, 1, 2),
+        "the uniform tiny model warms one call per block kind, two for attention (pre and post)"
     );
     assert_eq!(
         (stats.delta.traces, stats.moe.traces, stats.attn.traces),
-        (1, 1, 1),
-        "the warm-up traced every block kind once (the native body counts)"
+        (1, 1, 2),
+        "the warm-up traced every block kind once, attention twice (the native body counts)"
     );
     let (delta_seconds, moe_seconds, attn_seconds) = on.compile_warmup_seconds();
     assert_eq!(

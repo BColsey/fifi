@@ -579,8 +579,9 @@ pub(super) fn step(
 
 /// The compiled B=1 path: the pre-RoPE head runs as one compiled closure (the projections,
 /// the q/gate split, the q/k norms, and the reshape of q/k/v to `[1, heads, 1, D]`), then the
-/// position-scaled RoPE, the cache append, the attention core, and the sigmoid gate stay eager
-/// — exactly the tail the eager path shares.
+/// position-scaled RoPE, the cache append, and the attention core stay eager, and the
+/// post-core tail (the sigmoid gate, the gated multiply, the cast, and the output projection)
+/// runs as a second compiled closure.
 fn step_compiled(
     ctx: &mut Ctx<'_>,
     shape: &HostShape,
@@ -599,8 +600,8 @@ fn step_compiled(
     };
     let q = ctx.kernels.rope_scaled(&pre.q, &rope)?;
     let k_new = ctx.kernels.rope_scaled(&pre.k, &rope)?;
-    let (o, cache) = step_tail(ctx, shape, cache, pos, &q, &k_new, &pre.v, &pre.gate)?;
-    let out = linear(ctx, &w.o, &o)?;
+    let (att, cache) = step_tail_to_att(ctx, shape, cache, pos, &q, &k_new, &pre.v)?;
+    let out = super::compiled::attn_post_step(ctx, shape, w, &att, &pre.gate)?;
     Ok(AttnStep { out, cache })
 }
 
@@ -675,10 +676,39 @@ fn step_tail(
     v_new: &ExecutionTensor,
     gate: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, KvCache), EngError> {
+    let (att, cache) = step_tail_to_att(ctx, shape, cache, pos, q, k_new, v_new)?;
+    let a = &shape.attn;
+    let heads = dim(a.heads_q)?;
+    let width = dim(a.head_dim)?;
+    // 7. Sigmoid output gate and gated multiply, then the cast and the flat row reshape
+    // (the eager reference of the compiled post-core closure).
+    let att = ctx.kernels.reshape(&att, &[heads, width])?;
+    let gate = ctx.kernels.unary(UnaryOp::Sigmoid, gate)?;
+    let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
+    let o = to_act(ctx, &o)?;
+    let output_width = heads.checked_mul(width).ok_or_else(overflow)?;
+    let o = ctx.kernels.reshape(&o, &[1, output_width])?;
+    Ok((o, cache))
+}
+
+/// The length-dependent half of the tail — the part that stays eager under the compile seam:
+/// the cache-form casts, the cache append, and the prefix/decode attention core. Takes the
+/// ROPED query `[1, heads, 1, D]`, the ROPED new key and the new value `[1, KVH, 1, D]`;
+/// returns the attention core output `[1, heads, 1, D]` (F32 over the F32 cache, the query
+/// dtype over the quantized cache) and the grown cache.
+fn step_tail_to_att(
+    ctx: &mut Ctx<'_>,
+    shape: &HostShape,
+    cache: KvCache,
+    pos: u32,
+    q: &ExecutionTensor,
+    k_new: &ExecutionTensor,
+    v_new: &ExecutionTensor,
+) -> Result<(ExecutionTensor, KvCache), EngError> {
     check_cache(shape, &cache, pos)?;
     let a = &shape.attn;
     let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
-    let output_width = heads.checked_mul(width).ok_or_else(overflow)?;
+    let _ = heads;
     let len = cache.len;
     let next_len = len.checked_add(1).ok_or_else(overflow)?;
     // The cache form: the F32 control keeps its cast to F32 whatever the activation dtype, and
@@ -745,17 +775,9 @@ fn step_tail(
         }
         None => return Err(mismatch()),
     };
-    // 7. Sigmoid output gate and output projection.
-    let att = ctx.kernels.reshape(&att, &[heads, width])?;
-    let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
-    let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
-    // The attention output is F32 over the F32 cache and follows the query dtype over the Q8
-    // cache; the projection takes the activation dtype.
-    let o = to_act(ctx, &o)?;
-    // One flat row `[1, heads * width]`: the stacked tail (`linear_rows`) needs
-    // rank-2 rows whose column count is the weight input width.
-    let o = ctx.kernels.reshape(&o, &[1, output_width])?;
-    Ok((o, cache))
+    // The attention core output `[1, heads, 1, width]`: F32 over the F32 cache and the query
+    // dtype over the Q8 cache.
+    Ok((att, cache))
 }
 
 /// The cache of the old formulation (test-only): exactly the valid positions, `[1, KVH, len, D]`.
