@@ -498,6 +498,24 @@ mod tests {
         assert_eq!(prefill_order_name(LayerMajor::Jobs), "layer-major jobs");
     }
 
+    /// The fallback an open actually ran reads as the default token-major walk: no split, source
+    /// default, and the reason names both orders; an unchanged mode is the same order.
+    #[test]
+    fn a_fallback_order_is_the_defaulted_token_major_walk_without_the_split() {
+        let jobs = resolve_prefill_order(None, None, &inputs("f16", &none())).unwrap();
+        assert!(jobs.hilo && jobs.defaulted);
+        assert_eq!(jobs.with_mode(LayerMajor::Jobs), jobs);
+        let fell = jobs.with_mode(LayerMajor::Off);
+        assert_eq!(fell.mode, LayerMajor::Off);
+        assert!(fell.defaulted && !fell.hilo && !fell.hilo_inactive);
+        assert!(
+            fell.why.contains("fell back from layer-major jobs"),
+            "{}",
+            fell.why
+        );
+        assert_eq!(fell.load_suffix(), " prefill_order_source=default");
+    }
+
     fn order(mode: LayerMajor, defaulted: bool) -> PrefillOrder {
         PrefillOrder {
             mode,

@@ -432,7 +432,12 @@ mod tests {
     /// and no Qwen3.6 source reads the two switches.
     #[test]
     fn a_qwen36_load_has_no_flint_prefill_order() {
-        let options = Q36Options::default();
+        let options = Q36Options {
+            cache_limit_bytes: Some(4_294_967_296),
+            context_limit: Some(262_144),
+            prefill_budget_bytes: Some(32_212_254_720),
+            ..Q36Options::default()
+        };
         let settings = resolve(&options, Backend::Mlx);
         let rows = q36_effective(&options, None, Backend::Mlx, &settings);
         for key in ["layer_major", "tall_hilo"] {

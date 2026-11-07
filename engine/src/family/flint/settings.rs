@@ -51,7 +51,7 @@ pub(crate) use crate::family::flint::budget::{LayerMajor, layer_major_from_env};
 // The hi/lo switch parses in the budget layer too (host-buildable). The executor open resolves it
 // together with the layer-major mode and stores the decision here, so the tall projections of this
 // process read the resolved state, not the raw variable.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) use crate::family::flint::budget::{TALL_HILO_VAR, tall_hilo_from_env};
 
 /// Whether the tall projections of the jobs pass of this process split their activations into a hi
