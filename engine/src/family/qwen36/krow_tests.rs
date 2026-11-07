@@ -1,4 +1,5 @@
 use super::*;
+use crate::family::sampler::Sampler;
 use std::ffi::OsString;
 
 fn os(text: &str) -> OsString {
@@ -293,5 +294,274 @@ fn the_one_configuration_the_body_is_written_for_arms_and_each_departure_is_refu
     ] {
         let text = message(check_krow_configuration(facts));
         assert!(text.contains(needle), "{facts:?}: {text}");
+    }
+}
+
+// ---- the device verify, judged on the host ----
+
+fn ids_of(tokens: &[i32], rejected_at: Option<usize>) -> Vec<u32> {
+    // Window ids whose drafts are the tokens of the rows before them, except one that differs.
+    let mut ids: Vec<u32> = std::iter::once(5)
+        .chain(tokens.iter().map(|&token| token as u32))
+        .take(tokens.len())
+        .collect();
+    if let Some(draft) = rejected_at {
+        ids[draft + 1] += 1;
+    }
+    ids
+}
+
+#[test]
+fn the_accepted_run_is_the_leading_rows_whose_token_is_the_next_window_id() {
+    for rows in 1..=8usize {
+        let tokens: Vec<i32> = (0..rows as i32).map(|i| 20 + i).collect();
+        // All accepted: run K - 1, the bonus is the last row's token.
+        assert_eq!(
+            greedy_run(&tokens, &ids_of(&tokens, None)),
+            (rows - 1, tokens[rows - 1]),
+            "{rows} rows"
+        );
+        // The first mismatch ends the run, whatever follows it.
+        for draft in 0..rows.saturating_sub(1) {
+            assert_eq!(
+                greedy_run(&tokens, &ids_of(&tokens, Some(draft))),
+                (draft, tokens[draft]),
+                "{rows} rows, mismatch at draft {draft}"
+            );
+        }
+    }
+    // Reject-first and keep-middle by name, at 8 rows.
+    let tokens = [11, 12, 13, 14, 15, 16, 17, 18];
+    assert_eq!(
+        greedy_run(&tokens, &[0, 99, 12, 13, 14, 15, 16, 17]),
+        (0, 11)
+    );
+    assert_eq!(
+        greedy_run(&tokens, &[0, 11, 12, 13, 99, 15, 16, 17]),
+        (3, 14)
+    );
+    // A row without a token never matches an id.
+    assert_eq!(greedy_run(&[4, -1, 6], &[0, 4, 0]), (1, -1));
+}
+
+#[test]
+fn the_device_verify_is_enforced_against_the_pairs_and_any_difference_is_an_error() {
+    let tokens = [30, 31, 32, 33];
+    let ids = ids_of(&tokens, Some(2));
+    // The sound device answer.
+    assert_eq!(check_verify(&tokens, &ids, 2, 32).unwrap(), (2, 32));
+    // Off by one either way, a bonus from the wrong row, a bonus from the next row.
+    for (accepted, bonus) in [(3, 32), (1, 32), (2, 31), (2, 33), (2, 0), (0, 30)] {
+        let text = format!("{:?}", check_verify(&tokens, &ids, accepted, bonus));
+        assert!(
+            text.contains("the pairs say run 2 and bonus 32"),
+            "{accepted} {bonus}: {text}"
+        );
+    }
+    // A run outside the window (negative, or as long as the window) is refused by itself.
+    for accepted in [-1, 4, 100] {
+        assert!(
+            check_verify(&tokens, &ids, accepted, 33).is_err(),
+            "{accepted}"
+        );
+    }
+    // Rows and ids of different counts, or no rows, are refused.
+    assert!(check_verify(&tokens, &ids[..3], 2, 32).is_err());
+    assert!(check_verify(&[], &[], 0, 0).is_err());
+    // A device that agrees with its pairs on a token the host cannot use is refused.
+    assert!(check_verify(&[7, -1], &[0, 7], 1, -1).is_err());
+}
+
+// ---- the shortlist records ----
+
+/// A record as the device writes it: 20 entries of (f32 logit bits, u32 id), the non-finite word,
+/// three zero pad words. Entries past `entries.len()` are the empty candidate.
+fn record(entries: &[(u32, f32)], non_finite: u32) -> [u8; SHORTLIST_RECORD_BYTES] {
+    let mut bytes = [0u8; SHORTLIST_RECORD_BYTES];
+    for at in 0..SHORTLIST_K {
+        let (id, logit) = entries
+            .get(at)
+            .copied()
+            .unwrap_or((u32::MAX, f32::NEG_INFINITY));
+        bytes[at * 8..at * 8 + 4].copy_from_slice(&logit.to_le_bytes());
+        bytes[at * 8 + 4..at * 8 + 8].copy_from_slice(&id.to_le_bytes());
+    }
+    bytes[160..164].copy_from_slice(&non_finite.to_le_bytes());
+    bytes
+}
+
+/// The top-20 of a row by the device's order: larger logit first, then the lower id.
+fn ranked_top(row: &[f32], keep: usize) -> Vec<(u32, f32)> {
+    let mut all: Vec<(u32, f32)> = row
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i as u32, v))
+        .collect();
+    all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    all.truncate(keep);
+    all
+}
+
+#[test]
+fn a_record_decodes_to_its_ranked_candidates_and_the_non_finite_word_is_the_one_row_error() {
+    let row: Vec<f32> = (0..64)
+        .map(|i| ((i * 37 + 11) % 61) as f32 / 8.0 - 3.0)
+        .collect();
+    let ranked = ranked_top(&row, SHORTLIST_K);
+    let bytes = record(&ranked, 0);
+    let decoded = decode_shortlist(&bytes, 64).unwrap();
+    assert_eq!(decoded.len(), 20);
+    for (got, want) in decoded.iter().zip(&ranked) {
+        assert_eq!((got.0, got.1.to_bits()), (want.0, want.1.to_bits()));
+    }
+    // A vocabulary below 20 reads that many entries.
+    let few = ranked_top(&row[..7], 7);
+    assert_eq!(decode_shortlist(&record(&few, 0), 7).unwrap().len(), 7);
+    // The non-finite word is the error of the one-row step.
+    let error = decode_shortlist(&record(&ranked, 1), 64).expect_err("non-finite");
+    assert!(format!("{error:?}").contains("device shortlist found non-finite logits"));
+    // Only whole records decode.
+    assert!(decode_shortlist(&bytes[..175], 64).is_err());
+}
+
+#[test]
+fn a_shortlist_that_disagrees_with_its_pair_is_an_error_and_a_bad_row_is_not_read() {
+    let rows: Vec<Vec<f32>> = (0..3)
+        .map(|r| {
+            (0..40)
+                .map(|i| ((i * 7 + r * 13) % 29) as f32 - 9.0)
+                .collect()
+        })
+        .collect();
+    let tokens: Vec<i32> = rows
+        .iter()
+        .map(|row| ranked_top(row, 1)[0].0 as i32)
+        .collect();
+    let records: Vec<[u8; SHORTLIST_RECORD_BYTES]> = rows
+        .iter()
+        .map(|row| record(&ranked_top(row, 20), 0))
+        .collect();
+    let bits = [0, 0, 0];
+    let ok = check_shortlists(&tokens, &bits, &records, 40).unwrap();
+    assert_eq!(ok.len(), 3);
+    assert_eq!(ok[1], ranked_top(&rows[1], 20));
+    // The record of another row (the K-row grid indexing the wrong row) starts at another id.
+    let mut swapped = records.clone();
+    swapped.swap(0, 1);
+    let text = format!("{:?}", check_shortlists(&tokens, &bits, &swapped, 40));
+    assert!(text.contains("row 0: the shortlist starts at"), "{text}");
+    // A non-finite word where the argmax saw nothing wrong is an error ...
+    let mut flagged = records.clone();
+    flagged[2] = record(&ranked_top(&rows[2], 20), 1);
+    let text = format!("{:?}", check_shortlists(&tokens, &bits, &flagged, 40));
+    assert!(
+        text.contains("row 2: the shortlist saw a non-finite value"),
+        "{text}"
+    );
+    // ... and where the argmax did see it, the row's record is not read (the window fails on its bit).
+    let flagged_bits = [0, 0, 2];
+    let read = check_shortlists(&tokens, &flagged_bits, &flagged, 40).unwrap();
+    assert!(read[2].is_empty());
+    // One record per row.
+    assert!(check_shortlists(&tokens, &bits, &records[..2], 40).is_err());
+}
+
+// ---- which draws need a full row ----
+
+#[test]
+fn only_a_record_and_a_sampler_that_keeps_one_to_twenty_candidates_draw_from_the_shortlist() {
+    let keeps = |top_k: u32| SamplingParams::new(0.8, 0.95, top_k).unwrap();
+    for top_k in [1, 5, 20] {
+        assert_eq!(
+            draw_source(keeps(top_k), false, true, true),
+            DrawSource::Shortlist
+        );
+    }
+    for top_k in [0, 21, 64] {
+        assert_eq!(
+            draw_source(keeps(top_k), false, true, true),
+            DrawSource::Row,
+            "{top_k}"
+        );
+    }
+    assert_eq!(
+        draw_source(keeps(20), true, true, true),
+        DrawSource::Row,
+        "sync each"
+    );
+    assert_eq!(
+        draw_source(keeps(20), false, false, true),
+        DrawSource::Row,
+        "vocabulary"
+    );
+    assert_eq!(
+        draw_source(keeps(20), false, true, false),
+        DrawSource::Row,
+        "no record"
+    );
+    assert_eq!(
+        draw_source(SamplingParams::greedy(), false, true, true),
+        DrawSource::Row
+    );
+}
+
+#[test]
+fn the_draws_belong_to_the_window_that_began_at_their_base_over_their_ids() {
+    let draws = DeviceDraws {
+        base: 12,
+        inputs: vec![1, 2, 3],
+        accepted: 1,
+        bonus: 2,
+        shortlists: Vec::new(),
+    };
+    assert!(draws.belongs_to(12, &[1, 2, 3]));
+    assert!(!draws.belongs_to(13, &[1, 2, 3]));
+    assert!(!draws.belongs_to(12, &[1, 2, 4]));
+    assert!(!draws.belongs_to(12, &[1, 2]));
+}
+
+// ---- a seeded draw from the K shortlists is the one-row draw ----
+
+/// For fixed rows and seeds, drawing row after row from the top-20 records gives the tokens and
+/// leaves the generator where `Sampler::sample` on the full rows gives and leaves it, including a
+/// window that stops early (rows after the run are never drawn). Several settings; top-k from 1
+/// to 20, the temperature and the nucleus cut vary.
+#[test]
+fn drawing_rows_from_their_records_is_drawing_them_from_the_full_rows() {
+    let vocab = 300;
+    let rows: Vec<Vec<f32>> = (0..8)
+        .map(|r| {
+            (0..vocab)
+                .map(|i| (((i * 31 + r * 17) % 97) as f32) / 7.0 - 6.0)
+                .collect()
+        })
+        .collect();
+    let records: Vec<Vec<(u32, f32)>> = rows.iter().map(|row| ranked_top(row, 20)).collect();
+    for (temperature, top_p, top_k) in [
+        (1.0, 1.0, 20),
+        (0.8, 0.95, 20),
+        (1.3, 0.9, 5),
+        (0.7, 0.0, 1),
+    ] {
+        let params = SamplingParams::new(temperature, top_p, top_k).unwrap();
+        for seed in [0u64, 7, 12345, u64::MAX] {
+            for drawn in 1..=rows.len() {
+                let mut from_records = Sampler::new(params, seed);
+                let mut from_rows = Sampler::new(params, seed);
+                for row in 0..drawn {
+                    assert_eq!(
+                        from_records.sample_shortlist(&records[row], vocab).unwrap(),
+                        from_rows.sample(&rows[row]).unwrap(),
+                        "params {params:?} seed {seed} row {row}"
+                    );
+                }
+                assert_eq!(
+                    from_records.rng_state(),
+                    from_rows.rng_state(),
+                    "the generator after {drawn} rows"
+                );
+            }
+        }
     }
 }

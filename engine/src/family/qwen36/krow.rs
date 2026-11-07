@@ -22,6 +22,14 @@
 //!   field, not only the environment, so the hook meets the same refusal as the variable.
 //!
 //! The KV8 switches belong to the long-context stage and are not decided here.
+//!
+//! The logits of a window stay on the device. The window reads one small report (the pairs, the
+//! window word, the device comparison of the pair tokens with the window ids, and one top-20
+//! record per row); this file holds the host rules that judge it: [`greedy_run`] and
+//! [`check_verify`] (the accepted run and the bonus token, re-derived on the host from the pairs
+//! and enforced against the device's), [`decode_shortlist`] and [`check_shortlists`] (the records
+//! a seeded draw uses, checked against the pairs), [`DeviceDraws`] (what an open window keeps for
+//! its draws) and [`draw_source`] (when a draw needs a full logits row after all).
 
 use std::ffi::OsStr;
 
@@ -29,7 +37,7 @@ use super::{
     exl3_merge_plan::{SHARED_IN_ROUTED_VAR, shared_in_routed_from_env},
     rollback::{MAX_ROWS, check_window_fits},
 };
-use crate::EngError;
+use crate::{EngError, family::sampler::SamplingParams};
 
 /// The environment variable that selects the single-row EXL3 kernel
 /// (`kernels/cuda/resident/exl3.rs`, `SINGLE_GATHER_VAR`; a test pins that the two agree).
@@ -241,6 +249,198 @@ pub(crate) fn rows_verdict(
                 })
         })
         .collect()
+}
+
+/// Entries of a shortlist record (`kernels/cuda/native/resident/shortlist.h`).
+pub(crate) const SHORTLIST_K: usize = 20;
+/// Bytes of a shortlist record: 20 entries of (f32 logit, u32 id), the non-finite word, three pad
+/// words. A test pins the value against the kernel wrapper's.
+pub(crate) const SHORTLIST_RECORD_BYTES: usize = 176;
+/// Byte of the record that holds the non-finite word.
+const SHORTLIST_NON_FINITE_AT: usize = 160;
+
+/// The accepted run of a greedy window and the token after it, as a host reference of
+/// `verify_greedy`: `accepted` is the number of leading rows `i < K - 1` whose token equals the
+/// next window id (`ids[i + 1]`), and `bonus` is the token of row `accepted`. `tokens` and `ids`
+/// have one entry per row (`K >= 1`).
+pub(crate) fn greedy_run(tokens: &[i32], ids: &[u32]) -> (usize, i32) {
+    let mut accepted = 0;
+    while accepted + 1 < tokens.len()
+        && u32::try_from(tokens[accepted]).is_ok_and(|token| token == ids[accepted + 1])
+    {
+        accepted += 1;
+    }
+    (accepted, tokens[accepted])
+}
+
+/// The device's comparison, judged: the run and the bonus the device stored must be the host's
+/// own reference of the pairs. A device that disagrees with its own pair table is a window that
+/// cannot be trusted, so the caller fails the window closed on any error.
+pub(crate) fn check_verify(
+    tokens: &[i32],
+    ids: &[u32],
+    accepted: i32,
+    bonus: i32,
+) -> Result<(usize, u32), EngError> {
+    if tokens.is_empty() || tokens.len() != ids.len() {
+        return Err(refuse(&format!(
+            "the device verify judged {} tokens against {} window ids",
+            tokens.len(),
+            ids.len()
+        )));
+    }
+    let (want, want_bonus) = greedy_run(tokens, ids);
+    let got = usize::try_from(accepted)
+        .ok()
+        .filter(|run| *run < tokens.len())
+        .ok_or_else(|| {
+            refuse(&format!(
+                "the device verify reports an accepted run of {accepted} in a window of {} rows",
+                tokens.len()
+            ))
+        })?;
+    if got != want || bonus != want_bonus {
+        return Err(refuse(&format!(
+            "the device verify says run {got} and bonus {bonus}; the pairs say run {want} and \
+             bonus {want_bonus}"
+        )));
+    }
+    let bonus = u32::try_from(bonus).map_err(|_| {
+        refuse(&format!(
+            "the device verify reports the bonus token {bonus}"
+        ))
+    })?;
+    Ok((got, bonus))
+}
+
+/// The candidates of one shortlist record, ranked (larger logit first, then lower id), as
+/// `Sampler::sample_shortlist` takes them: the same decoding the one-row step applies to its own
+/// record. A non-zero non-finite word is the one-row step's error. `vocab` is the sampler
+/// vocabulary; the first `min(vocab, 20)` entries are read.
+pub(crate) fn decode_shortlist(record: &[u8], vocab: usize) -> Result<Vec<(u32, f32)>, EngError> {
+    if record.len() != SHORTLIST_RECORD_BYTES {
+        return Err(refuse(&format!(
+            "a shortlist record is {SHORTLIST_RECORD_BYTES} bytes, got {}",
+            record.len()
+        )));
+    }
+    if record[SHORTLIST_NON_FINITE_AT..SHORTLIST_NON_FINITE_AT + 4] != [0; 4] {
+        return Err(EngError::Backend {
+            operation: "sample",
+            message: "device shortlist found non-finite logits".to_owned(),
+        });
+    }
+    Ok(record[..vocab.min(SHORTLIST_K) * 8]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|entry| {
+            (
+                u32::from_le_bytes(entry[4..8].try_into().expect("candidate id word")),
+                f32::from_le_bytes(entry[..4].try_into().expect("candidate logit word")),
+            )
+        })
+        .collect())
+}
+
+/// Whether the record of row `row` has its non-finite word set.
+fn record_non_finite(record: &[u8]) -> bool {
+    record[SHORTLIST_NON_FINITE_AT..SHORTLIST_NON_FINITE_AT + 4] != [0; 4]
+}
+
+/// The shortlist records against the pairs, for a window whose status already passed: a row with
+/// no status bit has a clean record, and the first entry of its record (the largest logit, the
+/// lowest id among equals) is the token the argmax chose. Two independent reductions of the same
+/// row must agree; a window where they do not fails closed. Returns each row's decoded candidates.
+pub(crate) fn check_shortlists(
+    tokens: &[i32],
+    bits: &[i32],
+    records: &[[u8; SHORTLIST_RECORD_BYTES]],
+    vocab: usize,
+) -> Result<Vec<Vec<(u32, f32)>>, EngError> {
+    if records.len() != tokens.len() || bits.len() != tokens.len() {
+        return Err(refuse(&format!(
+            "the report holds {} shortlist records for {} rows",
+            records.len(),
+            tokens.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(records.len());
+    for (row, record) in records.iter().enumerate() {
+        if bits[row] == 0 {
+            if record_non_finite(record) {
+                return Err(refuse(&format!(
+                    "row {row}: the shortlist saw a non-finite value that the argmax did not"
+                )));
+            }
+            let candidates = decode_shortlist(record, vocab)?;
+            let first = candidates.first().map(|candidate| i64::from(candidate.0));
+            if first != Some(i64::from(tokens[row])) {
+                return Err(refuse(&format!(
+                    "row {row}: the shortlist starts at {first:?} and the argmax chose {}",
+                    tokens[row]
+                )));
+            }
+            out.push(candidates);
+        } else {
+            // The window fails on this row's bit; its record is not read.
+            out.push(Vec::new());
+        }
+    }
+    Ok(out)
+}
+
+/// What an open K-row window keeps for its draws, read once with the report.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeviceDraws {
+    /// The committed rows when the window began.
+    pub(crate) base: usize,
+    /// The window ids.
+    pub(crate) inputs: Vec<u32>,
+    /// The accepted run the device compared, checked against the pairs.
+    pub(crate) accepted: usize,
+    /// The token after the accepted run.
+    pub(crate) bonus: u32,
+    /// The ranked candidates of each row; empty when the shortlist did not run.
+    pub(crate) shortlists: Vec<Vec<(u32, f32)>>,
+}
+
+impl DeviceDraws {
+    /// Whether the draws belong to the open window that began at `base` over `inputs`.
+    pub(crate) fn belongs_to(&self, base: usize, inputs: &[u32]) -> bool {
+        self.base == base && self.inputs == inputs
+    }
+}
+
+/// Where the draw of one row of a lazy window gets its logits when the sampler is not greedy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrawSource {
+    /// The row's top-20 record: `Sampler::sample_shortlist`.
+    Shortlist,
+    /// The complete row, read from the device (or the tap's copy): `Sampler::sample`.
+    Row,
+}
+
+/// The source of a non-greedy draw. The shortlist serves it when the one-row step would use its own
+/// (`readback::device_sampling_supported`, which a test pins against this rule): the sampler keeps
+/// 1 to 20 candidates, the step does not synchronize after every launch, and the sampler vocabulary
+/// is the width the shortlist covers; and the record exists for the row.
+pub(crate) fn draw_source(
+    params: SamplingParams,
+    sync_each: bool,
+    vocab_matches: bool,
+    record_present: bool,
+) -> DrawSource {
+    if record_present
+        && vocab_matches
+        && !sync_each
+        && !params.is_greedy()
+        && (1..=SHORTLIST_K as u32).contains(&params.top_k())
+    {
+        DrawSource::Shortlist
+    } else {
+        DrawSource::Row
+    }
 }
 
 #[cfg(test)]

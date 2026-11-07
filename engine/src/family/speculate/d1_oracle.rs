@@ -101,6 +101,14 @@ pub(crate) enum Fault {
     /// Test-only: logits row `j` alone is made non-finite after the logits stage and before the
     /// argmax stage, so no other row can see it. Only pair `j` may report it; the window fails.
     KRowRowPair(usize),
+    /// Test-only: the device comparison of the pair tokens with the window ids reports another
+    /// accepted run than the pairs give (the host re-derives it and must refuse): the window fails
+    /// closed, as for a non-zero status.
+    KRowVerify,
+    /// Test-only: the read of one full logits row for a draw fails (the window kept its logits on
+    /// the device and a sampler the shortlist cannot serve asked for a row): the window fails
+    /// closed. Raised at draw time, not at the window.
+    KRowDraw,
 }
 
 impl Fault {
@@ -890,6 +898,7 @@ pub(crate) fn krow_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> 
         (Fault::KRowLaunch, under(1)),
         (Fault::KRowReadback, under(1)),
         (Fault::KRowStatus, under(1)),
+        (Fault::KRowVerify, under(1)),
     ];
     let mut pairs = vec![0, rows / 2, rows - 1];
     pairs.dedup();

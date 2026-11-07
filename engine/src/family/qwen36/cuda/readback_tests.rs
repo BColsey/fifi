@@ -90,6 +90,46 @@ fn vocabulary_mismatch_falls_back_before_running_a_token() {
     }
 }
 
+/// The K-row draw takes the row's top-20 record exactly when the one-row step would take its own
+/// (`device_sampling_supported`): the same sampler, the same debug mode, the same vocabulary rule.
+/// A greedy draw never asks (the pair token answers it), and a row without a record is read whole.
+#[test]
+fn the_k_row_draw_source_is_the_one_row_rule() {
+    use super::readback::device_sampling_supported;
+    use crate::family::{
+        qwen36::krow::{DrawSource, draw_source},
+        sampler::SamplingParams,
+    };
+    let mut every = vec![SamplingParams::greedy()];
+    for top_k in [0, 1, 7, 20, 21, 64, u32::MAX] {
+        for top_p in [0.0, 0.95, 1.0] {
+            every.push(SamplingParams::new(1.0, top_p, top_k).unwrap());
+        }
+    }
+    for params in every {
+        for sync_each in [false, true] {
+            for vocab_matches in [false, true] {
+                let one_row = device_sampling_supported(params, sync_each, vocab_matches);
+                let from_record = draw_source(params, sync_each, vocab_matches, true);
+                if params.is_greedy() {
+                    assert_eq!(from_record, DrawSource::Row, "a greedy draw asks nothing");
+                } else {
+                    assert_eq!(
+                        from_record == DrawSource::Shortlist,
+                        one_row,
+                        "{params:?} sync_each {sync_each} vocab_matches {vocab_matches}"
+                    );
+                }
+                assert_eq!(
+                    draw_source(params, sync_each, vocab_matches, false),
+                    DrawSource::Row,
+                    "no record, no shortlist"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn sync_each_reads_zero_one_or_nothing() {
     for off in [None, Some(""), Some("0")] {

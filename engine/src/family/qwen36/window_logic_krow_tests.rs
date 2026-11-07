@@ -10,14 +10,14 @@
 //! slot byte layout and the stream order (device-only, in the later kernel and graph stages).
 
 use super::{
-    RowsFailure, RowsOut, WindowHost, commit_window, eager_rows, export_gate, import_state,
-    reset_epilogue, reset_prologue, run_window, state_usable, step_gate,
+    RowsFailure, RowsOut, WindowHost, commit_window, eager_rows, export_gate, fail_window,
+    import_state, reset_epilogue, reset_prologue, run_window, state_usable, step_gate,
 };
 use crate::{
     EngError,
     family::{
         qwen36::{
-            krow::{self, RowStatus, RowsFacts},
+            krow::{self, DeviceDraws, DrawSource, RowStatus, RowsFacts},
             rollback::{RollbackBook, RollbackPlan, StateFacts},
         },
         sampler::{Sampler, SamplingParams},
@@ -84,6 +84,15 @@ enum Flaw {
     /// A failure after the launch is reported as a state-decided one, so only the host counters
     /// and the validity of the state decide whether the window fails closed.
     AfterLaunchAsStateDecides,
+    /// The host does not compare the device verify with the pairs.
+    NoVerifyCheck,
+    /// The window copies the logits rows to the host whether or not the tap asked (the lazy
+    /// logits read silently on every window).
+    ReadsLogitsEveryWindow,
+    /// The K-row shortlist of row `r` is the record of row `r + 1` (the grid indexes the wrong row).
+    ShortlistFromWrongRow,
+    /// A failed read of a full row at draw time leaves the window open and the state valid.
+    LazyReadNotGated,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -132,6 +141,17 @@ struct DevFake {
     graph_k: Option<usize>,
     /// The pairs and the window word the last K-row window read back.
     last_status: Option<RowStatus>,
+    /// The tap: a K-row window also copies its logits rows to the host (`want_logits`). On by
+    /// default so that the checks of the rows run; the lazy-logits tests turn it off.
+    want_logits: bool,
+    /// The logits rows that stay on the device after a K-row window.
+    device_rows: Vec<Vec<f32>>,
+    /// Full rows read from the device at draw time.
+    row_reads: usize,
+    /// Windows that copied their logits rows to the host.
+    logit_copies: usize,
+    /// What the open K-row window keeps for its draws.
+    draws: Option<DeviceDraws>,
 }
 
 fn refused(what: &str) -> EngError {
@@ -202,6 +222,42 @@ fn device_argmax(row: &[f32]) -> u32 {
     best as u32
 }
 
+/// The device comparison, written another way than the host reference (`krow::greedy_run`): the
+/// first row whose token is not the next window id ends the run.
+fn fake_verify(tokens: &[i32], ids: &[u32]) -> (i32, i32) {
+    let ended = (0..tokens.len() - 1)
+        .find(|&row| tokens[row] != ids[row + 1] as i32)
+        .unwrap_or(tokens.len() - 1);
+    (ended as i32, tokens[ended])
+}
+
+/// The K-row shortlist record of one row as the device writes it: the ranked finite candidates
+/// (larger value first, then the lower index), the empty candidate after them, and the non-finite
+/// word.
+fn fake_record(row: &[f32]) -> [u8; krow::SHORTLIST_RECORD_BYTES] {
+    let mut ranked: Vec<(u32, f32)> = row
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .map(|(at, value)| (at as u32, value))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    ranked.truncate(krow::SHORTLIST_K);
+    let mut bytes = [0u8; krow::SHORTLIST_RECORD_BYTES];
+    for at in 0..krow::SHORTLIST_K {
+        let (id, value) = ranked
+            .get(at)
+            .copied()
+            .unwrap_or((u32::MAX, f32::NEG_INFINITY));
+        bytes[at * 8..at * 8 + 4].copy_from_slice(&value.to_le_bytes());
+        bytes[at * 8 + 4..at * 8 + 8].copy_from_slice(&id.to_le_bytes());
+    }
+    let flag = u32::from(!row.iter().all(|value| value.is_finite()));
+    bytes[160..164].copy_from_slice(&flag.to_le_bytes());
+    bytes
+}
+
 fn slot_bits(slot: &([f32; 3], [f32; 2])) -> Vec<u32> {
     slot.0.iter().chain(&slot.1).map(|v| v.to_bits()).collect()
 }
@@ -229,6 +285,11 @@ impl DevFake {
             counters: Counters::default(),
             graph_k: None,
             last_status: None,
+            want_logits: true,
+            device_rows: Vec::new(),
+            row_reads: 0,
+            logit_copies: 0,
+            draws: None,
         }
     }
 
@@ -310,6 +371,7 @@ impl DevFake {
         self.krow_checks(inputs)
             .map_err(RowsFailure::StateDecides)?;
         let rows = inputs.len();
+        self.draws = None;
         self.counters.krow_windows += 1;
         self.counters.krow_replays[rows] += 1;
         let executed = if self.flaw == Flaw::StaleGraph {
@@ -346,6 +408,7 @@ impl DevFake {
     /// The launch and what follows it: the body, the read-back, the status judgement, the slot
     /// mark, and last the commit of the live state.
     fn krow_launched(&mut self, inputs: &[u32], window: usize) -> Result<RowsOut<Vec<f32>>> {
+        let base = self.len;
         let Body {
             mut logits,
             mut word,
@@ -374,12 +437,45 @@ impl DevFake {
         if self.flaw != Flaw::IgnoresStatus {
             krow::check_status(&seen)?;
         }
+        // The device comparison of the pair tokens with the window ids, and the K-row shortlist.
+        let pairs: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+        let (mut accepted, bonus) = fake_verify(&pairs, inputs);
+        if self.fault == Some(Fault::KRowVerify) {
+            self.fault = None;
+            accepted = (accepted + 1) % inputs.len() as i32;
+        }
+        let (run, bonus) = if self.flaw == Flaw::NoVerifyCheck {
+            (accepted as usize, bonus as u32)
+        } else {
+            krow::check_verify(&pairs, inputs, accepted, bonus)?
+        };
+        let mut records: Vec<[u8; krow::SHORTLIST_RECORD_BYTES]> =
+            logits.iter().map(|row| fake_record(row)).collect();
+        if self.flaw == Flaw::ShortlistFromWrongRow {
+            records.rotate_left(1);
+        }
+        let bits_i32: Vec<i32> = self
+            .last_status
+            .as_ref()
+            .map(|status| status.bits.iter().map(|&bits| bits as i32).collect())
+            .unwrap_or_default();
+        let shortlists = krow::check_shortlists(&pairs, &bits_i32, &records, VOCAB)?;
         self.book
             .mark_captured_range(inputs.len().saturating_sub(1))?;
         (self.recurrent, self.conv, self.len) = after;
+        self.device_rows = logits.clone();
+        let copied = self.want_logits || self.flaw == Flaw::ReadsLogitsEveryWindow;
+        self.logit_copies += usize::from(copied);
+        self.draws = Some(DeviceDraws {
+            base,
+            inputs: inputs.to_vec(),
+            accepted: run,
+            bonus,
+            shortlists,
+        });
         Ok(RowsOut {
             argmax: tokens,
-            rows: logits,
+            rows: if copied { logits } else { Vec::new() },
         })
     }
 
@@ -657,6 +753,40 @@ impl WindowModel for DevFake {
                 .copied()
                 .ok_or_else(|| refused("no such row"));
         }
+        // A K-row window that kept its logits on the device draws from its report (the shortlist
+        // record) or reads the one row it needs, as the step does; the routing is production's.
+        let open = self
+            .draws
+            .as_ref()
+            .filter(|draws| draws.belongs_to(window.base, &window.inputs))
+            .map(|draws| draws.shortlists.get(row).cloned());
+        if let Some(record) = open {
+            let record = record.filter(|record| !record.is_empty());
+            match krow::draw_source(sampler.params(), false, vocab == VOCAB, record.is_some()) {
+                DrawSource::Shortlist => {
+                    return sampler.sample_shortlist(&record.expect("a record"), vocab);
+                }
+                DrawSource::Row => {
+                    if let Some(values) = window.rows.get(row) {
+                        return sampler.sample(&values[..vocab]);
+                    }
+                    self.row_reads += 1;
+                    if self.fault == Some(Fault::KRowDraw) {
+                        self.fault = None;
+                        if self.flaw != Flaw::LazyReadNotGated {
+                            fail_window(self);
+                        }
+                        return Err(refused("injected failure of the row read"));
+                    }
+                    let values = self
+                        .device_rows
+                        .get(row)
+                        .cloned()
+                        .ok_or_else(|| refused("no such row"))?;
+                    return sampler.sample(&values[..vocab]);
+                }
+            }
+        }
         let logits = window.rows.get(row).ok_or_else(|| refused("no such row"))?;
         sampler.sample(&logits[..vocab])
     }
@@ -709,6 +839,9 @@ impl D1Subject for DevFake {
 
     fn window_rows(&self) -> Result<Vec<Vec<f32>>> {
         let window = self.window.as_ref().ok_or_else(|| refused("no window"))?;
+        if window.rows.len() != window.inputs.len() {
+            return Err(refused("the logits rows were not copied (the tap is off)"));
+        }
         Ok(window.rows.clone())
     }
 
@@ -868,6 +1001,7 @@ fn the_k_row_plan_lists_the_five_points_and_the_restore_and_no_capture() {
         Fault::KRowLaunch,
         Fault::KRowReadback,
         Fault::KRowStatus,
+        Fault::KRowVerify,
         Fault::KRowRowPair(0),
         Fault::KRowRowPair(2),
         Fault::KRowRowPair(3),
@@ -894,6 +1028,7 @@ fn a_refusal_before_the_launch_leaves_the_state_valid_and_the_other_new_points_p
         (Fault::KRowLaunch, true),
         (Fault::KRowReadback, true),
         (Fault::KRowStatus, true),
+        (Fault::KRowVerify, true),
         (Fault::KRowRowPair(1), true),
     ] {
         let mut rig = Rig::krow(Flaw::Sound);
@@ -1203,7 +1338,12 @@ fn a_lost_read_back_leaves_the_counters_at_the_base_and_the_window_still_gates()
     // The step commits its rows only after the read-back, so a failed read-back leaves tokens() at
     // the base and the state valid. The old rule alone would let that window go; the unconditional
     // fail-closed of a failure after the launch gates it.
-    for fault in [Fault::KRowLaunch, Fault::KRowReadback, Fault::KRowStatus] {
+    for fault in [
+        Fault::KRowLaunch,
+        Fault::KRowReadback,
+        Fault::KRowStatus,
+        Fault::KRowVerify,
+    ] {
         let mut rig = Rig::krow(Flaw::Sound);
         let base = rig.fake.len;
         rig.fake.inject_fault(fault);
@@ -1258,4 +1398,228 @@ fn a_snapshot_stored_past_the_window_is_caught_by_the_slot_comparison_of_check_k
     );
     assert!(failure.violation, "{failure}");
     assert!(failure.detail.contains("state slots differ"), "{failure}");
+}
+
+// ---- the logits stay on the device ----
+
+/// A window of `n` rows over the prefilled fake, the draws of its first `drawn` rows with
+/// `sampler`, the verdict that keeps them. Returns the tokens drawn.
+fn serve(fake: &mut DevFake, n: usize, drawn: usize, sampler: &mut Sampler) -> Vec<u32> {
+    let base = fake.len;
+    fake.run_window(&rows(n)).expect("the window");
+    let tokens: Vec<u32> = (0..drawn)
+        .map(|row| fake.draw(row, sampler, VOCAB).expect("a draw"))
+        .collect();
+    fake.commit_window(&Commit {
+        committed_rows: base + drawn,
+        kept_rows: drawn,
+        discarded_rows: n - drawn,
+        state_slot: drawn - 1,
+    })
+    .expect("the verdict");
+    tokens
+}
+
+/// The sampler of `top_k` candidates, seeded.
+fn keeping(top_k: u32, seed: u64) -> Sampler {
+    Sampler::new(SamplingParams::new(0.9, 0.95, top_k).expect("params"), seed)
+}
+
+/// What the eager window draws for the same rows and sampler.
+fn eager_tokens(n: usize, drawn: usize, sampler: &mut Sampler) -> Vec<u32> {
+    let mut eager = Rig::new(Path::Eager, Flaw::Sound, false);
+    serve(&mut eager.fake, n, drawn, sampler)
+}
+
+#[test]
+fn a_serving_window_copies_no_logits_and_its_draws_are_the_eager_windows() {
+    for n in 2..=8 {
+        for drawn in [1, n / 2 + 1, n] {
+            for (name, make) in [
+                ("greedy", Sampler::greedy as fn() -> Sampler),
+                ("keeps 5", (|| keeping(5, 7)) as fn() -> Sampler),
+                ("keeps 1", (|| keeping(1, 3)) as fn() -> Sampler),
+            ] {
+                let mut rig = Rig::krow(Flaw::Sound);
+                rig.fake.want_logits = false;
+                let (mut from_report, mut from_rows) = (make(), make());
+                let tokens = serve(&mut rig.fake, n, drawn, &mut from_report);
+                assert_eq!(
+                    tokens,
+                    eager_tokens(n, drawn, &mut from_rows),
+                    "{name} n {n} drawn {drawn}"
+                );
+                assert_eq!(
+                    from_report.rng_state(),
+                    from_rows.rng_state(),
+                    "{name}: the generator"
+                );
+                assert_eq!(
+                    rig.fake.logit_copies, 0,
+                    "{name} n {n}: no copy of the logits"
+                );
+                assert_eq!(
+                    rig.fake.row_reads, 0,
+                    "{name} n {n}: no row was read either"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sampler_the_record_cannot_serve_reads_one_row_per_drawn_row_and_draws_what_the_eager_window_draws()
+ {
+    for top_k in [0, 21, 64] {
+        for (n, drawn) in [(4, 1), (4, 3), (8, 8)] {
+            let mut rig = Rig::krow(Flaw::Sound);
+            rig.fake.want_logits = false;
+            let (mut from_device, mut from_rows) = (keeping(top_k, 11), keeping(top_k, 11));
+            let tokens = serve(&mut rig.fake, n, drawn, &mut from_device);
+            assert_eq!(
+                tokens,
+                eager_tokens(n, drawn, &mut from_rows),
+                "top_k {top_k}"
+            );
+            assert_eq!(from_device.rng_state(), from_rows.rng_state());
+            assert_eq!(
+                rig.fake.row_reads, drawn,
+                "top_k {top_k}: one read per drawn row"
+            );
+            assert_eq!(rig.fake.logit_copies, 0);
+        }
+    }
+}
+
+#[test]
+fn with_the_tap_on_the_window_copies_its_rows_once_and_draws_the_same() {
+    let mut rig = Rig::krow(Flaw::Sound);
+    assert!(
+        rig.fake.want_logits,
+        "the fake runs with the tap on by default"
+    );
+    let tokens = serve(&mut rig.fake, 6, 6, &mut keeping(5, 7));
+    assert_eq!(rig.fake.logit_copies, 1);
+    assert_eq!(rig.fake.row_reads, 0, "the record still serves the draw");
+    let mut off = Rig::krow(Flaw::Sound);
+    off.fake.want_logits = false;
+    assert_eq!(tokens, serve(&mut off.fake, 6, 6, &mut keeping(5, 7)));
+    // The rows of the tap are the checks' input: a window without it gives none.
+    off.fake.run_window(&rows(3)).expect("window");
+    assert!(off.fake.window_rows().is_err());
+    off.fake.close_window();
+    rig.fake.run_window(&rows(3)).expect("window");
+    assert_eq!(rig.fake.window_rows().expect("rows").len(), 3);
+}
+
+#[test]
+fn a_window_that_copies_the_logits_without_the_tap_is_caught_by_the_copy_counter() {
+    let copies = |flaw: Flaw| {
+        let mut rig = Rig::krow(flaw);
+        rig.fake.want_logits = false;
+        for n in [2, 5, 8] {
+            serve(&mut rig.fake, n, 1, &mut Sampler::greedy());
+        }
+        rig.fake.logit_copies
+    };
+    assert_eq!(copies(Flaw::Sound), 0);
+    assert_eq!(copies(Flaw::ReadsLogitsEveryWindow), 3);
+}
+
+#[test]
+fn the_state_left_by_the_report_draws_equals_the_state_left_by_the_eager_window() {
+    // Check D and G with the tap off: the committed state, the next logits, the generator.
+    let mut rig = Rig::krow(Flaw::Sound);
+    rig.fake.want_logits = false;
+    let (fake, setup) = rig.split();
+    for drafts in [1, 3, 7] {
+        accepted_prefix(fake, &setup, drafts, &Sampler::greedy).expect("D greedy");
+        accepted_prefix(fake, &setup, drafts, &seeded).expect("D seeded");
+    }
+    repeated_rollbacks(fake, &setup, 3, &Sampler::greedy, 40).expect("G greedy");
+    repeated_rollbacks(fake, &setup, 7, &seeded, 40).expect("G seeded");
+    assert_eq!(fake.logit_copies, 0);
+    assert_eq!(fake.row_reads, 0);
+}
+
+// ---- the device verify and the records are judged ----
+
+#[test]
+fn the_device_verify_is_the_accepted_run_of_the_scripted_window() {
+    for drafts in [1usize, 3, 7] {
+        for accepted in 0..=drafts {
+            let mut rig = Rig::krow(Flaw::Sound);
+            let mut model = Rig::new(Path::Eager, Flaw::Sound, false);
+            // The model's own tokens after the rows, then a window whose first `accepted` drafts
+            // are right and the next is not.
+            let pending = 3;
+            let mut reference = Vec::new();
+            let mut token = pending;
+            for _ in 0..=drafts {
+                let row = model.fake.advance(token);
+                token = device_argmax(&row);
+                reference.push(token);
+            }
+            let mut inputs = vec![pending];
+            inputs.extend_from_slice(&reference[..accepted]);
+            while inputs.len() < drafts + 1 {
+                inputs.push((reference[inputs.len() - 1] + 1) % VOCAB as u32);
+            }
+            rig.fake.run_window(&inputs).expect("the window");
+            let draws = rig.fake.draws.clone().expect("draws");
+            assert_eq!(
+                (draws.accepted, draws.bonus),
+                (accepted, reference[accepted])
+            );
+        }
+    }
+}
+
+#[test]
+fn a_device_verify_that_disagrees_with_the_pairs_fails_the_window_closed() {
+    for n in 2..=8 {
+        assert!(fails_closed(Flaw::Sound, Fault::KRowVerify, n), "n {n}");
+        assert!(
+            !fails_closed(Flaw::NoVerifyCheck, Fault::KRowVerify, n),
+            "n {n}"
+        );
+    }
+    let failure = f_catches(Flaw::NoVerifyCheck, 4);
+    assert!(
+        failure.violation && failure.detail.contains("KRowVerify"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_shortlist_of_another_row_is_caught_by_the_pairs_or_by_the_seeded_draws() {
+    let mut sound = Rig::krow(Flaw::Sound);
+    let (fake, setup) = sound.split();
+    accepted_prefix(fake, &setup, 3, &seeded).expect("sound");
+    let mut flawed = Rig::krow(Flaw::ShortlistFromWrongRow);
+    let (fake, setup) = flawed.split();
+    accepted_prefix(fake, &setup, 3, &seeded).expect_err("a record of another row");
+}
+
+#[test]
+fn a_failed_row_read_at_draw_time_fails_the_window_closed() {
+    let run = |flaw: Flaw| {
+        let mut rig = Rig::krow(flaw);
+        rig.fake.want_logits = false;
+        rig.fake.run_window(&rows(4)).expect("the window");
+        rig.fake.inject_fault(Fault::KRowDraw);
+        let error = rig
+            .fake
+            .draw(0, &mut keeping(0, 5), VOCAB)
+            .expect_err("the read fails");
+        assert!(format!("{error:?}").contains("injected"), "{error:?}");
+        rig
+    };
+    let sound = run(Flaw::Sound);
+    assert!(sound.fake.poisoned && sound.fake.gate && sound.fake.window.is_none());
+    let mut sound = sound;
+    assert!(sound.fake.logits(1).is_err(), "a step on a failed window");
+    // The flaw leaves a valid state with the window open: it is not failed closed.
+    let flawed = run(Flaw::LazyReadNotGated);
+    assert!(!flawed.fake.poisoned && !flawed.fake.gate && flawed.fake.window.is_some());
 }
