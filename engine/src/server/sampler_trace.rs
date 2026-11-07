@@ -9,8 +9,11 @@
 //! (drop-oldest; a flooded ring may drop a running request's trace, and the
 //! route then reports not retained).
 //!
-//! The packet carries token ids, ranks, and probabilities only — never prompt
-//! text, reasoning, or tool arguments. Authorization is the process API key,
+//! Packet v2 carries, per position, the token id, rank, kept count,
+//! greedy flag, probabilities, and the reply's own generated piece text
+//! with its raw-text byte offset — reasoning and tool-call text included,
+//! since that is what the model emitted. The prompt is never copied.
+//! Authorization is the process API key,
 //! exactly like every other `/v1` route: one key serves the whole process, so
 //! per-user trace isolation is NOT provided — any key holder can read any
 //! reply's trace by id. The position budgets bound memory by the serialized
@@ -93,7 +96,13 @@ impl TraceAligner {
         for &id in tokens {
             let piece = match self.decoder.push(id) {
                 Ok(piece) => piece,
-                Err(_) => return self.stop(),
+                Err(_) => {
+                    // A decode failure in the replay is an alignment stop
+                    // by contract: the latch must show in the packet, not
+                    // just in the missing offsets.
+                    self.latch_alignment_error();
+                    return self.stop();
+                }
             };
             let aligned = {
                 let mut buffer = self
@@ -116,12 +125,25 @@ impl TraceAligner {
             return;
         }
         self.stopped = true;
-        if let Ok(text) = self.decoder.finish() {
-            self.buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push_trailer(&text);
+        match self.decoder.finish() {
+            Ok(text) => {
+                self.buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_trailer(&text);
+            }
+            // A tail that cannot decode is the same contract break as a
+            // mid-stream failure: latched, with the written offsets kept.
+            Err(_) => self.latch_alignment_error(),
         }
+    }
+
+    fn latch_alignment_error(&self) {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buffer.alignment_error = true;
     }
 
     fn stop(&mut self) {
@@ -276,11 +298,12 @@ mod tests {
     use crate::family::sampler::{RecordedSample, SampleObservation, Sampler};
 
     /// Verified upper bound on one serialized position's bytes. Six candidates
-    /// (five shown plus a rank-outside selected) with large ids and
-    /// full-precision probabilities measure 372 on serde_json 1.0.151; the
-    /// test below fails if the format ever grows past this bound, so the
-    /// position budgets of this module stay honest.
-    const WORST_CASE_BYTES_PER_POSITION: usize = 448;
+    /// (five shown plus a rank-outside selected) with large ids,
+    /// shortest-roundtrip full-precision probabilities, and a 32-byte piece
+    /// measure 451 on serde_json 1.0.151; the test below fails if the format
+    /// ever grows past this bound, so the position budgets of this module
+    /// stay honest.
+    const WORST_CASE_BYTES_PER_POSITION: usize = 464;
 
     fn filled_handle(first: u32, positions: usize, limit: usize) -> CaptureHandle {
         let mut sampler = Sampler::greedy();
@@ -373,7 +396,7 @@ mod tests {
             candidates: vec![
                 (151_996, 0.30000000000000004),
                 (151_997, 0.20000000000000004),
-                (151_998, 0.10000000000000001),
+                (151_998, 0.10000000000000002),
                 (151_999, 0.05000000000000001),
                 (151_995, 0.020000000000000004),
                 (152_000, 0.33000000000000007),
@@ -521,6 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_armed_request_leaves_a_readable_packet_and_an_unchanged_reply() {
+        let mut replies: Vec<Value> = Vec::new();
         for trace in [false, true] {
             let app = app(true);
             let body = testkit::post_json(
@@ -531,6 +555,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let reply = testkit::json_of(&bytes);
             assert_eq!(reply["choices"][0]["finish_reason"], "length");
+            replies.push(reply.clone());
             if !trace {
                 continue;
             }
@@ -587,6 +612,54 @@ mod tests {
             assert_eq!(packet["raw_byte_len"], content.len());
             assert_eq!(packet["trailer"], "");
         }
+        // The armed reply must be identical to the plain one — the e2e leg
+        // of semantics preservation (the per-row proof is in sampler tests).
+        assert_eq!(replies[0], replies[1], "arming capture changed the reply");
+    }
+
+    #[test]
+    fn aligner_latches_alignment_error_on_decode_failure() {
+        // An id outside the vocabulary fails the decoder's replay: the
+        // contract says alignment_error latches — not just missing offsets.
+        let mut sampler = Sampler::greedy();
+        let buffer = sampler.arm_capture(8);
+        for _ in 0..2 {
+            let mut row = vec![0.0_f32; 258];
+            row[5] = 1.0;
+            sampler.sample(&row).expect("greedy sample");
+        }
+        let mut aligner = TraceAligner::new(testkit::bundle().tokenizer(), buffer.clone());
+        aligner.on_batch(&[5]);
+        aligner.on_batch(&[9999]);
+        aligner.finish();
+        let buffer = buffer.lock().expect("buffer lock");
+        assert!(buffer.alignment_error, "decode failure must latch");
+        assert_eq!(buffer.positions[0].offset, Some(0), "earlier offsets stay");
+        assert_eq!(buffer.positions[1].offset, None);
+        assert_eq!(buffer.trailer, "", "a stopped aligner flushes nothing");
+    }
+
+    #[test]
+    fn truncated_capture_stops_the_replay_cleanly() {
+        // The buffer stopped recording at its limit while generation ran on:
+        // the replay's extra pieces are expected, so alignment stops without
+        // the error flag — truncation already says what happened.
+        let mut sampler = Sampler::greedy();
+        let buffer = sampler.arm_capture(2);
+        for _ in 0..3 {
+            let mut row = vec![0.0_f32; 258];
+            row[5] = 1.0;
+            sampler.sample(&row).expect("greedy sample");
+        }
+        let mut aligner = TraceAligner::new(testkit::bundle().tokenizer(), buffer.clone());
+        aligner.on_batch(&[5, 5, 5]);
+        aligner.finish();
+        let buffer = buffer.lock().expect("buffer lock");
+        assert!(buffer.truncated);
+        assert!(!buffer.alignment_error, "clean stop, not a disagreement");
+        assert_eq!(buffer.positions.len(), 2);
+        assert_eq!(buffer.positions[0].offset, Some(0));
+        assert_eq!(buffer.positions[1].offset, Some(1));
     }
 
     #[tokio::test]

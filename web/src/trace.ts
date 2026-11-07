@@ -119,8 +119,14 @@ export class TraceView {
         (packet.truncated ? " \u00b7 truncated at the per-reply limit" : "")
     );
     fact("Raw text", packet.raw_byte_len + " bytes");
-    if (packet.alignment_error !== null) {
-      fact("Alignment", "stopped: " + packet.alignment_error);
+    if (packet.alignment_error) {
+      fact("Alignment", "stopped early \u2014 offsets after the break are missing");
+    }
+    // Region labels replay the parser-transformed wire deltas, while the
+    // packet's offsets count the raw text: think tags and tool markup the
+    // parser strips shift the two apart on any non-content reply.
+    if (this.message.traceSegs?.some((s) => s.field !== "content") === true) {
+      fact("Region labels", "approximate \u2014 the wire strips think tags and tool markup that the offsets count");
     }
     if (packet.trailer !== "") {
       fact("Trailer", JSON.stringify(packet.trailer));
@@ -158,6 +164,7 @@ export class TraceView {
   }
 
   private positionRow(pos: SamplerPosition, index: number, segs: readonly TraceSeg[] | undefined): HTMLElement {
+    const approx = segs?.some((s) => s.field !== "content") === true;
     const row = div("trace-row");
     const i = div("trace-i");
     i.textContent = String(index);
@@ -171,9 +178,9 @@ export class TraceView {
         ? pos.offset === null
           ? "unaligned"
           : "outside text"
-        : at.field + " +" + at.offsetInField;
+        : (approx ? "\u2248" : "") + at.field + " +" + at.offsetInField;
     const p = div("trace-p");
-    p.textContent = pos.greedy ? "greedy" : fmtProb(pos.selected_prob);
+    p.textContent = pos.greedy || pos.selected_prob === null ? "greedy" : fmtProb(pos.selected_prob);
     const cands = div("trace-cands");
     for (const cand of pos.candidates) {
       const chip = document.createElement("span");
@@ -181,7 +188,13 @@ export class TraceView {
       chip.textContent = cand.token_id + ": " + fmtProb(cand.prob);
       cands.append(chip);
     }
-    if (!pos.candidates.some((c) => c.token_id === pos.token_id)) {
+    // Only a sampled pick that fell outside the top-5 needs a chip of its
+    // own; greedy rows carry no distribution by contract.
+    if (
+      !pos.greedy &&
+      pos.selected_prob !== null &&
+      !pos.candidates.some((c) => c.token_id === pos.token_id)
+    ) {
       const chip = document.createElement("span");
       chip.className = "trace-cand trace-cand-sel";
       chip.textContent = pos.token_id + ": " + fmtProb(pos.selected_prob);

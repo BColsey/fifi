@@ -149,7 +149,10 @@ export class InternalsView {
     const head = div("panel-head");
     const h2 = document.createElement("h2");
     h2.textContent = "Internals";
-    head.append(h2);
+    const badge = document.createElement("span");
+    badge.className = "fixture-badge";
+    badge.textContent = "Recorded fixture \u2014 not live";
+    head.append(h2, badge);
     column.append(head);
 
     const { summary } = this.packet;

@@ -317,7 +317,8 @@ export interface SamplerPosition {
   rank: number;
   kept: number;
   greedy: boolean;
-  selected_prob: number;
+  /** Null on greedy rows: by contract they carry no distribution. */
+  selected_prob: number | null;
   candidates: SamplerCandidate[];
   offset: number | null;
   piece: string | null;
@@ -334,7 +335,9 @@ export interface SamplerTracePacket {
   captured_positions: number;
   raw_byte_len: number;
   aligned_positions: number;
-  alignment_error: string | null;
+  /** True once the replay's token stream disagreed with the recorded
+   * positions or a piece failed to decode; offsets below it stay valid. */
+  alignment_error: boolean;
   trailer: string;
   positions: SamplerPosition[];
 }

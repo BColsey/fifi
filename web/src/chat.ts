@@ -458,9 +458,10 @@ export class ChatView {
           if (delta.toolCall !== undefined) {
             // Tool-call pieces are part of the raw text the packet's
             // offsets run over, so they need a segment of their own —
-            // otherwise every later offset would shift. The wire's name +
-            // argument fragments carry the same text the pieces decoded
-            // to (drift only for malformed calls, where the parser rewraps).
+            // otherwise every later offset would shift. The wire carries
+            // re-serialized name + arguments, not the raw markup, so these
+            // byte lengths are approximate; the trace view marks its region
+            // labels accordingly (think tags shift them the same way).
             if (msg.traceSegs !== undefined) {
               appendSeg(
                 msg.traceSegs,

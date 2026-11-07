@@ -429,7 +429,13 @@ impl CaptureBuffer {
     /// stay valid.
     pub(crate) fn annotate(&mut self, token: u32, piece: &str) -> bool {
         let Some(recorded) = self.positions.get_mut(self.fed) else {
-            self.alignment_error = true;
+            // The replay ran past the recorded positions. When the buffer
+            // truncated, the sampler kept drawing past its budget and those
+            // pieces simply have no home — a clean stop, not a disagreement.
+            // Without truncation the streams disagree, which is the error.
+            if !self.truncated {
+                self.alignment_error = true;
+            }
             return false;
         };
         if recorded.token != token {
@@ -558,11 +564,14 @@ impl Sampler {
         ranked: &[(u32, f32)],
         vocab: usize,
     ) -> Result<u32, EngError> {
-        let (token, obs) = self.sample_shortlist_observed(ranked, vocab)?;
         if self.capture.is_some() {
+            let (token, obs) = self.sample_shortlist_observed(ranked, vocab)?;
             self.record(&obs);
+            return Ok(token);
         }
-        Ok(token)
+        // Telemetry off must cost nothing on the qualified decode path:
+        // no observation is built, so the walk allocates exactly as before.
+        Ok(self.sample_shortlist_inner(ranked, vocab, None)?.0)
     }
 
     /// Arms capture for this request and returns the buffer the sampler appends
@@ -626,6 +635,19 @@ impl Sampler {
         ranked: &[(u32, f32)],
         vocab: usize,
     ) -> Result<(u32, SampleObservation), EngError> {
+        let mut obs = SampleObservation::default();
+        let (token, _) = self.sample_shortlist_inner(ranked, vocab, Some(&mut obs))?;
+        Ok((token, obs))
+    }
+
+    /// The shortlist validation and keep walk both entries share. `obs` is
+    /// filled only when passed, so the unarmed path allocates nothing.
+    fn sample_shortlist_inner(
+        &mut self,
+        ranked: &[(u32, f32)],
+        vocab: usize,
+        obs: Option<&mut SampleObservation>,
+    ) -> Result<(u32, usize), EngError> {
         if self.params.is_greedy() || !(1..=20).contains(&self.params.top_k) {
             return Err(EngError::BadRequest(
                 "device shortlist requires non-greedy top_k 1 through 20".to_owned(),
@@ -647,17 +669,15 @@ impl Sampler {
         let ranked = &ranked[..vocab.min(self.params.top_k as usize)];
         let top = f64::from(ranked[0].1);
         let (weights, total) = ranked_weights(ranked, top, self.params.temperature);
-        let mut obs = SampleObservation::default();
         let rng = &mut self.rng;
-        let (token, _) = draw_kept(
+        draw_kept(
             self.params,
             ranked,
             &weights,
             total,
             || rng.next_unit(),
-            Some(&mut obs),
-        )?;
-        Ok((token, obs))
+            obs,
+        )
     }
 
     /// The token and the number of kept candidates that `sample_with_keep` returns when the

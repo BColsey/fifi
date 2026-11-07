@@ -924,3 +924,23 @@ details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
   color: var(--fifi-text);
   font-weight: 600;
 }
+
+.trace-field-content {
+  color: var(--fifi-ready);
+  border-color: var(--fifi-ready);
+}
+
+.trace-field-tool {
+  color: var(--fifi-busy);
+  border-color: var(--fifi-busy);
+}
+
+.fixture-badge {
+  font-size: var(--fifi-size-1);
+  color: var(--fifi-text-tertiary);
+  border: 1px solid var(--fifi-separator);
+  border-radius: 8px;
+  padding: 0 8px;
+  margin-left: var(--fifi-space-2);
+  white-space: nowrap;
+}
