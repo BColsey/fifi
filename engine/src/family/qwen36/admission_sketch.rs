@@ -190,6 +190,57 @@ mod tests {
     }
 
     #[test]
+    fn the_context_search_finds_the_exact_boundary_of_a_monotone_fit() {
+        let step = CONTEXT_SEARCH_STEP;
+        // The boundary between multiples: the largest multiple of the step that fits.
+        let found = largest_fitting_context(262_144, &|c| c <= 90_000).unwrap();
+        assert_eq!(found, 87 * step);
+        // The boundary on a multiple, and a request that is not a multiple.
+        assert_eq!(
+            largest_fitting_context(262_144, &|c| c <= 64 * step),
+            Some(64 * step)
+        );
+        assert_eq!(
+            largest_fitting_context(100_000, &|c| c <= 50_000),
+            Some(48 * step)
+        );
+        // For a set of boundaries the result fits and the next step does not.
+        for limit in [1_024, 1_500, 2_048, 5_000, 131_072, 200_000, 262_143] {
+            let found = largest_fitting_context(262_144, &|c| c <= limit).unwrap();
+            assert_eq!(found % step, 0, "limit {limit}");
+            assert!(
+                found <= limit && limit < found + step,
+                "limit {limit}: {found}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_context_search_reports_nothing_fits_and_never_asks_the_request() {
+        let step = CONTEXT_SEARCH_STEP;
+        assert_eq!(largest_fitting_context(262_144, &|_| false), None);
+        // Even the least context does not fit.
+        assert_eq!(largest_fitting_context(262_144, &|c| c < step), None);
+        // Only the least context fits.
+        assert_eq!(
+            largest_fitting_context(262_144, &|c| c < 2 * step),
+            Some(step)
+        );
+        // A request of one step or less has no room to search, whatever fits.
+        assert_eq!(largest_fitting_context(step, &|_| true), None);
+        assert_eq!(largest_fitting_context(100, &|_| true), None);
+        // Everything fits: the answer is one step under the request, because the request is assumed
+        // not to fit and is never asked.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let found = largest_fitting_context(262_144, &|c| {
+            asked.borrow_mut().push(c);
+            true
+        });
+        assert_eq!(found, Some(262_144 - step));
+        assert!(!asked.borrow().contains(&262_144));
+    }
+
+    #[test]
     fn the_sketch_sums_its_terms_checked() {
         let sketch = admission_demand(1_000, 65_863_680, 65_863_680, 67_108_864);
         let total = sketch.total_after_weights().unwrap();

@@ -124,7 +124,9 @@ impl TierInputs {
     /// (`capability::probe`). The device reserves are the fixed admission ledger of Qwen3.6's
     /// `enginesrv check` (`qwen36::admission_sketch`): the measured runtime overhead floor for the
     /// kernel arena and the CUDA context, and the admission margin, the minimum spare and the
-    /// uncertainty band as the margin, plus 64 MiB of engine state. The host keeps the larger of
+    /// uncertainty band as the margin (`desktop_reserve` of `VramBudget`, whose error text still says
+    /// "desktop reserve"), plus the ledger's 64 MiB chunked-attention part charge, which stands in for
+    /// Flash-Next's own engine state until the step's arena plan supplies the real term. The host keeps the larger of
     /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
     /// heap, 1 GiB of staging and a 1 GiB margin. Prefill transients (the hyper stream, QSA scratch
     /// and expert streaming planes) are not charged yet; the step's arena plan supplies them.
@@ -137,16 +139,15 @@ impl TierInputs {
     ) -> Self {
         use crate::family::qwen36::admission_sketch::{
             ADMISSION_UNCERTAINTY_BAND_BYTES, FIXED_ADMISSION_MARGIN_BYTES,
-            PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
+            PREFILL_PART_CHARGE_BYTES, PREFILL_SPARE_MIN_BYTES, RUNTIME_OVERHEAD_FLOOR_BYTES,
         };
         const GIB: u64 = 1 << 30;
-        const MIB: u64 = 1 << 20;
         Self {
             shape,
             vram: VramBudget {
                 usable: free_vram,
-                non_expert: trunk_bytes + state_bytes,
-                state: 64 * MIB,
+                non_expert: trunk_bytes.saturating_add(state_bytes),
+                state: PREFILL_PART_CHARGE_BYTES as u64,
                 arena: RUNTIME_OVERHEAD_FLOOR_BYTES,
                 desktop_reserve: FIXED_ADMISSION_MARGIN_BYTES as u64
                     + PREFILL_SPARE_MIN_BYTES as u64

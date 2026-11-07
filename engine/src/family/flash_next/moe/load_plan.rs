@@ -82,7 +82,9 @@ impl FlashLoadPlan {
             })?;
         let cached_layers = kinds.iter().filter(|&&attention| attention).count() as u64;
         let delta_layers = kinds.len() as u64 - cached_layers;
-        let delta_state_bytes = delta_layers * DeltaState::new(&model.delta).byte_len() as u64;
+        let delta_state_bytes = delta_layers
+            .checked_mul(DeltaState::new(&model.delta).byte_len() as u64)
+            .ok_or_else(|| refuse("the DeltaNet state bytes overflow".into()))?;
         let dims = model.qsa.dims();
         let geometry = KvGeometry {
             cached_layers,
@@ -93,7 +95,9 @@ impl FlashLoadPlan {
         };
         let mut base = card;
         base.shape = shape;
-        base.vram.non_expert = trunk_bytes + delta_state_bytes;
+        base.vram.non_expert = trunk_bytes
+            .checked_add(delta_state_bytes)
+            .ok_or_else(|| refuse("the trunk and state bytes overflow".into()))?;
         base.kv = KvPlan {
             positions: 1,
             bytes_per_position: 1,
