@@ -461,6 +461,13 @@ mod tests {
         // seed+2 moves BOTH bounds.
         assert_eq!(bound(20_261_033, true), 0.031433823529411764);
         assert_eq!(bound(20_261_033, false), -0.003043831168831169);
+        // The stream starts from `seed | 1`: an EVEN seed gives the same
+        // bounds as the odd seed one above it, so a dropped `| 1` changes
+        // these values (an odd seed alone cannot show it).
+        assert_eq!(bound(20_261_030, true), 0.03125);
+        assert_eq!(bound(20_261_030, false), -0.0011432926829268292);
+        assert_eq!(bound(20_261_032, true), 0.031433823529411764);
+        assert_eq!(bound(20_261_032, false), -0.003043831168831169);
         // Side semantics: the lower bound is below the point difference and
         // the upper bound above it, never swapped.
         let point = 0.0144382911392405;
@@ -477,6 +484,140 @@ mod tests {
             let second = bootstrap_bound(&a, &b, &clusters, 40, 500, 20_261_031, upper);
             assert_eq!(first.to_bits(), second.to_bits());
         }
+    }
+
+    /// The four registered margins, exactly, by the names in the code.
+    #[test]
+    fn frozen_margins_are_exactly_the_registered_values() {
+        assert_eq!(
+            Margins::frozen(),
+            Margins {
+                nll_ub: 0.02,
+                top1_lb: -0.005,
+                copy_lb: -0.01,
+                retrieval_lb: -0.02,
+            }
+        );
+    }
+
+    fn comparison(nll_ub: f64, top1_lb: f64, probe_lb: f64, retrieval_lb: f64) -> Comparison {
+        Comparison {
+            nll_ub,
+            top1_lb,
+            probe_lb,
+            retrieval_lb,
+        }
+    }
+
+    /// `passes` gate by gate: all four holding passes (also exactly at the
+    /// margins), and each single failing bound alone makes it false. A
+    /// `passes` that dropped one gate (for example the retrieval floor,
+    /// which decides the registered P1 verdict) fails one of these cases.
+    #[test]
+    fn passes_requires_each_of_the_four_gates() {
+        let m = Margins::frozen();
+        assert!(comparison(0.0, 0.0, 0.0, 0.0).passes(&m));
+        // Exactly at every margin still passes (<= for the ceiling, >= for floors).
+        assert!(comparison(0.02, -0.005, -0.01, -0.02).passes(&m));
+        // Only the NLL ceiling fails.
+        assert!(!comparison(0.0201, 0.0, 0.0, 0.0).passes(&m));
+        // Only the top-1 floor fails (just past -0.005).
+        assert!(!comparison(0.0, -0.0051, 0.0, 0.0).passes(&m));
+        // Only the copy floor fails (just past -0.01).
+        assert!(!comparison(0.0, 0.0, -0.0101, 0.0).passes(&m));
+        // Only the retrieval floor fails (just past -0.02; the registered
+        // P1 retrieval bound was -0.034091).
+        assert!(!comparison(0.0, 0.0, 0.0, -0.0201).passes(&m));
+        assert!(!comparison(0.000271, -0.000272, -0.005051, -0.034091).passes(&m));
+    }
+
+    fn probes_in(clusters: &[u32]) -> Vec<ProbeRow> {
+        clusters
+            .iter()
+            .map(|&cluster| ProbeRow {
+                cluster,
+                exact: true,
+            })
+            .collect()
+    }
+
+    fn evaluate_rows(
+        cand_pos: &[PositionRow],
+        ref_pos: &[PositionRow],
+        cand_copy: &[ProbeRow],
+        ref_copy: &[ProbeRow],
+        cand_retr: &[ProbeRow],
+        ref_retr: &[ProbeRow],
+    ) -> Comparison {
+        Comparison::evaluate(
+            cand_pos, ref_pos, cand_copy, ref_copy, cand_retr, ref_retr, 3, 50, 20261031,
+        )
+    }
+
+    /// Candidate and reference rows must carry the same clusters in the same
+    /// order. Same length with different clusters, and a shorter reference,
+    /// are each refused for positions.
+    #[test]
+    #[should_panic(expected = "reference rows are not aligned with candidate rows")]
+    fn misaligned_position_clusters_are_refused() {
+        let cand = rows(&[-1.0; 6], &[true; 6], 2); // clusters 0,0,1,1,2,2
+        let refr = rows(&[-1.0; 6], &[true; 6], 3); // clusters 0,0,0,1,1,1
+        let p = probes_in(&[0, 1, 2]);
+        evaluate_rows(&cand, &refr, &p, &p, &p, &p);
+    }
+
+    #[test]
+    #[should_panic(expected = "reference rows are not aligned with candidate rows")]
+    fn short_reference_positions_are_refused() {
+        let cand = rows(&[-1.0; 6], &[true; 6], 2);
+        let refr = rows(&[-1.0; 5], &[true; 5], 2); // same clusters, one row short
+        let p = probes_in(&[0, 1, 2]);
+        evaluate_rows(&cand, &refr, &p, &p, &p, &p);
+    }
+
+    #[test]
+    #[should_panic(expected = "reference probe rows are not aligned with candidate rows")]
+    fn misaligned_copy_probe_clusters_are_refused() {
+        let pos = rows(&[-1.0; 6], &[true; 6], 2);
+        let ok = probes_in(&[0, 1, 2]);
+        evaluate_rows(
+            &pos,
+            &pos,
+            &probes_in(&[0, 1, 2]),
+            &probes_in(&[0, 2, 1]),
+            &ok,
+            &ok,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "reference probe rows are not aligned with candidate rows")]
+    fn short_retrieval_probe_reference_is_refused() {
+        let pos = rows(&[-1.0; 6], &[true; 6], 2);
+        let ok = probes_in(&[0, 1, 2]);
+        evaluate_rows(
+            &pos,
+            &pos,
+            &ok,
+            &ok,
+            &probes_in(&[0, 1, 2]),
+            &probes_in(&[0, 1]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "reference probe rows are not aligned with candidate rows")]
+    fn misaligned_retrieval_probe_clusters_are_refused() {
+        let pos = rows(&[-1.0; 6], &[true; 6], 2);
+        let ok = probes_in(&[0, 1, 2]);
+        evaluate_rows(
+            &pos,
+            &pos,
+            &ok,
+            &ok,
+            &probes_in(&[0, 1, 2]),
+            &probes_in(&[2, 1, 0]),
+        );
     }
 
     /// Probes occupying only a SPARSE subset of the position clusters: the
