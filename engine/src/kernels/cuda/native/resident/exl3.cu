@@ -495,6 +495,9 @@ __global__ void __launch_bounds__(128) project_midrows(inference_cuda_exl3_linea
         default: midrows_projection<2>(a, inputs2, weights32, result); break;
     }
 }
+// Resources of this kernel (nvcc 12.6, sm_86, production build, measured with cuobjdump --dump-resource-usage): 63 registers, no spills,
+// 8,704 bytes of static shared memory, so 8 CTAs of 128 threads fit an SM where project_midrows fits 10 (48 registers). Recheck whenever
+// this kernel changes (project_midrows records the same warning about a tighter launch bound).
 __global__ void __launch_bounds__(128) project_midrows_hilo(inference_cuda_exl3_linear_args a) {
     __shared__ __align__(32) half2 inputs2[512];
     __shared__ __align__(32) half2 inputs2_lo[512];

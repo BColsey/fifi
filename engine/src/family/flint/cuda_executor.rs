@@ -699,10 +699,10 @@ impl FlintExecutor {
                 format!(" layer_major={rows}{jobs}")
             }),
             // Printed only when armed, so the default load line is unchanged.
-            if super::settings::tall_hilo_armed() {
-                " tall_hilo=on"
-            } else {
-                ""
+            match (super::settings::tall_hilo_armed(), mode == LayerMajor::Jobs) {
+                (true, true) => " tall_hilo=on",
+                (true, false) => " tall_hilo=inactive",
+                _ => "",
             },
             ctx.single_gather_suffix(),
             model

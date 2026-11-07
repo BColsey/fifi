@@ -277,6 +277,14 @@ pub(in crate::kernels::cuda) fn linear_midrows_hilo(
 ) -> Result<(), DeviceFailure> {
     let args = linear_args(call, true)?;
     let mut stage = STAGE_NONE;
+    // The hi/lo entry launches the same three emissions as the rows entry, so a recording test sees the same schedule.
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    if launch_observer::recording() {
+        return checked(
+            launch_observer::linear(&args, call.split_k, true, stream, &mut stage),
+            stage,
+        );
+    }
     // SAFETY: as in `linear_mode`: extents, alignment and disjoint writes are checked above and
     // repeated in C; the explicit live stream is protected by the dispatch guard.
     let status =

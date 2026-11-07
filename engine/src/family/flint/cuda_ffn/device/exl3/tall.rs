@@ -113,7 +113,8 @@ mod tests {
         assert_eq!(row_slices(145), [(0, 73), (73, 72)]);
     }
 
-    /// The hi/lo entry is reached only through the opt-in switch; unset keeps the call it always made.
+    /// The hi/lo entry is reached only through the opt-in switch; unset keeps the call it always made. The exact text of the branch
+    /// is asserted, so an inverted condition fails.
     #[test]
     fn the_hilo_entry_sits_behind_the_switch_and_unset_keeps_the_rows_entry() {
         let source = include_str!("tall.rs");
@@ -121,19 +122,13 @@ mod tests {
             .find("pub(in crate::family::flint::cuda_ffn::device) fn linear_rows(")
             .unwrap();
         let body = &source[start..source.find("#[cfg(test)]\nmod tests").unwrap()];
-        let armed = body
-            .find("settings::tall_hilo_armed()")
-            .expect("the switch is read");
-        let hilo = body
-            .find("exl3_linear_midrows_hilo(")
-            .expect("the hi/lo entry is called");
-        let plain = body
-            .find("exl3_linear_midrows(stream")
-            .expect("the rows entry is called");
-        assert!(
-            armed < hilo && hilo < plain,
-            "the hi/lo call sits in the armed branch, the rows entry in the else"
+        let branch = "        if crate::family::flint::settings::tall_hilo_armed() {\n            ctx.exl3_linear_midrows_hilo(stream, weight.linear_call(&part))?;\n        } else {\n            ctx.exl3_linear_midrows(stream, weight.linear_call(&part))?;\n        }\n";
+        assert_eq!(
+            body.matches(branch).count(),
+            1,
+            "the armed branch takes the hi/lo entry, the else branch the rows entry"
         );
         assert_eq!(body.matches("exl3_linear_midrows_hilo(").count(), 1);
+        assert_eq!(body.matches("exl3_linear_midrows(").count(), 1);
     }
 }
