@@ -940,10 +940,10 @@ impl Context {
     /// B = 1 only; the batched path stays eager.
     ///
     /// Inputs: `x` `[1, H]` in the activation dtype, the q, k, v packed weights with the logical
-    /// shapes `[heads*2*D, H]`, `[kv*D, H]`, `[kv*D, H]`, and the q and k norm weights
-    /// `[heads, D]`, `[kv, D]` in the activation dtype. Every tensor must belong to this
-    /// adapter; `check_operand` plus the logical shapes reject anything else before the first
-    /// native call.
+    /// shapes `[heads*2*D, H]`, `[kv*D, H]`, `[kv*D, H]`, and the q and k norm weights `[D]`
+    /// (rank 1, broadcast over the heads by the norm) in the activation dtype. Every tensor
+    /// must belong to this adapter; `check_operand` plus the logical shapes reject anything
+    /// else before the first native call.
     ///
     /// Baked constants: the four dimensions, the RMS norm epsilon, the activation dtype, and per
     /// packed weight the scale dtype and the quantization triple. They form the compile cache
@@ -984,9 +984,7 @@ impl Context {
                 ));
             }
         }
-        if args.norms[0].shape() != [args.heads, args.width]
-            || args.norms[1].shape() != [args.kv_heads, args.width]
-        {
+        if args.norms[0].shape() != [args.width] || args.norms[1].shape() != [args.width] {
             return Err(EngError::BadRequest(
                 "compile seam inputs differ from the attention block norm shapes".into(),
             ));
