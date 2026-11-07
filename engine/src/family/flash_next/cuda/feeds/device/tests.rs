@@ -8,10 +8,13 @@
 //! - The start sink writes the `StepParams` block, the stream and the PLE embedding to their
 //!   offsets and nothing around them; a negative token or position is refused with nothing written.
 
-use super::{DeviceKeyValue, DevicePle, DeviceStart, f32_bytes, f32_values};
+use super::{DevicePle, DevicePleRoute, DeviceStart, f32_bytes, f32_values};
 use crate::{
     EngError,
-    family::flash_next::cuda::feeds::{StartShape, write_start},
+    family::flash_next::cuda::{
+        feeds::{StartShape, write_start},
+        ple_feed::{HostMatrix, HostProjection, PleKeyValue, PleProjection},
+    },
     kernels::cuda::{CudaContext, device_present},
 };
 
@@ -85,7 +88,7 @@ fn the_projections_match_an_f64_evaluation_of_the_stored_half_values() {
         ple.device_bytes(),
         (WIDTH + HIDDEN) * EMBED * 2 + (EMBED + WIDTH + HIDDEN) * 4
     );
-    let mut previous: Option<DeviceKeyValue> = None;
+    let mut previous: Option<PleKeyValue> = None;
     for seed in [3usize, 4] {
         let x = values(EMBED, seed, 1.5);
         let got = ple.project(&context, &stream, &x).unwrap();
@@ -198,4 +201,64 @@ fn the_start_sink_writes_the_block_the_stream_and_the_embedding_at_their_offsets
 
 fn buffer_len(buffer: &crate::kernels::cuda::DeviceBuffer) -> usize {
     buffer.bytes()
+}
+
+#[test]
+fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
+    if !device_present("PLE route against the host projection") {
+        return;
+    }
+    let context = std::rc::Rc::new(CudaContext::new().expect("context"));
+    let stream = std::rc::Rc::new(context.stream().expect("stream"));
+    let key = halves(&values(WIDTH * EMBED, 1, 0.05));
+    let value = halves(&values(HIDDEN * EMBED, 2, 0.05));
+    let widen = |codes: &[u16]| -> Vec<f32> {
+        codes
+            .iter()
+            .map(|&c| half::f16::from_bits(c).to_f32())
+            .collect()
+    };
+    let mut host = HostProjection::new(
+        HostMatrix::new(WIDTH, EMBED, widen(&key)).unwrap(),
+        HostMatrix::new(HIDDEN, EMBED, widen(&value)).unwrap(),
+        4,
+    );
+    let mut route = DevicePleRoute::new(
+        DevicePle::upload(
+            &context,
+            &half_bytes(&key),
+            &half_bytes(&value),
+            WIDTH,
+            HIDDEN,
+            EMBED,
+        )
+        .unwrap(),
+        context,
+        stream,
+    );
+    let x = values(EMBED, 9, 1.0);
+    let (device, reference_host) = (route.project(&x).unwrap(), host.project(&x).unwrap());
+    // Both are f32 sums of the same products in different orders: each differs from the f64 value
+    // by at most the bound, so from each other by at most twice it.
+    for (name, got, want, codes, rows) in [
+        ("keys", &device.keys, &reference_host.keys, &key, WIDTH),
+        (
+            "value",
+            &device.value,
+            &reference_host.value,
+            &value,
+            HIDDEN,
+        ),
+    ] {
+        for (row, (g, (h, (_, bound)))) in got
+            .iter()
+            .zip(want.iter().zip(reference(codes, rows, &x)))
+            .enumerate()
+        {
+            assert!(
+                (f64::from(*g) - f64::from(*h)).abs() <= 2.0 * bound,
+                "{name} row {row}: device {g}, host {h}, bound {bound}"
+            );
+        }
+    }
 }

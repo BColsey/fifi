@@ -32,6 +32,8 @@ use crate::{
 };
 
 use super::StartSink;
+use crate::family::flash_next::cuda::ple_feed::{PleKeyValue, PleProjection};
+use std::rc::Rc;
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -44,13 +46,6 @@ fn f32_values(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect()
-}
-
-/// The keys (`width` values) and the value (`hidden` values) of one embedding.
-#[derive(Debug, Clone, PartialEq)]
-pub(in crate::family) struct DeviceKeyValue {
-    pub(in crate::family) keys: Vec<f32>,
-    pub(in crate::family) value: Vec<f32>,
 }
 
 /// The PLE projections resident on the device.
@@ -152,12 +147,12 @@ impl DevicePle {
     pub(in crate::family) fn collect(
         &self,
         stream: &DeviceStream,
-    ) -> Result<DeviceKeyValue, EngError> {
+    ) -> Result<PleKeyValue, EngError> {
         let mut keys = vec![0u8; self.width * 4];
         let mut value = vec![0u8; self.hidden * 4];
         self.keys.read_at(stream, 0, &mut keys)?;
         self.value.read_at(stream, 0, &mut value)?;
-        Ok(DeviceKeyValue {
+        Ok(PleKeyValue {
             keys: f32_values(&keys),
             value: f32_values(&value),
         })
@@ -169,9 +164,38 @@ impl DevicePle {
         context: &CudaContext,
         stream: &DeviceStream,
         embedding: &[f32],
-    ) -> Result<DeviceKeyValue, EngError> {
+    ) -> Result<PleKeyValue, EngError> {
         self.enqueue(context, stream, embedding)?;
         self.collect(stream)
+    }
+}
+
+/// The device route of the PLE step: [`PleProjection`] over [`DevicePle`], for `PleFeed`. It owns
+/// shared handles to the step's context and stream, so the projection queues behind the layers
+/// already enqueued on that stream and `project` returns when its results are read back.
+pub(in crate::family) struct DevicePleRoute {
+    ple: DevicePle,
+    context: Rc<CudaContext>,
+    stream: Rc<DeviceStream>,
+}
+
+impl DevicePleRoute {
+    pub(in crate::family) fn new(
+        ple: DevicePle,
+        context: Rc<CudaContext>,
+        stream: Rc<DeviceStream>,
+    ) -> Self {
+        Self {
+            ple,
+            context,
+            stream,
+        }
+    }
+}
+
+impl PleProjection for DevicePleRoute {
+    fn project(&mut self, embedding: &[f32]) -> Result<PleKeyValue, EngError> {
+        self.ple.project(&self.context, &self.stream, embedding)
     }
 }
 
