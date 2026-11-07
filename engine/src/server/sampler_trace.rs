@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use super::error::ServerError;
 use super::state::AppState;
 use crate::family::sampler::{CaptureBuffer, CaptureHandle};
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 /// The per-request absolute position budget. 8192 positions at the serialized
 /// worst case stay under 3.2 MiB.
@@ -56,6 +57,76 @@ struct TraceEntry {
     id: String,
     meta: TraceMeta,
     buffer: CaptureHandle,
+}
+
+/// Replays the decode batches of one traced reply through an incremental
+/// decoder over the same tokenizer the engine used, attaching each token's
+/// piece and its byte offset in the raw generated text to the sampler's
+/// recorded position. The GUI maps raw offsets into the reply's fields by
+/// replaying the piece stream it already receives; the packet never guesses
+/// that mapping. Alignment is write-only telemetry: a disagreement latches
+/// `alignment_error` on the buffer and stops the feed — the reply itself is
+/// unaffected.
+pub(crate) struct TraceAligner {
+    buffer: CaptureHandle,
+    decoder: IncrementalDecoder,
+    /// Set once the feed stopped; further batches are ignored.
+    stopped: bool,
+}
+
+impl TraceAligner {
+    pub(crate) fn new(tokenizer: &Tokenizer, buffer: CaptureHandle) -> Self {
+        Self {
+            buffer,
+            decoder: IncrementalDecoder::new(tokenizer),
+            stopped: false,
+        }
+    }
+
+    /// Feeds one batch's tokens in order. The first decode failure or token
+    /// the sampler never recorded latches `alignment_error` and stops the
+    /// feed: offsets already written stay valid, later positions stay bare.
+    pub(crate) fn on_batch(&mut self, tokens: &[u32]) {
+        if self.stopped {
+            return;
+        }
+        for &id in tokens {
+            let piece = match self.decoder.push(id) {
+                Ok(piece) => piece,
+                Err(_) => return self.stop(),
+            };
+            let aligned = {
+                let mut buffer = self
+                    .buffer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                buffer.annotate(id, &piece)
+            };
+            if !aligned {
+                return self.stop();
+            }
+        }
+    }
+
+    /// Flushes the decoder's pending text into the trailer after the last
+    /// batch. It belongs to no single position — typically a partial UTF-8
+    /// sequence the output limit cut mid-character.
+    pub(crate) fn finish(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        if let Ok(text) = self.decoder.finish() {
+            self.buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_trailer(&text);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stopped = true;
+    }
 }
 
 /// The drop-oldest ring of reply id to capture buffer and metadata.
@@ -138,11 +209,20 @@ fn packet(reply_id: &str, meta: &TraceMeta, buffer: &CaptureBuffer) -> Value {
                     .iter()
                     .map(|&(id, prob)| json!({ "token_id": id, "prob": prob }))
                     .collect::<Vec<_>>(),
+                // The alignment pair (P1-C): null until the replay reaches
+                // this position, or forever when alignment stopped early.
+                "offset": recorded.offset,
+                "piece": recorded.piece,
             })
         })
         .collect();
+    let aligned = buffer
+        .positions
+        .iter()
+        .filter(|recorded| recorded.offset.is_some())
+        .count();
     json!({
-        "packet": 1,
+        "packet": 2,
         "reply_id": reply_id,
         "model": meta.model,
         "sampling": {
@@ -153,6 +233,13 @@ fn packet(reply_id: &str, meta: &TraceMeta, buffer: &CaptureBuffer) -> Value {
         "capture_scope": "decode",
         "truncated": buffer.truncated,
         "captured_positions": buffer.positions.len(),
+        // Alignment (P1-C): offsets are bytes into the raw generated text
+        // (the concatenation of pieces); the GUI maps raw offsets into the
+        // reply's fields by replaying the piece stream it receives.
+        "raw_byte_len": buffer.raw_len,
+        "aligned_positions": aligned,
+        "alignment_error": buffer.alignment_error,
+        "trailer": buffer.trailer,
         "positions": positions,
     })
 }
@@ -193,7 +280,7 @@ mod tests {
     /// full-precision probabilities measure 372 on serde_json 1.0.151; the
     /// test below fails if the format ever grows past this bound, so the
     /// position budgets of this module stay honest.
-    const WORST_CASE_BYTES_PER_POSITION: usize = 384;
+    const WORST_CASE_BYTES_PER_POSITION: usize = 448;
 
     fn filled_handle(first: u32, positions: usize, limit: usize) -> CaptureHandle {
         let mut sampler = Sampler::greedy();
@@ -273,8 +360,9 @@ mod tests {
     #[test]
     fn serialized_worst_case_position_stays_under_the_documented_bound() {
         // Six candidates (five shown plus a rank-outside selected), large ids,
-        // full-precision probabilities: the measured serialized size must stay
-        // under WORST_CASE_BYTES_PER_POSITION, or the memory budgets are lies.
+        // full-precision probabilities, and a 32-byte piece with a max offset:
+        // the measured serialized size must stay under
+        // WORST_CASE_BYTES_PER_POSITION, or the memory budgets are lies.
         let mut sampler = Sampler::greedy();
         let handle = sampler.arm_capture(1);
         sampler.record(&SampleObservation {
@@ -291,6 +379,11 @@ mod tests {
                 (152_000, 0.33000000000000007),
             ],
         });
+        {
+            let mut buffer = handle.lock().expect("buffer lock");
+            buffer.positions[0].piece = Some("x".repeat(32));
+            buffer.positions[0].offset = Some(u32::MAX);
+        }
         let buffer = handle.lock().expect("buffer lock");
         let body = packet("chatcmpl-x", &meta(), &buffer);
         let per_position = serde_json::to_string(&body["positions"][0]).expect("serialize");
@@ -310,7 +403,7 @@ mod tests {
         }
         let buffer = handle.lock().expect("buffer lock");
         let body = packet("r", &meta(), &buffer);
-        assert_eq!(body["packet"], 1);
+        assert_eq!(body["packet"], 2);
         assert_eq!(body["truncated"], true);
         assert_eq!(body["captured_positions"], 10);
         assert_eq!(body["model"], "test-model");
@@ -318,6 +411,79 @@ mod tests {
         assert_eq!(body["sampling"]["top_k"], 40);
         assert_eq!(body["capture_scope"], "decode");
         assert_eq!(body["positions"].as_array().expect("array").len(), 10);
+        // Unreplayed positions serialize bare alignment fields: explicit
+        // nulls, not absent keys, so a consumer always sees the same shape.
+        assert_eq!(body["positions"][0]["offset"], serde_json::Value::Null);
+        assert_eq!(body["positions"][0]["piece"], serde_json::Value::Null);
+        assert_eq!(body["aligned_positions"], 0);
+        assert_eq!(body["raw_byte_len"], 0);
+        assert_eq!(body["alignment_error"], false);
+        assert_eq!(body["trailer"], "");
+    }
+
+    #[test]
+    fn aligner_attaches_pieces_offsets_and_survives_the_unicode_split() {
+        // 'é' is ids [195, 169] on the byte-level fixture tokenizer: the first
+        // id alone is an incomplete UTF-8 sequence, so its piece is empty and
+        // the NEXT position carries the whole character — offsets must stay
+        // monotone through that split.
+        let mut sampler = Sampler::greedy();
+        let buffer = sampler.arm_capture(8);
+        for winner in [195_usize, 169, 97] {
+            let mut row = vec![0.0_f32; 258];
+            row[winner] = 1.0;
+            sampler.sample(&row).expect("greedy sample");
+        }
+        let mut aligner = TraceAligner::new(testkit::bundle().tokenizer(), buffer.clone());
+        aligner.on_batch(&[195, 169]);
+        aligner.on_batch(&[97]);
+        aligner.finish();
+        let buffer = buffer.lock().expect("buffer lock");
+        assert!(!buffer.alignment_error);
+        let pieces: Vec<&str> = buffer
+            .positions
+            .iter()
+            .map(|recorded| recorded.piece.as_deref().expect("aligned piece"))
+            .collect();
+        assert_eq!(pieces, ["", "\u{e9}", "a"]);
+        assert_eq!(buffer.positions[0].offset, Some(0));
+        assert_eq!(
+            buffer.positions[1].offset,
+            Some(0),
+            "the empty piece advanced nothing"
+        );
+        assert_eq!(buffer.positions[2].offset, Some(2));
+        assert_eq!(buffer.raw_len, 3);
+        assert_eq!(buffer.trailer, "");
+    }
+
+    #[test]
+    fn aligner_latches_on_token_mismatch_and_keeps_earlier_offsets() {
+        // The replay feeds a token the sampler never recorded for that
+        // position: alignment stops with the flag set, and the offsets
+        // already written stay valid.
+        let mut sampler = Sampler::greedy();
+        let buffer = sampler.arm_capture(8);
+        for _ in 0..2 {
+            let mut row = vec![0.0_f32; 258];
+            row[5] = 1.0;
+            sampler.sample(&row).expect("greedy sample");
+        }
+        let mut aligner = TraceAligner::new(testkit::bundle().tokenizer(), buffer.clone());
+        aligner.on_batch(&[5, 6]);
+        aligner.on_batch(&[5]);
+        aligner.finish();
+        let buffer = buffer.lock().expect("buffer lock");
+        assert!(buffer.alignment_error);
+        let first = &buffer.positions[0];
+        assert_eq!(first.piece.as_deref(), Some("\u{5}"));
+        assert_eq!(first.offset, Some(0));
+        assert_eq!(
+            buffer.positions[1].piece, None,
+            "alignment stopped at the break"
+        );
+        assert_eq!(buffer.raw_len, 1);
+        assert_eq!(buffer.trailer, "", "a stopped aligner flushes nothing");
     }
 
     #[test]
@@ -383,7 +549,7 @@ mod tests {
                 Some("no-store")
             );
             let packet = testkit::json_of(&bytes);
-            assert_eq!(packet["packet"], 1);
+            assert_eq!(packet["packet"], 2);
             assert_eq!(packet["reply_id"], reply["id"]);
             assert_eq!(packet["model"], "model-a");
             assert_eq!(packet["sampling"]["temperature"].as_f64(), Some(0.0));
@@ -400,6 +566,26 @@ mod tests {
                     0
                 );
             }
+            // Alignment (P1-C): every position carries its piece, the pieces
+            // concatenate to exactly the reply's content text, and the
+            // offsets walk it byte by byte — the guarantee the GUI highlights
+            // against.
+            assert_eq!(packet["aligned_positions"], 3);
+            assert_eq!(packet["alignment_error"], false);
+            let content = reply["choices"][0]["message"]["content"]
+                .as_str()
+                .expect("content")
+                .to_string();
+            let mut joined = String::new();
+            let mut offsets = Vec::new();
+            for position in positions {
+                joined.push_str(position["piece"].as_str().expect("aligned piece"));
+                offsets.push(position["offset"].as_u64());
+            }
+            assert_eq!(joined, content, "pieces concatenate to the reply text");
+            assert_eq!(offsets, vec![Some(0), Some(1), Some(2)]);
+            assert_eq!(packet["raw_byte_len"], content.len());
+            assert_eq!(packet["trailer"], "");
         }
     }
 

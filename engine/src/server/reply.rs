@@ -8,6 +8,7 @@
 use super::error::ServerError;
 use super::pieces::{Piece, ReplyParser};
 use super::reqlog::RequestLog;
+use super::sampler_trace::TraceAligner;
 use super::wire::{FinishReason, ReplyParts, ToolCall, Usage};
 use crate::EngError;
 use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefixReport};
@@ -45,6 +46,9 @@ pub(crate) struct RunningJob {
     /// refused, or stop-string reply logs no prefix keys.
     prefix: Option<PrefixReport>,
     calls: u32,
+    /// The alignment replay of a traced reply: fed every batch's tokens,
+    /// finished at `Done`. `None` on every request that did not arm capture.
+    trace: Option<TraceAligner>,
     /// The log of the request. A writer that ends the request without a step writes through it.
     pub(crate) log: RequestLog,
 }
@@ -65,6 +69,7 @@ impl RunningJob {
         parser: ReplyParser,
         prompt_tokens: u32,
         log: RequestLog,
+        trace: Option<TraceAligner>,
     ) -> Self {
         Self {
             handle,
@@ -75,6 +80,7 @@ impl RunningJob {
             reused: 0,
             prefix: None,
             calls: 0,
+            trace,
             log,
         }
     }
@@ -156,6 +162,12 @@ impl RunningJob {
     }
 
     fn on_batch(&mut self, batch: &DecodeBatch) -> Result<Option<Step>, ServerError> {
+        // The replay sees the batch's tokens before the assembler and the
+        // parser read its text: the same ids, in the same order, so the
+        // positions stay aligned with what the reply will show.
+        if let Some(trace) = self.trace.as_mut() {
+            trace.on_batch(&batch.tokens);
+        }
         let delta = self.assembler.push_batch(batch)?;
         let mut pieces = self.parser.push(&delta.text);
         if let Some(finish) = delta.finish.and_then(finish_reason) {
@@ -171,6 +183,9 @@ impl RunningJob {
     }
 
     fn done(&mut self, pieces: Vec<Piece>, finish: FinishReason) -> Step {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.finish();
+        }
         self.calls += count_calls(&pieces);
         let finish = if self.calls > 0 {
             FinishReason::ToolCalls
@@ -349,7 +364,10 @@ mod tests {
             &[testkit::add_tool()],
             &head().call_prefix(),
         );
-        (RunningJob::new(handle, assembler, parser, 3, log), cancel)
+        (
+            RunningJob::new(handle, assembler, parser, 3, log, None),
+            cancel,
+        )
     }
 
     async fn steps(job: &mut RunningJob) -> Vec<Step> {
@@ -599,7 +617,7 @@ mod tests {
         handle.cancel();
         let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
         let parser = ReplyParser::new(Start::Content, &[], "call_");
-        let mut running = RunningJob::new(handle, assembler, parser, 3, silent());
+        let mut running = RunningJob::new(handle, assembler, parser, 3, silent(), None);
         assert_eq!(running.next().await, Ok(Step::Aborted));
     }
 
@@ -611,7 +629,7 @@ mod tests {
         drop(job);
         let assembler = OutputAssembler::new(Vec::new()).expect("assembler");
         let parser = ReplyParser::new(Start::Content, &[], "call_");
-        let mut running = RunningJob::new(handle, assembler, parser, 3, silent());
+        let mut running = RunningJob::new(handle, assembler, parser, 3, silent(), None);
         let error = running.next().await.expect_err("error");
         assert!(
             matches!(error, ServerError::Eng(EngError::Backend { .. })),
@@ -695,7 +713,7 @@ mod tests {
                     "/v1/test",
                 );
                 log.admit();
-                let mut running = RunningJob::new(handle, assembler, parser, 3, log);
+                let mut running = RunningJob::new(handle, assembler, parser, 3, log, None);
                 let result = if collected {
                     collect(&mut running).await.map(|_| ())
                 } else {

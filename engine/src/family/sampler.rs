@@ -381,7 +381,10 @@ impl SampleObservation {
 }
 
 /// One recorded sampling decision: what the sampler considered when it chose
-/// `token`. The selected entry's probability is absent on greedy rows.
+/// `token`. The selected entry's probability is absent on greedy rows. The
+/// `offset`/`piece` pair arrives later, from the server's replay of the
+/// decode batches: the byte offset of this token's piece in the raw
+/// generated text, absent on positions the replay never reached.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecordedSample {
     pub(crate) token: u32,
@@ -390,16 +393,61 @@ pub(crate) struct RecordedSample {
     pub(crate) greedy: bool,
     pub(crate) selected_prob: Option<f64>,
     pub(crate) candidates: Vec<(u32, f64)>,
+    pub(crate) offset: Option<u32>,
+    pub(crate) piece: Option<String>,
 }
 
 /// The buffer an armed sampler appends to: one request's positions under an
 /// absolute limit, with the truncation flag the trace packet reports. Data
 /// only — no invariant lives here, so a poisoned lock recovers with the data.
+/// The alignment fields grow only from the server's replay, never from the
+/// sampling path.
 #[derive(Debug, Default)]
 pub(crate) struct CaptureBuffer {
     pub(crate) positions: Vec<RecordedSample>,
     pub(crate) truncated: bool,
     limit: usize,
+    /// How many replay tokens the buffer has consumed. The replay and the
+    /// sampler see the same stream, so this walks `positions` in order.
+    fed: usize,
+    /// The bytes of raw generated text the aligned pieces cover.
+    pub(crate) raw_len: usize,
+    /// True once the replay's token stream disagreed with the recorded
+    /// positions (or a decode failed): alignment stopped, and the offsets
+    /// before the break stay trustworthy. Latched, never cleared.
+    pub(crate) alignment_error: bool,
+    /// Text the decoder flushed at the end that belongs to no single
+    /// position — a partial sequence the output limit cut mid-character.
+    pub(crate) trailer: String,
+}
+
+impl CaptureBuffer {
+    /// Attaches the replayed piece and its raw byte offset to the next
+    /// unfed position. Returns false — and latches `alignment_error` — when
+    /// the replayed token is not the token the sampler recorded for that
+    /// position; the caller then stops feeding, and offsets before the break
+    /// stay valid.
+    pub(crate) fn annotate(&mut self, token: u32, piece: &str) -> bool {
+        let Some(recorded) = self.positions.get_mut(self.fed) else {
+            self.alignment_error = true;
+            return false;
+        };
+        if recorded.token != token {
+            self.alignment_error = true;
+            return false;
+        }
+        recorded.offset = Some(u32::try_from(self.raw_len).unwrap_or(u32::MAX));
+        recorded.piece = Some(piece.to_owned());
+        self.fed += 1;
+        self.raw_len += piece.len();
+        true
+    }
+
+    /// Records the decoder's end-of-stream flush as the packet's trailer.
+    pub(crate) fn push_trailer(&mut self, text: &str) {
+        self.raw_len += text.len();
+        self.trailer.push_str(text);
+    }
 }
 
 pub(crate) type CaptureHandle = std::sync::Arc<std::sync::Mutex<CaptureBuffer>>;
@@ -528,6 +576,10 @@ impl Sampler {
             positions: Vec::new(),
             truncated: false,
             limit,
+            fed: 0,
+            raw_len: 0,
+            alignment_error: false,
+            trailer: String::new(),
         }));
         self.capture = Some(std::sync::Arc::clone(&handle));
         handle
@@ -557,6 +609,8 @@ impl Sampler {
             greedy: obs.greedy,
             selected_prob,
             candidates: obs.candidates.clone(),
+            offset: None,
+            piece: None,
         });
     }
 

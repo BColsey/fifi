@@ -270,6 +270,7 @@ pub(super) fn admit(
     };
     let decoder = IncrementalDecoder::new(entry.bundle.tokenizer());
     let mut sampler = Sampler::from_entropy(sampling);
+    let mut trace = None;
     if sample_trace {
         // Fail closed: the request asked for capture the process forbids.
         // The refusal is a request error, like an unknown x-thinking value.
@@ -283,7 +284,9 @@ pub(super) fn admit(
         }
         // Arm before generation begins — nothing is captured retroactively —
         // and register in the ring at submit, so in-progress captures count
-        // against its budgets from the first token on.
+        // against its budgets from the first token on. The aligner replays
+        // the batches through the same tokenizer, attaching each position's
+        // piece and raw offset (P1-C).
         let params = sampler.params();
         let buffer = sampler.arm_capture(super::sampler_trace::PER_REQUEST_POSITION_LIMIT);
         state.register_trace(
@@ -294,8 +297,12 @@ pub(super) fn admit(
                 top_p: params.top_p(),
                 top_k: params.top_k(),
             },
-            buffer,
+            std::sync::Arc::clone(&buffer),
         );
+        trace = Some(super::sampler_trace::TraceAligner::new(
+            entry.bundle.tokenizer(),
+            buffer,
+        ));
     }
     let generation = GenerationState::with_sampler(decoder, sampler).with_max_tokens(max_tokens);
     let (mut job, handle) =
@@ -335,7 +342,7 @@ pub(super) fn admit(
     log.admit();
     Ok(Submitted {
         head,
-        running: RunningJob::new(handle, assembler, parser, prompt_tokens, log),
+        running: RunningJob::new(handle, assembler, parser, prompt_tokens, log, trace),
     })
 }
 
