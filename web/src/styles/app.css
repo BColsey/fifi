@@ -778,3 +778,56 @@ details.engine-settings summary {
   font-size: var(--fifi-size-1);
 }
 details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
+
+/* Internals view: expert bars and the routing heatmap. Layout and
+   cards come from the shared panel classes. */
+.expert-bars { display: grid; gap: 3px; }
+.expert-bar {
+  display: grid;
+  grid-template-columns: 4ch 1fr 6ch;
+  align-items: center;
+  gap: var(--fifi-space-2);
+  font-family: var(--fifi-mono);
+  font-size: var(--fifi-size-1);
+  font-variant-numeric: tabular-nums;
+}
+.expert-bar .bar { height: 9px; border-radius: 3px; background: var(--fifi-accent); min-width: 2px; }
+.expert-bar .n { color: var(--fifi-text-tertiary); text-align: right; }
+
+.heat { overflow-x: auto; padding-bottom: var(--fifi-space-2); }
+.heat-grid { display: grid; gap: 1px; width: max-content; }
+.heat-grid .lab {
+  font-family: var(--fifi-mono);
+  font-size: 10px;
+  color: var(--fifi-text-tertiary);
+  text-align: right;
+  padding-right: var(--fifi-space-1);
+  line-height: 10px;
+}
+.hc {
+  width: 9px;
+  height: 10px;
+  border-radius: 2px;
+  border: 0;
+  padding: 0;
+  background: var(--c, var(--fifi-fill));
+}
+.hc:hover { outline: 1px solid var(--fifi-separator); }
+.hc.sel { outline: 2px solid var(--fifi-accent); outline-offset: 1px; }
+
+.heat-detail h4 { margin: var(--fifi-space-3) 0 var(--fifi-space-2); font-size: var(--fifi-size-3); }
+.pick-layers { display: grid; gap: 2px; }
+.pick-line {
+  display: grid;
+  grid-template-columns: 4ch 1fr;
+  gap: var(--fifi-space-2);
+  font-family: var(--fifi-mono);
+  font-size: var(--fifi-size-1);
+}
+.pick-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+.pick-chip {
+  background: var(--fifi-code-bg);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-variant-numeric: tabular-nums;
+}

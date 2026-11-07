@@ -7,6 +7,8 @@ import { ApiError, getHealth, getReady, listModels, type Model } from "./api";
 import { AboutView, applyTheme } from "./about";
 import { ChatView } from "./chat";
 import { Drawer } from "./drawer";
+import { InternalsView } from "./internals";
+import { fixture as routingFixture } from "./internals.fixture";
 import { MonitorView } from "./monitor";
 import { noticeList } from "./notices";
 import { pollPlan } from "./panel";
@@ -20,7 +22,7 @@ import {
   type ChatRecord,
 } from "./store";
 
-type ViewName = "chat" | "monitor" | "about";
+type ViewName = "chat" | "monitor" | "internals" | "about";
 type PillState = "offline" | "starting" | "ready" | "busy" | "error";
 
 const pillLabels: Record<PillState, string> = {
@@ -329,8 +331,16 @@ function main(): void {
   const views: Record<ViewName, HTMLElement> = {
     chat: el<HTMLElement>("view-chat"),
     monitor: el<HTMLElement>("view-monitor"),
+    internals: el<HTMLElement>("view-internals"),
     about: el<HTMLElement>("view-about"),
   };
+  const viewTitles: Record<ViewName, string> = {
+    chat: "Chat",
+    monitor: "Monitor",
+    internals: "Internals",
+    about: "About",
+  };
+  new InternalsView(views.internals, routingFixture);
 
   function showView(name: ViewName): void {
     currentView = name;
@@ -341,7 +351,7 @@ function main(): void {
       if (link.dataset.view === name) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     }
-    viewTitle.textContent = name === "chat" ? "Chat" : name === "monitor" ? "Monitor" : "About";
+    viewTitle.textContent = viewTitles[name];
     const drawerButton = document.getElementById("drawer-button");
     if (drawerButton !== null) drawerButton.hidden = name !== "chat";
     if (name === "monitor") void monitor.refresh();
@@ -351,7 +361,7 @@ function main(): void {
 
   function routeFromHash(): ViewName {
     const hash = window.location.hash.replace(/^#\/?"?/, "");
-    if (hash === "monitor" || hash === "about") return hash;
+    if (hash === "monitor" || hash === "internals" || hash === "about") return hash;
     return "chat";
   }
 

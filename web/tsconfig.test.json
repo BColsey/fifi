@@ -18,6 +18,8 @@
     "src/deadchats.test.ts",
     "src/history.ts",
     "src/history.test.ts",
+    "src/internals.ts",
+    "src/internals.test.ts",
     "src/notices.ts",
     "src/notices.test.ts",
     "src/panel.ts",
