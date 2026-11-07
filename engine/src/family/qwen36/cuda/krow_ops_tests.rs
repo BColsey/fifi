@@ -263,7 +263,10 @@ fn the_buffer_regions_are_aligned_apart_and_as_wide_as_the_geometry() {
                     region.bytes(rows)
                 };
         }
-        assert!(io.total >= end && io.total % 256 == 0, "{rows} rows: total");
+        assert!(
+            io.total >= end && io.total.is_multiple_of(256),
+            "{rows} rows: total"
+        );
         // The tight places resolve to the regions.
         assert_eq!(io.tight(Tight::Qkv), io.qkv);
         assert_eq!(io.tight(Tight::V), io.v);

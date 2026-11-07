@@ -34,7 +34,7 @@ pub(super) fn switch_refusal(get: impl Fn(&str) -> Option<OsString>) -> Result<(
 
 /// [`switch_refusal`] over the process environment.
 pub(super) fn refuse_switches() -> Result<(), String> {
-    switch_refusal(std::env::var_os)
+    switch_refusal(|name| std::env::var_os(name))
 }
 
 /// Check B: the first difference between the per-layer taps of a K-row window and those of the

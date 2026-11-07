@@ -439,7 +439,7 @@ fn rig() -> Rig {
     .expect("step");
     let mut step = step;
     arm_rollback(&mut step, rollback);
-    arm_verify(&mut step, verify).unwrap_or_else(|error| panic!("{error}"));
+    arm_verify(&mut step, verify).unwrap_or_else(|error| panic!("{error:?}"));
     Rig {
         step,
         tokenizer,

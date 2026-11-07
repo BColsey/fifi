@@ -773,6 +773,7 @@ impl<'a> QwenResidentStep<'a> {
             window_trace: Default::default(),
             #[cfg(test)]
             moe_pick_tap: Default::default(),
+            #[cfg(test)]
             taps: Default::default(),
             speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
