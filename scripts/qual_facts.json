@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6285,
-      "ignored": 529,
+      "test_fns": 6315,
+      "ignored": 531,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -57,6 +57,7 @@
         "FIFI_FLASH_NEXT_EXL3_MOE_LAYER",
         "FIFI_FLASH_NEXT_EXL3_PACK",
         "FIFI_FLASH_NEXT_MISS_TRACES",
+        "FIFI_FLASH_NEXT_ROUTE_TRACE",
         "FIFI_FLINT_CHAIN_ORACLE_DIR",
         "FIFI_FLINT_CHAIN_ORACLE_SHA256",
         "FIFI_FLINT_CONTROL_ARM",
