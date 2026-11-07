@@ -21,6 +21,7 @@ mod model_serve;
 mod pieces;
 mod reply;
 mod reqlog;
+mod route_trace;
 mod router;
 mod run;
 mod sampler_trace;

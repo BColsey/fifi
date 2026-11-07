@@ -27,10 +27,10 @@ pub(in crate::family::qwen36) fn enabled(value: Option<&str>) -> bool {
 /// One layer's router picks: the pick ids (i32, `-1` is the router-fault value), the
 /// renormalized pick weights, and the shared-expert gate.
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::family::qwen36) struct LayerPicks {
-    pub(in crate::family::qwen36) ids: Vec<i32>,
-    pub(in crate::family::qwen36) weights: Vec<f32>,
-    pub(in crate::family::qwen36) shared_gate: f32,
+pub(crate) struct LayerPicks {
+    pub(crate) ids: Vec<i32>,
+    pub(crate) weights: Vec<f32>,
+    pub(crate) shared_gate: f32,
 }
 
 /// Process-wide, like the layer-trace counters: every session and warm-up step of the process

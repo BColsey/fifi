@@ -17,14 +17,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The env opt-in: `1` arms the stage, any other value (including unset) leaves it off.
-pub(in crate::family::qwen36) const VAR: &str = "Q36_ROUTE_STAGE";
+pub(crate) const VAR: &str = "Q36_ROUTE_STAGE";
 
 /// How many steps the ring keeps; older steps fall off the front. One step of the 35B model is
 /// 40 layers x 68 bytes of picks, so the cap is a few KiB.
-const RING_STEPS: usize = 16;
+pub(crate) const RING_STEPS: usize = 16;
 
 /// The parse of [`VAR`], separate from the env read so tests can cover it.
-pub(in crate::family::qwen36) fn enabled(value: Option<&str>) -> bool {
+pub(crate) fn enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
@@ -48,12 +48,8 @@ pub(in crate::family::qwen36) fn store(step: u32, picks: Vec<LayerPicks>) {
     }
 }
 
-/// A copy of the ring, oldest first, for the server drain of a later slice and for tests.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drained by the server packet of the next slice")
-)]
-pub(in crate::family::qwen36) fn snapshot() -> Vec<(u32, Vec<LayerPicks>)> {
+/// A copy of the ring, oldest first, for the server's route-trace packet and for tests.
+pub(crate) fn snapshot() -> Vec<(u32, Vec<LayerPicks>)> {
     RING.lock()
         .map(|mut ring| ring.make_contiguous().to_vec())
         .unwrap_or_default()
