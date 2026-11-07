@@ -14,10 +14,97 @@
 //! * the expert union of K tokens in one layer is the number of distinct ids among their K * top_k
 //!   picks; windows slide one token at a time.
 
-/// The row counts of the alpha measurement. 1 is the single-row (wide1) reference.
-pub(crate) const ROWS: [usize; 4] = [1, 2, 4, 8];
+/// The row counts of the alpha measurement. 1 is the single-row (wide1) reference; 3 and 6 run the
+/// rows kernel of the next power of two (4 and 8) with fewer rows.
+pub(crate) const ROWS: [usize; 6] = [1, 2, 3, 4, 6, 8];
 /// The window sizes of the expert union.
 pub(crate) const UNION_WINDOWS: [usize; 7] = [2, 3, 4, 5, 6, 7, 8];
+
+use serde_json::{Map, Value, json};
+
+use super::window_cost::{median, summary};
+use crate::family::AttentionKind;
+
+/// Variables that may stay set in a measurement process: the pack, and the device requirement the
+/// runner sets. Everything else under a prefix of [`REFUSED_PREFIXES`] changes which kernel or
+/// which numerics the step runs, or what it reports, and makes the test refuse to start.
+pub(crate) const ALLOWED_VARS: [&str; 2] =
+    ["FIFI_EXL3_CHECKPOINT", "INFERENCE_CUDA_REQUIRE_DEVICE"];
+/// Prefixes of the engine's kernel, numerics and diagnostic switches (read from the environment
+/// reads of `qwen36/cuda`, `kernels/cuda` and `project/cuda`: GDN input-projection fusion, sparse
+/// attention, the KV8 attention variants, the device shortlist, the Q36 ablations, the per-op
+/// sync, the single-row, gather, dp4a, indexed-pair and shared-in-routed EXL3 switches, the graph
+/// bench phases).
+pub(crate) const REFUSED_PREFIXES: [&str; 6] = [
+    "FIFI_EXL3_",
+    "INFERENCE_CUDA_",
+    "INFERENCE_QWEN36_",
+    "INFERENCE_Q36_",
+    "Q36_",
+    "FIFI_GRAPH_BENCH_",
+];
+/// Single variables outside those prefixes that change a step.
+pub(crate) const REFUSED_EXACT: [&str; 1] = ["FIFI_DELTA_TRACE"];
+
+/// The names among `names` that a measurement refuses to run with.
+pub(crate) fn refused_switches(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| {
+            !ALLOWED_VARS.contains(&name.as_str())
+                && (REFUSED_PREFIXES.iter().any(|p| name.starts_with(p))
+                    || REFUSED_EXACT.contains(&name.as_str()))
+        })
+        .collect()
+}
+
+/// The whole startup check of a measurement process: no refused variable, and the shared expert
+/// not inside the routed launches (`shared` is the process-wide reading of
+/// `FIFI_EXL3_SHARED_IN_ROUTED`: `Ok(false)` is off, `Ok(true)` on, `Err` a bad value). An `Err`
+/// names every reason.
+pub(crate) fn check_default_path(
+    names: impl IntoIterator<Item = String>,
+    shared: Result<bool, String>,
+) -> Result<(), String> {
+    let mut reasons = Vec::new();
+    let refused = refused_switches(names);
+    if !refused.is_empty() {
+        reasons.push(format!(
+            "switches set that change what the step runs: {refused:?}"
+        ));
+    }
+    match shared {
+        Ok(false) => {}
+        Ok(true) => reasons.push("FIFI_EXL3_SHARED_IN_ROUTED is on".to_owned()),
+        Err(error) => reasons.push(format!("FIFI_EXL3_SHARED_IN_ROUTED: {error}")),
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
+/// The receipt code of a launch of `rows` rows run as separate single-row launches
+/// (`SEP_CODE_OFFSET + rows`), against the plain `rows` of one batched launch.
+pub(crate) const SEP_CODE_OFFSET: usize = 16;
+
+/// What the union record does and does not cover (S6 of the review of the first window).
+pub(crate) const UNION_CAVEAT: &str = "true-continuation windows only: the K rows are the next K tokens of the real text, i.e. every draft accepted; a window holding rejected drafts has other tokens in its later rows and a different union; depth 1K to 4K (a 1024-row prefill and 3000 decoded tokens), not 8K or 32K; picks are read on the EAGER body (capture off), assuming the captured step routes the same (D1)";
+
+/// The size in bytes of the device-to-device marker copy that the receipt pass queues before the
+/// launch of op `op` at `rows` rows, so that a profile can tell which kernels belong to which
+/// (op, rows): 4096 * (op + 1) + 16 * rows.
+pub(crate) fn receipt_marker_bytes(op: usize, rows: usize) -> usize {
+    4096 * (op + 1) + 16 * rows
+}
+
+/// The `(op, rows)` a marker size names, `None` for any other size.
+pub(crate) fn decode_receipt_marker(bytes: usize) -> Option<(usize, usize)> {
+    let (op, rest) = (bytes / 4096, bytes % 4096);
+    (op >= 1 && rest.is_multiple_of(16) && (1..=64).contains(&(rest / 16)))
+        .then(|| (op - 1, rest / 16))
+}
 
 /// alpha(R) = (t(R) - t(1)) / ((R - 1) * t(1)); `None` for R = 1 or a non-positive t(1).
 pub(crate) fn alpha(t1: f64, t_rows: f64, rows: usize) -> Option<f64> {
@@ -172,4 +259,120 @@ impl Inputs {
 
 pub(crate) fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+// ---- the records of the phase and union tests (host logic, host-tested) ----
+
+pub(crate) struct Reading {
+    pub(crate) wall_ms: f64,
+    pub(crate) whole_ms: f64,
+    pub(crate) embed_ms: f64,
+    pub(crate) tail_ms: f64,
+    pub(crate) groups: Vec<f64>,
+}
+
+fn medians(rows: &[Vec<f64>]) -> Vec<f64> {
+    let width = rows.first().map_or(0, Vec::len);
+    (0..width)
+        .map(|at| median(&rows.iter().map(|row| row[at]).collect::<Vec<_>>()).unwrap_or(f64::NAN))
+        .collect()
+}
+
+pub(crate) fn depth_json(
+    depth: usize,
+    readings: &[Reading],
+    plan: &[(usize, usize, AttentionKind)],
+) -> Value {
+    let col = |f: &dyn Fn(&Reading) -> f64| -> Vec<f64> { readings.iter().map(f).collect() };
+    let kind_total = |reading: &Reading, kind: AttentionKind| -> f64 {
+        reading
+            .groups
+            .iter()
+            .zip(plan)
+            .filter(|(_, (_, _, k))| *k == kind)
+            .map(|(ms, (_, size, _))| ms * *size as f64)
+            .sum()
+    };
+    let gdn = col(&|r| kind_total(r, AttentionKind::DeltaNet));
+    let full = col(&|r| kind_total(r, AttentionKind::Full));
+    let embed = col(&|r| r.embed_ms);
+    let tail = col(&|r| r.tail_ms);
+    let whole = col(&|r| r.whole_ms);
+    let sum_over_whole = col(&|r| {
+        (r.embed_ms
+            + r.tail_ms
+            + kind_total(r, AttentionKind::DeltaNet)
+            + kind_total(r, AttentionKind::Full))
+            / r.whole_ms
+    });
+    let per_group = medians(
+        &readings
+            .iter()
+            .map(|r| r.groups.clone())
+            .collect::<Vec<_>>(),
+    );
+    let groups: Vec<Value> = plan
+        .iter()
+        .zip(&per_group)
+        .map(|((layer, size, kind), ms)| {
+            json!({"layer": layer, "run_size": size, "kind": format!("{kind:?}"), "median_ms": ms})
+        })
+        .collect();
+    let m = |v: &[f64]| median(v).unwrap_or(f64::NAN);
+    json!({
+        "depth_start": depth,
+        "tokens_timed": readings.len(),
+        "step_wall_ms": summary(&col(&|r| r.wall_ms)),
+        "step_gpu_event_ms": summary(&whole),
+        "idle_gap_ms_median": m(&col(&|r| r.wall_ms - r.whole_ms)),
+        "embed_ms": summary(&embed),
+        "tail_ms (final norm, head, argmax, advance)": summary(&tail),
+        "gdn_layers_ms_scaled_to_30 (mixer + moe)": summary(&gdn),
+        "full_attention_layers_ms_scaled_to_10 (mixer + moe)": summary(&full),
+        "marked_sum_over_whole_token": summary(&sum_over_whole),
+        "median_shares_of_gpu_event": {
+            "embed": m(&embed) / m(&whole), "tail": m(&tail) / m(&whole),
+            "gdn_layers": m(&gdn) / m(&whole), "full_attention_layers": m(&full) / m(&whole),
+        },
+        "groups": groups,
+        "raw_step_wall_ms": col(&|r| r.wall_ms),
+        "raw_gpu_event_ms": whole,
+    })
+}
+
+pub(crate) fn union_json(picks: &[Vec<Vec<i32>>]) -> Value {
+    let mut per_k = Map::new();
+    for k in std::iter::once(1).chain(UNION_WINDOWS) {
+        let mut all: Vec<f64> = Vec::new();
+        let mut layers = Vec::new();
+        for (layer, tokens) in picks.iter().enumerate() {
+            let sizes: Vec<f64> = union_sizes(tokens, k)
+                .unwrap_or_else(|e| panic!("layer {layer} K {k}: {e}"))
+                .into_iter()
+                .map(|n| n as f64)
+                .collect();
+            layers.push(json!({
+                "layer": layer,
+                "windows": sizes.len(),
+                "mean": mean(&sizes),
+                "p90": percentile(&sizes, 90.0),
+            }));
+            all.extend(sizes);
+        }
+        let top_k = picks[0][0].len() as f64;
+        per_k.insert(
+            k.to_string(),
+            json!({
+                "windows_total": all.len(),
+                "mean": mean(&all),
+                "p90": percentile(&all, 90.0),
+                "mean_per_layer_p90": mean(
+                    &layers.iter().filter_map(|l| l["p90"].as_f64()).collect::<Vec<_>>()
+                ),
+                "mean_over_k_times_top_k": mean(&all).map(|m| m / (k as f64 * top_k)),
+                "per_layer": layers,
+            }),
+        );
+    }
+    Value::Object(per_k)
 }

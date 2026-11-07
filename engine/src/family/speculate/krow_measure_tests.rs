@@ -2,7 +2,9 @@
 //! tests carry. No device is needed.
 
 use super::krow_measure::{
-    Inputs, alpha, first_word_difference, mean, percentile, rotated, union_sizes, weighted_alpha,
+    ALLOWED_VARS, Inputs, ROWS, Reading, SEP_CODE_OFFSET, UNION_CAVEAT, alpha, check_default_path,
+    decode_receipt_marker, depth_json, first_word_difference, mean, percentile,
+    receipt_marker_bytes, refused_switches, rotated, union_json, union_sizes, weighted_alpha,
 };
 
 #[test]
@@ -132,9 +134,209 @@ fn every_measurement_test_refuses_the_switches_first() {
         assert!(tests >= 1, "{name}");
     }
     let alpha = include_str!("../qwen36/cuda/krow_alpha_device_tests.rs");
+    assert!(
+        alpha.contains("check_default_path("),
+        "the guard reads the shared check"
+    );
     assert!(alpha.contains("FIFI_EXL3_SHARED_IN_ROUTED") && alpha.contains("\"effective\""));
     assert!(
         alpha.contains("FIFI_EXL3_CHECKPOINT"),
         "the one switch the guard allows"
     );
+}
+
+#[test]
+fn the_rows_include_three_and_six() {
+    assert_eq!(ROWS, [1, 2, 3, 4, 6, 8]);
+}
+
+#[test]
+fn every_switch_that_changes_the_step_is_refused() {
+    let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // The ones the review named, and the single-row and shared-expert switches.
+    let bad = [
+        "INFERENCE_CUDA_GDN_FUSE_INPROJ",
+        "INFERENCE_QWEN36_SPARSE_ATTN",
+        "Q36_NO_ACTMUL",
+        "Q36_CUDA_DEVICE_SHORTLIST",
+        "INFERENCE_CUDA_KV8_ATTN_R1",
+        "INFERENCE_CUDA_SYNC_EACH",
+        "Q36_NO_MOECOMBINE",
+        "Q36_NO_GDNPREP",
+        "Q36_FLASH_DELTA",
+        "FIFI_EXL3_SINGLE_GATHER",
+        "FIFI_EXL3_SHARED_IN_ROUTED",
+        "FIFI_EXL3_DP4A",
+        "FIFI_EXL3_INDEXED_PAIRS",
+        "FIFI_EXL3_LEGACY",
+        "FIFI_GRAPH_BENCH_PHASES",
+        "FIFI_DELTA_TRACE",
+    ];
+    assert_eq!(refused_switches(names(&bad)), names(&bad));
+    // What the runner sets stays allowed, with the measurement's own variables.
+    let fine = [
+        "FIFI_EXL3_CHECKPOINT",
+        "INFERENCE_CUDA_REQUIRE_DEVICE",
+        "FIFI_SPEC_TEXT",
+        "FIFI_SPEC_TOKENIZER",
+        "FIFI_KROW_OUT",
+        "FIFI_KROW_ROUNDS",
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "TMPDIR",
+    ];
+    assert!(refused_switches(names(&fine)).is_empty());
+    assert_eq!(ALLOWED_VARS.len(), 2);
+}
+
+#[test]
+fn the_receipt_markers_round_trip() {
+    for op in 0..20 {
+        for rows in ROWS {
+            let bytes = receipt_marker_bytes(op, rows);
+            assert_eq!(decode_receipt_marker(bytes), Some((op, rows)));
+            assert!(bytes < (1 << 20));
+        }
+    }
+    // Sizes that are not markers: the 128 MiB flush, a bare power of two, a row count of zero.
+    assert_eq!(decode_receipt_marker(128 << 20), None);
+    assert_eq!(decode_receipt_marker(4096), None);
+    assert_eq!(decode_receipt_marker(4096 + 7), None);
+    assert_eq!(decode_receipt_marker(100), None);
+}
+
+#[test]
+fn the_depth_record_scales_each_marked_layer_by_its_run_size() {
+    use crate::family::AttentionKind::{DeltaNet, Full};
+    // Marked layers 1 (GDN, run of 3), 3 (attention, run of 1), 5 (GDN, run of 3), 7 (attention).
+    let plan = [
+        (1, 3, DeltaNet),
+        (3, 1, Full),
+        (5, 3, DeltaNet),
+        (7, 1, Full),
+    ];
+    // GDN layers cost 0.2 and 0.4 ms, attention layers 0.3 and 0.5 ms; embed 0.01, tail 0.8.
+    let group = [0.2, 0.3, 0.4, 0.5];
+    // The whole token the marks would read if the unmarked layers cost what their group does.
+    let whole = 0.01 + 0.8 + 3.0 * 0.2 + 0.3 + 3.0 * 0.4 + 0.5;
+    let one = |wall_ms: f64| Reading {
+        wall_ms,
+        whole_ms: whole,
+        embed_ms: 0.01,
+        tail_ms: 0.8,
+        groups: group.to_vec(),
+    };
+    let readings = vec![one(9.0), one(9.5)];
+    let json = depth_json(8192, &readings, &plan);
+    let gdn = json["gdn_layers_ms_scaled_to_30 (mixer + moe)"]["median"]
+        .as_f64()
+        .unwrap();
+    let full = json["full_attention_layers_ms_scaled_to_10 (mixer + moe)"]["median"]
+        .as_f64()
+        .unwrap();
+    assert!((gdn - (3.0 * 0.2 + 3.0 * 0.4)).abs() < 1e-12, "{gdn}");
+    assert!((full - (0.3 + 0.5)).abs() < 1e-12, "{full}");
+    // The scaled sections plus embed and tail make the whole token.
+    let ratio = json["marked_sum_over_whole_token"]["median"]
+        .as_f64()
+        .unwrap();
+    assert!((ratio - 1.0).abs() < 1e-12, "{ratio}");
+    let shares = &json["median_shares_of_gpu_event"];
+    let total: f64 = ["embed", "tail", "gdn_layers", "full_attention_layers"]
+        .iter()
+        .map(|k| shares[k].as_f64().unwrap())
+        .sum();
+    assert!((total - 1.0).abs() < 1e-12);
+    assert_eq!(json["groups"].as_array().unwrap().len(), 4);
+    assert_eq!(json["groups"][1]["kind"], "Full");
+    assert_eq!(json["tokens_timed"], 2);
+}
+
+#[test]
+fn the_union_record_pools_windows_and_layers() {
+    // Two layers, four tokens, two picks each (top_k = 2 keeps the arithmetic readable).
+    let layer0 = vec![vec![1, 2], vec![3, 4], vec![1, 2], vec![5, 6]];
+    let layer1 = vec![vec![7, 8], vec![7, 8], vec![7, 9], vec![7, 8]];
+    let json = union_json(&[layer0, layer1]);
+    // K = 1: every window is top_k wide.
+    assert_eq!(json["1"]["mean"], 2.0);
+    assert_eq!(json["1"]["windows_total"], 8);
+    // K = 2: layer 0 windows {1,2,3,4}=4, {3,4,1,2}=4, {1,2,5,6}=4; layer 1: {7,8}=2, {7,8,9}=3, {7,9,8}=3.
+    let k2 = &json["2"];
+    assert_eq!(k2["windows_total"], 6);
+    assert!((k2["mean"].as_f64().unwrap() - (12.0 + 8.0) / 6.0).abs() < 1e-12);
+    assert_eq!(k2["p90"], 4.0);
+    assert_eq!(k2["per_layer"][0]["mean"], 4.0);
+    assert!((k2["per_layer"][1]["mean"].as_f64().unwrap() - 8.0 / 3.0).abs() < 1e-12);
+    assert!((k2["mean_over_k_times_top_k"].as_f64().unwrap() - (20.0 / 6.0) / 4.0).abs() < 1e-12);
+    // K = 4 has one window per layer; K = 5 and up have none (mean is null).
+    assert_eq!(json["4"]["windows_total"], 2);
+    assert!(json["5"]["mean"].is_null());
+    for k in 1..=8 {
+        assert!(json[k.to_string()].is_object());
+    }
+}
+
+#[test]
+fn the_union_caveat_names_what_the_windows_are() {
+    for word in ["true-continuation", "depth 1K to 4K", "EAGER"] {
+        assert!(UNION_CAVEAT.contains(word), "{word}");
+    }
+}
+
+#[test]
+fn each_refused_switch_alone_stops_the_start() {
+    for name in [
+        "INFERENCE_CUDA_GDN_FUSE_INPROJ",
+        "INFERENCE_QWEN36_SPARSE_ATTN",
+        "Q36_NO_ACTMUL",
+        "Q36_CUDA_DEVICE_SHORTLIST",
+        "INFERENCE_CUDA_KV8_ATTN_R1",
+        "INFERENCE_CUDA_SYNC_EACH",
+        "FIFI_EXL3_SINGLE_GATHER",
+        "FIFI_EXL3_SHARED_IN_ROUTED",
+        "FIFI_EXL3_DP4A",
+        "FIFI_EXL3_INDEXED_PAIRS",
+        "FIFI_GRAPH_BENCH_PHASES",
+        "FIFI_DELTA_TRACE",
+    ] {
+        let env = ["FIFI_EXL3_CHECKPOINT", "FIFI_KROW_OUT", name].map(str::to_owned);
+        let error = check_default_path(env, Ok(false)).expect_err(name);
+        assert!(error.contains(name), "{name}: {error}");
+    }
+    let clean = [
+        "FIFI_EXL3_CHECKPOINT",
+        "INFERENCE_CUDA_REQUIRE_DEVICE",
+        "FIFI_KROW_OUT",
+    ]
+    .map(str::to_owned);
+    assert_eq!(check_default_path(clean.clone(), Ok(false)), Ok(()));
+}
+
+#[test]
+fn the_shared_in_routed_reading_stops_the_start_whatever_the_names() {
+    let clean = ["FIFI_EXL3_CHECKPOINT".to_owned()];
+    let on = check_default_path(clean.clone(), Ok(true)).unwrap_err();
+    assert!(on.contains("SHARED_IN_ROUTED is on"), "{on}");
+    let bad =
+        check_default_path(clean.clone(), Err("must be unset, \"0\" or \"1\"".into())).unwrap_err();
+    assert!(bad.contains("FIFI_EXL3_SHARED_IN_ROUTED"), "{bad}");
+    // Both reasons are named together.
+    let both = check_default_path(["Q36_NO_ACTMUL".to_owned()], Ok(true)).unwrap_err();
+    assert!(
+        both.contains("Q36_NO_ACTMUL") && both.contains("is on"),
+        "{both}"
+    );
+}
+
+#[test]
+fn a_separate_launch_code_stays_inside_the_marker_range() {
+    for rows in ROWS {
+        let code = SEP_CODE_OFFSET + rows;
+        assert!(rows < SEP_CODE_OFFSET);
+        assert_eq!(
+            decode_receipt_marker(receipt_marker_bytes(3, code)),
+            Some((3, code))
+        );
+    }
 }

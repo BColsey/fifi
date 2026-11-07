@@ -53,7 +53,7 @@ use super::{
     window_bench_device_tests::bench_step,
 };
 use crate::family::speculate::krow_measure::{
-    Inputs, UNION_WINDOWS, f32_bytes, mean, percentile, rotated, union_sizes,
+    Inputs, Reading, UNION_CAVEAT, depth_json, f32_bytes, mean, rotated, union_json,
 };
 use crate::{
     family::{
@@ -118,79 +118,6 @@ fn shared_in_routed_effective(step: &super::step::QwenResidentStep<'_>) -> bool 
 // ---------------------------------------------------------------------------------------------
 // The phases of the captured step.
 // ---------------------------------------------------------------------------------------------
-
-struct Reading {
-    wall_ms: f64,
-    whole_ms: f64,
-    embed_ms: f64,
-    tail_ms: f64,
-    groups: Vec<f64>,
-}
-
-fn medians(rows: &[Vec<f64>]) -> Vec<f64> {
-    let width = rows.first().map_or(0, Vec::len);
-    (0..width)
-        .map(|at| median(&rows.iter().map(|row| row[at]).collect::<Vec<_>>()).unwrap_or(f64::NAN))
-        .collect()
-}
-
-fn depth_json(depth: usize, readings: &[Reading], plan: &[(usize, usize, AttentionKind)]) -> Value {
-    let col = |f: &dyn Fn(&Reading) -> f64| -> Vec<f64> { readings.iter().map(f).collect() };
-    let kind_total = |reading: &Reading, kind: AttentionKind| -> f64 {
-        reading
-            .groups
-            .iter()
-            .zip(plan)
-            .filter(|(_, (_, _, k))| *k == kind)
-            .map(|(ms, (_, size, _))| ms * *size as f64)
-            .sum()
-    };
-    let gdn = col(&|r| kind_total(r, AttentionKind::DeltaNet));
-    let full = col(&|r| kind_total(r, AttentionKind::Full));
-    let embed = col(&|r| r.embed_ms);
-    let tail = col(&|r| r.tail_ms);
-    let whole = col(&|r| r.whole_ms);
-    let sum_over_whole = col(&|r| {
-        (r.embed_ms
-            + r.tail_ms
-            + kind_total(r, AttentionKind::DeltaNet)
-            + kind_total(r, AttentionKind::Full))
-            / r.whole_ms
-    });
-    let per_group = medians(
-        &readings
-            .iter()
-            .map(|r| r.groups.clone())
-            .collect::<Vec<_>>(),
-    );
-    let groups: Vec<Value> = plan
-        .iter()
-        .zip(&per_group)
-        .map(|((layer, size, kind), ms)| {
-            json!({"layer": layer, "run_size": size, "kind": format!("{kind:?}"), "median_ms": ms})
-        })
-        .collect();
-    let m = |v: &[f64]| median(v).unwrap_or(f64::NAN);
-    json!({
-        "depth_start": depth,
-        "tokens_timed": readings.len(),
-        "step_wall_ms": summary(&col(&|r| r.wall_ms)),
-        "step_gpu_event_ms": summary(&whole),
-        "idle_gap_ms_median": m(&col(&|r| r.wall_ms - r.whole_ms)),
-        "embed_ms": summary(&embed),
-        "tail_ms (final norm, head, argmax, advance)": summary(&tail),
-        "gdn_layers_ms_scaled_to_30 (mixer + moe)": summary(&gdn),
-        "full_attention_layers_ms_scaled_to_10 (mixer + moe)": summary(&full),
-        "marked_sum_over_whole_token": summary(&sum_over_whole),
-        "median_shares_of_gpu_event": {
-            "embed": m(&embed) / m(&whole), "tail": m(&tail) / m(&whole),
-            "gdn_layers": m(&gdn) / m(&whole), "full_attention_layers": m(&full) / m(&whole),
-        },
-        "groups": groups,
-        "raw_step_wall_ms": col(&|r| r.wall_ms),
-        "raw_gpu_event_ms": whole,
-    })
-}
 
 #[test]
 #[ignore = "the 3090, held exclusively (21 GiB lease): loads the real 4.00 bpw pack; a measurement, one future window"]
@@ -410,43 +337,6 @@ fn picks_by_layer(tap: Vec<(usize, Vec<i32>)>, layers: usize) -> Vec<Vec<Vec<i32
     picks
 }
 
-fn union_json(picks: &[Vec<Vec<i32>>]) -> Value {
-    let mut per_k = Map::new();
-    for k in std::iter::once(1).chain(UNION_WINDOWS) {
-        let mut all: Vec<f64> = Vec::new();
-        let mut layers = Vec::new();
-        for (layer, tokens) in picks.iter().enumerate() {
-            let sizes: Vec<f64> = union_sizes(tokens, k)
-                .unwrap_or_else(|e| panic!("layer {layer} K {k}: {e}"))
-                .into_iter()
-                .map(|n| n as f64)
-                .collect();
-            layers.push(json!({
-                "layer": layer,
-                "windows": sizes.len(),
-                "mean": mean(&sizes),
-                "p90": percentile(&sizes, 90.0),
-            }));
-            all.extend(sizes);
-        }
-        let top_k = picks[0][0].len() as f64;
-        per_k.insert(
-            k.to_string(),
-            json!({
-                "windows_total": all.len(),
-                "mean": mean(&all),
-                "p90": percentile(&all, 90.0),
-                "mean_per_layer_p90": mean(
-                    &layers.iter().filter_map(|l| l["p90"].as_f64()).collect::<Vec<_>>()
-                ),
-                "mean_over_k_times_top_k": mean(&all).map(|m| m / (k as f64 * top_k)),
-                "per_layer": layers,
-            }),
-        );
-    }
-    Value::Object(per_k)
-}
-
 #[test]
 #[ignore = "the 3090, held exclusively (21 GiB lease): loads the real 4.00 bpw pack; a measurement, one future window"]
 fn krow_union_record() {
@@ -532,7 +422,7 @@ fn krow_union_record() {
         ctx,
         stream: &stream,
     };
-    let ks = [1usize, 2, 4, 8];
+    let ks = [1usize, 2, 3, 4, 8];
     let mut chain_cells = Vec::new();
     for &layer in &chain_layers {
         let weights =
@@ -626,10 +516,12 @@ fn krow_union_record() {
             "routing_text": "teacher forced from the pinned text after a chunk-prefilled prefix; the routing is that of real text",
             "chain": "routed_on_device (gate/up indexed launch, swiglu, down indexed launch) once per row, K times back to back in one captured graph, ids written per window outside the event pair, L2 flushed before the start event; the control gives every row 8 experts no other row picks",
             "prefix_rows": prefix, "decoded_tokens": done,
+            "caveat": UNION_CAVEAT,
         },
         "single_row_launches": launches.describe(),
         "kernel_check": format!("{kernel_check:?}"),
         "union": union,
+        "caveat": UNION_CAVEAT,
         "chains": chain_cells,
         "wall_s": started.elapsed().as_secs_f64(),
     });

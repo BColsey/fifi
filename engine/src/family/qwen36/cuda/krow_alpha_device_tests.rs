@@ -67,7 +67,9 @@ use super::{
     resources::GlobalNames,
 };
 use crate::family::speculate::krow_measure::{
-    Inputs, ROWS, alpha, f32_bytes, first_word_difference, rotated, weighted_alpha,
+    ALLOWED_VARS, Inputs, REFUSED_EXACT, REFUSED_PREFIXES, ROWS, SEP_CODE_OFFSET, alpha,
+    check_default_path, f32_bytes, first_word_difference, receipt_marker_bytes, rotated,
+    weighted_alpha,
 };
 use crate::{
     EngError,
@@ -192,26 +194,17 @@ const FLUSH_BYTES: usize = 128 << 20;
 // Guards, identity and the timing primitives shared with `krow_step_device_tests`.
 // ---------------------------------------------------------------------------------------------
 
-/// Refuses to run unless the process is on the default path: no `FIFI_EXL3_*` switch except the
-/// checkpoint (so the single-row kernel is the registered `wide1`, the shared expert is not inside
-/// the routed launches, no gather, dp4a or indexed-pair option is on), no per-op sync, no phase
-/// switch of another bench.
+/// Refuses to run unless the process is on the default path: none of the kernel, numerics or
+/// diagnostic switches of `krow_measure::REFUSED_PREFIXES` / `REFUSED_EXACT` is set (the single-row
+/// kernel is then the registered `wide1`, the shared expert is not inside the routed launches, and
+/// no gather, dp4a, indexed-pair, GDN input-projection fusion, sparse attention, KV8 variant,
+/// device shortlist, Q36 ablation or per-op sync option is on). Only `krow_measure::ALLOWED_VARS`
+/// may stay set.
 pub(super) fn refuse_switches() {
-    let set: Vec<String> = std::env::vars()
-        .map(|(name, _)| name)
-        .filter(|name| {
-            (name.starts_with("FIFI_EXL3_") && name != "FIFI_EXL3_CHECKPOINT")
-                || name == "INFERENCE_CUDA_SYNC_EACH"
-                || name == "FIFI_GRAPH_BENCH_PHASES"
-        })
-        .collect();
-    assert!(
-        set.is_empty(),
-        "the measurement runs the default path; these switches are set and must be unset: {set:?}"
-    );
-    match shared_in_routed_explicit() {
-        Ok(false) => {}
-        other => panic!("FIFI_EXL3_SHARED_IN_ROUTED must be off for the measurement: {other:?}"),
+    let names = std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned());
+    let shared = shared_in_routed_explicit().map_err(|e| format!("{e:?}"));
+    if let Err(reasons) = check_default_path(names, shared) {
+        panic!("the measurement runs the default path: {reasons}");
     }
 }
 
@@ -240,7 +233,13 @@ pub(super) fn identity(kv_mode: &str, capture: bool, kernel: &str) -> Value {
         );
     }
     let exe = std::env::current_exe().expect("current_exe");
-    let mut switches: Vec<(String, String)> = std::env::vars()
+    let mut switches: Vec<(String, String)> = std::env::vars_os()
+        .map(|(n, v)| {
+            (
+                n.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
         .filter(|(name, _)| {
             ["FIFI_", "Q36_", "INFERENCE_CUDA_", "INFERENCE_QWEN36_"]
                 .iter()
@@ -260,6 +259,9 @@ pub(super) fn identity(kv_mode: &str, capture: bool, kernel: &str) -> Value {
             "env": std::env::var("FIFI_EXL3_SHARED_IN_ROUTED").ok(),
             "effective": shared_in_routed_explicit().unwrap_or(true),
         },
+        "refused_prefixes": REFUSED_PREFIXES,
+        "refused_exact": REFUSED_EXACT,
+        "allowed_vars": ALLOWED_VARS,
         "switches": Value::Object(
             switches.into_iter().map(|(name, value)| (name, Value::String(value))).collect()
         ),
@@ -705,6 +707,56 @@ impl Op {
         })
     }
 
+    /// Writes 0xff over the rotated-input and partial scratch, so a byte a launch did not write is
+    /// visible afterwards.
+    fn poison_scratch(&self, env: &Env<'_>) -> Result<(), EngError> {
+        for buffer in [self.xh.as_ref(), self.z.as_ref()].into_iter().flatten() {
+            buffer.write_at(env.stream, 0, &vec![0xff; buffer.bytes()])?;
+        }
+        Ok(())
+    }
+
+    /// The buffers (name, first byte offset) in which a byte past the `rows` real rows of the last
+    /// launch into output A was written: the main output, and for an EXL3 matrix the rotated input
+    /// and the partials. Empty when the padded rows of the rows kernel left everything untouched.
+    fn written_past_the_rows(
+        &self,
+        env: &Env<'_>,
+        mi: usize,
+        rows: usize,
+    ) -> Result<Vec<(&'static str, usize)>, EngError> {
+        let untouched = |bytes: &[u8], from: usize| {
+            bytes[from..]
+                .iter()
+                .position(|b| *b != 0xff)
+                .map(|at| from + at)
+        };
+        let mut found = Vec::new();
+        let out = &self.out[Which::A.at()];
+        let whole = self.read(env, out, out.bytes())?;
+        let used = match &self.kind {
+            Kind::Dense(v) => rows * v[mi].shape[1] * F32,
+            Kind::Pair(v) => rows * 2 * v[mi].0.shape[1] * F32,
+            Kind::Plain { n_expert, .. } => rows * n_expert * F32,
+            Kind::Router { n_expert, .. } => rows * (n_expert + 1) * F32,
+        };
+        if let Some(at) = untouched(&whole, used) {
+            found.push(("out", at));
+        }
+        if let (Kind::Dense(v), Some(xh), Some(z)) = (&self.kind, &self.xh, &self.z) {
+            let [k, n] = v[mi].shape;
+            let xh_bytes = self.read(env, xh, xh.bytes())?;
+            if let Some(at) = untouched(&xh_bytes, rows * k * F32) {
+                found.push(("xh", at));
+            }
+            let z_bytes = self.read(env, z, z.bytes())?;
+            if let Some(at) = untouched(&z_bytes, rows * n * F32) {
+                found.push(("z", at));
+            }
+        }
+        Ok(found)
+    }
+
     /// The bitwise check of this role at `rows` rows: the R-row launch against R single-row
     /// launches, for every layer, on the inputs of `seed`. Returns the number of comparisons and
     /// the mismatches (each a JSON object).
@@ -721,10 +773,22 @@ impl Op {
             let layer = self.layers.get(mi).copied();
             self.poison(env, Which::A)?;
             self.poison(env, Which::B)?;
+            self.poison_scratch(env)?;
             self.flag.write_at(env.stream, 0, &[0u8; F32])?;
             self.launch_matrix(env, mi, (0, rows), Which::A)?;
             env.stream.synchronize()?;
             let flag_rows = self.read(env, &self.flag, F32)?;
+            // The rows kernel of the next instantiation (R = 3 rides rows<4>, R = 5..7 rides rows<8>)
+            // pads the missing rows: they read zeros (`x[row] = row < a.rows ? xh[..] : 0`) and the
+            // output store is guarded by `row < a.rows`. Nothing may be written past the real rows.
+            for (name, offset) in self.written_past_the_rows(env, mi, rows)? {
+                mismatches.push(json!({
+                    "role": self.label, "layer": layer, "rows": rows, "seed": seed,
+                    "output": format!("{name}: bytes past the {rows} real rows were written"),
+                    "byte_offset": offset,
+                }));
+            }
+            comparisons += 1;
             self.flag.write_at(env.stream, 0, &[0u8; F32])?;
             for row in 0..rows {
                 self.launch_matrix(env, mi, (row, 1), Which::B)?;
@@ -1002,6 +1066,68 @@ fn family_json(ops: &[Op], configs: &[Config], members: &[usize], how: How) -> V
     Value::Object(out)
 }
 
+/// The run-time receipt of which kernel each (op, rows) launches: for every op and every R, one
+/// eager launch of layer 0's matrix, after a device-to-device marker copy whose size encodes the
+/// (op, R) (`receipt_marker_bytes`). Run under `nsys profile` (tools/nsys_receipt_leg.sh), the
+/// kernels between two markers are the kernels of that launch, and `tools/reduce_receipt.py` turns
+/// them into names per op and R. A final marker closes the last launch. No timing is taken.
+fn receipt_pass(env: &Env<'_>, ops: &[Op], kernel: &str) {
+    let from = env.ctx.allocate(1 << 20).expect("marker source");
+    let to = env.ctx.allocate(1 << 20).expect("marker destination");
+    let marker = |bytes: usize| {
+        env.ctx
+            .copy_device(
+                env.stream,
+                from.range(0, bytes).expect("range"),
+                to.range(0, bytes).expect("range"),
+            )
+            .expect("marker copy");
+        env.stream.synchronize().expect("sync");
+    };
+    for (index, op) in ops.iter().enumerate() {
+        op.fill(env, 7).expect("fill");
+        for &rows in &ROWS {
+            // One batched launch of R rows.
+            marker(receipt_marker_bytes(index, rows));
+            op.launch_matrix(env, 0, (0, rows), Which::A)
+                .unwrap_or_else(|e| panic!("receipt launch {} R {rows}: {e:?}", op.label));
+            env.stream.synchronize().expect("sync");
+            // R separate single-row launches: the repeated execution the batched one replaces.
+            if rows > 1 {
+                marker(receipt_marker_bytes(index, SEP_CODE_OFFSET + rows));
+                for row in 0..rows {
+                    op.launch_matrix(env, 0, (row, 1), Which::A)
+                        .unwrap_or_else(|e| panic!("receipt sep {} R {rows}: {e:?}", op.label));
+                }
+                env.stream.synchronize().expect("sync");
+            }
+        }
+    }
+    marker(receipt_marker_bytes(ops.len(), 1));
+    let kinds: Vec<Value> = ops
+        .iter()
+        .map(|op| {
+            let kind = match op.kind {
+                Kind::Dense(_) => "dense",
+                Kind::Pair(_) => "pair",
+                Kind::Plain { .. } => "plain",
+                Kind::Router { .. } => "router",
+            };
+            json!({"label": op.label, "kind": kind})
+        })
+        .collect();
+    let record = json!({
+        "schema": 1,
+        "kind": "krow_receipt",
+        "identity": identity("n/a (no KV in this test)", false, kernel),
+        "ops": kinds,
+        "rows": ROWS,
+        "sep_code_offset": SEP_CODE_OFFSET,
+        "marker": "device-to-device copy of 4096 * (op + 1) + 16 * code bytes before each launch group, code = rows for one batched launch of that many rows and 16 + rows for that many separate single-row launches; the last marker has op = ops.len(); layer 0 of the op",
+    });
+    emit(&record);
+}
+
 #[test]
 #[ignore = "the 3090, held exclusively: loads the whole 4.00 bpw pack; run by name"]
 fn krow_alpha_record() {
@@ -1166,6 +1292,7 @@ fn krow_alpha_record() {
     let mut with_pair = by_family(&[Family::Dense], &["shared_gate", "shared_up"]);
     with_pair.extend(by_family(&[Family::SharedPair], &[]));
     let plain = by_family(&[Family::Plain], &[]);
+    let router = by_family(&[Family::Router], &[]);
     let families = json!({
         "dense": family_json(&ops, &configs, &dense, How::Rows),
         "dense_sep": family_json(&ops, &configs, &dense, How::Sep),
@@ -1173,6 +1300,9 @@ fn krow_alpha_record() {
         "dense_no_head": family_json(&ops, &configs, &dense_no_head, How::Rows),
         "dense_with_shared_pair": family_json(&ops, &configs, &with_pair, How::Rows),
         "plain_gemv": family_json(&ops, &configs, &plain, How::Rows),
+        "plain_gemv_chunk4": family_json(&ops, &configs, &plain, How::Chunk4),
+        "moe_router": family_json(&ops, &configs, &router, How::Rows),
+        "moe_router_chunk4": family_json(&ops, &configs, &router, How::Chunk4),
     });
     let kernel = loaded.kernel;
     let mut record = json!({
@@ -1180,10 +1310,12 @@ fn krow_alpha_record() {
         "kind": "krow_alpha",
         "identity": identity("n/a (no KV in this test)", false, kernel),
         "method": {
-            "timing": "CUDA event pair around one replay of a graph of one whole-token sweep; L2 flushed by a 128 MiB device copy before the start event; medians of the warm rounds",
-            "rows": "R >= 2 rows through exl3_linear (the rows kernel under wide1); R = 1 is the production wide1 body",
+            "timing": "CUDA event pair around one replay of a graph of one whole-token sweep; L2 flushed by a 128 MiB device copy before the start event (the 0.35 ms flush hides the host cost of cudaGraphLaunch, which holds for graphs of 30 to about 1000 nodes); medians of the warm rounds",
+            "headline_family": "dense_with_shared_pair is the step-faithful dense family (the production block launches the shared gate and up as one grouped pair); dense counts them as two separate launches",
+            "rows": "R >= 2 rows through exl3_linear: for the EXL3 matrices grouped_project_rows<2|4|8> under wide1 (R = 3 rides <4>, R = 6 rides <8>; receipted by the nsys pass of FIFI_KROW_RECEIPT=1), R = 1 is the production wide1 body (grouped_project_small_wide<1>). The router and the plain GEMVs are NOT a rows kernel: m = 2..7 is the router decode kernel (m-grid), m = 8 the tiled kernel, which the design avoids by 4-row chunking, so use their chunk4 figure at 8",
+            "padded_rows": "native/resident/exl3.cu at the base: the dispatch on the largest group row count (1467-1477) runs grouped_project_small_wide<1> for 1 row, grouped_project_rows<2> for 2, <4> for 3 and 4, <8> for 5 to 8, so R = 3 launches the <4> instantiation and R = 6 the <8> one. The missing rows read x = 0 (line 1109, x[row] = row < a.rows ? xh[..] : 0) and are never stored (line 1170, if (row < R && row < a.rows)); every row has its own sums[row][col] and partial[w][row][col], so a padded row cannot change rows 0..R-1. Checked here per role, layer and seed: the bytes of out, xh and z past the real rows stay untouched (0xff) and rows 0..R-1 equal the single-row launches bit for bit. The instantiation and the launch count per R come from the nsys receipt (receipt_kernels), not from this reading of the code",
             "sep": "R single-row launches per layer back to back",
-            "chunk4": "R = 8 as two 4-row launches per layer",
+            "chunk4": "R = 8 as two 4-row launches per layer (the configuration the design runs for the router and beta/alpha)",
             "rounds": rounds, "warm_from": warm_from, "rounds_completed": completed,
         },
         "single_row_launches": counts.describe(),
@@ -1234,5 +1366,5 @@ fn the_role_table_lists_the_shared_expert_matrices_separately() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), labels.len(), "labels are unique");
-    assert_eq!(ROWS, [1, 2, 4, 8]);
+    assert_eq!(ROWS, [1, 2, 3, 4, 6, 8]);
 }
