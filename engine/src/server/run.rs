@@ -595,9 +595,11 @@ const BOOT_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// never resolves for a server with no engines (which `Config` rejects; the guard is defensive).
 /// The watch samples every `BOOT_WATCH_INTERVAL`: an engine that is Ready for less than one
 /// sample and then fails natively is not seen as live. That needs a job queued during the
-/// load, and the cost is only an early exit of a server that was never useful. The engine threads load in the background
-/// after the listener is bound, so without this watch a refused load (for example
-/// "cuda admission") leaves a process that is up and never ready.
+/// load, and the cost is only an early exit of a server that was never useful.
+///
+/// The engine threads load in the background after the listener is bound, so without this
+/// watch a refused load (for example "cuda admission") leaves a process that is up and never
+/// ready.
 async fn boot_failed(handles: Vec<crate::sched::worker::EngineHandle>) {
     use crate::sched::worker::EngineState;
     if handles.is_empty() {
@@ -1627,7 +1629,9 @@ mod tests {
         let (engine, gate) = testkit::gated_failing_engine();
         let entries = vec![testkit::entry("e1", "model-a", &engine, 4_096)];
         let task = serve_without_signal(entries).await;
-        tokio::time::sleep(super::BOOT_WATCH_INTERVAL * 3).await;
+        // A fixed wall-clock wait, not a multiple of the interval: a watch whose interval grew
+        // would otherwise stretch the wait with it and the bound below would never catch it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !task.is_finished(),
             "the server stopped while the engine was loading"

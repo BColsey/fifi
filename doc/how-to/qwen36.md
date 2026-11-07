@@ -102,7 +102,8 @@ The Mac profile leaves it off. To turn it on there, set `"prefix_reuse": true` a
 
 The server starts listening before the model loads.
 If every engine fails to load, the server stops by itself within a second or so.
-The process exits with a non-zero code and prints the cause on standard error, and the server log has the same line.
+The process exits with a non-zero code and prints the cause on standard error.
+Standard error carries two lines: `engine q36 failed: ...` from the engine thread when the load fails, and `enginesrv: engine q36 ended in state error: ...` from the main program as it exits.
 Scripts that wait for `/ready` should also watch the process: it is gone when loading failed.
 With more than one engine, the server keeps running while at least one engine is ready or busy; `/ready` stays `200`, and `/v1/models` shows the failed engine with its error.
 
