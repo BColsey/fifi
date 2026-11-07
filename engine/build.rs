@@ -201,6 +201,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/embed_bf16.h",
     "src/kernels/cuda/native/resident/embed_q8.h",
     "src/kernels/cuda/native/resident/exl3.h",
+    "src/kernels/cuda/native/resident/exl3_rotate_pair.h",
     "src/kernels/cuda/native/resident/exl3_rotate_wide.h",
     "src/kernels/cuda/native/resident/gdn_conv.h",
     "src/kernels/cuda/native/resident/gdn_delta.h",

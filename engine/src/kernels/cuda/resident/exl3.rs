@@ -49,20 +49,50 @@ pub(crate) const SINGLE_GATHER_VAR: &str = "FIFI_EXL3_SINGLE_GATHER";
 /// fallback. Process-wide, read once: a change after the first job-table call is ignored.
 pub(crate) const JOBS_WARP_ROTATE_VAR: &str = "FIFI_EXL3_JOBS_WARP_ROTATE";
 
-/// Parses [`JOBS_WARP_ROTATE_VAR`]: unset and `0` are off, `1` is on.
-pub(crate) fn jobs_warp_rotate_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+/// Opt-in switch of the combined gate and up input rotation of the routed experts: unset or `0`
+/// rotates the rows once for each of the two projections, `1` rotates them once for both. Same
+/// bytes. It needs the aligned buffers of the warp-wide kernel; a call that does not meet them runs
+/// the two projections one after the other. Every other value is refused. Process-wide, read
+/// once.
+pub(crate) const JOBS_PAIR_ROTATE_VAR: &str = "FIFI_EXL3_JOBS_PAIR_ROTATE";
+
+/// Parses a switch that is unset or `0` for off and `1` for on, naming `var` in the refusal.
+fn zero_one_from_env(var: &str, value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
     match value.map(|text| text.to_str()) {
         None | Some(Some("0")) => Ok(false),
         Some(Some("1")) => Ok(true),
-        _ => Err(format!("{JOBS_WARP_ROTATE_VAR} must be unset, \"0\" or \"1\"")),
+        _ => Err(format!("{var} must be unset, \"0\" or \"1\"")),
     }
+}
+
+/// Parses [`JOBS_WARP_ROTATE_VAR`]: unset and `0` are off, `1` is on.
+pub(crate) fn jobs_warp_rotate_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    zero_one_from_env(JOBS_WARP_ROTATE_VAR, value)
+}
+
+/// Parses [`JOBS_PAIR_ROTATE_VAR`]: unset and `0` are off, `1` is on.
+pub(crate) fn jobs_pair_rotate_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    zero_one_from_env(JOBS_PAIR_ROTATE_VAR, value)
+}
+
+/// The pair switch of the environment, or the refusal of a bad value. Read once per process.
+fn jobs_pair_rotate_setting() -> Result<bool, EngError> {
+    static SETTING: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    SETTING
+        .get_or_init(|| {
+            jobs_pair_rotate_from_env(std::env::var_os(JOBS_PAIR_ROTATE_VAR).as_deref())
+        })
+        .clone()
+        .map_err(EngError::BadRequest)
 }
 
 /// The switch of the environment, or the refusal of a bad value. Read once per process.
 fn jobs_warp_rotate_setting() -> Result<bool, EngError> {
     static SETTING: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
     SETTING
-        .get_or_init(|| jobs_warp_rotate_from_env(std::env::var_os(JOBS_WARP_ROTATE_VAR).as_deref()))
+        .get_or_init(|| {
+            jobs_warp_rotate_from_env(std::env::var_os(JOBS_WARP_ROTATE_VAR).as_deref())
+        })
         .clone()
         .map_err(EngError::BadRequest)
 }
@@ -467,10 +497,11 @@ impl CudaContext {
     }
 
     /// Refuses a bad value of an EXL3 launch switch (`FIFI_EXL3_SINGLE_GATHER`, [`DP4A_VAR`],
-    /// [`INDEXED_PAIRS_VAR`], [`JOBS_WARP_ROTATE_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
+    /// [`INDEXED_PAIRS_VAR`], [`JOBS_WARP_ROTATE_VAR`], [`JOBS_PAIR_ROTATE_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
     /// session start calls it.
     pub(crate) fn check_single_gather(&self) -> Result<(), EngError> {
         jobs_warp_rotate_setting()?;
+        jobs_pair_rotate_setting()?;
         check_indexed_with(self.single_row_setting()?, self.exl3_indexed_options()?)
     }
 
@@ -753,7 +784,9 @@ impl CudaContext {
         call: Exl3JobsCall<'_>,
         mutant: i32,
     ) -> Result<(), EngError> {
-        self.exl3_jobs_with(stream, call, |s, raw| ffi::jobs_rotate_mutant(s, raw, mutant))
+        self.exl3_jobs_with(stream, call, |s, raw| {
+            ffi::jobs_rotate_mutant(s, raw, mutant)
+        })
     }
 
     fn exl3_jobs_with(
@@ -762,8 +795,18 @@ impl CudaContext {
         call: Exl3JobsCall<'_>,
         launch: impl FnOnce(&RawStream, &ffi::JobsRaw<'_>) -> Result<(), DeviceFailure>,
     ) -> Result<(), EngError> {
+        let (raw, _) = self.checked_jobs(&call)?;
+        self.launch_on(stream, |s| launch(s, &raw))
+    }
+
+    /// The raw view of `call` once its ranges are proved to fit the extents of the call and
+    /// the written ranges to be apart from the others, with the bytes each range needs.
+    fn checked_jobs<'c>(
+        &'c self,
+        call: &Exl3JobsCall<'c>,
+    ) -> Result<(ffi::JobsRaw<'c>, [usize; 9]), EngError> {
         self.ensure_usable()?;
-        let raw = self.jobs_raw(&call)?;
+        let raw = self.jobs_raw(call)?;
         let needs = ffi::jobs_extents(&raw.shape()).ok_or_else(|| {
             EngError::BadRequest("EXL3 jobs: invalid geometry, bank strides or limits".into())
         })?;
@@ -778,17 +821,7 @@ impl CudaContext {
             &call.out,
             &call.flag,
         ];
-        let names = [
-            "EXL3 trellis",
-            "EXL3 suh",
-            "EXL3 svh",
-            "EXL3 jobs",
-            "EXL3 x",
-            "EXL3 xh",
-            "EXL3 z",
-            "EXL3 out",
-            "EXL3 flag",
-        ];
+        let names = JOBS_RANGE_NAMES;
         for (i, range) in ranges.iter().enumerate() {
             require_fit(names[i], range, needs[i], if i == 0 { 2 } else { 4 })?;
             for (j, other) in ranges[..i].iter().enumerate() {
@@ -816,8 +849,138 @@ impl CudaContext {
                 )?;
             }
         }
-        self.launch_on(stream, |s| launch(s, &raw))
+        Ok((raw, needs))
     }
+
+    /// The gate and up projections of the routed experts: two calls over the same rows and table
+    /// with their own scales and rotated-row buffers. With the pair switch on and both calls
+    /// aligned for the warp-wide kernel, the rows are read and rotated once for both, then each
+    /// call projects; otherwise the two calls run one after the other. The bytes are the same.
+    pub(crate) fn exl3_jobs_pair(
+        &self,
+        stream: &DeviceStream,
+        calls: (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
+    ) -> Result<(), EngError> {
+        self.exl3_jobs_pair_mode(stream, calls, (jobs_pair_rotate_setting()?, None))
+    }
+
+    /// Whether the pair switch is on; a bad value of the variable is refused.
+    pub(crate) fn exl3_jobs_pair_enabled(&self) -> Result<bool, EngError> {
+        jobs_pair_rotate_setting()
+    }
+
+    /// [`Self::exl3_jobs_pair`] with the switch and the fused-output request given (`None` is the
+    /// environment's), for the device tests.
+    pub(crate) fn exl3_jobs_pair_mode(
+        &self,
+        stream: &DeviceStream,
+        (first, second): (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
+        (pair, fused_out): (bool, Option<bool>),
+    ) -> Result<(), EngError> {
+        if !pair || !self.pair_usable(&first, &second)? {
+            jobs_warp_rotate_setting()?;
+            for call in [first, second] {
+                self.exl3_jobs_with(stream, call, |s, raw| match fused_out {
+                    Some(fused) => ffi::jobs_fused(s, raw, fused),
+                    None => ffi::jobs(s, raw),
+                })?;
+            }
+            return Ok(());
+        }
+        let ((ra, na), (rb, nb)) = (self.checked_jobs(&first)?, self.checked_jobs(&second)?);
+        require_pair_apart((&first, &na), (&second, &nb))?;
+        self.launch_on(stream, |s| {
+            ffi::jobs_rotate_pair(s, (&ra, &rb))?;
+            ffi::jobs_rotated(s, &ra, fused_out)?;
+            ffi::jobs_rotated(s, &rb, fused_out)
+        })
+    }
+
+    /// Whether the pair rotation accepts the two calls (`exl3.h`).
+    pub(crate) fn pair_usable(
+        &self,
+        first: &Exl3JobsCall<'_>,
+        second: &Exl3JobsCall<'_>,
+    ) -> Result<bool, EngError> {
+        let ((ra, _), (rb, _)) = (self.checked_jobs(first)?, self.checked_jobs(second)?);
+        ffi::jobs_pair_usable(&ra, &rb).map_err(|_| {
+            EngError::BadRequest("EXL3 jobs: the pair is refused by its checks".into())
+        })
+    }
+
+    /// The pair rotation alone, by the deliberately wrong variant `mutant` (1 or 2).
+    #[cfg(feature = "cuda-exl3-rotate-mutants")]
+    pub(crate) fn exl3_jobs_pair_mutant(
+        &self,
+        stream: &DeviceStream,
+        (first, second): (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
+        mutant: i32,
+    ) -> Result<(), EngError> {
+        let ((ra, na), (rb, nb)) = (self.checked_jobs(&first)?, self.checked_jobs(&second)?);
+        require_pair_apart((&first, &na), (&second, &nb))?;
+        self.launch_on(stream, |s| {
+            ffi::jobs_rotate_pair_mutant(s, (&ra, &rb), mutant)
+        })
+    }
+}
+
+const JOBS_RANGE_NAMES: [&str; 9] = [
+    "EXL3 trellis",
+    "EXL3 suh",
+    "EXL3 svh",
+    "EXL3 jobs",
+    "EXL3 x",
+    "EXL3 xh",
+    "EXL3 z",
+    "EXL3 out",
+    "EXL3 flag",
+];
+
+/// Every range a job-table call reads or writes with the bytes it needs, row lists included.
+fn jobs_claims<'a>(call: &Exl3JobsCall<'a>, needs: &[usize; 9]) -> Vec<Claim<'a>> {
+    let ranges = [
+        &call.trellis,
+        &call.suh,
+        &call.svh,
+        &call.jobs,
+        &call.x,
+        &call.xh,
+        &call.z,
+        &call.out,
+        &call.flag,
+    ];
+    let mut claims: Vec<Claim<'a>> = ranges
+        .into_iter()
+        .zip(JOBS_RANGE_NAMES)
+        .zip(needs)
+        .map(|((range, name), need)| Claim::of(name, range, *need))
+        .collect();
+    for (name, list) in [
+        ("EXL3 in rows", &call.in_rows),
+        ("EXL3 out rows", &call.out_rows),
+    ] {
+        if let Some(list) = list {
+            claims.push(Claim::of(name, list, call.total_rows * 4));
+        }
+    }
+    claims
+}
+
+/// The pair rotation writes both rotated-row ranges before either call projects, so each must be
+/// apart from every range of the other call as well as of its own (checked by the call itself).
+fn require_pair_apart(
+    (first, first_needs): (&Exl3JobsCall<'_>, &[usize; 9]),
+    (second, second_needs): (&Exl3JobsCall<'_>, &[usize; 9]),
+) -> Result<(), EngError> {
+    let first_xh = Claim::of(JOBS_RANGE_NAMES[5], &first.xh, first_needs[5]);
+    let second_xh = Claim::of(JOBS_RANGE_NAMES[5], &second.xh, second_needs[5]);
+    for other in jobs_claims(second, second_needs) {
+        require_apart(&first_xh, &other)?;
+    }
+    for other in jobs_claims(first, first_needs) {
+        require_apart(&second_xh, &other)?;
+    }
+    Ok(())
 }
 
 impl CudaContext {

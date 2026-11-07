@@ -43,7 +43,7 @@ use crate::{
         DeviceRange,
         prefill::swiglu_rows::SwigluRowsCall,
         resident::{
-            exl3::Exl3Job,
+            exl3::{Exl3Job, Exl3JobsCall},
             moe_combine::{CombineCall, CombineOut, SharedTerm},
         },
     },
@@ -251,6 +251,13 @@ struct Table<'a, 'b> {
     rows: usize,
 }
 
+/// The rotated-row and partial-sum ranges one routed projection works in.
+#[derive(Clone, Copy)]
+struct Scratch<'b> {
+    xh: DeviceRange<'b>,
+    z: DeviceRange<'b>,
+}
+
 /// One routed projection over every job: three launches whatever the number of experts.
 fn project_jobs(
     projector: &Projector<'_>,
@@ -260,11 +267,29 @@ fn project_jobs(
 ) -> Result<(), EngError> {
     #[cfg(test)]
     super::split::count("routed job-table projections");
+    let scratch = Scratch {
+        xh: bufs.expert_xh,
+        z: bufs.expert_z,
+    };
+    let launch = jobs_call(projector, scratch, table, call)?;
+    projector
+        .launch
+        .ctx
+        .exl3_jobs(projector.launch.stream, launch)
+}
+
+/// The job-table call of one routed projection, over the ranges of `scratch`.
+fn jobs_call<'b>(
+    projector: &Projector<'b>,
+    scratch: Scratch<'b>,
+    table: Table<'_, 'b>,
+    call: Routed<'b, 'b>,
+) -> Result<Exl3JobsCall<'b>, EngError> {
     let (out, out_ld, out_col) = call.out;
     let io = Exl3JobsIo {
         x: call.x,
-        xh: bufs.expert_xh,
-        z: bufs.expert_z,
+        xh: scratch.xh,
+        z: scratch.z,
         out,
         flag: projector.scratch.flag,
         jobs: table.range,
@@ -285,10 +310,38 @@ fn project_jobs(
     launch.out_rows = call.lists.output;
     launch.x_rows = call.lists.x_rows;
     launch.out_total_rows = call.lists.out_rows;
-    projector
-        .launch
-        .ctx
-        .exl3_jobs(projector.launch.stream, launch)
+    Ok(launch)
+}
+
+/// The scratch ranges of the gate and up projections when they rotate their input rows together:
+/// the first projection keeps its usual rotated-row range and the head of the partial-sum range
+/// (the projection needs `pairs * inter` values of it), the second takes its rotated rows from the
+/// unused tail of the partial-sum range, so the pair needs no buffer of its own. `None` when the
+/// tail is too small for `pairs` rows of `hidden` halves.
+fn paired_scratch<'b>(
+    bufs: &Bufs<'b>,
+    dims: &MoeDims,
+) -> Result<Option<(Scratch<'b>, Scratch<'b>)>, EngError> {
+    const F16: usize = 2;
+    const F32: usize = 4;
+    const ALIGN: usize = 256;
+    let pairs = dims.rows * dims.top_k;
+    let z_bytes = pairs * dims.inter * F32;
+    let tail = z_bytes.next_multiple_of(ALIGN);
+    let xh_bytes = pairs * dims.hidden * F16;
+    if tail + xh_bytes > bufs.expert_z.bytes() {
+        return Ok(None);
+    }
+    let z = window(bufs.expert_z, 0, z_bytes)?;
+    let first = Scratch {
+        xh: bufs.expert_xh,
+        z,
+    };
+    let second = Scratch {
+        xh: window(bufs.expert_z, tail, xh_bytes)?,
+        z,
+    };
+    Ok(Some((first, second)))
 }
 
 /// The routed experts: the sort, gate and up reading the chunk rows through a list, one SwiGLU,
@@ -317,14 +370,35 @@ fn routed(
         x_rows: m,
         out_rows: pairs,
     };
-    for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
-        let call = Routed {
-            bank,
-            x: bufs.x2,
-            out: (bufs.gu, 2 * i, half * i),
-            lists: listed,
-        };
-        project_jobs(projector, bufs, table, call)?;
+    let gate_up = |half: usize, bank| Routed {
+        bank,
+        x: bufs.x2,
+        out: (bufs.gu, 2 * i, half * i),
+        lists: listed,
+    };
+    // With the pair switch on, the rows are read and rotated once for both projections.
+    let paired = if projector.launch.ctx.exl3_jobs_pair_enabled()? {
+        paired_scratch(bufs, dims)?
+    } else {
+        None
+    };
+    if let Some((first, second)) = paired {
+        #[cfg(test)]
+        for _ in 0..2 {
+            super::split::count("routed job-table projections");
+        }
+        let calls = (
+            jobs_call(projector, first, table, gate_up(0, weights.gate))?,
+            jobs_call(projector, second, table, gate_up(1, weights.up))?,
+        );
+        projector
+            .launch
+            .ctx
+            .exl3_jobs_pair(projector.launch.stream, calls)?;
+    } else {
+        for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
+            project_jobs(projector, bufs, table, gate_up(half, bank))?;
+        }
     }
     super::split::mark(projector.launch.stream, "routed gate/up");
     projector.launch.ctx.swiglu_rows(

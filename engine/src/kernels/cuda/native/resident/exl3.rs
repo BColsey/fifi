@@ -787,6 +787,30 @@ unsafe extern "C" {
         wide_input: c_int,
     ) -> c_int;
     fn inference_cuda_exl3_jobs_wide_input_kernel(args: *const JobsArgs, enabled: c_int) -> c_int;
+    fn inference_cuda_exl3_jobs_rotated(
+        args: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        fused_out: c_int,
+    ) -> c_int;
+    fn inference_cuda_exl3_jobs_rotate_pair(
+        first: *const JobsArgs,
+        second: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+    fn inference_cuda_exl3_jobs_pair_usable(
+        first: *const JobsArgs,
+        second: *const JobsArgs,
+    ) -> c_int;
+    #[cfg(feature = "cuda-exl3-rotate-mutants")]
+    fn inference_cuda_exl3_jobs_rotate_pair_mutant(
+        first: *const JobsArgs,
+        second: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        mutant: c_int,
+    ) -> c_int;
     #[cfg(test)]
     fn inference_cuda_exl3_jobs_wide_input_setting(text: *const std::ffi::c_char) -> c_int;
     #[cfg(feature = "cuda-exl3-rotate-mutants")]
@@ -1096,6 +1120,74 @@ pub(in crate::kernels::cuda) fn jobs_wide_input_usable(
         1 => Ok(true),
         _ => Err(invalid_argument()),
     }
+}
+
+/// The projection and output rotation of a call whose `xh` already holds the rotated rows;
+/// `fused_out` is the fused output rotation request, `None` for the environment's.
+pub(in crate::kernels::cuda) fn jobs_rotated(
+    stream: &RawStream,
+    call: &JobsRaw<'_>,
+    fused_out: Option<bool>,
+) -> Result<(), DeviceFailure> {
+    let args = jobs_args(call)?;
+    let mut stage = STAGE_NONE;
+    let request = fused_out.map_or(-1, c_int::from);
+    // SAFETY: the same checked argument block as jobs; the entry skips the input rotation and
+    // reads the rows of xh that the pair rotation of the same stream wrote.
+    let status =
+        unsafe { inference_cuda_exl3_jobs_rotated(&args, stream.as_ptr(), &mut stage, request) };
+    checked(status, stage)
+}
+
+/// The input rotation of two calls that read the same rows, in one pass (`exl3.h`).
+pub(in crate::kernels::cuda) fn jobs_rotate_pair(
+    stream: &RawStream,
+    (first, second): (&JobsRaw<'_>, &JobsRaw<'_>),
+) -> Result<(), DeviceFailure> {
+    let (first, second) = (jobs_args(first)?, jobs_args(second)?);
+    let mut stage = STAGE_NONE;
+    // SAFETY: two checked argument blocks; the entry refuses calls that are not consistent or
+    // aligned, and writes only the two xh ranges and the shared flag.
+    let status = unsafe {
+        inference_cuda_exl3_jobs_rotate_pair(&first, &second, stream.as_ptr(), &mut stage)
+    };
+    checked(status, stage)
+}
+
+/// Whether the pair rotation accepts the two calls (`exl3.h`).
+pub(in crate::kernels::cuda) fn jobs_pair_usable(
+    first: &JobsRaw<'_>,
+    second: &JobsRaw<'_>,
+) -> Result<bool, DeviceFailure> {
+    let (first, second) = (jobs_args(first)?, jobs_args(second)?);
+    // SAFETY: two checked argument blocks; the entry only reads their integers and pointer values.
+    match unsafe { inference_cuda_exl3_jobs_pair_usable(&first, &second) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_argument()),
+    }
+}
+
+/// The pair rotation by the deliberately wrong variant `mutant` (1 or 2).
+#[cfg(feature = "cuda-exl3-rotate-mutants")]
+pub(in crate::kernels::cuda) fn jobs_rotate_pair_mutant(
+    stream: &RawStream,
+    (first, second): (&JobsRaw<'_>, &JobsRaw<'_>),
+    mutant: i32,
+) -> Result<(), DeviceFailure> {
+    let (first, second) = (jobs_args(first)?, jobs_args(second)?);
+    let mut stage = STAGE_NONE;
+    // SAFETY: as jobs_rotate_pair; the variant only changes which values land where.
+    let status = unsafe {
+        inference_cuda_exl3_jobs_rotate_pair_mutant(
+            &first,
+            &second,
+            stream.as_ptr(),
+            &mut stage,
+            mutant,
+        )
+    };
+    checked(status, stage)
 }
 
 /// The input rotation alone, by the deliberately wrong variant `mutant` (1 to 5).
@@ -1492,16 +1584,17 @@ mod tests {
     #[test]
     fn the_warp_rotation_is_chosen_by_request_and_alignment() {
         // The decision reads pointer values and integers only, so the block needs no device.
-        let usable = |x: usize, suh: usize, xh: usize, members: usize, stride: usize, enabled: c_int| {
-            let args = JobsArgs {
-                x: x as *const f32,
-                suh: suh as *const f32,
-                scale_stride: stride,
-                ..selector_args(xh, 0x20_0000, 4096, members, 2048)
+        let usable =
+            |x: usize, suh: usize, xh: usize, members: usize, stride: usize, enabled: c_int| {
+                let args = JobsArgs {
+                    x: x as *const f32,
+                    suh: suh as *const f32,
+                    scale_stride: stride,
+                    ..selector_args(xh, 0x20_0000, 4096, members, 2048)
+                };
+                // SAFETY: the entry reads the integers of the block; no pointer is dereferenced.
+                unsafe { inference_cuda_exl3_jobs_wide_input_kernel(&args, enabled) }
             };
-            // SAFETY: the entry reads the integers of the block; no pointer is dereferenced.
-            unsafe { inference_cuda_exl3_jobs_wide_input_kernel(&args, enabled) }
-        };
         assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 5, 2560, 1), 1);
         // Not requested.
         assert_eq!(usable(0x10_0000, 0x30_0000, 0x40_0000, 5, 2560, 0), 0);
@@ -1518,6 +1611,64 @@ mod tests {
         assert_eq!(
             // SAFETY: a null block is refused before any read.
             unsafe { inference_cuda_exl3_jobs_wide_input_kernel(std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn the_pair_rotation_needs_calls_that_share_their_rows_and_keep_their_outputs_apart() {
+        let block = |x: usize, xh: usize, rows: usize, k: usize, flag: usize| JobsArgs {
+            x: x as *const f32,
+            suh: 0x30_0000 as *const f32,
+            xh: xh as *mut u16,
+            xh_bytes: rows * k * 2,
+            flag: flag as *mut u32,
+            total_rows: rows,
+            max_rows: 64,
+            jobs_count: 3,
+            jobs: 0x50_0000 as *const _,
+            scale_stride: 2560,
+            x_rows: rows,
+            ..selector_args(xh, 0x20_0000, 4096, 5, k)
+        };
+        let usable = |a: &JobsArgs, b: &JobsArgs| {
+            // SAFETY: the entry reads the integers and pointer values of the blocks only.
+            unsafe { inference_cuda_exl3_jobs_pair_usable(a, b) }
+        };
+        let first = block(0x10_0000, 0x40_0000, 64, 2048, 0x60_0000);
+        let second = block(0x10_0000, 0x48_0000, 64, 2048, 0x60_0000);
+        assert_eq!(usable(&first, &second), 1);
+        // A different input buffer, row count, width, flag, or the same output buffer.
+        assert_eq!(
+            usable(&first, &block(0x11_0000, 0x48_0000, 64, 2048, 0x60_0000)),
+            0
+        );
+        assert_eq!(
+            usable(&first, &block(0x10_0000, 0x48_0000, 63, 2048, 0x60_0000)),
+            0
+        );
+        assert_eq!(
+            usable(&first, &block(0x10_0000, 0x48_0000, 64, 1024, 0x60_0000)),
+            0
+        );
+        assert_eq!(
+            usable(&first, &block(0x10_0000, 0x48_0000, 64, 2048, 0x60_0010)),
+            0
+        );
+        assert_eq!(usable(&first, &first), 0);
+        // Output ranges that overlap (the second starts inside the first's 256 KiB).
+        assert_eq!(
+            usable(&first, &block(0x10_0000, 0x42_0000, 64, 2048, 0x60_0000)),
+            0
+        );
+        // An output off an 8-byte boundary falls back to the separate calls.
+        assert_eq!(
+            usable(&first, &block(0x10_0000, 0x48_0004, 64, 2048, 0x60_0000)),
+            0
+        );
+        // SAFETY: a null block is refused before any read.
+        assert_eq!(
+            unsafe { inference_cuda_exl3_jobs_pair_usable(std::ptr::null(), &first) },
             -1
         );
     }

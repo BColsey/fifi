@@ -12,6 +12,8 @@ use super::{
     bank_of, packed_elements_of, rows_of, table, testkit,
 };
 
+mod pair;
+
 /// The scale of the butterfly, `rsqrtf(128.0f)` of the kernels, as the host reference needs it.
 const ROTATE_SCALE: f32 = f32::from_bits(0x3db5_04f3);
 
@@ -60,17 +62,7 @@ fn reference_row(x: &[f32], suh: &[f32], fuse: Fuse) -> (Vec<u16>, bool) {
             }
             step = 2;
         }
-        while step < 128 {
-            let before = v;
-            for e in 0..128 {
-                v[e] = if e & step != 0 {
-                    before[e ^ step] - before[e]
-                } else {
-                    before[e] + before[e ^ step]
-                };
-            }
-            step *= 2;
-        }
+        network_from(&mut v, step);
         for value in v {
             let scaled = value * ROTATE_SCALE;
             if scaled.is_finite() {
@@ -82,6 +74,52 @@ fn reference_row(x: &[f32], suh: &[f32], fuse: Fuse) -> (Vec<u16>, bool) {
         }
     }
     (bits, flagged)
+}
+
+/// The butterfly steps `first_step, 2 * first_step, .. 64` over one group, as the kernels run them:
+/// the element with the step's bit set computes `other - own`, the other `own + other`.
+fn network_from(v: &mut [f32; 128], first_step: usize) {
+    let mut step = first_step;
+    while step < 128 {
+        let before = *v;
+        for e in 0..128 {
+            v[e] = if e & step != 0 {
+                before[e ^ step] - before[e]
+            } else {
+                before[e] + before[e ^ step]
+            };
+        }
+        step *= 2;
+    }
+}
+
+/// The warp-wide layout on the host: lane `l` holds elements `4l..4l+4`; the steps at distance 1 and
+/// 2 run inside a lane, the steps at distance 4 to 64 are exchanges with lane `l ^ (step / 4)`, where
+/// the lane whose bit is set adds the negation of its own value to the partner's (a subtraction).
+fn warp_layout(group: &[f32; 128]) -> [f32; 128] {
+    let mut lanes: Vec<[f32; 4]> = group.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+    for lane in &mut lanes {
+        let [a, b, c, d] = *lane;
+        *lane = [a + b, a - b, c + d, c - d];
+        let [a, b, c, d] = *lane;
+        *lane = [a + c, b + d, a - c, b - d];
+    }
+    for bit in 0..5 {
+        let before = lanes.clone();
+        for (l, lane) in lanes.iter_mut().enumerate() {
+            for i in 0..4 {
+                let own = before[l][i];
+                let other = before[l ^ (1 << bit)][i];
+                let signed = if l & (1 << bit) != 0 { -own } else { own };
+                lane[i] = signed + other;
+            }
+        }
+    }
+    let mut out = [0.0f32; 128];
+    for (l, lane) in lanes.iter().enumerate() {
+        out[4 * l..4 * l + 4].copy_from_slice(lane);
+    }
+    out
 }
 
 /// A pair `(x0, x1)` whose products with `(s0, s1)` nearly cancel, so that fusing either product
@@ -207,7 +245,7 @@ fn awkward_rows(rng: &mut testkit::Rng, scales: &Scales) -> Vec<f32> {
                 8 => row
                     .iter_mut()
                     .for_each(|v| *v = 2.0f32.powi(rng.below(40) as i32 - 20)),
-                9 | 10 | 11 => {
+                9..=11 => {
                     row.fill(0.0);
                     if kind != 10 {
                         (row[0], row[1]) = trap_a;
@@ -484,13 +522,12 @@ fn warp_rotation_is_byte_identical_to_the_per_value_kernel_over_the_grid() {
             for case in &cases {
                 let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
                 let new = rotate(rig, &bank, case, (Path::Warp, false, (0, 0))).expect("new");
-                assert!(new.usable, "k={k} {}: the warp kernel must be taken", case.name);
-                assert_eq!(
-                    difference(&old, &new, false),
-                    None,
-                    "k={k} {}",
+                assert!(
+                    new.usable,
+                    "k={k} {}: the warp kernel must be taken",
                     case.name
                 );
+                assert_eq!(difference(&old, &new, false), None, "k={k} {}", case.name);
                 compared += 1;
             }
         }
@@ -550,7 +587,10 @@ fn the_per_value_kernel_matches_the_host_reference() {
     for k in [256, 2048] {
         let (bank, scales) = scaled_bank(&ctx, k, true, 0x5741_5253 + k as u64);
         let cases = suite(k, &scales, &mut rng);
-        let case = cases.iter().find(|case| case.awkward).expect("awkward case");
+        let case = cases
+            .iter()
+            .find(|case| case.awkward)
+            .expect("awkward case");
         let run = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("run");
         for (row, x) in case.x.chunks(k).enumerate() {
             let member = row / ROWS_PER_JOB;
@@ -591,6 +631,33 @@ fn the_trap_rows_separate_fused_from_separate_products() {
 }
 
 #[test]
+fn the_warp_layout_reproduces_the_butterfly_network_bit_for_bit() {
+    // Host only: the register steps, the lane exchanges and the negate-and-add of the upper partner
+    // give the bits of the element-wise network, including on cancelling and extreme values.
+    let mut rng = testkit::Rng::new(0x5741_5259);
+    for round in 0..2000 {
+        let mut group = [0.0f32; 128];
+        for (i, value) in group.iter_mut().enumerate() {
+            *value = match (round % 4, i % 7) {
+                (1, 0) => 0.0,
+                (1, 1) => -0.0,
+                (2, _) => (rng.normal() as f32) * 2.0f32.powi(rng.below(60) as i32 - 30),
+                (3, _) => (rng.below(9) as f32) - 4.0,
+                _ => rng.normal() as f32,
+            };
+        }
+        let mut want = group;
+        network_from(&mut want, 1);
+        let got = warp_layout(&group);
+        let same = want
+            .iter()
+            .zip(&got)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "round {round}");
+    }
+}
+
+#[test]
 fn the_host_reference_rotates_an_impulse_to_a_flat_row_of_the_scale() {
     // Row of zeros with one value: every output is +-value * scale, with the Hadamard sign.
     let mut x = [0.0f32; 128];
@@ -621,7 +688,12 @@ fn calls_the_warp_kernel_cannot_take_run_the_per_value_kernel_with_the_same_byte
     let cases = suite(k, &scales, &mut rng);
     let case = &cases[0];
     // x 4 bytes in, xh 4 bytes in: not taken. x 16 and xh 8 bytes in: taken.
-    for (shift, taken) in [((4, 0), false), ((0, 4), false), ((16, 8), true), ((32, 16), true)] {
+    for (shift, taken) in [
+        ((4, 0), false),
+        ((0, 4), false),
+        ((16, 8), true),
+        ((32, 16), true),
+    ] {
         let old = rotate(rig, &bank, case, (Path::PerValue, false, shift)).expect("old");
         let new = rotate(rig, &bank, case, (Path::Warp, false, shift)).expect("new");
         assert_eq!(new.usable, taken, "shift {shift:?}");
@@ -641,8 +713,8 @@ fn the_whole_projection_is_byte_identical_with_the_warp_rotation_on_and_off() {
         for (bank, _, cases) in banks_and_cases(&ctx, k, &mut rng) {
             for case in &cases {
                 for fused_out in [false, true] {
-                    let old = rotate(rig, &bank, case, (Path::PerValue, fused_out, (0, 0)))
-                        .expect("old");
+                    let old =
+                        rotate(rig, &bank, case, (Path::PerValue, fused_out, (0, 0))).expect("old");
                     let new =
                         rotate(rig, &bank, case, (Path::Warp, fused_out, (0, 0))).expect("new");
                     assert_eq!(
