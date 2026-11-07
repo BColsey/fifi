@@ -521,85 +521,97 @@ fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
     if !registers_expected() {
         return;
     }
-    for (bits_twice, book) in [(8, Codebook::Mul1), (4, Codebook::Mcg)] {
-        let bank = bank_of(
-            &ctx,
-            (K, N),
-            (bits_twice, book),
-            0x4e45_5757 + u64::from(bits_twice),
-        );
-        let shape: &[(u32, u32)] = &[(3, 1), (0, 70), (4, 144), (2, 9), (1, 64), (4, 33)];
-        let (jobs, total) = table(shape);
-        let x = rows_of(&mut rng, total, bank.k);
-        let reversed: Vec<u32> = (0..total as u32).rev().collect();
-        let mut over_range = reversed.clone();
-        over_range[2] = total as u32; // one past the rows of out: refused, nothing written
-        for (ld, col) in [(bank.n, 0), (bank.n + 40, COL)] {
-            for (name, listed) in [("straight", None), ("reversed", Some(&reversed[..]))] {
-                let (plain_out, plain_flag, registers, plain_z) =
-                    run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, false)
-                        .expect("jobs");
-                assert!(
-                    registers,
-                    "the fused epilogue needs the register-decode kernel"
-                );
-                assert_eq!(
-                    plain_flag, 0,
-                    "{bits_twice}/{book:?}: flag of the plain call"
-                );
-                assert_ne!(
-                    plain_z,
-                    vec![CANARY; plain_z.len()],
-                    "{bits_twice}/{book:?}: the plain call must write z"
-                );
-                let (fused_out, fused_flag, _, fused_z) =
-                    run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, true)
+    // K grid over every ring residue: stages = k / 32, so 128 -> 1, 256 -> 2, 384 -> 0
+    // (mod 3). The pre-remediation race lived in the first two classes; 384 checks the
+    // residue whose last slot the staging tile never touches.
+    for k in [K, 128, 384] {
+        for (bits_twice, book) in [(8, Codebook::Mul1), (4, Codebook::Mcg)] {
+            let bank = bank_of(
+                &ctx,
+                (k, N),
+                (bits_twice, book),
+                0x4e45_5757 + u64::from(bits_twice) + k as u64,
+            );
+            let shape: &[(u32, u32)] = &[(3, 1), (0, 70), (4, 144), (2, 9), (1, 64), (4, 33)];
+            let (jobs, total) = table(shape);
+            let x = rows_of(&mut rng, total, bank.k);
+            let reversed: Vec<u32> = (0..total as u32).rev().collect();
+            let mut over_range = reversed.clone();
+            over_range[2] = total as u32; // one past the rows of out: refused, nothing written
+            for (ld, col) in [(bank.n, 0), (bank.n + 40, COL)] {
+                for (name, listed) in [("straight", None), ("reversed", Some(&reversed[..]))] {
+                    let (plain_out, plain_flag, registers, plain_z) =
+                        run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, false)
+                            .expect("jobs");
+                    assert!(
+                        registers,
+                        "the fused epilogue needs the register-decode kernel"
+                    );
+                    assert_eq!(
+                        plain_flag, 0,
+                        "{bits_twice}/{book:?}: flag of the plain call"
+                    );
+                    assert_ne!(
+                        plain_z,
+                        vec![CANARY; plain_z.len()],
+                        "{bits_twice}/{book:?}: the plain call must write z"
+                    );
+                    let (fused_out, fused_flag, _, fused_z) =
+                        run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, true)
+                            .expect("fused jobs");
+                    assert_eq!(
+                        fused_out, plain_out,
+                        "k={k} {bits_twice}/{book:?} ld={ld} col={col} {name}: fused bits differ"
+                    );
+                    assert_eq!(
+                        fused_flag, plain_flag,
+                        "{bits_twice}/{book:?} {name}: flag differs"
+                    );
+                    assert_eq!(
+                        fused_z,
+                        vec![CANARY; fused_z.len()],
+                        "{bits_twice}/{book:?} {name}: the fused call must not write z"
+                    );
+                }
+                // The out-of-range scatter: both paths flag it, drop the same row, keep its canary.
+                let (plain_out, plain_flag, _, _) = run_jobs_output_mode(
+                    rig,
+                    &bank,
+                    &jobs,
+                    &x,
+                    (ld, col),
+                    Some(&over_range),
+                    false,
+                )
+                .expect("jobs");
+                let (fused_out, fused_flag, _, _) =
+                    run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), Some(&over_range), true)
                         .expect("fused jobs");
                 assert_eq!(
-                    fused_out, plain_out,
-                    "{bits_twice}/{book:?} ld={ld} col={col} {name}: fused bits differ"
+                    plain_flag & 1,
+                    1,
+                    "{bits_twice}/{book:?}: the plain call must flag"
                 );
                 assert_eq!(
                     fused_flag, plain_flag,
-                    "{bits_twice}/{book:?} {name}: flag differs"
+                    "{bits_twice}/{book:?}: refusal flag differs"
                 );
                 assert_eq!(
-                    fused_z,
-                    vec![CANARY; fused_z.len()],
-                    "{bits_twice}/{book:?} {name}: the fused call must not write z"
+                    fused_out, plain_out,
+                    "{bits_twice}/{book:?}: refused rows differ"
+                );
+                let kept = (0..total)
+                    .filter(|&r| {
+                        fused_out[r * ld * 4..(r + 1) * ld * 4]
+                            .iter()
+                            .all(|b| *b == CANARY)
+                    })
+                    .count();
+                assert_eq!(
+                    kept, 1,
+                    "k={k} {bits_twice}/{book:?}: exactly the refused row keeps canary"
                 );
             }
-            // The out-of-range scatter: both paths flag it, drop the same row, keep its canary.
-            let (plain_out, plain_flag, _, _) =
-                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), Some(&over_range), false)
-                    .expect("jobs");
-            let (fused_out, fused_flag, _, _) =
-                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), Some(&over_range), true)
-                    .expect("fused jobs");
-            assert_eq!(
-                plain_flag & 1,
-                1,
-                "{bits_twice}/{book:?}: the plain call must flag"
-            );
-            assert_eq!(
-                fused_flag, plain_flag,
-                "{bits_twice}/{book:?}: refusal flag differs"
-            );
-            assert_eq!(
-                fused_out, plain_out,
-                "{bits_twice}/{book:?}: refused rows differ"
-            );
-            let kept = (0..total)
-                .filter(|&r| {
-                    fused_out[r * ld * 4..(r + 1) * ld * 4]
-                        .iter()
-                        .all(|b| *b == CANARY)
-                })
-                .count();
-            assert_eq!(
-                kept, 1,
-                "k={k} {bits_twice}/{book:?}: exactly the refused row keeps canary"
-            );
         }
     }
 }
