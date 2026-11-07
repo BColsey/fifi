@@ -477,9 +477,9 @@ fn a_packed_slot_record_of_a_real_expert_runs_on_the_cpu_kernel_like_its_matrice
                 .collect::<Vec<_>>(),
             "expert {expert}: a record and the matrices give the same bits"
         );
-        let error = relative_l2(&from_record, &reference.fp64(&x64));
+        let error = relative_l2(&from_record, &reference.fp64_exact(&x64));
         eprintln!("expert {expert} from its record: relative L2 {error:.3e}");
-        assert!(error <= CPU_BOUND, "expert {expert}: {error:.3e}");
+        assert!(error <= EXACT_BOUND, "expert {expert}: {error:.3e}");
     }
     // A matrix of another rate than the layout is refused.
     let shared =
