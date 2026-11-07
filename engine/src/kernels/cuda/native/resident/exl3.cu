@@ -99,6 +99,23 @@ __device__ float rotate128(float value, float *values) {
     }
     return values[lane] * rsqrtf(128.0f);
 }
+
+// rotate128 for a 256-thread block: two independent 128-element groups advance in lockstep
+// through the SAME butterfly network and add order per group, so each group's result is
+// bit-identical to rotate128's; the barriers are CTA-wide by necessity and harmless to a group
+// whose row is absent (its threads exchange a staged zero nobody reads).
+__device__ float rotate128_pair(float value, float *values) {
+    const unsigned lane = threadIdx.x & 127, slot = (threadIdx.x >> 7) * 128 + lane;
+    values[slot] = value;
+    __syncthreads();
+    for (unsigned step = 1; step < 128; step *= 2) {
+        const float own = values[slot], other = values[slot ^ step];
+        __syncthreads();
+        values[slot] = (lane & step) ? other - own : own + other;
+        __syncthreads();
+    }
+    return values[slot] * rsqrtf(128.0f);
+}
 __global__ void input_rotate(inference_cuda_exl3_linear_args a) {
     __shared__ float values[128];
     const size_t index = size_t(blockIdx.x) * 128 + threadIdx.x;
@@ -1746,6 +1763,12 @@ struct JobsTile {
     uint32_t *flag;
     size_t rows, k, n;
     int bits_twice;
+    // The fused output-rotation epilogue only: the output scale, the scatter target and
+    // the job's first row in the table (row0 plus the CTA's row block). Null/0 when unfused.
+    const float *svh;
+    const uint32_t *out_rows;
+    float *out;
+    size_t out_total_rows, out_ld, out_col, table_row0;
 };
 
 template <int Book, int W, int NT>
@@ -1899,6 +1922,12 @@ constexpr int jobs_reg_a_bytes = jobs_reg_rows * jobs_reg_stride;
 constexpr int jobs_reg_b_bytes = 8 * 2 * 16 * 16;  // 8 tiles x 2 K16 steps x 16 bytes x bits_twice
 constexpr int jobs_reg_stage_bytes = jobs_reg_a_bytes + jobs_reg_b_bytes;
 
+// The fused output-rotation epilogue stages its 32-row slab and the pair butterfly's values
+// onto the cp.async ring, which is dead once the last stage is consumed; both must fit.
+constexpr int jobs_fused_tile_bytes = 32 * 128 * int(sizeof(float));
+static_assert(jobs_reg_stages * jobs_reg_stage_bytes >= jobs_fused_tile_bytes + 1024,
+              "fused epilogue no longer fits the dead ring");
+
 // ldmatrix needs sm_75 and mma.m16n8k16 and cp.async need sm_80: an older device pass (the sm_72
 // build of aarch64) gets the kernel as a trap that the launch below never reaches.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
@@ -1931,7 +1960,7 @@ __device__ __forceinline__ void cp_async_wait() {
 // The ring holds jobs_reg_stages stages of 32 values of K: the 64 F16 input rows of the job and the
 // raw trellis words of the 8 tiles of the CTA for the two K16 steps. Stage s is copied by cp.async
 // while stage s - 1 is multiplied; one barrier per stage.
-template <int Book>
+template <int Book, bool FusedOut = false>
 __device__ __forceinline__ void jobs_reg_projection(const JobsTile &a,
                                                     unsigned char (*ring)[jobs_reg_stage_bytes]) {
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -2014,17 +2043,65 @@ __device__ __forceinline__ void jobs_reg_projection(const JobsTile &a,
     }
 
     const size_t column0 = (size_t(blockIdx.x) * 8 + warp) * 16;
-    #pragma unroll
-    for (unsigned fragment = 0; fragment < 4; ++fragment) {
+    if constexpr (!FusedOut) {
         #pragma unroll
-        for (unsigned half_column = 0; half_column < 2; ++half_column) {
+        for (unsigned fragment = 0; fragment < 4; ++fragment) {
             #pragma unroll
-            for (unsigned part = 0; part < 4; ++part) {
-                const size_t row = size_t(fragment) * 16 + group + 8 * (part >> 1);
-                if (row >= rows) continue;
-                a.z[row * a.n + column0 + half_column * 8 + 2 * quad + (part & 1)] =
-                    finite_or_flag(acc[fragment][half_column][part], a.flag);
+            for (unsigned half_column = 0; half_column < 2; ++half_column) {
+                #pragma unroll
+                for (unsigned part = 0; part < 4; ++part) {
+                    const size_t row = size_t(fragment) * 16 + group + 8 * (part >> 1);
+                    if (row >= rows) continue;
+                    a.z[row * a.n + column0 + half_column * 8 + 2 * quad + (part & 1)] =
+                        finite_or_flag(acc[fragment][half_column][part], a.flag);
+                }
             }
+        }
+    } else {
+        // The output rotation of jobs_output_rotate fused into the epilogue: a CTA holds every
+        // 128-column group of its rows complete (n is a multiple of 128 and the CTA covers 128
+        // consecutive columns), so the butterfly needs no exchange beyond this block. The staged
+        // values are the same finite_or_flag(acc) the unfused store writes to z, the butterfly is
+        // the same network, and the scale, flag and scatter are the same ops in the same order, so
+        // the published bits are identical; only z itself stays unwritten.
+        float *const tile = reinterpret_cast<float *>(&ring[0][0]);
+        float *const values = reinterpret_cast<float *>(
+            &ring[0][0] + jobs_fused_tile_bytes);
+        const unsigned rows_u = unsigned(a.rows);
+        const size_t col0 = size_t(blockIdx.x) * 128;
+        for (unsigned base = 0; base < rows_u; base += 32) {
+            #pragma unroll
+            for (unsigned fragment = 0; fragment < 4; ++fragment) {
+                #pragma unroll
+                for (unsigned half_column = 0; half_column < 2; ++half_column) {
+                    #pragma unroll
+                    for (unsigned part = 0; part < 4; ++part) {
+                        const unsigned row = fragment * 16 + group + 8 * (part >> 1);
+                        if (row >= rows_u || row < base || row >= base + 32) continue;
+                        const unsigned col = warp * 16 + half_column * 8 + 2 * quad + (part & 1);
+                        tile[size_t(row - base) * 128 + col] =
+                            finite_or_flag(acc[fragment][half_column][part], a.flag);
+                    }
+                }
+            }
+            __syncthreads();
+            const unsigned top = base + 32 < rows_u ? base + 32 : rows_u;
+            for (unsigned row = base; row < top; row += 2) {
+                const bool live = row + (threadIdx.x >> 7) < top;
+                const float staged = live
+                    ? tile[size_t(row - base + (threadIdx.x >> 7)) * 128 + (threadIdx.x & 127)]
+                    : 0.0f;
+                const float rotated = rotate128_pair(staged, values);
+                if (live) {
+                    const unsigned col = unsigned(col0) + (threadIdx.x & 127);
+                    const size_t table_row = a.table_row0 + row + (threadIdx.x >> 7);
+                    const size_t target = a.out_rows ? size_t(a.out_rows[table_row]) : table_row;
+                    const float value = finite_or_flag(rotated * a.svh[col], a.flag);
+                    if (target >= a.out_total_rows) atomicOr(a.flag, 1u);
+                    else a.out[target * a.out_ld + a.out_col + col] = value;
+                }
+            }
+            __syncthreads();  // the next slab overwrites the tile
         }
     }
 }
@@ -2055,6 +2132,42 @@ __global__ void __launch_bounds__(256) jobs_project_reg(
         case 0: jobs_reg_projection<0>(a, ring); break;
         case 1: jobs_reg_projection<1>(a, ring); break;
         default: jobs_reg_projection<2>(a, ring); break;
+    }
+#endif
+}
+
+// The register-decode kernel with the output rotation fused into its epilogue (see the
+// FusedOut tail of jobs_reg_projection); only the launch differs from jobs_project_reg.
+__global__ void __launch_bounds__(256) jobs_project_reg_fused(
+    const __grid_constant__ inference_cuda_exl3_jobs_args p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();
+#else
+    __shared__ __align__(16) unsigned char ring[jobs_reg_stages][jobs_reg_stage_bytes];
+    const inference_cuda_exl3_job job = p.jobs[blockIdx.z];
+    if (!job_runs(p, job)) return;
+    const size_t first = size_t(blockIdx.y) * jobs_reg_rows;
+    if (first >= size_t(job.rows)) return;
+    JobsTile a{};
+    a.trellis = inference_cuda_exl3_member_trellis(p, job.member);
+    a.xh = reinterpret_cast<const unsigned *>(p.xh) + (size_t(job.row0) + first) * (p.k / 2);
+    a.z = p.z + (size_t(job.row0) + first) * p.n;
+    a.flag = p.flag;
+    a.rows = min(size_t(jobs_reg_rows), size_t(job.rows) - first);
+    a.k = p.k;
+    a.n = p.n;
+    a.bits_twice = p.bits_twice;
+    a.svh = inference_cuda_exl3_member_svh(p, job.member);
+    a.out_rows = p.out_rows;
+    a.out = p.out;
+    a.out_total_rows = p.out_total_rows;
+    a.out_ld = p.out_ld;
+    a.out_col = p.out_col;
+    a.table_row0 = size_t(job.row0) + first;
+    switch (p.book) {
+        case 0: jobs_reg_projection<0, true>(a, ring); break;
+        case 1: jobs_reg_projection<1, true>(a, ring); break;
+        default: jobs_reg_projection<2, true>(a, ring); break;
     }
 #endif
 }
@@ -2171,6 +2284,16 @@ bool jobs_registers_enabled() {
     return enabled;
 }
 
+// Whether FIFI_EXL3_JOBS_FUSED_OUT turns the fused output-rotation epilogue on (exactly "1";
+// unset or any other value keeps the separate kernel), read once. Default off.
+bool jobs_fused_out_enabled() {
+    static const bool enabled = [] {
+        const char *text = std::getenv("FIFI_EXL3_JOBS_FUSED_OUT");
+        return text && text[0] == '1' && text[1] == '\0';
+    }();
+    return enabled;
+}
+
 // Whether a call takes the register-decode kernel: the switch on, a device of compute capability 8
 // or more running code compiled for sm_80 or more (the kernel needs mma.m16n8k16 and cp.async),
 // 16-byte aligned input rows, trellis and member stride (cp.async copies 16 bytes), and K a
@@ -2184,8 +2307,8 @@ bool jobs_use_registers(const inference_cuda_exl3_jobs_args &a, DeviceSupport su
 }
 } // namespace
 
-extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
-                                       void *stream, int *out_stage) {
+static int exl3_jobs_launch(const inference_cuda_exl3_jobs_args *a, void *stream,
+                            int *out_stage, bool fused_request) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!a || !stream || !jobs_views(*a)) return INFERENCE_CUDA_INVALID_ARGUMENT;
@@ -2194,12 +2317,19 @@ extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
         const unsigned jobs = a->jobs_count;
         jobs_input_rotate<<<dim3(unsigned(a->max_rows * a->k / 128), jobs), 128, 0, s>>>(*a);
         failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        // The fused epilogue exists only on the register-decode kernel; a call that falls back
+        // to the shared-memory kernels keeps the separate output rotation.
+        bool fused = false;
         if (failure.err == cudaSuccess) {
             // One CTA covers 64, 128 or 256 rows: the narrowest that holds the tallest job in one
             // row block, so a table of short jobs does not pay for wide CTAs.
             const unsigned tiles = unsigned(a->n / 16);
             if (jobs_use_registers(*a, device_support(), jobs_registers_enabled())) {
-                jobs_project_reg<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
+                fused = fused_request;
+                if (fused)
+                    jobs_project_reg_fused<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
+                else
+                    jobs_project_reg<<<dim3(tiles / 8, unsigned((a->max_rows + 63) / 64), jobs), 256, 0, s>>>(*a);
             } else if (a->max_rows <= 64) {
                 jobs_project<4><<<dim3(tiles / jobs_tiles<4>, 1, jobs), 128, 0, s>>>(*a);
             } else if (a->max_rows <= 128) {
@@ -2209,13 +2339,25 @@ extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
             }
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
-        if (failure.err == cudaSuccess) {
+        if (failure.err == cudaSuccess && !fused) {
             jobs_output_rotate<<<dim3(unsigned(a->max_rows * a->n / 128), jobs), 128, 0, s>>>(*a);
             failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
         }
         report_stage(out_stage, failure.stage);
         return int(failure.err);
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
+}
+
+extern "C" int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *a,
+                                       void *stream, int *out_stage) {
+    return exl3_jobs_launch(a, stream, out_stage, jobs_fused_out_enabled());
+}
+
+// The same launches with an explicit fused-output request, for the device tests and the GPU
+// qualification (an env flip would race the other tests of the process).
+extern "C" int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *a,
+                                                 void *stream, int *out_stage, int fused_out) {
+    return exl3_jobs_launch(a, stream, out_stage, fused_out != 0);
 }
 
 extern "C" int inference_cuda_exl3_jobs_kernel(const inference_cuda_exl3_jobs_args *a,

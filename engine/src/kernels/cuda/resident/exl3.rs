@@ -615,6 +615,27 @@ impl CudaContext {
         stream: &DeviceStream,
         call: Exl3JobsCall<'_>,
     ) -> Result<(), EngError> {
+        self.exl3_jobs_mode(stream, call, None)
+    }
+
+    /// [`Self::exl3_jobs`] with the fused-output-rotation request made explicit, for the device
+    /// tests and the GPU qualification; `None` leaves the env default (off).
+    #[cfg(test)]
+    pub(crate) fn exl3_jobs_fused_out(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3JobsCall<'_>,
+        fused_out: bool,
+    ) -> Result<(), EngError> {
+        self.exl3_jobs_mode(stream, call, Some(fused_out))
+    }
+
+    fn exl3_jobs_mode(
+        &self,
+        stream: &DeviceStream,
+        call: Exl3JobsCall<'_>,
+        fused_out: Option<bool>,
+    ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.jobs_raw(&call)?;
         let needs = ffi::jobs_extents(&raw.shape()).ok_or_else(|| {
@@ -669,7 +690,10 @@ impl CudaContext {
                 )?;
             }
         }
-        self.launch_on(stream, |s| ffi::jobs(s, &raw))
+        self.launch_on(stream, |s| match fused_out {
+            Some(fused) => ffi::jobs_fused(s, &raw, fused),
+            None => ffi::jobs(s, &raw),
+        })
     }
 }
 

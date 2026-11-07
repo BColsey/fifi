@@ -745,6 +745,12 @@ unsafe extern "C" {
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
+    fn inference_cuda_exl3_jobs_fused_out(
+        args: *const JobsArgs,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        fused_out: c_int,
+    ) -> c_int;
     fn inference_cuda_exl3_jobs_kernel(
         args: *const JobsArgs,
         capability_major: c_int,
@@ -985,6 +991,25 @@ pub(in crate::kernels::cuda) fn jobs(
     // repeated in C; the table is read on the device, and the C entry guards every job against the
     // bank and the row bounds. The explicit live stream is under the dispatch guard.
     let status = unsafe { inference_cuda_exl3_jobs(&args, stream.as_ptr(), &mut stage) };
+    checked(status, stage)
+}
+
+/// The same launches with an explicit fused-output-rotation request (the env default is off):
+/// for the device tests and the GPU qualification, where an env flip would race the process.
+/// Production builds never call it — the env decides — so the dead code is allowed there.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::kernels::cuda) fn jobs_fused(
+    stream: &RawStream,
+    call: &JobsRaw<'_>,
+    fused_out: bool,
+) -> Result<(), DeviceFailure> {
+    let args = jobs_args(call)?;
+    let mut stage = STAGE_NONE;
+    // SAFETY: the same checked argument block as jobs; the request only selects the epilogue of
+    // the register-decode kernel.
+    let status = unsafe {
+        inference_cuda_exl3_jobs_fused_out(&args, stream.as_ptr(), &mut stage, fused_out as c_int)
+    };
     checked(status, stage)
 }
 

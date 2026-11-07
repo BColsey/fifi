@@ -227,6 +227,10 @@ static_assert(sizeof(inference_cuda_exl3_job) == 16 &&
 #endif
 int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *args,
                              void *stream, int *out_stage);
+/* The same launches with an explicit fused-output-rotation request (the env default above is
+ * off); the fusion applies only when the register-decode kernel is taken. */
+int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *args,
+                                       void *stream, int *out_stage, int fused_out);
 
 /* Member addressing of a job-table call, shared by every stage kernel that reads the table: the
  * trellis of member m starts trellis_stride u16 elements after member m-1's, its suh and svh

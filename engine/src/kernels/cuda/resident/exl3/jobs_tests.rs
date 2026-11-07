@@ -429,6 +429,133 @@ fn permutation(rng: &mut testkit::Rng, len: usize) -> Vec<u32> {
     list
 }
 
+/// One job-table call through the explicit fused-output entry (or the plain one when
+/// `fused_out` is false); `z` is canary-filled before the launch and returned raw, so the
+/// caller can see whether the fused epilogue left it untouched.
+fn run_jobs_output_mode(
+    (ctx, stream): (&CudaContext, &DeviceStream),
+    bank: &Bank,
+    jobs: &[Exl3Job],
+    x: &[f32],
+    (out_ld, out_col): (usize, usize),
+    fused_out: bool,
+) -> Result<(Vec<u8>, u32, bool, Vec<u8>), EngError> {
+    let (k, n) = (bank.k, bank.n);
+    let total_rows = x.len() / k;
+    let max_rows = jobs.iter().map(|job| job.rows as usize).max().unwrap();
+    let x_buf = testkit::upload_f32(ctx, x);
+    let xh = testkit::upload_filled(ctx, 0, total_rows * k * 4);
+    let z = testkit::upload_filled(ctx, CANARY, total_rows * n * 4);
+    let out_bytes = total_rows * out_ld * 4;
+    let out = testkit::upload_filled(ctx, CANARY, out_bytes);
+    let flag = testkit::upload_filled(ctx, 0, 4);
+    let table = Exl3Job::table(jobs);
+    let table_buf = testkit::upload_bytes(ctx, &table);
+    let scales = bank.scales.range(0, bank.scales.bytes())?;
+    let call = Exl3JobsCall {
+        trellis: bank.trellis.range(0, bank.trellis.bytes())?,
+        suh: scales,
+        svh: bank.scales.range(k * 4, bank.scales.bytes() - k * 4)?,
+        trellis_stride: packed_elements_of(k, n, bank.bits_twice),
+        scale_stride: k + n,
+        members: MEMBERS,
+        x: x_buf.range(0, x.len() * 4)?,
+        xh: xh.range(0, total_rows * k * 4)?,
+        z: z.range(0, total_rows * n * 4)?,
+        out: out.range(0, out_bytes)?,
+        flag: flag.range(0, 4)?,
+        jobs: table_buf.range(0, table.len())?,
+        jobs_count: jobs.len(),
+        max_rows,
+        total_rows,
+        out_ld,
+        out_col,
+        k,
+        n,
+        bits_twice: bank.bits_twice,
+        book: bank.book,
+        in_rows: None,
+        out_rows: None,
+        x_rows: total_rows,
+        out_total_rows: total_rows,
+    };
+    let registers = ctx.exl3_jobs_use_registers(&call)?;
+    if fused_out {
+        ctx.exl3_jobs_fused_out(stream, call, true)?;
+    } else {
+        ctx.exl3_jobs(stream, call)?;
+    }
+    stream.synchronize()?;
+    let out_read = testkit::read_bytes(ctx, &out, out_bytes);
+    let flag_read = testkit::read_bytes(ctx, &flag, 4);
+    let z_read = testkit::read_bytes(ctx, &z, total_rows * n * 4);
+    Ok((
+        out_read,
+        u32::from_le_bytes(flag_read.try_into().unwrap()),
+        registers,
+        z_read,
+    ))
+}
+
+/// The opt-in fused output-rotation epilogue (`FIFI_EXL3_JOBS_FUSED_OUT`, driven through the
+/// explicit entry so no env flip races the other tests of the process) must publish the same
+/// bits as the separate rotation kernel, keep the flag, and leave the z projection buffer
+/// untouched. The mixed heights cover one-row jobs, part blocks, odd tops and several CTAs, so
+/// both 32-row staging slabs and the absent-row side of a butterfly pair run.
+#[test]
+fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
+    if !testkit::device_present("EXL3 fused output rotation") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let rig = (&ctx, &stream);
+    let mut rng = testkit::Rng::new(0x4655_5345);
+    for (bits_twice, book) in [(8, Codebook::Mul1), (4, Codebook::Mcg)] {
+        let bank = bank_of(
+            &ctx,
+            (K, N),
+            (bits_twice, book),
+            0x4e45_5757 + u64::from(bits_twice),
+        );
+        let shape: &[(u32, u32)] = &[(3, 1), (0, 70), (4, 144), (2, 9), (1, 64), (4, 33)];
+        let (jobs, total) = table(shape);
+        let x = rows_of(&mut rng, total, bank.k);
+        for (ld, col) in [(bank.n, 0), (bank.n + 40, COL)] {
+            let (plain_out, plain_flag, registers, plain_z) =
+                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), false).expect("jobs");
+            assert!(
+                registers,
+                "the fused epilogue needs the register-decode kernel"
+            );
+            assert_eq!(
+                plain_flag, 0,
+                "{bits_twice}/{book:?}: flag of the plain call"
+            );
+            assert_ne!(
+                plain_z,
+                vec![CANARY; plain_z.len()],
+                "{bits_twice}/{book:?}: the plain call must write z"
+            );
+            let (fused_out, fused_flag, _, fused_z) =
+                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), true).expect("fused jobs");
+            assert_eq!(
+                fused_out, plain_out,
+                "{bits_twice}/{book:?} ld={ld} col={col}: fused bits differ"
+            );
+            assert_eq!(
+                fused_flag, plain_flag,
+                "{bits_twice}/{book:?}: flag differs"
+            );
+            assert_eq!(
+                fused_z,
+                vec![CANARY; fused_z.len()],
+                "{bits_twice}/{book:?}: the fused call must not write z"
+            );
+        }
+    }
+}
+
 #[test]
 fn row_lists_equal_the_gather_before_and_the_scatter_after_bit_for_bit() {
     if !testkit::device_present("EXL3 job table row lists") {
