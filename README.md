@@ -74,8 +74,6 @@ Set it on any host that is supposed to have the data, so a gate cannot pass with
 Tests that need model weights or recorded data on your machine find them by name.
 Each name is an environment variable, or else a key in the JSON object `~/.config/fifi/test-paths.json`, which lives outside the repository so every worktree shares it.
 The names are `Q36_CUDA_MODEL_DIR`, `FIFI_QWEN36_MODEL_DIR` (a Qwen3.6 model directory), `Q36_CUDA_COHORT_DIR` (the recorded prompt cohort), `FLINT_P01_GGUF_LOGITS` (a cached logits file) and `FIFI_SCRATCH_ROOT` (the directory under which tests may write).
-`M3_LAYOUT_DIR` (the frozen layout directory of the EXL3-versus-GGUF quality comparison) is a further name; the two default tests that read it skip when it is unset.
-The ignored `m3_compare` test scores two recorded sidecar sets: set `M3_COMPARE` to `P1:<candidate dir>:<reference dir>` or `O1:<candidate dir>:<reference dir>`, set `M3_REGISTRATION` to `v6` or `v7` (there is no default; every verdict names its registration version, see `qualification/o1-gate-v7/`), and run `cargo test --lib m3_compare -- --ignored --nocapture` from `engine/`.
 An `#[ignore]`d test that needs one of them fails with a message naming it when it is unset; the Qwen3.6 tokenizer tests skip instead.
 `FIFI_SCRATCH_ROOT` is also read as an environment variable only, never from the file, by the macOS native qualification code outside test builds, so set it there.
 

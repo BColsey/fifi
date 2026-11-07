@@ -93,3 +93,13 @@ On NVIDIA CUDA:
 | `FIFI_FLINT_CUDA_KV_DEVICE_F16` | on (default; `0` rolls back) | Run the KV cache row acceptance guard on the GPU instead of reading each layer's new K and V rows back to the host. On the f16 KV profile the GPU also writes the accepted half-precision rows into the cache, so the host read and the 1,024-byte upload per row (98 pairs per decoded token) are not issued; on the q8 profile the GPU append is unchanged and only the guard moves. A row is accepted when it is finite, has its low 16 bits clear and converts to a finite f16 (round to nearest even), the same rule and the same stored bits as the host path; a rejected row fails the token with the same error, checked once per token before sampling (once per prompt piece in layer-major prefill). Unset, `1`, `true` and `on` keep it on; any other value, including empty and non-UTF-8, turns it off. Read once at the first Flint CUDA engine load; restart to change. Rollback: `FIFI_FLINT_CUDA_KV_DEVICE_F16=0`. |
 
 The startup line reports `alloc_cache=`, `late_health=`, `token_health=`, `packed_pointwise=`, `grouped_gather=`, `q8_tiled=`, `kv_device_f16=` and `fused_publish=` (the q8-tile route resolves off on f16 engines). When armed it also ends with `alloc_return=lazy`.
+
+## Tests
+
+These are read by `cargo test`, not by `enginesrv`. A test that needs recorded data finds each location by name: the environment variable first, then the same key in the JSON object `~/.config/fifi/test-paths.json`. The tests that read them skip when a location is unset, and fail instead when `FIFI_TEST_REQUIRE_DATA` is exactly `1`. A deliberate `#[ignore]`d run always fails on a missing value.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `M3_LAYOUT_DIR` | unset | The frozen layout directory of the EXL3-versus-GGUF quality comparison. The two default tests that load it skip when it is unset; the ignored `m3_compare` test requires it. |
+| `M3_COMPARE` | unset | For the ignored `m3_compare` test: `P1:<candidate dir>:<reference dir>` or `O1:<candidate dir>:<reference dir>`, the two recorded sidecar sets to score. Run `cargo test --lib m3_compare -- --ignored --nocapture` from `engine/`. |
+| `M3_REGISTRATION` | unset (refused) | For `m3_compare`: `v6` or `v7`, the registration version whose rule scores the pair. There is no default: an unset or unknown value stops the test before any sidecar is read, and every verdict names its version (see `qualification/o1-gate-v7/`). |
