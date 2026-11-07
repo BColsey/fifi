@@ -27,6 +27,15 @@ fn reference(tokens: &[i32], ids: &[i32]) -> (i32, i32) {
     (run as i32, tokens[run])
 }
 
+/// The bytes of the window ids with one more word after them, equal to the token of the last row.
+/// The kernel is given `m` ids and must never read the word after them; a loop that ran one row
+/// too far would find a token equal to that word, accept the last row too and report a run of `m`.
+fn ids_with_a_word_after(ids: &[i32], last_token: i32) -> Vec<u8> {
+    let mut all = ids.to_vec();
+    all.push(last_token);
+    words(&all)
+}
+
 fn words(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
@@ -41,6 +50,7 @@ impl Rig {
     /// Runs `verify_greedy` on a table of `m` pairs (token, bits 0) with the window word `window`,
     /// a zero pad, and stale bytes where the verify words go. Returns the report bytes read back.
     fn verify(&self, tokens: &[i32], ids: &[i32], window: i32) -> Vec<u8> {
+        let after = tokens[tokens.len() - 1];
         let m = tokens.len();
         let mut table = Vec::new();
         for &token in tokens {
@@ -49,7 +59,7 @@ impl Rig {
         table.extend(words(&[window, 0]));
         table.extend([STALE; 8]);
         let result = testkit::upload_bytes(&self.ctx, &table);
-        let ids_buf = testkit::upload_bytes(&self.ctx, &words(ids));
+        let ids_buf = testkit::upload_bytes(&self.ctx, &ids_with_a_word_after(ids, after));
         self.ctx
             .verify_greedy(
                 &self.stream,
@@ -64,7 +74,8 @@ impl Rig {
     }
 
     /// The chain: `argmax_rows` on the rows (stride `n`), then `verify_greedy` against `ids`.
-    fn chain(&self, rows: &[Vec<f32>], ids: &[i32]) -> WindowReport {
+    /// `last_token` is the token the argmax gives the last row; it is the word after the ids.
+    fn chain(&self, rows: &[Vec<f32>], ids: &[i32], last_token: i32) -> WindowReport {
         let (m, n) = (rows.len(), rows[0].len());
         let flat: Vec<f32> = rows.iter().flatten().copied().collect();
         let logits = testkit::upload_f32(&self.ctx, &flat);
@@ -74,7 +85,7 @@ impl Rig {
         let mut table = vec![0u8; 8 * m + 8];
         table.extend([STALE; 8]);
         let result = testkit::upload_bytes(&self.ctx, &table);
-        let ids_buf = testkit::upload_bytes(&self.ctx, &words(ids));
+        let ids_buf = testkit::upload_bytes(&self.ctx, &ids_with_a_word_after(ids, last_token));
         self.ctx
             .argmax_rows(
                 &self.stream,
@@ -256,12 +267,12 @@ fn the_chain_from_logits_takes_the_first_index_of_a_tie() {
         .chain(first.iter().copied())
         .take(4)
         .collect();
-    let report = rig.chain(&rows, &ids);
+    let report = rig.chain(&rows, &ids, 500);
     assert_eq!(report.table.tokens, first);
     assert_eq!((report.accepted, report.bonus), (3, 500));
     // A draft equal to the SECOND tied index of row 1 is a mismatch there.
     let mut ids = ids.clone();
     ids[2] = 256;
-    let report = rig.chain(&rows, &ids);
+    let report = rig.chain(&rows, &ids, 500);
     assert_eq!((report.accepted, report.bonus), (1, 255));
 }
