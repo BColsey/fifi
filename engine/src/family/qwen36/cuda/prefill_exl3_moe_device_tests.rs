@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use super::{Bufs, run};
+use super::{Bufs, routed_with, run};
 use crate::{
     family::{
         project::cuda::{CudaProjector, CudaWeights, Reserve},
@@ -306,6 +306,35 @@ fn moe_case(rows: usize, forced: bool) {
     assert!(error < BOUND, "block output: {error}");
     assert_eq!(scratch.flag_word(&projector), 0, "flag");
     assert_eq!(read(&projector, &owned[14], 1)[0].to_bits(), 0, "status");
+    // The routed experts again, without and with the pair rotation of the gate and up inputs:
+    // the pair path must be the one that ran, and the gate/up outputs must be the same bits.
+    let gu_bits = |projector: &CudaProjector| -> Vec<u32> {
+        read(projector, &owned[7], pairs * 2 * i)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    assert!(
+        !routed_with(&projector_view, &block, &bufs, &moe, false).expect("routed, no pair"),
+        "the request was off"
+    );
+    stream.synchronize().unwrap();
+    let without = gu_bits(&projector);
+    // A canary where the outputs go, so an output the pair run does not write cannot pass on the
+    // bytes the separate calls left.
+    owned[7]
+        .write_at(&stream, 0, &vec![0xa5u8; pairs * 2 * i * F32])
+        .unwrap();
+    assert!(
+        routed_with(&projector_view, &block, &bufs, &moe, true).expect("routed, pair"),
+        "the pair rotation must have run: the scratch fits and the buffers are aligned"
+    );
+    stream.synchronize().unwrap();
+    assert!(
+        without == gu_bits(&projector),
+        "gate/up outputs with the pair rotation differ from the separate calls"
+    );
+    assert_eq!(scratch.flag_word(&projector), 0, "flag after the pair");
     if forced {
         return;
     }

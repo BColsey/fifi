@@ -1168,7 +1168,7 @@ pub(in crate::kernels::cuda) fn jobs_pair_usable(
     }
 }
 
-/// The pair rotation by the deliberately wrong variant `mutant` (1 or 2).
+/// The pair rotation by the deliberately wrong variant `mutant` (1 to 3).
 #[cfg(feature = "cuda-exl3-rotate-mutants")]
 pub(in crate::kernels::cuda) fn jobs_rotate_pair_mutant(
     stream: &RawStream,
@@ -1190,7 +1190,7 @@ pub(in crate::kernels::cuda) fn jobs_rotate_pair_mutant(
     checked(status, stage)
 }
 
-/// The input rotation alone, by the deliberately wrong variant `mutant` (1 to 5).
+/// The input rotation alone, by the deliberately wrong variant `mutant` (1 to 7).
 #[cfg(feature = "cuda-exl3-rotate-mutants")]
 pub(in crate::kernels::cuda) fn jobs_rotate_mutant(
     stream: &RawStream,
@@ -1638,6 +1638,112 @@ mod tests {
         let first = block(0x10_0000, 0x40_0000, 64, 2048, 0x60_0000);
         let second = block(0x10_0000, 0x48_0000, 64, 2048, 0x60_0000);
         assert_eq!(usable(&first, &second), 1);
+        // Each shared fact flipped once on the second call, on its own.
+        let flips = [
+            (
+                "x_rows",
+                JobsArgs {
+                    x_rows: 63,
+                    ..second
+                },
+            ),
+            (
+                "in_rows",
+                JobsArgs {
+                    in_rows: 0x70_0000 as *const u32,
+                    ..second
+                },
+            ),
+            (
+                "jobs",
+                JobsArgs {
+                    jobs: 0x50_0010 as *const _,
+                    ..second
+                },
+            ),
+            (
+                "jobs_count",
+                JobsArgs {
+                    jobs_count: 4,
+                    ..second
+                },
+            ),
+            (
+                "max_rows",
+                JobsArgs {
+                    max_rows: 65,
+                    ..second
+                },
+            ),
+            (
+                "total_rows",
+                JobsArgs {
+                    total_rows: 63,
+                    ..second
+                },
+            ),
+            (
+                "members",
+                JobsArgs {
+                    members: 4,
+                    ..second
+                },
+            ),
+        ];
+        for (name, bad) in &flips {
+            assert_eq!(usable(&first, bad), 0, "{name}");
+        }
+        // An output that overlaps something the rotation reads: x, either call's scales, the
+        // table or the row list.
+        let both = |f: fn(JobsArgs) -> JobsArgs| usable(&f(first), &f(second));
+        assert_eq!(
+            both(|a| JobsArgs {
+                x_bytes: 0x40_0000,
+                ..a
+            }),
+            0,
+            "x"
+        );
+        assert_eq!(
+            both(|a| JobsArgs {
+                jobs: 0x41_0000 as *const _,
+                jobs_bytes: 48,
+                ..a
+            }),
+            0,
+            "jobs"
+        );
+        assert_eq!(
+            both(|a| JobsArgs {
+                in_rows: 0x41_0000 as *const u32,
+                in_rows_bytes: 64,
+                ..a
+            }),
+            0,
+            "in_rows"
+        );
+        assert_eq!(
+            usable(
+                &JobsArgs {
+                    suh_bytes: 0x20_0000,
+                    ..first
+                },
+                &second
+            ),
+            0,
+            "first scales"
+        );
+        assert_eq!(
+            usable(
+                &first,
+                &JobsArgs {
+                    suh_bytes: 0x20_0000,
+                    ..second
+                }
+            ),
+            0,
+            "second scales"
+        );
         // A different input buffer, row count, width, flag, or the same output buffer.
         assert_eq!(
             usable(&first, &block(0x11_0000, 0x48_0000, 64, 2048, 0x60_0000)),

@@ -313,32 +313,59 @@ fn jobs_call<'b>(
     Ok(launch)
 }
 
+/// Where the pair rotation puts its scratch inside the partial-sum range of `range_bytes` bytes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct PairLayout {
+    /// Bytes of partial sums one projection needs (`pairs * inter` values), at the head.
+    z_bytes: usize,
+    /// Offset of the second rotated-row range: `z_bytes` rounded up to `PAIR_ALIGN`.
+    tail: usize,
+    /// Bytes of that range (`pairs * hidden` halves).
+    xh_bytes: usize,
+}
+
+/// Alignment of the second rotated-row range, in bytes.
+const PAIR_ALIGN: usize = 256;
+
+/// The layout of the pair's scratch for `pairs` rows of a projection with `inter` outputs over
+/// `hidden` inputs, or `None` when the second rotated-row range does not fit behind the partial
+/// sums in `range_bytes` bytes (which is the case when `inter` is more than half of `hidden`
+/// for the usual `pairs * max(hidden, inter)` values of F32) or the sizes overflow.
+fn pair_layout(
+    (pairs, inter, hidden): (usize, usize, usize),
+    range_bytes: usize,
+) -> Option<PairLayout> {
+    const F16: usize = 2;
+    const F32: usize = 4;
+    let z_bytes = pairs.checked_mul(inter)?.checked_mul(F32)?;
+    let tail = z_bytes.checked_next_multiple_of(PAIR_ALIGN)?;
+    let xh_bytes = pairs.checked_mul(hidden)?.checked_mul(F16)?;
+    (tail.checked_add(xh_bytes)? <= range_bytes).then_some(PairLayout {
+        z_bytes,
+        tail,
+        xh_bytes,
+    })
+}
+
 /// The scratch ranges of the gate and up projections when they rotate their input rows together:
-/// the first projection keeps its usual rotated-row range and the head of the partial-sum range
-/// (the projection needs `pairs * inter` values of it), the second takes its rotated rows from the
-/// unused tail of the partial-sum range, so the pair needs no buffer of its own. `None` when the
-/// tail is too small for `pairs` rows of `hidden` halves.
+/// the first projection keeps its usual rotated-row range and the head of the partial-sum range,
+/// the second takes its rotated rows from the unused tail of the partial-sum range
+/// ([`pair_layout`]), so the pair needs no buffer of its own. `None` when the tail is too small.
 fn paired_scratch<'b>(
     bufs: &Bufs<'b>,
     dims: &MoeDims,
 ) -> Result<Option<(Scratch<'b>, Scratch<'b>)>, EngError> {
-    const F16: usize = 2;
-    const F32: usize = 4;
-    const ALIGN: usize = 256;
     let pairs = dims.rows * dims.top_k;
-    let z_bytes = pairs * dims.inter * F32;
-    let tail = z_bytes.next_multiple_of(ALIGN);
-    let xh_bytes = pairs * dims.hidden * F16;
-    if tail + xh_bytes > bufs.expert_z.bytes() {
+    let Some(layout) = pair_layout((pairs, dims.inter, dims.hidden), bufs.expert_z.bytes()) else {
         return Ok(None);
-    }
-    let z = window(bufs.expert_z, 0, z_bytes)?;
+    };
+    let z = window(bufs.expert_z, 0, layout.z_bytes)?;
     let first = Scratch {
         xh: bufs.expert_xh,
         z,
     };
     let second = Scratch {
-        xh: window(bufs.expert_z, tail, xh_bytes)?,
+        xh: window(bufs.expert_z, layout.tail, layout.xh_bytes)?,
         z,
     };
     Ok(Some((first, second)))
@@ -352,6 +379,25 @@ fn routed(
     bufs: &Bufs<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
+    routed_with(
+        projector,
+        weights,
+        bufs,
+        dims,
+        projector.launch.ctx.exl3_jobs_pair_enabled()?,
+    )
+    .map(|_| ())
+}
+
+/// [`routed`] with the pair request given; returns whether the gate and up projections rotated
+/// their rows together (the request was on, the scratch fit, and the buffers were aligned).
+fn routed_with(
+    projector: &Projector<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Bufs<'_>,
+    dims: &MoeDims,
+    pair: bool,
+) -> Result<bool, EngError> {
     let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
     let plan = read_plan(projector, bufs.ids, dims)?;
     let jobs = plan_jobs(&plan.counts);
@@ -376,12 +422,13 @@ fn routed(
         out: (bufs.gu, 2 * i, half * i),
         lists: listed,
     };
-    // With the pair switch on, the rows are read and rotated once for both projections.
-    let paired = if projector.launch.ctx.exl3_jobs_pair_enabled()? {
+    // With the pair request on, the rows are read and rotated once for both projections.
+    let paired = if pair {
         paired_scratch(bufs, dims)?
     } else {
         None
     };
+    let mut taken = false;
     if let Some((first, second)) = paired {
         #[cfg(test)]
         for _ in 0..2 {
@@ -391,10 +438,11 @@ fn routed(
             jobs_call(projector, first, table, gate_up(0, weights.gate))?,
             jobs_call(projector, second, table, gate_up(1, weights.up))?,
         );
-        projector
-            .launch
-            .ctx
-            .exl3_jobs_pair(projector.launch.stream, calls)?;
+        taken = projector.launch.ctx.exl3_jobs_pair_mode(
+            projector.launch.stream,
+            calls,
+            (true, None),
+        )?;
     } else {
         for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
             project_jobs(projector, bufs, table, gate_up(half, bank))?;
@@ -424,7 +472,7 @@ fn routed(
     };
     project_jobs(projector, bufs, table, call)?;
     super::split::mark(projector.launch.stream, "routed down");
-    Ok(())
+    Ok(taken)
 }
 
 /// `hidden = hidden + (picks in rank order + gate * shared)` for every row, in place.
@@ -468,6 +516,59 @@ mod device_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pair_layout_puts_the_second_rotated_rows_behind_the_partial_sums() {
+        // Qwen3.6 shape: hidden 2048, inter 512, 16,384 pairs, partial sums of pairs * 2048 F32.
+        let range = 16_384 * 2048 * 4;
+        let layout = pair_layout((16_384, 512, 2048), range).expect("fits");
+        assert_eq!(layout.z_bytes, 16_384 * 512 * 4);
+        assert_eq!(layout.tail, layout.z_bytes, "already a multiple of 256");
+        assert_eq!(layout.xh_bytes, 16_384 * 2048 * 2);
+        assert!(layout.tail + layout.xh_bytes <= range);
+        // The tail rounds up to 256 bytes.
+        let layout = pair_layout((3, 100, 64), 1 << 20).expect("fits");
+        assert_eq!(
+            (layout.z_bytes, layout.tail, layout.xh_bytes),
+            (1200, 1280, 384)
+        );
+    }
+
+    #[test]
+    fn the_pair_layout_fits_exactly_and_refuses_one_byte_less() {
+        let need = 1280 + 384;
+        assert!(pair_layout((3, 100, 64), need).is_some());
+        assert_eq!(pair_layout((3, 100, 64), need - 1), None);
+        assert_eq!(pair_layout((3, 100, 64), 0), None);
+    }
+
+    #[test]
+    fn the_pair_layout_refuses_an_inter_above_half_of_hidden() {
+        // The partial-sum range is pairs * max(hidden, inter) F32: the head takes 4 * inter and the
+        // second rotated rows 2 * hidden of the 4 * hidden bytes a pair row owns.
+        for (hidden, inter, expect) in [
+            (2048, 1024, true),
+            (2048, 1025, false),
+            (2048, 2048, false),
+            (512, 2048, false),
+            (4096, 2048, true),
+        ] {
+            let pairs = 64;
+            let range = pairs * hidden.max(inter) * 4;
+            assert_eq!(
+                pair_layout((pairs, inter, hidden), range).is_some(),
+                expect,
+                "hidden {hidden} inter {inter}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pair_layout_refuses_sizes_that_overflow() {
+        assert_eq!(pair_layout((usize::MAX, 2, 2), usize::MAX), None);
+        assert_eq!(pair_layout((2, usize::MAX, 2), usize::MAX), None);
+        assert_eq!(pair_layout((2, 2, usize::MAX), usize::MAX), None);
+    }
 
     #[test]
     fn the_sort_groups_pairs_by_expert_and_keeps_chunk_order_within_one() {

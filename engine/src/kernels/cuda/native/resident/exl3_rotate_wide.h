@@ -27,6 +27,8 @@ enum WideMutant {
     wide_contract,            // the first butterfly step takes fused multiply-adds
     wide_gather_row,          // the row list is read at the neighbouring row
     wide_tail,                // the last group of the table is dropped
+    wide_drop_product_flag,   // a non-finite product is zeroed without flagging the call
+    wide_drop_scale_flag,     // a non-finite scaled value is zeroed without flagging the call
 };
 
 // The rows [lo, hi) of the table that one job owns; member < 0 when no job does.
@@ -43,8 +45,10 @@ __device__ __forceinline__ bool job_holds(const inference_cuda_exl3_jobs_args &p
 
 // A table lists its jobs back to back in row order, so the owner of a row is the last entry that
 // starts at or before it, found by bisection. A table in another order, or a row that no job
-// holds, is settled by a scan of every entry: the result is the same job the one-block-per-job
-// kernel would have run for the row, or none.
+// holds, is settled by a scan of every entry. For tables whose valid jobs hold disjoint rows (the
+// contract of exl3.h) the result is the job the one-block-per-job kernel would have run for the
+// row, or none; where two valid jobs overlap, that kernel's last writer wins and this one takes
+// the first job it finds, so an overlapping table is outside the identity.
 __device__ WideOwner wide_find_owner(const inference_cuda_exl3_jobs_args &p, uint32_t row) {
     uint32_t low = 0, high = p.jobs_count;
     while (low < high) {
@@ -132,7 +136,10 @@ __device__ __forceinline__ uint2 wide_rotate_group(float4 x, float4 s, unsigned 
     }
     #pragma unroll
     for (unsigned i = 0; i < 4; ++i) {
-        if (!isfinite(v[i])) { non_finite = true; v[i] = 0.0f; }
+        if (!isfinite(v[i])) {
+            if (Mutant != wide_drop_product_flag) non_finite = true;
+            v[i] = 0.0f;
+        }
     }
     if constexpr (Mutant == wide_contract) {
         // What the compiler may do to x * suh + y when the product is not pinned.
@@ -145,7 +152,10 @@ __device__ __forceinline__ uint2 wide_rotate_group(float4 x, float4 s, unsigned 
     #pragma unroll
     for (unsigned i = 0; i < 4; ++i) {
         v[i] = __fmul_rn(v[i], scale);
-        if (!isfinite(v[i])) { non_finite = true; v[i] = 0.0f; }
+        if (!isfinite(v[i])) {
+            if (Mutant != wide_drop_scale_flag) non_finite = true;
+            v[i] = 0.0f;
+        }
     }
     return make_uint2(wide_pack(v[0], v[1]), wide_pack(v[2], v[3]));
 }

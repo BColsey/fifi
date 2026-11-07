@@ -43,10 +43,11 @@ fn midrows_enabled(rows: usize, legacy: Option<&std::ffi::OsStr>) -> bool {
 /// once: a change after the first EXL3 call is ignored.
 pub(crate) const SINGLE_GATHER_VAR: &str = "FIFI_EXL3_SINGLE_GATHER";
 
-/// Opt-in switch of the warp-wide input rotation of the job-table projections: unset or `0` keeps the
-/// one-thread-per-value kernel, `1` rotates each 128-value group with one warp (registers and lane
-/// exchanges, no block barriers). Same bytes. Every other value is refused, never a silent
-/// fallback. Process-wide, read once: a change after the first job-table call is ignored.
+/// Opt-in switch of the warp-wide input rotation of the job-table projections: unset or `0`
+/// keeps the one-thread-per-value kernel, `1` rotates each 128-value group with one warp
+/// (registers and lane exchanges, no block barriers). Same bytes. Every other value is refused,
+/// never a silent fallback. Process-wide, read once: a change after the first job-table call is
+/// ignored.
 pub(crate) const JOBS_WARP_ROTATE_VAR: &str = "FIFI_EXL3_JOBS_WARP_ROTATE";
 
 /// Opt-in switch of the combined gate and up input rotation of the routed experts: unset or `0`
@@ -497,8 +498,8 @@ impl CudaContext {
     }
 
     /// Refuses a bad value of an EXL3 launch switch (`FIFI_EXL3_SINGLE_GATHER`, [`DP4A_VAR`],
-    /// [`INDEXED_PAIRS_VAR`], [`JOBS_WARP_ROTATE_VAR`], [`JOBS_PAIR_ROTATE_VAR`]) and an id-indexed option the single-row kernel cannot run with; a
-    /// session start calls it.
+    /// [`INDEXED_PAIRS_VAR`], [`JOBS_WARP_ROTATE_VAR`], [`JOBS_PAIR_ROTATE_VAR`]) and an
+    /// id-indexed option the single-row kernel cannot run with; a session start calls it.
     pub(crate) fn check_single_gather(&self) -> Result<(), EngError> {
         jobs_warp_rotate_setting()?;
         jobs_pair_rotate_setting()?;
@@ -508,7 +509,9 @@ impl CudaContext {
     /// The load-line suffix of this context's EXL3 launch switches: empty for the shuffle kernel
     /// and the default id-indexed launch, so the default line is unchanged;
     /// ` single_gather=on single_kernel=<name>` when the single-row switch is armed, then
-    /// ` exl3_dp4a=on` and ` exl3_indexed_pairs=20` for the id-indexed options that are on.
+    /// ` exl3_dp4a=on` and ` exl3_indexed_pairs=20` for the id-indexed options that are on, then
+    /// ` exl3_jobs_warp_rotate=on` and ` exl3_jobs_pair_rotate=on` for the rotation switches that
+    /// are on.
     pub(crate) fn single_gather_suffix(&self) -> String {
         let single = self
             .single_row_setting()
@@ -520,7 +523,15 @@ impl CudaContext {
         let options = self
             .exl3_indexed_options()
             .map_or(String::new(), IndexedOptions::suffix);
-        single + &options
+        let rotation = [
+            (jobs_warp_rotate_setting(), " exl3_jobs_warp_rotate=on"),
+            (jobs_pair_rotate_setting(), " exl3_jobs_pair_rotate=on"),
+        ]
+        .into_iter()
+        .filter(|(setting, _)| matches!(setting, Ok(true)))
+        .map(|(_, text)| text)
+        .collect::<String>();
+        single + &options + &rotation
     }
 }
 
@@ -775,7 +786,7 @@ impl CudaContext {
         })
     }
 
-    /// The input rotation of `call` by the deliberately wrong variant `mutant` (1 to 5), alone:
+    /// The input rotation of `call` by the deliberately wrong variant `mutant` (1 to 7), alone:
     /// the projection and output rotation do not run. For the mutation tests.
     #[cfg(feature = "cuda-exl3-rotate-mutants")]
     pub(crate) fn exl3_jobs_rotate_mutant(
@@ -852,31 +863,23 @@ impl CudaContext {
         Ok((raw, needs))
     }
 
-    /// The gate and up projections of the routed experts: two calls over the same rows and table
-    /// with their own scales and rotated-row buffers. With the pair switch on and both calls
-    /// aligned for the warp-wide kernel, the rows are read and rotated once for both, then each
-    /// call projects; otherwise the two calls run one after the other. The bytes are the same.
-    pub(crate) fn exl3_jobs_pair(
-        &self,
-        stream: &DeviceStream,
-        calls: (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
-    ) -> Result<(), EngError> {
-        self.exl3_jobs_pair_mode(stream, calls, (jobs_pair_rotate_setting()?, None))
-    }
-
     /// Whether the pair switch is on; a bad value of the variable is refused.
     pub(crate) fn exl3_jobs_pair_enabled(&self) -> Result<bool, EngError> {
         jobs_pair_rotate_setting()
     }
 
-    /// [`Self::exl3_jobs_pair`] with the switch and the fused-output request given (`None` is the
-    /// environment's), for the device tests.
+    /// The gate and up projections of the routed experts: two calls over the same rows and table
+    /// with their own scales and rotated-row buffers. With `pair` set and both calls aligned for
+    /// the warp-wide kernel, the rows are read and rotated once for both, then each call
+    /// projects; otherwise the two calls run one after the other. The bytes are the same.
+    /// `fused_out` is the fused-output request (`None` is the environment's). Returns whether
+    /// the pair rotation ran.
     pub(crate) fn exl3_jobs_pair_mode(
         &self,
         stream: &DeviceStream,
         (first, second): (Exl3JobsCall<'_>, Exl3JobsCall<'_>),
         (pair, fused_out): (bool, Option<bool>),
-    ) -> Result<(), EngError> {
+    ) -> Result<bool, EngError> {
         if !pair || !self.pair_usable(&first, &second)? {
             jobs_warp_rotate_setting()?;
             for call in [first, second] {
@@ -885,7 +888,7 @@ impl CudaContext {
                     None => ffi::jobs(s, raw),
                 })?;
             }
-            return Ok(());
+            return Ok(false);
         }
         let ((ra, na), (rb, nb)) = (self.checked_jobs(&first)?, self.checked_jobs(&second)?);
         require_pair_apart((&first, &na), (&second, &nb))?;
@@ -893,7 +896,8 @@ impl CudaContext {
             ffi::jobs_rotate_pair(s, (&ra, &rb))?;
             ffi::jobs_rotated(s, &ra, fused_out)?;
             ffi::jobs_rotated(s, &rb, fused_out)
-        })
+        })?;
+        Ok(true)
     }
 
     /// Whether the pair rotation accepts the two calls (`exl3.h`).
@@ -908,7 +912,7 @@ impl CudaContext {
         })
     }
 
-    /// The pair rotation alone, by the deliberately wrong variant `mutant` (1 or 2).
+    /// The pair rotation alone, by the deliberately wrong variant `mutant` (1 to 3).
     #[cfg(feature = "cuda-exl3-rotate-mutants")]
     pub(crate) fn exl3_jobs_pair_mutant(
         &self,

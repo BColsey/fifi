@@ -2,26 +2,38 @@
  * inside its unnamed namespace, after exl3_rotate_wide.h; it declares no namespace of its own. */
 #pragma once
 
-// Two projections that read the same rows (the gate and the up matrix of the routed experts) rotate
-// the same x by their own scales. This kernel reads each x group once and writes both rotated
-// rows: xh of call `a` with the scales of `a`, xh of call `b` with the scales of `b`. Each output is
-// computed by wide_rotate_group, the arithmetic of the separate rotation of that call, so both are
-// byte-identical to two separate calls. The two calls share x, the row list, the table, the shape
-// and the flag (jobs_pair_consistent).
+// Two projections that read the same rows (the gate and the up matrix of the routed experts)
+// rotate the same x by their own scales. This kernel reads each x group once and writes both
+// rotated rows: xh of call `a` with the scales of `a`, xh of call `b` with the scales of `b`.
+// Each output is computed by wide_rotate_group, the arithmetic of the separate rotation of that
+// call, so both are byte-identical to two separate calls. The two calls share x, the row list,
+// the table, the shape and the flag (jobs_pair_consistent).
 enum PairMutant {
     pair_exact = 0,
     pair_swapped_outputs,    // each rotation lands in the other call's xh
     pair_first_scales_twice,  // the second output is rotated by the first call's scales
+    pair_drop_b_flag,         // the non-finite values of the second output do not flag the call
 };
 
 // The facts two calls must share to be rotated together: the same input rows read the same way
 // through the same table, and a flag to report to, with the two outputs apart.
 bool jobs_pair_consistent(const inference_cuda_exl3_jobs_args &a,
                           const inference_cuda_exl3_jobs_args &b) {
-    return a.x == b.x && a.x_rows == b.x_rows && a.in_rows == b.in_rows && a.jobs == b.jobs &&
-        a.jobs_count == b.jobs_count && a.max_rows == b.max_rows && a.total_rows == b.total_rows &&
-        a.k == b.k && a.members == b.members && a.flag == b.flag && a.xh != b.xh &&
-        apart(a.xh, a.xh_bytes, b.xh, b.xh_bytes);
+    if (!(a.x == b.x && a.x_rows == b.x_rows && a.in_rows == b.in_rows && a.jobs == b.jobs &&
+          a.jobs_count == b.jobs_count && a.max_rows == b.max_rows &&
+          a.total_rows == b.total_rows && a.k == b.k && a.members == b.members &&
+          a.flag == b.flag && a.xh != b.xh && apart(a.xh, a.xh_bytes, b.xh, b.xh_bytes)))
+        return false;
+    // Both outputs are written before either call projects: apart from everything the rotation
+    // reads.
+    for (const uint16_t *xh : {a.xh, b.xh}) {
+        const size_t bytes = xh == a.xh ? a.xh_bytes : b.xh_bytes;
+        if (!apart(xh, bytes, a.x, a.x_bytes) || !apart(xh, bytes, a.suh, a.suh_bytes) ||
+            !apart(xh, bytes, b.suh, b.suh_bytes) || !apart(xh, bytes, a.jobs, a.jobs_bytes) ||
+            (a.in_rows && !apart(xh, bytes, a.in_rows, a.in_rows_bytes)))
+            return false;
+    }
+    return true;
 }
 
 // Whether the pair rotation can run: consistent calls, and both meet the alignment rules of the
@@ -88,13 +100,14 @@ jobs_input_rotate_pair(const __grid_constant__ inference_cuda_exl3_jobs_args a,
         if (xs[u]) x[u] = __ldg(reinterpret_cast<const float4 *>(xs[u]));
     }
 
-    bool non_finite = false;
+    bool non_finite = false, non_finite_b = false;
     #pragma unroll
     for (unsigned u = 0; u < wide_groups; ++u) {
         if (!live[u]) continue;
         *dst_a[u] = wide_rotate_group<wide_exact>(x[u], s_a[u], lane, non_finite);
-        *dst_b[u] = wide_rotate_group<wide_exact>(x[u], s_b[u], lane, non_finite);
+        *dst_b[u] = wide_rotate_group<wide_exact>(x[u], s_b[u], lane, non_finite_b);
     }
+    if (Mutant != pair_drop_b_flag) non_finite = non_finite || non_finite_b;
     if (__any_sync(0xffffffffu, non_finite) && lane == 0) atomicOr(a.flag, 1u);
 }
 

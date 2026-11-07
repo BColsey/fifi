@@ -15,6 +15,9 @@ use super::{
 mod pair;
 
 /// The scale of the butterfly, `rsqrtf(128.0f)` of the kernels, as the host reference needs it.
+/// This is the immediate nvcc folds the expression to (checked in the SASS of both kernels), so
+/// the host reference is coupled to that compiler behavior: a toolchain that emits a hardware
+/// reciprocal square root instead would move the reference by an ulp.
 const ROTATE_SCALE: f32 = f32::from_bits(0x3db5_04f3);
 
 /// How the reference evaluates the products of the first butterfly step: as separate roundings
@@ -93,9 +96,10 @@ fn network_from(v: &mut [f32; 128], first_step: usize) {
     }
 }
 
-/// The warp-wide layout on the host: lane `l` holds elements `4l..4l+4`; the steps at distance 1 and
-/// 2 run inside a lane, the steps at distance 4 to 64 are exchanges with lane `l ^ (step / 4)`, where
-/// the lane whose bit is set adds the negation of its own value to the partner's (a subtraction).
+/// The warp-wide layout on the host: lane `l` holds elements `4l..4l+4`; the steps at distance 1
+/// and 2 run inside a lane, the steps at distance 4 to 64 are exchanges with the partner lane
+/// (`l` xor `step / 4`), where the lane whose bit is set adds the negation of its own value to
+/// the partner's (a subtraction).
 fn warp_layout(group: &[f32; 128]) -> [f32; 128] {
     let mut lanes: Vec<[f32; 4]> = group.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
     for lane in &mut lanes {
@@ -178,7 +182,8 @@ impl Scales {
     }
 }
 
-fn scaled_bank(ctx: &CudaContext, k: usize, awkward: bool, seed: u64) -> (Bank, Scales) {
+/// The scales of a bank, `[suh | svh]` per member, on the host.
+fn host_scales(k: usize, awkward: bool, seed: u64) -> Scales {
     let mut rng = testkit::Rng::new(seed);
     let mut values = Vec::new();
     for member in 0..MEMBERS {
@@ -189,18 +194,25 @@ fn scaled_bank(ctx: &CudaContext, k: usize, awkward: bool, seed: u64) -> (Bank, 
         });
         values.extend((0..N).map(|_| 0.5 + rng.unit() as f32));
     }
+    Scales { values, k }
+}
+
+fn scaled_bank(ctx: &CudaContext, k: usize, awkward: bool, seed: u64) -> (Bank, Scales) {
+    let scales = host_scales(k, awkward, seed);
     let bank = bank_of(ctx, (k, N), (8, Codebook::Mul1), seed);
     let bank = Bank {
-        scales: testkit::upload_f32(ctx, &values),
+        scales: testkit::upload_f32(ctx, &scales.values),
         ..bank
     };
-    (bank, Scales { values, k })
+    (bank, scales)
 }
 
 /// One job-table call to run: its table, the rows of `x`, and an optional row list.
 struct Case {
     name: String,
     awkward: bool,
+    /// Members the call declares: the bank's, or 1 for a single matrix (strides ignored).
+    members: usize,
     jobs: Vec<Exl3Job>,
     total_rows: usize,
     max_rows: usize,
@@ -269,6 +281,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
         cases.push(Case {
             name: name.into(),
             awkward: false,
+            members: MEMBERS,
             max_rows: shape.iter().map(|&(_, r)| r as usize).max().unwrap(),
             x: rows_of(rng, total_rows, k),
             in_rows: None,
@@ -298,6 +311,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
     cases.push(Case {
         name: "gather list".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: 70,
         x: rows_of(rng, tokens, k),
         in_rows: Some(list),
@@ -309,6 +323,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
     cases.push(Case {
         name: "gather permutation".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: 33,
         x: rows_of(rng, total_rows, k),
         in_rows: Some((0..total_rows as u32).rev().collect()),
@@ -319,6 +334,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
     cases.push(Case {
         name: "rows no job holds".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: 10,
         x: rows_of(rng, 40, k),
         in_rows: None,
@@ -329,6 +345,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
     cases.push(Case {
         name: "unordered table".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: 18,
         x: rows_of(rng, 40, k),
         in_rows: None,
@@ -340,6 +357,7 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
     cases.push(Case {
         name: "refused jobs".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: 64,
         x: rows_of(rng, 100, k),
         in_rows: None,
@@ -353,17 +371,114 @@ fn suite(k: usize, scales: &Scales, rng: &mut testkit::Rng) -> Vec<Case> {
         ],
         total_rows: 100,
     });
+    // A sorted table of many short jobs: the owner of each row is found by bisection.
+    let mut shape = Vec::new();
+    for index in 0..120u32 {
+        shape.push((index % MEMBERS as u32, 1 + rng.below(5) as u32));
+    }
+    let (jobs, total_rows) = table(&shape);
+    cases.push(Case {
+        name: "sorted table of many jobs".into(),
+        awkward: false,
+        members: MEMBERS,
+        max_rows: 5,
+        x: rows_of(rng, total_rows, k),
+        in_rows: None,
+        jobs,
+        total_rows,
+    });
+    // A single matrix (members = 1): the strides are ignored and every job reads member 0.
+    let (jobs, total_rows) = table(&[(0, 33), (0, 1), (0, 40)]);
+    cases.push(Case {
+        name: "single member bank".into(),
+        awkward: false,
+        members: 1,
+        max_rows: 40,
+        x: rows_of(rng, total_rows, k),
+        in_rows: None,
+        jobs,
+        total_rows,
+    });
+    // More table entries than the grid has threads (one block of 128 for one row): one valid job
+    // and 299 entries that are refused (a member outside the bank, a negative first row, no rows),
+    // which the threads of the grid must all flag.
+    let mut jobs = vec![job(0, 0, 1)];
+    jobs.extend((1..300u32).map(|n| match n % 3 {
+        0 => job(MEMBERS as u32 + n, 0, 1),
+        1 => job(1, 0x8000_0000 + n, 1),
+        _ => job(2, 0, 0),
+    }));
+    cases.push(Case {
+        name: "more entries than threads".into(),
+        awkward: false,
+        members: MEMBERS,
+        max_rows: 1,
+        x: rows_of(rng, 1, k),
+        in_rows: None,
+        jobs,
+        total_rows: 1,
+    });
+    let awkward = awkward_rows(rng, scales);
     cases.push(Case {
         name: "awkward values".into(),
         awkward: true,
+        members: MEMBERS,
         max_rows: ROWS_PER_JOB,
-        x: awkward_rows(rng, scales),
+        x: awkward.clone(),
         in_rows: None,
         jobs: (0..MEMBERS as u32)
             .map(|m| job(m, m * ROWS_PER_JOB as u32, ROWS_PER_JOB as u32))
             .collect(),
         total_rows: MEMBERS * ROWS_PER_JOB,
     });
+    // The same rows in calls of their own, so that one kind of flag cannot hide behind another:
+    // rows whose products stay finite and whose sums overflow (flagged at the scaled value only;
+    // the members with ordinary scales), and NaN or infinite inputs (flagged at the product only).
+    // The extreme but finite kinds (zeros, tiny, subnormal, the cancelling trap rows) get a call of
+    // their own too: no flag may be raised for them. The call runs the projection and the output
+    // rotation as well, which flag an F16 infinity in xh, so the members with huge scales and the
+    // powers-of-two kind (rotated values far above 65,504) stay out.
+    for (name, kinds, members) in [
+        (
+            "awkward overflow rows only",
+            &[4usize][..],
+            &[0usize, 4][..],
+        ),
+        (
+            "awkward non-finite rows only",
+            &[2, 3][..],
+            &[0, 1, 2, 3, 4][..],
+        ),
+        (
+            "awkward finite rows only",
+            &[0, 1, 6, 7, 9, 10, 11][..],
+            &[0, 1, 4][..],
+        ),
+    ] {
+        let mut x = Vec::new();
+        let mut jobs = Vec::new();
+        for (slot, &member) in members.iter().enumerate() {
+            jobs.push(job(
+                member as u32,
+                (slot * kinds.len()) as u32,
+                kinds.len() as u32,
+            ));
+            for &kind in kinds {
+                let row = member * ROWS_PER_JOB + kind;
+                x.extend_from_slice(&awkward[row * k..(row + 1) * k]);
+            }
+        }
+        cases.push(Case {
+            name: name.into(),
+            awkward: true,
+            members: MEMBERS,
+            max_rows: kinds.len(),
+            x,
+            in_rows: None,
+            jobs,
+            total_rows: members.len() * kinds.len(),
+        });
+    }
     cases
 }
 
@@ -373,6 +488,9 @@ enum Path {
     PerValue,
     /// The warp-wide kernel, as requested.
     Warp,
+    /// The entry that reads the environment (`FIFI_EXL3_JOBS_WARP_ROTATE`,
+    /// `FIFI_EXL3_JOBS_FUSED_OUT`).
+    Env,
     /// A deliberately wrong variant of the warp-wide kernel, alone.
     #[cfg_attr(not(feature = "cuda-exl3-rotate-mutants"), allow(dead_code))]
     Mutant(i32),
@@ -416,7 +534,7 @@ fn rotate(
         svh: bank.scales.range(k * 4, bank.scales.bytes() - k * 4)?,
         trellis_stride: packed_elements_of(k, n, bank.bits_twice),
         scale_stride: k + n,
-        members: MEMBERS,
+        members: case.members,
         x: x_buf.range(shift.0, case.x.len() * 4)?,
         xh: xh.range(shift.1, xh_len)?,
         z: z.range(0, case.total_rows * n * 4)?,
@@ -444,6 +562,7 @@ fn rotate(
     match path {
         Path::PerValue => ctx.exl3_jobs_modes(stream, call, (fused_out, false))?,
         Path::Warp => ctx.exl3_jobs_modes(stream, call, (fused_out, true))?,
+        Path::Env => ctx.exl3_jobs(stream, call)?,
         #[cfg(feature = "cuda-exl3-rotate-mutants")]
         Path::Mutant(mutant) => ctx.exl3_jobs_rotate_mutant(stream, call, mutant)?,
         #[cfg(not(feature = "cuda-exl3-rotate-mutants"))]
@@ -489,9 +608,104 @@ fn device() -> Option<(CudaContext, DeviceStream)> {
     Some((ctx, stream))
 }
 
+/// The limits `jobs_views` enforces on a call, checked on the host against a case: the table and
+/// the row counts, the sizes of the row buffers, the row list and the member count.
+fn check_case_bounds(case: &Case, k: usize) {
+    let name = &case.name;
+    assert!(k >= 128 && k.is_multiple_of(128), "{name}: K {k}");
+    assert!(
+        (1..=4096).contains(&case.jobs.len()),
+        "{name}: {} jobs",
+        case.jobs.len()
+    );
+    assert!(
+        (1..=256).contains(&case.max_rows),
+        "{name}: max_rows {}",
+        case.max_rows
+    );
+    assert!(
+        (1..=65536).contains(&case.total_rows),
+        "{name}: total_rows {}",
+        case.total_rows
+    );
+    assert!(
+        case.total_rows * k <= 1 << 32 && case.total_rows * N <= 1 << 32,
+        "{name}"
+    );
+    assert!((1..=MEMBERS).contains(&case.members), "{name}: members");
+    assert!(case.x.len().is_multiple_of(k), "{name}: x is whole rows");
+    let x_rows = case.x.len() / k;
+    assert!((1..=65536).contains(&x_rows), "{name}: x rows {x_rows}");
+    match &case.in_rows {
+        None => assert_eq!(
+            x_rows, case.total_rows,
+            "{name}: no list, x holds the table rows"
+        ),
+        Some(list) => assert_eq!(list.len(), case.total_rows, "{name}: one entry a table row"),
+    }
+    assert!(
+        case.jobs
+            .iter()
+            .any(|job| (job.row0 as i32) >= 0 && job.rows >= 1),
+        "{name}: at least one job can run"
+    );
+}
+
+/// The largest rotated value of `case` in F16, by the host reference; infinite when any value
+/// overflows F16 (the projection of such an xh flags the call, which the rotation does not).
+fn largest_rotated(case: &Case, scales: &Scales) -> f32 {
+    let k = scales.k;
+    let mut largest = 0.0f32;
+    for job in &case.jobs {
+        for row in job.row0 as usize..(job.row0 + job.rows) as usize {
+            let x = &case.x[row * k..(row + 1) * k];
+            let (bits, _) = reference_row(x, scales.suh(job.member as usize), Fuse::Never);
+            for bit in bits {
+                largest = largest.max(testkit::f16_to_f32(bit).abs());
+            }
+        }
+    }
+    largest
+}
+
+#[test]
+fn the_suites_build_on_the_host_and_every_case_meets_the_call_bounds() {
+    // Host only: debug arithmetic on, no device. A panic while a case is built, or a case that
+    // jobs_views would refuse, fails here before any lease.
+    let mut rng = testkit::Rng::new(0x5741_525f);
+    for k in GRID {
+        let mut total = 0;
+        for awkward in [false, true] {
+            let scales = host_scales(k, awkward, 0x5741_5260 + k as u64);
+            let mut cases = suite(k, &scales, &mut rng);
+            total += cases.len();
+            cases.retain(|case| case.awkward == awkward);
+            assert_eq!(cases.len(), if awkward { 4 } else { 11 }, "k={k}");
+            for case in &cases {
+                check_case_bounds(case, k);
+                // The finite case runs the whole call: its rotated values must stay inside F16, or
+                // the projection of the infinity would flag it. The weights of a decoded tile are
+                // below 4 in magnitude, so a bound of 65,504 on xh keeps every partial sum finite
+                // in F32 for K up to 4,096 (65,504 * 4 * 4,096 is about 1e9).
+                if case.name == "awkward finite rows only" {
+                    let largest = largest_rotated(case, &scales);
+                    assert!(largest < 65_504.0, "k={k}: largest rotated value {largest}");
+                    assert!(largest > 0.0, "k={k}: the case must rotate something");
+                }
+            }
+        }
+        // `suite` builds every case each time; the ordinary bank keeps 11 of them, the extreme
+        // one 4.
+        assert_eq!(total, 2 * CASES_PER_K, "k={k}");
+    }
+}
+
 /// K values of the grid: the three served shapes and the odd group counts (1, 2, 3 groups a row)
 /// that leave the last warp of the grid with fewer than four groups.
 const GRID: [usize; 6] = [128, 256, 384, 512, 2048, 4096];
+
+/// Cases of one value of K: 11 on the ordinary bank, 4 on the awkward one.
+const CASES_PER_K: usize = 15;
 
 fn banks_and_cases(
     ctx: &CudaContext,
@@ -532,8 +746,8 @@ fn warp_rotation_is_byte_identical_to_the_per_value_kernel_over_the_grid() {
             }
         }
     }
-    // 6 values of K, 8 plain cases on the ordinary bank and 1 on the awkward bank.
-    assert_eq!(compared, 6 * 9);
+    // 6 values of K, 11 plain cases on the ordinary bank and 4 on the awkward bank.
+    assert_eq!(compared, 6 * CASES_PER_K);
 }
 
 #[test]
@@ -564,6 +778,14 @@ fn the_cases_exercise_what_they_name() {
                     assert!((90..96).all(rows_written));
                 }
                 "gather list" => assert_eq!(run.flag & 1, 1, "an entry past x flags the call"),
+                "more entries than threads" => {
+                    assert_eq!(run.flag & 1, 1, "refused entries flag the call");
+                    assert!(rows_written(0), "the one valid job runs");
+                }
+                "awkward overflow rows only" | "awkward non-finite rows only" => {
+                    assert_eq!(run.flag & 1, 1, "{}", case.name);
+                    assert!((0..case.total_rows).all(rows_written));
+                }
                 "awkward values" => {
                     assert_eq!(run.flag & 1, 1, "non-finite values flag the call");
                     assert!((0..case.total_rows).all(rows_written));
@@ -676,6 +898,184 @@ fn the_host_reference_rotates_an_impulse_to_a_flat_row_of_the_scale() {
     assert!(reference_row(&x, &[1.0; 128], Fuse::Never).1);
 }
 
+/// Whether the host reference flags any row of `case` (a non-finite product, or a non-finite
+/// scaled value); the rows are read straight, the cases that use it carry no row list.
+fn expected_flag(case: &Case, scales: &Scales) -> bool {
+    let k = scales.k;
+    case.jobs.iter().any(|job| {
+        (job.row0 as usize..(job.row0 + job.rows) as usize).any(|row| {
+            let x = &case.x[row * k..(row + 1) * k];
+            reference_row(x, scales.suh(job.member as usize), Fuse::Never).1
+        })
+    })
+}
+
+#[test]
+fn the_device_flag_follows_the_host_reference_on_every_awkward_case() {
+    let Some((ctx, stream)) = device() else {
+        return;
+    };
+    let rig = (&ctx, &stream);
+    let mut rng = testkit::Rng::new(0x5741_525a);
+    for k in [256, 2048] {
+        let (bank, scales) = scaled_bank(&ctx, k, true, 0x5741_525b + k as u64);
+        let mut cases = suite(k, &scales, &mut rng);
+        cases.retain(|case| case.awkward);
+        assert_eq!(cases.len(), 4);
+        for case in &cases {
+            let want = expected_flag(case, &scales);
+            // Only the finite rows stay clear of the flag; the device must agree both ways.
+            assert_eq!(
+                want,
+                case.name != "awkward finite rows only",
+                "k={k} {}: the host reference",
+                case.name
+            );
+            for path in [Path::PerValue, Path::Warp] {
+                let run = rotate(rig, &bank, case, (path, false, (0, 0))).expect("run");
+                assert_eq!(
+                    run.flag & 1,
+                    u32::from(want),
+                    "k={k} {} {path:?}",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+/// The variable that the child tests set, and the name of this process's role.
+const CHILD_MARK: &str = "FIFI_ROTATE_TEST_CHILD";
+
+/// In the parent process: runs the test `name` again in a child process of the test executable,
+/// once for each environment of `runs`, and checks that each child passed on a device. Returns
+/// true in a child, where the caller runs the body of the test. The switches are read once per
+/// process, so each value needs a process of its own.
+fn run_in_children(name: &str, runs: &[&[(&str, &str)]]) -> bool {
+    if std::env::var_os(CHILD_MARK).is_some() {
+        return true;
+    }
+    if !testkit::device_present("EXL3 rotation switches") {
+        return false;
+    }
+    let path = format!(
+        "{}::{name}",
+        module_path!().split_once("::").expect("crate path").1
+    );
+    for env in runs {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &path, "--test-threads=1", "--nocapture"])
+            .env_remove("FIFI_EXL3_JOBS_WARP_ROTATE")
+            .env_remove("FIFI_EXL3_JOBS_PAIR_ROTATE")
+            .env(CHILD_MARK, "1")
+            .envs(env.iter().copied())
+            .output()
+            .expect("the child process");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success()
+                && text.contains("test result: ok. 1 passed")
+                && !text.contains("SKIPPED"),
+            "child with {env:?} failed:\n{text}"
+        );
+    }
+    false
+}
+
+const WARP_VAR: &str = "FIFI_EXL3_JOBS_WARP_ROTATE";
+const PAIR_VAR: &str = "FIFI_EXL3_JOBS_PAIR_ROTATE";
+
+fn runs_of<'a>(var: &'a str, values: &[&'a str]) -> Vec<Vec<(&'a str, &'a str)>> {
+    values.iter().map(|value| vec![(var, *value)]).collect()
+}
+
+#[test]
+fn a_bad_warp_switch_is_refused_by_the_session_check_and_by_the_launch() {
+    let runs = runs_of(WARP_VAR, &["2", "on", "", "01"]);
+    let refs: Vec<&[(&str, &str)]> = runs.iter().map(Vec::as_slice).collect();
+    if !run_in_children(
+        "a_bad_warp_switch_is_refused_by_the_session_check_and_by_the_launch",
+        &refs,
+    ) {
+        return;
+    }
+    let (ctx, stream) = device().expect("a device");
+    let refusal = ctx.check_single_gather().expect_err("the session check");
+    assert!(format!("{refusal:?}").contains(WARP_VAR), "{refusal:?}");
+    let (bank, scales) = scaled_bank(&ctx, 256, false, 0x5741_525c);
+    let cases = suite(256, &scales, &mut testkit::Rng::new(0x5741_525d));
+    let launch = rotate(
+        (&ctx, &stream),
+        &bank,
+        &cases[0],
+        (Path::Env, false, (0, 0)),
+    );
+    let refusal = launch.err().expect("the launch is refused");
+    assert!(format!("{refusal:?}").contains(WARP_VAR), "{refusal:?}");
+}
+
+#[test]
+fn a_bad_pair_switch_is_refused_by_the_session_check_and_the_enabled_query() {
+    let runs = runs_of(PAIR_VAR, &["2", "on", "", "01"]);
+    let refs: Vec<&[(&str, &str)]> = runs.iter().map(Vec::as_slice).collect();
+    if !run_in_children(
+        "a_bad_pair_switch_is_refused_by_the_session_check_and_the_enabled_query",
+        &refs,
+    ) {
+        return;
+    }
+    let (ctx, _) = device().expect("a device");
+    let refusal = ctx.check_single_gather().expect_err("the session check");
+    assert!(format!("{refusal:?}").contains(PAIR_VAR), "{refusal:?}");
+    let refusal = ctx.exl3_jobs_pair_enabled().expect_err("the enabled query");
+    assert!(format!("{refusal:?}").contains(PAIR_VAR), "{refusal:?}");
+}
+
+#[test]
+fn good_switch_values_pass_the_check_name_themselves_on_the_load_line_and_reach_the_launch() {
+    let runs: Vec<Vec<(&str, &str)>> = vec![
+        vec![(WARP_VAR, "1")],
+        vec![(PAIR_VAR, "1")],
+        vec![(WARP_VAR, "1"), (PAIR_VAR, "1")],
+        vec![(WARP_VAR, "0"), (PAIR_VAR, "0")],
+    ];
+    let refs: Vec<&[(&str, &str)]> = runs.iter().map(Vec::as_slice).collect();
+    if !run_in_children(
+        "good_switch_values_pass_the_check_name_themselves_on_the_load_line_and_reach_the_launch",
+        &refs,
+    ) {
+        return;
+    }
+    let (ctx, stream) = device().expect("a device");
+    ctx.check_single_gather().expect("the session check");
+    let on = |var: &str| std::env::var(var).is_ok_and(|value| value == "1");
+    let line = ctx.single_gather_suffix();
+    assert_eq!(
+        line.contains(" exl3_jobs_warp_rotate=on"),
+        on(WARP_VAR),
+        "{line}"
+    );
+    assert_eq!(
+        line.contains(" exl3_jobs_pair_rotate=on"),
+        on(PAIR_VAR),
+        "{line}"
+    );
+    assert_eq!(ctx.exl3_jobs_pair_enabled().expect("pair"), on(PAIR_VAR));
+    // The entry that reads the environment gives the bytes of the one-thread-per-value kernel.
+    let (bank, scales) = scaled_bank(&ctx, 512, false, 0x5741_525e);
+    let cases = suite(512, &scales, &mut testkit::Rng::new(0x5741_525f));
+    let rig = (&ctx, &stream);
+    for case in &cases[..4] {
+        let old = rotate(rig, &bank, case, (Path::PerValue, false, (0, 0))).expect("old");
+        let env = rotate(rig, &bank, case, (Path::Env, false, (0, 0))).expect("env");
+        assert_eq!(difference(&old, &env, true), None, "{}", case.name);
+    }
+}
+
 #[test]
 fn calls_the_warp_kernel_cannot_take_run_the_per_value_kernel_with_the_same_bytes() {
     let Some((ctx, stream)) = device() else {
@@ -733,7 +1133,7 @@ fn the_whole_projection_is_byte_identical_with_the_warp_rotation_on_and_off() {
             }
         }
     }
-    assert_eq!(compared, 3 * 9 * 2);
+    assert_eq!(compared, 3 * CASES_PER_K * 2);
 }
 
 /// Whether the mutant `mutant` gives bytes different from the per-value kernel on some case of the
@@ -786,6 +1186,22 @@ fn mutant_fused_multiply_add_is_caught() {
 #[test]
 fn mutant_wrong_gather_row_is_caught() {
     if let Some(caught) = mutant_is_caught(4) {
+        assert!(caught);
+    }
+}
+
+#[cfg(feature = "cuda-exl3-rotate-mutants")]
+#[test]
+fn mutant_dropped_product_flag_is_caught() {
+    if let Some(caught) = mutant_is_caught(6) {
+        assert!(caught);
+    }
+}
+
+#[cfg(feature = "cuda-exl3-rotate-mutants")]
+#[test]
+fn mutant_dropped_scale_flag_is_caught() {
+    if let Some(caught) = mutant_is_caught(7) {
         assert!(caught);
     }
 }

@@ -238,19 +238,46 @@ int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *args,
  * default is off); the fusion applies only when the register-decode kernel is taken. */
 int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *args,
                                        void *stream, int *out_stage, int fused_out);
-/* The same launches with both requests explicit: the fused output rotation (above) and the warp-wide
- * input rotation. The FIFI_EXL3_JOBS_WARP_ROTATE default is off. The wide kernel gives the same xh bits
- * as the one-thread-per-value kernel; it needs x and suh 16-byte aligned (and the member stride of the
- * scales a multiple of 4 floats), xh 8-byte aligned, and a call that does not meet that runs the
- * one-thread-per-value kernel whatever the request. */
+/* The same launches with both requests explicit: the fused output rotation (above) and the
+ * warp-wide input rotation. The FIFI_EXL3_JOBS_WARP_ROTATE default is off. The wide kernel gives
+ * the same xh bits as the one-thread-per-value kernel; it needs x and suh 16-byte aligned (and
+ * the member stride of the scales a multiple of 4 floats), xh 8-byte aligned, and a call that
+ * does not meet that runs the one-thread-per-value kernel whatever the request. */
 int inference_cuda_exl3_jobs_modes(const inference_cuda_exl3_jobs_args *args,
                                    void *stream, int *out_stage, int fused_out, int wide_input);
-/* Whether the warp-wide input rotation would run for a call with the request `enabled` (1) or not (0),
- * from the alignment rules alone; INFERENCE_CUDA_INVALID_ARGUMENT for a null args pointer. */
+/* Whether the warp-wide input rotation would run for a call with the request `enabled` (1) or
+ * not (0), from the alignment rules alone; INFERENCE_CUDA_INVALID_ARGUMENT for a null args
+ * pointer. */
 int inference_cuda_exl3_jobs_wide_input_kernel(const inference_cuda_exl3_jobs_args *args, int enabled);
-/* The reading of the FIFI_EXL3_JOBS_WARP_ROTATE text: 1 for exactly "1", 0 for "0" or a null text, -1
- * for any other text (a launch treats -1 as off). */
+/* The reading of the FIFI_EXL3_JOBS_WARP_ROTATE text: 1 for exactly "1", 0 for "0" or a null
+ * text, -1 for any other text (a launch treats -1 as off). */
 int inference_cuda_exl3_jobs_wide_input_setting(const char *text);
+
+/* The input rotation of two job-table calls that read the same rows, in one pass: call a is
+ * rotated into its xh by its scales, call b into its xh by its scales, each by the arithmetic of
+ * the warp-wide rotation, so both are byte-identical to two separate calls. The calls must share
+ * x (pointer and row count), the row list, the table (pointer, count, max_rows), total_rows, K,
+ * the member count and the flag, and meet the alignment rules of
+ * inference_cuda_exl3_jobs_wide_input_kernel. The two xh ranges must be apart from each other
+ * and from x, both scales, the table and the row list (these are checked here). Each xh against
+ * the other call's trellis, svh, z, out and flag is the caller's duty (the Rust wrapper's
+ * require_pair_apart checks it). Writes only the two xh ranges and the flag; the projection and
+ * the output rotation are not run. A call that fails the checks is refused with
+ * INFERENCE_CUDA_INVALID_ARGUMENT before any launch. */
+int inference_cuda_exl3_jobs_rotate_pair(const inference_cuda_exl3_jobs_args *a,
+                                         const inference_cuda_exl3_jobs_args *b,
+                                         void *stream, int *out_stage);
+/* 1 when inference_cuda_exl3_jobs_rotate_pair accepts the two calls (the consistency and alignment
+ * rules above), 0 when it does not, INFERENCE_CUDA_INVALID_ARGUMENT for a null pointer. Looks at
+ * pointers and integers only. */
+int inference_cuda_exl3_jobs_pair_usable(const inference_cuda_exl3_jobs_args *a,
+                                         const inference_cuda_exl3_jobs_args *b);
+/* The projection and the output rotation of a call whose xh already holds the rotated input rows
+ * (written by inference_cuda_exl3_jobs_rotate_pair on the same stream): the input rotation is
+ * skipped. fused_out is the fused output rotation request, negative for the environment's. Calling
+ * it on an xh that was not rotated projects whatever xh holds. */
+int inference_cuda_exl3_jobs_rotated(const inference_cuda_exl3_jobs_args *a, void *stream,
+                                     int *out_stage, int fused_out);
 
 /* Member addressing of a job-table call, shared by every stage kernel that reads the table: the
  * trellis of member m starts trellis_stride u16 elements after member m-1's, its suh and svh

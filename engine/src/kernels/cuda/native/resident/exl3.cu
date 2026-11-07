@@ -2597,8 +2597,8 @@ extern "C" int inference_cuda_exl3_jobs_wide_input_setting(const char *text) {
 }
 
 #ifdef INFERENCE_CUDA_EXL3_ROTATE_MUTANTS
-// The input rotation of a job-table call by a deliberately wrong variant (WideMutant, 1 to 5),
-// then the unchanged projection and output rotation, for the mutation tests only.
+// The input rotation of a job-table call by a deliberately wrong variant (WideMutant, 1 to 7),
+// alone: the projection and the output rotation do not run. For the mutation tests only.
 extern "C" int inference_cuda_exl3_jobs_rotate_mutant(const inference_cuda_exl3_jobs_args *a,
                                                       void *stream, int *out_stage, int mutant) {
     try {
@@ -2611,6 +2611,8 @@ extern "C" int inference_cuda_exl3_jobs_rotate_mutant(const inference_cuda_exl3_
             case wide_contract: launch_wide_input<wide_contract>(*a, s); break;
             case wide_gather_row: launch_wide_input<wide_gather_row>(*a, s); break;
             case wide_tail: launch_wide_input<wide_tail>(*a, s); break;
+            case wide_drop_product_flag: launch_wide_input<wide_drop_product_flag>(*a, s); break;
+            case wide_drop_scale_flag: launch_wide_input<wide_drop_scale_flag>(*a, s); break;
             default: return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Failure failure;
@@ -2620,7 +2622,7 @@ extern "C" int inference_cuda_exl3_jobs_rotate_mutant(const inference_cuda_exl3_
     } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
-// The pair rotation by a deliberately wrong variant (PairMutant, 1 or 2), for the mutation tests.
+// The pair rotation by a deliberately wrong variant (PairMutant, 1 to 3), for the mutation tests.
 extern "C" int inference_cuda_exl3_jobs_rotate_pair_mutant(const inference_cuda_exl3_jobs_args *a,
                                                            const inference_cuda_exl3_jobs_args *b,
                                                            void *stream, int *out_stage,
@@ -2633,6 +2635,7 @@ extern "C" int inference_cuda_exl3_jobs_rotate_pair_mutant(const inference_cuda_
         switch (mutant) {
             case pair_swapped_outputs: launch_pair_input<pair_swapped_outputs>(*a, *b, s); break;
             case pair_first_scales_twice: launch_pair_input<pair_first_scales_twice>(*a, *b, s); break;
+            case pair_drop_b_flag: launch_pair_input<pair_drop_b_flag>(*a, *b, s); break;
             default: return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Failure failure;

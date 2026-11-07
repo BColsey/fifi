@@ -75,7 +75,7 @@ fn run_pair(
             svh: bank.scales.range(k * 4, bank.scales.bytes() - k * 4)?,
             trellis_stride: packed_elements_of(k, n, bank.bits_twice),
             scale_stride: k + n,
-            members: MEMBERS,
+            members: case.members,
             x: x_buf.range(shifts[0], case.x.len() * 4)?,
             xh: xh[at].range(shifts[1 + at], xh_len)?,
             z: z[at].range(0, out_len)?,
@@ -112,9 +112,18 @@ fn run_pair(
                 ctx.exl3_jobs_modes(stream, call(at)?, (false, true))?;
             }
         }
-        How::Pair => ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (true, Some(false)))?,
+        How::Pair => {
+            let taken =
+                ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (true, Some(false)))?;
+            assert_eq!(
+                taken, usable,
+                "the pair rotation runs exactly when the calls allow it"
+            );
+        }
         How::PairOff => {
-            ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (false, Some(false)))?;
+            let taken =
+                ctx.exl3_jobs_pair_mode(stream, (call(0)?, call(1)?), (false, Some(false)))?;
+            assert!(!taken, "the pair rotation must not run with the switch off");
         }
         #[cfg(feature = "cuda-exl3-rotate-mutants")]
         How::Mutant(mutant) => ctx.exl3_jobs_pair_mutant(stream, (call(0)?, call(1)?), mutant)?,
@@ -158,6 +167,31 @@ fn setup(ctx: &CudaContext, k: usize, awkward: bool) -> (Bank, Bank, Vec<Case>) 
     (first, second, cases)
 }
 
+/// A second bank whose scales hold an infinity, so that only the second rotation of a pair sees a
+/// non-finite product (the first bank is ordinary), with the first case of the suite.
+fn poisoned_setup(ctx: &CudaContext, k: usize) -> (Bank, Bank, Vec<Case>) {
+    let (first, scales) = scaled_bank(ctx, k, false, 0x5041_4952 + k as u64);
+    let (second, mut poisoned) = scaled_bank(ctx, k, false, 0x5041_4953 + k as u64);
+    poisoned.values[0] = f32::INFINITY;
+    let second = Bank {
+        scales: testkit::upload_f32(ctx, &poisoned.values),
+        ..second
+    };
+    let mut rng = testkit::Rng::new(0x5041_4955 + k as u64);
+    let mut cases = suite(k, &scales, &mut rng);
+    cases.truncate(1);
+    (first, second, cases)
+}
+
+/// The pairs of banks the tests run: ordinary, extreme-valued, and one with a poisoned second bank.
+fn all_setups(ctx: &CudaContext, k: usize) -> Vec<(Bank, Bank, Vec<Case>)> {
+    vec![
+        setup(ctx, k, false),
+        setup(ctx, k, true),
+        poisoned_setup(ctx, k),
+    ]
+}
+
 #[test]
 fn the_pair_rotation_equals_two_separate_calls_over_the_grid() {
     let Some((ctx, stream)) = device() else {
@@ -166,8 +200,7 @@ fn the_pair_rotation_equals_two_separate_calls_over_the_grid() {
     let rig = (&ctx, &stream);
     let mut compared = 0;
     for k in GRID {
-        for awkward in [false, true] {
-            let (a, b, cases) = setup(&ctx, k, awkward);
+        for (a, b, cases) in all_setups(&ctx, k) {
             for case in &cases {
                 let old = run_pair(rig, [&a, &b], case, (How::Separate, [0; 3])).expect("old");
                 let new = run_pair(rig, [&a, &b], case, (How::Pair, [0; 3])).expect("pair");
@@ -185,7 +218,8 @@ fn the_pair_rotation_equals_two_separate_calls_over_the_grid() {
             }
         }
     }
-    assert_eq!(compared, 6 * 9);
+    // 6 values of K, 14 cases of the two ordinary setups and 1 of the poisoned one.
+    assert_eq!(compared, 6 * (super::CASES_PER_K + 1));
 }
 
 #[test]
@@ -288,8 +322,7 @@ fn pair_mutant_is_caught(mutant: i32) -> Option<bool> {
     let (ctx, stream) = device()?;
     let rig = (&ctx, &stream);
     for k in [256, 512, 2048] {
-        for awkward in [false, true] {
-            let (a, b, cases) = setup(&ctx, k, awkward);
+        for (a, b, cases) in all_setups(&ctx, k) {
             for case in &cases {
                 let old = run_pair(rig, [&a, &b], case, (How::Separate, [0; 3])).expect("old");
                 let bad =
@@ -307,6 +340,14 @@ fn pair_mutant_is_caught(mutant: i32) -> Option<bool> {
 #[test]
 fn mutant_swapped_pair_outputs_is_caught() {
     if let Some(caught) = pair_mutant_is_caught(1) {
+        assert!(caught);
+    }
+}
+
+#[cfg(feature = "cuda-exl3-rotate-mutants")]
+#[test]
+fn mutant_dropped_pair_b_flag_is_caught() {
+    if let Some(caught) = pair_mutant_is_caught(3) {
         assert!(caught);
     }
 }
@@ -337,6 +378,7 @@ fn moe_shape_case(rng: &mut testkit::Rng) -> Case {
     Case {
         name: "4K gate/up shape".into(),
         awkward: false,
+        members: MEMBERS,
         max_rows: jobs.iter().map(|job| job.rows as usize).max().unwrap(),
         x: super::rows_of(rng, tokens, k),
         in_rows: Some(
@@ -347,6 +389,17 @@ fn moe_shape_case(rng: &mut testkit::Rng) -> Case {
         jobs,
         total_rows: pairs,
     }
+}
+
+#[test]
+fn the_gate_up_shape_case_meets_the_call_bounds() {
+    // Host only: the case of the timing driver, built with debug arithmetic and checked against the
+    // limits of the call.
+    let case = moe_shape_case(&mut testkit::Rng::new(0x5041_4958));
+    super::check_case_bounds(&case, 2048);
+    assert!(case.jobs.len() > 300, "about 400 jobs of up to 80 rows");
+    let rows: usize = case.jobs.iter().map(|job| job.rows as usize).sum();
+    assert_eq!(rows, case.total_rows, "the jobs cover the table");
 }
 
 /// The launches of the 4K gate/up shape in the three ways, five times each, for a profiler run
