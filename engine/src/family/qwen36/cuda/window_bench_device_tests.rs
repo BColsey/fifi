@@ -136,7 +136,9 @@ use crate::{
             },
         },
     },
-    kernels::single_row::require_kernel_ran,
+    kernels::{
+        cuda::resident::argmax_rows::window_full_report_bytes, single_row::require_kernel_ran,
+    },
 };
 
 const GIB: u64 = 1 << 30;
@@ -616,13 +618,18 @@ impl PathCounts {
 }
 
 /// Which window a round times: the host rollback, the device rollback with the eager rows, or the
-/// K-row window as the eager body or as the graph.
+/// K-row window as the eager body or as the graph. The two graph arms run the same captured graph and
+/// differ in one thing: `KrowGraph` copies the logits of every row to the host after the verdict (the
+/// test tap `want_logits`, what a window did before the logits stayed on the device), and
+/// `KrowGraphDevVerify` reads its report and nothing else, as a serving window does. Their
+/// difference in one process, rotated within the same rounds, is the cost of the logits copy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WindowPath {
     Host,
     Device,
     KrowEager,
     KrowGraph,
+    KrowGraphDevVerify,
 }
 
 impl WindowPath {
@@ -632,18 +639,29 @@ impl WindowPath {
             Self::Device => "device_eager",
             Self::KrowEager => "krow_eager",
             Self::KrowGraph => "krow_graph",
+            Self::KrowGraphDevVerify => "krow_graph_devverify",
         }
     }
 
     fn krow(self) -> bool {
-        matches!(self, Self::KrowEager | Self::KrowGraph)
+        matches!(
+            self,
+            Self::KrowEager | Self::KrowGraph | Self::KrowGraphDevVerify
+        )
     }
 
-    /// Selects the path on a step: the rollback, the K-row body, the graphs.
+    /// Whether the arm runs the captured graph.
+    fn graph(self) -> bool {
+        matches!(self, Self::KrowGraph | Self::KrowGraphDevVerify)
+    }
+
+    /// Selects the path on a step: the rollback, the K-row body, the graphs, and whether the window
+    /// copies its logits rows to the host (every K-row arm but the device-verify one does).
     fn select(self, step: &mut QwenResidentStep<'_>) -> Result<(), EngError> {
         step.use_device_rollback(self != Self::Host)?;
         step.use_krow(self.krow());
-        step.use_krow_graphs(self == Self::KrowGraph);
+        step.use_krow_graphs(self.graph());
+        step.set_krow_want_logits(self != Self::KrowGraphDevVerify);
         Ok(())
     }
 
@@ -656,7 +674,7 @@ impl WindowPath {
                 eager: 1,
                 ..PathCounts::default()
             },
-            Self::KrowGraph => PathCounts {
+            Self::KrowGraph | Self::KrowGraphDevVerify => PathCounts {
                 windows: 1,
                 replays: 1,
                 ..PathCounts::default()
@@ -943,13 +961,21 @@ fn krow_window_json(
         "raw_run_window_wall_ms_all_rounds": runs.iter().map(|w| w.run_ms).collect::<Vec<_>>(),
         "transfers_per_window": {
             "computed_from_sizes": true,
-            "logits_d2h_bytes": (rows * HEAD_ROWS * 4) as u64,
+            // Additive fields of schema 1: the logits copy is the tap's, and every K-row window
+            // reads its report (the table, the device verify words and the K top-20 records).
+            "logits_d2h_bytes": if path == WindowPath::KrowGraphDevVerify {
+                0
+            } else {
+                (rows * HEAD_ROWS * 4) as u64
+            },
+            "logits_copied_to_the_host": path != WindowPath::KrowGraphDevVerify,
+            "report_d2h_bytes": window_full_report_bytes(rows) as u64,
             "result_table_d2h_bytes": (8 * rows + 8) as u64,
             "window_ids_h2d_bytes": (4 * rows) as u64,
             "start_block_h2d_bytes": shape.start_block_bytes,
             "slot_d2d_copies_for_the_verdict": u64::from(kept < rows),
             "slot_d2d_bytes": if kept < rows { slot_bytes } else { 0 },
-            "graph_launches": u64::from(path == WindowPath::KrowGraph),
+            "graph_launches": u64::from(path.graph()),
         },
     });
     merge(&mut record, split_json(warm));
@@ -970,6 +996,7 @@ fn arms_of(config: &Config, rows: usize) -> Vec<Arm> {
         paths.push(WindowPath::KrowEager);
         if config.krow_graph {
             paths.push(WindowPath::KrowGraph);
+            paths.push(WindowPath::KrowGraphDevVerify);
         }
     }
     for path in paths {
@@ -1040,6 +1067,7 @@ fn d1_paths(config: &Config) -> Vec<WindowPath> {
         paths.push(WindowPath::KrowEager);
         if config.krow_graph {
             paths.push(WindowPath::KrowGraph);
+            paths.push(WindowPath::KrowGraphDevVerify);
         }
     }
     paths
@@ -1111,6 +1139,9 @@ fn run_cell(
     let mut d1_modes = Vec::new();
     for path in d1_paths(cell.config) {
         path.select(step)?;
+        // The D1 checks compare the logits rows, so the window reads them whatever the arm does
+        // when it is timed.
+        step.set_krow_want_logits(true);
         let counted = PathCounts::now(step);
         let d1_a = full_logits(step, &d1_inputs);
         let d1_r = restoration(step, &d1_inputs);
@@ -1118,7 +1149,7 @@ fn run_cell(
         let ran = match path {
             WindowPath::Host | WindowPath::Device => seen.windows == 0,
             WindowPath::KrowEager => seen.windows > 0 && seen.replays == 0 && seen.captures == 0,
-            WindowPath::KrowGraph => {
+            WindowPath::KrowGraph | WindowPath::KrowGraphDevVerify => {
                 seen.windows > 0
                     && seen.eager == 0
                     && seen.captures == 0
@@ -1306,6 +1337,9 @@ fn cell_json(
             "krow_graph_accept_all": krow(WindowPath::KrowGraph, Keep::All),
             "krow_graph_reject_first": krow(WindowPath::KrowGraph, Keep::First),
             "krow_graph_keep_middle": krow(WindowPath::KrowGraph, Keep::Middle),
+            "krow_graph_devverify_accept_all": krow(WindowPath::KrowGraphDevVerify, Keep::All),
+            "krow_graph_devverify_reject_first": krow(WindowPath::KrowGraphDevVerify, Keep::First),
+            "krow_graph_devverify_keep_middle": krow(WindowPath::KrowGraphDevVerify, Keep::Middle),
         },
         "single_row_launches": step.kernel_launches().describe(),
         "standalone_at_this_state": {
@@ -1325,6 +1359,9 @@ fn cell_json(
             "krow_graph_accept_all": ratios(WindowPath::KrowGraph, Keep::All),
             "krow_graph_reject_first": ratios(WindowPath::KrowGraph, Keep::First),
             "krow_graph_keep_middle": ratios(WindowPath::KrowGraph, Keep::Middle),
+            "krow_graph_devverify_accept_all": ratios(WindowPath::KrowGraphDevVerify, Keep::All),
+            "krow_graph_devverify_reject_first": ratios(WindowPath::KrowGraphDevVerify, Keep::First),
+            "krow_graph_devverify_keep_middle": ratios(WindowPath::KrowGraphDevVerify, Keep::Middle),
         },
     })
 }
@@ -1616,13 +1653,14 @@ fn the_verdicts_keep_all_the_first_or_the_middle_rows() {
 fn a_cell_times_the_host_device_and_k_row_windows_with_every_verdict() {
     let config = test_config(BenchRollback::Both, true, true);
     let arms = arms_of(&config, 4);
-    // The single-row arm, and four paths with three verdicts each.
-    assert_eq!(arms.len(), 1 + 4 * 3);
+    // The single-row arm, and five paths with three verdicts each.
+    assert_eq!(arms.len(), 1 + 5 * 3);
     for path in [
         WindowPath::Host,
         WindowPath::Device,
         WindowPath::KrowEager,
         WindowPath::KrowGraph,
+        WindowPath::KrowGraphDevVerify,
     ] {
         for keep in [Keep::All, Keep::First, Keep::Middle] {
             assert!(arms.contains(&Arm::Window(path, keep)));
@@ -1632,8 +1670,9 @@ fn a_cell_times_the_host_device_and_k_row_windows_with_every_verdict() {
     // verdict.
     for rows in [2, 3] {
         let short = arms_of(&config, rows);
-        assert_eq!(short.len(), 1 + 4 * 2);
+        assert_eq!(short.len(), 1 + 5 * 2);
         assert!(!short.contains(&Arm::Window(WindowPath::KrowGraph, Keep::Middle)));
+        assert!(!short.contains(&Arm::Window(WindowPath::KrowGraphDevVerify, Keep::Middle)));
     }
 }
 
@@ -1642,6 +1681,7 @@ fn the_graph_arm_exists_only_when_graphs_may_be_captured_and_the_single_arm_stan
     let eager_only = arms_of(&test_config(BenchRollback::Both, true, false), 3);
     assert!(eager_only.contains(&Arm::Window(WindowPath::KrowEager, Keep::All)));
     assert!(!eager_only.contains(&Arm::Window(WindowPath::KrowGraph, Keep::All)));
+    assert!(!eager_only.contains(&Arm::Window(WindowPath::KrowGraphDevVerify, Keep::All)));
     let single = arms_of(&test_config(BenchRollback::Single, false, true), 8);
     assert_eq!(single, vec![Arm::Single]);
     // No K-row arm without the K-row path.
@@ -1775,4 +1815,45 @@ fn a_timed_window_must_show_the_counters_of_its_own_path() {
     assert!(WindowPath::KrowGraph.check(one(1, 1, 0, 0)).is_err());
     assert!(WindowPath::KrowGraph.check(one(1, 0, 1, 1)).is_err());
     assert!(WindowPath::KrowGraph.check(one(2, 0, 0, 2)).is_err());
+    // The device-verify arm is the same graph window: it differs in the logits copy, not in the
+    // launches, so it must show the same counters and be refused for the same reasons.
+    assert!(
+        WindowPath::KrowGraphDevVerify
+            .check(one(1, 0, 0, 1))
+            .is_ok()
+    );
+    assert!(
+        WindowPath::KrowGraphDevVerify
+            .check(one(1, 1, 0, 0))
+            .is_err()
+    );
+    assert!(
+        WindowPath::KrowGraphDevVerify
+            .check(one(1, 0, 1, 1))
+            .is_err()
+    );
+}
+
+#[test]
+fn the_two_graph_arms_differ_in_the_logits_copy_and_in_nothing_else() {
+    assert!(WindowPath::KrowGraph.graph() && WindowPath::KrowGraphDevVerify.graph());
+    assert!(WindowPath::KrowGraph.krow() && WindowPath::KrowGraphDevVerify.krow());
+    assert!(!WindowPath::KrowEager.graph());
+    assert_ne!(
+        WindowPath::KrowGraph.name(),
+        WindowPath::KrowGraphDevVerify.name()
+    );
+    assert_eq!(
+        WindowPath::KrowGraphDevVerify.name(),
+        "krow_graph_devverify"
+    );
+    // The tap is the only difference: it is selected from the path alone. (The needle is joined
+    // from two pieces so that this test does not find itself.)
+    let source = include_str!("window_bench_device_tests.rs");
+    let needle = [
+        "step.set_krow_want_logits(self != ",
+        "Self::KrowGraphDevVerify);",
+    ]
+    .concat();
+    assert_eq!(source.matches(&needle).count(), 1);
 }
