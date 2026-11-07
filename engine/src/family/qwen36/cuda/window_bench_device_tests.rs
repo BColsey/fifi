@@ -235,7 +235,7 @@ fn gpu_ms(step: &QwenResidentStep<'_>) -> Option<f64> {
 }
 
 /// The session, admitted for chunked prefill the way the serve path admits it for `kv`.
-fn bench_step(
+pub(super) fn bench_step(
     loaded: &Loaded,
     kv: KvMode,
     context: usize,

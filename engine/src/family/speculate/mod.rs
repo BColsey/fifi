@@ -15,6 +15,10 @@ pub(crate) mod d1_oracle;
 #[cfg(test)]
 mod d1_oracle_tests;
 pub(crate) mod driver;
+#[cfg(test)]
+pub(crate) mod krow_measure;
+#[cfg(test)]
+mod krow_measure_tests;
 pub(crate) mod mtp;
 pub(crate) mod repeat;
 pub(crate) mod stats;

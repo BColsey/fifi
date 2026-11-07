@@ -116,6 +116,10 @@ const F32: usize = size_of::<f32>();
 #[path = "prefill_kv8_target_device_tests.rs"]
 mod kv8_target;
 
+/// The routed expert ids of one MoE block: the layer and its `top_k` ids (test builds only).
+#[cfg(test)]
+pub(super) type MoePicks = (usize, Vec<i32>);
+
 /// Capture settings of the step; distinct from `dims::StepOptions` (the dimensions options of
 /// `new`).
 pub(crate) struct CaptureConfig {
@@ -429,6 +433,11 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The host and device time of the last window, by part (test builds only).
     #[cfg(test)]
     pub(super) window_trace: super::eager_window::WindowTrace,
+    /// The routed expert ids of each EXL3 MoE block, `(layer, top_k ids)` in launch order, filled
+    /// only while the measurement tests switch it on (`None` is off). It reads the ids back after
+    /// each block, so it is valid for the eager body only (test builds only).
+    #[cfg(test)]
+    pub(super) moe_pick_tap: std::cell::RefCell<Option<Vec<MoePicks>>>,
     /// Drain the stream after each device-rollback capture, so the copy's time shows in the trace
     /// (test builds only; the copy otherwise overlaps the host's next work).
     #[cfg(test)]
@@ -753,6 +762,8 @@ impl<'a> QwenResidentStep<'a> {
             window_fault: None,
             #[cfg(test)]
             window_trace: Default::default(),
+            #[cfg(test)]
+            moe_pick_tap: Default::default(),
             speculator: None,
             m_sess_cap: DEFAULT_CUDA_PREFILL_CHUNK,
             logits_bytes: vec![0; f32_bytes(vocab)?],
@@ -1968,7 +1979,7 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
                 }
-                if let Some(merge) = &self.exl3_merge {
+                let block = if let Some(merge) = &self.exl3_merge {
                     run_exl3_moe_merged(
                         &launch,
                         (weights, &bufs, merge),
@@ -1983,7 +1994,24 @@ impl<'a> QwenResidentStep<'a> {
                         &self.moe_dims,
                         self.exl3_device_ids,
                     )
+                };
+                #[cfg(test)]
+                if block.is_ok()
+                    && let Some(taps) = self.moe_pick_tap.borrow_mut().as_mut()
+                {
+                    let ids = bufs.route.ids;
+                    let mut raw = vec![0u8; self.moe_dims.top_k * size_of::<i32>()];
+                    ids.buffer().read_at(s, ids.offset(), &mut raw)?;
+                    taps.push((
+                        layer,
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|word| i32::from_le_bytes(*word))
+                            .collect(),
+                    ));
                 }
+                block
             }
             StepOp::Moe(layer) if self.tiered_mode => {
                 let runtime = self.tiered.as_ref().ok_or_else(|| {

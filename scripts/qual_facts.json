@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6000,
-      "ignored": 502,
+      "test_fns": 6012,
+      "ignored": 506,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -49,6 +49,7 @@
         "FIFI_EXL3_MIXER_OUT",
         "FIFI_EXL3_PROJECTION_OUT",
         "FIFI_EXL3_REAL_CASES",
+        "FIFI_EXL3_SHARED_IN_ROUTED",
         "FIFI_EXL3_SINGLE_GATHER",
         "FIFI_FLASH_NEXT_EXL3_MOE_LAYER",
         "FIFI_FLASH_NEXT_EXL3_PACK",
@@ -100,6 +101,12 @@
         "FIFI_FLINT_TEACHER_IDS",
         "FIFI_FLINT_TOKEN_HEALTH",
         "FIFI_GRAPH_BENCH_PHASES",
+        "FIFI_KROW_COMMIT",
+        "FIFI_KROW_IDS_SHA256",
+        "FIFI_KROW_ONLY",
+        "FIFI_KROW_OUT",
+        "FIFI_KROW_PACK_MANIFEST_SHA256",
+        "FIFI_KROW_PICKS_OUT",
         "FIFI_MRV_COMMIT",
         "FIFI_MRV_IDS_SHA256",
         "FIFI_MRV_NEED",
