@@ -20,9 +20,12 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use super::{
-    load::{TrunkList, upload::layer_weights},
+    load::{
+        TrunkList,
+        upload::{layer_weights, root_weights},
+    },
     state::StateSlot,
-    step::{AllResidentMoe, FlashStep, bank_key},
+    step::{AllResidentMoe, FlashStep, MIXER, bank_key},
     step_plan::{Site, Slot},
 };
 use crate::{
@@ -332,7 +335,7 @@ fn host_token(
     model: &ModelShape,
     layer: &mut HostLayer,
     pos: u32,
-    stream: &mut Vec<f32>,
+    stream: &mut [f32],
 ) -> HostRun {
     let read = hyper::read(projector, &model.hyper, &layer.attn.weights(), stream).expect("read");
     let gate = read.gate.clone().expect("gate");
@@ -430,12 +433,16 @@ fn device_weights(
     projector: &CudaProjector,
     checkpoint: &Checkpoint,
     layers: &[usize],
+    with_head: bool,
 ) -> CudaWeights {
     let list = TrunkList::new(&checkpoint.source, &checkpoint.model_config).expect("trunk list");
     let reader = PackReader::new(projector, checkpoint, Reserve::default());
     let (model, _) = model_shape(&checkpoint.model_config).expect("shape");
     let experts = model.moe.experts();
     let mut all = Vec::new();
+    if with_head {
+        all.extend(root_weights(&reader, &list).expect("the mixer and lm_head"));
+    }
     for &layer in layers {
         all.extend(layer_weights(&reader, &list, layer).expect("the layer's trunk"));
         for part in ExpertPart::ALL {
@@ -505,7 +512,8 @@ fn run_window(layers: &[usize]) {
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
     let stream: DeviceStream = ctx.stream().expect("stream");
-    let weights = device_weights(&projector, &checkpoint, layers);
+    let with_head = std::env::var_os("FIFI_FLASH_NEXT_STEP_HEAD").is_some();
+    let weights = device_weights(&projector, &checkpoint, layers, with_head);
     let first = *layers.first().expect("a layer");
     let end = layers.last().expect("a layer") + 1;
     let step = FlashStep::new(
@@ -524,6 +532,26 @@ fn run_window(layers: &[usize]) {
         .iter()
         .map(|&layer| host_layer(&checkpoint, &model, &kinds, layer))
         .collect();
+    let host_head = with_head.then(|| {
+        let width = model.hyper.width();
+        let rank = model.hyper.rank();
+        (
+            vector(&checkpoint, &format!("{MIXER}.hc_norm.weight"), width),
+            dense(
+                &checkpoint,
+                &format!("{MIXER}.input_mix_weight_down.weight"),
+                rank,
+                width,
+            ),
+            dense(
+                &checkpoint,
+                &format!("{MIXER}.input_mix_weight_up.weight"),
+                width,
+                rank,
+            ),
+            exl3(&checkpoint, "lm_head"),
+        )
+    });
     let (words, words_at) = step.words_buffer().expect("words");
     let mut moe = AllResidentMoe { weights: &weights };
 
@@ -619,6 +647,51 @@ fn run_window(layers: &[usize]) {
             // The next layer reads the host stream the device holds: keep them in step, so one
             // layer's error does not compound into the next layer's comparison.
             host_stream = device_stream;
+        }
+        if let Some((norm, down, up, lm_head)) = &host_head {
+            step.head().expect("the head");
+            let vocab = step.geometry.vocab;
+            let device_logits = step
+                .read_f32(step.slot(Slot::Logits).unwrap(), vocab)
+                .expect("logits");
+            let read = hyper::read(
+                &mut host_projector,
+                &model.hyper,
+                &HyperWeights {
+                    norm,
+                    down,
+                    up,
+                    inject: None,
+                },
+                &host_stream,
+            )
+            .expect("final mixer");
+            let host_logits = host_projector
+                .linear(lm_head, &read.mixed)
+                .expect("lm_head");
+            let top = |logits: &[f32], count: usize| -> Vec<usize> {
+                let mut order: Vec<usize> = (0..logits.len()).collect();
+                order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]));
+                order.truncate(count);
+                order
+            };
+            let (device_top, host_top) = (top(&device_logits, 20), top(&host_logits, 20));
+            let overlap = device_top.iter().filter(|id| host_top.contains(id)).count();
+            let error = relative_l2(&device_logits, &host_logits);
+            println!(
+                "token {token}: logits rel {error:.2e} max {:.2e} (ref max {:.2e}); top-1 device {} \
+                 host {}; top-20 overlap {overlap}",
+                max_abs(&device_logits, &host_logits),
+                host_logits.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+                device_top[0],
+                host_top[0],
+            );
+            // A truncated model has no preferred token; the top-1 agreement is reported, the
+            // logits error is the gate.
+            assert!(
+                error <= BLOCK_BOUND,
+                "token {token}: logits differ by {error:.3e}"
+            );
         }
     }
     // The recurrent state and the conv ring of every DeltaNet layer after the sequence: drift here
