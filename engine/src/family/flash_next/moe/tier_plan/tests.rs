@@ -64,6 +64,10 @@ fn a_position_costs_what_the_memory_budget_says() {
 
 #[test]
 fn the_slot_counts_track_the_cost_model_at_each_context() {
+    // The plan is deterministic, so the counts are exact at these inputs (trunk 3,854,000,000 bytes,
+    // 113,246,208 of state, reserves of 64 + 512 + 1400 MiB, 90,316,800 bytes per slot of all layers).
+    // The int8 count is 178, not 177: 177 came from a trunk of 3.59 GiB rounded the other way.
+    // The int8 count is optimistic, since int8 scale bytes are not counted yet.
     let near = |got: usize, want: usize, by: usize| got.abs_diff(want) <= by;
     let (long, mid, short, int8) = (
         slots(262_144, 2),
@@ -71,6 +75,7 @@ fn the_slot_counts_track_the_cost_model_at_each_context() {
         slots(32_768, 2),
         slots(262_144, 1),
     );
+    assert_eq!((long, mid, short, int8), (142, 180, 208, 178));
     assert!(near(long, 143, 3), "262,144 tokens f16: {long}");
     assert!((178..=184).contains(&mid), "131,072 tokens f16: {mid}");
     assert!((206..=212).contains(&short), "32,768 tokens f16: {short}");

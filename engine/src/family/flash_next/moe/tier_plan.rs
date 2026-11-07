@@ -20,6 +20,10 @@
 //! bytes of EXL3 trellis and scales, and the bank itself (with the filler-expert rule for a missed
 //! pick) is the CUDA step's job.
 //!
+//! The host check compares the cold experts with the page-cache share of the host budget
+//! (`plan_host`); the page cache of the n-gram table's random reads competes for the same RAM and
+//! is not budgeted yet.
+//!
 //! Pure host arithmetic: no device, no clock, no I/O.
 
 // Staged: the Flash-Next CUDA step is the first caller.

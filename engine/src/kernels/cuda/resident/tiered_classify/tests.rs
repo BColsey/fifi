@@ -395,6 +395,27 @@ fn tiered_classify_matches_the_reference_bit_for_bit() {
             },
             0x7CA9_0104,
         ),
+        // Fewer than 8 picks: bytes 80 to 111 stay untouched (a gate of top_k > 4 would write them).
+        (
+            ClassifyShape {
+                n_expert: 32,
+                slots: 12,
+                top_k: 5,
+                hidden: 256,
+                layer: 0,
+            },
+            0x7CA9_0105,
+        ),
+        (
+            ClassifyShape {
+                n_expert: 64,
+                slots: 12,
+                top_k: 6,
+                hidden: 256,
+                layer: 0,
+            },
+            0x7CA9_0106,
+        ),
     ];
     for (shape, seed) in shapes {
         let script = seeded_script(&shape, seed, 2_880);

@@ -15,6 +15,7 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::CudaProjector,
+    family::qwen36::tiered::classify::classify_reference,
     family::{
         exl3_pack::{Root, router_name_in},
         flash_next::{load::model_shape, stored::host_f32},
@@ -65,7 +66,21 @@ fn the_device_classifier_agrees_with_the_oracle_on_real_routes_at_ten_picks() {
         counts.record(layer, &ids).expect("record");
     }
     let hot = plan.hot_set(counts.counts()).expect("the hot set");
-    let row = hot.table.row(layer).to_vec();
+    // Two slot rows: the plan's hot set, and one that holds only 16 experts the profile never routed,
+    // so nearly every route has more than 8 misses and reaches the request tail (picks 8 and 9).
+    let cold_only: Vec<usize> = (0..moe.experts)
+        .filter(|&e| counts.counts()[layer][e] == 0)
+        .take(16)
+        .collect();
+    assert_eq!(cold_only.len(), 16, "the profile left 16 experts unrouted");
+    let mut small = vec![-1i32; moe.experts];
+    for (slot, &expert) in cold_only.iter().enumerate() {
+        small[expert] = slot as i32;
+    }
+    let rows: [(Vec<i32>, usize); 2] = [
+        (hot.table.row(layer).to_vec(), hot.table.slots()),
+        (small, 16),
+    ];
 
     let projector = CudaProjector::new().expect("projector");
     let ctx: &CudaContext = projector.context();
@@ -75,7 +90,7 @@ fn the_device_classifier_agrees_with_the_oracle_on_real_routes_at_ten_picks() {
     let zeros = |bytes: usize| ctx.upload(&vec![0u8; bytes]).expect("upload");
     let ids = zeros(40);
     let weights = zeros(40);
-    let slot_row = ctx.upload(&le_i32(&row)).expect("upload");
+    let slot_row = zeros(moe.experts * 4);
     let norm_row = zeros(hidden * 4);
     let slot_ids_out = zeros(40);
     let weights_out = zeros(40);
@@ -85,95 +100,102 @@ fn the_device_classifier_agrees_with_the_oracle_on_real_routes_at_ten_picks() {
     let unused_req = zeros(REQUEST_BYTES);
     let unused_row = zeros(hidden * 4);
     let (mut after, mut tail_misses) = (0u64, 0usize);
-    for (index, picks) in routes[32..].iter().enumerate() {
-        let want_ids: Vec<i32> = picks.iter().map(|p| p.0 as i32).collect();
-        let want_weights: Vec<f32> = picks.iter().map(|p| p.1).collect();
-        let want = hot
-            .table
-            .classify(layer, &want_ids, &want_weights)
-            .expect("oracle");
-        ids.write_at(&stream, 0, &le_i32(&want_ids)).expect("ids");
-        weights
-            .write_at(&stream, 0, &le_f32(&want_weights))
-            .expect("weights");
-        norm_row
-            .write_at(&stream, 0, &le_f32(&input(hidden, 64 + index)))
-            .expect("row");
+    for (row, slots) in &rows {
+        slot_row
+            .write_at(&stream, 0, &le_i32(row))
+            .expect("slot row");
         stream.synchronize().expect("sync");
-        let call = ClassifyCall {
-            shape: ClassifyShape {
-                n_expert: 512,
-                slots: hot.table.slots(),
-                top_k: 10,
-                hidden,
-                layer: 0,
-            },
-            ids: whole(&ids).unwrap(),
-            weights: whole(&weights).unwrap(),
-            slot_row: whole(&slot_row).unwrap(),
-            norm_row: whole(&norm_row).unwrap(),
-            slot_ids_out: whole(&slot_ids_out).unwrap(),
-            weights_out: whole(&weights_out).unwrap(),
-            log_out: whole(&log_out).unwrap(),
-            ctrl: whole(&ctrl).unwrap(),
-            word: whole(&word).unwrap(),
-            mbox_req: whole(&unused_req).unwrap(),
-            mbox_row: whole(&unused_row).unwrap(),
-        };
-        ctx.tiered_classify_to_mailbox(&stream, call, &mailbox)
-            .expect("classify");
-        stream.synchronize().expect("sync");
-        let (mut slot_bytes, mut weight_bytes) = ([0u8; 40], [0u8; 40]);
-        slot_ids_out
-            .read_at(&stream, 0, &mut slot_bytes)
-            .expect("read");
-        weights_out
-            .read_at(&stream, 0, &mut weight_bytes)
-            .expect("read");
-        let slots: Vec<i32> = slot_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| i32::from_le_bytes(*b))
-            .collect();
-        let weights_got: Vec<u32> = weight_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b))
-            .collect();
-        assert_eq!(slots, want.slot_ids, "route {index}: slots");
-        assert_eq!(
-            weights_got,
-            want.weights.iter().map(|w| w.to_bits()).collect::<Vec<_>>(),
-            "route {index}: weights"
-        );
-        if want.misses.is_empty() {
-            assert!(
-                port.poll(after).is_none(),
-                "route {index}: no request without a miss"
-            );
-            continue;
-        }
-        let request = port.poll(after).expect("a request for the misses");
-        assert_eq!(
-            request.count as usize,
-            want.misses.len(),
-            "route {index}: count"
-        );
-        for (k, &(id, weight)) in want.misses.iter().enumerate() {
-            let got = request.miss(k).expect("a published miss");
+        for (index, picks) in routes[32..].iter().enumerate() {
+            let want_ids: Vec<i32> = picks.iter().map(|p| p.0 as i32).collect();
+            let want_weights: Vec<f32> = picks.iter().map(|p| p.1).collect();
+            let want = classify_reference(row, *slots, &want_ids, &want_weights).expect("oracle");
+            ids.write_at(&stream, 0, &le_i32(&want_ids)).expect("ids");
+            weights
+                .write_at(&stream, 0, &le_f32(&want_weights))
+                .expect("weights");
+            norm_row
+                .write_at(&stream, 0, &le_f32(&input(hidden, 64 + index)))
+                .expect("row");
+            stream.synchronize().expect("sync");
+            let call = ClassifyCall {
+                shape: ClassifyShape {
+                    n_expert: 512,
+                    slots: *slots,
+                    top_k: 10,
+                    hidden,
+                    layer: 0,
+                },
+                ids: whole(&ids).unwrap(),
+                weights: whole(&weights).unwrap(),
+                slot_row: whole(&slot_row).unwrap(),
+                norm_row: whole(&norm_row).unwrap(),
+                slot_ids_out: whole(&slot_ids_out).unwrap(),
+                weights_out: whole(&weights_out).unwrap(),
+                log_out: whole(&log_out).unwrap(),
+                ctrl: whole(&ctrl).unwrap(),
+                word: whole(&word).unwrap(),
+                mbox_req: whole(&unused_req).unwrap(),
+                mbox_row: whole(&unused_row).unwrap(),
+            };
+            ctx.tiered_classify_to_mailbox(&stream, call, &mailbox)
+                .expect("classify");
+            stream.synchronize().expect("sync");
+            let (mut slot_bytes, mut weight_bytes) = ([0u8; 40], [0u8; 40]);
+            slot_ids_out
+                .read_at(&stream, 0, &mut slot_bytes)
+                .expect("read");
+            weights_out
+                .read_at(&stream, 0, &mut weight_bytes)
+                .expect("read");
+            let slots: Vec<i32> = slot_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
+                .collect();
+            let weights_got: Vec<u32> = weight_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect();
+            assert_eq!(slots, want.slot_ids, "route {index}: slots");
             assert_eq!(
-                (got.0, got.1.to_bits()),
-                (id, weight.to_bits()),
-                "route {index}: miss {k}"
+                weights_got,
+                want.weights.iter().map(|w| w.to_bits()).collect::<Vec<_>>(),
+                "route {index}: weights"
             );
+            if want.misses.is_empty() {
+                assert!(
+                    port.poll(after).is_none(),
+                    "route {index}: no request without a miss"
+                );
+                continue;
+            }
+            let request = port.poll(after).expect("a request for the misses");
+            assert_eq!(
+                request.count as usize,
+                want.misses.len(),
+                "route {index}: count"
+            );
+            for (k, &(id, weight)) in want.misses.iter().enumerate() {
+                let got = request.miss(k).expect("a published miss");
+                assert_eq!(
+                    (got.0, got.1.to_bits()),
+                    (id, weight.to_bits()),
+                    "route {index}: miss {k}"
+                );
+            }
+            tail_misses += usize::from(want.misses.len() > 8);
+            let mut partial_row = vec![0f32; hidden];
+            assert!(port.read_row(&mut partial_row));
+            assert!(port.answer(request.seq, Ok(&vec![0f32; hidden])));
+            after = request.seq;
         }
-        tail_misses += usize::from(want.misses.len() > 8);
-        let mut partial_row = vec![0f32; hidden];
-        assert!(port.read_row(&mut partial_row));
-        assert!(port.answer(request.seq, Ok(&vec![0f32; hidden])));
-        after = request.seq;
     }
     eprintln!("routes with more than 8 misses (the request tail): {tail_misses}");
+    assert!(
+        tail_misses > 0,
+        "no route reached the tail of the request line (picks 8 and 9)"
+    );
 }
