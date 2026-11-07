@@ -590,11 +590,15 @@ fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
                 "{bits_twice}/{book:?}: refused rows differ"
             );
             let kept = (0..total)
-                .filter(|&r| fused_out[r * ld..(r + 1) * ld].iter().all(|b| *b == CANARY))
+                .filter(|&r| {
+                    fused_out[r * ld * 4..(r + 1) * ld * 4]
+                        .iter()
+                        .all(|b| *b == CANARY)
+                })
                 .count();
             assert_eq!(
                 kept, 1,
-                "{bits_twice}/{book:?}: exactly the refused row keeps canary"
+                "k={k} {bits_twice}/{book:?}: exactly the refused row keeps canary"
             );
         }
     }
