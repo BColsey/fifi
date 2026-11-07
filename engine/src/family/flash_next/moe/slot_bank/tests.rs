@@ -203,3 +203,24 @@ fn the_cpu_kernel_gives_the_same_bits_from_a_record_as_from_the_components() {
         );
     }
 }
+
+/// Every component offset of a record is a multiple of 16 bytes (the launches' vector loads need it),
+/// at the real sizes and for any 128-grid shape and stored rate.
+#[test]
+fn every_component_offset_is_a_multiple_of_16_bytes() {
+    let mut layouts = vec![real()];
+    for (hidden, inter) in [(128, 128), (256, 384), (2560, 512), (4096, 1024)] {
+        for words in [16usize, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128] {
+            layouts.push(SlotBankLayout::new(hidden, inter, [words; 3]).unwrap());
+        }
+    }
+    for layout in layouts {
+        assert_eq!(layout.record_bytes() % 16, 0);
+        for part in 0..3 {
+            let p = layout.part(part);
+            for offset in [p.trellis.start, p.suh.start, p.svh.start, p.svh.end] {
+                assert_eq!(offset % 16, 0, "part {part} offset {offset}");
+            }
+        }
+    }
+}
