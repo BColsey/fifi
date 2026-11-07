@@ -14,10 +14,8 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-#[cfg(test)]
-pub(super) use crate::family::exl3_pack::Marker;
 pub(super) use crate::family::exl3_pack::{
-    EMBED_NAME, ExpertPart, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root,
+    EMBED_NAME, ExpertPart, HEAD_PREFIX, Inspector, Marker, MoeBlock, NORM_NAME, PackReport, Root,
     expert_name_in, layer_name, router_name_in, shared_gate_name_in, shared_name_in,
 };
 
@@ -157,4 +155,46 @@ impl Inspector<'_> {
         )?;
         Ok(())
     }
+}
+
+/// The planning summary of one pack directory for a device-free estimate: exactly the
+/// loader's own header walk, with its totals copied out for callers outside `family`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Exl3PackPlan {
+    /// Device bytes the load will hold ([`PackReport::device_bytes`]: trellises as stored,
+    /// scales and plain vectors widened to F32, the embedding as stored).
+    pub(crate) device_bytes: u64,
+    /// Quantized matrices (a routed expert counts one per projection).
+    pub(crate) matrices: usize,
+    /// Matrices per rate, keyed by twice the bits per weight.
+    pub(crate) rates: std::collections::BTreeMap<u8, usize>,
+    /// The codebook marker tensor every matrix of the pack carries, by name.
+    pub(crate) codebook: &'static str,
+}
+
+/// The name of the codebook marker a matrix carries, for rows that retell the walk.
+pub(super) fn codebook_name(marker: Marker) -> &'static str {
+    match marker {
+        Marker::Mul1 => "Mul1",
+        Marker::Mcg => "Mcg",
+    }
+}
+
+/// Walks the pack of `dir` the way the serving load does (`load_exl3_dir`: pinned model,
+/// pinned rotary dimension, no MTP head) and returns its planning facts. A pack of another
+/// size, rate, codebook or layout is refused here, exactly as the load would refuse it
+/// before the first upload.
+pub(crate) fn exl3_plan(dir: &std::path::Path) -> Result<Exl3PackPlan, EngError> {
+    let checkpoint = crate::weights::exl3::Checkpoint::open(dir)?;
+    let shape = HostShape::from_spec(
+        &crate::family::spec::QWEN3_6_35B_A3B,
+        super::settings::ROTARY_DIM,
+    )?;
+    let report = inspect_pack(&checkpoint.source, &shape)?;
+    Ok(Exl3PackPlan {
+        device_bytes: report.device_bytes,
+        matrices: report.matrices,
+        rates: report.rates,
+        codebook: codebook_name(report.codebook),
+    })
 }

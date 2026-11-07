@@ -13,7 +13,7 @@ use crate::expert_tier::{CudaStreamBanks, ExpertId, ExpertPayloadSource, StreamB
 const HIDDEN: usize = 2048;
 const INTERMEDIATE: usize = 512;
 const SHARED: usize = 1024;
-const EXPERTS: usize = 256;
+const EXPERTS: usize = crate::family::flint::budget::EXPERTS;
 const PART_BYTES: u64 = 589_824;
 
 fn block(rows: usize) -> Result<FfnBlock, EngError> {

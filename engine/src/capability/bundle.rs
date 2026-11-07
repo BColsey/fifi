@@ -23,9 +23,9 @@
 //! allowlisted, not a credential.
 //!
 //! Schema history: /1 added the per-engine `preflight.decisions` array
-//! (the execution-plan inventory; empty for families whose estimate does
-//! not compose decisions yet). Additive only — every earlier /1 field is
-//! unchanged.
+//! (the execution-plan inventory; Flint on every estimate, Q36 on EXL3
+//! loads; empty for families and formats whose estimate does not compose
+//! decisions). Additive only — every earlier /1 field is unchanged.
 
 use super::Probe;
 use super::preflight::{self, Candidate, PreflightReport};

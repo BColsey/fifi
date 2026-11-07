@@ -175,9 +175,9 @@ pub struct PreflightReport {
     pub estimate: Option<Estimate>,
     /// The planned decisions behind the estimate: what each choice landed
     /// on, the alternatives the plan weighed, and whether the choice is
-    /// fixed at engine start or re-decided at load. Empty for families
-    /// whose estimate does not yet compose decisions (Qwen3.6); Flint
-    /// EXL3 fills these from the same pure functions its loader runs.
+    /// fixed at engine start or re-decided at load. Flint EXL3 fills these
+    /// from the same pure functions its loader runs; Qwen3.6 EXL3 from its
+    /// pack walk; empty for estimates that compose no decisions.
     pub decisions: Vec<PlanDecision>,
     /// The single most useful next action, in one sentence.
     pub next_step: String,
@@ -483,7 +483,10 @@ fn q36_preflight(
     use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options, Q36Settings};
 
     let family = Some(crate::family::qwen36::factory::FAMILY.to_string());
-    let finish = |checks: Vec<Check>, estimate: Option<Estimate>, qualification: Qualification| {
+    let finish = |checks: Vec<Check>,
+                  estimate: Option<Estimate>,
+                  decisions: Vec<PlanDecision>,
+                  qualification: Qualification| {
         let dimensions = q36_dimensions(&checks, estimate.as_ref(), qualification);
         let (verdict, next_step) = q36_verdict(&checks, estimate.as_ref(), qualification);
         PreflightReport {
@@ -493,7 +496,7 @@ fn q36_preflight(
             verdict,
             dimensions,
             checks,
-            decisions: Vec::new(),
+            decisions,
             estimate,
             next_step,
         }
@@ -505,7 +508,7 @@ fn q36_preflight(
             CheckStatus::Fail,
             "no GPU backend is compiled into this build (build with --features native-cuda on Linux or native-mlx on Apple Silicon); this binary cannot serve this family".to_string(),
         ));
-        return finish(checks, None, Qualification::Unverified);
+        return finish(checks, None, Vec::new(), Qualification::Unverified);
     };
     checks.push(Check::new(
         "backend",
@@ -531,7 +534,7 @@ fn q36_preflight(
     }
     if backend == Backend::Cuda && facts.cuda.device_count.as_ref() == Some(&0) {
         checks.last_mut().expect("backend check").status = CheckStatus::Fail;
-        return finish(checks, None, Qualification::Unverified);
+        return finish(checks, None, Vec::new(), Qualification::Unverified);
     }
 
     // The factory's own settings resolution: identical validation of the
@@ -571,7 +574,7 @@ fn q36_preflight(
                     super::describe_error(&error)
                 ),
             ));
-            return finish(checks, None, Qualification::Unverified);
+            return finish(checks, None, Vec::new(), Qualification::Unverified);
         }
     };
 
@@ -632,18 +635,48 @@ fn q36_preflight(
     }
 
     if any_failed(&checks) {
-        return finish(checks, None, qualification);
+        return finish(checks, None, Vec::new(), qualification);
     }
 
     let spec = settings.spec;
     // The CUDA GGUF loader reads exactly the pinned file, so only its
     // bytes are the planning figure; other layouts use the whole
     // inventory of weight files found.
-    let weight_bytes = if backend == Backend::Cuda && settings.weights == WeightFormat::Gguf {
+    let disk_bytes = if backend == Backend::Cuda && settings.weights == WeightFormat::Gguf {
         pinned_gguf_bytes(inspection).unwrap_or_else(|| inspection.weight_bytes())
     } else {
         inspection.weight_bytes()
     };
+    // The EXL3 planning figure is the loader's own header walk, not the
+    // bytes on disk: the walk counts the widening to F32 the load
+    // performs, and refuses a pack of another size, rate, codebook or
+    // layout exactly as the load would, before the first upload. The
+    // walk needs the EXL3 weights layer, compiled with the CUDA backend
+    // (and into every test build); a build without it never reaches an
+    // EXL3 estimate: EXL3 loads need the CUDA backend, which such a
+    // build either fails (no backend at all) or refuses in the settings
+    // check above (the MLX arm has no EXL3).
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    let (weight_bytes, exl3_plan) = if settings.weights == WeightFormat::Exl3 {
+        match crate::family::qwen36::exl3_plan(model_dir) {
+            Ok(plan) => (plan.device_bytes, Some(plan)),
+            Err(error) => {
+                checks.push(Check::new(
+                    "exl3 pack",
+                    CheckStatus::Fail,
+                    format!(
+                        "the load would refuse this pack: {}",
+                        super::describe_error(&error)
+                    ),
+                ));
+                return finish(checks, None, Vec::new(), qualification);
+            }
+        }
+    } else {
+        (disk_bytes, None)
+    };
+    #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
+    let weight_bytes = disk_bytes;
     let estimate = match estimate_q36(&spec, &settings, weight_bytes, backend, facts) {
         Ok(estimate) => estimate,
         Err(error) => {
@@ -655,7 +688,7 @@ fn q36_preflight(
                     super::describe_error(&error)
                 ),
             ));
-            return finish(checks, None, qualification);
+            return finish(checks, None, Vec::new(), qualification);
         }
     };
     let demand = estimate
@@ -701,7 +734,14 @@ fn q36_preflight(
             ),
         )),
     }
-    finish(checks, Some(estimate), qualification)
+    #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+    let decisions = exl3_plan
+        .as_ref()
+        .map(|plan| q36_exl3_decisions(plan, &estimate, disk_bytes, settings.kv))
+        .unwrap_or_default();
+    #[cfg(not(any(test, all(feature = "native-cuda", target_os = "linux"))))]
+    let decisions = Vec::new();
+    finish(checks, Some(estimate), decisions, qualification)
 }
 
 /// The Flint deep path: the only family with a three-way load decision
@@ -1533,6 +1573,74 @@ fn estimate_q36(
     })
 }
 
+/// The EXL3 decision rows: what the loader's own header walk found in the pack, and the
+/// context the same paper charges admit. The walk already ran for the weight figure; these
+/// rows only retell it, so the record and the estimate cannot disagree.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+fn q36_exl3_decisions(
+    plan: &crate::family::qwen36::Exl3PackPlan,
+    estimate: &Estimate,
+    disk_bytes: u64,
+    kv: crate::family::qwen36::settings::KvDtype,
+) -> Vec<PlanDecision> {
+    use crate::family::qwen36::settings::kv_dtype_name;
+
+    // Rates are keyed by twice the bits per weight; render them as bpw.
+    let rates = if plan.rates.is_empty() {
+        "none".to_string()
+    } else {
+        plan.rates
+            .iter()
+            .map(|(twice_bits, count)| format!("{:.1} bpw x {count}", f64::from(*twice_bits) / 2.0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let weights_row = PlanDecision {
+        name: "weight figure".to_string(),
+        chosen: format!(
+            "{} B device bytes from the pack walk ({} quantized matrices, rates {rates}, \
+             codebook {}); {} B on disk",
+            plan.device_bytes, plan.matrices, plan.codebook, disk_bytes
+        ),
+        alternatives: vec![PlanAlternative {
+            option: format!("the {disk_bytes} B the files occupy on disk"),
+            verdict: "refused".to_string(),
+            reason: format!(
+                "the load widens scales and plain vectors to F32, so the walk's {} B is the \
+                 figure the device holds",
+                plan.device_bytes
+            ),
+        }],
+        fixed_at: PlanFixity::Load,
+    };
+    let mut context_alternatives = Vec::new();
+    if let Some(largest) = estimate.largest_fitting_context {
+        context_alternatives.push(PlanAlternative {
+            option: format!("{largest} positions"),
+            verdict: "fits".to_string(),
+            reason: "largest context the same paper charges admit; a proposal, never applied"
+                .to_string(),
+        });
+    }
+    let context_row = PlanDecision {
+        name: "context".to_string(),
+        chosen: format!("{} positions", estimate.context_limit),
+        alternatives: context_alternatives,
+        fixed_at: PlanFixity::Start,
+    };
+    let kv_row = PlanDecision {
+        name: "kv cache".to_string(),
+        chosen: format!(
+            "{} at {} B per position",
+            kv_dtype_name(kv),
+            estimate.kv_bytes_per_position
+        ),
+        alternatives: Vec::new(),
+        fixed_at: PlanFixity::Start,
+    };
+    vec![weights_row, context_row, kv_row]
+}
+
 /// The largest context (a multiple of 1024, capped at the requested context)
 /// whose paper demand leaves at least the uncertainty band of slack against
 /// the measured budget. `None` when not even a minimal context fits — the
@@ -1583,8 +1691,8 @@ fn largest_fitting_cuda(
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, CheckStatus, Compatibility, Estimate, Qualification, ResourceFit, Verdict,
-        q36_dimensions, q36_verdict,
+        Check, CheckStatus, Compatibility, Estimate, PlanFixity, Qualification, ResourceFit,
+        Verdict, q36_dimensions, q36_verdict,
     };
 
     fn estimate(total: u64, limit: Option<u64>, fitting: Option<u32>) -> Estimate {
@@ -1886,6 +1994,82 @@ mod tests {
         assert_eq!(estimate.weight_bytes, audit.resident_bytes);
         assert_eq!(estimate.fit, ResourceFit::Fits);
         assert!(estimate.largest_fitting_context.is_none());
+    }
+
+    #[test]
+    fn q36_exl3_decisions_retell_the_pack_walk_and_the_context_proposal() {
+        use crate::family::qwen36::Exl3PackPlan;
+        use crate::family::qwen36::settings::KvDtype;
+        use std::collections::BTreeMap;
+
+        let plan = Exl3PackPlan {
+            device_bytes: 21_000_000_000,
+            matrices: 1_976,
+            rates: BTreeMap::from([(10u8, 976), (12u8, 1_000)]),
+            codebook: "Mcg",
+        };
+        // An over-budget estimate carries the proposal the rows must retell.
+        let est = estimate(2000, Some(1000), Some(90));
+        let decisions = super::q36_exl3_decisions(&plan, &est, 20_000_000_000, KvDtype::F32);
+
+        let weights = decisions
+            .iter()
+            .find(|decision| decision.name == "weight figure")
+            .expect("weight figure row");
+        assert!(
+            weights.chosen.contains("21000000000 B device bytes"),
+            "{}",
+            weights.chosen
+        );
+        // The rates print in bpw, sorted by their key order, not insertion order.
+        assert!(
+            weights.chosen.contains("5.0 bpw x 976, 6.0 bpw x 1000"),
+            "{}",
+            weights.chosen
+        );
+        assert!(
+            weights.chosen.contains("codebook Mcg"),
+            "{}",
+            weights.chosen
+        );
+        assert_eq!(weights.fixed_at, PlanFixity::Load);
+        assert_eq!(weights.alternatives.len(), 1);
+        assert_eq!(weights.alternatives[0].verdict, "refused");
+        assert!(
+            weights.alternatives[0].option.contains("20000000000 B"),
+            "{}",
+            weights.alternatives[0].option
+        );
+
+        let context = decisions
+            .iter()
+            .find(|decision| decision.name == "context")
+            .expect("context row");
+        assert_eq!(context.chosen, "1000 positions");
+        assert_eq!(context.fixed_at, PlanFixity::Start);
+        assert_eq!(context.alternatives.len(), 1);
+        assert_eq!(context.alternatives[0].option, "90 positions");
+        assert_eq!(context.alternatives[0].verdict, "fits");
+
+        let kv = decisions
+            .iter()
+            .find(|decision| decision.name == "kv cache")
+            .expect("kv cache row");
+        assert_eq!(kv.chosen, "f32 at 10 B per position");
+
+        // A fitting estimate proposes nothing, so the context row has no alternative.
+        let fitting = estimate(500, Some(1000), None);
+        let decisions = super::q36_exl3_decisions(&plan, &fitting, 20_000_000_000, KvDtype::Q8);
+        let context = decisions
+            .iter()
+            .find(|decision| decision.name == "context")
+            .expect("context row");
+        assert!(context.alternatives.is_empty());
+        let kv = decisions
+            .iter()
+            .find(|decision| decision.name == "kv cache")
+            .expect("kv cache row");
+        assert_eq!(kv.chosen, "q8 at 10 B per position");
     }
 
     #[test]

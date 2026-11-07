@@ -327,3 +327,43 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
         .unwrap();
     assert_eq!(report.device_bytes, expected);
 }
+
+/// The planning seam of [`exl3_plan`]: a directory without a pack's metadata is refused with
+/// the loader's own words, with no projector and no device — the refusal a preflight turns
+/// into a failing check before any upload.
+#[test]
+fn exl3_plan_refuses_a_directory_without_pack_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = super::exl3_plan(dir.path()).expect_err("an empty directory is not a pack");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("config.json"),
+        "the refusal names the file: {text}"
+    );
+}
+
+/// The marker names the seam reports are the marker enum's own: swapped arms would rename a
+/// real pack's codebook in the decision rows, so the mapping is pinned, not println'd.
+#[test]
+fn codebook_names_are_the_markers_own() {
+    use super::exl3_pack::codebook_name;
+    assert_eq!(codebook_name(Marker::Mul1), "Mul1");
+    assert_eq!(codebook_name(Marker::Mcg), "Mcg");
+}
+
+/// The seam and the loader's walk agree on the real pack: the same device bytes the ignored
+/// walk test pins, read through the planning path the preflight uses.
+#[test]
+#[ignore = "reads the headers of a real pack in FIFI_EXL3_CHECKPOINT"]
+fn exl3_plan_reports_the_real_packs_walk() {
+    let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    let plan = super::exl3_plan(Path::new(&dir)).expect("the pack fits the model");
+    let expected: u64 = std::env::var("FIFI_EXL3_EXPECT_BYTES")
+        .expect("FIFI_EXL3_EXPECT_BYTES")
+        .parse()
+        .unwrap();
+    assert_eq!(plan.device_bytes, expected);
+    assert!(plan.matrices > 0);
+    assert!(!plan.rates.is_empty());
+    println!("{plan:?}");
+}

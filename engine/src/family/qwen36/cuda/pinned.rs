@@ -13,7 +13,8 @@ use crate::{
 
 /// Rotary dimension of the pinned model (head_dim 256 times the partial-rotary factor 0.25);
 /// the GGUF carries no config.json, and the resident-step test fixtures name the same 64.
-pub(super) const ROTARY_DIM: u32 = 64;
+/// Aliases the ungated single pinned fact in `settings.rs`.
+pub(super) const ROTARY_DIM: u32 = super::super::settings::ROTARY_DIM;
 /// Less than this many bytes free after the load is a typed refusal, not an error.
 pub(super) const MIN_FREE_AFTER_LOAD: usize = 1 << 30;
 

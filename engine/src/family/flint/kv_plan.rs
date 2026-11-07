@@ -6,7 +6,7 @@ use crate::EngError;
 
 pub(crate) const LAYERS: usize = 49;
 pub(super) const WINDOW: usize = 513;
-const MODEL_CONTEXT_LIMIT: usize = 262_144;
+const MODEL_CONTEXT_LIMIT: usize = super::budget::MODEL_CONTEXT_LIMIT as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvStorage {

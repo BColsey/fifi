@@ -19,6 +19,12 @@ use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Rotary dimension of the pinned model (head_dim 256 times the partial-rotary factor 0.25);
+/// the GGUF carries no config.json, and the resident-step test fixtures name the same 64.
+/// The single pinned fact: `cuda/pinned.rs` and the EXL3 pack walk alias this constant so the
+/// loader's walk and the preflight estimate cannot drift apart.
+pub(crate) const ROTARY_DIM: u32 = 64;
+
 /// Vocabulary size of the pinned `tokenizer.json` with its added tokens.
 const TOKENIZER_VOCAB_SIZE: u32 = 248_077;
 /// Positions of the default context limit of the CUDA arm. The CUDA arm sizes its default F32 cache
