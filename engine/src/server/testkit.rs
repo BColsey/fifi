@@ -112,6 +112,20 @@ pub(super) fn load_refused_engine(error: EngError) -> Engine {
     spawn_engine::<FakeExecutor, _>(512, move |_| Err(error)).expect("spawn engine")
 }
 
+/// An engine that fails its load, with the engine's own error, once the returned sender fires or
+/// is dropped: the failure arrives while the server is already listening and watching.
+pub(super) fn gated_failing_engine() -> (Engine, std::sync::mpsc::Sender<()>) {
+    let (gate, wait) = std::sync::mpsc::channel::<()>();
+    let engine = spawn_engine::<FakeExecutor, _>(512, move |_| {
+        let _ = wait.recv();
+        Err(EngError::MemoryPlan(
+            "cuda admission: need 10 bytes, device has 1 free".to_string(),
+        ))
+    })
+    .expect("spawn engine");
+    (engine, gate)
+}
+
 pub(super) fn gated_engine(script: Vec<Vec<u32>>) -> (Engine, std::sync::mpsc::Sender<()>) {
     let (gate, wait) = std::sync::mpsc::channel::<()>();
     let engine = spawn_engine(512, move |_| {

@@ -1579,6 +1579,166 @@ mod tests {
         loading.shutdown();
     }
 
+    /// Several engines, all refused: the same exit as one engine, and every cause is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_whose_engines_all_failed_to_load_stops_and_reports_each_cause() {
+        let first = testkit::load_refused_engine(crate::EngError::MemoryPlan(
+            "cuda admission: need 2 bytes, device has 1 free".to_string(),
+        ));
+        let second = testkit::failing_engine();
+        let entries = vec![
+            testkit::entry("e1", "model-a", &first, 4_096),
+            testkit::entry("e2", "model-b", &second, 4_096),
+        ];
+        testkit::wait_for_state(&entries[0].handle, EngineState::Error);
+        testkit::wait_for_state(&entries[1].handle, EngineState::Error);
+        let task = serve_without_signal(entries).await;
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the server kept running after every engine failed to load")
+            .expect("task");
+        let failures: Vec<String> = [("e1", first.shutdown()), ("e2", second.shutdown())]
+            .iter()
+            .filter_map(|(id, report)| shutdown_failure(id, report))
+            .collect();
+        let error = outcome(served, failures).expect_err("a non-zero run");
+        assert!(
+            error.0.contains("engine e1 ended in state error"),
+            "{}",
+            error.0
+        );
+        assert!(
+            error.0.contains("cuda admission: need 2 bytes"),
+            "{}",
+            error.0
+        );
+        assert!(
+            error.0.contains("engine e2 ended in state error"),
+            "{}",
+            error.0
+        );
+        assert!(error.0.contains("fixture load failure"), "{}", error.0);
+    }
+
+    /// The time bound. A failure the watch sees on its next sample ends the server within one
+    /// `BOOT_WATCH_INTERVAL` (100 ms) plus an empty drain; one second leaves room for a loaded host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_load_failure_that_arrives_while_serving_ends_the_server_within_a_second() {
+        let (engine, gate) = testkit::gated_failing_engine();
+        let entries = vec![testkit::entry("e1", "model-a", &engine, 4_096)];
+        let task = serve_without_signal(entries).await;
+        tokio::time::sleep(super::BOOT_WATCH_INTERVAL * 3).await;
+        assert!(
+            !task.is_finished(),
+            "the server stopped while the engine was loading"
+        );
+        let failed_at = std::time::Instant::now();
+        drop(gate);
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the server kept running after the load failed")
+            .expect("task");
+        let elapsed = failed_at.elapsed();
+        assert!(served.is_ok(), "{served:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the exit took {elapsed:?} after the load failed"
+        );
+        let report = engine.shutdown();
+        assert_eq!(report.state, EngineState::Error);
+        assert!(
+            report.failure.expect("cause").contains("cuda admission"),
+            "the cause is lost"
+        );
+    }
+
+    /// Serves `entries` on a real socket with a shutdown future that never fires; returns the
+    /// address with the task.
+    async fn serve_at(
+        entries: Vec<crate::server::state::EngineEntry>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<(), StartupError>>,
+    ) {
+        let state = Arc::new(AppState::new(testkit::API_KEY, entries));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        (
+            address,
+            tokio::spawn(serve(listener, state, std::future::pending())),
+        )
+    }
+
+    /// One blocking HTTP/1.1 GET; returns the whole answer.
+    async fn http_get(address: std::net::SocketAddr, path: &str, key: Option<&str>) -> String {
+        let auth = key
+            .map(|key| format!("Authorization: Bearer {key}\r\n"))
+            .unwrap_or_default();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: test\r\n{auth}Connection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            let mut socket = std::net::TcpStream::connect(address).expect("connect");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            socket.write_all(request.as_bytes()).expect("write");
+            let mut answer = String::new();
+            socket.read_to_string(&mut answer).expect("read");
+            answer
+        })
+        .await
+        .expect("client")
+    }
+
+    /// The server's current design, over real HTTP: `/ready` is 200 as soon as one engine is
+    /// ready, even beside a failed one, and `/v1/models` still names the failed engine's state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_answers_200_beside_a_failed_engine_and_models_shows_the_failure() {
+        let broken = testkit::failing_engine();
+        let live = testkit::engine(testkit::script("hi"));
+        let entries = vec![
+            testkit::entry("e1", "model-a", &broken, 4_096),
+            testkit::entry("e2", "model-b", &live, 4_096),
+        ];
+        testkit::wait_for_state(&entries[0].handle, EngineState::Error);
+        testkit::wait_for_state(&entries[1].handle, EngineState::Ready);
+        let (address, task) = serve_at(entries).await;
+        let ready = http_get(address, "/ready", None).await;
+        assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+        assert!(ready.contains(r#""status":"ready""#), "{ready}");
+        let models = http_get(address, "/v1/models", Some(testkit::API_KEY)).await;
+        assert!(models.starts_with("HTTP/1.1 200"), "{models}");
+        assert!(models.contains(r#""state":"error""#), "{models}");
+        assert!(models.contains(r#""state":"ready""#), "{models}");
+        task.abort();
+        broken.shutdown();
+        live.shutdown();
+    }
+
+    /// While the only engine still loads, `/ready` is 503 and names the state, and the server
+    /// stays up; the load then finishes and `/ready` turns 200 with no restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_is_503_while_loading_then_200_when_the_engine_loads() {
+        let (loading, gate) = testkit::gated_engine(testkit::script("hi"));
+        let entries = vec![testkit::entry("e1", "model-a", &loading, 4_096)];
+        let handle = entries[0].handle.clone();
+        let (address, task) = serve_at(entries).await;
+        let waiting = http_get(address, "/ready", None).await;
+        assert!(waiting.starts_with("HTTP/1.1 503"), "{waiting}");
+        assert!(waiting.contains("e1 is loading"), "{waiting}");
+        gate.send(()).expect("open the gate");
+        testkit::wait_for_state(&handle, EngineState::Ready);
+        let ready = http_get(address, "/ready", None).await;
+        assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+        tokio::time::sleep(super::BOOT_WATCH_INTERVAL * 3).await;
+        assert!(
+            !task.is_finished(),
+            "a loaded engine did not keep the server up"
+        );
+        task.abort();
+        loading.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_lets_a_running_stream_finish() {
         let (address, stop, task, engines) = start(30).await;
