@@ -45,21 +45,21 @@ use crate::{
 
 /// The sizes of the routed experts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TierShape {
+pub(in crate::family::flash_next) struct TierShape {
     /// Layers with routed experts (48).
-    pub(super) layers: usize,
+    pub(in crate::family::flash_next) layers: usize,
     /// Routed experts per layer (512).
-    pub(super) experts: usize,
+    pub(in crate::family::flash_next) experts: usize,
     /// Picks per token and layer (10).
-    pub(super) top_k: usize,
+    pub(in crate::family::flash_next) top_k: usize,
     /// Device bytes of one routed expert, identical for all of them (1,881,600 in the 3.05 pack).
-    pub(super) expert_bytes: u64,
+    pub(in crate::family::flash_next) expert_bytes: u64,
 }
 
 impl TierShape {
     /// The shape from the header walk: every routed expert has the same size because every bank
     /// has one rate and the shapes are fixed (`FlashPackReport::expert_bytes` is their sum).
-    pub(super) fn from_pack(
+    pub(in crate::family::flash_next) fn from_pack(
         layers: usize,
         experts: usize,
         top_k: usize,
@@ -83,7 +83,7 @@ impl TierShape {
     }
 
     /// Device bytes of one more slot in every layer.
-    pub(super) fn slot_cost(&self) -> u64 {
+    pub(in crate::family::flash_next) fn slot_cost(&self) -> u64 {
         self.layers as u64 * self.expert_bytes
     }
 }
@@ -92,7 +92,7 @@ impl TierShape {
 /// `heads_kv * head_dim` values of `kv_elem_bytes`, and one f32 indexer key of `idx_dim` per `ratio`
 /// positions. Int8 K/V (`kv_elem_bytes` 1) counts no scale bytes here; `KvGeometry::position_bytes`
 /// (`context_budget.rs`) adds the f32 row scales and is what the step's budget uses.
-pub(super) fn position_bytes(
+pub(in crate::family::flash_next) fn position_bytes(
     qsa_layers: u64,
     heads_kv: u64,
     head_dim: u64,
@@ -109,12 +109,12 @@ pub(super) fn position_bytes(
 
 /// What the plan reads. The VRAM and host fields are the caller's measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TierInputs {
-    pub(super) shape: TierShape,
-    pub(super) vram: VramBudget,
+pub(in crate::family::flash_next) struct TierInputs {
+    pub(in crate::family::flash_next) shape: TierShape,
+    pub(in crate::family::flash_next) vram: VramBudget,
     /// Context positions and the K/V plus indexer bytes of one.
-    pub(super) kv: KvPlan,
-    pub(super) host: HostBudget,
+    pub(in crate::family::flash_next) kv: KvPlan,
+    pub(in crate::family::flash_next) host: HostBudget,
 }
 
 impl TierInputs {
@@ -128,7 +128,7 @@ impl TierInputs {
     /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
     /// heap, 1 GiB of staging and a 1 GiB margin. Prefill transients (the hyper stream, QSA scratch
     /// and expert streaming planes) are not charged yet; the step's arena plan supplies them.
-    pub(super) fn measured(
+    pub(in crate::family::flash_next) fn measured(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
         kv: KvPlan,
@@ -168,7 +168,7 @@ impl TierInputs {
     /// chosen so the slot counts match the residency cost model (142, 180 and 208 slots at 262,144,
     /// 131,072 and 32,768 positions). A test fixture: the load uses [`Self::measured`].
     #[cfg(test)]
-    pub(super) fn cost_model_3090(
+    pub(in crate::family::flash_next) fn cost_model_3090(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
         kv: KvPlan,
@@ -198,7 +198,7 @@ impl TierInputs {
 
 /// The settled split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TierPlan {
+pub(in crate::family::flash_next) struct TierPlan {
     shape: TierShape,
     slots_per_layer: usize,
     vram: VramPlan,
@@ -218,7 +218,7 @@ impl TierPlan {
     /// Refuses, with the budget that lost, a context whose K/V leaves fewer than `top_k` slots per
     /// layer, a K/V that does not fit the card (it never spills to the host), and a split whose
     /// cold experts exceed the host's page-locked budget.
-    pub(super) fn new(inputs: &TierInputs) -> Result<Self, EngError> {
+    pub(in crate::family::flash_next) fn new(inputs: &TierInputs) -> Result<Self, EngError> {
         let shape = inputs.shape;
         if shape.top_k == 0 || shape.top_k > shape.experts {
             return Err(refuse(format!(
@@ -253,37 +253,40 @@ impl TierPlan {
     }
 
     /// Resident experts in every layer (at least `top_k`, at most the expert count).
-    pub(super) fn slots_per_layer(&self) -> usize {
+    pub(in crate::family::flash_next) fn slots_per_layer(&self) -> usize {
         self.slots_per_layer
     }
 
     /// Device bytes of the slots of all layers.
-    pub(super) fn bank_bytes(&self) -> u64 {
+    pub(in crate::family::flash_next) fn bank_bytes(&self) -> u64 {
         self.slots_per_layer as u64 * self.shape.slot_cost()
     }
 
     /// Pinned host bytes of the experts outside the slots.
-    pub(super) fn cold_bytes(&self) -> u64 {
+    pub(in crate::family::flash_next) fn cold_bytes(&self) -> u64 {
         self.cold_bytes
     }
 
     /// Host bytes still free for the page-locked experts after the plan.
-    pub(super) fn host_spare_bytes(&self) -> u64 {
+    pub(in crate::family::flash_next) fn host_spare_bytes(&self) -> u64 {
         self.host.page_cache - self.cold_bytes
     }
 
     /// Device bytes the card has left after K/V, the trunk and the slots (less than one more slot).
-    pub(super) fn vram_left(&self) -> u64 {
+    pub(in crate::family::flash_next) fn vram_left(&self) -> u64 {
         self.vram.vram_left
     }
 
-    pub(super) fn shape(&self) -> TierShape {
+    pub(in crate::family::flash_next) fn shape(&self) -> TierShape {
         self.shape
     }
 
     /// The slot holders of every layer: the `slots_per_layer` experts with the highest counts
     /// (`counts[layer][expert]`), ties to the lowest id. Holders get slots `0..slots` in id order.
-    pub(super) fn hot_set(&self, counts: &[Vec<u64>]) -> Result<HotSet, EngError> {
+    pub(in crate::family::flash_next) fn hot_set(
+        &self,
+        counts: &[Vec<u64>],
+    ) -> Result<HotSet, EngError> {
         let shape = self.shape;
         let config = TieredConfig {
             layers: shape.layers,
@@ -331,28 +334,32 @@ impl TierPlan {
 
 /// Per layer, the slot of every expert or -1: the `slot_row` the device classifier reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SlotTable {
+pub(in crate::family::flash_next) struct SlotTable {
     slots: usize,
     rows: Vec<Vec<i32>>,
 }
 
 impl SlotTable {
-    pub(super) fn slots(&self) -> usize {
+    pub(in crate::family::flash_next) fn slots(&self) -> usize {
         self.slots
     }
 
     /// The row of `layer`, `experts` entries.
-    pub(super) fn row(&self, layer: usize) -> &[i32] {
+    pub(in crate::family::flash_next) fn row(&self, layer: usize) -> &[i32] {
         self.rows.get(layer).map_or(&[], Vec::as_slice)
     }
 
-    pub(super) fn slot_of(&self, layer: usize, expert: usize) -> Option<usize> {
+    pub(in crate::family::flash_next) fn slot_of(
+        &self,
+        layer: usize,
+        expert: usize,
+    ) -> Option<usize> {
         let slot = *self.rows.get(layer)?.get(expert)?;
         usize::try_from(slot).ok()
     }
 
     /// What `tiered_classify` computes for `layer` from the router's picks: the host oracle.
-    pub(super) fn classify(
+    pub(in crate::family::flash_next) fn classify(
         &self,
         layer: usize,
         ids: &[i32],
@@ -365,26 +372,30 @@ impl SlotTable {
 /// The slot holders of every layer as a slot table and as a placement map: GPU for a holder, CPU
 /// (page-locked host) for every other expert.
 #[derive(Debug)]
-pub(super) struct HotSet {
-    pub(super) table: SlotTable,
-    pub(super) residency: Residency,
+pub(in crate::family::flash_next) struct HotSet {
+    pub(in crate::family::flash_next) table: SlotTable,
+    pub(in crate::family::flash_next) residency: Residency,
 }
 
 /// Router pick counts per layer and expert: the popularity profile of [`TierPlan::hot_set`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RouteCounts {
+pub(in crate::family::flash_next) struct RouteCounts {
     counts: Vec<Vec<u64>>,
 }
 
 impl RouteCounts {
-    pub(super) fn new(layers: usize, experts: usize) -> Self {
+    pub(in crate::family::flash_next) fn new(layers: usize, experts: usize) -> Self {
         Self {
             counts: vec![vec![0; experts]; layers],
         }
     }
 
     /// Counts the picks of one token in `layer`; refuses an id outside the layer.
-    pub(super) fn record(&mut self, layer: usize, picks: &[u32]) -> Result<(), EngError> {
+    pub(in crate::family::flash_next) fn record(
+        &mut self,
+        layer: usize,
+        picks: &[u32],
+    ) -> Result<(), EngError> {
         let row = self
             .counts
             .get_mut(layer)
@@ -396,7 +407,7 @@ impl RouteCounts {
         Ok(())
     }
 
-    pub(super) fn counts(&self) -> &[Vec<u64>] {
+    pub(in crate::family::flash_next) fn counts(&self) -> &[Vec<u64>] {
         &self.counts
     }
 }

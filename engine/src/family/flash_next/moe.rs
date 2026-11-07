@@ -397,7 +397,7 @@ mod real_attention_tests;
 mod real_layer_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod residency_bench;
-mod slot_bank;
+pub(in crate::family::flash_next) mod slot_bank;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod tier_cuda_tests;
-mod tier_plan;
+pub(in crate::family::flash_next) mod tier_plan;

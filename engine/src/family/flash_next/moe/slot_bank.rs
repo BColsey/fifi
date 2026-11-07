@@ -35,7 +35,7 @@ use crate::{
 };
 
 /// Parts of an expert: gate, up, down.
-pub(super) const PARTS: usize = 3;
+pub(in crate::family::flash_next) const PARTS: usize = 3;
 const F32: usize = 4;
 /// Both matrix sides must be multiples of the EXL3 block (the CPU kernel's and the launches' grid).
 const BLOCK: usize = 128;
@@ -52,37 +52,37 @@ fn supported_words(words: usize) -> bool {
 
 /// Where the components of one part sit in a record, as byte ranges from the record start.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PartLayout {
+pub(in crate::family::flash_next) struct PartLayout {
     /// `[k, n]` of the matrix: the input and the output width.
-    pub(super) shape: [usize; 2],
+    pub(in crate::family::flash_next) shape: [usize; 2],
     /// u16 words per tile.
-    pub(super) words: usize,
-    pub(super) trellis: Range<usize>,
-    pub(super) suh: Range<usize>,
-    pub(super) svh: Range<usize>,
+    pub(in crate::family::flash_next) words: usize,
+    pub(in crate::family::flash_next) trellis: Range<usize>,
+    pub(in crate::family::flash_next) suh: Range<usize>,
+    pub(in crate::family::flash_next) svh: Range<usize>,
 }
 
 /// The bytes of one part as the checkpoint gives them, `suh` and `svh` already F32.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct PartBytes<'a> {
-    pub(super) trellis: &'a [u8],
-    pub(super) suh: &'a [u8],
-    pub(super) svh: &'a [u8],
+pub(in crate::family::flash_next) struct PartBytes<'a> {
+    pub(in crate::family::flash_next) trellis: &'a [u8],
+    pub(in crate::family::flash_next) suh: &'a [u8],
+    pub(in crate::family::flash_next) svh: &'a [u8],
 }
 
 /// An owned part, widened from a stored matrix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OwnedPart {
-    pub(super) shape: [usize; 2],
-    pub(super) words: usize,
-    pub(super) trellis: Vec<u8>,
-    pub(super) suh: Vec<u8>,
-    pub(super) svh: Vec<u8>,
+pub(in crate::family::flash_next) struct OwnedPart {
+    pub(in crate::family::flash_next) shape: [usize; 2],
+    pub(in crate::family::flash_next) words: usize,
+    pub(in crate::family::flash_next) trellis: Vec<u8>,
+    pub(in crate::family::flash_next) suh: Vec<u8>,
+    pub(in crate::family::flash_next) svh: Vec<u8>,
 }
 
 impl OwnedPart {
     /// The trellis as stored and the scales widened to F32 (an F16 scale widens exactly).
-    pub(super) fn from_matrix(matrix: &Matrix) -> Result<Self, EngError> {
+    pub(in crate::family::flash_next) fn from_matrix(matrix: &Matrix) -> Result<Self, EngError> {
         let widen = |tensor: &crate::tensor::Tensor| -> Result<Vec<u8>, EngError> {
             let bytes = tensor
                 .host_bytes()
@@ -111,7 +111,7 @@ impl OwnedPart {
         })
     }
 
-    pub(super) fn bytes(&self) -> PartBytes<'_> {
+    pub(in crate::family::flash_next) fn bytes(&self) -> PartBytes<'_> {
         PartBytes {
             trellis: &self.trellis,
             suh: &self.suh,
@@ -122,7 +122,7 @@ impl OwnedPart {
 
 /// The record of one expert: three parts back to back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SlotBankLayout {
+pub(in crate::family::flash_next) struct SlotBankLayout {
     parts: [PartLayout; PARTS],
     record_bytes: usize,
 }
@@ -131,7 +131,7 @@ impl SlotBankLayout {
     /// `hidden` and `inter` are the model's widths (gate and up are `[hidden, inter]`, down is
     /// `[inter, hidden]`); `words` is the tile size of each part. Refuses a width off the 128
     /// grid, an unsupported rate and a size that overflows.
-    pub(super) fn new(
+    pub(in crate::family::flash_next) fn new(
         hidden: usize,
         inter: usize,
         words: [usize; PARTS],
@@ -183,42 +183,48 @@ impl SlotBankLayout {
         })
     }
 
-    pub(super) fn part(&self, index: usize) -> &PartLayout {
+    pub(in crate::family::flash_next) fn part(&self, index: usize) -> &PartLayout {
         &self.parts[index]
     }
 
     /// Bytes of one record, which is also the byte stride between slots.
-    pub(super) fn record_bytes(&self) -> usize {
+    pub(in crate::family::flash_next) fn record_bytes(&self) -> usize {
         self.record_bytes
     }
 
     /// The stride between the trellises of consecutive slots, in bytes.
-    pub(super) fn trellis_stride_bytes(&self) -> usize {
+    pub(in crate::family::flash_next) fn trellis_stride_bytes(&self) -> usize {
         self.record_bytes
     }
 
     /// The stride between the `suh` (and the `svh`) of consecutive slots, in floats. Every part
     /// is a multiple of four bytes, so the record is too, and the byte strides of all three
     /// components are equal.
-    pub(super) fn scale_stride_floats(&self) -> usize {
+    pub(in crate::family::flash_next) fn scale_stride_floats(&self) -> usize {
         self.record_bytes / F32
     }
 
     /// Byte offset of slot `slot` in a bank buffer.
-    pub(super) fn slot_offset(&self, slot: usize) -> Result<usize, EngError> {
+    pub(in crate::family::flash_next) fn slot_offset(
+        &self,
+        slot: usize,
+    ) -> Result<usize, EngError> {
         slot.checked_mul(self.record_bytes)
             .ok_or_else(|| refuse(format!("slot {slot} overflows the buffer offset")))
     }
 
     /// Bytes of a bank buffer of `slots` slots.
-    pub(super) fn bank_bytes(&self, slots: usize) -> Result<usize, EngError> {
+    pub(in crate::family::flash_next) fn bank_bytes(
+        &self,
+        slots: usize,
+    ) -> Result<usize, EngError> {
         self.slot_offset(slots)
     }
 
     /// The three component ranges of part `part` for a launch over `slots` slots of a bank buffer:
     /// each starts at the component's place in record 0 and ends at its place in the last record,
     /// so member `i` of the launch is the component at `start + i * stride`.
-    pub(super) fn bank_ranges(
+    pub(in crate::family::flash_next) fn bank_ranges(
         &self,
         part: usize,
         slots: usize,
@@ -237,7 +243,7 @@ impl SlotBankLayout {
 
     /// Writes one expert into `out` (exactly one record). Refuses a part whose component lengths
     /// or shape do not match this layout; nothing is written then.
-    pub(super) fn pack_into(
+    pub(in crate::family::flash_next) fn pack_into(
         &self,
         parts: [PartBytes<'_>; PARTS],
         out: &mut [u8],
@@ -273,7 +279,10 @@ impl SlotBankLayout {
     }
 
     /// One expert's matrices as a record. Refuses a matrix of another shape or rate than the layout.
-    pub(super) fn pack_matrices(&self, matrices: [&Matrix; PARTS]) -> Result<Vec<u8>, EngError> {
+    pub(in crate::family::flash_next) fn pack_matrices(
+        &self,
+        matrices: [&Matrix; PARTS],
+    ) -> Result<Vec<u8>, EngError> {
         let owned = [
             OwnedPart::from_matrix(matrices[0])?,
             OwnedPart::from_matrix(matrices[1])?,
@@ -296,7 +305,10 @@ impl SlotBankLayout {
     }
 
     /// The CPU kernel's view of the expert in `record`.
-    pub(super) fn view<'a>(&self, record: &'a [u8]) -> Result<ExpertView<'a>, EngError> {
+    pub(in crate::family::flash_next) fn view<'a>(
+        &self,
+        record: &'a [u8],
+    ) -> Result<ExpertView<'a>, EngError> {
         if record.len() != self.record_bytes {
             return Err(refuse(format!(
                 "a record is {} bytes, received {}",

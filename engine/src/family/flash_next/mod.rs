@@ -4,6 +4,7 @@
 //! [`crate::family::project::Projector`] seam.
 
 mod artifact;
+mod cuda;
 mod deltanet;
 pub(crate) mod factory;
 mod hyper;
