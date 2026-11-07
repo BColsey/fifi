@@ -34,7 +34,11 @@
 
 use super::{
     dims::{KvMode, StepOptions},
-    exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
+    exl3_moe::{
+        Exl3MoeBufs, Exl3MoeWeights, Scratch,
+        merge::{SharedMerge, run_exl3_moe_merged},
+        run_exl3_moe,
+    },
     layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_geometry::MixerGeometry,
@@ -75,6 +79,7 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
+    family::qwen36::exl3_merge_plan::{load_suffix, shared_in_routed_explicit},
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
@@ -349,6 +354,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
     /// read; `moe` is empty then.
     exl3_moe: Vec<Exl3MoeWeights<'a>>,
+    /// `FIFI_EXL3_SHARED_IN_ROUTED=1`: the working buffer of the MoE block that queues the shared
+    /// expert inside the routed launches. `None` (the default) keeps the reference block.
+    exl3_merge: Option<SharedMerge>,
     /// The tiered mode: the options asked for it. The routed expert stacks are then not loaded,
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
     /// token syncs with the host: about 0.8 ms per token over the plain step when every expert is
@@ -643,6 +651,12 @@ impl<'a> QwenResidentStep<'a> {
         } else {
             Vec::new()
         };
+        // The opt-in merged block; a bad value of the switch stops the start, not the first token.
+        let exl3_merge = if options.layout == WeightLayout::Exl3 && shared_in_routed_explicit()? {
+            Some(SharedMerge::new(context, &moe_dims(&res.dims), &exl3_moe)?)
+        } else {
+            None
+        };
         let (moe, tiered_parts) = if tiered_mode {
             let parts = layers
                 .iter()
@@ -681,6 +695,7 @@ impl<'a> QwenResidentStep<'a> {
             mixers: Mixers::new(context, parts)?,
             moe,
             exl3_moe,
+            exl3_merge,
             tiered_mode,
             tiered_parts,
             tiered: None,
@@ -737,6 +752,32 @@ impl<'a> QwenResidentStep<'a> {
         let mut step = step;
         step.refill_prefill_report();
         Ok(step)
+    }
+
+    /// The load-line suffix of the opt-in merged MoE block: empty unless it is on.
+    pub(crate) fn shared_in_routed_suffix(&self) -> &'static str {
+        load_suffix(self.exl3_merge.is_some())
+    }
+
+    /// Test builds: puts the shared expert in the routed launches (or back) on this step, which
+    /// the process-wide switch cannot do twice in one process. Before the first token only.
+    #[cfg(test)]
+    pub(crate) fn set_shared_in_routed(&mut self, on: bool) -> Result<(), EngError> {
+        if self.started {
+            return Err(EngError::BadRequest(
+                "step: the MoE block is fixed once the session runs".to_owned(),
+            ));
+        }
+        self.exl3_merge = if on && self.layout == WeightLayout::Exl3 {
+            Some(SharedMerge::new(
+                self.context,
+                &self.moe_dims,
+                &self.exl3_moe,
+            )?)
+        } else {
+            None
+        };
+        Ok(())
     }
 
     /// Sets the capture settings; refuses after the first token and refuses
@@ -1887,13 +1928,22 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
                 }
-                run_exl3_moe(
-                    &launch,
-                    weights,
-                    &bufs,
-                    &self.moe_dims,
-                    self.exl3_device_ids,
-                )
+                if let Some(merge) = &self.exl3_merge {
+                    run_exl3_moe_merged(
+                        &launch,
+                        (weights, &bufs, merge),
+                        &self.moe_dims,
+                        self.exl3_device_ids,
+                    )
+                } else {
+                    run_exl3_moe(
+                        &launch,
+                        weights,
+                        &bufs,
+                        &self.moe_dims,
+                        self.exl3_device_ids,
+                    )
+                }
             }
             StepOp::Moe(layer) if self.tiered_mode => {
                 let runtime = self.tiered.as_ref().ok_or_else(|| {

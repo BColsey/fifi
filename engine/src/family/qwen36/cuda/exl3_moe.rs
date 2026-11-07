@@ -20,6 +20,8 @@
 //! queued as consecutive launches of at most that many in group order. Qwen3.6's 8 picks make
 //! one launch, as before.
 
+pub(in crate::family) mod merge;
+
 use super::{
     layer_table::LayerTable,
     moe::{Launch, MoeDims, RouteBufs},
@@ -427,6 +429,21 @@ fn shared(
 
 /// `resid_out = resid_in + (picks in pick order + gate * shared)`, as the GGUF block combines.
 fn combine(launch: &Launch<'_>, bufs: &Exl3MoeBufs<'_>, dims: &MoeDims) -> Result<(), EngError> {
+    combine_ranges(
+        launch,
+        &bufs.route,
+        (bufs.expert_down, bufs.shared_out),
+        dims,
+    )
+}
+
+/// The combine over the routed `down` rows and the `shared` row, wherever the block put them.
+fn combine_ranges(
+    launch: &Launch<'_>,
+    route: &RouteBufs<'_>,
+    (down, shared): (DeviceRange<'_>, DeviceRange<'_>),
+    dims: &MoeDims,
+) -> Result<(), EngError> {
     launch.ctx.moe_combine(
         launch.stream,
         CombineCall {
@@ -436,14 +453,14 @@ fn combine(launch: &Launch<'_>, bufs: &Exl3MoeBufs<'_>, dims: &MoeDims) -> Resul
                 top_k: dims.top_k,
                 ld_down: dims.hidden,
             },
-            res: bufs.route.resid_in,
-            down: bufs.expert_down,
-            weights: bufs.route.weights,
+            res: route.resid_in,
+            down,
+            weights: route.weights,
             shared: Some(SharedTerm {
-                gate: bufs.route.shared_gate,
-                row: bufs.shared_out,
+                gate: route.shared_gate,
+                row: shared,
             }),
-            out: CombineOut::To(bufs.route.resid_out),
+            out: CombineOut::To(route.resid_out),
         },
     )
 }
