@@ -708,7 +708,7 @@ impl<'c> ResidentDecoder<'c> {
                 .mixer
             else {
                 return Err(EngError::BadRequest(
-                    "the compile warm-up found no attention layer",
+                    "the compile warm-up found no attention layer".into(),
                 ));
             };
             let started = std::time::Instant::now();

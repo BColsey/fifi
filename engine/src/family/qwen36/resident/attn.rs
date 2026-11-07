@@ -687,14 +687,14 @@ fn step_tail(
     // it (BF16 in the serving default).
     let (k_new, v_new) = match cache.kv {
         KvDtype::F32 => (
-            cast_to(ctx, &k_new, Dtype::F32)?,
-            cast_to(ctx, &v_new, Dtype::F32)?,
+            cast_to(ctx, k_new, Dtype::F32)?,
+            cast_to(ctx, v_new, Dtype::F32)?,
         ),
         KvDtype::Bf16 => (
-            cast_to(ctx, &k_new, Dtype::Bf16)?,
-            cast_to(ctx, &v_new, Dtype::Bf16)?,
+            cast_to(ctx, k_new, Dtype::Bf16)?,
+            cast_to(ctx, v_new, Dtype::Bf16)?,
         ),
-        KvDtype::Q8 => (k_new, v_new),
+        KvDtype::Q8 => (k_new.share(), v_new.share()),
     };
     // 5. Append into the capacity buffers (a growth builds the larger buffers first).
     let cache = append(ctx, kv_heads, width, cache, 1, &k_new, &v_new)?;
