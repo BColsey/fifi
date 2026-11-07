@@ -93,6 +93,9 @@ enum Flaw {
     ShortlistFromWrongRow,
     /// A failed read of a full row at draw time leaves the window open and the state valid.
     LazyReadNotGated,
+    /// Entry 7 of the record of row 0 repeats the id of entry 3 (the first entry and the
+    /// non-finite word are right, so only a check of every entry can see it).
+    CorruptRecordEntry,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -453,6 +456,10 @@ impl DevFake {
             logits.iter().map(|row| fake_record(row)).collect();
         if self.flaw == Flaw::ShortlistFromWrongRow {
             records.rotate_left(1);
+        }
+        if self.flaw == Flaw::CorruptRecordEntry {
+            let id: [u8; 4] = records[0][3 * 8 + 4..3 * 8 + 8].try_into().expect("an id");
+            records[0][7 * 8 + 4..7 * 8 + 8].copy_from_slice(&id);
         }
         let bits_i32: Vec<i32> = self
             .last_status
@@ -1622,4 +1629,19 @@ fn a_failed_row_read_at_draw_time_fails_the_window_closed() {
     // The flaw leaves a valid state with the window open: it is not failed closed.
     let flawed = run(Flaw::LazyReadNotGated);
     assert!(!flawed.fake.poisoned && !flawed.fake.gate && flawed.fake.window.is_some());
+}
+
+#[test]
+fn a_record_with_a_corrupt_later_entry_fails_the_window_closed_when_the_report_is_read() {
+    // Sound: the same window runs and a seeded draw is made from the record.
+    let mut sound = Rig::krow(Flaw::Sound);
+    sound.fake.want_logits = false;
+    serve(&mut sound.fake, 4, 2, &mut keeping(5, 7));
+    // Corrupt entry 7 of row 0: the window fails closed at the read of the report, before any
+    // draw can meet it (the state is poisoned, the gate is set, no window is stored).
+    let mut rig = Rig::krow(Flaw::CorruptRecordEntry);
+    rig.fake.want_logits = false;
+    let error = rig.fake.run_window(&rows(4)).expect_err("a corrupt record");
+    assert!(format!("{error:?}").contains("row 0"), "{error:?}");
+    assert!(rig.fake.poisoned && rig.fake.gate && rig.fake.window.is_none());
 }

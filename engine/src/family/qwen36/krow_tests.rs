@@ -472,6 +472,63 @@ fn a_shortlist_that_disagrees_with_its_pair_is_an_error_and_a_bad_row_is_not_rea
     assert!(check_shortlists(&tokens, &bits, &records[..2], 40).is_err());
 }
 
+/// The ways entry `at` of a record can be corrupt that a later entry-by-entry check must find and
+/// the first entry and the non-finite word cannot show.
+fn corruptions(good: &[(u32, f32)], at: usize, vocab: usize) -> Vec<(&'static str, Vec<(u32, f32)>)> {
+    let mut out = Vec::new();
+    let mut repeated = good.to_vec();
+    repeated[at].0 = good[at - 4].0;
+    out.push(("an id used twice", repeated));
+    let mut outside = good.to_vec();
+    outside[at].0 = vocab as u32;
+    out.push(("an id outside the vocabulary", outside));
+    for (name, value) in [("a NaN", f32::NAN), ("an infinity", f32::INFINITY)] {
+        let mut not_finite = good.to_vec();
+        not_finite[at].1 = value;
+        out.push((name, not_finite));
+    }
+    let mut swapped = good.to_vec();
+    swapped.swap(at, at + 1);
+    out.push(("two entries out of order", swapped));
+    let mut raised = good.to_vec();
+    raised[at].1 = good[at - 1].1 + 1.0;
+    out.push(("an entry ranked above the one before it", raised));
+    out
+}
+
+#[test]
+fn a_corrupt_later_entry_fails_the_check_that_reads_the_report_with_the_predicate_of_the_sampler() {
+    use crate::family::sampler::check_shortlist;
+    let vocab = 40;
+    let row: Vec<f32> = (0..vocab).map(|i| ((i * 7 + 3) % 29) as f32 - 9.0).collect();
+    let good = ranked_top(&row, SHORTLIST_K);
+    let token = good[0].0 as i32;
+    let params = SamplingParams::new(0.9, 0.95, 20).unwrap();
+    // The sound record passes both the report check and the sampler.
+    let sound = [record(&good, 0)];
+    check_shortlists(&[token], &[0], &sound, vocab).expect("a sound record");
+    check_shortlist(&good, vocab).expect("the shared predicate");
+    Sampler::new(params, 1)
+        .sample_shortlist(&good, vocab)
+        .expect("the sampler");
+    for (what, bad) in corruptions(&good, 7, vocab) {
+        // Entry 0 is the argmax token and the non-finite word is clear: only the entry-by-entry
+        // check can find it.
+        let rec = [record(&bad, 0)];
+        let text = format!("{:?}", check_shortlists(&[token], &[0], &rec, vocab));
+        assert!(text.starts_with("Err") && text.contains("row 0"), "{what}: {text}");
+        // And it is the predicate the sampler applies: the two agree on every corruption.
+        assert!(check_shortlist(&bad, vocab).is_err(), "{what}");
+        assert!(
+            Sampler::new(params, 1).sample_shortlist(&bad, vocab).is_err(),
+            "{what}"
+        );
+    }
+    // A record of fewer entries than the vocabulary allows is the wrong length for both.
+    assert!(check_shortlist(&good[..19], vocab).is_err());
+    assert!(Sampler::new(params, 1).sample_shortlist(&good[..19], vocab).is_err());
+}
+
 // ---- which draws need a full row ----
 
 #[test]

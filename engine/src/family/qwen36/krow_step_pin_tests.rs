@@ -213,16 +213,18 @@ fn a_draw_reads_one_row_only_when_the_record_cannot_serve_it_and_a_failed_read_f
             "draws.belongs_to(window.base, &window.inputs)",
             "draw_source(",
             "DrawSource::Shortlist =>",
-            "sampler.sample_shortlist(candidates, sampler_vocab)",
+            "let drawn = sampler.sample_shortlist(candidates, sampler_vocab);",
+            "if drawn.is_err() {",
+            "window_logic::fail_window(self);",
             "DrawSource::Row =>",
             "window.rows.get(row)",
             "self.fault_at(Fault::KRowDraw)",
-            "window_logic::fail_window(self);",
             "self.read_krow_row(row)",
         ],
     );
-    // The failed read closes the window on both routes (the injected fault and the real error).
-    assert_eq!(draw.matches("window_logic::fail_window(self);").count(), 2);
+    // A failed draw closes the window on all three routes: the sampler refusing a record, the
+    // injected fault of the row read, and the real error of the row read.
+    assert_eq!(draw.matches("window_logic::fail_window(self);").count(), 3);
     // A single row, not the window's rows.
     assert!(body(&source, "read_krow_row").contains(&code("row * row_bytes")));
 }

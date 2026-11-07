@@ -653,19 +653,7 @@ impl Sampler {
                 "device shortlist requires non-greedy top_k 1 through 20".to_owned(),
             ));
         }
-        if vocab == 0 || u32::try_from(vocab).is_err() || ranked.len() != vocab.min(20) {
-            return Err(invalid_logits("device shortlist has the wrong length"));
-        }
-        for (index, &(id, value)) in ranked.iter().enumerate() {
-            if id as usize >= vocab
-                || !value.is_finite()
-                || ranked[..index].iter().any(|entry| entry.0 == id)
-                || (index > 0
-                    && compare_ranked(&ranked[index - 1], &ranked[index]) != Ordering::Less)
-            {
-                return Err(invalid_logits("device shortlist is invalid or not ranked"));
-            }
-        }
+        check_shortlist(ranked, vocab)?;
         let ranked = &ranked[..vocab.min(self.params.top_k as usize)];
         let top = f64::from(ranked[0].1);
         let (weights, total) = ranked_weights(ranked, top, self.params.temperature);
@@ -803,6 +791,31 @@ fn draw_kept(
         .get(last)
         .map(|entry| (entry.0, keep))
         .ok_or_else(|| invalid_logits("no candidate token"))
+}
+
+/// Whether `ranked` is a whole, valid top-`min(vocab, 20)` list of a vocabulary of `vocab` values:
+/// the right length, every id inside the vocabulary and used once, every value finite, and the
+/// entries strictly ranked (larger value first, then the lower id). The predicate that
+/// [`Sampler::sample_shortlist`] applies before it draws, so that the K-row window can apply it to a
+/// record when it reads the report instead of when a draw meets a corrupt entry.
+#[cfg_attr(
+    not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+    expect(dead_code, reason = "used by the CUDA device shortlist")
+)]
+pub(crate) fn check_shortlist(ranked: &[(u32, f32)], vocab: usize) -> Result<(), EngError> {
+    if vocab == 0 || u32::try_from(vocab).is_err() || ranked.len() != vocab.min(20) {
+        return Err(invalid_logits("device shortlist has the wrong length"));
+    }
+    for (index, &(id, value)) in ranked.iter().enumerate() {
+        if id as usize >= vocab
+            || !value.is_finite()
+            || ranked[..index].iter().any(|entry| entry.0 == id)
+            || (index > 0 && compare_ranked(&ranked[index - 1], &ranked[index]) != Ordering::Less)
+        {
+            return Err(invalid_logits("device shortlist is invalid or not ranked"));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_logits(message: &str) -> EngError {

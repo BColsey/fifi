@@ -1077,7 +1077,13 @@ impl QwenResidentStep<'_> {
         ) {
             DrawSource::Shortlist => {
                 let candidates = record?;
-                Some(sampler.sample_shortlist(candidates, sampler_vocab))
+                let drawn = sampler.sample_shortlist(candidates, sampler_vocab);
+                // The report was judged entry by entry when it was read (`check_shortlists`), so an
+                // error here is a record that changed since: the window fails closed.
+                if drawn.is_err() {
+                    window_logic::fail_window(self);
+                }
+                Some(drawn)
             }
             DrawSource::Row => {
                 if let Some(values) = window.rows.get(row) {

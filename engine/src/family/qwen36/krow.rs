@@ -37,7 +37,10 @@ use super::{
     exl3_merge_plan::{SHARED_IN_ROUTED_VAR, shared_in_routed_from_env},
     rollback::{MAX_ROWS, check_window_fits},
 };
-use crate::{EngError, family::sampler::SamplingParams};
+use crate::{
+    EngError,
+    family::sampler::{SamplingParams, check_shortlist},
+};
 
 /// The environment variable that selects the single-row EXL3 kernel
 /// (`kernels/cuda/resident/exl3.rs`, `SINGLE_GATHER_VAR`; a test pins that the two agree).
@@ -383,6 +386,10 @@ pub(crate) fn check_shortlists(
                     tokens[row]
                 )));
             }
+            // Every entry, by the predicate the sampler applies before it draws: a corrupt later
+            // entry fails the window here, not a draw of it.
+            check_shortlist(&candidates, vocab)
+                .map_err(|error| refuse(&format!("row {row}: {error:?}")))?;
             out.push(candidates);
         } else {
             // The window fails on this row's bit; its record is not read.
