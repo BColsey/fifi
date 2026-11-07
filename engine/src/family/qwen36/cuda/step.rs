@@ -79,7 +79,7 @@ use super::{
 use crate::{
     EngError,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::exl3_merge_plan::{load_suffix, shared_in_routed_explicit},
+    family::qwen36::exl3_merge_plan::{load_suffix, resolve_switch, shared_in_routed_explicit},
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
@@ -354,8 +354,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
     /// read; `moe` is empty then.
     exl3_moe: Vec<Exl3MoeWeights<'a>>,
-    /// `FIFI_EXL3_SHARED_IN_ROUTED=1`: the working buffer of the MoE block that queues the shared
-    /// expert inside the routed launches. `None` (the default) keeps the reference block.
+    /// The working buffer of the MoE block that queues the shared expert inside the routed launches
+    /// (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` or a load that cannot run it
+    /// leaves `None`, which keeps the reference block).
     ///
     /// Declared after `graph`, so the graph drops first: a captured body bakes in this buffer's
     /// address and its replay must never outlive the buffer.
@@ -656,9 +657,13 @@ impl<'a> QwenResidentStep<'a> {
         } else {
             Vec::new()
         };
-        // The opt-in merged block; a bad value of the switch stops the start, not the first token.
-        let exl3_merge = if options.layout == WeightLayout::Exl3 && shared_in_routed_explicit()? {
-            Some(SharedMerge::new(context, &moe_dims(&res.dims), &exl3_moe)?)
+        // The merged shared-expert block: on by default for an EXL3 load (a load that cannot run it
+        // falls back to the reference block with a logged reason), off with
+        // `FIFI_EXL3_SHARED_IN_ROUTED=0`, refused if `=1` cannot be honoured. A bad value of the
+        // switch stops the start, not the first token.
+        let exl3_merge = if options.layout == WeightLayout::Exl3 {
+            let intent = resolve_switch(shared_in_routed_explicit(), true)?;
+            SharedMerge::choose(context, &moe_dims(&res.dims), &exl3_moe, intent)?
         } else {
             None
         };
@@ -760,7 +765,7 @@ impl<'a> QwenResidentStep<'a> {
         Ok(step)
     }
 
-    /// The load-line suffix of the opt-in merged MoE block: empty unless it is on.
+    /// The load-line suffix of the merged MoE block: empty unless it is running.
     pub(crate) fn shared_in_routed_suffix(&self) -> &'static str {
         load_suffix(self.exl3_merge.is_some())
     }

@@ -1,4 +1,4 @@
-//! The shared expert inside the routed experts' EXL3 launches (`FIFI_EXL3_SHARED_IN_ROUTED=1`).
+//! The shared expert inside the routed experts' EXL3 launches (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` opts out).
 //!
 //! Today a MoE layer queues three groups for the routed experts and three for the shared expert:
 //!
@@ -95,15 +95,14 @@ struct Ranges<'b> {
 }
 
 impl SharedMerge {
-    /// Checks that every layer can run merged and allocates the zeroed working buffer. Refuses,
-    /// naming the switch, what the merged launches cannot run: a wide single-row kernel of more
-    /// than one tile, a block of more than 20 gate/up pairs, unequal widths, a shared matrix with
-    /// a bias or a rate other than 4 or 6 bits.
-    pub(in crate::family) fn new(
+    /// Whether every layer can run merged, or the first refusal (naming the switch): a single-row
+    /// kernel other than `wide1` (one tile per block), a block of more than 20 gate/up pairs,
+    /// unequal widths, a shared matrix with a bias or a rate other than 4 or 6 bits. No allocation.
+    pub(in crate::family) fn check(
         ctx: &CudaContext,
         dims: &MoeDims,
         layers: &[Exl3MoeWeights<'_>],
-    ) -> Result<Self, EngError> {
+    ) -> Result<(), String> {
         let facts: Vec<[SharedFacts; 3]> = layers
             .iter()
             .map(|weights| {
@@ -119,11 +118,51 @@ impl SharedMerge {
                 })
             })
             .collect();
-        let plan = plan_dims(dims);
-        check_merge(&plan, ctx.single_row_setting()?, &facts).map_err(EngError::BadRequest)?;
-        let layout = MergeLayout::new(&plan).map_err(EngError::BadRequest)?;
+        let kernel = ctx
+            .single_row_setting()
+            .map_err(|error| format!("{error:?}"))?;
+        check_merge(&plan_dims(dims), kernel, &facts)
+    }
+
+    /// Checks that every layer can run merged and allocates the zeroed working buffer; refuses
+    /// with the reason of [`Self::check`].
+    pub(in crate::family) fn new(
+        ctx: &CudaContext,
+        dims: &MoeDims,
+        layers: &[Exl3MoeWeights<'_>],
+    ) -> Result<Self, EngError> {
+        Self::check(ctx, dims, layers).map_err(EngError::BadRequest)?;
+        let layout = MergeLayout::new(&plan_dims(dims)).map_err(EngError::BadRequest)?;
         let buffer = ctx.upload(&vec![0u8; layout.total])?;
         Ok(Self { buffer, layout })
+    }
+
+    /// The merged block a load runs under `intent`: the working buffer, or `None` for the reference
+    /// block. `Intent::Default` (variable unset) falls back to the reference block, logging the
+    /// reason, when [`Self::check`] refuses: a default must never turn a loadable model into a
+    /// failure. `Intent::Explicit` (`=1`) keeps the refusal. `Intent::Off` checks nothing.
+    pub(in crate::family) fn choose(
+        ctx: &CudaContext,
+        dims: &MoeDims,
+        layers: &[Exl3MoeWeights<'_>],
+        intent: Intent,
+    ) -> Result<Option<Self>, EngError> {
+        let check = if intent == Intent::Off {
+            Ok(())
+        } else {
+            Self::check(ctx, dims, layers)
+        };
+        match decide(intent, check) {
+            Decision::Merge => Self::new(ctx, dims, layers).map(Some),
+            Decision::Reference => Ok(None),
+            Decision::Fallback(reason) => {
+                eprintln!(
+                    "q36 cuda: {SHARED_IN_ROUTED_VAR} unset and the merged shared-expert block cannot run on this load, using the reference block: {reason}"
+                );
+                Ok(None)
+            }
+            Decision::Refuse(reason) => Err(EngError::BadRequest(reason)),
+        }
     }
 
     fn ranges(&self) -> Result<Ranges<'_>, EngError> {

@@ -696,7 +696,7 @@ pub(crate) fn start(
     // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
     // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
-    // start before any weight is read.
+    // start before any weight is read. Unset on a GGUF checkpoint is off and is not refused.
     resolve_switch(
         shared_in_routed_explicit(),
         matches!(settings.weights, WeightFormat::Exl3),

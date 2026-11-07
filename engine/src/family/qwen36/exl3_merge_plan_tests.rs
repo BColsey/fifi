@@ -11,8 +11,8 @@
 use std::ffi::OsStr;
 
 use super::exl3_merge_plan::{
-    IdWord, Input, Member, MergeLayout, PairSpans, PlanDims, PlannedPair, Proj,
-    SHARED_IN_ROUTED_VAR, SharedFacts, Span, block_plan, check_merge, load_suffix,
+    Decision, IdWord, Input, Intent, Member, MergeLayout, PairSpans, PlanDims, PlannedPair, Proj,
+    SHARED_IN_ROUTED_VAR, SharedFacts, Span, block_plan, check_merge, decide, load_suffix,
     reference_kernel_launches, resolve_switch, shared_in_routed_from_env,
 };
 use crate::{EngError, kernels::single_row::SingleRow};
@@ -29,12 +29,12 @@ fn qwen36() -> PlanDims {
 }
 
 #[test]
-fn the_switch_parses_strictly_and_is_off_when_unset() {
-    assert_eq!(shared_in_routed_from_env(None), Ok(false));
+fn the_switch_parses_strictly_and_reports_unset_apart_from_zero() {
+    assert_eq!(shared_in_routed_from_env(None), Ok(None));
     for (value, on) in [("0", false), ("1", true), (" 1 ", true), (" 0", false)] {
         assert_eq!(
             shared_in_routed_from_env(Some(OsStr::new(value))),
-            Ok(on),
+            Ok(Some(on)),
             "{value:?}"
         );
     }
@@ -355,13 +355,14 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
 fn the_step_reaches_the_merged_block_only_through_the_switch() {
     let step = include_str!("cuda/step.rs");
     let squeezed = squeeze(step);
+    // Only an EXL3 load builds it, from the resolved intent, through `choose` (default falls back,
+    // explicit refuses); every other layout gets `None`.
     assert!(
         squeezed.contains(
-            "letexl3_merge=ifoptions.layout==WeightLayout::Exl3&&shared_in_routed_explicit()?{Some(SharedMerge::new("
+            "letexl3_merge=ifoptions.layout==WeightLayout::Exl3{letintent=resolve_switch(shared_in_routed_explicit(),true)?;SharedMerge::choose(context,&moe_dims(&res.dims),&exl3_moe,intent)?}else{None};"
         ),
-        "the merge exists only for the EXL3 layout with the switch on"
+        "the merge exists only for the EXL3 layout, chosen from the resolved intent"
     );
-    assert!(squeezed.contains("else{None};"));
     let run = squeeze(section(step, "fn run_op("));
     assert!(
         run.contains("ifletSome(merge)=&self.exl3_merge{run_exl3_moe_merged(&launch,(weights,&bufs,merge),&self.moe_dims,self.exl3_device_ids)}else{run_exl3_moe(&launch,weights,&bufs,&self.moe_dims,self.exl3_device_ids)}"),
@@ -370,6 +371,10 @@ fn the_step_reaches_the_merged_block_only_through_the_switch() {
     // The merge is built from the weights that exist, before the stream of the session.
     let new = &step[step.find("pub(crate) fn new(").expect("new")..];
     let merge = new.find("shared_in_routed_explicit()").expect("the switch");
+    assert!(
+        new.find("resolve_switch(").expect("intent")
+            < new.find("SharedMerge::choose(").expect("choose")
+    );
     let stream = new.find("context.stream()").expect("the stream");
     assert!(
         new.find("check_single_gather()").expect("check") < stream,
@@ -594,17 +599,24 @@ fn the_merged_block_accepts_the_qwen36_pack_and_refuses_what_it_cannot_run() {
 #[test]
 fn the_merged_block_checks_run_in_the_constructor_and_name_each_fact() {
     let merge = include_str!("cuda/exl3_moe/merge.rs");
-    let new = squeeze(section(merge, "pub(in crate::family) fn new("));
+    let check = squeeze(section(merge, "pub(in crate::family) fn check("));
     for part in [
         "bias:weight.bias.is_some()",
         "bits_twice:weight.bits_twice",
-        "check_merge(&plan,ctx.single_row_setting()?,&facts)",
+        "check_merge(&plan_dims(dims),kernel,&facts)",
         "weights.shared_gate",
         "weights.shared_up",
         "weights.shared_down",
     ] {
-        assert!(new.contains(part), "{part}: {new}");
+        assert!(check.contains(part), "{part}: {check}");
     }
+    // `new` runs the same check before it allocates, and refuses with its reason.
+    let new = squeeze(section(merge, "pub(in crate::family) fn new("));
+    assert!(
+        new.contains("Self::check(ctx,dims,layers).map_err(EngError::BadRequest)?;"),
+        "{new}"
+    );
+    assert!(new.find("Self::check(").unwrap() < new.find("ctx.upload(").unwrap());
 }
 
 // ---- the switch at the session start ----
@@ -619,15 +631,151 @@ fn the_start_refuses_a_bad_switch_for_every_weight_format_and_one_on_gguf() {
     for exl3 in [false, true] {
         let error = resolve_switch(bad(), exl3).expect_err("a bad value");
         assert!(format!("{error:?}").contains(SHARED_IN_ROUTED_VAR));
-        assert!(!resolve_switch(Ok(false), exl3).unwrap());
     }
-    assert!(resolve_switch(Ok(true), true).unwrap());
-    let error = resolve_switch(Ok(true), false).expect_err("1 on GGUF");
+    let error = resolve_switch(Ok(Some(true)), false).expect_err("1 on GGUF");
     let text = format!("{error:?}");
     assert!(
         text.contains(SHARED_IN_ROUTED_VAR) && text.contains("EXL3"),
         "{text}"
     );
+}
+
+/// The whole table of the switch, one row per case. Unset on a GGUF checkpoint is the critical
+/// row: the default must not turn a loadable model into a failure.
+#[test]
+fn the_switch_semantics_table() {
+    // (variable, EXL3 weights) -> intent, or a refusal
+    let table: [(Option<bool>, bool, Option<Intent>); 6] = [
+        (None, true, Some(Intent::Default)),
+        (Some(false), true, Some(Intent::Off)),
+        (Some(true), true, Some(Intent::Explicit)),
+        (None, false, Some(Intent::Off)),
+        (Some(false), false, Some(Intent::Off)),
+        (Some(true), false, None),
+    ];
+    for (value, exl3, want) in table {
+        let got = resolve_switch(Ok(value), exl3);
+        match want {
+            Some(intent) => assert_eq!(got.unwrap(), intent, "{value:?} exl3 {exl3}"),
+            None => assert!(got.is_err(), "{value:?} exl3 {exl3} must be refused"),
+        }
+    }
+    // Unset on GGUF is not an error, whatever else is set.
+    assert_eq!(resolve_switch(Ok(None), false).unwrap(), Intent::Off);
+}
+
+#[test]
+fn a_default_falls_back_and_an_explicit_request_is_refused() {
+    let no = || Err("it needs wide1".to_owned());
+    // Everything fine: the default and the explicit request merge, off never does.
+    assert_eq!(decide(Intent::Default, Ok(())), Decision::Merge);
+    assert_eq!(decide(Intent::Explicit, Ok(())), Decision::Merge);
+    assert_eq!(decide(Intent::Off, Ok(())), Decision::Reference);
+    // The load cannot run merged (not wide1, a bias, a rate, picks, widths, rows).
+    assert_eq!(
+        decide(Intent::Default, no()),
+        Decision::Fallback("it needs wide1".to_owned()),
+        "a default must never refuse a loadable model"
+    );
+    assert_eq!(
+        decide(Intent::Explicit, no()),
+        Decision::Refuse("it needs wide1".to_owned()),
+        "an explicit =1 keeps today's hard refusal"
+    );
+    assert_eq!(
+        decide(Intent::Off, no()),
+        Decision::Reference,
+        "off never looks at the check"
+    );
+}
+
+/// Every refusal of `check_merge`, fed through the default and the explicit intent.
+#[test]
+fn every_refusal_of_the_check_falls_back_by_default_and_refuses_when_explicit() {
+    let dims = qwen36();
+    let ok = [facts(false, 8), facts(false, 12)];
+    let mut bias = facts(false, 8);
+    bias[1].bias = true;
+    let mut wide = qwen36();
+    wide.top_k = 10;
+    let mut rows = qwen36();
+    rows.rows = 2;
+    let mut narrow = qwen36();
+    narrow.shared_inter = 256;
+    let cases: [(&str, Result<(), String>); 7] = [
+        ("not wide1", check_merge(&dims, SingleRow::Wide(2), &ok)),
+        ("legacy kernel", check_merge(&dims, SingleRow::Legacy, &ok)),
+        ("bias", check_merge(&dims, SingleRow::Wide(1), &[bias])),
+        (
+            "rate",
+            check_merge(&dims, SingleRow::Wide(1), &[facts(false, 10)]),
+        ),
+        ("picks", check_merge(&wide, SingleRow::Wide(1), &ok)),
+        ("rows", check_merge(&rows, SingleRow::Wide(1), &ok)),
+        ("width", check_merge(&narrow, SingleRow::Wide(1), &ok)),
+    ];
+    for (name, check) in cases {
+        let reason = check.clone().expect_err(name);
+        assert_eq!(
+            decide(Intent::Default, check.clone()),
+            Decision::Fallback(reason.clone()),
+            "{name}"
+        );
+        assert_eq!(
+            decide(Intent::Explicit, check.clone()),
+            Decision::Refuse(reason),
+            "{name}"
+        );
+        assert_eq!(decide(Intent::Off, check), Decision::Reference, "{name}");
+    }
+    assert_eq!(
+        decide(Intent::Default, check_merge(&dims, SingleRow::Wide(1), &ok)),
+        Decision::Merge
+    );
+}
+
+/// The load chooses through `decide`: fallback logs and returns None, refuse is an error, and the
+/// check is skipped when off.
+#[test]
+fn the_load_chooses_through_the_decision_with_a_logged_fallback() {
+    let merge = include_str!("cuda/exl3_moe/merge.rs");
+    let choose = squeeze(section(merge, "pub(in crate::family) fn choose("));
+    for part in [
+        "letcheck=ifintent==Intent::Off{Ok(())}else{Self::check(ctx,dims,layers)};",
+        "matchdecide(intent,check){",
+        "Decision::Merge=>Self::new(ctx,dims,layers).map(Some)",
+        "Decision::Reference=>Ok(None)",
+        "Decision::Fallback(reason)=>{eprintln!(",
+        "usingthereferenceblock:{reason}",
+        "Ok(None)",
+        "Decision::Refuse(reason)=>Err(EngError::BadRequest(reason))",
+    ] {
+        assert!(choose.contains(part), "{part}: {choose}");
+    }
+    assert!(choose.contains(&squeeze("{SHARED_IN_ROUTED_VAR} unset")));
+}
+
+/// The default is on the EXL3 load only: GGUF, Flint and Flash-Next never reach the merge.
+#[test]
+fn only_the_qwen36_exl3_load_can_reach_the_merged_block() {
+    for (file, source) in [
+        ("flint", include_str!("../flint/cuda_executor.rs")),
+        ("flash_next step", include_str!("../flash_next/step.rs")),
+        (
+            "flash_next moe",
+            include_str!("../flash_next/moe/exl3_cuda_tests.rs"),
+        ),
+        ("qwen36 moe.rs (GGUF block)", include_str!("cuda/moe.rs")),
+    ] {
+        for word in [
+            "SharedMerge",
+            "run_exl3_moe_merged",
+            "exl3_merge_plan",
+            "SHARED_IN_ROUTED",
+        ] {
+            assert!(!source.contains(word), "{file} mentions {word}");
+        }
+    }
 }
 
 /// The start resolves the switch before the projector exists and before any weight is opened.

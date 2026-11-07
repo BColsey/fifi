@@ -24,22 +24,27 @@ pub(in crate::family) struct PlanDims {
     pub(in crate::family) shared_inter: usize,
 }
 
-/// The environment switch: unset or `0` keeps the reference MoE block, `1` puts the shared expert
-/// in the routed launches. Process-wide, read once, strict: any other value stops the session
-/// start. Same bytes as the reference block (device-tested), fewer launches.
+/// The environment switch of the shared expert in the routed launches. On an EXL3 Qwen3.6 load,
+/// unset means ON as a default (a load that cannot run merged falls back to the reference block and
+/// says why), `0` means OFF, and `1` means ON as an explicit request (a load that cannot run merged
+/// is refused). On any other weight format unset and `0` mean off and `1` is refused. Process-wide,
+/// read once, strict: any other value stops the session start. Same bytes as the reference block
+/// (device-tested), fewer launches.
 pub(in crate::family) const SHARED_IN_ROUTED_VAR: &str = "FIFI_EXL3_SHARED_IN_ROUTED";
 
 /// The most pairs of the merged gate/up launch: the 20-pair kernels' capacity.
 const PAIR_LIMIT: usize = 20;
 
-/// Parses [`SHARED_IN_ROUTED_VAR`]: unset is off.
-pub(in crate::family) fn shared_in_routed_from_env(value: Option<&OsStr>) -> Result<bool, String> {
+/// Parses [`SHARED_IN_ROUTED_VAR`]: `None` when unset, else whether it asks for the merged block.
+pub(in crate::family) fn shared_in_routed_from_env(
+    value: Option<&OsStr>,
+) -> Result<Option<bool>, String> {
     let Some(value) = value else {
-        return Ok(false);
+        return Ok(None);
     };
     match value.to_str().map(str::trim) {
-        Some("0") => Ok(false),
-        Some("1") => Ok(true),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
         _ => Err(format!(
             "{SHARED_IN_ROUTED_VAR} must be unset, \"0\" or \"1\""
         )),
@@ -47,8 +52,8 @@ pub(in crate::family) fn shared_in_routed_from_env(value: Option<&OsStr>) -> Res
 }
 
 /// The switch from the environment, or the refusal of a bad value. Read once per process.
-pub(in crate::family) fn shared_in_routed_explicit() -> Result<bool, EngError> {
-    static EXPLICIT: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+pub(in crate::family) fn shared_in_routed_explicit() -> Result<Option<bool>, EngError> {
+    static EXPLICIT: std::sync::OnceLock<Result<Option<bool>, String>> = std::sync::OnceLock::new();
     EXPLICIT
         .get_or_init(|| {
             shared_in_routed_from_env(std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref())
@@ -57,7 +62,7 @@ pub(in crate::family) fn shared_in_routed_explicit() -> Result<bool, EngError> {
         .map_err(EngError::BadRequest)
 }
 
-/// The load-line suffix: empty when the switch is off, so the default line is unchanged.
+/// The load-line suffix: empty when the merged block is not running.
 pub(in crate::family) fn load_suffix(on: bool) -> &'static str {
     if on { " exl3_shared_in_routed=on" } else { "" }
 }
@@ -328,7 +333,7 @@ pub(in crate::family) fn check_merge(
     kernel: SingleRow,
     layers: &[[SharedFacts; 3]],
 ) -> Result<(), String> {
-    let fail = |detail: String| format!("{SHARED_IN_ROUTED_VAR}=1: {detail}");
+    let fail = |detail: String| format!("{SHARED_IN_ROUTED_VAR}: {detail}");
     check_dims(dims).map_err(fail)?;
     if kernel != SingleRow::Wide(1) {
         return Err(fail(format!(
@@ -351,18 +356,56 @@ pub(in crate::family) fn check_merge(
     Ok(())
 }
 
+/// What the switch asks of a load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family) enum Intent {
+    /// Reference block: `0`, or any switch value on a weight format with no such block.
+    Off,
+    /// The default of an EXL3 load (variable unset): merged if the load can run it, else the
+    /// reference block with a logged reason. Never a failure.
+    Default,
+    /// `1` on an EXL3 load: merged, or the start is refused.
+    Explicit,
+}
+
 /// The switch as the session start resolves it, before any weight is read: a bad value is
-/// refused for every weight format, and `1` is refused unless the weights are EXL3, because only
-/// the EXL3 MoE block has a shared expert to move. `value` is [`shared_in_routed_explicit`].
+/// refused for every weight format, `1` is refused unless the weights are EXL3 (only the EXL3 MoE
+/// block has a shared expert to move), and unset on other formats is off and NOT refused.
+/// `value` is [`shared_in_routed_explicit`].
 pub(in crate::family) fn resolve_switch(
-    value: Result<bool, EngError>,
+    value: Result<Option<bool>, EngError>,
     exl3_weights: bool,
-) -> Result<bool, EngError> {
-    let on = value?;
-    if on && !exl3_weights {
-        return Err(EngError::BadRequest(format!(
+) -> Result<Intent, EngError> {
+    match (value?, exl3_weights) {
+        (Some(true), false) => Err(EngError::BadRequest(format!(
             "{SHARED_IN_ROUTED_VAR}=1 applies to EXL3 weights only; unset it or use an EXL3 pack"
-        )));
+        ))),
+        (Some(false), _) | (None, false) => Ok(Intent::Off),
+        (None, true) => Ok(Intent::Default),
+        (Some(true), true) => Ok(Intent::Explicit),
     }
-    Ok(on)
+}
+
+/// What a load does with the merged block, given the intent and the result of [`check_merge`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::family) enum Decision {
+    /// Run the merged block.
+    Merge,
+    /// Run the reference block, nothing to say.
+    Reference,
+    /// Run the reference block and log `reason`: the default could not be honoured.
+    Fallback(String),
+    /// Refuse the start with `reason`: an explicit request could not be honoured.
+    Refuse(String),
+}
+
+/// The default must never turn a loadable model into a failure; an explicit `1` keeps the hard
+/// refusal. `Off` never looks at the check.
+pub(in crate::family) fn decide(intent: Intent, check: Result<(), String>) -> Decision {
+    match (intent, check) {
+        (Intent::Off, _) => Decision::Reference,
+        (_, Ok(())) => Decision::Merge,
+        (Intent::Default, Err(reason)) => Decision::Fallback(reason),
+        (Intent::Explicit, Err(reason)) => Decision::Refuse(reason),
+    }
 }
