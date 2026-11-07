@@ -64,6 +64,18 @@ impl NgramFile {
         key: &str,
         layout: NgramLayout,
     ) -> Result<Self, EngError> {
+        Self::open_judging(path, guard, key, layout, &check_open_file)
+    }
+
+    /// [`Self::open`] with the judgement of the open descriptor passed in, so a test can show that the
+    /// open runs it, once, after the file is opened and before any byte of it is read.
+    fn open_judging(
+        path: &Path,
+        guard: &LocalGuard,
+        key: &str,
+        layout: NgramLayout,
+        judge_open_file: &dyn Fn(&LocalGuard, &File) -> Result<(), EngError>,
+    ) -> Result<Self, EngError> {
         guard.check(path, "model weights")?;
         // A FIFO or a device named like the table would block or hang the open.
         if !std::fs::metadata(path)
@@ -76,7 +88,7 @@ impl NgramFile {
             )));
         }
         let file = File::open(path).map_err(|error| io_error(path, &error))?;
-        check_open_file(guard, &file)?;
+        judge_open_file(guard, &file)?;
         let metadata = file.metadata().map_err(|error| io_error(path, &error))?;
         if !metadata.is_file() {
             return Err(EngError::Checkpoint(format!(

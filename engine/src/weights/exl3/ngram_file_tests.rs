@@ -289,3 +289,34 @@ fn an_open_descriptor_on_a_network_mount_is_refused() {
     });
     assert!(text.contains("must be on local storage"), "{text}");
 }
+
+// Fails if the open stops judging the descriptor: the judgement is passed in, so a refusing one must
+// surface from the open, and an accepting one must be called exactly once, with a regular file.
+#[test]
+fn the_open_judges_its_descriptor_once_and_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let guard = LocalGuard::new().unwrap();
+    let calls = std::cell::Cell::new(0usize);
+    let counting = |_: &LocalGuard, file: &File| {
+        calls.set(calls.get() + 1);
+        assert!(file.metadata().unwrap().is_file());
+        Ok::<(), EngError>(())
+    };
+    NgramFile::open_judging(&path, &guard, KEY, LAYOUT, &counting).unwrap();
+    assert_eq!(calls.get(), 1);
+    let refusing = |_: &LocalGuard, _: &File| {
+        Err::<(), EngError>(EngError::Checkpoint("descriptor refused".into()))
+    };
+    let text = NgramFile::open_judging(&path, &guard, KEY, LAYOUT, &refusing)
+        .expect_err("refused")
+        .describe();
+    assert!(text.contains("descriptor refused"), "{text}");
+    // Judged before any read: a file too short to hold a prefix reports the refusal, not the short read.
+    std::fs::write(&path, [1u8, 2, 3]).unwrap();
+    let text = NgramFile::open_judging(&path, &guard, KEY, LAYOUT, &refusing)
+        .expect_err("refused")
+        .describe();
+    assert!(text.contains("descriptor refused"), "{text}");
+}

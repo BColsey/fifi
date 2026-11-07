@@ -366,7 +366,9 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
                 to_exact <= EXACT_BOUND,
                 "{name}, row {seed}: {to_exact:.3e}"
             );
-            // Against the rounded oracle it shows that rounding, and no more.
+            // Against the rounded oracle it shows that rounding, and no more. The lower check below is a
+            // tripwire by design: if the CPU kernel is ever given a binary16-rounding option, the CPU
+            // cold path and the device hot path will agree and this assertion will fail; change it then.
             assert!(
                 to_rounded <= rounded_bound(),
                 "{name}, row {seed}: {to_rounded:.3e}"
