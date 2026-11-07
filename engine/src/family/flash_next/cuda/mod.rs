@@ -3,8 +3,9 @@
 //! feeds (S1) exist so far; the other slices add their modules beside them. The trunk loader is
 //! `load`; the host feeds are `embedding` (the token's embedding row), `ple_feed` (the n-gram rows
 //! and the PLE step) and, with a device build, `stream_io` (the residual stream between the host
-//! and the card). Nothing here is called by a model step, and a CUDA build of Flash-Next still
-//! refuses to serve.
+//! and the card), and `feeds` (batched sorted n-gram row reads, the token-start write and the
+//! device PLE projections). Nothing here is called by a model step, and a CUDA build of Flash-Next
+//! still refuses to serve.
 
 mod bank;
 // The pack reader exists where the pack files do (`load::pack_files`): tests and native-cuda Linux.
@@ -45,6 +46,8 @@ mod step_plan_tests;
 // Linux.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod embedding;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+mod feeds;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(in crate::family::flash_next) mod load;
 #[cfg(test)]
