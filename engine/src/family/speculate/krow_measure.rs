@@ -1,7 +1,7 @@
 //! The host arithmetic of the K-row measurement tests (`krow_alpha_device_tests`,
 //! `krow_step_device_tests`): everything that needs no device and can be tested on the host.
 //!
-//! The measurements replace the estimated per-row costs of the K-row verifier design with numbers
+//! The measurements replace the estimated per-row costs of a K-row verify window with numbers
 //! from the real pack: the marginal cost of one more row through the rows kernel (alpha), the
 //! phases of one captured step, the expert union of K consecutive tokens, and the routed-expert
 //! chain of K rows. This file holds the definitions those numbers share, so a device run and a
@@ -89,8 +89,8 @@ pub(crate) fn check_default_path(
 /// (`SEP_CODE_OFFSET + rows`), against the plain `rows` of one batched launch.
 pub(crate) const SEP_CODE_OFFSET: usize = 16;
 
-/// What the union record does and does not cover (S6 of the review of the first window).
-pub(crate) const UNION_CAVEAT: &str = "true-continuation windows only: the K rows are the next K tokens of the real text, i.e. every draft accepted; a window holding rejected drafts has other tokens in its later rows and a different union; depth 1K to 4K (a 1024-row prefill and 3000 decoded tokens), not 8K or 32K; picks are read on the EAGER body (capture off), assuming the captured step routes the same (D1)";
+/// What the union record does and does not cover.
+pub(crate) const UNION_CAVEAT: &str = "true-continuation windows only: the K rows are the next K tokens of the real text, i.e. every draft accepted; a window holding rejected drafts has other tokens in its later rows and a different union; depth 1K to 4K (a 1024-row prefill and 3000 decoded tokens), not 8K or 32K; picks are read on the EAGER body (capture off), assuming the captured step routes the same (not measured here)";
 
 /// The size in bytes of the device-to-device marker copy that the receipt pass queues before the
 /// launch of op `op` at `rows` rows, so that a profile can tell which kernels belong to which

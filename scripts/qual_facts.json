@@ -107,6 +107,7 @@
         "FIFI_KROW_OUT",
         "FIFI_KROW_PACK_MANIFEST_SHA256",
         "FIFI_KROW_PICKS_OUT",
+        "FIFI_KROW_RECEIPT",
         "FIFI_MRV_COMMIT",
         "FIFI_MRV_IDS_SHA256",
         "FIFI_MRV_NEED",

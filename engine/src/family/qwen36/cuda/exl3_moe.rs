@@ -364,7 +364,7 @@ fn routed(
 /// The routed experts with the picks read on the device: the same groups and the same arithmetic
 /// as [`routed`], but the member of every pair comes from the router's id array when the kernels
 /// run, so the block waits for nothing and can be captured in a graph.
-pub(in crate::family) fn routed_on_device(
+pub(super) fn routed_on_device(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,

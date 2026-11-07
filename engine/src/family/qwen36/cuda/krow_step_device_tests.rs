@@ -1,5 +1,6 @@
-//! Measurements of the real captured step and of real routing for the K-row verifier design:
-//! MEASUREMENT tests for one future GPU window, NOT run. They gate nothing about speed.
+//! Measurements of the real captured step and of real routing for a K-row verify window:
+//! MEASUREMENT tests that have run in exclusive GPU windows (the records are kept beside the run
+//! plan). They gate nothing about speed.
 //!
 //! Two tests, one per process, each on the GPU held exclusively and each loading the whole
 //! 4.00 bpw pack (about 17 GiB, so a lease of about 21 GiB with the KV cache and the arena):
@@ -18,16 +19,19 @@
 //!   (`FIFI_SPEC_TEXT`, teacher forced) one at a time on the EAGER body with a test-only tap that
 //!   reads the routed expert ids of every layer after its MoE block (the eager body is the one
 //!   that can read; the router kernel and its inputs are the same as in the captured step, which
-//!   D1 shows bitwise equal). From the ids it reports, per layer and over all layers, the mean and
+//!   is assumed to route the same; that is not measured here). From the ids it reports, per layer and over all layers, the mean and
 //!   the 90th percentile of the number of distinct experts in windows of K = 2 to 8 consecutive
 //!   tokens (sliding by one token). Then, on the same real ids, it times the routed experts of K
-//!   rows run as K single-row id-indexed chains back to back in one stream (the design's per-row
-//!   family), against one chain, for K = 1, 2, 4, 8, and against a control whose rows pick disjoint
+//!   rows run as K single-row id-indexed chains back to back in one stream (the per-row
+//!   launch pattern), against one chain, for K = 1, 2, 3, 4, 8, and against a control whose rows pick disjoint
 //!   experts (no weight overlap between the rows).
 //!
 //! The record carries the identity of the run (commit, binary, pack, KV mode, capture, the
 //! effective single-row kernel and the effective `FIFI_EXL3_SHARED_IN_ROUTED`); both tests refuse
-//! to run with any `FIFI_EXL3_*` switch set, and with the shared expert inside the routed launches.
+//! to start if any variable under the refused prefixes of `krow_measure` (`FIFI_EXL3_`,
+//! `INFERENCE_CUDA_`, `INFERENCE_QWEN36_`, `INFERENCE_Q36_`, `Q36_`, `FIFI_GRAPH_BENCH_`) or
+//! `FIFI_DELTA_TRACE` is set, except `FIFI_EXL3_CHECKPOINT` and `INFERENCE_CUDA_REQUIRE_DEVICE`, or if
+//! the shared expert is inside the routed launches.
 //!
 //! Environment: `FIFI_EXL3_CHECKPOINT`, `FIFI_SPEC_TEXT`, `FIFI_SPEC_TOKENIZER`, `FIFI_KROW_COMMIT`
 //! (required), `FIFI_KROW_OUT` (the JSON path), `FIFI_KROW_PACK_MANIFEST_SHA256` and
@@ -39,7 +43,7 @@
 
 use std::{fs, time::Instant};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::{
     common_tests::{dims, inventory},

@@ -1,6 +1,6 @@
 //! The marginal cost of one more row through the EXL3 rows kernel, measured on the real 4.00 bpw
-//! Qwen3.6-35B-A3B pack (the alpha receipt of the K-row verifier design, section 7, stage S1):
-//! a MEASUREMENT test for one future GPU window, NOT run. It gates nothing about speed.
+//! Qwen3.6-35B-A3B pack, against the single-row `wide1` launch: a MEASUREMENT test that has run in
+//! two exclusive GPU windows (the records are kept beside the run plan). It gates nothing about speed.
 //!
 //! One test per process on the GPU held exclusively: `krow_alpha_record`. It loads the whole pack
 //! (about 17 GiB, so a lease of 20 GiB), measures, and writes one JSON record (`FIFI_KROW_OUT`).
@@ -8,15 +8,15 @@
 //! **What is measured.** For each dense projection role of the step, with the real tensors of
 //! every layer that has the role:
 //!
-//! * `rows`: one launch per layer at `R` rows (R = 1, 2, 4, 8) through `exl3_linear`, the call the
+//! * `rows`: one launch per layer at `R` rows (R = 1, 2, 3, 4, 6, 8) through `exl3_linear`, the call the
 //!   step makes. Under the served single-row kernel (`wide1`) a call of R >= 2 rows is the rows
 //!   kernel; R = 1 is the production one-tile body. A sweep over all layers of the role is the
 //!   role's cost per token.
 //! * `sep`: for each layer, R separate single-row (`wide1`) launches back to back on the stream,
-//!   the layer-major order of a graph that keeps a role per-row. The second and later launches
+//!   the layer-major order of a graph that runs each row as its own launch. The second and later launches
 //!   find the layer's weights in the L2 cache when the matrix is small.
-//! * `chunk4` (R = 8 only): two 4-row launches per layer, the design's fallback if R = 8 is worse
-//!   than two R = 4 launches.
+//! * `chunk4` (R = 8 only): two 4-row launches per layer, the alternative to one 8-row launch
+//!   if the 8-row launch is worse than two 4-row ones.
 //!
 //! A sweep is captured once into a CUDA graph and replayed (a host launch loop would be bound by
 //! the host, not the device, as the step is not: it replays one graph). The time of a replay is
@@ -31,7 +31,7 @@
 //! of (t(R) - t(1)) over the sum of (R - 1) * t(1), so a role weighs by its own per-token solo
 //! time (`krow_measure`).
 //!
-//! **The bitwise check (D1 evidence per op).** For every role, every layer, every R in {2, 4, 8}
+//! **The bitwise check.** For every role, every layer, every R in {2, 3, 4, 6, 8}
 //! and two input sets, the output of the R-row launch is compared bit for bit with the R
 //! single-row launches (row j of one against the single-row output for input row j). Every
 //! mismatch is listed with its role, layer, R, row, column, flat index and both bit patterns; none
@@ -40,8 +40,8 @@
 //! writes the record first and fails afterwards, so a mismatch is in the file.
 //!
 //! **The shared expert.** Gate, up and down are measured as three separate matrices (each with
-//! `exl3_linear`, rows = R). In addition `shared_gate_up_pair` times what the K-row design's
-//! option B would launch: the reference block runs gate and up as ONE grouped launch of two
+//! `exl3_linear`, rows = R). In addition `shared_gate_up_pair` times a pair layout that keeps
+//! the one-row arithmetic: the reference block runs gate and up as ONE grouped launch of two
 //! one-row calls; at R rows the pair becomes 2R one-row calls in one launch (R = 1 is the
 //! reference), against R separate reference launches.
 //!
@@ -51,9 +51,14 @@
 //! (the JSON path, required), `FIFI_KROW_ROUNDS` (30), `FIFI_KROW_WARM_FROM` (3: rounds before it
 //! are left out of the medians), `FIFI_KROW_DEADLINE_S` (600: after it no new round begins),
 //! `FIFI_KROW_ONLY` (a comma list of role labels to measure, for a short run),
-//! `FIFI_KROW_PACK_MANIFEST_SHA256` (pins the pack). No `FIFI_EXL3_*` switch other than the
-//! checkpoint may be set, and `FIFI_EXL3_SHARED_IN_ROUTED` must be unset: the test refuses
-//! otherwise (`refuse_switches`).
+//! `FIFI_KROW_PACK_MANIFEST_SHA256` (pins the pack), `FIFI_KROW_RECEIPT` (`1`: skip the sweep and
+//! only launch each op once per row count, batched and as separate single-row launches, behind
+//! marker copies, for a profiler to read kernel names and launch counts; see `receipt_pass`).
+//! The test refuses to start if any variable under the refused prefixes of `krow_measure`
+//! (`FIFI_EXL3_`, `INFERENCE_CUDA_`, `INFERENCE_QWEN36_`, `INFERENCE_Q36_`, `Q36_`,
+//! `FIFI_GRAPH_BENCH_`) or `FIFI_DELTA_TRACE` is set, except the two allowed ones
+//! (`FIFI_EXL3_CHECKPOINT`, `INFERENCE_CUDA_REQUIRE_DEVICE`), or if `FIFI_EXL3_SHARED_IN_ROUTED`
+//! is on (`refuse_switches`).
 
 use std::{fs, path::PathBuf, time::Instant};
 
@@ -97,8 +102,8 @@ pub(super) enum Family {
     /// The EXL3 dense projections whose rows the rows kernel can share: GDN and attention
     /// projections, the shared-expert matrices and the head.
     Dense,
-    /// The shared expert's gate and up as one grouped launch of one-row calls (the design's
-    /// option B), measured instead of the two separate matrices.
+    /// The shared expert's gate and up as one grouped launch of one-row calls (2R calls
+    /// for R rows), measured instead of the two separate matrices.
     SharedPair,
     /// The plain F32 GEMVs of GDN beta and alpha.
     Plain,
@@ -1158,6 +1163,11 @@ fn krow_alpha_record() {
         ops.len(),
         began.elapsed().as_secs_f64()
     );
+    // The receipt mode: the kernel names and launch counts of each (op, R) under a profiler, no timing.
+    if std::env::var("FIFI_KROW_RECEIPT").as_deref() == Ok("1") {
+        receipt_pass(&env, &ops, loaded.kernel);
+        return;
+    }
 
     // The bitwise check, role by role. Every mismatch is kept.
     let mut checks = Vec::new();
@@ -1312,10 +1322,10 @@ fn krow_alpha_record() {
         "method": {
             "timing": "CUDA event pair around one replay of a graph of one whole-token sweep; L2 flushed by a 128 MiB device copy before the start event (the 0.35 ms flush hides the host cost of cudaGraphLaunch, which holds for graphs of 30 to about 1000 nodes); medians of the warm rounds",
             "headline_family": "dense_with_shared_pair is the step-faithful dense family (the production block launches the shared gate and up as one grouped pair); dense counts them as two separate launches",
-            "rows": "R >= 2 rows through exl3_linear: for the EXL3 matrices grouped_project_rows<2|4|8> under wide1 (R = 3 rides <4>, R = 6 rides <8>; receipted by the nsys pass of FIFI_KROW_RECEIPT=1), R = 1 is the production wide1 body (grouped_project_small_wide<1>). The router and the plain GEMVs are NOT a rows kernel: m = 2..7 is the router decode kernel (m-grid), m = 8 the tiled kernel, which the design avoids by 4-row chunking, so use their chunk4 figure at 8",
+            "rows": "R >= 2 rows through exl3_linear: for the EXL3 matrices grouped_project_rows<2|4|8> under wide1 (R = 3 rides <4>, R = 6 rides <8>; receipted by the nsys pass of FIFI_KROW_RECEIPT=1), R = 1 is the production wide1 body (grouped_project_small_wide<1>). The router and the plain GEMVs are NOT a rows kernel: m = 2..7 is the router decode kernel (m-grid), m = 8 the tiled kernel, which 4-row chunking avoids, so use their chunk4 figure at 8",
             "padded_rows": "native/resident/exl3.cu at the base: the dispatch on the largest group row count (1467-1477) runs grouped_project_small_wide<1> for 1 row, grouped_project_rows<2> for 2, <4> for 3 and 4, <8> for 5 to 8, so R = 3 launches the <4> instantiation and R = 6 the <8> one. The missing rows read x = 0 (line 1109, x[row] = row < a.rows ? xh[..] : 0) and are never stored (line 1170, if (row < R && row < a.rows)); every row has its own sums[row][col] and partial[w][row][col], so a padded row cannot change rows 0..R-1. Checked here per role, layer and seed: the bytes of out, xh and z past the real rows stay untouched (0xff) and rows 0..R-1 equal the single-row launches bit for bit. The instantiation and the launch count per R come from the nsys receipt (receipt_kernels), not from this reading of the code",
             "sep": "R single-row launches per layer back to back",
-            "chunk4": "R = 8 as two 4-row launches per layer (the configuration the design runs for the router and beta/alpha)",
+            "chunk4": "R = 8 as two 4-row launches per layer (the configuration that avoids the tiled kernel for the router and beta/alpha)",
             "rounds": rounds, "warm_from": warm_from, "rounds_completed": completed,
         },
         "single_row_launches": counts.describe(),

@@ -134,6 +134,9 @@ fn every_measurement_test_refuses_the_switches_first() {
         assert!(tests >= 1, "{name}");
     }
     let alpha = include_str!("../qwen36/cuda/krow_alpha_device_tests.rs");
+    // The receipt mode is wired into the alpha test: the env switch is read and the pass is called.
+    assert!(alpha.contains("FIFI_KROW_RECEIPT\").as_deref() == Ok(\"1\")"));
+    assert!(alpha.contains("receipt_pass(&env, &ops, loaded.kernel);"));
     assert!(
         alpha.contains("check_default_path("),
         "the guard reads the shared check"
@@ -153,7 +156,7 @@ fn the_rows_include_three_and_six() {
 #[test]
 fn every_switch_that_changes_the_step_is_refused() {
     let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    // The ones the review named, and the single-row and shared-expert switches.
+    // The GDN fusion, sparse attention, shortlist and ablation switches, and the single-row and shared-expert switches.
     let bad = [
         "INFERENCE_CUDA_GDN_FUSE_INPROJ",
         "INFERENCE_QWEN36_SPARSE_ATTN",
