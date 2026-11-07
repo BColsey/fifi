@@ -1,12 +1,17 @@
-//! The record layout at the real sizes (counted independently from the shapes), its refusals, and
-//! a packed record against the same bytes handed to the CPU kernel directly.
+//! The record layout at the real sizes (counted independently from the shapes), its refusals, a
+//! packed record against the same bytes handed to the CPU kernel directly, and the widening of a
+//! stored matrix into a record part.
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use super::*;
-use crate::kernels::{
-    exl3_cpu::{Exl3Isa, ExpertCpu, ExpertPick},
-    nvfp4_cpu::WaitPolicy,
+use crate::{
+    kernels::{
+        exl3_cpu::{Exl3Isa, ExpertCpu, ExpertPick},
+        nvfp4_cpu::WaitPolicy,
+    },
+    tensor::Tensor,
+    weights::{Tier, WeightSource, exl3::Config},
 };
 
 /// 2560 x 640 experts at 3 bpw (48 words per tile).
@@ -223,4 +228,135 @@ fn every_component_offset_is_a_multiple_of_16_bytes() {
             }
         }
     }
+}
+
+/// The `mul1` marker word that `Matrix::load` checks for the codebook.
+const MUL1_MARKER: u32 = 0x83dc_d12d;
+
+struct Components(HashMap<String, Tensor>);
+
+impl WeightSource for Components {
+    fn tensor(&self, key: &str) -> Option<Tensor> {
+        self.0.get(key).cloned()
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.0.values().map(Tensor::byte_len).sum()
+    }
+    fn tier(&self) -> Tier {
+        Tier::Resident
+    }
+}
+
+/// F16 scale values in (0, 2], one per index, as the pack stores `suh` and `svh`.
+fn half_scales(seed: usize, count: usize) -> Vec<f16> {
+    (0..count)
+        .map(|i| f16::from_f32(((i * 7 + seed) % 255 + 1) as f32 / 128.0))
+        .collect()
+}
+
+fn le_bytes(values: &[f16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A stored mul1 matrix of `shape` at `words` per tile, with random trellis bytes and F16 scales.
+/// Returns the matrix and its three raw components.
+fn stored_matrix(seed: u64, shape: [usize; 2], words: usize) -> (Matrix, [Vec<u8>; 3]) {
+    let [k, n] = shape;
+    let trellis = Rng(seed).bytes((k / 16) * (n / 16) * words * 2);
+    let (suh, svh) = (le_bytes(&half_scales(3, k)), le_bytes(&half_scales(11, n)));
+    let tensor = |dtype, dims: Vec<u32>, bytes: &[u8]| {
+        Tensor::try_from_host(dtype, dims, bytes.to_vec()).unwrap()
+    };
+    let parts = HashMap::from([
+        (
+            "m.trellis".to_string(),
+            tensor(
+                Dtype::I16,
+                vec![(k / 16) as u32, (n / 16) as u32, words as u32],
+                &trellis,
+            ),
+        ),
+        (
+            "m.suh".to_string(),
+            tensor(Dtype::F16, vec![k as u32], &suh),
+        ),
+        (
+            "m.svh".to_string(),
+            tensor(Dtype::F16, vec![n as u32], &svh),
+        ),
+        (
+            "m.mul1".to_string(),
+            tensor(Dtype::I32, vec![], &MUL1_MARKER.to_le_bytes()),
+        ),
+    ]);
+    let config = Config::from_json(
+        br#"{"quantization_config":{"quant_method":"exl3","version":"1.4.9","codebook":"mul1"}}"#
+            .as_slice(),
+    )
+    .unwrap();
+    let matrix = Matrix::load(&Components(parts), "m", &config).unwrap();
+    (matrix, [trellis, suh, svh])
+}
+
+#[test]
+fn a_part_from_a_stored_matrix_keeps_the_trellis_and_widens_the_half_scales_exactly() {
+    let (matrix, [trellis, suh, svh]) = stored_matrix(0x00A1_1CE5, [256, 128], 48);
+    let part = OwnedPart::from_matrix(&matrix).unwrap();
+    assert_eq!(part.shape, [256, 128]);
+    assert_eq!(
+        part.words, 48,
+        "twice the bits per weight is 6, eight words each"
+    );
+    assert_eq!(part.trellis, trellis);
+    let widen = |half: &[u8]| -> Vec<u8> {
+        half.as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|pair| f16::from_le_bytes(*pair).to_f32().to_le_bytes())
+            .collect()
+    };
+    assert_eq!(part.suh.len(), 4 * 256);
+    assert_eq!(part.svh.len(), 4 * 128);
+    assert_eq!(part.suh, widen(&suh));
+    assert_eq!(part.svh, widen(&svh));
+    // Spot values: the widening is the exact binary16 value, not a rounded decimal.
+    let first = f32::from_le_bytes(part.suh[..4].try_into().unwrap());
+    assert_eq!(first, half_scales(3, 256)[0].to_f32());
+    let last = f32::from_le_bytes(part.svh[4 * 127..].try_into().unwrap());
+    assert_eq!(last, half_scales(11, 128)[127].to_f32());
+    let borrowed = part.bytes();
+    assert_eq!(
+        (
+            borrowed.trellis.len(),
+            borrowed.suh.len(),
+            borrowed.svh.len()
+        ),
+        (trellis.len(), 4 * 256, 4 * 128)
+    );
+}
+
+#[test]
+fn matrices_pack_into_a_record_part_by_part_and_a_wrong_rate_or_shape_is_refused() {
+    let layout = SlotBankLayout::new(128, 256, [48, 32, 24]).unwrap();
+    let gate = stored_matrix(1, [128, 256], 48);
+    let up = stored_matrix(2, [128, 256], 32);
+    let down = stored_matrix(3, [256, 128], 24);
+    let record = layout
+        .pack_matrices([&gate.0, &up.0, &down.0])
+        .expect("matrices of the layout's shapes and rates");
+    for (index, matrix) in [&gate.0, &up.0, &down.0].into_iter().enumerate() {
+        let part = OwnedPart::from_matrix(matrix).unwrap();
+        let at = layout.part(index);
+        assert_eq!(&record[at.trellis.clone()], part.trellis.as_slice());
+        assert_eq!(&record[at.suh.clone()], part.suh.as_slice());
+        assert_eq!(&record[at.svh.clone()], part.svh.as_slice());
+    }
+    // Another rate for the up part, and the down matrix where the up one belongs.
+    let up_other_rate = stored_matrix(4, [128, 256], 48);
+    assert!(
+        layout
+            .pack_matrices([&gate.0, &up_other_rate.0, &down.0])
+            .is_err()
+    );
+    assert!(layout.pack_matrices([&gate.0, &down.0, &up.0]).is_err());
 }
