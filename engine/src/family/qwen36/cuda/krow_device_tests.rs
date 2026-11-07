@@ -5,7 +5,10 @@
 
 use std::ffi::OsString;
 
-use super::{d1_window_device_tests::require_krow_enqueued, step::LayerTap};
+use super::{
+    d1_window_device_tests::{require_krow_enqueued, require_krow_idle},
+    step::LayerTap,
+};
 use crate::{
     family::qwen36::{exl3_merge_plan::SHARED_IN_ROUTED_VAR, krow::SINGLE_GATHER_NAME},
     kernels::row_launches::RowLaunches,
@@ -237,4 +240,26 @@ fn a_missing_tap_a_reordered_tap_and_a_short_row_are_differences() {
             .expect("rows")
             .contains("row 2 was not read")
     );
+}
+
+#[test]
+fn the_eager_control_wants_every_real_enqueue_counter_at_zero() {
+    require_krow_idle(&RowLaunches::default()).expect("an eager run");
+    // The echo counters of the projection table do not count; each real-enqueue counter does.
+    require_krow_idle(&RowLaunches {
+        rows4: 7,
+        small_wide1: 100,
+        ..RowLaunches::default()
+    })
+    .expect("projection echoes are not asked");
+    for run in [
+        counts(1, 0, 0, 0, 0, 0),
+        counts(0, 1, 0, 0, 0, 0),
+        counts(0, 0, 1, 0, 0, 0),
+        counts(0, 0, 0, 1, 0, 0),
+        counts(0, 0, 0, 0, 1, 0),
+        counts(0, 0, 0, 0, 0, 1),
+    ] {
+        assert!(require_krow_idle(&run).is_err(), "{}", run.describe());
+    }
 }

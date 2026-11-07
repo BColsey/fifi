@@ -100,7 +100,8 @@ pub(super) struct KrowRuntime {
 struct TestState {
     /// The K-row path is switched off: windows run the eager loop on this armed step.
     path_off: bool,
-    /// K-row windows that completed.
+    /// K-row windows whose body was enqueued whole (a window that fails after its launch counts:
+    /// its kernels ran, and the launch counters count them).
     windows: u64,
     /// Return empty logits rows (the tap that a later device-side argmax keeps).
     skip_logits: bool,
@@ -269,6 +270,12 @@ impl<'a> QwenResidentStep<'a> {
         let ran = self.run_body_rows(k, admit_pos, &mut entered);
         #[cfg(test)]
         self.take_injection();
+        #[cfg(test)]
+        if ran.is_ok()
+            && let Some(runtime) = self.krow.as_mut()
+        {
+            runtime.test.windows += 1;
+        }
         if let Err(error) = ran {
             return Err(self.fail_rows(entered, error));
         }
@@ -756,10 +763,6 @@ impl<'a> QwenResidentStep<'a> {
             .as_mut()
             .ok_or_else(|| refuse("needs the device rollback slots"))?
             .mark_row_slots(stream, state, k - 1)?;
-        #[cfg(test)]
-        if let Some(runtime) = self.krow.as_mut() {
-            runtime.test.windows += 1;
-        }
         Ok(RowsOut { argmax, rows })
     }
 
@@ -806,7 +809,7 @@ impl<'a> QwenResidentStep<'a> {
 /// Test builds: the switches, counters and injections of the D1 harness.
 #[cfg(test)]
 impl QwenResidentStep<'_> {
-    /// K-row windows that completed since the step was made (zero on a step that never armed it).
+    /// K-row windows launched since the step was made (zero on a step that never armed it).
     pub(crate) fn krow_windows(&self) -> u64 {
         self.krow.as_ref().map_or(0, |runtime| runtime.test.windows)
     }

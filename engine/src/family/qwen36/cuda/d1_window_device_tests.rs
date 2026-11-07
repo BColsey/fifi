@@ -530,6 +530,27 @@ pub(super) fn require_krow_enqueued(
     Ok(())
 }
 
+/// The eager control: every counter that observes a real enqueue of the K-row path is zero. (The
+/// projection counters are not asked; they echo the dispatch table.)
+pub(super) fn require_krow_idle(
+    counts: &crate::kernels::row_launches::RowLaunches,
+) -> Result<(), String> {
+    let used = counts.argmax_rows
+        + counts.status_fold
+        + counts.pack_rows
+        + counts.conv_snap
+        + counts.delta_snap
+        + counts.router_strided;
+    if used == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the K-row path ran in an eager run ({})",
+            counts.describe()
+        ))
+    }
+}
+
 fn assert_path_counters(step: &QwenResidentStep<'_>, verify: VerifyMode, phase: &str) {
     let counts = step.row_launches();
     let windows = step.krow_windows();
@@ -542,7 +563,7 @@ fn assert_path_counters(step: &QwenResidentStep<'_>, verify: VerifyMode, phase: 
         VerifyMode::Eager if windows != 0 => {
             Err(format!("{windows} K-row windows in an eager run"))
         }
-        VerifyMode::Eager => counts.require_krow_idle(),
+        VerifyMode::Eager => require_krow_idle(&counts),
         VerifyMode::Krow => require_krow_enqueued(&counts, windows),
     };
     verdict.unwrap_or_else(|error| panic!("{phase}: {error}"));
