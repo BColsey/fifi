@@ -11,9 +11,11 @@
 use std::ffi::OsStr;
 
 use super::exl3_merge_plan::{
-    Input, Member, MergeLayout, PlanDims, PlannedPair, Proj, SHARED_IN_ROUTED_VAR, block_plan,
-    load_suffix, reference_kernel_launches, shared_in_routed_from_env,
+    IdWord, Input, Member, MergeLayout, PairSpans, PlanDims, PlannedPair, Proj,
+    SHARED_IN_ROUTED_VAR, SharedFacts, Span, block_plan, check_merge, load_suffix,
+    reference_kernel_launches, resolve_switch, shared_in_routed_from_env,
 };
+use crate::{EngError, kernels::single_row::SingleRow};
 
 /// The shape of the Qwen3.6-35B-A3B block.
 fn qwen36() -> PlanDims {
@@ -425,4 +427,302 @@ fn the_combine_keeps_its_kernel_and_inputs() {
     }
     let merge = squeeze(include_str!("cuda/exl3_moe/merge.rs"));
     assert!(merge.contains("combine_ranges(launch,&bufs.route,(down,shared),dims)"));
+}
+
+// ---- where each pair reads and writes, and which id word it uses ----
+
+#[test]
+fn the_shared_pair_reads_the_zero_word_and_every_routed_pair_its_own_router_slot() {
+    for top_k in [1usize, 8, 9] {
+        let plan = block_plan(top_k);
+        for group in [&plan.gate_up, &plan.down] {
+            for pair in group.iter() {
+                match pair.member {
+                    Member::Shared => assert_eq!(pair.id_word(), (IdWord::Zero, 0)),
+                    Member::Routed(slot) => assert_eq!(pair.id_word(), (IdWord::Router, slot)),
+                }
+            }
+            let zero = group
+                .iter()
+                .filter(|p| p.id_word().0 == IdWord::Zero)
+                .count();
+            assert_eq!(
+                zero,
+                group.len() - top_k * if group.len() > top_k + 1 { 2 } else { 1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn the_spans_of_each_pair_put_the_shared_pair_after_the_routed_rows() {
+    let dims = qwen36();
+    let layout = MergeLayout::new(&dims).unwrap();
+    let plan = block_plan(dims.top_k);
+    let (h, i, k) = (dims.hidden * 4, dims.inter * 4, dims.top_k);
+    // Gate/up: pair p writes gu half-row p; every pair reads the normalized row.
+    for (p, pair) in plan.gate_up.iter().enumerate() {
+        assert_eq!(
+            pair.spans(&dims, &layout),
+            PairSpans {
+                input: None,
+                output: Span {
+                    offset: layout.gu.offset + p * i,
+                    bytes: i
+                },
+            },
+            "gate/up pair {p}"
+        );
+    }
+    // Down: pair s reads act row s and writes down row s; the shared pair is row top_k.
+    for (s, pair) in plan.down.iter().enumerate() {
+        assert_eq!(
+            pair.spans(&dims, &layout),
+            PairSpans {
+                input: Some(Span {
+                    offset: layout.act.offset + s * i,
+                    bytes: i
+                }),
+                output: Span {
+                    offset: layout.down.offset + s * h,
+                    bytes: h
+                },
+            },
+            "down pair {s}"
+        );
+    }
+    assert_eq!(plan.down.len(), k + 1);
+    // The 9 down rows and 9 gate/up rows fit the areas the layout reserved.
+    assert!(layout.gu.bytes >= (k + 1) * 2 * i);
+    assert!(layout.down.bytes >= (k + 1) * h);
+}
+
+#[test]
+fn the_combine_reads_the_routed_rows_then_the_shared_row() {
+    let dims = qwen36();
+    let layout = MergeLayout::new(&dims).unwrap();
+    let (routed, shared) = layout.combine_spans(&dims);
+    let h = dims.hidden * 4;
+    assert_eq!(
+        routed,
+        Span {
+            offset: layout.down.offset,
+            bytes: dims.top_k * h
+        }
+    );
+    assert_eq!(
+        shared,
+        Span {
+            offset: layout.down.offset + dims.top_k * h,
+            bytes: h
+        }
+    );
+    // The shared row is the output of the shared down pair, and the routed term ends where it begins.
+    let plan = block_plan(dims.top_k);
+    let shared_down = plan.down.last().unwrap().spans(&dims, &layout).output;
+    assert_eq!(shared_down, shared);
+    assert_eq!(routed.offset + routed.bytes, shared.offset);
+    // The swiglu covers the routed rows and the shared row.
+    assert_eq!(plan.swiglu_rows, dims.top_k + 1);
+}
+
+// ---- the refusals of the merged block ----
+
+fn facts(bias: bool, bits_twice: u8) -> [SharedFacts; 3] {
+    ["shared gate", "shared up", "shared down"].map(|name| SharedFacts {
+        name,
+        bias,
+        bits_twice,
+    })
+}
+
+fn refusal(dims: &PlanDims, kernel: SingleRow, layers: &[[SharedFacts; 3]]) -> String {
+    let error = check_merge(dims, kernel, layers).expect_err("a refusal");
+    assert!(error.contains(SHARED_IN_ROUTED_VAR), "{error}");
+    error
+}
+
+#[test]
+fn the_merged_block_accepts_the_qwen36_pack_and_refuses_what_it_cannot_run() {
+    let dims = qwen36();
+    let ok = [facts(false, 8), facts(false, 12)];
+    assert_eq!(check_merge(&dims, SingleRow::Wide(1), &ok), Ok(()));
+    assert_eq!(check_merge(&dims, SingleRow::Wide(1), &[]), Ok(()));
+    // The single-row kernel must be wide1.
+    for kernel in [
+        SingleRow::Legacy,
+        SingleRow::Gather,
+        SingleRow::Wide(2),
+        SingleRow::Wide(4),
+    ] {
+        assert!(refusal(&dims, kernel, &ok).contains("wide1"), "{kernel:?}");
+    }
+    // A shared matrix with a bias, in any of the three roles and any layer.
+    for role in 0..3 {
+        let mut layer = facts(false, 8);
+        layer[role].bias = true;
+        let error = refusal(&dims, SingleRow::Wide(1), &[facts(false, 8), layer]);
+        assert!(
+            error.contains("layer 1") && error.contains("bias"),
+            "{error}"
+        );
+        assert!(error.contains(layer[role].name), "{error}");
+    }
+    // A rate other than 4 and 6 bits per weight (bits twice 8 and 12).
+    for bits in [4u8, 6, 10, 14, 16] {
+        let error = refusal(&dims, SingleRow::Wide(1), &[facts(false, bits)]);
+        assert!(error.contains("bits twice"), "{bits}: {error}");
+    }
+    let mut layer = facts(false, 8);
+    layer[2].bits_twice = 10;
+    assert!(refusal(&dims, SingleRow::Wide(1), &[layer]).contains("shared down"));
+    // More picks than 20 pairs hold.
+    let mut wide = qwen36();
+    wide.top_k = 10;
+    assert!(refusal(&wide, SingleRow::Wide(1), &ok).contains("picks"));
+    // A shared expert of another width, and more than one row.
+    let mut narrow = qwen36();
+    narrow.shared_inter = 256;
+    assert!(refusal(&narrow, SingleRow::Wide(1), &ok).contains("wide"));
+    let mut rows = qwen36();
+    rows.rows = 2;
+    assert!(refusal(&rows, SingleRow::Wide(1), &ok).contains("one row"));
+    // The block is checked before the kernel: both wrong names the block.
+    assert!(refusal(&rows, SingleRow::Gather, &ok).contains("one row"));
+}
+
+#[test]
+fn the_merged_block_checks_run_in_the_constructor_and_name_each_fact() {
+    let merge = include_str!("cuda/exl3_moe/merge.rs");
+    let new = squeeze(section(merge, "pub(in crate::family) fn new("));
+    for part in [
+        "bias:weight.bias.is_some()",
+        "bits_twice:weight.bits_twice",
+        "check_merge(&plan,ctx.single_row_setting()?,&facts)",
+        "weights.shared_gate",
+        "weights.shared_up",
+        "weights.shared_down",
+    ] {
+        assert!(new.contains(part), "{part}: {new}");
+    }
+}
+
+// ---- the switch at the session start ----
+
+#[test]
+fn the_start_refuses_a_bad_switch_for_every_weight_format_and_one_on_gguf() {
+    let bad = || {
+        Err(EngError::BadRequest(
+            "FIFI_EXL3_SHARED_IN_ROUTED must be unset".into(),
+        ))
+    };
+    for exl3 in [false, true] {
+        let error = resolve_switch(bad(), exl3).expect_err("a bad value");
+        assert!(format!("{error:?}").contains(SHARED_IN_ROUTED_VAR));
+        assert!(!resolve_switch(Ok(false), exl3).unwrap());
+    }
+    assert!(resolve_switch(Ok(true), true).unwrap());
+    let error = resolve_switch(Ok(true), false).expect_err("1 on GGUF");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains(SHARED_IN_ROUTED_VAR) && text.contains("EXL3"),
+        "{text}"
+    );
+}
+
+/// The start resolves the switch before the projector exists and before any weight is opened.
+#[test]
+fn the_start_resolves_the_switch_before_any_weight_work() {
+    let start = include_str!("cuda/start.rs");
+    let body = &start[start.find("pub(crate) fn start(").expect("start")..];
+    let switch = body.find("resolve_switch(").expect("the switch check");
+    for later in [
+        "check_tiered_start(",
+        "CudaProjector::new()",
+        "open_gguf(",
+        "load_exl3_dir(",
+    ] {
+        let at = body.find(later).unwrap_or_else(|| panic!("{later}"));
+        assert!(switch < at, "resolve_switch must precede {later}");
+    }
+    let call = squeeze(&body[switch..switch + 160]);
+    assert!(
+        call.contains("resolve_switch(shared_in_routed_explicit(),matches!(settings.weights,WeightFormat::Exl3),)?;")
+            || call.contains("resolve_switch(shared_in_routed_explicit(),matches!(settings.weights,WeightFormat::Exl3))?;"),
+        "{call}"
+    );
+}
+
+/// The test hook of the step refuses a non-EXL3 layout instead of silently building nothing.
+#[test]
+fn the_step_hook_refuses_a_layout_that_is_not_exl3() {
+    let step = include_str!("cuda/step.rs");
+    let hook = squeeze(section(step, "pub(crate) fn set_shared_in_routed("));
+    assert!(
+        hook.contains("ifon&&self.layout!=WeightLayout::Exl3{returnErr("),
+        "{hook}"
+    );
+    assert!(
+        hook.contains("self.exl3_merge=ifon{Some(SharedMerge::new("),
+        "{hook}"
+    );
+    let field = &step[step
+        .find("exl3_merge: Option<SharedMerge>,")
+        .expect("field")..];
+    let comment = &step[..step.len() - field.len()];
+    let doc = comment.rsplit("\n\n").next().unwrap_or(comment);
+    assert!(doc.contains("graph drops first"), "{doc}");
+}
+
+// ---- the executor takes its rows, ids and counts from the plan ----
+
+#[test]
+fn the_executor_uses_the_plan_for_ids_rows_swiglu_and_the_combine() {
+    let merge = include_str!("cuda/exl3_moe/merge.rs");
+    // Which ids word: the plan's, mapped to the router ids or the zero word, nothing else.
+    let group = squeeze(section(merge, "fn indexed_group("));
+    for part in [
+        "let(word,slot)=pair.word;",
+        "letids=matchword{IdWord::Router=>router_ids,IdWord::Zero=>zero}",
+        "bank.span()?.indexed_call(&io,ids,slot)",
+        "weight.view()?.indexed_call(&io,ids,slot)",
+    ] {
+        assert!(group.contains(part), "{part}: {group}");
+    }
+    assert!(!group.contains("indexed_call(&io,zero"), "{group}");
+    assert!(!group.contains(",0)"), "{group}");
+    // The pair carries the plan's word.
+    let device = squeeze(section(merge, "fn merged_on_device("));
+    assert!(device.contains("word:pair.id_word()"), "{device}");
+    // Rows come from the plan's spans.
+    let ranges = squeeze(section(merge, "fn pair_ranges"));
+    for part in [
+        "letspans=pair.spans(&plan_dims(dims),r.layout);",
+        "None=>norm_row",
+        "Some(span)=>r.buffer.range(span.offset,span.bytes)?",
+        "r.buffer.range(spans.output.offset,spans.output.bytes)",
+    ] {
+        assert!(ranges.contains(part), "{part}: {ranges}");
+    }
+    // The swiglu covers `plan.swiglu_rows` rows on both paths.
+    let host = squeeze(section(merge, "fn merged_on_host("));
+    for (name, body) in [("device", &device), ("host", &host)] {
+        assert!(
+            body.contains("swiglu(launch,r.gu,r.act,(plan.swiglu_rows,dims.inter))?;"),
+            "{name}: {body}"
+        );
+    }
+    // The combine's two terms come from the layout's spans.
+    let run = squeeze(section(
+        merge,
+        "pub(in crate::family) fn run_exl3_moe_merged(",
+    ));
+    for part in [
+        "let(routed,shared)=r.layout.combine_spans(&plan_dims(dims));",
+        "letdown=r.buffer.range(routed.offset,routed.bytes)?;",
+        "letshared=r.buffer.range(shared.offset,shared.bytes)?;",
+        "combine_ranges(launch,&bufs.route,(down,shared),dims)",
+    ] {
+        assert!(run.contains(part), "{part}: {run}");
+    }
 }
