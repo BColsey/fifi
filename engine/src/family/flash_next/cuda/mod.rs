@@ -89,3 +89,14 @@ mod testkit {
         .unwrap()
     }
 }
+
+// The decode step. It needs the state and step plans, so it builds with the native CUDA backend
+// only. Staged: the executor is the first caller.
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
+mod mixer;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
+mod step;
+#[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+mod step_tests;
