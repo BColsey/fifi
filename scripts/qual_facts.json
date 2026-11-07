@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5916,
-      "ignored": 490,
+      "test_fns": 5936,
+      "ignored": 497,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -49,6 +49,7 @@
         "FIFI_EXL3_MIXER_OUT",
         "FIFI_EXL3_PROJECTION_OUT",
         "FIFI_EXL3_REAL_CASES",
+        "FIFI_EXL3_SINGLE_GATHER",
         "FIFI_FLASH_NEXT_EXL3_MOE_LAYER",
         "FIFI_FLASH_NEXT_EXL3_PACK",
         "FIFI_FLASH_NEXT_MISS_TRACES",
@@ -207,6 +208,8 @@
         "LC_NEEDLE_PERCENTS",
         "LC_PROMPT",
         "LC_TOKENIZER_DIR",
+        "M3_COMPARE",
+        "M3_TRACE_COMPARE",
         "NEM35_CHUNK_EXPERTS",
         "NEM35_CUDA_CHUNK_PREFILL",
         "NEM35_CUDA_GROUPED_EXPERTS",
@@ -326,6 +329,10 @@
         "INFERENCE_CUDA_MODEL_GGUF": {
           "or_skip": 0,
           "required": 1
+        },
+        "M3_LAYOUT_DIR": {
+          "or_skip": 2,
+          "required": 2
         },
         "Q36_CUDA_COHORT_DIR": {
           "or_skip": 0,

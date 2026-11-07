@@ -17,7 +17,8 @@
 
 /// The four gate margins of one comparison. All are candidate-minus-reference
 /// differences; the NLL bound is a ceiling, the rest are floors (negative
-/// floors tolerate a small drop, matching 0052).
+/// floors tolerate a small drop, matching the registered quality standard
+/// of 30 Oct 2026, recorded in `doc/explanation/status.md`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Margins {
     pub nll_ub: f64,
@@ -51,7 +52,7 @@ pub(in crate::family::qwen36) struct PositionRow {
 }
 
 /// One probe of one arm: all-token exact (copy continuations and retrieval
-/// marker spans alike; 0052 probes are all-token-exact by definition).
+/// marker spans alike; v6 probes are all-token-exact by definition).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::family::qwen36) struct ProbeRow {
     pub cluster: u32,
@@ -402,21 +403,80 @@ mod tests {
         assert!(nll_rows(&bad).is_err());
     }
 
-    /// The bootstrap is deterministic from the seed and moves with the seed:
-    /// same seed twice is bit-identical, a different seed differs somewhere.
+    /// The registered resampling stream: xorshift64* from seed 20261031 (|1),
+    /// the first outputs and the first rejection-sampled indices are pinned
+    /// to values computed by an independent implementation, so a changed
+    /// shift, multiplier, seed handling or rejection zone fails here by
+    /// design rather than by accident.
+    #[test]
+    fn rng_stream_is_pinned_to_the_registered_xorshift64star() {
+        let mut raw = Rng(20_261_031 | 1);
+        let words: Vec<u64> = (0..5).map(|_| raw.next_u64()).collect();
+        assert_eq!(
+            words,
+            [
+                0xe45f_0253_810d_29e8,
+                0x073c_734b_64e0_a991,
+                0x121b_3213_968f_6640,
+                0xf1a3_689a_3c58_3388,
+                0x4c69_fada_2e97_c313,
+            ]
+        );
+        let mut r1526 = Rng(20_261_031 | 1);
+        let idx: Vec<u64> = (0..8).map(|_| r1526.below(1526)).collect();
+        assert_eq!(idx, [746, 755, 420, 784, 779, 1272, 220, 636]);
+        let mut r40 = Rng(20_261_031 | 1);
+        let idx: Vec<u64> = (0..8).map(|_| r40.below(40)).collect();
+        assert_eq!(idx, [8, 25, 8, 32, 35, 24, 36, 18]);
+    }
+
+    /// 40 clusters of 1-3 rows with dyadic values (k/64), so every sum is
+    /// exact and the golden bounds below are bit-for-bit reproducible.
+    fn golden_fixture() -> (Vec<f64>, Vec<f64>, Vec<u32>) {
+        let (mut cand, mut refr, mut clusters) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..40u32 {
+            for j in 0..(1 + i % 3) {
+                cand.push(f64::from((7 * i + 3 * j) % 13) / 64.0);
+                refr.push(f64::from((5 * i + j) % 11) / 64.0);
+                clusters.push(i);
+            }
+        }
+        (cand, refr, clusters)
+    }
+
+    /// Golden bounds of the paired clustered bootstrap (500 draws, seed
+    /// 20261031) from an independent implementation: upper AND lower side
+    /// and the second seed (seed+2) are pinned, so a flipped side, a moved
+    /// seed, a changed percentile level (0.90 gives 0.0271.. / 0.00257..),
+    /// a changed multiplier or shift each change a hard-coded value. The
+    /// point difference 0.01443829... lies strictly between the two bounds.
+    #[test]
+    fn bootstrap_bounds_match_the_golden_values_on_both_sides() {
+        let (a, b, clusters) = golden_fixture();
+        assert_eq!(a.len(), 79);
+        let bound =
+            |seed: u64, upper: bool| bootstrap_bound(&a, &b, &clusters, 40, 500, seed, upper);
+        assert_eq!(bound(20_261_031, true), 0.03125);
+        assert_eq!(bound(20_261_031, false), -0.0011432926829268292);
+        // seed+2 moves BOTH bounds.
+        assert_eq!(bound(20_261_033, true), 0.031433823529411764);
+        assert_eq!(bound(20_261_033, false), -0.003043831168831169);
+        // Side semantics: the lower bound is below the point difference and
+        // the upper bound above it, never swapped.
+        let point = 0.0144382911392405;
+        assert!(bound(20_261_031, false) < point && point < bound(20_261_031, true));
+    }
+
+    /// The bootstrap is deterministic from the seed: the same seed twice is
+    /// bit-identical; the golden test above pins the values themselves.
     #[test]
     fn bootstrap_is_deterministic_from_the_seed() {
-        // Varied clusters and asymmetric rows, so the drawn statistics depend
-        // on the RNG stream (uniform rows over one cluster would be
-        // seed-independent by construction).
-        let a: Vec<f64> = (0..40).map(|i| 0.1 + f64::from(i) * 0.0173).collect();
-        let b: Vec<f64> = (0..40).map(|i| 0.05 + f64::from(i) * 0.0091).collect();
-        let clusters: Vec<u32> = (0..40).map(|i| (i % 3) as u32).collect();
-        let first = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261031, true);
-        let second = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261031, true);
-        let other = bootstrap_bound(&a, &b, &clusters, 3, 100, 20261032, true);
-        assert_eq!(first, second);
-        assert_ne!(first, other);
+        let (a, b, clusters) = golden_fixture();
+        for upper in [true, false] {
+            let first = bootstrap_bound(&a, &b, &clusters, 40, 500, 20_261_031, upper);
+            let second = bootstrap_bound(&a, &b, &clusters, 40, 500, 20_261_031, upper);
+            assert_eq!(first.to_bits(), second.to_bits());
+        }
     }
 
     /// Probes occupying only a SPARSE subset of the position clusters: the

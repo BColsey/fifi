@@ -174,12 +174,6 @@ fn options_of(kv: KvMode, layout: WeightLayout) -> StepOptions {
     }
 }
 
-/// One window on a FRESH step: prefill ids[lo..score_lo) over the arm's
-/// path (the chunked arena is admitted and its verdict ASSERTED Ready,
-/// because a silently serial 'chunked' arm would score the wrong
-/// hypothesis), then one forced step per scored target. Returns one row
-/// per scored position in target order, plus the padding probability mass
-/// when `mass` is set (window 0 only).
 /// UTC wall-clock stamp + seconds since `t0`, for lease-progress lines.
 fn stamp(t0: &std::time::Instant) -> String {
     let epoch = std::time::SystemTime::now()
@@ -190,6 +184,12 @@ fn stamp(t0: &std::time::Instant) -> String {
     format!("{h:02}:{m:02}:{s:02}Z +{:.0}s", t0.elapsed().as_secs_f64())
 }
 
+/// One window on a FRESH step: prefill ids[lo..score_lo) over the arm's
+/// path (the chunked arena is admitted and its verdict ASSERTED Ready,
+/// because a silently serial 'chunked' arm would score the wrong
+/// hypothesis), then one forced step per scored target. Returns one row
+/// per scored position in target order, plus the padding probability mass
+/// when `mass` is set (window 0 only).
 #[allow(clippy::too_many_arguments)] // test-harness leg: window slice + outputs
 fn run_window(
     step: &mut QwenResidentStep<'_>,
@@ -326,6 +326,13 @@ fn m3_leg() {
             .split(':')
             .map(|x| x.parse().expect("window bound"))
             .collect();
+        assert!(bounds.len() == 2, "M3_WINDOWS is lo:hi");
+        assert!(
+            bounds[0] <= bounds[1],
+            "M3_WINDOWS lo:hi needs lo <= hi, got {}:{}",
+            bounds[0],
+            bounds[1]
+        );
         (bounds[0], bounds[1])
     };
     assert!(hi_w <= layout.windows.len(), "window range past the layout");

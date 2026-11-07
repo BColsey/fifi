@@ -328,6 +328,16 @@ pub(in crate::family::qwen36) fn read_sidecar(
         )));
     }
     let n = fields[4] as usize;
+    // The row count must be the scored run of the layout window: a sidecar
+    // with fewer rows (truncated leg) or more (wrong geometry) is refused
+    // with its own message, not left to fail as a missing probe later.
+    if n != want.2.saturating_sub(want.1) {
+        return Err(err(&format!(
+            "{}: header row count {n} is not hi - score_lo = {}",
+            path.display(),
+            want.2.saturating_sub(want.1)
+        )));
+    }
     if body.len() != 67 + n * 9 {
         return Err(err(&format!("{}: row count", path.display())));
     }
@@ -571,13 +581,15 @@ mod tests {
     use super::*;
 
     /// The frozen v5 layout files load and match every REGISTERED digest and
-    /// count. Runs in the gate whenever M3_LAYOUT_DIR resolves (env or
-    /// ~/.config/fifi/test-paths.json). Unset FAILS LOUDLY (v5 review SF): a
-    /// silent skip here would let the gate pass without ever loading the
-    /// registered layout.
+    /// count. Runs whenever M3_LAYOUT_DIR resolves (env or
+    /// ~/.config/fifi/test-paths.json); skips with a SKIPPING line when it
+    /// does not, and FIFI_TEST_REQUIRE_DATA=1 turns the skip into a failure
+    /// so a gate host cannot pass without loading the registered layout.
     #[test]
     fn frozen_layout_loads_with_registered_shas() {
-        let dir = crate::test_paths::required("M3_LAYOUT_DIR");
+        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
+            return;
+        };
         let layout = load_layout(&dir).expect("the frozen layout loads");
         assert_eq!(layout.windows.len(), N_WINDOWS);
         assert_eq!(layout.probes.iter().filter(|p| !p.3).count(), N_RETRIEVAL);
@@ -593,7 +605,9 @@ mod tests {
     /// detect a finer loss than the larger (copy).
     #[test]
     fn power_statement_against_perfect_reference() {
-        let dir = crate::test_paths::required("M3_LAYOUT_DIR");
+        let Some(dir) = crate::test_paths::or_skip("M3_LAYOUT_DIR") else {
+            return;
+        };
         let layout = load_layout(&dir).expect("layout");
         let positions: Vec<PositionRow> = layout
             .windows
@@ -692,25 +706,23 @@ mod tests {
     /// window, and wrong geometry.
     #[test]
     fn sidecar_round_trips_and_rejects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let geom = (100, 354, 356);
         let rows: Vec<Row> = vec![(-0.5, true, 7), (-1.25, false, 3)];
-        let bytes = sidecar_bytes(9, (100, 356, 400), [0, 1, 0], [7u8; 20], &rows);
-        let back = read_sidecar(
-            std::path::Path::new("/dev/null-does-not-exist"),
-            9,
-            (100, 356, 400),
-        );
+        let bytes = sidecar_bytes(9, geom, [0, 1, 0], [7u8; 20], &rows);
+        let back = read_sidecar(&dir.path().join("does-not-exist"), 9, geom);
         assert!(back.is_err());
-        let path = std::env::temp_dir().join("m3_store_selfcheck");
+        let path = dir.path().join("w009.m3row");
         std::fs::write(&path, &bytes).unwrap();
-        let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
+        let (rows, (arm, build)) = read_sidecar(&path, 9, geom).unwrap();
         assert_eq!(rows, vec![(-0.5f32, true, 7u32), (-1.25, false, 3)]);
         assert_eq!((arm, build), ([0, 1, 0], [7u8; 20]));
-        assert!(read_sidecar(&path, 8, (100, 356, 400)).is_err());
-        assert!(read_sidecar(&path, 9, (101, 356, 400)).is_err());
+        assert!(read_sidecar(&path, 8, geom).is_err());
+        assert!(read_sidecar(&path, 9, (101, 354, 356)).is_err());
         let mut tampered = bytes.clone();
         tampered[67] ^= 1; // a row byte: the digest must reject it
         std::fs::write(&path, &tampered).unwrap();
-        assert!(read_sidecar(&path, 9, (100, 356, 400)).is_err());
+        assert!(read_sidecar(&path, 9, geom).is_err());
         let mut wrong_arm = bytes.clone();
         wrong_arm[44] ^= 1; // the arm id byte, digest recomputed below
         let len = wrong_arm.len();
@@ -718,9 +730,33 @@ mod tests {
         wrong_arm[len - 32..].copy_from_slice(&digest);
         std::fs::write(&path, &wrong_arm).unwrap();
         // the digest passes but the returned identity must say what it carries
-        let (rows, (arm, build)) = read_sidecar(&path, 9, (100, 356, 400)).unwrap();
+        let (rows, (arm, build)) = read_sidecar(&path, 9, geom).unwrap();
         assert_eq!(rows.len(), 2);
         assert_ne!((arm, build), ([0, 1, 0], [7u8; 20]));
-        std::fs::remove_file(&path).ok();
+    }
+
+    /// A sidecar whose header row count is not hi - score_lo is refused with
+    /// the row-count message: a truncated one (fewer rows, digest valid) and
+    /// an overlong one (more rows than the window's scored run).
+    #[test]
+    fn sidecar_row_count_must_match_the_window_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let geom = (100, 354, 358); // 4 scored rows
+        let row = |i: u32| (-0.5 - f32::from(i as u8) / 8.0, i.is_multiple_of(2), i);
+        let write = |name: &str, n: u32| {
+            let rows: Vec<Row> = (0..n).map(row).collect();
+            let path = dir.path().join(name);
+            std::fs::write(&path, sidecar_bytes(3, geom, [0, 0, 1], [1u8; 20], &rows)).unwrap();
+            path
+        };
+        let (rows, _) = read_sidecar(&write("exact.m3row", 4), 3, geom).unwrap();
+        assert_eq!(rows.len(), 4);
+        for (name, n) in [("short.m3row", 3), ("empty.m3row", 0), ("long.m3row", 5)] {
+            let err = read_sidecar(&write(name, n), 3, geom).expect_err(name);
+            assert!(
+                err.contains("header row count") && err.contains("hi - score_lo = 4"),
+                "{name}: {err}"
+            );
+        }
     }
 }
