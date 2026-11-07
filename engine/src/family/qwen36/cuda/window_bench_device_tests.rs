@@ -137,7 +137,7 @@ use crate::{
         },
     },
     kernels::{
-        cuda::resident::argmax_rows::window_full_report_bytes, single_row::require_kernel_ran,
+        cuda::resident::argmax_rows::window_read_bytes, single_row::require_kernel_ran,
     },
 };
 
@@ -578,6 +578,11 @@ struct WindowRun {
     minflt: Option<u64>,
     /// K-row windows, eager K-row bodies, captures and graph launches this window caused.
     krow: PathCounts,
+    /// Bytes copied from the device to the host during the window, and the longest single copy,
+    /// from the observer of the context (`QwenResidentStep::d2h_reads`), read outside the timed
+    /// region.
+    d2h_bytes: u64,
+    d2h_widest: usize,
 }
 
 /// What a window did on the K-row path, from the counters before and after it.
@@ -703,6 +708,7 @@ fn window_arm(
     let base = step.tokens();
     let counted = PathCounts::now(step);
     let faults_before = minor_faults();
+    let reads_before = step.d2h_reads();
     let began = Instant::now();
     step.run_window(tokens)?;
     let run_ms = ms(began);
@@ -724,6 +730,7 @@ fn window_arm(
     let minflt = faults_before
         .zip(minor_faults())
         .map(|(a, b)| b.saturating_sub(a));
+    let grown = super::krow_device_tests::d2h_growth(&reads_before, &step.d2h_reads());
     Ok(WindowRun {
         total_ms,
         run_ms,
@@ -732,6 +739,8 @@ fn window_arm(
         trace: step.window_trace.clone(),
         minflt,
         krow: PathCounts::now(step).since(counted),
+        d2h_bytes: grown.iter().map(|(len, count)| (len * count) as u64).sum(),
+        d2h_widest: grown.keys().next_back().copied().unwrap_or(0),
     })
 }
 
@@ -962,14 +971,18 @@ fn krow_window_json(
         "transfers_per_window": {
             "computed_from_sizes": true,
             // Additive fields of schema 1: the logits copy is the tap's, and every K-row window
-            // reads its report (the table, the device verify words and the K top-20 records).
+            // reads its report (the table, the device verify words and, with the shortlist on, the
+            // K top-20 records). The first three are computed from sizes; the last two are what the
+            // observer of the context counted in each timed window (all reads, and the longest).
             "logits_d2h_bytes": if path == WindowPath::KrowGraphDevVerify {
                 0
             } else {
                 (rows * HEAD_ROWS * 4) as u64
             },
             "logits_copied_to_the_host": path != WindowPath::KrowGraphDevVerify,
-            "report_d2h_bytes": window_full_report_bytes(rows) as u64,
+            "report_d2h_bytes": window_read_bytes(rows, device_shortlist_on()) as u64,
+            "observed_d2h_bytes": summary(&col(&|w| w.d2h_bytes as f64)),
+            "observed_d2h_widest_read_bytes": summary(&col(&|w| w.d2h_widest as f64)),
             "result_table_d2h_bytes": (8 * rows + 8) as u64,
             "window_ids_h2d_bytes": (4 * rows) as u64,
             "start_block_h2d_bytes": shape.start_block_bytes,
@@ -1366,6 +1379,15 @@ fn cell_json(
     })
 }
 
+/// Whether the K-row shortlist runs in this process (`Q36_CUDA_DEVICE_SHORTLIST`, on unless `0`).
+fn device_shortlist_on() -> bool {
+    super::readback::device_shortlist_enabled(
+        std::env::var(super::readback::SHORTLIST_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn write_record(config: &Config, record: &Value) {
     let text = serde_json::to_string_pretty(record).expect("record");
     println!("MRV_RECORD {record}");
@@ -1393,6 +1415,7 @@ fn record(
             "warm_from": config.warm_from, "deadline_s": config.deadline_s,
             "rollback": config.rollback.name(), "sync_capture": config.sync_capture,
             "krow": config.krow, "krow_graph": config.krow && config.krow_graph,
+            "device_shortlist": device_shortlist_on(),
             "eos": EOS,
         },
         "memory": memory,
