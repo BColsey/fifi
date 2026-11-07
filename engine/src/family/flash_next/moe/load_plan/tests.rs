@@ -77,7 +77,8 @@ fn a_served_context_settles_slots_and_names_every_part_in_the_load_line() {
         long.context.plan.slots_per_layer(),
         mid.context.plan.slots_per_layer(),
     );
-    // The real delta state is 112 MiB, a little under the 113 MiB stand-in of the plan's own tests.
+    // The real delta state is 117.7 MB (112.2 MiB), a little over the 108 MiB (36 x 3 MiB) stand-in of
+    // the tier plan's own tests (4.4 MB, far below the 90 MB of a slot).
     assert!((140..=146).contains(&long_slots), "{long_slots}");
     assert!((178..=184).contains(&mid_slots), "{mid_slots}");
     assert_eq!(long.kv_bytes, 262_144 * 26_112);

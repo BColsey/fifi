@@ -83,6 +83,7 @@ pub(crate) mod attn_decode;
 pub(crate) mod attn_decode_gemma;
 pub(crate) mod attn_decode_q8;
 pub(crate) mod attn_prep;
+pub(crate) mod dense_gemv;
 pub(crate) mod embed;
 pub(crate) mod embed_bf16;
 pub(crate) mod embed_q8;

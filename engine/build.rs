@@ -128,6 +128,7 @@ const CUDA_SOURCES: &[&str] = &[
     "src/kernels/cuda/native/resident/qsa_index.cu",
     "src/kernels/cuda/native/resident/qsa_select.cu",
     "src/kernels/cuda/native/resident/pack_rows.cu",
+    "src/kernels/cuda/native/resident/dense_gemv.cu",
 ];
 
 /// The vendored llama.cpp MMQ sources that compile to objects. Their build group:
@@ -259,6 +260,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/nemotron_gemv.h",
     "src/kernels/cuda/native/nvfp4_gemv.h",
     "src/kernels/cuda/native/prefill/flint_qk.h",
+    "src/kernels/cuda/native/resident/dense_gemv.h",
     "src/kernels/cuda/native/resident/hyper.h",
     "src/kernels/cuda/native/resident/qsa_attn.h",
     "src/kernels/cuda/native/resident/qsa_index.h",

@@ -56,6 +56,7 @@ pub(in crate::kernels::cuda) mod attn_decode;
 pub(in crate::kernels::cuda) mod attn_decode_gemma;
 pub(in crate::kernels::cuda) mod attn_decode_q8;
 pub(in crate::kernels::cuda) mod attn_prep;
+pub(in crate::kernels::cuda) mod dense_gemv;
 pub(in crate::kernels::cuda) mod embed;
 pub(in crate::kernels::cuda) mod embed_bf16;
 pub(in crate::kernels::cuda) mod embed_q8;

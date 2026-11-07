@@ -67,6 +67,8 @@ impl FlashLoadPlan {
         let (model, kinds) = model_shape(model_config)?;
         let moe = model.moe;
         let shape = TierShape::from_pack(kinds.len(), moe.experts, moe.top_k, report.expert_bytes)?;
+        // Two bytes an element: the real pack stores the embedding in BF16. The walk accepts any half
+        // dtype or F32; an F32 table would make this figure, and so the trunk's, too small by half.
         let embedding_bytes = (model.vocab as u64)
             .checked_mul(moe.hidden as u64 * 2)
             .ok_or_else(|| refuse("the embedding size overflows".into()))?;
@@ -124,7 +126,9 @@ impl FlashLoadPlan {
             trunk_bytes: self.trunk_bytes,
             embedding_bytes: self.embedding_bytes,
             ngram_bytes: self.ngram_bytes,
-            kv_bytes: requested * self.budget.geometry().position_bytes(format)?,
+            kv_bytes: requested
+                .checked_mul(self.budget.geometry().position_bytes(format)?)
+                .ok_or_else(|| refuse("the K/V bytes overflow".into()))?,
         })
     }
 }
