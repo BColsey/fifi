@@ -502,7 +502,6 @@ fn corruptions(
 
 #[test]
 fn a_corrupt_later_entry_fails_the_check_that_reads_the_report_with_the_predicate_of_the_sampler() {
-    use crate::family::sampler::check_shortlist;
     let vocab = 40;
     let row: Vec<f32> = (0..vocab)
         .map(|i| ((i * 7 + 3) % 29) as f32 - 9.0)

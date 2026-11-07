@@ -89,7 +89,6 @@ fn header_value(name: &str) -> usize {
 /// refusal both use) are the header's numbers. A host test: it needs no device.
 #[test]
 fn the_rust_constants_are_those_of_the_header() {
-    use crate::kernels::cuda::native::resident::shortlist as raw;
     assert_eq!(header_value("K"), K);
     assert_eq!(header_value("PART_BYTES"), RESULT_BYTES);
     assert_eq!(header_value("RESULT_OFFSET"), RESULT_OFFSET);
