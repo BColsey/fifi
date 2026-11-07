@@ -1,7 +1,7 @@
 # Flash-Next n-gram table: read latency on the real file
 
 Measured 2026-11-07 on the real table, `ngram_embedding.safetensors` of the 3.05 bpw pack (30.4 GiB,
-320,001,536 rows of 102 bytes, rev 69e33439), on `/home` (btrfs, Samsung 990 PRO, PCIe 4.0 x4,
+320,001,536 rows of 102 bytes, rev 69e33439), on local NVMe (btrfs, Samsung 990 PRO, PCIe 4.0 x4,
 mount options `noatime,ssd,discard=async,autodefrag`). `fincore` showed 0 bytes of the file in the
 page cache after the bench runs (read at the terminal, not logged) and before and after each
 production-reader run (logged in `results.txt`).
@@ -19,7 +19,7 @@ production-reader run (logged in `results.txt`).
   their own 4 KiB ranges. No system-wide cache drop.
 - Pool cases use persistent threads fed by channels, as `RowReader` does. A 16-row token is split
   over the threads; the time is dispatch to the last reply.
-- The machine was busy with other lanes during the runs: load average 12-20, I/O pressure
+- The machine was busy with other jobs during the runs: load average 12-20, I/O pressure
   `some avg10` 60% (`/proc/pressure/io`), memory pressure 10%, 29 GiB of swap in use. The cold
   figures therefore include contention for the drive and the CPU. Treat them as a conservative
   bound. A first run of the "warm" pass after a full cold pass at 40k rows missed the cache (pages
@@ -65,7 +65,7 @@ rows are all resident is served faster inline, which `RowReader` does not do yet
 These are raw reads: the bench does no `decode_row` and no embedding assembly. Through `RowReader`
 (read + decode + embeddings for every token) a 4096-token chunk costs 242-244 ms (table below), so
 a 32K prompt is eight chunks and about 2 s of cold n-gram work, read one chunk ahead of its compute
-(about 3 s per chunk by the research notes). Serial per-row reads at 162 us (the old Kingston
+(about 3 s of compute per 4096-token chunk is an estimate, not measured here). Serial per-row reads at 162 us (the old Kingston
 figure) would take 85 s; at the measured 52 us they would still take 27 s.
 
 ## What it means for the design
