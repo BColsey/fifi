@@ -484,15 +484,21 @@ fn the_automatic_order_is_avx512_then_avx2_then_scalar() {
 }
 
 /// On a host with AVX-512 the default is the AVX-512 tier, as before the AVX2 tier existed, and
-/// it produces the bits of an explicitly requested AVX-512 engine.
+/// it produces the bits of an explicitly requested engine of that tier. An exported
+/// `FIFI_EXL3_CPU_ISA` moves the expected tier to what the setting names, so it cannot make this
+/// test pass without checking; the child-process test below pins the unset case in any
+/// environment.
 #[test]
 fn an_avx512_host_keeps_the_avx512_default() {
-    if std::env::var_os(ISA_ENV).is_some() || !IsaSupport::host().avx512 {
-        eprintln!("skipped: the setting is set or the host has no AVX-512");
+    if !IsaSupport::host().avx512 {
+        eprintln!("skipped: the host has no AVX-512");
         return;
     }
-    assert_eq!(Exl3Isa::detect(), Exl3Isa::Avx512);
-    assert_eq!(Exl3Isa::from_env(), Ok(Exl3Isa::Avx512));
+    let want = Exl3Isa::from_env().expect("a valid setting");
+    if std::env::var_os(ISA_ENV).is_none() {
+        assert_eq!(want, Exl3Isa::Avx512);
+        assert_eq!(Exl3Isa::detect(), Exl3Isa::Avx512);
+    }
     let mut rng = Rng(0x3141_5926_5358_9793);
     let shape = (256, 128);
     let parts = random_experts(&mut rng, shape, 64);
@@ -512,9 +518,88 @@ fn an_avx512_host_keeps_the_avx512_default() {
         (cpu.isa(), out)
     };
     let (default_isa, default_out) = run(None);
-    let (_, forced_out) = run(Some(Exl3Isa::Avx512));
-    assert_eq!(default_isa, Exl3Isa::Avx512);
+    let (_, forced_out) = run(Some(want));
+    assert_eq!(default_isa, want);
     assert_eq!(default_out, forced_out);
+}
+
+/// What the child below prints before its result.
+const CHILD_MARK: &str = "exl3-cpu-isa-child: ";
+
+/// Entry point for `the_environment_setting_reaches_the_engine`: reports what
+/// `ExpertCpu::new(.., None)` makes of the environment this process was started with. It asserts
+/// nothing and is ignored, so only that test runs it.
+#[test]
+#[ignore = "run by a parent test in a child process with FIFI_EXL3_CPU_ISA set"]
+fn child_reports_the_engine_tier_for_its_environment() {
+    let line = match ExpertCpu::new(1, WaitPolicy::Park, None) {
+        Ok(cpu) => format!("isa {:?}", cpu.isa()),
+        Err(EngError::BadRequest(message)) => format!("err {message}"),
+        Err(other) => format!("other {other:?}"),
+    };
+    println!("{CHILD_MARK}{line}");
+}
+
+/// Runs this test binary again, with `FIFI_EXL3_CPU_ISA` set to `setting` (removed for `None`) in
+/// the child's environment only, and returns the child's report.
+fn child_result(setting: Option<&str>) -> String {
+    let crate_relative = module_path!().split_once("::").expect("a crate path").1;
+    let name = format!("{crate_relative}::child_reports_the_engine_tier_for_its_environment");
+    let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
+    command.args([
+        "--ignored",
+        "--exact",
+        &name,
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    match setting {
+        Some(value) => command.env(ISA_ENV, value),
+        None => command.env_remove(ISA_ENV),
+    };
+    let output = command.output().expect("run the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "child failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        .find_map(|line| line.split_once(CHILD_MARK).map(|(_, report)| report))
+        .unwrap_or_else(|| panic!("the child reported nothing: {stdout}"))
+        .to_owned()
+}
+
+/// `ExpertCpu::new(.., None)` follows `FIFI_EXL3_CPU_ISA` end to end: a forced tier is used, an
+/// unsupported or unknown one fails with an error that names the variable, and `auto` or an unset
+/// variable gives the best tier. The environment is set in child processes only.
+#[test]
+fn the_environment_setting_reaches_the_engine() {
+    let host = IsaSupport::host();
+    let best = format!("isa {:?}", host.best());
+    assert_eq!(child_result(None), best);
+    assert_eq!(child_result(Some("auto")), best);
+    assert_eq!(child_result(Some("scalar")), "isa Scalar");
+    for (value, tier, supported) in [
+        ("avx2", Exl3Isa::Avx2, host.avx2),
+        ("avx512", Exl3Isa::Avx512, host.avx512),
+    ] {
+        let got = child_result(Some(value));
+        if supported {
+            assert_eq!(got, format!("isa {tier:?}"), "{value}");
+        } else {
+            assert!(
+                got.starts_with("err ") && got.contains(ISA_ENV),
+                "{value}: {got}"
+            );
+        }
+    }
+    let bogus = child_result(Some("bogus"));
+    assert!(
+        bogus.starts_with("err ") && bogus.contains(ISA_ENV),
+        "{bogus}"
+    );
 }
 
 #[test]
@@ -714,11 +799,16 @@ fn flint_shape_rate_latency() {
     let (h, f) = (2048, 512);
     let mut rng = Rng(0x1357_9bdf_2468_ace0);
     let x: Vec<f32> = (0..h).map(|_| rng.unit()).collect();
-    let layer_count: usize = std::env::var("FIFI_EXL3_SWEEP_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(12);
+    let layer_count: usize = match std::env::var_os("FIFI_EXL3_SWEEP_LAYERS") {
+        None => 12,
+        Some(value) => value
+            .to_str()
+            .and_then(|text| text.trim().parse().ok())
+            .filter(|&count| count > 0)
+            .unwrap_or_else(|| {
+                panic!("FIFI_EXL3_SWEEP_LAYERS must be a positive whole number, got {value:?}")
+            }),
+    };
     for words in ALL_WORDS {
         let parts: Vec<_> = (0..layer_count)
             .map(|_| {
