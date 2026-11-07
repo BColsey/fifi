@@ -37,8 +37,37 @@ impl Codebook {
         f16::from_f64(low + high).to_bits()
     }
 
+    /// The value of a state before the single rounding to binary16 that [`Self::decode_state`]
+    /// applies: for `Mul1`, `(1024 + byte sum) * scale + bias` in f64, which is exact; for the
+    /// other codebooks (whose value is a sum of two binary16 numbers rounded once) the rounded value,
+    /// since no unrounded form is defined here. A reference for kernels that evaluate the affine form
+    /// without the rounding, such as the CPU expert kernel.
+    pub fn decode_state_exact(self, state: u16) -> f64 {
+        match self {
+            Self::Mul1 => {
+                let x = u32::from(state).wrapping_mul(MUL1_MARKER);
+                let sum: f64 = x.to_le_bytes().into_iter().map(f64::from).sum();
+                let offset = f16::from_bits(0x6400).to_f64();
+                let scale = f16::from_bits(0x1eee).to_f64();
+                let bias = f16::from_bits(0xc931).to_f64();
+                (offset + sum) * scale + bias
+            }
+            _ => f16::from_bits(self.decode_state(state)).to_f64(),
+        }
+    }
+
     /// Reconstructs one 16×16 W' tile, with input channels on the first axis.
     pub fn decode_tile(self, trellis: &[u16], output: &mut [u16; 256]) -> Result<(), EngError> {
+        self.decode_tile_with(trellis, output, |state| self.decode_state(state))
+    }
+
+    /// [`Self::decode_tile`] with the value of each state taken from `value`.
+    fn decode_tile_with<T: Copy>(
+        self,
+        trellis: &[u16],
+        output: &mut [T; 256],
+        value: impl Fn(u16) -> T,
+    ) -> Result<(), EngError> {
         let bits_twice = self.bits_twice(trellis.len())?;
         let mut stream = [0u32; 64];
         for (word, pair) in stream.iter_mut().zip(trellis.as_chunks::<2>().0.iter()) {
@@ -52,7 +81,7 @@ impl Codebook {
             let j = p & 7;
             let row = 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1);
             let col = (lane >> 2) + 8 * (j >> 2);
-            output[row * 16 + col] = self.decode_state(state);
+            output[row * 16 + col] = value(state);
         }
         Ok(())
     }
@@ -80,6 +109,46 @@ impl Codebook {
                 *slot = u16::from_le_bytes([pair[0], pair[1]]);
             }
             self.decode_tile(&tile_words[..words], &mut tile)?;
+            let row = (index / n_tiles) * 16;
+            let col = (index % n_tiles) * 16;
+            for (local_row, values) in tile.as_chunks::<16>().0.iter().enumerate() {
+                let start = (row + local_row) * n + col;
+                output[start..start + 16].copy_from_slice(values);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::reconstruct_into`] with the unrounded values of [`Self::decode_state_exact`], as
+    /// input-major [k, n] f64.
+    pub fn reconstruct_exact_into(
+        self,
+        trellis: &Tensor,
+        output: &mut [f64],
+    ) -> Result<(), EngError> {
+        let (k, n, words) = matrix_shape(self, trellis)?;
+        let expected = k
+            .checked_mul(n)
+            .ok_or_else(|| EngError::Checkpoint("EXL3 matrix extent exceeds host limits".into()))?;
+        if output.len() != expected {
+            return Err(EngError::BadRequest(format!(
+                "EXL3 output requires {expected} elements, received {}",
+                output.len()
+            )));
+        }
+        let bytes = trellis.host_bytes().ok_or_else(|| {
+            EngError::Checkpoint("EXL3 reference requires host trellis storage".into())
+        })?;
+        let mut tile_words = [0u16; 128];
+        let mut tile = [0f64; 256];
+        let n_tiles = n / 16;
+        for (index, bytes) in bytes.chunks_exact(words * 2).enumerate() {
+            for (slot, pair) in tile_words.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
+                *slot = u16::from_le_bytes([pair[0], pair[1]]);
+            }
+            self.decode_tile_with(&tile_words[..words], &mut tile, |state| {
+                self.decode_state_exact(state)
+            })?;
             let row = (index / n_tiles) * 16;
             let col = (index % n_tiles) * 16;
             for (local_row, values) in tile.as_chunks::<16>().0.iter().enumerate() {
@@ -140,3 +209,7 @@ fn stream_state(words: &[u32], end: usize) -> u16 {
     let pair = (u64::from(words[index]) << 32) | u64::from(words[(index + 1) % words.len()]);
     (pair >> (48 - start % 32)) as u16
 }
+
+#[cfg(test)]
+#[path = "reference_exact_tests.rs"]
+mod exact_tests;

@@ -10,6 +10,17 @@ use super::Matrix;
 impl Matrix {
     /// Reconstructs ideal fp64 weights in [input, output] order, without bias.
     pub fn reconstruct_fp64_into(&self, output: &mut [f64]) -> Result<(), EngError> {
+        self.reconstruct_fp64_with(output, false)
+    }
+
+    /// As [`Self::reconstruct_fp64_into`], with the codebook values unrounded
+    /// ([`Codebook::decode_state_exact`](super::Codebook::decode_state_exact)) instead of rounded
+    /// once to binary16 as the device kernels do.
+    pub fn reconstruct_fp64_exact_into(&self, output: &mut [f64]) -> Result<(), EngError> {
+        self.reconstruct_fp64_with(output, true)
+    }
+
+    fn reconstruct_fp64_with(&self, output: &mut [f64], exact: bool) -> Result<(), EngError> {
         let [k, n] = self.shape();
         let count = k
             .checked_mul(n)
@@ -21,15 +32,20 @@ impl Matrix {
         }
         let suh = host(self.suh())?;
         let svh = host(self.svh())?;
-        let mut bits = Vec::new();
-        bits.try_reserve_exact(count).map_err(|error| {
-            EngError::MemoryPlan(format!("EXL3 fp16 reference buffer: {error}"))
-        })?;
-        bits.resize(count, 0u16);
-        self.codebook()
-            .reconstruct_into(self.trellis(), &mut bits)?;
-        for (value, bits) in output.iter_mut().zip(bits) {
-            *value = f16::from_bits(bits).to_f64();
+        if exact {
+            self.codebook()
+                .reconstruct_exact_into(self.trellis(), output)?;
+        } else {
+            let mut bits = Vec::new();
+            bits.try_reserve_exact(count).map_err(|error| {
+                EngError::MemoryPlan(format!("EXL3 fp16 reference buffer: {error}"))
+            })?;
+            bits.resize(count, 0u16);
+            self.codebook()
+                .reconstruct_into(self.trellis(), &mut bits)?;
+            for (value, bits) in output.iter_mut().zip(bits) {
+                *value = f16::from_bits(bits).to_f64();
+            }
         }
         for block in output.chunks_exact_mut(128 * n) {
             for column in 0..n {
@@ -58,6 +74,27 @@ impl Matrix {
         rows: usize,
         output: &mut [f64],
     ) -> Result<(), EngError> {
+        self.project_fp64_with(input, rows, output, false)
+    }
+
+    /// [`Self::project_fp64_into`] with the unrounded codebook values of
+    /// [`Self::reconstruct_fp64_exact_into`].
+    pub fn project_fp64_exact_into(
+        &self,
+        input: &[f64],
+        rows: usize,
+        output: &mut [f64],
+    ) -> Result<(), EngError> {
+        self.project_fp64_with(input, rows, output, true)
+    }
+
+    fn project_fp64_with(
+        &self,
+        input: &[f64],
+        rows: usize,
+        output: &mut [f64],
+        exact: bool,
+    ) -> Result<(), EngError> {
         let [k, n] = self.shape();
         let input_count = rows
             .checked_mul(k)
@@ -83,7 +120,7 @@ impl Matrix {
             EngError::MemoryPlan(format!("EXL3 fp64 reference buffer: {error}"))
         })?;
         weights.resize(count, 0.0);
-        self.reconstruct_fp64_into(&mut weights)?;
+        self.reconstruct_fp64_with(&mut weights, exact)?;
         for (x, y) in input.chunks_exact(k).zip(output.chunks_exact_mut(n)) {
             y.fill(0.0);
             for (x, w) in x.iter().zip(weights.chunks_exact(n)) {

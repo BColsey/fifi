@@ -35,11 +35,29 @@ use crate::{
 };
 
 const GIB: u64 = 1 << 30;
-/// Relative L2 bound of the CPU kernel against fp64 on one expert block. The fp64 oracle takes the
-/// codebook weights rounded to binary16 once (the device kernels' rule); the CPU kernel evaluates the
-/// exact affine value, so the two differ by that rounding: about 2^-12 per weight, which averages to a
-/// few times 1e-4 of the output (measured 3.5e-4 on a real 3 bpw expert). The bound is 1e-3.
-const CPU_BOUND: f64 = 1e-3;
+/// Relative L2 bound of the CPU kernel against the fp64 oracle that evaluates the codebook exactly,
+/// as the kernel does (`1024 + byte sum` times a binary16 scale plus a binary16 bias, with no
+/// rounding). The two differ only by f32 accumulation and the f32 SiLU: about 1e-6; the bound is 1e-5.
+const EXACT_BOUND: f64 = 1e-5;
+
+/// What rounding the codebook weights to binary16 once (the device kernels' rule, and the other fp64
+/// oracle's) should cost the same comparison, from the format alone. A weight in `[2^e, 2^(e+1))` is
+/// `m * 2^e` with `m` in `[1, 2)` and binary16 keeps 10 fraction bits, so round-to-nearest errs by a
+/// uniform amount within half a step, `2^-11 * 2^e`: a relative rms error of `2^-11 / (m * sqrt(3))`.
+/// With `m` spread uniformly over the binade, `E[1/m^2] = 1/2`, so the rms relative weight error is
+/// `2^-11 * sqrt(1/6)`, 2.0e-4. Errors of independent weights add incoherently in a dot product, so
+/// the output of one projection carries the same relative error; an expert is three chained
+/// projections (gate, up, down), which add in quadrature: `sqrt(3)` times that, 3.5e-4. Measured on
+/// real layer-3 experts: 3.2e-4 to 4.0e-4.
+fn expected_rounding_error() -> f64 {
+    (3.0f64).sqrt() * (1.0 / 2048.0) * (1.0f64 / 6.0).sqrt()
+}
+
+/// The bound on the rounded comparison: twice the expected error, so a systematic fault (a wrong
+/// tile order, a missing scale) lands far outside it while sampling noise over 2560 outputs stays inside.
+fn rounded_bound() -> f64 {
+    2.0 * expected_rounding_error()
+}
 
 pub(super) fn open() -> (Checkpoint, usize) {
     let dir = std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK");
@@ -242,12 +260,25 @@ impl Stored {
         }
     }
 
-    /// `down(silu(gate x) * up x)` in fp64.
+    /// `down(silu(gate x) * up x)` in fp64 with the codebook weights rounded to binary16 once.
     fn fp64(&self, x: &[f64]) -> Vec<f64> {
+        self.evaluate(x, false)
+    }
+
+    /// The same with the codebook weights unrounded, as the CPU kernel evaluates them.
+    fn fp64_exact(&self, x: &[f64]) -> Vec<f64> {
+        self.evaluate(x, true)
+    }
+
+    fn evaluate(&self, x: &[f64], exact: bool) -> Vec<f64> {
         let project = |m: &Matrix, input: &[f64]| -> Vec<f64> {
             let mut out = vec![0.0; m.shape()[1]];
-            m.project_fp64_into(input, 1, &mut out)
-                .expect("fp64 projection");
+            let result = if exact {
+                m.project_fp64_exact_into(input, 1, &mut out)
+            } else {
+                m.project_fp64_into(input, 1, &mut out)
+            };
+            result.expect("fp64 projection");
             out
         };
         let (gate, up) = (project(&self.parts[0], x), project(&self.parts[1], x));
@@ -258,6 +289,12 @@ impl Stored {
             .collect();
         project(&self.parts[2], &act)
     }
+}
+
+fn relative_l2_f64(got: &[f64], want: &[f64]) -> f64 {
+    let diff: f64 = got.iter().zip(want).map(|(g, w)| (g - w).powi(2)).sum();
+    let norm: f64 = want.iter().map(|w| w * w).sum();
+    (diff / norm).sqrt()
 }
 
 fn relative_l2(got: &[f32], want: &[f64]) -> f64 {
@@ -313,9 +350,35 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
                 &mut out,
             )
             .expect("the CPU forward");
-            let error = relative_l2(&out, &expert.fp64(&x64));
-            eprintln!("{name}, row {seed}: relative L2 {error:.3e}");
-            assert!(error <= CPU_BOUND, "{name}, row {seed}: {error:.3e}");
+            let (rounded, exact) = (expert.fp64(&x64), expert.fp64_exact(&x64));
+            let to_exact = relative_l2(&out, &exact);
+            let to_rounded = relative_l2(&out, &rounded);
+            let oracles = relative_l2_f64(&rounded, &exact);
+            eprintln!(
+                "{name}, row {seed}: against the exact oracle {to_exact:.3e}, against the \
+                 binary16-rounded oracle {to_rounded:.3e} (the two oracles differ by {oracles:.3e}; \
+                 expected {:.3e})",
+                expected_rounding_error()
+            );
+            // The kernel evaluates the codebook exactly, so it agrees with the exact oracle to f32 accuracy.
+            // A larger gap here would be a real discrepancy, not rounding.
+            assert!(
+                to_exact <= EXACT_BOUND,
+                "{name}, row {seed}: {to_exact:.3e}"
+            );
+            // Against the rounded oracle it shows that rounding, and no more.
+            assert!(
+                to_rounded <= rounded_bound(),
+                "{name}, row {seed}: {to_rounded:.3e}"
+            );
+            assert!(
+                to_rounded >= expected_rounding_error() / 2.0,
+                "{name}, row {seed}: {to_rounded:.3e} is too small for the rounding to explain the gap"
+            );
+            assert!(
+                (expected_rounding_error() / 2.0..=rounded_bound()).contains(&oracles),
+                "{name}, row {seed}: the oracles differ by {oracles:.3e}"
+            );
         }
     }
     // Two experts weighted and summed in pick order, as the tier's cold path combines them.
@@ -338,14 +401,17 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
         &mut out,
     )
     .expect("the CPU forward");
-    let want: Vec<f64> = cases[0]
-        .1
-        .fp64(&x64)
-        .iter()
-        .zip(cases[1].1.fp64(&x64))
-        .map(|(a, b)| f64::from(weights[0]) * a + f64::from(weights[1]) * b)
-        .collect();
-    let error = relative_l2(&out, &want);
-    eprintln!("two weighted picks: relative L2 {error:.3e}");
-    assert!(error <= CPU_BOUND, "{error:.3e}");
+    let combine = |first: Vec<f64>, second: Vec<f64>| -> Vec<f64> {
+        first
+            .iter()
+            .zip(second)
+            .map(|(a, b)| f64::from(weights[0]) * a + f64::from(weights[1]) * b)
+            .collect()
+    };
+    let exact = combine(cases[0].1.fp64_exact(&x64), cases[1].1.fp64_exact(&x64));
+    let rounded = combine(cases[0].1.fp64(&x64), cases[1].1.fp64(&x64));
+    let (to_exact, to_rounded) = (relative_l2(&out, &exact), relative_l2(&out, &rounded));
+    eprintln!("two weighted picks: exact {to_exact:.3e}, rounded {to_rounded:.3e}");
+    assert!(to_exact <= EXACT_BOUND, "{to_exact:.3e}");
+    assert!(to_rounded <= rounded_bound(), "{to_rounded:.3e}");
 }
