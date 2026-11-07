@@ -25,6 +25,12 @@
 //! once after resolving, and a path that still sits on a placeholder is
 //! refused.
 //!
+//! A path is judged by name and then opened, so a file replaced by a link to a network mount in
+//! between is not seen. The n-gram table closes that gap on Linux: after opening it, the guard judges
+//! `/proc/self/fd/<n>`, which resolves to the opened file. The shard, config and index opens still
+//! check and then open by name; swapping them in that interval takes a process that already owns the
+//! model directory, so it is documented and not closed.
+//!
 //! What a filesystem type cannot reveal is not caught: a union filesystem
 //! such as mergerfs over network branches, and a FUSE mount whose source is
 //! a local-looking path. The tokenizer directory and the Flash-Next manifest

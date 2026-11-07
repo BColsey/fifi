@@ -217,3 +217,75 @@ fn a_local_link_to_a_table_on_a_network_mount_is_refused() {
     assert!(text.contains("must be on local storage"), "{text}");
     assert!(open(&link).is_ok());
 }
+
+#[test]
+fn a_missing_file_a_short_file_and_a_header_longer_than_the_file_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    let text = message(open(&path));
+    assert!(text.contains("n-gram table"), "{text}");
+    // Under 8 bytes: no prefix to read.
+    std::fs::write(&path, [1u8, 2, 3]).unwrap();
+    let text = message(open(&path));
+    assert!(text.contains("n-gram table"), "{text}");
+    // A prefix inside the 64 MiB limit that still claims more header than the file holds: the
+    // second operand of the length test, which a prefix of u64::MAX never reaches.
+    let mut bytes = 100u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0u8; 50]);
+    std::fs::write(&path, &bytes).unwrap();
+    let text = message(open(&path));
+    assert!(
+        text.contains("the header claims 100 bytes in a file of 58"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_directory_is_not_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = message(open(dir.path()));
+    assert!(text.contains("is not a regular file"), "{text}");
+}
+
+#[test]
+fn a_file_cut_short_after_the_open_fails_its_reads_with_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let file = open(&path).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(HEADER.len() as u64)
+        .unwrap();
+    let mut packed = vec![0u8; file.table().row_bytes()];
+    assert!(matches!(
+        file.read_row(5, &mut packed),
+        Err(EngError::Checkpoint(_))
+    ));
+    assert!(matches!(
+        file.read_aux(NgramAux::HeadBias),
+        Err(EngError::Checkpoint(_))
+    ));
+}
+
+// Fails if the open descriptor is not judged: the descriptor of a file below a network mount is
+// refused by `check_open_file` even though no name is checked. This is the check that closes the
+// gap between judging a path and opening it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_open_descriptor_on_a_network_mount_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ngram_embedding.safetensors");
+    write_table(&path);
+    let file = File::open(&path).unwrap();
+    let guard = LocalGuard::new().unwrap();
+    assert!(super::check_open_file(&guard, &file).is_ok());
+    let text = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
+        super::check_open_file(&guard, &file)
+            .expect_err("refused")
+            .describe()
+    });
+    assert!(text.contains("must be on local storage"), "{text}");
+}

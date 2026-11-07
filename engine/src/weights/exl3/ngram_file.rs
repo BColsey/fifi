@@ -39,6 +39,21 @@ fn io_error(path: &Path, error: &std::io::Error) -> EngError {
     EngError::Checkpoint(format!("EXL3 n-gram table {}: {error}", path.display()))
 }
 
+/// Judges the open descriptor, not the name: a file swapped for a link to a network mount between the
+/// check of the path and the open is caught here, because `/proc/self/fd/<n>` resolves to the
+/// opened file's real path. Linux only; elsewhere the check of the name stands.
+#[cfg(target_os = "linux")]
+fn check_open_file(guard: &LocalGuard, file: &File) -> Result<(), EngError> {
+    use std::os::fd::AsRawFd;
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    guard.check(&fd_path, "model weights")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_open_file(_guard: &LocalGuard, _file: &File) -> Result<(), EngError> {
+    Ok(())
+}
+
 impl NgramFile {
     /// Refuses a path on a network-backed filesystem before opening it, then validates the header
     /// against `layout` and the length of the file. `key` is the tensor-name prefix of the table
@@ -50,11 +65,26 @@ impl NgramFile {
         layout: NgramLayout,
     ) -> Result<Self, EngError> {
         guard.check(path, "model weights")?;
-        let file = File::open(path).map_err(|error| io_error(path, &error))?;
-        let length = file
-            .metadata()
+        // A FIFO or a device named like the table would block or hang the open.
+        if !std::fs::metadata(path)
             .map_err(|error| io_error(path, &error))?
-            .len();
+            .is_file()
+        {
+            return Err(EngError::Checkpoint(format!(
+                "EXL3 n-gram table {} is not a regular file",
+                path.display()
+            )));
+        }
+        let file = File::open(path).map_err(|error| io_error(path, &error))?;
+        check_open_file(guard, &file)?;
+        let metadata = file.metadata().map_err(|error| io_error(path, &error))?;
+        if !metadata.is_file() {
+            return Err(EngError::Checkpoint(format!(
+                "EXL3 n-gram table {} is not a regular file",
+                path.display()
+            )));
+        }
+        let length = metadata.len();
         let mut prefix = [0u8; 8];
         file.read_exact_at(&mut prefix, 0)
             .map_err(|error| io_error(path, &error))?;
