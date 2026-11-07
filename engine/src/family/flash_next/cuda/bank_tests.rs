@@ -107,6 +107,9 @@ fn the_bank_needs_a_slot_for_the_filler_beyond_the_picks() {
     assert!(BankGeometry::new(48, 512, 10, 11, 1_881_600).is_ok());
     assert!(BankGeometry::new(48, 512, 10, 513, 1_881_600).is_err());
     assert!(BankGeometry::new(48, 70_000, 10, 100, 1_881_600).is_err());
+    // 65,535 is the policy's empty-slot sentinel, so a layer holds at most 65,535 experts.
+    assert!(BankGeometry::new(48, 65_536, 10, 100, 1_881_600).is_err());
+    assert!(BankGeometry::new(48, 65_535, 10, 100, 1_881_600).is_ok());
     assert!(BankGeometry::new(48, 512, 10, 100, 1_881_601).is_err());
     assert!(BankGeometry::new(0, 512, 10, 100, 1_881_600).is_err());
 }
@@ -191,9 +194,10 @@ fn the_pinned_store_is_the_cold_experts_plus_one_spare_place_per_layer() {
             plan.process_bytes,
             plan.store_bytes + plan.scratch_bytes + 3 * GIB + 2 * GIB
         );
+        // 55 GiB available minus the store, the scratch, 3 + 2 GiB and the 8 GiB floor.
         assert_eq!(
             plan.page_cache_left,
-            HOST_TOTAL - plan.process_bytes - 8 * GIB
+            55 * GIB - plan.process_bytes - 8 * GIB
         );
         assert!(plan.page_cache_left >= 8 * GIB);
     }
@@ -216,9 +220,9 @@ fn the_budget_at_the_contexts_of_the_tier_plan() {
         "{} GiB",
         gib(plan.store_bytes)
     );
-    // The page cache left for the 30.4 GiB n-gram table: 62.43 - 8 - 31.13 - 5 = 18.3 GiB.
+    // The page cache left for the 30.4 GiB n-gram table: 55 available - 8 floor - 31.2 - 5 = 10.8 GiB.
     assert!(
-        (18.0..18.6).contains(&gib(plan.page_cache_left)),
+        (10.5..11.1).contains(&gib(plan.page_cache_left)),
         "{} GiB",
         gib(plan.page_cache_left)
     );
@@ -275,7 +279,23 @@ fn the_budget_refuses_when_other_lanes_hold_the_memory_and_never_shrinks() {
         .unwrap_err(),
     );
     assert!(error.contains("are available"), "{error}");
-    // Exactly enough available memory passes, one byte less refuses.
+    // Exactly enough available memory passes, one byte less refuses (the n-gram floor is judged
+    // in `the_page_cache_left_follows_what_other_processes_hold`, so it is off here).
+    let terms = HostTerms {
+        ngram_cache_min: 0,
+        ..HostTerms::DEFAULT
+    };
+    let ok = HostPinPlan::new(&geometry, HostMode::Exclusive, &host(55 * GIB), &terms).unwrap();
+    let needed = ok.process_bytes + ok.os_floor;
+    assert!(HostPinPlan::new(&geometry, HostMode::Exclusive, &host(needed), &terms).is_ok());
+    assert!(HostPinPlan::new(&geometry, HostMode::Exclusive, &host(needed - 1), &terms).is_err());
+}
+
+#[test]
+fn the_page_cache_left_follows_what_other_processes_hold() {
+    // 46 GiB available on the 62 GiB host: the store passes the availability guard (44 needed), but
+    // only about 2 GiB of page cache would remain, under the provisional 8 GiB floor.
+    let geometry = geometry_of(&plan_with_slots(143));
     let ok = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
@@ -284,20 +304,33 @@ fn the_budget_refuses_when_other_lanes_hold_the_memory_and_never_shrinks() {
     )
     .unwrap();
     let needed = ok.process_bytes + ok.os_floor;
-    assert!(
+    assert!(needed < 46 * GIB);
+    let error = message(
         HostPinPlan::new(
             &geometry,
             HostMode::Exclusive,
-            &host(needed),
-            &HostTerms::DEFAULT
+            &host(46 * GIB),
+            &HostTerms::DEFAULT,
         )
-        .is_ok()
+        .unwrap_err(),
     );
+    assert!(error.contains("page-cache floor"), "{error}");
+    assert!(error.contains("provisional"), "{error}");
+    // Exactly the floor above the need passes; one byte less refuses.
+    let floor = HostTerms::DEFAULT.ngram_cache_min;
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &host(needed + floor),
+        &HostTerms::DEFAULT,
+    )
+    .unwrap();
+    assert_eq!(plan.page_cache_left, floor);
     assert!(
         HostPinPlan::new(
             &geometry,
             HostMode::Exclusive,
-            &host(needed - 1),
+            &host(needed + floor - 1),
             &HostTerms::DEFAULT
         )
         .is_err()
@@ -361,6 +394,13 @@ fn the_profile_parser_refuses_a_wrong_shape_a_repeat_and_a_stray_line() {
         parse_route_counts("# layers=2\n", 2, 4).is_err(),
         "no schema"
     );
+    // A header alone is an empty profile of that shape; another shape or no shape is refused.
+    assert_eq!(
+        parse_route_counts(head, 2, 4).unwrap(),
+        vec![vec![0u64; 4]; 2]
+    );
+    assert!(parse_route_counts(head, 3, 4).is_err());
+    assert!(parse_route_counts("# schema=flash-next-route-counts/1\n", 2, 4).is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -537,6 +577,55 @@ fn admitted_experts_keep_the_newest_use_and_leave_the_recency_in_that_order() {
     assert_eq!(state.expert_in_slot(0, 0), Some(7));
     let copies = state.begin_pass(0, &[1]).unwrap();
     assert_eq!(copies.ops[0].demote.unwrap().expert, 8);
+}
+
+#[test]
+fn a_policy_row_must_hold_exactly_the_slots() {
+    let geometry = BankGeometry::new(1, 16, 3, 5, 64).unwrap();
+    let counts = vec![vec![0u64; 16]];
+    let fill = |row: Vec<i32>| {
+        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts)?;
+        ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).map(|_| ())
+    };
+    let row = |held: usize| -> Vec<i32> {
+        (0..16)
+            .map(|e| if e < held { e as i32 } else { -1 })
+            .collect()
+    };
+    assert!(fill(row(5)).is_ok());
+    assert!(fill(row(4)).is_err(), "a short row");
+    assert!(fill(row(6)).is_err(), "a slot past the bank");
+    // A policy that reports a short row after its own checks is caught by `with_policy`.
+    struct Short(Vec<i32>);
+    impl SlotPolicy for Short {
+        fn plan_pass(&mut self, _: usize, _: &[i32]) -> Result<PassPlan, EngError> {
+            Ok(PassPlan::default())
+        }
+        fn admit(&mut self, _: usize, _: &[u16]) -> Result<PassPlan, EngError> {
+            Ok(PassPlan::default())
+        }
+        fn slot_row(&self, _: usize) -> &[i32] {
+            &self.0
+        }
+        fn expert_in_slot(&self, _: usize, _: usize) -> Option<u16> {
+            None
+        }
+    }
+    let error = message(
+        ExpertBankState::with_policy(geometry, HostMode::Exclusive, Short(row(3)))
+            .err()
+            .expect("refused"),
+    );
+    assert!(error.contains("holds 3 experts"), "{error}");
+}
+
+#[test]
+fn a_poisoned_bank_refuses_every_later_pass() {
+    let mut state = small(HostMode::Exclusive);
+    state.begin_pass(0, &[9]).unwrap();
+    state.poison();
+    assert!(state.begin_pass(0, &[1]).is_err());
+    assert!(state.admit(0, &[1]).is_err());
 }
 
 #[test]
@@ -823,6 +912,23 @@ fn the_second_pass_refuses_what_has_no_second_pass() {
     assert!(miss_pass_inputs(&[-1, 1], &weights, &fault, &after).is_err());
     let invalid = classify_reference(&row, 2, &[0, 0], &weights).unwrap();
     assert!(miss_pass_inputs(&[0, 0], &weights, &invalid, &after).is_err());
+    // A non-finite weight is flagged by the classifier (word != 0), so there is no second pass.
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let w = [0.5f32, bad];
+        let flagged = classify_reference(&row, 2, &ids, &w).unwrap();
+        assert_ne!(flagged.word, 0, "{bad}");
+        assert!(
+            miss_pass_inputs(&ids, &w, &flagged, &after).is_err(),
+            "{bad}"
+        );
+    }
+    // -0.0 is the one finite weight whose bits change: -0.0 + 0.0 is +0.0. A router softmax cannot
+    // produce it; the second pass carries it through as given.
+    let w = [0.5f32, -0.0];
+    let negative = classify_reference(&row, 2, &ids, &w).unwrap();
+    let (_, second) = miss_pass_inputs(&ids, &w, &negative, &after).unwrap();
+    assert_eq!(second[1].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(negative.weights[1].to_bits(), 0.0f32.to_bits());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -832,6 +938,9 @@ fn the_second_pass_refuses_what_has_no_second_pass() {
 /// Replays the T0 route trace through the policy as the replay tool did: a cache per layer, a fresh
 /// bank per prompt, prompt steps admitted, hits counted over the decode steps of prompts 1 to 6.
 /// The receipt: LRU hit 0.870195 at 143 slots and 0.914977 at 184 (`flash-next-routing-locality-t0-trace`).
+/// This policy lands 0.0007 and 0.0004 under it: the gap is the slot-0 protection of a pass with a
+/// miss, which the replay tool's cache (and Flint's) does not have; without it an independent replay
+/// gives 0.870107 and 0.914921.
 fn replay(trace: &str, slots: usize) -> f64 {
     let geometry = BankGeometry::new(48, 512, 10, slots, 1_881_600).unwrap();
     let fresh = || {
@@ -873,7 +982,7 @@ fn the_policy_reproduces_the_recorded_lru_hit_rates_on_the_t0_trace() {
         let rate = replay(&trace, slots);
         eprintln!("{slots} slots: hit {rate:.6} (recorded {recorded})");
         assert!(
-            (rate - recorded).abs() < 0.01,
+            (rate - recorded).abs() < 0.002,
             "{slots} slots: {rate} against {recorded}"
         );
     }
@@ -886,7 +995,8 @@ fn the_policy_reproduces_the_recorded_lru_hit_rates_on_the_t0_trace() {
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::super::bank::{
-        BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, device::*,
+        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
+        ReplaceOnMissLru, device::*,
     };
     use crate::{EngError, family::project::cuda::CudaProjector, kernels::cuda::device_present};
 
@@ -929,7 +1039,17 @@ mod device_tests {
         let projector = CudaProjector::new().expect("projector");
         let ctx = projector.context();
         let pinned_before = ctx.live_owners().pinned;
-        let mut bank = DeviceBank::build(ctx, state, &Pattern).expect("build");
+        let plan = HostPinPlan::new(
+            &geometry,
+            HostMode::Exclusive,
+            &HostMemory {
+                total: 62 * (1 << 30),
+                available: 55 * (1 << 30),
+            },
+            &HostTerms::DEFAULT,
+        )
+        .expect("the host plan");
+        let mut bank = DeviceBank::build(ctx, state, &Pattern, &plan).expect("build");
         assert_eq!(
             ctx.live_owners().pinned - pinned_before,
             2 * places * record,
@@ -952,9 +1072,8 @@ mod device_tests {
         }
 
         // Experts 8 and 9 miss in layer 0; slot 0 is the filler, so slots 1 and 2 are refilled.
-        let copies = bank.state_mut().begin_pass(0, &[8, 9]).unwrap();
+        let copies = bank.step(ctx, 0, &[8, 9]).unwrap();
         assert_eq!(copies.ops.len(), 2);
-        bank.run_copies(ctx, &copies).expect("copies");
         for op in &copies.ops {
             assert_eq!(
                 read_slot(&bank, 0, usize::from(op.slot)),
@@ -972,9 +1091,8 @@ mod device_tests {
         }
         // Layer 1 is untouched, and a pass of hits copies nothing.
         assert_eq!(read_slot(&bank, 1, 1), expected(1, 1, record));
-        let copies = bank.state_mut().begin_pass(0, &[8, 9]).unwrap();
+        let copies = bank.step(ctx, 0, &[8, 9]).unwrap();
         assert!(copies.ops.is_empty());
-        bank.run_copies(ctx, &copies).expect("no copies");
 
         // The pinned store is released with the bank: observe the drop, not an output.
         drop(bank);

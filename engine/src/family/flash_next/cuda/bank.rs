@@ -92,9 +92,10 @@ impl BankGeometry {
                 "{layers} layers, top-{top_k} and a {record_bytes}-byte record are not a bank"
             )));
         }
-        if experts == 0 || experts > usize::from(u16::MAX) + 1 {
+        // `u16::MAX` is the empty-slot sentinel of the policy, so it cannot be an expert number.
+        if experts == 0 || experts > usize::from(u16::MAX) {
             return Err(plan_error(format!(
-                "{experts} experts do not fit a 16-bit expert number"
+                "{experts} experts do not fit a 16-bit expert number below the sentinel"
             )));
         }
         if slots <= top_k {
@@ -258,7 +259,8 @@ pub(super) struct HostPinPlan {
     pub(super) os_floor: u64,
     /// Store, scratch, heap and margin: what this process takes.
     pub(super) process_bytes: u64,
-    /// RAM left for the page cache after the process and the OS floor.
+    /// RAM left for the page cache: `MemAvailable` (other processes' holds already out) minus what
+    /// this plan needs now (store, scratch, heap, margin and the OS floor).
     pub(super) page_cache_left: u64,
 }
 
@@ -266,7 +268,7 @@ impl HostPinPlan {
     /// Sizes the pinned store from the machine and refuses (it never shrinks the store, and never
     /// changes the context) when
     /// - the process and the OS floor exceed `available`, or
-    /// - the page cache left is below `ngram_cache_min`.
+    /// - the page cache left (`available` minus the need) is below `ngram_cache_min`.
     ///
     /// On the CUDA path the caller also runs `HostBudget::probe()?.admit_for(process_bytes, ..)`,
     /// which applies the cgroup ancestors (and refuses a cgroup-namespace root, so run on the host).
@@ -297,16 +299,13 @@ impl HostPinPlan {
                 terms.engine_heap, terms.margin, memory.available
             )));
         }
-        let page_cache_left = memory.total.checked_sub(needed_now).ok_or_else(|| {
-            plan_error(format!(
-                "{needed_now} bytes needed exceed the {} bytes of RAM",
-                memory.total
-            ))
-        })?;
+        // Cannot underflow: `needed_now <= available` above.
+        let page_cache_left = memory.available - needed_now;
         if page_cache_left < terms.ngram_cache_min {
             return Err(plan_error(format!(
-                "{page_cache_left} bytes of page cache are left, the n-gram table needs {}",
-                terms.ngram_cache_min
+                "{page_cache_left} bytes of page cache are left of {} available; the n-gram \
+                 page-cache floor is {} (provisional, an author choice, not a measurement)",
+                memory.available, terms.ngram_cache_min
             )));
         }
         Ok(Self {
@@ -391,8 +390,10 @@ pub(super) fn parse_route_counts(
         }
         counts[layer][expert] = count;
     }
-    if !schema {
-        return Err(bad("no schema header".into()));
+    if !schema || seen_layers != Some(layers) || seen_experts != Some(experts) {
+        return Err(bad(format!(
+            "no header for schema flash-next-route-counts/1 with {layers} layers and {experts} experts"
+        )));
     }
     Ok(counts)
 }
@@ -854,6 +855,15 @@ impl<P: SlotPolicy> ExpertBankState<P> {
         if rows.iter().any(|row| row.len() != geometry.experts) {
             return Err(bank_error("the policy has no slot row for a layer".into()));
         }
+        for (layer, row) in rows.iter().enumerate() {
+            let held = row.iter().filter(|&&slot| slot >= 0).count();
+            if held != geometry.slots {
+                return Err(bank_error(format!(
+                    "layer {layer}: the policy holds {held} experts, the bank has {} slots",
+                    geometry.slots
+                )));
+            }
+        }
         let places = HostPlaces::new(&geometry, mode, &rows);
         Ok(Self {
             geometry,
@@ -910,6 +920,12 @@ impl<P: SlotPolicy> ExpertBankState<P> {
         self.check_usable()?;
         let plan = self.policy.admit(layer, experts_by_use)?;
         self.translate(layer, plan, false)
+    }
+
+    /// Marks the host model as ahead of or apart from the device: every later pass is refused. The
+    /// device owner calls it when the copies of a planned pass failed.
+    pub(super) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     fn check_usable(&self) -> Result<(), EngError> {
@@ -1026,7 +1042,7 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
-    use super::{BankGeometry, ExpertBankState, PassCopies, ReplaceOnMissLru};
+    use super::{BankGeometry, ExpertBankState, HostPinPlan, PassCopies, ReplaceOnMissLru};
     use crate::{
         EngError,
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, PinnedBuf},
@@ -1047,14 +1063,26 @@ pub(super) mod device {
 
     impl DeviceBank {
         /// Allocates the buffers, writes the host places and fills every slot from `source`.
-        /// Returns when the device holds the fill.
+        /// Returns when the device holds the fill. `plan` is the host budget the caller admitted
+        /// (`HostPinPlan::new`, plus Flint's cgroup-aware `HostBudget::admit_for` on the CUDA path):
+        /// it must be for this bank's mode and place count, so a store is never pinned unchecked.
         pub(in crate::family::flash_next) fn build(
             ctx: &CudaContext,
             state: ExpertBankState<ReplaceOnMissLru>,
             source: &dyn RecordSource,
+            plan: &HostPinPlan,
         ) -> Result<Self, EngError> {
             let geometry: BankGeometry = *state.geometry();
             let places = state.mode().places_per_layer(&geometry);
+            if plan.mode != state.mode() || plan.places_per_layer != places {
+                return Err(EngError::BadRequest(format!(
+                    "Flash-Next expert bank: the host plan is for {:?} with {} places per layer, \
+                     the bank is {:?} with {places}",
+                    plan.mode,
+                    plan.places_per_layer,
+                    state.mode()
+                )));
+            }
             let stream = ctx.stream()?;
             let mut slots = Vec::with_capacity(geometry.layers);
             let mut store = Vec::with_capacity(geometry.layers);
@@ -1088,12 +1116,6 @@ pub(super) mod device {
             &self.state
         }
 
-        pub(in crate::family::flash_next) fn state_mut(
-            &mut self,
-        ) -> &mut ExpertBankState<ReplaceOnMissLru> {
-            &mut self.state
-        }
-
         /// The bank buffer of `layer`: slot `s` starts at `s * record_bytes`.
         pub(in crate::family::flash_next) fn slots(&self, layer: usize) -> Option<&DeviceBuffer> {
             self.slots.get(layer)
@@ -1103,13 +1125,48 @@ pub(super) mod device {
             &self.stream
         }
 
-        /// Runs the copies of `copies` on the bank's stream, in order, and returns when they have
-        /// finished: per op the write-back (D2H) into the host place, then the H2D into the slot.
-        pub(in crate::family::flash_next) fn run_copies(
+        /// One decode layer: plans the copies for the router's picks (all of them, hits included),
+        /// runs them and returns when they have finished. The only way to move a slot, so the
+        /// device cannot lag the host model; if a copy fails the state is poisoned and every later
+        /// step is refused.
+        pub(in crate::family::flash_next) fn step(
             &mut self,
             ctx: &CudaContext,
-            copies: &PassCopies,
-        ) -> Result<(), EngError> {
+            layer: usize,
+            picks: &[i32],
+        ) -> Result<PassCopies, EngError> {
+            let copies = self.state.begin_pass(layer, picks)?;
+            self.finish(ctx, copies)
+        }
+
+        /// Admits the experts a prefill chunk used (oldest use first) and runs the copies.
+        pub(in crate::family::flash_next) fn admit(
+            &mut self,
+            ctx: &CudaContext,
+            layer: usize,
+            experts_by_use: &[u16],
+        ) -> Result<PassCopies, EngError> {
+            let copies = self.state.admit(layer, experts_by_use)?;
+            self.finish(ctx, copies)
+        }
+
+        fn finish(
+            &mut self,
+            ctx: &CudaContext,
+            copies: PassCopies,
+        ) -> Result<PassCopies, EngError> {
+            match self.run_copies(ctx, &copies) {
+                Ok(()) => Ok(copies),
+                Err(error) => {
+                    self.state.poison();
+                    Err(error)
+                }
+            }
+        }
+
+        /// Runs the copies of `copies` on the bank's stream, in order, and returns when they have
+        /// finished: per op the write-back (D2H) into the host place, then the H2D into the slot.
+        fn run_copies(&mut self, ctx: &CudaContext, copies: &PassCopies) -> Result<(), EngError> {
             if copies.ops.is_empty() {
                 return Ok(());
             }
