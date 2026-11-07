@@ -99,6 +99,9 @@ enum Flaw {
     /// The draw hook serves the records of the last K-row window to any window with the same base
     /// and inputs, also when the K-row path does not run it.
     ServesStaleDraws,
+    /// A seeded draw that the sampler refuses (a record that changed after the report was judged)
+    /// leaves the window open and the state valid.
+    ShortlistDrawErrorNotGated,
 }
 
 /// The state a snapshot carries: the committed cells, never the stale ones above the frontier.
@@ -795,7 +798,11 @@ impl WindowModel for DevFake {
                     .cloned()
                     .ok_or_else(|| refused("no record"))?;
                 self.shortlist_draws += 1;
-                return sampler.sample_shortlist(&record, vocab);
+                let drawn = sampler.sample_shortlist(&record, vocab);
+                if drawn.is_err() && self.flaw != Flaw::ShortlistDrawErrorNotGated {
+                    fail_window(self);
+                }
+                return drawn;
             }
             DrawRoute::TapRow => {
                 let values = window.rows.get(row).ok_or_else(|| refused("no such row"))?;
@@ -1652,6 +1659,28 @@ fn a_failed_row_read_at_draw_time_fails_the_window_closed() {
     assert!(sound.fake.logits(1).is_err(), "a step on a failed window");
     // The flaw leaves a valid state with the window open: it is not failed closed.
     let flawed = run(Flaw::LazyReadNotGated);
+    assert!(!flawed.fake.poisoned && !flawed.fake.gate && flawed.fake.window.is_some());
+}
+
+#[test]
+fn a_record_the_sampler_refuses_at_draw_time_fails_the_window_closed() {
+    let run = |flaw: Flaw| {
+        let mut rig = Rig::krow(flaw);
+        rig.fake.want_logits = false;
+        rig.fake.run_window(&rows(4)).expect("the window");
+        // The record was sound when the report was read; entry 7 repeats entry 3 before the draw.
+        let draws = rig.fake.draws.as_mut().expect("draws");
+        let entry = draws.shortlists[0][3];
+        draws.shortlists[0][7] = entry;
+        rig.fake
+            .draw(0, &mut keeping(5, 7), VOCAB)
+            .expect_err("a record the sampler refuses");
+        rig
+    };
+    let sound = run(Flaw::Sound);
+    assert!(sound.fake.poisoned && sound.fake.gate && sound.fake.window.is_none());
+    // The flaw returns the error and leaves the window open with a valid state.
+    let flawed = run(Flaw::ShortlistDrawErrorNotGated);
     assert!(!flawed.fake.poisoned && !flawed.fake.gate && flawed.fake.window.is_some());
 }
 
