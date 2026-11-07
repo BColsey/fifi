@@ -147,7 +147,7 @@ const MIN_FREE_AFTER_BUILD: u64 = GIB;
 /// Positions past the deepest depth that the cache holds. Every cell starts at its depth and every
 /// round returns to the position the cell started its rounds at (`run_cell`), so a cell reaches at
 /// most its depth, the rows of its prepare windows, one round of every arm and one more window of
-/// look-ahead: under 100 rows for 8 rows and four window paths. The slack is far above that, and
+/// look-ahead: under 128 rows for 8 rows and five window paths (105). The slack is far above that, and
 /// `a_cell_stays_inside_the_cache_and_the_text` pins the arithmetic with the real arms.
 const CONTEXT_SLACK: usize = 1_536;
 /// The depth the token ids of the identity run to, whatever the depths of the run.
@@ -1451,7 +1451,7 @@ fn verify_window_cost_record() {
     let capture = capture_from_env();
     let deepest = *config.depths.last().expect("a depth");
     // The text must outlast the deepest prefill and the rows a cell reaches past its depth (under
-    // 100, see `CONTEXT_SLACK`).
+    // 128, see `CONTEXT_SLACK`).
     // The ids hashed into the identity are the same whatever depths a run takes (a run of the
     // shallow cells and a run of the deep cells carry one `ids_sha256`): the text is hashed to the
     // deepest depth the plans use.
@@ -1785,7 +1785,7 @@ fn a_cell_stays_inside_the_cache_and_the_text() {
                 "depth {depth}, {rows} rows: {extent} against {text} ids"
             );
             assert!(
-                extent - depth < 100,
+                extent - depth < 128,
                 "depth {depth}, {rows} rows: reaches {} past its depth",
                 extent - depth
             );
