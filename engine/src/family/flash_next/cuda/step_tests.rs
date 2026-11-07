@@ -641,6 +641,9 @@ struct RunOut {
     moe_out: Vec<Vec<f32>>,
     streams: Vec<Vec<f32>>,
     misses: Vec<u64>,
+    /// Per DeltaNet layer of the window, the device recurrent state followed by the conv ring after
+    /// the sequence.
+    states: Vec<Vec<f32>>,
 }
 
 /// How the layers of a token are driven.
@@ -770,6 +773,7 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
         moe_out: Vec::new(),
         streams: Vec::new(),
         misses: Vec::new(),
+        states: Vec::new(),
     };
 
     for token in 0..tokens {
@@ -974,6 +978,12 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
                     state.ring()[channel * taps + tap];
             }
         }
+        out.states
+            .push(rec.iter().chain(&ring_device).copied().collect());
+        if drive == Drive::Composed {
+            // No host reference ran: the state is compared with the stepped run's, bit for bit.
+            continue;
+        }
         let rec_error = relative_l2(&rec, state.rec());
         let ring_error = relative_l2(&ring_device, &ring_host_planar);
         println!(
@@ -1047,6 +1057,15 @@ fn the_composed_layers_equal_the_stepped_layers_bit_for_bit() {
         ..Spec::new(&layers, MoeKind::Resident)
     });
     assert_eq!(stepped.streams.len(), composed.streams.len());
+    assert_eq!(stepped.states.len(), composed.states.len());
+    for (index, (a, b)) in stepped.states.iter().zip(&composed.states).enumerate() {
+        let equal = a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        println!("DeltaNet layer {index} of the window: state and ring bit for bit: {equal}");
+        assert!(
+            equal,
+            "DeltaNet layer {index} of the window: the composed state differs"
+        );
+    }
     for token in 0..stepped.streams.len() {
         let equal = stepped.streams[token]
             .iter()
