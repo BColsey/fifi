@@ -32,6 +32,7 @@ use crate::{
         exl3_pack::layer_name,
         flash_next::{
             cuda::{
+                moe_block::{SplitMoe, SplitMoeTrunk},
                 state::{FlashGeometry, StatePlan, StateSlot, WORD_STEP_PARAMS},
                 step_plan::{Site, Slot, StepOptions, StepPlan},
             },
@@ -524,5 +525,56 @@ impl MoeBlock for AllResidentMoe<'_> {
                 .ok_or_else(|| refuse(format!("layer {layer} has no key for {role:?}")))
         })?;
         run_exl3_moe(launch, &weights, bufs, dims, true)
+    }
+}
+
+/// The trunk weights of `layer`'s MoE block that the split block needs, borrowed from the uploaded
+/// set: the router, the shared-expert gate row and the three shared-expert matrices.
+pub(super) fn split_trunk(
+    weights: &CudaWeights,
+    layer: usize,
+) -> Result<SplitMoeTrunk<'_>, EngError> {
+    let at = |suffix: &str| layer_name(layer, suffix);
+    let raw = |name: String| match weights.get(&name) {
+        Some(CudaWeight::Raw {
+            ty: GgufType::F32,
+            buffer,
+            ..
+        }) => Ok(buffer),
+        _ => Err(refuse(format!("{name} is not an uploaded F32 tensor"))),
+    };
+    let matrix = |name: String| match weights.get(&name) {
+        Some(CudaWeight::Exl3 { weight, .. }) => Ok(weight),
+        _ => Err(refuse(format!("{name} is not an uploaded EXL3 matrix"))),
+    };
+    Ok(SplitMoeTrunk {
+        router: raw(at("mlp.gate.weight"))?,
+        router_shared: raw(at("mlp.shared_expert_gate.weight"))?,
+        shared_gate: matrix(at("mlp.shared_expert.gate_proj"))?,
+        shared_up: matrix(at("mlp.shared_expert.up_proj"))?,
+        shared_down: matrix(at("mlp.shared_expert.down_proj"))?,
+    })
+}
+
+/// The split block as the step's MoE block. `first_layer` is the model layer of the bank's row 0:
+/// a bank over a window of layers is indexed from its own first row, a bank over the whole model
+/// from 0.
+pub(super) struct SplitMoeAt<'w> {
+    pub(super) inner: SplitMoe<'w>,
+    pub(super) first_layer: usize,
+}
+
+impl MoeBlock for SplitMoeAt<'_> {
+    fn run(
+        &mut self,
+        launch: &Launch<'_>,
+        layer: usize,
+        bufs: &Exl3MoeBufs<'_>,
+        dims: &MoeDims,
+    ) -> Result<(), EngError> {
+        let row = layer
+            .checked_sub(self.first_layer)
+            .ok_or_else(|| refuse(format!("layer {layer} is before the bank's first layer")))?;
+        self.inner.run(launch, row, bufs, dims)
     }
 }

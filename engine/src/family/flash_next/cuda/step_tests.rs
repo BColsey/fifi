@@ -20,12 +20,18 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use super::{
+    bank::{
+        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
+        ReplaceOnMissLru, device::DeviceBank,
+    },
+    bank_source::PackRecordSource,
     load::{
         TrunkList,
         upload::{layer_weights, root_weights},
     },
+    moe_block::SplitMoe,
     state::StateSlot,
-    step::{AllResidentMoe, FlashStep, MIXER, bank_key},
+    step::{AllResidentMoe, FlashStep, MIXER, MoeBlock, SplitMoeAt, bank_key, split_trunk},
     step_plan::{Site, Slot},
 };
 use crate::{
@@ -433,7 +439,7 @@ fn device_weights(
     projector: &CudaProjector,
     checkpoint: &Checkpoint,
     layers: &[usize],
-    with_head: bool,
+    (with_head, with_banks): (bool, bool),
 ) -> CudaWeights {
     let list = TrunkList::new(&checkpoint.source, &checkpoint.model_config).expect("trunk list");
     let reader = PackReader::new(projector, checkpoint, Reserve::default());
@@ -445,7 +451,7 @@ fn device_weights(
     }
     for &layer in layers {
         all.extend(layer_weights(&reader, &list, layer).expect("the layer's trunk"));
-        for part in ExpertPart::ALL {
+        for part in ExpertPart::ALL.into_iter().filter(|_| with_banks) {
             let bank = projector
                 .upload_exl3_bank(experts, Reserve::default(), |expert| {
                     let name = expert_name_in(Root::Layers, layer, expert, part);
@@ -502,7 +508,119 @@ fn input(width: usize, hidden: usize, token: usize) -> Vec<f32> {
 /// a missing term, a wrong head order or a wrong cache row moves a block by 1e-2 or more.
 const BLOCK_BOUND: f64 = 1.5e-3;
 
-fn run_window(layers: &[usize]) {
+/// The MoE block a run uses.
+#[derive(Clone, Copy, Debug)]
+enum MoeKind {
+    /// Qwen3.6's block over routed experts that are all resident (three banks per layer).
+    Resident,
+    /// The split block over a bank of `slots` slots per layer, held experts `0..slots` at the start.
+    Split { slots: usize },
+}
+
+/// Bank layer `i` holds pack layer `layers[i]`.
+struct WindowRecords<'a, 'b> {
+    inner: &'b PackRecordSource<'a>,
+    layers: Vec<usize>,
+}
+
+impl RecordSource for WindowRecords<'_, '_> {
+    fn record(&self, layer: usize, expert: u16, out: &mut [u8]) -> Result<(), EngError> {
+        self.inner.record(self.layers[layer], expert, out)
+    }
+}
+
+enum Block<'w> {
+    Resident(AllResidentMoe<'w>),
+    Split(Box<SplitMoeAt<'w>>),
+}
+
+impl Block<'_> {
+    fn as_block(&mut self) -> &mut dyn MoeBlock {
+        match self {
+            Self::Resident(block) => block,
+            Self::Split(block) => block.as_mut(),
+        }
+    }
+
+    /// Misses the bank has served so far (0 for the resident block).
+    fn misses(&self) -> u64 {
+        match self {
+            Self::Resident(_) => 0,
+            Self::Split(block) => block.inner.bank().state().stats().misses,
+        }
+    }
+}
+
+/// The split block over a bank of `slots` slots for each of `layers`.
+fn split_block<'w>(
+    projector: &CudaProjector,
+    checkpoint: &Checkpoint,
+    weights: &'w CudaWeights,
+    layers: &[usize],
+    slots: usize,
+    dims: &crate::family::qwen36::cuda::moe::MoeDims,
+) -> SplitMoeAt<'w> {
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let record = source.layout().record_bytes();
+    let geometry = BankGeometry::new(layers.len(), dims.n_expert, dims.top_k, slots, record)
+        .expect("geometry");
+    let held: Vec<i32> = (0..dims.n_expert as i32)
+        .map(|expert| {
+            if (expert as usize) < slots {
+                expert
+            } else {
+                -1
+            }
+        })
+        .collect();
+    let rows: Vec<Vec<i32>> = layers.iter().map(|_| held.clone()).collect();
+    let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
+    let counts: Vec<Vec<u64>> = layers
+        .iter()
+        .map(|_| (0..dims.n_expert as u64).rev().collect())
+        .collect();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts).expect("the fill");
+    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).expect("state");
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &HostMemory {
+            total: 62 << 30,
+            available: 55 << 30,
+        },
+        &HostTerms::DEFAULT,
+    )
+    .expect("the host plan");
+    let bank = DeviceBank::build(
+        projector.context(),
+        state,
+        &WindowRecords {
+            inner: &source,
+            layers: layers.to_vec(),
+        },
+        &plan,
+    )
+    .expect("build the bank");
+    let trunks = layers
+        .iter()
+        .map(|&layer| split_trunk(weights, layer).expect("the trunk of the split block"))
+        .collect();
+    SplitMoeAt {
+        inner: SplitMoe::new(projector.context(), trunks, bank, source.layout(), dims)
+            .expect("the split block"),
+        first_layer: layers[0],
+    }
+}
+
+/// What a run leaves for comparison with another run: per token, the MoE output and the stream of
+/// the last layer, and the bank's misses over the token (all layers).
+struct RunOut {
+    moe_out: Vec<Vec<f32>>,
+    streams: Vec<Vec<f32>>,
+    misses: Vec<u64>,
+}
+
+fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
     assert!(
         device_present("Flash-Next layer parity"),
         "a GPU is required"
@@ -513,7 +631,12 @@ fn run_window(layers: &[usize]) {
     let ctx = projector.context();
     let stream: DeviceStream = ctx.stream().expect("stream");
     let with_head = std::env::var_os("FIFI_FLASH_NEXT_STEP_HEAD").is_some();
-    let weights = device_weights(&projector, &checkpoint, layers, with_head);
+    let weights = device_weights(
+        &projector,
+        &checkpoint,
+        layers,
+        (with_head, matches!(kind, MoeKind::Resident)),
+    );
     let first = *layers.first().expect("a layer");
     let end = layers.last().expect("a layer") + 1;
     let step = FlashStep::new(
@@ -553,10 +676,27 @@ fn run_window(layers: &[usize]) {
         )
     });
     let (words, words_at) = step.words_buffer().expect("words");
-    let mut moe = AllResidentMoe { weights: &weights };
+    let mut block = match kind {
+        MoeKind::Resident => Block::Resident(AllResidentMoe { weights: &weights }),
+        MoeKind::Split { slots } => Block::Split(Box::new(split_block(
+            &projector,
+            &checkpoint,
+            &weights,
+            layers,
+            slots,
+            &step.moe_dims(),
+        ))),
+    };
+    let mut out = RunOut {
+        moe_out: Vec::new(),
+        streams: Vec::new(),
+        misses: Vec::new(),
+    };
 
     for token in 0..TOKENS {
         let mut host_stream = input(width, hidden, token);
+        let misses_start = block.misses();
+        let mut last = (Vec::new(), Vec::new());
         let stream_range = step.slot(Slot::Stream).expect("stream");
         step.begin_token().expect("begin");
         let params = crate::kernels::cuda::resident::step_params::StepParams::new(1, token as i32)
@@ -600,7 +740,7 @@ fn run_window(layers: &[usize]) {
             let mixed_mlp = step
                 .read_f32(step.slot(Slot::Mixed(Site::Mlp)).unwrap(), hidden)
                 .expect("mixed");
-            step.moe_block(layer, &mut moe).expect("moe");
+            step.moe_block(layer, block.as_block()).expect("moe");
             let moe_out = step
                 .read_f32(step.slot(Slot::BlockOut(Site::Mlp)).unwrap(), hidden)
                 .expect("moe out");
@@ -646,8 +786,12 @@ fn run_window(layers: &[usize]) {
             }
             // The next layer reads the host stream the device holds: keep them in step, so one
             // layer's error does not compound into the next layer's comparison.
+            last = (moe_out.clone(), device_stream.clone());
             host_stream = device_stream;
         }
+        out.moe_out.push(last.0);
+        out.streams.push(last.1);
+        out.misses.push(block.misses() - misses_start);
         if let Some((norm, down, up, lm_head)) = &host_head {
             step.head().expect("the head");
             let vocab = step.geometry.vocab;
@@ -742,10 +886,52 @@ fn run_window(layers: &[usize]) {
             "layer {layer}: conv ring {ring_error:.3e}"
         );
     }
+    out
 }
 
 #[test]
 #[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
 fn the_device_layers_match_the_host_reference_on_the_real_pack() {
-    run_window(&window());
+    run_window(&window(), MoeKind::Resident);
+}
+
+#[test]
+#[ignore = "needs a GPU, --test-threads=1 and the full pack in FIFI_FLASH_NEXT_EXL3_PACK (6 GiB)"]
+fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
+    let layers = window();
+    let resident = run_window(&layers, MoeKind::Resident);
+    // (a) A bank that holds every expert: no miss, one pass.
+    let full = run_window(&layers, MoeKind::Split { slots: 512 });
+    assert!(
+        full.misses.iter().all(|&m| m == 0),
+        "misses {:?}",
+        full.misses
+    );
+    let mut worst = 0.0f64;
+    for token in 0..TOKENS {
+        let moe = relative_l2(&full.moe_out[token], &resident.moe_out[token]);
+        let stream = relative_l2(&full.streams[token], &resident.streams[token]);
+        let bits_equal = full.moe_out[token]
+            .iter()
+            .zip(&resident.moe_out[token])
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        println!(
+            "512 slots, token {token}: moe out against the resident block rel {moe:.2e} max {:.2e}, \
+             stream rel {stream:.2e}, bit for bit: {bits_equal}",
+            max_abs(&full.moe_out[token], &resident.moe_out[token])
+        );
+        worst = worst.max(moe).max(stream);
+    }
+    assert!(
+        worst <= 1e-5,
+        "the 512-slot split block differs from the resident block by {worst:.3e}"
+    );
+    // (b) A small bank: the picks miss at every token, and the bank state carries across tokens.
+    let small = run_window(&layers, MoeKind::Split { slots: 32 });
+    println!("32 slots: misses per token {:?}", small.misses);
+    assert!(
+        small.misses.iter().all(|&m| m > 0),
+        "a 32-slot bank must miss at every token: {:?}",
+        small.misses
+    );
 }
