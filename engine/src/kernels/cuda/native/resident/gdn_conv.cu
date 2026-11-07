@@ -95,7 +95,7 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
 #endif
     static_assert(R >= 3, "a CTA row after the first must find its window in proj");
     const int c = blockIdx.x * kBlock + threadIdx.x;
-    if (c >= n) return;
+    if (mutant == 21 ? c > n : c >= n) return;
     const int t0 = blockIdx.y * R;
     const int rows = min(R, m - t0);
     float x[R + 3];
@@ -108,7 +108,8 @@ conv_silu_rows_k(const float *__restrict__ proj, int ld, int m, int n,
     }
 #pragma unroll
     for (int j = 0; j < R; ++j) {
-        if (j < rows) x[3 + j] = proj[(size_t)(t0 + j) * ld + c];
+        // A dead row (j >= rows) leaves x[3 + j] unset: the compute loop below skips it, so it is never read.
+        if (j < rows + (mutant == 19 ? 1 : 0)) x[3 + j] = proj[(size_t)(t0 + j) * ld + c];
     }
     const float4 wc = w[c];
 #pragma unroll
@@ -230,7 +231,7 @@ extern "C" int inference_cuda_gdn_conv_rows_launch(const inference_cuda_gdn_conv
 std::atomic<int> g_gdn_mutant{0};
 
 extern "C" int inference_cuda_gdn_mutant_select(int id) {
-    if (id < 0 || id > 11) {
+    if (id < 0 || id > 23) {
         return INFERENCE_CUDA_INVALID_ARGUMENT;
     }
     g_gdn_mutant.store(id, std::memory_order_relaxed);

@@ -54,6 +54,7 @@ mod context;
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 mod fault;
 mod gdn_mutants;
+mod gdn_switch;
 #[cfg(all(test, feature = "cuda-fault-qualification"))]
 pub(crate) use fault::{
     assert_child_finishes as assert_cuda_fault_child_finishes, test_inject_unmapped_fault,

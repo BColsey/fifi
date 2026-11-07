@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6617,
-      "ignored": 574,
+      "test_fns": 6625,
+      "ignored": 576,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -208,6 +208,7 @@
         "FMT_TIERED",
         "FUSED_AB_ARM",
         "GAP_TRIM_FREEZE",
+        "GDN_MUTANT_ID",
         "GEMMA4_BANDWIDTH_PROBE",
         "GEMMA4_CONTEXT_TOKENS",
         "GEMMA4_PROBE_K",

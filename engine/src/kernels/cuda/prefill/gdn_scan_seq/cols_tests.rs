@@ -6,7 +6,10 @@
 
 use std::ffi::OsStr;
 
-use super::{GdnForm, GdnScanSeqCall, ScanShape, ScanWeights, parse_scan_cols, scan_bytes};
+use super::{
+    GdnForm, GdnScanSeqCall, SCAN_MIN_ROWS, ScanShape, ScanWeights, parse_scan_cols, scan_bytes,
+    scan_cols_for,
+};
 use crate::EngError;
 use crate::kernels::cuda::gdn_mutants::quick;
 use crate::kernels::cuda::testkit::{self, Rng};
@@ -14,6 +17,8 @@ use crate::kernels::cuda::{CudaContext, DeviceStream};
 
 const D: usize = 128;
 const WIDTHS: [usize; 3] = [8, 16, 32];
+/// Bytes of sentinel after the `o_out` rows: a kernel that stores past its rows changes them.
+const TAIL_BYTES: usize = 2048;
 
 #[test]
 fn the_scan_columns_value_is_strict() {
@@ -29,10 +34,21 @@ fn the_scan_columns_value_is_strict() {
         );
     }
     for other in [
-        "", "0", "1", "4", "7", "64", "128", "016", "+16", "16.0", "on", "1", "-8",
+        "", "0", "1", "4", "7", "64", "128", "016", "+16", "16.0", "on", "-8",
     ] {
         assert_eq!(parse_scan_cols(Some(OsStr::new(other))), None, "{other:?}");
     }
+}
+
+#[test]
+fn only_a_long_scan_under_a_set_switch_takes_the_narrow_block_kernel() {
+    assert_eq!(SCAN_MIN_ROWS, 64);
+    assert_eq!(scan_cols_for(None, 4096), None, "switch unset");
+    assert_eq!(scan_cols_for(Some(16), 1), None, "a single-token step");
+    assert_eq!(scan_cols_for(Some(16), SCAN_MIN_ROWS - 1), None);
+    assert_eq!(scan_cols_for(Some(16), SCAN_MIN_ROWS), Some(16));
+    assert_eq!(scan_cols_for(Some(8), 1024), Some(8));
+    assert_eq!(scan_cols_for(Some(32), 2051), Some(32));
 }
 
 struct Rig {
@@ -142,7 +158,7 @@ fn try_pieces(rig: &Rig, c: &Case, pieces: &[(usize, Option<usize>)]) -> Result<
     let nw = testkit::upload_f32(ctx, &c.norm_w);
     let state = testkit::upload_f32(ctx, &c.state0);
     let out_bytes = c.m * c.n_v * D * 4;
-    let o_out = testkit::upload_filled(ctx, 0xa7, out_bytes);
+    let o_out = testkit::upload_filled(ctx, 0xa7, out_bytes + TAIL_BYTES);
     let mut row0 = 0;
     for &(rows, cols) in pieces {
         let shape = ScanShape {
@@ -177,8 +193,14 @@ fn try_pieces(rig: &Rig, c: &Case, pieces: &[(usize, Option<usize>)]) -> Result<
         row0 += rows;
     }
     rig.stream.synchronize().expect("drain");
+    let mut rows_and_tail = testkit::read_bytes(ctx, &o_out, out_bytes + TAIL_BYTES);
+    let tail = rows_and_tail.split_off(out_bytes);
+    assert!(
+        tail.iter().all(|b| *b == 0xa7),
+        "{pieces:?}: the o_out tail changed"
+    );
     Ok(Run {
-        o_out: testkit::read_bytes(ctx, &o_out, out_bytes),
+        o_out: rows_and_tail,
         state: testkit::read_bytes(ctx, &state, c.n_v * D * D * 4),
         conv_after: testkit::read_bytes(ctx, &conv, c.conv.len() * 4),
         proj_after: testkit::read_bytes(ctx, &proj, c.proj.len() * 4),
@@ -320,6 +342,80 @@ fn pieces_carry_the_state_across_launches_and_across_kernels() {
 }
 
 #[test]
+fn the_switch_routes_only_long_scans_to_the_narrow_block_kernel() {
+    if !testkit::device_present("scan cols routing") {
+        return;
+    }
+    let rig = Rig::new();
+    for (setting, m, on_cols) in [
+        (None, 300usize, false),
+        (Some(16), 1, false),
+        (Some(16), 8, false),
+        (Some(16), SCAN_MIN_ROWS - 1, false),
+        (Some(16), SCAN_MIN_ROWS, true),
+        (Some(8), 70, true),
+        (Some(32), 300, true),
+    ] {
+        let c = case(2, 4, m, GdnForm::QWEN36_GGUF, 0x5c06_0000 + m as u64);
+        let before = super::COLS_CALLS.with(std::cell::Cell::get);
+        let call_pieces = |setting: Option<usize>| {
+            let ctx = &rig.ctx;
+            let conv = testkit::upload_f32(ctx, &c.conv);
+            let proj = testkit::upload_f32(ctx, &c.proj);
+            let a = testkit::upload_f32(ctx, &c.a);
+            let dt = testkit::upload_f32(ctx, &c.dt_bias);
+            let nw = testkit::upload_f32(ctx, &c.norm_w);
+            let state = testkit::upload_f32(ctx, &c.state0);
+            let o_out = testkit::upload_filled(ctx, 0xa7, m * c.n_v * D * 4);
+            let shape = ScanShape {
+                m,
+                p0: 0,
+                ctx_tokens: m + 8,
+                n_k_heads: c.n_k,
+                n_v_heads: c.n_v,
+                head_dim: D,
+                conv_ld: c.conv_ld(),
+                ld: c.ld(),
+                z_off: 0,
+                beta_off: c.beta_off(),
+                alpha_off: c.alpha_off(),
+            };
+            let need = scan_bytes(shape).expect("sizes");
+            let call = GdnScanSeqCall {
+                shape,
+                eps: super::GDN_SCAN_EPS,
+                conv: conv.range(0, need.conv).unwrap(),
+                proj: proj.range(0, need.proj).unwrap(),
+                weights: ScanWeights {
+                    a: a.range(0, need.a).unwrap(),
+                    dt_bias: dt.range(0, need.dt_bias).unwrap(),
+                    norm_w: nw.range(0, need.norm_w).unwrap(),
+                },
+                state: state.range(0, need.state).unwrap(),
+                o_out: o_out.range(0, need.o_out).unwrap(),
+                status: None,
+            };
+            ctx.gdn_scan_seq_with(&rig.stream, call, c.form, setting)
+                .expect("launch");
+            rig.stream.synchronize().expect("drain");
+            (
+                testkit::read_bytes(ctx, &o_out, need.o_out),
+                testkit::read_bytes(ctx, &state, need.state),
+            )
+        };
+        let got = call_pieces(setting);
+        let ran = super::COLS_CALLS.with(std::cell::Cell::get) - before;
+        assert_eq!(ran, usize::from(on_cols), "setting {setting:?} m {m}");
+        let want = run_pieces(&rig, &c, &[(m, None)]);
+        assert_eq!(
+            (got.0, got.1),
+            (want.o_out, want.state),
+            "setting {setting:?} m {m}"
+        );
+    }
+}
+
+#[test]
 fn the_narrow_block_wrapper_refuses_a_width_it_does_not_have() {
     if !testkit::device_present("scan cols wrapper refusals") {
         return;
@@ -392,7 +488,9 @@ fn scan_cols_kernel_timing() {
             let need = scan_bytes(shape).expect("sizes");
             let mut times = vec![Vec::new(); kernels.len()];
             for round in 0..WARM + ROUNDS {
-                for (slot, &cols) in kernels.iter().enumerate() {
+                for step in 0..kernels.len() {
+                    let slot = (step + round) % kernels.len();
+                    let cols = kernels[slot];
                     let started = std::time::Instant::now();
                     for state in &states {
                         let call = GdnScanSeqCall {
@@ -440,6 +538,9 @@ fn scan_cols_kernel_timing() {
 mod mutants {
     use super::*;
     use crate::kernels::cuda::gdn_mutants::{self as gm, select};
+    use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
+        GdnScanSeqRaw, gdn_scan_seq_cols_bad_bounds,
+    };
 
     /// The mutant `id` must make `body` panic.
     fn killed(id: u32, name: &str, body: fn()) {
@@ -455,8 +556,11 @@ mod mutants {
     fn mutant_control_without_a_mutant_passes_the_short_lists() {
         let _selected = select(0);
         the_scan_columns_value_is_strict();
+        only_a_long_scan_under_a_set_switch_takes_the_narrow_block_kernel();
         the_narrow_block_scan_writes_the_bytes_of_the_original();
         pieces_carry_the_state_across_launches_and_across_kernels();
+        the_narrow_block_kernel_guards_a_bad_bound_at_every_width();
+        the_switch_routes_only_long_scans_to_the_narrow_block_kernel();
     }
 
     #[test]
@@ -511,6 +615,110 @@ mod mutants {
             "state store dropped",
             pieces_carry_the_state_across_launches_and_across_kernels,
         );
+    }
+
+    #[test]
+    fn mutant_scan_threshold_one_is_killed() {
+        killed(
+            gm::SCAN_MIN_ONE,
+            "threshold one",
+            only_a_long_scan_under_a_set_switch_takes_the_narrow_block_kernel,
+        );
+    }
+
+    #[test]
+    fn mutant_scan_bound_guard_disabled_is_killed() {
+        killed(
+            23,
+            "bound guard disabled",
+            the_narrow_block_kernel_guards_a_bad_bound_at_every_width,
+        );
+    }
+
+    /// The cols kernel's own bound-violation branch, at every width (the fault-qualification entry
+    /// reaches only the original kernel). A refused launch loads no state, NaNs every o_out element and
+    /// ORs mask 8 into the status word.
+    #[test]
+    fn the_narrow_block_kernel_guards_a_bad_bound_at_every_width() {
+        if !testkit::device_present("scan cols bound violation") {
+            return;
+        }
+        let rig = Rig::new();
+        let ctx = &rig.ctx;
+        let c = case(2, 4, 4, GdnForm::QWEN36_GGUF, 0x5c07_0001);
+        let shape = ScanShape {
+            m: c.m,
+            p0: 0,
+            ctx_tokens: 1024,
+            n_k_heads: c.n_k,
+            n_v_heads: c.n_v,
+            head_dim: D,
+            conv_ld: c.conv_ld(),
+            ld: c.ld(),
+            z_off: 0,
+            beta_off: c.beta_off(),
+            alpha_off: c.alpha_off(),
+        };
+        let need = scan_bytes(shape).expect("sizes");
+        for cols in WIDTHS {
+            let conv = testkit::upload_f32(ctx, &c.conv);
+            let proj = testkit::upload_f32(ctx, &c.proj);
+            let a = testkit::upload_f32(ctx, &c.a);
+            let dt = testkit::upload_f32(ctx, &c.dt_bias);
+            let nw = testkit::upload_f32(ctx, &c.norm_w);
+            let state = testkit::upload_f32(ctx, &c.state0);
+            let o_out = testkit::upload_filled(ctx, 0xff, need.o_out);
+            let status = testkit::upload_f32(ctx, &[0.0]);
+            let io = GdnScanSeqRaw {
+                conv: ctx.raw_range(&conv.range(0, need.conv).unwrap()).unwrap(),
+                proj: ctx.raw_range(&proj.range(0, need.proj).unwrap()).unwrap(),
+                a: ctx.raw_range(&a.range(0, need.a).unwrap()).unwrap(),
+                dt_bias: ctx.raw_range(&dt.range(0, need.dt_bias).unwrap()).unwrap(),
+                norm_w: ctx.raw_range(&nw.range(0, need.norm_w).unwrap()).unwrap(),
+                state: ctx.raw_range(&state.range(0, need.state).unwrap()).unwrap(),
+                o_out: ctx.raw_range(&o_out.range(0, need.o_out).unwrap()).unwrap(),
+                status: Some(ctx.raw_range(&status.range(0, 4).unwrap()).unwrap()),
+                ints: super::super::scan_ints(&shape).expect("ints"),
+                eps: super::super::GDN_SCAN_EPS,
+                form: 0,
+            };
+            ctx.launch_on(&rig.stream, |raw| {
+                gdn_scan_seq_cols_bad_bounds(raw, io, cols)
+            })
+            .expect("the guard launch");
+            rig.stream.synchronize().expect("drain");
+            let out = testkit::floats(&testkit::read_bytes(ctx, &o_out, need.o_out));
+            assert!(
+                out.iter().all(|v| v.is_nan()),
+                "width {cols}: a refused launch must NaN every o_out element"
+            );
+            assert_eq!(
+                testkit::read_bytes(ctx, &state, need.state),
+                float_bytes(&c.state0),
+                "width {cols}: a refused launch must not touch the state"
+            );
+            let word = testkit::read_bytes(ctx, &status, 4);
+            assert_eq!(
+                i32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                crate::kernels::cuda::PREFILL_STATUS_BOUND_VIOLATION,
+                "width {cols}: mask 8 of the prefill status word"
+            );
+        }
+    }
+
+    /// For the sanitizer runs: selects the mutant named by `GDN_MUTANT_ID` and runs the byte tests plainly
+    /// (no catch_unwind), so `compute-sanitizer --error-exitcode` reports what memcheck, racecheck or
+    /// synccheck see. A mutant the byte tests cannot see (19, 20) is killed by the sanitizer's exit code.
+    #[test]
+    #[ignore = "sanitizer runs only: set GDN_MUTANT_ID"]
+    fn mutant_from_the_environment_runs_the_byte_tests() {
+        let id: u32 = std::env::var("GDN_MUTANT_ID")
+            .expect("GDN_MUTANT_ID")
+            .parse()
+            .expect("a mutant id");
+        let _selected = select(id);
+        the_narrow_block_scan_writes_the_bytes_of_the_original();
+        pieces_carry_the_state_across_launches_and_across_kernels();
     }
 
     #[test]

@@ -13,7 +13,11 @@
  *          8 v staged for the first slot of a warp only          9 grid z uses 32 columns per block
  *          10 sk sum combined in another order                   11 width 16: head 0 state stored as zero
  *   Rust (kernels/cuda/gdn_mutants.rs only): 12 conv routing ignored   13 conv threshold 1   14 conv "1" selects 16
- *          15 conv value not trimmed   16 conv accepts "8"   17 scan accepts "4"   18 scan value not trimmed. */
+ *          15 conv value not trimmed   16 conv accepts "8"   17 scan accepts "4"   18 scan value not trimmed
+ *          22 scan threshold 1
+ *   More kernel mutants: 19 conv loads one row past the tile (same bytes; only memcheck sees it)
+ *          20 scan: second barrier of a tile removed (a race; racecheck and synccheck see it)
+ *          21 conv: channel guard c > n instead of c >= n   23 scan: the bound-violation guard disabled. */
 #ifndef INFERENCE_CUDA_RESIDENT_GDN_MUTANTS_H
 #define INFERENCE_CUDA_RESIDENT_GDN_MUTANTS_H
 

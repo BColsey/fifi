@@ -9,7 +9,8 @@
 // the blocks share nothing (their state and o_out columns are disjoint), so a multi-wave
 // launch is still correct (one wave on the 3090; sm_72/sm_89 run multi-wave). fp32 SIMT
 // only: no MMA, no fp16, so the same source compiles unchanged for sm_72. Contract:
-// prefill/gdn_scan_seq.h.
+// prefill/gdn_scan_seq.h. gdn_scan_seq_cols_k further down is the same scan with a block width of
+// 8, 16 or 32 value columns (the launch above is its 32-column case); the per-column arithmetic is shared.
 #include "prefill/gdn_scan_seq.h"
 
 #include <cuda_runtime.h>
@@ -143,7 +144,7 @@ bool valid(const inference_cuda_gdn_scan_seq_args &a, void *stream) {
     return bounds_ok(a);
 }
 
-#ifdef INFERENCE_CUDA_FAULT_QUALIFICATION
+#if defined(INFERENCE_CUDA_FAULT_QUALIFICATION) || defined(INFERENCE_CUDA_GDN_MUTANTS)
 /* valid() with `p0` replaced: the one field the sans-bounds check below must not depend
  * on. `p0` 0 passes the bound whenever m <= ctx_tokens, which every call that reaches the
  * fault entry satisfies (a real p0 in range implies it). */
@@ -480,7 +481,7 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
     const int g = lane & 7, cg = lane >> 3;
     const int col = blockIdx.z * (mutant == 6 ? 32 : kCols) + w * 4 + cg;
     float *st = a.state + (size_t)h * D * D;
-    if ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens) {
+    if (mutant != 23 && ((long long)a.p0 < 0 || (long long)a.p0 + a.m > a.ctx_tokens)) {
         if (a.status && blockIdx.x == 0 && blockIdx.z == 0 && threadIdx.x == 0 &&
             threadIdx.y == 0) {
             atomicOr(a.status, INFERENCE_CUDA_PREFILL_STATUS_BOUND_VIOLATION);
@@ -600,7 +601,7 @@ __global__ void __launch_bounds__(kLanes * kW, kTile / kW) gdn_scan_seq_cols_k(S
             const float o = group_sum((oacc[0] + oacc[1]) + (oacc[2] + oacc[3]));
             if (g == 0) a.o_out[((size_t)(t0 + j) * a.n_v_heads + h) * D + col] = o;
         }
-        __syncthreads();
+        if (mutant != 20) __syncthreads();
     }
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -746,6 +747,30 @@ extern "C" int inference_cuda_gdn_scan_seq_fault_bad_bounds_launch(
         ScanArgs k = to_args(args);
         k.p0 = k.ctx_tokens;  // ctx_tokens + m > ctx_tokens: the violation, p0 still an int
         const Failure failure = launch_scan(k, args->form, 0, stream);
+        report_stage(out_stage, failure.stage);
+        return (int)failure.err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+#endif
+
+#ifdef INFERENCE_CUDA_GDN_MUTANTS
+/* The bound-violation launch of gdn_scan_seq_cols_k for the mutation tests: every rule of the entry holds except the
+ * p0 bound, which is violated by force after validation, so the kernel's own device re-check is the code under test
+ * (NaN rows, mask 8, no state load). The same shape as the fault-qualification entry of the original kernel, with a
+ * block width. */
+extern "C" int inference_cuda_gdn_scan_seq_cols_bad_bounds_launch(
+    const inference_cuda_gdn_scan_seq_args *args, void *stream, int *out_stage, int block_cols) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (args == NULL || !valid_sans_bounds(*args, stream) ||
+            (block_cols != 8 && block_cols != 16 && block_cols != 32)) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        ScanArgs k = to_args(args);
+        k.p0 = k.ctx_tokens;
+        const Failure failure = launch_scan(k, args->form, block_cols, stream);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {

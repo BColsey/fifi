@@ -129,6 +129,12 @@ fn inputs(channels: usize, ld: usize, m: usize, seed: u64) -> Inputs {
         let at = pick.below(state0.len() as u64) as usize;
         state0[at] = SPECIALS[pick.below(SPECIALS.len() as u64) as usize];
     }
+    // A few special tap weights as well: zeros of both signs, an infinity, a subnormal.
+    let mut w = w;
+    for special in [0.0f32, -0.0, f32::INFINITY, 1.0e-40] {
+        let at = pick.below(w.len() as u64) as usize;
+        w[at] = special;
+    }
     Inputs {
         channels,
         ld,
@@ -517,7 +523,9 @@ fn conv_prefill_kernel_timing() {
             let out = testkit::upload_filled(ctx, SENTINEL, m * channels * 4);
             let mut times = vec![Vec::new(); variants.len()];
             for round in 0..WARM + ROUNDS {
-                for (slot, &kernel) in variants.iter().enumerate() {
+                for step in 0..variants.len() {
+                    let slot = (step + round) % variants.len();
+                    let kernel = variants[slot];
                     let started = std::time::Instant::now();
                     for state in &states {
                         let call = piece_call(&inp, (&proj, &w, state, &out), 0, m);
@@ -573,6 +581,7 @@ mod mutants {
         the_switch_value_is_strict();
         only_a_long_launch_under_a_set_switch_takes_the_prefill_kernel();
         the_prefill_kernel_writes_the_bytes_of_the_original();
+        the_prefill_kernel_handles_channel_counts_off_the_block_size();
         pieces_carry_the_window_across_launches_and_across_kernels();
         the_switch_routes_only_long_launches_to_the_prefill_kernel();
     }
@@ -620,6 +629,30 @@ mod mutants {
             "last row not stored",
             the_prefill_kernel_writes_the_bytes_of_the_original,
         );
+    }
+
+    #[test]
+    fn mutant_conv_channel_guard_off_by_one_is_killed() {
+        killed(
+            21,
+            "channel guard c > n",
+            the_prefill_kernel_handles_channel_counts_off_the_block_size,
+        );
+    }
+
+    /// For the sanitizer runs: selects the mutant named by `GDN_MUTANT_ID` and runs the byte tests plainly
+    /// (no catch_unwind), so `compute-sanitizer --error-exitcode` reports what memcheck sees. A mutant the byte
+    /// tests cannot see (19, a load one row past the tile) is killed by the sanitizer's exit code.
+    #[test]
+    #[ignore = "sanitizer runs only: set GDN_MUTANT_ID"]
+    fn mutant_from_the_environment_runs_the_byte_tests() {
+        let id: u32 = std::env::var("GDN_MUTANT_ID")
+            .expect("GDN_MUTANT_ID")
+            .parse()
+            .expect("a mutant id");
+        let _selected = select(id);
+        the_prefill_kernel_writes_the_bytes_of_the_original();
+        the_prefill_kernel_handles_channel_counts_off_the_block_size();
     }
 
     #[test]

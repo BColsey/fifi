@@ -146,11 +146,15 @@ pub(crate) fn parse_prefill_setting(value: Option<&OsStr>) -> Option<usize> {
     }
 }
 
-/// The setting of this process, read once: restart to change.
+/// The setting of this process, read once: restart to change. The first read logs what was parsed.
 fn prefill_setting() -> Option<usize> {
     static SETTING: OnceLock<Option<usize>> = OnceLock::new();
-    *SETTING
-        .get_or_init(|| parse_prefill_setting(std::env::var_os("FIFI_GDN_CONV_PREFILL").as_deref()))
+    *SETTING.get_or_init(|| {
+        let raw = std::env::var_os("FIFI_GDN_CONV_PREFILL");
+        let parsed = parse_prefill_setting(raw.as_deref());
+        crate::kernels::cuda::gdn_switch::note("FIFI_GDN_CONV_PREFILL", raw.as_deref(), parsed);
+        parsed
+    })
 }
 
 /// Rows per thread of the prefill kernel for a launch of `m` rows under `setting`, or `None` for

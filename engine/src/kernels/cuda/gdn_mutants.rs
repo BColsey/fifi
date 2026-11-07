@@ -3,8 +3,8 @@
 //! [`mutated`] answers whether the mutant `id` is the active one. Without the `cuda-gdn-mutants`
 //! feature it is the constant `false`, so the branches that ask it compile away and a build without
 //! the feature contains no mutant. With the feature a test selects one mutant at a time with [`select`]
-//! (ids 1 to 11 reach the kernels through `native/resident/gdn_mutants.h`; ids 12 to 18 are Rust-side
-//! branches of the switch code) and the mutation tests check that the byte-identity tests notice it.
+//! (ids 1 to 11, 19 to 21 and 23 reach the kernels through `native/resident/gdn_mutants.h`; ids 12 to 18
+//! and 22 are Rust-side branches of the switch code) and the mutation tests check that the byte-identity tests notice it.
 //! The ids are listed in the header.
 
 /// The conv launch ignores the switch and always runs the vendored kernel.
@@ -21,6 +21,8 @@ pub(crate) const CONV_ACCEPTS_EIGHT: u32 = 16;
 pub(crate) const SCAN_ACCEPTS_FOUR: u32 = 17;
 /// The scan switch value is not trimmed.
 pub(crate) const SCAN_NO_TRIM: u32 = 18;
+/// The scan threshold is one row.
+pub(crate) const SCAN_MIN_ONE: u32 = 22;
 
 #[cfg(not(feature = "cuda-gdn-mutants"))]
 pub(crate) const fn mutated(_id: u32) -> bool {
@@ -79,7 +81,11 @@ mod active {
     #[cfg(test)]
     fn set(id: u32) {
         ACTIVE.store(id, Ordering::Relaxed);
-        let kernel_id = if id <= 11 { id } else { 0 };
+        let kernel_id = if matches!(id, 1..=11 | 19..=21 | 23) {
+            id
+        } else {
+            0
+        };
         assert!(
             select_gdn_mutant(kernel_id),
             "the native mutant selector refused {kernel_id}"

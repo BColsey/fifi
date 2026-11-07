@@ -101,6 +101,17 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+#[cfg(all(test, feature = "cuda-gdn-mutants"))]
+unsafe extern "C" {
+    #[link_name = "inference_cuda_gdn_scan_seq_cols_bad_bounds_launch"]
+    fn gdn_scan_seq_cols_bad_bounds_raw(
+        args: *const GdnScanSeqArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+        block_cols: c_int,
+    ) -> c_int;
+}
+
 /// Value columns per block that `gdn_scan_seq_cols_k` is instantiated for (`gdn_scan_seq.h`).
 pub(in crate::kernels::cuda) const GDN_SCAN_BLOCK_COLS: [usize; 3] = [8, 16, 32];
 
@@ -316,6 +327,30 @@ pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_launch(
     // is a live writable `c_int` and `stream` is live for the call.
     let status = unsafe {
         gdn_scan_seq_cols_launch_raw(&args, stream.as_ptr(), &mut stage, block_cols as c_int)
+    };
+    checked(status, stage)
+}
+
+/// The launch of `gdn_scan_seq_cols_k` with a deliberately violated p0 bound, so its own device re-check
+/// (no state load, NaN rows, mask 8) is the code under test; every other rule of the call holds.
+/// Mutation-test build only.
+#[cfg(all(test, feature = "cuda-gdn-mutants"))]
+pub(in crate::kernels::cuda) fn gdn_scan_seq_cols_bad_bounds(
+    stream: &RawStream,
+    io: GdnScanSeqRaw<'_>,
+    block_cols: usize,
+) -> Result<(), DeviceFailure> {
+    check_scan(&io)?;
+    if !GDN_SCAN_BLOCK_COLS.contains(&block_cols) {
+        return Err(invalid_argument());
+    }
+    let mut args = c_args(&io);
+    args.p0 = io.ints.ctx_tokens; // ctx_tokens + m > ctx_tokens: the violation
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `gdn_scan_seq_cols_launch`; the guard refuses before any state access and its NaN
+    // writes stay inside the proved `o_out` range.
+    let status = unsafe {
+        gdn_scan_seq_cols_bad_bounds_raw(&args, stream.as_ptr(), &mut stage, block_cols as c_int)
     };
     checked(status, stage)
 }

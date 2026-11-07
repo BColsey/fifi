@@ -38,7 +38,7 @@ use crate::EngError;
 use crate::kernels::cuda::context::{
     Claim, CudaContext, DeviceRange, DeviceStream, require_apart, require_fit,
 };
-use crate::kernels::cuda::gdn_mutants::{SCAN_ACCEPTS_FOUR, SCAN_NO_TRIM, mutated};
+use crate::kernels::cuda::gdn_mutants::{SCAN_ACCEPTS_FOUR, SCAN_MIN_ONE, SCAN_NO_TRIM, mutated};
 use crate::kernels::cuda::native::prefill::gdn_scan_seq::{
     FORM_ADD_EPS_L2, FORM_GROUPED_HEADS, FORM_SIGMOID_GATE, GDN_SCAN_BLOCK_COLS, GdnScanSeqInts,
     GdnScanSeqRaw, gdn_scan_seq_cols_launch, gdn_scan_seq_launch,
@@ -447,10 +447,37 @@ pub(crate) fn parse_scan_cols(value: Option<&OsStr>) -> Option<usize> {
     }
 }
 
-/// The setting of this process, read once: restart to change.
+/// Fewest rows of a scan launch that the switch sends to the narrow-block kernel. Below it (the
+/// Flash-Next single-token step, a short last chunk) the original kernel runs: more, smaller blocks
+/// re-read the q/k rows of a head once per block, which a few rows cannot amortise.
+pub(crate) const SCAN_MIN_ROWS: usize = 64;
+
+/// Block width for a scan launch of `m` rows under `setting`, or `None` for the original kernel.
+pub(crate) fn scan_cols_for(setting: Option<usize>, m: usize) -> Option<usize> {
+    let min = if mutated(SCAN_MIN_ONE) {
+        1
+    } else {
+        SCAN_MIN_ROWS
+    };
+    setting.filter(|_| m >= min)
+}
+
+/// The setting of this process, read once: restart to change. The first read logs what was parsed, so a
+/// misspelt value is visible in the server log instead of silently running the original kernel.
 fn scan_cols_setting() -> Option<usize> {
     static SETTING: OnceLock<Option<usize>> = OnceLock::new();
-    *SETTING.get_or_init(|| parse_scan_cols(std::env::var_os("FIFI_GDN_SCAN_COLS").as_deref()))
+    *SETTING.get_or_init(|| {
+        let raw = std::env::var_os("FIFI_GDN_SCAN_COLS");
+        let parsed = parse_scan_cols(raw.as_deref());
+        crate::kernels::cuda::gdn_switch::note("FIFI_GDN_SCAN_COLS", raw.as_deref(), parsed);
+        parsed
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Narrow-block scan launches this thread has queued: lets a test see which kernel a call chose.
+    static COLS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl CudaContext {
@@ -477,14 +504,27 @@ impl CudaContext {
     /// `state`/`o_out`/status overlap.
     ///
     /// `FIFI_GDN_SCAN_COLS` (see [`parse_scan_cols`]) selects the scan kernel with narrower
-    /// blocks; unset, the original kernel runs. Both write the same bytes.
+    /// blocks for launches of at least [`SCAN_MIN_ROWS`] rows; every other launch, and every launch
+    /// by default, runs the original kernel. Both write the same bytes.
     pub(crate) fn gdn_scan_seq_form(
         &self,
         stream: &DeviceStream,
         call: GdnScanSeqCall<'_>,
         form: GdnForm,
     ) -> Result<(), EngError> {
-        self.gdn_scan_seq_cols(stream, call, form, scan_cols_setting())
+        self.gdn_scan_seq_with(stream, call, form, scan_cols_setting())
+    }
+
+    /// [`Self::gdn_scan_seq_form`] under an explicit switch value (the parsed `FIFI_GDN_SCAN_COLS`).
+    fn gdn_scan_seq_with(
+        &self,
+        stream: &DeviceStream,
+        call: GdnScanSeqCall<'_>,
+        form: GdnForm,
+        setting: Option<usize>,
+    ) -> Result<(), EngError> {
+        let cols = scan_cols_for(setting, call.shape.m);
+        self.gdn_scan_seq_cols(stream, call, form, cols)
     }
 
     /// [`Self::gdn_scan_seq_form`] with an explicit kernel: `None` is the original
@@ -538,6 +578,10 @@ impl CudaContext {
             eps,
             form,
         };
+        #[cfg(test)]
+        if cols.is_some() {
+            COLS_CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
         self.launch_on(stream, move |raw| match cols {
             Some(cols) => gdn_scan_seq_cols_launch(raw, io, cols),
             None => gdn_scan_seq_launch(raw, io),
