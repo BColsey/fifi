@@ -390,3 +390,4 @@ mod graph_bench;
 mod projection_bench;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod residency_bench;
+mod tier_plan;
