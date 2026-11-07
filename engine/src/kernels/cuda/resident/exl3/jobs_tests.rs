@@ -429,9 +429,6 @@ fn permutation(rng: &mut testkit::Rng, len: usize) -> Vec<u32> {
     list
 }
 
-/// One job-table call through the explicit fused-output entry (or the plain one when
-/// `fused_out` is false); `z` is canary-filled before the launch and returned raw, so the
-/// caller can see whether the fused epilogue left it untouched.
 /// One job-table call through the explicit fused-output entry with the request `fused_out`
 /// (both legs of the byte-identity test go through it, so its false arm is exercised too);
 /// `z` is canary-filled before the launch and returned raw, so the caller can see whether the
