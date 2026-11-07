@@ -1258,7 +1258,7 @@ fn q8_tf_gate_teacher_forced_leg() {
         "resolved KV storage disagrees with the arm"
     );
     let load_started = Instant::now();
-    let (mut engine, mut session) = FlintExecutor::open(
+    let (mut engine, mut session) = FlintExecutor::open_token_major(
         &root,
         &options,
         bundle.eos_token_ids().to_vec(),

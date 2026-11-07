@@ -38,6 +38,7 @@ mod cuda_sample;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) mod exl3_resident;
 pub(crate) mod factory;
+pub(crate) mod prefill_order;
 pub(crate) mod settings;
 // Staged CUDA source views; the mixed-residency entry has no serving caller yet.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]

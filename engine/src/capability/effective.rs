@@ -300,19 +300,46 @@ pub(crate) fn flint_effective(
         request,
         switch(env.expert_slots.is_some()),
     ));
-    let layer_major = env.layer_major().map_or_else(
-        |error| format!("refused: {error:?}"),
-        |major| match major {
-            LayerMajor::Off => "off".to_owned(),
-            LayerMajor::Tiles => "tiles (1)".to_owned(),
-            LayerMajor::Jobs => "jobs".to_owned(),
-        },
-    );
+    // The prefill order resolves the way the executor open resolves it: the job-table pass with the
+    // hi/lo split by default on the f16 profile, the operator's words over that.
+    let cpu_moe = crate::family::flint::budget::CpuMoeConfig::new(
+        options.cpu_moe_offload_layers,
+        options.cpu_moe_split_experts,
+        options.cpu_moe_threads,
+    )
+    .unwrap_or_default();
+    let (layer_major, hilo) = match env.prefill_order(options, &cpu_moe) {
+        Ok(order) => {
+            let name = match order.mode {
+                LayerMajor::Off => "off (token-major)",
+                LayerMajor::Tiles => "tiles (1)",
+                LayerMajor::Jobs => "jobs",
+            };
+            let source = if order.defaulted {
+                "default"
+            } else {
+                "explicit"
+            };
+            let hilo = if order.hilo {
+                "on".to_owned()
+            } else if order.hilo_inactive {
+                "inactive (needs the jobs pass)".to_owned()
+            } else {
+                "off".to_owned()
+            };
+            (
+                format!("{name} ({source}: {})", order.why),
+                (hilo, order.hilo_defaulted),
+            )
+        }
+        Err(error) => (format!("refused: {error:?}"), ("refused".to_owned(), false)),
+    };
     rows.push(row(
         "layer_major",
         layer_major,
         switch(env.layer_major.is_some()),
     ));
+    rows.push(row("tall_hilo", hilo.0, switch(!hilo.1)));
     rows.push(row(
         "alloc_cache",
         if env.alloc_cache_enabled() {
@@ -360,6 +387,12 @@ mod tests {
         let context = rows.iter().find(|r| r.key == "context_limit").unwrap();
         assert_eq!(context.value, "131072");
         assert_eq!(origin(&rows, "kv_profile"), Origin::Default);
+        // The default prefill order of a Flint load: the job-table pass with the hi/lo split, from the defaults.
+        assert_eq!(origin(&rows, "layer_major"), Origin::Default);
+        let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
+        assert!(major.value.starts_with("jobs (default"), "{}", major.value);
+        assert_eq!(origin(&rows, "tall_hilo"), Origin::Default);
+        assert!(rows.iter().any(|r| r.key == "tall_hilo" && r.value == "on"));
         // The alloc cache is default-on; the row says so without a var set.
         assert_eq!(origin(&rows, "alloc_cache"), Origin::Default);
         assert!(
@@ -383,7 +416,7 @@ mod tests {
         assert_eq!(slots.value, "exactly 226");
         assert_eq!(origin(&rows, "layer_major"), Origin::Environment);
         let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
-        assert_eq!(major.value, "jobs");
+        assert!(major.value.starts_with("jobs (explicit"), "{}", major.value);
 
         // A refused switch value renders as the refusal, not a setting.
         let env = FlintEnv {
@@ -393,6 +426,44 @@ mod tests {
         let rows = super::flint_effective(&FlintOptions::cuda_default(), &env);
         let major = rows.iter().find(|r| r.key == "layer_major").unwrap();
         assert!(major.value.starts_with("refused:"), "{}", major.value);
+    }
+
+    /// The Flint prefill order and its hi/lo split are Flint settings: a Qwen3.6 load reports neither,
+    /// and no Qwen3.6 source reads the two switches.
+    #[test]
+    fn a_qwen36_load_has_no_flint_prefill_order() {
+        let options = Q36Options::default();
+        let settings = resolve(&options, Backend::Mlx);
+        let rows = q36_effective(&options, None, Backend::Mlx, &settings);
+        for key in ["layer_major", "tall_hilo"] {
+            assert!(rows.iter().all(|r| r.key != key), "{key} is a Flint row");
+        }
+        let qwen = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/family/qwen36");
+        let mut stack = vec![qwen];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    seen += 1;
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for needle in [
+                        "FIFI_EXL3_TALL_HILO",
+                        "FIFI_EXL3_LAYER_MAJOR",
+                        "TALL_HILO_VAR",
+                    ] {
+                        assert!(
+                            !source.contains(needle),
+                            "{} reads {needle}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(seen > 10, "the Qwen3.6 sources were not found");
     }
 
     #[test]

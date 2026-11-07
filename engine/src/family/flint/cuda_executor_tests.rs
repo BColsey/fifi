@@ -219,7 +219,7 @@ fn real_executor_at_context(
     // [0u8; 32] is a fixture template identity: parks only need
     // consistency within a test.
     let (executor, initial) =
-        FlintExecutor::open(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
+        FlintExecutor::open_token_major(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
     assert_eq!(executor.ctx.alloc_cache_enabled(), arm == "1");
     assert_eq!(executor.prefill_chunk_size, 8);
     drop(initial);
@@ -1113,7 +1113,7 @@ fn cache_single_state(
         "context_limit": context, "kv_profile": "f16", "prefill_chunk_size": 8,
     }))
     .unwrap();
-    let (executor, session) = FlintExecutor::open(
+    let (executor, session) = FlintExecutor::open_token_major(
         &root,
         &options,
         bundle.eos_token_ids().to_vec(),
@@ -1270,7 +1270,7 @@ fn context_2048_same_pack_bitwise_golden() {
         .unwrap();
         // Sequential opens charge the actual production plan and keep only one State live.
         let (mut executor, mut session) =
-            FlintExecutor::open(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
+            FlintExecutor::open_token_major(&root, &options, vec![2], VOCAB, [0u8; 32]).unwrap();
         assert_eq!(session.state.test_late_health_enabled(), late_health);
         let before = test_counts();
         let heads = test_head_reads();
@@ -2019,7 +2019,7 @@ fn control_q8_interim_prompt_generation() {
     }))
     .unwrap();
     let root = PathBuf::from(std::env::var_os("FLINT_EXL3_PACK").unwrap());
-    let (mut executor, mut session) = FlintExecutor::open(
+    let (mut executor, mut session) = FlintExecutor::open_token_major(
         &root,
         &options,
         bundle.eos_token_ids().to_vec(),

@@ -277,7 +277,7 @@ fn trace_real_exl3_routes() -> Result<()> {
         assets.insert(name.to_owned(), file_hash(&root.join(name))?.into());
     }
     let elf_hash = file_hash(&std::env::current_exe().map_err(bad)?)?;
-    let (mut executor, mut session) = FlintExecutor::open(
+    let (mut executor, mut session) = FlintExecutor::open_token_major(
         &root,
         &options,
         bundle.eos_token_ids().to_vec(),

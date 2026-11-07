@@ -46,6 +46,10 @@ pub(crate) struct CudaPrefixEnv {
     /// on different matrix kernels, so the planes a snapshot holds are only valid for a
     /// session in the same mode.
     pub(crate) layer_major: crate::family::flint::settings::LayerMajor,
+    /// The hi/lo split of the activations of the tall projections of the jobs pass (`FIFI_EXL3_TALL_HILO`, on by default
+    /// with the jobs pass): the K/V it writes differ from the F16 cast's, so a snapshot is only valid for a session in the
+    /// same state.
+    pub(crate) tall_hilo: bool,
 }
 
 /// The numeric-path fingerprint a stored CUDA prefix binds: context limit,

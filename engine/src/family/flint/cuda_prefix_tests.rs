@@ -50,6 +50,7 @@ fn a_cuda_path_binds_every_flag_it_reads() {
             exl3_legacy: false,
             expert_cache: false,
             layer_major: LayerMajor::Off,
+            tall_hilo: false,
         }
     }
     // One selector flip per arm, including the three bound by the respin
@@ -63,6 +64,7 @@ fn a_cuda_path_binds_every_flag_it_reads() {
             "expert_cache" => next.expert_cache = !next.expert_cache,
             "layer_major" => next.layer_major = LayerMajor::Tiles,
             "layer_jobs" => next.layer_major = LayerMajor::Jobs,
+            "tall_hilo" => next.tall_hilo = !next.tall_hilo,
             _ => unreachable!("a bound selector"),
         }
         next
@@ -74,6 +76,7 @@ fn a_cuda_path_binds_every_flag_it_reads() {
         "expert_cache",
         "layer_major",
         "layer_jobs",
+        "tall_hilo",
     ] {
         assert_ne!(
             CudaPrefixPath::from_values(Path::new("/model"), 4096, 8, "f16", off.clone()),
@@ -110,6 +113,58 @@ fn a_cuda_path_binds_every_flag_it_reads() {
     assert_ne!(
         base,
         CudaPrefixPath::from_values(Path::new("/other-model"), 4096, 8, "f16", env(false, false))
+    );
+}
+
+/// The fingerprint binds the walk the open resolved, not the raw switch: an unset switch that
+/// resolves to the job-table pass differs from `off`, and an unset switch that falls back to the
+/// token-major walk equals `off`, so a prefix saved under one walk never restores under the other.
+/// The executor builds its environment with `prefix_env_for` (pinned in cuda_executor.rs tests).
+#[test]
+fn the_fingerprint_binds_the_resolved_walk_not_the_raw_switch() {
+    use crate::family::flint::cpu_moe::CpuMoeConfig;
+    use crate::family::flint::prefill_order::{OrderInputs, resolve_prefill_order};
+    use crate::family::flint::settings::{FlintOptions, layer_major_from_env};
+    use std::ffi::OsStr;
+
+    let path_with = |mode: LayerMajor, hilo: bool| {
+        CudaPrefixPath::from_values(
+            Path::new("/model"),
+            4096,
+            8,
+            "f16",
+            super::cuda_executor::prefix_env_for(mode, hilo),
+        )
+    };
+    let path = |mode: LayerMajor| path_with(mode, false);
+    let none = CpuMoeConfig::new(0, 0, 0).unwrap();
+    let some = CpuMoeConfig::new(2, 0, 0).unwrap();
+    let options = FlintOptions::cuda_default();
+    let resolve = |switch: Option<&str>, cpu: &CpuMoeConfig| {
+        let selected = layer_major_from_env(switch.map(OsStr::new)).unwrap();
+        resolve_prefill_order(
+            selected,
+            None,
+            &OrderInputs::for_options(&options, cpu, true, true),
+        )
+        .unwrap()
+        .mode
+    };
+    let off = resolve(Some("off"), &none);
+    let default_jobs = resolve(None, &none);
+    let fallback = resolve(None, &some);
+    assert_eq!(default_jobs, LayerMajor::Jobs);
+    assert_ne!(path(default_jobs), path(off), "default jobs against off");
+    assert_eq!(
+        path(fallback),
+        path(off),
+        "a fallback is the token-major walk"
+    );
+    assert_eq!(path(default_jobs), path(resolve(Some("jobs"), &none)));
+    assert_ne!(
+        path_with(LayerMajor::Jobs, true),
+        path_with(LayerMajor::Jobs, false),
+        "a prefix saved under the hi/lo split never restores under the F16 cast"
     );
 }
 

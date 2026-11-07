@@ -450,7 +450,8 @@ fn open_control(case: &Case, arm: &str, root: &Path) -> Checked<(FlintExecutor, 
         cpu_moe_threads: 0,
     };
     let (executor, session) =
-        FlintExecutor::open(root, &options, vec![2], VOCAB, [0u8; 32]).map_err(engine_error)?;
+        FlintExecutor::open_token_major(root, &options, vec![2], VOCAB, [0u8; 32])
+            .map_err(engine_error)?;
     require(
         executor.prefill_chunk_size == rows as usize
             && executor.context_limit == case.context_capacity

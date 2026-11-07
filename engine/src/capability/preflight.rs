@@ -1226,10 +1226,23 @@ fn flint_estimate(
         },
         PlanDecision {
             name: "layer_major".to_string(),
-            chosen: match env.layer_major()? {
-                crate::family::flint::budget::LayerMajor::Off => "off (default)".to_string(),
-                crate::family::flint::budget::LayerMajor::Tiles => "tiles".to_string(),
-                crate::family::flint::budget::LayerMajor::Jobs => "jobs".to_string(),
+            chosen: {
+                let order = env.prefill_order(options, &cpu)?;
+                let name = match order.mode {
+                    crate::family::flint::budget::LayerMajor::Off => "off (token-major)",
+                    crate::family::flint::budget::LayerMajor::Tiles => "tiles",
+                    crate::family::flint::budget::LayerMajor::Jobs => "jobs",
+                };
+                format!(
+                    "{name} ({}: {}){}",
+                    if order.defaulted {
+                        "default"
+                    } else {
+                        "explicit"
+                    },
+                    order.why,
+                    if order.hilo { ", hi/lo split on" } else { "" }
+                )
             },
             alternatives: Vec::new(),
             fixed_at: PlanFixity::Start,

@@ -98,7 +98,8 @@ pub(super) fn pack_fingerprint(root: &Path) -> Result<[u8; 32], EngError> {
 /// encoding depends on beside the profile — the KV profile string, the
 /// prefill numeric path (steps vs chunked and the chunk size, taken
 /// from the engine's configuration), the serialized row-block size, the
-/// context limit, and the layer-major selection. Every field is
+/// context limit, and the layer-major walk (0 token-major, 1 tiles, 2 jobs; the
+/// three are different numeric paths). Every field is
 /// length-prefixed. A change in any input means a park built under the
 /// old configuration can never restore.
 pub(super) fn cache_config_hash(
@@ -107,7 +108,7 @@ pub(super) fn cache_config_hash(
     chunk_size: u32,
     row_block: usize,
     context_limit: u32,
-    layer_major: bool,
+    layer_major: u8,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     // Domain tag: hashes from different constructions can never collide.
@@ -120,7 +121,7 @@ pub(super) fn cache_config_hash(
         &u64::try_from(row_block).unwrap_or(u64::MAX).to_le_bytes(),
     );
     field(&mut hasher, &context_limit.to_le_bytes());
-    field(&mut hasher, &[u8::from(layer_major)]);
+    field(&mut hasher, &[layer_major]);
     hasher.finalize().into()
 }
 
@@ -135,7 +136,7 @@ pub(super) fn park_identity(
     chunk_size: u32,
     row_block: usize,
     context_limit: u32,
-    layer_major: bool,
+    layer_major: u8,
 ) -> Result<ParkIdentity, EngError> {
     let profile = match kv_profile {
         "f16" => ParkProfile::F16,
@@ -211,35 +212,39 @@ mod tests {
 
     #[test]
     fn cache_config_hash_is_stable_and_senses_every_input() {
-        let base = cache_config_hash("f16", false, 0, 8, 131_072, false);
-        assert_eq!(cache_config_hash("f16", false, 0, 8, 131_072, false), base);
-        assert_ne!(cache_config_hash("q8", false, 0, 8, 131_072, false), base);
-        assert_ne!(cache_config_hash("f16", true, 0, 8, 131_072, false), base);
-        assert_ne!(cache_config_hash("f16", true, 512, 8, 131_072, false), base);
-        assert_ne!(cache_config_hash("f16", false, 0, 16, 131_072, false), base);
-        assert_ne!(cache_config_hash("f16", false, 0, 8, 8_192, false), base);
-        assert_ne!(cache_config_hash("f16", false, 0, 8, 131_072, true), base);
+        let base = cache_config_hash("f16", false, 0, 8, 131_072, 0);
+        assert_eq!(cache_config_hash("f16", false, 0, 8, 131_072, 0), base);
+        assert_ne!(cache_config_hash("q8", false, 0, 8, 131_072, 0), base);
+        assert_ne!(cache_config_hash("f16", true, 0, 8, 131_072, 0), base);
+        assert_ne!(cache_config_hash("f16", true, 512, 8, 131_072, 0), base);
+        assert_ne!(cache_config_hash("f16", false, 0, 16, 131_072, 0), base);
+        assert_ne!(cache_config_hash("f16", false, 0, 8, 8_192, 0), base);
+        assert_ne!(cache_config_hash("f16", false, 0, 8, 131_072, 2), base);
+        assert_ne!(
+            cache_config_hash("f16", false, 0, 8, 131_072, 1),
+            cache_config_hash("f16", false, 0, 8, 131_072, 2)
+        );
     }
 
     #[test]
     fn park_identity_derives_the_profile_from_the_kv_string() {
         let guard = tmp_pack("identity");
         let pack = &guard.0;
-        let id = park_identity(pack, [7; 32], "f16", true, 512, 8, 131_072, false).unwrap();
+        let id = park_identity(pack, [7; 32], "f16", true, 512, 8, 131_072, 0).unwrap();
         assert_eq!(id.model, pack_fingerprint(pack).unwrap());
         assert_eq!(id.template, [7; 32]);
         assert_eq!(
             id.cache_config,
-            cache_config_hash("f16", true, 512, 8, 131_072, false)
+            cache_config_hash("f16", true, 512, 8, 131_072, 0)
         );
         assert_eq!(id.format, PARK_FORMAT_VERSION);
         assert!(matches!(id.profile, ParkProfile::F16));
         assert!(matches!(
-            park_identity(pack, [7; 32], "q8", true, 512, 8, 131_072, false)
+            park_identity(pack, [7; 32], "q8", true, 512, 8, 131_072, 0)
                 .unwrap()
                 .profile,
             ParkProfile::Q8
         ));
-        assert!(park_identity(pack, [7; 32], "fp8", true, 512, 8, 131_072, false).is_err());
+        assert!(park_identity(pack, [7; 32], "fp8", true, 512, 8, 131_072, 0).is_err());
     }
 }

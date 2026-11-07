@@ -265,7 +265,7 @@ impl Plan {
             cpu_moe_threads: 0,
         };
         let vocab = bundle.vocab_size() as usize;
-        FlintExecutor::open(
+        FlintExecutor::open_token_major(
             &self.root,
             &options,
             vec![never_chosen_eos(vocab)],
@@ -309,10 +309,7 @@ fn scorer_identity(engine: &FlintExecutor) -> ExecutionIdentity {
 /// return, which changes when a freed block may be reused, not what a kernel computes.
 fn effective_profile(engine: &FlintExecutor) -> BTreeMap<String, String> {
     let options = &engine.options;
-    let numeric_env = CudaPrefixEnv {
-        layer_major: engine.layer_mode,
-        ..frozen_prefix_env()
-    };
+    let numeric_env = prefix_env_for(engine.layer_mode, engine.tall_hilo);
     let switches = [
         resolved_switch_suffix(
             packed_pointwise_enabled(),

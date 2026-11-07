@@ -462,21 +462,46 @@ pub(crate) enum LayerMajor {
 }
 
 /// FIFI_EXL3_LAYER_MAJOR, strict-parse switch for the layer-major prefill
-/// mode. Unset is OFF (byte-identical walk to today); `1` selects the tile
-/// pass and `jobs` the job-table pass; every other value — including a
-/// non-UTF-8 one — is an error at executor open, never a silent fallback,
-/// mirroring `prefill_window_from_env`'s strictness rule for opt-in knobs.
+/// mode. `off` selects the token-major walk (the rollback), `1` the tile pass and `jobs` the
+/// job-table pass; unset returns `None` and the engine picks its default (the job-table pass on
+/// the `f16` profile, see `prefill_order`). Every other value, including an empty or a
+/// non-UTF-8 one, is an error at executor open, never a silent fallback, mirroring
+/// `prefill_window_from_env`'s strictness rule.
 pub(crate) fn layer_major_from_env(
     value: Option<&std::ffi::OsStr>,
-) -> Result<LayerMajor, EngError> {
+) -> Result<Option<LayerMajor>, EngError> {
     let Some(value) = value else {
-        return Ok(LayerMajor::Off);
+        return Ok(None);
     };
     match value.to_str().map(str::trim) {
-        Some("1") => Ok(LayerMajor::Tiles),
-        Some("jobs") => Ok(LayerMajor::Jobs),
+        Some("off") => Ok(Some(LayerMajor::Off)),
+        Some("1") => Ok(Some(LayerMajor::Tiles)),
+        Some("jobs") => Ok(Some(LayerMajor::Jobs)),
         _ => Err(EngError::BadRequest(
-            "FIFI_EXL3_LAYER_MAJOR must be unset, \"1\" or \"jobs\"".into(),
+            "FIFI_EXL3_LAYER_MAJOR must be unset, \"jobs\", \"1\" or \"off\"".into(),
+        )),
+    }
+}
+
+/// The switch of the hi/lo split of the tall projections of the jobs pass.
+pub(crate) const TALL_HILO_VAR: &str = "FIFI_EXL3_TALL_HILO";
+
+/// FIFI_EXL3_TALL_HILO, strict: unset leaves the choice to the engine (the split is on whenever
+/// the jobs pass is active); `0` keeps the F16 cast of the tall projection inputs (the rollback
+/// of the split alone); `1` asks for the split (it has no effect without the jobs pass).
+/// Surrounding spaces are ignored; every other value, including an empty or non-UTF-8 one, is
+/// an error at executor open.
+pub(crate) fn tall_hilo_from_env(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<bool>, EngError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.to_str().map(str::trim) {
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        _ => Err(EngError::BadRequest(
+            "FIFI_EXL3_TALL_HILO must be unset, \"0\" or \"1\"".into(),
         )),
     }
 }
@@ -511,6 +536,7 @@ pub(crate) struct FlintEnv {
     pub(crate) expert_cache: Option<String>,
     pub(crate) expert_slots: Option<String>,
     pub(crate) layer_major: Option<std::ffi::OsString>,
+    pub(crate) tall_hilo: Option<std::ffi::OsString>,
     pub(crate) alloc_cache: Option<String>,
 }
 
@@ -537,6 +563,7 @@ impl FlintEnv {
             expert_cache: read(CACHE_VAR),
             expert_slots: read(SLOTS_VAR),
             layer_major: std::env::var_os("FIFI_EXL3_LAYER_MAJOR"),
+            tall_hilo: std::env::var_os(TALL_HILO_VAR),
             alloc_cache: read(ALLOC_CACHE_VAR),
         }
     }
@@ -551,9 +578,35 @@ impl FlintEnv {
         BankRequest::from_value(self.expert_slots.as_deref())
     }
 
-    /// The resolved layer-major pass, default `off`.
-    pub(crate) fn layer_major(&self) -> Result<LayerMajor, EngError> {
+    /// The layer-major pass the operator selected, `None` when the variable is unset.
+    pub(crate) fn layer_major(&self) -> Result<Option<LayerMajor>, EngError> {
         layer_major_from_env(self.layer_major.as_deref())
+    }
+
+    /// The hi/lo selection the operator made, `None` when the variable is unset.
+    pub(crate) fn tall_hilo(&self) -> Result<Option<bool>, EngError> {
+        tall_hilo_from_env(self.tall_hilo.as_deref())
+    }
+
+    /// The prefill order a load with these options and this environment resolves to: the same
+    /// pure decision the executor open takes. The static admission of the jobs reserve is taken
+    /// as met here (a diagnostic has no device); an open that does not fit retries on the
+    /// token-major walk.
+    pub(crate) fn prefill_order(
+        &self,
+        options: &crate::family::flint::settings::FlintOptions,
+        cpu_moe: &CpuMoeConfig,
+    ) -> Result<crate::family::flint::prefill_order::PrefillOrder, EngError> {
+        crate::family::flint::prefill_order::resolve_prefill_order(
+            self.layer_major()?,
+            self.tall_hilo()?,
+            &crate::family::flint::prefill_order::OrderInputs::for_options(
+                options,
+                cpu_moe,
+                self.alloc_cache_enabled(),
+                true,
+            ),
+        )
     }
 
     /// Whether the allocation cache is armed (unset keeps it on; only
@@ -750,15 +803,18 @@ mod tests {
     fn layer_major_parses_strictly() {
         use std::ffi::OsStr;
 
-        assert_eq!(layer_major_from_env(None).unwrap(), LayerMajor::Off);
-        assert_eq!(
-            layer_major_from_env(Some(OsStr::new("1"))).unwrap(),
-            LayerMajor::Tiles
-        );
-        assert_eq!(
-            layer_major_from_env(Some(OsStr::new("jobs"))).unwrap(),
-            LayerMajor::Jobs
-        );
+        // Unset is no choice: the engine picks its default.
+        assert_eq!(layer_major_from_env(None).unwrap(), None);
+        for (word, mode) in [
+            ("off", LayerMajor::Off),
+            ("1", LayerMajor::Tiles),
+            ("jobs", LayerMajor::Jobs),
+        ] {
+            assert_eq!(
+                layer_major_from_env(Some(OsStr::new(word))).unwrap(),
+                Some(mode)
+            );
+        }
         assert!(layer_major_from_env(Some(OsStr::new("2"))).is_err());
         assert!(layer_major_from_env(Some(OsStr::new(" true "))).is_err());
         // A set-but-empty or non-UTF-8 value is a refusal, exactly as at
@@ -772,12 +828,80 @@ mod tests {
     }
 
     #[test]
+    fn tall_hilo_parses_strictly_and_unset_leaves_the_choice_to_the_engine() {
+        use std::ffi::OsStr;
+
+        assert_eq!(tall_hilo_from_env(None).unwrap(), None);
+        for (value, want) in [
+            ("0", false),
+            (" 0 ", false),
+            ("1", true),
+            (" 1\n", true),
+            ("\u{2003}1", true),
+        ] {
+            assert_eq!(
+                tall_hilo_from_env(Some(OsStr::new(value))).unwrap(),
+                Some(want),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "", " ", "on", "true", "yes", "2", "01", "+1", "off", "hilo", "1.0", "-1",
+        ] {
+            assert!(
+                tall_hilo_from_env(Some(OsStr::new(value))).is_err(),
+                "{value:?} must be refused"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(tall_hilo_from_env(Some(OsStr::from_bytes(b"\xff"))).is_err());
+        }
+    }
+
+    #[test]
     fn flint_env_resolves_the_default_plan() {
         let env = FlintEnv::default();
         assert_eq!(env.expert_cache_mode().unwrap(), ExpertCacheMode::Auto);
         assert_eq!(env.bank_request().unwrap(), BankRequest::Fit);
-        assert_eq!(env.layer_major().unwrap(), LayerMajor::Off);
+        assert_eq!(env.layer_major().unwrap(), None);
+        assert_eq!(env.tall_hilo().unwrap(), None);
         assert!(env.alloc_cache_enabled());
+        // The default prefill order of a Flint load: the job-table pass with the hi/lo split.
+        let options = crate::family::flint::settings::FlintOptions::cuda_default();
+        let order = env
+            .prefill_order(&options, &CpuMoeConfig::default())
+            .unwrap();
+        assert_eq!((order.mode, order.hilo), (LayerMajor::Jobs, true));
+        // The rollbacks.
+        let off = FlintEnv {
+            layer_major: Some("off".into()),
+            ..FlintEnv::default()
+        };
+        assert_eq!(
+            off.prefill_order(&options, &CpuMoeConfig::default())
+                .unwrap()
+                .mode,
+            LayerMajor::Off
+        );
+        let cast = FlintEnv {
+            tall_hilo: Some("0".into()),
+            ..FlintEnv::default()
+        };
+        let cast = cast
+            .prefill_order(&options, &CpuMoeConfig::default())
+            .unwrap();
+        assert_eq!((cast.mode, cast.hilo), (LayerMajor::Jobs, false));
+        // A bad value is a refusal.
+        let bad = FlintEnv {
+            tall_hilo: Some("on".into()),
+            ..FlintEnv::default()
+        };
+        assert!(
+            bad.prefill_order(&options, &CpuMoeConfig::default())
+                .is_err()
+        );
     }
 
     #[test]

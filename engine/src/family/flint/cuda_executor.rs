@@ -1,5 +1,8 @@
 //! Single-session CUDA adapter. The shared session owns generation and publication.
 
+use super::prefill_order::{
+    OrderInputs, open_with_default_fallback, prefill_order_name, resolve_prefill_order,
+};
 use super::{
     budget::{
         ALLOC_CACHE_VAR, FLINT_HEADROOM_BYTES, MODEL_CONTEXT_LIMIT, bank_note,
@@ -67,8 +70,19 @@ fn frozen_prefix_env() -> CudaPrefixEnv {
         expert_cache: FlintExl3Resident::cache_forced_on(),
         // Each executor binds its own mode in `prefix_path`.
         layer_major: LayerMajor::Off,
+        tall_hilo: false,
     })
     .clone()
+}
+
+/// The numeric-path identity of an engine that opened with `mode`: the frozen selectors with the
+/// executor's own walk. A prefix saved under one walk never restores under another.
+pub(super) fn prefix_env_for(mode: LayerMajor, tall_hilo: bool) -> CudaPrefixEnv {
+    CudaPrefixEnv {
+        layer_major: mode,
+        tall_hilo,
+        ..frozen_prefix_env()
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +132,8 @@ pub(super) struct FlintExecutor {
     layer_major: Option<usize>,
     /// The layer-major pass the engine runs (`Off` keeps the token-major walk).
     layer_mode: LayerMajor,
+    /// The tall projections of the jobs pass split their activations (hi/lo), as resolved at open.
+    tall_hilo: bool,
     bank_tally: BankTally,
     root: std::path::PathBuf,
     options: FlintOptions,
@@ -366,17 +382,18 @@ fn resident_advice(
     }
     let fits = largest.map_or_else(
         || String::from("no context fits that way"),
-        |tokens| format!("the largest context that fits that way is {tokens} tokens with the {profile} profile, not counting the staging of FIFI_EXL3_LAYER_MAJOR"),
+        |tokens| format!("the largest context that fits that way is {tokens} tokens with the {profile} profile, not counting the staging of the job-table prefill, which FIFI_EXL3_LAYER_MAJOR=off removes"),
     );
     Some(if forced_off {
         format!(
             "FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU, and {fits}. Unset the \
-             variable to keep part of the experts in host memory, or lower context_limit"
+             variable to keep part of the experts in host memory, lower context_limit, or set \
+             FIFI_EXL3_LAYER_MAJOR=off"
         )
     } else {
         format!(
             "Without the host buffer, with every expert on the GPU, {fits}. Lower context_limit \
-             to that, or free host memory"
+             to that, free host memory, or set FIFI_EXL3_LAYER_MAJOR=off"
         )
     })
 }
@@ -471,45 +488,55 @@ fn layer_major_staging_charge(piece_rows: usize, jobs: bool) -> Result<u64> {
         .ok_or_else(|| EngError::MemoryPlan("Flint layer-major staging overflows".into()))
 }
 
-/// CPU experts read the pinned host store token by token; neither layer-major pass stages their
-/// layers, so the two are refused together before any device work starts. The text names the
-/// switch and the options that conflict.
-fn cpu_experts_allow(cpu_moe: &CpuMoeConfig, mode: LayerMajor) -> Result<()> {
-    if cpu_moe.enabled() && mode != LayerMajor::Off {
-        return Err(EngError::BadRequest(
-            "FIFI_EXL3_LAYER_MAJOR (1 or jobs) cannot be combined with Flint CPU experts \
-             (cpu_moe_offload_layers, cpu_moe_split_experts); unset it or turn the CPU experts off"
-                .into(),
-        ));
-    }
-    Ok(())
+/// Whether the jobs pass's reserve fits the working ceiling for these options: the admission the
+/// open runs for an explicit `jobs`, asked early so an unset switch can keep the token-major walk
+/// where the pass would refuse a context that opened before.
+fn jobs_default_admitted(options: &FlintOptions) -> bool {
+    jobs_admitted_under(options, LAYER_MAJOR_CEILING_BYTES)
 }
 
-/// The mixed q8k KV profile has no layer-major / jobs prefill arm: both passes
-/// stage whole layers, but the q8k write path is only validated on the default
-/// token-major launch. Refused at open, before any device work, naming the
-/// switch and the profile.
-fn q8k_layer_major_allow(profile: &str, mode: LayerMajor) -> Result<()> {
-    if profile == "q8k" && mode != LayerMajor::Off {
-        return Err(EngError::BadRequest(
-            "FIFI_EXL3_LAYER_MAJOR (1 or jobs) has no q8k arm: use kv_profile q8k on the \
-             default token-major prefill (unset the switch)"
-                .into(),
-        ));
-    }
-    Ok(())
+/// [`jobs_default_admitted`] against a given ceiling, so the test can reach the boundary.
+fn jobs_admitted_under(options: &FlintOptions, ceiling_bytes: u64) -> bool {
+    let rows = JOBS_PIECE_ROWS.min(options.context_limit as usize);
+    let admitted = || -> Result<()> {
+        let kv = options.plan_rows(rows)?;
+        let reserve = reserve_with(
+            options,
+            &kv,
+            CudaContext::alloc_cache_reserve(alloc_cache_selected()),
+        )?;
+        layer_major_admission(
+            "FIFI_EXL3_LAYER_MAJOR=jobs",
+            reserve.kv_cache,
+            reserve.work,
+            layer_major_staging_charge(rows, true)?,
+            reserve.headroom,
+            ceiling_bytes,
+        )
+    };
+    admitted().is_ok()
 }
 
 /// The strict switches read when the session opens: a bad `FIFI_EXL3_SINGLE_GATHER` or
 /// `FIFI_EXL3_LAYER_MAJOR` stops the open, not the first request. Returns the layer-major
-/// selection. The single-row switch itself is read once per process by the projection entry; the
-/// open only refuses a value that entry would refuse.
+/// selection, `None` when the switch is unset. The single-row switch itself is read once per
+/// process by the projection entry; the open only refuses a value that entry would refuse.
 fn open_switches(
     single_gather: Option<&std::ffi::OsStr>,
     layer_major: Option<&std::ffi::OsStr>,
-) -> Result<LayerMajor> {
+) -> Result<Option<LayerMajor>> {
     single_gather_from_env(single_gather).map_err(EngError::BadRequest)?;
     super::settings::layer_major_from_env(layer_major)
+}
+
+/// What an open runs with once the prefill order is resolved: the layer-major mode, the CPU expert
+/// configuration, whether the tall projections split their activations, and the load-line tokens
+/// that name the order and its source.
+struct Resolved {
+    mode: LayerMajor,
+    cpu_moe: CpuMoeConfig,
+    hilo: bool,
+    suffix: String,
 }
 
 impl FlintExecutor {
@@ -528,6 +555,21 @@ impl FlintExecutor {
         })
     }
 
+    /// [`Self::open`] on the token-major walk whatever the environment says, for the tests that
+    /// compare against or count the launches of that walk.
+    #[cfg(test)]
+    pub(super) fn open_token_major(
+        root: &Path,
+        options: &FlintOptions,
+        eos: Vec<u32>,
+        vocab: usize,
+        template_sha: [u8; 32],
+    ) -> Result<(Self, FlintSession)> {
+        Self::open_with(root, options, eos, vocab, template_sha, || {
+            Ok(Some(LayerMajor::Off))
+        })
+    }
+
     /// [`Self::open`] with the layer-major selection supplied by the caller,
     /// read at the point `open` has always parsed it, so a test can open
     /// either mode without touching the process environment.
@@ -537,7 +579,7 @@ impl FlintExecutor {
         eos: Vec<u32>,
         vocab: usize,
         template_sha: [u8; 32],
-        layer_major: impl FnOnce() -> Result<LayerMajor>,
+        layer_major: impl FnOnce() -> Result<Option<LayerMajor>>,
     ) -> Result<(Self, FlintSession)> {
         if vocab == 0
             || vocab > VOCAB
@@ -548,11 +590,11 @@ impl FlintExecutor {
                 "Flint tokenizer vocabulary or EOS set is invalid".into(),
             ));
         }
-        // Layer-major prefill: the selection parses strictly now (unset, "1" or "jobs"); the
-        // admission check below runs after the reserve is sized.
-        let mode = layer_major()?;
-        // The hi/lo split of the tall projections parses strictly too (unset, "0" or "1").
-        super::settings::tall_hilo_from_env(
+        // The switches parse strictly now (FIFI_EXL3_LAYER_MAJOR: unset, "off", "1" or "jobs";
+        // FIFI_EXL3_TALL_HILO: unset, "0" or "1"); the admission check below runs after the
+        // reserve is sized.
+        let selected = layer_major()?;
+        let hilo = super::settings::tall_hilo_from_env(
             std::env::var_os(super::settings::TALL_HILO_VAR).as_deref(),
         )?;
         let cpu_moe = CpuMoeConfig::new(
@@ -560,8 +602,64 @@ impl FlintExecutor {
             options.cpu_moe_split_experts,
             options.cpu_moe_threads,
         )?;
-        cpu_experts_allow(&cpu_moe, mode)?;
-        q8k_layer_major_allow(&options.kv_profile, mode)?;
+        let order = resolve_prefill_order(
+            selected,
+            hilo,
+            &OrderInputs::for_options(
+                options,
+                &cpu_moe,
+                alloc_cache_selected(),
+                jobs_default_admitted(options),
+            ),
+        )?;
+        eprintln!(
+            "Flint prefill order: {} ({})",
+            prefill_order_name(order.mode),
+            order.why
+        );
+        // The default must never stop an open that the token-major walk would have served: the
+        // jobs pass reserves more memory and the early check sees only the static ceiling, so a
+        // defaulted jobs open that fails for want of memory is retried once on the token-major
+        // walk (an explicit value is never retried).
+        open_with_default_fallback(
+            &order,
+            |mode| {
+                Self::open_resolved(
+                    root,
+                    options,
+                    eos.clone(),
+                    vocab,
+                    template_sha,
+                    Resolved {
+                        mode,
+                        cpu_moe,
+                        hilo: mode == LayerMajor::Jobs && order.hilo,
+                        suffix: order.with_mode(mode).load_suffix(),
+                    },
+                )
+            },
+            |line| eprintln!("{line}"),
+        )
+    }
+
+    /// The open for a resolved prefill order: plans the memory, loads the weights and arms the
+    /// pass.
+    fn open_resolved(
+        root: &Path,
+        options: &FlintOptions,
+        eos: Vec<u32>,
+        vocab: usize,
+        template_sha: [u8; 32],
+        resolved: Resolved,
+    ) -> Result<(Self, FlintSession)> {
+        let Resolved {
+            mode,
+            cpu_moe,
+            hilo,
+            suffix: order_suffix,
+        } = resolved;
+        // The tall projections of this process read the resolved hi/lo state, not the raw variable.
+        super::settings::set_tall_hilo(hilo);
         let context_rows = options.context_limit as usize;
         let piece_rows = match mode {
             LayerMajor::Off => None,
@@ -688,12 +786,8 @@ impl FlintExecutor {
                 };
                 format!(" layer_major={rows}{jobs}")
             }),
-            // Printed only when armed, so the default load line is unchanged.
-            match (super::settings::tall_hilo_armed(), mode == LayerMajor::Jobs) {
-                (true, true) => " tall_hilo=on",
-                (true, false) => " tall_hilo=inactive",
-                _ => "",
-            },
+            // The resolved order and where it came from (default or explicit), and the hi/lo state.
+            order_suffix,
             ctx.single_gather_suffix(),
             model
                 .banked_experts()
@@ -733,6 +827,7 @@ impl FlintExecutor {
                 prefill_chunk_size: options.prefill_chunk_size as usize,
                 layer_major: layer_major_rows,
                 layer_mode: mode,
+                tall_hilo: hilo,
                 bank_tally: BankTally::default(),
                 root: root.to_path_buf(),
                 template_sha,
@@ -759,10 +854,7 @@ impl FlintExecutor {
         // The mode is the executor's own, fixed at open: layer-major KV is
         // computed by different matrix kernels, so a prefix saved under one
         // mode must not restore under the other.
-        let env = CudaPrefixEnv {
-            layer_major: self.layer_mode,
-            ..frozen_prefix_env()
-        };
+        let env = prefix_env_for(self.layer_mode, self.tall_hilo);
         CudaPrefixPath::now(&self.root, &self.options, env)
     }
 
@@ -995,7 +1087,7 @@ impl FlintExecutor {
             super::factory::load_tokenizer(&tokenizer_dir).expect("the qualification tokenizer");
         let eos = bundle.eos_token_ids().to_vec();
         let vocab = bundle.vocab_size() as usize;
-        Self::open(
+        Self::open_token_major(
             &root,
             &options,
             eos,
@@ -1173,7 +1265,9 @@ mod resident_advice_tests {
         assert!(off.contains("FIFI_FLINT_CUDA_EXPERT_CACHE=0"), "{off}");
         assert!(off.contains("45315 tokens") && off.contains("f16"), "{off}");
         assert!(
-            off.contains("Unset the variable") && off.contains("lower context_limit"),
+            off.contains("Unset the variable")
+                && off.contains("lower context_limit")
+                && off.contains("FIFI_EXL3_LAYER_MAJOR=off"),
             "{off}"
         );
         let none = resident_advice(true, "cuda admission: need 1 bytes", None, "q8").unwrap();
@@ -1204,10 +1298,11 @@ mod open_switch_tests {
         let open = |single: Option<&str>, major: Option<&str>| {
             open_switches(single.map(OsStr::new), major.map(OsStr::new))
         };
-        assert_eq!(open(None, None).unwrap(), LayerMajor::Off);
-        assert_eq!(open(Some("1"), None).unwrap(), LayerMajor::Off);
-        assert_eq!(open(Some("1"), Some("1")).unwrap(), LayerMajor::Tiles);
-        assert_eq!(open(None, Some("jobs")).unwrap(), LayerMajor::Jobs);
+        assert_eq!(open(None, None).unwrap(), None);
+        assert_eq!(open(Some("1"), None).unwrap(), None);
+        assert_eq!(open(Some("1"), Some("1")).unwrap(), Some(LayerMajor::Tiles));
+        assert_eq!(open(None, Some("jobs")).unwrap(), Some(LayerMajor::Jobs));
+        assert_eq!(open(None, Some("off")).unwrap(), Some(LayerMajor::Off));
         assert!(open(Some("wide2"), None).is_ok());
         assert!(open(Some("wide8"), None).is_err());
         for bad in ["", "0", "true", "on", "gather"] {
@@ -1252,18 +1347,80 @@ mod open_switch_tests {
         );
     }
 
+    /// The static check admits the default context under the real ceiling and refuses it under a
+    /// small one; the jobs pass's demand grows with the context.
     #[test]
-    fn q8k_refuses_both_layer_major_arms_at_open() {
-        for mode in [LayerMajor::Tiles, LayerMajor::Jobs] {
-            let error =
-                super::q8k_layer_major_allow("q8k", mode).expect_err("q8k has no layer-major arm");
-            let text = format!("{error:?}");
-            assert!(text.contains("q8k"), "{text}");
-            assert!(text.contains("FIFI_EXL3_LAYER_MAJOR"), "{text}");
-            assert!(text.contains("token-major"), "{text}");
+    fn the_early_jobs_check_follows_the_ceiling() {
+        use super::{FlintOptions, LAYER_MAJOR_CEILING_BYTES, jobs_admitted_under};
+
+        let options = FlintOptions::cuda_default();
+        assert!(jobs_admitted_under(&options, LAYER_MAJOR_CEILING_BYTES));
+        assert!(!jobs_admitted_under(&options, 1 << 30));
+        let mut small = FlintOptions::cuda_default();
+        small.context_limit = 4096;
+        assert!(jobs_admitted_under(&small, 4 << 30));
+        assert!(!jobs_admitted_under(&options, 4 << 30));
+    }
+
+    /// The prefix fingerprint binds the walk the executor resolved, not the frozen default.
+    #[test]
+    fn the_prefix_environment_carries_the_resolved_walk() {
+        use super::{frozen_prefix_env, prefix_env_for};
+
+        assert_eq!(frozen_prefix_env().layer_major, LayerMajor::Off);
+        for mode in [LayerMajor::Off, LayerMajor::Tiles, LayerMajor::Jobs] {
+            assert_eq!(prefix_env_for(mode, false).layer_major, mode);
         }
-        assert!(super::q8k_layer_major_allow("q8k", LayerMajor::Off).is_ok());
-        assert!(super::q8k_layer_major_allow("f16", LayerMajor::Jobs).is_ok());
-        assert!(super::q8k_layer_major_allow("q8", LayerMajor::Tiles).is_ok());
+        assert_eq!(
+            prefix_env_for(LayerMajor::Jobs, true).alloc_cache,
+            frozen_prefix_env().alloc_cache
+        );
+    }
+
+    /// The wiring the pure tests cannot reach: the open resolves the order (and the hi/lo split)
+    /// through `resolve_prefill_order`, retries a defaulted jobs open through
+    /// `open_with_default_fallback` (a memory shortage only, pinned in prefill_order.rs), and the
+    /// fingerprint is built from the executor's own walk.
+    #[test]
+    fn the_open_and_the_fingerprint_use_the_resolved_walk() {
+        let source = include_str!("cuda_executor.rs");
+        let open = source.find("    fn open_with(").expect("open_with");
+        let end = source[open..]
+            .find("    fn open_resolved(")
+            .expect("open_resolved");
+        let body = &source[open..open + end];
+        for needle in [
+            "resolve_prefill_order(",
+            "OrderInputs::for_options(",
+            "options,",
+            "&cpu_moe,",
+            "alloc_cache_selected(),",
+            "jobs_default_admitted(options),",
+            "open_with_default_fallback(",
+            "hilo: mode == LayerMajor::Jobs && order.hilo,",
+            "order.with_mode(mode).load_suffix()",
+            "tall_hilo_from_env(",
+        ] {
+            assert!(body.contains(needle), "open_with lost `{needle}`");
+        }
+        assert!(
+            !body.contains("true,") && !body.contains("false,"),
+            "the order inputs are not literals"
+        );
+        let path = source
+            .find("    fn prefix_path(&self)")
+            .expect("prefix_path");
+        let body = &source[path..path + 600];
+        assert!(
+            body.contains("prefix_env_for(self.layer_mode, self.tall_hilo)"),
+            "{body}"
+        );
+        let qual = source
+            .find("pub(super) fn open_qualification")
+            .expect("open_qualification");
+        assert!(
+            source[qual..qual + 1400].contains("Self::open_token_major("),
+            "the qualification opener pins the token-major walk"
+        );
     }
 }

@@ -32,22 +32,6 @@ fn the_piece_is_as_tall_as_the_router_admits_and_never_taller_than_the_context()
 }
 
 #[test]
-fn cpu_experts_are_refused_with_either_layer_major_pass_and_allowed_without() {
-    let on = CpuMoeConfig::new(2, 0, 0).unwrap();
-    let off = CpuMoeConfig::new(0, 0, 0).unwrap();
-    for mode in [LayerMajor::Tiles, LayerMajor::Jobs] {
-        let refused = cpu_experts_allow(&on, mode);
-        assert!(
-            matches!(&refused, Err(EngError::BadRequest(text))
-                if text.contains("FIFI_EXL3_LAYER_MAJOR") && text.contains("cpu_moe_offload_layers")),
-            "{mode:?}: {refused:?}"
-        );
-        assert!(cpu_experts_allow(&off, mode).is_ok(), "{mode:?}");
-    }
-    assert!(cpu_experts_allow(&on, LayerMajor::Off).is_ok());
-}
-
-#[test]
 fn staging_charges_one_piece_not_the_whole_context() {
     let extra = State::layer_major_extra_bytes(4096, false).unwrap();
     // A piece of 4,096 rows: 384 MiB of faces plus the planes and tile
@@ -99,6 +83,7 @@ fn env(layer_major: LayerMajor) -> CudaPrefixEnv {
         exl3_legacy: false,
         expert_cache: true,
         layer_major,
+        tall_hilo: false,
     }
 }
 
@@ -223,7 +208,7 @@ fn armed_executor_with(
         vec![2],
         VOCAB,
         [0u8; 32],
-        || Ok(mode),
+        || Ok(Some(mode)),
     )
     .unwrap();
     assert_eq!(executor.layer_major, Some(piece));
@@ -454,15 +439,37 @@ fn bits(values: &[f32]) -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "requires admitted GPU and full EXL3 pack; armed open leaves the unarmed default untouched"]
-fn unset_knob_opens_the_token_major_walk_with_no_staging() {
-    // The environment decides here, exactly as serving does: run this with
-    // FIFI_EXL3_LAYER_MAJOR unset.
-    assert!(std::env::var_os("FIFI_EXL3_LAYER_MAJOR").is_none());
+#[ignore = "requires admitted GPU and full EXL3 pack; `off` opens the token-major walk"]
+fn the_off_knob_opens_the_token_major_walk_with_no_staging() {
     let (executor, session) =
-        FlintExecutor::open(&pack_root(), &options(CONTEXT), vec![2], VOCAB, [0u8; 32]).unwrap();
+        FlintExecutor::open_token_major(&pack_root(), &options(CONTEXT), vec![2], VOCAB, [0u8; 32])
+            .unwrap();
     assert_eq!(executor.layer_major, None);
     assert_eq!(executor.prefill_piece(), Some(8));
+    assert!(session.state.test_layer_major_rows().is_none());
+}
+
+#[test]
+#[ignore = "requires admitted GPU and full EXL3 pack; the environment decides, run with FIFI_EXL3_LAYER_MAJOR unset"]
+fn the_unset_knob_opens_the_jobs_pass_on_f16_and_the_token_major_walk_on_q8() {
+    // The environment decides here, exactly as serving does.
+    assert!(std::env::var_os("FIFI_EXL3_LAYER_MAJOR").is_none());
+    let piece = 1024.min(CONTEXT);
+    let (executor, session) =
+        FlintExecutor::open(&pack_root(), &options(CONTEXT), vec![2], VOCAB, [0u8; 32]).unwrap();
+    assert_eq!(executor.layer_major, Some(piece));
+    assert_eq!(session.state.test_layer_major_rows(), Some(piece));
+    drop((executor, session));
+    // The jobs pass is measured and gated on f16 only: q8 keeps the walk it always had.
+    let (executor, session) = FlintExecutor::open(
+        &pack_root(),
+        &options_for(CONTEXT, "q8"),
+        vec![2],
+        VOCAB,
+        [0u8; 32],
+    )
+    .unwrap();
+    assert_eq!(executor.layer_major, None);
     assert!(session.state.test_layer_major_rows().is_none());
 }
 

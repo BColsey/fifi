@@ -58,7 +58,7 @@ The context limit is 32,768 tokens. To use less memory, set `FIFI_FLINT_MLX_CONT
 
 You need Linux with the CUDA 12 toolkit.
 The pack is 20.7 GB.
-Up to a context of about 60,000 tokens (`f16`) every weight stays on the GPU.
+Up to a context of about 60,000 tokens (`f16`, token-major prefill; the default job-table prefill reserves about 0.65 GB more, so slightly less) every weight stays on the GPU.
 A longer context, which is the default, keeps part of the experts in about 18 GiB of page-locked host memory, so the machine needs that much free memory on top of the GPU.
 
 1. Download the EXL3 pack. It includes the tokenizer files:
@@ -94,6 +94,8 @@ A longer context, which is the default, keeps part of the experts in about 18 Gi
    ```
 
 4. Start the server as above and wait for `/ready`.
+
+On the `f16` KV profile the engine prefills a prompt with the job-table layer-major pass by default, with a hi/lo split of the activations of its tall projections that removes the F16 rounding they would otherwise add. The first token of a 16,000-token prompt falls from 118 to 21 s (4,000 tokens: 28 to 4.7 s), and the first request after a prefill decodes somewhat slower while the expert bank refills (about 13 percent at 16K, level on the next request). The registered 32K quality check of the plain pass fails two of four bars and covers a jobs prefill of only 11,519 rows; the split's check and the reorder control it rests on are cited at `FIFI_EXL3_LAYER_MAJOR` and `FIFI_EXL3_TALL_HILO` in the environment reference, and the default applies to prompts up to the full context. The start line `Flint prefill order: ...` says which order the engine took and why, and the load line carries `prefill_order_source=default|explicit` and `tall_hilo=`. The engine keeps the token-major walk when the profile is not `f16`, when CPU experts are configured, when `prefill_chunk_size` is not 8, or when `FIFI_FLINT_CUDA_ALLOC_CACHE=0`; if the job-table pass does not fit in memory it retries once on the token-major walk and says so. To roll back, set `FIFI_EXL3_LAYER_MAJOR=off` and restart; to keep the pass without the split, set `FIFI_EXL3_TALL_HILO=0`. Prefix reuse under the job-table pass has not been run on a GPU yet; a prefix saved under one order or split state is never restored under another.
 
 Startup checks free GPU memory and free host memory and refuses a load that does not fit; lower `context_limit` if it is refused.
 The load line says `expert_slots=` and `bank=auto` when part of the experts is in host memory. To keep every expert on the GPU, set `FIFI_FLINT_CUDA_EXPERT_CACHE=0`; a context that does not fit then is refused with the largest one that does.

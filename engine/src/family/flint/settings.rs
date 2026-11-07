@@ -48,38 +48,27 @@ pub(crate) fn cpu_moe_overlap_selected(value: Option<&std::ffi::OsStr>) -> bool 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use crate::family::flint::budget::{LayerMajor, layer_major_from_env};
 
-/// The opt-in switch of the hi/lo activation split of the tall projections of the jobs pass.
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
-pub(crate) const TALL_HILO_VAR: &str = "FIFI_EXL3_TALL_HILO";
-
-/// FIFI_EXL3_TALL_HILO, strict: unset and `0` keep the F16 cast of the tall projection inputs (the
-/// default, unchanged); `1` splits each activation into an F16 high part and a scaled F16 residual
-/// (two tensor-core products against one decoded weight tile, summed in F32). Surrounding spaces are
-/// ignored; every other value, including an empty or non-UTF-8 one, is an error at executor open.
+// The hi/lo switch parses in the budget layer too (host-buildable). The executor open resolves it
+// together with the layer-major mode and stores the decision here, so the tall projections of this
+// process read the resolved state, not the raw variable.
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(crate) fn tall_hilo_from_env(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
-    let Some(value) = value else {
-        return Ok(false);
-    };
-    match value.to_str().map(str::trim) {
-        Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        _ => Err(EngError::BadRequest(
-            "FIFI_EXL3_TALL_HILO must be unset, \"0\" or \"1\"".into(),
-        )),
-    }
-}
+pub(crate) use crate::family::flint::budget::{TALL_HILO_VAR, tall_hilo_from_env};
 
-/// FIFI_EXL3_TALL_HILO, read once per process; the executor open refuses a bad value before any
-/// tall projection asks, so a value that is not `1` reads as off here.
+/// Whether the tall projections of the jobs pass of this process split their activations into a hi
+/// and a scaled lo F16 part. Set once per executor open from the resolved prefill order
+/// ([`set_tall_hilo`]); off until an open has resolved it.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(crate) fn tall_hilo_armed() -> bool {
-    use std::sync::OnceLock;
-    static ARMED: OnceLock<bool> = OnceLock::new();
-    *ARMED.get_or_init(|| {
-        tall_hilo_from_env(std::env::var_os(TALL_HILO_VAR).as_deref()).unwrap_or(false)
-    })
+    TALL_HILO.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(crate) fn set_tall_hilo(on: bool) {
+    TALL_HILO.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+static TALL_HILO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) fn q8_tiled_selected(value: Option<&std::ffi::OsStr>) -> bool {
@@ -272,7 +261,7 @@ pub(crate) fn resolved_switch_suffix(
     )
 }
 
-fn default_chunk_size() -> u32 {
+pub(crate) fn default_chunk_size() -> u32 {
     8
 }
 
@@ -544,63 +533,37 @@ mod tests {
     }
 
     #[test]
-    fn tall_hilo_env_is_strict_and_default_off() {
+    fn layer_major_env_is_strict_and_unset_leaves_the_choice_to_the_engine() {
         use std::ffi::OsStr;
 
-        assert!(!tall_hilo_from_env(None).unwrap());
-        for (value, want) in [
-            ("0", false),
-            (" 0 ", false),
-            ("1", true),
-            (" 1\n", true),
-            ("\u{2003}1", true),
-        ] {
+        // Unset is no choice; only the exact trimmed "off", "1" and "jobs" name a pass.
+        assert_eq!(layer_major_from_env(None).unwrap(), None);
+        for value in ["off", " off\n"] {
             assert_eq!(
-                tall_hilo_from_env(Some(OsStr::new(value))).unwrap(),
-                want,
+                layer_major_from_env(Some(OsStr::new(value))).unwrap(),
+                Some(LayerMajor::Off),
                 "{value:?}"
             );
         }
-        for value in [
-            "", " ", "on", "true", "yes", "2", "01", "+1", "off", "hilo", "1.0", "-1",
-        ] {
-            assert!(
-                tall_hilo_from_env(Some(OsStr::new(value))).is_err(),
-                "{value:?} must be refused"
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            assert!(tall_hilo_from_env(Some(OsStr::from_bytes(b"\xff"))).is_err());
-        }
-    }
-
-    #[test]
-    fn layer_major_env_is_strict_and_default_off() {
-        use std::ffi::OsStr;
-
-        // Unset is OFF; only the exact trimmed "1" and "jobs" arm a pass.
-        assert_eq!(layer_major_from_env(None).unwrap(), LayerMajor::Off);
         for value in ["1", " 1 ", "\u{2003}1"] {
             assert_eq!(
                 layer_major_from_env(Some(OsStr::new(value))).unwrap(),
-                LayerMajor::Tiles,
+                Some(LayerMajor::Tiles),
                 "{value:?}"
             );
         }
         for value in ["jobs", " jobs\n"] {
             assert_eq!(
                 layer_major_from_env(Some(OsStr::new(value))).unwrap(),
-                LayerMajor::Jobs,
+                Some(LayerMajor::Jobs),
                 "{value:?}"
             );
         }
-        // Everything else is an open-time error, never a silent fallback —
-        // including the near-miss forms an operator might type as "off".
+        // Everything else is an open-time error, never a silent fallback, including the
+        // near-miss forms an operator might type for "off".
         for value in [
             "0", "", " ", "true", "on", "yes", "1.0", "01", "+1", "-1", "one", "l", "Jobs", "job",
-            "jobs1",
+            "jobs1", "Off", "OFF", "false", "no", "none",
         ] {
             assert!(
                 layer_major_from_env(Some(OsStr::new(value))).is_err(),
