@@ -280,10 +280,10 @@ fn an_open_descriptor_on_a_network_mount_is_refused() {
     let path = dir.path().join("ngram_embedding.safetensors");
     write_table(&path);
     let file = File::open(&path).unwrap();
-    let guard = LocalGuard::new().unwrap();
-    assert!(super::check_open_file(&guard, &file).is_ok());
+    assert!(super::check_open_file(&LocalGuard::new().unwrap(), &file).is_ok());
+    // The guard reads the mount table when it is made, so it is made inside the seam.
     let text = crate::storage_guard::seam::with_nfs_at(dir.path(), || {
-        super::check_open_file(&guard, &file)
+        super::check_open_file(&LocalGuard::new().unwrap(), &file)
             .expect_err("refused")
             .describe()
     });
