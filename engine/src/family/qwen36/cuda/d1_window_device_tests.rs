@@ -41,7 +41,8 @@
 //! Environment: `FIFI_EXL3_CHECKPOINT` (the pack), `FIFI_SPEC_TEXT` and `FIFI_SPEC_TOKENIZER`
 //! (real text, as in the other window tests), `FIFI_D1_PREFIX_ROWS` (comma separated prefix
 //! lengths, default 600; use 255,256,257 and 4095,4096,4097 for page and chunk boundaries with
-//! `FIFI_D1_CONTEXT` raised), `FIFI_D1_KV` (`fp16`, the current CUDA default, or `int8g32`),
+//! `FIFI_D1_CONTEXT` raised), `FIFI_D1_KV` (`fp16`, the current CUDA default, or `int8g32`; the
+//! K-row window refuses `int8g32` at arming, so `FIFI_D1_VERIFY=krow` runs `fp16` only),
 //! `FIFI_D1_CAPTURE` (`1`, the serving default for an EXL3 entry, or `0` for the eager body),
 //! `FIFI_D1_ROLLBACK` (`host` or `device`), `FIFI_D1_VERIFY` (`eager` or `krow`),
 //! `FIFI_D1_KROW_ROWS` (the window lengths of check K), `FIFI_KROW_BREAK` (`ids`, the break
