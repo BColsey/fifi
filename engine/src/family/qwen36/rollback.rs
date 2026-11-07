@@ -221,6 +221,35 @@ impl RollbackBook {
         Ok(())
     }
 
+    /// Marks slots `0..count` captured in one call: the K-row path, whose kernels stored every
+    /// slot inside one graph. The caller makes the call after the window's synchronization and
+    /// result read, so a slot is never marked readable on an enqueue alone. Refused unless the
+    /// window is open and still has no slot marked, not complete, and `count` is exactly one slot
+    /// per row but the last: a partial mark would leave a verdict that names an unwritten slot.
+    pub(crate) fn mark_captured_range(&mut self, count: usize) -> Result<(), EngError> {
+        let window = self
+            .window
+            .as_mut()
+            .ok_or_else(|| refuse("mark_captured_range", "no window is open"))?;
+        if window.complete || window.captured != 0 {
+            return Err(refuse(
+                "mark_captured_range",
+                &format!(
+                    "the window already has {} slots marked or is complete",
+                    window.captured
+                ),
+            ));
+        }
+        if count + 1 != window.rows {
+            return Err(refuse(
+                "mark_captured_range",
+                &format!("{count} slots marked for a window of {} rows", window.rows),
+            ));
+        }
+        window.captured = count;
+        Ok(())
+    }
+
     /// Closes the window and says what the verdict asks for: `None` when every row stays. The
     /// window is closed whatever the answer, so a refused verdict leaves no open window.
     /// `committed_rows` is the verdict's `base + kept` and `tokens` the book's row count now.

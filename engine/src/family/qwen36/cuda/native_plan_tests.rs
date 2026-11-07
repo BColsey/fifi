@@ -489,3 +489,172 @@ fn the_int8_plan_refuses_the_tiled_layout() {
         other => panic!("a Tiled Int8G32 plan must be refused: {other:?}"),
     }
 }
+
+/// The K-row verify plan of the EXL3 layout (`draft_verify = krow`): host planning only. The
+/// bytes of a slot are read back from the plan, never recomputed with the plan's own formula.
+mod verify_plan {
+    use super::*;
+    use crate::kernels::cuda::resident::step_params::ARGMAX_PART_BYTES;
+
+    fn bytes(plan: &StepPlan, slot: Slot) -> usize {
+        let at = plan
+            .index(slot)
+            .unwrap_or_else(|| panic!("{slot:?} in the plan"));
+        plan.tensors()[at].bytes
+    }
+
+    fn one_row() -> StepPlan {
+        let d = dims();
+        let scratch = KernelScratch::for_dims(&d, 1, KvMode::Fp16).expect("scratch");
+        StepPlan::new(&d, 1, &options(WeightLayout::Exl3), &scratch).expect("one row")
+    }
+
+    fn verify(rows: usize) -> StepPlan {
+        let d = dims();
+        let scratch = KernelScratch::for_verify(&d, rows, KvMode::Fp16).expect("scratch");
+        StepPlan::new_verify(&d, rows, &options(WeightLayout::Exl3), &scratch).expect("plan")
+    }
+
+    #[test]
+    fn a_k_row_plan_exists_for_two_to_eight_rows_and_keeps_every_slot_of_the_one_row_plan() {
+        let single = one_row();
+        for rows in 2..=8 {
+            let plan = verify(rows);
+            for planned in single.tensors() {
+                assert!(
+                    plan.index(planned.slot).is_some(),
+                    "{rows} rows: {:?}",
+                    planned.slot
+                );
+            }
+            assert_eq!(plan.tensors().len(), single.tensors().len());
+            assert!(plan.arena_bytes() > single.arena_bytes());
+        }
+    }
+
+    #[test]
+    fn the_slots_that_grow_with_the_row_count_grow_exactly_by_it() {
+        let single = one_row();
+        for rows in 2..=8 {
+            let plan = verify(rows);
+            for slot in [
+                Slot::ResidA,
+                Slot::ResidB,
+                Slot::NormRow,
+                Slot::Logits,
+                Slot::TopkId,
+                Slot::TopkWeight,
+                Slot::ExpertGu,
+                Slot::ExpertAct,
+                Slot::ExpertDown,
+                Slot::SharedGu,
+                Slot::SharedAct,
+                Slot::SharedOut,
+                Slot::AttnQ,
+                Slot::AttnCore,
+                Slot::MixOut,
+                Slot::DeltaProj,
+                Slot::FinalNormRow,
+            ] {
+                assert_eq!(
+                    bytes(&plan, slot),
+                    rows * bytes(&single, slot),
+                    "{rows} rows {slot:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_argmax_partials_take_one_set_per_row() {
+        for rows in 2..=8 {
+            assert_eq!(
+                bytes(&verify(rows), Slot::ArgmaxPart),
+                rows * ARGMAX_PART_BYTES
+            );
+        }
+        assert_eq!(bytes(&one_row(), Slot::ArgmaxPart), ARGMAX_PART_BYTES);
+    }
+
+    #[test]
+    fn the_scratch_of_a_single_row_cannot_plan_a_window() {
+        // M-style: a plan whose ArgmaxPart was not scaled by K is refused, not planned.
+        let d = dims();
+        let single_set = KernelScratch::for_dims(&d, 4, KvMode::Fp16).expect("scratch");
+        match StepPlan::new_verify(&d, 4, &options(WeightLayout::Exl3), &single_set) {
+            Err(crate::EngError::BadRequest(message)) => {
+                assert!(message.contains("one set per row"), "{message}");
+            }
+            other => panic!("one argmax set for four rows must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_head_sets_the_rotated_output_scratch_and_grows_with_k_while_the_routed_chains_reuse_it()
+    {
+        // The head is the widest output (K rows at once); the widest input is the routed gate and
+        // up launch of ONE row's chain, which K rows do not enlarge (they run in stream order).
+        let single = one_row();
+        for rows in 2..=8 {
+            let plan = verify(rows);
+            assert_eq!(
+                bytes(&plan, Slot::Exl3Z),
+                rows * bytes(&single, Slot::Exl3Z),
+                "{rows}"
+            );
+            assert_eq!(
+                bytes(&plan, Slot::Exl3Xh),
+                bytes(&single, Slot::Exl3Xh),
+                "{rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_explicit_constructor_plans_several_exl3_rows() {
+        let d = dims();
+        let scratch = KernelScratch::for_verify(&d, 2, KvMode::Fp16).expect("scratch");
+        assert!(StepPlan::new(&d, 2, &options(WeightLayout::Exl3), &scratch).is_err());
+    }
+
+    #[test]
+    fn the_verify_plan_refuses_other_layouts_other_row_counts_and_forked_experts() {
+        let d = dims();
+        for layout in [WeightLayout::Native, WeightLayout::Tiled] {
+            let scratch = KernelScratch::for_verify(&d, 2, KvMode::Fp16).expect("scratch");
+            assert!(
+                StepPlan::new_verify(&d, 2, &options(layout), &scratch).is_err(),
+                "{layout:?}"
+            );
+        }
+        for rows in [0, 1, 9] {
+            let scratch =
+                KernelScratch::for_dims(&d, rows.clamp(1, 8), KvMode::Fp16).expect("scratch");
+            let error = StepPlan::new_verify(&d, rows, &options(WeightLayout::Exl3), &scratch)
+                .expect_err("refused");
+            assert!(
+                format!("{error:?}").contains("2 to 8 rows"),
+                "{rows}: {error:?}"
+            );
+        }
+        let forked = StepOptions {
+            forked_experts: true,
+            ..options(WeightLayout::Exl3)
+        };
+        let scratch = KernelScratch::for_verify(&d, 2, KvMode::Fp16).expect("scratch");
+        assert!(StepPlan::new_verify(&d, 2, &forked, &scratch).is_err());
+    }
+
+    #[test]
+    fn the_plan_is_valid_under_the_int8_kv_mode_too() {
+        let d = dims();
+        let int8 = StepOptions {
+            kv_mode: KvMode::Int8G32,
+            ..options(WeightLayout::Exl3)
+        };
+        for rows in [2, 8] {
+            let scratch = KernelScratch::for_verify(&d, rows, KvMode::Int8G32).expect("scratch");
+            StepPlan::new_verify(&d, rows, &int8, &scratch).expect("KV8 plan");
+        }
+    }
+}

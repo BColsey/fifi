@@ -39,6 +39,15 @@ mod host_load;
 #[cfg(test)]
 mod host_real;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "stage S0 is the host seam; the K-row step (S2) is the first caller of most of it"
+    )
+)]
+pub(crate) mod krow;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod mtp_pack;
 #[cfg(test)]
 mod mtp_pack_tests;

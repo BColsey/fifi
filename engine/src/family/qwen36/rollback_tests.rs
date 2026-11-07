@@ -357,3 +357,58 @@ fn arming_is_refused_for_every_unsupported_state_and_forked_experts_by_name() {
         assert!(text.contains("draft_rollback"), "{name}: {text}");
     }
 }
+
+#[test]
+fn the_k_row_path_marks_every_slot_in_one_call_and_a_verdict_may_then_restore_any_of_them() {
+    for rows in 2..=8 {
+        for kept in 1..rows {
+            let mut book = RollbackBook::new(plan(rows));
+            book.begin_window(100, rows).unwrap();
+            book.mark_captured_range(rows - 1).unwrap();
+            book.mark_complete().unwrap();
+            let restore = book.finish_window(kept, 100 + kept, 100 + rows).unwrap();
+            assert_eq!(
+                restore,
+                Some(Restore {
+                    slot: kept - 1,
+                    frontier: 100 + kept
+                }),
+                "{rows} rows, kept {kept}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unmarked_k_row_window_refuses_a_partial_accept() {
+    // The mark is what makes a slot readable: a window whose mark never came poisons through the
+    // refusal, it does not restore garbage.
+    let mut book = RollbackBook::new(plan(4));
+    book.begin_window(100, 4).unwrap();
+    book.mark_complete().unwrap();
+    let error = book.finish_window(2, 102, 104).expect_err("never captured");
+    assert!(format!("{error:?}").contains("never captured"), "{error:?}");
+}
+
+#[test]
+fn the_range_mark_needs_an_open_fresh_window_and_exactly_one_slot_per_row_but_the_last() {
+    let mut book = RollbackBook::new(plan(4));
+    assert!(book.mark_captured_range(3).is_err(), "no window");
+    book.begin_window(100, 4).unwrap();
+    for count in [0, 1, 2, 4, 5] {
+        assert!(book.mark_captured_range(count).is_err(), "count {count}");
+    }
+    book.mark_captured_range(3).unwrap();
+    assert!(book.mark_captured_range(3).is_err(), "twice");
+    let mut book = RollbackBook::new(plan(4));
+    book.begin_window(100, 4).unwrap();
+    book.note_captured(0).unwrap();
+    assert!(
+        book.mark_captured_range(3).is_err(),
+        "a window with a slot already marked by the per-row path"
+    );
+    let mut book = RollbackBook::new(plan(4));
+    book.begin_window(100, 4).unwrap();
+    book.mark_complete().unwrap();
+    assert!(book.mark_captured_range(3).is_err(), "a complete window");
+}

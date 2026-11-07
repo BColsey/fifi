@@ -205,6 +205,62 @@ pub(crate) struct Q36Options {
     /// copy, no replay). `device` needs an enabled `draft_mode`; its slots take up to 440 MiB at 8
     /// rows, and start is refused when they cannot be allocated.
     pub(crate) draft_rollback: Option<String>,
+    /// How a verify window runs its rows: `eager` (the default: the one-row step once per row) or
+    /// `krow` (one captured K-row graph per window). `krow` needs `draft_rollback` `device` and
+    /// the EXL3 pack. The K-row device path is not built yet: the engine refuses to start with
+    /// `krow` until it is (`family/qwen36/krow.rs`).
+    pub(crate) draft_verify: Option<String>,
+}
+
+/// How a verify window runs its rows (`draft_verify`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum VerifyMode {
+    /// The eager window: one one-row step per row. The reference of the K-row path.
+    #[default]
+    Eager,
+    /// One K-row window (`family/qwen36/krow.rs`).
+    Krow,
+}
+
+/// The config text of `draft_verify`.
+pub(crate) fn verify_mode_name(mode: VerifyMode) -> &'static str {
+    match mode {
+        VerifyMode::Eager => "eager",
+        VerifyMode::Krow => "krow",
+    }
+}
+
+/// Parses `draft_verify` by exact match; absent is `eager`. `krow` needs the device rollback (its
+/// per-row states are written straight into the rollback slots) and the EXL3 pack (the only
+/// layout with a K-row plan). The window cap of 8 rows is `draft_max_rows`, already enforced for
+/// an enabled Qwen3.6 speculation.
+fn verify_of(
+    options: &Q36Options,
+    rollback: RollbackMode,
+    weights: WeightFormat,
+) -> Result<VerifyMode, EngError> {
+    let mode = match options.draft_verify.as_deref() {
+        None | Some("eager") => VerifyMode::Eager,
+        Some("krow") => VerifyMode::Krow,
+        Some(other) => {
+            return Err(bad(format!(
+                "draft_verify must be eager or krow, got {other:?}"
+            )));
+        }
+    };
+    if mode == VerifyMode::Krow {
+        if rollback != RollbackMode::Device {
+            return Err(bad(
+                "draft_verify krow needs draft_rollback device; set draft_rollback to device or \
+                 draft_verify to eager"
+                    .into(),
+            ));
+        }
+        if weights != WeightFormat::Exl3 {
+            return Err(bad("draft_verify krow needs weight_format exl3".into()));
+        }
+    }
+    Ok(mode)
 }
 
 /// How a verify window is rolled back (`draft_rollback`).
@@ -763,6 +819,8 @@ pub(crate) struct Q36Settings {
     pub(crate) speculation: SpecConfig,
     /// How a verify window is rolled back. `Host` unless `draft_rollback` says `device`.
     pub(crate) draft_rollback: RollbackMode,
+    /// How a verify window runs its rows. `Eager` unless `draft_verify` says `krow`.
+    pub(crate) draft_verify: VerifyMode,
     /// The CUDA device ordinals this engine spans, strictly ascending. `[0]` unless the
     /// `cuda_devices` member said otherwise. Inert on the MLX arm, which refuses the member.
     pub(crate) cuda_devices: Vec<usize>,
@@ -1055,6 +1113,7 @@ impl Q36Settings {
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
         let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes)?;
+        let draft_verify = verify_of(options, draft_rollback, weights)?;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
             Backend::Mlx => {
@@ -1234,6 +1293,7 @@ impl Q36Settings {
             weights,
             speculation,
             draft_rollback,
+            draft_verify,
             cuda_devices,
             ignored_mlx_keys,
         })
@@ -1325,7 +1385,8 @@ mod tests {
         parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
     use super::{
-        QWEN36_MAX_WINDOW_ROWS, RollbackMode, check_window_rows, rollback_mode_name, rollback_of,
+        QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
+        rollback_mode_name, rollback_of, verify_mode_name, verify_of,
     };
     use crate::EngError;
     use crate::family::session::StoreLimits;
@@ -1834,6 +1895,78 @@ mod tests {
     }
 
     #[test]
+    fn draft_verify_is_eager_unless_the_member_says_krow() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        assert_eq!(
+            cuda(exl3_options(|_| {})).unwrap().draft_verify,
+            VerifyMode::Eager
+        );
+        assert_eq!(
+            cuda(exl3_options(|o| o.draft_verify = Some("eager".into())))
+                .unwrap()
+                .draft_verify,
+            VerifyMode::Eager
+        );
+        let krow = cuda(exl3_options(|o| {
+            o.draft_mode = Some("ngram".into());
+            o.draft_rollback = Some("device".into());
+            o.draft_verify = Some("krow".into());
+        }))
+        .unwrap();
+        assert_eq!(krow.draft_verify, VerifyMode::Krow);
+        assert_eq!(krow.draft_rollback, RollbackMode::Device);
+        assert_eq!(verify_mode_name(krow.draft_verify), "krow");
+        assert_eq!(verify_mode_name(VerifyMode::default()), "eager");
+    }
+
+    #[test]
+    fn draft_verify_krow_is_refused_without_the_device_rollback_and_with_an_unknown_value() {
+        let cuda =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
+        // The default rollback is host; an explicit host is refused the same way.
+        for rollback in [None, Some("host")] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = rollback.map(Into::into);
+                o.draft_verify = Some("krow".into());
+            })));
+            assert!(
+                text.contains("draft_verify krow needs draft_rollback device"),
+                "{rollback:?}: {text}"
+            );
+        }
+        for bad_value in ["Krow", "k-row", "", "1", "device"] {
+            let text = message(cuda(exl3_options(|o| {
+                o.draft_mode = Some("ngram".into());
+                o.draft_rollback = Some("device".into());
+                o.draft_verify = Some(bad_value.into());
+            })));
+            assert!(
+                text.contains("draft_verify must be eager or krow"),
+                "{bad_value:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_verify_krow_is_refused_without_the_exl3_pack() {
+        let options = Q36Options {
+            draft_verify: Some("krow".into()),
+            ..Q36Options::default()
+        };
+        let text = format!(
+            "{:?}",
+            verify_of(&options, RollbackMode::Device, WeightFormat::Gguf).unwrap_err()
+        );
+        assert!(text.contains("weight_format exl3"), "{text}");
+        assert_eq!(
+            verify_of(&options, RollbackMode::Device, WeightFormat::Exl3).unwrap(),
+            VerifyMode::Krow
+        );
+    }
+
+    #[test]
     fn the_cap_is_confined_to_enabled_qwen36_speculation() {
         let cuda =
             |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
@@ -2206,6 +2339,7 @@ mod tests {
                 weights: super::WeightFormat::Gguf,
                 speculation: SpecConfig::default(),
                 draft_rollback: RollbackMode::Host,
+                draft_verify: VerifyMode::Eager,
                 ignored_mlx_keys: Vec::new(),
             }
         );

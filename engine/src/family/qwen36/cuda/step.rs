@@ -442,6 +442,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// `qwen36.draft_rollback = device` asked for: a verify window rolls back through `rollback`.
     /// A window on a step that wants it and holds no slots is refused before any state change.
     rollback_wanted: bool,
+    /// `qwen36.draft_verify = krow` asked for (`rollback_runtime`): the merged MoE block is refused.
+    krow_wanted: bool,
     /// The options asked for experts on branch streams (refused in stage 1 at resource creation,
     /// and refused again when the device rollback is armed, which orders its copies on one stream).
     forked_experts: bool,
@@ -747,6 +749,7 @@ impl<'a> QwenResidentStep<'a> {
             #[cfg(test)]
             trace_sync_capture: false,
             rollback_wanted: false,
+            krow_wanted: false,
             forked_experts: options.forked_experts,
             rollback: None,
             pending_prefix: None,
@@ -776,6 +779,10 @@ impl<'a> QwenResidentStep<'a> {
                 "step: the shared expert rides in the routed launches of an EXL3 step only"
                     .to_owned(),
             ));
+        }
+        if on && self.krow_wanted {
+            // The same refusal as the variable: the K-row path is qualified without the block.
+            crate::family::qwen36::krow::check_krow_switches(None, true)?;
         }
         self.exl3_merge = if on {
             Some(SharedMerge::new(

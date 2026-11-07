@@ -1,7 +1,10 @@
 //! Unit tests of the launch order of one token. CPU only.
 use super::{
     common_tests::dims,
-    step_ops::{POS_WORD_READERS, StepOp, final_resid, resid_in, resid_out, token_ops},
+    step_ops::{
+        POS_WORD_READERS, RowsOp, StepOp, final_resid, resid_in, resid_out, token_ops,
+        token_ops_rows,
+    },
     step_plan::{PHASES, Phase, Slot},
 };
 use crate::family::AttentionKind;
@@ -207,4 +210,95 @@ fn the_body_op_list_is_pinned() {
             Advance
         ]
     );
+}
+
+#[test]
+fn a_k_row_window_is_the_body_then_argmax_rows_then_the_status_fold_then_advance() {
+    use StepOp::{Advance, Begin, Embed, FinalNorm, LmHead, Mixer, Moe};
+    let want = [
+        RowsOp::Step(Begin),
+        RowsOp::Step(Embed),
+        RowsOp::Step(Mixer(0)),
+        RowsOp::Step(Moe(0)),
+        RowsOp::Step(Mixer(1)),
+        RowsOp::Step(Moe(1)),
+        RowsOp::Step(FinalNorm),
+        RowsOp::Step(LmHead),
+        RowsOp::ArgmaxRows,
+        RowsOp::StatusFold,
+        RowsOp::Step(Advance),
+    ];
+    for rows in 2..=8 {
+        assert_eq!(token_ops_rows(2, rows).unwrap(), want, "{rows} rows");
+    }
+}
+
+#[test]
+fn a_k_row_window_has_two_to_eight_rows() {
+    for rows in [0, 1, 9, 16, 64] {
+        let error = token_ops_rows(2, rows).expect_err("refused");
+        assert!(
+            format!("{error:?}").contains("2 to 8 rows"),
+            "{rows}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn the_status_fold_is_the_last_status_writer_of_a_k_row_window_and_argmax_rows_writes_none() {
+    let layers = dims().shape.kinds.len();
+    let ops = token_ops_rows(layers, 4).unwrap();
+    let kind = |op: RowsOp| op.layer().map_or(AttentionKind::DeltaNet, kind_of);
+    let writers: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|&(_, &op)| op.writes_status(kind(op)))
+        .map(|(at, _)| at)
+        .collect();
+    let fold = ops
+        .iter()
+        .position(|&op| op == RowsOp::StatusFold)
+        .expect("fold");
+    let argmax = ops
+        .iter()
+        .position(|&op| op == RowsOp::ArgmaxRows)
+        .expect("argmax rows");
+    assert_eq!(writers.last(), Some(&fold));
+    assert_eq!(writers.first(), Some(&0), "step_begin clears status first");
+    assert!(!writers.contains(&argmax), "row-local bits only");
+    assert!(argmax < fold, "the fold ORs what the argmax stored");
+    assert_eq!(ops.last(), Some(&RowsOp::Step(StepOp::Advance)));
+    assert!(!ops.last().unwrap().writes_status(AttentionKind::Full));
+}
+
+#[test]
+fn the_phases_of_a_k_row_window_ascend_and_every_phase_of_the_plan_is_run() {
+    let d = dims();
+    let kind = |op: RowsOp| op.layer().map_or(AttentionKind::DeltaNet, kind_of);
+    let mut seen = Vec::new();
+    let mut last = None::<usize>;
+    for op in token_ops_rows(d.shape.kinds.len(), 3).unwrap() {
+        let phases: Vec<usize> = op
+            .phases(kind(op))
+            .into_iter()
+            .map(|p| p as usize)
+            .collect();
+        assert!(
+            phases.windows(2).all(|w| w[0] < w[1]),
+            "{op:?} not ascending"
+        );
+        let starts_layer = matches!(op, RowsOp::Step(StepOp::Mixer(_)));
+        if let (Some(prev), false, false) = (last, starts_layer, op == RowsOp::StatusFold) {
+            assert!(
+                phases[0] > prev,
+                "{op:?} starts at {} after {prev}",
+                phases[0]
+            );
+        }
+        last = phases.last().copied();
+        seen.extend(phases);
+    }
+    for phase in PHASES {
+        assert!(seen.contains(&(phase as usize)), "{phase:?} is never run");
+    }
 }

@@ -11,6 +11,8 @@ const PREFIX: &str = include_str!("cuda/prefix_runtime.rs");
 const WINDOW: &str = include_str!("window_logic.rs");
 const STATE: &str = include_str!("cuda/state.rs");
 const SLOTS: &str = include_str!("cuda/state/rollback.rs");
+const START: &str = include_str!("cuda/start.rs");
+const RUNTIME: &str = include_str!("cuda/rollback_runtime.rs");
 
 /// The code of `source` as the pins compare it: comments removed, string and character literals
 /// emptied, raw strings emptied, and every whitespace character dropped. A commented-out call
@@ -608,4 +610,148 @@ fn the_restoring_entry_points_are_exactly_the_six_of_the_table() {
         ],
         "a restoring site was added or removed: extend the table of DESIGN 17.2 and its gate"
     );
+}
+
+// ---- the K-row seam (stage S0) ----
+
+#[test]
+fn the_device_window_runs_its_rows_through_run_rows_and_not_through_a_loop_of_its_own() {
+    let window = code(WINDOW);
+    let device = body(&window, "run_window_device");
+    statement(device, "let ran = host.run_rows(inputs);");
+    for gone in [
+        "host.run_row(",
+        "host.capture(",
+        "host.feed_fault(",
+        "host.capture_fault(",
+    ] {
+        assert!(
+            !device.contains(&code(gone)),
+            "`{gone}` belongs to the eager default of run_rows, not to the window"
+        );
+    }
+    // Either way a failed run closes the book first, then decides valid-or-failed.
+    let failure = block(device, "Err(error)=>{");
+    in_order(
+        failure,
+        "host.rollback_discard();",
+        "return Err(row_failure(host,base,error));",
+    );
+    // The completion mark and the store stay in the window, after the rows, for both paths.
+    in_order(
+        device,
+        "let ran = host.run_rows(inputs);",
+        "host.store_window(Window{",
+    );
+    let complete = device
+        .find(&code("host.rollback_window_complete()"))
+        .expect("complete");
+    assert!(complete > device.find(&code("host.run_rows(inputs)")).expect("rows"));
+}
+
+#[test]
+fn the_default_of_run_rows_is_the_eager_loop_with_its_capture_after_every_row_but_the_last() {
+    let window = code(WINDOW);
+    let default = body(&window, "run_rows");
+    statement(default, "eager_rows(self, inputs)");
+    let eager = body(&window, "eager_rows");
+    let at = |needle: &str| {
+        eager
+            .find(&code(needle))
+            .unwrap_or_else(|| panic!("`{needle}`"))
+    };
+    assert!(at("host.feed_fault(at)?;") < at("host.run_row(token)?;"));
+    assert!(at("host.run_row(token)?;") < at("host.trace_mark(Mark::RowDone);"));
+    assert!(at("host.trace_mark(Mark::RowDone);") < at("host.capture_fault(at)?;"));
+    assert!(at("host.capture_fault(at)?;") < at("host.capture(at)?;"));
+    assert!(
+        eager.contains(&code("if at + 1 < inputs.len() {")),
+        "the last row is not captured"
+    );
+}
+
+#[test]
+fn the_step_does_not_override_run_rows_in_stage_s0() {
+    // The step's `WindowHost` block is pinned by the forwards table above, which lists no
+    // `run_rows`: the eager window is the only window the step runs until the K-row body exists.
+    let eager = code(include_str!("cuda/eager_window.rs"));
+    let host = block(&eager, "impl WindowHost for QwenResidentStep<'_> {");
+    assert!(!declared(host).iter().any(|name| name == "run_rows"));
+}
+
+#[test]
+fn the_start_checks_the_krow_switches_before_the_weights_and_the_step_checks_its_own_fields() {
+    let start = code(START);
+    let at = |needle: &str| {
+        start
+            .find(&code(needle))
+            .unwrap_or_else(|| panic!("`{needle}`"))
+    };
+    assert!(at("settings.draft_verify == VerifyMode::Krow") < at("check_krow_env("));
+    assert!(at("check_krow_env(") < at("load_exl3_dir(&projector"));
+    // After the slots are armed: ask for krow, check the step, then the stub refusal.
+    let armed = at("step.enable_device_rollback(");
+    assert!(armed < at("step.request_krow_verify();"));
+    assert!(at("step.request_krow_verify();") < at("step.check_krow_arming("));
+    assert!(at("step.check_krow_arming(") < at("return Err(not_built());"));
+}
+
+#[test]
+fn the_step_reads_the_merged_block_from_its_own_field_and_the_hook_meets_the_same_refusal() {
+    let runtime = code(RUNTIME);
+    let arming = body(&runtime, "check_krow_arming");
+    statement(
+        arming,
+        "let single_gather = std::env::var_os(SINGLE_GATHER_NAME);",
+    );
+    for field in [
+        "rollback_armed: self.rollback.is_some(),",
+        "shared_in_routed: self.exl3_merge.is_some()",
+        "single_gather: single_gather.as_deref(),",
+    ] {
+        assert!(
+            arming.contains(&code(field)),
+            "`{field}` missing from check_krow_arming"
+        );
+    }
+    let step = code(STEP);
+    let hook = body(&step, "set_shared_in_routed");
+    assert!(
+        hook.contains(&code(
+            "if on && self.krow_wanted { crate::family::qwen36::krow::check_krow_switches(None, true)?; }"
+        )),
+        "the test hook must refuse the merged block on a krow step with the arming's own refusal"
+    );
+}
+
+/// Where the field `name` of the struct body `fields` starts, if it is declared.
+fn field_at(fields: &str, name: &str) -> Option<usize> {
+    [format!(",{name}:"), format!("){name}:")]
+        .iter()
+        .find_map(|pattern| fields.find(&code(pattern)))
+        .or_else(|| fields.starts_with(&format!("{name}:")).then_some(0))
+}
+
+#[test]
+fn the_captured_graphs_are_declared_before_the_buffers_whose_addresses_they_bake_in() {
+    // Fields drop in declaration order. By NAME, never by line: the lines keep moving.
+    let step = code(STEP);
+    let fields = block(&step, "pub(crate) struct QwenResidentStep<'a> {");
+    let at = |name: &str| field_at(fields, name).unwrap_or_else(|| panic!("field `{name}`"));
+    assert!(
+        at("graph") < at("state"),
+        "the graph drops before the state it bakes in"
+    );
+    assert!(
+        at("graph") < at("rollback"),
+        "the graph drops before the slots"
+    );
+    assert!(
+        at("graph") < at("exl3_merge"),
+        "the precedent: the merged block's buffer"
+    );
+    // The per-K graphs (stage S3) obey the same rule as soon as they exist.
+    if let Some(krow) = field_at(fields, "krow_graphs") {
+        assert!(krow < at("state") && krow < at("rollback"));
+    }
 }

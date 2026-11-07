@@ -74,6 +74,12 @@ pub(crate) enum WindowSave<S> {
     Device,
 }
 
+/// What the rows of a device window leave: per row, the device argmax and the logits row.
+pub(crate) struct RowsOut<R> {
+    pub(crate) argmax: Vec<u32>,
+    pub(crate) rows: Vec<R>,
+}
+
 /// The primitive effects of a window. Every method is one forward on the step.
 pub(crate) trait WindowHost {
     /// The host copy of the committed state.
@@ -136,6 +142,20 @@ pub(crate) trait WindowHost {
     fn rollback_window_complete(&mut self) -> Result<(), EngError>;
     /// Applies the verdict through the slots; returns whether a slot was copied back.
     fn rollback_finish(&mut self, kept: usize, committed_rows: usize) -> Result<bool, EngError>;
+
+    /// Runs every row of an open device window and leaves the state after each row but the last in
+    /// its slot. The default is the eager loop ([`eager_rows`]): one `run_row` and one `capture`
+    /// per row, so the eager window is the reference and the fallback of any override. An override
+    /// (`draft_verify = krow`) runs the K rows as one window and, once the window synchronized and
+    /// its results were read, marks the slots (`RollbackBook::mark_captured_range`). It must
+    /// refuse before any enqueue (state valid, unchanged) or fail with the state poisoned or
+    /// advanced: `run_window_device` closes the window either way.
+    fn run_rows(&mut self, inputs: &[u32]) -> Result<RowsOut<Self::Row>, EngError>
+    where
+        Self: Sized,
+    {
+        eager_rows(self, inputs)
+    }
 
     /// A failure injected at a point of the commit. Empty outside the step's test build.
     fn commit_fault(&mut self, _at: CommitPoint) -> Result<(), EngError> {
@@ -422,6 +442,29 @@ pub(crate) fn commit_window<H: WindowHost>(host: &mut H, commit: &Commit) -> Res
     Ok(())
 }
 
+/// The eager rows of a device window: each row through the one-row step, and the state after each
+/// row but the last copied into its slot. The default of [`WindowHost::run_rows`].
+pub(crate) fn eager_rows<H: WindowHost>(
+    host: &mut H,
+    inputs: &[u32],
+) -> Result<RowsOut<H::Row>, EngError> {
+    let mut rows = Vec::with_capacity(inputs.len());
+    let mut argmax = Vec::with_capacity(inputs.len());
+    for (at, &token) in inputs.iter().enumerate() {
+        host.feed_fault(at)?;
+        let (drawn, row) = host.run_row(token)?;
+        argmax.push(drawn);
+        rows.push(row);
+        host.trace_mark(Mark::RowDone);
+        if at + 1 < inputs.len() {
+            host.capture_fault(at)?;
+            host.capture(at)?;
+            host.trace_mark(Mark::Captured);
+        }
+    }
+    Ok(RowsOut { argmax, rows })
+}
+
 /// Runs the rows and copies the state after each row but the last into its slot. Refused before
 /// any state change when the slots are not armed, a window is still open or the state is not
 /// valid and idle. After the first row ran, any failure poisons the state and drops the window:
@@ -433,27 +476,14 @@ fn run_window_device<H: WindowHost>(host: &mut H, inputs: &[u32]) -> Result<(), 
     host.complete_prefix_save()?;
     let base = host.tokens();
     host.rollback_begin(inputs.len())?;
-    let mut rows = Vec::with_capacity(inputs.len());
-    let mut argmax = Vec::with_capacity(inputs.len());
-    let ran = (|| -> Result<(), EngError> {
-        for (at, &token) in inputs.iter().enumerate() {
-            host.feed_fault(at)?;
-            let (drawn, row) = host.run_row(token)?;
-            argmax.push(drawn);
-            rows.push(row);
-            host.trace_mark(Mark::RowDone);
-            if at + 1 < inputs.len() {
-                host.capture_fault(at)?;
-                host.capture(at)?;
-                host.trace_mark(Mark::Captured);
-            }
+    let ran = host.run_rows(inputs);
+    let RowsOut { argmax, rows } = match ran {
+        Ok(out) => out,
+        Err(error) => {
+            host.rollback_discard();
+            return Err(row_failure(host, base, error));
         }
-        Ok(())
-    })();
-    if let Err(error) = ran {
-        host.rollback_discard();
-        return Err(row_failure(host, base, error));
-    }
+    };
     // Every row ran: until the verdict a step or an export through the state is refused.
     // `rollback_window_complete` can fail only if the window closed under it: all rows ran and
     // the state would stay valid and ahead, so the error fails the window closed like every other
@@ -504,6 +534,10 @@ mod tests;
 #[cfg(test)]
 #[path = "window_logic_d1_tests.rs"]
 mod d1_tests;
+
+#[cfg(test)]
+#[path = "window_logic_krow_tests.rs"]
+mod krow_tests;
 
 #[cfg(test)]
 #[path = "window_pin_tests.rs"]

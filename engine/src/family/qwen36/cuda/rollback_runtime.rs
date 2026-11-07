@@ -9,8 +9,12 @@ use super::super::state::rollback::{RollbackSlots, slot_bytes_of};
 use super::QwenResidentStep;
 use crate::{
     EngError,
-    family::qwen36::rollback::{
-        ArmingFacts, Cover, RollbackPlan, check_arming, check_uncharged_slots,
+    family::{
+        project::cuda::WeightLayout,
+        qwen36::{
+            krow::{KrowFacts, SINGLE_GATHER_NAME, check_krow_arming},
+            rollback::{ArmingFacts, Cover, RollbackPlan, check_arming, check_uncharged_slots},
+        },
     },
 };
 
@@ -68,6 +72,26 @@ impl QwenResidentStep<'_> {
         let bytes = slots.bytes();
         self.rollback = Some(slots);
         Ok(bytes)
+    }
+
+    /// Records that the settings asked for `draft_verify = krow`: from now on the merged MoE block
+    /// is refused, including through the test hook that builds it (`set_shared_in_routed`).
+    pub(crate) fn request_krow_verify(&mut self) {
+        self.krow_wanted = true;
+    }
+
+    /// The arming refusals of the K-row path (`family/qwen36/krow.rs`) over this step's own fields:
+    /// the slots are armed, the layout is EXL3, the window cap, the single-row kernel switch, and
+    /// the merged MoE block as the step holds it (`exl3_merge`), not only as the environment says.
+    pub(crate) fn check_krow_arming(&self, rows: usize) -> Result<(), EngError> {
+        let single_gather = std::env::var_os(SINGLE_GATHER_NAME);
+        check_krow_arming(KrowFacts {
+            rollback_armed: self.rollback.is_some(),
+            exl3: self.layout == WeightLayout::Exl3,
+            rows,
+            single_gather: single_gather.as_deref(),
+            shared_in_routed: self.exl3_merge.is_some(),
+        })
     }
 
     /// The slots, or the refusal of a window on a step that wants them and has none.

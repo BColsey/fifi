@@ -9,11 +9,14 @@
 //! flag before `spawn_engine`, commits it right after the leaks, and every retry in the same
 //! process is refused.
 
-use super::super::exl3_merge_plan::{resolve_switch, shared_in_routed_explicit};
+use super::super::exl3_merge_plan::{
+    SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
+};
+use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env, not_built};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
-    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, WeightFormat,
-    tokenizer_pin, weight_format_name,
+    DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, VerifyMode,
+    WeightFormat, tokenizer_pin, weight_format_name,
 };
 use super::{
     card_load::card_loads,
@@ -698,6 +701,14 @@ pub(crate) fn start(
         shared_in_routed_explicit(),
         matches!(settings.weights, WeightFormat::Exl3),
     )?;
+    // `draft_verify = krow`: the one qualified configuration is checked before any weight is read;
+    // the step checks its own fields again once it exists (below).
+    if settings.draft_verify == VerifyMode::Krow {
+        check_krow_env(
+            std::env::var_os(SINGLE_GATHER_NAME).as_deref(),
+            std::env::var_os(SHARED_IN_ROUTED_VAR).as_deref(),
+        )?;
+    }
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
     let chunk_off = chunk_rollback_requested(std::env::var_os(CHUNK_PREFILL_VAR).as_deref());
@@ -1131,6 +1142,14 @@ fn make(
                 });
             }
             rollback_cover = Some(cover);
+        }
+        // `draft_verify = krow` needs the armed slots above. The K-row device path is not built
+        // (stage S0 is the host seam), so a configuration that passes every check is refused
+        // too; the refusal is the stub, and `eager` never reaches it.
+        if settings.draft_verify == VerifyMode::Krow {
+            step.request_krow_verify();
+            step.check_krow_arming(settings.speculation.max_rows)?;
+            return Err(not_built());
         }
         let mut arena_admitted = None;
         if arena {

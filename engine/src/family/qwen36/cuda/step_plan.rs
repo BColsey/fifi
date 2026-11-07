@@ -19,7 +19,9 @@
 //! pack). Every non-pack slot is shared but `NormRow`, which the NATIVE plan holds live across the
 //! whole step because the fused `add_rmsnorm_q8` always writes the f32 normalized row (the MIXER
 //! PROLOGUE writes it as scratch beside Q8Mix; the final norm writes its own FinalNormRow instead).
-//! The Native plan exists at one row only (`check_layout_rows`).
+//! The Native plan exists at one row only (`check_layout_rows`). So does the EXL3 plan of
+//! [`StepPlan::new`]; the K-row verify window of `qwen36.draft_verify = krow` has its own explicit
+//! constructor, [`StepPlan::new_verify`], so that the default path cannot drift into several rows.
 //!
 //! # Rows
 //!
@@ -134,6 +136,19 @@ impl KernelScratch {
             top_k: moe.top_k,
         })?;
         Self::new(dims, rows, router, kv_mode)
+    }
+
+    /// The scratch of a K-row verify window: every size of [`Self::for_dims`] at `rows` rows, and
+    /// one `argmax_part` set per row (the per-row argmax of `argmax_rows` reduces each logits row
+    /// into its own partials).
+    pub(crate) fn for_verify(
+        dims: &StepDims,
+        rows: usize,
+        kv_mode: KvMode,
+    ) -> Result<Self, EngError> {
+        let mut scratch = Self::for_dims(dims, rows, kv_mode)?;
+        scratch.argmax_part = product(&[rows, ARGMAX_PART_BYTES])?;
+        Ok(scratch)
     }
 
     pub(crate) fn new(
@@ -453,6 +468,46 @@ impl StepPlan {
             )));
         }
         check_layout_rows(rows, options)?;
+        scratch.check(dims, rows, options.kv_mode)?;
+        let slots = list_slots(dims, rows, options, scratch)?;
+        Self::from_slots(rows, slots)
+    }
+
+    /// The plan of a K-row verify window (`draft_verify = krow`) over the EXL3 layout: `rows` in
+    /// 2 to [`MAX_STEP_ROWS`]. [`Self::new`] keeps refusing several rows for this layout. Refused:
+    /// another layout, forked experts, and a scratch that was not sized for the window
+    /// ([`KernelScratch::for_verify`]: one `argmax_part` set per row). Host planning only: the
+    /// sizes follow the K-row design (dense and head launches take K rows, the routed experts and
+    /// the attention chain K one-row launches); the device checks them in stage S2.
+    pub(crate) fn new_verify(
+        dims: &StepDims,
+        rows: usize,
+        options: &StepOptions,
+        scratch: &KernelScratch,
+    ) -> Result<Self, EngError> {
+        if options.layout != WeightLayout::Exl3 {
+            return Err(EngError::BadRequest(
+                "step plan: a K-row verify plan needs the EXL3 layout".to_owned(),
+            ));
+        }
+        if !(2..=MAX_STEP_ROWS).contains(&rows) {
+            return Err(EngError::BadRequest(format!(
+                "step plan: a K-row verify plan has 2 to {MAX_STEP_ROWS} rows, got {rows}"
+            )));
+        }
+        if options.forked_experts {
+            return Err(EngError::BadRequest(
+                "step plan: the EXL3 layout takes the single merged expert down pack".to_owned(),
+            ));
+        }
+        let want_argmax = product(&[rows, ARGMAX_PART_BYTES])?;
+        if scratch.argmax_part < want_argmax {
+            return Err(EngError::BadRequest(format!(
+                "step plan: the kernel scratch holds {} argmax bytes, a {rows}-row window needs \
+                 {want_argmax} (one set per row)",
+                scratch.argmax_part
+            )));
+        }
         scratch.check(dims, rows, options.kv_mode)?;
         let slots = list_slots(dims, rows, options, scratch)?;
         Self::from_slots(rows, slots)
@@ -995,20 +1050,24 @@ fn list_card_moe(
 fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngError> {
     let geometry = super::mixer_geometry::MixerGeometry::new(dims)?;
     let (h, e) = (dims.shape.hidden, &dims.shape.moe);
+    // A K-row window: the dense, shared-expert and head launches take K rows at once (the shared
+    // gate and up as 2K one-row groups), while the routed experts run one chain per row, in
+    // stream order, so their rotated inputs and partials are reused row after row.
+    let k = list.rows;
     // (rows of the launch, input width, output width) of every projection kind.
     let mut launches = vec![
-        (1, h, dims.shape.vocab),
+        (k, h, dims.shape.vocab),
         (2 * e.top_k, h, e.inter),
         (e.top_k, e.inter, h),
-        (2, h, e.shared_inter),
-        (1, e.shared_inter, h),
+        (2 * k, h, e.shared_inter),
+        (k, e.shared_inter, h),
     ];
     for kind in [
         crate::family::AttentionKind::DeltaNet,
         crate::family::AttentionKind::Full,
     ] {
         for spec in geometry.dense_specs(WeightLayout::Exl3, kind)? {
-            launches.push((1, spec.k, spec.rows));
+            launches.push((k, spec.k, spec.rows));
         }
     }
     let xh = launches

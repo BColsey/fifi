@@ -22,6 +22,9 @@
 //!   state compared after the first windows, in the middle and at the end.
 //! * **F** [`failure_recovery`] (not a letter of the spec): a fault injected mid-window or
 //!   mid-replay leaves the pre-window state or a refusing model, never a silent partial state.
+//! * **K** [`krow_matches_eager`] (not a letter of the spec; krow design 6.1): the same prefix and
+//!   inputs run once on the K-row path and once on the eager device window give the same logits
+//!   rows, the same slots, and after every verdict the same committed state and next step.
 //!
 //! Test B (per-layer taps) needs device-side debug taps and is not covered.
 //!
@@ -53,6 +56,7 @@ const D: &str = "D accepted prefix, commit and rollback";
 const E: &str = "E ties";
 const F: &str = "F failure recovery";
 const G: &str = "G repeated rollback cycles";
+const K: &str = "K K-row against eager";
 
 /// The job limit of the oracle's generations: far above any window.
 const MAX_TOKENS: u32 = 4_096;
@@ -82,6 +86,29 @@ pub(crate) enum Fault {
     ReplayRefused(usize),
     /// Not an injection: the plan commits a verdict whose committed rows are not the window's.
     Verdict,
+    /// The K-row window is refused before anything is enqueued (the host token check, the capacity
+    /// check, the switch re-check): the state stays valid and unchanged and no window opens.
+    KRowRefusal,
+    /// The K-row window fails after its launch was enqueued: the state is poisoned.
+    KRowLaunch,
+    /// The result pairs or the logits of the K-row window cannot be read back: the state is
+    /// poisoned.
+    KRowReadback,
+    /// A row or the window reports a non-zero status without a row of its own to blame (a router
+    /// fault, an invalid state or the arithmetic flag live in the window word only): the window
+    /// fails closed, exactly as the eager window does for a non-zero status.
+    KRowStatus,
+    /// Test-only: logits row `j` alone is made non-finite after the logits stage and before the
+    /// argmax stage, so no other row can see it. Only pair `j` may report it; the window fails.
+    KRowRowPair(usize),
+}
+
+impl Fault {
+    /// Whether the fault is a refusal before any device work: the state stays valid and unchanged,
+    /// so the recovery gate is NOT set and a step is still accepted.
+    pub(crate) fn refuses_before_launch(self) -> bool {
+        self == Self::KRowRefusal
+    }
 }
 
 /// What the checks need from a model, on top of the window interface.
@@ -110,6 +137,12 @@ pub(crate) trait D1Subject: WindowModel {
     /// its own points.
     fn fault_plan(&self, rows: usize) -> Vec<(Fault, Commit)> {
         faults_for(rows)
+    }
+
+    /// The state slots a window left, as the bit patterns of their contents, or `None` for a
+    /// subject without slots (check K compares them between the two paths).
+    fn window_slots(&self) -> Option<Vec<Vec<u32>>> {
+        None
     }
 
     /// Whether a failed commit of this subject sets a recovery gate that only a reset clears.
@@ -840,6 +873,34 @@ pub(crate) fn slot_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> 
     faults
 }
 
+/// The fault points of a window of `rows` rows over `base` committed rows for the K-row path: the
+/// five K-row points (the row-pair fault at the first, a middle and the last row) and the restore
+/// under the verdicts that keep one row and all but one. There is no `Capture(i)`: the K-row path
+/// has no per-row capture. Each is committed under a partial verdict so that a rollback is
+/// attempted when the window survives.
+pub(crate) fn krow_faults_for(base: usize, rows: usize) -> Vec<(Fault, Commit)> {
+    let under = |kept: usize| Commit {
+        committed_rows: base + kept,
+        kept_rows: kept,
+        discarded_rows: rows - kept,
+        state_slot: kept - 1,
+    };
+    let mut faults = vec![
+        (Fault::KRowRefusal, under(1)),
+        (Fault::KRowLaunch, under(1)),
+        (Fault::KRowReadback, under(1)),
+        (Fault::KRowStatus, under(1)),
+    ];
+    let mut pairs = vec![0, rows / 2, rows - 1];
+    pairs.dedup();
+    faults.extend(pairs.into_iter().map(|j| (Fault::KRowRowPair(j), under(1))));
+    if rows > 2 {
+        faults.push((Fault::Restore, under(rows - 1)));
+    }
+    faults.push((Fault::Restore, under(1)));
+    faults
+}
+
 /// The fault points of a window of `rows` rows over `base` committed rows for the host path: the
 /// feed, the three refusals before `begin_import`, the device failure after it, the replay (a
 /// failure that poisons and a refusal before launch), and a verdict that is not the window's. Each
@@ -918,7 +979,11 @@ pub(crate) fn failure_recovery<S: D1Subject>(
             ));
         }
         require_closed_or_rolled_back(subject, &base, inputs[0], fault)?;
-        require_gated(subject, &base, inputs[0], fault)?;
+        if fault.refuses_before_launch() {
+            require_unchanged_and_usable(subject, &base, inputs[0], fault)?;
+        } else {
+            require_gated(subject, &base, inputs[0], fault)?;
+        }
         subject.restore(&base).at(F)?;
         let rows = window_rows_of(subject, inputs, F)?;
         subject.restore(&base).at(F)?;
@@ -969,6 +1034,28 @@ fn require_gated<S: D1Subject>(
     Ok(())
 }
 
+/// A refusal before any launch leaves the pre-window state, valid: a snapshot answers and equals
+/// the base, and a step is accepted (it is rolled back by the restore that follows). A refusal that
+/// poisoned the state, or left the recovery gate set, is not a clean refusal.
+fn require_unchanged_and_usable<S: D1Subject>(
+    subject: &mut S,
+    base: &S::State,
+    token: u32,
+    fault: Fault,
+) -> Verdict<()> {
+    let poisoned =
+        |what: &str| D1Failure::violation(F, format!("{fault:?}: a clean refusal {what}"));
+    match subject.snapshot() {
+        Ok(after) if subject.state_difference(&after, base).is_none() => {}
+        Ok(_) => return Err(poisoned("moved the state")),
+        Err(_) => return Err(poisoned("poisoned the state")),
+    }
+    if subject.logits(token).is_err() {
+        return Err(poisoned("left the state refusing steps"));
+    }
+    Ok(())
+}
+
 /// After a fault the state is the pre-window state, or the model refuses both a snapshot and a
 /// step. A state that differs and still answers is a silent partial state.
 fn require_closed_or_rolled_back<S: D1Subject>(
@@ -993,6 +1080,112 @@ fn require_closed_or_rolled_back<S: D1Subject>(
             }
         }
     }
+}
+
+/// Check K (krow design 6.1): the K-row path against the eager device window, on the same prefix
+/// and inputs. `krow` and `eager` are two subjects of one model, one running each path; `eager`
+/// is brought to `krow`'s state first. Both run the window; every logits row and the state slots
+/// must be bit-identical. Then, for every verdict that keeps `kept`
+/// rows (1 to the window), both commit it from a fresh run and the committed state must be
+/// bit-identical. `base_rows` is the number of committed rows before the window. Both subjects
+/// are back at the prefix on return.
+pub(crate) fn krow_matches_eager<S: D1Subject>(
+    krow: &mut S,
+    eager: &mut S,
+    inputs: &[u32],
+    base_rows: usize,
+) -> Verdict<Tally> {
+    let base = krow.snapshot().at(K)?;
+    eager.restore(&base).at(K)?;
+    let mut tally = Tally::default();
+    let rows = inputs.len();
+    for kept in 1..=rows {
+        let want = run_and_commit(eager, &base, inputs, kept, base_rows)?;
+        let got = run_and_commit(krow, &base, inputs, kept, base_rows)?;
+        tally.comparisons += 1;
+        compare_paths(krow, &got, &want, kept)?;
+    }
+    krow.restore(&base).at(K)?;
+    eager.restore(&base).at(K)?;
+    Ok(tally)
+}
+
+/// What one path left after a window and a verdict.
+struct PathOutcome<T> {
+    rows: Vec<Vec<f32>>,
+    slots: Option<Vec<Vec<u32>>>,
+    committed: T,
+    next: Vec<f32>,
+}
+
+fn run_and_commit<S: D1Subject>(
+    subject: &mut S,
+    base: &S::State,
+    inputs: &[u32],
+    kept: usize,
+    base_rows: usize,
+) -> Verdict<PathOutcome<S::State>> {
+    subject.restore(base).at(K)?;
+    subject.run_window(inputs).at(K)?;
+    let rows = subject.window_rows().at(K)?;
+    let slots = subject.window_slots();
+    let commit = Commit {
+        committed_rows: base_rows + kept,
+        kept_rows: kept,
+        discarded_rows: inputs.len() - kept,
+        state_slot: kept - 1,
+    };
+    // The live state of a window that awaits its verdict is not readable (a snapshot is refused),
+    // so it is compared through the rows and the slots, and after the verdict through the state.
+    subject.commit_window(&commit).at(K)?;
+    let committed = subject.snapshot().at(K)?;
+    let next = subject.logits(inputs[0]).at(K)?;
+    subject.restore(base).at(K)?;
+    Ok(PathOutcome {
+        rows,
+        slots,
+        committed,
+        next,
+    })
+}
+
+fn compare_paths<S: D1Subject>(
+    subject: &S,
+    got: &PathOutcome<S::State>,
+    want: &PathOutcome<S::State>,
+    kept: usize,
+) -> Verdict<()> {
+    let violation = |detail: String| D1Failure::violation(K, format!("kept {kept}: {detail}"));
+    if got.rows.len() != want.rows.len() {
+        return Err(violation(format!(
+            "the K-row window kept {} rows, the eager window {}",
+            got.rows.len(),
+            want.rows.len()
+        )));
+    }
+    for (row, (a, b)) in got.rows.iter().zip(&want.rows).enumerate() {
+        if let Some(difference) = first_bit_difference(a, b) {
+            return Err(violation(format!("logits row {row}: {difference}")));
+        }
+    }
+    match (&got.slots, &want.slots) {
+        (None, None) => {}
+        (Some(a), Some(b)) if a == b => {}
+        (a, b) => {
+            return Err(violation(format!(
+                "state slots differ: {:?} against {:?}",
+                a.as_ref().map(Vec::len),
+                b.as_ref().map(Vec::len)
+            )));
+        }
+    }
+    if let Some(difference) = subject.state_difference(&got.committed, &want.committed) {
+        return Err(violation(format!("the committed state: {difference}")));
+    }
+    if let Some(difference) = first_bit_difference(&got.next, &want.next) {
+        return Err(violation(format!("the next step's logits: {difference}")));
+    }
+    Ok(())
 }
 
 /// The fixture of the exllamav3 near tie (`d1-near-tie-exllamav3-4row-vs-1row.json`): the facts
