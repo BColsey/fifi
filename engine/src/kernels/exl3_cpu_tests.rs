@@ -702,8 +702,10 @@ fn real_flint_expert_latency() {
 }
 
 /// Random weights in the shape of a Flint 4.0 expert (2048 x 512, three projections) at every
-/// stored rate, six experts per layer drawn from a pool of 30 so the weights leave the caches.
-/// Times the SIMD tiers only; the scalar tier needs about 20 ms per expert.
+/// stored rate, six experts per layer. The rounds cycle through `FIFI_EXL3_SWEEP_LAYERS` layers
+/// (default 12, 72 experts, more than the caches hold); 1 keeps the six experts cache resident as
+/// `real_flint_expert_latency` does. Times the SIMD tiers only; the scalar tier needs about 20 ms
+/// per expert.
 ///
 /// Run: `cargo test --release --lib flint_shape_rate_latency -- --ignored --nocapture`.
 #[test]
@@ -712,8 +714,13 @@ fn flint_shape_rate_latency() {
     let (h, f) = (2048, 512);
     let mut rng = Rng(0x1357_9bdf_2468_ace0);
     let x: Vec<f32> = (0..h).map(|_| rng.unit()).collect();
+    let layer_count: usize = std::env::var("FIFI_EXL3_SWEEP_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(12);
     for words in ALL_WORDS {
-        let parts: Vec<_> = (0..5)
+        let parts: Vec<_> = (0..layer_count)
             .map(|_| {
                 let owned = random_experts(&mut rng, (h, f), words);
                 // Six experts per layer: two sets of three.
@@ -739,7 +746,7 @@ fn flint_shape_rate_latency() {
                 let cpu = ExpertCpu::new(threads, WaitPolicy::Spin, Some(tier)).unwrap();
                 let mut out = vec![0.0f32; h];
                 let mut samples = Vec::new();
-                for round in 0..140 {
+                for round in 0..260 {
                     let start = Instant::now();
                     cpu.forward(&x, &layers[round % layers.len()], &mut out)
                         .unwrap();

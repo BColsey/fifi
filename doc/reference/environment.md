@@ -102,6 +102,7 @@ These are read by `cargo test`, not by `enginesrv`. A test that needs recorded d
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `FIFI_EXL3_SWEEP_LAYERS` | `12` | For the ignored `flint_shape_rate_latency` timing test of the EXL3 CPU kernel (random weights of the Flint expert shape at every stored rate): how many layers of six experts the rounds cycle through. `1` keeps the six experts cache resident; the default exceeds the caches. Run `cargo test --release --lib flint_shape_rate_latency -- --ignored --nocapture` from `engine/`. |
 | `M3_LAYOUT_DIR` | unset | The frozen layout directory of the EXL3-versus-GGUF quality comparison. The two default tests that load it skip when it is unset; the ignored `m3_compare` test requires it. |
 | `M3_COMPARE` | unset | For the ignored `m3_compare` test: `P1:<candidate dir>:<reference dir>` or `O1:<candidate dir>:<reference dir>`, the two recorded sidecar sets to score. Run `cargo test --lib m3_compare -- --ignored --nocapture` from `engine/`. |
 | `M3_REGISTRATION` | unset (refused) | For `m3_compare`: `v6` or `v7`, the registration version whose rule scores the pair. There is no default: an unset or unknown value stops the test before any sidecar is read, and every verdict names its version (see `qualification/o1-gate-v7/`). |
