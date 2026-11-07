@@ -227,8 +227,8 @@ static_assert(sizeof(inference_cuda_exl3_job) == 16 &&
 #endif
 int inference_cuda_exl3_jobs(const inference_cuda_exl3_jobs_args *args,
                              void *stream, int *out_stage);
-/* The same launches with an explicit fused-output-rotation request (the env default above is
- * off); the fusion applies only when the register-decode kernel is taken. */
+/* The same launches with an explicit fused-output-rotation request (the FIFI_EXL3_JOBS_FUSED_OUT
+ * default is off); the fusion applies only when the register-decode kernel is taken. */
 int inference_cuda_exl3_jobs_fused_out(const inference_cuda_exl3_jobs_args *args,
                                        void *stream, int *out_stage, int fused_out);
 

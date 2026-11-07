@@ -432,12 +432,17 @@ fn permutation(rng: &mut testkit::Rng, len: usize) -> Vec<u32> {
 /// One job-table call through the explicit fused-output entry (or the plain one when
 /// `fused_out` is false); `z` is canary-filled before the launch and returned raw, so the
 /// caller can see whether the fused epilogue left it untouched.
+/// One job-table call through the explicit fused-output entry with the request `fused_out`
+/// (both legs of the byte-identity test go through it, so its false arm is exercised too);
+/// `z` is canary-filled before the launch and returned raw, so the caller can see whether the
+/// fused epilogue left it untouched. `listed_out` optionally supplies the output row list.
 fn run_jobs_output_mode(
     (ctx, stream): (&CudaContext, &DeviceStream),
     bank: &Bank,
     jobs: &[Exl3Job],
     x: &[f32],
     (out_ld, out_col): (usize, usize),
+    listed_out: Option<&[u32]>,
     fused_out: bool,
 ) -> Result<(Vec<u8>, u32, bool, Vec<u8>), EngError> {
     let (k, n) = (bank.k, bank.n);
@@ -451,6 +456,10 @@ fn run_jobs_output_mode(
     let flag = testkit::upload_filled(ctx, 0, 4);
     let table = Exl3Job::table(jobs);
     let table_buf = testkit::upload_bytes(ctx, &table);
+    let out_rows_buf = listed_out.map(|list| {
+        let bytes: Vec<u8> = list.iter().flat_map(|&r| r.to_le_bytes()).collect();
+        testkit::upload_bytes(ctx, &bytes)
+    });
     let scales = bank.scales.range(0, bank.scales.bytes())?;
     let call = Exl3JobsCall {
         trellis: bank.trellis.range(0, bank.trellis.bytes())?,
@@ -475,16 +484,15 @@ fn run_jobs_output_mode(
         bits_twice: bank.bits_twice,
         book: bank.book,
         in_rows: None,
-        out_rows: None,
+        out_rows: out_rows_buf
+            .as_ref()
+            .map(|buf| buf.range(0, total_rows * 4))
+            .transpose()?,
         x_rows: total_rows,
         out_total_rows: total_rows,
     };
     let registers = ctx.exl3_jobs_use_registers(&call)?;
-    if fused_out {
-        ctx.exl3_jobs_fused_out(stream, call, true)?;
-    } else {
-        ctx.exl3_jobs(stream, call)?;
-    }
+    ctx.exl3_jobs_fused_out(stream, call, fused_out)?;
     stream.synchronize()?;
     let out_read = testkit::read_bytes(ctx, &out, out_bytes);
     let flag_read = testkit::read_bytes(ctx, &flag, 4);
@@ -501,7 +509,8 @@ fn run_jobs_output_mode(
 /// explicit entry so no env flip races the other tests of the process) must publish the same
 /// bits as the separate rotation kernel, keep the flag, and leave the z projection buffer
 /// untouched. The mixed heights cover one-row jobs, part blocks, odd tops and several CTAs, so
-/// both 32-row staging slabs and the absent-row side of a butterfly pair run.
+/// both 32-row staging slabs and the absent-row side of a butterfly pair run; the listed-output
+/// rounds cover the fused scatter and its out-of-range refusal.
 #[test]
 fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
     if !testkit::device_present("EXL3 fused output rotation") {
@@ -511,6 +520,10 @@ fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
     let stream = ctx.stream().expect("stream");
     let rig = (&ctx, &stream);
     let mut rng = testkit::Rng::new(0x4655_5345);
+    // The rollback has no fused path to compare; the plain entry keeps its own coverage.
+    if !registers_expected() {
+        return;
+    }
     for (bits_twice, book) in [(8, Codebook::Mul1), (4, Codebook::Mcg)] {
         let bank = bank_of(
             &ctx,
@@ -521,36 +534,70 @@ fn fused_output_rotation_matches_the_separate_kernel_and_leaves_z_untouched() {
         let shape: &[(u32, u32)] = &[(3, 1), (0, 70), (4, 144), (2, 9), (1, 64), (4, 33)];
         let (jobs, total) = table(shape);
         let x = rows_of(&mut rng, total, bank.k);
+        let reversed: Vec<u32> = (0..total as u32).rev().collect();
+        let mut over_range = reversed.clone();
+        over_range[2] = total as u32; // one past the rows of out: refused, nothing written
         for (ld, col) in [(bank.n, 0), (bank.n + 40, COL)] {
-            let (plain_out, plain_flag, registers, plain_z) =
-                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), false).expect("jobs");
-            assert!(
-                registers,
-                "the fused epilogue needs the register-decode kernel"
-            );
+            for (name, listed) in [("straight", None), ("reversed", Some(&reversed[..]))] {
+                let (plain_out, plain_flag, registers, plain_z) =
+                    run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, false)
+                        .expect("jobs");
+                assert!(
+                    registers,
+                    "the fused epilogue needs the register-decode kernel"
+                );
+                assert_eq!(
+                    plain_flag, 0,
+                    "{bits_twice}/{book:?}: flag of the plain call"
+                );
+                assert_ne!(
+                    plain_z,
+                    vec![CANARY; plain_z.len()],
+                    "{bits_twice}/{book:?}: the plain call must write z"
+                );
+                let (fused_out, fused_flag, _, fused_z) =
+                    run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), listed, true)
+                        .expect("fused jobs");
+                assert_eq!(
+                    fused_out, plain_out,
+                    "{bits_twice}/{book:?} ld={ld} col={col} {name}: fused bits differ"
+                );
+                assert_eq!(
+                    fused_flag, plain_flag,
+                    "{bits_twice}/{book:?} {name}: flag differs"
+                );
+                assert_eq!(
+                    fused_z,
+                    vec![CANARY; fused_z.len()],
+                    "{bits_twice}/{book:?} {name}: the fused call must not write z"
+                );
+            }
+            // The out-of-range scatter: both paths flag it, drop the same row, keep its canary.
+            let (plain_out, plain_flag, _, _) =
+                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), Some(&over_range), false)
+                    .expect("jobs");
+            let (fused_out, fused_flag, _, _) =
+                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), Some(&over_range), true)
+                    .expect("fused jobs");
             assert_eq!(
-                plain_flag, 0,
-                "{bits_twice}/{book:?}: flag of the plain call"
-            );
-            assert_ne!(
-                plain_z,
-                vec![CANARY; plain_z.len()],
-                "{bits_twice}/{book:?}: the plain call must write z"
-            );
-            let (fused_out, fused_flag, _, fused_z) =
-                run_jobs_output_mode(rig, &bank, &jobs, &x, (ld, col), true).expect("fused jobs");
-            assert_eq!(
-                fused_out, plain_out,
-                "{bits_twice}/{book:?} ld={ld} col={col}: fused bits differ"
+                plain_flag & 1,
+                1,
+                "{bits_twice}/{book:?}: the plain call must flag"
             );
             assert_eq!(
                 fused_flag, plain_flag,
-                "{bits_twice}/{book:?}: flag differs"
+                "{bits_twice}/{book:?}: refusal flag differs"
             );
             assert_eq!(
-                fused_z,
-                vec![CANARY; fused_z.len()],
-                "{bits_twice}/{book:?}: the fused call must not write z"
+                fused_out, plain_out,
+                "{bits_twice}/{book:?}: refused rows differ"
+            );
+            let kept = (0..total)
+                .filter(|&r| fused_out[r * ld..(r + 1) * ld].iter().all(|b| *b == CANARY))
+                .count();
+            assert_eq!(
+                kept, 1,
+                "{bits_twice}/{book:?}: exactly the refused row keeps canary"
             );
         }
     }

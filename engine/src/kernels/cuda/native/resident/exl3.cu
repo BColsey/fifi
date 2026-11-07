@@ -2064,6 +2064,12 @@ __device__ __forceinline__ void jobs_reg_projection(const JobsTile &a,
         // values are the same finite_or_flag(acc) the unfused store writes to z, the butterfly is
         // the same network, and the scale, flag and scatter are the same ops in the same order, so
         // the published bits are identical; only z itself stays unwritten.
+        //
+        // The ring is dead only AFTER this barrier: the loop's last barrier sits at the top of
+        // its final iteration, so without this one a warp leaving the loop could overwrite the
+        // slot a straggler still reads (every stages % 3 except 0 lands that slot inside the
+        // tile). The staging below aliases the ring, so the ordering lives here, not in layout.
+        __syncthreads();
         float *const tile = reinterpret_cast<float *>(&ring[0][0]);
         float *const values = reinterpret_cast<float *>(
             &ring[0][0] + jobs_fused_tile_bytes);
