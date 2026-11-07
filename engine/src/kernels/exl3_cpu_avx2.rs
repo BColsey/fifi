@@ -11,8 +11,9 @@
 //! halves, one `vpshufb` gathers three ring bytes per dword (the stored little-endian words
 //! hold the ring most significant bit first, so the byte order of the ring is folded into the
 //! index table), `vpsrlvd` by `8 - bit offset` and a 16-bit mask cut the trellis state out, and a
-//! dword multiply by the mul1 constant followed by `vpmaddubsw` and `vpmaddwd` against ones gives
-//! the byte sum `S` of each state in an i32 lane. It is converted to f32 and fused-multiply-added
+//! dword multiply by the mul1 constant (`vpmulld`, a wrapping 32-bit multiply like the scalar
+//! `wrapping_mul`) followed by `vpmaddubsw` and `vpmaddwd` against ones gives the byte sum `S` of
+//! each state in an i32 lane. It is converted to f32 and fused-multiply-added
 //! with the activation of that lane's row. Activations stay f32, so, as in the AVX-512 tier, the
 //! only departure from the device kernel is that the weight is not rounded to fp16. The decode
 //! (`decode_sums`, window to byte sums) does not touch an activation and the FMA step
