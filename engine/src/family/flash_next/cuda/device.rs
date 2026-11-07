@@ -53,7 +53,7 @@ impl CardDevice {
 
     /// The bank's statistics line for the load log and the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
-        self.moe.inner.bank().state().stats().misses
+        self.moe.bank().stats().misses
     }
 }
 

@@ -1,11 +1,13 @@
-//! The Qwen3.8 Flash-Next CUDA step, built slice by slice (`docs/plans/flash-next-cuda.md`). The
-//! expert bank (S5, host half), the state and step plans (S3) and the trunk loader with the host
-//! feeds (S1) exist so far; the other slices add their modules beside them. The trunk loader is
-//! `load`; the host feeds are `embedding` (the token's embedding row), `ple_feed` (the n-gram rows
-//! and the PLE step) and, with a device build, `stream_io` (the residual stream between the host
-//! and the card), and `feeds` (batched sorted n-gram row reads, the token-start write and the
-//! device PLE projections). Nothing here is called by a model step, and a CUDA build of Flash-Next
-//! still refuses to serve.
+//! The Qwen3.8 Flash-Next CUDA path (`docs/plans/flash-next-cuda.md`).
+//!
+//! - Loading: `load` (the trunk tensors from the pack walk) and the host feeds `embedding`,
+//!   `ple_feed`, `feeds`, `pack_feeds` and `stream_io`.
+//! - State: `state` and `step_plan` (the device state and the decode arena plan).
+//! - Expert placement: `bank` (device slots, pinned host store and the slot policy), `bank_source`
+//!   (the records from the pack) and `moe_block` (the MoE block split over the bank).
+//! - The decode step: `step`, `mixer`, `driver`, `executor`, `device` and `start`.
+//!
+//! Each module's own header says what it does.
 
 mod bank;
 // The pack reader exists where the pack files do (`load::pack_files`): tests and native-cuda Linux.

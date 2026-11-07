@@ -718,6 +718,11 @@ impl<'w> SplitMoeAt<'w> {
             rows: layers.len(),
         })
     }
+
+    /// The bank behind the split block (its counters and slot row).
+    pub(super) fn bank(&self) -> &super::bank::device::DeviceBank {
+        self.inner.bank()
+    }
 }
 
 impl MoeBlock for SplitMoeAt<'_> {

@@ -412,7 +412,7 @@ mod device {
             layout: &SlotBankLayout,
             dims: &MoeDims,
         ) -> Result<Self, EngError> {
-            let geometry = *bank.state().geometry();
+            let geometry = *bank.geometry();
             if trunks.len() != geometry.layers {
                 return Err(refuse(format!(
                     "{} trunks for a bank of {} layers",
@@ -494,7 +494,7 @@ mod device {
                     dims.rows
                 )));
             }
-            let geometry = *self.bank.state().geometry();
+            let geometry = *self.bank.geometry();
             if dims.n_expert != geometry.experts
                 || dims.top_k != geometry.top_k
                 || layer >= geometry.layers
@@ -508,7 +508,7 @@ mod device {
             let (ctx, stream) = (launch.ctx, launch.stream);
             let sc = self.layout;
             let (h, k) = (dims.hidden, dims.top_k);
-            let slot_row_before: Vec<i32> = self.bank.state().slot_row(layer).to_vec();
+            let slot_row_before: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
             let scratch = &self.scratch;
             let slot_ids = scratch.range(sc.slot_ids, k * I32)?;
             let slot_weights = scratch.range(sc.weights, k * F32)?;
@@ -593,7 +593,7 @@ mod device {
 
             // The copies for every pick, hits included; they run behind the resident pass.
             self.bank.step(ctx, layer, &ids)?;
-            let slot_row_after = self.bank.state().slot_row(layer).to_vec();
+            let slot_row_after = self.bank.slot_row(layer)?.to_vec();
             let second = plan_second_pass(&ids, &weights, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_weights)) = second.miss {
                 let scratch = &self.scratch;
@@ -651,10 +651,7 @@ mod device {
             items: &[Item<'a>],
             (ids, scratch): (DeviceRange<'a>, &Scratch<'a>),
         ) -> Result<(), EngError> {
-            let bank = self
-                .bank
-                .slots(layer)
-                .ok_or_else(|| refuse(format!("layer {layer} is outside the bank")))?;
+            let bank = self.bank.slots(layer)?;
             let first = items
                 .first()
                 .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;

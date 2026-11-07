@@ -6,6 +6,7 @@ use std::{fs::File, os::unix::fs::FileExt, path::PathBuf};
 
 use super::{bank::RecordSource, bank_source::PackRecordSource};
 use crate::{
+    EngError,
     family::{
         exl3_pack::{ExpertPart, Root, expert_name_in},
         flash_next::load::pack_files::FlashPackFiles,
@@ -66,7 +67,7 @@ fn the_records_equal_the_pack_bytes_at_the_offsets_of_the_shard_headers() {
     let dir = pack_dir();
     let layer = moe_layer();
     let files = FlashPackFiles::open(&dir).expect("open the pack through the guard");
-    let source = PackRecordSource::new(&files.checkpoint).expect("the record source");
+    let source = PackRecordSource::from_files(&files).expect("the record source");
     assert_eq!((source.layers(), source.experts()), (48, 512));
     assert_eq!(source.layout().record_bytes(), 1_881_600);
     let index: serde_json::Value = serde_json::from_slice(
@@ -109,11 +110,329 @@ fn the_records_equal_the_pack_bytes_at_the_offsets_of_the_shard_headers() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// A small synthetic pack: 2 layers of 3 experts, 128 x 128 matrices, one in-memory shard.
+// ---------------------------------------------------------------------------------------------
+
+mod synthetic {
+    use std::{
+        io::{Cursor, Read, Seek, SeekFrom},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use super::super::bank_source::PackRecordSource;
+    use crate::{
+        family::{
+            exl3_pack::{ExpertPart, Root, expert_name_in},
+            flash_next::moe::slot_bank::SlotBankLayout,
+        },
+        weights::{
+            StreamedCheckpoint,
+            exl3::{Checkpoint, Config},
+        },
+    };
+
+    pub(super) const LAYERS: usize = 2;
+    pub(super) const EXPERTS: usize = 3;
+    pub(super) const WORDS: usize = 16;
+    const WIDTH: usize = 128;
+
+    /// What a matrix of the pack differs in from the normal one.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Tweak {
+        Normal,
+        /// Another rate: this many u16 words per tile.
+        Words(usize),
+        /// A wider input: this many rows.
+        Rows(usize),
+        /// Carries a `bias` tensor.
+        Bias,
+        /// Lacks its `svh` tensor.
+        NoSvh,
+    }
+
+    /// A shard whose reads fail once `broken` is set (a file that shrinks or errors after open).
+    struct Flaky {
+        inner: Cursor<Vec<u8>>,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl Read for Flaky {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.broken.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("the shard went away"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for Flaky {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    fn bytes(seed: usize, count: usize) -> Vec<u8> {
+        (0..count)
+            .map(|i| ((i * 31 + seed * 17 + (i >> 3)) & 0xff) as u8)
+            .collect()
+    }
+
+    /// Finite F16 scales (0.5 to 2.0) as stored bytes.
+    fn scales(seed: usize, count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|i| {
+                half::f16::from_f32(((i * 7 + seed) % 97 + 32) as f32 / 64.0).to_le_bytes()
+            })
+            .collect()
+    }
+
+    type Entry = (String, &'static str, Vec<usize>, Vec<u8>);
+
+    fn matrix_entries(prefix: &str, seed: usize, tweak: Tweak, entries: &mut Vec<Entry>) {
+        let words = if let Tweak::Words(words) = tweak {
+            words
+        } else {
+            WORDS
+        };
+        let rows = if let Tweak::Rows(rows) = tweak {
+            rows
+        } else {
+            WIDTH
+        };
+        let trellis = bytes(seed, (rows / 16) * (WIDTH / 16) * words * 2);
+        entries.push((
+            format!("{prefix}.trellis"),
+            "I16",
+            vec![rows / 16, WIDTH / 16, words],
+            trellis,
+        ));
+        entries.push((
+            format!("{prefix}.suh"),
+            "F16",
+            vec![rows],
+            scales(seed, rows),
+        ));
+        if tweak != Tweak::NoSvh {
+            entries.push((
+                format!("{prefix}.svh"),
+                "F16",
+                vec![WIDTH],
+                scales(seed + 5, WIDTH),
+            ));
+        }
+        entries.push((
+            format!("{prefix}.mul1"),
+            "I32",
+            vec![],
+            0x83dc_d12du32.to_le_bytes().to_vec(),
+        ));
+        if tweak == Tweak::Bias {
+            entries.push((
+                format!("{prefix}.bias"),
+                "F16",
+                vec![WIDTH],
+                scales(seed + 9, WIDTH),
+            ));
+        }
+    }
+
+    /// Seed of the matrix of (layer, expert, part): every record differs.
+    pub(super) fn seed(layer: usize, expert: usize, part: usize) -> usize {
+        1 + layer * 100 + expert * 10 + part
+    }
+
+    /// The checkpoint of the pack, the layout of its normal matrices, and the switch that breaks
+    /// the shard's reads. `tweak(layer, expert, part)` changes one matrix.
+    pub(super) fn checkpoint(
+        tweak: &dyn Fn(usize, usize, usize) -> Tweak,
+    ) -> (Checkpoint, SlotBankLayout, Arc<AtomicBool>) {
+        let mut entries: Vec<Entry> = Vec::new();
+        for layer in 0..LAYERS {
+            for expert in 0..EXPERTS {
+                for (index, part) in ExpertPart::ALL.into_iter().enumerate() {
+                    let prefix = expert_name_in(Root::Layers, layer, expert, part);
+                    let seed = seed(layer, expert, index);
+                    matrix_entries(&prefix, seed, tweak(layer, expert, index), &mut entries);
+                }
+            }
+        }
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        let mut weight_map = serde_json::Map::new();
+        for (key, dtype, shape, payload) in &entries {
+            let start = data.len();
+            data.extend_from_slice(payload);
+            header.insert(
+                key.clone(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+            weight_map.insert(key.clone(), serde_json::json!("m.safetensors"));
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut file = (json.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&json);
+        file.extend_from_slice(&data);
+        let len = file.len() as u64;
+        let index = serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let shard = Flaky {
+            inner: Cursor::new(file),
+            broken: Arc::clone(&broken),
+        };
+        let source = StreamedCheckpoint::open(
+            &index,
+            vec![("m.safetensors".to_string(), Box::new(shard), len)],
+            1 << 20,
+        )
+        .expect("the synthetic shard opens");
+        let config = Config::from_json(
+            br#"{"quantization_config":{"quant_method":"exl3","version":"1.4.9","codebook":"mul1"}}"#
+                .as_slice(),
+        )
+        .unwrap();
+        let checkpoint = Checkpoint {
+            source,
+            config,
+            model_config: b"{}".to_vec(),
+        };
+        let layout = SlotBankLayout::new(WIDTH, WIDTH, [WORDS; 3]).unwrap();
+        (checkpoint, layout, broken)
+    }
+
+    pub(super) fn source<'a>(
+        checkpoint: &'a Checkpoint,
+        layout: &SlotBankLayout,
+    ) -> PackRecordSource<'a> {
+        PackRecordSource::from_parts(checkpoint, layout.clone(), LAYERS, EXPERTS)
+    }
+}
+
+use synthetic::{EXPERTS, LAYERS, Tweak};
+
+fn normal(_: usize, _: usize, _: usize) -> Tweak {
+    Tweak::Normal
+}
+
+fn text(error: EngError) -> String {
+    error.describe()
+}
+
+#[test]
+fn a_synthetic_pack_yields_the_record_of_each_expert_in_the_layout_order() {
+    let (checkpoint, layout, _) = synthetic::checkpoint(&normal);
+    let source = synthetic::source(&checkpoint, &layout);
+    let mut seen = std::collections::BTreeSet::new();
+    for layer in 0..LAYERS {
+        for expert in 0..EXPERTS {
+            let record = source.read_record(layer, expert).expect("a record");
+            assert_eq!(record.len(), layout.record_bytes());
+            // Each part's trellis is the stored bytes, so records of different experts differ and the
+            // suh of part 0 is the widened F16 scale of that matrix.
+            let part = layout.part(0);
+            let suh = &record[part.suh.clone()];
+            let first = f32::from_le_bytes(suh[..4].try_into().unwrap());
+            let seed = synthetic::seed(layer, expert, 0);
+            assert_eq!(
+                first,
+                half::f16::from_f32((seed % 97 + 32) as f32 / 64.0).to_f32()
+            );
+            assert!(
+                seen.insert(record),
+                "layer {layer} expert {expert} repeats a record"
+            );
+        }
+    }
+    assert_eq!(source.layout().record_bytes(), layout.record_bytes());
+    let total = (LAYERS * EXPERTS * layout.record_bytes()) as u64;
+    source
+        .check_expert_bytes(total)
+        .expect("the total of the walk");
+    let error = text(source.check_expert_bytes(total + 1).unwrap_err());
+    assert!(error.contains("header walk counts"), "{error}");
+    assert!(source.check_expert_bytes(total - 1).is_err());
+}
+
+#[test]
+fn a_wrong_rate_or_shape_is_refused_with_the_layer_and_the_expert() {
+    let wrong = |layer: usize, expert: usize, part: usize, tweak: Tweak| {
+        move |l: usize, e: usize, p: usize| {
+            if (l, e, p) == (layer, expert, part) {
+                tweak
+            } else {
+                Tweak::Normal
+            }
+        }
+    };
+    let (checkpoint, layout, _) = synthetic::checkpoint(&wrong(1, 2, 2, Tweak::Words(80)));
+    let source = synthetic::source(&checkpoint, &layout);
+    assert!(source.read_record(1, 1).is_ok(), "the neighbours are fine");
+    let error = text(source.read_record(1, 2).unwrap_err());
+    assert!(error.contains("layer 1 expert 2"), "{error}");
+    assert!(error.contains("80 words"), "{error}");
+    let (checkpoint, layout, _) = synthetic::checkpoint(&wrong(0, 1, 0, Tweak::Rows(256)));
+    let source = synthetic::source(&checkpoint, &layout);
+    let error = text(source.read_record(0, 1).unwrap_err());
+    assert!(error.contains("layer 0 expert 1"), "{error}");
+    assert!(error.contains("[256, 128]"), "{error}");
+}
+
+#[test]
+fn a_matrix_with_a_bias_is_refused() {
+    let tweak = |l: usize, e: usize, p: usize| {
+        if (l, e, p) == (0, 2, 1) {
+            Tweak::Bias
+        } else {
+            Tweak::Normal
+        }
+    };
+    let (checkpoint, layout, _) = synthetic::checkpoint(&tweak);
+    let source = synthetic::source(&checkpoint, &layout);
+    assert!(source.read_record(0, 0).is_ok());
+    let error = text(source.read_record(0, 2).unwrap_err());
+    assert!(error.contains("layer 0 expert 2 Up has a bias"), "{error}");
+}
+
+#[test]
+fn a_missing_tensor_is_refused_by_name() {
+    let tweak = |l: usize, e: usize, p: usize| {
+        if (l, e, p) == (1, 0, 0) {
+            Tweak::NoSvh
+        } else {
+            Tweak::Normal
+        }
+    };
+    let (checkpoint, layout, _) = synthetic::checkpoint(&tweak);
+    let source = synthetic::source(&checkpoint, &layout);
+    let error = text(source.read_record(1, 0).unwrap_err());
+    let name = expert_name_in(Root::Layers, 1, 0, ExpertPart::Gate);
+    assert!(error.contains("missing tensor"), "{error}");
+    assert!(error.contains(&format!("{name}.svh")), "{error}");
+    assert!(source.read_record(1, 1).is_ok());
+}
+
+#[test]
+fn a_read_that_fails_after_the_open_is_refused_by_name() {
+    let (checkpoint, layout, broken) = synthetic::checkpoint(&normal);
+    let source = synthetic::source(&checkpoint, &layout);
+    assert!(source.read_record(0, 0).is_ok());
+    broken.store(true, std::sync::atomic::Ordering::Release);
+    let error = text(source.read_record(0, 1).unwrap_err());
+    let prefix = expert_name_in(Root::Layers, 0, 1, ExpertPart::Gate);
+    assert!(error.contains(&prefix), "{error}");
+    assert!(error.contains("the shard went away"), "{error}");
+}
+
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::*;
     use crate::{
-        EngError,
         family::{
             flash_next::cuda::bank::{
                 BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
@@ -149,7 +468,7 @@ mod device_tests {
         );
         let layer = moe_layer();
         let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
-        let source = PackRecordSource::new(&files.checkpoint).expect("the record source");
+        let source = PackRecordSource::from_files(&files).expect("the record source");
         let record = source.layout().record_bytes();
         let counts = parse_route_counts(ROUTED, 48, 512).expect("the profile")[layer].clone();
         // The static fill: the sixteen most picked experts of the layer, slots in id order.
