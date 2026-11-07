@@ -5,8 +5,9 @@
 //!
 //! - The real router at top-k 10: the host `route`, a popularity profile, the tier plan's hot set,
 //!   and the classifier oracle on routes outside the profile.
-//! - The CPU cold-expert kernel (`ExpertCpu`, AVX-512) on real routed experts at 3 bpw and on the
-//!   shared expert at 5 bpw, against an fp64 evaluation of the same stored matrices.
+//! - The CPU cold-expert kernel (`ExpertCpu`, every tier the host supports: scalar, AVX2, AVX-512) on
+//!   real routed experts at 3 bpw and on the shared expert at 5 bpw, against an fp64 evaluation of
+//!   the same stored matrices.
 //! - The pack's trunk bytes against the plan's 3,872,376,320 (3.61 GiB).
 
 use std::path::Path;
@@ -40,6 +41,17 @@ const GIB: u64 = 1 << 30;
 /// as the kernel does (`1024 + byte sum` times a binary16 scale plus a binary16 bias, with no
 /// rounding). The two differ only by f32 accumulation and the f32 SiLU: about 1e-6; the bound is 1e-5.
 const EXACT_BOUND: f64 = 1e-5;
+
+/// The same bound for a tier. The vector tiers keep per-lane partial sums and measure 1e-6 to 3e-6
+/// on real layer-3 experts; the scalar reference adds each column in one f32 chain over 2560 terms
+/// and measures up to about 1.2e-5, so it gets three times the bound.
+fn exact_bound(tier: Exl3Isa) -> f64 {
+    if tier == Exl3Isa::Scalar {
+        3.0 * EXACT_BOUND
+    } else {
+        EXACT_BOUND
+    }
+}
 
 /// What rounding the codebook weights to binary16 once (the device kernels' rule, and the other fp64
 /// oracle's) should cost the same comparison, from the format alone. A weight in `[2^e, 2^(e+1))` is
@@ -309,21 +321,31 @@ pub(super) fn relative_l2(got: &[f32], want: &[f64]) -> f64 {
     (diff / norm).sqrt()
 }
 
+/// Every kernel tier this host can run.
+fn host_tiers() -> Vec<Exl3Isa> {
+    [Exl3Isa::Scalar, Exl3Isa::Avx2, Exl3Isa::Avx512]
+        .into_iter()
+        .filter(|tier| tier.is_supported())
+        .collect()
+}
+
 #[test]
-#[ignore = "reads real experts of layer 3 in FIFI_FLASH_NEXT_EXL3_PACK (about 12 MiB) and needs AVX-512"]
+#[ignore = "reads real experts of layer 3 in FIFI_FLASH_NEXT_EXL3_PACK (about 12 MiB), once per supported tier"]
 fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
-    if Exl3Isa::detect() != Exl3Isa::Avx512 {
-        eprintln!("skipped: no AVX-512 on this host");
-        return;
-    }
     let (checkpoint, layer) = open();
+    for tier in host_tiers() {
+        real_experts_match_fp64(&checkpoint, layer, tier);
+    }
+}
+
+fn real_experts_match_fp64(checkpoint: &Checkpoint, layer: usize, tier: Exl3Isa) {
     let (shape, _) = model_shape(&checkpoint.model_config).expect("the model shape");
     let hidden = shape.moe.hidden;
     let root = Root::Layers;
     let cpu = ExpertCpu::new(
         4,
         WaitPolicy::SpinThenPark(Duration::from_micros(500)),
-        Some(Exl3Isa::Avx512),
+        Some(tier),
     )
     .expect("the CPU kernel");
     let mut cases: Vec<(String, Stored)> = [0usize, 255, 511]
@@ -331,13 +353,16 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
         .map(|expert| {
             let prefixes = ExpertPart::ALL.map(|part| expert_name_in(root, layer, expert, part));
             (
-                format!("expert {expert} (3 bpw)"),
-                stored(&checkpoint, prefixes),
+                format!("{tier:?} expert {expert} (3 bpw)"),
+                stored(checkpoint, prefixes),
             )
         })
         .collect();
     let shared = ExpertPart::ALL.map(|part| shared_name_in(root, layer, part));
-    cases.push(("shared expert (5 bpw)".into(), stored(&checkpoint, shared)));
+    cases.push((
+        format!("{tier:?} shared expert (5 bpw)"),
+        stored(checkpoint, shared),
+    ));
     for seed in 0..3 {
         let x = input(hidden, seed);
         let x64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
@@ -365,7 +390,7 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
             // The kernel evaluates the codebook exactly, so it agrees with the exact oracle to f32 accuracy.
             // A larger gap here would be a real discrepancy, not rounding.
             assert!(
-                to_exact <= EXACT_BOUND,
+                to_exact <= exact_bound(tier),
                 "{name}, row {seed}: {to_exact:.3e}"
             );
             // Against the rounded oracle it shows that rounding, and no more. The lower check below is a
@@ -415,26 +440,28 @@ fn the_cpu_kernel_matches_fp64_on_real_experts_and_the_shared_expert() {
     let exact = combine(cases[0].1.fp64_exact(&x64), cases[1].1.fp64_exact(&x64));
     let rounded = combine(cases[0].1.fp64(&x64), cases[1].1.fp64(&x64));
     let (to_exact, to_rounded) = (relative_l2(&out, &exact), relative_l2(&out, &rounded));
-    eprintln!("two weighted picks: exact {to_exact:.3e}, rounded {to_rounded:.3e}");
-    assert!(to_exact <= EXACT_BOUND, "{to_exact:.3e}");
-    assert!(to_rounded <= rounded_bound(), "{to_rounded:.3e}");
+    eprintln!("{tier:?} two weighted picks: exact {to_exact:.3e}, rounded {to_rounded:.3e}");
+    assert!(to_exact <= exact_bound(tier), "{tier:?}: {to_exact:.3e}");
+    assert!(to_rounded <= rounded_bound(), "{tier:?}: {to_rounded:.3e}");
 }
 
 #[test]
-#[ignore = "reads real experts of layer 3 in FIFI_FLASH_NEXT_EXL3_PACK (about 6 MiB) and needs AVX-512"]
+#[ignore = "reads real experts of layer 3 in FIFI_FLASH_NEXT_EXL3_PACK (about 6 MiB), once per supported tier"]
 fn a_packed_slot_record_of_a_real_expert_runs_on_the_cpu_kernel_like_its_matrices() {
-    if Exl3Isa::detect() != Exl3Isa::Avx512 {
-        eprintln!("skipped: no AVX-512 on this host");
-        return;
-    }
     let (checkpoint, layer) = open();
+    for tier in host_tiers() {
+        slot_record_runs_like_its_matrices(&checkpoint, layer, tier);
+    }
+}
+
+fn slot_record_runs_like_its_matrices(checkpoint: &Checkpoint, layer: usize, tier: Exl3Isa) {
     let (shape, _) = model_shape(&checkpoint.model_config).expect("the model shape");
     let moe = shape.moe;
     let root = Root::Layers;
     let cpu = ExpertCpu::new(
         4,
         WaitPolicy::SpinThenPark(Duration::from_micros(500)),
-        Some(Exl3Isa::Avx512),
+        Some(tier),
     )
     .expect("the CPU kernel");
     let layout = SlotBankLayout::new(moe.hidden, moe.inter, [48, 48, 48]).expect("the layout");
@@ -447,12 +474,12 @@ fn a_packed_slot_record_of_a_real_expert_runs_on_the_cpu_kernel_like_its_matrice
     let x64: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
     for expert in [1usize, 256, 510] {
         let parts = ExpertPart::ALL
-            .map(|part| matrix(&checkpoint, &expert_name_in(root, layer, expert, part)));
+            .map(|part| matrix(checkpoint, &expert_name_in(root, layer, expert, part)));
         let record = layout
             .pack_matrices([&parts[0], &parts[1], &parts[2]])
             .expect("a record");
         let reference = stored(
-            &checkpoint,
+            checkpoint,
             ExpertPart::ALL.map(|part| expert_name_in(root, layer, expert, part)),
         );
         let run = |view: ExpertView<'_>| {
@@ -476,15 +503,17 @@ fn a_packed_slot_record_of_a_real_expert_runs_on_the_cpu_kernel_like_its_matrice
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            "expert {expert}: a record and the matrices give the same bits"
+            "{tier:?} expert {expert}: a record and the matrices give the same bits"
         );
         let error = relative_l2(&from_record, &reference.fp64_exact(&x64));
-        eprintln!("expert {expert} from its record: relative L2 {error:.3e}");
-        assert!(error <= EXACT_BOUND, "expert {expert}: {error:.3e}");
+        eprintln!("{tier:?} expert {expert} from its record: relative L2 {error:.3e}");
+        assert!(
+            error <= exact_bound(tier),
+            "{tier:?} expert {expert}: {error:.3e}"
+        );
     }
     // A matrix of another rate than the layout is refused.
-    let shared =
-        ExpertPart::ALL.map(|part| matrix(&checkpoint, &shared_name_in(root, layer, part)));
+    let shared = ExpertPart::ALL.map(|part| matrix(checkpoint, &shared_name_in(root, layer, part)));
     assert!(
         layout
             .pack_matrices([&shared[0], &shared[1], &shared[2]])
