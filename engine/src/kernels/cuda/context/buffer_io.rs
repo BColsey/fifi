@@ -165,6 +165,35 @@ impl CudaContext {
         })
     }
 
+    /// The capture-legal form of [`Self::copy_device`]: the same launch-only D2D enqueue,
+    /// allowed inside an open capture window, where it becomes a memcpy node of the graph.
+    /// CONTRACT: the caller pins both allocations for the whole life of any graph that records
+    /// the copy (a graph bakes their addresses in), so the ordinary [`Self::copy_device`] stays
+    /// closed to capture and only callers that own their pinning use this form.
+    pub(crate) fn copy_device_pinned(
+        &self,
+        stream: &DeviceStream,
+        source: DeviceRange<'_>,
+        destination: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        self.ensure_usable()?;
+        if source.bytes() != destination.bytes() {
+            return Err(EngError::BadRequest(
+                "device copies need equal byte ranges".into(),
+            ));
+        }
+        if std::ptr::eq(source.buffer(), destination.buffer()) {
+            return Err(EngError::BadRequest(
+                "device copies need distinct allocations".into(),
+            ));
+        }
+        let source = self.raw_range(&source)?;
+        let destination = self.raw_range(&destination)?;
+        self.launch_on(stream, |raw| {
+            resident::copy_d2d_async(source, destination, raw)
+        })
+    }
+
     /// Allocates `bytes` of uninitialized device memory that shares this context's lease.
     ///
     /// Returns `BadRequest` for zero bytes (the adapter would reject it with a

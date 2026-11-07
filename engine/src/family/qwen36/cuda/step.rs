@@ -469,6 +469,12 @@ pub(crate) struct QwenResidentStep<'a> {
     /// decode step runs EAGER and reads the router picks back after every MoE block. A
     /// diagnostic measurement opt-in, not a serving feature (see `route_capture`).
     route_capture: bool,
+    /// The env flag of the capture-preserving stage (Q36_ROUTE_STAGE=1): when on, the plain-MoE
+    /// layers' router picks are D2D-staged inside the step's enqueued work (graph-capture legal)
+    /// and read back once per token. EXL3 and tiered layouts are refused at step time.
+    route_stage_on: bool,
+    /// The stage itself, allocated for the plain layout when `route_stage_on` (see `RouteStage`).
+    route_stage: Option<RouteStage>,
     shortlist_bytes: [u8; shortlist::RESULT_BYTES],
     report: RunReport,
     prefill_report: PrefillReport,
@@ -614,6 +620,83 @@ pub(super) fn any_chunk_weight_q6k(
     Ok(false)
 }
 
+/// The capture-preserving routing stage (`Q36_ROUTE_STAGE`, `route_stage`): a staging buffer
+/// beside the arena whose address a captured graph bakes in, so the per-layer D2D copies that
+/// fill it — launch-only, enqueued in the plain-MoE arm — become graph nodes a replay refreshes
+/// every step. The host reads it back once per token, after the step's own read-back (the stream
+/// is drained by then, so the copy rides that sync). Leaked like `pins`: the buffer is pinned
+/// for the graph's life, 40 layers x 68 bytes, once per engine.
+struct RouteStage {
+    buffer: &'static DeviceBuffer,
+    /// Bytes per layer: ids `[top_k]` i32, weights `[top_k]` f32, gate f32.
+    stride: usize,
+    top_k: usize,
+    /// Host scratch of the whole buffer, refilled by the per-token readback.
+    bytes: Vec<u8>,
+}
+
+fn new_route_stage(
+    context: &CudaContext,
+    layers: usize,
+    top_k: usize,
+) -> Result<RouteStage, EngError> {
+    let stride = (2 * top_k + 1) * size_of::<f32>();
+    let buffer = context.allocate(stride * layers)?;
+    Ok(RouteStage {
+        buffer: Box::leak(Box::new(buffer)),
+        stride,
+        top_k,
+        bytes: vec![0; stride * layers],
+    })
+}
+
+/// The staging copies of one layer: three launch-only D2D enqueues from the layer's router
+/// ranges into the stage at `layer * stride` (ids, then weights, then gate). Inside a capture
+/// window each becomes a memcpy node of the graph.
+fn stage_route_layer(
+    ctx: &CudaContext,
+    stream: &DeviceStream,
+    stage: &RouteStage,
+    layer: usize,
+    route: &super::moe::RouteBufs<'_>,
+) -> Result<(), EngError> {
+    let at = layer * stage.stride;
+    let ids = stage.buffer.range(at, stage.top_k * size_of::<i32>())?;
+    let weights = stage.buffer.range(
+        at + stage.top_k * size_of::<f32>(),
+        stage.top_k * size_of::<f32>(),
+    )?;
+    let shared_gate = stage
+        .buffer
+        .range(at + 2 * stage.top_k * size_of::<f32>(), size_of::<f32>())?;
+    ctx.copy_device_pinned(stream, route.ids, ids)?;
+    ctx.copy_device_pinned(stream, route.weights, weights)?;
+    ctx.copy_device_pinned(stream, route.shared_gate, shared_gate)
+}
+
+/// The per-token host readback of the whole stage, decoded into one `LayerPicks` per layer in
+/// launch order. The caller runs it after the step's own read-back, so the single `read_at` is
+/// hot (the stream is already drained).
+fn read_staged_route(
+    stage: &mut RouteStage,
+    stream: &DeviceStream,
+) -> Result<Vec<crate::family::qwen36::route_capture::LayerPicks>, EngError> {
+    stage.buffer.read_at(stream, 0, &mut stage.bytes)?;
+    let layer = stage.bytes.chunks(stage.stride).map(|row| {
+        let word = |at: usize| {
+            u32::from_le_bytes(row[4 * at..4 * at + 4].try_into().expect("stage row word"))
+        };
+        crate::family::qwen36::route_capture::LayerPicks {
+            ids: (0..stage.top_k).map(|i| word(i) as i32).collect(),
+            weights: (0..stage.top_k)
+                .map(|i| f32::from_bits(word(stage.top_k + i)))
+                .collect(),
+            shared_gate: f32::from_bits(word(2 * stage.top_k)),
+        }
+    });
+    Ok(layer.collect())
+}
+
 impl<'a> QwenResidentStep<'a> {
     /// Builds the step: stream, event, pinned word, resident state, and every weight lookup. All
     /// allocation of a session happens here.
@@ -722,8 +805,28 @@ impl<'a> QwenResidentStep<'a> {
             (moe, None)
         };
         let vocab = res.dims.shape.vocab;
+        let route_stage_on = crate::family::qwen36::route_stage::enabled(
+            std::env::var(crate::family::qwen36::route_stage::VAR)
+                .ok()
+                .as_deref(),
+        );
+        // EXL3 and tiered are refused at step time (their MoE arms are not staged); the stage
+        // is not even allocated for them.
+        let route_stage = if route_stage_on && options.layout != WeightLayout::Exl3 && !tiered_mode
+        {
+            Some(new_route_stage(
+                context,
+                layers.len(),
+                moe_dims(&res.dims).top_k,
+            )?)
+        } else {
+            None
+        };
         let mut pinned: Vec<&'a DeviceBuffer> = weights.device_buffers().collect();
         pinned.push(res.arena.buffer());
+        if let Some(stage) = &route_stage {
+            pinned.push(stage.buffer);
+        }
         let pins: &'a [&'a DeviceBuffer] = Box::leak(pinned.into_boxed_slice());
         // The chunk gate's Q6_K scan, beside the other build-time facts: only Native weights carry
         // a quant type; a Tiled session is refused by its layout before the scan matters. The
@@ -798,6 +901,8 @@ impl<'a> QwenResidentStep<'a> {
                     .ok()
                     .as_deref(),
             ),
+            route_stage_on,
+            route_stage,
             shortlist_bytes: [0; shortlist::RESULT_BYTES],
             report: RunReport::default(),
             prefill_report: PrefillReport::default(),
@@ -1640,10 +1745,14 @@ impl<'a> QwenResidentStep<'a> {
             ));
         }
         // The spike instruments the plain gguf MoE arm only, so it refuses the layouts it
-        // cannot record (silently partial picks would poison the measurement).
-        if self.route_capture && (self.layout == WeightLayout::Exl3 || self.tiered_mode) {
+        // cannot record (silently partial picks would poison the measurement). The stage is
+        // refused with it: it stages the same arm.
+        if (self.route_capture || self.route_stage_on)
+            && (self.layout == WeightLayout::Exl3 || self.tiered_mode)
+        {
             return Err(EngError::BadRequest(
-                "step: Q36_ROUTE_CAPTURE covers the plain MoE arm only, not EXL3 or tiered"
+                "step: Q36_ROUTE_CAPTURE and Q36_ROUTE_STAGE cover the plain MoE arm only, not \
+                 EXL3 or tiered"
                     .to_owned(),
             ));
         }
@@ -1711,6 +1820,27 @@ impl<'a> QwenResidentStep<'a> {
             );
         }
         let pair = self.read_back(&plan).inspect_err(|_| self.state.poison())?;
+        if let Some(stage) = self.route_stage.as_mut() {
+            // The one host readback of the stage (see `RouteStage`): the stream is drained by
+            // `read_back`, so this single `read_at` rides that sync and adds no wait of its own.
+            let step = crate::family::qwen36::route_stage::begin_step();
+            let picks = read_staged_route(stage, &self.stream)?;
+            if step < 2 {
+                let first = picks.first().expect("stage readback has layer 0");
+                let last = picks.last().expect("stage readback has the last layer");
+                eprintln!(
+                    "q36 route stage: step {step}: {} layers; layer 0 ids {:?} weights {:?} \
+                     gate {:.4}; layer {} ids {:?}",
+                    picks.len(),
+                    first.ids,
+                    first.weights,
+                    first.shared_gate,
+                    picks.len() - 1,
+                    last.ids
+                );
+            }
+            crate::family::qwen36::route_stage::store(step, picks);
+        }
         if let Some(error) = exl3_pair_refusal(self.layout, pair) {
             self.state.poison();
             return Err(error);
@@ -1847,7 +1977,11 @@ impl<'a> QwenResidentStep<'a> {
     /// the ops that were entered, the failing one included. Opt-in research activation capture is
     /// another eager-only exception: one synchronous read after Moe(19), before arena reuse. The
     /// routing readback spike (`Q36_ROUTE_CAPTURE`, `route_capture`) is the last one: three
-    /// synchronous reads after every plain-MoE block, so a step with it on stays EAGER.
+    /// synchronous reads after every plain-MoE block, so a step with it on stays EAGER. The
+    /// capture-preserving stage (`Q36_ROUTE_STAGE`, `route_stage`) is launch-only like the rest
+    /// of the body: its per-layer D2D staging copies enqueue on the owned stream and become
+    /// memcpy nodes of a captured graph (the host readback runs after the body, beside
+    /// `read_back`), so it does NOT force eager and is the production shape.
     fn run_body(
         &self,
         admit_pos: usize,
@@ -2141,8 +2275,13 @@ impl<'a> QwenResidentStep<'a> {
                     self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
                 let block = run_moe_block(&launch, weights, bufs, &self.moe_dims);
-                if self.route_capture && block.is_ok() {
-                    self.capture_route_picks(s, &bufs.route, self.moe_dims.top_k)?;
+                if block.is_ok() {
+                    if let Some(stage) = &self.route_stage {
+                        stage_route_layer(ctx, s, stage, layer, &bufs.route)?;
+                    }
+                    if self.route_capture {
+                        self.capture_route_picks(s, &bufs.route, self.moe_dims.top_k)?;
+                    }
                 }
                 block
             }

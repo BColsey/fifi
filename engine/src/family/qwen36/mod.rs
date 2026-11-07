@@ -72,6 +72,7 @@ mod resident;
 )]
 pub(crate) mod rollback;
 mod route_capture;
+mod route_stage;
 pub(crate) mod settings;
 #[cfg(test)]
 mod sparse_reference;
