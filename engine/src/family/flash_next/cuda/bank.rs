@@ -224,15 +224,18 @@ pub(super) struct HostTerms {
     /// Kept free so the plan does not ride the line (exllamav3 keeps 2 GiB as well).
     pub(super) margin: u64,
     /// The least page cache the n-gram table's random reads must keep. A floor, not a target: all
-    /// RAM the plan leaves free is page cache.
+    /// RAM the plan leaves free is page cache. PROVISIONAL: the default of 8 GiB (a quarter of the
+    /// 30.4 GiB table) came from the author's choice, not from a measurement. The coordinator
+    /// accepted it as provisional; it is to be set from the row-read latency measurement on the
+    /// 990 PRO (M-N1) once that exists.
     pub(super) ngram_cache_min: u64,
     /// Metadata allowance charged to each of the two stream-bank slots besides the payload.
     pub(super) stream_slot_metadata: u64,
 }
 
 impl HostTerms {
-    /// The defaults for the 62 GiB host. `ngram_cache_min` is a choice (8 GiB, a quarter of the
-    /// 30.4 GiB table); the plan reports what is left above it.
+    /// The defaults for the 62 GiB host. `ngram_cache_min` is a provisional choice (8 GiB, a
+    /// quarter of the 30.4 GiB table), not a measurement; the plan reports what is left above it.
     pub(super) const DEFAULT: Self = Self {
         engine_heap: 3 * GIB,
         margin: 2 * GIB,
