@@ -21,6 +21,8 @@ use crate::{
 
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(super) mod exl3_pack;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) mod pack_files;
 
 const MODEL: &str = "language_model.model.";
 

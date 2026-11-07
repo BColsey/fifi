@@ -25,7 +25,15 @@ impl Checkpoint {
     pub(crate) fn open(dir: &Path) -> Result<Self, EngError> {
         // One mount-table read covers the directory and every shard: a shard
         // can be a symlink into a network mount (a downloaded snapshot).
-        let guard = crate::storage_guard::LocalGuard::new()?;
+        Self::open_with(dir, &crate::storage_guard::LocalGuard::new()?)
+    }
+
+    /// [`Self::open`] with the caller's guard, for a loader that opens more files of the same
+    /// pack (the Flash-Next n-gram table) and reads the mount table once.
+    pub(crate) fn open_with(
+        dir: &Path,
+        guard: &crate::storage_guard::LocalGuard,
+    ) -> Result<Self, EngError> {
         guard.check(dir, "model weights")?;
         let model_config = read_metadata(&dir.join("config.json"), CONFIG_LIMIT)?;
         let config = Config::from_json(&model_config)?;
