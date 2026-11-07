@@ -77,7 +77,7 @@ pub(super) fn input(hidden: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Matrix {
+pub(super) fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Matrix {
     let names = COMPONENT_SUFFIXES.map(|suffix| format!("{prefix}.{suffix}"));
     let keys = names.each_ref().map(String::as_str);
     let selected = checkpoint
@@ -90,7 +90,7 @@ fn matrix(checkpoint: &Checkpoint, prefix: &str) -> Matrix {
 /// The plan on the 3090 at `positions` of f16 K/V, with the trunk the header walk found.
 pub(super) fn plan_at(tier: TierShape, trunk: u64, positions: u64) -> TierPlan {
     let bytes = position_bytes(12, 2, 256, 2, (128, 4)).expect("position bytes");
-    let inputs = TierInputs::rtx3090(
+    let inputs = TierInputs::cost_model_3090(
         tier,
         (trunk, 36 * 3 * (1 << 20)),
         crate::family::qwen36::tiered::budget::KvPlan {
@@ -215,7 +215,7 @@ struct Stored {
     bytes: [[Vec<u8>; 3]; 3],
 }
 
-fn widened(tensor: &crate::tensor::Tensor) -> Vec<u8> {
+pub(super) fn widened(tensor: &crate::tensor::Tensor) -> Vec<u8> {
     let bytes = tensor.host_bytes().expect("host bytes");
     match tensor.dtype() {
         Dtype::F32 => bytes.to_vec(),
@@ -292,13 +292,13 @@ impl Stored {
     }
 }
 
-fn relative_l2_f64(got: &[f64], want: &[f64]) -> f64 {
+pub(super) fn relative_l2_f64(got: &[f64], want: &[f64]) -> f64 {
     let diff: f64 = got.iter().zip(want).map(|(g, w)| (g - w).powi(2)).sum();
     let norm: f64 = want.iter().map(|w| w * w).sum();
     (diff / norm).sqrt()
 }
 
-fn relative_l2(got: &[f32], want: &[f64]) -> f64 {
+pub(super) fn relative_l2(got: &[f32], want: &[f64]) -> f64 {
     let diff: f64 = got
         .iter()
         .zip(want)

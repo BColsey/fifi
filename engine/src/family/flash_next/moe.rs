@@ -389,6 +389,8 @@ mod graph_bench;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod projection_bench;
 #[cfg(test)]
+mod real_attention_tests;
+#[cfg(test)]
 mod real_layer_tests;
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod residency_bench;
