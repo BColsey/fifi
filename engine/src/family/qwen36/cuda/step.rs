@@ -1693,6 +1693,23 @@ impl<'a> QwenResidentStep<'a> {
             Ok(how) => how,
             Err(error) => return Err(self.fail(entered, error)),
         };
+        // The first two staged steps log their picks once: a bench log then carries the sanity
+        // evidence that the readback held real picks (top-k ids below n_expert, no -1 fault,
+        // renormalized weights) without any extra surface.
+        if self.route_capture
+            && let Some((step, layers)) = crate::family::qwen36::route_capture::staged()
+            && step < 2
+            && let (Some(first), Some(last)) = (layers.first(), layers.last())
+        {
+            eprintln!(
+                "q36 route capture: step {step} staged {} layers; first ids {:?} weights {:?} gate {:.4}; last ids {:?}",
+                layers.len(),
+                first.ids,
+                first.weights,
+                first.shared_gate,
+                last.ids
+            );
+        }
         let pair = self.read_back(&plan).inspect_err(|_| self.state.poison())?;
         if let Some(error) = exl3_pair_refusal(self.layout, pair) {
             self.state.poison();
