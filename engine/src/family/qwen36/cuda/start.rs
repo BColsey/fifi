@@ -9,6 +9,7 @@
 //! flag before `spawn_engine`, commits it right after the leaks, and every retry in the same
 //! process is refused.
 
+use super::super::exl3_merge_plan::{resolve_switch, shared_in_routed_explicit};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
     DEFAULT_CUDA_PREFILL_CHUNK, KvDtype, NO_BUDGET_PIECE, Q36Settings, RollbackMode, WeightFormat,
@@ -691,6 +692,12 @@ pub(crate) fn start(
     // refused at startup, not on the engine thread after the projector exists; unset stays OFF
     // with no error (`sha256_wanted(None)` is `Ok(false)`, pinned in start_tests).
     let verify = sha256_wanted(std::env::var(VERIFY_SHA256_VAR).ok().as_deref())?;
+    // Likewise `FIFI_EXL3_SHARED_IN_ROUTED`: a bad value, or `1` on a GGUF checkpoint, stops the
+    // start before any weight is read.
+    resolve_switch(
+        shared_in_routed_explicit(),
+        matches!(settings.weights, WeightFormat::Exl3),
+    )?;
     let chunked =
         chunk_prefill_wanted(settings.kv, std::env::var_os(CHUNK_PREFILL_VAR).as_deref())?;
     let chunk_off = chunk_rollback_requested(std::env::var_os(CHUNK_PREFILL_VAR).as_deref());

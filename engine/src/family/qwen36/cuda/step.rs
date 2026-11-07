@@ -356,6 +356,9 @@ pub(crate) struct QwenResidentStep<'a> {
     exl3_moe: Vec<Exl3MoeWeights<'a>>,
     /// `FIFI_EXL3_SHARED_IN_ROUTED=1`: the working buffer of the MoE block that queues the shared
     /// expert inside the routed launches. `None` (the default) keeps the reference block.
+    ///
+    /// Declared after `graph`, so the graph drops first: a captured body bakes in this buffer's
+    /// address and its replay must never outlive the buffer.
     exl3_merge: Option<SharedMerge>,
     /// The tiered mode: the options asked for it. The routed expert stacks are then not loaded,
     /// `moe` is empty and every layer's MoE block runs through `tiered`. Cost: each layer of each
@@ -768,7 +771,13 @@ impl<'a> QwenResidentStep<'a> {
                 "step: the MoE block is fixed once the session runs".to_owned(),
             ));
         }
-        self.exl3_merge = if on && self.layout == WeightLayout::Exl3 {
+        if on && self.layout != WeightLayout::Exl3 {
+            return Err(EngError::BadRequest(
+                "step: the shared expert rides in the routed launches of an EXL3 step only"
+                    .to_owned(),
+            ));
+        }
+        self.exl3_merge = if on {
             Some(SharedMerge::new(
                 self.context,
                 &self.moe_dims,

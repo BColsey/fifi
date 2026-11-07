@@ -6,7 +6,7 @@
 
 use std::ffi::OsStr;
 
-use crate::EngError;
+use crate::{EngError, kernels::single_row::SingleRow};
 
 const F32: usize = size_of::<f32>();
 
@@ -248,4 +248,121 @@ impl MergeLayout {
             total: offset,
         })
     }
+}
+
+/// Which `ids` word a pair reads its member from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family) enum IdWord {
+    /// The router's `TopkId` array.
+    Router,
+    /// The zero word of the working buffer: the member id of a one-member bank.
+    Zero,
+}
+
+/// Byte ranges of a pair inside the working buffer. `input` is `None` for the normalized row,
+/// which lives in the step arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family) struct PairSpans {
+    pub(in crate::family) input: Option<Span>,
+    pub(in crate::family) output: Span,
+}
+
+impl PlannedPair {
+    /// The `ids` word and slot the pair's member is read from: pick `s` reads the router's
+    /// `ids[s]`, the shared pair reads word 0 of the zero word, so its member is member 0.
+    pub(in crate::family) fn id_word(&self) -> (IdWord, u32) {
+        match self.member {
+            Member::Routed(slot) => (IdWord::Router, slot),
+            Member::Shared => (IdWord::Zero, 0),
+        }
+    }
+
+    /// Where the pair reads its row and writes its result in the working buffer.
+    pub(in crate::family) fn spans(&self, dims: &PlanDims, layout: &MergeLayout) -> PairSpans {
+        let row = |base: Span, width: usize, index: usize| Span {
+            offset: base.offset + index * width * F32,
+            bytes: width * F32,
+        };
+        PairSpans {
+            input: match self.input {
+                Input::NormRow => None,
+                Input::ActRow(index) => Some(row(layout.act, dims.inter, index)),
+            },
+            output: match self.proj {
+                Proj::Gate | Proj::Up => row(layout.gu, dims.inter, self.out_row),
+                Proj::Down => row(layout.down, dims.hidden, self.out_row),
+            },
+        }
+    }
+}
+
+impl MergeLayout {
+    /// The combine's two terms in the `down` area: the routed rows `0..top_k` in pick order and
+    /// the shared row `top_k`.
+    pub(in crate::family) fn combine_spans(&self, dims: &PlanDims) -> (Span, Span) {
+        let routed = Span {
+            offset: self.down.offset,
+            bytes: dims.top_k * dims.hidden * F32,
+        };
+        let shared = Span {
+            offset: self.down.offset + routed.bytes,
+            bytes: dims.hidden * F32,
+        };
+        (routed, shared)
+    }
+}
+
+/// What the plan needs to know of one shared matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::family) struct SharedFacts {
+    pub(in crate::family) name: &'static str,
+    pub(in crate::family) bias: bool,
+    pub(in crate::family) bits_twice: u8,
+}
+
+/// Everything that must hold for the shared expert to ride in the routed launches, or the first
+/// refusal, naming the switch: the block (rows, picks, widths), the single-row kernel (`wide1`,
+/// one tile per block) and, per layer, the shared gate, up and down (no bias, 4 or 6 bits).
+pub(in crate::family) fn check_merge(
+    dims: &PlanDims,
+    kernel: SingleRow,
+    layers: &[[SharedFacts; 3]],
+) -> Result<(), String> {
+    let fail = |detail: String| format!("{SHARED_IN_ROUTED_VAR}=1: {detail}");
+    check_dims(dims).map_err(fail)?;
+    if kernel != SingleRow::Wide(1) {
+        return Err(fail(format!(
+            "it needs the single-row kernel wide1 (one tile per block), the session runs {kernel:?}"
+        )));
+    }
+    for (layer, facts) in layers.iter().enumerate() {
+        for fact in facts {
+            if fact.bias {
+                return Err(fail(format!("layer {layer} {} has a bias", fact.name)));
+            }
+            if !matches!(fact.bits_twice, 8 | 12) {
+                return Err(fail(format!(
+                    "layer {layer} {} is {} bits twice, the merged launch supports 8 and 12",
+                    fact.name, fact.bits_twice
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The switch as the session start resolves it, before any weight is read: a bad value is
+/// refused for every weight format, and `1` is refused unless the weights are EXL3, because only
+/// the EXL3 MoE block has a shared expert to move. `value` is [`shared_in_routed_explicit`].
+pub(in crate::family) fn resolve_switch(
+    value: Result<bool, EngError>,
+    exl3_weights: bool,
+) -> Result<bool, EngError> {
+    let on = value?;
+    if on && !exl3_weights {
+        return Err(EngError::BadRequest(format!(
+            "{SHARED_IN_ROUTED_VAR}=1 applies to EXL3 weights only; unset it or use an EXL3 pack"
+        )));
+    }
+    Ok(on)
 }

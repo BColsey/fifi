@@ -60,11 +60,11 @@ use crate::{
     family::{
         project::cuda::exl3::{Exl3Bank, Exl3Io, Exl3Weight},
         qwen36::exl3_merge_plan::{
-            BlockPlan, Input, Member, MergeLayout, PlanDims, PlannedPair, Proj,
-            SHARED_IN_ROUTED_VAR, Span, block_plan, check_dims,
+            BlockPlan, IdWord, Member, MergeLayout, PlanDims, PlannedPair, Proj,
+            SHARED_IN_ROUTED_VAR, SharedFacts, Span, block_plan, check_dims, check_merge,
         },
     },
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, resident::exl3::SingleRow},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
 };
 
 /// The plan sizes of a block.
@@ -78,21 +78,6 @@ fn plan_dims(dims: &MoeDims) -> PlanDims {
     }
 }
 
-/// What one layer's shared matrices must satisfy: the rates whose projection body is the same
-/// code in the grouped and the id-indexed kernels, and no bias.
-fn check_shared(layer: usize, name: &str, weight: &Exl3Weight) -> Result<(), String> {
-    if weight.bias.is_some() {
-        return Err(format!("layer {layer} {name} has a bias"));
-    }
-    if !matches!(weight.bits_twice, 8 | 12) {
-        return Err(format!(
-            "layer {layer} {name} is {} bits twice, the merged launch supports 8 and 12",
-            weight.bits_twice
-        ));
-    }
-    Ok(())
-}
-
 /// The merged block's working buffer, owned by the step for its life.
 pub(in crate::family) struct SharedMerge {
     buffer: DeviceBuffer,
@@ -100,6 +85,8 @@ pub(in crate::family) struct SharedMerge {
 }
 
 struct Ranges<'b> {
+    buffer: &'b DeviceBuffer,
+    layout: &'b MergeLayout,
     xh: DeviceRange<'b>,
     z: DeviceRange<'b>,
     gu: DeviceRange<'b>,
@@ -118,24 +105,24 @@ impl SharedMerge {
         dims: &MoeDims,
         layers: &[Exl3MoeWeights<'_>],
     ) -> Result<Self, EngError> {
-        let fail =
-            |detail: String| EngError::BadRequest(format!("{SHARED_IN_ROUTED_VAR}=1: {detail}"));
-        let layout = MergeLayout::new(&plan_dims(dims)).map_err(fail)?;
-        let kernel = ctx.single_row_setting()?;
-        if kernel != SingleRow::Wide(1) {
-            return Err(fail(format!(
-                "it needs the single-row kernel wide1 (one tile per block), the session runs {kernel:?}"
-            )));
-        }
-        for (layer, weights) in layers.iter().enumerate() {
-            for (name, weight) in [
-                ("shared gate", weights.shared_gate),
-                ("shared up", weights.shared_up),
-                ("shared down", weights.shared_down),
-            ] {
-                check_shared(layer, name, weight).map_err(fail)?;
-            }
-        }
+        let facts: Vec<[SharedFacts; 3]> = layers
+            .iter()
+            .map(|weights| {
+                [
+                    ("shared gate", weights.shared_gate),
+                    ("shared up", weights.shared_up),
+                    ("shared down", weights.shared_down),
+                ]
+                .map(|(name, weight)| SharedFacts {
+                    name,
+                    bias: weight.bias.is_some(),
+                    bits_twice: weight.bits_twice,
+                })
+            })
+            .collect();
+        let plan = plan_dims(dims);
+        check_merge(&plan, ctx.single_row_setting()?, &facts).map_err(EngError::BadRequest)?;
+        let layout = MergeLayout::new(&plan).map_err(EngError::BadRequest)?;
         let buffer = ctx.upload(&vec![0u8; layout.total])?;
         Ok(Self { buffer, layout })
     }
@@ -143,6 +130,8 @@ impl SharedMerge {
     fn ranges(&self) -> Result<Ranges<'_>, EngError> {
         let span = |s: Span| self.buffer.range(s.offset, s.bytes);
         Ok(Ranges {
+            buffer: &self.buffer,
+            layout: &self.layout,
             xh: span(self.layout.xh)?,
             z: span(self.layout.z)?,
             gu: span(self.layout.gu)?,
@@ -185,22 +174,19 @@ fn single_of<'w>(weights: &Exl3MoeWeights<'w>, proj: Proj) -> &'w Exl3Weight {
     }
 }
 
-/// The input and output ranges of a planned pair.
+/// The input and output ranges of a planned pair: the plan says where, the buffer makes ranges.
 fn pair_ranges<'b>(
     pair: &PlannedPair,
     norm_row: DeviceRange<'b>,
     r: &Ranges<'b>,
     dims: &MoeDims,
 ) -> Result<(DeviceRange<'b>, DeviceRange<'b>), EngError> {
-    let x = match pair.input {
-        Input::NormRow => norm_row,
-        Input::ActRow(index) => row(&r.act, dims.inter * F32, index)?,
+    let spans = pair.spans(&plan_dims(dims), r.layout);
+    let x = match spans.input {
+        None => norm_row,
+        Some(span) => r.buffer.range(span.offset, span.bytes)?,
     };
-    let out = match pair.proj {
-        Proj::Gate | Proj::Up => row(&r.gu, dims.inter * F32, pair.out_row)?,
-        Proj::Down => row(&r.down, dims.hidden * F32, pair.out_row)?,
-    };
-    Ok((x, out))
+    Ok((x, r.buffer.range(spans.output.offset, spans.output.bytes)?))
 }
 
 /// The matrix of one id-indexed pair of the merged block.
@@ -223,6 +209,8 @@ impl MergedMember<'_> {
 /// One id-indexed pair of the merged block.
 struct MergedPair<'a> {
     member: MergedMember<'a>,
+    /// The `ids` word and slot the member is read from, as the plan says.
+    word: (IdWord, u32),
     x: DeviceRange<'a>,
     out: DeviceRange<'a>,
 }
@@ -231,7 +219,7 @@ struct MergedPair<'a> {
 fn indexed_group(
     launch: &Launch<'_>,
     pairs: &[MergedPair<'_>],
-    (ids, zero): (DeviceRange<'_>, DeviceRange<'_>),
+    (router_ids, zero): (DeviceRange<'_>, DeviceRange<'_>),
     scratch: &Scratch<'_>,
 ) -> Result<(), EngError> {
     let [k, n] = pairs
@@ -249,9 +237,14 @@ fn indexed_group(
             rows: 1,
             fused: false,
         };
+        let (word, slot) = pair.word;
+        let ids = match word {
+            IdWord::Router => router_ids,
+            IdWord::Zero => zero,
+        };
         calls.push(match &pair.member {
-            MergedMember::Routed(bank, slot) => bank.span()?.indexed_call(&io, ids, *slot),
-            MergedMember::Shared(weight) => weight.view()?.indexed_call(&io, zero, 0),
+            MergedMember::Routed(bank, _) => bank.span()?.indexed_call(&io, ids, slot),
+            MergedMember::Shared(weight) => weight.view()?.indexed_call(&io, ids, slot),
         });
     }
     launch
@@ -280,7 +273,12 @@ fn merged_on_device(
                     Member::Routed(slot) => MergedMember::Routed(bank_of(weights, pair.proj), slot),
                     Member::Shared => MergedMember::Shared(single_of(weights, pair.proj)),
                 };
-                Ok(MergedPair { member, x, out })
+                Ok(MergedPair {
+                    member,
+                    word: pair.id_word(),
+                    x,
+                    out,
+                })
             })
             .collect()
     };
@@ -342,8 +340,8 @@ pub(in crate::family) fn run_exl3_moe_merged(
         let picks = read_picks(launch, &bufs.route.ids, dims)?;
         merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), dims)?;
     }
-    let routed = dims.top_k * dims.hidden * F32;
-    let down = r.down.buffer().range(r.down.offset(), routed)?;
-    let shared = row(&r.down, dims.hidden * F32, dims.top_k)?;
+    let (routed, shared) = r.layout.combine_spans(&plan_dims(dims));
+    let down = r.buffer.range(routed.offset, routed.bytes)?;
+    let shared = r.buffer.range(shared.offset, shared.bytes)?;
     combine_ranges(launch, &bufs.route, (down, shared), dims)
 }
