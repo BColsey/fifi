@@ -12,9 +12,11 @@
 //!
 //! QSA: `q|gate`, `k`, `v` and the indexer projection, `attn_prep` (q and k norms, rope, the fp16
 //! K/V append), the indexer (pooled keys, scores, selection of the best blocks), the gated sparse
-//! attention over the selected blocks and the open tail, the output projection. The position is the
-//! device word of the step parameters for every QSA kernel, so a captured graph would serve every
-//! position.
+//! attention over the selected blocks and the open tail, the output projection. Every QSA kernel
+//! reads the position from the device word of the step parameters. The DeltaNet scan does not: it
+//! takes its start position from the host launch, so only the QSA half of a layer is
+//! position-independent.
+#![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
 
 use super::{
     state::StateSlot,

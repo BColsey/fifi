@@ -15,6 +15,10 @@
 //! block. The stream, the block outputs and the status words are compared at every token of a short
 //! sequence; the QSA cache and the DeltaNet state therefore have to agree across tokens too.
 //!
+//! The head check (`FIFI_FLASH_NEXT_STEP_HEAD`) runs the final mixer and `lm_head` on the stream the
+//! window leaves, not the full host step: neither side applies the PLE update, so a window that
+//! crosses the PLE layer is a truncated model on both sides and its logits only compare the head.
+//!
 //! Needs a GPU, `--test-threads=1` and (for the full window) several GiB; ignored by default.
 
 use std::{collections::HashMap, path::Path, time::Duration};
@@ -500,13 +504,31 @@ fn input(width: usize, hidden: usize, token: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Bound on the relative L2 of a block output or of the stream against the host. The device rounds
-/// every EXL3 weight (about 2e-4 per projection) and every activation entering an EXL3 projection
-/// to binary16, and the host does not. The first run on layer 3 of the real pack measured the block
-/// outputs at 3.0e-4 to 4.6e-4 and the stream at 3e-5 to 5.5e-5 over ten tokens, with the mixed rows
-/// (the hyper read, all f32) at 1e-6 to 1e-4. The bound is about three times the worst block output:
-/// a missing term, a wrong head order or a wrong cache row moves a block by 1e-2 or more.
-const BLOCK_BOUND: f64 = 1.5e-3;
+/// Bounds on the relative L2 of each quantity against the host, each about three to four times the
+/// worst value measured over ten tokens of the real pack (layer 3, layers 0 to 2, the head, the
+/// split block). The device rounds every EXL3 weight (about 2e-4 per projection) and every
+/// activation entering an EXL3 projection to binary16, and the host does not; the quantities that
+/// never pass through an EXL3 projection (the hyper read of the attention site, all f32) are
+/// therefore held far tighter than the block outputs, and a stream that is mostly the residual
+/// tighter than a block. A missing term, a wrong head order or a wrong cache row moves a block by
+/// 1e-2 or more.
+struct Bounds {
+    /// Mixed row of the attention site: measured 2.2e-6.
+    mixed_attn: f64,
+    /// Mixed row of the MLP site, after the attention block's EXL3 projections: measured 9.1e-5.
+    mixed_mlp: f64,
+    /// The residual stream after a layer: measured 5.5e-5.
+    stream: f64,
+    /// A block output, the DeltaNet state and ring, the logits: measured 4.6e-4 at most.
+    block: f64,
+}
+
+const BOUNDS: Bounds = Bounds {
+    mixed_attn: 1e-5,
+    mixed_mlp: 3e-4,
+    stream: 2e-4,
+    block: 1.5e-3,
+};
 
 /// The MoE block a run uses.
 #[derive(Clone, Copy, Debug)]
@@ -605,11 +627,12 @@ fn split_block<'w>(
         .iter()
         .map(|&layer| split_trunk(weights, layer).expect("the trunk of the split block"))
         .collect();
-    SplitMoeAt {
-        inner: SplitMoe::new(projector.context(), trunks, bank, source.layout(), dims)
+    SplitMoeAt::new(
+        SplitMoe::new(projector.context(), trunks, bank, source.layout(), dims)
             .expect("the split block"),
-        first_layer: layers[0],
-    }
+        layers,
+    )
+    .expect("consecutive layers")
 }
 
 /// What a run leaves for comparison with another run: per token, the MoE output and the stream of
@@ -620,13 +643,76 @@ struct RunOut {
     misses: Vec<u64>,
 }
 
+/// How the layers of a token are driven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drive {
+    /// Block by block with a drain and a read-back after each, compared with the host.
+    Stepped,
+    /// All layers queued by one `run_layers_without_ple` call and one drain, as the decode loop
+    /// does; only the stream after the last layer is read.
+    Composed,
+}
+
+/// One run of a window of layers.
+#[derive(Clone, Copy, Debug)]
+struct Spec<'l> {
+    layers: &'l [usize],
+    kind: MoeKind,
+    tokens: usize,
+    /// Replaces `indexer_budget` of the pack's config (the pack's 2048 selects every block of a
+    /// short sequence), host reference and device alike.
+    budget: Option<u32>,
+    drive: Drive,
+}
+
+impl<'l> Spec<'l> {
+    fn new(layers: &'l [usize], kind: MoeKind) -> Self {
+        Self {
+            layers,
+            kind,
+            tokens: TOKENS,
+            budget: None,
+            drive: Drive::Stepped,
+        }
+    }
+}
+
+/// The pack's config with `indexer_budget` replaced.
+fn config_with_budget(config: &[u8], budget: u32) -> Vec<u8> {
+    let text = String::from_utf8(config.to_vec()).expect("a utf-8 config");
+    let key = "\"indexer_budget\"";
+    let at = text.find(key).expect("indexer_budget in the config") + key.len();
+    let rest = &text[at..];
+    let digits_from = rest.find(|c: char| c.is_ascii_digit()).expect("a number");
+    let digits = rest[digits_from..]
+        .find(|c: char| !c.is_ascii_digit())
+        .expect("the end of the number");
+    let (start, end) = (at + digits_from, at + digits_from + digits);
+    format!("{}{budget}{}", &text[..start], &text[end..]).into_bytes()
+}
+
 fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
+    run_spec(Spec::new(layers, kind))
+}
+
+fn run_spec(spec: Spec<'_>) -> RunOut {
+    let Spec {
+        layers,
+        kind,
+        tokens,
+        budget,
+        drive,
+    } = spec;
     assert!(
         device_present("Flash-Next layer parity"),
         "a GPU is required"
     );
     let checkpoint = checkpoint();
-    let (model, kinds) = model_shape(&checkpoint.model_config).expect("shape");
+    let config = match budget {
+        Some(budget) => config_with_budget(&checkpoint.model_config, budget),
+        None => checkpoint.model_config.clone(),
+    };
+    let (model, kinds) = model_shape(&config).expect("shape");
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
     let stream: DeviceStream = ctx.stream().expect("stream");
@@ -639,15 +725,8 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
     );
     let first = *layers.first().expect("a layer");
     let end = layers.last().expect("a layer") + 1;
-    let step = FlashStep::new(
-        ctx,
-        &stream,
-        &weights,
-        &checkpoint.model_config,
-        POSITIONS,
-        first..end,
-    )
-    .expect("the step");
+    let step =
+        FlashStep::new(ctx, &stream, &weights, &config, POSITIONS, first..end).expect("the step");
     let hidden = model.hyper.hidden();
     let width = model.hyper.width();
     let mut host_projector = RealProjector::new(&checkpoint);
@@ -693,7 +772,7 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
         misses: Vec::new(),
     };
 
-    for token in 0..TOKENS {
+    for token in 0..tokens {
         let mut host_stream = input(width, hidden, token);
         let misses_start = block.misses();
         let mut last = (Vec::new(), Vec::new());
@@ -715,6 +794,19 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
                     .collect::<Vec<u8>>(),
             )
             .expect("stream");
+        if drive == Drive::Composed {
+            step.run_layers_without_ple(token, block.as_block())
+                .expect("the layers");
+            step.finish_token().expect("a clean token");
+            let device_stream = step
+                .read_f32(step.slot(Slot::Stream).unwrap(), width)
+                .expect("stream");
+            // Only the stream survives the whole window: the block outputs are lifetime-aliased.
+            out.moe_out.push(Vec::new());
+            out.streams.push(device_stream);
+            out.misses.push(block.misses() - misses_start);
+            continue;
+        }
         for (index, &layer) in layers.iter().enumerate() {
             let reference = host_token(
                 &mut host_projector,
@@ -749,22 +841,32 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
                 .read_f32(step.slot(Slot::Stream).unwrap(), width)
                 .expect("stream");
             let (status, flag) = step.health().expect("health");
-            let pairs: [(&str, &[f32], &[f32]); 5] = [
-                ("mixed(attn)", &mixed, &reference.mixed_attn),
-                ("attn out", &attn_out, &reference.attn_out),
-                ("mixed(mlp)", &mixed_mlp, &reference.mixed_mlp),
-                ("moe out", &moe_out, &reference.moe_out),
-                ("stream", &device_stream, &host_stream),
+            let pairs: [(&str, &[f32], &[f32], f64); 5] = [
+                (
+                    "mixed(attn)",
+                    &mixed,
+                    &reference.mixed_attn,
+                    BOUNDS.mixed_attn,
+                ),
+                ("attn out", &attn_out, &reference.attn_out, BOUNDS.block),
+                (
+                    "mixed(mlp)",
+                    &mixed_mlp,
+                    &reference.mixed_mlp,
+                    BOUNDS.mixed_mlp,
+                ),
+                ("moe out", &moe_out, &reference.moe_out, BOUNDS.block),
+                ("stream", &device_stream, &host_stream, BOUNDS.stream),
             ];
-            let errors: Vec<(&str, f64)> = pairs
+            let errors: Vec<(&str, f64, f64)> = pairs
                 .iter()
-                .map(|(name, got, want)| (*name, relative_l2(got, want)))
+                .map(|(name, got, want, bound)| (*name, relative_l2(got, want), *bound))
                 .collect();
             println!(
                 "layer {layer} token {token}: status {status} flag {flag}; {}",
                 pairs
                     .iter()
-                    .map(|(name, got, want)| format!(
+                    .map(|(name, got, want, _)| format!(
                         "{name} rel {:.2e} max {:.2e} (ref max {:.2e})",
                         relative_l2(got, want),
                         max_abs(got, want),
@@ -778,10 +880,11 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
                 (0, 0),
                 "layer {layer} token {token}: health"
             );
-            for (name, error) in errors {
+            for (name, error, bound) in errors {
                 assert!(
-                    error <= BLOCK_BOUND,
-                    "layer {layer} token {token}: {name} differs from the host by {error:.3e}"
+                    error <= bound,
+                    "layer {layer} token {token}: {name} differs from the host by {error:.3e} \
+                     (bound {bound:.1e})"
                 );
             }
             // The next layer reads the host stream the device holds: keep them in step, so one
@@ -792,8 +895,12 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
         out.moe_out.push(last.0);
         out.streams.push(last.1);
         out.misses.push(block.misses() - misses_start);
+        if host_head.is_none() {
+            step.finish_token().expect("a clean token");
+        }
         if let Some((norm, down, up, lm_head)) = &host_head {
             step.head().expect("the head");
+            step.finish_token().expect("a clean token with the head");
             let vocab = step.geometry.vocab;
             let device_logits = step
                 .read_f32(step.slot(Slot::Logits).unwrap(), vocab)
@@ -833,7 +940,7 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
             // A truncated model has no preferred token; the top-1 agreement is reported, the
             // logits error is the gate.
             assert!(
-                error <= BLOCK_BOUND,
+                error <= BOUNDS.block,
                 "token {token}: logits differ by {error:.3e}"
             );
         }
@@ -870,7 +977,7 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
         let rec_error = relative_l2(&rec, state.rec());
         let ring_error = relative_l2(&ring_device, &ring_host_planar);
         println!(
-            "layer {layer} after {TOKENS} tokens: recurrent state rel {rec_error:.2e} max {:.2e} \
+            "layer {layer} after {tokens} tokens: recurrent state rel {rec_error:.2e} max {:.2e} \
              (ref max {:.2e}); conv ring rel {ring_error:.2e} max {:.2e} (ref max {:.2e})",
             max_abs(&rec, state.rec()),
             state.rec().iter().fold(0.0f32, |m, v| m.max(v.abs())),
@@ -878,11 +985,11 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
             ring_host_planar.iter().fold(0.0f32, |m, v| m.max(v.abs())),
         );
         assert!(
-            rec_error <= BLOCK_BOUND,
+            rec_error <= BOUNDS.block,
             "layer {layer}: recurrent state {rec_error:.3e}"
         );
         assert!(
-            ring_error <= BLOCK_BOUND,
+            ring_error <= BOUNDS.block,
             "layer {layer}: conv ring {ring_error:.3e}"
         );
     }
@@ -893,6 +1000,141 @@ fn run_window(layers: &[usize], kind: MoeKind) -> RunOut {
 #[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
 fn the_device_layers_match_the_host_reference_on_the_real_pack() {
     run_window(&window(), MoeKind::Resident);
+}
+
+/// The indexer's selection has to pick: with the pack's budget of 2048 positions every block of a
+/// short sequence is selected and a wrong ranking cannot show. A budget of 8 positions is two
+/// blocks of the pack's four; from the 13th token on there are more complete blocks than the
+/// selection takes, so the cache, the indexer scores and the selection all decide the output.
+/// Run on the window's QSA layers (the DeltaNet layers do not read the budget). fp16 score
+/// rounding can flip two near-equal blocks; a flip shows as an error far above the bounds, and is
+/// then reported rather than bounded away.
+#[test]
+#[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
+fn the_selection_of_blocks_matches_the_host_when_it_has_to_choose() {
+    let layers = window();
+    let (model, kinds) = model_shape(&checkpoint().model_config).expect("shape");
+    assert!(
+        layers.iter().any(|&layer| kinds[layer]),
+        "the window {layers:?} has no QSA layer"
+    );
+    let tokens = 16;
+    let budget = 8;
+    let ratio = model.qsa.dims().ratio as usize;
+    assert!(
+        tokens / ratio > budget / ratio,
+        "{tokens} tokens give {} complete blocks, a budget of {budget} takes {}: the selection would not choose",
+        tokens / ratio,
+        budget / ratio
+    );
+    run_spec(Spec {
+        tokens,
+        budget: Some(budget as u32),
+        ..Spec::new(&layers, MoeKind::Resident)
+    });
+}
+
+/// The decode loop queues every layer of a token and drains once. That path has to give the same
+/// stream, bit for bit, as the block-by-block run the host comparison uses (same kernels in the
+/// same order on the same stream; the drains between blocks must change nothing).
+#[test]
+#[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layers in FIFI_FLASH_NEXT_STEP_LAYERS)"]
+fn the_composed_layers_equal_the_stepped_layers_bit_for_bit() {
+    let layers = window();
+    let stepped = run_window(&layers, MoeKind::Resident);
+    let composed = run_spec(Spec {
+        drive: Drive::Composed,
+        ..Spec::new(&layers, MoeKind::Resident)
+    });
+    assert_eq!(stepped.streams.len(), composed.streams.len());
+    for token in 0..stepped.streams.len() {
+        let equal = stepped.streams[token]
+            .iter()
+            .zip(&composed.streams[token])
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        println!(
+            "token {token}: composed stream against stepped, rel {:.2e}, bit for bit: {equal}",
+            relative_l2(&composed.streams[token], &stepped.streams[token])
+        );
+        assert!(
+            equal,
+            "token {token}: the composed run differs from the stepped run"
+        );
+    }
+}
+
+/// A failed call poisons the step: every later call refuses until `reset`, a nonzero status word
+/// poisons at `finish_token`, and a `run_layers` that would cross the PLE layer refuses and names
+/// the numbers.
+#[test]
+#[ignore = "needs a GPU, --test-threads=1 and the pack in FIFI_FLASH_NEXT_EXL3_PACK (layer 3)"]
+fn a_failed_call_poisons_the_step_until_reset() {
+    assert!(device_present("Flash-Next poison"), "a GPU is required");
+    let checkpoint = checkpoint();
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream: DeviceStream = ctx.stream().expect("stream");
+    let weights = device_weights(&projector, &checkpoint, &[3], (false, true));
+    let step = FlashStep::new(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        POSITIONS,
+        3..4,
+    )
+    .expect("the step");
+    let mut moe = AllResidentMoe { weights: &weights };
+
+    // A layer whose weights were never uploaded fails, and poisons.
+    assert!(!step.is_poisoned());
+    let error = step
+        .run_layer(5, 0, &mut moe)
+        .expect_err("layer 5 has no weights");
+    println!("layer 5: {error:?}");
+    assert!(step.is_poisoned());
+    for refused in [
+        step.begin_token(),
+        step.run_layer(3, 0, &mut moe),
+        step.head(),
+    ] {
+        let text = format!("{:?}", refused.expect_err("a poisoned step refuses"));
+        assert!(text.contains("reset"), "{text}");
+    }
+    step.reset().expect("reset");
+    assert!(!step.is_poisoned());
+
+    // A clean token finishes clean; a nonzero status word fails the finish and poisons.
+    step.begin_token().expect("begin");
+    step.finish_token().expect("nothing ran, nothing wrong");
+    let status = step.status_word().expect("status word");
+    status
+        .buffer()
+        .write_at(&stream, status.offset(), &1u32.to_le_bytes())
+        .expect("write the status word");
+    let error = step.finish_token().expect_err("a nonzero status word");
+    println!("status word 1: {error:?}");
+    assert!(step.is_poisoned());
+    step.reset().expect("reset");
+
+    // The PLE refusal names the layer and the range, and does not poison (nothing ran).
+    let ple = step.ple_layer();
+    let crossing = FlashStep::new(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        POSITIONS,
+        (ple - 1)..(ple + 1),
+    )
+    .expect("a window across the PLE layer");
+    let error = crossing
+        .run_layers(0, &mut moe)
+        .expect_err("a window across the PLE layer");
+    let text = format!("{error:?}");
+    println!("PLE: {text}");
+    assert!(text.contains(&format!("PLE layer {ple}")), "{text}");
+    assert!(!crossing.is_poisoned());
 }
 
 #[test]
@@ -932,6 +1174,15 @@ fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
     assert!(
         small.misses.iter().all(|&m| m > 0),
         "a 32-slot bank must miss at every token: {:?}",
+        small.misses
+    );
+    // Top-10 of 512 experts per layer and token with 32 held: about 9 of the 10 picks miss, so a
+    // floor of 3 misses per layer and token leaves room for a lucky token and still fails a bank
+    // that does not replace.
+    let floor = 3 * layers.len() as u64;
+    assert!(
+        small.misses.iter().all(|&m| m >= floor),
+        "a 32-slot bank must miss at least {floor} times per token: {:?}",
         small.misses
     );
 }

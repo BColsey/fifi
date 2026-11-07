@@ -22,9 +22,26 @@
 //! runs use; the split block puts the partial slot bank behind the same call.
 //!
 //! One row only: the step plan allows up to 8, the shared MoE block takes one.
+//!
+//! The PLE block is NOT part of this step. The model applies a per-token update to the residual
+//! stream before the attention read of the PLE layer; the caller does it on
+//! the host between two calls, with the stream read back and written again. A range of layers that
+//! would run the PLE layer after an earlier layer of the same call therefore has the wrong stream
+//! from the PLE layer on, and [`FlashStep::run_layers`] refuses it: call it for the layers before
+//! the PLE layer, apply the update, then call it (or [`FlashStep::run_layer`] one layer at a time)
+//! from the PLE layer on. A range that starts at the PLE layer is the caller's promise that the
+//! update was applied. The layer and head tests of `step_tests.rs` run without PLE on both sides, on
+//! purpose, through `run_layers_without_ple`, a test-only entry point.
+//!
+//! Errors: after any error in a launch call the step is poisoned (its stream or state may be half
+//! written) and every later call except [`FlashStep::reset`] refuses, as the host reference does.
+//! [`FlashStep::finish_token`] turns a nonzero status word or EXL3 flag into an error, after the
+//! drain; a step that finished a token with a fault is poisoned too.
 
 // Staged: the executor is the first caller of the whole step.
 #![cfg_attr(not(test), allow(dead_code, reason = "staged for the executor"))]
+
+use std::cell::Cell;
 
 use crate::{
     EngError,
@@ -88,6 +105,8 @@ pub(super) struct FlashStep<'a> {
     /// the block output to the stream instead.
     zeros: DeviceBuffer,
     pub(super) layers: std::ops::Range<usize>,
+    /// Set by any error of a launch call; cleared by [`Self::reset`].
+    poisoned: Cell<bool>,
 }
 
 impl<'a> FlashStep<'a> {
@@ -128,12 +147,15 @@ impl<'a> FlashStep<'a> {
             scratch,
             zeros,
             layers,
+            poisoned: Cell::new(false),
         };
         step.reset()?;
         Ok(step)
     }
 
-    /// Zeroes the persistent state (the recurrent states, the rings, the caches): a new sequence.
+    /// Zeroes the persistent state (the recurrent states, the rings, the caches) and clears the
+    /// poison: a new sequence. The device has no memset wrapper yet, so the zeros go over in chunks
+    /// of 16 MiB; a state of 6 GiB (a 262,144-position context) takes about half a second.
     pub(super) fn reset(&self) -> Result<(), EngError> {
         let zeros = vec![0u8; 1 << 24];
         let mut at = 0usize;
@@ -145,7 +167,31 @@ impl<'a> FlashStep<'a> {
                 .write_at(self.stream, at, &zeros[..len])?;
             at += len;
         }
+        self.poisoned.set(false);
         Ok(())
+    }
+
+    /// Refuses while the step is poisoned.
+    fn ensure_usable(&self) -> Result<(), EngError> {
+        if self.poisoned.get() {
+            return Err(refuse(
+                "an earlier call failed; the step needs a reset".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Poisons the step when `result` is an error.
+    fn poison_on<T>(&self, result: Result<T, EngError>) -> Result<T, EngError> {
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
+
+    /// True when an error has poisoned the step.
+    pub(super) fn is_poisoned(&self) -> bool {
+        self.poisoned.get()
     }
 
     /// The tensor of `slot` in the step arena.
@@ -283,16 +329,20 @@ impl<'a> FlashStep<'a> {
     pub(super) fn hyper_read(&self, site: Site, prefix: &str) -> Result<(), EngError> {
         let inject = site != Site::Final;
         let (norm, dtype) = self.half(&format!("{prefix}.hc_norm.weight"))?;
-        let (down, _) = self.half(&format!("{prefix}.input_mix_weight_down.weight"))?;
-        let (up, _) = self.half(&format!("{prefix}.input_mix_weight_up.weight"))?;
-        let inject_weight = if inject {
-            Some(
-                self.half(&format!("{prefix}.block_inject_weight.weight"))?
-                    .0,
-            )
+        let (down, down_dtype) = self.half(&format!("{prefix}.input_mix_weight_down.weight"))?;
+        let (up, up_dtype) = self.half(&format!("{prefix}.input_mix_weight_up.weight"))?;
+        let (inject_weight, inject_dtype) = if inject {
+            let (range, found) = self.half(&format!("{prefix}.block_inject_weight.weight"))?;
+            (Some(range), found)
         } else {
-            None
+            (None, dtype)
         };
+        if [down_dtype, up_dtype, inject_dtype] != [dtype; 3] {
+            return Err(refuse(format!(
+                "the weights of {prefix} are not of one dtype: norm {dtype:?}, down {down_dtype:?}, \
+                 up {up_dtype:?}, inject {inject_dtype:?}"
+            )));
+        }
         self.ctx.hyper_read(
             self.stream,
             HyperReadCall {
@@ -403,44 +453,106 @@ impl<'a> FlashStep<'a> {
 
     // ------------------------------------------------------------------ layers and the tail
 
-    /// One layer at position `pos`, in the site order of the host reference.
+    /// One layer at position `pos`, in the site order of the host reference. The PLE update, if
+    /// `layer` is the PLE layer, is the caller's to apply before this call.
     pub(super) fn run_layer(
         &self,
         layer: usize,
         pos: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
-        self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"))?;
-        self.mixer(layer, pos)?;
-        self.hyper_apply(Site::Attn)?;
-        self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"))?;
-        self.moe_block(layer, moe)?;
-        self.hyper_apply(Site::Mlp)
+        self.ensure_usable()?;
+        let result = (|| {
+            self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"))?;
+            self.mixer(layer, pos)?;
+            self.hyper_apply(Site::Attn)?;
+            self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"))?;
+            self.moe_block(layer, moe)?;
+            self.hyper_apply(Site::Mlp)
+        })();
+        self.poison_on(result)
     }
 
     /// The final mixer and `lm_head`: the logits land in the `Logits` slot.
     pub(super) fn head(&self) -> Result<(), EngError> {
-        self.hyper_read(Site::Final, MIXER)?;
-        self.project(
-            "lm_head",
-            self.slot(Slot::Mixed(Site::Final))?,
-            self.slot(Slot::Logits)?,
-        )
+        self.ensure_usable()?;
+        let result = (|| {
+            self.hyper_read(Site::Final, MIXER)?;
+            self.project(
+                "lm_head",
+                self.slot(Slot::Mixed(Site::Final))?,
+                self.slot(Slot::Logits)?,
+            )
+        })();
+        self.poison_on(result)
     }
 
     /// Clears the sticky EXL3 flag and the status word: the first launch of a token.
     pub(super) fn begin_token(&self) -> Result<(), EngError> {
-        let flag = self.slot(Slot::Exl3Flag)?;
-        flag.buffer()
-            .write_at(self.stream, flag.offset(), &[0u8; 4])?;
-        let status = self.status_word()?;
-        status
-            .buffer()
-            .write_at(self.stream, status.offset(), &[0u8; 4])
+        self.ensure_usable()?;
+        let result = (|| {
+            let flag = self.slot(Slot::Exl3Flag)?;
+            flag.buffer()
+                .write_at(self.stream, flag.offset(), &[0u8; 4])?;
+            let status = self.status_word()?;
+            status
+                .buffer()
+                .write_at(self.stream, status.offset(), &[0u8; 4])
+        })();
+        self.poison_on(result)
     }
 
-    /// Queues the layers of the window for the token at `pos`.
+    /// Reads the status word and the EXL3 flag behind the queued work (so it drains the stream's
+    /// work up to here) and turns a fault into an error: a nonzero status word or EXL3 flag
+    /// poisons the step. Call it after the last launch of a token, `head` included.
+    pub(super) fn finish_token(&self) -> Result<(), EngError> {
+        let (status, flag) = self.health()?;
+        if status != 0 || flag != 0 {
+            self.poisoned.set(true);
+            return Err(EngError::ModelOutput(format!(
+                "Flash-Next step: the token finished with status word {status} and EXL3 flag {flag}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The layer of the PLE block.
+    pub(super) fn ple_layer(&self) -> usize {
+        self.model.ple_layer
+    }
+
+    /// Refuses a range that has the PLE layer after its first layer.
+    fn check_ple(&self, range: &std::ops::Range<usize>) -> Result<(), EngError> {
+        let ple = self.ple_layer();
+        if range.start < ple && ple < range.end {
+            return Err(refuse(format!(
+                "layers {}..{} run the PLE layer {ple} after layer {}; apply the PLE update on the \
+                 host and call {}..{ple} and {ple}..{}",
+                range.start, range.end, range.start, range.start, range.end
+            )));
+        }
+        Ok(())
+    }
+
+    /// Queues the layers of the window for the token at `pos`. Refuses a window that crosses the
+    /// PLE layer (see the module doc).
     pub(super) fn run_layers(&self, pos: usize, moe: &mut dyn MoeBlock) -> Result<(), EngError> {
+        self.check_ple(&self.layers)?;
+        self.run_range(pos, moe)
+    }
+
+    /// `run_layers` for the tests, which run a window across the PLE layer without the
+    /// update on both sides, host reference and device.
+    #[cfg(test)]
+    pub(super) fn run_layers_without_ple(
+        &self,
+        pos: usize,
+        moe: &mut dyn MoeBlock,
+    ) -> Result<(), EngError> {
+        self.run_range(pos, moe)
+    }
+
+    fn run_range(&self, pos: usize, moe: &mut dyn MoeBlock) -> Result<(), EngError> {
         for layer in self.layers.clone() {
             self.run_layer(layer, pos, moe)?;
         }
@@ -556,12 +668,36 @@ pub(super) fn split_trunk(
     })
 }
 
-/// The split block as the step's MoE block. `first_layer` is the model layer of the bank's row 0:
-/// a bank over a window of layers is indexed from its own first row, a bank over the whole model
-/// from 0.
+/// The split block as the step's MoE block. The bank has one row per layer of a contiguous window
+/// of the model that starts at `first_layer`: a bank over a window of layers is indexed from its
+/// own first row, a bank over the whole model from 0.
 pub(super) struct SplitMoeAt<'w> {
     pub(super) inner: SplitMoe<'w>,
-    pub(super) first_layer: usize,
+    first_layer: usize,
+    rows: usize,
+}
+
+impl<'w> SplitMoeAt<'w> {
+    /// `layers` are the model layers of the bank's rows, in row order: consecutive layers.
+    pub(super) fn new(inner: SplitMoe<'w>, layers: &[usize]) -> Result<Self, EngError> {
+        let Some(&first_layer) = layers.first() else {
+            return Err(refuse("a split block over no layers".to_owned()));
+        };
+        if layers
+            .iter()
+            .enumerate()
+            .any(|(row, &layer)| layer != first_layer + row)
+        {
+            return Err(refuse(format!(
+                "the split block maps rows to layers by offset, the layers {layers:?} are not consecutive"
+            )));
+        }
+        Ok(Self {
+            inner,
+            first_layer,
+            rows: layers.len(),
+        })
+    }
 }
 
 impl MoeBlock for SplitMoeAt<'_> {
@@ -574,7 +710,14 @@ impl MoeBlock for SplitMoeAt<'_> {
     ) -> Result<(), EngError> {
         let row = layer
             .checked_sub(self.first_layer)
-            .ok_or_else(|| refuse(format!("layer {layer} is before the bank's first layer")))?;
+            .filter(|&row| row < self.rows)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is outside the bank's layers {}..{}",
+                    self.first_layer,
+                    self.first_layer + self.rows
+                ))
+            })?;
         self.inner.run(launch, row, bufs, dims)
     }
 }
