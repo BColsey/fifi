@@ -736,6 +736,20 @@ fn a_default_merged_block_yields_to_krow_and_an_explicit_one_stays_to_be_refused
             "`{part}` missing from request_krow_verify"
         );
     }
+    // The whole block, exactly: the drop sits INSIDE the condition on the default intent, so an
+    // explicit `1` is never touched, and nothing else runs in the function.
+    assert_eq!(
+        request,
+        code(
+            "self.krow_wanted = true; \
+             if self.merge_intent == Intent::Default && self.exl3_merge.is_some() { \
+                 eprintln!(\"\"); \
+                 self.exl3_merge = None; \
+                 self.merge_source = Source::Krow; \
+             }"
+        ),
+        "request_krow_verify is exactly: ask for krow, then drop a default-built merge"
+    );
     // The drop is conditioned on the default intent only, so an explicit `1` is not touched.
     assert!(!request.contains(&code("Intent::Explicit")));
     assert!(
