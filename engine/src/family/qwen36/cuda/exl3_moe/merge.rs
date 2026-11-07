@@ -60,8 +60,9 @@ use crate::{
     family::{
         project::cuda::exl3::{Exl3Bank, Exl3Io, Exl3Weight},
         qwen36::exl3_merge_plan::{
-            BlockPlan, IdWord, Member, MergeLayout, PlanDims, PlannedPair, Proj, SharedFacts, Span,
-            block_plan, check_dims, check_merge,
+            BlockPlan, IdWord, Intent, Member, MergeLayout, PlanDims, PlannedPair, Proj,
+            SHARED_IN_ROUTED_VAR, SharedFacts, Source, Span, block_plan, check_dims, check_merge,
+            resolve,
         },
     },
     kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
