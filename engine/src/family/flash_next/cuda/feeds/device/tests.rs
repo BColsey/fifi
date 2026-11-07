@@ -1,9 +1,10 @@
 //! Device tests (3090) of the PLE projections and the token-start sink. They skip when no device
 //! is present. Run with `--test-threads=1` under a GPU lease.
 //!
-//! - The projections at the real shapes (`key_proj` 10,240 x 2,560, `value_proj` 2,560 x 2,560, F16)
-//!   against an f64 evaluation of the same stored half-precision values, within twice a first-order
-//!   f32 rounding bound per output (a lane adds `cols / 32` terms, then a butterfly).
+//! - The projections at the real shapes (`key_proj` 10,240 x 2,560, `value_proj` 2,560 x 2,560,
+//!   once as F16 and once as BF16) against an f64 evaluation of the same stored half-precision
+//!   values, within twice a first-order f32 rounding bound per output (a lane adds `cols / 32`
+//!   terms, then a butterfly). Any other stored dtype is refused.
 //! - A second `project` with another embedding must not return the first one's results.
 //! - The start sink writes the `StepParams` block, the stream and the PLE embedding to their
 //!   offsets and nothing around them; a negative token or position is refused with nothing written.
@@ -16,6 +17,7 @@ use crate::{
         ple_feed::{HostMatrix, HostProjection, PleKeyValue, PleProjection},
     },
     kernels::cuda::{CudaContext, device_present},
+    tensor::Dtype,
 };
 
 const WIDTH: usize = 10_240;
@@ -30,11 +32,23 @@ fn values(count: usize, seed: usize, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-fn halves(values: &[f32]) -> Vec<u16> {
+/// The stored 16-bit codes of `values` in `dtype` (F16 or BF16).
+fn narrow(dtype: Dtype, values: &[f32]) -> Vec<u16> {
     values
         .iter()
-        .map(|&v| half::f16::from_f32(v).to_bits())
+        .map(|&v| match dtype {
+            Dtype::F16 => half::f16::from_f32(v).to_bits(),
+            Dtype::Bf16 => half::bf16::from_f32(v).to_bits(),
+            other => panic!("{other:?} is not a 16-bit float"),
+        })
         .collect()
+}
+
+fn widen_one(dtype: Dtype, code: u16) -> f64 {
+    match dtype {
+        Dtype::F16 => half::f16::from_bits(code).to_f64(),
+        _ => half::bf16::from_bits(code).to_f64(),
+    }
 }
 
 fn half_bytes(codes: &[u16]) -> Vec<u8> {
@@ -42,12 +56,12 @@ fn half_bytes(codes: &[u16]) -> Vec<u8> {
 }
 
 /// `(value, bound)` of every row of `w x` in f64: the bound is `2 * u * (cols/32 + 6) * sum |w x|`.
-fn reference(codes: &[u16], rows: usize, x: &[f32]) -> Vec<(f64, f64)> {
+fn reference(dtype: Dtype, codes: &[u16], rows: usize, x: &[f32]) -> Vec<(f64, f64)> {
     (0..rows)
         .map(|r| {
             let (mut sum, mut mag) = (0.0f64, 0.0f64);
             for (c, &xv) in x.iter().enumerate() {
-                let term = half::f16::from_bits(codes[r * x.len() + c]).to_f64() * f64::from(xv);
+                let term = widen_one(dtype, codes[r * x.len() + c]) * f64::from(xv);
                 sum += term;
                 mag += term.abs();
             }
@@ -66,17 +80,17 @@ fn check(name: &str, got: &[f32], want: &[(f64, f64)]) {
     }
 }
 
-#[test]
-fn the_projections_match_an_f64_evaluation_of_the_stored_half_values() {
-    if !device_present("PLE projections against f64") {
+fn projections_match_f64(dtype: Dtype, gate: &str) {
+    if !device_present(gate) {
         return;
     }
     let context = CudaContext::new().expect("context");
     let stream = context.stream().expect("stream");
-    let key = halves(&values(WIDTH * EMBED, 1, 0.05));
-    let value = halves(&values(HIDDEN * EMBED, 2, 0.05));
-    let ple = DevicePle::upload(
+    let key = narrow(dtype, &values(WIDTH * EMBED, 1, 0.05));
+    let value = narrow(dtype, &values(HIDDEN * EMBED, 2, 0.05));
+    let mut ple = DevicePle::upload(
         &context,
+        dtype,
         &half_bytes(&key),
         &half_bytes(&value),
         WIDTH,
@@ -92,8 +106,8 @@ fn the_projections_match_an_f64_evaluation_of_the_stored_half_values() {
     for seed in [3usize, 4] {
         let x = values(EMBED, seed, 1.5);
         let got = ple.project(&context, &stream, &x).unwrap();
-        check("keys", &got.keys, &reference(&key, WIDTH, &x));
-        check("value", &got.value, &reference(&value, HIDDEN, &x));
+        check("keys", &got.keys, &reference(dtype, &key, WIDTH, &x));
+        check("value", &got.value, &reference(dtype, &value, HIDDEN, &x));
         if let Some(before) = &previous {
             assert_ne!(
                 before.keys, got.keys,
@@ -109,8 +123,18 @@ fn the_projections_match_an_f64_evaluation_of_the_stored_half_values() {
     check(
         "keys (enqueue/collect)",
         &got.keys,
-        &reference(&key, WIDTH, &x),
+        &reference(dtype, &key, WIDTH, &x),
     );
+}
+
+#[test]
+fn the_f16_projections_match_an_f64_evaluation_of_the_stored_values() {
+    projections_match_f64(Dtype::F16, "PLE F16 projections against f64");
+}
+
+#[test]
+fn the_bf16_projections_match_an_f64_evaluation_of_the_stored_values() {
+    projections_match_f64(Dtype::Bf16, "PLE BF16 projections against f64");
 }
 
 #[test]
@@ -120,8 +144,17 @@ fn the_projections_refuse_a_wrong_size_before_any_launch() {
     }
     let context = CudaContext::new().expect("context");
     let stream = context.stream().expect("stream");
-    assert!(DevicePle::upload(&context, &[0; 6], &[0; 8], 2, 2, 2).is_err());
-    let ple = DevicePle::upload(&context, &[0; 8], &[0; 8], 2, 2, 2).unwrap();
+    assert!(DevicePle::upload(&context, Dtype::F16, &[0; 6], &[0; 8], 2, 2, 2).is_err());
+    for other in [Dtype::F32, Dtype::I32] {
+        match DevicePle::upload(&context, other, &[0; 16], &[0; 16], 2, 2, 2) {
+            Err(EngError::Checkpoint(message)) => {
+                assert!(message.contains("F16 or BF16"), "{message}")
+            }
+            Err(error) => panic!("{error:?}"),
+            Ok(_) => panic!("{other:?} was accepted"),
+        }
+    }
+    let mut ple = DevicePle::upload(&context, Dtype::F16, &[0; 8], &[0; 8], 2, 2, 2).unwrap();
     assert!(matches!(
         ple.enqueue(&context, &stream, &[0.0; 3]),
         Err(EngError::BadRequest(_))
@@ -143,7 +176,7 @@ fn the_start_sink_writes_the_block_the_stream_and_the_embedding_at_their_offsets
         context.upload_at(buffer, 0, &vec![0xAB; len]).unwrap();
     }
     let shape = StartShape {
-        vocab: 248_320,
+        sampler_vocab: 248_070,
         stream: 16,
         ple_embed: 8,
     };
@@ -210,8 +243,8 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
     }
     let context = std::rc::Rc::new(CudaContext::new().expect("context"));
     let stream = std::rc::Rc::new(context.stream().expect("stream"));
-    let key = halves(&values(WIDTH * EMBED, 1, 0.05));
-    let value = halves(&values(HIDDEN * EMBED, 2, 0.05));
+    let key = narrow(Dtype::F16, &values(WIDTH * EMBED, 1, 0.05));
+    let value = narrow(Dtype::F16, &values(HIDDEN * EMBED, 2, 0.05));
     let widen = |codes: &[u16]| -> Vec<f32> {
         codes
             .iter()
@@ -226,6 +259,7 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
     let mut route = DevicePleRoute::new(
         DevicePle::upload(
             &context,
+            Dtype::F16,
             &half_bytes(&key),
             &half_bytes(&value),
             WIDTH,
@@ -252,7 +286,7 @@ fn the_route_agrees_with_the_host_projection_of_the_same_stored_values() {
     ] {
         for (row, (g, (h, (_, bound)))) in got
             .iter()
-            .zip(want.iter().zip(reference(codes, rows, &x)))
+            .zip(want.iter().zip(reference(Dtype::F16, codes, rows, &x)))
             .enumerate()
         {
             assert!(

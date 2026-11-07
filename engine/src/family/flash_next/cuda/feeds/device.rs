@@ -1,24 +1,31 @@
 //! The device half of the feeds: the PLE key and value projections on the card, and the sink that
 //! writes a token start to the device.
 //!
-//! WHAT: [`DevicePle`] keeps the stored F16 `key_proj` (`width x ple_embed`) and `value_proj`
-//! (`hidden x ple_embed`) on the device as they are in the pack (65 MiB, no F32 copy) and runs
-//! them with `CudaContext::dense_gemv`. [`DevicePle::enqueue`] writes the embedding and queues the
-//! two launches on the step stream; [`DevicePle::collect`] reads the keys and the value back
-//! (44 KiB), behind the queued work. [`DeviceStart`] is the [`StartSink`] over the device words
-//! block and two F32 buffers: it builds the `StepParams` block (token and position) and writes the
-//! initial stream and the PLE embedding, all ordered on the step stream.
+//! WHAT: [`DevicePle`] keeps the stored F16 or BF16 `key_proj` (`width x ple_embed`) and
+//! `value_proj` (`hidden x ple_embed`) on the device as they are in the pack (65 MiB, no F32
+//! copy) and runs them with `CudaContext::dense_gemv`. [`DevicePle::enqueue`] writes the embedding
+//! and queues the two launches on the step stream; [`DevicePle::collect`] reads the keys and the
+//! value back (44 KiB), behind the queued work. [`DeviceStart`] is the [`StartSink`] over the
+//! device words block and two F32 buffers: it builds the `StepParams` block (token and position)
+//! and writes the initial stream and the PLE embedding, all ordered on the step stream.
 //!
 //! WHY the projections run here: they depend on the token only, but the token is known when the
 //! step starts, so the host would have the 12,800 x 2,560 product to finish while the device runs
-//! layers 0 and 1 (about 1 ms). The host product took 2.6 ms (F16, 8 threads) to 4-5 ms (1-4
-//! threads) at p50 and up to 14 ms at p99 on this machine, and it competes with the pinned expert
-//! copies for memory bandwidth. The device reads the 65 MiB in well under 0.1 ms. The rest of the
-//! PLE block (norms, gate, convolution ring, about 100 us) stays on the host in `ple::step`, which
-//! takes the downloaded keys and value in place of its two `linear` calls.
+//! layers 0 and 1 (about 1 ms). Measured on this machine under load 13-20 (8 threads, F16 weights),
+//! the host product took 1.57 ms at best and 2.6 ms at p50 (p99 7.6 ms), 4-5 ms at p50 on 1-4
+//! threads, and it reads 65 MiB (131 MiB as F32) from host memory per token, which competes
+//! with the pinned expert copies and keeps 8 host threads busy. The kernel reads the 65 MiB on the
+//! device in well under 0.1 ms (the S0 figure; the route's own time, with the copies and the
+//! read-back, is not measured yet). The rest of the PLE block (norms, gate, convolution ring, about
+//! 100 us) stays on the host in `ple::step`, which takes the downloaded keys and value in place of
+//! its two `linear` calls.
 //!
-//! Nothing here synchronizes except `collect` (a read behind the queue) and the pageable writes of
-//! `DeviceBuffer::write_at`, which return when the copy finished, as the Qwen3.6 start write does.
+//! SYNCHRONIZATION: `DeviceBuffer::write_at` and `read_at` are pageable copies that return when the
+//! copy finished, and `collect` reads behind the queued work. So [`DevicePle::project`] (and the
+//! [`DevicePleRoute`] built on it) is a host-device synchronization in the middle of the step: it
+//! waits for everything queued on the stream before it. A captured graph of the token therefore
+//! must be cut at the PLE layer, or capture only the segments before and after it. The start sink
+//! writes are the same kind of copy.
 
 use crate::{
     EngError,
@@ -29,6 +36,7 @@ use crate::{
             step_params::StepParams,
         },
     },
+    tensor::Dtype,
 };
 
 use super::StartSink;
@@ -55,22 +63,35 @@ pub(in crate::family) struct DevicePle {
     embedding: DeviceBuffer,
     keys: DeviceBuffer,
     value: DeviceBuffer,
+    dtype: DenseDtype,
     width: usize,
     hidden: usize,
     embed: usize,
 }
 
 impl DevicePle {
-    /// Uploads the projections as stored: `key_f16` is `width x embed` binary16 values and
-    /// `value_f16` is `hidden x embed`, little-endian row-major (the pack layout `[out, in]`).
+    /// Uploads the projections as stored: `key` is `width x embed` values of `stored` and `value`
+    /// is `hidden x embed`, little-endian row-major (the pack layout `[out, in]`). `stored` is the
+    /// dtype of the tensors in the checkpoint; anything but F16 (the EXL3 pack) and BF16 (the
+    /// official checkpoint) is refused.
     pub(in crate::family) fn upload(
         context: &CudaContext,
-        key_f16: &[u8],
-        value_f16: &[u8],
+        stored: Dtype,
+        key: &[u8],
+        value: &[u8],
         width: usize,
         hidden: usize,
         embed: usize,
     ) -> Result<Self, EngError> {
+        let dtype = match stored {
+            Dtype::F16 => DenseDtype::F16,
+            Dtype::Bf16 => DenseDtype::Bf16,
+            other => {
+                return Err(EngError::Checkpoint(format!(
+                    "the PLE projections are stored as {other:?}, the device route takes F16 or BF16"
+                )));
+            }
+        };
         let overflow = || EngError::BadRequest("ple projection sizes overflow".to_owned());
         let key_bytes = width
             .checked_mul(embed)
@@ -80,11 +101,11 @@ impl DevicePle {
             .checked_mul(embed)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(overflow)?;
-        if key_f16.len() != key_bytes || value_f16.len() != value_bytes {
+        if key.len() != key_bytes || value.len() != value_bytes {
             return Err(EngError::Checkpoint(format!(
                 "ple projections hold {} and {} bytes, expected {key_bytes} and {value_bytes}",
-                key_f16.len(),
-                value_f16.len()
+                key.len(),
+                value.len()
             )));
         }
         let place = |bytes: &[u8]| -> Result<DeviceBuffer, EngError> {
@@ -93,11 +114,12 @@ impl DevicePle {
             Ok(buffer)
         };
         Ok(Self {
-            key_weight: place(key_f16)?,
-            value_weight: place(value_f16)?,
+            key_weight: place(key)?,
+            value_weight: place(value)?,
             embedding: context.allocate(embed * 4)?,
             keys: context.allocate(width * 4)?,
             value: context.allocate(hidden * 4)?,
+            dtype,
             width,
             hidden,
             embed,
@@ -110,9 +132,10 @@ impl DevicePle {
     }
 
     /// Writes `embedding` and queues both projections on `stream`. The results stay on the device
-    /// until [`Self::collect`].
+    /// until [`Self::collect`]. `&mut self`: the buffers are shared, so a second `enqueue` before
+    /// the `collect` of the first would overwrite its results.
     pub(in crate::family) fn enqueue(
-        &self,
+        &mut self,
         context: &CudaContext,
         stream: &DeviceStream,
         embedding: &[f32],
@@ -133,7 +156,7 @@ impl DevicePle {
                 stream,
                 DenseGemvCall {
                     shape: DenseGemvShape::packed(1, rows, self.embed),
-                    dtype: DenseDtype::F16,
+                    dtype: self.dtype,
                     w: weight.range(0, rows * self.embed * 2)?,
                     x: self.embedding.range(0, self.embed * 4)?,
                     y: y.range(0, y_len * 4)?,
@@ -160,7 +183,7 @@ impl DevicePle {
 
     /// [`Self::enqueue`] and [`Self::collect`].
     pub(in crate::family) fn project(
-        &self,
+        &mut self,
         context: &CudaContext,
         stream: &DeviceStream,
         embedding: &[f32],

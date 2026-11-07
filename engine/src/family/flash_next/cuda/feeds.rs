@@ -19,9 +19,10 @@
 //! WHY a pool and a sorted run: the table is 30.4 GiB on local NVMe and a row is 102 bytes that
 //! cost one 4 KiB page. Measured on the real file (`doc/flash-next-ngram-latency.md`), a buffered
 //! read costs about 52 us cold and 1 us warm per row at queue depth 1, and a 16-row token costs
-//! 837 us cold on one thread against 147 us on 8 and 111 us on 16 pool threads (p50). A prefill
-//! chunk of 4096 tokens reads 65,532 distinct rows in 226 ms on 16 and 142 ms on 32 threads, where
-//! one thread would need seconds. Sorting by id sorts by file offset, so each thread reads a
+//! 837 us cold on one thread against 160-200 us p50 (p99 238-323 us) through this reader on 32
+//! threads. A prefill chunk of 4096 tokens (65,528 distinct rows) costs 242-244 ms through
+//! `RowReader::read` plus `embedding()` for every token; the raw read without decode took 142 ms on 32 threads in the bench.
+//! One thread would need seconds. Sorting by id sorts by file offset, so each thread reads a
 //! contiguous run. The pool lives as long as the reader, so a decode token pays a channel
 //! hand-off and no thread spawn.
 //!
@@ -33,7 +34,11 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::{
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -50,14 +55,16 @@ use crate::{
 pub(in crate::family) mod device;
 
 /// Reader threads when the caller does not choose. They wait on the drive, not on the CPU, so the
-/// count may exceed the cores: the chunk reads were fastest at 32.
+/// count may exceed the cores. A 4096-token chunk was read faster on 32 threads than on 16 (142
+/// against 226 ms, read only); more than 32 was not measured.
 pub(in crate::family) const DEFAULT_THREADS: usize = 32;
 const MAX_THREADS: usize = 128;
 
 /// Page cache the n-gram table needs reserved in the host budget (`HostBudget::page_cache` of
 /// `tier_plan`): none. Measured on the real file (`doc/flash-next-ngram-latency.md`), a decode
-/// token with all 16 rows cold costs 147 us p50 and 302 us p99 on 8 reader threads, about 1% of a
-/// token, and the reads can start before layer 0; a prefill chunk reads one chunk ahead of its
+/// token with all 16 rows cold costs 160-200 us p50 and 238-323 us p99 through [`RowReader`] on 32
+/// threads (three runs, 400 tokens each, machine under load), about 1% of a token, and the reads can
+/// start before layer 0; a prefill chunk reads one chunk ahead of its
 /// compute. A warm page is a bonus, not a requirement, so the pinned expert store may take the RAM
 /// and the kernel keeps whatever rows fit. A reserve is justified only by a measured low hit rate
 /// on real transcripts (the trace study M-N2 was not run).
@@ -136,7 +143,16 @@ impl PendingRows {
         }
         let mut values = Vec::with_capacity(self.ids.len() * ROW_DIM);
         for part in parts {
-            values.extend(part.unwrap_or_default());
+            values.extend(part.ok_or_else(|| {
+                EngError::Checkpoint("an n-gram reader part is missing".to_owned())
+            })?);
+        }
+        if values.len() != self.ids.len() * ROW_DIM {
+            return Err(EngError::Checkpoint(format!(
+                "an n-gram read returned {} values for {} rows",
+                values.len(),
+                self.ids.len()
+            )));
         }
         Ok(RowBlock {
             ids: self.ids,
@@ -145,9 +161,22 @@ impl PendingRows {
     }
 }
 
+type ReadRun = dyn Fn(&[u64]) -> Result<Vec<f32>, EngError> + Send + Sync;
+
 /// Batched reads of the n-gram table through a pool of reader threads.
+///
+/// Parts of one read go to consecutive workers starting at a rotating counter, so reads in flight
+/// together (a decode token behind a chunk, a double-buffered chunk worker) spread over the pool
+/// instead of queuing on the same first workers.
+///
+/// A panic in a worker ends that worker. Reads that had a part on it fail with a `Checkpoint`
+/// error from [`PendingRows::wait`], and any later [`Self::submit`] that puts a part on it fails
+/// with a `Checkpoint` error: the pool does not respawn, so the reader is unusable and must be
+/// rebuilt. Dropping the reader closes the queues; the workers finish the jobs already queued and
+/// exit, so a [`PendingRows`] still waits to a complete block after the reader is dropped.
 pub(in crate::family) struct RowReader {
     workers: Vec<mpsc::Sender<Job>>,
+    next: AtomicUsize,
 }
 
 impl RowReader {
@@ -158,16 +187,23 @@ impl RowReader {
         decoder: Arc<NgramDecoder>,
         threads: usize,
     ) -> Result<Self, EngError> {
+        Self::with_reader(
+            Arc::new(move |rows: &[u64]| read_run(&file, &decoder, rows)),
+            threads,
+        )
+    }
+
+    fn with_reader(read: Arc<ReadRun>, threads: usize) -> Result<Self, EngError> {
         let threads = threads.clamp(1, MAX_THREADS);
         let mut workers = Vec::with_capacity(threads);
         for index in 0..threads {
             let (sender, jobs) = mpsc::channel::<Job>();
-            let (file, decoder) = (Arc::clone(&file), Arc::clone(&decoder));
+            let read = Arc::clone(&read);
             thread::Builder::new()
                 .name(format!("flash-ngram-read-{index}"))
                 .spawn(move || {
                     for job in jobs {
-                        let result = read_run(&file, &decoder, &job.rows);
+                        let result = read(&job.rows);
                         // The caller dropped its PendingRows: nobody wants the rows.
                         let _ = job.reply.send((job.part, result));
                     }
@@ -175,29 +211,37 @@ impl RowReader {
                 .map_err(|error| EngError::MemoryPlan(format!("n-gram reader thread: {error}")))?;
             workers.push(sender);
         }
-        Ok(Self { workers })
+        Ok(Self {
+            workers,
+            next: AtomicUsize::new(0),
+        })
     }
 
-    /// Queues the read of `rows` (any order, repeats allowed) and returns at once.
+    /// Queues the read of `rows` (any order, repeats allowed) and returns at once. The distinct
+    /// rows are split into `min(rows, threads)` consecutive runs whose lengths differ by at most
+    /// one, so every thread of the pool gets work when there are rows for it.
     pub(in crate::family) fn submit(&self, rows: &[u64]) -> Result<PendingRows, EngError> {
         let mut ids = rows.to_vec();
         ids.sort_unstable();
         ids.dedup();
         let (reply, replies) = mpsc::channel();
-        let mut parts = 0;
-        if !ids.is_empty() {
-            let per = ids.len().div_ceil(ids.len().min(self.workers.len()));
-            for (part, run) in ids.chunks(per).enumerate() {
-                self.workers[part]
+        let parts = ids.len().min(self.workers.len());
+        if let Some(size) = ids.len().checked_div(parts) {
+            let extra = ids.len() % parts;
+            let first = self.next.fetch_add(parts, Ordering::Relaxed);
+            let mut at = 0;
+            for part in 0..parts {
+                let len = size + usize::from(part < extra);
+                self.workers[(first + part) % self.workers.len()]
                     .send(Job {
-                        rows: run.to_vec(),
+                        rows: ids[at..at + len].to_vec(),
                         part,
                         reply: reply.clone(),
                     })
                     .map_err(|_| {
                         EngError::Checkpoint("an n-gram reader thread has ended".to_owned())
                     })?;
-                parts += 1;
+                at += len;
             }
         }
         Ok(PendingRows {
@@ -303,8 +347,10 @@ pub(in crate::family) trait StartSink {
 /// The sizes a token start is checked against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family) struct StartShape {
-    /// Embedding table rows: ids at or above are refused.
-    pub(in crate::family) vocab: usize,
+    /// The sampler vocabulary, the largest id the argmax can draw plus one. It is NOT the width of
+    /// the embedding table: the table has padding rows above it that would embed and run, so ids
+    /// from here up to the table width are refused like the Qwen3.6 `check_token_id`.
+    pub(in crate::family) sampler_vocab: usize,
     /// `branches * hidden`.
     pub(in crate::family) stream: usize,
     /// `ple_embed`.
@@ -314,8 +360,8 @@ pub(in crate::family) struct StartShape {
 /// Writes the start block of the token at position `pos`.
 ///
 /// Every check comes before the first write, so a refused token changes nothing (the rule of the
-/// Qwen3.6 `write_start`): the token is inside the table, both vectors have their width, and the
-/// token and position fit an `i32`.
+/// Qwen3.6 `write_start`): the token is inside the sampler vocabulary, both vectors have their
+/// width, and the token and position fit an `i32`.
 pub(in crate::family) fn write_start<S: StartSink>(
     sink: &mut S,
     shape: &StartShape,
@@ -324,10 +370,10 @@ pub(in crate::family) fn write_start<S: StartSink>(
     stream: &[f32],
     ple_embedding: &[f32],
 ) -> Result<(), EngError> {
-    if usize::try_from(token).is_ok_and(|id| id >= shape.vocab) {
+    if usize::try_from(token).is_ok_and(|id| id >= shape.sampler_vocab) {
         return Err(EngError::BadRequest(format!(
-            "token id {token} is outside the embedding table 0..{}",
-            shape.vocab
+            "token id {token} is outside the sampler vocabulary 0..{}",
+            shape.sampler_vocab
         )));
     }
     if stream.len() != shape.stream {

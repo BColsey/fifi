@@ -11,7 +11,14 @@
 //!   chunk is read sorted, and the per-token latency of the production reader is printed cold and
 //!   warm.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use super::{
     DEFAULT_THREADS, NGRAM_PAGE_CACHE_RESERVE_BYTES, RowReader, StartShape, StartSink, global_rows,
@@ -283,8 +290,10 @@ impl StartSink for Recorder {
     }
 }
 
+/// A sampler vocabulary of 248,070 inside an embedding table of 248,320 rows: ids 248,070 to
+/// 248,319 are padding rows that would embed and run but that the argmax can never draw.
 const SHAPE: StartShape = StartShape {
-    vocab: 248_320,
+    sampler_vocab: 248_070,
     stream: 8,
     ple_embed: 4,
 };
@@ -299,14 +308,12 @@ fn a_token_start_writes_the_params_then_the_stream_then_the_embedding() {
 #[test]
 fn a_refused_token_start_writes_nothing() {
     for (token, stream, embedding, pos, want) in [
-        (
-            248_320u32,
-            8usize,
-            4usize,
-            0usize,
-            "outside the embedding table",
-        ),
-        (u32::MAX, 8, 4, 0, "outside the embedding table"),
+        // The padding rows inside the table, first, middle, last; the first row above the table.
+        (248_070u32, 8usize, 4usize, 0usize, "sampler vocabulary"),
+        (248_100, 8, 4, 0, "sampler vocabulary"),
+        (248_319, 8, 4, 0, "sampler vocabulary"),
+        (248_320, 8, 4, 0, "sampler vocabulary"),
+        (u32::MAX, 8, 4, 0, "sampler vocabulary"),
         (1, 7, 4, 0, "start stream has 7"),
         (1, 8, 5, 0, "PLE embedding has 5"),
         (1, 8, 4, usize::MAX, "position does not fit an i32"),
@@ -322,16 +329,129 @@ fn a_refused_token_start_writes_nothing() {
         );
         match result {
             Err(EngError::BadRequest(message)) => {
-                assert!(message.contains(want), "{message} (wanted {want})")
+                assert!(message.contains(want), "{message} (wanted {want})");
+                if want == "sampler vocabulary" {
+                    assert!(message.contains(&format!("token id {token}")), "{message}");
+                }
             }
             other => panic!("{other:?}"),
         }
         assert!(sink.events.is_empty(), "{:?}", sink.events);
     }
-    // The last id inside the table is accepted.
+    // The last id the sampler can draw is accepted.
     let mut sink = Recorder::default();
-    write_start(&mut sink, &SHAPE, 248_319, 0, &[0.0; 8], &[0.0; 4]).unwrap();
+    write_start(&mut sink, &SHAPE, 248_069, 0, &[0.0; 8], &[0.0; 4]).unwrap();
     assert_eq!(sink.events.len(), 3);
+}
+
+#[test]
+fn global_rows_adds_the_start_of_each_table_and_refuses_a_missing_table() {
+    let shard_rows = [10u64, 5, 7];
+    assert_eq!(
+        global_rows(&[(0, 3), (1, 0), (2, 6), (1, 4)], &shard_rows).unwrap(),
+        [3, 10, 21, 14]
+    );
+    assert!(global_rows(&[(3, 0)], &shard_rows).is_err());
+    assert!(global_rows(&[(0, 0)], &[u64::MAX, 1]).is_err());
+}
+
+/// A reader whose runs sleep, so reads submitted together are in flight together, and whose
+/// values name the row (`row as f32` repeated), so a block can be checked without a table.
+fn named_reader(threads: usize, delay: Duration) -> RowReader {
+    RowReader::with_reader(
+        Arc::new(move |rows: &[u64]| {
+            std::thread::sleep(delay);
+            Ok(rows
+                .iter()
+                .flat_map(|&row| std::iter::repeat_n(row as f32, ROW_DIM))
+                .collect())
+        }),
+        threads,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_split_gives_every_thread_a_run_and_the_runs_cover_the_rows_once() {
+    let reader = named_reader(4, Duration::ZERO);
+    for n in [1u64, 3, 4, 5, 7, 33, 100] {
+        let rows: Vec<u64> = (0..n).map(|i| i * 3 + 1).collect();
+        let block = reader.read(&rows).unwrap();
+        assert_eq!(block.ids(), rows, "n = {n}");
+        for &row in &rows {
+            assert!(block.get(row).unwrap().iter().all(|v| *v == row as f32));
+        }
+    }
+}
+
+#[test]
+fn reads_in_flight_together_spread_over_the_pool_instead_of_queuing_on_the_first_workers() {
+    // 8 workers, 4 rows per read: the parts of read A sit on workers 0-3 and the parts of read B on
+    // workers 4-7, so both finish after one delay. Without the rotation B queues behind A and
+    // needs two delays.
+    let delay = Duration::from_millis(300);
+    let reader = named_reader(8, delay);
+    let start = std::time::Instant::now();
+    let a = reader.submit(&[1, 2, 3, 4]).unwrap();
+    let b = reader.submit(&[5, 6, 7, 8]).unwrap();
+    let (b, a) = (b.wait().unwrap(), a.wait().unwrap());
+    let elapsed = start.elapsed();
+    assert_eq!((a.len(), b.len()), (4, 4));
+    assert!(
+        elapsed < delay * 3 / 2,
+        "{elapsed:?} for two reads of one delay each"
+    );
+}
+
+#[test]
+fn a_pending_read_completes_after_the_reader_is_dropped() {
+    let reader = named_reader(3, Duration::from_millis(20));
+    let pending = reader.submit(&[10, 11, 12, 13, 14]).unwrap();
+    drop(reader);
+    let block = pending.wait().unwrap();
+    assert_eq!(block.ids(), [10, 11, 12, 13, 14]);
+}
+
+#[test]
+fn a_panicking_reader_thread_fails_the_read_and_every_later_submit_on_that_worker() {
+    // One worker, so every submit lands on it. The first run panics; the worker ends.
+    let tripped = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&tripped);
+    let reader = RowReader::with_reader(
+        Arc::new(move |rows: &[u64]| {
+            if rows.contains(&13) && !flag.swap(true, Ordering::SeqCst) {
+                panic!("test: the reader panics on row 13");
+            }
+            Ok(vec![0.0; rows.len() * ROW_DIM])
+        }),
+        1,
+    )
+    .unwrap();
+    match reader.read(&[12, 13]) {
+        Err(EngError::Checkpoint(message)) => assert!(message.contains("ended"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // The worker leaves its loop when the panic unwinds; its queue closes a moment after the
+    // reply channel does, so poll for the failure instead of assuming the order.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match reader.submit(&[1]) {
+            Err(EngError::Checkpoint(message)) => {
+                assert!(message.contains("has ended"), "{message}");
+                break;
+            }
+            Ok(pending) => {
+                // Queued before the worker's receiver closed: the read cannot be served.
+                assert!(matches!(pending.wait(), Err(EngError::Checkpoint(_))));
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dead worker was never reported"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {
@@ -340,8 +460,11 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
 }
 
 /// The full pack's table: the same prompt hashes to the same rows and decodes to the same bits as
-/// the fixture, a 256-token chunk reads sorted, and the production reader's per-token latency is
-/// printed. Run with `--ignored --nocapture`; the pack must be on local storage.
+/// the fixture, and the production reader's per-token latency and the time of 256- and 4096-token
+/// chunks (plan, read plus decode, embedding assembly) are printed. Run with `--ignored
+/// --nocapture`; the pack must be on local storage. The test drops no pages: a "cold" figure
+/// relies on fresh pseudo-random rows over 30 GiB rarely being resident, so check `fincore` of the
+/// file before the run when the figure matters. "Warm" is the same rows read again at once.
 #[test]
 #[ignore = "reads the 30.4 GiB n-gram table of the full pack: FIFI_FLASH_NEXT_EXL3_PACK"]
 fn the_full_pack_table_serves_the_recorded_rows_and_reports_read_latency() {
@@ -398,23 +521,40 @@ fn the_full_pack_table_serves_the_recorded_rows_and_reports_read_latency() {
         }
     }
     println!(
-        "token (16 rows) reader threads={DEFAULT_THREADS}: cold p50 {:.0} us p99 {:.0} us; warm p50 {:.0} us p99 {:.0} us",
+        "token (16 rows) reader threads={DEFAULT_THREADS}, n={}: cold p50 {:.0} us p99 {:.0} us; warm p50 {:.0} us p99 {:.0} us",
+        chunk.per_token.len(),
         percentile(&mut cold, 0.5),
         percentile(&mut cold, 0.99),
         percentile(&mut warm, 0.5),
         percentile(&mut warm, 0.99)
     );
 
-    // A prefill chunk of 256 tokens: all ids up front, one sorted read.
-    let tokens: Vec<u32> = (0..256).map(|_| (next() % 248_000) as u32).collect();
-    let chunk = plan_chunk(&shape, &weights, &[], &tokens).unwrap();
-    let start = Instant::now();
-    let block = reader.read(&chunk.all()).unwrap();
-    println!(
-        "chunk of 256 tokens: {} distinct rows in {:.1} ms",
-        block.len(),
-        start.elapsed().as_secs_f64() * 1e3
-    );
+    // Prefill chunks: all ids planned up front, one sorted read, then the embedding of every
+    // token assembled from the block, which is what a chunk feed does.
+    for count in [256usize, 4096] {
+        let tokens: Vec<u32> = (0..count).map(|_| (next() % 248_000) as u32).collect();
+        let t0 = Instant::now();
+        let chunk = plan_chunk(&shape, &weights, &[], &tokens).unwrap();
+        let planned = t0.elapsed();
+        let t1 = Instant::now();
+        let block = reader.read(&chunk.all()).unwrap();
+        let read = t1.elapsed();
+        let t2 = Instant::now();
+        let mut checksum = 0.0f32;
+        for rows in &chunk.per_token {
+            checksum += block.embedding(rows, 1.0).unwrap()[0];
+        }
+        let assembled = t2.elapsed();
+        println!(
+            "chunk of {count} tokens: {} distinct rows; plan {:.1} ms, read+decode {:.1} ms, \
+             embeddings {:.1} ms, total {:.1} ms (checksum {checksum})",
+            block.len(),
+            planned.as_secs_f64() * 1e3,
+            read.as_secs_f64() * 1e3,
+            assembled.as_secs_f64() * 1e3,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+    }
 }
 
 #[test]

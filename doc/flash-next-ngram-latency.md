@@ -2,8 +2,9 @@
 
 Measured 2026-11-07 on the real table, `ngram_embedding.safetensors` of the 3.05 bpw pack (30.4 GiB,
 320,001,536 rows of 102 bytes, rev 69e33439), on `/home` (btrfs, Samsung 990 PRO, PCIe 4.0 x4,
-mount options `noatime,ssd,discard=async,autodefrag`). The page cache held 0 bytes of the file before
-and after every run (`fincore`).
+mount options `noatime,ssd,discard=async,autodefrag`). `fincore` showed 0 bytes of the file in the
+page cache after the bench runs (read at the terminal, not logged) and before and after each
+production-reader run (logged in `results.log`).
 
 ## Method
 
@@ -24,7 +25,7 @@ and after every run (`fincore`).
   bound. A first run of the "warm" pass after a full cold pass at 40k rows missed the cache (pages
   evicted under the pressure); the numbers below come from the interleaved runs.
 
-## Per-row reads (queue depth = reader threads), two runs
+## Per-row reads (queue depth = reader threads), two runs. Read only, no decode
 
 | QD | cold p50 us | cold p99 us | cold max us | warm p50 us | warm p99 us |
 |---|---|---|---|---|---|
@@ -38,7 +39,7 @@ Aggregate cold throughput (cold plus warm reads over wall time, so about twice t
 cold p50 57.4 us, p99 72.6 us, against 52 us with `FADV_RANDOM`. The 10% gap does not justify a
 new method on `NgramFile`, so the reader does not set the advice.
 
-## One decode token (16 random rows), two runs, 2,000 tokens each
+## One decode token (16 random rows), two runs, 2,000 tokens each. Read only, no decode
 
 | reader threads | cold p50 us | cold p99 us | warm p50 us | warm p99 us |
 |---|---|---|---|---|
@@ -52,7 +53,7 @@ Cold per-token cost on one thread is 16 times the per-row figure. With 8 to 16 p
 than the inline loop (hand-off 10-30 us against 7.7 us for 16 resident rows): a decode token whose
 rows are all resident is served faster inline, which `RowReader` does not do yet.
 
-## One prefill chunk (sorted, de-duplicated, pool of N threads)
+## One prefill chunk (sorted, de-duplicated, pool of N threads). Read only, no decode
 
 | tokens | rows (distinct) | threads | cold | warm |
 |---|---|---|---|---|
@@ -61,16 +62,18 @@ rows are all resident is served faster inline, which `RowReader` does not do yet
 | 4096 | 65,532 | 16 | 226 ms (290k rows/s) | 12.8 ms |
 | 4096 | 65,528 | 32 | 142 ms (461k rows/s) | 12.8 ms |
 
-A 32K prompt is eight 4096-token chunks: 1.1-1.8 s of cold reads in total, read one chunk ahead of
-its compute (about 3 s per chunk by the research notes). Serial per-row reads at 162 us (the old
-Kingston figure) would take 85 s; at the measured 52 us they would still take 27 s.
+These are raw reads: the bench does no `decode_row` and no embedding assembly. Through `RowReader`
+(read + decode + embeddings for every token) a 4096-token chunk costs 242-244 ms (table below), so
+a 32K prompt is eight chunks and about 2 s of cold n-gram work, read one chunk ahead of its compute
+(about 3 s per chunk by the research notes). Serial per-row reads at 162 us (the old Kingston
+figure) would take 85 s; at the measured 52 us they would still take 27 s.
 
 ## What it means for the design
 
 - The old 162 us single-read figure was the Kingston drive. The real file on the 990 PRO is 52 us
   cold at QD1 under load.
 - Decode: submit the 16 reads as soon as the token is known (the rows depend on the token and the
-  last two tokens only) and wait for them at the PLE layer; the 110-340 us then overlap layer 0.
+  last two tokens only) and wait for them at the PLE layer; the 160-320 us then overlap layer 0.
 - Prefill: plan the whole chunk first, one sorted read at 32 threads.
 - Page cache: nothing needs reserving (`NGRAM_PAGE_CACHE_RESERVE_BYTES = 0` in `feeds.rs`). The cold
   cost is small enough that a hit rate matters little; the kernel keeps what fits. Transient
@@ -82,16 +85,35 @@ Kingston figure) would take 85 s; at the measured 52 us they would still take 27
 
 `feeds::tests::the_full_pack_table_serves_the_recorded_rows_and_reports_read_latency` (ignored; run
 with `FIFI_FLASH_NEXT_EXL3_PACK=<pack> ... --ignored --nocapture`) drives `RowReader` with 32 threads
-through `NgramFile::read_row` and `NgramDecoder::decode_row`, 400 random tokens, including the
-2,560-value embedding assembly. Release build, `taskset -c 16-23`, load average 22, the file's pages
-dropped before each run (two runs):
+through `NgramFile::read_row` and `NgramDecoder::decode_row`: 400 random tokens (n = 400, so p99 is
+the fourth largest sample) with the 2,560-value embedding assembly, then chunks of 256 and 4096
+tokens. Release build, CPU only, `taskset -c 16-23`, load average 7, three runs. The test drops no
+pages itself; I dropped the file's pages with `posix_fadvise(DONTNEED)` before each run and `fincore`
+showed 0 resident before every run (`results.log`). Within a run, "cold" is fresh random rows and
+"warm" is the same 16 rows read again at once.
 
-| case | p50 | p99 |
-|---|---|---|
-| token, 16 rows, cold | 145 / 145 us | 385 / 268 us |
-| token, 16 rows, warm (re-read at once) | 54 / 55 us | 460 / 204 us |
-| chunk of 256 tokens, 4,096 distinct rows, cold | 17.7 / 17.4 ms | - |
+| case | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| token, 16 rows, cold p50 / p99 | 200 / 323 us | 163 / 255 us | 160 / 238 us |
+| token, 16 rows, warm p50 / p99 | 36 / 49 us | 41 / 63 us | 36 / 54 us |
+| chunk of 256 tokens (4,096 rows): read+decode, total | 14.9, 15.3 ms | 14.9, 15.3 ms | 15.2, 15.6 ms |
+| chunk of 4096 tokens (65,529 rows): plan | 1.9 ms | 1.9 ms | 1.7 ms |
+| chunk of 4096 tokens: read+decode | 233.6 ms | 230.3 ms | 232.5 ms |
+| chunk of 4096 tokens: 4096 embeddings | 8.8 ms | 9.5 ms | 9.3 ms |
+| chunk of 4096 tokens: total | 244.2 ms | 241.7 ms | 243.6 ms |
 
-The warm token is hand-off plus decode (about 3 us per row at 16 rows), not I/O. A debug build of the
-same test reports 266 us cold and 197 us warm at p50: the decode loop needs an optimized build. The
-same rows decode to the recorded bits of the committed fixture.
+An earlier set of two runs under load 22, before parts were rotated over the workers, gave cold p50
+145 us / p99 268-385 us and warm p50 54 us. The warm token is hand-off plus decode (about 2 us per
+row), not I/O. A debug build of the same test reports 266 us cold and 197 us warm at p50: the decode
+loop needs an optimized build. The same rows decode to the recorded bits of the committed fixture.
+
+## The PLE key/value matvec on the host (why the projections run on the card)
+
+`doc/flash-next-ngram-bench/ple_matvec_bench.rs`: both projections (12,800 x 2,560, 33 M multiply-adds,
+65 MiB as F16 or 131 MiB as F32) on `taskset -c 16-23`, 40 calls each, load 13-20: F16 on 8 threads
+min 1.57 ms, p50 2.62 ms, p99 7.6 ms; F32 on 8 threads min 2.72 ms, p50 3.41 ms; F16 on 1-4 threads
+p50 4.1-5.4 ms, p99 6-14 ms on 2-16 threads (61-70 ms on one). The 2.6-5 ms figures were taken under that load; the best case
+is 1.57 ms with all 8 pinned cores busy and 65 MiB read from memory per token. The device route is
+chosen for that traffic and those cores, and because the host product must finish while the card
+runs layers 0 and 1 (about 1 ms); the kernel time is the S0 figure, and the route's own time
+(pageable copies, two launches, a 44 KiB read-back) is not measured yet.
