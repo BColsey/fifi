@@ -286,11 +286,14 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
 
 /// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
 /// the attention pre-RoPE and post-core closures of a uniform model need four keys, and a
-/// fifth covers one extra distinct constant set (for example a second quantization). A sixth
-/// distinct key is an unapproved configuration change. This does not count MLX tapes: one MoE
-/// key permits B=1/2/4/8, so one adapter context can approve at most twenty key/batch pairs.
-/// Other contexts, cache clears and other threads are not bounded by this registry.
-pub(crate) const PROGRAM_LIMIT: usize = 5;
+/// fifth covers one extra distinct constant set (for example a second quantization). The
+/// dense releases mix per-layer quantization overrides, so one attention layer set is no
+/// longer one constant set: the oQ6 pack needs 2 delta + 3 attention sets (2 programs each)
+/// = 8 keys. A ninth distinct key is an unapproved configuration change. This does not
+/// count MLX tapes: one MoE key permits B=1/2/4/8, so one adapter context can approve at
+/// most thirty-two key/batch pairs. Other contexts, cache clears and other threads are not
+/// bounded by this registry.
+pub(crate) const PROGRAM_LIMIT: usize = 8;
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
@@ -996,7 +999,7 @@ mod tests {
     }
 
     /// The registry of one adapter context holds the limit rule as a plain function of the ids
-    /// seen: five distinct ids register, a repeat is a cache hit, and the SIXTH distinct id is
+    /// seen: eight distinct ids register, a repeat is a cache hit, and the NINTH distinct id is
     /// refused with `BadRequest` naming the limit — reaching the limit through the ids, not
     /// through the constant.
     #[test]
@@ -1009,17 +1012,18 @@ mod tests {
         assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
         // A repeat of a registered id is fine: it is a cache hit, not a new program.
         assert_eq!(registry.admit(8), Ok(false));
-        let sixth = registry.admit(16);
-        let EngError::BadRequest(message) = sixth.unwrap_err() else {
+        let ninth = registry.admit(16);
+        let EngError::BadRequest(message) = ninth.unwrap_err() else {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("at most 5 compiled programs per adapter"),
+            message.contains("at most 8 compiled programs per adapter"),
             "the refusal names the limit: {message}"
         );
         // The refused id was not registered, so the registry still holds exactly the limit and
-        // stays refused for a further distinct id.
+        // stays refused for a further distinct id (12 is inside the admitted range, so probe
+        // an id beyond it).
         assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
-        assert!(registry.admit(12).is_err(), "the limit stays refused");
+        assert!(registry.admit(20).is_err(), "the limit stays refused");
     }
 }

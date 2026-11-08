@@ -10,12 +10,12 @@
 //! uncompiled run issue the same MLX calls in the same order in both activation dtypes.
 //! Activation and packed-weight scale dtypes belong to the compile cache key
 //! (`kernels::compile_key`), keeping the F32 and BF16 decoders on distinct baked keys. One
-//! adapter context admits at most 5 keys before any native call; its `ProgramRegistry` dies
+//! adapter context admits at most 8 keys before any native call; its `ProgramRegistry` dies
 //! with it. B>1 MoE vectorizes its sequence. Staged B>1 DeltaNet batches
 //! five projections and keeps one recurrence/ring core per slot; taps<=1 stays B1-only.
-//! Each block key permits B=1/2/4/8 where supported: one context admits at most twenty key/batch
-//! pairs. This is not a per-thread or global bound: other contexts can admit other keys, and
-//! cache clears or other threads can cause further closure-body entries.
+//! Each block key permits B=1/2/4/8 where supported: one context admits at most thirty-two
+//! key/batch pairs. This is not a per-thread or global bound: other contexts can admit other
+//! keys, and cache clears or other threads can cause further closure-body entries.
 //!
 //! Every wrapper runs under the dispatch guard, validates before the first native call
 //! (`check_operand` and the F32 rule on every input, `check_owner` plus the logical shapes on
@@ -442,7 +442,7 @@ impl Context {
     /// epsilon, the activation dtype, and per packed weight the scale dtype and the quantization
     /// triple. They form the compile cache key (`compile_key::delta_fun_id`), so every layer with
     /// the same constants shares one compiled program, and the per-adapter registry admits the
-    /// key BEFORE any native call: a sixth distinct key of one adapter is `BadRequest`.
+    /// key BEFORE any native call: a ninth distinct key of one adapter is `BadRequest`.
     ///
     /// Dtype rules: the block output carries the activation dtype (the block ends in `to_act`);
     /// the recurrence state and the ring stay F32; the closure mirrors every cast of the
@@ -618,7 +618,7 @@ impl Context {
                 .map(|weight| compile_key::dtype_key(weight.scales().dtype())),
             quant: triples,
         });
-        // The per-adapter program registry decides before any native call: a sixth distinct key
+        // The per-adapter program registry decides before any native call: a ninth distinct key
         // of one adapter is a setting mistake, not a reason to grow the MLX compile cache.
         adapter.programs.admit(fun_id)?;
         let mut keep: Vec<_> = [args.x, args.rec, args.ring]
@@ -780,7 +780,7 @@ impl Context {
     /// flag, the clamp bound `experts - 1` (the ONE `mlx_minimum` clamp per layer), the activation
     /// dtype, and per packed weight the scale dtype and the quantization triple. They form the
     /// compile cache key (`compile_key::moe_fun_id`); the per-adapter registry admits it BEFORE
-    /// any native call, and a sixth distinct key of one adapter is `BadRequest`. B is not baked;
+    /// any native call, and a ninth distinct key of one adapter is `BadRequest`. B is not baked;
     /// the nonshapeless MLX cache specializes input shapes under the same key.
     ///
     /// Dtype rules: the block output carries the activation dtype (the final `to_act`); the
