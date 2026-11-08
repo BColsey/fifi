@@ -1,0 +1,44 @@
+{
+  "schema": "fifi.model-router-primary-validation.v1",
+  "recorded_utc": "2026-11-08T18:07:22.867966+00:00",
+  "base_commit": "04fe2ff94d240a4ebf0be38aab2c9e6f82d38913",
+  "node": "v22.17.0",
+  "router_sha256": "b3eab502336798866dfb26f401627f2a92388f54dfdcba458cbcbcec1d3fc764",
+  "test_sha256": "96854af174b4cd32fd4eb4f7f84ab95634f8de8776b256db952199177a888eff",
+  "checks": [
+    {
+      "command": "node --check scripts/web-model-router.mjs",
+      "result": "passed"
+    },
+    {
+      "command": "python3 -I -B -m unittest discover -s scripts/tests -p test_web_model_router.py -v",
+      "result": "3 passed",
+      "output": [
+        "test_model_list_fails_when_both_backends_are_unavailable (test_web_model_router.ModelRouterTests.test_model_list_fails_when_both_backends_are_unavailable) ... ok",
+        "test_primary_is_first_and_model_specific_routes_still_work (test_web_model_router.ModelRouterTests.test_primary_is_first_and_model_specific_routes_still_work) ... ok",
+        "test_primary_placeholder_stays_first_if_its_backend_is_unavailable (test_web_model_router.ModelRouterTests.test_primary_placeholder_stays_first_if_its_backend_is_unavailable) ... ok",
+        "",
+        "----------------------------------------------------------------------",
+        "Ran 3 tests in 2.781s",
+        "",
+        "OK"
+      ]
+    },
+    {
+      "command": "ruff check and format --check on the test",
+      "result": "passed",
+      "output": [
+        "All checks passed!",
+        "1 file already formatted"
+      ]
+    },
+    {
+      "command": "compare deployed router bytes with tested router",
+      "result": "identical"
+    }
+  ],
+  "limits": [
+    "Loopback fake backends verify ordering and routing; they do not establish GPU or model performance.",
+    "Existing browser model selections are retained and must be changed by the user if a different model was already saved."
+  ]
+}
