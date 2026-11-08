@@ -50,6 +50,31 @@ multi-block rework of the ring's payload kernels (grid-strided copies,
 addresses exactly this; the probe re-run after it is the acceptance
 number. PCIe 3.0 x4-ish effective ceiling would put 2.1 MB at ~0.3 ms.
 
+## Refinement: the expert stacks split along INTER, not experts
+
+The keystone's stack refusal is the inter-dimensional split, not an
+expert subset: each card holds HALF THE INTERMEDIATE ROWS OF EVERY
+EXPERT (65536 of 131072 gate rows = its 256 of 512 inter). So NO pick
+filtering is needed - both cards compute EVERY pick over their inter
+half (the mmid grouped GEMM's per-expert n already derives from
+`weight.n_rows()/experts`), the swiglu and down projection run on the
+card's halves, and the down/shared outputs are PARTIAL [m x hidden]
+sums - exactly the per-token card path's shape. The card chunk twin is
+therefore:
+
+- a `ChunkModel::card` constructor whose MoeDims carries the CARD's
+  inter/shared_inter (from the shard table) and whose stack checks
+  validate against those (the full-dims check is what refused);
+- routing ONCE on card 0 with a small per-layer broadcast of the picks
+  (m*top_k ids + weights + m shared-gates, ~0.1 ms) - both cards hold
+  the router, but cross-GPU fp determinism is an assumption not worth
+  making when the broadcast is this cheap;
+- after each layer's mixer-output stage: exchange_sum the mixer output
+  slot (m*hidden values) BEFORE norm_f (which reads the full row);
+- after combine_chunk_moe: exchange_sum `h` (m*hidden) BEFORE the next
+  layer's norm_a add - combine's per-card h is the card's inter-half
+  partial, and moe_combine already writes it in place.
+
 ## Keystone finding (card_views_construct_chunk_models)
 
 The card session's per-card views construct ChunkModel under the CARD
