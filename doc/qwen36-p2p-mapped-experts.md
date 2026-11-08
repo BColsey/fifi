@@ -36,7 +36,10 @@ factor, but leaves less free VRAM. Choose values for the actual device order,
 context size, and other GPU users. The loader reports the selected host bytes
 and remaining GPU memory at startup.
 
-First measure the existing placement against an idle, ready engine:
+First measure the existing placement against an idle, ready engine. These
+commands use a key-free endpoint at `http://127.0.0.1:18792`; pass `--url`
+to both scripts if the endpoint is elsewhere. Use output paths that do not
+already exist:
 
 ```sh
 python3 scripts/bench_p2p_prefill.py --samples 3 --repeat 100 --output /tmp/qwen36-p2p-before.json
