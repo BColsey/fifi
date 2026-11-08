@@ -16,7 +16,7 @@ use crate::{
     EngError,
     family::{
         flash_next::stored::{
-            RoleRange, SlicedWeight, StackedLayouts, StoredWeight, read_stack_into,
+            RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
             read_stacked_into, stacked_layout,
         },
         qwen36::{
