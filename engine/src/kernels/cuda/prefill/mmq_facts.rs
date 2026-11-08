@@ -17,7 +17,6 @@ use std::cell::OnceCell;
 
 use crate::EngError;
 use crate::kernels::cuda::context::CudaContext;
-use crate::kernels::cuda::guard::DispatchGuard;
 use crate::kernels::cuda::native::prefill::mmq_facts::mmq_facts;
 use crate::kernels::cuda::prefill::mmq_size::fixup_floats_max;
 use crate::kernels::cuda::{ADAPTER_OPERATION, TERMINAL, native_error};
@@ -60,7 +59,7 @@ impl CudaContext {
         if let Some(facts) = self.mmq_facts.facts.get() {
             return Ok(*facts);
         }
-        let _dispatch = DispatchGuard::enter(&TERMINAL);
+        let _dispatch = self.enter()?;
         self.ensure_usable()?;
         #[cfg(test)]
         self.mmq_facts.queries.set(self.mmq_facts.queries.get() + 1);

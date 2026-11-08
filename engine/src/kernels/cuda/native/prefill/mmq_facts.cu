@@ -17,8 +17,7 @@
 #include "prefill/mmq_facts.h"
 #include "resident/mmvq_arch.h"
 
-// The live query. Called once per process by the cached wrapper below, and on demand by the
-// introspection entry. The four attributes cannot change while the process holds one device.
+// The live query. The four attributes cannot change while the process holds the device.
 static cudaError_t mmq_facts_live(fifi_device_facts *out) {
     int device = 0, major = 0, minor = 0, nsm = 0, smpbo = 0;
     cudaError_t err = cudaGetDevice(&device);
@@ -45,20 +44,29 @@ static cudaError_t mmq_facts_live(fifi_device_facts *out) {
     return cudaSuccess;
 }
 
-// Cached: every MMQ entry used to run this query, which is cudaGetDevice plus four
-// cudaDeviceGetAttribute calls. A 128-row chunk makes about 470 MMQ entries, so the cache
-// removes roughly 2,350 driver calls per chunk from the enqueue path.
+// Every entry must use the calling thread's current device. Cache the four immutable
+// attributes separately for each device and thread: a process can alternate contexts
+// on different GPUs, and independent threads must not race to populate a shared slot.
 cudaError_t inference_cuda_mmq_query_facts(fifi_device_facts *out) {
-    static const fifi_device_facts cached = [] {
-        fifi_device_facts facts{};
-        const cudaError_t err = mmq_facts_live(&facts);
-        return err == cudaSuccess ? facts : fifi_device_facts{};
-    }();
-    if (cached.cc == 0) {
-        // The first query failed. Repeat it so the caller sees the device error, not a zero fact.
+    int device = 0;
+    const cudaError_t selected = cudaGetDevice(&device);
+    if (selected != cudaSuccess) {
+        return selected;
+    }
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        // Preserve the live-query behavior for ordinals outside the cache.
         return mmq_facts_live(out);
     }
-    *out = cached;
+    static thread_local fifi_device_facts cached[GGML_CUDA_MAX_DEVICES]{};
+    if (cached[device].cc == 0) {
+        fifi_device_facts facts{};
+        const cudaError_t err = mmq_facts_live(&facts);
+        if (err != cudaSuccess) {
+            return err;
+        }
+        cached[device] = facts;
+    }
+    *out = cached[device];
     return cudaSuccess;
 }
 

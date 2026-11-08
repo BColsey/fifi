@@ -1123,7 +1123,7 @@ impl CudaContext {
         DeviceBuffer::from_raw(&self.lease, raw)
     }
 
-    fn enter(&self) -> Result<DispatchGuard<'static>, EngError> {
+    pub(super) fn enter(&self) -> Result<DispatchGuard<'static>, EngError> {
         enter_on(self.lease.device())
     }
 
