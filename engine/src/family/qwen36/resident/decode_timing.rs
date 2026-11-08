@@ -327,17 +327,24 @@ use {
     super::super::settings::{activation_name, chunked_prefill_allowed, kv_dtype_name},
     super::chunk_plan::{ChunkCost, PrefillTerms, admitted_chunk},
     super::decoder::{ResidentDecoder, StepMode, StepResult},
+    super::executor::{Q36Executor, Q36Rules},
     super::parity::{CONFIG_SHA256, sha256},
     super::real::{env_path, kv_dtype_from_env, open},
     super::state::ResidentState,
     super::within_mode::{BankConfig, env_number, run_pieces},
     crate::family::{
-        qwen36::host_load::HostWeights,
+        executor::{ExecutorOps, GenerationState},
+        qwen36::{host_load::HostWeights, settings::tokenizer_pin},
         sampler::{Sampler, SamplingParams},
-        session::DecodeSession,
+        session::{DecodeSession, StoreLimits},
         spec::QWEN3_6_35B_A3B,
+        speculate::config::{SpecConfig, SpecOptions},
     },
-    crate::{kernels::MlxKernels, sched::SessionBudget},
+    crate::{
+        kernels::MlxKernels,
+        sched::SessionBudget,
+        tokenizer::{IncrementalDecoder, TokenizerBundle},
+    },
     std::time::Instant,
 };
 
@@ -1108,6 +1115,177 @@ fn decode_phase_timing_by_mode() {
              model difference"
         );
     }
+}
+
+/// Speculative decode timing (Mac, ignored, real checkpoint): the serving decode path
+/// (`Q36Executor::decode_window`) with `draft_mode ngram` against speculation off, one model
+/// load, interleaved reps with the arm order alternating per rep. Both arms prefill the same
+/// prompt of the LAST `DT_DEPTHS` depth, warm up, then time `DT_SPEC_CALLS` decode calls per
+/// rep; the report is per arm: wall ms per call, published tokens per call, tokens per second
+/// and (ngram only) the calls that published more than one token. The tokenizer of the pinned
+/// serving setup is required (`DT_TOKENIZER_DIR`) because a serving decode builds the record
+/// chain of every published token. `DT_SPEC_DRAFTS` (default 2) is `num_draft_tokens`; the
+/// session cap defaults to the shipped `SESSION_CAP` and `DT_SPEC_SESSION_CAP` (bytes)
+/// overrides it — the ngram window snapshot charges the fixed DeltaNet bytes beside the row
+/// growth, so a tight cap refuses with `MemoryPlan`. Run like the decode timing, e.g.
+/// `Q36_CKPT_DIR=<CKPT> DT_TOKENIZER_DIR=<TOKENIZER> Q36_ACTIVATION=bf16 Q36_KV_DTYPE=q8 \
+///  DT_IDS_SOURCE=file Q36_PROMPT_IDS=<IDS> DT_DEPTHS=16384 Q36_OUT_DIR=<OUT> \
+///  QWEN36_G2A_COMPILE=1 cargo test --release --features native-mlx,native-fault-qualification \
+///  --lib family::qwen36::resident::decode_timing::speculative_decode_timing -- --ignored --exact --nocapture`.
+#[test]
+#[ignore = "needs the real checkpoint and tokenizer on the Mac; run with --ignored"]
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn speculative_decode_timing() {
+    let _serial = crate::native_test_lock();
+    let ckpt_dir = env_path("Q36_CKPT_DIR");
+    let tokenizer_dir = env_path("DT_TOKENIZER_DIR");
+    let ids = match ids_source_from_env() {
+        IdsSource::Tool => {
+            let ids_value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(env_path("IDS_FILE")).unwrap()).unwrap();
+            let ref_value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(env_path("REF_JSON")).unwrap()).unwrap();
+            read_ids(&ids_value, &ref_value)
+        }
+        IdsSource::File => read_prompt_ids(),
+    };
+    let depth = *depths_from_env(ids.len())
+        .last()
+        .expect("DT_DEPTHS names at least one depth");
+    let prompt = &ids[..depth];
+    let activation = required_activation_from_env();
+    let kv = kv_dtype_from_env();
+    let compile = std::env::var("QWEN36_G2A_COMPILE").is_ok_and(|v| v == "1");
+    let drafts = env_number("DT_SPEC_DRAFTS", 2, 1, 7) as u32;
+    let calls = env_number("DT_SPEC_CALLS", 32, 1, 1024);
+    let reps = env_number("DT_SPEC_REPS", 3, 1, 16);
+    let session_cap = std::env::var("DT_SPEC_SESSION_CAP")
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|_| panic!("DT_SPEC_SESSION_CAP must be bytes")))
+        .unwrap_or(SESSION_CAP);
+    let out_dir = create_out_dir(&out_dir_must_be_new());
+
+    let real = open(&ckpt_dir);
+    assert_eq!(
+        sha256(&real.config),
+        CONFIG_SHA256,
+        "config.json differs from the pinned checkpoint"
+    );
+    let mut kernels = MlxKernels::try_new().unwrap();
+    kernels.set_cache_limit(CACHE_LIMIT).unwrap();
+    let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
+    let rules = Q36Rules {
+        eos: Vec::new(),
+        sampler_vocab: host.shape().vocab,
+        context_limit: CONTEXT_LIMIT,
+        session_cap,
+        activation,
+        kv_dtype: kv,
+        compile,
+        max_seqs: 1,
+        prefix_store: StoreLimits::default(),
+    };
+    let (mut executor, mut solo) = Q36Executor::from_parts(kernels, &real.ckpt, host, rules).unwrap();
+    let mut ngram_session = executor.new_session().unwrap();
+    let bundle = TokenizerBundle::load(&tokenizer_dir, &tokenizer_pin().unwrap()).unwrap();
+    let disabled = SpecConfig::default();
+    let ngram = SpecConfig::new(&SpecOptions {
+        draft_mode: Some("ngram".to_owned()),
+        num_draft_tokens: Some(drafts),
+        ..SpecOptions::default()
+    })
+    .unwrap();
+    // The pair of arms shares one decode loop: prefill, warm-up (which also pays the window
+    // compile of the ngram arm), then the timed calls.
+    let mut arms: Vec<(&str, &SpecConfig, &mut Q36Session)> = vec![
+        ("disabled", &disabled, &mut solo),
+        ("ngram", &ngram, &mut ngram_session),
+    ];
+    for (_, config, session) in &mut arms {
+        executor.set_speculation(config).unwrap();
+        executor.prefill(session, prompt).unwrap();
+        let mut job = GenerationState::new(IncrementalDecoder::new(&bundle))
+            .with_max_tokens(u32::MAX);
+        for _ in 0..4 {
+            let _ = one_serving_call(&mut executor, session, &mut job);
+        }
+    }
+    let mut jobs: Vec<GenerationState> = arms
+        .iter()
+        .map(|_| {
+            GenerationState::new(IncrementalDecoder::new(&bundle)).with_max_tokens(u32::MAX)
+        })
+        .collect();
+    let mut rows = Vec::new();
+    for rep in 0..reps {
+        // Alternate the arm order per rep so thermal drift cannot favor one arm.
+        let order: Vec<usize> = if rep % 2 == 0 {
+            (0..arms.len()).collect()
+        } else {
+            (0..arms.len()).rev().collect()
+        };
+        for slot in order {
+            let (name, config, session) = &mut arms[slot];
+            executor.set_speculation(config).unwrap();
+            let started = Instant::now();
+            let mut tokens = 0usize;
+            let mut multi = 0usize;
+            for _ in 0..calls {
+                let batch =
+                    one_serving_call(&mut executor, &mut **session, &mut jobs[slot]);
+                let count = batch.tokens.len();
+                tokens += count;
+                multi += usize::from(count > 1);
+            }
+            let wall = ms(started.elapsed());
+            rows.push(serde_json::json!({
+                "arm": name,
+                "rep": rep,
+                "calls": calls,
+                "tokens": tokens,
+                "multi_token_calls": multi,
+                "wall_ms": wall,
+                "ms_per_call": wall / calls as f64,
+                "tokens_per_call": tokens as f64 / calls as f64,
+                "tok_s": tokens as f64 / (wall / 1e3),
+            }));
+        }
+    }
+    let report = serde_json::json!({
+        "depth": depth,
+        "prompt_tokens": depth,
+        "activation_dtype": activation_name(activation),
+        "kv_dtype": kv_dtype_name(kv),
+        "compile": compile,
+        "num_draft_tokens": drafts,
+        "warmup_calls": 4,
+        "rows": rows,
+    });
+    std::fs::write(
+        out_dir.join("spec_decode_timing.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    println!("wrote {}", out_dir.join("spec_decode_timing.json").display());
+}
+
+/// One serving decode call of the timing pair: a single-session `decode_window` whose batch
+/// must stay unfinished (the job has no token limit, so a finish is a defect).
+#[cfg(all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64"))]
+fn one_serving_call(
+    executor: &mut Q36Executor,
+    session: &mut super::executor::Q36Session,
+    job: &mut GenerationState,
+) -> crate::tokenizer::DecodeBatch {
+    let mut batches = executor
+        .decode_window(&mut [session], &mut [job])
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let batch = batches.remove(0);
+    let batch = batch.expect("the solo decode call succeeds");
+    assert!(batch.finish.is_none(), "the job has no limit or eos");
+    batch
 }
 
 /// Prefill rate by depth segment (Mac, ignored, real checkpoint): the like-for-like counterpart of
