@@ -1,0 +1,181 @@
+{
+  "schema": "fifi.tiered-prefix-2080-ab.v1",
+  "recorded_utc": "2026-11-08T21:08:46.932572+00:00",
+  "hardware": "RTX 2080 Ti",
+  "model": "fifi-q36-2080ti",
+  "configured_context_tokens": 131072,
+  "transport": "keyless LAN HTTP proxy",
+  "inputs": {
+    "commit": "14259decbd5f874d0cb7ac470ea55104768ce0fb",
+    "original_start_sha256": "85dbd59335a009da7782e65c85bc4ada66adc2cacbafdaf9299ac094ad501b57",
+    "config_sha256": "c35afd5952be0054956cb07b794d103af60d43d856d7a3494c99543f5ec8c05f",
+    "baseline_binary_sha256": "fc7a5b7173b062a3a697e98444c920607e9fae4b4e7f35dbf98b4f735b58a24e",
+    "candidate_binary_sha256": "448cb6b679525d6e7169295858c9931a7e1e733de8be3b1e5f27745639afecef"
+  },
+  "mr_executor_sha256": "ab2a6df9fdbfa03c37a243aae51518f33473ad488abb0a98f40712ce4df50612",
+  "combined_executor_sha256": "ab2a6df9fdbfa03c37a243aae51518f33473ad488abb0a98f40712ce4df50612",
+  "samples": {
+    "basic": {
+      "prefix_off": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 28.8687
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 25.1011
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+          "captured_positions": 2,
+          "seconds": 22.7775
+        }
+      ],
+      "prefix_on": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 29.2074
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 1298,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 0.2709
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+          "captured_positions": 2,
+          "seconds": 25.189
+        }
+      ],
+      "repeat_wall_time_ratio": 92.65817644887413
+    },
+    "semantic": {
+      "prefix_off": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 6.2797
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 5.9482
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 356,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7",
+          "captured_positions": 2,
+          "seconds": 5.7592
+        }
+      ],
+      "prefix_on": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 6.8678
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 347,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 0.2529
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 356,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7",
+          "captured_positions": 2,
+          "seconds": 6.6792
+        }
+      ],
+      "repeat_wall_time_ratio": 23.519968366943456
+    }
+  },
+  "guard": {
+    "control_samples": 105,
+    "prefix_on_samples": 61,
+    "raw_file": "tiered-prefix-2080-guard.jsonl",
+    "raw_sha256": "140f1656ad5bad2183f582bf9d26f49dd2a100680e56291087f82c9e0498a462"
+  },
+  "deployed": {
+    "binary_sha256": "448cb6b679525d6e7169295858c9931a7e1e733de8be3b1e5f27745639afecef",
+    "tiered_prefix": "1",
+    "live_greedy_trace_smoke": {
+      "mode": "candidate",
+      "model": "fifi-q36-2080ti",
+      "client_api_key": "none",
+      "completion_tokens": 20,
+      "finish_reason": "length",
+      "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+      "captured_positions": 20,
+      "all_greedy": true,
+      "no_selected_probabilities": true
+    }
+  },
+  "limits": [
+    "One repeated-prompt sample per arm and scenario; wall time includes the two-token reply and HTTP overhead, not a general prefill-throughput or TTFT benchmark.",
+    "The changed questions were cache misses, so this does not establish reuse across divergent continuations.",
+    "Only short outputs were checked; full logits, concurrent conversations, eviction, and a full 131072-token prompt were not tested.",
+    "The comparison used a combined branch including other tiered changes, not the standalone MR binary; executor file hashes match.",
+    "GPU and builder idleness were sampled; this is not exhaustive proof of host exclusivity."
+  ]
+}
