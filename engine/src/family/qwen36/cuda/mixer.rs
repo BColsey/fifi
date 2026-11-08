@@ -398,7 +398,10 @@ impl<'a> Mixers<'a> {
             );
             let closes_core = matches!(
                 op,
-                BlockOp::Delta { .. } | BlockOp::AttnDecode { .. } | BlockOp::AttnDecodeQ { .. }
+                BlockOp::Delta { .. }
+                    | BlockOp::AttnDecode { .. }
+                    | BlockOp::AttnDecodeQ8 { .. }
+                    | BlockOp::AttnDecodeQ8Card { .. }
             );
             if let Some((core_start, _)) = core_marks {
                 if opens_core && !core_open {

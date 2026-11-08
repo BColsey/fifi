@@ -974,6 +974,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                         resid: ref_view(resid_in(l))?,
                         admit_pos: admitted.admit_pos,
                     },
+                    None,
                 )?;
                 let ref_moe_set = MoeBuffers {
                     route: RouteBufs {

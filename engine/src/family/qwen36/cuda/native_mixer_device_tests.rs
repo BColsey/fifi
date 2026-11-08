@@ -262,6 +262,7 @@ fn run_block(
             resid: resid_view,
             admit_pos: 0,
         },
+        None,
     )?;
     stream.synchronize()?;
     let read = |slot: Slot| -> Result<Vec<f32>, EngError> {

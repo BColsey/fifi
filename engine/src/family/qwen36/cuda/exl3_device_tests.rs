@@ -161,6 +161,7 @@ fn capture(
             resid,
             admit_pos: 0,
         },
+        None,
     ) {
         state.poison();
         stream.synchronize().map_err(|sync| {

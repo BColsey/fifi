@@ -178,6 +178,7 @@ impl SectionMarks {
             embed_end: context.event_timing()?,
             groups,
             mixer_end,
+            core,
             head_start: context.event_timing()?,
             head_end: context.event_timing()?,
             tail_start: context.event_timing()?,

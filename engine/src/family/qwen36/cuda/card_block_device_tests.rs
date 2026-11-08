@@ -249,6 +249,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             resid: resid_view_ref,
             admit_pos: 0,
         },
+        None,
     )?;
     stream0.synchronize()?;
     let read_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -842,6 +843,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
                 resid: arena_ref.tensor(resid_at_ref)?,
                 admit_pos: token,
             },
+            None,
         )?;
         stream0.synchronize()?;
         mix_out_ref.push(read_ref_slot(Slot::MixOut)?);
@@ -1510,6 +1512,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             resid: resid_view_ref,
             admit_pos: 0,
         },
+        None,
     )?;
     stream0.synchronize()?;
     let read_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {

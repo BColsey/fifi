@@ -411,6 +411,7 @@ fn rig_append(
             resid: view,
             admit_pos: admitted.admit_pos,
         },
+        None,
     )?;
     rig.stream.synchronize()?;
     let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -601,6 +602,7 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
                 resid: resid_view,
                 admit_pos: clean,
             },
+            None,
         )?;
         stream.synchronize()?;
         let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
