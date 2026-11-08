@@ -1,0 +1,42 @@
+{
+  "schema": "fifi.bench-engines-validation.v1",
+  "recorded_utc": "2026-11-08T17:59:49.784780+00:00",
+  "base_commit": "e3233425d7a39d70bcb9bbac285fcccdc48d1e06",
+  "platform": "Linux x86_64",
+  "python": "3.13.5",
+  "script_sha256": "09f42c1f164c2c6479bc5a200dd3c127d0c36082e02f35e865b4ce2d109904a2",
+  "tests_sha256": "9569f6f658ae0767cffdd8177402a02cac9dc4b5e10c2f67229878326e3bed4b",
+  "checks": [
+    {
+      "command": "python3 -I -B -m unittest discover -s scripts/tests -p test_bench_engines.py -v",
+      "result": "7 passed",
+      "output": [
+        "test_cli_correlates_server_rate_and_reports_reuse (test_bench_engines.IntegrationTests.test_cli_correlates_server_rate_and_reports_reuse) ... ok",
+        "test_cli_reports_na_when_server_telemetry_is_unavailable (test_bench_engines.IntegrationTests.test_cli_reports_na_when_server_telemetry_is_unavailable) ... ok",
+        "test_missing_mismatched_or_ambiguous_telemetry_is_not_a_rate (test_bench_engines.StreamTests.test_missing_mismatched_or_ambiguous_telemetry_is_not_a_rate) ... ok",
+        "test_rejects_incomplete_and_inconsistent_streams (test_bench_engines.StreamTests.test_rejects_incomplete_and_inconsistent_streams) ... ok",
+        "test_reuse_must_be_a_valid_prompt_subset (test_bench_engines.StreamTests.test_reuse_must_be_a_valid_prompt_subset) ... ok",
+        "test_stream_chunks_do_not_determine_server_token_rate (test_bench_engines.StreamTests.test_stream_chunks_do_not_determine_server_token_rate) ... ok",
+        "test_unavailable_telemetry_does_not_estimate_from_chunks (test_bench_engines.StreamTests.test_unavailable_telemetry_does_not_estimate_from_chunks) ... ok",
+        "",
+        "----------------------------------------------------------------------",
+        "Ran 7 tests in 1.126s",
+        "",
+        "OK"
+      ]
+    },
+    {
+      "command": "python3 -m ruff check scripts/bench_engines.py scripts/tests/test_bench_engines.py; python3 -m ruff format --check scripts/bench_engines.py scripts/tests/test_bench_engines.py",
+      "result": "passed",
+      "output": [
+        "All checks passed!",
+        "2 files already formatted"
+      ]
+    }
+  ],
+  "limitations": [
+    "CPU-only tests use synthetic responses and a loopback HTTP mock.",
+    "No live-engine or GPU performance result is claimed.",
+    "The server recent-request endpoint must return one matching row for a numeric decode rate."
+  ]
+}
