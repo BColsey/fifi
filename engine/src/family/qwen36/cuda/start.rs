@@ -28,7 +28,7 @@ use super::{
     exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
     exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
-    pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+    pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
     resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes, moe_dims},
@@ -160,7 +160,7 @@ impl StartupPlan {
         let Some(native) = self.device_first_native else {
             return Ok(self);
         };
-        let available = free.checked_sub(MIN_FREE_AFTER_LOAD).ok_or_else(|| {
+        let available = free.checked_sub(min_free_after_load()?).ok_or_else(|| {
             EngError::MemoryPlan("device-first load is below the free-memory floor".into())
         })?;
         if native <= available {
@@ -273,9 +273,10 @@ fn device_first_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError
 }
 
 fn require_device_first_room(free: usize, reserve: u64) -> Result<(), EngError> {
+    let floor = min_free_after_load()?;
     let needed = usize::try_from(reserve)
         .ok()
-        .and_then(|bytes| bytes.checked_add(MIN_FREE_AFTER_LOAD))
+        .and_then(|bytes| bytes.checked_add(floor))
         .ok_or_else(|| {
             EngError::MemoryPlan("device-first resident reserve plus headroom exceeds usize".into())
         })?;
@@ -902,10 +903,11 @@ fn make_multi(
     stages.begin("checking memory floors");
     for (card, context) in stack.contexts().iter().enumerate() {
         let info = context.memory_info()?;
-        if info.free < MIN_FREE_AFTER_LOAD {
+        let floor = min_free_after_load()?;
+        if info.free < floor {
             return Err(EngError::MemoryPlan(format!(
                 "cuda admission: card {card} has {} bytes free after the load, below the {}-byte floor",
-                info.free, MIN_FREE_AFTER_LOAD
+                info.free, floor
             )));
         }
         eprintln!(
@@ -1050,10 +1052,11 @@ fn make(
     };
     let after = projector.memory_info()?;
     stages.begin("admitting memory");
-    if after.free < MIN_FREE_AFTER_LOAD {
+    let floor = min_free_after_load()?;
+    if after.free < floor {
         return Err(EngError::MemoryPlan(format!(
             "cuda admission: {} bytes free after the load is below the {}-byte floor",
-            after.free, MIN_FREE_AFTER_LOAD
+            after.free, floor
         )));
     }
     let plan = plan.after_load(&settings, after.free)?;
@@ -1463,7 +1466,10 @@ mod chunk_prefill_flag_tests {
         );
         assert_eq!(super::prefill_headroom(false), 1usize << 30);
         assert_eq!(super::prefill_headroom(true), 256usize << 20);
-        assert_eq!(super::MIN_FREE_AFTER_LOAD, 1usize << 30);
+        assert_eq!(
+            super::super::pinned::min_free_after_load_default(),
+            1usize << 30
+        );
     }
 
     #[test]
@@ -1555,6 +1561,12 @@ mod paged_start_tests {
     use super::*;
     use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options};
 
+    /// The floor the admission reads in this process (the default, or `Q36_CUDA_MIN_FREE_MIB`),
+    /// so the arithmetic tests hold under either.
+    fn floor() -> usize {
+        super::super::pinned::min_free_after_load().unwrap()
+    }
+
     fn settings(body: &str) -> Q36Settings {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         Q36Settings::new(
@@ -1627,9 +1639,7 @@ mod paged_start_tests {
             plan.reserve < native as u64,
             "pre-load reserve must exclude the full KV pool"
         );
-        let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + native)
-            .unwrap();
+        let plan = plan.after_load(&configured, floor() + native).unwrap();
         assert!(plan.paged.is_none());
         assert_eq!(plan.reserve, native as u64);
 
@@ -1651,9 +1661,7 @@ mod paged_start_tests {
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         let native = plan.device_first_native.unwrap();
         assert!(plan.reserve as usize <= native);
-        let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + native)
-            .unwrap();
+        let plan = plan.after_load(&configured, floor() + native).unwrap();
         assert!(plan.paged.is_none());
         assert_eq!(plan.reserve as usize, native);
     }
@@ -1669,7 +1677,7 @@ mod paged_start_tests {
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         let fixed = plan.reserve as usize;
         let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + fixed + 2 * group)
+            .after_load(&configured, floor() + fixed + 2 * group)
             .unwrap();
         assert_eq!(
             plan.paged.as_ref().unwrap().cache_rows(),
@@ -1679,14 +1687,14 @@ mod paged_start_tests {
 
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         assert!(
-            plan.after_load(&configured, MIN_FREE_AFTER_LOAD + fixed + group - 1)
+            plan.after_load(&configured, floor() + fixed + group - 1)
                 .is_err()
         );
         let mut insufficient_host = configured;
         insufficient_host.kv_offload_host_bytes = Some(1);
         let plan = StartupPlan::new_device_first(&insufficient_host, false, modes(false)).unwrap();
         assert!(
-            plan.after_load(&insufficient_host, MIN_FREE_AFTER_LOAD + fixed + 2 * group)
+            plan.after_load(&insufficient_host, floor() + fixed + 2 * group)
                 .is_err()
         );
     }
@@ -1704,8 +1712,8 @@ mod paged_start_tests {
 
     #[test]
     fn device_first_resident_admission_retains_the_complete_headroom() {
-        assert!(require_device_first_room(MIN_FREE_AFTER_LOAD + 256, 256).is_ok());
-        assert!(require_device_first_room(MIN_FREE_AFTER_LOAD + 255, 256).is_err());
+        assert!(require_device_first_room(floor() + 256, 256).is_ok());
+        assert!(require_device_first_room(floor() + 255, 256).is_err());
         assert!(require_device_first_room(usize::MAX, u64::MAX).is_err());
     }
 

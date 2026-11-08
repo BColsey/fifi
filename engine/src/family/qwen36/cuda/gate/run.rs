@@ -29,7 +29,7 @@ use crate::{
         qwen36::{
             cuda::{
                 dims::{KvMode, StepDims, StepOptions},
-                pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+                pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
                 readback::{SYNC_EACH_VAR, parse_sync_each},
                 resources::StepResources,
                 rules::QwenRules,
@@ -499,7 +499,7 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     };
     let after = projector.memory_info()?;
     let identities = identities_of(s, after.total, before.free, after.free);
-    if after.free < MIN_FREE_AFTER_LOAD {
+    if after.free < min_free_after_load()? {
         let mut doc = gate_doc(mode, identities, Vec::new());
         doc["refused"] = json!({ "kind": "memory", "free_after_load": after.free });
         return report(doc);

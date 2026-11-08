@@ -72,7 +72,10 @@ pub(super) fn decide(
     let budget = free
         .saturating_sub(hold)
         .saturating_sub(dense)
-        .saturating_sub(super::pinned::MIN_FREE_AFTER_LOAD as u64);
+        .saturating_sub(
+            u64::try_from(super::pinned::min_free_after_load()?)
+                .map_err(|_| refuse("the free-after-load floor exceeds u64".into()))?,
+        );
     let slots = match request {
         SlotRequest::Exactly(want) => {
             if want < 1 || want > n_expert {
