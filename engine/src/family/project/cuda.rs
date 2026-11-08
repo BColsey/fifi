@@ -925,6 +925,43 @@ pub(crate) fn tiled_head_overrides() -> Vec<String> {
         .collect()
 }
 
+/// The tiled-head override admission: every override name must be part of this load (a typo
+/// must not silently load the head native), inert on the other layouts. Pure so the CPU tests
+/// pin the refusal without a device load.
+pub(crate) fn tiled_override_admission(
+    layout: WeightLayout,
+    names: &[&str],
+    overrides: &[String],
+) -> Result<Vec<String>, EngError> {
+    if layout != WeightLayout::Native {
+        return Ok(Vec::new());
+    }
+    for name in overrides {
+        if !names.contains(&name.as_str()) {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {name}: the INFERENCE_CUDA_TILED_HEAD override is not part of this load"
+            )));
+        }
+    }
+    Ok(overrides.to_vec())
+}
+
+/// A name that is both sliced and overridden to tiles refuses: a sliced tensor plans rows from
+/// the weight's own shape, and only the native readers take those shapes. Pure so the CPU tests
+/// pin the refusal.
+pub(crate) fn check_sliced_override(
+    name: &str,
+    tensor_layout: WeightLayout,
+    sliced: bool,
+) -> Result<(), EngError> {
+    if sliced && tensor_layout == WeightLayout::Tiled {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {name}: a sliced load cannot override a name to tiles"
+        )));
+    }
+    Ok(())
+}
+
 /// The sibling suffixes of an `attn_qkv` tensor, in DeltaProj column order.
 const GDN_INPROJ_SIBLINGS: [&str; 3] =
     [".attn_gate.weight", ".ssm_beta.weight", ".ssm_alpha.weight"];
@@ -1111,19 +1148,8 @@ fn load_inner(
     // tensors already upload as tiles under Tiled, and EXL3 never reaches here); an override
     // that names no tensor of this load refuses - a typo must not silently load the head
     // native.
-    let tiled_overrides: Vec<String> = if layout == WeightLayout::Native {
-        for override_name in tiled_head_overrides() {
-            if !names.contains(&override_name.as_str()) {
-                return Err(EngError::Checkpoint(format!(
-                    "tensor {override_name}: the INFERENCE_CUDA_TILED_HEAD override is not part of \
-                     this load"
-                )));
-            }
-        }
-        tiled_head_overrides()
-    } else {
-        Vec::new()
-    };
+    let tiled_overrides: Vec<String> =
+        tiled_override_admission(layout, names, &tiled_head_overrides())?;
     // The slice set of a sliced load, by tensor name. A slice for a tensor this load
     // did not name, a name sliced twice, or any slice on a non-native layout refuses
     // before planning: a sliced tensor has a different shape than its file record,
@@ -1174,11 +1200,7 @@ fn load_inner(
                 layout
             };
             let (tensor, whole_bytes) = planned(weights, name, tensor_layout)?;
-            if slice_specs.contains_key(name) && tensor_layout == WeightLayout::Tiled {
-                return Err(EngError::Checkpoint(format!(
-                    "tensor {name}: a sliced load cannot override a name to tiles"
-                )));
-            };
+            check_sliced_override(name, tensor_layout, slice_specs.contains_key(name))?;
             match slice_specs.get(name) {
                 None => Ok(PlannedTensor {
                     tensor,

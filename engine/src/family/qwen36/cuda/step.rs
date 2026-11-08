@@ -666,6 +666,23 @@ struct RouteStage {
     bytes: Vec<u8>,
 }
 
+/// The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a mixed
+/// override (tiled stacks in some layers, native in others) refuses. Pure so the CPU tests pin
+/// the refusal without loaded weights.
+pub(super) fn moe_override_uniform(tiled: &[bool]) -> Result<bool, EngError> {
+    let Some(&first) = tiled.first() else {
+        return Ok(false);
+    };
+    if tiled.iter().any(|&t| t != first) {
+        return Err(EngError::Checkpoint(
+            "step weights: the INFERENCE_CUDA_TILED_HEAD override must cover the expert \
+             stacks of every layer, not some"
+                .to_owned(),
+        ));
+    }
+    Ok(first)
+}
+
 fn new_route_stage(
     context: &CudaContext,
     layers: usize,
@@ -867,19 +884,11 @@ impl<'a> QwenResidentStep<'a> {
             // The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a
             // mixed override (tiled stacks in some layers, native in others) refuses here
             // instead of failing per layer inside the block's own check.
-            let tiled = moe
-                .first()
-                .is_some_and(|w| matches!(w.gate, StackWeights::Tiled(_)));
-            if moe
-                .iter()
-                .any(|w| matches!(w.gate, StackWeights::Tiled(_)) != tiled)
-            {
-                return Err(EngError::Checkpoint(
-                    "step weights: the INFERENCE_CUDA_TILED_HEAD override must cover the expert \
-                     stacks of every layer, not some"
-                        .to_owned(),
-                ));
-            }
+            let tiled = moe_override_uniform(
+                &moe.iter()
+                    .map(|w| matches!(w.gate, StackWeights::Tiled(_)))
+                    .collect::<Vec<_>>(),
+            )?;
             (moe, None)
         };
         let vocab = res.dims.shape.vocab;

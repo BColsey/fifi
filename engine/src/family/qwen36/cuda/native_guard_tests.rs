@@ -3,11 +3,15 @@
 use super::common_tests::dims;
 use super::dims::KvMode;
 use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
-use super::mixer_ops::{block_ops, check_native_column};
+use super::mixer_ops::{BlockOp, block_ops, block_ops_with, check_native_column};
+use super::step::moe_override_uniform;
+use super::step_plan::{Phase, Slot};
 use crate::EngError;
 use crate::family::AttentionKind;
 use crate::family::gguf_model::Role;
-use crate::family::project::cuda::{TensorKind, WeightLayout, load_layout};
+use crate::family::project::cuda::{
+    TensorKind, WeightLayout, check_sliced_override, load_layout, tiled_override_admission,
+};
 
 fn geometry() -> MixerGeometry {
     MixerGeometry::new(&dims()).expect("geometry")
@@ -45,6 +49,94 @@ fn the_native_projection_columns_are_aligned() {
             block_ops(kind, &g, WeightLayout::Native, KvMode::Fp16, false).is_ok(),
             "{kind:?}"
         );
+    }
+}
+
+/// The tiled-experts hybrid's epilogue under a Native load: with `moe_tiled` the block ends in
+/// the fp16 `NormPack` (the overridden expert stacks read the pack), not the native `NormQ8`.
+#[test]
+fn the_native_moe_tiled_epilogue_packs_fp16() {
+    let g = geometry();
+    for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
+        let hybrid =
+            block_ops_with(false, kind, &g, WeightLayout::Native, KvMode::Fp16, true).expect("ops");
+        match hybrid.last().expect("epilogue") {
+            BlockOp::NormPack {
+                phase,
+                weight,
+                delta,
+                xf,
+                norm_out,
+            } => {
+                assert_eq!(*phase, Phase::AddNorm, "{kind:?}");
+                assert_eq!(*weight, Role::PostAttentionNorm, "{kind:?}");
+                assert_eq!(*delta, Some(Slot::MixOut), "{kind:?}");
+                assert_eq!(*xf, Slot::XfMoe, "{kind:?}");
+                assert_eq!(*norm_out, Some(Slot::NormRow), "{kind:?}");
+            }
+            other => panic!("the hybrid epilogue must pack fp16, got {other:?}"),
+        }
+        let native = block_ops(kind, &g, WeightLayout::Native, KvMode::Fp16, false).expect("ops");
+        match native.last().expect("epilogue") {
+            BlockOp::NormQ8 { q8, norm_out, .. } => {
+                assert_eq!(*q8, Slot::Q8Moe, "{kind:?}");
+                assert_eq!(*norm_out, Slot::NormRow, "{kind:?}");
+            }
+            other => panic!("the native epilogue must stay NormQ8, got {other:?}"),
+        }
+    }
+}
+
+/// The tiled-head override fails closed: a name no tensor of the load carries (a typo) refuses
+/// instead of silently loading the head native; on the other layouts the override is inert.
+#[test]
+fn a_tiled_override_that_names_no_tensor_of_the_load_refuses() {
+    let names = ["model.layers.0.mlp.down_proj.weight"];
+    let listed = |name: &str| vec![name.to_owned()];
+    assert!(tiled_override_admission(WeightLayout::Native, &names, &listed(names[0])).is_ok());
+    for layout in [WeightLayout::Tiled, WeightLayout::Exl3] {
+        assert!(
+            tiled_override_admission(layout, &names, &listed("not-in-the-load"))
+                .expect("inert")
+                .is_empty()
+        );
+    }
+    match tiled_override_admission(WeightLayout::Native, &names, &listed("output.weigth.typo")) {
+        Err(EngError::Checkpoint(message)) => assert!(
+            message.contains("not part of this load") && message.contains("output.weigth.typo"),
+            "{message}"
+        ),
+        other => panic!("a typo override must refuse, got {other:?}"),
+    }
+}
+
+/// A name that is both sliced and overridden to tiles refuses: slices plan rows from the
+/// weight's own shape, and only the native readers take those shapes.
+#[test]
+fn a_sliced_tiled_override_refuses() {
+    assert!(check_sliced_override("n", WeightLayout::Tiled, false).is_ok());
+    assert!(check_sliced_override("n", WeightLayout::Native, true).is_ok());
+    match check_sliced_override("a.output", WeightLayout::Tiled, true) {
+        Err(EngError::Checkpoint(message)) => assert!(
+            message.contains("cannot override a name to tiles") && message.contains("a.output"),
+            "{message}"
+        ),
+        other => panic!("a sliced override must refuse, got {other:?}"),
+    }
+}
+
+/// The tiled-experts hybrid must be uniform across layers: one packs kind serves every layer.
+#[test]
+fn a_mixed_expert_stack_override_refuses() {
+    assert!(matches!(moe_override_uniform(&[]), Ok(false)));
+    assert!(matches!(moe_override_uniform(&[true; 40]), Ok(true)));
+    assert!(matches!(moe_override_uniform(&[false; 40]), Ok(false)));
+    let mixed: Vec<bool> = [vec![true; 20], vec![false; 20]].concat();
+    match moe_override_uniform(&mixed) {
+        Err(EngError::Checkpoint(message)) => {
+            assert!(message.contains("every layer"), "{message}")
+        }
+        other => panic!("a mixed override must refuse, got {other:?}"),
     }
 }
 
