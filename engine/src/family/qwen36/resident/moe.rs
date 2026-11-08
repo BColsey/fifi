@@ -16,7 +16,7 @@
 //! probability row (the health). A softmax row sums to 1, so a NaN or infinite entry makes the sum
 //! non-finite. The step adds the sums of all layers and checks the total at the token readback.
 //! The expert ids are clamped below the expert count ONCE per layer (`bound_indices`): the
-//! top-probability take and the gate, up, and down products of the layer share the one clamp
+//! top-probability take and the stacked and down products of the layer share the one clamp
 //! node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};

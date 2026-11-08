@@ -2985,7 +2985,11 @@ static int compile_moe_rows(
         &stacked.value, x3.value, in.values[12], in.values[13], in.values[14],
         p->rows_lhs[moe_lhs], clamped.value, true, compile_quant_optional(p->group[3]),
         compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
-  if (status == 0 && stacked.value.ctx != nullptr) {
+  if (status == 0 && stacked.value.ctx == nullptr) {
+    // Fail closed: a null stacked product must not reach the split.
+    status = 1;
+  }
+  if (status == 0) {
     const int* stacked_shape = mlx_array_shape(stacked.value);
     if (stacked_shape == nullptr || stacked_shape[3] % 2 != 0) {
       status = 1;
@@ -3167,7 +3171,11 @@ static int compile_moe_body(
         compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
   // The stacked product is [k, 1, 2I]: the slice shapes come from its own static shape, so
   // the body bakes no intermediate width beyond the payload's quantization triple.
-  if (status == 0 && stacked.value.ctx != nullptr) {
+  if (status == 0 && stacked.value.ctx == nullptr) {
+    // Fail closed: a null stacked product must not reach the split.
+    status = 1;
+  }
+  if (status == 0) {
     const int* stacked_shape = mlx_array_shape(stacked.value);
     if (stacked_shape == nullptr || stacked_shape[2] % 2 != 0) {
       status = 1;

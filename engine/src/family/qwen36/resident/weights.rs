@@ -1,7 +1,8 @@
 //! Resident Q36 weights, imported once at load.
 //!
 //! Non-expert matrices, plain norms, split convolutions, and the F32 router and shared gate become
-//! residents with `layers + 2` synchronizations. The 120 expert stacks are read once with
+//! residents with `layers + 2` synchronizations. The 80 expert stacks (the gate and up projections
+//! stacked into one operand each, plus `down`) are read once with
 //! positioned reads into page-aligned anonymous pages and wrapped without a copy. They need no
 //! synchronization and no page pool, because every expert stays resident for the life of the
 //! engine. The embedding table stays in the checkpoint; the token start reads one row per token.
@@ -288,7 +289,7 @@ pub(super) struct RMoe {
     /// one `gather_qmm` per step instead of two.
     pub(super) gate_up: ResidentPackedWeight,
     pub(super) down: ResidentPackedWeight,
-    /// The pages under the three stacks. Field order is drop order: the pages outlive the stacks.
+    /// The pages under the two stacks. Field order is drop order: the pages outlive the stacks.
     pages: HostPages,
 }
 
