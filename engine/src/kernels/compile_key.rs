@@ -589,7 +589,7 @@ mod tests {
     /// The row count of the delta table below: one row per scalar field, per dimension, per
     /// scale key, and per quantization value.
     const DELTA_ROWS: usize = 1 + 1 + 8 + 1 + 1 + 5 + 5 * 3;
-    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
+    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
     /// The row count of the Flint tail table below: one row per scalar field, per scale
     /// key, and per quantization value.
     const FLINT_ROWS: usize = 1 + 1 + 1 + 1 + 3 + 3 * 3;
