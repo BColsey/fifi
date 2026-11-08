@@ -122,12 +122,24 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
+        Self::with_table(dims, options, devices, admission, &table)
+    }
+
+    /// The stack over an explicit shard table: the placement planner's
+    /// table, whose runs the loader must have used for the same cards.
+    pub(crate) fn with_table(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
                 "the card stack needs at least one device".to_owned(),
             ));
         }
-        let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
         let scratch = KernelScratch::for_dims(dims, 1, options.kv_mode)?;
         let mut contexts = Vec::with_capacity(devices.len());
         let mut streams = Vec::with_capacity(devices.len());
@@ -147,7 +159,7 @@ impl CardStack {
         let mut shards = Vec::with_capacity(devices.len());
         let mut states = Vec::with_capacity(devices.len());
         for (card, context) in contexts.iter().enumerate() {
-            let plan = StepPlan::for_card(dims, &table, card, options, &scratch)?;
+            let plan = StepPlan::for_card(dims, table, card, options, &scratch)?;
             shards.push(CardShard::new(context, &streams[card], &plan)?);
             states.push(ResidentState::allocate(
                 context,
@@ -161,7 +173,7 @@ impl CardStack {
             Self {
                 ring,
                 shards,
-                table,
+                table: table.clone(),
                 plans,
                 streams,
                 contexts,

@@ -27,6 +27,7 @@ use super::{
     exl3_load::load_exl3_dir,
     layer_table::LayerTable,
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+    placement::{PlacementPolicy, PlacementRequest, plan_placement, profiles_from_facts},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
     resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes},
@@ -882,7 +883,6 @@ fn make_multi(
     let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
     let options = step_options(settings.context_limit, WeightLayout::Native, kv_mode)?;
     stages.begin("planning shards");
-    let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
     // The shard plans size each card's upload from the file's expert quant; layer 0's
     // expert gate names the tensor that carries it.
     let layers = LayerTable::new(&dims, &inventory)?;
@@ -895,7 +895,52 @@ fn make_multi(
             EngError::Checkpoint(format!("gguf model: tensor {gate} is not in the file"))
         })?
         .ggml_type();
-    let loads = card_loads(&table, &inventory, quant)?;
+    // Experimental and default off: the bandwidth-waterfill placement
+    // planner redistributes the sliceable roles instead of the even deal.
+    // The planner budgets every sliced weight as card-resident, so each
+    // card's host-expert budget is handed to it as free-byte relief: that
+    // much sliced mass leaves the card for pinned host RAM at load. The
+    // receipt's reason line says which candidate won and why.
+    let waterfill = std::env::var_os("Q36_P2P_WATERFILL").is_some_and(|v| v == "1");
+    let mut planned = None;
+    let even_table;
+    let table: &ShardTable = if waterfill {
+        let mut profiles = profiles_from_facts(&facts);
+        let host_expert_bytes = [
+            p2p_host_expert_bytes(
+                "Q36_P2P_HOST_EXPERT_BYTES_0",
+                std::env::var_os("Q36_P2P_HOST_EXPERT_BYTES_0").as_deref(),
+            )?,
+            p2p_host_expert_bytes(
+                "Q36_P2P_HOST_EXPERT_BYTES",
+                std::env::var_os("Q36_P2P_HOST_EXPERT_BYTES").as_deref(),
+            )?,
+        ];
+        for (profile, relief) in profiles.iter_mut().zip(host_expert_bytes) {
+            profile.free_bytes += relief;
+        }
+        let policy = PlacementPolicy::default();
+        let request = PlacementRequest {
+            shape: &shape,
+            inventory: &inventory,
+            quant,
+            kv_capacity_rows: settings.context_limit as usize,
+            delta_slots: options.delta_slots,
+            profiles: &profiles,
+            policy: &policy,
+        };
+        let plan = plan_placement(&request)?;
+        eprintln!(
+            "q36 cuda: placement {} - {}",
+            plan.receipt.chosen, plan.receipt.reason
+        );
+        planned = Some(plan);
+        &planned.as_ref().expect("just set").table
+    } else {
+        even_table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+        &even_table
+    };
+    let loads = card_loads(table, &inventory, quant)?;
     let fixed_admission = plan.modes.fixed_admission;
     // The load reserve keeps the single-device figure: it holds the KV bytes
     // free during each card's upload, and over-reserving per card (the cards
@@ -909,8 +954,16 @@ fn make_multi(
         p2p_host_expert_bytes(first_var, std::env::var_os(first_var).as_deref())?,
         p2p_host_expert_bytes(second_var, std::env::var_os(second_var).as_deref())?,
     ];
-    let (stack, states) =
-        CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
+    let (stack, states) = match planned.as_ref() {
+        Some(plan) => CardStack::with_table(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &plan.table,
+        )?,
+        None => CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?,
+    };
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
