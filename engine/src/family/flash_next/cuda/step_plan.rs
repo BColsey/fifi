@@ -156,6 +156,9 @@ pub(super) enum Slot {
     Exl3Xh,
     Exl3Z,
     Exl3Flag,
+    /// The device job table of a chunk's job-table projections: one entry (a chunk of at most
+    /// `MAX_STEP_ROWS` rows is one tile), 16 bytes.
+    Exl3Jobs,
     /// f32 `[rows][vocab]`.
     Logits,
     ArgmaxPart,
@@ -531,6 +534,7 @@ fn list_slots(
     list.add(Slot::Exl3Z, Ok(z), Phase::Ple, Phase::LmHead)?;
     // The step clears the flag at StepBegin and folds it into the status just before the argmax.
     list.add(Slot::Exl3Flag, Ok(4), Phase::StepBegin, Phase::Argmax)?;
+    list.add(Slot::Exl3Jobs, Ok(16), Phase::StepBegin, Phase::Argmax)?;
     list.add(
         Slot::Logits,
         list.row(geometry.vocab),

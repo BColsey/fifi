@@ -728,8 +728,8 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
     );
     let first = *layers.first().expect("a layer");
     let end = layers.last().expect("a layer") + 1;
-    let step =
-        FlashStep::new(ctx, &stream, &weights, &config, POSITIONS, first..end).expect("the step");
+    let step = FlashStep::new(ctx, &stream, &weights, &config, POSITIONS, 1, first..end)
+        .expect("the step");
     let hidden = model.hyper.hidden();
     let width = model.hyper.width();
     let mut host_projector = RealProjector::new(&checkpoint);
@@ -766,7 +766,7 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
             &weights,
             layers,
             slots,
-            &step.moe_dims(),
+            &step.moe_dims(1),
         ))),
     };
     let mut out = RunOut {
@@ -799,7 +799,7 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
             )
             .expect("stream");
         if drive == Drive::Composed {
-            step.run_layers_without_ple(token, block.as_block())
+            step.run_layers_without_ple(token, 1, block.as_block())
                 .expect("the layers");
             step.finish_token().expect("a clean token");
             let device_stream = step
@@ -821,26 +821,26 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
             );
             // Device, in steps with a read-back after each block.
             let attn_prefix = layer_name(layer, "attn_hyper_connection");
-            step.hyper_read(Site::Attn, &attn_prefix)
+            step.hyper_read(Site::Attn, &attn_prefix, 1)
                 .expect("hyper read");
             let mixed = step
                 .read_f32(step.slot(Slot::Mixed(Site::Attn)).unwrap(), hidden)
                 .expect("mixed");
-            step.mixer(layer, token).expect("mixer");
+            step.mixer(layer, token, 1).expect("mixer");
             let attn_out = step
                 .read_f32(step.slot(Slot::BlockOut(Site::Attn)).unwrap(), hidden)
                 .expect("block out");
-            step.hyper_apply(Site::Attn).expect("apply");
-            step.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"))
+            step.hyper_apply(Site::Attn, 1).expect("apply");
+            step.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), 1)
                 .expect("hyper read");
             let mixed_mlp = step
                 .read_f32(step.slot(Slot::Mixed(Site::Mlp)).unwrap(), hidden)
                 .expect("mixed");
-            step.moe_block(layer, block.as_block()).expect("moe");
+            step.moe_block(layer, block.as_block(), 1).expect("moe");
             let moe_out = step
                 .read_f32(step.slot(Slot::BlockOut(Site::Mlp)).unwrap(), hidden)
                 .expect("moe out");
-            step.hyper_apply(Site::Mlp).expect("apply");
+            step.hyper_apply(Site::Mlp, 1).expect("apply");
             let device_stream = step
                 .read_f32(step.slot(Slot::Stream).unwrap(), width)
                 .expect("stream");
@@ -903,7 +903,7 @@ fn run_spec(spec: Spec<'_>) -> RunOut {
             step.finish_token().expect("a clean token");
         }
         if let Some((norm, down, up, lm_head)) = &host_head {
-            step.head().expect("the head");
+            step.head(1).expect("the head");
             step.finish_token().expect("a clean token with the head");
             let vocab = step.geometry.vocab;
             let device_logits = step
@@ -1105,6 +1105,7 @@ fn a_failed_call_poisons_the_step_until_reset() {
         &weights,
         &checkpoint.model_config,
         POSITIONS,
+        1,
         3..4,
     )
     .expect("the step");
@@ -1113,14 +1114,14 @@ fn a_failed_call_poisons_the_step_until_reset() {
     // A layer whose weights were never uploaded fails, and poisons.
     assert!(!step.is_poisoned());
     let error = step
-        .run_layer(5, 0, &mut moe)
+        .run_layer(5, 0, 1, &mut moe)
         .expect_err("layer 5 has no weights");
     println!("layer 5: {error:?}");
     assert!(step.is_poisoned());
     for refused in [
         step.begin_token(),
-        step.run_layer(3, 0, &mut moe),
-        step.head(),
+        step.run_layer(3, 0, 1, &mut moe),
+        step.head(1),
     ] {
         let text = format!("{:?}", refused.expect_err("a poisoned step refuses"));
         assert!(text.contains("reset"), "{text}");
@@ -1149,11 +1150,12 @@ fn a_failed_call_poisons_the_step_until_reset() {
         &weights,
         &checkpoint.model_config,
         POSITIONS,
+        1,
         (ple - 1)..(ple + 1),
     )
     .expect("a window across the PLE layer");
     let error = crossing
-        .run_layers((ple - 1)..(ple + 1), 0, &mut moe)
+        .run_layers((ple - 1)..(ple + 1), 0, 1, &mut moe)
         .expect_err("a range across the PLE layer");
     let text = format!("{error:?}");
     println!("PLE: {text}");
@@ -1161,7 +1163,7 @@ fn a_failed_call_poisons_the_step_until_reset() {
     assert!(!crossing.is_poisoned());
     // A range outside the window refuses too, and does not poison.
     let outside = crossing
-        .run_layers(ple..(ple + 5), 0, &mut moe)
+        .run_layers(ple..(ple + 5), 0, 1, &mut moe)
         .expect_err("a range outside the window");
     let text = format!("{outside:?}");
     println!("outside: {text}");
@@ -1217,4 +1219,175 @@ fn the_split_moe_block_matches_the_resident_block_and_the_host_across_tokens() {
         "a 32-slot bank must miss at least {floor} times per token: {:?}",
         small.misses
     );
+}
+
+#[test]
+fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
+    // The chunked prefill contract at the step level: M rows through one rows=M step equal M
+    // launches of a rows=1 step, stream rows and DeltaNet states alike. The tolerance covers the
+    // EXL3 row-grouped launch's reduction order (the scan itself is bit-exact by contract).
+    assert!(
+        device_present("Flash-Next chunk parity"),
+        "a GPU is required"
+    );
+    let layers = window();
+    let m = 4usize;
+    let checkpoint = checkpoint();
+    let (model, _kinds) = model_shape(&checkpoint.model_config).expect("shape");
+    let hidden = model.hyper.hidden();
+    let width = model.hyper.width();
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream: DeviceStream = ctx.stream().expect("stream");
+    let weights = device_weights(&projector, &checkpoint, &layers, (false, true));
+    let first = *layers.first().expect("a layer");
+    let end = *layers.last().expect("a layer") + 1;
+    let single = FlashStep::new(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        POSITIONS,
+        1,
+        first..end,
+    )
+    .expect("the single-row step");
+    let chunk = FlashStep::new(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        POSITIONS,
+        m,
+        first..end,
+    )
+    .expect("the chunk step");
+
+    // One row at a time.
+    let mut moe = AllResidentMoe { weights: &weights };
+    let mut singles = Vec::new();
+    for token in 0..m {
+        let row = input(width, hidden, token);
+        single.begin_token().expect("begin");
+        write_params(&single, 1, token as i32);
+        write_stream_row(&single, &row);
+        single
+            .run_layers_without_ple(token, 1, &mut moe)
+            .expect("the layers");
+        single.finish_token().expect("a clean token");
+        singles.push(
+            single
+                .read_f32(single.slot(Slot::Stream).unwrap(), width)
+                .expect("stream"),
+        );
+    }
+
+    // The same rows as one chunk.
+    let rows: Vec<f32> = (0..m)
+        .flat_map(|token| input(width, hidden, token))
+        .collect();
+    chunk.begin_chunk(m).expect("begin");
+    write_params(&chunk, 1, 0);
+    write_stream_row(&chunk, &rows);
+    chunk
+        .run_layers_without_ple(0, m, &mut moe)
+        .expect("the layers");
+    chunk.finish_token().expect("a clean chunk");
+    let chunked = chunk
+        .read_f32(chunk.slot(Slot::Stream).unwrap(), m * width)
+        .expect("stream");
+
+    for token in 0..m {
+        let got = &chunked[token * width..(token + 1) * width];
+        let error = relative_l2(got, &singles[token]);
+        println!("row {token}: relative L2 {error:.3e}");
+        assert!(
+            error < 1e-4,
+            "row {token} of the chunk drifts from the single-row run: relative L2 {error:.3e}"
+        );
+    }
+
+    // The DeltaNet recurrent state and conv ring after the sequence.
+    for &layer in &layers {
+        if chunk.geometry.layers.get(layer) != Some(&crate::family::AttentionKind::DeltaNet) {
+            continue;
+        }
+        let ring_len = single
+            .state_slot(StateSlot::DeltaConv(layer))
+            .unwrap()
+            .bytes()
+            / 4;
+        let rec_len = single
+            .state_slot(StateSlot::DeltaRec(layer))
+            .unwrap()
+            .bytes()
+            / 4;
+        single.stream.synchronize().expect("drain");
+        let a = single
+            .read_f32(
+                single.state_slot(StateSlot::DeltaRec(layer)).unwrap(),
+                rec_len,
+            )
+            .expect("recurrent state");
+        let b = chunk
+            .read_f32(
+                chunk.state_slot(StateSlot::DeltaRec(layer)).unwrap(),
+                rec_len,
+            )
+            .expect("recurrent state");
+        let error = relative_l2(&b, &a);
+        println!(
+            "layer {layer} recurrent state: relative L2 {error:.3e} ({} values)",
+            rec_len
+        );
+        // The chunk's projections run the job-table kernel (FP16-rounded operands, F32
+        // accumulation) where the single rows run legacy F32, and that rounding difference
+        // compounds through the recurrent state; 1e-3 covers it with room.
+        assert!(
+            error < 1e-3,
+            "layer {layer}: the chunk's recurrent state drifts beyond the jobs-kernel rounding"
+        );
+        let ra = single
+            .read_f32(
+                single.state_slot(StateSlot::DeltaConv(layer)).unwrap(),
+                ring_len,
+            )
+            .expect("conv ring");
+        let rb = chunk
+            .read_f32(
+                chunk.state_slot(StateSlot::DeltaConv(layer)).unwrap(),
+                ring_len,
+            )
+            .expect("conv ring");
+        let error = relative_l2(&rb, &ra);
+        println!("layer {layer} conv ring: relative L2 {error:.3e}");
+        assert!(
+            error < 1e-3,
+            "layer {layer}: the chunk's conv ring drifts beyond the jobs-kernel rounding"
+        );
+    }
+}
+
+fn write_params(step: &FlashStep<'_>, token: i32, pos: i32) {
+    let (words, words_at) = step.words_buffer().expect("words");
+    let params =
+        crate::kernels::cuda::resident::step_params::StepParams::new(token, pos).expect("params");
+    words
+        .write_at(step.stream, words_at, &params.to_bytes())
+        .expect("params");
+}
+
+fn write_stream_row(step: &FlashStep<'_>, values: &[f32]) {
+    let range = step.slot(Slot::Stream).expect("stream");
+    range
+        .buffer()
+        .write_at(
+            step.stream,
+            range.offset(),
+            &values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .expect("stream");
 }

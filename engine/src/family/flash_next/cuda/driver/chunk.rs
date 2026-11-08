@@ -25,16 +25,16 @@
 //! position accounting run in host tests against fakes; the card implementation is staged for the
 //! chunked prefill step (`step`/`mixer` at `m` rows).
 
-use std::{ops::Range, time::Instant};
+use std::ops::Range;
 
-use super::{DriverShape, TokenFeeds, TokenTimes};
+use super::{DriverShape, TokenFeeds};
 use crate::{EngError, family::session::TokenStepper};
 
 type Result<T> = std::result::Result<T, EngError>;
 
 /// The device side of a chunk. The start writes are the sink of the host feeds at chunk
 /// granularity; every buffer holds `m` rows where the token step holds one.
-pub(super) trait ChunkDevice {
+pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     /// Writes the step parameters of the chunk: its first token id, its start position and its
     /// row count.
     fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<()>;
@@ -59,6 +59,10 @@ pub(super) trait ChunkDevice {
     fn check_health(&mut self) -> Result<()>;
     /// Zeroes the persistent state: a new sequence.
     fn reset(&mut self) -> Result<()>;
+    /// The bank's miss count for the per-job report, if the device has a bank.
+    fn bank_misses(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The chunk driver: a [`ChunkDevice`] and its [`TokenFeeds`] under the token driver's rules.

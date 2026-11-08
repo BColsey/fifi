@@ -604,6 +604,7 @@ pub(super) fn build_driver(
         weights,
         &checkpoint.model_config,
         wanted.context as usize,
+        1,
         0..layers,
     )?;
     let block = SplitMoe::new(
@@ -611,7 +612,7 @@ pub(super) fn build_driver(
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
-        &step.moe_dims(),
+        &step.moe_dims(1),
     )?;
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;

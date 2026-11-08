@@ -6,7 +6,7 @@ use crate::{
     EngError,
     family::{flash_next::cuda::driver::fakes, session::TokenStepper},
 };
-use fakes::{FakeChunkDevice, FakeFeeds, LOGITS, POSITIONS, SAMPLER_VOCAB, STREAM, shape};
+use fakes::{FakeChunkDevice, FakeFeeds, LOGITS, SAMPLER_VOCAB, STREAM, shape};
 
 fn chunk_driver() -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
     ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap()
