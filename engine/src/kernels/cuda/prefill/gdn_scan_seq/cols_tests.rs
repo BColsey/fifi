@@ -165,12 +165,6 @@ impl Case {
     fn conv_ld(&self) -> usize {
         (2 * self.n_k + self.n_v) * D
     }
-    fn beta_off(&self) -> usize {
-        self.n_v * D
-    }
-    fn alpha_off(&self) -> usize {
-        self.n_v * D + self.n_v
-    }
     /// z, beta and alpha, then four floats the kernel must not read.
     fn ld(&self) -> usize {
         self.n_v * D + 2 * self.n_v + 4
