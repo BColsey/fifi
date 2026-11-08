@@ -29,6 +29,7 @@ use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
 use crate::kernels::cuda::{DeviceBuffer, DeviceEvent, PinnedBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
