@@ -528,7 +528,7 @@ impl<'c> ResidentDecoder<'c> {
                     &states,
                     &x,
                     &layer_ref.input_norm,
-                )?;;
+                )?;
                 let mut outputs = vec![&got.out];
                 for (rec, ring) in &got.states {
                     outputs.extend([rec, ring]);
@@ -547,7 +547,7 @@ impl<'c> ResidentDecoder<'c> {
                     moe,
                     &x,
                     &layer_ref.post_norm,
-                )?;;
+                )?;
                 ctx.kernels
                     .evaluate(&[&got.0, got.1.ids.ids(), &got.1.gates, &got.1.health])?;
                 seconds.moe.push(started.elapsed().as_secs_f64());
@@ -725,7 +725,7 @@ impl<'c> ResidentDecoder<'c> {
                 ));
             };
             let started = std::time::Instant::now();
-            let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x, &layer_ref.input_norm)?;;
+            let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x, &layer_ref.input_norm)?;
             ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
             // The post-core closure warms on the attention core output dtype this cache form
             // produces: F32 over the F32 cache, BF16 over the BF16 cache, the activation
@@ -741,7 +741,7 @@ impl<'c> ResidentDecoder<'c> {
             } else {
                 ctx.kernels.cast(&got.q, att_dtype)?
             };
-            let out = super::compiled::attn_post_step(&mut ctx, &shape, w, &att, &got.gate, &x)?;;
+            let out = super::compiled::attn_post_step(&mut ctx, &shape, w, &att, &got.gate, &x)?;
             ctx.kernels.evaluate(&[&out])?;
             attn_seconds.push(started.elapsed().as_secs_f64());
         }
