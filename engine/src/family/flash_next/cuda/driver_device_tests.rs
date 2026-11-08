@@ -13,6 +13,7 @@
 //! - `FIFI_FLASH_NEXT_DRIVER_SLOTS`: expert slots per layer (default: the load plan's).
 //! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for `engine.json` (one run record) and
 //!   `step0.logits.f32` (the first row); optional.
+//!
 //! Reported: the generated ids against the oracle's, the stage table, and the step-0 relative L2,
 //! largest difference, argmax and top-20 overlap against the oracle's full row.
 //!
@@ -36,6 +37,7 @@
 //!   name the record. Both are file-name parts: letters, digits, `.`, `_` and `-` only.
 //! - `FIFI_FLASH_NEXT_DRIVER_OUT`: the directory of `ab-<config>-r<round>.json` (required).
 //! - It also reports `FIFI_EXL3_SINGLE_GATHER`, `FIFI_EXL3_DP4A` and `FIFI_EXL3_INDEXED_PAIRS`.
+//!
 //! Nothing here asserts a speed.
 
 use std::path::{Path, PathBuf};
