@@ -40,28 +40,46 @@ miss resolver at the existing `read_picks` site.**
 
 - **Load** (`exl3_load.rs`, new banked arm): allocate per-layer banks of `S`
   expert stacks (gate/up/down byte ranges per expert as today, `S` members),
-  and pin every layer's 256 experts' raw EXL3-encoded bytes in host RAM
-  (flint `HostStore::build` pattern; the reader closure comes from the shared
-  `weights::exl3::Checkpoint`, which q36 already opens). Admission: host
-  bytes = full expert bank (2.08 bpw ≈ 9.9 GB) against a host-RAM budget;
-  device bytes = dense + `S`·per-slot + KV + reserve (flint
-  `bank_budget`/`BANK_MARGIN_BYTES` arithmetic, per-slot audited from the
-  pack, not the 4.00-bpw 72 MiB figure).
-- **Decode** (eager only): at the `read_picks` site, the host maps each pick
-  `id → slot` through a per-layer LRU table; misses enqueue pinned→device
-  copies of that expert's byte ranges into its layer's slot stacks, then the
-  launches receive **slot ids** where they today receive router ids. Router
-  weights, kernels, buffers and combine are untouched. Readback per layer is
-  ids only (32 B); no hidden-row copy (that is the CPU-expert path's need).
+  and keep every layer's 256 experts' raw EXL3-encoded bytes in host RAM in a
+  **pageable store (plain `Vec`, not page-locked) — v1**; the driver stages
+  H2D from pageable memory internally, and 9.9 GB of page-locked memory on a
+  14 GiB laptop risks OS instability (reviewer finding 4). A bounded pinned
+  staging ring is a measured follow-up, not v1. Admission: host bytes = full
+  expert bank (2.08 bpw ≈ 9.9 GB) against a host-RAM budget **with an
+  explicit OS margin floor for laptop-class boxes**; device bytes = dense +
+  `S`·per-slot + KV + reserve (flint `bank_budget` semantics, per-slot
+  audited from the pack, not the 4.00-bpw 72 MiB figure). The q36 arm
+  **re-implements the small policy core** (mode/request/budget arithmetic
+  with parity tests against flint's `budget.rs` rules) rather than promoting
+  `pub(super)` flint internals across families (reviewer finding 5); the
+  reader closure comes from the shared `weights::exl3::Checkpoint`, which
+  q36 already opens.
+- **Decode** (eager only): the resolver hooks the **merged host block
+  (`merged_on_host`, the default decode block)** and the reference `routed`
+  path alike — both already read picks to the host (`merge.rs:361`,
+  `exl3_moe.rs:578`). The host maps each pick `id → slot` through a
+  per-layer LRU table; misses enqueue H2D copies of that expert's byte
+  ranges into its layer's slot stacks, then the launches receive **slot
+  ids** where they today receive router ids. Router weights, kernels,
+  buffers and combine are untouched. Readback per layer is ids only
+  (32 B); no hidden-row copy (that is the CPU-expert path's need).
+- **Refused while banked** (by name, like today's checks): graph capture,
+  `draft_mode`, **and `draft_verify = krow` windows** (krow_step runs
+  `run_exl3_moe_rows` with device-resident picks under per-window CUDA
+  graphs — no host hook exists there; reviewer finding 1).
 - **Capture**: a banked engine refuses graph capture (settings force
   `capture: false` with a start line when the bank is on; the typed
   captured-window refusals from tiered are the precedent). This also matches
   the fact that the merged/captured EXL3 step reads picks on the device.
-- **Prefill**: v1 routes prefill pieces through the same miss resolver
-  (correctness first): a piece that touches all 256 experts of a layer
-  streams them through the slots once per piece. Measured cost on danlap
-  (PCIe gen4 x8) decides whether we need flint's `cache_prefill_floor`
-  analog later. The floor itself is a follow-up, not v1.
+- **Prefill**: v1 routes prefill pieces through the same miss resolver,
+  which must also remap the **prefill job-table members** — the job table
+  addresses experts directly (`member: expert as u32`,
+  `prefill_exl3_moe.rs:167`) after a 256-bin host sort (`read_plan`), so the
+  remap happens there, host-side (reviewer finding 3). A piece that touches
+  all 256 experts of a layer streams them through the slots once per piece.
+  Measured cost on danlap (PCIe gen4 x8) decides whether we need flint's
+  `cache_prefill_floor` analog later. The floor itself is a follow-up, not
+  v1.
 - **Knobs** (q36 convention — JSON, not env): a `qwen36.expert_bank` object,
   `{ "slots": N, "mode": "auto" | "on" }` — `auto` banks only when the
   resident load would not admit; refused together with `tiered` and
@@ -100,18 +118,26 @@ multi-device, mmap/NVMe host store. Each is a follow-up with its own gate.
 - M3: prefill through the resolver; danlap end-to-end on the 2.08 pack;
   measurements + report; review (zai/glm-5.3).
 
+## Review
+
+M0 review (zai/glm-5.3, 2026-11-07): all six factual claims CONFIRMED with
+file:line evidence; five additions folded in above (krow refusal, merged
+block as the hook site, prefill job member remap, pageable store, policy
+re-implementation). One known check to relax under a flag: `Exl3MoeWeights::new`
+rejects `bank.count() != moe.n_expert` (exl3_moe.rs:96) — the banked arm
+supplies slot-indexed banks and must carry its own member check.
+
 ## Risks / open questions
 
-- `Exl3Bank` member-count invariants: if any host-side check assumes 256
-  members, the banked arm needs its own `check_bank` (tiered's
-  full-depth-facts trick is the precedent).
+- `Exl3Bank` member-count invariants: `Exl3MoeWeights::new` rejects
+  `bank.count() != moe.n_expert` (exl3_moe.rs:96) — the banked arm needs its
+  own `check_bank` (tiered's full-depth-facts trick is the precedent).
 - Per-layer sync cost: the eager path already pays the picks readback per
-  layer; miss copies add pinned H2D on the same stream. Bound the per-token
-  serial copy time on danlap before optimizing (M2 measurement).
-- Shared expert ("shared in routed") rides the routed banks; it must be
-  permanently resident (it is one member — pin it in slot 0 or keep its
-  1-member bank outside the slot table; prefer the latter, it is already a
-  separate bank).
-- Host store pinning 9.9 GB on a 14 GiB laptop: the host budget probe must
-  leave the OS margin (flint `HostBudget::probe` + `admit` semantics; add an
-  explicit floor for danlap-class boxes).
+  layer; miss copies add H2D on the same stream. Bound the per-token serial
+  copy time on danlap before optimizing (M2 measurement).
+- Shared expert ("shared in routed") is structurally outside the routed
+  banks (three single `CudaWeight::Exl3` matrices,
+  `exl3_moe_source.rs:167-176`) — it stays resident and out of the slot
+  table unchanged.
+- Host store of 9.9 GB on a 14 GiB laptop is resident-but-swappable in v1
+  (pageable); the admission leaves an explicit OS margin.
