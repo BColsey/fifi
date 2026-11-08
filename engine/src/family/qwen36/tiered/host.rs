@@ -198,6 +198,15 @@ pub struct TieredHost {
     meter: RecallMeter,
     /// The meter counts already reported, so a token report carries only its delta.
     meter_seen: (u64, u64),
+    /// ponytail: the route probe's token counter.
+    token_seen: u64,
+}
+
+/// ponytail: the route-trace probe (Q36_TIERED_ROUTES=1) — one line per (token, layer)
+/// with pick:hit/miss flags, for the adjacent-token repetition analysis. Delete with the
+/// timing probes after the refill decision.
+fn routes_probe_on() -> bool {
+    std::env::var_os("Q36_TIERED_ROUTES").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 /// The ledger deadline of a synchronous fill: any later clock value expires it, which is how
@@ -259,6 +268,7 @@ impl TieredHost {
             arrived: None,
             meter: RecallMeter::default(),
             meter_seen: (0, 0),
+            token_seen: 0,
         })
     }
 
@@ -508,6 +518,17 @@ impl TieredHost {
             )));
         }
         let routes = std::mem::replace(&mut self.routes, vec![Vec::new(); self.cfg.layers]);
+        if routes_probe_on() {
+            self.token_seen += 1;
+            for (layer, ids) in routes.iter().enumerate() {
+                let picks = ids
+                    .iter()
+                    .map(|&id| format!("{id}:{}", if self.table.lookup(layer, id).is_some() { 'h' } else { 'm' }))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!("tiered route t{} l{layer}: {picks}", self.token_seen);
+            }
+        }
         self.policy.observe(&routes);
         let swaps = self.policy.boundary();
         // Publish everything a mid-token prefetch queued BEFORE the boundary picks
