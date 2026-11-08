@@ -129,6 +129,7 @@ pub(super) fn moe_facts(
         clamp: experts
             .checked_sub(1)
             .ok_or_else(|| EngError::BadRequest("resident moe needs experts".into()))?,
+        eps_bits: shape.eps.to_bits(),
         act: compile_key::dtype_key(act),
         weights: [
             weight_facts(&w.shared_gate)?,

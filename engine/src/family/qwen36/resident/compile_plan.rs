@@ -55,6 +55,8 @@ pub(super) struct MoeLayerFacts {
     pub(super) renorm: u32,
     /// The clamp bound of the expert ids, `experts - 1`.
     pub(super) clamp: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the folded post-attention norm.
+    pub(super) eps_bits: u32,
     /// The activation dtype key (`compile_key::dtype_key`).
     pub(super) act: u64,
     /// The weight facts, in the seam's order.
