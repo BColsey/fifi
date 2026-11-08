@@ -441,7 +441,7 @@ mod tests {
     /// cover all four experts.
     const LAYER0_ROUTES: [[u32; 2]; 8] = [
         [2, 1],
-        [0, 3],
+        [3, 0],
         [1, 0],
         [3, 0],
         [1, 3],
