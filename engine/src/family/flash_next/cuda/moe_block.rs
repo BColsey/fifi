@@ -351,7 +351,7 @@ mod device {
     pub(in crate::family::flash_next) struct SplitMoe<'w> {
         trunks: Vec<SplitMoeTrunk<'w>>,
         bank: DeviceBank,
-        spans: Vec<SlotSpans>,
+        spans: SlotSpans,
         layout: ScratchLayout,
         scratch: DeviceBuffer,
         book: Codebook,
@@ -412,7 +412,7 @@ mod device {
             layout: &SlotBankLayout,
             dims: &MoeDims,
         ) -> Result<Self, EngError> {
-            let geometry = bank.geometry().clone();
+            let geometry = *bank.geometry();
             if trunks.len() != geometry.layers {
                 return Err(refuse(format!(
                     "{} trunks for a bank of {} layers",
@@ -443,9 +443,7 @@ mod device {
                     dims.hidden, dims.inter
                 )));
             }
-            let spans = (0..geometry.layers)
-                .map(|layer| SlotSpans::new(layout, geometry.slots_of(layer)))
-                .collect::<Result<Vec<_>, _>>()?;
+            let spans = SlotSpans::new(layout, geometry.slots)?;
             let book = trunks
                 .first()
                 .ok_or_else(|| refuse("a block without layers".into()))?
@@ -496,7 +494,7 @@ mod device {
                     dims.rows
                 )));
             }
-            let geometry = self.bank.geometry().clone();
+            let geometry = *self.bank.geometry();
             if dims.n_expert != geometry.experts
                 || dims.top_k != geometry.top_k
                 || layer >= geometry.layers
@@ -546,7 +544,7 @@ mod device {
                 ClassifyCall {
                     shape: ClassifyShape {
                         n_expert: dims.n_expert,
-                        slots: geometry.slots_of(layer),
+                        slots: geometry.slots,
                         top_k: k,
                         hidden: h,
                         layer,
@@ -567,8 +565,7 @@ mod device {
             let mut raw = vec![0u8; k * LOG_ENTRY];
             scratch.read_at(stream, sc.log, &mut raw)?;
             let (ids, weights) = parse_log(&raw, k)?;
-            let classified =
-                classify_picks(&slot_row_before, geometry.slots_of(layer), &ids, &weights)?;
+            let classified = classify_picks(&slot_row_before, geometry.slots, &ids, &weights)?;
 
             // The resident pass. With a miss its result waits in the partial buffer; without one
             // it is the block's output.
@@ -658,17 +655,13 @@ mod device {
             let first = items
                 .first()
                 .ok_or_else(|| refuse("an indexed launch without pairs".into()))?;
-            let spans = self
-                .spans
-                .get(layer)
-                .ok_or_else(|| refuse(format!("layer {layer} is outside the bank")))?;
-            let [k, n] = spans.parts[first.part].shape;
-            let members = u32::try_from(spans.slots)
+            let [k, n] = self.spans.parts[first.part].shape;
+            let members = u32::try_from(self.spans.slots)
                 .map_err(|_| refuse("the bank has too many slots".into()))?;
             for chunk in items.chunks(launch.ctx.exl3_indexed_capacity()) {
                 let mut calls = Vec::with_capacity(chunk.len());
                 for (index, item) in chunk.iter().enumerate() {
-                    let span = &spans.parts[item.part];
+                    let span = &self.spans.parts[item.part];
                     if span.shape != [k, n] {
                         return Err(refuse("a launch group mixes matrix shapes".into()));
                     }
@@ -694,8 +687,8 @@ mod device {
                         ids,
                         slot: item.pick,
                         members,
-                        trellis_stride: spans.trellis_stride,
-                        scale_stride: spans.scale_stride,
+                        trellis_stride: self.spans.trellis_stride,
+                        scale_stride: self.spans.scale_stride,
                         offsets: None,
                     });
                 }

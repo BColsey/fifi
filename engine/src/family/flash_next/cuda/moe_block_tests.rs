@@ -30,8 +30,8 @@ fn bank(held: &[u16]) -> ExpertBankState<ReplaceOnMissLru> {
     }
     // The least popular holder is the first victim: count by id, so a low id is evicted last.
     let counts = vec![(0..EXPERTS as u64).rev().collect::<Vec<u64>>()];
-    let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &[row.as_slice()], &counts).unwrap();
-    ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy).unwrap()
+    let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts).unwrap();
+    ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
 }
 
 /// The sum the combine kernel forms for one row: each product rounded alone, the picks added in
@@ -93,7 +93,7 @@ fn split(
     weights: &[f32],
     gate: f32,
 ) -> (Vec<f32>, PassInputs) {
-    let slots = state.geometry().uniform_slots().expect("uniform");
+    let slots = state.geometry().slots;
     let before = holders(state, slots);
     let row_before = state.slot_row(0).to_vec();
     let classified = classify_picks(&row_before, slots, ids, weights).unwrap();
