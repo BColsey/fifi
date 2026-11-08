@@ -606,16 +606,7 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(
-                &mut ctx,
-                &shape,
-                rw,
-                &concat,
-                n,
-                &xr,
-                &w.layers[1].input_norm,
-            )
-            .unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -658,16 +649,7 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(
-                &mut ctx,
-                &shape,
-                rw,
-                &concat,
-                n,
-                &xr,
-                &w.layers[1].input_norm,
-            )
-            .unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,
@@ -733,16 +715,7 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(
-                &mut ctx,
-                &shape,
-                rw,
-                &concat,
-                n,
-                &xr,
-                &w.layers[1].input_norm,
-            )
-            .unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -809,16 +782,7 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(
-                &mut ctx,
-                &shape,
-                rw,
-                &concat,
-                n,
-                &xr,
-                &w.layers[1].input_norm,
-            )
-            .unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,

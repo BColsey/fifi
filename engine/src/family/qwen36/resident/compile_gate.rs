@@ -1113,9 +1113,22 @@ fn compiled_and_uncompiled_moe_blocks_agree_in_f32_tiny() {
             consts: &decoder.weights.consts,
             compile: false,
         };
-        let (plain, plain_route) = moe::step_device(&mut ctx, &shape, w, &x).unwrap();
-        let (compiled_run, compiled_route) =
-            compiled::moe_step_device(&mut ctx, &shape, w, &x).unwrap();
+        let (plain, plain_route) = moe::step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
+        let (compiled_run, compiled_route) = compiled::moe_step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
         assert_same_metadata("moe output", &plain, &compiled_run);
         assert_same_metadata("moe gates", &plain_route.gates, &compiled_route.gates);
         let (plain_ids, compiled_ids) = (
@@ -1636,7 +1649,7 @@ fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
         let args = delta_seam_args(
             &shape,
             w,
-            first_delta_norm(&decoder.weights).unwrap(),
+            first_delta_norm(&f32_decoder.weights).unwrap(),
             &f32_decoder.weights.consts,
             inputs,
             eps,
@@ -1661,6 +1674,7 @@ fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
         let args = delta_seam_args(
             &shape,
             w16,
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             inputs16,
             eps,
@@ -1716,7 +1730,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w,
-            first_delta_norm(&decoder.weights).unwrap(),
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             (&x16, &rec16, &ring),
             1e-6,
@@ -1735,7 +1749,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w,
-            first_delta_norm(&decoder.weights).unwrap(),
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             (&x32, &rec, &ring),
             1e-6,
@@ -1765,6 +1779,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w32,
+            first_delta_norm(&f32_decoder.weights).unwrap(),
             &f32_decoder.weights.consts,
             (&x, &rec32, &ring32),
             1e-6,
@@ -1810,6 +1825,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
     let mut args = delta_seam_args(
         &shape,
         delta_w,
+        first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         (&x, &rec, &ring),
         1e-6,

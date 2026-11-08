@@ -604,8 +604,14 @@ mod tests {
             compile: false,
         };
         let (got, routes) = chunk(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
-        let (want, (selection, _)) =
-            decode_step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+        let (want, (selection, _)) = decode_step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &one,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         let chosen: Vec<(u32, f32)> = routes[0]
             .indices
             .iter()
@@ -775,8 +781,14 @@ mod tests {
             };
             let device =
                 chunk_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
-            let decode =
-                decode_step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+            let decode = decode_step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &one,
+                &w.layers[0].post_norm,
+            )
+            .unwrap();
             (device, decode)
         };
         let (decode, route) = decode;

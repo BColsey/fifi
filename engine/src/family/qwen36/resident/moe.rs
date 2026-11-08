@@ -502,11 +502,22 @@ mod tests {
         let super::super::weights::RFeedForward::Dense(w) = &weights.layers[0].feed_forward else {
             panic!("expected dense weights");
         };
+        // dense_rows folds the post norm and the residual add: feed it a raw residual and a
+        // ones norm, so the block computes `x + ffn(x / rms(x))`. For a constant row `v` the
+        // normed row is `y = v / sqrt(v^2 + eps)` everywhere, and the uniform gate/up/down
+        // weights turn the SwiGLU into `-6 y^2 / (1 + e^-y)` per element.
+        let post_norm = kernels
+            .import_tensor(&f32_tensor(vec![64], &vec![1.0; 64]).unwrap())
+            .unwrap();
+        let eps = weights.shape.eps;
         for row_values in [&[1.0f32][..], &[1.0, -1.0, 0.0, 0.5][..]] {
             let input: Vec<f32> = row_values.iter().flat_map(|&v| [v; 64]).collect();
             let expected: Vec<f32> = row_values
                 .iter()
-                .flat_map(|&v| [-6.0 * v * v / (1.0 + (-v).exp()); 64])
+                .flat_map(|&v| {
+                    let y = v / (v * v + eps).sqrt();
+                    [v - 6.0 * y * y / (1.0 + (-y).exp()); 64]
+                })
                 .collect();
             let rows = u32::try_from(row_values.len()).unwrap();
             let x = kernels
@@ -517,7 +528,7 @@ mod tests {
                 consts: &weights.consts,
                 compile: false,
             };
-            let out = dense_rows(&mut ctx, w, &x).unwrap();
+            let out = dense_rows(&mut ctx, &weights.shape, w, &x, &post_norm).unwrap();
             assert_eq!(out.shape(), [rows, 64]);
             assert_eq!(out.dtype(), Dtype::F32);
             let got = values(&mut kernels, &out).unwrap();
@@ -1085,7 +1096,8 @@ mod tests {
                 &mut ctx,
                 &shape,
                 w.layers[0].as_moe().unwrap(),
-                &xr
+                &xr,
+                &w.layers[0].post_norm
             )),
             "moe router has 8 values, expected 4"
         );

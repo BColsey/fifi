@@ -1071,16 +1071,7 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(
-                &mut ctx,
-                &shape,
-                rw,
-                &concat,
-                n,
-                &xr,
-                &w.layers[1].input_norm,
-            )
-            .unwrap();
+            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
             let t = n as usize + 1;
             // The cache arithmetic: one growth every three positions.
             let want_cap = [3, 3, 3, 6, 6, 6, 9, 9, 9][n as usize];
@@ -1452,6 +1443,7 @@ mod tests {
             KvCache::with_form(KvDtype::Q8, 65_536),
             0,
             &warm,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let mut parts = vec![&first.out];
@@ -1553,6 +1545,7 @@ mod tests {
                 std::mem::replace(&mut f32_cache, KvCache::with_step(4)),
                 n,
                 &xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             f32_cache = control.cache;
@@ -1563,6 +1556,7 @@ mod tests {
                 std::mem::replace(&mut q8_cache, KvCache::with_form(KvDtype::Q8, 4)),
                 n,
                 &xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             q8_cache = quantized.cache;
@@ -1751,6 +1745,7 @@ mod tests {
                 std::mem::replace(&mut small, KvCache::with_form(KvDtype::Q8, 3)),
                 n as u32,
                 xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             small = from_small.cache;
@@ -1766,6 +1761,7 @@ mod tests {
                 std::mem::replace(&mut large, KvCache::with_form(KvDtype::Q8, 65_536)),
                 n as u32,
                 xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             large = from_large.cache;
@@ -1855,6 +1851,7 @@ mod tests {
             KvCache::with_form(KvDtype::F32, 4),
             0,
             &xr,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let quantized = step(
@@ -1864,6 +1861,7 @@ mod tests {
             KvCache::with_form(KvDtype::Q8, 4),
             0,
             &xr,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let mut f32_as_q8 = control.cache;
