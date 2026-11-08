@@ -85,6 +85,18 @@ fn dims() -> Result<StepDims, EngError> {
     StepDims::new(&shape, &inventory)
 }
 
+/// The rig's layout: `Q36_CUDA_LAYOUT=tiled` runs the whole-model Tiled control
+/// (fp16 packs + tiled matmuls) beside the default Native rig, for per-arm attribution.
+fn rig_layout() -> WeightLayout {
+    match std::env::var("Q36_CUDA_LAYOUT")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "tiled" => WeightLayout::Tiled,
+        _ => WeightLayout::Native,
+    }
+}
+
 fn options() -> StepOptions {
     StepOptions {
         kv_mode: KvMode::Fp16,
@@ -92,7 +104,7 @@ fn options() -> StepOptions {
         delta_slots: 1,
         forked_experts: false,
         tiered: None,
-        layout: WeightLayout::Native,
+        layout: rig_layout(),
     }
 }
 
@@ -109,7 +121,7 @@ fn load_options() -> LoadOptions<'static> {
             headroom: 0,
         },
         drop_page_cache: None,
-        layout: WeightLayout::Native,
+        layout: rig_layout(),
     }
 }
 
