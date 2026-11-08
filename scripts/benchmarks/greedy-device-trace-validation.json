@@ -37,8 +37,8 @@
     "limits": "An output hash was not retained for this preliminary reproduction."
   },
   "limits": [
-    "The compiled candidate has not yet been exercised on a GPU or deployed.",
-    "The sampler unit checks do not substitute for an end-to-end test of the CUDA argmax path."
+    "One fixed greedy prompt was compared on the RTX 2080 Ti, via the LAN HTTP proxy; this is not a browser automation test.",
+    "The live check does not qualify other models, sampling modes, or the multi-GPU engine."
   ],
   "repeatable_baseline": {
     "model": "fifi-q36-2080ti",
@@ -49,5 +49,22 @@
     "captured_positions": 0,
     "prompt": "Write the numbers one to ten, one per line.",
     "recorded_utc": "2026-11-08T19:49:00.868926+00:00"
+  },
+  "candidate_end_to_end": {
+    "model": "fifi-q36-2080ti",
+    "client_api_key": "none",
+    "completion_tokens": 20,
+    "finish_reason": "length",
+    "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+    "captured_positions": 20,
+    "all_greedy": true,
+    "no_selected_probabilities": true,
+    "baseline_and_candidate_match": [
+      "content_sha256",
+      "completion_tokens",
+      "finish_reason"
+    ],
+    "deployment_candidate_sha256": "ba8151dbdaaa529162ff3e3e9014635dc61a8df7197d6ad949e67498aa126fd3",
+    "recorded_utc": "2026-11-08T19:54:28.484524+00:00"
   }
 }
