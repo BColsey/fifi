@@ -693,7 +693,18 @@ pub(crate) fn stacked_layout(
             ));
         }
     };
-    let logical_shape = payload.shape.clone();
+    let logical_shape = {
+        // The stacked logical shape sums the OUTPUT rows of the two projections; the input width
+        // and the quantization stay those of the two stacks (already checked equal).
+        let mut shape = gate.logical_shape.clone();
+        let rows = gate
+            .logical_shape
+            .get(1)
+            .and_then(|&rows| rows.checked_add(*up.logical_shape.get(1)?))
+            .ok_or_else(|| EngError::BadRequest("the stacked logical shape overflows".into()))?;
+        shape[1] = rows;
+        shape
+    };
     Ok(StackLayout {
         count: gate.count,
         payload,
