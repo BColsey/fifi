@@ -526,6 +526,10 @@ impl LayerLru {
 pub(super) struct ReplaceOnMissLru {
     geometry: BankGeometry,
     layers: Vec<LayerLru>,
+    /// Per-layer pick counts, written to `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` on drop so a run can
+    /// produce the popularity profile of its own workload (the read side is
+    /// `FIFI_FLASH_NEXT_EXPERT_STATS`). `None` when the env is unset.
+    usage: Option<Vec<Vec<u64>>>,
 }
 
 impl ReplaceOnMissLru {
@@ -582,7 +586,41 @@ impl ReplaceOnMissLru {
                 recency,
             });
         }
-        Ok(Self { geometry, layers })
+        let usage = std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|_| vec![vec![0u64; geometry.experts]; geometry.layers]);
+        Ok(Self {
+            geometry,
+            layers,
+            usage,
+        })
+    }
+
+    /// Writes the collected pick counts in the `expert_stats` layer-key format the profile
+    /// reader takes, so the file feeds straight back through `FIFI_FLASH_NEXT_EXPERT_STATS`.
+    fn dump_usage(&self) {
+        let Some(path) = std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
+            .ok()
+            .filter(|p| !p.is_empty())
+        else {
+            return;
+        };
+        let Some(usage) = &self.usage else { return };
+        let layers: serde_json::Map<String, serde_json::Value> = usage
+            .iter()
+            .enumerate()
+            .map(|(layer, counts)| {
+                (
+                    format!("model.language_model.layers.{layer}.mlp"),
+                    serde_json::json!(counts),
+                )
+            })
+            .collect();
+        let body = serde_json::json!({"schema": "fifi-usage/1", "layers": layers});
+        if let Err(e) = std::fs::write(&path, serde_json::to_vec(&body).unwrap_or_default()) {
+            eprintln!("flash-next cuda: expert usage dump {path}: {e}");
+        }
     }
 
     fn layer(&self, layer: usize) -> Result<&LayerLru, EngError> {
@@ -600,16 +638,25 @@ impl ReplaceOnMissLru {
     }
 }
 
+impl Drop for ReplaceOnMissLru {
+    fn drop(&mut self) {
+        self.dump_usage();
+    }
+}
+
 impl SlotPolicy for ReplaceOnMissLru {
     fn plan_pass(&mut self, layer: usize, picks: &[i32]) -> Result<PassPlan, EngError> {
         let current = self.layer(layer)?;
         let mut demanded = vec![false; self.geometry.experts];
         let mut order = Vec::with_capacity(picks.len());
+        // Pick ids deferred to after `current`'s borrow ends, for the usage profile.
+        let mut picked = Vec::with_capacity(picks.len());
         for &id in picks {
             if id == -1 {
                 continue;
             }
             let expert = self.check_expert(id)?;
+            picked.push(usize::from(expert));
             if !std::mem::replace(&mut demanded[usize::from(expert)], true) {
                 order.push(expert);
             }
@@ -629,6 +676,12 @@ impl SlotPolicy for ReplaceOnMissLru {
             )));
         }
         let mut next = current.clone();
+        drop(current);
+        if let Some(usage) = &mut self.usage {
+            for expert in picked {
+                usage[layer][expert] += 1;
+            }
+        }
         let plan = next.apply(&order, &demanded)?;
         self.layers[layer] = next;
         Ok(plan)
