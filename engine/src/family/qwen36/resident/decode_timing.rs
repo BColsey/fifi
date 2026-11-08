@@ -327,7 +327,7 @@ use {
     super::super::settings::{activation_name, chunked_prefill_allowed, kv_dtype_name},
     super::chunk_plan::{ChunkCost, PrefillTerms, admitted_chunk},
     super::decoder::{ResidentDecoder, StepMode, StepResult},
-    super::executor::{Q36Executor, Q36Rules},
+    super::executor::{Q36Executor, Q36Rules, Q36Session},
     super::parity::{CONFIG_SHA256, sha256},
     super::real::{env_path, kv_dtype_from_env, open},
     super::state::ResidentState,
@@ -1204,7 +1204,7 @@ fn speculative_decode_timing() {
     for (_, config, session) in &mut arms {
         executor.set_speculation(config).unwrap();
         executor.prefill(session, prompt).unwrap();
-        let mut job = GenerationState::new(IncrementalDecoder::new(&bundle))
+        let mut job = GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()))
             .with_max_tokens(u32::MAX);
         for _ in 0..4 {
             let _ = one_serving_call(&mut executor, session, &mut job);
@@ -1213,7 +1213,7 @@ fn speculative_decode_timing() {
     let mut jobs: Vec<GenerationState> = arms
         .iter()
         .map(|_| {
-            GenerationState::new(IncrementalDecoder::new(&bundle)).with_max_tokens(u32::MAX)
+            GenerationState::new(IncrementalDecoder::new(bundle.tokenizer())).with_max_tokens(u32::MAX)
         })
         .collect();
     let mut rows = Vec::new();
