@@ -51,6 +51,14 @@ impl CardDevice {
         self.step.ctx.single_row_kernel_name()
     }
 
+    /// The single-row launch counters of this context, since it was made: the receipt run's proof
+    /// that the grouped launches of the served step (the mixer inputs and the shared expert) ran
+    /// on the wide kernel, one launch per group.
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        self.step.ctx.exl3_launch_counts()
+    }
+
     /// The bank's statistics line for the load log and the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses

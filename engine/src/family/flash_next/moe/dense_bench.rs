@@ -598,7 +598,6 @@ fn run() -> Res<()> {
 
 /// Checks every path against `legacy`, then times the paths that agree. `false` when a path wrote
 /// other bytes.
-/// other bytes.
 fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
     let last = rig.weights.len() - 1;
     let mut want = Vec::with_capacity(2);
@@ -651,28 +650,26 @@ fn measure_group(
 ) -> Res<bool> {
     let rig = GroupRig::new(projector, matrices, shapes.to_vec())?;
     let last = rig.weights.len() - 1;
-    select(rig.ctx, 2);
-    let want: Vec<Vec<u8>> = [0, last]
-        .iter()
-        .map(|&copy| rig.written(copy, false))
-        .collect::<Res<_>>()?;
-    let grouped: Vec<Vec<u8>> = [0, last]
-        .iter()
-        .map(|&copy| rig.written(copy, true))
-        .collect::<Res<_>>()?;
     let mut ok = true;
-    for slot in 0..=last.min(1) {
-        if grouped[slot] != want[slot] {
-            ok = false;
-            println!(
-                "DENSEBENCH {{\"phase\":\"identity\",\"case\":\"{}\",\"path\":\"grouped\",\"equal\":false}}",
-                group.name
-            );
+    // The wide body comes in three served flavors (plain, rate 10/6 compile-time body, that body
+    // with DP4A); the grouped launch must write the member-wise bytes on each of them.
+    for index in [2, 3, 4] {
+        select(rig.ctx, index);
+        for &copy in &[0, last.min(1)] {
+            let (name, want) = (PATHS[index].0, rig.written(copy, false)?);
+            if rig.written(copy, true)? != want {
+                ok = false;
+                println!(
+                    "DENSEBENCH {{\"phase\":\"identity\",\"case\":\"{}\",\"path\":\"grouped-{name}\",\"equal\":false}}",
+                    group.name
+                );
+            }
         }
     }
     // The launch proof: one grouped call is exactly one wide1 launch of the routed shape; the
     // members separately are `members.len()` of them. `exl3_grouped_step` chooses the kernel the
     // context default picks, like every other launch in this bench.
+    select(rig.ctx, 2);
     let launch_delta = |grouped: bool| -> Res<u64> {
         let before = rig.ctx.exl3_launch_counts().wide1;
         if grouped {

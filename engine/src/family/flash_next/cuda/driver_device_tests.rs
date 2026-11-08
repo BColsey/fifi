@@ -854,12 +854,32 @@ fn single_row_kernel_receipt_run() {
     }
     let mut input = *last;
     let mut records = Vec::with_capacity(steps);
+    // The launch proof: every decode step adds the same launches to the counters. The grouped
+    // mixer inputs are one wide launch per layer (48), the shared expert two (96); the per-step
+    // counter replaces the 216 separate launches of the pre-grouping mixer. Gather must stay
+    // flat: the shared expert rides the context default, not the gather kernel.
+    let mut before = driver.device().kernel_launches();
+    let mut step_wide: Vec<u64> = Vec::with_capacity(steps);
     for step in 0..steps {
         let began = std::time::Instant::now();
         let row = driver
             .logits(input)
             .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
         let wall = began.elapsed();
+        let after = driver.device().kernel_launches();
+        let wide = after.wide1 - before.wide1;
+        assert_eq!(
+            after.gather, before.gather,
+            "step {step}: a grouped launch ran on the gather kernel"
+        );
+        if let Some(&first) = step_wide.first() {
+            assert_eq!(
+                wide, first,
+                "step {step}: {wide} wide launches, step 0 ran {first}"
+            );
+        }
+        step_wide.push(wide);
+        before = after;
         assert!(
             row[..actual_vocab].iter().all(|v| v.is_finite()),
             "step {step}: non-finite logits"
@@ -870,6 +890,7 @@ fn single_row_kernel_receipt_run() {
         records.push(serde_json::json!({
             "i": step, "input": input, "token": pick, "sha256": hash, "ms": ms(wall),
             "misses": driver.bank_misses(),
+            "wide1_launches": wide,
         }));
         input = pick as u32;
     }
@@ -888,4 +909,8 @@ fn single_row_kernel_receipt_run() {
     )
     .expect("write the run");
     println!("wrote {}", path.display());
+    println!(
+        "launches per step: wide1 {} (grouped mixer inputs 48 + shared expert 96 + singles), gather 0",
+        step_wide.first().copied().unwrap_or(0)
+    );
 }
