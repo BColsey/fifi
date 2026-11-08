@@ -175,6 +175,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/mamba_step.h",
     "src/kernels/cuda/native/nvfp4_gemv_batch.h",
     "src/kernels/cuda/native/nvfp4_grouped_gemm.h",
+    "src/kernels/cuda/native/peer_ring_policy.h",
     "src/kernels/cuda/native/prefill/attn_prep_chunk.h",
     "src/kernels/cuda/native/prefill/attn_prefill.h",
     "src/kernels/cuda/native/prefill/gdn_scan_seq.h",
