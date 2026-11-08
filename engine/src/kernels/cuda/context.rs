@@ -161,6 +161,8 @@ pub(crate) struct CudaContext {
         std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
     /// Whether the one-tile wide launches may take the rate 10 and rate 6 body of book 2.
     pub(in crate::kernels::cuda) exl3_odd_rates: std::cell::Cell<bool>,
+    /// Whether the grouped launches may fuse the input rotation into the projection kernel.
+    pub(in crate::kernels::cuda) exl3_fused_in: std::cell::Cell<bool>,
     /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
@@ -388,6 +390,7 @@ impl CudaContext {
             exl3_single_row_default: std::cell::Cell::new(None),
             exl3_indexed_default: std::cell::Cell::new(None),
             exl3_odd_rates: std::cell::Cell::new(false),
+            exl3_fused_in: std::cell::Cell::new(false),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]

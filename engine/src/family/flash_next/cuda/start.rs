@@ -94,12 +94,30 @@ fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
     ctx.set_single_row_default(SERVED_SINGLE_ROW);
     ctx.set_indexed_default(SERVED_INDEXED);
     ctx.set_odd_rate_kernel(true);
+    // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
+    // runs inside the projection kernel, two launches per set instead of three, bit-identical
+    // bytes. Default off; `FIFI_FLASH_NEXT_FUSED_IN=1` opts in, any other non-empty value is
+    // refused, never a silent fallback. Read once here, per process.
+    let fused_in = match std::env::var("FIFI_FLASH_NEXT_FUSED_IN") {
+        Err(_) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v.is_empty() || v == "0" => false,
+        Ok(v) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_FUSED_IN={v}: only 0 and 1 are valid"
+            )));
+        }
+    };
+    ctx.set_fused_in_kernel(fused_in);
     ctx.check_single_gather()?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
         ctx.single_row_kernel_name()?,
         ctx.single_gather_suffix()
     );
+    if fused_in {
+        eprintln!("flash-next cuda: fused-input launch on");
+    }
     Ok(())
 }
 

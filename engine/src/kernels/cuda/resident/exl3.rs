@@ -383,6 +383,15 @@ impl CudaContext {
         self.exl3_odd_rates.set(on);
     }
 
+    /// Lets the grouped launches of this context fuse the input rotation into the projection
+    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start;
+    /// a context that never calls it (Qwen3.6, Flint) runs the launches it ran before. Calls the
+    /// fused kernel cannot take fall back to the separate launches. Every byte written is the
+    /// same either way.
+    pub(crate) fn set_fused_in_kernel(&self, on: bool) {
+        self.exl3_fused_in.set(on);
+    }
+
     /// Registers the id-indexed options an unset [`DP4A_VAR`] or [`INDEXED_PAIRS_VAR`] leaves to
     /// this context: set by the session that owns it, like [`Self::set_single_row_default`], so a
     /// variable that is set still wins for its own option and another context in the process is
@@ -1204,6 +1213,19 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[Exl3LinearCall<'_>],
     ) -> Result<(), EngError> {
+        // The fused-input launch replaces the separate input rotation where every call allows
+        // it; it notes its own launch, so this path must not note again.
+        if self.exl3_fused_in.get()
+            && calls.iter().all(|call| {
+                call.rows == 1
+                    && call.n.is_multiple_of(16)
+                    && call.k.is_multiple_of(512)
+                    && call.book == Codebook::Mul1
+                    && matches!(call.bits_twice, 10 | 6)
+            })
+        {
+            return self.exl3_grouped_fin(stream, calls);
+        }
         let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
         #[cfg(test)]
         self.note_exl3_launch(match kernel {
