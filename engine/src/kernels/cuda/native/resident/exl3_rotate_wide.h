@@ -2,6 +2,8 @@
  * unnamed namespace, after job_in_bounds; it declares no namespace of its own. */
 #pragma once
 
+#include "exl3_rotate_butterfly.h"
+
 // ---- the warp-wide input rotation ------------------------------------------------------------
 // jobs_input_rotate with one warp per 128-value group instead of one thread per value: a lane
 // holds four consecutive values, the first two butterfly steps (distance 1 and 2) run in its
@@ -68,55 +70,6 @@ __device__ WideOwner wide_find_owner(const inference_cuda_exl3_jobs_args &p, uin
     return {-1, row, row + 1};
 }
 
-// One butterfly step across lanes: the lane whose bit is set computes other - own, which is the
-// sum of other and the negated own value (a subtraction is that sum, bit for bit), so one add
-// serves both partners after the sign of own is flipped on the upper one.
-template <unsigned Bit>
-__device__ __forceinline__ void wide_lane_step(float (&v)[4], unsigned lane) {
-    const unsigned flip = (lane & (1u << Bit)) ? 0x80000000u : 0u;
-    #pragma unroll
-    for (unsigned i = 0; i < 4; ++i) {
-        const float own = v[i], other = __shfl_xor_sync(0xffffffffu, own, 1u << Bit);
-        v[i] = __fadd_rn(__uint_as_float(__float_as_uint(own) ^ flip), other);
-    }
-}
-// Steps at distance 1 and 2 over the four values of a lane.
-__device__ __forceinline__ void wide_step_one(float (&v)[4]) {
-    const float a = v[0], b = v[1], c = v[2], d = v[3];
-    v[0] = __fadd_rn(a, b);
-    v[1] = __fsub_rn(a, b);
-    v[2] = __fadd_rn(c, d);
-    v[3] = __fsub_rn(c, d);
-}
-__device__ __forceinline__ void wide_step_two(float (&v)[4]) {
-    const float a = v[0], b = v[1], c = v[2], d = v[3];
-    v[0] = __fadd_rn(a, c);
-    v[2] = __fsub_rn(a, c);
-    v[1] = __fadd_rn(b, d);
-    v[3] = __fsub_rn(b, d);
-}
-
-template <int Mutant>
-__device__ __forceinline__ void wide_butterfly(float (&v)[4], unsigned lane) {
-    if constexpr (Mutant == wide_reversed_butterfly) {
-        wide_lane_step<4>(v, lane);
-        wide_lane_step<3>(v, lane);
-        wide_lane_step<2>(v, lane);
-        wide_lane_step<1>(v, lane);
-        wide_lane_step<0>(v, lane);
-        wide_step_two(v);
-        wide_step_one(v);
-    } else {
-        if constexpr (Mutant != wide_contract) wide_step_one(v);
-        wide_step_two(v);
-        wide_lane_step<0>(v, lane);
-        wide_lane_step<1>(v, lane);
-        wide_lane_step<2>(v, lane);
-        wide_lane_step<3>(v, lane);
-        wide_lane_step<4>(v, lane);
-    }
-}
-
 __device__ __forceinline__ unsigned wide_pack(float low, float high) {
     return unsigned(__half_as_ushort(__float2half_rn(low))) |
         (unsigned(__half_as_ushort(__float2half_rn(high))) << 16);
@@ -147,7 +100,7 @@ __device__ __forceinline__ uint2 wide_rotate_group(float4 x, float4 s, unsigned 
         const float c = fmaf(x.z, s.z, v[3]), d = fmaf(x.z, s.z, -v[3]);
         v[0] = a; v[1] = b; v[2] = c; v[3] = d;
     }
-    wide_butterfly<Mutant>(v, lane);
+    wide_butterfly<Mutant == wide_reversed_butterfly, Mutant == wide_contract>(v, lane);
     const float scale = rsqrtf(128.0f);
     #pragma unroll
     for (unsigned i = 0; i < 4; ++i) {

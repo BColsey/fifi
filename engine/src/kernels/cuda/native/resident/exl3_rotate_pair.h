@@ -2,6 +2,8 @@
  * inside its unnamed namespace, after exl3_rotate_wide.h; it declares no namespace of its own. */
 #pragma once
 
+#include "exl3_rotate_butterfly.h"
+
 // Two projections that read the same rows (the gate and the up matrix of the routed experts)
 // rotate the same x by their own scales. This kernel reads each x group once and writes both
 // rotated rows: xh of call `a` with the scales of `a`, xh of call `b` with the scales of `b`.
