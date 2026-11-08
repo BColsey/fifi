@@ -61,6 +61,36 @@ fn only_a_long_launch_under_a_set_switch_takes_the_prefill_kernel() {
     assert_eq!(prefill_rows(Some(64), 4099), Some(64));
 }
 
+/// How the pieces test cuts a prompt (rows of each piece) and the prompt's total; the host test below checks that every cut
+/// adds up, so a wrong cut cannot panic inside a device test (a panic with the device context alive latches the CUDA backend).
+const CONV_CUTS: ([&[usize]; 4], usize) = (
+    [
+        &[2048, 1024, 1024, 3],
+        &[2048, 2048, 3],
+        &[1, 2, 4091, 5],
+        &[1024, 1024, 1024, 1024, 3],
+    ],
+    4099,
+);
+const CONV_CUTS_QUICK: ([&[usize]; 4], usize) = (
+    [
+        &[128, 100, 70, 2],
+        &[150, 150],
+        &[1, 2, 290, 7],
+        &[64, 64, 64, 64, 44],
+    ],
+    300,
+);
+
+#[test]
+fn every_conv_piece_cut_adds_up_to_its_prompt() {
+    for (cuts, total) in [CONV_CUTS, CONV_CUTS_QUICK] {
+        for cut in cuts {
+            assert_eq!(cut.iter().sum::<usize>(), total, "{cut:?}");
+        }
+    }
+}
+
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -298,24 +328,14 @@ fn pieces_carry_the_window_across_launches_and_across_kernels() {
         return;
     }
     let rig = Rig::new();
-    let total = if quick() { 300 } else { 4099 };
+    let total = if quick() {
+        CONV_CUTS_QUICK.1
+    } else {
+        CONV_CUTS.1
+    };
     let inp = inputs(QWEN36.0, QWEN36.1, total, 0x6c05_0001);
     let want = run_pieces(&rig, &inp, &[(inp.m, Kernel::Original)]);
-    let cuts: [&[usize]; 4] = if quick() {
-        [
-            &[128, 100, 70, 2],
-            &[150, 150],
-            &[1, 2, 290, 7],
-            &[64, 64, 64, 64, 44],
-        ]
-    } else {
-        [
-            &[2048, 1024, 1024, 3],
-            &[2048, 2048, 3],
-            &[1, 2, 4091, 5],
-            &[1024, 1024, 1024, 1024, 3],
-        ]
-    };
+    let (cuts, _) = if quick() { CONV_CUTS_QUICK } else { CONV_CUTS };
     for cut in cuts {
         let plans: [Vec<(usize, Kernel)>; 4] = [
             cut.iter().map(|&r| (r, Kernel::Original)).collect(),

@@ -51,6 +51,31 @@ fn only_a_long_scan_under_a_set_switch_takes_the_narrow_block_kernel() {
     assert_eq!(scan_cols_for(Some(32), 2051), Some(32));
 }
 
+/// How the pieces tests cut a prompt (rows of each piece) and the prompt's total; the host test below checks that every cut
+/// adds up, so a wrong cut cannot panic inside a device test (a panic with the device context alive latches the CUDA backend
+/// and fails every test after it).
+const SCAN_CUTS: ([&[usize]; 3], usize) = (
+    [
+        &[1024, 300, 176],
+        &[1, 2, 1497],
+        &[512, 512, 452, 16, 1, 3, 4],
+    ],
+    1500,
+);
+const SCAN_CUTS_QUICK: ([&[usize]; 3], usize) = (
+    [&[200, 99, 1], &[1, 2, 297], &[100, 100, 64, 16, 1, 3, 16]],
+    300,
+);
+
+#[test]
+fn every_scan_piece_cut_adds_up_to_its_prompt() {
+    for (cuts, total) in [SCAN_CUTS, SCAN_CUTS_QUICK] {
+        for cut in cuts {
+            assert_eq!(cut.iter().sum::<usize>(), total, "{cut:?}");
+        }
+    }
+}
+
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -310,18 +335,14 @@ fn pieces_carry_the_state_across_launches_and_across_kernels() {
     let rig = Rig::new();
     let forms = [(GdnForm::QWEN36_GGUF, 32usize), (GdnForm::FLASH_NEXT, 48)];
     for &(form, n_v) in &forms {
-        let total = if quick() { 300 } else { 1500 };
+        let total = if quick() {
+            SCAN_CUTS_QUICK.1
+        } else {
+            SCAN_CUTS.1
+        };
         let c = case(16, n_v, total, form, 0x5c03_0000 + n_v as u64);
         let want = run_pieces(&rig, &c, &[(c.m, None)]);
-        let cuts: [&[usize]; 3] = if quick() {
-            [&[200, 99, 1], &[1, 2, 297], &[100, 100, 64, 16, 1, 3, 16]]
-        } else {
-            [
-                &[1024, 300, 176],
-                &[1, 2, 1497],
-                &[512, 512, 512, 16, 1, 3, 4],
-            ]
-        };
+        let (cuts, _) = if quick() { SCAN_CUTS_QUICK } else { SCAN_CUTS };
         for cut in cuts {
             let plans: [Vec<(usize, Option<usize>)>; 4] = [
                 cut.iter().map(|&r| (r, None)).collect(),
