@@ -74,6 +74,8 @@ pub(crate) struct CardSession {
     context_limit: usize,
     fed: usize,
     poisoned: bool,
+    /// Experimental: prompt-only feeds need state, not the vocabulary row.
+    skip_prefill_head: bool,
     eos: Arc<[u32]>,
     sampler_vocab: usize,
 }
@@ -240,6 +242,8 @@ impl CardSession {
             context_limit,
             fed: 0,
             poisoned: false,
+            skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
+                .is_some_and(|value| value == "1"),
             eos,
             sampler_vocab,
         })
@@ -247,6 +251,11 @@ impl CardSession {
 
     pub(crate) fn context_limit(&self) -> usize {
         self.context_limit
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_skip_prefill_head_for_test(&mut self, enabled: bool) {
+        self.skip_prefill_head = enabled;
     }
 
     /// The one launch path of a token: run the whole distributed step, fold
@@ -303,6 +312,7 @@ impl CardSession {
             &self.heads,
             self.eps,
             self.fed,
+            read_logits || !self.skip_prefill_head,
         )?;
         // The read-back: every stream joined, then every status word folded
         // BEFORE anything is handed out.
