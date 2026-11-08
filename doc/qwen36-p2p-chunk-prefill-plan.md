@@ -44,6 +44,23 @@ indices. The P2P layout can use asymmetric head ranges while replicating key
 heads, so the scan needs checked global offsets and valid shapes before such
 a shard can use it.
 
+## Performance accounting
+
+Batching can reduce the number of launches and synchronization points per
+token, and can reuse weights across rows. It does not by itself reduce the
+payload bytes per token: a full-width f32 row still contributes 2,048 values
+for each token. For example, a 2,048-row, full-width f32 sum carries 16 MiB
+of values, before transport overhead. At the current 4 MiB payload limit, a
+contiguous sum of that size needs at least four tiles. A fused buffer holding
+eight routed outputs and one shared output at the same shape contains 144 MiB
+and needs at least 36 such tiles. These are payload sizes, not total mailbox
+allocations or measured PCIe traffic.
+
+Treat projected throughput as a hypothesis until the complete card path is
+implemented and measured against the same binary and configuration. The
+experimental card-prefix path also still needs physical-peer and full-model
+qualification; a prefill path tag alone does not establish restore parity.
+
 ## Verification gates
 
 - CPU: chunk sizes and tails, overflow and mailbox tiling, disjoint scratch
