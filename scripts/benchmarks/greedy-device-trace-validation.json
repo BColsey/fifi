@@ -21,6 +21,10 @@
     {
       "command": "cargo fmt --all -- --check; git diff --check",
       "result": "passed"
+    },
+    {
+      "command": "cargo clippy --locked --release --lib --features native-cuda -- -D warnings",
+      "result": "passed"
     }
   ],
   "preliminary_reproduction": {
@@ -35,5 +39,15 @@
   "limits": [
     "The compiled candidate has not yet been exercised on a GPU or deployed.",
     "The sampler unit checks do not substitute for an end-to-end test of the CUDA argmax path."
-  ]
+  ],
+  "repeatable_baseline": {
+    "model": "fifi-q36-2080ti",
+    "client_api_key": "none",
+    "completion_tokens": 20,
+    "finish_reason": "length",
+    "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+    "captured_positions": 0,
+    "prompt": "Write the numbers one to ten, one per line.",
+    "recorded_utc": "2026-11-08T19:49:00.868926+00:00"
+  }
 }
