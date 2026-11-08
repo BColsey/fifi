@@ -50,6 +50,20 @@ multi-block rework of the ring's payload kernels (grid-strided copies,
 addresses exactly this; the probe re-run after it is the acceptance
 number. PCIe 3.0 x4-ish effective ceiling would put 2.1 MB at ~0.3 ms.
 
+## Keystone finding (card_views_construct_chunk_models)
+
+The card session's per-card views construct ChunkModel under the CARD
+geometry for every mixer, attention and DeltaNet role - the stage
+functions are reusable unchanged. The ONE refusal is the MoE expert
+stacks: `check_model` wants the full 131072-row stack, each card holds
+its 65536-row slice. So the card chunk driver needs exactly one
+purpose-built stage - `chunk_moe` over the card's expert slice (the
+mmq_mmid grouped GEMM behind a per-card pick guard: a row's top-8 picks
+scatter across both cards, each card computes the picks it owns and the
+multi-row MoeSum exchange combines them) - plus the driver loop itself.
+MoeLayerWeights/StackWeights/ExpertStack are now Clone+Copy so a
+[card][layer] transpose of the session's views exists.
+
 ## The build, in stages
 
 1. **Card chunk geometry** (`StepDims`/`StepPlan`): a `rows`-wide card
