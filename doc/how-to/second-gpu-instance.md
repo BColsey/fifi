@@ -2,9 +2,9 @@
 
 This guide shows how to run a second, independent `enginesrv` on a spare GPU
 next to an existing deployment (for example a two-card P2P pair), and how to
-serve both models through one LAN web GUI. Everything below was deployed and
-measured on 2026-11-08 on ben-X570 (P2P pair: RTX 3080 + RTX 3060, second
-instance: RTX 2080 Ti 11 GB, Qwen3.6-35B-A3B Q4_K_M GGUF).
+serve both models through one LAN web GUI. The example host has an RTX 3080
+and RTX 3060 P2P pair plus an RTX 2080 Ti 11 GB, serving Qwen3.6-35B-A3B
+Q4_K_M GGUF. The observations below are limited to that host.
 
 ## Why a second instance, not a third ring member
 
@@ -14,10 +14,8 @@ device set at all: `check_peer_facts` refuses mixed compute capabilities
 geometry refuses 3 cards at Q4_K_M: the 16 attention query heads form exactly
 two 8-per-KV-head decode groups, and the expert down projection's K width of
 512 is exactly two Q4_K superblocks, so any 3-way cut splits a quant block
-(`engine/src/family/qwen36/cuda/shard.rs`). A card behind a chipset link is
-also strictly worse than host RAM for expert traffic. A second process is the
-only shape that works — and it is fully independent: separate KV cache,
-separate sessions, separate failure domain.
+(`engine/src/family/qwen36/cuda/shard.rs`). A second process can use the spare
+card independently, with a separate KV cache, sessions and failure domain.
 
 ## Build
 
@@ -67,30 +65,27 @@ becomes ready in seconds).
 ```
 
 Give the engine a distinct `model` id (not the primary's `fifi-q36`) so a
-merged endpoint can route by model name. Measured on the 2080 Ti at the
-262144/q8 shape: 9.7 of 11.3 GB VRAM (~1.5 GB margin), ready in 7 s with a
-warm page cache, ~26 tok/s decode on short contexts (f32 KV measured ~16).
+merged endpoint can route by model name. The 2080 Ti was also observed to
+load a 262144-position q8 configuration with 64 tiered slots per layer. These
+settings are host-specific and do not prove that every prompt of that length
+will complete.
 
 Two engine-level facts to know before tuning further:
 
-- **`kv_dtype: "q8"` over `"f32"` is a large win** — 4x smaller KV and a
-  cheaper attention path; it is what makes 256k context fit an 11 GB card.
+- **`kv_dtype: "q8"` uses less KV memory than `"f32"`**. Its exact footprint
+  and performance depend on the layout, context and device.
 - **`kv_offload_host_bytes` (host-pinned KV spill) is refused with tiered
   experts** — the two are mutually exclusive, and tiered is what fits the
-  model, so the spill knob is unusable in this shape. 256k fits in VRAM at
-  q8 anyway.
+  model, so the spill knob is unavailable in this shape.
 
 ## Prefill is per-token in tiered mode
 
 The chunked prefill path requires non-tiered q8 with fixed admission and
 context staging; tiered mode forces per-token feeding (the P2P pair is
 per-token for its own reason — multi-device also refuses chunked prefill).
-Measured on the 2080 Ti, per-token prefill still out-runs the pair: 45 tok/s
-at ~3k prompt tokens rising to 64 tok/s at ~22k, versus the pair's flat
-39 tok/s. The very first prompt after a restart can be much slower (~8 tok/s
-at first touch) while the tiered banks fault cold experts into the page
-cache. Budget ~16 s per 1000 tokens for large pastes; continued chats on the
-same conversation only feed new turns.
+First-touch weight loading, host contention and prefix reuse can affect
+timings. A continued chat does not automatically avoid reprocessing earlier
+tokens: prefix reuse must be enabled and validated for the selected engine.
 
 ## One LAN GUI, both models
 
@@ -102,7 +97,12 @@ its `model` field, injecting the matching backend's API key. Point the proxy
 at it with the existing env hook (`export FIFI_BACKEND=http://127.0.0.1:18795`
 in `start-web.sh`) and add `Wants=`/`After=` on the router unit. Requests
 without a model field (monitor panels, `/v1/system`) report the primary
-engine by design.
+engine by design. List the desired primary model first for new browser
+sessions; an existing browser keeps its saved model selection. A request with
+**Trace sampling alternatives** enabled also requires top-level
+`"sample_trace": true` on the selected engine. With this router, trace lookups
+without a model route to the primary, so use the primary for tracing until
+secondary trace routing is supported.
 
 ## GPU test coordination
 
@@ -122,20 +122,27 @@ A permanently resident process on the spare GPU breaks any machine-wide
   ledger; measurement lanes that need a PCIe-quiet window stop the second
   instance for the window (stop → lease → test → restore, as before).
 
-Measured interference: the primary pair decoded 46.7 tok/s alone vs 44.5
-tok/s while the second instance generated full-rate concurrently (~5%
-worst case, ~0 when idle-resident).
+Concurrent use can change the primary pair's performance. Measure any
+interference with matched workloads and retained telemetry rather than
+assuming a fixed penalty.
 
-## Measured summary (2026-11-08, short contexts unless noted)
+## Example server observations
 
-| engine | prompt_t | prefill | decode | notes |
-|---|---:|---:|---:|---|
-| P2P pair (3080+3060) | 747 | 39 tok/s | 35 tok/s | warm-prefix TTFT 0.26 s |
-| 2080 Ti 64-slot, threads 6, 256k | 22,447 | 64 tok/s | 45 tok/s | |
-| 2080 Ti 64-slot, threads 8, 256k | 15,762 | 62 tok/s | 48-50 tok/s | |
-| 2080 Ti 85-slot, threads 8, preload, 131k | 22,447 | 75 tok/s | 50-53 tok/s | no first-touch crawl |
+The following are single observations on the 2080 Ti, not an A/B test. The
+first rate divides prompt tokens by the server's time to first token for a
+one-token request; it includes work beyond prefill. Decode is the server's
+token-based rate for a separate 36-token streamed response. All six requests
+reported zero reused tokens.
 
-Measured 2026-11-08, temperature 0, one run per point; see
-`scripts/bench_engines.py` to reproduce. The second instance is
-competitive-with-or-faster than the pair at matched context — the 5%
-interference figure above was measured on short-context decode.
+| Tiered slots / threads | Configured context | Prompt tokens | Prompt / first-token time | Server decode |
+|---|---:|---:|---:|---:|
+| 64 / 6 | 262,144 | 22,447 | 64.16 tokens/s | 44.94 tokens/s |
+| 64 / 8 | 262,144 | 15,762 | 62.38 tokens/s | 48.28 tokens/s |
+| 85 / 8 | 131,072 | 22,447 | 75.50 tokens/s | 50.17 tokens/s |
+
+The [server observation record](../../scripts/benchmarks/second-gpu-server-observations.json)
+contains the selected journal fields and startup lines. The journal does not
+establish binary hashes, exclusive host resources or complete answer
+correctness. The older benchmark driver counted nonempty stream chunks rather
+than tokens; discard its decode figures. The corrected driver in
+`scripts/bench_engines.py` uses matched server telemetry when available.

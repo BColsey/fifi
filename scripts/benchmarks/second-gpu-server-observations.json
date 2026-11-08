@@ -1,0 +1,135 @@
+{
+  "schema": "fifi.second-gpu-server-observations.v1",
+  "source": "Local systemd journal for fifi-qwen36-2080ti.service; startup lines and allowlisted request fields.",
+  "hardware": "RTX 2080 Ti, Qwen3.6-35B-A3B Q4_K_M, q8 KV",
+  "process_settings": {
+    "773577": {
+      "slots": 64,
+      "threads": 6,
+      "context": 262144,
+      "startup_log": [
+        "q36 cuda: tiered, 64 slots per layer, 6 cpu threads, timeout 10000 ms",
+        "q36 cuda: gguf weights resident (2571108352 B), free after load 8604090368 B, context_limit 262144, kv int8g32, capture off"
+      ]
+    },
+    "806422": {
+      "slots": 64,
+      "threads": 8,
+      "context": 262144,
+      "startup_log": [
+        "q36 cuda: tiered, 64 slots per layer, 8 cpu threads, timeout 10000 ms",
+        "q36 cuda: gguf weights resident (2571108352 B), free after load 8604090368 B, context_limit 262144, kv int8g32, capture off"
+      ]
+    },
+    "830058": {
+      "slots": 85,
+      "threads": 8,
+      "context": 131072,
+      "startup_log": [
+        "q36 cuda: tiered, 85 slots per layer, 8 cpu threads, timeout 10000 ms",
+        "q36 cuda: gguf weights resident (2571108352 B), free after load 8604090368 B, context_limit 131072, kv int8g32, capture off"
+      ]
+    }
+  },
+  "requests": [
+    {
+      "request_id": "chatcmpl-000000000000000b",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": false,
+      "prompt_tokens": 22447,
+      "completion_tokens": 1,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 349865.4,
+      "decode_tokens_per_second": null,
+      "finish_reason": "length",
+      "time_utc": "2026-11-08T15:41:29+00:00",
+      "process_id": 773577,
+      "prompt_tokens_per_first_token_second": 64.16
+    },
+    {
+      "request_id": "chatcmpl-000000000000000c",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": true,
+      "prompt_tokens": 22447,
+      "completion_tokens": 36,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 356655.8,
+      "decode_tokens_per_second": 44.94,
+      "finish_reason": "stop",
+      "time_utc": "2026-11-08T15:47:27+00:00",
+      "process_id": 773577
+    },
+    {
+      "request_id": "chatcmpl-0000000000000003",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": false,
+      "prompt_tokens": 15762,
+      "completion_tokens": 1,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 252693.1,
+      "decode_tokens_per_second": null,
+      "finish_reason": "length",
+      "time_utc": "2026-11-08T16:00:15+00:00",
+      "process_id": 806422,
+      "prompt_tokens_per_first_token_second": 62.38
+    },
+    {
+      "request_id": "chatcmpl-0000000000000004",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": true,
+      "prompt_tokens": 15762,
+      "completion_tokens": 36,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 249452.3,
+      "decode_tokens_per_second": 48.28,
+      "finish_reason": "stop",
+      "time_utc": "2026-11-08T16:04:25+00:00",
+      "process_id": 806422
+    },
+    {
+      "request_id": "chatcmpl-0000000000000003",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": false,
+      "prompt_tokens": 22447,
+      "completion_tokens": 1,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 297294.4,
+      "decode_tokens_per_second": null,
+      "finish_reason": "length",
+      "time_utc": "2026-11-08T16:24:22+00:00",
+      "process_id": 830058,
+      "prompt_tokens_per_first_token_second": 75.5
+    },
+    {
+      "request_id": "chatcmpl-0000000000000004",
+      "model": "fifi-q36-2080ti",
+      "status": 200,
+      "outcome": "ok",
+      "stream": true,
+      "prompt_tokens": 22447,
+      "completion_tokens": 36,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 306400.5,
+      "decode_tokens_per_second": 50.17,
+      "finish_reason": "stop",
+      "time_utc": "2026-11-08T16:29:30+00:00",
+      "process_id": 830058
+    }
+  ],
+  "limitations": [
+    "One non-streaming and one streaming sample per configuration; no controlled A/B and different prompt sizes and contexts.",
+    "Prompt tokens divided by server time to first token is an estimate including work outside pure prefill; it is not client wall time.",
+    "Decode rates are reported by the server from token counts, not calculated from streaming chunks.",
+    "The journal does not prove complete answer correctness, binary hashes, exclusive host resources or causal speed gains."
+  ]
+}
