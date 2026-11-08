@@ -797,8 +797,35 @@ mod device_tests {
         {
             return;
         }
+        let (contexts, streams, ring) = two_context_ring(2049);
+        assert_large_f32_exchange_clears_overflow(contexts, streams, ring);
+    }
+
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused() {
+        const NAME: &str = "physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused";
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, 2049).expect("ring");
+        assert_large_f32_exchange_clears_overflow(contexts, streams, ring);
+    }
+
+    fn assert_large_f32_exchange_clears_overflow(
+        contexts: [CudaContext; 2],
+        streams: [DeviceStream; 2],
+        ring: PeerRing,
+    ) {
         const N: usize = 2049;
-        let (contexts, streams, ring) = two_context_ring(N);
         let a = vec![1.5f32; N];
         let b = vec![2.25f32; N];
         let mut overflow = b.clone();
