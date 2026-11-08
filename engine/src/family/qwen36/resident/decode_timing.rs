@@ -1171,6 +1171,9 @@ fn speculative_decode_timing() {
         CONFIG_SHA256,
         "config.json differs from the pinned checkpoint"
     );
+    // `Q36Executor::from_parts` holds the checkpoint for the engine's life (`&'static`), so the
+    // timing run leaks the opened checkpoint for the same span.
+    let real = Box::leak(Box::new(real));
     let mut kernels = MlxKernels::try_new().unwrap();
     kernels.set_cache_limit(CACHE_LIMIT).unwrap();
     let host = HostWeights::load(&real.ckpt, &QWEN3_6_35B_A3B, &real.config).unwrap();
