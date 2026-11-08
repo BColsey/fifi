@@ -1,0 +1,89 @@
+{
+  "recorded_at_utc": "2026-11-08T21:41:09Z",
+  "suite": "ring",
+  "source_commit": "ab6548806c0c904ecc39040ff124ac9a38ff32ea",
+  "binary_sha256": "d06a29a0acb96dbecab4f1d89266fc8f358d6f681de8cf7a8dd042b55362608d",
+  "platform": {
+    "gpu_pair": [
+      "NVIDIA GeForce RTX 3080 10 GB",
+      "NVIDIA GeForce RTX 3060 12 GB"
+    ],
+    "other_gpu": "NVIDIA GeForce RTX 2080 Ti, serving but idle in samples",
+    "nvidia_driver": "615.78.08",
+    "cuda_arch": "sm_86",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)"
+  },
+  "build": {
+    "command": "cargo test --locked --release --lib --features native-cuda --no-run",
+    "cargo_build_jobs": 2
+  },
+  "execution": {
+    "shared_gpu_reservation": true,
+    "cuda_visible_pair_only": true,
+    "test_threads": 1,
+    "exact_names": true,
+    "device_required": true,
+    "primary_service_stopped_then_restored": true,
+    "samples_guarded": 5,
+    "guard_file": "p2p-ring-large-safety-validation-guard.jsonl"
+  },
+  "results": [
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.24s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.26s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": true,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.42s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": true,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.35s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word",
+      "multiblock_env": "1",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.26s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged",
+      "multiblock_env": "1",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.24s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization",
+      "multiblock_env": "1",
+      "ignored_test_explicitly_selected": true,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_chains_large_exchanges_without_host_synchronization ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.42s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused",
+      "multiblock_env": "1",
+      "ignored_test_explicitly_selected": true,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5794 filtered out; finished in 0.38s\n\n"
+    }
+  ],
+  "limits": [
+    "One physical host; device checks do not establish model output quality or end-to-end performance.",
+    "Guard observations are sampled at approximately one-second intervals, not continuous.",
+    "One run per flag per test; chained F32 sums do not cover every operation ordering, FP16 publication race or multi-host setup."
+  ],
+  "details": {
+    "large_timeout": "65,536-value F32 sum, F16 sum and F32 copy wait on an unpublished slot; checks timeout and unchanged output.",
+    "physical_chain": "16 back-to-back 524,288-value F32 sums with dependent inputs and no host synchronization until all are queued; every output value and both final status words checked."
+  }
+}
