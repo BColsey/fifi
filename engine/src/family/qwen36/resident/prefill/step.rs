@@ -475,12 +475,7 @@ fn run(
         if let Some(next) = next {
             outputs.push(next);
         }
-        if matches!(mode, StepMode::Logits | StepMode::Record) {
-            outputs.push(logits);
-        }
-    }
-    if let Some((logits, _)) = &head {
-        if mode == StepMode::Window {
+        if matches!(mode, StepMode::Logits | StepMode::Record | StepMode::Window) {
             outputs.push(logits);
         }
     }
