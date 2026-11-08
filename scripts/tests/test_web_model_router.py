@@ -29,6 +29,13 @@ class Backend(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/models":
             value = {"object": "list", "data": [{"id": self.server.model}]}
+        elif self.path.startswith("/v1/sampler-trace?"):
+            value = {
+                "backend": self.server.model,
+                "auth_ok": self.headers.get("authorization")
+                == "Bearer " + self.server.key,
+                "forwarded_model_header": self.headers.get("x-fifi-trace-model"),
+            }
         else:
             value = {
                 "backend": self.server.model,
@@ -119,8 +126,9 @@ class ModelRouterTests(unittest.TestCase):
             self.proc.terminate()
             self.proc.wait(timeout=5)
 
-    def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=4) as response:
+    def get(self, path, headers=None):
+        request = urllib.request.Request(self.base + path, headers=headers or {})
+        with urllib.request.urlopen(request, timeout=4) as response:
             return json.load(response)
 
     def post(self, model):
@@ -156,6 +164,19 @@ class ModelRouterTests(unittest.TestCase):
             [model["id"] for model in self.get("/v1/models")["data"]],
             ["fifi-q36", "fifi-q36-2080ti"],
         )
+
+    def test_trace_lookup_uses_the_reply_model_even_when_ids_collide(self):
+        path = "/v1/sampler-trace?id=shared-id"
+        for model in ("fifi-q36", "fifi-q36-2080ti"):
+            with self.subTest(model=model):
+                result = self.get(path, {"X-Fifi-Trace-Model": model})
+                self.assertEqual(result["backend"], model)
+                self.assertTrue(result["auth_ok"])
+                self.assertIsNone(result["forwarded_model_header"])
+        self.assertEqual(self.get(path)["backend"], "fifi-q36")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.get(path, {"X-Fifi-Trace-Model": "unknown-model"})
+        self.assertEqual(error.exception.code, 400)
 
     def test_model_list_fails_when_both_backends_are_unavailable(self):
         for backend in self.backends:

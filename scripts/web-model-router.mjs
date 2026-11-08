@@ -72,12 +72,17 @@ createServer((req, res) => {
   let url;
   try { url = new URL(req.url, 'http://x'); } catch { res.writeHead(400, { 'content-type': 'application/json' }); res.end('{"error":"bad request target"}'); return; }
   if (req.method === 'GET' && url.pathname === '/v1/models') { mergedModels(res); return; }
+  let traceBackend;
+  if (req.method === 'GET' && url.pathname === '/v1/sampler-trace' && 'x-fifi-trace-model' in req.headers) {
+    traceBackend = BACKENDS.find(b => b.model === req.headers['x-fifi-trace-model']);
+    if (!traceBackend) { res.writeHead(400, { 'content-type': 'application/json' }); res.end('{"error":"unknown trace model"}'); return; }
+  }
   readBody(req).then(body => {
     let model = '';
     if (body.length && (req.headers['content-type'] ?? '').includes('application/json')) {
       try { model = String(JSON.parse(body.toString())?.model ?? ''); } catch { /* route to default */ }
     }
-    forward(req, body, pick(model), res);
+    forward(req, body, traceBackend ?? pick(model), res);
   }).catch(e => {
     if (e.message === 'too large') { res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"error":"body too large"}'); res.once('finish', () => req.destroy()); }
   });
