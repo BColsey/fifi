@@ -716,7 +716,7 @@ impl<'c> ResidentDecoder<'c> {
             ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
             // The post-core closure warms on the attention core output dtype this cache form
             // produces: F32 over the F32 cache, BF16 over the BF16 cache, the activation
-            // dtype over the Q8 cache. The roped q output is a stand-in of exactly that
+            // dtype over the Q8 cache. The pre-closure q output is a stand-in of exactly that
             // shape; a wrong guess at most compiles the right key lazily at the first use.
             let att_dtype = match self.weights.kv {
                 KvDtype::F32 => Dtype::F32,

@@ -402,7 +402,7 @@ impl Context {
     /// epsilon, the activation dtype, and per packed weight the scale dtype and the quantization
     /// triple. They form the compile cache key (`compile_key::delta_fun_id`), so every layer with
     /// the same constants shares one compiled program, and the per-adapter registry admits the
-    /// key BEFORE any native call: a fifth distinct key of one adapter is `BadRequest`.
+    /// key BEFORE any native call: a sixth distinct key of one adapter is `BadRequest`.
     ///
     /// Dtype rules: the block output carries the activation dtype (the block ends in `to_act`);
     /// the recurrence state and the ring stay F32; the closure mirrors every cast of the
@@ -553,7 +553,7 @@ impl Context {
                 .map(|weight| compile_key::dtype_key(weight.scales().dtype())),
             quant: triples,
         });
-        // The per-adapter program registry decides before any native call: a fifth distinct key
+        // The per-adapter program registry decides before any native call: a sixth distinct key
         // of one adapter is a setting mistake, not a reason to grow the MLX compile cache.
         adapter.programs.admit(fun_id)?;
         let mut keep: Vec<_> = [args.x, args.rec, args.ring]
@@ -709,7 +709,7 @@ impl Context {
     /// flag, the clamp bound `experts - 1` (the ONE `mlx_minimum` clamp per layer), the activation
     /// dtype, and per packed weight the scale dtype and the quantization triple. They form the
     /// compile cache key (`compile_key::moe_fun_id`); the per-adapter registry admits it BEFORE
-    /// any native call, and a fifth distinct key of one adapter is `BadRequest`. B is not baked;
+    /// any native call, and a sixth distinct key of one adapter is `BadRequest`. B is not baked;
     /// the nonshapeless MLX cache specializes input shapes under the same key.
     ///
     /// Dtype rules: the block output carries the activation dtype (the final `to_act`); the

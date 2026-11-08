@@ -3058,7 +3058,7 @@ static int compile_delta_apply(
       );
 }
 
-// Compiles the attention pre-RoPE block under the fixed cache key `fun_id` (shapeless true
+// Compiles the attention pre-RoPE block under the fixed cache key `fun_id` (shape-specialized
 // over the fixed B=1 shapes, like the delta block) and applies it once; the outputs are lazy.
 // Defined after compile_apply_block, which it calls.
 extern "C" int inference_mlx_compile_attn_pre_block(
