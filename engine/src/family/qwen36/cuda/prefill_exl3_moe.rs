@@ -135,6 +135,24 @@ fn too_many() -> EngError {
     EngError::BadRequest("EXL3 moe chunk: the pair count exceeds i32".into())
 }
 
+/// Reads the picks of the chunk back, which waits for the stream.
+fn read_ids(
+    projector: &Projector<'_>,
+    ids: DeviceRange<'_>,
+    dims: &MoeDims,
+) -> Result<Vec<i32>, EngError> {
+    let pairs = dims.rows * dims.top_k;
+    let mut raw = vec![0u8; pairs * I32];
+    ids.buffer()
+        .read_at(projector.launch.stream, ids.offset(), &mut raw)?;
+    Ok(raw
+        .as_chunks::<I32>()
+        .0
+        .iter()
+        .map(|bytes| i32::from_le_bytes(*bytes))
+        .collect())
+}
+
 /// Reads the picks of the chunk back, which waits for the stream, and sorts them.
 fn read_plan(
     projector: &Projector<'_>,
@@ -142,16 +160,7 @@ fn read_plan(
     dims: &MoeDims,
     bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<PairPlan, EngError> {
-    let pairs = dims.rows * dims.top_k;
-    let mut raw = vec![0u8; pairs * I32];
-    ids.buffer()
-        .read_at(projector.launch.stream, ids.offset(), &mut raw)?;
-    let picks: Vec<i32> = raw
-        .as_chunks::<I32>()
-        .0
-        .iter()
-        .map(|bytes| i32::from_le_bytes(*bytes))
-        .collect();
+    let picks = read_ids(projector, ids, dims)?;
     // A banked block maps its picks through the layer's slot table before the sort: the
     // grouped launches then read the slot members of the bank region exactly as a resident
     // block reads its expert ids. A fault-marked id (-1) falls through to the sort's refusal.
@@ -416,8 +425,21 @@ fn routed_with(
     bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
     pair: bool,
 ) -> Result<bool, EngError> {
-    let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
     let plan = read_plan(projector, bufs.ids, dims, bank)?;
+    routed_plan(projector, weights, bufs, dims, plan, pair)
+}
+
+/// [`routed_with`] with the pair plan given: the caller has already read (and possibly
+/// mapped) the picks, so this stages only the sort lists and the projections.
+fn routed_plan(
+    projector: &Projector<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Bufs<'_>,
+    dims: &MoeDims,
+    plan: PairPlan,
+    pair: bool,
+) -> Result<bool, EngError> {
+    let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
     let jobs = plan_jobs(&plan.counts);
     write_lists(projector, bufs.perm, (&plan, &jobs))?;
     super::split::mark(projector.launch.stream, "ids read and sort");
@@ -577,9 +599,34 @@ pub(super) fn run_banked(
 ) -> Result<(), EngError> {
     shared(projector, weights, bufs, dims)?;
     super::split::mark(projector.launch.stream, "shared expert");
+    // One readback for the whole chunk: each sub-block's mapping then runs host-side from
+    // the picks already in hand, and only its mapped slot ids return to the device — the
+    // per-sub-block readback, a blocking drain of the stream, is gone. The mapping stays
+    // per sub-block: one sub-block's picks fit the slots together, a whole chunk's need not.
+    let picks = read_ids(projector, bufs.ids, dims)?;
+    let pair = projector.launch.ctx.exl3_jobs_pair_enabled()?;
+    let k = dims.top_k;
     for &(r0, ref sub_dims) in sub {
+        let raw = &picks[r0 * k..r0 * k + sub_dims.rows * k];
         let sub_bufs = slice_at(bufs, dims, sub_dims, r0)?;
-        routed(projector, weights, &sub_bufs, sub_dims, Some(bank))?;
+        let plan = if raw.iter().any(|&id| id < 0) {
+            // A fault-marked pick reaches the sort's refusal, as on the eager path.
+            plan_pairs(raw, dims.n_expert, k)?
+        } else {
+            let wanted = raw.iter().map(|&id| id as usize).collect::<Vec<_>>();
+            let mapped = bank.resolve(projector.launch.ctx, &wanted)?;
+            let bytes: Vec<u8> = mapped
+                .iter()
+                .flat_map(|&slot| (slot as i32).to_le_bytes())
+                .collect();
+            sub_bufs
+                .ids
+                .buffer()
+                .write_at(projector.launch.stream, sub_bufs.ids.offset(), &bytes)?;
+            let slots: Vec<i32> = mapped.iter().map(|&slot| slot as i32).collect();
+            plan_pairs(&slots, dims.n_expert, k)?
+        };
+        routed_plan(projector, weights, &sub_bufs, sub_dims, plan, pair)?;
         combine(projector, &sub_bufs, sub_dims)?;
     }
     super::split::mark(projector.launch.stream, "combine");
