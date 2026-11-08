@@ -579,7 +579,9 @@ pub(super) fn step(
     let (o, cache) = step_projected(ctx, shape, w, cache, pos, [&qp, &kp, &vp])?;
     let mixed = linear(ctx, &w.o, &o)?;
     // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
-    let out = ctx.kernels.binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
+    let out = ctx
+        .kernels
+        .binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(AttnStep { out, cache })
 }
 
@@ -1068,8 +1070,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let t = n as usize + 1;
             // The cache arithmetic: one growth every three positions.
             let want_cap = [3, 3, 3, 6, 6, 6, 9, 9, 9][n as usize];
@@ -1213,7 +1224,15 @@ mod tests {
         };
         // The cache error must precede even the projection's bad input-width error.
         let short = upload(ctx.kernels, &[0.0]);
-        let wrong_len = step(&mut ctx, &shape, rw, KvCache::empty(), 3, &short);
+        let wrong_len = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::empty(),
+            3,
+            &short,
+            &w.layers[1].input_norm,
+        );
         assert!(
             matches!(&wrong_len, Err(EngError::BadRequest(m)) if m.contains("cache holds 0 positions")),
             "{:?}",
@@ -1235,7 +1254,7 @@ mod tests {
             cap: 1,
             step: 3,
         };
-        let wrong_shape = step(&mut ctx, &shape, rw, bad, 1, &xr);
+        let wrong_shape = step(&mut ctx, &shape, rw, bad, 1, &xr, &w.layers[1].input_norm);
         assert!(
             matches!(&wrong_shape, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "{:?}",
@@ -1259,7 +1278,7 @@ mod tests {
             cap: 1,
             step: 3,
         };
-        let wrong_cap = step(&mut ctx, &shape, rw, bad, 2, &xr);
+        let wrong_cap = step(&mut ctx, &shape, rw, bad, 2, &xr, &w.layers[1].input_norm);
         assert!(
             matches!(&wrong_cap, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "{:?}",
@@ -1333,7 +1352,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let first = step(&mut ctx, &shape, rw, KvCache::with_step(65_536), 0, &warm).unwrap();
+        let first = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::with_step(65_536),
+            0,
+            &warm,
+            &w.layers[1].input_norm,
+        )
+        .unwrap();
         let (first_k, first_v) = f32_pair(&first.cache);
         kernels.evaluate(&[&first.out, first_k, first_v]).unwrap();
         let mut cache = first.cache;
@@ -1346,7 +1374,7 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             if n % 8 == 7 {
                 let (k_buf, v_buf) = f32_pair(&next.cache);
                 kernels.evaluate(&[&next.out, k_buf, v_buf]).unwrap();
@@ -1439,7 +1467,7 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             if n % 8 == 7 {
                 let mut parts = vec![&next.out];
                 parts.extend(next.cache.tensors());
@@ -1616,8 +1644,28 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
-            q8_cache = step(&mut ctx, &shape, rw, q8_cache, n, &xr).unwrap().cache;
+            f32_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                f32_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
+            q8_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                q8_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
         }
         let mut swapped_keys = q8_cache.share();
         let Some(KvBuffers::Q8 { k, .. }) = swapped_keys.buffers.as_mut() else {
@@ -1637,7 +1685,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let out = step(&mut ctx, &shape, rw, cache, 7, &last).unwrap().out;
+            let out = step(
+                &mut ctx,
+                &shape,
+                rw,
+                cache,
+                7,
+                &last,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .out;
             outputs.push(values(&mut kernels, &out).unwrap());
         }
         let gap = |a: &[f32], b: &[f32]| {
@@ -1754,7 +1812,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
             let logical = kv_plan::logical_bytes(cache.len, growth).unwrap();
             assert_eq!(
                 cache.byte_len(),
@@ -1808,7 +1868,15 @@ mod tests {
         .unwrap();
         let mut f32_as_q8 = control.cache;
         f32_as_q8.kv = KvDtype::Q8;
-        let refused = step(&mut ctx, &shape, rw, f32_as_q8, 1, &xr);
+        let refused = step(
+            &mut ctx,
+            &shape,
+            rw,
+            f32_as_q8,
+            1,
+            &xr,
+            &w.layers[1].input_norm,
+        );
         assert!(
             matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "F32 buffers under a cache that declares the Q8 form: {:?}",
@@ -1850,7 +1918,16 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n as u32, xr).unwrap();
+            let next = step(
+                &mut ctx,
+                &shape,
+                rw,
+                cache,
+                n as u32,
+                xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 kernels.qualification_sync_count(),
                 before,
@@ -1884,7 +1961,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let next = step(&mut ctx, &shape, rw, KvCache::empty(), 0, &xr).unwrap();
+        let next = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::empty(),
+            0,
+            &xr,
+            &w.layers[1].input_norm,
+        )
+        .unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),
             before,

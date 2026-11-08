@@ -361,10 +361,7 @@ pub(super) fn moe_step_device(
     let m = &shape.moe;
     let (hidden, experts) = (dim(shape.hidden)?, dim(m.experts)?);
     let supported_rows = matches!(x.shape(), &[1 | 2 | 4 | 8, width] if width == hidden);
-    if !supported_rows
-        || w.router_t.shape() != [hidden, experts]
-        || post_norm.shape() != [hidden]
-    {
+    if !supported_rows || w.router_t.shape() != [hidden, experts] || post_norm.shape() != [hidden] {
         return Err(EngError::BadRequest(
             "compile seam inputs differ from the moe block shapes".into(),
         ));

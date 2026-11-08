@@ -73,7 +73,9 @@ pub(super) fn step(
     let (o, rec_next, ring_next) = step_projected(ctx, shape, w, rec, ring, [&u, &z, &bb, &aa])?;
     let mixed = linear(ctx, &w.out, &o)?;
     // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
-    let out = ctx.kernels.binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
+    let out = ctx
+        .kernels
+        .binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(DeltaStep {
         out,
         rec: rec_next,
@@ -329,7 +331,16 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, &rec, &ring, &xr).unwrap();
+            let next = step(
+                &mut ctx,
+                &shape,
+                rw,
+                &rec,
+                &ring,
+                &xr,
+                &w.layers[0].input_norm,
+            )
+            .unwrap();
             assert_eq!(next.out.shape(), [1, 64], "step {n} output shape");
             assert_eq!(next.rec.shape(), rec.shape(), "step {n} rec shape");
             assert_eq!(next.ring.shape(), ring.shape(), "step {n} ring shape");
@@ -384,13 +395,29 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let bad_rec = step(&mut ctx, &shape, rw, &flat_rec, &ring, &x);
+        let bad_rec = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &flat_rec,
+            &ring,
+            &x,
+            &w.layers[0].input_norm,
+        );
         assert!(
             matches!(&bad_rec, Err(EngError::BadRequest(m)) if m.contains("delta rec shape")),
             "{:?}",
             bad_rec.as_ref().err()
         );
-        let bad_ring = step(&mut ctx, &shape, rw, &rec, &short_ring, &x);
+        let bad_ring = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &rec,
+            &short_ring,
+            &x,
+            &w.layers[0].input_norm,
+        );
         assert!(
             matches!(&bad_ring, Err(EngError::BadRequest(m)) if m.contains("delta ring shape")),
             "{:?}",
@@ -417,7 +444,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let next = step(&mut ctx, &shape, rw, &rec, &ring, &x).unwrap();
+        let next = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &rec,
+            &ring,
+            &x,
+            &w.layers[0].input_norm,
+        )
+        .unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),
             before,

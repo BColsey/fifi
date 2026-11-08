@@ -499,7 +499,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         let x = rows(&mut kernels, warm, count);
         let mut ctx = Ctx {
@@ -603,8 +605,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -646,8 +657,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,
@@ -712,8 +732,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -779,8 +808,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,
@@ -886,7 +924,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         cache
     }
@@ -949,7 +989,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         cache
     }
@@ -1149,7 +1191,7 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             cache = next.cache;
             stepped.extend(values(&mut kernels, &next.out).unwrap());
         }
@@ -1163,7 +1205,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
+            f32_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                f32_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
         }
         let x = upload(&mut kernels, vec![count, 64], &data);
         let mut ctx = Ctx {

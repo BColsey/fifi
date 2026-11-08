@@ -560,8 +560,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let (out, (routes, probs)) =
-                step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+            let (out, (routes, probs)) = step(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap();
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
             let experts: Vec<u32> = routes.iter().map(|r| r.0).collect();
             assert_eq!(experts, LAYER0_ROUTES[n as usize], "input {n} experts");
@@ -598,7 +604,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (_, (_, probs)) = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (_, (_, probs)) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_parity(&probs, &want, "router probabilities of input 2");
     }
 
@@ -615,8 +628,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (_, (routes, probs)) =
-            step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (_, (routes, probs)) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(routes, [(0, 0.5), (1, 0.5)]);
         assert_eq!(probs, [0.25; 4]);
     }
@@ -634,7 +653,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         assert!(
             matches!(
                 failed,
@@ -653,7 +678,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        assert!(step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &good).is_ok());
+        assert!(
+            step(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &good,
+                &w.layers[0].post_norm
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -668,7 +702,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         assert!(
             matches!(failed, Err(EngError::BadRequest(_))),
             "{:?}",
@@ -682,7 +722,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         match failed {
             Err(EngError::BadRequest(message)) => assert!(
                 message.contains("moe router has 8 values, expected 4"),
@@ -705,7 +751,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (out, _) = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (out, _) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(kernels.qualification_sync_count(), before + 2);
         drop(out);
     }
@@ -914,7 +967,14 @@ mod tests {
                     consts: &w.consts,
                     compile: false,
                 };
-                step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+                step_device(
+                    &mut ctx,
+                    &shape,
+                    w.layers[0].as_moe().unwrap(),
+                    &xr,
+                    &w.layers[0].post_norm,
+                )
+                .unwrap()
             };
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
             assert_eq!(
@@ -948,7 +1008,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         assert_eq!(read_u32(&mut kernels, route.ids.ids()), [0, 1]);
         assert_eq!(values(&mut kernels, &route.gates).unwrap(), [0.5, 0.5]);
@@ -968,7 +1035,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         let health = values(&mut kernels, &route.health).unwrap()[0];
         assert!(health.is_nan(), "health {health}");
@@ -980,7 +1054,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &good).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &good,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         let health = values(&mut kernels, &route.health).unwrap()[0];
         assert!((health - 1.0).abs() <= 1e-5, "health {health}");
@@ -1023,8 +1104,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (out, route) =
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (out, route) = step_device(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(kernels.qualification_sync_count(), before);
         drop((out, route));
     }

@@ -932,6 +932,7 @@ mod tests {
             top_k: 8,
             renorm: 1,
             clamp: 255,
+            eps_bits: 1.0e-6f32.to_bits(),
             act: d.act,
             scale_keys: [d.scale_keys[0], 1, 1, 1, 1, 1],
             quant: [d.quant[0]; 6],

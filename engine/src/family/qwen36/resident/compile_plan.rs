@@ -274,6 +274,7 @@ mod tests {
             clamp: 255,
             act: dtype_key(Dtype::F32),
             weights: [affine(bits); 6],
+            eps_bits: 1e-6f32.to_bits(),
         }
     }
 

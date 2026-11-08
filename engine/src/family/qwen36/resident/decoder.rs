@@ -714,18 +714,17 @@ impl<'c> ResidentDecoder<'c> {
             }
         }
         for (layer, _id) in &plan.attn {
-            let layer_ref = self
-                .weights
-                .layers
-                .get(*layer)
-                .ok_or_else(|| EngError::BadRequest("the compile warm-up layer is missing".into()))?;
+            let layer_ref = self.weights.layers.get(*layer).ok_or_else(|| {
+                EngError::BadRequest("the compile warm-up layer is missing".into())
+            })?;
             let RMixer::Attn(w) = &layer_ref.mixer else {
                 return Err(EngError::BadRequest(
                     "the compile warm-up found no attention layer".into(),
                 ));
             };
             let started = std::time::Instant::now();
-            let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x, &layer_ref.input_norm)?;
+            let got =
+                super::compiled::attn_pre_step(&mut ctx, &shape, w, &x, &layer_ref.input_norm)?;
             ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
             // The post-core closure warms on the attention core output dtype this cache form
             // produces: F32 over the F32 cache, BF16 over the BF16 cache, the activation
@@ -748,8 +747,7 @@ impl<'c> ResidentDecoder<'c> {
         for layer in &self.weights.layers {
             if let RFeedForward::Dense(w) = &layer.feed_forward {
                 // Warm the primitives only. A compiled dense seam is a later optimization.
-                let out =
-                    super::moe::dense_rows(&mut ctx, &shape, w, &x, &layer.post_norm)?;
+                let out = super::moe::dense_rows(&mut ctx, &shape, w, &x, &layer.post_norm)?;
                 ctx.kernels.evaluate(&[&out])?;
             }
         }
