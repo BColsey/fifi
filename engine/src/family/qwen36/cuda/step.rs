@@ -1755,10 +1755,7 @@ impl<'a> QwenResidentStep<'a> {
         want_logits: bool,
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
-        let ran = self.run_token_inner(token, want_logits, want_shortlist);
-        if ran.is_err() {
-            self.abort_tiered_token();
-        } else if let Some(bank) = self.exl3_bank {
+        if let Some(bank) = self.exl3_bank {
             // The banked session's pulse: one line every 256 tokens, the cumulative hit/miss
             // counts that explain its speed (a miss is a host-store refill).
             self.banked_echo += 1;
@@ -1769,6 +1766,10 @@ impl<'a> QwenResidentStep<'a> {
                     self.banked_echo
                 );
             }
+        }
+        let ran = self.run_token_inner(token, want_logits, want_shortlist);
+        if ran.is_err() {
+            self.abort_tiered_token();
         }
         ran
     }

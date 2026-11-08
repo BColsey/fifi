@@ -1314,7 +1314,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
     /// Attaches the EXL3 banked resolver: each layer's moe stage then reads its picks back,
     /// maps them through the layer's slot table (refilling missed slots from the host store)
-    /// and rewrites the id buffer to slot indices before the gather. `None` on resident loads.
+    /// and groups the launches on slot ids. `None` on resident loads.
     pub(super) fn with_bank(
         mut self,
         bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,

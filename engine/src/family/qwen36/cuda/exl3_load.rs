@@ -151,6 +151,18 @@ pub(super) fn load_exl3_dir_decided(
         reserve,
         host,
     )?;
+    // A bank smaller than one token's picks cannot hold them together: the resolver would
+    // refuse every decode token and every prefill sub-block after a successful boot. Refuse
+    // at load, where the operator still sees the memory figure that produced the count.
+    if let Some(admission) = &decision
+        && admission.slots < shape.moe.top_k
+    {
+        return Err(EngError::BadRequest(format!(
+            "expert_bank: the fit admitted {} slots but one token picks {} experts; \
+             free device memory or set expert_bank.slots to at least {}",
+            admission.slots, shape.moe.top_k, shape.moe.top_k
+        )));
+    }
     match decision {
         None => Ok(DecidedLoad::Resident(load_exl3_dir(
             projector, dir, reserve,

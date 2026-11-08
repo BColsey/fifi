@@ -550,9 +550,9 @@ pub(crate) struct TieredOptions {
 }
 
 /// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
-/// resident when the rest live in a host store. `slots` may name the exact count (1 to 256) or
-/// stay absent for "the most that fit"; `mode` is `auto` (bank only when the resident load does
-/// not fit) or `on` (always bank), `auto` by default.
+/// resident when the rest live in a host store. `slots` may name the exact count (8 to 256,
+/// from the 8 picks of one token) or stay absent for "the most that fit"; `mode` is `auto`
+/// (bank only when the resident load does not fit) or `on` (always bank), `auto` by default.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExpertBankOptions {
@@ -1079,8 +1079,10 @@ fn expert_bank_settings(
     }
     let slots = match bank.slots {
         None => SlotRequest::Fit,
+        // From 8, the picks of one token: a smaller bank cannot hold one token's picks
+        // together, so the resolver would refuse every token after boot.
         Some(count) => SlotRequest::Exactly(
-            usize::try_from(ranged("expert_bank.slots", Some(count), count, 1, 256)?)
+            usize::try_from(ranged("expert_bank.slots", Some(count), 8, 8, 256)?)
                 .map_err(|_| bad("expert_bank.slots exceeds usize".into()))?,
         ),
     };
@@ -1492,11 +1494,11 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
-        DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE, Q36Env, Q36Options,
-        Q36Settings, TieredSettings, activation_name, activation_of, cache_growth_per_position,
-        chunked_prefill_allowed, delta_state_bytes, digest, kv_dtype_name, kv_dtype_of,
-        parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,
+        DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE,
+        Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
+        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
+        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
     };
     use super::{
         QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
@@ -1522,6 +1524,68 @@ mod tests {
         assert_eq!(pair.cuda_devices, vec![0, 1]);
         let second = cuda_offload(r#"{"cuda_devices":[1]}"#).unwrap();
         assert_eq!(second.cuda_devices, vec![1]);
+    }
+
+    #[test]
+    fn expert_bank_refuses_wrong_arms_and_floors_slots_by_key() {
+        // Every refusal names the key an operator can fix; the multi-device arm refuses the
+        // member by name the same way it refuses tiered.
+        for (body, needle) in [
+            (r#"{"expert_bank":{}}"#, "weight_format exl3"),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"capture":true}"#,
+                "capture",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#,
+                "speculative decoding",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":4}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":257}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"mode":"bogus"}}"#,
+                "expert_bank.mode",
+            ),
+            (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
+        ] {
+            assert!(message(cuda_offload(body)).contains(needle), "{body}");
+        }
+        // The member is CUDA-only; on the MLX arm the refusal fires before the pack check
+        // (the cache limit the MLX settings also need comes from the env).
+        let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
+        let mlx = Q36Env {
+            cache_limit: Some("1024".to_string()),
+        };
+        assert!(
+            message(settings_for(Some(&options), &mlx, Backend::Mlx))
+                .contains("the MLX arm refuses it")
+        );
+    }
+
+    #[test]
+    fn expert_bank_accepts_the_fit_request_and_explicit_slots_from_the_floor() {
+        let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
+        assert_eq!(
+            fit.expert_bank.map(|bank| (bank.slots, bank.mode)),
+            Some((SlotRequest::Fit, BankMode::Auto))
+        );
+        let on = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on"}}"#)
+            .unwrap();
+        assert_eq!(
+            on.expert_bank.map(|bank| (bank.slots, bank.mode)),
+            Some((SlotRequest::Exactly(8), BankMode::On))
+        );
+        let top = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":256}}"#).unwrap();
+        assert_eq!(
+            top.expert_bank.map(|bank| bank.slots),
+            Some(SlotRequest::Exactly(256))
+        );
     }
 
     #[test]

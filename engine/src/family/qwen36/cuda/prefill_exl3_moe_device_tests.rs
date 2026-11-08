@@ -316,7 +316,7 @@ fn moe_case(rows: usize, forced: bool) {
             .collect()
     };
     assert!(
-        !routed_with(&projector_view, &block, &bufs, &moe, false).expect("routed, no pair"),
+        !routed_with(&projector_view, &block, &bufs, &moe, None, false).expect("routed, no pair"),
         "the request was off"
     );
     stream.synchronize().unwrap();
@@ -327,7 +327,7 @@ fn moe_case(rows: usize, forced: bool) {
         .write_at(&stream, 0, &vec![0xa5u8; pairs * 2 * i * F32])
         .unwrap();
     assert!(
-        routed_with(&projector_view, &block, &bufs, &moe, true).expect("routed, pair"),
+        routed_with(&projector_view, &block, &bufs, &moe, None, true).expect("routed, pair"),
         "the pair rotation must have run: the scratch fits and the buffers are aligned"
     );
     stream.synchronize().unwrap();

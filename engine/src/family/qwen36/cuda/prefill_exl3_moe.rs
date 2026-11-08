@@ -400,6 +400,7 @@ fn routed(
         weights,
         bufs,
         dims,
+        bank,
         projector.launch.ctx.exl3_jobs_pair_enabled()?,
     )
     .map(|_| ())
@@ -412,6 +413,7 @@ fn routed_with(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Bufs<'_>,
     dims: &MoeDims,
+    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
     pair: bool,
 ) -> Result<bool, EngError> {
     let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);

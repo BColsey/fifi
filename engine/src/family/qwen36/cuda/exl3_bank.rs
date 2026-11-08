@@ -354,7 +354,8 @@ impl LayerSlots {
             .min_by_key(|&slot| self.last_used[slot])
             .ok_or_else(|| {
                 EngError::BadRequest(format!(
-                    "EXL3 expert bank: {} slots cannot hold the {} picks of one token",
+                    "EXL3 expert bank: {} slots cannot hold the {} picks of one call \
+                     (a decode token, or a prefill sub-block's rows together)",
                     self.slots,
                     taken.len() + 1
                 ))
@@ -478,10 +479,10 @@ pub(crate) struct LayerResolver<'r, 'w> {
 }
 
 impl LayerResolver<'_, '_> {
-    /// Maps one token's picks to slots, refilling the missed slots' device bytes from the
-    /// store. The copies are stream-ordered on the caller's context: the readback that
-    /// produced the picks has already waited for the stream, and the launches this return
-    /// feeds queue behind the copies.
+    /// Maps one call's picks (a decode token's, or a prefill sub-block's) to slots, refilling
+    /// the missed slots' device bytes from the store. The copies are host-synchronous
+    /// (`upload_at` waits for its copy): the readback that produced the picks has already
+    /// waited for the stream, and the launches this return feeds queue behind the copies.
     pub(crate) fn resolve(
         &mut self,
         ctx: &CudaContext,
