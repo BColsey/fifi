@@ -132,6 +132,8 @@ pub(crate) struct MoeBaked {
     pub(crate) renorm: u32,
     /// The clamp bound of the expert ids, `experts - 1`: the ONE `mlx_minimum` clamp per layer.
     pub(crate) clamp: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the folded post-attention norm.
+    pub(crate) eps_bits: u32,
     pub(crate) act: u64,
     /// The scale dtype key of EACH packed weight, in the seam's weight order shared gate, up,
     /// down, then the gate, up, down expert stacks.
@@ -273,6 +275,7 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     parts.push(u64::from(baked.top_k));
     parts.push(u64::from(baked.renorm));
     parts.push(u64::from(baked.clamp));
+    parts.push(u64::from(baked.eps_bits));
     parts.push(baked.act);
     parts.extend(baked.scale_keys);
     for triple in &baked.quant {
@@ -348,6 +351,7 @@ mod tests {
             top_k: 8,
             renorm: 1,
             clamp: 255,
+            eps_bits: 1.0e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
             scale_keys: [1, 1, 1, 1, 1, 1],
             quant: [[0, 64, 4]; 6],
@@ -837,6 +841,13 @@ mod tests {
             ("top_k", MoeBaked { top_k: 9, ..base }),
             ("renorm", MoeBaked { renorm: 0, ..base }),
             ("clamp", MoeBaked { clamp: 256, ..base }),
+            (
+                "eps_bits",
+                MoeBaked {
+                    eps_bits: 1.0e-5f32.to_bits(),
+                    ..base
+                },
+            ),
             (
                 "act",
                 MoeBaked {

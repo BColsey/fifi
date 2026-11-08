@@ -516,11 +516,19 @@ impl<'c> ResidentDecoder<'c> {
             let states: Vec<_> = states.iter().map(|(rec, ring)| (rec, ring)).collect();
             let mut seconds = WarmupSeconds::default();
             for (layer, _) in &plan.delta {
-                let RMixer::Delta(w) = &self.weights.layers[*layer].mixer else {
+                let layer_ref = &self.weights.layers[*layer];
+                let RMixer::Delta(w) = &layer_ref.mixer else {
                     unreachable!("the admitted DeltaNet layer changed during preparation");
                 };
                 let started = std::time::Instant::now();
-                let got = super::compiled::delta_rows(&mut ctx, &shape, w, &states, &x)?;
+                let got = super::compiled::delta_rows(
+                    &mut ctx,
+                    &shape,
+                    w,
+                    &states,
+                    &x,
+                    &layer_ref.input_norm,
+                )?;;
                 let mut outputs = vec![&got.out];
                 for (rec, ring) in &got.states {
                     outputs.extend([rec, ring]);
@@ -531,8 +539,15 @@ impl<'c> ResidentDecoder<'c> {
             for (layer, _) in &plan.moe {
                 let started = std::time::Instant::now();
                 // plan.moe holds only MoE layers, so the accessor cannot fail here.
-                let moe = self.weights.layers[*layer].as_moe()?;
-                let got = super::compiled::moe_step_device(&mut ctx, &shape, moe, &x)?;
+                let layer_ref = &self.weights.layers[*layer];
+                let moe = layer_ref.as_moe()?;
+                let got = super::compiled::moe_step_device(
+                    &mut ctx,
+                    &shape,
+                    moe,
+                    &x,
+                    &layer_ref.post_norm,
+                )?;;
                 ctx.kernels
                     .evaluate(&[&got.0, got.1.ids.ids(), &got.1.gates, &got.1.health])?;
                 seconds.moe.push(started.elapsed().as_secs_f64());
@@ -661,21 +676,18 @@ impl<'c> ResidentDecoder<'c> {
             let rec = next()?;
             let ring = next()?;
             for (layer, _id) in &plan.delta {
-                let RMixer::Delta(w) = &self
-                    .weights
-                    .layers
-                    .get(*layer)
-                    .ok_or_else(|| {
-                        EngError::BadRequest("the compile warm-up layer is missing".into())
-                    })?
-                    .mixer
-                else {
+                let layer_ref = self.weights.layers.get(*layer).ok_or_else(|| {
+                    EngError::BadRequest("the compile warm-up layer is missing".into())
+                })?;
+                let RMixer::Delta(w) = &layer_ref.mixer else {
                     return Err(EngError::BadRequest(
                         "the compile warm-up found no DeltaNet layer".into(),
                     ));
                 };
+                let norm_in = &layer_ref.input_norm;
                 let started = std::time::Instant::now();
-                let got = super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x)?;
+                let got =
+                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, &norm_in)?;
                 ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])?;
                 delta_seconds.push(started.elapsed().as_secs_f64());
             }
@@ -686,8 +698,10 @@ impl<'c> ResidentDecoder<'c> {
             })?;
             match &layer.feed_forward {
                 RFeedForward::Moe(w) => {
+                    let norm_post = &layer.post_norm;
                     let started = std::time::Instant::now();
-                    let got = super::compiled::moe_step_device(&mut ctx, &shape, w, &x)?;
+                    let got =
+                        super::compiled::moe_step_device(&mut ctx, &shape, w, &x, &norm_post)?;
                     ctx.kernels.evaluate(&[
                         &got.0,
                         got.1.ids.ids(),

@@ -2468,7 +2468,7 @@ static int compile_delta_slot(
   CompileScopeArray q4d, k4d;
   CompileScopeArray pre, soft, decay, alpha_exp, alpha, beta_sig, beta;
   CompileScopeArray state4, y2, state_out;
-  CompileScopeArray core, rec_next, normed, z2d, gate, o, o_act, out;
+  CompileScopeArray core, rec_next, normed, z2d, gate, o, o_act, out, out_resid;
   int status = 0;
   // The pre-recurrence middle. Unfused: the op sequence below, whose math and casts mirror
   // delta::step (b is F32 before sigmoid, the conv runs in F32). Fused
@@ -2560,8 +2560,15 @@ static int compile_delta_slot(
         &out.value, o_flat.value, in.values[15], in.values[16], in.values[17], true,
         compile_quant_optional(p->group[4]), compile_quant_optional(p->bits[4]),
         compile_quant_mode(p->mode[4]), s);
+  // The folded output residual (solo decode only): the raw residual stream of in.values[0]
+  // joins the projected row, the same mlx_add the eager loop ran after the block. Multirow
+  // adds its residual in the wrapper, over the stacked projection.
+  if (status == 0 && solo)
+    status = inference_mlx_add(&out_resid.value, in.values[0], out.value, s);
   compile_touching("delta body output vector");
-  if (status == 0 && solo) status = mlx_vector_array_append_value(results, out.value);
+  if (status == 0 && solo)
+    status = mlx_vector_array_append_value(
+        results, out_resid.value.ctx != nullptr ? out_resid.value : out.value);
   if (status == 0) status = mlx_vector_array_append_value(results, rec_next.value);
   // With one tap the new ring is the appended column itself, converted to F32 when the
   // projection did not already run in F32 (`delta.rs` keeps a F32 column as is).
@@ -2575,12 +2582,14 @@ static int compile_delta_slot(
   return status;
 }
 
-// Canonical 26 operands, then independent rec/ring pairs for slots 1..B. B is inferred from
+// Canonical 27 operands, then independent rec/ring pairs for slots 1..B. B is inferred from
 // the live x shape, so the existing nonshapeless fun_id specializes both shape and arity.
-// Outputs: out [B,H], then one F32 rec/ring pair per slot. B1's graph order is unchanged.
-// Base input order (26): x, rec, ring; payload/scales/biases for qkv,z,b,a,out;
+// Outputs: out [B,H] (the folded residual sum), then one F32 rec/ring pair per slot. B1's
+// graph order is unchanged.
+// Base input order (27): x (the RAW residual stream, pre-norm), rec, ring; payload/scales/
+// biases for qkv,z,b,a,out;
 // conv_taps,conv_last,neg_exp_a_log,dt_bias,norm; zero; the [kd] query and key norm weights
-// (1/kd and 1/sqrt(kd)).
+// (1/kd and 1/sqrt(kd)); input_norm [H] (the folded input RMS norm weight).
 // Multirow appends rec/ring for slots 1..B-1. Outputs are out, then B rec/ring pairs.
 static int compile_delta_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
@@ -2589,7 +2598,7 @@ static int compile_delta_body(
   if (p == nullptr || res == nullptr) return 1;
   compile_touching("delta closure input vector");
   const size_t count = mlx_vector_array_size(input);
-  if (count < 26 || count > CompileScopeInputs::kMax) return 1;
+  if (count < 27 || count > CompileScopeInputs::kMax) return 1;
   compile_touching("delta closure input element");
   CompileScopeInputs in;
   while (in.count < count) {
@@ -2603,14 +2612,20 @@ static int compile_delta_body(
   const int batch = input_shape[0];
   if ((batch != 1 && batch != 2 && batch != 4 && batch != 8) ||
       input_shape[1] != p->hidden ||
-      count != 26 + 2 * static_cast<size_t>(batch - 1) || (batch > 1 && p->taps <= 1)) return 1;
+      count != 27 + 2 * static_cast<size_t>(batch - 1) || (batch > 1 && p->taps <= 1)) return 1;
   // Collected in a body-owned vector; appending to a caller's null *res is not valid.
   mlx_vector_array results = mlx_vector_array_new();
   if (results.ctx == nullptr) return 1;
   const mlx_stream s = p->stream;
   const int x_shape[2] = {batch, p->hidden};
   CompileScopeArray x_flat, u, z, b_product, b_cast, a;
-  int status = inference_mlx_reshape(&x_flat.value, in.values[0], x_shape, 2, s);
+  // The folded input norm: in.values[0] is the raw residual stream; the same rms_norm shim
+  // the eager step called normalizes it once, and every projection below reads the
+  // normalized rows exactly as the uncompiled step did.
+  CompileScopeArray x_normed;
+  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[26], p->eps, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&x_flat.value, x_normed.value, x_shape, 2, s);
   // The original B1 projection order and casts: qkv, z, b, F32 b cast, a.
   if (status == 0)
     status = inference_mlx_quantized_matmul(
@@ -2657,7 +2672,7 @@ static int compile_delta_body(
         const int stop[2] = {slot + 1, widths[j]};
         status = inference_mlx_slice(&row[j].value, projections[j], start, stop, strides, 2, s);
       }
-      const size_t state = slot == 0 ? 1 : 26 + 2 * static_cast<size_t>(slot - 1);
+      const size_t state = slot == 0 ? 1 : 27 + 2 * static_cast<size_t>(slot - 1);
       if (status == 0)
         status = compile_delta_slot(states, in, p, row[0], row[1], row[2].value, row[3],
                                     in.values[state], in.values[state + 1], flat[slot], false);
@@ -2671,7 +2686,12 @@ static int compile_delta_body(
           &out.value, stacked.value, in.values[15], in.values[16], in.values[17], true,
           compile_quant_optional(p->group[4]), compile_quant_optional(p->bits[4]),
           compile_quant_mode(p->mode[4]), s);
-    if (status == 0) status = mlx_vector_array_append_value(results, out.value);
+    // The folded output residual: the raw residual stream of in.values[0] joins the projected
+    // stack, the same mlx_add the eager loop ran after the block.
+    CompileScopeArray resid_out;
+    if (status == 0)
+      status = inference_mlx_add(&resid_out.value, in.values[0], out.value, s);
+    if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
     for (size_t i = 0; status == 0 && i < 2 * static_cast<size_t>(batch); ++i) {
       CompileScopeArray state;
       status = mlx_vector_array_get(&state.value, states, i);
@@ -2694,6 +2714,7 @@ static int compile_delta_body(
 struct CompileMoePayload {
   int hidden;  // H
   int experts, top_k, renorm;
+  float eps;  // the RMS norm epsilon of the folded post-attention norm
   mlx_dtype act;
   mlx_stream stream;
   int mode[6];   // shared gate, up, down, then the gate, up, down stacks
@@ -2840,7 +2861,13 @@ static int compile_moe_rows(
   CompileScopeArray renorm_sum, gates0, gates, x3, hg, hu, act, h;
   CompileScopeArray eo, weighted, expert_rows, experts;
   CompileScopeArray sg, su, act2, sh, so, scalar_logit, factor, shared_out, total, total_act;
-  int status = inference_mlx_matmul(&logits.value, in.values[0], in.values[1], s);
+  CompileScopeArray resid_out;
+  // The folded post-attention norm: in.values[0] is the raw residual stream, and the same
+  // rms_norm shim the eager block calls normalizes it once for the whole block.
+  CompileScopeArray x_normed;
+  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[21], p->eps, s);
+  if (status == 0)
+    status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[1], s);
   // As in B=1, the F32 router promotes BF16 products before the precise F32 softmax.
   if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
   if (status == 0) status = inference_mlx_negative(&negated.value, probs.value, s);
@@ -2860,7 +2887,7 @@ static int compile_moe_rows(
     status = inference_mlx_reshape(
         &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
   const int moe_lhs = compile_moe_lhs_index(batch);
-  if (status == 0) status = inference_mlx_reshape(&x3.value, in.values[0], x3_shape, 3, s);
+  if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
         &hg.value, x3.value, in.values[12], in.values[13], in.values[14], p->rows_lhs[moe_lhs],
@@ -2886,12 +2913,12 @@ static int compile_moe_rows(
   // All shared projections consume the complete [B,H] stack in one qmm each.
   if (status == 0)
     status = inference_mlx_quantized_matmul(
-        &sg.value, in.values[0], in.values[2], in.values[3], in.values[4], true,
+        &sg.value, x_normed.value, in.values[2], in.values[3], in.values[4], true,
         compile_quant_optional(p->group[0]), compile_quant_optional(p->bits[0]),
         compile_quant_mode(p->mode[0]), s);
   if (status == 0)
     status = inference_mlx_quantized_matmul(
-        &su.value, in.values[0], in.values[5], in.values[6], in.values[7], true,
+        &su.value, x_normed.value, in.values[5], in.values[6], in.values[7], true,
         compile_quant_optional(p->group[1]), compile_quant_optional(p->bits[1]),
         compile_quant_mode(p->mode[1]), s);
   if (status == 0) status = inference_mlx_silu(&act2.value, sg.value, s);
@@ -2901,14 +2928,19 @@ static int compile_moe_rows(
         &so.value, sh.value, in.values[8], in.values[9], in.values[10], true,
         compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
         compile_quant_mode(p->mode[2]), s);
-  if (status == 0) status = inference_mlx_matmul(&scalar_logit.value, in.values[0], in.values[11], s);
+  if (status == 0)
+    status = inference_mlx_matmul(&scalar_logit.value, x_normed.value, in.values[11], s);
   if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
   if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
   if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
   if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
-  const mlx_array out = total_act.value.ctx != nullptr ? total_act.value : total.value;
+  const mlx_array total_used = total_act.value.ctx != nullptr ? total_act.value : total.value;
+  // The folded output residual: the raw residual stream of in.values[0] joins the block total,
+  // the same mlx_add the eager loop ran after the block.
+  if (status == 0)
+    status = inference_mlx_add(&resid_out.value, in.values[0], total_used, s);
   compile_touching("moe rows body output vector");
-  if (status == 0) status = mlx_vector_array_append_value(results, out);
+  if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
   if (status == 0) status = mlx_vector_array_append_value(results, clamped.value);
   if (status == 0) status = mlx_vector_array_append_value(results, gates.value);
   if (status == 0) status = mlx_vector_array_append_value(results, health.value);
@@ -2933,22 +2965,24 @@ static int compile_moe_rows(
 // and an axis-0 take returns the gather output as is, so the no-op `Contiguous` calls of the
 // original closure are gone; nothing here rebuilds them.
 //
-// Input order (21): x [B,H]; router_t [H,E]; payload, scales, biases of the shared gate, up, and
-// down weights; shared_scalar_t [H,1]; payload, scales, biases of the gate, up, and down expert
-// stacks (a null biases slot when the weight has none).
-// Output order (4), B=1: out [1,H] in the activation dtype; ids [k] (U32, once-clamped);
+// Input order (22): x [B,H] (the RAW residual stream, pre-norm); router_t [H,E]; payload,
+// scales, biases of the shared gate, up, and down weights; shared_scalar_t [H,1]; payload,
+// scales, biases of the gate, up, and down expert stacks (a null biases slot when the weight
+// has none); post_norm [H] (the folded post-attention RMS norm weight).
+// Output order (4), B=1: out [1,H] in the activation dtype (the folded residual sum);
+// ids [k] (U32, once-clamped);
 // gates [k,1,1] (F32); health [1] (F32). B>1: [B,H], [B,k], [B,k,1,1], [B].
 static int compile_moe_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
   compile_moe_body_entries_.fetch_add(1, std::memory_order_relaxed);
   const CompileMoePayload* p = static_cast<const CompileMoePayload*>(raw);
   compile_touching("moe closure input vector");
-  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 21) {
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 22) {
     return 1;
   }
   compile_touching("moe closure input element");
   CompileScopeInputs in;
-  for (; in.count < 21; ++in.count) {
+  for (; in.count < 22; ++in.count) {
     if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
       return 1;
     }
@@ -2981,11 +3015,16 @@ static int compile_moe_body(
   CompileScopeArray clamped, top, health, renorm_sum, gates0, gates;
   CompileScopeArray x3, hg, hu, act, h, eo, weighted, experts;
   CompileScopeArray sg_flat, sg, su, act2, sh, so_flat, so;
-  CompileScopeArray scalar_logit, factor, shared_out, total, total_act;
-  int status = 0;
+  CompileScopeArray scalar_logit, factor, shared_out, total, total_act, resid_out;
+  // The folded post-attention norm: in.values[0] is the raw residual stream; the same
+  // rms_norm shim the eager loop called normalizes it once, and every consumer below reads
+  // the normalized row exactly as the uncompiled block did.
+  CompileScopeArray x_normed;
+  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[21], p->eps, s);
   // Router probabilities softmax(x . router_t) [1, E]: the F32 router promotes the
   // activation-dtype logits, so the routing arithmetic runs in F32 exactly as uncompiled.
-  if (status == 0) status = inference_mlx_matmul(&logits.value, in.values[0], in.values[1], s);
+  if (status == 0)
+    status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[1], s);
   if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
   if (status == 0) status = inference_mlx_reshape(&flat.value, probs.value, flat_shape, 1, s);
   // Device routing: stable argsort of the negated row, slice, ONE clamp below the expert count
@@ -3012,7 +3051,7 @@ static int compile_moe_body(
   // up) and the arange over the k gathered rows (down), exactly the defaults mlx_gather_qmm
   // would build per call - as persistent arrays they bind once at trace time instead of
   // replaying arange and broadcast kernels on every decode step.
-  if (status == 0) status = inference_mlx_reshape(&x3.value, in.values[0], x3_shape, 3, s);
+  if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
         &hg.value, x3.value, in.values[12], in.values[13], in.values[14], p->rows_lhs[0],
@@ -3034,7 +3073,8 @@ static int compile_moe_body(
   if (status == 0) status = inference_mlx_multiply(&weighted.value, eo.value, gates.value, s);
   if (status == 0) status = inference_mlx_sum_axis(&experts.value, weighted.value, 0, false, s);
   // The shared expert: sigmoid(x . s) * down(silu(gate(x)) * up(x)).
-  if (status == 0) status = inference_mlx_reshape(&sg_flat.value, in.values[0], one_hidden, 2, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&sg_flat.value, x_normed.value, one_hidden, 2, s);
   if (status == 0)
     status = inference_mlx_quantized_matmul(
         &sg.value, sg_flat.value, in.values[2], in.values[3], in.values[4], true,
@@ -3063,14 +3103,18 @@ static int compile_moe_body(
         compile_quant_mode(p->mode[2]), s);
   // The F32 shared scalar promotes the sigmoid factor, so the shared product is F32 and so is
   // the block total; the total then converts to the activation dtype (the block's `to_act`).
-  if (status == 0) status = inference_mlx_matmul(&scalar_logit.value, in.values[0], in.values[11], s);
+  if (status == 0) status = inference_mlx_matmul(&scalar_logit.value, x_normed.value, in.values[11], s);
   if (status == 0) status = inference_mlx_sigmoid(&factor.value, scalar_logit.value, s);
   if (status == 0) status = inference_mlx_multiply(&shared_out.value, factor.value, so.value, s);
   if (status == 0) status = inference_mlx_add(&total.value, experts.value, shared_out.value, s);
   if (status == 0) status = compile_cast_to(&total_act.value, total.value, p->act, s);
-  const mlx_array out = total_act.value.ctx != nullptr ? total_act.value : total.value;
+  const mlx_array total_used = total_act.value.ctx != nullptr ? total_act.value : total.value;
+  // The folded output residual: the raw residual stream of in.values[0] joins the block total,
+  // the same mlx_add the eager loop ran after the block.
+  if (status == 0)
+    status = inference_mlx_add(&resid_out.value, in.values[0], total_used, s);
   compile_touching("moe body output vector");
-  if (status == 0) status = mlx_vector_array_append_value(results, out);
+  if (status == 0) status = mlx_vector_array_append_value(results, resid_out.value);
   // The route is the once-clamped ids, exactly the `BoundedIndices::ids` the uncompiled route
   // exposes; the clamp of an in-range id is the identity, so the values are bit for bit equal.
   if (status == 0) status = mlx_vector_array_append_value(results, clamped.value);
@@ -3090,8 +3134,10 @@ static int compile_moe_body(
 // keeps the KV append (int slice bounds) eager. The body calls the same inference_mlx_*
 // entries the adapter exposes, in the same order as the eager path, so a replayed closure
 // must produce bit-identical outputs.
-// 12 inputs: x [1, hidden] in the activation dtype, then the q, k, v packed weights in the
-// (payload, scales, biases) triple order of the delta block, then q_norm and k_norm.
+// 12 inputs were the pre-fold form; the body now takes 13: x [1, hidden] is the RAW residual
+// stream in the activation dtype, then the q, k, v packed weights in the
+// (payload, scales, biases) triple order of the delta block, then q_norm and k_norm, then
+// input_norm [H] (the folded input RMS norm weight).
 // 4 outputs: q_normed [1, heads, 1, width], k_normed [1, kv_heads, 1, width],
 // v [1, kv_heads, 1, width], gate [heads, width], all in the activation dtype.
 static std::atomic<std::uint64_t> attn_pre_body_entries_{0};
@@ -3123,12 +3169,12 @@ static int compile_attn_pre_body(
   attn_pre_body_entries_.fetch_add(1, std::memory_order_relaxed);
   const CompileAttnPrePayload* p = static_cast<const CompileAttnPrePayload*>(raw);
   compile_touching("attn pre closure input vector");
-  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 12) {
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 13) {
     return 1;
   }
   compile_touching("attn pre closure input element");
   CompileScopeInputs in;
-  for (; in.count < 12; ++in.count) {
+  for (; in.count < 13; ++in.count) {
     if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
       return 1;
     }
@@ -3154,7 +3200,13 @@ static int compile_attn_pre_body(
   const int strides2[2] = {1, 1};
   CompileScopeArray x_flat, q_full, k_full, v_full, qp, q_raw, gate, q_normed, kp, k_normed;
   CompileScopeArray q4, k4, v4;
-  int status = inference_mlx_reshape(&x_flat.value, in.values[0], one_hidden, 2, s);
+  // The folded input norm: in.values[0] is the raw residual stream; the same rms_norm shim
+  // the eager step called normalizes it once, and the projections below read the normalized
+  // row exactly as the uncompiled step did.
+  CompileScopeArray x_normed;
+  int status = inference_mlx_rms_norm(&x_normed.value, in.values[0], in.values[12], p->eps, s);
+  if (status == 0)
+    status = inference_mlx_reshape(&x_flat.value, x_normed.value, one_hidden, 2, s);
   if (status == 0)
     status = inference_mlx_quantized_matmul(
         &q_full.value, x_flat.value, in.values[1], in.values[2], in.values[3], true,
@@ -3301,7 +3353,7 @@ extern "C" int inference_mlx_compile_attn_pre_block(
     uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(q, stream, [&]() noexcept {
     (void)activation;  // The activation dtype rides in the cache key; the body needs no cast.
-    if (inputs_num != 12) return 1;
+    if (inputs_num != 13) return 1;
     CompileAttnPrePayload* payload =
         static_cast<CompileAttnPrePayload*>(std::malloc(sizeof(CompileAttnPrePayload)));
     if (payload == nullptr) {
@@ -3368,12 +3420,12 @@ static int compile_attn_post_body(
   attn_post_body_entries_.fetch_add(1, std::memory_order_relaxed);
   compile_touching("attn post closure input vector");
   const CompileAttnPostPayload* p = static_cast<const CompileAttnPostPayload*>(raw);
-  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 5) {
+  if (p == nullptr || res == nullptr || mlx_vector_array_size(input) != 6) {
     return 1;
   }
   compile_touching("attn post closure input element");
   CompileScopeInputs in;
-  for (; in.count < 5; ++in.count) {
+  for (; in.count < 6; ++in.count) {
     if (mlx_vector_array_get(&in.values[in.count], input, in.count) != 0) {
       return 1;
     }
@@ -3388,12 +3440,18 @@ static int compile_attn_post_body(
       gate_shape[1] != p->width) {
     return 1;
   }
+  // The folded residual operand: the raw residual stream [1, hidden].
+  const int* res_shape = mlx_array_shape(in.values[5]);
+  if (mlx_array_ndim(in.values[5]) != 2 || res_shape == nullptr || res_shape[0] != 1 ||
+      res_shape[1] != p->hidden) {
+    return 1;
+  }
   mlx_vector_array results = mlx_vector_array_new();
   if (results.ctx == nullptr) return 1;
   const mlx_stream s = p->stream;
   const int heads_width[2] = {p->heads, p->width};
   const int one_row[2] = {1, p->heads * p->width};
-  CompileScopeArray att2, sig, gated, gated_act, row, out;
+  CompileScopeArray att2, sig, gated, gated_act, row, out, out_resid;
   int status = inference_mlx_reshape(&att2.value, in.values[0], heads_width, 2, s);
   if (status == 0) status = inference_mlx_sigmoid(&sig.value, in.values[1], s);
   if (status == 0)
@@ -3409,8 +3467,12 @@ static int compile_attn_post_body(
         &out.value, row.value, in.values[2], in.values[3], in.values[4], true,
         compile_quant_optional(p->group), compile_quant_optional(p->bits),
         compile_quant_mode(p->mode), s);
+  // The folded output residual: the raw residual stream of in.values[5] joins the projected
+  // row, the same mlx_add the eager loop ran after the block.
+  if (status == 0)
+    status = inference_mlx_add(&out_resid.value, in.values[5], out.value, s);
   compile_touching("attn post body output vector");
-  if (status == 0) status = mlx_vector_array_append_value(results, out.value);
+  if (status == 0) status = mlx_vector_array_append_value(results, out_resid.value);
   if (status == 0) status = mlx_vector_array_set(res, results);
   const int release = mlx_vector_array_free(results);
   return status != 0 ? status : release;
@@ -3423,7 +3485,7 @@ extern "C" int inference_mlx_compile_attn_post_block(
     mlx_array* out, const mlx_array* inputs, size_t inputs_num, const int* dims,
     const int* quant, mlx_dtype activation, uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
-    if (inputs_num != 5) return 1;
+    if (inputs_num != 6) return 1;
     CompileAttnPostPayload* payload =
         static_cast<CompileAttnPostPayload*>(std::malloc(sizeof(CompileAttnPostPayload)));
     if (payload == nullptr) {
@@ -3744,7 +3806,7 @@ extern "C" int inference_mlx_compile_delta_block(
     const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
     const char* middle_source, uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
-    if (inputs_num != 26) return 1;
+    if (inputs_num != 27) return 1;
     mlx_array outputs[3] = {{nullptr}, {nullptr}, {nullptr}};
     const int status = compile_delta_apply(
         outputs, 3, inputs, inputs_num, dims, quant, eps, activation, source, middle_source,
@@ -3765,9 +3827,9 @@ extern "C" int inference_mlx_compile_delta_rows(
     const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
     const char* middle_source, uintptr_t fun_id, mlx_stream stream) noexcept {
   if (outputs == nullptr || inputs == nullptr || dims == nullptr || quant == nullptr ||
-      source == nullptr || inputs_num < 28 || inputs_num > CompileScopeInputs::kMax) return 1;
-  const size_t batch = (inputs_num - 24) / 2;
-  if ((batch != 2 && batch != 4 && batch != 8) || inputs_num != 24 + 2 * batch ||
+      source == nullptr || inputs_num < 29 || inputs_num > CompileScopeInputs::kMax) return 1;
+  const size_t batch = (inputs_num - 25) / 2;
+  if ((batch != 2 && batch != 4 && batch != 8) || inputs_num != 25 + 2 * batch ||
       outputs_num != 1 + 2 * batch || dims[6] <= 1) return 1;
   for (size_t i = 0; i < outputs_num; ++i) {
     if (outputs[i].ctx != nullptr) return 1;
@@ -3806,16 +3868,16 @@ extern "C" int inference_mlx_compile_delta_rows(
 
 // The device-routed MoE decode block as one compiled closure. `dims`
 // holds hidden, experts, top_k, and renorm (0 or 1). `quant` holds mode, group, bits per weight for the shared gate, up, down
-// and the gate, up, down stacks (18 values). `inputs` holds the 21 arrays of the input order of
+// and the gate, up, down stacks (18 values). `inputs` holds the 22 arrays of the input order of
 // `compile_moe_body`. `activation` is the activation dtype of the step. The outputs are lazy.
 // The wrapper runs under `run_selected_operation`, so the injected faults of the qualification
 // build strike `out` (the first output), like the `y` of `inference_mlx_gated_delta`.
 extern "C" int inference_mlx_compile_moe_block(
     mlx_array* out, mlx_array* ids, mlx_array* gates, mlx_array* health, const mlx_array* inputs,
-    size_t inputs_num, const int* dims, const int* quant, mlx_dtype activation, uintptr_t owner,
-    uintptr_t fun_id, mlx_stream stream) noexcept {
+    size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
+    uintptr_t owner, uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
-    if (inputs_num != 21) {
+    if (inputs_num != 22) {
       return 1;
     }
     CompileMoePayload* payload =
@@ -3831,6 +3893,7 @@ extern "C" int inference_mlx_compile_moe_block(
     payload->experts = dims[1];
     payload->top_k = dims[2];
     payload->renorm = dims[3];
+    payload->eps = eps;
     payload->act = activation;
     int stream_status = compile_copy_stream(&payload->stream, stream);
     if (stream_status != 0) {

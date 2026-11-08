@@ -140,13 +140,13 @@ impl ResidentDecoder<'_> {
         let mut nexts: Vec<Vec<LayerState>> = (0..rows).map(|_| Vec::new()).collect();
         let mut health: Option<ExecutionTensor> = None;
         for layer in weights.layers.iter() {
-            // ONE input norm over all B rows.
-            let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
-            check_dtype("input norm", &normed, ctx.consts.act)?;
-            // Dense projections batch across rows; attention caches and DeltaNet
-            // recurrence/conv rings remain independent per slot.
+            // The attention arm and the eager DeltaNet arm keep their external input norm (their
+            // projections batch over [B, H] here); the compiled DeltaNet arm folds the norm and
+            // the residual add into its closure, exactly like the solo step seam.
             let mixed_stack = match &layer.mixer {
                 RMixer::Attn(w) => {
+                    let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
+                    check_dtype("input norm", &normed, ctx.consts.act)?;
                     let qp = super::ops::linear_rows(&mut ctx, &w.q, &normed)?;
                     let kp = super::ops::linear_rows(&mut ctx, &w.k, &normed)?;
                     let vp = super::ops::linear_rows(&mut ctx, &w.v, &normed)?;
@@ -179,7 +179,10 @@ impl ResidentDecoder<'_> {
                     }
                     let parts: Vec<&ExecutionTensor> = o_rows.iter().collect();
                     let o_stack = ctx.kernels.concatenate(&parts, 0)?;
-                    super::ops::linear_rows(&mut ctx, &w.o, &o_stack)?
+                    let out = super::ops::linear_rows(&mut ctx, &w.o, &o_stack)?;
+                    // The residual add of the arm: the compiled DeltaNet arm folds it into its
+                    // closure, so every arm returns the residual sum `mid` directly.
+                    ctx.kernels.binary(BinaryOp::Add, &h, &out)?
                 }
                 RMixer::Delta(w) if compiled_rows => {
                     let previous = olds
@@ -200,8 +203,14 @@ impl ResidentDecoder<'_> {
                             )),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let got =
-                        super::compiled::delta_rows(&mut ctx, shape, w, &delta_states, &normed)?;
+                    let got = super::compiled::delta_rows(
+                        &mut ctx,
+                        shape,
+                        w,
+                        &delta_states,
+                        &h,
+                        &layer.input_norm,
+                    )?;
                     if got.states.len() != rows {
                         return Err(EngError::Backend {
                             operation: "qwen36 step_rows",
@@ -218,6 +227,8 @@ impl ResidentDecoder<'_> {
                     // their weights in ONE qmm each over all B rows; only the
                     // per-slot recurrence (ring, decay, gated delta) stays per
                     // slot, and `w.out` projects the stacked rows once.
+                    let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
+                    check_dtype("input norm", &normed, ctx.consts.act)?;
                     let u = super::ops::linear_rows(&mut ctx, &w.qkv, &normed)?;
                     let z = super::ops::linear_rows(&mut ctx, &w.z, &normed)?;
                     let b = super::ops::linear_rows(&mut ctx, &w.b, &normed)?;
@@ -252,25 +263,27 @@ impl ResidentDecoder<'_> {
                     }
                     let parts: Vec<&ExecutionTensor> = o_rows.iter().collect();
                     let o_stack = ctx.kernels.concatenate(&parts, 0)?;
-                    super::ops::linear_rows(&mut ctx, &w.out, &o_stack)?
+                    let out = super::ops::linear_rows(&mut ctx, &w.out, &o_stack)?;
+                    ctx.kernels.binary(BinaryOp::Add, &h, &out)?
                 }
             };
-            let mid = ctx.kernels.binary(BinaryOp::Add, &h, &mixed_stack)?;
-            // ONE post norm over all B rows.
-            let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
-            check_dtype("post norm", &normed, ctx.consts.act)?;
-            // Slice 3: the SHARED expert runs ONCE over the whole row stack
-            // (gate/up/down in one qmm each over [B, hidden]).
-            // Slice 4: the routed experts batch too - ONE router readback and
-            // ONE pair import for the window (route_rows), then ONE gathered
-            // product per weight over all B * k (slot, expert) pairs
-            // (combine_rows), the union-of-top-k device MoE.
-            let total = match (&layer.feed_forward, compiled_rows) {
+            // Every arm returns the residual sum already: `mixed_stack` IS `mid`.
+            let mid = mixed_stack;
+            // The FFN blocks fold the post norm and the output residual add: the compiled
+            // closure bakes them, the eager arms run the same ops here.
+            let h_next = match (&layer.feed_forward, compiled_rows) {
                 // Dense layers carry no router: the plain SwiGLU path serves any row count.
-                (RFeedForward::Dense(w), _) => moe::dense_rows(&mut ctx, w, &normed)?,
+                (RFeedForward::Dense(w), _) => {
+                    moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
+                }
                 (RFeedForward::Moe(w), true) => {
-                    let (out, route) =
-                        super::compiled::moe_step_device(&mut ctx, shape, w, &normed)?;
+                    let (out, route) = super::compiled::moe_step_device(
+                        &mut ctx,
+                        shape,
+                        w,
+                        &mid,
+                        &layer.post_norm,
+                    )?;
                     health = Some(match health.take() {
                         Some(sum) => ctx.kernels.binary(BinaryOp::Add, &sum, &route.health)?,
                         None => route.health,
@@ -278,6 +291,8 @@ impl ResidentDecoder<'_> {
                     out
                 }
                 (RFeedForward::Moe(w), false) => {
+                    let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
+                    check_dtype("post norm", &normed, ctx.consts.act)?;
                     let shared_stack = moe::shared(&mut ctx, w, &normed)?;
                     let (ids, gates, top_k) = moe::route_rows(&mut ctx, shape, w, &normed)?;
                     let routed_stack =
@@ -285,10 +300,11 @@ impl ResidentDecoder<'_> {
                     let total = ctx
                         .kernels
                         .binary(BinaryOp::Add, &routed_stack, &shared_stack)?;
-                    super::ops::to_act(&mut ctx, &total)?
+                    let total = super::ops::to_act(&mut ctx, &total)?;
+                    ctx.kernels.binary(BinaryOp::Add, &mid, &total)?
                 }
             };
-            h = ctx.kernels.binary(BinaryOp::Add, &mid, &total)?;
+            h = h_next;
             check_dtype("layer output", &h, ctx.consts.act)?;
         }
         // ONE head over all B rows: final norm, one lm_head matmul, one argmax.

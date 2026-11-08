@@ -43,17 +43,23 @@ pub(super) enum Routing {
 /// and the router probabilities `[E]` that the selection read.
 pub(super) type Selection = (Vec<(u32, f32)>, Vec<f32>);
 
-/// Dense SwiGLU on `[T, H]`, without routing or a shared-expert scalar gate.
+/// Dense SwiGLU on `[T, H]`, without routing or a shared-expert scalar gate. The block folds
+/// the post-attention norm and the output residual add around the FFN: `x` is the raw residual
+/// stream, the norm runs first, and the returned row is the residual sum `x + ffn(norm(x))`.
 pub(super) fn dense_rows(
     ctx: &mut Ctx<'_>,
+    shape: &HostShape,
     w: &RDense,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
-    let gate = ctx.kernels.qmm(x, &w.gate)?;
-    let up = ctx.kernels.qmm(x, &w.up)?;
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let gate = ctx.kernels.qmm(&normed, &w.gate)?;
+    let up = ctx.kernels.qmm(&normed, &w.up)?;
     let act = ctx.kernels.silu(&gate)?;
     let hidden = ctx.kernels.binary(BinaryOp::Mul, &act, &up)?;
-    ctx.kernels.qmm(&hidden, &w.down)
+    let out = ctx.kernels.qmm(&hidden, &w.down)?;
+    ctx.kernels.binary(BinaryOp::Add, x, &out)
 }
 
 /// Whether the fused prefill kernels replace the composite ops. Default ON after their gate
@@ -99,9 +105,15 @@ pub(super) fn step(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
-    let ((bounded, gates), tail) = route_row(ctx, shape, w, x)?;
-    let out = combine(ctx, shape, w, x, &bounded, &gates)?;
+    // The folded post-attention norm: the same op the step loop used to run, relocated inside
+    // the block so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let ((bounded, gates), tail) = route_row(ctx, shape, w, &normed)?;
+    let out = combine(ctx, shape, w, &normed, &bounded, &gates)?;
+    // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     Ok((out, tail))
 }
 
@@ -368,6 +380,7 @@ pub(super) fn step_device(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, DeviceRoute), EngError> {
     let m = &shape.moe;
     // The compiled decode closure: the `qwen36.compile` setting (or the test override of
@@ -376,9 +389,12 @@ pub(super) fn step_device(
     // never compiles: it is the parity reference. No fallback: a failure of the compiled path is
     // a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
-        return super::compiled::moe_step_device(ctx, shape, w, x);
+        return super::compiled::moe_step_device(ctx, shape, w, x, post_norm);
     }
-    let logits = ctx.kernels.mm(x, &w.router_t)?;
+    // The folded post-attention norm: the same op the step loop used to run, relocated inside
+    // the block so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let logits = ctx.kernels.mm(&normed, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     if probs.shape() != [1, dim(m.experts)?] {
         let count = probs
@@ -392,7 +408,9 @@ pub(super) fn step_device(
         )));
     }
     let route = route_device(ctx, &probs, m.top_k, m.renorm)?;
-    let out = combine(ctx, shape, w, x, &route.ids, &route.gates)?;
+    let out = combine(ctx, shape, w, &normed, &route.ids, &route.gates)?;
+    // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     Ok((out, route))
 }
 

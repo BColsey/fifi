@@ -36,7 +36,10 @@ fn overflow() -> EngError {
 /// `Consts`.
 const NORM_EPS: f32 = 1.0e-6;
 
-/// Builds one DeltaNet decode step over `x` (`hidden` elements) and the old `rec` and `ring`.
+/// Builds one DeltaNet decode step over the raw residual stream `x` (`hidden` elements) and
+/// the old `rec` and `ring`, folding the input RMS norm and the output residual add around
+/// the block: `x` meets `in_norm` first (the same `rms_norm` the loop used to run), the block
+/// runs exactly as before, and the returned `out` is the residual sum `x + mixed`.
 ///
 /// It performs no synchronization. The caller replaces its state with the returned `rec` and `ring`.
 /// A state shape error returns `BadRequest` before the first native call.
@@ -47,6 +50,7 @@ pub(super) fn step(
     rec: &ExecutionTensor,
     ring: &ExecutionTensor,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<DeltaStep, EngError> {
     check_state_shapes(shape, rec, ring)?;
     // The compiled decode closure: the `qwen36.compile` setting (or the test override of
@@ -54,17 +58,22 @@ pub(super) fn step(
     // below, in the activation dtype of the step. There is no fallback: a failure of the compiled
     // path is a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
-        return super::compiled::delta_step(ctx, shape, w, rec, ring, x);
+        return super::compiled::delta_step(ctx, shape, w, rec, ring, x, in_norm);
     }
+    // The folded input norm: the same op the step loop used to run, relocated inside the block
+    // so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // Projections: the batched path (`batch::step_rows`) meets these four
     // weights in ONE qmm each over `[B, hidden]`; only the recurrence below
     // stays per slot (the compiled closure above stays the solo path only).
-    let u = linear(ctx, &w.qkv, x)?;
-    let z = linear(ctx, &w.z, x)?;
-    let bb = linear(ctx, &w.b, x)?;
-    let aa = linear(ctx, &w.a, x)?;
+    let u = linear(ctx, &w.qkv, &normed)?;
+    let z = linear(ctx, &w.z, &normed)?;
+    let bb = linear(ctx, &w.b, &normed)?;
+    let aa = linear(ctx, &w.a, &normed)?;
     let (o, rec_next, ring_next) = step_projected(ctx, shape, w, rec, ring, [&u, &z, &bb, &aa])?;
-    let out = linear(ctx, &w.out, &o)?;
+    let mixed = linear(ctx, &w.out, &o)?;
+    // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
+    let out = ctx.kernels.binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(DeltaStep {
         out,
         rec: rec_next,

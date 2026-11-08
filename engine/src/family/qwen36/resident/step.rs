@@ -121,14 +121,12 @@ pub(super) fn run(
         trace::begin_step()
     };
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
-        let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
-        check_dtype("input norm output", &normed, ctx.consts.act)?;
-        // The old layer state moves into its arm: an attention cache is consumed by `kv_append`
-        // (a growth replaces the buffer), and a DeltaNet state drops at the end of the arm, after
-        // the replacement graph exists. The next synchronization frees the dropped arrays.
+        // The folded glue: each block owns its input norm and its output residual add (the
+        // compiled closures bake them; the eager arms run the same ops in the same order), so
+        // the loop only sequences blocks and keeps the trace hook.
         let (mixed, next) = match (&layer.mixer, old_layer) {
             (RMixer::Delta(w), LayerState::Delta { rec, ring }) => {
-                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &normed)?;
+                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &h, &layer.input_norm)?;
                 (
                     s.out,
                     LayerState::Delta {
@@ -138,7 +136,7 @@ pub(super) fn run(
                 )
             }
             (RMixer::Attn(w), LayerState::Attn(cache)) => {
-                let s = attn::step(&mut ctx, shape, w, cache, pos, &normed)?;
+                let s = attn::step(&mut ctx, shape, w, cache, pos, &h, &layer.input_norm)?;
                 (s.out, LayerState::Attn(s.cache))
             }
             _ => {
@@ -148,7 +146,8 @@ pub(super) fn run(
             }
         };
         layers.push(next);
-        let mid = ctx.kernels.binary(BinaryOp::Add, &h, &mixed)?;
+        // `mixed` is the residual sum already: the mixer folded the `h + mixed` add.
+        let mid = mixed;
         if let Some(trace_step) = trace_step {
             trace::hidden(&mut ctx, index, trace_step, &mid)?;
         }
@@ -157,12 +156,13 @@ pub(super) fn run(
             h = mid;
             break;
         }
-        let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
-        check_dtype("post norm output", &normed, ctx.consts.act)?;
         let routed = match (&layer.feed_forward, routing) {
-            (RFeedForward::Dense(w), _) => moe::dense_rows(&mut ctx, w, &normed)?,
+            (RFeedForward::Dense(w), _) => {
+                moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => {
-                let (out, (selection, probs)) = moe::step(&mut ctx, shape, w, &normed)?;
+                let (out, (selection, probs)) =
+                    moe::step(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 if mode == StepMode::Record {
                     host_routes.push(selection.iter().map(|pick| pick.0).collect());
                     host_probs.push(probs);
@@ -170,7 +170,7 @@ pub(super) fn run(
                 out
             }
             (RFeedForward::Moe(w), Routing::Device) => {
-                let (out, route) = moe::step_device(&mut ctx, shape, w, &normed)?;
+                let (out, route) = moe::step_device(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 health = Some(match health.take() {
                     Some(sum) => ctx.kernels.binary(BinaryOp::Add, &sum, &route.health)?,
                     None => route.health,
@@ -181,7 +181,8 @@ pub(super) fn run(
                 out
             }
         };
-        h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        // `routed` is the next residual stream already: the FFN folded the `mid + routed` add.
+        h = routed;
         // MLX promotes mixed operands, so a stray F32 operand would turn BF16 activations back to
         // F32 without an error. The check keeps a BF16 run honest.
         check_dtype("layer output", &h, ctx.consts.act)?;

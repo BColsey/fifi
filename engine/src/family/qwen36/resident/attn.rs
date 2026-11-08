@@ -558,22 +558,28 @@ pub(super) fn step(
     cache: KvCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
     check_cache(shape, &cache, pos)?;
     // The compile seam replaces the projections, the q/gate split, and the q/k norms of the
     // head with one compiled closure (B = 1 only); everything position- or length-dependent
     // stays eager. The batched path (`batch::step_rows`) never compiles.
     if super::compiled::step_requested(ctx.compile) {
-        return step_compiled(ctx, shape, w, cache, pos, x);
+        return step_compiled(ctx, shape, w, cache, pos, x, in_norm);
     }
+    // The folded input norm: the same op the step loop used to run, relocated inside the block
+    // so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // 1. The dense projections of the step: every one reads its weight in full
     // for one row, so the batched path (`batch::step_rows`) meets these three
     // weights in ONE qmm over `[B, hidden]` and only the core stays per slot.
-    let qp = linear(ctx, &w.q, x)?;
-    let kp = linear(ctx, &w.k, x)?;
-    let vp = linear(ctx, &w.v, x)?;
+    let qp = linear(ctx, &w.q, &normed)?;
+    let kp = linear(ctx, &w.k, &normed)?;
+    let vp = linear(ctx, &w.v, &normed)?;
     let (o, cache) = step_projected(ctx, shape, w, cache, pos, [&qp, &kp, &vp])?;
-    let out = linear(ctx, &w.o, &o)?;
+    let mixed = linear(ctx, &w.o, &o)?;
+    // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
+    let out = ctx.kernels.binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(AttnStep { out, cache })
 }
 
@@ -589,8 +595,9 @@ fn step_compiled(
     cache: KvCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
-    let pre = super::compiled::attn_pre_step(ctx, shape, w, x)?;
+    let pre = super::compiled::attn_pre_step(ctx, shape, w, x, in_norm)?;
     let a = &shape.attn;
     let rope = RopeSpec {
         dims: dim(a.rotary_dim)?,
@@ -601,7 +608,9 @@ fn step_compiled(
     let q = ctx.kernels.rope_scaled(&pre.q, &rope)?;
     let k_new = ctx.kernels.rope_scaled(&pre.k, &rope)?;
     let (att, cache) = step_tail_to_att(ctx, shape, cache, pos, &q, &k_new, &pre.v)?;
-    let out = super::compiled::attn_post_step(ctx, shape, w, &att, &pre.gate)?;
+    // The post closure folds the output residual add: its `out` is the residual sum `x +
+    // mixed`, the same mlx_add the eager path runs after the output projection.
+    let out = super::compiled::attn_post_step(ctx, shape, w, &att, &pre.gate, x)?;
     Ok(AttnStep { out, cache })
 }
 

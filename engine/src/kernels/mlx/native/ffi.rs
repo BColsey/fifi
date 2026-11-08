@@ -863,6 +863,7 @@ unsafe extern "C" {
         inputs_num: usize,
         dims: *const i32,
         quant: *const i32,
+        eps: f32,
         activation: mlx_dtype,
         owner: usize,
         fun_id: usize,
@@ -870,8 +871,9 @@ unsafe extern "C" {
     ) -> i32;
     /// The attention pre-RoPE block as one compiled closure (behind `qwen36.compile`).
     /// `dims` holds hidden, heads, kv_heads, width; `quant` holds mode, group, bits per weight
-    /// for the q, k, v projections; `inputs` holds the 12 closure inputs (x, then the q, k, v
-    /// packed triples, then q_norm, k_norm); `eps` is the RMS norm epsilon. The four outputs
+    /// for the q, k, v projections; `inputs` holds the 13 closure inputs (the raw residual
+    /// stream, then the q, k, v packed triples, then q_norm, k_norm, then the folded input
+    /// norm weight); `eps` is the RMS norm epsilon. The four outputs
     /// (q, k, v, gate) are lazy. A non-zero status is a native failure of the adapter.
     #[link_name = "inference_mlx_compile_attn_pre_block"]
     pub(super) fn mlx_compile_attn_pre_block(
@@ -890,9 +892,10 @@ unsafe extern "C" {
     ) -> i32;
     /// The attention post-core block as one compiled closure (behind `qwen36.compile`).
     /// `dims` holds heads, width, hidden; `quant` holds mode, group, bits of the output
-    /// projection weight; `inputs` holds the 5 closure inputs (the attention core output
-    /// `[1, heads, 1, width]`, the gate `[heads, width]`, then the packed output weight
-    /// triple). The single output is lazy. A non-zero status is a native failure of the
+    /// projection weight; `inputs` holds the 6 closure inputs (the attention core output
+    /// `[1, heads, 1, width]`, the gate `[heads, width]`, the packed output weight
+    /// triple, then the raw residual stream `[1, hidden]` of the folded residual add).
+    /// The single output is lazy. A non-zero status is a native failure of the
     /// adapter.
     #[link_name = "inference_mlx_compile_attn_post_block"]
     pub(super) fn mlx_compile_attn_post_block(
