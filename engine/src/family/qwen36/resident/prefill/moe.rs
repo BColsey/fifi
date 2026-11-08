@@ -603,7 +603,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (got, routes) = chunk(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+        // The decode seam folds the input norm and the output residual; the chunk keeps the
+        // raw contract, so bridge both for the one-row comparison.
+        let one_normed = ctx
+            .kernels
+            .rms_norm(&one, &w.layers[0].post_norm, shape.eps)
+            .unwrap();
+        let (got, routes) =
+            chunk(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one_normed).unwrap();
         let (want, (selection, _)) = decode_step(
             &mut ctx,
             &shape,
@@ -619,11 +626,13 @@ mod tests {
             .zip(routes[0].weights.iter().copied())
             .collect();
         assert_eq!(chosen, selection, "the route of the decode block");
-        assert_parity(
-            &values(&mut kernels, &got).unwrap(),
-            &values(&mut kernels, &want).unwrap(),
-            "one row",
-        );
+        let want_mixer: Vec<f32> = values(&mut kernels, &want)
+            .unwrap()
+            .iter()
+            .zip(&x)
+            .map(|(v, r)| v - r)
+            .collect();
+        assert_parity(&values(&mut kernels, &got).unwrap(), &want_mixer, "one row");
     }
 
     fn read_u32(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u32> {
