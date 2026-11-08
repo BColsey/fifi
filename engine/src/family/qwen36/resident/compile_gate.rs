@@ -1282,7 +1282,7 @@ fn moe_seam_args<'a>(
         router_t: &w.router_t,
         shared: [&w.shared_gate, &w.shared_up, &w.shared_down],
         shared_scalar_t: &w.shared_scalar_t,
-        stacks: [&w.gate, &w.up, &w.down],
+        stacks: [&w.gate_up, &w.down],
         hidden: dim(shape.hidden).unwrap(),
         experts: dim(shape.moe.experts).unwrap(),
         top_k: dim(shape.moe.top_k).unwrap(),

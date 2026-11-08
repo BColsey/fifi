@@ -173,8 +173,9 @@ pub(crate) struct CompileMoeArgs<'a> {
     pub(crate) shared: [&'a ResidentPackedWeight; 3],
     /// The transposed shared gate scalar `[H, 1]`.
     pub(crate) shared_scalar_t: &'a ExecutionTensor,
-    /// The expert gate, up, down stacks.
-    pub(crate) stacks: [&'a ResidentPackedWeight; 3],
+    /// The stacked gate/up expert operand (logical `[E, 2I, H]`) and the down stack
+    /// (`[E, H, I]`): one gathered product feeds the SwiGLU split of both projections.
+    pub(crate) stacks: [&'a ResidentPackedWeight; 2],
     pub(crate) hidden: u32,
     pub(crate) experts: u32,
     pub(crate) top_k: u32,
@@ -768,8 +769,9 @@ impl Context {
     /// The ids are once-clamped; callers can wrap them with `BoundedIndices::from_clamped`.
     ///
     /// Inputs: `x` `[B, H]` in the activation dtype, the F32 `router_t` `[H, E]`, the three
-    /// shared packed weights, the F32 `shared_scalar_t` `[H, 1]`, and the three expert stacks
-    /// with the logical shapes `[E, I, H]` (gate, up) and `[E, H, I]` (down). Every tensor must
+    /// shared packed weights, the F32 `shared_scalar_t` `[H, 1]`, and the two expert stacks
+    /// with the logical shapes `[E, 2I, H]` (the stacked gate/up operand) and `[E, H, I]`
+    /// (down). Every tensor must
     /// belong to this adapter; `check_operand`, the F32 rule, and `check_owner` plus the expert
     /// count and the widths of the logical shapes reject anything else before the first native
     /// call (an out-of-range device gather is not bounds-checked by MLX).
@@ -818,14 +820,13 @@ impl Context {
             ));
         }
         // The expert stacks must hold exactly the baked expert count and the hidden width where
-        // the block reads it: the gate and up stacks read `[1, H]` (their last dimension), the
-        // down stack writes `[1, H]` (its middle dimension), the shared weights the same at rank
-        // 2. A stack that disagrees would gather past its own last expert or die in a reshape
-        // inside the traced closure.
+        // the block reads it: the stacked gate/up operand reads `[1, H]` (its last dimension),
+        // the down stack writes `[1, H]` (its middle dimension), the shared weights the same at
+        // rank 2. A stack that disagrees would gather past its own last expert or die in a
+        // reshape inside the traced closure.
         for (what, stack, reads_hidden_last) in [
-            ("gate stack", &args.stacks[0], true),
-            ("up stack", &args.stacks[1], true),
-            ("down stack", &args.stacks[2], false),
+            ("stacked gate/up operand", &args.stacks[0], true),
+            ("down stack", &args.stacks[1], false),
         ] {
             let shape = stack.logical_shape();
             let ok = match (shape, reads_hidden_last) {
@@ -902,7 +903,7 @@ impl Context {
             .each_ref()
             .map(|weight| compile_key::dtype_key(weight.scales().dtype()));
         let [sg, su, sd] = shared_triples;
-        let [xg, xu, xd] = stack_triples;
+        let [xg, xd] = stack_triples;
         let fun_id = compile_key::moe_fun_id(&compile_key::MoeBaked {
             hidden: args.hidden,
             experts: args.experts,
@@ -920,12 +921,11 @@ impl Context {
                 shared_scales[2],
                 stack_scales[0],
                 stack_scales[1],
-                stack_scales[2],
             ],
-            quant: [sg, su, sd, xg, xu, xd],
+            quant: [sg, su, sd, xg, xd],
         });
         adapter.programs.admit(fun_id)?;
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(22);
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(19);
         inputs.push(args.x.storage.native_array());
         inputs.push(args.router_t.storage.native_array());
         // The native body reads the shared scalar at index 11, between the shared weights and the
@@ -951,7 +951,7 @@ impl Context {
                     .unwrap_or(ffi::NULL_ARRAY),
             );
         }
-        // The folded post-attention norm weight closes the 22-operand input list.
+        // The folded post-attention norm weight closes the 19-operand input list.
         inputs.push(args.post_norm.storage.native_array());
         let mut keep: Vec<_> = [args.x, args.router_t, args.shared_scalar_t, args.post_norm]
             .into_iter()

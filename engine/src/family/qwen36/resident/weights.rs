@@ -281,8 +281,9 @@ pub(super) struct RMoe {
     pub(super) shared_up: ResidentPackedWeight,
     pub(super) shared_down: ResidentPackedWeight,
     pub(super) shared_scalar_t: ExecutionTensor,
-    pub(super) gate: ResidentPackedWeight,
-    pub(super) up: ResidentPackedWeight,
+    /// The gate and up projections of all experts stacked along the output axis: ONE operand of
+    /// one `gather_qmm` per step instead of two.
+    pub(super) gate_up: ResidentPackedWeight,
     pub(super) down: ResidentPackedWeight,
     /// The pages under the three stacks. Field order is drop order: the pages outlive the stacks.
     pages: HostPages,
@@ -382,14 +383,16 @@ impl RMoe {
         }
         let [gate, up, down]: [ResidentPackedWeight; 3] =
             imported.try_into().map_err(|_| short_import())?;
+        // The gate and up stacks join along the output axis: the host pages keep their three
+        // roles, the device holds the one stacked operand, and the two originals free here.
+        let gate_up = kernels.concat_packed_outputs(&gate, &up)?;
         Ok(Self {
             router_t: front.router_t,
             shared_gate: front.shared_gate,
             shared_up: front.shared_up,
             shared_down: front.shared_down,
             shared_scalar_t: front.shared_scalar_t,
-            gate,
-            up,
+            gate_up,
             down,
             pages,
         })
@@ -402,8 +405,7 @@ impl RMoe {
             &self.shared_gate,
             &self.shared_up,
             &self.shared_down,
-            &self.gate,
-            &self.up,
+            &self.gate_up,
             &self.down,
         ] {
             total.packed(w)?;

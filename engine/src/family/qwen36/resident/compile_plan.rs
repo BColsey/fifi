@@ -60,7 +60,7 @@ pub(super) struct MoeLayerFacts {
     /// The activation dtype key (`compile_key::dtype_key`).
     pub(super) act: u64,
     /// The weight facts, in the seam's order.
-    pub(super) weights: [WeightFacts; 6],
+    pub(super) weights: [WeightFacts; 5],
 }
 
 /// The facts of one attention layer of the model: where the layer sits, the baked constants of
@@ -162,8 +162,7 @@ pub(super) fn model_warmup(
                     "shared gate",
                     "shared up",
                     "shared down",
-                    "gate stack",
-                    "up stack",
+                    "stacked gate/up",
                     "down stack",
                 ],
             )?;
@@ -273,7 +272,7 @@ mod tests {
             renorm: 1,
             clamp: 255,
             act: dtype_key(Dtype::F32),
-            weights: [affine(bits); 6],
+            weights: [affine(bits); 5],
             eps_bits: 1e-6f32.to_bits(),
         }
     }

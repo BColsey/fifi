@@ -136,10 +136,10 @@ pub(crate) struct MoeBaked {
     pub(crate) eps_bits: u32,
     pub(crate) act: u64,
     /// The scale dtype key of EACH packed weight, in the seam's weight order shared gate, up,
-    /// down, then the gate, up, down expert stacks.
-    pub(crate) scale_keys: [u64; 6],
+    /// down, then the stacked gate/up expert operand and the down stack.
+    pub(crate) scale_keys: [u64; 5],
     /// The quantization triple of EACH packed weight, in the same order.
-    pub(crate) quant: [[i32; 3]; 6],
+    pub(crate) quant: [[i32; 3]; 5],
 }
 
 pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
@@ -353,8 +353,8 @@ mod tests {
             clamp: 255,
             eps_bits: 1.0e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
-            scale_keys: [1, 1, 1, 1, 1, 1],
-            quant: [[0, 64, 4]; 6],
+            scale_keys: [1, 1, 1, 1, 1],
+            quant: [[0, 64, 4]; 5],
         }
     }
 
@@ -589,7 +589,7 @@ mod tests {
     /// The row count of the delta table below: one row per scalar field, per dimension, per
     /// scale key, and per quantization value.
     const DELTA_ROWS: usize = 1 + 1 + 8 + 1 + 1 + 5 + 5 * 3;
-    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
+    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 5 * 3;
     /// The row count of the Flint tail table below: one row per scalar field, per scale
     /// key, and per quantization value.
     const FLINT_ROWS: usize = 1 + 1 + 1 + 1 + 3 + 3 * 3;
@@ -858,48 +858,41 @@ mod tests {
             (
                 "scale_keys[0]",
                 MoeBaked {
-                    scale_keys: [0, 1, 1, 1, 1, 1],
+                    scale_keys: [0, 1, 1, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[1]",
                 MoeBaked {
-                    scale_keys: [1, 0, 1, 1, 1, 1],
+                    scale_keys: [1, 0, 1, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[2]",
                 MoeBaked {
-                    scale_keys: [1, 1, 0, 1, 1, 1],
+                    scale_keys: [1, 1, 0, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[3]",
                 MoeBaked {
-                    scale_keys: [1, 1, 1, 0, 1, 1],
+                    scale_keys: [1, 1, 1, 0, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[4]",
                 MoeBaked {
-                    scale_keys: [1, 1, 1, 1, 0, 1],
-                    ..base
-                },
-            ),
-            (
-                "scale_keys[5]",
-                MoeBaked {
-                    scale_keys: [1, 1, 1, 1, 1, 0],
+                    scale_keys: [1, 1, 1, 1, 0],
                     ..base
                 },
             ),
         ]
         .into_iter()
-        .chain((0..6).flat_map(|weight| {
+        .chain((0..5).flat_map(|weight| {
             (0..3).map(move |field| {
                 let names = ["mode", "group", "bits"];
                 let name = names[field];
@@ -934,8 +927,8 @@ mod tests {
             clamp: 255,
             eps_bits: 1.0e-6f32.to_bits(),
             act: d.act,
-            scale_keys: [d.scale_keys[0], 1, 1, 1, 1, 1],
-            quant: [d.quant[0]; 6],
+            scale_keys: [d.scale_keys[0], 1, 1, 1, 1],
+            quant: [d.quant[0]; 5],
         };
         assert_ne!(
             delta_fun_id(&d),

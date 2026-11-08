@@ -182,8 +182,15 @@ fn combine_core(
 ) -> Result<ExecutionTensor, EngError> {
     let hidden = dim(shape.hidden)?;
     let x3 = ctx.kernels.reshape(x, &[1, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
-    let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
+    // One gathered product of the stacked gate/up operand: rows [0, I) carry the gate
+    // projection and rows [I, 2I) the up projection of every selected expert, so the two
+    // bandwidth-bound gathers of the layer become one.
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let (rows, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[rows, 1, half])?;
+    let hu = ctx
+        .kernels
+        .slice(&stacked, &[0, 0, half], &[rows, 1, half * 2])?;
     // The act_mul fused kernel (Q36_FUSED_PREFILL=1) replaces silu+mul.
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
@@ -284,8 +291,14 @@ pub(super) fn combine_rows(
         .checked_mul(top_k)
         .ok_or_else(|| EngError::BadRequest("moe pair count overflows u32".into()))?;
     let x3 = ctx.kernels.reshape(&x3, &[pairs, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
-    let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
+    // The stacked gate/up operand: one gathered product for the whole window, split into the
+    // gate half [0, I) and the up half [I, 2I) of every selected pair row.
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
+    let hu = ctx
+        .kernels
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
         && hg.dtype() == Dtype::Bf16

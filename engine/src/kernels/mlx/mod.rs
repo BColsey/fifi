@@ -1026,6 +1026,73 @@ impl MlxKernels {
             .gather_qmm_sorted_bounded(x, stack, indices.ids(), indices.bound())
     }
 
+    /// Stacks two packed expert weights along the output axis of every expert, so the two
+    /// projections of a layer become ONE operand of one `gather_qmm` call. The groups of the
+    /// packed payloads stay contiguous (the group size divides both output counts), so every
+    /// output row of the stacked product equals the matching row of the two separate products.
+    /// Both weights must be `[experts, outputs, inputs]` with the same expert and input counts,
+    /// the same quantization, and the same bias presence.
+    pub fn concat_packed_outputs(
+        &mut self,
+        first: &ResidentPackedWeight,
+        second: &ResidentPackedWeight,
+    ) -> Result<ResidentPackedWeight, EngError> {
+        let shape_of = |weight: &ResidentPackedWeight| -> Option<(u32, u32, u32)> {
+            let shape = weight.logical_shape();
+            match shape {
+                [experts, outputs, inputs] => Some((*experts, *outputs, *inputs)),
+                _ => None,
+            }
+        };
+        let (experts, first_outputs, inputs) = shape_of(first)
+            .ok_or_else(|| EngError::BadRequest("packed concat needs a rank three stack".into()))?;
+        let (second_experts, second_outputs, second_inputs) = shape_of(second)
+            .ok_or_else(|| EngError::BadRequest("packed concat needs a rank three stack".into()))?;
+        if second_experts != experts || second_inputs != inputs {
+            return Err(EngError::BadRequest(
+                "packed concat stacks differ in experts or inputs".into(),
+            ));
+        }
+        if second.quantization() != first.quantization() {
+            return Err(EngError::BadRequest(
+                "packed concat stacks differ in quantization".into(),
+            ));
+        }
+        match (first.biases(), second.biases()) {
+            (Some(a), Some(b)) => {
+                if a.shape() != b.shape() {
+                    return Err(EngError::BadRequest(
+                        "packed concat stacks differ in bias shape".into(),
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(EngError::BadRequest(
+                    "packed concat needs bias presence to match".into(),
+                ));
+            }
+        }
+        let axis = 1;
+        let payload = self.concatenate(&[first.payload(), second.payload()], axis)?;
+        let scales = self.concatenate(&[first.scales(), second.scales()], axis)?;
+        let biases = match (first.biases(), second.biases()) {
+            (Some(a), Some(b)) => Some(self.concatenate(&[a, b], axis)?),
+            _ => None,
+        };
+        Ok(ResidentPackedWeight {
+            payload,
+            scales,
+            biases,
+            logical_shape: vec![experts, first_outputs + second_outputs, inputs],
+            logical_elements: first
+                .logical_elements()
+                .checked_add(second.logical_elements())
+                .ok_or_else(|| EngError::BadRequest("packed concat overflows".into()))?,
+            quantization: first.quantization(),
+        })
+    }
+
     /// Gathers along `axis` with ids that `bound_indices` clamped once. The checks and the output
     /// layout are those of `take`. While the recorded bound covers the axis length the method
     /// builds no clamp node; with a bound past the axis length it clamps on the device itself, so
