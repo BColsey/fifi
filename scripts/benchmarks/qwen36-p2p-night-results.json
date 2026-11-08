@@ -1,0 +1,217 @@
+{
+  "schema": 1,
+  "hardware": "RTX 3060 12 GB + RTX 3080 10 GB, peer access enabled",
+  "model": "Qwen3.6-35B-A3B Q4_K_M GGUF, q8 KV",
+  "prefill_method": "prompt tokens divided by wall time to the complete short reply; includes request overhead and output",
+  "limitations": [
+    "The night prefill arms use different engine builds and in some cases different host-expert placements; they are not a controlled same-binary comparison.",
+    "The night SSE decode script counts non-empty content chunks, not output tokens; its rates are excluded.",
+    "A configured context limit is not a prompt processed at that depth.",
+    "The near-128k response reached the total context limit; its checker verified only the first five requested numbers."
+  ],
+  "night_prefill_records": [
+    {
+      "file": "baseline-prefill-524.json",
+      "sha256": "dedcceb5756695b55525c8d932510cee23d5aeac0162602595153cb16e81c367",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.031245,
+            "estimated_prompt_tokens_per_second": 32.686,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.014412,
+            "estimated_prompt_tokens_per_second": 32.721,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.012291,
+            "estimated_prompt_tokens_per_second": 32.725,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 16.014412,
+        "median_prompt_tokens_per_second": 32.721
+      }
+    },
+    {
+      "file": "fused-prefill-524.json",
+      "sha256": "a4d8b8c3b30dda1620a9f4d6bbbee0d5c45cf44e587e6b7fe704774e8c076669",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.287151,
+            "estimated_prompt_tokens_per_second": 34.277,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.24983,
+            "estimated_prompt_tokens_per_second": 34.361,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.242944,
+            "estimated_prompt_tokens_per_second": 34.377,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 15.24983,
+        "median_prompt_tokens_per_second": 34.361
+      }
+    },
+    {
+      "file": "combined-prefill-524.json",
+      "sha256": "2d27ba02be8d636efda864c6663958d91992fac6e5b03f2bb7860d8633b35930",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30501,
+            "estimated_prompt_tokens_per_second": 39.384,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.183093,
+            "estimated_prompt_tokens_per_second": 39.748,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30754,
+            "estimated_prompt_tokens_per_second": 39.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 13.30501,
+        "median_prompt_tokens_per_second": 39.384
+      }
+    },
+    {
+      "file": "combined-prefill-4274.json",
+      "sha256": "7cd6bc37efa4cb3f37b9b1f78d421d866ffa4be24e1f3703aa2b2a29478842ec",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 850,
+        "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+        "samples": [
+          {
+            "prompt_tokens": 4274,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 105.979762,
+            "estimated_prompt_tokens_per_second": 40.328,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000008"
+          }
+        ],
+        "median_seconds": 105.979762,
+        "median_prompt_tokens_per_second": 40.328
+      }
+    },
+    {
+      "file": "waterfill2-prefill-524.json",
+      "sha256": "42f4c01719b8db81ded7c335f6a46183e252e84e3bd27773ecf4862a4e4fc984",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.009553,
+            "estimated_prompt_tokens_per_second": 40.278,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.990074,
+            "estimated_prompt_tokens_per_second": 40.338,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.977869,
+            "estimated_prompt_tokens_per_second": 40.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 12.990074,
+        "median_prompt_tokens_per_second": 40.338
+      }
+    }
+  ],
+  "near_128k_server_telemetry": {
+    "file": "near-128k-server-evidence.json",
+    "sha256": "f6b47a951e1a83064cce5a776300db4c62a8e5d23cab23269ee10e7e36650f1d",
+    "data": {
+      "source": "systemd user-engine request log",
+      "engine_pid": "350093",
+      "engine_executable": "/home/ben/fifi-scratch/7f9c3ee80929/ring-fuse-moe/target/release/enginesrv",
+      "message": {
+        "request_id": "chatcmpl-0000000000000001",
+        "status": 200,
+        "outcome": "ok",
+        "finish_reason": "length",
+        "prompt_tokens": 130981,
+        "completion_tokens": 91,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 3736681.5,
+        "decode_tokens_per_second": 29.96
+      },
+      "limitation": "This was a separate fusion build, not the exact upstream PR binary. The response was cut short by the 131072-token total context. A separate script checked only the first five counted numbers, not the complete requested output."
+    }
+  }
+}
