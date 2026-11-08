@@ -282,8 +282,6 @@ fn allocation(error: std::collections::TryReserveError) -> EngError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::super::cache::BankReason;
     use super::*;
     use crate::weights::exl3::flint_pack::{Geometry, PackBuilder};
@@ -329,12 +327,15 @@ mod tests {
         limits.max_weight_bytes = packing.bytes as u64;
         limits.max_staging_bytes = packing.staging;
         assert!(Packing::new(&layout, &limits).is_ok());
-        // Keep the receipt visible without changing the existing test runner's capture flags.
-        writeln!(
-            std::io::stdout().lock(),
+        // Use --show-output for the receipt without interrupting libtest status lines.
+        println!(
             "EXPECTED_CPU_PLAN device_weight_bytes={} staging_bytes={} arena_align={} modules={} plain={}; NOT measured VRAM peak",
-            packing.bytes, packing.staging, ARENA_ALIGN, layout.modules.len(), layout.plain.len()
-        ).unwrap();
+            packing.bytes,
+            packing.staging,
+            ARENA_ALIGN,
+            layout.modules.len(),
+            layout.plain.len()
+        );
     }
 
     #[test]
