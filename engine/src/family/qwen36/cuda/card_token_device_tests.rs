@@ -1089,6 +1089,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             &heads,
             eps,
             t,
+            true,
         )?;
         let mut card_reads = Vec::with_capacity(2);
         let mut boundaries = Vec::with_capacity(2);

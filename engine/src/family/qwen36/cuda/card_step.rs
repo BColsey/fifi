@@ -215,6 +215,11 @@ impl CardStack {
         &self.streams
     }
 
+    #[cfg(test)]
+    pub(super) fn enable_broadcast_sync_for_test(&mut self) {
+        self.sync_broadcasts = true;
+    }
+
     /// One ring sum over every card: `partials[card]` in, `outs[card]`
     /// out, `statuses[card]` ORed. The executor's per-op entry point; the
     /// caller keeps the gather-pair gate and the end-of-token fold.

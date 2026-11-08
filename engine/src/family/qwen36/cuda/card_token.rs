@@ -6,9 +6,8 @@
 //! row rides ONE broadcast (`EmbedBroadcast`) so every card's residual
 //! stream starts identical; per layer the mixer block (`run_card_block`,
 //! its K/V gathers inside) then the MoE block (`run_card_moe_block`, its
-//! route broadcast and sums inside); the final norm, the head projection
-//! over the card's own vocabulary shard, the argmax over that shard, and
-//! `step_advance` - every card, on its own stream.
+//! route broadcast and sums inside); optionally the final norm, the head projection
+//! over the card's own vocabulary shard and argmax; then `step_advance` on every card.
 //!
 //! The residual stream alternates exactly as single-device `resid_in`/
 //! `resid_out` pin: the embedding writes `ResidA`, layer `l`'s mixer adds
@@ -88,7 +87,8 @@ pub(crate) fn merge_head_candidates(shards: &[&[f32]], starts: &[usize]) -> i32 
 /// later token write the merged token id into card 0's `TokenId` word -
 /// each card's own argmax writes its LOCAL id, which is not the global
 /// one - and let `step_advance`, run at each token's end, keep `pos` and
-/// `kv_len` moving).
+/// `kv_len` moving). When `project_head` is false, the host supplies the
+/// next token and neither the discarded logits nor their argmax are needed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_card_token(
     stack: &CardStack,
@@ -104,6 +104,7 @@ pub(crate) fn run_card_token(
     heads: &[&NativeWeight],
     eps: f32,
     admit_pos: usize,
+    project_head: bool,
 ) -> Result<(), EngError> {
     let cards = stack.shards().len();
     if kinds.len() != ordinals.len()
@@ -236,49 +237,52 @@ pub(crate) fn run_card_token(
         let ops: Vec<&[CardMoeOp]> = lists.iter().map(|l| l.as_slice()).collect();
         run_card_moe_block(stack, moe[layer], &sets, &ops)?;
     }
-    // The tail on every card: final norm, the head shard, its argmax,
-    // the advance.
+    // Prompt-only feeds can omit the unused vocabulary projection; state
+    // advancement still runs. The next token id is always injected by the
+    // card session before the next step.
     for card in 0..cards {
         let ctx = &stack.contexts()[card];
         let stream = &stack.streams()[card];
         let params = states[card].word(Word::StepParams)?;
-        let norm = output_norms[card].range(0, output_norms[card].bytes())?;
-        ctx.add_rmsnorm_q8(
-            stream,
-            AddNormQ8Call {
-                n: hidden,
-                eps,
-                h: view(card, final_resid(kinds.len()))?,
-                delta: None,
-                weight: norm,
-                norm_out: view(card, Slot::FinalNormRow)?,
-                q8: view(card, Slot::Q8Final)?,
-            },
-        )?;
-        let head = heads[card];
-        let rows = head.n_rows();
-        ctx.matvec_q(
-            stream,
-            MatvecCall {
-                ty: head.quant(),
-                w: head.buffer().range(0, head.buffer().bytes())?,
-                x_q8: view(card, Slot::Q8Final)?,
-                y: view(card, Slot::Logits)?,
-                k: head.k(),
-                rows,
-                ncols: 1,
-            },
-        )?;
-        ctx.argmax(
-            stream,
-            ArgmaxCall {
-                n: rows,
-                logits: view(card, Slot::Logits)?,
-                part: view(card, Slot::ArgmaxPart)?,
-                params,
-                result: Some(states[card].word(Word::ResultPair)?),
-            },
-        )?;
+        if project_head {
+            let norm = output_norms[card].range(0, output_norms[card].bytes())?;
+            ctx.add_rmsnorm_q8(
+                stream,
+                AddNormQ8Call {
+                    n: hidden,
+                    eps,
+                    h: view(card, final_resid(kinds.len()))?,
+                    delta: None,
+                    weight: norm,
+                    norm_out: view(card, Slot::FinalNormRow)?,
+                    q8: view(card, Slot::Q8Final)?,
+                },
+            )?;
+            let head = heads[card];
+            let rows = head.n_rows();
+            ctx.matvec_q(
+                stream,
+                MatvecCall {
+                    ty: head.quant(),
+                    w: head.buffer().range(0, head.buffer().bytes())?,
+                    x_q8: view(card, Slot::Q8Final)?,
+                    y: view(card, Slot::Logits)?,
+                    k: head.k(),
+                    rows,
+                    ncols: 1,
+                },
+            )?;
+            ctx.argmax(
+                stream,
+                ArgmaxCall {
+                    n: rows,
+                    logits: view(card, Slot::Logits)?,
+                    part: view(card, Slot::ArgmaxPart)?,
+                    params,
+                    result: Some(states[card].word(Word::ResultPair)?),
+                },
+            )?;
+        }
         ctx.step_advance(stream, params, 1)?;
     }
     Ok(())

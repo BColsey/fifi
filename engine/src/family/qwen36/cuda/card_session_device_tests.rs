@@ -80,11 +80,23 @@ fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     if !device_present(NAME) {
         return;
     }
-    let result = run_session_rig(NAME);
+    let result = run_session_rig(NAME, [0, 0]);
     result.expect("the card session rig");
 }
 
-fn run_session_rig(name: &'static str) -> Result<(), EngError> {
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
+    const NAME: &str = "prefill_without_head_matches_normal_logits_on_peer_gpus";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_session_rig(NAME, devices).expect("two-GPU session parity");
+}
+
+fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
@@ -247,7 +259,8 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
     let admission = served_admission();
     let shard = ShardTable::new(&d.shape, 2, 32)?;
     let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let (stack, states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let (mut stack, states) = CardStack::new(&d, &options, &devices, &admission)?;
+    stack.enable_broadcast_sync_for_test();
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
         ..LoadOptions::default()
@@ -281,6 +294,7 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
         eos,
         vocab,
     )?;
+    session.set_skip_prefill_head_for_test(false);
     let limit = session.context_limit();
     if limit < 4 {
         return Err(EngError::Checkpoint(format!(
@@ -332,6 +346,48 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
     assert_eq!(
         row, row_after,
         "{name}: the reset run reproduces the logits row exactly"
+    );
+
+    // Record a later decode row after another prompt feed. The optimized
+    // path must preserve state both before and after a logits-producing step.
+    session.feed(3)?;
+    let next_row = session.logits(4)?;
+    TokenStepper::reset(&mut session)?;
+    session.set_skip_prefill_head_for_test(true);
+    session.feed(0)?;
+    session.feed(1)?;
+    let optimized_row = session.logits(2)?;
+    assert_eq!(row, optimized_row, "{name}: first decoded logits");
+    session.feed(3)?;
+    let optimized_next = session.logits(4)?;
+    assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
+
+    // A corrupt head makes a logits-producing step fail. A prompt-only feed
+    // must still succeed with that head, proving that it was not launched.
+    let head = match loaded[0].get(&names.head) {
+        Some(crate::family::project::cuda::CudaWeight::Native { weight, .. }) => weight.buffer(),
+        _ => {
+            return Err(EngError::Checkpoint(
+                "test fixture has no native head".into(),
+            ));
+        }
+    };
+    let stream = &stack.streams()[0];
+    let mut saved = vec![0u8; head.bytes()];
+    head.read_at(stream, 0, &mut saved)?;
+    head.write_at(stream, 0, &vec![0xff; saved.len()])?;
+    TokenStepper::reset(&mut session)?;
+    let feed_result = session.feed(0);
+    let logits_result = if feed_result.is_ok() {
+        Some(session.logits(1))
+    } else {
+        None
+    };
+    head.write_at(stream, 0, &saved)?;
+    feed_result?;
+    assert!(
+        matches!(logits_result, Some(Err(EngError::Backend { .. }))),
+        "{name}: the decode must still reject a non-finite head"
     );
     Ok(())
 }
