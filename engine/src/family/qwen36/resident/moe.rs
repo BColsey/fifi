@@ -69,8 +69,6 @@ pub(super) fn fused_prefill() -> bool {
     *ON.get_or_init(|| std::env::var_os("Q36_FUSED_PREFILL").is_none_or(|v| v != "0"))
 }
 
-use crate::tensor::Dtype;
-
 /// The shared expert of one row `[1, H]` or of a whole row stack `[B, H]`: the
 /// three dense weights (gate, up, down) meet the rows in ONE qmm each
 /// (`linear_rows`), and the scalar factor broadcasts `[B, 1]` over the stack.
