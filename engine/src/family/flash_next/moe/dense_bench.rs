@@ -191,7 +191,8 @@ fn layer_index(var: &str, default: usize) -> Res<usize> {
 }
 
 /// The cases `FIFI_FLASH_NEXT_DENSE_CASES` names (comma separated), all of them when it is unset.
-/// A value that is not UTF-8 or a name that matches no case is refused.
+/// A value that is not UTF-8 or a name that matches no case and no group is refused; group names
+/// belong to [`selected_groups`].
 fn selected_cases() -> Res<Vec<&'static Case>> {
     let Some(value) = std::env::var_os("FIFI_FLASH_NEXT_DENSE_CASES") else {
         return Ok(CASES.iter().collect());
@@ -201,6 +202,7 @@ fn selected_cases() -> Res<Vec<&'static Case>> {
         .ok_or_else(|| fail("FIFI_FLASH_NEXT_DENSE_CASES must be UTF-8"))?;
     names
         .split(',')
+        .filter(|name| GROUPS.iter().all(|group| group.name != *name))
         .map(|name| {
             CASES.iter().find(|case| case.name == name).ok_or_else(|| {
                 fail(format!(
