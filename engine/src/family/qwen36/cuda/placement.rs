@@ -498,11 +498,19 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+/// The native matvec serves dense rows in multiples of four
+/// (`check_native_dense`), so a dealt dimension whose rows load as native
+/// dense weights moves in blocks of at least four rows.
+const NATIVE_ROWS_MULTIPLE: usize = 4;
+
 /// The legal grain of each dealt dimension. `k_align` is the quantization
 /// block along K: the column-sharded matrices (delta out, attention o,
 /// expert and shared down) must cut on K multiples of it, which forces
 /// heads to move in groups of `k_align / gcd(k_align, head width)` and
-/// inter cuts onto `lcm(VALUE_BLOCK, k_align)` multiples.
+/// inter cuts onto `lcm(VALUE_BLOCK, k_align)` multiples. Dimensions whose
+/// rows resolve through the native matvec (value heads and their beta /
+/// alpha vectors, the vocabulary head shards) additionally move in
+/// `NATIVE_ROWS_MULTIPLE` row groups.
 fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
     let head_grain = |width: usize| {
         if k_align <= 1 {
@@ -520,10 +528,12 @@ fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
     // heads move in whole 8-groups on top of the quantization grain.
     let q_grain = head_grain(shape.attn.head_dim);
     let q_block = q_grain * ATTN_Q_PER_KV_HEAD / gcd(q_grain, ATTN_Q_PER_KV_HEAD);
+    let native_grain =
+        |grain: usize| grain * NATIVE_ROWS_MULTIPLE / gcd(grain, NATIVE_ROWS_MULTIPLE);
     [
         Dim {
             total: shape.delta.value_heads,
-            block: head_grain(shape.delta.value_dim),
+            block: native_grain(head_grain(shape.delta.value_dim)),
             what: "DeltaNet value heads",
         },
         Dim {
@@ -548,7 +558,7 @@ fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
         },
         Dim {
             total: shape.vocab,
-            block: 1,
+            block: NATIVE_ROWS_MULTIPLE,
             what: "vocabulary",
         },
     ]
@@ -746,6 +756,12 @@ fn realize(
             continue;
         }
         let blocks = dim.total / dim.block;
+        if !dim.total.is_multiple_of(dim.block) {
+            return Err(format!(
+                "{} width {} is not a whole number of {}-value blocks",
+                dim.what, dim.total, dim.block
+            ));
+        }
         let per_card = deal_blocks(blocks, &cand.shares).ok_or_else(|| {
             format!(
                 "{} has {blocks} blocks for {} cards; a card would hold none",

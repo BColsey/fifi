@@ -422,3 +422,58 @@ fn unequal_bandwidth_reports_geometry_cap() {
     assert_eq!(plan.table.query_heads(0).unwrap(), 0..8);
     assert_eq!(plan.table.query_heads(1).unwrap(), 8..16);
 }
+
+#[test]
+fn the_real_shape_deals_rows_the_native_matvec_accepts() {
+    use crate::family::qwen36::cuda::pinned::ROTARY_DIM;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("shape");
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+    // The deployed pair with tonight's host-expert relief folded in.
+    let mut p0 = rtx_3060_12g(11_292 * MIB);
+    p0.free_bytes += 1_342_177_280;
+    let mut p1 = rtx_3080_10g(9_060 * MIB);
+    p1.free_bytes += 3_489_660_928;
+    let profiles = [p0, p1];
+    let policy = PlacementPolicy::default();
+    let req = PlacementRequest {
+        shape: &shape,
+        inventory: &inventory,
+        quant: GgufType::Q4K,
+        kv_capacity_rows: 131072,
+        delta_slots: 1,
+        profiles: &profiles,
+        policy: &policy,
+    };
+    let PlacementPlan { runs, table, .. } = plan_placement(&req).expect("a feasible plan");
+    // Every dealt dimension covers its whole total exactly, and the two
+    // dimensions whose rows resolve through the native matvec move in
+    // multiples of four rows on every card.
+    let lens =
+        |runs: &Vec<std::ops::Range<usize>>| runs.iter().map(|r| r.len()).collect::<Vec<_>>();
+    for (what, got, total) in [
+        ("value heads", &runs.value_heads, shape.delta.value_heads),
+        ("query heads", &runs.query_heads, shape.attn.heads_q),
+        (
+            "kv rows",
+            &runs.kv_rows,
+            shape.attn.heads_kv * shape.attn.head_dim,
+        ),
+        ("vocab", &runs.vocab, shape.vocab),
+    ] {
+        let per_card = lens(got);
+        assert_eq!(per_card.iter().sum::<usize>(), total, "{what} coverage");
+        if what == "value heads" || what == "vocab" {
+            for (card, len) in per_card.iter().enumerate() {
+                assert_eq!(
+                    len % 4,
+                    0,
+                    "{what} card {card} rows {len} break the native matvec"
+                );
+            }
+        }
+    }
+    for card in 0..2 {
+        let vh = table.value_heads(card).expect("value heads").len();
+        assert_eq!(vh % 4, 0, "card {card} beta/alpha rows {vh}");
+    }
+}
