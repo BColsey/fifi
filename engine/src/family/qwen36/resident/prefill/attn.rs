@@ -354,9 +354,19 @@ mod tests {
         let (mut outputs, mut keys, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         for n in 0..count {
             let x = input(n);
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let normed_x = rms_plain(&x, view.layers[1].input_norm, shape.eps).unwrap();
+            outputs.push(
+                host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &normed_x).unwrap(),
+            );
             outputs
-                .push(host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &x).unwrap());
-            let kp = cpu.linear(host_w.k, &x).unwrap();
+                .last_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(&x)
+                .for_each(|(a, b)| *a += b);
+            let kp = cpu.linear(host_w.k, &normed_x).unwrap();
             let mut key = Vec::new();
             for g in 0..hkv {
                 let mut head =
@@ -365,7 +375,7 @@ mod tests {
                 key.extend(head);
             }
             keys.push(key);
-            vals.push(cpu.linear(host_w.v, &x).unwrap());
+            vals.push(cpu.linear(host_w.v, &normed_x).unwrap());
         }
         HostRun {
             outputs,

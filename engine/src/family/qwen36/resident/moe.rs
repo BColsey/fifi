@@ -420,7 +420,7 @@ mod tests {
     use super::super::weights::ResidentWeights;
     use super::*;
     use crate::family::project::Projector;
-    use crate::family::qwen36::host::{self, MoeW};
+    use crate::family::qwen36::host::{self, MoeW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY};
@@ -564,7 +564,12 @@ mod tests {
         let mut seen = [false; 4];
         for n in 0..8u32 {
             let x = input(n);
-            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &x).unwrap();
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let post_norm = oracle.view().layers[0].post_norm;
+            let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
+            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
             let xr = upload(&mut kernels, &x);
             let mut ctx = Ctx {
                 kernels: &mut kernels,
@@ -970,7 +975,12 @@ mod tests {
         let mut cpu = CpuProjector::new(&ckpt, 1);
         for n in 0..8u32 {
             let x = input(n);
-            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &x).unwrap();
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let post_norm = oracle.view().layers[0].post_norm;
+            let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
+            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
             let xr = upload(&mut kernels, &x);
             let (out, route) = {
                 let mut ctx = Ctx {

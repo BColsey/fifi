@@ -254,7 +254,7 @@ mod tests {
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
     use crate::family::project::Projector;
-    use crate::family::qwen36::host::{self, DeltaState, MixerW};
+    use crate::family::qwen36::host::{self, DeltaState, MixerW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY, TINY_WIDE};
@@ -321,8 +321,13 @@ mod tests {
         let mut projected = Vec::new();
         for n in 0..5u32 {
             let x = input(n);
-            let want = host::delta_step(&mut cpu, &shape, host_w, &mut host_state, &x).unwrap();
-            projected.push(cpu.linear(host_w.qkv, &x).unwrap());
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let normed_x = rms_plain(&x, view.layers[0].input_norm, shape.eps).unwrap();
+            let want =
+                host::delta_step(&mut cpu, &shape, host_w, &mut host_state, &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
+            projected.push(cpu.linear(host_w.qkv, &normed_x).unwrap());
             let xr = kernels
                 .import_tensor(&f32_tensor(vec![1, 64], &x).unwrap())
                 .unwrap();
