@@ -303,6 +303,12 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
     }
 }
 
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "staged for the chunked prefill step")
+)]
+pub(super) mod chunk;
 #[cfg(test)]
 pub(super) mod fakes;
 #[cfg(test)]
