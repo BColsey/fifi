@@ -966,14 +966,14 @@ mod tests {
                 knob: ("Q36_SCALE_DTYPE", "bf16"),
                 activation: Activation::F32,
                 want: "activation_dtype f32 needs F32 scales and biases; the census holds \
-                       43 packed weights with 0 F32, 86 BF16, and 0 other parts",
+                       39 packed weights with 0 F32, 78 BF16, and 0 other parts",
             },
             Mismatch {
                 // F32 scales under a `bf16` activation: every qmm would promote back to F32.
                 knob: ("Q36_SCALE_DTYPE", "f32"),
                 activation: Activation::Bf16,
                 want: "activation_dtype bf16 needs BF16 scales and biases; the census holds \
-                       43 packed weights with 86 F32, 0 BF16, and 0 other parts",
+                       39 packed weights with 78 F32, 0 BF16, and 0 other parts",
             },
         ];
         if let Some(which) = std::env::var_os(CHILD) {

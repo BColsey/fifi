@@ -397,13 +397,13 @@ mod tests {
         );
         // The MoE block refuses its own biasless weights on the device-routed path.
         let mut moe = moe_layer(5, 4);
-        moe.weights[4].biases = false;
+        moe.weights[3].biases = false;
         let refused = model_warmup(true, true, &[], &[moe], &[]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the biasless refusal is a BadRequest");
         };
         assert!(
-            message.contains("layer 5") && message.contains("the up stack weight has none"),
+            message.contains("layer 5") && message.contains("the stacked gate/up weight has none"),
             "the refusal names the layer and the weight: {message}"
         );
     }
