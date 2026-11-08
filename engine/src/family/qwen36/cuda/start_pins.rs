@@ -352,14 +352,16 @@ fn the_weight_format_selects_the_load_in_make() {
     let device = make
         .find("CudaProjector::new()")
         .expect("make opens the device");
-    let pack = make.find("load_exl3_dir(").expect("make loads the pack");
+    let pack = make
+        .find("load_exl3_dir_decided(")
+        .expect("make loads the pack");
     let layout = make
         .find("device.layout()?")
         .expect("make reads the layout");
     assert!(device < pack && pack < layout, "{device} {pack} {layout}");
     // Only the GGUF arm reaches the file-based loads.
     assert_eq!(make.matches("open_gguf(").count(), 1);
-    assert_eq!(make.matches("load_exl3_dir(").count(), 1);
+    assert_eq!(make.matches("load_exl3_dir_decided(").count(), 1);
 }
 
 #[test]

@@ -721,7 +721,7 @@ fn the_start_checks_the_krow_switches_before_the_weights_and_arms_the_k_row_path
     );
     // The early block: guard, then the switches; all before the first weight read.
     assert!(at("settings.draft_verify == VerifyMode::Krow") < at("check_krow_env("));
-    assert!(at("check_krow_env(") < at("load_exl3_dir(&projector"));
+    assert!(at("check_krow_env(") < at("load_exl3_dir_decided(&projector"));
     // The K-row arena is added to the resources only for a K-row session, before they are leaked.
     assert!(
         at("res.with_krow(") < at("let res: &'static StepResources = Box::leak(Box::new(res));")

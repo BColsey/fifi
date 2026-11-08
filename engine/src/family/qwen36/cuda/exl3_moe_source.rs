@@ -9,8 +9,9 @@
 
 use super::{
     super::exl3_pack::{
-        ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
+        ExpertPart, Root, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
     },
+    exl3_bank::{ExpertStore, PartStore},
     exl3_source::PackReader,
     layer_table::LayerTable,
     mixer_geometry::DenseSpec,
@@ -18,7 +19,11 @@ use super::{
 };
 use crate::{
     EngError,
-    family::{gguf_model::Role, project::cuda::CudaWeight},
+    family::{
+        gguf_model::Role,
+        project::cuda::{CudaWeight, exl3::exl3_member_staging},
+    },
+    weights::exl3::Matrix,
 };
 
 /// Output rows and input length each expert projection must have.
@@ -127,6 +132,30 @@ pub(super) fn moe_weights(
     layer: usize,
     moe: &MoeDims,
 ) -> Result<Vec<CudaWeight>, EngError> {
+    moe_weights_inner(reader, table, layer, moe, None)
+}
+
+/// The banked arm: `slots` members per routed bank on the device, and every expert of every
+/// projection staged into the host `store`'s entry for this layer (gate, up, down order), in
+/// the device-bank byte layout a later miss copy moves unchanged.
+pub(super) fn moe_weights_banked(
+    reader: &PackReader<'_>,
+    table: &LayerTable,
+    layer: usize,
+    moe: &MoeDims,
+    slots: usize,
+    store: &mut ExpertStore,
+) -> Result<Vec<CudaWeight>, EngError> {
+    moe_weights_inner(reader, table, layer, moe, Some((slots, store)))
+}
+
+fn moe_weights_inner(
+    reader: &PackReader<'_>,
+    table: &LayerTable,
+    layer: usize,
+    moe: &MoeDims,
+    banked: Option<(usize, &mut ExpertStore)>,
+) -> Result<Vec<CudaWeight>, EngError> {
     let plan = expert_shapes(moe);
     let root = reader.root();
     let name = |role| table.name(layer, role).map(str::to_owned);
@@ -145,12 +174,19 @@ pub(super) fn moe_weights(
         &gate_shape,
         Ok,
     )?);
-    for (role, part, shape) in [
+    let routed_count = banked
+        .as_ref()
+        .map_or(moe.n_expert, |(slots, _)| *slots);
+    let mut parts = [None, None, None];
+    for (index, (role, part, shape)) in [
         (Role::FfnGateExps, ExpertPart::Gate, &plan.gate),
         (Role::FfnUpExps, ExpertPart::Up, &plan.up),
         (Role::FfnDownExps, ExpertPart::Down, &plan.down),
-    ] {
-        let bank = reader.bank(name(role)?, moe.n_expert, |expert| {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let matrix = |expert: usize| {
             let matrix = reader.matrix(&expert_name_in(root, layer, expert, part))?;
             if matrix.shape() != [shape.k, shape.rows] {
                 return Err(EngError::Checkpoint(format!(
@@ -160,8 +196,14 @@ pub(super) fn moe_weights(
                 )));
             }
             Ok(matrix)
-        })?;
-        weights.push(bank);
+        };
+        weights.push(reader.bank(name(role)?, routed_count, matrix)?);
+        if banked.is_some() {
+            parts[index] = Some(fill_part_store(layer, moe, matrix)?);
+        }
+    }
+    if let Some((_, store)) = banked {
+        store.push_layer(parts.map(|part| part.expect("the loop fills every part")));
     }
     for (role, part, shape) in [
         (Role::FfnGateShexp, ExpertPart::Gate, &plan.shared_gate),
@@ -177,6 +219,36 @@ pub(super) fn moe_weights(
         weights.push(reader.exl3(name(role)?, &prefix, &want, None)?);
     }
     Ok(weights)
+}
+
+/// Stages every expert of one projection into a fresh part store. The first matrix fixes the
+/// store's layout; every later member must match it in shape, rate and codebook (the bank
+/// upload checks the same for the members it uploads, this covers the rest).
+fn fill_part_store(
+    layer: usize,
+    moe: &MoeDims,
+    matrix: impl Fn(usize) -> Result<Matrix, EngError>,
+) -> Result<PartStore, EngError> {
+    let first = matrix(0)?;
+    let (shape, bits_twice, book) = (first.shape(), first.bitrate_twice(), first.codebook());
+    let mut store = PartStore::new(shape, bits_twice, moe.n_expert);
+    let staged = exl3_member_staging(&first)?;
+    store.put(0, &staged)?;
+    for expert in 1..moe.n_expert {
+        let member = matrix(expert)?;
+        if member.shape() != shape
+            || member.bitrate_twice() != bits_twice
+            || member.codebook() != book
+            || member.bias().is_some()
+        {
+            return Err(EngError::Checkpoint(format!(
+                "EXL3 expert bank: expert {expert} of layer {layer} differs from expert 0 in \
+                 shape, rate, codebook or bias"
+            )));
+        }
+        store.put(expert, &exl3_member_staging(&member)?)?;
+    }
+    Ok(store)
 }
 
 #[cfg(test)]

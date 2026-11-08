@@ -175,6 +175,10 @@ pub(crate) struct Q36Options {
     /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
     /// resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
+    /// The banked EXL3 expert mode of the CUDA arm: `slots` experts per layer stay on the device
+    /// and every expert's packed bytes stay in a pageable host store for miss copies. Absent means
+    /// off. An EXL3-only CUDA member.
+    pub(crate) expert_bank: Option<ExpertBankOptions>,
     /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
     /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
     pub(crate) weight_format: Option<String>,
@@ -430,6 +434,7 @@ fn cuda_devices_of(
         for (set, key) in [
             (weights == WeightFormat::Exl3, "weight_format exl3"),
             (options.tiered.is_some(), "tiered"),
+            (options.expert_bank.is_some(), "expert_bank"),
             (
                 options.kv_offload_host_bytes.is_some(),
                 "kv_offload_host_bytes",
@@ -542,6 +547,40 @@ pub(crate) struct TieredOptions {
     /// Fill every layer's bank with its lowest-numbered experts before the first token. The
     /// default is false: the banks start empty and policy P fills them.
     pub(crate) preload: Option<bool>,
+}
+
+/// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
+/// resident when the rest live in a host store. `slots` may name the exact count (1 to 256) or
+/// stay absent for "the most that fit"; `mode` is `auto` (bank only when the resident load does
+/// not fit) or `on` (always bank), `auto` by default.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpertBankOptions {
+    pub(crate) slots: Option<u32>,
+    pub(crate) mode: Option<String>,
+}
+
+/// How many bank slots per layer the banked load holds: an exact operator count, or `Fit` for
+/// the largest count the admission arithmetic admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotRequest {
+    Fit,
+    Exactly(usize),
+}
+
+/// Whether the banked load runs only when the resident load does not fit (`Auto`) or always
+/// (`On`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BankMode {
+    Auto,
+    On,
+}
+
+/// The checked `expert_bank` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertBankSettings {
+    pub(crate) slots: SlotRequest,
+    pub(crate) mode: BankMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -823,6 +862,8 @@ pub(crate) struct Q36Settings {
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
+    /// The banked EXL3 expert mode, or `None` for the resident engine.
+    pub(crate) expert_bank: Option<ExpertBankSettings>,
     /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
     pub(crate) weights: WeightFormat,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
@@ -1000,6 +1041,59 @@ pub(crate) fn cache_growth_per_position(
 /// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
 /// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
 /// `chunk_ready` keeps a tiered session off the chunk path).
+/// The checked `expert_bank` entry, or `None` when the member is absent. The refusals mirror the
+/// qualified state of the arm: the banked decode is eager-only, has no speculative-draft path,
+/// and reads an EXL3 pack (so `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse
+/// `exl3` themselves).
+fn expert_bank_settings(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<Option<ExpertBankSettings>, EngError> {
+    let Some(bank) = &options.expert_bank else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad("expert_bank is a CUDA member; the MLX arm refuses it".into()));
+    }
+    if weights != WeightFormat::Exl3 {
+        return Err(bad(
+            "expert_bank needs weight_format exl3: the host store reads an EXL3 pack".into(),
+        ));
+    }
+    if options.capture == Some(true) {
+        return Err(bad(
+            "expert_bank and capture exclude each other: the banked decode is eager only".into(),
+        ));
+    }
+    if options
+        .draft_mode
+        .as_deref()
+        .is_some_and(|mode| mode != "disabled")
+    {
+        return Err(bad(
+            "expert_bank does not support speculative decoding; set draft_mode disabled".into(),
+        ));
+    }
+    let slots = match bank.slots {
+        None => SlotRequest::Fit,
+        Some(count) => SlotRequest::Exactly(
+            usize::try_from(ranged("expert_bank.slots", Some(count), count, 1, 256)?)
+                .map_err(|_| bad("expert_bank.slots exceeds usize".into()))?,
+        ),
+    };
+    let mode = match bank.mode.as_deref() {
+        None | Some("auto") => BankMode::Auto,
+        Some("on") => BankMode::On,
+        Some(other) => {
+            return Err(bad(format!(
+                "expert_bank.mode must be auto or on, got {other:?}"
+            )))
+        }
+    };
+    Ok(Some(ExpertBankSettings { slots, mode }))
+}
+
 fn tiered_settings(
     options: &Q36Options,
     backend: Backend,
@@ -1242,6 +1336,7 @@ impl Q36Settings {
             Backend::Cuda => (0, 0),
         };
         let tiered = tiered_settings(options, backend)?;
+        let expert_bank = expert_bank_settings(options, backend, weights)?;
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The override validates at boot through `ranged` (the same message shape as every
         // other member) so a typo cannot reach the store; the range keeps a fat finger from
@@ -1303,6 +1398,7 @@ impl Q36Settings {
             backend,
             prefix_reuse: false,
             tiered,
+            expert_bank,
             weights,
             speculation,
             draft_rollback,
@@ -2362,6 +2458,7 @@ mod tests {
                 backend: Backend::Mlx,
                 prefix_reuse: false,
                 tiered: None,
+                expert_bank: None,
                 weights: super::WeightFormat::Gguf,
                 speculation: SpecConfig::default(),
                 draft_rollback: RollbackMode::Host,

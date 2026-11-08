@@ -45,6 +45,7 @@ mod eager_window_device_tests;
 mod executor;
 #[cfg(test)]
 mod executor_tests;
+mod exl3_bank;
 #[cfg(test)]
 mod exl3_device_tests;
 mod exl3_load;

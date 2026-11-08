@@ -24,7 +24,7 @@ use super::{
     card_step::CardStack,
     card_weights::load_card_weights,
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
-    exl3_load::load_exl3_dir,
+    exl3_load::{DecidedLoad, load_exl3_dir_decided},
     layer_table::LayerTable,
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
@@ -986,7 +986,35 @@ fn make(
             projector
                 .context()
                 .set_single_row_default(SERVED_SINGLE_ROW);
-            let device = load_exl3_dir(&projector, &settings.artifact, reserve)?;
+            let device = match load_exl3_dir_decided(
+                &projector,
+                &settings.artifact,
+                settings.expert_bank.as_ref(),
+                reserve,
+            )? {
+                DecidedLoad::Resident(device) => device,
+                DecidedLoad::Banked(banked) => {
+                    eprintln!(
+                        "q36 cuda: EXL3 expert bank: {} of {} experts per layer resident \
+                         (device {:.2} GiB incl. dense {:.2} GiB), host store {:.2} GiB, loaded \
+                         from {} in {:.1} s",
+                        banked.slots,
+                        banked.experts,
+                        banked.weights.device_bytes() as f64 / (1 << 30) as f64,
+                        banked.dense_bytes as f64 / (1 << 30) as f64,
+                        banked.store.host_bytes() as f64 / (1 << 30) as f64,
+                        settings.artifact.display(),
+                        began.elapsed().as_secs_f64(),
+                    );
+                    // M1 wires the load and admission only; the banked decode step (slot
+                    // tables, miss copies, the eager host resolve) is the next slice.
+                    return Err(EngError::BadRequest(
+                        "q36 cuda: the banked EXL3 load works but its decode step is not wired \
+                         yet; remove qwen36.expert_bank or wait for the decode slice"
+                            .into(),
+                    ));
+                }
+            };
             eprintln!(
                 "q36 cuda: EXL3 weights loaded from {} in {:.1} s",
                 settings.artifact.display(),

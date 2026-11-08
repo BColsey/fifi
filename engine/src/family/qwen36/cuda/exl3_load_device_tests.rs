@@ -11,9 +11,10 @@ use std::{fs, path::Path, time::Instant};
 use serde_json::json;
 
 use super::{
-    super::exl3_pack::layer_name,
+    super::exl3_pack::{ExpertPart, Root, expert_name_in, inspect_pack_split, layer_name},
     common_tests::{dims, inventory},
-    exl3_load::load_exl3_dir,
+    exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
+    pinned::ROTARY_DIM,
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
@@ -22,9 +23,13 @@ use super::{
 };
 use crate::{
     family::{
-        AttentionKind,
+        AttentionKind, QWEN3_6_35B_A3B,
         gguf_model::Role,
-        project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, WeightLayout},
+        project::cuda::{
+            CudaProjector, CudaWeight, CudaWeights, Reserve, WeightLayout,
+            exl3::exl3_member_staging,
+        },
+        qwen36::host::HostShape,
     },
     kernels::cuda::device_present,
     tensor::Tensor,
@@ -118,6 +123,69 @@ fn reference(matrix: &Matrix, input: &[f32]) -> Vec<f64> {
     let input: Vec<f64> = input.iter().map(|&v| f64::from(v)).collect();
     matrix.project_fp64_into(&input, 1, &mut out).unwrap();
     out
+}
+
+/// The banked load on the real pack: dense weights plus `slots`-member banks on the device
+/// (the header-derived figure, exactly), every routed expert of every layer in the host
+/// store, and the store's member bytes identical to the staging of the pack's own matrices.
+#[test]
+#[ignore = "requires the EXL3 pack in FIFI_EXL3_CHECKPOINT and admitted GPU memory"]
+fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
+    let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    let dir = Path::new(&dir);
+    assert!(
+        device_present("banked EXL3 load"),
+        "a GPU is required"
+    );
+    let slots = 8usize;
+    let checkpoint = Checkpoint::open(dir).expect("open the pack");
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM).expect("host shape");
+    let split = inspect_pack_split(&checkpoint.source, &shape).expect("header walk");
+    let routed = split.routed_bytes;
+    let dense = split.report.device_bytes - routed;
+    let layers = shape.kinds.len();
+    let experts = shape.moe.experts;
+    let per_member = routed / layers as u64 / experts as u64;
+    let expected_device = dense + per_member * slots as u64 * layers as u64;
+    let projector = CudaProjector::new().expect("projector");
+    let before = projector.memory_info().unwrap();
+    let BankedModel {
+        weights,
+        store,
+        slots: got_slots,
+        experts: got_experts,
+        routed_bytes,
+        dense_bytes,
+    } = load_exl3_banked_dir(&projector, dir, slots, Reserve::default()).expect("banked load");
+    assert_eq!(got_slots, slots);
+    assert_eq!(got_experts, experts);
+    assert_eq!(routed_bytes, routed);
+    assert_eq!(dense_bytes, dense);
+    assert_eq!(weights.device_bytes() as u64, expected_device);
+    assert_eq!(store.layers(), layers);
+    assert_eq!(store.host_bytes(), routed);
+    let after = projector.memory_info().unwrap();
+    let used = (before.free - after.free) as u64;
+    assert!(
+        used >= expected_device,
+        "free fell by {used}, below the expected {expected_device}"
+    );
+    // The store's member bytes are the staging of the pack's own matrices: spot-check layer
+    // 0's three parts at members 0, 1 and the last, through the loader's own helpers.
+    for (part_index, part) in [ExpertPart::Gate, ExpertPart::Up, ExpertPart::Down].into_iter()
+        .enumerate()
+    {
+        for expert in [0, 1, experts - 1] {
+            let matrix = matrix_of(
+                &checkpoint,
+                &expert_name_in(Root::Layers, 0, expert, part),
+            );
+            let staged = exl3_member_staging(&matrix).expect("staging");
+            let (trellis, scales) = store.layer(0)[part_index].member(expert);
+            assert_eq!(trellis, staged.trellis.as_slice());
+            assert_eq!(scales, staged.scales.as_slice());
+        }
+    }
 }
 
 fn device_view<'a>(

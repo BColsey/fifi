@@ -517,8 +517,7 @@ impl CudaProjector {
         }
         let first = member(0)?;
         let (shape, bits_twice, book) = (first.shape(), first.bitrate_twice(), first.codebook());
-        let stride = shape[0] * shape[1] / 256 * usize::from(bits_twice) * 16;
-        let scale_stride = (shape[0] + shape[1]) * size_of::<f32>();
+        let (stride, scale_stride) = exl3_member_layout(shape, bits_twice);
         let overflow = || EngError::MemoryPlan("EXL3 bank byte count overflow".into());
         let trellis_bytes = stride.checked_mul(count).ok_or_else(overflow)?;
         let scale_bytes = scale_stride.checked_mul(count).ok_or_else(overflow)?;
@@ -547,13 +546,10 @@ impl CudaProjector {
                     "EXL3 bank member {index} differs from member 0 in shape, rate, codebook or bias"
                 )));
             }
-            let packed = matrix
-                .trellis()
-                .host_bytes()
-                .ok_or_else(|| EngError::Checkpoint("EXL3 trellis requires host storage".into()))?;
-            self.context.upload_at(&trellis, index * stride, packed)?;
-            scales.extend_from_slice(&float_bytes(matrix.suh())?);
-            scales.extend_from_slice(&float_bytes(matrix.svh())?);
+            let staged = exl3_member_staging(&matrix)?;
+            self.context
+                .upload_at(&trellis, index * stride, &staged.trellis)?;
+            scales.extend_from_slice(&staged.scales);
         }
         let scales = self.context.upload(&scales)?;
         Ok(Exl3Bank {
@@ -565,6 +561,36 @@ impl CudaProjector {
             book,
         })
     }
+}
+
+/// The byte layout of one member of an [`Exl3Bank`]: the trellis stride (u16 elements) and the
+/// scale stride (bytes, `suh` then `svh` of F32) between two members. Shared by the device bank
+/// upload and the banked host store, which must paste the same layout into slots.
+pub(crate) fn exl3_member_layout(shape: [usize; 2], bits_twice: u8) -> (usize, usize) {
+    let stride = shape[0] * shape[1] / 256 * usize::from(bits_twice) * 16;
+    let scale_stride = (shape[0] + shape[1]) * size_of::<f32>();
+    (stride, scale_stride)
+}
+
+/// One member's bytes in the bank layout: the packed trellis as stored and the `suh`/`svh`
+/// scales widened to F32, concatenated as the bank's scale buffer orders them. The banked host
+/// store holds exactly these bytes for every expert, so a miss copy moves them unchanged.
+pub(crate) struct Exl3MemberStaging {
+    pub(crate) trellis: Vec<u8>,
+    pub(crate) scales: Vec<u8>,
+}
+
+pub(crate) fn exl3_member_staging(matrix: &Matrix) -> Result<Exl3MemberStaging, EngError> {
+    let trellis = matrix
+        .trellis()
+        .host_bytes()
+        .ok_or_else(|| EngError::Checkpoint("EXL3 trellis requires host storage".into()))?;
+    let mut scales = float_bytes(matrix.suh())?;
+    scales.extend_from_slice(&float_bytes(matrix.svh())?);
+    Ok(Exl3MemberStaging {
+        trellis: trellis.to_vec(),
+        scales,
+    })
 }
 
 fn float_bytes(tensor: &Tensor) -> Result<Vec<u8>, EngError> {

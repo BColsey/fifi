@@ -838,7 +838,7 @@ fn the_start_resolves_the_switch_before_any_weight_work() {
         "check_tiered_start(",
         "CudaProjector::new()",
         "open_gguf(",
-        "load_exl3_dir(",
+        "load_exl3_dir_decided(",
     ] {
         let at = body.find(later).unwrap_or_else(|| panic!("{later}"));
         assert!(switch < at, "resolve_switch must precede {later}");
