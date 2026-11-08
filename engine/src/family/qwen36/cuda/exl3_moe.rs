@@ -644,8 +644,7 @@ pub(in crate::family) fn run_exl3_moe(
             Some(bank) => {
                 #[cfg(test)]
                 let began = std::time::Instant::now();
-                let (slots, missed, event) =
-                    bank.resolve_split(launch.stream, &picks, overlap)?;
+                let (slots, missed, event) = bank.resolve_split(launch.stream, &picks, overlap)?;
                 #[cfg(test)]
                 crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
                 gated = event.map(|event| (event, missed));

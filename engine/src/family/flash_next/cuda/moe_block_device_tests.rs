@@ -286,7 +286,16 @@ fn prepare(
         })
         .expect("the all-resident block resolves");
         let rig = Rig::new(projector, moe, &row).expect("rig");
-        run_exl3_moe(launch, &block, &rig.bufs().expect("bufs"), moe, true, None, false).expect("block");
+        run_exl3_moe(
+            launch,
+            &block,
+            &rig.bufs().expect("bufs"),
+            moe,
+            true,
+            None,
+            false,
+        )
+        .expect("block");
         launch.stream.synchronize().expect("sync");
         rig.out_bytes(projector)
     };

@@ -368,16 +368,40 @@ fn merged_on_host(
     let (resident_pairs, refilling): (Vec<PlannedPair>, Vec<PlannedPair>) =
         plan.gate_up.iter().copied().partition(resident);
     if !resident_pairs.is_empty() {
-        grouped(launch, &build(&resident_pairs)?, &scratch)?;
+        grouped_runs(launch, &build(&resident_pairs)?, &scratch)?;
     }
     if !refilling.is_empty() {
         if let Some((event, _)) = gate {
             launch.stream.wait(event)?;
         }
-        grouped(launch, &build(&refilling)?, &scratch)?;
+        grouped_runs(launch, &build(&refilling)?, &scratch)?;
     }
     swiglu(launch, r.gu, r.act, (plan.swiglu_rows, dims.inter))?;
-    grouped(launch, &build(&plan.down)?, &scratch)
+    grouped_runs(launch, &build(&plan.down)?, &scratch)
+}
+
+/// [`grouped`] as one launch per maximal run of plan-contiguous `out` rows. The C side of the
+/// grouped kernels validates that a launch's out rows are consecutive (`follows` in
+/// `group_args`), and a resident/refilling split - or a hit pick inside a miss run - leaves
+/// holes between the kept rows, so each contiguous slice becomes its own launch. A whole
+/// plan is one run, so an unsplit call set still launches once.
+fn grouped_runs(
+    launch: &Launch<'_>,
+    pairs: &[Pair<'_>],
+    scratch: &Scratch<'_>,
+) -> Result<(), EngError> {
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        while end < pairs.len()
+            && pairs[end].out.offset() == pairs[end - 1].out.offset() + pairs[end - 1].out.bytes()
+        {
+            end += 1;
+        }
+        grouped(launch, &pairs[start..end], scratch)?;
+        start = end;
+    }
+    Ok(())
 }
 
 /// The block of one layer with the shared expert in the routed launches: the same router, the

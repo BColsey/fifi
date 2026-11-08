@@ -12,8 +12,7 @@ use crate::{
         qwen36::settings::{BankMode, SlotRequest},
     },
     kernels::cuda::{
-        DeviceBuffer, DeviceEvent, DeviceStream, device_synchronize, host_register,
-        host_unregister,
+        DeviceBuffer, DeviceEvent, DeviceStream, device_synchronize, host_register, host_unregister,
     },
 };
 

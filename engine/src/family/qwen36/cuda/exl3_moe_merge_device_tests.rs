@@ -650,7 +650,14 @@ fn shared_in_routed_graph_has_seven_fewer_kernel_nodes() {
         let (graph, ()) = ctx
             .capture(&stream, plan, || {
                 if merged {
-                    run_exl3_moe_merged(&launch, (&block, &bufs, &merge), &rig.moe, true, None, false)
+                    run_exl3_moe_merged(
+                        &launch,
+                        (&block, &bufs, &merge),
+                        &rig.moe,
+                        true,
+                        None,
+                        false,
+                    )
                 } else {
                     run_exl3_moe(&launch, &block, &bufs, &rig.moe, true, None, false)
                 }

@@ -1140,7 +1140,8 @@ impl CudaContext {
         gather: bool,
     ) -> Result<(), EngError> {
         let raw = self.grouped_raw(calls)?;
-        self.launch_on(stream, |s| ffi::grouped(s, &raw, gather))
+        let out = self.launch_on(stream, |s| ffi::grouped(s, &raw, gather));
+        out
     }
 
     /// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
