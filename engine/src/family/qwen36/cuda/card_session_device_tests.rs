@@ -585,11 +585,23 @@ fn card_views_construct_chunk_models() {
         let geometry = MixerGeometry::for_card(&d, stack.table(), card).expect("card geometry");
         let (mixer, moe) = session.chunk_views_for_test(card);
         let weights = super::prefill::ChunkWeights::new(mixer, &moe, session.embed_for_test());
-        let model = super::prefill::ChunkModel::new(&table, &geometry, &d, weights);
+        let inter = stack.table().expert_inter(card).expect("card inter").len();
+        let shared_inter = stack
+            .table()
+            .shared_inter(card)
+            .expect("card shared inter")
+            .len();
+        let model =
+            super::prefill::ChunkModel::card(&table, &geometry, &d, weights, inter, shared_inter);
         assert!(
             model.is_ok(),
-            "{NAME}: card {card} views must construct the chunk model: {:?}",
+            "{NAME}: card {card} views must construct the CARD chunk model: {:?}",
             model.err()
+        );
+        assert_eq!(
+            model.expect("checked above").moe_dims().inter,
+            inter,
+            "{NAME}: card {card} dims carry its inter slice"
         );
     }
 }
