@@ -145,6 +145,12 @@ fn warm_up_flash_prefill(
     if !flash_prefill_enabled() || head_dim < 128 || kv != KvDtype::Q8 {
         return Ok(());
     }
+    // REP 8 (heads_q / heads_kv) closes the envelope: the dense releases run REP 6, whose
+    // prefill serves through the composite `quantized_attention_prefix` path, so there is
+    // no flash program to compile for them.
+    if heads_kv == 0 || heads_q / heads_kv != 8 {
+        return Ok(());
+    }
     let cells = 8 * heads_kv as usize * head_dim as usize;
     let kv_data = vec![0.01f32; cells];
     let upload = |kernels: &mut MlxKernels| -> Result<crate::tensor::ExecutionTensor, EngError> {
