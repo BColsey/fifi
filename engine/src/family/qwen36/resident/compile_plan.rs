@@ -172,6 +172,7 @@ pub(super) fn model_warmup(
                 renorm: facts.renorm,
                 clamp: facts.clamp,
                 act: facts.act,
+                eps_bits: facts.eps_bits,
                 scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
                 quant: facts.weights.each_ref().map(|weight| weight.quant),
             };

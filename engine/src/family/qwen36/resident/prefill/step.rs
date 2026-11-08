@@ -359,8 +359,13 @@ fn run(
         }
         let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
         check_dtype("post norm output", &normed, ctx.consts.act)?;
+        let mut skip_add = false;
         let routed = match (&layer.feed_forward, decoder.routing) {
-            (RFeedForward::Dense(w), _) => super::super::moe::dense_rows(&mut ctx, w, &normed)?,
+            (RFeedForward::Dense(w), _) => {
+                // dense_rows folds the post norm and the residual add itself.
+                skip_add = true;
+                super::super::moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => moe::chunk(&mut ctx, shape, w, &normed)?.0,
             (RFeedForward::Moe(w), Routing::Device) => {
                 let device = moe::chunk_device(&mut ctx, shape, w, &normed)?;
@@ -368,7 +373,11 @@ fn run(
                 device.out
             }
         };
-        h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        h = if skip_add {
+            routed
+        } else {
+            ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?
+        };
         check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
             // The recorded last row reads back as F32.
