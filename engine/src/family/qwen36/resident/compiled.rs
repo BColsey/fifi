@@ -308,7 +308,7 @@ fn delta_args<'a>(
             &w.dt_bias,
             &w.norm,
         ],
-        consts: [&consts.zero, &consts.qk_eps, &consts.sqrt_kd],
+        consts: [&consts.zero, &consts.q_norm_w, &consts.k_norm_w],
         hidden,
         dims: [
             dim(d.key_heads)?,

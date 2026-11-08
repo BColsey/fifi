@@ -123,7 +123,7 @@ pub(crate) struct CompileDeltaArgs<'a> {
     pub(crate) packed: [&'a ResidentPackedWeight; 5],
     /// conv_taps, conv_last, neg_exp_a_log, dt_bias, norm.
     pub(crate) plain: [&'a ExecutionTensor; 5],
-    /// zero, qk_eps, sqrt_kd.
+    /// zero, then the `[kd]` query and key norm weights (`1 / kd` and `1 / sqrt(kd)`).
     pub(crate) consts: [&'a ExecutionTensor; 3],
     pub(crate) hidden: u32,
     /// kh, kd, vh, vd, cd, taps.
@@ -493,14 +493,16 @@ impl Context {
             ));
         }
         // Keep the legacy B1 validation path. Multirow operands must match the full closure
-        // signature before admission, including the shared plain tensors and scalar constants.
+        // signature before admission, including the shared plain tensors and the norm weights.
         if batch > 1
             && (args.plain[0].shape() != [cd, taps]
                 || args.plain[1].shape() != [cd]
                 || args.plain[2].shape() != [vh]
                 || args.plain[3].shape() != [vh]
                 || args.plain[4].shape() != [vd]
-                || args.consts.iter().any(|tensor| !tensor.shape().is_empty()))
+                || !args.consts[0].shape().is_empty()
+                || args.consts[1].shape() != [kd]
+                || args.consts[2].shape() != [kd])
         {
             return Err(EngError::BadRequest(
                 "compile seam inputs differ from the delta plain operand shapes".into(),

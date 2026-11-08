@@ -2360,8 +2360,7 @@ static int compile_delta_slot(
   CompileScopeArray now, past_wide, past, val, y;
   CompileScopeArray column, column_cast, kept, ring_next;
   CompileScopeArray q_sliced, q2d, k_sliced, k2d, v_sliced, v4d;
-  CompileScopeArray q_sq, q_sum, q_eps, q_den0, q_den, q_div;
-  CompileScopeArray k_sq, k_sum, k_eps, k_den, k_div;
+  CompileScopeArray q_div, k_div;
   CompileScopeArray q4d, k4d;
   CompileScopeArray pre, soft, decay, alpha_exp, alpha, beta_sig, beta;
   CompileScopeArray state4, y2, state_out;
@@ -2397,18 +2396,16 @@ static int compile_delta_slot(
   if (status == 0) status = inference_mlx_reshape(&k2d.value, k_sliced.value, head_shape, 2, s);
   if (status == 0) status = inference_mlx_slice(&v_sliced.value, y.value, start_v, stop_v, strides1, 1, s);
   if (status == 0) status = inference_mlx_reshape(&v4d.value, v_sliced.value, v_shape, 4, s);
-  // Query and key norm: x / sqrt(sum(x * x) + qk_eps), with sqrt(kd) extra on the query.
-  if (status == 0) status = inference_mlx_multiply(&q_sq.value, q2d.value, q2d.value, s);
-  if (status == 0) status = inference_mlx_sum_axis(&q_sum.value, q_sq.value, 1, true, s);
-  if (status == 0) status = inference_mlx_add(&q_eps.value, q_sum.value, in.values[24], s);
-  if (status == 0) status = inference_mlx_sqrt(&q_den0.value, q_eps.value, s);
-  if (status == 0) status = inference_mlx_multiply(&q_den.value, q_den0.value, in.values[25], s);
-  if (status == 0) status = inference_mlx_divide(&q_div.value, q2d.value, q_den.value, s);
-  if (status == 0) status = inference_mlx_multiply(&k_sq.value, k2d.value, k2d.value, s);
-  if (status == 0) status = inference_mlx_sum_axis(&k_sum.value, k_sq.value, 1, true, s);
-  if (status == 0) status = inference_mlx_add(&k_eps.value, k_sum.value, in.values[24], s);
-  if (status == 0) status = inference_mlx_sqrt(&k_den.value, k_eps.value, s);
-  if (status == 0) status = inference_mlx_divide(&k_div.value, k2d.value, k_den.value, s);
+  // Query and key norm: ONE fused rms_norm kernel each. With the channel weights
+  // in.values[24] (1/kd, query) and in.values[25] (1/sqrt(kd), key) and eps 1e-6 against the
+  // mean of squares, rms_norm equals the host rule x / sqrt(sum(x * x) + kd * 1e-6) with the
+  // extra sqrt(kd) divisor on the query - the same fast.rms_norm kernel and weights as the
+  // eager `delta::step_projected`, so the compiled and eager paths stay identical. The decode
+  // step is dispatch-bound at batch 1, and this replaces ten tape kernels with two.
+  if (status == 0)
+    status = inference_mlx_rms_norm(&q_div.value, q2d.value, in.values[24], 1.0e-6f, s);
+  if (status == 0)
+    status = inference_mlx_rms_norm(&k_div.value, k2d.value, in.values[25], 1.0e-6f, s);
   if (status == 0) status = inference_mlx_reshape(&q4d.value, q_div.value, qk_shape, 4, s);
   if (status == 0) status = inference_mlx_reshape(&k4d.value, k_div.value, qk_shape, 4, s);
   // alpha = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b). The F32 `dt_bias`
@@ -2463,7 +2460,8 @@ static int compile_delta_slot(
 // the live x shape, so the existing nonshapeless fun_id specializes both shape and arity.
 // Outputs: out [B,H], then one F32 rec/ring pair per slot. B1's graph order is unchanged.
 // Base input order (26): x, rec, ring; payload/scales/biases for qkv,z,b,a,out;
-// conv_taps,conv_last,neg_exp_a_log,dt_bias,norm; zero,qk_eps,sqrt_kd.
+// conv_taps,conv_last,neg_exp_a_log,dt_bias,norm; zero; the [kd] query and key norm weights
+// (1/kd and 1/sqrt(kd)).
 // Multirow appends rec/ring for slots 1..B-1. Outputs are out, then B rec/ring pairs.
 static int compile_delta_body(
     mlx_vector_array* res, const mlx_vector_array input, void* raw) noexcept {
@@ -2579,15 +2577,79 @@ struct CompileMoePayload {
   int mode[6];   // shared gate, up, down, then the gate, up, down stacks
   int group[6];
   int bits[6];
+  // The persistent GatherQMM row-index operands, one pair per supported batch size (index
+  // log2(B)): `rows_lhs` holds the row id broadcast over the top-k experts (the gate and up
+  // gathers), `flat_lhs` the arange over the B*k gathered rows (the down gather). With them
+  // passed explicitly, mlx_gather_qmm builds no default arange/broadcast nodes inside the
+  // traced closures; those would otherwise replay as kernels on every decode step, and the
+  // step is dispatch-bound at batch 1.
+  mlx_array rows_lhs[4];
+  mlx_array flat_lhs[4];
 };
 
-// Frees the stream copy that the payload holds, then the payload itself.
+// Frees the stream copy and the row-index operands that the payload holds, then the payload
+// itself.
 static void compile_moe_payload_free(void* raw) noexcept {
   CompileMoePayload* payload = static_cast<CompileMoePayload*>(raw);
   if (payload != nullptr) {
+    for (int i = 0; i < 4; ++i) {
+      if (payload->rows_lhs[i].ctx != nullptr) mlx_array_free(payload->rows_lhs[i]);
+      if (payload->flat_lhs[i].ctx != nullptr) mlx_array_free(payload->flat_lhs[i]);
+    }
     mlx_stream_free(payload->stream);
     std::free(payload);
   }
+}
+
+// The payload slot of one supported batch size.
+static int compile_moe_lhs_index(int batch) noexcept {
+  return batch == 1 ? 0 : batch == 2 ? 1 : batch == 4 ? 2 : 3;
+}
+
+// Builds one (rows, flat) pair of the persistent row-index operands for `batch` rows over
+// `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, [B,k] above) with the row
+// id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
+// Both are evaluated, so the traced closures bind them as constants instead of replaying their
+// producers as kernels. The values equal exactly what mlx_gather_qmm derives internally when
+// the lhs slot is null, so the gathers read the same indices as before.
+static int compile_moe_lhs_build(
+    mlx_array* rows, mlx_array* flat, int batch, int top_k, mlx_stream s) noexcept {
+  *rows = mlx_array_new();
+  *flat = mlx_array_new();
+  int status = mlx_arange(rows, 0.0, static_cast<double>(batch), 1.0, MLX_UINT32, s);
+  if (status == 0) {
+    if (batch == 1) {
+      const int k_shape[1] = {top_k};
+      status = mlx_broadcast_to(rows, *rows, k_shape, 1, s);
+    } else {
+      mlx_array column = mlx_array_new();
+      const int column_shape[2] = {batch, 1};
+      const int pair_shape[2] = {batch, top_k};
+      status = mlx_reshape(&column, *rows, column_shape, 2, s);
+      if (status == 0) status = mlx_broadcast_to(rows, column, pair_shape, 2, s);
+      const int release = mlx_array_free(column);
+      if (status == 0) status = release;
+    }
+  }
+  if (status == 0)
+    status = mlx_arange(flat, 0.0, static_cast<double>(batch * top_k), 1.0, MLX_UINT32, s);
+  if (status == 0 && batch > 1) {
+    const int pair_shape[2] = {batch, top_k};
+    mlx_array shaped = mlx_array_new();
+    status = mlx_reshape(&shaped, *flat, pair_shape, 2, s);
+    const int release = mlx_array_free(*flat);
+    *flat = shaped;
+    if (status == 0) status = release;
+  }
+  if (status == 0) status = mlx_array_eval(*rows);
+  if (status == 0) status = mlx_array_eval(*flat);
+  if (status != 0) {
+    if (rows->ctx != nullptr) mlx_array_free(*rows);
+    if (flat->ctx != nullptr) mlx_array_free(*flat);
+    *rows = mlx_array{nullptr};
+    *flat = mlx_array{nullptr};
+  }
+  return status;
 }
 
 // Vectorized B>1 MoE. The single-row body below stays on its original op sequence.
@@ -2601,7 +2663,6 @@ static int compile_moe_rows(
   if (results.ctx == nullptr) return 1;
   const mlx_stream s = p->stream;
   const int x3_shape[3] = {batch, 1, p->hidden};
-  const int lhs_shape[2] = {batch, 1};
   const int gates_shape[4] = {batch, p->top_k, 1, 1};
   const int out_shape[2] = {batch, p->hidden};
   const int start[2] = {0, 0};
@@ -2609,7 +2670,7 @@ static int compile_moe_rows(
   const int strides[2] = {1, 1};
   const uint32_t expert_upper = static_cast<uint32_t>(p->experts - 1);
   CompileScopeArray logits, probs, negated, order, ids, clamped, top, health;
-  CompileScopeArray renorm_sum, gates0, gates, row_ids, lhs, x3, hg, hu, act, h;
+  CompileScopeArray renorm_sum, gates0, gates, x3, hg, hu, act, h;
   CompileScopeArray eo, weighted, expert_rows, experts;
   CompileScopeArray sg, su, act2, sh, so, scalar_logit, factor, shared_out, total, total_act;
   int status = inference_mlx_matmul(&logits.value, in.values[0], in.values[1], s);
@@ -2631,25 +2692,23 @@ static int compile_moe_rows(
   if (status == 0)
     status = inference_mlx_reshape(
         &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
-  if (status == 0)
-    status = mlx_arange(&row_ids.value, 0.0, static_cast<double>(batch), 1.0, MLX_UINT32, s);
-  if (status == 0) status = inference_mlx_reshape(&lhs.value, row_ids.value, lhs_shape, 2, s);
+  const int moe_lhs = compile_moe_lhs_index(batch);
   if (status == 0) status = inference_mlx_reshape(&x3.value, in.values[0], x3_shape, 3, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &hg.value, x3.value, in.values[12], in.values[13], in.values[14], lhs.value,
+        &hg.value, x3.value, in.values[12], in.values[13], in.values[14], p->rows_lhs[moe_lhs],
         clamped.value, true, compile_quant_optional(p->group[3]),
         compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &hu.value, x3.value, in.values[15], in.values[16], in.values[17], lhs.value,
+        &hu.value, x3.value, in.values[15], in.values[16], in.values[17], p->rows_lhs[moe_lhs],
         clamped.value, true, compile_quant_optional(p->group[4]),
         compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
   if (status == 0) status = inference_mlx_silu(&act.value, hg.value, s);
   if (status == 0) status = inference_mlx_multiply(&h.value, act.value, hu.value, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &eo.value, h.value, in.values[18], in.values[19], in.values[20], mlx_array{nullptr},
+        &eo.value, h.value, in.values[18], in.values[19], in.values[20], p->flat_lhs[moe_lhs],
         clamped.value, true, compile_quant_optional(p->group[5]),
         compile_quant_optional(p->bits[5]), compile_quant_mode(p->mode[5]), false, s);
   // F32 gates promote the expert products before reducing only the expert axis.
@@ -2781,23 +2840,27 @@ static int compile_moe_body(
     status = inference_mlx_reshape(
         &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 3, s);
   // The selected experts on x: gate and up, SwiGLU, down, the gate-weighted sum. Every gather
-  // reads the SAME once-clamped ids, so the layer builds one clamp node, like `combine`.
+  // reads the SAME once-clamped ids, so the layer builds one clamp node, like `combine`. The
+  // row-index operands come from the payload: at B=1 they are [k] with the row id 0 (gate and
+  // up) and the arange over the k gathered rows (down), exactly the defaults mlx_gather_qmm
+  // would build per call - as persistent arrays they bind once at trace time instead of
+  // replaying arange and broadcast kernels on every decode step.
   if (status == 0) status = inference_mlx_reshape(&x3.value, in.values[0], x3_shape, 3, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &hg.value, x3.value, in.values[12], in.values[13], in.values[14], mlx_array{nullptr},
+        &hg.value, x3.value, in.values[12], in.values[13], in.values[14], p->rows_lhs[0],
         clamped.value, true, compile_quant_optional(p->group[3]),
         compile_quant_optional(p->bits[3]), compile_quant_mode(p->mode[3]), false, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &hu.value, x3.value, in.values[15], in.values[16], in.values[17], mlx_array{nullptr},
+        &hu.value, x3.value, in.values[15], in.values[16], in.values[17], p->rows_lhs[0],
         clamped.value, true, compile_quant_optional(p->group[4]),
         compile_quant_optional(p->bits[4]), compile_quant_mode(p->mode[4]), false, s);
   if (status == 0) status = inference_mlx_silu(&act.value, hg.value, s);
   if (status == 0) status = inference_mlx_multiply(&h.value, act.value, hu.value, s);
   if (status == 0)
     status = inference_mlx_resident_gather_qmm(
-        &eo.value, h.value, in.values[18], in.values[19], in.values[20], mlx_array{nullptr},
+        &eo.value, h.value, in.values[18], in.values[19], in.values[20], p->flat_lhs[0],
         clamped.value, true, compile_quant_optional(p->group[5]),
         compile_quant_optional(p->bits[5]), compile_quant_mode(p->mode[5]), false, s);
   // The F32 gates promote the weighted products, so the expert sum is F32.
@@ -3588,6 +3651,10 @@ extern "C" int inference_mlx_compile_moe_block(
     if (payload == nullptr) {
       return 1;
     }
+    for (int i = 0; i < 4; ++i) {
+      payload->rows_lhs[i] = mlx_array{nullptr};
+      payload->flat_lhs[i] = mlx_array{nullptr};
+    }
     payload->hidden = dims[0];
     payload->experts = dims[1];
     payload->top_k = dims[2];
@@ -3602,6 +3669,15 @@ extern "C" int inference_mlx_compile_moe_block(
       payload->mode[i] = quant[3 * i];
       payload->group[i] = quant[3 * i + 1];
       payload->bits[i] = quant[3 * i + 2];
+    }
+    int lhs_status = 0;
+    for (int i = 0; i < 4 && lhs_status == 0; ++i) {
+      lhs_status = compile_moe_lhs_build(
+          &payload->rows_lhs[i], &payload->flat_lhs[i], 1 << i, payload->top_k, payload->stream);
+    }
+    if (lhs_status != 0) {
+      compile_moe_payload_free(payload);
+      return lhs_status;
     }
     mlx_array outputs[4] = {{nullptr}, {nullptr}, {nullptr}, {nullptr}};
     int status = compile_apply_block(

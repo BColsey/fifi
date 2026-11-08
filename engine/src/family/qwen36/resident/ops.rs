@@ -97,14 +97,25 @@ impl Bytes {
     }
 }
 
-/// Rank-0 F32 constants, imported once at load.
+/// The scalar and vector constants of the decode and prefill steps, imported once at load.
 pub(super) struct Consts {
     /// 0, the second operand of `logaddexp` (softplus).
     pub(super) zero: ExecutionTensor,
-    /// `key_dim * 1e-6`: the epsilon of the DeltaNet query and key norm against the sum of squares.
+    /// `key_dim * 1e-6`: the epsilon of the DeltaNet query and key norm against the sum of
+    /// squares. The chunked prefill keeps the square/sum/divide rule and reads this; the decode
+    /// step's fused form is the pair below.
     pub(super) qk_eps: ExecutionTensor,
-    /// `sqrt(key_dim)`: the extra divisor of the DeltaNet query.
+    /// `sqrt(key_dim)`: the extra divisor of the DeltaNet query in the prefill rule.
     pub(super) sqrt_kd: ExecutionTensor,
+    /// The query norm weight `[key_dim]` of the DeltaNet DECODE head norm: `1 / key_dim` per
+    /// channel. `rms_norm(q, q_norm_w, 1e-6)` equals the host rule
+    /// `q / (sqrt(sum(q * q) + key_dim * 1e-6) * sqrt(key_dim))` exactly over the reals, in ONE
+    /// fused kernel instead of the square/sum/divide chain (the decode step is dispatch-bound,
+    /// so the chain's extra kernel launches cost more than the math they do).
+    pub(super) q_norm_w: ExecutionTensor,
+    /// The key norm weight `[key_dim]` of the decode head norm: `1 / sqrt(key_dim)` per channel,
+    /// so `rms_norm(k, k_norm_w, 1e-6)` equals `k / sqrt(sum(k * k) + key_dim * 1e-6)`.
+    pub(super) k_norm_w: ExecutionTensor,
     /// The dtype of the decode activations: the hidden state between blocks,
     /// the inputs of the quantized matmuls, and the converted layer norms. `F32` at import; the
     /// decoder constructor sets `Bf16` for a BF16 engine, and nothing mutates it afterwards.
@@ -114,11 +125,19 @@ pub(super) struct Consts {
 impl Consts {
     /// Imports every constant with one `import_many` (one synchronization).
     pub(super) fn import(kernels: &mut MlxKernels, shape: &HostShape) -> Result<Self, EngError> {
-        let key_dim = shape.delta.key_dim as f32;
-        let sources = [0.0, key_dim * 1e-6, key_dim.sqrt()]
-            .iter()
-            .map(|&v| f32_tensor(Vec::new(), &[v]))
-            .collect::<Result<Vec<_>, _>>()?;
+        let key_dim = shape.delta.key_dim;
+        let kd = key_dim as f32;
+        // 1 / key_dim is exact in f32 for the power-of-two key dims of the family; 1 / sqrt(D)
+        // rounds, within the parity tolerance of the step tests.
+        let q_fill = 1.0 / kd;
+        let k_fill = 1.0 / kd.sqrt();
+        let sources = [
+            f32_tensor(Vec::new(), &[0.0])?,
+            f32_tensor(Vec::new(), &[kd * 1e-6])?,
+            f32_tensor(Vec::new(), &[kd.sqrt()])?,
+            f32_tensor(vec![key_dim as u32], &vec![q_fill; key_dim as usize])?,
+            f32_tensor(vec![key_dim as u32], &vec![k_fill; key_dim as usize])?,
+        ];
         let refs: Vec<&Tensor> = sources.iter().collect();
         let mut got = kernels.import_many(&refs)?.into_iter();
         let mut next = || got.next().ok_or_else(short_import);
@@ -126,11 +145,19 @@ impl Consts {
             zero: next()?,
             qk_eps: next()?,
             sqrt_kd: next()?,
+            q_norm_w: next()?,
+            k_norm_w: next()?,
             act: Dtype::F32,
         })
     }
     pub(super) fn bytes(&self, total: &mut Bytes) -> Result<(), EngError> {
-        for tensor in [&self.zero, &self.qk_eps, &self.sqrt_kd] {
+        for tensor in [
+            &self.zero,
+            &self.qk_eps,
+            &self.sqrt_kd,
+            &self.q_norm_w,
+            &self.k_norm_w,
+        ] {
             total.tensor(tensor)?;
         }
         Ok(())
@@ -260,7 +287,9 @@ mod tests {
 
     #[test]
     fn consts_read_back_their_values() {
-        // Real key dimension 128: 128 * 1e-6 = 1.28e-4 and sqrt(128) = 11.3137085.
+        // Real key dimension 128: the prefill scalars 128 * 1e-6 = 1.28e-4 and
+        // sqrt(128) = 11.3137085, and the decode norm weights 1/128 = 0.0078125 exactly and
+        // 1/sqrt(128) = 0.08838835.
         let _serial = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
         let consts = Consts::import(&mut kernels, &real_shape()).unwrap();
@@ -270,6 +299,9 @@ mod tests {
                 "scalar shape {:?}",
                 tensor.shape()
             );
+        }
+        for tensor in [&consts.q_norm_w, &consts.k_norm_w] {
+            assert_eq!(tensor.shape(), &[128], "norm weight shape");
         }
         assert_close(
             &values(&mut kernels, &consts.zero).unwrap(),
@@ -288,6 +320,18 @@ mod tests {
             &[11.313_708],
             1e-5,
             "sqrt key dim",
+        );
+        assert_close(
+            &values(&mut kernels, &consts.q_norm_w).unwrap(),
+            &[0.0078125; 128],
+            0.0,
+            "query norm weight",
+        );
+        assert_close(
+            &values(&mut kernels, &consts.k_norm_w).unwrap(),
+            &[0.088_388_35; 128],
+            1e-7,
+            "key norm weight",
         );
     }
 

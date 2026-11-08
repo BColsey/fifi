@@ -13,7 +13,7 @@ use super::weights::RDelta;
 use crate::{
     EngError,
     family::qwen36::host::HostShape,
-    kernels::{BinaryOp, MlxKernels, ReduceOp, UnaryOp},
+    kernels::{BinaryOp, ReduceOp, UnaryOp},
     tensor::{Dtype, ExecutionTensor},
 };
 
@@ -31,17 +31,10 @@ fn overflow() -> EngError {
     EngError::BadRequest("resident delta dimensions overflow".into())
 }
 
-/// Returns `sqrt(sum(x * x) + eps)` for each row of a `[rows, width]` tensor, as `[rows, 1]`.
-fn l2_den(
-    m: &mut MlxKernels,
-    x: &ExecutionTensor,
-    eps: &ExecutionTensor,
-) -> Result<ExecutionTensor, EngError> {
-    let sq = m.binary(BinaryOp::Mul, x, x)?;
-    let sum = m.reduce(ReduceOp::Sum, &sq, 1, true)?;
-    let sum = m.binary(BinaryOp::Add, &sum, eps)?;
-    m.unary(UnaryOp::Sqrt, &sum)
-}
+/// The epsilon of the DeltaNet query and key head norms, against the MEAN of squares. The host
+/// rule adds `key_dim` times this against the sum of squares, which is the same value: see
+/// `Consts`.
+const NORM_EPS: f32 = 1.0e-6;
 
 /// Builds one DeltaNet decode step over `x` (`hidden` elements) and the old `rec` and `ring`.
 ///
@@ -162,13 +155,13 @@ pub(super) fn step_projected(
     let k = m.reshape(&k, &[kh, kd])?;
     let v = m.slice(&y, &[kw2], &[cd])?;
     let v = m.reshape(&v, &[1, 1, vh, vd])?;
-    // rms_norm(x, None, 1e-6) times 1/D (query) or 1/sqrt(D) (key) equals x / sqrt(sum + D * 1e-6)
-    // with an extra divisor sqrt(D) on the query. `qk_eps` holds D * 1e-6.
-    let qd = l2_den(m, &q, &consts.qk_eps)?;
-    let qd = m.binary(BinaryOp::Mul, &qd, &consts.sqrt_kd)?;
-    let q = m.binary(BinaryOp::Div, &q, &qd)?;
-    let kden = l2_den(m, &k, &consts.qk_eps)?;
-    let k = m.binary(BinaryOp::Div, &k, &kden)?;
+    // The head norms as single fused RMSNorm kernels: with the baked channel weights
+    // (`1 / D` query, `1 / sqrt(D)` key) and eps against the mean of squares, `rms_norm`
+    // equals the host rule x / sqrt(sum(x * x) + D * 1e-6) with the extra sqrt(D) divisor on
+    // the query (see `Consts`). One kernel each; the eager step and the compiled closure call
+    // the same `fast.rms_norm`, so the two paths stay identical.
+    let q = m.rms_norm(&q, &consts.q_norm_w, NORM_EPS)?;
+    let k = m.rms_norm(&k, &consts.k_norm_w, NORM_EPS)?;
     let q = m.reshape(&q, &[1, 1, kh, kd])?;
     let k = m.reshape(&k, &[1, 1, kh, kd])?;
     // alpha = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
@@ -201,6 +194,7 @@ pub(super) fn step_projected(
 #[cfg(test)]
 mod tests {
     use super::super::ops::{assert_parity, f32_tensor, values, zeros};
+    use crate::kernels::MlxKernels;
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
     use crate::family::project::Projector;
