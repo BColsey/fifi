@@ -226,19 +226,104 @@ fn piece_call<'b>(
     row0: usize,
     rows: usize,
 ) -> ConvCall<'b> {
-    let n = inp.channels;
+    let r = piece_ranges(inp.channels, inp.ld, row0, rows);
     ConvCall {
         shape: ConvShape {
             m: rows,
-            channels: n,
+            channels: inp.channels,
             ld: inp.ld,
         },
-        proj: proj
-            .range(row0 * inp.ld * 4, ((rows - 1) * inp.ld + n) * 4)
-            .unwrap(),
-        weights: w.range(0, n * 16).unwrap(),
-        state: state.range(0, n * 12).unwrap(),
-        out: out.range(row0 * n * 4, rows * n * 4).unwrap(),
+        proj: proj.range(r.proj.0, r.proj.1).unwrap(),
+        weights: w.range(r.weights.0, r.weights.1).unwrap(),
+        state: state.range(r.state.0, r.state.1).unwrap(),
+        out: out.range(r.out.0, r.out.1).unwrap(),
+    }
+}
+
+/// (byte offset, byte length) of each range of the piece `row0 .. row0 + rows`: the arithmetic of the device tests' calls,
+/// kept free of the device so that a host test can run it over every plan the tests use.
+struct PieceRanges {
+    proj: (usize, usize),
+    weights: (usize, usize),
+    state: (usize, usize),
+    out: (usize, usize),
+}
+
+fn piece_ranges(channels: usize, ld: usize, row0: usize, rows: usize) -> PieceRanges {
+    PieceRanges {
+        proj: (row0 * ld * 4, ((rows - 1) * ld + channels) * 4),
+        weights: (0, channels * 16),
+        state: (0, channels * 12),
+        out: (row0 * channels * 4, rows * channels * 4),
+    }
+}
+
+/// Runs the harness arithmetic of every device test on the host: the input builder at the real channel counts (the data
+/// stays inside its rows, the pad columns stay NaN, the special values land on data), and the ranges of every piece plan
+/// the tests use against the buffers the tests upload (proj `m * ld`, weights `channels * 4`, state `channels * 3`, out
+/// `m * channels` floats), for the routing, refusal and timing shapes too.
+#[test]
+fn the_conv_harness_arithmetic_fits_its_buffers() {
+    let shapes = [
+        QWEN36,
+        FLASH_NEXT,
+        (384, 400),
+        (256, 300),
+        (257, 300),
+        (255, 255),
+        (4, 4),
+        (1, 1),
+    ];
+    for (channels, ld) in shapes {
+        for m in [1usize, 2, 3, 4, 5, 16, 17, 63, 64, 65, 70, 128, 200] {
+            let inp = inputs(channels, ld, m, 0x6c0a_0000 + (channels * 1000 + m) as u64);
+            assert_eq!(inp.proj.len(), m * ld, "{channels} {ld} {m}: proj");
+            assert_eq!(inp.w.len(), channels * 4);
+            assert_eq!(inp.state0.len(), channels * 3);
+            for row in inp.proj.chunks(ld) {
+                assert!(
+                    row[channels..].iter().all(|v| v.is_nan()),
+                    "a special value landed in a pad column"
+                );
+            }
+            // the whole prompt in one piece, and cut in halves
+            let mut plans = vec![vec![m]];
+            if m >= 2 {
+                plans.push(vec![m / 2, m - m / 2]);
+            }
+            for plan in plans {
+                check_plan(channels, ld, m, &plan);
+            }
+        }
+        // the cut lists and the timing, routing and bytes shapes of the device tests
+        for (cuts, total) in [CONV_CUTS, CONV_CUTS_QUICK] {
+            for cut in cuts {
+                check_plan(channels, ld, total, cut);
+            }
+        }
+        for m in [1024usize, 2048, 2051, 4099] {
+            check_plan(channels, ld, m, &[m]);
+        }
+    }
+}
+
+fn check_plan(channels: usize, ld: usize, m: usize, plan: &[usize]) {
+    assert_eq!(plan.iter().sum::<usize>(), m, "{plan:?}");
+    let mut row0 = 0;
+    for &rows in plan {
+        let r = piece_ranges(channels, ld, row0, rows);
+        let end = |range: (usize, usize)| range.0 + range.1;
+        assert!(
+            end(r.proj) <= m * ld * 4,
+            "proj {channels} {ld} {m} {plan:?} at {row0}"
+        );
+        assert!(end(r.weights) <= channels * 16);
+        assert!(end(r.state) <= channels * 12);
+        assert!(
+            end(r.out) <= m * channels * 4,
+            "out {channels} {ld} {m} {plan:?} at {row0}"
+        );
+        row0 += rows;
     }
 }
 

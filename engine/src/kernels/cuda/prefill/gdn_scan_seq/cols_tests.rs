@@ -76,6 +76,65 @@ fn every_scan_piece_cut_adds_up_to_its_prompt() {
     }
 }
 
+/// The harness arithmetic of the scan device tests on the host: the input builder at the real head counts, and for every plan
+/// the tests use the ranges of each piece (`scan_bytes` of its shape at its row offset) against the buffers the tests upload.
+#[test]
+fn the_scan_harness_arithmetic_fits_its_buffers() {
+    for &(n_k, n_v) in &[(16usize, 32usize), (16, 48), (2, 4), (3, 6)] {
+        // the builder itself, at a few rows
+        for m in [1usize, 2, 17, 33] {
+            let c = case(
+                n_k,
+                n_v,
+                m,
+                GdnForm::QWEN36_GGUF,
+                0x5c0a_0000 + (n_v * 100 + m) as u64,
+            );
+            assert_eq!(c.conv.len(), m * c.conv_ld());
+            assert_eq!(c.proj.len(), m * c.ld());
+            assert_eq!((c.a.len(), c.dt_bias.len(), c.norm_w.len()), (n_v, n_v, D));
+            assert_eq!(c.state0.len(), n_v * D * D);
+        }
+        let mut plans: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (cuts, total) in [SCAN_CUTS, SCAN_CUTS_QUICK] {
+            plans.extend(cuts.iter().map(|cut| (total, cut.to_vec())));
+        }
+        for m in [
+            1usize, 2, 7, 8, 9, 15, 16, 17, 31, 33, 100, 300, 1024, 1500, 2051,
+        ] {
+            plans.push((m, vec![m]));
+        }
+        plans.push((4, vec![4])); // the refusal and bound-violation tests
+        for (m, plan) in plans {
+            assert_eq!(plan.iter().sum::<usize>(), m, "{plan:?}");
+            let mut row0 = 0;
+            for &rows in &plan {
+                let shape = scan_shape(n_k, n_v, rows, row0, m + 8);
+                let need = scan_bytes(shape).expect("sizes");
+                let (conv_ld, ld) = (shape.conv_ld, shape.ld);
+                assert!(
+                    row0 * conv_ld * 4 + need.conv <= m * conv_ld * 4,
+                    "conv {n_k} {n_v} {plan:?}"
+                );
+                assert!(
+                    row0 * ld * 4 + need.proj <= m * ld * 4,
+                    "proj {n_k} {n_v} {plan:?}"
+                );
+                assert!(
+                    row0 * n_v * D * 4 + need.o_out <= m * n_v * D * 4,
+                    "o_out {n_k} {n_v} {plan:?}"
+                );
+                assert_eq!(need.state, n_v * D * D * 4);
+                assert_eq!(
+                    (need.a, need.dt_bias, need.norm_w),
+                    (n_v * 4, n_v * 4, D * 4)
+                );
+                row0 += rows;
+            }
+        }
+    }
+}
+
 struct Rig {
     ctx: CudaContext,
     stream: DeviceStream,
@@ -115,6 +174,26 @@ impl Case {
     /// z, beta and alpha, then four floats the kernel must not read.
     fn ld(&self) -> usize {
         self.n_v * D + 2 * self.n_v + 4
+    }
+    fn shape(&self, m: usize, p0: usize, ctx_tokens: usize) -> ScanShape {
+        scan_shape(self.n_k, self.n_v, m, p0, ctx_tokens)
+    }
+}
+
+/// The scan shape of the device tests, free of the device so that a host test can run its arithmetic.
+fn scan_shape(n_k: usize, n_v: usize, m: usize, p0: usize, ctx_tokens: usize) -> ScanShape {
+    ScanShape {
+        m,
+        p0: p0 as i64,
+        ctx_tokens,
+        n_k_heads: n_k,
+        n_v_heads: n_v,
+        head_dim: D,
+        conv_ld: (2 * n_k + n_v) * D,
+        ld: n_v * D + 2 * n_v + 4,
+        z_off: 0,
+        beta_off: n_v * D,
+        alpha_off: n_v * D + n_v,
     }
 }
 
@@ -186,19 +265,7 @@ fn try_pieces(rig: &Rig, c: &Case, pieces: &[(usize, Option<usize>)]) -> Result<
     let o_out = testkit::upload_filled(ctx, 0xa7, out_bytes + TAIL_BYTES);
     let mut row0 = 0;
     for &(rows, cols) in pieces {
-        let shape = ScanShape {
-            m: rows,
-            p0: row0 as i64,
-            ctx_tokens: c.m + 8,
-            n_k_heads: c.n_k,
-            n_v_heads: c.n_v,
-            head_dim: D,
-            conv_ld: c.conv_ld(),
-            ld: c.ld(),
-            z_off: 0,
-            beta_off: c.beta_off(),
-            alpha_off: c.alpha_off(),
-        };
+        let shape = c.shape(rows, row0, c.m + 8);
         let need = scan_bytes(shape).expect("sizes");
         let call = GdnScanSeqCall {
             shape,
@@ -390,19 +457,7 @@ fn the_switch_routes_only_long_scans_to_the_narrow_block_kernel() {
             let nw = testkit::upload_f32(ctx, &c.norm_w);
             let state = testkit::upload_f32(ctx, &c.state0);
             let o_out = testkit::upload_filled(ctx, 0xa7, m * c.n_v * D * 4);
-            let shape = ScanShape {
-                m,
-                p0: 0,
-                ctx_tokens: m + 8,
-                n_k_heads: c.n_k,
-                n_v_heads: c.n_v,
-                head_dim: D,
-                conv_ld: c.conv_ld(),
-                ld: c.ld(),
-                z_off: 0,
-                beta_off: c.beta_off(),
-                alpha_off: c.alpha_off(),
-            };
+            let shape = c.shape(m, 0, m + 8);
             let need = scan_bytes(shape).expect("sizes");
             let call = GdnScanSeqCall {
                 shape,
@@ -495,19 +550,7 @@ fn scan_cols_kernel_timing() {
                 .map(|_| testkit::upload_f32(ctx, &c.state0))
                 .collect();
             let o_out = testkit::upload_filled(ctx, 0, m * n_v * D * 4);
-            let shape = ScanShape {
-                m,
-                p0: 0,
-                ctx_tokens: m + 8,
-                n_k_heads: 16,
-                n_v_heads: n_v,
-                head_dim: D,
-                conv_ld: c.conv_ld(),
-                ld: c.ld(),
-                z_off: 0,
-                beta_off: c.beta_off(),
-                alpha_off: c.alpha_off(),
-            };
+            let shape = c.shape(m, 0, m + 8);
             let need = scan_bytes(shape).expect("sizes");
             let mut times = vec![Vec::new(); kernels.len()];
             for round in 0..WARM + ROUNDS {
@@ -675,19 +718,7 @@ mod mutants {
         let rig = Rig::new();
         let ctx = &rig.ctx;
         let c = case(2, 4, 4, GdnForm::QWEN36_GGUF, 0x5c07_0001);
-        let shape = ScanShape {
-            m: c.m,
-            p0: 0,
-            ctx_tokens: 1024,
-            n_k_heads: c.n_k,
-            n_v_heads: c.n_v,
-            head_dim: D,
-            conv_ld: c.conv_ld(),
-            ld: c.ld(),
-            z_off: 0,
-            beta_off: c.beta_off(),
-            alpha_off: c.alpha_off(),
-        };
+        let shape = c.shape(c.m, 0, 1024);
         let need = scan_bytes(shape).expect("sizes");
         for cols in WIDTHS {
             let conv = testkit::upload_f32(ctx, &c.conv);
