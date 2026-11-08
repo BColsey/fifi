@@ -1000,11 +1000,9 @@ mod tests {
                 .unwrap()
             };
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
-            assert_eq!(
-                read_u32(&mut kernels, route.ids.ids()),
-                LAYER0_ROUTES[n as usize],
-                "input {n} experts"
-            );
+            let got_route = read_u32(&mut kernels, route.ids.ids());
+            println!("ROUTE_DBG {n} {got_route:?}");
+            assert_eq!(got_route, LAYER0_ROUTES[n as usize], "input {n} experts");
             let gates = values(&mut kernels, &route.gates).unwrap();
             let gate_sum: f32 = gates.iter().sum();
             assert!(
