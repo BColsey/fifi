@@ -1,9 +1,11 @@
 #include <cuda/atomic>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #include "abi.h"
 #include "abi_ring.h"
+#include "peer_ring_policy.h"
 
 namespace {
 
@@ -226,7 +228,8 @@ cudaStream_t as_stream(void *stream) {
 
 /// One block covers this many values before the multi-block form pays
 /// for its two extra launches (the eager step's payloads all sit below).
-constexpr int kSingleBlockValues = kThreads * 8;
+constexpr int kSingleBlockValues = fifi_ring::kValuesPerBlock;
+static_assert(kSingleBlockValues == kThreads * 8);
 
 __global__ void publish_f16_small_kernel(const float *src, void *dst_slot,
                                          int count, unsigned seq) {
@@ -268,14 +271,13 @@ __global__ void publish_f32_small_kernel(const float *src, void *dst_slot,
 }
 
 int payload_blocks(int count) {
-    int blocks = (count + kThreads * 8 - 1) / (kThreads * 8);
-    if (blocks < 1) {
-        blocks = 1;
+    if (count <= kSingleBlockValues) {
+        return 1;
     }
-    if (blocks > 64) {
-        blocks = 64;
-    }
-    return blocks;
+    // Opt in before process start; the disabled path retains one-block launches.
+    static const bool enabled = fifi_ring::multiblock_enabled(
+        std::getenv("INFERENCE_CUDA_P2P_RING_MULTIBLOCK"));
+    return fifi_ring::payload_blocks(count, enabled);
 }
 
 } // namespace
@@ -290,11 +292,11 @@ extern "C" int inference_cuda_ring_publish_f16(void *stream,
         }
         (void)cudaGetLastError();
         cudaStream_t s = as_stream(stream);
-        if (count <= kSingleBlockValues) {
+        const int blocks = payload_blocks(count);
+        if (blocks == 1) {
             publish_f16_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
                                                             count, seq);
         } else {
-            int blocks = payload_blocks(count);
             publish_flags_zero_kernel<<<1, 1, 0, s>>>(dst_slot);
             publish_f16_kernel<<<blocks, kThreads, 0, s>>>(src, dst_slot,
                                                            count);
@@ -316,11 +318,11 @@ extern "C" int inference_cuda_ring_publish_f32(void *stream,
         }
         (void)cudaGetLastError();
         cudaStream_t s = as_stream(stream);
-        if (count <= kSingleBlockValues) {
+        const int blocks = payload_blocks(count);
+        if (blocks == 1) {
             publish_f32_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
                                                             count, seq);
         } else {
-            int blocks = payload_blocks(count);
             publish_f32_kernel<<<blocks, kThreads, 0, s>>>(src, dst_slot,
                                                            count);
             publish_commit_kernel<<<1, 1, 0, s>>>(dst_slot, seq);
