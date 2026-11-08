@@ -2072,11 +2072,17 @@ impl<'a> QwenResidentStep<'a> {
             .zip(&marks.mixer_end)
             .map(|((start, _), mixer_end)| start.elapsed_ms_since(mixer_end))
             .collect::<Result<Vec<_>, _>>()?;
-        let core_ms = marks
-            .core
-            .iter()
-            .map(|(start, end)| start.elapsed_ms_since(end))
-            .collect::<Result<Vec<_>, _>>()?;
+        let core_ms = if crate::family::qwen36::section_core_marks() {
+            marks
+                .core
+                .iter()
+                .map(|(start, end)| start.elapsed_ms_since(end))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            // The core pair was never recorded: zeros keep the readings shaped (the split is
+            // an opt-in attribution run; a never-recorded event must never be queried).
+            vec![0.0; marks.core.len()]
+        };
         let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
         marks
             .plan
@@ -2363,13 +2369,21 @@ impl<'a> QwenResidentStep<'a> {
                     admit_pos,
                 };
                 // The attention-core pair of the finer split: `None` on unmarked layers (the
-                // pair is one extra event node per marked group per replay).
-                let core = self.marks.as_ref().and_then(|marks| {
-                    marks
-                        .group_index(layer)
-                        .map(|at| (&marks.core[at].0, &marks.core[at].1))
-                });
-                self.mixers.run_block(s, &self.state, layer, io, core)
+                // pair is one extra event node per marked group per replay). Opt-in via
+                // `Q36_SECTION_CORE_MARKS=1`: an event node BETWEEN the block's dependent
+                // kernels costs real replay time on small GPUs (measured +30ms on the Xavier
+                // over 20 groups), unlike the boundary events, so the default rig stays clean
+                // and the core/proj split is an explicit attribution run.
+                let core_marks = if crate::family::qwen36::section_core_marks() {
+                    self.marks.as_ref().and_then(|marks| {
+                        marks
+                            .group_index(layer)
+                            .map(|at| (&marks.core[at].0, &marks.core[at].1))
+                    })
+                } else {
+                    None
+                };
+                self.mixers.run_block(s, &self.state, layer, io, core_marks)
             }
             StepOp::Moe(layer) if self.layout == WeightLayout::Exl3 => {
                 let weights = self.exl3_moe.get(layer).ok_or_else(|| {
