@@ -27,8 +27,8 @@
 //! the same buffers.
 //! These copies preserve saved bytes, but chunk partitioning can change after a restore.
 //! Comparisons against cold chunked prefill use numerical tolerances, not bitwise equality.
-//! A tiered step never saves: its numbers follow
-//! the bank state, which follows the history. A capture needs no invalidation: the graph bakes
+//! Tiered prefix saving is experimental and requires `Q36_TIERED_PREFIX=1`; its numerical behavior
+//! must be checked against a fresh prefill. A capture needs no invalidation: the graph bakes
 //! addresses, not positions, and the next token rewrites the `pos`/`kv_len` words from the
 //! imported `tokens` count.
 
@@ -163,14 +163,11 @@ impl ExecutorOps for QwenResidentStep<'_> {
     }
 
     fn prefix_limits(&self) -> StoreLimits {
-        if self.is_tiered() {
-            StoreLimits {
-                roots: 0,
-                entries: 0,
-            }
-        } else {
-            self.prefix.limits()
-        }
+        effective_prefix_limits(
+            self.is_tiered(),
+            tiered_prefix_enabled(std::env::var_os(TIERED_PREFIX_VAR).as_deref()),
+            self.prefix.limits(),
+        )
     }
 
     fn history<'s>(&self, st: &'s DecodeSession) -> &'s [u32] {
@@ -238,8 +235,7 @@ impl ExecutorOps for QwenResidentStep<'_> {
     /// nothing structurally blocks a tiered save — but the combination was never
     /// qualified, so the flag ships it dark exactly like every other new path.
     fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
-        let flag = tiered_prefix_enabled(std::env::var_os(TIERED_PREFIX_VAR).as_deref());
-        if (self.is_tiered() && !flag) || self.prefix.limits().entries == 0 {
+        if self.prefix_limits().entries == 0 {
             return Ok(false);
         }
         if self.pinned_prefix_enabled() {
@@ -336,7 +332,6 @@ impl QwenResidentStep<'_> {
     }
 }
 
-
 /// Whether tiered sessions may save and restore prefixes (`Q36_TIERED_PREFIX=1`). The
 /// default stays off: tiered prefix reuse was gated out of the original executor and
 /// re-enabling it is new behaviour pending device qualification.
@@ -345,9 +340,21 @@ fn tiered_prefix_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
+fn effective_prefix_limits(tiered: bool, enabled: bool, configured: StoreLimits) -> StoreLimits {
+    if tiered && !enabled {
+        StoreLimits {
+            roots: 0,
+            entries: 0,
+        }
+    } else {
+        configured
+    }
+}
+
 #[cfg(test)]
 mod tiered_prefix_tests {
-    use super::{TIERED_PREFIX_VAR, tiered_prefix_enabled};
+    use super::{TIERED_PREFIX_VAR, effective_prefix_limits, tiered_prefix_enabled};
+    use crate::family::session::StoreLimits;
     use std::ffi::OsStr;
 
     /// Exactly `1` enables; anything else (including unset) keeps the gate closed.
@@ -358,5 +365,25 @@ mod tiered_prefix_tests {
         assert!(!tiered_prefix_enabled(Some(OsStr::new("0"))));
         assert!(!tiered_prefix_enabled(Some(OsStr::new("yes"))));
         assert!(!tiered_prefix_enabled(None));
+    }
+
+    #[test]
+    fn tiered_opt_in_exposes_configured_slots_to_the_save_scheduler() {
+        let configured = StoreLimits {
+            roots: 0,
+            entries: 1,
+        };
+        let disabled = StoreLimits {
+            roots: 0,
+            entries: 0,
+        };
+        assert_eq!(effective_prefix_limits(true, false, configured), disabled);
+        assert_eq!(effective_prefix_limits(true, true, configured), configured);
+        assert_eq!(
+            effective_prefix_limits(false, false, configured),
+            configured
+        );
+        assert_eq!(effective_prefix_limits(false, true, configured), configured);
+        assert_eq!(effective_prefix_limits(true, true, disabled), disabled);
     }
 }

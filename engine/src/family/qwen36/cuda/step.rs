@@ -1502,7 +1502,7 @@ impl<'a> QwenResidentStep<'a> {
         Ok(())
     }
 
-    /// Whether the step runs the tiered MoE path: a tiered step never saves a prefix.
+    /// Whether the step runs the tiered MoE path, whose prefix reuse is experimental.
     pub(super) fn is_tiered(&self) -> bool {
         self.tiered_mode
     }
