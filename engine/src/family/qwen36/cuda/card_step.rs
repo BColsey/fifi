@@ -122,12 +122,24 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
+        Self::with_table(dims, options, devices, admission, &table)
+    }
+
+    /// The stack over an explicit shard table: the placement planner's
+    /// table, whose runs the loader must have used for the same cards.
+    pub(crate) fn with_table(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
                 "the card stack needs at least one device".to_owned(),
             ));
         }
-        let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
         let scratch = KernelScratch::for_dims(dims, 1, options.kv_mode)?;
         let mut contexts = Vec::with_capacity(devices.len());
         let mut streams = Vec::with_capacity(devices.len());
@@ -137,21 +149,28 @@ impl CardStack {
             contexts.push(context);
         }
         // The ring first: it captures each mailbox's base address from the
-        // bare contexts before anything else borrows them.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden)?;
+        // bare contexts before anything else borrows them. The payload cap
+        // covers the MoE all-reduce, which exchanges every `expert_down`
+        // pick row (`top_k` hidden rows) in one sequence.
+        let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
         let mut shards = Vec::with_capacity(devices.len());
         let mut states = Vec::with_capacity(devices.len());
         for (card, context) in contexts.iter().enumerate() {
-            let plan = StepPlan::for_card(dims, &table, card, options, &scratch)?;
+            let plan = StepPlan::for_card(dims, table, card, options, &scratch)?;
             shards.push(CardShard::new(context, &streams[card], &plan)?);
-            states.push(ResidentState::allocate(
+            // The card's cache planes hold only its own K/V head groups
+            // (whole head multiples by the shard table's deal); the
+            // gathered full row stays at the whole shape's width.
+            let kv_heads = table.kv_rows(card)?.len() / dims.shape.attn.head_dim;
+            states.push(ResidentState::allocate_with_kv_heads(
                 context,
                 &streams[card],
                 dims,
                 options,
+                kv_heads,
             )?);
             plans.push(plan);
         }
@@ -159,7 +178,7 @@ impl CardStack {
             Self {
                 ring,
                 shards,
-                table,
+                table: table.clone(),
                 plans,
                 streams,
                 contexts,
@@ -429,7 +448,9 @@ mod device_tests {
                     slot.slot
                 );
             }
-            // The state is full-size and shaped like every other card's.
+            // The delta state replicates; the KV pool is SLICED to the
+            // card's own heads, and the cards' pools together hold exactly
+            // one full replica's worth of cache.
             assert!(states[card].kv_bytes() > 0);
             assert_eq!(
                 states[card].layout().delta.total,
@@ -440,6 +461,14 @@ mod device_tests {
                 states[card].kv_bytes(),
                 states[1 - card].kv_bytes(),
                 "card {card}: kv state size"
+            );
+            assert_eq!(
+                states[card].kv_bytes() + states[1 - card].kv_bytes(),
+                crate::family::qwen36::cuda::state_layout::StateLayout::new(&d, &options())
+                    .expect("full layout")
+                    .kv
+                    .total,
+                "the sliced pools hold exactly one replica of KV"
             );
         }
         for (card, shard) in stack.shards().iter().enumerate() {

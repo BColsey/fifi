@@ -153,17 +153,20 @@ impl MixerGeometry {
     /// [`Self::new`] with the sharded widths replaced by the card's run —
     /// its key/value-head runs, its channel segments of `AttnQkv`, its
     /// query-head run and its K/V projection rows. The replicated widths
-    /// stay full: `hidden` (the residual row every card holds), `heads_kv`
-    /// (the replicated KV cache), `value_dim`, `head_dim` and the RoPE
-    /// facts. A card's projection rows (`ld`) are therefore narrower than
+    /// stay full: `hidden` (the residual row every card holds), `value_dim`,
+    /// `head_dim` and the RoPE facts. `heads_kv` is the CARD's own K/V head
+    /// groups (the cache planes are sliced to the card); only the gathered
+    /// full row (`Slot::KRows`/`VRows`) keeps the whole shape's width. A
+    /// card's projection rows (`ld`) are therefore narrower than
     /// the single-device row, so the plan-width check of `new` does not
     /// apply; the two table-consistency checks below replace it.
     ///
     /// The card's K/V projection rows are its slice of the full row, not a
     /// head multiple: ops that need the absolute row index (the RoPE phase
     /// of a K row) read `table.kv_rows(card)`, not this geometry's slice
-    /// length. The full new K/V row reappears on every card through the
-    /// ring gather before the cache append.
+    /// length. The full new K/V row still reappears on every card through
+    /// the ring gather, but the append writes only the card's heads into
+    /// its sliced cache planes.
     pub(super) fn for_card(
         dims: &StepDims,
         table: &ShardTable,
@@ -219,9 +222,19 @@ impl MixerGeometry {
         }
         let q_rows = 2 * q_width;
         let kv_rows = table.kv_rows(card)?.len();
+        if !kv_rows.is_multiple_of(a.head_dim) {
+            return Err(EngError::Checkpoint(format!(
+                "mixer geometry: card {card} kv rows {kv_rows} are not whole {}-dim heads",
+                a.head_dim
+            )));
+        }
         let attn = AttnGeometry {
             heads_q,
-            heads_kv: a.heads_kv,
+            // The card's own K/V head groups: the cache planes are SLICED to
+            // the card (each card stores, appends and decodes only its heads;
+            // see ResidentState::allocate_with_kv_heads). The whole-row
+            // gather buffers stay at the full shape's width.
+            heads_kv: kv_rows / a.head_dim,
             head_dim: a.head_dim,
             n_rot: a.rotary_dim,
             rope_base: a.theta,

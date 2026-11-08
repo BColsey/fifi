@@ -99,6 +99,12 @@ pub(crate) struct StateIdentity {
 
 impl StateIdentity {
     pub(crate) fn new(dims: &StepDims, kv_mode: KvMode) -> Self {
+        Self::with_kv_heads(dims, kv_mode, dims.shape.attn.heads_kv)
+    }
+
+    /// The sliced form: a state of `kv_heads` K/V heads per plane never
+    /// identifies with a full-replica layout (or a different slice).
+    pub(crate) fn with_kv_heads(dims: &StepDims, kv_mode: KvMode, kv_heads: usize) -> Self {
         let (d, a) = (&dims.shape.delta, &dims.shape.attn);
         Self {
             layout: LAYOUT_TAG,
@@ -110,7 +116,7 @@ impl StateIdentity {
             value_dim: d.value_dim,
             conv_taps: d.conv_kernel - 1,
             conv_dim: d.conv_dim(),
-            kv_heads: a.heads_kv,
+            kv_heads,
             head_dim: a.head_dim,
         }
     }
@@ -256,7 +262,20 @@ impl ResidentState {
         dims: &StepDims,
         options: &StepOptions,
     ) -> Result<Self, EngError> {
-        let layout = StateLayout::new(dims, options)?;
+        Self::allocate_with_kv_heads(context, stream, dims, options, dims.shape.attn.heads_kv)
+    }
+
+    /// The sliced form: the KV pool holds only `kv_heads` heads per plane -
+    /// a multi-device card's own K/V head groups - and the identity records
+    /// the slice so it never imports into a differently shaped layout.
+    pub(crate) fn allocate_with_kv_heads(
+        context: &CudaContext,
+        stream: &DeviceStream,
+        dims: &StepDims,
+        options: &StepOptions,
+        kv_heads: usize,
+    ) -> Result<Self, EngError> {
+        let layout = StateLayout::new_with_kv_heads(dims, options, kv_heads)?;
         if layout.delta.total == 0 || layout.kv.total == 0 {
             return Err(EngError::Checkpoint(
                 "the family needs both DeltaNet and attention layers".to_owned(),
@@ -271,7 +290,7 @@ impl ResidentState {
             delta,
             words,
             layout,
-            identity: StateIdentity::new(dims, options.kv_mode),
+            identity: StateIdentity::with_kv_heads(dims, options.kv_mode, kv_heads),
             instance: Rc::new(()),
             book,
             resident_tip: None,
@@ -411,6 +430,13 @@ impl ResidentState {
         status: i32,
     ) -> Result<(), CommitRefusal> {
         self.book.commit(accepted, status)
+    }
+
+    /// Admits a step of `advance` rows into the state book (rule 1 of
+    /// `book.rs`): the card session enqueues its one-row steps so the books
+    /// carry the token count the prefix export reads.
+    pub(crate) fn enqueue_step(&mut self, advance: usize) -> Result<(), EngError> {
+        self.book.enqueue(advance).map(|_| ())
     }
 
     /// Marks the state untrustworthy until the next `reset` or a successful `import_state`: the

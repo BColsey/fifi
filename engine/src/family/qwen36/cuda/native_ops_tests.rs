@@ -286,6 +286,8 @@ fn the_int8_attention_list_is_pinned() {
         BlockOp::Kv8Append {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at: 0,
+            v_at: 0,
             k_codes: Plane::K,
             k_scales: Plane::KScales,
             v_codes: Plane::V,
