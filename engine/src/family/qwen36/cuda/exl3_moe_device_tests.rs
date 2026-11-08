@@ -292,6 +292,9 @@ fn run_block_rounded(
     };
     let ctx = projector.context();
     let stream = ctx.stream()?;
+    // The overlap fact travels with the resolver (the arming of `enable_overlap`), so the
+    // harness cannot desync from the production read of the split.
+    let overlap = bank.is_some_and(|bank| bank.overlap_armed());
     run_exl3_moe(
         &Launch {
             ctx,
@@ -302,6 +305,7 @@ fn run_block_rounded(
         moe,
         device_ids,
         bank,
+        overlap,
     )?;
     stream.synchronize()?;
     let ids = read(projector, &owned.buffers[4])
@@ -329,6 +333,20 @@ fn run_block_rounded(
 #[test]
 #[ignore = "requires the pinned EXL3 pack in FIFI_EXL3_CHECKPOINT and a GPU"]
 fn banked_moe_block_is_byte_identical_to_the_resident_block() {
+    banked_block_parity(false);
+}
+
+/// [`banked_moe_block_is_byte_identical_to_the_resident_block`] with the overlap armed
+/// (`Q36_CUDA_BANK_OVERLAP`'s device path): the misses refill on the copy stream and the
+/// resident picks' gate/up launches run before the event wait — the same bytes through a
+/// different stream order is the whole claim of the split.
+#[test]
+#[ignore = "requires the pinned EXL3 pack in FIFI_EXL3_CHECKPOINT and a GPU"]
+fn overlapped_banked_moe_block_is_byte_identical_to_the_resident_block() {
+    banked_block_parity(true);
+}
+
+fn banked_block_parity(overlap: bool) {
     let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
     assert!(device_present("banked EXL3 moe block"), "a GPU is required");
     let checkpoint = Checkpoint::open(Path::new(&dir)).expect("open the pack");
@@ -351,6 +369,9 @@ fn banked_moe_block_is_byte_identical_to_the_resident_block() {
         let mut resolver =
             Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert, 0)
                 .unwrap();
+        if overlap {
+            resolver.enable_overlap(projector.context()).unwrap();
+        }
         let mut saw_miss = false;
         for round in 0..6 {
             let want = run_block_rounded(&projector, &block, &moe, false, round, None)

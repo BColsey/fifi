@@ -2404,6 +2404,9 @@ impl<'a> QwenResidentStep<'a> {
                     self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
                 }
                 let mut bank_guard = self.exl3_bank.map(|bank| bank.borrow_mut());
+                // The overlap fact travels with the resolver: the start armed it from the
+                // environment, the block splits its launches around the copy-stream refills.
+                let overlap = bank_guard.as_ref().is_some_and(|guard| guard.overlap_armed());
                 let mut bank = bank_guard.as_mut().map(|guard| guard.layer(layer));
                 let block = if let Some(merge) = &self.exl3_merge {
                     run_exl3_moe_merged(
@@ -2412,6 +2415,7 @@ impl<'a> QwenResidentStep<'a> {
                         &self.moe_dims,
                         self.exl3_device_ids,
                         bank.as_mut(),
+                        overlap,
                     )
                 } else {
                     run_exl3_moe(
@@ -2421,6 +2425,7 @@ impl<'a> QwenResidentStep<'a> {
                         &self.moe_dims,
                         self.exl3_device_ids,
                         bank.as_mut(),
+                        overlap,
                     )
                 };
                 #[cfg(test)]

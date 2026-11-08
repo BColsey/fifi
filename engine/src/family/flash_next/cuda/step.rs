@@ -917,7 +917,7 @@ impl MoeBlock for AllResidentMoe<'_> {
         })?;
         // Flash-Next runs the captured block; the q36 expert bank never reaches it (the
         // bank is a q36 member and the eager read path is the resolver's).
-        run_exl3_moe(launch, &weights, bufs, dims, true, None)
+        run_exl3_moe(launch, &weights, bufs, dims, true, None, false)
     }
 }
 

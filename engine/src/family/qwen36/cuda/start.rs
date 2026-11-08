@@ -260,6 +260,7 @@ const CHUNK_ROWS_VAR: &str = "Q36_CUDA_CHUNK_ROWS";
 const CONTEXT_STAGING_VAR: &str = "Q36_CUDA_KV8_STAGE_CONTEXT";
 const FIXED_ADMISSION_VAR: &str = "Q36_CUDA_KV8_FIXED_ADMISSION";
 const DEVICE_FIRST_VAR: &str = "Q36_CUDA_PAGED_DEVICE_FIRST";
+const BANK_OVERLAP_VAR: &str = "Q36_CUDA_BANK_OVERLAP";
 pub(super) const WIDE_STAGE_VAR: &str = "Q36_CUDA_CPF_STAGE_128K";
 
 fn device_first_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
@@ -328,6 +329,14 @@ fn context_staging_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngEr
 /// `Q36_CUDA_CPF_STAGE_128K=0` rolls it back to the 32768-row default stage.
 fn wide_stage_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
     prefill_flag(WIDE_STAGE_VAR, true, value)
+}
+
+/// Whether `Q36_CUDA_BANK_OVERLAP=1` was given: a banked decode's miss refills move to a copy
+/// stream and the MoE blocks launch their resident-expert work before the wait, hiding the
+/// refill DMA under compute. Default off: the overlap is a measured, not assumed, win on the
+/// small-VRAM banks it targets.
+fn bank_overlap_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError> {
+    prefill_flag(BANK_OVERLAP_VAR, false, value)
 }
 
 fn fixed_admission_wanted(
@@ -1235,6 +1244,13 @@ fn make(
                 experts,
                 settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky),
             )?;
+            // A bad value stops the start, not the first token (the other flags' rule);
+            // the arming happens before the leak so no `RefCell` borrow crosses it.
+            let overlap = bank_overlap_wanted(std::env::var_os(BANK_OVERLAP_VAR).as_deref())?;
+            let mut resolver = resolver;
+            if overlap {
+                resolver.enable_overlap(projector.context())?;
+            }
             Some(Box::leak(Box::new(std::cell::RefCell::new(resolver))))
         }
         None => None,

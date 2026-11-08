@@ -326,7 +326,15 @@ impl Block<'_> {
     /// Queues the block on `stream`; nothing synchronizes.
     pub(super) fn queue(&self, ctx: &CudaContext, stream: &DeviceStream) -> Res<()> {
         let launch = Launch { ctx, stream };
-        run_exl3_moe(&launch, &self.weights, &self.bufs()?, &self.moe, true, None)
+        run_exl3_moe(
+            &launch,
+            &self.weights,
+            &self.bufs()?,
+            &self.moe,
+            true,
+            None,
+            false,
+        )
     }
 }
 

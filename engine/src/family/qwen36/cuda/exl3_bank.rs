@@ -12,7 +12,8 @@ use crate::{
         qwen36::settings::{BankMode, SlotRequest},
     },
     kernels::cuda::{
-        DeviceBuffer, DeviceStream, device_synchronize, host_register, host_unregister,
+        DeviceBuffer, DeviceEvent, DeviceStream, device_synchronize, host_register,
+        host_unregister,
     },
 };
 
@@ -479,6 +480,11 @@ pub(crate) struct Exl3SlotResolver<'w> {
     store: ExpertStore,
     hits: u64,
     misses: u64,
+    /// The overlap pair (`Q36_CUDA_BANK_OVERLAP=1`): a copy stream that carries miss refills
+    /// beside the launch stream, and the event the launches reading the refilled slots wait.
+    /// Only [`LayerResolver::resolve_split`] uses it; a plain [`LayerResolver::resolve`]
+    /// never does, so a caller that cannot split its launches keeps today's ordering.
+    overlap: Option<(DeviceStream, DeviceEvent)>,
 }
 
 impl<'w> Exl3SlotResolver<'w> {
@@ -528,7 +534,29 @@ impl<'w> Exl3SlotResolver<'w> {
             store,
             hits: 0,
             misses: 0,
+            overlap: None,
         })
+    }
+
+    /// Arms the overlap pair of [`LayerResolver::resolve_split`]: one copy stream for miss
+    /// refills, one event to gate the launches that read them. Before the first token only,
+    /// from the start of a banked session whose environment asked for it.
+    pub(crate) fn enable_overlap(
+        &mut self,
+        context: &crate::kernels::cuda::CudaContext,
+    ) -> Result<(), EngError> {
+        if self.overlap.is_some() {
+            return Ok(());
+        }
+        self.overlap = Some((context.stream()?, context.event()?));
+        Ok(())
+    }
+
+    /// Whether [`LayerResolver::resolve_split`] refills on the copy stream (the start armed
+    /// the pair from `Q36_CUDA_BANK_OVERLAP=1`); the MoE blocks read this to split their
+    /// launches around the refills.
+    pub(crate) fn overlap_armed(&self) -> bool {
+        self.overlap.is_some()
     }
 
     /// One layer's resolver view, what the MoE block hooks take.
@@ -561,6 +589,12 @@ pub(crate) struct LayerResolver<'r, 'w> {
 }
 
 impl LayerResolver<'_, '_> {
+    /// Whether this resolver's calls refill on the copy stream (the arming of the resolver
+    /// it borrows); the launch builders read this to split around the refills.
+    pub(crate) fn overlap_armed(&self) -> bool {
+        self.resolver.overlap_armed()
+    }
+
     /// Maps one call's picks (a decode token's, a prefill sub-block's, or a K-row window
     /// row's) to slots, refilling the missed slots' device bytes from the store. The copies
     /// are enqueued on `stream` (`write_at_enqueue`; the store is page-locked after the load):
@@ -571,27 +605,80 @@ impl LayerResolver<'_, '_> {
         stream: &DeviceStream,
         picks: &[usize],
     ) -> Result<Vec<usize>, EngError> {
+        Ok(self.resolve_mapped(stream, picks, false)?.0)
+    }
+
+    /// [`Self::resolve`] for a caller that splits its launches around the refills
+    /// (`Q36_CUDA_BANK_OVERLAP=1`): the missed slots refill on the resolver's copy stream
+    /// instead, the event lands in the return, and the caller queues the launches that read
+    /// only already-resident slots before the wait (their compute hides the refill DMA), the
+    /// launches that read a refilled slot after it. Without the pair armed this is exactly
+    /// [`Self::resolve`] with an absent event.
+    ///
+    /// Safety rests on the readback that produced the picks: it waited the launch stream,
+    /// which had waited every earlier copy event before the launches it read back, so both
+    /// streams are quiescent here and a copy-stream refill cannot overtake a queued reader.
+    pub(crate) fn resolve_split(
+        &mut self,
+        stream: &DeviceStream,
+        picks: &[usize],
+        overlap: bool,
+    ) -> Result<(Vec<usize>, Vec<usize>, Option<&DeviceEvent>), EngError> {
+        let (slots, refilled, event) = self.resolve_mapped(stream, picks, overlap)?;
+        // A pick gates on the event when its SLOT refilled this call, not when the pick
+        // itself reported the miss: a duplicate pick of a just-refilled expert reads the
+        // same refilling bytes and must wait with the miss.
+        let gated = (0..picks.len())
+            .filter(|&p| refilled.contains(&slots[p]))
+            .collect();
+        Ok((slots, gated, event))
+    }
+
+    /// The shared body: `assign`, the refills, the stats. With `split`, the refills go on
+    /// the overlap copy stream and the event is recorded on it (absent when nothing
+    /// refilled — no wait orders anything); without, they ride `stream` as they always did.
+    fn resolve_mapped(
+        &mut self,
+        stream: &DeviceStream,
+        picks: &[usize],
+        split: bool,
+    ) -> Result<(Vec<usize>, Vec<usize>, Option<&DeviceEvent>), EngError> {
         #[cfg(test)]
         let began = std::time::Instant::now();
         let (table, parts) = &mut self.resolver.layers[self.layer];
         let store = self.resolver.store.layer(self.layer);
         let (slots, misses) = table.assign(picks)?;
         let miss_count = misses.len();
+        let copy = if split && miss_count > 0 {
+            self.resolver.overlap.as_ref()
+        } else {
+            None
+        };
+        let refill = copy.map_or(stream, |(copy, _)| copy);
         for slot in misses {
             let expert = table.expert_of(slot);
             for (part, target) in parts.iter().enumerate() {
                 let record = store[part].member(expert);
-                // Enqueued on the launch stream: the copy races the launches queued
-                // after it instead of a device-wide sync per miss, and the next
-                // layer's readback (already a stream wait) covers its completion.
+                // On the launch stream (no split): the copy races the launches queued
+                // after it instead of a device-wide sync per miss, and the next layer's
+                // readback (already a stream wait) covers its completion. On the copy
+                // stream (split): the event below gates the launches that read the slot;
+                // both streams were quiescent at the readback that produced the picks.
                 // The store is pinned, so the record must stay untouched until the
-                // stream drains; the store is immutable post-load and
+                // streams drain; the store is immutable post-load and
                 // process-long-lived, which is that invariant.
                 target
                     .bank
-                    .write_at_enqueue(stream, slot * target.record, record)?;
+                    .write_at_enqueue(refill, slot * target.record, record)?;
             }
         }
+        let event = match (copy, miss_count > 0) {
+            (Some((_, event)), true) => {
+                refill.record(event)?;
+                Some(event)
+            }
+            _ => None,
+        };
         self.resolver.hits += (picks.len() - miss_count) as u64;
         self.resolver.misses += miss_count as u64;
         #[cfg(test)]
@@ -600,7 +687,7 @@ impl LayerResolver<'_, '_> {
         }
         #[cfg(test)]
         probe::resolve(began.elapsed());
-        Ok(slots)
+        Ok((slots, misses, event))
     }
 }
 

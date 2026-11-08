@@ -38,7 +38,7 @@ use crate::{
         },
     },
     kernels::cuda::{
-        DeviceBuffer, DeviceRange,
+        DeviceBuffer, DeviceEvent, DeviceRange,
         prefill::swiglu_rows::{SwigluRowsCall, SwigluRowsShape},
         resident::{
             moe_combine::{CombineCall, CombineOut, CombineShape, SharedTerm},
@@ -368,24 +368,47 @@ fn swiglu(
     )
 }
 
+/// The routed experts of the host-picks arm: `picks` holds one slot (banked) or expert
+/// (resident) per pick. `gate`, when present, carries the overlapped refills of a banked
+/// call: the pick indices whose slots are refilling on the copy stream and the event those
+/// picks' launches must first wait. The picks outside `gate.1` are already resident, so
+/// their gate/up pairs launch before the wait and their compute hides the refill DMA; the
+/// swiglu, the down pairs and the combine still wait (they need every pick's output), which
+/// is why only the gate/up phase splits.
 fn routed(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
     (picks, dims): (&[usize], &MoeDims),
+    gate: Option<(&DeviceEvent, &[usize])>,
 ) -> Result<(), EngError> {
     let (h, i) = (dims.hidden, dims.inter);
-    let mut group = Vec::with_capacity(2 * picks.len());
-    for (slot, &expert) in picks.iter().enumerate() {
+    let mut resident = Vec::with_capacity(2 * picks.len());
+    let mut refilling = Vec::new();
+    for (index, &slot) in picks.iter().enumerate() {
+        let gated = gate.is_some_and(|(_, missed)| missed.contains(&index));
         for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
-            group.push(Pair {
-                view: bank.view(expert)?,
+            let pair = Pair {
+                view: bank.view(slot)?,
                 x: bufs.route.norm_row,
-                out: row(&bufs.expert_gu, i * F32, 2 * slot + half)?,
-            });
+                out: row(&bufs.expert_gu, i * F32, 2 * index + half)?,
+            };
+            if gated {
+                refilling.push(pair);
+            } else {
+                resident.push(pair);
+            }
         }
     }
-    grouped(launch, &group, &bufs.scratch)?;
+    if !resident.is_empty() {
+        grouped(launch, &resident, &bufs.scratch)?;
+    }
+    if !refilling.is_empty() {
+        if let Some((event, _)) = gate {
+            launch.stream.wait(event)?;
+        }
+        grouped(launch, &refilling, &bufs.scratch)?;
+    }
     swiglu(launch, bufs.expert_gu, bufs.expert_act, (dims.top_k, i))?;
     let mut group = Vec::with_capacity(picks.len());
     for (slot, &expert) in picks.iter().enumerate() {
@@ -597,6 +620,7 @@ pub(in crate::family) fn run_exl3_moe(
     dims: &MoeDims,
     device_ids: bool,
     bank: Option<&mut super::exl3_bank::LayerResolver<'_, '_>>,
+    overlap: bool,
 ) -> Result<(), EngError> {
     if dims.rows != 1 {
         return Err(refuse(format!(
@@ -615,18 +639,24 @@ pub(in crate::family) fn run_exl3_moe(
         routed_on_device(launch, weights, bufs, dims)?;
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims.top_k, dims.n_expert)?;
+        let mut gated = None;
         let picks = match bank {
             Some(bank) => {
                 #[cfg(test)]
                 let began = std::time::Instant::now();
-                let mapped = bank.resolve(launch.stream, &picks)?;
+                let (slots, missed, event) =
+                    bank.resolve_split(launch.stream, &picks, overlap)?;
                 #[cfg(test)]
                 crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
-                mapped
+                gated = event.map(|event| (event, missed));
+                slots
             }
             None => picks,
         };
-        routed(launch, weights, bufs, (&picks, dims))?;
+        let gate = gated
+            .as_ref()
+            .map(|(event, missed)| (*event, missed.as_slice()));
+        routed(launch, weights, bufs, (&picks, dims), gate)?;
     }
     shared(launch, weights, bufs, dims)?;
     combine(launch, bufs, dims)

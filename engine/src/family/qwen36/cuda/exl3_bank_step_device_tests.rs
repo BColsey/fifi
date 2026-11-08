@@ -87,8 +87,14 @@ fn resident_leg(projector: &CudaProjector, weights: &CudaWeights) -> Result<Deco
     decode(&mut step)
 }
 
-/// The banked leg: consumes the model, every layer's slot table starting empty.
-fn banked_leg(projector: &CudaProjector, model: BankedModel) -> Result<Decoded, EngError> {
+/// The banked leg: consumes the model, every layer's slot table starting empty. `overlap`
+/// arms the copy-stream refills (`Q36_CUDA_BANK_OVERLAP`'s device path) before the step is
+/// built, so the merged MoE block — the default of an EXL3 load — exercises the split too.
+fn banked_leg(
+    projector: &CudaProjector,
+    model: BankedModel,
+    overlap: bool,
+) -> Result<Decoded, EngError> {
     let context = projector.context();
     let mut step_options = options();
     step_options.context_tokens = PROMPT.len() + GENERATED + 1;
@@ -110,6 +116,9 @@ fn banked_leg(projector: &CudaProjector, model: BankedModel) -> Result<Decoded, 
         .map(|layer| Exl3MoeWeights::resolve_banked(&weights, &table, layer, &moe, slots))
         .collect::<Result<Vec<_>, _>>()?;
     let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, 0)?);
+    if overlap {
+        bank.get_mut().enable_overlap(context)?;
+    }
     let mut step = QwenResidentStep::new_banked(
         context,
         &resources,
@@ -143,7 +152,7 @@ fn banked_step_decodes_byte_identically_to_the_resident_step() {
     const SLOTS: usize = 8;
     let banked = load_exl3_banked_dir(&projector, Path::new(&dir), SLOTS, Reserve::default())
         .expect("the banked pack");
-    let got = banked_leg(&projector, banked).expect("the banked leg");
+    let got = banked_leg(&projector, banked, false).expect("the banked leg");
 
     assert_eq!(
         got.next, want.next,
@@ -155,6 +164,50 @@ fn banked_step_decodes_byte_identically_to_the_resident_step() {
     );
     println!(
         "banked step parity: {} positions, hits {}, misses {}, sha256 {}",
+        want.next.len(),
+        got.hits,
+        got.misses,
+        want.digest
+    );
+    assert!(
+        got.misses > 0,
+        "the decode never missed; the resolver was not exercised"
+    );
+}
+
+/// [`banked_step_decodes_byte_identically_to_the_resident_step`] with the overlap armed: the
+/// miss refills ride a copy stream and the merged MoE block launches its resident picks before
+/// the event wait. The default merged block is the production path of an EXL3 serve, so this
+/// leg — not the unmerged one — is the parity that shipping `Q36_CUDA_BANK_OVERLAP` stands on.
+#[test]
+#[ignore = "requires the pinned EXL3 pack in FIFI_EXL3_CHECKPOINT and a GPU that holds it resident"]
+fn overlapped_banked_step_decodes_byte_identically_to_the_resident_step() {
+    let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    assert!(device_present("banked step parity"), "a GPU is required");
+    let projector = CudaProjector::new().expect("projector");
+    projector
+        .context()
+        .set_single_row_default(crate::kernels::cuda::resident::exl3::SingleRow::Wide(1));
+
+    let resident = load_exl3_dir(&projector, Path::new(&dir), Reserve::default()).expect("pack");
+    let want = resident_leg(&projector, &resident).expect("the resident leg");
+    drop(resident);
+
+    const SLOTS: usize = 8;
+    let banked = load_exl3_banked_dir(&projector, Path::new(&dir), SLOTS, Reserve::default())
+        .expect("the banked pack");
+    let got = banked_leg(&projector, banked, true).expect("the overlapped banked leg");
+
+    assert_eq!(
+        got.next, want.next,
+        "the overlapped banked step decoded different tokens"
+    );
+    assert_eq!(
+        got.digest, want.digest,
+        "the overlapped banked rows differ in some byte"
+    );
+    println!(
+        "overlapped banked step parity: {} positions, hits {}, misses {}, sha256 {}",
         want.next.len(),
         got.hits,
         got.misses,

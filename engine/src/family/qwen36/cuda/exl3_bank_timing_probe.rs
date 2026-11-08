@@ -87,6 +87,23 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         .unwrap_or(0);
     let bank =
         RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, sticky).expect("resolver"));
+    // FIFI_EXL3_OVERLAP=1 arms the copy-stream refills of Q36_CUDA_BANK_OVERLAP's device
+    // path, for the A/B the probe exists to make (the wall clock is the measurement; the
+    // drain/resolve shares come from the launch stream's own waits either way).
+    let overlap = std::env::var("FIFI_EXL3_OVERLAP")
+        .map(|v| {
+            v.parse::<usize>()
+                .ok()
+                .filter(|&v| v <= 1)
+                .unwrap_or_else(|| panic!("FIFI_EXL3_OVERLAP is not 0 or 1: {v:?}"))
+                == 1
+        })
+        .unwrap_or(false);
+    if overlap {
+        bank.get_mut()
+            .enable_overlap(context)
+            .expect("the overlap pair");
+    }
     let mut step = QwenResidentStep::new_banked(
         context,
         &resources,
@@ -135,7 +152,8 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         crate::family::qwen36::cuda::exl3_bank::probe::take();
     let (hits, misses) = bank.borrow().stats();
     println!(
-        "banked decode probe: decode {tokens} tokens {:.1} ms/token total, drains {:.1} \
+        "banked decode probe: overlap {overlap}, slots {slots}, sticky {sticky}: decode \
+         {tokens} tokens {:.1} ms/token total, drains {:.1} \
          ms/token across {} calls, resolves {:.1} ms/token; hits {hits} misses {misses}; \
          last id {id}",
         decode_wall.as_secs_f64() * 1e3 / tokens as f64,

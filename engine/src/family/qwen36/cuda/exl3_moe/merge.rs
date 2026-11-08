@@ -65,7 +65,7 @@ use crate::{
             resolve,
         },
     },
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceEvent, DeviceRange},
 };
 
 /// The plan sizes of a block.
@@ -327,10 +327,15 @@ fn merged_on_device(
     indexed_group(launch, &build(&plan.down)?, ids, &scratch)
 }
 
+/// The gate/up phase of [`merged_on_host`] split around the overlapped refills: the pairs
+/// whose member is resident (every shared pair, every pick whose slot did not refill) launch
+/// before the wait, the pairs whose pick is refilling on the copy stream wait its event. The
+/// swiglu and the down group need every pair's output, so they stay behind the wait.
 fn merged_on_host(
     launch: &Launch<'_>,
     (weights, bufs, r): (&Exl3MoeWeights<'_>, &Exl3MoeBufs<'_>, &Ranges<'_>),
     (plan, picks): (&BlockPlan, &[usize]),
+    gate: Option<(&DeviceEvent, &[usize])>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
     let scratch = Scratch {
@@ -356,7 +361,21 @@ fn merged_on_host(
             })
             .collect()
     };
-    grouped(launch, &build(&plan.gate_up)?, &scratch)?;
+    let resident = |pair: &PlannedPair| match pair.member {
+        Member::Routed(pick) => !gate.is_some_and(|(_, missed)| missed.contains(&(pick as usize))),
+        Member::Shared => true,
+    };
+    let (resident_pairs, refilling): (Vec<PlannedPair>, Vec<PlannedPair>) =
+        plan.gate_up.iter().copied().partition(resident);
+    if !resident_pairs.is_empty() {
+        grouped(launch, &build(&resident_pairs)?, &scratch)?;
+    }
+    if !refilling.is_empty() {
+        if let Some((event, _)) = gate {
+            launch.stream.wait(event)?;
+        }
+        grouped(launch, &build(&refilling)?, &scratch)?;
+    }
     swiglu(launch, r.gu, r.act, (plan.swiglu_rows, dims.inter))?;
     grouped(launch, &build(&plan.down)?, &scratch)
 }
@@ -372,6 +391,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
     dims: &MoeDims,
     device_ids: bool,
     bank: Option<&mut super::super::exl3_bank::LayerResolver<'_, '_>>,
+    overlap: bool,
 ) -> Result<(), EngError> {
     check_dims(&plan_dims(dims)).map_err(refuse)?;
     let r = merge.ranges()?;
@@ -387,11 +407,19 @@ pub(in crate::family) fn run_exl3_moe_merged(
         merged_on_device(launch, (weights, bufs, &r), &plan, dims)?;
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims.top_k, dims.n_expert)?;
+        let mut gated = None;
         let picks = match bank {
-            Some(bank) => bank.resolve(launch.stream, &picks)?,
+            Some(bank) => {
+                let (slots, missed, event) = bank.resolve_split(launch.stream, &picks, overlap)?;
+                gated = event.map(|event| (event, missed));
+                slots
+            }
             None => picks,
         };
-        merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), dims)?;
+        let gate = gated
+            .as_ref()
+            .map(|(event, missed)| (*event, missed.as_slice()));
+        merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), gate, dims)?;
     }
     let (routed, shared) = r.layout.combine_spans(&plan_dims(dims));
     let down = r.buffer.range(routed.offset, routed.bytes)?;

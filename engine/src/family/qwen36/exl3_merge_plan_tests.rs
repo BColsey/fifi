@@ -399,7 +399,7 @@ fn the_step_reaches_the_merged_block_only_through_the_switch() {
     );
     let run = squeeze(section(step, "fn run_op("));
     assert!(
-        run.contains("ifletSome(merge)=&self.exl3_merge{run_exl3_moe_merged(&launch,(weights,&bufs,merge),&self.moe_dims,self.exl3_device_ids,bank.as_mut())}else{run_exl3_moe(&launch,weights,&bufs,&self.moe_dims,self.exl3_device_ids,bank.as_mut())}"),
+        run.contains("ifletSome(merge)=&self.exl3_merge{run_exl3_moe_merged(&launch,(weights,&bufs,merge),&self.moe_dims,self.exl3_device_ids,bank.as_mut(),overlap)}else{run_exl3_moe(&launch,weights,&bufs,&self.moe_dims,self.exl3_device_ids,bank.as_mut(),overlap)}"),
         "{run}"
     );
     // The merge is built from the weights that exist, before the stream of the session.
