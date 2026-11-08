@@ -466,8 +466,8 @@ fn run_session_rig(
             .feed(0)
             .expect_err("the peer fault must stop the cache append");
         assert!(
-            refused.to_string().contains("cache was not appended"),
-            "{name}: unexpected refusal {refused}"
+            matches!(&refused, EngError::BadRequest(message) if message.contains("cache was not appended")),
+            "{name}: unexpected refusal {refused:?}"
         );
         assert_eq!(before_failure, kv_prefix(&session, stack, 5)?);
         assert_eq!(session.fed(), 0);
