@@ -13,7 +13,11 @@ use super::host_load::rotary_dim;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 use crate::family::speculate::driver::{RepeatDrafter, Speculator};
 use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
