@@ -621,8 +621,8 @@ mod device_tests {
         ];
         let ring = PeerRing::new(&contexts, N).expect("odd-capacity ring");
         let partials = [
-            upload_f32(&contexts[0], &streams[0], &vec![1.5; N]).expect("partial 0"),
-            upload_f32(&contexts[1], &streams[1], &vec![-0.25; N]).expect("partial 1"),
+            upload_f32(&contexts[0], &streams[0], &[1.5; N]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &[-0.25; N]).expect("partial 1"),
         ];
         let outs = [
             contexts[0].allocate(N * 4).expect("out 0"),
