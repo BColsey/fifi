@@ -207,7 +207,7 @@ impl<'a> MixerViews<'a> {
         let locals = || {
             ops.all().filter_map(|op| match op {
                 CardOp::Local(op) => Some(op),
-                CardOp::GatherK | CardOp::GatherV | CardOp::MixerSum => None,
+                CardOp::MixerSum => None,
             })
         };
         let views = named_slots(plan, locals())?
@@ -228,7 +228,7 @@ impl<'a> MixerViews<'a> {
         let locals = || {
             ops.all().filter_map(|op| match op {
                 CardOp::Local(op) => Some(op),
-                CardOp::GatherK | CardOp::GatherV | CardOp::MixerSum => None,
+                CardOp::MixerSum => None,
             })
         };
         named_slots(plan, locals())

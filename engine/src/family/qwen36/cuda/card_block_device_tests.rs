@@ -110,7 +110,6 @@ struct Evidence {
     resid_out_ref: Vec<f32>,
     core_ref: Vec<f32>,
     planes_ref: Planes,
-    rows_after_gather: Vec<(Vec<f32>, Vec<f32>)>,
     mix_out: Vec<Vec<f32>>,
     resid_out: Vec<Vec<f32>>,
     core: Vec<Vec<f32>>,
@@ -401,51 +400,14 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops = ops_attn
         .as_ref()
         .ok_or_else(|| EngError::Checkpoint("ops".into()))?;
-    let split = ops[0]
-        .iter()
-        .position(|op| matches!(op, super::mixer_ops::CardOp::GatherV))
-        .ok_or_else(|| EngError::Checkpoint("no gather".into()))?
-        + 1;
-    let ops_gather: Vec<&[CardOp]> = ops.iter().map(|l| &l[..split]).collect();
+    let ops_full: Vec<&[CardOp]> = ops.iter().map(|l| l.as_slice()).collect();
     run_card_block(
         &stack,
         &states,
         &mixers,
         layer,
         ordinal,
-        &ops_gather,
-        &resid_views,
-        0,
-        &kv_runs,
-    )?;
-    let rows_after_gather = (0..2)
-        .map(|card| {
-            stack.streams()[card].synchronize()?;
-            let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
-                let view = mixers[card].slot_view(slot)?;
-                let mut bytes = vec![0u8; view.bytes()];
-                view.buffer()
-                    .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
-                Ok(bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect())
-            };
-            Ok((read(Slot::KRows)?, read(Slot::VRows)?))
-        })
-        .collect::<Result<Vec<_>, EngError>>()?;
-    // The second half runs the suffix after the gather boundary; the
-    // rows it consumes were produced by the first half's gathers.
-    let ops_suffix: Vec<&[CardOp]> = ops.iter().map(|l| &l[split..]).collect();
-    run_card_block(
-        &stack,
-        &states,
-        &mixers,
-        layer,
-        ordinal,
-        &ops_suffix,
+        &ops_full,
         &resid_views,
         0,
         &kv_runs,
@@ -520,7 +482,6 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
         resid_out_ref,
         core_ref,
         planes_ref,
-        rows_after_gather,
         mix_out,
         resid_out,
         core,
@@ -571,17 +532,6 @@ fn a_full_attention_block_runs_distributed_and_matches_the_reference() {
             );
         }
     }
-    // Exact: the gathered rows agree across cards, read back BEFORE the
-    // append may touch the caches (later phases reuse the row arena, so a
-    // post-block readback would compare clobbered scratch, not the rows).
-    assert_eq!(
-        ev.rows_after_gather[0].0, ev.rows_after_gather[1].0,
-        "the gathered K row is bit-identical"
-    );
-    assert_eq!(
-        ev.rows_after_gather[0].1, ev.rows_after_gather[1].1,
-        "the gathered V row is bit-identical"
-    );
     // Exact: the per-head decode against the reference's head slice.
     let head_stride = ev.core_ref.len() / (ev.head_runs[0].len() + ev.head_runs[1].len());
     for card in 0..2 {
@@ -1597,49 +1547,14 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
     let ops = ops_attn
         .as_ref()
         .ok_or_else(|| EngError::Checkpoint("ops".into()))?;
-    let split = ops[0]
-        .iter()
-        .position(|op| matches!(op, super::mixer_ops::CardOp::GatherV))
-        .ok_or_else(|| EngError::Checkpoint("no gather".into()))?
-        + 1;
-    let ops_gather: Vec<&[CardOp]> = ops.iter().map(|l| &l[..split]).collect();
+    let ops_full: Vec<&[CardOp]> = ops.iter().map(|l| l.as_slice()).collect();
     run_card_block(
         &stack,
         &states,
         &mixers,
         layer,
         ordinal,
-        &ops_gather,
-        &resid_views,
-        0,
-        &kv_runs,
-    )?;
-    let rows_after_gather = (0..2)
-        .map(|card| {
-            stack.streams()[card].synchronize()?;
-            let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
-                let view = mixers[card].slot_view(slot)?;
-                let mut bytes = vec![0u8; view.bytes()];
-                view.buffer()
-                    .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
-                Ok(bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect())
-            };
-            Ok((read(Slot::KRows)?, read(Slot::VRows)?))
-        })
-        .collect::<Result<Vec<_>, EngError>>()?;
-    let ops_suffix: Vec<&[CardOp]> = ops.iter().map(|l| &l[split..]).collect();
-    run_card_block(
-        &stack,
-        &states,
-        &mixers,
-        layer,
-        ordinal,
-        &ops_suffix,
+        &ops_full,
         &resid_views,
         0,
         &kv_runs,
@@ -1712,7 +1627,6 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
         resid_out_ref,
         core_ref,
         planes_ref,
-        rows_after_gather,
         mix_out,
         resid_out,
         core,
@@ -1750,15 +1664,6 @@ fn a_real_gguf_file_loads_the_distributed_block() {
             );
         }
     }
-    // Exact: the gathered rows agree across cards.
-    assert_eq!(
-        ev.rows_after_gather[0].0, ev.rows_after_gather[1].0,
-        "the gathered K row is bit-identical"
-    );
-    assert_eq!(
-        ev.rows_after_gather[0].1, ev.rows_after_gather[1].1,
-        "the gathered V row is bit-identical"
-    );
     // Exact: the per-head decode against the reference's head slice.
     let head_stride = ev.core_ref.len() / (ev.head_runs[0].len() + ev.head_runs[1].len());
     for card in 0..2 {

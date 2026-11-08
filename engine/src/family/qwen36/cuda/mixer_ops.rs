@@ -716,19 +716,11 @@ pub(super) fn block_ops_with(
 }
 
 /// One step of one card's mixer block: a local [`BlockOp`] launch, or one of
-/// the two K/V row gathers of a full-attention layer, which sit between the
-/// card's prep and the cache append and each consume one ring sequence (the
-/// token plan of `multi.rs` counts one `KvGatherK` and one `KvGatherV` per
-/// full-attention layer). The gathers are markers: the driver runs them
-/// through the peer ring between the neighbouring local launches.
+/// no per-layer K/V gathers: with the cache sliced to each card's own K/V
+/// heads, a card's prep, append and decode all run on its local rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CardOp {
     Local(BlockOp),
-    /// This card publishes its K row slice and every card's slice lands in
-    /// its full `KRows` row: one `all_gather_row`, one sequence.
-    GatherK,
-    /// The V half, its own `all_gather_row` and sequence.
-    GatherV,
     /// The sum of every card's `Slot::MixOut` partial at the mixer/MoE
     /// boundary, so the epilogue's fused residual add and norm see the
     /// full mixer output: one ring sum, one sequence. Sits between the
@@ -847,8 +839,6 @@ fn attn_ops_card(
             pos: StepField::Pos,
             status: StepField::Status,
         }),
-        CardOp::GatherK,
-        CardOp::GatherV,
         append,
         decode,
     ];

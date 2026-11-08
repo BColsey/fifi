@@ -111,8 +111,6 @@ fn exchange_markers_sit_inside_the_exchanged_slots_plan_lifetimes() {
                     let list = ops.of(kind).expect("kind list");
                     for (index, op) in list.iter().enumerate() {
                         let slot = match op {
-                            CardOp::GatherK => Slot::KRows,
-                            CardOp::GatherV => Slot::VRows,
                             CardOp::MixerSum => Slot::MixOut,
                             CardOp::Local(_) => continue,
                         };
