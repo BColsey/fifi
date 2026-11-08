@@ -58,3 +58,11 @@ result for either installed GPU. A two-card ring at the maximum f32 payload
 uses four payload slots per card: about 16 MiB plus headers per card. Measure
 or calculate each actual allocation on the 28-SM RTX 3060 and 68-SM RTX 3080
 before deciding whether a chunk fits their configured 128k sessions.
+
+## Transfer primitive status
+
+A staged `PeerRing::exchange_sum_tiled` divides an oversized contiguous sum
+into mailbox-sized transfers. It checks sequence capacity, buffer ownership,
+lengths and unsafe overlaps before queuing the first tile. No prefill caller
+uses it yet. CPU tests cover the transfer boundaries and overflow checks; the
+physical two-GPU stress test is still required before integrating the method.

@@ -61,6 +61,68 @@ fn bad(message: String) -> EngError {
     EngError::BadRequest(format!("peer ring: {message}"))
 }
 
+/// A bounded view of a larger contiguous payload, in f32 values.
+/// Construction proves the byte size and the whole sequence range before any
+/// tile can be queued; iteration itself does not allocate.
+struct PayloadTiles {
+    next: usize,
+    count: usize,
+    limit: usize,
+}
+
+impl Iterator for PayloadTiles {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.count {
+            return None;
+        }
+        let start = self.next;
+        self.next += (self.count - start).min(self.limit);
+        Some(start..self.next)
+    }
+}
+
+fn payload_tiles(count: usize, limit: usize, sequence: u32) -> Result<PayloadTiles, EngError> {
+    if count == 0 || limit == 0 || limit > native::peer_ring::MAX_VALUES {
+        return Err(bad("tiled exchange needs a nonzero, bounded payload".into()));
+    }
+    count
+        .checked_mul(VALUE_BYTES)
+        .ok_or_else(|| bad("tiled exchange byte size overflows".into()))?;
+    let tiles = 1 + (count - 1) / limit;
+    let tiles =
+        u32::try_from(tiles).map_err(|_| bad("tiled exchange has too many tiles".into()))?;
+    sequence
+        .checked_add(tiles)
+        .ok_or_else(|| bad("the ring sequence is exhausted; reset the ring".into()))?;
+    Ok(PayloadTiles {
+        next: 0,
+        count,
+        limit,
+    })
+}
+
+fn ranges_overlap(
+    a: DeviceRange<'_>,
+    a_bytes: usize,
+    b: DeviceRange<'_>,
+    b_bytes: usize,
+) -> Result<bool, EngError> {
+    if !std::ptr::eq(a.buffer(), b.buffer()) {
+        return Ok(false);
+    }
+    let a_end = a
+        .offset()
+        .checked_add(a_bytes)
+        .ok_or_else(|| bad("range end overflows".into()))?;
+    let b_end = b
+        .offset()
+        .checked_add(b_bytes)
+        .ok_or_else(|| bad("range end overflows".into()))?;
+    Ok(a.offset() < b_end && b.offset() < a_end)
+}
+
 /// Where every slot of one device's mailbox lies. Pure arithmetic over the
 /// device count and the largest payload (in f32 values) an exchange carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +363,102 @@ impl PeerRing {
         Ok(())
     }
 
+    /// Exchanges a contiguous sum larger than one mailbox payload in bounded
+    /// tiles. All argument, ownership, alias and sequence checks run before
+    /// the first tile is queued. On a device launch failure after that point,
+    /// the caller must poison the session just as for a failed single exchange.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exchange_sum_tiled(
+        &self,
+        contexts: &[CudaContext],
+        streams: &[DeviceStream],
+        partials: &[DeviceRange<'_>],
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+        mode: RingMode,
+    ) -> Result<(), EngError> {
+        self.check_members(contexts, streams.len())?;
+        if partials.len() != self.layout.cards
+            || outs.len() != self.layout.cards
+            || statuses.len() != self.layout.cards
+        {
+            return Err(bad(
+                "partials, outs and statuses are one range per device".into()
+            ));
+        }
+        let tiles = payload_tiles(count, self.layout.max_values, self.next_seq.get())?;
+        let bytes = count
+            .checked_mul(VALUE_BYTES)
+            .ok_or_else(|| bad("tiled exchange byte size overflows".into()))?;
+        if partials
+            .iter()
+            .chain(outs)
+            .any(|range| range.bytes() < bytes)
+            || statuses.iter().any(|range| range.bytes() < 4)
+        {
+            return Err(bad(
+                "a tiled exchange range is shorter than its payload".into()
+            ));
+        }
+        for (card, context) in contexts.iter().enumerate() {
+            context.check_launch_stream(&streams[card])?;
+            context.raw_range(&partials[card])?;
+            context.raw_range(&outs[card])?;
+            context.raw_range(&statuses[card])?;
+        }
+        for (card, out) in outs.iter().copied().enumerate() {
+            for (source, partial) in partials.iter().copied().enumerate() {
+                if ranges_overlap(out, bytes, partial, bytes)?
+                    && (source != card || out.offset() != partial.offset())
+                {
+                    return Err(bad(
+                        "tiled exchange has overlapping input and output ranges".into(),
+                    ));
+                }
+            }
+            for other in outs.iter().copied().skip(card + 1) {
+                if ranges_overlap(out, bytes, other, bytes)? {
+                    return Err(bad("tiled exchange output ranges overlap".into()));
+                }
+            }
+        }
+        for (card, status) in statuses.iter().copied().enumerate() {
+            for range in partials.iter().chain(outs).copied() {
+                if ranges_overlap(status, 4, range, bytes)? {
+                    return Err(bad("tiled exchange status overlaps a payload".into()));
+                }
+            }
+            for other in statuses.iter().copied().skip(card + 1) {
+                if ranges_overlap(status, 4, other, 4)? {
+                    return Err(bad("tiled exchange status ranges overlap".into()));
+                }
+            }
+        }
+        for tile in tiles {
+            let start = tile.start * VALUE_BYTES;
+            let len = tile.len() * VALUE_BYTES;
+            let tile_partials = partials
+                .iter()
+                .map(|range| range.buffer().range(range.offset() + start, len))
+                .collect::<Result<Vec<_>, _>>()?;
+            let tile_outs = outs
+                .iter()
+                .map(|range| range.buffer().range(range.offset() + start, len))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.exchange_sum(
+                contexts,
+                streams,
+                &tile_partials,
+                &tile_outs,
+                statuses,
+                tile.len(),
+                mode,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Queues one broadcast: device `source_card` publishes `count` f32
     /// values of `src` into every device's mailbox (its own included), and
     /// every device copies them to `outs[i]`. The copy is bit-exact, so
@@ -456,6 +614,40 @@ impl PeerRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chunk_payload_tiles_at_the_mailbox_limit_without_gaps() {
+        let limit = native::peer_ring::MAX_VALUES;
+        let values = 128 * 9 * 2048;
+        let got = payload_tiles(values, limit, 1)
+            .expect("tiles")
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec![0..limit, limit..2 * limit, 2 * limit..values]);
+        assert_eq!(
+            payload_tiles(limit, limit, 1).unwrap().collect::<Vec<_>>(),
+            vec![0..limit]
+        );
+        assert_eq!(
+            payload_tiles(1, limit, 1).unwrap().collect::<Vec<_>>(),
+            vec![0..1]
+        );
+    }
+
+    #[test]
+    fn tiled_payload_rejects_empty_overflow_and_sequence_exhaustion() {
+        let limit = native::peer_ring::MAX_VALUES;
+        assert!(payload_tiles(0, limit, 1).is_err());
+        assert!(payload_tiles(1, 0, 1).is_err());
+        assert!(payload_tiles(1, limit + 1, 1).is_err());
+        assert!(payload_tiles(usize::MAX, limit, 1).is_err());
+        if usize::BITS > 32 {
+            assert!(payload_tiles(usize::MAX / 4, 1, 1).is_err());
+        }
+        assert!(payload_tiles(1, limit, u32::MAX).is_err());
+        assert!(payload_tiles(1, limit, u32::MAX - 1).is_ok());
+        assert!(payload_tiles(2 * limit + 1, limit, u32::MAX - 2).is_err());
+        assert!(payload_tiles(2 * limit + 1, limit, u32::MAX - 3).is_ok());
+    }
 
     #[test]
     fn the_layout_tiles_slots_by_source_then_parity() {
@@ -708,6 +900,109 @@ mod device_tests {
         ];
         let ring = PeerRing::new(&contexts, max_values).expect("ring");
         (contexts, streams, ring)
+    }
+
+    #[test]
+    #[ignore = "requires two peer-enabled GPUs; run alone under the GPU lease"]
+    fn tiled_peer_sums_preserve_values_and_reject_overlapping_ranges() {
+        assert!(device_present(
+            "tiled_peer_sums_preserve_values_and_reject_overlapping_ranges"
+        ));
+        let devices = [0, 1];
+        let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+        crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+        crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        let streams = [contexts[0].stream().unwrap(), contexts[1].stream().unwrap()];
+        let ring = PeerRing::new(&contexts, 8).expect("ring");
+        let count = 37usize;
+        let a: Vec<f32> = (0..count).map(|i| i as f32 * 0.25 - 8.0).collect();
+        let b: Vec<f32> = (0..count).map(|i| 3.0 - i as f32 * 0.125).collect();
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &a).unwrap(),
+            upload_f32(&contexts[1], &streams[1], &b).unwrap(),
+        ];
+        let outs = [
+            contexts[0].allocate(count * 4).unwrap(),
+            contexts[1].allocate(count * 4).unwrap(),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).unwrap(),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).unwrap(),
+        ];
+        let status_views = [whole(&statuses[0]), whole(&statuses[1])];
+        for _ in 0..16 {
+            ring.exchange_sum_tiled(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &status_views,
+                count,
+                RingMode::F32,
+            )
+            .expect("tiled exchange");
+        }
+        assert_eq!(ring.next_sequence_for_test(), 1 + 16 * 5);
+        for card in 0..2 {
+            streams[card].synchronize().unwrap();
+            assert_eq!(status_of(&statuses[card], &streams[card]).unwrap(), 0);
+            let got = download_f32(&outs[card], &streams[card], count).unwrap();
+            for i in 0..count {
+                assert_eq!(
+                    got[i].to_bits(),
+                    (a[i] + b[i]).to_bits(),
+                    "card {card} value {i}"
+                );
+            }
+        }
+        ring.exchange_sum_tiled(
+            &contexts,
+            &streams,
+            &[whole(&outs[0]), whole(&outs[1])],
+            &[whole(&outs[0]), whole(&outs[1])],
+            &status_views,
+            count,
+            RingMode::F32,
+        )
+        .expect("in-place tiled exchange");
+        for card in 0..2 {
+            streams[card].synchronize().unwrap();
+            let got = download_f32(&outs[card], &streams[card], count).unwrap();
+            for i in 0..count {
+                assert_eq!(got[i].to_bits(), ((a[i] + b[i]) * 2.0).to_bits());
+            }
+        }
+        let alias = [
+            contexts[0].allocate((count + 1) * 4).unwrap(),
+            contexts[1].allocate((count + 1) * 4).unwrap(),
+        ];
+        let before = ring.next_sequence_for_test();
+        let result = ring.exchange_sum_tiled(
+            &contexts,
+            &streams,
+            &[
+                alias[0].range(0, count * 4).unwrap(),
+                alias[1].range(0, count * 4).unwrap(),
+            ],
+            &[
+                alias[0].range(4, count * 4).unwrap(),
+                alias[1].range(4, count * 4).unwrap(),
+            ],
+            &status_views,
+            count,
+            RingMode::F32,
+        );
+        assert!(matches!(result, Err(EngError::BadRequest(_))));
+        assert_eq!(
+            ring.next_sequence_for_test(),
+            before,
+            "refuse before queueing a tile"
+        );
     }
 
     #[test]
