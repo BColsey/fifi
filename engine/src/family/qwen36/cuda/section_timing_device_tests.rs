@@ -57,6 +57,10 @@ struct Reading {
     sum_ms: f32,
     fraction: f32,
     groups: Vec<(usize, usize, f32)>,
+    /// The finer split: the mixer half per marked group (same order as `groups`) and the
+    /// `LmHead` op alone.
+    mixer_ms: Vec<f32>,
+    head_ms: f32,
     wall_ms: f32,
 }
 
@@ -163,6 +167,8 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
             sum_ms: times.extrapolated_ms(),
             fraction: times.whole_ratio(),
             groups,
+            mixer_ms: times.mixer_marked_ms().to_vec(),
+            head_ms: times.head_ms(),
             wall_ms,
         });
     }
@@ -261,14 +267,18 @@ fn section_marks_time_the_captured_step() {
         let groups = reading
             .groups
             .iter()
-            .map(|(layer, size, ms)| format!("l{layer}x{size}:{ms:.4}ms"))
+            .zip(&reading.mixer_ms)
+            .map(|((layer, size, ms), mixer)| {
+                format!("l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}/moe {:.4})", ms - mixer)
+            })
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms whole={:.4}ms groups=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
+            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms(head {:.4}) whole={:.4}ms groups=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
             reading.token,
             reading.embed_ms,
             reading.tail_ms,
+            reading.head_ms,
             reading.whole_ms,
             groups,
             reading.sum_ms,

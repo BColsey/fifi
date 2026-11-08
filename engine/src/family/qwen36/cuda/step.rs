@@ -69,7 +69,7 @@ use super::{
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::{CaptureOutcome, HostSyncs, PrefillReport, RunReport, StepKind, StepRecord},
-    section_timing::{MarkedGroup, SectionPlan, SectionTimes, section_plan},
+    section_timing::{FineSplit, MarkedGroup, SectionPlan, SectionTimes, section_plan},
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::{StateLayout, Word},
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -145,6 +145,11 @@ struct SectionMarks {
     embed_start: TimingEvent,
     embed_end: TimingEvent,
     groups: Vec<(TimingEvent, TimingEvent)>,
+    /// The finer split (`FineSplit`): one event per marked group, recorded at the `Moe` start
+    /// (= the mixer half's end), and the `LmHead` pair.
+    mixer_end: Vec<TimingEvent>,
+    head_start: TimingEvent,
+    head_end: TimingEvent,
     tail_start: TimingEvent,
     end: TimingEvent,
     /// Whether the last token's marks were all recorded and its read-back completed: the
@@ -158,14 +163,19 @@ impl SectionMarks {
     fn new(context: &CudaContext, kinds: &[AttentionKind]) -> Result<Self, EngError> {
         let plan = section_plan(kinds);
         let mut groups = Vec::with_capacity(plan.groups.len());
+        let mut mixer_end = Vec::with_capacity(plan.groups.len());
         for _ in &plan.groups {
             groups.push((context.event_timing()?, context.event_timing()?));
+            mixer_end.push(context.event_timing()?);
         }
         Ok(Self {
             whole_start: context.event_timing()?,
             embed_start: context.event_timing()?,
             embed_end: context.event_timing()?,
             groups,
+            mixer_end,
+            head_start: context.event_timing()?,
+            head_end: context.event_timing()?,
             tail_start: context.event_timing()?,
             end: context.event_timing()?,
             plan,
@@ -187,7 +197,16 @@ impl SectionMarks {
                 };
             }
             StepOp::FinalNorm => &self.tail_start,
-            StepOp::Moe(_) | StepOp::LmHead | StepOp::Argmax | StepOp::Advance => return Ok(()),
+            StepOp::LmHead => &self.head_start,
+            StepOp::Moe(layer) => {
+                // The MoE half starts where the mixer half ends: one extra event per marked
+                // group splits the pair (see `FineSplit`).
+                if let Some(at) = self.group_index(layer) {
+                    stream.record_timing(&self.mixer_end[at])?;
+                }
+                return Ok(());
+            }
+            StepOp::Argmax | StepOp::Advance => return Ok(()),
         };
         stream.record_timing(event)
     }
@@ -202,10 +221,10 @@ impl SectionMarks {
                 };
             }
             StepOp::Advance => &self.end,
+            StepOp::LmHead => return stream.record_timing(&self.head_end),
             StepOp::Begin
             | StepOp::Mixer(_)
             | StepOp::FinalNorm
-            | StepOp::LmHead
             | StepOp::Argmax => return Ok(()),
         };
         stream.record_timing(event)
@@ -2002,7 +2021,23 @@ impl<'a> QwenResidentStep<'a> {
             .iter()
             .map(|(start, end)| start.elapsed_ms_since(end))
             .collect::<Result<Vec<_>, _>>()?;
-        marks.plan.reconcile(embed, tail, &groups, whole).map(Some)
+        let mixer_ms = marks
+            .groups
+            .iter()
+            .zip(&marks.mixer_end)
+            .map(|((start, _), mixer_end)| start.elapsed_ms_since(mixer_end))
+            .collect::<Result<Vec<_>, _>>()?;
+        let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
+        marks
+            .plan
+            .reconcile(
+                embed,
+                tail,
+                &groups,
+                FineSplit { mixer_ms, head_ms },
+                whole,
+            )
+            .map(Some)
     }
 
     /// The start block of the step: the token, at the position of the committed rows. A token

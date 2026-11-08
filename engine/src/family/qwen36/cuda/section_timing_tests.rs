@@ -1,7 +1,7 @@
 //! Unit tests of the pure section-timing algebra of the in-graph section timer: which layers
 //! carry timing marks and how the marked sections extrapolate to a whole token. CPU only, no
 //! device call.
-use super::section_timing::{MarkedGroup, section_plan};
+use super::section_timing::{FineSplit, MarkedGroup, section_plan};
 use crate::family::AttentionKind::{DeltaNet, Full, Qsa};
 
 #[test]
@@ -40,24 +40,60 @@ fn empty_and_uniform_kinds_are_plans() {
 fn extrapolation_scales_groups_and_reconciles_with_whole() {
     let plan = section_plan(&[Full, Full, Full, DeltaNet, DeltaNet]);
     let times = plan
-        .reconcile(0.5, 0.25, &[1.0, 2.0], 7.75)
+        .reconcile(
+            0.5,
+            0.25,
+            &[1.0, 2.0],
+            FineSplit {
+                mixer_ms: vec![0.6, 1.1],
+                head_ms: 0.2,
+            },
+            7.75,
+        )
         .expect("reconcile");
     assert_eq!(times.extrapolated_ms(), 7.75);
     assert_eq!(times.whole_ratio(), 1.0);
     assert_eq!(times.group_totals_ms(), vec![3.0, 4.0]);
+    assert_eq!(times.mixer_marked_ms(), &[0.6, 1.1]);
+    assert_eq!(times.head_ms(), 0.2);
 }
 
 #[test]
 fn reconcile_rejects_non_finite_or_negative_sections() {
     let plan = section_plan(&[Full, Full]);
-    assert!(plan.reconcile(-0.1, 0.2, &[1.0], 3.0).is_err());
-    assert!(plan.reconcile(0.1, 0.2, &[f32::NAN], 3.0).is_err());
-    assert!(plan.reconcile(0.1, f32::INFINITY, &[1.0], 3.0).is_err());
-    assert!(plan.reconcile(0.1, 0.2, &[1.0], -3.0).is_err());
+    let fine = || FineSplit {
+        mixer_ms: vec![0.5],
+        head_ms: 0.2,
+    };
+    assert!(plan.reconcile(-0.1, 0.2, &[1.0], fine(), 3.0).is_err());
+    assert!(plan.reconcile(0.1, 0.2, &[f32::NAN], fine(), 3.0).is_err());
+    assert!(plan.reconcile(0.1, f32::INFINITY, &[1.0], fine(), 3.0).is_err());
+    assert!(plan.reconcile(0.1, 0.2, &[1.0], fine(), -3.0).is_err());
     // A zero whole is refused, not divided through.
-    assert!(plan.reconcile(0.1, 0.2, &[1.0], 0.0).is_err());
+    assert!(plan.reconcile(0.1, 0.2, &[1.0], fine(), 0.0).is_err());
     // A group count that does not match the plan is refused, not silently zipped.
-    assert!(plan.reconcile(0.1, 0.2, &[1.0, 2.0], 3.0).is_err());
+    assert!(plan
+        .reconcile(0.1, 0.2, &[1.0, 2.0], fine(), 3.0)
+        .is_err());
+    // The finer split is validated with the same rule: one mixer reading per marked group,
+    // finite and non-negative, and a finite non-negative head.
+    let mismatched = FineSplit {
+        mixer_ms: vec![],
+        head_ms: 0.2,
+    };
+    assert!(plan.reconcile(0.1, 0.2, &[1.0], mismatched, 3.0).is_err());
+    let negative_mixer = FineSplit {
+        mixer_ms: vec![-0.1],
+        head_ms: 0.2,
+    };
+    assert!(plan
+        .reconcile(0.1, 0.2, &[1.0], negative_mixer, 3.0)
+        .is_err());
+    let nan_head = FineSplit {
+        mixer_ms: vec![0.5],
+        head_ms: f32::NAN,
+    };
+    assert!(plan.reconcile(0.1, 0.2, &[1.0], nan_head, 3.0).is_err());
 }
 
 #[test]
@@ -65,9 +101,17 @@ fn reconcile_rejects_overflowing_derived_totals() {
     // Finite inputs can still overflow the derived totals (the scaled sum, or its ratio
     // against a tiny whole); those are refused, not read back as infinities.
     let plan = section_plan(&[Full, Full]);
-    assert!(plan.reconcile(1e38, 1e38, &[1e38], 1e-38).is_err());
+    let huge = FineSplit {
+        mixer_ms: vec![1e38],
+        head_ms: 1e38,
+    };
+    assert!(plan.reconcile(1e38, 1e38, &[1e38], huge, 1e-38).is_err());
     // A finite sum alone is not enough: the ratio against a tiny whole overflows too.
-    assert!(plan.reconcile(1.0, 1.0, &[1.0], 1e-38).is_err());
+    let ok = FineSplit {
+        mixer_ms: vec![0.5],
+        head_ms: 0.2,
+    };
+    assert!(plan.reconcile(1.0, 1.0, &[1.0], ok, 1e-38).is_err());
 }
 
 /// The marked pairs are ordered so a caller can hand them to `token_ops` once, in order.
