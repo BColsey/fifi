@@ -1546,7 +1546,7 @@ impl Context {
         let output = dispatch_contiguous(&expected, |slot| unsafe {
             ffi::mlx_concatenate_axis(slot, handles.as_ptr(), handles.len(), native_axis, stream)
         })?;
-        Ok(output)
+        Ok(state.resident(output, dtype, layout.shape, byte_len))
     }
 
     /// One lazy F32 [1] health scalar: 1.0 when every element of `x` is finite,

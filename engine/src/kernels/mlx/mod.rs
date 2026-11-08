@@ -1306,6 +1306,16 @@ impl MlxKernels {
         self.context.concatenate(parts, axis)
     }
 
+    /// Joins packed-weight payloads, scales, and biases (U32/BF16 included); see the native
+    /// sibling for the rules.
+    pub fn concatenate_weights(
+        &mut self,
+        parts: &[&ExecutionTensor],
+        axis: u32,
+    ) -> Result<ExecutionTensor, EngError> {
+        self.context.concatenate_weights(parts, axis)
+    }
+
     /// Converts a U32 resident of rank at least one to F32 with the same shape. Values above 2^24 round
     /// to the nearest F32. Returns an unevaluated resident.
     pub fn u32_to_f32(&mut self, x: &ExecutionTensor) -> Result<ExecutionTensor, EngError> {
