@@ -215,11 +215,12 @@ fn the_native_plan_figures_are_pinned_and_do_not_overlap() {
     let p = plan(WeightLayout::Native);
     assert_eq!(
         (p.arena_bytes(), p.unaliased_bytes()),
-        (2_068_992, 3_445_248),
-        "the swapped q8_1 sizes must move these figures or nothing (the tiled-head hybrid's \
-         live-through-LM_HEAD XfFinal displaces the late slots by ~0.9 MiB)"
+        (2_238_724, 6_591_744),
+        "the swapped q8_1 sizes must move these figures or nothing (the hybrid's four fp16 packs - \
+         XfFinal live through LM_HEAD, XfMoe/XfDown(0)/XfShared beside their q8 twins - and the \
+         finer phase lifetimes displace the late slots)"
     );
-    assert_eq!(p.tensors().len(), 30);
+    assert_eq!(p.tensors().len(), 33);
     let t = p.tensors();
     for (i, a) in t.iter().enumerate() {
         assert_eq!(p.plan().offsets[i] % 256, 0, "{:?}", a.slot);
@@ -235,6 +236,31 @@ fn the_native_plan_figures_are_pinned_and_do_not_overlap() {
     assert_eq!(
         (part.first, part.last),
         (Phase::Argmax as usize, Phase::Argmax as usize)
+    );
+}
+
+/// The hybrid's dead fp16 MoE slots are planned for EVERY native load with pinned lifetimes:
+/// the epilogue writes `XfMoe` in ADD_NORM and the overridden gate/up stacks read it through
+/// GATE_UP; `XfDown(0)` and `XfShared` span SWIGLU..DOWN like their q8 twins (`XfFinal`, the one
+/// live-through-LM_HEAD slot, is pinned by `native_pack_slots_take_the_tiled_lifetimes_and_sizes`).
+#[test]
+fn the_native_hybrid_moe_slots_carry_pinned_lifetimes() {
+    let p = plan(WeightLayout::Native);
+    let first_last = |slot: Slot| {
+        let t = p.tensors()[p.index(slot).expect("slot")];
+        (t.first, t.last)
+    };
+    assert_eq!(
+        first_last(Slot::XfMoe),
+        (Phase::AddNorm as usize, Phase::GateUp as usize)
+    );
+    assert_eq!(
+        first_last(Slot::XfDown(0)),
+        (Phase::Swiglu as usize, Phase::Down as usize)
+    );
+    assert_eq!(
+        first_last(Slot::XfShared),
+        (Phase::Swiglu as usize, Phase::Down as usize)
     );
 }
 
@@ -294,7 +320,13 @@ fn native_pack_slots_take_the_tiled_lifetimes_and_sizes() {
         Phase::FinalNorm as usize,
         Phase::LmHead as usize
     )));
-    assert_eq!(got.len(), want.len() + 2);
+    // The tiled-experts hybrid beside the native packs: the epilogue's fp16 MoE pack and the
+    // per-slot swiglu packs are planned for EVERY native load (dead bytes when the hybrid is
+    // off) - three more beside the swapped table.
+    for hybrid in [Slot::XfMoe, Slot::XfDown(0), Slot::XfShared] {
+        assert!(p.index(hybrid).is_some(), "{hybrid:?} missing");
+    }
+    assert_eq!(got.len(), want.len() + 5);
     // Non-pack slots keep their Tiled byte counts (a pack slot's q8 bytes are test 1's literals).
     for planned in tiled.tensors() {
         if swap(planned.slot) == planned.slot {
@@ -302,8 +334,10 @@ fn native_pack_slots_take_the_tiled_lifetimes_and_sizes() {
             assert_eq!(p.tensors()[at].bytes, planned.bytes, "{:?}", planned.slot);
         }
     }
-    // And the swap is exactly seven packs: no Tiled pack survives in the Native plan.
-    assert!(p.index(Slot::XfMix).is_none() && p.index(Slot::XfDown(0)).is_none());
+    // And the swap is exactly seven packs: no Tiled pack of the seven survives in the Native
+    // plan beside the hybrid's own four (pinned above; XfMoe/XfDown(0)/XfShared are the
+    // hybrid's, not the swapped Tiled packs).
+    assert!(p.index(Slot::XfMix).is_none());
     assert!(tiled.index(Slot::Q8Mix).is_none() && tiled.index(Slot::Q8Down).is_none());
 }
 
@@ -380,11 +414,11 @@ fn the_int8_native_plan_figures_are_pinned_and_do_not_overlap() {
     let (d, p) = (dims(), int8_plan());
     assert_eq!(
         (p.arena_bytes(), p.unaliased_bytes()),
-        (2_068_992, 3_449_344),
-        "the two rows slots must move these figures or nothing (the tiled-head hybrid's \
-         live-through-LM_HEAD XfFinal displaces the late slots by ~0.9 MiB)"
+        (2_238_724, 6_595_840),
+        "the two rows slots must move these figures or nothing (the hybrid's four fp16 packs move \
+         them the same way as the Fp16 plan's)"
     );
-    assert_eq!(p.tensors().len(), 32);
+    assert_eq!(p.tensors().len(), 35);
     let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;
     for slot in [Slot::KRows, Slot::VRows] {
         let planned = p.tensors()[p.index(slot).expect("rows slot")];
