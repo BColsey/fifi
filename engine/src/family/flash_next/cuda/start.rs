@@ -96,8 +96,13 @@ fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
     ctx.set_odd_rate_kernel(true);
     // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
     // runs inside the projection kernel, two launches per set instead of three, bit-identical
-    // bytes. Default off; `FIFI_FLASH_NEXT_FUSED_IN=1` opts in, any other non-empty value is
-    // refused, never a silent fallback. Read once here, per process.
+    // bytes (64/64 receipt logits match). Isolated it saves ~1.27 us per launch, but measured on
+    // the full 64-step decode it REGRESSES the step: median 39.25 vs 38.28 ms and paired mean
+    // +2.25 ms (steps 9-64 of the adjacent off/on pair; REPORT.md cites the artifacts) - the
+    // larger shared footprint and the per-column-block rotation recompute reduce the overlap the
+    // 253 small launches had with the attention and expert kernels. Kept off for re-measuring
+    // after the launch floor changes (e.g. graph capture); `FIFI_FLASH_NEXT_FUSED_IN=1` opts in,
+    // any other non-empty value is refused, never a silent fallback. Read once here, per process.
     let fused_in = match std::env::var("FIFI_FLASH_NEXT_FUSED_IN") {
         Err(_) => false,
         Ok(v) if v == "1" => true,
