@@ -310,8 +310,7 @@ impl DeviceBuffer {
         ensure_closed("a ranged copy")?;
         same_adapter(&self.lease, stream.lease(), "stream")?;
         let device = self
-            .raw
-            .as_ref()
+            .raw_view()
             .ok_or_else(|| EngError::BadRequest("the CUDA buffer was already freed".to_owned()))?;
         if len == 0 {
             return Err(EngError::BadRequest(format!(

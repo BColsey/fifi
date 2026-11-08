@@ -58,6 +58,21 @@ const LARGE_LIMITS: GgufLimits = GgufLimits {
     max_header_bytes: 1 << 20,
     max_tensor_bytes: 1 << 30,
 };
+
+#[test]
+fn mapped_expert_selection_is_opt_in_bounded_and_refuses_impossible_requests() {
+    let choices = [(true, 40), (false, 500), (true, 30), (true, 20)];
+    assert_eq!(
+        select_host_experts(&choices, 0).unwrap(),
+        (vec![false; 4], 0)
+    );
+    assert_eq!(
+        select_host_experts(&choices, 45).unwrap(),
+        (vec![false, false, true, true], 50)
+    );
+    assert!(select_host_experts(&choices, 91).is_err());
+    assert!(select_host_experts(&[(true, u64::MAX), (true, 1)], u64::MAX).is_err());
+}
 /// The measured file is named by the operator, so the reader does not second-guess
 /// its tensor sizes.
 const MEASURE_LIMITS: GgufLimits = GgufLimits {
@@ -3493,6 +3508,7 @@ fn plan_of<'a>(
                 tensor,
                 bytes,
                 slice: None,
+                mapped: false,
             })
         })
         .collect::<Result<Vec<_>, _>>()

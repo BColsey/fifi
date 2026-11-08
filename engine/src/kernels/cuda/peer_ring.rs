@@ -9,12 +9,12 @@
 //! sequence advances once per exchange and the slot parity follows it, so
 //! a slot is only reused two exchanges later and never needs clearing.
 //!
-//! Slot reuse is safe only under the stream contract stated in
-//! `native/abi_ring.h`: all ring work for one device is queued in exchange
-//! order on one stream, and exchanges never overlap. The two-exchange
-//! chain through each publisher's own wait is what keeps an S+2 publish
-//! from overwriting a slot a consumer still reads for S. Callers that
-//! queue ring work on several streams break that chain.
+//! Slot reuse requires the stream contract stated in `native/abi_ring.h`:
+//! all ring work for one device is queued in exchange order on one stream.
+//! For sums and gathers, each device's own wait supplies a two-exchange
+//! dependency chain. Consecutive broadcasts have only one publisher, so
+//! they also need a consumer barrier before a slot can be reused. The
+//! Qwen card stack offers an opt-in host synchronization for this case.
 //!
 //! [`PeerRing::reset`] re-zeroes every mailbox and restarts the sequence;
 //! it is the session boundary. It also serves the (practically unreachable)

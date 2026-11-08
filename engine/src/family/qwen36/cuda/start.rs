@@ -22,7 +22,7 @@ use super::{
     card_load::card_loads,
     card_session::{CardSession, Q36CudaStep},
     card_step::CardStack,
-    card_weights::load_card_weights,
+    card_weights::{load_card_weights, load_card_weights_mapped},
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     exl3_load::load_exl3_dir,
     layer_table::LayerTable,
@@ -889,13 +889,33 @@ fn make_multi(
     // free during each card's upload, and over-reserving per card (the cards
     // share the KV rows) only refuses a tight fit earlier, never corrupts it.
     let load = load_options(plan.reserve, fixed_admission);
+    // Experimental, default off: map this many bytes of card 1's sliced
+    // expert weights from pinned system RAM while retaining P2P execution.
+    let host_expert_bytes = match std::env::var("Q36_P2P_HOST_EXPERT_BYTES") {
+        Ok(value) => value.parse::<u64>().map_err(|_| {
+            EngError::BadRequest(
+                "Q36_P2P_HOST_EXPERT_BYTES must be a nonnegative byte count".into(),
+            )
+        })?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => {
+            return Err(EngError::BadRequest(
+                "Q36_P2P_HOST_EXPERT_BYTES must be valid UTF-8".into(),
+            ));
+        }
+    };
     let (stack, states) =
         CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
         let loader = BorrowedLoader::new(&stack.contexts()[card])?;
-        loaded.push(load_card_weights(&loader, &model.weights, set, card, load)?);
+        let weights = if card == 1 && host_expert_bytes != 0 {
+            load_card_weights_mapped(&loader, &model.weights, set, card, load, host_expert_bytes)?
+        } else {
+            load_card_weights(&loader, &model.weights, set, card, load)?
+        };
+        loaded.push(weights);
     }
     stages.begin("checking memory floors");
     for (card, context) in stack.contexts().iter().enumerate() {
@@ -907,7 +927,7 @@ fn make_multi(
             )));
         }
         eprintln!(
-            "q36 cuda: card {card} (device {}) weights resident ({} B), free after load {} B",
+            "q36 cuda: card {card} (device {}) weights loaded ({} B), free after load {} B",
             settings.cuda_devices[card],
             loads[card].upload_bytes(),
             info.free

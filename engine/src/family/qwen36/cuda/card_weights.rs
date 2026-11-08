@@ -57,6 +57,17 @@ pub(crate) fn load_card_weights(
     card: usize,
     options: LoadOptions<'_>,
 ) -> Result<CudaWeights, EngError> {
+    load_card_weights_mapped(loader, weights, load, card, options, 0)
+}
+
+pub(crate) fn load_card_weights_mapped(
+    loader: &BorrowedLoader<'_>,
+    weights: &GgufWeights,
+    load: &CardLoad,
+    card: usize,
+    options: LoadOptions<'_>,
+    host_expert_bytes: u64,
+) -> Result<CudaWeights, EngError> {
     let plan = card_upload_plan(load, card);
     let names: Vec<&str> = plan.names.iter().map(String::as_str).collect();
     let slices: Vec<(&str, SliceSpec)> = plan
@@ -64,5 +75,5 @@ pub(crate) fn load_card_weights(
         .iter()
         .map(|(name, spec)| (name.as_str(), spec.clone()))
         .collect();
-    loader.load_sliced(weights, &names, options, &slices)
+    loader.load_sliced(weights, &names, options, &slices, host_expert_bytes)
 }
