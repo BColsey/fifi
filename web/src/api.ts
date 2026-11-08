@@ -240,10 +240,15 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(message, code, res.status);
 }
 
-async function getJson<T>(path: string, auth: boolean, signal?: AbortSignal): Promise<T> {
+async function getJson<T>(
+  path: string, auth: boolean, signal?: AbortSignal, extraHeaders?: Record<string, string>
+): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, { signal, headers: auth ? authHeaders() : undefined });
+    const headers = extraHeaders === undefined
+      ? (auth ? authHeaders() : undefined)
+      : { ...(auth ? authHeaders() : {}), ...extraHeaders };
+    res = await fetch(path, { signal, headers });
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") throw err;
     throw new ApiError("Server unreachable.", "network", 0);
@@ -342,11 +347,14 @@ export interface SamplerTracePacket {
   positions: SamplerPosition[];
 }
 
-export function getSamplerTrace(replyId: string, signal?: AbortSignal): Promise<SamplerTracePacket> {
+export function getSamplerTrace(
+  replyId: string, signal?: AbortSignal, model?: string
+): Promise<SamplerTracePacket> {
   return getJson<SamplerTracePacket>(
     "/v1/sampler-trace?id=" + encodeURIComponent(replyId),
     true,
-    signal
+    signal,
+    model === undefined ? undefined : { "X-Fifi-Trace-Model": model }
   );
 }
 

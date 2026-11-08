@@ -385,7 +385,10 @@ export class ChatView {
     const body = this.buildBody(chat);
     // Arming is pre-generation: the segment map is recorded only for
     // replies the server was asked to trace.
-    if (body["x-sample-trace"] === true) assistant.traceSegs = [];
+    if (body["x-sample-trace"] === true) {
+      assistant.traceSegs = [];
+      assistant.traceModel = body.model;
+    }
     this.controller = controller;
     this.streamDom = this.createStreamDom();
     this.streamChat = chat;
