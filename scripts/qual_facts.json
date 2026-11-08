@@ -14,8 +14,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 5690,
-      "ignored": 462,
+      "test_fns": 5755,
+      "ignored": 481,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -36,6 +36,7 @@
         "FIFI_D1_KV",
         "FIFI_D1_NEAR_TIE_FIXTURE",
         "FIFI_D1_PREFIX_ROWS",
+        "FIFI_D1_ROLLBACK",
         "FIFI_DELTA_TRACE",
         "FIFI_EXL3_CHECKPOINT",
         "FIFI_EXL3_EXPECT_BYTES",
@@ -103,6 +104,7 @@
         "FIFI_MRV_NEED",
         "FIFI_MRV_OUT",
         "FIFI_MRV_PACK_MANIFEST_SHA256",
+        "FIFI_MRV_ROLLBACK",
         "FIFI_MTP_CHECKPOINT",
         "FIFI_PF_KV",
         "FIFI_PF_PROMPT_IDS",
