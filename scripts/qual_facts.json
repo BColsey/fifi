@@ -2,6 +2,7 @@
   "schema_version": 2,
   "cargo_features": [
     "cuda-arms-qualification",
+    "cuda-exl3-rotate-mutants",
     "cuda-fault-qualification",
     "cuda-q8-reference",
     "default",
@@ -14,8 +15,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6463,
-      "ignored": 555,
+      "test_fns": 6501,
+      "ignored": 556,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -314,6 +315,7 @@
       ],
       "features": [
         "cuda-arms-qualification",
+        "cuda-exl3-rotate-mutants",
         "cuda-fault-qualification",
         "cuda-q8-reference",
         "native-ane",
