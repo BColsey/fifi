@@ -672,8 +672,7 @@ impl ResidentWeights {
                     &moe.shared_gate,
                     &moe.shared_up,
                     &moe.shared_down,
-                    &moe.gate,
-                    &moe.up,
+                    &moe.gate_up,
                     &moe.down,
                 ]
                 .into_iter()
@@ -842,8 +841,7 @@ mod tests {
         assert_eq!(moe.router_t.shape(), [64, 4]);
         assert_eq!(moe.shared_scalar_t.shape(), [64, 1]);
         assert_eq!(shape_of(&moe.shared_gate), [64, 64]);
-        assert_eq!(shape_of(&moe.gate), [4, 64, 64]);
-        assert_eq!(shape_of(&moe.up), [4, 64, 64]);
+        assert_eq!(shape_of(&moe.gate_up), [4, 128, 64]);
         assert_eq!(shape_of(&moe.down), [4, 64, 64]);
     }
 
@@ -1072,14 +1070,9 @@ mod tests {
             .unwrap();
         for (name, stack, host_stack) in [
             (
-                "gate",
-                &w.layers[0].as_moe().unwrap().gate,
-                view.layers[0].as_moe().unwrap().gate,
-            ),
-            (
-                "up",
-                &w.layers[0].as_moe().unwrap().up,
-                view.layers[0].as_moe().unwrap().up,
+                "gate_up",
+                &w.layers[0].as_moe().unwrap().gate_up,
+                view.layers[0].as_moe().unwrap().gate_up,
             ),
             (
                 "down",
@@ -1183,7 +1176,7 @@ mod tests {
                 let role = format!("layer {index} {role}");
                 assert_role(&mut kernels, &mut cpu, resident, stored, &role);
             }
-            for stack in [&moe.gate, &moe.up, &moe.down] {
+            for stack in [&moe.gate_up, &moe.down] {
                 let spec = stack.quantization();
                 assert_eq!(
                     (spec.mode, spec.bits, spec.group_size),

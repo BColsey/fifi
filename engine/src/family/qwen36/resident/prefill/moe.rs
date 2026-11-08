@@ -140,12 +140,16 @@ pub(super) fn chunk(
     // Selected experts: gate and up on the input row of each pair, SwiGLU, then down per pair.
     let picked = ctx.kernels.take(x, &tokens, 0)?;
     let x_pairs = ctx.kernels.reshape(&picked, &[pairs, 1, hidden])?;
-    let hg = ctx
+    // One gathered product of the stacked gate/up operand, split into the gate half [0, I)
+    // and the up half [I, 2I) of every pair row.
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
@@ -285,12 +289,14 @@ pub(super) fn chunk_device(
     // d. Selected experts in the sorted order, SwiGLU, down per pair, then the un-sort back to
     // token-major order and the sum over the choices of each token. The gate product is the same
     // elementwise product as in the host path; only its place moves (token-major, not sorted).
-    let hg = ctx
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &sorted_bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
@@ -423,12 +429,14 @@ pub(super) fn chunk_device_phased(
     let x_rep = ctx.kernels.repeat(x, top_k, 0)?;
     let x_sorted = ctx.kernels.take(&x_rep, &order_p, 0)?;
     let x_pairs = ctx.kernels.reshape(&x_sorted, &[pairs, 1, hidden])?;
-    let hg = ctx
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &sorted_bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx

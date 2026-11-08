@@ -1862,13 +1862,14 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
             "the delta {what} shape refusal: {error:?}"
         );
     }
-    // The gate stack slot gets the shared gate weight: rank 2 against the needed [E, ., H].
+    // The stacked gate/up stack slot gets the shared gate weight: rank 2 against the needed
+    // [E, ., H].
     let stack_args = CompileMoeArgs {
         x: &x,
         router_t: &moe_w.router_t,
         shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
         shared_scalar_t: &moe_w.shared_scalar_t,
-        stacks: [&moe_w.shared_gate, &moe_w.up, &moe_w.down],
+        stacks: [&moe_w.shared_gate, &moe_w.down],
         hidden: dim(shape.hidden).unwrap(),
         experts: dim(shape.moe.experts).unwrap(),
         top_k: dim(shape.moe.top_k).unwrap(),
@@ -1883,7 +1884,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
         .err()
         .unwrap();
     assert!(
-        matches!(&error, EngError::BadRequest(m) if m.contains("the gate stack holds the logical shape")),
+        matches!(&error, EngError::BadRequest(m) if m.contains("the stacked gate/up operand holds the logical shape")),
         "the moe stack refusal: {error:?}"
     );
     let stats = compile_stats::read();
