@@ -587,6 +587,54 @@ fn run_cases(inputs: &[CaseInput]) -> Result<Vec<Run>, EngError> {
         .collect()
 }
 
+#[test]
+#[ignore = "requires two physical CUDA devices"]
+fn q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process() {
+    const NAME: &str = "q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process";
+    assert!(
+        testkit::device_present(NAME),
+        "{NAME}: CUDA devices are required"
+    );
+    let admission = crate::family::project::cuda::served_admission();
+    for rows in [256usize, 512] {
+        let input = input(dense(NAME, QuantType::Q4K, (2048, 2048, rows)), 0x6453_0001);
+        let mut outputs = Vec::new();
+        for device in 0..2 {
+            let ctx = CudaContext::with_admission_on(device, &admission).expect("context");
+            let stream = ctx.stream().expect("stream");
+            let fixup_bytes = ctx.mmq_fixup_bytes().expect("fixup size");
+            let fixup = fixup_buffer(&ctx, fixup_bytes);
+            let rig = Rig {
+                fixup,
+                fixup_bytes,
+                stream,
+                ctx,
+            };
+            let weight = upload_weight(
+                &rig.ctx,
+                input.case.ty,
+                (input.case.n, input.case.k),
+                &input.w,
+            )
+            .expect("weight");
+            let result = run_case(&rig, &input.case, &weight, &input.x)
+                .unwrap_or_else(|error| panic!("device {device}, rows {rows}: {error:?}"));
+            outputs.push(gated_slice(&result, &input.case));
+        }
+        for (index, (&first, &second)) in outputs[0].iter().zip(&outputs[1]).enumerate() {
+            let tolerance = 0.001 + 0.0002 * first.abs().max(second.abs());
+            assert!(
+                (first - second).abs() <= tolerance,
+                "rows {rows}, value {index}: device 0 {first}, device 1 {second}"
+            );
+        }
+        println!(
+            "{NAME}: {rows} rows, {} results agree on both devices",
+            outputs[0].len()
+        );
+    }
+}
+
 /// The hard gate, before any other check: every slice value finite (an unwritten value is
 /// the NaN poison), every byte outside the slice and in the canary still poison, the q8_1
 /// pad still poison (the GEMM may read it, never write it). Returns the slice as f64,
