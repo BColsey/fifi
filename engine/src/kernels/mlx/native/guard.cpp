@@ -2236,7 +2236,7 @@ struct CompileScopeArray {
 
 // Owns the borrowed input copies that mlx_vector_array_get returned.
 struct CompileScopeInputs {
-  static constexpr size_t kMax = 40;  // 26 canonical DeltaNet operands + 2 * (8 - 1) states.
+  static constexpr size_t kMax = 41;  // 27 canonical DeltaNet operands (26 + folded input norm) + 2 * (8 - 1) states.
   mlx_array values[kMax] = {};
   size_t count{0};
   ~CompileScopeInputs() {
