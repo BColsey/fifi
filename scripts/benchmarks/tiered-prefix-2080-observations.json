@@ -1,0 +1,68 @@
+{
+  "schema": "fifi.tiered-prefix-2080-observation.v1",
+  "recorded_utc": "2026-11-08T19:00:30.813039+00:00",
+  "proposed_commit": "4eb1a19da8efefd0e38952183e30bca0ba3eb7a5",
+  "source_log_sha256": "9ca3df3f746f0ebd8f8c3810cd2163d1bff825743ef4361953ba4699457dcb2b",
+  "source_driver_sha256": "abb09a753556f2425dba3bc806534cb5bd05661b619003a9a9fbb2ab55b9dcf9",
+  "source_config_sha256": "b81be6213a9fb7c8b24bd6583bdd49b721b70745192ecb149d36194ee981278e",
+  "hardware": "RTX 2080 Ti",
+  "configuration": {
+    "context_limit": 131072,
+    "kv_dtype": "q8",
+    "tiered_slots_per_layer": 85,
+    "threads": 8,
+    "preload": true,
+    "prefix_reuse": true,
+    "experimental_env": "Q36_TIERED_PREFIX=1"
+  },
+  "requests": [
+    {
+      "request_id": "chatcmpl-0000000000000001",
+      "status": 200,
+      "outcome": "ok",
+      "model": "fifi-q36-2080ti",
+      "stream": false,
+      "finish_reason": "length",
+      "prompt_tokens": 15762,
+      "completion_tokens": 24,
+      "reused_tokens": 0,
+      "time_to_first_token_ms": 263107.7,
+      "decode_tokens_per_second": 49.13
+    },
+    {
+      "request_id": "chatcmpl-0000000000000002",
+      "status": 200,
+      "outcome": "ok",
+      "model": "fifi-q36-2080ti",
+      "stream": false,
+      "finish_reason": "length",
+      "prompt_tokens": 15762,
+      "completion_tokens": 24,
+      "reused_tokens": 15755,
+      "time_to_first_token_ms": 314.1,
+      "decode_tokens_per_second": 50.24
+    },
+    {
+      "request_id": "chatcmpl-0000000000000003",
+      "status": 200,
+      "outcome": "ok",
+      "model": "fifi-q36-2080ti",
+      "stream": false,
+      "finish_reason": "length",
+      "prompt_tokens": 15762,
+      "completion_tokens": 24,
+      "reused_tokens": 15755,
+      "time_to_first_token_ms": 311.6,
+      "decode_tokens_per_second": 51.35
+    }
+  ],
+  "cold_to_warm_median_ttft_ratio": 841.0027169570081,
+  "limits": [
+    "One cold and two repeated identical-prompt requests; no flag-off A/B or independent replications.",
+    "All replies stopped at the 24-token length limit; the driver printed only the first 60 characters and did not compare full outputs or logits.",
+    "The running binary hash and exact source tree were not recorded; the proposed commit was created after the local run.",
+    "The host was not known to be exclusive; another local build or service may have overlapped.",
+    "131072 is the configured context; the observed prompt contained 15762 tokens.",
+    "TTFT values are server telemetry; the earlier 263.6-to-0.8-second figures were whole-response wall times."
+  ]
+}
