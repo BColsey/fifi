@@ -273,6 +273,19 @@ impl CardSession {
         self.skip_prefill_head = enabled;
     }
 
+    /// The prefix rig's comparison vehicle: one export per card of the
+    /// committed state (sliced KV planes plus DeltaNet slots).
+    #[cfg(test)]
+    pub(super) fn export_states_for_test(
+        &self,
+    ) -> Result<Vec<crate::family::qwen36::cuda::state::export::ExportedState>, EngError> {
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
+            .collect()
+    }
+
     /// The one launch path of a token: run the whole distributed step, fold
     /// the status words, and optionally read the concatenated logits row.
     /// `fed` advances only when the token ran clean.
