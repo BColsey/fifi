@@ -530,10 +530,17 @@ fn dims(shape: &HostShape, k_align: usize) -> [Dim; 6] {
     let q_block = q_grain * ATTN_Q_PER_KV_HEAD / gcd(q_grain, ATTN_Q_PER_KV_HEAD);
     let native_grain =
         |grain: usize| grain * NATIVE_ROWS_MULTIPLE / gcd(grain, NATIVE_ROWS_MULTIPLE);
+    // The GDN delta kernel pairs value head h with key head h % n_k_heads,
+    // and the keys REPLICATE (every card holds all key channels), so a
+    // card's value heads must be a multiple of the full key-head count.
+    let v_head_block = {
+        let g = native_grain(head_grain(shape.delta.value_dim));
+        g * shape.delta.key_heads / gcd(g, shape.delta.key_heads)
+    };
     [
         Dim {
             total: shape.delta.value_heads,
-            block: native_grain(head_grain(shape.delta.value_dim)),
+            block: v_head_block,
             what: "DeltaNet value heads",
         },
         Dim {
