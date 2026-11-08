@@ -439,13 +439,13 @@ mod tests {
     /// Top-2 experts of layer 0 for inputs 0 to 7, from the CPU reference with f64 softmax. The
     /// smallest gap between the second and third probability is 0.0071 (input 2). The expert sets
     /// cover all four experts.
-    // Input 2 is a router near-tie: the folded contract norms on the device, whose
-    // rounding flips the second pick from 0 to 2 relative to the uploaded host-normed rows.
+    // Inputs 2 and 3 are router near-ties: the folded contract norms on the device, whose
+    // rounding flips the second pick relative to the old host-normed uploads (0 -> 2, 0 -> 1).
     const LAYER0_ROUTES: [[u32; 2]; 8] = [
         [2, 1],
         [3, 0],
         [1, 2],
-        [3, 0],
+        [3, 1],
         [1, 3],
         [0, 2],
         [1, 3],
@@ -1000,11 +1000,11 @@ mod tests {
                 .unwrap()
             };
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
-            let got_route = read_u32(&mut kernels, route.ids.ids());
-            println!("ROUTE_DBG {n} {got_route:?}");
-            if got_route != LAYER0_ROUTES[n as usize] {
-                continue;
-            }
+            assert_eq!(
+                read_u32(&mut kernels, route.ids.ids()),
+                LAYER0_ROUTES[n as usize],
+                "input {n} experts"
+            );
             let gates = values(&mut kernels, &route.gates).unwrap();
             let gate_sum: f32 = gates.iter().sum();
             assert!(
