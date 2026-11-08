@@ -13,8 +13,9 @@
 //! - `wide1_r56_dp4a`: `wide1_r56` with the DP4A decode of book 2.
 //!
 //! Group rows (named by `FIFI_FLASH_NEXT_DENSE_CASES` beside the cases) run a group's members
-//! member-wise against the grouped launch on the wide bodies above; the identity is grouped vs
-//! member-wise bytes, not vs the legacy kernel, and the gather kernel is not exercised.
+//! member-wise against the grouped launch and the fused-input launch (input rotation inside the
+//! projection kernel) on the wide bodies above; the identity is grouped/fused vs member-wise
+//! bytes, not vs the legacy kernel, and the gather kernel is not exercised.
 //! Each case reads its matrix from the pack once and uploads it in as many copies as make a pool of
 //! up to 96 MiB (2 copies at least, 48 at most; the head is 2), so a call never finds its weights
 //! in the 6 MB L2 for the shapes of the table. A trial
@@ -473,6 +474,33 @@ impl<'a> GroupRig<'a> {
         self.ctx.exl3_grouped_step(&self.stream, &calls)
     }
 
+    /// The same group through the fused-input launch (`exl3_decode_fused.h`): the input rotation
+    /// runs inside the projection kernel, two launches instead of three.
+    fn group_fin(&self, copy: usize) -> Res<()> {
+        let mut members = Vec::with_capacity(self.shapes.len());
+        for index in 0..self.shapes.len() {
+            let (k, n) = (self.shapes[index].k, self.shapes[index].n);
+            let (xh_at, z_at) = self.offsets(index);
+            members.push((
+                self.weights[copy][index].view()?,
+                Exl3Io {
+                    x: self.x.range(0, k * F32)?,
+                    xh: self.xh.range(xh_at, k * F32)?,
+                    z: self.z.range(z_at, n * F32)?,
+                    out: self.out.range(z_at, n * F32)?,
+                    flag: self.flag.range(0, F32)?,
+                    rows: 1,
+                    fused: false,
+                },
+            ));
+        }
+        let calls: Vec<_> = members
+            .iter()
+            .map(|(view, io)| view.linear_call(io))
+            .collect();
+        self.ctx.exl3_grouped_fin(&self.stream, &calls)
+    }
+
     /// The float offsets of member `index` in the scratch buffers.
     fn offsets(&self, index: usize) -> (usize, usize) {
         let xh_at = self.shapes[..index]
@@ -507,6 +535,23 @@ impl<'a> GroupRig<'a> {
             }
         }
         self.stream.synchronize()?;
+        self.read_out_flag(n_total)
+    }
+
+    /// The bytes the fused-input launch writes (out and flag over a NaN fill; it never touches
+    /// `xh`, so the fill and the read skip it).
+    fn written_fin(&self, copy: usize) -> Res<Vec<u8>> {
+        let n_total: usize = self.shapes.iter().map(|shape| shape.n).sum();
+        let nan = f32::NAN.to_le_bytes();
+        for (buffer, len) in [(&self.z, n_total), (&self.out, n_total)] {
+            buffer.write_at(&self.stream, 0, &nan.repeat(len))?;
+        }
+        self.group_fin(copy)?;
+        self.stream.synchronize()?;
+        self.read_out_flag(n_total)
+    }
+
+    fn read_out_flag(&self, n_total: usize) -> Res<Vec<u8>> {
         let mut bytes = vec![0u8; n_total * F32 + F32];
         self.out
             .read_at(&self.stream, 0, &mut bytes[..n_total * F32])?;
@@ -535,6 +580,26 @@ impl<'a> GroupRig<'a> {
                         self.call(copy, index)?;
                     }
                 }
+            }
+        }
+        let queued = queue.elapsed().as_secs_f64() * 1e6;
+        self.stream.record_timing(&self.marks[1])?;
+        self.stream.synchronize()?;
+        let passes = (ROUNDS * copies) as f64;
+        Ok((
+            device_us(&self.marks[0], &self.marks[1])? / passes,
+            queued / passes,
+        ))
+    }
+
+    /// The same timing with the fused-input grouped launch (`group_fin`).
+    fn time_fin(&self) -> Res<(f64, f64)> {
+        let copies = self.weights.len();
+        self.stream.record_timing(&self.marks[0])?;
+        let queue = Instant::now();
+        for _ in 0..ROUNDS {
+            for copy in 0..copies {
+                self.group_fin(copy)?;
             }
         }
         let queued = queue.elapsed().as_secs_f64() * 1e6;
@@ -663,7 +728,8 @@ fn measure_group(
     let last = rig.weights.len() - 1;
     let mut ok = true;
     // The wide body comes in three served flavors (plain, rate 10/6 compile-time body, that body
-    // with DP4A); the grouped launch must write the member-wise bytes on each of them.
+    // with DP4A); the grouped launch must write the member-wise bytes on each of them, and the
+    // fused-input launch the same bytes again (it never writes xh, so the compare is out+flag).
     for index in [2, 3, 4] {
         select(rig.ctx, index);
         for &copy in &[0, last] {
@@ -672,6 +738,13 @@ fn measure_group(
                 ok = false;
                 println!(
                     "DENSEBENCH {{\"phase\":\"identity\",\"case\":\"{}\",\"path\":\"grouped-{name}\",\"equal\":false}}",
+                    group.name
+                );
+            }
+            if rig.written_fin(copy)? != want {
+                ok = false;
+                println!(
+                    "DENSEBENCH {{\"phase\":\"identity\",\"case\":\"{}\",\"path\":\"fused-{name}\",\"equal\":false}}",
                     group.name
                 );
             }
@@ -695,16 +768,23 @@ fn measure_group(
     };
     let separate_launches = launch_delta(false)?;
     let grouped_launches = launch_delta(true)?;
-    if separate_launches != shapes.len() as u64 || grouped_launches != 1 {
+    let fin_launches = {
+        let before = rig.ctx.exl3_launch_counts().wide1;
+        rig.group_fin(0)?;
+        rig.stream.synchronize()?;
+        rig.ctx.exl3_launch_counts().wide1 - before
+    };
+    if separate_launches != shapes.len() as u64 || grouped_launches != 1 || fin_launches != 1 {
         return Err(fail(format!(
-            "{}: separate mode took {separate_launches} launches, grouped took {grouped_launches}",
+            "{}: separate mode took {separate_launches} launches, grouped took {grouped_launches}, fused took {fin_launches}",
             group.name
         )));
     }
     let (separate_us, separate_queued) = median_of(|| rig.time(false))?;
     let (grouped_us, grouped_queued) = median_of(|| rig.time(true))?;
+    let (fin_us, fin_queued) = median_of(|| rig.time_fin())?;
     println!(
-        "DENSEBENCH {{\"phase\":\"group\",\"case\":\"{}\",\"members\":{},\"launches\":{{\"separate\":{separate_launches},\"grouped\":{grouped_launches}}},\"bytes_equal\":{ok},\"separate_us\":{separate_us:.2},\"grouped_us\":{grouped_us:.2},\"separate_queued_us\":{separate_queued:.2},\"grouped_queued_us\":{grouped_queued:.2},\"per_token\":{},\"stock_us\":{}}}",
+        "DENSEBENCH {{\"phase\":\"group\",\"case\":\"{}\",\"members\":{},\"launches\":{{\"separate\":{separate_launches},\"grouped\":{grouped_launches},\"fused\":{fin_launches}}},\"bytes_equal\":{ok},\"separate_us\":{separate_us:.2},\"grouped_us\":{grouped_us:.2},\"fused_us\":{fin_us:.2},\"separate_queued_us\":{separate_queued:.2},\"grouped_queued_us\":{grouped_queued:.2},\"fused_queued_us\":{fin_queued:.2},\"per_token\":{},\"stock_us\":{}}}",
         group.name,
         group.members.len(),
         group.per_token,

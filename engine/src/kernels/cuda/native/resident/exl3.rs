@@ -445,6 +445,13 @@ unsafe extern "C" {
         stage: *mut c_int,
         dp4a: u32,
     ) -> c_int;
+    fn inference_cuda_exl3_grouped_wide_fin(
+        args: *const LinearArgs,
+        count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        dp4a: u32,
+    ) -> c_int;
 }
 
 /// Mirror of `inference_cuda_exl3_index_args`.
@@ -691,6 +698,42 @@ pub(in crate::kernels::cuda) fn grouped_wide(
                 cols,
             )
         }
+    };
+    checked(status, stage)
+}
+
+/// The wide odd-rate launch with the input rotation fused into the projection kernel
+/// (`exl3_decode_fused.h`): two launches per group set instead of three. Requires one row per
+/// call, book 2 at rate 10 or 6, and `k` a multiple of 512 (C validates and refuses otherwise);
+/// every byte written equals [`grouped_wide`] at `cols` 1 with `odd`.
+pub(in crate::kernels::cuda) fn grouped_fin(
+    stream: &RawStream,
+    calls: &[LinearRaw<'_>],
+    dp4a: bool,
+) -> Result<(), DeviceFailure> {
+    if calls.is_empty() || calls.len() > 48 {
+        return Err(invalid_argument());
+    }
+    let mut pairs = 0usize;
+    let mut args = Vec::with_capacity(calls.len());
+    for call in calls {
+        pairs = pairs.checked_add(call.rows).ok_or_else(invalid_argument)?;
+        if call.rows != 1 || call.split_k != 2 || pairs > 48 {
+            return Err(invalid_argument());
+        }
+        args.push(linear_args(call, false)?);
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: as `grouped_wide`: every record has live bounded owners and validated local
+    // extents; C validates the group shapes, the rates and the half rounding before any enqueue.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_wide_fin(
+            args.as_ptr(),
+            args.len(),
+            stream.as_ptr(),
+            &mut stage,
+            u32::from(dp4a),
+        )
     };
     checked(status, stage)
 }

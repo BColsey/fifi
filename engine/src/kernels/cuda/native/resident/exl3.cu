@@ -1249,6 +1249,8 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) grouped_project_small
         one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial);
 }
 
+#include "exl3_decode_fused.h"
+
 // Whether every group of a launch is book 2 at rate 10 or 6: the launches grouped_project_small_wide_r56 runs.
 static bool wide_odd_rates(const GroupArgs &p) {
     for (uint32_t g = 0; g < p.groups; ++g) {
@@ -1645,7 +1647,7 @@ int inference_cuda_exl3_rows_kernel(uint32_t max_rows) {
 
 // Odd: 0, or a launch with one tile per block may run grouped_project_small_wide_r56 when its groups
 // allow it (1), with the DP4A decode (2); only the entry the Flash-Next context opts into sets it.
-template<bool Observe = false, bool Gather = false, int Cols = 0, int Odd = 0>
+template<bool Observe = false, bool Gather = false, int Cols = 0, int Odd = 0, bool FinIn = false>
 static inline __attribute__((always_inline)) int grouped_launch(
     const inference_cuda_exl3_linear_args *calls, size_t count,
     void *stream, int *out_stage, uint64_t *launches = nullptr,
@@ -1654,15 +1656,33 @@ static inline __attribute__((always_inline)) int grouped_launch(
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         GroupArgs args;
         if (!stream || !group_args(calls, count, args)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if constexpr (FinIn) {
+            // The fused-input kernel stages the row half in shared memory: one row per
+            // group, the Flash-Next rates only, a half of whole 256-value rounds.
+            if (args.k % 512u) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            for (uint32_t g = 0; g < args.groups; ++g) {
+                const GroupEntry &e = args.entries[g];
+                if (e.rows != 1 || e.book != 2 ||
+                    (e.bits_twice != 10 && e.bits_twice != 6))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
         Failure failure;
         // Whether the projection kernel the launch enqueued was grouped_project_small_wide_r56.
         bool used_odd = false;
         emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
-            if (e.kind == LinearKind::Input)
+            if (e.kind == LinearKind::Input) {
+                if constexpr (FinIn)
+                    return true;  // rotated inside the projection kernel's shared half
                 grouped_input_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
+            }
             else if (e.kind == LinearKind::Small) {
-                if constexpr (Cols > 0) {
+                if constexpr (FinIn) {
+                    const size_t shared = size_t(args.k) / 2 * 4;
+                    grouped_project_small_wide_r56_fin<Odd == 2>
+                        <<<grid,block,shared,(cudaStream_t)stream>>>(args);
+                } else if constexpr (Cols > 0) {
                     const dim3 wide(grid.x / Cols, grid.y, grid.z);
                     if constexpr (Cols == 1) {
                         uint32_t max_rows = 1;
@@ -1827,6 +1847,17 @@ extern "C" int inference_cuda_exl3_grouped_wide_odd(const inference_cuda_exl3_li
     if (!calls || count < 1 || calls[0].n % 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
     return dp4a ? grouped_launch<false, true, 1, 2>(calls, count, stream, out_stage)
                 : grouped_launch<false, true, 1, 1>(calls, count, stream, out_stage);
+}
+
+// inference_cuda_exl3_grouped_wide_odd with the input rotation fused into the projection kernel
+// (exl3_decode_fused.h): two launches per group set instead of three, no xh round trip. Requires
+// every group to be one row of book 2 at rate 10 or 6 and k a multiple of 512; every byte written
+// equals the odd entry's.
+extern "C" int inference_cuda_exl3_grouped_wide_fin(const inference_cuda_exl3_linear_args *calls,
+    size_t count, void *stream, int *out_stage, unsigned dp4a) {
+    if (!calls || count < 1 || calls[0].n % 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    return dp4a ? grouped_launch<false, true, 1, 2, true>(calls, count, stream, out_stage)
+                : grouped_launch<false, true, 1, 1, true>(calls, count, stream, out_stage);
 }
 
 

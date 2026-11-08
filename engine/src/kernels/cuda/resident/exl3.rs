@@ -1166,6 +1166,36 @@ impl CudaContext {
         self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols, odd))
     }
 
+    /// The grouped launch with the input rotation fused into the projection kernel
+    /// ([`exl3_decode_fused.h`](crate::kernels::cuda::native::resident)): two launches per group
+    /// set instead of three, no `xh` round trip. Every call must be one row, book 2 at rate 10
+    /// or 6, `n` a multiple of 16 and `k` of 512; the bytes written equal
+    /// [`Self::exl3_grouped_wide`] at `cols` 1.
+    pub(crate) fn exl3_grouped_fin(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+    ) -> Result<(), EngError> {
+        if calls.iter().any(|call| {
+            call.rows != 1
+                || !call.n.is_multiple_of(16)
+                || !call.k.is_multiple_of(512)
+                || call.book != Codebook::Mul1
+                || !matches!(call.bits_twice, 10 | 6)
+        }) {
+            return Err(EngError::BadRequest(
+                "EXL3 fused-input launch: every call must be one row of book 2 at rate 10 or 6, \
+                 n a multiple of 16 and k of 512"
+                    .to_string(),
+            ));
+        }
+        let raw = self.grouped_raw(calls)?;
+        #[cfg(test)]
+        self.note_exl3_launch(SingleRow::Wide(1));
+        let dp4a = self.exl3_indexed_options()?.dp4a;
+        self.launch_on(stream, |s| ffi::grouped_fin(s, &raw, dp4a))
+    }
+
     /// The grouped launch of the Qwen3.6 MoE block: the gather kernel, or the wide kernel when
     /// `FIFI_EXL3_SINGLE_GATHER` names one (`wide1`, `wide2`, `wide4`) and every call's `n` is a
     /// multiple of its tile span. Both write the same bytes.
