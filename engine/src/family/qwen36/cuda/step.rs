@@ -146,8 +146,10 @@ struct SectionMarks {
     embed_end: TimingEvent,
     groups: Vec<(TimingEvent, TimingEvent)>,
     /// The finer split (`FineSplit`): one event per marked group, recorded at the `Moe` start
-    /// (= the mixer half's end), and the `LmHead` pair.
+    /// (= the mixer half's end), the `LmHead` pair, and the attention-core pair inside the
+    /// mixer half (the `Conv`/`AttnPrep` start to the `Delta`/`AttnDecode` end).
     mixer_end: Vec<TimingEvent>,
+    core: Vec<(TimingEvent, TimingEvent)>,
     head_start: TimingEvent,
     head_end: TimingEvent,
     tail_start: TimingEvent,
@@ -164,9 +166,11 @@ impl SectionMarks {
         let plan = section_plan(kinds);
         let mut groups = Vec::with_capacity(plan.groups.len());
         let mut mixer_end = Vec::with_capacity(plan.groups.len());
+        let mut core = Vec::with_capacity(plan.groups.len());
         for _ in &plan.groups {
             groups.push((context.event_timing()?, context.event_timing()?));
             mixer_end.push(context.event_timing()?);
+            core.push((context.event_timing()?, context.event_timing()?));
         }
         Ok(Self {
             whole_start: context.event_timing()?,
@@ -2067,10 +2071,25 @@ impl<'a> QwenResidentStep<'a> {
             .zip(&marks.mixer_end)
             .map(|((start, _), mixer_end)| start.elapsed_ms_since(mixer_end))
             .collect::<Result<Vec<_>, _>>()?;
+        let core_ms = marks
+            .core
+            .iter()
+            .map(|(start, end)| start.elapsed_ms_since(end))
+            .collect::<Result<Vec<_>, _>>()?;
         let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
         marks
             .plan
-            .reconcile(embed, tail, &groups, FineSplit { mixer_ms, head_ms }, whole)
+            .reconcile(
+                embed,
+                tail,
+                &groups,
+                FineSplit {
+                    mixer_ms,
+                    core_ms,
+                    head_ms,
+                },
+                whole,
+            )
             .map(Some)
     }
 
@@ -2342,7 +2361,14 @@ impl<'a> QwenResidentStep<'a> {
                     resid: self.view(resid_in(layer))?,
                     admit_pos,
                 };
-                self.mixers.run_block(s, &self.state, layer, io)
+                // The attention-core pair of the finer split: `None` on unmarked layers (the
+                // pair is one extra event node per marked group per replay).
+                let core = self.marks.as_ref().and_then(|marks| {
+                    marks
+                        .group_index(layer)
+                        .map(|at| (&marks.core[at].0, &marks.core[at].1))
+                });
+                self.mixers.run_block(s, &self.state, layer, io, core)
             }
             StepOp::Moe(layer) if self.layout == WeightLayout::Exl3 => {
                 let weights = self.exl3_moe.get(layer).ok_or_else(|| {

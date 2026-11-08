@@ -43,6 +43,7 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceRange, DeviceStream, MatmulIo, PackCall, Projection,
+        TimingEvent,
         resident::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
@@ -370,6 +371,7 @@ impl<'a> Mixers<'a> {
         state: &ResidentState,
         layer: usize,
         io: BlockIo<'_>,
+        core_marks: Option<(&TimingEvent, &TimingEvent)>,
     ) -> Result<(), EngError> {
         state.check_block(stream)?;
         let slot = self.parts.table.slot(layer)?;
@@ -381,8 +383,35 @@ impl<'a> Mixers<'a> {
             ordinal: slot.ordinal,
             io,
         };
+        // The finer split's attention-core window: opens at the block's first core op
+        // (`Conv` of the delta list, `AttnPrep*` of the full list) and closes after its last
+        // (`Delta`, `AttnDecode*`), so the pair brackets the core whatever the list's exact
+        // shape (the KV-append ops sit inside it).
+        let mut core_open = false;
         for op in self.ops.of(slot.kind)? {
+            let opens_core = matches!(
+                op,
+                BlockOp::Conv { .. }
+                    | BlockOp::AttnPrep { .. }
+                    | BlockOp::AttnPrepRows { .. }
+                    | BlockOp::AttnPrepCard { .. }
+            );
+            let closes_core = matches!(
+                op,
+                BlockOp::Delta { .. } | BlockOp::AttnDecode { .. } | BlockOp::AttnDecodeQ { .. }
+            );
+            if let Some((core_start, _)) = core_marks {
+                if opens_core && !core_open {
+                    stream.record_timing(core_start)?;
+                    core_open = true;
+                }
+            }
             self.run_op(&run, op)?;
+            if let Some((_, core_end)) = core_marks {
+                if closes_core {
+                    stream.record_timing(core_end)?;
+                }
+            }
         }
         Ok(())
     }

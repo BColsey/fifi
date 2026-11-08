@@ -31,6 +31,10 @@ pub(super) struct MarkedGroup {
 #[derive(Debug, Clone, Default)]
 pub(super) struct FineSplit {
     pub(super) mixer_ms: Vec<f32>,
+    /// The attention core of each marked layer (`Conv`/`AttnPrep` start to the
+    /// `Delta`/`AttnDecode` end), inside its mixer reading; the projections and norms are
+    /// the mixer reading minus it.
+    pub(super) core_ms: Vec<f32>,
     pub(super) head_ms: f32,
 }
 
@@ -110,6 +114,16 @@ impl SectionPlan {
         for (at, ms) in fine.mixer_ms.iter().enumerate() {
             check(&format!("mixer {at}"), *ms)?;
         }
+        if fine.core_ms.len() != self.groups.len() {
+            return Err(EngError::BadRequest(format!(
+                "section timing: {} core readings for {} marked groups",
+                fine.core_ms.len(),
+                self.groups.len()
+            )));
+        }
+        for (at, ms) in fine.core_ms.iter().enumerate() {
+            check(&format!("core {at}"), *ms)?;
+        }
         check("head", fine.head_ms)?;
         check("whole token", whole_ms)?;
         if whole_ms <= 0.0 {
@@ -162,6 +176,12 @@ impl SectionTimes {
     /// layer is its group reading minus its mixer reading.
     pub(super) fn mixer_marked_ms(&self) -> &[f32] {
         &self.fine.mixer_ms
+    }
+
+    /// The attention core of each marked layer as read, in mark order; the projections and
+    /// norms around it are the mixer reading minus it.
+    pub(super) fn core_marked_ms(&self) -> &[f32] {
+        &self.fine.core_ms
     }
 
     /// The `LmHead` op alone, split out of the tail section.

@@ -57,9 +57,10 @@ struct Reading {
     sum_ms: f32,
     fraction: f32,
     groups: Vec<(usize, usize, f32)>,
-    /// The finer split: the mixer half per marked group (same order as `groups`) and the
-    /// `LmHead` op alone.
+    /// The finer split: the mixer half per marked group (same order as `groups`), the
+    /// attention core inside it, and the `LmHead` op alone.
     mixer_ms: Vec<f32>,
+    core_ms: Vec<f32>,
     head_ms: f32,
     wall_ms: f32,
 }
@@ -180,6 +181,7 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
             fraction: times.whole_ratio(),
             groups,
             mixer_ms: times.mixer_marked_ms().to_vec(),
+            core_ms: times.core_marked_ms().to_vec(),
             head_ms: times.head_ms(),
             wall_ms,
         });
@@ -280,9 +282,11 @@ fn section_marks_time_the_captured_step() {
             .groups
             .iter()
             .zip(&reading.mixer_ms)
-            .map(|((layer, size, ms), mixer)| {
+            .zip(&reading.core_ms)
+            .map(|(((layer, size, ms), mixer), core)| {
                 format!(
-                    "l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}/moe {:.4})",
+                    "l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}[core {core:.4}/proj {:.4}]/moe {:.4})",
+                    mixer - core,
                     ms - mixer
                 )
             })

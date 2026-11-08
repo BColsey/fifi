@@ -46,6 +46,7 @@ fn extrapolation_scales_groups_and_reconciles_with_whole() {
             &[1.0, 2.0],
             FineSplit {
                 mixer_ms: vec![0.6, 1.1],
+                core_ms: vec![0.3, 0.3],
                 head_ms: 0.2,
             },
             7.75,
@@ -63,6 +64,7 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
     let plan = section_plan(&[Full, Full]);
     let fine = || FineSplit {
         mixer_ms: vec![0.5],
+        core_ms: vec![0.3],
         head_ms: 0.2,
     };
     assert!(plan.reconcile(-0.1, 0.2, &[1.0], fine(), 3.0).is_err());
@@ -80,11 +82,13 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
     // finite and non-negative, and a finite non-negative head.
     let mismatched = FineSplit {
         mixer_ms: vec![],
+        core_ms: vec![],
         head_ms: 0.2,
     };
     assert!(plan.reconcile(0.1, 0.2, &[1.0], mismatched, 3.0).is_err());
     let negative_mixer = FineSplit {
         mixer_ms: vec![-0.1],
+        core_ms: vec![0.3],
         head_ms: 0.2,
     };
     assert!(
@@ -93,6 +97,7 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
     );
     let nan_head = FineSplit {
         mixer_ms: vec![0.5],
+        core_ms: vec![0.3],
         head_ms: f32::NAN,
     };
     assert!(plan.reconcile(0.1, 0.2, &[1.0], nan_head, 3.0).is_err());
@@ -105,12 +110,14 @@ fn reconcile_rejects_overflowing_derived_totals() {
     let plan = section_plan(&[Full, Full]);
     let huge = FineSplit {
         mixer_ms: vec![1e38],
+        core_ms: vec![0.3],
         head_ms: 1e38,
     };
     assert!(plan.reconcile(1e38, 1e38, &[1e38], huge, 1e-38).is_err());
     // A finite sum alone is not enough: the ratio against a tiny whole overflows too.
     let ok = FineSplit {
         mixer_ms: vec![0.5],
+        core_ms: vec![0.3],
         head_ms: 0.2,
     };
     assert!(plan.reconcile(1.0, 1.0, &[1.0], ok, 1e-38).is_err());
