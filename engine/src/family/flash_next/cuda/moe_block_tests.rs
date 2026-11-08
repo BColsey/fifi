@@ -30,7 +30,7 @@ fn bank(held: &[u16]) -> ExpertBankState<ReplaceOnMissLru> {
     }
     // The least popular holder is the first victim: count by id, so a low id is evicted last.
     let counts = vec![(0..EXPERTS as u64).rev().collect::<Vec<u64>>()];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts, None).unwrap();
     ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
 }
 

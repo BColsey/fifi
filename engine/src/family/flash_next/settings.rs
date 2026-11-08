@@ -46,6 +46,12 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
+    /// CUDA only: the popularity profile file of the expert bank. A load reads it for a
+    /// rank-ordered initial fill, and the bank rewrites it with its own usage counts on shutdown,
+    /// so the next start of the same entry serves warm. A file that does not exist yet is a cold
+    /// start (identity fill); a file that exists but does not parse is refused. Needs
+    /// `cuda_decode`.
+    pub(crate) expert_stats: Option<PathBuf>,
 }
 
 /// The K/V storage formats a `kv_format` value names.
@@ -72,6 +78,8 @@ pub(crate) struct CudaSettings {
     pub(crate) kv_format: KvFormatName,
     /// `None`: the load plan decides.
     pub(crate) slots: Option<u32>,
+    /// The popularity profile path of `flash_next.expert_stats`.
+    pub(crate) expert_stats: Option<PathBuf>,
 }
 
 /// Default positions of the CUDA K/V caches.
@@ -159,6 +167,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
             ("context", options.context.is_some()),
             ("kv_format", options.kv_format.is_some()),
             ("slots", options.slots.is_some()),
+            ("expert_stats", options.expert_stats.is_some()),
         ];
         return match stray.iter().find(|(_, set)| *set) {
             Some((key, _)) => Err(bad(format!("{key} needs cuda_decode set to true"))),
@@ -197,6 +206,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
         context,
         kv_format,
         slots,
+        expert_stats: options.expert_stats.clone(),
     }))
 }
 
@@ -557,6 +567,7 @@ mod tests {
                 context: 4096,
                 kv_format: KvFormatName::F16,
                 slots: None,
+                expert_stats: None,
             })
         );
         // The manifest is still required: it pins the tokenizer.
@@ -584,9 +595,31 @@ mod tests {
                 context: 65536,
                 kv_format: KvFormatName::F16,
                 slots: Some(48),
+                expert_stats: None,
             })
         );
         assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);
+        // expert_stats is a CUDA key: carried with cuda_decode, refused without it.
+        let warm = serde_json::from_str::<FlashOptions>(
+            r#"{"manifest": "/m.json", "cuda_decode": true, "expert_stats": "/var/lib/fn/stats.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings(Some(&warm), &env)
+                .unwrap()
+                .cuda
+                .map(|c| c.expert_stats),
+            Some(Some(std::path::PathBuf::from("/var/lib/fn/stats.json")))
+        );
+        let off = serde_json::from_str::<FlashOptions>(
+            r#"{"manifest": "/m.json", "expert_stats": "/var/lib/fn/stats.json"}"#,
+        )
+        .unwrap();
+        let refused = settings(Some(&off), &env).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("expert_stats needs cuda_decode"),
+            "{refused:?}"
+        );
         for (options, want) in [
             (
                 FlashOptions {

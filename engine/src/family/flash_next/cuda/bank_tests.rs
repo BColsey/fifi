@@ -542,7 +542,7 @@ fn small(mode: HostMode) -> ExpertBankState<ReplaceOnMissLru> {
     let counts: Vec<Vec<u64>> = (0..2)
         .map(|_| (0..16).map(|e| e as u64).collect())
         .collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     ExpertBankState::with_policy(geometry, mode, policy).unwrap()
 }
 
@@ -672,7 +672,7 @@ fn a_policy_row_must_hold_exactly_the_slots() {
     let geometry = BankGeometry::new(1, 16, 3, 5, 64).unwrap();
     let counts = vec![vec![0u64; 16]];
     let fill = |row: Vec<i32>| {
-        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts)?;
+        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts, None)?;
         ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).map(|_| ())
     };
     let row = |held: usize| -> Vec<i32> {
@@ -723,11 +723,11 @@ fn an_unfilled_start_is_refused() {
     let geometry = BankGeometry::new(1, 8, 2, 4, 64).unwrap();
     let counts = vec![vec![0u64; 8]];
     let short: Vec<i32> = vec![0, 1, 2, -1, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[short.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[short.as_slice()], &counts, None).is_err());
     let twice: Vec<i32> = vec![0, 1, 2, 2, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[twice.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[twice.as_slice()], &counts, None).is_err());
     let outside: Vec<i32> = vec![0, 1, 2, 4, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[outside.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[outside.as_slice()], &counts, None).is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -842,7 +842,7 @@ fn run_random_passes(mode: HostMode) {
     let row: Vec<i32> = (0..64).map(|e| if e < 20 { e } else { -1 }).collect();
     let rows = vec![row.as_slice(); 3];
     let counts = vec![vec![0u64; 64]; 3];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     let mut state = ExpertBankState::with_policy(geometry, mode, policy).unwrap();
     let mut sim = Sim::new(&state);
     sim.check(&state);
@@ -1039,7 +1039,7 @@ fn replay(trace: &str, slots: usize) -> f64 {
             .collect();
         let rows = vec![row.as_slice(); 48];
         let counts = vec![vec![0u64; 512]; 48];
-        ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap()
+        ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap()
     };
     let (mut policy, mut current) = (fresh(), String::new());
     let (mut hits, mut picks) = (0u64, 0u64);
@@ -1121,7 +1121,7 @@ mod device_tests {
         let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
         let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
         let policy =
-            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts)
+            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts, None)
                 .unwrap();
         let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
         let places = state.mode().places_per_layer(&geometry);
@@ -1208,9 +1208,13 @@ mod device_tests {
         let state = {
             let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
             let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
-            let policy =
-                ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts)
-                    .unwrap();
+            let policy = ReplaceOnMissLru::from_fill(
+                geometry,
+                &[row.as_slice(), row.as_slice()],
+                &counts,
+                None,
+            )
+            .unwrap();
             ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
         };
         let mut wrong = plan;

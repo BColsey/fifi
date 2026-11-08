@@ -526,10 +526,13 @@ impl LayerLru {
 pub(super) struct ReplaceOnMissLru {
     geometry: BankGeometry,
     layers: Vec<LayerLru>,
-    /// Per-layer pick counts, written to `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` on drop so a run can
-    /// produce the popularity profile of its own workload (the read side is
-    /// `FIFI_FLASH_NEXT_EXPERT_STATS`). `None` when the env is unset.
+    /// Per-layer pick counts, written to `usage_out` on drop so a run can produce the popularity
+    /// profile of its own workload (the read side is `FIFI_FLASH_NEXT_EXPERT_STATS`, or the
+    /// `expert_stats` engine key). `None` when no write path is set.
     usage: Option<Vec<Vec<u64>>>,
+    /// Where the dump goes: the `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` value, or the engine's
+    /// `expert_stats` path (which then also feeds the next start's fill).
+    usage_out: Option<std::path::PathBuf>,
     /// Per-layer miss counts of the same dump: where the slot capacity actually binds.
     miss_counts: Vec<u64>,
 }
@@ -542,6 +545,7 @@ impl ReplaceOnMissLru {
         geometry: BankGeometry,
         rows: &[&[i32]],
         counts: &[Vec<u64>],
+        usage_out: Option<&std::path::Path>,
     ) -> Result<Self, EngError> {
         if rows.len() != geometry.layers || counts.len() != geometry.layers {
             return Err(bank_error(format!(
@@ -588,15 +592,16 @@ impl ReplaceOnMissLru {
                 recency,
             });
         }
-        let usage = std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
-            .ok()
-            .filter(|p| !p.is_empty())
+        let usage_out = usage_out.map(std::path::Path::to_path_buf);
+        let usage = usage_out
+            .as_ref()
             .map(|_| vec![vec![0u64; geometry.experts]; geometry.layers]);
         let miss_counts = vec![0u64; geometry.layers];
         Ok(Self {
             geometry,
             layers,
             usage,
+            usage_out,
             miss_counts,
         })
     }
@@ -604,10 +609,7 @@ impl ReplaceOnMissLru {
     /// Writes the collected pick counts in the `expert_stats` layer-key format the profile
     /// reader takes, so the file feeds straight back through `FIFI_FLASH_NEXT_EXPERT_STATS`.
     fn dump_usage(&self) {
-        let Some(path) = std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
-            .ok()
-            .filter(|p| !p.is_empty())
-        else {
+        let Some(path) = self.usage_out.as_deref() else {
             return;
         };
         let Some(usage) = &self.usage else { return };
@@ -624,8 +626,15 @@ impl ReplaceOnMissLru {
         let usage_misses = self.miss_counts.clone();
         let body =
             serde_json::json!({"schema": "fifi-usage/1", "layers": layers, "misses": usage_misses});
-        if let Err(e) = std::fs::write(&path, serde_json::to_vec(&body).unwrap_or_default()) {
-            eprintln!("flash-next cuda: expert usage dump {path}: {e}");
+        match serde_json::to_vec(&body) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display());
+                }
+            }
+            // The body is maps of u64 vectors: serialization cannot fail. Skip the write
+            // instead of emitting an empty file a next start would refuse.
+            Err(e) => eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display()),
         }
     }
 
@@ -682,7 +691,7 @@ impl SlotPolicy for ReplaceOnMissLru {
             )));
         }
         let mut next = current.clone();
-        drop(current);
+        let _ = current; // end the borrow: the write-back below takes the layer slot
         if let Some(usage) = &mut self.usage {
             for expert in picked {
                 usage[layer][expert] += 1;
@@ -923,7 +932,7 @@ impl ExpertBankState<ReplaceOnMissLru> {
         let rows: Vec<&[i32]> = (0..geometry.layers)
             .map(|layer| hot.table.row(layer))
             .collect();
-        let policy = ReplaceOnMissLru::from_fill(geometry, &rows, counts)?;
+        let policy = ReplaceOnMissLru::from_fill(geometry, &rows, counts, None)?;
         Self::with_policy(geometry, mode, policy)
     }
 }

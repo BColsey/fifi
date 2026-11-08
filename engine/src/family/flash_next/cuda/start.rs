@@ -256,8 +256,9 @@ impl RecordSource for TimedSource<'_> {
 
 /// Reads an exllamav3 `expert_stats` JSON into per-layer expert use weights, in layer order.
 /// Refuses a missing file, bad JSON, any layer key that is not `model.language_model.layers.<i>.mlp`,
-/// a layer index outside `0..layers`, or a duplicate layer. The weights themselves are validated
-/// against the bank geometry by [`fill_from_profile`].
+/// or a layer index outside `0..layers`. A duplicate layer key cannot be detected here: the JSON
+/// parser keeps the last value of a repeated object key, so the layer reads as missing instead.
+/// The weights themselves are validated against the bank geometry by [`fill_from_profile`].
 fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngError> {
     let bad = |detail: String| {
         EngError::BadRequest(format!("FIFI_FLASH_NEXT_EXPERT_STATS={path}: {detail}"))
@@ -351,11 +352,12 @@ fn build_bank(
     geometry: BankGeometry,
     plan: &HostPinPlan,
     profile: Option<&[Vec<f64>]>,
+    usage_out: Option<&std::path::Path>,
     source: &PackRecordSource<'_>,
 ) -> Result<DeviceBank, EngError> {
     let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, usage_out)?;
 
     let state = ExpertBankState::with_policy(geometry, plan.mode, policy)?;
     let timed = TimedSource {
@@ -545,22 +547,51 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     let source = PackRecordSource::new(checkpoint)?;
-    // Optional popularity profile (`FIFI_FLASH_NEXT_EXPERT_STATS`, an exllamav3 expert_stats
-    // JSON: {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}).
-    // Unset fills by expert id as before; a set value must read and parse, and a malformed file
-    // is refused, never a silent identity fill.
-    let profile = match std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS") {
-        Err(_) => None,
-        Ok(path) if path.is_empty() => None,
-        Ok(path) => Some(read_expert_stats(&path, layers)?),
+    // Optional popularity profile, an exllamav3 expert_stats JSON:
+    // {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}. Sources,
+    // in order: the engine's `expert_stats` key (which also takes the usage dump, so the next
+    // start of the same entry serves warm) and `FIFI_FLASH_NEXT_EXPERT_STATS`. A set env value
+    // must read and parse; a malformed file is refused, never a silent identity fill. A
+    // not-yet-written engine-key file is a cold start (the dump creates it on shutdown).
+    let env_stats = std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS")
+        .ok()
+        .filter(|path| !path.is_empty());
+    let stats_path = wanted
+        .expert_stats
+        .as_deref()
+        .map(std::path::Path::new)
+        .or_else(|| env_stats.as_deref().map(std::path::Path::new));
+    let profile = match &stats_path {
+        None => None,
+        Some(path) if wanted.expert_stats.is_some() && !path.exists() => {
+            eprintln!(
+                "flash-next cuda: expert bank: no profile at {} yet; identity fill, the dump                  writes it on shutdown",
+                path.display()
+            );
+            None
+        }
+        Some(path) => Some(read_expert_stats(&path.display().to_string(), layers)?),
     };
+    let usage_out = wanted.expert_stats.clone().or_else(|| {
+        std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    });
     if profile.is_some() {
         eprintln!(
             "flash-next cuda: expert bank: popularity profile {}",
-            std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS").unwrap_or_default()
+            stats_path.map_or(String::new(), |p| p.display().to_string())
         );
     }
-    let bank = build_bank(projector, geometry, &host_plan, profile.as_deref(), &source)?;
+    let bank = build_bank(
+        projector,
+        geometry,
+        &host_plan,
+        profile.as_deref(),
+        usage_out.as_deref(),
+        &source,
+    )?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()
@@ -658,6 +689,25 @@ mod tests {
 
     /// The stats reader takes the stock layer keys in any object order, refuses a bad key, a
     /// duplicate, an out-of-range index and a missing layer, and returns weights in layer order.
+    #[test]
+    fn the_usage_dump_round_trips_through_the_reader() {
+        let dir = std::env::temp_dir().join(format!("fn-dump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("dump.json");
+        let geometry = BankGeometry::new(1, 4, 2, 3, 8).expect("geometry");
+        let (rows, counts) = fill_from_profile(geometry.clone(), None).expect("identity fill");
+        let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
+        {
+            let _policy =
+                super::ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, Some(&path))
+                    .expect("policy");
+        } // drop writes the dump
+        assert!(path.exists(), "the drop wrote the dump");
+        let read = read_expert_stats(path.to_str().unwrap(), 1).expect("read back");
+        assert_eq!(read, vec![vec![0.0; 4]], "zero picks dump zero weights");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn the_stats_reader_parses_and_refuses() {
         let dir = std::env::temp_dir().join(format!("fn-stats-{}", std::process::id()));

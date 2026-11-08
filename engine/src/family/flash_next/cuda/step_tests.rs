@@ -601,7 +601,7 @@ fn split_block<'w>(
         .iter()
         .map(|_| (0..dims.n_expert as u64).rev().collect())
         .collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts).expect("the fill");
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, None).expect("the fill");
     let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).expect("state");
     let plan = HostPinPlan::new(
         &geometry,

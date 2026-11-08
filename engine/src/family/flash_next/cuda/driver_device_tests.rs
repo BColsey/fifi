@@ -222,6 +222,7 @@ fn the_first_real_tokens_match_the_oracle() {
         context,
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
+        expert_stats: None,
     };
     let began = std::time::Instant::now();
     let mut driver = build_driver(
@@ -492,6 +493,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         context,
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
+        expert_stats: None,
     };
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
@@ -831,10 +833,15 @@ fn single_row_kernel_receipt_run() {
         prompt.len() + steps < context as usize,
         "the context is too small"
     );
+    // The engine key path of the warm-start slice: FIFI_FLASH_NEXT_DRIVER_STATS points the
+    // driver's expert_stats at a file; a missing one is the cold start, and the bank's drop
+    // writes the usage dump there for the next run.
+    let stats = var("FIFI_FLASH_NEXT_DRIVER_STATS").map(std::path::PathBuf::from);
     let wanted = CudaSettings {
         context,
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
+        expert_stats: stats,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
     let kernel = driver
@@ -906,6 +913,20 @@ fn single_row_kernel_receipt_run() {
         input = pick as u32;
     }
     std::fs::create_dir_all(&out).expect("out dir");
+    // The warm-start e2e: with the engine key set, the bank's drop must have written the
+    // usage dump to exactly that path, in the format the next start's reader takes.
+    drop(driver);
+    if let Some(stats) = wanted.expert_stats.as_ref() {
+        let body =
+            std::fs::read(stats).unwrap_or_else(|e| panic!("usage dump {}: {e}", stats.display()));
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("dump json");
+        assert_eq!(parsed["schema"], "fifi-usage/1");
+        assert_eq!(
+            parsed["layers"].as_object().map(|m| m.len()),
+            Some(48),
+            "one layer row per bank layer"
+        );
+    }
     let path = out.join(format!("ab-{config}-r{round}.json"));
     std::fs::write(
         &path,
