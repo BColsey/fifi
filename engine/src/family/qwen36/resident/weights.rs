@@ -8,14 +8,17 @@
 
 use super::super::settings::{Activation, scale_pairing_error};
 use super::layout::{
-    ExpertPlan, neg_exp, router_transposed, scalar_gate, split_conv, widen_stack_scales,
+    neg_exp, router_transposed, scalar_gate, split_conv, widen_layout, widen_stack_scales,
     with_f32_scales,
 };
 use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
 use crate::{
     EngError,
     family::{
-        flash_next::stored::{RoleRange, SlicedWeight, StoredWeight, read_stack_into},
+        flash_next::stored::{
+            RoleRange, SlicedWeight, StackedLayouts, StoredWeight, read_stack_into,
+            read_stacked_into, stacked_layout,
+        },
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
@@ -328,7 +331,8 @@ fn page_range(range: &RoleRange) -> PageRange {
 }
 
 impl RMoe {
-    /// Reads all experts of one layer into new pages and wraps the three stacks without a copy.
+    /// Reads all experts of one layer into new pages - the gate and up projections stacked into
+    /// one operand, then `down` - and wraps the two stacks without a copy.
     fn import_experts(
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
@@ -337,38 +341,54 @@ impl RMoe {
         experts: u32,
         f32_scales: bool,
     ) -> Result<Self, EngError> {
-        let sliced = (&stacks.0, &stacks.1, &stacks.2);
+        let (gate, up, down) = (&stacks.0, &stacks.1, &stacks.2);
         let page = HostPages::page_size();
-        // With F32 scales (the default) the plan places each scale and bias role at twice its
-        // stored size, and `reads` places the stored BF16 values in the upper half of that role.
-        let (plan, reads) = if f32_scales {
-            let (plan, reads) = ExpertPlan::new_f32_scales(ckpt, sliced, experts, page)?;
-            (plan, Some(reads))
+        // The narrow gate/up layouts carry the stored slice sizes of the two projections. The
+        // stacked layout joins every expert slice of every role - gate bytes then up bytes - so
+        // the pages wrap ONE operand `[experts, 2 * rows, cols]` for both projections, with no
+        // second copy on the device. `down` follows the stacked block.
+        let gate_narrow = StackLayout::new(ckpt, gate, experts, 0, page)?;
+        let up_narrow = StackLayout::new(ckpt, up, experts, 0, page)?;
+        let stacked_narrow = stacked_layout(&gate_narrow, &up_narrow, 0, page)?;
+        // With F32 scales (the default) the scales and biases slots hold F32 values that
+        // `read_stacked_into` widens per slot; `down` widens through the plain machinery.
+        let (stacked, down_layout, down_read) = if f32_scales {
+            let (stacked, _whole_role_read) = widen_layout(&stacked_narrow, page)?;
+            let down_narrow = StackLayout::new(ckpt, down, experts, stacked.end, page)?;
+            let (down, read) = widen_layout(&down_narrow, page)?;
+            (stacked, down, Some(read))
         } else {
-            (ExpertPlan::new(ckpt, sliced, experts, page)?, None)
+            let down = StackLayout::new(ckpt, down, experts, stacked_narrow.end, page)?;
+            (stacked_narrow, down, None)
         };
-        let mut pages = HostPages::try_new(plan.end)?;
+        let mut pages = HostPages::try_new(down_layout.end)?;
         let ids: Vec<u32> = (0..experts).collect();
         {
             let bytes = pages.try_write().ok_or_else(|| EngError::Backend {
                 operation: "expert_pages",
                 message: "new expert pages are not writable".into(),
             })?;
-            for (index, (stored, layout)) in [&stacks.0, &stacks.1, &stacks.2]
-                .into_iter()
-                .zip(&plan.stacks)
-                .enumerate()
-            {
-                let read = reads.as_ref().map_or(layout, |reads| &reads[index]);
-                read_stack_into(ckpt, stored, &ids, bytes, read)?;
-                if reads.is_some() {
-                    widen_stack_scales(bytes, layout)?;
-                }
+            read_stacked_into(
+                ckpt,
+                gate,
+                up,
+                &ids,
+                bytes,
+                &StackedLayouts {
+                    gate: &gate_narrow,
+                    up: &up_narrow,
+                    stacked: &stacked,
+                },
+                f32_scales,
+            )?;
+            let down_target = down_read.as_ref().unwrap_or(&down_layout);
+            read_stack_into(ckpt, down, &ids, bytes, down_target)?;
+            if f32_scales {
+                widen_stack_scales(bytes, &down_layout)?;
             }
         }
-        let wrapped: Vec<PackedPages> = plan
-            .stacks
-            .iter()
+        let wrapped: Vec<PackedPages> = [&stacked, &down_layout]
+            .into_iter()
             .map(|stack| PackedPages {
                 payload: page_range(&stack.payload),
                 scales: page_range(&stack.scales),
@@ -381,11 +401,8 @@ impl RMoe {
         if !plain.is_empty() {
             return Err(short_import());
         }
-        let [gate, up, down]: [ResidentPackedWeight; 3] =
+        let [gate_up, down]: [ResidentPackedWeight; 2] =
             imported.try_into().map_err(|_| short_import())?;
-        // The gate and up stacks join along the output axis: the host pages keep their three
-        // roles, the device holds the one stacked operand, and the two originals free here.
-        let gate_up = kernels.concat_packed_outputs(&gate, &up)?;
         Ok(Self {
             router_t: front.router_t,
             shared_gate: front.shared_gate,

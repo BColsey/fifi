@@ -1495,62 +1495,6 @@ impl Context {
         Ok(promoting_elementwise_result(state, output, layout))
     }
 
-    /// The weight-grade sibling of `concatenate`: it joins packed-weight payloads, scales, and
-    /// biases along one axis WITHOUT the activation dtype rules - the packed payload is U32 and
-    /// the scales BF16 or F32, and every part is an owned resident of this adapter, not an
-    /// activation. All parts must share one dtype and rank; the layout check covers the rest.
-    pub(in crate::kernels::mlx) fn concatenate_weights(
-        &mut self,
-        parts: &[&ExecutionTensor],
-        axis: u32,
-    ) -> Result<ExecutionTensor, EngError> {
-        let label = "concatenate weights";
-        let _dispatch = DispatchGuard::enter();
-        self.check_ready()?;
-        let state = self.state.as_mut().unwrap();
-        let Some((first, rest)) = parts.split_first() else {
-            return Err(EngError::BadRequest(format!(
-                "{label}: needs at least one part"
-            )));
-        };
-        // Ownership only, no dtype gate: the parts are owned packed-weight payloads whose
-        // dtypes (U32, BF16, F32) the caller already validated.
-        check_owner(label, state, first)?;
-        let dtype = first.dtype();
-        for part in rest {
-            check_owner(label, state, part)?;
-            if part.dtype() != dtype {
-                return Err(EngError::BadRequest(format!(
-                    "{label}: parts differ in dtype"
-                )));
-            }
-        }
-        let shapes: Vec<&[u32]> = parts.iter().map(|part| part.shape()).collect();
-        let layout = shape::concatenate(label, &shapes, axis)?;
-        // The layout counts 4-byte elements, which is exact for F32 and U32 and halves for BF16.
-        let byte_len = layout.byte_len / Dtype::F32.byte_width() * dtype.byte_width();
-        let native_axis = native_ints(label, &[axis])?[0];
-        let _inputs: Vec<_> = parts.iter().map(|part| part.share()).collect();
-        let handles: Vec<ffi::mlx_array> = parts
-            .iter()
-            .map(|part| part.storage.native_array())
-            .collect();
-        clear_message();
-        let stream = state.stream.0;
-        let expected = ExpectedOutput {
-            operation: label,
-            stream,
-            shape: &layout.shape,
-            byte_len,
-            dtype,
-            promotes: false,
-        };
-        let output = dispatch_contiguous(&expected, |slot| unsafe {
-            ffi::mlx_concatenate_axis(slot, handles.as_ptr(), handles.len(), native_axis, stream)
-        })?;
-        Ok(state.resident(output, dtype, layout.shape, byte_len))
-    }
-
     /// One lazy F32 [1] health scalar: 1.0 when every element of `x` is finite,
     /// 0.0 otherwise (the router bounds-health piece). The guard wrapper
     /// sequences the library nodes - isfinite, all, astype, reshape - so this

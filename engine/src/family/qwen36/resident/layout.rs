@@ -5,12 +5,11 @@
 use crate::{
     EngError,
     family::{
-        flash_next::stored::{RoleRange, SlicedWeight, StackLayout},
+        flash_next::stored::{RoleRange, StackLayout, widen_bf16_in_place},
         qwen36::host_cpu::dequantize_matrix,
     },
     kernels::{PackedWeight, QuantizationMode},
     tensor::{Dtype, Tensor},
-    weights::StreamedCheckpoint,
 };
 
 fn mismatch(what: &str) -> EngError {
@@ -76,33 +75,6 @@ pub(super) fn scalar_gate(gate: &PackedWeight, hidden: usize) -> Result<Vec<f32>
     Ok(values)
 }
 
-/// Page layout of the three expert stacks of one layer, placed one after the other.
-pub(super) struct ExpertPlan {
-    /// The gate, up, and down stacks, in this order.
-    pub(super) stacks: [StackLayout; 3],
-    /// Bytes from the start of the pages to the end of the last role. A multiple of `page`.
-    pub(super) end: usize,
-}
-
-impl ExpertPlan {
-    /// Places the stacks of all `experts` experts, each role at a page multiple.
-    pub(super) fn new(
-        ckpt: &StreamedCheckpoint,
-        (gate, up, down): (&SlicedWeight, &SlicedWeight, &SlicedWeight),
-        experts: u32,
-        page: usize,
-    ) -> Result<Self, EngError> {
-        let gate = StackLayout::new(ckpt, gate, experts, 0, page)?;
-        let up = StackLayout::new(ckpt, up, experts, gate.end, page)?;
-        let down = StackLayout::new(ckpt, down, experts, up.end, page)?;
-        let end = down.end;
-        Ok(Self {
-            stacks: [gate, up, down],
-            end,
-        })
-    }
-}
-
 /// Expands every BF16 value of `tensor` to F32. BF16 is the high half of an F32, so the expansion is
 /// exact. Any other dtype returns `BadRequest`.
 fn widen_tensor(tensor: &Tensor) -> Result<Tensor, EngError> {
@@ -147,33 +119,15 @@ pub(super) fn with_f32_scales(weight: &PackedWeight) -> Result<PackedWeight, Eng
     )
 }
 
-/// Expands BF16 values to F32 inside one buffer, with no second buffer.
-///
-/// `region` holds `count` F32 slots (`4 * count` bytes). On entry the BF16 values sit in its upper
-/// half, `region[2 * count..]`. On return `region` holds the F32 values. Value `i` is read from
-/// byte `2 * count + 2 * i` and written to byte `4 * i`. The write ends at `4 * i + 4`, which is at
-/// most `2 * count + 2 * i + 2`, so a write never reaches a BF16 value that is still unread.
-/// A length that is not a multiple of 4 returns `BadRequest`.
-pub(super) fn widen_bf16_in_place(region: &mut [u8]) -> Result<(), EngError> {
-    if !region.len().is_multiple_of(4) {
-        return Err(EngError::BadRequest(
-            "an F32 region holds whole 4-byte values".into(),
-        ));
-    }
-    let half = region.len() / 2;
-    for i in 0..half / 2 {
-        let (low, high) = (region[half + 2 * i], region[half + 2 * i + 1]);
-        region[4 * i..4 * i + 4].copy_from_slice(&[0, 0, low, high]);
-    }
-    Ok(())
-}
-
 /// The wide form of one expert stack and the layout that reads it.
 ///
 /// `wide` is the layout of the finished pages: the payload as stored, the scales and biases as F32.
 /// `read` places each BF16 role in the upper half of its F32 role, so that `read_stack_into` fills
 /// it and `widen_stack_scales` expands it in place.
-fn widen_layout(narrow: &StackLayout, page: usize) -> Result<(StackLayout, StackLayout), EngError> {
+pub(super) fn widen_layout(
+    narrow: &StackLayout,
+    page: usize,
+) -> Result<(StackLayout, StackLayout), EngError> {
     let overflow = || EngError::BadRequest("widened stack layout overflows".into());
     let biases = narrow.biases.as_ref().ok_or_else(|| {
         EngError::BadRequest("F32 scale storage needs affine expert stacks".into())
@@ -240,37 +194,4 @@ pub(super) fn widen_stack_scales(bytes: &mut [u8], wide: &StackLayout) -> Result
         widen_bf16_in_place(region)?;
     }
     Ok(())
-}
-
-impl ExpertPlan {
-    /// Like `new`, with the scales and biases of every stack placed as F32. Returns the plan of the
-    /// finished pages and, per stack, the layout to read the stored BF16 values into (see
-    /// `widen_layout`). The caller reads with the second, then calls `widen_stack_scales` with the
-    /// first. A stack with a dtype other than BF16 scales and biases returns `BadRequest`.
-    pub(super) fn new_f32_scales(
-        ckpt: &StreamedCheckpoint,
-        stacks: (&SlicedWeight, &SlicedWeight, &SlicedWeight),
-        experts: u32,
-        page: usize,
-    ) -> Result<(Self, [StackLayout; 3]), EngError> {
-        let mut base = 0;
-        let mut both = Vec::with_capacity(3);
-        for weight in [stacks.0, stacks.1, stacks.2] {
-            let narrow = StackLayout::new(ckpt, weight, experts, base, page)?;
-            let (wide, read) = widen_layout(&narrow, page)?;
-            base = wide.end;
-            both.push((wide, read));
-        }
-        let [(gate, read_gate), (up, read_up), (down, read_down)]: [(StackLayout, StackLayout); 3] =
-            both.try_into()
-                .map_err(|_| EngError::BadRequest("an expert plan holds three stacks".into()))?;
-        let end = down.end;
-        Ok((
-            Self {
-                stacks: [gate, up, down],
-                end,
-            },
-            [read_gate, read_up, read_down],
-        ))
-    }
 }

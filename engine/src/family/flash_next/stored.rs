@@ -602,6 +602,225 @@ pub(crate) fn read_stack_into(
     Ok(())
 }
 
+/// Expands BF16 values to F32 inside one buffer, with no second buffer.
+///
+/// `region` holds `count` F32 slots (`4 * count` bytes). On entry the BF16 values sit in its upper
+/// half, `region[2 * count..]`. On return `region` holds the F32 values. Value `i` is read from
+/// byte `2 * count + 2 * i` and written to byte `4 * i`. The write ends at `4 * i + 4`, which is at
+/// most `2 * count + 2 * i + 2`, so a write never reaches a BF16 value that is still unread.
+/// A length that is not a multiple of 4 returns `BadRequest`.
+pub(crate) fn widen_bf16_in_place(region: &mut [u8]) -> Result<(), EngError> {
+    if !region.len().is_multiple_of(4) {
+        return Err(EngError::BadRequest(
+            "an F32 region holds whole 4-byte values".into(),
+        ));
+    }
+    let half = region.len() / 2;
+    for i in 0..half / 2 {
+        let (low, high) = (region[half + 2 * i], region[half + 2 * i + 1]);
+        region[4 * i..4 * i + 4].copy_from_slice(&[0, 0, low, high]);
+    }
+    Ok(())
+}
+
+/// The stacked byte range of one role (`weight`, `scales`, or `biases`): the gate bytes then the
+/// up bytes of one expert slice, as ONE wrapped operand of both projections requires.
+fn stacked_role(gate: &RoleRange, up: &RoleRange, offset: usize) -> Result<RoleRange, EngError> {
+    if gate.dtype != up.dtype || gate.shape.get(2..) != up.shape.get(2..) {
+        return Err(EngError::BadRequest(
+            "the gate and up stacks differ in dtype or trailing shape".into(),
+        ));
+    }
+    let rows = gate
+        .shape
+        .get(1)
+        .and_then(|&rows| rows.checked_add(*up.shape.get(1)?))
+        .ok_or_else(|| EngError::BadRequest("the stacked row count overflows".into()))?;
+    let mut shape = gate.shape.clone();
+    shape[1] = rows;
+    Ok(RoleRange {
+        offset,
+        slice_len: gate
+            .slice_len
+            .checked_add(up.slice_len)
+            .ok_or_else(|| EngError::BadRequest("the stacked slice size overflows".into()))?,
+        dtype: gate.dtype,
+        shape,
+    })
+}
+
+/// Places the stacked gate/up stack of two layouts of the SAME expert count and quantization
+/// from `base`, a page multiple: every slice slot of every role holds the gate bytes then the up
+/// bytes of one expert, so the wrapped operand `[experts, rows_g + rows_u, cols]` serves both
+/// projections of one `gather_qmm` call.
+pub(crate) fn stacked_layout(
+    gate: &StackLayout,
+    up: &StackLayout,
+    base: usize,
+    page: usize,
+) -> Result<StackLayout, EngError> {
+    let overflow = || EngError::BadRequest("the stacked layout overflows".into());
+    if page == 0 || !base.is_multiple_of(page) {
+        return Err(EngError::BadRequest(
+            "the stacked layout needs a base at a page multiple".into(),
+        ));
+    }
+    if gate.count != up.count || gate.spec != up.spec {
+        return Err(EngError::BadRequest(
+            "the gate and up stacks differ in experts or quantization".into(),
+        ));
+    }
+    let count = usize::try_from(gate.count).map_err(|_| overflow())?;
+    let mut cursor = base;
+    let mut place = |gate: &RoleRange, up: &RoleRange| -> Result<RoleRange, EngError> {
+        let role = stacked_role(gate, up, cursor)?;
+        let total = role.slice_len.checked_mul(count).ok_or_else(overflow)?;
+        cursor = role
+            .offset
+            .checked_add(total)
+            .and_then(|end| end.checked_next_multiple_of(page))
+            .ok_or_else(overflow)?;
+        Ok(role)
+    };
+    let payload = place(&gate.payload, &up.payload)?;
+    let scales = place(&gate.scales, &up.scales)?;
+    let biases = match (&gate.biases, &up.biases) {
+        (Some(gate), Some(up)) => Some(place(gate, up)?),
+        (None, None) => None,
+        _ => {
+            return Err(EngError::BadRequest(
+                "the gate and up stacks differ in bias presence".into(),
+            ));
+        }
+    };
+    let logical_shape = payload.shape.clone();
+    Ok(StackLayout {
+        count: gate.count,
+        payload,
+        scales,
+        biases,
+        logical_shape,
+        spec: gate.spec,
+        end: cursor,
+    })
+}
+
+/// The layouts of one stacked gate/up import: the two narrow stacks (the stored slice sizes)
+/// and the stacked target (the joined slots, optionally the widened form).
+pub(crate) struct StackedLayouts<'a> {
+    pub(crate) gate: &'a StackLayout,
+    pub(crate) up: &'a StackLayout,
+    pub(crate) stacked: &'a StackLayout,
+}
+
+/// Reads the gate and up expert slices of one layer into the slots of `wide` (a stacked layout of
+/// the two stacks, optionally the widened form). Every slice slot of every role holds the gate
+/// bytes then the up bytes of one expert. With `f32_scales` the scales and biases slots hold F32
+/// values: the narrow pair reads into the upper half of each slot and widens in place, which
+/// keeps the gate values before the up values.
+pub(crate) fn read_stacked_into(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
+    let (gate_narrow, up_narrow, wide) = (layouts.gate, layouts.up, layouts.stacked);
+    if indices.is_empty() || u32::try_from(indices.len()).ok() != Some(wide.count) {
+        return Err(EngError::BadRequest(format!(
+            "expert stack of {} needs {} slices, received {}",
+            gate.stem,
+            wide.count,
+            indices.len()
+        )));
+    }
+    if wide.end > dst.len() {
+        return Err(EngError::BadRequest(format!(
+            "expert stack of {} needs {} bytes, the destination holds {}",
+            gate.stem,
+            wide.end,
+            dst.len()
+        )));
+    }
+    for weight in [gate, up] {
+        if let Some(&index) = indices.iter().find(|&&index| index >= weight.slices) {
+            return Err(EngError::BadRequest(format!(
+                "slice {index} is outside {} slices of {}",
+                weight.slices, weight.stem
+            )));
+        }
+    }
+    let mut read_role = |role: &str,
+                         g: &RoleRange,
+                         u: &RoleRange,
+                         wide_role: &RoleRange,
+                         widen: bool|
+     -> Result<(), EngError> {
+        let pair = g.slice_len + u.slice_len;
+        for (rank, &index) in indices.iter().enumerate() {
+            let offset_error = || EngError::BadRequest(format!("stacked {role} offset overflows"));
+            let slot = wide_role
+                .offset
+                .checked_add(
+                    rank.checked_mul(wide_role.slice_len)
+                        .ok_or_else(offset_error)?,
+                )
+                .ok_or_else(offset_error)?;
+            let (gate_at, up_at) = if widen {
+                (slot + pair, slot + pair + g.slice_len)
+            } else {
+                (slot, slot + g.slice_len)
+            };
+            for (weight, at, len) in [(gate, gate_at, g.slice_len), (up, up_at, u.slice_len)] {
+                let end = at
+                    .checked_add(len)
+                    .filter(|&end| end <= dst.len())
+                    .ok_or_else(|| {
+                        EngError::BadRequest(format!("stacked {role} range passes the end"))
+                    })?;
+                let key = format!("{}.{role}", weight.stem);
+                counted_read(len, || ckpt.read_slice_into(&key, index, &mut dst[at..end]))?;
+            }
+            if widen {
+                let end =
+                    slot.checked_add(pair.checked_mul(2).ok_or_else(|| {
+                        EngError::BadRequest("the widened slot overflows".into())
+                    })?)
+                    .filter(|&end| end <= dst.len())
+                    .ok_or_else(|| {
+                        EngError::BadRequest("stacked widened slot passes the end".into())
+                    })?;
+                widen_bf16_in_place(&mut dst[slot..end])?;
+            }
+        }
+        Ok(())
+    };
+    read_role(
+        "weight",
+        &gate_narrow.payload,
+        &up_narrow.payload,
+        &wide.payload,
+        false,
+    )?;
+    read_role(
+        "scales",
+        &gate_narrow.scales,
+        &up_narrow.scales,
+        &wide.scales,
+        f32_scales,
+    )?;
+    if let (Some(g), Some(u), Some(w)) = (
+        gate_narrow.biases.as_ref(),
+        up_narrow.biases.as_ref(),
+        wide.biases.as_ref(),
+    ) {
+        read_role("biases", g, u, w, f32_scales)?;
+    }
+    Ok(())
+}
+
 /// Concatenates equal-shaped slice tensors into one tensor with a leading axis of `count`.
 fn stack_parts<'a>(
     parts: impl Iterator<Item = &'a Tensor>,
