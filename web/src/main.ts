@@ -193,13 +193,6 @@ function main(): void {
   });
 
   async function refreshModels(): Promise<void> {
-    if (loadSettings().apiKey === "") {
-      models = [];
-      modelsUnauthorized = false;
-      renderPicker();
-      about.updateModels([]);
-      return;
-    }
     try {
       // Bound the poll: a hanging /v1/models must not wedge pollOutstanding.
       const list = await listModels(AbortSignal.timeout(4000));

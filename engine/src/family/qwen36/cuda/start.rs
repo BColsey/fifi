@@ -22,7 +22,7 @@ use super::{
     card_load::card_loads,
     card_session::{CardSession, Q36CudaStep},
     card_step::CardStack,
-    card_weights::load_card_weights,
+    card_weights::{load_card_weights, load_card_weights_mapped},
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     exl3_bank::{Exl3SlotResolver, ExpertStore},
     exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
@@ -797,6 +797,18 @@ pub(crate) fn start(
     Ok((engine, bundle))
 }
 
+fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<u64, EngError> {
+    match value {
+        None => Ok(0),
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("{name} must be a nonnegative byte count"))
+            }),
+    }
+}
+
 /// The engine-thread half: everything CUDA is built here, in the gate's own order — projector,
 /// memory figure, GGUF identity, open, load with admission, free-after-load floor, the step
 /// options from the loaded layout, step resources, then the leaks, the step and the capture
@@ -892,13 +904,27 @@ fn make_multi(
     // free during each card's upload, and over-reserving per card (the cards
     // share the KV rows) only refuses a tight fit earlier, never corrupts it.
     let load = load_options(plan.reserve, fixed_admission);
+    // Experimental and default off. The original variable controls card 1;
+    // the new card-0 variable leaves that existing setting compatible.
+    let first_var = "Q36_P2P_HOST_EXPERT_BYTES_0";
+    let second_var = "Q36_P2P_HOST_EXPERT_BYTES";
+    let host_expert_bytes = [
+        p2p_host_expert_bytes(first_var, std::env::var_os(first_var).as_deref())?,
+        p2p_host_expert_bytes(second_var, std::env::var_os(second_var).as_deref())?,
+    ];
     let (stack, states) =
         CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
         let loader = BorrowedLoader::new(&stack.contexts()[card])?;
-        loaded.push(load_card_weights(&loader, &model.weights, set, card, load)?);
+        let budget = host_expert_bytes.get(card).copied().unwrap_or(0);
+        let weights = if budget != 0 {
+            load_card_weights_mapped(&loader, &model.weights, set, card, load, budget)?
+        } else {
+            load_card_weights(&loader, &model.weights, set, card, load)?
+        };
+        loaded.push(weights);
     }
     stages.begin("checking memory floors");
     for (card, context) in stack.contexts().iter().enumerate() {
@@ -911,7 +937,7 @@ fn make_multi(
             )));
         }
         eprintln!(
-            "q36 cuda: card {card} (device {}) weights resident ({} B), free after load {} B",
+            "q36 cuda: card {card} (device {}) weights loaded ({} B), free after load {} B",
             settings.cuda_devices[card],
             loads[card].upload_bytes(),
             info.free
@@ -1302,6 +1328,30 @@ mod chunk_prefill_flag_tests {
         context_staging_wanted, kv8_prefill_start_line,
     };
     use std::ffi::OsStr;
+
+    #[test]
+    fn p2p_expert_budgets_default_off_and_validate_each_card() {
+        let parse = super::p2p_host_expert_bytes;
+        assert_eq!(parse("card0", None).unwrap(), 0);
+        assert_eq!(parse("card1", None).unwrap(), 0);
+        assert_eq!(
+            parse("card0", Some(OsStr::new("2147483648"))).unwrap(),
+            2 << 30
+        );
+        assert_eq!(
+            parse("card1", Some(OsStr::new("4294967296"))).unwrap(),
+            4 << 30
+        );
+        for invalid in ["", "-1", "two", "18446744073709551616"] {
+            let error = parse("card0", Some(OsStr::new(invalid))).unwrap_err();
+            assert!(format!("{error:?}").contains("card0"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(parse("card0", Some(OsStr::from_bytes(&[0xff]))).is_err());
+        }
+    }
 
     #[test]
     fn wide_stage_defaults_on_and_zero_rolls_it_back() {

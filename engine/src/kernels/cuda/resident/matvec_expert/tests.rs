@@ -157,6 +157,89 @@ fn expert_launch(
 }
 
 #[test]
+#[ignore = "requires native CUDA; run explicitly under the GPU lease"]
+fn mapped_expert_weights_match_device_weights() {
+    assert!(testkit::device_present(
+        "mapped_expert_weights_match_device_weights"
+    ));
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let shape = (512, 64);
+    for (ty, gguf) in [
+        (QuantType::Q4K, crate::weights::GgufType::Q4K),
+        (QuantType::Q6K, crate::weights::GgufType::Q6K),
+    ] {
+        let seed = 0x9123_4567;
+        let mut rng = testkit::Rng::new(seed);
+        let bytes = reference::build_weight(ty, shape.1 * N_EXPERT, shape.0, &mut rng);
+        let (device, ids, shared, per_slot) = stack_rig(&ctx, &stream, ty, shape, seed);
+        let tensor = crate::kernels::cuda::QuantTensor {
+            name: "experts",
+            ty: gguf,
+            n_rows: shape.1 * N_EXPERT,
+            k: shape.0,
+            source_len: bytes.len(),
+        };
+        let pinned_before = ctx.live_owners().pinned;
+        let device_before = ctx.live_bytes();
+        let failed = ctx.upload_native_mapped(tensor, 4096, &mut |_, _| {
+            Err(EngError::Checkpoint("injected read failure".into()))
+        });
+        assert!(matches!(failed, Err(EngError::Checkpoint(_))));
+        assert_eq!(
+            ctx.live_owners().pinned,
+            pinned_before,
+            "failed read released mapping"
+        );
+        let mapped = ctx
+            .upload_native_mapped(tensor, 4096, &mut |at, out| {
+                out.copy_from_slice(&bytes[at..at + out.len()]);
+                Ok(())
+            })
+            .expect("mapped upload");
+        assert_eq!(ctx.live_owners().pinned, pinned_before + bytes.len());
+        assert_eq!(
+            ctx.live_bytes(),
+            device_before,
+            "mapped weights do not consume the device ledger"
+        );
+        for (per, x) in [(false, &shared), (true, &per_slot)] {
+            let n = shape.1 * N_USED * 4;
+            let actual = testkit::upload_filled(&ctx, 0xAA, n);
+            let expected = testkit::upload_filled(&ctx, 0xAA, n);
+            expert_launch(
+                &ctx, &stream, ty, &device, &ids, x, &expected, 0, shape, per, shape.1,
+            );
+            expert_launch(
+                &ctx,
+                &stream,
+                ty,
+                mapped.buffer(),
+                &ids,
+                x,
+                &actual,
+                0,
+                shape,
+                per,
+                shape.1,
+            );
+            stream.synchronize().expect("drain");
+            assert_eq!(
+                testkit::read_bytes(&ctx, &actual, n),
+                testkit::read_bytes(&ctx, &expected, n),
+                "{ty:?} per_slot={per}"
+            );
+        }
+        drop(mapped);
+        assert_eq!(
+            ctx.live_owners().pinned,
+            pinned_before,
+            "mapping released after use"
+        );
+    }
+}
+
+#[test]
 fn expert_needs_are_pure_and_exact() {
     let shape = ExpertShape {
         ty: QuantType::Q4K,

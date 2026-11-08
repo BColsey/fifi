@@ -401,6 +401,12 @@ export class ChatView {
       if (dom !== null) {
         dom.waiting.remove();
         dom.text.parentElement?.classList.remove("caret");
+        if (state === "error" && errorMessage !== undefined) {
+          const error = document.createElement("div");
+          error.className = "msg-error";
+          error.textContent = errorMessage;
+          dom.root.insertBefore(error, dom.meta);
+        }
         if (assistant.replyId !== undefined && assistant.traceSegs !== undefined) {
           dom.root.insertBefore(this.buildTraceButton(assistant), dom.meta);
         }

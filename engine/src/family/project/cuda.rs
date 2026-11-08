@@ -163,6 +163,7 @@ struct PlannedTensor<'w> {
     tensor: &'w GgufTensor,
     bytes: u64,
     slice: Option<plan::TensorSlice>,
+    mapped: bool,
 }
 
 /// One checkpoint tensor resident on the device.
@@ -459,8 +460,16 @@ impl<'a> BorrowedLoader<'a> {
         names: &[&str],
         options: LoadOptions<'_>,
         slices: &[(&str, SliceSpec)],
+        host_expert_bytes: u64,
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, slices)
+        load_inner(
+            &self.knobs(),
+            weights,
+            names,
+            options,
+            slices,
+            host_expert_bytes,
+        )
     }
 }
 
@@ -574,7 +583,7 @@ impl CudaProjector {
         names: &[&str],
         options: LoadOptions<'_>,
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, &[])
+        load_inner(&self.knobs(), weights, names, options, &[], 0)
     }
 
     /// Like [`Self::load`], uploading only the named tensors' slices: each
@@ -599,7 +608,7 @@ impl CudaProjector {
         options: LoadOptions<'_>,
         slices: &[(&str, SliceSpec)],
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, slices)
+        load_inner(&self.knobs(), weights, names, options, slices, 0)
     }
 
     /// Loads every tensor of `model` onto the device: the tiled tensors as
@@ -1128,12 +1137,41 @@ pub(crate) use exl3::{Exl3JobsIo, Exl3MatrixView};
 mod load_policy;
 #[cfg(test)]
 mod model_tests;
+
+/// Select whole eligible slices from the end of the load until the requested
+/// minimum is met. The only possible overshoot is one complete expert slice.
+fn select_host_experts(
+    candidates: &[(bool, u64)],
+    minimum: u64,
+) -> Result<(Vec<bool>, u64), EngError> {
+    let mut selected = vec![false; candidates.len()];
+    let mut bytes = 0u64;
+    for (index, &(eligible, size)) in candidates.iter().enumerate().rev() {
+        if bytes >= minimum {
+            break;
+        }
+        if eligible && size != 0 {
+            bytes = bytes.checked_add(size).ok_or_else(|| {
+                EngError::MemoryPlan("cuda mapped experts: selected bytes overflow".into())
+            })?;
+            selected[index] = true;
+        }
+    }
+    if bytes < minimum {
+        return Err(EngError::MemoryPlan(format!(
+            "cuda mapped experts: requested {minimum} bytes, but only {bytes} eligible bytes exist"
+        )));
+    }
+    Ok((selected, bytes))
+}
+
 fn load_inner(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
     names: &[&str],
     options: LoadOptions<'_>,
     slices: &[(&str, SliceSpec)],
+    host_expert_bytes: u64,
 ) -> Result<CudaWeights, EngError> {
     knobs.context.ensure_usable()?;
     if options.layout == WeightLayout::Exl3 {
@@ -1190,7 +1228,7 @@ fn load_inner(
             index.insert(name.to_owned(), index.len());
         }
     }
-    let tensors = names
+    let mut tensors = names
         .iter()
         .map(|name| {
             // A hybrid-overridden name plans (admission bytes, tile-row stacks) as tiles.
@@ -1206,6 +1244,7 @@ fn load_inner(
                     tensor,
                     bytes: whole_bytes,
                     slice: None,
+                    mapped: false,
                 }),
                 Some(spec) => {
                     let slice = plan::plan_slice_rows(
@@ -1220,15 +1259,67 @@ fn load_inner(
                         tensor,
                         bytes,
                         slice: Some(slice),
+                        mapped: false,
                     })
                 }
             }
         })
         .collect::<Result<Vec<PlannedTensor<'_>>, EngError>>()?;
+    let candidates: Vec<_> = tensors
+        .iter()
+        .map(|t| {
+            let name = t.tensor.name();
+            let eligible = layout == WeightLayout::Native
+                && t.slice.is_some()
+                && t.tensor.dims().len() == 3
+                && [
+                    "ffn_gate_exps.weight",
+                    "ffn_up_exps.weight",
+                    "ffn_down_exps.weight",
+                ]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+                && matches!(
+                    t.tensor.ggml_type(),
+                    GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50
+                );
+            (eligible, t.bytes)
+        })
+        .collect();
+    let (mapped, host_bytes) = select_host_experts(&candidates, host_expert_bytes)?;
+    for (tensor, mapped) in tensors.iter_mut().zip(mapped) {
+        tensor.mapped = mapped;
+    }
+    if host_bytes != 0 {
+        let available = crate::capability::probe::probe_host()
+            .mem_available_bytes
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                EngError::MemoryPlan(
+                    "cuda mapped experts: host memory availability is unknown".into(),
+                )
+            })?;
+        let needed = host_bytes.checked_add(1 << 30).ok_or_else(|| {
+            EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
+        })?;
+        if needed > available {
+            return Err(EngError::MemoryPlan(format!(
+                "cuda mapped experts: need {needed} host bytes including 1 GiB free, have {available}"
+            )));
+        }
+        eprintln!(
+            "cuda mapped experts: placing {host_bytes} bytes in host memory (host available {available} bytes)"
+        );
+    }
     let total = tensors
         .iter()
         .try_fold(0u64, |sum, planned_tensor| {
-            sum.checked_add(planned_tensor.bytes)
+            sum.checked_add(if planned_tensor.mapped {
+                0
+            } else {
+                planned_tensor.bytes
+            })
         })
         .ok_or_else(|| EngError::MemoryPlan("cuda admission: tensors overflow u64".into()))?;
     let policy = LoadPolicy::for_device(knobs.integrated);
@@ -1343,6 +1434,7 @@ fn transfer(
                             layout
                         },
                         planned_tensor.slice.as_ref(),
+                        planned_tensor.mapped,
                     )
                 },
                 || recover(weights.file(), policy.retry_pause),
@@ -1470,11 +1562,12 @@ fn upload(
     tensor: &GgufTensor,
     layout: WeightLayout,
     slice: Option<&plan::TensorSlice>,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
     let name = tensor.name();
     match (tensor.ggml_type(), layout) {
         (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
-            upload_quant(knobs, weights, tensor, name, ty, layout, slice)
+            upload_quant(knobs, weights, tensor, ty, layout, slice, mapped)
         }
         (ty @ (GgufType::F32 | GgufType::F16), _) => {
             let (_, bytes) = weights.read_tensor(name)?;
@@ -1505,13 +1598,14 @@ fn upload_quant(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
     tensor: &GgufTensor,
-    name: &str,
     ty: GgufType,
     layout: WeightLayout,
     slice: Option<&plan::TensorSlice>,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
+    let name = tensor.name();
     if let Some(slice) = slice {
-        return upload_quant_sliced(knobs, weights, tensor, name, ty, slice);
+        return upload_quant_sliced(knobs, weights, tensor, name, ty, slice, mapped);
     }
     let (n_rows, k) = matrix_shape(tensor)?;
     let experts = stack_depth(tensor)?;
@@ -1568,6 +1662,7 @@ fn upload_quant_sliced(
     name: &str,
     ty: GgufType,
     slice: &plan::TensorSlice,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
     let shape_error =
         || EngError::Checkpoint(format!("tensor {name} has an unusable sliced shape"));
@@ -1595,14 +1690,21 @@ fn upload_quant_sliced(
         source_len,
     };
     let reader = SliceReader::new(&slice.segments);
-    let weight = knobs
-        .context
-        .upload_native(quant, knobs.chunk_limit, &mut |at, buf| {
-            reader.fill(at as u64, buf, &mut |offset, part| {
-                weights.read_range(name, offset, part)
-            })
-        })?
-        .with_experts(experts);
+    let mut fill = |at, buf: &mut [u8]| {
+        reader.fill(at as u64, buf, &mut |offset, part| {
+            weights.read_range(name, offset, part)
+        })
+    };
+    let weight = if mapped {
+        knobs
+            .context
+            .upload_native_mapped(quant, knobs.chunk_limit, &mut fill)?
+    } else {
+        knobs
+            .context
+            .upload_native(quant, knobs.chunk_limit, &mut fill)?
+    }
+    .with_experts(experts);
     Ok(CudaWeight::Native {
         name: name.to_owned(),
         weight,

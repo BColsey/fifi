@@ -20,7 +20,7 @@ impl DeviceBuffer {
     /// Returns `BadRequest` for an empty range, a range past the end of the
     /// allocation, or a buffer that was already freed.
     pub(crate) fn range(&self, offset: usize, bytes: usize) -> Result<DeviceRange<'_>, EngError> {
-        let Some(raw) = self.raw.as_ref() else {
+        let Some(raw) = self.raw_view() else {
             return Err(EngError::BadRequest(
                 "the CUDA buffer was already freed".to_owned(),
             ));

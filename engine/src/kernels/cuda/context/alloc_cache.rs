@@ -234,6 +234,7 @@ impl AllocCache {
     fn wrap(self: &Rc<Self>, raw: RawDevice) -> DeviceBuffer {
         DeviceBuffer {
             raw: Some(raw),
+            mapped: None,
             lease: Rc::clone(&self.lease),
             _thread_confined: std::marker::PhantomData,
             alloc_cache: Some(Rc::clone(self)),
