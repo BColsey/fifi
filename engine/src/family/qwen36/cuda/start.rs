@@ -679,6 +679,25 @@ pub(super) fn load_options(kv_cache: u64, fixed_admission: bool) -> LoadOptions<
     }
 }
 
+/// P2P allocates each card's complete resident state before admitting its
+/// weights. Optionally avoid reserving those KV bytes a second time while
+/// preserving the per-card post-load free-memory floor at admission too.
+fn p2p_resident_load_options(
+    kv_cache: u64,
+    fixed_admission: bool,
+    use_resident_kv: bool,
+) -> LoadOptions<'static> {
+    let mut options = load_options(kv_cache, fixed_admission);
+    if use_resident_kv {
+        options.reserve.kv_cache = 0;
+        options.reserve.headroom = options.reserve.headroom.max(
+            u64::try_from(min_free_after_load()?)
+                .map_err(|_| EngError::MemoryPlan("min free after load overflows u64".into()))?,
+        );
+    }
+    options
+}
+
 fn open_gguf(artifact: &Path, verify: bool) -> Result<(GgufModel, PathBuf), EngError> {
     let gguf = pinned_gguf(artifact);
     check_gguf_identity(&gguf, verify)?;
@@ -900,10 +919,14 @@ fn make_multi(
         .ggml_type();
     let loads = card_loads(&table, &inventory, quant)?;
     let fixed_admission = plan.modes.fixed_admission;
-    // The load reserve keeps the single-device figure: it holds the KV bytes
-    // free during each card's upload, and over-reserving per card (the cards
-    // share the KV rows) only refuses a tight fit earlier, never corrupts it.
-    let load = load_options(plan.reserve, fixed_admission);
+    // The historical reserve keeps a second copy of the full KV charge even
+    // though CardStack allocates it before weight admission. The experimental
+    // switch below can remove that duplicate charge after allocation.
+    let resident_kv = prefill_flag(
+        "Q36_P2P_PREALLOCATED_KV",
+        false,
+        std::env::var_os("Q36_P2P_PREALLOCATED_KV").as_deref(),
+    )?;
     // Experimental and default off. The original variable controls card 1;
     // the new card-0 variable leaves that existing setting compatible.
     let first_var = "Q36_P2P_HOST_EXPERT_BYTES_0";
@@ -914,6 +937,14 @@ fn make_multi(
     ];
     let (stack, states) =
         CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
+    let load = p2p_resident_load_options(plan.reserve, fixed_admission, resident_kv);
+    if resident_kv {
+        eprintln!(
+            "q36 cuda: P2P load admission counts the already-allocated KV once; \
+             reserve at least {} free bytes per card",
+            load.reserve.headroom
+        );
+    }
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
@@ -1328,6 +1359,60 @@ mod chunk_prefill_flag_tests {
         context_staging_wanted, kv8_prefill_start_line,
     };
     use std::ffi::OsStr;
+
+    #[test]
+    fn p2p_resident_kv_admission_keeps_the_free_memory_floor() {
+        use crate::kernels::cuda::plan::{Demand, admit};
+
+        let name = "Q36_P2P_PREALLOCATED_KV";
+        assert!(!super::prefill_flag(name, false, None).unwrap());
+        assert!(!super::prefill_flag(name, false, Some(OsStr::new("0"))).unwrap());
+        assert!(super::prefill_flag(name, false, Some(OsStr::new("1"))).unwrap());
+        assert!(super::prefill_flag(name, false, Some(OsStr::new("other"))).is_err());
+
+        let kv = 2u64 << 30;
+        let tensors = 3u64 << 30;
+        let floor = super::min_free_after_load().unwrap() as u64;
+        for fixed in [false, true] {
+            let original = super::load_options(kv, fixed);
+            let disabled = super::p2p_resident_load_options(kv, fixed, false);
+            assert_eq!(disabled.reserve.kv_cache, original.reserve.kv_cache);
+            assert_eq!(disabled.reserve.work, original.reserve.work);
+            assert_eq!(disabled.reserve.headroom, original.reserve.headroom);
+
+            let enabled = super::p2p_resident_load_options(kv, fixed, true);
+            assert_eq!(enabled.reserve.kv_cache, 0);
+            assert_eq!(enabled.reserve.work, original.reserve.work);
+            assert!(enabled.reserve.headroom >= floor);
+            let demand = Demand {
+                tensors,
+                kv_cache: enabled.reserve.kv_cache,
+                work: enabled.reserve.work,
+                headroom: enabled.reserve.headroom,
+            };
+            let required = tensors + enabled.reserve.headroom;
+            assert!(admit(&demand, required).is_ok());
+            assert!(admit(&demand, required - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn p2p_kv_charge_matches_the_resident_state_at_128k() {
+        use super::super::state_layout::StateLayout;
+
+        let inventory = super::Inventory::for_spec(&super::QWEN3_6_35B_A3B).unwrap();
+        let shape =
+            super::HostShape::from_spec(&super::QWEN3_6_35B_A3B, super::ROTARY_DIM).unwrap();
+        let dims = super::StepDims::new(&shape, &inventory).unwrap();
+        for mode in [super::KvMode::Fp16, super::KvMode::Int8G32] {
+            let options = super::step_options(131072, super::WeightLayout::Native, mode).unwrap();
+            let state = StateLayout::new(&dims, &options).unwrap();
+            assert_eq!(
+                state.kv.total as u64,
+                super::kv_cache_bytes(131072, mode).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn p2p_expert_budgets_default_off_and_validate_each_card() {
