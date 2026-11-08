@@ -65,7 +65,10 @@ use crate::{
         qwen36::{cuda::exl3_source::PackReader, tiered::budget::KvPlan},
         session::DecodeSession,
     },
-    kernels::cuda::DeviceBuffer,
+    kernels::cuda::{
+        CudaContext, DeviceBuffer,
+        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW},
+    },
     sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
     tokenizer::TokenizerBundle,
     weights::exl3::Checkpoint,
@@ -73,6 +76,31 @@ use crate::{
 
 /// Threads of the host PLE projections (rows split over them).
 const PLE_THREADS: usize = 8;
+
+/// The id-indexed options Flash-Next serves its routed experts with: the DP4A decode of codebook 2
+/// (the codebook of this pack) and one launch for the 20 gate and up pairs of ten picks. Both write
+/// the bytes of the default launches; a set `FIFI_EXL3_DP4A` or `FIFI_EXL3_INDEXED_PAIRS` still wins
+/// for its own option.
+const SERVED_INDEXED: IndexedOptions = IndexedOptions {
+    dp4a: true,
+    pairs20: true,
+};
+
+/// Registers the kernels the Flash-Next decode runs on its context: the wide single-row kernel for
+/// every dense projection and the id-indexed options of the routed experts. Qwen3.6 and Flint
+/// register their own; a bad launch switch or an option the kernel cannot combine with is refused
+/// here, before any weight is uploaded.
+fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
+    ctx.set_single_row_default(SERVED_SINGLE_ROW);
+    ctx.set_indexed_default(SERVED_INDEXED);
+    ctx.check_single_gather()?;
+    eprintln!(
+        "flash-next cuda: single-row kernel {}{}",
+        ctx.single_row_kernel_name()?,
+        ctx.single_gather_suffix()
+    );
+    Ok(())
+}
 
 static CUDA_ENGINE_BUILT: AtomicBool = AtomicBool::new(false);
 
@@ -275,6 +303,7 @@ pub(super) fn build_driver(
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
+    register_served_kernels(projector.context())?;
     let free_vram = projector.memory_info()?.free as u64;
 
     stage("opening the pack");
@@ -439,4 +468,44 @@ pub(super) fn build_driver(
         began.elapsed().as_secs_f64()
     );
     Ok(driver)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The served kernels are registered and checked before the pack is opened and before any
+    /// stream or weight exists, in the order set default, set options, check.
+    #[test]
+    fn the_served_kernels_are_registered_and_checked_before_the_first_upload() {
+        let source = include_str!("start.rs");
+        let register = &source[source
+            .find("fn register_served_kernels(")
+            .expect("register_served_kernels")..];
+        let single = register
+            .find("ctx.set_single_row_default(")
+            .expect("the single-row default");
+        let indexed = register
+            .find("ctx.set_indexed_default(")
+            .expect("the indexed default");
+        let check = register
+            .find("ctx.check_single_gather()?")
+            .expect("the switch check");
+        assert!(
+            single < indexed && indexed < check,
+            "the defaults must be registered before check_single_gather()"
+        );
+        let build = &source[source
+            .find("pub(super) fn build_driver(")
+            .expect("build_driver")..];
+        let call = build
+            .find("register_served_kernels(projector.context())?")
+            .expect("the registration in build_driver");
+        let pack = build
+            .find("stage(\"opening the pack\")")
+            .expect("the pack open");
+        let stream = build.find("ctx.stream()").expect("the stream");
+        assert!(
+            call < pack && call < stream,
+            "register_served_kernels() must precede the pack open and the first stream"
+        );
+    }
 }

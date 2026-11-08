@@ -155,6 +155,10 @@ pub(crate) struct CudaContext {
     /// context: set by the session that owns it, so two engines in one process choose apart.
     pub(in crate::kernels::cuda) exl3_single_row_default:
         std::cell::Cell<Option<super::resident::exl3::SingleRow>>,
+    /// The id-indexed options an unset `FIFI_EXL3_DP4A` or `FIFI_EXL3_INDEXED_PAIRS` leaves to this
+    /// context: set by the session that owns it.
+    pub(in crate::kernels::cuda) exl3_indexed_default:
+        std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
     /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
@@ -380,6 +384,7 @@ impl CudaContext {
             _thread_confined: PhantomData,
             alloc_cache: None,
             exl3_single_row_default: std::cell::Cell::new(None),
+            exl3_indexed_default: std::cell::Cell::new(None),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]

@@ -19,7 +19,7 @@ use std::ffi::OsStr;
 use super::{
     DP4A_VAR, Exl3IndexedCall, Exl3LinearCall, INDEXED_CAPACITY, INDEXED_PAIRS_VAR, IndexedOptions,
     SINGLE_GATHER_VAR, SingleRow, check_indexed_with, dp4a_from_env, indexed_from_env,
-    indexed_pairs_from_env,
+    indexed_pairs_from_env, merge_indexed,
 };
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
@@ -58,23 +58,39 @@ fn the_switches_parse_strictly() {
     }
 }
 
-/// The pair of switches the environment read goes through: unset is off, each switch selects
-/// its option alone, and a bad value of either refuses the pair and names that switch.
+/// A context default fills the options whose variable is unset, and a set variable wins for its
+/// own option alone: `0` and `16` switch a registered default off, `1` and `20` switch one on.
+#[test]
+fn a_set_variable_wins_over_the_context_default_for_its_own_option() {
+    assert_eq!(merge_indexed(OFF, (None, None)), OFF);
+    assert_eq!(merge_indexed(BOTH, (None, None)), BOTH);
+    assert_eq!(merge_indexed(BOTH, (Some(false), None)), PAIRS20);
+    assert_eq!(merge_indexed(BOTH, (None, Some(false))), DP4A);
+    assert_eq!(merge_indexed(BOTH, (Some(false), Some(false))), OFF);
+    assert_eq!(merge_indexed(OFF, (Some(true), None)), DP4A);
+    assert_eq!(merge_indexed(DP4A, (None, Some(true))), BOTH);
+}
+
+/// The pair of switches the environment read goes through (the function the production read
+/// calls): unset is off, each switch selects its option alone, and a bad value of either refuses
+/// the pair and names that switch.
 #[test]
 fn the_two_switches_select_their_options_independently() {
     let os = |v: &'static str| Some(OsStr::new(v));
-    assert_eq!(indexed_from_env(None, None), Ok(OFF));
-    assert_eq!(indexed_from_env(os("1"), None), Ok(DP4A));
-    assert_eq!(indexed_from_env(None, os("20")), Ok(PAIRS20));
-    assert_eq!(indexed_from_env(os("1"), os("20")), Ok(BOTH));
-    assert_eq!(indexed_from_env(os("0"), os("16")), Ok(OFF));
+    let read =
+        |dp4a, pairs| indexed_from_env(dp4a, pairs).map(|explicit| merge_indexed(OFF, explicit));
+    assert_eq!(read(None, None), Ok(OFF));
+    assert_eq!(read(os("1"), None), Ok(DP4A));
+    assert_eq!(read(None, os("20")), Ok(PAIRS20));
+    assert_eq!(read(os("1"), os("20")), Ok(BOTH));
+    assert_eq!(read(os("0"), os("16")), Ok(OFF));
     for (dp4a, pairs, var) in [
         (os("on"), None, DP4A_VAR),
         (os("1"), os("32"), INDEXED_PAIRS_VAR),
         (None, os(""), INDEXED_PAIRS_VAR),
         (os("2"), os("20"), DP4A_VAR),
     ] {
-        let error = indexed_from_env(dp4a, pairs).expect_err("a bad value");
+        let error = read(dp4a, pairs).expect_err("a bad value");
         assert!(error.contains(var), "{dp4a:?} {pairs:?}: {error}");
     }
 }
@@ -115,16 +131,27 @@ fn an_option_refuses_a_wide_kernel_of_more_than_one_tile() {
         // The refusal names the switches that are on, and the kernel switch to change.
         for options in [DP4A, PAIRS20, BOTH] {
             let error = check_indexed_with(kernel, options).expect_err("a wide kernel");
-            let text = format!("{error:?}");
+            let whole = format!("{error:?}");
+            // The first part names the options that are on; the tail names both off values.
+            let (text, tail) = whole.split_once(", or turn").expect("the off values");
             assert!(
                 text.contains(SINGLE_GATHER_VAR),
-                "{kernel:?} {options:?}: {text}"
+                "{kernel:?} {options:?}: {whole}"
             );
-            assert_eq!(text.contains(DP4A_VAR), options.dp4a, "{options:?}: {text}");
+            assert_eq!(
+                text.contains(DP4A_VAR),
+                options.dp4a,
+                "{options:?}: {whole}"
+            );
             assert_eq!(
                 text.contains(INDEXED_PAIRS_VAR),
                 options.pairs20,
-                "{options:?}: {text}"
+                "{options:?}: {whole}"
+            );
+            assert!(
+                tail.contains(&format!("{DP4A_VAR}=0"))
+                    && tail.contains(&format!("{INDEXED_PAIRS_VAR}=16")),
+                "{options:?}: {whole}"
             );
         }
     }
@@ -164,6 +191,41 @@ fn the_session_check_and_the_load_line_see_the_context_options() {
         ctx.single_gather_suffix(),
         " single_gather=on single_kernel=wide1"
     );
+}
+
+/// A default a session registers on its context reaches the session check and the load line, and
+/// another context in the process keeps the default launch: the real path of the Flash-Next start.
+/// Skipped, not passed, when a launch switch is set in the environment.
+#[test]
+fn a_registered_default_reaches_the_session_check_and_stays_on_its_context() {
+    if !testkit::device_present("EXL3 indexed default session check") {
+        return;
+    }
+    let set: Vec<&str> = [SINGLE_GATHER_VAR, DP4A_VAR, INDEXED_PAIRS_VAR]
+        .into_iter()
+        .filter(|var| std::env::var_os(var).is_some())
+        .collect();
+    if !set.is_empty() {
+        eprintln!("skipped: {set:?} set in the environment");
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    ctx.set_indexed_default(BOTH);
+    ctx.set_single_row_default(SingleRow::Wide(2));
+    assert!(
+        ctx.check_single_gather().is_err(),
+        "the default options with two tiles"
+    );
+    ctx.set_single_row_default(SingleRow::Wide(1));
+    assert!(ctx.check_single_gather().is_ok());
+    assert_eq!(
+        ctx.single_gather_suffix(),
+        " single_gather=on single_kernel=wide1 exl3_dp4a=on exl3_indexed_pairs=20"
+    );
+    assert_eq!(ctx.exl3_indexed_capacity(), 20);
+    let other = CudaContext::new().expect("second context");
+    assert_eq!(other.exl3_indexed_capacity(), 16);
+    assert_eq!(other.single_gather_suffix(), "");
 }
 
 /// 1024 + s is an F16 integer for every byte sum s (0 to 1020), and its bits are 0x6400 + s:

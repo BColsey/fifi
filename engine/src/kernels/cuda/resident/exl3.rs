@@ -31,7 +31,7 @@ fn midrows_enabled(rows: usize, legacy: Option<&std::ffi::OsStr>) -> bool {
 
 /// Environment switch of the single-row grouped path. Unset takes the default of the context the
 /// projection runs on (the shuffle kernel, or the kernel its session registered with
-/// [`CudaContext::set_single_row_default`]: the Qwen3.6 EXL3 start registers `wide1`); `off` selects the shuffle kernel explicitly. `1` sends every 1..=8 row call
+/// [`CudaContext::set_single_row_default`]: the Qwen3.6 EXL3 start, the Flint session and the Flash-Next CUDA decode register `wide1`); `off` selects the shuffle kernel explicitly. `1` sends every 1..=8 row call
 /// of `exl3_linear` (split-K 2) through the shared-table gather kernel as a one-group grouped
 /// launch; `wide1`, `wide2` and `wide4` use the wide kernel with that many adjacent 16-column tiles
 /// per block (a call whose `n` is not a multiple of `16 * cols` takes the gather kernel). The
@@ -47,11 +47,13 @@ const INDEXED_CAPACITY: usize = 16;
 const INDEXED_OPTION_CAPACITY: usize = 20;
 
 /// Opt-in switch of the DP4A decode of book 2 in the id-indexed launch: unset or `0` keeps the
-/// default decode, `1` decodes with one packed byte dot product. Same bytes. Process-wide, read
+/// default decode, `1` decodes with one packed byte dot product. Same bytes. A set value wins over
+/// the default a session registered (the Flash-Next CUDA decode turns it on). Process-wide, read
 /// once, strict: any other value is refused.
 pub(crate) const DP4A_VAR: &str = "FIFI_EXL3_DP4A";
 /// Opt-in switch of the 20-pair id-indexed launch: unset or `16` keeps launches of at most 16
-/// pairs, `20` takes up to 20 pairs in one launch. Same bytes. Process-wide, read once, strict.
+/// pairs, `20` takes up to 20 pairs in one launch. Same bytes. A set value wins over the default a
+/// session registered (the Flash-Next CUDA decode takes 20). Process-wide, read once, strict.
 pub(crate) const INDEXED_PAIRS_VAR: &str = "FIFI_EXL3_INDEXED_PAIRS";
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
@@ -158,21 +160,22 @@ pub(crate) fn indexed_pairs_from_env(
     }
 }
 
-/// The options the values of [`DP4A_VAR`] and [`INDEXED_PAIRS_VAR`] select (`None`: unset, off),
-/// or the refusal of the first bad value.
+/// What the environment says about the DP4A option and the 20-pair option (`None`: unset).
+type IndexedExplicit = (Option<bool>, Option<bool>);
+
+/// What the values of [`DP4A_VAR`] and [`INDEXED_PAIRS_VAR`] say about each option (`None`: unset),
+/// or the refusal of the first bad value. The environment read and the tests both go through it.
 fn indexed_from_env(
     dp4a: Option<&std::ffi::OsStr>,
     pairs: Option<&std::ffi::OsStr>,
-) -> Result<IndexedOptions, String> {
-    Ok(IndexedOptions {
-        dp4a: dp4a_from_env(dp4a)?.unwrap_or(false),
-        pairs20: indexed_pairs_from_env(pairs)?.unwrap_or(false),
-    })
+) -> Result<IndexedExplicit, String> {
+    Ok((dp4a_from_env(dp4a)?, indexed_pairs_from_env(pairs)?))
 }
 
-/// The options the environment selects, or the refusal of a bad value. Read once per process.
-fn indexed_explicit() -> Result<IndexedOptions, EngError> {
-    static EXPLICIT: std::sync::OnceLock<Result<IndexedOptions, String>> =
+/// What the environment says about each option, or the refusal of a bad value. Read once per
+/// process.
+fn indexed_explicit() -> Result<IndexedExplicit, EngError> {
+    static EXPLICIT: std::sync::OnceLock<Result<IndexedExplicit, String>> =
         std::sync::OnceLock::new();
     EXPLICIT
         .get_or_init(|| {
@@ -183,6 +186,15 @@ fn indexed_explicit() -> Result<IndexedOptions, EngError> {
         })
         .clone()
         .map_err(EngError::BadRequest)
+}
+
+/// The options a context runs with: each option takes the environment's value when its variable is
+/// set (so `0` and `16` switch a registered default off) and the context's default otherwise.
+fn merge_indexed(default: IndexedOptions, explicit: IndexedExplicit) -> IndexedOptions {
+    IndexedOptions {
+        dp4a: explicit.0.unwrap_or(default.dp4a),
+        pairs20: explicit.1.unwrap_or(default.pairs20),
+    }
 }
 
 /// Refuses options the single-row kernel `kernel` cannot run with: both options run one tile per
@@ -205,7 +217,7 @@ fn check_indexed_with(kernel: SingleRow, options: IndexedOptions) -> Result<(), 
     };
     Err(EngError::BadRequest(format!(
         "{} {verb} one tile per block: set {SINGLE_GATHER_VAR} to unset, \"off\", \"1\" or \
-         \"wide1\" with {them}",
+         \"wide1\" with {them}, or turn {them} off ({DP4A_VAR}=0, {INDEXED_PAIRS_VAR}=16)",
         on.join(" and ")
     )))
 }
@@ -288,15 +300,29 @@ impl CudaContext {
             .map_or(INDEXED_CAPACITY, IndexedOptions::capacity)
     }
 
-    /// The options the id-indexed launches of this context run with: the environment's
-    /// ([`DP4A_VAR`], [`INDEXED_PAIRS_VAR`]), or in a test build the options a test or bench set on
-    /// the context, which win over the environment.
+    /// The options the id-indexed launches of this context run with: per option the environment's
+    /// ([`DP4A_VAR`], [`INDEXED_PAIRS_VAR`]) when set, else the default the session registered
+    /// ([`Self::set_indexed_default`]), else off; in a test build the options a test or bench set
+    /// on the context win over both.
     pub(crate) fn exl3_indexed_options(&self) -> Result<IndexedOptions, EngError> {
         #[cfg(test)]
         if let Some(options) = self.exl3_indexed_options.get() {
             return Ok(options);
         }
-        indexed_explicit()
+        Ok(merge_indexed(
+            self.exl3_indexed_default
+                .get()
+                .unwrap_or(IndexedOptions::OFF),
+            indexed_explicit()?,
+        ))
+    }
+
+    /// Registers the id-indexed options an unset [`DP4A_VAR`] or [`INDEXED_PAIRS_VAR`] leaves to
+    /// this context: set by the session that owns it, like [`Self::set_single_row_default`], so a
+    /// variable that is set still wins for its own option and another context in the process is
+    /// unaffected.
+    pub(crate) fn set_indexed_default(&self, options: IndexedOptions) {
+        self.exl3_indexed_default.set(Some(options));
     }
 
     /// Sets the options of this context's id-indexed launches (test builds only); `None` returns
