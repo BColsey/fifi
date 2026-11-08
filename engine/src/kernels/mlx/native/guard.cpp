@@ -1818,6 +1818,79 @@ extern "C" int inference_mlx_act_mul(
 }
 
 
+// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection of
+// one router probability row plus the renormalized gates in ONE launch,
+// replacing negate, argsort, slice, clamp, take, the k-sum, the divide and the
+// reshape of the op chain. `dims` is [rows, experts, top_k, k_max, renorm].
+// Launch contract: threadgroup (experts, 1, 1) = one row per group, grid
+// (experts, rows, 1); experts must be a nonzero multiple of 32 at most 1024.
+// The ids are U32 in rank order (`[k]` or `[B, k]` per `ids_shape`), the gates
+// F32 (`[k, 1, 1]` or `[B, k, 1, 1]` per `gates_shape`); both are already
+// bounded below the expert count by construction.
+static int router_topk_kernel_call(
+    mlx_array* ids_out, mlx_array* gates_out, mlx_array probs, const int* dims,
+    const int* ids_shape, int ids_rank, const int* gates_shape, int gates_rank,
+    const char* source, mlx_stream stream) noexcept {
+  const int rows = dims[0], experts = dims[1], top_k = dims[2];
+  const int k_max = dims[3], renorm = dims[4];
+  const char* input_names[] = {"probs", "e_count", "k", "renorm"};
+  const char* output_names[] = {"ids_out", "gates_out"};
+  mlx_vector_string in_names = mlx_vector_string_new_data(input_names, 4);
+  mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 2);
+  mlx_fast_metal_kernel kernel =
+      mlx_fast_metal_kernel_new("moe_router_topk_v1", in_names, out_names,
+                               source, kFusedPrefillHeader, true, false);
+  mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+  mlx_array e_arg = mlx_array_new_int(experts);
+  mlx_array k_arg = mlx_array_new_int(top_k);
+  mlx_array renorm_arg = mlx_array_new_int(renorm);
+  const mlx_array operands[4] = {probs, e_arg, k_arg, renorm_arg};
+  mlx_vector_array inputs = mlx_vector_array_new_data(operands, 4);
+  mlx_vector_array outputs = mlx_vector_array_new();
+  int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                e_arg.ctx && k_arg.ctx && renorm_arg.ctx && inputs.ctx &&
+                outputs.ctx) ? 0 : 1;
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, ids_shape, ids_rank,
+          MLX_UINT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, gates_shape,
+          gates_rank, MLX_FLOAT32);
+  if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(
+      config, experts, rows, 1);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_set_thread_group(config, experts, 1, 1);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_template_arg_int(config, "K_MAX", k_max);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+  if (status == 0 && mlx_vector_array_size(outputs) != 2) status = 1;
+  if (status == 0) status = mlx_vector_array_get(ids_out, outputs, 0);
+  if (status == 0) status = mlx_vector_array_get(gates_out, outputs, 1);
+  int released = mlx_vector_array_free(outputs);
+  released |= mlx_vector_array_free(inputs);
+  released |= mlx_array_free(renorm_arg);
+  released |= mlx_array_free(k_arg);
+  released |= mlx_array_free(e_arg);
+  mlx_fast_metal_kernel_config_free(config);
+  mlx_fast_metal_kernel_free(kernel);
+  released |= mlx_vector_string_free(out_names);
+  released |= mlx_vector_string_free(in_names);
+  return status != 0 ? status : released;
+}
+
+extern "C" int inference_mlx_router_topk(
+    mlx_array* ids_out, mlx_array* gates_out, mlx_array probs, const int* dims,
+    const int* ids_shape, int ids_rank, const int* gates_shape, int gates_rank,
+    const char* source, mlx_stream stream) noexcept {
+  return run_selected_operation(ids_out, stream, [&] {
+    return router_topk_kernel_call(
+        ids_out, gates_out, probs, dims, ids_shape, ids_rank, gates_shape,
+        gates_rank, source, stream);
+  });
+}
+
+
 // The gdn_post fused kernel (Q36_FUSED_PREFILL=1): gated RMS norm and output
 // gate in one kernel - o = bf16(rms_norm(core) * silu(z)) - replacing
 // rms_norm, silu, mul, and the cast (5 kernels). Launch contract: threadgroup
@@ -2717,6 +2790,7 @@ struct CompileMoePayload {
   float eps;  // the RMS norm epsilon of the folded post-attention norm
   mlx_dtype act;
   mlx_stream stream;
+  const char* router_source;  // borrowed Metal body of the fused router top-k (Rust static)
   int mode[6];   // shared gate, up, down, then the gate, up, down stacks
   int group[6];
   int bits[6];
@@ -2870,6 +2944,22 @@ static int compile_moe_rows(
     status = inference_mlx_matmul(&logits.value, x_normed.value, in.values[1], s);
   // As in B=1, the F32 router promotes BF16 products before the precise F32 softmax.
   if (status == 0) status = inference_mlx_softmax(&probs.value, logits.value, true, s);
+  // The health reduce keeps its own MLX accumulation order in both router paths.
+  if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
+  // The fused router top-k kernel replaces the eight selection and renorm ops below at the
+  // decode contract (B = 1 with a multiple-of-32 expert count up to 1024 and top-k up to 32);
+  // the ids and the gates come out in the exact shapes and the same rank order, tie rule, and
+  // gate rounding as the op chain, which the batched shapes keep using.
+  const bool router_kernel =
+      batch == 1 && p->experts % 32 == 0 && p->experts <= 1024 && p->top_k <= 32;
+  if (status == 0 && router_kernel) {
+    const int rk_dims[5] = {batch, p->experts, p->top_k,
+                            p->top_k > 8 ? p->top_k : 8, p->renorm};
+    const int rk_ids[1] = {p->top_k};
+    status = router_topk_kernel_call(
+        &clamped.value, &gates.value, probs.value, rk_dims, rk_ids, 1,
+        gates_shape, 4, p->router_source, s);
+  } else if (status == 0) {
   if (status == 0) status = inference_mlx_negative(&negated.value, probs.value, s);
   if (status == 0) status = inference_mlx_argsort_axis(&order.value, negated.value, 1, s);
   if (status == 0)
@@ -2878,7 +2968,6 @@ static int compile_moe_rows(
     status = inference_mlx_clamp_indices(&clamped.value, ids.value, expert_upper, s);
   if (status == 0)
     status = inference_mlx_resident_take_along_axis(&top.value, probs.value, clamped.value, 1, s);
-  if (status == 0) status = inference_mlx_sum_axis(&health.value, probs.value, 1, false, s);
   if (status == 0 && p->renorm != 0) {
     status = inference_mlx_sum_axis(&renorm_sum.value, top.value, 1, true, s);
     if (status == 0) status = inference_mlx_divide(&gates0.value, top.value, renorm_sum.value, s);
@@ -2886,6 +2975,7 @@ static int compile_moe_rows(
   if (status == 0)
     status = inference_mlx_reshape(
         &gates.value, p->renorm != 0 ? gates0.value : top.value, gates_shape, 4, s);
+  }
   const int moe_lhs = compile_moe_lhs_index(batch);
   if (status == 0) status = inference_mlx_reshape(&x3.value, x_normed.value, x3_shape, 3, s);
   if (status == 0)
@@ -3875,7 +3965,8 @@ extern "C" int inference_mlx_compile_delta_rows(
 extern "C" int inference_mlx_compile_moe_block(
     mlx_array* out, mlx_array* ids, mlx_array* gates, mlx_array* health, const mlx_array* inputs,
     size_t inputs_num, const int* dims, const int* quant, float eps, mlx_dtype activation,
-    uintptr_t owner, uintptr_t fun_id, mlx_stream stream) noexcept {
+    const char* router_source, uintptr_t owner, uintptr_t fun_id,
+    mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
     if (inputs_num != 22) {
       return 1;
@@ -3895,6 +3986,7 @@ extern "C" int inference_mlx_compile_moe_block(
     payload->renorm = dims[3];
     payload->eps = eps;
     payload->act = activation;
+    payload->router_source = router_source;
     int stream_status = compile_copy_stream(&payload->stream, stream);
     if (stream_status != 0) {
       std::free(payload);

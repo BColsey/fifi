@@ -981,6 +981,7 @@ impl Context {
                 quant.as_ptr(),
                 args.eps,
                 native_dtype(args.act),
+                super::resident_ops::MOE_ROUTER_SOURCE.as_ptr().cast(),
                 adapter.owner.0.get() as usize,
                 fun_id as usize,
                 stream,

@@ -63,6 +63,10 @@ pub(super) const ATTN_GATE_SOURCE: &str = concat!(include_str!("attn_gate.body.m
 /// body; the prefill chunk tail (un-sort, gate, sum, shared fold, cast) in one kernel.
 pub(super) const MOE_COMBINE_SOURCE: &str = concat!(include_str!("moe_combine.body.metal"), "\0");
 
+/// The Metal source of the fused MoE router top-k (Q36 decode): the stable selection and the
+/// renormalized gates of one router row in one kernel, replacing the eight-op chain.
+pub(super) const MOE_ROUTER_SOURCE: &str = concat!(include_str!("moe_router.body.metal"), "\0");
+
 /// The Metal source of the fused 8-bit KV decode attention: the two kernel bodies,
 /// separated by the marker line that `shape::Q8_DECODE_PASS_MARKER` names.
 /// `q8_decode_sources` splits it; the properties of the split are pinned by the portable
@@ -2314,6 +2318,91 @@ impl Context {
         };
         expected.complete(&out, built)?;
         Ok(state.resident(out, Dtype::Bf16, vec![rows, hidden], byte_len))
+    }
+
+    /// The fused MoE router top-k (Q36 decode): the stable top-k selection of one probability
+    /// row `probs` `[1, experts]` F32 plus the renormalized gates in ONE kernel - the same
+    /// rank order, tie rule, and gate rounding as the op chain of `route_device`. Returns
+    /// `(ids, gates)`: `ids` `[k]` U32 in rank order (already below `experts`, so the caller
+    /// wraps them in `BoundedIndices` without a clamp node) and `gates` `[k, 1, 1]` F32.
+    /// `BadRequest` unless the row is F32 `[1, experts]` with `experts` a nonzero multiple of
+    /// 32 at most 1024 and `top_k` between 1 and `experts` at most 32; the general path stays
+    /// the op chain. Health is NOT computed here: the caller keeps its own reduce node.
+    pub(in crate::kernels::mlx) fn router_topk(
+        &mut self,
+        probs: &ExecutionTensor,
+        experts: u32,
+        top_k: u32,
+        renorm: bool,
+    ) -> Result<(ExecutionTensor, ExecutionTensor), EngError> {
+        let label = "moe router top-k";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        check_owner(label, state, probs)?;
+        if probs.dtype() != Dtype::F32 {
+            return Err(EngError::BadRequest(
+                "moe router top-k needs the F32 softmax row".into(),
+            ));
+        }
+        if probs.shape() != [1, experts] {
+            return Err(EngError::BadRequest(
+                "moe router top-k needs the [1, experts] probability row".into(),
+            ));
+        }
+        if experts == 0
+            || experts % 32 != 0
+            || experts > 1024
+            || top_k == 0
+            || top_k > experts
+            || top_k > 32
+        {
+            return Err(EngError::BadRequest(
+                "moe router top-k needs a multiple of 32 experts up to 1024 and a top-k up to 32"
+                    .into(),
+            ));
+        }
+        let dims = native_ints(label, &[1, experts, top_k, top_k.max(8), renorm as u32])?;
+        let ids_shape = native_ints(label, &[top_k])?;
+        let gates_shape = native_ints(label, &[top_k, 1, 1])?;
+        let _input = probs.share();
+        clear_message();
+        let stream = state.stream.0;
+        let mut ids = Array::null();
+        let mut gates = Array::null();
+        let built = produce(&mut ids, label, |slot| unsafe {
+            ffi::mlx_router_topk(
+                slot,
+                &mut gates.0,
+                probs.storage.native_array(),
+                dims.as_ptr(),
+                ids_shape.as_ptr(),
+                1,
+                gates_shape.as_ptr(),
+                3,
+                MOE_ROUTER_SOURCE.as_ptr().cast(),
+                stream,
+            )
+        });
+        let ids_len = u64::from(top_k);
+        let expected_ids = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &[top_k],
+            byte_len: ids_len * 4,
+            dtype: Dtype::U32,
+            promotes: false,
+        };
+        expected_ids.complete(&ids, built)?;
+        let expected_gates = ExpectedOutput {
+            shape: &[top_k, 1, 1],
+            dtype: Dtype::F32,
+            ..expected_ids
+        };
+        expected_gates.complete(&gates, Ok(()))?;
+        let ids = state.resident(ids, Dtype::U32, vec![top_k], ids_len * 4);
+        let gates = state.resident(gates, Dtype::F32, vec![top_k, 1, 1], ids_len * 4);
+        Ok((ids, gates))
     }
 
     /// Runs the flash-delta gated rule (`Q36_FLASH_DELTA=1`): the same contract as

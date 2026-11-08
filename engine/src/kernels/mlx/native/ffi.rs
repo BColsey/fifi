@@ -610,6 +610,24 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection and
+    /// renormalized gates of one router probability row in ONE launch. `dims` holds
+    /// [rows, experts, top_k, k_max, renorm]; `ids_shape`/`gates_shape` set the output ranks
+    /// (`[k]`/`[k, 1, 1]` eager, `[B, k]`/`[B, k, 1, 1]` compiled). Outputs are lazy: ids U32 in
+    /// rank order, gates F32. Faults strike `ids_out`.
+    #[link_name = "inference_mlx_router_topk"]
+    pub(super) fn mlx_router_topk(
+        ids_out: *mut mlx_array,
+        gates_out: *mut mlx_array,
+        probs: mlx_array,
+        dims: *const i32,
+        ids_shape: *const i32,
+        ids_rank: i32,
+        gates_shape: *const i32,
+        gates_rank: i32,
+        source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     /// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
     /// DeltaNet pre-recurrence chain. `dims` holds rows. All six outputs are lazy F32.
     /// Faults strike `q_out`.
@@ -865,6 +883,7 @@ unsafe extern "C" {
         quant: *const i32,
         eps: f32,
         activation: mlx_dtype,
+        router_source: *const c_char,
         owner: usize,
         fun_id: usize,
         stream: mlx_stream,

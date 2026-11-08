@@ -2005,6 +2005,20 @@ impl MlxKernels {
         self.context.moe_combine(eo, inverse, gates, so, raw, rows)
     }
 
+    /// The fused MoE router top-k: the stable selection and renormalized gates of one
+    /// `[1, experts]` F32 probability row in one kernel. Returns `(ids [k], gates [k, 1, 1])`;
+    /// the ids are already below `experts`. `BadRequest` outside the launch contract
+    /// (F32 row, experts a multiple of 32 up to 1024, top-k up to 32).
+    pub fn router_topk(
+        &mut self,
+        probs: &ExecutionTensor,
+        experts: u32,
+        top_k: u32,
+        renorm: bool,
+    ) -> Result<(ExecutionTensor, ExecutionTensor), EngError> {
+        self.context.router_topk(probs, experts, top_k, renorm)
+    }
+
     /// The gdn_post fused kernel: gated RMS norm and output gate.
     pub fn gdn_post(
         &mut self,

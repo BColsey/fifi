@@ -27,7 +27,7 @@ use crate::{
         flash_next::math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router,
     },
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
-    tensor::{ExecutionTensor, Tensor},
+    tensor::{Dtype, ExecutionTensor, Tensor},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -346,6 +346,20 @@ pub(super) fn route_device(
         ));
     }
     let flat = ctx.kernels.reshape(probs, &[experts])?;
+    // The health reduce runs on the whole row in both paths: its accumulation order is the
+    // MLX reduce's own, unchanged by the fused selection below.
+    let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
+    // The fused top-k kernel of the decode contract: an F32 row with a multiple-of-32 expert
+    // count up to 1024 and a top-k up to 32 selects and renormalizes in ONE launch, with the
+    // same rank order, tie rule, and gate rounding as the op chain below (the general path,
+    // which the tiny shapes and any exotic expert count keep using).
+    if probs.dtype() == Dtype::F32 && experts % 32 == 0 && experts <= 1024 && top_k <= 32 {
+        let (ids, gates) = ctx.kernels.router_topk(probs, experts, k, renorm)?;
+        // The kernel emits ids already below the expert count: the selection picks indices of
+        // the row itself, so the trusted clamp-free bound holds by construction.
+        let ids = BoundedIndices::from_clamped(ids, experts);
+        return Ok(DeviceRoute { ids, gates, health });
+    }
     // A stable ascending sort of the negated row lists the largest probability first and keeps the
     // lower index first among equal values.
     let negated = ctx.kernels.unary(UnaryOp::Neg, &flat)?;
@@ -355,7 +369,6 @@ pub(super) fn route_device(
     // and the three gathered products of `combine` share it.
     let bounded = ctx.kernels.bound_indices(&ids, experts)?;
     let top = ctx.kernels.take_bounded(&flat, &bounded, 0)?;
-    let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
     let gates = if renorm {
         let sum = ctx.kernels.reduce(ReduceOp::Sum, &top, 0, true)?;
         ctx.kernels.binary(BinaryOp::Div, &top, &sum)?
