@@ -596,6 +596,9 @@ impl StepPlan {
         let h = dims.shape.hidden;
         list.add(Slot::Q8Final, list.q8(h, 1), FINAL_NORM, LM_HEAD)?;
         list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+        // The tiled-head hybrid's pack, live through LM_HEAD (the vendored head matmul reads
+        // it); dead bytes in a plain native card run, as in the single-device plan.
+        list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
         let vocab = table.head_rows(card)?.len();
         list.add(Slot::Logits, list.row(vocab), LM_HEAD, ARGMAX)?;
         list.add(Slot::ArgmaxPart, Ok(scratch.argmax_part), ARGMAX, ARGMAX)?;
@@ -769,6 +772,11 @@ fn list_slots(
             // covers FINAL_NORM and live slots never share bytes), kept so the final norm depends
             // on no other op's slot.
             list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+            // The decode-only tiled-head hybrid: when the load overrode the head to tiles, the
+            // final norm fuses the pack too (the vendored head matmul reads it), so the pack must
+            // live through LM_HEAD. The slot is dead bytes (~32 KiB) in a plain native run - the
+            // plan cannot know the head's kind.
+            list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
         }
         WeightLayout::Exl3 => {
             // The fused norm still emits its tiled pack, which the EXL3 head never reads; the

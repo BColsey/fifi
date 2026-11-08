@@ -280,10 +280,14 @@ impl CudaWeights {
     /// The one device layout of this load's quantized tensors: the resident step derives its
     /// mode from it, and a mixed load is a typed refusal naming the tensor.
     pub(crate) fn layout(&self) -> Result<WeightLayout, EngError> {
+        // The tiled-head hybrid's overridden names do not make the load mixed: they are exempt
+        // from the one-layout rule exactly like the fused in-projection's hidden siblings.
+        let overrides = tiled_head_overrides();
         load_layout(
             self.weights
                 .iter()
-                .map(|weight| (weight.name(), weight.kind())),
+                .map(|weight| (weight.name(), weight.kind()))
+                .filter(|(name, _)| !overrides.iter().any(|o| o == name)),
         )
     }
 }
@@ -361,7 +365,12 @@ struct LoadPlan<'a> {
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
+    /// The load layout - the `tiled_overrides` names of a native load upload as tiles beside
+    /// it and do not change this field.
     layout: WeightLayout,
+    /// The names this load uploads in the `Tiled` layout beside the `Native` load
+    /// (`INFERENCE_CUDA_TILED_HEAD`); empty unless the hybrid is on.
+    tiled_overrides: Vec<String>,
     /// The fused GDN input-projection groups of this load, as `(qkv position, [sibling
     /// positions in column order])`; empty unless the fusion flag is set. The sibling
     /// positions still hold their admission bytes but never upload.
@@ -902,6 +911,20 @@ pub(crate) fn gdn_fuse_inproj() -> bool {
         == Some("1")
 }
 
+/// The decode-only tiled-head hybrid: tensor names (comma-separated) that a `Native` load
+/// uploads in the `Tiled` layout instead, so the qwen36 step runs the vendored tiled head
+/// matmul beside its native ops. Read per load and per `CudaWeights::layout()`, like the
+/// `INFERENCE_CUDA_GDN_FUSE_INPROJ` precedent; empty or unset = no override (default).
+pub(crate) fn tiled_head_overrides() -> Vec<String> {
+    std::env::var("INFERENCE_CUDA_TILED_HEAD")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The sibling suffixes of an `attn_qkv` tensor, in DeltaProj column order.
 const GDN_INPROJ_SIBLINGS: [&str; 3] =
     [".attn_gate.weight", ".ssm_beta.weight", ".ssm_alpha.weight"];
@@ -985,7 +1008,7 @@ fn planned<'w>(
 /// one chunk of at most `chunk_limit` bytes.
 fn check_scale_ranges(
     weights: &GgufWeights,
-    tensors: &[PlannedTensor<'_>],
+    tensors: &[&PlannedTensor<'_>],
     chunk_limit: usize,
 ) -> Result<(), EngError> {
     for planned_tensor in tensors {
@@ -1083,6 +1106,24 @@ fn load_inner(
     }
     load_index(names)?; // the duplicate-name refusal still covers the whole request
     let layout = options.layout;
+    // The tiled-head hybrid (`INFERENCE_CUDA_TILED_HEAD`): tensor names that upload in the
+    // Tiled layout beside this native load. On any other layout the override is inert (the
+    // tensors already upload as tiles under Tiled, and EXL3 never reaches here); an override
+    // that names no tensor of this load refuses - a typo must not silently load the head
+    // native.
+    let tiled_overrides: Vec<String> = if layout == WeightLayout::Native {
+        for override_name in tiled_head_overrides() {
+            if !names.contains(&override_name.as_str()) {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {override_name}: the INFERENCE_CUDA_TILED_HEAD override is not part of \
+                     this load"
+                )));
+            }
+        }
+        tiled_head_overrides()
+    } else {
+        Vec::new()
+    };
     // The slice set of a sliced load, by tensor name. A slice for a tensor this load
     // did not name, a name sliced twice, or any slice on a non-native layout refuses
     // before planning: a sliced tensor has a different shape than its file record,
@@ -1126,7 +1167,18 @@ fn load_inner(
     let tensors = names
         .iter()
         .map(|name| {
-            let (tensor, whole_bytes) = planned(weights, name, layout)?;
+            // A hybrid-overridden name plans (admission bytes, tile-row stacks) as tiles.
+            let tensor_layout = if tiled_overrides.iter().any(|o| o == name) {
+                WeightLayout::Tiled
+            } else {
+                layout
+            };
+            let (tensor, whole_bytes) = planned(weights, name, tensor_layout)?;
+            if slice_specs.contains_key(name) && tensor_layout == WeightLayout::Tiled {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {name}: a sliced load cannot override a name to tiles"
+                )));
+            };
             match slice_specs.get(name) {
                 None => Ok(PlannedTensor {
                     tensor,
@@ -1174,6 +1226,7 @@ fn load_inner(
             policy,
             drop_file,
             layout,
+            tiled_overrides,
             fused,
         },
     )
@@ -1198,13 +1251,22 @@ fn transfer(
         policy,
         drop_file,
         layout,
+        tiled_overrides,
         fused,
     } = plan;
     let scan_began = Instant::now();
     // The fp16 scale scans guard the tile dequantisation (fp16(d * scale)); a native load
-    // keeps the file's exact scales and scans nothing.
+    // keeps the file's exact scales and scans nothing - except the hybrid's overridden
+    // names, which dequantise through the same fp16 tile path.
     if layout == WeightLayout::Tiled {
-        check_scale_ranges(weights, &tensors, knobs.chunk_limit)?;
+        let scanned: Vec<&PlannedTensor> = tensors.iter().collect();
+        check_scale_ranges(weights, &scanned, knobs.chunk_limit)?;
+    } else if !tiled_overrides.is_empty() {
+        let overridden: Vec<&PlannedTensor> = tensors
+            .iter()
+            .filter(|t| tiled_overrides.iter().any(|o| o == t.tensor.name()))
+            .collect();
+        check_scale_ranges(weights, &overridden, knobs.chunk_limit)?;
     }
     let scan = scan_began.elapsed();
     // A tiled load's scan read every Q6_K, Q8_0 and Q5_0 tensor once and refilled the
@@ -1252,7 +1314,12 @@ fn transfer(
                         knobs,
                         weights,
                         tensor,
-                        layout,
+                        // A hybrid-overridden name uploads as tiles beside the native load.
+                        if tiled_overrides.iter().any(|o| o == tensor.name()) {
+                            WeightLayout::Tiled
+                        } else {
+                            layout
+                        },
                         planned_tensor.slice.as_ref(),
                     )
                 },

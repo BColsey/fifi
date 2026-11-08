@@ -759,15 +759,20 @@ impl<'w> GlobalWeights<'w> {
             match layout {
                 WeightLayout::Exl3 => exl3_global(weights, name, spec),
                 WeightLayout::Tiled => Ok(GlobalWeight::Tiled(dense(weights, name, spec)?)),
-                WeightLayout::Native => {
-                    let Some(CudaWeight::Native { weight, .. }) = weights.get(name) else {
-                        return Err(EngError::Checkpoint(format!(
-                            "step weights: {name} is not a native tensor"
-                        )));
-                    };
-                    check_native_dense(name, (weight.n_rows(), weight.k()), spec)?;
-                    Ok(GlobalWeight::Native(weight))
-                }
+                WeightLayout::Native => match weights.get(name) {
+                    Some(CudaWeight::Native { weight, .. }) => {
+                        check_native_dense(name, (weight.n_rows(), weight.k()), spec)?;
+                        Ok(GlobalWeight::Native(weight))
+                    }
+                    // Decode-only hybrid: the head may ride as tiles beside a native load (the
+                    // load-time override), so the step's Tiled head arm serves it.
+                    Some(CudaWeight::Tiled { .. }) if name == names.head => {
+                        Ok(GlobalWeight::Tiled(dense(weights, name, spec)?))
+                    }
+                    _ => Err(EngError::Checkpoint(format!(
+                        "step weights: {name} is not a native tensor"
+                    ))),
+                },
             }
         };
         let embed = global(&names.embed, &specs.embed)?;

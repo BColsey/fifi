@@ -67,14 +67,15 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
     };
     assert!(plan.reconcile(-0.1, 0.2, &[1.0], fine(), 3.0).is_err());
     assert!(plan.reconcile(0.1, 0.2, &[f32::NAN], fine(), 3.0).is_err());
-    assert!(plan.reconcile(0.1, f32::INFINITY, &[1.0], fine(), 3.0).is_err());
+    assert!(
+        plan.reconcile(0.1, f32::INFINITY, &[1.0], fine(), 3.0)
+            .is_err()
+    );
     assert!(plan.reconcile(0.1, 0.2, &[1.0], fine(), -3.0).is_err());
     // A zero whole is refused, not divided through.
     assert!(plan.reconcile(0.1, 0.2, &[1.0], fine(), 0.0).is_err());
     // A group count that does not match the plan is refused, not silently zipped.
-    assert!(plan
-        .reconcile(0.1, 0.2, &[1.0, 2.0], fine(), 3.0)
-        .is_err());
+    assert!(plan.reconcile(0.1, 0.2, &[1.0, 2.0], fine(), 3.0).is_err());
     // The finer split is validated with the same rule: one mixer reading per marked group,
     // finite and non-negative, and a finite non-negative head.
     let mismatched = FineSplit {
@@ -86,9 +87,10 @@ fn reconcile_rejects_non_finite_or_negative_sections() {
         mixer_ms: vec![-0.1],
         head_ms: 0.2,
     };
-    assert!(plan
-        .reconcile(0.1, 0.2, &[1.0], negative_mixer, 3.0)
-        .is_err());
+    assert!(
+        plan.reconcile(0.1, 0.2, &[1.0], negative_mixer, 3.0)
+            .is_err()
+    );
     let nan_head = FineSplit {
         mixer_ms: vec![0.5],
         head_ms: f32::NAN,

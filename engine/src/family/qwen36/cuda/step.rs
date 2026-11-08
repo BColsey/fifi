@@ -222,10 +222,7 @@ impl SectionMarks {
             }
             StepOp::Advance => &self.end,
             StepOp::LmHead => return stream.record_timing(&self.head_end),
-            StepOp::Begin
-            | StepOp::Mixer(_)
-            | StepOp::FinalNorm
-            | StepOp::Argmax => return Ok(()),
+            StepOp::Begin | StepOp::Mixer(_) | StepOp::FinalNorm | StepOp::Argmax => return Ok(()),
         };
         stream.record_timing(event)
     }
@@ -1669,6 +1666,12 @@ impl<'a> QwenResidentStep<'a> {
         Ok(())
     }
 
+    /// Whether this load overrode the head to tiles (the decode-only hybrid): the final norm
+    /// then emits the tiled pack and the vendored head matmul reads it.
+    fn head_is_tiled(&self) -> bool {
+        matches!(self.globals.head, HeadWeight::Tiled(_))
+    }
+
     fn view(&self, slot: Slot) -> Result<DeviceRange<'a>, EngError> {
         let res: &'a StepResources = self.res;
         let index = res
@@ -2030,13 +2033,7 @@ impl<'a> QwenResidentStep<'a> {
         let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
         marks
             .plan
-            .reconcile(
-                embed,
-                tail,
-                &groups,
-                FineSplit { mixer_ms, head_ms },
-                whole,
-            )
+            .reconcile(embed, tail, &groups, FineSplit { mixer_ms, head_ms }, whole)
             .map(Some)
     }
 
@@ -2456,6 +2453,23 @@ impl<'a> QwenResidentStep<'a> {
             // lifetime covers FINAL_NORM and live slots never share bytes) - it silently repurposed
             // the router-input value slot as scratch, a latent bug the moment NormRow's lifetime
             // tightens to its true need.
+            //
+            // The decode-only tiled-head hybrid: when the load overrode the head to tiles, the
+            // final norm emits the tiled pack beside the f32 row (the vendored head matmul reads
+            // the pack, not the row), exactly the Exl3 producer shape.
+            WeightLayout::Native if self.head_is_tiled() => self.context.add_norm_pack(
+                &self.stream,
+                AddNormCall {
+                    m: STEP_ROWS,
+                    n: self.res.geometry.hidden,
+                    eps: self.res.geometry.eps,
+                    h,
+                    delta: None,
+                    weight,
+                    xf: self.view(Slot::XfFinal)?,
+                    norm_out: Some(self.view(Slot::FinalNormRow)?),
+                },
+            ),
             WeightLayout::Native => self.context.add_rmsnorm_q8(
                 &self.stream,
                 AddNormQ8Call {
@@ -2472,8 +2486,9 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     fn lm_head(&self) -> Result<(), EngError> {
-        // The pack slot is resolved INSIDE each arm: the Native plan holds no XfFinal slot, so a
-        // lookup before the match refused every native run.
+        // The pack slot is resolved INSIDE each arm: the plain native plan's xf slot is dead
+        // bytes (the matvec head never reads it), and a lookup before the match is only needed
+        // by the arms that use it.
         let y = self.view(Slot::Logits)?;
         if let HeadWeight::Exl3(head) = self.globals.head {
             let io = Exl3Io {

@@ -215,10 +215,11 @@ fn the_native_plan_figures_are_pinned_and_do_not_overlap() {
     let p = plan(WeightLayout::Native);
     assert_eq!(
         (p.arena_bytes(), p.unaliased_bytes()),
-        (1_159_168, 2_396_416),
-        "the swapped q8_1 sizes must move these figures or nothing"
+        (2_068_992, 3_445_248),
+        "the swapped q8_1 sizes must move these figures or nothing (the tiled-head hybrid's \
+         live-through-LM_HEAD XfFinal displaces the late slots by ~0.9 MiB)"
     );
-    assert_eq!(p.tensors().len(), 29);
+    assert_eq!(p.tensors().len(), 30);
     let t = p.tensors();
     for (i, a) in t.iter().enumerate() {
         assert_eq!(p.plan().offsets[i] % 256, 0, "{:?}", a.slot);
@@ -285,7 +286,15 @@ fn native_pack_slots_take_the_tiled_lifetimes_and_sizes() {
         Phase::FinalNorm as usize,
         Phase::FinalNorm as usize
     )));
-    assert_eq!(got.len(), want.len() + 1);
+    // The decode-only tiled-head hybrid: the plan CANNOT know the loaded head's kind, so the
+    // native plan always carries the tiled final pack - live through LM_HEAD because the
+    // vendored head matmul reads it (dead bytes, ~32 KiB, in a plain native run).
+    assert!(got.contains(&(
+        Slot::XfFinal,
+        Phase::FinalNorm as usize,
+        Phase::LmHead as usize
+    )));
+    assert_eq!(got.len(), want.len() + 2);
     // Non-pack slots keep their Tiled byte counts (a pack slot's q8 bytes are test 1's literals).
     for planned in tiled.tensors() {
         if swap(planned.slot) == planned.slot {
@@ -371,10 +380,11 @@ fn the_int8_native_plan_figures_are_pinned_and_do_not_overlap() {
     let (d, p) = (dims(), int8_plan());
     assert_eq!(
         (p.arena_bytes(), p.unaliased_bytes()),
-        (1_159_168, 2_400_512),
-        "the two rows slots must move these figures or nothing"
+        (2_068_992, 3_449_344),
+        "the two rows slots must move these figures or nothing (the tiled-head hybrid's \
+         live-through-LM_HEAD XfFinal displaces the late slots by ~0.9 MiB)"
     );
-    assert_eq!(p.tensors().len(), 31);
+    assert_eq!(p.tensors().len(), 32);
     let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;
     for slot in [Slot::KRows, Slot::VRows] {
         let planned = p.tensors()[p.index(slot).expect("rows slot")];

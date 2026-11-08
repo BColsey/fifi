@@ -269,7 +269,10 @@ fn section_marks_time_the_captured_step() {
             .iter()
             .zip(&reading.mixer_ms)
             .map(|((layer, size, ms), mixer)| {
-                format!("l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}/moe {:.4})", ms - mixer)
+                format!(
+                    "l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}/moe {:.4})",
+                    ms - mixer
+                )
             })
             .collect::<Vec<_>>()
             .join(",");

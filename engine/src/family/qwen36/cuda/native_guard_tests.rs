@@ -352,9 +352,20 @@ fn the_head_and_final_norm_name_only_live_slots_of_their_layout() {
     }
     // lm_head: the tiled arm reads XfFinal; the native arm reads Q8Final; both write Logits.
     assert!(has(&tiled, Slot::Logits) && has(&native, Slot::Logits));
+    // The tiled-head hybrid: the native plan now ALWAYS holds XfFinal (live through LM_HEAD,
+    // because the plan cannot know whether the loaded head is tiled - the vendored head
+    // matmul reads the pack). In a plain native run it is dead bytes the matvec head never
+    // touches.
     assert!(
-        !has(&native, Slot::XfFinal),
-        "the defect: the native plan has no XfFinal"
+        has(&native, Slot::XfFinal),
+        "the tiled-head hybrid's pack slot is missing from the native plan"
+    );
+    let xf = native.index(Slot::XfFinal).expect("the hybrid pack");
+    let xf_planned = native.tensors()[xf];
+    assert_eq!(
+        (xf_planned.first, xf_planned.last),
+        (Phase::FinalNorm as usize, Phase::LmHead as usize),
+        "the hybrid pack must live through the head's read"
     );
     // The scratch row lives exactly at FINAL_NORM, dead before the head reads its pack.
     let at = native.index(Slot::FinalNormRow).expect("the scratch row");

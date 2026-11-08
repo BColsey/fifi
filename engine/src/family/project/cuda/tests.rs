@@ -3503,6 +3503,7 @@ fn plan_of<'a>(
         policy,
         drop_file,
         layout: WeightLayout::Tiled,
+        tiled_overrides: Vec::new(),
         fused: Vec::new(),
     }
 }
