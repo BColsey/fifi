@@ -997,6 +997,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The decode steps norm inside (the folded contract); the chunk keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk_sliced(&mut ctx, shape, rw, cache, warm, &x, slice).unwrap();
         assert_eq!(next.cache.len, warm as usize + count as usize);
         values(kernels, &next.out).unwrap()
