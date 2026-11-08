@@ -176,7 +176,9 @@ fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
         for expert in [0, 1, experts - 1] {
             let matrix = matrix_of(&checkpoint, &expert_name_in(Root::Layers, 0, expert, part));
             let staged = exl3_member_staging(&matrix).expect("staging");
-            let (trellis, scales) = store.layer(0)[part_index].member(expert);
+            let record = store.layer(0)[part_index].member(expert);
+            let trellis = &record[..staged.trellis.len()];
+            let scales = &record[staged.trellis.len()..];
             assert_eq!(trellis, staged.trellis.as_slice());
             assert_eq!(scales, staged.scales.as_slice());
         }

@@ -1,11 +1,9 @@
 //! The banked EXL3 expert load: the admission arithmetic that decides banking and the slot
-//! count (pure, mirrored on `project::cuda`'s demand rule), and the pageable host store that
-//! holds every routed expert's bytes in the exact device-bank layout, so a later miss copy
-//! moves a member into a slot unchanged.
-//!
-//! The store is pageable by decision, not pinned: on the 16 GiB hosts this mode targets,
-//! 9-10 GiB of page-locked memory would starve the OS; the copy cost of driver-internal
-//! staging is a measured follow-up, not a load-time guess.
+//! count (pure, mirrored on `project::cuda`'s demand rule), and the host store that holds
+//! every routed expert's bytes as one contiguous record per member in the exact device-bank
+//! layout, so a later miss copy moves a member into a slot as a single DMA. The store is
+//! page-locked after the load ([`ExpertStore::pin_all`]) so refills DMA without staging;
+//! the pin is best effort, and a host that refuses it serves staged but correct.
 
 use crate::{
     EngError,
@@ -13,7 +11,7 @@ use crate::{
         project::cuda::{Reserve, exl3::Exl3MemberStaging, exl3::exl3_member_layout},
         qwen36::settings::{BankMode, SlotRequest},
     },
-    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, host_register, host_unregister},
+    kernels::cuda::{DeviceBuffer, DeviceStream, host_register, host_unregister},
 };
 
 /// The refusal helper of this module: every admission error names its numbers.
@@ -174,32 +172,31 @@ fn admit_host(routed: u64, host: Option<(u64, u64)>) -> Result<(), EngError> {
     Ok(())
 }
 
-/// Every routed expert of one projection of one layer, in the device-bank byte layout:
-/// member `i`'s trellis at `i * stride` and its scales at `i * scale_stride`, exactly the
-/// addressing of the device bank, so a slot fill or miss copy is a plain byte move.
+/// Every routed expert of one projection of one layer, one record per member in the exact
+/// device-bank layout: member `i`'s `[trellis, scales]` bytes at `i * record`, so a slot
+/// fill or miss copy is a single contiguous write.
 pub(super) struct PartStore {
-    trellis: Vec<u8>,
-    scales: Vec<u8>,
-    stride: usize,
+    records: Vec<u8>,
+    record: usize,
+    trellis: usize,
     scale_stride: usize,
-    trellis_pinned: bool,
-    scales_pinned: bool,
+    pinned: bool,
 }
 
 impl PartStore {
     pub(super) fn new(shape: [usize; 2], bits_twice: u8, members: usize) -> Self {
-        let (stride, scale_stride) = exl3_member_layout(shape, bits_twice);
+        let (trellis, scale_stride) = exl3_member_layout(shape, bits_twice);
+        let record = trellis + scale_stride;
         Self {
-            trellis: vec![0; stride * members],
-            scales: vec![0; scale_stride * members],
-            stride,
+            records: vec![0; record * members],
+            record,
+            trellis,
             scale_stride,
-            trellis_pinned: false,
-            scales_pinned: false,
+            pinned: false,
         }
     }
 
-    /// Writes member `member`'s staged bytes at its slot offsets. The length checks are the
+    /// Writes member `member`'s staged bytes as its record. The length checks are the
     /// store's own rate guard: a member whose staged bytes disagree with the first member's
     /// strides is refused, not mis-laid.
     pub(super) fn put(
@@ -207,46 +204,38 @@ impl PartStore {
         member: usize,
         staged: &Exl3MemberStaging,
     ) -> Result<(), EngError> {
-        if staged.trellis.len() != self.stride || staged.scales.len() != self.scale_stride {
+        if staged.trellis.len() != self.trellis || staged.scales.len() != self.scale_stride {
             return Err(EngError::Checkpoint(format!(
                 "EXL3 expert bank: member {member} stages {} trellis and {} scale bytes, \
                  the bank layout holds {} and {}",
                 staged.trellis.len(),
                 staged.scales.len(),
-                self.stride,
+                self.trellis,
                 self.scale_stride,
             )));
         }
-        let trellis_at = member * self.stride;
-        self.trellis[trellis_at..trellis_at + self.stride].copy_from_slice(&staged.trellis);
-        let scales_at = member * self.scale_stride;
-        self.scales[scales_at..scales_at + self.scale_stride].copy_from_slice(&staged.scales);
+        let at = member * self.record;
+        self.records[at..at + self.trellis].copy_from_slice(&staged.trellis);
+        self.records[at + self.trellis..at + self.record].copy_from_slice(&staged.scales);
         Ok(())
     }
 
-    /// Member `member`'s (trellis, scales) bytes, the source of a miss copy.
-    pub(super) fn member(&self, member: usize) -> (&[u8], &[u8]) {
-        let trellis_at = member * self.stride;
-        let scales_at = member * self.scale_stride;
-        (
-            &self.trellis[trellis_at..trellis_at + self.stride],
-            &self.scales[scales_at..scales_at + self.scale_stride],
-        )
+    /// Member `member`'s record bytes, the source of a miss copy.
+    pub(super) fn member(&self, member: usize) -> &[u8] {
+        let at = member * self.record;
+        &self.records[at..at + self.record]
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.trellis.len() + self.scales.len()
+        self.records.len()
     }
 
-    /// Page-locks both members' storage, best effort: a store that fails to pin stays
-    /// pageable (the refills still work, only staged). The vectors never move after
-    /// the load, so the registered pointers stay the buffers' own.
+    /// Page-locks the record storage, best effort: a store that fails to pin stays
+    /// pageable (the refills still work, only staged). The vector never moves after
+    /// the load, so the registered pointer stays the buffer's own.
     pub(super) fn pin(&mut self) {
-        if host_register(&self.trellis).is_ok() {
-            self.trellis_pinned = true;
-        }
-        if host_register(&self.scales).is_ok() {
-            self.scales_pinned = true;
+        if host_register(&self.records).is_ok() {
+            self.pinned = true;
         }
     }
 }
@@ -255,11 +244,8 @@ impl Drop for PartStore {
     fn drop(&mut self) {
         // The page lock must go before the Vec free; a failure leaves the lock to the
         // process exit, which the CUDA runtime cleans up.
-        if self.trellis_pinned {
-            let _ = host_unregister(&self.trellis);
-        }
-        if self.scales_pinned {
-            let _ = host_unregister(&self.scales);
+        if self.pinned {
+            let _ = host_unregister(&self.records);
         }
     }
 }
@@ -406,25 +392,19 @@ impl LayerSlots {
     }
 }
 
-/// One routed bank's device upload target: the buffers a slot's bytes land in, and the
-/// per-member strides of [`exl3_member_layout`].
+/// One routed bank's device upload target: the record buffer a slot's bytes land in, and
+/// the record stride of [`exl3_member_layout`].
 struct BankTarget<'w> {
-    trellis: &'w DeviceBuffer,
-    scales: &'w DeviceBuffer,
-    stride: usize,
-    scale_stride: usize,
+    bank: &'w DeviceBuffer,
+    record: usize,
 }
 
 /// The upload target of one bank, by shared layout (a plain fn so the borrowed buffers keep
 /// the resolver's lifetime).
 fn target_of<'w>(bank: &'w crate::family::project::cuda::exl3::Exl3Bank) -> BankTarget<'w> {
-    let (stride, scale_stride) = exl3_member_layout(bank.shape(), bank.bits_twice());
-    let [trellis, scales] = bank.bank_buffers();
     BankTarget {
-        trellis,
-        scales,
-        stride,
-        scale_stride,
+        bank: bank.bank_buffer(),
+        record: bank.record_bytes(),
     }
 }
 
@@ -534,16 +514,13 @@ impl LayerResolver<'_, '_> {
         for slot in misses {
             let expert = table.expert_of(slot);
             for (part, target) in parts.iter().enumerate() {
-                let (trellis, scales) = store[part].member(expert);
-                // Enqueued on the launch stream: the copies race the launches queued
-                // after them instead of a device-wide sync per copy, and the next
-                // layer's readback (already a stream wait) covers their completion.
+                let record = store[part].member(expert);
+                // Enqueued on the launch stream: the copy races the launches queued
+                // after it instead of a device-wide sync per miss, and the next
+                // layer's readback (already a stream wait) covers its completion.
                 target
-                    .trellis
-                    .write_at_enqueue(stream, slot * target.stride, trellis)?;
-                target
-                    .scales
-                    .write_at_enqueue(stream, slot * target.scale_stride, scales)?;
+                    .bank
+                    .write_at_enqueue(stream, slot * target.record, record)?;
             }
         }
         self.resolver.hits += (picks.len() - miss_count) as u64;
@@ -729,21 +706,23 @@ mod tests {
     }
 
     #[test]
-    fn the_store_lays_members_at_the_bank_strides() {
+    fn the_store_lays_members_as_contiguous_records() {
         let shape = [64usize, 32];
         let (stride, scale_stride) = exl3_member_layout(shape, 8);
         let mut store = PartStore::new(shape, 8, 4);
         let member = |trellis_byte: u8| Exl3MemberStaging {
             trellis: vec![trellis_byte; stride],
-            scales: vec![trellis_byte; scale_stride],
+            scales: vec![trellis_byte + 1; scale_stride],
         };
         for i in 0..4u8 {
             store.put(i as usize, &member(i)).unwrap();
         }
         for i in 0..4u8 {
-            let (trellis, scales) = store.member(i as usize);
-            assert!(trellis.iter().all(|&byte| byte == i));
-            assert!(scales.iter().all(|&byte| byte == i));
+            let record = store.member(i as usize);
+            // One contiguous record per member: its trellis then its scales, adjacent.
+            assert_eq!(record.len(), stride + scale_stride);
+            assert!(record[..stride].iter().all(|&byte| byte == i));
+            assert!(record[stride..].iter().all(|&byte| byte == i + 1));
         }
         // A member staged at another rate is refused, not mis-laid.
         let error = format!(

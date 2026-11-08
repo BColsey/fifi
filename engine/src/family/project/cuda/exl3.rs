@@ -26,13 +26,13 @@ pub(crate) struct Exl3Weight {
     pub(crate) book: Codebook,
 }
 
-/// Same-shaped, same-rate matrices without bias in two device buffers: the routed experts of one
-/// projection of one layer. One allocation per component replaces one per matrix and expert; a
-/// member's trellis and scales are ranges at fixed strides.
+/// Same-shaped, same-rate matrices without bias in one device buffer: the routed experts of one
+/// projection of one layer. One allocation replaces one per matrix and expert; a member's
+/// trellis and scales live in one record of `trellis + scale` bytes at a fixed stride, so a
+/// slot fill or miss copy is a single contiguous write.
 pub(crate) struct Exl3Bank {
     // Reverse upload order also applies when the bank is dropped.
-    scales: DeviceBuffer,
-    trellis: DeviceBuffer,
+    records: DeviceBuffer,
     count: usize,
     shape: [usize; 2],
     bits_twice: u8,
@@ -358,6 +358,11 @@ impl Exl3Bank {
         (self.shape[0] + self.shape[1]) * size_of::<f32>()
     }
 
+    /// Bytes of one member's record: its trellis then its scales, one contiguous unit.
+    fn record_stride(&self) -> usize {
+        self.trellis_stride() + self.scale_stride()
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.count
     }
@@ -370,11 +375,16 @@ impl Exl3Bank {
         self.bits_twice
     }
 
-    /// The trellis and scales buffers in member order, for a banked slot fill: member `i`'s
-    /// bytes live at `i * stride` of the trellis buffer and `i * scale_stride` of the scales
-    /// buffer ([`exl3_member_layout`]).
-    pub(crate) fn bank_buffers(&self) -> [&DeviceBuffer; 2] {
-        [&self.trellis, &self.scales]
+    /// The record buffer in member order, for a banked slot fill: member `i`'s trellis and
+    /// scales are the `record` bytes at `i * record`
+    /// ([`exl3_member_layout`] per component).
+    pub(crate) fn bank_buffer(&self) -> &DeviceBuffer {
+        &self.records
+    }
+
+    /// The bytes between the records of two members (see [`Self::bank_buffer`]).
+    pub(crate) fn record_bytes(&self) -> usize {
+        self.record_stride()
     }
 
     pub(crate) fn view(&self, index: usize) -> Result<Exl3MatrixView<'_>, EngError> {
@@ -386,12 +396,13 @@ impl Exl3Bank {
         }
         let (trellis, scales) = (self.trellis_stride(), self.scale_stride());
         let suh_bytes = self.shape[0] * size_of::<f32>();
+        let at = index * self.record_stride();
         Ok(Exl3MatrixView {
-            trellis: self.trellis.range(index * trellis, trellis)?,
-            suh: self.scales.range(index * scales, suh_bytes)?,
+            trellis: self.records.range(at, trellis)?,
+            suh: self.records.range(at + trellis, suh_bytes)?,
             svh: self
-                .scales
-                .range(index * scales + suh_bytes, scales - suh_bytes)?,
+                .records
+                .range(at + trellis + suh_bytes, scales - suh_bytes)?,
             bias: None,
             shape: self.shape,
             bits_twice: self.bits_twice,
@@ -401,15 +412,19 @@ impl Exl3Bank {
 
     pub(crate) fn members(&self) -> Result<Exl3Members<'_>, EngError> {
         let [k, n] = self.shape;
-        let last = (self.count - 1) * self.scale_stride();
+        let trellis = self.trellis_stride();
+        let record = self.record_stride();
+        let last = (self.count - 1) * record;
         Ok(Exl3Members {
-            trellis: self.trellis.range(0, self.trellis.bytes())?,
-            suh: self.scales.range(0, last + k * size_of::<f32>())?,
+            // The kernel indexes each component by the record stride from the component's
+            // own base offset inside the shared buffer.
+            trellis: self.records.range(0, last + trellis)?,
+            suh: self.records.range(trellis, last + k * size_of::<f32>())?,
             svh: self
-                .scales
-                .range(k * size_of::<f32>(), last + n * size_of::<f32>())?,
-            trellis_stride: self.trellis_stride() / size_of::<u16>(),
-            scale_stride: k + n,
+                .records
+                .range(trellis + k * size_of::<f32>(), last + n * size_of::<f32>())?,
+            trellis_stride: record / size_of::<u16>(),
+            scale_stride: record / size_of::<f32>(),
             members: self.count,
             shape: self.shape,
             bits_twice: self.bits_twice,
@@ -420,17 +435,22 @@ impl Exl3Bank {
     /// The bank as one span for an id-indexed launch.
     pub(crate) fn span(&self) -> Result<Exl3BankSpan<'_>, EngError> {
         let suh_bytes = self.shape[0] * size_of::<f32>();
+        let (trellis, _) = (self.trellis_stride(), self.scale_stride());
         let members = u32::try_from(self.count)
             .map_err(|_| EngError::BadRequest("EXL3 bank has too many members".into()))?;
+        let record = self.record_stride();
         Ok(Exl3BankSpan {
-            trellis: self.trellis.range(0, self.trellis.bytes())?,
-            suh: self.scales.range(0, self.scales.bytes())?,
-            svh: self
-                .scales
-                .range(suh_bytes, self.scales.bytes() - suh_bytes)?,
+            trellis: self.records.range(0, self.records.bytes())?,
+            suh: self
+                .records
+                .range(trellis, self.records.bytes() - trellis)?,
+            svh: self.records.range(
+                trellis + suh_bytes,
+                self.records.bytes() - trellis - suh_bytes,
+            )?,
             members,
-            trellis_stride: self.trellis_stride(),
-            scale_stride: self.scale_stride() / size_of::<f32>(),
+            trellis_stride: record,
+            scale_stride: record / size_of::<f32>(),
             shape: self.shape,
             bits_twice: self.bits_twice,
             book: self.book,
@@ -438,7 +458,7 @@ impl Exl3Bank {
     }
 
     pub(crate) fn device_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
-        [&self.trellis, &self.scales].into_iter()
+        [&self.records].into_iter()
     }
 
     pub(crate) fn device_bytes(&self) -> usize {
@@ -526,18 +546,16 @@ impl CudaProjector {
         let (shape, bits_twice, book) = (first.shape(), first.bitrate_twice(), first.codebook());
         let (stride, scale_stride) = exl3_member_layout(shape, bits_twice);
         let overflow = || EngError::MemoryPlan("EXL3 bank byte count overflow".into());
-        let trellis_bytes = stride.checked_mul(count).ok_or_else(overflow)?;
-        let scale_bytes = scale_stride.checked_mul(count).ok_or_else(overflow)?;
-        let total = trellis_bytes
-            .checked_add(scale_bytes)
+        let record = stride.checked_add(scale_stride).ok_or_else(overflow)?;
+        let total = record
+            .checked_mul(count)
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or_else(overflow)?;
         self.admit(total, reserve)?;
-        let mut scales = Vec::new();
-        scales
-            .try_reserve_exact(scale_bytes)
-            .map_err(|error| EngError::MemoryPlan(format!("EXL3 bank scale staging: {error}")))?;
-        let trellis = self.context.allocate(trellis_bytes)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(total as usize)
+            .map_err(|error| EngError::MemoryPlan(format!("EXL3 bank record staging: {error}")))?;
         let mut next = Some(first);
         for index in 0..count {
             let matrix = match next.take() {
@@ -554,14 +572,12 @@ impl CudaProjector {
                 )));
             }
             let staged = exl3_member_staging(&matrix)?;
-            self.context
-                .upload_at(&trellis, index * stride, &staged.trellis)?;
-            scales.extend_from_slice(&staged.scales);
+            records.extend_from_slice(&staged.trellis);
+            records.extend_from_slice(&staged.scales);
         }
-        let scales = self.context.upload(&scales)?;
+        let records = self.context.upload(&records)?;
         Ok(Exl3Bank {
-            scales,
-            trellis,
+            records,
             count,
             shape,
             bits_twice,

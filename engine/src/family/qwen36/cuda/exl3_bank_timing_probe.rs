@@ -88,8 +88,19 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         id = step.run_token(token, true).expect("prompt token");
     }
     let prompt_wall = began.elapsed();
-    let ((readback_calls, readback_ns), (resolve_calls, resolve_ns)) =
+    let ((prompt_drains, prompt_drain_ns), (prompt_resolves, prompt_resolve_ns)) =
         crate::family::qwen36::cuda::exl3_bank::probe::take();
+    let ms_prompt = |ns: u64, count: u64| ns as f64 / 1e6 / count.max(1) as f64;
+    println!(
+        "banked decode probe: prompt {} rows {:.0} ms ({} drains {:.2} ms each, {} resolves \
+         {:.2} ms each)",
+        PROMPT.len(),
+        prompt_wall.as_secs_f64() * 1e3,
+        prompt_drains,
+        ms_prompt(prompt_drain_ns, prompt_drains),
+        prompt_resolves,
+        ms_prompt(prompt_resolve_ns, prompt_resolves),
+    );
     let began = Instant::now();
     for _ in 0..TOKENS {
         id = step.run_token(id, true).expect("decoded token");
@@ -98,17 +109,10 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
     let ((readback_calls, readback_ns), (resolve_calls, resolve_ns)) =
         crate::family::qwen36::cuda::exl3_bank::probe::take();
     let (hits, misses) = bank.borrow().stats();
-    let ms = |ns: u64, count: usize| ns as f64 / 1e6 / count.max(1) as f64;
     println!(
-        "banked decode probe: prompt {} rows {:.0} ms ({} drains {:.2} ms each, {} resolves \
-         {:.2} ms each); decode {TOKENS} tokens {:.1} ms/token total, drains {:.1} ms/token \
-         across {} calls, resolves {:.1} ms/token; hits {hits} misses {misses}; last id {id}",
-        PROMPT.len(),
-        prompt_wall.as_secs_f64() * 1e3,
-        readback_calls,
-        ms(readback_ns, readback_calls as usize),
-        resolve_calls,
-        ms(resolve_ns, resolve_calls as usize),
+        "banked decode probe: decode {TOKENS} tokens {:.1} ms/token total, drains {:.1} \
+         ms/token across {} calls, resolves {:.1} ms/token; hits {hits} misses {misses}; \
+         last id {id}",
         decode_wall.as_secs_f64() * 1e3 / TOKENS as f64,
         readback_ns as f64 / 1e6 / TOKENS as f64,
         readback_calls,
