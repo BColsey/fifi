@@ -85,9 +85,10 @@ impl MailboxLayout {
         Ok(Self { cards, max_values })
     }
 
-    /// Bytes of one slot: header plus the payload at the f32 stride.
+    /// Header plus the f32-stride payload, padded for the native 16-byte
+    /// alignment requirement on every slot, including odd capacities.
     pub(crate) fn slot_bytes(&self) -> usize {
-        HEADER_BYTES + self.max_values * VALUE_BYTES
+        (HEADER_BYTES + self.max_values * VALUE_BYTES).next_multiple_of(16)
     }
 
     /// Bytes of one device's whole mailbox: a slot per source and parity.
@@ -483,6 +484,21 @@ mod tests {
         assert!(MailboxLayout::new(2, native::peer_ring::MAX_VALUES + 1).is_err());
         let layout = MailboxLayout::new(2, 8).expect("layout");
         assert!(layout.slot_offset(2, 1).is_err());
+    }
+
+    #[test]
+    fn the_layout_aligns_every_slot_for_odd_capacities() {
+        for capacity in [1, 2, 3, 5, 2049, native::peer_ring::MAX_VALUES - 1] {
+            let layout = MailboxLayout::new(3, capacity).expect("layout");
+            let unpadded = HEADER_BYTES + capacity * VALUE_BYTES;
+            assert!(layout.slot_bytes() >= unpadded);
+            assert!(layout.slot_bytes() - unpadded < 16);
+            for source in 0..3 {
+                for sequence in 1..=2 {
+                    assert_eq!(layout.slot_offset(source, sequence).expect("slot") % 16, 0);
+                }
+            }
+        }
     }
 }
 
