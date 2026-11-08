@@ -665,6 +665,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             &geometry_full,
             WeightLayout::Native,
             options.kv_mode,
+            false,
         )?,
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,

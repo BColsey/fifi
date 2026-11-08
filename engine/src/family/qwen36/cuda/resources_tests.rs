@@ -95,7 +95,8 @@ fn paged_mixer_views_use_owned_partials_instead_of_an_arena_slot() {
     let resident = StepPlan::new(&d, 1, &o, &scratch).unwrap();
     let paged = StepPlan::new_paged(&d, &o, &scratch).unwrap();
     for plan in [&resident, &paged] {
-        let indices = MixerViews::slot_indices(plan, &geometry, o.layout, o.kv_mode).unwrap();
+        let indices =
+            MixerViews::slot_indices(plan, &geometry, o.layout, o.kv_mode, false).unwrap();
         assert_eq!(
             indices
                 .iter()
