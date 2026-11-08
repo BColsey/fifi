@@ -79,7 +79,10 @@ export function liveRoutingPacket(live: RouteTracePacket): RoutingTracePacket | 
     const gates: number[][] = [];
     for (const step of live.steps) {
       const row = step.layers[l];
-      if (row === undefined) return null;
+      // A step must carry exactly the facts' layer count: fewer would
+      // render holes, more would silently truncate (two shapes in one
+      // process) \u2014 both refuse.
+      if (row === undefined || step.layers.length !== live.layers) return null;
       ids.push(row.ids);
       gates.push(row.weights);
       for (const id of row.ids) histogram[id] = (histogram[id] ?? 0) + 1;
@@ -217,7 +220,16 @@ export class InternalsView {
         const live = await getRouteTrace();
         const packet = liveRoutingPacket(live);
         if (packet === null) {
-          this.setBadge("Live \u2014 ring empty (no decode steps yet)");
+          // The two null causes say different things: no facts means no
+          // routing stage exists (flag off on a fresh process, or a
+          // non-qwen36-native engine); facts with no steps means the
+          // stage exists but nothing decoded yet.
+          const noStage = live.layers === null;
+          this.setBadge(
+            noStage
+              ? "Live \u2014 no routing stage (qwen36 native layout, Q36_ROUTE_STAGE=1)"
+              : "Live \u2014 ring empty (no decode steps yet)"
+          );
         } else {
           this.packet = packet;
           this.selectedToken = Math.min(this.selectedToken, packet.summary.tokens - 1);

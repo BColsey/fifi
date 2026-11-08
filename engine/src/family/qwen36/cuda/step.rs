@@ -815,8 +815,9 @@ impl<'a> QwenResidentStep<'a> {
         let route_stage = if route_stage_on && options.layout != WeightLayout::Exl3 && !tiered_mode
         {
             let dims = moe_dims(&res.dims);
+            let stage = new_route_stage(context, layers.len(), dims.top_k)?;
             crate::family::qwen36::route_stage::set_facts(layers.len(), dims.top_k, dims.n_expert);
-            Some(new_route_stage(context, layers.len(), dims.top_k)?)
+            Some(stage)
         } else {
             None
         };
@@ -1821,8 +1822,11 @@ impl<'a> QwenResidentStep<'a> {
         if let Some(stage) = self.route_stage.as_mut() {
             // The one host readback of the stage (see `RouteStage`): the stream is drained by
             // `read_back`, so this single `read_at` rides that sync and adds no wait of its own.
+            // A failure poisons like `read_back`'s own does, and the step index is claimed only
+            // after a successful read so the ring never shows a gap.
+            let picks =
+                read_staged_route(stage, &self.stream).inspect_err(|_| self.state.poison())?;
             let step = crate::family::qwen36::route_stage::begin_step();
-            let picks = read_staged_route(stage, &self.stream)?;
             if step < 2 {
                 let first = picks.first().expect("stage readback has layer 0");
                 let last = picks.last().expect("stage readback has the last layer");
