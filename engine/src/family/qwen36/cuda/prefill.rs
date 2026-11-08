@@ -958,6 +958,20 @@ fn model_facts(
     weights: &ChunkWeights<'_, '_>,
     layers: usize,
 ) -> Result<ModelFacts, EngError> {
+    model_facts_with(table, geometry, dims, weights, layers, None)
+}
+
+/// The card twin's seam: `moe` overrides the inter-dimensional facts (the
+/// card's inter and shared-inter slices) while every other dimension and
+/// every weight check stays the single-device rule.
+fn model_facts_with(
+    table: &LayerTable,
+    geometry: &MixerGeometry,
+    dims: &StepDims,
+    weights: &ChunkWeights<'_, '_>,
+    layers: usize,
+    card_moe: Option<crate::family::qwen36::host::MoeDims>,
+) -> Result<ModelFacts, EngError> {
     let mut facts = Vec::with_capacity(layers);
     for layer in 0..layers {
         let kind = table.slot(layer)?.kind;
@@ -1017,10 +1031,14 @@ fn model_facts(
             shared,
         });
     }
+    let inter = match &card_moe {
+        Some(card) => card.inter,
+        None => dims.shape.moe.inter,
+    };
     Ok(ModelFacts {
         eps_bits: geometry.eps.to_bits(),
         hidden: dims.shape.hidden,
-        inter: dims.shape.moe.inter,
+        inter,
         experts: dims.shape.moe.experts,
         layers: facts,
     })
@@ -1146,6 +1164,41 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         })
     }
 
+    /// The card twin: the same model with the CARD's inter dimensions (the
+    /// shard table's deal for this card) and the card's per-layer MoE views.
+    /// Every stack check then validates the card's slices, and `dims_at`
+    /// shapes the chunk MoE stages for them.
+    pub(super) fn card(
+        table: &'a LayerTable,
+        geometry: &'a MixerGeometry,
+        dims: &StepDims,
+        weights: ChunkWeights<'a, 'w>,
+        inter: usize,
+        shared_inter: usize,
+    ) -> Result<Self, EngError> {
+        let host_moe = crate::family::qwen36::host::MoeDims {
+            inter,
+            shared_inter,
+            ..dims.shape.moe
+        };
+        let facts = model_facts_with(table, geometry, dims, &weights, table.len(), Some(host_moe))?;
+        check_model(&facts, table.len())?;
+        let moe_dims = super::moe::MoeDims::new(dims, 1);
+        let moe_dims = super::moe::MoeDims {
+            inter,
+            shared_inter,
+            ..moe_dims
+        };
+        Ok(Self {
+            table,
+            geometry,
+            moe_dims,
+            weights,
+            layers: table.len(),
+            vocab: dims.shape.vocab,
+        })
+    }
+
     /// The same checks over the first `n` layers (the rig seam).
     #[cfg(test)]
     pub(super) fn leading(
@@ -1164,6 +1217,11 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
             layers: n,
             vocab: dims.shape.vocab,
         })
+    }
+
+    /// The MoE dims this model shapes its chunk stages for (the rig seam).
+    pub(super) fn moe_dims(&self) -> MoeDims {
+        self.moe_dims
     }
 
     fn dims_at(&self, m: usize) -> MoeDims {
