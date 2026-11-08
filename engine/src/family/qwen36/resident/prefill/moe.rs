@@ -813,9 +813,16 @@ mod tests {
         );
         let health = values(&mut kernels, &device.health).unwrap()[0];
         assert!((health - 1.0).abs() <= 1e-5, "health {health}");
+        // The decode seam folds the output residual; the device chunk keeps the mixer output.
+        let decode_mixer: Vec<f32> = values(&mut kernels, &decode)
+            .unwrap()
+            .iter()
+            .zip(&x)
+            .map(|(v, r)| v - r)
+            .collect();
         assert_close_relative(
             &values(&mut kernels, &device.out).unwrap(),
-            &values(&mut kernels, &decode).unwrap(),
+            &decode_mixer,
             1e-6,
             "one row against the decode block",
         );
