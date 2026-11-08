@@ -63,7 +63,7 @@ fn decode(step: &mut QwenResidentStep<'_>) -> Result<Decoded, EngError> {
     }
     let mut hash = Sha256::new();
     for id in &next {
-        hash.update(&id.to_le_bytes());
+        hash.update(id.to_le_bytes());
     }
     for row in &rows {
         hash.update(row);

@@ -233,7 +233,7 @@ fn run_block_rounded(
     moe: &MoeDims,
     device_ids: bool,
     round: usize,
-    mut bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<Device, EngError> {
     let (row, resid) = inputs_of_round(moe.hidden, round);
     let h = moe.hidden * F32;
@@ -301,7 +301,7 @@ fn run_block_rounded(
         &bufs,
         moe,
         device_ids,
-        bank.as_deref_mut(),
+        bank,
     )?;
     stream.synchronize()?;
     let ids = read(projector, &owned.buffers[4])

@@ -2,7 +2,7 @@
 
 Lane `task/q36-exl3-bank`, base `d2015ab85` (2026-11-07). Target: run
 Qwen3.6-35B-A3B EXL3 packs on cards that cannot hold the whole routed bank
-(first target: danlap, RTX 4050 6 GB, 14 GiB RAM — see the lane NOW.md).
+(first target: RTX 4050 6 GB, 14 GiB RAM — see the lane NOW.md).
 
 ## Problem
 
@@ -77,7 +77,7 @@ miss resolver at the existing `read_picks` site.**
   `prefill_exl3_moe.rs:167`) after a 256-bin host sort (`read_plan`), so the
   remap happens there, host-side (reviewer finding 3). A piece that touches
   all 256 experts of a layer streams them through the slots once per piece.
-  Measured cost on danlap (PCIe gen4 x8) decides whether we need flint's
+  Measured cost on the 4050 (PCIe gen4 x8) decides whether we need flint's
   `cache_prefill_floor` analog later. The floor itself is a follow-up, not
   v1.
 - **Knobs** (q36 convention — JSON, not env): a `qwen36.expert_bank` object,
@@ -101,21 +101,21 @@ multi-device, mmap/NVMe host store. Each is a follow-up with its own gate.
   `plan_bank`/`choose_slots` semantics via the q36 JSON surface); slot table
   LRU behavior; settings refusals (tiered+expert_bank, capture+bank,
   drafts+bank) by name.
-- Device (danlap, `--test-threads=1`, single lease): fixture-pack banked step
+- Device (RTX 4050, `--test-threads=1`, single lease): fixture-pack banked step
   vs resident step logits parity (same pack, `slots=256` bank ≡ resident);
   miss-copy correctness with `slots < 256` against a resident reference run;
   LRU eviction order; readback/copy fencing.
-- End-to-end (danlap, 2.08 bpw pack): `/ready`, smoke completion, decode
+- End-to-end (RTX 4050, 2.08 bpw pack): `/ready`, smoke completion, decode
   rate + miss statistics (the flint bank keeps hit/miss counters — carry
   them into the route report), prefill wall time per piece size.
 
 ## Milestones
 
 - M1: settings + budget + banked load (host store, slot banks, admission) —
-  default-off, unit-green, device load test on danlap fixture.
+  default-off, unit-green, device load test on the 4050 fixture.
 - M2: decode miss resolver + eager banked step + parity tests; capture
   refusal wiring.
-- M3: prefill through the resolver; danlap end-to-end on the 2.08 pack;
+- M3: prefill through the resolver; 4050 end-to-end on the 2.08 pack;
   measurements + report; review (zai/glm-5.3).
 
 ## Review
@@ -134,7 +134,7 @@ supplies slot-indexed banks and must carry its own member check.
   own `check_bank` (tiered's full-depth-facts trick is the precedent).
 - Per-layer sync cost: the eager path already pays the picks readback per
   layer; miss copies add H2D on the same stream. Bound the per-token serial
-  copy time on danlap before optimizing (M2 measurement).
+  copy time on the 4050 before optimizing (M2 measurement).
 - Shared expert ("shared in routed") is structurally outside the routed
   banks (three single `CudaWeight::Exl3` matrices,
   `exl3_moe_source.rs:167-176`) — it stays resident and out of the slot

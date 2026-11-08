@@ -1759,7 +1759,7 @@ impl<'a> QwenResidentStep<'a> {
             // The banked session's pulse: one line every 256 tokens, the cumulative hit/miss
             // counts that explain its speed (a miss is a host-store refill).
             self.banked_echo += 1;
-            if self.banked_echo % 256 == 0 {
+            if self.banked_echo.is_multiple_of(256) {
                 let (hits, misses) = bank.borrow().stats();
                 eprintln!(
                     "q36 cuda: EXL3 expert bank after {} tokens: hits {hits}, misses {misses}",
