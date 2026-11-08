@@ -137,8 +137,10 @@ impl CardStack {
             contexts.push(context);
         }
         // The ring first: it captures each mailbox's base address from the
-        // bare contexts before anything else borrows them.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden)?;
+        // bare contexts before anything else borrows them. The payload cap
+        // covers the MoE all-reduce, which exchanges every `expert_down`
+        // pick row (`top_k` hidden rows) in one sequence.
+        let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());

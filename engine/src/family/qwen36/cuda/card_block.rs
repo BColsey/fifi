@@ -186,10 +186,10 @@ pub(crate) fn run_card_block(
 /// * `RouteBroadcast`: ids, pick weights and the shared gate - the router's
 ///   whole output - ride three word broadcasts from card 0, so every card
 ///   then computes the same experts;
-/// * `MoeSum`: each pick slot's `expert_down` row and the `shared_out` row
+/// * `MoeSum`: the whole `expert_down` pick block and the `shared_out` row
 ///   are full-width partials (the card's down projection covers its
-///   intermediate slice), summed in place per row - the ring's payload cap
-///   is one hidden row.
+///   intermediate slice), summed in place - the picks ride one exchange
+///   sized `top_k` hidden rows, the shared row another.
 pub(crate) fn run_card_moe_block(
     stack: &CardStack,
     weights: &[MoeLayerWeights<'_>],
@@ -272,21 +272,17 @@ pub(crate) fn run_card_moe_block(
                 }
             }
             CardMoeOp::MoeSum => {
-                let top_k = bufs[0].route.ids.bytes() / 4;
-                let hidden = bufs[0].route.resid_in.bytes() / 4;
-                for slot in 0..top_k {
-                    let mut partials = Vec::with_capacity(cards);
-                    for buf in bufs {
-                        partials.push(buf.expert.expert_down.buffer().range(
-                            buf.expert.expert_down.offset() + slot * hidden * F32,
-                            hidden * F32,
-                        )?);
-                    }
-                    stack.exchange_sum(&partials, &partials, &statuses, hidden, RingMode::F32)?;
-                }
+                // The pick rows are contiguous in `expert_down`, so every
+                // row rides ONE exchange instead of one sequence per pick.
+                let rows = bufs[0].expert.expert_down.bytes() / 4;
+                let partials: Vec<DeviceRange<'_>> = (0..cards)
+                    .map(|card| bufs[card].expert.expert_down)
+                    .collect();
+                stack.exchange_sum(&partials, &partials, &statuses, rows, RingMode::F32)?;
                 let shared: Vec<DeviceRange<'_>> = (0..cards)
                     .map(|card| bufs[card].expert.shared_out)
                     .collect();
+                let hidden = bufs[0].route.resid_in.bytes() / 4;
                 stack.exchange_sum(&shared, &shared, &statuses, hidden, RingMode::F32)?;
             }
             CardMoeOp::Local(_) => unreachable!("the local loop advanced every cursor"),
