@@ -207,7 +207,7 @@ fn run_bufs(ctx: &CudaContext, dims: &MoeDims) -> Result<RunBufs, EngError> {
             q8(dims.shared_inter, 1)?,
         ],
         expert_gu: zero_buf(ctx, dims.top_k * dims.inter * 2 * F32)?,
-        expert_down: zero_buf(ctx, dims.top_k * dims.hidden * F32)?,
+        expert_down: zero_buf(ctx, (dims.top_k + 1) * dims.hidden * F32)?,
         shared_gu: zero_buf(ctx, dims.shared_inter * 2 * F32)?,
         shared_out: zero_buf(ctx, dims.hidden * F32)?,
     })
@@ -217,7 +217,14 @@ fn range(buf: &DeviceBuffer) -> Result<crate::kernels::cuda::DeviceRange<'_>, En
     buf.range(0, buf.bytes())
 }
 
-fn moe_bufs(b: &RunBufs) -> Result<MoeBuffers<'_>, EngError> {
+fn moe_bufs(b: &RunBufs, combined: bool) -> Result<MoeBuffers<'_>, EngError> {
+    let row_bytes = b.resid.bytes();
+    let down_bytes = (b.ids.bytes() / 4) * row_bytes;
+    let shared_out = if combined {
+        b.expert_down.range(down_bytes, row_bytes)?
+    } else {
+        range(&b.shared_out)?
+    };
     Ok(MoeBuffers {
         route: RouteBufs {
             resid_in: range(&b.resid)?,
@@ -236,9 +243,9 @@ fn moe_bufs(b: &RunBufs) -> Result<MoeBuffers<'_>, EngError> {
                 shared: range(&b.packs[2])?,
             },
             expert_gu: range(&b.expert_gu)?,
-            expert_down: range(&b.expert_down)?,
+            expert_down: b.expert_down.range(0, down_bytes)?,
             shared_gu: range(&b.shared_gu)?,
-            shared_out: range(&b.shared_out)?,
+            shared_out,
         },
     })
 }
@@ -270,7 +277,7 @@ struct TokenRun {
     shared_pack: Vec<u8>,
 }
 
-fn read_run(stream: &DeviceStream, b: &RunBufs) -> Result<TokenRun, EngError> {
+fn read_run(stream: &DeviceStream, b: &RunBufs, combined: bool) -> Result<TokenRun, EngError> {
     let read_f32 = |buf: &DeviceBuffer| -> Result<Vec<f32>, EngError> {
         let mut bytes = vec![0u8; buf.bytes()];
         buf.read_at(stream, 0, &mut bytes)?;
@@ -295,14 +302,21 @@ fn read_run(stream: &DeviceStream, b: &RunBufs) -> Result<TokenRun, EngError> {
     b.packs[1].read_at(stream, 0, &mut down_pack)?;
     let mut shared_pack = vec![0u8; b.packs[2].bytes()];
     b.packs[2].read_at(stream, 0, &mut shared_pack)?;
+    let mut expert_down = read_f32(&b.expert_down)?;
+    let shared_tail = expert_down.split_off((b.ids.bytes() / 4) * (b.resid.bytes() / F32));
+    let shared_out = if combined {
+        shared_tail
+    } else {
+        read_f32(&b.shared_out)?
+    };
     Ok(TokenRun {
         ids: read_i32(&b.ids)?,
         weights: read_f32(&b.weights)?,
         shared_gate: read_f32(&b.shared_gate)?,
         expert_gu: read_f32(&b.expert_gu)?,
-        expert_down: read_f32(&b.expert_down)?,
+        expert_down,
         shared_gu: read_f32(&b.shared_gu)?,
-        shared_out: read_f32(&b.shared_out)?,
+        shared_out,
         resid_out: read_f32(&b.resid_out)?,
         down_pack,
         shared_pack,
@@ -345,7 +359,11 @@ struct Evidence {
     words: Vec<u32>,
 }
 
-fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngError> {
+fn run_rig(
+    devices: [usize; 2],
+    compare_fused: bool,
+    compare_shared: bool,
+) -> Result<Evidence, EngError> {
     let d = step_dims();
     let table = ShardTable::new(&d.shape, 2, 32).expect("table");
     let full = MoeDims::new(&d, 1);
@@ -362,7 +380,9 @@ fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngErro
 
     let s = sources(&full, 0x50E_FEED);
     let admission = served_admission();
-    let (mut stack, _states) = if compare_fused {
+    let (mut stack, _states) = if compare_shared {
+        CardStack::new_for_fused_shared_sum_test(&d, &options(), &devices, &admission)?
+    } else if compare_fused {
         CardStack::new_for_fused_expert_sum_test(&d, &options(), &devices, &admission)?
     } else {
         CardStack::new(&d, &options(), &devices, &admission)?
@@ -510,29 +530,35 @@ fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngErro
             run_moe_block(
                 &Launch { ctx: ctx0, stream },
                 &reference.moe(&router, &router_shared),
-                &moe_bufs(&ref_bufs)?,
+                &moe_bufs(&ref_bufs, false)?,
                 &full,
             )?;
             stream.synchronize()?;
         }
-        let reference_run = read_run(&stack.streams()[0], &ref_bufs)?;
+        let reference_run = read_run(&stack.streams()[0], &ref_bufs, false)?;
         let mut card_runs = Vec::with_capacity(2);
         for ((ctx, stream), bufs) in stack.contexts().iter().zip(stack.streams()).zip(&card_bufs) {
             bufs.norm.write_at(stream, 0, &f32_bytes(&s.norms[t]))?;
             bufs.resid.write_at(stream, 0, &f32_bytes(&s.resids[t]))?;
             produce(ctx, stream, bufs)?;
         }
-        let buf_sets: Vec<MoeBuffers<'_>> =
-            card_bufs.iter().map(moe_bufs).collect::<Result<_, _>>()?;
+        let buf_sets: Vec<MoeBuffers<'_>> = card_bufs
+            .iter()
+            .map(|b| moe_bufs(b, false))
+            .collect::<Result<_, _>>()?;
         let separate_start = stack.ring().next_sequence_for_test();
         run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
         let separate_count = stack.ring().next_sequence_for_test() - separate_start;
         for (stream, bufs) in stack.streams().iter().zip(&card_bufs) {
             stream.synchronize()?;
-            card_runs.push(read_run(stream, bufs)?);
+            card_runs.push(read_run(stream, bufs, false)?);
         }
-        if compare_fused {
-            stack.set_fused_expert_sum_for_test(true);
+        if compare_fused || compare_shared {
+            if compare_shared {
+                stack.set_fused_shared_sum_for_test(true);
+            } else {
+                stack.set_fused_expert_sum_for_test(true);
+            }
             for ((ctx, stream), bufs) in
                 stack.contexts().iter().zip(stack.streams()).zip(&card_bufs)
             {
@@ -540,20 +566,29 @@ fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngErro
                 bufs.resid.write_at(stream, 0, &f32_bytes(&s.resids[t]))?;
                 produce(ctx, stream, bufs)?;
             }
+            let fused_buf_sets: Vec<MoeBuffers<'_>> = card_bufs
+                .iter()
+                .map(|b| moe_bufs(b, compare_shared))
+                .collect::<Result<_, _>>()?;
             let fused_start = stack.ring().next_sequence_for_test();
-            run_card_moe_block(&stack, &weight_sets, &buf_sets, &op_lists)?;
+            run_card_moe_block(&stack, &weight_sets, &fused_buf_sets, &op_lists)?;
             let fused_count = stack.ring().next_sequence_for_test() - fused_start;
             assert_eq!(
                 separate_count,
-                fused_count + u32::try_from(full.top_k - 1).unwrap(),
-                "the fused path must replace top-k sums with one exchange"
+                fused_count
+                    + if compare_shared {
+                        1
+                    } else {
+                        u32::try_from(full.top_k - 1).unwrap()
+                    },
+                "the fused path must remove the expected exchanges"
             );
             if step == 0 {
                 println!("MoE ring exchanges: separate {separate_count}, fused {fused_count}");
             }
             for (card, (stream, bufs)) in stack.streams().iter().zip(&card_bufs).enumerate() {
                 stream.synchronize()?;
-                let fused = read_run(stream, bufs)?;
+                let fused = read_run(stream, bufs, compare_shared)?;
                 assert_eq!(fused, card_runs[card], "step {step} card {card}");
                 for (label, got, want) in [
                     (
@@ -561,6 +596,7 @@ fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngErro
                         &fused.expert_down,
                         &card_runs[card].expert_down,
                     ),
+                    ("shared_out", &fused.shared_out, &card_runs[card].shared_out),
                     ("resid_out", &fused.resid_out, &card_runs[card].resid_out),
                 ] {
                     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -571,7 +607,11 @@ fn run_rig(devices: [usize; 2], compare_fused: bool) -> Result<Evidence, EngErro
                     );
                 }
             }
-            stack.set_fused_expert_sum_for_test(false);
+            if compare_shared {
+                stack.set_fused_shared_sum_for_test(false);
+            } else {
+                stack.set_fused_expert_sum_for_test(false);
+            }
         }
         tokens.push((reference_run, card_runs));
     }
@@ -614,7 +654,7 @@ fn a_moe_block_runs_distributed_and_matches_the_reference() {
     if !device_present(NAME) {
         return;
     }
-    let ev = run_rig([0, 0], false).expect("the rig");
+    let ev = run_rig([0, 0], false, false).expect("the rig");
     let dims = &ev.dims;
     let gu_stride = |d: &MoeDims| d.inter * 2;
     let pack_row = |d: &MoeDims| q8_1_bytes(d.inter, 1).expect("q8 row");
@@ -736,7 +776,22 @@ fn fused_expert_sums_match_separate_sums_on_peer_gpus() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
-    let evidence = run_rig(devices, true).expect("fused and separate sums");
+    let evidence = run_rig(devices, true, false).expect("fused and separate sums");
+    assert_eq!(evidence.tokens.len(), TOKENS * 8);
+    assert_eq!(evidence.words, vec![0, 0]);
+}
+
+#[test]
+#[ignore = "requires two peer-enabled CUDA devices; run alone under the GPU lease"]
+fn fused_shared_sum_matches_separate_sum_on_peer_gpus() {
+    assert!(device_present(
+        "fused_shared_sum_matches_separate_sum_on_peer_gpus"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
+    let evidence = run_rig(devices, false, true).expect("combined shared and separate sums");
     assert_eq!(evidence.tokens.len(), TOKENS * 8);
     assert_eq!(evidence.words, vec![0, 0]);
 }

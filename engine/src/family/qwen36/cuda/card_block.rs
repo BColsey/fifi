@@ -296,8 +296,56 @@ pub(crate) fn run_card_moe_block(
                                 .range(buf.expert.expert_down.offset(), bytes)?,
                         );
                     }
-                    stack.exchange_sum(&partials, &partials, &statuses, count, RingMode::F32)?;
+                    if stack.fused_shared_sum() {
+                        let shared_bytes = hidden.checked_mul(F32).ok_or_else(|| {
+                            EngError::BadRequest("card moe: shared row bytes overflow".into())
+                        })?;
+                        let total = bytes.checked_add(shared_bytes).ok_or_else(|| {
+                            EngError::BadRequest("card moe: combined sum bytes overflow".into())
+                        })?;
+                        for (partial, buf) in partials.iter_mut().zip(bufs) {
+                            let expected =
+                                partial.offset().checked_add(bytes).ok_or_else(|| {
+                                    EngError::BadRequest(
+                                        "card moe: shared row offset overflows".into(),
+                                    )
+                                })?;
+                            if !std::ptr::eq(partial.buffer(), buf.expert.shared_out.buffer())
+                                || buf.expert.shared_out.offset() != expected
+                                || buf.expert.shared_out.bytes() != shared_bytes
+                            {
+                                return Err(EngError::BadRequest(
+                                    "card moe: shared sum row must immediately follow expert rows"
+                                        .into(),
+                                ));
+                            }
+                            *partial = partial.buffer().range(partial.offset(), total)?;
+                        }
+                        let total_count = count.checked_add(hidden).ok_or_else(|| {
+                            EngError::BadRequest("card moe: combined sum count overflows".into())
+                        })?;
+                        stack.exchange_sum(
+                            &partials,
+                            &partials,
+                            &statuses,
+                            total_count,
+                            RingMode::F32,
+                        )?;
+                    } else {
+                        stack.exchange_sum(
+                            &partials,
+                            &partials,
+                            &statuses,
+                            count,
+                            RingMode::F32,
+                        )?;
+                    }
                 } else {
+                    if stack.fused_shared_sum() {
+                        return Err(EngError::BadRequest(
+                            "card moe: shared fusion requires expert fusion".into(),
+                        ));
+                    }
                     for slot in 0..top_k {
                         let mut partials = Vec::with_capacity(cards);
                         for buf in bufs {
@@ -315,10 +363,12 @@ pub(crate) fn run_card_moe_block(
                         )?;
                     }
                 }
-                let shared: Vec<DeviceRange<'_>> = (0..cards)
-                    .map(|card| bufs[card].expert.shared_out)
-                    .collect();
-                stack.exchange_sum(&shared, &shared, &statuses, hidden, RingMode::F32)?;
+                if !stack.fused_shared_sum() {
+                    let shared: Vec<DeviceRange<'_>> = (0..cards)
+                        .map(|card| bufs[card].expert.shared_out)
+                        .collect();
+                    stack.exchange_sum(&shared, &shared, &statuses, hidden, RingMode::F32)?;
+                }
             }
             CardMoeOp::Local(_) => unreachable!("the local loop advanced every cursor"),
         }

@@ -115,6 +115,8 @@ pub(crate) struct CardStack {
     async_broadcasts: Cell<bool>,
     /// Experimental: reduce all contiguous routed-expert rows at once.
     fused_expert_sum: Cell<bool>,
+    /// Experimental: reduce the shared expert row with the routed rows.
+    fused_shared_sum: Cell<bool>,
 }
 
 pub(super) fn expert_sum_count(hidden: usize, top_k: usize) -> Result<usize, EngError> {
@@ -143,7 +145,17 @@ impl CardStack {
         let fused = std::env::var_os("Q36_P2P_FUSE_EXPERT_SUM").is_some_and(|value| value == "1");
         let async_broadcasts =
             std::env::var_os("Q36_P2P_ASYNC_BROADCAST").is_some_and(|value| value == "1");
-        Self::new_with_flags(dims, options, devices, admission, fused, async_broadcasts)
+        let fused_shared =
+            std::env::var_os("Q36_P2P_FUSE_SHARED_SUM").is_some_and(|value| value == "1");
+        Self::new_with_flags(
+            dims,
+            options,
+            devices,
+            admission,
+            fused,
+            async_broadcasts,
+            fused_shared,
+        )
     }
 
     fn new_with_flags(
@@ -153,7 +165,13 @@ impl CardStack {
         admission: &Admission,
         fused: bool,
         async_broadcasts: bool,
+        fused_shared: bool,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        if fused_shared && !fused {
+            return Err(EngError::BadRequest(
+                "card stack: fused shared sum requires Q36_P2P_FUSE_EXPERT_SUM=1".into(),
+            ));
+        }
         if devices.is_empty() {
             return Err(EngError::BadRequest(
                 "the card stack needs at least one device".to_owned(),
@@ -171,7 +189,15 @@ impl CardStack {
         // The ring first: it captures each mailbox's base address from the
         // bare contexts before anything else borrows them.
         let mailbox_values = if fused {
-            expert_sum_count(dims.shape.hidden, dims.shape.moe.top_k)?
+            let picks = dims
+                .shape
+                .moe
+                .top_k
+                .checked_add(usize::from(fused_shared))
+                .ok_or_else(|| {
+                    EngError::BadRequest("card stack: fused sum picks overflow".into())
+                })?;
+            expert_sum_count(dims.shape.hidden, picks)?
         } else {
             dims.shape.hidden
         };
@@ -190,7 +216,11 @@ impl CardStack {
         let mut shards = Vec::with_capacity(devices.len());
         let mut states = Vec::with_capacity(devices.len());
         for (card, context) in contexts.iter().enumerate() {
-            let plan = StepPlan::for_card(dims, &table, card, options, &scratch)?;
+            let plan = if fused_shared {
+                StepPlan::for_card_with_shared_capacity(dims, &table, card, options, &scratch)?
+            } else {
+                StepPlan::for_card(dims, &table, card, options, &scratch)?
+            };
             shards.push(CardShard::new(context, &streams[card], &plan)?);
             states.push(ResidentState::allocate(
                 context,
@@ -212,6 +242,7 @@ impl CardStack {
                 sync_broadcasts,
                 async_broadcasts: Cell::new(async_broadcasts),
                 fused_expert_sum: Cell::new(fused),
+                fused_shared_sum: Cell::new(fused_shared),
             },
             states,
         ))
@@ -267,6 +298,28 @@ impl CardStack {
         self.fused_expert_sum.get()
     }
 
+    pub(super) fn fused_shared_sum(&self) -> bool {
+        self.fused_shared_sum.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_fused_shared_sum_test(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let (stack, states) =
+            Self::new_with_flags(dims, options, devices, admission, true, true, true)?;
+        stack.fused_shared_sum.set(false);
+        Ok((stack, states))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fused_shared_sum_for_test(&self, enabled: bool) {
+        self.fused_shared_sum.set(enabled);
+    }
+
     #[cfg(test)]
     pub(super) fn new_for_fused_expert_sum_test(
         dims: &StepDims,
@@ -274,7 +327,8 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
-        let (stack, states) = Self::new_with_flags(dims, options, devices, admission, true, false)?;
+        let (stack, states) =
+            Self::new_with_flags(dims, options, devices, admission, true, false, false)?;
         stack.fused_expert_sum.set(false);
         Ok((stack, states))
     }
@@ -286,7 +340,8 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
-        let (stack, states) = Self::new_with_flags(dims, options, devices, admission, true, true)?;
+        let (stack, states) =
+            Self::new_with_flags(dims, options, devices, admission, true, true, false)?;
         stack.async_broadcasts.set(false);
         Ok((stack, states))
     }

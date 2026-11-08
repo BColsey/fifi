@@ -237,6 +237,29 @@ fn describe(plan: &StepPlan) -> Vec<(Slot, usize, usize, usize)> {
 }
 
 #[test]
+fn shared_sum_capacity_adds_one_row_to_the_card_expert_slot() {
+    let d = dims();
+    let table = ShardTable::new(&d.shape, 2, 32).expect("table");
+    for mode in [KvMode::Fp16, KvMode::Int8G32] {
+        let options = native_options(mode);
+        let scratch = KernelScratch::for_dims(&d, 1, mode).expect("scratch");
+        for card in 0..2 {
+            let normal = StepPlan::for_card(&d, &table, card, &options, &scratch).expect("normal");
+            let combined =
+                StepPlan::for_card_with_shared_capacity(&d, &table, card, &options, &scratch)
+                    .expect("combined");
+            let mut expected = describe(&normal);
+            let down = expected
+                .iter_mut()
+                .find(|slot| slot.0 == Slot::ExpertDown)
+                .expect("expert slot");
+            down.1 += d.shape.hidden * size_of::<f32>();
+            assert_eq!(describe(&combined), expected, "card {card}, {mode:?}");
+        }
+    }
+}
+
+#[test]
 fn a_one_card_plan_is_the_single_device_native_plan_plus_the_gathered_rows() {
     let d = dims();
     let kv_width = d.shape.attn.heads_kv * d.shape.attn.head_dim;

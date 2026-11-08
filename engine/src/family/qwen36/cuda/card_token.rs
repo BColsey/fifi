@@ -173,6 +173,40 @@ pub(crate) fn run_card_token(
                 shared_gate: view(card, Slot::SharedGate)?,
                 status: *status,
             };
+            let down_slot = view(card, Slot::ExpertDown)?;
+            let down_bytes = (route.ids.bytes() / F32)
+                .checked_mul(hidden)
+                .and_then(|v| v.checked_mul(F32))
+                .ok_or_else(|| {
+                    EngError::BadRequest("card token: expert row size overflows".into())
+                })?;
+            let shared_bytes = hidden.checked_mul(F32).ok_or_else(|| {
+                EngError::BadRequest("card token: shared row size overflows".into())
+            })?;
+            let required = down_bytes
+                .checked_add(if stack.fused_shared_sum() {
+                    shared_bytes
+                } else {
+                    0
+                })
+                .ok_or_else(|| {
+                    EngError::BadRequest("card token: expert sum size overflows".into())
+                })?;
+            if down_slot.bytes() < required {
+                return Err(EngError::BadRequest(
+                    "card token: expert output slot too small".into(),
+                ));
+            }
+            let down_offset = down_slot.offset();
+            let expert_down = down_slot.buffer().range(down_offset, down_bytes)?;
+            let shared_out = if stack.fused_shared_sum() {
+                let offset = down_offset.checked_add(down_bytes).ok_or_else(|| {
+                    EngError::BadRequest("card token: shared offset overflows".into())
+                })?;
+                down_slot.buffer().range(offset, shared_bytes)?
+            } else {
+                view(card, Slot::SharedOut)?
+            };
             let expert = ExpertBufs {
                 packs: Packs::Q8 {
                     moe: view(card, Slot::Q8Moe)?,
@@ -180,9 +214,9 @@ pub(crate) fn run_card_token(
                     shared: view(card, Slot::Q8Shared)?,
                 },
                 expert_gu: view(card, Slot::ExpertGu)?,
-                expert_down: view(card, Slot::ExpertDown)?,
+                expert_down,
                 shared_gu: view(card, Slot::SharedGu)?,
-                shared_out: view(card, Slot::SharedOut)?,
+                shared_out,
             };
             sets.push(MoeBuffers { route, expert });
         }

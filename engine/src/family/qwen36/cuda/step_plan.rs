@@ -580,6 +580,28 @@ impl StepPlan {
         options: &StepOptions,
         scratch: &KernelScratch,
     ) -> Result<Self, EngError> {
+        Self::card_plan(dims, table, card, options, scratch, false)
+    }
+
+    /// Reserve one additional hidden row immediately after the routed expert rows.
+    pub(super) fn for_card_with_shared_capacity(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+        options: &StepOptions,
+        scratch: &KernelScratch,
+    ) -> Result<Self, EngError> {
+        Self::card_plan(dims, table, card, options, scratch, true)
+    }
+
+    fn card_plan(
+        dims: &StepDims,
+        table: &ShardTable,
+        card: usize,
+        options: &StepOptions,
+        scratch: &KernelScratch,
+        shared_capacity: bool,
+    ) -> Result<Self, EngError> {
         if options.layout != WeightLayout::Native {
             return Err(EngError::BadRequest(
                 "card step plan: the multi-device step takes the native layout".to_owned(),
@@ -593,6 +615,21 @@ impl StepPlan {
         };
         list_card_mixers(&mut list, dims, &geometry, scratch)?;
         list_card_moe(&mut list, dims, table, card, scratch)?;
+        if shared_capacity {
+            let extra = dims.shape.hidden.checked_mul(F32).ok_or_else(|| {
+                EngError::MemoryPlan("card step plan: shared sum row overflows".into())
+            })?;
+            let down = list
+                .slots
+                .iter_mut()
+                .find(|slot| slot.slot == Slot::ExpertDown)
+                .ok_or_else(|| {
+                    EngError::MemoryPlan("card step plan: missing expert output".into())
+                })?;
+            down.bytes = down.bytes.checked_add(extra).ok_or_else(|| {
+                EngError::MemoryPlan("card step plan: shared sum capacity overflows".into())
+            })?;
+        }
         let h = dims.shape.hidden;
         list.add(Slot::Q8Final, list.q8(h, 1), FINAL_NORM, LM_HEAD)?;
         list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
