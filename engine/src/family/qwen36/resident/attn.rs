@@ -1303,9 +1303,11 @@ mod tests {
         cpu: &mut CpuProjector<'_>,
         shape: &HostShape,
         host_w: &AttnW<'_, StoredWeight>,
+        input_norm: &[f32],
         n: u32,
     ) -> (Vec<f32>, Vec<f32>) {
-        let x = input(n);
+        // The seam folds the input norm, so the reference rows project the NORMED input.
+        let x = rms_plain(&input(n), input_norm, shape.eps).unwrap();
         let kp = cpu.linear(host_w.k, &x).unwrap();
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
         let mut key = Vec::new();
@@ -1351,7 +1353,7 @@ mod tests {
         let mut keys: Vec<Vec<f32>> = Vec::new();
         let mut vals: Vec<Vec<f32>> = Vec::new();
         for n in 0..200u32 {
-            let (key, val) = host_kv_rows(&mut cpu, &shape, host_w, n);
+            let (key, val) = host_kv_rows(&mut cpu, &shape, host_w, view.layers[1].input_norm, n);
             keys.push(key);
             vals.push(val);
         }
