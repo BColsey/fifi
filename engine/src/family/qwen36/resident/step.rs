@@ -205,8 +205,8 @@ pub(super) fn run(
     let head = match mode {
         StepMode::Prompt => None,
         StepMode::Window => {
-            return Err(bad(
-                "a verify window needs the chunk path: a one-row step has no window",
+            return Err(EngError::BadRequest(
+                "a verify window needs the chunk path: a one-row step has no window".into(),
             ));
         }
         StepMode::Generate | StepMode::Logits | StepMode::Record => {

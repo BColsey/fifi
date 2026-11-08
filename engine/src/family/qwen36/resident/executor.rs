@@ -707,7 +707,7 @@ impl Q36Executor {
 
     /// Turns the speculation settings into the engine's drafter (`settings::speculator_of`).
     /// `None` (a disabled `draft_mode`) keeps the one-row decode of every job.
-    pub(super) fn set_speculation(&mut self, config: &SpecConfig) -> Result<()> {
+    pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<()> {
         self.speculator = speculator_of(config)?;
         Ok(())
     }

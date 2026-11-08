@@ -500,7 +500,11 @@ pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
 /// the host. The settings parser refuses a window of more than 8 rows already; a step built from a
 /// hand-made config meets the same cap here, before the mode is looked at. The CUDA step's
 /// `set_speculation` is this function plus an assignment.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 pub(crate) fn speculator_of(
     config: &SpecConfig,
 ) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
