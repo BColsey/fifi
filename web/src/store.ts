@@ -179,6 +179,8 @@ export interface UiMessage {
   replyId?: string;
   /** Present only when capture was armed; see TraceSeg. */
   traceSegs?: TraceSeg[];
+  /** The model that generated this traced reply, even if the picker later changes. */
+  traceModel?: string;
 }
 
 export interface ChatRecord {

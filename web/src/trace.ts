@@ -64,7 +64,7 @@ export class TraceView {
     column.append(loading);
     let packet: SamplerTracePacket;
     try {
-      packet = await getSamplerTrace(this.message.replyId ?? "");
+      packet = await getSamplerTrace(this.message.replyId ?? "", undefined, this.message.traceModel);
     } catch (err) {
       loading.textContent =
         err instanceof ApiError && err.status === 404
