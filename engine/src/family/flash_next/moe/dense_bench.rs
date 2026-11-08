@@ -244,6 +244,7 @@ fn full_prefix(case: &Case) -> Res<String> {
 }
 
 /// Facts of one matrix read from the pack.
+#[derive(Clone)]
 struct Shape {
     k: usize,
     n: usize,
