@@ -2835,7 +2835,15 @@ mod fault_tests {
         if announce_count(ctx.kernels) {
             return Ok(());
         }
-        let got = compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x)?;
+        let got = compiled::delta_step(
+            &mut ctx,
+            &shape,
+            w,
+            &rec,
+            &ring,
+            &x,
+            first_delta_norm(&decoder.weights).unwrap(),
+        )?;
         ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])
     }
 
@@ -2860,7 +2868,13 @@ mod fault_tests {
         if announce_count(ctx.kernels) {
             return Ok(());
         }
-        let (out, route) = compiled::moe_step_device(&mut ctx, &shape, w, &x)?;
+        let (out, route) = compiled::moe_step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )?;
         ctx.kernels
             .evaluate(&[&out, route.ids.ids(), &route.gates, &route.health])
     }
