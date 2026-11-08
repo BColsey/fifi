@@ -35,21 +35,27 @@ SSE proxy), and the model still counted 1..120 correctly at full depth.
 
 ## What still blocks the 256k goal
 
-KV is replicated full-size on both cards (10,880 B/position, 2.85 GB per
-card at 262144). Admission arithmetic at 256k needs each card's tensors
-below `free - 2.85 GB - floors`; the even 50/50 shard deal puts card 1 at
-its floor (only ~6.05 GiB of its expert mass is host-eligible), 385 MB
-short. So 256k requires an uneven shard split - the waterfill planner.
+Resolved and re-scoped (second night session): `Q36_P2P_WATERFILL=1` now
+serves end to end (grain fixes 9267ca0 + 10b8e52: native-matvec rows move
+in multiples of four, and value heads in whole key-head groups - the GDN
+kernel's `n_v_heads % n_k_heads == 0` pairing rule). Measured 40.34 tok/s
+prefill vs 39.38 even: within noise, because at Q4_K every heavy dimension
+is geometry-pinned (experts at the 256-value grain, query heads in 8-groups
+over 16 heads, value heads 16+16 as the only legal deal) and the plan can
+tilt only vocabulary (~286 MB of mass, ~100 MB moved). Placement cannot
+rescue 256k at this quant; the planner flag stays default-off, verified
+and available for quants whose experts are expressible (Q8_0's 32-value
+grain).
 
-`Q36_P2P_WATERFILL=1` (e3d286c, default off) wires `plan_placement` in with
-host budgets as free-byte relief; on this pair it now chooses
-"bandwidth-waterfill" but still fails closed at load: at Q4_K the DeltaNet
-value-head dimension can be dealt into row counts the native matvec refuses
-(`rows % 4 != 0`, observed on `blk.0.ssm_beta`). Fix: dim-0 grain becomes
-`lcm(head grain, 4)` in `placement.rs::dims`, and the remainder dealing in
-`runs_from_counts` needs a test for it. Also note the planner geometry-caps
-attention query heads and expert intermediate at this quant, so the expected
-256k win comes from moving vocabulary/delta-head mass, not experts.
+The real 256k path is **KV slicing**: today every card replicates the full
+KV planes (10,880 B/position each; 2.85 GB/card at 262144) even though
+each card only decodes against its own K/V head groups. Slicing the cache
+by kv-head ownership frees ~1.43 GB per card at 256k; with that and the
+existing host-expert offload at its floor (card 1 tensors 6.75 GB vs a
+9.48 - 1.43 - 0.27 = 7.78 GB budget), 256k admission fits with ~1 GB of
+margin. The step's K/V gather already broadcasts full rows, so the
+append kernel's plane layout and the resident-state allocation are the
+affected pieces (card_step.rs:145-150, placement.rs:395-415 budget notes).
 
 ## Ranked remaining levers (from the subsystem map, evidence-based)
 
