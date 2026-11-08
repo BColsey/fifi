@@ -16,6 +16,7 @@ use super::step::QwenResidentStep;
 use crate::EngError;
 use crate::family::qwen36::tiered::budget::{ExpertSize, KvPlan, VramBudget, plan_vram};
 use crate::family::qwen36::tiered::cpu_pool::{CpuPool, ExpertKernel, MappedRegion, PoolError};
+use crate::family::qwen36::tiered::guess::{GuessError, LayerRouter, RouterGuess};
 use crate::family::qwen36::tiered::host::TieredHost;
 use crate::family::qwen36::tiered::locator::{ExpertLocator, ExpertTensorNames};
 use crate::family::qwen36::tiered::mapped_file::MappedFile;
@@ -135,8 +136,20 @@ pub(super) fn build_tiered(
         decay: f64::from(plan.decay_milli) / 1000.0,
     };
     let timeout = Duration::from_millis(u64::from(plan.timeout_ms));
-    let host = TieredHost::new(config, locator, region, pool, timeout)
+    // The guess reads the same mapping the host will own, so build it first.
+    let guess = if guess_enabled(std::env::var_os(GUESS_VAR).as_deref()) {
+        Some(
+            build_router_guess(header, &region, dims)
+                .map_err(|error| checkpoint(format!("router guess: {error:?}")))?,
+        )
+    } else {
+        None
+    };
+    let mut host = TieredHost::new(config, locator, region, pool, timeout)
         .map_err(|error| checkpoint(error.to_string()))?;
+    if let Some(guess) = guess {
+        host.set_guess(guess, moe.top_k);
+    }
     let geometry = geometry_of(dims);
     let banks = (0..layers)
         .map(|_| ExpertBank::new(ctx, geometry, plan.slots_per_layer))
@@ -171,6 +184,82 @@ pub(super) fn attach_tiered_parts(
 
 /// The device bytes kept free beside the banks: the loader's headroom (1 GiB).
 const ADMISSION_RESERVE: u64 = 1 << 30;
+
+/// Whether the router-guess expert prefetch runs: `Q36_TIERED_GUESS=1`. The flag exists
+/// so the prefetch (new behaviour in the tiered token path) ships dark until it is
+/// qualified on a device; anything but `1` keeps today's behaviour.
+const GUESS_VAR: &str = "Q36_TIERED_GUESS";
+fn guess_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Builds the [`RouterGuess`] of the whole model straight from the checkpoint mapping:
+/// every layer's `ffn_gate_inp` router matrix and `post_attention_layernorm` weight are
+/// plain F32 in this family's files, so no dequantization is involved. `Err` names the
+/// first tensor that is missing or not the expected F32 `[experts, hidden]` shape.
+fn build_router_guess(
+    header: &GgufHeader,
+    region: &Arc<dyn MappedRegion>,
+    dims: &StepDims,
+) -> Result<RouterGuess, GuessError> {
+    let (hidden, experts) = (dims.shape.hidden, dims.shape.moe.experts);
+    let eps = crate::family::spec::QWEN3_6_35B_A3B.rms_norm_eps;
+    let bytes = region.bytes();
+    let read_f32 = |tensor: &crate::weights::GgufTensor, len: usize, what: &str| {
+        let range = tensor.abs_range();
+        let start = usize::try_from(range.start).map_err(|_| {
+            GuessError::BadInput(format!(
+                "tiered guess: {what} offset {} overflows usize",
+                range.start
+            ))
+        })?;
+        let end = start
+            .checked_add(tensor.byte_len() as usize)
+            .ok_or_else(|| {
+                GuessError::BadInput(format!("tiered guess: {what} length overflows usize"))
+            })?;
+        let slice = bytes.get(start..end).ok_or_else(|| {
+            GuessError::BadInput(format!(
+                "tiered guess: {what} range {start}..{end} is outside the file"
+            ))
+        })?;
+        if tensor.ggml_type() != crate::weights::GgufType::F32
+            || tensor.element_count() != len as u64
+        {
+            return Err(GuessError::BadInput(format!(
+                "tiered guess: {what} is not F32 of {len} values"
+            )));
+        }
+        let (words, _) = slice.as_chunks::<4>();
+        Ok(words
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect::<Vec<f32>>()
+            .into())
+    };
+    let mut routers = Vec::with_capacity(dims.shape.kinds.len());
+    for layer in 0..dims.shape.kinds.len() {
+        let router = header
+            .tensor(&format!("blk.{layer}.ffn_gate_inp.weight"))
+            .ok_or_else(|| {
+                GuessError::BadInput(format!(
+                    "tiered guess: blk.{layer}.ffn_gate_inp.weight is missing"
+                ))
+            })?;
+        let norm = header
+            .tensor(&format!("blk.{layer}.post_attention_norm.weight"))
+            .ok_or_else(|| {
+                GuessError::BadInput(format!(
+                    "tiered guess: blk.{layer}.post_attention_norm.weight is missing"
+                ))
+            })?;
+        routers.push(LayerRouter {
+            router: read_f32(router, experts * hidden, "the router matrix")?,
+            norm_weight: read_f32(norm, hidden, "the post-attention norm weight")?,
+        });
+    }
+    RouterGuess::new(routers, hidden, experts, eps)
+}
 
 #[cfg(test)]
 mod tests {
@@ -249,5 +338,16 @@ mod tests {
         }
         assert!(admit_banks(free, geometry, 40, &plan(39), reserve).is_ok());
         assert!(admit_banks(reserve + 40 * slot_set, geometry, 40, &plan(40), reserve).is_ok());
+    }
+
+    #[test]
+    fn the_guess_flag_is_exactly_one() {
+        use super::{GUESS_VAR, guess_enabled};
+        use std::ffi::OsStr;
+        assert_eq!(GUESS_VAR, "Q36_TIERED_GUESS");
+        assert!(guess_enabled(Some(OsStr::new("1"))));
+        assert!(!guess_enabled(Some(OsStr::new("0"))));
+        assert!(!guess_enabled(Some(OsStr::new("true"))));
+        assert!(!guess_enabled(None));
     }
 }

@@ -17,9 +17,12 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::cpu_pool::{CpuPool, MappedRegion, PendingLayer, PoolError};
+use super::guess::{RecallMeter, RouterGuess};
 use super::locator::{ExpertLocator, ExpertRanges, LocatorError};
 use super::policy::{ExpertPolicy, Swap};
 use super::report::TokenReport;
@@ -70,7 +73,9 @@ impl std::error::Error for HostError {}
 /// The real implementation writes them with blocking copies; tests use a mock.
 pub trait BankDevice {
     /// Fills `slot` of the bank of `layer` with the expert whose bytes `ranges` locate
-    /// inside `region`. Returns when the bytes are on the device.
+    /// inside `region`. Returns when the fill is QUEUED (a blocking implementation
+    /// returns when the bytes are on the device); completion is observed through
+    /// [`BankDevice::wait_fills`].
     fn fill_slot(
         &mut self,
         layer: usize,
@@ -78,6 +83,14 @@ pub trait BankDevice {
         ranges: &ExpertRanges,
         region: &Arc<dyn MappedRegion>,
     ) -> Result<(), HostError>;
+
+    /// Waits until every fill queued by [`BankDevice::fill_slot`] has landed, so the
+    /// caller can complete the events and publish. The default says every blocking
+    /// fill already landed; an asynchronous implementation overrides it. `Err` means
+    /// a queued fill failed: the caller poisons exactly as a failed `fill_slot`.
+    fn wait_fills(&mut self) -> Result<(), HostError> {
+        Ok(())
+    }
 }
 
 /// What the device launches of one layer need: per pick the bank slot to read and the
@@ -134,6 +147,31 @@ impl RouteLog {
     }
 }
 
+/// The guess side channel of one host: a worker thread that turns a layer's raw residual
+/// into the next layer's ranked expert advice, off the step thread (one guess is a
+/// 2 MiB router matvec, ~0.2 ms — 39 of them would cost a measurable slice of a token).
+/// The worker owns a cheap clone of the (immutable, `Arc`-backed) [`RouterGuess`]; the
+/// host hands it `(layer, resid)` after a layer's route readback and consumes whatever
+/// advice has arrived by the next `begin_layer` of the target layer. Stale advice (the
+/// worker lost the race) is dropped, never queued: advice exists to be early.
+struct GuessWorker {
+    k: usize,
+    to_worker: mpsc::Sender<(usize, Vec<f32>)>,
+    from_worker: mpsc::Receiver<(usize, Vec<u16>)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for GuessWorker {
+    fn drop(&mut self) {
+        // Dropping the sender closes the channel; the worker exits on the recv error
+        // after at most one in-flight guess (~0.2 ms).
+        self.to_worker = mpsc::channel().0;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct TieredHost {
     cfg: TieredConfig,
     locator: ExpertLocator,
@@ -148,11 +186,28 @@ pub struct TieredHost {
     report: TokenReport,
     next_event: EventId,
     poisoned: bool,
+    /// Fills queued since the last drain: their events complete (and their slots
+    /// publish) only at the token boundary or after preload, never mid-token.
+    pending_fills: Vec<EventId>,
+    /// The router-guess prefetch side channel, set by [`TieredHost::set_guess`].
+    guess: Option<GuessWorker>,
+    /// The advice consumed by the latest `begin_layer` of its target layer, taken by the
+    /// runtime for the prefetch fills: `(target layer, ranked ids)`.
+    arrived: Option<(usize, Vec<u16>)>,
+    /// Running recall of every consumed advice against the route it met.
+    meter: RecallMeter,
+    /// The meter counts already reported, so a token report carries only its delta.
+    meter_seen: (u64, u64),
 }
 
 /// The ledger deadline of a synchronous fill: any later clock value expires it, which is how
 /// `abandon_fills` poisons the slot of a fill the device failed.
 const FILL_DEADLINE_NS: u64 = 1;
+
+/// The per-call cap of evicting guess promotions: a guess has no routed evidence, so at
+/// 77 percent recall a wrong promotion evicts a proven resident and costs the token BOTH
+/// experts on the CPU. Free-slot promotions are uncapped (they evict nothing).
+const GUESS_EVICT_CAP: usize = 2;
 
 impl TieredHost {
     /// Builds the host for an adaptive policy. `Err(Config)` when the config is invalid,
@@ -199,6 +254,11 @@ impl TieredHost {
             report: TokenReport::default(),
             next_event: 1,
             poisoned: false,
+            pending_fills: Vec::new(),
+            guess: None,
+            arrived: None,
+            meter: RecallMeter::default(),
+            meter_seen: (0, 0),
         })
     }
 
@@ -206,15 +266,21 @@ impl TieredHost {
     ///
     /// `ids` and `weights` are the router's picks in rank order (`ids[i] == -1` is the
     /// router-fault value; any other negative id is refused); `hidden` is the normed row the
-    /// CPU experts read. A resident pick maps to its bank slot with its weight; a missed pick
-    /// maps to slot 0 with weight 0.0 and one CPU job; the fault id -1 passes through. Nothing
-    /// is started when the route is refused.
+    /// CPU experts read; `resid` is the RAW residual before the block's norm, the input the
+    /// router guess of the NEXT layer wants (it applies its own rmsnorm). A resident pick
+    /// maps to its bank slot with its weight; a missed pick maps to slot 0 with weight 0.0
+    /// and one CPU job; the fault id -1 passes through. Nothing is started when the route
+    /// is refused. When a guess worker is set, the advice that arrived for this layer is
+    /// metered against the real route, staged for the runtime's prefetch fills
+    /// ([`TieredHost::take_arrived_advice`]), and the residual is handed to the worker for
+    /// the next layer's advice.
     pub fn begin_layer(
         &mut self,
         layer: usize,
         ids: &[i32],
         weights: &[f32],
         hidden: &[f32],
+        resid: &[f32],
     ) -> Result<LayerPlanHost, HostError> {
         if let Some(open) = &self.in_flight {
             return Err(HostError::Order(format!(
@@ -223,6 +289,24 @@ impl TieredHost {
             )));
         }
         self.check_route(layer, ids, weights)?;
+        if let Some(worker) = &self.guess {
+            let mut arrived = None;
+            while let Ok((target, advice)) = worker.from_worker.try_recv() {
+                if target == layer {
+                    arrived = Some((target, advice));
+                }
+            }
+            if let Some((_, advice)) = &arrived {
+                let actual: Vec<u16> = ids
+                    .iter()
+                    .filter(|&&id| id >= 0)
+                    .map(|&id| id as u16)
+                    .collect();
+                self.meter.add(advice, &actual);
+            }
+            self.arrived = arrived;
+            let _ = worker.to_worker.send((layer, resid.to_vec()));
+        }
         let mut plan = LayerPlanHost {
             slot_ids: Vec::with_capacity(ids.len()),
             device_weights: Vec::with_capacity(ids.len()),
@@ -426,6 +510,11 @@ impl TieredHost {
         let routes = std::mem::replace(&mut self.routes, vec![Vec::new(); self.cfg.layers]);
         self.policy.observe(&routes);
         let swaps = self.policy.boundary();
+        // Publish everything a mid-token prefetch queued BEFORE the boundary picks
+        // victims: the policy already counts those promotees as residents, so an
+        // unpublish of one that is still Filling would refuse (the invariant the
+        // original inline-complete fills never had to state).
+        self.drain_fills(device)?;
         for swap in &swaps {
             if let Err(error) = self.apply_swap(device, swap) {
                 self.poisoned = true;
@@ -433,9 +522,13 @@ impl TieredHost {
                 return Err(error);
             }
         }
-        self.table.publish_ready();
+        self.drain_fills(device)?;
         let mut report = std::mem::take(&mut self.report);
         report.swaps = u32::try_from(swaps.len()).unwrap_or(u32::MAX);
+        let (hits, total) = self.meter.counts();
+        report.guess_hits = hits.saturating_sub(self.meter_seen.0);
+        report.guess_samples = total.saturating_sub(self.meter_seen.1);
+        self.meter_seen = (hits, total);
         Ok(report)
     }
 
@@ -479,8 +572,103 @@ impl TieredHost {
                 fills += 1;
             }
         }
-        self.table.publish_ready();
+        self.drain_fills(device)?;
         Ok(fills)
+    }
+
+    /// Arms the router-guess prefetch: spawns the advice worker (a cheap `Arc` clone of
+    /// `guess`) that ranks `k` experts of the layer AFTER the one whose residual the
+    /// host hands it. Advice is best-effort by design: nothing here can change a
+    /// token's result, only which experts sit in the banks of later tokens.
+    pub fn set_guess(&mut self, guess: RouterGuess, k: usize) {
+        let (tx_in, rx_in) = mpsc::channel::<(usize, Vec<f32>)>();
+        let (tx_out, rx_out) = mpsc::channel::<(usize, Vec<u16>)>();
+        let worker_guess = guess.clone();
+        let handle = std::thread::Builder::new()
+            .name(String::from("tiered-router-guess"))
+            .spawn(move || {
+                while let Ok((layer, resid)) = rx_in.recv() {
+                    let target = layer + 1;
+                    if target < worker_guess.layers()
+                        && let Ok(advice) = worker_guess.top_k(target, &resid, k)
+                    {
+                        let _ = tx_out.send((target, advice));
+                    }
+                }
+            })
+            .expect("spawn the router-guess worker");
+        self.guess = Some(GuessWorker {
+            k,
+            to_worker: tx_in,
+            from_worker: rx_out,
+            handle: Some(handle),
+        });
+    }
+
+    /// Whether the router-guess prefetch is armed (an armed worker exists).
+    pub fn has_guess(&self) -> bool {
+        self.guess.is_some()
+    }
+
+    /// The advice the latest `begin_layer` of its target layer consumed, if any: the
+    /// runtime takes it to issue the prefetch fills. One-shot.
+    pub fn take_arrived_advice(&mut self) -> Option<(usize, Vec<u16>)> {
+        self.arrived.take()
+    }
+
+    /// Issues the prefetch fills of `advice` for `layer` through the same residency state
+    /// machine as the boundary swaps: free-slot promotions are free, full-bank promotions
+    /// only when the advised expert outscores the lowest resident of the layer, and at most
+    /// [`GUESS_EVICT_CAP`] evicting promotions per call — a guess has no routed evidence,
+    /// so it must not be able to thrash a whole bank. Everything publishes at the token
+    /// boundary like every other fill; a failed fill poisons the host as in `end_token`.
+    pub fn prefetch(
+        &mut self,
+        device: &mut dyn BankDevice,
+        layer: usize,
+        advice: &[u16],
+    ) -> Result<(), HostError> {
+        if self.poisoned {
+            return Err(HostError::Poisoned);
+        }
+        if layer >= self.cfg.layers {
+            return Err(HostError::BadRoute(format!(
+                "prefetch layer {layer} is outside 0..{}",
+                self.cfg.layers
+            )));
+        }
+        let mut evictions = 0;
+        for &expert in advice {
+            let Some(swap) = self.policy.advise(layer, expert) else {
+                continue;
+            };
+            if let Some(evict) = swap.evict
+                && self.table.lookup(layer, evict).is_none()
+            {
+                // The victim's slot is not Published — its own fill is still in
+                // flight (a mid-token promotion of an earlier advice). Skip this
+                // promotion entirely: advice is best-effort by contract, and racing
+                // the state machine is the one thing it must never do.
+                self.policy.unadvise(layer, expert, swap.evict);
+                continue;
+            }
+            if swap.evict.is_some() {
+                if evictions >= GUESS_EVICT_CAP {
+                    // Undo the policy-side mark: this promotion is not happening.
+                    self.policy.unadvise(layer, expert, swap.evict);
+                    continue;
+                }
+                evictions += 1;
+                self.report.guess_evicts += 1;
+            }
+            if let Err(error) = self.apply_swap(device, &swap) {
+                self.poisoned = true;
+                self.table.publish_ready();
+                return Err(error);
+            }
+            self.report.guess_fills += 1;
+        }
+        Ok(())
     }
 
     fn apply_swap(&mut self, device: &mut dyn BankDevice, swap: &Swap) -> Result<(), HostError> {
@@ -501,12 +689,44 @@ impl TieredHost {
             .ranges(layer, usize::from(swap.promote))
             .map_err(HostError::Locator)?;
         if let Err(error) = device.fill_slot(layer, slot, &ranges, &self.region) {
+            // The failed slot poisons, but the fills QUEUED BEFORE it may have landed:
+            // complete what a wait can still salvage, so only the failure is poisoned.
+            let _ = device.wait_fills();
+            for event in std::mem::take(&mut self.pending_fills) {
+                let _ = self.table.event_complete(event);
+            }
             self.abandon_fills()?;
             return Err(error);
         }
-        self.table
-            .event_complete(event)
-            .map_err(HostError::Residency)
+        // The fill is queued, not necessarily landed: its event completes at the next
+        // drain (the token boundary), which is also the only publisher.
+        self.pending_fills.push(event);
+        Ok(())
+    }
+
+    /// Waits the queued fills, completes their events and PUBLISHES what landed.
+    /// Publication still never happens inside a layer — this runs at the token
+    /// boundary (and after preload) — but it must also run BETWEEN the boundary's
+    /// two halves: a victim the boundary is about to unpublish may be a mid-token
+    /// promotee whose slot is Ready (event complete) but not yet Published, and
+    /// `unpublish` refuses anything but a Published slot. A failed wait poisons the
+    /// host exactly like a failed fill.
+    fn drain_fills(&mut self, device: &mut dyn BankDevice) -> Result<(), HostError> {
+        if let Err(error) = device.wait_fills() {
+            self.poisoned = true;
+            let _ = self.abandon_fills();
+            self.table.publish_ready();
+            return Err(error);
+        }
+        for event in std::mem::take(&mut self.pending_fills) {
+            if let Err(error) = self.table.event_complete(event) {
+                self.poisoned = true;
+                self.table.publish_ready();
+                return Err(HostError::Residency(error));
+            }
+        }
+        self.table.publish_ready();
+        Ok(())
     }
 
     /// Poisons and frees every fill still in flight (only the one that just failed).
@@ -559,13 +779,17 @@ mod tests {
     const SLOTS: usize = 3;
 
     fn config_with(slots: usize) -> TieredConfig {
+        config_with_rate(slots, 0.25)
+    }
+
+    fn config_with_rate(slots: usize, rate: f64) -> TieredConfig {
         TieredConfig {
             layers: LAYERS,
             experts: EXPERTS,
             top_k: TOP_K,
             bank_slots_per_layer: slots,
             mode: PolicyMode::Adaptive,
-            swaps_per_token: 0.25,
+            swaps_per_token: rate,
             decay: 0.999,
         }
     }
@@ -582,7 +806,7 @@ mod tests {
         hidden: Vec<f32>,
     }
 
-    fn fixture_with_slots(timeout: Duration, slots: usize) -> Fixture {
+    fn fixture_with_rate(timeout: Duration, slots: usize, rate: f64) -> Fixture {
         let mut rng = Lcg(0xD4D4_0000_5EED_0001);
         let ((bytes, _), _) = expert_file(&mut rng, LAYERS, EXPERTS, SHAPE);
         let header = parse(&bytes);
@@ -592,7 +816,7 @@ mod tests {
         let kernel = ExpertKernel::Q8k(DotBackend::scalar());
         let pool = CpuPool::with_kernel(2, SHAPE, kernel).unwrap();
         let host = TieredHost::new(
-            config_with(slots),
+            config_with_rate(slots, rate),
             make(),
             Arc::clone(&region),
             pool,
@@ -610,8 +834,12 @@ mod tests {
         }
     }
 
+    fn fixture_with_slots(timeout: Duration, slots: usize) -> Fixture {
+        fixture_with_rate(timeout, slots, 0.25)
+    }
+
     fn fixture_with(timeout: Duration) -> Fixture {
-        fixture_with_slots(timeout, SLOTS)
+        fixture_with_rate(timeout, SLOTS, 0.25)
     }
 
     fn fixture() -> Fixture {
@@ -638,27 +866,33 @@ mod tests {
         let s5 = install(&mut f.host, 1, 5, 2);
         let plan = f
             .host
-            .begin_layer(1, &[2, 3, -1, 5], &[0.4, 0.3, 0.0, 0.2], &f.hidden)
+            .begin_layer(
+                1,
+                &[2, 3, -1, 5],
+                &[0.4, 0.3, 0.0, 0.2],
+                &f.hidden,
+                &f.hidden,
+            )
             .unwrap();
         assert_eq!(plan.slot_ids, vec![s2 as i32, 0, -1, s5 as i32]);
         assert_eq!(plan.device_weights, vec![0.4, 0.0, 0.0, 0.2]);
         assert!(f.host.finish_layer(1).unwrap().is_some());
         let plan = f
             .host
-            .begin_layer(1, &[5, 2], &[0.6, 0.4], &f.hidden)
+            .begin_layer(1, &[5, 2], &[0.6, 0.4], &f.hidden, &f.hidden)
             .unwrap();
         assert_eq!(plan.slot_ids, vec![s5 as i32, s2 as i32]);
         assert_eq!(plan.device_weights, vec![0.6, 0.4]);
         assert_eq!(f.host.finish_layer(1), Ok(None));
         let plan = f
             .host
-            .begin_layer(0, &[-1, -1, -1, -1], &[0.0; 4], &f.hidden)
+            .begin_layer(0, &[-1, -1, -1, -1], &[0.0; 4], &f.hidden, &f.hidden)
             .unwrap();
         assert_eq!(plan.slot_ids, vec![-1; 4]);
         assert_eq!(f.host.finish_layer(0), Ok(None));
         let plan = f
             .host
-            .begin_layer(2, &[0, 1], &[0.5, 0.5], &f.hidden)
+            .begin_layer(2, &[0, 1], &[0.5, 0.5], &f.hidden, &f.hidden)
             .unwrap();
         assert_eq!(plan.slot_ids, vec![0, 0]);
         assert_eq!(plan.device_weights, vec![0.0, 0.0]);
@@ -676,7 +910,9 @@ mod tests {
         install(&mut f.host, 1, 6, 1);
         let ids = [3, 6, 1];
         let weights = [0.25f32, 0.5, 0.125];
-        f.host.begin_layer(1, &ids, &weights, &f.hidden).unwrap();
+        f.host
+            .begin_layer(1, &ids, &weights, &f.hidden, &f.hidden)
+            .unwrap();
         let got = f.host.finish_layer(1).unwrap().unwrap();
         // Reference: expert_forward_q8k over the slices the locator names, experts 3
         // and 1 (6 is resident) in job order, weight-scaled, from +0.0.
@@ -713,7 +949,7 @@ mod tests {
             (0, vec![0, 1, 2, 3, 4], vec![0.2; 5]),
         ];
         for (layer, ids, weights) in cases {
-            let result = f.host.begin_layer(layer, &ids, &weights, &h);
+            let result = f.host.begin_layer(layer, &ids, &weights, &h, &h);
             assert!(matches!(result, Err(HostError::BadRoute(_))), "{ids:?}");
             assert!(matches!(
                 f.host.finish_layer(layer.min(LAYERS - 1)),
@@ -721,15 +957,17 @@ mod tests {
             ));
         }
         assert_eq!(f.host.report, TokenReport::default());
-        assert!(f.host.begin_layer(0, &[1], &[0.5], &h).is_ok());
+        assert!(f.host.begin_layer(0, &[1], &[0.5], &h, &h).is_ok());
     }
 
     #[test]
     fn finish_layer_out_of_order_is_refused_and_the_layer_stays_in_flight() {
         let mut f = fixture();
-        f.host.begin_layer(1, &[3], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(1, &[3], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         assert!(matches!(
-            f.host.begin_layer(2, &[3], &[0.5], &f.hidden),
+            f.host.begin_layer(2, &[3], &[0.5], &f.hidden, &f.hidden),
             Err(HostError::Order(_))
         ));
         assert!(matches!(f.host.finish_layer(2), Err(HostError::Order(_))));
@@ -743,7 +981,7 @@ mod tests {
         // layer must still begin and finish.
         let mut f = fixture_with(Duration::ZERO);
         f.host
-            .begin_layer(1, &[3, 4], &[0.5, 0.5], &f.hidden)
+            .begin_layer(1, &[3, 4], &[0.5, 0.5], &f.hidden, &f.hidden)
             .unwrap();
         let err = f.host.finish_layer(1).unwrap_err();
         assert!(
@@ -751,9 +989,13 @@ mod tests {
             "{err:?}"
         );
         assert!(f.host.in_flight.is_none());
-        f.host.begin_layer(2, &[1], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(2, &[1], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         assert!(f.host.finish_layer(2).is_err());
-        f.host.begin_layer(0, &[-1], &[0.0], &f.hidden).unwrap();
+        f.host
+            .begin_layer(0, &[-1], &[0.0], &f.hidden, &f.hidden)
+            .unwrap();
         assert_eq!(f.host.finish_layer(0), Ok(None));
     }
 
@@ -830,6 +1072,7 @@ mod tests {
     struct MockDevice {
         fills: Vec<(usize, usize, ExpertRanges)>,
         fail_on: Option<usize>,
+        fail_wait: bool,
     }
 
     impl BankDevice for MockDevice {
@@ -844,6 +1087,13 @@ mod tests {
                 return Err(HostError::Device(String::from("mock fill failure")));
             }
             self.fills.push((layer, slot, ranges.clone()));
+            Ok(())
+        }
+
+        fn wait_fills(&mut self) -> Result<(), HostError> {
+            if self.fail_wait {
+                return Err(HostError::Device(String::from("mock wait failure")));
+            }
             Ok(())
         }
     }
@@ -868,7 +1118,8 @@ mod tests {
     ) -> Result<TokenReport, HostError> {
         for (layer, ids) in picks.iter().enumerate() {
             let weights = vec![1.0 / ids.len() as f32; ids.len()];
-            f.host.begin_layer(layer, ids, &weights, &f.hidden)?;
+            f.host
+                .begin_layer(layer, ids, &weights, &f.hidden, &f.hidden)?;
             f.host.finish_layer(layer)?;
         }
         f.host.end_token(device)
@@ -958,7 +1209,7 @@ mod tests {
         assert_eq!(f.host.end_token(&mut device), Err(HostError::Poisoned));
         let plan = f
             .host
-            .begin_layer(0, &[0, 1], &[0.5, 0.5], &f.hidden)
+            .begin_layer(0, &[0, 1], &[0.5, 0.5], &f.hidden, &f.hidden)
             .unwrap();
         assert_eq!(plan.device_weights, vec![0.5, 0.0]);
         assert!(f.host.finish_layer(0).unwrap().is_some());
@@ -968,7 +1219,9 @@ mod tests {
     fn end_token_refuses_while_a_layer_is_in_flight() {
         let mut f = fixture();
         let mut device = MockDevice::default();
-        f.host.begin_layer(0, &[1], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(0, &[1], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         assert!(matches!(
             f.host.end_token(&mut device),
             Err(HostError::Order(_))
@@ -981,15 +1234,19 @@ mod tests {
     fn an_aborted_token_frees_the_layer_in_flight_and_drops_its_counters() {
         let mut f = fixture();
         let mut device = MockDevice::default();
-        f.host.begin_layer(0, &[1], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(0, &[1], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         // The failure between begin_layer and finish_layer: without the abort every later
         // layer is refused for good.
         assert!(matches!(
-            f.host.begin_layer(1, &[2], &[0.5], &f.hidden),
+            f.host.begin_layer(1, &[2], &[0.5], &f.hidden, &f.hidden),
             Err(HostError::Order(_))
         ));
         f.host.abort_token();
-        f.host.begin_layer(1, &[2], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(1, &[2], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         f.host.finish_layer(1).unwrap();
         let report = f.host.end_token(&mut device).unwrap();
         assert_eq!(
@@ -1004,13 +1261,15 @@ mod tests {
         let mut f = fixture();
         let mut device = MockDevice::default();
         f.host
-            .begin_layer(0, &[1, 2], &[0.5, 0.5], &f.hidden)
+            .begin_layer(0, &[1, 2], &[0.5, 0.5], &f.hidden, &f.hidden)
             .unwrap();
         f.host.abort_token();
         // The next token reaches only layers 1 and 2: a stale route of layer 0 would reach the
         // policy at the boundary, and the policy would fill layer 0 for it.
         for layer in 1..LAYERS {
-            f.host.begin_layer(layer, &[3], &[1.0], &f.hidden).unwrap();
+            f.host
+                .begin_layer(layer, &[3], &[1.0], &f.hidden, &f.hidden)
+                .unwrap();
             f.host.finish_layer(layer).unwrap();
         }
         f.host.end_token(&mut device).unwrap();
@@ -1069,7 +1328,7 @@ mod tests {
             for (layer, picks) in routes.iter().enumerate() {
                 let (ids, weights): (Vec<i32>, Vec<f32>) = picks.iter().copied().unzip();
                 v1.host
-                    .begin_layer(layer, &ids, &weights, &v1.hidden)
+                    .begin_layer(layer, &ids, &weights, &v1.hidden, &v1.hidden)
                     .unwrap();
                 v1.host.finish_layer(layer).unwrap();
             }
@@ -1149,7 +1408,7 @@ mod tests {
             let (ids, weights): (Vec<i32>, Vec<f32>) = picks.iter().copied().unzip();
             assert!(
                 matches!(
-                    f.host.begin_layer(2, &ids, &weights, &f.hidden),
+                    f.host.begin_layer(2, &ids, &weights, &f.hidden, &f.hidden),
                     Err(HostError::BadRoute(_))
                 ),
                 "begin_layer: {what}"
@@ -1220,7 +1479,7 @@ mod tests {
                 .collect();
             let want = f
                 .host
-                .begin_layer(layer, &ids, &weights, &f.hidden)
+                .begin_layer(layer, &ids, &weights, &f.hidden, &f.hidden)
                 .unwrap();
             f.host.finish_layer(layer).unwrap();
             let row = f.host.slot_row(layer).unwrap();
@@ -1279,7 +1538,7 @@ mod tests {
         let mut f = fixture();
         let (ids, weights) = ([2, -2, 5, 3], [0.4, 0.0, 0.2, 0.1]);
         assert!(matches!(
-            f.host.begin_layer(0, &ids, &weights, &f.hidden),
+            f.host.begin_layer(0, &ids, &weights, &f.hidden, &f.hidden),
             Err(HostError::BadRoute(_))
         ));
         let picks: Vec<(i32, f32)> = [(2, 0.4), (-1, 0.0), (5, 0.2), (3, 0.1)].repeat(LAYERS);
@@ -1298,7 +1557,9 @@ mod tests {
     #[test]
     fn a_log_is_refused_while_a_v1_layer_is_in_flight() {
         let mut f = fixture();
-        f.host.begin_layer(0, &[1], &[0.5], &f.hidden).unwrap();
+        f.host
+            .begin_layer(0, &[1], &[0.5], &f.hidden, &f.hidden)
+            .unwrap();
         let log = RouteLog::new(LAYERS, TOP_K, vec![(1, 0.5); LAYERS * TOP_K]).unwrap();
         assert!(matches!(
             f.host.account_token(&log),
@@ -1396,7 +1657,13 @@ mod tests {
         );
         let plan = f
             .host
-            .begin_layer(1, &[7, 0, 3, 5], &[0.4, 0.3, 0.2, 0.1], &f.hidden)
+            .begin_layer(
+                1,
+                &[7, 0, 3, 5],
+                &[0.4, 0.3, 0.2, 0.1],
+                &f.hidden,
+                &f.hidden,
+            )
             .unwrap();
         assert_eq!(
             plan.slot_ids,
@@ -1437,5 +1704,96 @@ mod tests {
             f.host.preload_all(&mut device),
             Err(HostError::Poisoned)
         ));
+    }
+
+    #[test]
+    fn prefetch_fills_through_the_state_machine_and_publishes_at_the_boundary() {
+        let mut f = fixture();
+        let mut device = MockDevice::default();
+        // Token one routes layer 0 to expert 1: a miss (nothing is installed).
+        f.host
+            .begin_layer(0, &[1], &[1.0], &f.hidden, &f.hidden)
+            .unwrap();
+        assert!(f.host.finish_layer(0).unwrap().is_some());
+        // The arrived advice names the miss (1) and a second expert (2): both promote
+        // into free slots, evicting nothing.
+        f.host.prefetch(&mut device, 0, &[1, 2]).unwrap();
+        assert!(
+            !f.host.is_resident(0, 1) && !f.host.is_resident(0, 2),
+            "a queued fill is not resident until the boundary publishes it"
+        );
+        let report = f.host.end_token(&mut device).unwrap();
+        assert_eq!((report.guess_fills, report.guess_evicts), (2, 0));
+        assert!(f.host.is_resident(0, 1) && f.host.is_resident(0, 2));
+        f.host.check_consistency().unwrap();
+        // The next token's layer 0 serves both picks from the bank.
+        f.host
+            .begin_layer(0, &[1, 2], &[0.5, 0.5], &f.hidden, &f.hidden)
+            .unwrap();
+        assert!(f.host.finish_layer(0).unwrap().is_none(), "both picks hit");
+        f.host.end_token(&mut device).unwrap();
+        f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn prefetch_never_evicts_a_victim_whose_fill_is_still_in_flight() {
+        // Two slots, both preloaded: experts 0 and 1 sit Published. Scoring: expert 1
+        // routed three times, expert 2 twice (the first advice's promotee), expert 3
+        // three times (the second advice's candidate, which must beat 2).
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 0.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let mut token = |f: &mut Fixture, device: &mut MockDevice, id: u16| {
+            f.host
+                .begin_layer(0, &[i32::from(id)], &[1.0], &f.hidden, &f.hidden)
+                .unwrap();
+            f.host.finish_layer(0).unwrap();
+            f.host.end_token(device).unwrap();
+        };
+        for id in [1u16, 1, 1, 2, 2, 3, 3, 3] {
+            token(&mut f, &mut device, id);
+        }
+        let fills_before = filled(&device, &f.reference).len();
+        // First advice: promote 2, evict the unscored 0 (Published: applied, pending).
+        f.host.prefetch(&mut device, 0, &[2]).unwrap();
+        assert_eq!(filled(&device, &f.reference).len(), fills_before + 1);
+        // Second advice: promote 3 over the PENDING 2 (now the lowest resident).
+        // The host must skip it rather than unpublish a filling slot.
+        f.host.prefetch(&mut device, 0, &[3]).unwrap();
+        assert_eq!(
+            filled(&device, &f.reference).len(),
+            fills_before + 1,
+            "the promotion racing the pending fill is skipped"
+        );
+        let report = f.host.end_token(&mut device).unwrap();
+        assert_eq!(report.guess_fills, 1);
+        assert!(f.host.is_resident(0, 2), "the pending fill publishes");
+        assert!(!f.host.is_resident(0, 3), "the skipped candidate never filled");
+        f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn a_failed_wait_fills_poisons_like_a_failed_fill() {
+        let mut f = fixture();
+        let mut device = MockDevice {
+            fail_wait: true,
+            ..MockDevice::default()
+        };
+        f.host
+            .begin_layer(0, &[1], &[1.0], &f.hidden, &f.hidden)
+            .unwrap();
+        f.host.finish_layer(0).unwrap();
+        f.host.prefetch(&mut device, 0, &[1]).unwrap();
+        assert!(
+            matches!(f.host.end_token(&mut device), Err(HostError::Device(_))),
+            "the wait failure surfaces, and the poison flag stays"
+        );
+        assert!(matches!(
+            f.host.end_token(&mut device),
+            Err(HostError::Poisoned)
+        ));
+        // Poisoned means the policy and the ledger disagree by design; classification
+        // still serves every pick from the ledger (all misses, on the CPU).
+        assert!(!f.host.is_resident(0, 1));
     }
 }

@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct LayerRouter {
     /// The router matrix of the layer, `[experts][hidden]` f32, row-major (ggml
     /// ne0 = hidden fastest), shared because the guess only reads it.
@@ -32,6 +33,7 @@ pub enum GuessError {
 /// The router-guess arithmetic of a whole model: one [`LayerRouter`] per MoE
 /// layer plus the shared geometry. Validate once with [`RouterGuess::new`], then
 /// call [`RouterGuess::logits`] per token and layer.
+#[derive(Clone)]
 pub struct RouterGuess {
     /// Per-layer router matrix and norm weight, indexed like the model layers.
     layers: Vec<LayerRouter>,
@@ -233,6 +235,12 @@ impl RecallMeter {
         } else {
             self.hits as f64 / self.total as f64
         }
+    }
+
+    /// The absolute `(hits, total)` behind [`RecallMeter::recall`], so a reporter can
+    /// carry the delta of a window instead of the whole history.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.hits, self.total)
     }
 
     pub fn samples(&self) -> u64 {
