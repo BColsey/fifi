@@ -607,10 +607,13 @@ mod tests {
             assert_parity(&got, &want, &format!("input {n} output"));
         }
         assert_eq!(seen, [true; 4], "every expert is selected at least once");
-        // The router probabilities of input 2, read back, equal the CPU softmax of the router logits.
+        // The router probabilities of input 2, read back, equal the CPU softmax of the router
+        // logits over the normed row (the folded contract norms inside the block).
         let x = input(2);
+        let post_norm = oracle.view().layers[0].post_norm;
+        let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
         let logits = cpu
-            .linear(oracle.view().layers[0].as_moe().unwrap().router, &x)
+            .linear(oracle.view().layers[0].as_moe().unwrap().router, &normed_x)
             .unwrap();
         let max = logits.iter().copied().fold(f32::MIN, f32::max);
         let exps: Vec<f64> = logits.iter().map(|v| f64::from(v - max).exp()).collect();
