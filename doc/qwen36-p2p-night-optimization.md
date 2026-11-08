@@ -105,3 +105,34 @@ affected pieces (card_step.rs:145-150, placement.rs:395-415 budget notes).
   gather cannot write a stale row into the replicated cache". The correct
   removal is device-side status guards in the native append kernel - the
   mechanism multi.rs:74-76 already names as the future non-fatal path.
+
+## Third session: KV slicing - 256k context achieved (3bd5ac7)
+
+Each card's KV planes now hold only its own K/V head groups (the shard
+table already deals them with the query heads): the pair stores exactly
+one replica of cache instead of two, the append quantizes the card's
+slice of the gathered row (new k_at/v_at op offsets), the card decode
+addresses its planes from local head 0, the state identity records the
+slice, and the multi-device load reserve swaps the full-replica state
+term for the largest card's. The gathers and the both-halves gate are
+unchanged.
+
+- 131k, same budgets: prefill 40.30 tok/s, decode 26.3 (+2% over
+  combined) - the smaller planes also help L2/append work.
+- **262,144-token context now admits and serves** (was structurally
+  impossible: full-replica KV left card 1 exactly 385 MB short even at
+  its host-offload floor): 41.3 tok/s prefill at the same budgets
+  (card 0 nudged +50 MB host), answers verified. Not yet exercised
+  end-to-end: a >131k prompt at depth.
+- Validation: 1408 host tests; 11 card parity rigs byte-exact over each
+  card's head slice (codes and scales, K and V, both cards, whole-40-
+  layer model vs reference); session and peer rigs; the shards rig now
+  pins "the sliced pools hold exactly one replica".
+- Deployment: the service runs the sliced 256k build; rollback is
+  `start.sh.pre-kv-slicing` (or `.pre-night-opt` for the original).
+
+Phase 2 (next): drop the K/V gathers entirely - each card's prep already
+computes its rows locally, so appending from AttnProj removes 2 ring
+sequences per full-attention layer (~20/token) and shrinks the KRows/VRows
+slots to the card's width. After that, prefix save/restore (the multi-turn
+capability) and chunked prefill remain the top levers.
