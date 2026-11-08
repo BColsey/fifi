@@ -1745,7 +1745,7 @@ fn a_real_gguf_file_loads_the_distributed_block() {
             let start = ev.head_runs[card].start * per_head;
             let end = start + per_head * ev.head_runs[card].len();
             assert!(
-                &got_bytes[..end - start] == &want_bytes[start..end],
+                got_bytes[..end - start] == want_bytes[start..end],
                 "{NAME}: card {card} {plane}: differing bytes over the card's head slice"
             );
         }

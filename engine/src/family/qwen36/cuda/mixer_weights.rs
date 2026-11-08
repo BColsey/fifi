@@ -230,9 +230,6 @@ pub(super) fn dense_weight<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "mixer weights: {name} does not match the requested EXL3 layout"
         ))),
-        (Some(CudaWeight::Tiled { .. }), WeightLayout::Native) => Err(EngError::Checkpoint(
-            format!("mixer weights: {name} is loaded in the tiled layout, the step runs native"),
-        )),
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the native layout, the step runs tiled"),
         )),

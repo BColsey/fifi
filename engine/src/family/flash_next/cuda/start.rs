@@ -294,6 +294,9 @@ fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngErro
         .collect()
 }
 
+/// The per-layer slot fill: expert ids in slot order and their LRU counts.
+type FillFromProfile = (Vec<Vec<i32>>, Vec<Vec<u64>>);
+
 /// The slot rows and LRU counts of the initial fill. With a profile: per layer, the experts sorted
 /// by use weight (highest first, id breaking ties) take the slots in rank order and the weights
 /// scale to `u64` counts. Without: the first experts by id take the slots and lower ids count as
@@ -301,7 +304,7 @@ fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngErro
 fn fill_from_profile(
     geometry: BankGeometry,
     profile: Option<&[Vec<f64>]>,
-) -> Result<(Vec<Vec<i32>>, Vec<Vec<u64>>), EngError> {
+) -> Result<FillFromProfile, EngError> {
     if let Some(profile) = profile
         && profile.len() != geometry.layers
     {
@@ -798,7 +801,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("dump.json");
         let geometry = BankGeometry::new(1, 4, 2, 3, 8).expect("geometry");
-        let (rows, counts) = fill_from_profile(geometry.clone(), None).expect("identity fill");
+        let (rows, counts) = fill_from_profile(geometry, None).expect("identity fill");
         let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
         {
             let _policy =

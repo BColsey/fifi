@@ -384,7 +384,7 @@ impl LayerSlots {
     /// caller must refill from the store.
     fn assign(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
         self.tick += 1;
-        if self.tick % DECAY_CALLS == 0 {
+        if self.tick.is_multiple_of(DECAY_CALLS) {
             self.decay();
         }
         let mut slots = Vec::with_capacity(picks.len());
@@ -615,7 +615,7 @@ pub(crate) mod trace {
 
     static ARMED: AtomicBool = AtomicBool::new(false);
     thread_local! {
-        static CALLS: RefCell<Vec<(usize, Vec<u32>)>> = RefCell::new(Vec::new());
+        static CALLS: RefCell<Vec<(usize, Vec<u32>)>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn arm() {

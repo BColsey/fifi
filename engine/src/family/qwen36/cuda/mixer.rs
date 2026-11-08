@@ -403,17 +403,18 @@ impl<'a> Mixers<'a> {
                     | BlockOp::AttnDecodeQ8 { .. }
                     | BlockOp::AttnDecodeQ8Card { .. }
             );
-            if let Some((core_start, _)) = core_marks {
-                if opens_core && !core_open {
-                    stream.record_timing(core_start)?;
-                    core_open = true;
-                }
+            if let Some((core_start, _)) = core_marks
+                && opens_core
+                && !core_open
+            {
+                stream.record_timing(core_start)?;
+                core_open = true;
             }
             self.run_op(&run, op)?;
-            if let Some((_, core_end)) = core_marks {
-                if closes_core {
-                    stream.record_timing(core_end)?;
-                }
+            if let Some((_, core_end)) = core_marks
+                && closes_core
+            {
+                stream.record_timing(core_end)?;
             }
         }
         Ok(())

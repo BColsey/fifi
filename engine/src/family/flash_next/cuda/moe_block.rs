@@ -768,7 +768,7 @@ mod device {
             let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
             scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row))?;
             let mut classified = Vec::with_capacity(m);
-            for r in 0..m {
+            for (r, pick) in picks.iter().enumerate() {
                 ctx.tiered_classify(
                     stream,
                     ClassifyCall {
@@ -792,12 +792,7 @@ mod device {
                         mbox_row: scratch.range(sc.mbox_row, h * F32)?,
                     },
                 )?;
-                classified.push(classify_picks(
-                    &slot_row,
-                    geometry.slots,
-                    &picks[r].0,
-                    &picks[r].1,
-                )?);
+                classified.push(classify_picks(&slot_row, geometry.slots, &pick.0, &pick.1)?);
             }
 
             // The resident pass of every row in flat launches: pick `r * k + p` indexes the
@@ -839,8 +834,8 @@ mod device {
             )?;
             self.grouped(launch, layer, &down, (slot_ids, &bufs.scratch))?;
             if self.verify_finite_filler {
-                for r in 0..m {
-                    self.check_filler(launch, bufs, dims, r, &classified[r].weights)?;
+                for (r, class) in classified.iter().enumerate() {
+                    self.check_filler(launch, bufs, dims, r, &class.weights)?;
                 }
             }
 
@@ -948,7 +943,6 @@ mod device {
 
         /// Reads the down rows back and refuses a non-finite row whose pick weight is zero.
         /// `r` indexes the rows of a multi-row chunk (`0` for the single-row block).
-        #[expect(clippy::too_many_arguments, reason = "one debug read of one row")]
         fn check_filler(
             &self,
             launch: &Launch<'_>,

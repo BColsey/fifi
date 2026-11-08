@@ -358,42 +358,23 @@ mod tests {
     }
 
     #[test]
-    fn more_than_eight_distinct_programs_are_refused() {
+    fn more_than_five_distinct_programs_are_refused() {
         let delta = [delta_layer(0, 4), delta_layer(1, 5), delta_layer(2, 6)];
-        let moe = [moe_layer(0, 4)];
-        // Eight distinct ids pass: the limit is exactly the program budget (the dense oQ6
-        // pack needs 2 delta + 3 attention sets = 2*3 attn programs).
-        let eight = model_warmup(
-            true,
-            true,
-            &delta,
-            &moe,
-            &[attn_layer(0, 4), attn_layer(1, 5)],
-        )
-        .unwrap();
-        assert_eq!(
-            eight.delta.len() + eight.moe.len() + 2 * eight.attn.len(),
-            8,
-            "8 ids pass"
-        );
-        // One further attention set (pre + post) exceeds it.
-        let refused = model_warmup(
-            true,
-            true,
-            &delta,
-            &moe,
-            &[attn_layer(0, 4), attn_layer(1, 5), attn_layer(2, 6)],
-        )
-        .unwrap_err();
+        let moe = [moe_layer(0, 4), moe_layer(1, 8)];
+        // Five distinct ids pass: the limit is exactly the program budget.
+        let five = model_warmup(true, true, &delta, &moe, &[]).unwrap();
+        assert_eq!(five.delta.len() + five.moe.len(), 5, "5 ids pass");
+        // A sixth program (one attention set = pre + post) exceeds it.
+        let refused = model_warmup(true, true, &delta, &moe, &[attn_layer(0, 4)]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the admission refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 10 distinct compiled programs (3 delta, 1 moe, 6 attn)"),
+            message.contains("needs 7 distinct compiled programs (3 delta, 2 moe, 2 attn)"),
             "the refusal names the count: {message}"
         );
         assert!(
-            message.contains("at most 8"),
+            message.contains("at most 5"),
             "the refusal names the limit: {message}"
         );
     }
@@ -469,17 +450,17 @@ mod tests {
 
     #[test]
     fn attention_programs_count_against_the_limit() {
-        // two delta quantizations + moe + three attention quantizations (pre + post each)
-        // = nine programs: refused.
+        // two delta quantizations + moe + two attention quantizations (pre + post each)
+        // = seven programs: refused.
         let delta = [delta_layer(0, 4), delta_layer(1, 8)];
         let moe = [moe_layer(0, 4)];
-        let attn = [attn_layer(0, 4), attn_layer(1, 5), attn_layer(2, 8)];
+        let attn = [attn_layer(0, 4), attn_layer(1, 8)];
         let refused = model_warmup(true, true, &delta, &moe, &attn).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 9 distinct compiled programs (2 delta, 1 moe, 6 attn)"),
+            message.contains("needs 7 distinct compiled programs (2 delta, 1 moe, 4 attn)"),
             "the refusal names all three kinds: {message}"
         );
     }

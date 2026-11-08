@@ -105,7 +105,7 @@ struct State {
     max_threadgroup_memory: u64,
     /// The compiled-program registry of THIS adapter context: the MLX compile cache is
     /// thread-local and dies with its thread, so the registry lives and dies with the adapter.
-    /// The compile seam admits every cache key here before any native call; a ninth distinct key
+    /// The compile seam admits every cache key here before any native call; a sixth distinct key
     /// of one adapter is a non-terminal `BadRequest`.
     programs: crate::kernels::compile_key::ProgramRegistry,
 }

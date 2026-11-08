@@ -985,10 +985,10 @@ fn single_row_kernel_receipt_run() {
         );
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         let hash = format!("{:x}", Sha256::digest(&bytes));
-        if step == 0 {
-            if let Some(path) = var("FIFI_FLASH_NEXT_DRIVER_STEP0_BIN") {
-                std::fs::write(&path, &bytes).expect("write step0 logits");
-            }
+        if step == 0
+            && let Some(path) = var("FIFI_FLASH_NEXT_DRIVER_STEP0_BIN")
+        {
+            std::fs::write(&path, &bytes).expect("write step0 logits");
         }
         let pick = argmax(&row[..actual_vocab]);
         records.push(serde_json::json!({

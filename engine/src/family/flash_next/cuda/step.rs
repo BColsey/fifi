@@ -323,6 +323,7 @@ impl<'a> FlashStep<'a> {
     /// The projection of `m` rows into `n` floats at column `col_off` of a `ld`-wide row
     /// (`DeltaProj`/`AttnProj`): one row writes its columns as today, many rows run the job
     /// table.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn project_cols(
         &self,
         prefix: &str,

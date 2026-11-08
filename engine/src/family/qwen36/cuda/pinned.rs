@@ -38,11 +38,11 @@ fn min_free_mib(value: Option<&std::ffi::OsStr>) -> Result<usize, EngError> {
                 "{MIN_FREE_MIB_VAR} must be {MIN_FREE_MIB_FLOOR} to {MIN_FREE_MIB_CAP} MiB"
             ))
         })?;
-    Ok(mib.checked_mul(1 << 20).ok_or_else(|| {
+    mib.checked_mul(1 << 20).ok_or_else(|| {
         EngError::BadRequest(format!(
             "{MIN_FREE_MIB_VAR} must be {MIN_FREE_MIB_FLOOR} to {MIN_FREE_MIB_CAP} MiB"
         ))
-    })?)
+    })
 }
 
 /// The free-after-load floor of the memory admission, the same bytes for the gate's qualified
@@ -65,6 +65,12 @@ pub(super) fn min_free_after_load_default() -> usize {
     MIN_FREE_AFTER_LOAD_DEFAULT
 }
 
+pub(super) fn head_rows_of() -> Result<usize, EngError> {
+    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
+    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
+    Ok(StepDims::new(&shape, &inventory)?.shape.vocab)
+}
+
 #[cfg(test)]
 mod floor_tests {
     use super::*;
@@ -79,10 +85,4 @@ mod floor_tests {
             assert!(min_free_mib(Some(bad.as_ref())).is_err(), "{bad}");
         }
     }
-}
-
-pub(super) fn head_rows_of() -> Result<usize, EngError> {
-    let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B)?;
-    let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, ROTARY_DIM)?;
-    Ok(StepDims::new(&shape, &inventory)?.shape.vocab)
 }
