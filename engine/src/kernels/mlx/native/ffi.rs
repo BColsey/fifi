@@ -635,6 +635,32 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The delta_middle fused kernel (`Q36_FUSED_DECODE=1`): the same six F32 outputs as
+    /// `mlx_gdn_prep` in their decode shapes, over ONE slot - `dims` is [kh, kd, vh, vd, cd],
+    /// the ring has three taps, and `u_in`/`a_in`/`b_in` are the raw activation-dtype
+    /// projection rows of the slot. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_delta_middle"]
+    pub(super) fn mlx_delta_middle(
+        q_out: *mut mlx_array,
+        k_out: *mut mlx_array,
+        v_out: *mut mlx_array,
+        g_out: *mut mlx_array,
+        beta_out: *mut mlx_array,
+        ring_out: *mut mlx_array,
+        u_in: mlx_array,
+        a_in: mlx_array,
+        b_in: mlx_array,
+        ring: mlx_array,
+        taps: mlx_array,
+        last: mlx_array,
+        neg_exp_a_log: mlx_array,
+        dt_bias: mlx_array,
+        dims: *const i32,
+        qk_eps: mlx_array,
+        sqrt_kd: mlx_array,
+        source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     /// The flash-delta gated rule (Q36_FLASH_DELTA=1): the same contract as
     /// `mlx_gated_delta` above - the same operands, dims, F32 outputs, and NUL-terminated
     /// `source` - through the `gated_delta_wy` program (the placeholder body is the vendored
@@ -799,6 +825,7 @@ unsafe extern "C" {
         eps: f32,
         activation: mlx_dtype,
         source: *const c_char,
+        middle_source: *const c_char,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
@@ -816,6 +843,7 @@ unsafe extern "C" {
         eps: f32,
         activation: mlx_dtype,
         source: *const c_char,
+        middle_source: *const c_char,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;

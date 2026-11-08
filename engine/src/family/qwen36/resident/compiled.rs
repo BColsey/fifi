@@ -92,6 +92,11 @@ pub(super) fn delta_facts(
         layer,
         hidden: dim(shape.hidden)?,
         dims,
+        fused: u32::from(super::delta::fused_middle_applicable(
+            dim(taps)?,
+            dim(d.key_dim)?,
+            dim(d.value_dim)?,
+        )),
         eps_bits: eps.to_bits(),
         act: compile_key::dtype_key(act),
         weights: [
@@ -296,6 +301,17 @@ fn delta_args<'a>(
 ) -> Result<CompileDeltaArgs<'a>, EngError> {
     let d = &shape.delta;
     let hidden = dim(shape.hidden)?;
+    let taps = d
+        .conv_kernel
+        .checked_sub(1)
+        .ok_or_else(|| EngError::BadRequest("resident delta kernel is empty".into()))?;
+    // Q36_FUSED_DECODE=1 with three taps: the closure's pre-recurrence middle runs as the ONE
+    // delta_middle kernel, and the two norm-weight slots carry the qk_eps and sqrt_kd scalars
+    // instead (the empty shape is how the seam tells the modes apart, in both the key and the
+    // traced body).
+    let fused =
+        super::delta::fused_middle_applicable(dim(taps)?, dim(d.key_dim)?, dim(d.value_dim)?);
+    let middle_consts = consts.middle_consts(fused);
     Ok(CompileDeltaArgs {
         x,
         rec,
@@ -308,7 +324,7 @@ fn delta_args<'a>(
             &w.dt_bias,
             &w.norm,
         ],
-        consts: [&consts.zero, &consts.q_norm_w, &consts.k_norm_w],
+        consts: middle_consts,
         hidden,
         dims: [
             dim(d.key_heads)?,
@@ -316,10 +332,7 @@ fn delta_args<'a>(
             dim(d.value_heads)?,
             dim(d.value_dim)?,
             dim(d.conv_dim())?,
-            dim(d
-                .conv_kernel
-                .checked_sub(1)
-                .ok_or_else(|| EngError::BadRequest("resident delta kernel is empty".into()))?)?,
+            dim(taps)?,
         ],
         eps: shape.eps,
         act: consts.act,

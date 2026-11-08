@@ -108,6 +108,9 @@ pub(crate) struct DeltaBaked {
     /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw): every
     /// dimension of the native seam's `dims`, as checked by [`checked_delta_dims`].
     pub(crate) dims: [u32; 8],
+    /// 1 when the pre-recurrence middle runs as the ONE `delta_middle` Metal kernel
+    /// (`Q36_FUSED_DECODE=1` with three taps): a different closure body, so a different key.
+    pub(crate) fused: u32,
     /// `f32::to_bits(eps)`: the RMS norm epsilon of the block output norm.
     pub(crate) eps_bits: u32,
     /// The activation dtype key of the step (`dtype_key`): the dtype of the layer input and of
@@ -141,6 +144,7 @@ pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
     parts.extend(baked.dims.iter().map(|&dim| u64::from(dim)));
+    parts.push(u64::from(baked.fused));
     parts.push(u64::from(baked.eps_bits));
     parts.push(baked.act);
     parts.extend(baked.scale_keys);
@@ -327,6 +331,7 @@ mod tests {
         DeltaBaked {
             hidden: 2048,
             dims: [16, 128, 32, 128, 8192, 3, 2048, 4096],
+            fused: 0,
             eps_bits: 1e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
             scale_keys: [1, 1, 1, 1, 1],
@@ -579,7 +584,7 @@ mod tests {
 
     /// The row count of the delta table below: one row per scalar field, per dimension, per
     /// scale key, and per quantization value.
-    const DELTA_ROWS: usize = 1 + 8 + 1 + 1 + 5 + 5 * 3;
+    const DELTA_ROWS: usize = 1 + 1 + 8 + 1 + 1 + 5 + 5 * 3;
     const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
     /// The row count of the Flint tail table below: one row per scalar field, per scale
     /// key, and per quantization value.
@@ -681,6 +686,7 @@ mod tests {
                     ..base
                 },
             ),
+            ("fused", DeltaBaked { fused: 1, ..base }),
             (
                 "dims[0] kh",
                 DeltaBaked {

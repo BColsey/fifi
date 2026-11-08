@@ -47,6 +47,12 @@ pub(super) const FLASH_DELTA_SOURCE: &str = concat!(include_str!("gated_delta_wy
 /// The NUL-terminated Metal source of the gdn_prep kernel (Q36_FUSED_PREFILL=1).
 pub(super) const GDN_PREP_SOURCE: &str = concat!(include_str!("gdn_prep.body.metal"), "\0");
 
+/// The NUL-terminated Metal source of the delta_middle kernel (Q36_FUSED_DECODE=1): the
+/// decode-step pre-recurrence chain of ONE slot (conv, silu, q/k/v split, head norms,
+/// decay/beta gates, ring shift) in a single launch.
+pub(super) const DELTA_MIDDLE_SOURCE: &str =
+    concat!(include_str!("delta_middle_v1.body.metal"), "\0");
+
 pub(super) const ACT_MUL_SOURCE: &str = concat!(include_str!("act_mul.body.metal"), "\0");
 
 pub(super) const GDN_POST_SOURCE: &str = concat!(include_str!("gdn_post.body.metal"), "\0");
@@ -2506,6 +2512,111 @@ impl Context {
             g: state.resident(g, Dtype::F32, vec![rows, 32], (rows as u64) * 32 * 4),
             beta: state.resident(beta, Dtype::F32, vec![rows, 32], (rows as u64) * 32 * 4),
             ring: state.resident(ring_o, Dtype::F32, vec![8192, 3], 8192 * 3 * 4),
+        })
+    }
+
+    /// Runs the delta_middle fused kernel (`Q36_FUSED_DECODE=1`): ONE Metal kernel for the
+    /// pre-recurrence chain of ONE decode slot (causal conv over the three-tap ring, silu,
+    /// split, head norms, gates, ring shift). `dims` is `kh, kd, vh, vd, cd`; `u_in`,
+    /// `a_in`, and `b_in` are the raw activation-dtype projections of the slot. All outputs
+    /// are lazy F32 in their decode shapes (q/k `[1,1,KH,KD]`, v `[1,1,VH,VD]`, gates
+    /// `[1,1,VH]`, ring `[CD,3]`).
+    #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
+    pub(in crate::kernels::mlx) fn delta_middle(
+        &mut self,
+        u_in: &ExecutionTensor,
+        a_in: &ExecutionTensor,
+        b_in: &ExecutionTensor,
+        ring: &ExecutionTensor,
+        taps: &ExecutionTensor,
+        last: &ExecutionTensor,
+        neg_exp_a_log: &ExecutionTensor,
+        dt_bias: &ExecutionTensor,
+        qk_eps: &ExecutionTensor,
+        sqrt_kd: &ExecutionTensor,
+        dims: &[u32; 5],
+    ) -> Result<crate::kernels::mlx::GdnPrepOutput, EngError> {
+        let label = "delta middle";
+        let _dispatch = DispatchGuard::enter();
+        self.check_ready()?;
+        let state = self.state.as_mut().unwrap();
+        let [kh, kd, vh, vd, cd] = *dims;
+        let dims = native_ints(label, dims)?;
+        clear_message();
+        let stream = state.stream.0;
+        let (mut q, mut k, mut v, mut g, mut beta, mut ring_o) = (
+            Array::null(),
+            Array::null(),
+            Array::null(),
+            Array::null(),
+            Array::null(),
+            Array::null(),
+        );
+        let built = produce(&mut q, label, |slot| unsafe {
+            ffi::mlx_delta_middle(
+                slot,
+                &mut k.0,
+                &mut v.0,
+                &mut g.0,
+                &mut beta.0,
+                &mut ring_o.0,
+                u_in.storage.native_array(),
+                a_in.storage.native_array(),
+                b_in.storage.native_array(),
+                ring.storage.native_array(),
+                taps.storage.native_array(),
+                last.storage.native_array(),
+                neg_exp_a_log.storage.native_array(),
+                dt_bias.storage.native_array(),
+                dims.as_ptr(),
+                qk_eps.storage.native_array(),
+                sqrt_kd.storage.native_array(),
+                DELTA_MIDDLE_SOURCE.as_ptr().cast(),
+                stream,
+            )
+        });
+        let qk_len = u64::from(kh) * u64::from(kd);
+        let v_len = u64::from(vh) * u64::from(vd);
+        let expected = ExpectedOutput {
+            operation: label,
+            stream,
+            shape: &[1, 1, kh, kd],
+            byte_len: qk_len * 4,
+            dtype: Dtype::F32,
+            promotes: false,
+        };
+        expected.complete(&q, built)?;
+        let k_expected = ExpectedOutput {
+            shape: &[1, 1, kh, kd],
+            ..expected
+        };
+        k_expected.complete(&k, Ok(()))?;
+        let v_expected = ExpectedOutput {
+            shape: &[1, 1, vh, vd],
+            byte_len: v_len * 4,
+            ..expected
+        };
+        v_expected.complete(&v, Ok(()))?;
+        let gate_expected = ExpectedOutput {
+            shape: &[1, 1, vh],
+            byte_len: u64::from(vh) * 4,
+            ..expected
+        };
+        gate_expected.complete(&g, Ok(()))?;
+        gate_expected.complete(&beta, Ok(()))?;
+        let ring_expected = ExpectedOutput {
+            shape: &[cd, 3],
+            byte_len: u64::from(cd) * 3 * 4,
+            ..expected
+        };
+        ring_expected.complete(&ring_o, Ok(()))?;
+        Ok(crate::kernels::mlx::GdnPrepOutput {
+            q: state.resident(q, Dtype::F32, vec![1, 1, kh, kd], qk_len * 4),
+            k: state.resident(k, Dtype::F32, vec![1, 1, kh, kd], qk_len * 4),
+            v: state.resident(v, Dtype::F32, vec![1, 1, vh, vd], v_len * 4),
+            g: state.resident(g, Dtype::F32, vec![1, 1, vh], u64::from(vh) * 4),
+            beta: state.resident(beta, Dtype::F32, vec![1, 1, vh], u64::from(vh) * 4),
+            ring: state.resident(ring_o, Dtype::F32, vec![cd, 3], u64::from(cd) * 3 * 4),
         })
     }
 

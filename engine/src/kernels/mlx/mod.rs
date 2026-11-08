@@ -1949,6 +1949,39 @@ impl MlxKernels {
         )
     }
 
+    /// The delta_middle fused kernel (`Q36_FUSED_DECODE=1`): the decode counterpart of
+    /// [`MlxKernels::gdn_prep`], for one decode slot at a time. The extra `dims` argument is
+    /// `[kh, kd, vh, vd, cd]`.
+    #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
+    pub fn delta_middle(
+        &mut self,
+        u_in: &ExecutionTensor,
+        a_in: &ExecutionTensor,
+        b_in: &ExecutionTensor,
+        ring: &ExecutionTensor,
+        taps: &ExecutionTensor,
+        last: &ExecutionTensor,
+        neg_exp_a_log: &ExecutionTensor,
+        dt_bias: &ExecutionTensor,
+        qk_eps: &ExecutionTensor,
+        sqrt_kd: &ExecutionTensor,
+        dims: &[u32; 5],
+    ) -> Result<GdnPrepOutput, EngError> {
+        self.context.delta_middle(
+            u_in,
+            a_in,
+            b_in,
+            ring,
+            taps,
+            last,
+            neg_exp_a_log,
+            dt_bias,
+            qk_eps,
+            sqrt_kd,
+            dims,
+        )
+    }
+
     /// The act_mul fused kernel: SwiGLU activation.
     pub fn act_mul(
         &mut self,

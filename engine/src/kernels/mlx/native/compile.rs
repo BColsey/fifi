@@ -35,7 +35,8 @@ use super::{
     guard::{DispatchGuard, clear_message, failure, mark_failed},
     handles::{Array, native_dtype},
     resident_ops::{
-        GATED_DELTA_SOURCE, check_f32_operand, check_operand, native_output_valid, produce,
+        DELTA_MIDDLE_SOURCE, GATED_DELTA_SOURCE, check_f32_operand, check_operand,
+        native_output_valid, produce,
     },
 };
 use crate::{
@@ -123,7 +124,10 @@ pub(crate) struct CompileDeltaArgs<'a> {
     pub(crate) packed: [&'a ResidentPackedWeight; 5],
     /// conv_taps, conv_last, neg_exp_a_log, dt_bias, norm.
     pub(crate) plain: [&'a ExecutionTensor; 5],
-    /// zero, then the `[kd]` query and key norm weights (`1 / kd` and `1 / sqrt(kd)`).
+    /// zero, then the `[kd]` query and key norm weights (`1 / kd` and `1 / sqrt(kd)`); in the
+    /// fused mode (`Q36_FUSED_DECODE=1`, taps 3) the two norm slots carry the `qk_eps` and
+    /// `sqrt_kd` scalars instead, and the empty shape is the mode marker for the key and the
+    /// traced body.
     pub(crate) consts: [&'a ExecutionTensor; 3],
     pub(crate) hidden: u32,
     /// kh, kd, vh, vd, cd, taps.
@@ -457,6 +461,23 @@ impl Context {
         // and the fused-projection identity cd == 2 * kw + vh * vd fit an i32, before any
         // native call (the pure rule of `compile_key::checked_delta_dims`, Linux-tested).
         let [kh, kd, vh, vd, cd, taps, kw, kw2] = compile_key::checked_delta_dims(args.dims)?;
+        // The fused middle (ONE delta_middle kernel) or the unfused op sequence: the mode
+        // marker is the empty shape of the two norm slots (the qk_eps and sqrt_kd scalars
+        // replace the [kd] weights), and the kernel hardcodes the three-tap ring.
+        let fused = args.consts[1].shape().is_empty();
+        if fused && taps != 3 {
+            return Err(EngError::BadRequest(
+                "compile seam fused delta requires a three-tap ring".into(),
+            ));
+        }
+        // The kernel tiles one head's channels across `yv[4]` per simdgroup; wider heads would
+        // write out of bounds, so the seam refuses them even though the resident callers gate
+        // on the same bound (`delta::fused_middle_applicable`).
+        if fused && (kd > 128 || vd > 128) {
+            return Err(EngError::BadRequest(
+                "compile seam fused delta requires head widths of at most 128".into(),
+            ));
+        }
         let vh_vd = vh
             .checked_mul(vd)
             .ok_or_else(|| EngError::BadRequest("compile seam vh * vd exceeds u32".into()))?;
@@ -501,8 +522,11 @@ impl Context {
                 || args.plain[3].shape() != [vh]
                 || args.plain[4].shape() != [vd]
                 || !args.consts[0].shape().is_empty()
-                || args.consts[1].shape() != [kd]
-                || args.consts[2].shape() != [kd])
+                || (if fused {
+                    !args.consts[1].shape().is_empty() || !args.consts[2].shape().is_empty()
+                } else {
+                    args.consts[1].shape() != [kd] || args.consts[2].shape() != [kd]
+                }))
         {
             return Err(EngError::BadRequest(
                 "compile seam inputs differ from the delta plain operand shapes".into(),
@@ -541,12 +565,14 @@ impl Context {
             native_dim(label, taps)?,
             native_dim(label, kw)?,
             native_dim(label, kw2)?,
+            i32::from(fused),
         ];
         let triples = quant_triples(args.packed)?;
         let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
         let fun_id = compile_key::delta_fun_id(&compile_key::DeltaBaked {
             hidden: args.hidden,
             dims: [kh, kd, vh, vd, cd, taps, kw, kw2],
+            fused: u32::from(fused),
             eps_bits: args.eps.to_bits(),
             act: compile_key::dtype_key(args.act),
             scale_keys: args
@@ -616,6 +642,7 @@ impl Context {
                     args.eps,
                     native_dtype(args.act),
                     GATED_DELTA_SOURCE.as_ptr().cast(),
+                    DELTA_MIDDLE_SOURCE.as_ptr().cast(),
                     fun_id as usize,
                     stream,
                 )
@@ -630,6 +657,7 @@ impl Context {
                     args.eps,
                     native_dtype(args.act),
                     GATED_DELTA_SOURCE.as_ptr().cast(),
+                    DELTA_MIDDLE_SOURCE.as_ptr().cast(),
                     fun_id as usize,
                     stream,
                 );

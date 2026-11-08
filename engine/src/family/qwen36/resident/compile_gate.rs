@@ -185,6 +185,11 @@ fn delta_seam_args<'a>(
 ) -> CompileDeltaArgs<'a> {
     let (x, rec, ring) = inputs;
     let d = &shape.delta;
+    // The fused middle swaps the two norm slots for the qk_eps and sqrt_kd scalars; the same
+    // rule as `compiled::delta_args` and `delta::step_projected`, on the shared helpers.
+    // `dim(...).unwrap()` matches this non-Result builder's existing style.
+    let taps = dim(d.conv_kernel - 1).unwrap();
+    let fused = super::delta::fused_middle_applicable(taps, dim(d.key_dim).unwrap(), dim(d.value_dim).unwrap());
     CompileDeltaArgs {
         x,
         rec,
@@ -197,7 +202,7 @@ fn delta_seam_args<'a>(
             &w.dt_bias,
             &w.norm,
         ],
-        consts: [&consts.zero, &consts.q_norm_w, &consts.k_norm_w],
+        consts: consts.middle_consts(fused),
         hidden: dim(shape.hidden).unwrap(),
         dims: [
             dim(d.key_heads).unwrap(),

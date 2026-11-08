@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <unistd.h>
 #include <mach/mach.h>
 
@@ -1656,6 +1658,103 @@ extern "C" int inference_mlx_gdn_prep(
 }
 
 
+// The delta_middle fused kernel (Q36_FUSED_DECODE=1): the whole decode-step
+// pre-recurrence chain of ONE slot - causal conv over the 3-tap ring, silu,
+// the q/k/v split, the q/k head norms, the decay/beta gates, and the shifted
+// ring - in ONE launch. Replaces ~15 traced kernels per delta layer; the
+// decode step is dispatch-bound at batch 1. `dims` is [kh, kd, vh, vd, cd].
+// Launch contract: threadgroup (32,1,1) = one simdgroup per head; grid
+// ((2*kh+vh)*32, 1, 1) threads; template args KH/KD/VH/VD. Inputs are indexed
+// linearly (u is [1, cd], a and b are [1, vh]); outputs carry their final
+// shapes so no reshape follows the kernel.
+static int delta_middle_kernel_call(
+    mlx_array* q_out, mlx_array* k_out, mlx_array* v_out, mlx_array* g_out,
+    mlx_array* beta_out, mlx_array* ring_out, mlx_array u_in, mlx_array a_in,
+    mlx_array b_in, mlx_array ring, mlx_array taps, mlx_array last,
+    mlx_array neg_exp_a_log, mlx_array dt_bias, const int* dims, mlx_array qk_eps,
+    mlx_array sqrt_kd, const char* source, mlx_stream stream) noexcept {
+  const int kh = dims[0], kd = dims[1], vh = dims[2], vd = dims[3], cd = dims[4];
+  const char* input_names[] = {"u_in",  "a_in",  "b_in",  "ring",
+                               "taps",  "last",  "neg_exp_a_log",
+                               "dt_bias", "qk_eps", "sqrt_kd"};
+  const char* output_names[] = {"q_out", "k_out", "v_out",
+                                "g_out", "beta_out", "ring_out"};
+  mlx_vector_string in_names = mlx_vector_string_new_data(input_names, 10);
+  mlx_vector_string out_names = mlx_vector_string_new_data(output_names, 6);
+  mlx_fast_metal_kernel kernel =
+      mlx_fast_metal_kernel_new("delta_middle_v1", in_names, out_names, source,
+                               kFusedPrefillHeader, true, false);
+  mlx_fast_metal_kernel_config config = mlx_fast_metal_kernel_config_new();
+  const mlx_array operands[10] = {u_in, a_in, b_in, ring, taps, last,
+                                  neg_exp_a_log, dt_bias, qk_eps, sqrt_kd};
+  mlx_vector_array inputs = mlx_vector_array_new_data(operands, 10);
+  mlx_vector_array outputs = mlx_vector_array_new();
+  const int q_shape[4] = {1, 1, kh, kd};
+  const int k_shape[4] = {1, 1, kh, kd};
+  const int v_shape[4] = {1, 1, vh, vd};
+  const int gate_shape[3] = {1, 1, vh};
+  const int ring_shape[2] = {cd, 3};
+  int status = (in_names.ctx && out_names.ctx && kernel.ctx && config.ctx &&
+                inputs.ctx && outputs.ctx)
+                   ? 0
+                   : 1;
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, q_shape, 4, MLX_FLOAT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, k_shape, 4, MLX_FLOAT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, v_shape, 4, MLX_FLOAT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, gate_shape, 3, MLX_FLOAT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, gate_shape, 3, MLX_FLOAT32);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_output_arg(config, ring_shape, 2, MLX_FLOAT32);
+  if (status == 0) status = mlx_fast_metal_kernel_config_set_grid(
+      config, (2 * kh + vh) * 32, 1, 1);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_template_arg_int(config, "KH", kh);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_template_arg_int(config, "KD", kd);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_template_arg_int(config, "VH", vh);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_config_add_template_arg_int(config, "VD", vd);
+  if (status == 0) status =
+      mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, config, stream);
+  if (status == 0 && mlx_vector_array_size(outputs) != 6) status = 1;
+  if (status == 0) status = mlx_vector_array_get(q_out, outputs, 0);
+  if (status == 0) status = mlx_vector_array_get(k_out, outputs, 1);
+  if (status == 0) status = mlx_vector_array_get(v_out, outputs, 2);
+  if (status == 0) status = mlx_vector_array_get(g_out, outputs, 3);
+  if (status == 0) status = mlx_vector_array_get(beta_out, outputs, 4);
+  if (status == 0) status = mlx_vector_array_get(ring_out, outputs, 5);
+  int released = mlx_vector_array_free(outputs);
+  released |= mlx_vector_array_free(inputs);
+  mlx_fast_metal_kernel_config_free(config);
+  mlx_fast_metal_kernel_free(kernel);
+  released |= mlx_vector_string_free(out_names);
+  released |= mlx_vector_string_free(in_names);
+  return status != 0 ? status : released;
+}
+
+extern "C" int inference_mlx_delta_middle(
+    mlx_array* q_out, mlx_array* k_out, mlx_array* v_out, mlx_array* g_out,
+    mlx_array* beta_out, mlx_array* ring_out, mlx_array u_in, mlx_array a_in,
+    mlx_array b_in, mlx_array ring, mlx_array taps, mlx_array last,
+    mlx_array neg_exp_a_log, mlx_array dt_bias, const int* dims, mlx_array qk_eps,
+    mlx_array sqrt_kd, const char* source, mlx_stream stream) noexcept {
+  return run_selected_operation(q_out, stream, [&] {
+    return delta_middle_kernel_call(q_out, k_out, v_out, g_out, beta_out,
+                                    ring_out, u_in, a_in, b_in, ring, taps, last,
+                                    neg_exp_a_log, dt_bias, dims, qk_eps, sqrt_kd,
+                                    source, stream);
+  });
+}
+
+
 // The act_mul fused kernel (Q36_FUSED_PREFILL=1): SwiGLU activation of the
 // experts - h = bf16(bf16(g * sigmoid(g)) * u) - replacing sigmoid,
 // multiply, multiply. Launch contract: grid (NCOL/4, rows, 1), threadgroup
@@ -2308,9 +2407,12 @@ static int compile_cast_to(
 struct CompileDeltaPayload {
   int hidden;  // H
   int kh, kd, vh, vd, cd, taps, kw, kw2;
+  int fused;  // Q36_FUSED_DECODE=1 with taps == 3: the pre-recurrence middle runs as the
+              // ONE delta_middle kernel (payload->middle_source) instead of the op sequence
   float eps;
   mlx_dtype act;
   const char* source;
+  const char* middle_source;
   mlx_stream stream;
   int mode[5];   // qkv, z, b, a, out
   int group[5];
@@ -2368,6 +2470,20 @@ static int compile_delta_slot(
   CompileScopeArray state4, y2, state_out;
   CompileScopeArray core, rec_next, normed, z2d, gate, o, o_act, out;
   int status = 0;
+  // The pre-recurrence middle. Unfused: the op sequence below, whose math and casts mirror
+  // delta::step (b is F32 before sigmoid, the conv runs in F32). Fused
+  // (Q36_FUSED_DECODE=1, taps == 3): ONE delta_middle kernel produces the split, normed,
+  // gated outputs and the shifted ring - the same kernel the eager `step_projected` calls,
+  // so the compiled and eager paths stay identical.
+  if (p->fused) {
+    const int middle_dims[5] = {p->kh, p->kd, p->vh, p->vd, p->cd};
+    if (status == 0)
+      status = delta_middle_kernel_call(
+          &q4d.value, &k4d.value, &v4d.value, &alpha.value, &beta.value,
+          &ring_next.value, u.value, a.value, b_used, ring, in.values[18], in.values[19],
+          in.values[20], in.values[21], middle_dims, in.values[24], in.values[25],
+          p->middle_source, s);
+  } else {
   // Causal depthwise convolution over the ring and the new row, then SiLU. The F32 `conv_last`
   // and `conv_taps` meet the activation-dtype `u` and promote, so the convolution runs in F32
   // exactly as the uncompiled step does.
@@ -2419,6 +2535,7 @@ static int compile_delta_slot(
   if (status == 0) status = inference_mlx_reshape(&alpha.value, alpha_exp.value, gate_scalar_shape, 3, s);
   if (status == 0) status = inference_mlx_sigmoid(&beta_sig.value, b_used, s);
   if (status == 0) status = inference_mlx_reshape(&beta.value, beta_sig.value, gate_scalar_shape, 3, s);
+  }
   // The gated delta rule for one token.
   if (status == 0) status = inference_mlx_reshape(&state4.value, rec, state_shape, 4, s);
   if (status == 0)
@@ -2510,7 +2627,10 @@ static int compile_delta_body(
         &b_product.value, x_flat.value, in.values[9], in.values[10], in.values[11], true,
         compile_quant_optional(p->group[2]), compile_quant_optional(p->bits[2]),
         compile_quant_mode(p->mode[2]), s);
-  if (status == 0) status = compile_cast_to(&b_cast.value, b_product.value, MLX_FLOAT32, s);
+  // The fused middle takes the raw activation-dtype b (the kernel casts inside), so the F32
+  // cast runs in the unfused mode alone.
+  if (status == 0 && !p->fused)
+    status = compile_cast_to(&b_cast.value, b_product.value, MLX_FLOAT32, s);
   const mlx_array b_used = b_cast.value.ctx != nullptr ? b_cast.value : b_product.value;
   if (status == 0)
     status = inference_mlx_quantized_matmul(
@@ -3119,7 +3239,9 @@ static int compile_apply_block(
 }
 
 // The DeltaNet decode block as one compiled closure. `dims` holds
-// hidden, kh, kd, vh, vd, cd, taps, kw, kw2.
+// hidden, kh, kd, vh, vd, cd, taps, kw, kw2, fused (1 when the delta_middle kernel replaces
+// the pre-recurrence middle; requires taps == 3, and inputs 24/25 then carry the qk_eps and
+// sqrt_kd scalars instead of the [kd] norm weights).
 // `quant` holds mode, group, bits per weight for qkv, z, b, a, out (15 values; group and bits -1
 // when the mode has none). Inputs follow compile_delta_body: 26 base arrays plus any
 // extra rec/ring pairs. Outputs stay lazy. The B1 and rows entry wrappers below select
@@ -3127,7 +3249,7 @@ static int compile_apply_block(
 static int compile_delta_apply(
     mlx_array* outputs, size_t outputs_num, const mlx_array* inputs, size_t inputs_num,
     const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
-    uintptr_t fun_id, mlx_stream stream
+    const char* middle_source, uintptr_t fun_id, mlx_stream stream
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
     , bool partial_output = false
 #endif
@@ -3146,9 +3268,11 @@ static int compile_delta_apply(
   payload->taps = dims[6];
   payload->kw = dims[7];
   payload->kw2 = dims[8];
+  payload->fused = dims[9];
   payload->eps = eps;
   payload->act = activation;
   payload->source = source;
+  payload->middle_source = middle_source;
   int stream_status = compile_copy_stream(&payload->stream, stream);
   if (stream_status != 0) {
     std::free(payload);
@@ -3618,12 +3742,13 @@ extern "C" int inference_mlx_compile_add_chain_probe(
 extern "C" int inference_mlx_compile_delta_block(
     mlx_array* out, mlx_array* rec, mlx_array* ring, const mlx_array* inputs, size_t inputs_num,
     const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
-    uintptr_t fun_id, mlx_stream stream) noexcept {
+    const char* middle_source, uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
     if (inputs_num != 26) return 1;
     mlx_array outputs[3] = {{nullptr}, {nullptr}, {nullptr}};
     const int status = compile_delta_apply(
-        outputs, 3, inputs, inputs_num, dims, quant, eps, activation, source, fun_id, stream);
+        outputs, 3, inputs, inputs_num, dims, quant, eps, activation, source, middle_source,
+        fun_id, stream);
     *out = outputs[0];
     *rec = outputs[1];
     *ring = outputs[2];
@@ -3638,7 +3763,7 @@ extern "C" int inference_mlx_compile_delta_block(
 extern "C" int inference_mlx_compile_delta_rows(
     mlx_array* outputs, size_t outputs_num, const mlx_array* inputs, size_t inputs_num,
     const int* dims, const int* quant, float eps, mlx_dtype activation, const char* source,
-    uintptr_t fun_id, mlx_stream stream) noexcept {
+    const char* middle_source, uintptr_t fun_id, mlx_stream stream) noexcept {
   if (outputs == nullptr || inputs == nullptr || dims == nullptr || quant == nullptr ||
       source == nullptr || inputs_num < 28 || inputs_num > CompileScopeInputs::kMax) return 1;
   const size_t batch = (inputs_num - 24) / 2;
@@ -3652,7 +3777,7 @@ extern "C" int inference_mlx_compile_delta_rows(
 #endif
   const int status = run_selected_operation(&outputs[0], stream, [&]() noexcept {
     return compile_delta_apply(outputs, outputs_num, inputs, inputs_num, dims, quant, eps,
-                               activation, source, fun_id, stream
+                               activation, source, middle_source, fun_id, stream
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
                                , partial_output
 #endif

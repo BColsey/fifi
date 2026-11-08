@@ -30,6 +30,10 @@ pub(super) struct DeltaLayerFacts {
     pub(super) hidden: u32,
     /// The eight checked dimensions of the block (`compile_key::checked_delta_dims`).
     pub(super) dims: [u32; 8],
+    /// 1 when the pre-recurrence middle runs as the ONE `delta_middle` kernel
+    /// (`Q36_FUSED_DECODE=1` with three taps, read at load): a different closure body, so a
+    /// different warm-up program.
+    pub(super) fused: u32,
     /// `f32::to_bits(eps)`: the RMS norm epsilon of the block.
     pub(super) eps_bits: u32,
     /// The activation dtype key (`compile_key::dtype_key`).
@@ -134,6 +138,7 @@ pub(super) fn model_warmup(
         let baked = DeltaBaked {
             hidden: facts.hidden,
             dims: facts.dims,
+            fused: facts.fused,
             eps_bits: facts.eps_bits,
             act: facts.act,
             scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
@@ -249,6 +254,7 @@ mod tests {
             layer,
             hidden: 2048,
             dims: [16, 128, 32, 128, 8192, 3, 2048, 4096],
+            fused: 0,
             eps_bits: 1e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
             weights: [affine(bits); 5],

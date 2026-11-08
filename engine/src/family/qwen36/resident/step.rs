@@ -1369,10 +1369,14 @@ mod tests {
     /// The end-to-end bit equality of a short decode. Eight `Record` steps of the tiny GQA model
     /// must return the SAME tokens and the SAME logit bits on the trimmed graph (one clamp per
     /// layer, no no-op contiguous nodes) as the frozen expectation from the untrimmed graph, in F32
-    /// and in BF16. The comparison is on `f32::to_bits`.
+    /// and in BF16. The comparison is on `f32::to_bits` - except under `Q36_FUSED_DECODE=1`, where
+    /// the fused `delta_middle` kernel reorders the middle math (a last-digit difference per step,
+    /// within the parity tolerance) and the logits compare with `assert_parity` instead; the
+    /// tokens stay exact either way, and re-freezing happens the day the flag flips default on.
     #[test]
     fn eight_decode_steps_match_the_frozen_expectation_in_f32_and_bf16() {
         let freeze = std::env::var_os("GAP_TRIM_FREEZE").is_some();
+        let fused = super::super::delta::fused_decode_enabled();
         for (name, activation, frozen) in [
             ("FROZEN_F32", Activation::F32, &FROZEN_F32),
             ("FROZEN_BF16", Activation::Bf16, &FROZEN_BF16),
@@ -1398,6 +1402,10 @@ mod tests {
                     want.len(),
                     "{name} step {step}: the vocabulary width"
                 );
+                if fused {
+                    super::super::ops::assert_parity(got, want, &format!("{name} step {step}"));
+                    continue;
+                }
                 for (index, (got, want)) in got.iter().zip(want).enumerate() {
                     assert_eq!(
                         got.to_bits(),
