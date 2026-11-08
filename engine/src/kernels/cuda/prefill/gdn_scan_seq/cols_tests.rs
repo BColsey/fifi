@@ -274,8 +274,10 @@ fn the_narrow_block_scan_writes_the_bytes_of_the_original() {
         ("small-tiled", 2, 4, GdnForm::QWEN36_GGUF),
         ("small-grouped", 3, 6, GdnForm::FLASH_NEXT),
     ];
+    // The short lists keep both models' forms: the grouped form addresses q/k differently, and the
+    // sanitizer legs run these lists.
     let geometries: &[_] = if quick() {
-        &geometries[..1]
+        &geometries[..2]
     } else {
         &geometries
     };
@@ -307,7 +309,7 @@ fn pieces_carry_the_state_across_launches_and_across_kernels() {
     }
     let rig = Rig::new();
     let forms = [(GdnForm::QWEN36_GGUF, 32usize), (GdnForm::FLASH_NEXT, 48)];
-    for &(form, n_v) in if quick() { &forms[..1] } else { &forms[..] } {
+    for &(form, n_v) in &forms {
         let total = if quick() { 300 } else { 1500 };
         let c = case(16, n_v, total, form, 0x5c03_0000 + n_v as u64);
         let want = run_pieces(&rig, &c, &[(c.m, None)]);
@@ -536,6 +538,12 @@ fn scan_cols_kernel_timing() {
 /// run with `--test-threads=1`.
 #[cfg(feature = "cuda-gdn-mutants")]
 mod mutants {
+    // Accepted survivors, by construction (no test can see them): a dispatch-mapping swap such as
+    // `case 16: launch_cols<8>` instead of `launch_cols<4>` writes the same bytes at a different launch shape.
+    // Equivalent mutants: removing the clamp `min(t0 + slot, m - 1)` (every use of the row pointer is already
+    // under `slot < len`, so it only avoids forming a pointer past the object) and the `slot < len` guard on the
+    // q/k staging while that clamp exists (the dead `qk_s` slots are never read). Mutant 20 (the tile barrier) is
+    // seen by racecheck, not by bytes; the sanitizer legs of tools/sanitizer_run.sh kill it.
     use super::*;
     use crate::kernels::cuda::gdn_mutants::{self as gm, select};
     use crate::kernels::cuda::native::prefill::gdn_scan_seq::{

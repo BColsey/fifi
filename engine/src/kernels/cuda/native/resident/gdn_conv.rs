@@ -329,7 +329,7 @@ unsafe extern "C" {
     fn gdn_mutant_select_raw(id: c_int) -> c_int;
 }
 
-/// Makes the kernel mutant `id` (0 is none; 1 to 11, `native/resident/gdn_mutants.h`) the one the next
+/// Makes the kernel mutant `id` (0 is none; 1 to 11, 19 to 21 and 23, `native/resident/gdn_mutants.h`) the one the next
 /// conv prefill and narrow-block scan launches run. Mutation tests only; returns whether the id was accepted.
 #[cfg(all(test, feature = "cuda-gdn-mutants"))]
 pub(in crate::kernels::cuda) fn select_gdn_mutant(id: u32) -> bool {
@@ -337,6 +337,6 @@ pub(in crate::kernels::cuda) fn select_gdn_mutant(id: u32) -> bool {
         return false;
     };
     // SAFETY: the entry stores one integer in a process-wide atomic and touches no pointer, device
-    // or stream; it refuses an id outside 0 to 11.
+    // or stream; it refuses an id outside 0 to 23.
     unsafe { gdn_mutant_select_raw(id) == 0 }
 }
