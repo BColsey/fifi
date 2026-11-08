@@ -1068,18 +1068,33 @@ mod tests {
         let x3 = kernels
             .import_tensor(&f32_tensor(vec![1, 1, 64], &x).unwrap())
             .unwrap();
-        for (name, stack, host_stack) in [
-            (
-                "gate_up",
-                &w.layers[0].as_moe().unwrap().gate_up,
-                view.layers[0].as_moe().unwrap().gate_up,
-            ),
-            (
-                "down",
-                &w.layers[1].as_moe().unwrap().down,
-                view.layers[1].as_moe().unwrap().down,
-            ),
-        ] {
+        // The stacked gate/up operand: the first half of the gathered product is the gate
+        // projection and the second the up projection, each equal to the CPU reference of the
+        // checkpoint's own gate and up stacks.
+        let moe0 = view.layers[0].as_moe().unwrap();
+        for e in 0..4u32 {
+            let ids = kernels
+                .import_tensor(&u32_tensor(vec![1], &[e]).unwrap())
+                .unwrap();
+            let got = kernels
+                .gather_qmm(&x3, &w.layers[0].as_moe().unwrap().gate_up, &ids)
+                .unwrap();
+            let got = values(&mut kernels, &got).unwrap();
+            let gate = cpu.expert_linear(moe0.gate, e, &x).unwrap();
+            let up = cpu.expert_linear(moe0.up, e, &x).unwrap();
+            let half = gate.len();
+            assert_parity(
+                &got[..half],
+                &gate,
+                &format!("gate_up gate half expert {e}"),
+            );
+            assert_parity(&got[half..], &up, &format!("gate_up up half expert {e}"));
+        }
+        for (name, stack, host_stack) in [(
+            "down",
+            &w.layers[1].as_moe().unwrap().down,
+            view.layers[1].as_moe().unwrap().down,
+        )] {
             for e in 0..4u32 {
                 let ids = kernels
                     .import_tensor(&u32_tensor(vec![1], &[e]).unwrap())
