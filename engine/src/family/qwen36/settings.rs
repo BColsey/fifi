@@ -5,8 +5,9 @@
 //! environment fallback. This file only reads and checks values. It opens no file and starts no
 //! thread.
 //!
-//! The dense Qwen3.8 family uses these settings on MLX and expects the same pinned tokenizer
-//! bundle as Q36. Its session cap is explicit and includes its attention and DeltaNet state.
+//! The dense Qwen3.8 family uses these settings on MLX and expects its own pinned tokenizer
+//! bundle (`dense_tokenizer_pin`). Its session cap is explicit and includes its attention and
+//! DeltaNet state.
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
@@ -80,6 +81,17 @@ const CHAT_TEMPLATE_SHA256: &str =
     "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
+
+/// SHA-256 of the pinned files of the Qwen3.8-27B dense release
+/// (`Qwen3.8-27B-Dense-exl3-4.00bpw`). Its tokenizer serializes differently and its
+/// chat template is its own, but the id count (base 248,044 plus 33 added tokens,
+/// 248,077 ids) and the generation config are identical to Qwen3.6.
+const DENSE_TOKENIZER_JSON_SHA256: &str =
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
+const DENSE_TOKENIZER_CONFIG_SHA256: &str =
+    "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
+const DENSE_CHAT_TEMPLATE_SHA256: &str =
+    "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 
 /// The backend a build serves Q36 from: MLX on Apple Silicon, CUDA on Linux with `native-cuda`; a
 /// build with neither keeps the MLX reading, as before.
@@ -1521,6 +1533,18 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
     })
 }
 
+/// The same pin for the dense Qwen3.8 family: its own tokenizer, config, and template,
+/// the shared generation config and id count.
+pub(crate) fn dense_tokenizer_pin() -> Result<TokenizerPin, EngError> {
+    Ok(TokenizerPin {
+        tokenizer_json: digest(DENSE_TOKENIZER_JSON_SHA256)?,
+        tokenizer_config_json: digest(DENSE_TOKENIZER_CONFIG_SHA256)?,
+        chat_template_jinja: digest(DENSE_CHAT_TEMPLATE_SHA256)?,
+        generation_config_json: digest(GENERATION_CONFIG_SHA256)?,
+        vocab_size: TOKENIZER_VOCAB_SIZE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1528,7 +1552,8 @@ mod tests {
         DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE,
         Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
         activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
-        digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        dense_tokenizer_pin, digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype,
+        scale_pairing_error, tokenizer_pin,
     };
     use super::{
         QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
@@ -3455,6 +3480,21 @@ mod tests {
         assert_eq!(pin.tokenizer_config_json[..4], [0xe9, 0x8f, 0x19, 0x01]);
         assert_eq!(pin.chat_template_jinja[..4], [0xe8, 0x4f, 0x32, 0xa2]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
+    }
+
+    #[test]
+    fn the_dense_pin_holds_its_own_digests_and_shares_generation() {
+        let pin = dense_tokenizer_pin().unwrap();
+        let moe = tokenizer_pin().unwrap();
+        assert_eq!(pin.vocab_size, 248_077);
+        assert_eq!(pin.tokenizer_json[..4], [0x09, 0x97, 0xf4, 0x10]);
+        assert_eq!(pin.tokenizer_config_json[..4], [0xb1, 0x13, 0x49, 0xaa]);
+        assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
+        // The release ships the same generation config as Qwen3.6, so the pin shares it.
+        assert_eq!(pin.generation_config_json, moe.generation_config_json);
+        assert_ne!(pin.tokenizer_json, moe.tokenizer_json);
+        assert_ne!(pin.tokenizer_config_json, moe.tokenizer_config_json);
+        assert_ne!(pin.chat_template_jinja, moe.chat_template_jinja);
     }
 
     #[test]
