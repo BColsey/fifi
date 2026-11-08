@@ -61,6 +61,8 @@ async function mergedModels(res) {
     fetch(b.origin + '/v1/models', { headers: { authorization: 'Bearer ' + b.key }, signal: AbortSignal.timeout(4000) })
       .then(r => r.json()).catch(() => null)));
   const data = lists.flatMap((l, i) => l?.data ?? [{ id: BACKENDS[i].model, object: 'model', owned_by: 'fifi' }]);
+  // The GUI selects the first model when it has no saved choice. Prefer the P2P engine.
+  data.sort((a, b) => Number(b.id === DEFAULT.model) - Number(a.id === DEFAULT.model));
   if (!lists.some(l => l?.data?.length)) { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'no backends reachable' })); return; }
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ object: 'list', data }));
