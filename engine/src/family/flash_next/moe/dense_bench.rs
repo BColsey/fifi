@@ -10,20 +10,23 @@
 //! - `wide1`: the one-tile wide kernel that Qwen3.6 and Flint serve.
 //!
 //! Each case reads its matrix from the pack once and uploads it in as many copies as make a pool of
-//! at least 96 MiB (2 for the head), so a call never finds its weights in the 6 MB L2. A trial
+//! up to 96 MiB (2 copies at least, 48 at most; the head is 2), so a call never finds its weights
+//! in the 6 MB L2 for the shapes of the table. A trial
 //! issues `ROUNDS` passes over the pool between two timing events. Trials rotate the order of the
 //! paths, and the first trial is a warm-up.
 //!
 //! Before timing, every path's output row, rotated input and split-K partial are compared byte for
 //! byte with `legacy` (NaN-filled first, so a skipped write shows) for the first and last copy, and
-//! the arithmetic flag must stay 0. A path that differs is reported and not timed.
+//! the arithmetic flag of every result must stay 0. A path that differs is reported, not timed, and
+//! fails the test after the last case.
 //!
 //! Without a device the test only reads the pack, checks each matrix's byte length against the
 //! packed-tile formula and prints the shape table (the dry run).
 //!
-//! Stock figures (exllamav3's own decode profile of the same pack, in microseconds per call) are
-//! printed beside the cases they cover: the in projections `qkv` and `z` together 44 + 3.6 us, `out` 21 us,
-//! `q`, `k`, `v` together 50 us, the head 466 us.
+//! Stock figures (an nsys profile of exllamav3 decoding 32 greedy tokens of a short chat prompt on
+//! this pack, one row, in microseconds per call) are printed beside the cases they cover: the in
+//! projections `qkv` and `z` together 44 + 3.6 us, `out` 21 us, `q`, `k`, `v` together 50 us, the
+//! head 466 us.
 
 use std::{path::Path, time::Instant};
 
@@ -131,7 +134,33 @@ const PATHS: [(&str, SingleRow); 3] = [
 ];
 
 fn layer_index(var: &str, default: usize) -> Res<usize> {
-    std::env::var(var).map_or(Ok(default), |v| v.parse().map_err(|_| fail(var)))
+    std::env::var_os(var).map_or(Ok(default), |value| {
+        value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| fail(format!("{var} must be a layer number")))
+    })
+}
+
+/// The cases `FIFI_FLASH_NEXT_DENSE_CASES` names (comma separated), all of them when it is unset.
+/// A value that is not UTF-8 or a name that matches no case is refused.
+fn selected_cases() -> Res<Vec<&'static Case>> {
+    let Some(value) = std::env::var_os("FIFI_FLASH_NEXT_DENSE_CASES") else {
+        return Ok(CASES.iter().collect());
+    };
+    let names = value
+        .to_str()
+        .ok_or_else(|| fail("FIFI_FLASH_NEXT_DENSE_CASES must be UTF-8"))?;
+    names
+        .split(',')
+        .map(|name| {
+            CASES.iter().find(|case| case.name == name).ok_or_else(|| {
+                fail(format!(
+                    "FIFI_FLASH_NEXT_DENSE_CASES: no case named {name:?}"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// The tensor prefix of `case`.
@@ -296,13 +325,11 @@ fn run() -> Res<()> {
         ));
     }
     let checkpoint = Checkpoint::open(Path::new(&dir))?;
-    let only = std::env::var("FIFI_FLASH_NEXT_DENSE_CASES").ok();
+    let cases = selected_cases()?;
     let device = device_present("Flash-Next dense projection microbenchmark");
     let projector = device.then(CudaProjector::new).transpose()?;
-    for case in CASES.iter().filter(|c| {
-        only.as_deref()
-            .is_none_or(|o| o.split(',').any(|n| n == c.name))
-    }) {
+    let mut mismatched = Vec::new();
+    for case in cases {
         let name = full_prefix(case)?;
         let matrix = matrix(&checkpoint, &name)?;
         let shape = shape_of(&matrix, &name)?;
@@ -311,13 +338,21 @@ fn run() -> Res<()> {
             continue;
         };
         let rig = Rig::new(projector, &matrix, shape)?;
-        measure(case, &rig)?;
+        if !measure(case, &rig)? {
+            mismatched.push(case.name);
+        }
     }
-    Ok(())
+    if mismatched.is_empty() {
+        return Ok(());
+    }
+    Err(fail(format!(
+        "a path wrote other bytes than the legacy kernel in: {mismatched:?}"
+    )))
 }
 
-/// Checks every path against `legacy`, then times the paths that agree.
-fn measure(case: &Case, rig: &Rig<'_>) -> Res<()> {
+/// Checks every path against `legacy`, then times the paths that agree. `false` when a path wrote
+/// other bytes.
+fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
     let last = rig.weights.len() - 1;
     let mut want = Vec::with_capacity(2);
     rig.ctx.set_single_row_default(PATHS[0].1);
@@ -337,7 +372,7 @@ fn measure(case: &Case, rig: &Rig<'_>) -> Res<()> {
             }
         }
     }
-    if want[0][want[0].len() - 4..] != [0; 4] {
+    if want.iter().any(|bytes| bytes[bytes.len() - 4..] != [0; 4]) {
         return Err(fail(format!("{}: the arithmetic flag is set", case.name)));
     }
     let mut samples: Vec<Vec<(f64, f64)>> = vec![Vec::new(); PATHS.len()];
@@ -355,7 +390,7 @@ fn measure(case: &Case, rig: &Rig<'_>) -> Res<()> {
         }
     }
     report(case, rig, &samples, &agree);
-    Ok(())
+    Ok(agree.iter().all(|&same| same))
 }
 
 fn report(case: &Case, rig: &Rig<'_>, samples: &[Vec<(f64, f64)>], agree: &[bool]) {
