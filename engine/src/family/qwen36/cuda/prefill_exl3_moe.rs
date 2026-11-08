@@ -162,24 +162,9 @@ fn read_plan(
     projector: &Projector<'_>,
     ids: DeviceRange<'_>,
     dims: &MoeDims,
-    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<PairPlan, EngError> {
     let picks = read_ids(projector, ids, dims)?;
-    // A banked block maps its picks through the layer's slot table before the sort: the
-    // grouped launches then read the slot members of the bank region exactly as a resident
-    // block reads its expert ids. A fault-marked id (-1) falls through to the sort's refusal.
-    let picks = match bank {
-        Some(bank) if !picks.iter().any(|&id| id < 0) => {
-            #[cfg(test)]
-            let began = std::time::Instant::now();
-            let wanted = picks.iter().map(|&id| id as usize).collect::<Vec<_>>();
-            let mapped = bank.resolve(projector.launch.stream, &wanted)?;
-            #[cfg(test)]
-            crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
-            mapped.into_iter().map(|slot| slot as i32).collect()
-        }
-        _ => picks,
-    };
+    // A fault-marked id (-1) falls through to the sort's refusal.
     plan_pairs(&picks, dims.n_expert, dims.top_k)
 }
 
@@ -408,14 +393,12 @@ fn routed(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Bufs<'_>,
     dims: &MoeDims,
-    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<(), EngError> {
     routed_with(
         projector,
         weights,
         bufs,
         dims,
-        bank,
         projector.launch.ctx.exl3_jobs_pair_enabled()?,
     )
     .map(|_| ())
@@ -428,10 +411,9 @@ fn routed_with(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Bufs<'_>,
     dims: &MoeDims,
-    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
     pair: bool,
 ) -> Result<bool, EngError> {
-    let plan = read_plan(projector, bufs.ids, dims, bank)?;
+    let plan = read_plan(projector, bufs.ids, dims)?;
     routed_plan(projector, weights, bufs, dims, plan, pair)
 }
 
@@ -549,7 +531,7 @@ pub(super) fn run(
 ) -> Result<(), EngError> {
     shared(projector, weights, bufs, dims)?;
     super::split::mark(projector.launch.stream, "shared expert");
-    routed(projector, weights, bufs, dims, None)?;
+    routed(projector, weights, bufs, dims)?;
     combine(projector, bufs, dims)?;
     super::split::mark(projector.launch.stream, "combine");
     Ok(())

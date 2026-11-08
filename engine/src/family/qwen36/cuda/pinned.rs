@@ -38,9 +38,11 @@ fn min_free_mib(value: Option<&std::ffi::OsStr>) -> Result<usize, EngError> {
                 "{MIN_FREE_MIB_VAR} must be {MIN_FREE_MIB_FLOOR} to {MIN_FREE_MIB_CAP} MiB"
             ))
         })?;
-    Ok(mib
-        .checked_mul(1 << 20)
-        .unwrap_or(MIN_FREE_AFTER_LOAD_DEFAULT))
+    Ok(mib.checked_mul(1 << 20).ok_or_else(|| {
+        EngError::BadRequest(format!(
+            "{MIN_FREE_MIB_VAR} must be {MIN_FREE_MIB_FLOOR} to {MIN_FREE_MIB_CAP} MiB"
+        ))
+    })?)
 }
 
 /// The free-after-load floor of the memory admission, the same bytes for the gate's qualified
@@ -58,6 +60,7 @@ pub(super) fn min_free_after_load() -> Result<usize, EngError> {
 }
 
 /// The default floor in bytes: 1 GiB. The settings constants test pins it.
+#[cfg(test)]
 pub(super) fn min_free_after_load_default() -> usize {
     MIN_FREE_AFTER_LOAD_DEFAULT
 }

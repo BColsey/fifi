@@ -300,9 +300,14 @@ impl DeviceBuffer {
 
     /// Enqueues `bytes` into the buffer at byte `offset` behind the work queued on
     /// `stream` and returns without waiting for the copy: the next work on the stream
-    /// sees it. The enqueue consumes the caller's bytes, so they may be reused or
-    /// dropped as soon as this returns. The expert-bank refills use this to keep a
-    /// miss's copies on the launch stream instead of a device-wide sync per copy.
+    /// sees it. The caller's bytes must stay valid and unchanged until `stream`
+    /// completes the copy: `cudaMemcpyAsync` on a **pageable** source is fully
+    /// consumed before this returns (reuse/drop is then fine), but a **pinned**
+    /// source is re-read by the DMA engine after return and may not be freed,
+    /// moved or written until the stream's next synchronization point. The
+    /// expert-bank refills rely on this: they enqueue the store's pinned record
+    /// slices, and the store is immutable and process-long-lived (leaked by the
+    /// server), while tests end on readbacks that drain the stream.
     ///
     /// Returns `BadRequest` for the conditions of [`Self::read_at`].
     pub(crate) fn write_at_enqueue(

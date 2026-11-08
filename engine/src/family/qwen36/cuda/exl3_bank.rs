@@ -11,7 +11,9 @@ use crate::{
         project::cuda::{Reserve, exl3::Exl3MemberStaging, exl3::exl3_member_layout},
         qwen36::settings::{BankMode, SlotRequest},
     },
-    kernels::cuda::{DeviceBuffer, DeviceStream, host_register, host_unregister},
+    kernels::cuda::{
+        DeviceBuffer, DeviceStream, device_synchronize, host_register, host_unregister,
+    },
 };
 
 /// The refusal helper of this module: every admission error names its numbers.
@@ -235,19 +237,25 @@ impl PartStore {
 
     /// Page-locks the record storage, best effort: a store that fails to pin stays
     /// pageable (the refills still work, only staged). The vector never moves after
-    /// the load, so the registered pointer stays the buffer's own.
-    pub(super) fn pin(&mut self) {
+    /// the load, so the registered pointer stays the buffer's own. Returns whether
+    /// the pin took.
+    pub(super) fn pin(&mut self) -> bool {
         if host_register(&self.records).is_ok() {
             self.pinned = true;
         }
+        self.pinned
     }
 }
 
 impl Drop for PartStore {
     fn drop(&mut self) {
         // The page lock must go before the Vec free; a failure leaves the lock to the
-        // process exit, which the CUDA runtime cleans up.
+        // process exit, which the CUDA runtime cleans up. Unregistering while a refill
+        // DMA still reads the range is undefined, so drain the device first; live drop
+        // paths reach this with the stream already drained, and the cost is irrelevant
+        // on a drop path.
         if self.pinned {
+            let _ = device_synchronize();
             let _ = host_unregister(&self.records);
         }
     }
@@ -278,13 +286,13 @@ impl ExpertStore {
         &self.layers[layer]
     }
 
-    /// Page-locks every member's storage (see [`PartStore::pin`]).
-    pub(crate) fn pin_all(&mut self) {
-        for parts in &mut self.layers {
-            for part in parts {
-                part.pin();
-            }
-        }
+    /// Page-locks every member's storage (see [`PartStore::pin`]); true when every
+    /// member pinned.
+    pub(crate) fn pin_all(&mut self) -> bool {
+        self.layers
+            .iter_mut()
+            .flat_map(|parts| parts.iter_mut())
+            .all(|part| part.pin())
     }
 
     /// The whole store's bytes, for the start line and the admission's echo.
@@ -523,6 +531,9 @@ impl LayerResolver<'_, '_> {
                 // Enqueued on the launch stream: the copy races the launches queued
                 // after it instead of a device-wide sync per miss, and the next
                 // layer's readback (already a stream wait) covers its completion.
+                // The store is pinned, so the record must stay untouched until the
+                // stream drains; the store is immutable post-load and
+                // process-long-lived, which is that invariant.
                 target
                     .bank
                     .write_at_enqueue(stream, slot * target.record, record)?;

@@ -91,7 +91,11 @@ pub(super) fn load_exl3_banked_dir(
     let mut store = ExpertStore::with_layers(layers);
     let weights = model_weights_admitted(&reader, &facts, Some((slots, &mut store)))?;
     // The store never changes again: page-lock it so the bank refills DMA without staging.
-    store.pin_all();
+    // A failed pin is best-effort: refills then copy through pageable staging, and the
+    // operator sees it here rather than inferring it from refill timings.
+    if !store.pin_all() {
+        eprintln!("q36 cuda: EXL3 host store pin failed; bank refills will stage pageable copies");
+    }
     Ok(BankedModel {
         weights: CudaWeights::from_exl3(weights)?,
         store,

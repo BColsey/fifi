@@ -502,7 +502,9 @@ pub(in crate::kernels::cuda) fn copy_h2d_pageable(
 
 /// Enqueues a pageable-host slice into a device range behind earlier work on `stream` and
 /// returns without waiting for the copy. A pageable `cudaMemcpyAsync` consumes the source
-/// before it returns, so the caller's bytes may be reused as soon as this does.
+/// before it returns, so the caller's bytes may be reused as soon as this does; this is
+/// why it takes `&[u8]` and not the pinned [`RawPinned`] handle. Pinned sources must use
+/// [`copy_h2d_async_at`], whose contract covers the post-return DMA window.
 pub(in crate::kernels::cuda) fn copy_h2d_enqueue(
     dst: RawRange<'_>,
     host: &[u8],
@@ -512,9 +514,9 @@ pub(in crate::kernels::cuda) fn copy_h2d_enqueue(
         return Err(invalid_argument());
     }
     let mut stage = STAGE_NONE;
-    // SAFETY: `RawRange::new` proved the range inside a live allocation, and the pageable
-    // source is fully consumed before the call returns, so the slice need not outlive it.
-    // `stream` is live for the call.
+    // SAFETY: `RawRange::new` proved the range inside a live allocation. A pageable
+    // source is fully consumed before the call returns, so the slice need not outlive
+    // it; a pinned one would (see `copy_h2d_async_at`). `stream` is live for the call.
     let status = unsafe {
         copy_h2d_async_raw(
             dst.address(),

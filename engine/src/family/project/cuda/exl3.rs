@@ -31,7 +31,6 @@ pub(crate) struct Exl3Weight {
 /// trellis and scales live in one record of `trellis + scale` bytes at a fixed stride, so a
 /// slot fill or miss copy is a single contiguous write.
 pub(crate) struct Exl3Bank {
-    // Reverse upload order also applies when the bank is dropped.
     records: DeviceBuffer,
     count: usize,
     shape: [usize; 2],
@@ -576,6 +575,13 @@ impl CudaProjector {
             records.extend_from_slice(&staged.scales);
         }
         let records = self.context.upload(&records)?;
+        // The member views divide the record by u16/f32 element sizes and the register
+        // kernel fast path wants 16B alignment; the layout guarantees both.
+        debug_assert_eq!(exl3_member_layout(shape, bits_twice).0 % 16, 0);
+        debug_assert_eq!(
+            (exl3_member_layout(shape, bits_twice).0 + exl3_member_layout(shape, bits_twice).1) % 4,
+            0
+        );
         Ok(Exl3Bank {
             records,
             count,

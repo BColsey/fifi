@@ -177,7 +177,12 @@ pub(crate) struct Q36Options {
     pub(crate) tiered: Option<TieredOptions>,
     /// The banked EXL3 expert mode of the CUDA arm: `slots` experts per layer stay on the device
     /// and every expert's packed bytes stay in a pageable host store for miss copies. Absent means
-    /// off. An EXL3-only CUDA member.
+    /// off. An EXL3-only CUDA member. Measured on a 6 GB laptop GPU over PCIe Gen4 (2.08bpw):
+    /// 40.5-43.8 tok/s served decode. The ngram-drafted `draft_verify: krow` over the bank measured
+    /// net-negative in the same state (31.9/21.7 tok/s vs the 41.7/39.0 baseline, and 10.8/8.1 on
+    /// a Gen1 link) because every extra drafted expert read misses the bank and pays the PCIe
+    /// refill; revisit only with a real draft head, which reads resident experts it already
+    /// picked.
     pub(crate) expert_bank: Option<ExpertBankOptions>,
     /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
     /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.

@@ -499,6 +499,8 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     };
     let after = projector.memory_info()?;
     let identities = identities_of(s, after.total, before.free, after.free);
+    // A malformed Q36_CUDA_MIN_FREE_MIB surfaces here as an engine error, not a refused
+    // gate: it is a config mistake, not a capability verdict.
     if after.free < min_free_after_load()? {
         let mut doc = gate_doc(mode, identities, Vec::new());
         doc["refused"] = json!({ "kind": "memory", "free_after_load": after.free });
