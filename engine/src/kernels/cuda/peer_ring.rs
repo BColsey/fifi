@@ -161,6 +161,11 @@ impl PeerRing {
         self.layout.cards
     }
 
+    #[cfg(test)]
+    pub(crate) fn next_sequence_for_test(&self) -> u32 {
+        self.next_seq.get()
+    }
+
     /// Re-zeroes every mailbox and restarts the sequence. The caller queues
     /// this on `streams` it knows are ordered after earlier exchanges.
     pub(crate) fn reset(

@@ -32,6 +32,8 @@
     )
 )]
 
+use std::cell::Cell;
+
 use crate::EngError;
 use crate::family::qwen36::cuda::dims::{StepDims, StepOptions};
 use crate::family::qwen36::cuda::shard::ShardTable;
@@ -107,20 +109,43 @@ pub(crate) struct CardStack {
     /// A broadcast has only one publisher, so its following broadcast cannot
     /// acknowledge that every peer has consumed a double-buffered slot.
     sync_broadcasts: bool,
+    /// Experimental: reduce all contiguous routed-expert rows at once.
+    fused_expert_sum: Cell<bool>,
+}
+
+pub(super) fn expert_sum_count(hidden: usize, top_k: usize) -> Result<usize, EngError> {
+    if hidden == 0 || top_k == 0 {
+        return Err(EngError::BadRequest(
+            "card stack: fused expert sum needs nonzero hidden width and picks".into(),
+        ));
+    }
+    hidden
+        .checked_mul(top_k)
+        .ok_or_else(|| EngError::BadRequest("card stack: fused expert sum size overflows".into()))
 }
 
 impl CardStack {
     /// Builds the stack for `devices.len()` cards. Card `i` runs on
     /// `devices[i]` (one ordinal per physical card; the same ordinal twice
     /// gives two logical contexts, the rig configuration). The mailbox
-    /// covers `dims.shape.hidden` values: every exchange payload of the
-    /// plan - embed broadcast, mixer sum, MoE sum - is at most the hidden
-    /// row; route picks and gathered K/V rows are narrower.
+    /// normally covers one hidden row. The experimental fused expert-sum
+    /// path allocates enough mailbox space for all pick rows together.
     pub(crate) fn new(
         dims: &StepDims,
         options: &StepOptions,
         devices: &[usize],
         admission: &Admission,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let fused = std::env::var_os("Q36_P2P_FUSE_EXPERT_SUM").is_some_and(|value| value == "1");
+        Self::new_with_fused_expert_sum(dims, options, devices, admission, fused)
+    }
+
+    fn new_with_fused_expert_sum(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        fused: bool,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
@@ -138,7 +163,12 @@ impl CardStack {
         }
         // The ring first: it captures each mailbox's base address from the
         // bare contexts before anything else borrows them.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden)?;
+        let mailbox_values = if fused {
+            expert_sum_count(dims.shape.hidden, dims.shape.moe.top_k)?
+        } else {
+            dims.shape.hidden
+        };
+        let ring = PeerRing::new(&contexts, mailbox_values)?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
@@ -164,6 +194,7 @@ impl CardStack {
                 streams,
                 contexts,
                 sync_broadcasts,
+                fused_expert_sum: Cell::new(fused),
             },
             states,
         ))
@@ -213,6 +244,28 @@ impl CardStack {
 
     pub(crate) fn streams(&self) -> &[DeviceStream] {
         &self.streams
+    }
+
+    pub(super) fn fused_expert_sum(&self) -> bool {
+        self.fused_expert_sum.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_fused_expert_sum_test(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let (stack, states) =
+            Self::new_with_fused_expert_sum(dims, options, devices, admission, true)?;
+        stack.fused_expert_sum.set(false);
+        Ok((stack, states))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fused_expert_sum_for_test(&self, enabled: bool) {
+        self.fused_expert_sum.set(enabled);
     }
 
     #[cfg(test)]
@@ -304,6 +357,16 @@ mod device_tests {
     use crate::family::qwen36::cuda::common_tests::dims;
     use crate::family::qwen36::cuda::dims::KvMode;
     use crate::kernels::cuda::device_present;
+
+    #[test]
+    fn fused_expert_sum_count_checks_empty_and_overflow() {
+        assert_eq!(expert_sum_count(2048, 8).unwrap(), 16384);
+        assert!(expert_sum_count(0, 8).is_err());
+        assert!(expert_sum_count(2048, 0).is_err());
+        assert!(expert_sum_count(usize::MAX, 2).is_err());
+        assert!(crate::kernels::cuda::peer_ring::MailboxLayout::new(2, 1 << 20).is_ok());
+        assert!(crate::kernels::cuda::peer_ring::MailboxLayout::new(2, (1 << 20) + 1).is_err());
+    }
 
     fn options() -> StepOptions {
         StepOptions {
