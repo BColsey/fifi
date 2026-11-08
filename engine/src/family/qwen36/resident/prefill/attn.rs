@@ -1227,7 +1227,15 @@ mod tests {
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             cache = next.cache;
-            stepped.extend(values(&mut kernels, &next.out).unwrap());
+            // The decode seam folds the output residual; the chunk keeps the mixer output, so
+            // remove the residual row before comparing the two paths.
+            stepped.extend(
+                values(&mut kernels, &next.out)
+                    .unwrap()
+                    .iter()
+                    .zip(&input(n))
+                    .map(|(v, r)| v - r),
+            );
         }
         assert_eq!(cache.len, 8);
         // The F32 chunk after three F32 decode steps.
