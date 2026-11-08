@@ -220,7 +220,7 @@ fn the_banked_krow_window_commits_the_one_row_tokens_and_state() {
         .map(|layer| Exl3MoeWeights::resolve_banked(&weights, &table, layer, &moe, slots))
         .collect::<Result<Vec<_>, _>>()
         .expect("bank views");
-    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts).expect("resolver"));
+    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, 0).expect("resolver"));
     let mut step = QwenResidentStep::new_banked(
         context,
         resources,

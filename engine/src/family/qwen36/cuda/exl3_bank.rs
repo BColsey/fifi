@@ -313,26 +313,67 @@ impl ExpertStore {
 struct LayerSlots {
     experts: usize,
     slots: usize,
+    /// How many of the layer's hottest experts (by decayed use count) stay pinned: a miss
+    /// evicts a non-hot slot first, so repeatedly routed experts stop refilling. Zero is
+    /// plain LRU. Clamped to `slots - 1`; ties at the threshold can still mark more experts
+    /// hot than that, and the victim's fallback — not the clamp — guarantees progress.
+    sticky: usize,
     /// Expert -> slot, [`EMPTY`] when absent.
     slot_of: Vec<u16>,
     /// Slot -> expert, [`EMPTY`] when the slot never filled.
     expert_of: Vec<u16>,
     last_used: Vec<u64>,
+    /// Decayed use count per expert; the sticky set is its top-`sticky`. Halved every
+    /// [`DECAY_CALLS`] calls so the set tracks a drifting workload.
+    counts: Vec<u32>,
+    /// Cached top-`sticky` membership, recomputed at each decay.
+    hot: Vec<bool>,
     tick: u64,
 }
+
+/// Calls between use-count halvings. 64 calls ≈ 8 tokens of one layer's routing at top-8:
+/// the replay study on a captured trace (384-token greedy decode) put the adaptive
+/// policy's best miss reduction (9.5% fewer than LRU at k=48) at this interval; longer
+/// intervals only lag a drifting workload, shorter ones thrash the hot set.
+const DECAY_CALLS: u64 = 64;
 
 /// The absent marker of both directions of the slot table.
 const EMPTY: u16 = u16::MAX;
 
 impl LayerSlots {
-    fn new(experts: usize, slots: usize) -> Self {
+    fn new(experts: usize, slots: usize, sticky: usize) -> Self {
+        let sticky = sticky.min(slots.saturating_sub(1));
+        // The decay reads `sorted[self.sticky - 1]`; `decide()` keeps slots <= experts,
+        // pinned here so a future caller change cannot move the panic boundary.
+        debug_assert!(sticky <= experts);
         Self {
             experts,
             slots,
+            sticky,
             slot_of: vec![EMPTY; experts],
             expert_of: vec![EMPTY; slots],
             last_used: vec![0; slots],
+            counts: vec![0; experts],
+            hot: vec![false; experts],
             tick: 0,
+        }
+    }
+
+    /// Halves every use count and rebuilds the hot set from the survivors: the `sticky`
+    /// largest counts, ties included. Called on the decay boundary only; with no sticky
+    /// set the counts are dead weight and the halving is skipped.
+    fn decay(&mut self) {
+        if self.sticky == 0 {
+            return;
+        }
+        for count in &mut self.counts {
+            *count >>= 1;
+        }
+        let mut sorted = self.counts.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let threshold = sorted[self.sticky - 1];
+        for (expert, &count) in self.counts.iter().enumerate() {
+            self.hot[expert] = count >= threshold && count > 0;
         }
     }
 
@@ -342,6 +383,10 @@ impl LayerSlots {
     /// Returns the slots in pick order and, for each miss, the slot whose device bytes the
     /// caller must refill from the store.
     fn assign(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
+        self.tick += 1;
+        if self.tick % DECAY_CALLS == 0 {
+            self.decay();
+        }
         let mut slots = Vec::with_capacity(picks.len());
         let mut misses = Vec::new();
         for &expert in picks {
@@ -350,6 +395,9 @@ impl LayerSlots {
                     "EXL3 expert bank: pick {expert} exceeds the {} experts of the layer",
                     self.experts
                 )));
+            }
+            if self.sticky > 0 {
+                self.counts[expert] = self.counts[expert].saturating_add(1);
             }
             let slot = match usize::from(self.slot_of[expert]) {
                 s if s < self.slots => s,
@@ -371,7 +419,6 @@ impl LayerSlots {
             }
             slots.push(slot);
         }
-        self.tick += 1;
         for &slot in &slots {
             self.last_used[slot] = self.tick;
         }
@@ -379,22 +426,27 @@ impl LayerSlots {
     }
 
     /// The next slot for a miss: an empty one, else the least-recently-used slot no pick of
-    /// this call took.
+    /// this call took. A slot holding a hot (sticky) expert is skipped unless every
+    /// untouched slot is hot — pinning yields to progress, never to a refusal.
     fn victim(&self, taken: &[usize]) -> Result<usize, EngError> {
         if let Some(slot) = (0..self.slots).find(|&slot| self.expert_of[slot] == EMPTY) {
             return Ok(slot);
         }
-        (0..self.slots)
-            .filter(|slot| !taken.contains(slot))
-            .min_by_key(|&slot| self.last_used[slot])
-            .ok_or_else(|| {
-                EngError::BadRequest(format!(
-                    "EXL3 expert bank: {} slots cannot hold the {} picks of one call \
+        let all = |hot: bool| {
+            (0..self.slots)
+                .filter(|&slot| {
+                    !taken.contains(&slot) && self.hot[usize::from(self.expert_of[slot])] == hot
+                })
+                .min_by_key(|&slot| self.last_used[slot])
+        };
+        all(false).or_else(|| all(true)).ok_or_else(|| {
+            EngError::BadRequest(format!(
+                "EXL3 expert bank: {} slots cannot hold the {} picks of one call \
                      (a decode token, or a prefill sub-block's rows together)",
-                    self.slots,
-                    taken.len() + 1
-                ))
-            })
+                self.slots,
+                taken.len() + 1
+            ))
+        })
     }
 
     /// The expert a slot holds (for the store read of a miss copy).
@@ -437,6 +489,7 @@ impl<'w> Exl3SlotResolver<'w> {
         store: ExpertStore,
         blocks: &[super::exl3_moe::Exl3MoeWeights<'w>],
         experts: usize,
+        sticky: usize,
     ) -> Result<Self, EngError> {
         if store.layers() != blocks.len() {
             return Err(EngError::MemoryPlan(format!(
@@ -461,7 +514,7 @@ impl<'w> Exl3SlotResolver<'w> {
                     }
                 }
                 Ok((
-                    LayerSlots::new(experts, slots),
+                    LayerSlots::new(experts, slots, sticky),
                     [
                         target_of(block.gate),
                         target_of(block.up),
@@ -542,8 +595,64 @@ impl LayerResolver<'_, '_> {
         self.resolver.hits += (picks.len() - miss_count) as u64;
         self.resolver.misses += miss_count as u64;
         #[cfg(test)]
+        if trace::armed() {
+            trace::record(self.layer, picks);
+        }
+        #[cfg(test)]
         probe::resolve(began.elapsed());
         Ok(slots)
+    }
+}
+
+/// Test-only pick-trace capture: the admission-policy study replays real routing through
+/// offline slot policies. `arm()` starts capture, `dump` writes it.
+#[cfg(test)]
+pub(crate) mod trace {
+    use std::{
+        cell::RefCell,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static CALLS: RefCell<Vec<(usize, Vec<u32>)>> = RefCell::new(Vec::new());
+    }
+
+    pub(crate) fn arm() {
+        ARMED.store(true, Ordering::Relaxed);
+        CALLS.with(|c| c.borrow_mut().clear());
+    }
+
+    pub(crate) fn armed() -> bool {
+        ARMED.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record(layer: usize, picks: &[usize]) {
+        CALLS.with(|c| {
+            c.borrow_mut()
+                .push((layer, picks.iter().map(|&e| e as u32).collect()));
+        });
+    }
+
+    /// One line per resolve call: `layer pick pick ...`.
+    pub(crate) fn dump(path: &std::path::Path) -> std::io::Result<usize> {
+        use std::io::Write;
+        let mut lines = 0;
+        CALLS.with(|c| {
+            let calls = c.borrow();
+            let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+            for (layer, picks) in calls.iter() {
+                write!(out, "{layer}")?;
+                for &e in picks {
+                    write!(out, " {e}")?;
+                }
+                writeln!(out)?;
+                lines += 1;
+            }
+            out.flush()
+        })?;
+        ARMED.store(false, Ordering::Relaxed);
+        Ok(lines)
     }
 }
 
@@ -760,7 +869,7 @@ mod tests {
     /// with the same slots and no misses.
     #[test]
     fn slot_table_fills_in_order_then_hits() {
-        let mut table = LayerSlots::new(64, 8);
+        let mut table = LayerSlots::new(64, 8, 0);
         let picks = [3usize, 41, 7, 19];
         let (slots, misses) = table.assign(&picks).unwrap();
         assert_eq!(slots, [0, 1, 2, 3]);
@@ -774,7 +883,7 @@ mod tests {
     /// again makes expert 41's slot the victim, not 3's.
     #[test]
     fn slot_table_evicts_least_recently_used() {
-        let mut table = LayerSlots::new(64, 8);
+        let mut table = LayerSlots::new(64, 8, 0);
         table.assign(&[3, 41, 5, 6, 7, 8, 9, 10]).unwrap();
         table.assign(&[3]).unwrap(); // touch 3; 41 is now the least-recently-used
         let (slots, misses) = table.assign(&[50]).unwrap();
@@ -789,11 +898,59 @@ mod tests {
         );
     }
 
+    /// Sticky pinning: after a hot set emerges (enough calls to cross the decay boundary),
+    /// a cold sweep cannot evict it, while plain LRU loses the same experts and re-misses.
+    #[test]
+    fn slot_table_sticky_keeps_the_hot_set_through_a_cold_sweep() {
+        fn sweep_misses(sticky: usize) -> usize {
+            let mut table = LayerSlots::new(64, 8, sticky);
+            // The hot set: experts 0-3, routed twice per call, long enough that the
+            // repeated halvings reach the count steady state and promote them past any
+            // cold count.
+            for _ in 0..600 {
+                table.assign(&[0, 1, 2, 3]).unwrap();
+                table.assign(&[0, 1, 2, 3]).unwrap();
+            }
+            // The cold sweep: distinct experts the hot calls never touch.
+            let mut misses = 0;
+            for cold in 20..44 {
+                misses += table.assign(&[cold]).unwrap().1.len();
+            }
+            // The hot set returns: sticky keeps it resident.
+            misses += table.assign(&[0, 1, 2, 3]).unwrap().1.len();
+            misses
+        }
+        let lru = sweep_misses(0);
+        let sticky = sweep_misses(4);
+        assert_eq!(lru, 24 + 4, "plain LRU re-misses the whole hot set");
+        assert_eq!(sticky, 24, "the sweep misses, the hot set does not");
+    }
+
+    /// Pinning yields to progress: when ties at the decay threshold mark every resident
+    /// expert hot (sticky=1, eight equally-counted residents), a new pick still resolves —
+    /// the victim falls back to plain LRU instead of refusing.
+    #[test]
+    fn slot_table_sticky_falls_back_to_lru_when_every_slot_is_hot() {
+        let mut table = LayerSlots::new(64, 8, 1);
+        // Eight equal-count residents: the tie marks them all hot at the first decay.
+        for _ in 0..128 {
+            table.assign(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        }
+        assert!(
+            table.hot[..8].iter().all(|&hot| hot),
+            "the tie marks all hot"
+        );
+        // A cold pick must still seat: the fallback evicts a hot slot rather than refusing.
+        let (slots, misses) = table.assign(&[40]).unwrap();
+        assert_eq!(misses.len(), 1);
+        assert_eq!(slots.len(), 1);
+    }
+
     /// A token whose picks are all new may replace every resident: the victims hold old
     /// experts, which no new pick uses. A token with more picks than slots is refused.
     #[test]
     fn slot_table_replaces_everything_then_refuses_overload() {
-        let mut table = LayerSlots::new(64, 4);
+        let mut table = LayerSlots::new(64, 4, 0);
         table.assign(&[0, 1, 2, 3]).unwrap();
         let (slots, misses) = table.assign(&[10, 11, 12, 13]).unwrap();
         assert_eq!(misses.len(), 4);
@@ -806,7 +963,7 @@ mod tests {
     /// A pick outside the layer's experts is refused by name.
     #[test]
     fn slot_table_refuses_out_of_range_picks() {
-        let mut table = LayerSlots::new(64, 8);
+        let mut table = LayerSlots::new(64, 8, 0);
         let error = format!("{:?}", table.assign(&[64]).unwrap_err());
         assert!(error.contains("pick 64"), "{error}");
     }

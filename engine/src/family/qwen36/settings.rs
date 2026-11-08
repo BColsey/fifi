@@ -586,6 +586,9 @@ pub(crate) struct TieredOptions {
 pub(crate) struct ExpertBankOptions {
     pub(crate) slots: Option<u32>,
     pub(crate) mode: Option<String>,
+    /// How many of the layer's hottest experts stay pinned in their slots instead of
+    /// competing under LRU; 0 (the default) is plain LRU.
+    pub(crate) sticky: Option<u32>,
 }
 
 /// How many bank slots per layer the banked load holds: an exact operator count, or `Fit` for
@@ -609,6 +612,7 @@ pub(crate) enum BankMode {
 pub(crate) struct ExpertBankSettings {
     pub(crate) slots: SlotRequest,
     pub(crate) mode: BankMode,
+    pub(crate) sticky: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1115,7 +1119,13 @@ fn expert_bank_settings(
             )));
         }
     };
-    Ok(Some(ExpertBankSettings { slots, mode }))
+    let sticky = usize::try_from(ranged("expert_bank.sticky", bank.sticky, 0, 0, 256)?)
+        .map_err(|_| bad("expert_bank.sticky exceeds usize".into()))?;
+    Ok(Some(ExpertBankSettings {
+        slots,
+        mode,
+        sticky,
+    }))
 }
 
 fn tiered_settings(
@@ -1572,6 +1582,10 @@ mod tests {
                 r#"{"weight_format":"exl3","expert_bank":{"mode":"bogus"}}"#,
                 "expert_bank.mode",
             ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"sticky":257}}"#,
+                "expert_bank.sticky",
+            ),
             (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
         ] {
             let text = message(cuda_offload(body));
@@ -1601,14 +1615,18 @@ mod tests {
         ));
         let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
         assert_eq!(
-            fit.expert_bank.map(|bank| (bank.slots, bank.mode)),
-            Some((SlotRequest::Fit, BankMode::Auto))
+            fit.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Fit, BankMode::Auto, 0))
         );
-        let on = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on"}}"#)
-            .unwrap();
+        let on = cuda_offload(
+            r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on","sticky":64}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            on.expert_bank.map(|bank| (bank.slots, bank.mode)),
-            Some((SlotRequest::Exactly(8), BankMode::On))
+            on.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Exactly(8), BankMode::On, 64))
         );
         let top = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":256}}"#).unwrap();
         assert_eq!(

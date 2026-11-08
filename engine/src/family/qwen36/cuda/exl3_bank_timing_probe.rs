@@ -1,6 +1,9 @@
 //! A banked decode timing probe over the real pack.
 //!
-//! `FIFI_EXL3_CHECKPOINT` names the pack directory. The test loads the banked model (the
+//! `FIFI_EXL3_CHECKPOINT` names the pack directory; `FIFI_EXL3_SLOTS`, `FIFI_EXL3_STICKY`
+//! and `FIFI_EXL3_TOKENS` override the slot count (69), the sticky pin count (0) and the
+//! decode length (96) for policy measurement, and `FIFI_EXL3_TRACE` dumps every decode
+//! resolve's picks for the offline admission-policy study. The test loads the banked model (the
 //! admission-floor slot count, every expert in the host store), decodes a fixed prompt plus
 //! `TOKENS` greedy tokens, and reports the wall time per token beside the shares the test-only
 //! probe accumulates: the readback drains (the blocking device-to-host waits of the pick
@@ -24,6 +27,12 @@ use super::{
 };
 use crate::family::project::cuda::{CudaProjector, Reserve};
 
+/// The trace path: when set, every decode-phase resolve's picks are dumped (one
+/// `layer pick ...` line per call) for the offline admission-policy study.
+fn trace_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("FIFI_EXL3_TRACE").map(std::path::PathBuf::from)
+}
+
 /// Tokens decoded after the prompt: enough for the banks to reach their steady state.
 const TOKENS: usize = 96;
 
@@ -46,7 +55,13 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         .expect("the banked pack");
     let context = projector.context();
     let mut step_options = options();
-    step_options.context_tokens = PROMPT.len() + TOKENS + 1;
+    let tokens: usize = std::env::var("FIFI_EXL3_TOKENS")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("FIFI_EXL3_TOKENS is not a number: {v:?}"))
+        })
+        .unwrap_or(TOKENS);
+    step_options.context_tokens = PROMPT.len() + tokens + 1;
     let rules = QwenRules::new(EOS.to_vec(), SAMPLER_VOCAB, HEAD_ROWS).expect("rules");
     let resources =
         StepResources::new(context, dims(), &inventory(), &step_options).expect("resources");
@@ -64,7 +79,14 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         .map(|layer| Exl3MoeWeights::resolve_banked(&weights, &table, layer, &moe, slots))
         .collect::<Result<Vec<_>, _>>()
         .expect("banked blocks");
-    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts).expect("resolver"));
+    let sticky: usize = std::env::var("FIFI_EXL3_STICKY")
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("FIFI_EXL3_STICKY is not a number: {v:?}"))
+        })
+        .unwrap_or(0);
+    let bank =
+        RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, sticky).expect("resolver"));
     let mut step = QwenResidentStep::new_banked(
         context,
         &resources,
@@ -102,7 +124,10 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         ms_prompt(prompt_resolve_ns, prompt_resolves),
     );
     let began = Instant::now();
-    for _ in 0..TOKENS {
+    if trace_path().is_some() {
+        crate::family::qwen36::cuda::exl3_bank::trace::arm();
+    }
+    for _ in 0..tokens {
         id = step.run_token(id, true).expect("decoded token");
     }
     let decode_wall = began.elapsed();
@@ -110,13 +135,21 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         crate::family::qwen36::cuda::exl3_bank::probe::take();
     let (hits, misses) = bank.borrow().stats();
     println!(
-        "banked decode probe: decode {TOKENS} tokens {:.1} ms/token total, drains {:.1} \
+        "banked decode probe: decode {tokens} tokens {:.1} ms/token total, drains {:.1} \
          ms/token across {} calls, resolves {:.1} ms/token; hits {hits} misses {misses}; \
          last id {id}",
-        decode_wall.as_secs_f64() * 1e3 / TOKENS as f64,
-        readback_ns as f64 / 1e6 / TOKENS as f64,
+        decode_wall.as_secs_f64() * 1e3 / tokens as f64,
+        readback_ns as f64 / 1e6 / tokens as f64,
         readback_calls,
-        resolve_ns as f64 / 1e6 / TOKENS as f64,
+        resolve_ns as f64 / 1e6 / tokens as f64,
     );
+    if let Some(path) = &trace_path() {
+        let lines =
+            crate::family::qwen36::cuda::exl3_bank::trace::dump(path).expect("the trace dump");
+        println!(
+            "banked decode probe: trace {lines} resolve calls to {}",
+            path.display()
+        );
+    }
     assert!((id as usize) < SAMPLER_VOCAB, "the decode produced a token");
 }

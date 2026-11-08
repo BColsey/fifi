@@ -1003,12 +1003,14 @@ fn make(
             )? {
                 DecidedLoad::Resident(device) => device,
                 DecidedLoad::Banked(banked) => {
+                    let sticky = settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky);
                     eprintln!(
-                        "q36 cuda: EXL3 expert bank: {} of {} experts per layer resident \
-                         (device {:.2} GiB incl. dense {:.2} GiB), host store {:.2} GiB, loaded \
-                         from {} in {:.1} s",
+                        "q36 cuda: EXL3 expert bank: {} of {} experts per layer resident, \
+                         sticky {} (device {:.2} GiB incl. dense {:.2} GiB), host store {:.2} GiB, \
+                         loaded from {} in {:.1} s",
                         banked.slots,
                         banked.experts,
+                        sticky.min(banked.slots.saturating_sub(1)),
                         banked.weights.device_bytes() as f64 / (1 << 30) as f64,
                         banked.dense_bytes as f64 / (1 << 30) as f64,
                         banked.store.host_bytes() as f64 / (1 << 30) as f64,
@@ -1115,7 +1117,12 @@ fn make(
                     Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let resolver = Exl3SlotResolver::new(store, &blocks, experts)?;
+            let resolver = Exl3SlotResolver::new(
+                store,
+                &blocks,
+                experts,
+                settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky),
+            )?;
             Some(Box::leak(Box::new(std::cell::RefCell::new(resolver))))
         }
         None => None,

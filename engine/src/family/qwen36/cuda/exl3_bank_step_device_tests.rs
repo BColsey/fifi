@@ -109,7 +109,7 @@ fn banked_leg(projector: &CudaProjector, model: BankedModel) -> Result<Decoded, 
     let blocks = (0..table.len())
         .map(|layer| Exl3MoeWeights::resolve_banked(&weights, &table, layer, &moe, slots))
         .collect::<Result<Vec<_>, _>>()?;
-    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts)?);
+    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, 0)?);
     let mut step = QwenResidentStep::new_banked(
         context,
         &resources,

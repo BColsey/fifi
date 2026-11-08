@@ -503,7 +503,7 @@ fn banked_sub_blocked_chunk_is_byte_identical_to_the_resident_chunk() {
             .map(|r0| (r0, MoeDims::new(&d, (rows - r0).min(sub_rows))))
             .collect();
         let mut resolver =
-            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert)
+            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert, 0)
                 .unwrap();
         let got = {
             let mut bank = resolver.layer(0);

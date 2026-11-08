@@ -349,7 +349,7 @@ fn banked_moe_block_is_byte_identical_to_the_resident_block() {
         let banked_block =
             Exl3MoeWeights::resolve_banked(&banked_weights, &table, layer, &moe, SLOTS).unwrap();
         let mut resolver =
-            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert)
+            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert, 0)
                 .unwrap();
         let mut saw_miss = false;
         for round in 0..6 {
