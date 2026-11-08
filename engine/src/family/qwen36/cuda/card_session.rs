@@ -275,6 +275,26 @@ impl CardSession {
         self.skip_prefill_head = enabled;
     }
 
+    /// Card 0's embedding table: the reference ChunkWeights carries.
+    #[cfg(test)]
+    pub(super) fn embed_for_test(&self) -> &'static crate::kernels::cuda::NativeWeight {
+        self.embed
+    }
+
+    /// The chunk-driver seam: this card's mixer views and its per-layer
+    /// MoE views, transposed to the [card][layer] order ChunkWeights takes.
+    #[cfg(test)]
+    pub(super) fn chunk_views_for_test(
+        &self,
+        card: usize,
+    ) -> (
+        &super::mixer_weights::MixerWeights<'static>,
+        Vec<super::moe::MoeLayerWeights<'static>>,
+    ) {
+        let moe = self.moe.iter().map(|set| set[card]).collect::<Vec<_>>();
+        (self.mixers[card].weights(), moe)
+    }
+
     /// The prefix rig's comparison vehicle: one export per card of the
     /// committed state (sliced KV planes plus DeltaNet slots).
     #[cfg(test)]
