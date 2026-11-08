@@ -1080,6 +1080,13 @@ impl MlxKernels {
             (Some(a), Some(b)) => Some(self.concatenate_weights(&[a, b], axis)?),
             _ => None,
         };
+        // Materialize the joined parts now: an unevaluated concat keeps both source stacks alive
+        // in the lazy graph forever, which held ~11 GB of dead expert weight in serving.
+        let mut joined = vec![&payload, &scales];
+        if let Some(bias) = biases.as_ref() {
+            joined.push(bias);
+        }
+        self.evaluate(&joined)?;
         Ok(ResidentPackedWeight {
             payload,
             scales,
