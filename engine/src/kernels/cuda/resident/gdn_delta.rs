@@ -1,8 +1,8 @@
 //! Safe launch wrapper of the gated DeltaNet recurrence step.
 //!
-//! The kernel (`gated_delta_k`) is vendored xavier-qwen code; this file and the launch shim of
-//! `native/resident/gdn_delta.cu` add no kernel. The ggml comparison of `gated_delta_k` found
-//! no shape match.
+//! The default kernel (`gated_delta_k`) is vendored xavier-qwen code. The native shim also
+//! exposes a state-partition experiment selected only in test binaries. The ggml comparison
+//! of `gated_delta_k` found no shape match.
 //!
 //! [`CudaContext::gdn_delta`] queues one kernel on a [`DeviceStream`] and returns. Per value head
 //! it L2-normalizes q and k (`x * rsqrt(sum(x^2) + eps)`, q also times `1/sqrt(128)`), forms the

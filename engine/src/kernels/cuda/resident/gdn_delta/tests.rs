@@ -640,6 +640,8 @@ fn delta_matches_the_f64_reference_short() {
         (16, 32, 4),
         (16, 32, 16),
         (16, 32, 69),
+        (16, 48, 1),
+        (16, 48, 7),
         (2, 4, 3),
         (1, 1, 2),
         (1, 8, 2),
@@ -745,6 +747,74 @@ fn delta_matches_the_f64_reference_1152() {
     }
     let group = long_rollout(&Rig::new(), 1152, "T1c (16,32,1152) reported only");
     println!("T1c reported only: maximum {}", group.late.show());
+}
+
+#[test]
+fn delta_16x48_matches_the_f64_reference_1152() {
+    if !testkit::device_present("delta_16x48_matches_the_f64_reference_1152") {
+        return;
+    }
+    let rig = Rig::new();
+    for zero_start in [false, true] {
+        let mut inp = generate(16, 48, 1152, Layout::odd(16, 48), 0x7148, false);
+        if zero_start {
+            inp.state0.fill(0.0);
+        }
+        judge(
+            &format!("16x48 1152 steps zero_start={zero_start}"),
+            &inp,
+            &launch_all(&rig, &inp, &[1152]),
+            &[0, 15, 16, 31, 32, 47],
+        );
+    }
+}
+
+#[test]
+fn delta_16x48_snapshots_match_single_rows() {
+    if !testkit::device_present("delta_16x48_snapshots_match_single_rows") {
+        return;
+    }
+    let rig = Rig::new();
+    let inp = generate(16, 48, 4, Layout::odd(16, 48), 0x7149, false);
+    let need = exact_bytes(inp.shape(inp.m));
+    let stride = need.state + 64;
+    let total = (inp.m - 2) * stride + need.state;
+    let snap = Padded::new(&rig.ctx, &vec![0xA5; total], 4);
+    let bufs = Bufs::separate(&rig.ctx, &inp, 0);
+    rig.ctx
+        .gdn_delta_snap(
+            &rig.stream,
+            bufs.call(inp.shape(inp.m), 0),
+            super::SnapRows {
+                range: snap.at(0, total),
+                stride,
+            },
+        )
+        .expect("strided snapshots");
+    rig.stream.synchronize().expect("drain snapshots");
+    let got = bufs.finish(&rig);
+    let plain = launch_all(&rig, &inp, &[1; 4]);
+    assert_eq!(le_bytes(&got.out), le_bytes(&plain.out));
+    assert_eq!(le_bytes(&got.state), le_bytes(&plain.state));
+    let bytes = snap.verify(&rig.ctx, false, "snap");
+    for t in 0..inp.m - 1 {
+        let prefix = Inputs {
+            m: t + 1,
+            ..inp.clone()
+        };
+        let state = launch_all(&rig, &prefix, &[t + 1]).state;
+        assert_eq!(
+            &bytes[t * stride..t * stride + need.state],
+            le_bytes(&state)
+        );
+        if t < inp.m - 2 {
+            assert!(
+                bytes[t * stride + need.state..(t + 1) * stride]
+                    .iter()
+                    .all(|&b| b == 0xA5)
+            );
+        }
+    }
 }
 
 #[test]

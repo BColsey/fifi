@@ -1,4 +1,9 @@
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(fifi_gdn_partition_qualification)");
+    println!("cargo:rerun-if-env-changed=FIFI_GDN_PARTITION_QUALIFY");
+    if std::env::var("FIFI_GDN_PARTITION_QUALIFY").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=fifi_gdn_partition_qualification");
+    }
     println!("cargo:rerun-if-changed=src/kernels/mlx/native/guard.cpp");
     println!("cargo:rerun-if-changed=src/kernels/mlx/native/device_caps.mm");
     println!("cargo:rerun-if-changed=src/kernels/decision/anebridge.mm");
@@ -206,6 +211,7 @@ const CUDA_HEADERS: &[&str] = &[
     "src/kernels/cuda/native/resident/exl3_rotate_wide.h",
     "src/kernels/cuda/native/resident/gdn_conv.h",
     "src/kernels/cuda/native/resident/gdn_delta.h",
+    "src/kernels/cuda/native/resident/gdn_delta_partition.cuh",
     "src/kernels/cuda/native/resident/graph.h",
     "src/kernels/cuda/native/resident/kv8_append.h",
     "src/kernels/cuda/native/resident/kv_f16_append.h",

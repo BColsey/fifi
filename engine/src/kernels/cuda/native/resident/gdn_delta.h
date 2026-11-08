@@ -1,7 +1,6 @@
 /* The gated DeltaNet recurrence step with the gated RMSNorm, per-kernel header
  * (native/resident/gdn_delta.h). Included by gdn_delta.cu and read by the Rust FFI mirror; nothing
- * else. Wraps the vendored kern::gated_delta (engine/vendor/xavier-qwen/src/ops.cu) and adds no
- * kernel.
+ * else. The default wraps vendored kern::gated_delta (engine/vendor/xavier-qwen/src/ops.cu).
  *
  * Per v head h (kernel layout; D = 128): key head kh = h % n_k_heads (tiled, the GGUF layout);
  * q, k = the head's 128 values of the conv row, each x * rsqrt(sum(x^2) + eps), q also times
@@ -50,6 +49,11 @@ typedef struct inference_cuda_gdn_delta_args {
 int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args, void *stream,
                                     int *out_stage);
 
+/* Qualification-only 256-thread partition; same validation and layout, different sum order.
+ * Serving callers keep the entries above/below. */
+int inference_cuda_gdn_delta_partition_launch(const inference_cuda_gdn_delta_args *args, void *stream,
+                                              int *out_stage);
+
 /* The same step with per-token state snapshots stored at a stride (the K-row verify window). After
  * token t < m - 1 the whole state [n_v_heads][128][128] is also stored at snap + t * snap_stride
  * bytes, in the layout of `state`, so a K-row window writes the state after each row straight into
@@ -68,6 +72,8 @@ typedef struct inference_cuda_gdn_delta_snap_args {
 
 int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args, void *stream,
                                          int *out_stage);
+int inference_cuda_gdn_delta_partition_snap_launch(const inference_cuda_gdn_delta_snap_args *args, void *stream,
+                                                   int *out_stage);
 
 #ifdef __cplusplus
 static_assert(sizeof(inference_cuda_gdn_delta_args) == 96 &&
