@@ -38,6 +38,18 @@ the knee.
   must add `CudaPrefillPath::Chunked(n)` so a chunk-built state never
   restores into a steps-built one (the path tag exists for exactly this).
 
+## Measured transport (chunk_sized_exchange probe)
+
+A 256x2048 f32 exchange_sum (2.1 MB payload) on the physical pair:
+**1.333 ms per exchange** with the original single-block publish/wait
+kernels (1.6 GB/s effective - 256 threads copying over PCIe). A
+40-layer chunk pays 80 such sums: 107 ms - MORE than the chunk's
+compute at m=256 (~20 ms/card), so the transport would dominate. The
+multi-block rework of the ring's payload kernels (grid-strided copies,
+64-block ceiling, publish split into flags-zero + data + seq-commit)
+addresses exactly this; the probe re-run after it is the acceptance
+number. PCIe 3.0 x4-ish effective ceiling would put 2.1 MB at ~0.3 ms.
+
 ## The build, in stages
 
 1. **Card chunk geometry** (`StepDims`/`StepPlan`): a `rows`-wide card
