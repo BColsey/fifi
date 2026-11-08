@@ -1049,6 +1049,7 @@ mod tests {
     use crate::family::qwen36::settings::activation_name;
     use crate::family::qwen36::tiny::{self, TINY_GQA, TINY_KV8};
     use crate::family::session::SaveSideTotals;
+    use crate::family::speculate::driver::{Drafter, Proposal, Speculator};
     use crate::{
         family::sampler::{Sampler, SamplingParams},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
@@ -1552,6 +1553,98 @@ mod tests {
         // Three prompt tokens and four sampled tokens are fed. The fifth sampled token is pending.
         assert_eq!(session.state.pos(), 7, "fed positions");
         assert_eq!(session.core.pending(), Some(want[4]), "pending token");
+    }
+
+    /// One speculative decode call through the window model, outside the executor's own
+    /// speculator so that a scripted drafter can drive it.
+    fn spec_decode<D: Drafter>(
+        speculator: &mut Speculator<D>,
+        executor: &mut Q36Executor,
+        session: &mut Q36Session,
+        generation: &mut GenerationState,
+    ) -> DecodeBatch {
+        let Q36Session { state, core, .. } = session;
+        let (step, limits) = executor.split(state);
+        let mut window = Q36WindowStep {
+            step,
+            context_limit: limits.context_limit,
+            snapshot: None,
+            inputs: Vec::new(),
+            logits: Vec::new(),
+        };
+        speculator
+            .decode(core, &mut window, generation, &limits)
+            .unwrap()
+    }
+
+    /// Proposes the oracle chain (`wrong`: every draft off by one, so no draft is ever accepted
+    /// and every window rolls back).
+    struct Scripted {
+        want: Vec<u32>,
+        wrong: bool,
+    }
+
+    impl Drafter for Scripted {
+        fn propose(
+            &mut self,
+            history: &[u32],
+            room: usize,
+        ) -> std::result::Result<Proposal, crate::EngError> {
+            let start = history.len().min(self.want.len());
+            let take = room.min(self.want.len() - start);
+            let tokens = self.want[start..start + take]
+                .iter()
+                .map(|&token| {
+                    if self.wrong {
+                        (token + 1) % VOCAB as u32
+                    } else {
+                        token
+                    }
+                })
+                .collect();
+            Ok(Proposal {
+                tokens,
+                scores: Vec::new(),
+            })
+        }
+
+        fn observe(
+            &mut self,
+            _window: &crate::family::speculate::window::Window,
+            _accepted: &crate::family::speculate::accept::Accepted,
+        ) -> std::result::Result<(), crate::EngError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn speculative_windows_publish_the_tokens_of_the_one_row_run() {
+        let _serial = crate::native_test_lock();
+        let want = oracle(&PROMPT, 5, &mut seeded_sampler(), VOCAB);
+        for (wrong, name) in [(true, "no draft accepted"), (false, "every draft accepted")] {
+            let (mut executor, mut session) = build(rules(vec![], VOCAB));
+            let mut job = seeded_generation(5);
+            executor.prefill(&mut session, &PROMPT).unwrap();
+            let mut speculator = Speculator::new(
+                Scripted {
+                    want: want.clone(),
+                    wrong,
+                },
+                2,
+            );
+            let mut batches = Vec::new();
+            for _ in 0..100 {
+                let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+                let done = batch.finish.is_some();
+                batches.push(batch);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(tokens_of(&batches), want, "{name}: tokens");
+            assert_eq!(session.state.pos(), 7, "{name}: fed positions");
+            assert_eq!(session.core.pending(), Some(want[4]), "{name}: pending");
+        }
     }
 
     /// The session A, B, A pattern on one executor. Each job starts with a reset, as the engine
