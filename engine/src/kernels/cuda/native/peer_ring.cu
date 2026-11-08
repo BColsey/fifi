@@ -56,23 +56,6 @@ __device__ void *payload_of(void *slot) {
     return reinterpret_cast<char *>(slot) + kHeaderBytes;
 }
 
-__global__ void publish_f16_kernel(const float *src, void *dst_slot,
-                                   int count) {
-    half *dst = reinterpret_cast<half *>(payload_of(dst_slot));
-    unsigned local = 0;
-    for (int i = (int)(blockIdx.x * kThreads + threadIdx.x); i < count;
-         i += kThreads * gridDim.x) {
-        const float v = src[i];
-        if (!(fabsf(v) <= 65504.0f)) {
-            local = kFlagOverflow;
-        }
-        dst[i] = __float2half_rn(v);
-    }
-    if (local != 0) {
-        atomicOr(reinterpret_cast<unsigned *>(flags_word(dst_slot)), local);
-    }
-}
-
 __global__ void publish_f32_kernel(const float *src, void *dst_slot,
                                    int count) {
     float *dst = reinterpret_cast<float *>(payload_of(dst_slot));
@@ -82,21 +65,12 @@ __global__ void publish_f32_kernel(const float *src, void *dst_slot,
     }
 }
 
-/// One thread, ordered after the multi-block data launch on the same
-/// stream: every block's flag OR is visible, so the overflow bit is final
-/// and the sequence word lands last.
+/// One thread, ordered after the multi-block f32 data launch on the same
+/// stream. Clear the old slot's flags before making the new sequence visible.
 __global__ void publish_commit_kernel(void *dst_slot, unsigned seq) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        seq_publish(dst_slot, seq);
-    }
-}
-
-/// One thread: resets the slot's overflow flags so the multi-block f16
-/// data launch can accumulate its ORs from zero.
-__global__ void publish_flags_zero_kernel(void *dst_slot) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
         *flags_word(dst_slot) = 0;
-        __threadfence_system();
+        seq_publish(dst_slot, seq);
     }
 }
 
@@ -292,16 +266,10 @@ extern "C" int inference_cuda_ring_publish_f16(void *stream,
         }
         (void)cudaGetLastError();
         cudaStream_t s = as_stream(stream);
-        const int blocks = payload_blocks(count);
-        if (blocks == 1) {
-            publish_f16_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
-                                                            count, seq);
-        } else {
-            publish_flags_zero_kernel<<<1, 1, 0, s>>>(dst_slot);
-            publish_f16_kernel<<<blocks, kThreads, 0, s>>>(src, dst_slot,
-                                                           count);
-            publish_commit_kernel<<<1, 1, 0, s>>>(dst_slot, seq);
-        }
+        // The destination is peer memory. Keep overflow aggregation in one
+        // local block: remote atomics are not available on every P2P link.
+        publish_f16_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
+                                                        count, seq);
         return finish(cudaGetLastError());
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;

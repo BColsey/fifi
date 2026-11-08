@@ -2,9 +2,11 @@
 
 The peer ring normally publishes and reduces each payload with one CUDA
 block. Setting `INFERENCE_CUDA_P2P_RING_MULTIBLOCK=1` before starting the
-engine allows larger payloads to use multiple blocks. Payloads of 2,048
-values or fewer retain the single-block path. Only the exact value `1`
-enables the experiment; unset the variable and restart to roll back.
+engine allows larger f32 publishes and f32/FP16 reductions to use multiple blocks.
+Payloads of 2,048 values or fewer retain the single-block path. FP16 publishes
+also retain one block: their overflow flag lives in peer memory, and not all
+P2P links support remote atomics. Only the exact value `1` enables the
+experiment; unset the variable and restart to roll back.
 
 The switch is off by default and is not qualified. It does not implement
 chunked P2P prefill by itself. Before enabling it for normal serving, compare

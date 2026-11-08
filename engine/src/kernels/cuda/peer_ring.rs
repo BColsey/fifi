@@ -859,6 +859,79 @@ mod device_tests {
         assert_eq!(got[3], 70_000.0 + 1.5);
     }
 
+    #[test]
+    fn large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot() {
+        if !device_present("large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot")
+        {
+            return;
+        }
+        const N: usize = 2049;
+        let (contexts, streams, ring) = two_context_ring(N);
+        let a = vec![1.5f32; N];
+        let b = vec![2.25f32; N];
+        let mut overflow = b.clone();
+        overflow[N - 1] = 70_000.0;
+        let safe = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let overflowing = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("overflow partial 0"),
+            upload_f32(&contexts[1], &streams[1], &overflow).expect("overflow partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(N * 4).expect("out 0"),
+            contexts[1].allocate(N * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+
+        // Sequences 1 and 3 use the same slot. Sequence 1 leaves an FP16
+        // overflow flag there; the large FP32 publish must replace it.
+        for round in 0..3 {
+            for index in 0..2 {
+                statuses[index]
+                    .write_at(&streams[index], 0, &0u32.to_le_bytes())
+                    .expect("clear status");
+            }
+            let (partials, mode) = if round == 0 {
+                (&overflowing, RingMode::F16)
+            } else {
+                (&safe, RingMode::F32)
+            };
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                mode,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                let expected = if round == 0 && index == 0 {
+                    STATUS_OVERFLOW
+                } else {
+                    0
+                };
+                assert_eq!(
+                    status_of(&statuses[index], stream).expect("status"),
+                    expected
+                );
+                if round > 0 {
+                    assert_eq!(
+                        download_f32(&outs[index], stream, N).expect("sum"),
+                        vec![3.75; N]
+                    );
+                }
+            }
+        }
+    }
+
     fn two_context_ring(max_values: usize) -> ([CudaContext; 2], [DeviceStream; 2], PeerRing) {
         let admission = served_admission();
         let contexts = [
