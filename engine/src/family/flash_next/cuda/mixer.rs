@@ -70,13 +70,17 @@ impl FlashStep<'_> {
         let beta_off = z_off + delta.value_width();
         let alpha_off = beta_off + delta.value_heads;
 
-        self.project_group(
-            &[
-                (&at("linear_attn.in_proj_qkv"), 0, delta.conv_dim),
-                (&at("linear_attn.in_proj_z"), z_off, delta.value_width()),
-            ],
+        // qkv (n = conv_dim) and z (n = value_width) differ in width, and the grouped launch
+        // takes one width per group (exl3.cu group_args), so they stay two launches.
+        self.project(
+            &at("linear_attn.in_proj_qkv"),
             x,
-            &row,
+            Self::columns(&row, 0, delta.conv_dim)?,
+        )?;
+        self.project(
+            &at("linear_attn.in_proj_z"),
+            x,
+            Self::columns(&row, z_off, delta.value_width())?,
         )?;
         for (name, offset) in [
             ("linear_attn.in_proj_b.weight", beta_off),
@@ -185,19 +189,22 @@ impl FlashStep<'_> {
                 idx_off + qsa.idx_proj()
             )));
         }
+        // q (2 * q_width) and index (idx_proj) have widths of their own; k and v share
+        // kv_width, the one pair the grouped launch's single-width contract allows. One launch
+        // instead of two also beats the 12-14 us small-call floor once, not twice.
+        self.project(&at("self_attn.q_proj"), x, Self::columns(&row, 0, q_cols)?)?;
         self.project_group(
             &[
-                (&at("self_attn.q_proj"), 0, q_cols),
                 (&at("self_attn.k_proj"), k_off, kv_cols),
                 (&at("self_attn.v_proj"), v_off, kv_cols),
-                (
-                    &at("self_attn.indexer.index_qk_proj"),
-                    idx_off,
-                    qsa.idx_proj(),
-                ),
             ],
             x,
             &row,
+        )?;
+        self.project(
+            &at("self_attn.indexer.index_qk_proj"),
+            x,
+            Self::columns(&row, idx_off, qsa.idx_proj())?,
         )?;
 
         let positions = self.state_plan.positions();

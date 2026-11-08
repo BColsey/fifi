@@ -117,9 +117,9 @@ const CASES: [Case; 12] = [
     case("lm_head", "lm_head", Layer::None, 1, 466.0),
 ];
 
-/// A grouped input-projection launch of a mixer: the member cases in group order, the layers
-/// the group runs in per token, and the stock's microseconds for the whole group (the sum of the
-/// members' stock rows).
+/// A grouped input-projection launch of a mixer: the member cases in group order (one launch,
+/// one width: the kernel contract of exl3_grouped_step), the layers the group runs in per token,
+/// and the stock's microseconds for the whole group (the sum of the members' stock rows).
 struct Group {
     name: &'static str,
     members: &'static [&'static str],
@@ -127,20 +127,12 @@ struct Group {
     stock_us: f64,
 }
 
-const GROUPS: [Group; 2] = [
-    Group {
-        name: "gdn_in",
-        members: &["gdn_qkv", "gdn_z"],
-        per_token: 36,
-        stock_us: 47.6,
-    },
-    Group {
-        name: "qsa_in",
-        members: &["qsa_q", "qsa_k", "qsa_v", "qsa_index"],
-        per_token: 12,
-        stock_us: 50.0,
-    },
-];
+const GROUPS: [Group; 1] = [Group {
+    name: "qsa_kv",
+    members: &["qsa_k", "qsa_v"],
+    per_token: 12,
+    stock_us: 0.0,
+}];
 
 const fn case(
     name: &'static str,

@@ -855,9 +855,9 @@ fn single_row_kernel_receipt_run() {
     let mut input = *last;
     let mut records = Vec::with_capacity(steps);
     // The launch proof: every decode step adds the same launches to the counters. The grouped
-    // mixer inputs are one wide launch per layer (48), the shared expert two (96); the per-step
-    // counter replaces the 216 separate launches of the pre-grouping mixer. Gather must stay
-    // flat: the shared expert rides the context default, not the gather kernel.
+    // QSA k and v projections are one wide launch per QSA layer (12), the shared expert two per
+    // layer (96); gather must stay flat: the shared expert rides the context default, not the
+    // gather kernel.
     let mut before = driver.device().kernel_launches();
     let mut step_wide: Vec<u64> = Vec::with_capacity(steps);
     for step in 0..steps {
@@ -910,7 +910,7 @@ fn single_row_kernel_receipt_run() {
     .expect("write the run");
     println!("wrote {}", path.display());
     println!(
-        "launches per step: wide1 {} (grouped mixer inputs 48 + shared expert 96 + singles), gather 0",
+        "launches per step: wide1 {} (grouped QSA k+v 12 + shared expert 96 + singles), gather 0",
         step_wide.first().copied().unwrap_or(0)
     );
 }

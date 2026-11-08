@@ -324,10 +324,19 @@ impl<'a> FlashStep<'a> {
         );
         let mut xh_at = xh.offset();
         let mut z_at = z.offset();
+        // The grouped launch takes one width per group (exl3.cu group_args: every call's n equals
+        // the first's), so the guard below refuses a mixer change that mixes widths.
+        let group_n = parts.first().map(|&(_, _, n)| n);
         // The views and their io outlive the calls that borrow them: collect the members first,
         // then build the calls in a second pass.
         let mut members = Vec::with_capacity(parts.len());
         for (prefix, col, n) in parts {
+            if Some(*n) != group_n {
+                return Err(refuse(format!(
+                    "{prefix} is {n} wide, the group takes one width ({:?})",
+                    group_n
+                )));
+            }
             let view = self.exl3(prefix)?.view()?;
             let [k, wide] = view.shape;
             if wide != *n {
