@@ -9,11 +9,17 @@ matvecs re-read its top-8 routed experts plus the dense/mixer weights,
 efficiency. No per-token optimization crosses ~45 tok/s.
 
 Chunking changes the arithmetic: one 2048-token pass reads the same
-weight bytes ONCE and runs dense MMQ GEMMs at 20-30 TFLOPS instead of
-one-row matvecs. Weight traffic per token collapses by the chunk factor;
-the pair's prefill becomes compute-bound at an estimated 1500-3000 tok/s
-(the single-device 3090 path already demonstrates ~2500 tok/s with the
-same kernels on one card).
+weight bytes ONCE and runs dense MMQ GEMMs instead of one-row matvecs.
+MEASURED (mmq_prefill_ceiling_probe, Q4_K, k=n=2048, release build, the
+deployment's cards): the 3060 sustains 14.7 / 23.9 / 28.8 / 33.0 / 33.7
+TFLOPS at m = 64 / 256 / 512 / 1024 / 2048 - a whole-model projection of
+8,400 to 19,300 tok/s on that card alone; the 3080 measures 16.2 TFLOPS
+at m=64 (its m>=256 sweep hits a launch-config refusal in the vendored
+MMQ wrapper on 68 SMs - a wrapper quirk to file separately, the kernel
+family is identical). Even at a quarter of the m=512 efficiency
+end-to-end (MoE gather, attention, quantize passes, ring sums), the pair
+sustains >3000 tok/s. The target is real with wide margin; m = 512 is
+the knee.
 
 ## What already exists (do not rebuild)
 
