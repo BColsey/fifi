@@ -17,6 +17,7 @@ use super::moe::tiered::{
 };
 use super::moe::{Launch, MoeBuffers, MoeDims, MoeLayerWeights, StackWeights};
 use super::run_report::HostSyncs;
+use super::tiered_load::{GUESS_ENV, GuessMode, guess_mode_of};
 use crate::EngError;
 use crate::family::qwen36::tiered::cpu_pool::MappedRegion;
 use crate::family::qwen36::tiered::host::{BankDevice, HostError, TieredHost};
@@ -50,6 +51,10 @@ fn host_error(error: HostError) -> EngError {
 struct HostAdapter<'h, 'd> {
     host: &'h mut TieredHost,
     fills: &'d mut dyn BankDevice,
+    /// Whether advice may drive fills this token: `Always` mode, or `Prefill` mode
+    /// inside a multi-row feed. Decode tokens of a prefill-mode engine never touch
+    /// the banks on advice.
+    prefetch: bool,
 }
 
 impl TieredLayerHost for HostAdapter<'_, '_> {
@@ -64,7 +69,9 @@ impl TieredLayerHost for HostAdapter<'_, '_> {
                 &route.resid,
             )
             .map_err(host_error)?;
-        if let Some((target, advice)) = self.host.take_arrived_advice() {
+        if self.prefetch
+            && let Some((target, advice)) = self.host.take_arrived_advice()
+        {
             self.host
                 .prefetch(self.fills, target, &advice)
                 .map_err(host_error)?;
@@ -325,6 +332,8 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
+    /// Whether advice-driven fills happen only while feeding prompt rows.
+    guess_prefill_only: bool,
     /// The async fill channel, built at attach when `Q36_TIERED_ASYNC_FILLS=1`.
     fills: Option<FillParts>,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
@@ -359,11 +368,16 @@ impl<'w> TieredRuntime<'w> {
         } else {
             None
         };
+        let guess_prefill_only = matches!(
+            guess_mode_of(std::env::var_os(GUESS_ENV).as_deref()),
+            GuessMode::Prefill
+        );
         Ok(Self {
             parts,
             banks,
             scratch,
             host,
+            guess_prefill_only,
             fills,
             syncs: HostSyncs::default(),
         })
@@ -376,6 +390,7 @@ impl<'w> TieredRuntime<'w> {
         layer: usize,
         bufs: &MoeBuffers<'_>,
         dims: &MoeDims,
+        feeding_prefill: bool,
     ) -> Result<(), EngError> {
         let missing = || EngError::BadRequest(format!("tiered runtime: layer {layer} has no bank"));
         let (parts, bank) = (
@@ -416,6 +431,7 @@ impl<'w> TieredRuntime<'w> {
             &mut HostAdapter {
                 host: &mut self.host,
                 fills: &mut fills,
+                prefetch: !self.guess_prefill_only || feeding_prefill,
             },
             layer,
             &mut block,

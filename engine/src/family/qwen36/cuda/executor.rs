@@ -99,21 +99,29 @@ impl TokenStepper for QwenResidentStep<'_> {
     fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
         let verdict = self.chunk_ready();
         self.note_feed_rows(&verdict, tokens.len());
-        match chunk_path_of(&verdict) {
+        // A multi-row feed is the prompt: the tiered guess prefetch of `prefill` mode
+        // consumes advice inside this window and never on decode tokens.
+        let prior = self.feeding_prefill;
+        self.feeding_prefill = true;
+        let fed = match chunk_path_of(&verdict) {
             ChunkPath::PerToken => {
                 // The per-token arm records its rows too, so the report rows sum to the
                 // prompt on every path and the job line can carry them.
-                for &token in tokens {
-                    let p0 = self.tokens();
-                    let opened = Instant::now();
-                    TokenStepper::feed(self, token)?;
-                    let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.record_feed(p0, ns);
-                }
-                Ok(())
+                (|| {
+                    for &token in tokens {
+                        let p0 = self.tokens();
+                        let opened = Instant::now();
+                        TokenStepper::feed(self, token)?;
+                        let ns = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        self.record_feed(p0, ns);
+                    }
+                    Ok(())
+                })()
             }
             ChunkPath::Chunked { m_sess } => self.feed_rows_chunked(tokens, m_sess),
-        }
+        };
+        self.feeding_prefill = prior;
+        fed
     }
 
     /// Feeds `token` and returns the full logits row of the next token.

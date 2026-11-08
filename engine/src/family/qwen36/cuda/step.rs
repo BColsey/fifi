@@ -418,6 +418,9 @@ pub(crate) struct QwenResidentStep<'a> {
     /// Set only at the end of a fully successful eager token (a failed first token does not
     /// warm; the warm-up retries).
     warmed: bool,
+    /// True only while a multi-row prompt feed runs: the tiered guess prefetch of the
+    /// `prefill` mode consumes advice on prompt rows and never on decode tokens.
+    pub(super) feeding_prefill: bool,
     capture_on: bool,
     /// An EXL3 step reads the router's picks on the device (no host read in the MoE block); set
     /// with the capture config, which needs a body that makes no host read.
@@ -874,6 +877,7 @@ impl<'a> QwenResidentStep<'a> {
             sync_each,
             started: false,
             warmed: false,
+            feeding_prefill: false,
             capture_on: false,
             exl3_device_ids: false,
             refused: false,
@@ -2267,9 +2271,14 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_moe_row(&launch, bufs, step, layer)?;
                 }
-                runtime
-                    .borrow_mut()
-                    .run_layer(&launch, layer, bufs, &self.moe_dims)
+                let feeding_prefill = self.feeding_prefill;
+                runtime.borrow_mut().run_layer(
+                    &launch,
+                    layer,
+                    bufs,
+                    &self.moe_dims,
+                    feeding_prefill,
+                )
             }
             StepOp::Moe(layer) => {
                 let weights = self.moe.get(layer).ok_or_else(|| {
