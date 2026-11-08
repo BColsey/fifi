@@ -254,32 +254,109 @@ impl RecordSource for TimedSource<'_> {
     }
 }
 
-/// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host,
-/// under the host plan the caller admitted. The plan's mode picks the store: an inclusive plan
-/// holds every expert, so a miss copies one way only (no D2H write-back).
+/// Reads an exllamav3 `expert_stats` JSON into per-layer expert use weights, in layer order.
+/// Refuses a missing file, bad JSON, any layer key that is not `model.language_model.layers.<i>.mlp`,
+/// a layer index outside `0..layers`, or a duplicate layer. The weights themselves are validated
+/// against the bank geometry by [`fill_from_profile`].
+fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngError> {
+    let bad = |detail: String| {
+        EngError::BadRequest(format!("FIFI_FLASH_NEXT_EXPERT_STATS={path}: {detail}"))
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| bad(format!("unreadable: {e}")))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| bad(format!("not valid JSON: {e}")))?;
+    let layer_map = parsed
+        .get("layers")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| bad("no layers object".into()))?;
+    let mut out: Vec<Option<Vec<f64>>> = vec![None; layers];
+    for (key, weights) in layer_map {
+        let index: Option<usize> = key
+            .strip_prefix("model.language_model.layers.")
+            .and_then(|rest| rest.strip_suffix(".mlp"))
+            .and_then(|n| n.parse().ok());
+        let index = index.ok_or_else(|| bad(format!("layer key {key} is not expected")))?;
+        if index >= layers {
+            return Err(bad(format!("layer index {index} outside 0..{layers}")));
+        }
+        let row: Vec<f64> = serde_json::from_value(weights.clone())
+            .map_err(|e| bad(format!("layer {index}: not a list of numbers: {e}")))?;
+        if out[index].is_some() {
+            return Err(bad(format!("layer {index} appears twice")));
+        }
+        out[index] = Some(row);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(index, row)| row.ok_or_else(|| bad(format!("layer {index} is missing"))))
+        .collect()
+}
+
+/// The slot rows and LRU counts of the initial fill. With a profile: per layer, the experts sorted
+/// by use weight (highest first, id breaking ties) take the slots in rank order and the weights
+/// scale to `u64` counts. Without: the first experts by id take the slots and lower ids count as
+/// hotter. Pure; both arms keep every invariant `ReplaceOnMissLru::from_fill` checks.
+fn fill_from_profile(
+    geometry: BankGeometry,
+    profile: Option<&[Vec<f64>]>,
+) -> Result<(Vec<Vec<i32>>, Vec<Vec<u64>>), EngError> {
+    if let Some(profile) = profile
+        && profile.len() != geometry.layers
+    {
+        return Err(EngError::BadRequest(format!(
+            "Flash-Next expert bank: the popularity profile has {} layers, the bank has {}",
+            profile.len(),
+            geometry.layers
+        )));
+    }
+    let mut rows = Vec::with_capacity(geometry.layers);
+    let mut counts = Vec::with_capacity(geometry.layers);
+    for layer in 0..geometry.layers {
+        let Some(weights) = profile.and_then(|p| p.get(layer)) else {
+            rows.push(
+                (0..geometry.experts)
+                    .map(|e| if e < geometry.slots { e as i32 } else { -1 })
+                    .collect(),
+            );
+            counts.push((0..geometry.experts as u64).rev().collect());
+            continue;
+        };
+        if weights.len() != geometry.experts || weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err(EngError::BadRequest(format!(
+                "Flash-Next expert bank: layer {layer} of the popularity profile has {} weights \
+                 (need {}, each finite and non-negative)",
+                weights.len(),
+                geometry.experts
+            )));
+        }
+        let mut by_weight: Vec<usize> = (0..geometry.experts).collect();
+        by_weight.sort_by(|&a, &b| weights[b].total_cmp(&weights[a]).then(a.cmp(&b)));
+        let mut row = vec![-1; geometry.experts];
+        for (slot, &expert) in by_weight.iter().take(geometry.slots).enumerate() {
+            row[expert] = slot as i32;
+        }
+        rows.push(row);
+        counts.push(weights.iter().map(|w| (*w * 1000.0) as u64).collect());
+    }
+    Ok((rows, counts))
+}
+
+/// The bank: under the host plan the caller admitted. The plan's mode picks the store (an inclusive
+/// plan holds every expert, so a miss copies one way only). `profile`, when the caller read one, is
+/// the per-layer expert use weights of a serving run: the hottest `slots` experts fill the slots in
+/// rank order and the counts keep them the last evicted; without one the first experts by id fill
+/// the slots and lower ids count as hotter.
 fn build_bank(
     projector: &CudaProjector,
     geometry: BankGeometry,
     plan: &HostPinPlan,
+    profile: Option<&[Vec<f64>]>,
     source: &PackRecordSource<'_>,
 ) -> Result<DeviceBank, EngError> {
-    let rows: Vec<Vec<i32>> = (0..geometry.layers)
-        .map(|_| {
-            (0..geometry.experts)
-                .map(|expert| {
-                    if expert < geometry.slots {
-                        expert as i32
-                    } else {
-                        -1
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
-    // No popularity profile: lower ids count as hotter, so the first experts are the last evicted.
-    let counts = vec![(0..geometry.experts as u64).rev().collect::<Vec<u64>>(); geometry.layers];
     let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
+
     let state = ExpertBankState::with_policy(geometry, plan.mode, policy)?;
     let timed = TimedSource {
         inner: source,
@@ -468,7 +545,22 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     let source = PackRecordSource::new(checkpoint)?;
-    let bank = build_bank(projector, geometry, &host_plan, &source)?;
+    // Optional popularity profile (`FIFI_FLASH_NEXT_EXPERT_STATS`, an exllamav3 expert_stats
+    // JSON: {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}).
+    // Unset fills by expert id as before; a set value must read and parse, and a malformed file
+    // is refused, never a silent identity fill.
+    let profile = match std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS") {
+        Err(_) => None,
+        Ok(path) if path.is_empty() => None,
+        Ok(path) => Some(read_expert_stats(&path, layers)?),
+    };
+    if profile.is_some() {
+        eprintln!(
+            "flash-next cuda: expert bank: popularity profile {}",
+            std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS").unwrap_or_default()
+        );
+    }
+    let bank = build_bank(projector, geometry, &host_plan, profile.as_deref(), &source)?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()
@@ -528,6 +620,89 @@ pub(super) fn build_driver(
 
 #[cfg(test)]
 mod tests {
+    use super::{BankGeometry, fill_from_profile, read_expert_stats};
+    use std::io::Write as _;
+
+    /// A profile fills the slots in weight rank order (ties by id) and scales the weights to
+    /// counts; the same bank without one keeps the id-ordered fill and the reversed-id counts.
+    #[test]
+    fn a_profile_ranks_the_initial_fill() {
+        let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
+        let profile = [vec![1.0, 9.0, 4.0, 9.0, 0.0, 2.0]];
+        let (rows, counts) = fill_from_profile(geometry, Some(&profile)).expect("fill");
+        // experts 1 and 3 tie at the top weight; id breaks it, so 1 takes slot 0, 3 slot 1, 2 slot 2.
+        assert_eq!(rows[0], [-1, 0, 2, 1, -1, -1]);
+        assert_eq!(counts[0], vec![1000, 9000, 4000, 9000, 0, 2000]);
+        let (rows, counts) = fill_from_profile(geometry, None).expect("identity fill");
+        assert_eq!(rows[0], [0, 1, 2, -1, -1, -1]);
+        assert_eq!(counts[0], (0..6u64).rev().collect::<Vec<u64>>());
+    }
+
+    /// A profile with the wrong layer count or non-finite weights is refused, not folded into
+    /// the identity fill.
+    #[test]
+    fn a_bad_profile_is_refused() {
+        let geometry = BankGeometry::new(2, 4, 2, 3, 8).expect("geometry");
+        assert!(fill_from_profile(geometry, Some(&[vec![1.0; 4]])).is_err());
+        assert!(
+            fill_from_profile(geometry, Some(&[vec![1.0; 4], vec![-1.0, 0.0, 0.0, 0.0]])).is_err()
+        );
+        assert!(
+            fill_from_profile(
+                geometry,
+                Some(&[vec![1.0; 4], vec![f64::NAN, 0.0, 0.0, 0.0]])
+            )
+            .is_err()
+        );
+    }
+
+    /// The stats reader takes the stock layer keys in any object order, refuses a bad key, a
+    /// duplicate, an out-of-range index and a missing layer, and returns weights in layer order.
+    #[test]
+    fn the_stats_reader_parses_and_refuses() {
+        let dir = std::env::temp_dir().join(format!("fn-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            let mut file = std::fs::File::create(&path).expect("file");
+            file.write_all(body.as_bytes()).expect("write");
+            path
+        };
+        let good = write(
+            "good.json",
+            r#"{"model_dir": "x", "layers": {
+                "model.language_model.layers.1.mlp": [2.0, 1.0],
+                "model.language_model.layers.0.mlp": [0.5, 4.0]}}"#,
+        );
+        assert_eq!(
+            read_expert_stats(good.to_str().unwrap(), 2).expect("read"),
+            vec![vec![0.5, 4.0], vec![2.0, 1.0]]
+        );
+        for (name, body) in [
+            ("badkey.json", "{\"layers\": {\"layers.0.mlp\": [1.0]}}"),
+            (
+                "dup.json",
+                r#"{"layers": {"model.language_model.layers.0.mlp": [1.0], "model.language_model.layers.0.mlp": [2.0]}}"#,
+            ),
+            (
+                "range.json",
+                "{\"layers\": {\"model.language_model.layers.2.mlp\": [1.0]}}",
+            ),
+            (
+                "missing.json",
+                "{\"layers\": {\"model.language_model.layers.0.mlp\": [1.0]}}",
+            ),
+            ("notjson.json", "nope"),
+        ] {
+            let path = write(name, body);
+            assert!(
+                read_expert_stats(path.to_str().unwrap(), 2).is_err(),
+                "{name} must be refused"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
     /// The served kernels are registered and checked before the pack is opened and before any
     /// stream or weight exists, in the order set default, set options, check.
     #[test]
