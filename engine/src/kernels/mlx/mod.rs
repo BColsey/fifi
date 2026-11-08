@@ -1074,10 +1074,10 @@ impl MlxKernels {
             }
         }
         let axis = 1;
-        let payload = self.concatenate(&[first.payload(), second.payload()], axis)?;
-        let scales = self.concatenate(&[first.scales(), second.scales()], axis)?;
+        let payload = self.concatenate_weights(&[first.payload(), second.payload()], axis)?;
+        let scales = self.concatenate_weights(&[first.scales(), second.scales()], axis)?;
         let biases = match (first.biases(), second.biases()) {
-            (Some(a), Some(b)) => Some(self.concatenate(&[a, b], axis)?),
+            (Some(a), Some(b)) => Some(self.concatenate_weights(&[a, b], axis)?),
             _ => None,
         };
         Ok(ResidentPackedWeight {
