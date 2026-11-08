@@ -1513,10 +1513,12 @@ impl Context {
                 "{label}: needs at least one part"
             )));
         };
-        check_operand(label, state, first)?;
+        // Ownership only, no dtype gate: the parts are owned packed-weight payloads whose
+        // dtypes (U32, BF16, F32) the caller already validated.
+        check_owner(label, state, first)?;
         let dtype = first.dtype();
         for part in rest {
-            check_operand(label, state, part)?;
+            check_owner(label, state, part)?;
             if part.dtype() != dtype {
                 return Err(EngError::BadRequest(format!(
                     "{label}: parts differ in dtype"
