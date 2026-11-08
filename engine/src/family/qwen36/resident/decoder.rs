@@ -866,9 +866,9 @@ mod tests {
     /// The BF16 constructor keeps the stored BF16 scales and biases, converts the 100-shaped norm
     /// set (here 8 layer norms and 4 head norms) to BF16, and holds `Bf16` as the activation dtype.
     /// The F32 constructor widens every scale and bias and keeps the norms F32. The two censuses
-    /// have the same shape (43 packed weights of 2 parts each), so a wiring that imports F32 scales
-    /// for BF16 activations shows here as an F32 part or a construction refusal from
-    /// `ensure_scale_pairing`.
+    /// have the same shape (39 packed weights of 2 parts each - the gate/up stacks are joined), so
+    /// a wiring that imports F32 scales for BF16 activations shows here as an F32 part or a
+    /// construction refusal from `ensure_scale_pairing`.
     #[test]
     fn the_activation_dtype_pairs_the_scales_and_converts_the_norms() {
         let _serial = crate::native_test_lock();
@@ -892,7 +892,7 @@ mod tests {
         let (f32, bf16) = (f32.weights.scale_census(), bf16.weights.scale_census());
         assert_eq!(
             (f32.weights, f32.f32_parts, f32.bf16_parts, f32.other_parts),
-            (43, 86, 0, 0),
+            (39, 78, 0, 0),
             "the F32 import widens every scale and bias"
         );
         assert_eq!(
@@ -902,7 +902,7 @@ mod tests {
                 bf16.bf16_parts,
                 bf16.other_parts
             ),
-            (43, 0, 86, 0),
+            (39, 0, 78, 0),
             "the BF16 import keeps every scale and bias as stored"
         );
     }
