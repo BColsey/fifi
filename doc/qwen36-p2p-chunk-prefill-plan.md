@@ -3,18 +3,26 @@
 Status: design only. The multi-device session currently feeds one token at a
 time; the single-device chunk runner cannot be enabled for it unchanged.
 
+This plan was first written against a build with replicated K/V caches. The
+currently deployed experimental branch includes KV slicing (`3bd5ac7`):
+each card now owns only its dealt K/V head groups. Rebase and revalidate the
+transfer primitive and the admission calculation against that branch before
+using this plan. The production P2P chunk path is still unimplemented.
+
 ## Boundaries
 
 1. Admit one chunk size on every participating card using that card's free
-   memory, current decode arena, replicated resident state, workspace and all
+   memory, current decode arena, that card's resident state, workspace and all
    peer mailboxes. Allocate only after the same chunk size passes on all cards.
    Keep per-token prefill as the default and fallback.
 2. Embed once, broadcast the rows, and run the layer stages in lockstep across
    the cards. Exchange the mixer partials before the following residual/norm.
-3. For full attention, prepare each card's K/V slices, gather complete K/V rows
-   on both cards, and check peer statuses before appending either replica.
-   Adapt the chunk Q8 attention shape: its current checks require 16 query
-   heads and two K/V heads on a single card.
+3. For full attention on the sliced-cache branch, prepare and append each
+   card's own K/V head groups. Preserve a cross-card peer-status check before
+   either persistent cache is changed; removing a gather does not remove this
+   failure boundary. The older replicated-cache branch needs complete K/V rows
+   on every card instead. Adapt the chunk Q8 attention shape: its current
+   checks require 16 query heads and two K/V heads on a single card.
 4. Broadcast routing choices and weights from the routing card. Run each
    expert's sharded intermediate on each card, reduce the routed and shared
    partials, then combine. Do not change the order of floating-point
@@ -41,7 +49,8 @@ a shard can use it.
 - CPU: chunk sizes and tails, overflow and mailbox tiling, disjoint scratch
   lifetimes, admission on the tighter GPU, exact 131,072 total-token limit.
 - Two peer GPUs: per-stage partials, routing, mixer and expert reductions,
-  DeltaNet state, K/V rows and cache replicas against the one-token path.
+  DeltaNet state, K/V rows and each card's cache-head slice against the
+  one-token path.
   Include asymmetric placement, chunk boundaries, one-row tails, reset and
   injected peer failures before append.
 - Full model: match greedy outputs and compare logits across short, boundary,
