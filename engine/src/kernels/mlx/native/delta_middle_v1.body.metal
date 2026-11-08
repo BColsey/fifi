@@ -19,9 +19,9 @@
 // v_out [1,1,VH,VD] f32, g_out [1,1,VH] f32 (alpha), beta_out [1,1,VH] f32,
 // ring_out [CD,3] f32.
 // Launch: threadgroup (32,1,1) = one simdgroup per head; grid (heads*32, 1, 1) threads over
-// heads = 2*KH + VH: q heads 0..KH-1 and k heads KH..2KH-1 (KD channels each), then VH value
-// heads (VD channels). The head channels tile the CD columns of u and y, so every channel is
-// convolved exactly once. KD and VD stay <= 128: each lane holds at most 4 elements.
+// heads = 2*KH + VH: the first KH heads are q and the next KH are k (KD channels each),
+// then VH value heads (VD channels). The head channels tile the CD columns of u and y, so every
+// channel is convolved exactly once. KD and VD stay <= 128: each lane holds at most 4 elements.
 const uint lane = thread_index_in_simdgroup;
 const int hd = int(threadgroup_position_in_grid.x);
 constexpr int CD = 2 * KH * KD + VH * VD;
