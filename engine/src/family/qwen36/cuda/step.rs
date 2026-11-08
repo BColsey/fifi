@@ -784,6 +784,16 @@ impl<'a> QwenResidentStep<'a> {
         };
         let (event, word) = (context.event()?, context.pinned_word()?);
         let layers: Vec<usize> = (0..res.table.len()).collect();
+        // The tiled-experts hybrid: layer 0's gate stack loaded as tiles beside the native
+        // session flips the MoE epilogue to the fp16 pack form. Uniformity across layers is
+        // enforced when the MoE weights resolve below; layer 0 is enough to pick the op list.
+        let moe_tiled = options.layout == WeightLayout::Native
+            && res
+                .table
+                .name(0, Role::FfnGateExps)
+                .ok()
+                .and_then(|name| weights.get(&name))
+                .is_some_and(|weight| matches!(weight, CudaWeight::Tiled { .. }));
         let parts = MixerParts {
             geometry: res.geometry,
             table: &res.table,
@@ -800,9 +810,11 @@ impl<'a> QwenResidentStep<'a> {
                 &res.geometry,
                 options.layout,
                 options.kv_mode,
+                moe_tiled,
             )?,
             layout: options.layout,
             kv_mode: options.kv_mode,
+            moe_tiled,
             paged: res.paged.as_ref(),
             sparse: res.sparse.as_ref(),
         };
@@ -847,6 +859,22 @@ impl<'a> QwenResidentStep<'a> {
                 .iter()
                 .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer, options.layout))
                 .collect::<Result<Vec<_>, _>>()?;
+            // The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a
+            // mixed override (tiled stacks in some layers, native in others) refuses here
+            // instead of failing per layer inside the block's own check.
+            let tiled = moe
+                .first()
+                .is_some_and(|w| matches!(w.gate, StackWeights::Tiled(_)));
+            if moe
+                .iter()
+                .any(|w| matches!(w.gate, StackWeights::Tiled(_)) != tiled)
+            {
+                return Err(EngError::Checkpoint(
+                    "step weights: the INFERENCE_CUDA_TILED_HEAD override must cover the expert \
+                     stacks of every layer, not some"
+                        .to_owned(),
+                ));
+            }
             (moe, None)
         };
         let vocab = res.dims.shape.vocab;
@@ -1733,6 +1761,14 @@ impl<'a> QwenResidentStep<'a> {
             .exl3_flag_fold(&self.stream, params, self.view(Slot::Exl3Flag)?)
     }
 
+    /// Whether this load overrode the expert stacks to tiles (the tiled-experts hybrid): the
+    /// MoE blocks then run the Tiled per-slot form over the plan's fp16 packs.
+    fn moe_is_tiled(&self) -> bool {
+        self.moe
+            .first()
+            .is_some_and(|w| matches!(w.gate, StackWeights::Tiled(_)))
+    }
+
     /// The buffers of the MoE block of the layers whose residual input is buffer `parity` (0 is
     /// `ResidA`, 1 is `ResidB`).
     fn moe_buffers(&self, parity: usize) -> Result<MoeBuffers<'_>, EngError> {
@@ -1740,9 +1776,10 @@ impl<'a> QwenResidentStep<'a> {
         Ok(MoeBuffers {
             route: self.route_bufs(parity)?,
             expert: ExpertBufs {
-                // The packs follow the plan: the fp16 packs of the Tiled plan or the padded
-                // q8_1 packs of the Native plan.
-                packs: if self.res.plan.index(Slot::Q8Moe).is_some() {
+                // The packs follow the plan: the fp16 packs of the Tiled plan, the padded q8_1
+                // packs of the Native plan - or, in the tiled-experts hybrid, the plan's dead
+                // fp16 slots beside the native ones, because the overridden stacks read them.
+                packs: if self.res.plan.index(Slot::Q8Moe).is_some() && !self.moe_is_tiled() {
                     Packs::Q8 {
                         moe: view(Slot::Q8Moe)?,
                         down: view(Slot::Q8Down)?,

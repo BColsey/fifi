@@ -596,6 +596,20 @@ fn stack_of<'w>(
             check_native_stack(name, (weight.n_rows(), weight.k(), Some(experts)), want)?;
             Ok(StackWeights::Native(weight))
         }
+        // The tiled-head hybrid's sibling: an expert stack the load overrode to tiles beside
+        // the native session, so the block runs the Tiled per-slot form for this layer.
+        (
+            Some(CudaWeight::Tiled {
+                weight, experts, ..
+            }),
+            WeightLayout::Native,
+        ) => {
+            check_stack(name, (weight.n_rows(), weight.k(), *experts), want)?;
+            Ok(StackWeights::Tiled(ExpertStack {
+                weight,
+                experts: want.experts,
+            }))
+        }
         (Some(CudaWeight::Exl3 { .. } | CudaWeight::Exl3Bank { .. }), _)
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "moe weights: {name} needs EXL3 per-expert dispatch"

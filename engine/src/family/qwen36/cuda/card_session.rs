@@ -137,6 +137,8 @@ impl CardSession {
                 views,
                 layout: native,
                 kv_mode: options.kv_mode,
+                // Cards hold native weights only: the tiled-experts hybrid has no card form.
+                moe_tiled: false,
                 paged: None,
                 // Card sessions run dense: no sparse exec is constructed on this
                 // path, so the sparse chain can never launch here.

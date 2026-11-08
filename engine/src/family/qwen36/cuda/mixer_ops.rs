@@ -430,9 +430,18 @@ fn prologue(layout: WeightLayout) -> BlockOp {
 }
 
 /// The residual add of the mixer output and the norm for the MoE block: ends the mixer block.
-fn epilogue(layout: WeightLayout) -> BlockOp {
+fn epilogue(layout: WeightLayout, moe_tiled: bool) -> BlockOp {
     match layout {
         WeightLayout::Tiled => BlockOp::NormPack {
+            phase: Phase::AddNorm,
+            weight: Role::PostAttentionNorm,
+            delta: Some(Slot::MixOut),
+            xf: Slot::XfMoe,
+            norm_out: Some(Slot::NormRow),
+        },
+        // The tiled-experts hybrid: the overridden expert stacks read the fp16 pack, so the
+        // epilogue produces it even beside the native session (the Exl3 shape).
+        WeightLayout::Native if moe_tiled => BlockOp::NormPack {
             phase: Phase::AddNorm,
             weight: Role::PostAttentionNorm,
             delta: Some(Slot::MixOut),
@@ -649,12 +658,13 @@ pub(super) fn block_ops(
     g: &MixerGeometry,
     layout: WeightLayout,
     kv_mode: KvMode,
+    moe_tiled: bool,
 ) -> Result<Vec<BlockOp>, EngError> {
     // The loader fuses only Native weights, so the op list must make the SAME decision - fusion on
     // another layout would plan a wide qkv the weights cannot satisfy.
     let fuse_inproj =
         crate::family::project::cuda::gdn_fuse_inproj() && layout == WeightLayout::Native;
-    block_ops_with(fuse_inproj, kind, g, layout, kv_mode)
+    block_ops_with(fuse_inproj, kind, g, layout, kv_mode, moe_tiled)
 }
 
 /// The `block_ops` twin with an explicit fusion flag, so the CPU tests pin both arms without
@@ -665,6 +675,7 @@ pub(super) fn block_ops_with(
     g: &MixerGeometry,
     layout: WeightLayout,
     kv_mode: KvMode,
+    moe_tiled: bool,
 ) -> Result<Vec<BlockOp>, EngError> {
     if layout == WeightLayout::Native {
         for (role, col, rows, ld) in native_columns(g, kind, fuse_inproj) {
@@ -693,7 +704,7 @@ pub(super) fn block_ops_with(
             )));
         }
     }
-    ops.push(epilogue(layout));
+    ops.push(epilogue(layout, moe_tiled));
     Ok(ops)
 }
 
@@ -892,6 +903,7 @@ pub(super) fn block_ops_card(
     // into the residual, so the partials must sum first (the `MixerSum` of `multi.rs`'s
     // token plan).
     ops.push(CardOp::MixerSum);
-    ops.push(CardOp::Local(epilogue(layout)));
+    // Cards hold native weights only: the tiled-experts hybrid has no card form.
+    ops.push(CardOp::Local(epilogue(layout, false)));
     Ok(ops)
 }

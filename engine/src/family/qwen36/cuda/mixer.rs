@@ -73,10 +73,15 @@ struct KindOps {
 }
 
 impl KindOps {
-    fn new(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Result<Self, EngError> {
+    fn new(
+        g: &MixerGeometry,
+        layout: WeightLayout,
+        kv_mode: KvMode,
+        moe_tiled: bool,
+    ) -> Result<Self, EngError> {
         Ok(Self {
-            delta: block_ops(AttentionKind::DeltaNet, g, layout, kv_mode)?,
-            attn: block_ops(AttentionKind::Full, g, layout, kv_mode)?,
+            delta: block_ops(AttentionKind::DeltaNet, g, layout, kv_mode, moe_tiled)?,
+            attn: block_ops(AttentionKind::Full, g, layout, kv_mode, moe_tiled)?,
         })
     }
 
@@ -180,8 +185,9 @@ impl<'a> MixerViews<'a> {
         g: &MixerGeometry,
         layout: WeightLayout,
         kv_mode: KvMode,
+        moe_tiled: bool,
     ) -> Result<Self, EngError> {
-        let views = Self::slot_indices(plan, g, layout, kv_mode)?
+        let views = Self::slot_indices(plan, g, layout, kv_mode, moe_tiled)?
             .into_iter()
             .map(|(slot, index)| Ok((slot, arena.tensor(index)?)))
             .collect::<Result<Vec<_>, EngError>>()?;
@@ -232,8 +238,9 @@ impl<'a> MixerViews<'a> {
         g: &MixerGeometry,
         layout: WeightLayout,
         kv_mode: KvMode,
+        moe_tiled: bool,
     ) -> Result<Vec<(Slot, usize)>, EngError> {
-        let ops = KindOps::new(g, layout, kv_mode)?;
+        let ops = KindOps::new(g, layout, kv_mode, moe_tiled)?;
         let mut indices: Vec<(Slot, usize)> = Vec::new();
         for op in ops.all() {
             for slot in op.reads().into_iter().chain(op.writes()) {
@@ -299,6 +306,10 @@ pub(super) struct MixerParts<'a> {
     /// The KV mode the op lists were built for: the attention core is the fp16 pair under `Fp16`
     /// and the KV8 rows/append/q8-decode triple under `Int8G32`.
     pub(super) kv_mode: KvMode,
+    /// Whether the MoE epilogue must produce the fp16 pack: the tiled-experts hybrid overrides
+    /// the expert stacks to tiles beside the native session, so their launches read `XfMoe`
+    /// instead of `Q8Moe`.
+    pub(super) moe_tiled: bool,
     pub(super) paged: Option<&'a PagedResources>,
     /// Present only when armed and admitted: sparse decode resources, else every op runs dense.
     pub(super) sparse: Option<&'a SparseExec>,
@@ -338,7 +349,12 @@ impl<'a> Mixers<'a> {
 
     pub(super) fn new(context: &'a CudaContext, parts: MixerParts<'a>) -> Result<Self, EngError> {
         check_delta_eps(parts.geometry.eps)?;
-        let ops = KindOps::new(&parts.geometry, parts.layout, parts.kv_mode)?;
+        let ops = KindOps::new(
+            &parts.geometry,
+            parts.layout,
+            parts.kv_mode,
+            parts.moe_tiled,
+        )?;
         Ok(Self {
             context,
             parts,
