@@ -34,6 +34,10 @@ pub(super) enum StepMode {
     Prompt,
     /// `Generate` plus the logits, for a sampler.
     Logits,
+    /// A verify window of speculative decoding: the head runs on EVERY row and the logits of
+    /// each row are read back. No token is drawn on the device; the sampler draws on the host
+    /// from `window_logits`. Only `ResidentDecoder::prefill` takes this mode.
+    Window,
     /// Parity runs only: `Logits` plus the residual stream after every layer.
     Record,
 }
@@ -44,6 +48,8 @@ pub(super) struct StepResult {
     pub(super) token: Option<u32>,
     /// Next-token logits `[vocab]`. `Logits` and `Record` only.
     pub(super) logits: Option<Vec<f32>>,
+    /// The next-token logits of every row, `[rows][vocab]`. `Window` only.
+    pub(super) window_logits: Option<Vec<Vec<f32>>>,
     /// The `[hidden]` residual stream after each layer, as the host reference records it. `Record` only.
     pub(super) layer_out: Option<Vec<Vec<f32>>>,
     /// The experts of each layer in rank order, `top_k` per layer. `Record` only.

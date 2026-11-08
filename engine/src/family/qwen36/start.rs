@@ -91,6 +91,13 @@ pub(crate) fn start(
         stages.begin("opening the model");
         let (mut executor, session) =
             Q36Executor::open_for_family(&owned.artifact, owned.cache_limit, rules, &owned.spec)?;
+        if owned.speculation.enabled() {
+            executor.set_speculation(&owned.speculation)?;
+            eprintln!(
+                "q36: speculation on: up to {} draft(s), ngram, verify window on the chunk path",
+                owned.speculation.num_draft_tokens
+            );
+        }
         stages.begin("planning the prefill chunk");
         let (delta_warmup, moe_warmup, attn_warmup) = executor.compile_warmup_seconds();
         if !delta_warmup.is_empty() || !moe_warmup.is_empty() || !attn_warmup.is_empty() {

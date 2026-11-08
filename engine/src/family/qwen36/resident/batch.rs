@@ -396,6 +396,7 @@ impl ResidentDecoder<'_> {
             let layers = std::mem::take(&mut nexts[slot]);
             state.commit_rows(1, layers, permit)?;
             results.push(StepResult {
+                window_logits: None,
                 token: Some(next_tokens[slot]),
                 logits: logit_rows[slot].take(),
                 layer_out: None,

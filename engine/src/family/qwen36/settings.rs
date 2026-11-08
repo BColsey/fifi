@@ -193,8 +193,8 @@ pub(crate) struct Q36Options {
     /// `kv_offload_host_bytes`, and `capture` (the resolved flag: unset means the CUDA arm's
     /// default, on), each by name.
     pub(crate) cuda_devices: Option<Vec<u32>>,
-    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. A CUDA
-    /// member for `weight_format` `exl3` only.
+    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. The
+    /// CUDA arm (`weight_format` `exl3`) and the MLX resident arm (`gguf`) take `ngram`.
     pub(crate) draft_mode: Option<String>,
     /// The most drafts of one verify window, from 1 to 16. The default is 2.
     pub(crate) num_draft_tokens: Option<u32>,
@@ -304,6 +304,7 @@ fn rollback_of(
     options: &Q36Options,
     speculation: &SpecConfig,
     kv_offload_host_bytes: Option<u64>,
+    backend: Backend,
 ) -> Result<RollbackMode, EngError> {
     let mode = match options.draft_rollback.as_deref() {
         None | Some("host") => RollbackMode::Host,
@@ -315,6 +316,13 @@ fn rollback_of(
         }
     };
     if mode == RollbackMode::Device {
+        if backend != Backend::Cuda {
+            return Err(bad(
+                "draft_rollback device is CUDA-only: the MLX arm rolls back with a shared-handle \
+                     snapshot"
+                    .into(),
+            ));
+        }
         if !speculation.enabled() {
             return Err(bad("draft_rollback device needs draft_mode ngram".into()));
         }
@@ -512,17 +520,24 @@ pub(crate) fn speculator_of(
     }
 }
 
-/// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
-/// only verify window and the only MTP head the engine has.
+/// The speculation members. An enabled mode needs an arm that has a verify window: the CUDA arm
+/// with an EXL3 pack or the MLX resident arm with GGUF blocks.
 fn speculation_of(
     options: &Q36Options,
     backend: Backend,
     weights: WeightFormat,
 ) -> Result<SpecConfig, EngError> {
     let config = SpecConfig::new(&options.spec_options())?;
-    if config.enabled() && (backend != Backend::Cuda || weights != WeightFormat::Exl3) {
+    if config.enabled()
+        && !matches!(
+            (backend, weights),
+            (Backend::Cuda, WeightFormat::Exl3) | (Backend::Mlx, WeightFormat::Gguf)
+        )
+    {
         return Err(bad(
-            "draft_mode other than disabled needs the CUDA arm with weight_format exl3".into(),
+            "draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the \
+             MLX arm with gguf"
+                .into(),
         ));
     }
     // The MTP head has no draft step yet: accepting the mode would promise a speed the engine
@@ -1221,7 +1236,7 @@ impl Q36Settings {
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
-        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes)?;
+        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes, backend)?;
         let draft_verify = verify_of(options, draft_rollback, weights)?;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
@@ -1975,6 +1990,39 @@ mod tests {
     }
 
     #[test]
+    fn the_mlx_arm_takes_ngram_but_not_the_device_rollback_or_mtp() {
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let on = mlx(Q36Options {
+            draft_mode: Some("ngram".into()),
+            num_draft_tokens: Some(3),
+            cache_limit_bytes: Some(8 << 30),
+            ..Q36Options::default()
+        })
+        .unwrap();
+        assert!(on.speculation.enabled());
+        assert_eq!(on.speculation.num_draft_tokens, 3);
+        assert_eq!(on.draft_rollback, super::RollbackMode::Host);
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("ngram".into()),
+                draft_rollback: Some("device".into()),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_rollback device is CUDA-only: the MLX arm rolls back with a \
+             shared-handle snapshot"
+        );
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("mtp".into()),
+                mtp_model_dir: Some(PathBuf::from("/h")),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_mode mtp has no draft step yet"
+        );
+    }
+
+    #[test]
     fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
         let cuda =
             |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
@@ -2075,11 +2123,11 @@ mod tests {
         };
         let text = format!(
             "{:?}",
-            rollback_of(&options, &speculation, Some(1 << 30)).unwrap_err()
+            rollback_of(&options, &speculation, Some(1 << 30), Backend::Cuda).unwrap_err()
         );
         assert!(text.contains("kv_offload_host_bytes"), "{text}");
         assert_eq!(
-            rollback_of(&options, &speculation, None).unwrap(),
+            rollback_of(&options, &speculation, None, Backend::Cuda).unwrap(),
             RollbackMode::Device
         );
     }
@@ -2204,7 +2252,7 @@ mod tests {
 
     #[test]
     fn an_enabled_draft_mode_is_refused_where_no_window_runs() {
-        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3";
+        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the MLX arm with gguf";
         let gguf = Q36Options {
             draft_mode: Some("ngram".into()),
             ..Q36Options::default()
@@ -2217,8 +2265,6 @@ mod tests {
             message(mlx),
             "engine config: weight_format exl3 is CUDA-only"
         );
-        let mlx_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Mlx);
-        assert_eq!(message(mlx_gguf), want);
     }
 
     #[test]

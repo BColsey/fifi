@@ -204,6 +204,11 @@ pub(super) fn run(
     // The head. `Prompt` skips the norm, `lm_head`, and the argmax.
     let head = match mode {
         StepMode::Prompt => None,
+        StepMode::Window => {
+            return Err(bad(
+                "a verify window needs the chunk path: a one-row step has no window",
+            ));
+        }
         StepMode::Generate | StepMode::Logits | StepMode::Record => {
             let final_h = ctx.kernels.rms_norm(&h, &weights.final_norm, shape.eps)?;
             let logits = linear(&mut ctx, &weights.lm_head, &final_h)?;
@@ -308,6 +313,7 @@ pub(super) fn run(
     };
     state.commit(layers, permit)?;
     Ok(StepResult {
+        window_logits: None,
         token: token_out,
         logits: logits_out,
         layer_out,
@@ -692,6 +698,7 @@ mod tests {
                     StepMode::Prompt => assert_eq!(
                         got,
                         StepResult {
+                            window_logits: None,
                             token: None,
                             logits: None,
                             layer_out: None,
@@ -703,6 +710,7 @@ mod tests {
                     StepMode::Generate => assert_eq!(
                         got,
                         StepResult {
+                            window_logits: None,
                             token: Some(want_token),
                             logits: None,
                             layer_out: None,
@@ -711,6 +719,7 @@ mod tests {
                         },
                         "{what}"
                     ),
+                    StepMode::Window => unreachable!("a one-row step refuses Window"),
                     StepMode::Logits => unreachable!("not used here"),
                     StepMode::Record => {
                         assert_eq!(got.token, Some(want_token), "{what}: argmax");
