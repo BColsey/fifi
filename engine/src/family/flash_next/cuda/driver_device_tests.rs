@@ -657,3 +657,111 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         .expect("write engine-follow.json");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The single-row EXL3 kernel receipt: one process, one configuration.
+
+/// One greedy run of `STEPS` tokens on the oracle prompt, with the sha256 of every step's whole
+/// logits row and the wall time of every step, written to
+/// `$OUT/ab-<CONFIG>-r<ROUND>.json`. The EXL3 kernel switches are process-wide and read once, so
+/// a script runs this test once per configuration, with the `FIFI_EXL3_*` variables of that
+/// configuration in the environment, and compares the hashes across the runs.
+///
+/// Environment: `FIFI_FLASH_NEXT_EXL3_PACK`, `FIFI_FLASH_NEXT_DRIVER_ORACLE`, `_PROMPT` (default
+/// `chat-short`), `_STEPS` (default 64), `_CONTEXT` (default 512), `_OUT`, `_CONFIG` (a label) and
+/// `_ROUND`.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB) and the full pack; run by the kernel receipt script"]
+fn single_row_kernel_receipt_run() {
+    use sha2::{Digest, Sha256};
+
+    assert!(
+        device_present("Flash-Next kernel receipt"),
+        "a GPU is required"
+    );
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let config = var("FIFI_FLASH_NEXT_DRIVER_CONFIG").expect("FIFI_FLASH_NEXT_DRIVER_CONFIG");
+    let round = var("FIFI_FLASH_NEXT_DRIVER_ROUND").unwrap_or_else(|| "1".into());
+    let out = PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_OUT").expect("FIFI_FLASH_NEXT_DRIVER_OUT"));
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(64, |v| v.parse().expect("steps"));
+    let context: u32 =
+        var("FIFI_FLASH_NEXT_DRIVER_CONTEXT").map_or(512, |v| v.parse().expect("context"));
+    let wanted_id = var("FIFI_FLASH_NEXT_DRIVER_PROMPT").unwrap_or_else(|| "chat-short".into());
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"]
+        .as_u64()
+        .expect("actual_vocab") as usize;
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == wanted_id.as_str())
+        .unwrap_or_else(|| panic!("no prompt {wanted_id}"));
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    assert!(
+        prompt.len() + steps < context as usize,
+        "the context is too small"
+    );
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
+    };
+    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let kernel = driver
+        .device()
+        .single_row_kernel_name()
+        .expect("kernel name");
+    let env = |name: &str| std::env::var(name).ok();
+    println!(
+        "config {config} round {round}: single-row kernel {kernel}; SINGLE_GATHER {:?} DP4A {:?} INDEXED_PAIRS {:?}",
+        env("FIFI_EXL3_SINGLE_GATHER"),
+        env("FIFI_EXL3_DP4A"),
+        env("FIFI_EXL3_INDEXED_PAIRS")
+    );
+    let (last, head) = prompt.split_last().expect("a prompt");
+    for &token in head {
+        driver.feed(token).expect("feed a prompt token");
+    }
+    let mut input = *last;
+    let mut records = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let began = std::time::Instant::now();
+        let row = driver
+            .logits(input)
+            .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
+        let wall = began.elapsed();
+        let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let pick = argmax(&row[..actual_vocab]);
+        records.push(serde_json::json!({
+            "i": step, "input": input, "token": pick, "sha256": hash, "ms": ms(wall),
+            "misses": driver.bank_misses(),
+        }));
+        input = pick as u32;
+    }
+    std::fs::create_dir_all(&out).expect("out dir");
+    let path = out.join(format!("ab-{config}-r{round}.json"));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "config": config, "round": round, "kernel": kernel, "prompt": wanted_id,
+            "env": {"FIFI_EXL3_SINGLE_GATHER": env("FIFI_EXL3_SINGLE_GATHER"),
+                    "FIFI_EXL3_DP4A": env("FIFI_EXL3_DP4A"),
+                    "FIFI_EXL3_INDEXED_PAIRS": env("FIFI_EXL3_INDEXED_PAIRS")},
+            "steps": records,
+        }))
+        .expect("json"),
+    )
+    .expect("write the run");
+    println!("wrote {}", path.display());
+}

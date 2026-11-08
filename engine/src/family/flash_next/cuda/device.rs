@@ -44,6 +44,13 @@ impl CardDevice {
         }
     }
 
+    /// The kernel the single-row EXL3 projections of this context run on (`legacy`, `wide1`, ...),
+    /// from `FIFI_EXL3_SINGLE_GATHER` or the shuffle kernel; the Flash-Next load line does not print it.
+    #[cfg(test)]
+    pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        self.step.ctx.single_row_kernel_name()
+    }
+
     /// The bank's statistics line for the load log and the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.inner.bank().state().stats().misses
