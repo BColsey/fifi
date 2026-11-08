@@ -5,7 +5,7 @@
 //! release test binary with `--ignored --nocapture`.
 
 use super::linear_tests::{fixture, upload_scales};
-use super::{Exl3IndexedCall, Exl3LinearCall};
+use super::{Exl3IndexedCall, Exl3LinearCall, IndexedOptions};
 use crate::kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, testkit};
 use crate::weights::exl3::Codebook;
 
@@ -17,6 +17,11 @@ enum Path {
     Gather,
     /// `exl3_grouped_wide` with the call as its only group, `cols` tiles per block.
     Wide(u32),
+    /// `exl3_grouped_wide` with one tile per block and the context opted into the compile-time
+    /// rate 10 and rate 6 body of book 2, which every other group falls back from.
+    WideOdd,
+    /// [`Path::WideOdd`] with the DP4A decode of book 2 (the DP4A option on the context).
+    WideOddDp4a,
 }
 
 struct Rig {
@@ -121,6 +126,35 @@ impl Rig {
             Path::Legacy => ctx.exl3_linear_mode(stream, call, false),
             Path::Gather => ctx.exl3_grouped(stream, std::slice::from_ref(&call), true),
             Path::Wide(cols) => ctx.exl3_grouped_wide(stream, std::slice::from_ref(&call), cols),
+            Path::WideOdd | Path::WideOddDp4a => {
+                ctx.set_odd_rate_kernel(true);
+                if matches!(path, Path::WideOddDp4a) {
+                    ctx.set_indexed_options(Some(IndexedOptions::DP4A));
+                }
+                let done = ctx.exl3_grouped_wide(stream, std::slice::from_ref(&call), 1);
+                ctx.set_indexed_options(None);
+                ctx.set_odd_rate_kernel(false);
+                // The native launch reports the kernel it enqueued: the compile-time body only for
+                // book 2 at rate 10 or 6 with one row, the unchanged kernels otherwise.
+                let (rows, ..) = self.shape;
+                let qualifies =
+                    self.book == Codebook::Mul1 && matches!(self.bits_twice, 10 | 6) && rows == 1;
+                let want = match (qualifies, matches!(path, Path::WideOddDp4a)) {
+                    (false, _) => 2,
+                    (true, false) => 3,
+                    (true, true) => 4,
+                };
+                if done.is_ok() {
+                    assert_eq!(
+                        CudaContext::test_last_odd_variant(),
+                        want,
+                        "{path:?}: {:?} rate {} rows {rows}",
+                        self.book,
+                        self.bits_twice
+                    );
+                }
+                done
+            }
         }
         .unwrap();
     }
@@ -191,6 +225,8 @@ fn single_row_gather_and_wide_are_bit_identical_to_the_legacy_kernel() {
                 for path in [
                     Path::Gather,
                     Path::Wide(1),
+                    Path::WideOdd,
+                    Path::WideOddDp4a,
                     Path::Wide(2),
                     Path::Wide(4),
                     Path::Wide(8),
@@ -211,7 +247,13 @@ fn single_row_gather_and_wide_are_bit_identical_to_the_legacy_kernel() {
             bias: true,
             fused: rows % 2 == 0,
         };
-        for path in [Path::Gather, Path::Wide(1), Path::Wide(4)] {
+        for path in [
+            Path::Gather,
+            Path::Wide(1),
+            Path::WideOdd,
+            Path::WideOddDp4a,
+            Path::Wide(4),
+        ] {
             compare(&ctx, &stream, &case, path, &mut rng, rows == 5);
             checked += 1;
         }
@@ -223,6 +265,8 @@ fn single_row_gather_and_wide_are_bit_identical_to_the_legacy_kernel() {
         (Codebook::Mcg, 8u8),
         (Codebook::Mcg, 12),
         (Codebook::ThreeInst, 8),
+        (Codebook::Mul1, 10),
+        (Codebook::Mul1, 6),
     ] {
         for k in [128usize, 384, 640] {
             let case = Case {
@@ -233,7 +277,12 @@ fn single_row_gather_and_wide_are_bit_identical_to_the_legacy_kernel() {
                 bias: false,
                 fused: false,
             };
-            for path in [Path::Gather, Path::Wide(1)] {
+            for path in [
+                Path::Gather,
+                Path::Wide(1),
+                Path::WideOdd,
+                Path::WideOddDp4a,
+            ] {
                 compare(&ctx, &stream, &case, path, &mut rng, false);
                 checked += 1;
             }
@@ -303,6 +352,8 @@ fn an_unaligned_trellis_gives_the_bytes_of_the_shuffle_kernel() {
         (Codebook::ThreeInst, 8, 1),
         (Codebook::Mcg, 12, 1),
         (Codebook::Mul1, 5, 1),
+        (Codebook::Mul1, 10, 1),
+        (Codebook::Mul1, 6, 1),
         // Several rows: the rows kernel reads the same unaligned words.
         (Codebook::Mcg, 8, 3),
         (Codebook::ThreeInst, 8, 8),
@@ -316,7 +367,7 @@ fn an_unaligned_trellis_gives_the_bytes_of_the_shuffle_kernel() {
             bias: false,
             fused: false,
         };
-        for path in [Path::Gather, Path::Wide(1), Path::Wide(4)] {
+        for path in [Path::Gather, Path::Wide(1), Path::WideOdd, Path::Wide(4)] {
             compare_at(&ctx, &stream, &case, path, (&mut rng, false), 2);
         }
     }
@@ -389,6 +440,101 @@ fn grouped_wide_matches_grouped_gather_across_mixed_groups() {
     let expected = run(None);
     for cols in [1, 2, 4, 8] {
         assert_eq!(run(Some(cols)), expected, "wide {cols}");
+    }
+}
+
+/// Groups of book 2 at rates 10 and 6 in one launch take the compile-time body when the context
+/// opts in, and write the bytes of the gather launch; one group of another book or rate sends
+/// the same launch to the unchanged wide kernel, which writes them too.
+#[test]
+fn the_odd_rate_body_matches_the_gather_launch_in_mixed_groups() {
+    if !testkit::device_present("EXL3 odd-rate body vs gather") {
+        return;
+    }
+    let ctx = CudaContext::new().expect("context");
+    let stream = ctx.stream().expect("stream");
+    let mut rng = testkit::Rng::new(0x5347_0007);
+    let (k, n) = (640usize, 384usize);
+    for kinds in [
+        vec![
+            (Codebook::Mul1, 10u8),
+            (Codebook::Mul1, 6),
+            (Codebook::Mul1, 10),
+        ],
+        vec![
+            (Codebook::Mul1, 10),
+            (Codebook::Mcg, 8),
+            (Codebook::Mul1, 6),
+        ],
+        vec![
+            (Codebook::Mul1, 10),
+            (Codebook::Mul1, 8),
+            (Codebook::Mul1, 6),
+        ],
+    ] {
+        let groups = kinds.len();
+        let rigs: Vec<Rig> = kinds
+            .iter()
+            .map(|&(book, bits_twice)| {
+                let case = Case {
+                    book,
+                    bits_twice,
+                    shape: (k, n),
+                    rows: 1,
+                    bias: false,
+                    fused: false,
+                };
+                Rig::new(&ctx, &case, &input(&mut rng, k, false))
+            })
+            .collect();
+        let run = |mode: u8| {
+            let xh = testkit::upload_filled(&ctx, 0xff, groups * k * 4);
+            let z = testkit::upload_filled(&ctx, 0xff, groups * n * 4);
+            let out = testkit::upload_filled(&ctx, 0xff, groups * n * 4);
+            let flag = testkit::upload_bytes(&ctx, &0u32.to_le_bytes());
+            let calls: Vec<Exl3LinearCall<'_>> = rigs
+                .iter()
+                .enumerate()
+                .map(|(g, rig)| Exl3LinearCall {
+                    xh: xh.range(g * k * 4, k * 4).unwrap(),
+                    z: z.range(g * n * 4, n * 4).unwrap(),
+                    out: out.range(g * n * 4, n * 4).unwrap(),
+                    flag: flag.range(0, 4).unwrap(),
+                    ..rig.call()
+                })
+                .collect();
+            if mode > 0 {
+                ctx.set_odd_rate_kernel(true);
+                if mode == 2 {
+                    ctx.set_indexed_options(Some(IndexedOptions::DP4A));
+                }
+                ctx.exl3_grouped_wide(&stream, &calls, 1).unwrap();
+                ctx.set_indexed_options(None);
+                ctx.set_odd_rate_kernel(false);
+                // Only a launch whose every group is book 2 at rate 10 or 6 runs the new body.
+                let all = kinds
+                    .iter()
+                    .all(|&(book, bits)| book == Codebook::Mul1 && matches!(bits, 10 | 6));
+                let want = if all { 2 + u32::from(mode) } else { 2 };
+                assert_eq!(
+                    CudaContext::test_last_odd_variant(),
+                    want,
+                    "{kinds:?} mode {mode}"
+                );
+            } else {
+                ctx.exl3_grouped(&stream, &calls, true).unwrap();
+            }
+            stream.synchronize().unwrap();
+            (
+                testkit::read_bytes(&ctx, &xh, groups * k * 4),
+                testkit::read_bytes(&ctx, &z, groups * n * 4),
+                testkit::read_bytes(&ctx, &out, groups * n * 4),
+                testkit::read_bytes(&ctx, &flag, 4),
+            )
+        };
+        let expected = run(0);
+        assert_eq!(run(1), expected, "{kinds:?} odd");
+        assert_eq!(run(2), expected, "{kinds:?} odd with DP4A");
     }
 }
 

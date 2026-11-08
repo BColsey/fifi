@@ -93,6 +93,7 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
     ctx.set_single_row_default(SERVED_SINGLE_ROW);
     ctx.set_indexed_default(SERVED_INDEXED);
+    ctx.set_odd_rate_kernel(true);
     ctx.check_single_gather()?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
@@ -486,11 +487,14 @@ mod tests {
         let indexed = register
             .find("ctx.set_indexed_default(")
             .expect("the indexed default");
+        let odd = register
+            .find("ctx.set_odd_rate_kernel(true)")
+            .expect("the odd-rate kernel switch");
         let check = register
             .find("ctx.check_single_gather()?")
             .expect("the switch check");
         assert!(
-            single < indexed && indexed < check,
+            single < indexed && indexed < odd && odd < check,
             "the defaults must be registered before check_single_gather()"
         );
         let build = &source[source

@@ -438,6 +438,13 @@ unsafe extern "C" {
         stage: *mut c_int,
         cols: u32,
     ) -> c_int;
+    fn inference_cuda_exl3_grouped_wide_odd(
+        args: *const LinearArgs,
+        count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+        dp4a: u32,
+    ) -> c_int;
 }
 
 /// Mirror of `inference_cuda_exl3_index_args`.
@@ -633,11 +640,14 @@ fn indexed_records(
 
 /// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
 /// 16-column tiles. Same validation and results as [`grouped`] with `gather`; `n` of every call
-/// must be a multiple of `16 * cols`.
+/// must be a multiple of `16 * cols`. With `odd` and one tile per block the launch may run the
+/// compile-time rate 10 and rate 6 body of book 2 (`Some(dp4a)`: with the DP4A decode when `dp4a`);
+/// the bytes written are the same.
 pub(in crate::kernels::cuda) fn grouped_wide(
     stream: &RawStream,
     calls: &[LinearRaw<'_>],
     cols: u32,
+    odd: Option<bool>,
 ) -> Result<(), DeviceFailure> {
     if calls.is_empty() || calls.len() > 48 || !matches!(cols, 1 | 2 | 4 | 8) {
         return Err(invalid_argument());
@@ -652,17 +662,35 @@ pub(in crate::kernels::cuda) fn grouped_wide(
         args.push(linear_args(call, false)?);
     }
     let mut stage = STAGE_NONE;
+    #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
+    if let (Some(dp4a), 1) = (odd, cols) {
+        // The same launch through the observed entry, so tests see which kernel ran.
+        return checked(
+            launch_observer::wide_odd(&args, stream, &mut stage, dp4a),
+            stage,
+        );
+    }
     // SAFETY: as `grouped`: every record has live bounded owners and validated local extents, C
     // validates all group shapes, the column multiple and aliases before any enqueue, and `cols`
     // is 1, 2, 4 or 8.
     let status = unsafe {
-        inference_cuda_exl3_grouped_wide(
-            args.as_ptr(),
-            args.len(),
-            stream.as_ptr(),
-            &mut stage,
-            cols,
-        )
+        if let (Some(dp4a), 1) = (odd, cols) {
+            inference_cuda_exl3_grouped_wide_odd(
+                args.as_ptr(),
+                args.len(),
+                stream.as_ptr(),
+                &mut stage,
+                u32::from(dp4a),
+            )
+        } else {
+            inference_cuda_exl3_grouped_wide(
+                args.as_ptr(),
+                args.len(),
+                stream.as_ptr(),
+                &mut stage,
+                cols,
+            )
+        }
     };
     checked(status, stage)
 }
@@ -1232,6 +1260,42 @@ pub(in crate::kernels::cuda) mod launch_observer {
         static ROUTED: Cell<bool> = const { Cell::new(false) };
         /// 0 none, 1 shuffle, 2 gather, 3 mixed across a leg's dispatches.
         static GATHERED: Cell<u8> = const { Cell::new(0) };
+        /// The projection kernel of the last odd-rate wide launch: 3 and 4 the rate 10 and rate 6
+        /// body without and with DP4A, 2 the unchanged kernels, 0 none yet.
+        static ODD_VARIANT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// The projection kernel the last odd-rate wide launch of this thread enqueued, as the native
+    /// launch reported it (see [`wide_odd`]).
+    pub(in crate::kernels::cuda) fn last_odd_variant() -> u32 {
+        ODD_VARIANT.with(Cell::get)
+    }
+
+    /// The odd-rate wide launch through the observed entry: the same launch plan and bytes, and the
+    /// kernel that actually ran is recorded for [`last_odd_variant`].
+    pub(super) fn wide_odd(
+        args: &[LinearArgs],
+        stream: &RawStream,
+        stage: &mut c_int,
+        dp4a: bool,
+    ) -> c_int {
+        let mut launches = 0;
+        let mut variant = 0u32;
+        // SAFETY: as `grouped`: live validated records and owners, C validates the group shapes
+        // and aliases before any enqueue, and both outputs stay live through the call.
+        let status = unsafe {
+            inference_cuda_exl3_grouped_wide_odd_observed(
+                args.as_ptr(),
+                args.len(),
+                stream.as_ptr(),
+                stage,
+                u32::from(dp4a),
+                &mut launches,
+                &mut variant,
+            )
+        };
+        ODD_VARIANT.with(|last| last.set(if status == 0 { variant } else { 0 }));
+        status
     }
 
     #[repr(C)]
@@ -1283,6 +1347,15 @@ pub(in crate::kernels::cuda) mod launch_observer {
             count: usize,
             stream: *mut c_void,
             stage: *mut c_int,
+            launches: *mut u64,
+            variant: *mut u32,
+        ) -> c_int;
+        fn inference_cuda_exl3_grouped_wide_odd_observed(
+            args: *const LinearArgs,
+            count: usize,
+            stream: *mut c_void,
+            stage: *mut c_int,
+            dp4a: u32,
             launches: *mut u64,
             variant: *mut u32,
         ) -> c_int;

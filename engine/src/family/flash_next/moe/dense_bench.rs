@@ -7,7 +7,10 @@
 //! - `legacy`: the shuffle kernel Flash-Next runs today (input rotation, `project_small`, output
 //!   rotation);
 //! - `gather`: the per-warp shared-table gather kernel;
-//! - `wide1`: the one-tile wide kernel that Qwen3.6 and Flint serve.
+//! - `wide1`: the one-tile wide kernel that Qwen3.6 and Flint serve;
+//! - `wide1_r56`: `wide1` with the compile-time rate 10 and rate 6 body of book 2, the kernel the
+//!   Flash-Next decode opts into;
+//! - `wide1_r56_dp4a`: `wide1_r56` with the DP4A decode of book 2.
 //!
 //! Each case reads its matrix from the pack once and uploads it in as many copies as make a pool of
 //! up to 96 MiB (2 copies at least, 48 at most; the head is 2), so a call never finds its weights
@@ -37,7 +40,10 @@ use super::{
 use crate::{
     family::project::cuda::{CudaProjector, Reserve, exl3::Exl3Io},
     kernels::{
-        cuda::{CudaContext, DeviceBuffer, DeviceStream, TimingEvent, device_present},
+        cuda::{
+            CudaContext, DeviceBuffer, DeviceStream, TimingEvent, device_present,
+            resident::exl3::IndexedOptions,
+        },
         single_row::SingleRow,
     },
     weights::exl3::{Checkpoint, Matrix},
@@ -127,11 +133,28 @@ const fn case(
     }
 }
 
-const PATHS: [(&str, SingleRow); 3] = [
-    ("legacy", SingleRow::Legacy),
-    ("gather", SingleRow::Gather),
-    ("wide1", SingleRow::Wide(1)),
+/// A path: name, kernel, whether the one-tile launch may take the rate 10 and rate 6 body of
+/// book 2, and whether that body decodes book 2 with DP4A.
+type BenchPath = (&'static str, SingleRow, bool, bool);
+
+const PATHS: [BenchPath; 5] = [
+    ("legacy", SingleRow::Legacy, false, false),
+    ("gather", SingleRow::Gather, false, false),
+    ("wide1", SingleRow::Wide(1), false, false),
+    ("wide1_r56", SingleRow::Wide(1), true, false),
+    ("wide1_r56_dp4a", SingleRow::Wide(1), true, true),
 ];
+
+/// Selects path `index` on the context.
+fn select(ctx: &CudaContext, index: usize) {
+    ctx.set_single_row_default(PATHS[index].1);
+    ctx.set_odd_rate_kernel(PATHS[index].2);
+    ctx.set_indexed_options(Some(if PATHS[index].3 {
+        IndexedOptions::DP4A
+    } else {
+        IndexedOptions::OFF
+    }));
+}
 
 fn layer_index(var: &str, default: usize) -> Res<usize> {
     std::env::var_os(var).map_or(Ok(default), |value| {
@@ -355,13 +378,13 @@ fn run() -> Res<()> {
 fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
     let last = rig.weights.len() - 1;
     let mut want = Vec::with_capacity(2);
-    rig.ctx.set_single_row_default(PATHS[0].1);
+    select(rig.ctx, 0);
     for copy in [0, last] {
         want.push(rig.written(copy)?);
     }
     let mut agree = [true; PATHS.len()];
-    for (index, (name, path)) in PATHS.iter().enumerate().skip(1) {
-        rig.ctx.set_single_row_default(*path);
+    for (index, (name, _, _, _)) in PATHS.iter().enumerate().skip(1) {
+        select(rig.ctx, index);
         for (slot, copy) in [0, last].into_iter().enumerate() {
             if rig.written(copy)? != want[slot] {
                 agree[index] = false;
@@ -382,7 +405,7 @@ fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
             if !agree[index] {
                 continue;
             }
-            rig.ctx.set_single_row_default(PATHS[index].1);
+            select(rig.ctx, index);
             let timed = rig.time()?;
             if trial > 0 {
                 samples[index].push(timed);
@@ -402,7 +425,7 @@ fn report(case: &Case, rig: &Rig<'_>, samples: &[Vec<(f64, f64)>], agree: &[bool
         Some((*device.get(device.len() / 2)?, *queue.get(queue.len() / 2)?))
     };
     let legacy = median(0).map(|m| m.0);
-    for (index, (name, _)) in PATHS.iter().enumerate() {
+    for (index, (name, _, _, _)) in PATHS.iter().enumerate() {
         let Some((us, queue_us)) = median(index) else {
             continue;
         };
