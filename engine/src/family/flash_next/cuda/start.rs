@@ -255,7 +255,8 @@ impl RecordSource for TimedSource<'_> {
 }
 
 /// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host,
-/// under the host plan the caller admitted.
+/// under the host plan the caller admitted. The plan's mode picks the store: an inclusive plan
+/// holds every expert, so a miss copies one way only (no D2H write-back).
 fn build_bank(
     projector: &CudaProjector,
     geometry: BankGeometry,
@@ -279,7 +280,7 @@ fn build_bank(
     // No popularity profile: lower ids count as hotter, so the first experts are the last evicted.
     let counts = vec![(0..geometry.experts as u64).rev().collect::<Vec<u64>>(); geometry.layers];
     let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
-    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy)?;
+    let state = ExpertBankState::with_policy(geometry, plan.mode, policy)?;
     let timed = TimedSource {
         inner: source,
         spent: Cell::new(Duration::ZERO),
@@ -399,15 +400,46 @@ pub(super) fn build_driver(
         slots,
         record_bytes,
     )?;
-    let host_plan = HostPinPlan::new(
-        &geometry,
-        HostMode::Exclusive,
-        &HostMemory {
-            total: mem_total,
-            available: mem_available,
+    // The store mode: an inclusive store holds every expert pinned, so a miss copies one way
+    // only (the D2H write-back of the evicted expert disappears); it needs every record's bytes
+    // of host RAM (43.07 GiB on this pack), so `auto` takes it only when the plan admits it and
+    // falls back to the exclusive store of spare places. `FIFI_FLASH_NEXT_BANK_MODE` forces a
+    // mode (`inclusive` or `exclusive`); anything else is refused, never a silent fallback.
+    let memory = HostMemory {
+        total: mem_total,
+        available: mem_available,
+    };
+    let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
+        Err(_) | Ok("") | Ok("auto") => {
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT).or_else(
+                |inclusive| {
+                    eprintln!(
+                        "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
+                    );
+                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
+                },
+            )?
+        }
+        Ok("inclusive") => {
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)?
+        }
+        Ok("exclusive") => {
+            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)?
+        }
+        Ok(other) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+            )));
+        }
+    };
+    eprintln!(
+        "flash-next cuda: {} store, {} pinned host bytes",
+        match host_plan.mode {
+            HostMode::Inclusive => "inclusive",
+            HostMode::Exclusive => "exclusive",
         },
-        &HostTerms::DEFAULT,
-    )?;
+        host_plan.store_bytes
+    );
     let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
     let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
     HostBudget::probe()?.admit_for(
