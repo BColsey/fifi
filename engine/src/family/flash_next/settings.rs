@@ -202,6 +202,13 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
         .slots
         .map(|slots| bounded("slots", slots, MIN_CUDA_SLOTS, MAX_CUDA_SLOTS))
         .transpose()?;
+    if options
+        .expert_stats
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(bad("expert_stats must not be empty".into()));
+    }
     Ok(Some(CudaSettings {
         context,
         kv_format,

@@ -260,9 +260,8 @@ impl RecordSource for TimedSource<'_> {
 /// parser keeps the last value of a repeated object key, so the layer reads as missing instead.
 /// The weights themselves are validated against the bank geometry by [`fill_from_profile`].
 fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngError> {
-    let bad = |detail: String| {
-        EngError::BadRequest(format!("FIFI_FLASH_NEXT_EXPERT_STATS={path}: {detail}"))
-    };
+    let bad =
+        |detail: String| EngError::BadRequest(format!("expert_stats profile {path}: {detail}"));
     let text = std::fs::read_to_string(path).map_err(|e| bad(format!("unreadable: {e}")))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| bad(format!("not valid JSON: {e}")))?;
@@ -565,7 +564,7 @@ pub(super) fn build_driver(
         None => None,
         Some(path) if wanted.expert_stats.is_some() && !path.exists() => {
             eprintln!(
-                "flash-next cuda: expert bank: no profile at {} yet; identity fill, the dump                  writes it on shutdown",
+                "flash-next cuda: expert bank: no profile at {} yet; identity fill, the dump writes it on shutdown",
                 path.display()
             );
             None

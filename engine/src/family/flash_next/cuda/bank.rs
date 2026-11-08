@@ -626,9 +626,15 @@ impl ReplaceOnMissLru {
         let usage_misses = self.miss_counts.clone();
         let body =
             serde_json::json!({"schema": "fifi-usage/1", "layers": layers, "misses": usage_misses});
+        // Write-and-rename: a crash mid-dump must not leave a truncated file the next start
+        // refuses. The temp file sits next to the target so the rename stays on one filesystem.
+        let temp = path.with_extension("json.tmp");
         match serde_json::to_vec(&body) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
+                let written =
+                    std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+                if let Err(e) = written {
+                    std::fs::remove_file(&temp).ok();
                     eprintln!("flash-next cuda: expert usage dump {}: {e}", path.display());
                 }
             }
