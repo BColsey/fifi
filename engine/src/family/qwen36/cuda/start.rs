@@ -1031,6 +1031,21 @@ fn make_multi(
         &options,
         rules.eos,
         rules.sampler_vocab,
+        // Experimental and default off: the card path's prefix save/restore
+        // is wired but NOT yet qualified (the restore passed filler-agnostic
+        // bench answers and failed a deeper turn-chain check; see the branch
+        // doc). Q36_P2P_PREFIX=1 opts in.
+        if std::env::var_os("Q36_P2P_PREFIX").is_some_and(|v| v == "1") {
+            crate::family::qwen36::settings::prefix_store_limits_of(
+                settings.prefix_reuse,
+                settings.prefix_store_entries,
+            )
+        } else {
+            crate::family::session::StoreLimits {
+                roots: 0,
+                entries: 0,
+            }
+        },
     )?;
     Ok((
         Q36CudaStep::Cards(Box::new(session)),

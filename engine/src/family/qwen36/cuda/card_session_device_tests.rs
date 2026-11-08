@@ -293,6 +293,7 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
         &options,
         eos,
         vocab,
+        crate::family::session::StoreLimits::default(),
     )?;
     session.set_skip_prefill_head_for_test(false);
     let limit = session.context_limit();

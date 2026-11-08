@@ -136,3 +136,28 @@ computes its rows locally, so appending from AttnProj removes 2 ring
 sequences per full-attention layer (~20/token) and shrinks the KRows/VRows
 slots to the card's width. After that, prefix save/restore (the multi-turn
 capability) and chunked prefill remain the top levers.
+
+## Fourth session: card prefix save/restore (wired, gated off)
+
+The CardSession now implements the ExecutorOps prefix hooks over the
+shared session rules: a save exports one state per card (its sliced KV
+planes plus its DeltaNet slots), a restore imports them in order, and
+the card states' books are enqueued/committed per token so exports carry
+the true count; after an import the next feed rewrites the full step
+params (the import zeroes the word block, and the position must restart
+at the restored count). Q36_P2P_PREFIX=1 opts in; the default is OFF
+because the feature is NOT yet qualified:
+
+- Repeat requests restore and answer 46x faster (0.28 s vs 13.2 s,
+  reused_tokens 517/524) - but that bench's answer is filler-agnostic,
+  and it initially passed while the restore was in fact broken (the
+  export carried tokens=0 because the card books were never committed;
+  the fix adds the enqueue/commit pair).
+- The deeper turn-chain check (recall question across a warm multi-turn
+  conversation) passes on answers today, but the end-of-turn save
+  refused with a fed/key mismatch in one instrumented run and the
+  follow-up validation was blocked by GPU contention from the other
+  automation lanes. The bookkeeping arithmetic (fed vs key length with
+  the pending-token rule) needs a device rig before this ships - the
+  session.rs rules suite is single-device-calibrated and the card path
+  reports a manual counter.

@@ -432,6 +432,13 @@ impl ResidentState {
         self.book.commit(accepted, status)
     }
 
+    /// Admits a step of `advance` rows into the state book (rule 1 of
+    /// `book.rs`): the card session enqueues its one-row steps so the books
+    /// carry the token count the prefix export reads.
+    pub(crate) fn enqueue_step(&mut self, advance: usize) -> Result<(), EngError> {
+        self.book.enqueue(advance).map(|_| ())
+    }
+
     /// Marks the state untrustworthy until the next `reset` or a successful `import_state`: the
     /// executor calls it for ANY non-zero status bit of a step or prefill report (1, 2, 4, 8 or
     /// unknown bits) and for any error after the first launch of a step. Host flag only: it stops
