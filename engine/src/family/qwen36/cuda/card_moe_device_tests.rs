@@ -515,7 +515,11 @@ fn run_rig(
         .collect();
     let op_lists: Vec<&[CardMoeOp]> = ops.iter().map(|o| o.as_slice()).collect();
 
-    let rounds = if compare_fused { 8 } else { 1 };
+    let rounds = if compare_fused || compare_shared {
+        8
+    } else {
+        1
+    };
     let mut tokens = Vec::with_capacity(TOKENS * rounds);
     for step in 0..TOKENS * rounds {
         let t = step % TOKENS;
