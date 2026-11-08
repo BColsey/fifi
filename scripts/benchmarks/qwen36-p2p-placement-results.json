@@ -1,0 +1,321 @@
+{
+  "date_local": "2026-11-08 America/New_York",
+  "method": "Same candidate binary and model, three deterministic 524-token requests per arm, one configured placement per engine load. Rates divide prompt tokens by wall time through the complete two-token reply.",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X",
+    "gpu_order": [
+      "NVIDIA GeForce RTX 3060 12 GB (PCIe 4.0 x4)",
+      "NVIDIA GeForce RTX 3080 10 GB (PCIe 4.0 x8)"
+    ],
+    "driver": "615.78.08 with local P2P patch",
+    "kernel": "7.0.0-42-generic"
+  },
+  "model": {
+    "file": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "context_tokens": 131072,
+    "kv_dtype": "q8",
+    "prefix_reuse": false,
+    "synchronized_broadcasts": true,
+    "skip_prefill_head": true,
+    "preallocated_kv_admission": true
+  },
+  "provenance": {
+    "base_commit": "7f9c3ee809297bcf0e8c7e6d5d54e33f17687e48",
+    "candidate_binary_sha256": "0ab214365701a98567807ea32d261e4dc539fdc93df2825e175bc41ac1e90bbc",
+    "benchmark_script_sha256": "cc8d51af6d67f75200a6582d4235efdc94bccb36c1eb45ea5fe868344956516f",
+    "comparison_script_sha256": "2f4d1350e983033e951ee73f7e0e7bf6fd8d5a91c8a21be76b35d64ea8418582"
+  },
+  "control": {
+    "requested_host_expert_bytes_by_card": [
+      2147483648,
+      4294967296
+    ],
+    "startup": {
+      "mapped_expert_bytes_by_card": [
+        2189426688,
+        4303355904
+      ],
+      "free_bytes_by_card_after_load": [
+        2363031552,
+        2477391872
+      ]
+    },
+    "benchmark": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 15.999717,
+          "estimated_prompt_tokens_per_second": 32.751,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 15.994486,
+          "estimated_prompt_tokens_per_second": 32.761,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 15.996797,
+          "estimated_prompt_tokens_per_second": 32.757,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 15.996797,
+      "median_prompt_tokens_per_second": 32.757
+    },
+    "first_token_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 15965.8,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 15960.7,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 15963.1,
+        "outcome": "ok"
+      }
+    ]
+  },
+  "tuned": {
+    "requested_host_expert_bytes_by_card": [
+      1342177280,
+      3489660928
+    ],
+    "startup": {
+      "mapped_expert_bytes_by_card": [
+        1358954496,
+        3548381184
+      ],
+      "free_bytes_by_card_after_load": [
+        1536753664,
+        1726611456
+      ]
+    },
+    "benchmark": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.845234,
+          "estimated_prompt_tokens_per_second": 37.847,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.848887,
+          "estimated_prompt_tokens_per_second": 37.837,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 14.681453,
+          "estimated_prompt_tokens_per_second": 35.691,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 13.848887,
+      "median_prompt_tokens_per_second": 37.837
+    },
+    "first_token_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 13815.3,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 13817.8,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 14650.9,
+        "outcome": "ok"
+      }
+    ]
+  },
+  "deterministic_replies_same_for_both": {
+    "model": "fifi-q36",
+    "prompts": [
+      "Compute 19 plus 23. Reply with only the number.",
+      "Name the capital of Japan in one word.",
+      "What are the three letters immediately after D? Reply with just those letters.",
+      "What is the opposite of cold? Reply with one word."
+    ],
+    "results": [
+      {
+        "content": "42",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Tokyo",
+        "finish_reason": "stop",
+        "prompt_tokens": 21,
+        "completion_tokens": 3
+      },
+      {
+        "content": "EFG",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Hot",
+        "finish_reason": "stop",
+        "prompt_tokens": 24,
+        "completion_tokens": 2
+      }
+    ]
+  },
+  "pcie_dmon": {
+    "description": "One-second nvidia-smi dmon samples during each three-request run; rates include all PCIe traffic and are not an isolated measurement of host experts.",
+    "control": {
+      "1": {
+        "samples": 43,
+        "mean_rx_MB_s": 5566.5,
+        "mean_tx_MB_s": 1205.8
+      },
+      "2": {
+        "samples": 43,
+        "mean_rx_MB_s": 2973.7,
+        "mean_tx_MB_s": 690.1
+      }
+    },
+    "tuned": {
+      "1": {
+        "samples": 39,
+        "mean_rx_MB_s": 4961.2,
+        "mean_tx_MB_s": 1115.8
+      },
+      "2": {
+        "samples": 39,
+        "mean_rx_MB_s": 2219.9,
+        "mean_tx_MB_s": 527.5
+      }
+    }
+  },
+  "long_prompt": {
+    "previous_binary_same_original_placement": {
+      "model": "fifi-q36",
+      "repeat": 850,
+      "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+      "samples": [
+        {
+          "prompt_tokens": 4274,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 130.515445,
+          "estimated_prompt_tokens_per_second": 32.747,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000004"
+        }
+      ],
+      "median_seconds": 130.515445,
+      "median_prompt_tokens_per_second": 32.747
+    },
+    "tuned_candidate": {
+      "model": "fifi-q36",
+      "repeat": 850,
+      "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+      "samples": [
+        {
+          "prompt_tokens": 4274,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 112.730094,
+          "estimated_prompt_tokens_per_second": 37.914,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000008"
+        }
+      ],
+      "median_seconds": 112.730094,
+      "median_prompt_tokens_per_second": 37.914
+    },
+    "tuned_first_token_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000008",
+        "prompt_tokens": 4274,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 112695.3,
+        "outcome": "ok"
+      }
+    ]
+  },
+  "checks": {
+    "128k_kv_layout_cpu": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5787 filtered out; finished in 0.00s",
+    "admission_floor_cpu": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5787 filtered out; finished in 0.00s",
+    "mapped_expert_gpu0": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5787 filtered out; finished in 0.21s",
+    "mapped_expert_gpu1": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5787 filtered out; finished in 0.21s",
+    "two_gpu_session_parity": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5787 filtered out; finished in 10.39s"
+  },
+  "limitations": [
+    "The long-prompt comparison has one sample per arm and uses the prior binary for the old placement.",
+    "A full 131072-token end-to-end prompt was not run.",
+    "These results cover one host, one model, and one pair of placements.",
+    "A later control loaded the same tuned placement without the admission option; the measured throughput gain cannot be attributed to the option itself."
+  ],
+  "follow_up_without_admission_option": {
+    "description": "A separate session subsequently loaded the same tuned host-mapping budgets without Q36_P2P_PREALLOCATED_KV. The loader source was unchanged from the base commit; its worktree had independent experimental changes to card_block.rs and card_step.rs.",
+    "base_commit": "7f9c3ee809297bcf0e8c7e6d5d54e33f17687e48",
+    "binary_sha256": "78ebccb36e0acc60b1103609637ae37d7f16819161b778b3420629d9242b6210",
+    "requested_host_expert_bytes_by_card": [
+      1342177280,
+      3489660928
+    ],
+    "mapped_expert_bytes_by_card": [
+      1358954496,
+      3548381184
+    ],
+    "free_bytes_by_card_after_load": [
+      1536753664,
+      1726611456
+    ],
+    "resident_kv_environment_variable": "absent",
+    "engine_state": "ready",
+    "interpretation": "The measured speedup is due to the expert placement. This control shows that this particular placement did not require the admission option on this host; no practical fit improvement from the option was measured."
+  }
+}

@@ -92,6 +92,12 @@ To check the model file's SHA-256 while it loads, set `Q36_VERIFY_GGUF_SHA256=1`
 
 A server process runs one Qwen3.6 CUDA engine.
 
+## Two-device experiments
+
+For an experimental peer-access configuration with limited device memory, see
+[host-backed expert placement](../qwen36-p2p-mapped-experts.md) for its
+requirements and a method to compare placements.
+
 ## Keep long conversations fast
 
 All shipped CUDA profiles set `"prefix_reuse": true`: when a conversation continues, only the new messages are processed.

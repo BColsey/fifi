@@ -27,3 +27,45 @@ On systems where peers can advance at different rates, set
 card to consume a broadcast before reusing the ring's two mailbox slots;
 it prevents a faster publisher from overwriting a slower peer's message.
 The additional synchronizations can reduce throughput.
+
+## Tune host placement
+
+The requested host-byte values are minimums. Reducing them keeps more expert
+slices in GPU memory, which can improve throughput when PCIe is the limiting
+factor, but leaves less free VRAM. Choose values for the actual device order,
+context size, and other GPU users. The loader reports the selected host bytes
+and remaining GPU memory at startup.
+
+First measure the existing placement against an idle, ready engine. These
+commands use a key-free endpoint at `http://127.0.0.1:18792`; pass `--url`
+to both scripts if the endpoint is elsewhere. Use output paths that do not
+already exist:
+
+```sh
+python3 scripts/bench_p2p_prefill.py --samples 3 --repeat 100 --output /tmp/qwen36-p2p-before.json
+python3 scripts/compare_p2p_placement.py --output /tmp/qwen36-p2p-replies-before.json
+```
+
+For example, a 12 GB RTX 3060 followed by a 10 GB RTX 3080, with a 131,072-token
+context and q8 KV cache, loaded with these settings on one system:
+
+```sh
+export Q36_P2P_HOST_EXPERT_BYTES_0=1342177280
+export Q36_P2P_HOST_EXPERT_BYTES=3489660928
+```
+
+Restart the engine with candidate values, verify its startup memory report,
+and measure again using a new output filename:
+
+```sh
+python3 scripts/bench_p2p_prefill.py --samples 3 --repeat 100 --output /tmp/qwen36-p2p-after.json
+python3 scripts/compare_p2p_placement.py --baseline /tmp/qwen36-p2p-replies-before.json --output /tmp/qwen36-p2p-replies-after.json
+```
+
+Compare the samples and the free VRAM after loading. The comparison script
+also checks that four deterministic replies, finish reasons, and token counts
+match. The rates include the complete short reply, not just the prefill kernels.
+The example values are not a general recommendation: a different model,
+context, device order, or background GPU process can require more host-backed
+memory. Restore the prior settings and restart if the candidate does not fit
+or is slower.
