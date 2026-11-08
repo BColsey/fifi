@@ -62,6 +62,8 @@ pub(super) trait ChunkDevice {
 }
 
 /// The chunk driver: a [`ChunkDevice`] and its [`TokenFeeds`] under the token driver's rules.
+/// `feed_rows` splits the prompt into device chunks of at most `chunk_cap` rows (1 = the token
+/// loop, the decode shape).
 pub(super) struct ChunkDriver<D: ChunkDevice, F: TokenFeeds> {
     device: D,
     feeds: F,
@@ -69,6 +71,8 @@ pub(super) struct ChunkDriver<D: ChunkDevice, F: TokenFeeds> {
     /// Tokens the state has consumed: the next position.
     pos: usize,
     poisoned: bool,
+    /// The most rows one device chunk runs; the caller sets it from the memory plan.
+    pub(super) chunk_cap: usize,
 }
 
 impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
@@ -85,6 +89,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             shape,
             pos: 0,
             poisoned: false,
+            chunk_cap: 1,
         })
     }
 
@@ -216,6 +221,19 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
 
     fn feed(&mut self, token: u32) -> Result<()> {
         self.run_chunk(&[token], false).map(|_| ())
+    }
+
+    /// The prefill path: the whole prompt chunk lands as device chunks of at most `chunk_cap`
+    /// rows, so the executor's `feed_rows` call is the chunked prefill entry.
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let cap = self.chunk_cap.max(1);
+        for chunk in tokens.chunks(cap) {
+            self.run_chunk(chunk, false).map(|_| ())?;
+        }
+        Ok(())
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {

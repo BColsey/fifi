@@ -130,3 +130,39 @@ fn the_shape_refuses_a_ple_layer_at_or_past_the_layers() {
     bad.ple_layer = bad.layers;
     assert!(ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), bad).is_err());
 }
+
+#[test]
+fn feed_rows_splits_the_prompt_into_chunks_of_the_cap() {
+    let mut driver = chunk_driver();
+    driver.chunk_cap = 3;
+    driver.feed_rows(&[1, 2, 3, 4, 5]).unwrap();
+    let params: Vec<_> = driver
+        .device()
+        .log
+        .iter()
+        .filter(|line| line.starts_with("chunk_params"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        params,
+        ["chunk_params 1 0 3", "chunk_params 4 3 2"].map(String::from)
+    );
+    assert_eq!(driver.fed(), 5);
+}
+
+#[test]
+fn feed_rows_with_the_default_cap_feeds_one_token_at_a_time() {
+    let mut driver = chunk_driver();
+    driver.feed_rows(&[1, 2]).unwrap();
+    let params: Vec<_> = driver
+        .device()
+        .log
+        .iter()
+        .filter(|line| line.starts_with("chunk_params"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        params,
+        ["chunk_params 1 0 1", "chunk_params 2 1 1"].map(String::from)
+    );
+}
