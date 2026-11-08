@@ -530,6 +530,8 @@ pub(super) struct ReplaceOnMissLru {
     /// produce the popularity profile of its own workload (the read side is
     /// `FIFI_FLASH_NEXT_EXPERT_STATS`). `None` when the env is unset.
     usage: Option<Vec<Vec<u64>>>,
+    /// Per-layer miss counts of the same dump: where the slot capacity actually binds.
+    miss_counts: Vec<u64>,
 }
 
 impl ReplaceOnMissLru {
@@ -590,10 +592,12 @@ impl ReplaceOnMissLru {
             .ok()
             .filter(|p| !p.is_empty())
             .map(|_| vec![vec![0u64; geometry.experts]; geometry.layers]);
+        let miss_counts = vec![0u64; geometry.layers];
         Ok(Self {
             geometry,
             layers,
             usage,
+            miss_counts,
         })
     }
 
@@ -617,7 +621,9 @@ impl ReplaceOnMissLru {
                 )
             })
             .collect();
-        let body = serde_json::json!({"schema": "fifi-usage/1", "layers": layers});
+        let usage_misses = self.miss_counts.clone();
+        let body =
+            serde_json::json!({"schema": "fifi-usage/1", "layers": layers, "misses": usage_misses});
         if let Err(e) = std::fs::write(&path, serde_json::to_vec(&body).unwrap_or_default()) {
             eprintln!("flash-next cuda: expert usage dump {path}: {e}");
         }
@@ -683,6 +689,7 @@ impl SlotPolicy for ReplaceOnMissLru {
             }
         }
         let plan = next.apply(&order, &demanded)?;
+        self.miss_counts[layer] += plan.moves.len() as u64;
         self.layers[layer] = next;
         Ok(plan)
     }
