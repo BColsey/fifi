@@ -664,8 +664,17 @@ mod device {
         /// layer's slot row as the chunk found it (all before the single host read of the
         /// picks), the resident passes of every row in flat grouped launches with the shared
         /// expert and the first combine over all rows, and then, one row at a time, that row's
-        /// bank copies and miss pass — the per-row timeline of `run`, so a later row's copies
-        /// cannot disturb an earlier row's second pass.
+        /// bank copies and miss pass.
+        ///
+        /// Ordering: the bank's copies run on the bank's own stream, unordered against this
+        /// stream, and their victim slots are chosen from row `r`'s picks alone — so they must
+        /// not start while ANY launch of this chunk is still reading the bank. Each row's
+        /// `step` is therefore preceded by a full drain of this stream (the flat pass, or the
+        /// previous row's miss pass), which serializes execution row by row. A pick that was a
+        /// chunk-initial hit but was evicted by an earlier row's step is re-admitted by this
+        /// row's step (one wasted copy); its contribution stays in the first pass, so the
+        /// chunked sums can associate differently than the one-row-at-a-time block — within the
+        /// two-pass tolerance, like a miss.
         pub(in crate::family::flash_next) fn run_rows(
             &mut self,
             launch: &Launch<'_>,
@@ -899,6 +908,11 @@ mod device {
                     )?;
                     continue;
                 }
+                // The copies overwrite victim slots this chunk's flat pass (or an earlier
+                // row's miss pass) may still be reading, and they run on the bank's own
+                // stream: drain this stream first. `step` itself returns once its copies
+                // are done, so execution is serialized row by row.
+                launch.stream.synchronize()?;
                 self.bank.step(ctx, layer, &picks[r].0)?;
                 let slot_row_after = self.bank.slot_row(layer)?.to_vec();
                 let second =

@@ -1307,6 +1307,10 @@ pub(super) mod device {
         /// step is refused. A `ctx` of another adapter than the one that built the bank fails in
         /// the first copy, after the host model has moved, so it poisons the bank too: pass the
         /// context of the build.
+        ///
+        /// The copies run on the bank's own stream, unordered against the caller's stream, so a
+        /// caller with reads of the banked bytes still pending on its own stream must drain it
+        /// before every `step` (`SplitMoe::run_rows` does; `run` relies on its caller's drains).
         pub(in crate::family::flash_next) fn step(
             &mut self,
             ctx: &CudaContext,
