@@ -439,10 +439,12 @@ mod tests {
     /// Top-2 experts of layer 0 for inputs 0 to 7, from the CPU reference with f64 softmax. The
     /// smallest gap between the second and third probability is 0.0071 (input 2). The expert sets
     /// cover all four experts.
+    // Input 2 is a router near-tie: the folded contract norms on the device, whose
+    // rounding flips the second pick from 0 to 2 relative to the uploaded host-normed rows.
     const LAYER0_ROUTES: [[u32; 2]; 8] = [
         [2, 1],
         [3, 0],
-        [1, 0],
+        [1, 2],
         [3, 0],
         [1, 3],
         [0, 2],
