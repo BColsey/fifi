@@ -48,3 +48,13 @@ a shard can use it.
   long and decode-after-prefill prompts with the same context and placement.
   Measure prefill and decode separately, record per-card free VRAM, and keep
   raw, reproducible baseline and candidate samples.
+
+## Initial sizing reference
+
+The existing single-device Qwen3.6 sizing test reports a 20.12 MiB arena and
+64 MiB attention-part charge for 128 rows using an 82-SM reference device.
+This excludes the P2P-specific staging and mailboxes and is not an admission
+result for either installed GPU. A two-card ring at the maximum f32 payload
+uses four payload slots per card: about 16 MiB plus headers per card. Measure
+or calculate each actual allocation on the 28-SM RTX 3060 and 68-SM RTX 3080
+before deciding whether a chunk fits their configured 128k sessions.
