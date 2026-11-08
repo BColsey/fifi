@@ -1,0 +1,64 @@
+{
+  "schema": "fifi.p2p-ring-safety-validation.v1",
+  "recorded_utc": "2026-11-08T19:44:36.618304+00:00",
+  "code_commit": "d6783adc78ce26d67da503d24001a5cc88e1eabd",
+  "source_sha256": {
+    "engine/src/kernels/cuda/native/peer_ring.cu": "79578cf2fade899b666a1e029f6901db0083b41618914127dee9c9eb74a06548",
+    "engine/src/kernels/cuda/native/peer_ring_policy.h": "c157d54a2296e6d846422845114874f522c525ec279672c78aad4fbcdc3d4c8c",
+    "engine/src/kernels/cuda/peer_ring.rs": "9f8d3a401f2a825a469a487b4743ccdb29f707211cf1c53211829faae7ea3699",
+    "scripts/tests/test_p2p_ring_policy.py": "107e688cccfba25458c4ecc5c94a8fe86b4727d76cf076a84216d0a9c928d9e7"
+  },
+  "host_devices": [
+    "0, NVIDIA GeForce RTX 2080 Ti, GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c",
+    "1, NVIDIA GeForce RTX 3080, GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a",
+    "2, NVIDIA GeForce RTX 3060, GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+  ],
+  "peer_atomic_topology": [
+    " \tGPU0\tGPU1\tGPU2\t",
+    " GPU0\tX\tNS\tNS\t",
+    " GPU1\tNS\tX\tNS\t",
+    " GPU2\tNS\tNS\tX\t",
+    "",
+    "Legend:",
+    "",
+    "  X    = Self",
+    "  OK   = Status Ok",
+    "  CNS  = Chipset not supported",
+    "  GNS  = GPU not supported",
+    "  TNS  = Topology not supported",
+    "  NS   = Not supported",
+    "  DR   = Disabled by regkey",
+    "  U    = Unknown"
+  ],
+  "checks": [
+    {
+      "command": "python3 -m unittest scripts.tests.test_p2p_ring_policy -v",
+      "result": "4 passed",
+      "output": [
+        "test_default_keeps_one_block_even_for_maximum_payload (scripts.tests.test_p2p_ring_policy.RingLaunchPolicyTests.test_default_keeps_one_block_even_for_maximum_payload) ... ok",
+        "test_only_exact_one_enables_the_feature (scripts.tests.test_p2p_ring_policy.RingLaunchPolicyTests.test_only_exact_one_enables_the_feature) ... ok",
+        "test_opt_in_caps_the_grid_at_64_blocks (scripts.tests.test_p2p_ring_policy.RingLaunchPolicyTests.test_opt_in_caps_the_grid_at_64_blocks) ... ok",
+        "test_opt_in_respects_the_single_block_boundary (scripts.tests.test_p2p_ring_policy.RingLaunchPolicyTests.test_opt_in_respects_the_single_block_boundary) ... ok",
+        "",
+        "----------------------------------------------------------------------",
+        "Ran 4 tests in 0.299s",
+        "",
+        "OK"
+      ]
+    },
+    {
+      "command": "nvcc -std=c++17 -arch=sm_86 -ccbin /usr/bin/g++-13 -I engine/src/kernels/cuda/native -Xcompiler -fPIC -c engine/src/kernels/cuda/native/peer_ring.cu",
+      "result": "passed",
+      "object_sha256": "be542171209ec7d1684128136edf2fbfa2c845ae75a26ff764a5827ea2b2f748"
+    },
+    {
+      "command": "ruff check and format --check; cargo fmt --all -- --check; python3 scripts/check_doc_links.py; git diff --check",
+      "result": "passed"
+    }
+  ],
+  "limits": [
+    "The newly added reused-slot device regression has not yet been run.",
+    "The standalone CUDA compilation is not a full engine build or GPU execution.",
+    "No controlled performance comparison has been run."
+  ]
+}
