@@ -1,0 +1,158 @@
+{
+  "schema": "fifi.p2p-ring-device-ab.v1",
+  "recorded_utc": "2026-11-08T21:11:52.234434+00:00",
+  "code_commit": "edc6a9f9a065c76ec7b4b817e158e45eee1bbc6f",
+  "test_binary_sha256": "21d90c30f1aa663eb8f3d608c03be5ad0e3031e5b229df803b55bdb887ed3ea3",
+  "engine_binary_sha256": "1697def3d3ad2a30d5ec9c3480dcf7d26c162981e6c4f99ada12bf7100784132",
+  "target": "x86_64 Linux, release native-cuda sm_86",
+  "devices": "RTX 3060 12 GB and RTX 3080 10 GB with patched P2P",
+  "tests": {
+    "0-a_wait_with_no_publisher_times_out_in_the_status_word.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.26s",
+      ""
+    ],
+    "0-chained_exchanges_keep_producer_and_consumer_order_without_host_syncs.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::chained_exchanges_keep_producer_and_consumer_order_without_host_syncs ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.29s",
+      ""
+    ],
+    "0-chunk_sized_exchange_sums_on_a_physical_pair.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair ... CUDA devices visible: 2",
+      "chunk_sized_exchange_sums_on_a_physical_pair: 256x2048 f32 (2.10 MB payload) exchange_sum: 0.00133037045*1e3 = 1.330 ms              per exchange; a 40-layer chunk pays 80 sums = 106.4 ms",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.42s",
+      ""
+    ],
+    "0-large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.25s",
+      ""
+    ],
+    "0-physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.45s",
+      ""
+    ],
+    "0-the_fp16_exchange_sums_within_half_precision_and_flags_overflow.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::the_fp16_exchange_sums_within_half_precision_and_flags_overflow ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.24s",
+      ""
+    ],
+    "0-two_contexts_exchange_a_sum_and_repeat_it.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::two_contexts_exchange_a_sum_and_repeat_it ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.28s",
+      ""
+    ],
+    "1-a_wait_with_no_publisher_times_out_in_the_status_word.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.31s",
+      ""
+    ],
+    "1-chained_exchanges_keep_producer_and_consumer_order_without_host_syncs.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::chained_exchanges_keep_producer_and_consumer_order_without_host_syncs ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.28s",
+      ""
+    ],
+    "1-chunk_sized_exchange_sums_on_a_physical_pair.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair ... CUDA devices visible: 2",
+      "chunk_sized_exchange_sums_on_a_physical_pair: 256x2048 f32 (2.10 MB payload) exchange_sum: 0.000510408575*1e3 = 0.510 ms              per exchange; a 40-layer chunk pays 80 sums = 40.8 ms",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.38s",
+      ""
+    ],
+    "1-large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.25s",
+      ""
+    ],
+    "1-physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.46s",
+      ""
+    ],
+    "1-the_fp16_exchange_sums_within_half_precision_and_flags_overflow.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::the_fp16_exchange_sums_within_half_precision_and_flags_overflow ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.25s",
+      ""
+    ],
+    "1-two_contexts_exchange_a_sum_and_repeat_it.log": [
+      "",
+      "running 1 test",
+      "test kernels::cuda::peer_ring::device_tests::two_contexts_exchange_a_sum_and_repeat_it ... CUDA devices visible: 2",
+      "ok",
+      "",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.29s",
+      ""
+    ]
+  },
+  "guard": {
+    "samples": 6,
+    "raw_file": "p2p-ring-device-guard.jsonl",
+    "raw_sha256": "e70268c4baeb9b963fb543a8653698b7d2716a303190ff3b9ed208dfec49afb0"
+  },
+  "microbenchmark": {
+    "payload": "256 x 2048 f32 values per peer exchange",
+    "repeats_per_arm": 40,
+    "flag_off_seconds_per_exchange": 0.00133037045,
+    "flag_on_seconds_per_exchange": 0.000510408575,
+    "speedup_ratio": 2.606481386015115,
+    "latency_reduction_percent": 61.63410161432854
+  },
+  "limits": [
+    "One 40-exchange average per arm, run sequentially off then on; no independent repeat or variance estimate.",
+    "Microbenchmark is not end-to-end model prefill or decode.",
+    "The large slot-reuse test synchronized after each round; large-payload timeout and long asynchronous reuse remain untested.",
+    "Guard sampled host/device activity; it does not establish complete host exclusivity."
+  ]
+}
