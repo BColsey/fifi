@@ -295,6 +295,27 @@
   "limitations": [
     "The long-prompt comparison has one sample per arm and uses the prior binary for the old placement.",
     "A full 131072-token end-to-end prompt was not run.",
-    "These results cover one host, one model, and one pair of placements."
-  ]
+    "These results cover one host, one model, and one pair of placements.",
+    "A later control loaded the same tuned placement without the admission option; the measured throughput gain cannot be attributed to the option itself."
+  ],
+  "follow_up_without_admission_option": {
+    "description": "A separate session subsequently loaded the same tuned host-mapping budgets without Q36_P2P_PREALLOCATED_KV. The loader source was unchanged from the base commit; its worktree had independent experimental changes to card_block.rs and card_step.rs.",
+    "base_commit": "7f9c3ee809297bcf0e8c7e6d5d54e33f17687e48",
+    "binary_sha256": "78ebccb36e0acc60b1103609637ae37d7f16819161b778b3420629d9242b6210",
+    "requested_host_expert_bytes_by_card": [
+      1342177280,
+      3489660928
+    ],
+    "mapped_expert_bytes_by_card": [
+      1358954496,
+      3548381184
+    ],
+    "free_bytes_by_card_after_load": [
+      1536753664,
+      1726611456
+    ],
+    "resident_kv_environment_variable": "absent",
+    "engine_state": "ready",
+    "interpretation": "The measured speedup is due to the expert placement. This control shows that this particular placement did not require the admission option on this host; no practical fit improvement from the option was measured."
+  }
 }

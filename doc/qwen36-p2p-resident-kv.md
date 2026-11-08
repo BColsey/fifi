@@ -43,3 +43,10 @@ elapsed time through a two-token reply. A single 4,274-token request took
 candidate; both returned the same answer. The longer comparison has one sample
 per arm. [Individual results, first-token telemetry, and test summaries](qwen36-p2p-resident-kv-results.json)
 record the hardware and limitations. A full 131,072-token prompt was not run.
+
+A later control loaded the same tuned host-mapping budgets on this host with
+the admission option unset, using a separate binary whose loader was unchanged
+from the prerequisite. It reported the same mapped bytes and free VRAM. The
+measured throughput gain is therefore attributable to the placement change;
+this measurement does not show that the admission option was required for that
+placement or that it enabled a tighter fit in practice.
