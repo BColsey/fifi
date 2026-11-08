@@ -807,6 +807,7 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
             weights,
             &row_bufs(bufs, dims, index)?,
             (&mapped, &one),
+            None,
         )?;
     }
     let route = &bufs.route;

@@ -655,7 +655,7 @@ impl LayerResolver<'_, '_> {
             None
         };
         let refill = copy.map_or(stream, |(copy, _)| copy);
-        for slot in misses {
+        for &slot in &misses {
             let expert = table.expert_of(slot);
             for (part, target) in parts.iter().enumerate() {
                 let record = store[part].member(expert);

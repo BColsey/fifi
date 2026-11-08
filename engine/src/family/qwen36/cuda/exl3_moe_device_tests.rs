@@ -294,7 +294,7 @@ fn run_block_rounded(
     let stream = ctx.stream()?;
     // The overlap fact travels with the resolver (the arming of `enable_overlap`), so the
     // harness cannot desync from the production read of the split.
-    let overlap = bank.is_some_and(|bank| bank.overlap_armed());
+    let overlap = bank.as_ref().is_some_and(|bank| bank.overlap_armed());
     run_exl3_moe(
         &Launch {
             ctx,

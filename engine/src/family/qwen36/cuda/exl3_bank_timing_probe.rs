@@ -85,7 +85,7 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
                 .unwrap_or_else(|_| panic!("FIFI_EXL3_STICKY is not a number: {v:?}"))
         })
         .unwrap_or(0);
-    let bank =
+    let mut bank =
         RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, sticky).expect("resolver"));
     // FIFI_EXL3_OVERLAP=1 arms the copy-stream refills of Q36_CUDA_BANK_OVERLAP's device
     // path, for the A/B the probe exists to make (the wall clock is the measurement; the

@@ -115,7 +115,7 @@ fn banked_leg(
     let blocks = (0..table.len())
         .map(|layer| Exl3MoeWeights::resolve_banked(&weights, &table, layer, &moe, slots))
         .collect::<Result<Vec<_>, _>>()?;
-    let bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, 0)?);
+    let mut bank = RefCell::new(Exl3SlotResolver::new(store, &blocks, experts, 0)?);
     if overlap {
         bank.get_mut().enable_overlap(context)?;
     }
