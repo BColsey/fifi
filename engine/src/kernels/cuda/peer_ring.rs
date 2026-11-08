@@ -604,6 +604,58 @@ mod device_tests {
     }
 
     #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn odd_capacity_exchanges_on_physical_peers() {
+        const NAME: &str = "odd_capacity_exchanges_on_physical_peers";
+        const N: usize = 2049;
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, N).expect("odd-capacity ring");
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &vec![1.5; N]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &vec![-0.25; N]).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(N * 4).expect("out 0"),
+            contexts[1].allocate(N * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        // Three rounds exercise both parity slots and reuse the first slot.
+        for mode in [RingMode::F16, RingMode::F32, RingMode::F32] {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                mode,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                assert_eq!(status_of(&statuses[index], stream).expect("status"), 0);
+                assert_eq!(
+                    download_f32(&outs[index], stream, N).expect("sum"),
+                    vec![1.25; N]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_reset_ring_exchanges_again_from_sequence_one() {
         if !device_present("a_reset_ring_exchanges_again_from_sequence_one") {
             return;
