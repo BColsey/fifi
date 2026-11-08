@@ -85,3 +85,23 @@ affected pieces (card_step.rs:145-150, placement.rs:395-415 budget notes).
   combined json, dmon csv, engine logs).
 - The full-128k characterization (first ever on this rig) is recorded in
   `qwen36-local/night-opt/full128k-result.json`.
+
+## Second session addendum (same night)
+
+- `Q36_P2P_WATERFILL=1` now serves end to end after two planner grain
+  fixes (9267ca0: native-matvec rows in %4 blocks; 10b8e52: value heads in
+  whole key-head groups - the GDN kernel's `n_v_heads % n_k_heads == 0`
+  pairing rule, caught by serving the real model, where 12+20 heads
+  refused the first token). At Q4_K all heavy dims are geometry-pinned, so
+  the flag tilts only vocabulary: 40.34 vs 39.38 tok/s, noise. Deployment
+  stays on the even split; the flag is verified for quants whose experts
+  are expressible (Q8_0).
+- Robustness: the engine service now self-heals (systemd drop-in
+  `Restart=on-failure`, 15 s, 3 per 10 min) because the P2P failure model
+  poisons sessions irrevocably by design. Verified live: kill -9 ->
+  restarted in 15 s -> ready in ~135 s -> correct answer.
+- The per-attention-layer gather gate (10 host syncs/token) is
+  load-bearing: its doc pins "refusal BEFORE the append queues, so a dead
+  gather cannot write a stale row into the replicated cache". The correct
+  removal is device-side status guards in the native append kernel - the
+  mechanism multi.rs:74-76 already names as the future non-fatal path.
