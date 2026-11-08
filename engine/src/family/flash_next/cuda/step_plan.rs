@@ -323,8 +323,8 @@ fn exl3_scratch(geometry: &FlashGeometry, rows: usize) -> Result<(usize, usize),
         (rows, qsa.q_width(), h),
         // the grouped k and v input projections of the QSA mixer: both read the same k and share
         // kv_width, the one mixer pair the grouped launch's single-width contract allows (the
-        // tuple counts members as rows, the z spans the member sum)
-        (2 * rows, h, 2 * qsa.kv_width()),
+        // tuple counts members as rows, so z covers both members' outputs)
+        (2 * rows, h, qsa.kv_width()),
         // PLE: key and value projections of the n-gram row
         (rows, geometry.ple_embed, geometry.width()),
         (rows, geometry.ple_embed, h),

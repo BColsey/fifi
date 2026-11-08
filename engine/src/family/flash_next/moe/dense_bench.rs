@@ -12,6 +12,9 @@
 //!   Flash-Next decode opts into;
 //! - `wide1_r56_dp4a`: `wide1_r56` with the DP4A decode of book 2.
 //!
+//! Group rows (named by `FIFI_FLASH_NEXT_DENSE_CASES` beside the cases) run a group's members
+//! member-wise against the grouped launch on the wide bodies above; the identity is grouped vs
+//! member-wise bytes, not vs the legacy kernel, and the gather kernel is not exercised.
 //! Each case reads its matrix from the pack once and uploads it in as many copies as make a pool of
 //! up to 96 MiB (2 copies at least, 48 at most; the head is 2), so a call never finds its weights
 //! in the 6 MB L2 for the shapes of the table. A trial
@@ -509,6 +512,11 @@ impl<'a> GroupRig<'a> {
             .read_at(&self.stream, 0, &mut bytes[..n_total * F32])?;
         self.flag
             .read_at(&self.stream, 0, &mut bytes[n_total * F32..])?;
+        if bytes[n_total * F32..] != [0; 4] {
+            return Err(fail(
+                "the grouped run: the arithmetic flag is set".to_string(),
+            ));
+        }
         Ok(bytes)
     }
 
@@ -595,7 +603,7 @@ fn run() -> Res<()> {
         return Ok(());
     }
     Err(fail(format!(
-        "a path wrote other bytes than the legacy kernel in: {mismatched:?}"
+        "a path wrote other bytes than its reference run in: {mismatched:?}"
     )))
 }
 
@@ -658,7 +666,7 @@ fn measure_group(
     // with DP4A); the grouped launch must write the member-wise bytes on each of them.
     for index in [2, 3, 4] {
         select(rig.ctx, index);
-        for &copy in &[0, last.min(1)] {
+        for &copy in &[0, last] {
             let (name, want) = (PATHS[index].0, rig.written(copy, false)?);
             if rig.written(copy, true)? != want {
                 ok = false;

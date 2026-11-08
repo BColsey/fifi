@@ -878,6 +878,12 @@ fn single_row_kernel_receipt_run() {
                 "step {step}: {wide} wide launches, step 0 ran {first}"
             );
         }
+        // Ungrouped k and v would add 12 launches and still be constant: pin the count. 253 =
+        // 145 singles (36x3 GDN + 12x3 QSA + lm_head) + 12 QSA grouped + 96 shared expert.
+        assert_eq!(
+            wide, 253,
+            "step {step}: {wide} wide launches, the receipt config runs 253"
+        );
         step_wide.push(wide);
         before = after;
         assert!(
