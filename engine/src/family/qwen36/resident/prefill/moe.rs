@@ -788,8 +788,13 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
+            // The decode seam folds the input norm; the device chunk keeps the raw contract.
+            let one_normed = ctx
+                .kernels
+                .rms_norm(&one, &w.layers[0].post_norm, shape.eps)
+                .unwrap();
             let device =
-                chunk_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+                chunk_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one_normed).unwrap();
             let decode = decode_step_device(
                 &mut ctx,
                 &shape,
