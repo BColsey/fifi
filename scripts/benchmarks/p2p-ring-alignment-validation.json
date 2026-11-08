@@ -1,0 +1,37 @@
+{
+  "schema": "fifi.p2p-ring-alignment-validation.v1",
+  "recorded_utc": "2026-11-08T20:12:33.541504+00:00",
+  "code_commit": "d6b2586fe91d96de6de455b75c8ef84be62b2fd0",
+  "source_sha256": "0ade5d45fe34d3a9d27dc10bc506e229a49710682ce5e69ef7156401ff514887",
+  "test_binary_sha256": "21d90c30f1aa663eb8f3d608c03be5ad0e3031e5b229df803b55bdb887ed3ea3",
+  "engine_binary_sha256": "1697def3d3ad2a30d5ec9c3480dcf7d26c162981e6c4f99ada12bf7100784132",
+  "checks": [
+    {
+      "test": "layout_odd",
+      "output": [
+        "",
+        "running 1 test",
+        "test kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "test": "layout_even",
+      "output": [
+        "",
+        "running 1 test",
+        "test kernels::cuda::peer_ring::tests::the_layout_tiles_slots_by_source_then_parity ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5792 filtered out; finished in 0.00s",
+        ""
+      ]
+    }
+  ],
+  "build": "release, native-cuda, sm_86; lib test executable and enginesrv built successfully",
+  "limits": [
+    "Device tests of the corrected alignment have not yet run.",
+    "No speedup is established."
+  ]
+}
