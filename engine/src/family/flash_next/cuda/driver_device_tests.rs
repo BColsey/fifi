@@ -1,22 +1,42 @@
-//! The token driver on the real pack, on a card: the first Flash-Next token through the same
-//! assembly the engine start uses (`start::build_driver`), against the exllamav3 oracle.
+//! The token driver on the real pack, on a card: the assembly the engine start uses
+//! (`start::build_driver`), against the exllamav3 oracle. Three ignored device tests, each with its
+//! own environment. Every test needs a GPU (about 21 GiB), about 25 GiB of pinned host memory and
+//! `--test-threads=1`.
 //!
-//! Environment:
+//! `the_first_real_tokens_match_the_oracle`: one free greedy run on one oracle prompt.
 //! - `FIFI_FLASH_NEXT_EXL3_PACK`: the full local pack directory (required).
-//! - `FIFI_FLASH_NEXT_DRIVER_ORACLE`: the oracle run JSON; `FIFI_FLASH_NEXT_DRIVER_PROMPT`
-//!   names the prompt in it (default `chat-short`). The prompt ids are the oracle's.
+//! - `FIFI_FLASH_NEXT_DRIVER_ORACLE`: the oracle run JSON (required).
+//! - `FIFI_FLASH_NEXT_DRIVER_PROMPT`: the prompt id in it (default `chat-short`); its ids are the
+//!   oracle's.
 //! - `FIFI_FLASH_NEXT_DRIVER_STEPS`: greedy tokens to draw (default 16).
 //! - `FIFI_FLASH_NEXT_DRIVER_CONTEXT`: positions of the caches (default 512, a multiple of 4).
 //! - `FIFI_FLASH_NEXT_DRIVER_SLOTS`: expert slots per layer (default: the load plan's).
-//! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for the run record (`engine.json`, step 0 logits).
+//! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for `engine.json` (one run record) and
+//!   `step0.logits.f32` (the first row); optional.
+//! Reported: the generated ids against the oracle's, the stage table, and the step-0 relative L2,
+//! largest difference, argmax and top-20 overlap against the oracle's full row.
 //!
-//! The prompt is fed one token at a time (all but the last), then the driver draws `STEPS` greedy
-//! tokens inside the tokenizer's vocabulary. Reported: the generated ids against the oracle's,
-//! the top-1 agreement per step, the top-20 overlap of step 0, and the relative L2 and the largest
-//! difference of the step-0 row against the oracle's full row. Nothing here asserts a speed.
+//! `teacher_forced_steps_follow_the_oracle_on_every_prompt`: every oracle prompt, fed the oracle's
+//! tokens, in one process.
+//! - `FIFI_FLASH_NEXT_EXL3_PACK`, `_DRIVER_ORACLE`, `_DRIVER_CONTEXT` (default: the largest prompt
+//!   plus its steps plus 8, rounded up to 4) and `_DRIVER_SLOTS` as above.
+//! - `FIFI_FLASH_NEXT_DRIVER_PROMPTS`: a comma-separated list of prompt ids (default: all).
+//! - `FIFI_FLASH_NEXT_DRIVER_BUDGET_SEC`: wall seconds after which a prompt that would not finish
+//!   is skipped and named (default 700).
+//! - `FIFI_FLASH_NEXT_DRIVER_OUT`: a directory for `follow.json` (summaries), `engine-follow.json`
+//!   (the run in the oracle's schema) and `engine-follow.parts/<id>.logits.npy` (the first full
+//!   rows of each prompt); rewritten after every prompt. Optional.
 //!
-//! Needs a GPU (about 21 GiB), about 25 GiB of pinned host memory, `--test-threads=1`; ignored by
-//! default.
+//! `single_row_kernel_receipt_run`: one greedy run with a logits hash per step, for one process
+//! configuration of the EXL3 kernel switches.
+//! - `FIFI_FLASH_NEXT_EXL3_PACK`, `_DRIVER_ORACLE`, `_DRIVER_PROMPT` (default `chat-short`),
+//!   `_DRIVER_CONTEXT` (default 512) and `_DRIVER_SLOTS` as above.
+//! - `FIFI_FLASH_NEXT_DRIVER_STEPS`: steps (default 64).
+//! - `FIFI_FLASH_NEXT_DRIVER_CONFIG` (a label) and `FIFI_FLASH_NEXT_DRIVER_ROUND` (default `1`):
+//!   name the record. Both are file-name parts: letters, digits, `.`, `_` and `-` only.
+//! - `FIFI_FLASH_NEXT_DRIVER_OUT`: the directory of `ab-<config>-r<round>.json` (required).
+//! - It also reports `FIFI_EXL3_SINGLE_GATHER`, `FIFI_EXL3_DP4A` and `FIFI_EXL3_INDEXED_PAIRS`.
+//! Nothing here asserts a speed.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +56,20 @@ use crate::{
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// A file-name part from the oracle file or the environment: letters, digits, `.`, `_` and `-`
+/// only, no `..`, so a name cannot leave the output directory.
+fn safe_name(what: &str, value: &str) -> String {
+    assert!(
+        !value.is_empty()
+            && !value.contains("..")
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+        "{what} {value:?} is not a plain file-name part ([A-Za-z0-9._-])"
+    );
+    value.to_string()
 }
 
 /// The `[rows, width]` float32 rows of a `.npy` file (version 1 or 2, C order).
@@ -436,6 +470,10 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         })
         .collect();
     records.sort_by_key(|p| p["prompt_len"].as_u64().expect("prompt_len"));
+    // Every id becomes a file name: refuse a bad one now, not after the load and the first prompts.
+    for record in &records {
+        safe_name("prompt id", record["id"].as_str().expect("id"));
+    }
     let need = records
         .iter()
         .map(|p| p["prompt_len"].as_u64().unwrap() + p["steps"].as_array().unwrap().len() as u64)
@@ -476,7 +514,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
     let (mut all_kl20, mut all_klfull) = (Vec::new(), Vec::new());
     let dir = oracle_path.parent().expect("dir");
     for record in records {
-        let id = record["id"].as_str().expect("id").to_string();
+        let id = safe_name("prompt id", record["id"].as_str().expect("id"));
         let ids = |key: &str| -> Vec<u32> {
             record[key]
                 .as_array()
@@ -488,6 +526,21 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         let (prompt, generated) = (ids("prompt_ids"), ids("generated"));
         let oracle_steps = record["steps"].as_array().expect("steps");
         let count = oracle_steps.len();
+        if count == 0 {
+            println!("skipped {id}: the oracle has no steps for it");
+            summaries.push(serde_json::json!({"id": id, "skipped": true, "estimate_sec": 0}));
+            if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
+                write_follow_reports(
+                    &PathBuf::from(out),
+                    context,
+                    &summaries,
+                    &engine_prompts,
+                    (all_steps, all_agree, &all_kl20, &all_klfull),
+                    false,
+                );
+            }
+            continue;
+        }
         let estimate = (prompt.len() as f64 * feed_ms + count as f64 * step_ms) * 1.25 / 1e3;
         if opened.elapsed().as_secs_f64() + estimate > budget {
             println!(
@@ -495,11 +548,27 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
             );
             summaries
                 .push(serde_json::json!({"id": id, "skipped": true, "estimate_sec": estimate}));
+            if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
+                write_follow_reports(
+                    &PathBuf::from(out),
+                    context,
+                    &summaries,
+                    &engine_prompts,
+                    (all_steps, all_agree, &all_kl20, &all_klfull),
+                    false,
+                );
+            }
             continue;
         }
         let rows = read_npy(&dir.join(record["full_logits"]["file"].as_str().expect("file")));
         let width = record["full_logits"]["width"].as_u64().expect("width") as usize;
-        let full_steps = record["full_logits"]["steps"].as_u64().expect("steps") as usize;
+        let stored_steps = record["full_logits"]["steps"].as_u64().expect("steps") as usize;
+        let full_steps = stored_steps.min(count);
+        assert!(
+            rows.len() >= full_steps * width && width >= actual_vocab,
+            "{id}: the stored full rows ({} values) do not hold {full_steps} rows of {width}",
+            rows.len()
+        );
         driver.reset().expect("reset");
         let began = std::time::Instant::now();
         let (last, head) = prompt.split_last().expect("a prompt");
@@ -516,8 +585,14 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
             let row = driver
                 .logits(input)
                 .unwrap_or_else(|e| panic!("{id} step {i}: {e:?}"));
+            assert_eq!(row.len(), width, "{id} step {i}: the logits row width");
             let ours = &row[..actual_vocab];
-            let order = top(ours, 2);
+            assert!(
+                ours.iter().all(|v| v.is_finite()),
+                "{id} step {i}: non-finite logits"
+            );
+            let ours_top = top(ours, 20);
+            let order = &ours_top[..2];
             let oracle = &oracle_steps[i];
             let oracle_top = oracle["top"].as_array().expect("top");
             let oracle_ids: Vec<usize> = oracle_top
@@ -529,7 +604,6 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
                 .map(|t| t[1].as_f64().expect("logit"))
                 .collect();
             let our_at_oracle: Vec<f64> = oracle_ids.iter().map(|&t| f64::from(ours[t])).collect();
-            let ours_top = top(ours, 20);
             let our_top20: Vec<usize> = ours_top.iter().map(|t| t.0).collect();
             engine_steps.push(serde_json::json!({
                 "i": i, "token": generated[i], "argmax": order[0].0,
@@ -621,6 +695,16 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
             "kl_full_max": klf_max, "top20_overlap_mean": overlap, "disagreements": flips,
             "prompt_ms_per_token": feed_ms, "step_ms_per_token": step_ms,
         }));
+        if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
+            write_follow_reports(
+                &PathBuf::from(out),
+                context,
+                &summaries,
+                &engine_prompts,
+                (all_steps, all_agree, &all_kl20, &all_klfull),
+                false,
+            );
+        }
     }
     let (m20, x20) = mean_max(&all_kl20);
     let (mf, xf) = mean_max(&all_klfull);
@@ -633,29 +717,57 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         opened.elapsed().as_secs_f64()
     );
     if let Some(out) = var("FIFI_FLASH_NEXT_DRIVER_OUT") {
-        let out = PathBuf::from(out);
-        std::fs::create_dir_all(&out).expect("out dir");
-        std::fs::write(
-            out.join("follow.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "mode": "teacher-forced", "context": context, "prompts": summaries,
-                "all": {"steps": all_steps, "top1_agree": all_agree, "kl_top20_mean": m20,
-                        "kl_top20_max": x20, "kl_full_mean": mf, "kl_full_max": xf},
-            }))
-            .expect("json"),
-        )
-        .expect("write follow.json");
-        std::fs::write(
-            out.join("engine-follow.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schema": "fifi-flash-next-oracle/1", "role": "engine",
-                "complete": engine_prompts.len() == oracle["prompts"].as_array().unwrap().len(),
-                "prompts": engine_prompts,
-            }))
-            .expect("json"),
-        )
-        .expect("write engine-follow.json");
+        write_follow_reports(
+            &PathBuf::from(out),
+            context,
+            &summaries,
+            &engine_prompts,
+            (all_steps, all_agree, &all_kl20, &all_klfull),
+            engine_prompts.len() == oracle["prompts"].as_array().unwrap().len(),
+        );
     }
+}
+
+/// Writes `bytes` to `path` through a temporary name in the same directory and a rename, so a kill
+/// during the write leaves the previous file whole.
+fn write_atomic(path: &Path, bytes: &[u8]) {
+    let name = path.file_name().expect("a file name").to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.tmp"));
+    std::fs::write(&temp, bytes).unwrap_or_else(|e| panic!("{}: {e}", temp.display()));
+    std::fs::rename(&temp, path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+/// Writes `follow.json` (the summaries) and `engine-follow.json` (the run in the oracle's schema).
+/// Called after every prompt, so a run that dies keeps what it finished; `complete` is false until
+/// the last prompt.
+fn write_follow_reports(
+    out: &Path,
+    context: u32,
+    summaries: &[serde_json::Value],
+    engine_prompts: &[serde_json::Value],
+    (steps, agree, kl20, klfull): (usize, usize, &[f64], &[f64]),
+    complete: bool,
+) {
+    let (m20, x20) = mean_max(kl20);
+    let (mf, xf) = mean_max(klfull);
+    std::fs::create_dir_all(out).expect("out dir");
+    write_atomic(
+        &out.join("follow.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "mode": "teacher-forced", "context": context, "prompts": summaries,
+            "all": {"steps": steps, "top1_agree": agree, "kl_top20_mean": m20,
+                    "kl_top20_max": x20, "kl_full_mean": mf, "kl_full_max": xf},
+        }))
+        .expect("json"),
+    );
+    write_atomic(
+        &out.join("engine-follow.json"),
+        &serde_json::to_vec(&serde_json::json!({
+            "schema": "fifi-flash-next-oracle/1", "role": "engine",
+            "complete": complete, "prompts": engine_prompts,
+        }))
+        .expect("json"),
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -682,8 +794,14 @@ fn single_row_kernel_receipt_run() {
     let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
     let oracle_path =
         PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
-    let config = var("FIFI_FLASH_NEXT_DRIVER_CONFIG").expect("FIFI_FLASH_NEXT_DRIVER_CONFIG");
-    let round = var("FIFI_FLASH_NEXT_DRIVER_ROUND").unwrap_or_else(|| "1".into());
+    let config = safe_name(
+        "config",
+        &var("FIFI_FLASH_NEXT_DRIVER_CONFIG").expect("FIFI_FLASH_NEXT_DRIVER_CONFIG"),
+    );
+    let round = safe_name(
+        "round",
+        &var("FIFI_FLASH_NEXT_DRIVER_ROUND").unwrap_or_else(|| "1".into()),
+    );
     let out = PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_OUT").expect("FIFI_FLASH_NEXT_DRIVER_OUT"));
     let steps: usize =
         var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(64, |v| v.parse().expect("steps"));
@@ -740,6 +858,10 @@ fn single_row_kernel_receipt_run() {
             .logits(input)
             .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
         let wall = began.elapsed();
+        assert!(
+            row[..actual_vocab].iter().all(|v| v.is_finite()),
+            "step {step}: non-finite logits"
+        );
         let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         let hash = format!("{:x}", Sha256::digest(&bytes));
         let pick = argmax(&row[..actual_vocab]);
