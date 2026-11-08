@@ -519,6 +519,12 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle models the mixer over pre-normed rows; the chunk seam keeps the raw input
+        // and lets the caller norm, so bridge the folded contract here.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, warm, &x).unwrap();
         let total = warm as usize + count as usize;
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
@@ -642,6 +648,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -769,6 +780,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -793,6 +809,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 4, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 4, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -1233,6 +1254,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The decode steps norm inside (the folded contract); the chunk keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let control = chunk(&mut ctx, &shape, rw, f32_cache, warm, &x).unwrap();
         let control = values(&mut kernels, &control.out).unwrap();
         let gap = |a: &[f32], b: &[f32]| {
