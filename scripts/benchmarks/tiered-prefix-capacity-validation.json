@@ -1,0 +1,29 @@
+{
+  "schema": "fifi.tiered-prefix-capacity-validation.v1",
+  "recorded_utc": "2026-11-08T20:18:40.300178+00:00",
+  "mr_code_commit": "ede5dc6dad93d2a8b5d80db5ef18e4ed811c5904",
+  "combined_code_commit": "14259decbd5f874d0cb7ac470ea55104768ce0fb",
+  "shared_executor_sha256": "ab2a6df9fdbfa03c37a243aae51518f33473ad488abb0a98f40712ce4df50612",
+  "test_binary_sha256": "f1ae92417a124bfe02cf14d71253ad3bb78833bb277fe6b7258050a15e8facac",
+  "checks": [
+    {
+      "test": "tiered_opt_in_exposes_configured_slots_to_the_save_scheduler",
+      "output": [
+        "",
+        "running 1 test",
+        "test family::qwen36::cuda::executor::tiered_prefix_tests::tiered_opt_in_exposes_configured_slots_to_the_save_scheduler ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5790 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "test": "the_tiered_prefix_flag_is_exactly_one",
+      "result": "1 passed"
+    }
+  ],
+  "limits": [
+    "These CPU tests ran in a combined branch, not the standalone MR test binary; the modified executor file hashes match.",
+    "The corrected feature has not yet been validated on a physical GPU."
+  ]
+}
