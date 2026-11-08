@@ -232,8 +232,14 @@ impl ExecutorOps for QwenResidentStep<'_> {
 
     /// Pinned CUDA stages Block and Tip entries; the admitted limits determine how many entries
     /// remain. The caller supplies `kind`, and the session rules validate the save point.
+    ///
+    /// Tiered mode saves only under `Q36_TIERED_PREFIX=1`: the exported state is the
+    /// step's KV planes and position (banks are weights and never part of a save), so
+    /// nothing structurally blocks a tiered save — but the combination was never
+    /// qualified, so the flag ships it dark exactly like every other new path.
     fn save_prefix(&mut self, st: &DecodeSession, key: &[u32], kind: SaveKind) -> Result<bool> {
-        if self.is_tiered() || self.prefix.limits().entries == 0 {
+        let flag = tiered_prefix_enabled(std::env::var_os(TIERED_PREFIX_VAR).as_deref());
+        if (self.is_tiered() && !flag) || self.prefix.limits().entries == 0 {
             return Ok(false);
         }
         if self.pinned_prefix_enabled() {
@@ -327,5 +333,29 @@ impl QwenResidentStep<'_> {
             "q36 cuda: prefix {what} {positions} positions, {charge}, {:.1} ms",
             began.elapsed().as_secs_f64() * 1000.0
         );
+    }
+}
+
+/// Whether tiered sessions may save and restore prefixes (`Q36_TIERED_PREFIX=1`). The
+/// default stays off: tiered prefix reuse was gated out of the original executor and
+/// re-enabling it is new behaviour pending device qualification.
+const TIERED_PREFIX_VAR: &str = "Q36_TIERED_PREFIX";
+fn tiered_prefix_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+mod tiered_prefix_tests {
+    use super::{TIERED_PREFIX_VAR, tiered_prefix_enabled};
+    use std::ffi::OsStr;
+
+    /// Exactly `1` enables; anything else (including unset) keeps the gate closed.
+    #[test]
+    fn the_tiered_prefix_flag_is_exactly_one() {
+        assert_eq!(TIERED_PREFIX_VAR, "Q36_TIERED_PREFIX");
+        assert!(tiered_prefix_enabled(Some(OsStr::new("1"))));
+        assert!(!tiered_prefix_enabled(Some(OsStr::new("0"))));
+        assert!(!tiered_prefix_enabled(Some(OsStr::new("yes"))));
+        assert!(!tiered_prefix_enabled(None));
     }
 }
