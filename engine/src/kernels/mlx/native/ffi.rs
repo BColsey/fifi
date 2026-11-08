@@ -836,6 +836,7 @@ unsafe extern "C" {
         dims: *const i32,
         quant: *const i32,
         activation: mlx_dtype,
+        owner: usize,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;

@@ -20,6 +20,8 @@
 
 #ifdef INFERENCE_NATIVE_FAULT_QUALIFICATION
 #include <atomic>
+#include <map>
+#include <mutex>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -2610,7 +2612,7 @@ static int compile_moe_lhs_index(int batch) noexcept {
 // `top_k` experts. `rows` matches the clamped ids shape ([k] at B=1, [B,k] above) with the row
 // id broadcast along the experts; `flat` enumerates the B*k gathered rows in the same shape.
 // Both are evaluated, so the traced closures bind them as constants instead of replaying their
-// producers as kernels. The values equal exactly what mlx_gather_qmm derives internally when
+// producers as kernels. Called only on a cache miss of the pair below. The values equal exactly what mlx_gather_qmm derives internally when
 // the lhs slot is null, so the gathers read the same indices as before.
 static int compile_moe_lhs_build(
     mlx_array* rows, mlx_array* flat, int batch, int top_k, mlx_stream s) noexcept {
@@ -2650,6 +2652,51 @@ static int compile_moe_lhs_build(
     *flat = mlx_array{nullptr};
   }
   return status;
+}
+
+// The persistent GatherQMM row-index operands, cached per (stream, batch slot, expert
+// width): their values depend only on (batch, top_k), never on the step, so building them
+// per block call (the original form) evaluated two fresh aranges on every moe block call -
+// 120 per decode step - and each mlx_array_eval is a stream synchronization point, ~1 ms per
+// call. Entries are immutable once built and never freed: a compiled tape may still hold the
+// pair it was traced with, and freeing a cache entry out from under another thread's tape
+// corrupted later evaluations in the full test suite. The map therefore only grows - one
+// entry per (adapter stream, batch, top_k), which is four entries for a serving adapter.
+static std::mutex compile_moe_lhs_mutex_;
+static std::map<std::tuple<uintptr_t, int, int>, std::pair<mlx_array, mlx_array>>
+    compile_moe_lhs_cache_;
+
+// Returns retained (rows, flat) operands for `batch` rows over `top_k` experts, building the
+// pair on first use for this (stream, batch, top_k). Returns non-zero on error.
+static int compile_moe_lhs_load(
+    mlx_array* rows, mlx_array* flat, uintptr_t owner, int batch, int top_k,
+    mlx_stream s) noexcept {
+  // Keyed by (owner, batch slot, top_k): the adapter owner is stable for the adapter's
+  // lifetime and its stream is stable too, so an entry is always read back on the stream it
+  // was built and evaluated on. Entries are never freed - a compiled tape may hold the pair it
+  // was traced with - and a retired adapter's entries are never read again.
+  const int slot = compile_moe_lhs_index(batch);
+  const std::tuple<uintptr_t, int, int> key(owner, slot, top_k);
+  std::lock_guard<std::mutex> lock(compile_moe_lhs_mutex_);
+  const auto found = compile_moe_lhs_cache_.find(key);
+  if (found != compile_moe_lhs_cache_.end()) {
+    const int kept_rows = mlx_array_set(rows, found->second.first);
+    if (kept_rows != 0) return kept_rows;
+    return mlx_array_set(flat, found->second.second);
+  }
+  mlx_array built_rows = mlx_array_new();
+  mlx_array built_flat = mlx_array_new();
+  const int built = compile_moe_lhs_build(&built_rows, &built_flat, batch, top_k, s);
+  if (built != 0) return built;
+  const int kept_rows = mlx_array_set(rows, built_rows);
+  const int kept_flat = kept_rows == 0 ? mlx_array_set(flat, built_flat) : 1;
+  if (kept_rows != 0 || kept_flat != 0) {
+    mlx_array_free(built_rows);
+    mlx_array_free(built_flat);
+    return kept_rows != 0 ? kept_rows : kept_flat;
+  }
+  compile_moe_lhs_cache_.emplace(key, std::make_pair(built_rows, built_flat));
+  return 0;
 }
 
 // Vectorized B>1 MoE. The single-row body below stays on its original op sequence.
@@ -3640,8 +3687,8 @@ extern "C" int inference_mlx_compile_delta_rows(
 // build strike `out` (the first output), like the `y` of `inference_mlx_gated_delta`.
 extern "C" int inference_mlx_compile_moe_block(
     mlx_array* out, mlx_array* ids, mlx_array* gates, mlx_array* health, const mlx_array* inputs,
-    size_t inputs_num, const int* dims, const int* quant, mlx_dtype activation, uintptr_t fun_id,
-    mlx_stream stream) noexcept {
+    size_t inputs_num, const int* dims, const int* quant, mlx_dtype activation, uintptr_t owner,
+    uintptr_t fun_id, mlx_stream stream) noexcept {
   return run_selected_operation(out, stream, [&]() noexcept {
     if (inputs_num != 21) {
       return 1;
@@ -3672,8 +3719,9 @@ extern "C" int inference_mlx_compile_moe_block(
     }
     int lhs_status = 0;
     for (int i = 0; i < 4 && lhs_status == 0; ++i) {
-      lhs_status = compile_moe_lhs_build(
-          &payload->rows_lhs[i], &payload->flat_lhs[i], 1 << i, payload->top_k, payload->stream);
+      lhs_status = compile_moe_lhs_load(
+          &payload->rows_lhs[i], &payload->flat_lhs[i], owner, 1 << i, payload->top_k,
+          payload->stream);
     }
     if (lhs_status != 0) {
       compile_moe_payload_free(payload);

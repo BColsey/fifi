@@ -909,6 +909,7 @@ impl Context {
                 dims.as_ptr(),
                 quant.as_ptr(),
                 native_dtype(args.act),
+                adapter.owner.0.get() as usize,
                 fun_id as usize,
                 stream,
             )
