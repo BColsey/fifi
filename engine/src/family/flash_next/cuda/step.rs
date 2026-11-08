@@ -324,7 +324,9 @@ impl<'a> FlashStep<'a> {
         );
         let mut xh_at = xh.offset();
         let mut z_at = z.offset();
-        let mut calls = Vec::with_capacity(parts.len());
+        // The views and their io outlive the calls that borrow them: collect the members first,
+        // then build the calls in a second pass.
+        let mut members = Vec::with_capacity(parts.len());
         for (prefix, col, n) in parts {
             let view = self.exl3(prefix)?.view()?;
             let [k, wide] = view.shape;
@@ -333,18 +335,25 @@ impl<'a> FlashStep<'a> {
                     "{prefix} is {wide} wide, the mixer row expects {n}"
                 )));
             }
-            calls.push(view.linear_call(&Exl3Io {
-                x,
-                xh: xh.buffer().range(xh_at, k * F32)?,
-                z: z.buffer().range(z_at, n * F32)?,
-                out: Self::columns(row, *col, *n)?,
-                flag,
-                rows: 1,
-                fused: false,
-            }));
+            members.push((
+                view,
+                Exl3Io {
+                    x,
+                    xh: xh.buffer().range(xh_at, k * F32)?,
+                    z: z.buffer().range(z_at, n * F32)?,
+                    out: Self::columns(row, *col, *n)?,
+                    flag,
+                    rows: 1,
+                    fused: false,
+                },
+            ));
             xh_at += k * F32;
             z_at += n * F32;
         }
+        let calls: Vec<_> = members
+            .iter()
+            .map(|(view, io)| view.linear_call(io))
+            .collect();
         self.ctx.exl3_grouped_step(self.stream, &calls)
     }
 

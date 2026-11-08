@@ -448,23 +448,30 @@ impl<'a> GroupRig<'a> {
         self.ctx.exl3_linear(&self.stream, view.linear_call(&io))
     }
 
-    /// The whole group on weight copy `copy` as one `exl3_grouped_step` launch.
+    /// The whole group on weight copy `copy` as one `exl3_grouped_step` launch. The views and
+    /// their io outlive the calls that borrow them: two passes, as in `project_group`.
     fn group(&self, copy: usize) -> Res<()> {
-        let mut calls = Vec::with_capacity(self.shapes.len());
+        let mut members = Vec::with_capacity(self.shapes.len());
         for index in 0..self.shapes.len() {
             let (k, n) = (self.shapes[index].k, self.shapes[index].n);
             let (xh_at, z_at) = self.offsets(index);
-            let view = self.weights[copy][index].view()?;
-            calls.push(view.linear_call(&Exl3Io {
-                x: self.x.range(0, k * F32)?,
-                xh: self.xh.range(xh_at, k * F32)?,
-                z: self.z.range(z_at, n * F32)?,
-                out: self.out.range(z_at, n * F32)?,
-                flag: self.flag.range(0, F32)?,
-                rows: 1,
-                fused: false,
-            }));
+            members.push((
+                self.weights[copy][index].view()?,
+                Exl3Io {
+                    x: self.x.range(0, k * F32)?,
+                    xh: self.xh.range(xh_at, k * F32)?,
+                    z: self.z.range(z_at, n * F32)?,
+                    out: self.out.range(z_at, n * F32)?,
+                    flag: self.flag.range(0, F32)?,
+                    rows: 1,
+                    fused: false,
+                },
+            ));
         }
+        let calls: Vec<_> = members
+            .iter()
+            .map(|(view, io)| view.linear_call(io))
+            .collect();
         self.ctx.exl3_grouped_step(&self.stream, &calls)
     }
 
@@ -578,12 +585,13 @@ fn run() -> Res<()> {
         let matrices = group
             .members
             .iter()
-            .map(|&name| Ok(matrix(&checkpoint, &full_prefix(member(name)?)?)))
+            .map(|&name| matrix(&checkpoint, &full_prefix(member(name)?)?))
             .collect::<Res<Vec<_>>>()?;
         let shapes = matrices
             .iter()
-            .map(|&matrix| shape_of(matrix, group.name))
+            .map(|matrix| shape_of(matrix, group.name))
             .collect::<Res<Vec<_>>>()?;
+        let matrices: Vec<&Matrix> = matrices.iter().collect();
         if !measure_group(group, projector, &matrices, &shapes)? {
             mismatched.push(group.name);
         }
