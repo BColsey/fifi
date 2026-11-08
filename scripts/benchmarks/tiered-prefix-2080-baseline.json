@@ -1,0 +1,47 @@
+{
+  "schema": "fifi.tiered-prefix-baseline.v1",
+  "recorded_utc": "2026-11-08T20:13:26.139133+00:00",
+  "model": "fifi-q36-2080ti",
+  "transport": "keyless LAN HTTP proxy",
+  "configured_context_tokens": 131072,
+  "previous_service_binary_sha256": "fc7a5b7173b062a3a697e98444c920607e9fae4b4e7f35dbf98b4f735b58a24e",
+  "matching_local_build_commit": "602c99d75710547430d619f0d2dcefada243c01d",
+  "observed_missing_environment_option": "Q36_TIERED_PREFIX",
+  "samples": [
+    {
+      "label": "a_cold",
+      "prompt_tokens": 1305,
+      "completion_tokens": 2,
+      "reused_tokens": 0,
+      "finish_reason": "stop",
+      "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+      "captured_positions": 0,
+      "seconds": 32.4736
+    },
+    {
+      "label": "a_repeat",
+      "prompt_tokens": 1305,
+      "completion_tokens": 2,
+      "reused_tokens": 0,
+      "finish_reason": "stop",
+      "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+      "captured_positions": 0,
+      "seconds": 26.7491
+    },
+    {
+      "label": "b_changed",
+      "prompt_tokens": 1305,
+      "completion_tokens": 2,
+      "reused_tokens": 0,
+      "finish_reason": "stop",
+      "content_sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+      "captured_positions": 0,
+      "seconds": 24.0768
+    }
+  ],
+  "limits": [
+    "The running binary hash matched the local 602c build artifact; this alone is not a reproducible build receipt.",
+    "CPU builds overlapped these requests, so the wall times do not establish performance.",
+    "This baseline has neither the original prefix patch nor the scheduler fix; it is not an exact-tip test."
+  ]
+}
