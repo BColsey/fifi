@@ -319,41 +319,6 @@ impl CudaContext {
     }
 
     /// Enqueues the zeroing of the sticky EXL3 arithmetic flag word `flag`. Runs right after
-    /// `step_begin` in an EXL3 step.
-    pub(crate) fn exl3_flag_clear(
-        &self,
-        stream: &DeviceStream,
-        flag: DeviceRange<'_>,
-    ) -> Result<(), EngError> {
-        let flag_raw = self.raw_range(&flag)?;
-        require_fit("EXL3 flag", &flag, 4, 4)?;
-        self.launch_on(stream, move |raw_stream| {
-            raw::exl3_flag_clear_launch(raw_stream, flag_raw)
-        })
-    }
-
-    /// Enqueues the fold of the EXL3 arithmetic flag word into `params.status`: when bit 0 of
-    /// `flag` is set, mask [`STATUS_EXL3_ARITHMETIC`] is OR-ed into the status; the word is zeroed
-    /// either way. Runs after the last EXL3 projection and before `argmax`, so the result pair
-    /// carries the verdict. `flag` and `params` must not overlap.
-    pub(crate) fn exl3_flag_fold(
-        &self,
-        stream: &DeviceStream,
-        params: DeviceRange<'_>,
-        flag: DeviceRange<'_>,
-    ) -> Result<(), EngError> {
-        let params_raw = self.raw_range(&params)?;
-        let flag_raw = self.raw_range(&flag)?;
-        require_fit("params", &params, STEP_PARAMS_BYTES, 4)?;
-        require_fit("EXL3 flag", &flag, 4, 4)?;
-        require_apart(
-            &Claim::of("params", &params, STEP_PARAMS_BYTES),
-            &Claim::of("EXL3 flag", &flag, 4),
-        )?;
-        self.launch_on(stream, move |raw_stream| {
-            raw::exl3_flag_fold_launch(raw_stream, params_raw, flag_raw)
-        })
-    }
 
     /// Enqueues `step_advance` by `m` (`1..=MAX_ADVANCE`) on `stream`: `pos`, `kv_len` and
     /// `kv_slot` move together when the state is valid and `pos + m <= POS_MAX`; in every other

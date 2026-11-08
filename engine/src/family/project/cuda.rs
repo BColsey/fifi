@@ -610,6 +610,183 @@ impl CudaProjector {
         let device = self.load(&model.weights, &names, options)?;
         Ok(LoadedModel { device, layout })
     }
+
+    /// Uploads the fused GDN input projection: the `qkv` tensor's bytes followed by its three
+    /// siblings', as ONE native matrix of `n_rows = sum` under the `qkv` name. Refuses unless
+    /// all four parts share the quant type and input width, and is only called on the Native
+    /// layout for a full four-name group (`gdn_inproj_groups`). The device holds exactly the
+    /// same bytes the four separate uploads would hold - VRAM delta zero - and every output row
+    /// keeps its dot, so the fused launch is bitwise per segment (pinned by an A/B run).
+    fn upload_fused_inproj(
+        &self,
+        weights: &GgufWeights,
+        qkv: &GgufTensor,
+        sibs: [&GgufTensor; 3],
+        layout: WeightLayout,
+    ) -> Result<CudaWeight, EngError> {
+        if layout != WeightLayout::Native {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {}: the GDN input-projection fusion is native-only",
+                qkv.name()
+            )));
+        }
+        let parts = [qkv, sibs[0], sibs[1], sibs[2]];
+        let (mut rows, k) = matrix_shape(qkv)?;
+        for part in &parts[1..] {
+            let (part_rows, part_k) = matrix_shape(part)?;
+            if part_k != k || part.ggml_type() != qkv.ggml_type() {
+                return Err(EngError::Checkpoint(format!(
+                    "tensor {}: the GDN input-projection fusion needs {} siblings of the same \
+                     type and input width, found {} of {:?}",
+                    qkv.name(),
+                    k,
+                    part.name(),
+                    part.ggml_type()
+                )));
+            }
+            rows += part_rows;
+        }
+        let sources: Vec<(&str, u64)> = parts
+            .iter()
+            .map(|part| (part.name(), part.byte_len()))
+            .collect();
+        let total: u64 = sources.iter().map(|&(_, len)| len).sum();
+        let quant = QuantTensor {
+            name: qkv.name(),
+            ty: qkv.ggml_type(),
+            n_rows: rows,
+            k,
+            source_len: usize::try_from(total).map_err(|_| {
+                EngError::MemoryPlan(format!(
+                    "tensor {}: the fused input projection does not fit",
+                    qkv.name()
+                ))
+            })?,
+        };
+        let weight = self
+            .context
+            .upload_native(quant, self.chunk_limit, &mut |at, buf| {
+                // One chunk can span several sources: walk to the source holding `at`, read
+                // its tail, then every later source from its start (offset 0).
+                let at64 = at as u64;
+                let mut filled = 0;
+                let mut base = 0u64;
+                let mut started = false;
+                for &(name, len) in &sources {
+                    let offset = if started {
+                        0
+                    } else {
+                        if at64 >= base + len {
+                            base += len;
+                            continue;
+                        }
+                        at64 - base
+                    };
+                    // take is bounded by the REMAINING destination, not buf.len(): a chunk
+                    // that crosses into a later source must not overrun the slice (F2).
+                    let take = (buf.len() - filled).min((len - offset) as usize);
+                    weights.read_range(name, offset, &mut buf[filled..filled + take])?;
+                    filled += take;
+                    if filled == buf.len() {
+                        return Ok(());
+                    }
+                    started = true;
+                    base += len;
+                }
+                Err(EngError::BadRequest(format!(
+                    "tensor {}: the fused input-projection read ran past its sources",
+                    qkv.name()
+                )))
+            })?;
+        Ok(CudaWeight::Native {
+            name: qkv.name().to_owned(),
+            weight,
+        })
+    }
+
+    fn upload(
+        &self,
+        weights: &GgufWeights,
+        tensor: &GgufTensor,
+        layout: WeightLayout,
+    ) -> Result<CudaWeight, EngError> {
+        let name = tensor.name();
+        match (tensor.ggml_type(), layout) {
+            (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
+                self.upload_quant(weights, tensor, name, ty, layout)
+            }
+            (ty @ (GgufType::F32 | GgufType::F16), _) => {
+                let (_, bytes) = weights.read_tensor(name)?;
+                Ok(CudaWeight::Raw {
+                    name: name.to_owned(),
+                    ty,
+                    buffer: self.context.upload(&bytes)?,
+                })
+            }
+            (other, WeightLayout::Native) => Err(EngError::Checkpoint(format!(
+                "tensor {name} has type {other:?}, which the CUDA native weights do not take"
+            ))),
+            (other, _) => Err(EngError::Checkpoint(format!(
+                "tensor {name} has type {other:?}, which the CUDA backend does not load"
+            ))),
+        }
+    }
+
+    /// Uploads one quantized tensor in `layout`: the repacked tiles through `upload_tiled`
+    /// (whose dequantisation the fp16 scale scans guard) or the file's own blocks through
+    /// `upload_native` (no repack, no scan), with the stack depth of a rank-3 tensor riding
+    /// the weight.
+    fn upload_quant(
+        &self,
+        weights: &GgufWeights,
+        tensor: &GgufTensor,
+        name: &str,
+        ty: GgufType,
+        layout: WeightLayout,
+    ) -> Result<CudaWeight, EngError> {
+        let (n_rows, k) = matrix_shape(tensor)?;
+        let experts = stack_depth(tensor)?;
+        let source_len = usize::try_from(tensor.byte_len()).map_err(|_| {
+            EngError::MemoryPlan(format!("cuda allocate: tensor {name} does not fit"))
+        })?;
+        let quant = QuantTensor {
+            name,
+            ty,
+            n_rows,
+            k,
+            source_len,
+        };
+        match layout {
+            WeightLayout::Tiled => {
+                let weight =
+                    self.context
+                        .upload_tiled(quant, self.chunk_limit, &mut |at, buf| {
+                            weights.read_range(name, at as u64, buf)
+                        })?;
+                Ok(CudaWeight::Tiled {
+                    name: name.to_owned(),
+                    weight,
+                    experts,
+                })
+            }
+            WeightLayout::Native => {
+                // The file's own blocks, no repack and no scale scan.
+                let weight = self
+                    .context
+                    .upload_native(quant, self.chunk_limit, &mut |at, buf| {
+                        weights.read_range(name, at as u64, buf)
+                    })?
+                    .with_experts(experts);
+                Ok(CudaWeight::Native {
+                    name: name.to_owned(),
+                    weight,
+                })
+            }
+            WeightLayout::Exl3 => Err(EngError::Checkpoint(format!(
+                "tensor {name}: GGUF blocks cannot be uploaded as EXL3"
+            ))),
+        }
+    }
 }
 
 impl Projector for CudaProjector {

@@ -69,7 +69,6 @@ pub(in crate::kernels::cuda) mod hyper;
 pub(in crate::kernels::cuda) mod kv8_append;
 pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod kv_f16_rows;
-pub(in crate::kernels::cuda) mod kv_f16_append;
 pub(in crate::kernels::cuda) mod mailbox;
 pub(in crate::kernels::cuda) mod matmul_expert;
 pub(in crate::kernels::cuda) mod matmul_q5_0;

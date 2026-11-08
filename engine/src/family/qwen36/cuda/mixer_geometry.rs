@@ -72,6 +72,8 @@ const CONV_TAPS: usize = 4;
 /// The DeltaNet gates an EXL3 pack keeps as plain matrices (see `MixerGeometry::plain_specs`).
 const PLAIN_ROLES: [Role; 2] = [Role::SsmBeta, Role::SsmAlpha];
 
+/// A dense (tiled) mixer weight: its role, output rows and input length.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DenseSpec {
     pub(super) role: Role,

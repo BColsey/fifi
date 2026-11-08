@@ -263,8 +263,6 @@ pub(in crate::kernels::cuda) static Q8_TILED_FALLBACKS: AtomicU64 = AtomicU64::n
 /// route (default ON, rollback via a rejected knob value).
 pub(in crate::kernels::cuda) static Q8_TILED_ROUTES: AtomicU64 = AtomicU64::new(0);
 
-/// Every integer argument of the launch, already bounded and converted by the wrapper before
-/// `launch_on`, so no conversion can fail inside the launch closure. `ld` is 0 without
 /// `proj`.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::kernels::cuda) struct AttnPrefillInts {

@@ -938,6 +938,7 @@ impl Q36Settings {
         check_weight_format(weights, options, backend)?;
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
+        let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
@@ -1931,6 +1932,7 @@ mod tests {
                 artifact: PathBuf::from("/m"),
                 tokenizer_dir: PathBuf::from("/t"),
                 cache_limit: 1024,
+                cuda_devices: vec![0],
                 context_limit: 262_144,
                 session_cap: 4 << 30,
                 prefill_chunk: 256,
