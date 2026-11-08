@@ -323,7 +323,7 @@ fn rollback_of(
         if backend != Backend::Cuda {
             return Err(bad(
                 "draft_rollback device is CUDA-only: the MLX arm rolls back with a shared-handle \
-                     snapshot"
+                 snapshot"
                     .into(),
             ));
         }

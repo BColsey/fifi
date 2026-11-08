@@ -947,6 +947,9 @@ impl ExecutorOps for Q36Executor {
         generation: &mut GenerationState,
     ) -> Result<DecodeBatch> {
         let Q36Session { state, core, .. } = st;
+        // The take/put-back moves the drafter out of `&mut self` for the window call: a
+        // panic inside `speculator.decode` unwinds before the put-back and the speculator is
+        // dropped with the executor, so the feature turns off only with the engine.
         let Some(mut speculator) = self.speculator.take() else {
             let (mut step, limits) = self.split(state);
             return core.decode(&mut step, generation, &limits);
