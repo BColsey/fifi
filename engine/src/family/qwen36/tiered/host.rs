@@ -523,7 +523,16 @@ impl TieredHost {
             for (layer, ids) in routes.iter().enumerate() {
                 let picks = ids
                     .iter()
-                    .map(|&id| format!("{id}:{}", if self.table.lookup(layer, id).is_some() { 'h' } else { 'm' }))
+                    .map(|&id| {
+                        format!(
+                            "{id}:{}",
+                            if self.table.lookup(layer, id).is_some() {
+                                'h'
+                            } else {
+                                'm'
+                            }
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 eprintln!("tiered route t{} l{layer}: {picks}", self.token_seen);
@@ -537,6 +546,20 @@ impl TieredHost {
         // original inline-complete fills never had to state).
         self.drain_fills(device)?;
         for swap in &swaps {
+            // A swap whose victim is not Published names the promotee of an EARLIER
+            // swap of THIS SAME boundary (its fill is still pending; the policy's
+            // lowest-of re-resolution picked it as the next victim). With credit
+            // below one swap per boundary this is unreachable; at higher
+            // tiered.swaps_milli it is the one self-collision the loop can make.
+            // Skip the whole swap and revert the policy marks, as the prefetch
+            // guard does: a promotion is best-effort, never a race.
+            if let Some(evict) = swap.evict
+                && self.table.lookup(usize::from(swap.layer), evict).is_none()
+            {
+                self.policy
+                    .unadvise(usize::from(swap.layer), swap.promote, swap.evict);
+                continue;
+            }
             if let Err(error) = self.apply_swap(device, swap) {
                 self.poisoned = true;
                 self.table.publish_ready();
@@ -1794,6 +1817,41 @@ mod tests {
             "the skipped candidate never filled"
         );
         f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn a_boundary_never_evicts_its_own_pending_promotee() {
+        // Credit 2.0: ONE token's boundary issues two swaps of one layer. Route
+        // fresh experts 2 (twice-routed) and 3 (once) in a full bank of 0 and 1
+        // (1 routed most): swap one promotes 2 over victim 0; the re-resolution
+        // of swap two (promote 3) then finds 2 — freshly promoted, score ONE
+        // increment below 1's several — as the lowest resident, and the host
+        // must skip that swap, not unpublish the pending fill.
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 2.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let mut token = |f: &mut Fixture, device: &mut MockDevice, id: u16| {
+            f.host
+                .begin_layer(0, &[i32::from(id)], &[1.0], &f.hidden, &f.hidden)
+                .unwrap();
+            f.host.finish_layer(0).unwrap();
+            f.host.end_token(device).unwrap();
+        };
+        // 1 outscores everything; 2 next; 3 lowest of the fresh set.
+        for id in [1u16, 1, 1, 2, 2, 3] {
+            token(&mut f, &mut device, id);
+        }
+        f.host.check_consistency().unwrap();
+        // The next token routes 2 and 3 again: two candidates, credit 2.
+        f.host
+            .begin_layer(0, &[2, 3], &[0.6, 0.4], &f.hidden, &f.hidden)
+            .unwrap();
+        f.host.finish_layer(0).unwrap();
+        let report = f.host.end_token(&mut device).unwrap();
+        f.host.check_consistency().unwrap();
+        // Whatever the re-resolution named, the boundary survived and the ledger
+        // and the policy still agree: that is the regression this pins.
+        assert!(report.swaps <= 2);
     }
 
     #[test]
