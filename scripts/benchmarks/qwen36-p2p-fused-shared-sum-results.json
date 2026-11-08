@@ -1,0 +1,49 @@
+{
+  "date_local": "2026-11-08 America/New_York",
+  "status": "experimental; default off; no full-model performance measurement",
+  "method": "Two physical peer-enabled GPUs. The same synthetic fixture and stack run the separate shared reduction and the combined routed/shared reduction on identical inputs. Fused routed sums and asynchronous broadcast barriers are enabled in both arms. The 24-iteration MoE rig checks routed and shared outputs and residuals bit for bit; the separate synthetic GGUF session checks complete first and later logits rows after reset.",
+  "hardware": {
+    "gpu_order": [
+      "NVIDIA GeForce RTX 3060 12 GB",
+      "NVIDIA GeForce RTX 3080 10 GB"
+    ],
+    "driver": "615.78.08 with local P2P patch"
+  },
+  "provenance": {
+    "tested_source_commit": "0cc9a0f1a227651a3dfd4f75b241bc3bf2dbf351",
+    "engine_tree": "8e39b205e3c978487f63b7d9428c30024c9aad42",
+    "engine_binary_sha256": "40ae166daf698071305f6f959c03b3ac8399977e906f203c660e7c9539efc7e8",
+    "test_binary_sha256": "5c2032383de021ef9e8d8e8a5ca650fea79049612176b1321792f4388f165785"
+  },
+  "moe_block": {
+    "iterations": 24,
+    "peer_exchanges_per_block": {
+      "separate_shared": 5,
+      "combined_shared": 4
+    },
+    "checks": "bitwise routed outputs, shared output and residual; zero peer status on both devices",
+    "test_output": "\nrunning 1 test\ntest family::qwen36::cuda::card_moe_device_tests::fused_shared_sum_matches_separate_sum_on_peer_gpus ... CUDA devices visible: 2\nMoE ring exchanges: separate 5, fused 4\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5793 filtered out; finished in 2.08s\n\n"
+  },
+  "session": {
+    "fixture": "synthetic GGUF session, not the full 35B model",
+    "checks": "first and later complete decoded logits rows match after resetting state",
+    "test_output": "\nrunning 1 test\ntest family::qwen36::cuda::card_session_device_tests::fused_shared_sum_preserves_logits_on_peer_gpus ... CUDA devices visible: 2\nfused_shared_sum_preserves_logits_on_peer_gpus: greedy gap after 3 tokens: 2.578 (runner 34.885, best 37.462)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5793 filtered out; finished in 11.32s\n\n"
+  },
+  "context_ownership_refusal": {
+    "test_output": "\nrunning 1 test\ntest kernels::cuda::context::stream::tests::a_stream_or_event_of_another_context_is_refused ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5793 filtered out; finished in 0.24s\n\n"
+  },
+  "cpu_validation": {
+    "geometry_tests_passed": 11,
+    "peer_size_test_passed": 1,
+    "prefill_plan_tests_passed": 43,
+    "release_native_cuda_build": true,
+    "clippy_deny_warnings": true,
+    "rustfmt_check": true
+  },
+  "limitations": [
+    "No throughput samples were accepted: another local build overlapped the first timing attempt.",
+    "No claim is made about prefill or decode speed.",
+    "The configured 131072-token context and full Qwen3.6-35B-A3B model were not exercised with this candidate.",
+    "This option depends on Q36_P2P_FUSE_EXPERT_SUM=1 and has not been qualified or enabled by default."
+  ]
+}
