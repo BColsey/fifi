@@ -28,7 +28,45 @@ use super::{
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::kernels::cuda::{DeviceBuffer, DeviceEvent, PinnedBuf};
+
+/// ponytail: qualification-only timing probes (Q36_TIERED_TIMING=1); delete after the
+/// hang analysis. All times are ns accumulated per phase across a token.
+pub(in crate::family::qwen36::cuda) static T_ROUTE: AtomicU64 = AtomicU64::new(0);
+pub(in crate::family::qwen36::cuda) static T_BEGIN: AtomicU64 = AtomicU64::new(0);
+pub(in crate::family::qwen36::cuda) static T_WRITES: AtomicU64 = AtomicU64::new(0);
+pub(in crate::family::qwen36::cuda) static T_OPS: AtomicU64 = AtomicU64::new(0);
+pub(in crate::family::qwen36::cuda) static T_FINISH: AtomicU64 = AtomicU64::new(0);
+pub(in crate::family::qwen36::cuda) static T_PARTIAL: AtomicU64 = AtomicU64::new(0);
+
+fn timing_on() -> bool {
+    std::env::var_os("Q36_TIERED_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+fn mark() -> Option<std::time::Instant> {
+    timing_on().then(std::time::Instant::now)
+}
+fn tock(counter: &AtomicU64, at: Option<std::time::Instant>) {
+    if let Some(at) = at {
+        let ns = at.elapsed().as_nanos() as u64;
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// Prints and clears the accumulated phases; the step calls it at each token boundary.
+pub(in crate::family::qwen36::cuda) fn tiered_timing_line(token: usize) {
+    if !timing_on() { return; }
+    eprintln!(
+        "tiered timing t{token}: route {} us, begin {} us, writes {} us, ops {} us, finish {} us, partial {} us",
+        T_ROUTE.swap(0, Ordering::Relaxed) / 1000,
+        T_BEGIN.swap(0, Ordering::Relaxed) / 1000,
+        T_WRITES.swap(0, Ordering::Relaxed) / 1000,
+        T_OPS.swap(0, Ordering::Relaxed) / 1000,
+        T_FINISH.swap(0, Ordering::Relaxed) / 1000,
+        T_PARTIAL.swap(0, Ordering::Relaxed) / 1000,
+    );
+}
 
 const F32: usize = size_of::<f32>();
 const I32: usize = size_of::<i32>();
@@ -326,14 +364,19 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
             block.scratch.hidden, block.scratch.top_k, dims.hidden, dims.top_k
         )));
     }
+    let t0 = mark();
     let route = route_to_host(launch, weights, block.bufs, block.scratch, dims)?;
+    tock(&T_ROUTE, t0);
     let mut syncs = HostSyncs {
         waits: 1,
         writes: 0,
     };
+    let t0 = mark();
     let plan = host.begin_layer(layer, &route)?;
+    tock(&T_BEGIN, t0);
     check_plan(&plan, dims.top_k, slots)?;
     let scratch = &*block.scratch;
+    let t0 = mark();
     scratch.slot_ids.write_at(
         launch.stream,
         0,
@@ -346,15 +389,23 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         &to_bytes(&plan.device_weights, f32::to_le_bytes),
     )?;
     syncs.writes += 1;
+    tock(&T_WRITES, t0);
     let tiered = tiered_bufs(block.bufs, scratch)?;
+    let t0 = mark();
     for op in moe_sequence(dims.top_k, WeightLayout::Native)
         .into_iter()
         .skip(1)
     {
         launch_op(launch, weights, &tiered, op)?;
     }
-    if let Some(partial) = host.finish_layer(layer)? {
+    tock(&T_OPS, t0);
+    let t0 = mark();
+    let joined = host.finish_layer(layer)?;
+    tock(&T_FINISH, t0);
+    if let Some(partial) = joined {
+        let t0 = mark();
         add_cpu_partial(launch, block, &partial)?;
+        tock(&T_PARTIAL, t0);
         syncs.writes += 1;
     }
     Ok(syncs)

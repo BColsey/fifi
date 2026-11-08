@@ -334,6 +334,8 @@ pub(super) struct TieredRuntime<'w> {
     host: TieredHost,
     /// Whether advice-driven fills happen only while feeding prompt rows.
     guess_prefill_only: bool,
+    /// ponytail: the timing probe's token counter (Q36_TIERED_TIMING only).
+    timing_token: usize,
     /// The async fill channel, built at attach when `Q36_TIERED_ASYNC_FILLS=1`.
     fills: Option<FillParts>,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
@@ -378,6 +380,7 @@ impl<'w> TieredRuntime<'w> {
             scratch,
             host,
             guess_prefill_only,
+            timing_token: 0,
             fills,
             syncs: HostSyncs::default(),
         })
@@ -489,6 +492,8 @@ impl<'w> TieredRuntime<'w> {
         if self.fills.is_none() {
             self.syncs.writes += report.swaps * ExpertBank::FILL_WRITES;
         }
+        self.timing_token += 1;
+        super::moe::tiered::tiered_timing_line(self.timing_token);
         Ok(report)
     }
 }
