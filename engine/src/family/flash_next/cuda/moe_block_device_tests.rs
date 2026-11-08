@@ -199,8 +199,10 @@ fn build_bank(
         .collect();
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
     let counts: Vec<Vec<u64>> = layers.iter().map(|_| (0..512u64).rev().collect()).collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts).expect("the fill");
-    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).expect("state");
+    let policy =
+        ReplaceOnMissLru::from_fill(geometry.clone(), &row_refs, &counts).expect("the fill");
+    let state =
+        ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy).expect("state");
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,

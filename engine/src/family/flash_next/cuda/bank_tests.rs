@@ -123,12 +123,13 @@ fn the_geometry_takes_the_plan_and_refuses_another_record_size() {
             geometry.layers,
             geometry.experts,
             geometry.top_k,
-            geometry.slots
+            geometry.uniform_slots()
         ),
-        (48, 512, 10, 143)
+        (48, 512, 10, Some(143))
     );
     assert_eq!(geometry.offset(142), 142 * 1_881_600);
-    assert_eq!(geometry.device_bytes_per_layer(), 143 * 1_881_600);
+    assert_eq!(geometry.device_bytes(0), 143 * 1_881_600);
+    assert_eq!(geometry.device_bytes_total(), 48 * 143 * 1_881_600);
     let other = SlotBankLayout::new(2560, 640, [80, 80, 80]).unwrap();
     let error = message(BankGeometry::from_plan(&plan, &other).unwrap_err());
     assert!(error.contains("tier plan counts"), "{error}");
@@ -207,7 +208,8 @@ fn the_pinned_store_is_the_cold_experts_plus_one_spare_place_per_layer() {
 fn the_budget_at_the_contexts_of_the_tier_plan() {
     // 262,144 positions: 143 slots, the largest store.
     let long = geometry_of(&plan_at(262_144));
-    assert!((140..=146).contains(&long.slots), "{} slots", long.slots);
+    let long_slots = long.uniform_slots().expect("uniform");
+    assert!((140..=146).contains(&long_slots), "{long_slots} slots");
     let plan = HostPinPlan::new(
         &long,
         HostMode::Exclusive,
@@ -236,9 +238,9 @@ fn the_budget_at_the_contexts_of_the_tier_plan() {
     .unwrap();
     assert!(
         (25.0..26.0).contains(&gib(plan.store_bytes)),
-        "{} GiB at {} slots",
+        "{} GiB at {:?} slots",
         gib(plan.store_bytes),
-        short.slots
+        short.uniform_slots()
     );
 }
 
@@ -542,8 +544,8 @@ fn small(mode: HostMode) -> ExpertBankState<ReplaceOnMissLru> {
     let counts: Vec<Vec<u64>> = (0..2)
         .map(|_| (0..16).map(|e| e as u64).collect())
         .collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
-    ExpertBankState::with_policy(geometry, mode, policy).unwrap()
+    let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &rows, &counts).unwrap();
+    ExpertBankState::with_policy(geometry.clone(), mode, policy).unwrap()
 }
 
 fn moved(copies: &PassCopies) -> Vec<(u16, u16)> {
@@ -672,8 +674,8 @@ fn a_policy_row_must_hold_exactly_the_slots() {
     let geometry = BankGeometry::new(1, 16, 3, 5, 64).unwrap();
     let counts = vec![vec![0u64; 16]];
     let fill = |row: Vec<i32>| {
-        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts)?;
-        ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).map(|_| ())
+        let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &[row.as_slice()], &counts)?;
+        ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy).map(|_| ())
     };
     let row = |held: usize| -> Vec<i32> {
         (0..16)
@@ -700,7 +702,7 @@ fn a_policy_row_must_hold_exactly_the_slots() {
         }
     }
     let error = message(
-        ExpertBankState::with_policy(geometry, HostMode::Exclusive, Short(row(3)))
+        ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, Short(row(3)))
             .err()
             .expect("refused"),
     );
@@ -723,11 +725,11 @@ fn an_unfilled_start_is_refused() {
     let geometry = BankGeometry::new(1, 8, 2, 4, 64).unwrap();
     let counts = vec![vec![0u64; 8]];
     let short: Vec<i32> = vec![0, 1, 2, -1, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[short.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry.clone(), &[short.as_slice()], &counts).is_err());
     let twice: Vec<i32> = vec![0, 1, 2, 2, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[twice.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry.clone(), &[twice.as_slice()], &counts).is_err());
     let outside: Vec<i32> = vec![0, 1, 2, 4, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[outside.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry.clone(), &[outside.as_slice()], &counts).is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -743,11 +745,11 @@ struct Sim {
 
 impl Sim {
     fn new(state: &ExpertBankState<ReplaceOnMissLru>) -> Self {
-        let geometry = *state.geometry();
-        let places = state.mode().places_per_layer(&geometry);
+        let geometry = state.geometry().clone();
+        let places = state.mode().places_per_layer(&geometry).expect("places");
         let device = (0..geometry.layers)
             .map(|layer| {
-                (0..geometry.slots)
+                (0..geometry.slots_of(layer))
                     .map(|slot| state.expert_in_slot(layer, slot).unwrap())
                     .collect()
             })
@@ -842,8 +844,8 @@ fn run_random_passes(mode: HostMode) {
     let row: Vec<i32> = (0..64).map(|e| if e < 20 { e } else { -1 }).collect();
     let rows = vec![row.as_slice(); 3];
     let counts = vec![vec![0u64; 64]; 3];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
-    let mut state = ExpertBankState::with_policy(geometry, mode, policy).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &rows, &counts).unwrap();
+    let mut state = ExpertBankState::with_policy(geometry.clone(), mode, policy).unwrap();
     let mut sim = Sim::new(&state);
     sim.check(&state);
     let mut rng = Lcg(7);
@@ -903,7 +905,13 @@ fn an_inclusive_store_needs_no_write_back() {
 #[test]
 fn the_exclusive_store_never_needs_more_than_one_spare_place() {
     let state = small(HostMode::Exclusive);
-    assert_eq!(state.mode().places_per_layer(state.geometry()), 16 - 5 + 1);
+    assert_eq!(
+        state
+            .mode()
+            .places_per_layer(state.geometry())
+            .expect("places"),
+        16 - 5 + 1
+    );
     // A pass of three misses reuses the places its own copies free.
     let mut state = small(HostMode::Exclusive);
     let copies = state.begin_pass(0, &[10, 11, 12]).unwrap();
@@ -1039,7 +1047,7 @@ fn replay(trace: &str, slots: usize) -> f64 {
             .collect();
         let rows = vec![row.as_slice(); 48];
         let counts = vec![vec![0u64; 512]; 48];
-        ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap()
+        ReplaceOnMissLru::from_fill(geometry.clone(), &rows, &counts).unwrap()
     };
     let (mut policy, mut current) = (fresh(), String::new());
     let (mut hits, mut picks) = (0u64, 0u64);
@@ -1120,11 +1128,15 @@ mod device_tests {
         let geometry = BankGeometry::new(2, 12, 2, 4, record).unwrap();
         let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
         let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
-        let policy =
-            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts)
-                .unwrap();
-        let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
-        let places = state.mode().places_per_layer(&geometry);
+        let policy = ReplaceOnMissLru::from_fill(
+            geometry.clone(),
+            &[row.as_slice(), row.as_slice()],
+            &counts,
+        )
+        .unwrap();
+        let state =
+            ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy).unwrap();
+        let places = state.mode().places_per_layer(&geometry).expect("places");
 
         let projector = CudaProjector::new().expect("projector");
         let ctx = projector.context();
@@ -1187,7 +1199,7 @@ mod device_tests {
         // The failure branch of `step`: a context of another adapter fails in the first copy, after
         // the host model has moved. The bank is poisoned and every later use of it is refused.
         assert_eq!((bank.stats().passes, bank.stats().misses), (2, 2));
-        assert_eq!(bank.geometry().slots, 4);
+        assert_eq!(bank.geometry().uniform_slots().expect("uniform"), 4);
         let other = CudaProjector::new().expect("a second context");
         assert!(!bank.is_poisoned());
         assert!(bank.slot_row(0).is_ok());
@@ -1208,10 +1220,13 @@ mod device_tests {
         let state = {
             let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
             let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
-            let policy =
-                ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts)
-                    .unwrap();
-            ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
+            let policy = ReplaceOnMissLru::from_fill(
+                geometry.clone(),
+                &[row.as_slice(), row.as_slice()],
+                &counts,
+            )
+            .unwrap();
+            ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy).unwrap()
         };
         let mut wrong = plan;
         wrong.store_bytes += 1;

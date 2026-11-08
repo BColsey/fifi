@@ -258,6 +258,81 @@ impl RecordSource for TimedSource<'_> {
 /// Refuses a missing file, bad JSON, any layer key that is not `model.language_model.layers.<i>.mlp`,
 /// a layer index outside `0..layers`, or a duplicate layer. The weights themselves are validated
 /// against the bank geometry by [`fill_from_profile`].
+/// Greedy water-fill of one uniform slot budget across the layers of a popularity profile:
+/// every layer gets the filler minimum first, then each remaining slot goes to the layer whose
+/// next hottest still-uncovered expert carries the most profile weight. Layers whose demand
+/// fits keep exactly their demand; the total granted never exceeds budget_per_layer * layers.
+fn profile_widths(
+    profile: &[Vec<f64>],
+    budget_per_layer: usize,
+    min_slots: usize,
+    experts: usize,
+) -> Vec<usize> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    /// A weight ordered totally (profile weights are finite and non-negative, so the bit
+    /// pattern preserves their order); the heap needs .
+    #[derive(Clone, Copy, PartialEq)]
+    struct Weight(f64);
+    impl Eq for Weight {}
+    impl PartialOrd for Weight {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Weight {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0.total_cmp(&other.0)
+        }
+    }
+    let layers = profile.len();
+    let mut sorted: Vec<Vec<(f64, usize)>> = profile
+        .iter()
+        .map(|row| {
+            let mut by_weight: Vec<(f64, usize)> =
+                row.iter().enumerate().map(|(e, &w)| (w, e)).collect();
+            by_weight.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            by_weight
+        })
+        .collect();
+    // (next marginal weight, tie-break layer, cursor) - the heap pops the best next slot.
+    // Seeded empty: only the post-drain pushes below enter, all with positive weight.
+    let mut heap: BinaryHeap<(Weight, Reverse<usize>, usize)> = BinaryHeap::new();
+    let mut widths = vec![0usize; layers];
+    let mut remaining = budget_per_layer.saturating_mul(layers);
+    // The filler minimum every layer needs, whatever its demand.
+    for layer in 0..layers {
+        let grant = min_slots.min(sorted[layer].len().min(experts));
+        widths[layer] = grant.max(min_slots).min(experts);
+        remaining = remaining.saturating_sub(widths[layer]);
+    }
+    // Cursors start past the granted minimum.
+    for layer in 0..layers {
+        let cursor = widths[layer].min(sorted[layer].len());
+        sorted[layer].drain(..cursor);
+        // Only positive demand earns slots: weightless experts never take budget.
+        if let Some(&(weight, _)) = sorted[layer].first().filter(|(w, _)| *w > 0.0) {
+            heap.push((Weight(weight), Reverse(layer), 0));
+        }
+    }
+    while remaining > 0 {
+        let Some((_, Reverse(layer), cursor)) = heap.pop() else {
+            break;
+        };
+        if cursor >= sorted[layer].len() {
+            continue;
+        }
+        widths[layer] += 1;
+        remaining -= 1;
+        let next = cursor + 1;
+        if let Some(&(weight, _)) = sorted[layer].get(next).filter(|(w, _)| *w > 0.0) {
+            heap.push((Weight(weight), Reverse(layer), next));
+        }
+    }
+    widths
+}
+
 fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngError> {
     let bad = |detail: String| {
         EngError::BadRequest(format!("FIFI_FLASH_NEXT_EXPERT_STATS={path}: {detail}"))
@@ -315,7 +390,13 @@ fn fill_from_profile(
         let Some(weights) = profile.and_then(|p| p.get(layer)) else {
             rows.push(
                 (0..geometry.experts)
-                    .map(|e| if e < geometry.slots { e as i32 } else { -1 })
+                    .map(|e| {
+                        if e < geometry.slots_of(layer) {
+                            e as i32
+                        } else {
+                            -1
+                        }
+                    })
                     .collect(),
             );
             counts.push((0..geometry.experts as u64).rev().collect());
@@ -332,7 +413,7 @@ fn fill_from_profile(
         let mut by_weight: Vec<usize> = (0..geometry.experts).collect();
         by_weight.sort_by(|&a, &b| weights[b].total_cmp(&weights[a]).then(a.cmp(&b)));
         let mut row = vec![-1; geometry.experts];
-        for (slot, &expert) in by_weight.iter().take(geometry.slots).enumerate() {
+        for (slot, &expert) in by_weight.iter().take(geometry.slots_of(layer)).enumerate() {
             row[expert] = slot as i32;
         }
         rows.push(row);
@@ -353,9 +434,9 @@ fn build_bank(
     profile: Option<&[Vec<f64>]>,
     source: &PackRecordSource<'_>,
 ) -> Result<DeviceBank, EngError> {
-    let (rows, counts) = fill_from_profile(geometry, profile)?;
+    let (rows, counts) = fill_from_profile(geometry.clone(), profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
+    let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &row_refs, &counts)?;
 
     let state = ExpertBankState::with_policy(geometry, plan.mode, policy)?;
     let timed = TimedSource {
@@ -458,6 +539,38 @@ pub(super) fn build_driver(
             )));
         }
     };
+    // Optional popularity profile (`FIFI_FLASH_NEXT_EXPERT_STATS`, an exllamav3 expert_stats
+    // JSON: {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}).
+    // Unset fills by expert id as before; a set value must read and parse, and a malformed file
+    // is refused, never a silent identity fill.
+    let profile = match std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS") {
+        Err(_) => None,
+        Ok(path) if path.is_empty() => None,
+        Ok(path) => Some(read_expert_stats(&path, layers)?),
+    };
+    if profile.is_some() {
+        eprintln!(
+            "flash-next cuda: expert bank: popularity profile {}",
+            std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS").unwrap_or_default()
+        );
+    }
+    // With a profile the same total slot budget moves to where the demand is: every layer
+    // starts at the filler minimum, then each remaining slot goes to the layer whose next
+    // hottest uncovered expert carries the most weight (a greedy water-fill over the sorted
+    // profile rows).
+    let widths = match &profile {
+        None => vec![slots; layers],
+        Some(profile) => profile_widths(profile, slots, model.moe.top_k() + 1, model.moe.experts()),
+    };
+    let split = widths.iter().filter(|&&w| w != slots).count();
+    if split > 0 {
+        eprintln!(
+            "flash-next cuda: expert bank: profile split {slots} slots/layer: min {}, max {}, {} layers moved",
+            widths.iter().min().copied().unwrap_or(slots),
+            widths.iter().max().copied().unwrap_or(slots),
+            split
+        );
+    }
     eprintln!("{load}; serving {slots} slots per layer");
     if sampler_vocab == 0 || sampler_vocab > model.vocab {
         return Err(EngError::Checkpoint(format!(
@@ -470,11 +583,11 @@ pub(super) fn build_driver(
     // engine heap and margin of `HostTerms`, and the two PLE projection matrices that
     // `PleVectors::read` holds in F32 (`HostTerms::engine_heap` does not count them).
     let record_bytes = PackRecordSource::new(&checkpoint)?.layout().record_bytes();
-    let geometry = BankGeometry::new(
+    let geometry = BankGeometry::new_widths(
         layers,
         model.moe.experts(),
         model.moe.top_k(),
-        slots,
+        &widths,
         record_bytes,
     )?;
     // The store mode: an inclusive store holds every expert pinned, so a miss copies one way
@@ -486,29 +599,58 @@ pub(super) fn build_driver(
         total: mem_total,
         available: mem_available,
     };
-    let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
-        Err(_) | Ok("") | Ok("auto") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT).or_else(
-                |inclusive| {
-                    eprintln!(
-                        "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
-                    );
-                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
-                },
-            )?
-        }
-        Ok("inclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)?
-        }
-        Ok("exclusive") => {
-            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)?
-        }
-        Ok(other) => {
-            return Err(EngError::BadRequest(format!(
+    let plan_for = |geometry: &BankGeometry| -> Result<HostPinPlan, EngError> {
+        match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
+            Err(_) | Ok("") | Ok("auto") => HostPinPlan::new(
+                geometry,
+                HostMode::Inclusive,
+                &memory,
+                &HostTerms::DEFAULT,
+            )
+            .or_else(|inclusive| {
+                eprintln!(
+                    "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
+                );
+                HostPinPlan::new(geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
+            }),
+            Ok("inclusive") => {
+                HostPinPlan::new(geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)
+            }
+            Ok("exclusive") => {
+                HostPinPlan::new(geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
+            }
+            Ok(other) => Err(EngError::BadRequest(format!(
                 "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
-            )));
+            ))),
         }
     };
+    let mut geometry = geometry;
+    let mut host_plan = plan_for(&geometry);
+    // A profile split the widths and no store mode admits it (the inclusive store needs the
+    // whole pack pinned and the exclusive place budget is uniform): keep serving on the uniform
+    // widths - the profile still orders the fill, only the split is dropped. A forced mode
+    // keeps refusing instead.
+    if host_plan.is_err()
+        && geometry.uniform_slots().is_none()
+        && !matches!(
+            std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref(),
+            Ok("inclusive") | Ok("exclusive")
+        )
+    {
+        eprintln!(
+            "flash-next cuda: no store admits the profile slot split; keeping uniform {slots} slots per layer (the profile still orders the fill)"
+        );
+        let uniform = vec![slots; layers];
+        geometry = BankGeometry::new_widths(
+            layers,
+            model.moe.experts(),
+            model.moe.top_k(),
+            &uniform,
+            record_bytes,
+        )?;
+        host_plan = plan_for(&geometry);
+    }
+    let host_plan = host_plan?;
     eprintln!(
         "flash-next cuda: {} store, {} pinned host bytes",
         match host_plan.mode {
@@ -545,21 +687,6 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     let source = PackRecordSource::new(checkpoint)?;
-    // Optional popularity profile (`FIFI_FLASH_NEXT_EXPERT_STATS`, an exllamav3 expert_stats
-    // JSON: {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}).
-    // Unset fills by expert id as before; a set value must read and parse, and a malformed file
-    // is refused, never a silent identity fill.
-    let profile = match std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS") {
-        Err(_) => None,
-        Ok(path) if path.is_empty() => None,
-        Ok(path) => Some(read_expert_stats(&path, layers)?),
-    };
-    if profile.is_some() {
-        eprintln!(
-            "flash-next cuda: expert bank: popularity profile {}",
-            std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS").unwrap_or_default()
-        );
-    }
     let bank = build_bank(projector, geometry, &host_plan, profile.as_deref(), &source)?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
@@ -620,8 +747,72 @@ pub(super) fn build_driver(
 
 #[cfg(test)]
 mod tests {
-    use super::{BankGeometry, fill_from_profile, read_expert_stats};
+    use super::{BankGeometry, HostMode, fill_from_profile, profile_widths, read_expert_stats};
     use std::io::Write as _;
+
+    /// The water-fill keeps the budget, gives every layer the filler minimum, spends the rest
+    /// on marginal weight, and never exceeds a layer's demand or the expert count; uniform
+    /// demand degenerates to the uniform split.
+    #[test]
+    fn the_water_fill_moves_budget_to_demand() {
+        let profile = vec![vec![9.0, 9.0, 0.0, 0.0], vec![1.0, 1.0, 1.0, 1.0]];
+        let widths = profile_widths(&profile, 3, 2, 4);
+        assert_eq!(widths.iter().sum::<usize>(), 3 * 2, "the budget is kept");
+        assert!(widths.iter().all(|&w| w >= 2), "the filler minimum");
+        assert_eq!(
+            widths,
+            vec![2, 4],
+            "layer 0 has demand 2, layer 1 takes the rest"
+        );
+        let widths = profile_widths(&profile, 2, 2, 4);
+        assert_eq!(widths, vec![2, 2], "a tight budget is the uniform minimum");
+        // Capped demand: zero-weight experts never earn a slot beyond the minimum.
+        let profile = vec![vec![5.0, 0.0, 0.0, 0.0], vec![0.0; 4]];
+        let widths = profile_widths(&profile, 4, 2, 4);
+        assert_eq!(
+            widths,
+            vec![2, 2],
+            "no layer exceeds its demand or gains weightless slots"
+        );
+    }
+
+    /// A per-layer bank validates each width like the uniform one and reports its widths; the
+    /// exclusive host mode refuses it, the inclusive one admits it.
+    #[test]
+    fn a_bank_with_per_layer_widths_validates_and_splits_places() {
+        assert!(BankGeometry::new_widths(2, 16, 2, &[3, 9], 8).is_ok());
+        assert!(
+            BankGeometry::new_widths(2, 8, 2, &[3, 9], 8).is_err(),
+            "a width past the experts"
+        );
+        assert!(
+            BankGeometry::new_widths(2, 16, 2, &[3], 8).is_err(),
+            "a width per layer"
+        );
+        assert!(
+            BankGeometry::new_widths(2, 16, 2, &[2, 9], 8).is_err(),
+            "below the minimum"
+        );
+        assert!(
+            BankGeometry::new_widths(2, 16, 2, &[3, 9], 7).is_err(),
+            "not whole floats"
+        );
+        let geometry = BankGeometry::new_widths(2, 16, 2, &[3, 9], 8).expect("geometry");
+        assert_eq!(geometry.slots_of(0), 3);
+        assert_eq!(geometry.slots_of(1), 9);
+        assert_eq!(geometry.uniform_slots(), None);
+        assert_eq!(geometry.device_bytes(0), 3 * 8);
+        assert_eq!(geometry.device_bytes(1), 9 * 8);
+        assert_eq!(geometry.device_bytes_total(), (3 + 9) * 8);
+        let places = HostMode::Exclusive.places_per_layer(&geometry);
+        assert!(places.is_err(), "the exclusive place budget is uniform");
+        assert_eq!(
+            HostMode::Inclusive
+                .places_per_layer(&geometry)
+                .expect("places"),
+            16
+        );
+    }
 
     /// A profile fills the slots in weight rank order (ties by id) and scales the weights to
     /// counts; the same bank without one keeps the id-ordered fill and the reversed-id counts.
@@ -629,11 +820,11 @@ mod tests {
     fn a_profile_ranks_the_initial_fill() {
         let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
         let profile = [vec![1.0, 9.0, 4.0, 9.0, 0.0, 2.0]];
-        let (rows, counts) = fill_from_profile(geometry, Some(&profile)).expect("fill");
+        let (rows, counts) = fill_from_profile(geometry.clone(), Some(&profile)).expect("fill");
         // experts 1 and 3 tie at the top weight; id breaks it, so 1 takes slot 0, 3 slot 1, 2 slot 2.
         assert_eq!(rows[0], [-1, 0, 2, 1, -1, -1]);
         assert_eq!(counts[0], vec![1000, 9000, 4000, 9000, 0, 2000]);
-        let (rows, counts) = fill_from_profile(geometry, None).expect("identity fill");
+        let (rows, counts) = fill_from_profile(geometry.clone(), None).expect("identity fill");
         assert_eq!(rows[0], [0, 1, 2, -1, -1, -1]);
         assert_eq!(counts[0], (0..6u64).rev().collect::<Vec<u64>>());
     }
@@ -643,9 +834,13 @@ mod tests {
     #[test]
     fn a_bad_profile_is_refused() {
         let geometry = BankGeometry::new(2, 4, 2, 3, 8).expect("geometry");
-        assert!(fill_from_profile(geometry, Some(&[vec![1.0; 4]])).is_err());
+        assert!(fill_from_profile(geometry.clone(), Some(&[vec![1.0; 4]])).is_err());
         assert!(
-            fill_from_profile(geometry, Some(&[vec![1.0; 4], vec![-1.0, 0.0, 0.0, 0.0]])).is_err()
+            fill_from_profile(
+                geometry.clone(),
+                Some(&[vec![1.0; 4], vec![-1.0, 0.0, 0.0, 0.0]])
+            )
+            .is_err()
         );
         assert!(
             fill_from_profile(

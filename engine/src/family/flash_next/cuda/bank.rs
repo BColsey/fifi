@@ -67,13 +67,14 @@ fn bank_error(detail: String) -> EngError {
 }
 
 /// The sizes of the bank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BankGeometry {
     pub(super) layers: usize,
     pub(super) experts: usize,
     pub(super) top_k: usize,
-    /// Device slots in every layer.
-    pub(super) slots: usize,
+    /// Device slots per layer, indexed by layer. Uniform (`new`) unless a popularity profile
+    /// redistributed the same total budget to where the demand is (`new_widths`).
+    pub(super) slots: Vec<usize>,
     /// Bytes of one expert record (`SlotBankLayout::record_bytes`, 1,881,600 in the 3.05 pack).
     pub(super) record_bytes: usize,
 }
@@ -115,9 +116,60 @@ impl BankGeometry {
             layers,
             experts,
             top_k,
-            slots,
+            slots: vec![slots; layers],
             record_bytes,
         })
+    }
+
+    /// A bank whose layers may hold different slot counts (a popularity profile that moved
+    /// budget to the layers that demand it). Every width passes the `new` checks; the total
+    /// must fit the same device bytes as a uniform bank.
+    pub(super) fn new_widths(
+        layers: usize,
+        experts: usize,
+        top_k: usize,
+        slots: &[usize],
+        record_bytes: usize,
+    ) -> Result<Self, EngError> {
+        if slots.len() != layers {
+            return Err(plan_error(format!(
+                "{} slot widths for {layers} layers",
+                slots.len()
+            )));
+        }
+        for (layer, &width) in slots.iter().enumerate() {
+            if width <= top_k {
+                return Err(plan_error(format!(
+                    "layer {layer}: {width} slots cannot protect {top_k} picks and the filler \
+                     slot; the bank needs {} or more",
+                    top_k + 1
+                )));
+            }
+            if width > experts {
+                return Err(plan_error(format!(
+                    "layer {layer}: {width} slots exceed the {experts} experts of a layer"
+                )));
+            }
+        }
+        // The `new` checks that do not depend on the widths.
+        Self::new(layers, experts, top_k, top_k + 1, record_bytes)?;
+        Ok(Self {
+            layers,
+            experts,
+            top_k,
+            slots: slots.to_vec(),
+            record_bytes,
+        })
+    }
+
+    /// The slot count of `layer`.
+    pub(super) fn slots_of(&self, layer: usize) -> usize {
+        self.slots[layer]
+    }
+
+    /// The one slot count when every layer agrees, `None` when a profile split them.
+    pub(super) fn uniform_slots(&self) -> Option<usize> {
+        (self.slots.iter().all(|&width| width == self.slots[0])).then_some(self.slots[0])
     }
 
     /// The bank the tier plan settled, for records of `layout`. The record size must be the plan's
@@ -145,8 +197,17 @@ impl BankGeometry {
         index * self.record_bytes
     }
 
-    pub(super) fn device_bytes_per_layer(&self) -> u64 {
-        self.slots as u64 * self.record_bytes as u64
+    /// Device bytes of one layer's bank buffer.
+    pub(super) fn device_bytes(&self, layer: usize) -> u64 {
+        self.slots[layer] as u64 * self.record_bytes as u64
+    }
+
+    /// Device bytes of every layer's bank buffers together.
+    pub(super) fn device_bytes_total(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|&width| width as u64 * self.record_bytes as u64)
+            .sum()
     }
 }
 
@@ -161,10 +222,19 @@ pub(super) enum HostMode {
 }
 
 impl HostMode {
-    pub(super) fn places_per_layer(self, geometry: &BankGeometry) -> usize {
+    pub(super) fn places_per_layer(self, geometry: &BankGeometry) -> Result<usize, EngError> {
         match self {
-            Self::Exclusive => geometry.experts - geometry.slots + 1,
-            Self::Inclusive => geometry.experts,
+            Self::Exclusive => {
+                let uniform = geometry.uniform_slots().ok_or_else(|| {
+                    plan_error(
+                        "per-layer slot counts need the inclusive host store: the exclusive \
+                         place budget is uniform"
+                            .into(),
+                    )
+                })?;
+                Ok(geometry.experts - uniform + 1)
+            }
+            Self::Inclusive => Ok(geometry.experts),
         }
     }
 }
@@ -301,7 +371,7 @@ impl HostPinPlan {
         terms: &HostTerms,
     ) -> Result<Self, EngError> {
         let overflow = || plan_error("the host byte counts overflow".into());
-        let places_per_layer = mode.places_per_layer(geometry);
+        let places_per_layer = mode.places_per_layer(geometry)?;
         let store_bytes = (geometry.layers as u64)
             .checked_mul(places_per_layer as u64)
             .and_then(|places| places.checked_mul(geometry.record_bytes as u64))
@@ -561,7 +631,7 @@ impl ReplaceOnMissLru {
                     geometry.experts
                 )));
             }
-            let mut resident = vec![u16::MAX; geometry.slots];
+            let mut resident = vec![u16::MAX; geometry.slots_of(layer)];
             for (expert, &slot) in row.iter().enumerate() {
                 if slot < 0 {
                     continue;
@@ -577,7 +647,7 @@ impl ReplaceOnMissLru {
             if resident.contains(&u16::MAX) {
                 return Err(bank_error(format!("layer {layer}: a slot is not filled")));
             }
-            let mut recency: Vec<u16> = (0..geometry.slots as u16).collect();
+            let mut recency: Vec<u16> = (0..geometry.slots_of(layer) as u16).collect();
             recency.sort_by_key(|&slot| {
                 let expert = resident[usize::from(slot)];
                 (count[usize::from(expert)], std::cmp::Reverse(expert))
@@ -675,14 +745,13 @@ impl SlotPolicy for ReplaceOnMissLru {
             demanded[usize::from(current.resident[0])] = true;
         }
         let protected = demanded.iter().filter(|&&flag| flag).count();
-        if protected > self.geometry.slots {
+        let width = self.geometry.slots_of(layer);
+        if protected > width {
             return Err(bank_error(format!(
-                "{protected} protected experts exceed the {} slots",
-                self.geometry.slots
+                "{protected} protected experts exceed the {width} slots"
             )));
         }
         let mut next = current.clone();
-        drop(current);
         if let Some(usage) = &mut self.usage {
             for expert in picked {
                 usage[layer][expert] += 1;
@@ -700,7 +769,7 @@ impl SlotPolicy for ReplaceOnMissLru {
         let mut newest_first = Vec::new();
         for &expert in experts_by_use.iter().rev() {
             self.check_expert(i32::from(expert))?;
-            if newest_first.len() < self.geometry.slots
+            if newest_first.len() < self.geometry.slots_of(layer)
                 && !std::mem::replace(&mut demanded[usize::from(expert)], true)
             {
                 newest_first.push(expert);
@@ -915,7 +984,7 @@ impl ExpertBankState<ReplaceOnMissLru> {
     ) -> Result<Self, EngError> {
         let geometry = BankGeometry::from_plan(plan, layout)?;
         let hot = plan.hot_set(counts)?;
-        if hot.table.slots() != geometry.slots {
+        if hot.table.slots() != geometry.uniform_slots().unwrap_or_default() {
             return Err(bank_error(
                 "the hot set and the bank disagree on the slot count".into(),
             ));
@@ -923,8 +992,8 @@ impl ExpertBankState<ReplaceOnMissLru> {
         let rows: Vec<&[i32]> = (0..geometry.layers)
             .map(|layer| hot.table.row(layer))
             .collect();
-        let policy = ReplaceOnMissLru::from_fill(geometry, &rows, counts)?;
-        Self::with_policy(geometry, mode, policy)
+        let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &rows, counts)?;
+        Self::with_policy(geometry.clone(), mode, policy)
     }
 }
 
@@ -943,16 +1012,16 @@ impl<P: SlotPolicy> ExpertBankState<P> {
         }
         for (layer, row) in rows.iter().enumerate() {
             let held = row.iter().filter(|&&slot| slot >= 0).count();
-            if held != geometry.slots {
+            if held != geometry.slots_of(layer) {
                 return Err(bank_error(format!(
                     "layer {layer}: the policy holds {held} experts, the bank has {} slots",
-                    geometry.slots
+                    geometry.slots_of(layer)
                 )));
             }
         }
         let places = HostPlaces::new(&geometry, mode, &rows);
         Ok(Self {
-            geometry,
+            geometry: geometry.clone(),
             mode,
             policy,
             places,
@@ -1172,8 +1241,8 @@ pub(super) mod device {
             source: &dyn RecordSource,
             plan: &HostPinPlan,
         ) -> Result<Self, EngError> {
-            let geometry: BankGeometry = *state.geometry();
-            let places = state.mode().places_per_layer(&geometry);
+            let geometry: BankGeometry = state.geometry().clone();
+            let places = state.mode().places_per_layer(&geometry)?;
             let store_bytes = (geometry.layers as u64)
                 .checked_mul(places as u64)
                 .and_then(|places| places.checked_mul(geometry.record_bytes as u64));
@@ -1195,14 +1264,15 @@ pub(super) mod device {
             let mut store = Vec::with_capacity(geometry.layers);
             let mut record = vec![0u8; geometry.record_bytes];
             for layer in 0..geometry.layers {
-                slots.push(ctx.allocate(geometry.slots * geometry.record_bytes)?);
+                let width = geometry.slots_of(layer);
+                slots.push(ctx.allocate(width * geometry.record_bytes)?);
                 let mut pinned = ctx.pinned_buf(places * geometry.record_bytes)?;
                 for (place, expert) in state.places().occupied(layer) {
                     source.record(layer, expert, &mut record)?;
                     pinned.write(geometry.offset(place as usize), &record)?;
                 }
                 store.push(pinned);
-                for slot in 0..geometry.slots {
+                for slot in 0..width {
                     let expert = state.expert_in_slot(layer, slot).ok_or_else(|| {
                         EngError::BadRequest("a slot of the filled bank is empty".into())
                     })?;
@@ -1335,7 +1405,7 @@ pub(super) mod device {
             if copies.ops.is_empty() {
                 return Ok(());
             }
-            let geometry: BankGeometry = *self.state.geometry();
+            let geometry: BankGeometry = self.state.geometry().clone();
             let layer = copies.layer;
             let (Some(bank), Some(store)) = (self.slots.get(layer), self.store.get_mut(layer))
             else {

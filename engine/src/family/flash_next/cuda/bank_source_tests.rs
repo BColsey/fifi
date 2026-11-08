@@ -481,11 +481,11 @@ mod device_tests {
             row[expert] = slot as i32;
         }
         let geometry = BankGeometry::new(1, 512, 10, SLOTS, record).expect("geometry");
-        let policy =
-            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &[counts]).expect("fill");
-        let state =
-            ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).expect("state");
-        let places = state.mode().places_per_layer(&geometry);
+        let policy = ReplaceOnMissLru::from_fill(geometry.clone(), &[row.as_slice()], &[counts])
+            .expect("fill");
+        let state = ExpertBankState::with_policy(geometry.clone(), HostMode::Exclusive, policy)
+            .expect("state");
+        let places = state.mode().places_per_layer(&geometry).expect("places");
         assert_eq!(places, 512 - SLOTS + 1);
 
         let projector = CudaProjector::new().expect("projector");
