@@ -1622,7 +1622,10 @@ mod tests {
         let _serial = crate::native_test_lock();
         let want = oracle(&PROMPT, 5, &mut seeded_sampler(), VOCAB);
         for (wrong, name) in [(true, "no draft accepted"), (false, "every draft accepted")] {
-            let (mut executor, mut session) = build(rules(vec![], VOCAB));
+            let mut big = rules(vec![], VOCAB);
+            // The window's snapshot charges the fixed DeltaNet bytes beside the row growth.
+            big.session_cap = 64 * 1024;
+            let (mut executor, mut session) = build(big);
             let mut job = seeded_generation(5);
             executor.prefill(&mut session, &PROMPT).unwrap();
             let mut speculator = Speculator::new(
