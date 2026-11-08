@@ -117,6 +117,31 @@ const CASES: [Case; 12] = [
     case("lm_head", "lm_head", Layer::None, 1, 466.0),
 ];
 
+/// A grouped input-projection launch of a mixer: the member cases in group order, the layers
+/// the group runs in per token, and the stock's microseconds for the whole group (the sum of the
+/// members' stock rows).
+struct Group {
+    name: &'static str,
+    members: &'static [&'static str],
+    per_token: usize,
+    stock_us: f64,
+}
+
+const GROUPS: [Group; 2] = [
+    Group {
+        name: "gdn_in",
+        members: &["gdn_qkv", "gdn_z"],
+        per_token: 36,
+        stock_us: 47.6,
+    },
+    Group {
+        name: "qsa_in",
+        members: &["qsa_q", "qsa_k", "qsa_v", "qsa_index"],
+        per_token: 12,
+        stock_us: 50.0,
+    },
+];
+
 const fn case(
     name: &'static str,
     prefix: &'static str,
@@ -184,6 +209,21 @@ fn selected_cases() -> Res<Vec<&'static Case>> {
             })
         })
         .collect()
+}
+
+/// The groups `FIFI_FLASH_NEXT_DENSE_CASES` names; without the variable, all. Group names ride
+/// the same variable as case names, so a run can pick one group alone or mix cases and groups.
+fn selected_groups() -> Res<Vec<&'static Group>> {
+    let Some(value) = std::env::var_os("FIFI_FLASH_NEXT_DENSE_CASES") else {
+        return Ok(GROUPS.iter().collect());
+    };
+    let names = value
+        .to_str()
+        .ok_or_else(|| fail("FIFI_FLASH_NEXT_DENSE_CASES must be UTF-8"))?;
+    Ok(names
+        .split(',')
+        .filter_map(|name| GROUPS.iter().find(|group| group.name == name))
+        .collect())
 }
 
 /// The tensor prefix of `case`.
@@ -339,6 +379,165 @@ impl<'a> Rig<'a> {
     }
 }
 
+/// One group on the device: pools of the member matrices and the summed buffers a grouped launch
+/// writes. The members share one input row (the same `k`); the scratch and output slices follow
+/// group order, as the mixer's `project_group` lays them out.
+struct GroupRig<'a> {
+    ctx: &'a CudaContext,
+    stream: DeviceStream,
+    weights: Vec<Vec<crate::family::project::cuda::exl3::Exl3Weight>>,
+    x: DeviceBuffer,
+    xh: DeviceBuffer,
+    z: DeviceBuffer,
+    out: DeviceBuffer,
+    flag: DeviceBuffer,
+    shapes: Vec<Shape>,
+    marks: [TimingEvent; 2],
+}
+
+impl<'a> GroupRig<'a> {
+    fn new(projector: &'a CudaProjector, matrices: &[&Matrix], shapes: Vec<Shape>) -> Res<Self> {
+        let ctx = projector.context();
+        let bytes: usize = shapes.iter().map(|shape| shape.bytes).sum();
+        let copies = POOL_BYTES.div_ceil(bytes).clamp(2, MAX_COPIES);
+        let k = shapes[0].k;
+        if shapes.iter().any(|shape| shape.k != k) {
+            return Err(fail(
+                "a group's members read different input widths".to_string(),
+            ));
+        }
+        let weights = (0..copies)
+            .map(|_| {
+                matrices
+                    .iter()
+                    .map(|&matrix| projector.upload_exl3(matrix, Reserve::default()))
+                    .collect::<Res<Vec<_>>>()
+            })
+            .collect::<Res<Vec<_>>>()?;
+        let n_total: usize = shapes.iter().map(|shape| shape.n).sum();
+        let x: Vec<u8> = input(k, 0).iter().flat_map(|v| v.to_le_bytes()).collect();
+        let floats = |count: usize| ctx.allocate(count * F32);
+        Ok(Self {
+            ctx,
+            stream: ctx.stream()?,
+            weights,
+            x: ctx.upload(&x)?,
+            xh: floats(shapes.len() * k)?,
+            z: floats(n_total)?,
+            out: floats(n_total)?,
+            flag: ctx.upload(&0u32.to_le_bytes())?,
+            shapes,
+            marks: [ctx.event_timing()?, ctx.event_timing()?],
+        })
+    }
+
+    /// The call of member `index` on weight copy `copy`, with the group-order scratch slices.
+    fn call(&self, copy: usize, index: usize) -> Res<()> {
+        let (k, n) = (self.shapes[index].k, self.shapes[index].n);
+        let (xh_at, z_at) = self.offsets(index);
+        let io = Exl3Io {
+            x: self.x.range(0, k * F32)?,
+            xh: self.xh.range(xh_at, k * F32)?,
+            z: self.z.range(z_at, n * F32)?,
+            out: self.out.range(z_at, n * F32)?,
+            flag: self.flag.range(0, F32)?,
+            rows: 1,
+            fused: false,
+        };
+        let view = self.weights[copy][index].view()?;
+        self.ctx.exl3_linear(&self.stream, view.linear_call(&io))
+    }
+
+    /// The whole group on weight copy `copy` as one `exl3_grouped_step` launch.
+    fn group(&self, copy: usize) -> Res<()> {
+        let mut calls = Vec::with_capacity(self.shapes.len());
+        for index in 0..self.shapes.len() {
+            let (k, n) = (self.shapes[index].k, self.shapes[index].n);
+            let (xh_at, z_at) = self.offsets(index);
+            let view = self.weights[copy][index].view()?;
+            calls.push(view.linear_call(&Exl3Io {
+                x: self.x.range(0, k * F32)?,
+                xh: self.xh.range(xh_at, k * F32)?,
+                z: self.z.range(z_at, n * F32)?,
+                out: self.out.range(z_at, n * F32)?,
+                flag: self.flag.range(0, F32)?,
+                rows: 1,
+                fused: false,
+            }));
+        }
+        self.ctx.exl3_grouped_step(&self.stream, &calls)
+    }
+
+    /// The float offsets of member `index` in the scratch buffers.
+    fn offsets(&self, index: usize) -> (usize, usize) {
+        let xh_at = self.shapes[..index]
+            .iter()
+            .map(|shape| shape.k)
+            .sum::<usize>()
+            * F32;
+        let z_at = self.shapes[..index]
+            .iter()
+            .map(|shape| shape.n)
+            .sum::<usize>()
+            * F32;
+        (xh_at, z_at)
+    }
+
+    /// The output and flag bytes one run of `mode` on copy `copy` writes, over a NaN fill.
+    fn written(&self, copy: usize, grouped: bool) -> Res<Vec<u8>> {
+        let n_total: usize = self.shapes.iter().map(|shape| shape.n).sum();
+        let nan = f32::NAN.to_le_bytes();
+        for (buffer, len) in [
+            (&self.xh, self.shapes.len() * self.shapes[0].k),
+            (&self.z, n_total),
+            (&self.out, n_total),
+        ] {
+            buffer.write_at(&self.stream, 0, &nan.repeat(len))?;
+        }
+        if grouped {
+            self.group(copy)?;
+        } else {
+            for index in 0..self.shapes.len() {
+                self.call(copy, index)?;
+            }
+        }
+        self.stream.synchronize()?;
+        let mut bytes = vec![0u8; n_total * F32 + F32];
+        self.out
+            .read_at(&self.stream, 0, &mut bytes[..n_total * F32])?;
+        self.flag
+            .read_at(&self.stream, 0, &mut bytes[n_total * F32..])?;
+        Ok(bytes)
+    }
+
+    /// Microseconds per whole group (one grouped launch, or every member once) over `ROUNDS`
+    /// passes of the pool, and the host's microseconds to queue one pass.
+    fn time(&self, grouped: bool) -> Res<(f64, f64)> {
+        let copies = self.weights.len();
+        self.stream.record_timing(&self.marks[0])?;
+        let queue = Instant::now();
+        for _ in 0..ROUNDS {
+            for copy in 0..copies {
+                if grouped {
+                    self.group(copy)?;
+                } else {
+                    for index in 0..self.shapes.len() {
+                        self.call(copy, index)?;
+                    }
+                }
+            }
+        }
+        let queued = queue.elapsed().as_secs_f64() * 1e6;
+        self.stream.record_timing(&self.marks[1])?;
+        self.stream.synchronize()?;
+        let passes = (ROUNDS * copies) as f64;
+        Ok((
+            device_us(&self.marks[0], &self.marks[1])? / passes,
+            queued / passes,
+        ))
+    }
+}
+
 fn run() -> Res<()> {
     let dir = std::env::var_os("FIFI_FLASH_NEXT_EXL3_PACK")
         .ok_or_else(|| fail("FIFI_FLASH_NEXT_EXL3_PACK"))?;
@@ -349,6 +548,7 @@ fn run() -> Res<()> {
     }
     let checkpoint = Checkpoint::open(Path::new(&dir))?;
     let cases = selected_cases()?;
+    let groups = selected_groups()?;
     let device = device_present("Flash-Next dense projection microbenchmark");
     let projector = device.then(CudaProjector::new).transpose()?;
     let mut mismatched = Vec::new();
@@ -365,6 +565,29 @@ fn run() -> Res<()> {
             mismatched.push(case.name);
         }
     }
+    for group in groups {
+        let Some(projector) = projector.as_ref() else {
+            break;
+        };
+        let member = |name: &str| -> Res<&'static Case> {
+            CASES
+                .iter()
+                .find(|case| case.name == name)
+                .ok_or_else(|| fail(format!("{name}: not a case")))
+        };
+        let matrices = group
+            .members
+            .iter()
+            .map(|&name| Ok(matrix(&checkpoint, &full_prefix(member(name)?)?)))
+            .collect::<Res<Vec<_>>>()?;
+        let shapes = matrices
+            .iter()
+            .map(|&matrix| shape_of(matrix, group.name))
+            .collect::<Res<Vec<_>>>()?;
+        if !measure_group(group, projector, &matrices, &shapes)? {
+            mismatched.push(group.name);
+        }
+    }
     if mismatched.is_empty() {
         return Ok(());
     }
@@ -374,6 +597,7 @@ fn run() -> Res<()> {
 }
 
 /// Checks every path against `legacy`, then times the paths that agree. `false` when a path wrote
+/// other bytes.
 /// other bytes.
 fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
     let last = rig.weights.len() - 1;
@@ -414,6 +638,88 @@ fn measure(case: &Case, rig: &Rig<'_>) -> Res<bool> {
     }
     report(case, rig, &samples, &agree);
     Ok(agree.iter().all(|&same| same))
+}
+
+/// Checks one group: the grouped launch must write the member-wise bytes, and must count as one
+/// wide launch of the routed shape. Then times the group against its separate members. `false`
+/// when the bytes or the launch counts disagree.
+fn measure_group(
+    group: &Group,
+    projector: &CudaProjector,
+    matrices: &[&Matrix],
+    shapes: &[Shape],
+) -> Res<bool> {
+    let rig = GroupRig::new(projector, matrices, shapes.to_vec())?;
+    let last = rig.weights.len() - 1;
+    select(rig.ctx, 2);
+    let want: Vec<Vec<u8>> = [0, last]
+        .iter()
+        .map(|&copy| rig.written(copy, false))
+        .collect::<Res<_>>()?;
+    let grouped: Vec<Vec<u8>> = [0, last]
+        .iter()
+        .map(|&copy| rig.written(copy, true))
+        .collect::<Res<_>>()?;
+    let mut ok = true;
+    for slot in 0..=last.min(1) {
+        if grouped[slot] != want[slot] {
+            ok = false;
+            println!(
+                "DENSEBENCH {{\"phase\":\"identity\",\"case\":\"{}\",\"path\":\"grouped\",\"equal\":false}}",
+                group.name
+            );
+        }
+    }
+    // The launch proof: one grouped call is exactly one wide1 launch of the routed shape; the
+    // members separately are `members.len()` of them. `exl3_grouped_step` chooses the kernel the
+    // context default picks, like every other launch in this bench.
+    let launch_delta = |grouped: bool| -> Res<u64> {
+        let before = rig.ctx.exl3_launch_counts().wide1;
+        if grouped {
+            rig.group(0)?;
+        } else {
+            for index in 0..shapes.len() {
+                rig.call(0, index)?;
+            }
+        }
+        rig.stream.synchronize()?;
+        Ok(rig.ctx.exl3_launch_counts().wide1 - before)
+    };
+    let separate_launches = launch_delta(false)?;
+    let grouped_launches = launch_delta(true)?;
+    if separate_launches != shapes.len() as u64 || grouped_launches != 1 {
+        return Err(fail(format!(
+            "{}: separate mode took {separate_launches} launches, grouped took {grouped_launches}",
+            group.name
+        )));
+    }
+    let (separate_us, separate_queued) = median_of(|| rig.time(false))?;
+    let (grouped_us, grouped_queued) = median_of(|| rig.time(true))?;
+    println!(
+        "DENSEBENCH {{\"phase\":\"group\",\"case\":\"{}\",\"members\":{},\"launches\":{{\"separate\":{separate_launches},\"grouped\":{grouped_launches}}},\"bytes_equal\":{ok},\"separate_us\":{separate_us:.2},\"grouped_us\":{grouped_us:.2},\"separate_queued_us\":{separate_queued:.2},\"grouped_queued_us\":{grouped_queued:.2},\"per_token\":{},\"stock_us\":{}}}",
+        group.name,
+        group.members.len(),
+        group.per_token,
+        group.stock_us
+    );
+    Ok(ok)
+}
+
+/// The median `(device, queued)` of `TRIALS - 1` timed samples.
+fn median_of<F: FnMut() -> Res<(f64, f64)>>(mut trial: F) -> Res<(f64, f64)> {
+    let mut samples = Vec::new();
+    for index in 0..TRIALS {
+        let timed = trial()?;
+        if index > 0 {
+            samples.push(timed);
+        }
+    }
+    let pick = |side: fn(&(f64, f64)) -> f64| -> f64 {
+        let mut values: Vec<f64> = samples.iter().map(side).collect();
+        values.sort_by(|a, b| a.total_cmp(b));
+        values[values.len() / 2]
+    };
+    Ok((pick(|s| s.0), pick(|s| s.1)))
 }
 
 fn report(case: &Case, rig: &Rig<'_>, samples: &[Vec<(f64, f64)>], agree: &[bool]) {

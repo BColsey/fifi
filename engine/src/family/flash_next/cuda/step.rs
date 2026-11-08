@@ -306,6 +306,48 @@ impl<'a> FlashStep<'a> {
         self.ctx.exl3_linear(self.stream, view.linear_call(&io))
     }
 
+    /// The input projections `parts` as one grouped launch: part `(prefix, col, n)` writes the
+    /// `n` floats of column `col` of `row`, exactly as one [`Self::project`] call per part would;
+    /// only the kernel grouping changes. The scratch slices follow group order, so the plan sizes
+    /// them for the member sums ([`exl3_scratch`]); the flag is shared, as in every group this
+    /// engine launches.
+    pub(super) fn project_group(
+        &self,
+        parts: &[(&str, usize, usize)],
+        x: DeviceRange<'_>,
+        row: &DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let (xh, z, flag) = (
+            self.slot(Slot::Exl3Xh)?,
+            self.slot(Slot::Exl3Z)?,
+            self.slot(Slot::Exl3Flag)?,
+        );
+        let mut xh_at = xh.offset();
+        let mut z_at = z.offset();
+        let mut calls = Vec::with_capacity(parts.len());
+        for (prefix, col, n) in parts {
+            let view = self.exl3(prefix)?.view()?;
+            let [k, wide] = view.shape;
+            if wide != *n {
+                return Err(refuse(format!(
+                    "{prefix} is {wide} wide, the mixer row expects {n}"
+                )));
+            }
+            calls.push(view.linear_call(&Exl3Io {
+                x,
+                xh: xh.buffer().range(xh_at, k * F32)?,
+                z: z.buffer().range(z_at, n * F32)?,
+                out: Self::columns(row, *col, *n)?,
+                flag,
+                rows: 1,
+                fused: false,
+            }));
+            xh_at += k * F32;
+            z_at += n * F32;
+        }
+        self.ctx.exl3_grouped_step(self.stream, &calls)
+    }
+
     /// `width` floats of `row` from float column `col`.
     pub(super) fn columns<'r>(
         row: &DeviceRange<'r>,

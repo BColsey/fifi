@@ -70,15 +70,13 @@ impl FlashStep<'_> {
         let beta_off = z_off + delta.value_width();
         let alpha_off = beta_off + delta.value_heads;
 
-        self.project(
-            &at("linear_attn.in_proj_qkv"),
+        self.project_group(
+            &[
+                (&at("linear_attn.in_proj_qkv"), 0, delta.conv_dim),
+                (&at("linear_attn.in_proj_z"), z_off, delta.value_width()),
+            ],
             x,
-            Self::columns(&row, 0, delta.conv_dim)?,
-        )?;
-        self.project(
-            &at("linear_attn.in_proj_z"),
-            x,
-            Self::columns(&row, z_off, delta.value_width())?,
+            &row,
         )?;
         for (name, offset) in [
             ("linear_attn.in_proj_b.weight", beta_off),
@@ -187,14 +185,20 @@ impl FlashStep<'_> {
                 idx_off + qsa.idx_proj()
             )));
         }
-        for (prefix, col, n) in [
-            ("self_attn.q_proj", 0, q_cols),
-            ("self_attn.k_proj", k_off, kv_cols),
-            ("self_attn.v_proj", v_off, kv_cols),
-            ("self_attn.indexer.index_qk_proj", idx_off, qsa.idx_proj()),
-        ] {
-            self.project(&at(prefix), x, Self::columns(&row, col, n)?)?;
-        }
+        self.project_group(
+            &[
+                (&at("self_attn.q_proj"), 0, q_cols),
+                (&at("self_attn.k_proj"), k_off, kv_cols),
+                (&at("self_attn.v_proj"), v_off, kv_cols),
+                (
+                    &at("self_attn.indexer.index_qk_proj"),
+                    idx_off,
+                    qsa.idx_proj(),
+                ),
+            ],
+            x,
+            &row,
+        )?;
 
         let positions = self.state_plan.positions();
         // A context shorter than the selection budget completes fewer blocks than the budget, and

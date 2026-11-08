@@ -321,6 +321,14 @@ fn exl3_scratch(geometry: &FlashGeometry, rows: usize) -> Result<(usize, usize),
         (rows, h, qsa.kv_width()),
         (rows, h, qsa.idx_proj()),
         (rows, qsa.q_width(), h),
+        // the grouped input projections of the mixers: every member reads the same k, the z
+        // spans the sum of the member widths (the tuple counts members as rows)
+        (2 * rows, h, delta.conv_dim + delta.value_width()),
+        (
+            4 * rows,
+            h,
+            2 * qsa.q_width() + 2 * qsa.kv_width() + qsa.idx_proj(),
+        ),
         // PLE: key and value projections of the n-gram row
         (rows, geometry.ple_embed, geometry.width()),
         (rows, geometry.ple_embed, h),
