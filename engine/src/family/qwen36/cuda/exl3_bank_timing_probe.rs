@@ -106,7 +106,7 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         id = step.run_token(id, true).expect("decoded token");
     }
     let decode_wall = began.elapsed();
-    let ((readback_calls, readback_ns), (resolve_calls, resolve_ns)) =
+    let ((readback_calls, readback_ns), (_resolve_calls, resolve_ns)) =
         crate::family::qwen36::cuda::exl3_bank::probe::take();
     let (hits, misses) = bank.borrow().stats();
     println!(

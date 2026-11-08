@@ -195,12 +195,16 @@ fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
 }
 
 /// The ids of the picks, read back once the router has run; a faulty router row writes -1.
+/// Reads `count` picks back, which waits for the stream: the one drain the block makes. A
+/// fault-marked or out-of-range id is the router's own error (non-finite logits).
 fn read_picks(
     launch: &Launch<'_>,
     ids: &DeviceRange<'_>,
-    dims: &MoeDims,
+    count: usize,
+    n_expert: usize,
 ) -> Result<Vec<usize>, EngError> {
-    let mut raw = vec![0u8; dims.top_k * I32];
+    let mut raw = vec![0u8; count * I32];
+    #[cfg(test)]
     let began = std::time::Instant::now();
     ids.buffer()
         .read_at(launch.stream, ids.offset(), &mut raw)?;
@@ -212,7 +216,7 @@ fn read_picks(
         .map(|bytes| {
             usize::try_from(i32::from_le_bytes(*bytes))
                 .ok()
-                .filter(|&id| id < dims.n_expert)
+                .filter(|&id| id < n_expert)
                 .ok_or_else(|| {
                     EngError::ModelOutput(
                         "EXL3 moe block: the router picked no valid expert (non-finite logits)"
@@ -610,9 +614,10 @@ pub(in crate::family) fn run_exl3_moe(
         }
         routed_on_device(launch, weights, bufs, dims)?;
     } else {
-        let picks = read_picks(launch, &bufs.route.ids, dims)?;
+        let picks = read_picks(launch, &bufs.route.ids, dims.top_k, dims.n_expert)?;
         let picks = match bank {
             Some(bank) => {
+                #[cfg(test)]
                 let began = std::time::Instant::now();
                 let mapped = bank.resolve(launch.stream, &picks)?;
                 #[cfg(test)]
@@ -658,27 +663,14 @@ fn row_bufs<'b>(
     })
 }
 
-/// The block of one layer of a K-row verify window (`dims.rows` rows, 2 to 8) on the one stream.
-/// `bufs` holds the K-row buffers: row `r` of each per-row buffer is at `r` rows from its start.
-///
-/// The router runs once for all rows (the decode kernel at every row count: below 8 rows one
-/// launch, from 8 rows chunks of 4). The routed experts differ per row, so each row runs its own
-/// chain of id-indexed launches on its own ranges, exactly the launches of the one-row block with
-/// other pointers; the results of every row stay in their own buffers until the combine. The
-/// shared expert and the combine take all rows at once. The picks stay on the device, so the block
-/// waits for nothing.
-pub(in crate::family) fn run_exl3_moe_rows(
+/// The router of a K-row block: one launch over every row, its picks to the id array.
+fn route_rows(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
+    rows: usize,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
-    let rows = dims.rows;
-    if !(2..=8).contains(&rows) {
-        return Err(refuse(format!(
-            "the K-row block takes 2 to 8 rows, got {rows}"
-        )));
-    }
     let route = &bufs.route;
     launch.ctx.router_rows(
         launch.stream,
@@ -702,11 +694,92 @@ pub(in crate::family) fn run_exl3_moe_rows(
                 status: route.status,
             },
         },
-    )?;
+    )
+}
+
+/// The block of one layer of a K-row verify window (`dims.rows` rows, 2 to 8) on the one stream.
+/// `bufs` holds the K-row buffers: row `r` of each per-row buffer is at `r` rows from its start.
+///
+/// The router runs once for all rows (the decode kernel at every row count: below 8 rows one
+/// launch, from 8 rows chunks of 4). The routed experts differ per row, so each row runs its own
+/// chain of id-indexed launches on its own ranges, exactly the launches of the one-row block with
+/// other pointers; the results of every row stay in their own buffers until the combine. The
+/// shared expert and the combine take all rows at once. The picks stay on the device, so the block
+/// waits for nothing.
+pub(in crate::family) fn run_exl3_moe_rows(
+    launch: &Launch<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) -> Result<(), EngError> {
+    let rows = dims.rows;
+    if !(2..=8).contains(&rows) {
+        return Err(refuse(format!(
+            "the K-row block takes 2 to 8 rows, got {rows}"
+        )));
+    }
+    route_rows(launch, weights, bufs, rows, dims)?;
     let one = MoeDims { rows: 1, ..*dims };
     for index in 0..rows {
         routed_on_device(launch, weights, &row_bufs(bufs, dims, index)?, &one)?;
     }
+    let route = &bufs.route;
+    shared_rows(
+        launch,
+        &SharedWeights {
+            gate: weights.shared_gate,
+            up: weights.shared_up,
+            down: weights.shared_down,
+        },
+        &SharedRowsIo {
+            norm_row: route.norm_row,
+            gu: bufs.shared_gu,
+            act: bufs.shared_act,
+            out: bufs.shared_out,
+            scratch: bufs.scratch,
+        },
+        (dims.hidden, dims.shared_inter, rows),
+    )?;
+    combine(launch, bufs, dims)
+}
+
+/// The block of one layer of a K-row verify window on a banked engine: the router, the shared
+/// expert and the combine are the resident body's. The routed experts differ: the picks of
+/// every row are read back once — the one drain of the layer — then each row runs the host-pick
+/// chain of the one-row banked block over its own ranges, its picks mapped through the layer's
+/// slot table (refilling missed slots from the host store first), so the grouped launches read
+/// the slot members of the bank views exactly as the resident body reads its expert members.
+/// The body waits for the host inside every layer, so a banked step never captures it.
+pub(in crate::family) fn run_exl3_moe_rows_banked(
+    launch: &Launch<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+    bank: &mut super::exl3_bank::LayerResolver<'_, '_>,
+) -> Result<(), EngError> {
+    let rows = dims.rows;
+    if !(2..=8).contains(&rows) {
+        return Err(refuse(format!(
+            "the K-row block takes 2 to 8 rows, got {rows}"
+        )));
+    }
+    route_rows(launch, weights, bufs, rows, dims)?;
+    let picks = read_picks(launch, &bufs.route.ids, rows * dims.top_k, dims.n_expert)?;
+    let one = MoeDims { rows: 1, ..*dims };
+    for (index, row) in picks.chunks(dims.top_k).enumerate() {
+        #[cfg(test)]
+        let began = std::time::Instant::now();
+        let mapped = bank.resolve(launch.stream, row)?;
+        #[cfg(test)]
+        crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+        routed(
+            launch,
+            weights,
+            &row_bufs(bufs, dims, index)?,
+            (&mapped, &one),
+        )?;
+    }
+    let route = &bufs.route;
     shared_rows(
         launch,
         &SharedWeights {

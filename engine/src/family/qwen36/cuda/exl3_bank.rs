@@ -497,15 +497,17 @@ pub(crate) struct LayerResolver<'r, 'w> {
 }
 
 impl LayerResolver<'_, '_> {
-    /// Maps one call's picks (a decode token's, or a prefill sub-block's) to slots, refilling
-    /// the missed slots' device bytes from the store. The copies are host-synchronous
-    /// (`upload_at` waits for its copy): the readback that produced the picks has already
-    /// waited for the stream, and the launches this return feeds queue behind the copies.
+    /// Maps one call's picks (a decode token's, a prefill sub-block's, or a K-row window
+    /// row's) to slots, refilling the missed slots' device bytes from the store. The copies
+    /// are enqueued on `stream` (`write_at_enqueue`; the store is page-locked after the load):
+    /// the readback that produced the picks has already waited for the stream, and the
+    /// launches this return feeds queue behind the copies on the same stream.
     pub(crate) fn resolve(
         &mut self,
         stream: &DeviceStream,
         picks: &[usize],
     ) -> Result<Vec<usize>, EngError> {
+        #[cfg(test)]
         let began = std::time::Instant::now();
         let (table, parts) = &mut self.resolver.layers[self.layer];
         let store = self.resolver.store.layer(self.layer);

@@ -47,6 +47,8 @@ mod executor;
 mod executor_tests;
 mod exl3_bank;
 #[cfg(test)]
+mod exl3_bank_krow_device_tests;
+#[cfg(test)]
 mod exl3_bank_step_device_tests;
 #[cfg(test)]
 mod exl3_bank_timing_probe;

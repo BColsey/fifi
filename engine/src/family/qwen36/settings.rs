@@ -217,9 +217,9 @@ pub(crate) struct Q36Options {
     /// rows, and start is refused when they cannot be allocated.
     pub(crate) draft_rollback: Option<String>,
     /// How a verify window runs its rows: `eager` (the default: the one-row step once per row) or
-    /// `krow` (one captured K-row graph per window). `krow` needs `draft_rollback` `device` and
-    /// the EXL3 pack. The K-row device path is not built yet: the engine refuses to start with
-    /// `krow` until it is (`family/qwen36/krow.rs`).
+    /// `krow` (one K-row window; a captured graph per window length on a resident engine, the
+    /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
+    /// `draft_rollback` `device` and the EXL3 pack.
     pub(crate) draft_verify: Option<String>,
 }
 
@@ -1042,9 +1042,10 @@ pub(crate) fn cache_growth_per_position(
 /// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
 /// `chunk_ready` keeps a tiered session off the chunk path).
 /// The checked `expert_bank` entry, or `None` when the member is absent. The refusals mirror the
-/// qualified state of the arm: the banked decode is eager-only, has no speculative-draft path,
-/// and reads an EXL3 pack (so `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse
-/// `exl3` themselves).
+/// qualified state of the arm: the banked decode is eager-only and reads an EXL3 pack (so
+/// `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse `exl3` themselves). An
+/// enabled draft rides the same banked body (`ngram` today; `mtp` refuses globally, having no
+/// draft step).
 fn expert_bank_settings(
     options: &Q36Options,
     backend: Backend,
@@ -1066,15 +1067,6 @@ fn expert_bank_settings(
     if options.capture == Some(true) {
         return Err(bad(
             "expert_bank and capture exclude each other: the banked decode is eager only".into(),
-        ));
-    }
-    if options
-        .draft_mode
-        .as_deref()
-        .is_some_and(|mode| mode != "disabled")
-    {
-        return Err(bad(
-            "expert_bank does not support speculative decoding; set draft_mode disabled".into(),
         ));
     }
     let slots = match bank.slots {
@@ -1537,8 +1529,8 @@ mod tests {
                 "capture",
             ),
             (
-                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#,
-                "speculative decoding",
+                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"mtp","mtp_model_dir":"/h"}"#,
+                "no draft step",
             ),
             (
                 r#"{"weight_format":"exl3","expert_bank":{"slots":4}}"#,
@@ -1554,7 +1546,8 @@ mod tests {
             ),
             (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
         ] {
-            assert!(message(cuda_offload(body)).contains(needle), "{body}");
+            let text = message(cuda_offload(body));
+            assert!(text.contains(needle), "{body}: {text}");
         }
         // The member is CUDA-only; on the MLX arm the refusal fires before the pack check
         // (the cache limit the MLX settings also need comes from the env).
@@ -1570,6 +1563,14 @@ mod tests {
 
     #[test]
     fn expert_bank_accepts_the_fit_request_and_explicit_slots_from_the_floor() {
+        // An ngram draft rides the banked window (the refusal above holds mtp out).
+        let draft =
+            cuda_offload(r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#)
+                .unwrap();
+        assert!(matches!(
+            draft.speculation.mode,
+            crate::family::speculate::config::DraftMode::Ngram
+        ));
         let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
         assert_eq!(
             fit.expert_bank.map(|bank| (bank.slots, bank.mode)),

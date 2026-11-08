@@ -143,6 +143,7 @@ fn read_ids(
 ) -> Result<Vec<i32>, EngError> {
     let pairs = dims.rows * dims.top_k;
     let mut raw = vec![0u8; pairs * I32];
+    #[cfg(test)]
     let began = std::time::Instant::now();
     ids.buffer()
         .read_at(projector.launch.stream, ids.offset(), &mut raw)?;
@@ -169,6 +170,7 @@ fn read_plan(
     // block reads its expert ids. A fault-marked id (-1) falls through to the sort's refusal.
     let picks = match bank {
         Some(bank) if !picks.iter().any(|&id| id < 0) => {
+            #[cfg(test)]
             let began = std::time::Instant::now();
             let wanted = picks.iter().map(|&id| id as usize).collect::<Vec<_>>();
             let mapped = bank.resolve(projector.launch.stream, &wanted)?;
@@ -589,10 +591,10 @@ fn slice_at<'b>(
 
 /// Stages 10-17 of one banked chunk layer: the shared expert once for the whole chunk, then the
 /// routed experts and the combine per sub-block, because the launches of one block read every
-/// pick of its rows together and the bank holds only `slots` members. Each sub-block's picks
-/// are read back, mapped through the slot table (refilling missed slots from the host store)
-/// and grouped as slot ids. `sub` carries each sub-block's first row and its dims, built by the
-/// caller from its own chunk model.
+/// pick of its rows together and the bank holds only `slots` members. The whole chunk's picks
+/// are read back once; each sub-block's picks are then mapped through the slot table
+/// (refilling missed slots from the host store) and grouped as slot ids. `sub` carries each
+/// sub-block's first row and its dims, built by the caller from its own chunk model.
 pub(super) fn run_banked(
     projector: &Projector<'_>,
     weights: &Exl3MoeWeights<'_>,
