@@ -1,0 +1,359 @@
+{
+  "date_local": "2026-11-08 America/New_York",
+  "method": "Same binary, identical 131072-token configuration and input for each arm, fusion off versus on, sequential engine loads. Prefill divides prompt tokens by total wall time through the two-token reply. Decode rate is server-reported tokens after the first batch divided by elapsed time between first and last batch.",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X",
+    "gpu_order": [
+      "NVIDIA GeForce RTX 3060 12 GB (PCIe 4.0 x4)",
+      "NVIDIA GeForce RTX 3080 10 GB (PCIe 4.0 x8)"
+    ],
+    "driver": "615.78.08 with local P2P patch",
+    "kernel": "7.0.0-42-generic"
+  },
+  "model": {
+    "file": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "context_tokens": 131072,
+    "kv_dtype": "q8",
+    "prefix_reuse": false,
+    "synchronized_broadcasts": true,
+    "skip_prefill_head": true,
+    "preallocated_kv_admission": false
+  },
+  "provenance": {
+    "code_commit": "dc061f210e95990abc9e18818e692c58d054ec2c",
+    "candidate_binary_sha256": "f9e7d4145641ef613bc549a3c0b26feca97661a1303b7ed9514c1556e640ba2b",
+    "prefill_driver_sha256": "cc8d51af6d67f75200a6582d4235efdc94bccb36c1eb45ea5fe868344956516f",
+    "decode_driver_sha256": "18784169af16a62928618bccacb475ceb311f79ba180b8011d8c6850323edf6f",
+    "reply_comparison_driver_sha256": "2f4d1350e983033e951ee73f7e0e7bf6fd8d5a91c8a21be76b35d64ea8418582"
+  },
+  "requested_host_expert_bytes_by_card": [
+    1342177280,
+    3489660928
+  ],
+  "mapped_expert_bytes_by_card": [
+    1358954496,
+    3548381184
+  ],
+  "free_bytes_by_card_after_load": [
+    1536753664,
+    1726611456
+  ],
+  "control": {
+    "prefill": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.903965,
+          "estimated_prompt_tokens_per_second": 37.687,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.947439,
+          "estimated_prompt_tokens_per_second": 37.57,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.829464,
+          "estimated_prompt_tokens_per_second": 37.89,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 13.903965,
+      "median_prompt_tokens_per_second": 37.687
+    },
+    "short_decode": {
+      "model": "fifi-q36",
+      "repeat": 0,
+      "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+      "samples": [
+        {
+          "request_id": "chatcmpl-0000000000000008",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 837.1,
+          "decode_tokens_per_second": 36.25,
+          "total_seconds": 4.342631
+        },
+        {
+          "request_id": "chatcmpl-0000000000000009",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 838.6,
+          "decode_tokens_per_second": 35.95,
+          "total_seconds": 4.37299
+        },
+        {
+          "request_id": "chatcmpl-000000000000000a",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 837.5,
+          "decode_tokens_per_second": 36.37,
+          "total_seconds": 4.331136
+        }
+      ],
+      "median_decode_tokens_per_second": 36.25
+    },
+    "long_decode": {
+      "model": "fifi-q36",
+      "repeat": 850,
+      "payload_sha256": "2dd8757dcc85fedf53efe046c814733d343da5be1f937debf52a5423198d15e5",
+      "samples": [
+        {
+          "request_id": "chatcmpl-000000000000000b",
+          "prompt_tokens": 4282,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 113200.6,
+          "decode_tokens_per_second": 36.2,
+          "total_seconds": 116.715524
+        }
+      ],
+      "median_decode_tokens_per_second": 36.2
+    },
+    "prefill_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 13873.9,
+        "decode_tokens_per_second": 35.99
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 13917.8,
+        "decode_tokens_per_second": 36.38
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 13799.0,
+        "decode_tokens_per_second": 35.41
+      }
+    ]
+  },
+  "fused": {
+    "prefill": {
+      "model": "fifi-q36",
+      "repeat": 100,
+      "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+      "samples": [
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 12.974339,
+          "estimated_prompt_tokens_per_second": 40.387,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000005"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.029546,
+          "estimated_prompt_tokens_per_second": 40.216,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000006"
+        },
+        {
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "answer": "4",
+          "seconds": 13.059353,
+          "estimated_prompt_tokens_per_second": 40.124,
+          "context_limit": 131072,
+          "request_id": "chatcmpl-0000000000000007"
+        }
+      ],
+      "median_seconds": 13.029546,
+      "median_prompt_tokens_per_second": 40.216
+    },
+    "short_decode": {
+      "model": "fifi-q36",
+      "repeat": 0,
+      "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+      "samples": [
+        {
+          "request_id": "chatcmpl-0000000000000008",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 787.9,
+          "decode_tokens_per_second": 38.52,
+          "total_seconds": 4.086237
+        },
+        {
+          "request_id": "chatcmpl-0000000000000009",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 792.7,
+          "decode_tokens_per_second": 38.64,
+          "total_seconds": 4.081669
+        },
+        {
+          "request_id": "chatcmpl-000000000000000a",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 791.1,
+          "decode_tokens_per_second": 38.71,
+          "total_seconds": 4.072988
+        }
+      ],
+      "median_decode_tokens_per_second": 38.64
+    },
+    "long_decode": {
+      "model": "fifi-q36",
+      "repeat": 850,
+      "payload_sha256": "2dd8757dcc85fedf53efe046c814733d343da5be1f937debf52a5423198d15e5",
+      "samples": [
+        {
+          "request_id": "chatcmpl-000000000000000b",
+          "prompt_tokens": 4282,
+          "completion_tokens": 128,
+          "finish_reason": "length",
+          "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+          "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+          "time_to_first_token_ms": 106459.1,
+          "decode_tokens_per_second": 38.37,
+          "total_seconds": 109.775397
+        }
+      ],
+      "median_decode_tokens_per_second": 38.37
+    },
+    "prefill_telemetry": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 12946.4,
+        "decode_tokens_per_second": 38.8
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 13001.3,
+        "decode_tokens_per_second": 38.1
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "status": 200,
+        "outcome": "ok",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 13031.7,
+        "decode_tokens_per_second": 38.69
+      }
+    ]
+  },
+  "four_deterministic_replies": {
+    "model": "fifi-q36",
+    "prompts": [
+      "Compute 19 plus 23. Reply with only the number.",
+      "Name the capital of Japan in one word.",
+      "What are the three letters immediately after D? Reply with just those letters.",
+      "What is the opposite of cold? Reply with one word."
+    ],
+    "results": [
+      {
+        "content": "42",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Tokyo",
+        "finish_reason": "stop",
+        "prompt_tokens": 21,
+        "completion_tokens": 3
+      },
+      {
+        "content": "EFG",
+        "finish_reason": "stop",
+        "prompt_tokens": 27,
+        "completion_tokens": 3
+      },
+      {
+        "content": "Hot",
+        "finish_reason": "stop",
+        "prompt_tokens": 24,
+        "completion_tokens": 2
+      }
+    ]
+  },
+  "changes": {
+    "prefill_percent": 6.71,
+    "short_decode_percent": 6.59,
+    "long_decode_percent_single_samples": 5.99,
+    "long_ttft_percent_single_samples": -5.96
+  },
+  "verification": {
+    "expert_gpu_test": "1 passed; 24 alternating fused/unfused runs, complete expert_down and residual rows bit-exact on each card, all TokenRun fields equal and ring statuses clean; exchanges in test fixture 12 to 5",
+    "session_gpu_test": "1 passed; first and later complete logits rows matched on both physical GPUs",
+    "gpu_test_threads": 1,
+    "release_cuda_build": "passed",
+    "clippy_native_cuda_deny_warnings": "passed",
+    "rustfmt": "passed",
+    "decode_driver_cpu_mock_test": "1 passed",
+    "benchmark_driver_self_tests": "passed"
+  },
+  "limitations": [
+    "The 4282-token comparison has one sample per arm. An unrelated CPU build overlapped the control long-prompt run, so that comparison is indicative only.",
+    "A separate session attempted to start an engine on the occupied port during the fused long-prompt run; it failed to bind. No additional GPU compute process was present at the end of the experiment.",
+    "The 131072-token context was configured but not filled in this A/B experiment.",
+    "All timings are from one host, one model and this particular placement."
+  ]
+}
