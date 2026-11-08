@@ -44,7 +44,7 @@ use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
 use super::super::moe::Routing;
-use super::super::ops::{Ctx, cast_to, dim, linear, short_import, to_act, values};
+use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
@@ -402,7 +402,7 @@ fn run(
         StepMode::Prompt => None,
         StepMode::Window => {
             let final_h = ctx.kernels.rms_norm(&h, &weights.final_norm, shape.eps)?;
-            let logits = linear(&mut ctx, &weights.lm_head, &final_h)?;
+            let logits = linear_rows(&mut ctx, &weights.lm_head, &final_h)?;
             Some((logits, None))
         }
         StepMode::Generate | StepMode::Logits | StepMode::Record => {
