@@ -1743,7 +1743,7 @@ mod tests {
         let mut f = fixture_with_rate(Duration::from_secs(60), 2, 0.0);
         let mut device = MockDevice::default();
         f.host.preload_all(&mut device).unwrap();
-        let mut token = |f: &mut Fixture, device: &mut MockDevice, id: u16| {
+        let token = |f: &mut Fixture, device: &mut MockDevice, id: u16| {
             f.host
                 .begin_layer(0, &[i32::from(id)], &[1.0], &f.hidden, &f.hidden)
                 .unwrap();
