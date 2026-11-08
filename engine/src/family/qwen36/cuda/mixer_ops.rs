@@ -152,10 +152,13 @@ pub(super) enum BlockOp {
     },
     /// The KV8 append of the Int8G32 step: the f32 `k`/`v` rows of the prep op, quantized into the
     /// four code and scale `planes` of this layer's KV pool at cells `*pos ..`; a refused position
-    /// ORs mask 4 into the `status` word.
+    /// ORs mask 4 into the `status` word. `k_at`/`v_at` is the f32-value offset of the card's
+    /// K/V head slice inside the gathered full-width row (0 for a whole-row state).
     Kv8Append {
         k: Slot,
         v: Slot,
+        k_at: usize,
+        v_at: usize,
         k_codes: Plane,
         k_scales: Plane,
         v_codes: Plane,
@@ -225,6 +228,8 @@ pub(super) enum BlockOp {
     KvAppendF16 {
         k: Slot,
         v: Slot,
+        k_at: usize,
+        v_at: usize,
         k_plane: Plane,
         v_plane: Plane,
         pos: StepField,
@@ -562,6 +567,8 @@ fn attn_ops(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Vec<Blo
             BlockOp::Kv8Append {
                 k: Slot::KRows,
                 v: Slot::VRows,
+                k_at: 0,
+                v_at: 0,
                 k_codes: Plane::K,
                 k_scales: Plane::KScales,
                 v_codes: Plane::V,
@@ -739,10 +746,15 @@ fn attn_ops_card(
             layout,
         ))
     };
+    // The append consumes the card's slice of the gathered full-width
+    // row: its K/V heads start at `k_range.0` f32 values into the row.
+    let (k_at, v_at) = (k_range.0, k_range.0);
     let append = match kv_mode {
         KvMode::Fp16 => CardOp::Local(BlockOp::KvAppendF16 {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at,
+            v_at,
             k_plane: Plane::K,
             v_plane: Plane::V,
             pos: StepField::Pos,
@@ -751,6 +763,8 @@ fn attn_ops_card(
         KvMode::Int8G32 => CardOp::Local(BlockOp::Kv8Append {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at,
+            v_at,
             k_codes: Plane::K,
             k_scales: Plane::KScales,
             v_codes: Plane::V,
@@ -782,10 +796,14 @@ fn attn_ops_card(
                 )));
             }
             let span = a.heads_q / groups;
-            let kv_heads = (k_range.0 / head_dim, k_range.0 / head_dim + span);
-            if !k_range.0.is_multiple_of(head_dim) || k_range.1 / head_dim != kv_heads.1 {
+            // The card's cache planes hold ONLY its own heads (sliced at
+            // allocation), so the decode addresses them from head 0 of the
+            // card's planes, not from the absolute head index.
+            let kv_heads = (0, span);
+            let run_heads = (k_range.1 - k_range.0) / head_dim;
+            if !k_range.0.is_multiple_of(head_dim) || run_heads != span {
                 return Err(EngError::BadRequest(format!(
-                    "card attn: kv rows {k_range:?} do not cover the card's {span} kv heads"
+                    "card attn: kv rows {k_range:?} hold {run_heads} heads, not the card's {span}                      kv heads"
                 )));
             }
             CardOp::Local(BlockOp::AttnDecodeQ8Card {

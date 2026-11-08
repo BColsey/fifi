@@ -184,11 +184,17 @@ fn card_geometries_tile_the_full_geometry() {
             cards * g.delta.key_heads,
             "{cards} cards: key heads (replicated)"
         );
+        // The cache heads TILE: each card's sliced cache holds its own K/V
+        // head groups, so the card counts sum to the full head count.
+        assert_eq!(
+            sum(&|c| c.attn.heads_kv),
+            g.attn.heads_kv,
+            "{cards} cards: KV cache heads (sliced, tiling)"
+        );
         // The replicated widths stay full on every card.
         for card in 0..cards {
             let c = MixerGeometry::for_card(&d, &table, card).expect("card geometry");
             assert_eq!(c.hidden, g.hidden, "card {card}: residual row");
-            assert_eq!(c.attn.heads_kv, g.attn.heads_kv, "card {card}: KV cache");
             assert_eq!(c.attn.head_dim, g.attn.head_dim, "card {card}: head dim");
             assert_eq!(c.attn.n_rot, g.attn.n_rot, "card {card}: rope");
             assert_eq!(

@@ -942,10 +942,28 @@ fn make_multi(
     };
     let loads = card_loads(table, &inventory, quant)?;
     let fixed_admission = plan.modes.fixed_admission;
-    // The load reserve keeps the single-device figure: it holds the KV bytes
-    // free during each card's upload, and over-reserving per card (the cards
-    // share the KV rows) only refuses a tight fit earlier, never corrupts it.
-    let load = load_options(plan.reserve, fixed_admission);
+    // The load reserve keeps the single-device figure except its state
+    // term: the card caches are SLICED (each card stores only its own K/V
+    // head groups), so the largest card's sliced state replaces the full
+    // replica's. Over-reserving only refuses a tight fit earlier, never
+    // corrupts it, and the post-load floor check still guards every card.
+    let reserve = {
+        let head_dim = dims.shape.attn.head_dim;
+        let full_state = u64::try_from(StateLayout::new(&dims, &options)?.bytes()?)
+            .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
+        let mut max_card_state: u64 = 0;
+        for card in 0..settings.cuda_devices.len() {
+            let heads = table.kv_rows(card)?.len() / head_dim;
+            let bytes =
+                u64::try_from(StateLayout::new_with_kv_heads(&dims, &options, heads)?.bytes()?)
+                    .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
+            max_card_state = max_card_state.max(bytes);
+        }
+        plan.reserve
+            .saturating_sub(full_state)
+            .saturating_add(max_card_state)
+    };
+    let load = load_options(reserve, fixed_admission);
     // Experimental and default off. The original variable controls card 1;
     // the new card-0 variable leaves that existing setting compatible.
     let first_var = "Q36_P2P_HOST_EXPERT_BYTES_0";

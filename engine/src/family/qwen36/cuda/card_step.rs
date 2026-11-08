@@ -161,11 +161,16 @@ impl CardStack {
         for (card, context) in contexts.iter().enumerate() {
             let plan = StepPlan::for_card(dims, table, card, options, &scratch)?;
             shards.push(CardShard::new(context, &streams[card], &plan)?);
-            states.push(ResidentState::allocate(
+            // The card's cache planes hold only its own K/V head groups
+            // (whole head multiples by the shard table's deal); the
+            // gathered full row stays at the whole shape's width.
+            let kv_heads = table.kv_rows(card)?.len() / dims.shape.attn.head_dim;
+            states.push(ResidentState::allocate_with_kv_heads(
                 context,
                 &streams[card],
                 dims,
                 options,
+                kv_heads,
             )?);
             plans.push(plan);
         }
@@ -443,7 +448,9 @@ mod device_tests {
                     slot.slot
                 );
             }
-            // The state is full-size and shaped like every other card's.
+            // The delta state replicates; the KV pool is SLICED to the
+            // card's own heads, and the cards' pools together hold exactly
+            // one full replica's worth of cache.
             assert!(states[card].kv_bytes() > 0);
             assert_eq!(
                 states[card].layout().delta.total,
@@ -454,6 +461,14 @@ mod device_tests {
                 states[card].kv_bytes(),
                 states[1 - card].kv_bytes(),
                 "card {card}: kv state size"
+            );
+            assert_eq!(
+                states[card].kv_bytes() + states[1 - card].kv_bytes(),
+                crate::family::qwen36::cuda::state_layout::StateLayout::new(&d, &options())
+                    .expect("full layout")
+                    .kv
+                    .total,
+                "the sliced pools hold exactly one replica of KV"
             );
         }
         for (card, shard) in stack.shards().iter().enumerate() {

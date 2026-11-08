@@ -687,6 +687,8 @@ impl<'a> Mixers<'a> {
             BlockOp::Kv8Append {
                 k,
                 v,
+                k_at,
+                v_at,
                 k_codes,
                 k_scales,
                 v_codes,
@@ -710,12 +712,21 @@ impl<'a> Mixers<'a> {
                         },
                     )
                 } else {
+                    // The card's slice of the gathered full-width row: its
+                    // K/V heads at `k_at` f32 values in, `heads_kv` heads
+                    // wide, quantized into its sliced planes.
+                    let kv_width = g.attn.heads_kv * g.attn.head_dim;
+                    let slice = |slot: Slot, at: usize| -> Result<_, EngError> {
+                        let view = self.view(slot)?;
+                        view.buffer()
+                            .range(view.offset() + at * F32, kv_width * F32)
+                    };
                     ctx.kv8_append(
                         stream,
                         kv8_shape(g, run.state.layout().kv.capacity),
                         Kv8Data {
-                            k: self.view(k)?,
-                            v: self.view(v)?,
+                            k: slice(k, k_at)?,
+                            v: slice(v, v_at)?,
                             k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
                             k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
                             v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
@@ -1016,11 +1027,13 @@ impl<'a> Mixers<'a> {
                     },
                 )
             }
-            // The card F16 append: the gathered full rows into the
-            // replicated fp16 cache pair of this layer.
+            // The card F16 append: the card's slice of the gathered full
+            // rows into the card's sliced fp16 cache pair of this layer.
             BlockOp::KvAppendF16 {
                 k,
                 v,
+                k_at,
+                v_at,
                 k_plane,
                 v_plane,
                 pos,
@@ -1032,12 +1045,18 @@ impl<'a> Mixers<'a> {
                     head_dim: g.attn.head_dim,
                     cells: run.state.layout().kv.capacity,
                 };
+                let kv_width = g.attn.heads_kv * g.attn.head_dim;
+                let slice = |slot: Slot, at: usize| -> Result<_, EngError> {
+                    let view = self.view(slot)?;
+                    view.buffer()
+                        .range(view.offset() + at * F32, kv_width * F32)
+                };
                 ctx.kv_f16_append(
                     stream,
                     shape,
                     KvF16AppendData {
-                        k: self.view(k)?,
-                        v: self.view(v)?,
+                        k: slice(k, k_at)?,
+                        v: slice(v, v_at)?,
                         k_cache: run.state.kv_plane(run.ordinal, k_plane)?,
                         v_cache: run.state.kv_plane(run.ordinal, v_plane)?,
                     },
