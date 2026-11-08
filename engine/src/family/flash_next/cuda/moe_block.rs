@@ -98,20 +98,28 @@ pub(super) struct ScratchLayout {
 }
 
 impl ScratchLayout {
-    pub(super) fn new(n_expert: usize, top_k: usize, hidden: usize) -> Result<Self, EngError> {
+    /// `rows` is the chunk row count the multi-row block plans for (`1` for the decode block);
+    /// only the regions the block indexes per row scale with it.
+    pub(super) fn new(
+        n_expert: usize,
+        top_k: usize,
+        hidden: usize,
+        rows: usize,
+    ) -> Result<Self, EngError> {
         let overflow = || refuse("the scratch size overflows".into());
+        let mul = |a: Option<usize>, b: usize| a.and_then(|at| at.checked_mul(b));
         let regions = [
             n_expert.checked_mul(I32),
-            top_k.checked_mul(I32),
-            top_k.checked_mul(F32),
+            mul(rows.checked_mul(top_k), I32),
+            mul(rows.checked_mul(top_k), F32),
             top_k.checked_mul(LOG_ENTRY),
             Some(CTRL_BYTES),
             Some(I32),
             Some(REQUEST_BYTES),
             hidden.checked_mul(F32),
-            top_k.checked_mul(I32),
-            top_k.checked_mul(F32),
-            hidden.checked_mul(F32),
+            mul(rows.checked_mul(top_k), I32),
+            mul(rows.checked_mul(top_k), F32),
+            mul(rows.checked_mul(hidden), F32),
         ];
         let mut offsets = [0usize; 11];
         let mut at = 0usize;
@@ -318,8 +326,10 @@ mod device {
             flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
             project::cuda::exl3::Exl3Weight,
             qwen36::cuda::{
-                exl3_moe::{Exl3MoeBufs, Scratch, SharedWeights, shared_of},
-                moe::{Launch, MoeDims},
+                exl3_moe::{
+                    Exl3MoeBufs, Scratch, SharedRowsIo, SharedWeights, shared_of, shared_rows,
+                },
+                moe::{Launch, MoeDims, RouteBufs},
             },
         },
         kernels::cuda::{
@@ -450,7 +460,8 @@ mod device {
                 .shared_gate
                 .view()?
                 .book;
-            let scratch_layout = ScratchLayout::new(dims.n_expert, dims.top_k, dims.hidden)?;
+            let scratch_layout =
+                ScratchLayout::new(dims.n_expert, dims.top_k, dims.hidden, dims.rows)?;
             let scratch = ctx.upload(&vec![0u8; scratch_layout.total])?;
             Ok(Self {
                 trunks,
@@ -588,7 +599,7 @@ mod device {
                 },
             )?;
             if self.verify_finite_filler {
-                self.check_filler(launch, bufs, dims, &classified.weights)?;
+                self.check_filler(launch, bufs, dims, 0, &classified.weights)?;
             }
 
             // The copies for every pick, hits included; they run behind the resident pass.
@@ -613,27 +624,333 @@ mod device {
                     },
                 )?;
                 if self.verify_finite_filler {
-                    self.check_filler(launch, bufs, dims, &miss_weights)?;
+                    self.check_filler(launch, bufs, dims, 0, &miss_weights)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// The buffers of row `r` of a multi-row chunk, as the one-row [`Self::run`] sees them:
+        /// the miss pass of `run_rows` reuses `pass` over them.
+        fn row_of<'b>(
+            bufs: &Exl3MoeBufs<'b>,
+            dims: &MoeDims,
+            r: usize,
+        ) -> Result<Exl3MoeBufs<'b>, EngError> {
+            let (h, i, k) = (dims.hidden, dims.inter, dims.top_k);
+            Ok(Exl3MoeBufs {
+                route: RouteBufs {
+                    resid_in: row(&bufs.route.resid_in, h * F32, r)?,
+                    resid_out: row(&bufs.route.resid_out, h * F32, r)?,
+                    norm_row: row(&bufs.route.norm_row, h * F32, r)?,
+                    logits: row(&bufs.route.logits, (dims.n_expert + 1) * F32, r)?,
+                    ids: row(&bufs.route.ids, k * F32, r)?,
+                    weights: row(&bufs.route.weights, k * F32, r)?,
+                    shared_gate: row(&bufs.route.shared_gate, F32, r)?,
+                    status: bufs.route.status,
+                },
+                expert_gu: row(&bufs.expert_gu, k * 2 * i * F32, r)?,
+                expert_act: row(&bufs.expert_act, k * i * F32, r)?,
+                expert_down: row(&bufs.expert_down, k * h * F32, r)?,
+                shared_gu: row(&bufs.shared_gu, 2 * dims.shared_inter * F32, r)?,
+                shared_act: row(&bufs.shared_act, dims.shared_inter * F32, r)?,
+                shared_out: row(&bufs.shared_out, h * F32, r)?,
+                scratch: bufs.scratch,
+            })
+        }
+
+        /// The MoE block of a chunk of `dims.rows` rows (`2..=8`), the batched shape of
+        /// [`Self::run`]: one router launch over every row, one classify per row against the
+        /// layer's slot row as the chunk found it (all before the single host read of the
+        /// picks), the resident passes of every row in flat grouped launches with the shared
+        /// expert and the first combine over all rows, and then, one row at a time, that row's
+        /// bank copies and miss pass — the per-row timeline of `run`, so a later row's copies
+        /// cannot disturb an earlier row's second pass.
+        pub(in crate::family::flash_next) fn run_rows(
+            &mut self,
+            launch: &Launch<'_>,
+            layer: usize,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+        ) -> Result<(), EngError> {
+            let m = dims.rows;
+            if !(2..=8).contains(&m) {
+                return Err(refuse(format!("the block takes 2 to 8 rows, got {m}")));
+            }
+            let geometry = *self.bank.geometry();
+            if dims.n_expert != geometry.experts
+                || dims.top_k != geometry.top_k
+                || layer >= geometry.layers
+            {
+                return Err(refuse(format!(
+                    "layer {layer} with {} experts and {} picks does not fit a bank of {} layers, \
+                     {} experts and {} picks",
+                    dims.n_expert, dims.top_k, geometry.layers, geometry.experts, geometry.top_k
+                )));
+            }
+            let (ctx, stream) = (launch.ctx, launch.stream);
+            let sc = self.layout;
+            let (h, i, k, e) = (dims.hidden, dims.inter, dims.top_k, dims.n_expert);
+            let scratch = &self.scratch;
+            let slot_ids = scratch.range(sc.slot_ids, m * k * I32)?;
+            let slot_weights = scratch.range(sc.weights, m * k * F32)?;
+            let partial = scratch.range(sc.partial, m * h * F32)?;
+
+            // One router over every row; its picks drive the host bank, so they come back once.
+            let trunk = &self.trunks[layer];
+            ctx.router_rows(
+                stream,
+                RouterCall {
+                    shape: RouterShape {
+                        m,
+                        hidden: h,
+                        n_expert: e,
+                        top_k: k,
+                    },
+                    x: bufs.route.norm_row,
+                    weights: RouterWeights {
+                        w: whole(trunk.router)?,
+                        w_shared: Some(whole(trunk.router_shared)?),
+                    },
+                    logits: bufs.route.logits,
+                    out: RouterOut {
+                        ids: bufs.route.ids,
+                        weights: bufs.route.weights,
+                        shared_gate: Some(bufs.route.shared_gate),
+                        status: bufs.route.status,
+                    },
+                },
+            )?;
+            let mut raw_ids = vec![0u8; m * k * I32];
+            bufs.route
+                .ids
+                .buffer()
+                .read_at(stream, bufs.route.ids.offset(), &mut raw_ids)?;
+            let mut raw_weights = vec![0u8; m * k * F32];
+            bufs.route.weights.buffer().read_at(
+                stream,
+                bufs.route.weights.offset(),
+                &mut raw_weights,
+            )?;
+            let mut picks: Vec<(Vec<i32>, Vec<f32>)> = Vec::with_capacity(m);
+            for r in 0..m {
+                let ids: Vec<i32> = raw_ids[r * k * I32..][..k * I32]
+                    .as_chunks::<I32>()
+                    .0
+                    .iter()
+                    .map(|bytes| i32::from_le_bytes(*bytes))
+                    .collect();
+                if ids.iter().any(|&id| !(0..e as i32).contains(&id)) {
+                    return Err(refuse(
+                        "the router picked no valid expert (non-finite logits?)".into(),
+                    ));
+                }
+                let weights: Vec<f32> = raw_weights[r * k * F32..][..k * F32]
+                    .as_chunks::<I32>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes))
+                    .collect();
+                picks.push((ids, weights));
+            }
+
+            // One classify per row against the slot row as the chunk found it: a pick another
+            // row of the chunk missed still rides this row's own second pass.
+            let slot_row: Vec<i32> = self.bank.slot_row(layer)?.to_vec();
+            scratch.write_at(stream, sc.slot_row, &le_i32(&slot_row))?;
+            let mut classified = Vec::with_capacity(m);
+            for r in 0..m {
+                ctx.tiered_classify(
+                    stream,
+                    ClassifyCall {
+                        shape: ClassifyShape {
+                            n_expert: e,
+                            slots: geometry.slots,
+                            top_k: k,
+                            hidden: h,
+                            layer,
+                        },
+                        ids: row(&bufs.route.ids, k * I32, r)?,
+                        weights: row(&bufs.route.weights, k * F32, r)?,
+                        slot_row: scratch.range(sc.slot_row, e * I32)?,
+                        norm_row: row(&bufs.route.norm_row, h * F32, r)?,
+                        slot_ids_out: scratch.range(sc.slot_ids + r * k * I32, k * I32)?,
+                        weights_out: scratch.range(sc.weights + r * k * F32, k * F32)?,
+                        log_out: scratch.range(sc.log, k * LOG_ENTRY)?,
+                        ctrl: scratch.range(sc.ctrl, CTRL_BYTES)?,
+                        word: scratch.range(sc.word, I32)?,
+                        mbox_req: scratch.range(sc.mbox_req, REQUEST_BYTES)?,
+                        mbox_row: scratch.range(sc.mbox_row, h * F32)?,
+                    },
+                )?;
+                classified.push(classify_picks(
+                    &slot_row,
+                    geometry.slots,
+                    &picks[r].0,
+                    &picks[r].1,
+                )?);
+            }
+
+            // The resident pass of every row in flat launches: pick `r * k + p` indexes the
+            // flat slot ids the classifies wrote.
+            let mut gu = Vec::with_capacity(2 * m * k);
+            let mut down = Vec::with_capacity(m * k);
+            for r in 0..m {
+                for pick in 0..k {
+                    for part in 0..2usize {
+                        gu.push(Item {
+                            part,
+                            pick: (r * k + pick) as u32,
+                            x: row(&bufs.route.norm_row, h * F32, r)?,
+                            out: row(&bufs.expert_gu, i * F32, 2 * (r * k + pick) + part)?,
+                        });
+                    }
+                    down.push(Item {
+                        part: 2,
+                        pick: (r * k + pick) as u32,
+                        x: row(&bufs.expert_act, i * F32, r * k + pick)?,
+                        out: row(&bufs.expert_down, h * F32, r * k + pick)?,
+                    });
+                }
+            }
+            self.grouped(launch, layer, &gu, (slot_ids, &bufs.scratch))?;
+            ctx.swiglu_rows(
+                stream,
+                SwigluRowsCall {
+                    shape: SwigluRowsShape {
+                        rows: m * k,
+                        n_ff: i,
+                        up_off: i,
+                        ld_in: 2 * i,
+                        ld_out: i,
+                    },
+                    gu: bufs.expert_gu,
+                    act: bufs.expert_act,
+                },
+            )?;
+            self.grouped(launch, layer, &down, (slot_ids, &bufs.scratch))?;
+            if self.verify_finite_filler {
+                for r in 0..m {
+                    self.check_filler(launch, bufs, dims, r, &classified[r].weights)?;
+                }
+            }
+
+            // The shared expert of every row, then the first combine over the resident pass.
+            shared_rows(
+                launch,
+                &SharedWeights {
+                    gate: trunk.shared_gate,
+                    up: trunk.shared_up,
+                    down: trunk.shared_down,
+                },
+                &SharedRowsIo {
+                    norm_row: bufs.route.norm_row,
+                    gu: bufs.shared_gu,
+                    act: bufs.shared_act,
+                    out: bufs.shared_out,
+                    scratch: bufs.scratch,
+                },
+                (h, dims.shared_inter, m),
+            )?;
+            ctx.moe_combine(
+                stream,
+                CombineCall {
+                    shape: CombineShape {
+                        m,
+                        n: h,
+                        top_k: k,
+                        ld_down: h,
+                    },
+                    res: bufs.route.resid_in,
+                    down: bufs.expert_down,
+                    weights: slot_weights,
+                    shared: Some(SharedTerm {
+                        gate: bufs.route.shared_gate,
+                        row: bufs.shared_out,
+                    }),
+                    out: CombineOut::To(partial),
+                },
+            )?;
+
+            // Per row: the copies for its picks, then its miss pass — or, when every pick was
+            // resident, the one combine that moves the resident result to the block output.
+            for r in 0..m {
+                if classified[r].misses.is_empty() {
+                    scratch.write_at(
+                        stream,
+                        sc.miss_weights + r * k * F32,
+                        &le_f32(&vec![0.0; k]),
+                    )?;
+                    ctx.moe_combine(
+                        stream,
+                        CombineCall {
+                            shape: CombineShape {
+                                m: 1,
+                                n: h,
+                                top_k: k,
+                                ld_down: h,
+                            },
+                            res: row(&partial, h * F32, r)?,
+                            down: row(&bufs.expert_down, k * h * F32, r)?,
+                            weights: scratch.range(sc.miss_weights + r * k * F32, k * F32)?,
+                            shared: None,
+                            out: CombineOut::To(row(&bufs.route.resid_out, h * F32, r)?),
+                        },
+                    )?;
+                    continue;
+                }
+                self.bank.step(ctx, layer, &picks[r].0)?;
+                let slot_row_after = self.bank.slot_row(layer)?.to_vec();
+                let second =
+                    plan_second_pass(&picks[r].0, &picks[r].1, &classified[r], &slot_row_after)?;
+                if let Some((miss_slots, miss_weights)) = second.miss {
+                    scratch.write_at(stream, sc.miss_ids + r * k * I32, &le_i32(&miss_slots))?;
+                    scratch.write_at(
+                        stream,
+                        sc.miss_weights + r * k * F32,
+                        &le_f32(&miss_weights),
+                    )?;
+                    let row_bufs = Self::row_of(bufs, dims, r)?;
+                    self.pass(
+                        launch,
+                        &row_bufs,
+                        dims,
+                        Pass {
+                            layer,
+                            ids: scratch.range(sc.miss_ids + r * k * I32, k * I32)?,
+                            weights: scratch.range(sc.miss_weights + r * k * F32, k * F32)?,
+                            shared: false,
+                            res: row(&partial, h * F32, r)?,
+                            out: row(&bufs.route.resid_out, h * F32, r)?,
+                        },
+                    )?;
+                    if self.verify_finite_filler {
+                        self.check_filler(launch, &row_bufs, dims, 0, &miss_weights)?;
+                    }
                 }
             }
             Ok(())
         }
 
         /// Reads the down rows back and refuses a non-finite row whose pick weight is zero.
+        /// `r` indexes the rows of a multi-row chunk (`0` for the single-row block).
+        #[expect(clippy::too_many_arguments, reason = "one debug read of one row")]
         fn check_filler(
             &self,
             launch: &Launch<'_>,
             bufs: &Exl3MoeBufs<'_>,
             dims: &MoeDims,
+            r: usize,
             weights: &[f32],
         ) -> Result<(), EngError> {
-            let mut raw = vec![0u8; dims.top_k * dims.hidden * F32];
+            let (h, k) = (dims.hidden, dims.top_k);
+            let mut raw = vec![0u8; k * h * F32];
             bufs.expert_down.buffer().read_at(
                 launch.stream,
-                bufs.expert_down.offset(),
+                bufs.expert_down.offset() + r * k * h * F32,
                 &mut raw,
             )?;
-            match first_poisoned_filler(&raw, dims.hidden, weights) {
+            match first_poisoned_filler(&raw, h, weights) {
                 Some(pick) => Err(refuse(format!(
                     "the filler expert (slot 0) gave a non-finite output on pick {pick}; \
                      0.0 times it would poison the sum"

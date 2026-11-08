@@ -220,7 +220,7 @@ fn the_chunked_prefill_driver_matches_the_oracle() {
         kv_format: KvFormatName::F16,
         slots: None,
         expert_stats: None,
-        prefill_rows: 4,
+        prefill_rows: var("FIFI_FLASH_NEXT_DRIVER_ROWS").map_or(4, |v| v.parse().expect("rows")),
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
 

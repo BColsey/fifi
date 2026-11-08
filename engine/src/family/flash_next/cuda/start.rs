@@ -617,7 +617,7 @@ pub(super) fn build_driver(
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
-        &step.moe_dims(1),
+        &step.moe_dims(rows),
     )?;
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;

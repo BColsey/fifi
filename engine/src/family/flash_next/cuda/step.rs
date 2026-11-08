@@ -138,7 +138,7 @@ impl<'a> FlashStep<'a> {
         let step_plan = StepPlan::new(&geometry, rows, positions, &options)?;
         let state = ctx.arena(&state_plan.arena_tensors())?;
         let scratch = ctx.arena(&step_plan.arena_tensors())?;
-        let zeros = ctx.upload(&vec![0u8; geometry.hidden * F32])?;
+        let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
         let step = Self {
             ctx,
             stream,
@@ -573,7 +573,7 @@ impl<'a> FlashStep<'a> {
             .range(ids.offset() + r * g.top_k * F32, g.top_k * F32)?;
         Ok(Exl3MoeBufs {
             route: RouteBufs {
-                resid_in: self.zeros.range(0, self.zeros.bytes())?,
+                resid_in: self.zeros.range(r * g.hidden * F32, g.hidden * F32)?,
                 resid_out: at(Slot::BlockOut(Site::Mlp), g.hidden)?,
                 norm_row: at(Slot::Mixed(Site::Mlp), g.hidden)?,
                 logits: at(Slot::RouterLogits, g.experts + 1)?,
@@ -596,6 +596,42 @@ impl<'a> FlashStep<'a> {
         })
     }
 
+    /// The buffers of the MoE block over all `m` rows at once: every slot spans `m` rows and
+    /// the residual input is the plan's zero rows. The batched block
+    /// ([`MoeBlock::run_rows`]); `m` must match the plan's row count.
+    pub(super) fn moe_bufs_rows(&self, m: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
+        let g = &self.geometry;
+        let at = |slot: Slot, width: usize| -> Result<DeviceRange<'_>, EngError> {
+            let range = self.slot(slot)?;
+            range.buffer().range(range.offset(), width * m * F32)
+        };
+        let ids = self.slot(Slot::TopkId)?;
+        let ids = ids.buffer().range(ids.offset(), g.top_k * m * F32)?;
+        Ok(Exl3MoeBufs {
+            route: RouteBufs {
+                resid_in: self.zeros.range(0, self.zeros.bytes())?,
+                resid_out: at(Slot::BlockOut(Site::Mlp), g.hidden)?,
+                norm_row: at(Slot::Mixed(Site::Mlp), g.hidden)?,
+                logits: at(Slot::RouterLogits, g.experts + 1)?,
+                ids,
+                weights: at(Slot::TopkWeight, g.top_k)?,
+                shared_gate: at(Slot::SharedGate, 1)?,
+                status: self.status_word()?,
+            },
+            expert_gu: at(Slot::ExpertGu, g.top_k * 2 * g.inter)?,
+            expert_act: at(Slot::ExpertAct, g.top_k * g.inter)?,
+            expert_down: at(Slot::ExpertDown, g.top_k * g.hidden)?,
+            shared_gu: at(Slot::SharedGu, 2 * g.shared_inter)?,
+            shared_act: at(Slot::SharedAct, g.shared_inter)?,
+            shared_out: at(Slot::SharedOut, g.hidden)?,
+            scratch: Scratch {
+                xh: self.slot(Slot::Exl3Xh)?,
+                z: self.slot(Slot::Exl3Z)?,
+                flag: self.slot(Slot::Exl3Flag)?,
+            },
+        })
+    }
+
     /// The MoE block of `layer` at the phases `Route` to `Combine`, run by `moe`: the output lands
     /// in `BlockOut(Mlp)`.
     pub(super) fn moe_block(
@@ -604,13 +640,17 @@ impl<'a> FlashStep<'a> {
         moe: &mut dyn MoeBlock,
         m: usize,
     ) -> Result<(), EngError> {
+        let launch = Launch {
+            ctx: self.ctx,
+            stream: self.stream,
+        };
+        // The split block takes a chunk in one call; every other block loops one row.
+        if m > 1 && moe.batches_rows() {
+            return moe.run_rows(&launch, layer, &self.moe_bufs_rows(m)?, &self.moe_dims(m));
+        }
         // The split block runs one row; a chunk loops it over its rows.
         let dims = self.moe_dims(1);
         for r in 0..m {
-            let launch = Launch {
-                ctx: self.ctx,
-                stream: self.stream,
-            };
             moe.run(&launch, layer, &self.moe_bufs_at(r)?, &dims)?;
         }
         Ok(())
@@ -831,6 +871,25 @@ pub(super) trait MoeBlock {
         bufs: &Exl3MoeBufs<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError>;
+
+    /// Whether [`MoeBlock::run_rows`] takes a multi-row chunk in one call.
+    fn batches_rows(&self) -> bool {
+        false
+    }
+
+    /// The block over `dims.rows` rows of `bufs` (every buffer spans that many rows). Only
+    /// called when [`MoeBlock::batches_rows`] says so.
+    fn run_rows(
+        &mut self,
+        _launch: &Launch<'_>,
+        _layer: usize,
+        _bufs: &Exl3MoeBufs<'_>,
+        _dims: &MoeDims,
+    ) -> Result<(), EngError> {
+        Err(EngError::BadRequest(
+            "this MoE block has no multi-row path".into(),
+        ))
+    }
 }
 
 /// The stand-in until the split block lands: Qwen3.6's EXL3 MoE block over routed experts that
@@ -945,5 +1004,29 @@ impl MoeBlock for SplitMoeAt<'_> {
                 ))
             })?;
         self.inner.run(launch, row, bufs, dims)
+    }
+
+    fn batches_rows(&self) -> bool {
+        true
+    }
+
+    fn run_rows(
+        &mut self,
+        launch: &Launch<'_>,
+        layer: usize,
+        bufs: &Exl3MoeBufs<'_>,
+        dims: &MoeDims,
+    ) -> Result<(), EngError> {
+        let row = layer
+            .checked_sub(self.first_layer)
+            .filter(|&row| row < self.rows)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is outside the bank's layers {}..{}",
+                    self.first_layer,
+                    self.first_layer + self.rows
+                ))
+            })?;
+        self.inner.run_rows(launch, row, bufs, dims)
     }
 }

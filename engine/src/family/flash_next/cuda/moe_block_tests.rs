@@ -138,7 +138,7 @@ fn close(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn the_private_scratch_is_aligned_disjoint_and_small() {
-    let layout = ScratchLayout::new(512, 10, 2560).unwrap();
+    let layout = ScratchLayout::new(512, 10, 2560, 1).unwrap();
     let regions = [
         (layout.slot_row, 512 * 4),
         (layout.slot_ids, 40),
