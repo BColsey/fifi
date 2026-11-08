@@ -355,6 +355,12 @@ pub(crate) enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkSlot {
     Hidden,
+    /// The card plans' permanent zero row (`m * hidden` f32): the arena is
+    /// zero-filled at build and nothing ever writes this slot, so card 1's
+    /// MoE combine reads it as the residual of its `CombineOut::To`
+    /// partial - the exchange then sums card 0's residual-included output
+    /// with card 1's partial alone.
+    Zero,
     IdsTok,
     X,
     X2,
@@ -803,14 +809,25 @@ pub(crate) fn chunk_tensors_for(
             "prefill plan: nsm {nsm} is below 1; the fixup range needs the device SM count"
         )));
     }
-    let rows = [
+    let mut rows: Vec<Row> = [
         common_rows(g, m, nsm)?,
         mixer_rows(g, m)?,
         moe_rows_with(dims, moe, m)?,
-    ];
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let hidden = dims.shape.hidden;
+    rows.push((
+        ChunkSlot::Zero,
+        m.checked_mul(hidden)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(overflow)?,
+        Phase::Embed,
+        Phase::Combine,
+    ));
     Ok(rows
         .into_iter()
-        .flatten()
         .map(|(slot, bytes, first, last)| {
             let (first, last) = (first as usize, last as usize);
             (slot, ArenaTensor { bytes, first, last })
