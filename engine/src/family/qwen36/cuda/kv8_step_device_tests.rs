@@ -553,6 +553,7 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
         kv_mode: KvMode::Int8G32,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers = Mixers::new(&context, parts)?;
     let resid_slot = if layer.is_multiple_of(2) {

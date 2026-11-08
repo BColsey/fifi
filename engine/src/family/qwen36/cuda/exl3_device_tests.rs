@@ -141,6 +141,7 @@ fn capture(
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         },
     )?;
     // Match the existing native block rig: initialized params and run_block, no invented

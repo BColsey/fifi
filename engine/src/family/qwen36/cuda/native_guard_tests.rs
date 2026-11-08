@@ -42,7 +42,7 @@ fn the_native_projection_columns_are_aligned() {
     assert_eq!((a.k_off, a.v_off, a.ld), (8192, 8704, 9216));
     for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
         assert!(
-            block_ops(kind, &g, WeightLayout::Native, KvMode::Fp16).is_ok(),
+            block_ops(kind, &g, WeightLayout::Native, KvMode::Fp16, false).is_ok(),
             "{kind:?}"
         );
     }
@@ -123,7 +123,7 @@ fn exl3_mixers_read_f32_and_keep_projection_inputs_live() {
         let plan = StepPlan::exl3_mixers(&d, &options, &scratch).unwrap();
         let full = StepPlan::new(&d, 1, &options, &scratch).unwrap();
         for kind in [AttentionKind::DeltaNet, AttentionKind::Full] {
-            let ops = block_ops(kind, &g, WeightLayout::Exl3, kv_mode).unwrap();
+            let ops = block_ops(kind, &g, WeightLayout::Exl3, kv_mode, false).unwrap();
             assert!(
                 ops.iter()
                     .any(|op| matches!(op, BlockOp::ProjectExl3 { .. }))
@@ -150,6 +150,7 @@ fn the_exl3_delta_block_projects_the_gates_plain_and_the_rest_through_exl3() {
         &g,
         WeightLayout::Exl3,
         KvMode::Fp16,
+        false,
     )
     .unwrap();
     let columns = |wanted: fn(&super::mixer_ops::BlockOp) -> Option<(Role, usize)>| {
@@ -180,14 +181,21 @@ fn the_exl3_delta_block_projects_the_gates_plain_and_the_rest_through_exl3() {
         ]
     );
     // A full-attention block has no plain projection, and no layout but EXL3 has one.
-    let attn = block_ops(AttentionKind::Full, &g, WeightLayout::Exl3, KvMode::Fp16).unwrap();
+    let attn = block_ops(
+        AttentionKind::Full,
+        &g,
+        WeightLayout::Exl3,
+        KvMode::Fp16,
+        false,
+    )
+    .unwrap();
     assert!(
         !attn
             .iter()
             .any(|op| matches!(op, BlockOp::ProjectPlain { .. }))
     );
     for layout in [WeightLayout::Tiled, WeightLayout::Native] {
-        let ops = block_ops(AttentionKind::DeltaNet, &g, layout, KvMode::Fp16).unwrap();
+        let ops = block_ops(AttentionKind::DeltaNet, &g, layout, KvMode::Fp16, false).unwrap();
         assert!(
             !ops.iter()
                 .any(|op| matches!(op, BlockOp::ProjectPlain { .. }))

@@ -47,8 +47,8 @@ use super::{
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
-        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
-        tiered::TieredScratch,
+        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
+        run_moe_block, tiered::TieredScratch,
     },
     prefill_driver::{
         AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,

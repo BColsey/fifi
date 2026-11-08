@@ -244,6 +244,7 @@ fn run_block(
         kv_mode: super::dims::KvMode::Fp16,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers = Mixers::new(ctx, parts)?;
     mixers.run_block(
