@@ -814,6 +814,7 @@ pub(super) fn concat_step(
     cache: &ConcatCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, ConcatCache), EngError> {
     let a = &shape.attn;
     let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
@@ -837,8 +838,10 @@ pub(super) fn concat_step(
         scale: 1.0,
         offset: pos,
     };
+    // The folded input norm, matching `step`: x is the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // 1. Query and gate, interleaved per head.
-    let qp = linear(ctx, &w.q, x)?;
+    let qp = linear(ctx, &w.q, &normed)?;
     let qp = ctx.kernels.reshape(&qp, &[heads, pair])?;
     let q_raw = ctx.kernels.slice(&qp, &[0, 0], &[heads, width])?;
     let gate = ctx.kernels.slice(&qp, &[0, width], &[heads, pair])?;
@@ -847,13 +850,13 @@ pub(super) fn concat_step(
     let q = ctx.kernels.reshape(&q, &[1, heads, 1, width])?;
     let q = ctx.kernels.rope_scaled(&q, &rope)?;
     // 3. New key: norm and RoPE per key-value head.
-    let kp = linear(ctx, &w.k, x)?;
+    let kp = linear(ctx, &w.k, &normed)?;
     let kp = ctx.kernels.reshape(&kp, &[kv_heads, width])?;
     let k_new = ctx.kernels.rms_norm(&kp, &w.k_norm, shape.eps)?;
     let k_new = ctx.kernels.reshape(&k_new, &[1, kv_heads, 1, width])?;
     let k_new = ctx.kernels.rope_scaled(&k_new, &rope)?;
     // 4. New value.
-    let v_new = linear(ctx, &w.v, x)?;
+    let v_new = linear(ctx, &w.v, &normed)?;
     let v_new = ctx.kernels.reshape(&v_new, &[1, kv_heads, 1, width])?;
     let k_new = cast_to(ctx, &k_new, Dtype::F32)?;
     let v_new = cast_to(ctx, &v_new, Dtype::F32)?;
@@ -875,7 +878,9 @@ pub(super) fn concat_step(
     let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
     let o = to_act(ctx, &o)?;
-    let out = linear(ctx, &w.o, &o)?;
+    let mixed = linear(ctx, &w.o, &o)?;
+    // The folded output residual, matching `step`.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &mixed)?;
     Ok((
         out,
         ConcatCache {
@@ -1071,7 +1076,16 @@ mod tests {
                 compile: false,
             };
             let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let t = n as usize + 1;
             // The cache arithmetic: one growth every three positions.
             let want_cap = [3, 3, 3, 6, 6, 6, 9, 9, 9][n as usize];
