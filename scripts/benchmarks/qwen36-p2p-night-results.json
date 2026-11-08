@@ -1,0 +1,410 @@
+{
+  "schema": 1,
+  "hardware": "RTX 3060 12 GB + RTX 3080 10 GB, peer access enabled",
+  "model": "Qwen3.6-35B-A3B Q4_K_M GGUF, q8 KV",
+  "prefill_method": "prompt tokens divided by wall time to the complete short reply; includes request overhead and output",
+  "limitations": [
+    "The night prefill arms use different engine builds and in some cases different host-expert placements; they are not a controlled same-binary comparison.",
+    "The night SSE decode script counts non-empty content chunks, not output tokens; its rates are excluded.",
+    "A configured context limit is not a prompt processed at that depth.",
+    "The near-128k response reached the total context limit; its checker verified only the first five requested numbers."
+  ],
+  "night_prefill_records": [
+    {
+      "file": "baseline-prefill-524.json",
+      "sha256": "dedcceb5756695b55525c8d932510cee23d5aeac0162602595153cb16e81c367",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.031245,
+            "estimated_prompt_tokens_per_second": 32.686,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.014412,
+            "estimated_prompt_tokens_per_second": 32.721,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.012291,
+            "estimated_prompt_tokens_per_second": 32.725,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 16.014412,
+        "median_prompt_tokens_per_second": 32.721
+      }
+    },
+    {
+      "file": "fused-prefill-524.json",
+      "sha256": "a4d8b8c3b30dda1620a9f4d6bbbee0d5c45cf44e587e6b7fe704774e8c076669",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.287151,
+            "estimated_prompt_tokens_per_second": 34.277,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.24983,
+            "estimated_prompt_tokens_per_second": 34.361,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.242944,
+            "estimated_prompt_tokens_per_second": 34.377,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 15.24983,
+        "median_prompt_tokens_per_second": 34.361
+      }
+    },
+    {
+      "file": "combined-prefill-524.json",
+      "sha256": "2d27ba02be8d636efda864c6663958d91992fac6e5b03f2bb7860d8633b35930",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30501,
+            "estimated_prompt_tokens_per_second": 39.384,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.183093,
+            "estimated_prompt_tokens_per_second": 39.748,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30754,
+            "estimated_prompt_tokens_per_second": 39.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 13.30501,
+        "median_prompt_tokens_per_second": 39.384
+      }
+    },
+    {
+      "file": "combined-prefill-4274.json",
+      "sha256": "7cd6bc37efa4cb3f37b9b1f78d421d866ffa4be24e1f3703aa2b2a29478842ec",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 850,
+        "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+        "samples": [
+          {
+            "prompt_tokens": 4274,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 105.979762,
+            "estimated_prompt_tokens_per_second": 40.328,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000008"
+          }
+        ],
+        "median_seconds": 105.979762,
+        "median_prompt_tokens_per_second": 40.328
+      }
+    },
+    {
+      "file": "waterfill2-prefill-524.json",
+      "sha256": "42f4c01719b8db81ded7c335f6a46183e252e84e3bd27773ecf4862a4e4fc984",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.009553,
+            "estimated_prompt_tokens_per_second": 40.278,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.990074,
+            "estimated_prompt_tokens_per_second": 40.338,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.977869,
+            "estimated_prompt_tokens_per_second": 40.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 12.990074,
+        "median_prompt_tokens_per_second": 40.338
+      }
+    },
+    {
+      "file": "sliced-prefill-524.json",
+      "sha256": "f4fe7c1ec52651695fd971dcdd97372c72afa95fd252a151a09749bf3b654ecb",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.013059,
+            "estimated_prompt_tokens_per_second": 40.267,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.004244,
+            "estimated_prompt_tokens_per_second": 40.295,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.00082,
+            "estimated_prompt_tokens_per_second": 40.305,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 13.004244,
+        "median_prompt_tokens_per_second": 40.295
+      }
+    }
+  ],
+  "near_128k_server_telemetry": {
+    "file": "near-128k-server-evidence.json",
+    "sha256": "f6b47a951e1a83064cce5a776300db4c62a8e5d23cab23269ee10e7e36650f1d",
+    "data": {
+      "source": "systemd user-engine request log",
+      "engine_pid": "350093",
+      "engine_executable": "/home/ben/fifi-scratch/7f9c3ee80929/ring-fuse-moe/target/release/enginesrv",
+      "message": {
+        "request_id": "chatcmpl-0000000000000001",
+        "status": 200,
+        "outcome": "ok",
+        "finish_reason": "length",
+        "prompt_tokens": 130981,
+        "completion_tokens": 91,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 3736681.5,
+        "decode_tokens_per_second": 29.96
+      },
+      "limitation": "This was a separate fusion build, not the exact upstream PR binary. The response was cut short by the 131072-token total context. A separate script checked only the first five counted numbers, not the complete requested output."
+    }
+  },
+  "excluded_mislabeled_256k_file": {
+    "reason": "Every sample records context_limit 131072 despite the file name.",
+    "record": {
+      "file": "sliced-256k-prefill-524.json",
+      "sha256": "8b45b0252fbcb920603550b65c030304b3b5acc024deb2736af4dd186f8c263b",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.701389,
+            "estimated_prompt_tokens_per_second": 41.255,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.71783,
+            "estimated_prompt_tokens_per_second": 41.202,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.635255,
+            "estimated_prompt_tokens_per_second": 41.471,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000005"
+          }
+        ],
+        "median_seconds": 12.701389,
+        "median_prompt_tokens_per_second": 41.255
+      }
+    }
+  },
+  "live_262144_observation": {
+    "source_commit": "5d97e11c1ca147b6e0d4844db77b0787fa6b4f59",
+    "engine_tree": "5f401c41fb38b4c1fdaaabbaa53a3e178311eed1",
+    "engine_sha256": "1c8fb928aa4d028eac0b9617f6fcedc138c460a1a8b40f8e3648d144a1e84914",
+    "config_sha256": "4e9fd69117cb3785937e3e08105500b4e0a04a66a2fba5da8e21a9b622022c81",
+    "summary": {
+      "file": "live-summary.json",
+      "sha256": "c5ff20caaf10a3b675abb8f9529fe06cc28c24bfb5e18fad054cb3bfbffccba6",
+      "data": {
+        "context_limit": 262144,
+        "prefill_median_tokens_per_second": 40.164,
+        "decode_median_tokens_per_second": 38.44,
+        "monitor_samples": 53,
+        "monitor_problem_count": 0,
+        "unrelated_main_requests": 0,
+        "secondary_requests": 0,
+        "valid_without_observed_contention": true,
+        "limitations": [
+          "Live-service observation, not an A/B comparison; a second idle engine remained loaded.",
+          "GPU utilization sampling can miss short bursts and does not prove exclusive CPU access.",
+          "The context was configured to 262144 but the benchmark did not fill it."
+        ]
+      }
+    },
+    "prefill": {
+      "file": "live-prefill.json",
+      "sha256": "284e9dbe0044fa4f306de8b076cfbfaa28bb6bdd5bdb3fa38df245cd8205840e",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.064099,
+            "estimated_prompt_tokens_per_second": 40.11,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-0000000000000008"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.013768,
+            "estimated_prompt_tokens_per_second": 40.265,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-0000000000000009"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.046466,
+            "estimated_prompt_tokens_per_second": 40.164,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-000000000000000a"
+          }
+        ],
+        "median_seconds": 13.046466,
+        "median_prompt_tokens_per_second": 40.164
+      }
+    },
+    "decode": {
+      "file": "live-decode.json",
+      "sha256": "2f4f72f80ac75d19e7bc21d095d05f281ddada1e106d339a8dc904614b158719",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 0,
+        "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+        "samples": [
+          {
+            "request_id": "chatcmpl-000000000000000b",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 794.5,
+            "decode_tokens_per_second": 38.44,
+            "total_seconds": 4.100397
+          },
+          {
+            "request_id": "chatcmpl-000000000000000c",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 795.4,
+            "decode_tokens_per_second": 38.34,
+            "total_seconds": 4.109114
+          },
+          {
+            "request_id": "chatcmpl-000000000000000d",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 794.0,
+            "decode_tokens_per_second": 38.55,
+            "total_seconds": 4.089609
+          }
+        ],
+        "median_decode_tokens_per_second": 38.44
+      }
+    }
+  }
+}

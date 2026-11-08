@@ -45,3 +45,5 @@ end-to-end times through a two-token reply, not pure kernel timings. The
 [individual samples, first-token telemetry, hardware, and test results](qwen36-p2p-prefill-results.json)
 record the conditions and limitations; a full 131,072-token prompt was not
 run.
+
+For the multi-device execution path, see [P2P execution](qwen36-p2p-night-optimization.md).
