@@ -278,6 +278,17 @@ impl CardSession {
                 self.fed, self.context_limit
             )));
         }
+        // Once an admitted token begins, a failed launch or readback may
+        // have changed persistent state on one or more cards. Refuse later
+        // tokens until reset even when the error precedes the status fold.
+        let result = self.run_admitted_token(token, read_logits);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn run_admitted_token(&mut self, token: u32, read_logits: bool) -> Result<Vec<f32>, EngError> {
         if self.fed == 0 {
             // The cleared word block takes the full params: the token id
             // and the restarted position.

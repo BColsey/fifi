@@ -453,24 +453,37 @@ fn run_session_rig(
             "{name}: two fewer gathers for each of five tokens"
         );
 
-        // A prior peer failure must still refuse before either cache append,
-        // even though this mode no longer performs the two K/V exchanges.
-        TokenStepper::reset(&mut session)?;
-        let before_failure = kv_prefix(&session, stack, 5)?;
-        stack.shards()[1].ring_word().write_at(
-            &stack.streams()[1],
-            0,
-            &crate::kernels::cuda::peer_ring::STATUS_TIMEOUT.to_le_bytes(),
-        )?;
-        let refused = session
-            .feed(0)
-            .expect_err("the peer fault must stop the cache append");
-        assert!(
-            matches!(&refused, EngError::BadRequest(message) if message.contains("cache was not appended")),
-            "{name}: unexpected refusal {refused:?}"
-        );
-        assert_eq!(before_failure, kv_prefix(&session, stack, 5)?);
-        assert_eq!(session.fed(), 0);
+        // A prior peer failure must refuse before either cache append and
+        // poison the session, with the original gathers and with local K/V.
+        for local in [false, true] {
+            stack.set_local_kv_rows_for_test(local);
+            TokenStepper::reset(&mut session)?;
+            let before_failure = kv_prefix(&session, stack, 5)?;
+            stack.shards()[1].ring_word().write_at(
+                &stack.streams()[1],
+                0,
+                &crate::kernels::cuda::peer_ring::STATUS_TIMEOUT.to_le_bytes(),
+            )?;
+            let refused = session
+                .feed(0)
+                .expect_err("the peer fault must stop the cache append");
+            assert!(
+                matches!(&refused, EngError::BadRequest(message) if message.contains("cache was not appended")),
+                "{name}: unexpected refusal {refused:?}"
+            );
+            assert_eq!(before_failure, kv_prefix(&session, stack, 5)?);
+            assert_eq!(session.fed(), 0);
+            let sequence = stack.ring().next_sequence_for_test();
+            let retry = session
+                .feed(0)
+                .expect_err("a failed step must poison the session");
+            assert!(
+                matches!(&retry, EngError::Backend { message, .. } if message.contains("poisoned")),
+                "{name}: unexpected retry refusal {retry:?}"
+            );
+            assert_eq!(stack.ring().next_sequence_for_test(), sequence);
+            assert_eq!(before_failure, kv_prefix(&session, stack, 5)?);
+        }
         TokenStepper::reset(&mut session)?;
         stack.set_local_kv_rows_for_test(false);
     }
