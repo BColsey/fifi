@@ -55,15 +55,11 @@ __device__ void *payload_of(void *slot) {
 }
 
 __global__ void publish_f16_kernel(const float *src, void *dst_slot,
-                                   int count, unsigned seq) {
-    __shared__ unsigned overflow;
-    if (threadIdx.x == 0) {
-        overflow = 0;
-    }
-    __syncthreads();
+                                   int count) {
     half *dst = reinterpret_cast<half *>(payload_of(dst_slot));
     unsigned local = 0;
-    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+    for (int i = (int)(blockIdx.x * kThreads + threadIdx.x); i < count;
+         i += kThreads * gridDim.x) {
         const float v = src[i];
         if (!(fabsf(v) <= 65504.0f)) {
             local = kFlagOverflow;
@@ -71,25 +67,34 @@ __global__ void publish_f16_kernel(const float *src, void *dst_slot,
         dst[i] = __float2half_rn(v);
     }
     if (local != 0) {
-        atomicOr(&overflow, local);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        *flags_word(dst_slot) = overflow;
-        seq_publish(dst_slot, seq);
+        atomicOr(reinterpret_cast<unsigned *>(flags_word(dst_slot)), local);
     }
 }
 
 __global__ void publish_f32_kernel(const float *src, void *dst_slot,
-                                   int count, unsigned seq) {
+                                   int count) {
     float *dst = reinterpret_cast<float *>(payload_of(dst_slot));
-    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+    for (int i = (int)(blockIdx.x * kThreads + threadIdx.x); i < count;
+         i += kThreads * gridDim.x) {
         dst[i] = src[i];
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        *flags_word(dst_slot) = 0;
+}
+
+/// One thread, ordered after the multi-block data launch on the same
+/// stream: every block's flag OR is visible, so the overflow bit is final
+/// and the sequence word lands last.
+__global__ void publish_commit_kernel(void *dst_slot, unsigned seq) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
         seq_publish(dst_slot, seq);
+    }
+}
+
+/// One thread: resets the slot's overflow flags so the multi-block f16
+/// data launch can accumulate its ORs from zero.
+__global__ void publish_flags_zero_kernel(void *dst_slot) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *flags_word(dst_slot) = 0;
+        __threadfence_system();
     }
 }
 
@@ -149,7 +154,8 @@ __global__ void wait_sum_kernel(float *out, const float *own,
         return;
     }
     const void *slots[kMaxPeers] = {slot0, slot1, slot2};
-    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+    for (int i = (int)(blockIdx.x * kThreads + threadIdx.x); i < count;
+         i += kThreads * gridDim.x) {
         float sum = own[i];
         for (int p = 0; p < peer_count; ++p) {
             const Payload *payload = reinterpret_cast<const Payload *>(
@@ -183,7 +189,8 @@ __global__ void wait_copy_kernel(float *out, const void *slot, int count,
     }
     const float *payload = reinterpret_cast<const float *>(
         reinterpret_cast<const char *>(slot) + kHeaderBytes);
-    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+    for (int i = (int)(blockIdx.x * kThreads + threadIdx.x); i < count;
+         i += kThreads * gridDim.x) {
         out[i] = payload[i];
     }
 }
@@ -217,6 +224,60 @@ cudaStream_t as_stream(void *stream) {
     return reinterpret_cast<cudaStream_t>(stream);
 }
 
+/// One block covers this many values before the multi-block form pays
+/// for its two extra launches (the eager step's payloads all sit below).
+constexpr int kSingleBlockValues = kThreads * 8;
+
+__global__ void publish_f16_small_kernel(const float *src, void *dst_slot,
+                                         int count, unsigned seq) {
+    __shared__ unsigned overflow;
+    if (threadIdx.x == 0) {
+        overflow = 0;
+    }
+    __syncthreads();
+    half *dst = reinterpret_cast<half *>(payload_of(dst_slot));
+    unsigned local = 0;
+    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+        const float v = src[i];
+        if (!(fabsf(v) <= 65504.0f)) {
+            local = kFlagOverflow;
+        }
+        dst[i] = __float2half_rn(v);
+    }
+    if (local != 0) {
+        atomicOr(&overflow, local);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *flags_word(dst_slot) = overflow;
+        seq_publish(dst_slot, seq);
+    }
+}
+
+__global__ void publish_f32_small_kernel(const float *src, void *dst_slot,
+                                         int count, unsigned seq) {
+    float *dst = reinterpret_cast<float *>(payload_of(dst_slot));
+    for (int i = (int)threadIdx.x; i < count; i += kThreads) {
+        dst[i] = src[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *flags_word(dst_slot) = 0;
+        seq_publish(dst_slot, seq);
+    }
+}
+
+int payload_blocks(int count) {
+    int blocks = (count + kThreads * 8 - 1) / (kThreads * 8);
+    if (blocks < 1) {
+        blocks = 1;
+    }
+    if (blocks > 64) {
+        blocks = 64;
+    }
+    return blocks;
+}
+
 } // namespace
 
 extern "C" int inference_cuda_ring_publish_f16(void *stream,
@@ -228,8 +289,17 @@ extern "C" int inference_cuda_ring_publish_f16(void *stream,
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
-        publish_f16_kernel<<<1, kThreads, 0, as_stream(stream)>>>(src, dst_slot,
-                                                                  count, seq);
+        cudaStream_t s = as_stream(stream);
+        if (count <= kSingleBlockValues) {
+            publish_f16_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
+                                                            count, seq);
+        } else {
+            int blocks = payload_blocks(count);
+            publish_flags_zero_kernel<<<1, 1, 0, s>>>(dst_slot);
+            publish_f16_kernel<<<blocks, kThreads, 0, s>>>(src, dst_slot,
+                                                           count);
+            publish_commit_kernel<<<1, 1, 0, s>>>(dst_slot, seq);
+        }
         return finish(cudaGetLastError());
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
@@ -245,8 +315,16 @@ extern "C" int inference_cuda_ring_publish_f32(void *stream,
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
-        publish_f32_kernel<<<1, kThreads, 0, as_stream(stream)>>>(src, dst_slot,
-                                                                  count, seq);
+        cudaStream_t s = as_stream(stream);
+        if (count <= kSingleBlockValues) {
+            publish_f32_small_kernel<<<1, kThreads, 0, s>>>(src, dst_slot,
+                                                            count, seq);
+        } else {
+            int blocks = payload_blocks(count);
+            publish_f32_kernel<<<blocks, kThreads, 0, s>>>(src, dst_slot,
+                                                           count);
+            publish_commit_kernel<<<1, 1, 0, s>>>(dst_slot, seq);
+        }
         return finish(cudaGetLastError());
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
@@ -264,7 +342,7 @@ extern "C" int inference_cuda_ring_wait_sum_f16(
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
-        wait_sum_kernel<half><<<1, kThreads, 0, as_stream(stream)>>>(
+        wait_sum_kernel<half><<<payload_blocks(count), kThreads, 0, as_stream(stream)>>>(
             out, own, peer_slot0, peer_slot1, peer_slot2, peer_count, count,
             seq, timeout_cycles, status);
         return finish(cudaGetLastError());
@@ -283,7 +361,7 @@ extern "C" int inference_cuda_ring_wait_copy_f32(
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
-        wait_copy_kernel<<<1, kThreads, 0, as_stream(stream)>>>(
+        wait_copy_kernel<<<payload_blocks(count), kThreads, 0, as_stream(stream)>>>(
             out, peer_slot, count, seq, timeout_cycles, status);
         return finish(cudaGetLastError());
     } catch (...) {
@@ -302,7 +380,7 @@ extern "C" int inference_cuda_ring_wait_sum_f32(
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         (void)cudaGetLastError();
-        wait_sum_kernel<float><<<1, kThreads, 0, as_stream(stream)>>>(
+        wait_sum_kernel<float><<<payload_blocks(count), kThreads, 0, as_stream(stream)>>>(
             out, own, peer_slot0, peer_slot1, peer_slot2, peer_count, count,
             seq, timeout_cycles, status);
         return finish(cudaGetLastError());

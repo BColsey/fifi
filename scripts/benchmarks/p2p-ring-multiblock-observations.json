@@ -1,0 +1,82 @@
+{
+  "schema": "fifi.p2p-ring-multiblock-observation.v1",
+  "recorded_utc": "2026-11-08T19:11:21.801009+00:00",
+  "source_commits": [
+    "606e80e98c7fe700763abfb2a9bdeb9a9437262f",
+    "3e28cc9878c230a4870fb495f9d7212fedf570d5"
+  ],
+  "runner_record": {
+    "time_utc": "2026-11-08T18:43:05Z",
+    "gpu_uuids": [
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+    ],
+    "scope": "gpu-run-local; peer-ring test command"
+  },
+  "observations": [
+    {
+      "label": "earlier attempt",
+      "log_sha256": "33a001e0f8955c186e1e3e609711a4eae8767d0ec9941b17f0ab877fcb1fdc53",
+      "result": "failed with CUDA illegal memory access",
+      "log": [
+        "",
+        "running 1 test",
+        "test kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair ... CUDA devices visible: 2",
+        "CUDA FIRST ERROR: an illegal memory access was encountered (code 700) at stage synchronize",
+        "",
+        "thread 'kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair' (970172) panicked at src/kernels/cuda/peer_ring.rs:648:42:",
+        "sync: Backend { operation: \"cuda synchronize\", message: \"an illegal memory access was encountered (status 700)\" }",
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+        "FAILED",
+        "",
+        "failures:",
+        "",
+        "failures:",
+        "    kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair",
+        "",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5789 filtered out; finished in 0.66s",
+        ""
+      ]
+    },
+    {
+      "label": "later run",
+      "log_sha256": "28785ecff3ae6401138f3e27a8266faf83b00e70af7b921665e624fd2c14cde1",
+      "result": "11 tests passed; one 256x2048 f32 exchange timing averaged 40 repeats",
+      "reported_ms_per_exchange": 0.509,
+      "log": [
+        "",
+        "running 11 tests",
+        "test kernels::cuda::native::peer_ring::tests::the_native_entry_rejects_bad_arguments_before_any_cuda_call ... ok",
+        "test kernels::cuda::peer_ring::device_tests::a_broadcast_lands_bit_exact_on_every_device ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::a_reset_ring_exchanges_again_from_sequence_one ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::an_all_gather_row_replicates_the_full_row_on_every_device ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::chained_exchanges_keep_producer_and_consumer_order_without_host_syncs ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::chunk_sized_exchange_sums_on_a_physical_pair ... CUDA devices visible: 2",
+        "chunk_sized_exchange_sums_on_a_physical_pair: 256x2048 f32 (2.10 MB payload) exchange_sum: 0.0005094680499999999*1e3 = 0.509 ms              per exchange; a 40-layer chunk pays 80 sums = 40.8 ms",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::the_fp16_exchange_sums_within_half_precision_and_flags_overflow ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::device_tests::two_contexts_exchange_a_sum_and_repeat_it ... CUDA devices visible: 2",
+        "ok",
+        "test kernels::cuda::peer_ring::tests::the_layout_refuses_bad_shapes ... ok",
+        "test kernels::cuda::peer_ring::tests::the_layout_tiles_slots_by_source_then_parity ... ok",
+        "",
+        "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 5779 filtered out; finished in 0.68s",
+        ""
+      ]
+    }
+  ],
+  "limits": [
+    "The source tree and test-binary hash for the logged runs were not recorded; both logs predate the final small-payload fallback commit.",
+    "The successful log has no retained matched baseline; it does not establish a speedup.",
+    "The port changes the new test to require two physical devices and be ignored by default; exact-tip tests remain unrun.",
+    "The proposed multi-block path is not gated by an opt-in flag, so it is not ready to merge under the default-off policy.",
+    "No full-model prefill or decode benchmark was run for this port."
+  ]
+}
