@@ -393,8 +393,8 @@ impl Context {
     /// `[VH, VD, KD]`, the F32 convolution `ring` `[CD, CK - 1]`, the five packed weights
     /// (qkv, z, b, a, out) with their stored scale and bias dtypes and logical shapes
     /// `[CD, H]`, `[VH*VD, H]` (three), and `[H, VH*VD]`, the five plain tensors
-    /// (conv_taps, conv_last, neg_exp_a_log, dt_bias, norm), and the three rank-0 constants
-    /// (zero, qk_eps, sqrt_kd). Every tensor must belong to this adapter; `check_operand`, the
+    /// (conv_taps, conv_last, neg_exp_a_log, dt_bias, norm), and the rank-0 `zero` plus the
+    /// two `[kd]` head-norm weights. Every tensor must belong to this adapter; `check_operand`, the
     /// F32 rule, and `check_owner` plus the logical shapes reject anything else before the
     /// first native call.
     ///

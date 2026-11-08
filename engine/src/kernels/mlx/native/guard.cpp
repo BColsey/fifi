@@ -2654,8 +2654,8 @@ static int compile_moe_lhs_build(
   return status;
 }
 
-// The persistent GatherQMM row-index operands, cached per (stream, batch slot, expert
-// width): their values depend only on (batch, top_k), never on the step, so building them
+// The persistent GatherQMM row-index operands, cached per (adapter owner, batch slot,
+// expert width): their values depend only on (batch, top_k), never on the step, so building them
 // per block call (the original form) evaluated two fresh aranges on every moe block call -
 // 120 per decode step - and each mlx_array_eval is a stream synchronization point, ~1 ms per
 // call. Entries are immutable once built and never freed: a compiled tape may still hold the

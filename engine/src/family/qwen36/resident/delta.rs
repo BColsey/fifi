@@ -194,7 +194,6 @@ pub(super) fn step_projected(
 #[cfg(test)]
 mod tests {
     use super::super::ops::{assert_parity, f32_tensor, values, zeros};
-    use crate::kernels::MlxKernels;
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
     use crate::family::project::Projector;
@@ -203,6 +202,7 @@ mod tests {
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY, TINY_WIDE};
     use crate::family::spec::FamilySpec;
+    use crate::kernels::MlxKernels;
     use crate::weights::StreamedCheckpoint;
 
     /// Input of step `n`: `x[i] = (((i + 5 n) % 11) - 5) / 160`, exact in `f32` up to rounding of the
