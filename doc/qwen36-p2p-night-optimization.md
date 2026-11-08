@@ -15,6 +15,12 @@ lines, unless noted. Day-to-day noise on this rig is about 4%.
 | fused MoE ring exchange (d0569ca) | 34.36 | - | 22.58 | 22.49 |
 | fused + 4.5 GiB host budgets (deployed tonight) | 39.38 | 40.33 | 26.0 | 26.1 |
 
+First full-context run on this rig (deployed config, 130,981 prompt tokens,
+streaming): TTFT 3,736.9 s = 62.3 min (~35.1 tok/s prefill at full depth -
+attention prep costs ~14% versus the 4.3k rate), decode ~30 tok/s by the
+server's own metric at 131k depth (19.4 measured client-side through the
+SSE proxy), and the model still counted 1..120 correctly at full depth.
+
 - Fusing the MoE all-reduce from `top_k+1` ring exchanges per layer to 2
   (the whole `expert_down` block, then `shared_out`) is worth ~5% on every
   token: ~320 serialized PCIe round trips removed; the measured 1.45 ms/token
