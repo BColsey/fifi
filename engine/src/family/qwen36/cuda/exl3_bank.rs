@@ -68,7 +68,13 @@ pub(super) fn decide(
         return Ok(None);
     }
     admit_host(routed, host)?;
-    let budget = free.saturating_sub(hold).saturating_sub(dense);
+    // The load also leaves the resident flow's post-load floor free: the CUDA context and
+    // workspaces eat bytes the figures above do not count, and the per-tensor admits after
+    // the banks re-subtract the full hold (the embed table's admit is the last one).
+    let budget = free
+        .saturating_sub(hold)
+        .saturating_sub(dense)
+        .saturating_sub(super::pinned::MIN_FREE_AFTER_LOAD as u64);
     let slots = match request {
         SlotRequest::Exactly(want) => {
             if want < 1 || want > n_expert {
@@ -96,7 +102,8 @@ pub(super) fn decide(
             want
         }
         SlotRequest::Fit => {
-            let slots = (budget / per_member.max(1)) as usize;
+            // One slot costs `per_member` per LAYER; the budget must cover every layer's bank.
+            let slots = (budget / per_member.max(1) / layers as u64) as usize;
             if slots < 1 {
                 return Err(refuse(format!(
                     "the budget after the dense weights and the reserve leaves {slots} slots, \
@@ -449,6 +456,14 @@ impl<'w> Exl3SlotResolver<'w> {
         }
     }
 
+    /// The slot count of every layer's bank (the prefill sub-block arithmetic).
+    pub(crate) fn slots(&self) -> usize {
+        self.layers
+            .first()
+            .map(|(slots, _)| slots.slots)
+            .unwrap_or(0)
+    }
+
     /// The hit/miss counts of the session, for the start-line echo and the report.
     pub(crate) fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
@@ -548,9 +563,9 @@ mod tests {
     #[test]
     fn a_pack_that_does_not_fit_banks_the_fitting_slot_count() {
         let (dense, routed) = figures();
-        // Free for 1 GiB of dense + hold, plus exactly 64 slots of experts.
+        // Free for 1 GiB of dense + hold + the post-load floor, plus 64 slots per layer.
         let per_member = routed / 47 / 256;
-        let free = dense + (1 << 30) + per_member * 64;
+        let free = dense + (1 << 30) + (1 << 30) + per_member * 64 * 47;
         let got = decide_auto((dense, routed), free, SlotRequest::Fit, host())
             .unwrap()
             .expect("banks");
@@ -639,9 +654,9 @@ mod tests {
     #[test]
     fn fit_never_returns_zero_or_above_the_expert_count() {
         let (dense, routed) = figures();
-        // Barely past the dense figure: one slot still fits.
+        // Barely past the dense figure + hold + the post-load floor: one slot fits.
         let per_member = routed / 47 / 256;
-        let free = dense + (1 << 30) + per_member;
+        let free = dense + (1 << 30) + (1 << 30) + per_member * 47;
         let got = decide_auto((dense, routed), free, SlotRequest::Fit, host())
             .unwrap()
             .expect("banks");

@@ -380,6 +380,8 @@ pub(crate) struct QwenResidentStep<'a> {
     /// step; when set, the eager MoE blocks map their read picks through the tables and
     /// refill missed slots before the launches (the engine thread is the only borrower).
     exl3_bank: Option<&'a std::cell::RefCell<Exl3SlotResolver<'a>>>,
+    /// Tokens decoded since the last banked hits/misses log line (a banked step only).
+    banked_echo: u32,
     /// The working buffer of the MoE block that queues the shared expert inside the routed launches
     /// (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` or a load that cannot run it
     /// leaves `None`, which keeps the reference block).
@@ -877,6 +879,7 @@ impl<'a> QwenResidentStep<'a> {
             moe,
             exl3_moe,
             exl3_bank: banked.map(|(_, bank)| bank),
+            banked_echo: 0,
             exl3_merge,
             merge_intent,
             merge_source,
@@ -1461,13 +1464,8 @@ impl<'a> QwenResidentStep<'a> {
             ..
         } = self;
         // 1. Host checks. Nothing touches the device before all of them pass.
-        if self.exl3_bank.is_some() {
-            return Err(EngError::BadRequest(
-                "prefill chunk: the banked EXL3 engine decodes only; its prefill slice is not \
-                 wired yet"
-                    .into(),
-            ));
-        }
+        // A banked chunk runs its MoE stage in sub-blocks (see prefill_exl3::moe_block), so
+        // any admitted chunk row count serves.
         check_chunk_start(p0, state.tokens())?;
         let arena = prefill
             .as_ref()
@@ -1511,7 +1509,7 @@ impl<'a> QwenResidentStep<'a> {
                 .buffer()
                 .write_at(stream, ids_range.offset(), &bytes)?;
             let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
-            let run = run.with_sparse(
+            let run = run.with_bank(self.exl3_bank).with_sparse(
                 res.sparse
                     .as_ref()
                     .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
@@ -1760,6 +1758,17 @@ impl<'a> QwenResidentStep<'a> {
         let ran = self.run_token_inner(token, want_logits, want_shortlist);
         if ran.is_err() {
             self.abort_tiered_token();
+        } else if let Some(bank) = self.exl3_bank {
+            // The banked session's pulse: one line every 256 tokens, the cumulative hit/miss
+            // counts that explain its speed (a miss is a host-store refill).
+            self.banked_echo += 1;
+            if self.banked_echo % 256 == 0 {
+                let (hits, misses) = bank.borrow().stats();
+                eprintln!(
+                    "q36 cuda: EXL3 expert bank after {} tokens: hits {hits}, misses {misses}",
+                    self.banked_echo
+                );
+            }
         }
         ran
     }

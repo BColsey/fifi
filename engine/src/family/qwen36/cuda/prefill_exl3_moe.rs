@@ -50,6 +50,7 @@ use crate::{
 };
 
 const I32: usize = size_of::<i32>();
+const F32: usize = size_of::<f32>();
 
 pub(super) struct Bufs<'b> {
     /// F32 `[m][hidden]`: the normalized rows, read only.
@@ -139,6 +140,7 @@ fn read_plan(
     projector: &Projector<'_>,
     ids: DeviceRange<'_>,
     dims: &MoeDims,
+    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<PairPlan, EngError> {
     let pairs = dims.rows * dims.top_k;
     let mut raw = vec![0u8; pairs * I32];
@@ -150,6 +152,19 @@ fn read_plan(
         .iter()
         .map(|bytes| i32::from_le_bytes(*bytes))
         .collect();
+    // A banked block maps its picks through the layer's slot table before the sort: the
+    // grouped launches then read the slot members of the bank region exactly as a resident
+    // block reads its expert ids. A fault-marked id (-1) falls through to the sort's refusal.
+    let picks = match bank {
+        Some(bank) if !picks.iter().any(|&id| id < 0) => {
+            let wanted = picks.iter().map(|&id| id as usize).collect::<Vec<_>>();
+            bank.resolve(projector.launch.ctx, &wanted)?
+                .into_iter()
+                .map(|slot| slot as i32)
+                .collect()
+        }
+        _ => picks,
+    };
     plan_pairs(&picks, dims.n_expert, dims.top_k)
 }
 
@@ -378,6 +393,7 @@ fn routed(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Bufs<'_>,
     dims: &MoeDims,
+    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<(), EngError> {
     routed_with(
         projector,
@@ -399,7 +415,7 @@ fn routed_with(
     pair: bool,
 ) -> Result<bool, EngError> {
     let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
-    let plan = read_plan(projector, bufs.ids, dims)?;
+    let plan = read_plan(projector, bufs.ids, dims, bank)?;
     let jobs = plan_jobs(&plan.counts);
     write_lists(projector, bufs.perm, (&plan, &jobs))?;
     super::split::mark(projector.launch.stream, "ids read and sort");
@@ -503,8 +519,67 @@ pub(super) fn run(
 ) -> Result<(), EngError> {
     shared(projector, weights, bufs, dims)?;
     super::split::mark(projector.launch.stream, "shared expert");
-    routed(projector, weights, bufs, dims)?;
+    routed(projector, weights, bufs, dims, None)?;
     combine(projector, bufs, dims)?;
+    super::split::mark(projector.launch.stream, "combine");
+    Ok(())
+}
+
+/// The per-row slice of every row-scaled buffer of `bufs` at chunk row `r0`, for `sub.rows`
+/// rows. The `perm` scratch stays whole: each sub-block rewrites and consumes it on the one
+/// stream before the next sub-block's launches, so no slice is needed.
+fn slice_at<'b>(
+    bufs: &Bufs<'b>,
+    full: &MoeDims,
+    sub: &MoeDims,
+    r0: usize,
+) -> Result<Bufs<'b>, EngError> {
+    let (h, i, k, s) = (full.hidden, full.inter, full.top_k, full.shared_inter);
+    let wide = h.max(i);
+    let f = |range: &DeviceRange<'b>, row: usize| {
+        range
+            .buffer()
+            .range(range.offset() + r0 * row, sub.rows * row)
+    };
+    Ok(Bufs {
+        x2: f(&bufs.x2, h * F32)?,
+        ids: f(&bufs.ids, k * I32)?,
+        weights: f(&bufs.weights, k * F32)?,
+        shared_gate: f(&bufs.shared_gate, F32)?,
+        hidden: f(&bufs.hidden, h * F32)?,
+        perm: bufs.perm,
+        gu: f(&bufs.gu, k * 2 * i * F32)?,
+        act: f(&bufs.act, k * i * F32)?,
+        paired: f(&bufs.paired, k * h * F32)?,
+        expert_xh: f(&bufs.expert_xh, k * wide * 2)?,
+        expert_z: f(&bufs.expert_z, k * wide * F32)?,
+        shared_gu: f(&bufs.shared_gu, 2 * s * F32)?,
+        shared_act: f(&bufs.shared_act, s * F32)?,
+        shared_out: f(&bufs.shared_out, h * F32)?,
+    })
+}
+
+/// Stages 10-17 of one banked chunk layer: the shared expert once for the whole chunk, then the
+/// routed experts and the combine per sub-block, because the launches of one block read every
+/// pick of its rows together and the bank holds only `slots` members. Each sub-block's picks
+/// are read back, mapped through the slot table (refilling missed slots from the host store)
+/// and grouped as slot ids. `sub` carries each sub-block's first row and its dims, built by the
+/// caller from its own chunk model.
+pub(super) fn run_banked(
+    projector: &Projector<'_>,
+    weights: &Exl3MoeWeights<'_>,
+    bufs: &Bufs<'_>,
+    dims: &MoeDims,
+    sub: &[(usize, MoeDims)],
+    bank: &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
+) -> Result<(), EngError> {
+    shared(projector, weights, bufs, dims)?;
+    super::split::mark(projector.launch.stream, "shared expert");
+    for &(r0, ref sub_dims) in sub {
+        let sub_bufs = slice_at(bufs, dims, sub_dims, r0)?;
+        routed(projector, weights, &sub_bufs, sub_dims, Some(bank))?;
+        combine(projector, &sub_bufs, sub_dims)?;
+    }
     super::split::mark(projector.launch.stream, "combine");
     Ok(())
 }
