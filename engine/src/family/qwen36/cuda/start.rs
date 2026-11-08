@@ -555,6 +555,7 @@ pub(super) fn tiered_plan_of(settings: &Q36Settings) -> Option<TieredPlan> {
     settings.tiered.map(|tiered| TieredPlan {
         timeout_ms: tiered.timeout_ms,
         preload: tiered.preload,
+        swaps_milli: tiered.swaps_milli,
         ..TieredPlan::new(tiered.slots, tiered.threads)
     })
 }

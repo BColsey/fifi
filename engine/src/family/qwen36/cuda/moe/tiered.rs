@@ -28,8 +28,8 @@ use super::{
 use crate::EngError;
 use crate::family::project::cuda::WeightLayout;
 use crate::kernels::cuda::resident::moe_combine::{CombineCall, CombineOut, CombineShape};
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::kernels::cuda::{DeviceBuffer, DeviceEvent, PinnedBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// ponytail: qualification-only timing probes (Q36_TIERED_TIMING=1); delete after the
 /// hang analysis. All times are ns accumulated per phase across a token.
@@ -56,7 +56,9 @@ fn tock(counter: &AtomicU64, at: Option<std::time::Instant>) {
 
 /// Prints and clears the accumulated phases; the step calls it at each token boundary.
 pub(in crate::family::qwen36::cuda) fn tiered_timing_line(token: usize) {
-    if !timing_on() { return; }
+    if !timing_on() {
+        return;
+    }
     eprintln!(
         "tiered timing t{token}: route {} us, begin {} us, writes {} us, ops {} us, finish {} us, partial {} us",
         T_ROUTE.swap(0, Ordering::Relaxed) / 1000,
