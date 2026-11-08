@@ -412,7 +412,7 @@ fn start_without_the_tiered_key_builds_no_bank() {
     );
     assert!(check_tiered_start(&plain).is_ok());
     let tiered = cuda_settings(
-        r#"{"tiered": {"slots": 40, "threads": 4, "timeout_ms": 2500, "preload": true}}"#,
+        r#"{"capture":false, "tiered": {"slots": 40, "threads": 4, "timeout_ms": 2500, "preload": true}}"#,
     );
     let plan = tiered_plan_of(&tiered).expect("the member asks for a plan");
     assert_eq!(
@@ -426,9 +426,11 @@ fn start_without_the_tiered_key_builds_no_bank() {
     );
     assert!(plan.preload, "the member asks for the preload");
     assert!(
-        !tiered_plan_of(&cuda_settings(r#"{"tiered": {"slots": 40}}"#))
-            .unwrap()
-            .preload,
+        !tiered_plan_of(&cuda_settings(
+            r#"{"capture":false, "tiered": {"slots": 40}}"#
+        ))
+        .unwrap()
+        .preload,
         "the banks start empty unless asked"
     );
     assert!(plan.check().is_ok());
@@ -439,7 +441,7 @@ fn start_without_the_tiered_key_builds_no_bank() {
 fn start_refuses_capture_with_tiered() {
     // The settings refuse the pair by name; the start checks it again on its own, so a settings
     // value built by hand cannot start a captured tiered engine.
-    let mut tiered = cuda_settings(r#"{"tiered": {"slots": 40}}"#);
+    let mut tiered = cuda_settings(r#"{"capture":false, "tiered": {"slots": 40}}"#);
     tiered.capture = true;
     match check_tiered_start(&tiered) {
         Err(EngError::BadRequest(message)) => {

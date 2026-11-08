@@ -153,8 +153,8 @@ pub(crate) struct Q36Options {
     pub(crate) kv_dtype: Option<String>,
     /// Opt-in host-backed CUDA Q8 KV budget, including pinned staging and owned metadata.
     pub(crate) kv_offload_host_bytes: Option<u64>,
-    /// Graph capture of the CUDA arm (default true for an EXL3 pack, false for GGUF: eager
-    /// launches); the MLX arm ignores it.
+    /// Graph capture of the CUDA arm (default true on the CUDA arm for every weights format;
+    /// `"capture": false` rolls back to the eager step); the MLX arm ignores it.
     pub(crate) capture: Option<bool>,
     /// `mlx_compile` on the Q36 DeltaNet and device-routed MoE decode blocks: the engine traces
     /// both blocks once after the weights load and runs every one-token decode step through the
@@ -181,7 +181,8 @@ pub(crate) struct Q36Options {
     /// The CUDA devices this engine spans, as explicit ordinals in strictly ascending order.
     /// Absent means `[0]`: the first device only, as before. A CUDA member; the MLX arm
     /// refuses it. More than one device is refused with `weight_format` `exl3`, `tiered`,
-    /// `kv_offload_host_bytes`, and `capture`, each by name.
+    /// `kv_offload_host_bytes`, and `capture` (the resolved flag: unset means the CUDA arm's
+    /// default, on), each by name.
     pub(crate) cuda_devices: Option<Vec<u32>>,
     /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. A CUDA
     /// member for `weight_format` `exl3` only.
@@ -433,7 +434,10 @@ fn cuda_devices_of(
                 options.kv_offload_host_bytes.is_some(),
                 "kv_offload_host_bytes",
             ),
-            (options.capture == Some(true), "capture"),
+            (
+                options.capture.unwrap_or(backend == Backend::Cuda),
+                "capture",
+            ),
         ] {
             if set {
                 return Err(bad(format!(
@@ -1006,22 +1010,26 @@ fn tiered_settings(
     if backend == Backend::Mlx {
         return Err(bad("tiered is a CUDA member; the MLX arm refuses it".into()));
     }
-    if options.capture == Some(true) {
-        return Err(bad(
-            "tiered and capture exclude each other: the tiered step is eager only".into(),
-        ));
-    }
     let slots = tiered
         .slots
         .ok_or_else(|| bad("tiered needs slots (bank slots per layer, 8 to 256)".into()))?;
-    Ok(Some(TieredSettings {
+    let built = TieredSettings {
         slots: usize::try_from(ranged("tiered.slots", Some(slots), 8, 8, 256)?)
             .map_err(|_| bad("tiered.slots exceeds usize".into()))?,
         threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 8)?)
             .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
         timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
         preload: tiered.preload.unwrap_or(false),
-    }))
+    };
+    // The member shapes are validated above so their errors keep precedence; the exclusion
+    // reads the resolved flag, so an unset capture (the CUDA arm's default, on) is refused
+    // here by name with its rollback.
+    if options.capture.unwrap_or(backend == Backend::Cuda) {
+        return Err(bad(
+            "tiered and capture exclude each other: the tiered step is eager only; set \"capture\": false".into(),
+        ));
+    }
+    Ok(Some(built))
 }
 
 /// Refuses one MLX chunked-prefill key on the CUDA arm, naming it: the arm prefills one token
@@ -1067,7 +1075,7 @@ fn kv_offload_of(options: &Q36Options, backend: Backend) -> Result<Option<u64>, 
     if kv_dtype_of(options.kv_dtype.as_deref(), backend)? != KvDtype::Q8 {
         return Err(bad("kv_offload_host_bytes requires kv_dtype q8".into()));
     }
-    if options.capture.unwrap_or(false) || options.tiered.is_some() {
+    if options.capture.unwrap_or(backend == Backend::Cuda) || options.tiered.is_some() {
         return Err(bad(
             "kv_offload_host_bytes requires capture=false and no tiered experts".into(),
         ));
@@ -1280,11 +1288,10 @@ impl Q36Settings {
             activation,
             kv,
             kv_offload_host_bytes,
-            // A served EXL3 pack captures by default (its step reads the picks on the device);
-            // `"capture": false` rolls back to the eager step.
-            capture: options
-                .capture
-                .unwrap_or(weights == WeightFormat::Exl3 && backend == Backend::Cuda),
+            // The CUDA arm captures by default (EXL3 reads the picks on the device; a GGUF step
+            // saves its launch overhead — measured 5.3 percent of wall in the W3 bench, at a
+            // one-time first-request capture warmup); `"capture": false` rolls back to eager.
+            capture: options.capture.unwrap_or(backend == Backend::Cuda),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
             compile: match backend {
@@ -1410,7 +1417,7 @@ mod tests {
     fn cuda_devices_default_to_the_first_device_and_parse_a_list() {
         let resident = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(resident.cuda_devices, vec![0]);
-        let pair = cuda_offload(r#"{"cuda_devices":[0,1]}"#).unwrap();
+        let pair = cuda_offload(r#"{"cuda_devices":[0,1],"capture":false}"#).unwrap();
         assert_eq!(pair.cuda_devices, vec![0, 1]);
         let second = cuda_offload(r#"{"cuda_devices":[1]}"#).unwrap();
         assert_eq!(second.cuda_devices, vec![1]);
@@ -1427,6 +1434,7 @@ mod tests {
                 r#"{"cuda_devices":[0,1],"weight_format":"exl3"}"#,
                 "weight_format exl3",
             ),
+            (r#"{"cuda_devices":[0,1]}"#, "capture"),
             (r#"{"cuda_devices":[0,1],"capture":true}"#, "capture"),
             (r#"{"cuda_devices":[0,1],"tiered":{"slots":8}}"#, "tiered"),
             (
@@ -1454,14 +1462,18 @@ mod tests {
     fn host_kv_offload_is_opt_in_and_does_not_enable_prefix_reuse() {
         let resident = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(resident.kv_offload_host_bytes, None);
-        let paged = cuda_offload(r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608}"#).unwrap();
+        let paged =
+            cuda_offload(r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608,"capture":false}"#)
+                .unwrap();
         assert_eq!(paged.kv_offload_host_bytes, Some(8_388_608));
         assert!(!paged.prefix_reuse);
         assert!(paged.check_prefix_reuse_cap(false).is_ok());
         assert!(error_text(paged.check_prefix_reuse_cap(true)).contains("prefix_reuse"));
         assert!(
-            cuda_offload(r#"{"kv_dtype":"q8","kv_offload_host_bytes":18446744073709551615}"#)
-                .is_ok()
+            cuda_offload(
+                r#"{"kv_dtype":"q8","kv_offload_host_bytes":18446744073709551615,"capture":false}"#
+            )
+            .is_ok()
         );
     }
 
@@ -1472,6 +1484,7 @@ mod tests {
             r#"{"kv_dtype":"f32","kv_offload_host_bytes":1}"#,
             r#"{"kv_dtype":"q8","kv_offload_host_bytes":0}"#,
             r#"{"kv_dtype":"q8","kv_offload_host_bytes":1,"capture":true}"#,
+            r#"{"kv_dtype":"q8","kv_offload_host_bytes":8388608}"#,
             r#"{"kv_dtype":"q8","kv_offload_host_bytes":1,"tiered":{"slots":8}}"#,
         ] {
             assert!(message(cuda_offload(body)).contains("kv_offload_host_bytes"));
@@ -2102,13 +2115,13 @@ mod tests {
     }
 
     #[test]
-    fn an_exl3_entry_captures_by_default_and_can_roll_back() {
+    fn a_cuda_entry_captures_by_default_and_can_roll_back() {
         let capture = |options: &Q36Options, backend| {
             settings_for(Some(options), &Q36Env::default(), backend)
                 .unwrap()
                 .capture
         };
-        // Unset: an EXL3 entry on the CUDA arm captures; a GGUF entry stays eager.
+        // Unset: every CUDA entry captures (EXL3 and GGUF alike); an explicit false rolls back.
         assert!(capture(&exl3_options(|_| ()), Backend::Cuda));
         assert!(!capture(
             &exl3_options(|o| o.capture = Some(false)),
@@ -2119,7 +2132,14 @@ mod tests {
             Backend::Cuda
         ));
         let gguf = Q36Options::default();
-        assert!(!capture(&gguf, Backend::Cuda));
+        assert!(capture(&gguf, Backend::Cuda));
+        assert!(!capture(
+            &Q36Options {
+                capture: Some(false),
+                ..Q36Options::default()
+            },
+            Backend::Cuda
+        ));
     }
 
     /// The rule derives its byte counts from the family spec and the cache form, never from a
@@ -3248,7 +3268,7 @@ mod tests {
         let got = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(
             (got.context_limit, got.cache_limit, got.capture),
-            (DEFAULT_CONTEXT_LIMIT, 0, false)
+            (DEFAULT_CONTEXT_LIMIT, 0, true)
         );
         // Default options set no MLX key, so NOTHING is recorded for the start lines (the empty
         // case pins the filter of `ignored_mlx_keys_of`).
@@ -3315,7 +3335,7 @@ mod tests {
     fn the_tiered_member_is_off_by_default_and_takes_its_defaults_when_given() {
         let off = settings_for(None, &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(off.tiered, None, "tiered is never on without the member");
-        let minimal = tiered(r#""tiered": {"slots": 40}"#);
+        let minimal = tiered(r#""capture":false, "tiered": {"slots": 40}"#);
         let got = settings_for(Some(&minimal), &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(
             got.tiered,
@@ -3326,8 +3346,9 @@ mod tests {
                 preload: false
             })
         );
-        let full =
-            tiered(r#""tiered": {"slots": 61, "threads": 4, "timeout_ms": 5000, "preload": true}"#);
+        let full = tiered(
+            r#""capture":false, "tiered": {"slots": 61, "threads": 4, "timeout_ms": 5000, "preload": true}"#,
+        );
         let got = settings_for(Some(&full), &Q36Env::default(), Backend::Cuda).unwrap();
         assert_eq!(
             got.tiered,
@@ -3381,6 +3402,7 @@ mod tests {
             cuda,
             "exclude each other",
         );
+        refused(r#""tiered": {"slots": 40}"#, cuda, "exclude each other");
         let unknown = serde_json::from_str::<Q36Options>(r#"{"tiered": {"slots": 40, "bank": 1}}"#);
         assert!(
             unknown.is_err(),

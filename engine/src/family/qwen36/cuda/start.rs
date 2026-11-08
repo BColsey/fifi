@@ -1530,7 +1530,7 @@ mod paged_start_tests {
     #[test]
     fn paged_startup_retains_the_exact_physical_resource_plan() {
         let settings = settings(
-            r#"{"kv_dtype":"q8","context_limit":131072,"kv_offload_host_bytes":2000000000}"#,
+            r#"{"kv_dtype":"q8","context_limit":131072,"kv_offload_host_bytes":2000000000,"capture":false}"#,
         );
         let plan = StartupPlan::new(&settings, false, modes(false)).unwrap();
         assert_eq!(
@@ -1542,8 +1542,9 @@ mod paged_start_tests {
 
     #[test]
     fn device_first_start_uses_the_complete_resident_reserve_without_host_payloads() {
-        let configured =
-            settings(r#"{"kv_dtype":"q8","context_limit":33280,"kv_offload_host_bytes":1}"#);
+        let configured = settings(
+            r#"{"kv_dtype":"q8","context_limit":33280,"kv_offload_host_bytes":1,"capture":false}"#,
+        );
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         assert!(plan.paged.is_none());
         let inventory = Inventory::for_spec(&QWEN3_6_35B_A3B).unwrap();
@@ -1577,8 +1578,9 @@ mod paged_start_tests {
 
     #[test]
     fn tiny_native_fit_is_not_rejected_by_rounded_page_reservation() {
-        let configured =
-            settings(r#"{"kv_dtype":"q8","context_limit":2,"kv_offload_host_bytes":1}"#);
+        let configured = settings(
+            r#"{"kv_dtype":"q8","context_limit":2,"kv_offload_host_bytes":1,"capture":false}"#,
+        );
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         let native = plan.device_first_native.unwrap();
         assert!(plan.reserve as usize <= native);
@@ -1591,8 +1593,9 @@ mod paged_start_tests {
 
     #[test]
     fn device_first_selects_the_measured_cache_budget_after_loading_weights() {
-        let configured =
-            settings(r#"{"kv_dtype":"q8","context_limit":1280,"kv_offload_host_bytes":33554432}"#);
+        let configured = settings(
+            r#"{"kv_dtype":"q8","context_limit":1280,"kv_offload_host_bytes":33554432,"capture":false}"#,
+        );
         let dims = super::super::common_tests::dims();
         let paging = super::super::paging_plan::PagingPlan::new(&dims, 1280).unwrap();
         let group = paging.group.total * paging.full_layers;
@@ -1641,7 +1644,9 @@ mod paged_start_tests {
 
     #[test]
     fn device_first_retains_the_capacity_mode_refusals() {
-        let base = settings(r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":1}"#);
+        let base = settings(
+            r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":1,"capture":false}"#,
+        );
         assert!(StartupPlan::new_device_first(&base, false, modes(true)).is_err());
         let mut bad = base.clone();
         bad.capture = true;
@@ -1659,8 +1664,9 @@ mod paged_start_tests {
 
     #[test]
     fn unsupported_paged_starts_fail_without_a_device_or_checkpoint() {
-        let settings =
-            settings(r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":8388608}"#);
+        let settings = settings(
+            r#"{"kv_dtype":"q8","context_limit":320,"kv_offload_host_bytes":8388608,"capture":false}"#,
+        );
         assert!(StartupPlan::new(&settings, false, modes(true)).is_err());
         let mut bad = settings.clone();
         bad.capture = true;
