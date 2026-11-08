@@ -13,7 +13,7 @@ use crate::{
         project::cuda::{Reserve, exl3::Exl3MemberStaging, exl3::exl3_member_layout},
         qwen36::settings::{BankMode, SlotRequest},
     },
-    kernels::cuda::{CudaContext, DeviceBuffer},
+    kernels::cuda::{CudaContext, DeviceBuffer, DeviceStream, host_register, host_unregister},
 };
 
 /// The refusal helper of this module: every admission error names its numbers.
@@ -182,6 +182,8 @@ pub(super) struct PartStore {
     scales: Vec<u8>,
     stride: usize,
     scale_stride: usize,
+    trellis_pinned: bool,
+    scales_pinned: bool,
 }
 
 impl PartStore {
@@ -192,6 +194,8 @@ impl PartStore {
             scales: vec![0; scale_stride * members],
             stride,
             scale_stride,
+            trellis_pinned: false,
+            scales_pinned: false,
         }
     }
 
@@ -233,6 +237,31 @@ impl PartStore {
     pub(super) fn bytes(&self) -> usize {
         self.trellis.len() + self.scales.len()
     }
+
+    /// Page-locks both members' storage, best effort: a store that fails to pin stays
+    /// pageable (the refills still work, only staged). The vectors never move after
+    /// the load, so the registered pointers stay the buffers' own.
+    pub(super) fn pin(&mut self) {
+        if host_register(&self.trellis).is_ok() {
+            self.trellis_pinned = true;
+        }
+        if host_register(&self.scales).is_ok() {
+            self.scales_pinned = true;
+        }
+    }
+}
+
+impl Drop for PartStore {
+    fn drop(&mut self) {
+        // The page lock must go before the Vec free; a failure leaves the lock to the
+        // process exit, which the CUDA runtime cleans up.
+        if self.trellis_pinned {
+            let _ = host_unregister(&self.trellis);
+        }
+        if self.scales_pinned {
+            let _ = host_unregister(&self.scales);
+        }
+    }
 }
 
 /// Every routed expert of every layer: `layers` entries of the `[gate, up, down]` parts.
@@ -258,6 +287,15 @@ impl ExpertStore {
 
     pub(crate) fn layer(&self, layer: usize) -> &[PartStore; 3] {
         &self.layers[layer]
+    }
+
+    /// Page-locks every member's storage (see [`PartStore::pin`]).
+    pub(crate) fn pin_all(&mut self) {
+        for parts in &mut self.layers {
+            for part in parts {
+                part.pin();
+            }
+        }
     }
 
     /// The whole store's bytes, for the start line and the admission's echo.
@@ -485,9 +523,10 @@ impl LayerResolver<'_, '_> {
     /// waited for the stream, and the launches this return feeds queue behind the copies.
     pub(crate) fn resolve(
         &mut self,
-        ctx: &CudaContext,
+        stream: &DeviceStream,
         picks: &[usize],
     ) -> Result<Vec<usize>, EngError> {
+        let began = std::time::Instant::now();
         let (table, parts) = &mut self.resolver.layers[self.layer];
         let store = self.resolver.store.layer(self.layer);
         let (slots, misses) = table.assign(picks)?;
@@ -496,12 +535,21 @@ impl LayerResolver<'_, '_> {
             let expert = table.expert_of(slot);
             for (part, target) in parts.iter().enumerate() {
                 let (trellis, scales) = store[part].member(expert);
-                ctx.upload_at(target.trellis, slot * target.stride, trellis)?;
-                ctx.upload_at(target.scales, slot * target.scale_stride, scales)?;
+                // Enqueued on the launch stream: the copies race the launches queued
+                // after them instead of a device-wide sync per copy, and the next
+                // layer's readback (already a stream wait) covers their completion.
+                target
+                    .trellis
+                    .write_at_enqueue(stream, slot * target.stride, trellis)?;
+                target
+                    .scales
+                    .write_at_enqueue(stream, slot * target.scale_stride, scales)?;
             }
         }
         self.resolver.hits += (picks.len() - miss_count) as u64;
         self.resolver.misses += miss_count as u64;
+        #[cfg(test)]
+        probe::resolve(began.elapsed());
         Ok(slots)
     }
 }
@@ -766,5 +814,39 @@ mod tests {
         let mut table = LayerSlots::new(64, 8);
         let error = format!("{:?}", table.assign(&[64]).unwrap_err());
         assert!(error.contains("pick 64"), "{error}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod probe {
+    //! Test-only timing of the banked readback and resolve, so a decode probe can report
+    //! what share of a token the host round trips take.
+    use std::cell::Cell;
+
+    thread_local! {
+        static READBACK: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        static RESOLVE: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn readback(spent: std::time::Duration) {
+        READBACK.with(|cell| {
+            let (calls, nanos) = cell.get();
+            cell.set((calls + 1, nanos + spent.as_nanos() as u64));
+        });
+    }
+
+    pub(crate) fn resolve(spent: std::time::Duration) {
+        RESOLVE.with(|cell| {
+            let (calls, nanos) = cell.get();
+            cell.set((calls + 1, nanos + spent.as_nanos() as u64));
+        });
+    }
+
+    /// The accumulated `(calls, nanos)` of each phase since the last take.
+    pub(crate) fn take() -> ((u64, u64), (u64, u64)) {
+        (
+            READBACK.with(|cell| cell.replace((0, 0))),
+            RESOLVE.with(|cell| cell.replace((0, 0))),
+        )
     }
 }

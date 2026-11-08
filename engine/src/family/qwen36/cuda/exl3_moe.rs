@@ -201,8 +201,11 @@ fn read_picks(
     dims: &MoeDims,
 ) -> Result<Vec<usize>, EngError> {
     let mut raw = vec![0u8; dims.top_k * I32];
+    let began = std::time::Instant::now();
     ids.buffer()
         .read_at(launch.stream, ids.offset(), &mut raw)?;
+    #[cfg(test)]
+    crate::family::qwen36::cuda::exl3_bank::probe::readback(began.elapsed());
     raw.as_chunks::<I32>()
         .0
         .iter()
@@ -609,7 +612,13 @@ pub(in crate::family) fn run_exl3_moe(
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims)?;
         let picks = match bank {
-            Some(bank) => bank.resolve(launch.ctx, &picks)?,
+            Some(bank) => {
+                let began = std::time::Instant::now();
+                let mapped = bank.resolve(launch.stream, &picks)?;
+                #[cfg(test)]
+                crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+                mapped
+            }
             None => picks,
         };
         routed(launch, weights, bufs, (&picks, dims))?;

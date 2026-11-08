@@ -388,7 +388,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims)?;
         let picks = match bank {
-            Some(bank) => bank.resolve(launch.ctx, &picks)?,
+            Some(bank) => bank.resolve(launch.stream, &picks)?,
             None => picks,
         };
         merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), dims)?;

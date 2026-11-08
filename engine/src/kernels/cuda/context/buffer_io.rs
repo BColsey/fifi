@@ -298,6 +298,29 @@ impl DeviceBuffer {
         Ok(())
     }
 
+    /// Enqueues `bytes` into the buffer at byte `offset` behind the work queued on
+    /// `stream` and returns without waiting for the copy: the next work on the stream
+    /// sees it. The enqueue consumes the caller's bytes, so they may be reused or
+    /// dropped as soon as this returns. The expert-bank refills use this to keep a
+    /// miss's copies on the launch stream instead of a device-wide sync per copy.
+    ///
+    /// Returns `BadRequest` for the conditions of [`Self::read_at`].
+    pub(crate) fn write_at_enqueue(
+        &self,
+        stream: &DeviceStream,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), EngError> {
+        let range = self.io_range(stream, "write", offset, bytes.len())?;
+        let raw = stream.raw()?;
+        let _dispatch = enter_on(stream.lease().device())?;
+        resident::copy_h2d_enqueue(range, bytes, raw).map_err(device_error)?;
+        stream.note_enqueue();
+        #[cfg(test)]
+        record_ranged_h2d(std::rc::Rc::as_ptr(&self.lease) as usize, bytes.len());
+        Ok(())
+    }
+
     /// The checks both calls share, then the native view of the range.
     fn io_range(
         &self,

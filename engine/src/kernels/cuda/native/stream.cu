@@ -225,6 +225,42 @@ extern "C" int inference_cuda_event_synchronize(void *event, int *out_stage) {
     }
 }
 
+/* Page-locks host memory the caller owns (cudaHostRegister). Registered ranges DMA
+ * without driver staging; the caller unregisters before freeing the memory. */
+extern "C" int inference_cuda_host_register(void *host, size_t bytes, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (host == NULL || bytes == 0) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        (void)cudaGetLastError();
+        Failure failure;
+        failure.record(cudaHostRegister(host, bytes, cudaHostRegisterDefault),
+                       INFERENCE_CUDA_STAGE_ALLOCATE);
+        (void)cudaGetLastError();
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
+/* Releases a page lock taken by inference_cuda_host_register. */
+extern "C" int inference_cuda_host_unregister(void *host, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        if (host == NULL) {
+            return INFERENCE_CUDA_OK;
+        }
+        (void)cudaGetLastError();
+        Failure failure;
+        failure.record(cudaHostUnregister(host), INFERENCE_CUDA_STAGE_ALLOCATE);
+        (void)cudaGetLastError();
+        return finish(failure, out_stage);
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}
+
 extern "C" int inference_cuda_pinned_alloc(size_t bytes, void **out_host, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);

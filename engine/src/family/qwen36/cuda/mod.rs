@@ -49,6 +49,8 @@ mod exl3_bank;
 #[cfg(test)]
 mod exl3_bank_step_device_tests;
 #[cfg(test)]
+mod exl3_bank_timing_probe;
+#[cfg(test)]
 mod exl3_device_tests;
 mod exl3_load;
 #[cfg(test)]

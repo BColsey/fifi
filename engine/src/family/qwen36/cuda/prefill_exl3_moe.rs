@@ -143,8 +143,11 @@ fn read_ids(
 ) -> Result<Vec<i32>, EngError> {
     let pairs = dims.rows * dims.top_k;
     let mut raw = vec![0u8; pairs * I32];
+    let began = std::time::Instant::now();
     ids.buffer()
         .read_at(projector.launch.stream, ids.offset(), &mut raw)?;
+    #[cfg(test)]
+    crate::family::qwen36::cuda::exl3_bank::probe::readback(began.elapsed());
     Ok(raw
         .as_chunks::<I32>()
         .0
@@ -166,11 +169,12 @@ fn read_plan(
     // block reads its expert ids. A fault-marked id (-1) falls through to the sort's refusal.
     let picks = match bank {
         Some(bank) if !picks.iter().any(|&id| id < 0) => {
+            let began = std::time::Instant::now();
             let wanted = picks.iter().map(|&id| id as usize).collect::<Vec<_>>();
-            bank.resolve(projector.launch.ctx, &wanted)?
-                .into_iter()
-                .map(|slot| slot as i32)
-                .collect()
+            let mapped = bank.resolve(projector.launch.stream, &wanted)?;
+            #[cfg(test)]
+            crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+            mapped.into_iter().map(|slot| slot as i32).collect()
         }
         _ => picks,
     };
@@ -614,15 +618,16 @@ pub(super) fn run_banked(
             plan_pairs(raw, dims.n_expert, k)?
         } else {
             let wanted = raw.iter().map(|&id| id as usize).collect::<Vec<_>>();
-            let mapped = bank.resolve(projector.launch.ctx, &wanted)?;
+            let mapped = bank.resolve(projector.launch.stream, &wanted)?;
             let bytes: Vec<u8> = mapped
                 .iter()
                 .flat_map(|&slot| (slot as i32).to_le_bytes())
                 .collect();
-            sub_bufs
-                .ids
-                .buffer()
-                .write_at(projector.launch.stream, sub_bufs.ids.offset(), &bytes)?;
+            sub_bufs.ids.buffer().write_at(
+                projector.launch.stream,
+                sub_bufs.ids.offset(),
+                &bytes,
+            )?;
             let slots: Vec<i32> = mapped.iter().map(|&slot| slot as i32).collect();
             plan_pairs(&slots, dims.n_expert, k)?
         };

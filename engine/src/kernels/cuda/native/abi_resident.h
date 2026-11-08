@@ -39,6 +39,10 @@ int inference_cuda_stream_wait_event(void *stream, void *event, int *out_stage);
 /* Blocks the host until the event completes. */
 int inference_cuda_event_synchronize(void *event, int *out_stage);
 
+/* Page-locks host memory the caller owns and later unregisters before freeing it. */
+int inference_cuda_host_register(void *host, size_t bytes, int *out_stage);
+int inference_cuda_host_unregister(void *host, int *out_stage);
+
 /* Page-locked host memory (cudaHostAlloc, default flags). bytes must not be 0. */
 int inference_cuda_pinned_alloc(size_t bytes, void **out_host, int *out_stage);
 /* Waits for the device, then frees; if the wait fails nothing is freed. */

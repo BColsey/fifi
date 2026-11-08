@@ -90,6 +90,8 @@ pub(super) fn load_exl3_banked_dir(
     let layers = LayerTable::new(&dims, &inventory)?.len();
     let mut store = ExpertStore::with_layers(layers);
     let weights = model_weights_admitted(&reader, &facts, Some((slots, &mut store)))?;
+    // The store never changes again: page-lock it so the bank refills DMA without staging.
+    store.pin_all();
     Ok(BankedModel {
         weights: CudaWeights::from_exl3(weights)?,
         store,

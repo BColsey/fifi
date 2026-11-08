@@ -1695,6 +1695,8 @@ pub(super) fn host_write(
     native::upload_at(raw, offset, bytes).map_err(device_error)
 }
 
+/// Page-lock helpers re-exported for the expert bank's host store.
+pub(crate) use native::resident::{host_register, host_unregister};
 #[cfg(test)]
 pub(crate) use nvfp4_launch::{Nvfp4GroupedPlan, Nvfp4LaunchStatus};
 pub(crate) use pinned::{PinnedWord, WordValue};
