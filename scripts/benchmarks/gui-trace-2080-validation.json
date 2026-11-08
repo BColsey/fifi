@@ -1,0 +1,45 @@
+{
+  "schema": "fifi.gui-trace-validation.v1",
+  "recorded_utc": "2026-11-08T18:57:43.145324+00:00",
+  "gui_code_commit": "b18a6deefb57dd3ca92a63558fbbd4bc702aaace",
+  "router_code_commit": "cb2a4d97e7b65a3956b0d3f85d3576de0dc26b77",
+  "gui_bundle_sha256": "a011c35bb7055cc7d88c4238738f53a1acfbccf2992db86bae956c432e315681",
+  "deployed_router_sha256": "d4e4c0d80e0ec3bcd7d09336d095a1fd25d7da09fd7ded15dff2e138c0976db0",
+  "checks": [
+    {
+      "name": "web unit tests",
+      "result": "54 passed"
+    },
+    {
+      "name": "Vite TypeScript and production build",
+      "result": "passed"
+    },
+    {
+      "name": "router loopback tests",
+      "result": "4 passed, including colliding reply IDs and unknown model rejection"
+    },
+    {
+      "name": "isolated browser with mocked APIs",
+      "traced_chat": true,
+      "lookup_after_model_change": true,
+      "stored_reply_model": true,
+      "browser": "isolated Chromium",
+      "backend": "mock"
+    },
+    {
+      "name": "live 2080 Ti through keyless LAN proxy",
+      "model": "fifi-q36-2080ti",
+      "stream_status": 200,
+      "trace_status": 200,
+      "reply_id_matches": true,
+      "captured_positions": 18,
+      "stream_complete": true,
+      "client_api_key": "none"
+    }
+  ],
+  "limits": [
+    "The browser smoke used file-origin Chromium with mocked API responses; the live stream and trace lookup used HTTP through the LAN proxy.",
+    "A separate very short temperature-zero reply returned a trace packet with zero captured positions; greedy trace capture needs separate investigation.",
+    "These are functional checks, not inference-performance measurements."
+  ]
+}
