@@ -22,6 +22,8 @@ __pycache__/
 # The token-forcing device drivers are tracked in place; the rest of qualification/ is
 # internal and force-added file by file.
 !/qualification/token-forcing/
+# The MTP acceptance collector is tracked in place as well.
+!/qualification/mtp-acceptance/
 .pi-dsh/
 .pi-glla/
 engine/.pi-dsh/
