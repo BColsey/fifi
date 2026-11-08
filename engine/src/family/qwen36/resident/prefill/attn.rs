@@ -689,11 +689,13 @@ mod tests {
                 values(&mut kernels, &old.0).unwrap(),
                 "decode step {n} after the chunk differs from the concatenate formulation"
             );
-            assert_parity(
-                &got,
-                &host.outputs[n as usize],
-                &format!("decode step {n} against the host"),
-            );
+            // The decode seam folds the output residual, so bridge it onto the host row.
+            let want: Vec<f32> = host.outputs[n as usize]
+                .iter()
+                .zip(&input(n))
+                .map(|(a, b)| a + b)
+                .collect();
+            assert_parity(&got, &want, &format!("decode step {n} against the host"));
             cache = next.cache;
             concat = old.1;
         }
@@ -850,11 +852,13 @@ mod tests {
                 values(&mut kernels, &old.0).unwrap(),
                 "decode step {n} after the chunks differs from the concatenate formulation"
             );
-            assert_parity(
-                &got,
-                &host.outputs[n as usize],
-                &format!("decode step {n} against the host"),
-            );
+            // The decode seam folds the output residual, so bridge it onto the host row.
+            let want: Vec<f32> = host.outputs[n as usize]
+                .iter()
+                .zip(&input(n))
+                .map(|(a, b)| a + b)
+                .collect();
+            assert_parity(&got, &want, &format!("decode step {n} against the host"));
             cache = next.cache;
             concat = old.1;
         }
