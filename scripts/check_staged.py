@@ -377,10 +377,21 @@ def staged_publisher_gate(root: Path) -> None:
             "commit; commit or restore the unstaged changes first: "
             + ", ".join(differing)
         )
+    # The gate's tests spawn `git` in throwaway directories; the hook
+    # context exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE, which would
+    # hijack those subprocesses into this worktree's git dir (observed:
+    # ignored_local_files_are_not_published_files fails under pre-commit
+    # but passes standalone). Scrub the git context, keep the rest.
+    gate_env = {
+        key: value for key, value in os.environ.items()
+        if key not in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE",
+                       "GIT_PREFIX")
+    }
     try:
         gate = subprocess.run(
             ["cargo", "test", "--locked", "--test", "published_text", "--quiet"],
             cwd=engine,
+            env=gate_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,

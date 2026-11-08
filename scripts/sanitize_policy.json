@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "version": 2,
+ "version": 3,
  "description": "Authoritative public-vocabulary policy shared by the publisher sanitizer and the published_text gate. Every entry is classified; additions require a classification receipt.",
  "allowed_tags": [
   {
@@ -122,6 +122,11 @@
    "tag": "L-3",
    "class": "index-notation",
    "origin": "receipt 2026-11-02, sanitizer false positive"
+  },
+  {
+   "tag": "K-1",
+   "class": "index-notation",
+   "origin": "receipt 2026-11-08, sanitizer false positive (rows 0..K-1 arithmetic range, krow_step.rs)"
   },
   {
    "tag": "N-1",
