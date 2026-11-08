@@ -80,7 +80,7 @@ fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     if !device_present(NAME) {
         return;
     }
-    let result = run_session_rig(NAME, [0, 0]);
+    let result = run_session_rig(NAME, [0, 0], false);
     result.expect("the card session rig");
 }
 
@@ -93,10 +93,26 @@ fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    run_session_rig(NAME, devices).expect("two-GPU session parity");
+    run_session_rig(NAME, devices, false).expect("two-GPU session parity");
 }
 
-fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn async_broadcasts_preserve_logits_on_peer_gpus() {
+    const NAME: &str = "async_broadcasts_preserve_logits_on_peer_gpus";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_session_rig(NAME, devices, true).expect("async two-GPU session parity");
+}
+
+fn run_session_rig(
+    name: &'static str,
+    devices: [usize; 2],
+    compare_async: bool,
+) -> Result<(), EngError> {
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
@@ -259,7 +275,11 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     let admission = served_admission();
     let shard = ShardTable::new(&d.shape, 2, 32)?;
     let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let (mut stack, states) = CardStack::new(&d, &options, &devices, &admission)?;
+    let (mut stack, states) = if compare_async {
+        CardStack::new_for_async_broadcast_test(&d, &options, &devices, &admission)?
+    } else {
+        CardStack::new(&d, &options, &devices, &admission)?
+    };
     stack.enable_broadcast_sync_for_test();
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
@@ -361,6 +381,19 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     session.feed(3)?;
     let optimized_next = session.logits(4)?;
     assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
+
+    if compare_async {
+        stack.set_async_broadcasts_for_test(true);
+        TokenStepper::reset(&mut session)?;
+        session.feed(0)?;
+        session.feed(1)?;
+        let async_row = session.logits(2)?;
+        assert_eq!(row, async_row, "{name}: async first decoded logits");
+        session.feed(3)?;
+        let async_next = session.logits(4)?;
+        assert_eq!(next_row, async_next, "{name}: async later decoded logits");
+        stack.set_async_broadcasts_for_test(false);
+    }
 
     // A corrupt head makes a logits-producing step fail. A prompt-only feed
     // must still succeed with that head, proving that it was not launched.
