@@ -1,0 +1,62 @@
+{
+  "recorded_at_utc": "2026-11-08T21:41:09Z",
+  "suite": "alignment",
+  "source_commit": "1fac3c3228224adf1a5d339bc24cab66e3e21f18",
+  "binary_sha256": "070864394cef5b49f2989a6f2891414774595a041e89077193e8bff83b25baa5",
+  "platform": {
+    "gpu_pair": [
+      "NVIDIA GeForce RTX 3080 10 GB",
+      "NVIDIA GeForce RTX 3060 12 GB"
+    ],
+    "other_gpu": "NVIDIA GeForce RTX 2080 Ti, serving but idle in samples",
+    "nvidia_driver": "615.78.08",
+    "cuda_arch": "sm_86",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)"
+  },
+  "build": {
+    "command": "cargo test --locked --release --lib --features native-cuda --no-run",
+    "cargo_build_jobs": 2
+  },
+  "execution": {
+    "shared_gpu_reservation": true,
+    "cuda_visible_pair_only": true,
+    "test_threads": 1,
+    "exact_names": true,
+    "device_required": true,
+    "primary_service_stopped_then_restored": true,
+    "samples_guarded": 5,
+    "guard_file": "p2p-mailbox-exact-tip-validation-guard.jsonl"
+  },
+  "results": [
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::a_wait_with_no_publisher_times_out_in_the_status_word ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.23s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::odd_capacity_exchanges_on_physical_peers",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": true,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::odd_capacity_exchanges_on_physical_peers ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.37s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::the_fp16_exchange_sums_within_half_precision_and_flags_overflow",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::the_fp16_exchange_sums_within_half_precision_and_flags_overflow ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.23s\n\n"
+    },
+    {
+      "test": "kernels::cuda::peer_ring::device_tests::two_contexts_exchange_a_sum_and_repeat_it",
+      "multiblock_env": "0",
+      "ignored_test_explicitly_selected": false,
+      "output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::device_tests::two_contexts_exchange_a_sum_and_repeat_it ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.26s\n\n"
+    }
+  ],
+  "limits": [
+    "One physical host; device checks do not establish model output quality or end-to-end performance.",
+    "Guard observations are sampled at approximately one-second intervals, not continuous.",
+    "The physical odd-capacity test uses 2,049 values with F16 then F32 in three synchronized rounds; it is not an exhaustive concurrency test."
+  ],
+  "cpu_layout_test_output": "\nrunning 1 test\ntest kernels::cuda::peer_ring::tests::the_layout_aligns_every_slot_for_odd_capacities ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.00s\n\n"
+}
