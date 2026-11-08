@@ -1392,18 +1392,18 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
 // ---- the stage functions: P1 and the two mixer blocks ----------------------------------------
 
-struct LayerCtx<'a, 'w> {
-    launch: &'a Launch<'a>,
-    weights: &'a LayerWeights<'w>,
-    moe: LayerMoe<'a, 'w>,
-    ord: usize,
-    layer: usize,
-    kind: AttentionKind,
-    status: DeviceRange<'a>,
+pub(super) struct LayerCtx<'a, 'w> {
+    pub(super) launch: &'a Launch<'a>,
+    pub(super) weights: &'a LayerWeights<'w>,
+    pub(super) moe: LayerMoe<'a, 'w>,
+    pub(super) ord: usize,
+    pub(super) layer: usize,
+    pub(super) kind: AttentionKind,
+    pub(super) status: DeviceRange<'a>,
 }
 
 #[derive(Clone, Copy)]
-enum LayerMoe<'a, 'w> {
+pub(super) enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
     Exl3(&'a Exl3MoeWeights<'w>),
 }
@@ -1419,7 +1419,7 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
 }
 
 impl ChunkRun<'_, '_> {
-    fn v(&self, slot: ChunkSlot) -> Result<DeviceRange<'_>, EngError> {
+    pub(super) fn v(&self, slot: ChunkSlot) -> Result<DeviceRange<'_>, EngError> {
         self.bufs.views.get(slot)
     }
 
@@ -1455,7 +1455,7 @@ impl ChunkRun<'_, '_> {
 }
 
 /// P1, the embedding.
-fn chunk_embed(
+pub(super) fn chunk_embed(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
     status: DeviceRange<'_>,
@@ -1492,7 +1492,7 @@ fn chunk_embed(
 }
 
 /// Stage 1, `NormA`.
-fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let g = run.model.geometry;
     launch.ctx.add_norm_pack(
@@ -1511,7 +1511,7 @@ fn norm_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError
 }
 
 /// Stage 2, `QuantA`: one quantize on the group representative role of the kind.
-fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_a(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let rep = match ctx.kind {
         AttentionKind::DeltaNet => Role::AttnQkv,
@@ -1541,7 +1541,7 @@ fn call_weight_k(weight: &crate::kernels::cuda::NativeWeight) -> usize {
     weight.k()
 }
 
-fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (m, g) = (run.rows.m(), run.model.geometry);
     // The wide upload concatenates the siblings in DeltaProj column order, so a segment's
@@ -1620,7 +1620,7 @@ fn delta_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 4d, the causal conv: the ring state of the layer's own ordinal.
-fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     launch.ctx.gdn_conv(
         launch.stream,
@@ -1635,7 +1635,7 @@ fn delta_conv(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 5d, the scan: the recurrent state of the layer's own ordinal, in place.
-fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let status = ctx.status;
     launch.ctx.gdn_scan_seq(
@@ -1662,7 +1662,7 @@ fn delta_scan(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngE
 }
 
 /// Stage 6d, `QuantDOut`.
-fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense_input(
         launch,
@@ -1678,7 +1678,7 @@ fn quant_d_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 }
 
 /// Stage 7d, `SsmOut`.
-fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense(
         launch,
@@ -1695,7 +1695,7 @@ fn ssm_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErro
     )
 }
 /// Stage 3a, the three attention projections.
-fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (m, g) = (run.rows.m(), run.model.geometry);
     for (role, _n, col_off) in attn_proj_cols(g) {
@@ -1829,7 +1829,7 @@ fn kv8_parts<'a>(run: &ChunkRun<'a, '_>) -> Result<Kv8Parts<'a>, EngError> {
 }
 
 /// Stage 4a, preparation and the mode-specific KV append of the layer's ordinal.
-fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_prep(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (g, status) = (run.model.geometry, ctx.status);
     let kv8 = if run.state.layout().kv.mode == KvMode::Int8G32 {
@@ -2013,7 +2013,7 @@ fn attn_flash_kv8(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), 
 }
 
 /// Stage 5a, the flash attention: the launch plan's split, the flat-capped `part`.
-fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     if run.state.layout().kv.mode == KvMode::Int8G32 {
         if let Some(staging) = run.bufs.kv8_staging {
             if staging.plan.covers(run.rows.end()) {
@@ -2191,7 +2191,7 @@ fn attn_flash_fp16(
 }
 
 /// Stage 6a, `QuantAOut`.
-fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense_input(
         launch,
@@ -2207,7 +2207,7 @@ fn quant_a_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 }
 
 /// Stage 7a, `AttnOut`.
-fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     run.dense(
         launch,
@@ -2224,7 +2224,7 @@ fn attn_out(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngErr
     )
 }
 /// Stage 8, `NormF`.
-fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn norm_f(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let g = run.model.geometry;
     launch.ctx.add_norm_pack(
@@ -2537,7 +2537,7 @@ pub(super) fn run_chunk_route(launch: &Launch<'_>, io: &RouteIo<'_>) -> Result<(
 // ---- the layer walk and the body --------------------------------------------------------------
 
 /// Stage 9 inside the layer walk.
-fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let (router, router_shared) = ctx.moe.router();
     run_chunk_route(
@@ -2559,7 +2559,7 @@ fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 
 /// The MoE dispatch inside the layer walk: v1 always the Resident arm (tiered sessions take
 /// the per-token path, `chunk_ready`).
-fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+pub(super) fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
     let LayerMoe::Native(moe) = ctx.moe else {
         return exl3::moe_block(run, ctx);
