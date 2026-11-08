@@ -42,6 +42,11 @@ pub(in crate::family::qwen36::cuda) struct RouteRead {
     pub(in crate::family::qwen36::cuda) weights: Vec<f32>,
     /// The normed row the CPU experts read.
     pub(in crate::family::qwen36::cuda) hidden: Vec<f32>,
+    /// The RAW residual before the block's norm (`resid_in`), the input a router guess of a
+    /// LATER layer wants: the guess applies its own rmsnorm with the target layer's norm
+    /// weight, so it must not be fed the normed row. Read back under the same event as the
+    /// rest of the route (no extra host sync).
+    pub(in crate::family::qwen36::cuda) resid: Vec<f32>,
 }
 
 /// What the device launches of the layer need, per pick.
@@ -92,7 +97,7 @@ impl TieredScratch {
             slot_weights: zeros(top_k * F32)?,
             cpu_partial: zeros(hidden * F32)?,
             ones: ctx.upload(&1.0f32.to_le_bytes())?,
-            host: ctx.pinned_buf((hidden + 2 * top_k) * F32)?,
+            host: ctx.pinned_buf((2 * hidden + 2 * top_k) * F32)?,
             event: ctx.event()?,
             hidden,
             top_k,
@@ -191,7 +196,9 @@ fn to_bytes<T: Copy>(values: &[T], one: impl Fn(T) -> [u8; 4]) -> Vec<u8> {
     values.iter().flat_map(|&v| one(v)).collect()
 }
 
-/// Runs the router, copies its outputs to the host and waits: the first host sync of the layer.
+/// Runs the router, copies its outputs and the raw residual to the host and waits: the first
+/// host sync of the layer. The residual shares the batch and the event of the route outputs,
+/// so it costs one more device-to-host copy and no extra sync.
 fn route_to_host(
     launch: &Launch<'_>,
     weights: &MoeLayerWeights<'_>,
@@ -201,11 +208,13 @@ fn route_to_host(
 ) -> Result<RouteRead, EngError> {
     op_router(launch, weights, bufs, *dims)?;
     let (ids_at, weights_at) = (scratch.hidden * F32, (scratch.hidden + scratch.top_k) * F32);
+    let resid_at = (scratch.hidden + 2 * scratch.top_k) * F32;
     let route = &bufs.route;
     let ctx = launch.ctx;
     ctx.copy_to_pinned(launch.stream, route.norm_row, &mut scratch.host, 0)?;
     ctx.copy_to_pinned(launch.stream, route.ids, &mut scratch.host, ids_at)?;
     ctx.copy_to_pinned(launch.stream, route.weights, &mut scratch.host, weights_at)?;
+    ctx.copy_to_pinned(launch.stream, route.resid_in, &mut scratch.host, resid_at)?;
     launch.stream.record(&scratch.event)?;
     scratch.host.wait(&scratch.event)?;
     let mut raw = vec![0u8; scratch.host.len()];
@@ -217,8 +226,9 @@ fn route_to_host(
         .collect();
     Ok(RouteRead {
         ids,
-        weights: floats(&raw[weights_at..]),
+        weights: floats(&raw[weights_at..resid_at]),
         hidden: floats(&raw[..ids_at]),
+        resid: floats(&raw[resid_at..]),
     })
 }
 

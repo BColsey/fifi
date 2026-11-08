@@ -290,6 +290,66 @@ impl ExpertPolicy {
         swaps
     }
 
+    /// Decides the promotion of ONE candidate outside the token boundary: a router guess
+    /// offers `expert` for `layer` before the layer's route is known. Free bank: the
+    /// promotion is free, exactly a warm-up fill of `boundary`. Full bank: the victim is
+    /// the lowest-score resident of the layer and the promotion only pays when the
+    /// candidate outscores it — the guess carries no routed evidence, so `scores` holds
+    /// only what earlier tokens observed. Marks the swap in the internal bank exactly as
+    /// `boundary` does, so the caller mirrors it through the residency table; `None`
+    /// changes nothing (already resident, static policy, or the candidate loses to the
+    /// victim). WHY: a mid-token promotion publishes at the token boundary like any
+    /// other fill, so it can only ever serve a LATER token, and the score gate keeps a
+    /// wrong guess from evicting a proven resident.
+    pub fn advise(&mut self, layer: usize, expert: u16) -> Option<Swap> {
+        if self.cfg.mode != PolicyMode::Adaptive {
+            return None;
+        }
+        let (l, e) = (layer, usize::from(expert));
+        if l >= self.cfg.layers || e >= self.cfg.experts || self.resident[l][e] {
+            return None;
+        }
+        if self.bank_len[l] < self.cfg.bank_slots_per_layer {
+            self.resident[l][e] = true;
+            self.bank_len[l] += 1;
+            return Some(Swap {
+                layer: u16::try_from(l).ok()?,
+                promote: expert,
+                evict: None,
+            });
+        }
+        let victim = self.lowest_of(l);
+        if self.scores[l][e] > self.scores[l][victim] {
+            self.resident[l][victim] = false;
+            self.resident[l][e] = true;
+            // The promotion PRESERVES the bank's ordering: the promotee starts just
+            // above the victim it replaced (a guess carries no routed score, so
+            // without this floor it would be the next eviction's victim — even the
+            // same token's boundary — while its fill is still in flight).
+            self.scores[l][e] = self.scores[l][e].max(self.scores[l][victim] + self.scale);
+            return Some(Swap {
+                layer: u16::try_from(l).ok()?,
+                promote: expert,
+                evict: Some(u16::try_from(victim).ok()?),
+            });
+        }
+        None
+    }
+
+    /// Reverts the internal marks of an [`ExpertPolicy::advise`] the caller declined to
+    /// mirror through the residency table (the guess-eviction cap hit): the candidate
+    /// stops being resident and, when the advice evicted, the victim returns. The
+    /// free-slot branch gives the slot back (`bank_len` drops); the evicting branch
+    /// changed no length. Only the caller that just took the `Swap` may call this.
+    pub fn unadvise(&mut self, layer: usize, expert: u16, evict: Option<u16>) {
+        let (l, e) = (layer, usize::from(expert));
+        self.resident[l][e] = false;
+        match evict {
+            Some(victim) => self.resident[l][usize::from(victim)] = true,
+            None => self.bank_len[l] -= 1,
+        }
+    }
+
     /// The resident expert of `layer` with the lowest score; equal scores keep the
     /// lowest expert id because the scan is in id order. The bank must not be
     /// empty, which callers guarantee by checking it is full first.
@@ -627,5 +687,61 @@ mod tests {
             fixed.preload(0, 1).is_err(),
             "a static policy refuses a preload"
         );
+    }
+
+    #[test]
+    fn advise_fills_free_slots_and_unadvise_gives_the_slot_back() {
+        let mut policy = ExpertPolicy::new(&adaptive(4, 0.25), None).unwrap();
+        let swap = policy.advise(0, 5).unwrap();
+        assert_eq!(
+            swap,
+            Swap {
+                layer: 0,
+                promote: 5,
+                evict: None
+            }
+        );
+        assert!(policy.is_resident(0, 5));
+        policy.unadvise(0, 5, None);
+        assert!(!policy.is_resident(0, 5));
+        assert_eq!(policy.advise(0, 5).unwrap().evict, None);
+    }
+
+    #[test]
+    fn advise_evicts_only_when_the_candidate_outscores_the_victim() {
+        // Two slots, no boundary budget: only advise can replace a resident.
+        let mut policy = ExpertPolicy::new(&adaptive(2, 0.0), None).unwrap();
+        // Token one routes experts 1 and 3; the boundary fills both free slots.
+        let hits = policy.observe(&[vec![1u16, 3u16], Vec::new()]);
+        assert!(!hits[0][0] && !hits[0][1]);
+        assert_eq!(policy.boundary().len(), 2);
+        assert_eq!(policy.advise(0, 4), None, "an unscored candidate loses");
+        // Two more tokens of expert 2 outscore the one-token residents.
+        for _ in 0..2 {
+            policy.observe(&[vec![2u16], Vec::new()]);
+            policy.boundary();
+        }
+        let swap = policy.advise(0, 2).unwrap();
+        let victim = usize::from(swap.evict.unwrap());
+        assert_eq!(victim, 1, "the lower-id one-token resident loses");
+        assert!(policy.is_resident(0, 2) && !policy.is_resident(0, 1));
+        // The promotion preserves the ordering: the promotee outranks what it
+        // replaced, so the OTHER resident is the next eviction's victim.
+        assert!(policy.scores[0][2] > policy.scores[0][victim]);
+        let second = policy.advise(0, 4);
+        assert!(
+            second.is_none() || second.unwrap().evict != Some(2),
+            "a fresh promotee is never the next victim"
+        );
+        policy.unadvise(0, 2, swap.evict);
+        assert!(policy.is_resident(0, 1) && !policy.is_resident(0, 2));
+    }
+
+    #[test]
+    fn advise_of_a_resident_expert_changes_nothing() {
+        let mut policy = ExpertPolicy::new(&adaptive(2, 0.25), None).unwrap();
+        policy.observe(&[vec![7u16], Vec::new()]);
+        policy.boundary();
+        assert_eq!(policy.advise(0, 7), None);
     }
 }

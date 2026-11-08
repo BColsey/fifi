@@ -293,6 +293,11 @@ struct Timed {
     tiered: Option<TokenReport>,
 }
 
+// The large variant stays unboxed on purpose: the timed region that builds it may not
+// allocate (the_timed_region_text_spells_no_allocation), and a Region lives for one
+// measurement, never in a loop. Its size grew with the tiered token report's prefetch
+// counters, which is size on a struct built once per measurement.
+#[allow(clippy::large_enum_variant)]
 enum Region {
     Complete(Timed),
     Expired { steps_done: usize },

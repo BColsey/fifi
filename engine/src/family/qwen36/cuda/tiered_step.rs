@@ -42,15 +42,31 @@ fn host_error(error: HostError) -> EngError {
 }
 
 /// The block-side view of the host: converts the plain route into the host's slices and its
-/// plan and errors back.
-struct HostAdapter<'h>(&'h mut TieredHost);
+/// plan and errors back, and issues the router-guess prefetch fills of the advice that
+/// arrived for this layer (advice exists to be early: it publishes at the token boundary
+/// and serves a later token, so issuing it here cannot change this token's result).
+struct HostAdapter<'h, 'd> {
+    host: &'h mut TieredHost,
+    fills: &'d mut dyn BankDevice,
+}
 
-impl TieredLayerHost for HostAdapter<'_> {
+impl TieredLayerHost for HostAdapter<'_, '_> {
     fn begin_layer(&mut self, layer: usize, route: &RouteRead) -> Result<LayerPlan, EngError> {
         let plan = self
-            .0
-            .begin_layer(layer, &route.ids, &route.weights, &route.hidden)
+            .host
+            .begin_layer(
+                layer,
+                &route.ids,
+                &route.weights,
+                &route.hidden,
+                &route.resid,
+            )
             .map_err(host_error)?;
+        if let Some((target, advice)) = self.host.take_arrived_advice() {
+            self.host
+                .prefetch(self.fills, target, &advice)
+                .map_err(host_error)?;
+        }
         Ok(LayerPlan {
             slot_ids: plan.slot_ids,
             device_weights: plan.device_weights,
@@ -58,7 +74,7 @@ impl TieredLayerHost for HostAdapter<'_> {
     }
 
     fn finish_layer(&mut self, layer: usize) -> Result<Option<Vec<f32>>, EngError> {
-        self.0.finish_layer(layer).map_err(host_error)
+        self.host.finish_layer(layer).map_err(host_error)
     }
 }
 
@@ -159,8 +175,19 @@ impl<'w> TieredRuntime<'w> {
             scratch: &mut self.scratch,
             dims,
         };
-        let made =
-            run_moe_block_tiered(launch, &mut HostAdapter(&mut self.host), layer, &mut block)?;
+        let mut fills = BankFill {
+            banks: &self.banks,
+            stream: launch.stream,
+        };
+        let made = run_moe_block_tiered(
+            launch,
+            &mut HostAdapter {
+                host: &mut self.host,
+                fills: &mut fills,
+            },
+            layer,
+            &mut block,
+        )?;
         self.syncs.add(made);
         Ok(())
     }

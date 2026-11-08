@@ -19,6 +19,14 @@ pub struct TokenReport {
     /// outputs are built from. WHY: the CPU share of PICKS says little when the popular experts are the missed ones.
     pub routed_weight_ppm: u64,
     pub cpu_weight_ppm: u64,
+    /// Router-guess prefetch fills issued (advice promotions that reached the fill path).
+    pub guess_fills: u32,
+    /// Prefetch promotions that evicted a resident expert (the thrash-bound counter).
+    pub guess_evicts: u32,
+    /// Advice layers consumed against a real route (the RecallMeter sample count).
+    pub guess_samples: u64,
+    /// Advised experts that the consumed route actually picked (the RecallMeter hits).
+    pub guess_hits: u64,
 }
 
 impl TokenReport {
@@ -33,6 +41,10 @@ impl TokenReport {
             ssd_bytes,
             routed_weight_ppm,
             cpu_weight_ppm,
+            guess_fills,
+            guess_evicts,
+            guess_samples,
+            guess_hits,
         } = *other;
         self.bank_hits += bank_hits;
         self.cpu_served += cpu_served;
@@ -41,6 +53,10 @@ impl TokenReport {
         self.ssd_bytes += ssd_bytes;
         self.routed_weight_ppm += routed_weight_ppm;
         self.cpu_weight_ppm += cpu_weight_ppm;
+        self.guess_fills += guess_fills;
+        self.guess_evicts += guess_evicts;
+        self.guess_samples += guess_samples;
+        self.guess_hits += guess_hits;
     }
 }
 
@@ -58,6 +74,10 @@ mod tests {
             ssd_bytes: 1_000,
             routed_weight_ppm: 900_000,
             cpu_weight_ppm: 400_000,
+            guess_fills: 2,
+            guess_evicts: 1,
+            guess_samples: 6,
+            guess_hits: 4,
         };
         left.merge(&TokenReport {
             bank_hits: 4,
@@ -67,6 +87,10 @@ mod tests {
             ssd_bytes: 2_048,
             routed_weight_ppm: 100_000,
             cpu_weight_ppm: 100_000,
+            guess_fills: 5,
+            guess_evicts: 2,
+            guess_samples: 9,
+            guess_hits: 3,
         });
         assert_eq!(
             left,
@@ -78,6 +102,10 @@ mod tests {
                 ssd_bytes: 3_048,
                 routed_weight_ppm: 1_000_000,
                 cpu_weight_ppm: 500_000,
+                guess_fills: 7,
+                guess_evicts: 3,
+                guess_samples: 15,
+                guess_hits: 7,
             }
         );
         let mut empty = TokenReport::default();
