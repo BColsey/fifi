@@ -32,6 +32,8 @@
     )
 )]
 
+use std::cell::Cell;
+
 use crate::EngError;
 use crate::family::qwen36::cuda::dims::{StepDims, StepOptions};
 use crate::family::qwen36::cuda::shard::ShardTable;
@@ -107,6 +109,8 @@ pub(crate) struct CardStack {
     /// A broadcast has only one publisher, so its following broadcast cannot
     /// acknowledge that every peer has consumed a double-buffered slot.
     sync_broadcasts: bool,
+    /// The per-card cache is sliced, so its own prepared K/V rows suffice.
+    local_kv_rows: Cell<bool>,
 }
 
 impl CardStack {
@@ -155,6 +159,7 @@ impl CardStack {
         let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
+        let local_kv_rows = std::env::var_os("Q36_P2P_LOCAL_KV").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
         let mut shards = Vec::with_capacity(devices.len());
         let mut states = Vec::with_capacity(devices.len());
@@ -183,6 +188,7 @@ impl CardStack {
                 streams,
                 contexts,
                 sync_broadcasts,
+                local_kv_rows: Cell::new(local_kv_rows),
             },
             states,
         ))
@@ -232,6 +238,15 @@ impl CardStack {
 
     pub(crate) fn streams(&self) -> &[DeviceStream] {
         &self.streams
+    }
+
+    pub(super) fn local_kv_rows(&self) -> bool {
+        self.local_kv_rows.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_local_kv_rows_for_test(&self, enabled: bool) {
+        self.local_kv_rows.set(enabled);
     }
 
     #[cfg(test)]

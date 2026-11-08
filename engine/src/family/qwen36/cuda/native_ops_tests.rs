@@ -672,9 +672,24 @@ mod card_ops_tests {
             );
             let append_op = at(7);
             match (mode, append_op) {
-                (KvMode::Fp16, BlockOp::KvAppendF16 { k, v, .. })
-                | (KvMode::Int8G32, BlockOp::Kv8Append { k, v, .. }) => {
+                (
+                    KvMode::Fp16,
+                    BlockOp::KvAppendF16 {
+                        k, v, k_at, v_at, ..
+                    },
+                )
+                | (
+                    KvMode::Int8G32,
+                    BlockOp::Kv8Append {
+                        k, v, k_at, v_at, ..
+                    },
+                ) => {
                     assert_eq!((*k, *v), (Slot::KRows, Slot::VRows), "{append}");
+                    assert_eq!(
+                        (*k_at, *v_at),
+                        (k_range.0, k_range.0),
+                        "{append}: the append consumes the same local row extent as the prep"
+                    );
                 }
                 _ => panic!("{append}: op 7 must be the mode's append, met {append_op:?}"),
             }

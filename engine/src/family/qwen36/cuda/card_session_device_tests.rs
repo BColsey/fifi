@@ -80,7 +80,7 @@ fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     if !device_present(NAME) {
         return;
     }
-    let result = run_session_rig(NAME, [0, 0]);
+    let result = run_session_rig(NAME, [0, 0], KvMode::Int8G32, false);
     result.expect("the card session rig");
 }
 
@@ -93,16 +93,74 @@ fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    run_session_rig(NAME, devices).expect("two-GPU session parity");
+    run_session_rig(NAME, devices, KvMode::Int8G32, false).expect("two-GPU session parity");
 }
 
-fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn local_kv_rows_preserve_q8_cache_and_logits_on_peer_gpus() {
+    run_local_kv_peer_rig(
+        "local_kv_rows_preserve_q8_cache_and_logits_on_peer_gpus",
+        KvMode::Int8G32,
+    );
+}
+
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn local_kv_rows_preserve_fp16_cache_and_logits_on_peer_gpus() {
+    run_local_kv_peer_rig(
+        "local_kv_rows_preserve_fp16_cache_and_logits_on_peer_gpus",
+        KvMode::Fp16,
+    );
+}
+
+fn run_local_kv_peer_rig(name: &'static str, mode: KvMode) {
+    assert!(device_present(name));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_session_rig(name, devices, mode, true).expect("local K/V session parity");
+}
+
+/// Read only committed cells, including each Q8 head's separate prefix;
+/// uninitialized Fp16 cache tails must not participate in the comparison.
+fn kv_prefix(
+    session: &CardSession,
+    stack: &CardStack,
+    tokens: usize,
+) -> Result<Vec<Vec<u8>>, EngError> {
+    let mut result = Vec::new();
+    for (card, state) in session.states_for_test().iter().enumerate() {
+        for ordinal in 0..state.layout().kv.layers {
+            for run in state.layout().kv.prefix_ranges(ordinal, tokens)? {
+                let (plane_start, _) = state.layout().kv.plane_extent(ordinal, run.plane)?;
+                let view = state.kv_plane(ordinal, run.plane)?;
+                let mut bytes = vec![0; run.bytes];
+                view.buffer().read_at(
+                    &stack.streams()[card],
+                    view.offset() + run.device_offset - plane_start,
+                    &mut bytes,
+                )?;
+                result.push(bytes);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn run_session_rig(
+    name: &'static str,
+    devices: [usize; 2],
+    kv_mode: KvMode,
+    compare_local_kv: bool,
+) -> Result<(), EngError> {
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
     let d = StepDims::new(&shape, &inv)?;
     let options = StepOptions {
-        kv_mode: KvMode::Int8G32,
+        kv_mode,
         context_tokens: 8,
         delta_slots: 1,
         forked_experts: false,
@@ -281,6 +339,7 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
             .into_boxed_slice(),
     );
     let stack: &'static CardStack = Box::leak(Box::new(stack));
+    stack.set_local_kv_rows_for_test(false);
     let table_static: &'static LayerTable = Box::leak(Box::new(table_layers));
     let eos: Arc<[u32]> = Arc::from(vec![7u32]);
     let mut session = CardSession::new(
@@ -352,6 +411,17 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     // path must preserve state both before and after a logits-producing step.
     session.feed(3)?;
     let next_row = session.logits(4)?;
+    let original_sequence = stack.ring().next_sequence_for_test();
+    let original_kv = if compare_local_kv {
+        let prefix = kv_prefix(&session, stack, 5)?;
+        assert!(
+            !prefix.is_empty() && prefix.iter().all(|run| !run.is_empty()),
+            "{name}: the cache comparison must cover committed rows"
+        );
+        prefix
+    } else {
+        Vec::new()
+    };
     TokenStepper::reset(&mut session)?;
     session.set_skip_prefill_head_for_test(true);
     session.feed(0)?;
@@ -361,6 +431,49 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     session.feed(3)?;
     let optimized_next = session.logits(4)?;
     assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
+
+    if compare_local_kv {
+        stack.set_local_kv_rows_for_test(true);
+        TokenStepper::reset(&mut session)?;
+        session.feed(0)?;
+        session.feed(1)?;
+        let local_row = session.logits(2)?;
+        assert_eq!(row, local_row, "{name}: local K/V first logits");
+        session.feed(3)?;
+        let local_next = session.logits(4)?;
+        assert_eq!(next_row, local_next, "{name}: local K/V later logits");
+        assert_eq!(
+            original_kv,
+            kv_prefix(&session, stack, 5)?,
+            "{name}: every committed K/V code, scale or fp16 value"
+        );
+        assert_eq!(
+            stack.ring().next_sequence_for_test() + 10,
+            original_sequence,
+            "{name}: two fewer gathers for each of five tokens"
+        );
+
+        // A prior peer failure must still refuse before either cache append,
+        // even though this mode no longer performs the two K/V exchanges.
+        TokenStepper::reset(&mut session)?;
+        let before_failure = kv_prefix(&session, stack, 5)?;
+        stack.shards()[1].ring_word().write_at(
+            &stack.streams()[1],
+            0,
+            &crate::kernels::cuda::peer_ring::STATUS_TIMEOUT.to_le_bytes(),
+        )?;
+        let refused = session
+            .feed(0)
+            .expect_err("the peer fault must stop the cache append");
+        assert!(
+            refused.to_string().contains("cache was not appended"),
+            "{name}: unexpected refusal {refused}"
+        );
+        assert_eq!(before_failure, kv_prefix(&session, stack, 5)?);
+        assert_eq!(session.fed(), 0);
+        TokenStepper::reset(&mut session)?;
+        stack.set_local_kv_rows_for_test(false);
+    }
 
     // A corrupt head makes a logits-producing step fail. A prompt-only feed
     // must still succeed with that head, proving that it was not launched.

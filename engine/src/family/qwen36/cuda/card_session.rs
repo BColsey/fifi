@@ -256,6 +256,11 @@ impl CardSession {
         self.skip_prefill_head = enabled;
     }
 
+    #[cfg(test)]
+    pub(super) fn states_for_test(&self) -> &[ResidentState] {
+        &self.states
+    }
+
     /// The one launch path of a token: run the whole distributed step, fold
     /// the status words, and optionally read the concatenated logits row.
     /// `fed` advances only when the token ran clean.

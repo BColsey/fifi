@@ -125,6 +125,23 @@ pub(crate) fn run_card_block(
                 }
             }
             CardOp::GatherK | CardOp::GatherV => {
+                if stack.local_kv_rows() {
+                    // The prep wrote this card's own extent at the exact
+                    // offset that its sliced-cache append reads. Keep the
+                    // host gate: an earlier ring failure must still be
+                    // detected on both cards before either cache append.
+                    for (card, run) in kv_runs.iter().enumerate() {
+                        if *run != stack.table().kv_rows(card)? {
+                            return Err(EngError::BadRequest(format!(
+                                "card block: card {card} K/V rows do not match its shard"
+                            )));
+                        }
+                    }
+                    if matches!(op, CardOp::GatherV) {
+                        gate_the_gathers(stack)?;
+                    }
+                    continue;
+                }
                 let slot = match op {
                     CardOp::GatherK => Slot::KRows,
                     _ => Slot::VRows,
@@ -309,8 +326,13 @@ fn gate_the_gathers(stack: &CardStack) -> Result<(), EngError> {
     }
     let folded = fold_ring_status(&words);
     if folded != 0 {
+        let operation = if stack.local_kv_rows() {
+            "peer exchange before the K/V append"
+        } else {
+            "K/V gather"
+        };
         return Err(EngError::BadRequest(format!(
-            "card block: the K/V gather failed on the ring (status {folded}); \
+            "card block: the {operation} failed on the ring (status {folded}); \
              the session is dead and the cache was not appended"
         )));
     }
