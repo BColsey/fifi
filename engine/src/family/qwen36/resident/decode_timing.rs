@@ -1161,7 +1161,10 @@ fn speculative_decode_timing() {
     let reps = env_number("DT_SPEC_REPS", 3, 1, 16);
     let session_cap = std::env::var("DT_SPEC_SESSION_CAP")
         .ok()
-        .map(|v| v.parse().unwrap_or_else(|_| panic!("DT_SPEC_SESSION_CAP must be bytes")))
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("DT_SPEC_SESSION_CAP must be bytes"))
+        })
         .unwrap_or(SESSION_CAP);
     let out_dir = create_out_dir(&out_dir_must_be_new());
 
@@ -1188,7 +1191,8 @@ fn speculative_decode_timing() {
         max_seqs: 1,
         prefix_store: StoreLimits::default(),
     };
-    let (mut executor, mut solo) = Q36Executor::from_parts(kernels, &real.ckpt, host, rules).unwrap();
+    let (mut executor, mut solo) =
+        Q36Executor::from_parts(kernels, &real.ckpt, host, rules).unwrap();
     let mut ngram_session = executor.new_session().unwrap();
     let bundle = TokenizerBundle::load(&tokenizer_dir, &tokenizer_pin().unwrap()).unwrap();
     let disabled = SpecConfig::default();
@@ -1216,7 +1220,8 @@ fn speculative_decode_timing() {
     let mut jobs: Vec<GenerationState> = arms
         .iter()
         .map(|_| {
-            GenerationState::new(IncrementalDecoder::new(bundle.tokenizer())).with_max_tokens(u32::MAX)
+            GenerationState::new(IncrementalDecoder::new(bundle.tokenizer()))
+                .with_max_tokens(u32::MAX)
         })
         .collect();
     let mut rows = Vec::new();
@@ -1234,8 +1239,7 @@ fn speculative_decode_timing() {
             let mut tokens = 0usize;
             let mut multi = 0usize;
             for _ in 0..calls {
-                let batch =
-                    one_serving_call(&mut executor, &mut **session, &mut jobs[slot]);
+                let batch = one_serving_call(&mut executor, &mut **session, &mut jobs[slot]);
                 let count = batch.tokens.len();
                 tokens += count;
                 multi += usize::from(count > 1);
@@ -1269,7 +1273,10 @@ fn speculative_decode_timing() {
         serde_json::to_vec_pretty(&report).unwrap(),
     )
     .unwrap();
-    println!("wrote {}", out_dir.join("spec_decode_timing.json").display());
+    println!(
+        "wrote {}",
+        out_dir.join("spec_decode_timing.json").display()
+    );
 }
 
 /// One serving decode call of the timing pair: a single-session `decode_window` whose batch
