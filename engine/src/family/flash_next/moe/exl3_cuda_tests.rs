@@ -375,7 +375,7 @@ fn run_block(
         ctx,
         stream: &stream,
     };
-    run_exl3_moe(&launch, block, &bufs, moe, device_ids)?;
+    run_exl3_moe(&launch, block, &bufs, moe, device_ids, None)?;
     stream.synchronize()?;
     let ids = read(projector, &owned[4])?
         .as_chunks::<4>()

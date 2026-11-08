@@ -1054,7 +1054,9 @@ fn expert_bank_settings(
         return Ok(None);
     };
     if backend == Backend::Mlx {
-        return Err(bad("expert_bank is a CUDA member; the MLX arm refuses it".into()));
+        return Err(bad(
+            "expert_bank is a CUDA member; the MLX arm refuses it".into()
+        ));
     }
     if weights != WeightFormat::Exl3 {
         return Err(bad(
@@ -1088,7 +1090,7 @@ fn expert_bank_settings(
         Some(other) => {
             return Err(bad(format!(
                 "expert_bank.mode must be auto or on, got {other:?}"
-            )))
+            )));
         }
     };
     Ok(Some(ExpertBankSettings { slots, mode }))
@@ -1386,7 +1388,10 @@ impl Q36Settings {
             // The CUDA arm captures by default (EXL3 reads the picks on the device; a GGUF step
             // saves its launch overhead — measured 5.3 percent of wall in the W3 bench, at a
             // one-time first-request capture warmup); `"capture": false` rolls back to eager.
-            capture: options.capture.unwrap_or(backend == Backend::Cuda),
+            // A banked load stays eager: the slot resolver works on the host between the
+            // readback and the launches, which a graph cannot do (an explicit `"capture": true`
+            // was refused above).
+            capture: options.capture.unwrap_or(backend == Backend::Cuda) && expert_bank.is_none(),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
             compile: match backend {

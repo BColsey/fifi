@@ -24,12 +24,14 @@ use super::{
     card_step::CardStack,
     card_weights::load_card_weights,
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
-    exl3_load::{DecidedLoad, load_exl3_dir_decided},
+    exl3_bank::{Exl3SlotResolver, ExpertStore},
+    exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
+    exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
     pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
-    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes},
+    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes, moe_dims},
     rules::QwenRules,
     shard::ShardTable,
     state_layout::{KvPool, StateLayout},
@@ -976,6 +978,10 @@ fn make(
         WeightFormat::Exl3 => None,
     };
     let tiered = tiered_plan_of(&settings);
+    // The banked EXL3 load's leftovers (None on every resident path): the host store and the
+    // figures the resolver build below needs. Declared here because the load match's arms are
+    // separate blocks.
+    let mut banked_load: Option<(ExpertStore, usize, usize)> = None;
     // A tiered load leaves the routed expert stacks in the file: the banks hold the hot ones.
     let device = match (&gguf, tiered) {
         (None, _) => {
@@ -986,6 +992,7 @@ fn make(
             projector
                 .context()
                 .set_single_row_default(SERVED_SINGLE_ROW);
+            let mut banked_inner: Option<(ExpertStore, usize, usize)> = None;
             let device = match load_exl3_dir_decided(
                 &projector,
                 &settings.artifact,
@@ -1006,15 +1013,19 @@ fn make(
                         settings.artifact.display(),
                         began.elapsed().as_secs_f64(),
                     );
-                    // M1 wires the load and admission only; the banked decode step (slot
-                    // tables, miss copies, the eager host resolve) is the next slice.
-                    return Err(EngError::BadRequest(
-                        "q36 cuda: the banked EXL3 load works but its decode step is not wired \
-                         yet; remove qwen36.expert_bank or wait for the decode slice"
-                            .into(),
-                    ));
+                    let BankedModel {
+                        weights,
+                        store,
+                        slots,
+                        experts,
+                        routed_bytes: _,
+                        dense_bytes: _,
+                    } = *banked;
+                    banked_inner = Some((store, slots, experts));
+                    weights
                 }
             };
+            banked_load = banked_inner;
             eprintln!(
                 "q36 cuda: EXL3 weights loaded from {} in {:.1} s",
                 settings.artifact.display(),
@@ -1089,8 +1100,36 @@ fn make(
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
     let weights: &'static CudaWeights = Box::leak(Box::new(device));
     let res: &'static StepResources = Box::leak(Box::new(res));
+    // The banked resolver, from the leaked weights: per-layer slot tables over the load's slot
+    // banks and the host store. Leaked like its owners, for the step's life.
+    let mut banked_slots = 0;
+    let bank = match banked_load {
+        Some((store, slots, experts)) => {
+            banked_slots = slots;
+            let dims = moe_dims(&res.dims);
+            let blocks = (0..res.table.len())
+                .map(|layer| {
+                    Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let resolver = Exl3SlotResolver::new(store, &blocks, experts)?;
+            Some(Box::leak(Box::new(std::cell::RefCell::new(resolver))))
+        }
+        None => None,
+    };
     guard.commit();
-    let mut step = QwenResidentStep::new(projector.context(), res, weights, &options, rules)?;
+    let mut step = match bank {
+        Some(bank) => QwenResidentStep::new_banked(
+            projector.context(),
+            res,
+            weights,
+            &options,
+            rules,
+            banked_slots,
+            bank,
+        )?,
+        None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
+    };
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
         // The section-timing marks stay off on the serve path: the timer is a measurement harness,

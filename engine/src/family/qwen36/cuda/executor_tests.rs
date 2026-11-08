@@ -529,7 +529,7 @@ fn the_step_builds_its_chunk_facts_and_the_start_hands_the_cap_over() {
     // scan, `chunk_ready` reads the stored facts, and `make` opens KV8 only by opt-in
     // before handing over the 512-row cap. The old default remains unchanged.
     let step = include_str!("step.rs");
-    let new = pinned(section_of(step, "step.rs", "pub(crate) fn new("));
+    let new = pinned(section_of(step, "step.rs", "fn build("));
     assert!(new.contains("any_chunk_weight_q6k("), "{new}");
     let ready = pinned(section_of(step, "step.rs", "fn chunk_ready("));
     assert!(

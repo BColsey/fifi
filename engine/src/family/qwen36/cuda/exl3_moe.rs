@@ -73,12 +73,36 @@ impl<'w> Exl3MoeWeights<'w> {
         Self::resolve_by(weights, layer, moe, |role| table.name(layer, role))
     }
 
+    /// The block of `layer` of a banked load: the routed banks hold `members` slots, not the
+    /// full expert count, and the host miss resolver feeds the launches slot indices.
+    pub(super) fn resolve_banked(
+        weights: &'w CudaWeights,
+        table: &LayerTable,
+        layer: usize,
+        moe: &MoeDims,
+        members: usize,
+    ) -> Result<Self, EngError> {
+        Self::resolve_by_members(weights, layer, moe, |role| table.name(layer, role), members)
+    }
+
     /// The block of `layer` in `weights`, where `name` gives the key of each role's tensor.
     pub(in crate::family) fn resolve_by<'n>(
         weights: &'w CudaWeights,
         layer: usize,
         moe: &MoeDims,
         name: impl Fn(Role) -> Result<&'n str, EngError>,
+    ) -> Result<Self, EngError> {
+        Self::resolve_by_members(weights, layer, moe, name, moe.n_expert)
+    }
+
+    /// [`resolve_by`] with the routed banks' member count named by the caller: a banked load
+    /// resolves against its slot count.
+    fn resolve_by_members<'n>(
+        weights: &'w CudaWeights,
+        layer: usize,
+        moe: &MoeDims,
+        name: impl Fn(Role) -> Result<&'n str, EngError>,
+        members: usize,
     ) -> Result<Self, EngError> {
         let raw = |role, values: usize| -> Result<&'w DeviceBuffer, EngError> {
             match weights.get(name(role)?) {
@@ -93,13 +117,12 @@ impl<'w> Exl3MoeWeights<'w> {
         let bank = |role, shape: [usize; 2]| -> Result<&'w Exl3Bank, EngError> {
             match weights.get(name(role)?) {
                 Some(CudaWeight::Exl3Bank { bank, .. })
-                    if bank.count() == moe.n_expert && bank.shape() == shape =>
+                    if bank.count() == members && bank.shape() == shape =>
                 {
                     Ok(bank)
                 }
                 _ => Err(refuse(format!(
-                    "layer {layer} {role:?} is not a bank of {} experts of {shape:?}",
-                    moe.n_expert
+                    "layer {layer} {role:?} is not a bank of {members} experts of {shape:?}"
                 ))),
             }
         };
@@ -557,13 +580,16 @@ fn combine_ranges(
 }
 
 /// The block of one layer on the one stream. With `device_ids` the picks stay on the device and
-/// the block makes no host read; otherwise it waits for the stream once, to read the ids.
+/// the block makes no host read; otherwise it waits for the stream once, to read the ids. With
+/// `bank` the read picks map through the layer's slot table, whose missed slots this fills from
+/// the host store first, and the launches then read the slot members.
 pub(in crate::family) fn run_exl3_moe(
     launch: &Launch<'_>,
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
     device_ids: bool,
+    bank: Option<&mut super::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<(), EngError> {
     if dims.rows != 1 {
         return Err(refuse(format!(
@@ -573,9 +599,19 @@ pub(in crate::family) fn run_exl3_moe(
     }
     route(launch, weights, bufs, dims)?;
     if device_ids {
+        if bank.is_some() {
+            return Err(refuse(
+                "the banked block reads the picks on the host; capture is refused while banked"
+                    .into(),
+            ));
+        }
         routed_on_device(launch, weights, bufs, dims)?;
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims)?;
+        let picks = match bank {
+            Some(bank) => bank.resolve(launch.ctx, &picks)?,
+            None => picks,
+        };
         routed(launch, weights, bufs, (&picks, dims))?;
     }
     shared(launch, weights, bufs, dims)?;

@@ -370,6 +370,13 @@ impl Exl3Bank {
         self.bits_twice
     }
 
+    /// The trellis and scales buffers in member order, for a banked slot fill: member `i`'s
+    /// bytes live at `i * stride` of the trellis buffer and `i * scale_stride` of the scales
+    /// buffer ([`exl3_member_layout`]).
+    pub(crate) fn bank_buffers(&self) -> [&DeviceBuffer; 2] {
+        [&self.trellis, &self.scales]
+    }
+
     pub(crate) fn view(&self, index: usize) -> Result<Exl3MatrixView<'_>, EngError> {
         if index >= self.count {
             return Err(EngError::BadRequest(format!(

@@ -13,6 +13,7 @@ use crate::{
         project::cuda::{Reserve, exl3::Exl3MemberStaging, exl3::exl3_member_layout},
         qwen36::settings::{BankMode, SlotRequest},
     },
+    kernels::cuda::{CudaContext, DeviceBuffer},
 };
 
 /// The refusal helper of this module: every admission error names its numbers.
@@ -42,6 +43,8 @@ pub(super) struct BankAdmission {
 /// The slot arithmetic mirrors `project::cuda::admit`'s demand rule: a load of `tensors`
 /// bytes plus the reserve's `kv_cache + work + headroom` must fit `free`. Banking replaces
 /// the routed share with `per_member * slots * layers`.
+// Every figure is one named admission input; a config struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decide(
     request: SlotRequest,
     mode: BankMode,
@@ -68,6 +71,12 @@ pub(super) fn decide(
     let budget = free.saturating_sub(hold).saturating_sub(dense);
     let slots = match request {
         SlotRequest::Exactly(want) => {
+            if want < 1 || want > n_expert {
+                return Err(refuse(format!(
+                    "{want} slots are outside 1 to {n_expert}, one banked expert to the experts \
+                     of a layer",
+                )));
+            }
             let demand = per_member
                 .checked_mul(want as u64)
                 .and_then(|bytes| bytes.checked_mul(layers as u64))
@@ -88,7 +97,15 @@ pub(super) fn decide(
         }
         SlotRequest::Fit => {
             let slots = (budget / per_member.max(1)) as usize;
-            slots.clamp(1, n_expert)
+            if slots < 1 {
+                return Err(refuse(format!(
+                    "the budget after the dense weights and the reserve leaves {slots} slots, \
+                     below one (budget {}, per member {})",
+                    gib(budget),
+                    gib(per_member),
+                )));
+            }
+            slots.min(n_expert)
         }
     };
     let device_bytes = dense.saturating_add(
@@ -240,8 +257,236 @@ impl ExpertStore {
     pub(crate) fn host_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|parts| parts.iter().map(PartStore::bytes).sum::<usize>() as u64)
-            .sum()
+            .map(|parts| parts.iter().map(PartStore::bytes).sum::<usize>())
+            .sum::<usize>() as u64
+    }
+}
+
+/// The least-recently-used slot table of one layer: which expert sits in which slot of the
+/// layer's three banks. Pure — the device copies live one level up, so the policy is testable
+/// without a GPU.
+///
+/// One slot index addresses member `i` of all three parts' device banks and of the store's
+/// part stores alike, so the table is one array per layer, not per part.
+struct LayerSlots {
+    experts: usize,
+    slots: usize,
+    /// Expert -> slot, [`EMPTY`] when absent.
+    slot_of: Vec<u16>,
+    /// Slot -> expert, [`EMPTY`] when the slot never filled.
+    expert_of: Vec<u16>,
+    last_used: Vec<u64>,
+    tick: u64,
+}
+
+/// The absent marker of both directions of the slot table.
+const EMPTY: u16 = u16::MAX;
+
+impl LayerSlots {
+    fn new(experts: usize, slots: usize) -> Self {
+        Self {
+            experts,
+            slots,
+            slot_of: vec![EMPTY; experts],
+            expert_of: vec![EMPTY; slots],
+            last_used: vec![0; slots],
+            tick: 0,
+        }
+    }
+
+    /// Maps `picks` (this layer's routed experts of one token, distinct) to slot indices,
+    /// evicting for every miss the least-recently-used slot that no pick of THIS call uses —
+    /// all picks must be resident together, because the launches of one block read them all.
+    /// Returns the slots in pick order and, for each miss, the slot whose device bytes the
+    /// caller must refill from the store.
+    fn assign(&mut self, picks: &[usize]) -> Result<(Vec<usize>, Vec<usize>), EngError> {
+        let mut slots = Vec::with_capacity(picks.len());
+        let mut misses = Vec::new();
+        for &expert in picks {
+            if expert >= self.experts {
+                return Err(EngError::BadRequest(format!(
+                    "EXL3 expert bank: pick {expert} exceeds the {} experts of the layer",
+                    self.experts
+                )));
+            }
+            let slot = match usize::from(self.slot_of[expert]) {
+                s if s < self.slots => s,
+                _ => self.victim(&slots)?,
+            };
+            let miss = self.slot_of[expert] == EMPTY;
+            if miss {
+                let evicted = self.expert_of[slot];
+                if evicted != EMPTY {
+                    self.slot_of[usize::from(evicted)] = EMPTY;
+                }
+                self.expert_of[slot] = u16::try_from(expert).map_err(|_| {
+                    EngError::BadRequest(format!(
+                        "EXL3 expert bank: expert {expert} does not fit the slot table"
+                    ))
+                })?;
+                self.slot_of[expert] = u16::try_from(slot).expect("slots fit u16 (max 256)");
+                misses.push(slot);
+            }
+            slots.push(slot);
+        }
+        self.tick += 1;
+        for &slot in &slots {
+            self.last_used[slot] = self.tick;
+        }
+        Ok((slots, misses))
+    }
+
+    /// The next slot for a miss: an empty one, else the least-recently-used slot no pick of
+    /// this call took.
+    fn victim(&self, taken: &[usize]) -> Result<usize, EngError> {
+        if let Some(slot) = (0..self.slots).find(|&slot| self.expert_of[slot] == EMPTY) {
+            return Ok(slot);
+        }
+        (0..self.slots)
+            .filter(|slot| !taken.contains(slot))
+            .min_by_key(|&slot| self.last_used[slot])
+            .ok_or_else(|| {
+                EngError::BadRequest(format!(
+                    "EXL3 expert bank: {} slots cannot hold the {} picks of one token",
+                    self.slots,
+                    taken.len() + 1
+                ))
+            })
+    }
+
+    /// The expert a slot holds (for the store read of a miss copy).
+    fn expert_of(&self, slot: usize) -> usize {
+        usize::from(self.expert_of[slot])
+    }
+}
+
+/// One routed bank's device upload target: the buffers a slot's bytes land in, and the
+/// per-member strides of [`exl3_member_layout`].
+struct BankTarget<'w> {
+    trellis: &'w DeviceBuffer,
+    scales: &'w DeviceBuffer,
+    stride: usize,
+    scale_stride: usize,
+}
+
+/// The upload target of one bank, by shared layout (a plain fn so the borrowed buffers keep
+/// the resolver's lifetime).
+fn target_of<'w>(bank: &'w crate::family::project::cuda::exl3::Exl3Bank) -> BankTarget<'w> {
+    let (stride, scale_stride) = exl3_member_layout(bank.shape(), bank.bits_twice());
+    let [trellis, scales] = bank.bank_buffers();
+    BankTarget {
+        trellis,
+        scales,
+        stride,
+        scale_stride,
+    }
+}
+
+/// The banked decode state: every layer's slot table with its three banks' upload targets,
+/// and the host store the misses copy from. The banks the tables point into are the same
+/// banks the block's views read, resolved once at the start.
+pub(crate) struct Exl3SlotResolver<'w> {
+    layers: Vec<(LayerSlots, [BankTarget<'w>; 3])>,
+    store: ExpertStore,
+    hits: u64,
+    misses: u64,
+}
+
+impl<'w> Exl3SlotResolver<'w> {
+    /// Builds the resolver from one resolved [`Exl3MoeWeights`](super::exl3_moe::Exl3MoeWeights)
+    /// per layer (banked: banks of `slots` members) and the matching store, so table, banks and
+    /// store agree on the layer order and the part order (gate, up, down).
+    pub(crate) fn new(
+        store: ExpertStore,
+        blocks: &[super::exl3_moe::Exl3MoeWeights<'w>],
+        experts: usize,
+    ) -> Result<Self, EngError> {
+        if store.layers() != blocks.len() {
+            return Err(EngError::MemoryPlan(format!(
+                "EXL3 expert bank: the store holds {} layers, the step resolved {}",
+                store.layers(),
+                blocks.len()
+            )));
+        }
+        let layers = blocks
+            .iter()
+            .map(|block| {
+                let slots = block.gate.count();
+                for bank in [block.gate, block.up, block.down] {
+                    if bank.count() != slots {
+                        return Err(EngError::MemoryPlan(format!(
+                            "EXL3 expert bank: a layer's banks hold {} gate, {} up and {} down \
+                             slots",
+                            slots,
+                            block.up.count(),
+                            block.down.count()
+                        )));
+                    }
+                }
+                Ok((
+                    LayerSlots::new(experts, slots),
+                    [
+                        target_of(block.gate),
+                        target_of(block.up),
+                        target_of(block.down),
+                    ],
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            layers,
+            store,
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    /// One layer's resolver view, what the MoE block hooks take.
+    pub(crate) fn layer(&mut self, layer: usize) -> LayerResolver<'_, 'w> {
+        LayerResolver {
+            resolver: self,
+            layer,
+        }
+    }
+
+    /// The hit/miss counts of the session, for the start-line echo and the report.
+    pub(crate) fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
+
+/// One layer's slice of the resolver: the block hooks need the layer bound once, not threaded
+/// through every launch builder.
+pub(crate) struct LayerResolver<'r, 'w> {
+    resolver: &'r mut Exl3SlotResolver<'w>,
+    layer: usize,
+}
+
+impl LayerResolver<'_, '_> {
+    /// Maps one token's picks to slots, refilling the missed slots' device bytes from the
+    /// store. The copies are stream-ordered on the caller's context: the readback that
+    /// produced the picks has already waited for the stream, and the launches this return
+    /// feeds queue behind the copies.
+    pub(crate) fn resolve(
+        &mut self,
+        ctx: &CudaContext,
+        picks: &[usize],
+    ) -> Result<Vec<usize>, EngError> {
+        let (table, parts) = &mut self.resolver.layers[self.layer];
+        let store = self.resolver.store.layer(self.layer);
+        let (slots, misses) = table.assign(picks)?;
+        let miss_count = misses.len();
+        for slot in misses {
+            let expert = table.expert_of(slot);
+            for (part, target) in parts.iter().enumerate() {
+                let (trellis, scales) = store[part].member(expert);
+                ctx.upload_at(target.trellis, slot * target.stride, trellis)?;
+                ctx.upload_at(target.scales, slot * target.scale_stride, scales)?;
+            }
+        }
+        self.resolver.hits += (picks.len() - miss_count) as u64;
+        self.resolver.misses += miss_count as u64;
+        Ok(slots)
     }
 }
 
@@ -450,5 +695,60 @@ mod tests {
                 .unwrap_err()
         );
         assert!(error.contains("member 2"), "{error}");
+    }
+
+    /// The first picks fill the empty slots in order; a repeat of the same picks is all hits
+    /// with the same slots and no misses.
+    #[test]
+    fn slot_table_fills_in_order_then_hits() {
+        let mut table = LayerSlots::new(64, 8);
+        let picks = [3usize, 41, 7, 19];
+        let (slots, misses) = table.assign(&picks).unwrap();
+        assert_eq!(slots, [0, 1, 2, 3]);
+        assert_eq!(misses, [0, 1, 2, 3]);
+        let (slots, misses) = table.assign(&picks).unwrap();
+        assert_eq!(slots, [0, 1, 2, 3]);
+        assert!(misses.is_empty());
+    }
+
+    /// A miss evicts the least-recently-used slot no pick of the call uses: touching expert 3
+    /// again makes expert 41's slot the victim, not 3's.
+    #[test]
+    fn slot_table_evicts_least_recently_used() {
+        let mut table = LayerSlots::new(64, 8);
+        table.assign(&[3, 41, 5, 6, 7, 8, 9, 10]).unwrap();
+        table.assign(&[3]).unwrap(); // touch 3; 41 is now the least-recently-used
+        let (slots, misses) = table.assign(&[50]).unwrap();
+        assert_eq!(slots, [1], "the victim is 41's slot");
+        assert_eq!(misses, [1]);
+        // 41 must miss again; it lands in some other slot.
+        let (slots, misses) = table.assign(&[41]).unwrap();
+        assert_eq!(misses.len(), 1);
+        assert_ne!(
+            slots[0], 1,
+            "41 cannot return to the slot it was evicted from"
+        );
+    }
+
+    /// A token whose picks are all new may replace every resident: the victims hold old
+    /// experts, which no new pick uses. A token with more picks than slots is refused.
+    #[test]
+    fn slot_table_replaces_everything_then_refuses_overload() {
+        let mut table = LayerSlots::new(64, 4);
+        table.assign(&[0, 1, 2, 3]).unwrap();
+        let (slots, misses) = table.assign(&[10, 11, 12, 13]).unwrap();
+        assert_eq!(misses.len(), 4);
+        assert_eq!(slots.len(), 4);
+        assert!((0..4).all(|slot| table.expert_of(slot) >= 10));
+        let error = format!("{:?}", table.assign(&[20, 21, 22, 23, 24]).unwrap_err());
+        assert!(error.contains("cannot hold"), "{error}");
+    }
+
+    /// A pick outside the layer's experts is refused by name.
+    #[test]
+    fn slot_table_refuses_out_of_range_picks() {
+        let mut table = LayerSlots::new(64, 8);
+        let error = format!("{:?}", table.assign(&[64]).unwrap_err());
+        assert!(error.contains("pick 64"), "{error}");
     }
 }

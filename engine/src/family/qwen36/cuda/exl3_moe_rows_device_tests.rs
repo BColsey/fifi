@@ -407,7 +407,8 @@ fn the_moe_block_of_k_rows_equals_k_single_row_blocks() {
             let row_resid = &resid[r * HIDDEN..(r + 1) * HIDDEN];
             let row_norm = &norm[r * HIDDEN..(r + 1) * HIDDEN];
             let single = buffers(ctx, 1, row_resid, row_norm);
-            run_exl3_moe(&launch, &weights, &single.row(0), &dims(1), true).expect("one-row block");
+            run_exl3_moe(&launch, &weights, &single.row(0), &dims(1), true, None)
+                .expect("one-row block");
             for (i, (name, buffer)) in stages(&single).iter().enumerate() {
                 let want = read(ctx, &stream, buffer);
                 let width = want.len();

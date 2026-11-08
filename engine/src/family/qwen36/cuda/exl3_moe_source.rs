@@ -9,7 +9,7 @@
 
 use super::{
     super::exl3_pack::{
-        ExpertPart, Root, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
+        ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
     },
     exl3_bank::{ExpertStore, PartStore},
     exl3_source::PackReader,
@@ -174,9 +174,7 @@ fn moe_weights_inner(
         &gate_shape,
         Ok,
     )?);
-    let routed_count = banked
-        .as_ref()
-        .map_or(moe.n_expert, |(slots, _)| *slots);
+    let routed_count = banked.as_ref().map_or(moe.n_expert, |(slots, _)| *slots);
     let mut parts = [None, None, None];
     for (index, (role, part, shape)) in [
         (Role::FfnGateExps, ExpertPart::Gate, &plan.gate),

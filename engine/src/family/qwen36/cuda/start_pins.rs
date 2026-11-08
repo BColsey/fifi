@@ -139,11 +139,7 @@ fn the_cuda_step_reports_the_admitted_pinned_store_limits() {
 
 #[test]
 fn the_non_tiered_flag_off_path_keeps_the_one_entry_default_store() {
-    let constructor = pinned(section_of(
-        include_str!("step.rs"),
-        "step.rs",
-        "pub(crate) fn new(",
-    ));
+    let constructor = pinned(section_of(include_str!("step.rs"), "step.rs", "fn build("));
     assert!(constructor.contains("prefix:PrefixSlot::default(),"));
     let make = pinned(fn_section("fn make("));
     assert!(make.contains("ifmodes.prefix!=PrefixMemory::Disabled{step.enable_pinned_prefix()?;"));

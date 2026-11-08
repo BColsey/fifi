@@ -287,12 +287,7 @@ fn model_weights_admitted(
         match banked.as_mut() {
             None => weights.extend(moe_weights(reader, &table, layer, &moe)?),
             Some((slots, store)) => weights.extend(moe_weights_banked(
-                reader,
-                &table,
-                layer,
-                &moe,
-                *slots,
-                &mut **store,
+                reader, &table, layer, &moe, *slots, store,
             )?),
         }
     }

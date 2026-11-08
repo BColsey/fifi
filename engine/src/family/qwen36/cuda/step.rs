@@ -32,8 +32,11 @@
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
 
+use std::cell::RefCell;
+
 use super::{
     dims::{KvMode, StepOptions},
+    exl3_bank::Exl3SlotResolver,
     exl3_moe::{
         Exl3MoeBufs, Exl3MoeWeights, Scratch,
         merge::{SharedMerge, run_exl3_moe_merged},
@@ -372,6 +375,11 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
     /// read; `moe` is empty then.
     exl3_moe: Vec<Exl3MoeWeights<'a>>,
+    /// The banked EXL3 decode state: every layer's slot tables with the host store, behind a
+    /// `RefCell` because the decode runs through a shared step view. `None` is the resident
+    /// step; when set, the eager MoE blocks map their read picks through the tables and
+    /// refill missed slots before the launches (the engine thread is the only borrower).
+    exl3_bank: Option<&'a std::cell::RefCell<Exl3SlotResolver<'a>>>,
     /// The working buffer of the MoE block that queues the shared expert inside the routed launches
     /// (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` or a load that cannot run it
     /// leaves `None`, which keeps the reference block).
@@ -720,6 +728,20 @@ impl<'a> QwenResidentStep<'a> {
         options: &StepOptions,
         rules: QwenRules,
     ) -> Result<Self, EngError> {
+        Self::build(context, res, weights, options, rules, None)
+    }
+
+    /// The build shared by both constructors; `banked` names the slot count and the resolver
+    /// of a banked EXL3 load (`None` is the resident step, whose banks must hold every
+    /// expert).
+    fn build(
+        context: &'a CudaContext,
+        res: &'a StepResources,
+        weights: &'a CudaWeights,
+        options: &StepOptions,
+        rules: QwenRules,
+        banked: Option<(usize, &'a RefCell<Exl3SlotResolver<'a>>)>,
+    ) -> Result<Self, EngError> {
         let widths = validate_step_inputs(options, res.dims.shape.vocab, &rules)?;
         // The mode follows the loaded weights: the options carry the same layout, derived from
         // `CudaWeights::layout()` by every production caller, and a mismatch is a typed error
@@ -772,7 +794,12 @@ impl<'a> QwenResidentStep<'a> {
             let dims = moe_dims(&res.dims);
             layers
                 .iter()
-                .map(|&layer| Exl3MoeWeights::resolve(weights, &res.table, layer, &dims))
+                .map(|&layer| match banked.as_ref().map(|(slots, _)| *slots) {
+                    Some(slots) => {
+                        Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
+                    }
+                    None => Exl3MoeWeights::resolve(weights, &res.table, layer, &dims),
+                })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
@@ -849,6 +876,7 @@ impl<'a> QwenResidentStep<'a> {
             mixers: Mixers::new(context, parts)?,
             moe,
             exl3_moe,
+            exl3_bank: banked.map(|(_, bank)| bank),
             exl3_merge,
             merge_intent,
             merge_source,
@@ -922,6 +950,21 @@ impl<'a> QwenResidentStep<'a> {
         Ok(step)
     }
 
+    /// [`Self::new`] for a banked EXL3 load: the routed banks hold `slots` members (resolved
+    /// against that count) and the decode maps every layer's picks through `bank`'s slot
+    /// tables, refilling missed slots from its host store.
+    pub(crate) fn new_banked(
+        context: &'a CudaContext,
+        res: &'a StepResources,
+        weights: &'a CudaWeights,
+        options: &StepOptions,
+        rules: QwenRules,
+        slots: usize,
+        bank: &'a RefCell<Exl3SlotResolver<'a>>,
+    ) -> Result<Self, EngError> {
+        Self::build(context, res, weights, options, rules, Some((slots, bank)))
+    }
+
     /// The load-line suffix of the merged MoE block: the resolved mode and its source on an EXL3
     /// load (` exl3_shared_in_routed=on source=default`), nothing on any other layout.
     pub(crate) fn shared_in_routed_suffix(&self) -> String {
@@ -987,10 +1030,14 @@ impl<'a> QwenResidentStep<'a> {
         if config.capture && self.res.sparse.is_some() {
             eprintln!("q36 cuda: capture off — the sparse attention chain is admitted");
         }
-        self.capture_on = config.capture && self.res.sparse.is_none();
+        // A banked engine never captures: the slot resolver works on the host between the
+        // readback and the launches, which a graph cannot do (the settings force capture off;
+        // this guard holds for any caller).
+        self.capture_on = config.capture && self.res.sparse.is_none() && self.exl3_bank.is_none();
         // A captured body cannot wait for the host inside a layer: the EXL3 MoE blocks read the
         // picks from device memory then.
-        self.exl3_device_ids = config.capture && self.layout == WeightLayout::Exl3;
+        self.exl3_device_ids =
+            config.capture && self.layout == WeightLayout::Exl3 && self.exl3_bank.is_none();
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
@@ -1414,6 +1461,13 @@ impl<'a> QwenResidentStep<'a> {
             ..
         } = self;
         // 1. Host checks. Nothing touches the device before all of them pass.
+        if self.exl3_bank.is_some() {
+            return Err(EngError::BadRequest(
+                "prefill chunk: the banked EXL3 engine decodes only; its prefill slice is not \
+                 wired yet"
+                    .into(),
+            ));
+        }
         check_chunk_start(p0, state.tokens())?;
         let arena = prefill
             .as_ref()
@@ -2220,12 +2274,15 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
                 }
+                let mut bank_guard = self.exl3_bank.map(|bank| bank.borrow_mut());
+                let mut bank = bank_guard.as_mut().map(|guard| guard.layer(layer));
                 let block = if let Some(merge) = &self.exl3_merge {
                     run_exl3_moe_merged(
                         &launch,
                         (weights, &bufs, merge),
                         &self.moe_dims,
                         self.exl3_device_ids,
+                        bank.as_mut(),
                     )
                 } else {
                     run_exl3_moe(
@@ -2234,6 +2291,7 @@ impl<'a> QwenResidentStep<'a> {
                         &bufs,
                         &self.moe_dims,
                         self.exl3_device_ids,
+                        bank.as_mut(),
                     )
                 };
                 #[cfg(test)]

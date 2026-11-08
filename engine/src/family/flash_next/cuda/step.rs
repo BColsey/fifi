@@ -656,7 +656,9 @@ impl MoeBlock for AllResidentMoe<'_> {
                 .map(|(_, name)| name.as_str())
                 .ok_or_else(|| refuse(format!("layer {layer} has no key for {role:?}")))
         })?;
-        run_exl3_moe(launch, &weights, bufs, dims, true)
+        // Flash-Next runs the captured block; the q36 expert bank never reaches it (the
+        // bank is a q36 member and the eager read path is the resolver's).
+        run_exl3_moe(launch, &weights, bufs, dims, true, None)
     }
 }
 

@@ -330,7 +330,13 @@ fn the_reference_block_does_not_know_the_merged_one() {
     }
     let run = squeeze(section(source, "pub(in crate::family) fn run_exl3_moe("));
     assert!(
-        run.contains("route(launch,weights,bufs,dims)?;ifdevice_ids{routed_on_device(launch,weights,bufs,dims)?;}else{"),
+        run.contains(
+            "route(launch,weights,bufs,dims)?;ifdevice_ids{ifbank.is_some(){returnErr(refuse("
+        ),
+        "the device branch exists only unbanked: {run}"
+    );
+    assert!(
+        run.contains("routed_on_device(launch,weights,bufs,dims)?;}else{"),
         "{run}"
     );
     assert!(
@@ -393,7 +399,7 @@ fn the_step_reaches_the_merged_block_only_through_the_switch() {
     );
     let run = squeeze(section(step, "fn run_op("));
     assert!(
-        run.contains("ifletSome(merge)=&self.exl3_merge{run_exl3_moe_merged(&launch,(weights,&bufs,merge),&self.moe_dims,self.exl3_device_ids)}else{run_exl3_moe(&launch,weights,&bufs,&self.moe_dims,self.exl3_device_ids)}"),
+        run.contains("ifletSome(merge)=&self.exl3_merge{run_exl3_moe_merged(&launch,(weights,&bufs,merge),&self.moe_dims,self.exl3_device_ids,bank.as_mut())}else{run_exl3_moe(&launch,weights,&bufs,&self.moe_dims,self.exl3_device_ids,bank.as_mut())}"),
         "{run}"
     );
     // The merge is built from the weights that exist, before the stream of the session.

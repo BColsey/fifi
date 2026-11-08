@@ -852,6 +852,12 @@ impl<'a> QwenResidentStep<'a> {
 
     /// The MoE block of `layer` for the `k` rows, over the K-row arena.
     fn moe_rows(&self, layer: usize, k: usize) -> Result<(), EngError> {
+        if self.exl3_bank.is_some() {
+            return Err(refuse(
+                "the K-row window reads its picks on the device; it cannot run on a banked EXL3 \
+                 engine",
+            ));
+        }
         let weights = self
             .exl3_moe
             .get(layer)

@@ -363,21 +363,34 @@ fn merged_on_host(
 
 /// The block of one layer with the shared expert in the routed launches: the same router, the
 /// same combine, the groups of [`block_plan`]. With `device_ids` the picks stay on the device and
-/// the block makes no host read; otherwise it waits for the stream once, to read the ids.
+/// the block makes no host read; otherwise it waits for the stream once, to read the ids. With
+/// `bank` the read picks map through the layer's slot table first (misses refilled from the host
+/// store), and the launches then read the slot members.
 pub(in crate::family) fn run_exl3_moe_merged(
     launch: &Launch<'_>,
     (weights, bufs, merge): (&Exl3MoeWeights<'_>, &Exl3MoeBufs<'_>, &SharedMerge),
     dims: &MoeDims,
     device_ids: bool,
+    bank: Option<&mut super::super::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<(), EngError> {
     check_dims(&plan_dims(dims)).map_err(refuse)?;
     let r = merge.ranges()?;
     let plan = block_plan(dims.top_k);
     route(launch, weights, bufs, dims)?;
     if device_ids {
+        if bank.is_some() {
+            return Err(refuse(
+                "the banked block reads the picks on the host; capture is refused while banked"
+                    .into(),
+            ));
+        }
         merged_on_device(launch, (weights, bufs, &r), &plan, dims)?;
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims)?;
+        let picks = match bank {
+            Some(bank) => bank.resolve(launch.ctx, &picks)?,
+            None => picks,
+        };
         merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), dims)?;
     }
     let (routed, shared) = r.layout.combine_spans(&plan_dims(dims));
