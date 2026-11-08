@@ -682,28 +682,24 @@ mod card_ops_tests {
                 "{append}: the prep carries the absolute rows"
             );
             assert_eq!((*k_rows, *v_rows), (Slot::KRows, Slot::VRows), "{append}");
-            // The gathers sit between the prep and the append, K before V.
-            assert_eq!(
-                (ops[5], ops[6]),
-                (CardOp::GatherK, CardOp::GatherV),
-                "{append}"
-            );
-            let append_op = at(7);
+            // The append follows the prep directly: with the cache sliced
+            // to the card's own K/V heads there is no gather between them.
+            let append_op = at(5);
             match (mode, append_op) {
                 (KvMode::Fp16, BlockOp::KvAppendF16 { k, v, .. })
                 | (KvMode::Int8G32, BlockOp::Kv8Append { k, v, .. }) => {
                     assert_eq!((*k, *v), (Slot::KRows, Slot::VRows), "{append}");
                 }
-                _ => panic!("{append}: op 7 must be the mode's append, met {append_op:?}"),
+                _ => panic!("{append}: op 5 must be the mode's append, met {append_op:?}"),
             }
-            // The append reads the full gathered rows before the decode.
+            // The append reads the card's K/V rows before the decode.
             assert_eq!(
                 append_op.reads(),
                 vec![Slot::KRows, Slot::VRows],
                 "{append}"
             );
             assert!(matches!(
-                at(8),
+                at(6),
                 BlockOp::AttnDecode { .. }
                     | BlockOp::AttnDecodeQ8 { .. }
                     | BlockOp::AttnDecodeQ8Card { .. }

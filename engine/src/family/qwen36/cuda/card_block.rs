@@ -8,10 +8,6 @@
 //!   production `Mixers::run_local_op` - the same launches the
 //!   single-device step uses, over the card's geometry, weight table and
 //!   arena views;
-//! * [`CardOp::GatherK`] / [`CardOp::GatherV`] run [`CardStack::
-//!   all_gather_row`]: each card publishes the slice of the row its
-//!   `kv_run` names, and every card's `KRows`/`VRows` slot ends with the
-//!   full gathered row;
 //! * [`CardOp::MixerSum`] runs [`CardStack::exchange_sum`] over the
 //!   full-width `MixOut` partials in place - each card's out projection
 //!   wrote its q-heads' contribution, and the summed row is the epilogue's
@@ -33,7 +29,6 @@ use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::{BlockIo, Mixers};
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
 use crate::family::qwen36::cuda::moe::{CardMoeOp, Launch, MoeBuffers, MoeLayerWeights, launch_op};
-use crate::family::qwen36::cuda::multi::fold_ring_status;
 use crate::family::qwen36::cuda::state::ResidentState;
 use crate::family::qwen36::cuda::step_plan::Slot;
 use crate::kernels::cuda::DeviceRange;
@@ -48,8 +43,6 @@ const F32: usize = size_of::<f32>();
 fn marker(op: &CardOp) -> &'static str {
     match op {
         CardOp::Local(_) => "Local",
-        CardOp::GatherK => "GatherK",
-        CardOp::GatherV => "GatherV",
         CardOp::MixerSum => "MixerSum",
     }
 }
@@ -122,31 +115,6 @@ pub(crate) fn run_card_block(
                         },
                         block,
                     )?;
-                }
-            }
-            CardOp::GatherK | CardOp::GatherV => {
-                let slot = match op {
-                    CardOp::GatherK => Slot::KRows,
-                    _ => Slot::VRows,
-                };
-                let total = kv_runs.iter().map(|run| run.len()).sum::<usize>();
-                let mut parts = Vec::with_capacity(cards);
-                let mut outs = Vec::with_capacity(cards);
-                let mut statuses = Vec::with_capacity(cards);
-                for (card, mixer) in mixers.iter().enumerate() {
-                    let row = mixer.slot_view(slot)?;
-                    parts.push(row.buffer().range(
-                        row.offset() + kv_runs[card].start * F32,
-                        kv_runs[card].len() * F32,
-                    )?);
-                    outs.push(row.buffer().range(row.offset(), total * F32)?);
-                    statuses.push(stack.shards()[card].ring_status()?);
-                }
-                stack.all_gather_row(&parts, &outs, &statuses, kv_runs, total)?;
-                if matches!(op, CardOp::GatherV) {
-                    // The gather gate of the v1 failure model: both halves
-                    // published before the append may touch the cache.
-                    gate_the_gathers(stack)?;
                 }
             }
             CardOp::MixerSum => {
@@ -291,28 +259,4 @@ pub(crate) fn run_card_moe_block(
             *cursor += 1;
         }
     }
-}
-
-/// Reads every card's ring status word and refuses - session-fatal, the
-/// rig's rule - when any gather timed out or overflowed. The refusal
-/// happens BEFORE the append queues, so a dead gather cannot write a
-/// stale row into the replicated cache.
-fn gate_the_gathers(stack: &CardStack) -> Result<(), EngError> {
-    let mut words = Vec::with_capacity(stack.shards().len());
-    for (card, shard) in stack.shards().iter().enumerate() {
-        stack.streams()[card].synchronize()?;
-        let mut bytes = [0u8; 4];
-        shard
-            .ring_word()
-            .read_at(&stack.streams()[card], 0, &mut bytes)?;
-        words.push(u32::from_le_bytes(bytes));
-    }
-    let folded = fold_ring_status(&words);
-    if folded != 0 {
-        return Err(EngError::BadRequest(format!(
-            "card block: the K/V gather failed on the ring (status {folded}); \
-             the session is dead and the cache was not appended"
-        )));
-    }
-    Ok(())
 }
