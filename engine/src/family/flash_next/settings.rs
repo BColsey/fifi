@@ -46,6 +46,11 @@ pub(crate) struct FlashOptions {
     /// CUDA only: routed-expert slots per layer in video memory, from 11 to 512. Default: what the
     /// load plan leaves at the context.
     pub(crate) slots: Option<u32>,
+    /// CUDA only: rows of one device step during prefill, from 1 to 8. The default, 1, is the
+    /// decode shape: one row per device call, exactly as before. A value above one runs the
+    /// prompt as device chunks of that many rows (one PLE host roundtrip per chunk), with decode
+    /// unchanged at one row.
+    pub(crate) prefill_rows: Option<u32>,
     /// CUDA only: the popularity profile file of the expert bank. A load reads it for a
     /// rank-ordered initial fill, and the bank rewrites it with its own usage counts on shutdown,
     /// so the next start of the same entry serves warm. A file that does not exist yet is a cold
@@ -80,6 +85,8 @@ pub(crate) struct CudaSettings {
     pub(crate) slots: Option<u32>,
     /// The popularity profile path of `flash_next.expert_stats`.
     pub(crate) expert_stats: Option<PathBuf>,
+    /// Rows of one device prefill step (1 = the decode shape). From `prefill_rows`.
+    pub(crate) prefill_rows: u32,
 }
 
 /// Default positions of the CUDA K/V caches.
@@ -168,6 +175,7 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
             ("kv_format", options.kv_format.is_some()),
             ("slots", options.slots.is_some()),
             ("expert_stats", options.expert_stats.is_some()),
+            ("prefill_rows", options.prefill_rows.is_some()),
         ];
         return match stray.iter().find(|(_, set)| *set) {
             Some((key, _)) => Err(bad(format!("{key} needs cuda_decode set to true"))),
@@ -209,10 +217,14 @@ fn cuda_settings(options: &FlashOptions) -> Result<Option<CudaSettings>, EngErro
     {
         return Err(bad("expert_stats must not be empty".into()));
     }
+    // The step's rows are capped by the merged expert launches; `MAX_STEP_ROWS` in
+    // `cuda/step_plan.rs` is the same 8.
+    let prefill_rows = ranged("prefill_rows", options.prefill_rows, 1, 1, 8)?;
     Ok(Some(CudaSettings {
         context,
         kv_format,
         slots,
+        prefill_rows,
         expert_stats: options.expert_stats.clone(),
     }))
 }
@@ -575,6 +587,7 @@ mod tests {
                 kv_format: KvFormatName::F16,
                 slots: None,
                 expert_stats: None,
+                prefill_rows: 1,
             })
         );
         // The manifest is still required: it pins the tokenizer.
@@ -603,6 +616,7 @@ mod tests {
                 kv_format: KvFormatName::F16,
                 slots: Some(48),
                 expert_stats: None,
+                prefill_rows: 1,
             })
         );
         assert_eq!(KvFormatName::Int8.format(), KvFormat::Int8);

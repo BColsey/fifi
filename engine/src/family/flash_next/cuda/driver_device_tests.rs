@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{
-    driver::{TokenDriver, TokenTimes},
-    start::build_driver,
+    driver::TokenTimes,
+    start::{StepDriver, build_driver},
 };
 use crate::{
     family::{
@@ -164,18 +164,104 @@ fn table(title: &str, samples: &[Sample]) {
     println!("  bank misses per token            {mean:>9.2} {p50:>9.1}  (total {total})");
 }
 
-fn sample(
-    driver: &TokenDriver<super::device::CardDevice, super::pack_feeds::PackFeeds>,
-    wall: Duration,
-    argmax: Duration,
-    before: u64,
-) -> Sample {
+fn sample(driver: &StepDriver, wall: Duration, argmax: Duration, before: u64) -> Sample {
     Sample {
         times: driver.last_times(),
         wall,
         argmax,
-        misses: driver.bank_misses().unwrap_or(0).saturating_sub(before),
+        misses: driver.bank_misses().saturating_sub(before),
     }
+}
+
+/// `prefill_rows: 4` builds the chunked driver: the prompt runs as device chunks of four rows
+/// through `feed_rows`, then decode continues one row at a time, and the greedy tokens still
+/// match the oracle run. This is the settings-to-driver wiring proof; the m-row kernel math is
+/// proven by `step_tests::a_chunk_of_rows_matches_the_same_rows_one_at_a_time`.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_chunked_prefill_driver_matches_the_oracle() {
+    assert!(
+        device_present("Flash-Next chunked driver"),
+        "this test needs a CUDA card"
+    );
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"]
+        .as_u64()
+        .expect("actual_vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(16, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "chat-short")
+        .expect("the chat-short prompt");
+    let ids = |key: &str| -> Vec<u32> {
+        record[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("no {key}"))
+            .iter()
+            .map(|v| v.as_u64().expect("an id") as u32)
+            .collect()
+    };
+    let prompt = ids("prompt_ids");
+    let expected = ids("generated");
+    let context: u32 = 512;
+    assert!(
+        prompt.len() + steps < context as usize,
+        "the context is too small"
+    );
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: 4,
+    };
+    let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+
+    // The prompt (its last token included) through the chunked feed: chunks of four rows.
+    let began = std::time::Instant::now();
+    driver.feed_rows(&prompt).expect("feed the prompt");
+    println!(
+        "chunked prompt: {} tokens in {:.2} s",
+        prompt.len(),
+        began.elapsed().as_secs_f64()
+    );
+
+    // Decode from the last prompt token, one row per call, against the oracle's greedy tokens.
+    let mut input = *prompt.last().expect("a prompt");
+    let mut generated = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let row = driver
+            .logits(input)
+            .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
+        let pick = argmax(&row[..actual_vocab]) as u32;
+        assert!(
+            row[..actual_vocab].iter().all(|v| v.is_finite()),
+            "step {step}: non-finite logits"
+        );
+        generated.push(pick);
+        input = pick;
+    }
+    println!("chunked generated {generated:?}");
+    println!(
+        "oracle           {:?}",
+        &expected[..steps.min(expected.len())]
+    );
+    let agree = generated
+        .iter()
+        .zip(&expected)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(
+        agree >= 8.min(steps),
+        "the chunked prefill driver agrees with the oracle on only {agree} of {steps}"
+    );
 }
 
 #[test]
@@ -223,6 +309,7 @@ fn the_first_real_tokens_match_the_oracle() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
+        prefill_rows: 1,
     };
     let began = std::time::Instant::now();
     let mut driver = build_driver(
@@ -239,7 +326,7 @@ fn the_first_real_tokens_match_the_oracle() {
     let fed = std::time::Instant::now();
     let mut prompt_samples = Vec::new();
     for &token in head {
-        let before = driver.bank_misses().unwrap_or(0);
+        let before = driver.bank_misses();
         let opened = std::time::Instant::now();
         driver.feed(token).expect("feed a prompt token");
         prompt_samples.push(sample(&driver, opened.elapsed(), Duration::ZERO, before));
@@ -255,7 +342,7 @@ fn the_first_real_tokens_match_the_oracle() {
     let mut first_row: Vec<f32> = Vec::new();
     let mut step_samples = Vec::new();
     for step in 0..steps {
-        let before = driver.bank_misses().unwrap_or(0);
+        let before = driver.bank_misses();
         let began = std::time::Instant::now();
         let row = driver
             .logits(input)
@@ -494,6 +581,7 @@ fn teacher_forced_steps_follow_the_oracle_on_every_prompt() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: None,
+        prefill_rows: 1,
     };
     let mut driver = build_driver(
         &|stage| println!("stage: {stage}"),
@@ -842,12 +930,10 @@ fn single_row_kernel_receipt_run() {
         kv_format: KvFormatName::F16,
         slots: var("FIFI_FLASH_NEXT_DRIVER_SLOTS").map(|v| v.parse().expect("slots")),
         expert_stats: stats,
+        prefill_rows: 1,
     };
     let mut driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
-    let kernel = driver
-        .device()
-        .single_row_kernel_name()
-        .expect("kernel name");
+    let kernel = driver.single_row_kernel_name().expect("kernel name");
     let env = |name: &str| std::env::var(name).ok();
     println!(
         "config {config} round {round}: single-row kernel {kernel}; SINGLE_GATHER {:?} DP4A {:?} INDEXED_PAIRS {:?}",
@@ -865,7 +951,7 @@ fn single_row_kernel_receipt_run() {
     // QSA k and v projections are one wide launch per QSA layer (12), the shared expert two per
     // layer (96); gather must stay flat: the shared expert rides the context default, not the
     // gather kernel.
-    let mut before = driver.device().kernel_launches();
+    let mut before = driver.kernel_launches();
     let mut step_wide: Vec<u64> = Vec::with_capacity(steps);
     for step in 0..steps {
         let began = std::time::Instant::now();
@@ -873,7 +959,7 @@ fn single_row_kernel_receipt_run() {
             .logits(input)
             .unwrap_or_else(|e| panic!("step {step}: {e:?}"));
         let wall = began.elapsed();
-        let after = driver.device().kernel_launches();
+        let after = driver.kernel_launches();
         let wide = after.wide1 - before.wide1;
         assert_eq!(
             after.gather, before.gather,

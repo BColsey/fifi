@@ -159,6 +159,23 @@ impl CardChunkDevice {
     }
 }
 
+impl CardChunkDevice {
+    #[cfg(test)]
+    pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        self.step.ctx.single_row_kernel_name()
+    }
+
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        self.step.ctx.exl3_launch_counts()
+    }
+
+    /// The bank's statistics line, as 's.
+    pub(super) fn bank_misses(&self) -> u64 {
+        self.moe.bank().stats().misses
+    }
+}
+
 impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<(), EngError> {
         self.m = usize::try_from(m).map_err(|_| {

@@ -68,7 +68,7 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
 /// The chunk driver: a [`ChunkDevice`] and its [`TokenFeeds`] under the token driver's rules.
 /// `feed_rows` splits the prompt into device chunks of at most `chunk_cap` rows (1 = the token
 /// loop, the decode shape).
-pub(super) struct ChunkDriver<D: ChunkDevice, F: TokenFeeds> {
+pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: TokenFeeds> {
     device: D,
     feeds: F,
     shape: DriverShape,
@@ -76,11 +76,15 @@ pub(super) struct ChunkDriver<D: ChunkDevice, F: TokenFeeds> {
     pos: usize,
     poisoned: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
-    pub(super) chunk_cap: usize,
+    pub(in crate::family::flash_next::cuda) chunk_cap: usize,
 }
 
 impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
-    pub(super) fn new(device: D, feeds: F, shape: DriverShape) -> Result<Self> {
+    pub(in crate::family::flash_next::cuda) fn new(
+        device: D,
+        feeds: F,
+        shape: DriverShape,
+    ) -> Result<Self> {
         if shape.layers <= shape.ple_layer {
             return Err(EngError::BadRequest(format!(
                 "Flash-Next chunk driver: the PLE layer {} must sit inside the {} layers",
@@ -97,7 +101,12 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         })
     }
 
-    pub(super) fn device(&self) -> &D {
+    /// The number of positions the caches hold, for the executor.
+    pub(super) fn positions(&self) -> usize {
+        self.shape.positions
+    }
+
+    pub(in crate::family::flash_next::cuda) fn device(&self) -> &D {
         &self.device
     }
 
@@ -140,10 +149,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             )));
         }
         // Host reads only: a failure here leaves the state as it was.
-        let starts: Vec<_> = tokens
-            .iter()
-            .map(|token| self.feeds.begin(*token))
-            .collect::<Result<_>>()?;
+        let starts = self.feeds.begin_chunk(tokens)?;
         let outcome = self.queue(tokens, &starts, want_logits);
         match outcome {
             Ok(logits) => {
@@ -217,6 +223,12 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         };
         self.device.check_health()?;
         Ok(logits)
+    }
+}
+
+impl<D: ChunkDevice, F: TokenFeeds> super::StepperPositions for ChunkDriver<D, F> {
+    fn positions(&self) -> usize {
+        self.positions()
     }
 }
 

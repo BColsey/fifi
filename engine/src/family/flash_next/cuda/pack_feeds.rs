@@ -22,13 +22,14 @@ struct Pending<T> {
     rows: T,
 }
 
-/// Takes the pending rows for `token`; refuses rows read for another token or none at all.
-fn take_pending<T>(pending: &mut Option<Pending<T>>, token: u32) -> Result<T, EngError> {
-    pending
-        .take()
-        .filter(|pending| pending.token == token)
-        .map(|pending| pending.rows)
-        .ok_or_else(|| EngError::BadRequest(format!("no n-gram rows were read for token {token}")))
+/// Takes the front pending rows, which must be `token`'s; a chunk consumes its rows in order.
+fn take_pending<T>(pending: &mut Vec<Pending<T>>, token: u32) -> Result<T, EngError> {
+    if pending.first().is_some_and(|front| front.token == token) {
+        return Ok(pending.remove(0).rows);
+    }
+    Err(EngError::BadRequest(format!(
+        "no n-gram rows were read for token {token}"
+    )))
 }
 
 pub(super) struct PackFeeds {
@@ -36,7 +37,7 @@ pub(super) struct PackFeeds {
     ple: PleFeed,
     hidden: usize,
     branches: usize,
-    pending: Option<Pending<Gathered>>,
+    pending: Vec<Pending<Gathered>>,
 }
 
 impl PackFeeds {
@@ -51,29 +52,42 @@ impl PackFeeds {
             ple,
             hidden,
             branches,
-            pending: None,
+            pending: Vec::new(),
         }
     }
 }
 
 impl TokenFeeds for PackFeeds {
     fn begin(&mut self, token: u32) -> Result<StartVectors, EngError> {
-        self.pending = None;
-        let stream = stream_row(self.source, token, self.hidden, self.branches)?;
-        let plan = self.ple.plan(token)?;
-        let rows = self.ple.gather(&plan)?;
-        let mut ple_embedding = Vec::new();
-        for &(_, local) in &plan.rows {
-            let values = rows.get(u64::from(local)).ok_or_else(|| {
-                EngError::BadRequest(format!("n-gram row {local} was not gathered"))
-            })?;
-            ple_embedding.extend_from_slice(values);
+        self.begin_chunk(&[token])
+            .map(|mut starts| starts.pop().expect("one start"))
+    }
+
+    /// Row `i` plans against the history it will have when its turn comes (the tokens before it
+    /// in the chunk), and every row set stays pending for the ordered update pass. All reads
+    /// are host-only, so a failure leaves the feed where it was.
+    fn begin_chunk(&mut self, tokens: &[u32]) -> Result<Vec<StartVectors>, EngError> {
+        let mut starts = Vec::with_capacity(tokens.len());
+        let mut pending = Vec::with_capacity(tokens.len());
+        for (i, &token) in tokens.iter().enumerate() {
+            let stream = stream_row(self.source, token, self.hidden, self.branches)?;
+            let plan = self.ple.plan_after(&tokens[..i], token)?;
+            let rows = self.ple.gather(&plan)?;
+            let mut ple_embedding = Vec::new();
+            for &(_, local) in &plan.rows {
+                let values = rows.get(u64::from(local)).ok_or_else(|| {
+                    EngError::BadRequest(format!("n-gram row {local} was not gathered"))
+                })?;
+                ple_embedding.extend_from_slice(values);
+            }
+            starts.push(StartVectors {
+                stream,
+                ple_embedding,
+            });
+            pending.push(Pending { token, rows });
         }
-        self.pending = Some(Pending { token, rows });
-        Ok(StartVectors {
-            stream,
-            ple_embedding,
-        })
+        self.pending = pending;
+        Ok(starts)
     }
 
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>, EngError> {
@@ -82,7 +96,7 @@ impl TokenFeeds for PackFeeds {
     }
 
     fn reset(&mut self) {
-        self.pending = None;
+        self.pending.clear();
         self.ple.reset();
     }
 }
@@ -94,10 +108,10 @@ mod tests {
 
     #[test]
     fn pending_rows_serve_their_own_token_once() {
-        let mut pending = Some(Pending {
+        let mut pending = vec![Pending {
             token: 7,
             rows: "rows",
-        });
+        }];
         assert_eq!(take_pending(&mut pending, 7).unwrap(), "rows");
         assert!(matches!(
             take_pending(&mut pending, 7),
@@ -106,16 +120,20 @@ mod tests {
     }
 
     #[test]
-    fn rows_read_for_another_token_are_refused_and_dropped() {
-        let mut pending = Some(Pending {
+    fn rows_read_for_another_token_are_refused_and_kept() {
+        let mut pending = vec![Pending {
             token: 7,
             rows: "rows",
-        });
+        }];
         assert!(matches!(
             take_pending(&mut pending, 8),
             Err(EngError::BadRequest(text)) if text.contains("token 8")
         ));
-        assert!(pending.is_none());
-        assert!(take_pending::<()>(&mut None, 1).is_err());
+        // The queue keeps its row: a mismatched take is a caller bug, not a reason to drop
+        // the row the real token still needs.
+        assert_eq!(pending.len(), 1);
+        assert_eq!(take_pending(&mut pending, 7).unwrap(), "rows");
+        let mut empty: Vec<Pending<()>> = Vec::new();
+        assert!(take_pending(&mut empty, 1).is_err());
     }
 }

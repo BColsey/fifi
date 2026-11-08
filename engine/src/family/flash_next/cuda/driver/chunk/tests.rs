@@ -90,8 +90,10 @@ fn an_empty_chunk_and_an_out_of_range_token_change_nothing() {
 
 #[test]
 fn a_failure_after_the_first_write_poisons_until_reset() {
-    let mut device = FakeChunkDevice::default();
-    device.fail = Some("layers");
+    let device = FakeChunkDevice {
+        fail: Some("layers"),
+        ..FakeChunkDevice::default()
+    };
     let mut driver = ChunkDriver::new(device, FakeFeeds::default(), shape()).unwrap();
     assert!(driver.run_chunk(&[3, 4], false).is_err());
     // The chunk did not land: the position stayed, and the poison refuses later chunks.
@@ -104,8 +106,10 @@ fn a_failure_after_the_first_write_poisons_until_reset() {
 
 #[test]
 fn a_failed_host_begin_leaves_the_state_unpoisoned() {
-    let mut feeds = FakeFeeds::default();
-    feeds.fail_begin = Some(4);
+    let feeds = FakeFeeds {
+        fail_begin: Some(4),
+        ..FakeFeeds::default()
+    };
     let mut driver = ChunkDriver::new(FakeChunkDevice::default(), feeds, shape()).unwrap();
     assert!(driver.run_chunk(&[3, 4], false).is_err());
     assert_eq!(driver.fed(), 0);
@@ -116,8 +120,10 @@ fn a_failed_host_begin_leaves_the_state_unpoisoned() {
 
 #[test]
 fn a_ple_update_of_the_wrong_width_is_refused_and_poisons() {
-    let mut feeds = FakeFeeds::default();
-    feeds.update_width = Some(STREAM + 1);
+    let feeds = FakeFeeds {
+        update_width: Some(STREAM + 1),
+        ..FakeFeeds::default()
+    };
     let mut driver = ChunkDriver::new(FakeChunkDevice::default(), feeds, shape()).unwrap();
     assert!(driver.run_chunk(&[3, 4], false).is_err());
     assert_eq!(driver.fed(), 0);

@@ -18,7 +18,7 @@ use crate::{
 
 const TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"post_processor":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7},"merges":[]}}"#;
 
-type Executor = FlashCudaExecutor<FakeDevice, FakeFeeds>;
+type Executor = FlashCudaExecutor<TokenDriver<FakeDevice, FakeFeeds>>;
 
 fn build(eos: &[u32]) -> (Executor, DecodeSession) {
     let driver = TokenDriver::new(FakeDevice::default(), FakeFeeds::default(), shape()).unwrap();
