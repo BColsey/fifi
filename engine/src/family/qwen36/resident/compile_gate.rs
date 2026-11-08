@@ -189,7 +189,11 @@ fn delta_seam_args<'a>(
     // rule as `compiled::delta_args` and `delta::step_projected`, on the shared helpers.
     // `dim(...).unwrap()` matches this non-Result builder's existing style.
     let taps = dim(d.conv_kernel - 1).unwrap();
-    let fused = super::delta::fused_middle_applicable(taps, dim(d.key_dim).unwrap(), dim(d.value_dim).unwrap());
+    let fused = super::delta::fused_middle_applicable(
+        taps,
+        dim(d.key_dim).unwrap(),
+        dim(d.value_dim).unwrap(),
+    );
     CompileDeltaArgs {
         x,
         rec,
