@@ -1843,6 +1843,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
         let mut args = delta_seam_args(
             &shape,
             delta_w,
+            first_delta_norm(&decoder.weights).unwrap(),
             &decoder.weights.consts,
             (&x, &rec, &ring),
             1e-6,
