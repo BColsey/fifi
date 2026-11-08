@@ -100,9 +100,11 @@ without a model field (monitor panels, `/v1/system`) report the primary
 engine by design. List the desired primary model first for new browser
 sessions; an existing browser keeps its saved model selection. A request with
 **Trace sampling alternatives** enabled also requires top-level
-`"sample_trace": true` on the selected engine. With this router, trace lookups
-without a model route to the primary, so use the primary for tracing until
-secondary trace routing is supported.
+`"sample_trace": true` on the selected engine, followed by an engine restart.
+With the model-aware router and GUI, a traced reply keeps its model association
+even if the picker changes. Older clients that do not identify the model send
+trace lookups to the primary; refresh the GUI after upgrading. Retained traces
+include generated token pieces and are accessible through a keyless LAN GUI.
 
 ## GPU test coordination
 
