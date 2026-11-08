@@ -2106,7 +2106,9 @@ fn mmq_prefill_ceiling_probe() {
     let bytes = weight_bytes(QuantType::Q4K, n, k, 0x5E55);
     let admission = crate::family::project::cuda::served_admission();
     for device in 0..2 {
-        let Ok(ctx) = CudaContext::with_admission_on(device, &admission) else { continue };
+        let Ok(ctx) = CudaContext::with_admission_on(device, &admission) else {
+            continue;
+        };
         let Ok(stream) = ctx.stream() else { continue };
         let Ok(weight) = upload_weight(&ctx, QuantType::Q4K, (n, k), &bytes) else {
             continue;
