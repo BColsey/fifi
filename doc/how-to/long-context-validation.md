@@ -48,6 +48,36 @@ A 262,144-token input plus a reply requires a context limit greater than
 262,144. The driver checks both the requested and actual prompt lengths against
 the reported limit before sending the generation request.
 
+## Check a two-turn coding session
+
+The coding-session driver fills the first prompt with synthetic Python source,
+asks for a small code edit, and then asks for a revision in the same chat. It
+compares the returned statements as Python syntax trees and never executes the
+model's code. It counts both rendered prompts and verifies the first was cold.
+By default, the second turn must report at least one reused token; set a higher
+`--min-reused-tokens` threshold to require substantial reuse, or `0` to observe
+an engine with reuse disabled.
+
+```sh
+python3 scripts/bench_coding_session.py \
+  --url http://127.0.0.1:18792 \
+  --model fifi-q36 \
+  --prompt-tokens 131072 \
+  --max-tokens 128 \
+  --min-reused-tokens 100000 \
+  --output "$TMPDIR/coding-session-128k.json"
+```
+
+For a 262,144-token total context, use a first-prompt target such as `257000`
+to leave space for both turns. The driver reserves two replies before starting
+and checks the exact follow-up count before sending it. Its result contains
+each turn's count, reuse, answer, edit verdict, and matched server timings.
+The estimated uncached-token rates exclude reported reused tokens. The client
+rate includes tokenization, queueing and response overhead; the server rate
+uses the engine-start-to-first-batch interval when it is available.
+The generated project and edits are synthetic: passing checks a narrow coding
+interaction and does not establish general coding quality.
+
 ## Read the result
 
 The JSON result records the counted prompt and completion tokens, prefix reuse,
