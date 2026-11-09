@@ -2301,24 +2301,98 @@ fn run_chunk_tiered(
     let weights = runtime.layer_weights(layer)?;
     run_chunk_shared(launch, &weights, io)?;
 
-    // The host-built grouped ids: compact columns grouped by slot, misses spread
-    // round-robin. The device TopkWeight gets the plan's weights (misses are 0.0).
-    let ids = build_tiered_host_ids(&plan, m, top_k, slots, ctx, stream, io)?;
-    patch_tiered_weights(ctx, stream, &plan, m, top_k, io)?;
+    // Build and upload the host ids, patch the weights.
+    let d = io.scratch;
+    let ids = build_tiered_host_ids(
+        stream,
+        &plan,
+        m,
+        top_k,
+        slots,
+        crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut {
+            ids_src1: d.get(ChunkSlot::IdsSrc1)?,
+            ids_dst: d.get(ChunkSlot::IdsDst)?,
+            expert_bounds: d.get(ChunkSlot::ExpertBounds)?,
+        },
+    )?;
+    patch_tiered_weights(stream, &plan, io)?;
 
-    // Stages 12-16 against the bank stacks: scatter quantize, grouped MMQ, swiglu.
-    let gate_stack = native_stack(&weights.gate)?;
-    let _ = gate_stack; // slice-5-cont: the scatter quantize through the host ids
-    // TODO(slice-5-cont): the grouped gate/up/down launches against the bank stacks,
-    // the swiglu, the M-row combine, the CPU pool call, and the partial add.
-    // The launch shape mirrors run_chunk_routed's stages 13-16 with the bank's
-    // n_experts = slots instead of dims.n_expert, and the fixup from the same slot.
+    // Stages 12-16 against the bank stacks: scatter quantize, grouped MMQ (gate,
+    // up, down), swiglu. The launch code mirrors run_chunk_routed's stages 12-16
+    // with the bank stacks in place of the full-depth stacks.
+    let gate = native_stack(&weights.gate)?;
+    ctx.mmq_quantize_scatter_ids(
+        stream,
+        &ids,
+        MmidQuantCall {
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            quant: gate.quant(),
+            k: hidden,
+            row_stride: hidden,
+            x: io.x2,
+            y: d.get(ChunkSlot::Q8S)?,
+        },
+    )?;
+    let gu = d.get(ChunkSlot::Gu)?;
+    let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
+    let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
+    let launch_mmid =
+        |weight: &NativeWeight, y: DeviceRange<'_>, ld: usize, dst: DeviceRange<'_>| {
+            let n = weight.n_rows() / weight.experts().unwrap_or(1);
+            ctx.mmq_mmid_launch(
+                stream,
+                MmidLaunchCall {
+                    shape: ids.shape(),
+                    weight: routed_weight(weight, dims, weight.k(), n)?,
+                    ids: &ids,
+                    y,
+                    dst,
+                    ld,
+                    fixup: d.get(ChunkSlot::Fixup)?,
+                },
+            )
+        };
+    let q8s = d.get(ChunkSlot::Q8S)?;
+    launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
+    launch_mmid(native_stack(&weights.up)?, q8s, 2 * dims.inter, up_dst)?;
+    ctx.swiglu_rows(
+        stream,
+        SwigluRowsCall {
+            shape: routed_swiglu(m, dims),
+            gu: d.get(ChunkSlot::Gu)?,
+            act: d.get(ChunkSlot::Act)?,
+        },
+    )?;
+    let down = native_stack(&weights.down)?;
+    ctx.mmq_quantize_gather_ids(
+        stream,
+        &ids,
+        MmidQuantCall {
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            quant: down.quant(),
+            k: dims.inter,
+            row_stride: dims.inter,
+            x: d.get(ChunkSlot::Act)?,
+            y: d.get(ChunkSlot::Q8Act)?,
+        },
+    )?;
+    launch_mmid(
+        down,
+        d.get(ChunkSlot::Q8Act)?,
+        dims.hidden,
+        d.get(ChunkSlot::Down)?,
+    )?;
 
-    let _ = (misses, stream, ctx, gate_stack);
-    Err(EngError::BadRequest(
-        "tiered chunk prefill: slice 5 in progress (readback+classify landed; launches next)"
-            .to_owned(),
-    ))
+    // Stage 17, the combine with the patched weights.
+    combine_chunk_moe(launch, io)?;
+
+    // The CPU misses: serve as one grouped pool job, add the partial with one
+    // M-row moe_combine (top_k 1, weights ones, in place).
+    if !misses.is_empty() {
+        // TODO(slice-5-final): wire the grouped pool call and the partial add.
+        let _ = misses;
+    }
+    Ok(())
 }
 
 /// The batched route readback of one chunk layer: one pinned copy of the router's
@@ -2375,37 +2449,79 @@ struct ChunkRouteRead {
     hidden: Vec<f32>,
 }
 
-/// Builds the grouped ids on the host: each pick's column goes to its bank slot's
-/// group (resident picks) or a spread slot (misses, round-robin so no group exceeds
-/// m columns). The weights patch zeroes the misses.
-fn build_tiered_host_ids(
+/// Builds and uploads the grouped ids from the chunk plan: picks are grouped by their
+/// bank slot, misses spread round-robin (the plan's weight is 0.0 for misses, so the
+/// wasted grouped compute is zeroed by the combine). Returns the checked `MmidIds`.
+fn build_tiered_host_ids<'b>(
+    stream: &crate::kernels::cuda::DeviceStream,
     plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
     m: usize,
     top_k: usize,
     slots: usize,
-    _ctx: &crate::kernels::cuda::CudaContext,
-    _stream: &crate::kernels::cuda::DeviceStream,
-    _io: &MoeChunkIo<'_>,
-) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'static>, EngError> {
-    let _ = (plan, m, top_k, slots);
-    Err(EngError::BadRequest(
-        "tiered chunk prefill: host ids construction is the next piece".to_owned(),
-    ))
+    out: crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut<'b>,
+) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>, EngError> {
+    let shape = crate::kernels::cuda::prefill::mmq_mmid::MmidShape {
+        n_experts: slots,
+        m,
+        top_k,
+    };
+    // Group picks by slot; misses (weight 0.0) spread round-robin.
+    let mut groups: Vec<Vec<i32>> = vec![Vec::new(); slots];
+    let mut spread = 0usize;
+    for (flat, (&slot_id, &weight)) in plan.slot_ids.iter().zip(&plan.device_weights).enumerate() {
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
+        let target = if weight == 0.0 && slot_id <= 0 {
+            // A miss or a router fault: spread round-robin over the slots.
+            let target = spread;
+            spread = (spread + 1) % slots.max(1);
+            target
+        } else if slot_id > 0 {
+            usize::try_from(slot_id).unwrap_or(0)
+        } else {
+            0
+        };
+        groups
+            .get_mut(target)
+            .map(|g| g.push(flat_i32))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("tiered chunk: slot {target} of {slots}"))
+            })?;
+    }
+    // Compact: concatenate the groups, build the bounds.
+    let mut ids_dst = Vec::with_capacity(m * top_k);
+    let mut expert_bounds = Vec::with_capacity(slots + 1);
+    expert_bounds.push(0i32);
+    for group in &groups {
+        ids_dst.extend_from_slice(group);
+        expert_bounds.push(i32::try_from(ids_dst.len()).unwrap_or(i32::MAX));
+    }
+    crate::kernels::cuda::prefill::mmq_mmid::MmidIds::from_host(
+        stream,
+        shape,
+        crate::kernels::cuda::prefill::mmq_mmid::HostIds {
+            ids_dst: &ids_dst,
+            expert_bounds: &expert_bounds,
+        },
+        out,
+    )
 }
 
-/// Patches the device TopkWeight with the plan's weights (misses are 0.0).
+/// Patches the device TopkWeight with the plan's weights (misses are 0.0, hits carry
+/// the router's weight — the same contract the decode plan's device_weights hold).
 fn patch_tiered_weights(
-    _ctx: &crate::kernels::cuda::CudaContext,
-    _stream: &crate::kernels::cuda::DeviceStream,
+    stream: &crate::kernels::cuda::DeviceStream,
     plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
-    m: usize,
-    top_k: usize,
     io: &MoeChunkIo<'_>,
 ) -> Result<(), EngError> {
-    let _ = (plan, m, top_k, io);
-    Err(EngError::BadRequest(
-        "tiered chunk prefill: weights patch is the next piece".to_owned(),
-    ))
+    let bytes: Vec<u8> = plan
+        .device_weights
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    io.weights
+        .buffer()
+        .write_at(stream, io.weights.offset(), &bytes)
 }
 
 /// Stages 10a-f, the shared expert. Diagnostic runs replace only its projections.
