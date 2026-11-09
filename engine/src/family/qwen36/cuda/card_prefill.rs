@@ -46,14 +46,14 @@ use super::{
 use crate::{
     EngError,
     family::qwen36::host::MoeDims as HostMoeDims,
+    kernels::cuda::NativeWeight,
     kernels::cuda::peer_ring::{MAX_VALUES, RingMode},
-    kernels::cuda::{DeviceStream, NativeWeight},
 };
 
 /// The largest chunk rows the driver accepts for this shape: every layer
 /// sum is one ring sequence, and the transport caps a payload at
 /// [`MAX_VALUES`] values.
-pub(super) fn max_chunk_rows(hidden: usize) -> usize {
+pub(crate) fn max_chunk_rows(hidden: usize) -> usize {
     (MAX_VALUES / hidden).max(1)
 }
 
@@ -66,7 +66,7 @@ struct CardChunkCard {
 }
 
 /// The session's chunk resources, built once at start.
-pub(super) struct CardChunk {
+pub(crate) struct CardChunk {
     cards: Vec<CardChunkCard>,
     m_sess: usize,
     hidden: usize,
@@ -76,18 +76,19 @@ pub(super) struct CardChunk {
 /// count (the caller checked `m_chunk <= max_chunk_rows(hidden)`; v1 uses
 /// one fixed size, not the ladder).
 /// The session's 'static weight views the chunk models borrow.
-pub(super) struct CardChunkWeights<'s> {
-    pub(super) mixers: &'s [super::mixer::Mixers<'static>],
-    pub(super) moe_per_layer: &'s [Vec<MoeLayerWeights<'static>>],
-    pub(super) embed: &'s NativeWeight,
+pub(crate) struct CardChunkInputs {
+    /// The per-card loaded weights, leaked at start (`&'static [&'static CudaWeights]`).
+    pub(crate) weights: &'static [&'static crate::family::project::cuda::CudaWeights],
+    /// The embedding tensor's name in card 0's weights.
+    pub(crate) embed_name: &'static str,
 }
 
 pub(super) fn build_card_chunk(
-    stack: &CardStack,
-    streams: &[DeviceStream],
+    stack: &'static CardStack,
     dims: &StepDims,
     table: &LayerTable,
-    weights: CardChunkWeights<'static>,
+    inputs: CardChunkInputs,
+    options: &super::dims::StepOptions,
     m_chunk: usize,
 ) -> Result<CardChunk, EngError> {
     let cards = stack.shards().len();
@@ -98,11 +99,6 @@ pub(super) fn build_card_chunk(
             max_chunk_rows(hidden)
         )));
     }
-    let CardChunkWeights {
-        mixers,
-        moe_per_layer,
-        embed,
-    } = weights;
     let mut out = Vec::with_capacity(cards);
     for card in 0..cards {
         let context = &stack.contexts()[card];
@@ -118,18 +114,48 @@ pub(super) fn build_card_chunk(
         // over the card's list (zero-filled, part buffer, kv8 staging).
         let arena = PrefillArena::allocate_list(
             &stack.contexts()[card],
-            &streams[card],
+            &stack.streams()[card],
             list,
             (m_chunk, facts, m_chunk * hidden * 4),
         )?;
+        // The card's own views, resolved exactly as the session resolves
+        // them, then leaked for the chunk models' process lifetime.
+        let weights_card_of = inputs.weights[card];
+        let wanted: Vec<usize> = (0..table.len()).collect();
+        let weights_card = super::mixer_weights::MixerWeights::new(
+            &geometry,
+            table,
+            weights_card_of,
+            &wanted,
+            options.layout,
+        )?;
+        let moe_specs = super::resources::MoeSpecs::for_card(dims, stack.table(), card)?;
         let moe_card: &'static [MoeLayerWeights<'static>] = Box::leak(
-            moe_per_layer
-                .iter()
-                .map(|set| set[card])
-                .collect::<Vec<_>>()
+            (0..table.len())
+                .map(|layer| {
+                    super::resources::moe_layer_weights(
+                        table,
+                        weights_card_of,
+                        &moe_specs,
+                        layer,
+                        options.layout,
+                    )
+                })
+                .collect::<Result<Vec<_>, EngError>>()?
                 .into_boxed_slice(),
         );
-        let weights = ChunkWeights::new(mixers[card].weights(), moe_card, embed);
+        // Card 0 holds the embedding table; the other cards' models
+        // reference it through card 0's leaked weights.
+        let Some(crate::family::project::cuda::CudaWeight::Native { weight, .. }) =
+            inputs.weights[0].get(inputs.embed_name)
+        else {
+            return Err(EngError::Checkpoint(format!(
+                "card chunk: {} is not a native tensor",
+                inputs.embed_name
+            )));
+        };
+        let embed: &'static NativeWeight = weight;
+        let weights = ChunkWeights::new(Box::leak(Box::new(weights_card)), moe_card, embed);
         let model = ChunkModel::card(
             Box::leak(Box::new(table.clone())),
             Box::leak(Box::new(geometry)),
@@ -155,7 +181,7 @@ pub(super) fn build_card_chunk(
 /// both cards. Enqueue-only: the caller syncs the streams and folds the
 /// status words after this returns; a refusal before the first launch
 /// leaves the states untouched.
-pub(super) fn run_card_chunk(
+pub(crate) fn run_card_chunk(
     stack: &CardStack,
     states: &mut [ResidentState],
     chunk: &CardChunk,

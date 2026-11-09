@@ -1060,8 +1060,42 @@ fn make_multi(
             }
         },
     )?;
+    // Experimental and default off: chunked prefill through both cards
+    // (card_prefill.rs). Q36_P2P_CHUNK=<rows> sets the chunk size, capped
+    // at MAX_VALUES/hidden; the views are freshly resolved from the same
+    // leaked weights the session holds, so the chunk models live beside
+    // the session in the enum. A refusal logs and leaves the per-token
+    // path in place.
+    let chunk = match std::env::var_os("Q36_P2P_CHUNK") {
+        Some(value) => {
+            let rows: usize = value
+                .to_str()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(256);
+            let rows = rows.min(super::card_prefill::max_chunk_rows(dims.shape.hidden));
+            let embed_name: &'static str = Box::leak(
+                crate::family::qwen36::cuda::resources::GlobalNames::new(&inventory)?
+                    .embed
+                    .into_boxed_str(),
+            );
+            super::card_prefill::build_card_chunk(
+                stack,
+                &dims,
+                layers,
+                super::card_prefill::CardChunkInputs {
+                    weights,
+                    embed_name,
+                },
+                &options,
+                rows,
+            )
+            .inspect_err(|error| eprintln!("q36 cuda: chunked prefill refused: {error:?}"))
+            .ok()
+        }
+        None => None,
+    };
     Ok((
-        Q36CudaStep::Cards(Box::new(session)),
+        Q36CudaStep::Cards(Box::new(session), chunk),
         DecodeSession::default(),
     ))
 }
