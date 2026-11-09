@@ -1446,19 +1446,30 @@ mod tests {
         let q = upload(&mut kernels, vec![1, h, rows, d], &qd);
         let scale = 1.0 / (d as f32).sqrt();
 
+        // MLX caches lazy graphs by inputs: identical iterations are free. Each timed
+        // iteration uploads a fresh distinct q so the attention really runs each time.
+        let variants: Vec<ExecutionTensor> = (0..6)
+            .map(|n| {
+                let data: Vec<f32> = (0..h * rows * d)
+                    .map(|i| (((i * 29 + n * 7) % 389) as f32 - 194.0) / 300.0)
+                    .collect();
+                upload(&mut kernels, vec![1, h, rows, d], &data)
+            })
+            .collect();
+
         // The duplicate pad: per kv group g, [q[g*6..g*6+6], q[g*6..g*6+2]] -> 32 heads.
-        let build_pad = |kernels: &mut MlxKernels| {
+        let build_pad = |kernels: &mut MlxKernels, q: &ExecutionTensor| {
             let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(8);
             for g in 0..kvh {
                 let base = g * 6;
                 parts.push(
                     kernels
-                        .slice(&q, &[0, base, 0, 0], &[1, base + 6, rows, d])
+                        .slice(q, &[0, base, 0, 0], &[1, base + 6, rows, d])
                         .unwrap(),
                 );
                 parts.push(
                     kernels
-                        .slice(&q, &[0, base, 0, 0], &[1, base + 2, rows, d])
+                        .slice(q, &[0, base, 0, 0], &[1, base + 2, rows, d])
                         .unwrap(),
                 );
             }
@@ -1480,12 +1491,13 @@ mod tests {
             let mut whole = None;
             for i in 0..5 {
                 let start = std::time::Instant::now();
+                let q_i = &variants[i + 1];
                 let mut blocks: Vec<ExecutionTensor> = Vec::new();
                 let mut start_row = 0u32;
                 while start_row < rows {
                     let end = (start_row + block).min(rows);
                     let q_block = kernels
-                        .slice(&q, &[0, 0, start_row, 0], &[1, h, end, d])
+                        .slice(q_i, &[0, 0, start_row, 0], &[1, h, end, d])
                         .unwrap();
                     blocks.push(
                         kernels
@@ -1515,7 +1527,7 @@ mod tests {
             let mut sliced = None;
             for i in 0..5 {
                 let start = std::time::Instant::now();
-                let pad_q = build_pad(&mut kernels);
+                let pad_q = build_pad(&mut kernels, &variants[i + 1]);
                 let out = kernels
                     .q8_flash_prefill(&pad_q, &keys, &values_q, cap, scale, group, bits, None, 0)
                     .unwrap();
@@ -1537,13 +1549,14 @@ mod tests {
             "dense REP6 rows={rows} depth={cap}: composite {composite_ms:.3}ms (first {cf:.3}), flash+pad {flash_ms:.3}ms (first {ff:.3})"
         );
 
-        // Numerics: the F32 reference in the same blocks, over the real 24 heads.
+        // Numerics: the F32 reference in the same blocks, over the real 24 heads, on the
+        // same query variant the timed arms' final outputs hold (variants[5]).
         let mut reference: Vec<f32> = Vec::new();
         let mut start = 0u32;
         while start < rows {
             let end = (start + block).min(rows);
             let q_block = kernels
-                .slice(&q, &[0, 0, start, 0], &[1, h, end, d])
+                .slice(&variants[5], &[0, 0, start, 0], &[1, h, end, d])
                 .unwrap();
             let out = kernels
                 .grouped_attention_prefix(&q_block, &k, &v, end, scale, end - start > 1)
