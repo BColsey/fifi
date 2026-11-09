@@ -17,7 +17,9 @@
 //! activation dtype at the o-projection.
 
 use super::super::attn::{AttnStep, KvBuffers, KvCache, append};
-use super::super::kv_plan::{flash_prefill_enabled, query_block_ranges, query_slice_rows};
+use super::super::kv_plan::{
+    flash_dense_pad_enabled, flash_prefill_enabled, query_block_ranges, query_slice_rows,
+};
 use super::super::ops::{Ctx, cast_to, dim, to_act};
 use super::super::weights::RAttn;
 use crate::{
@@ -179,7 +181,7 @@ pub(super) fn chunk_sliced(
             let rep = heads / kv_heads;
             if flash_prefill_enabled()
                 && width >= 128
-                && matches!(rep, 6 | 8)
+                && (rep == 8 || (rep == 6 && flash_dense_pad_enabled()))
                 && crate::kernels::mlx::q8_flash_envelope(width, Q8_GROUP)
             {
                 let (flash_q, padded_heads) = if rep == 8 {

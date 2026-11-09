@@ -60,6 +60,15 @@ pub(super) fn flash_prefill_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var_os("Q36_FLASH_PREFILL").is_some_and(|v| v == "0"))
 }
 
+/// Whether the REP 6 dense pad path runs: the padded flash prefill is NEW for the dense
+/// 24q/4kv shape, so it ships DEFAULT OFF - `Q36_FLASH_PREFILL=1` opts in (the same
+/// variable: `0` is the kill switch for the validated REP 8 path, `1` the opt-in for the
+/// pad). Flipping the default needs the dense serving A/B evidence.
+pub(super) fn flash_dense_pad_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("Q36_FLASH_PREFILL").as_deref() == Ok("1"))
+}
+
 /// Whether the flash kernel runs for this model shape AND the score-budget split is moot:
 /// the flash kernel streams the softmax online and never materializes the score matrix, so
 /// a caller planning chunks passes an unbounded budget instead of `SCORE_BUDGET_BYTES`
@@ -77,7 +86,7 @@ pub(super) fn flash_prefill_split(
     let rep = heads_q / heads_kv.max(1);
     flash_prefill_enabled()
         && head_dim >= 128
-        && matches!(rep, 6 | 8)
+        && (rep == 8 || (rep == 6 && flash_dense_pad_enabled()))
         && kv == crate::family::qwen36::settings::KvDtype::Q8
 }
 
