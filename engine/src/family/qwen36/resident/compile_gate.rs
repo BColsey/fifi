@@ -870,14 +870,14 @@ fn dropping_the_adapter_clears_the_compile_cache() {
     reset_compile_state();
 }
 
-/// The program limit of one adapter context: five seam calls with five distinct epsilon constants
-/// register five programs of THIS adapter, and a call whose key is a SIXTH distinct one is refused
-/// with `BadRequest` BEFORE any native call, so the counters do not move. The portable registry
-/// logic carries its own Linux test; this one runs the refusal through the real seam. Mutation
-/// check (the registry-limit patch): with the limit raised to 6, the sixth call succeeds and the
-/// `unwrap_err` fails.
+/// The program limit of one adapter context: eight seam calls with eight distinct epsilon
+/// constants register eight programs of THIS adapter, and a call whose key is a NINTH distinct
+/// one is refused with `BadRequest` BEFORE any native call, so the counters do not move. The
+/// portable registry logic carries its own Linux test; this one runs the refusal through the
+/// real seam. Mutation check (the registry-limit patch): with the limit raised to 9, the
+/// ninth call succeeds and the `unwrap_err` fails.
 #[test]
-fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
+fn the_ninth_distinct_compiled_program_is_refused_before_any_native_call() {
     let _serial = crate::native_test_lock();
     reset_compile_state();
     let (ckpt, host) = tiny_host();
@@ -893,7 +893,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
     let w = first_delta(&decoder.weights).unwrap();
     let (x, rec, ring) = zero_delta_inputs(&mut decoder.kernels, &shape, Dtype::F32).unwrap();
     let inputs = (&x, &rec, &ring);
-    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6] {
+    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6, 6e-6, 7e-6, 8e-6] {
         let args = delta_seam_args(
             &shape,
             w,
@@ -907,8 +907,8 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
     }
     let warmed = compile_stats::read();
     assert_eq!(
-        warmed.delta.traces, 5,
-        "five distinct epsilons traced five programs (the native body count)"
+        warmed.delta.traces, 8,
+        "eight distinct epsilons traced eight programs (the native body count)"
     );
     let refused = decoder.kernels.compiled_delta_step(&delta_seam_args(
         &shape,
@@ -916,7 +916,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
         first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         inputs,
-        6e-6,
+        9e-6,
         Dtype::F32,
     ));
     let message = match refused {
@@ -925,7 +925,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
         Ok(_) => panic!("expected BadRequest, got a successful step"),
     };
     assert!(
-        message.contains("at most 5 compiled programs per adapter"),
+        message.contains("at most 8 compiled programs per adapter"),
         "the refusal names the limit: {message}"
     );
     let stats = compile_stats::read();
@@ -934,7 +934,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
         "the refused call reached no native call"
     );
     assert_eq!(
-        stats.delta.traces, 5,
+        stats.delta.traces, 8,
         "the refused call traced nothing (the native body count stayed)"
     );
     reset_compile_state();
