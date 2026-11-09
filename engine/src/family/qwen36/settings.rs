@@ -3452,10 +3452,10 @@ mod tests {
     fn the_pin_holds_the_digest_of_each_tokenizer_file() {
         let pin = tokenizer_pin().unwrap();
         assert_eq!(pin.vocab_size, 248_077);
-        assert_eq!(pin.tokenizer_json[..4], [0x87, 0xa7, 0x83, 0x0d]);
-        assert_eq!(pin.tokenizer_json[28..], [0x3d, 0xb7, 0x2d, 0xe4]);
-        assert_eq!(pin.tokenizer_config_json[..4], [0xe9, 0x8f, 0x19, 0x01]);
-        assert_eq!(pin.chat_template_jinja[..4], [0xe8, 0x4f, 0x32, 0xa2]);
+        assert_eq!(pin.tokenizer_json[..4], [0x09, 0x97, 0xf4, 0x10]);
+        assert_eq!(pin.tokenizer_json[28..], [0x22, 0x9b, 0x9f, 0x03]);
+        assert_eq!(pin.tokenizer_config_json[..4], [0xb1, 0x13, 0x49, 0xaa]);
+        assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
     }
 
