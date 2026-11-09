@@ -418,7 +418,7 @@ type Row = (ChunkSlot, usize, Phase, Phase);
 
 /// The tensors that live across blocks: the residual stream, the norm rows and their `xf`
 /// sinks (written, never read in prefill), the first quantize and the stream-k fixup range.
-fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngError> {
+fn common_rows(g: &MixerGeometry, m: usize, nsm: usize, card: bool) -> Result<Vec<Row>, EngError> {
     use {ChunkSlot as S, Phase::*};
     let hidden = row_bytes(m, g.hidden).ok_or_else(overflow)?;
     // `xf_bytes` is not monotone in m: a chunk of at most 16 rows packs the whole fixed fragment
@@ -435,7 +435,10 @@ fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngE
         (S::X, hidden, NormA, QuantA),
         (S::XfA, xf, NormA, NormA),
         (S::Q8X, q8_1_bytes(g.hidden, m)?, QuantA, AProj),
-        (S::Delta, hidden, DOut, NormF),
+        // A non-primary card reuses Delta for the output of the MoE combine;
+        // its routed and shared inputs must remain disjoint from that output.
+        // The single-device path combines into Hidden and keeps its shorter lifetime.
+        (S::Delta, hidden, DOut, if card { Combine } else { NormF }),
         (S::X2, hidden, NormF, Scatter),
         (S::XfF, xf, NormF, NormF),
         (
@@ -827,7 +830,7 @@ fn chunk_tensors_inner(
         )));
     }
     let mut rows: Vec<Row> = [
-        common_rows(g, m, nsm)?,
+        common_rows(g, m, nsm, card)?,
         mixer_rows(g, m)?,
         moe_rows_with(dims, moe, m)?,
     ]
@@ -954,6 +957,13 @@ mod card_tests {
         .expect("shape");
         let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
         let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        let single = chunk_tensors(&dims, 512, 28).expect("single-device plan");
+        let single_delta = single
+            .iter()
+            .find(|(slot, _)| *slot == ChunkSlot::Delta)
+            .expect("single-device Delta")
+            .1;
+        assert_eq!(single_delta.last, Phase::NormF as usize);
         for card in 0..2 {
             let geometry =
                 super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
