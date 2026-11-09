@@ -224,7 +224,10 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
             let mut queue = lock(&shared.queue);
             loop {
                 if let Some(item) = queue.jobs.pop_front() {
-                    break Some(item);
+                    break Some(WorkItem::PerToken(item));
+                }
+                if let Some(item) = queue.chunk_jobs.pop_front() {
+                    break Some(WorkItem::Chunk(item));
                 }
                 if queue.shutdown {
                     break None;
@@ -239,29 +242,76 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
         if let Some(gate) = &shared.gate {
             wait_gate(gate);
         }
-        let job = item.1;
-        let bytes = job.region.bytes();
-        let slices = ExpertSlices {
-            gate: &bytes[job.gate],
-            up: &bytes[job.up],
-            down: &bytes[job.down],
-        };
-        let mut out = vec![0.0f32; shape.hidden];
-        match catch_unwind(AssertUnwindSafe(|| {
-            worker.compute(shape, &slices, &item.2, &mut out)
-        })) {
-            Ok(Ok(())) => {
-                let _ = item.3.send(JobOutcome::Done(item.0, out));
+        match item {
+            WorkItem::PerToken(item) => {
+                let job = item.1;
+                let bytes = job.region.bytes();
+                let slices = ExpertSlices {
+                    gate: &bytes[job.gate],
+                    up: &bytes[job.up],
+                    down: &bytes[job.down],
+                };
+                let mut out = vec![0.0f32; shape.hidden];
+                match catch_unwind(AssertUnwindSafe(|| {
+                    worker.compute(shape, &slices, &item.2, &mut out)
+                })) {
+                    Ok(Ok(())) => {
+                        let _ = item.3.send(JobOutcome::Done(item.0, out));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = item.3.send(JobOutcome::Failed(item.0, error));
+                    }
+                    Err(_panic) => {
+                        let _ = item.3.send(JobOutcome::Lost);
+                        return;
+                    }
+                }
             }
-            Ok(Err(error)) => {
-                let _ = item.3.send(JobOutcome::Failed(item.0, error));
-            }
-            Err(_panic) => {
-                let _ = item.3.send(JobOutcome::Lost);
-                return;
+            WorkItem::Chunk(item) => {
+                let (at, job, block, _m, sender) = (item.0, item.1, item.2, item.3, item.4);
+                let bytes = job.region.bytes();
+                let slices = ExpertSlices {
+                    gate: &bytes[job.gate],
+                    up: &bytes[job.up],
+                    down: &bytes[job.down],
+                };
+                let mut outs = Vec::with_capacity(job.rows.len());
+                let mut failure: Option<ExpertCpuError> = None;
+                for &row in job.rows.iter() {
+                    let input = &block[row * shape.hidden..(row + 1) * shape.hidden];
+                    let mut out = vec![0.0f32; shape.hidden];
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        worker.compute(shape, &slices, input, &mut out)
+                    })) {
+                        Ok(Ok(())) => outs.push((row, out)),
+                        Ok(Err(error)) => {
+                            failure = Some(error);
+                            break;
+                        }
+                        Err(_panic) => {
+                            let _ = sender.send(ChunkJobOutcome::Lost);
+                            return;
+                        }
+                    }
+                }
+                match failure {
+                    None => {
+                        let _ = sender.send(ChunkJobOutcome::Done(at, outs));
+                    }
+                    Some(error) => {
+                        let _ = sender.send(ChunkJobOutcome::Failed(at, error));
+                    }
+                }
             }
         }
     }
+}
+
+/// One item of work for the merged worker loop: a per-token expert job (the
+/// decode path) or a grouped chunk job (the chunked prefill path).
+enum WorkItem {
+    PerToken(TaskItem),
+    Chunk(ChunkTaskItem),
 }
 
 /// A run allocates no kernel scratch: each worker owns the scratch of the
