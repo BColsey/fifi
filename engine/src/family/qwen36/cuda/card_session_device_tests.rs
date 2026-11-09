@@ -100,6 +100,7 @@ pub(super) fn build_rig_session_for_chunk(
     devices: [usize; 2],
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
+    chunk_rows: usize,
 ) -> Result<
     (
         CardSession,
@@ -110,13 +111,14 @@ pub(super) fn build_rig_session_for_chunk(
     ),
     EngError,
 > {
-    build_rig_session(devices, context_tokens, prefix_limits)
+    build_rig_session(devices, context_tokens, prefix_limits, Some(chunk_rows))
 }
 
 fn build_rig_session(
     devices: [usize; 2],
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
+    chunk_rows: Option<usize>,
 ) -> Result<
     (
         CardSession,
@@ -289,7 +291,13 @@ fn build_rig_session(
     let admission = served_admission();
     let shard = ShardTable::new(&d.shape, 2, 32)?;
     let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let (mut stack, states) = CardStack::new(&d, &options, &devices, &admission)?;
+    let payload = chunk_rows
+        .map(|rows| {
+            super::card_prefill::chunk_mailbox_values(rows, d.shape.hidden, d.shape.moe.top_k)
+        })
+        .transpose()?;
+    let (mut stack, states) =
+        CardStack::with_payload(&d, &options, &devices, &admission, &shard, payload)?;
     stack.enable_broadcast_sync_for_test();
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
@@ -332,8 +340,12 @@ fn build_rig_session(
 }
 
 fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
-    let (mut session, stack, loaded, names, vocab) =
-        build_rig_session(devices, 8, crate::family::session::StoreLimits::default())?;
+    let (mut session, stack, loaded, names, vocab) = build_rig_session(
+        devices,
+        8,
+        crate::family::session::StoreLimits::default(),
+        None,
+    )?;
     let limit = session.context_limit();
     if limit < 4 {
         return Err(EngError::Checkpoint(format!(
@@ -465,6 +477,7 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
             roots: 0,
             entries: 2,
         },
+        None,
     )
     .expect("the rig session");
 
@@ -588,9 +601,13 @@ fn card_views_construct_chunk_models() {
         return;
     }
     let _ = NAME;
-    let (session, stack, _loaded, _names, _vocab) =
-        build_rig_session([0, 0], 256, crate::family::session::StoreLimits::default())
-            .expect("the rig session");
+    let (session, stack, _loaded, _names, _vocab) = build_rig_session(
+        [0, 0],
+        256,
+        crate::family::session::StoreLimits::default(),
+        None,
+    )
+    .expect("the rig session");
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec).expect("inventory");
     let shape = HostShape::from_spec(&spec, 64).expect("shape");

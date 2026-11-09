@@ -18,11 +18,12 @@ update for each query tile. Its impact at long contexts has not been measured
 on this port. Staged attention on card geometry needs separate investigation
 and device validation before it can be enabled.
 
-The serving worker currently supplies at most 16 prompt tokens per piece when
-the card executor advertises no larger piece. This chunk driver also leaves one
-row to the eager path, so the serving path batches at most 15 rows per call.
-Increasing the arena's row limit alone does not make the worker supply larger
-pieces. Larger pieces need their own device correctness and admission checks.
+When this experimental path is active, the card executor advertises the
+admitted chunk size to the serving worker. With chunking off, the worker keeps
+its existing fallback. The chunk driver leaves one row to the eager path, and
+the session keeps one pending token across pieces. Large pieces need physical
+device correctness, memory-admission, cancellation and long-context checks;
+they are not yet qualified on this port.
 
 ## Design
 
