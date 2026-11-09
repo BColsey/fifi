@@ -1,7 +1,6 @@
 # Getting started
 
-In this tutorial you build fifi, start its server, and send it your first requests.
-You do not need a GPU or a model download: you will use the built-in `fake` engine, which answers every request with a fixed sentence.
+Build fifi, start its server, and send your first requests. You do not need a GPU or a model download: the built-in `fake` engine answers every request with a fixed sentence.
 Once this works, the same steps run a real model.
 
 ## What you need
@@ -58,7 +57,7 @@ Create `fifi.json` in the `engine` directory:
 
 ## 4. Start the server
 
-Choose an API key, put it in the variable you named, and start the server:
+Choose an API key, set the variable you named, and start the server:
 
 ```sh
 export FIFI_API_KEY=my-secret-key

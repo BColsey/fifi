@@ -1,7 +1,7 @@
 # Diagnostics: doctor, check, and the support bundle
 
-Three commands answer "why will fifi not run here" before or after it fails.
-None of them loads model weights, starts a server, or touches the network.
+Use these commands to diagnose why fifi will not run, before or after a failure.
+None loads model weights, starts a server, or touches the network.
 
 ```text
 enginesrv doctor [--config <path>] [--json] [--bundle <file>]
@@ -24,7 +24,7 @@ enginesrv config effective <path> [--json]
 enginesrv doctor --bundle fifi-bundle.json --config engine/config/qwen36-cuda-3090-kv8-prefix.json
 ```
 
-writes one JSON document you can attach to an issue. It works with no GPU,
+This writes one JSON document you can attach to an issue. It works with no GPU,
 no model, and no running server — those facts are recorded as unavailable,
 never guessed. An existing file is never overwritten; the write is atomic
 (a `.part` sibling, then one rename).

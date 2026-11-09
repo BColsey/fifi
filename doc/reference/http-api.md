@@ -1,7 +1,7 @@
 # HTTP API
 
 `enginesrv` serves the routes below on the `listen` address of its [configuration file](configuration.md).
-The full contract is [`api/openapi.yaml`](../../api/openapi.yaml). The completion, token and template routes are extensions that the contract file does not describe.
+The contract is in [`api/openapi.yaml`](../../api/openapi.yaml). The completion, token and template routes are extensions that the contract file does not describe.
 
 ## Routes
 
@@ -91,7 +91,7 @@ Each takes `model`, `x-engine` and `x-session` as chat completions do: `x-engine
 A bad field returns `400` with the field's name in the message, and so does a body over 16 MiB.
 These routes read no sampling field: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop` and `stream` are ignored.
 Each served request writes one line to the request log, as `POST /v1/messages/count_tokens` does; a failed request writes none.
-The line has no finish reason or timings, and its `prompt_tokens` is the length of the ids that encode returned or that decode received, and 0 for apply-template.
+The line has no finish reason or timings. Its `prompt_tokens` is the number of IDs returned by encode, received by decode, or zero for apply-template.
 
 `POST /v1/token/encode` takes either `text` or `messages`, not both.
 

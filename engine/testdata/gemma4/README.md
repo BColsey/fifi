@@ -1,6 +1,6 @@
 # Gemma 4 Humanizer test data
 
-The files here belong to the Hugging Face model `jialinyyzz/humanizer` at revision `2e57b6528a4070c33f3e09ca24e3325a84272f68`, a Gemma 4 fine-tune.
+These fixtures use the Hugging Face model `jialinyyzz/humanizer` at revision `2e57b6528a4070c33f3e09ca24e3325a84272f68`, a Gemma 4 fine-tune.
 At that revision the model repository is licensed under Apache-2.0; see `THIRD_PARTY_NOTICES.md` at the repository root.
 No file here contains model weights.
 

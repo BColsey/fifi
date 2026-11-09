@@ -3,7 +3,7 @@
 Flint is a mixture-of-experts model with 39.8B parameters, 2.5B of them active per token.
 fifi serves it on Apple Silicon. On NVIDIA GPUs it runs as a pilot: short contexts work, and long-context quality is not measured.
 
-If you have not built fifi before, do the [tutorial](../getting-started.md) first.
+If you have not built fifi before, follow the [tutorial](../getting-started.md) first.
 Run Flint in a server process of its own: it sets the MLX allocator cache limit to 64 MiB for the whole process (rollback: `FIFI_FLINT_MLX_CACHE_LIMIT=0`).
 
 ## On a Mac

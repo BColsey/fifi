@@ -1,8 +1,8 @@
 # Running a second engine on an idle GPU
 
-This guide shows how to run a second, independent `enginesrv` on a spare GPU
-next to an existing deployment (for example a two-card P2P pair), and how to
-serve both models through one LAN web GUI. The example host has an RTX 3080
+Run a second, independent `enginesrv` on a spare GPU next to an existing
+deployment (for example a two-card P2P pair), and serve both models through one
+LAN web GUI. The example host has an RTX 3080
 and RTX 3060 P2P pair plus an RTX 2080 Ti 11 GB, serving Qwen3.6-35B-A3B
 Q4_K_M GGUF. The observations below are limited to that host.
 

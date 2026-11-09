@@ -15,8 +15,8 @@ are checked when logits are next required, rather than for every prompt-only
 token. This option is experimental until qualified on the target system.
 
 `python3 scripts/bench_p2p_prefill.py --self-test` checks the measurement driver
-without a GPU. Run it against an otherwise idle server with an output file in
-scratch storage, once with the option off and once on. The reported rate is
+without a GPU. For the benchmark, use an otherwise idle server and an output
+file in scratch storage, once with the option off and once on. The reported rate is
 prompt tokens divided by time to the complete reply, so it includes request
 and generation overhead. Save individual samples and compare the same prompt,
 model, context and host configuration.

@@ -4,7 +4,7 @@ Nemotron 3.5 Super is a 120B-parameter mixture-of-experts model with 12B active 
 fifi runs its NVFP4 checkpoint on Linux with an NVIDIA GPU.
 The GPU computes the matrix products and the host runs the rest of each forward pass, so generation is slow.
 
-If you have not built fifi before, do the [tutorial](../getting-started.md) first.
+If you have not built fifi before, follow the [tutorial](../getting-started.md) first.
 
 ## Steps
 

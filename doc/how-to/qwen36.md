@@ -1,6 +1,6 @@
 # Run Qwen3.6
 
-This guide runs `Qwen3.6-35B-A3B` on a Mac with Apple Silicon or on a PC with an NVIDIA RTX 3090.
+Run `Qwen3.6-35B-A3B` on a Mac with Apple Silicon or on a PC with an NVIDIA RTX 3090.
 If you have not built fifi before, do the [tutorial](../getting-started.md) first.
 
 ## On a Mac

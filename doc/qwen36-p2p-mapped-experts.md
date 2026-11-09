@@ -19,8 +19,8 @@ admission calculation. It also retains the usual per-device reservations and
 the free-VRAM check after loading. Available host RAM can change during a
 load, and pinned pages cannot be swapped. Direct host-memory reads can reduce
 inference throughput; measure on the target hardware before relying on this
-option. Remove the environment variable to restore the existing GPU-only
-placement.
+option. Remove both host-expert environment variables to restore the existing
+GPU-only placement.
 
 On systems where peers can advance at different rates, set
 `Q36_P2P_SYNC_BROADCAST=1` as well. This experimental option waits for every

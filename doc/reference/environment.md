@@ -1,6 +1,6 @@
 # Environment variables
 
-Set these before starting `enginesrv`; the server reads them once at startup.
+Set serving variables before starting `enginesrv`, unless an entry says otherwise. Some are read per call or at engine or session creation.
 The API key variable is not listed here: its name comes from `api_key_env` in the [configuration file](configuration.md).
 
 Two kinds of values appear below:
@@ -44,6 +44,7 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 
 | Variable | Default | Accepted values | Meaning |
 | --- | --- | --- | --- |
+| `FIFI_EXL3_GROUP_SPLIT` | `2` | `2`, `4`, `8` | Sets the K split for Qwen3.6 EXL3 host-picked routed and grouped shared-expert projections. Flash-Next CUDA also uses it for the shared expert. It does not change device-indexed routed launches. `4` and `8` require more scratch space and change the partial-sum order, so results can differ from `2`. Invalid or unreadable values use `2`. Read once per process; restart to change it. |
 | `Q36_VERIFY_GGUF_SHA256` | `0` | `0`, `1` | `1` checks the model file's SHA-256 while it loads. |
 | `Q36_CUDA_CHUNK_PREFILL` | on (chunked prefill) | `0`, `1` | `0` processes the prompt one token at a time, with the `q8` cache and with the default `f32` cache (FP16 storage). Checked on an EXL3 pack with both caches; a GGUF file with Q6_K weights never chunks. Unset or `1` leaves the chunk path on. |
 | `Q36_CUDA_CHUNK_ROWS` | `1024` | `16`, `128`, `512`, `1024` | Largest prompt chunk of the `q8` cache when chunking is on. Ignored with the default `f32` cache (FP16 storage), whose chunks are 2,048 rows for the first 3,072 positions and 1,024 after that. |
@@ -104,8 +105,8 @@ On Apple Silicon:
 | `FIFI_FLINT_MLX_RING_VIEW` | on | switch | Read the full-attention KV cache as one ring view instead of concatenating it each step. Needs `FIFI_FLINT_MLX_ASYNC_CHAIN`. |
 | `FIFI_FLINT_PREFIX_REUSE` | off | switch | Experimental: keep prefix snapshots between turns. Also needs `"prefix_reuse": true`. |
 | `FIFI_FLINT_PREFIX_BUDGET_BYTES` | physical memory minus weights and a system reserve | positive byte count | Memory cap for prefix snapshots. `0` or an unreadable value refuses startup. |
-| `FIFI_FLINT_MLX_COMPILE_LAYER` | off | Run the layer tail through one compiled MLX closure (graph cache). Fail-safe polarity: absent, non-UTF-8 or any value other than the explicit enable words keeps the eager tail. Read once per process. |
-| `FIFI_FLINT_MLX_PREFILL_CHAIN` | off | Chained multi-row prefill groups (graph-ordered, fence-free). Default off until an A/B proves at least +10% pp4096 tok/s; any non-enable value is the rollback. |
+| `FIFI_FLINT_MLX_COMPILE_LAYER` | off | switch | Run the layer tail through one compiled MLX closure (graph cache). Fail-safe polarity: absent, non-UTF-8 or any value other than the explicit enable words keeps the eager tail. Read once per process. |
+| `FIFI_FLINT_MLX_PREFILL_CHAIN` | off | switch | Chained multi-row prefill groups (graph-ordered, fence-free). Default off until an A/B proves at least +10% pp4096 tok/s; any non-enable value is the rollback. |
 
 On NVIDIA CUDA:
 

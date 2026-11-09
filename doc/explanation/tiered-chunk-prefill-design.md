@@ -1,14 +1,14 @@
 # Batched tiered prefill — design
 
-Status: design, not implemented. Everything below was verified against the tree at
-`a81ebdf` by a three-lane source read (chunk driver, tiered host, KV/state). The
-motivating measurements live on MRs zbrdc/fifi#14 (per-token tiered prefill is
-decode-rate: 50–75 tok/s) and #15 (prefix reuse makes cold prefill a
-once-per-unique-prompt cost, so cutting it ~2x is still worth real money).
+Status at `a81ebdf`: design, not implemented. Three review lanes verified this
+document against that tree, covering the chunk driver, tiered host, and KV/state.
+The motivating measurements are in MRs zbrdc/fifi#14 (per-token tiered prefill
+runs at the 50–75 tok/s decode rate) and #15 (prefix reuse makes cold prefill a
+once-per-unique-prompt cost).
 
-## Why this is smaller than it looks
+## Existing components
 
-Three ingredients already shipped with tiered chunking in mind:
+Three components were already in place for tiered chunking:
 
 - **The grouped MMQ kernel takes bank stacks and host-built ids.**
   `MmidWeight` is documented as "a NativeWeight or a bank of slots with
@@ -24,13 +24,12 @@ Three ingredients already shipped with tiered chunking in mind:
 - **M-row KV, attention, state publication and prefix export are MoE-mode
   agnostic** (`prefill.rs:1761-2120`, the `revalidate` protocol). Zero work there.
 
-## The honest ceiling
+## Expected throughput
 
-Batching removes the per-layer-per-token host round trips and job overhead, not
-the CPU expert arithmetic: a 512-row chunk still owes ~345 GMAC of CPU expert
-work through 8 threads. Expect **~2x cold prefill (90–100 tok/s)**, not the
-chunk-path GPU rate. The plan should say this up front so nobody measures 300
-tok/s and calls the implementation broken.
+Batching removes per-layer-per-token host round trips and job overhead, but not
+the CPU expert arithmetic. A 512-row chunk still requires about 345 GMAC of CPU
+expert work across 8 threads. The estimate is **about 2x cold prefill
+(90–100 tok/s)**, not the chunk-path GPU rate.
 
 ## Slices (each independently landable)
 
@@ -67,7 +66,7 @@ tok/s and calls the implementation broken.
    to a run-pin, add host-arithmetic pins for the batch classify and the
    grouped-pool merge.
 
-## Ordering traps (the state lane's list — each is a bug if missed)
+## Ordering requirements
 
 - **Status contract**: the tiered MoE launches must OR faults into
   `Word::PrefillStatus` exactly like the native stages; host-side tiered errors

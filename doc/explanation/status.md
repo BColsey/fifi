@@ -1,12 +1,12 @@
 # Current status
 
-**Goal: 128K to 256K tokens of context for every model, with EXL3 as the primary weight format.** The rows below show where each model stands against that goal today; the context rows (admitted ceilings, boot results) are the ones to read first.
+**Goal: 128K to 256K tokens of context for every model, with EXL3 as the primary weight format.** The context rows show the measured admission limits and boot results.
 
-This page lists what fifi measures today, per model and backend.
+This page records measurements by model and backend.
 It holds measured facts only. Every row gives the date, the conditions and the receipt it comes from, and anything that is an estimate says so.
 Numbers move with every merged change, so the date on each row matters more than the order of the rows.
 
-Last updated: 31 Oct 2026, on main `87bebce43`.
+A 31 Oct 2026 snapshot was recorded at `87bebce43`. Later entries have their own dates and sources.
 
 How to read the rows:
 

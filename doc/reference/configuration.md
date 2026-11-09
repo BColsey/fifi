@@ -2,7 +2,7 @@
 
 `enginesrv --config <file>` reads one JSON file.
 Startup refuses unknown keys and values outside the ranges below.
-When a model does not fit in memory, startup refuses the load; it does not lower a setting to make it fit.
+When a model does not fit in memory, startup refuses the load rather than lowering a setting to make it fit.
 
 Example files are in [`engine/config`](../../engine/config/README.md).
 
@@ -99,7 +99,7 @@ It reloads the cache from host memory for every token, so it is slow: an 8K-toke
 ### Tiered experts (CUDA)
 
 `tiered` keeps a fixed number of expert slots per layer on the GPU and runs the other experts on the CPU from the memory-mapped model file.
-Do not modify or replace the model file while the server runs.
+Do not modify or replace the model file while the server is running.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

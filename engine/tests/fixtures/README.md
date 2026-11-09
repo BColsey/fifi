@@ -65,7 +65,7 @@ They exist to test that the resolver rejects the wrong dtypes. No engine code ge
 `family-delta-ratio.safetensors` holds one DeltaNet layer whose linear-attention sizes are not the old multiples of the hidden width.
 The geometry is hidden `128`, two key heads of width `8`, four value heads of width `16`, and convolution kernel `3`.
 Worked by hand from the mlx-lm `GatedDeltaNet` constructor, the key width is `16`, the value width is `64`, and the fused width is `96`.
-Every count differs, so a swapped head count and head width shows.
+Every count differs, so swapping a head count and a head width shows up.
 The old rules expected `512` fused rows and `256` gate rows. The fixture stores `96` and `64`.
 The default quantization is affine 4-bit, group size `32`, with no overrides.
 `family-delta-ratio.json` records schema `family-delta-ratio/1`, the geometry, per-tensor shapes and fill values, and artifact hashes.
