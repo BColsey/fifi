@@ -31,7 +31,8 @@ function forward(req, body, backend, res) {
   if (req.headers.accept) headers['accept'] = req.headers.accept;
   if (body.length) headers['content-length'] = String(body.length);
   headers['authorization'] = 'Bearer ' + backend.key;
-  const preq = request(backend.origin + pathname + (search ?? ''), { method: req.method, headers }, pres => {
+  // Do not pool completed upstream sockets; active streams remain open until completion.
+  const preq = request(backend.origin + pathname + (search ?? ''), { method: req.method, headers, agent: false }, pres => {
     const hop = { connection: 1, 'transfer-encoding': 1, 'keep-alive': 1 };
     const out = {}; for (const [k, v] of Object.entries(pres.headers)) if (!hop[k.toLowerCase()]) out[k] = v;
     res.writeHead(pres.statusCode ?? 502, out);
@@ -57,8 +58,9 @@ function readBody(req) {
 }
 
 async function mergedModels(res) {
+  // Model-list polling should not leave an idle socket attached to each backend.
   const lists = await Promise.all(BACKENDS.map(b =>
-    fetch(b.origin + '/v1/models', { headers: { authorization: 'Bearer ' + b.key }, signal: AbortSignal.timeout(4000) })
+    fetch(b.origin + '/v1/models', { headers: { authorization: 'Bearer ' + b.key, connection: 'close' }, signal: AbortSignal.timeout(4000) })
       .then(r => r.json()).catch(() => null)));
   const data = lists.flatMap((l, i) => l?.data ?? [{ id: BACKENDS[i].model, object: 'model', owned_by: 'fifi' }]);
   // The GUI selects the first model when it has no saved choice. Prefer the P2P engine.
