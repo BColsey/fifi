@@ -125,7 +125,9 @@ class TrackingHTTPServer(ThreadingHTTPServer):
             )
 
 
-class ModelRouterTests(unittest.TestCase):
+class RouterFixture(unittest.TestCase):
+    close_backend_connections = False
+
     def setUp(self):
         node = shutil.which("node")
         if not node:
@@ -175,6 +177,9 @@ class ModelRouterTests(unittest.TestCase):
             FIFI_SECONDARY_RUN=str(secondary),
             FIFI_MODEL_ROUTER_PORT=str(port),
         )
+        env.pop("FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS", None)
+        if self.close_backend_connections:
+            env["FIFI_ROUTER_CLOSE_BACKEND_CONNECTIONS"] = "1"
         self.proc = subprocess.Popen(
             [node, str(copy)],
             env=env,
@@ -214,6 +219,10 @@ class ModelRouterTests(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=4) as response:
             return json.load(response)
+
+
+class ModelRouterTests(RouterFixture):
+    close_backend_connections = True
 
     def test_primary_is_first_and_model_specific_routes_still_work(self):
         data = self.get("/v1/models")["data"]
@@ -321,6 +330,15 @@ class ModelRouterTests(unittest.TestCase):
             "the upstream connection remained open after the client disconnected",
         )
         self.assertTrue(backend.wait_for_no_connections())
+
+
+class DefaultConnectionPolicyTests(RouterFixture):
+    def test_default_preserves_model_list_connection_reuse(self):
+        self.assertEqual(len(self.get("/v1/models")["data"]), 2)
+        self.assertFalse(
+            self.backends[1].wait_for_no_connections(timeout=0.2),
+            "the default policy unexpectedly closed the model-list connection",
+        )
 
 
 if __name__ == "__main__":
