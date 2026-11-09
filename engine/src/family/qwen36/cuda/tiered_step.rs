@@ -176,6 +176,22 @@ impl<'w> TieredRuntime<'w> {
         self.banks.first().map(|_| self.slot_count).unwrap_or(0)
     }
 
+    /// The M-row classification delegate: the chunk arm's route readback flows through
+    /// the host's `begin_chunk_layer` (MR #20 slice 3).
+    pub(super) fn begin_chunk(
+        &mut self,
+        layer: usize,
+        rows: &[crate::family::qwen36::tiered::host::ChunkRouteRow],
+    ) -> Result<
+        (
+            crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+            Vec<crate::family::qwen36::tiered::host::ChunkMissGroup>,
+        ),
+        crate::family::qwen36::tiered::host::HostError,
+    > {
+        self.host.begin_chunk_layer(layer, rows)
+    }
+
     /// Runs the MoE block of `layer` with the host decision between the router and the experts.
     /// The weights construction stays inline: block borrow of `scratch`/`host` beside an
     /// immutable `self` is the disjoint-field shape the accessor cannot express.
