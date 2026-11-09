@@ -176,6 +176,24 @@ impl<'w> TieredRuntime<'w> {
         self.banks.first().map(|_| self.slot_count).unwrap_or(0)
     }
 
+    /// The router buffers of `layer` (the raw F32 matrix and the shared gate),
+    /// at the parts' 'w lifetime — the chunk's router stage reads them.
+    pub(super) fn router_of(
+        &self,
+        layer: usize,
+    ) -> Result<
+        (
+            &'w crate::kernels::cuda::DeviceBuffer,
+            &'w crate::kernels::cuda::DeviceBuffer,
+        ),
+        EngError,
+    > {
+        let parts = self.parts.get(layer).ok_or_else(|| {
+            EngError::BadRequest(format!("tiered runtime: layer {layer} has no parts"))
+        })?;
+        Ok((parts.router, parts.router_shared))
+    }
+
     /// Starts the grouped pool serving of a chunk layer's misses (the delegate to
     /// the host's `start_chunk_pool`): one GroupedExpertJob per DISTINCT missed expert,
     /// started BEFORE the GPU stages so the CPU work overlaps them.
