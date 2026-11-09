@@ -121,7 +121,7 @@ pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
 /// planned for `m_sess` rows. Constructed against the caller's `cap` and `m_sess`; the body
 /// re-checks the state's own cap (a chunk built against a larger cap than the state's).
 #[derive(Debug)]
-pub(super) struct ChunkRows {
+pub(crate) struct ChunkRows {
     p0: usize,
     m: usize,
 }
@@ -239,6 +239,7 @@ pub(super) fn check_view_layout(
 
 /// The arena views of one chunk's slots: built from the same `chunk_tensors` list the arena was
 /// planned from, slots and tensors together.
+#[derive(Clone)]
 pub(super) struct ChunkViews<'a> {
     views: Vec<(ChunkSlot, DeviceRange<'a>)>,
 }
@@ -1224,6 +1225,21 @@ impl<'a, 'w> ChunkModel<'a, 'w> {
         self.moe_dims
     }
 
+    /// The layer table the model walks (the card driver's loop).
+    pub(super) fn table(&self) -> &'a LayerTable {
+        self.table
+    }
+
+    /// The weights the model resolves layers through.
+    pub(super) fn weights(&self) -> &ChunkWeights<'a, 'w> {
+        &self.weights
+    }
+
+    /// `dims_at` for callers outside this module (the card driver's MoE io).
+    pub(super) fn model_dims_at(&self, m: usize) -> MoeDims {
+        self.dims_at(m)
+    }
+
     fn dims_at(&self, m: usize) -> MoeDims {
         MoeDims {
             rows: m,
@@ -1250,7 +1266,7 @@ impl<'a, 'w> ChunkWeights<'a, 'w> {
         Self::Exl3 { mixer, moe, embed }
     }
 
-    fn mixer(&self) -> &'a MixerWeights<'w> {
+    pub(super) fn mixer(&self) -> &'a MixerWeights<'w> {
         match self {
             Self::Native { mixer, .. } | Self::Exl3 { mixer, .. } => mixer,
         }
@@ -1334,6 +1350,16 @@ impl<'r> ChunkSparse<'r> {
 }
 
 impl<'r, 'w> ChunkRun<'r, 'w> {
+    /// The run's scratch views (the card driver's MoE io seam).
+    pub(super) fn views(&self) -> &'r ChunkViews<'r> {
+        &self.bufs.views
+    }
+
+    /// The model the run resolves weights through (the card driver's seam).
+    pub(super) fn model(&self) -> &'r ChunkModel<'r, 'w> {
+        self.model
+    }
+
     pub(super) fn new(
         state: &'r ResidentState,
         model: &'r ChunkModel<'r, 'w>,
@@ -2317,7 +2343,7 @@ pub(super) fn run_chunk_moe(
 }
 
 /// Stages 10a-f, the shared expert. Diagnostic runs replace only its projections.
-fn run_chunk_shared(
+pub(super) fn run_chunk_shared(
     launch: &Launch<'_>,
     mw: &MoeLayerWeights<'_>,
     io: &MoeChunkIo<'_>,
@@ -2391,7 +2417,7 @@ fn run_chunk_shared(
 }
 
 /// Stages 11-16, the grouped routed projections and their existing nonlinear operation.
-fn run_chunk_routed(
+pub(super) fn run_chunk_routed(
     launch: &Launch<'_>,
     mw: &MoeLayerWeights<'_>,
     io: &MoeChunkIo<'_>,
@@ -2480,7 +2506,7 @@ fn run_chunk_routed(
 }
 
 /// Stage 17, unchanged for every diagnostic class.
-fn combine_chunk_moe(launch: &Launch<'_>, io: &MoeChunkIo<'_>) -> Result<(), EngError> {
+pub(super) fn combine_chunk_moe(launch: &Launch<'_>, io: &MoeChunkIo<'_>) -> Result<(), EngError> {
     let (dims, d) = (&io.dims, io.scratch);
     launch.ctx.moe_combine(
         launch.stream,
