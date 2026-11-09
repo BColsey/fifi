@@ -2297,6 +2297,15 @@ fn run_chunk_tiered(
             message: e.to_string(),
         })?;
 
+    // Start the grouped pool serving BEFORE the GPU stages: the CPU work overlaps
+    // the GPU launches (the chunk's whole reason for existing).
+    let pending = runtime
+        .start_chunk_pool(layer, &misses, &route.hidden, m)
+        .map_err(|e| EngError::Backend {
+            operation: "tiered_chunk_pool",
+            message: e.to_string(),
+        })?;
+
     // The shared expert: unchanged, against the runtime's own weights (& runtime).
     let weights = runtime.layer_weights(layer)?;
     run_chunk_shared(launch, &weights, io)?;
@@ -2386,11 +2395,48 @@ fn run_chunk_tiered(
     // Stage 17, the combine with the patched weights.
     combine_chunk_moe(launch, io)?;
 
-    // The CPU misses: serve as one grouped pool job, add the partial with one
-    // M-row moe_combine (top_k 1, weights ones, in place).
-    if !misses.is_empty() {
-        // TODO(slice-5-final): wire the grouped pool call and the partial add.
-        let _ = misses;
+    // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
+    // weights ones, in place) adding `partial` to the block output.
+    if let Some(pending) = pending {
+        let partial = pending
+            .finish(std::time::Duration::from_secs(60))
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_pool_join",
+                message: format!("{e:?}"),
+            })?;
+        if partial.len() != m * hidden || partial.iter().any(|v| !v.is_finite()) {
+            return Err(EngError::Backend {
+                operation: "tiered_chunk_partial",
+                message: format!(
+                    "the partial holds {} values (want {} x {}) or a non-finite one",
+                    partial.len(),
+                    m,
+                    hidden
+                ),
+            });
+        }
+        // Upload the partial and add it: 1.0 * partial through a second M-row
+        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
+        let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let partial_buf = ctx.upload(&bytes)?;
+        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
+        let ones_buf = ctx.upload(&ones)?;
+        ctx.moe_combine(
+            stream,
+            crate::kernels::cuda::resident::moe_combine::CombineCall {
+                shape: crate::kernels::cuda::resident::moe_combine::CombineShape {
+                    m,
+                    n: hidden,
+                    top_k: 1,
+                    ld_down: hidden,
+                },
+                res: io.h,
+                down: partial_buf.range(0, bytes.len())?,
+                weights: ones_buf.range(0, ones.len())?,
+                shared: None,
+                out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
+            },
+        )?;
     }
     Ok(())
 }
