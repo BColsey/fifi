@@ -204,9 +204,7 @@ pub(super) fn chunk_sliced(
                 if padded_heads == heads {
                     flash_out
                 } else {
-                    let (rows, width) = (q.shape()[2], q.shape()[3]);
-                    ctx.kernels
-                        .slice(&flash_out, &[0, 0, 0, 0], &[1, heads, rows, width])?
+                    unpad_rep6_output(ctx.kernels, &flash_out, heads, kv_heads)?
                 }
             } else {
                 attend_blocks(ctx.kernels, &q, pos, &blocks, |kernels, q_block, len, n| {
@@ -272,6 +270,32 @@ fn pad_rep6_query(
         let base = group * 6;
         parts.push(kernels.slice(q, &[0, base, 0, 0], &[1, base + 6, rows, width])?);
         parts.push(kernels.slice(q, &[0, base, 0, 0], &[1, base + 2, rows, width])?);
+    }
+    let views: Vec<&ExecutionTensor> = parts.iter().collect();
+    kernels.concatenate(&views, 1)
+}
+
+/// The inverse of `pad_rep6_query`: keeps the FIRST 6 heads of each 8-head kv group of the
+/// padded flash output and concatenates them back to `heads` in order. A head-range slice
+/// of the first `heads` positions would interleave the discarded pad rows into the result
+/// (the padded layout is `[real 6, pad 2]` per group), so the real heads are re-assembled
+/// group by group.
+fn unpad_rep6_output(
+    kernels: &mut MlxKernels,
+    padded: &ExecutionTensor,
+    heads: u32,
+    kv_heads: u32,
+) -> Result<ExecutionTensor, EngError> {
+    let &[1, _, rows, width] = padded.shape() else {
+        return Err(mismatch());
+    };
+    if heads != kv_heads * 6 {
+        return Err(mismatch());
+    }
+    let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(kv_heads as usize);
+    for group in 0..kv_heads {
+        let base = group * 8;
+        parts.push(kernels.slice(padded, &[0, base, 0, 0], &[1, base + 6, rows, width])?);
     }
     let views: Vec<&ExecutionTensor> = parts.iter().collect();
     kernels.concatenate(&views, 1)
@@ -1584,9 +1608,7 @@ mod tests {
                 let out = kernels
                     .q8_flash_prefill(&pad_q, &keys, &values_q, cap, scale, group, bits, None, 0)
                     .unwrap();
-                let out = kernels
-                    .slice(&out, &[0, 0, 0, 0], &[1, h, rows, d])
-                    .unwrap();
+                let out = unpad_rep6_output(&mut kernels, &out, h, kvh).unwrap();
                 sync(&mut kernels, &out);
                 let elapsed = start.elapsed().as_secs_f64() * 1e3;
                 if i == 0 {
@@ -1710,10 +1732,11 @@ mod tests {
         let flash_out = kernels
             .q8_flash_prefill(&padded, &keys, &values_q, rows, scale, group, bits, None, 0)
             .unwrap();
-        let flash_out = kernels
-            .slice(&flash_out, &[0, 0, 0, 0], &[1, h, rows, d])
-            .unwrap();
-        let flash = values(&mut kernels, &flash_out).unwrap();
+        let flash = values(
+            &mut kernels,
+            &unpad_rep6_output(&mut kernels, &flash_out, h, kvh).unwrap(),
+        )
+        .unwrap();
 
         let max_err = |a: &[f32], b: &[f32]| {
             a.iter()
