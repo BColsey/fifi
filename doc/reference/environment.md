@@ -12,7 +12,9 @@ Two kinds of values appear below:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated GPU architectures for the CUDA kernels, for example `89` for RTX 40-series cards or `86,89` for both. Read by `cargo build --features native-cuda`. |
+| `INFERENCE_CUDA_ARCHS` | `86` (`72` on aarch64) | Comma-separated native GPU architecture targets for CUDA kernels, read by `cargo build --features native-cuda`. For example, `75,86,89` targets RTX 20, 30 and 40 series with CUDA 12.4. The build also includes PTX for the highest listed target, which a suitable newer driver may compile for a newer GPU; PTX does not run on an older architecture. CUDA 12.8 or newer is needed to compile a native `120` target for RTX 50 series. These targets and PTX compatibility do not by themselves qualify the engine on a GPU. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
+
+NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cuda/gpus), [PTX compatibility rules](https://docs.nvidia.com/cuda/archive/12.8.1/blackwell-compatibility-guide/index.html), and [CUDA 12.8 compiler support for SM 120](https://docs.nvidia.com/cuda/archive/12.8.2/cuda-features-archive/index.html).
 
 ## Server
 
