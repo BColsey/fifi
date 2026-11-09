@@ -275,6 +275,24 @@ impl CardSession {
         self.skip_prefill_head = enabled;
     }
 
+    /// The chunk driver's seams: the stack, the states, the fed count,
+    /// the poison flag and the post-chunk fed update.
+    pub(crate) fn stack(&self) -> &'static CardStack {
+        self.stack
+    }
+
+    pub(crate) fn states_mut(&mut self) -> &mut [ResidentState] {
+        &mut self.states
+    }
+
+    pub(crate) fn poisoned_for_chunk(&self) -> bool {
+        self.poisoned
+    }
+
+    pub(crate) fn note_chunk_rows(&mut self, rows: usize) {
+        self.fed += rows;
+    }
+
     /// Card 0's embedding table: the reference ChunkWeights carries.
     #[cfg(test)]
     pub(super) fn embed_for_test(&self) -> &'static crate::kernels::cuda::NativeWeight {
@@ -603,7 +621,7 @@ impl ExecutorOps for CardSession {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Q36CudaStep {
     Single(super::step::QwenResidentStep<'static>),
-    Cards(Box<CardSession>),
+    Cards(Box<CardSession>, Option<super::card_prefill::CardChunk>),
 }
 
 impl TokenStepper for Q36CudaStep {
@@ -612,29 +630,54 @@ impl TokenStepper for Q36CudaStep {
     fn feed(&mut self, token: u32) -> Result<(), EngError> {
         match self {
             Self::Single(step) => step.feed(token),
-            Self::Cards(session) => session.feed(token),
+            Self::Cards(session, _chunk) => session.feed(token),
         }
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
         match self {
             Self::Single(step) => step.logits(token),
-            Self::Cards(session) => session.logits(token),
+            Self::Cards(session, _chunk) => session.logits(token),
         }
     }
 
     fn fed(&self) -> usize {
         match self {
             Self::Single(step) => step.fed(),
-            Self::Cards(session) => session.fed(),
+            Self::Cards(session, _chunk) => session.fed(),
         }
     }
 
     fn reset(&mut self) -> Result<(), EngError> {
         match self {
             Self::Single(step) => TokenStepper::reset(step),
-            Self::Cards(session) => TokenStepper::reset(&mut **session),
+            Self::Cards(session, _) => TokenStepper::reset(&mut **session),
         }
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+        let Self::Cards(session, Some(chunk)) = self else {
+            return tokens.iter().try_for_each(|&t| self.feed(t));
+        };
+        if tokens.len() < 2 || session.poisoned_for_chunk() {
+            return tokens.iter().try_for_each(|&t| self.feed(t));
+        }
+        // The LAST token stays on the per-token path: the caller samples
+        // from it and the head-skip rule already covers prompt-only rows.
+        let (rows, tail) = tokens.split_at(tokens.len() - 1);
+        let [last] = tail else {
+            unreachable!("len checked above");
+        };
+        let fed = session.fed();
+        super::card_prefill::run_card_chunk(
+            session.stack(),
+            session.states_mut(),
+            chunk,
+            rows,
+            fed,
+        )?;
+        session.note_chunk_rows(rows.len());
+        self.feed(*last)
     }
 }
 
@@ -644,28 +687,28 @@ impl ExecutorOps for Q36CudaStep {
     fn check_prompt(&self, prompt_tokens: usize) -> Result<(), EngError> {
         match self {
             Self::Single(step) => step.check_prompt(prompt_tokens),
-            Self::Cards(session) => session.check_prompt(prompt_tokens),
+            Self::Cards(session, _chunk) => session.check_prompt(prompt_tokens),
         }
     }
 
     fn history<'s>(&self, st: &'s DecodeSession) -> &'s [u32] {
         match self {
             Self::Single(step) => step.history(st),
-            Self::Cards(session) => session.history(st),
+            Self::Cards(session, _chunk) => session.history(st),
         }
     }
 
     fn reset(&mut self, st: &mut DecodeSession) -> Result<(), EngError> {
         match self {
             Self::Single(step) => ExecutorOps::reset(step, st),
-            Self::Cards(session) => ExecutorOps::reset(&mut **session, st),
+            Self::Cards(session, _) => ExecutorOps::reset(&mut **session, st),
         }
     }
 
     fn prefill(&mut self, st: &mut DecodeSession, toks: &[u32]) -> Result<(), EngError> {
         match self {
             Self::Single(step) => step.prefill(st, toks),
-            Self::Cards(session) => session.prefill(st, toks),
+            Self::Cards(session, _chunk) => session.prefill(st, toks),
         }
     }
 
@@ -676,14 +719,14 @@ impl ExecutorOps for Q36CudaStep {
     ) -> Result<crate::tokenizer::DecodeBatch, EngError> {
         match self {
             Self::Single(step) => step.decode(st, generation),
-            Self::Cards(session) => session.decode(st, generation),
+            Self::Cards(session, _chunk) => session.decode(st, generation),
         }
     }
 
     fn prefix_limits(&self) -> StoreLimits {
         match self {
             Self::Single(step) => step.prefix_limits(),
-            Self::Cards(session) => session.prefix_limits(),
+            Self::Cards(session, _chunk) => session.prefix_limits(),
         }
     }
 
@@ -695,7 +738,7 @@ impl ExecutorOps for Q36CudaStep {
     ) -> Result<bool, EngError> {
         match self {
             Self::Single(step) => step.save_prefix(st, key, kind),
-            Self::Cards(session) => session.save_prefix(st, key, kind),
+            Self::Cards(session, _chunk) => session.save_prefix(st, key, kind),
         }
     }
 
@@ -706,14 +749,14 @@ impl ExecutorOps for Q36CudaStep {
     ) -> Result<usize, EngError> {
         match self {
             Self::Single(step) => step.restore_prefix(st, prompt),
-            Self::Cards(session) => session.restore_prefix(st, prompt),
+            Self::Cards(session, _chunk) => session.restore_prefix(st, prompt),
         }
     }
 
     fn boundary(&mut self, st: &mut DecodeSession) {
         match self {
             Self::Single(step) => step.boundary(st),
-            Self::Cards(session) => session.boundary(st),
+            Self::Cards(session, _chunk) => session.boundary(st),
         }
     }
 }
