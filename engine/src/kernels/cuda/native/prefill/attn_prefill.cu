@@ -906,14 +906,34 @@ PartArm arm_part() {
     return arm;
 }
 
-/* Enqueues both kernels. The part kernel is chosen and armed once per process, by a function-local
- * static with C++11 thread-safe initialisation. A failed arm is cached too, so a transient failure
- * stays permanent for the process; that assumes one device per process, the engine's model. */
+/* The per-device arm cache: cudaFuncGetAttributes and the shared-memory
+ * opt-in are DEVICE-scoped, and the multi-device engine arms the same
+ * kernel on every card it serves. One function-local static armed the
+ * first device only, and the second card's launch of the 98 KB kernel
+ * died with cudaErrorInvalidValue. The array arms each device once. */
+template <int kHeadDim, int kGroup>
+const PartArm &arm_for_device() {
+    static PartArm arms[8];
+    static bool armed[8] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 8) {
+        device = 0;
+    }
+    if (!armed[device]) {
+        arms[device] = arm_part<kHeadDim, kGroup>();
+        armed[device] = true;
+    }
+    return arms[device];
+}
+
+/* Enqueues both kernels. The part kernel is chosen and armed once per
+ * DEVICE (see arm_for_device); a failed arm is cached too, so a transient
+ * failure stays permanent for the process. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
-        static const PartArm arm = arm_part<kHeadDim, kGroup>();
+        const PartArm &arm = arm_for_device<kHeadDim, kGroup>();
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {
             const int q_tiles = (k.m + kQTile - 1) / kQTile;

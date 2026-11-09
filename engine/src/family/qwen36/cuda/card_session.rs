@@ -627,6 +627,18 @@ impl ExecutorOps for CardSession {
         self.prefix.limits()
     }
 
+    /// GATED OFF: advertising the chunk rows as the prefill piece drives
+    /// m >= ~32 chunks, and the delta_proj MMQ then refuses inside the
+    /// vendored launch (`FIFI_REQUIRE` -> cudaErrorInvalidValue) on the
+    /// cards - the same family as the m_sess=64 out/down aliasing the
+    /// moe_shared launch hit. m <= 25 chunks are stable and fast; the
+    /// piece stays the worker default until the large-m diagnosis lands
+    /// (standalone repro at k=2048, card n, m sweep; the J-config smem
+    /// opt-in per instantiation is the first suspect).
+    fn prefill_piece(&self) -> Option<usize> {
+        None
+    }
+
     /// Snapshots every card's state (its sliced KV planes plus its DeltaNet
     /// slots) into the host store under the shared session rules. An entry
     /// is one `ExportedState` per card, so restoring hands each card back
@@ -795,6 +807,13 @@ impl ExecutorOps for Q36CudaStep {
         match self {
             Self::Single(step) => step.restore_prefix(st, prompt),
             Self::Cards(session) => session.restore_prefix(st, prompt),
+        }
+    }
+
+    fn prefill_piece(&self) -> Option<usize> {
+        match self {
+            Self::Single(step) => step.prefill_piece(),
+            Self::Cards(session) => session.prefill_piece(),
         }
     }
 

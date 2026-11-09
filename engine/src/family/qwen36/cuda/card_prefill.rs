@@ -50,6 +50,64 @@ use crate::{
     kernels::cuda::peer_ring::{MAX_VALUES, RingMode},
 };
 
+/// Stage timing probe (host wall time per stage, accumulated over the
+/// chunk and printed once; a stage whose host time is large blocks - it
+/// syncs or launches stalled). Enabled by Q36_P2P_CHUNK_TRACE=1.
+pub(super) struct StageTimes {
+    pub(super) names: Vec<&'static str>,
+    pub(super) us: Vec<u128>,
+}
+
+thread_local! {
+    static STAGES: std::cell::RefCell<StageTimes> = std::cell::RefCell::new(StageTimes {
+        names: Vec::new(),
+        us: Vec::new(),
+    });
+}
+
+pub(super) fn time_stage<T>(
+    name: &'static str,
+    f: impl FnOnce() -> Result<T, EngError>,
+) -> Result<T, EngError> {
+    let began = std::time::Instant::now();
+    let out = f();
+    let us = began.elapsed().as_micros();
+    if let Err(error) = &out {
+        eprintln!("chunk-trace: stage {name} FAILED: {error:?}");
+    }
+    STAGES.with(|st| {
+        let mut st = st.borrow_mut();
+        let i = st.names.iter().position(|n| *n == name).unwrap_or_else(|| {
+            st.names.push(name);
+            st.us.push(0);
+            st.names.len() - 1
+        });
+        st.us[i] += us;
+    });
+    out
+}
+
+pub(super) fn print_stages(m: usize) {
+    STAGES.with(|st| {
+        let st = st.borrow();
+        if st.names.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(&str, u128)> = st
+            .names
+            .iter()
+            .cloned()
+            .zip(st.us.iter().cloned())
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u128 = st.us.iter().sum();
+        eprintln!("chunk-trace m={m}: total {total} us; top stages:");
+        for (name, us) in rows.iter().take(10) {
+            eprintln!("  {name:<14} {us:>8} us",);
+        }
+    });
+}
+
 /// The largest chunk rows the driver accepts for this shape: every layer
 /// sum is one ring sequence, and the transport caps a payload at
 /// [`MAX_VALUES`] values.
@@ -70,6 +128,13 @@ pub(crate) struct CardChunk {
     cards: Vec<CardChunkCard>,
     m_sess: usize,
     hidden: usize,
+}
+
+impl CardChunk {
+    /// The chunk rows the session advertises as its prefill piece.
+    pub(crate) fn m_sess(&self) -> usize {
+        self.m_sess
+    }
 }
 
 /// Builds both cards' chunk arenas and models. `m_chunk` is the chunk row
@@ -278,13 +343,15 @@ pub(crate) fn run_card_chunk(
     let status: Vec<_> = (0..cards)
         .map(|card| states[card].word(Word::PrefillStatus))
         .collect::<Result<_, EngError>>()?;
-    chunk_embed(&launches[0], &runs[0], status[0])?;
+    time_stage("embed", || chunk_embed(&launches[0], &runs[0], status[0]))?;
     if cards > 1 {
         let src = views[0].get(ChunkSlot::Hidden)?;
         let outs: Vec<_> = (0..cards)
             .map(|card| views[card].get(ChunkSlot::Hidden))
             .collect::<Result<_, EngError>>()?;
-        stack.broadcast(0, src, &outs, &status, m * hidden)?;
+        time_stage("ring_embed", || {
+            stack.broadcast(0, src, &outs, &status, m * hidden)
+        })?;
     }
     // The layer walk.
     let table = chunk.cards[0].model.table();
@@ -312,12 +379,13 @@ pub(crate) fn run_card_chunk(
     for card in 0..cards {
         let stream = &stack.streams()[card];
         let state = &mut states[card];
-        let read = state
-            .read_prefill_status(stream)
+        let read = time_stage("close_read", || state.read_prefill_status(stream))
             .inspect_err(|_| state.poison())?;
-        state
-            .revalidate(stream, p0 + m, read)
+        time_stage("revalidate", || state.revalidate(stream, p0 + m, read))
             .inspect_err(|_| state.poison())?;
+    }
+    if std::env::var_os("Q36_P2P_CHUNK_TRACE").is_some_and(|v| v == "1") {
+        print_stages(m);
     }
     Ok(())
 }
@@ -360,34 +428,24 @@ fn run_card_chunk_layer(
         match stage {
             Stage::NormF => {
                 // The mixer output exchange precedes the norm that reads it.
-                exchange_slot(stack, views, status, ChunkSlot::Delta, m * hidden)?;
+                time_stage("ring_delta", || {
+                    exchange_slot(stack, views, status, ChunkSlot::Delta, m * hidden)
+                })?;
                 for card in 0..cards {
                     let ctx = layer_ctx(launches, chunk, status, card, layer, kind, ordinal)?;
-                    norm_f(&runs[card], &ctx)?;
+                    time_stage("norm_f", || norm_f(&runs[card], &ctx))?;
                 }
             }
             Stage::Route => {
-                // Card 0 routes; the picks broadcast to every card.
-                {
-                    let ctx = layer_ctx(launches, chunk, status, 0, layer, kind, ordinal)?;
-                    chunk_route(&runs[0], &ctx)?;
-                }
-                for slot in [
-                    ChunkSlot::TopkId,
-                    ChunkSlot::TopkWeight,
-                    ChunkSlot::SharedGate,
-                ] {
-                    let src = views[0].get(slot)?;
-                    let outs: Vec<_> = (0..cards)
-                        .map(|card| views[card].get(slot))
-                        .collect::<Result<_, EngError>>()?;
-                    let count = match slot {
-                        ChunkSlot::TopkId | ChunkSlot::TopkWeight => {
-                            m * chunk.cards[0].model.moe_dims().top_k
-                        }
-                        _ => m,
-                    };
-                    stack.broadcast(0, src, &outs, status, count)?;
+                // Every card routes ITSELF: X2 is identical post-exchange
+                // and the router is a replicated raw weight, so the same
+                // kernel on the same arch yields identical picks - no
+                // broadcast, no sync. (The picks broadcast cost 75% of
+                // the chunk when SYNC_BROADCAST drained both streams 120
+                // times per chunk.)
+                for card in 0..cards {
+                    let ctx = layer_ctx(launches, chunk, status, card, layer, kind, ordinal)?;
+                    time_stage("route", || chunk_route(&runs[card], &ctx))?;
                 }
             }
             Stage::Moe => {
@@ -395,10 +453,14 @@ fn run_card_chunk_layer(
                 // the asymmetric combine and the Hidden exchange.
                 for card in 0..cards {
                     let io = moe_io(&runs[card], &status[card], m)?;
-                    run_chunk_shared(&launches[card], &chunk.cards[card].moe[layer], &io)?;
-                    run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)?;
+                    time_stage("moe_shared", || {
+                        run_chunk_shared(&launches[card], &chunk.cards[card].moe[layer], &io)
+                    })?;
+                    time_stage("moe_routed", || {
+                        run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)
+                    })?;
                     if card == 0 {
-                        combine_chunk_moe(&launches[card], &io)?;
+                        time_stage("moe_combine", || combine_chunk_moe(&launches[card], &io))?;
                     } else {
                         // The partial alone: combine into the dead Delta
                         // row reading the permanent Zero row as residual.
@@ -438,25 +500,35 @@ fn run_card_chunk_layer(
                 let outs: Vec<_> = (0..cards)
                     .map(|card| views[card].get(ChunkSlot::Hidden))
                     .collect::<Result<_, EngError>>()?;
-                stack.exchange_sum(&partials, &outs, status, m * hidden, RingMode::F32)?;
+                time_stage("ring_hidden", || {
+                    stack.exchange_sum(&partials, &outs, status, m * hidden, RingMode::F32)
+                })?;
             }
             other => {
                 // The card-local stages, driven on every card.
                 for card in 0..cards {
                     let ctx = layer_ctx(launches, chunk, status, card, layer, kind, ordinal)?;
                     match other {
-                        Stage::NormA => norm_a(&runs[card], &ctx)?,
-                        Stage::QuantA => quant_a(&runs[card], &ctx)?,
-                        Stage::DeltaProj => delta_proj(&runs[card], &ctx)?,
-                        Stage::Conv => delta_conv(&runs[card], &ctx)?,
-                        Stage::Scan => delta_scan(&runs[card], &ctx)?,
-                        Stage::QuantDOut => quant_d_out(&runs[card], &ctx)?,
-                        Stage::SsmOut => ssm_out(&runs[card], &ctx)?,
-                        Stage::AttnProj => attn_proj(&runs[card], &ctx)?,
-                        Stage::Prep => attn_prep(&runs[card], &ctx)?,
-                        Stage::Flash => attn_flash(&runs[card], &ctx)?,
-                        Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
-                        Stage::AttnOut => attn_out(&runs[card], &ctx)?,
+                        Stage::NormA => time_stage("norm_a", || norm_a(&runs[card], &ctx))?,
+                        Stage::QuantA => time_stage("quant_a", || quant_a(&runs[card], &ctx))?,
+                        Stage::DeltaProj => {
+                            time_stage("delta_proj", || delta_proj(&runs[card], &ctx))?
+                        }
+                        Stage::Conv => time_stage("conv", || delta_conv(&runs[card], &ctx))?,
+                        Stage::Scan => time_stage("scan", || delta_scan(&runs[card], &ctx))?,
+                        Stage::QuantDOut => {
+                            time_stage("quant_dout", || quant_d_out(&runs[card], &ctx))?
+                        }
+                        Stage::SsmOut => time_stage("ssm_out", || ssm_out(&runs[card], &ctx))?,
+                        Stage::AttnProj => {
+                            time_stage("attn_proj", || attn_proj(&runs[card], &ctx))?
+                        }
+                        Stage::Prep => time_stage("attn_prep", || attn_prep(&runs[card], &ctx))?,
+                        Stage::Flash => time_stage("attn_flash", || attn_flash(&runs[card], &ctx))?,
+                        Stage::QuantAOut => {
+                            time_stage("quant_aout", || quant_a_out(&runs[card], &ctx))?
+                        }
+                        Stage::AttnOut => time_stage("attn_out", || attn_out(&runs[card], &ctx))?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
                     }
                 }
