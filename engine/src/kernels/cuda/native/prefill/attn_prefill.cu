@@ -906,9 +906,6 @@ PartArm arm_part() {
     }
     arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    arm.bytes);
-    fprintf(stderr, "DBG arm_part<%d,%d>: ptx=%d dsplit=%d bytes=%d localSize=%d err=%d\n",
-            kHeadDim, kGroup, arm.ptx, (int)arm.dsplit, arm.bytes,
-            (int)attr.localSizeBytes, (int)arm.err);
     return arm;
 }
 
@@ -1187,17 +1184,13 @@ static Failure enqueue_q8_tiled(const Args &k, inference_cuda_attn_kv_pair views
         const cudaError_t got =
             cudaFuncGetAttributes(&attr, attn_prefill_part_q8_tile_k<128>);
         if (got != cudaSuccess) {
-            fprintf(stderr, "DBG q8_arm<%d>: getAttr err=%d\n", kHeadDim, (int)got);
             return got;  // propagate the real CUDA error
         }
         if (attr.maxThreadsPerBlock < 256 || attr.localSizeBytes != 0) {
-            fprintf(stderr, "DBG q8_arm<%d>: REFUSED localSize=%d maxThreads=%d kTileBytes=%d\n",
-                    kHeadDim, (int)attr.localSizeBytes, attr.maxThreadsPerBlock, (int)kTileBytes);
             return cudaErrorInvalidValue;  // attribute-invariant refusal, not a CUDA error
         }
         const cudaError_t set = cudaFuncSetAttribute(attn_prefill_part_q8_tile_k<128>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kTileBytes);
-        fprintf(stderr, "DBG q8_arm<%d>: set(%d)=%d\n", kHeadDim, (int)kTileBytes, (int)set);
         return set;
     }();
     if (arm_error != cudaSuccess) {
