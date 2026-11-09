@@ -1,0 +1,52 @@
+{
+  "schema": "fifi.p2p-ring-alignment-red.v1",
+  "tested_code_commit": "10f690b3cc6e9c5eecba32fc33d4d8df298bea10",
+  "test_binary_sha256": "5b473d0a9b8c3a50cb07be780431b6ece4d619bd1476637a1801dc57d77d096b",
+  "test": "large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot",
+  "multiblock_flag": "0",
+  "result": "FAILED: CUDA adapter invalid argument for a 2049-value mailbox capacity",
+  "test_output": [
+    "",
+    "running 1 test",
+    "test kernels::cuda::peer_ring::device_tests::large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot ... CUDA devices visible: 2",
+    "",
+    "thread 'kernels::cuda::peer_ring::device_tests::large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot' (1137969) panicked at src/kernels/cuda/peer_ring.rs:872:14:",
+    "exchange: Backend { operation: \"cuda adapter\", message: \"invalid argument (status -1)\" }",
+    "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "FAILED",
+    "",
+    "failures:",
+    "",
+    "failures:",
+    "    kernels::cuda::peer_ring::device_tests::large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot",
+    "",
+    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5791 filtered out; finished in 0.22s",
+    ""
+  ],
+  "other_tests_before_failure": [
+    "two_contexts_exchange_a_sum_and_repeat_it: passed",
+    "the_fp16_exchange_sums_within_half_precision_and_flags_overflow: passed"
+  ],
+  "guard_samples": [
+    {
+      "time": 1794168212.362369,
+      "other_jobs": [],
+      "builders": [],
+      "unexpected": [],
+      "secondary_utilization": 0
+    },
+    {
+      "time": 1794168213.4969614,
+      "other_jobs": [],
+      "builders": [],
+      "unexpected": [],
+      "secondary_utilization": 0
+    }
+  ],
+  "diagnosis": "The 128 + 2049*4-byte slot stride is not a multiple of 16. Native publish and wait reject unaligned slot addresses.",
+  "fix_commit": "d2c8d205feff7fdfe8b6ab180f0adc0ddfb100f5",
+  "limits": [
+    "The fix had not been built or rerun when this failure was recorded.",
+    "No performance comparison was produced."
+  ]
+}

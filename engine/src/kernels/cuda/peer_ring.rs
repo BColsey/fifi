@@ -85,9 +85,10 @@ impl MailboxLayout {
         Ok(Self { cards, max_values })
     }
 
-    /// Bytes of one slot: header plus the payload at the f32 stride.
+    /// Header plus the f32-stride payload, padded for the native 16-byte
+    /// alignment requirement on every slot, including odd capacities.
     pub(crate) fn slot_bytes(&self) -> usize {
-        HEADER_BYTES + self.max_values * VALUE_BYTES
+        (HEADER_BYTES + self.max_values * VALUE_BYTES).next_multiple_of(16)
     }
 
     /// Bytes of one device's whole mailbox: a slot per source and parity.
@@ -484,6 +485,21 @@ mod tests {
         let layout = MailboxLayout::new(2, 8).expect("layout");
         assert!(layout.slot_offset(2, 1).is_err());
     }
+
+    #[test]
+    fn the_layout_aligns_every_slot_for_odd_capacities() {
+        for capacity in [1, 2, 3, 5, 2049, native::peer_ring::MAX_VALUES - 1] {
+            let layout = MailboxLayout::new(3, capacity).expect("layout");
+            let unpadded = HEADER_BYTES + capacity * VALUE_BYTES;
+            assert!(layout.slot_bytes() >= unpadded);
+            assert!(layout.slot_bytes() - unpadded < 16);
+            for source in 0..3 {
+                for sequence in 1..=2 {
+                    assert_eq!(layout.slot_offset(source, sequence).expect("slot") % 16, 0);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +702,58 @@ mod device_tests {
             per * 1e3,
             per * 1e3 * 80.0,
         );
+    }
+
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn odd_capacity_exchanges_on_physical_peers() {
+        const NAME: &str = "odd_capacity_exchanges_on_physical_peers";
+        const N: usize = 2049;
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, N).expect("odd-capacity ring");
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &[1.5; N]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &[-0.25; N]).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(N * 4).expect("out 0"),
+            contexts[1].allocate(N * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        // Three rounds exercise both parity slots and reuse the first slot.
+        for mode in [RingMode::F16, RingMode::F32, RingMode::F32] {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                mode,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                assert_eq!(status_of(&statuses[index], stream).expect("status"), 0);
+                assert_eq!(
+                    download_f32(&outs[index], stream, N).expect("sum"),
+                    vec![1.25; N]
+                );
+            }
+        }
     }
 
     #[test]
