@@ -1,0 +1,70 @@
+{
+  "schema": "fifi.greedy-device-trace-validation.v1",
+  "recorded_utc": "2026-11-08T19:41:32.414125+00:00",
+  "code_commit": "f8c37463c6f8f250bf70370e4aebb282d004096e",
+  "source_sha256": {
+    "engine/src/family/qwen36/cuda/step.rs": "0a42a09c3ac44856711e81bd1e3500360949cf742ddee5e6307f661fcc09e6a2",
+    "engine/src/family/sampler.rs": "3c0583ce07660833393300dcd3a11fcd8ef6ed9be78fe61590b7dfb02673c505"
+  },
+  "target": "x86_64 Linux, native-cuda, sm_75",
+  "checks": [
+    {
+      "command": "cargo test --locked --release --lib --features native-cuda family::sampler::tests:: -- --test-threads=1",
+      "result": "test result: ok. 77 passed; 0 failed; 2 ignored; 0 measured; 5703 filtered out; finished in 16.94s",
+      "regression": "device_greedy_capture_matches_host_observations_and_limits ... ok"
+    },
+    {
+      "command": "cargo build --locked --release --features native-cuda --bin enginesrv",
+      "result": "passed",
+      "enginesrv_sha256": "ba8151dbdaaa529162ff3e3e9014635dc61a8df7197d6ad949e67498aa126fd3"
+    },
+    {
+      "command": "cargo fmt --all -- --check; git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --locked --release --lib --features native-cuda -- -D warnings",
+      "result": "passed"
+    }
+  ],
+  "preliminary_reproduction": {
+    "transport": "keyless LAN proxy",
+    "model": "fifi-q36-2080ti",
+    "temperature": 0,
+    "completion_tokens": 20,
+    "captured_positions": 0,
+    "http_status": 200,
+    "limits": "An output hash was not retained for this preliminary reproduction."
+  },
+  "limits": [
+    "One fixed greedy prompt was compared on the RTX 2080 Ti, via the LAN HTTP proxy; this is not a browser automation test.",
+    "The live check does not qualify other models, sampling modes, or the multi-GPU engine."
+  ],
+  "repeatable_baseline": {
+    "model": "fifi-q36-2080ti",
+    "client_api_key": "none",
+    "completion_tokens": 20,
+    "finish_reason": "length",
+    "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+    "captured_positions": 0,
+    "prompt": "Write the numbers one to ten, one per line.",
+    "recorded_utc": "2026-11-08T19:49:00.868926+00:00"
+  },
+  "candidate_end_to_end": {
+    "model": "fifi-q36-2080ti",
+    "client_api_key": "none",
+    "completion_tokens": 20,
+    "finish_reason": "length",
+    "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+    "captured_positions": 20,
+    "all_greedy": true,
+    "no_selected_probabilities": true,
+    "baseline_and_candidate_match": [
+      "content_sha256",
+      "completion_tokens",
+      "finish_reason"
+    ],
+    "deployment_candidate_sha256": "ba8151dbdaaa529162ff3e3e9014635dc61a8df7197d6ad949e67498aa126fd3",
+    "recorded_utc": "2026-11-08T19:54:28.484524+00:00"
+  }
+}

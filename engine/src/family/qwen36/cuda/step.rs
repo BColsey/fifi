@@ -2683,7 +2683,9 @@ impl<'a> QwenResidentStep<'a> {
             return Ok(None);
         }
         if sampler.params().is_greedy() {
-            return self.run_token(token, false).map(Some);
+            let selected = self.run_token(token, false)?;
+            sampler.record_device_greedy(selected);
+            return Ok(Some(selected));
         }
         self.run_token_output(token, false, true)?;
         let candidates = self.shortlist_values()?;
