@@ -1776,6 +1776,44 @@ mod tests {
     }
 
     #[test]
+    fn chained_boundary_swaps_publish_a_pending_victim_before_eviction() {
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 2.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let routes = [
+            vec![1, 2, 6, 5],
+            vec![7, 3, 0],
+            vec![0, 4],
+            vec![2, 7, 0, 4],
+            vec![3, 6, 5, 0],
+            vec![0, 7, 4],
+        ];
+        let mut last = None;
+        for ids in routes {
+            last = Some(run_token(&mut f, &[ids], &mut device).unwrap());
+            f.host.check_consistency().unwrap();
+        }
+        assert_eq!(last.unwrap().swaps, 2);
+        assert!(f.host.is_resident(0, 7));
+        assert!(!f.host.is_resident(0, 4));
+    }
+
+    #[test]
+    fn three_chained_boundary_swaps_keep_policy_and_ledger_in_sync() {
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 8.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        run_token(&mut f, &[vec![0, 3]], &mut device).unwrap();
+        f.host.check_consistency().unwrap();
+        let report = run_token(&mut f, &[vec![6, 2, 4, 3]], &mut device).unwrap();
+        assert_eq!(report.swaps, 3);
+        f.host.check_consistency().unwrap();
+        assert!(f.host.is_resident(0, 6));
+        assert!(!f.host.is_resident(0, 2));
+        assert!(!f.host.is_resident(0, 4));
+    }
+
+    #[test]
     fn a_failed_wait_fills_poisons_like_a_failed_fill() {
         let mut f = fixture();
         let mut device = MockDevice {
