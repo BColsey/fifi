@@ -1514,7 +1514,7 @@ mod tests {
                 let views: Vec<&ExecutionTensor> = blocks.iter().collect();
                 let out = kernels.concatenate(&views, 2).unwrap();
                 sync(&mut kernels, &out);
-                let elapsed = start.elapsed().as_secs_f64();
+                let elapsed = start.elapsed().as_secs_f64() * 1e3;
                 if i == 0 {
                     first = elapsed;
                 } else {
@@ -1538,7 +1538,7 @@ mod tests {
                     .slice(&out, &[0, 0, 0, 0], &[1, h, rows, d])
                     .unwrap();
                 sync(&mut kernels, &out);
-                let elapsed = start.elapsed().as_secs_f64();
+                let elapsed = start.elapsed().as_secs_f64() * 1e3;
                 if i == 0 {
                     first = elapsed;
                 } else {
