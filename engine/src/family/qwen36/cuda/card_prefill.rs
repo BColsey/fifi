@@ -453,7 +453,12 @@ fn run_card_chunk_layer(
                         }
                         _ => m,
                     };
-                    stack.broadcast(0, src, &outs, status, count)?;
+                    // Consecutive broadcasts have one publisher, so the
+                    // publisher's stream alone cannot prove the other cards
+                    // consumed a parity slot before it is reused. Join every
+                    // consumer here even when the eager path's optional
+                    // broadcast synchronization is off.
+                    stack.broadcast_synchronized(0, src, &outs, status, count)?;
                 }
             }
             Stage::Moe => {
