@@ -170,14 +170,28 @@ pub(super) fn chunk_sliced(
             };
             // The fused flash kernel replaces the composite under the flag, inside
             // its validated D envelope; the composite stays the default (and the D 64 form).
+            // REP 8 runs the kernel directly; a REP 6 shape (the dense 24q/4kv) runs the
+            // SAME kernel on a duplicate-padded query - each kv group of 6 real heads padded
+            // to the kernel's 8 with its own first 2 heads, whose output rows are discarded:
+            // a pad head reads real memory, its scores are finite, and its rows never reach
+            // the projection (measured 1.21x over the composite at rows 512 depth 16K, with
+            // flash error below the composite's against the F32 reference).
             let rep = heads / kv_heads;
             if flash_prefill_enabled()
                 && width >= 128
-                && rep == 8
+                && matches!(rep, 6 | 8)
                 && crate::kernels::mlx::q8_flash_envelope(width, Q8_GROUP)
             {
-                ctx.kernels.q8_flash_prefill(
-                    &q,
+                let (flash_q, padded_heads) = if rep == 8 {
+                    (q.share(), heads)
+                } else {
+                    (
+                        pad_rep6_query(ctx.kernels, &q, heads, kv_heads)?,
+                        kv_heads * 8,
+                    )
+                };
+                let flash_out = ctx.kernels.q8_flash_prefill(
+                    &flash_q,
                     &keys,
                     &values,
                     dim(next_len)?,
@@ -186,7 +200,14 @@ pub(super) fn chunk_sliced(
                     Q8_BITS,
                     None,
                     0,
-                )?
+                )?;
+                if padded_heads == heads {
+                    flash_out
+                } else {
+                    let (rows, width) = (q.shape()[2], q.shape()[3]);
+                    ctx.kernels
+                        .slice(&flash_out, &[0, 0, 0, 0], &[1, heads, rows, width])?
+                }
             } else {
                 attend_blocks(ctx.kernels, &q, pos, &blocks, |kernels, q_block, len, n| {
                     kernels.quantized_attention_prefix(
@@ -228,7 +249,36 @@ pub(super) fn chunk_sliced(
 }
 
 /// Runs `attend(kernels, queries, len, block_rows)` once per query block of `blocks` and joins
-/// the outputs on the query axis. A block `[start, stop)` of a chunk at position `pos` attends
+/// Pads a REP 6 query (`[1, heads, rows, width]`, heads = 6 * kv_heads, the dense 24q/4kv)
+/// to the flash kernel's REP 8 head contract: each kv group of 6 real heads is padded to 8
+/// with its own first 2 heads, so a pad row reads real memory, produces finite scores, and
+/// its output row is simply discarded by the caller's slice back to `heads` heads. Five lazy
+/// nodes (four 6-head slices, four 2-head slices, one concatenate), measured noise against
+/// the attention FLOPs at serving depths.
+fn pad_rep6_query(
+    kernels: &mut MlxKernels,
+    q: &ExecutionTensor,
+    heads: u32,
+    kv_heads: u32,
+) -> Result<ExecutionTensor, EngError> {
+    let &[1, _, rows, width] = q.shape() else {
+        return Err(mismatch());
+    };
+    if heads != kv_heads * 6 {
+        return Err(mismatch());
+    }
+    let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(8);
+    for group in 0..kv_heads {
+        let base = group * 6;
+        parts.push(kernels.slice(q, &[0, base, 0, 0], &[1, base + 6, rows, width])?);
+        parts.push(kernels.slice(q, &[0, base, 0, 0], &[1, base + 2, rows, width])?);
+    }
+    let views: Vec<&ExecutionTensor> = parts.iter().collect();
+    kernels.concatenate(&views, 1)
+}
+
+/// Causal attention over the valid prefix in the 256-row blocks of `Q36_PREFILL_QUERY_SLICE`,
+/// concatenating the outputs on the query axis. A block `[start, stop)` of a chunk at position `pos` attends
 /// the first `len = pos + stop` positions with `block_rows = stop - start` queries, and the
 /// causal mask aligned to the last key makes its first query the row `pos + start`: the rows
 /// the whole-chunk call gave. A single block covering the chunk is that whole-chunk call on
@@ -1579,6 +1629,100 @@ mod tests {
         };
         let composite_err = max_err(&composite_flat, &reference);
         let flash_err = max_err(&flash_flat, &reference);
+        eprintln!(
+            "dense REP6 tolerance: composite err {composite_err:.6}, flash err {flash_err:.6}"
+        );
+        assert!(
+            flash_err <= composite_err * 1.10 + 1e-6,
+            "flash err {flash_err:.6} vs composite err {composite_err:.6}"
+        );
+    }
+
+    /// The flash-prefill kernel through the INTEGRATION pad path (`pad_rep6_query` + the
+    /// slice back to 24 heads) at the dense shape (QH 24, KVH 4, D 256, REP 6) matches an
+    /// F32 reference at least as well as the composite prefix attention. Small depth, so it
+    /// runs in the suite; the deep measurement lives in `dense_rep6_flash_pad_bench`.
+    #[test]
+    fn q8_flash_prefill_dense_rep6_tolerance() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let (h, kvh, d, rows) = (24u32, 4u32, 256u32, 96u32);
+        let (group, bits) = (64u32, 8u32);
+        let block: u32 = 256;
+        let kv: Vec<f32> = (0..kvh * rows * d)
+            .map(|i| (((i * 37) % 509) as f32 - 254.0) / 254.0)
+            .collect();
+        let k = upload(&mut kernels, vec![1, kvh, rows, d], &kv);
+        let v = upload(&mut kernels, vec![1, kvh, rows, d], &kv);
+        let (kc, ks, kb) = kernels.quantize_rows(&k, group, bits).unwrap();
+        let (vc, vs, vb) = kernels.quantize_rows(&v, group, bits).unwrap();
+        let keys = QuantizedKv {
+            codes: &kc,
+            scales: &ks,
+            biases: &kb,
+        };
+        let values_q = QuantizedKv {
+            codes: &vc,
+            scales: &vs,
+            biases: &vb,
+        };
+        let qd: Vec<f32> = (0..h * rows * d)
+            .map(|i| (((i * 29) % 389) as f32 - 194.0) / 300.0)
+            .collect();
+        let q = upload(&mut kernels, vec![1, h, rows, d], &qd);
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let mut run_blocks = |f32_path: bool| -> Vec<f32> {
+            let mut start = 0u32;
+            let mut blocks: Vec<ExecutionTensor> = Vec::new();
+            while start < rows {
+                let end = (start + block).min(rows);
+                let q_block = kernels
+                    .slice(&q, &[0, 0, start, 0], &[1, h, end, d])
+                    .unwrap();
+                let out = if f32_path {
+                    kernels.grouped_attention_prefix(&q_block, &k, &v, end, scale, end - start > 1)
+                } else {
+                    kernels.quantized_attention_prefix(
+                        &q_block,
+                        &keys,
+                        &values_q,
+                        end,
+                        scale,
+                        end - start > 1,
+                        group,
+                        bits,
+                    )
+                }
+                .unwrap();
+                blocks.push(out);
+                start = end;
+            }
+            let views: Vec<&ExecutionTensor> = blocks.iter().collect();
+            let whole = kernels.concatenate(&views, 2).unwrap();
+            values(&mut kernels, &whole).unwrap()
+        };
+
+        let reference = run_blocks(true);
+        let composite = run_blocks(false);
+        let padded = pad_rep6_query(&mut kernels, &q, h, kvh).unwrap();
+        assert_eq!(padded.shape(), &[1, kvh * 8, rows, d]);
+        let flash_out = kernels
+            .q8_flash_prefill(&padded, &keys, &values_q, rows, scale, group, bits, None, 0)
+            .unwrap();
+        let flash_out = kernels
+            .slice(&flash_out, &[0, 0, 0, 0], &[1, h, rows, d])
+            .unwrap();
+        let flash = values(&mut kernels, &flash_out).unwrap();
+
+        let max_err = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max)
+        };
+        let composite_err = max_err(&composite, &reference);
+        let flash_err = max_err(&flash, &reference);
         eprintln!(
             "dense REP6 tolerance: composite err {composite_err:.6}, flash err {flash_err:.6}"
         );

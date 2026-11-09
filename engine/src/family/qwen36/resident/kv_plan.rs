@@ -64,17 +64,20 @@ pub(super) fn flash_prefill_enabled() -> bool {
 /// the flash kernel streams the softmax online and never materializes the score matrix, so
 /// a caller planning chunks passes an unbounded budget instead of `SCORE_BUDGET_BYTES`
 /// exactly under this condition - the same one the attention integration gates on. The
-/// whole validated envelope folds in: D >= 128, Q8 cache, and REP 8 (the worker body
-/// hardcodes it), so a shape outside it keeps main's behavior everywhere.
+/// whole validated envelope folds in: D >= 128, Q8 cache, and REP 8 or REP 6 (the worker
+/// body hardcodes REP 8, so a REP 6 shape - the dense 24q/4kv - runs the same kernel on a
+/// duplicate-padded query: each kv group of 6 real heads padded to 8 with its own first 2,
+/// the pad rows' outputs discarded). A shape outside it keeps main's behavior everywhere.
 pub(super) fn flash_prefill_split(
     heads_q: u32,
     heads_kv: u32,
     head_dim: u32,
     kv: crate::family::qwen36::settings::KvDtype,
 ) -> bool {
+    let rep = heads_q / heads_kv.max(1);
     flash_prefill_enabled()
         && head_dim >= 128
-        && heads_q / heads_kv.max(1) == 8
+        && matches!(rep, 6 | 8)
         && kv == crate::family::qwen36::settings::KvDtype::Q8
 }
 
