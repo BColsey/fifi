@@ -57,6 +57,19 @@ jobs:
         run: python3 ../scripts/qual_inventory.py packs
       - name: Tests (CPU-only default features, evidence and minimum-ran floor)
         run: |
+          status=0
           python3 ../scripts/qual_inventory.py collect \
-            --surface host-portable --out "$RUNNER_TEMP/qual-host-portable"
-          cat "$RUNNER_TEMP/qual-host-portable/evidence.json"
+            --surface host-portable --out "$RUNNER_TEMP/qual-host-portable" || status=$?
+          if [ "$status" -ne 0 ]; then
+            for stream in stdout stderr; do
+              log="$RUNNER_TEMP/qual-host-portable/host-portable.$stream"
+              if [ -f "$log" ]; then cat "$log"; fi
+            done
+          fi
+          if [ -f "$RUNNER_TEMP/qual-host-portable/evidence.json" ]; then
+            cat "$RUNNER_TEMP/qual-host-portable/evidence.json"
+          elif [ "$status" -eq 0 ]; then
+            echo 'Qualification completed without evidence.json' >&2
+            exit 1
+          fi
+          exit "$status"
