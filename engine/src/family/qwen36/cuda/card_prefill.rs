@@ -25,6 +25,8 @@
 //! hidden 2048): every exchange of a chunk is one ring sequence. The
 //! driver is enqueue-only until the caller folds the status words.
 
+use std::ffi::OsStr;
+
 use super::{
     card_step::CardStack,
     dims::StepDims,
@@ -46,8 +48,8 @@ use super::{
 use crate::{
     EngError,
     family::qwen36::host::MoeDims as HostMoeDims,
-    kernels::cuda::NativeWeight,
     kernels::cuda::peer_ring::{MAX_VALUES, RingMode},
+    kernels::cuda::{NativeWeight, plan_arena, prefill::attn_prefill::CPF_ATTN_PART_CAP},
 };
 
 /// The largest chunk rows the driver accepts for this shape: every layer
@@ -55,6 +57,62 @@ use crate::{
 /// [`MAX_VALUES`] values.
 pub(crate) fn max_chunk_rows(hidden: usize) -> usize {
     (MAX_VALUES / hidden).max(1)
+}
+
+/// The experimental path is off when unset or zero. Reject malformed settings
+/// rather than silently starting a different path from the one requested.
+pub(super) fn configured_chunk_rows(
+    value: Option<&OsStr>,
+    hidden: usize,
+) -> Result<Option<usize>, EngError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let rows = value
+        .to_str()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| {
+            EngError::BadRequest("Q36_P2P_CHUNK must be a non-negative row count".into())
+        })?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    if hidden == 0 || hidden > MAX_VALUES {
+        return Err(EngError::BadRequest(
+            "card chunk: invalid hidden width".into(),
+        ));
+    }
+    Ok(Some(rows.min(max_chunk_rows(hidden))))
+}
+
+/// The same mailbox also serves eager decode after each chunk.
+pub(super) fn chunk_mailbox_values(
+    rows: usize,
+    hidden: usize,
+    top_k: usize,
+) -> Result<usize, EngError> {
+    let values = rows
+        .max(top_k.max(1))
+        .checked_mul(hidden)
+        .ok_or_else(|| EngError::MemoryPlan("card chunk: mailbox size overflow".into()))?;
+    if values == 0 || values > MAX_VALUES {
+        return Err(EngError::BadRequest(
+            "card chunk: mailbox exceeds transport capacity".into(),
+        ));
+    }
+    Ok(values)
+}
+
+fn chunk_budget(free: usize, needed: usize, floor: usize) -> Result<usize, EngError> {
+    let budget = free.checked_sub(floor).ok_or_else(|| {
+        EngError::MemoryPlan("card chunk: free VRAM is below the configured floor".into())
+    })?;
+    if needed > budget {
+        return Err(EngError::MemoryPlan(format!(
+            "card chunk: needs {needed} bytes but only {budget} are above the VRAM floor"
+        )));
+    }
+    Ok(budget)
 }
 
 /// One card's chunk resources: its arena (the card's narrower slot plan)
@@ -70,6 +128,12 @@ pub(crate) struct CardChunk {
     cards: Vec<CardChunkCard>,
     m_sess: usize,
     hidden: usize,
+}
+
+impl CardChunk {
+    pub(super) fn rows(&self) -> usize {
+        self.m_sess
+    }
 }
 
 /// Builds both cards' chunk arenas and models. `m_chunk` is the chunk row
@@ -93,6 +157,11 @@ pub(super) fn build_card_chunk(
 ) -> Result<CardChunk, EngError> {
     let cards = stack.shards().len();
     let hidden = dims.shape.hidden;
+    if hidden == 0 || hidden > MAX_VALUES {
+        return Err(EngError::BadRequest(
+            "card chunk: invalid hidden width".into(),
+        ));
+    }
     if m_chunk == 0 || m_chunk > max_chunk_rows(hidden) {
         return Err(EngError::BadRequest(format!(
             "card chunk: {m_chunk} rows is outside 1..={}",
@@ -110,14 +179,23 @@ pub(super) fn build_card_chunk(
         };
         let facts = context.mmq_device_facts()?;
         let list = chunk_tensors_for(dims, &geometry, &host_moe, m_chunk, facts.nsm)?;
-        // The card's arena: the same builder the single-device path uses,
-        // over the card's list (zero-filled, part buffer, kv8 staging).
+        let tensors = list.iter().map(|(_, tensor)| *tensor).collect::<Vec<_>>();
+        let needed = plan_arena(&tensors)?
+            .total
+            .checked_add(CPF_ATTN_PART_CAP)
+            .ok_or_else(|| EngError::MemoryPlan("card chunk: arena size overflow".into()))?;
+        let floor = super::pinned::min_free_after_load()?;
+        let budget = chunk_budget(context.memory_info()?.free, needed, floor)?;
+        // The card's arena uses the single-device builder over the card's
+        // list. It includes the part buffer but does not attach KV8 staging;
+        // Q8 attention therefore uses the unstaged fallback.
         let arena = PrefillArena::allocate_list(
             &stack.contexts()[card],
             &stack.streams()[card],
             list,
-            (m_chunk, facts, m_chunk * hidden * 4),
+            (m_chunk, facts, budget),
         )?;
+        chunk_budget(context.memory_info()?.free, 0, floor)?;
         // The card's own views, resolved exactly as the session resolves
         // them, then leaked for the chunk models' process lifetime.
         let weights_card_of = inputs.weights[card];
@@ -178,9 +256,8 @@ pub(super) fn build_card_chunk(
 }
 
 /// Runs one chunk of `tokens.len()` rows at base position `p0` through
-/// both cards. Enqueue-only: the caller syncs the streams and folds the
-/// status words after this returns; a refusal before the first launch
-/// leaves the states untouched.
+/// both cards. It synchronizes and folds the status words before committing
+/// the prefill; the caller poisons the session if any part fails.
 pub(crate) fn run_card_chunk(
     stack: &CardStack,
     states: &mut [ResidentState],
@@ -197,8 +274,16 @@ pub(crate) fn run_card_chunk(
             chunk.m_sess.min(max_chunk_rows(hidden))
         )));
     }
+    if cards == 0 || states.len() != cards || chunk.cards.len() != cards {
+        return Err(EngError::BadRequest(
+            "card chunk: card and state counts differ".into(),
+        ));
+    }
     let capacity = states[0].layout().kv.capacity;
-    if p0 + m > capacity {
+    let end = p0
+        .checked_add(m)
+        .ok_or_else(|| EngError::ContextLimit("card chunk: position overflows".into()))?;
+    if end > capacity {
         return Err(EngError::ContextLimit(format!(
             "card chunk: p0 {p0} + m {m} passes the context cap {capacity}"
         )));
@@ -297,7 +382,7 @@ pub(crate) fn run_card_chunk(
             .read_prefill_status(stream)
             .inspect_err(|_| state.poison())?;
         state
-            .revalidate(stream, p0 + m, read)
+            .revalidate(stream, end, read)
             .inspect_err(|_| state.poison())?;
     }
     Ok(())
@@ -506,4 +591,52 @@ fn moe_io<'b>(
         status: *status,
         scratch: run.views(),
     })
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{MAX_VALUES, chunk_budget, chunk_mailbox_values, configured_chunk_rows};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn chunk_setting_is_explicit_and_bounded() {
+        assert_eq!(configured_chunk_rows(None, 2048).unwrap(), None);
+        assert_eq!(
+            configured_chunk_rows(Some(OsStr::new("0")), 2048).unwrap(),
+            None
+        );
+        assert_eq!(
+            configured_chunk_rows(Some(OsStr::new("1")), 2048).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            configured_chunk_rows(Some(OsStr::new("256")), 2048).unwrap(),
+            Some(256)
+        );
+        assert_eq!(
+            configured_chunk_rows(Some(OsStr::new("9999")), 2048).unwrap(),
+            Some(512)
+        );
+        for value in ["", "-1", "auto", " 256"] {
+            assert!(configured_chunk_rows(Some(OsStr::new(value)), 2048).is_err());
+        }
+        assert!(configured_chunk_rows(Some(OsStr::new("1")), 0).is_err());
+        assert!(configured_chunk_rows(Some(OsStr::new("1")), MAX_VALUES + 1).is_err());
+    }
+
+    #[test]
+    fn mailbox_covers_both_chunk_sums_and_eager_decode() {
+        assert_eq!(chunk_mailbox_values(1, 2048, 8).unwrap(), 8 * 2048);
+        assert_eq!(chunk_mailbox_values(256, 2048, 8).unwrap(), 256 * 2048);
+        assert_eq!(chunk_mailbox_values(512, 2048, 8).unwrap(), MAX_VALUES);
+        assert!(chunk_mailbox_values(513, 2048, 8).is_err());
+        assert!(chunk_mailbox_values(usize::MAX, 2, 8).is_err());
+    }
+
+    #[test]
+    fn chunk_admission_preserves_the_free_vram_floor() {
+        assert_eq!(chunk_budget(100, 30, 70).unwrap(), 30);
+        assert!(chunk_budget(99, 30, 70).is_err());
+        assert!(chunk_budget(69, 0, 70).is_err());
+    }
 }

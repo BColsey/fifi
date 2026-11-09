@@ -324,6 +324,7 @@ fn build_rig_session(
         eos,
         vocab,
         prefix_limits,
+        None,
     )?;
     session.set_skip_prefill_head_for_test(false);
 
