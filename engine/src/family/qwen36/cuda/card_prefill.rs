@@ -287,6 +287,19 @@ pub(crate) fn run_card_chunk(
             slot.ordinal,
         )?;
     }
+    // The close, per card: join the stream, read the prefill status word,
+    // and revalidate the book over the committed rows. A non-zero status
+    // poisons through the book's own rule.
+    for card in 0..cards {
+        let stream = &stack.streams()[card];
+        let state = &mut states[card];
+        let read = state
+            .read_prefill_status(stream)
+            .inspect_err(|_| state.poison())?;
+        state
+            .revalidate(stream, p0 + m, read)
+            .inspect_err(|_| state.poison())?;
+    }
     Ok(())
 }
 
