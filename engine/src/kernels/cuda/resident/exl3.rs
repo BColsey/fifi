@@ -1131,7 +1131,8 @@ impl CudaContext {
     }
 
     /// Every local group stays on the split-2 small-row arithmetic path.
-    /// XH/Z/out slices must be contiguous in group order; inputs may share read-only storage.
+    /// XH/Z slices must be contiguous in group order and the out extents mutually disjoint
+    /// (scattered rows allowed); inputs may share read-only storage.
     /// `gather` selects the shared-table gather variant; the launch plan is unchanged.
     pub(crate) fn exl3_grouped(
         &self,

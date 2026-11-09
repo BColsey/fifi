@@ -13,8 +13,8 @@
 //!
 //! The order of the pairs of the gate and up group is the layout of `ExpertGu`: pick `s` owns
 //! the pairs `2 s` (gate) and `2 s + 1` (up), so each pick's `[gate | up]` row is contiguous for
-//! the SwiGLU. The grouped launch requires the rotated inputs, the partials and the outputs of its
-//! pairs contiguous in group order; `Scratch` places them.
+//! the SwiGLU. The grouped launch requires the rotated inputs and the partials of its pairs
+//! contiguous in group order (`Scratch` places them); the out extents may be scattered rows.
 //!
 //! The block is shared with Qwen3.8 Flash-Next, which picks 10 of 512 experts: an id-indexed
 //! launch takes at most 16 pairs (`CudaContext::exl3_indexed_capacity`; 20 under the opt-in
