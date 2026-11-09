@@ -110,8 +110,14 @@ impl ExecutorOps for TerminalDecode {
 fn a_terminal_cuda_failure_is_process_scoped_for_the_worker() {
     // Requirement 4, the worker's rule: ANY Backend error ends the engine (NativeFailed),
     // the queued jobs are rejected, the late submit is refused, nothing hangs.
-    let engine = spawn_engine(8, |_| {
+    // Hold loading until both jobs are submitted, so the second is definitely queued when
+    // the first job reaches the terminal error.
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let engine = spawn_engine(8, move |_| {
         let inner = FakeExecutor::new(vec![vec![0], vec![0], vec![EOS]], &[EOS], 100_000);
+        entered_tx.send(()).expect("entered make");
+        release_rx.recv().expect("release make");
         Ok((
             TerminalDecode { inner },
             <FakeExecutor as ExecutorOps>::Session::default(),
@@ -119,10 +125,12 @@ fn a_terminal_cuda_failure_is_process_scoped_for_the_worker() {
     })
     .expect("spawn");
     let handle = engine.handle();
+    entered_rx.recv().expect("make is running");
     let (running, mut running_events) = job(&[2], 4);
     let (queued, mut queued_events) = job(&[2], 4);
     handle.try_submit(running).expect("submit running");
     handle.try_submit(queued).expect("submit queued");
+    release_tx.send(()).expect("release make");
     let error = EngError::Backend {
         operation: "execute",
         message: "CUDA backend is terminal after an earlier native failure".to_string(),
@@ -133,8 +141,8 @@ fn a_terminal_cuda_failure_is_process_scoped_for_the_worker() {
     }
     assert_eq!(
         events,
-        vec![JobEvent::Error(error)],
-        "the running job sees the latch error"
+        vec![JobEvent::Started, JobEvent::Error(error)],
+        "the running job starts and then sees the latch error"
     );
     let mut seen = Vec::new();
     while let Some(event) = queued_events.events.blocking_recv() {
