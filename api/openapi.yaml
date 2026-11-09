@@ -415,8 +415,9 @@ components:
         x-session:
           type: string
           description: >-
-            Reserved. This server keeps no named sessions, so a request that
-            sets x-session gets 404.
+            Server extension. A named session binds to the engine that
+            serves its first request and returns to it afterwards. A
+            session id with no model or x-engine gets 404 until bound.
     ToolFunction:
       type: object
       required: [name]

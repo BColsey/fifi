@@ -1,6 +1,7 @@
 /**
- * Streaming text is appended as text nodes through requestAnimationFrame.
- * The conversation is never re-rendered per token.
+ * Streaming text accumulates on the message and the reply's markdown is
+ * re-rendered at most once per animation frame, so code fences settle
+ * as they stream without re-rendering per token.
  */
 
 import {
@@ -26,6 +27,9 @@ import {
 import { formatDuration, formatSpeed, formatTokens } from "./format";
 import { DeadChats } from "./deadchats";
 import { SendGate } from "./sendgate";
+import { renderMarkdown } from "./markdown";
+import { copyText, flashCopied } from "./copy";
+import { composeOutgoing, isLargePaste, isLongMessage, pasteSummary } from "./paste";
 
 export interface ChatHooks {
   onBusyChange(busy: boolean): void;
@@ -56,9 +60,11 @@ interface StreamDom {
   waiting: HTMLElement;
   thinking: HTMLDetailsElement | null;
   thinkingText: Text | null;
-  text: Text;
+  /** The markdown host for the reply text; re-rendered per flush. */
+  textHost: HTMLElement;
   tools: HTMLElement | null;
   meta: HTMLElement;
+  actions: HTMLElement;
 }
 
 export class ChatView {
@@ -84,6 +90,9 @@ export class ChatView {
   private streamChat: ChatRecord | null = null;
   private streamMessage: UiMessage | null = null;
   private toolCalls = new Map<number, { name: string; args: string }>();
+  /** Large pastes held as composer attachments until Send. */
+  private pendingPastes: string[] = [];
+  private pasteTray: HTMLElement | null = null;
 
   constructor(
     column: HTMLElement,
@@ -109,6 +118,16 @@ export class ChatView {
         void this.send();
       }
     });
+    this.input.addEventListener("paste", (e) => {
+      const pasted = e.clipboardData?.getData("text") ?? "";
+      if (pasted === "" || !isLargePaste(pasted)) return; // small paste: normal textarea behaviour
+      e.preventDefault();
+      this.pendingPastes.push(pasted);
+      this.renderPasteTray();
+      this.updateSendEnabled();
+      this.input.focus();
+    });
+    this.buildPasteTray();
     this.sendButton.addEventListener("click", () => {
       if (this.controller !== null) this.controller.abort();
       else void this.send();
@@ -124,21 +143,65 @@ export class ChatView {
   }
 
   private updateSendEnabled(): void {
-    const hasText = this.input.value.trim() !== "";
+    const hasText = this.input.value.trim() !== "" || this.pendingPastes.length > 0;
     const streaming = this.controller !== null;
     this.sendButton.disabled = !streaming && (!hasText || this.offline);
+    // Exactly one icon at a time: the class drives CSS, `hidden` is the
+    // no-CSS fallback. Both together fix the both-icons-visible state.
+    this.sendButton.classList.toggle("is-streaming", streaming);
     this.sendIcon.hidden = streaming;
     this.stopIcon.hidden = !streaming;
     this.sendButton.setAttribute("aria-label", streaming ? "Stop" : "Send");
+    this.sendButton.title = streaming ? "Stop" : "Send";
   }
 
   private autosize(): void {
     this.input.style.height = "auto";
-    this.input.style.height = Math.min(
-      this.input.scrollHeight,
-      5 * 24 + 18
-    ) + "px";
+    const cap = Math.max(5 * 24 + 18, Math.floor(window.innerHeight * 0.4));
+    this.input.style.height = Math.min(this.input.scrollHeight, cap) + "px";
     this.updateSendEnabled();
+  }
+
+  /** The tray above the composer holding large pastes until Send. */
+  private buildPasteTray(): void {
+    const wrap = this.input.closest(".composer-wrap");
+    const composer = this.input.closest(".composer");
+    if (wrap === null || composer === null) return;
+    const tray = document.createElement("div");
+    tray.className = "paste-tray";
+    tray.hidden = true;
+    wrap.insertBefore(tray, composer);
+    this.pasteTray = tray;
+  }
+
+  private renderPasteTray(): void {
+    const tray = this.pasteTray;
+    if (tray === null) return;
+    tray.textContent = "";
+    tray.hidden = this.pendingPastes.length === 0;
+    this.pendingPastes.forEach((text, index) => {
+      const chip = document.createElement("span");
+      chip.className = "paste-chip";
+      const label = document.createElement("span");
+      label.textContent = "Pasted text · " + pasteSummary(text);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "paste-remove";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", "Remove pasted text " + (index + 1));
+      remove.addEventListener("click", () => {
+        this.pendingPastes.splice(index, 1);
+        this.renderPasteTray();
+        this.updateSendEnabled();
+      });
+      chip.append(label, remove);
+      tray.append(chip);
+    });
+  }
+
+  private clearPastes(): void {
+    this.pendingPastes = [];
+    this.renderPasteTray();
   }
 
   /** The partial reply is kept. */
@@ -173,6 +236,7 @@ export class ChatView {
   newChat(): void {
     this.abort();
     this.chat = null;
+    this.clearPastes();
     this.renderEmpty();
     this.input.focus();
   }
@@ -187,9 +251,7 @@ export class ChatView {
     hero.className = "chat-empty-hero";
     const h2 = document.createElement("h2");
     h2.textContent = "Chat with fifi";
-    const p = document.createElement("p");
-    p.textContent = "The model runs on this machine. Messages stay in this browser.";
-    hero.append(h2, p);
+    hero.append(h2);
     this.column.append(hero);
   }
 
@@ -210,8 +272,27 @@ export class ChatView {
       root.className = "msg msg-user";
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.textContent = m.content;
+      if (isLongMessage(m.content)) {
+        bubble.classList.add("bubble-collapsed");
+        const preview = document.createElement("span");
+        preview.textContent = m.content;
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "msg-expand";
+        toggle.textContent = "Show more";
+        toggle.setAttribute("aria-expanded", "false");
+        toggle.addEventListener("click", () => {
+          const expanded = bubble.classList.toggle("bubble-expanded");
+          bubble.classList.toggle("bubble-collapsed", !expanded);
+          toggle.textContent = expanded ? "Show less" : "Show more";
+          toggle.setAttribute("aria-expanded", String(expanded));
+        });
+        bubble.append(preview, toggle);
+      } else {
+        bubble.textContent = m.content;
+      }
       root.append(bubble);
+      root.append(this.buildActions(m));
       return root;
     }
     root.className = "msg msg-assistant";
@@ -219,8 +300,8 @@ export class ChatView {
       root.append(this.buildThinking(m.reasoning, true));
     }
     const text = document.createElement("div");
-    text.className = "msg-text";
-    text.textContent = m.content;
+    text.className = "msg-text markdown";
+    renderMarkdown(text, m.content, { onCopyCode: (code, btn) => void this.copyCode(code, btn) });
     root.append(text);
     if (m.toolCalls !== undefined && m.toolCalls.length > 0) {
       root.append(this.buildTools(m.toolCalls));
@@ -231,11 +312,33 @@ export class ChatView {
       err.textContent = m.errorMessage;
       root.append(err);
     }
-    if (m.replyId !== undefined && m.traceSegs !== undefined) {
-      root.append(this.buildTraceButton(m));
-    }
+    root.append(this.buildActions(m));
     root.append(this.buildMeta(m));
     return root;
+  }
+
+  private async copyCode(code: string, button: HTMLButtonElement): Promise<void> {
+    flashCopied(button, await copyText(code));
+  }
+
+  /** Copy for a whole message, plus the trace shortcut on traced replies. */
+  private buildActions(m: UiMessage): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "msg-actions";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "msg-copy";
+    copy.textContent = "Copy";
+    copy.setAttribute("aria-label", m.role === "user" ? "Copy your message" : "Copy reply");
+    const raw = m.content;
+    copy.addEventListener("click", () => {
+      void copyText(raw).then((ok) => flashCopied(copy, ok));
+    });
+    row.append(copy);
+    if (m.role === "assistant" && m.replyId !== undefined && m.traceSegs !== undefined) {
+      row.append(this.buildTraceButton(m));
+    }
+    return row;
   }
 
   private buildTraceButton(m: UiMessage): HTMLButtonElement {
@@ -264,18 +367,33 @@ export class ChatView {
     const wrap = document.createElement("div");
     wrap.className = "msg-tools";
     for (const call of calls) {
-      const block = document.createElement("div");
-      block.className = "tool-call";
-      const name = document.createElement("div");
-      name.className = "tool-call-name";
-      name.textContent = call.name;
-      const args = document.createElement("pre");
-      args.className = "tool-call-args";
-      args.textContent = call.arguments;
-      block.append(name, args);
-      wrap.append(block);
+      wrap.append(this.buildToolBlock(call.name, call.arguments));
     }
     return wrap;
+  }
+
+  private buildToolBlock(name: string, argsText: string): HTMLElement {
+    const block = document.createElement("div");
+    block.className = "tool-call";
+    const head = document.createElement("div");
+    head.className = "tool-call-head";
+    const nameEl = document.createElement("div");
+    nameEl.className = "tool-call-name";
+    nameEl.textContent = name;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "code-copy";
+    copy.textContent = "Copy";
+    copy.setAttribute("aria-label", "Copy tool arguments");
+    copy.addEventListener("click", () => {
+      void copyText(argsText).then((ok) => flashCopied(copy, ok));
+    });
+    head.append(nameEl, copy);
+    const args = document.createElement("pre");
+    args.className = "tool-call-args";
+    args.textContent = argsText;
+    block.append(head, args);
+    return block;
   }
 
   private buildMeta(m: UiMessage): HTMLElement {
@@ -311,14 +429,18 @@ export class ChatView {
 
   private buildBody(chat: ChatRecord): ChatRequestBody {
     const settings = loadSettings();
-    return buildChatBody(
+    const body = buildChatBody(
       settings,
       buildMessages(settings.drawer.systemMessage, chat.messages)
     );
+    // One named session per chat: turns stick to one engine, and the
+    // monitor groups this chat's rates under its id.
+    body["x-session"] = "web-" + chat.id;
+    return body;
   }
 
   private async send(): Promise<void> {
-    const text = this.input.value.trim();
+    const text = composeOutgoing(this.input.value, this.pendingPastes);
     if (text === "" || this.offline) return;
     const noModel = noModelNotice(loadSettings().model);
     if (noModel !== null) {
@@ -357,6 +479,7 @@ export class ChatView {
       }
 
       this.input.value = "";
+      this.clearPastes();
       this.autosize();
       if (chat.messages.length <= 2) this.renderAll();
       else this.column.append(this.renderMessage(userMsg));
@@ -403,22 +526,26 @@ export class ChatView {
       const dom = this.streamDom;
       if (dom !== null) {
         dom.waiting.remove();
-        dom.text.parentElement?.classList.remove("caret");
+        dom.textHost.classList.remove("caret");
+        // Final render settles any unterminated fence, then actions appear.
+        renderMarkdown(dom.textHost, assistant.content, {
+          onCopyCode: (code, btn) => void this.copyCode(code, btn),
+        });
         if (state === "error" && errorMessage !== undefined) {
           const error = document.createElement("div");
           error.className = "msg-error";
           error.textContent = errorMessage;
           dom.root.insertBefore(error, dom.meta);
         }
-        if (assistant.replyId !== undefined && assistant.traceSegs !== undefined) {
-          dom.root.insertBefore(this.buildTraceButton(assistant), dom.meta);
-        }
+        dom.actions.replaceChildren(...this.buildActions(assistant).childNodes);
+        dom.meta.textContent = "";
       }
       // Keep the placeholder; the error line carries the reason.
       assistant.state = state;
       assistant.errorMessage = errorMessage;
       if (usage !== undefined) assistant.usage = usage;
       assistant.durationMs = performance.now() - this.startedAt;
+      if (dom !== null) dom.meta.textContent = this.buildMeta(assistant).textContent;
       if (!this.deadChats.has(chat.id)) {
         chat.updatedAt = Date.now();
         putChat(chat)
@@ -445,7 +572,7 @@ export class ChatView {
         onRole: () => {
           const dom = this.streamDom;
           if (dom !== null) dom.waiting.textContent =
-            "Admitted. Prefilling \u2014 this can take a while.";
+            "Admitted. Prefilling.";
         },
         onReplyId: (id) => {
           const msg = this.streamMessage;
@@ -538,15 +665,15 @@ export class ChatView {
     waiting.className = "waiting";
     waiting.textContent = "Waiting for admission\u2026";
     const textEl = document.createElement("div");
-    textEl.className = "msg-text caret";
-    const text = document.createTextNode("");
-    textEl.append(text);
+    textEl.className = "msg-text markdown caret";
+    const actions = document.createElement("div");
+    actions.className = "msg-actions";
     const meta = document.createElement("div");
     meta.className = "msg-meta";
-    root.append(waiting, textEl, meta);
+    root.append(waiting, textEl, actions, meta);
     this.column.append(root);
     this.scrollToEnd();
-    return { root, waiting, thinking: null, thinkingText: null, text, tools: null, meta };
+    return { root, waiting, thinking: null, thinkingText: null, textHost: textEl, tools: null, meta, actions };
   }
 
   private scheduleFlush(): void {
@@ -584,11 +711,13 @@ export class ChatView {
     }
     if (this.pendingContent !== "") {
       dom.waiting.remove();
-      dom.text.insertData(dom.text.length, this.pendingContent);
       this.pendingContent = "";
-      // Keep the caret and recent text in view without smooth scrolling.
-      const anchor = dom.text.parentElement ?? dom.root;
-      anchor.scrollIntoView({ block: "end" });
+      // Re-render the markdown built so far. This runs at most once per
+      // animation frame, so code fences and emphasis settle as they stream.
+      renderMarkdown(dom.textHost, msg.content, {
+        onCopyCode: (code, btn) => void this.copyCode(code, btn),
+      });
+      dom.textHost.scrollIntoView({ block: "end" });
     }
   }
 
@@ -598,20 +727,11 @@ export class ChatView {
     if (dom.tools === null) {
       dom.tools = document.createElement("div");
       dom.tools.className = "msg-tools";
-      dom.root.insertBefore(dom.tools, dom.meta);
+      dom.root.insertBefore(dom.tools, dom.actions);
     }
     dom.tools.textContent = "";
     for (const call of this.toolCalls.values()) {
-      const block = document.createElement("div");
-      block.className = "tool-call";
-      const name = document.createElement("div");
-      name.className = "tool-call-name";
-      name.textContent = call.name;
-      const args = document.createElement("pre");
-      args.className = "tool-call-args";
-      args.textContent = call.args;
-      block.append(name, args);
-      dom.tools.append(block);
+      dom.tools.append(this.buildToolBlock(call.name, call.args));
     }
   }
 }

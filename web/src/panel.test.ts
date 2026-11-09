@@ -5,8 +5,12 @@ import {
   engineErrorLines,
   engineStageLine,
   pollPlan,
+  prefixHitRate,
   refreshRecentRows,
+  requestTotals,
   settingsLines,
+  sparkArea,
+  sparkPath,
   systemEngineFor,
 } from "./panel.js";
 import type { Engine, RecentRequest, SystemInfo } from "./api.js";
@@ -235,4 +239,31 @@ test("settings lines carry the resolver's facts verbatim", () => {
   const flint = systemEngineFor(shallow, "f");
   if (flint === null) throw new Error("f must be in the system view");
   deepStrictEqual(settingsLines(flint), []);
+});
+
+test("request totals count outcomes and reuse share", () => {
+  const totals = requestTotals([
+    { ...row(4), prompt_tokens: 100, completion_tokens: 4, reused_tokens: 25 },
+    { ...row(2), outcome: "error", prompt_tokens: 10, completion_tokens: 0, reused_tokens: 0 },
+    { ...row(0), outcome: "cancelled", prompt_tokens: 10, completion_tokens: 0, reused_tokens: 0 },
+  ]);
+  strictEqual(totals.total, 3);
+  strictEqual(totals.ok, 1);
+  strictEqual(totals.errors, 1);
+  strictEqual(totals.cancelled, 1);
+  strictEqual(totals.reuseShare, 25 / 120);
+  strictEqual(requestTotals([]).reuseShare, null);
+});
+
+test("prefix hit rate needs at least one lookup", () => {
+  strictEqual(prefixHitRate({ prefix_hits: 3, prefix_misses: 1 }), 0.75);
+  strictEqual(prefixHitRate({ prefix_hits: 0, prefix_misses: 0 }), null);
+});
+
+test("spark paths need two points and stay in the viewBox", () => {
+  strictEqual(sparkPath([]), "");
+  strictEqual(sparkPath([5]), "");
+  strictEqual(sparkPath([0, 10]), "M0.00,30.00L100.00,4.00");
+  ok(sparkArea([0, 10]).endsWith("L100,32L0,32Z"));
+  strictEqual(sparkPath([null, 5]), "M0.00,30.00L100.00,4.00", "nulls count as zero");
 });

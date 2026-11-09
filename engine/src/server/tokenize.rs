@@ -455,7 +455,7 @@ mod tests {
             for selector in [
                 json!({"model": "other"}),
                 json!({"x-engine": "e9"}),
-                json!({"model": "model-a", "x-session": "s1"}),
+                json!({"x-session": "s1"}),
             ] {
                 let mut body = base.clone();
                 for (key, value) in selector.as_object().expect("object") {

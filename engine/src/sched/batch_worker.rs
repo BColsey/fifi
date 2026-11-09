@@ -358,11 +358,13 @@ pub(super) fn work<E: ExecutorOps>(
                 shared.stop.store(true, Ordering::SeqCst);
                 break;
             };
+            shared.queued.fetch_sub(1, Ordering::SeqCst);
             if shared.stop.load(Ordering::SeqCst) || job.generation.cancel.load(Ordering::SeqCst) {
                 cancel_unstarted(job);
                 continue;
             }
             shared.set_state(EngineState::Busy);
+            send_data(&job.events, JobEvent::Started);
             register(shared, &job);
             // Keep portable handles registered even if session allocation or restore panics.
             let events = job.events.clone();

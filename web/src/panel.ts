@@ -133,3 +133,70 @@ export function settingsLines(engine: SystemEngineFor): string[] {
     (row) => row.key + ": " + row.value + " (" + row.origin + ")"
   );
 }
+
+export interface RequestTotals {
+  total: number;
+  ok: number;
+  errors: number;
+  cancelled: number;
+  promptTokens: number;
+  completionTokens: number;
+  reusedTokens: number;
+  /** Reused share of prompt tokens, 0..1; null with no prompt tokens. */
+  reuseShare: number | null;
+}
+
+/** Sums over the retained ring rows. Counts only; nothing is invented. */
+export function requestTotals(rows: readonly RecentRequest[]): RequestTotals {
+  let ok = 0;
+  let errors = 0;
+  let cancelled = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let reusedTokens = 0;
+  for (const row of rows) {
+    if (row.outcome === "ok") ok++;
+    else if (row.outcome === "error") errors++;
+    else cancelled++;
+    promptTokens += row.prompt_tokens;
+    completionTokens += row.completion_tokens;
+    reusedTokens += row.reused_tokens;
+  }
+  return {
+    total: rows.length,
+    ok,
+    errors,
+    cancelled,
+    promptTokens,
+    completionTokens,
+    reusedTokens,
+    reuseShare: promptTokens > 0 ? reusedTokens / promptTokens : null,
+  };
+}
+
+/** Prefix-cache hit rate 0..1, or null before any lookup is recorded. */
+export function prefixHitRate(cache: { prefix_hits: number; prefix_misses: number }): number | null {
+  const total = cache.prefix_hits + cache.prefix_misses;
+  return total > 0 ? cache.prefix_hits / total : null;
+}
+
+/** An SVG line path for a sparkline in a 100x32 viewBox, Strata-style.
+ * Fewer than two points draws nothing. Nulls count as zero. */
+export function sparkPath(values: readonly (number | null)[], max?: number): string {
+  if (values.length < 2) return "";
+  const nums = values.map((v) => (v === null || !Number.isFinite(v) ? 0 : Math.max(0, v)));
+  const top = Math.max(max ?? 0, ...nums, 1e-9);
+  return nums
+    .map((v, i) => {
+      const x = (i / (nums.length - 1)) * 100;
+      const y = 30 - (v / top) * 26;
+      return (i === 0 ? "M" : "L") + x.toFixed(2) + "," + y.toFixed(2);
+    })
+    .join("");
+}
+
+/** The filled area under sparkPath, closed along the bottom edge. */
+export function sparkArea(values: readonly (number | null)[], max?: number): string {
+  const line = sparkPath(values, max);
+  return line === "" ? "" : line + "L100,32L0,32Z";
+}

@@ -1,5 +1,10 @@
 //! Routing rules: the scheduler design ("Request flow") and the server design
-//! ("Session handling"). The server has anonymous sessions only.
+//! ("Session handling"). A named session (`x-session`) is an attribution
+//! binding: the first request that carries it binds it to the engine that
+//! serves it, and later requests with the same id return to that engine.
+//! It carries no conversation state of its own; the chat history is the
+//! client's. The registry is bounded and evicts the least recently used
+//! binding, after which the id binds again on its next request.
 
 use super::error::ServerError;
 use super::reqlog::{RecentRing, Sink, default_sink};
@@ -71,6 +76,27 @@ pub(crate) struct AppState {
     prompt_memory: Arc<Mutex<HashMap<String, Vec<u32>>>>,
     /// The built frontend directory served at `/`, when configured.
     web_dir: Option<std::path::PathBuf>,
+    /// Named-session bindings: session id → engine id and last use
+    /// (Unix milliseconds). Bounded by SESSION_CAP with LRU eviction.
+    sessions: Mutex<HashMap<String, (String, u64)>>,
+    /// The last GPU telemetry snapshot and when it was taken. The
+    /// monitor polls every 5 s; the subprocess probe is cached so the
+    /// poll cannot spawn it more than once per TELEMETRY_TTL.
+    telemetry: Mutex<Option<(std::time::Instant, serde_json::Value)>>,
+}
+
+/// How long a GPU telemetry snapshot stays fresh.
+pub(crate) const TELEMETRY_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most named sessions the registry holds at once.
+const SESSION_CAP: usize = 256;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 pub(crate) fn unix_seconds() -> u64 {
@@ -96,6 +122,8 @@ impl AppState {
             traces: SamplerTraceRing::default(),
             prompt_memory: Arc::new(Mutex::new(HashMap::new())),
             web_dir: None,
+            sessions: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(None),
         }
     }
 
@@ -188,10 +216,16 @@ impl AppState {
         model: Option<&str>,
     ) -> Result<&EngineEntry, ServerError> {
         if let Some(id) = session {
-            return Err(ServerError::NotFound(format!(
-                "session {id} does not exist"
-            )));
+            return self.resolve_session(id, engine, model);
         }
+        self.resolve_unbound(engine, model)
+    }
+
+    fn resolve_unbound(
+        &self,
+        engine: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<&EngineEntry, ServerError> {
         if let Some(id) = engine {
             return self
                 .engines
@@ -209,6 +243,96 @@ impl AppState {
         Err(ServerError::Eng(EngError::BadRequest(
             "one of model, x-engine, or x-session is required".to_string(),
         )))
+    }
+
+    /// A known session returns to its bound engine; an explicit engine
+    /// or model that disagrees with the binding is a 404, because the
+    /// session does not exist there. An unknown session binds to the
+    /// engine the request's own routing picks, and a session with no
+    /// routing field at all stays a 404, as before sessions existed.
+    fn resolve_session(
+        &self,
+        id: &str,
+        engine: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<&EngineEntry, ServerError> {
+        let bound = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            sessions.get_mut(id).map(|(engine_id, used)| {
+                *used = now_ms();
+                engine_id.clone()
+            })
+        };
+        if let Some(engine_id) = bound {
+            let entry = self
+                .engines
+                .iter()
+                .find(|entry| entry.id == engine_id)
+                .ok_or_else(|| ServerError::NotFound(format!("session {id} does not exist")))?;
+            if let Some(wanted) = engine
+                && wanted != entry.id
+            {
+                return Err(ServerError::NotFound(format!(
+                    "session {id} does not exist on engine {wanted}"
+                )));
+            }
+            if let Some(name) = model
+                && name != entry.model
+            {
+                return Err(ServerError::NotFound(format!(
+                    "session {id} does not exist for model {name}"
+                )));
+            }
+            return Ok(entry);
+        }
+        if engine.is_none() && model.is_none() {
+            return Err(ServerError::NotFound(format!(
+                "session {id} does not exist"
+            )));
+        }
+        let entry = self.resolve_unbound(engine, model)?;
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if sessions.len() >= SESSION_CAP
+            && !sessions.contains_key(id)
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            sessions.remove(&oldest);
+        }
+        sessions.insert(id.to_string(), (entry.id.clone(), now_ms()));
+        // The entry borrows self.engines; the registry holds only its id.
+        Ok(entry)
+    }
+
+    /// A fresh-enough telemetry snapshot, when one is cached.
+    pub(crate) fn telemetry_cached(&self) -> Option<serde_json::Value> {
+        let guard = self
+            .telemetry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match guard.as_ref() {
+            Some((taken, value)) if taken.elapsed() < TELEMETRY_TTL => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn telemetry_store(&self, value: serde_json::Value) {
+        *self
+            .telemetry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((std::time::Instant::now(), value));
+    }
+
+    /// The bound engine id of a session (test introspection).
+    #[cfg(test)]
+    pub(crate) fn session_engine(&self, id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|(engine_id, _)| engine_id.clone())
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -372,13 +496,47 @@ mod tests {
 
     #[test]
     fn x_session_missing_returns_404() {
+        // A session id with no routing field has nothing to bind to.
         let (state, _engines) = two_engines();
         let error = state
-            .resolve(Some("s1"), Some("e1"), Some("model-a"))
+            .resolve(Some("s1"), None, None)
             .err()
             .expect("session");
         assert_eq!(error.status().as_u16(), 404);
         assert_eq!(error.code(), "not_found");
+    }
+
+    #[test]
+    fn a_session_binds_on_first_use_and_sticks_to_its_engine() {
+        let (state, _engines) = two_engines();
+        let first = state
+            .resolve(Some("s1"), None, Some("model-b"))
+            .expect("bind");
+        assert_eq!(first.id, "e2");
+        assert_eq!(state.session_engine("s1").as_deref(), Some("e2"));
+        // Later requests return to the bound engine even when they
+        // name the other engine's model only by session.
+        let again = state.resolve(Some("s1"), None, None).expect("sticky");
+        assert_eq!(again.id, "e2");
+        // An explicit conflicting engine or model does not move it.
+        assert_eq!(
+            state
+                .resolve(Some("s1"), Some("e1"), None)
+                .err()
+                .expect("conflict")
+                .status()
+                .as_u16(),
+            404
+        );
+        assert_eq!(
+            state
+                .resolve(Some("s1"), None, Some("model-a"))
+                .err()
+                .expect("conflict")
+                .status()
+                .as_u16(),
+            404
+        );
     }
 
     #[test]

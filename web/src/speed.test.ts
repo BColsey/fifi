@@ -60,3 +60,20 @@ test("every ok row counts, even without a value", () => {
   strictEqual(summary.okCount, 2);
   strictEqual(summary.decodePerSecond, 5);
 });
+
+test("groups split prefill and decode per key from measured rows", async () => {
+  const { groupSpeed } = await import("./speed.js");
+  const groups = groupSpeed(
+    [
+      { outcome: "ok", decode_tokens_per_second: 10, time_to_first_token_ms: 100, prompt_tokens: 1000, reused_tokens: 200, queue_wait_ms: 4, prefill_ms: 100 },
+      { outcome: "ok", decode_tokens_per_second: 20, time_to_first_token_ms: 300, prompt_tokens: 1000, reused_tokens: 0, queue_wait_ms: 8, prefill_ms: 200 },
+      { outcome: "error", decode_tokens_per_second: 99, time_to_first_token_ms: 999, prompt_tokens: 5, reused_tokens: 0, queue_wait_ms: null, prefill_ms: null },
+    ],
+    () => "e1"
+  );
+  strictEqual(groups.length, 1);
+  strictEqual(groups[0]!.decodePerSecond, 10);
+  strictEqual(groups[0]!.prefillPerSecond, 5000, "(1000-0)/0.2s is the lower middle of 8000 and 5000");
+  strictEqual(groups[0]!.queueWaitMs, 4);
+  strictEqual(groups[0]!.total, 3);
+});

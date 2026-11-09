@@ -368,6 +368,9 @@ fn collect(mut handle: JobHandle) -> Vec<JobEvent> {
     let mut events = Vec::new();
     loop {
         match handle.events.try_recv() {
+            // Started is asserted by the worker tests; sequences here
+            // compare batches and terminal events only.
+            Ok(JobEvent::Started) => {}
             Ok(event) => events.push(event),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return events,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {

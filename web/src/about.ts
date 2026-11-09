@@ -52,12 +52,6 @@ export class AboutView {
     head.append(h2);
     column.append(head);
 
-    const intro = document.createElement("p");
-    intro.className = "sub";
-    intro.textContent =
-      "fifi serves one person at one machine. The model runs here. Nothing leaves it.";
-    column.append(intro);
-
     const { card: connCard, body: connBody } = this.card("Connection");
     const grid = document.createElement("dl");
     grid.className = "fact-grid";
@@ -143,7 +137,7 @@ export class AboutView {
       const settings = loadSettings();
       saveSettings({ ...settings, apiKey: input.value.trim() });
       reason.hidden = false;
-      reason.textContent = "Key saved in this browser.";
+      reason.textContent = "Key saved.";
     });
     const forget = document.createElement("button");
     forget.className = "btn";
@@ -154,12 +148,12 @@ export class AboutView {
       saveSettings({ ...settings, apiKey: "" });
       input.value = "";
       reason.hidden = false;
-      reason.textContent = "Key removed from this browser.";
+      reason.textContent = "Key removed.";
     });
     keyRow.append(input, show, save, forget);
     const keyNote = document.createElement("p");
     keyNote.className = "sub";
-    keyNote.textContent = "Stored in this browser's localStorage, readable by any script on this origin. Use Forget when done.";
+    keyNote.textContent = "Stored in localStorage, readable by any script on this origin. Use Forget when done.";
 
     const themeLabel = document.createElement("label");
     themeLabel.className = "field-label";

@@ -23,7 +23,9 @@ use tokio::sync::mpsc;
 pub(crate) const QUEUE_CAPACITY: usize = 32;
 
 /// Capacity of the bounded output channel of one job (scheduler.md, item 3).
-pub(crate) const EVENT_CAPACITY: usize = 1_024;
+/// 1,024 data/terminal events plus one slot for the `Started` control
+/// event, so the data capacity the slow-client rule sees is unchanged.
+pub(crate) const EVENT_CAPACITY: usize = 1_025;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JobUsage {
@@ -141,6 +143,9 @@ impl Default for PrefixReport {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum JobEvent {
+    /// The engine thread dequeued the job and started work on it. Lets
+    /// the server split queue wait from prefill; carries no payload.
+    Started,
     /// The batch with `finish` set is the last one.
     Batch(DecodeBatch),
     Finished(JobUsage),
@@ -421,10 +426,11 @@ mod tests {
                 .try_send(usage_event())
                 .unwrap_or_else(|error| panic!("event {index} did not fit: {error:?}"));
         }
-        assert_eq!(EVENT_CAPACITY, 1_024);
+        // 1,024 data events plus the one Started control slot.
+        assert_eq!(EVENT_CAPACITY, 1_025);
         assert!(
             job.events.try_send(usage_event()).is_err(),
-            "event 1025 fit into the channel"
+            "event 1026 fit into the channel"
         );
     }
 

@@ -73,6 +73,16 @@ struct Entry<'a> {
     digests: Option<&'a PromptDigest>,
     request_id: Option<&'a str>,
     model: &'a str,
+    /// The engine that took the job, when the handler routed to one.
+    engine: Option<&'a str>,
+    /// The named session the request carried, when it carried one.
+    session: Option<&'a str>,
+    /// Wall-clock start (Unix milliseconds) for monitor timelines.
+    started_at_ms: u64,
+    /// Submit to engine-start, when the engine reported its start.
+    queue_wait: Option<Duration>,
+    /// Engine-start to first batch, on the same condition.
+    prefill: Option<Duration>,
     stream: bool,
     /// The HTTP status that the client got. `None` when the client got no response.
     status: Option<u16>,
@@ -104,14 +114,18 @@ fn rate(tokens: u32, span: Duration) -> Option<f64> {
     Some((f64::from(tokens) / span.as_secs_f64() * 100.0).round() / 100.0)
 }
 
-/// The log line without the final newline. `queue_wait_ms` is always `null`: the engine thread
-/// reports no start event, so the server cannot split the queue wait from the prefill.
+/// The log line without the final newline. `queue_wait_ms` and
+/// `prefill_ms` are null until the engine thread reports its start
+/// (`JobEvent::Started`); a refused or never-started job keeps null.
 fn render(entry: &Entry<'_>) -> String {
     let mut line = json!({
         "request_id": entry.request_id,
         "method": entry.method,
         "endpoint": entry.endpoint,
         "model": entry.model,
+        "engine": entry.engine,
+        "session": entry.session,
+        "started_at_ms": entry.started_at_ms,
         "stream": entry.stream,
         "status": entry.status,
         "outcome": entry.outcome.as_str(),
@@ -120,7 +134,8 @@ fn render(entry: &Entry<'_>) -> String {
         "prompt_tokens": entry.prompt_tokens,
         "completion_tokens": entry.completion_tokens,
         "reused_tokens": entry.reused_tokens,
-        "queue_wait_ms": null,
+        "queue_wait_ms": entry.queue_wait.map(millis),
+        "prefill_ms": entry.prefill.map(millis),
         "time_to_first_token_ms": entry.first_token.map(millis),
         "decode_tokens_per_second": entry.decode.and_then(|(tokens, span)| rate(tokens, span)),
     });
@@ -228,15 +243,17 @@ const DIGEST_KEY: u64 = 0x5f1f_3a7c_d2e1_9b04;
 /// The keys a ring row exposes: an ALLOWLIST, so the digest keys,
 /// `prefix_*`, and `shadow_*` (prefix-overlap detail) never reach the
 /// panel, and a key a future `render` adds cannot leak automatically.
-/// `queue_wait_ms` stays out — the line writes it as a permanent null
-/// (the engine thread reports no start event), and a forever-null
-/// column is noise. `reused_tokens` stays in, so reuse is visible on
-/// the panel.
-const RING_KEYS: [&str; 14] = [
+/// `engine`, `started_at_ms`, `queue_wait_ms`, and `prefill_ms` are in:
+/// the panel groups rates by engine and splits queue from prefill.
+/// `reused_tokens` stays in, so reuse is visible on the panel.
+const RING_KEYS: [&str; 19] = [
     "request_id",
     "method",
     "endpoint",
     "model",
+    "engine",
+    "session",
+    "started_at_ms",
     "stream",
     "status",
     "outcome",
@@ -245,6 +262,8 @@ const RING_KEYS: [&str; 14] = [
     "prompt_tokens",
     "completion_tokens",
     "reused_tokens",
+    "queue_wait_ms",
+    "prefill_ms",
     "time_to_first_token_ms",
     "decode_tokens_per_second",
 ];
@@ -374,6 +393,12 @@ pub(crate) struct RequestLog {
     prompt_tokens: u32,
     /// Set when the queue admits the job. A stream sends its headers at that moment.
     admitted: Option<Instant>,
+    /// Set when the engine thread reports it started the job
+    /// (`JobEvent::Started` read by the reply pump).
+    started: Option<Instant>,
+    engine: Option<String>,
+    session: Option<String>,
+    started_at_ms: u64,
     first_batch: Option<(Instant, u32)>,
     last_batch: Option<Instant>,
     completion_tokens: u32,
@@ -410,6 +435,14 @@ impl RequestLog {
             request_id: None,
             prompt_tokens,
             admitted: None,
+            started: None,
+            engine: None,
+            session: None,
+            started_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                }),
             first_batch: None,
             last_batch: None,
             completion_tokens: 0,
@@ -437,6 +470,21 @@ impl RequestLog {
 
     pub(crate) fn admit(&mut self) {
         self.admitted = Some((self.clock)());
+    }
+
+    pub(crate) fn set_engine(&mut self, id: &str) {
+        self.engine = Some(id.to_string());
+    }
+
+    pub(crate) fn set_session(&mut self, id: &str) {
+        self.session = Some(id.to_string());
+    }
+
+    /// The engine thread started this job. First call wins.
+    pub(crate) fn started(&mut self) {
+        if self.started.is_none() {
+            self.started = Some((self.clock)());
+        }
     }
 
     pub(crate) fn batch(&mut self, tokens: u32) {
@@ -524,12 +572,25 @@ impl RequestLog {
             )),
             _ => None,
         };
+        let queue_wait = match (self.admitted, self.started) {
+            (Some(admitted), Some(started)) => Some(started.duration_since(admitted)),
+            _ => None,
+        };
+        let prefill = match (self.started, self.first_batch) {
+            (Some(started), Some((first, _))) => Some(first.duration_since(started)),
+            _ => None,
+        };
         let entry = Entry {
             method: self.method,
             endpoint: self.endpoint,
             digests: self.digests.as_ref(),
             request_id: self.request_id.as_deref(),
             model: &self.model,
+            engine: self.engine.as_deref(),
+            session: self.session.as_deref(),
+            started_at_ms: self.started_at_ms,
+            queue_wait,
+            prefill,
             stream: self.stream,
             status,
             outcome,
@@ -644,16 +705,18 @@ mod tests {
     /// The keys of every line without a prefix boundary, sorted.
     /// The keys of a route-produced row: the serving path always sets the
     /// prompt digests after the prompt renders.
-    const ROUTE_KEYS: [&str; 20] = [
+    const ROUTE_KEYS: [&str; 24] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
+        "engine",
         "error_code",
         "finish_reason",
         "lcp_prev_request_tokens",
         "method",
         "model",
         "outcome",
+        "prefill_ms",
         "prompt_hash_1024",
         "prompt_hash_4096",
         "prompt_hash_anchors",
@@ -662,24 +725,30 @@ mod tests {
         "queue_wait_ms",
         "request_id",
         "reused_tokens",
+        "session",
+        "started_at_ms",
         "status",
         "stream",
         "time_to_first_token_ms",
     ];
 
-    const KEYS: [&str; 15] = [
+    const KEYS: [&str; 19] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
+        "engine",
         "error_code",
         "finish_reason",
         "method",
         "model",
         "outcome",
+        "prefill_ms",
         "prompt_tokens",
         "queue_wait_ms",
         "request_id",
         "reused_tokens",
+        "session",
+        "started_at_ms",
         "status",
         "stream",
         "time_to_first_token_ms",
@@ -687,16 +756,18 @@ mod tests {
 
     /// The keys of a line whose request carried a prefix boundary: the keys above plus
     /// the `prefix_*` keys, sorted.
-    const PREFIX_KEYS: [&str; 31] = [
+    const PREFIX_KEYS: [&str; 35] = [
         "completion_tokens",
         "decode_tokens_per_second",
         "endpoint",
+        "engine",
         "error_code",
         "finish_reason",
         "lcp_prev_request_tokens",
         "method",
         "model",
         "outcome",
+        "prefill_ms",
         "prefix_bytes",
         "prefix_entries",
         "prefix_evictions",
@@ -716,6 +787,8 @@ mod tests {
         "queue_wait_ms",
         "request_id",
         "reused_tokens",
+        "session",
+        "started_at_ms",
         "status",
         "stream",
         "time_to_first_token_ms",
@@ -770,6 +843,8 @@ mod tests {
             for key in [
                 "method",
                 "endpoint",
+                // Wall-clock start: real, but no test can pin its value.
+                "started_at_ms",
                 "prompt_hash_1024",
                 "prompt_hash_4096",
                 "prompt_hash_full",
@@ -1108,6 +1183,11 @@ mod tests {
             digests: None,
             request_id: None,
             model: "m",
+            engine: None,
+            session: None,
+            started_at_ms: 0,
+            queue_wait: None,
+            prefill: None,
             stream: false,
             status: None,
             outcome: Outcome::Cancelled,
@@ -1127,6 +1207,11 @@ mod tests {
         let entry = Entry {
             request_id: Some("chatcmpl-0000000000000007"),
             model: "demo",
+            engine: None,
+            session: None,
+            started_at_ms: 0,
+            queue_wait: None,
+            prefill: None,
             stream: true,
             status: Some(200),
             outcome: Outcome::Ok,
@@ -1146,6 +1231,9 @@ mod tests {
                 "endpoint": null,
                 "request_id": "chatcmpl-0000000000000007",
                 "model": "demo",
+                "engine": null,
+                "session": null,
+                "started_at_ms": 0,
                 "stream": true,
                 "status": 200,
                 "outcome": "ok",
@@ -1155,6 +1243,7 @@ mod tests {
                 "completion_tokens": 10,
                 "reused_tokens": 3,
                 "queue_wait_ms": null,
+                "prefill_ms": null,
                 "time_to_first_token_ms": 1500.0,
                 "decode_tokens_per_second": 4.5,
             })
@@ -1170,6 +1259,7 @@ mod tests {
             "error_code",
             "finish_reason",
             "queue_wait_ms",
+            "prefill_ms",
             "time_to_first_token_ms",
             "decode_tokens_per_second",
         ] {
@@ -1257,6 +1347,9 @@ mod tests {
                 "method": null,
                 "endpoint": null,
                 "model": "m",
+                "engine": null,
+                "session": null,
+                "started_at_ms": 0,
                 "stream": false,
                 "status": null,
                 "outcome": "cancelled",
@@ -1266,6 +1359,7 @@ mod tests {
                 "completion_tokens": 0,
                 "reused_tokens": 0,
                 "queue_wait_ms": null,
+                "prefill_ms": null,
                 "time_to_first_token_ms": null,
                 "decode_tokens_per_second": null,
                 "prefix_hit": "root",
@@ -1400,11 +1494,12 @@ mod tests {
         assert_eq!(line["prompt_tokens"], 21);
         assert_eq!(line["completion_tokens"], 5);
         assert_eq!(line["reused_tokens"], 0);
-        assert_eq!(line["queue_wait_ms"], Value::Null);
+        assert_eq!(line["queue_wait_ms"], 2.0);
+        assert_eq!(line["prefill_ms"], 2.0);
         // The clock of a test request stamps every moment 2 ms after the last, so the timings are
         // exact: the first token needs 2 ms, and the 4 later tokens need 8 ms, which gives exactly
         // 500 tokens per second, the cap that the wall-clock test flaked on.
-        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
+        assert_eq!(line["time_to_first_token_ms"], 4.0, "{line}");
         assert_eq!(line["decode_tokens_per_second"], 500.0, "{line}");
     }
 
@@ -1504,6 +1599,8 @@ mod tests {
         let want = json!({
             "request_id": reply["id"],
             "model": "model-a",
+            "engine": "e1",
+                "session": null,
             "stream": false,
             "status": 200,
             "outcome": "ok",
@@ -1512,8 +1609,9 @@ mod tests {
             "prompt_tokens": 2_131,
             "completion_tokens": 2,
             "reused_tokens": 0,
-            "queue_wait_ms": null,
-            "time_to_first_token_ms": 2.0,
+            "queue_wait_ms": 2.0,
+            "prefill_ms": 2.0,
+            "time_to_first_token_ms": 4.0,
             "decode_tokens_per_second": 500.0,
             "prefix_hit": "miss",
             "prefix_entries": 2,
@@ -1661,6 +1759,8 @@ mod tests {
         let want = json!({
             "request_id": reply["id"],
             "model": "model-a",
+            "engine": "e1",
+                "session": null,
             "stream": false,
             "status": 200,
             "outcome": "ok",
@@ -1669,8 +1769,9 @@ mod tests {
             "prompt_tokens": 21,
             "completion_tokens": 5,
             "reused_tokens": 0,
-            "queue_wait_ms": null,
-            "time_to_first_token_ms": 2.0,
+            "queue_wait_ms": 2.0,
+            "prefill_ms": 2.0,
+            "time_to_first_token_ms": 4.0,
             "decode_tokens_per_second": 500.0,
         });
         assert_eq!(Capture::row_like(&capture.writes()[0]), want);
@@ -1742,7 +1843,7 @@ mod tests {
         assert_eq!(line["finish_reason"], Value::Null);
         let produced = line["completion_tokens"].as_u64().expect("count");
         assert!((1..50_000).contains(&produced), "{produced}");
-        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
+        assert_eq!(line["time_to_first_token_ms"], 4.0, "{line}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1780,13 +1881,19 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let lines = capture.lines_with_keys(&ROUTE_KEYS);
         assert_eq!(lines.len(), 1, "{lines:?}");
+        // started_at_ms is wall clock: present, but no value can be pinned.
+        assert!(lines[0]["started_at_ms"].is_number(), "{lines:?}");
+        let mut got = lines[0].clone();
+        got.as_object_mut().expect("object").remove("started_at_ms");
         assert_eq!(
-            lines[0],
+            got,
             json!({
                 "request_id": null,
                 "method": "POST",
                 "endpoint": "/v1/chat/completions",
                 "model": "model-a",
+                "engine": "e1",
+                "session": null,
                 "stream": false,
                 "status": 409,
                 "outcome": "error",
@@ -1796,6 +1903,7 @@ mod tests {
                 "completion_tokens": 0,
                 "reused_tokens": 0,
                 "queue_wait_ms": null,
+                "prefill_ms": null,
                 "time_to_first_token_ms": null,
                 "decode_tokens_per_second": null,
                 "prompt_hash_1024": "ea09b61c2b659ce4",
@@ -1906,7 +2014,7 @@ mod tests {
         assert_eq!(line["error_code"], "backend_error");
         assert_eq!(line["finish_reason"], Value::Null);
         assert_eq!(line["completion_tokens"], 2);
-        assert_eq!(line["time_to_first_token_ms"], 2.0, "{line}");
+        assert_eq!(line["time_to_first_token_ms"], 4.0, "{line}");
         let raw = &capture.writes()[0];
         assert!(
             !raw.contains("Metal"),

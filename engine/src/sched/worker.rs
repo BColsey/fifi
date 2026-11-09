@@ -31,7 +31,7 @@ use crate::family::executor::{ExecutorOps, GenerationState};
 use crate::family::session::{SaveKind, StoreLimits};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -147,6 +147,8 @@ struct Shared {
     running: Mutex<Option<Arc<AtomicBool>>>,
     /// Opt-in window jobs only. The legacy single-slot path never registers here.
     active: Mutex<Vec<ActiveJob>>,
+    /// Jobs submitted but not yet dequeued by the engine thread.
+    queued: AtomicUsize,
 }
 
 struct ActiveJob {
@@ -163,6 +165,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             running: Mutex::new(None),
             active: Mutex::new(Vec::new()),
+            queued: AtomicUsize::new(0),
         }
     }
 
@@ -270,7 +273,14 @@ impl EngineHandle {
             .map_err(|error| match error {
                 TrySendError::Full(_) => SubmitError::QueueFull,
                 TrySendError::Disconnected(_) => SubmitError::Unavailable,
-            })
+            })?;
+        self.shared.queued.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Jobs waiting for the engine thread to dequeue them.
+    pub(crate) fn queued(&self) -> usize {
+        self.shared.queued.load(Ordering::SeqCst)
     }
 }
 
@@ -452,6 +462,9 @@ fn cancel_unstarted(job: Job) {
 fn drain(jobs: &Receiver<Message>, finish: fn(Job)) {
     while let Ok(message) = jobs.try_recv() {
         if let Message::Job(job) = message {
+            // No shared counter here: drain runs on shutdown paths where
+            // the count is discarded with the engine. The live paths
+            // decrement at their own dequeue points.
             finish(job);
         }
     }
@@ -580,6 +593,7 @@ fn work<E, F>(
         return;
     }
     while let Ok(Message::Job(job)) = jobs.recv() {
+        shared.queued.fetch_sub(1, Ordering::SeqCst);
         if shared.state() == EngineState::NativeFailed {
             reject(job);
             continue;
@@ -598,6 +612,7 @@ fn work<E, F>(
             generation.cancel.store(true, Ordering::SeqCst);
         }
         shared.set_state(EngineState::Busy);
+        send_data(&events, JobEvent::Started);
         let events = current.insert(events);
         let plan = PromptPlan {
             tokens: &prompt,
@@ -1487,9 +1502,13 @@ mod tests {
     }
 
     fn collect(mut handle: JobHandle) -> Vec<JobEvent> {
+        // Started is asserted by its own test; the sequence tests below
+        // compare batches and terminal events only.
         let mut events = Vec::new();
         while let Some(event) = handle.events.blocking_recv() {
-            events.push(event);
+            if !matches!(event, JobEvent::Started) {
+                events.push(event);
+            }
         }
         events
     }
@@ -1640,6 +1659,20 @@ mod tests {
         collect(events)
     }
 
+    #[test]
+    fn started_arrives_before_the_first_batch_and_queued_returns_to_zero() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let engine = start_spy(2, Spy::new(vec![vec![0]], &log));
+        let handle = engine.handle();
+        let (job, mut events) = job(&[7]);
+        handle.try_submit(job).expect("submit");
+        let first = events.events.blocking_recv().expect("first event");
+        assert!(matches!(first, JobEvent::Started), "{first:?}");
+        while events.events.blocking_recv().is_some() {}
+        assert_eq!(handle.queued(), 0);
+        drop(engine);
+    }
+
     /// The events of a job that stops at once, uses no extra tokens, and reports a store that
     /// holds nothing and restored nothing.
     fn stop_events(prompt: u32, reused: u32) -> Vec<JobEvent> {
@@ -1669,7 +1702,14 @@ mod tests {
         let (request, mut events) = job(&[2, 2, 2]);
         engine.handle().try_submit(request).expect("submit");
         let entered = entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-        let first = events.events.try_recv().ok();
+        // Started precedes the first batch; the batch is what this test times.
+        let first = loop {
+            let event = events.events.try_recv().ok();
+            if matches!(event, Some(JobEvent::Started)) {
+                continue;
+            }
+            break event;
+        };
         let _ = release_tx.send(());
         let rest = collect(events);
         engine.shutdown();

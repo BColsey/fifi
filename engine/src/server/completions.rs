@@ -157,6 +157,7 @@ async fn submit(state: &AppState, input: CompletionInput) -> Result<Submitted, S
         reply: ReplyMode::Raw,
         method: "POST",
         endpoint: "/v1/completions",
+        session: input.session.clone(),
     };
     admit(state, entry, admission)
 }
@@ -398,11 +399,9 @@ mod tests {
     async fn routing_failures_return_the_status_of_the_chat_route() {
         let engine = testkit::engine(testkit::script("ok"));
         let app = app(&engine, 4_096);
-        for extra in [
-            json!({"model": "other"}),
-            json!({"x-engine": "e9"}),
-            json!({"x-session": "s1"}),
-        ] {
+        // Session routing (bind, stick, conflict) is covered in state.rs;
+        // a session with no routing field 404s there as an unknown id.
+        for extra in [json!({"model": "other"}), json!({"x-engine": "e9"})] {
             let (status, body) = post(&app, &request(extra.clone())).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{extra}");
             assert_eq!(error_code(&body), "not_found");

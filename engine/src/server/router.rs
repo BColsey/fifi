@@ -36,6 +36,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
     let bearer_routes = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/system", get(system))
+        .route("/v1/telemetry", get(telemetry))
         .route("/v1/recent-requests", get(recent_requests))
         .route("/v1/sampler-trace", get(get_sampler_trace))
         .route("/v1/route-trace", get(get_route_trace))
@@ -221,6 +222,7 @@ async fn system(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 "id": entry.id,
                 "model": entry.model,
                 "state": state_name(entry.handle.state()),
+                "queued": entry.handle.queued(),
                 "context_limit": entry.context_limit,
                 // The retained rows the engine started with (empty where a
                 // family composes no per-key origins) — not a re-resolution.
@@ -248,6 +250,72 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
 /// first (see `reqlog` for the allowlist and the endpoint filter). Dumb by
 /// agreement: no filtering, no aggregation — the panel computes its own
 /// medians.
+/// GPU telemetry for the monitor. The probe runs `nvidia-smi` as a
+/// subprocess: a failed driver tool cannot latch the serving backend
+/// the way an in-process CUDA query could (the rule /v1/system
+/// states). No GPU tool, no rows — `error` says why, with status 200,
+/// because the absence is data for the panel, not a request failure.
+async fn telemetry(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    if let Some(cached) = state.telemetry_cached() {
+        return Json(cached);
+    }
+    let probed = tokio::task::spawn_blocking(probe_gpus).await;
+    let value = match probed {
+        Ok(value) => value,
+        Err(_) => json!({"gpus": [], "source": "nvidia-smi", "error": "probe task failed"}),
+    };
+    state.telemetry_store(value.clone());
+    Json(value)
+}
+
+fn probe_gpus() -> serde_json::Value {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            json!({"gpus": parse_gpu_csv(&String::from_utf8_lossy(&out.stdout)), "source": "nvidia-smi", "error": null})
+        }
+        Ok(out) => json!({
+            "gpus": [],
+            "source": "nvidia-smi",
+            "error": format!("nvidia-smi exited {}", out.status),
+        }),
+        Err(error) => json!({
+            "gpus": [],
+            "source": "nvidia-smi",
+            "error": format!("nvidia-smi unavailable: {error}"),
+        }),
+    }
+}
+
+/// One JSON object per GPU line of `nvidia-smi` CSV output. Memory
+/// converts MiB to bytes; unparseable fields stay null, never zero.
+fn parse_gpu_csv(text: &str) -> Vec<serde_json::Value> {
+    let number = |field: Option<&str>| -> Option<f64> { field?.trim().parse::<f64>().ok() };
+    let mib_bytes = |field: Option<&str>| -> Option<u64> {
+        number(field).map(|mib| (mib * 1024.0 * 1024.0) as u64)
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split(',').collect();
+            json!({
+                "index": number(fields.first().copied()).map(|v| v as u64),
+                "name": fields.get(1).map(|name| name.trim().to_string()),
+                "util_percent": number(fields.get(2).copied()),
+                "mem_used_bytes": mib_bytes(fields.get(3).copied()),
+                "mem_total_bytes": mib_bytes(fields.get(4).copied()),
+                "temp_c": number(fields.get(5).copied()),
+                "power_w": number(fields.get(6).copied()),
+            })
+        })
+        .collect()
+}
+
 async fn recent_requests(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(json!({ "requests": state.recent_ring().rows_newest_first() }))
 }
@@ -660,5 +728,30 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("engine e1 failed: "), "{lines:?}");
         assert!(lines[0].contains("fixture load failure"), "{lines:?}");
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::parse_gpu_csv;
+
+    #[test]
+    fn gpu_csv_rows_parse_with_mib_converted_to_bytes() {
+        let rows = parse_gpu_csv(
+            "0, NVIDIA GeForce RTX 3090, 39, 1009, 24576, 55, 114.05\n1, Fake GPU, 0, 0, 8192, 30, 12.5\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "NVIDIA GeForce RTX 3090");
+        assert_eq!(rows[0]["util_percent"], 39.0);
+        assert_eq!(rows[0]["mem_total_bytes"], 24576_u64 * 1024 * 1024);
+        assert_eq!(rows[1]["temp_c"], 30.0);
+    }
+
+    #[test]
+    fn gpu_csv_unparseable_fields_stay_null() {
+        let rows = parse_gpu_csv("0, GPU, N/A, N/A, N/A, N/A, N/A\n\n");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["util_percent"].is_null());
+        assert!(rows[0]["mem_used_bytes"].is_null());
     }
 }

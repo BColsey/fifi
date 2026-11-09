@@ -44,7 +44,7 @@ Request fields:
 | `x-thinking` | `default` | Server extension: `on`, `off` or `default` (the chat template decides). |
 | `chat_template_kwargs` | none | Only `enable_thinking` is accepted: `true` acts as `x-thinking: on`, `false` as `off`. |
 | `x-engine` | none | Server extension: the `id` of the engine to use. Overrides `model`. An unknown id returns `404`. |
-| `x-session` | none | Reserved; returns `404`. |
+| `x-session` | none | Binds to the serving engine on first use and sticks to it; unbound with no other routing field returns `404`. |
 
 The request needs `model` or `x-engine`.
 

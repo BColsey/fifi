@@ -133,6 +133,8 @@ async fn a_dropped_request_cancels_a_queued_job_before_it_starts() {
     // before it has been passed over.
     let (job, mut sentinel) = Job::new(vec![104], testkit::generation()).expect("job");
     handle.try_submit(job).expect("submit");
+    let started = sentinel.events.recv().await;
+    assert!(matches!(started, Some(JobEvent::Started)), "{started:?}");
     let first = sentinel.events.recv().await;
     assert!(matches!(first, Some(JobEvent::Batch(_))), "{first:?}");
     sentinel.cancel();

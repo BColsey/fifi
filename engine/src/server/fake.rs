@@ -211,7 +211,9 @@ mod tests {
         fake.engine.handle().try_submit(job).expect("submit");
         let mut events = Vec::new();
         while let Some(event) = handle.events.blocking_recv() {
-            events.push(event);
+            if !matches!(event, JobEvent::Started) {
+                events.push(event);
+            }
         }
         let text = events
             .iter()
@@ -404,6 +406,8 @@ mod tests {
         let (job, mut handle) =
             Job::new(vec![104, 105], GenerationState::new(decoder)).expect("job");
         fake.engine.handle().try_submit(job).expect("submit");
+        let started = handle.events.blocking_recv().expect("started");
+        assert!(matches!(started, JobEvent::Started));
         let first = handle.events.blocking_recv().expect("first batch");
         assert!(matches!(&first, JobEvent::Batch(batch) if batch.finish.is_none()));
         handle.cancel();

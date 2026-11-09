@@ -45,6 +45,8 @@ export interface SystemEngine {
   id: string;
   model: string;
   state: EngineState;
+  /** Jobs submitted but not yet dequeued; absent on older builds. */
+  queued?: number;
   context_limit: number;
   /** The rows the engine started with, as `config effective` prints
    * them — not a re-resolution. Empty where a family composes no
@@ -103,6 +105,8 @@ export type FinishReason = "stop" | "length" | "tool_calls";
 
 export interface ChatRequestBody {
   model?: string;
+  /** Named session for sticky routing and monitor attribution. */
+  "x-session"?: string;
   messages: ChatMessage[];
   temperature?: number;
   top_p?: number;
@@ -281,21 +285,31 @@ export function getSystem(signal?: AbortSignal): Promise<SystemInfo> {
   return getJson<SystemInfo>("/v1/system", true, signal);
 }
 
-/** One row of the monitor's recent-request ring: the log line reduced to
- * the server's allowlist, then to the fields this panel reads — the
- * request/metadata keys (request_id, method, endpoint), finish_reason,
- * and the log's permanent-null queue_wait_ms stay off the wire type.
- * reused_tokens is kept on the wire type for future use; the card does
- * not render it today. */
+/** One row of the monitor's recent-request ring: the log line reduced
+ * to the server's allowlist (see reqlog RING_KEYS), then to the fields
+ * this panel reads. The request/metadata keys (request_id, method,
+ * endpoint) stay off the wire type. */
 export interface RecentRequest {
   model: string;
+  /** The engine that took the job; null on rows from older builds. */
+  engine?: string | null;
+  /** The named session the request carried; null when it carried none. */
+  session?: string | null;
+  /** Wall-clock start, Unix milliseconds; absent on older builds. */
+  started_at_ms?: number;
   stream: boolean;
   status: number | null;
   outcome: "ok" | "error" | "cancelled";
   error_code: string | null;
+  /** The wire row carries it (see reqlog RING_KEYS); older builds may not. */
+  finish_reason?: string | null;
   prompt_tokens: number;
   completion_tokens: number;
   reused_tokens: number;
+  /** Submit to engine start; null when the job never started. */
+  queue_wait_ms?: number | null;
+  /** Engine start to first batch; null on the same condition. */
+  prefill_ms?: number | null;
   time_to_first_token_ms: number | null;
   decode_tokens_per_second: number | null;
 }
@@ -307,6 +321,27 @@ export interface RecentRequestBody {
 /** The server extension behind the GUI's live speed panel. */
 export function listRecentRequests(signal?: AbortSignal): Promise<RecentRequestBody> {
   return getJson<RecentRequestBody>("/v1/recent-requests", true, signal);
+}
+
+export interface GpuInfo {
+  index: number | null;
+  name: string | null;
+  util_percent: number | null;
+  mem_used_bytes: number | null;
+  mem_total_bytes: number | null;
+  temp_c: number | null;
+  power_w: number | null;
+}
+
+export interface TelemetryInfo {
+  gpus: GpuInfo[];
+  source: string;
+  error: string | null;
+}
+
+/** Per-GPU telemetry (subprocess probe on the server, 2 s cache). */
+export function getTelemetry(signal?: AbortSignal): Promise<TelemetryInfo> {
+  return getJson<TelemetryInfo>("/v1/telemetry", true, signal);
 }
 
 export interface SamplerCandidate {

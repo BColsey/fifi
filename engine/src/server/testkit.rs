@@ -657,6 +657,8 @@ mod tests {
         let engine = refusing_engine(EngError::MemoryPlan("no room".to_string()));
         let (job, mut handle) = Job::new(vec![104], generation()).expect("job");
         engine.handle().try_submit(job).expect("submit");
+        let started = handle.events.blocking_recv().expect("started");
+        assert_eq!(started, JobEvent::Started);
         let event = handle.events.blocking_recv().expect("an event");
         assert_eq!(
             event,
@@ -674,10 +676,11 @@ mod tests {
         probes.engine.handle().try_submit(job).expect("submit");
         let mut ids = std::collections::BTreeSet::new();
         for _ in 0..40 {
-            let Some(JobEvent::Batch(batch)) = handle.events.blocking_recv() else {
-                panic!("expected a batch");
-            };
-            ids.extend(batch.tokens);
+            match handle.events.blocking_recv() {
+                Some(JobEvent::Started) => continue,
+                Some(JobEvent::Batch(batch)) => ids.extend(batch.tokens),
+                _ => panic!("expected a batch"),
+            }
         }
         handle.cancel();
         assert_eq!(ids, std::collections::BTreeSet::from([0, 1]));
@@ -695,12 +698,15 @@ mod tests {
         probes.engine.handle().try_submit(job).expect("submit");
         let mut finishes = Vec::new();
         while finishes.len() < 5 {
-            let Some(JobEvent::Batch(batch)) = handle.events.blocking_recv() else {
-                break;
-            };
-            finishes.push((batch.tokens.len(), batch.finish));
-            if batch.finish.is_some() {
-                break;
+            match handle.events.blocking_recv() {
+                Some(JobEvent::Started) => continue,
+                Some(JobEvent::Batch(batch)) => {
+                    finishes.push((batch.tokens.len(), batch.finish));
+                    if batch.finish.is_some() {
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
         assert_eq!(

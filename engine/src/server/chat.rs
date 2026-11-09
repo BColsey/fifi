@@ -72,6 +72,7 @@ pub(crate) async fn submit(
     endpoint: &'static str,
 ) -> Result<Submitted, ServerError> {
     let stream = input.stream;
+    let input_session = input.session.clone();
     let entry = state.resolve(
         input.session.as_deref(),
         input.engine.as_deref(),
@@ -172,6 +173,7 @@ pub(crate) async fn submit(
         reply,
         method,
         endpoint,
+        session: input_session,
     };
     admit(state, entry, admission)
 }
@@ -198,6 +200,8 @@ pub(super) struct Admission {
     pub(super) reply: ReplyMode,
     pub(super) method: &'static str,
     pub(super) endpoint: &'static str,
+    /// The named session the request carried, for ring attribution.
+    pub(super) session: Option<String>,
 }
 
 /// Checks the prompt against the context limit and queues the job on the engine of `entry`.
@@ -218,6 +222,7 @@ pub(super) fn admit(
         reply,
         method,
         endpoint,
+        session,
     } = admission;
     let prompt_tokens = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
     // From here on, every end of the request writes one line of the request log.
@@ -233,6 +238,10 @@ pub(super) fn admit(
     // The monitor's ring rides the same lines (count_tokens is filtered
     // out inside the ring, so the count route needs no wiring).
     log.set_ring(state.recent_ring());
+    log.set_engine(&entry.id);
+    if let Some(id) = &session {
+        log.set_session(id);
+    }
     // The prompt digests and the LCP with this model's previous request: the
     // server's own view of render stability, independent of the engine store.
     let lcp = state.note_prompt(&entry.model, &prompt);
@@ -1211,11 +1220,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_header_still_returns_not_found_with_the_flag_on() {
+    async fn a_session_header_binds_and_succeeds_with_the_flag_on() {
         let engine = testkit::engine(testkit::script("a"));
         let session = request(json!({"x-session": "s1"}));
         let (status, _) = post(&reuse_app(&engine, true), &session).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1286,9 +1295,12 @@ mod tests {
     #[tokio::test]
     async fn routing_failures_return_the_status_of_the_design() {
         let engine = testkit::engine(Vec::new());
+        // A named session binds to the routed engine on first use.
+        let script_engine = testkit::engine(testkit::script("a"));
+        let session_app = app(&script_engine, 4_096);
         let app = app(&engine, 4_096);
         let session = request(json!({"x-session": "s1"}));
-        assert_eq!(post(&app, &session).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(post(&session_app, &session).await.0, StatusCode::OK);
         let model = request(json!({"model": "other"}));
         assert_eq!(post(&app, &model).await.0, StatusCode::NOT_FOUND);
         let unrouted = json!({"messages": [{"role": "user", "content": "hi"}]});

@@ -120,6 +120,7 @@ impl RunningJob {
                 }));
             };
             match event {
+                JobEvent::Started => self.log.started(),
                 JobEvent::Batch(batch) => {
                     if batch.finish == Some(DecodeFinish::Cancelled) {
                         return Ok(Step::Aborted);

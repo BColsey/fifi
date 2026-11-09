@@ -650,6 +650,7 @@ mod tests {
             let mut usage = None;
             while let Some(event) = handle.events.blocking_recv() {
                 match event {
+                    JobEvent::Started => {}
                     JobEvent::Batch(batch) => batches.push(batch),
                     JobEvent::Finished(value) => usage = Some(value),
                     JobEvent::Error(error) => panic!("job failed: {error:?}"),
