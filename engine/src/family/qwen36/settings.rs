@@ -70,14 +70,15 @@ pub(crate) const MIN_PREFILL_CHUNK_ROWS: u32 = 4;
 /// prefill_chunk ceiling above.
 pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
 
-/// SHA-256 of the pinned files of `<model_dir>`
-/// (`engine/testdata/mac-phase0a.json`).
+/// SHA-256 of the pinned files of `<model_dir>`: the official `Qwen/Qwen3.8-27B`
+/// release tokenizer files (the same bytes the HF repo serves today). Quants rewrite these
+/// (`mlx-community` and exl3 both diverge), so the model dir must carry the release copies.
 const TOKENIZER_JSON_SHA256: &str =
-    "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4";
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
 const TOKENIZER_CONFIG_SHA256: &str =
-    "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182";
+    "207c03c41a06a9c3b0cc527d8a56115159c1eac6b59a4ffae85b646e773d074e";
 const CHAT_TEMPLATE_SHA256: &str =
-    "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
+    "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375";
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 
