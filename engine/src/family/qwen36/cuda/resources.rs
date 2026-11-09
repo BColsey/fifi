@@ -614,8 +614,7 @@ fn stack_of<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "moe weights: {name} needs EXL3 per-expert dispatch"
         ))),
-        (Some(CudaWeight::Tiled { .. }), WeightLayout::Native)
-        | (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
+        (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("moe weights: {name} is loaded in the other layout than the session"),
         )),
         (Some(CudaWeight::Raw { .. }), _) | (None, _) => Err(EngError::Checkpoint(format!(

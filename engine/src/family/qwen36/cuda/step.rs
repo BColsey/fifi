@@ -884,7 +884,7 @@ impl<'a> QwenResidentStep<'a> {
             // The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a
             // mixed override (tiled stacks in some layers, native in others) refuses here
             // instead of failing per layer inside the block's own check.
-            let tiled = moe_override_uniform(
+            moe_override_uniform(
                 &moe.iter()
                     .map(|w| matches!(w.gate, StackWeights::Tiled(_)))
                     .collect::<Vec<_>>(),

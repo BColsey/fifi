@@ -187,8 +187,8 @@ impl<'w> MixerWeights<'w> {
 }
 
 /// Resolves one dense spec of `layer` in `layout`: the tiles (shape-checked by `check_dense`) or
-/// the native blocks (shape-checked plus the rows%4 rule of `check_native_dense`), and a tensor
-/// of the other layout is a `Checkpoint` naming it, so a mixed load stops at the lookup.
+/// the native blocks (shape-checked plus the rows%4 rule of `check_native_dense`). Tiled
+/// overrides may also resolve under a native session; unsupported layouts refuse at lookup.
 pub(super) fn dense_weight<'w>(
     weights: &'w CudaWeights,
     name: &str,
@@ -230,9 +230,6 @@ pub(super) fn dense_weight<'w>(
         | (_, WeightLayout::Exl3) => Err(EngError::Checkpoint(format!(
             "mixer weights: {name} does not match the requested EXL3 layout"
         ))),
-        (Some(CudaWeight::Tiled { .. }), WeightLayout::Native) => Err(EngError::Checkpoint(
-            format!("mixer weights: {name} is loaded in the tiled layout, the step runs native"),
-        )),
         (Some(CudaWeight::Native { .. }), WeightLayout::Tiled) => Err(EngError::Checkpoint(
             format!("mixer weights: {name} is loaded in the native layout, the step runs tiled"),
         )),
