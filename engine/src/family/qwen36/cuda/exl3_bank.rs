@@ -538,8 +538,10 @@ impl<'w> Exl3SlotResolver<'w> {
     }
 
     /// Arms the overlap pair of [`LayerResolver::resolve_split`]: one copy stream for miss
-    /// refills, one event to gate the launches that read them. Before the first token only,
-    /// from the start of a banked session whose environment asked for it.
+    /// refills, one event to gate the launches that read them. The start of a banked session
+    /// whose environment asked for it arms this once, before the first token; a later arm
+    /// stays safe (every resolve_split sits at the readback quiescence anchor), but the
+    /// start never does it and callers should not rely on mid-session arming.
     pub(crate) fn enable_overlap(
         &mut self,
         context: &crate::kernels::cuda::CudaContext,
@@ -556,6 +558,16 @@ impl<'w> Exl3SlotResolver<'w> {
     /// launches around the refills.
     pub(crate) fn overlap_armed(&self) -> bool {
         self.overlap.is_some()
+    }
+
+    /// Drains the overlap copy stream (see [`LayerResolver::fence_copy_stream`]); a no-op
+    /// without the pair armed.
+    pub(crate) fn fence_copy_stream(&mut self) {
+        if let Some((copy, _)) = &self.overlap {
+            if let Err(error) = copy.synchronize() {
+                eprintln!("q36 cuda: overlap fence failed: {error:?}");
+            }
+        }
     }
 
     /// One layer's resolver view, what the MoE block hooks take.
@@ -592,6 +604,14 @@ impl LayerResolver<'_, '_> {
     /// it borrows); the launch builders read this to split around the refills.
     pub(crate) fn overlap_armed(&self) -> bool {
         self.resolver.overlap_armed()
+    }
+
+    /// Drains the overlap copy stream. The error path out of a split MoE block queues no
+    /// wait, so its refills keep writing with no fence; a later token's hit on a refilling
+    /// slot could read torn bytes, because only the launch stream is drained at the next
+    /// readback. Every block that resolves with a split fences on its way out with an error.
+    pub(crate) fn fence_copy_stream(&mut self) {
+        self.resolver.fence_copy_stream();
     }
 
     /// Maps one call's picks (a decode token's, a prefill sub-block's, or a K-row window

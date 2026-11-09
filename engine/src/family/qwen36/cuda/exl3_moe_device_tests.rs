@@ -98,18 +98,53 @@ fn inputs(hidden: usize) -> (Vec<f32>, Vec<f32>) {
     (row, resid)
 }
 
-/// The inputs of `inputs` scaled by `round`: a different router row means different picks,
-/// which is what a banked-block test needs to force misses and evictions.
-fn inputs_of_round(hidden: usize, round: usize) -> (Vec<f32>, Vec<f32>) {
-    let scale = 1.0 + 0.137 * round as f32;
-    let (row, resid) = inputs(hidden);
-    (
-        row.iter().map(|v| v * scale).collect(),
-        resid
-            .iter()
-            .map(|v| v * (1.0 + 0.05 * round as f32))
-            .collect(),
-    )
+/// The router rows of the parity rounds: round 0 is the base row; every later round blends
+/// the base row with its 337-rotation, taking the first blend whose host-routed top-k
+/// shares three to five experts with the predecessor's. Rounds that share some - not all -
+/// picks are what the banked overlap test needs: its resident group and its refilling
+/// group both launch in one round. A positive scaling cannot produce this (the router is
+/// linear, so scaling keeps the pick set), and the un-blended rotation replaces the whole
+/// set (measured: disjoint top-8s). Sharing is a heuristic, not a hit guarantee (an
+/// earlier miss can evict a shared pick's slot before the pick is processed); the test
+/// asserts on the resolver's own stats, so a heuristic miss fails loudly, never vacuously.
+fn rounded_rows(
+    checkpoint: &Checkpoint,
+    layer: usize,
+    hidden: usize,
+    top_k: usize,
+) -> Vec<Vec<f32>> {
+    let router = values_of(checkpoint, &router_name(layer));
+    let gate = values_of(checkpoint, &shared_gate_name(layer));
+    let (base, _) = inputs(hidden);
+    let rotated: Vec<f32> = (0..hidden).map(|i| base[(i + 337) % hidden]).collect();
+    let route_row = |row: &[f32]| -> Vec<usize> {
+        let x: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+        route(&router, &gate, &x, top_k).0
+    };
+    let mut rows = vec![base.clone()];
+    let mut picks = route_row(&base);
+    for _ in 1..6 {
+        let mut blended = None;
+        // The blend walk: at t=0 the picks equal the base set, at t=1 the rotated set;
+        // rank crossings move members between the sets, so a step usually lands in the
+        // 3..5 band (the fallback covers a walk that jumps over it).
+        for step in 1..100u32 {
+            let t = step as f32 / 100.0;
+            let row: Vec<f32> = (0..hidden)
+                .map(|i| base[i] * (1.0 - t) + rotated[i] * t)
+                .collect();
+            let p = route_row(&row);
+            let shared = p.iter().filter(|e| picks.contains(e)).count();
+            if (3..=5).contains(&shared) {
+                blended = Some((row, p));
+                break;
+            }
+        }
+        let (row, p) = blended.unwrap_or_else(|| (rotated.clone(), route_row(&rotated)));
+        rows.push(row);
+        picks = p;
+    }
+    rows
 }
 
 struct Reference {
@@ -221,21 +256,21 @@ fn run_block(
     moe: &MoeDims,
     device_ids: bool,
 ) -> Result<Device, EngError> {
-    run_block_rounded(projector, block, moe, device_ids, 0, None)
+    let (row, _) = inputs(moe.hidden);
+    run_block_rounded(projector, block, moe, device_ids, &row, None)
 }
 
-/// [`run_block`] with the input round and the banked slot resolver: `round` scales the
-/// router row (different picks per round), and `bank` maps the read picks through the
-/// layer's slot tables before the launches.
+/// [`run_block`] with the given router row and the banked slot resolver; `bank` maps the
+/// read picks through the layer's slot tables before the launches.
 fn run_block_rounded(
     projector: &CudaProjector,
     block: &Exl3MoeWeights<'_>,
     moe: &MoeDims,
     device_ids: bool,
-    round: usize,
+    row: &[f32],
     bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
 ) -> Result<Device, EngError> {
-    let (row, resid) = inputs_of_round(moe.hidden, round);
+    let (_, resid) = inputs(moe.hidden);
     let h = moe.hidden * F32;
     let logits = router_logits_bytes(crate::kernels::cuda::resident::router::RouterShape {
         m: 1,
@@ -372,10 +407,12 @@ fn banked_block_parity(overlap: bool) {
         if overlap {
             resolver.enable_overlap(projector.context()).unwrap();
         }
-        let mut saw_miss = false;
-        for round in 0..6 {
-            let want = run_block_rounded(&projector, &block, &moe, false, round, None)
+        let rows = rounded_rows(&checkpoint, layer, moe.hidden, moe.top_k);
+        let (mut saw_miss, mut saw_mixed) = (false, false);
+        for round in 0..rows.len() {
+            let want = run_block_rounded(&projector, &block, &moe, false, &rows[round], None)
                 .expect("the resident block");
+            let before = resolver.stats();
             let got = {
                 let mut bank = resolver.layer(0);
                 run_block_rounded(
@@ -383,7 +420,7 @@ fn banked_block_parity(overlap: bool) {
                     &banked_block,
                     &moe,
                     false,
-                    round,
+                    &rows[round],
                     Some(&mut bank),
                 )
                 .expect("the banked block")
@@ -395,9 +432,11 @@ fn banked_block_parity(overlap: bool) {
             );
             assert_eq!(got.flag, 0, "layer {layer} round {round}: arithmetic flag");
             let (hits, misses) = resolver.stats();
-            saw_miss |= misses > 0;
+            let (round_hits, round_misses) = (hits - before.0, misses - before.1);
+            saw_miss |= round_misses > 0;
+            saw_mixed |= round_hits > 0 && round_misses > 0;
             println!(
-                "layer {layer} round {round}: picks {:?}, hits {hits}, misses {misses}",
+                "layer {layer} round {round}: picks {:?}, hits {round_hits}, misses {round_misses}",
                 got.ids
             );
         }
@@ -405,7 +444,16 @@ fn banked_block_parity(overlap: bool) {
             saw_miss,
             "layer {layer}: the rounds never missed; the resolver was not exercised"
         );
+        assert!(
+            saw_mixed,
+            "layer {layer}: no round mixed hits and misses; the resident-before-wait \
+             split of the overlapped block was never exercised"
+        );
         let (hits, misses) = resolver.stats();
-        assert_eq!(hits + misses, 6 * moe.top_k as u64, "every pick counted");
+        assert_eq!(
+            hits + misses,
+            (rows.len() * moe.top_k) as u64,
+            "every pick counted"
+        );
     }
 }

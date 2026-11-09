@@ -256,6 +256,31 @@ fn grouped(launch: &Launch<'_>, pairs: &[Pair<'_>], scratch: &Scratch<'_>) -> Re
     launch.ctx.exl3_grouped_step(launch.stream, &calls)
 }
 
+/// [`grouped`] as one launch per maximal run of plan-contiguous `out` rows (shared with
+/// the merged block's split: both split their groups around the overlap refills). The C side of the
+/// grouped kernels validates that a launch's out rows are consecutive (`follows` in
+/// `group_args`), and a resident/refilling split - or a hit pick inside a miss run - leaves
+/// holes between the kept rows, so each contiguous slice becomes its own launch. A whole
+/// plan is one run, so an unsplit call set still launches once.
+pub(super) fn grouped_runs(
+    launch: &Launch<'_>,
+    pairs: &[Pair<'_>],
+    scratch: &Scratch<'_>,
+) -> Result<(), EngError> {
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        while end < pairs.len()
+            && pairs[end].out.offset() == pairs[end - 1].out.offset() + pairs[end - 1].out.bytes()
+        {
+            end += 1;
+        }
+        grouped(launch, &pairs[start..end], scratch)?;
+        start = end;
+    }
+    Ok(())
+}
+
 /// One pair of an id-indexed launch: the bank, the pick slot whose id chooses the member, the row
 /// the pair reads and where its rows go.
 struct IndexedPair<'a> {
@@ -401,13 +426,13 @@ fn routed(
         }
     }
     if !resident.is_empty() {
-        grouped(launch, &resident, &bufs.scratch)?;
+        grouped_runs(launch, &resident, &bufs.scratch)?;
     }
     if !refilling.is_empty() {
         if let Some((event, _)) = gate {
             launch.stream.wait(event)?;
         }
-        grouped(launch, &refilling, &bufs.scratch)?;
+        grouped_runs(launch, &refilling, &bufs.scratch)?;
     }
     swiglu(launch, bufs.expert_gu, bufs.expert_act, (dims.top_k, i))?;
     let mut group = Vec::with_capacity(picks.len());
@@ -619,7 +644,7 @@ pub(in crate::family) fn run_exl3_moe(
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
     device_ids: bool,
-    bank: Option<&mut super::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut super::exl3_bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     if dims.rows != 1 {
@@ -640,13 +665,22 @@ pub(in crate::family) fn run_exl3_moe(
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims.top_k, dims.n_expert)?;
         let mut gated = None;
-        let picks = match bank {
+        let picks = match bank.as_deref_mut() {
             Some(bank) => {
                 #[cfg(test)]
                 let began = std::time::Instant::now();
-                let (slots, missed, event) = bank.resolve_split(launch.stream, &picks, overlap)?;
+                let split = bank.resolve_split(launch.stream, &picks, overlap);
                 #[cfg(test)]
                 crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+                // A resolve that fails mid-refill leaves copies on the copy stream with no
+                // event recorded, so no wait would ever order them (fence_copy_stream).
+                let (slots, missed, event) = match split {
+                    Ok(split) => split,
+                    Err(error) => {
+                        bank.fence_copy_stream();
+                        return Err(error);
+                    }
+                };
                 gated = event.map(|event| (event, missed));
                 slots
             }
@@ -655,7 +689,14 @@ pub(in crate::family) fn run_exl3_moe(
         let gate = gated
             .as_ref()
             .map(|(event, missed)| (*event, missed.as_slice()));
-        routed(launch, weights, bufs, (&picks, dims), gate)?;
+        if let Err(error) = routed(launch, weights, bufs, (&picks, dims), gate) {
+            if let Some(bank) = bank.as_deref_mut() {
+                // The block queues no wait on its way out with an error; its refills keep
+                // writing with no fence (LayerResolver::fence_copy_stream).
+                bank.fence_copy_stream();
+            }
+            return Err(error);
+        }
     }
     shared(launch, weights, bufs, dims)?;
     combine(launch, bufs, dims)

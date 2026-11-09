@@ -54,7 +54,7 @@
 
 use super::{
     EngError, Exl3MoeBufs, Exl3MoeWeights, F32, Launch, MoeDims, Pair, Scratch, combine_ranges,
-    grouped, read_picks, refuse, route, row, swiglu,
+    grouped_runs, read_picks, refuse, route, row, swiglu,
 };
 use crate::{
     family::{
@@ -380,30 +380,6 @@ fn merged_on_host(
     grouped_runs(launch, &build(&plan.down)?, &scratch)
 }
 
-/// [`grouped`] as one launch per maximal run of plan-contiguous `out` rows. The C side of the
-/// grouped kernels validates that a launch's out rows are consecutive (`follows` in
-/// `group_args`), and a resident/refilling split - or a hit pick inside a miss run - leaves
-/// holes between the kept rows, so each contiguous slice becomes its own launch. A whole
-/// plan is one run, so an unsplit call set still launches once.
-fn grouped_runs(
-    launch: &Launch<'_>,
-    pairs: &[Pair<'_>],
-    scratch: &Scratch<'_>,
-) -> Result<(), EngError> {
-    let mut start = 0;
-    while start < pairs.len() {
-        let mut end = start + 1;
-        while end < pairs.len()
-            && pairs[end].out.offset() == pairs[end - 1].out.offset() + pairs[end - 1].out.bytes()
-        {
-            end += 1;
-        }
-        grouped(launch, &pairs[start..end], scratch)?;
-        start = end;
-    }
-    Ok(())
-}
-
 /// The block of one layer with the shared expert in the routed launches: the same router, the
 /// same combine, the groups of [`block_plan`]. With `device_ids` the picks stay on the device and
 /// the block makes no host read; otherwise it waits for the stream once, to read the ids. With
@@ -414,7 +390,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
     (weights, bufs, merge): (&Exl3MoeWeights<'_>, &Exl3MoeBufs<'_>, &SharedMerge),
     dims: &MoeDims,
     device_ids: bool,
-    bank: Option<&mut super::super::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut super::super::exl3_bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     check_dims(&plan_dims(dims)).map_err(refuse)?;
@@ -432,9 +408,18 @@ pub(in crate::family) fn run_exl3_moe_merged(
     } else {
         let picks = read_picks(launch, &bufs.route.ids, dims.top_k, dims.n_expert)?;
         let mut gated = None;
-        let picks = match bank {
+        let picks = match bank.as_deref_mut() {
             Some(bank) => {
-                let (slots, missed, event) = bank.resolve_split(launch.stream, &picks, overlap)?;
+                let split = bank.resolve_split(launch.stream, &picks, overlap);
+                // A resolve that fails mid-refill leaves copies on the copy stream with no
+                // event recorded, so no wait would ever order them (fence_copy_stream).
+                let (slots, missed, event) = match split {
+                    Ok(split) => split,
+                    Err(error) => {
+                        bank.fence_copy_stream();
+                        return Err(error);
+                    }
+                };
                 gated = event.map(|event| (event, missed));
                 slots
             }
@@ -443,7 +428,15 @@ pub(in crate::family) fn run_exl3_moe_merged(
         let gate = gated
             .as_ref()
             .map(|(event, missed)| (*event, missed.as_slice()));
-        merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), gate, dims)?;
+        if let Err(error) = merged_on_host(launch, (weights, bufs, &r), (&plan, &picks), gate, dims)
+        {
+            if let Some(bank) = bank.as_deref_mut() {
+                // The block queues no wait on its way out with an error; its refills keep
+                // writing with no fence (LayerResolver::fence_copy_stream).
+                bank.fence_copy_stream();
+            }
+            return Err(error);
+        }
     }
     let (routed, shared) = r.layout.combine_spans(&plan_dims(dims));
     let down = r.buffer.range(routed.offset, routed.bytes)?;
