@@ -621,15 +621,69 @@ fn q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process() {
                 .unwrap_or_else(|error| panic!("device {device}, rows {rows}: {error:?}"));
             outputs.push(gated_slice(&result, &input.case));
         }
+        // Use the Q4_K/q8_1 error bound from native_device_rig::hop_bound,
+        // scaled by the input maximum and each weight row's L1 norm. A fixed
+        // absolute tolerance near zero is unsuitable for different partitions.
+        const HOP_FACTOR: f64 = (0.5 + 127.0 / 2048.0) / 127.0 + 1.0 / 1024.0 + 1.0 / 262_144.0;
+        let weights = dequantize(gguf_of(input.case.ty), &input.w).expect("dequantize weights");
+        let row_l1: Vec<f64> = weights
+            .chunks_exact(input.case.k)
+            .map(|row| row.iter().map(|value| f64::from(value.abs())).sum())
+            .collect();
+        let input_max: Vec<f64> = input
+            .x
+            .chunks_exact(input.case.k)
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|value| f64::from(value.abs()))
+                    .fold(0.0, f64::max)
+            })
+            .collect();
+        assert_eq!(row_l1.len(), input.case.n);
+        assert_eq!(input_max.len(), rows);
+        let mut max_difference = 0.0_f64;
         for (index, (&first, &second)) in outputs[0].iter().zip(&outputs[1]).enumerate() {
-            let tolerance = 0.001 + 0.0002 * first.abs().max(second.abs());
+            let difference = (first - second).abs();
+            max_difference = max_difference.max(difference);
+            let bound =
+                2.0 * input_max[index / input.case.n] * row_l1[index % input.case.n] * HOP_FACTOR;
             assert!(
-                (first - second).abs() <= tolerance,
-                "rows {rows}, value {index}: device 0 {first}, device 1 {second}"
+                difference <= bound,
+                "rows {rows}, value {index}: device 0 {first}, device 1 {second}, bound {bound}"
             );
         }
+        let cross = nmse(&outputs[1], &outputs[0], input.case.n, rows);
         println!(
-            "{NAME}: {rows} rows, {} results agree on both devices",
+            "{NAME}: {rows} rows, cross-device NMSE {:.3e}, max difference {max_difference:.3e}",
+            cross.global
+        );
+
+        // Check three complete columns on each GPU against the host f64 dot
+        // product. The bound includes q8_1 activation rounding and accumulation.
+        let mut single = input.case.clone();
+        single.m = 1;
+        for column in [0, rows / 2, rows - 1] {
+            let x = &input.x[column * input.case.k..(column + 1) * input.case.k];
+            let expected = reference(&single, &input.w, x);
+            for (device, output) in outputs.iter().enumerate() {
+                let values = &output[column * input.case.n..(column + 1) * input.case.n];
+                let stat = nmse(values, &expected, input.case.n, 1);
+                println!(
+                    "{NAME}: rows {rows}, column {column}, device {device}, CPU-reference NMSE {:.3e}",
+                    stat.global
+                );
+                for (index, (&got, &want)) in values.iter().zip(&expected).enumerate() {
+                    let bound = input_max[column] * row_l1[index] * HOP_FACTOR;
+                    assert!(
+                        (got - want).abs() <= bound,
+                        "rows {rows}, column {column}, device {device}, value {index}: got {got}, want {want}, bound {bound}"
+                    );
+                }
+            }
+        }
+        println!(
+            "{NAME}: {rows} rows, {} cross-device values and three CPU-reference columns checked",
             outputs[0].len()
         );
     }
