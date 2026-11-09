@@ -1005,6 +1005,14 @@ mod tests {
         let text = super::describe(&error);
         if cfg!(all(feature = "native-cuda", target_os = "linux")) {
             assert!(text.contains("qwen3_8_27b_dense requires the native-mlx backend"));
+        } else if cfg!(feature = "native-mlx") {
+            // A native-mlx build carries the dense factory, so the dispatch witness is
+            // the factory's own first refusal: the tokenizer pin check fires before any
+            // model file access, which is the point here.
+            assert!(
+                text.contains("tokenizer.json hash does not match the pinned revision"),
+                "{text}"
+            );
         } else {
             // The dense session cap now derives instead of refusing, so
             // the dispatch witness on this arm is the selected factory's

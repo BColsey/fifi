@@ -897,13 +897,13 @@ mod tests {
         total + layers * (64 * 4 * 4 + 64 * 4) + 12 + 2 * key_dim * 4
     }
 
-    /// The mapped bytes of the expert pages of the tiny GQA model, pinned per scale arm. The
-    /// BF16 arm page-rounds every role separately (4 layers x 3 stacks x 3 x 16,384 = 589,824);
-    /// the widened F32 arm reuses the payload page's slack for the widened scales and biases
-    /// (2 x 16,384 per stack = 393,216). Regenerate both by printing `expert_page_bytes()` after
-    /// an intentional stack-layout change; the pin exists to trip on accidental ones.
-    fn expected_page_bytes(f32_scales: bool) -> u64 {
-        if f32_scales { 393_216 } else { 589_824 }
+    /// The mapped bytes of the expert pages of the tiny GQA model: 4 layers x 3 stacks, each
+    /// packing its payload, scales, and biases into two 16 KiB pages (393,216 total, the same
+    /// for both scale arms — the widened F32 layout reuses the payload page's slack just like
+    /// the stored BF16 one). Pinned, not derived: regenerate by printing `expert_page_bytes()`
+    /// after an intentional stack-layout change; the pin exists to trip on accidental ones.
+    fn expected_page_bytes(_f32_scales: bool) -> u64 {
+        393_216
     }
 
     #[test]
