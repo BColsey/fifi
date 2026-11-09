@@ -2534,6 +2534,7 @@ mod tests {
         let mut usage = None;
         while let Some(event) = handle.events.blocking_recv() {
             match event {
+                JobEvent::Started => {}
                 JobEvent::Batch(batch) => tokens.extend(batch.tokens),
                 JobEvent::Finished(done) => usage = Some(done),
                 JobEvent::Error(error) => panic!("{error:?}"),
@@ -2631,6 +2632,7 @@ mod tests {
         let mut tokens = 0;
         while let Some(event) = handle.events.blocking_recv() {
             match event {
+                JobEvent::Started => {}
                 JobEvent::Batch(batch) => tokens += batch.tokens.len(),
                 JobEvent::Finished(_) => {}
                 JobEvent::Error(error) => panic!("{error:?}"),
@@ -2900,6 +2902,7 @@ mod tests {
             let mut usage = None;
             while let Some(event) = handle.events.blocking_recv() {
                 match event {
+                    JobEvent::Started => {}
                     JobEvent::Batch(batch) => tokens.extend(batch.tokens),
                     JobEvent::Finished(done) => usage = Some(done),
                     JobEvent::Error(error) => panic!("round {round}: {error:?}"),
@@ -4244,6 +4247,7 @@ mod tests {
             let mut error = None;
             while let Some(event) = handle.events.blocking_recv() {
                 match event {
+                    JobEvent::Started => {}
                     JobEvent::Batch(batch) => tokens.extend(batch.tokens),
                     JobEvent::Finished(done) => usage = Some(done),
                     JobEvent::Error(failure) => error = Some(format!("{failure:?}")),
