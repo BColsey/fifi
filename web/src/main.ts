@@ -11,11 +11,14 @@ import { InternalsView } from "./internals";
 import { fixture as routingFixture } from "./internals.fixture";
 import { MonitorView } from "./monitor";
 import { noticeList } from "./notices";
+import { chatMarkdown, chatMatchesQuery } from "./history";
+import { downloadText } from "./copy";
 import { pollPlan } from "./panel";
 import { TraceView } from "./trace";
 import {
   deleteChat,
   listChats,
+  putChat,
   loadSettings,
   onSettingsChange,
   onStorageError,
@@ -258,6 +261,27 @@ function main(): void {
     }
   }
 
+  let searchQuery = "";
+  const searchInput = document.createElement("input");
+  searchInput.type = "search";
+  searchInput.className = "chat-search";
+  searchInput.placeholder = "Search chats";
+  searchInput.setAttribute("aria-label", "Search chats");
+  searchInput.addEventListener("input", () => {
+    searchQuery = searchInput.value;
+    void renderChatList();
+  });
+  chatList.parentElement?.insertBefore(searchInput, chatList);
+  chatList.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const buttons = Array.from(chatList.querySelectorAll<HTMLButtonElement>(".chat-open"));
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    if (at < 0) return;
+    e.preventDefault();
+    const next = e.key === "ArrowDown" ? buttons[at + 1] : buttons[at - 1];
+    next?.focus();
+  });
+
   async function renderChatList(): Promise<void> {
     let chats: ChatRecord[];
     try {
@@ -279,7 +303,15 @@ function main(): void {
       chatList.append(item);
       return;
     }
-    for (const record of chats) {
+    const visible = chats.filter((record) => chatMatchesQuery(record, searchQuery));
+    if (visible.length === 0) {
+      const item = document.createElement("li");
+      item.className = "chat-empty";
+      item.textContent = "No chats match the search.";
+      chatList.append(item);
+      return;
+    }
+    for (const record of visible) {
       const item = document.createElement("li");
       item.className = "chat-item";
       if (record.id === currentId) item.setAttribute("aria-current", "true");
@@ -292,6 +324,36 @@ function main(): void {
           // openChat reports read failures through its own notice hook.
         });
         closeSidebar();
+      });
+      open.addEventListener("dblclick", () => {
+        const editor = document.createElement("input");
+        editor.type = "text";
+        editor.className = "chat-rename";
+        editor.value = record.title;
+        editor.setAttribute("aria-label", "Rename chat");
+        open.replaceWith(editor);
+        editor.focus();
+        editor.select();
+        const commit = (save: boolean): void => {
+          if (save && editor.value.trim() !== "") {
+            record.title = editor.value.trim();
+            void putChat(record).catch(() => showNotice("Could not rename this chat."));
+          }
+          void renderChatList();
+        };
+        editor.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") commit(true);
+          if (ev.key === "Escape") commit(false);
+        });
+        editor.addEventListener("blur", () => commit(true));
+      });
+      const exp = document.createElement("button");
+      exp.type = "button";
+      exp.className = "chat-delete";
+      exp.setAttribute("aria-label", "Export chat: " + record.title);
+      exp.textContent = "Export";
+      exp.addEventListener("click", () => {
+        downloadText("chat.md", chatMarkdown(record), "text/markdown");
       });
       const del = document.createElement("button");
       del.type = "button";
@@ -315,7 +377,7 @@ function main(): void {
         if (chat.currentChatId() === record.id) chat.newChat();
         await renderChatList();
       });
-      item.append(open, del);
+      item.append(open, exp, del);
       chatList.append(item);
     }
   }

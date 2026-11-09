@@ -30,3 +30,20 @@ test("the paste summary counts chars and lines", () => {
   strictEqual(pasteSummary("a\nb"), "3 chars · 2 lines");
   strictEqual(pasteSummary("x".repeat(2500)), "2.5k chars · 1 line");
 });
+
+test("textual detection accepts prose and rejects binary noise", async () => {
+  const { looksTextual } = await import("./paste.js");
+  strictEqual(looksTextual("hello world\nplain text"), true);
+  strictEqual(looksTextual(""), true);
+  strictEqual(looksTextual(""), false);
+  strictEqual(looksTextual("mostly text with one � bad char in a longer readable sentence here"), true);
+});
+
+test("incremental rendering keeps a settled prefix", async () => {
+  const { blocksSharePrefix, parseBlocks } = await import("./markdown.js");
+  const before = parseBlocks("one\n\ntwo\n\nthree par");
+  const after = parseBlocks("one\n\ntwo\n\nthree partial reply");
+  strictEqual(blocksSharePrefix(before, after), true);
+  strictEqual(blocksSharePrefix(after, before), true, "same-count tail change still shares the settled prefix");
+  strictEqual(blocksSharePrefix(parseBlocks("one\n\nCHANGED\n\nthree"), after), false);
+});

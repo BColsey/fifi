@@ -25,6 +25,8 @@ import {
   type PanelData,
 } from "./panel";
 import { groupSpeed, speedSummary } from "./speed";
+import { appendPoint, HISTORY_KEY, parseHistory, serialize, values, type SparkPoint } from "./sparkstore";
+import { downloadText } from "./copy";
 
 export type MonitorData = PanelData;
 
@@ -52,12 +54,25 @@ export class MonitorView {
    * here, one point per poll, exactly like Strata's history ring. */
   private decodeHistory: (number | null)[] = [];
   private ttftHistory: (number | null)[] = [];
+  private decodePoints: SparkPoint[] = [];
+  private ttftPoints: SparkPoint[] = [];
+  /** The request shown in the detail drawer, when one is selected. */
+  private selectedRequest: RecentRequest | null = null;
   /** GPU telemetry from /v1/telemetry; null when unprobed or down. */
   private telemetry: TelemetryInfo | null = null;
   private telemetryError: string | null = null;
 
   constructor(section: HTMLElement) {
     this.section = section;
+    try {
+      const stored = parseHistory(window.localStorage.getItem(HISTORY_KEY), Date.now());
+      this.decodePoints = stored.decode;
+      this.ttftPoints = stored.ttft;
+      this.decodeHistory = values(stored.decode);
+      this.ttftHistory = values(stored.ttft);
+    } catch {
+      // Storage unavailable (private mode, quota): history stays in memory.
+    }
     this.render();
   }
 
@@ -151,6 +166,18 @@ export class MonitorView {
       const speed = speedSummary(this.data.recent);
       this.decodeHistory = [...this.decodeHistory, speed.decodePerSecond].slice(-HISTORY_CAP);
       this.ttftHistory = [...this.ttftHistory, speed.firstTokenMs].slice(-HISTORY_CAP);
+      this.decodePoints = appendPoint(this.decodePoints, this.data.checkedAt, speed.decodePerSecond);
+      this.ttftPoints = appendPoint(this.ttftPoints, this.data.checkedAt, speed.firstTokenMs);
+      this.decodeHistory = values(this.decodePoints);
+      this.ttftHistory = values(this.ttftPoints);
+      try {
+        window.localStorage.setItem(
+          HISTORY_KEY,
+          serialize({ decode: this.decodePoints, ttft: this.ttftPoints })
+        );
+      } catch {
+        // Persistence is best-effort; the in-memory trend still works.
+      }
     }
     this.render();
     return this.data;
@@ -284,6 +311,23 @@ export class MonitorView {
       alert.className = "monitor-alert";
       alert.setAttribute("role", "status");
       alert.textContent = "Server not answering. Check that enginesrv is running, then Refresh.";
+      column.append(alert);
+    }
+
+    const engineErrors = (this.data.models ?? [])
+      .flatMap((m) => m.engines ?? [])
+      .filter((e) => e.state === "error");
+    const queuedTotal = (this.data.system?.engines ?? []).reduce((sum, e) => sum + (e.queued ?? 0), 0);
+    if (engineErrors.length > 0 || queuedTotal >= 4) {
+      const alert = document.createElement("div");
+      alert.className = "monitor-alert";
+      alert.setAttribute("role", "alert");
+      const parts: string[] = [];
+      if (engineErrors.length > 0) {
+        parts.push("Engine error: " + engineErrors.map((e) => e.id).join(", ") + ". See Models & engines.");
+      }
+      if (queuedTotal >= 4) parts.push("Queue building: " + queuedTotal + " requests waiting.");
+      alert.textContent = parts.join(" ");
       column.append(alert);
     }
 
@@ -501,6 +545,10 @@ export class MonitorView {
       block.append(facts);
       body.append(block);
     }
+    const tie = document.createElement("p");
+    tie.className = "panel-hint";
+    tie.textContent = "Which engine runs on which card is not reported by the server.";
+    body.append(tie);
     return card;
   }
 
@@ -615,6 +663,18 @@ export class MonitorView {
     table.append(thead, tbody);
     wrap.append(table);
     body.append(wrap);
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "btn";
+    exportBtn.textContent = "Download requests as JSONL";
+    const rows = this.data.recent;
+    exportBtn.addEventListener("click", () => {
+      downloadText("recent-requests.jsonl", rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "application/json");
+    });
+    body.append(exportBtn);
+    if (this.selectedRequest !== null) {
+      body.append(this.requestDetail(this.selectedRequest));
+    }
     const totals = requestTotals(this.data.recent);
     const foot = document.createElement("p");
     foot.className = "req-totals";
@@ -626,8 +686,78 @@ export class MonitorView {
     return card;
   }
 
+  private requestDetail(row: RecentRequest): HTMLElement {
+    const detail = document.createElement("div");
+    detail.className = "request-detail";
+    const head = document.createElement("div");
+    head.className = "code-head";
+    const title = document.createElement("span");
+    title.className = "code-lang";
+    title.textContent = "Request detail";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "code-copy";
+    close.textContent = "Close";
+    close.addEventListener("click", () => {
+      this.selectedRequest = null;
+      this.render();
+    });
+    const copyJson = document.createElement("button");
+    copyJson.type = "button";
+    copyJson.className = "code-copy";
+    copyJson.textContent = "Copy JSON";
+    copyJson.addEventListener("click", () => {
+      void navigator.clipboard?.writeText(JSON.stringify(row, null, 2)).catch(() => undefined);
+      copyJson.textContent = "Copied";
+      window.setTimeout(() => (copyJson.textContent = "Copy JSON"), 1500);
+    });
+    head.append(title, copyJson, close);
+    detail.append(head);
+    const dl = document.createElement("dl");
+    dl.className = "fact-grid";
+    detail.append(dl);
+    const host = document.createElement("div");
+    host.append(dl);
+    const facts: Array<[string, string]> = [
+      ["Time", row.started_at_ms === undefined ? "—" : new Date(row.started_at_ms).toLocaleString()],
+      ["Model", row.model],
+      ["Engine", row.engine ?? "—"],
+      ["Session", row.session ?? "—"],
+      ["Result", row.outcome + (row.error_code !== null ? " · " + row.error_code : "") + (row.finish_reason ? " · " + row.finish_reason : "")],
+      ["HTTP status", row.status === null ? "—" : String(row.status)],
+      ["Stream", row.stream ? "yes" : "no"],
+      ["Prompt tokens", String(row.prompt_tokens)],
+      ["Reused tokens", String(row.reused_tokens)],
+      ["Output tokens", String(row.completion_tokens)],
+      ["Queue wait", row.queue_wait_ms == null ? "—" : Math.round(row.queue_wait_ms) + " ms"],
+      ["Prefill", row.prefill_ms == null ? "—" : Math.round(row.prefill_ms) + " ms"],
+      ["First token", row.time_to_first_token_ms === null ? "—" : Math.round(row.time_to_first_token_ms) + " ms"],
+      ["Decode", row.decode_tokens_per_second === null ? "—" : row.decode_tokens_per_second.toFixed(1) + " tok/s"],
+    ];
+    for (const [name, value] of facts) {
+      const dt = document.createElement("dt");
+      dt.textContent = name;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      dl.append(dt, dd);
+    }
+    detail.append(host);
+    return detail;
+  }
+
   private requestRow(row: RecentRequest): HTMLTableRowElement {
     const tr = document.createElement("tr");
+    tr.tabIndex = 0;
+    tr.className = "req-row-clickable";
+    tr.setAttribute("aria-label", "Show request detail");
+    const open = (): void => {
+      this.selectedRequest = row;
+      this.render();
+    };
+    tr.addEventListener("click", open);
+    tr.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") open();
+    });
     const time = document.createElement("td");
     time.className = "num";
     time.textContent = row.started_at_ms === undefined ? "—" : formatClock(row.started_at_ms);

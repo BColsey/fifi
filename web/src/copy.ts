@@ -23,6 +23,17 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/** Save text as a downloaded file. */
+export function downloadText(filename: string, text: string, type = "text/plain"): void {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 /** Flash "Copied" on a button, then restore its label. */
 export function flashCopied(button: HTMLButtonElement, ok: boolean): void {
   const original = button.dataset.label ?? button.textContent ?? "Copy";

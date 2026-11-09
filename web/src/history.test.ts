@@ -173,3 +173,25 @@ test("noModelNotice names the missing selection and stays silent once set", () =
   strictEqual((notice ?? "").includes("No model is selected yet"), true);
   strictEqual(noModelNotice("fifi-q36"), null);
 });
+
+test("chat search matches title and message text, case aside", async () => {
+  const { chatMatchesQuery } = await import("./history.js");
+  const record = { title: "Trip plan", messages: [{ role: "user" as const, content: "Find a Train" }] };
+  strictEqual(chatMatchesQuery(record, "trip"), true);
+  strictEqual(chatMatchesQuery(record, "TRAIN"), true);
+  strictEqual(chatMatchesQuery(record, "plane"), false);
+  strictEqual(chatMatchesQuery(record, "  "), true);
+});
+
+test("chat export renders title and turns as markdown", async () => {
+  const { chatMarkdown } = await import("./history.js");
+  const out = chatMarkdown({
+    title: "Demo",
+    messages: [
+      { role: "user" as const, content: "hi" },
+      { role: "assistant" as const, content: "" },
+      { role: "assistant" as const, content: "hello" },
+    ],
+  });
+  strictEqual(out, "# Demo\n\n## You\n\nhi\n\n## fifi\n\nhello\n");
+});

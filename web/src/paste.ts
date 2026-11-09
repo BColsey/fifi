@@ -34,6 +34,19 @@ export function pasteSummary(text: string): string {
   return chars + " · " + lines + (lines === 1 ? " line" : " lines");
 }
 
+/** Whether decoded file bytes read as text: fewer than 1 in 16
+ * replacement or control characters in the sampled head. */
+export function looksTextual(text: string): boolean {
+  const sample = text.slice(0, 4096);
+  if (sample === "") return true;
+  let bad = 0;
+  for (const ch of sample) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (ch === "\uFFFD" || (code < 32 && ch !== "\n" && ch !== "\t" && ch !== "\r")) bad++;
+  }
+  return bad / sample.length < 1 / 16;
+}
+
 /** What Send actually sends: typed text first, then each held paste. */
 export function composeOutgoing(typed: string, pastes: readonly string[]): string {
   const parts = [typed, ...pastes].map((p) => p.trim()).filter((p) => p !== "");

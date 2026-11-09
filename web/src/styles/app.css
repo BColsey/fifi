@@ -1218,3 +1218,69 @@ details.engine-settings[open] summary { margin-bottom: var(--fifi-space-1); }
   .monitor-grid { grid-template-columns: 1fr; }
   .speed-big { gap: var(--fifi-space-4); }
 }
+
+/* Syntax highlighting spans (highlight.ts token kinds). */
+.tok-keyword { color: var(--fifi-accent); font-weight: 600; }
+.tok-string { color: var(--fifi-ready); }
+.tok-comment { color: var(--fifi-text-tertiary); font-style: italic; }
+.tok-number { color: var(--fifi-busy); }
+
+/* Composer attach + params. */
+.attach-btn {
+  align-self: flex-end;
+  min-height: 36px;
+  padding: 0 var(--fifi-space-3);
+  border: 1px solid var(--fifi-separator);
+  border-radius: 999px;
+  background: none;
+  cursor: pointer;
+  font-size: var(--fifi-size-1);
+  color: var(--fifi-text-secondary);
+  white-space: nowrap;
+}
+.attach-btn:hover { background: var(--fifi-fill); }
+.attach-thumb { width: 28px; height: 28px; object-fit: cover; border-radius: 6px; }
+.params-pop {
+  max-width: 720px;
+  margin: 0 auto var(--fifi-space-2);
+  display: flex;
+  gap: var(--fifi-space-4);
+  padding: var(--fifi-space-3);
+  border: 1px solid var(--fifi-hairline);
+  border-radius: var(--fifi-radius-m);
+  background: var(--fifi-content-bg);
+}
+.params-pop[hidden] { display: none; }
+.params-field { display: flex; align-items: center; gap: var(--fifi-space-2); font-size: var(--fifi-size-2); }
+.params-field input { width: 90px; min-height: 32px; padding: 0 var(--fifi-space-2); }
+
+/* Sidebar search, rename, monitor detail. */
+.chat-search {
+  width: calc(100% - 16px);
+  margin: 0 8px 8px;
+  min-height: 34px;
+  padding: 0 var(--fifi-space-3);
+  border: 1px solid var(--fifi-separator);
+  border-radius: 8px;
+  background: var(--fifi-content-bg);
+  color: var(--fifi-text);
+}
+.chat-rename { flex: 1; min-height: 32px; padding: 0 var(--fifi-space-2); }
+.req-row-clickable { cursor: pointer; }
+.req-row-clickable:hover td { background: var(--fifi-fill); }
+.request-detail {
+  margin-top: var(--fifi-space-3);
+  border: 1px solid var(--fifi-hairline);
+  border-radius: var(--fifi-radius-m);
+  overflow: hidden;
+}
+.request-detail .fact-grid { padding: var(--fifi-space-3); }
+
+/* Reduced motion: no transitions or smooth scrolling. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -17,6 +17,7 @@ import {
   deleteChat,
   getChat,
   loadSettings,
+  saveSettings,
   newChatRecord,
   newUiMessage,
   putChat,
@@ -27,9 +28,9 @@ import {
 import { formatDuration, formatSpeed, formatTokens } from "./format";
 import { DeadChats } from "./deadchats";
 import { SendGate } from "./sendgate";
-import { renderMarkdown } from "./markdown";
-import { copyText, flashCopied } from "./copy";
-import { composeOutgoing, isLargePaste, isLongMessage, pasteSummary } from "./paste";
+import { renderMarkdown, renderMarkdownIncremental } from "./markdown";
+import { copyText, downloadText, flashCopied } from "./copy";
+import { composeOutgoing, isLargePaste, isLongMessage, looksTextual, pasteSummary } from "./paste";
 
 export interface ChatHooks {
   onBusyChange(busy: boolean): void;
@@ -62,6 +63,8 @@ interface StreamDom {
   thinkingText: Text | null;
   /** The markdown host for the reply text; re-rendered per flush. */
   textHost: HTMLElement;
+  /** The text the host currently shows, for incremental re-render. */
+  renderedText: string;
   tools: HTMLElement | null;
   meta: HTMLElement;
   actions: HTMLElement;
@@ -93,6 +96,11 @@ export class ChatView {
   /** Large pastes held as composer attachments until Send. */
   private pendingPastes: string[] = [];
   private pasteTray: HTMLElement | null = null;
+  /** Text files held as attachments; sent as fenced blocks. */
+  private pendingFiles: { name: string; text: string }[] = [];
+  /** Image attachments: previewed, but a text-only engine cannot take
+   * them; Send says so and sends the text parts only. */
+  private pendingImages: { name: string; url: string }[] = [];
 
   constructor(
     column: HTMLElement,
@@ -119,6 +127,12 @@ export class ChatView {
       }
     });
     this.input.addEventListener("paste", (e) => {
+      const files = e.clipboardData?.files;
+      if (files !== undefined && files.length > 0) {
+        e.preventDefault();
+        void this.addFiles(files);
+        return;
+      }
       const pasted = e.clipboardData?.getData("text") ?? "";
       if (pasted === "" || !isLargePaste(pasted)) return; // small paste: normal textarea behaviour
       e.preventDefault();
@@ -128,6 +142,7 @@ export class ChatView {
       this.input.focus();
     });
     this.buildPasteTray();
+    this.buildAttachButton();
     this.sendButton.addEventListener("click", () => {
       if (this.controller !== null) this.controller.abort();
       else void this.send();
@@ -143,7 +158,7 @@ export class ChatView {
   }
 
   private updateSendEnabled(): void {
-    const hasText = this.input.value.trim() !== "" || this.pendingPastes.length > 0;
+    const hasText = this.input.value.trim() !== "" || this.pendingPastes.length > 0 || this.pendingFiles.length > 0;
     const streaming = this.controller !== null;
     this.sendButton.disabled = !streaming && (!hasText || this.offline);
     // Exactly one icon at a time: the class drives CSS, `hidden` is the
@@ -174,34 +189,155 @@ export class ChatView {
     this.pasteTray = tray;
   }
 
+  private attachChip(labelText: string, ariaLabel: string, onRemove: () => void, thumbUrl?: string): HTMLElement {
+    const chip = document.createElement("span");
+    chip.className = "paste-chip";
+    if (thumbUrl !== undefined) {
+      const img = document.createElement("img");
+      img.className = "attach-thumb";
+      img.src = thumbUrl;
+      img.alt = "";
+      chip.append(img);
+    }
+    const label = document.createElement("span");
+    label.textContent = labelText;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "paste-remove";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", ariaLabel);
+    remove.addEventListener("click", onRemove);
+    chip.append(label, remove);
+    return chip;
+  }
+
   private renderPasteTray(): void {
     const tray = this.pasteTray;
     if (tray === null) return;
     tray.textContent = "";
-    tray.hidden = this.pendingPastes.length === 0;
+    tray.hidden =
+      this.pendingPastes.length === 0 && this.pendingFiles.length === 0 && this.pendingImages.length === 0;
     this.pendingPastes.forEach((text, index) => {
-      const chip = document.createElement("span");
-      chip.className = "paste-chip";
-      const label = document.createElement("span");
-      label.textContent = "Pasted text · " + pasteSummary(text);
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "paste-remove";
-      remove.textContent = "Remove";
-      remove.setAttribute("aria-label", "Remove pasted text " + (index + 1));
-      remove.addEventListener("click", () => {
+      tray.append(this.attachChip("Pasted text · " + pasteSummary(text), "Remove pasted text " + (index + 1), () => {
         this.pendingPastes.splice(index, 1);
         this.renderPasteTray();
         this.updateSendEnabled();
-      });
-      chip.append(label, remove);
-      tray.append(chip);
+      }));
+    });
+    this.pendingFiles.forEach((file, index) => {
+      tray.append(this.attachChip("File · " + file.name, "Remove file " + file.name, () => {
+        this.pendingFiles.splice(index, 1);
+        this.renderPasteTray();
+        this.updateSendEnabled();
+      }));
+    });
+    this.pendingImages.forEach((image, index) => {
+      tray.append(this.attachChip("Image · " + image.name + " (not sent: text-only engine)", "Remove image " + image.name, () => {
+        URL.revokeObjectURL(image.url);
+        this.pendingImages.splice(index, 1);
+        this.renderPasteTray();
+        this.updateSendEnabled();
+      }, image.url));
     });
   }
 
   private clearPastes(): void {
     this.pendingPastes = [];
+    this.pendingFiles = [];
+    for (const image of this.pendingImages) URL.revokeObjectURL(image.url);
+    this.pendingImages = [];
     this.renderPasteTray();
+  }
+
+  /** Attach button and hidden file input at the composer's left edge,
+   * plus drag-and-drop onto the composer. */
+  private buildAttachButton(): void {
+    const composer = this.input.closest(".composer");
+    const wrap = this.input.closest(".composer-wrap");
+    if (composer === null || wrap === null) return;
+    const picker = document.createElement("input");
+    picker.type = "file";
+    picker.multiple = true;
+    picker.hidden = true;
+    picker.setAttribute("aria-label", "Attach files");
+    picker.addEventListener("change", () => {
+      if (picker.files !== null) void this.addFiles(picker.files);
+      picker.value = "";
+    });
+    const paramsBtn = document.createElement("button");
+    paramsBtn.type = "button";
+    paramsBtn.className = "attach-btn";
+    paramsBtn.textContent = "Params";
+    paramsBtn.title = "Sampling parameters for the next replies";
+    const panel = document.createElement("div");
+    panel.className = "params-pop";
+    panel.hidden = true;
+    const current = loadSettings().drawer;
+    const numberField = (label: string, value: number, step: string, apply: (n: number) => void): HTMLElement => {
+      const wrap = document.createElement("label");
+      wrap.className = "params-field";
+      const name = document.createElement("span");
+      name.textContent = label;
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = step;
+      input.value = String(value);
+      input.addEventListener("change", () => {
+        const n = Number(input.value);
+        if (Number.isFinite(n)) apply(n);
+      });
+      wrap.append(name, input);
+      return wrap;
+    };
+    panel.append(
+      numberField("Temperature", current.temperature, "0.1", (n) => {
+        const s = loadSettings();
+        saveSettings({ ...s, drawer: { ...s.drawer, temperature: n } });
+      }),
+      numberField("Max tokens", current.maxTokens, "1", (n) => {
+        const s = loadSettings();
+        saveSettings({ ...s, drawer: { ...s.drawer, maxTokens: Math.max(1, Math.round(n)) } });
+      })
+    );
+    paramsBtn.addEventListener("click", () => {
+      panel.hidden = !panel.hidden;
+    });
+    composer.insertBefore(paramsBtn, this.input);
+    wrap.insertBefore(panel, composer);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "attach-btn";
+    button.textContent = "Attach";
+    button.title = "Attach text files or images";
+    button.addEventListener("click", () => picker.click());
+    composer.insertBefore(button, this.input);
+    composer.append(picker);
+    wrap.addEventListener("dragover", (e) => e.preventDefault());
+    wrap.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const transfer = (e as DragEvent).dataTransfer;
+      if (transfer !== null && transfer.files.length > 0) {
+        void this.addFiles(transfer.files);
+      }
+    });
+  }
+
+  private async addFiles(files: FileList): Promise<void> {
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith("image/")) {
+        this.pendingImages.push({ name: file.name, url: URL.createObjectURL(file) });
+        continue;
+      }
+      const text = await file.text().catch(() => null);
+      if (text === null || !looksTextual(text)) {
+        this.hooks.onNotice("Could not attach " + file.name + ": only text files and images are supported.");
+        continue;
+      }
+      this.pendingFiles.push({ name: file.name, text });
+    }
+    this.renderPasteTray();
+    this.updateSendEnabled();
+    this.input.focus();
   }
 
   /** The partial reply is kept. */
@@ -335,6 +471,29 @@ export class ChatView {
       void copyText(raw).then((ok) => flashCopied(copy, ok));
     });
     row.append(copy);
+    if (m.role === "user") {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "msg-copy";
+      edit.textContent = "Edit";
+      edit.setAttribute("aria-label", "Edit this message and resend");
+      edit.addEventListener("click", () => this.editUserMessage(m));
+      row.append(edit);
+    } else {
+      const regen = document.createElement("button");
+      regen.type = "button";
+      regen.className = "msg-copy";
+      regen.textContent = m.state === "error" ? "Retry" : "Regenerate";
+      regen.setAttribute("aria-label", "Regenerate this reply");
+      regen.addEventListener("click", () => this.regenerate(m));
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "msg-copy";
+      download.textContent = "Download";
+      download.setAttribute("aria-label", "Download this reply as markdown");
+      download.addEventListener("click", () => downloadText("reply.md", raw, "text/markdown"));
+      row.append(regen, download);
+    }
     if (m.role === "assistant" && m.replyId !== undefined && m.traceSegs !== undefined) {
       row.append(this.buildTraceButton(m));
     }
@@ -440,7 +599,11 @@ export class ChatView {
   }
 
   private async send(): Promise<void> {
-    const text = composeOutgoing(this.input.value, this.pendingPastes);
+    const fileBlocks = this.pendingFiles.map((f) => "File: " + f.name + "\n```\n" + f.text + "\n```");
+    const text = composeOutgoing(this.input.value, [...this.pendingPastes, ...fileBlocks]);
+    if (text !== "" && this.pendingImages.length > 0) {
+      this.hooks.onNotice("Images are not sent: this engine takes text only.");
+    }
     if (text === "" || this.offline) return;
     const noModel = noModelNotice(loadSettings().model);
     if (noModel !== null) {
@@ -485,17 +648,61 @@ export class ChatView {
       else this.column.append(this.renderMessage(userMsg));
       this.scrollToEnd();
 
-      const assistant = newUiMessage("assistant", "");
-      assistant.state = "streaming";
-      // The record joins the chat at stream start, so a reload, a chat switch,
-      // and the next request all see it. buildMessages skips its empty content.
-      chat.messages.push(assistant);
-      this.startStream(chat, assistant, controller);
+      this.launchAssistant(chat, controller);
     } catch (err) {
       // The stream never started; drop the busy state instead of wedging it.
       this.endPendingSend(controller);
       this.hooks.onNotice("Could not send the message: " + reasonOf(err));
     }
+  }
+
+  /** Push a fresh assistant message and start its stream. The send
+   * gate and controller must already be held by the caller. */
+  private launchAssistant(chat: ChatRecord, controller: AbortController): void {
+    const assistant = newUiMessage("assistant", "");
+    assistant.state = "streaming";
+    // The record joins the chat at stream start, so a reload, a chat switch,
+    // and the next request all see it. buildMessages skips its empty content.
+    chat.messages.push(assistant);
+    this.startStream(chat, assistant, controller);
+  }
+
+  /** Re-run the turn of an assistant message: drop it and everything
+   * after it, then stream a fresh reply to the same history. */
+  private regenerate(m: UiMessage): void {
+    const chat = this.chat;
+    if (chat === null || this.controller !== null || this.offline) return;
+    const idx = chat.messages.indexOf(m);
+    if (idx < 0) return;
+    if (!this.sendGate.tryBegin()) return;
+    const controller = new AbortController();
+    this.controller = controller;
+    this.updateSendEnabled();
+    chat.messages.splice(idx);
+    chat.updatedAt = Date.now();
+    void putChat(chat).catch((err: unknown) =>
+      this.hooks.onNotice("Could not save this chat: " + reasonOf(err))
+    );
+    this.renderAll();
+    this.launchAssistant(chat, controller);
+  }
+
+  /** Load a user message back into the composer and drop it and
+   * everything after it, so Send creates the revised turn. */
+  private editUserMessage(m: UiMessage): void {
+    const chat = this.chat;
+    if (chat === null || this.controller !== null) return;
+    const idx = chat.messages.indexOf(m);
+    if (idx < 0) return;
+    chat.messages.splice(idx);
+    chat.updatedAt = Date.now();
+    void putChat(chat).catch((err: unknown) =>
+      this.hooks.onNotice("Could not save this chat: " + reasonOf(err))
+    );
+    this.input.value = m.content;
+    this.renderAll();
+    this.autosize();
+    this.input.focus();
   }
 
   private endPendingSend(controller: AbortController): void {
@@ -673,7 +880,7 @@ export class ChatView {
     root.append(waiting, textEl, actions, meta);
     this.column.append(root);
     this.scrollToEnd();
-    return { root, waiting, thinking: null, thinkingText: null, textHost: textEl, tools: null, meta, actions };
+    return { root, waiting, thinking: null, thinkingText: null, textHost: textEl, renderedText: "", tools: null, meta, actions };
   }
 
   private scheduleFlush(): void {
@@ -714,9 +921,10 @@ export class ChatView {
       this.pendingContent = "";
       // Re-render the markdown built so far. This runs at most once per
       // animation frame, so code fences and emphasis settle as they stream.
-      renderMarkdown(dom.textHost, msg.content, {
+      renderMarkdownIncremental(dom.textHost, dom.renderedText, msg.content, {
         onCopyCode: (code, btn) => void this.copyCode(code, btn),
       });
+      dom.renderedText = msg.content;
       dom.textHost.scrollIntoView({ block: "end" });
     }
   }

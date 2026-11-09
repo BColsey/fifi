@@ -5,6 +5,8 @@
  * renderMarkdown touches the document.
  */
 
+import { highlightable, tokenize } from "./highlight.js";
+
 export type Inline =
   | { kind: "text"; text: string }
   | { kind: "code"; text: string }
@@ -240,10 +242,28 @@ export interface RenderOptions {
   onCopyCode?: (code: string, button: HTMLButtonElement) => void;
 }
 
-/** Replace the host's children with the rendered markdown. */
-export function renderMarkdown(host: HTMLElement, text: string, opts: RenderOptions = {}): void {
-  host.textContent = "";
-  for (const block of parseBlocks(text)) {
+/** Append code as highlighted spans (or one text node when plain). */
+function renderCode(codeEl: HTMLElement, lang: string, code: string): void {
+  if (!highlightable(lang)) {
+    codeEl.textContent = code;
+    return;
+  }
+  for (const span of tokenize(code)) {
+    if (span.kind === "plain") {
+      codeEl.append(document.createTextNode(span.text));
+    } else {
+      const s = document.createElement("span");
+      s.className = "tok-" + span.kind;
+      s.textContent = span.text;
+      codeEl.append(s);
+    }
+  }
+}
+
+/** Render one block to a fresh element. */
+function renderBlock(block: Block, opts: RenderOptions): HTMLElement {
+  const host = document.createElement("div");
+  {
     if (block.kind === "code") {
       const wrap = document.createElement("div");
       wrap.className = "code-block";
@@ -261,7 +281,7 @@ export function renderMarkdown(host: HTMLElement, text: string, opts: RenderOpti
       head.append(lang, copy);
       const pre = document.createElement("pre");
       const code = document.createElement("code");
-      code.textContent = block.code;
+      renderCode(code, block.lang, block.code);
       pre.append(code);
       wrap.append(head, pre);
       host.append(wrap);
@@ -318,5 +338,53 @@ export function renderMarkdown(host: HTMLElement, text: string, opts: RenderOpti
       });
       host.append(p);
     }
+  }
+  return host.firstElementChild as HTMLElement;
+}
+
+/** Replace the host's children with the rendered markdown. */
+export function renderMarkdown(host: HTMLElement, text: string, opts: RenderOptions = {}): void {
+  host.textContent = "";
+  for (const block of parseBlocks(text)) {
+    host.append(renderBlock(block, opts));
+  }
+}
+
+/** Whether every block of `a` before its last equals the same-index
+ * block of `b`: the condition for re-rendering only the tail. */
+export function blocksSharePrefix(a: Block[], b: Block[]): boolean {
+  if (b.length < a.length || a.length === 0) return false;
+  for (let i = 0; i < a.length - 1; i++) {
+    if (JSON.stringify(a[i]) !== JSON.stringify(b[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * Streaming render: when the new text only extends the old, keep the
+ * settled blocks' DOM and re-render from the last old block on. A long
+ * reply then costs one block per frame, not the whole message.
+ */
+export function renderMarkdownIncremental(
+  host: HTMLElement,
+  prevText: string,
+  nextText: string,
+  opts: RenderOptions = {}
+): void {
+  if (prevText === "" || !nextText.startsWith(prevText)) {
+    renderMarkdown(host, nextText, opts);
+    return;
+  }
+  const prevBlocks = parseBlocks(prevText);
+  const nextBlocks = parseBlocks(nextText);
+  if (!blocksSharePrefix(prevBlocks, nextBlocks) || host.childElementCount !== prevBlocks.length) {
+    renderMarkdown(host, nextText, opts);
+    return;
+  }
+  while (host.childElementCount > prevBlocks.length - 1) {
+    host.lastElementChild?.remove();
+  }
+  for (let i = prevBlocks.length - 1; i < nextBlocks.length; i++) {
+    host.append(renderBlock(nextBlocks[i]!, opts));
   }
 }

@@ -49,3 +49,21 @@ export function buildChatBody(settings: Settings, messages: ChatMessage[]): Chat
     "x-sample-trace": settings.drawer.recordTrace ? true : undefined,
   };
 }
+
+/** Sidebar search: title or any message text contains the query. */
+export function chatMatchesQuery(record: { title: string; messages: readonly HistoryTurn[] }, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (q === "") return true;
+  if (record.title.toLowerCase().includes(q)) return true;
+  return record.messages.some((m) => m.content.toLowerCase().includes(q));
+}
+
+/** A conversation as markdown, for export. */
+export function chatMarkdown(record: { title: string; messages: readonly HistoryTurn[] }): string {
+  const lines: string[] = ["# " + record.title, ""];
+  for (const m of record.messages) {
+    if (m.content === "") continue;
+    lines.push(m.role === "user" ? "## You" : "## fifi", "", m.content, "");
+  }
+  return lines.join("\n");
+}
