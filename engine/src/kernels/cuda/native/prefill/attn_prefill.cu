@@ -970,9 +970,18 @@ __device__ inline Q8GroupScalars q8_group_scalars(
  * scores sit in registers, one tile max, one rescale, one expf per key — the per-key serial
  * chain of the scalar kernel is gone. Masking/poison rules, the (maximum, normalizer,
  * accumulator) contract, cell layout rr = (t - t0) * group + g and index order match
- * attn_prefill_part_q8_k; no atomics. */
+ * attn_prefill_part_q8_k; no atomics.
+ *
+ * Launch bounds carry the occupancy this kernel can reach, not an aspiration: the
+ * 64 KiB dynamic shared request of enqueue_q8_tiled is a whole Turing/Ampere SM's
+ * block budget, so at most ONE block is ever resident per SM. minBlocks 2 (ptxas's
+ * reading of a plain 256 bound) is unreachable, and on sm_75 ptxas pays for it —
+ * 128 registers plus a 36-byte spill, and the arm's zero-spill invariant
+ * (localSizeBytes == 0) then refuses the kernel with cudaErrorInvalidValue for the
+ * rest of the process. minBlocks 1 compiles spill-free (145 registers) with the
+ * same one-block residency the shared budget already forces. */
 template <int kHeadDim>
-__global__ void __launch_bounds__(256) attn_prefill_part_q8_tile_k(Args a,
+__global__ void __launch_bounds__(256, 1) attn_prefill_part_q8_tile_k(Args a,
                                                                   inference_cuda_attn_kv_pair views) {
     constexpr int kLanes = 32, kWarps = 8;
     constexpr int kDims = kHeadDim / kLanes;       // dims one lane owns
