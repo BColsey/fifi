@@ -516,6 +516,15 @@ impl TieredHost {
         // original inline-complete fills never had to state).
         self.drain_fills(device)?;
         for swap in &swaps {
+            // The policy can select a promotee from an earlier swap in this same
+            // boundary as the next victim. Publish any queued fills before trying
+            // to unpublish that victim; skipping individual swaps would leave the
+            // policy and ledger out of step for longer chains.
+            if let Some(evict) = swap.evict
+                && self.table.lookup(usize::from(swap.layer), evict).is_none()
+            {
+                self.drain_fills(device)?;
+            }
             if let Err(error) = self.apply_swap(device, swap) {
                 self.poisoned = true;
                 self.table.publish_ready();
@@ -1073,6 +1082,8 @@ mod tests {
         fills: Vec<(usize, usize, ExpertRanges)>,
         fail_on: Option<usize>,
         fail_wait: bool,
+        fail_wait_at: Option<usize>,
+        waits: usize,
     }
 
     impl BankDevice for MockDevice {
@@ -1091,7 +1102,9 @@ mod tests {
         }
 
         fn wait_fills(&mut self) -> Result<(), HostError> {
-            if self.fail_wait {
+            let call = self.waits;
+            self.waits += 1;
+            if self.fail_wait || self.fail_wait_at == Some(call) {
                 return Err(HostError::Device(String::from("mock wait failure")));
             }
             Ok(())
@@ -1773,6 +1786,82 @@ mod tests {
             "the skipped candidate never filled"
         );
         f.host.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn chained_boundary_swaps_publish_a_pending_victim_before_eviction() {
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 2.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let routes = [
+            vec![1, 2, 6, 5],
+            vec![7, 3, 0],
+            vec![0, 4],
+            vec![2, 7, 0, 4],
+            vec![3, 6, 5, 0],
+            vec![0, 7, 4],
+        ];
+        let mut last = None;
+        let mut last_waits = 0;
+        for ids in routes {
+            let before = device.waits;
+            last = Some(run_token(&mut f, &[ids], &mut device).unwrap());
+            last_waits = device.waits - before;
+            f.host.check_consistency().unwrap();
+        }
+        assert_eq!(last.unwrap().swaps, 2);
+        assert_eq!(last_waits, 3, "only the dependent swap needs an extra wait");
+        assert!(f.host.is_resident(0, 7));
+        assert!(!f.host.is_resident(0, 4));
+    }
+
+    #[test]
+    fn three_chained_boundary_swaps_keep_policy_and_ledger_in_sync() {
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 8.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        let before = device.waits;
+        run_token(&mut f, &[vec![0, 3]], &mut device).unwrap();
+        assert_eq!(device.waits - before, 2, "an independent swap adds no wait");
+        f.host.check_consistency().unwrap();
+        let before = device.waits;
+        let report = run_token(&mut f, &[vec![6, 2, 4, 3]], &mut device).unwrap();
+        assert_eq!(report.swaps, 3);
+        assert_eq!(
+            device.waits - before,
+            4,
+            "both pending victims must publish"
+        );
+        f.host.check_consistency().unwrap();
+        assert!(f.host.is_resident(0, 6));
+        assert!(!f.host.is_resident(0, 2));
+        assert!(!f.host.is_resident(0, 4));
+    }
+
+    #[test]
+    fn a_failed_wait_for_a_pending_boundary_victim_poisons_the_host() {
+        let mut f = fixture_with_rate(Duration::from_secs(60), 2, 2.0);
+        let mut device = MockDevice::default();
+        f.host.preload_all(&mut device).unwrap();
+        for ids in [
+            vec![1, 2, 6, 5],
+            vec![7, 3, 0],
+            vec![0, 4],
+            vec![2, 7, 0, 4],
+            vec![3, 6, 5, 0],
+        ] {
+            run_token(&mut f, &[ids], &mut device).unwrap();
+        }
+        // The first boundary wait succeeds; the dependent victim's wait fails.
+        device.fail_wait_at = Some(device.waits + 1);
+        assert!(matches!(
+            run_token(&mut f, &[vec![0, 7, 4]], &mut device),
+            Err(HostError::Device(_))
+        ));
+        assert!(matches!(
+            f.host.end_token(&mut device),
+            Err(HostError::Poisoned)
+        ));
     }
 
     #[test]
