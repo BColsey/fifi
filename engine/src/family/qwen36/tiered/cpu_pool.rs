@@ -320,22 +320,12 @@ impl CpuPool {
             gate,
         });
         let mut handles = Vec::with_capacity(threads);
-        let chunk_workers = threads / 2;
-        for chunk_at in 0..threads {
+        for worker_at in 0..threads {
             let worker_shared = Arc::clone(&shared);
             let worker = Worker::new(kernel, shape);
-            let name = if chunk_at < chunk_workers {
-                format!("qwen36-cpu-pool-chunk-{chunk_at}")
-            } else {
-                format!("qwen36-cpu-pool-{}", chunk_at - chunk_workers)
-            };
-            let loop_chunk = chunk_at < chunk_workers;
-            let spawned = std::thread::Builder::new().name(name).spawn(move || {
-                if loop_chunk {
-                } else {
-                    worker_loop(worker_shared, shape, worker)
-                }
-            });
+            let spawned = std::thread::Builder::new()
+                .name(format!("qwen36-cpu-pool-{worker_at}"))
+                .spawn(move || worker_loop(worker_shared, shape, worker));
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(_) => {
