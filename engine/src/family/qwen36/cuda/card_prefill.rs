@@ -112,12 +112,31 @@ pub(super) fn build_card_chunk(
         let list = chunk_tensors_for(dims, &geometry, &host_moe, m_chunk, facts.nsm)?;
         // The card's arena: the same builder the single-device path uses,
         // over the card's list (zero-filled, part buffer, kv8 staging).
-        let arena = PrefillArena::allocate_list(
+        let mut arena = PrefillArena::allocate_list(
             &stack.contexts()[card],
             &stack.streams()[card],
             list,
             (m_chunk, facts, m_chunk * hidden * 4),
         )?;
+        // The FP16 attention staging: without it the KV8 attention pays a
+        // blocking causal-length write before every tile. DEFAULT OFF for
+        // cards: with staging attached, the flash launch refuses with
+        // `invalid argument` under the card geometry (both dequant
+        // launches pass; the failure is inside attn_prefill at
+        // n_head 8 / n_kv_head 1 / ld 4608 / cache_rows 65536 - the
+        // guard at attn_prefill.rs:738 admits 8 == GROUP*1, so the
+        // refusal is deeper, likely the native launch config). Unsized
+        // guesses (chunk-capacity plans, head-count plans) fail the same
+        // way; this needs the native grid inspection. Q36_P2P_CHUNK_STAGED
+        // opts in for the investigation.
+        if std::env::var_os("Q36_P2P_CHUNK_STAGED").is_some_and(|v| v == "1") {
+            let plan = super::prefill_driver::Kv8StagingPlan::for_context(
+                65_536,
+                geometry.attn.heads_kv,
+                geometry.attn.head_dim,
+            )?;
+            arena.attach_kv8_staging(&stack.contexts()[card], plan, false)?;
+        }
         // The card's own views, resolved exactly as the session resolves
         // them, then leaked for the chunk models' process lifetime.
         let weights_card_of = inputs.weights[card];
