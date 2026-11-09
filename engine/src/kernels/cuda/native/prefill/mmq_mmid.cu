@@ -309,6 +309,10 @@ extern "C" int inference_cuda_mmq_mmid_launch(const inference_cuda_mmq_mmid_args
         }
         const mmq_args args = to_mmq_args(a, facts);
         const cudaStream_t s = (cudaStream_t)stream;
+        fprintf(stderr, "mmq_mmid: k=%lld n=%lld e=%lld m=%lld ne=%lld stride_ch=%lld nr_dst=%lld\n",
+                (long long)a->ncols_x, (long long)a->nrows_x, (long long)a->nchannels_x,
+                (long long)a->ncols_max, (long long)a->ncols_dst,
+                (long long)a->stride_channel_x, (long long)a->nrows_dst);
         Failure failure;
         failure.record(a->type_x == INFERENCE_CUDA_TYPE_Q4_K
                            ? mul_mat_q_case<GGML_TYPE_Q4_K>(args, s)
