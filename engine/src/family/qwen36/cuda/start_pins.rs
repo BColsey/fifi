@@ -119,8 +119,9 @@ fn the_cuda_step_reports_the_admitted_pinned_store_limits() {
         limits,
         concat!(
             "fnprefix_limits(&self)->StoreLimits{",
-            "ifself.is_tiered(){StoreLimits{roots:0,entries:0,}}",
-            "else{self.prefix.limits()}}",
+            "effective_prefix_limits(self.is_tiered(),",
+            "tiered_prefix_enabled(std::env::var_os(TIERED_PREFIX_VAR).as_deref()),",
+            "self.prefix.limits(),)}",
         )
     );
     let admission = pinned(section_of(
