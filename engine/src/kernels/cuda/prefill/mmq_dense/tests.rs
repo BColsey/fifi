@@ -2085,3 +2085,131 @@ fn mmq_prefill_ceiling_probe() {
         }
     }
 }
+
+/// The card chunk's delta_proj geometry sweep: four column widths as
+/// segments of the wide fused destination (ld 8224), Q4_K, k = hidden,
+/// across the chunk row counts that refused on the cards (m >= ~32)
+/// beside the stable small ones. Standalone buffers: if a shape refuses
+/// here, the boundary is in the kernel dispatch; if all pass, the
+/// refusal in the serving path comes from the arena's ranges.
+#[test]
+fn card_delta_widths_m_sweep() {
+    const NAME: &str = "card_delta_widths_m_sweep";
+    if !testkit::device_present(NAME) {
+        return;
+    }
+    let order: [usize; 2] = std::env::var_os("FIFI_SWEEP_REVERSE")
+        .map(|_| [1, 0])
+        .unwrap_or([0, 1]);
+    for device in order {
+        sweep_on(device);
+    }
+}
+
+fn sweep_on(device: usize) {
+    let admission = crate::family::project::cuda::served_admission();
+    let ctx = CudaContext::with_admission_on(device, &admission).expect("context");
+    let stream = ctx.stream().expect("stream");
+    let fixup_bytes = ctx.mmq_fixup_bytes().expect("fixup floor");
+    let fixup = fixup_buffer(&ctx, fixup_bytes);
+    let k = 2048usize;
+    const NAME: &str = "card_delta_widths_m_sweep";
+    let ld = 4096usize + 2048 + 16 + 16;
+    let segments: [(usize, usize); 4] = [(4096, 0), (2048, 4096), (16, 4096 + 2048), (16, ld - 16)];
+    let ms = [16usize, 25, 26, 31, 32, 48, 64, 96, 128, 255, 256];
+    for &(n, col_off) in &segments {
+        let bytes = weight_bytes(QuantType::Q4K, n, k, 0x5E55);
+        let weight = upload_weight(&ctx, QuantType::Q4K, (n, k), &bytes).expect("weight");
+        // The card delta tensors in the mixed-quant model are Q8_0: sweep
+        // both types at the same geometry.
+        for ty in [QuantType::Q4K, QuantType::Q80] {
+            let bytes = weight_bytes(ty, n, k, 0x5E56);
+            let weight = upload_weight(&ctx, ty, (n, k), &bytes).expect("weight");
+            for &m in &ms {
+                let Ok(need) = dense_needs(ty, k, n, m, ld, col_off) else {
+                    continue;
+                };
+                let x: Vec<f32> = (0..m * k).map(|i| (i % 131) as f32 * 0.01).collect();
+                let xb = testkit::upload_f32(&ctx, &x);
+                let y = ctx.allocate(need.y).expect("y");
+                let dst = ctx.allocate(need.dst).expect("dst");
+                let out = ctx
+                    .mmq_dense_input(
+                        &stream,
+                        MmqDenseInputCall {
+                            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+                            weight: &weight,
+                            m,
+                            row_stride: k,
+                            x: xb.range(0, xb.bytes()).expect("x"),
+                            y: y.range(0, need.y).expect("y"),
+                        },
+                    )
+                    .and_then(|()| {
+                        ctx.mmq_dense(
+                            &stream,
+                            MmqDenseCall {
+                                weight: &weight,
+                                w_seg: None,
+                                m,
+                                q8_1: y.range(0, need.y).expect("y"),
+                                dst: dst.range(0, need.dst).expect("dst"),
+                                ld,
+                                col_off,
+                                fixup: fixup.range(0, fixup_bytes).expect("fixup"),
+                            },
+                        )
+                    });
+                if let Err(error) = out {
+                    println!(
+                        "{NAME}: dev {device} {ty:?} n {n} off {col_off} m {m}: REFUSED {error:?}"
+                    );
+                }
+                stream.synchronize().expect("sync");
+            }
+        }
+        for &m in &ms {
+            let Ok(need) = dense_needs(QuantType::Q4K, k, n, m, ld, col_off) else {
+                println!("{NAME}: n {n} m {m}: REFUSED by dense_needs");
+                continue;
+            };
+            let x: Vec<f32> = (0..m * k).map(|i| (i % 131) as f32 * 0.01).collect();
+            let xb = testkit::upload_f32(&ctx, &x);
+            let y = ctx.allocate(need.y).expect("y");
+            let dst = ctx.allocate(need.dst).expect("dst");
+            let quantized = ctx.mmq_dense_input(
+                &stream,
+                MmqDenseInputCall {
+                    packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
+                    weight: &weight,
+                    m,
+                    row_stride: k,
+                    x: xb.range(0, xb.bytes()).expect("x"),
+                    y: y.range(0, need.y).expect("y"),
+                },
+            );
+            let gemmed = quantized.and_then(|()| {
+                ctx.mmq_dense(
+                    &stream,
+                    MmqDenseCall {
+                        weight: &weight,
+                        w_seg: None,
+                        m,
+                        q8_1: y.range(0, need.y).expect("y"),
+                        dst: dst.range(0, need.dst).expect("dst"),
+                        ld,
+                        col_off,
+                        fixup: fixup.range(0, fixup_bytes).expect("fixup"),
+                    },
+                )
+            });
+            match gemmed {
+                Ok(()) => println!("{NAME}: n {n:5} off {col_off:5} m {m:4}: ok"),
+                Err(error) => {
+                    println!("{NAME}: n {n:5} off {col_off:5} m {m:4}: REFUSED {error:?}")
+                }
+            }
+            stream.synchronize().expect("sync");
+        }
+    }
+}

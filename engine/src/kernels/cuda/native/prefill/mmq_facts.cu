@@ -45,20 +45,36 @@ static cudaError_t mmq_facts_live(fifi_device_facts *out) {
     return cudaSuccess;
 }
 
-// Cached: every MMQ entry used to run this query, which is cudaGetDevice plus four
-// cudaDeviceGetAttribute calls. A 128-row chunk makes about 470 MMQ entries, so the cache
-// removes roughly 2,350 driver calls per chunk from the enqueue path.
+// Cached per DEVICE: every MMQ entry used to run this query, which is
+// cudaGetDevice plus four cudaDeviceGetAttribute calls - a 128-row chunk
+// makes about 470 MMQ entries, so the cache removes roughly 2,350 driver
+// calls per chunk from the enqueue path. The original single-slot cache was
+// a process-wide static filled by whichever card ran first: the second card
+// then armed ITS shared-memory opt-in for the first card's ordinal and the
+// >48 KB stream-k launches failed with cudaErrorInvalidValue (the multi-
+// device engine interleaves cards on one thread). One slot per ordinal
+// fixes the dense and grouped GEMMs alike.
 cudaError_t inference_cuda_mmq_query_facts(fifi_device_facts *out) {
-    static const fifi_device_facts cached = [] {
-        fifi_device_facts facts{};
-        const cudaError_t err = mmq_facts_live(&facts);
-        return err == cudaSuccess ? facts : fifi_device_facts{};
-    }();
-    if (cached.cc == 0) {
-        // The first query failed. Repeat it so the caller sees the device error, not a zero fact.
+    static constexpr int kMaxDevices = 16;
+    static fifi_device_facts cached[kMaxDevices];
+    static bool have[kMaxDevices] = {};
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    if (device < 0 || device >= kMaxDevices) {
+        // Outside the cache's reach: query live rather than guess.
         return mmq_facts_live(out);
     }
-    *out = cached;
+    if (!have[device]) {
+        const cudaError_t live = mmq_facts_live(&cached[device]);
+        if (live != cudaSuccess) {
+            return live;
+        }
+        have[device] = true;
+    }
+    *out = cached[device];
     return cudaSuccess;
 }
 

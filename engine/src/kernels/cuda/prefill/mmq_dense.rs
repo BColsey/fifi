@@ -353,7 +353,31 @@ impl CudaContext {
             fixup: self.raw_range(&call.fixup)?,
             ints,
         };
-        self.launch_on(stream, move |stream_raw| mmq_dense_launch(stream_raw, raw))
+        self.launch_on(stream, move |stream_raw| {
+            let out = mmq_dense_launch(stream_raw, raw);
+            if out.is_err() {
+                eprintln!(
+                    "mmq-dense-debug: k {k} n {n} m {} ld {} col_off {} \
+                     w [{:#x},+{:#x}) y [{:#x},+{:#x}) dst [{:#x},+{:#x}) fixup [{:#x},+{:#x}) \
+                     need w {:#x} y {:#x} dst {:#x} floor {fixup_floor:#x}",
+                    call.m,
+                    call.ld,
+                    call.col_off,
+                    w.offset(),
+                    need.w,
+                    call.q8_1.offset(),
+                    need.y,
+                    call.dst.offset(),
+                    need.dst,
+                    call.fixup.offset(),
+                    call.fixup.bytes(),
+                    need.w,
+                    need.y,
+                    need.dst,
+                );
+            }
+            out
+        })
     }
 }
 

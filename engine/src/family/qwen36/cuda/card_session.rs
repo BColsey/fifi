@@ -636,7 +636,13 @@ impl ExecutorOps for CardSession {
     /// (standalone repro at k=2048, card n, m sweep; the J-config smem
     /// opt-in per instantiation is the first suspect).
     fn prefill_piece(&self) -> Option<usize> {
-        None
+        // Investigation gate: Q36_P2P_CHUNK_PIECE=1 advertises the chunk
+        // rows as the piece so the large-m path runs under the diagnostic
+        // build. Default off (m >= ~32 refuses at delta_proj).
+        if !std::env::var_os("Q36_P2P_CHUNK_PIECE").is_some_and(|v| v == "1") {
+            return None;
+        }
+        self.chunk.as_ref().map(|chunk| chunk.m_sess())
     }
 
     /// Snapshots every card's state (its sliced KV planes plus its DeltaNet

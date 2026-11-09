@@ -253,11 +253,56 @@ extern "C" size_t inference_cuda_mmq_dense_fixup_need(const inference_cuda_mmq_d
     }
 }
 
+static void dump_launch_plan(const inference_cuda_mmq_dense_args &a, const fifi_device_facts &dev) {
+    // Replicates mul_mat_q_switch_J's walk and prints the SELECTED plan.
+    const ggml_type type = (ggml_type)a.type;
+    const bool fallback = a.n % 128 != 0;
+    const int ncols_opt = a.m;
+    int j_best = 0, ntiles_best = INT_MAX;
+    for (int j = 8; j <= 128 && ntiles_best > 1; j += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, j, fallback, dev.cc);
+        if (config.type == GGML_TYPE_COUNT) continue;
+        if (mmq_get_nbytes_shared(config, dev.cc) > dev.smpbo) continue;
+        const int ntiles = (ncols_opt + config.J - 1) / config.J;
+        if (ntiles < ntiles_best) { j_best = j; ntiles_best = ntiles; }
+    }
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, j_best, fallback, dev.cc);
+    const long long nty = (a.n + config.I - 1) / config.I;
+    const long long ntx = (a.m + config.J - 1) / config.J;
+    fprintf(stderr,
+            "mmq-plan-debug: dev %d cc %d nsm %d smpbo %d | J %d I %d threads %d "
+            "smem %zu stream_k %d tiling(ntx %lld x nty %lld) "
+            "(m=%d n=%d k=%d ld=%d off=%d)\n",
+            dev.device, dev.cc, dev.nsm, (int)dev.smpbo,
+            j_best, config.I, config.nthreads,
+            mmq_get_nbytes_shared(config, dev.cc),
+            (int)ggml_cuda_mmq_get_stream_k(type, j_best, fallback, dev.cc),
+            ntx, nty, a.m, a.n, a.k, a.ld, a.col_off);
+    // The same opt-in the launch performs, with its raw result.
+    {
+        int cur = -1;
+        cudaGetDevice(&cur);
+        const cudaError_t attr_err =
+            cudaFuncSetAttribute(mul_mat_q<GGML_TYPE_Q4_K, 96, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 mmq_get_nbytes_shared(config, dev.cc));
+        cudaFuncAttributes attr = {};
+        cudaFuncGetAttributes(&attr, mul_mat_q<GGML_TYPE_Q4_K, 96, false>);
+        fprintf(stderr,
+                "mmq-plan-debug: current dev %d (facts dev %d), setAttribute -> %d, "
+                "maxDynShared %d, sharedSizeBytes static %d, binaryVersion %d\n",
+                cur, dev.device, (int)attr_err,
+                (int)attr.maxDynamicSharedSizeBytes,
+                (int)attr.sharedSizeBytes, attr.binaryVersion);
+    }
+}
+
 extern "C" int inference_cuda_mmq_dense(const inference_cuda_mmq_dense_args *a, void *stream,
                                         int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         if (!valid_dense(a)) {
+            if (getenv("FIFI_MMQ_DEBUG")) { fifi_device_facts probe = {}; inference_cuda_mmq_query_facts(&probe); dump_launch_plan(*a, probe); }
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         }
         Failure failure;
@@ -271,6 +316,7 @@ extern "C" int inference_cuda_mmq_dense(const inference_cuda_mmq_dense_args *a, 
         if (failure.ok()) {
             failure.record(launch_dense(args, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
         }
+        if (!failure.ok() && getenv("FIFI_MMQ_DEBUG")) dump_launch_plan(*a, args.dev);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
