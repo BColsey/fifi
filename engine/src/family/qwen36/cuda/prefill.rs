@@ -2324,6 +2324,13 @@ pub(super) fn run_chunk_moe(
 /// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
 /// with three differences: (1) the route readback is HOST-side — M rows of ids and
 /// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
+/// Per-stage chunk trace prints, on only with Q36_TIERED_TRACE=1 (production logs stay
+/// quiet; the diagnostics earned their keep during bring-up).
+fn tiered_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1"))
+}
+
 /// grouped ids come from `MmidIds::from_host` with misses spread round-robin over
 /// the slots, each skipping the slots its own row already holds a column in (that
 /// exclusion is the ≤m-columns invariant; a miss's weight is 0.0, so the wasted
@@ -2394,7 +2401,6 @@ fn run_chunk_tiered(
     // up, down), swiglu. The launch code mirrors run_chunk_routed's stages 12-16
     // with the bank stacks in place of the full-depth stacks.
     let gate = native_stack(&weights.gate)?;
-    eprintln!("tiered-chunk: launching scatter quantize (k={hidden}, slots={slots})");
     ctx.mmq_quantize_scatter_ids(
         stream,
         &ids,
@@ -2427,14 +2433,8 @@ fn run_chunk_tiered(
             )
         };
     let q8s = d.get(ChunkSlot::Q8S)?;
-    eprintln!("tiered-chunk: launching gate MMQ");
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
-    eprintln!("tiered-chunk: launching up MMQ");
     launch_mmid(native_stack(&weights.up)?, q8s, 2 * dims.inter, up_dst)?;
-    eprintln!("tiered-chunk: syncing after up MMQ");
-    stream.synchronize()?;
-    eprintln!("tiered-chunk: sync after up MMQ OK");
-    eprintln!("tiered-chunk: launching swiglu");
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2447,7 +2447,8 @@ fn run_chunk_tiered(
     let q8act = d.get(ChunkSlot::Q8Act)?;
     let ids_dst = d.get(ChunkSlot::IdsDst)?;
     let act = d.get(ChunkSlot::Act)?;
-    eprintln!(
+    if tiered_trace() {
+        eprintln!(
         "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
         dims.inter,
         ids.shape().ne_get_rows(),
@@ -2455,7 +2456,8 @@ fn run_chunk_tiered(
         q8act.offset(), q8act.bytes(),
         ids_dst.offset(), ids_dst.bytes(),
     );
-    eprintln!("tiered-chunk: launching gather quantize (Vendor packing)");
+    }
+    if tiered_trace() { eprintln!("tiered-chunk: launching gather quantize (Vendor packing)"); }
     ctx.mmq_quantize_gather_ids(
         stream,
         &ids,
@@ -2468,25 +2470,25 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8Act)?,
         },
     )?;
-    eprintln!("tiered-chunk: syncing after gather");
+    if tiered_trace() { eprintln!("tiered-chunk: syncing after gather"); }
     stream.synchronize()?;
-    eprintln!("tiered-chunk: sync after gather OK");
-    eprintln!("tiered-chunk: launching down MMQ");
+    if tiered_trace() { eprintln!("tiered-chunk: sync after gather OK"); }
+    if tiered_trace() { eprintln!("tiered-chunk: launching down MMQ"); }
     launch_mmid(
         down,
         d.get(ChunkSlot::Q8Act)?,
         dims.hidden,
         d.get(ChunkSlot::Down)?,
     )?;
-    eprintln!("tiered-chunk: down MMQ OK");
+    if tiered_trace() { eprintln!("tiered-chunk: down MMQ OK"); }
 
     // Stage 17, the combine with the patched weights.
-    eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
+    if tiered_trace() { eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
         io.m, io.dims.hidden, io.dims.top_k,
         io.scratch.get(ChunkSlot::Down)?.bytes(),
-        io.h.bytes());
+        io.h.bytes()); }
     combine_chunk_moe(launch, io)?;
-    eprintln!("tiered-chunk: combine OK");
+    if tiered_trace() { eprintln!("tiered-chunk: combine OK"); }
 
     // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
     // weights ones, in place) adding `partial` to the block output.
@@ -2510,12 +2512,12 @@ fn run_chunk_tiered(
         }
         // Upload the partial and add it: 1.0 * partial through a second M-row
         // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
-        eprintln!("tiered-chunk: uploading the CPU partial ({} bytes)", partial.len() * 4);
+        if tiered_trace() { eprintln!("tiered-chunk: uploading the CPU partial ({} bytes)", partial.len() * 4); }
         let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
         let partial_buf = ctx.upload(&bytes)?;
         let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
         let ones_buf = ctx.upload(&ones)?;
-        eprintln!("tiered-chunk: adding the partial via moe_combine");
+        if tiered_trace() { eprintln!("tiered-chunk: adding the partial via moe_combine"); }
         ctx.moe_combine(
             stream,
             crate::kernels::cuda::resident::moe_combine::CombineCall {
@@ -2532,7 +2534,7 @@ fn run_chunk_tiered(
                 out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
             },
         )?;
-        eprintln!("tiered-chunk: partial add OK");
+        if tiered_trace() { eprintln!("tiered-chunk: partial add OK"); }
     }
     Ok(())
 }
@@ -2786,7 +2788,7 @@ fn run_chunk_shared(
             },
         )?;
     }
-    eprintln!("tiered-chunk: launching swiglu");
+    if tiered_trace() { eprintln!("tiered-chunk: launching swiglu"); }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2881,7 +2883,7 @@ fn run_chunk_routed(
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
     launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
     // 14-16, the SwiGLU, the gather quantize and the down launch.
-    eprintln!("tiered-chunk: launching swiglu");
+    if tiered_trace() { eprintln!("tiered-chunk: launching swiglu"); }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
