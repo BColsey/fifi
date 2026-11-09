@@ -879,15 +879,7 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
             }
         }
         for stack in &facts.stacks {
-            // A tiered load's stacks are absent (quant AND experts both None — the
-            // placeholder from model_facts): the banks hold the hot experts and are
-            // checked separately at attach, so the layout check passes them through.
-            // A tiered load's stacks carry no quant (the stacks stay in the file;
-            // the model_facts produced geometry-only placeholders). The banks are
-            // checked at attach; this check passes them through.
-            if stack.quant.is_none() && stack.experts.is_some() {
-                // A tiered placeholder with geometry: pass through.
-            } else if stack.quant.is_none() {
+            if stack.quant.is_none() {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: layout: layer {layer} stack {:?} is not loaded native",
                     stack.role
@@ -895,7 +887,7 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
             }
         }
         for (role, quant) in &facts.shared {
-            if quant.is_none() && !facts.stacks.iter().all(|s| s.quant.is_none()) {
+            if quant.is_none() {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: layout: layer {layer} shared {role:?} is not loaded native"
                 )));
@@ -1023,23 +1015,27 @@ fn model_facts(
                 ],
             ),
             None => {
-                // The tiered placeholders carry the model's full-depth geometry (the
-                // shape checks read n_rows/k; the actual stacks live in the banks).
+                // The tiered placeholders carry the model's full-depth geometry and
+                // its quant type (the banks hold the same Q4_K data as the file).
+                // TODO: read the quant from the banks at runtime when available.
                 let (e, i, h) = (
                     dims.shape.moe.experts,
                     dims.shape.moe.inter,
                     dims.shape.hidden,
                 );
+                let q = Some(QuantType::Q4K);
                 (
                     [
-                        StackFacts { role: Role::FfnGateExps, quant: None, experts: Some(e), n_rows: e * i, k: h },
-                        StackFacts { role: Role::FfnUpExps, quant: None, experts: Some(e), n_rows: e * i, k: h },
-                        StackFacts { role: Role::FfnDownExps, quant: None, experts: Some(e), n_rows: e * h, k: i },
+                        StackFacts { role: Role::FfnGateExps, quant: q, experts: Some(e), n_rows: e * i, k: h },
+                        StackFacts { role: Role::FfnUpExps, quant: q, experts: Some(e), n_rows: e * i, k: h },
+                        StackFacts { role: Role::FfnDownExps, quant: q, experts: Some(e), n_rows: e * h, k: i },
                     ],
+                // The shared expert is loaded for tiered (it's a non-expert
+                // weight); its quant comes from the model's format.
                 [
-                    (Role::FfnGateShexp, None),
-                    (Role::FfnUpShexp, None),
-                    (Role::FfnDownShexp, None),
+                    (Role::FfnGateShexp, Some(QuantType::Q4K)),
+                    (Role::FfnUpShexp, Some(QuantType::Q4K)),
+                    (Role::FfnDownShexp, Some(QuantType::Q4K)),
                 ],
                 )
             }
