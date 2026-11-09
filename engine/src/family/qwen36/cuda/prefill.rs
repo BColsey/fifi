@@ -1247,6 +1247,9 @@ pub(super) struct ChunkRun<'r, 'w> {
     rows: ChunkRows,
     sparse: Option<ChunkSparse<'r>>,
     bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    /// The tiered runtime, present when the session is tiered AND the chunk flag is
+    /// on: the chunk MoE stage routes through the bank stacks + CPU misses.
+    tiered: Option<&'r std::cell::RefCell<TieredRuntime<'w>>>,
     segmented_parts: std::cell::Cell<usize>,
     #[cfg(test)]
     kernel_class: ChunkKernelClass,
@@ -1295,6 +1298,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
             rows,
             sparse: None,
             bank: None,
+            tiered: None,
             segmented_parts: std::cell::Cell::new(0),
             #[cfg(test)]
             kernel_class: ChunkKernelClass::ProductionMmq,
@@ -1303,6 +1307,16 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
 
     pub(super) fn segmented_parts(&self) -> usize {
         self.segmented_parts.get()
+    }
+
+    /// Sets the tiered runtime: the chunk MoE stage routes through the bank stacks
+    /// + CPU misses when this is present.
+    pub(super) fn with_tiered(
+        mut self,
+        runtime: Option<&'r std::cell::RefCell<TieredRuntime<'w>>>,
+    ) -> Self {
+        self.tiered = runtime;
+        self
     }
 
     /// Attaches the session's sparse resources: every committed chunk row then also
@@ -1322,6 +1336,9 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
         self.bank = bank;
         self
     }
+
+    /// Sets the tiered runtime: the chunk MoE stage routes through the bank stacks
+    /// + CPU misses when this is present.
 
     /// Selects this run's diagnostic projections without changing another caller.
     /// `DenseMmvq` includes shared-expert projections; `AllMmvq` also replaces routed GEMMs.
@@ -2224,6 +2241,13 @@ pub(super) struct MoeChunkIo<'b> {
 }
 
 /// The MoE dispatch: the Resident arm, and the Tiered arm that chunked prefill refuses.
+/// Whether tiered sessions may run chunked prefill (`Q36_TIERED_CHUNK=1`). Default
+/// off: the chunk arm is complete but the gate ships dark until device-qualified.
+pub(super) const TIERED_CHUNK_VAR: &str = "Q36_TIERED_CHUNK";
+pub(super) fn tiered_chunk_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 pub(super) enum ChunkMoe<'a, 'w> {
     Resident(&'a MoeLayerWeights<'w>),
     #[cfg_attr(
@@ -2815,9 +2839,6 @@ fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 /// the per-token path, `chunk_ready`).
 fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
     let launch = ctx.launch;
-    let LayerMoe::Native(moe) = ctx.moe else {
-        return exl3::moe_block(run, ctx);
-    };
     let io = MoeChunkIo {
         m: run.rows.m(),
         dims: run.model.dims_at(run.rows.m()),
@@ -2828,6 +2849,21 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
         h: run.v(ChunkSlot::Hidden)?,
         status: ctx.status,
         scratch: &run.bufs.views,
+    };
+    // The tiered arm: the chunk MoE runs against the bank stacks + CPU misses.
+    if let Some(cell) = run.tiered {
+        let mut runtime = cell.borrow_mut();
+        return run_chunk_moe(
+            launch,
+            ChunkMoe::Tiered {
+                runtime: &mut *runtime,
+                layer: ctx.layer,
+            },
+            &io,
+        );
+    }
+    let LayerMoe::Native(moe) = ctx.moe else {
+        return exl3::moe_block(run, ctx);
     };
     #[cfg(test)]
     if run.kernel_class != ChunkKernelClass::ProductionMmq {
