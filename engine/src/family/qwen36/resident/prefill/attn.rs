@@ -1477,12 +1477,11 @@ mod tests {
             kernels.concatenate(&views, 1).unwrap()
         };
 
-        // Timing: each iteration syncs on a 1-element readback of the output, so the
-        // GPU completion lands inside the measurement (evaluate alone enqueues async).
+        // Timing: each iteration forces the whole output to host (a full readback is an
+        // unambiguous GPU sync; evaluate alone enqueues async and a probe element did not
+        // force the producers). The readback itself (~12 MB) is inside both arms equally.
         let sync = |kernels: &mut MlxKernels, out: &ExecutionTensor| {
-            let probe = kernels.slice(out, &[0, 0, 0, 0], &[1, 1, 1, 1]).unwrap();
-            kernels.evaluate(&[&probe]).unwrap();
-            values(kernels, &probe).unwrap();
+            let _ = values(kernels, out).unwrap();
         };
 
         let (cf, composite_ms, composite) = {
