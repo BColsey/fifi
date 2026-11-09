@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6629,
-      "ignored": 576,
+      "test_fns": 6646,
+      "ignored": 582,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -53,6 +53,7 @@
         "FIFI_EXL3_LOAD_REPORT",
         "FIFI_EXL3_MIXER_CASE",
         "FIFI_EXL3_MIXER_OUT",
+        "FIFI_EXL3_OVERLAP",
         "FIFI_EXL3_PROJECTION_OUT",
         "FIFI_EXL3_REAL_CASES",
         "FIFI_EXL3_SHARED_IN_ROUTED",
