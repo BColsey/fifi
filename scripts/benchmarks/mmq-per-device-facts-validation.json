@@ -1,0 +1,174 @@
+{
+  "campaign": "mmq-campaign-20261109T001611Z-1398681",
+  "provenance": {
+    "red_commit": "7a37863246c952ca3bbdf4906cb004ee3f205580",
+    "red_binary_sha256": "81b376697833fbe02fb35e7e1ba8d843a875d0ccb11e13c0953e104a5a6061a5",
+    "green_commit": "9353afa0d15e2a6438f8075015d1c8fa8da3bc6c",
+    "green_binary_sha256": "98f9eeb083e21f65fa169d561f108cb54ebd784c3628ed299a311992e9e53f99",
+    "visible_devices": [
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+    ]
+  },
+  "hardware": {
+    "first_order": [
+      "RTX 3060 12 GB",
+      "RTX 3080 10 GB"
+    ],
+    "second_order": [
+      "RTX 3080 10 GB",
+      "RTX 3060 12 GB"
+    ],
+    "other_gpu": "RTX 2080 Ti, service resident and idle in sampled telemetry",
+    "driver": "615.78.08",
+    "cuda_arch": "sm_86"
+  },
+  "build": "cargo test --locked --release --lib --features native-cuda --no-run",
+  "execution": {
+    "shared_gpu_reservation": true,
+    "test_threads": 1,
+    "exact_names": true,
+    "device_required": true,
+    "guard_samples": 13,
+    "guard_file": "mmq-per-device-facts-guard.jsonl",
+    "interrupted_when_another_job_started": true,
+    "planned_timing_order": [
+      "red",
+      "green",
+      "green",
+      "red",
+      "red",
+      "green"
+    ]
+  },
+  "cpu_simulated_cuda": {
+    "red_output": "Ewanted device 1, got status=0 device=0 nsm=28\nEwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nwanted device 1, got status=0 device=0 nsm=28\nE\n======================================================================\nERROR: test_initial_query_failure_does_not_poison_the_cache (__main__.MmqDeviceFactsCacheTests.test_initial_query_failure_does_not_poison_the_cache)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/wt/scripts/tests/test_mmq_device_facts_cache.py\", line 152, in test_initial_query_failure_does_not_poison_the_cache\n    subprocess.run([self.binary, \"2\"], check=True)\n    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ben/miniconda3/lib/python3.13/subprocess.py\", line 577, in run\n    raise CalledProcessError(retcode, process.args,\n                             output=stdout, stderr=stderr)\nsubprocess.CalledProcessError: Command '[PosixPath('/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/tmp/tmp9pbnokir/mmq-facts-cache'), '2']' returned non-zero exit status 3.\n\n======================================================================\nERROR: test_switching_devices_returns_their_own_cached_facts (__main__.MmqDeviceFactsCacheTests.test_switching_devices_returns_their_own_cached_facts)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/wt/scripts/tests/test_mmq_device_facts_cache.py\", line 146, in test_switching_devices_returns_their_own_cached_facts\n    subprocess.run([self.binary, \"0\"], check=True)\n    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ben/miniconda3/lib/python3.13/subprocess.py\", line 577, in run\n    raise CalledProcessError(retcode, process.args,\n                             output=stdout, stderr=stderr)\nsubprocess.CalledProcessError: Command '[PosixPath('/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/tmp/tmp9pbnokir/mmq-facts-cache'), '0']' returned non-zero exit status 1.\n\n======================================================================\nERROR: test_threads_can_query_different_devices (__main__.MmqDeviceFactsCacheTests.test_threads_can_query_different_devices)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/wt/scripts/tests/test_mmq_device_facts_cache.py\", line 149, in test_threads_can_query_different_devices\n    subprocess.run([self.binary, \"1\"], check=True)\n    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/ben/miniconda3/lib/python3.13/subprocess.py\", line 577, in run\n    raise CalledProcessError(retcode, process.args,\n                             output=stdout, stderr=stderr)\nsubprocess.CalledProcessError: Command '[PosixPath('/home/ben/fifi-scratch/a81ebdf26a2a/mmq-device-facts/tmp/tmp9pbnokir/mmq-facts-cache'), '1']' returned non-zero exit status 1.\n\n----------------------------------------------------------------------\nRan 3 tests in 0.408s\n\nFAILED (errors=3)\n",
+    "green_output": "...\n----------------------------------------------------------------------\nRan 3 tests in 1.711s\n\nOK\n"
+  },
+  "initial_candidate_comparison": {
+    "source_commit": "ea3607aa4d66a120ffc31afde3fec67e0bfbf127",
+    "binary_sha256": "1880c1b588ea6834e352fa738cb4b7a44ded73880f23bf9c888ea5a50555566c",
+    "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process ... CUDA devices visible: 2\n\nthread 'kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process' (1390840) panicked at src/kernels/cuda/prefill/mmq_dense/tests.rs:626:13:\nrows 256, value 16714: device 0 -0.05029296875, device 1 -0.049072265625\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.43s\n\n",
+    "follow_up": "The initial fixed absolute cross-device tolerance failed near zero. The revised test uses the existing Q4_K/q8_1 quantization-aware bound for all cross-device values and three sampled CPU-reference columns."
+  },
+  "device_test_output": [
+    {
+      "file": "green-mmq_facts_are_queried_once_per_context.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183375.2620802,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_facts::tests::mmq_facts_are_queried_once_per_context ... CUDA devices visible: 2\nMMQ facts: three calls, one query; a fresh context one query\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.27s\n\n"
+    },
+    {
+      "file": "green-mmq_facts_follow_the_context_when_another_device_was_selected.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183376.0801237,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_facts::tests::mmq_facts_follow_the_context_when_another_device_was_selected ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.32s\n\n"
+    },
+    {
+      "file": "green-mmq_fixup_bytes_follow_the_device_sm_count.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183375.5859764,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::mmq_fixup_bytes_follow_the_device_sm_count ... CUDA devices visible: 2\nMMQ fixup: nsm 28, fixup 1835008 B\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.23s\n\n"
+    },
+    {
+      "file": "green-q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183376.8799975,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process ... CUDA devices visible: 2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 256 rows, cross-device NMSE 2.111e-14, max difference 3.125e-2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 0, device 0, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 0, device 1, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 128, device 0, CPU-reference NMSE 7.593e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 128, device 1, CPU-reference NMSE 7.593e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 255, device 0, CPU-reference NMSE 1.949e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 255, device 1, CPU-reference NMSE 1.949e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 256 rows, 524288 cross-device values and three CPU-reference columns checked\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 512 rows, cross-device NMSE 9.933e-15, max difference 3.125e-2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 0, device 0, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 0, device 1, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 256, device 0, CPU-reference NMSE 3.370e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 256, device 1, CPU-reference NMSE 3.370e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 511, device 0, CPU-reference NMSE 4.770e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 511, device 1, CPU-reference NMSE 4.770e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 512 rows, 1048576 cross-device values and three CPU-reference columns checked\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.62s\n\n"
+    },
+    {
+      "file": "red-mmq_facts_follow_the_context_when_another_device_was_selected.log",
+      "expected_failure": true,
+      "completed_at_unix": 1794183374.358319,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_facts::tests::mmq_facts_follow_the_context_when_another_device_was_selected ... CUDA devices visible: 2\n\nthread 'kernels::cuda::prefill::mmq_facts::tests::mmq_facts_follow_the_context_when_another_device_was_selected' (1398807) panicked at src/kernels/cuda/prefill/mmq_facts/tests.rs:96:9:\nassertion `left == right` failed: device 0\n  left: 68\n right: 28\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    kernels::cuda::prefill::mmq_facts::tests::mmq_facts_follow_the_context_when_another_device_was_selected\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.36s\n\n"
+    },
+    {
+      "file": "red-q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process.log",
+      "expected_failure": true,
+      "completed_at_unix": 1794183374.9009676,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process ... CUDA devices visible: 2\nCUDA FIRST ERROR: invalid argument (code 1) at stage launch\n\nthread 'kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process' (1398848) panicked at src/kernels/cuda/prefill/mmq_dense/tests.rs:621:41:\ndevice 1, rows 256: Backend { operation: \"cuda launch\", message: \"invalid argument (status 1)\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.37s\n\n"
+    },
+    {
+      "file": "reverse-green-mmq_facts_follow_the_context_when_another_device_was_selected.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183377.371511,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_facts::tests::mmq_facts_follow_the_context_when_another_device_was_selected ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.32s\n\n"
+    },
+    {
+      "file": "reverse-green-q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183378.143031,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::q4k_chunk_gemm_runs_on_both_physical_devices_in_one_process ... CUDA devices visible: 2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 256 rows, cross-device NMSE 2.111e-14, max difference 3.125e-2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 0, device 0, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 0, device 1, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 128, device 0, CPU-reference NMSE 7.593e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 128, device 1, CPU-reference NMSE 7.593e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 255, device 0, CPU-reference NMSE 1.949e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 256, column 255, device 1, CPU-reference NMSE 1.949e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 256 rows, 524288 cross-device values and three CPU-reference columns checked\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 512 rows, cross-device NMSE 9.933e-15, max difference 3.125e-2\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 0, device 0, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 0, device 1, CPU-reference NMSE 1.509e-4\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 256, device 0, CPU-reference NMSE 3.370e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 256, device 1, CPU-reference NMSE 3.370e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 511, device 0, CPU-reference NMSE 4.770e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: rows 512, column 511, device 1, CPU-reference NMSE 4.770e-5\nq4k_chunk_gemm_runs_on_both_physical_devices_in_one_process: 512 rows, 1048576 cross-device values and three CPU-reference columns checked\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 0.59s\n\n"
+    },
+    {
+      "file": "timing-0-red.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183382.1477401,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::mmq_dense_speed_rows_report ... CUDA devices visible: 2\nspeed dense attn_qkv M=512 (unpaired, reported only): gemm 462.3 us (37.2 TOP/s), quantize+gemm 481.2 us\nspeed dense attn_qkv M=1024 (unpaired, reported only): gemm 870.7 us (39.5 TOP/s), quantize+gemm 903.8 us\nspeed dense attn_qkv M=2048 (unpaired, reported only): gemm 1697.9 us (40.5 TOP/s), quantize+gemm 1763.9 us\nspeed dense attn_gate M=512 (unpaired, reported only): gemm 223.4 us (38.5 TOP/s), quantize+gemm 242.0 us\nspeed dense attn_gate M=1024 (unpaired, reported only): gemm 431.0 us (39.9 TOP/s), quantize+gemm 465.8 us\nspeed dense attn_gate M=2048 (unpaired, reported only): gemm 821.2 us (41.8 TOP/s), quantize+gemm 908.8 us\nspeed dense ssm_out M=512 (unpaired, reported only): gemm 231.8 us (37.1 TOP/s), quantize+gemm 267.9 us\nspeed dense ssm_out M=1024 (unpaired, reported only): gemm 421.9 us (40.7 TOP/s), quantize+gemm 487.6 us\nspeed dense ssm_out M=2048 (unpaired, reported only): gemm 833.9 us (41.2 TOP/s), quantize+gemm 972.2 us\nspeed dense ssm_alpha_beta M=512 (unpaired, reported only): gemm 26.7 us (2.5 TOP/s), quantize+gemm 43.6 us\nspeed dense ssm_alpha_beta M=1024 (unpaired, reported only): gemm 31.8 us (4.2 TOP/s), quantize+gemm 66.1 us\nspeed dense ssm_alpha_beta M=2048 (unpaired, reported only): gemm 46.9 us (5.7 TOP/s), quantize+gemm 113.5 us\nspeed dense attn_q M=512 (unpaired, reported only): gemm 433.3 us (39.6 TOP/s), quantize+gemm 451.6 us\nspeed dense attn_q M=1024 (unpaired, reported only): gemm 814.6 us (42.2 TOP/s), quantize+gemm 875.3 us\nspeed dense attn_q M=2048 (unpaired, reported only): gemm 1614.9 us (42.6 TOP/s), quantize+gemm 1778.9 us\nspeed dense attn_k_v M=512 (unpaired, reported only): gemm 51.2 us (21.0 TOP/s), quantize+gemm 69.9 us\nspeed dense attn_k_v M=1024 (unpaired, reported only): gemm 79.2 us (27.1 TOP/s), quantize+gemm 112.5 us\nspeed dense attn_k_v M=2048 (unpaired, reported only): gemm 126.5 us (33.9 TOP/s), quantize+gemm 193.5 us\nspeed dense attn_output M=512 (unpaired, reported only): gemm 230.8 us (37.2 TOP/s), quantize+gemm 267.6 us\nspeed dense attn_output M=1024 (unpaired, reported only): gemm 419.1 us (41.0 TOP/s), quantize+gemm 484.0 us\nspeed dense attn_output M=2048 (unpaired, reported only): gemm 827.9 us (41.5 TOP/s), quantize+gemm 995.0 us\nspeed dense shexp_gate_up M=512 (unpaired, reported only): gemm 51.8 us (20.7 TOP/s), quantize+gemm 70.5 us\nspeed dense shexp_gate_up M=1024 (unpaired, reported only): gemm 79.1 us (27.2 TOP/s), quantize+gemm 112.4 us\nspeed dense shexp_gate_up M=2048 (unpaired, reported only): gemm 126.5 us (33.9 TOP/s), quantize+gemm 193.4 us\nspeed dense shexp_down M=512 (unpaired, reported only): gemm 53.4 us (20.1 TOP/s), quantize+gemm 60.3 us\nspeed dense shexp_down M=1024 (unpaired, reported only): gemm 76.4 us (28.1 TOP/s), quantize+gemm 84.8 us\nspeed dense shexp_down M=2048 (unpaired, reported only): gemm 138.0 us (31.1 TOP/s), quantize+gemm 158.2 us\nDENSE_TOTAL M=512 (unpaired with the stock constant, reported only): gemm only 43.07 ms, quantize+gemm 49.00 ms (stock 26.39 ms; llama.cpp 1K dense bucket 42.5 ms)\nDENSE_TOTAL M=1024 (unpaired with the stock constant, reported only): gemm only 76.92 ms, quantize+gemm 87.90 ms (stock 41.78 ms; llama.cpp 1K dense bucket 42.5 ms)\nDENSE_TOTAL M=2048 (unpaired with the stock constant, reported only): gemm only 146.01 ms, quantize+gemm 169.57 ms (stock 72.73 ms; llama.cpp 1K dense bucket 42.5 ms)\nspeed spot-check M=512: NMSE 6.419e-5 (frozen bound 5e-4)\nspeed spot-check M=1024: NMSE 6.422e-5 (frozen bound 5e-4)\nspeed spot-check M=2048: NMSE 6.553e-5 (frozen bound 5e-4)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 3.85s\n\n"
+    },
+    {
+      "file": "timing-1-green.log",
+      "expected_failure": false,
+      "completed_at_unix": 1794183386.364833,
+      "output": "\nrunning 1 test\ntest kernels::cuda::prefill::mmq_dense::tests::mmq_dense_speed_rows_report ... CUDA devices visible: 2\nspeed dense attn_qkv M=512 (unpaired, reported only): gemm 462.1 us (37.2 TOP/s), quantize+gemm 481.3 us\nspeed dense attn_qkv M=1024 (unpaired, reported only): gemm 870.6 us (39.5 TOP/s), quantize+gemm 903.0 us\nspeed dense attn_qkv M=2048 (unpaired, reported only): gemm 1697.8 us (40.5 TOP/s), quantize+gemm 1764.6 us\nspeed dense attn_gate M=512 (unpaired, reported only): gemm 222.1 us (38.7 TOP/s), quantize+gemm 241.0 us\nspeed dense attn_gate M=1024 (unpaired, reported only): gemm 428.5 us (40.1 TOP/s), quantize+gemm 462.1 us\nspeed dense attn_gate M=2048 (unpaired, reported only): gemm 815.3 us (42.1 TOP/s), quantize+gemm 887.0 us\nspeed dense ssm_out M=512 (unpaired, reported only): gemm 231.2 us (37.1 TOP/s), quantize+gemm 267.1 us\nspeed dense ssm_out M=1024 (unpaired, reported only): gemm 418.9 us (41.0 TOP/s), quantize+gemm 484.6 us\nspeed dense ssm_out M=2048 (unpaired, reported only): gemm 828.2 us (41.5 TOP/s), quantize+gemm 964.5 us\nspeed dense ssm_alpha_beta M=512 (unpaired, reported only): gemm 26.6 us (2.5 TOP/s), quantize+gemm 43.8 us\nspeed dense ssm_alpha_beta M=1024 (unpaired, reported only): gemm 31.6 us (4.2 TOP/s), quantize+gemm 65.9 us\nspeed dense ssm_alpha_beta M=2048 (unpaired, reported only): gemm 46.6 us (5.8 TOP/s), quantize+gemm 113.3 us\nspeed dense attn_q M=512 (unpaired, reported only): gemm 430.1 us (39.9 TOP/s), quantize+gemm 448.4 us\nspeed dense attn_q M=1024 (unpaired, reported only): gemm 809.3 us (42.5 TOP/s), quantize+gemm 842.6 us\nspeed dense attn_q M=2048 (unpaired, reported only): gemm 1596.9 us (43.0 TOP/s), quantize+gemm 1766.6 us\nspeed dense attn_k_v M=512 (unpaired, reported only): gemm 51.2 us (21.0 TOP/s), quantize+gemm 69.9 us\nspeed dense attn_k_v M=1024 (unpaired, reported only): gemm 83.6 us (25.7 TOP/s), quantize+gemm 117.1 us\nspeed dense attn_k_v M=2048 (unpaired, reported only): gemm 135.5 us (31.7 TOP/s), quantize+gemm 202.5 us\nspeed dense attn_output M=512 (unpaired, reported only): gemm 245.2 us (35.0 TOP/s), quantize+gemm 281.8 us\nspeed dense attn_output M=1024 (unpaired, reported only): gemm 451.4 us (38.1 TOP/s), quantize+gemm 516.7 us\nspeed dense attn_output M=2048 (unpaired, reported only): gemm 892.3 us (38.5 TOP/s), quantize+gemm 1019.9 us\nspeed dense shexp_gate_up M=512 (unpaired, reported only): gemm 54.3 us (19.8 TOP/s), quantize+gemm 73.0 us\nspeed dense shexp_gate_up M=1024 (unpaired, reported only): gemm 83.7 us (25.7 TOP/s), quantize+gemm 117.0 us\nspeed dense shexp_gate_up M=2048 (unpaired, reported only): gemm 135.6 us (31.7 TOP/s), quantize+gemm 202.6 us\nspeed dense shexp_down M=512 (unpaired, reported only): gemm 56.2 us (19.1 TOP/s), quantize+gemm 63.4 us\nspeed dense shexp_down M=1024 (unpaired, reported only): gemm 80.9 us (26.6 TOP/s), quantize+gemm 91.0 us\nspeed dense shexp_down M=2048 (unpaired, reported only): gemm 146.2 us (29.4 TOP/s), quantize+gemm 165.7 us\nDENSE_TOTAL M=512 (unpaired with the stock constant, reported only): gemm only 43.43 ms, quantize+gemm 49.38 ms (stock 26.39 ms; llama.cpp 1K dense bucket 42.5 ms)\nDENSE_TOTAL M=1024 (unpaired with the stock constant, reported only): gemm only 77.65 ms, quantize+gemm 88.38 ms (stock 41.78 ms; llama.cpp 1K dense bucket 42.5 ms)\nDENSE_TOTAL M=2048 (unpaired with the stock constant, reported only): gemm only 147.33 ms, quantize+gemm 170.03 ms (stock 72.73 ms; llama.cpp 1K dense bucket 42.5 ms)\nspeed spot-check M=512: NMSE 6.419e-5 (frozen bound 5e-4)\nspeed spot-check M=1024: NMSE 6.422e-5 (frozen bound 5e-4)\nspeed spot-check M=2048: NMSE 6.553e-5 (frozen bound 5e-4)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5782 filtered out; finished in 4.06s\n\n"
+    }
+  ],
+  "single_gpu_q8_microbenchmark": {
+    "samples": {
+      "red": {
+        "512": [
+          {
+            "order": 0,
+            "gemm_ms": 43.07,
+            "quantize_and_gemm_ms": 49.0
+          }
+        ],
+        "1024": [
+          {
+            "order": 0,
+            "gemm_ms": 76.92,
+            "quantize_and_gemm_ms": 87.9
+          }
+        ],
+        "2048": [
+          {
+            "order": 0,
+            "gemm_ms": 146.01,
+            "quantize_and_gemm_ms": 169.57
+          }
+        ]
+      },
+      "green": {
+        "512": [
+          {
+            "order": 1,
+            "gemm_ms": 43.43,
+            "quantize_and_gemm_ms": 49.38
+          }
+        ],
+        "1024": [
+          {
+            "order": 1,
+            "gemm_ms": 77.65,
+            "quantize_and_gemm_ms": 88.38
+          }
+        ],
+        "2048": [
+          {
+            "order": 1,
+            "gemm_ms": 147.33,
+            "quantize_and_gemm_ms": 170.03
+          }
+        ]
+      }
+    },
+    "medians_ms": null,
+    "complete": false
+  },
+  "limitations": [
+    "Single host. Guard observations were sampled, not continuous.",
+    "The Q4_K regression uses synthetic weights and activations at 256 and 512 rows; it checks all outputs across devices and three columns against an f64 CPU reference within an analytic quantization bound, not full model logits.",
+    "The Q8 timings are a weighted collection of isolated synthetic GEMMs on the RTX 3060, not end-to-end prefill or decode; the underlying timing test averages 20 launches per shape. The campaign was interrupted after one timing sample per binary and supports no speed claim.",
+    "This fix is a prerequisite for multi-device chunked prefill; it does not by itself implement or deploy that path."
+  ]
+}
