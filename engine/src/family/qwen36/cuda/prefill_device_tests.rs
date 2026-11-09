@@ -2157,9 +2157,10 @@ fn chunk_constructors_refuse_through_their_checks() {
     );
 }
 
-/// DV7: the Tiered arm refuses, before any launch, with exactly its typed refusal text.
+/// DV7: the Tiered arm RUNS (the refusal is gone); with empty banks it fails at the
+/// bank lookup before any launch, and the h canary + status word stay untouched.
 #[test]
-fn chunk_moe_tiered_arm_refuses_before_any_launch() {
+fn chunk_moe_tiered_arm_fails_clean_on_empty_banks() {
     if !device_present("chunk_moe_tiered_arm_refuses_before_any_launch") {
         return;
     }
@@ -2333,10 +2334,9 @@ fn chunk_moe_tiered_arm_refuses_before_any_launch() {
         Ok((error, h_bytes, word.to_vec()))
     };
     let (text, h, word) = phase().expect("the device phase");
-    assert_eq!(
-        text.as_str(),
-        "tiered chunk prefill: not supported",
-        "the Tiered refusal text"
+    assert!(
+        text.contains("layer 0 has no bank"),
+        "the empty-bank error names the bank lookup: {text}"
     );
     assert!(h.iter().all(|byte| *byte == 0xFF), "the h canary changed");
     assert_eq!(word, vec![0, 0, 0, 0], "the status word changed");
