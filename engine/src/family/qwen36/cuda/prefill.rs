@@ -1395,6 +1395,10 @@ struct LayerCtx<'a, 'w> {
 enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
     Exl3(&'a Exl3MoeWeights<'w>),
+    /// A tiered chunk: the MoE stage routes through the runtime's banks, not
+    /// the loaded weights. Constructed when run.tiered is Some; never matched
+    /// in chunk_moe (the tiered check fires first).
+    Tiered,
 }
 
 impl<'a, 'w> LayerMoe<'a, 'w> {
@@ -1403,6 +1407,7 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
         match self {
             Self::Native(moe) => (moe.router, moe.router_shared),
             Self::Exl3(moe) => (moe.router, moe.router_shared),
+            Self::Tiered => unreachable!("the tiered chunk's router runs before the MoE dispatch"),
         }
     }
 }
@@ -2924,9 +2929,15 @@ pub(super) fn run_chunk_layer(
     trace_piece: Option<u32>,
 ) -> Result<(), EngError> {
     let slot = run.model.table.slot(layer)?;
-    let moe = match &run.model.weights {
-        ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
-        ChunkWeights::Exl3 { moe, .. } => LayerMoe::Exl3(chunk_layer(moe, layer)?),
+    // A tiered chunk session routes through run.tiered: the moe slice is empty
+    // (the stacks live in the banks), so the layer dispatch skips it entirely.
+    let moe = if run.tiered.is_some() {
+        LayerMoe::Tiered
+    } else {
+        match &run.model.weights {
+            ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
+            ChunkWeights::Exl3 { moe, .. } => LayerMoe::Exl3(chunk_layer(moe, layer)?),
+        }
     };
     let ctx = LayerCtx {
         launch,
