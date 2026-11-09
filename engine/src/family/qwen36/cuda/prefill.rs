@@ -991,30 +991,47 @@ fn model_facts(
                 "prefill chunk: layout: the facts of a Native model need Native weights".to_owned(),
             ));
         };
-        let mw = &moe[layer];
-        let stacks = [
-            stack(Role::FfnGateExps, &mw.gate),
-            stack(Role::FfnUpExps, &mw.up),
-            stack(Role::FfnDownExps, &mw.down),
-        ];
-        let shared = |role, weight: &DenseWeight<'_>| {
-            let quant = match weight {
+        // The shared expert facts: (role, quant) pairs from the DenseWeight.
+        let shexp_quant = |weight: &DenseWeight<'_>| -> Option<QuantType> {
+            match weight {
                 DenseWeight::Native(native) => Some(native.quant()),
-                DenseWeight::Exl3(_) => None,
-                DenseWeight::Tiled(_) => None,
-            };
-            (role, quant)
+                _ => None,
+            }
         };
-        let shared = [
-            shared(Role::FfnGateShexp, &mw.shared_gate),
-            shared(Role::FfnUpShexp, &mw.shared_up),
-            shared(Role::FfnDownShexp, &mw.shared_down),
-        ];
+        // A tiered load keeps the routed stacks AND the shared expert projections
+        // in the runtime: the moe slice is empty, the chunk facts carry no MoE stack
+        // entries, and the shared facts carry no quant (the weights are not here).
+        let (stacks, shared_facts) = match moe.get(layer) {
+            Some(mw) => (
+                [
+                    stack(Role::FfnGateExps, &mw.gate),
+                    stack(Role::FfnUpExps, &mw.up),
+                    stack(Role::FfnDownExps, &mw.down),
+                ],
+                [
+                    (Role::FfnGateShexp, shexp_quant(&mw.shared_gate)),
+                    (Role::FfnUpShexp, shexp_quant(&mw.shared_up)),
+                    (Role::FfnDownShexp, shexp_quant(&mw.shared_down)),
+                ],
+            ),
+            None => (
+                [
+                    StackFacts { role: Role::FfnGateExps, quant: None, experts: None, n_rows: 0, k: 0 },
+                    StackFacts { role: Role::FfnUpExps, quant: None, experts: None, n_rows: 0, k: 0 },
+                    StackFacts { role: Role::FfnDownExps, quant: None, experts: None, n_rows: 0, k: 0 },
+                ],
+                [
+                    (Role::FfnGateShexp, None),
+                    (Role::FfnUpShexp, None),
+                    (Role::FfnDownShexp, None),
+                ],
+            ),
+        };
         facts.push(LayerFacts {
             kind,
             dense,
             stacks,
-            shared,
+            shared: shared_facts,
         });
     }
     Ok(ModelFacts {
