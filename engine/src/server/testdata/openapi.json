@@ -1,5 +1,5 @@
 {
- "x-source-sha256": "75c2a459e9bef290cafa3f794ca3a9cfe91edfdb31ae11051b30612727fe5ccf",
+ "x-source-sha256": "414e9e5083349a81decda17637f2415d75a8888ff255d04b81f40ce988274149",
  "components": {
   "securitySchemes": {
    "apiKey": {
@@ -466,7 +466,7 @@
      },
      "x-session": {
       "type": "string",
-      "description": "Reserved. This server keeps no named sessions, so a request that sets x-session gets 404."
+      "description": "Server extension. A named session binds to the engine that serves its first request and returns to it afterwards. A session id with no model or x-engine gets 404 until bound."
      }
     }
    },
