@@ -205,6 +205,7 @@ mod tests {
     /// cascade "the native resident owner has failed" into every later native test.
     #[test]
     fn a_panicking_thread_holding_dispatch_does_not_poison_the_owner_in_tests() {
+        let _serial = crate::native_test_lock();
         let panic_thread = std::thread::spawn(|| {
             let _dispatch = DispatchGuard::enter();
             panic!("local assertion failure");
