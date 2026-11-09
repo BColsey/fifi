@@ -79,8 +79,9 @@ pub(super) mod exl3;
 /// Every slot of the chunk arena exactly once, in `chunk_tensors` order: the view checks take the
 /// arena as the plan of exactly this set, so a slot added to the plan without this module fails
 /// [`super::prefill_tests`].
-pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
+pub(super) const ALL_SLOTS: [ChunkSlot; 36] = [
     ChunkSlot::Hidden,
+    ChunkSlot::Zero,
     ChunkSlot::IdsTok,
     ChunkSlot::X,
     ChunkSlot::XfA,
@@ -1837,9 +1838,15 @@ fn part_view<'a>(
 fn kv8_parts<'a>(run: &ChunkRun<'a, '_>) -> Result<Kv8Parts<'a>, EngError> {
     let g = run.model.geometry;
     let m = run.rows.m();
-    if g.attn.head_dim != 256 || g.attn.heads_q != 16 || g.attn.heads_kv != 2 {
+    // The single-device step pins the whole Q36 head geometry; a CARD
+    // geometry halves the heads (heads_q 8, heads_kv 1) at the same
+    // head_dim 256, and every downstream shape passes the geometry's own
+    // counts, so both halves of the pair are admitted here.
+    let heads_ok =
+        (g.attn.heads_q, g.attn.heads_kv) == (16, 2) || (g.attn.heads_q, g.attn.heads_kv) == (8, 1);
+    if g.attn.head_dim != 256 || !heads_ok {
         return Err(EngError::BadRequest(
-            "prefill chunk: kv mode: the KV8 body requires Q36 D256".to_owned(),
+            "prefill chunk: kv mode: the KV8 body requires Q36 D256 heads".to_owned(),
         ));
     }
     kv8_attention_tile(run.rows.p0(), m, 0)?;
