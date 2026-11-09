@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test .test-dist/*.test.js",
-    "test:browser": "npm run build && node test-browser/run.mjs"
+    "test:browser": "node --test test-browser/cleanup.test.mjs && npm run build && node test-browser/run.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.0",
