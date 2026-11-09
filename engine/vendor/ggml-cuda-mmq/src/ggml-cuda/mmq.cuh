@@ -1382,6 +1382,10 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    fprintf(stderr, "launch_mul_mat_q: grid=(%d,%d,%d) block=(%d,%d,%d) shared=%d nrows_x=%lld ncols_max=%lld nchannels_y=%lld\n",
+            block_nums_xy_tiling.x, block_nums_xy_tiling.y, block_nums_xy_tiling.z,
+            block_dims.x, block_dims.y, block_dims.z, nbytes_shared,
+            (long long)args.nrows_x, (long long)args.ncols_max, (long long)args.nchannels_y);
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
@@ -1414,6 +1418,10 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
+    fprintf(stderr, "launch_mul_mat_q STREAM-K: grid=(%d,%d,%d) block=(%d,%d,%d) shared=%d fixup=%p fixup_needed=%d ntiles_dst=%d\n",
+            block_nums_stream_k.x, block_nums_stream_k.y, block_nums_stream_k.z,
+            block_dims.x, block_dims.y, block_dims.z, nbytes_shared,
+            (void*)tmp_fixup, (int)fixup_needed, ntiles_dst);
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
