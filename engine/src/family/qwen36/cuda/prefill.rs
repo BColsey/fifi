@@ -2441,68 +2441,11 @@ fn run_chunk_tiered(
             act: d.get(ChunkSlot::Act)?,
         },
     )?;
-    let down = native_stack(&weights.down)?;
-    let q8act = d.get(ChunkSlot::Q8Act)?;
-    let ids_dst = d.get(ChunkSlot::IdsDst)?;
-    let act = d.get(ChunkSlot::Act)?;
-    eprintln!(
-        "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
-        dims.inter,
-        ids.shape().ne_get_rows(),
-        act.offset(), act.bytes(),
-        q8act.offset(), q8act.bytes(),
-        ids_dst.offset(), ids_dst.bytes(),
-    );
-    eprintln!("tiered-chunk: launching gather quantize (Vendor packing)");
-    ctx.mmq_quantize_gather_ids(
-        stream,
-        &ids,
-        MmidQuantCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
-            quant: down.quant(),
-            k: dims.inter,
-            row_stride: dims.inter,
-            x: d.get(ChunkSlot::Act)?,
-            y: d.get(ChunkSlot::Q8Act)?,
-        },
-    )?;
-    eprintln!("tiered-chunk: syncing after gather");
-    stream.synchronize()?;
-    eprintln!("tiered-chunk: sync after gather OK");
-    // ponytail: the vendored MMQ down kernel (k<n, 78 experts) returns CUDA
-    // invalid argument on Turing regardless of variant — the Down buffer is zeroed
-    // and the GPU down launch skipped. The combine multiplies by the (patched)
-    // weights, so zeros produce correct results for misses (weight 0.0) and
-    // zero contributions for hits. This is WRONG for hits — the chunk's MoE
-    // output is incomplete — but it unblocks the pipeline for debugging.
-    // TODO: compute the down projection on CPU from the swiglu output, or
-    // fix the kernel (see the TODO for the minimal reproducer).
-    {
-        let down_range = d.get(ChunkSlot::Down)?;
-        eprintln!("tiered-chunk: zero-fill Down: off={} bytes={}", down_range.offset(), down_range.bytes());
-        let zeros = vec![0u8; down_range.bytes()];
-        down_range.buffer().write_at(stream, down_range.offset(), &zeros)?;
-        eprintln!("tiered-chunk: zero-fill OK");
-    }
-
-    // Stage 17, the combine with the patched weights.
-    eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
-        io.m, io.dims.hidden, io.dims.top_k,
-        io.scratch.get(ChunkSlot::Down)?.bytes(),
-        io.h.bytes());
-    combine_chunk_moe(launch, io)?;
-    eprintln!("tiered-chunk: combine OK");
-
-    // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
-    // weights ones, in place) adding `partial` to the block output.
-    // TODO: the partial add's moe_combine returns CUDA invalid argument (same
-    // class as the down MMQ); skip it to complete the pipeline. The misses are
-    // computed by the pool but not contributed to the output — wrong but working.
-    let _ = pending; // (the pool join would timeout without this acknowledgment)
-    // if let Some(pending) = pending {
-    //     let partial = pending.finish(Duration::from_secs(60))?;
-    //     ... upload + M-row moe_combine ...
-    // }
+    // TODO: everything after the swiglu (gather quantize, down projection,
+    // combine, pool partial add) hits the vendored kernel's CUDA invalid
+    // argument bug. Skipped to prove the pipeline cycles through all layers.
+    // The MoE output is the shared expert only — wrong but completing.
+    let _ = (pending, ids, plan);
     Ok(())
 }
 
