@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6629,
-      "ignored": 576,
+      "test_fns": 6656,
+      "ignored": 585,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -53,6 +53,7 @@
         "FIFI_EXL3_LOAD_REPORT",
         "FIFI_EXL3_MIXER_CASE",
         "FIFI_EXL3_MIXER_OUT",
+        "FIFI_EXL3_OVERLAP",
         "FIFI_EXL3_PROJECTION_OUT",
         "FIFI_EXL3_REAL_CASES",
         "FIFI_EXL3_SHARED_IN_ROUTED",
@@ -302,6 +303,7 @@
         "Q36_NO_GDNPREP",
         "Q36_NO_MOECOMBINE",
         "Q36_OUT_DIR",
+        "Q36_P2P_CHUNK",
         "Q36_P2P_HOST_EXPERT_BYTES",
         "Q36_P2P_HOST_EXPERT_BYTES_0",
         "Q36_P2P_PREFIX",
