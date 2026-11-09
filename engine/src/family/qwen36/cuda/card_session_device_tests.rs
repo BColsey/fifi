@@ -569,8 +569,8 @@ fn card_views_construct_chunk_models() {
     if !device_present(NAME) {
         return;
     }
+    let _ = NAME;
     let (session, stack, _loaded, _names, _vocab) = build_rig_session(
-        NAME,
         [0, 0],
         256,
         crate::family::session::StoreLimits::default(),
