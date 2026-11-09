@@ -984,15 +984,34 @@ fn make_multi(
         p2p_host_expert_bytes(first_var, std::env::var_os(first_var).as_deref())?,
         p2p_host_expert_bytes(second_var, std::env::var_os(second_var).as_deref())?,
     ];
+    // The chunked session's layer sums carry m*hidden values, so the
+    // mailbox payload grows past the eager cap when Q36_P2P_CHUNK is set
+    // (capped at the transport's MAX_VALUES by max_chunk_rows).
+    let chunk_payload = std::env::var_os("Q36_P2P_CHUNK").and_then(|value| {
+        let rows: usize = value
+            .to_str()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(256);
+        let rows = rows.min(super::card_prefill::max_chunk_rows(dims.shape.hidden));
+        Some(rows * dims.shape.hidden)
+    });
     let (stack, states) = match planned.as_ref() {
-        Some(plan) => CardStack::with_table(
+        Some(plan) => CardStack::with_table_payload(
             &dims,
             &options,
             &settings.cuda_devices,
             &served_admission(),
             &plan.table,
+            chunk_payload.unwrap_or(dims.shape.hidden * dims.shape.moe.top_k.max(1)),
         )?,
-        None => CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?,
+        None => CardStack::with_payload(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &ShardTable::new(&dims.shape, settings.cuda_devices.len(), 256)?,
+            chunk_payload,
+        )?,
     };
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
@@ -1066,36 +1085,8 @@ fn make_multi(
     // leaked weights the session holds, so the chunk models live beside
     // the session in the enum. A refusal logs and leaves the per-token
     // path in place.
-    let chunk = match std::env::var_os("Q36_P2P_CHUNK") {
-        Some(value) => {
-            let rows: usize = value
-                .to_str()
-                .and_then(|text| text.parse().ok())
-                .unwrap_or(256);
-            let rows = rows.min(super::card_prefill::max_chunk_rows(dims.shape.hidden));
-            let embed_name: &'static str = Box::leak(
-                crate::family::qwen36::cuda::resources::GlobalNames::new(&inventory)?
-                    .embed
-                    .into_boxed_str(),
-            );
-            super::card_prefill::build_card_chunk(
-                stack,
-                &dims,
-                layers,
-                super::card_prefill::CardChunkInputs {
-                    weights,
-                    embed_name,
-                },
-                &options,
-                rows,
-            )
-            .inspect_err(|error| eprintln!("q36 cuda: chunked prefill refused: {error:?}"))
-            .ok()
-        }
-        None => None,
-    };
     Ok((
-        Q36CudaStep::Cards(Box::new(session), chunk),
+        Q36CudaStep::Cards(Box::new(session)),
         DecodeSession::default(),
     ))
 }
