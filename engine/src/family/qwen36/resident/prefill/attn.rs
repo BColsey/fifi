@@ -1495,13 +1495,17 @@ mod tests {
                 let mut start_row = 0u32;
                 while start_row < rows {
                     let end = (start_row + block).min(rows);
+                    // Tail-of-prefix causality: a block ending at row `end` of a chunk of
+                    // `rows` rows at depth `cap` sees `cap - rows + end` keys - the same
+                    // geometry the flash call gives the whole chunk.
+                    let len_b = cap - rows + end;
                     let q_block = kernels
                         .slice(q_i, &[0, 0, start_row, 0], &[1, h, end, d])
                         .unwrap();
                     blocks.push(
                         kernels
                             .quantized_attention_prefix(
-                                &q_block, &keys, &values_q, end, scale, true, group, bits,
+                                &q_block, &keys, &values_q, len_b, scale, true, group, bits,
                             )
                             .unwrap(),
                     );
@@ -1545,7 +1549,7 @@ mod tests {
             (first, best, sliced.unwrap())
         };
         eprintln!(
-            "dense REP6 rows={rows} depth={cap}: composite {composite_ms:.3}ms (first {cf:.3}), flash+pad {flash_ms:.3}ms (first {ff:.3})"
+            "dense REP6 rows={rows} depth={cap}: composite {composite_ms:.1}ms (first {cf:.1}), flash+pad {flash_ms:.1}ms (first {ff:.1})"
         );
 
         // Numerics: the F32 reference in the same blocks, over the real 24 heads, on the
@@ -1554,11 +1558,12 @@ mod tests {
         let mut start = 0u32;
         while start < rows {
             let end = (start + block).min(rows);
+            let len_b = cap - rows + end;
             let q_block = kernels
                 .slice(&variants[5], &[0, 0, start, 0], &[1, h, end, d])
                 .unwrap();
             let out = kernels
-                .grouped_attention_prefix(&q_block, &k, &v, end, scale, end - start > 1)
+                .grouped_attention_prefix(&q_block, &k, &v, len_b, scale, end - start > 1)
                 .unwrap();
             let mut block_values = values(&mut kernels, &out).unwrap();
             reference.append(&mut block_values);
