@@ -2325,8 +2325,9 @@ pub(super) fn run_chunk_moe(
 /// with three differences: (1) the route readback is HOST-side — M rows of ids and
 /// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
 /// grouped ids come from `MmidIds::from_host` with misses spread round-robin over
-/// the slots (the ≤m-columns invariant; the weight is 0.0, so the wasted compute is
-/// bounded by the miss rate); (3) the CPU partial joins via one extra M-row
+/// the slots, each skipping the slots its own row already holds a column in (that
+/// exclusion is the ≤m-columns invariant; a miss's weight is 0.0, so the wasted
+/// compute is bounded by the miss rate); (3) the CPU partial joins via one extra M-row
 /// `moe_combine` (top_k 1, weights ones, in place).
 fn run_chunk_tiered(
     launch: &Launch<'_>,
@@ -2606,28 +2607,55 @@ fn build_tiered_host_ids<'b>(
         m,
         top_k,
     };
-    // Group picks by slot; misses (weight 0.0) spread round-robin.
+    // Group picks by slot. Two passes: every pick with a slot of its own claims its
+    // group and marks the row's used slots; then the misses (weight 0.0, the picks the
+    // CPU serves) spread round-robin over the slots, SKIPPING every slot their own row
+    // already holds a column in. One column per (row, slot) is what keeps every group
+    // at <= m entries and ids_dst a permutation — a plain round-robin broke both the
+    // moment a spread miss landed on a slot its token had already hit (a hot slot
+    // holding all m rows gained misses on top: "expert N holds m+k columns, above m").
     let mut groups: Vec<Vec<i32>> = vec![Vec::new(); slots];
-    let mut spread = 0usize;
+    let words = slots.div_ceil(64);
+    let mut used = vec![0u64; m * words];
+    let mut spread_set: Vec<usize> = Vec::new();
     for (flat, (&slot_id, &weight)) in plan.slot_ids.iter().zip(&plan.device_weights).enumerate() {
-        let flat_i32 = i32::try_from(flat)
-            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
         let target = if weight == 0.0 && slot_id <= 0 {
-            // A miss or a router fault: spread round-robin over the slots.
-            let target = spread;
-            spread = (spread + 1) % slots.max(1);
-            target
+            spread_set.push(flat);
+            continue;
         } else if slot_id > 0 {
             usize::try_from(slot_id).unwrap_or(0)
         } else {
             0
         };
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
         groups
             .get_mut(target)
             .map(|g| g.push(flat_i32))
             .ok_or_else(|| {
                 EngError::BadRequest(format!("tiered chunk: slot {target} of {slots}"))
             })?;
+        used[flat / top_k * words + target / 64] |= 1u64 << (target % 64);
+    }
+    let mut spread = 0usize;
+    for flat in spread_set {
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
+        let row_words = &mut used[flat / top_k * words..flat / top_k * words + words];
+        // At most top_k slots of this row are marked, so this loop always finds a
+        // free slot while slots > top_k.
+        while row_words[spread / 64] >> (spread % 64) & 1 == 1 {
+            spread = (spread + 1) % slots.max(1);
+        }
+        let target = spread;
+        row_words[target / 64] |= 1u64 << (target % 64);
+        groups
+            .get_mut(target)
+            .map(|g| g.push(flat_i32))
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("tiered chunk: slot {target} of {slots}"))
+            })?;
+        spread = (spread + 1) % slots.max(1);
     }
     // Compact: concatenate the groups, build the bounds.
     let mut ids_dst = Vec::with_capacity(m * top_k);
