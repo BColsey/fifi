@@ -1466,6 +1466,14 @@ mod tests {
             kernels.concatenate(&views, 1).unwrap()
         };
 
+        // Timing: each iteration syncs on a 1-element readback of the output, so the
+        // GPU completion lands inside the measurement (evaluate alone enqueues async).
+        let sync = |kernels: &mut MlxKernels, out: &ExecutionTensor| {
+            let probe = kernels.slice(out, &[0, 0, 0, 0], &[1, 1, 1, 1]).unwrap();
+            kernels.evaluate(&[&probe]).unwrap();
+            values(kernels, &probe).unwrap();
+        };
+
         let (cf, composite_ms, composite) = {
             let mut best = f64::INFINITY;
             let mut first = 0.0;
@@ -1490,7 +1498,7 @@ mod tests {
                 }
                 let views: Vec<&ExecutionTensor> = blocks.iter().collect();
                 let out = kernels.concatenate(&views, 2).unwrap();
-                kernels.evaluate(&[&out]).unwrap();
+                sync(&mut kernels, &out);
                 let elapsed = start.elapsed().as_secs_f64();
                 if i == 0 {
                     first = elapsed;
@@ -1514,7 +1522,7 @@ mod tests {
                 let out = kernels
                     .slice(&out, &[0, 0, 0, 0], &[1, h, rows, d])
                     .unwrap();
-                kernels.evaluate(&[&out]).unwrap();
+                sync(&mut kernels, &out);
                 let elapsed = start.elapsed().as_secs_f64();
                 if i == 0 {
                     first = elapsed;
