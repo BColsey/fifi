@@ -1,14 +1,14 @@
 mod config;
 #[allow(
     dead_code,
-    reason = "the executors use the history call, the decoder and sampler fields, and the constructors; until they do, only the worker and tests use the seam"
+    reason = "the worker and the server jobs run the seam and every family executor implements it; the allow covers the members only tests still reach"
 )]
 pub(crate) mod executor;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 mod exl3_pack;
 #[allow(
     dead_code,
-    reason = "an executor wires the Flash-Next step; until it does, only tests and the Mac parity tests call it"
+    reason = "the factory wires the MLX and the opt-in CUDA executors (`cuda_decode`); the allow covers the pieces still reached only by tests until the family is qualified"
 )]
 pub(crate) mod flash_next;
 pub mod flint;
@@ -24,7 +24,7 @@ pub mod nemotron35;
 pub(crate) mod parking;
 #[allow(
     dead_code,
-    reason = "the Projector seam serves the Flash-Next step and the planned Qwen3.6 CUDA adapter; until an executor wires them, only tests call it"
+    reason = "the Qwen3.6 host and CUDA loads, the Flash-Next MoE/PLE blocks and the Nemotron host projector run the seam; the allow covers the adapters only tests still reach"
 )]
 pub(crate) mod project;
 pub mod quantization;
@@ -37,12 +37,12 @@ pub mod recurrent;
 pub mod route;
 #[allow(
     dead_code,
-    reason = "the executors and the server jobs build samplers; until they do, only GenerationState and tests use them"
+    reason = "the server jobs and the family executors build samplers through the seam; the allow covers the members only tests still reach"
 )]
 pub(crate) mod sampler;
 #[allow(
     dead_code,
-    reason = "the Flash-Next executor (Mac only) and the Q36 executor use the session; until they do, only tests call it"
+    reason = "the worker and the Qwen3.6, Flint and Flash-Next executors use the session; the allow covers the members only tests still call"
 )]
 pub(crate) mod session;
 pub mod spec;
