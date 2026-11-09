@@ -8,6 +8,7 @@ use super::card_prefill::{CardChunkInputs, build_card_chunk, run_card_chunk};
 use super::card_session_device_tests::rig_spec;
 use super::dims::{KvMode, StepDims, StepOptions};
 use super::layer_table::LayerTable;
+use crate::family::executor::ExecutorOps;
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::host::HostShape;
 use crate::family::session::TokenStepper;
@@ -22,7 +23,7 @@ fn card_chunk_matches_the_per_token_path() {
     if !device_present("card_chunk_matches_the_per_token_path") {
         return;
     }
-    check_card_chunk([0, 0]);
+    check_card_chunk([0, 0], 8);
 }
 
 #[test]
@@ -37,18 +38,33 @@ fn card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices);
+    check_card_chunk(devices, 8);
 }
 
-fn check_card_chunk(devices: [usize; 2]) {
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn large_card_chunk_matches_the_per_token_path_on_physical_peers() {
+    assert!(device_present(
+        "large_card_chunk_matches_the_per_token_path_on_physical_peers"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices, 96);
+}
+
+fn check_card_chunk(devices: [usize; 2], rows: usize) {
     const NAME: &str = "card_chunk_matches_the_per_token_path";
     let (mut session, stack, loaded, names, _vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
             devices,
             256,
             crate::family::session::StoreLimits::default(),
+            rows,
         )
         .expect("the rig session");
+    assert_eq!(ExecutorOps::prefill_piece(&session), None);
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec).expect("inventory");
     let shape = HostShape::from_spec(&spec, 64).expect("shape");
@@ -62,11 +78,9 @@ fn check_card_chunk(devices: [usize; 2]) {
         layout: crate::family::project::cuda::WeightLayout::Native,
     };
     let table = LayerTable::new(&d, &inv).expect("layers");
-    // The rig session's stock mailbox payload is hidden*top_k = 16384
-    // values; 8 rows fit it exactly (8 * 2048). The production start grows
-    // the mailbox for bigger chunks; this rig proves correctness at the
-    // boundary the stock stack allows.
-    let rows = 8usize.min(super::card_prefill::max_chunk_rows(d.shape.hidden));
+    // The rig requests the same mailbox sizing rule as production, so the
+    // larger peer test exercises a real multi-row exchange, not a truncation.
+    assert!(rows <= super::card_prefill::max_chunk_rows(d.shape.hidden));
     let chunk = build_card_chunk(
         stack,
         &d,
@@ -156,6 +170,7 @@ fn check_card_chunk(devices: [usize; 2]) {
     let long_control = TokenStepper::logits(&mut session, *last).expect("long control logits");
     TokenStepper::reset(&mut session).expect("reset long chunk");
     session.set_chunk_for_test(chunk);
+    assert_eq!(ExecutorOps::prefill_piece(&session), Some(rows));
     TokenStepper::feed_rows(&mut session, prompt).expect("long chunk feed");
     let long_chunk = TokenStepper::logits(&mut session, *last).expect("long chunk logits");
     let (want_tok, want_best, want_runner) = winner(&long_control);
@@ -167,5 +182,7 @@ fn check_card_chunk(devices: [usize; 2]) {
         (got_best - want_best).abs() <= slack && (got_runner - want_runner).abs() <= slack,
         "{NAME}: margins after multiple chunks exceed {slack:.5}"
     );
+    let executor = super::card_session::Q36CudaStep::Cards(Box::new(session));
+    assert_eq!(ExecutorOps::prefill_piece(&executor), Some(rows));
     println!("{NAME}: {rows} rows, winner {want_tok}, chunk margin {got_best:.4}/{got_runner:.4}");
 }

@@ -632,6 +632,12 @@ impl ExecutorOps for CardSession {
         st.prefill(self, toks, self.context_limit)
     }
 
+    /// Advertise the admitted chunk size only when experimental card chunking is active.
+    /// Otherwise the worker keeps its existing per-token-path fallback.
+    fn prefill_piece(&self) -> Option<usize> {
+        self.chunk.as_ref().map(|chunk| chunk.rows())
+    }
+
     fn decode(
         &mut self,
         st: &mut DecodeSession,
@@ -781,6 +787,13 @@ impl ExecutorOps for Q36CudaStep {
         match self {
             Self::Single(step) => step.prefill(st, toks),
             Self::Cards(session) => session.prefill(st, toks),
+        }
+    }
+
+    fn prefill_piece(&self) -> Option<usize> {
+        match self {
+            Self::Single(step) => step.prefill_piece(),
+            Self::Cards(session) => session.prefill_piece(),
         }
     }
 
