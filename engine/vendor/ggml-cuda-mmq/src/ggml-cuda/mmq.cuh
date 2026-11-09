@@ -1393,7 +1393,10 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
              ntx_fd);
-        return cudaGetLastError();
+        const cudaError_t e_tiling = cudaGetLastError();
+        if (e_tiling != cudaSuccess) fprintf(stderr, "DBG: TILING LAUNCH FAILED err=%d type=%d J=%d fallback=%d\n",
+                (int)e_tiling, (int)type, J, (int)fallback);
+        return e_tiling;
     }
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
@@ -1430,15 +1433,26 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
          ntx_fd);
 
     if (!fixup_needed) {
-        return cudaGetLastError();
+        const cudaError_t e_nofix = cudaGetLastError();
+        if (e_nofix != cudaSuccess) fprintf(stderr, "DBG: stream-k main (no fixup) launch err=%d\n", (int)e_nofix);
+        return e_nofix;
     }
 
-    FIFI_TRY(cudaGetLastError());
+    { const cudaError_t e_main = cudaGetLastError();
+      if (e_main != cudaSuccess) fprintf(stderr, "DBG: stream-k main launch err=%d (before fixup)\n", (int)e_main); }
+    fprintf(stderr, "DBG: launching fixup grid=(%d,%d,%d) block=(%d,%d,%d) type=%d J=%d fallback=%d\n",
+            block_nums_fixup.x, block_nums_fixup.y, block_nums_fixup.z,
+            block_dims_fixup.x, block_dims_fixup.y, block_dims_fixup.z, (int)type, J, (int)fallback);
     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
-    return cudaGetLastError();
+    const cudaError_t e_fix = cudaGetLastError();
+    if (e_fix != cudaSuccess) fprintf(stderr, "DBG: FIXUP LAUNCH FAILED err=%d type=%d J=%d fallback=%d grid=(%d,%d,%d) block=(%d,%d,%d)\n",
+            (int)e_fix, (int)type, J, (int)fallback,
+            block_nums_fixup.x, block_nums_fixup.y, block_nums_fixup.z,
+            block_dims_fixup.x, block_dims_fixup.y, block_dims_fixup.z);
+    return e_fix;
 }
 
 template <ggml_type type, bool fallback>
