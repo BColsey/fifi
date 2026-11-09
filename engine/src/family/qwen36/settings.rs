@@ -3453,7 +3453,7 @@ mod tests {
         let pin = tokenizer_pin().unwrap();
         assert_eq!(pin.vocab_size, 248_077);
         assert_eq!(pin.tokenizer_json[..4], [0x09, 0x97, 0xf4, 0x10]);
-        assert_eq!(pin.tokenizer_json[28..], [0x22, 0x9b, 0x9f, 0x03]);
+        assert_eq!(pin.tokenizer_json[28..], [0x72, 0x29, 0xb9, 0xf3]);
         assert_eq!(pin.tokenizer_config_json[..4], [0xb1, 0x13, 0x49, 0xaa]);
         assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
