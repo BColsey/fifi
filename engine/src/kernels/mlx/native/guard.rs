@@ -50,6 +50,10 @@ pub(super) fn has_failed() -> bool {
 ///
 /// The guard nests on one thread. An inner guard holds no lock and still runs its cleanup.
 /// Mutex poison and unwinding mark the owner terminal before any further native call.
+/// In the lib's own test builds neither does: an assertion panic is a local test failure,
+/// not evidence of damaged native state, and marking would cascade one failed assertion
+/// into every later native test in the process. Native failure paths still mark the
+/// owner terminal directly (see `mark_failed` call sites in `check`/`failure` callers).
 pub(super) struct DispatchGuard {
     lock: Option<MutexGuard<'static, ()>>,
 }
@@ -60,13 +64,15 @@ impl DispatchGuard {
             None
         } else {
             let lock = DISPATCH.lock().unwrap_or_else(|poisoned| {
-                mark_failed();
+                if !cfg!(test) {
+                    mark_failed();
+                }
                 poisoned.into_inner()
             });
             DISPATCH_HELD.with(|held| held.set(true));
             Some(lock)
         };
-        if std::thread::panicking() {
+        if std::thread::panicking() && !cfg!(test) {
             mark_failed();
         }
         Self { lock }
@@ -76,7 +82,7 @@ impl DispatchGuard {
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
         if self.lock.is_some() {
-            if std::thread::panicking() {
+            if std::thread::panicking() && !cfg!(test) {
                 mark_failed();
             }
             DISPATCH_HELD.with(|held| held.set(false));
@@ -188,4 +194,24 @@ pub(super) fn next_owner() -> Result<OwnerKey, EngError> {
             operation: "initialize",
             message: "native owner identifiers exhausted".into(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An assertion panic while a guard is held must stay local to its test: in test builds
+    /// the panic path does not mark the owner terminal, so one failed assertion cannot
+    /// cascade "the native resident owner has failed" into every later native test.
+    #[test]
+    fn a_panicking_thread_holding_dispatch_does_not_poison_the_owner_in_tests() {
+        let panic_thread = std::thread::spawn(|| {
+            let _dispatch = DispatchGuard::enter();
+            panic!("local assertion failure");
+        });
+        assert!(panic_thread.join().is_err());
+
+        let lease = Lease::acquire();
+        assert!(lease.is_ok(), "a sibling test's panic poisoned the owner");
+    }
 }

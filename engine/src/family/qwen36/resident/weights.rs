@@ -911,6 +911,44 @@ mod tests {
         assert_eq!(w.expert_page_bytes().unwrap(), expected_page_bytes(true));
     }
 
+    // TEMPORARY probe: per-part resident bytes to locate the +256 drift on the 2026-11 mac
+    // runtime. Remove after the diverging part is identified.
+    #[test]
+    fn probe_resident_byte_parts() {
+        let _serial = crate::native_test_lock();
+        let (ckpt, host) = load(&TINY_GQA);
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let w = ResidentWeights::import(&mut kernels, &ckpt, host).unwrap();
+        let show = |name: &str, mut b: Bytes| -> String { format!("{name} {}", b.total()) };
+        let mut b = Bytes::default();
+        b.packed(&w.lm_head).unwrap();
+        println!("{}", show("lm_head", b));
+        let mut b = Bytes::default();
+        b.tensor(&w.final_norm).unwrap();
+        println!("{}", show("final_norm", b));
+        for (i, layer) in w.layers.iter().enumerate() {
+            let mut b = Bytes::default();
+            b.tensor(&layer.input_norm).unwrap();
+            b.tensor(&layer.post_norm).unwrap();
+            println!("{}", show(&format!("layer{i}_norms"), b));
+            let mut b = Bytes::default();
+            match &layer.mixer {
+                RMixer::Delta(d) => d.bytes(&mut b).unwrap(),
+                RMixer::Attn(a) => a.bytes(&mut b).unwrap(),
+            }
+            println!("{}", show(&format!("layer{i}_mixer"), b));
+            let mut b = Bytes::default();
+            match &layer.feed_forward {
+                RFeedForward::Dense(d) => d.bytes(&mut b).unwrap(),
+                RFeedForward::Moe(m) => m.bytes(&mut b).unwrap(),
+            }
+            println!("{}", show(&format!("layer{i}_ff"), b));
+        }
+        let mut b = Bytes::default();
+        w.consts.bytes(&mut b).unwrap();
+        println!("{}", show("consts", b));
+    }
+
     /// The scale and bias census that the import must produce: the weights by rule, every part of
     /// the stated dtype.
     fn assert_scale_census(w: &ResidentWeights, f32_scales: bool) {
