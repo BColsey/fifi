@@ -810,7 +810,12 @@ mod tests {
             assert_eq!(w.expert_page_bytes().unwrap(), 0);
             assert_eq!(
                 w.byte_len().unwrap(),
-                expected_bytes(&tiny::entries(spec), 0, f32_scales)
+                expected_bytes(
+                    &tiny::entries(spec),
+                    0,
+                    f32_scales,
+                    spec.linear.as_ref().unwrap().key_dim().unwrap() as u64,
+                )
             );
             let census = w.scale_census();
             assert_eq!(census.weights, 16);
@@ -867,8 +872,9 @@ mod tests {
     /// packed payloads stay as stored; scales and biases take 4 bytes per element when they are
     /// F32 (the default) and their stored bytes when they stay BF16; dense BF16 tensors become F32;
     /// the embedding stays in the checkpoint; the router and the shared gate become F32 matrices;
-    /// the three constants take 4 bytes each.
-    fn expected_bytes(entries: &[Entry], layers: u64, f32_scales: bool) -> u64 {
+    /// the three scalar constants take 4 bytes each and the two `[key_dim]` decode head-norm
+    /// weights (`q_norm_w`, `k_norm_w`) take `key_dim` × 4 each.
+    fn expected_bytes(entries: &[Entry], layers: u64, f32_scales: bool, key_dim: u64) -> u64 {
         let mut total = 0u64;
         for (name, dtype, shape, bytes) in entries {
             let elements: u64 = shape.iter().map(|&d| u64::from(d)).product();
@@ -884,8 +890,11 @@ mod tests {
                 elements * 4
             };
         }
-        // Per layer: router [64, 4] and shared gate [64, 1] as F32.
-        total + layers * (64 * 4 * 4 + 64 * 4) + 12
+        // Per layer: router [64, 4] and shared gate [64, 1] as F32. The three scalar constants
+        // (softplus zero, qk_eps, sqrt_kd) plus the two `[key_dim]` head-norm weights that joined
+        // `Consts` after this rule was written: they are imported constants, not entries, so the
+        // rule counts them here.
+        total + layers * (64 * 4 * 4 + 64 * 4) + 12 + 2 * key_dim * 4
     }
 
     /// The mapped bytes of the expert pages of the tiny GQA model: 4 layers * 3 stacks, each with
@@ -906,47 +915,14 @@ mod tests {
         let w = ResidentWeights::import(&mut kernels, &ckpt, host).unwrap();
         assert_eq!(
             w.byte_len().unwrap(),
-            expected_bytes(&tiny::entries(&TINY_GQA), 4, true)
+            expected_bytes(
+                &tiny::entries(&TINY_GQA),
+                4,
+                true,
+                TINY_GQA.linear.as_ref().unwrap().key_dim().unwrap() as u64,
+            )
         );
         assert_eq!(w.expert_page_bytes().unwrap(), expected_page_bytes(true));
-    }
-
-    // TEMPORARY probe: per-part resident bytes to locate the +256 drift on the 2026-11 mac
-    // runtime. Remove after the diverging part is identified.
-    #[test]
-    fn probe_resident_byte_parts() {
-        let _serial = crate::native_test_lock();
-        let (ckpt, host) = load(&TINY_GQA);
-        let mut kernels = MlxKernels::try_new().unwrap();
-        let w = ResidentWeights::import(&mut kernels, &ckpt, host).unwrap();
-        let show = |name: &str, mut b: Bytes| -> String { format!("{name} {}", b.total()) };
-        let mut b = Bytes::default();
-        b.packed(&w.lm_head).unwrap();
-        println!("{}", show("lm_head", b));
-        let mut b = Bytes::default();
-        b.tensor(&w.final_norm).unwrap();
-        println!("{}", show("final_norm", b));
-        for (i, layer) in w.layers.iter().enumerate() {
-            let mut b = Bytes::default();
-            b.tensor(&layer.input_norm).unwrap();
-            b.tensor(&layer.post_norm).unwrap();
-            println!("{}", show(&format!("layer{i}_norms"), b));
-            let mut b = Bytes::default();
-            match &layer.mixer {
-                RMixer::Delta(d) => d.bytes(&mut b).unwrap(),
-                RMixer::Attn(a) => a.bytes(&mut b).unwrap(),
-            }
-            println!("{}", show(&format!("layer{i}_mixer"), b));
-            let mut b = Bytes::default();
-            match &layer.feed_forward {
-                RFeedForward::Dense(d) => d.bytes(&mut b).unwrap(),
-                RFeedForward::Moe(m) => m.bytes(&mut b).unwrap(),
-            }
-            println!("{}", show(&format!("layer{i}_ff"), b));
-        }
-        let mut b = Bytes::default();
-        w.consts.bytes(&mut b).unwrap();
-        println!("{}", show("consts", b));
     }
 
     /// The scale and bias census that the import must produce: the weights by rule, every part of
@@ -994,7 +970,12 @@ mod tests {
         assert_scale_census(&w, false);
         assert_eq!(
             w.byte_len().unwrap(),
-            expected_bytes(&tiny::entries(&TINY_GQA), 4, false)
+            expected_bytes(
+                &tiny::entries(&TINY_GQA),
+                4,
+                false,
+                TINY_GQA.linear.as_ref().unwrap().key_dim().unwrap() as u64,
+            )
         );
         assert_eq!(w.expert_page_bytes().unwrap(), expected_page_bytes(false));
     }
