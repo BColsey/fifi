@@ -31,6 +31,8 @@ An engine needs room for:
 
 At 262,144 positions with the 8-bit cache, the KV cache takes 2,852,126,720 bytes (2.66 GiB).
 
+For the quality evidence and limits of different cache profiles, see [KV cache quality at long context](kv-cache-quality.md).
+
 ### On Apple Silicon
 
 Unified memory holds everything, so the plan is a budget split:
