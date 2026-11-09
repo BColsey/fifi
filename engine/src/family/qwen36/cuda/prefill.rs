@@ -2466,6 +2466,9 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8Act)?,
         },
     )?;
+    eprintln!("tiered-chunk: syncing after gather");
+    stream.synchronize()?;
+    eprintln!("tiered-chunk: sync after gather OK");
     launch_mmid(
         down,
         d.get(ChunkSlot::Q8Act)?,
