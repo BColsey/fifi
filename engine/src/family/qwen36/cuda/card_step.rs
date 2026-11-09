@@ -123,7 +123,7 @@ impl CardStack {
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
-        Self::with_payload(dims, options, devices, admission, &table, None)
+        Self::with_table(dims, options, devices, admission, &table)
     }
 
     /// The ring's mailbox payload cap: the default covers the eager step's

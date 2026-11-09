@@ -79,9 +79,8 @@ pub(super) mod exl3;
 /// Every slot of the chunk arena exactly once, in `chunk_tensors` order: the view checks take the
 /// arena as the plan of exactly this set, so a slot added to the plan without this module fails
 /// [`super::prefill_tests`].
-pub(super) const ALL_SLOTS: [ChunkSlot; 36] = [
+pub(super) const ALL_SLOTS: [ChunkSlot; 35] = [
     ChunkSlot::Hidden,
-    ChunkSlot::Zero,
     ChunkSlot::IdsTok,
     ChunkSlot::X,
     ChunkSlot::XfA,
@@ -183,8 +182,9 @@ fn required_slots(slots: &[ChunkSlot]) -> &'static [ChunkSlot] {
 }
 
 /// (V1) the arena holds exactly the list's tensors; (V2) no slot twice; (V3) every slot of
-/// [`ALL_SLOTS`] (or [`EXL3_SLOTS`] for an EXL3 list) present, and no slot of the other set. The
-/// order is binding: every refusal names its guard.
+/// [`ALL_SLOTS`] (or [`EXL3_SLOTS`] for an EXL3 list) present, and no slot of the other set. A
+/// native card plan may additionally carry `Zero`; a single-device plan does not need it.
+/// The order is binding: every refusal names its guard.
 pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(), EngError> {
     if arena_len != slots.len() {
         return Err(EngError::BadRequest(format!(
@@ -207,7 +207,10 @@ pub(super) fn check_view_list(arena_len: usize, slots: &[ChunkSlot]) -> Result<(
             )));
         }
     }
-    if let Some(extra) = slots.iter().find(|slot| !required.contains(slot)) {
+    if let Some(extra) = slots.iter().find(|slot| {
+        !required.contains(slot)
+            && !(**slot == ChunkSlot::Zero && !slots.contains(&ChunkSlot::Exl3Flag))
+    }) {
         return Err(EngError::BadRequest(format!(
             "prefill chunk: slots: {extra:?} does not belong to this arena"
         )));

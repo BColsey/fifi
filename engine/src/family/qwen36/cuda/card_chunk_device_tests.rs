@@ -17,14 +17,34 @@ use crate::kernels::cuda::device_present;
 /// greedy winner must agree and the top-2 margin stay inside the slack
 /// the single-device chunk suite uses for MMQ-vs-matvec.
 #[test]
+#[ignore = "holds its CUDA adapter leases for the process lifetime; run alone"]
 fn card_chunk_matches_the_per_token_path() {
-    const NAME: &str = "card_chunk_matches_the_per_token_path";
-    if !device_present(NAME) {
+    if !device_present("card_chunk_matches_the_per_token_path") {
         return;
     }
+    check_card_chunk([0, 0]);
+}
+
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn card_chunk_matches_the_per_token_path_on_physical_peers() {
+    assert!(device_present(
+        "card_chunk_matches_the_per_token_path_on_physical_peers"
+    ));
+    // The device runner must expose only the intended peer pair, in the
+    // desired order, via CUDA_VISIBLE_DEVICES; these are logical ordinals.
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices);
+}
+
+fn check_card_chunk(devices: [usize; 2]) {
+    const NAME: &str = "card_chunk_matches_the_per_token_path";
     let (mut session, stack, loaded, names, _vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
-            [0, 0],
+            devices,
             256,
             crate::family::session::StoreLimits::default(),
         )
@@ -114,13 +134,38 @@ fn card_chunk_matches_the_per_token_path() {
              (peak {peak:.3}, slack {slack:.5})"
         );
     }
-    // And the mid-prompt winners: every control row's winner must lead its
-    // chunk counterpart within the same slack (the rows are not sampled by
-    // the driver, so compare only the last row above and the count here).
+    // The driver does not expose intermediate logits. Check that the control
+    // consumed the expected rows; only the final logits are compared here.
     assert_eq!(
         control_rows.len(),
         chunk_rows.len(),
         "{NAME}: the control fed every row"
+    );
+
+    // Exercise the serving hook across two full chunks plus an eager tail.
+    let longer: Vec<u32> = (0..(rows as u32 * 2 + 2))
+        .map(|i| (i * 29 + 17) % 900)
+        .collect();
+    let (prompt, [last]) = longer.split_at(longer.len() - 1) else {
+        unreachable!("the prompt has a final token");
+    };
+    TokenStepper::reset(&mut session).expect("reset long control");
+    for &token in prompt {
+        TokenStepper::feed(&mut session, token).expect("long control feed");
+    }
+    let long_control = TokenStepper::logits(&mut session, *last).expect("long control logits");
+    TokenStepper::reset(&mut session).expect("reset long chunk");
+    session.set_chunk_for_test(chunk);
+    TokenStepper::feed_rows(&mut session, prompt).expect("long chunk feed");
+    let long_chunk = TokenStepper::logits(&mut session, *last).expect("long chunk logits");
+    let (want_tok, want_best, want_runner) = winner(&long_control);
+    let (got_tok, got_best, got_runner) = winner(&long_chunk);
+    let peak = long_control.iter().fold(0f32, |a, &v| a.max(v.abs()));
+    let slack = 2.0 * (peak * 1e-3 + 1e-6);
+    assert_eq!(got_tok, want_tok, "{NAME}: winner after multiple chunks");
+    assert!(
+        (got_best - want_best).abs() <= slack && (got_runner - want_runner).abs() <= slack,
+        "{NAME}: margins after multiple chunks exceed {slack:.5}"
     );
     println!("{NAME}: {rows} rows, winner {want_tok}, chunk margin {got_best:.4}/{got_runner:.4}");
 }
