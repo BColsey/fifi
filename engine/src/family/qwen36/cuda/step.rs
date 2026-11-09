@@ -583,7 +583,11 @@ pub(super) fn chunk_verdict(facts: &ChunkFacts) -> ChunkVerdict {
     if facts.kv_mode == KvMode::Int8G32 && !facts.kv8_chunked_prefill {
         return ChunkVerdict::Kv8;
     }
-    if facts.tiered {
+    if facts.tiered
+        && !super::prefill::tiered_chunk_enabled(
+            std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+        )
+    {
         return ChunkVerdict::Tiered;
     }
     if facts.mmq_q6k {
@@ -1572,6 +1576,14 @@ impl<'a> QwenResidentStep<'a> {
                     .as_ref()
                     .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
             );
+            // The tiered chunk arm: the runtime is present when the session is tiered
+            // AND the chunk flag is on (the gate ships dark until device-qualified).
+            let tiered_chunk = self.tiered.as_ref().filter(|_| {
+                super::prefill::tiered_chunk_enabled(
+                    std::env::var_os(super::prefill::TIERED_CHUNK_VAR).as_deref(),
+                )
+            });
+            let run = run.with_tiered(tiered_chunk);
             #[cfg(test)]
             let run = run.with_kernel_class(kernel_class);
             run_chunk_body(
