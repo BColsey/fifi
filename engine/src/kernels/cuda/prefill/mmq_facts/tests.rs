@@ -67,3 +67,39 @@ fn mmq_facts_are_queried_once_per_context() {
     );
     println!("MMQ facts: three calls, one query; a fresh context one query");
 }
+
+#[test]
+#[ignore = "requires two physical CUDA devices"]
+fn mmq_facts_follow_the_context_when_another_device_was_selected() {
+    const NAME: &str = "mmq_facts_follow_the_context_when_another_device_was_selected";
+    assert!(
+        testkit::device_present(NAME),
+        "{NAME}: CUDA devices are required"
+    );
+    let admission = crate::family::project::cuda::served_admission();
+    let contexts = [
+        crate::kernels::cuda::CudaContext::with_admission_on(0, &admission).expect("device 0"),
+        crate::kernels::cuda::CudaContext::with_admission_on(1, &admission).expect("device 1"),
+    ];
+    let live = |device| {
+        let _dispatch = crate::kernels::cuda::context::enter_on(device).expect("select device");
+        crate::kernels::cuda::native::prefill::mmq_facts::mmq_facts().expect("live facts")
+    };
+    let expected = [live(0), live(1)];
+    // Device 1 is current here. Querying context 0 must still select device 0.
+    let observed = [
+        contexts[0].mmq_device_facts().expect("context 0 facts"),
+        contexts[1].mmq_device_facts().expect("context 1 facts"),
+    ];
+    for index in 0..2 {
+        assert_eq!(observed[index].cc, expected[index].cc, "device {index}");
+        assert_eq!(
+            observed[index].nsm, expected[index].nsm as usize,
+            "device {index}"
+        );
+        assert_eq!(
+            observed[index].smpbo, expected[index].smpbo,
+            "device {index}"
+        );
+    }
+}
