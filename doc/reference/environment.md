@@ -24,6 +24,7 @@ Two kinds of values appear below:
 | `ENGINESRV_CACHE_USAGE` | on | Report reused prompt tokens in the API usage fields. Once set, only the exact values `1`, `true` and `on` keep it on. |
 | `ENGINESRV_THINK_REPLAY` | on (switch) | Qwen3.6 only: keep the reasoning that clients resend with earlier assistant turns in the prompt. Off removes it for every engine. |
 | `ENGINESRV_NOTICE_TOOLWRAP` | on (switch) | Qwen3.6 only, with think replay on: render system messages that follow an assistant turn as tool responses, so that the chat template keeps the reasoning of earlier tool-calling turns. |
+| `ENGINESRV_SHADOW_BLOCK_LCP` | off (switch) | Read-only observation for the request log: report the longest common prefix the saved block checkpoint would have matched. Never changes restore or save behavior. |
 
 ## Qwen3.6 on Apple Silicon
 
@@ -31,6 +32,11 @@ Two kinds of values appear below:
 | --- | --- | --- |
 | `Q36_CACHE_LIMIT` | none | Fallback for `cache_limit_bytes`, in bytes. |
 | `Q36_FUSED_PREFILL` | on | Fused kernels for prompt processing. Only `0` turns them off. |
+| `Q36_FLASH_PREFILL` | on | Fused flash-prefill kernel replaces the composite prefix attention; on since its default-flip gate passed (cohort 2,046 positions: dNLL -0.000080, top-1 98.045%). `0` is the kill switch. Validated at D >= 128 with the Q8 cache and REP 8. |
+| `Q36_FLASH_DELTA` | on | Flash-delta gated rule replaces the recurrent kernel in prefill: the chunked WY-form kernel (4.1x) runs for chunks of 16 rows or more, the recurrent kernel serves decode. `0` is the kill switch. |
+| `Q36_FUSED_DECODE` | off | Opt-in fused decode-middle kernel (conv, SiLU, the q/k/v split, head norms, decay/beta gates and ring-shift as one kernel). Read per call; default off until the parity gates pass. |
+| `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for sliced prefill attention, read once. Applies only where the composite attention runs, so it has no effect while the flash kernel serves the chunk. |
+| `Q36_NO_ACTMUL` (and siblings) | unset | Kill switches for the individual fused-prefill kernels while `Q36_FUSED_PREFILL` stays on: `Q36_NO_ACTMUL`, `Q36_NO_ATTNGATE`, `Q36_NO_EMBEDDED`, `Q36_NO_GDNPREP`, `Q36_NO_GDNPOST`, `Q36_NO_MOECOMBINE`. The variable's presence alone disables that one fusion. |
 
 ## Qwen3.6 on NVIDIA CUDA
 
@@ -53,9 +59,35 @@ The Flash-Next CUDA step runs one row per launch, which is under the 64-row thre
 | `INFERENCE_CUDA_KV8_ATTN_V_PREFETCH` | `0` | only `1` is on | Experimental register-V decode attention: use the prefetch kernel variant, which holds the next key's code words in registers ahead of the dot chain. Read once at startup; only the exact value `1` turns it on, any other value or unset keeps the default kernel. Head dimension 256 only, and it needs the register-V KV8 decode attention path (the default with `kv_dtype: q8`); outputs are bitwise-equal to it. |
 | `FIFI_GDN_CONV_PREFILL` | off | `1`, `16`, `32`, `64` (surrounding spaces ignored) | Opt-in, CUDA DeltaNet layers of Qwen3.6: run the causal-conv step (conv1d plus SiLU) of a prompt chunk of 64 or more rows on a prefill kernel that splits the rows over many CTAs instead of one thread per channel looping over all rows. `1` selects 32 rows per thread; `16`, `32` and `64` select that many. Unset and every other value, including empty, keep the vendored kernel. Launches under 64 rows (decode, K-row verify) always keep the vendored kernel, and the snapshot entry of the K-row window is unchanged. Every output element has the same four products rounded and fused in the same order and the same SiLU, so the output and the conv window are meant to be byte-identical to the vendored kernel. The device tests compare all three row counts against the vendored kernel across Qwen3.6 and Flash-Next channel counts, 1 to 4,099 rows, piece handoff and decode after prefill; they have not run on the device yet. The first read logs the value when the variable is set. Process-wide and read once; restart to change. Not enabled by default: the end-to-end served-text identity and the TTFT gain are still to be measured on the device. |
 | `FIFI_GDN_SCAN_COLS` | off | `8`, `16`, `32` (surrounding spaces ignored) | Opt-in, CUDA DeltaNet layers of Qwen3.6 prefill: run the gated-delta scan of a launch of 64 rows or more on a kernel where each block owns that many value columns of a head, instead of 32 (128 blocks for Qwen3.6). `16` gives 256 blocks of 4 warps, `8` gives 512 blocks of 2 warps; `32` runs the same shape as the default from a separate kernel copy, for A/B. Unset and every other value, including empty, keep the original kernel, and so do launches under 64 rows (any single-token step, a short last chunk). The first read logs the value when the variable is set. Per value column nothing changes: the same 8 lanes, the same 16 state entries per lane, the same products and the same two 8-lane sums, so the state and the scan output are meant to be byte-identical to the default launch; a narrower block re-reads each q/k row once per block of its head. The device tests compare all three widths with the default launch across both models' head counts and forms, 1 to 2,051 rows and piece handoff; they have not run on the device yet. Process-wide and read once; restart to change. Not enabled by default: the speed and the served-text identity are still to be measured on the device. |
+| `INFERENCE_QWEN36_SPARSE_ATTN` | `0` | only `1` is on | Arm the sparse decode attention path (bounded admission; unsupported heads fall back to dense). Read once per process. |
+| `Q36_CUDA_BANK_OVERLAP` | `0` | only `1` is on | EXL3 expert-bank miss overlap: a miss refill enqueues on a copy stream while resident-expert groups launch before the wait. A bad value stops the start, not the first token. |
+| `Q36_CUDA_MIN_FREE_MIB` | admission default | MiB count | Free-after-load floor of the CUDA memory admission, the same bytes for the gate's qualified loop and the server start; parsed once so the checks cannot diverge. An out-of-range value refuses with the accepted range named. |
+| `Q36_TIERED_GUESS` | `0` | only `1` is on | Router-guess expert prefetch in the tiered token path; ships dark until qualified on a device. |
+| `Q36_TIERED_PREFIX` | `0` | only `1` is on | Tiered sessions may save and restore prefixes; default off pending device qualification. |
+| `Q36_P2P_WATERFILL` | `0` | only `1` is on | Experimental multi-device GGUF path: a bandwidth-waterfill placement planner redistributes the sliceable roles instead of the even deal. |
+| `Q36_P2P_HOST_EXPERT_BYTES` | `0` | nonnegative byte count | With waterfill: per-card sliced mass moved to pinned host RAM at load (`_0` sets card 0's budget separately). An unparseable value refuses the start. |
+| `Q36_P2P_PREFIX` | `0` | only `1` is on | Experimental: prefix save/restore on the card path; wired but not yet qualified. |
+| `Q36_P2P_SYNC_BROADCAST` | `0` | only `1` is on | Cross-card MoE reduction through sync broadcasts instead of the peer ring. |
+| `INFERENCE_CUDA_GDN_FUSE_INPROJ` | `0` | only `1` is on | Fuse the four Q8_0 DeltaNet input projections (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`) into one row-concatenated upload and launch; bitwise-identical per segment, ~20% faster on the sibling set in the isolated A/B bench. Read once per load. |
+| `INFERENCE_CUDA_TILED_HEAD` | none | comma-separated tensor names | Decode-only tiled-head hybrid: the named tensors upload in the `Tiled` layout so the vendored tiled-head matmul runs beside the native ops. Empty or unset is no override. |
+| `INFERENCE_CUDA_MMID_COLS_HINT` | `auto` | `auto`, `off`/`0`, integer | Column-block hint for the MMID prefill launch; `auto` keeps the shape-driven choice. |
+| `Q36_LAYER_TRACE_DIR` | unset (off) | directory | Layer-trace output directory; while tracing, the CUDA decoder also runs EAGER steps. |
 
 `Q36_CUDA_CHUNK_PREFILL=0` and `Q36_CUDA_KV8_STAGE_CONTEXT=0` also turn off `Q36_CUDA_KV8_FIXED_ADMISSION`.
 With `tiered`, the pinned prefix pool is off unless `Q36_CUDA_PINNED_PREFIX=1` is set.
+
+## Flash-Next on NVIDIA CUDA
+
+The Flash-Next family serves only with `flash_next.cuda_decode: true` in the config (opt-in; the family is not validated end to end):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FLASH_NEXT_ARTIFACT_MANIFEST` | unset | Path of the artifact manifest, read once at the engine start. |
+| `FLASH_NEXT_CACHE_LIMIT` | unset | Cache limit in bytes, read once at the engine start. |
+| `FIFI_FLASH_NEXT_BANK_MODE` | `auto` (strict) | Expert-bank store mode: `inclusive` holds every expert pinned in host RAM (about 43 GiB on the reference pack), `exclusive` keeps the evicting store, `auto` takes inclusive when the memory plan admits it and falls back to exclusive. Anything else refuses, never a silent fallback. |
+| `FIFI_FLASH_NEXT_EXPERT_STATS` | unset | Path of a popularity-profile JSON (`expert_stats` format). The engine's own `expert_stats` key wins over the variable; a set value must read and parse — a malformed file refuses the start. |
+| `FIFI_FLASH_NEXT_EXPERT_USAGE_OUT` | unset | Where the expert-usage dump is written at shutdown (the engine's `expert_stats` key first, this variable as fallback), so the next start of the same entry serves warm. |
+| `FIFI_FLASH_NEXT_FUSED_IN` | off (strict) | Fused-input launch of the dense projections: the input rotation runs inside the projection kernel. Bit-identical bytes, but the measured full-step decode regressed, so it stays off for re-measuring after the launch floor changes. Only `1` opts in; any other non-empty value is refused. Read once per process. |
 
 ## Flint
 
@@ -72,6 +104,8 @@ On Apple Silicon:
 | `FIFI_FLINT_MLX_RING_VIEW` | on | switch | Read the full-attention KV cache as one ring view instead of concatenating it each step. Needs `FIFI_FLINT_MLX_ASYNC_CHAIN`. |
 | `FIFI_FLINT_PREFIX_REUSE` | off | switch | Experimental: keep prefix snapshots between turns. Also needs `"prefix_reuse": true`. |
 | `FIFI_FLINT_PREFIX_BUDGET_BYTES` | physical memory minus weights and a system reserve | positive byte count | Memory cap for prefix snapshots. `0` or an unreadable value refuses startup. |
+| `FIFI_FLINT_MLX_COMPILE_LAYER` | off | Run the layer tail through one compiled MLX closure (graph cache). Fail-safe polarity: absent, non-UTF-8 or any value other than the explicit enable words keeps the eager tail. Read once per process. |
+| `FIFI_FLINT_MLX_PREFILL_CHAIN` | off | Chained multi-row prefill groups (graph-ordered, fence-free). Default off until an A/B proves at least +10% pp4096 tok/s; any non-enable value is the rollback. |
 
 On NVIDIA CUDA:
 
@@ -101,12 +135,33 @@ On NVIDIA CUDA:
 | `FIFI_EXL3_TALL_HILO` | on with the `jobs` pass (strict) | Flint on CUDA, numerics-changing: the tall single-matrix projections of the layer-major jobs prefill (attention q, k, v, o, the shared expert, the dense feed-forward; rows 64 to 144 per call, the tensor-core path) stage each rotated F32 activation as two F16 parts, `hi = F16(x)` and `lo = F16((x - hi) * 2048)`, multiply both against the same decoded weight tile and sum `hi + lo / 2048` in F32. The rounding error of the operands falls from about 2^-11 to about 2^-22 of each element (the default F16 cast is up to 4.9e-4 relative per element, 2.1e-4 relative L2 on real activations, behind the plain jobs prefill's drift from the token-major walk; in the early layers it also flushes or subnormalises elements of about 1e-4, which the scaled residual repairs); the accumulation is still the tensor core's. The routed experts of the jobs pass (the job-table kernels) keep their F16 input rows and are not changed. Unset means on whenever the jobs pass is active (the default on the `f16` profile, or an explicit `FIFI_EXL3_LAYER_MAJOR=jobs`); `0` keeps the F16 cast, byte for byte the pre-split jobs pass (the rollback); `1` asks for the split explicitly (surrounding spaces are ignored) and is the same as unset with the jobs pass, but is logged as explicit; any other value, including empty and non-UTF-8, stops the engine at open. It has no effect without the jobs pass (`1` set while the open runs the token-major walk is inactive, not an error, and the load line then says `tall_hilo=inactive`; with the variable unset or `0` on the token-major walk the load line carries no `tall_hilo` token), and none on rows below 64 or with `FIFI_EXL3_LEGACY=1` (both take the F32 path). Measured on the RTX 3090: the first token of a 4,000-token prompt 4.49 s without the split and 4.65 s with it, of a 16,002-token prompt 20.1 and 21.0 s; decode after the prefill is the same as with plain jobs. Quality basis: see `FIFI_EXL3_LAYER_MAJOR`; the default rests on an explicit override of the registered gate, which this configuration fails. The prefix fingerprint binds the resolved state: a prefix saved under the split never restores under the F16 cast. The load line carries `tall_hilo=on` or `off` with `tall_hilo_source=default|explicit` when the jobs pass runs, and `tall_hilo=inactive` only when `=1` is set without the jobs pass. Read once per process, at the Flint open: restart to change. Rollback: set `FIFI_EXL3_TALL_HILO=0`. Only the Flint family reads this variable; Qwen3.6, Flash-Next and GGUF checkpoints do not. |
 | `FIFI_FLINT_CUDA_FUSED_PUBLISH` | on (switch) | Producer fusion for the CUDA walk: the EXL3 projection, grouped projection, row-multiply and row-add kernels store the BF16-rounded value themselves, with the same rounding and the same non-finite check and flag as the separate publish kernel, so the separate publish launch is skipped at those sites. Unset, `1`, `true` and `on` keep it on; any other set value, including empty and non-UTF-8, rolls back to the separate publish launches, whose output is bit-identical. Read once; restart to change. The load line reports `fused_publish=on` or `off`. |
 | `FIFI_FLINT_CUDA_KV_DEVICE_F16` | on (default; `0` rolls back) | Run the KV cache row acceptance guard on the GPU instead of reading each layer's new K and V rows back to the host. On the f16 KV profile the GPU also writes the accepted half-precision rows into the cache, so the host read and the 1,024-byte upload per row (98 pairs per decoded token) are not issued; on the q8 profile the GPU append is unchanged and only the guard moves. A row is accepted when it is finite, has its low 16 bits clear and converts to a finite f16 (round to nearest even), the same rule and the same stored bits as the host path; a rejected row fails the token with the same error, checked once per token before sampling (once per prompt piece in layer-major prefill). Unset, `1`, `true` and `on` keep it on; any other value, including empty and non-UTF-8, turns it off. Read once at the first Flint CUDA engine load; restart to change. Rollback: `FIFI_FLINT_CUDA_KV_DEVICE_F16=0`. |
+| `FIFI_FLINT_CPU_MOE_OVERLAP` | off | With the `cpu_moe_*` keys configured, overlap the CPU expert work with the device step. Resolved once, like the kernel switches above. |
 
 The startup line reports `alloc_cache=`, `late_health=`, `token_health=`, `packed_pointwise=`, `grouped_gather=`, `q8_tiled=`, `kv_device_f16=` and `fused_publish=` (the q8-tile route resolves off on f16 engines). When armed it also ends with `alloc_return=lazy`.
 
+## Nemotron 3.5 on NVIDIA CUDA
+
+Nemotron serves greedy requests only on CUDA (sampled requests are refused). These switches select kernels and diagnostics; all default off unless noted:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NEM35_CHUNK_EXPERTS` | unset | `gpu`: large prompt chunks may stream the layer's routed experts to the device instead of the CPU pool. |
+| `NEM35_CUDA_CHUNK_PREFILL` | `0` | With `NEM35_CHUNK_EXPERTS=gpu`: stream the routed experts in row groups of this many rows (capped by the chunk capacity). |
+| `NEM35_CUDA_GROUPED_EXPERTS` | off | Grouped NVFP4 GEMM for resident expert batches. |
+| `NEM35_NO_BATCH` | off | Kill switch for the legacy GPU batch expert kernel. |
+| `NEM35_NO_F32_CACHE` | off | Bypass the F32 dense cache (per-call pinned/pageable upload), for isolating cache issues at production scale. |
+| `NEM35_NO_PACKED_CACHE` | off | Bypass packed-weight device residency (upload per call). |
+| `NEM35_RESIDENT_DENSE` | off | Startup guard: log the resident dense count and bytes after the first forward and warn if any F32 dense cache remains. |
+| `NEM35_DEVICE_CHAIN` | off | The resident guard also checks the device mamba step count against the expected count. |
+| `NEM35_DECODED_A_B` | off | Force the decoded route for one measurement run (diagnostic; the default stays the device route). |
+| `NEM35_DIAG_TOP2` | off | Log the top-two logits of every step on the CUDA head (diagnostic). |
+| `NEM35_PHASE_TIMING` | off | Time host spans per phase. |
+| `NEM35_SUBOP_TIMING` | off | Time the sub-operations of the MoE CPU routed path. |
+| `NEM35_TOKEN_TIMING` | off | Print each step's timing split to stderr as it closes, so a run cut short keeps the steps it finished. |
+
 ## Tests
 
-These are read by `cargo test`, not by `enginesrv`. A test that needs recorded data finds each location by name: the environment variable first, then the same key in the JSON object `~/.config/fifi/test-paths.json`. The tests that read them skip when a location is unset, and fail instead when `FIFI_TEST_REQUIRE_DATA` is exactly `1`. A deliberate `#[ignore]`d run always fails on a missing value.
+These are read by `cargo test`, not by `enginesrv`. A test that needs recorded data finds each location by name: the environment variable first, then the same key in the JSON object `~/.config/fifi/test-paths.json`. The tests that read them skip when a location is unset, and fail instead when `FIFI_TEST_REQUIRE_DATA` is exactly `1`. A deliberate `#[ignore]`d run always fails on a missing value. The qualification, benchmark and oracle harnesses read further variables (`FLINT_QUAL_*`, `DT_*`, `FIFI_GRAPH_BENCH_*`, `FIFI_FLINT_*_ORACLE*`, `FLINT_PROBE_*`, the `*_CHILD` child-process fault harnesses and the like); those are inputs of the harnesses, not serving switches.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
