@@ -665,7 +665,18 @@ mod tests {
         let dir = model_dir(Some("qwen3_5_moe"), true, false);
         let error = super::build_config(&args_for(dir.path())).unwrap_err();
         assert!(error.0.contains("cannot serve"), "{}", error.0);
-        assert!(error.0.contains("no GPU backend"), "{}", error.0);
+        if cfg!(feature = "native-mlx") {
+            // A native-mlx build reaches the settings validators before the backend
+            // choice and refuses the default-args fixture (no cache limit) — also a
+            // verbatim preflight quote, so this arm pins that refusal instead.
+            assert!(
+                error.0.contains("cache_limit_bytes is missing"),
+                "{}",
+                error.0
+            );
+        } else {
+            assert!(error.0.contains("no GPU backend"), "{}", error.0);
+        }
         assert!(error.0.contains("next:"), "{}", error.0);
 
         // The same refusal carries EXL3-only directories on this build
@@ -673,6 +684,14 @@ mod tests {
         // through the experimental acknowledgement instead.
         let exl3 = model_dir(Some("qwen3_5_moe"), false, true);
         let error = super::build_config(&args_for(exl3.path())).unwrap_err();
-        assert!(error.0.contains("no GPU backend"), "{}", error.0);
+        if cfg!(feature = "native-mlx") {
+            assert!(
+                error.0.contains("cache_limit_bytes is missing"),
+                "{}",
+                error.0
+            );
+        } else {
+            assert!(error.0.contains("no GPU backend"), "{}", error.0);
+        }
     }
 }

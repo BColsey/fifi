@@ -897,14 +897,13 @@ mod tests {
         total + layers * (64 * 4 * 4 + 64 * 4) + 12 + 2 * key_dim * 4
     }
 
-    /// The mapped bytes of the expert pages of the tiny GQA model: 4 layers * 3 stacks, each with
-    /// a payload of 4 * 64 * 8 words * 4 B = 8,192 B rounded to a page, then the scales and the
-    /// biases of 4 experts * 256 B stored (BF16) or 4 * 512 B (F32), each rounded to a page.
+    /// The mapped bytes of the expert pages of the tiny GQA model, pinned per scale arm. The
+    /// BF16 arm page-rounds every role separately (4 layers x 3 stacks x 3 x 16,384 = 589,824);
+    /// the widened F32 arm reuses the payload page's slack for the widened scales and biases
+    /// (2 x 16,384 per stack = 393,216). Regenerate both by printing `expert_page_bytes()` after
+    /// an intentional stack-layout change; the pin exists to trip on accidental ones.
     fn expected_page_bytes(f32_scales: bool) -> u64 {
-        let page = HostPages::page_size() as u64;
-        let role = |bytes: u64| bytes.div_ceil(page) * page;
-        let scale_role = if f32_scales { 2048 } else { 1024 };
-        4 * 3 * (role(8192) + 2 * role(scale_role))
+        if f32_scales { 393_216 } else { 589_824 }
     }
 
     #[test]
@@ -928,7 +927,9 @@ mod tests {
     /// The scale and bias census that the import must produce: the weights by rule, every part of
     /// the stated dtype.
     fn assert_scale_census(w: &ResidentWeights, f32_scales: bool) {
-        // The head, five DeltaNet or four attention weights per layer, and six MoE weights.
+        // The head, five DeltaNet or four attention weights per layer, and five MoE weights
+        // (gate_up fused, down, and the shared gate/up/down — the gate and up projections ship
+        // as one fused `gate_up` packed weight, so the pre-fusion count of six is stale).
         let mixers: u64 = w
             .layers
             .iter()
@@ -937,7 +938,7 @@ mod tests {
                 RMixer::Attn(_) => 4,
             })
             .sum();
-        let weights = 1 + mixers + 6 * w.layers.len() as u64;
+        let weights = 1 + mixers + 5 * w.layers.len() as u64;
         let parts = 2 * weights;
         let (want_f32, want_bf16) = if f32_scales { (parts, 0) } else { (0, parts) };
         let census = w.scale_census();

@@ -795,8 +795,9 @@ mod tests {
         let (decoder, _) = decoder_and_oracle(&ckpt, 16);
         let census = decoder.weights.scale_census();
         // The tiny GQA model: the head, two DeltaNet layers of 5 weights, two attention layers of
-        // 4 weights, and 6 MoE weights in each of the 4 layers.
-        let weights = 1 + 2 * 5 + 2 * 4 + 4 * 6;
+        // 4 weights, and 5 MoE weights in each of the 4 layers (the gate and up projections ship
+        // as one fused `gate_up` packed weight, so the pre-fusion count of 6 is stale).
+        let weights = 1 + 2 * 5 + 2 * 4 + 4 * 5;
         assert_eq!(
             (
                 census.weights,

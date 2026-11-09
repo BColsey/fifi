@@ -402,13 +402,13 @@ mod tests {
             &body,
         );
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-        // The CPU test build compiles no GPU backend, and says so.
-        assert!(
-            body["backends_compiled"]
-                .as_array()
-                .expect("array")
-                .is_empty()
-        );
+        // The compiled-in backends this build carries: none on the plain CPU test build,
+        // "mlx" on a native-mlx build.
+        if cfg!(feature = "native-mlx") {
+            assert_eq!(body["backends_compiled"], serde_json::json!(["mlx"]));
+        } else {
+            assert_eq!(body["backends_compiled"], serde_json::json!([]));
+        }
         assert!(body["host"]["cpu_threads"].as_u64().is_some_and(|n| n >= 1));
         assert_eq!(body["engines"][0]["id"], "e1");
         assert_eq!(body["engines"][0]["context_limit"], 4_096);
