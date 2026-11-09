@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Measure repeatable end-to-end prefill on an already-running fifi server.
 
-The reported rate divides prompt tokens by wall time to the complete reply;
-it includes request overhead and the few generated tokens. Supply a scratch
-output path; an existing result is never overwritten. Run --self-test without
-a server to check the payload and result validation.
+Rates divide token counts by wall time to the complete reply, including queueing,
+cache restore, request overhead and the few generated tokens. The legacy prompt
+rate includes reused tokens; the new-token rate excludes them when usage reports
+reuse. Supply a scratch output path; an existing result is never overwritten.
+Run --self-test without a server to check the payload and result validation.
 """
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -25,15 +27,58 @@ def make_payload(model, repeats):
     return (json.dumps(body) + '\n').encode()
 
 
+def reused_tokens_of(usage, prompt):
+    """Return reported cache reuse, or None when the server did not report it."""
+    counts = []
+    flat = usage.get('reused_tokens')
+    if flat is not None:
+        counts.append(flat)
+    details = usage.get('prompt_tokens_details')
+    if details is not None:
+        if not isinstance(details, dict):
+            raise ValueError('prompt_tokens_details must be an object or null')
+        cached = details.get('cached_tokens')
+        if cached is not None:
+            counts.append(cached)
+    if any(type(count) is not int or count < 0 or count > prompt for count in counts):
+        raise ValueError('reported reused tokens must be an integer within the prompt')
+    if len(set(counts)) > 1:
+        raise ValueError('reported reused token counts disagree')
+    return counts[0] if counts else None
+
+
 def sample_of(reply, elapsed):
     usage = reply['usage']
     prompt = usage['prompt_tokens']
+    completion = usage.get('completion_tokens')
     answer = reply['choices'][0]['message'].get('content') or ''
-    if not isinstance(prompt, int) or prompt < 1 or elapsed <= 0 or answer.strip() != '4':
-        raise ValueError(f'unexpected result: prompt={prompt!r}, answer={answer!r}, seconds={elapsed}')
-    return {'prompt_tokens': prompt, 'completion_tokens': usage['completion_tokens'],
+    if (type(prompt) is not int or prompt < 1 or type(completion) is not int or completion < 1
+            or not isinstance(elapsed, (int, float))
+            or isinstance(elapsed, bool) or not math.isfinite(elapsed) or elapsed <= 0
+            or not isinstance(answer, str) or answer.strip() != '4'):
+        raise ValueError(f'unexpected result: prompt={prompt!r}, completion={completion!r}, '
+                         f'answer={answer!r}, seconds={elapsed}')
+    reused = reused_tokens_of(usage, prompt)
+    new_tokens = None if reused is None else prompt - reused
+    return {'prompt_tokens': prompt, 'completion_tokens': completion,
             'answer': answer, 'seconds': round(elapsed, 6),
-            'estimated_prompt_tokens_per_second': round(prompt / elapsed, 3)}
+            'estimated_prompt_tokens_per_second': round(prompt / elapsed, 3),
+            'reused_tokens': reused, 'new_prompt_tokens': new_tokens,
+            'reuse_class': 'unknown' if reused is None else ('cold' if reused == 0 else 'warm'),
+            'estimated_new_prompt_tokens_per_second': (
+                None if new_tokens is None else round(new_tokens / elapsed, 3))}
+
+
+def reuse_summary(samples):
+    cold = [s for s in samples if s['reuse_class'] == 'cold']
+    warm = [s for s in samples if s['reuse_class'] == 'warm']
+    unknown = [s for s in samples if s['reuse_class'] == 'unknown']
+    return {'cold_samples': len(cold), 'warm_samples': len(warm),
+            'unknown_reuse_samples': len(unknown),
+            'median_cold_prompt_tokens_per_second': (
+                statistics.median(s['estimated_prompt_tokens_per_second'] for s in cold) if cold else None),
+            'median_warm_new_prompt_tokens_per_second': (
+                statistics.median(s['estimated_new_prompt_tokens_per_second'] for s in warm) if warm else None)}
 
 
 def self_test():
@@ -104,14 +149,20 @@ def main():
             'repeat': args.repeat, 'payload_sha256': hashlib.sha256(payload).hexdigest(),
             'samples': samples}, indent=2) + '\n')
         print(f'sample {index + 1}/{args.samples}: {sample["seconds"]:.3f}s, '
-              f'{sample["estimated_prompt_tokens_per_second"]:.2f} prompt tokens/s', flush=True)
+              f'{sample["estimated_prompt_tokens_per_second"]:.2f} prompt tokens/s '
+              f'(reuse={sample["reuse_class"]}, reused={sample["reused_tokens"]}, '
+              f'new={sample["new_prompt_tokens"]})', flush=True)
     if len({s['prompt_tokens'] for s in samples}) != 1:
         raise RuntimeError('prompt token counts differed between samples')
     result = {'model': args.model, 'repeat': args.repeat,
               'payload_sha256': hashlib.sha256(payload).hexdigest(), 'samples': samples,
               'median_seconds': statistics.median(s['seconds'] for s in samples),
               'median_prompt_tokens_per_second': statistics.median(
-                  s['estimated_prompt_tokens_per_second'] for s in samples)}
+                  s['estimated_prompt_tokens_per_second'] for s in samples),
+              'rate_note': ('Rates use complete-reply wall time, including queueing, cache restore '
+                            'and generation. The legacy median includes reused tokens and may mix '
+                            'cold, warm and unknown-reuse samples.'),
+              **reuse_summary(samples)}
     partial.write_text(json.dumps(result, indent=2) + '\n')
     os.link(partial, args.output)  # never replaces an existing result
     partial.unlink()
