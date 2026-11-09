@@ -1396,9 +1396,12 @@ enum LayerMoe<'a, 'w> {
     Native(&'a MoeLayerWeights<'w>),
     Exl3(&'a Exl3MoeWeights<'w>),
     /// A tiered chunk: the MoE stage routes through the runtime's banks, not
-    /// the loaded weights. Constructed when run.tiered is Some; never matched
-    /// in chunk_moe (the tiered check fires first).
-    Tiered,
+    /// the loaded weights. The router stage reads these buffers (the same
+    /// device buffers the loaded model's MoE would carry).
+    Tiered {
+        router: &'a crate::kernels::cuda::DeviceBuffer,
+        router_shared: &'a crate::kernels::cuda::DeviceBuffer,
+    },
 }
 
 impl<'a, 'w> LayerMoe<'a, 'w> {
@@ -1407,7 +1410,7 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
         match self {
             Self::Native(moe) => (moe.router, moe.router_shared),
             Self::Exl3(moe) => (moe.router, moe.router_shared),
-            Self::Tiered => unreachable!("the tiered chunk's router runs before the MoE dispatch"),
+            Self::Tiered { router, router_shared } => (router, router_shared),
         }
     }
 }
@@ -2931,8 +2934,9 @@ pub(super) fn run_chunk_layer(
     let slot = run.model.table.slot(layer)?;
     // A tiered chunk session routes through run.tiered: the moe slice is empty
     // (the stacks live in the banks), so the layer dispatch skips it entirely.
-    let moe = if run.tiered.is_some() {
-        LayerMoe::Tiered
+    let moe = if let Some(cell) = run.tiered {
+        let (router, router_shared) = cell.borrow().router_of(layer)?;
+        LayerMoe::Tiered { router, router_shared }
     } else {
         match &run.model.weights {
             ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),
