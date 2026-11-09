@@ -978,30 +978,41 @@ fn make_multi(
     // The chunked session's layer sums carry m*hidden values, so the
     // mailbox payload grows past the eager cap when Q36_P2P_CHUNK is set
     // (capped at the transport's MAX_VALUES by max_chunk_rows).
-    let chunk_payload = std::env::var_os("Q36_P2P_CHUNK").and_then(|value| {
-        let rows: usize = value
-            .to_str()
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(256);
-        let rows = rows.min(super::card_prefill::max_chunk_rows(dims.shape.hidden));
-        Some(rows * dims.shape.hidden)
-    });
-    let (stack, states) = match planned.as_ref() {
-        Some(plan) => CardStack::with_table_payload(
+    let chunk_rows = super::card_prefill::configured_chunk_rows(
+        std::env::var_os("Q36_P2P_CHUNK").as_deref(),
+        dims.shape.hidden,
+    )?;
+    let chunk_payload = chunk_rows
+        .map(|rows| {
+            super::card_prefill::chunk_mailbox_values(rows, dims.shape.hidden, dims.shape.moe.top_k)
+        })
+        .transpose()?;
+    let (stack, states) = match (planned.as_ref(), chunk_payload) {
+        (Some(plan), None) => CardStack::with_table(
             &dims,
             &options,
             &settings.cuda_devices,
             &served_admission(),
             &plan.table,
-            chunk_payload.unwrap_or(dims.shape.hidden * dims.shape.moe.top_k.max(1)),
         )?,
-        None => CardStack::with_payload(
+        (None, None) => {
+            CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?
+        }
+        (Some(plan), Some(payload)) => CardStack::with_table_payload(
             &dims,
             &options,
             &settings.cuda_devices,
             &served_admission(),
-            &ShardTable::new(&dims.shape, settings.cuda_devices.len(), 256)?,
-            chunk_payload,
+            &plan.table,
+            payload,
+        )?,
+        (None, Some(payload)) => CardStack::with_payload(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &ShardTable::new(&dims.shape, settings.cuda_devices.len(), 32)?,
+            Some(payload),
         )?,
     };
     stages.begin("loading weights");
@@ -1069,6 +1080,7 @@ fn make_multi(
                 entries: 0,
             }
         },
+        chunk_rows,
     )?;
     // Experimental and default off: chunked prefill through both cards
     // (card_prefill.rs). Q36_P2P_CHUNK=<rows> sets the chunk size, capped

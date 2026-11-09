@@ -475,10 +475,6 @@ fn mixer_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
 
 /// The Resident MoE block: router, shared expert, ids, scatter quantize, gate/up, down.
 /// `routed` is the grouped column count `M * top_k`.
-fn moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
-    moe_rows_with(dims, &dims.shape.moe, m)
-}
-
 fn moe_rows_with(
     dims: &StepDims,
     e: &crate::family::qwen36::host::MoeDims,
@@ -789,7 +785,14 @@ pub(crate) fn chunk_tensors(
     m: usize,
     nsm: usize,
 ) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
-    chunk_tensors_for(dims, &MixerGeometry::new(dims)?, &dims.shape.moe, m, nsm)
+    chunk_tensors_inner(
+        dims,
+        &MixerGeometry::new(dims)?,
+        &dims.shape.moe,
+        m,
+        nsm,
+        false,
+    )
 }
 
 /// The card twin: the same slot plan over the CARD's geometry and the
@@ -802,6 +805,17 @@ pub(crate) fn chunk_tensors_for(
     moe: &crate::family::qwen36::host::MoeDims,
     m: usize,
     nsm: usize,
+) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
+    chunk_tensors_inner(dims, g, moe, m, nsm, true)
+}
+
+fn chunk_tensors_inner(
+    dims: &StepDims,
+    g: &MixerGeometry,
+    moe: &crate::family::qwen36::host::MoeDims,
+    m: usize,
+    nsm: usize,
+    card: bool,
 ) -> Result<Vec<(ChunkSlot, ArenaTensor)>, EngError> {
     check_ncols_domain(m)?;
     if nsm == 0 {
@@ -817,15 +831,17 @@ pub(crate) fn chunk_tensors_for(
     .into_iter()
     .flatten()
     .collect();
-    let hidden = dims.shape.hidden;
-    rows.push((
-        ChunkSlot::Zero,
-        m.checked_mul(hidden)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or_else(overflow)?,
-        Phase::Embed,
-        Phase::Combine,
-    ));
+    if card {
+        let hidden = dims.shape.hidden;
+        rows.push((
+            ChunkSlot::Zero,
+            m.checked_mul(hidden)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(overflow)?,
+            Phase::Embed,
+            Phase::Combine,
+        ));
+    }
     Ok(rows
         .into_iter()
         .map(|(slot, bytes, first, last)| {
@@ -907,10 +923,12 @@ mod card_tests {
             let mut slots_card: Vec<_> = plan.iter().map(|(s, _)| *s).collect();
             slots_card.sort_by_key(|s| format!("{s:?}"));
             let mut slots_full_sorted = slots_full.clone();
+            assert!(!slots_full_sorted.contains(&ChunkSlot::Zero));
+            slots_full_sorted.push(ChunkSlot::Zero);
             slots_full_sorted.sort_by_key(|s| format!("{s:?}"));
             assert_eq!(
                 slots_full_sorted, slots_card,
-                "card {card} keeps every slot the stage list addresses"
+                "card {card} adds only its permanent zero row"
             );
             card_totals.push(total);
         }

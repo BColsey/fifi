@@ -2096,6 +2096,7 @@ fn mmq_dense_segments_over_one_upload_match_separate_weights_bitwise() {
 /// 2 * 3.5B active-parameter FLOPs of Qwen3.6-35B-A3B, so a full-model
 /// chunk costs R * 1.75 GFLOP per card at this kernel's rate).
 #[test]
+#[ignore = "timing probe: run alone in an admitted device window"]
 fn mmq_prefill_ceiling_probe() {
     const NAME: &str = "mmq_prefill_ceiling_probe";
     if !testkit::device_present(NAME) {
@@ -2138,16 +2139,6 @@ fn mmq_prefill_ceiling_probe() {
                 },
             )
             .expect("quantize");
-            let call = MmqDenseCall {
-                weight: &weight,
-                w_seg: None,
-                m,
-                q8_1: y.range(0, need_m.y).expect("y"),
-                dst: dst.range(0, need_m.dst).expect("dst"),
-                ld: n,
-                col_off: 0,
-                fixup: fixup.range(0, fixup_bytes).expect("fixup"),
-            };
             // Warm up, then time an inner loop of launches.
             let make = || MmqDenseCall {
                 weight: &weight,

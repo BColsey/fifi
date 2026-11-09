@@ -791,10 +791,7 @@ fn only(tensors: &[(S, ArenaTensor)]) -> Vec<ArenaTensor> {
 fn the_tensor_list_is_the_plans_table_at_every_ladder_size() {
     for m in M_LADDER {
         let tensors = tensors_of(m);
-        // +1: the permanent Zero row the card MoE combine reads as its
-        // zero residual (every plan carries it; the single-device path
-        // simply never reads it).
-        assert_eq!(tensors.len(), TABLE.len() + XF_SINKS.len() + 1, "m {m}");
+        assert_eq!(tensors.len(), TABLE.len() + XF_SINKS.len(), "m {m}");
         for (slot, per_token, fixed, first, last) in TABLE {
             let found: Vec<&ArenaTensor> = tensors
                 .iter()
@@ -1055,12 +1052,11 @@ fn fp16_kv_is_capped_near_80k_positions_at_the_2048_row_arena_ceiling() {
     // free-after-load is 3,618,963,456 B, which leaves 2,427 MiB after the 1 GiB headroom — a 63
     // MiB gap below the design basis; no numeric change follows from it here.
     //   2,490 MiB: (2,610,954,240 - 777,223,680 - 2 * 67,108,864 - 65,864,448) / 20,480
-    //             = 1,633,648,384 / 20,480 = 78,948 (the Zero row's 16 MiB costs 819 positions against the 79,767 basis).
+    //             = 1,633,648,384 / 20,480 = 79,767 (79,768 * 20,480 is 256 B past it).
     //   2,532 MiB: (2,654,994,432 - 777,223,680 - 2 * 67,108,864 - 65,864,448) / 20,480
     //             = 1,677,688,576 / 20,480 = 81,918 (remainder 7,936).
     let ceiling: usize = tensors_of(2048).iter().map(|(_, t)| t.bytes).sum();
-    // The Zero row adds 2048 * 2048 * 4 B = 160 tenths of a MiB.
-    assert_eq!(ceiling / (MIB / 10), 7412 + 160);
+    assert_eq!(ceiling / (MIB / 10), 7412);
     let cost = ChunkCost {
         m: 2048,
         arena: ceiling,
@@ -1072,9 +1068,8 @@ fn fp16_kv_is_capped_near_80k_positions_at_the_2048_row_arena_ceiling() {
             state_bytes(&d, KvMode::Fp16, window, 1).expect("state")
         })
     };
-    // The Zero row's 16 MiB costs 819 positions against the pre-Zero basis.
-    assert_eq!(end(2490), 79_767 - 819);
-    assert_eq!(end(2532), 81_918 - 819);
+    assert_eq!(end(2490), 79_767);
+    assert_eq!(end(2532), 81_918);
 }
 
 /// The one report this module prints (run with `--nocapture`): v1's `plan_arena` totals beside the
