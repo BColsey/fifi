@@ -123,6 +123,20 @@ pub(super) struct Consts {
 }
 
 impl Consts {
+    /// The three trailing slots of the compiled delta closure: the softplus zero, then either
+    /// the `[kd]` norm weights (unfused) or the `qk_eps` and `sqrt_kd` scalars
+    /// (`Q36_FUSED_DECODE=1` with three taps, when the ONE `delta_middle` kernel replaces the
+    /// op sequence and the empty shape marks the mode for the key and the traced body). Both
+    /// arg builders (`compiled::delta_args`, `compile_gate::delta_seam_args`) must agree with
+    /// `delta::step_projected`, so the rule lives here once.
+    pub(super) fn middle_consts(&self, fused: bool) -> [&ExecutionTensor; 3] {
+        if fused {
+            [&self.zero, &self.qk_eps, &self.sqrt_kd]
+        } else {
+            [&self.zero, &self.q_norm_w, &self.k_norm_w]
+        }
+    }
+
     /// Imports every constant with one `import_many` (one synchronization).
     pub(super) fn import(kernels: &mut MlxKernels, shape: &HostShape) -> Result<Self, EngError> {
         let key_dim = shape.delta.key_dim;

@@ -1229,6 +1229,37 @@ __global__ void __launch_bounds__(256, wide_min_blocks<Cols>) grouped_project_sm
     }
 }
 
+// Book 2 (MUL1) at rate 10 (5.0 bpw) or rate 6 (3.0 bpw), the rates of the Qwen3.8 Flash-Next dense
+// projections, with the bit rate known at compile time: the one-tile body that wide_by_rate runs
+// for rates 8 and 12, so the packed-layout constants (words per tile, the index step between
+// columns, the doubled-table writes) fold away instead of being computed from the entry on every
+// tile. The arithmetic, the order of every sum and the reductions are those of the generic wide
+// body, so the bytes written are identical. It is a kernel of its own, launched only for a launch
+// whose every group is book 2 at one of these rates, so the kernels the other models run are
+// unchanged.
+template <bool Dp4a>
+__global__ void __launch_bounds__(256, wide_min_blocks<1>) grouped_project_small_wide_r56(
+    const __grid_constant__ GroupArgs p) {
+    __shared__ float partial[8][16];
+    __shared__ unsigned wtab[8][128];
+    const GroupEntry &a = p.entries[p.row_to_group[blockIdx.y]];
+    if (a.bits_twice == 10)
+        one_tile_by_alignment<2, 10, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial);
+    else
+        one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial);
+}
+
+#include "exl3_decode_fused.h"
+
+// Whether every group of a launch is book 2 at rate 10 or 6: the launches grouped_project_small_wide_r56 runs.
+static bool wide_odd_rates(const GroupArgs &p) {
+    for (uint32_t g = 0; g < p.groups; ++g) {
+        const GroupEntry &e = p.entries[g];
+        if (e.book != 2 || (e.bits_twice != 10 && e.bits_twice != 6)) return false;
+    }
+    return p.groups > 0;
+}
+
 // Rows kernel: one block owns one 16-column tile for all rows of a group (R is a compile-time
 // bound, rows <= R), so each trellis tile is loaded, put in the table and decoded once and every
 // decoded weight multiplies the R input values of the group. The wide kernel does the same work
@@ -1614,7 +1645,9 @@ int inference_cuda_exl3_rows_kernel(uint32_t max_rows) {
     return max_rows >= 1 && max_rows <= grouped_max_rows ? rows_kernel_for(max_rows) : 0;
 }
 
-template<bool Observe = false, bool Gather = false, int Cols = 0>
+// Odd: 0, or a launch with one tile per block may run grouped_project_small_wide_r56 when its groups
+// allow it (1), with the DP4A decode (2); only the entry the Flash-Next context opts into sets it.
+template<bool Observe = false, bool Gather = false, int Cols = 0, int Odd = 0, bool FinIn = false>
 static inline __attribute__((always_inline)) int grouped_launch(
     const inference_cuda_exl3_linear_args *calls, size_t count,
     void *stream, int *out_stage, uint64_t *launches = nullptr,
@@ -1623,13 +1656,33 @@ static inline __attribute__((always_inline)) int grouped_launch(
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         GroupArgs args;
         if (!stream || !group_args(calls, count, args)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if constexpr (FinIn) {
+            // The fused-input kernel stages the row half in shared memory: one row per
+            // group, the Flash-Next rates only, a half of whole 256-value rounds.
+            if (args.k % 512u) return INFERENCE_CUDA_INVALID_ARGUMENT;
+            for (uint32_t g = 0; g < args.groups; ++g) {
+                const GroupEntry &e = args.entries[g];
+                if (e.rows != 1 || e.book != 2 ||
+                    (e.bits_twice != 10 && e.bits_twice != 6))
+                    return INFERENCE_CUDA_INVALID_ARGUMENT;
+            }
+        }
         Failure failure;
+        // Whether the projection kernel the launch enqueued was grouped_project_small_wide_r56.
+        bool used_odd = false;
         emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
-            if (e.kind == LinearKind::Input)
+            if (e.kind == LinearKind::Input) {
+                if constexpr (FinIn)
+                    return true;  // rotated inside the projection kernel's shared half
                 grouped_input_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
+            }
             else if (e.kind == LinearKind::Small) {
-                if constexpr (Cols > 0) {
+                if constexpr (FinIn) {
+                    const size_t shared = size_t(args.k) / 2 * 4;
+                    grouped_project_small_wide_r56_fin<Odd == 2>
+                        <<<grid,block,shared,(cudaStream_t)stream>>>(args);
+                } else if constexpr (Cols > 0) {
                     const dim3 wide(grid.x / Cols, grid.y, grid.z);
                     if constexpr (Cols == 1) {
                         uint32_t max_rows = 1;
@@ -1638,7 +1691,14 @@ static inline __attribute__((always_inline)) int grouped_launch(
                         const dim3 by_group(grid.x, args.groups, grid.z);
                         static_assert(grouped_max_rows == 8, "rows kernel bounds: 2, 4 and 8");
                         const int which = rows_kernel_for(max_rows);
-                        if (which == 1) {
+                        if constexpr (Odd) {
+                            used_odd = which == 1 && wide_odd_rates(args);
+                            if (used_odd)
+                                grouped_project_small_wide_r56<Odd == 2><<<wide,block,0,(cudaStream_t)stream>>>(args);
+                        }
+                        if (used_odd) {
+                            // enqueued above
+                        } else if (which == 1) {
                             grouped_project_small_wide<1><<<wide,block,0,(cudaStream_t)stream>>>(args);
                         } else if (which == 2) {
                             grouped_project_rows<2><<<by_group,block,0,(cudaStream_t)stream>>>(args);
@@ -1662,8 +1722,9 @@ static inline __attribute__((always_inline)) int grouped_launch(
                     ++*launches;
                     // Record which projection kernel actually enqueued: the
                     // observer must observe the launch, not echo the request.
+                    // 3 and 4 are grouped_project_small_wide_r56 without and with DP4A.
                     if (e.kind == LinearKind::Small && variant)
-                        *variant = Gather ? 2u : 1u;
+                        *variant = used_odd ? (Odd == 2 ? 4u : 3u) : (Gather ? 2u : 1u);
                 }
             }
             return failure.err == cudaSuccess;
@@ -1778,6 +1839,27 @@ extern "C" int inference_cuda_exl3_grouped_wide(const inference_cuda_exl3_linear
     }
 }
 
+// inference_cuda_exl3_grouped_wide with one tile per block that may take the rate 10 and rate 6 body
+// of book 2 (grouped_project_small_wide_r56). Same validation, grids and bytes as the entry with
+// cols 1; a launch whose groups are not all book 2 at those rates runs the same kernel as that entry.
+extern "C" int inference_cuda_exl3_grouped_wide_odd(const inference_cuda_exl3_linear_args *calls,
+    size_t count, void *stream, int *out_stage, unsigned dp4a) {
+    if (!calls || count < 1 || calls[0].n % 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    return dp4a ? grouped_launch<false, true, 1, 2>(calls, count, stream, out_stage)
+                : grouped_launch<false, true, 1, 1>(calls, count, stream, out_stage);
+}
+
+// inference_cuda_exl3_grouped_wide_odd with the input rotation fused into the projection kernel
+// (exl3_decode_fused.h): two launches per group set instead of three, no xh round trip. Requires
+// every group to be one row of book 2 at rate 10 or 6 and k a multiple of 512; every byte written
+// equals the odd entry's.
+extern "C" int inference_cuda_exl3_grouped_wide_fin(const inference_cuda_exl3_linear_args *calls,
+    size_t count, void *stream, int *out_stage, unsigned dp4a) {
+    if (!calls || count < 1 || calls[0].n % 16) return INFERENCE_CUDA_INVALID_ARGUMENT;
+    return dp4a ? grouped_launch<false, true, 1, 2, true>(calls, count, stream, out_stage)
+                : grouped_launch<false, true, 1, 1, true>(calls, count, stream, out_stage);
+}
+
 
 // The routed experts of one token: every call is one row of one bank member chosen on the device
 // (see IndexedArgs). Plan, grids and spans are fixed at queue time; `cols` is the wide tile count
@@ -1849,6 +1931,20 @@ int inference_cuda_exl3_grouped_observed_gathered(const inference_cuda_exl3_line
     *launches = 0;
     *variant = 0;
     return grouped_launch<true, true>(calls, count, stream, out_stage, launches, variant);
+}
+
+// Test builds only: inference_cuda_exl3_grouped_wide_odd that reports the projection kernel it
+// enqueued in `variant` (3 and 4 the rate 10 and 6 body without and with DP4A, 2 any other).
+extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))
+int inference_cuda_exl3_grouped_wide_odd_observed(const inference_cuda_exl3_linear_args *calls,
+    size_t count, void *stream, int *out_stage, unsigned dp4a, uint64_t *launches,
+    unsigned *variant) {
+    if (!launches || !variant || !calls || count < 1 || calls[0].n % 16)
+        return INFERENCE_CUDA_INVALID_ARGUMENT;
+    *launches = 0;
+    *variant = 0;
+    return dp4a ? grouped_launch<true, true, 1, 2>(calls, count, stream, out_stage, launches, variant)
+                : grouped_launch<true, true, 1, 1>(calls, count, stream, out_stage, launches, variant);
 }
 
 extern "C" __attribute__((section(".text.inference_cuda_exl3_observer"), visibility("hidden")))

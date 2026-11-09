@@ -199,7 +199,7 @@ fn build_bank(
         .collect();
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
     let counts: Vec<Vec<u64>> = layers.iter().map(|_| (0..512u64).rev().collect()).collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts).expect("the fill");
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, None).expect("the fill");
     let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).expect("state");
     let plan = HostPinPlan::new(
         &geometry,
@@ -286,7 +286,7 @@ fn prepare(
         })
         .expect("the all-resident block resolves");
         let rig = Rig::new(projector, moe, &row).expect("rig");
-        run_exl3_moe(launch, &block, &rig.bufs().expect("bufs"), moe, true).expect("block");
+        run_exl3_moe(launch, &block, &rig.bufs().expect("bufs"), moe, true, None).expect("block");
         launch.stream.synchronize().expect("sync");
         rig.out_bytes(projector)
     };
@@ -424,4 +424,251 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
 
 fn floats_f64(bytes: &[u8]) -> Vec<f64> {
     floats(bytes).into_iter().map(f64::from).collect()
+}
+
+/// The buffers of one `run_rows` call, zeroed, with `rows` as the normalized inputs. The
+/// grouped launches chunk at the same capacity as one row's, restarting at scratch row 0, so
+/// the EXL3 scratch keeps its one-row sizing.
+struct RigRows {
+    owned: Vec<DeviceBuffer>,
+    hidden: usize,
+}
+
+impl RigRows {
+    fn new(projector: &CudaProjector, moe: &MoeDims, rows: &[Vec<f32>]) -> Result<Self, EngError> {
+        let m = rows.len();
+        let ctx = projector.context();
+        let zeros = |bytes: usize| ctx.upload(&vec![0u8; bytes]);
+        let (h, k) = (moe.hidden * F32, moe.top_k);
+        let one = router_logits_bytes(RouterShape {
+            m: 1,
+            hidden: moe.hidden,
+            n_expert: moe.n_expert,
+            top_k: k,
+        })?;
+        let mut norm = Vec::with_capacity(m * h);
+        for row in rows {
+            norm.extend(row.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        let owned = vec![
+            zeros(m * h)?,
+            zeros(m * h)?,
+            ctx.upload(&norm)?,
+            zeros(m * one)?,
+            zeros(m * k * 4)?,
+            zeros(m * k * F32)?,
+            zeros(m * F32)?,
+            zeros(4)?,
+            zeros(m * k * 2 * moe.inter * F32)?,
+            zeros(m * k * moe.inter * F32)?,
+            zeros(m * k * h)?,
+            zeros(m * 2 * moe.shared_inter * F32)?,
+            zeros(m * moe.shared_inter * F32)?,
+            zeros(m * h)?,
+            zeros(2 * k * moe.hidden * F32)?,
+            zeros(2 * k * moe.inter.max(moe.hidden) * F32)?,
+            zeros(4)?,
+        ];
+        Ok(Self {
+            owned,
+            hidden: moe.hidden * F32,
+        })
+    }
+
+    fn bufs(&self) -> Result<Exl3MoeBufs<'_>, EngError> {
+        let r = |i: usize| self.owned[i].range(0, self.owned[i].bytes());
+        Ok(Exl3MoeBufs {
+            route: RouteBufs {
+                resid_in: r(0)?,
+                resid_out: r(1)?,
+                norm_row: r(2)?,
+                logits: r(3)?,
+                ids: r(4)?,
+                weights: r(5)?,
+                shared_gate: r(6)?,
+                status: r(7)?,
+            },
+            expert_gu: r(8)?,
+            expert_act: r(9)?,
+            expert_down: r(10)?,
+            shared_gu: r(11)?,
+            shared_act: r(12)?,
+            shared_out: r(13)?,
+            scratch: Scratch {
+                xh: r(14)?,
+                z: r(15)?,
+                flag: r(16)?,
+            },
+        })
+    }
+
+    fn out_row(&self, projector: &CudaProjector, r: usize) -> Vec<u8> {
+        let stream = projector.context().stream().expect("stream");
+        let mut bytes = vec![0u8; self.owned[1].bytes()];
+        self.owned[1]
+            .read_at(&stream, 0, &mut bytes)
+            .expect("read the outputs");
+        bytes[r * self.hidden..][..self.hidden].to_vec()
+    }
+}
+
+/// `run_rows` over a partial bank with eviction pressure: a chunk of `m` rows of distinct
+/// inputs, whose distinct picks far exceed the bank's slots, so rows evict each other's
+/// chunk-initial hits and every per-row miss pass runs behind earlier rows' bank copies — the
+/// ordering the chunked block must serialize. Every row matches the all-resident block within
+/// the split bound and fp64 within the output bound, and the same chunk again finds no miss.
+#[test]
+#[ignore = "needs a GPU (about 4 GiB), about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
+    assert!(
+        device_present("Flash-Next split MoE block"),
+        "a GPU is required"
+    );
+    let first = moe_layer();
+    let layers = vec![first, first + 1];
+    let files = FlashPackFiles::open(&pack_dir()).expect("open the pack");
+    let checkpoint = &files.checkpoint;
+    inspect_flash_pack(&checkpoint.source, &checkpoint.model_config)
+        .expect("the pack matches its config");
+    let (model, _) = model_shape(&checkpoint.model_config).expect("the model shape");
+    let shape = model.moe;
+    let one_row = MoeDims {
+        rows: 1,
+        hidden: model.hyper.hidden(),
+        n_expert: shape.experts(),
+        top_k: shape.top_k(),
+        inter: shape.inter(),
+        shared_inter: shape.shared_inter(),
+    };
+    let m = 8;
+    let chunk = MoeDims { rows: m, ..one_row };
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let source = PackRecordSource::new(checkpoint).expect("the record source");
+    let layout = source.layout().clone();
+
+    // Per bank layer: uploads, the chunk's rows, and per-row fp64 and all-resident references.
+    struct Arm {
+        row_inputs: Vec<Vec<f32>>,
+        weights: CudaWeights,
+        keys: Vec<(Role, String)>,
+        wants: Vec<Reference>,
+        residents: Vec<Vec<u8>>,
+    }
+    let mut arms: Vec<Arm> = Vec::with_capacity(layers.len());
+    for (index, &layer) in layers.iter().enumerate() {
+        let router = Router::read(checkpoint, layer, &one_row).expect("router");
+        let weights = upload(&projector, checkpoint, (layer, &router), &one_row).expect("upload");
+        let keys = keys(layer);
+        let row_inputs: Vec<Vec<f32>> = (0..m)
+            .map(|seed| input(one_row.hidden, seed + 7 * (index + 1)))
+            .collect();
+        let block = Exl3MoeWeights::resolve_by(&weights, layer, &one_row, |role| {
+            keys.iter()
+                .find(|(candidate, _)| *candidate == role)
+                .map(|(_, key)| key.as_str())
+                .ok_or_else(|| EngError::BadRequest(format!("no key for {role:?}")))
+        })
+        .expect("the all-resident block resolves");
+        let mut wants = Vec::with_capacity(m);
+        let mut residents = Vec::with_capacity(m);
+        for row in &row_inputs {
+            wants.push(
+                reference(checkpoint, (layer, &router), &one_row, row).expect("fp64 reference"),
+            );
+            let rig = Rig::new(&projector, &one_row, row).expect("rig");
+            run_exl3_moe(
+                &launch,
+                &block,
+                &rig.bufs().expect("bufs"),
+                &one_row,
+                true,
+                None,
+            )
+            .expect("the all-resident block");
+            launch.stream.synchronize().expect("sync");
+            residents.push(rig.out_bytes(&projector));
+        }
+        arms.push(Arm {
+            row_inputs,
+            weights,
+            keys,
+            wants,
+            residents,
+        });
+    }
+
+    // The bank holds six of row 0's picks per layer: row 0 is mixed, every later row misses.
+    let held: Vec<Vec<u16>> = arms
+        .iter()
+        .map(|arm| {
+            let mut held: Vec<u16> = arm.wants[0].ids.iter().take(6).map(|&e| e as u16).collect();
+            held.extend(others(&arm.wants[0].ids, SLOTS - 6));
+            held
+        })
+        .collect();
+    let bank = build_bank(&projector, &source, &layers, &held);
+    let trunks: Vec<SplitMoeTrunk<'_>> = arms
+        .iter()
+        .map(|arm| {
+            let key = |role: Role| {
+                arm.keys
+                    .iter()
+                    .find(|(candidate, _)| *candidate == role)
+                    .map(|(_, key)| key.as_str())
+                    .unwrap_or_else(|| panic!("no key for {role:?}"))
+            };
+            SplitMoeTrunk {
+                router: raw(&arm.weights, key(Role::FfnGateInp)),
+                router_shared: raw(&arm.weights, key(Role::FfnGateInpShexp)),
+                shared_gate: exl3(&arm.weights, key(Role::FfnGateShexp)),
+                shared_up: exl3(&arm.weights, key(Role::FfnUpShexp)),
+                shared_down: exl3(&arm.weights, key(Role::FfnDownShexp)),
+            }
+        })
+        .collect();
+    let mut split = SplitMoe::new(ctx, trunks, bank, &layout, &chunk).expect("split");
+
+    for (bank_layer, arm) in arms.iter().enumerate() {
+        for run in 0..2 {
+            let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
+            let before = split.bank().state().stats().misses;
+            split
+                .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
+                .expect("the chunked block");
+            stream.synchronize().expect("sync");
+            let misses = (split.bank().state().stats().misses - before) as usize;
+            let tag = format!(
+                "bank layer {bank_layer} (pack layer {}), run {run}",
+                layers[bank_layer]
+            );
+            // With about `m * top_k` distinct picks against `SLOTS` slots, BOTH chunks miss:
+            // even the second finds most picks evicted by the last rows of the first.
+            assert!(
+                misses > 0,
+                "{tag}: the chunk misses under eviction pressure"
+            );
+            for r in 0..m {
+                let got = rig.out_row(&projector, r);
+                let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
+                let fp64_error = relative_l2(&floats(&got), &arm.wants[r].out);
+                println!(
+                    "{tag}, row {r}: vs all-resident {resident_error:.3e}, vs fp64 {fp64_error:.3e}"
+                );
+                assert!(
+                    fp64_error < OUTPUT_BOUND,
+                    "{tag}, row {r}: fp64 {fp64_error}"
+                );
+                assert!(
+                    resident_error < SPLIT_BOUND,
+                    "{tag}, row {r}: all-resident {resident_error}"
+                );
+            }
+        }
+    }
 }

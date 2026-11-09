@@ -32,8 +32,11 @@
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
 
+use std::cell::RefCell;
+
 use super::{
     dims::{KvMode, StepOptions},
+    exl3_bank::Exl3SlotResolver,
     exl3_moe::{
         Exl3MoeBufs, Exl3MoeWeights, Scratch,
         merge::{SharedMerge, run_exl3_moe_merged},
@@ -44,8 +47,8 @@ use super::{
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     moe::{
-        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, run_moe_block,
-        tiered::TieredScratch,
+        ExpertBufs, Launch, MoeBuffers, MoeDims, MoeLayerWeights, Packs, RouteBufs, StackWeights,
+        run_moe_block, tiered::TieredScratch,
     },
     prefill_driver::{
         AdmitFacts, FIXED_ADMISSION_MARGIN, FULL_STAGE_TIER_ROWS, Kv8StagingPlan, LedgerFigures,
@@ -66,7 +69,7 @@ use super::{
     },
     rules::{QwenRules, StepWidths, check_token_id, validate_step_inputs},
     run_report::{CaptureOutcome, HostSyncs, PrefillReport, RunReport, StepKind, StepRecord},
-    section_timing::{MarkedGroup, SectionPlan, SectionTimes, section_plan},
+    section_timing::{FineSplit, MarkedGroup, SectionPlan, SectionTimes, section_plan},
     state::{ResidentState, StepField, export::ExportedState},
     state_layout::{StateLayout, Word},
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
@@ -142,6 +145,13 @@ struct SectionMarks {
     embed_start: TimingEvent,
     embed_end: TimingEvent,
     groups: Vec<(TimingEvent, TimingEvent)>,
+    /// The finer split (`FineSplit`): one event per marked group, recorded at the `Moe` start
+    /// (= the mixer half's end), the `LmHead` pair, and the attention-core pair inside the
+    /// mixer half (the `Conv`/`AttnPrep` start to the `Delta`/`AttnDecode` end).
+    mixer_end: Vec<TimingEvent>,
+    core: Vec<(TimingEvent, TimingEvent)>,
+    head_start: TimingEvent,
+    head_end: TimingEvent,
     tail_start: TimingEvent,
     end: TimingEvent,
     /// Whether the last token's marks were all recorded and its read-back completed: the
@@ -155,14 +165,22 @@ impl SectionMarks {
     fn new(context: &CudaContext, kinds: &[AttentionKind]) -> Result<Self, EngError> {
         let plan = section_plan(kinds);
         let mut groups = Vec::with_capacity(plan.groups.len());
+        let mut mixer_end = Vec::with_capacity(plan.groups.len());
+        let mut core = Vec::with_capacity(plan.groups.len());
         for _ in &plan.groups {
             groups.push((context.event_timing()?, context.event_timing()?));
+            mixer_end.push(context.event_timing()?);
+            core.push((context.event_timing()?, context.event_timing()?));
         }
         Ok(Self {
             whole_start: context.event_timing()?,
             embed_start: context.event_timing()?,
             embed_end: context.event_timing()?,
             groups,
+            mixer_end,
+            core,
+            head_start: context.event_timing()?,
+            head_end: context.event_timing()?,
             tail_start: context.event_timing()?,
             end: context.event_timing()?,
             plan,
@@ -184,7 +202,16 @@ impl SectionMarks {
                 };
             }
             StepOp::FinalNorm => &self.tail_start,
-            StepOp::Moe(_) | StepOp::LmHead | StepOp::Argmax | StepOp::Advance => return Ok(()),
+            StepOp::LmHead => &self.head_start,
+            StepOp::Moe(layer) => {
+                // The MoE half starts where the mixer half ends: one extra event per marked
+                // group splits the pair (see `FineSplit`).
+                if let Some(at) = self.group_index(layer) {
+                    stream.record_timing(&self.mixer_end[at])?;
+                }
+                return Ok(());
+            }
+            StepOp::Argmax | StepOp::Advance => return Ok(()),
         };
         stream.record_timing(event)
     }
@@ -199,11 +226,8 @@ impl SectionMarks {
                 };
             }
             StepOp::Advance => &self.end,
-            StepOp::Begin
-            | StepOp::Mixer(_)
-            | StepOp::FinalNorm
-            | StepOp::LmHead
-            | StepOp::Argmax => return Ok(()),
+            StepOp::LmHead => return stream.record_timing(&self.head_end),
+            StepOp::Begin | StepOp::Mixer(_) | StepOp::FinalNorm | StepOp::Argmax => return Ok(()),
         };
         stream.record_timing(event)
     }
@@ -372,6 +396,13 @@ pub(crate) struct QwenResidentStep<'a> {
     /// The MoE weights of each layer of an EXL3 load, whose experts the grouped EXL3 launches
     /// read; `moe` is empty then.
     exl3_moe: Vec<Exl3MoeWeights<'a>>,
+    /// The banked EXL3 decode state: every layer's slot tables with the host store, behind a
+    /// `RefCell` because the decode runs through a shared step view. `None` is the resident
+    /// step; when set, the eager MoE blocks map their read picks through the tables and
+    /// refill missed slots before the launches (the engine thread is the only borrower).
+    exl3_bank: Option<&'a std::cell::RefCell<Exl3SlotResolver<'a>>>,
+    /// Tokens decoded since the last banked hits/misses log line (a banked step only).
+    banked_echo: u32,
     /// The working buffer of the MoE block that queues the shared expert inside the routed launches
     /// (the default of an EXL3 load; `FIFI_EXL3_SHARED_IN_ROUTED=0` or a load that cannot run it
     /// leaves `None`, which keeps the reference block).
@@ -635,6 +666,23 @@ struct RouteStage {
     bytes: Vec<u8>,
 }
 
+/// The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a mixed
+/// override (tiled stacks in some layers, native in others) refuses. Pure so the CPU tests pin
+/// the refusal without loaded weights.
+pub(super) fn moe_override_uniform(tiled: &[bool]) -> Result<bool, EngError> {
+    let Some(&first) = tiled.first() else {
+        return Ok(false);
+    };
+    if tiled.iter().any(|&t| t != first) {
+        return Err(EngError::Checkpoint(
+            "step weights: the INFERENCE_CUDA_TILED_HEAD override must cover the expert \
+             stacks of every layer, not some"
+                .to_owned(),
+        ));
+    }
+    Ok(first)
+}
+
 fn new_route_stage(
     context: &CudaContext,
     layers: usize,
@@ -720,6 +768,20 @@ impl<'a> QwenResidentStep<'a> {
         options: &StepOptions,
         rules: QwenRules,
     ) -> Result<Self, EngError> {
+        Self::build(context, res, weights, options, rules, None)
+    }
+
+    /// The build shared by both constructors; `banked` names the slot count and the resolver
+    /// of a banked EXL3 load (`None` is the resident step, whose banks must hold every
+    /// expert).
+    fn build(
+        context: &'a CudaContext,
+        res: &'a StepResources,
+        weights: &'a CudaWeights,
+        options: &StepOptions,
+        rules: QwenRules,
+        banked: Option<(usize, &'a RefCell<Exl3SlotResolver<'a>>)>,
+    ) -> Result<Self, EngError> {
         let widths = validate_step_inputs(options, res.dims.shape.vocab, &rules)?;
         // The mode follows the loaded weights: the options carry the same layout, derived from
         // `CudaWeights::layout()` by every production caller, and a mismatch is a typed error
@@ -744,6 +806,16 @@ impl<'a> QwenResidentStep<'a> {
         };
         let (event, word) = (context.event()?, context.pinned_word()?);
         let layers: Vec<usize> = (0..res.table.len()).collect();
+        // The tiled-experts hybrid: layer 0's gate stack loaded as tiles beside the native
+        // session flips the MoE epilogue to the fp16 pack form. Uniformity across layers is
+        // enforced when the MoE weights resolve below; layer 0 is enough to pick the op list.
+        let moe_tiled = options.layout == WeightLayout::Native
+            && res
+                .table
+                .name(0, Role::FfnGateExps)
+                .ok()
+                .and_then(|name| weights.get(&name))
+                .is_some_and(|weight| matches!(weight, CudaWeight::Tiled { .. }));
         let parts = MixerParts {
             geometry: res.geometry,
             table: &res.table,
@@ -760,9 +832,11 @@ impl<'a> QwenResidentStep<'a> {
                 &res.geometry,
                 options.layout,
                 options.kv_mode,
+                moe_tiled,
             )?,
             layout: options.layout,
             kv_mode: options.kv_mode,
+            moe_tiled,
             paged: res.paged.as_ref(),
             sparse: res.sparse.as_ref(),
         };
@@ -772,7 +846,12 @@ impl<'a> QwenResidentStep<'a> {
             let dims = moe_dims(&res.dims);
             layers
                 .iter()
-                .map(|&layer| Exl3MoeWeights::resolve(weights, &res.table, layer, &dims))
+                .map(|&layer| match banked.as_ref().map(|(slots, _)| *slots) {
+                    Some(slots) => {
+                        Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
+                    }
+                    None => Exl3MoeWeights::resolve(weights, &res.table, layer, &dims),
+                })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
@@ -802,6 +881,14 @@ impl<'a> QwenResidentStep<'a> {
                 .iter()
                 .map(|&layer| moe_layer_weights(&res.table, weights, &specs, layer, options.layout))
                 .collect::<Result<Vec<_>, _>>()?;
+            // The tiled-experts hybrid must be uniform: one packs kind serves every layer, so a
+            // mixed override (tiled stacks in some layers, native in others) refuses here
+            // instead of failing per layer inside the block's own check.
+            let tiled = moe_override_uniform(
+                &moe.iter()
+                    .map(|w| matches!(w.gate, StackWeights::Tiled(_)))
+                    .collect::<Vec<_>>(),
+            )?;
             (moe, None)
         };
         let vocab = res.dims.shape.vocab;
@@ -849,6 +936,8 @@ impl<'a> QwenResidentStep<'a> {
             mixers: Mixers::new(context, parts)?,
             moe,
             exl3_moe,
+            exl3_bank: banked.map(|(_, bank)| bank),
+            banked_echo: 0,
             exl3_merge,
             merge_intent,
             merge_source,
@@ -922,6 +1011,21 @@ impl<'a> QwenResidentStep<'a> {
         Ok(step)
     }
 
+    /// [`Self::new`] for a banked EXL3 load: the routed banks hold `slots` members (resolved
+    /// against that count) and the decode maps every layer's picks through `bank`'s slot
+    /// tables, refilling missed slots from its host store.
+    pub(crate) fn new_banked(
+        context: &'a CudaContext,
+        res: &'a StepResources,
+        weights: &'a CudaWeights,
+        options: &StepOptions,
+        rules: QwenRules,
+        slots: usize,
+        bank: &'a RefCell<Exl3SlotResolver<'a>>,
+    ) -> Result<Self, EngError> {
+        Self::build(context, res, weights, options, rules, Some((slots, bank)))
+    }
+
     /// The load-line suffix of the merged MoE block: the resolved mode and its source on an EXL3
     /// load (` exl3_shared_in_routed=on source=default`), nothing on any other layout.
     pub(crate) fn shared_in_routed_suffix(&self) -> String {
@@ -987,10 +1091,14 @@ impl<'a> QwenResidentStep<'a> {
         if config.capture && self.res.sparse.is_some() {
             eprintln!("q36 cuda: capture off — the sparse attention chain is admitted");
         }
-        self.capture_on = config.capture && self.res.sparse.is_none();
+        // A banked engine never captures: the slot resolver works on the host between the
+        // readback and the launches, which a graph cannot do (the settings force capture off;
+        // this guard holds for any caller).
+        self.capture_on = config.capture && self.res.sparse.is_none() && self.exl3_bank.is_none();
         // A captured body cannot wait for the host inside a layer: the EXL3 MoE blocks read the
         // picks from device memory then.
-        self.exl3_device_ids = config.capture && self.layout == WeightLayout::Exl3;
+        self.exl3_device_ids =
+            config.capture && self.layout == WeightLayout::Exl3 && self.exl3_bank.is_none();
         // Created here, before the first token: the events must exist before the capture that
         // records them, and their addresses stay stable for the session's life.
         self.marks = if config.section_marks {
@@ -1414,6 +1522,8 @@ impl<'a> QwenResidentStep<'a> {
             ..
         } = self;
         // 1. Host checks. Nothing touches the device before all of them pass.
+        // A banked chunk runs its MoE stage in sub-blocks (see prefill_exl3::moe_block), so
+        // any admitted chunk row count serves.
         check_chunk_start(p0, state.tokens())?;
         let arena = prefill
             .as_ref()
@@ -1457,7 +1567,7 @@ impl<'a> QwenResidentStep<'a> {
                 .buffer()
                 .write_at(stream, ids_range.offset(), &bytes)?;
             let run = ChunkRun::new(&*state, &model, &bufs, chunk_rows)?;
-            let run = run.with_sparse(
+            let run = run.with_bank(self.exl3_bank).with_sparse(
                 res.sparse
                     .as_ref()
                     .map(|sp| ChunkSparse::new(sp, &res.dims.shape.kinds)),
@@ -1598,6 +1708,12 @@ impl<'a> QwenResidentStep<'a> {
         Ok(())
     }
 
+    /// Whether this load overrode the head to tiles (the decode-only hybrid): the final norm
+    /// then emits the tiled pack and the vendored head matmul reads it.
+    fn head_is_tiled(&self) -> bool {
+        matches!(self.globals.head, HeadWeight::Tiled(_))
+    }
+
     fn view(&self, slot: Slot) -> Result<DeviceRange<'a>, EngError> {
         let res: &'a StepResources = self.res;
         let index = res
@@ -1659,6 +1775,14 @@ impl<'a> QwenResidentStep<'a> {
             .exl3_flag_fold(&self.stream, params, self.view(Slot::Exl3Flag)?)
     }
 
+    /// Whether this load overrode the expert stacks to tiles (the tiled-experts hybrid): the
+    /// MoE blocks then run the Tiled per-slot form over the plan's fp16 packs.
+    fn moe_is_tiled(&self) -> bool {
+        self.moe
+            .first()
+            .is_some_and(|w| matches!(w.gate, StackWeights::Tiled(_)))
+    }
+
     /// The buffers of the MoE block of the layers whose residual input is buffer `parity` (0 is
     /// `ResidA`, 1 is `ResidB`).
     fn moe_buffers(&self, parity: usize) -> Result<MoeBuffers<'_>, EngError> {
@@ -1666,9 +1790,10 @@ impl<'a> QwenResidentStep<'a> {
         Ok(MoeBuffers {
             route: self.route_bufs(parity)?,
             expert: ExpertBufs {
-                // The packs follow the plan: the fp16 packs of the Tiled plan or the padded
-                // q8_1 packs of the Native plan.
-                packs: if self.res.plan.index(Slot::Q8Moe).is_some() {
+                // The packs follow the plan: the fp16 packs of the Tiled plan, the padded q8_1
+                // packs of the Native plan - or, in the tiled-experts hybrid, the plan's dead
+                // fp16 slots beside the native ones, because the overridden stacks read them.
+                packs: if self.res.plan.index(Slot::Q8Moe).is_some() && !self.moe_is_tiled() {
                     Packs::Q8 {
                         moe: view(Slot::Q8Moe)?,
                         down: view(Slot::Q8Down)?,
@@ -1703,6 +1828,18 @@ impl<'a> QwenResidentStep<'a> {
         want_logits: bool,
         want_shortlist: bool,
     ) -> Result<u32, EngError> {
+        if let Some(bank) = self.exl3_bank {
+            // The banked session's pulse: one line every 256 tokens, the cumulative hit/miss
+            // counts that explain its speed (a miss is a host-store refill).
+            self.banked_echo += 1;
+            if self.banked_echo.is_multiple_of(256) {
+                let (hits, misses) = bank.borrow().stats();
+                eprintln!(
+                    "q36 cuda: EXL3 expert bank after {} tokens: hits {hits}, misses {misses}",
+                    self.banked_echo
+                );
+            }
+        }
         let ran = self.run_token_inner(token, want_logits, want_shortlist);
         if ran.is_err() {
             self.abort_tiered_token();
@@ -1938,7 +2075,38 @@ impl<'a> QwenResidentStep<'a> {
             .iter()
             .map(|(start, end)| start.elapsed_ms_since(end))
             .collect::<Result<Vec<_>, _>>()?;
-        marks.plan.reconcile(embed, tail, &groups, whole).map(Some)
+        let mixer_ms = marks
+            .groups
+            .iter()
+            .zip(&marks.mixer_end)
+            .map(|((start, _), mixer_end)| start.elapsed_ms_since(mixer_end))
+            .collect::<Result<Vec<_>, _>>()?;
+        let core_ms = if crate::family::qwen36::section_core_marks() {
+            marks
+                .core
+                .iter()
+                .map(|(start, end)| start.elapsed_ms_since(end))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            // The core pair was never recorded: zeros keep the readings shaped (the split is
+            // an opt-in attribution run; a never-recorded event must never be queried).
+            vec![0.0; marks.core.len()]
+        };
+        let head_ms = marks.head_start.elapsed_ms_since(&marks.head_end)?;
+        marks
+            .plan
+            .reconcile(
+                embed,
+                tail,
+                &groups,
+                FineSplit {
+                    mixer_ms,
+                    core_ms,
+                    head_ms,
+                },
+                whole,
+            )
+            .map(Some)
     }
 
     /// The start block of the step: the token, at the position of the committed rows. A token
@@ -2209,7 +2377,22 @@ impl<'a> QwenResidentStep<'a> {
                     resid: self.view(resid_in(layer))?,
                     admit_pos,
                 };
-                self.mixers.run_block(s, &self.state, layer, io)
+                // The attention-core pair of the finer split: `None` on unmarked layers (the
+                // pair is one extra event node per marked group per replay). Opt-in via
+                // `Q36_SECTION_CORE_MARKS=1`: an event node BETWEEN the block's dependent
+                // kernels costs real replay time on small GPUs (measured +30ms on the Xavier
+                // over 20 groups), unlike the boundary events, so the default rig stays clean
+                // and the core/proj split is an explicit attribution run.
+                let core_marks = if crate::family::qwen36::section_core_marks() {
+                    self.marks.as_ref().and_then(|marks| {
+                        marks
+                            .group_index(layer)
+                            .map(|at| (&marks.core[at].0, &marks.core[at].1))
+                    })
+                } else {
+                    None
+                };
+                self.mixers.run_block(s, &self.state, layer, io, core_marks)
             }
             StepOp::Moe(layer) if self.layout == WeightLayout::Exl3 => {
                 let weights = self.exl3_moe.get(layer).ok_or_else(|| {
@@ -2220,12 +2403,15 @@ impl<'a> QwenResidentStep<'a> {
                 if let Some(step) = trace_step {
                     self.trace_row(&launch, &bufs.route.resid_in, step, layer)?;
                 }
+                let mut bank_guard = self.exl3_bank.map(|bank| bank.borrow_mut());
+                let mut bank = bank_guard.as_mut().map(|guard| guard.layer(layer));
                 let block = if let Some(merge) = &self.exl3_merge {
                     run_exl3_moe_merged(
                         &launch,
                         (weights, &bufs, merge),
                         &self.moe_dims,
                         self.exl3_device_ids,
+                        bank.as_mut(),
                     )
                 } else {
                     run_exl3_moe(
@@ -2234,6 +2420,7 @@ impl<'a> QwenResidentStep<'a> {
                         &bufs,
                         &self.moe_dims,
                         self.exl3_device_ids,
+                        bank.as_mut(),
                     )
                 };
                 #[cfg(test)]
@@ -2353,6 +2540,23 @@ impl<'a> QwenResidentStep<'a> {
             // lifetime covers FINAL_NORM and live slots never share bytes) - it silently repurposed
             // the router-input value slot as scratch, a latent bug the moment NormRow's lifetime
             // tightens to its true need.
+            //
+            // The decode-only tiled-head hybrid: when the load overrode the head to tiles, the
+            // final norm emits the tiled pack beside the f32 row (the vendored head matmul reads
+            // the pack, not the row), exactly the Exl3 producer shape.
+            WeightLayout::Native if self.head_is_tiled() => self.context.add_norm_pack(
+                &self.stream,
+                AddNormCall {
+                    m: STEP_ROWS,
+                    n: self.res.geometry.hidden,
+                    eps: self.res.geometry.eps,
+                    h,
+                    delta: None,
+                    weight,
+                    xf: self.view(Slot::XfFinal)?,
+                    norm_out: Some(self.view(Slot::FinalNormRow)?),
+                },
+            ),
             WeightLayout::Native => self.context.add_rmsnorm_q8(
                 &self.stream,
                 AddNormQ8Call {
@@ -2369,8 +2573,9 @@ impl<'a> QwenResidentStep<'a> {
     }
 
     fn lm_head(&self) -> Result<(), EngError> {
-        // The pack slot is resolved INSIDE each arm: the Native plan holds no XfFinal slot, so a
-        // lookup before the match refused every native run.
+        // The pack slot is resolved INSIDE each arm: the plain native plan's xf slot is dead
+        // bytes (the matvec head never reads it), and a lookup before the match is only needed
+        // by the arms that use it.
         let y = self.view(Slot::Logits)?;
         if let HeadWeight::Exl3(head) = self.globals.head {
             let io = Exl3Io {
@@ -2478,7 +2683,9 @@ impl<'a> QwenResidentStep<'a> {
             return Ok(None);
         }
         if sampler.params().is_greedy() {
-            return self.run_token(token, false).map(Some);
+            let selected = self.run_token(token, false)?;
+            sampler.record_device_greedy(selected);
+            return Ok(Some(selected));
         }
         self.run_token_output(token, false, true)?;
         let candidates = self.shortlist_values()?;

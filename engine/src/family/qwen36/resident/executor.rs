@@ -75,13 +75,17 @@ use crate::{
         qwen36::{
             host::HostShape,
             host_load::HostWeights,
-            settings::{Activation, KvDtype, chunked_prefill_allowed, shape_of},
+            settings::{Activation, KvDtype, chunked_prefill_allowed, shape_of, speculator_of},
         },
+        sampler::Sampler,
         session::{
             DecodePreparation, DecodeSession, Limits, PrefixSlot, SaveKind, ShadowLcp, StoreLimits,
             TokenStepper, check_prompt, sample_logits, shadow_block_lcp_enabled,
         },
         spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B},
+        speculate::config::SpecConfig,
+        speculate::driver::{RepeatDrafter, Speculator, WindowModel},
+        speculate::window::Commit,
     },
     kernels::MlxKernels,
     sched::job::{PrefixHit, PrefixReport},
@@ -172,6 +176,10 @@ pub(crate) struct Q36Executor {
     /// The shadow block-LCP observation of the last `restore_prefix` call,
     /// for `prefix_report`; a reset clears it too.
     prefix_shadow: Option<ShadowLcp>,
+    /// The engine's drafter, set by `set_speculation` from the settings. `None` (the default)
+    /// keeps every decode a one-row step. A verify window runs the chunk path with
+    /// `StepMode::Window` and rolls back with a shared-handle snapshot.
+    speculator: Option<Speculator<RepeatDrafter>>,
     /// Tests only: the row count of each chunk that ran through `ResidentDecoder::prefill`, in
     /// order. It is shared so that an engine thread test can read it.
     #[cfg(test)]
@@ -246,6 +254,104 @@ impl TokenStepper for Q36Step<'_> {
 
     fn reset(&mut self) -> Result<()> {
         self.decoder.reset(self.state)
+    }
+}
+
+/// The verify-window model of one speculative decode call: the solo step plus the pending window.
+/// `run_window` feeds every row as ONE chunk (`StepMode::Window`), so a window of `k + 1` rows
+/// costs one chunk pass, not `k + 1` steps. The rollback is the shared-handle snapshot of
+/// `ResidentState` (no array copy, no host round trip): a partial accept restores it and replays
+/// the kept rows in `Prompt` mode, and the KV cells above the rewound position stay written but
+/// unreachable. A failure after rows ran leaves the state advanced past the session's pending
+/// token, so the error must fail the job: the worker's reset is the only sound recovery.
+struct Q36WindowStep<'a> {
+    step: Q36Step<'a>,
+    context_limit: usize,
+    snapshot: Option<ResidentSnapshot>,
+    inputs: Vec<u32>,
+    logits: Vec<Vec<f32>>,
+}
+
+impl TokenStepper for Q36WindowStep<'_> {
+    const OPERATION: &'static str = "qwen36";
+
+    fn feed(&mut self, token: u32) -> Result<()> {
+        self.step.feed(token)
+    }
+
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<()> {
+        self.step.feed_rows(tokens)
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
+        self.step.logits(token)
+    }
+
+    fn fed(&self) -> usize {
+        self.step.fed()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.step.reset()
+    }
+}
+
+impl WindowModel for Q36WindowStep<'_> {
+    fn run_window(&mut self, inputs: &[u32]) -> Result<()> {
+        self.snapshot = None;
+        self.inputs.clear();
+        self.logits.clear();
+        let Q36Step { decoder, state, .. } = &mut self.step;
+        let limit = u32::try_from(self.context_limit)
+            .map_err(|_| EngError::BadRequest("context limit overflows u32".into()))?;
+        let rows = u32::try_from(inputs.len())
+            .map_err(|_| EngError::BadRequest("the verify window exceeds u32 rows".into()))?;
+        state.check_step(&decoder.weights, limit)?;
+        if state.pos().saturating_add(rows) > limit {
+            return Err(EngError::BadRequest(
+                "the verify window does not fit the context limit".into(),
+            ));
+        }
+        let snapshot = decoder.snapshot(state)?;
+        match decoder.prefill(state, inputs, StepMode::Window) {
+            Ok(result) => {
+                self.logits = result
+                    .window_logits
+                    .ok_or_else(|| window_output_error("the window step returned no logits"))?;
+                self.inputs = inputs.to_vec();
+                self.snapshot = Some(snapshot);
+                Ok(())
+            }
+            // The chunk's own contract leaves the state poisoned after its first native call;
+            // the snapshot drops with its charge.
+            Err(error) => Err(error),
+        }
+    }
+
+    fn draw(&mut self, row: usize, sampler: &mut Sampler, sampler_vocab: usize) -> Result<u32> {
+        let logits = self
+            .logits
+            .get(row)
+            .ok_or_else(|| window_output_error("the window drew past its rows"))?;
+        sample_logits(Self::OPERATION, logits, sampler, sampler_vocab)
+    }
+
+    fn commit_window(&mut self, commit: &Commit) -> Result<()> {
+        let snapshot = self
+            .snapshot
+            .take()
+            .ok_or_else(|| window_output_error("commit without a window"))?;
+        self.logits.clear();
+        let inputs = std::mem::take(&mut self.inputs);
+        if commit.discarded_rows == 0 {
+            return Ok(());
+        }
+        let kept = commit.kept_rows;
+        let Q36Step { decoder, state, .. } = &mut self.step;
+        decoder.restore(state, &snapshot)?;
+        decoder
+            .prefill(state, &inputs[..kept], StepMode::Prompt)
+            .map(|_| ())
     }
 }
 
@@ -478,6 +584,7 @@ impl Q36Executor {
             prefix_hit: PrefixHit::Miss,
             prefix_uncached: 0,
             prefix_shadow: None,
+            speculator: None,
             #[cfg(test)]
             log: std::sync::Arc::default(),
         };
@@ -595,6 +702,13 @@ impl Q36Executor {
             self.decoder.set_chunk_rows(rows)?;
         }
         self.chunk = chunk;
+        Ok(())
+    }
+
+    /// Turns the speculation settings into the engine's drafter (`settings::speculator_of`).
+    /// `None` (a disabled `draft_mode`) keeps the one-row decode of every job.
+    pub(crate) fn set_speculation(&mut self, config: &SpecConfig) -> Result<()> {
+        self.speculator = speculator_of(config)?;
         Ok(())
     }
 
@@ -833,8 +947,24 @@ impl ExecutorOps for Q36Executor {
         generation: &mut GenerationState,
     ) -> Result<DecodeBatch> {
         let Q36Session { state, core, .. } = st;
-        let (mut step, limits) = self.split(state);
-        core.decode(&mut step, generation, &limits)
+        // The take/put-back moves the drafter out of `&mut self` for the window call: a
+        // panic inside `speculator.decode` unwinds before the put-back and the speculator is
+        // dropped with the executor, so the feature turns off only with the engine.
+        let Some(mut speculator) = self.speculator.take() else {
+            let (mut step, limits) = self.split(state);
+            return core.decode(&mut step, generation, &limits);
+        };
+        let (step, limits) = self.split(state);
+        let mut window = Q36WindowStep {
+            step,
+            context_limit: limits.context_limit,
+            snapshot: None,
+            inputs: Vec::new(),
+            logits: Vec::new(),
+        };
+        let batch = speculator.decode(core, &mut window, generation, &limits);
+        self.speculator = Some(speculator);
+        batch
     }
 
     /// No transient routing or draft state exists: expert routing is computed inside each step.
@@ -922,6 +1052,7 @@ mod tests {
     use crate::family::qwen36::settings::activation_name;
     use crate::family::qwen36::tiny::{self, TINY_GQA, TINY_KV8};
     use crate::family::session::SaveSideTotals;
+    use crate::family::speculate::driver::{Drafter, Proposal, Speculator};
     use crate::{
         family::sampler::{Sampler, SamplingParams},
         tokenizer::{DecodeFinish, IncrementalDecoder, Tokenizer},
@@ -1425,6 +1556,101 @@ mod tests {
         // Three prompt tokens and four sampled tokens are fed. The fifth sampled token is pending.
         assert_eq!(session.state.pos(), 7, "fed positions");
         assert_eq!(session.core.pending(), Some(want[4]), "pending token");
+    }
+
+    /// One speculative decode call through the window model, outside the executor's own
+    /// speculator so that a scripted drafter can drive it.
+    fn spec_decode<D: Drafter>(
+        speculator: &mut Speculator<D>,
+        executor: &mut Q36Executor,
+        session: &mut Q36Session,
+        generation: &mut GenerationState,
+    ) -> DecodeBatch {
+        let Q36Session { state, core, .. } = session;
+        let (step, limits) = executor.split(state);
+        let mut window = Q36WindowStep {
+            step,
+            context_limit: limits.context_limit,
+            snapshot: None,
+            inputs: Vec::new(),
+            logits: Vec::new(),
+        };
+        speculator
+            .decode(core, &mut window, generation, &limits)
+            .unwrap()
+    }
+
+    /// Proposes the oracle chain (`wrong`: every draft off by one, so no draft is ever accepted
+    /// and every window rolls back).
+    struct Scripted {
+        want: Vec<u32>,
+        wrong: bool,
+    }
+
+    impl Drafter for Scripted {
+        fn propose(
+            &mut self,
+            history: &[u32],
+            room: usize,
+        ) -> std::result::Result<Proposal, crate::EngError> {
+            let start = history.len().min(self.want.len());
+            let take = room.min(self.want.len() - start);
+            let tokens = self.want[start..start + take]
+                .iter()
+                .map(|&token| {
+                    if self.wrong {
+                        (token + 1) % VOCAB as u32
+                    } else {
+                        token
+                    }
+                })
+                .collect();
+            Ok(Proposal {
+                tokens,
+                scores: Vec::new(),
+            })
+        }
+
+        fn observe(
+            &mut self,
+            _window: &crate::family::speculate::window::Window,
+            _accepted: &crate::family::speculate::accept::Accepted,
+        ) -> std::result::Result<(), crate::EngError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn speculative_windows_publish_the_tokens_of_the_one_row_run() {
+        let _serial = crate::native_test_lock();
+        let want = oracle(&PROMPT, 5, &mut seeded_sampler(), VOCAB);
+        for (wrong, name) in [(true, "no draft accepted"), (false, "every draft accepted")] {
+            let mut big = rules(vec![], VOCAB);
+            // The window's snapshot charges the fixed DeltaNet bytes beside the row growth.
+            big.session_cap = 64 * 1024;
+            let (mut executor, mut session) = build(big);
+            let mut job = seeded_generation(5);
+            executor.prefill(&mut session, &PROMPT).unwrap();
+            let mut speculator = Speculator::new(
+                Scripted {
+                    want: want.clone(),
+                    wrong,
+                },
+                2,
+            );
+            let mut batches = Vec::new();
+            for _ in 0..100 {
+                let batch = spec_decode(&mut speculator, &mut executor, &mut session, &mut job);
+                let done = batch.finish.is_some();
+                batches.push(batch);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(tokens_of(&batches), want, "{name}: tokens");
+            assert_eq!(session.state.pos(), 7, "{name}: fed positions");
+            assert_eq!(session.core.pending(), Some(want[4]), "{name}: pending");
+        }
     }
 
     /// The session A, B, A pattern on one executor. Each job starts with a reset, as the engine

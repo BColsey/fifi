@@ -29,7 +29,7 @@ use crate::{
         qwen36::{
             cuda::{
                 dims::{KvMode, StepDims, StepOptions},
-                pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+                pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
                 readback::{SYNC_EACH_VAR, parse_sync_each},
                 resources::StepResources,
                 rules::QwenRules,
@@ -293,6 +293,11 @@ struct Timed {
     tiered: Option<TokenReport>,
 }
 
+// The large variant stays unboxed on purpose: the timed region that builds it may not
+// allocate (the_timed_region_text_spells_no_allocation), and a Region lives for one
+// measurement, never in a loop. Its size grew with the tiered token report's prefetch
+// counters, which is size on a struct built once per measurement.
+#[allow(clippy::large_enum_variant)]
 enum Region {
     Complete(Timed),
     Expired { steps_done: usize },
@@ -499,7 +504,9 @@ pub(super) fn device_gate(s: &GateSettings) -> Result<GateReport, EngError> {
     };
     let after = projector.memory_info()?;
     let identities = identities_of(s, after.total, before.free, after.free);
-    if after.free < MIN_FREE_AFTER_LOAD {
+    // A malformed Q36_CUDA_MIN_FREE_MIB surfaces here as an engine error, not a refused
+    // gate: it is a config mistake, not a capability verdict.
+    if after.free < min_free_after_load()? {
         let mut doc = gate_doc(mode, identities, Vec::new());
         doc["refused"] = json!({ "kind": "memory", "free_after_load": after.free });
         return report(doc);

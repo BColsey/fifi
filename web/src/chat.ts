@@ -385,7 +385,10 @@ export class ChatView {
     const body = this.buildBody(chat);
     // Arming is pre-generation: the segment map is recorded only for
     // replies the server was asked to trace.
-    if (body["x-sample-trace"] === true) assistant.traceSegs = [];
+    if (body["x-sample-trace"] === true) {
+      assistant.traceSegs = [];
+      assistant.traceModel = body.model;
+    }
     this.controller = controller;
     this.streamDom = this.createStreamDom();
     this.streamChat = chat;
@@ -401,6 +404,12 @@ export class ChatView {
       if (dom !== null) {
         dom.waiting.remove();
         dom.text.parentElement?.classList.remove("caret");
+        if (state === "error" && errorMessage !== undefined) {
+          const error = document.createElement("div");
+          error.className = "msg-error";
+          error.textContent = errorMessage;
+          dom.root.insertBefore(error, dom.meta);
+        }
         if (assistant.replyId !== undefined && assistant.traceSegs !== undefined) {
           dom.root.insertBefore(this.buildTraceButton(assistant), dom.meta);
         }

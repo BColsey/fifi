@@ -140,12 +140,16 @@ pub(super) fn chunk(
     // Selected experts: gate and up on the input row of each pair, SwiGLU, then down per pair.
     let picked = ctx.kernels.take(x, &tokens, 0)?;
     let x_pairs = ctx.kernels.reshape(&picked, &[pairs, 1, hidden])?;
-    let hg = ctx
+    // One gathered product of the stacked gate/up operand, split into the gate half [0, I)
+    // and the up half [I, 2I) of every pair row.
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
@@ -285,12 +289,14 @@ pub(super) fn chunk_device(
     // d. Selected experts in the sorted order, SwiGLU, down per pair, then the un-sort back to
     // token-major order and the sum over the choices of each token. The gate product is the same
     // elementwise product as in the host path; only its place moves (token-major, not sorted).
-    let hg = ctx
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &sorted_bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
@@ -423,12 +429,14 @@ pub(super) fn chunk_device_phased(
     let x_rep = ctx.kernels.repeat(x, top_k, 0)?;
     let x_sorted = ctx.kernels.take(&x_rep, &order_p, 0)?;
     let x_pairs = ctx.kernels.reshape(&x_sorted, &[pairs, 1, hidden])?;
-    let hg = ctx
+    let stacked = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.gate, &sorted_bounded)?;
+        .gather_qmm_sorted_bounded(&x_pairs, &w.gate_up, &sorted_bounded)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
     let hu = ctx
         .kernels
-        .gather_qmm_sorted_bounded(&x_pairs, &w.up, &sorted_bounded)?;
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let act = ctx.kernels.silu(&hg)?;
     let h = ctx.kernels.binary(BinaryOp::Mul, &act, &hu)?;
     let eo = ctx
@@ -603,9 +611,22 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (got, routes) = chunk(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
-        let (want, (selection, _)) =
-            decode_step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+        // The decode seam folds the input norm and the output residual; the chunk keeps the
+        // raw contract, so bridge both for the one-row comparison.
+        let one_normed = ctx
+            .kernels
+            .rms_norm(&one, &w.layers[0].post_norm, shape.eps)
+            .unwrap();
+        let (got, routes) =
+            chunk(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one_normed).unwrap();
+        let (want, (selection, _)) = decode_step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &one,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         let chosen: Vec<(u32, f32)> = routes[0]
             .indices
             .iter()
@@ -613,11 +634,13 @@ mod tests {
             .zip(routes[0].weights.iter().copied())
             .collect();
         assert_eq!(chosen, selection, "the route of the decode block");
-        assert_parity(
-            &values(&mut kernels, &got).unwrap(),
-            &values(&mut kernels, &want).unwrap(),
-            "one row",
-        );
+        let want_mixer: Vec<f32> = values(&mut kernels, &want)
+            .unwrap()
+            .iter()
+            .zip(&x)
+            .map(|(v, r)| v - r)
+            .collect();
+        assert_parity(&values(&mut kernels, &got).unwrap(), &want_mixer, "one row");
     }
 
     fn read_u32(kernels: &mut MlxKernels, tensor: &ExecutionTensor) -> Vec<u32> {
@@ -773,10 +796,21 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
+            // The decode seam folds the input norm; the device chunk keeps the raw contract.
+            let one_normed = ctx
+                .kernels
+                .rms_norm(&one, &w.layers[0].post_norm, shape.eps)
+                .unwrap();
             let device =
-                chunk_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
-            let decode =
-                decode_step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one).unwrap();
+                chunk_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &one_normed).unwrap();
+            let decode = decode_step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &one,
+                &w.layers[0].post_norm,
+            )
+            .unwrap();
             (device, decode)
         };
         let (decode, route) = decode;
@@ -787,9 +821,16 @@ mod tests {
         );
         let health = values(&mut kernels, &device.health).unwrap()[0];
         assert!((health - 1.0).abs() <= 1e-5, "health {health}");
+        // The decode seam folds the output residual; the device chunk keeps the mixer output.
+        let decode_mixer: Vec<f32> = values(&mut kernels, &decode)
+            .unwrap()
+            .iter()
+            .zip(&x)
+            .map(|(v, r)| v - r)
+            .collect();
         assert_close_relative(
             &values(&mut kernels, &device.out).unwrap(),
-            &values(&mut kernels, &decode).unwrap(),
+            &decode_mixer,
             1e-6,
             "one row against the decode block",
         );

@@ -152,10 +152,13 @@ pub(super) enum BlockOp {
     },
     /// The KV8 append of the Int8G32 step: the f32 `k`/`v` rows of the prep op, quantized into the
     /// four code and scale `planes` of this layer's KV pool at cells `*pos ..`; a refused position
-    /// ORs mask 4 into the `status` word.
+    /// ORs mask 4 into the `status` word. `k_at`/`v_at` is the f32-value offset of the card's
+    /// K/V head slice inside the gathered full-width row (0 for a whole-row state).
     Kv8Append {
         k: Slot,
         v: Slot,
+        k_at: usize,
+        v_at: usize,
         k_codes: Plane,
         k_scales: Plane,
         v_codes: Plane,
@@ -225,6 +228,8 @@ pub(super) enum BlockOp {
     KvAppendF16 {
         k: Slot,
         v: Slot,
+        k_at: usize,
+        v_at: usize,
         k_plane: Plane,
         v_plane: Plane,
         pos: StepField,
@@ -430,9 +435,18 @@ fn prologue(layout: WeightLayout) -> BlockOp {
 }
 
 /// The residual add of the mixer output and the norm for the MoE block: ends the mixer block.
-fn epilogue(layout: WeightLayout) -> BlockOp {
+fn epilogue(layout: WeightLayout, moe_tiled: bool) -> BlockOp {
     match layout {
         WeightLayout::Tiled => BlockOp::NormPack {
+            phase: Phase::AddNorm,
+            weight: Role::PostAttentionNorm,
+            delta: Some(Slot::MixOut),
+            xf: Slot::XfMoe,
+            norm_out: Some(Slot::NormRow),
+        },
+        // The tiled-experts hybrid: the overridden expert stacks read the fp16 pack, so the
+        // epilogue produces it even beside the native session (the Exl3 shape).
+        WeightLayout::Native if moe_tiled => BlockOp::NormPack {
             phase: Phase::AddNorm,
             weight: Role::PostAttentionNorm,
             delta: Some(Slot::MixOut),
@@ -562,6 +576,8 @@ fn attn_ops(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Vec<Blo
             BlockOp::Kv8Append {
                 k: Slot::KRows,
                 v: Slot::VRows,
+                k_at: 0,
+                v_at: 0,
                 k_codes: Plane::K,
                 k_scales: Plane::KScales,
                 v_codes: Plane::V,
@@ -649,12 +665,13 @@ pub(super) fn block_ops(
     g: &MixerGeometry,
     layout: WeightLayout,
     kv_mode: KvMode,
+    moe_tiled: bool,
 ) -> Result<Vec<BlockOp>, EngError> {
     // The loader fuses only Native weights, so the op list must make the SAME decision - fusion on
     // another layout would plan a wide qkv the weights cannot satisfy.
     let fuse_inproj =
         crate::family::project::cuda::gdn_fuse_inproj() && layout == WeightLayout::Native;
-    block_ops_with(fuse_inproj, kind, g, layout, kv_mode)
+    block_ops_with(fuse_inproj, kind, g, layout, kv_mode, moe_tiled)
 }
 
 /// The `block_ops` twin with an explicit fusion flag, so the CPU tests pin both arms without
@@ -665,6 +682,7 @@ pub(super) fn block_ops_with(
     g: &MixerGeometry,
     layout: WeightLayout,
     kv_mode: KvMode,
+    moe_tiled: bool,
 ) -> Result<Vec<BlockOp>, EngError> {
     if layout == WeightLayout::Native {
         for (role, col, rows, ld) in native_columns(g, kind, fuse_inproj) {
@@ -693,7 +711,7 @@ pub(super) fn block_ops_with(
             )));
         }
     }
-    ops.push(epilogue(layout));
+    ops.push(epilogue(layout, moe_tiled));
     Ok(ops)
 }
 
@@ -739,10 +757,15 @@ fn attn_ops_card(
             layout,
         ))
     };
+    // The append consumes the card's slice of the gathered full-width
+    // row: its K/V heads start at `k_range.0` f32 values into the row.
+    let (k_at, v_at) = (k_range.0, k_range.0);
     let append = match kv_mode {
         KvMode::Fp16 => CardOp::Local(BlockOp::KvAppendF16 {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at,
+            v_at,
             k_plane: Plane::K,
             v_plane: Plane::V,
             pos: StepField::Pos,
@@ -751,6 +774,8 @@ fn attn_ops_card(
         KvMode::Int8G32 => CardOp::Local(BlockOp::Kv8Append {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at,
+            v_at,
             k_codes: Plane::K,
             k_scales: Plane::KScales,
             v_codes: Plane::V,
@@ -782,10 +807,14 @@ fn attn_ops_card(
                 )));
             }
             let span = a.heads_q / groups;
-            let kv_heads = (k_range.0 / head_dim, k_range.0 / head_dim + span);
-            if !k_range.0.is_multiple_of(head_dim) || k_range.1 / head_dim != kv_heads.1 {
+            // The card's cache planes hold ONLY its own heads (sliced at
+            // allocation), so the decode addresses them from head 0 of the
+            // card's planes, not from the absolute head index.
+            let kv_heads = (0, span);
+            let run_heads = (k_range.1 - k_range.0) / head_dim;
+            if !k_range.0.is_multiple_of(head_dim) || run_heads != span {
                 return Err(EngError::BadRequest(format!(
-                    "card attn: kv rows {k_range:?} do not cover the card's {span} kv heads"
+                    "card attn: kv rows {k_range:?} hold {run_heads} heads, not the card's {span}                      kv heads"
                 )));
             }
             CardOp::Local(BlockOp::AttnDecodeQ8Card {
@@ -892,6 +921,7 @@ pub(super) fn block_ops_card(
     // into the residual, so the partials must sum first (the `MixerSum` of `multi.rs`'s
     // token plan).
     ops.push(CardOp::MixerSum);
-    ops.push(CardOp::Local(epilogue(layout)));
+    // Cards hold native weights only: the tiled-experts hybrid has no card form.
+    ops.push(CardOp::Local(epilogue(layout, false)));
     Ok(ops)
 }

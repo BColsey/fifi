@@ -608,7 +608,7 @@ fn wide_stage_admits_under_the_real_card_free() {
         .device;
     let free = projector.memory_info().expect("memory info").free;
     assert!(
-        free >= super::pinned::MIN_FREE_AFTER_LOAD,
+        free >= super::pinned::min_free_after_load().expect("floor"),
         "the pin needs the loader free floor"
     );
     let budget = free

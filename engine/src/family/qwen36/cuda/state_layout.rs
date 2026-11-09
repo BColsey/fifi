@@ -174,13 +174,31 @@ pub(crate) struct KvPool {
 
 impl KvPool {
     pub(super) fn new(dims: &StepDims, mode: KvMode, capacity: usize) -> Result<Self, EngError> {
+        Self::new_with_heads(dims, mode, capacity, dims.shape.attn.heads_kv)
+    }
+
+    /// The sliced form: `kv_heads` K/V heads per plane instead of the full
+    /// replicated count (a multi-device card stores and appends only its
+    /// own head groups).
+    pub(super) fn new_with_heads(
+        dims: &StepDims,
+        mode: KvMode,
+        capacity: usize,
+        kv_heads: usize,
+    ) -> Result<Self, EngError> {
         let a = &dims.shape.attn;
         if capacity == 0 {
             return Err(EngError::BadRequest(
                 "state layout: zero KV positions".to_owned(),
             ));
         }
-        let values = mul(mul(capacity, a.heads_kv)?, a.head_dim)?;
+        if kv_heads == 0 || kv_heads > a.heads_kv {
+            return Err(EngError::BadRequest(format!(
+                "state layout: {kv_heads} K/V heads is outside 1..={}",
+                a.heads_kv
+            )));
+        }
+        let values = mul(mul(capacity, kv_heads)?, a.head_dim)?;
         let (plane, scale) = match mode {
             KvMode::Fp16 => (mul(values, HALF)?, 0),
             KvMode::Int8G32 => {
@@ -200,7 +218,7 @@ impl KvPool {
             mode,
             capacity,
             layers,
-            kv_heads: a.heads_kv,
+            kv_heads,
             head_dim: a.head_dim,
             plane_bytes,
             scale_bytes,
@@ -389,6 +407,17 @@ impl StateLayout {
     }
 
     pub(crate) fn new(dims: &StepDims, options: &StepOptions) -> Result<Self, EngError> {
+        Self::new_with_kv_heads(dims, options, dims.shape.attn.heads_kv)
+    }
+
+    /// The sliced form: the KV pool holds `kv_heads` heads per plane (a
+    /// multi-device card's own K/V head groups) instead of the full
+    /// replicated count.
+    pub(crate) fn new_with_kv_heads(
+        dims: &StepDims,
+        options: &StepOptions,
+        kv_heads: usize,
+    ) -> Result<Self, EngError> {
         if options.delta_slots == 0 {
             return Err(EngError::BadRequest(
                 "state layout: zero DeltaNet slots".to_owned(),
@@ -396,7 +425,7 @@ impl StateLayout {
         }
         Ok(Self {
             delta: DeltaPool::new(dims, options.delta_slots)?,
-            kv: KvPool::new(dims, options.kv_mode, options.context_tokens)?,
+            kv: KvPool::new_with_heads(dims, options.kv_mode, options.context_tokens, kv_heads)?,
             words: WordsBlock::new(),
         })
     }

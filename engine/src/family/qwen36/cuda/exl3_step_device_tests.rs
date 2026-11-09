@@ -50,7 +50,7 @@ pub(super) const PROMPT: [u32; 25] = [
     248045, 846, 198, 814, 20139, 303, 2250, 22157, 1092, 264, 5010, 2336, 369, 321, 3069, 1353,
     8339, 513, 4778, 13, 248046, 198, 248045, 74455, 198,
 ];
-const GENERATED: usize = 16;
+pub(super) const GENERATED: usize = 16;
 /// The aliasing bug gave rows unrelated to the true ones (relative L2 near 1); float summation
 /// order may differ between the two arenas only in the last bits.
 const ROW_BOUND: f64 = 1e-3;

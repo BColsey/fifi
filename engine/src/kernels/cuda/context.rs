@@ -159,6 +159,10 @@ pub(crate) struct CudaContext {
     /// context: set by the session that owns it.
     pub(in crate::kernels::cuda) exl3_indexed_default:
         std::cell::Cell<Option<super::resident::exl3::IndexedOptions>>,
+    /// Whether the one-tile wide launches may take the rate 10 and rate 6 body of book 2.
+    pub(in crate::kernels::cuda) exl3_odd_rates: std::cell::Cell<bool>,
+    /// Whether the grouped launches may fuse the input rotation into the projection kernel.
+    pub(in crate::kernels::cuda) exl3_fused_in: std::cell::Cell<bool>,
     /// Launches per single-row EXL3 variant (test builds; see `kernels/single_row.rs`).
     #[cfg(test)]
     pub(in crate::kernels::cuda) exl3_launches:
@@ -180,6 +184,7 @@ pub(crate) struct CudaContext {
 
 pub(crate) struct DeviceBuffer {
     raw: Option<RawDevice>,
+    mapped: Option<native::resident::mailbox::RawMapped>,
     lease: Rc<Lease>,
     _thread_confined: PhantomData<*const ()>,
     alloc_cache: Option<Rc<alloc_cache::AllocCache>>,
@@ -385,6 +390,8 @@ impl CudaContext {
             alloc_cache: None,
             exl3_single_row_default: std::cell::Cell::new(None),
             exl3_indexed_default: std::cell::Cell::new(None),
+            exl3_odd_rates: std::cell::Cell::new(false),
+            exl3_fused_in: std::cell::Cell::new(false),
             #[cfg(test)]
             exl3_launches: std::cell::Cell::new(Default::default()),
             #[cfg(test)]
@@ -1128,8 +1135,7 @@ impl CudaContext {
             ));
         }
         buffer
-            .raw
-            .as_ref()
+            .raw_view()
             .ok_or_else(|| EngError::BadRequest("the CUDA buffer was already freed".to_owned()))
     }
 }
@@ -1198,8 +1204,14 @@ pub(super) fn enter_on(device: c_int) -> Result<DispatchGuard<'static>, EngError
 }
 
 impl DeviceBuffer {
+    fn raw_view(&self) -> Option<&RawDevice> {
+        self.raw
+            .as_ref()
+            .or_else(|| self.mapped.as_ref().map(|m| m.device()))
+    }
+
     pub(crate) fn bytes(&self) -> usize {
-        self.raw.as_ref().map_or(0, RawDevice::bytes)
+        self.raw_view().map_or(0, RawDevice::bytes)
     }
 
     /// A buffer with no allocation: the placeholder for a plane that carries
@@ -1209,6 +1221,7 @@ impl DeviceBuffer {
     pub(in crate::kernels::cuda) fn empty(lease: &Rc<Lease>) -> Self {
         Self {
             raw: None,
+            mapped: None,
             lease: Rc::clone(lease),
             _thread_confined: PhantomData,
             alloc_cache: None,
@@ -1236,6 +1249,7 @@ impl DeviceBuffer {
         LIVE_BYTES.fetch_add(raw.bytes(), Ordering::AcqRel);
         Self {
             raw: Some(raw),
+            mapped: None,
             lease: Rc::clone(lease),
             _thread_confined: PhantomData,
             alloc_cache: None,
@@ -1245,6 +1259,22 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        if let Some(mapped) = self.mapped.take() {
+            let bytes = mapped.device().bytes();
+            let lease = Rc::clone(&self.lease);
+            graph::run_or_defer(move || {
+                let device = lease.device();
+                let _lease = lease;
+                stream::release(
+                    mapped,
+                    native::resident::mailbox::mapped_free,
+                    &LIVE_PINNED,
+                    bytes,
+                    device,
+                );
+            });
+            return;
+        }
         if let Some(raw) = self.raw.take() {
             if TERMINAL.load(Ordering::Acquire) {
                 if let Some(cache) = &self.alloc_cache {
@@ -1257,6 +1287,7 @@ impl Drop for DeviceBuffer {
                     // Abandoned closures must drop an owner that records quarantine.
                     let deferred = Self {
                         raw: Some(raw),
+                        mapped: None,
                         lease: Rc::clone(&self.lease),
                         _thread_confined: PhantomData,
                         alloc_cache: Some(cache),
@@ -1689,6 +1720,8 @@ pub(super) fn host_write(
     native::upload_at(raw, offset, bytes).map_err(device_error)
 }
 
+/// Page-lock helpers re-exported for the expert bank's host store.
+pub(crate) use native::resident::{host_register, host_unregister};
 #[cfg(test)]
 pub(crate) use nvfp4_launch::{Nvfp4GroupedPlan, Nvfp4LaunchStatus};
 pub(crate) use pinned::{PinnedWord, WordValue};

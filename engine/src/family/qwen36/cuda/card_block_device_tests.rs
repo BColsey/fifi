@@ -227,11 +227,13 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             &geometry,
             WeightLayout::Native,
             options.kv_mode,
+            false,
         )?,
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers_ref = Mixers::new(ctx0, parts)?;
     let resid_view_ref = arena_ref.tensor(
@@ -247,6 +249,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             resid: resid_view_ref,
             admit_pos: 0,
         },
+        None,
     )?;
     stream0.synchronize()?;
     let read_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -381,6 +384,7 @@ fn run_rig(name: &'static str) -> Result<Evidence, EngError> {
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -533,7 +537,11 @@ fn a_full_attention_block_runs_distributed_and_matches_the_reference() {
         return;
     }
     let ev = run_rig(NAME).expect("the rig");
-    // Exact: the KV cache planes (codes and scales) of the layer.
+    // Exact: the KV cache planes (codes and scales) of the layer. The card's
+    // planes hold only its own K/V heads (sliced at allocation), so the
+    // reference's head-run slice is the expectation; the tail past the card's
+    // heads is plane alignment padding, never compared.
+    let full_heads = ev.head_runs[0].len() + ev.head_runs[1].len();
     for card in 0..2 {
         let got = &ev.planes[card];
         let want = &ev.planes_ref;
@@ -543,35 +551,23 @@ fn a_full_attention_block_runs_distributed_and_matches_the_reference() {
             ("V codes", &got.2, &want.2),
             ("V scales", &got.3, &want.3),
         ] {
-            let ranges = || {
-                let mut out = Vec::new();
-                let mut open: Option<usize> = None;
-                for (i, (g, w)) in got_bytes.iter().zip(want_bytes).enumerate() {
-                    if g != w {
-                        open.get_or_insert(i);
-                    } else if let Some(start) = open.take() {
-                        out.push(format!("{start}..{i}"));
-                    }
-                }
-                if let Some(start) = open {
-                    out.push(format!("{start}..{}", got_bytes.len()));
-                }
-                out
-            };
-            let diff = ranges();
+            let per_head = want_bytes.len() / full_heads;
+            let start = ev.head_runs[card].start * per_head;
+            let end = start + got_bytes.len().min(per_head * ev.head_runs[card].len());
+            let want_slice = &want_bytes[start..end];
+            let diff_count = got_bytes[..want_slice.len()]
+                .iter()
+                .zip(want_slice)
+                .filter(|(g, w)| g != w)
+                .count();
             println!(
-                "{NAME}: card {card} {plane}: {} differing bytes, ranges {:?} of {}",
-                got_bytes
-                    .iter()
-                    .zip(want_bytes)
-                    .filter(|(g, w)| g != w)
-                    .count(),
-                &diff[..diff.len().min(8)],
-                got_bytes.len()
+                "{NAME}: card {card} {plane}: {diff_count} differing bytes over the card's {}                  head slice (plane holds {} B, per head {per_head} B)",
+                ev.head_runs[card].len(),
+                got_bytes.len(),
             );
             assert!(
-                diff.is_empty(),
-                "card {card} {plane}: the appended cache must equal the reference exactly"
+                diff_count == 0,
+                "card {card} {plane}: the appended cache must equal the reference's head slice"
             );
         }
     }
@@ -781,11 +777,13 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
             &geometry,
             WeightLayout::Native,
             options.kv_mode,
+            false,
         )?,
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers_ref = Mixers::new(ctx0, parts)?;
     let read_ref_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -837,6 +835,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
                 resid: arena_ref.tensor(resid_at_ref)?,
                 admit_pos: token,
             },
+            None,
         )?;
         stream0.synchronize()?;
         mix_out_ref.push(read_ref_slot(Slot::MixOut)?);
@@ -974,6 +973,7 @@ fn run_delta_rig(name: &'static str) -> Result<DeltaEvidence, EngError> {
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -1482,11 +1482,13 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
                 &geometry,
                 WeightLayout::Native,
                 options.kv_mode,
+                false,
             )?,
             layout: WeightLayout::Native,
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         },
     )?;
     let resid_view_ref = arena_ref.tensor(
@@ -1502,6 +1504,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             resid: resid_view_ref,
             admit_pos: 0,
         },
+        None,
     )?;
     stream0.synchronize()?;
     let read_slot = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -1579,6 +1582,7 @@ fn run_gguf_rig(name: &'static str) -> Result<Evidence, EngError> {
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -1725,7 +1729,9 @@ fn a_real_gguf_file_loads_the_distributed_block() {
         return;
     }
     let ev = run_gguf_rig(NAME).expect("the real-file rig");
-    // Exact: the KV cache planes byte for byte.
+    // Exact: the KV cache planes over the card's K/V head slice (the card's
+    // planes are sliced to its heads; the tail is alignment padding).
+    let full_heads = ev.head_runs[0].len() + ev.head_runs[1].len();
     for card in 0..2 {
         let got = &ev.planes[card];
         let want = &ev.planes_ref;
@@ -1735,14 +1741,12 @@ fn a_real_gguf_file_loads_the_distributed_block() {
             ("V codes", &got.2, &want.2),
             ("V scales", &got.3, &want.3),
         ] {
+            let per_head = want_bytes.len() / full_heads;
+            let start = ev.head_runs[card].start * per_head;
+            let end = start + per_head * ev.head_runs[card].len();
             assert!(
-                got_bytes == want_bytes,
-                "{NAME}: card {card} {plane}: {} differing bytes",
-                got_bytes
-                    .iter()
-                    .zip(want_bytes)
-                    .filter(|(g, w)| g != w)
-                    .count()
+                &got_bytes[..end - start] == &want_bytes[start..end],
+                "{NAME}: card {card} {plane}: differing bytes over the card's head slice"
             );
         }
     }

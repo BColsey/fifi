@@ -22,14 +22,17 @@ use super::{
     card_load::card_loads,
     card_session::{CardSession, Q36CudaStep},
     card_step::CardStack,
-    card_weights::load_card_weights,
+    card_weights::{load_card_weights, load_card_weights_mapped},
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
-    exl3_load::load_exl3_dir,
+    exl3_bank::{Exl3SlotResolver, ExpertStore},
+    exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
+    exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
-    pinned::{MIN_FREE_AFTER_LOAD, ROTARY_DIM, head_rows_of},
+    pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
+    placement::{PlacementPolicy, PlacementRequest, plan_placement, profiles_from_facts},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},
     prefill_plan::Extra,
-    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes},
+    resources::{PagedResourcesPlan, STEP_ROWS, StepResources, check_paged_modes, moe_dims},
     rules::QwenRules,
     shard::ShardTable,
     state_layout::{KvPool, StateLayout},
@@ -158,7 +161,7 @@ impl StartupPlan {
         let Some(native) = self.device_first_native else {
             return Ok(self);
         };
-        let available = free.checked_sub(MIN_FREE_AFTER_LOAD).ok_or_else(|| {
+        let available = free.checked_sub(min_free_after_load()?).ok_or_else(|| {
             EngError::MemoryPlan("device-first load is below the free-memory floor".into())
         })?;
         if native <= available {
@@ -271,9 +274,10 @@ fn device_first_wanted(value: Option<&std::ffi::OsStr>) -> Result<bool, EngError
 }
 
 fn require_device_first_room(free: usize, reserve: u64) -> Result<(), EngError> {
+    let floor = min_free_after_load()?;
     let needed = usize::try_from(reserve)
         .ok()
-        .and_then(|bytes| bytes.checked_add(MIN_FREE_AFTER_LOAD))
+        .and_then(|bytes| bytes.checked_add(floor))
         .ok_or_else(|| {
             EngError::MemoryPlan("device-first resident reserve plus headroom exceeds usize".into())
         })?;
@@ -794,6 +798,18 @@ pub(crate) fn start(
     Ok((engine, bundle))
 }
 
+fn p2p_host_expert_bytes(name: &str, value: Option<&std::ffi::OsStr>) -> Result<u64, EngError> {
+    match value {
+        None => Ok(0),
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                EngError::BadRequest(format!("{name} must be a nonnegative byte count"))
+            }),
+    }
+}
+
 /// The engine-thread half: everything CUDA is built here, in the gate's own order — projector,
 /// memory figure, GGUF identity, open, load with admission, free-after-load floor, the step
 /// options from the loaded layout, step resources, then the leaks, the step and the capture
@@ -870,7 +886,6 @@ fn make_multi(
     let kv_mode = kv_mode_of(settings.kv, WeightLayout::Native)?;
     let options = step_options(settings.context_limit, WeightLayout::Native, kv_mode)?;
     stages.begin("planning shards");
-    let table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
     // The shard plans size each card's upload from the file's expert quant; layer 0's
     // expert gate names the tensor that carries it.
     let layers = LayerTable::new(&dims, &inventory)?;
@@ -883,31 +898,117 @@ fn make_multi(
             EngError::Checkpoint(format!("gguf model: tensor {gate} is not in the file"))
         })?
         .ggml_type();
-    let loads = card_loads(&table, &inventory, quant)?;
+    // Experimental and default off: the bandwidth-waterfill placement
+    // planner redistributes the sliceable roles instead of the even deal.
+    // The planner budgets every sliced weight as card-resident, so each
+    // card's host-expert budget is handed to it as free-byte relief: that
+    // much sliced mass leaves the card for pinned host RAM at load. The
+    // receipt's reason line says which candidate won and why.
+    let waterfill = std::env::var_os("Q36_P2P_WATERFILL").is_some_and(|v| v == "1");
+    let mut planned = None;
+    let even_table;
+    let table: &ShardTable = if waterfill {
+        let mut profiles = profiles_from_facts(&facts);
+        let host_expert_bytes = [
+            p2p_host_expert_bytes(
+                "Q36_P2P_HOST_EXPERT_BYTES_0",
+                std::env::var_os("Q36_P2P_HOST_EXPERT_BYTES_0").as_deref(),
+            )?,
+            p2p_host_expert_bytes(
+                "Q36_P2P_HOST_EXPERT_BYTES",
+                std::env::var_os("Q36_P2P_HOST_EXPERT_BYTES").as_deref(),
+            )?,
+        ];
+        for (profile, relief) in profiles.iter_mut().zip(host_expert_bytes) {
+            profile.free_bytes += relief;
+        }
+        let policy = PlacementPolicy::default();
+        let request = PlacementRequest {
+            shape: &shape,
+            inventory: &inventory,
+            quant,
+            kv_capacity_rows: settings.context_limit as usize,
+            delta_slots: options.delta_slots,
+            profiles: &profiles,
+            policy: &policy,
+        };
+        let plan = plan_placement(&request)?;
+        eprintln!(
+            "q36 cuda: placement {} - {}",
+            plan.receipt.chosen, plan.receipt.reason
+        );
+        planned = Some(plan);
+        &planned.as_ref().expect("just set").table
+    } else {
+        even_table = ShardTable::new(&shape, settings.cuda_devices.len(), 256)?;
+        &even_table
+    };
+    let loads = card_loads(table, &inventory, quant)?;
     let fixed_admission = plan.modes.fixed_admission;
-    // The load reserve keeps the single-device figure: it holds the KV bytes
-    // free during each card's upload, and over-reserving per card (the cards
-    // share the KV rows) only refuses a tight fit earlier, never corrupts it.
-    let load = load_options(plan.reserve, fixed_admission);
-    let (stack, states) =
-        CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?;
+    // The load reserve keeps the single-device figure except its state
+    // term: the card caches are SLICED (each card stores only its own K/V
+    // head groups), so the largest card's sliced state replaces the full
+    // replica's. Over-reserving only refuses a tight fit earlier, never
+    // corrupts it, and the post-load floor check still guards every card.
+    let reserve = {
+        let head_dim = dims.shape.attn.head_dim;
+        let full_state = u64::try_from(StateLayout::new(&dims, &options)?.bytes()?)
+            .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
+        let mut max_card_state: u64 = 0;
+        for card in 0..settings.cuda_devices.len() {
+            let heads = table.kv_rows(card)?.len() / head_dim;
+            let bytes =
+                u64::try_from(StateLayout::new_with_kv_heads(&dims, &options, heads)?.bytes()?)
+                    .map_err(|_| EngError::MemoryPlan("card state layout overflows u64".into()))?;
+            max_card_state = max_card_state.max(bytes);
+        }
+        plan.reserve
+            .saturating_sub(full_state)
+            .saturating_add(max_card_state)
+    };
+    let load = load_options(reserve, fixed_admission);
+    // Experimental and default off. The original variable controls card 1;
+    // the new card-0 variable leaves that existing setting compatible.
+    let first_var = "Q36_P2P_HOST_EXPERT_BYTES_0";
+    let second_var = "Q36_P2P_HOST_EXPERT_BYTES";
+    let host_expert_bytes = [
+        p2p_host_expert_bytes(first_var, std::env::var_os(first_var).as_deref())?,
+        p2p_host_expert_bytes(second_var, std::env::var_os(second_var).as_deref())?,
+    ];
+    let (stack, states) = match planned.as_ref() {
+        Some(plan) => CardStack::with_table(
+            &dims,
+            &options,
+            &settings.cuda_devices,
+            &served_admission(),
+            &plan.table,
+        )?,
+        None => CardStack::new(&dims, &options, &settings.cuda_devices, &served_admission())?,
+    };
     stages.begin("loading weights");
     let mut loaded = Vec::with_capacity(loads.len());
     for (card, set) in loads.iter().enumerate() {
         let loader = BorrowedLoader::new(&stack.contexts()[card])?;
-        loaded.push(load_card_weights(&loader, &model.weights, set, card, load)?);
+        let budget = host_expert_bytes.get(card).copied().unwrap_or(0);
+        let weights = if budget != 0 {
+            load_card_weights_mapped(&loader, &model.weights, set, card, load, budget)?
+        } else {
+            load_card_weights(&loader, &model.weights, set, card, load)?
+        };
+        loaded.push(weights);
     }
     stages.begin("checking memory floors");
     for (card, context) in stack.contexts().iter().enumerate() {
         let info = context.memory_info()?;
-        if info.free < MIN_FREE_AFTER_LOAD {
+        let floor = min_free_after_load()?;
+        if info.free < floor {
             return Err(EngError::MemoryPlan(format!(
                 "cuda admission: card {card} has {} bytes free after the load, below the {}-byte floor",
-                info.free, MIN_FREE_AFTER_LOAD
+                info.free, floor
             )));
         }
         eprintln!(
-            "q36 cuda: card {card} (device {}) weights resident ({} B), free after load {} B",
+            "q36 cuda: card {card} (device {}) weights loaded ({} B), free after load {} B",
             settings.cuda_devices[card],
             loads[card].upload_bytes(),
             info.free
@@ -934,6 +1035,21 @@ fn make_multi(
         &options,
         rules.eos,
         rules.sampler_vocab,
+        // Experimental and default off: the card path's prefix save/restore
+        // is wired but NOT yet qualified (the restore passed filler-agnostic
+        // bench answers and failed a deeper turn-chain check; see the branch
+        // doc). Q36_P2P_PREFIX=1 opts in.
+        if std::env::var_os("Q36_P2P_PREFIX").is_some_and(|v| v == "1") {
+            crate::family::qwen36::settings::prefix_store_limits_of(
+                settings.prefix_reuse,
+                settings.prefix_store_entries,
+            )
+        } else {
+            crate::family::session::StoreLimits {
+                roots: 0,
+                entries: 0,
+            }
+        },
     )?;
     Ok((
         Q36CudaStep::Cards(Box::new(session)),
@@ -976,6 +1092,10 @@ fn make(
         WeightFormat::Exl3 => None,
     };
     let tiered = tiered_plan_of(&settings);
+    // The banked EXL3 load's leftovers (None on every resident path): the host store and the
+    // figures the resolver build below needs. Declared here because the load match's arms are
+    // separate blocks.
+    let mut banked_load: Option<(ExpertStore, usize, usize)> = None;
     // A tiered load leaves the routed expert stacks in the file: the banks hold the hot ones.
     let device = match (&gguf, tiered) {
         (None, _) => {
@@ -986,7 +1106,42 @@ fn make(
             projector
                 .context()
                 .set_single_row_default(SERVED_SINGLE_ROW);
-            let device = load_exl3_dir(&projector, &settings.artifact, reserve)?;
+            let mut banked_inner: Option<(ExpertStore, usize, usize)> = None;
+            let device = match load_exl3_dir_decided(
+                &projector,
+                &settings.artifact,
+                settings.expert_bank.as_ref(),
+                reserve,
+            )? {
+                DecidedLoad::Resident(device) => device,
+                DecidedLoad::Banked(banked) => {
+                    let sticky = settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky);
+                    eprintln!(
+                        "q36 cuda: EXL3 expert bank: {} of {} experts per layer resident, \
+                         sticky {} (device {:.2} GiB incl. dense {:.2} GiB), host store {:.2} GiB, \
+                         loaded from {} in {:.1} s",
+                        banked.slots,
+                        banked.experts,
+                        sticky.min(banked.slots.saturating_sub(1)),
+                        banked.weights.device_bytes() as f64 / (1 << 30) as f64,
+                        banked.dense_bytes as f64 / (1 << 30) as f64,
+                        banked.store.host_bytes() as f64 / (1 << 30) as f64,
+                        settings.artifact.display(),
+                        began.elapsed().as_secs_f64(),
+                    );
+                    let BankedModel {
+                        weights,
+                        store,
+                        slots,
+                        experts,
+                        routed_bytes: _,
+                        dense_bytes: _,
+                    } = *banked;
+                    banked_inner = Some((store, slots, experts));
+                    weights
+                }
+            };
+            banked_load = banked_inner;
             eprintln!(
                 "q36 cuda: EXL3 weights loaded from {} in {:.1} s",
                 settings.artifact.display(),
@@ -1011,10 +1166,11 @@ fn make(
     };
     let after = projector.memory_info()?;
     stages.begin("admitting memory");
-    if after.free < MIN_FREE_AFTER_LOAD {
+    let floor = min_free_after_load()?;
+    if after.free < floor {
         return Err(EngError::MemoryPlan(format!(
             "cuda admission: {} bytes free after the load is below the {}-byte floor",
-            after.free, MIN_FREE_AFTER_LOAD
+            after.free, floor
         )));
     }
     let plan = plan.after_load(&settings, after.free)?;
@@ -1061,8 +1217,41 @@ fn make(
     let projector: &'static CudaProjector = Box::leak(Box::new(projector));
     let weights: &'static CudaWeights = Box::leak(Box::new(device));
     let res: &'static StepResources = Box::leak(Box::new(res));
+    // The banked resolver, from the leaked weights: per-layer slot tables over the load's slot
+    // banks and the host store. Leaked like its owners, for the step's life.
+    let mut banked_slots = 0;
+    let bank = match banked_load {
+        Some((store, slots, experts)) => {
+            banked_slots = slots;
+            let dims = moe_dims(&res.dims);
+            let blocks = (0..res.table.len())
+                .map(|layer| {
+                    Exl3MoeWeights::resolve_banked(weights, &res.table, layer, &dims, slots)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let resolver = Exl3SlotResolver::new(
+                store,
+                &blocks,
+                experts,
+                settings.expert_bank.as_ref().map_or(0, |bank| bank.sticky),
+            )?;
+            Some(Box::leak(Box::new(std::cell::RefCell::new(resolver))))
+        }
+        None => None,
+    };
     guard.commit();
-    let mut step = QwenResidentStep::new(projector.context(), res, weights, &options, rules)?;
+    let mut step = match bank {
+        Some(bank) => QwenResidentStep::new_banked(
+            projector.context(),
+            res,
+            weights,
+            &options,
+            rules,
+            banked_slots,
+            bank,
+        )?,
+        None => QwenResidentStep::new(projector.context(), res, weights, &options, rules)?,
+    };
     step.set_capture_config(CaptureConfig {
         capture: settings.capture,
         // The section-timing marks stay off on the serve path: the timer is a measurement harness,
@@ -1225,6 +1414,48 @@ mod chunk_prefill_flag_tests {
         context_staging_wanted, kv8_prefill_start_line,
     };
     use std::ffi::OsStr;
+
+    #[test]
+    fn p2p_kv_charge_matches_the_resident_state_at_128k() {
+        use super::super::state_layout::StateLayout;
+
+        let inventory = super::Inventory::for_spec(&super::QWEN3_6_35B_A3B).unwrap();
+        let shape =
+            super::HostShape::from_spec(&super::QWEN3_6_35B_A3B, super::ROTARY_DIM).unwrap();
+        let dims = super::StepDims::new(&shape, &inventory).unwrap();
+        for mode in [super::KvMode::Fp16, super::KvMode::Int8G32] {
+            let options = super::step_options(131072, super::WeightLayout::Native, mode).unwrap();
+            let state = StateLayout::new(&dims, &options).unwrap();
+            assert_eq!(
+                state.kv.total as u64,
+                super::kv_cache_bytes(131072, mode).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn p2p_expert_budgets_default_off_and_validate_each_card() {
+        let parse = super::p2p_host_expert_bytes;
+        assert_eq!(parse("card0", None).unwrap(), 0);
+        assert_eq!(parse("card1", None).unwrap(), 0);
+        assert_eq!(
+            parse("card0", Some(OsStr::new("2147483648"))).unwrap(),
+            2 << 30
+        );
+        assert_eq!(
+            parse("card1", Some(OsStr::new("4294967296"))).unwrap(),
+            4 << 30
+        );
+        for invalid in ["", "-1", "two", "18446744073709551616"] {
+            let error = parse("card0", Some(OsStr::new(invalid))).unwrap_err();
+            assert!(format!("{error:?}").contains("card0"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(parse("card0", Some(OsStr::from_bytes(&[0xff]))).is_err());
+        }
+    }
 
     #[test]
     fn wide_stage_defaults_on_and_zero_rolls_it_back() {
@@ -1396,7 +1627,10 @@ mod chunk_prefill_flag_tests {
         );
         assert_eq!(super::prefill_headroom(false), 1usize << 30);
         assert_eq!(super::prefill_headroom(true), 256usize << 20);
-        assert_eq!(super::MIN_FREE_AFTER_LOAD, 1usize << 30);
+        assert_eq!(
+            super::super::pinned::min_free_after_load_default(),
+            1usize << 30
+        );
     }
 
     #[test]
@@ -1488,6 +1722,12 @@ mod paged_start_tests {
     use super::*;
     use crate::family::qwen36::settings::{Backend, Q36Env, Q36Options};
 
+    /// The floor the admission reads in this process (the default, or `Q36_CUDA_MIN_FREE_MIB`),
+    /// so the arithmetic tests hold under either.
+    fn floor() -> usize {
+        super::super::pinned::min_free_after_load().unwrap()
+    }
+
     fn settings(body: &str) -> Q36Settings {
         let options: Q36Options = serde_json::from_str(body).unwrap();
         Q36Settings::new(
@@ -1560,9 +1800,7 @@ mod paged_start_tests {
             plan.reserve < native as u64,
             "pre-load reserve must exclude the full KV pool"
         );
-        let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + native)
-            .unwrap();
+        let plan = plan.after_load(&configured, floor() + native).unwrap();
         assert!(plan.paged.is_none());
         assert_eq!(plan.reserve, native as u64);
 
@@ -1584,9 +1822,7 @@ mod paged_start_tests {
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         let native = plan.device_first_native.unwrap();
         assert!(plan.reserve as usize <= native);
-        let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + native)
-            .unwrap();
+        let plan = plan.after_load(&configured, floor() + native).unwrap();
         assert!(plan.paged.is_none());
         assert_eq!(plan.reserve as usize, native);
     }
@@ -1602,7 +1838,7 @@ mod paged_start_tests {
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         let fixed = plan.reserve as usize;
         let plan = plan
-            .after_load(&configured, MIN_FREE_AFTER_LOAD + fixed + 2 * group)
+            .after_load(&configured, floor() + fixed + 2 * group)
             .unwrap();
         assert_eq!(
             plan.paged.as_ref().unwrap().cache_rows(),
@@ -1612,14 +1848,14 @@ mod paged_start_tests {
 
         let plan = StartupPlan::new_device_first(&configured, false, modes(false)).unwrap();
         assert!(
-            plan.after_load(&configured, MIN_FREE_AFTER_LOAD + fixed + group - 1)
+            plan.after_load(&configured, floor() + fixed + group - 1)
                 .is_err()
         );
         let mut insufficient_host = configured;
         insufficient_host.kv_offload_host_bytes = Some(1);
         let plan = StartupPlan::new_device_first(&insufficient_host, false, modes(false)).unwrap();
         assert!(
-            plan.after_load(&insufficient_host, MIN_FREE_AFTER_LOAD + fixed + 2 * group)
+            plan.after_load(&insufficient_host, floor() + fixed + 2 * group)
                 .is_err()
         );
     }
@@ -1637,8 +1873,8 @@ mod paged_start_tests {
 
     #[test]
     fn device_first_resident_admission_retains_the_complete_headroom() {
-        assert!(require_device_first_room(MIN_FREE_AFTER_LOAD + 256, 256).is_ok());
-        assert!(require_device_first_room(MIN_FREE_AFTER_LOAD + 255, 256).is_err());
+        assert!(require_device_first_room(floor() + 256, 256).is_ok());
+        assert!(require_device_first_room(floor() + 255, 256).is_err());
         assert!(require_device_first_room(usize::MAX, u64::MAX).is_err());
     }
 

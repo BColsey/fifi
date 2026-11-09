@@ -43,6 +43,7 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceRange, DeviceStream, MatmulIo, PackCall, Projection,
+        TimingEvent,
         resident::{
             add_norm_pack::AddNormCall,
             add_rmsnorm_q8::AddNormQ8Call,
@@ -73,10 +74,15 @@ struct KindOps {
 }
 
 impl KindOps {
-    fn new(g: &MixerGeometry, layout: WeightLayout, kv_mode: KvMode) -> Result<Self, EngError> {
+    fn new(
+        g: &MixerGeometry,
+        layout: WeightLayout,
+        kv_mode: KvMode,
+        moe_tiled: bool,
+    ) -> Result<Self, EngError> {
         Ok(Self {
-            delta: block_ops(AttentionKind::DeltaNet, g, layout, kv_mode)?,
-            attn: block_ops(AttentionKind::Full, g, layout, kv_mode)?,
+            delta: block_ops(AttentionKind::DeltaNet, g, layout, kv_mode, moe_tiled)?,
+            attn: block_ops(AttentionKind::Full, g, layout, kv_mode, moe_tiled)?,
         })
     }
 
@@ -180,8 +186,9 @@ impl<'a> MixerViews<'a> {
         g: &MixerGeometry,
         layout: WeightLayout,
         kv_mode: KvMode,
+        moe_tiled: bool,
     ) -> Result<Self, EngError> {
-        let views = Self::slot_indices(plan, g, layout, kv_mode)?
+        let views = Self::slot_indices(plan, g, layout, kv_mode, moe_tiled)?
             .into_iter()
             .map(|(slot, index)| Ok((slot, arena.tensor(index)?)))
             .collect::<Result<Vec<_>, EngError>>()?;
@@ -232,8 +239,9 @@ impl<'a> MixerViews<'a> {
         g: &MixerGeometry,
         layout: WeightLayout,
         kv_mode: KvMode,
+        moe_tiled: bool,
     ) -> Result<Vec<(Slot, usize)>, EngError> {
-        let ops = KindOps::new(g, layout, kv_mode)?;
+        let ops = KindOps::new(g, layout, kv_mode, moe_tiled)?;
         let mut indices: Vec<(Slot, usize)> = Vec::new();
         for op in ops.all() {
             for slot in op.reads().into_iter().chain(op.writes()) {
@@ -299,6 +307,10 @@ pub(super) struct MixerParts<'a> {
     /// The KV mode the op lists were built for: the attention core is the fp16 pair under `Fp16`
     /// and the KV8 rows/append/q8-decode triple under `Int8G32`.
     pub(super) kv_mode: KvMode,
+    /// Whether the MoE epilogue must produce the fp16 pack: the tiled-experts hybrid overrides
+    /// the expert stacks to tiles beside the native session, so their launches read `XfMoe`
+    /// instead of `Q8Moe`.
+    pub(super) moe_tiled: bool,
     pub(super) paged: Option<&'a PagedResources>,
     /// Present only when armed and admitted: sparse decode resources, else every op runs dense.
     pub(super) sparse: Option<&'a SparseExec>,
@@ -338,7 +350,12 @@ impl<'a> Mixers<'a> {
 
     pub(super) fn new(context: &'a CudaContext, parts: MixerParts<'a>) -> Result<Self, EngError> {
         check_delta_eps(parts.geometry.eps)?;
-        let ops = KindOps::new(&parts.geometry, parts.layout, parts.kv_mode)?;
+        let ops = KindOps::new(
+            &parts.geometry,
+            parts.layout,
+            parts.kv_mode,
+            parts.moe_tiled,
+        )?;
         Ok(Self {
             context,
             parts,
@@ -354,6 +371,7 @@ impl<'a> Mixers<'a> {
         state: &ResidentState,
         layer: usize,
         io: BlockIo<'_>,
+        core_marks: Option<(&TimingEvent, &TimingEvent)>,
     ) -> Result<(), EngError> {
         state.check_block(stream)?;
         let slot = self.parts.table.slot(layer)?;
@@ -365,8 +383,38 @@ impl<'a> Mixers<'a> {
             ordinal: slot.ordinal,
             io,
         };
+        // The finer split's attention-core window: opens at the block's first core op
+        // (`Conv` of the delta list, `AttnPrep*` of the full list) and closes after its last
+        // (`Delta`, `AttnDecode*`), so the pair brackets the core whatever the list's exact
+        // shape (the KV-append ops sit inside it).
+        let mut core_open = false;
         for op in self.ops.of(slot.kind)? {
+            let opens_core = matches!(
+                op,
+                BlockOp::Conv { .. }
+                    | BlockOp::AttnPrep { .. }
+                    | BlockOp::AttnPrepRows { .. }
+                    | BlockOp::AttnPrepCard { .. }
+            );
+            let closes_core = matches!(
+                op,
+                BlockOp::Delta { .. }
+                    | BlockOp::AttnDecode { .. }
+                    | BlockOp::AttnDecodeQ8 { .. }
+                    | BlockOp::AttnDecodeQ8Card { .. }
+            );
+            if let Some((core_start, _)) = core_marks {
+                if opens_core && !core_open {
+                    stream.record_timing(core_start)?;
+                    core_open = true;
+                }
+            }
             self.run_op(&run, op)?;
+            if let Some((_, core_end)) = core_marks {
+                if closes_core {
+                    stream.record_timing(core_end)?;
+                }
+            }
         }
         Ok(())
     }
@@ -687,6 +735,8 @@ impl<'a> Mixers<'a> {
             BlockOp::Kv8Append {
                 k,
                 v,
+                k_at,
+                v_at,
                 k_codes,
                 k_scales,
                 v_codes,
@@ -710,12 +760,21 @@ impl<'a> Mixers<'a> {
                         },
                     )
                 } else {
+                    // The card's slice of the gathered full-width row: its
+                    // K/V heads at `k_at` f32 values in, `heads_kv` heads
+                    // wide, quantized into its sliced planes.
+                    let kv_width = g.attn.heads_kv * g.attn.head_dim;
+                    let slice = |slot: Slot, at: usize| -> Result<_, EngError> {
+                        let view = self.view(slot)?;
+                        view.buffer()
+                            .range(view.offset() + at * F32, kv_width * F32)
+                    };
                     ctx.kv8_append(
                         stream,
                         kv8_shape(g, run.state.layout().kv.capacity),
                         Kv8Data {
-                            k: self.view(k)?,
-                            v: self.view(v)?,
+                            k: slice(k, k_at)?,
+                            v: slice(v, v_at)?,
                             k_codes: run.state.kv_plane(run.ordinal, k_codes)?,
                             k_scales: run.state.kv_plane(run.ordinal, k_scales)?,
                             v_codes: run.state.kv_plane(run.ordinal, v_codes)?,
@@ -1016,11 +1075,13 @@ impl<'a> Mixers<'a> {
                     },
                 )
             }
-            // The card F16 append: the gathered full rows into the
-            // replicated fp16 cache pair of this layer.
+            // The card F16 append: the card's slice of the gathered full
+            // rows into the card's sliced fp16 cache pair of this layer.
             BlockOp::KvAppendF16 {
                 k,
                 v,
+                k_at,
+                v_at,
                 k_plane,
                 v_plane,
                 pos,
@@ -1032,12 +1093,18 @@ impl<'a> Mixers<'a> {
                     head_dim: g.attn.head_dim,
                     cells: run.state.layout().kv.capacity,
                 };
+                let kv_width = g.attn.heads_kv * g.attn.head_dim;
+                let slice = |slot: Slot, at: usize| -> Result<_, EngError> {
+                    let view = self.view(slot)?;
+                    view.buffer()
+                        .range(view.offset() + at * F32, kv_width * F32)
+                };
                 ctx.kv_f16_append(
                     stream,
                     shape,
                     KvF16AppendData {
-                        k: self.view(k)?,
-                        v: self.view(v)?,
+                        k: slice(k, k_at)?,
+                        v: slice(v, v_at)?,
                         k_cache: run.state.kv_plane(run.ordinal, k_plane)?,
                         v_cache: run.state.kv_plane(run.ordinal, v_plane)?,
                     },

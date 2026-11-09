@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds};
+use super::{DriverShape, StartVectors, TokenDevice, TokenFeeds, chunk::ChunkDevice};
 use crate::{
     EngError,
     family::flash_next::cuda::feeds::{StartShape, StartSink},
@@ -106,6 +106,100 @@ impl TokenDevice for FakeDevice {
     fn read_logits(&mut self) -> Result<Vec<f32>, EngError> {
         self.step("read_logits", String::new())?;
         Ok((0..LOGITS).map(|i| self.stream[0] * i as f32).collect())
+    }
+
+    fn check_health(&mut self) -> Result<(), EngError> {
+        self.step("health", String::new())
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        self.resets += 1;
+        self.stream.clear();
+        self.step("reset", String::new())
+    }
+}
+
+/// The chunk fake: `m` rows of the stream; layer `l` at position `p` adds `l + 1 + p + row` to
+/// every value of row `row`, so a row carries its own index and the PLE roundtrip is checkable
+/// per row. The logits row follows the LAST row, as the head does.
+#[derive(Default)]
+pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
+    /// Every call, in order.
+    pub(in crate::family::flash_next::cuda) log: Vec<String>,
+    pub(in crate::family::flash_next::cuda) stream: Vec<f32>,
+    /// The call that fails (its log name), once.
+    pub(in crate::family::flash_next::cuda) fail: Option<&'static str>,
+    pub(in crate::family::flash_next::cuda) resets: usize,
+}
+
+impl FakeChunkDevice {
+    fn step(&mut self, name: &'static str, detail: String) -> Result<(), EngError> {
+        self.log
+            .push(format!("{name} {detail}").trim_end().to_string());
+        if self.fail == Some(name) {
+            self.fail = None;
+            return Err(EngError::Backend {
+                operation: "fake_chunk_device",
+                message: format!("{name} failed"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ChunkDevice for FakeChunkDevice {
+    fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<(), EngError> {
+        self.step("chunk_params", format!("{token0} {pos} {m}"))
+    }
+
+    fn write_chunk_stream(&mut self, rows: &[f32]) -> Result<(), EngError> {
+        self.stream = rows.to_vec();
+        self.step("chunk_stream", String::new())
+    }
+
+    fn write_chunk_ple(&mut self, _rows: &[f32]) -> Result<(), EngError> {
+        self.step("chunk_ple", String::new())
+    }
+
+    fn begin_chunk(&mut self) -> Result<(), EngError> {
+        self.step("begin", String::new())
+    }
+
+    fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<(), EngError> {
+        let width = self.stream.len() / m.max(1);
+        for layer in range.clone() {
+            for (row, value) in self.stream.chunks_mut(width).enumerate() {
+                let add = (layer + 1 + pos + row) as f32;
+                for cell in value.iter_mut() {
+                    *cell += add;
+                }
+            }
+        }
+        self.step(
+            "layers",
+            format!("{}..{} @{pos} m{m}", range.start, range.end),
+        )
+    }
+
+    fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {
+        self.step("read_stream", String::new())?;
+        Ok(self.stream.clone())
+    }
+
+    fn write_stream_back(&mut self, rows: &[f32]) -> Result<(), EngError> {
+        self.stream = rows.to_vec();
+        self.step("write_back", String::new())
+    }
+
+    fn head(&mut self) -> Result<(), EngError> {
+        self.step("head", String::new())
+    }
+
+    fn read_logits(&mut self) -> Result<Vec<f32>, EngError> {
+        self.step("read_logits", String::new())?;
+        let width = self.stream.len().max(1);
+        let last = self.stream[width - STREAM..].to_vec();
+        Ok((0..LOGITS).map(|i| last[0] * i as f32).collect())
     }
 
     fn check_health(&mut self) -> Result<(), EngError> {

@@ -1949,6 +1949,39 @@ impl MlxKernels {
         )
     }
 
+    /// The delta_middle fused kernel (`Q36_FUSED_DECODE=1`): the decode counterpart of
+    /// [`MlxKernels::gdn_prep`], for one decode slot at a time. The extra `dims` argument is
+    /// `[kh, kd, vh, vd, cd]`.
+    #[allow(clippy::too_many_arguments, reason = "the fused kernel contract")]
+    pub fn delta_middle(
+        &mut self,
+        u_in: &ExecutionTensor,
+        a_in: &ExecutionTensor,
+        b_in: &ExecutionTensor,
+        ring: &ExecutionTensor,
+        taps: &ExecutionTensor,
+        last: &ExecutionTensor,
+        neg_exp_a_log: &ExecutionTensor,
+        dt_bias: &ExecutionTensor,
+        qk_eps: &ExecutionTensor,
+        sqrt_kd: &ExecutionTensor,
+        dims: &[u32; 5],
+    ) -> Result<GdnPrepOutput, EngError> {
+        self.context.delta_middle(
+            u_in,
+            a_in,
+            b_in,
+            ring,
+            taps,
+            last,
+            neg_exp_a_log,
+            dt_bias,
+            qk_eps,
+            sqrt_kd,
+            dims,
+        )
+    }
+
     /// The act_mul fused kernel: SwiGLU activation.
     pub fn act_mul(
         &mut self,
@@ -1970,6 +2003,20 @@ impl MlxKernels {
         rows: u32,
     ) -> Result<ExecutionTensor, EngError> {
         self.context.moe_combine(eo, inverse, gates, so, raw, rows)
+    }
+
+    /// The fused MoE router top-k: the stable selection and renormalized gates of one
+    /// `[1, experts]` F32 probability row in one kernel. Returns `(ids [k], gates [k, 1, 1])`;
+    /// the ids are already below `experts`. `BadRequest` outside the launch contract
+    /// (F32 row, experts a multiple of 32 up to 1024, top-k up to 32).
+    pub fn router_topk(
+        &mut self,
+        probs: &ExecutionTensor,
+        experts: u32,
+        top_k: u32,
+        renorm: bool,
+    ) -> Result<(ExecutionTensor, ExecutionTensor), EngError> {
+        self.context.router_topk(probs, experts, top_k, renorm)
     }
 
     /// The gdn_post fused kernel: gated RMS norm and output gate.

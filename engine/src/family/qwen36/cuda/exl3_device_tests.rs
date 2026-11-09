@@ -136,11 +136,19 @@ fn capture(
             geometry,
             table,
             weights,
-            views: MixerViews::new(&plan, &arena, &geometry, options.layout, options.kv_mode)?,
+            views: MixerViews::new(
+                &plan,
+                &arena,
+                &geometry,
+                options.layout,
+                options.kv_mode,
+                false,
+            )?,
             layout: options.layout,
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         },
     )?;
     // Match the existing native block rig: initialized params and run_block, no invented
@@ -153,6 +161,7 @@ fn capture(
             resid,
             admit_pos: 0,
         },
+        None,
     ) {
         state.poison();
         stream.synchronize().map_err(|sync| {

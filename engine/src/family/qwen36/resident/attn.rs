@@ -558,22 +558,30 @@ pub(super) fn step(
     cache: KvCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
     check_cache(shape, &cache, pos)?;
     // The compile seam replaces the projections, the q/gate split, and the q/k norms of the
     // head with one compiled closure (B = 1 only); everything position- or length-dependent
     // stays eager. The batched path (`batch::step_rows`) never compiles.
     if super::compiled::step_requested(ctx.compile) {
-        return step_compiled(ctx, shape, w, cache, pos, x);
+        return step_compiled(ctx, shape, w, cache, pos, x, in_norm);
     }
+    // The folded input norm: the same op the step loop used to run, relocated inside the block
+    // so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // 1. The dense projections of the step: every one reads its weight in full
     // for one row, so the batched path (`batch::step_rows`) meets these three
     // weights in ONE qmm over `[B, hidden]` and only the core stays per slot.
-    let qp = linear(ctx, &w.q, x)?;
-    let kp = linear(ctx, &w.k, x)?;
-    let vp = linear(ctx, &w.v, x)?;
+    let qp = linear(ctx, &w.q, &normed)?;
+    let kp = linear(ctx, &w.k, &normed)?;
+    let vp = linear(ctx, &w.v, &normed)?;
     let (o, cache) = step_projected(ctx, shape, w, cache, pos, [&qp, &kp, &vp])?;
-    let out = linear(ctx, &w.o, &o)?;
+    let mixed = linear(ctx, &w.o, &o)?;
+    // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
+    let out = ctx
+        .kernels
+        .binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(AttnStep { out, cache })
 }
 
@@ -589,8 +597,9 @@ fn step_compiled(
     cache: KvCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<AttnStep, EngError> {
-    let pre = super::compiled::attn_pre_step(ctx, shape, w, x)?;
+    let pre = super::compiled::attn_pre_step(ctx, shape, w, x, in_norm)?;
     let a = &shape.attn;
     let rope = RopeSpec {
         dims: dim(a.rotary_dim)?,
@@ -601,7 +610,9 @@ fn step_compiled(
     let q = ctx.kernels.rope_scaled(&pre.q, &rope)?;
     let k_new = ctx.kernels.rope_scaled(&pre.k, &rope)?;
     let (att, cache) = step_tail_to_att(ctx, shape, cache, pos, &q, &k_new, &pre.v)?;
-    let out = super::compiled::attn_post_step(ctx, shape, w, &att, &pre.gate)?;
+    // The post closure folds the output residual add: its `out` is the residual sum `x +
+    // mixed`, the same mlx_add the eager path runs after the output projection.
+    let out = super::compiled::attn_post_step(ctx, shape, w, &att, &pre.gate, x)?;
     Ok(AttnStep { out, cache })
 }
 
@@ -803,6 +814,7 @@ pub(super) fn concat_step(
     cache: &ConcatCache,
     pos: u32,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, ConcatCache), EngError> {
     let a = &shape.attn;
     let (heads, kv_heads, width) = (dim(a.heads_q)?, dim(a.heads_kv)?, dim(a.head_dim)?);
@@ -826,8 +838,10 @@ pub(super) fn concat_step(
         scale: 1.0,
         offset: pos,
     };
+    // The folded input norm, matching `step`: x is the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // 1. Query and gate, interleaved per head.
-    let qp = linear(ctx, &w.q, x)?;
+    let qp = linear(ctx, &w.q, &normed)?;
     let qp = ctx.kernels.reshape(&qp, &[heads, pair])?;
     let q_raw = ctx.kernels.slice(&qp, &[0, 0], &[heads, width])?;
     let gate = ctx.kernels.slice(&qp, &[0, width], &[heads, pair])?;
@@ -836,13 +850,13 @@ pub(super) fn concat_step(
     let q = ctx.kernels.reshape(&q, &[1, heads, 1, width])?;
     let q = ctx.kernels.rope_scaled(&q, &rope)?;
     // 3. New key: norm and RoPE per key-value head.
-    let kp = linear(ctx, &w.k, x)?;
+    let kp = linear(ctx, &w.k, &normed)?;
     let kp = ctx.kernels.reshape(&kp, &[kv_heads, width])?;
     let k_new = ctx.kernels.rms_norm(&kp, &w.k_norm, shape.eps)?;
     let k_new = ctx.kernels.reshape(&k_new, &[1, kv_heads, 1, width])?;
     let k_new = ctx.kernels.rope_scaled(&k_new, &rope)?;
     // 4. New value.
-    let v_new = linear(ctx, &w.v, x)?;
+    let v_new = linear(ctx, &w.v, &normed)?;
     let v_new = ctx.kernels.reshape(&v_new, &[1, kv_heads, 1, width])?;
     let k_new = cast_to(ctx, &k_new, Dtype::F32)?;
     let v_new = cast_to(ctx, &v_new, Dtype::F32)?;
@@ -864,7 +878,9 @@ pub(super) fn concat_step(
     let gate = ctx.kernels.unary(UnaryOp::Sigmoid, &gate)?;
     let o = ctx.kernels.binary(BinaryOp::Mul, &att, &gate)?;
     let o = to_act(ctx, &o)?;
-    let out = linear(ctx, &w.o, &o)?;
+    let mixed = linear(ctx, &w.o, &o)?;
+    // The folded output residual, matching `step`.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &mixed)?;
     Ok((
         out,
         ConcatCache {
@@ -1042,9 +1058,14 @@ mod tests {
         let mut vals: Vec<Vec<f32>> = Vec::new();
         for n in 0..9u32 {
             let x = input(n);
-            let want = host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &x).unwrap();
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let normed_x = rms_plain(&x, view.layers[1].input_norm, shape.eps).unwrap();
+            let want =
+                host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
             let mut key = Vec::new();
-            let kp = cpu.linear(host_w.k, &x).unwrap();
+            let kp = cpu.linear(host_w.k, &normed_x).unwrap();
             for g in 0..hkv {
                 let mut head =
                     rms_plain(&kp[g * hd..(g + 1) * hd], host_w.k_norm, shape.eps).unwrap();
@@ -1052,15 +1073,24 @@ mod tests {
                 key.extend(head);
             }
             keys.push(key);
-            vals.push(cpu.linear(host_w.v, &x).unwrap());
+            vals.push(cpu.linear(host_w.v, &normed_x).unwrap());
             let xr = upload(&mut kernels, &x);
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let t = n as usize + 1;
             // The cache arithmetic: one growth every three positions.
             let want_cap = [3, 3, 3, 6, 6, 6, 9, 9, 9][n as usize];
@@ -1204,7 +1234,15 @@ mod tests {
         };
         // The cache error must precede even the projection's bad input-width error.
         let short = upload(ctx.kernels, &[0.0]);
-        let wrong_len = step(&mut ctx, &shape, rw, KvCache::empty(), 3, &short);
+        let wrong_len = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::empty(),
+            3,
+            &short,
+            &w.layers[1].input_norm,
+        );
         assert!(
             matches!(&wrong_len, Err(EngError::BadRequest(m)) if m.contains("cache holds 0 positions")),
             "{:?}",
@@ -1226,7 +1264,7 @@ mod tests {
             cap: 1,
             step: 3,
         };
-        let wrong_shape = step(&mut ctx, &shape, rw, bad, 1, &xr);
+        let wrong_shape = step(&mut ctx, &shape, rw, bad, 1, &xr, &w.layers[1].input_norm);
         assert!(
             matches!(&wrong_shape, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "{:?}",
@@ -1250,7 +1288,7 @@ mod tests {
             cap: 1,
             step: 3,
         };
-        let wrong_cap = step(&mut ctx, &shape, rw, bad, 2, &xr);
+        let wrong_cap = step(&mut ctx, &shape, rw, bad, 2, &xr, &w.layers[1].input_norm);
         assert!(
             matches!(&wrong_cap, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "{:?}",
@@ -1265,9 +1303,11 @@ mod tests {
         cpu: &mut CpuProjector<'_>,
         shape: &HostShape,
         host_w: &AttnW<'_, StoredWeight>,
+        input_norm: &[f32],
         n: u32,
     ) -> (Vec<f32>, Vec<f32>) {
-        let x = input(n);
+        // The seam folds the input norm, so the reference rows project the NORMED input.
+        let x = rms_plain(&input(n), input_norm, shape.eps).unwrap();
         let kp = cpu.linear(host_w.k, &x).unwrap();
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
         let mut key = Vec::new();
@@ -1313,7 +1353,7 @@ mod tests {
         let mut keys: Vec<Vec<f32>> = Vec::new();
         let mut vals: Vec<Vec<f32>> = Vec::new();
         for n in 0..200u32 {
-            let (key, val) = host_kv_rows(&mut cpu, &shape, host_w, n);
+            let (key, val) = host_kv_rows(&mut cpu, &shape, host_w, view.layers[1].input_norm, n);
             keys.push(key);
             vals.push(val);
         }
@@ -1324,7 +1364,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let first = step(&mut ctx, &shape, rw, KvCache::with_step(65_536), 0, &warm).unwrap();
+        let first = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::with_step(65_536),
+            0,
+            &warm,
+            &w.layers[1].input_norm,
+        )
+        .unwrap();
         let (first_k, first_v) = f32_pair(&first.cache);
         kernels.evaluate(&[&first.out, first_k, first_v]).unwrap();
         let mut cache = first.cache;
@@ -1337,7 +1386,7 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             if n % 8 == 7 {
                 let (k_buf, v_buf) = f32_pair(&next.cache);
                 kernels.evaluate(&[&next.out, k_buf, v_buf]).unwrap();
@@ -1415,6 +1464,7 @@ mod tests {
             KvCache::with_form(KvDtype::Q8, 65_536),
             0,
             &warm,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let mut parts = vec![&first.out];
@@ -1430,7 +1480,7 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             if n % 8 == 7 {
                 let mut parts = vec![&next.out];
                 parts.extend(next.cache.tensors());
@@ -1516,6 +1566,7 @@ mod tests {
                 std::mem::replace(&mut f32_cache, KvCache::with_step(4)),
                 n,
                 &xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             f32_cache = control.cache;
@@ -1526,6 +1577,7 @@ mod tests {
                 std::mem::replace(&mut q8_cache, KvCache::with_form(KvDtype::Q8, 4)),
                 n,
                 &xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             q8_cache = quantized.cache;
@@ -1607,8 +1659,28 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
-            q8_cache = step(&mut ctx, &shape, rw, q8_cache, n, &xr).unwrap().cache;
+            f32_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                f32_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
+            q8_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                q8_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
         }
         let mut swapped_keys = q8_cache.share();
         let Some(KvBuffers::Q8 { k, .. }) = swapped_keys.buffers.as_mut() else {
@@ -1628,7 +1700,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let out = step(&mut ctx, &shape, rw, cache, 7, &last).unwrap().out;
+            let out = step(
+                &mut ctx,
+                &shape,
+                rw,
+                cache,
+                7,
+                &last,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .out;
             outputs.push(values(&mut kernels, &out).unwrap());
         }
         let gap = |a: &[f32], b: &[f32]| {
@@ -1684,6 +1766,7 @@ mod tests {
                 std::mem::replace(&mut small, KvCache::with_form(KvDtype::Q8, 3)),
                 n as u32,
                 xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             small = from_small.cache;
@@ -1699,6 +1782,7 @@ mod tests {
                 std::mem::replace(&mut large, KvCache::with_form(KvDtype::Q8, 65_536)),
                 n as u32,
                 xr,
+                &w.layers[1].input_norm,
             )
             .unwrap();
             large = from_large.cache;
@@ -1745,7 +1829,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
             let logical = kv_plan::logical_bytes(cache.len, growth).unwrap();
             assert_eq!(
                 cache.byte_len(),
@@ -1786,6 +1872,7 @@ mod tests {
             KvCache::with_form(KvDtype::F32, 4),
             0,
             &xr,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let quantized = step(
@@ -1795,11 +1882,20 @@ mod tests {
             KvCache::with_form(KvDtype::Q8, 4),
             0,
             &xr,
+            &w.layers[1].input_norm,
         )
         .unwrap();
         let mut f32_as_q8 = control.cache;
         f32_as_q8.kv = KvDtype::Q8;
-        let refused = step(&mut ctx, &shape, rw, f32_as_q8, 1, &xr);
+        let refused = step(
+            &mut ctx,
+            &shape,
+            rw,
+            f32_as_q8,
+            1,
+            &xr,
+            &w.layers[1].input_norm,
+        );
         assert!(
             matches!(&refused, Err(EngError::BadRequest(m)) if m.contains("does not match its shape")),
             "F32 buffers under a cache that declares the Q8 form: {:?}",
@@ -1841,7 +1937,16 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n as u32, xr).unwrap();
+            let next = step(
+                &mut ctx,
+                &shape,
+                rw,
+                cache,
+                n as u32,
+                xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 kernels.qualification_sync_count(),
                 before,
@@ -1875,7 +1980,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let next = step(&mut ctx, &shape, rw, KvCache::empty(), 0, &xr).unwrap();
+        let next = step(
+            &mut ctx,
+            &shape,
+            rw,
+            KvCache::empty(),
+            0,
+            &xr,
+            &w.layers[1].input_norm,
+        )
+        .unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),
             before,

@@ -1,0 +1,1062 @@
+{
+  "schema": 1,
+  "hardware": "RTX 3060 12 GB + RTX 3080 10 GB, peer access enabled",
+  "model": "Qwen3.6-35B-A3B Q4_K_M GGUF, q8 KV",
+  "prefill_method": "prompt tokens divided by wall time to the complete short reply; includes request overhead and output",
+  "limitations": [
+    "The night prefill arms use different engine builds and in some cases different host-expert placements; they are not a controlled same-binary comparison.",
+    "The night SSE decode script counts non-empty content chunks, not output tokens; its rates are excluded.",
+    "A configured context limit is not a prompt processed at that depth.",
+    "The near-128k response reached the total context limit; its checker verified only the first five requested numbers.",
+    "Device logs record the test output but do not include a binary hash; re-run the proposed exact source tip before qualification. The earlier peer-session failure reported peer access unavailable; later sliced-engine peer-session tests passed."
+  ],
+  "night_prefill_records": [
+    {
+      "file": "baseline-prefill-524.json",
+      "sha256": "dedcceb5756695b55525c8d932510cee23d5aeac0162602595153cb16e81c367",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.031245,
+            "estimated_prompt_tokens_per_second": 32.686,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.014412,
+            "estimated_prompt_tokens_per_second": 32.721,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 16.012291,
+            "estimated_prompt_tokens_per_second": 32.725,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 16.014412,
+        "median_prompt_tokens_per_second": 32.721
+      }
+    },
+    {
+      "file": "fused-prefill-524.json",
+      "sha256": "a4d8b8c3b30dda1620a9f4d6bbbee0d5c45cf44e587e6b7fe704774e8c076669",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.287151,
+            "estimated_prompt_tokens_per_second": 34.277,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.24983,
+            "estimated_prompt_tokens_per_second": 34.361,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 15.242944,
+            "estimated_prompt_tokens_per_second": 34.377,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 15.24983,
+        "median_prompt_tokens_per_second": 34.361
+      }
+    },
+    {
+      "file": "combined-prefill-524.json",
+      "sha256": "2d27ba02be8d636efda864c6663958d91992fac6e5b03f2bb7860d8633b35930",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30501,
+            "estimated_prompt_tokens_per_second": 39.384,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000001"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.183093,
+            "estimated_prompt_tokens_per_second": 39.748,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.30754,
+            "estimated_prompt_tokens_per_second": 39.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          }
+        ],
+        "median_seconds": 13.30501,
+        "median_prompt_tokens_per_second": 39.384
+      }
+    },
+    {
+      "file": "combined-prefill-4274.json",
+      "sha256": "7cd6bc37efa4cb3f37b9b1f78d421d866ffa4be24e1f3703aa2b2a29478842ec",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 850,
+        "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+        "samples": [
+          {
+            "prompt_tokens": 4274,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 105.979762,
+            "estimated_prompt_tokens_per_second": 40.328,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000008"
+          }
+        ],
+        "median_seconds": 105.979762,
+        "median_prompt_tokens_per_second": 40.328
+      }
+    },
+    {
+      "file": "waterfill2-prefill-524.json",
+      "sha256": "42f4c01719b8db81ded7c335f6a46183e252e84e3bd27773ecf4862a4e4fc984",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.009553,
+            "estimated_prompt_tokens_per_second": 40.278,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.990074,
+            "estimated_prompt_tokens_per_second": 40.338,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.977869,
+            "estimated_prompt_tokens_per_second": 40.376,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 12.990074,
+        "median_prompt_tokens_per_second": 40.338
+      }
+    },
+    {
+      "file": "sliced-prefill-524.json",
+      "sha256": "f4fe7c1ec52651695fd971dcdd97372c72afa95fd252a151a09749bf3b654ecb",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.013059,
+            "estimated_prompt_tokens_per_second": 40.267,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000002"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.004244,
+            "estimated_prompt_tokens_per_second": 40.295,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.00082,
+            "estimated_prompt_tokens_per_second": 40.305,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          }
+        ],
+        "median_seconds": 13.004244,
+        "median_prompt_tokens_per_second": 40.295
+      }
+    }
+  ],
+  "near_128k_server_telemetry": {
+    "file": "near-128k-server-evidence.json",
+    "sha256": "f6b47a951e1a83064cce5a776300db4c62a8e5d23cab23269ee10e7e36650f1d",
+    "data": {
+      "source": "systemd user-engine request log",
+      "engine_pid": "350093",
+      "engine_executable": "/home/ben/fifi-scratch/7f9c3ee80929/ring-fuse-moe/target/release/enginesrv",
+      "message": {
+        "request_id": "chatcmpl-0000000000000001",
+        "status": 200,
+        "outcome": "ok",
+        "finish_reason": "length",
+        "prompt_tokens": 130981,
+        "completion_tokens": 91,
+        "reused_tokens": 0,
+        "time_to_first_token_ms": 3736681.5,
+        "decode_tokens_per_second": 29.96
+      },
+      "limitation": "This was a separate fusion build, not the exact upstream PR binary. The response was cut short by the 131072-token total context. A separate script checked only the first five counted numbers, not the complete requested output."
+    }
+  },
+  "excluded_mislabeled_256k_file": {
+    "reason": "Every sample records context_limit 131072 despite the file name.",
+    "record": {
+      "file": "sliced-256k-prefill-524.json",
+      "sha256": "8b45b0252fbcb920603550b65c030304b3b5acc024deb2736af4dd186f8c263b",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.701389,
+            "estimated_prompt_tokens_per_second": 41.255,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000003"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.71783,
+            "estimated_prompt_tokens_per_second": 41.202,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000004"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 12.635255,
+            "estimated_prompt_tokens_per_second": 41.471,
+            "context_limit": 131072,
+            "request_id": "chatcmpl-0000000000000005"
+          }
+        ],
+        "median_seconds": 12.701389,
+        "median_prompt_tokens_per_second": 41.255
+      }
+    }
+  },
+  "live_262144_observation": {
+    "source_commit": "5d97e11c1ca147b6e0d4844db77b0787fa6b4f59",
+    "engine_tree": "5f401c41fb38b4c1fdaaabbaa53a3e178311eed1",
+    "engine_sha256": "1c8fb928aa4d028eac0b9617f6fcedc138c460a1a8b40f8e3648d144a1e84914",
+    "config_sha256": "4e9fd69117cb3785937e3e08105500b4e0a04a66a2fba5da8e21a9b622022c81",
+    "summary": {
+      "file": "live-summary.json",
+      "sha256": "c5ff20caaf10a3b675abb8f9529fe06cc28c24bfb5e18fad054cb3bfbffccba6",
+      "data": {
+        "context_limit": 262144,
+        "prefill_median_tokens_per_second": 40.164,
+        "decode_median_tokens_per_second": 38.44,
+        "monitor_samples": 53,
+        "monitor_problem_count": 0,
+        "unrelated_main_requests": 0,
+        "secondary_requests": 0,
+        "valid_without_observed_contention": true,
+        "limitations": [
+          "Live-service observation, not an A/B comparison; a second idle engine remained loaded.",
+          "GPU utilization sampling can miss short bursts and does not prove exclusive CPU access.",
+          "The context was configured to 262144 but the benchmark did not fill it."
+        ]
+      }
+    },
+    "prefill": {
+      "file": "live-prefill.json",
+      "sha256": "284e9dbe0044fa4f306de8b076cfbfaa28bb6bdd5bdb3fa38df245cd8205840e",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 100,
+        "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+        "samples": [
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.064099,
+            "estimated_prompt_tokens_per_second": 40.11,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-0000000000000008"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.013768,
+            "estimated_prompt_tokens_per_second": 40.265,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-0000000000000009"
+          },
+          {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "answer": "4",
+            "seconds": 13.046466,
+            "estimated_prompt_tokens_per_second": 40.164,
+            "context_limit": 262144,
+            "request_id": "chatcmpl-000000000000000a"
+          }
+        ],
+        "median_seconds": 13.046466,
+        "median_prompt_tokens_per_second": 40.164
+      }
+    },
+    "decode": {
+      "file": "live-decode.json",
+      "sha256": "2f4f72f80ac75d19e7bc21d095d05f281ddada1e106d339a8dc904614b158719",
+      "data": {
+        "model": "fifi-q36",
+        "repeat": 0,
+        "payload_sha256": "bacd82b581ce7dd5cb38dde1bb3004787b2327dab7ae6d4d6b3d25a6df747f3e",
+        "samples": [
+          {
+            "request_id": "chatcmpl-000000000000000b",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 794.5,
+            "decode_tokens_per_second": 38.44,
+            "total_seconds": 4.100397
+          },
+          {
+            "request_id": "chatcmpl-000000000000000c",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 795.4,
+            "decode_tokens_per_second": 38.34,
+            "total_seconds": 4.109114
+          },
+          {
+            "request_id": "chatcmpl-000000000000000d",
+            "prompt_tokens": 31,
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "answer_sha256": "ef5d7dd6bee907301e7cdb774195e953c37a82af6e8bde4afacc7b1ed065113b",
+            "answer_prefix": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30",
+            "time_to_first_token_ms": 794.0,
+            "decode_tokens_per_second": 38.55,
+            "total_seconds": 4.089609
+          }
+        ],
+        "median_decode_tokens_per_second": 38.44
+      }
+    },
+    "monitor": {
+      "sha256": "96fbbb5f96bc208053bba6d9963e58d39cb062e77ad41c0a2d71f7d40cffc14c",
+      "samples": [
+        {
+          "monotonic": 37895.356818012,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 0,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 0
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37896.445630565,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 0,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 0
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37897.536428991,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 0,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 0
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37898.631057371,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 89,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37899.726757308,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37900.814442381,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37901.89762044,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37902.987939314,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37904.072562374,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37905.158855844,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37906.244482792,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37907.332844904,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37908.422362723,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37909.510289716,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37910.592045827,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37911.677074927,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37912.769265784,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37913.875016203,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37914.965768134,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37916.053409997,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37917.142768759,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37918.227598524,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37919.314610898,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37920.400839045,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37921.488127618,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37922.577978284,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37923.662700258,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37924.743111391,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37925.82803403,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37926.921072565,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37928.018924504,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37929.105413154,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37930.194329221,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37931.283514123,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37932.369339019,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37933.452122348,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37934.541969146,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37935.633181261,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 91,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37936.71893756,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 21,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 15
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37937.805874483,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 87,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37938.894062687,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 87,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 94
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37939.979071751,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 87,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37941.071153982,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 88,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37942.161311548,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 94
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37943.256036517,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 87,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 94
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37944.343970579,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 88,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 94
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37945.422490015,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 62,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 78
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37946.508110322,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 90,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 96
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37947.598720566,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 89,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37948.687985122,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 87,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 95
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37949.76360749,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 56,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 73
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37950.84025683,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 0,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 0
+          },
+          "builds": []
+        },
+        {
+          "monotonic": 37951.917478543,
+          "gpu": {
+            "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0,
+            "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 0,
+            "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 0
+          },
+          "builds": []
+        }
+      ]
+    },
+    "server_telemetry": {
+      "sha256": "1250e6bb1abf7e35434a3dd41ff7e8ed55e58b3fb38a03c540d3b858687f77e0",
+      "requests": [
+        {
+          "request_id": "chatcmpl-0000000000000008",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "stop",
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 13035.7,
+          "decode_tokens_per_second": 38.45,
+          "prompt_hash_1024": "4a0f6c655d68e95a",
+          "prompt_hash_4096": "4a0f6c655d68e95a",
+          "prompt_hash_full": "4a0f6c655d68e95a",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 3
+        },
+        {
+          "request_id": "chatcmpl-0000000000000009",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "stop",
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 12985.8,
+          "decode_tokens_per_second": 38.85,
+          "prompt_hash_1024": "4a0f6c655d68e95a",
+          "prompt_hash_4096": "4a0f6c655d68e95a",
+          "prompt_hash_full": "4a0f6c655d68e95a",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 524
+        },
+        {
+          "request_id": "chatcmpl-000000000000000a",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "stop",
+          "prompt_tokens": 524,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 13018.4,
+          "decode_tokens_per_second": 38.4,
+          "prompt_hash_1024": "4a0f6c655d68e95a",
+          "prompt_hash_4096": "4a0f6c655d68e95a",
+          "prompt_hash_full": "4a0f6c655d68e95a",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 524
+        },
+        {
+          "request_id": "chatcmpl-000000000000000b",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "length",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 794.5,
+          "decode_tokens_per_second": 38.44,
+          "prompt_hash_1024": "ee019cb1b3d8fdc8",
+          "prompt_hash_4096": "ee019cb1b3d8fdc8",
+          "prompt_hash_full": "ee019cb1b3d8fdc8",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 3
+        },
+        {
+          "request_id": "chatcmpl-000000000000000c",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "length",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 795.4,
+          "decode_tokens_per_second": 38.34,
+          "prompt_hash_1024": "ee019cb1b3d8fdc8",
+          "prompt_hash_4096": "ee019cb1b3d8fdc8",
+          "prompt_hash_full": "ee019cb1b3d8fdc8",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 31
+        },
+        {
+          "request_id": "chatcmpl-000000000000000d",
+          "method": "POST",
+          "endpoint": "/v1/chat/completions",
+          "model": "fifi-q36",
+          "stream": false,
+          "status": 200,
+          "outcome": "ok",
+          "error_code": null,
+          "finish_reason": "length",
+          "prompt_tokens": 31,
+          "completion_tokens": 128,
+          "reused_tokens": 0,
+          "queue_wait_ms": null,
+          "time_to_first_token_ms": 794.0,
+          "decode_tokens_per_second": 38.55,
+          "prompt_hash_1024": "ee019cb1b3d8fdc8",
+          "prompt_hash_4096": "ee019cb1b3d8fdc8",
+          "prompt_hash_full": "ee019cb1b3d8fdc8",
+          "prompt_hash_anchors": [],
+          "lcp_prev_request_tokens": 31
+        }
+      ]
+    }
+  },
+  "device_test_logs": [
+    {
+      "file": "device-parity-tests.log",
+      "sha256": "8e8a8292732c189947b8d75ca545a9010df7898b5a0f64f8e792d06a6d96f5b0",
+      "output": "\nrunning 11 tests\ntest family::qwen36::cuda::card_attn_device_tests::a_poisoned_v_gather_stops_the_session_before_the_append ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::kv_f16_append_refuses_shapes_the_kernel_rejects ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_append_successive_tokens ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_f16_append_matches_the_fused_cache ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_prep_gather_and_append_the_full_kv_row ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_block_device_tests::a_deltanet_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_deltanet_block_runs_distributed_and_matches_the_reference: 3 tokens, heads 16+16, conv channels 6144\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 DeltaCore max |diff| = 0.000e0 (bound 4.348e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 conv state max |diff| = 0.000e0 (bound 3.728e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 recurrent state max |diff| = 0.000e0 (bound 6.294e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 DeltaCore max |diff| = 0.000e0 (bound 4.470e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 conv state max |diff| = 0.000e0 (bound 3.647e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 recurrent state max |diff| = 0.000e0 (bound 5.997e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 0 card 0 MixOut max |diff| = 4.470e-8 (bound 1.000e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 0 card 1 MixOut max |diff| = 4.470e-8 (bound 1.000e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 1 card 0 MixOut max |diff| = 6.104e-5 (bound 4.303e-1)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 1 card 1 MixOut max |diff| = 6.104e-5 (bound 4.303e-1)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 2 card 0 MixOut max |diff| = 2.441e-4 (bound 1.550e0)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 2 card 1 MixOut max |diff| = 2.441e-4 (bound 1.550e0)\nok\ntest family::qwen36::cuda::card_block_device_tests::a_full_attention_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 K codes: 0 differing bytes, ranges [] of 4096\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 K scales: 0 differing bytes, ranges [] of 256\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 V codes: 0 differing bytes, ranges [] of 4096\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 V scales: 0 differing bytes, ranges [] of 256\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 K codes: 0 differing bytes, ranges [] of 4096\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 K scales: 0 differing bytes, ranges [] of 256\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 V codes: 0 differing bytes, ranges [] of 4096\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 V scales: 0 differing bytes, ranges [] of 256\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 AttnCore max |diff| = 0.000e0 over 2048 values\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 AttnCore max |diff| = 0.000e0 over 2048 values\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 MixOut max |diff| = 9.537e-7 (bound 7.560e-3, reference peak 7.5598297)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 resid max |diff| = 9.537e-7 (bound 7.507e-3)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 MixOut max |diff| = 9.537e-7 (bound 7.560e-3, reference peak 7.5598297)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 resid max |diff| = 9.537e-7 (bound 7.507e-3)\nok\ntest family::qwen36::cuda::card_block_device_tests::a_real_gguf_file_loads_the_distributed_block ... CUDA devices visible: 2\na_real_gguf_file_loads_the_distributed_block: card 0 MixOut max |diff| = 9.537e-7 (bound 7.560e-3)\na_real_gguf_file_loads_the_distributed_block: card 0 resid max |diff| = 9.537e-7 (bound 7.507e-3)\na_real_gguf_file_loads_the_distributed_block: card 1 MixOut max |diff| = 9.537e-7 (bound 7.560e-3)\na_real_gguf_file_loads_the_distributed_block: card 1 resid max |diff| = 9.537e-7 (bound 7.507e-3)\nok\ntest family::qwen36::cuda::card_moe_device_tests::a_moe_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 0 expert_down diff 1.490e-8 bound 1.622e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 1 expert_down diff 1.490e-8 bound 1.588e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 2 expert_down diff 2.980e-8 bound 1.623e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 3 expert_down diff 2.980e-8 bound 1.739e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 4 expert_down diff 2.980e-8 bound 1.685e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 5 expert_down diff 2.980e-8 bound 1.885e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 6 expert_down diff 1.490e-8 bound 1.604e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 7 expert_down diff 1.490e-8 bound 1.564e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 shared_out diff 1.490e-8 bound 1.664e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 resid_out diff 5.960e-8 bound 4.412e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 0 expert_down diff 1.490e-8 bound 1.622e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 1 expert_down diff 1.490e-8 bound 1.588e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 2 expert_down diff 2.980e-8 bound 1.623e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 3 expert_down diff 2.980e-8 bound 1.739e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 4 expert_down diff 2.980e-8 bound 1.685e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 5 expert_down diff 2.980e-8 bound 1.885e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 6 expert_down diff 1.490e-8 bound 1.604e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 7 expert_down diff 1.490e-8 bound 1.564e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 shared_out diff 1.490e-8 bound 1.664e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 resid_out diff 5.960e-8 bound 4.412e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 resid_out cross-card diff 0.000e0\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 0 expert_down diff 3.725e-9 bound 2.762e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 1 expert_down diff 3.725e-9 bound 3.550e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 2 expert_down diff 3.725e-9 bound 4.294e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 3 expert_down diff 3.725e-9 bound 3.312e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 4 expert_down diff 3.725e-9 bound 3.692e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 5 expert_down diff 3.725e-9 bound 3.534e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 6 expert_down diff 3.725e-9 bound 3.921e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 7 expert_down diff 3.725e-9 bound 4.290e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 shared_out diff 1.863e-9 bound 2.973e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 resid_out diff 1.490e-8 bound 2.697e-4\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 0 expert_down diff 3.725e-9 bound 2.762e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 1 expert_down diff 3.725e-9 bound 3.550e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 2 expert_down diff 3.725e-9 bound 4.294e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 3 expert_down diff 3.725e-9 bound 3.312e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 4 expert_down diff 3.725e-9 bound 3.692e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 5 expert_down diff 3.725e-9 bound 3.534e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 6 expert_down diff 3.725e-9 bound 3.921e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 7 expert_down diff 3.725e-9 bound 4.290e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 shared_out diff 1.863e-9 bound 2.973e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 resid_out diff 1.490e-8 bound 2.697e-4\na_moe_block_runs_distributed_and_matches_the_reference: t1 resid_out cross-card diff 0.000e0\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 0 expert_down diff 1.863e-9 bound 1.767e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 1 expert_down diff 1.863e-9 bound 1.708e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 2 expert_down diff 3.725e-9 bound 2.166e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 3 expert_down diff 1.863e-9 bound 1.809e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 4 expert_down diff 1.164e-9 bound 1.003e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 5 expert_down diff 1.397e-9 bound 9.795e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 6 expert_down diff 1.863e-9 bound 1.481e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 7 expert_down diff 9.313e-10 bound 8.867e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 shared_out diff 1.863e-9 bound 1.510e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 resid_out diff 1.490e-8 bound 2.585e-4\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 0 expert_down diff 1.863e-9 bound 1.767e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 1 expert_down diff 1.863e-9 bound 1.708e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 2 expert_down diff 3.725e-9 bound 2.166e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 3 expert_down diff 1.863e-9 bound 1.809e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 4 expert_down diff 1.164e-9 bound 1.003e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 5 expert_down diff 1.397e-9 bound 9.795e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 6 expert_down diff 1.863e-9 bound 1.481e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 7 expert_down diff 9.313e-10 bound 8.867e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 shared_out diff 1.863e-9 bound 1.510e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 resid_out diff 1.490e-8 bound 2.585e-4\na_moe_block_runs_distributed_and_matches_the_reference: t2 resid_out cross-card diff 0.000e0\nok\ntest family::qwen36::cuda::card_token_device_tests::a_whole_40_layer_model_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_token_device_tests::a_whole_token_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\nok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 5775 filtered out; finished in 17.49s\n\n"
+    },
+    {
+      "file": "device-session-test.log",
+      "sha256": "645a2f14eca984f46c690d2ee04a07ace2ee5abc1111369713947cad0d2a48b5",
+      "output": "\nrunning 2 tests\ntest family::qwen36::cuda::card_session_device_tests::a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf ... CUDA devices visible: 2\na_card_session_feeds_logits_folds_and_resets_over_a_real_gguf: greedy gap after 3 tokens: 2.578 (runner 34.885, best 37.462)\nok\ntest family::qwen36::cuda::card_session_device_tests::prefill_without_head_matches_normal_logits_on_peer_gpus ... CUDA devices visible: 2\n\nthread 'family::qwen36::cuda::card_session_device_tests::prefill_without_head_matches_normal_logits_on_peer_gpus' (264494) panicked at src/family/qwen36/cuda/card_session_device_tests.rs:94:58:\npeer access: \"device 0 cannot directly access device 1 (peer access off, IOMMU not in pass-through, or BAR1 too small)\"\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    family::qwen36::cuda::card_session_device_tests::prefill_without_head_matches_normal_logits_on_peer_gpus\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 5784 filtered out; finished in 11.29s\n\n"
+    },
+    {
+      "file": "kv-slice-rigs3.log",
+      "sha256": "64b89bed5c1fbbfe914231f29e03f07e53254c09287b665864172fd1af899fe9",
+      "output": "\nrunning 11 tests\ntest family::qwen36::cuda::card_attn_device_tests::a_poisoned_v_gather_stops_the_session_before_the_append ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::kv_f16_append_refuses_shapes_the_kernel_rejects ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_append_successive_tokens ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_f16_append_matches_the_fused_cache ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_attn_device_tests::two_contexts_prep_gather_and_append_the_full_kv_row ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_block_device_tests::a_deltanet_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_deltanet_block_runs_distributed_and_matches_the_reference: 3 tokens, heads 16+16, conv channels 6144\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 DeltaCore max |diff| = 0.000e0 (bound 4.348e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 conv state max |diff| = 0.000e0 (bound 3.728e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 0 recurrent state max |diff| = 0.000e0 (bound 6.294e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 DeltaCore max |diff| = 0.000e0 (bound 4.470e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 conv state max |diff| = 0.000e0 (bound 3.647e-2)\na_deltanet_block_runs_distributed_and_matches_the_reference: card 1 recurrent state max |diff| = 0.000e0 (bound 5.997e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 0 card 0 MixOut max |diff| = 5.960e-8 (bound 1.000e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 0 card 1 MixOut max |diff| = 5.960e-8 (bound 1.000e-3)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 1 card 0 MixOut max |diff| = 6.104e-5 (bound 4.303e-1)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 1 card 1 MixOut max |diff| = 6.104e-5 (bound 4.303e-1)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 2 card 0 MixOut max |diff| = 2.441e-4 (bound 1.550e0)\na_deltanet_block_runs_distributed_and_matches_the_reference: token 2 card 1 MixOut max |diff| = 2.441e-4 (bound 1.550e0)\nok\ntest family::qwen36::cuda::card_block_device_tests::a_full_attention_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 K codes: 0 differing bytes over the card's 8                  head slice (plane holds 2048 B, per head 256 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 K scales: 0 differing bytes over the card's 8                  head slice (plane holds 256 B, per head 16 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 V codes: 0 differing bytes over the card's 8                  head slice (plane holds 2048 B, per head 256 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 V scales: 0 differing bytes over the card's 8                  head slice (plane holds 256 B, per head 16 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 K codes: 0 differing bytes over the card's 8                  head slice (plane holds 2048 B, per head 256 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 K scales: 0 differing bytes over the card's 8                  head slice (plane holds 256 B, per head 16 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 V codes: 0 differing bytes over the card's 8                  head slice (plane holds 2048 B, per head 256 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 V scales: 0 differing bytes over the card's 8                  head slice (plane holds 256 B, per head 16 B)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 AttnCore max |diff| = 0.000e0 over 2048 values\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 AttnCore max |diff| = 0.000e0 over 2048 values\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 MixOut max |diff| = 9.537e-7 (bound 7.560e-3, reference peak 7.5598297)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 0 resid max |diff| = 9.537e-7 (bound 7.507e-3)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 MixOut max |diff| = 9.537e-7 (bound 7.560e-3, reference peak 7.5598297)\na_full_attention_block_runs_distributed_and_matches_the_reference: card 1 resid max |diff| = 9.537e-7 (bound 7.507e-3)\nok\ntest family::qwen36::cuda::card_block_device_tests::a_real_gguf_file_loads_the_distributed_block ... CUDA devices visible: 2\na_real_gguf_file_loads_the_distributed_block: card 0 MixOut max |diff| = 9.537e-7 (bound 7.560e-3)\na_real_gguf_file_loads_the_distributed_block: card 0 resid max |diff| = 9.537e-7 (bound 7.507e-3)\na_real_gguf_file_loads_the_distributed_block: card 1 MixOut max |diff| = 9.537e-7 (bound 7.560e-3)\na_real_gguf_file_loads_the_distributed_block: card 1 resid max |diff| = 9.537e-7 (bound 7.507e-3)\nok\ntest family::qwen36::cuda::card_moe_device_tests::a_moe_block_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 0 expert_down diff 1.490e-8 bound 1.622e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 1 expert_down diff 1.490e-8 bound 1.588e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 2 expert_down diff 1.490e-8 bound 1.623e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 3 expert_down diff 1.490e-8 bound 1.739e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 4 expert_down diff 2.980e-8 bound 1.685e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 5 expert_down diff 2.980e-8 bound 1.885e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 6 expert_down diff 1.490e-8 bound 1.604e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 slot 7 expert_down diff 1.490e-8 bound 1.564e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 shared_out diff 2.980e-8 bound 1.664e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 0 resid_out diff 2.980e-8 bound 4.412e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 0 expert_down diff 1.490e-8 bound 1.622e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 1 expert_down diff 1.490e-8 bound 1.588e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 2 expert_down diff 1.490e-8 bound 1.623e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 3 expert_down diff 1.490e-8 bound 1.739e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 4 expert_down diff 2.980e-8 bound 1.685e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 5 expert_down diff 2.980e-8 bound 1.885e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 6 expert_down diff 1.490e-8 bound 1.604e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 slot 7 expert_down diff 1.490e-8 bound 1.564e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 shared_out diff 2.980e-8 bound 1.664e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 card 1 resid_out diff 2.980e-8 bound 4.412e-4\na_moe_block_runs_distributed_and_matches_the_reference: t0 resid_out cross-card diff 0.000e0\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 0 expert_down diff 3.725e-9 bound 2.762e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 1 expert_down diff 3.725e-9 bound 3.550e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 2 expert_down diff 3.725e-9 bound 4.294e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 3 expert_down diff 3.725e-9 bound 3.312e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 4 expert_down diff 3.725e-9 bound 3.692e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 5 expert_down diff 3.725e-9 bound 3.534e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 6 expert_down diff 3.725e-9 bound 3.921e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 slot 7 expert_down diff 3.725e-9 bound 4.290e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 shared_out diff 3.725e-9 bound 2.973e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 0 resid_out diff 2.980e-8 bound 2.697e-4\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 0 expert_down diff 3.725e-9 bound 2.762e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 1 expert_down diff 3.725e-9 bound 3.550e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 2 expert_down diff 3.725e-9 bound 4.294e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 3 expert_down diff 3.725e-9 bound 3.312e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 4 expert_down diff 3.725e-9 bound 3.692e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 5 expert_down diff 3.725e-9 bound 3.534e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 6 expert_down diff 3.725e-9 bound 3.921e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 slot 7 expert_down diff 3.725e-9 bound 4.290e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 shared_out diff 3.725e-9 bound 2.973e-5\na_moe_block_runs_distributed_and_matches_the_reference: t1 card 1 resid_out diff 2.980e-8 bound 2.697e-4\na_moe_block_runs_distributed_and_matches_the_reference: t1 resid_out cross-card diff 0.000e0\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 0 expert_down diff 1.863e-9 bound 1.767e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 1 expert_down diff 1.863e-9 bound 1.708e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 2 expert_down diff 1.863e-9 bound 2.166e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 3 expert_down diff 1.863e-9 bound 1.809e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 4 expert_down diff 9.313e-10 bound 1.003e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 5 expert_down diff 1.397e-9 bound 9.795e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 6 expert_down diff 1.863e-9 bound 1.481e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 slot 7 expert_down diff 9.313e-10 bound 8.867e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 shared_out diff 1.863e-9 bound 1.510e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 0 resid_out diff 1.490e-8 bound 2.585e-4\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 0 expert_down diff 1.863e-9 bound 1.767e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 1 expert_down diff 1.863e-9 bound 1.708e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 2 expert_down diff 1.863e-9 bound 2.166e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 3 expert_down diff 1.863e-9 bound 1.809e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 4 expert_down diff 9.313e-10 bound 1.003e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 5 expert_down diff 1.397e-9 bound 9.795e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 6 expert_down diff 1.863e-9 bound 1.481e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 slot 7 expert_down diff 9.313e-10 bound 8.867e-6\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 shared_out diff 1.863e-9 bound 1.510e-5\na_moe_block_runs_distributed_and_matches_the_reference: t2 card 1 resid_out diff 1.490e-8 bound 2.585e-4\na_moe_block_runs_distributed_and_matches_the_reference: t2 resid_out cross-card diff 0.000e0\nok\ntest family::qwen36::cuda::card_token_device_tests::a_whole_40_layer_model_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\nok\ntest family::qwen36::cuda::card_token_device_tests::a_whole_token_runs_distributed_and_matches_the_reference ... CUDA devices visible: 2\nok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 5776 filtered out; finished in 61.59s\n\n"
+    },
+    {
+      "file": "kv-slice-session1.log",
+      "sha256": "141cda6c8d30c5acfb1471303bf4dc6d9d2126a88403d015f0205431c58c4ec5",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_session_device_tests::a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf ... CUDA devices visible: 2\na_card_session_feeds_logits_folds_and_resets_over_a_real_gguf: greedy gap after 3 tokens: 2.578 (runner 34.885, best 37.462)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5786 filtered out; finished in 38.17s\n\n"
+    },
+    {
+      "file": "kv-slice-session2.log",
+      "sha256": "fa9280f0614629674d4776583036a89452553c8fdfc0b8c2e821b75ebb7b55e2",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_session_device_tests::prefill_without_head_matches_normal_logits_on_peer_gpus ... CUDA devices visible: 2\nprefill_without_head_matches_normal_logits_on_peer_gpus: greedy gap after 3 tokens: 2.578 (runner 34.885, best 37.462)\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5786 filtered out; finished in 37.67s\n\n"
+    },
+    {
+      "file": "kv-slice-shards.log",
+      "sha256": "368499aafb45d4a3946a9c18d5ac6cf612a4e98fa9ffae4136f5afd055ab10ca",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_step::device_tests::two_logical_shards_own_their_plan_arenas_and_states ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5786 filtered out; finished in 1.41s\n\n"
+    }
+  ]
+}

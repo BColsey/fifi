@@ -209,6 +209,10 @@ unsafe extern "C" {
     fn pinned_alloc_raw(bytes: usize, out_host: *mut *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_pinned_free"]
     fn pinned_free_raw(host: *mut c_void, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_host_register"]
+    fn host_register_raw(host: *mut c_void, bytes: usize, out_stage: *mut c_int) -> c_int;
+    #[link_name = "inference_cuda_host_unregister"]
+    fn host_unregister_raw(host: *mut c_void, out_stage: *mut c_int) -> c_int;
     #[link_name = "inference_cuda_upload_pinned"]
     fn upload_pinned_raw(
         device: *mut c_void,
@@ -423,6 +427,26 @@ pub(in crate::kernels::cuda) fn pinned_free(pinned: RawPinned) -> Result<(), Dev
     checked(status, stage)
 }
 
+/// Page-locks `host`, memory the caller owns, so DMA to and from it needs no driver
+/// staging. The caller must call [`host_unregister`] with the same pointer before the
+/// memory is freed.
+pub(crate) fn host_register(host: &[u8]) -> Result<(), DeviceFailure> {
+    let mut stage = STAGE_NONE;
+    // SAFETY: `host` addresses `host.len()` initialized bytes for the whole call, and the
+    // caller keeps the allocation alive until the matching unregister.
+    let status =
+        unsafe { host_register_raw(host.as_ptr().cast_mut().cast(), host.len(), &mut stage) };
+    checked(status, stage)
+}
+
+/// Releases the page lock [`host_register`] took on `host`; no copy may be in flight.
+pub(crate) fn host_unregister(host: &[u8]) -> Result<(), DeviceFailure> {
+    let mut stage = STAGE_NONE;
+    // SAFETY: the caller guarantees the pointer was registered and no DMA touches it now.
+    let status = unsafe { host_unregister_raw(host.as_ptr().cast_mut().cast(), &mut stage) };
+    checked(status, stage)
+}
+
 /// Queues a copy of `src` into the pinned memory on `stream`. The copy has not
 /// finished when the call returns; read the memory only after an event
 /// recorded behind it has completed.
@@ -474,6 +498,35 @@ pub(in crate::kernels::cuda) fn copy_h2d_pageable(
         )
     };
     complete_pageable_copy(host, stream, checked(status, stage))
+}
+
+/// Enqueues a pageable-host slice into a device range behind earlier work on `stream` and
+/// returns without waiting for the copy. A pageable `cudaMemcpyAsync` consumes the source
+/// before it returns, so the caller's bytes may be reused as soon as this does; this is
+/// why it takes `&[u8]` and not the pinned [`RawPinned`] handle. Pinned sources must use
+/// [`copy_h2d_async_at`], whose contract covers the post-return DMA window.
+pub(in crate::kernels::cuda) fn copy_h2d_enqueue(
+    dst: RawRange<'_>,
+    host: &[u8],
+    stream: &RawStream,
+) -> Result<(), DeviceFailure> {
+    if host.len() != dst.bytes {
+        return Err(invalid_argument());
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: `RawRange::new` proved the range inside a live allocation. A pageable
+    // source is fully consumed before the call returns, so the slice need not outlive
+    // it; a pinned one would (see `copy_h2d_async_at`). `stream` is live for the call.
+    let status = unsafe {
+        copy_h2d_async_raw(
+            dst.address(),
+            host.as_ptr().cast(),
+            dst.bytes,
+            stream.0.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
 }
 
 /// Queues a pinned-host range into a device range. Both owners synchronize before free.

@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use super::driver::{TokenDevice, TokenDriver, TokenFeeds};
+use super::driver::StepperPositions;
 use crate::{
     EngError,
     family::{
@@ -39,15 +39,15 @@ pub(in crate::family::flash_next) struct CudaRules {
 }
 
 /// The executor of one Flash-Next model on a card. It lives on the engine thread.
-pub(in crate::family::flash_next) struct FlashCudaExecutor<D: TokenDevice, F: TokenFeeds> {
-    driver: TokenDriver<D, F>,
+pub(in crate::family::flash_next) struct FlashCudaExecutor<S: StepperPositions> {
+    driver: S,
     rules: CudaRules,
 }
 
-impl<D: TokenDevice, F: TokenFeeds> FlashCudaExecutor<D, F> {
+impl<S: StepperPositions> FlashCudaExecutor<S> {
     /// The executor and its first session. Refuses a sampler vocabulary of 0.
     pub(in crate::family::flash_next) fn new(
-        driver: TokenDriver<D, F>,
+        driver: S,
         rules: CudaRules,
     ) -> Result<(Self, DecodeSession)> {
         if rules.sampler_vocab == 0 {
@@ -64,7 +64,7 @@ impl<D: TokenDevice, F: TokenFeeds> FlashCudaExecutor<D, F> {
     }
 }
 
-impl<D: TokenDevice, F: TokenFeeds> ExecutorOps for FlashCudaExecutor<D, F> {
+impl<S: StepperPositions> ExecutorOps for FlashCudaExecutor<S> {
     type Session = DecodeSession;
 
     /// Refuses a prompt that cannot fit before any state changes.

@@ -48,18 +48,18 @@ fn head<'r>(range: &DeviceRange<'r>, bytes: usize) -> Result<DeviceRange<'r>, En
 }
 
 impl FlashStep<'_> {
-    /// The mixer of `layer` for the token at `pos`.
-    pub(super) fn mixer(&self, layer: usize, pos: usize) -> Result<(), EngError> {
+    /// The mixer of `layer` for `m` rows at `pos`.
+    pub(super) fn mixer(&self, layer: usize, pos: usize, m: usize) -> Result<(), EngError> {
         match self.geometry.layers.get(layer) {
-            Some(AttentionKind::DeltaNet) => self.delta_mixer(layer, pos),
-            Some(AttentionKind::Qsa) => self.qsa_mixer(layer, pos),
+            Some(AttentionKind::DeltaNet) => self.delta_mixer(layer, pos, m),
+            Some(AttentionKind::Qsa) => self.qsa_mixer(layer, pos, m),
             other => Err(refuse(format!(
                 "layer {layer} has the mixer kind {other:?}"
             ))),
         }
     }
 
-    fn delta_mixer(&self, layer: usize, pos: usize) -> Result<(), EngError> {
+    fn delta_mixer(&self, layer: usize, pos: usize, m: usize) -> Result<(), EngError> {
         let delta = self.geometry.delta;
         let hidden = self.geometry.hidden;
         let x = self.slot(Slot::Mixed(Site::Attn))?;
@@ -70,15 +70,25 @@ impl FlashStep<'_> {
         let beta_off = z_off + delta.value_width();
         let alpha_off = beta_off + delta.value_heads;
 
-        self.project(
+        // qkv (n = conv_dim) and z (n = value_width) differ in width, and the grouped launch
+        // takes one width per group (exl3.cu group_args), so they stay two launches.
+        self.project_cols(
             &at("linear_attn.in_proj_qkv"),
             x,
-            Self::columns(&row, 0, delta.conv_dim)?,
+            row,
+            0,
+            delta.conv_dim,
+            ld,
+            m,
         )?;
-        self.project(
+        self.project_cols(
             &at("linear_attn.in_proj_z"),
             x,
-            Self::columns(&row, z_off, delta.value_width())?,
+            row,
+            z_off,
+            delta.value_width(),
+            ld,
+            m,
         )?;
         for (name, offset) in [
             ("linear_attn.in_proj_b.weight", beta_off),
@@ -88,21 +98,26 @@ impl FlashStep<'_> {
                 self.stream,
                 RouterLogitsStridedCall {
                     shape: RouterShape {
-                        m: 1,
+                        m,
                         hidden,
                         n_expert: delta.value_heads,
                         top_k: 1,
                     },
                     x,
                     w: self.float(&at(name))?,
-                    logits: Self::columns(&row, offset, delta.value_heads)?,
+                    // The strided writes land at float t * ld of the column start, so the
+                    // range runs to the end of the row slot (the one-row call reads its head).
+                    logits: row.buffer().range(
+                        row.offset() + offset * size_of::<f32>(),
+                        row.bytes() - offset * size_of::<f32>(),
+                    )?,
                     logit_stride: ld,
                 },
             )?;
         }
 
         let conv_shape = ConvShape {
-            m: 1,
+            m,
             channels: delta.conv_dim,
             ld,
         };
@@ -124,7 +139,7 @@ impl FlashStep<'_> {
         )?;
 
         let shape = ScanShape {
-            m: 1,
+            m,
             p0: i64::try_from(pos).map_err(|_| refuse("position overflows".into()))?,
             ctx_tokens: self.state_plan.positions(),
             n_k_heads: delta.key_heads,
@@ -167,10 +182,11 @@ impl FlashStep<'_> {
             &at("linear_attn.out_proj"),
             core,
             self.slot(Slot::BlockOut(Site::Attn))?,
+            m,
         )
     }
 
-    fn qsa_mixer(&self, layer: usize, pos: usize) -> Result<(), EngError> {
+    fn qsa_mixer(&self, layer: usize, pos: usize, m: usize) -> Result<(), EngError> {
         let qsa = self.geometry.qsa;
         let dims = self.model.qsa.dims();
         let x = self.slot(Slot::Mixed(Site::Attn))?;
@@ -187,14 +203,33 @@ impl FlashStep<'_> {
                 idx_off + qsa.idx_proj()
             )));
         }
-        for (prefix, col, n) in [
-            ("self_attn.q_proj", 0, q_cols),
-            ("self_attn.k_proj", k_off, kv_cols),
-            ("self_attn.v_proj", v_off, kv_cols),
-            ("self_attn.indexer.index_qk_proj", idx_off, qsa.idx_proj()),
-        ] {
-            self.project(&at(prefix), x, Self::columns(&row, col, n)?)?;
+        // q (2 * q_width) and index (idx_proj) have widths of their own; k and v share
+        // kv_width, the one pair the grouped launch's single-width contract allows. One launch
+        // instead of two also beats the 12-14 us small-call floor once, not twice.
+        self.project_cols(&at("self_attn.q_proj"), x, row, 0, q_cols, ld, m)?;
+        if m == 1 {
+            self.project_group(
+                &[
+                    (&at("self_attn.k_proj"), k_off, kv_cols),
+                    (&at("self_attn.v_proj"), v_off, kv_cols),
+                ],
+                x,
+                &row,
+                m,
+            )?;
+        } else {
+            self.project_cols(&at("self_attn.k_proj"), x, row, k_off, kv_cols, ld, m)?;
+            self.project_cols(&at("self_attn.v_proj"), x, row, v_off, kv_cols, ld, m)?;
         }
+        self.project_cols(
+            &at("self_attn.indexer.index_qk_proj"),
+            x,
+            row,
+            idx_off,
+            qsa.idx_proj(),
+            ld,
+            m,
+        )?;
 
         let positions = self.state_plan.positions();
         // A context shorter than the selection budget completes fewer blocks than the budget, and
@@ -207,7 +242,7 @@ impl FlashStep<'_> {
             self.stream,
             AttnPrepCall {
                 shape: AttnPrepShape {
-                    m: 1,
+                    m,
                     n_head: qsa.heads_q,
                     n_kv_head: qsa.heads_kv,
                     head_dim: qsa.head_dim,
@@ -254,7 +289,7 @@ impl FlashStep<'_> {
             self.stream,
             QsaIndexCall {
                 indexer,
-                m: 1,
+                m,
                 ld,
                 col_off: idx_off,
                 position: position()?,
@@ -272,7 +307,7 @@ impl FlashStep<'_> {
             self.stream,
             QsaScoreCall {
                 indexer,
-                m: 1,
+                m,
                 position: position()?,
                 queries,
                 keys,
@@ -285,7 +320,7 @@ impl FlashStep<'_> {
             self.stream,
             QsaSelectCall {
                 indexer,
-                m: 1,
+                m,
                 budget_blocks,
                 position: position()?,
                 scores,
@@ -298,7 +333,7 @@ impl FlashStep<'_> {
             self.stream,
             QsaAttnCall {
                 shape: QsaAttnShape {
-                    m: 1,
+                    m,
                     n_head: qsa.heads_q,
                     n_kv_head: qsa.heads_kv,
                     rows: positions,
@@ -323,6 +358,7 @@ impl FlashStep<'_> {
             &at("self_attn.o_proj"),
             core,
             self.slot(Slot::BlockOut(Site::Attn))?,
+            m,
         )
     }
 }

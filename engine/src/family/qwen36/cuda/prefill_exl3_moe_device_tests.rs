@@ -13,16 +13,17 @@
 
 use std::path::Path;
 
-use super::{Bufs, routed_with, run};
+use super::{Bufs, routed_with, run, run_banked};
 use crate::{
     family::{
         project::cuda::{CudaProjector, CudaWeights, Reserve},
         qwen36::{
             cuda::{
                 common_tests::{dims, inventory},
+                exl3_bank::{Exl3SlotResolver, ExpertStore},
                 exl3_load_device_tests::{matrix_of, relative_l2, values_of},
                 exl3_moe::Exl3MoeWeights,
-                exl3_moe_source::moe_weights,
+                exl3_moe_source::{moe_weights, moe_weights_banked},
                 exl3_source::PackReader,
                 layer_table::LayerTable,
                 moe::{Launch, MoeDims},
@@ -370,4 +371,153 @@ fn moe_case(rows: usize, forced: bool) {
         agree as f64 >= PICK_AGREEMENT * rows as f64,
         "router picks agree on {agree} of {rows} rows"
     );
+}
+
+/// The banked sub-blocked chunk block against the resident chunk block, byte for byte.
+///
+/// [`run_banked`] runs the shared expert once for the whole chunk, then the routed experts and
+/// the combine per sub-block whose picks fit the slots together (slots / top_k rows), mapping
+/// each sub-block's picks through the layer's slot table and refilling missed slots from the
+/// host store. Every launch is one the resident block also makes, over the same pair rows, so
+/// every byte of the hidden rows must match; one rounding step of difference is a slicing or
+/// slot-mapping bug. Forced picks walk the experts across rows, so the sub-blocks after the
+/// first miss and evict. `SLOTS = 8` makes one-row sub-blocks (the admission floor),
+/// `SLOTS = 64` makes 8-row sub-blocks.
+#[test]
+#[ignore = "requires the pinned EXL3 pack in FIFI_EXL3_CHECKPOINT and a GPU"]
+fn banked_sub_blocked_chunk_is_byte_identical_to_the_resident_chunk() {
+    let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    assert!(device_present("banked EXL3 chunk moe"), "a GPU is required");
+    let checkpoint = Checkpoint::open(Path::new(&dir)).expect("open the pack");
+    let d = dims();
+    let table = LayerTable::new(&d, &inventory()).unwrap();
+    // 33 rows: with 64 slots (8-row sub-blocks) the last sub-block is a 1-row remainder,
+    // the same tail a chunk length that is not a multiple of the sub-block produces.
+    let rows = 33usize;
+    let moe = MoeDims::new(&d, rows);
+    let projector = CudaProjector::new().expect("projector");
+    let layer = 3;
+    let (h, i, s, k) = (moe.hidden, moe.inter, moe.shared_inter, moe.top_k);
+    let pairs = rows * k;
+    let x2: Vec<f32> = (0..rows).flat_map(|t| row_of(t, h)).collect();
+    let resid: Vec<f32> = (0..rows).flat_map(|t| resid_of(t, h)).collect();
+    let ids: Vec<u8> = forced_picks(rows, k, moe.n_expert)
+        .iter()
+        .flat_map(|id| id.to_le_bytes())
+        .collect();
+    let widest = h.max(i).max(s);
+
+    // One leg: the same buffer set `moe_case` allocates, run resident or banked. Returns the
+    // hidden rows. `bank` pairs the layer's resolver view with the sub-block plan.
+    let leg = |block: &Exl3MoeWeights<'_>,
+               bank: Option<(
+        &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
+        &[(usize, MoeDims)],
+    )>|
+     -> Vec<f32> {
+        let logits = router_logits_bytes(RouterShape {
+            m: rows,
+            hidden: h,
+            n_expert: moe.n_expert,
+            top_k: k,
+        })
+        .unwrap();
+        let owned: Vec<DeviceBuffer> = vec![
+            upload(&projector, &x2),                          // 0 x2
+            projector.context().upload(&ids).unwrap(),        // 1 ids (forced)
+            upload(&projector, &vec![1.0 / k as f32; pairs]), // 2 weights
+            upload(&projector, &vec![0.5; rows]),             // 3 shared gate
+            upload(&projector, &resid),                       // 4 hidden
+            filled(
+                &projector,
+                0,
+                4 * (2 * pairs + 4 * exl3_max_jobs(moe.n_expert, pairs)),
+            ), // 5 perm
+            filled(&projector, 0, 4),                         // 6 spare
+            filled(&projector, 0, pairs * 2 * i * F32),       // 7 gu
+            filled(&projector, 0, pairs * i * F32),           // 8 act
+            filled(&projector, 0, pairs * h * F32),           // 9 paired
+            filled(&projector, 0, rows * 2 * s * F32),        // 10 shared gu
+            filled(&projector, 0, rows * s * F32),            // 11 shared act
+            filled(&projector, 0, rows * h * F32),            // 12 shared out
+            filled(&projector, 0, logits),                    // 13 logits
+            filled(&projector, 0, 4),                         // 14 status
+            filled(&projector, 0, pairs * h.max(i) * F32),    // 15 expert xh
+            filled(&projector, 0, pairs * h.max(i) * F32),    // 16 expert z
+        ];
+        let r = |index: usize| whole(&owned[index]);
+        let bufs = Bufs {
+            x2: r(0),
+            ids: r(1),
+            weights: r(2),
+            shared_gate: r(3),
+            hidden: r(4),
+            perm: r(5),
+            gu: r(7),
+            act: r(8),
+            paired: r(9),
+            expert_xh: r(15),
+            expert_z: r(16),
+            shared_gu: r(10),
+            shared_act: r(11),
+            shared_out: r(12),
+        };
+        let ctx = projector.context();
+        let stream = ctx.stream().unwrap();
+        let scratch = Scratch::new(&projector, rows, (widest, widest));
+        let launch = Launch {
+            ctx,
+            stream: &stream,
+        };
+        let projector_view = scratch.chunk(&launch, rows);
+        match bank {
+            None => run(&projector_view, block, &bufs, &moe).expect("the resident chunk block"),
+            Some((bank, sub)) => run_banked(&projector_view, block, &bufs, &moe, sub, bank)
+                .expect("the banked chunk block"),
+        }
+        stream.synchronize().unwrap();
+        assert_eq!(scratch.flag_word(&projector), 0, "arithmetic flag");
+        read(&projector, &owned[4], rows * h)
+    };
+
+    // The resident reference: every expert of the layer on the device.
+    let reader = PackReader::new(&projector, &checkpoint, Reserve::default());
+    let loaded = moe_weights(&reader, &table, layer, &moe).expect("moe tensors");
+    let resident_weights = CudaWeights::from_exl3(loaded).unwrap();
+    let resident_block = Exl3MoeWeights::resolve(&resident_weights, &table, layer, &moe).unwrap();
+    let want = leg(&resident_block, None);
+
+    for slots in [8usize, 64] {
+        // A fresh banked load and store per slot count: every table starts empty, so the
+        // first sub-block misses everywhere and later ones miss wherever the walk goes.
+        let reader = PackReader::new(&projector, &checkpoint, Reserve::default());
+        let mut store = ExpertStore::with_layers(1);
+        let banked_loaded = moe_weights_banked(&reader, &table, layer, &moe, slots, &mut store)
+            .expect("banked moe tensors");
+        let banked_weights = CudaWeights::from_exl3(banked_loaded).unwrap();
+        let banked_block =
+            Exl3MoeWeights::resolve_banked(&banked_weights, &table, layer, &moe, slots).unwrap();
+        let sub_rows = (slots / k).max(1);
+        let sub: Vec<(usize, MoeDims)> = (0..rows)
+            .step_by(sub_rows)
+            .map(|r0| (r0, MoeDims::new(&d, (rows - r0).min(sub_rows))))
+            .collect();
+        let mut resolver =
+            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert, 0)
+                .unwrap();
+        let got = {
+            let mut bank = resolver.layer(0);
+            leg(&banked_block, Some((&mut bank, &sub)))
+        };
+        let (hits, misses) = resolver.stats();
+        println!(
+            "slots {slots}: sub-blocks {}, hits {hits}, misses {misses}",
+            sub.len()
+        );
+        assert!(misses > 0, "slots {slots}: the bank was never missed");
+        assert_eq!(
+            got, want,
+            "slots {slots}: the banked sub-blocked chunk differs in some byte"
+        );
+    }
 }

@@ -298,6 +298,34 @@ impl DeviceBuffer {
         Ok(())
     }
 
+    /// Enqueues `bytes` into the buffer at byte `offset` behind the work queued on
+    /// `stream` and returns without waiting for the copy: the next work on the stream
+    /// sees it. The caller's bytes must stay valid and unchanged until `stream`
+    /// completes the copy: `cudaMemcpyAsync` on a **pageable** source is fully
+    /// consumed before this returns (reuse/drop is then fine), but a **pinned**
+    /// source is re-read by the DMA engine after return and may not be freed,
+    /// moved or written until the stream's next synchronization point. The
+    /// expert-bank refills rely on this: they enqueue the store's pinned record
+    /// slices, and the store is immutable and process-long-lived (leaked by the
+    /// server), while tests end on readbacks that drain the stream.
+    ///
+    /// Returns `BadRequest` for the conditions of [`Self::read_at`].
+    pub(crate) fn write_at_enqueue(
+        &self,
+        stream: &DeviceStream,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), EngError> {
+        let range = self.io_range(stream, "write", offset, bytes.len())?;
+        let raw = stream.raw()?;
+        let _dispatch = enter_on(stream.lease().device())?;
+        resident::copy_h2d_enqueue(range, bytes, raw).map_err(device_error)?;
+        stream.note_enqueue();
+        #[cfg(test)]
+        record_ranged_h2d(std::rc::Rc::as_ptr(&self.lease) as usize, bytes.len());
+        Ok(())
+    }
+
     /// The checks both calls share, then the native view of the range.
     fn io_range(
         &self,
@@ -310,8 +338,7 @@ impl DeviceBuffer {
         ensure_closed("a ranged copy")?;
         same_adapter(&self.lease, stream.lease(), "stream")?;
         let device = self
-            .raw
-            .as_ref()
+            .raw_view()
             .ok_or_else(|| EngError::BadRequest("the CUDA buffer was already freed".to_owned()))?;
         if len == 0 {
             return Err(EngError::BadRequest(format!(

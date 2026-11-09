@@ -98,6 +98,12 @@ int inference_cuda_exl3_grouped_gathered(const inference_cuda_exl3_linear_args *
 int inference_cuda_exl3_grouped_wide(const inference_cuda_exl3_linear_args *calls,
                                      size_t count, void *stream, int *out_stage,
                                      unsigned cols);
+/* inference_cuda_exl3_grouped_wide with cols 1 that runs a compile-time rate 10 or rate 6 body when every
+ * group is book 2 at one of those rates, with the DP4A decode of book 2 when `dp4a` is nonzero.
+ * Every written byte is identical to the cols 1 entry. */
+int inference_cuda_exl3_grouped_wide_odd(const inference_cuda_exl3_linear_args *calls,
+                                         size_t count, void *stream, int *out_stage,
+                                         unsigned dp4a);
 /* Id-indexed grouped projection (the routed experts of one decode token). calls[i] describes one
  * row of member 0 of a bank (trellis, suh, svh at member 0); index[i] names the member on the
  * device: ids[slot] is read when the kernels run, so the ids may be written by an earlier kernel of

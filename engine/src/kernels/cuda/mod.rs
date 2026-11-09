@@ -71,6 +71,7 @@ pub(crate) use context::{
     Admission, CHUNK_LIMIT, CudaContext, DeviceBuffer, Growth, MemoryInfo, NativeWeight,
     Nvfp4WeightRange, PINNED_STAGE_LIMIT_BYTES, PinnedBuf, QuantTensor, TiledWeight,
     WorkspaceShape, check_q5_0_scales, check_q6k_scales, check_q8_0_scales, drop_page_cache,
+    host_register, host_unregister,
 };
 #[cfg_attr(
     not(test),
@@ -91,6 +92,9 @@ pub(crate) use {
     native::xf_bytes,
 };
 
+/// The expert-bank store's drop drains the device before unregistering its pinned
+/// pages; the native tree stays private otherwise.
+pub(crate) use native::device_synchronize;
 /// The kernels' prefill status mask, re-exported for the family book:
 /// `status_error` maps it to `prefill_chunk`, and its tests pin that mapping against this one
 /// const. The native tree stays private; the mask is its public contract.

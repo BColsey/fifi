@@ -1,21 +1,25 @@
 //! Resident Q36 weights, imported once at load.
 //!
 //! Non-expert matrices, plain norms, split convolutions, and the F32 router and shared gate become
-//! residents with `layers + 2` synchronizations. The 120 expert stacks are read once with
+//! residents with `layers + 2` synchronizations. The 80 expert stacks (the gate and up projections
+//! stacked into one operand each, plus `down`) are read once with
 //! positioned reads into page-aligned anonymous pages and wrapped without a copy. They need no
 //! synchronization and no page pool, because every expert stays resident for the life of the
 //! engine. The embedding table stays in the checkpoint; the token start reads one row per token.
 
 use super::super::settings::{Activation, scale_pairing_error};
 use super::layout::{
-    ExpertPlan, neg_exp, router_transposed, scalar_gate, split_conv, widen_stack_scales,
+    neg_exp, router_transposed, scalar_gate, split_conv, widen_layout, widen_stack_scales,
     with_f32_scales,
 };
 use super::ops::{Bytes, Consts, dim, f32_tensor, short_import};
 use crate::{
     EngError,
     family::{
-        flash_next::stored::{RoleRange, SlicedWeight, StoredWeight, read_stack_into},
+        flash_next::stored::{
+            RoleRange, SlicedWeight, StackLayout, StackedLayouts, StoredWeight, read_stack_into,
+            read_stacked_into, stacked_layout,
+        },
         qwen36::{
             host::{DeltaW, DenseW, FeedForwardW, HostShape, LayerW, MixerW, MoeW},
             host_load::HostWeights,
@@ -281,10 +285,11 @@ pub(super) struct RMoe {
     pub(super) shared_up: ResidentPackedWeight,
     pub(super) shared_down: ResidentPackedWeight,
     pub(super) shared_scalar_t: ExecutionTensor,
-    pub(super) gate: ResidentPackedWeight,
-    pub(super) up: ResidentPackedWeight,
+    /// The gate and up projections of all experts stacked along the output axis: ONE operand of
+    /// one `gather_qmm` per step instead of two.
+    pub(super) gate_up: ResidentPackedWeight,
     pub(super) down: ResidentPackedWeight,
-    /// The pages under the three stacks. Field order is drop order: the pages outlive the stacks.
+    /// The pages under the two stacks. Field order is drop order: the pages outlive the stacks.
     pages: HostPages,
 }
 
@@ -327,7 +332,8 @@ fn page_range(range: &RoleRange) -> PageRange {
 }
 
 impl RMoe {
-    /// Reads all experts of one layer into new pages and wraps the three stacks without a copy.
+    /// Reads all experts of one layer into new pages - the gate and up projections stacked into
+    /// one operand, then `down` - and wraps the two stacks without a copy.
     fn import_experts(
         kernels: &mut MlxKernels,
         ckpt: &StreamedCheckpoint,
@@ -336,38 +342,54 @@ impl RMoe {
         experts: u32,
         f32_scales: bool,
     ) -> Result<Self, EngError> {
-        let sliced = (&stacks.0, &stacks.1, &stacks.2);
+        let (gate, up, down) = (&stacks.0, &stacks.1, &stacks.2);
         let page = HostPages::page_size();
-        // With F32 scales (the default) the plan places each scale and bias role at twice its
-        // stored size, and `reads` places the stored BF16 values in the upper half of that role.
-        let (plan, reads) = if f32_scales {
-            let (plan, reads) = ExpertPlan::new_f32_scales(ckpt, sliced, experts, page)?;
-            (plan, Some(reads))
+        // The narrow gate/up layouts carry the stored slice sizes of the two projections. The
+        // stacked layout joins every expert slice of every role - gate bytes then up bytes - so
+        // the pages wrap ONE operand `[experts, 2 * rows, cols]` for both projections, with no
+        // second copy on the device. `down` follows the stacked block.
+        let gate_narrow = StackLayout::new(ckpt, gate, experts, 0, page)?;
+        let up_narrow = StackLayout::new(ckpt, up, experts, 0, page)?;
+        let stacked_narrow = stacked_layout(&gate_narrow, &up_narrow, 0, page)?;
+        // With F32 scales (the default) the scales and biases slots hold F32 values that
+        // `read_stacked_into` widens per slot; `down` widens through the plain machinery.
+        let (stacked, down_layout, down_read) = if f32_scales {
+            let (stacked, _whole_role_read) = widen_layout(&stacked_narrow, page)?;
+            let down_narrow = StackLayout::new(ckpt, down, experts, stacked.end, page)?;
+            let (down, read) = widen_layout(&down_narrow, page)?;
+            (stacked, down, Some(read))
         } else {
-            (ExpertPlan::new(ckpt, sliced, experts, page)?, None)
+            let down = StackLayout::new(ckpt, down, experts, stacked_narrow.end, page)?;
+            (stacked_narrow, down, None)
         };
-        let mut pages = HostPages::try_new(plan.end)?;
+        let mut pages = HostPages::try_new(down_layout.end)?;
         let ids: Vec<u32> = (0..experts).collect();
         {
             let bytes = pages.try_write().ok_or_else(|| EngError::Backend {
                 operation: "expert_pages",
                 message: "new expert pages are not writable".into(),
             })?;
-            for (index, (stored, layout)) in [&stacks.0, &stacks.1, &stacks.2]
-                .into_iter()
-                .zip(&plan.stacks)
-                .enumerate()
-            {
-                let read = reads.as_ref().map_or(layout, |reads| &reads[index]);
-                read_stack_into(ckpt, stored, &ids, bytes, read)?;
-                if reads.is_some() {
-                    widen_stack_scales(bytes, layout)?;
-                }
+            read_stacked_into(
+                ckpt,
+                gate,
+                up,
+                &ids,
+                bytes,
+                &StackedLayouts {
+                    gate: &gate_narrow,
+                    up: &up_narrow,
+                    stacked: &stacked,
+                },
+                f32_scales,
+            )?;
+            let down_target = down_read.as_ref().unwrap_or(&down_layout);
+            read_stack_into(ckpt, down, &ids, bytes, down_target)?;
+            if f32_scales {
+                widen_stack_scales(bytes, &down_layout)?;
             }
         }
-        let wrapped: Vec<PackedPages> = plan
-            .stacks
-            .iter()
+        let wrapped: Vec<PackedPages> = [&stacked, &down_layout]
+            .into_iter()
             .map(|stack| PackedPages {
                 payload: page_range(&stack.payload),
                 scales: page_range(&stack.scales),
@@ -380,7 +402,7 @@ impl RMoe {
         if !plain.is_empty() {
             return Err(short_import());
         }
-        let [gate, up, down]: [ResidentPackedWeight; 3] =
+        let [gate_up, down]: [ResidentPackedWeight; 2] =
             imported.try_into().map_err(|_| short_import())?;
         Ok(Self {
             router_t: front.router_t,
@@ -388,8 +410,7 @@ impl RMoe {
             shared_up: front.shared_up,
             shared_down: front.shared_down,
             shared_scalar_t: front.shared_scalar_t,
-            gate,
-            up,
+            gate_up,
             down,
             pages,
         })
@@ -402,8 +423,7 @@ impl RMoe {
             &self.shared_gate,
             &self.shared_up,
             &self.shared_down,
-            &self.gate,
-            &self.up,
+            &self.gate_up,
             &self.down,
         ] {
             total.packed(w)?;
@@ -670,8 +690,7 @@ impl ResidentWeights {
                     &moe.shared_gate,
                     &moe.shared_up,
                     &moe.shared_down,
-                    &moe.gate,
-                    &moe.up,
+                    &moe.gate_up,
                     &moe.down,
                 ]
                 .into_iter()
@@ -840,8 +859,7 @@ mod tests {
         assert_eq!(moe.router_t.shape(), [64, 4]);
         assert_eq!(moe.shared_scalar_t.shape(), [64, 1]);
         assert_eq!(shape_of(&moe.shared_gate), [64, 64]);
-        assert_eq!(shape_of(&moe.gate), [4, 64, 64]);
-        assert_eq!(shape_of(&moe.up), [4, 64, 64]);
+        assert_eq!(shape_of(&moe.gate_up), [4, 128, 64]);
         assert_eq!(shape_of(&moe.down), [4, 64, 64]);
     }
 
@@ -1068,23 +1086,33 @@ mod tests {
         let x3 = kernels
             .import_tensor(&f32_tensor(vec![1, 1, 64], &x).unwrap())
             .unwrap();
-        for (name, stack, host_stack) in [
-            (
-                "gate",
-                &w.layers[0].as_moe().unwrap().gate,
-                view.layers[0].as_moe().unwrap().gate,
-            ),
-            (
-                "up",
-                &w.layers[0].as_moe().unwrap().up,
-                view.layers[0].as_moe().unwrap().up,
-            ),
-            (
-                "down",
-                &w.layers[1].as_moe().unwrap().down,
-                view.layers[1].as_moe().unwrap().down,
-            ),
-        ] {
+        // The stacked gate/up operand: the first half of the gathered product is the gate
+        // projection and the second the up projection, each equal to the CPU reference of the
+        // checkpoint's own gate and up stacks.
+        let moe0 = view.layers[0].as_moe().unwrap();
+        for e in 0..4u32 {
+            let ids = kernels
+                .import_tensor(&u32_tensor(vec![1], &[e]).unwrap())
+                .unwrap();
+            let got = kernels
+                .gather_qmm(&x3, &w.layers[0].as_moe().unwrap().gate_up, &ids)
+                .unwrap();
+            let got = values(&mut kernels, &got).unwrap();
+            let gate = cpu.expert_linear(moe0.gate, e, &x).unwrap();
+            let up = cpu.expert_linear(moe0.up, e, &x).unwrap();
+            let half = gate.len();
+            assert_parity(
+                &got[..half],
+                &gate,
+                &format!("gate_up gate half expert {e}"),
+            );
+            assert_parity(&got[half..], &up, &format!("gate_up up half expert {e}"));
+        }
+        for (name, stack, host_stack) in [(
+            "down",
+            &w.layers[1].as_moe().unwrap().down,
+            view.layers[1].as_moe().unwrap().down,
+        )] {
             for e in 0..4u32 {
                 let ids = kernels
                     .import_tensor(&u32_tensor(vec![1], &[e]).unwrap())
@@ -1181,7 +1209,7 @@ mod tests {
                 let role = format!("layer {index} {role}");
                 assert_role(&mut kernels, &mut cpu, resident, stored, &role);
             }
-            for stack in [&moe.gate, &moe.up, &moe.down] {
+            for stack in [&moe.gate_up, &moe.down] {
                 let spec = stack.quantization();
                 assert_eq!(
                     (spec.mode, spec.bits, spec.group_size),

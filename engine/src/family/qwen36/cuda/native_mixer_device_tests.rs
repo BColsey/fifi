@@ -239,11 +239,19 @@ fn run_block(
         geometry,
         table: &table,
         weights,
-        views: MixerViews::new(&plan, &arena, &geometry, layout, super::dims::KvMode::Fp16)?,
+        views: MixerViews::new(
+            &plan,
+            &arena,
+            &geometry,
+            layout,
+            super::dims::KvMode::Fp16,
+            false,
+        )?,
         layout,
         kv_mode: super::dims::KvMode::Fp16,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers = Mixers::new(ctx, parts)?;
     mixers.run_block(
@@ -254,6 +262,7 @@ fn run_block(
             resid: resid_view,
             admit_pos: 0,
         },
+        None,
     )?;
     stream.synchronize()?;
     let read = |slot: Slot| -> Result<Vec<f32>, EngError> {

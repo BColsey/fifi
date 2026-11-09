@@ -108,6 +108,9 @@ pub(crate) struct DeltaBaked {
     /// `kh, kd, vh, vd, cd, taps` (conv_kernel - 1), `kw` (kh * kd), `kw2` (2 * kw): every
     /// dimension of the native seam's `dims`, as checked by [`checked_delta_dims`].
     pub(crate) dims: [u32; 8],
+    /// 1 when the pre-recurrence middle runs as the ONE `delta_middle` Metal kernel
+    /// (`Q36_FUSED_DECODE=1` with three taps): a different closure body, so a different key.
+    pub(crate) fused: u32,
     /// `f32::to_bits(eps)`: the RMS norm epsilon of the block output norm.
     pub(crate) eps_bits: u32,
     /// The activation dtype key of the step (`dtype_key`): the dtype of the layer input and of
@@ -129,18 +132,21 @@ pub(crate) struct MoeBaked {
     pub(crate) renorm: u32,
     /// The clamp bound of the expert ids, `experts - 1`: the ONE `mlx_minimum` clamp per layer.
     pub(crate) clamp: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the folded post-attention norm.
+    pub(crate) eps_bits: u32,
     pub(crate) act: u64,
     /// The scale dtype key of EACH packed weight, in the seam's weight order shared gate, up,
-    /// down, then the gate, up, down expert stacks.
-    pub(crate) scale_keys: [u64; 6],
+    /// down, then the stacked gate/up expert operand and the down stack.
+    pub(crate) scale_keys: [u64; 5],
     /// The quantization triple of EACH packed weight, in the same order.
-    pub(crate) quant: [[i32; 3]; 6],
+    pub(crate) quant: [[i32; 3]; 5],
 }
 
 pub(crate) fn delta_fun_id(baked: &DeltaBaked) -> u64 {
     let mut parts = Vec::with_capacity(32);
     parts.push(u64::from(baked.hidden));
     parts.extend(baked.dims.iter().map(|&dim| u64::from(dim)));
+    parts.push(u64::from(baked.fused));
     parts.push(u64::from(baked.eps_bits));
     parts.push(baked.act);
     parts.extend(baked.scale_keys);
@@ -269,6 +275,7 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
     parts.push(u64::from(baked.top_k));
     parts.push(u64::from(baked.renorm));
     parts.push(u64::from(baked.clamp));
+    parts.push(u64::from(baked.eps_bits));
     parts.push(baked.act);
     parts.extend(baked.scale_keys);
     for triple in &baked.quant {
@@ -279,11 +286,14 @@ pub(crate) fn moe_fun_id(baked: &MoeBaked) -> u64 {
 
 /// The most baked keys that one adapter context may admit: DeltaNet, device-routed MoE, and
 /// the attention pre-RoPE and post-core closures of a uniform model need four keys, and a
-/// fifth covers one extra distinct constant set (for example a second quantization). A sixth
-/// distinct key is an unapproved configuration change. This does not count MLX tapes: one MoE
-/// key permits B=1/2/4/8, so one adapter context can approve at most twenty key/batch pairs.
-/// Other contexts, cache clears and other threads are not bounded by this registry.
-pub(crate) const PROGRAM_LIMIT: usize = 5;
+/// fifth covers one extra distinct constant set (for example a second quantization). The
+/// dense releases mix per-layer quantization overrides, so one attention layer set is no
+/// longer one constant set: the oQ6 pack needs 2 delta + 3 attention sets (2 programs each)
+/// = 8 keys. A ninth distinct key is an unapproved configuration change. This does not
+/// count MLX tapes: one MoE key permits B=1/2/4/8, so one adapter context can approve at
+/// most thirty-two key/batch pairs. Other contexts, cache clears and other threads are not
+/// bounded by this registry.
+pub(crate) const PROGRAM_LIMIT: usize = 8;
 
 /// The compiled-program registry of ONE adapter context:
 /// the MLX compile cache is thread-local and dies with its thread, so the registry lives in the
@@ -327,6 +337,7 @@ mod tests {
         DeltaBaked {
             hidden: 2048,
             dims: [16, 128, 32, 128, 8192, 3, 2048, 4096],
+            fused: 0,
             eps_bits: 1e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
             scale_keys: [1, 1, 1, 1, 1],
@@ -343,9 +354,10 @@ mod tests {
             top_k: 8,
             renorm: 1,
             clamp: 255,
+            eps_bits: 1.0e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
-            scale_keys: [1, 1, 1, 1, 1, 1],
-            quant: [[0, 64, 4]; 6],
+            scale_keys: [1, 1, 1, 1, 1],
+            quant: [[0, 64, 4]; 5],
         }
     }
 
@@ -579,8 +591,8 @@ mod tests {
 
     /// The row count of the delta table below: one row per scalar field, per dimension, per
     /// scale key, and per quantization value.
-    const DELTA_ROWS: usize = 1 + 8 + 1 + 1 + 5 + 5 * 3;
-    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 6 + 6 * 3;
+    const DELTA_ROWS: usize = 1 + 1 + 8 + 1 + 1 + 5 + 5 * 3;
+    const MOE_ROWS: usize = 1 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 5 * 3;
     /// The row count of the Flint tail table below: one row per scalar field, per scale
     /// key, and per quantization value.
     const FLINT_ROWS: usize = 1 + 1 + 1 + 1 + 3 + 3 * 3;
@@ -681,6 +693,7 @@ mod tests {
                     ..base
                 },
             ),
+            ("fused", DeltaBaked { fused: 1, ..base }),
             (
                 "dims[0] kh",
                 DeltaBaked {
@@ -832,6 +845,13 @@ mod tests {
             ("renorm", MoeBaked { renorm: 0, ..base }),
             ("clamp", MoeBaked { clamp: 256, ..base }),
             (
+                "eps_bits",
+                MoeBaked {
+                    eps_bits: 1.0e-5f32.to_bits(),
+                    ..base
+                },
+            ),
+            (
                 "act",
                 MoeBaked {
                     act: dtype_key(Dtype::Bf16),
@@ -841,48 +861,41 @@ mod tests {
             (
                 "scale_keys[0]",
                 MoeBaked {
-                    scale_keys: [0, 1, 1, 1, 1, 1],
+                    scale_keys: [0, 1, 1, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[1]",
                 MoeBaked {
-                    scale_keys: [1, 0, 1, 1, 1, 1],
+                    scale_keys: [1, 0, 1, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[2]",
                 MoeBaked {
-                    scale_keys: [1, 1, 0, 1, 1, 1],
+                    scale_keys: [1, 1, 0, 1, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[3]",
                 MoeBaked {
-                    scale_keys: [1, 1, 1, 0, 1, 1],
+                    scale_keys: [1, 1, 1, 0, 1],
                     ..base
                 },
             ),
             (
                 "scale_keys[4]",
                 MoeBaked {
-                    scale_keys: [1, 1, 1, 1, 0, 1],
-                    ..base
-                },
-            ),
-            (
-                "scale_keys[5]",
-                MoeBaked {
-                    scale_keys: [1, 1, 1, 1, 1, 0],
+                    scale_keys: [1, 1, 1, 1, 0],
                     ..base
                 },
             ),
         ]
         .into_iter()
-        .chain((0..6).flat_map(|weight| {
+        .chain((0..5).flat_map(|weight| {
             (0..3).map(move |field| {
                 let names = ["mode", "group", "bits"];
                 let name = names[field];
@@ -915,9 +928,10 @@ mod tests {
             top_k: 8,
             renorm: 1,
             clamp: 255,
+            eps_bits: 1.0e-6f32.to_bits(),
             act: d.act,
-            scale_keys: [d.scale_keys[0], 1, 1, 1, 1, 1],
-            quant: [d.quant[0]; 6],
+            scale_keys: [d.scale_keys[0], 1, 1, 1, 1],
+            quant: [d.quant[0]; 5],
         };
         assert_ne!(
             delta_fun_id(&d),
@@ -985,7 +999,7 @@ mod tests {
     }
 
     /// The registry of one adapter context holds the limit rule as a plain function of the ids
-    /// seen: five distinct ids register, a repeat is a cache hit, and the SIXTH distinct id is
+    /// seen: eight distinct ids register, a repeat is a cache hit, and the NINTH distinct id is
     /// refused with `BadRequest` naming the limit — reaching the limit through the ids, not
     /// through the constant.
     #[test]
@@ -998,17 +1012,18 @@ mod tests {
         assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
         // A repeat of a registered id is fine: it is a cache hit, not a new program.
         assert_eq!(registry.admit(8), Ok(false));
-        let sixth = registry.admit(16);
-        let EngError::BadRequest(message) = sixth.unwrap_err() else {
+        let ninth = registry.admit(16);
+        let EngError::BadRequest(message) = ninth.unwrap_err() else {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("at most 5 compiled programs per adapter"),
+            message.contains("at most 8 compiled programs per adapter"),
             "the refusal names the limit: {message}"
         );
         // The refused id was not registered, so the registry still holds exactly the limit and
-        // stays refused for a further distinct id.
+        // stays refused for a further distinct id (12 is inside the admitted range, so probe
+        // an id beyond it).
         assert_eq!(registry.seen().len(), PROGRAM_LIMIT);
-        assert!(registry.admit(12).is_err(), "the limit stays refused");
+        assert!(registry.admit(20).is_err(), "the limit stays refused");
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! The step only builds lazy graph nodes. It never reads back or evaluates.
 
-use super::ops::{Ctx, cast_to, dim, linear, to_act};
+use super::ops::{Ctx, dim, linear, to_act};
 use super::weights::RDelta;
 use crate::{
     EngError,
@@ -36,7 +36,10 @@ fn overflow() -> EngError {
 /// `Consts`.
 const NORM_EPS: f32 = 1.0e-6;
 
-/// Builds one DeltaNet decode step over `x` (`hidden` elements) and the old `rec` and `ring`.
+/// Builds one DeltaNet decode step over the raw residual stream `x` (`hidden` elements) and
+/// the old `rec` and `ring`, folding the input RMS norm and the output residual add around
+/// the block: `x` meets `in_norm` first (the same `rms_norm` the loop used to run), the block
+/// runs exactly as before, and the returned `out` is the residual sum `x + mixed`.
 ///
 /// It performs no synchronization. The caller replaces its state with the returned `rec` and `ring`.
 /// A state shape error returns `BadRequest` before the first native call.
@@ -47,6 +50,7 @@ pub(super) fn step(
     rec: &ExecutionTensor,
     ring: &ExecutionTensor,
     x: &ExecutionTensor,
+    in_norm: &ExecutionTensor,
 ) -> Result<DeltaStep, EngError> {
     check_state_shapes(shape, rec, ring)?;
     // The compiled decode closure: the `qwen36.compile` setting (or the test override of
@@ -54,17 +58,24 @@ pub(super) fn step(
     // below, in the activation dtype of the step. There is no fallback: a failure of the compiled
     // path is a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
-        return super::compiled::delta_step(ctx, shape, w, rec, ring, x);
+        return super::compiled::delta_step(ctx, shape, w, rec, ring, x, in_norm);
     }
+    // The folded input norm: the same op the step loop used to run, relocated inside the block
+    // so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, in_norm, shape.eps)?;
     // Projections: the batched path (`batch::step_rows`) meets these four
     // weights in ONE qmm each over `[B, hidden]`; only the recurrence below
     // stays per slot (the compiled closure above stays the solo path only).
-    let u = linear(ctx, &w.qkv, x)?;
-    let z = linear(ctx, &w.z, x)?;
-    let bb = linear(ctx, &w.b, x)?;
-    let aa = linear(ctx, &w.a, x)?;
+    let u = linear(ctx, &w.qkv, &normed)?;
+    let z = linear(ctx, &w.z, &normed)?;
+    let bb = linear(ctx, &w.b, &normed)?;
+    let aa = linear(ctx, &w.a, &normed)?;
     let (o, rec_next, ring_next) = step_projected(ctx, shape, w, rec, ring, [&u, &z, &bb, &aa])?;
-    let out = linear(ctx, &w.out, &o)?;
+    let mixed = linear(ctx, &w.out, &o)?;
+    // The folded output residual: the same `binary(Add, x, mixed)` the step loop used to run.
+    let out = ctx
+        .kernels
+        .binary(crate::kernels::BinaryOp::Add, x, &mixed)?;
     Ok(DeltaStep {
         out,
         rec: rec_next,
@@ -99,6 +110,22 @@ pub(super) fn check_state_shapes(
     Ok(())
 }
 
+/// Whether the fused decode middle kernel replaces the op sequence. Default OFF until the
+/// parity gates pass; `Q36_FUSED_DECODE=1` is the opt-in. Read per call so the compiled facts
+/// and the traced body never disagree with the eager step.
+pub(super) fn fused_decode_enabled() -> bool {
+    std::env::var_os("Q36_FUSED_DECODE").is_some_and(|v| v == "1")
+}
+
+/// Whether the fused `delta_middle` kernel applies to a block of these dimensions: the flag
+/// on, a three-tap ring, and head widths of at most 128 (the kernel tiles one head's channels
+/// across `yv[4]` per simdgroup, so a wider `kd` or `vd` would write out of bounds). The eager
+/// step, the compiled facts, and both seam arg builders must agree, so the whole rule lives
+/// here — the eager path falls back to the op sequence for anything wider.
+pub(super) fn fused_middle_applicable(taps: u32, kd: u32, vd: u32) -> bool {
+    fused_decode_enabled() && taps == 3 && kd <= 128 && vd <= 128
+}
+
 /// Everything between the projections and the out-projection: the F32 promote
 /// of `bb`, the causal convolution over each slot's own ring, the q/k/v split,
 /// the decay/beta gates, the gated-delta recurrence and the silu(z) gate. Takes
@@ -125,53 +152,83 @@ pub(super) fn step_projected(
     let taps = dim(d.conv_kernel)?.checked_sub(1).ok_or_else(overflow)?;
     let kw = kh.checked_mul(kd).ok_or_else(overflow)?;
     let kw2 = kw.checked_mul(2).ok_or_else(overflow)?;
-    // Under a BF16 activation the recurrence, its state, and the convolution ring stay F32. `u`,
-    // `z`, and `aa` meet an F32 weight or state first and promote on their own. `bb` feeds a
-    // sigmoid alone and the gated delta kernel takes F32 `beta`, so it converts here.
-    let bb = cast_to(ctx, bb, Dtype::F32)?;
     let consts = ctx.consts;
     let m = &mut *ctx.kernels;
-    let u = m.reshape(u, &[cd])?;
-    // Causal depthwise convolution over the ring and the new row, then SiLU.
-    let now = m.binary(BinaryOp::Mul, &w.conv_last, &u)?;
-    let past = m.binary(BinaryOp::Mul, &w.conv_taps, ring)?;
-    let past = m.reduce(ReduceOp::Sum, &past, 1, false)?;
-    let val = m.binary(BinaryOp::Add, &now, &past)?;
-    let y = m.silu(&val)?;
-    // New ring: drop the oldest tap and append u.
-    let column = m.reshape(&u, &[cd, 1])?;
-    let ring_next = if taps > 1 {
-        let kept = m.slice(ring, &[0, 1], &[cd, taps])?;
-        m.concatenate(&[&kept, &column], 1)?
-    } else if column.dtype() == Dtype::F32 {
-        column
+    // The fused delta_middle kernel (Q36_FUSED_DECODE=1, three-tap rings) replaces the ~15-op
+    // pre-recurrence chain below with ONE Metal kernel over the raw projections; the recurrence
+    // (gated_delta) and the output tail stay shared, so the eager and compiled paths stay
+    // identical after the split point. Under a BF16 activation the recurrence, its state, and
+    // the convolution ring stay F32; the kernel promotes its inputs itself.
+    let (q, k, v, alpha, beta, ring_next) = if fused_middle_applicable(taps, kd, vd) {
+        let crate::kernels::mlx::GdnPrepOutput {
+            q,
+            k,
+            v,
+            g: alpha,
+            beta,
+            ring: ring_next,
+        } = m.delta_middle(
+            u,
+            aa,
+            bb,
+            ring,
+            &w.conv_taps,
+            &w.conv_last,
+            &w.neg_exp_a_log,
+            &w.dt_bias,
+            &consts.qk_eps,
+            &consts.sqrt_kd,
+            &[kh, kd, vh, vd, cd],
+        )?;
+        (q, k, v, alpha, beta, ring_next)
     } else {
-        m.cast(&column, Dtype::F32)?
+        // `bb` feeds a sigmoid alone and the gated delta kernel takes F32 `beta`, so it converts
+        // here in the op sequence. `u`, `z`, and `aa` meet an F32 weight or state first and
+        // promote on their own.
+        let bb = m.cast(bb, Dtype::F32)?;
+        let u = m.reshape(u, &[cd])?;
+        // Causal depthwise convolution over the ring and the new row, then SiLU.
+        let now = m.binary(BinaryOp::Mul, &w.conv_last, &u)?;
+        let past = m.binary(BinaryOp::Mul, &w.conv_taps, ring)?;
+        let past = m.reduce(ReduceOp::Sum, &past, 1, false)?;
+        let val = m.binary(BinaryOp::Add, &now, &past)?;
+        let y = m.silu(&val)?;
+        // New ring: drop the oldest tap and append u.
+        let column = m.reshape(&u, &[cd, 1])?;
+        let ring_next = if taps > 1 {
+            let kept = m.slice(ring, &[0, 1], &[cd, taps])?;
+            m.concatenate(&[&kept, &column], 1)?
+        } else if column.dtype() == Dtype::F32 {
+            column
+        } else {
+            m.cast(&column, Dtype::F32)?
+        };
+        // Split y into q, k, v.
+        let q = m.slice(&y, &[0], &[kw])?;
+        let q = m.reshape(&q, &[kh, kd])?;
+        let k = m.slice(&y, &[kw], &[kw2])?;
+        let k = m.reshape(&k, &[kh, kd])?;
+        let v = m.slice(&y, &[kw2], &[cd])?;
+        let v = m.reshape(&v, &[1, 1, vh, vd])?;
+        // The head norms as single fused RMSNorm kernels: with the baked channel weights
+        // (`1 / D` query, `1 / sqrt(D)` key) and eps against the mean of squares, `rms_norm`
+        // equals the host rule x / sqrt(sum(x * x) + D * 1e-6) with the extra sqrt(D) divisor on
+        // the query (see `Consts`). One kernel each; the eager step and the compiled closure call
+        // the same `fast.rms_norm`, so the two paths stay identical.
+        let q = m.rms_norm(&q, &consts.q_norm_w, NORM_EPS)?;
+        let k = m.rms_norm(&k, &consts.k_norm_w, NORM_EPS)?;
+        let q = m.reshape(&q, &[1, 1, kh, kd])?;
+        let k = m.reshape(&k, &[1, 1, kh, kd])?;
+        // alpha = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
+        let pre = m.binary(BinaryOp::Add, aa, &w.dt_bias)?;
+        let soft = m.binary(BinaryOp::LogAddExp, &pre, &consts.zero)?;
+        let decay = m.binary(BinaryOp::Mul, &w.neg_exp_a_log, &soft)?;
+        let alpha = m.unary(UnaryOp::Exp, &decay)?;
+        let alpha = m.reshape(&alpha, &[1, 1, vh])?;
+        let beta = m.unary(UnaryOp::Sigmoid, &bb)?;
+        let beta = m.reshape(&beta, &[1, 1, vh])?;
+        (q, k, v, alpha, beta, ring_next)
     };
-    // Split y into q, k, v.
-    let q = m.slice(&y, &[0], &[kw])?;
-    let q = m.reshape(&q, &[kh, kd])?;
-    let k = m.slice(&y, &[kw], &[kw2])?;
-    let k = m.reshape(&k, &[kh, kd])?;
-    let v = m.slice(&y, &[kw2], &[cd])?;
-    let v = m.reshape(&v, &[1, 1, vh, vd])?;
-    // The head norms as single fused RMSNorm kernels: with the baked channel weights
-    // (`1 / D` query, `1 / sqrt(D)` key) and eps against the mean of squares, `rms_norm`
-    // equals the host rule x / sqrt(sum(x * x) + D * 1e-6) with the extra sqrt(D) divisor on
-    // the query (see `Consts`). One kernel each; the eager step and the compiled closure call
-    // the same `fast.rms_norm`, so the two paths stay identical.
-    let q = m.rms_norm(&q, &consts.q_norm_w, NORM_EPS)?;
-    let k = m.rms_norm(&k, &consts.k_norm_w, NORM_EPS)?;
-    let q = m.reshape(&q, &[1, 1, kh, kd])?;
-    let k = m.reshape(&k, &[1, 1, kh, kd])?;
-    // alpha = exp(-exp(A_log) * softplus(a + dt_bias)), beta = sigmoid(b).
-    let pre = m.binary(BinaryOp::Add, aa, &w.dt_bias)?;
-    let soft = m.binary(BinaryOp::LogAddExp, &pre, &consts.zero)?;
-    let decay = m.binary(BinaryOp::Mul, &w.neg_exp_a_log, &soft)?;
-    let alpha = m.unary(UnaryOp::Exp, &decay)?;
-    let alpha = m.reshape(&alpha, &[1, 1, vh])?;
-    let beta = m.unary(UnaryOp::Sigmoid, &bb)?;
-    let beta = m.reshape(&beta, &[1, 1, vh])?;
     // The delta rule for one token. Value head h reads key head h / (VH / KH) inside the kernel.
     let state = m.reshape(rec, &[1, vh, vd, kd])?;
     let kernel = m.gated_delta(&q, &k, &v, &alpha, &beta, &state)?;
@@ -197,7 +254,7 @@ mod tests {
     use super::super::weights::{RMixer, ResidentWeights};
     use super::*;
     use crate::family::project::Projector;
-    use crate::family::qwen36::host::{self, DeltaState, MixerW};
+    use crate::family::qwen36::host::{self, DeltaState, MixerW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY, TINY_WIDE};
@@ -264,8 +321,13 @@ mod tests {
         let mut projected = Vec::new();
         for n in 0..5u32 {
             let x = input(n);
-            let want = host::delta_step(&mut cpu, &shape, host_w, &mut host_state, &x).unwrap();
-            projected.push(cpu.linear(host_w.qkv, &x).unwrap());
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let normed_x = rms_plain(&x, view.layers[0].input_norm, shape.eps).unwrap();
+            let want =
+                host::delta_step(&mut cpu, &shape, host_w, &mut host_state, &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
+            projected.push(cpu.linear(host_w.qkv, &normed_x).unwrap());
             let xr = kernels
                 .import_tensor(&f32_tensor(vec![1, 64], &x).unwrap())
                 .unwrap();
@@ -274,7 +336,16 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, &rec, &ring, &xr).unwrap();
+            let next = step(
+                &mut ctx,
+                &shape,
+                rw,
+                &rec,
+                &ring,
+                &xr,
+                &w.layers[0].input_norm,
+            )
+            .unwrap();
             assert_eq!(next.out.shape(), [1, 64], "step {n} output shape");
             assert_eq!(next.rec.shape(), rec.shape(), "step {n} rec shape");
             assert_eq!(next.ring.shape(), ring.shape(), "step {n} ring shape");
@@ -329,13 +400,29 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let bad_rec = step(&mut ctx, &shape, rw, &flat_rec, &ring, &x);
+        let bad_rec = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &flat_rec,
+            &ring,
+            &x,
+            &w.layers[0].input_norm,
+        );
         assert!(
             matches!(&bad_rec, Err(EngError::BadRequest(m)) if m.contains("delta rec shape")),
             "{:?}",
             bad_rec.as_ref().err()
         );
-        let bad_ring = step(&mut ctx, &shape, rw, &rec, &short_ring, &x);
+        let bad_ring = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &rec,
+            &short_ring,
+            &x,
+            &w.layers[0].input_norm,
+        );
         assert!(
             matches!(&bad_ring, Err(EngError::BadRequest(m)) if m.contains("delta ring shape")),
             "{:?}",
@@ -362,7 +449,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let next = step(&mut ctx, &shape, rw, &rec, &ring, &x).unwrap();
+        let next = step(
+            &mut ctx,
+            &shape,
+            rw,
+            &rec,
+            &ring,
+            &x,
+            &w.layers[0].input_norm,
+        )
+        .unwrap();
         assert_eq!(
             kernels.qualification_sync_count(),
             before,

@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use super::{
     super::exl3_pack::{ExpertPart, expert_name, router_name, shared_gate_name, shared_name},
     common_tests::{dims, inventory},
+    exl3_bank::{Exl3SlotResolver, ExpertStore},
     exl3_load_device_tests::{matrix_of, relative_l2, values_of},
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
-    exl3_moe_source::moe_weights,
+    exl3_moe_source::{moe_weights, moe_weights_banked},
     exl3_source::PackReader,
     layer_table::LayerTable,
     moe::{Launch, MoeDims, RouteBufs},
@@ -95,6 +96,20 @@ fn inputs(hidden: usize) -> (Vec<f32>, Vec<f32>) {
         .map(|i| ((i * 31 % 97) as f32 - 48.0) / 50.0)
         .collect();
     (row, resid)
+}
+
+/// The inputs of `inputs` scaled by `round`: a different router row means different picks,
+/// which is what a banked-block test needs to force misses and evictions.
+fn inputs_of_round(hidden: usize, round: usize) -> (Vec<f32>, Vec<f32>) {
+    let scale = 1.0 + 0.137 * round as f32;
+    let (row, resid) = inputs(hidden);
+    (
+        row.iter().map(|v| v * scale).collect(),
+        resid
+            .iter()
+            .map(|v| v * (1.0 + 0.05 * round as f32))
+            .collect(),
+    )
 }
 
 struct Reference {
@@ -206,7 +221,21 @@ fn run_block(
     moe: &MoeDims,
     device_ids: bool,
 ) -> Result<Device, EngError> {
-    let (row, resid) = inputs(moe.hidden);
+    run_block_rounded(projector, block, moe, device_ids, 0, None)
+}
+
+/// [`run_block`] with the input round and the banked slot resolver: `round` scales the
+/// router row (different picks per round), and `bank` maps the read picks through the
+/// layer's slot tables before the launches.
+fn run_block_rounded(
+    projector: &CudaProjector,
+    block: &Exl3MoeWeights<'_>,
+    moe: &MoeDims,
+    device_ids: bool,
+    round: usize,
+    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+) -> Result<Device, EngError> {
+    let (row, resid) = inputs_of_round(moe.hidden, round);
     let h = moe.hidden * F32;
     let logits = router_logits_bytes(crate::kernels::cuda::resident::router::RouterShape {
         m: 1,
@@ -272,6 +301,7 @@ fn run_block(
         &bufs,
         moe,
         device_ids,
+        bank,
     )?;
     stream.synchronize()?;
     let ids = read(projector, &owned.buffers[4])
@@ -287,4 +317,74 @@ fn run_block(
         out: floats(&read(projector, &owned.buffers[1])),
         flag,
     })
+}
+
+/// The banked block against the resident block, byte for byte, over several input rounds.
+///
+/// The banked load keeps the SAME layer in an 8-slot bank (8 = the picks per token, the
+/// admission floor) with every expert in the host store; each round scales the router row, so
+/// the picks walk the experts and every round after the first misses and evicts. The banked
+/// launches must produce the exact bytes of the resident block — the slot fill is a plain byte
+/// move of the same staged layout, so nothing may differ by even a rounding step.
+#[test]
+#[ignore = "requires the pinned EXL3 pack in FIFI_EXL3_CHECKPOINT and a GPU"]
+fn banked_moe_block_is_byte_identical_to_the_resident_block() {
+    let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
+    assert!(device_present("banked EXL3 moe block"), "a GPU is required");
+    let checkpoint = Checkpoint::open(Path::new(&dir)).expect("open the pack");
+    let d = dims();
+    let table = LayerTable::new(&d, &inventory()).unwrap();
+    let moe = MoeDims::new(&d, STEP_ROWS);
+    let projector = CudaProjector::new().expect("projector");
+    const SLOTS: usize = 8;
+    for layer in [3, 24] {
+        let reader = PackReader::new(&projector, &checkpoint, Reserve::default());
+        let loaded = moe_weights(&reader, &table, layer, &moe).expect("moe tensors");
+        let weights = CudaWeights::from_exl3(loaded).unwrap();
+        let block = Exl3MoeWeights::resolve(&weights, &table, layer, &moe).unwrap();
+        let mut store = ExpertStore::with_layers(1);
+        let banked_loaded = moe_weights_banked(&reader, &table, layer, &moe, SLOTS, &mut store)
+            .expect("banked moe tensors");
+        let banked_weights = CudaWeights::from_exl3(banked_loaded).unwrap();
+        let banked_block =
+            Exl3MoeWeights::resolve_banked(&banked_weights, &table, layer, &moe, SLOTS).unwrap();
+        let mut resolver =
+            Exl3SlotResolver::new(store, std::slice::from_ref(&banked_block), moe.n_expert, 0)
+                .unwrap();
+        let mut saw_miss = false;
+        for round in 0..6 {
+            let want = run_block_rounded(&projector, &block, &moe, false, round, None)
+                .expect("the resident block");
+            let got = {
+                let mut bank = resolver.layer(0);
+                run_block_rounded(
+                    &projector,
+                    &banked_block,
+                    &moe,
+                    false,
+                    round,
+                    Some(&mut bank),
+                )
+                .expect("the banked block")
+            };
+            assert_eq!(got.ids, want.ids, "layer {layer} round {round}: the picks");
+            assert_eq!(
+                got.out, want.out,
+                "layer {layer} round {round}: the output bytes"
+            );
+            assert_eq!(got.flag, 0, "layer {layer} round {round}: arithmetic flag");
+            let (hits, misses) = resolver.stats();
+            saw_miss |= misses > 0;
+            println!(
+                "layer {layer} round {round}: picks {:?}, hits {hits}, misses {misses}",
+                got.ids
+            );
+        }
+        assert!(
+            saw_miss,
+            "layer {layer}: the rounds never missed; the resolver was not exercised"
+        );
+        let (hits, misses) = resolver.stats();
+        assert_eq!(hits + misses, 6 * moe.top_k as u64, "every pick counted");
+    }
 }

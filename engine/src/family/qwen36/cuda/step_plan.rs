@@ -596,6 +596,9 @@ impl StepPlan {
         let h = dims.shape.hidden;
         list.add(Slot::Q8Final, list.q8(h, 1), FINAL_NORM, LM_HEAD)?;
         list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+        // The tiled-head hybrid's pack, live through LM_HEAD (the vendored head matmul reads
+        // it); dead bytes in a plain native card run, as in the single-device plan.
+        list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
         let vocab = table.head_rows(card)?.len();
         list.add(Slot::Logits, list.row(vocab), LM_HEAD, ARGMAX)?;
         list.add(Slot::ArgmaxPart, Ok(scratch.argmax_part), ARGMAX, ARGMAX)?;
@@ -769,6 +772,11 @@ fn list_slots(
             // covers FINAL_NORM and live slots never share bytes), kept so the final norm depends
             // on no other op's slot.
             list.add(Slot::FinalNormRow, list.row(h), FINAL_NORM, FINAL_NORM)?;
+            // The decode-only tiled-head hybrid: when the load overrode the head to tiles, the
+            // final norm fuses the pack too (the vendored head matmul reads it), so the pack must
+            // live through LM_HEAD. The slot is dead bytes (~32 KiB) in a plain native run - the
+            // plan cannot know the head's kind.
+            list.add(Slot::XfFinal, list.xf(h), FINAL_NORM, LM_HEAD)?;
         }
         WeightLayout::Exl3 => {
             // The fused norm still emits its tiled pack, which the EXL3 head never reads; the
@@ -884,7 +892,13 @@ fn list_moe(
     let m = list.rows;
     match options.layout {
         WeightLayout::Tiled => list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?,
-        WeightLayout::Native => list.add(Slot::Q8Moe, list.q8(h, 1), ADD_NORM, GATE_UP)?,
+        WeightLayout::Native => {
+            list.add(Slot::Q8Moe, list.q8(h, 1), ADD_NORM, GATE_UP)?;
+            // The tiled-experts hybrid rides the native plan: the overridden expert stacks read
+            // this fp16 pack (the epilogue then produces it), so the slot is planned for every
+            // native load - dead bytes (~h x 2) when the hybrid is off.
+            list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?;
+        }
         // The fused norm still emits its tiled pack, which the EXL3 projections never read.
         WeightLayout::Exl3 => list.add(Slot::XfMoe, list.xf(h), ADD_NORM, ADD_NORM)?,
     }
@@ -924,7 +938,11 @@ fn list_moe(
         }
         // One merged pack of `top_k` padded q8_1 rows feeds the ONE down launch of the slots; the
         // forked per-expert packs have no Native form (`check_layout_rows`).
-        WeightLayout::Native => list.add(Slot::Q8Down, list.q8(e.inter, e.top_k), SWIGLU, DOWN)?,
+        WeightLayout::Native => {
+            list.add(Slot::Q8Down, list.q8(e.inter, e.top_k), SWIGLU, DOWN)?;
+            // The hybrid's per-slot swiglu pack (branch 0: native never forks).
+            list.add(Slot::XfDown(0), list.xf(e.inter), SWIGLU, DOWN)?;
+        }
         // One F32 row per pick feeds the grouped down launch.
         WeightLayout::Exl3 => list.add(
             Slot::ExpertAct,
@@ -954,7 +972,9 @@ fn list_moe(
     match options.layout {
         WeightLayout::Tiled => list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?,
         WeightLayout::Native => {
-            list.add(Slot::Q8Shared, list.q8(e.shared_inter, 1), SWIGLU, DOWN)?
+            list.add(Slot::Q8Shared, list.q8(e.shared_inter, 1), SWIGLU, DOWN)?;
+            // The hybrid's shared-expert pack (the overridden shared stacks read it).
+            list.add(Slot::XfShared, list.xf(e.shared_inter), SWIGLU, DOWN)?;
         }
         WeightLayout::Exl3 => list.add(
             Slot::SharedAct,
@@ -1029,6 +1049,9 @@ fn list_card_moe(
     let inter = table.expert_inter(card)?.len();
     let shared_inter = table.shared_inter(card)?.len();
     list.add(Slot::Q8Moe, list.q8(h, 1), ADD_NORM, GATE_UP)?;
+    // The hybrid's fp16 pack, planned beside the native one (the single-device Native arm adds
+    // the same three slots, so the card plan stays the single plan's mirror).
+    list.add(Slot::XfMoe, list.xf(h), ADD_NORM, GATE_UP)?;
     // The NATIVE NormRow lifetime: written by the mixer prologue at MIX_PACK, last read by the
     // argmax over the head's own shard.
     list.add(Slot::NormRow, list.row(h), MIX_PACK, ARGMAX)?;
@@ -1039,10 +1062,12 @@ fn list_card_moe(
     let gate_up = product(&[m, e.top_k, 2 * inter, F32]);
     list.add(Slot::ExpertGu, gate_up, GATE_UP, DOWN)?;
     list.add(Slot::Q8Down, list.q8(inter, e.top_k), SWIGLU, DOWN)?;
+    list.add(Slot::XfDown(0), list.xf(inter), SWIGLU, DOWN)?;
     let down = product(&[m, e.top_k, h, F32]);
     list.add(Slot::ExpertDown, down, DOWN, COMBINE)?;
     list.add(Slot::SharedGu, list.row(2 * shared_inter), GATE_UP, DOWN)?;
     list.add(Slot::Q8Shared, list.q8(shared_inter, 1), SWIGLU, DOWN)?;
+    list.add(Slot::XfShared, list.xf(shared_inter), SWIGLU, DOWN)?;
     list.add(Slot::SharedOut, list.row(h), DOWN, COMBINE)
 }
 /// the rotated inputs, the split-K partial and the sticky arithmetic flag. The sizes are the

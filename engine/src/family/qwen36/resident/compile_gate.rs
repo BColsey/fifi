@@ -33,7 +33,7 @@
 //! `the_chunked_prefill_never_compiles_and_a_one_token_step_does`; the executor-ignores-rules patch
 //! by `rules_with_compile_true_warm_the_decoder_at_open`; the start-passes-false patch by the
 //! `start` rules test; the limit patch by
-//! `the_sixth_distinct_compiled_program_is_refused_before_any_native_call` and the Linux registry
+//! `the_ninth_distinct_compiled_program_is_refused_before_any_native_call` and the Linux registry
 //! test; the teardown-clear patch by `dropping_the_adapter_clears_the_compile_cache`; the eps patch
 //! and the seam `eps_bits: 0` patch by `compiled_and_uncompiled_deltanet_blocks_agree_in_f32_tiny`
 //! and `two_eps_values_and_two_activation_dtypes_trace_distinct_programs`; the clamp patch
@@ -168,12 +168,49 @@ fn first_moe(weights: &super::weights::ResidentWeights) -> Result<&RMoe, EngErro
         .as_moe()
 }
 
+/// The input-norm operand of the first layer with the given mixer kind, and the
+/// post-norm operand of the first layer: the seam's folded norm weights.
+fn first_delta_norm(
+    weights: &super::weights::ResidentWeights,
+) -> Result<&ExecutionTensor, EngError> {
+    weights
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.mixer {
+            RMixer::Delta(_) => Some(&layer.input_norm),
+            RMixer::Attn(_) => None,
+        })
+        .ok_or_else(|| EngError::BadRequest("no DeltaNet layer".into()))
+}
+
+fn first_attn_norm(
+    weights: &super::weights::ResidentWeights,
+) -> Result<&ExecutionTensor, EngError> {
+    weights
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.mixer {
+            RMixer::Attn(_) => Some(&layer.input_norm),
+            RMixer::Delta(_) => None,
+        })
+        .ok_or_else(|| EngError::BadRequest("no attention layer".into()))
+}
+
+fn first_moe_norm(weights: &super::weights::ResidentWeights) -> Result<&ExecutionTensor, EngError> {
+    weights
+        .layers
+        .first()
+        .map(|layer| &layer.post_norm)
+        .ok_or_else(|| EngError::BadRequest("no layer".into()))
+}
+
 /// The seam arguments of one compiled DeltaNet step on `w`, with an explicit epsilon and
 /// activation dtype: the direct seam calls below drive both fields, which the decoder's own
 /// path always takes from the model shape. `inputs` is the (x, rec, ring) triple.
 fn delta_seam_args<'a>(
     shape: &HostShape,
     w: &'a RDelta,
+    in_norm: &'a ExecutionTensor,
     consts: &'a super::ops::Consts,
     inputs: (
         &'a ExecutionTensor,
@@ -185,10 +222,20 @@ fn delta_seam_args<'a>(
 ) -> CompileDeltaArgs<'a> {
     let (x, rec, ring) = inputs;
     let d = &shape.delta;
+    // The fused middle swaps the two norm slots for the qk_eps and sqrt_kd scalars; the same
+    // rule as `compiled::delta_args` and `delta::step_projected`, on the shared helpers.
+    // `dim(...).unwrap()` matches this non-Result builder's existing style.
+    let taps = dim(d.conv_kernel - 1).unwrap();
+    let fused = super::delta::fused_middle_applicable(
+        taps,
+        dim(d.key_dim).unwrap(),
+        dim(d.value_dim).unwrap(),
+    );
     CompileDeltaArgs {
         x,
         rec,
         ring,
+        in_norm,
         packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
         plain: [
             &w.conv_taps,
@@ -197,7 +244,7 @@ fn delta_seam_args<'a>(
             &w.dt_bias,
             &w.norm,
         ],
-        consts: [&consts.zero, &consts.q_norm_w, &consts.k_norm_w],
+        consts: consts.middle_consts(fused),
         hidden: dim(shape.hidden).unwrap(),
         dims: [
             dim(d.key_heads).unwrap(),
@@ -310,6 +357,7 @@ fn compiled_delta_batches_keep_independent_live_trajectories_tiny() {
                 let args = delta_seam_args(
                     &shape,
                     w,
+                    first_delta_norm(&decoder.weights).unwrap(),
                     &decoder.weights.consts,
                     (&x, &first.0, &first.1),
                     1e-6,
@@ -340,6 +388,7 @@ fn compiled_delta_batches_keep_independent_live_trajectories_tiny() {
                     let args = delta_seam_args(
                         &shape,
                         w,
+                        first_delta_norm(&decoder.weights).unwrap(),
                         &decoder.weights.consts,
                         (&x1, &solo[slot].0, &solo[slot].1),
                         1e-6,
@@ -446,6 +495,7 @@ fn compiled_delta_rows_refuse_invalid_operands_before_admission_tiny() {
     let args = delta_seam_args(
         &shape,
         w,
+        first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         (&x2, &rec, &ring),
         1e-6,
@@ -499,6 +549,7 @@ fn compiled_delta_rows_refuse_invalid_operands_before_admission_tiny() {
         let args = delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&decoder.weights).unwrap(),
             &decoder.weights.consts,
             (&x, &rec, &ring),
             1e-6,
@@ -532,6 +583,7 @@ fn compiled_delta_rows_refuse_invalid_operands_before_admission_tiny() {
     let args = delta_seam_args(
         &shape,
         w,
+        first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         (&x1, &rec, &ring),
         1e-6,
@@ -588,6 +640,7 @@ fn compiled_delta_rows_refuse_one_tap_but_keep_solo_tiny() {
             let mut args = delta_seam_args(
                 &shape,
                 w,
+                first_delta_norm(&decoder.weights).unwrap(),
                 &decoder.weights.consts,
                 (&x, &rec, &ring),
                 1e-6,
@@ -615,6 +668,7 @@ fn compiled_delta_rows_refuse_one_tap_but_keep_solo_tiny() {
         let mut args = delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&decoder.weights).unwrap(),
             &decoder.weights.consts,
             (&x1, &rec, &ring),
             1e-6,
@@ -816,14 +870,14 @@ fn dropping_the_adapter_clears_the_compile_cache() {
     reset_compile_state();
 }
 
-/// The program limit of one adapter context: five seam calls with five distinct epsilon constants
-/// register five programs of THIS adapter, and a call whose key is a SIXTH distinct one is refused
+/// The program limit of one adapter context: eight seam calls with eight distinct epsilon constants
+/// register eight programs of THIS adapter, and a call whose key is a NINTH distinct one is refused
 /// with `BadRequest` BEFORE any native call, so the counters do not move. The portable registry
 /// logic carries its own Linux test; this one runs the refusal through the real seam. Mutation
-/// check (the registry-limit patch): with the limit raised to 6, the sixth call succeeds and the
-/// `unwrap_err` fails.
+/// check (the registry-limit patch): with the limit raised to 9, the ninth call succeeds and the
+/// `Ok` arm's panic fires.
 #[test]
-fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
+fn the_ninth_distinct_compiled_program_is_refused_before_any_native_call() {
     let _serial = crate::native_test_lock();
     reset_compile_state();
     let (ckpt, host) = tiny_host();
@@ -839,21 +893,30 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
     let w = first_delta(&decoder.weights).unwrap();
     let (x, rec, ring) = zero_delta_inputs(&mut decoder.kernels, &shape, Dtype::F32).unwrap();
     let inputs = (&x, &rec, &ring);
-    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6] {
-        let args = delta_seam_args(&shape, w, &decoder.weights.consts, inputs, eps, Dtype::F32);
+    for eps in [1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6, 6e-6, 7e-6, 8e-6] {
+        let args = delta_seam_args(
+            &shape,
+            w,
+            first_delta_norm(&decoder.weights).unwrap(),
+            &decoder.weights.consts,
+            inputs,
+            eps,
+            Dtype::F32,
+        );
         decoder.kernels.compiled_delta_step(&args).unwrap();
     }
     let warmed = compile_stats::read();
     assert_eq!(
-        warmed.delta.traces, 5,
-        "five distinct epsilons traced five programs (the native body count)"
+        warmed.delta.traces, 8,
+        "eight distinct epsilons traced eight programs (the native body count)"
     );
     let refused = decoder.kernels.compiled_delta_step(&delta_seam_args(
         &shape,
         w,
+        first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         inputs,
-        6e-6,
+        9e-6,
         Dtype::F32,
     ));
     let message = match refused {
@@ -862,7 +925,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
         Ok(_) => panic!("expected BadRequest, got a successful step"),
     };
     assert!(
-        message.contains("at most 5 compiled programs per adapter"),
+        message.contains("at most 8 compiled programs per adapter"),
         "the refusal names the limit: {message}"
     );
     let stats = compile_stats::read();
@@ -871,7 +934,7 @@ fn the_sixth_distinct_compiled_program_is_refused_before_any_native_call() {
         "the refused call reached no native call"
     );
     assert_eq!(
-        stats.delta.traces, 5,
+        stats.delta.traces, 8,
         "the refused call traced nothing (the native body count stayed)"
     );
     reset_compile_state();
@@ -953,11 +1016,29 @@ fn compiled_and_uncompiled_attention_blocks_agree_in_f32_tiny() {
         let x = cast_to(&mut ctx, &x_zero, Activation::F32.dtype()).unwrap();
         // The eager arm: the uncompiled step on its own cache.
         let eager_cache = cache.share();
-        let plain = super::attn::step(&mut ctx, &shape, w, eager_cache, pos, &x).unwrap();
+        let plain = super::attn::step(
+            &mut ctx,
+            &shape,
+            w,
+            eager_cache,
+            pos,
+            &x,
+            first_attn_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
         // The compiled arm: the same step with the seam on, on the twin cache.
         ctx.compile = true;
         let twin = cache.share();
-        let compiled_run = super::attn::step(&mut ctx, &shape, w, twin, pos, &x).unwrap();
+        let compiled_run = super::attn::step(
+            &mut ctx,
+            &shape,
+            w,
+            twin,
+            pos,
+            &x,
+            first_attn_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
         cache = compiled_run.cache;
         assert_same_metadata("block output", &plain.out, &compiled_run.out);
         ctx.kernels
@@ -1032,9 +1113,22 @@ fn compiled_and_uncompiled_moe_blocks_agree_in_f32_tiny() {
             consts: &decoder.weights.consts,
             compile: false,
         };
-        let (plain, plain_route) = moe::step_device(&mut ctx, &shape, w, &x).unwrap();
-        let (compiled_run, compiled_route) =
-            compiled::moe_step_device(&mut ctx, &shape, w, &x).unwrap();
+        let (plain, plain_route) = moe::step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
+        let (compiled_run, compiled_route) = compiled::moe_step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )
+        .unwrap();
         assert_same_metadata("moe output", &plain, &compiled_run);
         assert_same_metadata("moe gates", &plain_route.gates, &compiled_route.gates);
         let (plain_ids, compiled_ids) = (
@@ -1179,13 +1273,16 @@ fn moe_seam_args<'a>(
     x: &'a ExecutionTensor,
     act: Dtype,
     renorm: bool,
+    post_norm: &'a ExecutionTensor,
 ) -> CompileMoeArgs<'a> {
     CompileMoeArgs {
         x,
+        post_norm,
+        eps: shape.eps,
         router_t: &w.router_t,
         shared: [&w.shared_gate, &w.shared_up, &w.shared_down],
         shared_scalar_t: &w.shared_scalar_t,
-        stacks: [&w.gate, &w.up, &w.down],
+        stacks: [&w.gate_up, &w.down],
         hidden: dim(shape.hidden).unwrap(),
         experts: dim(shape.moe.experts).unwrap(),
         top_k: dim(shape.moe.top_k).unwrap(),
@@ -1284,7 +1381,14 @@ fn compiled_moe_batches_match_solo_rows_without_retrace_tiny() {
                 let host_x = f32_tensor(vec![batch, dim(h).unwrap()], &input).unwrap();
                 let x = decoder.kernels.import_tensor(&host_x).unwrap();
                 let x = decoder.kernels.cast(&x, act).unwrap();
-                let mut args = moe_seam_args(&shape, w, &x, act, renorm);
+                let mut args = moe_seam_args(
+                    &shape,
+                    w,
+                    &x,
+                    act,
+                    renorm,
+                    first_moe_norm(&decoder.weights).unwrap(),
+                );
                 args.router_t = &router;
                 let got = decoder.kernels.compiled_moe_step(&args).unwrap();
                 assert_eq!(got.out.shape(), [batch, dim(h).unwrap()]);
@@ -1306,7 +1410,14 @@ fn compiled_moe_batches_match_solo_rows_without_retrace_tiny() {
                             .unwrap();
                     let solo = decoder.kernels.import_tensor(&solo).unwrap();
                     let solo = decoder.kernels.cast(&solo, act).unwrap();
-                    let mut args = moe_seam_args(&shape, w, &solo, act, renorm);
+                    let mut args = moe_seam_args(
+                        &shape,
+                        w,
+                        &solo,
+                        act,
+                        renorm,
+                        first_moe_norm(&decoder.weights).unwrap(),
+                    );
                     args.router_t = &router;
                     let control = decoder.kernels.compiled_moe_step(&args).unwrap();
                     assert_eq!(control.ids.shape(), [dim(k).unwrap()]);
@@ -1418,7 +1529,14 @@ fn compiled_moe_batches_keep_nonfinite_health_per_row_tiny() {
                 let x = f32_tensor(vec![batch, dim(shape.hidden).unwrap()], &input).unwrap();
                 let x = decoder.kernels.import_tensor(&x).unwrap();
                 let x = decoder.kernels.cast(&x, act).unwrap();
-                let args = moe_seam_args(&shape, w, &x, act, shape.moe.renorm);
+                let args = moe_seam_args(
+                    &shape,
+                    w,
+                    &x,
+                    act,
+                    shape.moe.renorm,
+                    first_moe_norm(&decoder.weights).unwrap(),
+                );
                 let got = decoder.kernels.compiled_moe_step(&args).unwrap();
                 let health = moe_seam_values(&mut decoder.kernels, &got.health);
                 assert_eq!(health.len(), batch as usize);
@@ -1467,7 +1585,14 @@ fn compiled_moe_refuses_unsupported_batches_before_admission_tiny() {
         )
         .unwrap();
         let x = decoder.kernels.import_tensor(&x).unwrap();
-        let args = moe_seam_args(&shape, w, &x, Dtype::F32, shape.moe.renorm);
+        let args = moe_seam_args(
+            &shape,
+            w,
+            &x,
+            Dtype::F32,
+            shape.moe.renorm,
+            first_moe_norm(&decoder.weights).unwrap(),
+        );
         let error = decoder.kernels.compiled_moe_step(&args).err().unwrap();
         assert!(matches!(error, EngError::BadRequest(m) if m.contains("B in 1, 2, 4, or 8")));
     }
@@ -1480,7 +1605,14 @@ fn compiled_moe_refuses_unsupported_batches_before_admission_tiny() {
     )
     .unwrap();
     let x = decoder.kernels.import_tensor(&x).unwrap();
-    let args = moe_seam_args(&shape, w, &x, Dtype::F32, shape.moe.renorm);
+    let args = moe_seam_args(
+        &shape,
+        w,
+        &x,
+        Dtype::F32,
+        shape.moe.renorm,
+        first_moe_norm(&decoder.weights).unwrap(),
+    );
     let valid = decoder.kernels.compiled_moe_step(&args).unwrap();
     assert_finite(
         "valid MoE after refusals",
@@ -1517,6 +1649,7 @@ fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
         let args = delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&f32_decoder.weights).unwrap(),
             &f32_decoder.weights.consts,
             inputs,
             eps,
@@ -1541,6 +1674,7 @@ fn two_eps_values_and_two_activation_dtypes_trace_distinct_programs() {
         let args = delta_seam_args(
             &shape,
             w16,
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             inputs16,
             eps,
@@ -1596,6 +1730,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             (&x16, &rec16, &ring),
             1e-6,
@@ -1614,6 +1749,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&bf16_decoder.weights).unwrap(),
             &bf16_decoder.weights.consts,
             (&x32, &rec, &ring),
             1e-6,
@@ -1643,6 +1779,7 @@ fn the_compiled_delta_block_refuses_wrong_operands_before_any_native_call() {
         .compiled_delta_step(&delta_seam_args(
             &shape,
             w32,
+            first_delta_norm(&f32_decoder.weights).unwrap(),
             &f32_decoder.weights.consts,
             (&x, &rec32, &ring32),
             1e-6,
@@ -1688,6 +1825,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
     let mut args = delta_seam_args(
         &shape,
         delta_w,
+        first_delta_norm(&decoder.weights).unwrap(),
         &decoder.weights.consts,
         (&x, &rec, &ring),
         1e-6,
@@ -1705,6 +1843,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
         let mut args = delta_seam_args(
             &shape,
             delta_w,
+            first_delta_norm(&decoder.weights).unwrap(),
             &decoder.weights.consts,
             (&x, &rec, &ring),
             1e-6,
@@ -1723,18 +1862,21 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
             "the delta {what} shape refusal: {error:?}"
         );
     }
-    // The gate stack slot gets the shared gate weight: rank 2 against the needed [E, ., H].
+    // The stacked gate/up stack slot gets the shared gate weight: rank 2 against the needed
+    // [E, ., H].
     let stack_args = CompileMoeArgs {
         x: &x,
         router_t: &moe_w.router_t,
         shared: [&moe_w.shared_gate, &moe_w.shared_up, &moe_w.shared_down],
         shared_scalar_t: &moe_w.shared_scalar_t,
-        stacks: [&moe_w.shared_gate, &moe_w.up, &moe_w.down],
+        stacks: [&moe_w.shared_gate, &moe_w.down],
         hidden: dim(shape.hidden).unwrap(),
         experts: dim(shape.moe.experts).unwrap(),
         top_k: dim(shape.moe.top_k).unwrap(),
         renorm: shape.moe.renorm,
         act: Dtype::F32,
+        eps: shape.eps,
+        post_norm: first_moe_norm(&decoder.weights).unwrap(),
     };
     let error = decoder
         .kernels
@@ -1742,7 +1884,7 @@ fn the_compiled_blocks_refuse_inconsistent_weight_shapes_before_admission() {
         .err()
         .unwrap();
     assert!(
-        matches!(&error, EngError::BadRequest(m) if m.contains("the gate stack holds the logical shape")),
+        matches!(&error, EngError::BadRequest(m) if m.contains("the stacked gate/up operand holds the logical shape")),
         "the moe stack refusal: {error:?}"
     );
     let stats = compile_stats::read();
@@ -1880,8 +2022,26 @@ fn deltanet_block_pair(
         compile: false,
     };
     let x = cast_to(&mut ctx, &x_zero, act).unwrap();
-    let plain = delta::step(&mut ctx, &shape, w, &rec, &ring, &x).unwrap();
-    let compiled_run = compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x).unwrap();
+    let plain = delta::step(
+        &mut ctx,
+        &shape,
+        w,
+        &rec,
+        &ring,
+        &x,
+        first_delta_norm(&decoder.weights).unwrap(),
+    )
+    .unwrap();
+    let compiled_run = compiled::delta_step(
+        &mut ctx,
+        &shape,
+        w,
+        &rec,
+        &ring,
+        &x,
+        first_delta_norm(&decoder.weights).unwrap(),
+    )
+    .unwrap();
     // Equal shapes and dtypes on all three outputs, before any readback.
     assert_same_metadata("block output", &plain.out, &compiled_run.out);
     assert_same_metadata("recurrent state", &plain.rec, &compiled_run.rec);
@@ -2676,7 +2836,15 @@ mod fault_tests {
         if announce_count(ctx.kernels) {
             return Ok(());
         }
-        let got = compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x)?;
+        let got = compiled::delta_step(
+            &mut ctx,
+            &shape,
+            w,
+            &rec,
+            &ring,
+            &x,
+            first_delta_norm(&decoder.weights).unwrap(),
+        )?;
         ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])
     }
 
@@ -2701,7 +2869,13 @@ mod fault_tests {
         if announce_count(ctx.kernels) {
             return Ok(());
         }
-        let (out, route) = compiled::moe_step_device(&mut ctx, &shape, w, &x)?;
+        let (out, route) = compiled::moe_step_device(
+            &mut ctx,
+            &shape,
+            w,
+            &x,
+            first_moe_norm(&decoder.weights).unwrap(),
+        )?;
         ctx.kernels
             .evaluate(&[&out, route.ids.ids(), &route.gates, &route.health])
     }
@@ -2727,6 +2901,7 @@ mod fault_tests {
         let args = delta_seam_args(
             &shape,
             w,
+            first_delta_norm(&decoder.weights).unwrap(),
             &decoder.weights.consts,
             (&x, &rec, &ring),
             1e-6,
@@ -2762,7 +2937,14 @@ mod fault_tests {
             vec![2, dim(shape.hidden)?],
             &vec![0.0; 2 * shape.hidden],
         )?)?;
-        let args = moe_seam_args(shape, w, &x, Dtype::F32, false);
+        let args = moe_seam_args(
+            shape,
+            w,
+            &x,
+            Dtype::F32,
+            false,
+            first_moe_norm(&decoder.weights).unwrap(),
+        );
         if announce_count(&decoder.kernels) {
             return Ok(());
         }

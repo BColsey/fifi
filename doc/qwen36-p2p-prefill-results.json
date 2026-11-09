@@ -1,0 +1,264 @@
+{
+  "date_local": "2026-11-08 America/New_York",
+  "description": "Single-host experimental measurements; rates are prompt tokens divided by wall time through the complete two-token reply. Same-binary option-off and option-on runs use identical benchmark inputs.",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores",
+    "gpu_order": [
+      "NVIDIA GeForce RTX 3060 12 GB",
+      "NVIDIA GeForce RTX 3080 10 GB"
+    ],
+    "driver": "615.78.08 with local P2P patch",
+    "kernel": "7.0.0-42-generic",
+    "link": "PCIe through host bridge"
+  },
+  "model": {
+    "file": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "context_tokens": 131072,
+    "kv_dtype": "q8",
+    "gpu0_host_expert_bytes_request": 2147483648,
+    "gpu1_host_expert_bytes_request": 4294967296,
+    "synchronized_broadcasts": true,
+    "prefix_reuse": false
+  },
+  "provenance": {
+    "base_commit": "84d58d8c1b55739b46afb8bf8c9610ab316a6654",
+    "old_binary_sha256": "f73ca8c2b0228a62a8410d9b0a5d5124b9ae1e2a39ad25188bf78df5b923acf2",
+    "same_binary_sha256": "44e7bd3f07ccf84a0fd45a63b37a4edb3a29cea6e519884f4fb16488422f324c",
+    "benchmark_script_sha256": "cc8d51af6d67f75200a6582d4235efdc94bccb36c1eb45ea5fe868344956516f",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)"
+  },
+  "same_binary_524_option_off": {
+    "model": "fifi-q36",
+    "repeat": 100,
+    "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+    "samples": [
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.397644,
+        "estimated_prompt_tokens_per_second": 31.956,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000001"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.373635,
+        "estimated_prompt_tokens_per_second": 32.003,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000002"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.378708,
+        "estimated_prompt_tokens_per_second": 31.993,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000003"
+      }
+    ],
+    "median_seconds": 16.378708,
+    "median_prompt_tokens_per_second": 31.993
+  },
+  "same_binary_524_option_on": {
+    "model": "fifi-q36",
+    "repeat": 100,
+    "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+    "samples": [
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.069502,
+        "estimated_prompt_tokens_per_second": 32.608,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000001"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 15.993278,
+        "estimated_prompt_tokens_per_second": 32.764,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000002"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.01243,
+        "estimated_prompt_tokens_per_second": 32.725,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000003"
+      }
+    ],
+    "median_seconds": 16.01243,
+    "median_prompt_tokens_per_second": 32.725
+  },
+  "old_binary_524": {
+    "model": "fifi-q36",
+    "repeat": 100,
+    "payload_sha256": "30d2e3484b1f4583f6e329fe9f8f9263e51894aa7898aa11fe107829277ee8ab",
+    "samples": [
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.39936,
+        "estimated_prompt_tokens_per_second": 31.952,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000005"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.364854,
+        "estimated_prompt_tokens_per_second": 32.02,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000006"
+      },
+      {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 16.394639,
+        "estimated_prompt_tokens_per_second": 31.962,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000007"
+      }
+    ],
+    "median_seconds": 16.394639,
+    "median_prompt_tokens_per_second": 31.962
+  },
+  "old_binary_4274": {
+    "passed": true,
+    "configured_context": 131072,
+    "prompt_tokens": 4274,
+    "completion_tokens": 2,
+    "answer": "4",
+    "seconds": 133.347
+  },
+  "new_binary_4274_option_on": {
+    "model": "fifi-q36",
+    "repeat": 850,
+    "payload_sha256": "83bc090b8c20bbf350317d552c592dd83fd0f8a0e9505c1ed895b914be94e890",
+    "samples": [
+      {
+        "prompt_tokens": 4274,
+        "completion_tokens": 2,
+        "answer": "4",
+        "seconds": 130.515445,
+        "estimated_prompt_tokens_per_second": 32.747,
+        "context_limit": 131072,
+        "request_id": "chatcmpl-0000000000000004"
+      }
+    ],
+    "median_seconds": 130.515445,
+    "median_prompt_tokens_per_second": 32.747
+  },
+  "server_first_token_telemetry": {
+    "same_binary_524_option_off": [
+      {
+        "request_id": "chatcmpl-0000000000000001",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16363.5,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000002",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16340.1,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000003",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16343.9,
+        "outcome": "ok"
+      }
+    ],
+    "same_binary_524_option_on": [
+      {
+        "request_id": "chatcmpl-0000000000000001",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16035.5,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000002",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 15959.4,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000003",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 15978.8,
+        "outcome": "ok"
+      }
+    ],
+    "old_binary_524": [
+      {
+        "request_id": "chatcmpl-0000000000000005",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16365.4,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000006",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16330.9,
+        "outcome": "ok"
+      },
+      {
+        "request_id": "chatcmpl-0000000000000007",
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 16360.9,
+        "outcome": "ok"
+      }
+    ],
+    "old_binary_4274": [
+      {
+        "request_id": "chatcmpl-0000000000000001",
+        "prompt_tokens": 4274,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 133308.0,
+        "outcome": "ok"
+      }
+    ],
+    "new_binary_4274_option_on": [
+      {
+        "request_id": "chatcmpl-0000000000000004",
+        "prompt_tokens": 4274,
+        "completion_tokens": 2,
+        "time_to_first_token_ms": 130477.0,
+        "outcome": "ok"
+      }
+    ]
+  },
+  "checks": {
+    "peer_gpu_exact_logit_and_head_skip_test": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5785 filtered out; finished in 10.56s",
+    "original_session_regression_test": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5785 filtered out; finished in 10.57s",
+    "note": "The peer test compares every logit at two decode points and confirms prompt-only feeds do not use a deliberately corrupted output head."
+  },
+  "limitations": [
+    "The 4274-token comparison has one sample per arm.",
+    "No end-to-end 131072-token prompt was run; the configured context was 131072.",
+    "This is one machine and model; results are not a general throughput guarantee."
+  ]
+}

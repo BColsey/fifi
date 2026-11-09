@@ -1,0 +1,171 @@
+{
+  "schema": "fifi.greedy-trace-integrated-2080.v1",
+  "recorded_utc": "2026-11-08T21:01:27.712868+00:00",
+  "model": "fifi-q36-2080ti",
+  "context_tokens": 131072,
+  "inputs": {
+    "commit": "14259decbd5f874d0cb7ac470ea55104768ce0fb",
+    "original_start_sha256": "85dbd59335a009da7782e65c85bc4ada66adc2cacbafdaf9299ac094ad501b57",
+    "config_sha256": "c35afd5952be0054956cb07b794d103af60d43d856d7a3494c99543f5ec8c05f",
+    "baseline_binary_sha256": "fc7a5b7173b062a3a697e98444c920607e9fae4b4e7f35dbf98b4f735b58a24e",
+    "candidate_binary_sha256": "448cb6b679525d6e7169295858c9931a7e1e733de8be3b1e5f27745639afecef"
+  },
+  "cases": {
+    "basic": {
+      "baseline": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 0,
+          "seconds": 32.4736
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 0,
+          "seconds": 26.7491
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+          "captured_positions": 0,
+          "seconds": 24.0768
+        }
+      ],
+      "integrated_prefix_off": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 28.8687
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+          "captured_positions": 2,
+          "seconds": 25.1011
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 1305,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683",
+          "captured_positions": 2,
+          "seconds": 22.7775
+        }
+      ]
+    },
+    "semantic": {
+      "baseline": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 0,
+          "seconds": 8.5326
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 0,
+          "seconds": 8.1222
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 356,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7",
+          "captured_positions": 0,
+          "seconds": 7.8206
+        }
+      ],
+      "integrated_prefix_off": [
+        {
+          "label": "a_cold",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 6.2797
+        },
+        {
+          "label": "a_repeat",
+          "prompt_tokens": 354,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+          "captured_positions": 2,
+          "seconds": 5.9482
+        },
+        {
+          "label": "b_changed",
+          "prompt_tokens": 356,
+          "completion_tokens": 2,
+          "reused_tokens": 0,
+          "finish_reason": "stop",
+          "content_sha256": "19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7",
+          "captured_positions": 2,
+          "seconds": 5.7592
+        }
+      ]
+    }
+  },
+  "guard": {
+    "clean_samples": 105,
+    "guard_sha256": "e8194366cdc543d1873a8e4fbcacefc431e5e4187ddcc57dd248049a6b3d44ea",
+    "candidate_interrupted": "other assistant jobs and CPU builds appeared; no prefix-on result"
+  },
+  "deployed_service": {
+    "binary_sha256": "448cb6b679525d6e7169295858c9931a7e1e733de8be3b1e5f27745639afecef",
+    "tiered_prefix": "0",
+    "keyless_lan_smoke": {
+      "mode": "candidate",
+      "model": "fifi-q36-2080ti",
+      "client_api_key": "none",
+      "completion_tokens": 20,
+      "finish_reason": "length",
+      "content_sha256": "d68dbfb354c79395d3263fb5121906a151c880c25b5ea040d969d328685e4073",
+      "captured_positions": 20,
+      "all_greedy": true,
+      "no_selected_probabilities": true
+    }
+  },
+  "limits": [
+    "Two short deterministic prompts; no full logits comparison or browser automation.",
+    "Prefix-on arm was interrupted before a result; no prefix speedup is established."
+  ]
+}

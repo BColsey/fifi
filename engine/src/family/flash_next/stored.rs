@@ -602,6 +602,255 @@ pub(crate) fn read_stack_into(
     Ok(())
 }
 
+/// Expands BF16 values to F32 inside one buffer, with no second buffer.
+///
+/// `region` holds `count` F32 slots (`4 * count` bytes). On entry the BF16 values sit in its upper
+/// half, `region[2 * count..]`. On return `region` holds the F32 values. Value `i` is read from
+/// byte `2 * count + 2 * i` and written to byte `4 * i`. The write ends at `4 * i + 4`, which is at
+/// most `2 * count + 2 * i + 2`, so a write never reaches a BF16 value that is still unread.
+/// A length that is not a multiple of 4 returns `BadRequest`.
+pub(crate) fn widen_bf16_in_place(region: &mut [u8]) -> Result<(), EngError> {
+    if !region.len().is_multiple_of(4) {
+        return Err(EngError::BadRequest(
+            "an F32 region holds whole 4-byte values".into(),
+        ));
+    }
+    let half = region.len() / 2;
+    for i in 0..half / 2 {
+        let (low, high) = (region[half + 2 * i], region[half + 2 * i + 1]);
+        region[4 * i..4 * i + 4].copy_from_slice(&[0, 0, low, high]);
+    }
+    Ok(())
+}
+
+/// The stacked byte range of one role (`weight`, `scales`, or `biases`): the gate bytes then the
+/// up bytes of one expert slice, as ONE wrapped operand of both projections requires.
+fn stacked_role(gate: &RoleRange, up: &RoleRange, offset: usize) -> Result<RoleRange, EngError> {
+    if gate.dtype != up.dtype || gate.shape.get(2..) != up.shape.get(2..) {
+        return Err(EngError::BadRequest(
+            "the gate and up stacks differ in dtype or trailing shape".into(),
+        ));
+    }
+    let rows = gate
+        .shape
+        .get(1)
+        .and_then(|&rows| rows.checked_add(*up.shape.get(1)?))
+        .ok_or_else(|| EngError::BadRequest("the stacked row count overflows".into()))?;
+    let mut shape = gate.shape.clone();
+    shape[1] = rows;
+    Ok(RoleRange {
+        offset,
+        slice_len: gate
+            .slice_len
+            .checked_add(up.slice_len)
+            .ok_or_else(|| EngError::BadRequest("the stacked slice size overflows".into()))?,
+        dtype: gate.dtype,
+        shape,
+    })
+}
+
+/// Places the stacked gate/up stack of two layouts of the SAME expert count and quantization
+/// from `base`, a page multiple: every slice slot of every role holds the gate bytes then the up
+/// bytes of one expert, so the wrapped operand `[experts, rows_g + rows_u, cols]` serves both
+/// projections of one `gather_qmm` call.
+pub(crate) fn stacked_layout(
+    gate: &StackLayout,
+    up: &StackLayout,
+    base: usize,
+    page: usize,
+) -> Result<StackLayout, EngError> {
+    let overflow = || EngError::BadRequest("the stacked layout overflows".into());
+    if page == 0 || !base.is_multiple_of(page) {
+        return Err(EngError::BadRequest(
+            "the stacked layout needs a base at a page multiple".into(),
+        ));
+    }
+    if gate.count != up.count || gate.spec != up.spec {
+        return Err(EngError::BadRequest(
+            "the gate and up stacks differ in experts or quantization".into(),
+        ));
+    }
+    // Every consumer splits the stacked product at the half of its output rows, so the two
+    // projections must contribute the SAME row count - an asymmetric pair would mis-split
+    // silently.
+    if gate.logical_shape.get(1) != up.logical_shape.get(1) {
+        return Err(EngError::BadRequest(
+            "the gate and up stacks differ in output rows".into(),
+        ));
+    }
+    let count = usize::try_from(gate.count).map_err(|_| overflow())?;
+    let mut cursor = base;
+    let mut place = |gate: &RoleRange, up: &RoleRange| -> Result<RoleRange, EngError> {
+        let role = stacked_role(gate, up, cursor)?;
+        let total = role.slice_len.checked_mul(count).ok_or_else(overflow)?;
+        cursor = role
+            .offset
+            .checked_add(total)
+            .and_then(|end| end.checked_next_multiple_of(page))
+            .ok_or_else(overflow)?;
+        Ok(role)
+    };
+    let payload = place(&gate.payload, &up.payload)?;
+    let scales = place(&gate.scales, &up.scales)?;
+    let biases = match (&gate.biases, &up.biases) {
+        (Some(gate), Some(up)) => Some(place(gate, up)?),
+        (None, None) => None,
+        _ => {
+            return Err(EngError::BadRequest(
+                "the gate and up stacks differ in bias presence".into(),
+            ));
+        }
+    };
+    let logical_shape = {
+        // The stacked logical shape sums the OUTPUT rows of the two projections; the input width
+        // and the quantization stay those of the two stacks (already checked equal).
+        let mut shape = gate.logical_shape.clone();
+        let rows = gate
+            .logical_shape
+            .get(1)
+            .and_then(|&rows| rows.checked_add(*up.logical_shape.get(1)?))
+            .ok_or_else(|| EngError::BadRequest("the stacked logical shape overflows".into()))?;
+        shape[1] = rows;
+        shape
+    };
+    Ok(StackLayout {
+        count: gate.count,
+        payload,
+        scales,
+        biases,
+        logical_shape,
+        spec: gate.spec,
+        end: cursor,
+    })
+}
+
+/// The layouts of one stacked gate/up import: the two narrow stacks (the stored slice sizes)
+/// and the stacked target (the joined slots, optionally the widened form).
+pub(crate) struct StackedLayouts<'a> {
+    pub(crate) gate: &'a StackLayout,
+    pub(crate) up: &'a StackLayout,
+    pub(crate) stacked: &'a StackLayout,
+}
+
+/// Reads the gate and up expert slices of one layer into the slots of `wide` (a stacked layout of
+/// the two stacks, optionally the widened form). Every slice slot of every role holds the gate
+/// bytes then the up bytes of one expert. With `f32_scales` the scales and biases slots hold F32
+/// values: the narrow pair reads into the upper half of each slot and widens in place, which
+/// keeps the gate values before the up values.
+pub(crate) fn read_stacked_into(
+    ckpt: &StreamedCheckpoint,
+    gate: &SlicedWeight,
+    up: &SlicedWeight,
+    indices: &[u32],
+    dst: &mut [u8],
+    layouts: &StackedLayouts<'_>,
+    f32_scales: bool,
+) -> Result<(), EngError> {
+    let (gate_narrow, up_narrow, wide) = (layouts.gate, layouts.up, layouts.stacked);
+    if indices.is_empty() || u32::try_from(indices.len()).ok() != Some(wide.count) {
+        return Err(EngError::BadRequest(format!(
+            "expert stack of {} needs {} slices, received {}",
+            gate.stem,
+            wide.count,
+            indices.len()
+        )));
+    }
+    if wide.end > dst.len() {
+        return Err(EngError::BadRequest(format!(
+            "expert stack of {} needs {} bytes, the destination holds {}",
+            gate.stem,
+            wide.end,
+            dst.len()
+        )));
+    }
+    for weight in [gate, up] {
+        if let Some(&index) = indices.iter().find(|&&index| index >= weight.slices) {
+            return Err(EngError::BadRequest(format!(
+                "slice {index} is outside {} slices of {}",
+                weight.slices, weight.stem
+            )));
+        }
+    }
+    let mut read_role = |role: &str,
+                         g: &RoleRange,
+                         u: &RoleRange,
+                         wide_role: &RoleRange,
+                         widen: bool|
+     -> Result<(), EngError> {
+        let pair = g
+            .slice_len
+            .checked_add(u.slice_len)
+            .ok_or_else(|| EngError::BadRequest(format!("stacked {role} pair overflows")))?;
+        for (rank, &index) in indices.iter().enumerate() {
+            let offset_error = || EngError::BadRequest(format!("stacked {role} offset overflows"));
+            let slot = wide_role
+                .offset
+                .checked_add(
+                    rank.checked_mul(wide_role.slice_len)
+                        .ok_or_else(offset_error)?,
+                )
+                .ok_or_else(offset_error)?;
+            let (gate_at, up_at) = if widen {
+                (
+                    slot.checked_add(pair).ok_or_else(offset_error)?,
+                    slot.checked_add(pair)
+                        .and_then(|at| at.checked_add(g.slice_len))
+                        .ok_or_else(offset_error)?,
+                )
+            } else {
+                (
+                    slot,
+                    slot.checked_add(g.slice_len).ok_or_else(offset_error)?,
+                )
+            };
+            for (weight, at, len) in [(gate, gate_at, g.slice_len), (up, up_at, u.slice_len)] {
+                let end = at
+                    .checked_add(len)
+                    .filter(|&end| end <= dst.len())
+                    .ok_or_else(|| {
+                        EngError::BadRequest(format!("stacked {role} range passes the end"))
+                    })?;
+                let key = format!("{}.{role}", weight.stem);
+                counted_read(len, || ckpt.read_slice_into(&key, index, &mut dst[at..end]))?;
+            }
+            if widen {
+                let end =
+                    slot.checked_add(pair.checked_mul(2).ok_or_else(|| {
+                        EngError::BadRequest("the widened slot overflows".into())
+                    })?)
+                    .filter(|&end| end <= dst.len())
+                    .ok_or_else(|| {
+                        EngError::BadRequest("stacked widened slot passes the end".into())
+                    })?;
+                widen_bf16_in_place(&mut dst[slot..end])?;
+            }
+        }
+        Ok(())
+    };
+    read_role(
+        "weight",
+        &gate_narrow.payload,
+        &up_narrow.payload,
+        &wide.payload,
+        false,
+    )?;
+    read_role(
+        "scales",
+        &gate_narrow.scales,
+        &up_narrow.scales,
+        &wide.scales,
+        f32_scales,
+    )?;
+    if let (Some(g), Some(u), Some(w)) = (
+        gate_narrow.biases.as_ref(),
+        up_narrow.biases.as_ref(),
+        wide.biases.as_ref(),
+    ) {
+        read_role("biases", g, u, w, f32_scales)?;
+    }
+    Ok(())
+}
+
 /// Concatenates equal-shaped slice tensors into one tensor with a leading axis of `count`.
 fn stack_parts<'a>(
     parts: impl Iterator<Item = &'a Tensor>,
@@ -756,6 +1005,194 @@ mod tests {
             ("e.scales", "BF16", vec![2, 2, 1], (100..108u8).collect()),
             ("e.biases", "BF16", vec![2, 2, 1], (200..208u8).collect()),
         ])
+    }
+
+    fn stacked_checkpoint() -> StreamedCheckpoint {
+        checkpoint(&[
+            ("g.weight", "U32", vec![2, 2, 4], (0..64u8).collect()),
+            ("g.scales", "BF16", vec![2, 2, 1], (100..108u8).collect()),
+            ("g.biases", "BF16", vec![2, 2, 1], (200..208u8).collect()),
+            ("u.weight", "U32", vec![2, 2, 4], (64..128u8).collect()),
+            ("u.scales", "BF16", vec![2, 2, 1], (108..116u8).collect()),
+            ("u.biases", "BF16", vec![2, 2, 1], (208..216u8).collect()),
+            // An up stack of double output rows, for the asymmetric refusal.
+            ("w.weight", "U32", vec![2, 8, 4], vec![7u8; 256]),
+            (
+                "w.scales",
+                "BF16",
+                vec![2, 8, 1],
+                (116..132u8).cycle().take(32).collect(),
+            ),
+            (
+                "w.biases",
+                "BF16",
+                vec![2, 8, 1],
+                (216..232u8).cycle().take(32).collect(),
+            ),
+        ])
+    }
+
+    /// The narrow and stacked layouts of the gate/up pair of `stacked_checkpoint`.
+    fn stacked_pair(
+        ckpt: &StreamedCheckpoint,
+        count: u32,
+        page: usize,
+    ) -> (
+        SlicedWeight,
+        SlicedWeight,
+        StackLayout,
+        StackLayout,
+        StackLayout,
+    ) {
+        let gate = sliced(ckpt, "g", spec4(), 2, 32).unwrap();
+        let up = sliced(ckpt, "u", spec4(), 2, 32).unwrap();
+        let gate_narrow = StackLayout::new(ckpt, &gate, count, 0, page).unwrap();
+        let up_narrow = StackLayout::new(ckpt, &up, count, 0, page).unwrap();
+        let stacked = stacked_layout(&gate_narrow, &up_narrow, page, page).unwrap();
+        (gate, up, gate_narrow, up_narrow, stacked)
+    }
+
+    #[test]
+    fn stacked_layout_reads_gate_then_up_bytes_of_every_expert() {
+        let ckpt = stacked_checkpoint();
+        let page = 64;
+        let (gate, up, gate_narrow, up_narrow, stacked) = stacked_pair(&ckpt, 3, page);
+        assert_eq!(stacked.payload.slice_len, 64, "two payload slices joined");
+        assert_eq!(stacked.payload.shape, [3, 4, 4], "payload rows summed");
+        assert_eq!(stacked.logical_shape, [3, 4, 32], "logical rows summed");
+        for role in [
+            &stacked.payload,
+            &stacked.scales,
+            stacked.biases.as_ref().unwrap(),
+        ] {
+            assert!(role.offset.is_multiple_of(page), "{role:?} starts mid-page");
+        }
+        assert!(stacked.end.is_multiple_of(page));
+
+        let indices = [1, 0, 0];
+        let mut dst = vec![0xAB_u8; stacked.end + page];
+        read_stacked_into(
+            &ckpt,
+            &gate,
+            &up,
+            &indices,
+            &mut dst,
+            &StackedLayouts {
+                gate: &gate_narrow,
+                up: &up_narrow,
+                stacked: &stacked,
+            },
+            false,
+        )
+        .unwrap();
+        let (oracle_gate, oracle_up) = (
+            read_stack(&ckpt, &gate, &indices).unwrap(),
+            read_stack(&ckpt, &up, &indices).unwrap(),
+        );
+        // Every expert slot of every role holds the gate bytes then the up bytes.
+        for (role, g, u) in [
+            (&stacked.payload, oracle_gate.payload(), oracle_up.payload()),
+            (&stacked.scales, oracle_gate.scales(), oracle_up.scales()),
+            (
+                stacked.biases.as_ref().unwrap(),
+                oracle_gate.biases().unwrap(),
+                oracle_up.biases().unwrap(),
+            ),
+        ] {
+            let (g, u) = (g.host_bytes().unwrap(), u.host_bytes().unwrap());
+            let one = g.len() / 3;
+            for rank in 0..3 {
+                let at = role.offset + rank * role.slice_len;
+                assert_eq!(
+                    &dst[at..at + one],
+                    &g[rank * one..(rank + 1) * one],
+                    "gate of {rank}"
+                );
+                assert_eq!(
+                    &dst[at + one..at + one + one],
+                    &u[rank * one..(rank + 1) * one],
+                    "up of {rank}"
+                );
+                assert_eq!(
+                    dst[at + 2 * one..at + role.slice_len],
+                    vec![0xAB; role.slice_len - 2 * one]
+                );
+            }
+        }
+
+        // The asymmetric pair refuses: every consumer splits the product at the row half.
+        let wide_up = sliced(&ckpt, "w", spec4(), 8, 32).unwrap();
+        let wide_up_narrow = StackLayout::new(&ckpt, &wide_up, 3, 0, page).unwrap();
+        assert!(matches!(
+            stacked_layout(&gate_narrow, &wide_up_narrow, page, page),
+            Err(EngError::BadRequest(m)) if m.contains("differ in output rows")
+        ));
+    }
+
+    #[test]
+    fn read_stacked_widens_the_scales_and_biases_per_slot_in_order() {
+        let ckpt = stacked_checkpoint();
+        let page = 64;
+        let (gate, up, gate_narrow, up_narrow, stacked) = stacked_pair(&ckpt, 3, page);
+        // The widened form: payload unchanged, scales and biases at double slice length as F32.
+        let widen = |role: &RoleRange| RoleRange {
+            slice_len: role.slice_len * 2,
+            dtype: Dtype::F32,
+            ..role.clone()
+        };
+        let wide = StackLayout {
+            scales: widen(&stacked.scales),
+            biases: Some(widen(stacked.biases.as_ref().unwrap())),
+            end: stacked.end + page,
+            ..stacked.clone()
+        };
+        let indices = [0, 1, 1];
+        let mut dst = vec![0xAB_u8; wide.end + page];
+        read_stacked_into(
+            &ckpt,
+            &gate,
+            &up,
+            &indices,
+            &mut dst,
+            &StackedLayouts {
+                gate: &gate_narrow,
+                up: &up_narrow,
+                stacked: &wide,
+            },
+            true,
+        )
+        .unwrap();
+        let f32_of = |bytes: &[u8]| -> Vec<u8> {
+            let mut wide = Vec::with_capacity(bytes.len() * 2);
+            for i in (0..bytes.len()).step_by(2) {
+                wide.extend([0, 0, bytes[i], bytes[i + 1]]);
+            }
+            wide
+        };
+        let oracle_gate = read_stack(&ckpt, &gate, &indices).unwrap();
+        let oracle_up = read_stack(&ckpt, &up, &indices).unwrap();
+        for (role, g, u) in [
+            (&wide.scales, oracle_gate.scales(), oracle_up.scales()),
+            (
+                wide.biases.as_ref().unwrap(),
+                oracle_gate.biases().unwrap(),
+                oracle_up.biases().unwrap(),
+            ),
+        ] {
+            let (g, u) = (
+                f32_of(g.host_bytes().unwrap()),
+                f32_of(u.host_bytes().unwrap()),
+            );
+            let one = g.len() / 3;
+            for rank in 0..3 {
+                let at = role.offset + rank * role.slice_len;
+                assert_eq!(&dst[at..at + one], &g[rank * one..(rank + 1) * one]);
+                assert_eq!(
+                    &dst[at + one..at + 2 * one],
+                    &u[rank * one..(rank + 1) * one]
+                );
+            }
+        }
     }
 
     #[test]

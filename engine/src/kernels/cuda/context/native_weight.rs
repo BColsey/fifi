@@ -17,6 +17,7 @@ use crate::EngError;
 use crate::kernels::cuda::native;
 use crate::kernels::cuda::resident::matvec_q::QuantType;
 use crate::weights::GgufType;
+use std::{marker::PhantomData, rc::Rc, sync::atomic::Ordering};
 
 use super::{BlockReader, CudaContext, DeviceBuffer, QuantTensor, host_source};
 
@@ -56,6 +57,56 @@ impl RowChunkPlan {
 }
 
 impl CudaContext {
+    /// Upload immutable native blocks into host pages mapped to this device.
+    /// The mapping remains private to the initializer until all reads succeed.
+    pub(crate) fn upload_native_mapped(
+        &self,
+        tensor: QuantTensor<'_>,
+        chunk_limit: usize,
+        read: BlockReader<'_>,
+    ) -> Result<NativeWeight, EngError> {
+        self.ensure_usable()?;
+        super::graph::ensure_closed("a mapped native upload")?;
+        let quant = checked_native(tensor)?;
+        let row_bytes = quant.weight_bytes(1, tensor.k).ok_or_else(|| {
+            EngError::Checkpoint(format!("tensor {} has an invalid row", tensor.name))
+        })?;
+        let plan = RowChunkPlan::new(tensor.n_rows, row_bytes, chunk_limit);
+        let raw = {
+            let _dispatch = self.enter()?;
+            native::resident::mailbox::UnpublishedMapped::allocate(tensor.source_len)
+                .map_err(super::device_error)?
+        };
+        super::LIVE_PINNED.fetch_add(tensor.source_len, Ordering::AcqRel);
+        let mut staging = MappedStaging {
+            raw: Some(raw),
+            lease: Rc::clone(&self.lease),
+            bytes: tensor.source_len,
+        };
+        staging.raw.as_mut().expect("mapping").initialize(|host| {
+            for first in (0..plan.rows).step_by(plan.per_chunk) {
+                let at = first * row_bytes;
+                let len = plan.count_of(first) * row_bytes;
+                read(at, &mut host[at..at + len])?;
+            }
+            Ok::<(), EngError>(())
+        })?;
+        let buffer = DeviceBuffer {
+            raw: None,
+            mapped: Some(staging.raw.take().expect("mapping").publish()),
+            lease: Rc::clone(&self.lease),
+            _thread_confined: PhantomData,
+            alloc_cache: None,
+        };
+        Ok(NativeWeight {
+            buffer,
+            quant,
+            k: tensor.k,
+            n_rows: tensor.n_rows,
+            experts: None,
+        })
+    }
+
     /// Reads a Q4_K, Q5_0, Q6_K or Q8_0 tensor through `read` in chunks of whole rows and
     /// uploads the file's own blocks into one device allocation made up front.
     ///
@@ -100,6 +151,33 @@ impl CudaContext {
             n_rows: tensor.n_rows,
             experts: None,
         })
+    }
+}
+
+/// Frees a mapping on read failure without ever exposing its device pointer.
+struct MappedStaging {
+    raw: Option<native::resident::mailbox::UnpublishedMapped>,
+    lease: Rc<super::Lease>,
+    bytes: usize,
+}
+
+impl Drop for MappedStaging {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            let lease = Rc::clone(&self.lease);
+            let bytes = self.bytes;
+            super::graph::run_or_defer(move || {
+                let device = lease.device();
+                let _lease = lease;
+                super::stream::release(
+                    raw.publish(),
+                    native::resident::mailbox::mapped_free,
+                    &super::LIVE_PINNED,
+                    bytes,
+                    device,
+                );
+            });
+        }
     }
 }
 

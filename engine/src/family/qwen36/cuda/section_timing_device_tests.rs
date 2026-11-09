@@ -57,6 +57,11 @@ struct Reading {
     sum_ms: f32,
     fraction: f32,
     groups: Vec<(usize, usize, f32)>,
+    /// The finer split: the mixer half per marked group (same order as `groups`), the
+    /// attention core inside it, and the `LmHead` op alone.
+    mixer_ms: Vec<f32>,
+    core_ms: Vec<f32>,
+    head_ms: f32,
     wall_ms: f32,
 }
 
@@ -81,6 +86,18 @@ fn dims() -> Result<StepDims, EngError> {
     StepDims::new(&shape, &inventory)
 }
 
+/// The rig's layout: `Q36_CUDA_LAYOUT=tiled` runs the whole-model Tiled control
+/// (fp16 packs + tiled matmuls) beside the default Native rig, for per-arm attribution.
+fn rig_layout() -> WeightLayout {
+    match std::env::var("Q36_CUDA_LAYOUT")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "tiled" => WeightLayout::Tiled,
+        _ => WeightLayout::Native,
+    }
+}
+
 fn options() -> StepOptions {
     StepOptions {
         kv_mode: KvMode::Fp16,
@@ -88,7 +105,7 @@ fn options() -> StepOptions {
         delta_slots: 1,
         forked_experts: false,
         tiered: None,
-        layout: WeightLayout::Native,
+        layout: rig_layout(),
     }
 }
 
@@ -105,7 +122,7 @@ fn load_options() -> LoadOptions<'static> {
             headroom: 0,
         },
         drop_page_cache: None,
-        layout: WeightLayout::Native,
+        layout: rig_layout(),
     }
 }
 
@@ -163,6 +180,9 @@ fn run_pair() -> Result<DeviceReceipt, EngError> {
             sum_ms: times.extrapolated_ms(),
             fraction: times.whole_ratio(),
             groups,
+            mixer_ms: times.mixer_marked_ms().to_vec(),
+            core_ms: times.core_marked_ms().to_vec(),
+            head_ms: times.head_ms(),
             wall_ms,
         });
     }
@@ -261,14 +281,23 @@ fn section_marks_time_the_captured_step() {
         let groups = reading
             .groups
             .iter()
-            .map(|(layer, size, ms)| format!("l{layer}x{size}:{ms:.4}ms"))
+            .zip(&reading.mixer_ms)
+            .zip(&reading.core_ms)
+            .map(|(((layer, size, ms), mixer), core)| {
+                format!(
+                    "l{layer}x{size}:{ms:.4}ms(mix {mixer:.4}[core {core:.4}/proj {:.4}]/moe {:.4})",
+                    mixer - core,
+                    ms - mixer
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms whole={:.4}ms groups=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
+            "SECTION TIMING token={} embed={:.4}ms tail={:.4}ms(head {:.4}) whole={:.4}ms groups=[{}] sum={:.4}ms fraction={:.4} wall={:.4}ms idle_gap={:.4} sum_gap={:.4} (report-only)",
             reading.token,
             reading.embed_ms,
             reading.tail_ms,
+            reading.head_ms,
             reading.whole_ms,
             groups,
             reading.sum_ms,

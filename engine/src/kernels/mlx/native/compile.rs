@@ -10,12 +10,12 @@
 //! uncompiled run issue the same MLX calls in the same order in both activation dtypes.
 //! Activation and packed-weight scale dtypes belong to the compile cache key
 //! (`kernels::compile_key`), keeping the F32 and BF16 decoders on distinct baked keys. One
-//! adapter context admits at most 5 keys before any native call; its `ProgramRegistry` dies
+//! adapter context admits at most 8 keys before any native call; its `ProgramRegistry` dies
 //! with it. B>1 MoE vectorizes its sequence. Staged B>1 DeltaNet batches
 //! five projections and keeps one recurrence/ring core per slot; taps<=1 stays B1-only.
-//! Each block key permits B=1/2/4/8 where supported: one context admits at most twenty key/batch
-//! pairs. This is not a per-thread or global bound: other contexts can admit other keys, and
-//! cache clears or other threads can cause further closure-body entries.
+//! Each block key permits B=1/2/4/8 where supported: one context admits at most thirty-two
+//! key/batch pairs. This is not a per-thread or global bound: other contexts can admit other
+//! keys, and cache clears or other threads can cause further closure-body entries.
 //!
 //! Every wrapper runs under the dispatch guard, validates before the first native call
 //! (`check_operand` and the F32 rule on every input, `check_owner` plus the logical shapes on
@@ -35,7 +35,8 @@ use super::{
     guard::{DispatchGuard, clear_message, failure, mark_failed},
     handles::{Array, native_dtype},
     resident_ops::{
-        GATED_DELTA_SOURCE, check_f32_operand, check_operand, native_output_valid, produce,
+        DELTA_MIDDLE_SOURCE, GATED_DELTA_SOURCE, check_f32_operand, check_operand,
+        native_output_valid, produce,
     },
 };
 use crate::{
@@ -113,8 +114,11 @@ pub(crate) fn quant_triples<const N: usize>(
 /// The flat input list and the baked constants of one compiled DeltaNet decode step. Every
 /// tensor must belong to this adapter.
 pub(crate) struct CompileDeltaArgs<'a> {
-    /// The layer input: `[1, H]` for the step seam or `[B, H]` for staged rows.
+    /// The raw residual stream `[1, H]` for the step seam or `[B, H]` for staged rows: the
+    /// closure folds the input RMS norm and the output residual add around the block.
     pub(crate) x: &'a ExecutionTensor,
+    /// The input RMS norm weight `[H]` of the folded head norm.
+    pub(crate) in_norm: &'a ExecutionTensor,
     /// Slot zero's recurrent state `[VH, VD, KD]`.
     pub(crate) rec: &'a ExecutionTensor,
     /// Slot zero's convolution ring `[CD, CK - 1]`.
@@ -123,7 +127,10 @@ pub(crate) struct CompileDeltaArgs<'a> {
     pub(crate) packed: [&'a ResidentPackedWeight; 5],
     /// conv_taps, conv_last, neg_exp_a_log, dt_bias, norm.
     pub(crate) plain: [&'a ExecutionTensor; 5],
-    /// zero, then the `[kd]` query and key norm weights (`1 / kd` and `1 / sqrt(kd)`).
+    /// zero, then the `[kd]` query and key norm weights (`1 / kd` and `1 / sqrt(kd)`); in the
+    /// fused mode (`Q36_FUSED_DECODE=1`, taps 3) the two norm slots carry the `qk_eps` and
+    /// `sqrt_kd` scalars instead, and the empty shape is the mode marker for the key and the
+    /// traced body.
     pub(crate) consts: [&'a ExecutionTensor; 3],
     pub(crate) hidden: u32,
     /// kh, kd, vh, vd, cd, taps.
@@ -155,21 +162,27 @@ pub(crate) struct CompiledDeltaRows {
 /// The flat input list and the baked constants of one compiled device-routed MoE decode
 /// step. Every tensor must belong to this adapter.
 pub(crate) struct CompileMoeArgs<'a> {
-    /// The layer input `[B, H]`, with `B` in 1, 2, 4, or 8.
+    /// The raw residual stream `[B, H]` (pre-norm), with `B` in 1, 2, 4, or 8: the closure
+    /// folds the post-attention RMS norm and the output residual add around the block.
     pub(crate) x: &'a ExecutionTensor,
+    /// The post-attention RMS norm weight `[H]` of the folded head norm.
+    pub(crate) post_norm: &'a ExecutionTensor,
     /// The transposed router weight `[H, E]`.
     pub(crate) router_t: &'a ExecutionTensor,
     /// The shared gate, up, down weights.
     pub(crate) shared: [&'a ResidentPackedWeight; 3],
     /// The transposed shared gate scalar `[H, 1]`.
     pub(crate) shared_scalar_t: &'a ExecutionTensor,
-    /// The expert gate, up, down stacks.
-    pub(crate) stacks: [&'a ResidentPackedWeight; 3],
+    /// The stacked gate/up expert operand (logical `[E, 2I, H]`) and the down stack
+    /// (`[E, H, I]`): one gathered product feeds the SwiGLU split of both projections.
+    pub(crate) stacks: [&'a ResidentPackedWeight; 2],
     pub(crate) hidden: u32,
     pub(crate) experts: u32,
     pub(crate) top_k: u32,
     /// Whether the gates renormalize over the selection.
     pub(crate) renorm: bool,
+    /// The RMS norm epsilon of the folded post-attention norm.
+    pub(crate) eps: f32,
     /// The activation dtype of the step: the dtype of the layer input and of the block output
     /// (the final `to_act`), and part of the compile cache key.
     pub(crate) act: Dtype,
@@ -190,8 +203,11 @@ pub(crate) struct CompiledMoe {
 /// The flat input list and the baked constants of one compiled attention pre-RoPE decode
 /// step. Every tensor must belong to this adapter.
 pub(crate) struct CompileAttnPreArgs<'a> {
-    /// The layer input `[1, H]` in the activation dtype (B = 1 only).
+    /// The raw residual stream `[1, H]` in the activation dtype (B = 1 only): the closure
+    /// folds the input RMS norm at its head.
     pub(crate) x: &'a ExecutionTensor,
+    /// The input RMS norm weight `[H]` of the folded head norm.
+    pub(crate) in_norm: &'a ExecutionTensor,
     /// The q (with interleaved gate), k, v packed weights.
     pub(crate) packed: [&'a ResidentPackedWeight; 3],
     /// The q and k norm weights, in the activation dtype.
@@ -231,6 +247,8 @@ pub(crate) struct CompileAttnPostArgs<'a> {
     pub(crate) gate: &'a ExecutionTensor,
     /// The packed output projection weight.
     pub(crate) packed: &'a ResidentPackedWeight,
+    /// The raw residual stream `[1, H]` of the folded output residual add.
+    pub(crate) res: &'a ExecutionTensor,
     pub(crate) hidden: u32,
     pub(crate) heads: u32,
     pub(crate) width: u32,
@@ -285,6 +303,28 @@ fn check_block_inputs(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Checks one folded norm weight of a compiled block before admission: a rank-1 `[hidden]`
+/// tensor of the activation dtype that belongs to this adapter. The eager blocks meet the
+/// same weight through the adapter's own rms_norm validation; the compiled seam refuses a
+/// foreign or misshapen operand before the first native call.
+fn check_norm_operand(
+    label: &'static str,
+    adapter: &super::State,
+    weight: &ExecutionTensor,
+    hidden: u32,
+    act: Dtype,
+) -> Result<(), EngError> {
+    check_operand(label, adapter, weight)?;
+    if weight.shape() != [hidden] || weight.dtype() != act {
+        return Err(EngError::BadRequest(format!(
+            "{label}: the folded norm weight carries {:?} {:?}, the block needs [{hidden}] of {act:?}",
+            weight.dtype(),
+            weight.shape()
+        )));
     }
     Ok(())
 }
@@ -402,7 +442,7 @@ impl Context {
     /// epsilon, the activation dtype, and per packed weight the scale dtype and the quantization
     /// triple. They form the compile cache key (`compile_key::delta_fun_id`), so every layer with
     /// the same constants shares one compiled program, and the per-adapter registry admits the
-    /// key BEFORE any native call: a sixth distinct key of one adapter is `BadRequest`.
+    /// key BEFORE any native call: a ninth distinct key of one adapter is `BadRequest`.
     ///
     /// Dtype rules: the block output carries the activation dtype (the block ends in `to_act`);
     /// the recurrence state and the ring stay F32; the closure mirrors every cast of the
@@ -457,6 +497,23 @@ impl Context {
         // and the fused-projection identity cd == 2 * kw + vh * vd fit an i32, before any
         // native call (the pure rule of `compile_key::checked_delta_dims`, Linux-tested).
         let [kh, kd, vh, vd, cd, taps, kw, kw2] = compile_key::checked_delta_dims(args.dims)?;
+        // The fused middle (ONE delta_middle kernel) or the unfused op sequence: the mode
+        // marker is the empty shape of the two norm slots (the qk_eps and sqrt_kd scalars
+        // replace the [kd] weights), and the kernel hardcodes the three-tap ring.
+        let fused = args.consts[1].shape().is_empty();
+        if fused && taps != 3 {
+            return Err(EngError::BadRequest(
+                "compile seam fused delta requires a three-tap ring".into(),
+            ));
+        }
+        // The kernel tiles one head's channels across `yv[4]` per simdgroup; wider heads would
+        // write out of bounds, so the seam refuses them even though the resident callers gate
+        // on the same bound (`delta::fused_middle_applicable`).
+        if fused && (kd > 128 || vd > 128) {
+            return Err(EngError::BadRequest(
+                "compile seam fused delta requires head widths of at most 128".into(),
+            ));
+        }
         let vh_vd = vh
             .checked_mul(vd)
             .ok_or_else(|| EngError::BadRequest("compile seam vh * vd exceeds u32".into()))?;
@@ -501,8 +558,11 @@ impl Context {
                 || args.plain[3].shape() != [vh]
                 || args.plain[4].shape() != [vd]
                 || !args.consts[0].shape().is_empty()
-                || args.consts[1].shape() != [kd]
-                || args.consts[2].shape() != [kd])
+                || (if fused {
+                    !args.consts[1].shape().is_empty() || !args.consts[2].shape().is_empty()
+                } else {
+                    args.consts[1].shape() != [kd] || args.consts[2].shape() != [kd]
+                }))
         {
             return Err(EngError::BadRequest(
                 "compile seam inputs differ from the delta plain operand shapes".into(),
@@ -531,6 +591,7 @@ impl Context {
             &f32_operands,
             &args.packed,
         )?;
+        check_norm_operand(label, adapter, args.in_norm, args.hidden, args.act)?;
         let dims = [
             native_dim(label, args.hidden)?,
             native_dim(label, kh)?,
@@ -541,12 +602,14 @@ impl Context {
             native_dim(label, taps)?,
             native_dim(label, kw)?,
             native_dim(label, kw2)?,
+            i32::from(fused),
         ];
         let triples = quant_triples(args.packed)?;
         let quant: Vec<i32> = triples.iter().flat_map(|t| t.iter().copied()).collect();
         let fun_id = compile_key::delta_fun_id(&compile_key::DeltaBaked {
             hidden: args.hidden,
             dims: [kh, kd, vh, vd, cd, taps, kw, kw2],
+            fused: u32::from(fused),
             eps_bits: args.eps.to_bits(),
             act: compile_key::dtype_key(args.act),
             scale_keys: args
@@ -555,13 +618,14 @@ impl Context {
                 .map(|weight| compile_key::dtype_key(weight.scales().dtype())),
             quant: triples,
         });
-        // The per-adapter program registry decides before any native call: a sixth distinct key
+        // The per-adapter program registry decides before any native call: a ninth distinct key
         // of one adapter is a setting mistake, not a reason to grow the MLX compile cache.
         adapter.programs.admit(fun_id)?;
         let mut keep: Vec<_> = [args.x, args.rec, args.ring]
             .into_iter()
             .chain(args.plain.iter().copied())
             .chain(args.consts.iter().copied())
+            .chain(std::iter::once(args.in_norm))
             .map(|tensor| tensor.share())
             .collect();
         for weight in args.packed {
@@ -571,7 +635,7 @@ impl Context {
                 keep.push(biases.share());
             }
         }
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(26 + 2 * (batch as usize - 1));
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(27 + 2 * (batch as usize - 1));
         inputs.push(args.x.storage.native_array());
         inputs.push(args.rec.storage.native_array());
         inputs.push(args.ring.storage.native_array());
@@ -588,6 +652,8 @@ impl Context {
         for tensor in args.plain.iter().chain(args.consts.iter()) {
             inputs.push(tensor.storage.native_array());
         }
+        // The folded input norm weight closes the 27-operand base; multirow states follow.
+        inputs.push(args.in_norm.storage.native_array());
         for &(rec, ring) in &states[1..] {
             inputs.push(rec.storage.native_array());
             inputs.push(ring.storage.native_array());
@@ -616,6 +682,7 @@ impl Context {
                     args.eps,
                     native_dtype(args.act),
                     GATED_DELTA_SOURCE.as_ptr().cast(),
+                    DELTA_MIDDLE_SOURCE.as_ptr().cast(),
                     fun_id as usize,
                     stream,
                 )
@@ -630,6 +697,7 @@ impl Context {
                     args.eps,
                     native_dtype(args.act),
                     GATED_DELTA_SOURCE.as_ptr().cast(),
+                    DELTA_MIDDLE_SOURCE.as_ptr().cast(),
                     fun_id as usize,
                     stream,
                 );
@@ -701,8 +769,9 @@ impl Context {
     /// The ids are once-clamped; callers can wrap them with `BoundedIndices::from_clamped`.
     ///
     /// Inputs: `x` `[B, H]` in the activation dtype, the F32 `router_t` `[H, E]`, the three
-    /// shared packed weights, the F32 `shared_scalar_t` `[H, 1]`, and the three expert stacks
-    /// with the logical shapes `[E, I, H]` (gate, up) and `[E, H, I]` (down). Every tensor must
+    /// shared packed weights, the F32 `shared_scalar_t` `[H, 1]`, and the two expert stacks
+    /// with the logical shapes `[E, 2I, H]` (the stacked gate/up operand) and `[E, H, I]`
+    /// (down). Every tensor must
     /// belong to this adapter; `check_operand`, the F32 rule, and `check_owner` plus the expert
     /// count and the widths of the logical shapes reject anything else before the first native
     /// call (an out-of-range device gather is not bounds-checked by MLX).
@@ -711,7 +780,7 @@ impl Context {
     /// flag, the clamp bound `experts - 1` (the ONE `mlx_minimum` clamp per layer), the activation
     /// dtype, and per packed weight the scale dtype and the quantization triple. They form the
     /// compile cache key (`compile_key::moe_fun_id`); the per-adapter registry admits it BEFORE
-    /// any native call, and a sixth distinct key of one adapter is `BadRequest`. B is not baked;
+    /// any native call, and a ninth distinct key of one adapter is `BadRequest`. B is not baked;
     /// the nonshapeless MLX cache specializes input shapes under the same key.
     ///
     /// Dtype rules: the block output carries the activation dtype (the final `to_act`); the
@@ -751,14 +820,13 @@ impl Context {
             ));
         }
         // The expert stacks must hold exactly the baked expert count and the hidden width where
-        // the block reads it: the gate and up stacks read `[1, H]` (their last dimension), the
-        // down stack writes `[1, H]` (its middle dimension), the shared weights the same at rank
-        // 2. A stack that disagrees would gather past its own last expert or die in a reshape
-        // inside the traced closure.
+        // the block reads it: the stacked gate/up operand reads `[1, H]` (its last dimension),
+        // the down stack writes `[1, H]` (its middle dimension), the shared weights the same at
+        // rank 2. A stack that disagrees would gather past its own last expert or die in a
+        // reshape inside the traced closure.
         for (what, stack, reads_hidden_last) in [
-            ("gate stack", &args.stacks[0], true),
-            ("up stack", &args.stacks[1], true),
-            ("down stack", &args.stacks[2], false),
+            ("stacked gate/up operand", &args.stacks[0], true),
+            ("down stack", &args.stacks[1], false),
         ] {
             let shape = stack.logical_shape();
             let ok = match (shape, reads_hidden_last) {
@@ -812,6 +880,7 @@ impl Context {
             &[args.router_t, args.shared_scalar_t],
             &weights,
         )?;
+        check_norm_operand(label, adapter, args.post_norm, args.hidden, args.act)?;
         let dims = [
             native_dim(label, args.hidden)?,
             native_dim(label, args.experts)?,
@@ -834,7 +903,7 @@ impl Context {
             .each_ref()
             .map(|weight| compile_key::dtype_key(weight.scales().dtype()));
         let [sg, su, sd] = shared_triples;
-        let [xg, xu, xd] = stack_triples;
+        let [xg, xd] = stack_triples;
         let fun_id = compile_key::moe_fun_id(&compile_key::MoeBaked {
             hidden: args.hidden,
             experts: args.experts,
@@ -844,6 +913,7 @@ impl Context {
                 .experts
                 .checked_sub(1)
                 .ok_or_else(|| EngError::BadRequest("compile seam moe needs experts".into()))?,
+            eps_bits: args.eps.to_bits(),
             act: compile_key::dtype_key(args.act),
             scale_keys: [
                 shared_scales[0],
@@ -851,12 +921,11 @@ impl Context {
                 shared_scales[2],
                 stack_scales[0],
                 stack_scales[1],
-                stack_scales[2],
             ],
-            quant: [sg, su, sd, xg, xu, xd],
+            quant: [sg, su, sd, xg, xd],
         });
         adapter.programs.admit(fun_id)?;
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(21);
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(19);
         inputs.push(args.x.storage.native_array());
         inputs.push(args.router_t.storage.native_array());
         // The native body reads the shared scalar at index 11, between the shared weights and the
@@ -882,7 +951,9 @@ impl Context {
                     .unwrap_or(ffi::NULL_ARRAY),
             );
         }
-        let mut keep: Vec<_> = [args.x, args.router_t, args.shared_scalar_t]
+        // The folded post-attention norm weight closes the 19-operand input list.
+        inputs.push(args.post_norm.storage.native_array());
+        let mut keep: Vec<_> = [args.x, args.router_t, args.shared_scalar_t, args.post_norm]
             .into_iter()
             .map(|tensor| tensor.share())
             .collect();
@@ -908,7 +979,9 @@ impl Context {
                 inputs.len(),
                 dims.as_ptr(),
                 quant.as_ptr(),
+                args.eps,
                 native_dtype(args.act),
+                super::resident_ops::MOE_ROUTER_SOURCE.as_ptr().cast(),
                 adapter.owner.0.get() as usize,
                 fun_id as usize,
                 stream,
@@ -1041,6 +1114,7 @@ impl Context {
                 )));
             }
         }
+        check_norm_operand(label, adapter, args.in_norm, args.hidden, args.act)?;
         let dims: [i32; 4] = [
             native_dim(label, args.hidden)?,
             native_dim(label, args.heads)?,
@@ -1068,7 +1142,7 @@ impl Context {
             quant: [tq, tk, tv],
         });
         adapter.programs.admit(fun_id)?;
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(12);
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(13);
         inputs.push(args.x.storage.native_array());
         for weight in args.packed {
             inputs.push(weight.payload().storage.native_array());
@@ -1082,7 +1156,9 @@ impl Context {
         }
         inputs.push(args.norms[0].storage.native_array());
         inputs.push(args.norms[1].storage.native_array());
-        let mut keep: Vec<_> = [args.x, args.norms[0], args.norms[1]]
+        // The folded input norm weight closes the 13-operand input list.
+        inputs.push(args.in_norm.storage.native_array());
+        let mut keep: Vec<_> = [args.x, args.norms[0], args.norms[1], args.in_norm]
             .into_iter()
             .map(|tensor| tensor.share())
             .collect();
@@ -1211,6 +1287,18 @@ impl Context {
             &[],
             std::slice::from_ref(&args.packed),
         )?;
+        // The folded residual operand: the raw residual stream [1, hidden] in the activation
+        // dtype, validated like the gate beside it.
+        check_operand(label, adapter, args.res)?;
+        if args.res.shape() != [1, args.hidden] || args.res.dtype() != args.act {
+            return Err(EngError::BadRequest(format!(
+                "{label}: the residual carries {:?} {:?}, the block needs [1, {}] of {:?}",
+                args.res.dtype(),
+                args.res.shape(),
+                args.hidden,
+                args.act
+            )));
+        }
         let dims: [i32; 3] = [
             native_dim(label, args.heads)?,
             native_dim(label, args.width)?,
@@ -1227,7 +1315,7 @@ impl Context {
             quant: triple,
         });
         adapter.programs.admit(fun_id)?;
-        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(5);
+        let mut inputs: Vec<ffi::mlx_array> = Vec::with_capacity(6);
         inputs.push(args.att.storage.native_array());
         inputs.push(args.gate.storage.native_array());
         inputs.push(args.packed.payload().storage.native_array());
@@ -1238,7 +1326,9 @@ impl Context {
                 .map(|biases| biases.storage.native_array())
                 .unwrap_or(ffi::NULL_ARRAY),
         );
-        let mut keep: Vec<_> = [args.att, args.gate]
+        // The raw residual stream closes the 6-operand input list of the folded residual add.
+        inputs.push(args.res.storage.native_array());
+        let mut keep: Vec<_> = [args.att, args.gate, args.res]
             .into_iter()
             .map(|tensor| tensor.share())
             .collect();

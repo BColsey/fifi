@@ -610,11 +610,55 @@ unsafe extern "C" {
         source: *const c_char,
         stream: mlx_stream,
     ) -> i32;
+    /// The router_topk fused kernel (Q36 decode MoE): the stable top-k selection and
+    /// renormalized gates of one router probability row in ONE launch. `dims` holds
+    /// [rows, experts, top_k, k_max, renorm]; `ids_shape`/`gates_shape` set the output ranks
+    /// (`[k]`/`[k, 1, 1]` eager, `[B, k]`/`[B, k, 1, 1]` compiled). Outputs are lazy: ids U32 in
+    /// rank order, gates F32. Faults strike `ids_out`.
+    #[link_name = "inference_mlx_router_topk"]
+    pub(super) fn mlx_router_topk(
+        ids_out: *mut mlx_array,
+        gates_out: *mut mlx_array,
+        probs: mlx_array,
+        dims: *const i32,
+        ids_shape: *const i32,
+        ids_rank: i32,
+        gates_shape: *const i32,
+        gates_rank: i32,
+        source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
     /// The gdn_prep fused kernel (Q36_FUSED_PREFILL=1): ONE kernel for the whole
     /// DeltaNet pre-recurrence chain. `dims` holds rows. All six outputs are lazy F32.
     /// Faults strike `q_out`.
     #[link_name = "inference_mlx_gdn_prep"]
     pub(super) fn mlx_gdn_prep(
+        q_out: *mut mlx_array,
+        k_out: *mut mlx_array,
+        v_out: *mut mlx_array,
+        g_out: *mut mlx_array,
+        beta_out: *mut mlx_array,
+        ring_out: *mut mlx_array,
+        u_in: mlx_array,
+        a_in: mlx_array,
+        b_in: mlx_array,
+        ring: mlx_array,
+        taps: mlx_array,
+        last: mlx_array,
+        neg_exp_a_log: mlx_array,
+        dt_bias: mlx_array,
+        dims: *const i32,
+        qk_eps: mlx_array,
+        sqrt_kd: mlx_array,
+        source: *const c_char,
+        stream: mlx_stream,
+    ) -> i32;
+    /// The delta_middle fused kernel (`Q36_FUSED_DECODE=1`): the same six F32 outputs as
+    /// `mlx_gdn_prep` in their decode shapes, over ONE slot - `dims` is [kh, kd, vh, vd, cd],
+    /// the ring has three taps, and `u_in`/`a_in`/`b_in` are the raw activation-dtype
+    /// projection rows of the slot. A non-zero status is a native failure of the adapter.
+    #[link_name = "inference_mlx_delta_middle"]
+    pub(super) fn mlx_delta_middle(
         q_out: *mut mlx_array,
         k_out: *mut mlx_array,
         v_out: *mut mlx_array,
@@ -799,6 +843,7 @@ unsafe extern "C" {
         eps: f32,
         activation: mlx_dtype,
         source: *const c_char,
+        middle_source: *const c_char,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
@@ -816,6 +861,7 @@ unsafe extern "C" {
         eps: f32,
         activation: mlx_dtype,
         source: *const c_char,
+        middle_source: *const c_char,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
@@ -835,15 +881,18 @@ unsafe extern "C" {
         inputs_num: usize,
         dims: *const i32,
         quant: *const i32,
+        eps: f32,
         activation: mlx_dtype,
+        router_source: *const c_char,
         owner: usize,
         fun_id: usize,
         stream: mlx_stream,
     ) -> i32;
     /// The attention pre-RoPE block as one compiled closure (behind `qwen36.compile`).
     /// `dims` holds hidden, heads, kv_heads, width; `quant` holds mode, group, bits per weight
-    /// for the q, k, v projections; `inputs` holds the 12 closure inputs (x, then the q, k, v
-    /// packed triples, then q_norm, k_norm); `eps` is the RMS norm epsilon. The four outputs
+    /// for the q, k, v projections; `inputs` holds the 13 closure inputs (the raw residual
+    /// stream, then the q, k, v packed triples, then q_norm, k_norm, then the folded input
+    /// norm weight); `eps` is the RMS norm epsilon. The four outputs
     /// (q, k, v, gate) are lazy. A non-zero status is a native failure of the adapter.
     #[link_name = "inference_mlx_compile_attn_pre_block"]
     pub(super) fn mlx_compile_attn_pre_block(
@@ -862,9 +911,10 @@ unsafe extern "C" {
     ) -> i32;
     /// The attention post-core block as one compiled closure (behind `qwen36.compile`).
     /// `dims` holds heads, width, hidden; `quant` holds mode, group, bits of the output
-    /// projection weight; `inputs` holds the 5 closure inputs (the attention core output
-    /// `[1, heads, 1, width]`, the gate `[heads, width]`, then the packed output weight
-    /// triple). The single output is lazy. A non-zero status is a native failure of the
+    /// projection weight; `inputs` holds the 6 closure inputs (the attention core output
+    /// `[1, heads, 1, width]`, the gate `[heads, width]`, the packed output weight
+    /// triple, then the raw residual stream `[1, hidden]` of the folded residual add).
+    /// The single output is lazy. A non-zero status is a native failure of the
     /// adapter.
     #[link_name = "inference_mlx_compile_attn_post_block"]
     pub(super) fn mlx_compile_attn_post_block(

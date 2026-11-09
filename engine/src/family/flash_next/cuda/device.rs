@@ -51,9 +51,17 @@ impl CardDevice {
         self.step.ctx.single_row_kernel_name()
     }
 
+    /// The single-row launch counters of this context, since it was made: the receipt run's proof
+    /// that the grouped launches of the served step (the mixer inputs and the shared expert) ran
+    /// on the wide kernel, one launch per group.
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        self.step.ctx.exl3_launch_counts()
+    }
+
     /// The bank's statistics line for the load log and the per-job report.
     pub(super) fn bank_misses(&self) -> u64 {
-        self.moe.inner.bank().state().stats().misses
+        self.moe.bank().stats().misses
     }
 }
 
@@ -88,7 +96,7 @@ impl TokenDevice for CardDevice {
         if range.is_empty() {
             return Ok(());
         }
-        self.step.run_layers(range, pos, &mut self.moe)
+        self.step.run_layers(range, pos, 1, &mut self.moe)
     }
 
     fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {
@@ -101,7 +109,7 @@ impl TokenDevice for CardDevice {
     }
 
     fn head(&mut self) -> Result<(), EngError> {
-        self.step.head()
+        self.step.head(1)
     }
 
     fn read_logits(&mut self) -> Result<Vec<f32>, EngError> {
@@ -121,5 +129,128 @@ impl TokenDevice for CardDevice {
 
     fn bank_misses(&self) -> Option<u64> {
         Some(CardDevice::bank_misses(self))
+    }
+}
+
+/// The card implementation of [`ChunkDevice`]: the same [`FlashStep`] and [`SplitMoeAt`] as
+/// [`CardDevice`], one step whose plan holds `rows` rows, every launch at the chunk's row count.
+/// The chunk's row count is remembered from `write_chunk_params`, so the read-backs know their
+/// width.
+pub(super) struct CardChunkDevice {
+    step: FlashStep<'static>,
+    moe: SplitMoeAt<'static>,
+    stream_width: usize,
+    logits_width: usize,
+    /// The rows of the chunk in flight, set by `write_chunk_params`.
+    m: usize,
+}
+
+impl CardChunkDevice {
+    pub(super) fn new(step: FlashStep<'static>, moe: SplitMoeAt<'static>) -> Self {
+        let stream_width = step.geometry.branches * step.geometry.hidden;
+        let logits_width = step.model.vocab;
+        Self {
+            step,
+            moe,
+            stream_width,
+            logits_width,
+            m: 1,
+        }
+    }
+}
+
+impl CardChunkDevice {
+    #[cfg(test)]
+    pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        self.step.ctx.single_row_kernel_name()
+    }
+
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        self.step.ctx.exl3_launch_counts()
+    }
+
+    /// The bank's statistics line, as 's.
+    pub(super) fn bank_misses(&self) -> u64 {
+        self.moe.bank().stats().misses
+    }
+}
+
+impl super::driver::chunk::ChunkDevice for CardChunkDevice {
+    fn write_chunk_params(&mut self, token0: i32, pos: i32, m: i32) -> Result<(), EngError> {
+        self.m = usize::try_from(m).map_err(|_| {
+            EngError::BadRequest(format!("Flash-Next chunk driver: a negative row count {m}"))
+        })?;
+        // The kernels read the position word; the token word is unused at m > 1 (the projections
+        // carry the rows).
+        let params = StepParams::new(token0, pos)?;
+        let range = self.step.params()?;
+        range
+            .buffer()
+            .write_at(self.step.stream, range.offset(), &params.to_bytes())
+    }
+
+    fn write_chunk_stream(&mut self, rows: &[f32]) -> Result<(), EngError> {
+        let range = self.step.slot(Slot::Stream)?;
+        range
+            .buffer()
+            .write_at(self.step.stream, range.offset(), &f32_le_bytes(rows))
+    }
+
+    /// The PLE projections stage their own embedding; the chunk start needs no copy of it.
+    fn write_chunk_ple(&mut self, _rows: &[f32]) -> Result<(), EngError> {
+        Ok(())
+    }
+
+    fn begin_chunk(&mut self) -> Result<(), EngError> {
+        self.step.begin_chunk(self.m)
+    }
+
+    fn layers(
+        &mut self,
+        range: std::ops::Range<usize>,
+        pos: usize,
+        m: usize,
+    ) -> Result<(), EngError> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        self.step.run_layers(range, pos, m, &mut self.moe)
+    }
+
+    fn read_stream(&mut self) -> Result<Vec<f32>, EngError> {
+        self.step
+            .read_f32(self.step.slot(Slot::Stream)?, self.m * self.stream_width)
+    }
+
+    fn write_stream_back(&mut self, rows: &[f32]) -> Result<(), EngError> {
+        <Self as super::driver::chunk::ChunkDevice>::write_chunk_stream(self, rows)
+    }
+
+    fn head(&mut self) -> Result<(), EngError> {
+        self.step.head(self.m)
+    }
+
+    fn read_logits(&mut self) -> Result<Vec<f32>, EngError> {
+        // The last row of the plan's `[rows][vocab]` logits slot.
+        let range = self.step.slot(Slot::Logits)?;
+        let last = range.buffer().range(
+            range.offset() + (self.m - 1) * self.logits_width * super::step::F32,
+            self.logits_width * super::step::F32,
+        )?;
+        self.step.read_f32(last, self.logits_width)
+    }
+
+    fn check_health(&mut self) -> Result<(), EngError> {
+        self.step.finish_token()
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        self.m = 1;
+        self.step.reset()
+    }
+
+    fn bank_misses(&self) -> Option<u64> {
+        Some(self.moe.bank().stats().misses)
     }
 }

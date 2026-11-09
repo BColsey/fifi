@@ -251,13 +251,10 @@ fn run_marked(
     let mut health = None;
     let mut layers = Vec::with_capacity(old.len());
     for (layer, old_layer) in weights.layers.iter().zip(old) {
-        let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, eps)?;
-        part.mark(&mut ctx, "input_norm", &[&normed])?;
         let (mixed, next) = match (&layer.mixer, old_layer) {
             (RMixer::Delta(w), LayerState::Delta { rec, ring }) => {
-                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &normed)?;
-                // The state update is part of this class: evaluating only `out`
-                // would leave rec/ring lazy and charge them to the next class.
+                // The folded contract: the block owns its input norm and residual add.
+                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &h, &layer.input_norm)?;
                 part.mark(&mut ctx, "delta_block", &[&s.out, &s.rec, &s.ring])?;
                 (
                     s.out,
@@ -268,6 +265,8 @@ fn run_marked(
                 )
             }
             (RMixer::Attn(w), LayerState::Attn(cache)) => {
+                let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, eps)?;
+                part.mark(&mut ctx, "input_norm", &[&normed])?;
                 let qp = linear(&mut ctx, &w.q, &normed)?;
                 let kp = linear(&mut ctx, &w.k, &normed)?;
                 let vp = linear(&mut ctx, &w.v, &normed)?;
@@ -277,6 +276,7 @@ fn run_marked(
                 part.mark(&mut ctx, "attn_core", &[&o])?;
                 let out = linear(&mut ctx, &w.o, &o)?;
                 part.mark(&mut ctx, "attn_out_proj", &[&out])?;
+                let out = ctx.kernels.binary(BinaryOp::Add, &h, &out)?;
                 (out, LayerState::Attn(cache))
             }
             _ => {
@@ -286,18 +286,16 @@ fn run_marked(
             }
         };
         layers.push(next);
-        let mid = ctx.kernels.binary(BinaryOp::Add, &h, &mixed)?;
+        let mid = mixed;
         part.mark(&mut ctx, "residual", &[&mid])?;
-        let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, eps)?;
-        part.mark(&mut ctx, "post_norm", &[&normed])?;
         let routed = match &layer.feed_forward {
             RFeedForward::Dense(w) => {
-                let out = moe::dense_rows(&mut ctx, w, &normed)?;
+                let out = moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 part.mark(&mut ctx, "moe_block", &[&out])?;
                 out
             }
             RFeedForward::Moe(w) => {
-                let (out, route) = moe::step_device(&mut ctx, shape, w, &normed)?;
+                let (out, route) = moe::step_device(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 health = Some(match health.take() {
                     Some(sum) => ctx.kernels.binary(BinaryOp::Add, &sum, &route.health)?,
                     None => route.health,
@@ -313,10 +311,7 @@ fn run_marked(
                 out
             }
         };
-        h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
-        // Own class: without this mark the final add is charged to the next
-        // layer's input_norm (or the head).
-        part.mark(&mut ctx, "residual_out", &[&h])?;
+        h = routed;
     }
     // The Generate head: final norm, lm_head, argmax, the device-routing health
     // pair, token readback. The pair's readback lands after the marks, so the

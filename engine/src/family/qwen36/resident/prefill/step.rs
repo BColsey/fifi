@@ -4,7 +4,8 @@
 //! (each part at most the depth-aware size of `kv_plan::depth_ranges`, so the score matrix of a deep
 //! chunk stays within its budget) and runs each chunk layer by layer: layer 1 over all rows, then layer 2, and so on. A chunk of one
 //! row runs the same blocks with `T = 1`. Every chunk but the last runs in `Prompt` mode, and the
-//! last chunk runs in the requested mode. The head reads the last row only.
+//! last chunk runs in the requested mode. The head reads the last row only, except `Window`,
+//! which reads every row.
 //!
 //! Synchronizations of one chunk with `L` layers, `D` DeltaNet layers, and `S = ceil(T / s)` parts
 //! of the recurrence (`delta::gated_delta_recurrence`): the token-start import 1, then the routing
@@ -43,7 +44,7 @@ use super::super::chunk_plan::{PREFILL_RETIRE_CAP, delta_retire_per_token, delta
 use super::super::decoder::{ResidentDecoder, StepMode, StepResult};
 use super::super::kv_plan::{depth_ranges, prefill_score_bound};
 use super::super::moe::Routing;
-use super::super::ops::{Ctx, cast_to, dim, linear, short_import, to_act, values};
+use super::super::ops::{Ctx, cast_to, dim, linear, linear_rows, short_import, to_act, values};
 use super::super::state::{LayerState, ResidentState, chunk_growth_bytes};
 use super::super::step::{check_dtype, read_token, split_rows};
 use super::super::weights::{RFeedForward, RMixer};
@@ -359,8 +360,13 @@ fn run(
         }
         let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
         check_dtype("post norm output", &normed, ctx.consts.act)?;
+        let mut skip_add = false;
         let routed = match (&layer.feed_forward, decoder.routing) {
-            (RFeedForward::Dense(w), _) => super::super::moe::dense_rows(&mut ctx, w, &normed)?,
+            (RFeedForward::Dense(w), _) => {
+                // dense_rows folds the post norm and the residual add itself.
+                skip_add = true;
+                super::super::moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => moe::chunk(&mut ctx, shape, w, &normed)?.0,
             (RFeedForward::Moe(w), Routing::Device) => {
                 let device = moe::chunk_device(&mut ctx, shape, w, &normed)?;
@@ -368,7 +374,11 @@ fn run(
                 device.out
             }
         };
-        h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        h = if skip_add {
+            routed
+        } else {
+            ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?
+        };
         check_dtype("layer output", &h, ctx.consts.act)?;
         if mode == StepMode::Record {
             // The recorded last row reads back as F32.
@@ -386,15 +396,21 @@ fn run(
             ctx.kernels.evaluate(&[&h])?;
         }
     }
-    // The head runs on the last row only. `Prompt` skips it.
+    // The head runs on the last row only, except `Window`, which runs it on every row of the
+    // chunk. `Prompt` skips it.
     let head = match mode {
         StepMode::Prompt => None,
+        StepMode::Window => {
+            let final_h = ctx.kernels.rms_norm(&h, &weights.final_norm, shape.eps)?;
+            let logits = linear_rows(&mut ctx, &weights.lm_head, &final_h)?;
+            Some((logits, None))
+        }
         StepMode::Generate | StepMode::Logits | StepMode::Record => {
             let row = last_row(&mut ctx, &h, rows, hidden)?;
             let final_h = ctx.kernels.rms_norm(&row, &weights.final_norm, shape.eps)?;
             let logits = linear(&mut ctx, &weights.lm_head, &final_h)?;
             let next = ctx.kernels.argmax(&logits, 1, false)?;
-            Some((logits, next))
+            Some((logits, Some(next)))
         }
     };
     let record_rows = if mode == StepMode::Record {
@@ -456,8 +472,10 @@ fn run(
         }
     }
     if let Some((logits, next)) = &head {
-        outputs.push(next);
-        if matches!(mode, StepMode::Logits | StepMode::Record) {
+        if let Some(next) = next {
+            outputs.push(next);
+        }
+        if matches!(mode, StepMode::Logits | StepMode::Record | StepMode::Window) {
             outputs.push(logits);
         }
     }
@@ -475,12 +493,20 @@ fn run(
         check_health(&values(ctx.kernels, health)?)?;
     }
     let token_out = match &head {
-        Some((_, next)) => Some(read_token(ctx.kernels, next, shape.vocab)?),
-        None => None,
+        Some((_, Some(next))) => Some(read_token(ctx.kernels, next, shape.vocab)?),
+        _ => None,
     };
     let logits_out = match (&head, mode) {
         (Some((logits, _)), StepMode::Logits | StepMode::Record) => {
             Some(values(ctx.kernels, logits)?)
+        }
+        _ => None,
+    };
+    let window_logits = match (&head, mode) {
+        (Some((logits, _)), StepMode::Window) => {
+            let row_count = usize::try_from(rows)
+                .map_err(|_| bad("the window row count exceeds the platform size"))?;
+            Some(split_rows(values(ctx.kernels, logits)?, row_count)?)
         }
         _ => None,
     };
@@ -490,6 +516,7 @@ fn run(
     };
     state.commit_rows(rows, layers, permit)?;
     Ok(StepResult {
+        window_logits,
         token: token_out,
         logits: logits_out,
         layer_out,
@@ -621,6 +648,7 @@ mod tests {
                 StepMode::Prompt => assert_eq!(
                     got,
                     StepResult {
+                        window_logits: None,
                         token: None,
                         logits: None,
                         layer_out: None,
@@ -632,6 +660,7 @@ mod tests {
                 StepMode::Generate => assert_eq!(
                     got,
                     StepResult {
+                        window_logits: None,
                         token: Some(host_argmax(&want.logits)),
                         logits: None,
                         layer_out: None,
@@ -640,6 +669,7 @@ mod tests {
                     },
                     "{what}"
                 ),
+                StepMode::Window => unreachable!("the chunk parity tests do not run Window"),
                 StepMode::Logits | StepMode::Record => {
                     assert_eq!(got.token, Some(host_argmax(&want.logits)), "{what}: argmax");
                     assert!(got.routes.is_none(), "{what}: a chunk never reports routes");
@@ -1208,6 +1238,7 @@ mod tests {
         assert_eq!(
             got,
             StepResult {
+                window_logits: None,
                 token: None,
                 logits: None,
                 layer_out: None,

@@ -1,6 +1,31 @@
 import { test } from "node:test";
-import { deepStrictEqual, strictEqual } from "node:assert";
-import { coerceSettings, defaultSettings } from "./store.js";
+import { deepStrictEqual, ok, strictEqual } from "node:assert";
+import { coerceSettings, defaultSettings, newChatRecord, newUiMessage } from "./store.js";
+
+test("chat and message IDs work when randomUUID is unavailable on LAN HTTP", () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  let sequence = 0;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      getRandomValues(bytes: Uint8Array): Uint8Array {
+        bytes.fill(++sequence);
+        return bytes;
+      },
+    },
+  });
+  try {
+    const chat = newChatRecord("fifi-q36");
+    const message = newUiMessage("user", "hello");
+    const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    ok(uuidV4.test(chat.id));
+    ok(uuidV4.test(message.id));
+    ok(chat.id !== message.id);
+  } finally {
+    if (original) Object.defineProperty(globalThis, "crypto", original);
+    else Reflect.deleteProperty(globalThis, "crypto");
+  }
+});
 
 /** A fully valid stored drawer; each case replaces one field. */
 const baseDrawer = {

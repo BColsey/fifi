@@ -7,10 +7,10 @@
 //! Safety invariants this file relies on:
 //! - A [`RawMapped`] is created once by [`mapped_alloc`] and consumed once by [`mapped_free`]. It has no `Drop`:
 //!   the owner in `context` frees it, so that a failed free is reported.
-//! - The device writes this memory while the host reads it, so every access is an atomic word access: acquire
-//!   and release for the 8-byte sequence words, relaxed for the 4-byte payload words. No plain (non-atomic)
-//!   reference or slice over the mapping is ever formed and no pointer or slice escapes; the only references are the
-//!   `&AtomicU32` / `&AtomicU64` of `from_ptr`. Reading a payload only after an acquire load of
+//! - After publication, the device may write while the host reads, so mailbox accesses are atomic: acquire
+//!   and release for the 8-byte sequence words, relaxed for the 4-byte payload words. The only references
+//!   to a published mailbox are the `&AtomicU32` / `&AtomicU64` of `from_ptr`; no pointer or slice escapes.
+//!   Reading a payload only after an acquire load of
 //!   the word the device releases it with is the caller's protocol, documented in
 //!   `context/mailbox.rs`; so is keeping the 4-byte payload regions and the 8-byte sequence words disjoint, because
 //!   atomic accesses of different sizes to the same bytes do not synchronize with each other.
@@ -18,6 +18,8 @@
 //!   memory is aligned like any host allocation, to at least 16 bytes). The device view ([`RawMapped::device`]) is
 //!   never passed to the device free: it only lets `RawRange::new` prove ranges of the mapping for a launch.
 //!   Extern declarations and raw pointers stay private.
+//! - `UnpublishedMapped` has no device view. It alone may expose a temporary mutable slice
+//!   to initialize immutable expert weights before publishing the device view.
 
 #![cfg_attr(
     not(test),
@@ -57,8 +59,38 @@ pub(in crate::kernels::cuda) struct RawMapped {
     device: RawDevice,
 }
 
-// SAFETY: the host pointer is only used for atomic accesses (see the module doc), which are sound from any
-// thread while the memory is allocated; the owner frees it only when no other handle to it is alive.
+/// A fresh mapping whose device pointer has not been exposed to any caller.
+/// This separate type permits ordinary host writes only before publication.
+pub(in crate::kernels::cuda) struct UnpublishedMapped(RawMapped);
+
+impl UnpublishedMapped {
+    pub(in crate::kernels::cuda) fn allocate(bytes: usize) -> Result<Self, DeviceFailure> {
+        if bytes > isize::MAX as usize {
+            return Err(invalid_argument());
+        }
+        mapped_alloc(bytes).map(Self)
+    }
+
+    pub(in crate::kernels::cuda) fn initialize<E>(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // SAFETY: this type never exposes its device pointer. The fresh allocation
+        // is initialized, exclusive, and bounded by isize::MAX. The slice cannot
+        // escape the callback; after publication no host slice can be made.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(self.0.host.as_ptr().cast::<u8>(), self.0.device.bytes)
+        };
+        fill(bytes)
+    }
+
+    pub(in crate::kernels::cuda) fn publish(self) -> RawMapped {
+        self.0
+    }
+}
+
+// SAFETY: after publication the host pointer is used only for atomic accesses (see the module doc),
+// and its owner frees it only when no other handle to it is alive.
 unsafe impl Send for RawMapped {}
 // SAFETY: as for `Send`: every shared access is atomic.
 unsafe impl Sync for RawMapped {}

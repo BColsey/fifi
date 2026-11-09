@@ -192,7 +192,7 @@ fn the_pinned_store_is_the_cold_experts_plus_one_spare_place_per_layer() {
         assert_eq!(plan.os_floor, 8 * GIB);
         assert_eq!(
             plan.process_bytes,
-            plan.store_bytes + plan.scratch_bytes + 3 * GIB + 2 * GIB
+            plan.store_bytes + plan.scratch_bytes + plan.ngram_staging_bytes + 3 * GIB + 2 * GIB
         );
         // 55 GiB available minus the store, the scratch, 3 + 2 GiB and the 8 GiB floor.
         assert_eq!(
@@ -242,27 +242,56 @@ fn the_budget_at_the_contexts_of_the_tier_plan() {
     );
 }
 
+/// The terms with the 8 GiB page-cache floor the plan used before the n-gram reads were measured, to
+/// exercise the floor logic itself.
+fn floor_terms() -> HostTerms {
+    HostTerms {
+        ngram_cache_min: 8 * GIB,
+        ..HostTerms::DEFAULT
+    }
+}
+
 #[test]
-fn an_inclusive_store_does_not_fit_next_to_the_n_gram_table() {
+fn an_inclusive_store_fits_the_host_by_availability_and_by_the_floor_if_one_is_set() {
     let geometry = geometry_of(&plan_with_slots(143));
+    // No n-gram floor (measured: cold rows are cheap): 43.07 GiB + 86 MB staging + 3 + 2 + 8 floor
+    // is 56.2 GiB, which 60 GiB available holds with 3.8 GiB of page cache left.
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Inclusive,
+        &host(60 * GIB),
+        &HostTerms::DEFAULT,
+    )
+    .unwrap();
+    assert!((gib(plan.store_bytes) - 43.07).abs() < 0.01);
+    assert!((3.5..4.1).contains(&gib(plan.page_cache_left)));
+    // 55 GiB available does not hold it.
+    let error = message(
+        HostPinPlan::new(
+            &geometry,
+            HostMode::Inclusive,
+            &host(55 * GIB),
+            &HostTerms::DEFAULT,
+        )
+        .unwrap_err(),
+    );
+    assert!(error.contains("are available"), "{error}");
+    // With an 8 GiB floor the 3.8 GiB left is refused.
     let error = message(
         HostPinPlan::new(
             &geometry,
             HostMode::Inclusive,
             &host(60 * GIB),
-            &HostTerms::DEFAULT,
+            &floor_terms(),
         )
         .unwrap_err(),
     );
-    // 43.07 + 8 + 3 + 2 leaves 6.3 GiB of page cache, under the 8 GiB the n-gram reads keep.
-    assert!(error.contains("page cache"), "{error}");
-    let no_ngram = HostTerms {
-        ngram_cache_min: 0,
-        ..HostTerms::DEFAULT
-    };
-    let plan =
-        HostPinPlan::new(&geometry, HostMode::Inclusive, &host(60 * GIB), &no_ngram).unwrap();
-    assert!((gib(plan.store_bytes) - 43.07).abs() < 0.01);
+    assert!(error.contains("page-cache floor"), "{error}");
+}
+
+#[test]
+fn the_default_floor_is_the_measured_zero() {
+    assert_eq!(HostTerms::DEFAULT.ngram_cache_min, 0);
 }
 
 #[test]
@@ -294,13 +323,13 @@ fn the_budget_refuses_when_other_lanes_hold_the_memory_and_never_shrinks() {
 #[test]
 fn the_page_cache_left_follows_what_other_processes_hold() {
     // 46 GiB available on the 62 GiB host: the store passes the availability guard (44 needed), but
-    // only about 2 GiB of page cache would remain, under the provisional 8 GiB floor.
+    // only about 2 GiB of page cache would remain, under an 8 GiB floor (the default floor is 0).
     let geometry = geometry_of(&plan_with_slots(143));
     let ok = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
         &host(55 * GIB),
-        &HostTerms::DEFAULT,
+        &floor_terms(),
     )
     .unwrap();
     let needed = ok.process_bytes + ok.os_floor;
@@ -310,19 +339,18 @@ fn the_page_cache_left_follows_what_other_processes_hold() {
             &geometry,
             HostMode::Exclusive,
             &host(46 * GIB),
-            &HostTerms::DEFAULT,
+            &floor_terms(),
         )
         .unwrap_err(),
     );
     assert!(error.contains("page-cache floor"), "{error}");
-    assert!(error.contains("provisional"), "{error}");
     // Exactly the floor above the need passes; one byte less refuses.
-    let floor = HostTerms::DEFAULT.ngram_cache_min;
+    let floor = floor_terms().ngram_cache_min;
     let plan = HostPinPlan::new(
         &geometry,
         HostMode::Exclusive,
         &host(needed + floor),
-        &HostTerms::DEFAULT,
+        &floor_terms(),
     )
     .unwrap();
     assert_eq!(plan.page_cache_left, floor);
@@ -331,10 +359,70 @@ fn the_page_cache_left_follows_what_other_processes_hold() {
             &geometry,
             HostMode::Exclusive,
             &host(needed + floor - 1),
-            &HostTerms::DEFAULT
+            &floor_terms()
         )
         .is_err()
     );
+}
+
+#[test]
+fn the_mirrored_ngram_figures_equal_the_feed_constants() {
+    use super::feeds::{NGRAM_PAGE_CACHE_RESERVE_BYTES, ngram_staging_bytes};
+    assert_eq!(
+        HostTerms::DEFAULT.ngram_cache_min,
+        NGRAM_PAGE_CACHE_RESERVE_BYTES
+    );
+    for rows in [0u64, 1, 65_536, 131_072] {
+        assert_eq!(
+            rows * NGRAM_STAGING_BYTES_PER_ROW,
+            ngram_staging_bytes(rows)
+        );
+    }
+}
+
+#[test]
+fn the_ngram_staging_is_a_host_transient_charged_to_the_process() {
+    assert_eq!(NGRAM_STAGING_BYTES_PER_ROW, 656);
+    let geometry = geometry_of(&plan_with_slots(143));
+    let plan = HostPinPlan::new(
+        &geometry,
+        HostMode::Exclusive,
+        &host(55 * GIB),
+        &HostTerms::DEFAULT,
+    )
+    .unwrap();
+    // Two 4096-token chunks of 16 rows each in flight: 2 x 65,536 rows of 656 bytes, 86 MB.
+    assert_eq!(plan.ngram_staging_bytes, 2 * 65_536 * 656);
+    // More rows in flight move the need byte for byte, so the availability boundary moves with them.
+    let more = HostTerms {
+        ngram_staging_rows: 1 << 21,
+        ..HostTerms::DEFAULT
+    };
+    let big = HostPinPlan::new(&geometry, HostMode::Exclusive, &host(55 * GIB), &more).unwrap();
+    assert_eq!(big.ngram_staging_bytes, (1 << 21) * 656);
+    assert_eq!(
+        big.process_bytes - plan.process_bytes,
+        big.ngram_staging_bytes - plan.ngram_staging_bytes
+    );
+    let needed = big.process_bytes + big.os_floor;
+    assert!(HostPinPlan::new(&geometry, HostMode::Exclusive, &host(needed), &more).is_ok());
+    assert!(HostPinPlan::new(&geometry, HostMode::Exclusive, &host(needed - 1), &more).is_err());
+    // The default terms would still pass at `needed - 1`: the staging is what moved the boundary.
+    assert!(
+        HostPinPlan::new(
+            &geometry,
+            HostMode::Exclusive,
+            &host(needed - 1),
+            &HostTerms::DEFAULT
+        )
+        .is_ok()
+    );
+    // A row count that overflows is refused, not wrapped.
+    let absurd = HostTerms {
+        ngram_staging_rows: u64::MAX,
+        ..HostTerms::DEFAULT
+    };
+    assert!(HostPinPlan::new(&geometry, HostMode::Exclusive, &host(55 * GIB), &absurd).is_err());
 }
 
 #[test]
@@ -454,7 +542,7 @@ fn small(mode: HostMode) -> ExpertBankState<ReplaceOnMissLru> {
     let counts: Vec<Vec<u64>> = (0..2)
         .map(|_| (0..16).map(|e| e as u64).collect())
         .collect();
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     ExpertBankState::with_policy(geometry, mode, policy).unwrap()
 }
 
@@ -584,7 +672,7 @@ fn a_policy_row_must_hold_exactly_the_slots() {
     let geometry = BankGeometry::new(1, 16, 3, 5, 64).unwrap();
     let counts = vec![vec![0u64; 16]];
     let fill = |row: Vec<i32>| {
-        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts)?;
+        let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts, None)?;
         ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).map(|_| ())
     };
     let row = |held: usize| -> Vec<i32> {
@@ -623,7 +711,9 @@ fn a_policy_row_must_hold_exactly_the_slots() {
 fn a_poisoned_bank_refuses_every_later_pass() {
     let mut state = small(HostMode::Exclusive);
     state.begin_pass(0, &[9]).unwrap();
+    assert!(!state.is_poisoned());
     state.poison();
+    assert!(state.is_poisoned());
     assert!(state.begin_pass(0, &[1]).is_err());
     assert!(state.admit(0, &[1]).is_err());
 }
@@ -633,11 +723,11 @@ fn an_unfilled_start_is_refused() {
     let geometry = BankGeometry::new(1, 8, 2, 4, 64).unwrap();
     let counts = vec![vec![0u64; 8]];
     let short: Vec<i32> = vec![0, 1, 2, -1, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[short.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[short.as_slice()], &counts, None).is_err());
     let twice: Vec<i32> = vec![0, 1, 2, 2, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[twice.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[twice.as_slice()], &counts, None).is_err());
     let outside: Vec<i32> = vec![0, 1, 2, 4, -1, -1, -1, -1];
-    assert!(ReplaceOnMissLru::from_fill(geometry, &[outside.as_slice()], &counts).is_err());
+    assert!(ReplaceOnMissLru::from_fill(geometry, &[outside.as_slice()], &counts, None).is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -752,7 +842,7 @@ fn run_random_passes(mode: HostMode) {
     let row: Vec<i32> = (0..64).map(|e| if e < 20 { e } else { -1 }).collect();
     let rows = vec![row.as_slice(); 3];
     let counts = vec![vec![0u64; 64]; 3];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap();
     let mut state = ExpertBankState::with_policy(geometry, mode, policy).unwrap();
     let mut sim = Sim::new(&state);
     sim.check(&state);
@@ -949,7 +1039,7 @@ fn replay(trace: &str, slots: usize) -> f64 {
             .collect();
         let rows = vec![row.as_slice(); 48];
         let counts = vec![vec![0u64; 512]; 48];
-        ReplaceOnMissLru::from_fill(geometry, &rows, &counts).unwrap()
+        ReplaceOnMissLru::from_fill(geometry, &rows, &counts, None).unwrap()
     };
     let (mut policy, mut current) = (fresh(), String::new());
     let (mut hits, mut picks) = (0u64, 0u64);
@@ -1031,7 +1121,7 @@ mod device_tests {
         let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
         let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
         let policy =
-            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts)
+            ReplaceOnMissLru::from_fill(geometry, &[row.as_slice(), row.as_slice()], &counts, None)
                 .unwrap();
         let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap();
         let places = state.mode().places_per_layer(&geometry);
@@ -1093,6 +1183,55 @@ mod device_tests {
         assert_eq!(read_slot(&bank, 1, 1), expected(1, 1, record));
         let copies = bank.step(ctx, 0, &[8, 9]).unwrap();
         assert!(copies.ops.is_empty());
+
+        // The failure branch of `step`: a context of another adapter fails in the first copy, after
+        // the host model has moved. The bank is poisoned and every later use of it is refused.
+        assert_eq!((bank.stats().passes, bank.stats().misses), (2, 2));
+        assert_eq!(bank.geometry().slots, 4);
+        let other = CudaProjector::new().expect("a second context");
+        assert!(!bank.is_poisoned());
+        assert!(bank.slot_row(0).is_ok());
+        assert!(bank.step(other.context(), 0, &[10, 11]).is_err());
+        assert!(bank.is_poisoned());
+        assert!(
+            bank.step(ctx, 0, &[8, 9]).is_err(),
+            "a poisoned bank refuses a step"
+        );
+        assert!(bank.admit(ctx, 0, &[1]).is_err(), "and an admission");
+        assert!(bank.slot_row(0).is_err(), "and the slot row");
+        assert!(bank.slots(0).is_err(), "and the slot buffer");
+        assert!(
+            bank.read_place(0, 0, &mut [0u8; 16]).is_err(),
+            "and a place read"
+        );
+        // A plan for another store size is refused before anything is allocated.
+        let state = {
+            let row: Vec<i32> = (0..12).map(|e| if e < 4 { e } else { -1 }).collect();
+            let counts = vec![(0..12u64).collect::<Vec<_>>(); 2];
+            let policy = ReplaceOnMissLru::from_fill(
+                geometry,
+                &[row.as_slice(), row.as_slice()],
+                &counts,
+                None,
+            )
+            .unwrap();
+            ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
+        };
+        let mut wrong = plan;
+        wrong.store_bytes += 1;
+        let error = DeviceBank::build(ctx, state, &Pattern, &wrong)
+            .err()
+            .expect("refused");
+        assert!(
+            error.describe().contains("store bytes"),
+            "{}",
+            error.describe()
+        );
+        assert_eq!(
+            ctx.live_owners().pinned,
+            pinned_before + 2 * places * record,
+            "the refused build pinned nothing"
+        );
 
         // The pinned store is released with the bank: observe the drop, not an output.
         drop(bank);

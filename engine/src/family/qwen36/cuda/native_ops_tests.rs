@@ -18,7 +18,7 @@ fn geometry() -> MixerGeometry {
 }
 
 fn ops_of(kind: AttentionKind, layout: WeightLayout) -> Vec<BlockOp> {
-    block_ops(kind, &geometry(), layout, KvMode::Fp16).expect("ops")
+    block_ops(kind, &geometry(), layout, KvMode::Fp16, false).expect("ops")
 }
 
 /// The NATIVE Int8G32 attention list, whose slots the Int8G32 plan of `native_plan_tests.rs`
@@ -29,6 +29,7 @@ fn int8_ops() -> Vec<BlockOp> {
         &geometry(),
         WeightLayout::Native,
         KvMode::Int8G32,
+        false,
     )
     .expect("ops")
 }
@@ -285,6 +286,8 @@ fn the_int8_attention_list_is_pinned() {
         BlockOp::Kv8Append {
             k: Slot::KRows,
             v: Slot::VRows,
+            k_at: 0,
+            v_at: 0,
             k_codes: Plane::K,
             k_scales: Plane::KScales,
             v_codes: Plane::V,
@@ -338,7 +341,8 @@ fn the_int8_attention_list_is_pinned() {
             AttentionKind::DeltaNet,
             &geometry(),
             WeightLayout::Native,
-            KvMode::Int8G32
+            KvMode::Int8G32,
+            false
         )
         .expect("ops"),
         ops_of(AttentionKind::DeltaNet, WeightLayout::Native)
@@ -351,6 +355,7 @@ fn the_int8_attention_list_is_pinned() {
         &geometry(),
         WeightLayout::Tiled,
         KvMode::Int8G32,
+        false,
     ) {
         Err(crate::EngError::BadRequest(message)) => {
             assert!(
@@ -439,10 +444,17 @@ fn the_int8_list_ascends_and_stays_inside_the_int8_slots() {
 fn fused_gdn_inproj_collapses_the_sibling_launches_only() {
     let g = geometry();
     for layout in [WeightLayout::Native, WeightLayout::Tiled] {
-        let unfused =
-            block_ops(AttentionKind::DeltaNet, &g, layout, KvMode::Fp16).expect("unfused ops");
-        let fused = block_ops_with(true, AttentionKind::DeltaNet, &g, layout, KvMode::Fp16)
-            .expect("fused ops");
+        let unfused = block_ops(AttentionKind::DeltaNet, &g, layout, KvMode::Fp16, false)
+            .expect("unfused ops");
+        let fused = block_ops_with(
+            true,
+            AttentionKind::DeltaNet,
+            &g,
+            layout,
+            KvMode::Fp16,
+            false,
+        )
+        .expect("fused ops");
         let projects = |ops: &[BlockOp], role: Role| {
             ops.iter()
                 .filter(|op| {
@@ -491,14 +503,21 @@ fn fused_gdn_inproj_collapses_the_sibling_launches_only() {
         assert_eq!(kept(&fused), kept(&unfused));
     }
     // The Full list never fuses in this slice.
-    let full_unfused =
-        block_ops(AttentionKind::Full, &g, WeightLayout::Native, KvMode::Fp16).expect("full ops");
+    let full_unfused = block_ops(
+        AttentionKind::Full,
+        &g,
+        WeightLayout::Native,
+        KvMode::Fp16,
+        false,
+    )
+    .expect("full ops");
     let full_fused = block_ops_with(
         true,
         AttentionKind::Full,
         &g,
         WeightLayout::Native,
         KvMode::Fp16,
+        false,
     )
     .expect("full fused ops");
     assert_eq!(full_unfused.len(), full_fused.len());
@@ -572,6 +591,7 @@ mod card_ops_tests {
                 &g,
                 WeightLayout::Native,
                 KvMode::Fp16,
+                false,
             )
             .expect("single-device list");
             // The card list is the single-device list with the one card addition: the
@@ -714,6 +734,7 @@ mod card_ops_tests {
             &MixerGeometry::new(&dims()).expect("geometry"),
             WeightLayout::Native,
             KvMode::Fp16,
+            false,
         )
         .expect("single-device list");
         assert!(single.iter().all(|op| !matches!(

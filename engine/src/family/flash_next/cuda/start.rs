@@ -34,8 +34,9 @@ use super::{
         ReplaceOnMissLru, device::DeviceBank,
     },
     bank_source::PackRecordSource,
-    device::CardDevice,
-    driver::{DriverShape, TokenDriver},
+    device::{CardChunkDevice, CardDevice},
+    driver::chunk::ChunkDriver,
+    driver::{DriverShape, StepperPositions, TokenDriver, TokenTimes},
     executor::{CudaRules, FlashCudaExecutor},
     feeds::StartShape,
     load::{TrunkList, upload::trunk_weights},
@@ -44,6 +45,7 @@ use super::{
     ple_feed::{NgramRows, PleFeed, PleVectors},
     step::{FlashStep, SplitMoeAt},
 };
+use crate::family::session::TokenStepper;
 use crate::{
     EngError,
     family::{
@@ -93,12 +95,36 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
     ctx.set_single_row_default(SERVED_SINGLE_ROW);
     ctx.set_indexed_default(SERVED_INDEXED);
+    ctx.set_odd_rate_kernel(true);
+    // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
+    // runs inside the projection kernel, two launches per set instead of three, bit-identical
+    // bytes (64/64 receipt logits match). Isolated it saves ~1.27 us per launch, but measured on
+    // the full 64-step decode it REGRESSES the step: median 39.25 vs 38.28 ms and paired mean
+    // +2.25 ms (steps 9-64 of the adjacent off/on pair; REPORT.md cites the artifacts) - the
+    // larger shared footprint and the per-column-block rotation recompute reduce the overlap the
+    // 253 small launches had with the attention and expert kernels. Kept off for re-measuring
+    // after the launch floor changes (e.g. graph capture); `FIFI_FLASH_NEXT_FUSED_IN=1` opts in,
+    // any other non-empty value is refused, never a silent fallback. Read once here, per process.
+    let fused_in = match std::env::var("FIFI_FLASH_NEXT_FUSED_IN") {
+        Err(_) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v.is_empty() || v == "0" => false,
+        Ok(v) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_FUSED_IN={v}: only 0 and 1 are valid"
+            )));
+        }
+    };
+    ctx.set_fused_in_kernel(fused_in);
     ctx.check_single_gather()?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
         ctx.single_row_kernel_name()?,
         ctx.single_gather_suffix()
     );
+    if fused_in {
+        eprintln!("flash-next cuda: fused-input launch on");
+    }
     Ok(())
 }
 
@@ -230,32 +256,111 @@ impl RecordSource for TimedSource<'_> {
     }
 }
 
-/// The bank: the first `slots` experts of every layer on the card, the rest pinned on the host,
-/// under the host plan the caller admitted.
+/// Reads an exllamav3 `expert_stats` JSON into per-layer expert use weights, in layer order.
+/// Refuses a missing file, bad JSON, any layer key that is not `model.language_model.layers.<i>.mlp`,
+/// or a layer index outside `0..layers`. A duplicate layer key cannot be detected here: the JSON
+/// parser keeps the last value of a repeated object key, so the layer reads as missing instead.
+/// The weights themselves are validated against the bank geometry by [`fill_from_profile`].
+fn read_expert_stats(path: &str, layers: usize) -> Result<Vec<Vec<f64>>, EngError> {
+    let bad =
+        |detail: String| EngError::BadRequest(format!("expert_stats profile {path}: {detail}"));
+    let text = std::fs::read_to_string(path).map_err(|e| bad(format!("unreadable: {e}")))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| bad(format!("not valid JSON: {e}")))?;
+    let layer_map = parsed
+        .get("layers")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| bad("no layers object".into()))?;
+    let mut out: Vec<Option<Vec<f64>>> = vec![None; layers];
+    for (key, weights) in layer_map {
+        let index: Option<usize> = key
+            .strip_prefix("model.language_model.layers.")
+            .and_then(|rest| rest.strip_suffix(".mlp"))
+            .and_then(|n| n.parse().ok());
+        let index = index.ok_or_else(|| bad(format!("layer key {key} is not expected")))?;
+        if index >= layers {
+            return Err(bad(format!("layer index {index} outside 0..{layers}")));
+        }
+        let row: Vec<f64> = serde_json::from_value(weights.clone())
+            .map_err(|e| bad(format!("layer {index}: not a list of numbers: {e}")))?;
+        if out[index].is_some() {
+            return Err(bad(format!("layer {index} appears twice")));
+        }
+        out[index] = Some(row);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(index, row)| row.ok_or_else(|| bad(format!("layer {index} is missing"))))
+        .collect()
+}
+
+/// The slot rows and LRU counts of the initial fill. With a profile: per layer, the experts sorted
+/// by use weight (highest first, id breaking ties) take the slots in rank order and the weights
+/// scale to `u64` counts. Without: the first experts by id take the slots and lower ids count as
+/// hotter. Pure; both arms keep every invariant `ReplaceOnMissLru::from_fill` checks.
+fn fill_from_profile(
+    geometry: BankGeometry,
+    profile: Option<&[Vec<f64>]>,
+) -> Result<(Vec<Vec<i32>>, Vec<Vec<u64>>), EngError> {
+    if let Some(profile) = profile
+        && profile.len() != geometry.layers
+    {
+        return Err(EngError::BadRequest(format!(
+            "Flash-Next expert bank: the popularity profile has {} layers, the bank has {}",
+            profile.len(),
+            geometry.layers
+        )));
+    }
+    let mut rows = Vec::with_capacity(geometry.layers);
+    let mut counts = Vec::with_capacity(geometry.layers);
+    for layer in 0..geometry.layers {
+        let Some(weights) = profile.and_then(|p| p.get(layer)) else {
+            rows.push(
+                (0..geometry.experts)
+                    .map(|e| if e < geometry.slots { e as i32 } else { -1 })
+                    .collect(),
+            );
+            counts.push((0..geometry.experts as u64).rev().collect());
+            continue;
+        };
+        if weights.len() != geometry.experts || weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err(EngError::BadRequest(format!(
+                "Flash-Next expert bank: layer {layer} of the popularity profile has {} weights \
+                 (need {}, each finite and non-negative)",
+                weights.len(),
+                geometry.experts
+            )));
+        }
+        let mut by_weight: Vec<usize> = (0..geometry.experts).collect();
+        by_weight.sort_by(|&a, &b| weights[b].total_cmp(&weights[a]).then(a.cmp(&b)));
+        let mut row = vec![-1; geometry.experts];
+        for (slot, &expert) in by_weight.iter().take(geometry.slots).enumerate() {
+            row[expert] = slot as i32;
+        }
+        rows.push(row);
+        counts.push(weights.iter().map(|w| (*w * 1000.0) as u64).collect());
+    }
+    Ok((rows, counts))
+}
+
+/// The bank: under the host plan the caller admitted. The plan's mode picks the store (an inclusive
+/// plan holds every expert, so a miss copies one way only). `profile`, when the caller read one, is
+/// the per-layer expert use weights of a serving run: the hottest `slots` experts fill the slots in
+/// rank order and the counts keep them the last evicted; without one the first experts by id fill
+/// the slots and lower ids count as hotter.
 fn build_bank(
     projector: &CudaProjector,
     geometry: BankGeometry,
     plan: &HostPinPlan,
+    profile: Option<&[Vec<f64>]>,
+    usage_out: Option<&std::path::Path>,
     source: &PackRecordSource<'_>,
 ) -> Result<DeviceBank, EngError> {
-    let rows: Vec<Vec<i32>> = (0..geometry.layers)
-        .map(|_| {
-            (0..geometry.experts)
-                .map(|expert| {
-                    if expert < geometry.slots {
-                        expert as i32
-                    } else {
-                        -1
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let (rows, counts) = fill_from_profile(geometry, profile)?;
     let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
-    // No popularity profile: lower ids count as hotter, so the first experts are the last evicted.
-    let counts = vec![(0..geometry.experts as u64).rev().collect::<Vec<u64>>(); geometry.layers];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts)?;
-    let state = ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy)?;
+    let policy = ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, usage_out)?;
+
+    let state = ExpertBankState::with_policy(geometry, plan.mode, policy)?;
     let timed = TimedSource {
         inner: source,
         spent: Cell::new(Duration::ZERO),
@@ -280,7 +385,7 @@ fn make(
     wanted: &CudaSettings,
     rules: CudaRules,
     guard: BuildGuard,
-) -> Result<(FlashCudaExecutor<CardDevice, PackFeeds>, DecodeSession), EngError> {
+) -> Result<(FlashCudaExecutor<StepDriver>, DecodeSession), EngError> {
     let driver = build_driver(
         &|name| stages.begin(name),
         artifact,
@@ -299,7 +404,7 @@ pub(super) fn build_driver(
     wanted: &CudaSettings,
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
-) -> Result<TokenDriver<CardDevice, PackFeeds>, EngError> {
+) -> Result<StepDriver, EngError> {
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -375,15 +480,46 @@ pub(super) fn build_driver(
         slots,
         record_bytes,
     )?;
-    let host_plan = HostPinPlan::new(
-        &geometry,
-        HostMode::Exclusive,
-        &HostMemory {
-            total: mem_total,
-            available: mem_available,
+    // The store mode: an inclusive store holds every expert pinned, so a miss copies one way
+    // only (the D2H write-back of the evicted expert disappears); it needs every record's bytes
+    // of host RAM (43.07 GiB on this pack), so `auto` takes it only when the plan admits it and
+    // falls back to the exclusive store of spare places. `FIFI_FLASH_NEXT_BANK_MODE` forces a
+    // mode (`inclusive` or `exclusive`); anything else is refused, never a silent fallback.
+    let memory = HostMemory {
+        total: mem_total,
+        available: mem_available,
+    };
+    let host_plan = match std::env::var("FIFI_FLASH_NEXT_BANK_MODE").as_deref() {
+        Err(_) | Ok("") | Ok("auto") => {
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT).or_else(
+                |inclusive| {
+                    eprintln!(
+                        "flash-next cuda: inclusive store refused ({inclusive:?}); exclusive store"
+                    );
+                    HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)
+                },
+            )?
+        }
+        Ok("inclusive") => {
+            HostPinPlan::new(&geometry, HostMode::Inclusive, &memory, &HostTerms::DEFAULT)?
+        }
+        Ok("exclusive") => {
+            HostPinPlan::new(&geometry, HostMode::Exclusive, &memory, &HostTerms::DEFAULT)?
+        }
+        Ok(other) => {
+            return Err(EngError::BadRequest(format!(
+                "FIFI_FLASH_NEXT_BANK_MODE={other}: only auto, inclusive and exclusive are valid"
+            )));
+        }
+    };
+    eprintln!(
+        "flash-next cuda: {} store, {} pinned host bytes",
+        match host_plan.mode {
+            HostMode::Inclusive => "inclusive",
+            HostMode::Exclusive => "exclusive",
         },
-        &HostTerms::DEFAULT,
-    )?;
+        host_plan.store_bytes
+    );
     let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
     let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
     HostBudget::probe()?.admit_for(
@@ -412,13 +548,60 @@ pub(super) fn build_driver(
 
     stage("filling the expert bank");
     let source = PackRecordSource::new(checkpoint)?;
-    let bank = build_bank(projector, geometry, &host_plan, &source)?;
+    // Optional popularity profile, an exllamav3 expert_stats JSON:
+    // {"model_dir": .., "layers": {"model.language_model.layers.<i>.mlp": [weights]}}. Sources,
+    // in order: the engine's `expert_stats` key (which also takes the usage dump, so the next
+    // start of the same entry serves warm) and `FIFI_FLASH_NEXT_EXPERT_STATS`. A set env value
+    // must read and parse; a malformed file is refused, never a silent identity fill. A
+    // not-yet-written engine-key file is a cold start (the dump creates it on shutdown).
+    let env_stats = std::env::var("FIFI_FLASH_NEXT_EXPERT_STATS")
+        .ok()
+        .filter(|path| !path.is_empty());
+    let stats_path = wanted
+        .expert_stats
+        .as_deref()
+        .map(std::path::Path::new)
+        .or_else(|| env_stats.as_deref().map(std::path::Path::new));
+    let profile = match &stats_path {
+        None => None,
+        Some(path) if wanted.expert_stats.is_some() && !path.exists() => {
+            eprintln!(
+                "flash-next cuda: expert bank: no profile at {} yet; identity fill, the dump writes it on shutdown",
+                path.display()
+            );
+            None
+        }
+        Some(path) => Some(read_expert_stats(&path.display().to_string(), layers)?),
+    };
+    let usage_out = wanted.expert_stats.clone().or_else(|| {
+        std::env::var("FIFI_FLASH_NEXT_EXPERT_USAGE_OUT")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    });
+    if profile.is_some() {
+        eprintln!(
+            "flash-next cuda: expert bank: popularity profile {}",
+            stats_path.map_or(String::new(), |p| p.display().to_string())
+        );
+    }
+    let bank = build_bank(
+        projector,
+        geometry,
+        &host_plan,
+        profile.as_deref(),
+        usage_out.as_deref(),
+        &source,
+    )?;
     eprintln!(
         "flash-next cuda: expert bank filled at {:.1} s",
         began.elapsed().as_secs_f64()
     );
 
     stage("building the step");
+    // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
+    // device chunks of that many rows; one (the default) is the decode shape of before.
+    let rows = wanted.prefill_rows as usize;
     let stream = Box::leak(Box::new(ctx.stream()?));
     let step = FlashStep::new(
         ctx,
@@ -426,6 +609,7 @@ pub(super) fn build_driver(
         weights,
         &checkpoint.model_config,
         wanted.context as usize,
+        rows,
         0..layers,
     )?;
     let block = SplitMoe::new(
@@ -433,11 +617,10 @@ pub(super) fn build_driver(
         moe_trunks(weights, layers)?,
         bank,
         source.layout(),
-        &step.moe_dims(),
+        &step.moe_dims(rows),
     )?;
     let model_layers: Vec<usize> = (0..layers).collect();
     let moe = SplitMoeAt::new(block, &model_layers)?;
-    let device = CardDevice::new(step, moe);
 
     stage("opening the n-gram table");
     let (vectors, projection) =
@@ -462,16 +645,217 @@ pub(super) fn build_driver(
             ple_embed,
         },
     };
-    let driver = TokenDriver::new(device, feeds, shape)?;
-    eprintln!(
-        "flash-next cuda: ready in {:.1} s",
-        began.elapsed().as_secs_f64()
-    );
+    let ready = began.elapsed().as_secs_f64();
+    let driver = if rows > 1 {
+        let mut chunked = ChunkDriver::new(CardChunkDevice::new(step, moe), feeds, shape)?;
+        chunked.chunk_cap = rows;
+        eprintln!("flash-next cuda: ready in {ready:.1} s, prefill chunks of {rows} rows");
+        StepDriver::Chunk(chunked)
+    } else {
+        eprintln!("flash-next cuda: ready in {ready:.1} s");
+        StepDriver::Token(TokenDriver::new(CardDevice::new(step, moe), feeds, shape)?)
+    };
     Ok(driver)
+}
+
+/// The executor's driver on the card: the exact token driver (one row per call), or the chunked
+/// driver when `prefill_rows` is set above one. Both follow the token stepper rules; the enum
+/// keeps `make` a single concrete executor type.
+pub(in crate::family::flash_next::cuda) enum StepDriver {
+    Token(TokenDriver<CardDevice, PackFeeds>),
+    Chunk(ChunkDriver<CardChunkDevice, PackFeeds>),
+}
+
+impl TokenStepper for StepDriver {
+    const OPERATION: &'static str = "flash_next_cuda";
+
+    fn feed(&mut self, token: u32) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.feed(token),
+            Self::Chunk(driver) => driver.feed(token),
+        }
+    }
+
+    /// Forwarded, not defaulted: the chunk driver's whole point is the chunked `feed_rows`.
+    fn feed_rows(&mut self, tokens: &[u32]) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.feed_rows(tokens),
+            Self::Chunk(driver) => driver.feed_rows(tokens),
+        }
+    }
+
+    fn logits(&mut self, token: u32) -> Result<Vec<f32>, EngError> {
+        match self {
+            Self::Token(driver) => driver.logits(token),
+            Self::Chunk(driver) => driver.logits(token),
+        }
+    }
+
+    fn fed(&self) -> usize {
+        match self {
+            Self::Token(driver) => driver.fed(),
+            Self::Chunk(driver) => driver.fed(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), EngError> {
+        match self {
+            Self::Token(driver) => driver.reset(),
+            Self::Chunk(driver) => driver.reset(),
+        }
+    }
+}
+
+impl StepperPositions for StepDriver {
+    fn positions(&self) -> usize {
+        match self {
+            Self::Token(driver) => driver.positions(),
+            Self::Chunk(driver) => driver.positions(),
+        }
+    }
+}
+
+impl StepDriver {
+    /// The bank's miss count for the per-job report.
+    pub(super) fn bank_misses(&self) -> u64 {
+        match self {
+            Self::Token(driver) => driver.device().bank_misses(),
+            Self::Chunk(driver) => driver.device().bank_misses(),
+        }
+    }
+
+    /// The single-row kernel counters, for the device tests.
+    #[cfg(test)]
+    pub(super) fn kernel_launches(&self) -> crate::kernels::single_row::SingleRowLaunches {
+        match self {
+            Self::Token(driver) => driver.device().kernel_launches(),
+            Self::Chunk(driver) => driver.device().kernel_launches(),
+        }
+    }
+
+    /// The single-row kernel name, for the device tests.
+    #[cfg(test)]
+    pub(super) fn single_row_kernel_name(&self) -> Result<&'static str, EngError> {
+        match self {
+            Self::Token(driver) => driver.device().single_row_kernel_name(),
+            Self::Chunk(driver) => driver.device().single_row_kernel_name(),
+        }
+    }
+
+    /// The last step's host timing, for the device tests. The chunk driver keeps none; its
+    /// table prints the decode shape's zeros.
+    pub(super) fn last_times(&self) -> TokenTimes {
+        match self {
+            Self::Token(driver) => driver.last_times(),
+            Self::Chunk(_) => TokenTimes::default(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{BankGeometry, fill_from_profile, read_expert_stats};
+    use std::io::Write as _;
+
+    /// A profile fills the slots in weight rank order (ties by id) and scales the weights to
+    /// counts; the same bank without one keeps the id-ordered fill and the reversed-id counts.
+    #[test]
+    fn a_profile_ranks_the_initial_fill() {
+        let geometry = BankGeometry::new(1, 6, 2, 3, 8).expect("geometry");
+        let profile = [vec![1.0, 9.0, 4.0, 9.0, 0.0, 2.0]];
+        let (rows, counts) = fill_from_profile(geometry, Some(&profile)).expect("fill");
+        // experts 1 and 3 tie at the top weight; id breaks it, so 1 takes slot 0, 3 slot 1, 2 slot 2.
+        assert_eq!(rows[0], [-1, 0, 2, 1, -1, -1]);
+        assert_eq!(counts[0], vec![1000, 9000, 4000, 9000, 0, 2000]);
+        let (rows, counts) = fill_from_profile(geometry, None).expect("identity fill");
+        assert_eq!(rows[0], [0, 1, 2, -1, -1, -1]);
+        assert_eq!(counts[0], (0..6u64).rev().collect::<Vec<u64>>());
+    }
+
+    /// A profile with the wrong layer count or non-finite weights is refused, not folded into
+    /// the identity fill.
+    #[test]
+    fn a_bad_profile_is_refused() {
+        let geometry = BankGeometry::new(2, 4, 2, 3, 8).expect("geometry");
+        assert!(fill_from_profile(geometry, Some(&[vec![1.0; 4]])).is_err());
+        assert!(
+            fill_from_profile(geometry, Some(&[vec![1.0; 4], vec![-1.0, 0.0, 0.0, 0.0]])).is_err()
+        );
+        assert!(
+            fill_from_profile(
+                geometry,
+                Some(&[vec![1.0; 4], vec![f64::NAN, 0.0, 0.0, 0.0]])
+            )
+            .is_err()
+        );
+    }
+
+    /// The stats reader takes the stock layer keys in any object order, refuses a bad key, a
+    /// duplicate, an out-of-range index and a missing layer, and returns weights in layer order.
+    #[test]
+    fn the_usage_dump_round_trips_through_the_reader() {
+        let dir = std::env::temp_dir().join(format!("fn-dump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("dump.json");
+        let geometry = BankGeometry::new(1, 4, 2, 3, 8).expect("geometry");
+        let (rows, counts) = fill_from_profile(geometry.clone(), None).expect("identity fill");
+        let row_refs: Vec<&[i32]> = rows.iter().map(Vec::as_slice).collect();
+        {
+            let _policy =
+                super::ReplaceOnMissLru::from_fill(geometry, &row_refs, &counts, Some(&path))
+                    .expect("policy");
+        } // drop writes the dump
+        assert!(path.exists(), "the drop wrote the dump");
+        let read = read_expert_stats(path.to_str().unwrap(), 1).expect("read back");
+        assert_eq!(read, vec![vec![0.0; 4]], "zero picks dump zero weights");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_stats_reader_parses_and_refuses() {
+        let dir = std::env::temp_dir().join(format!("fn-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            let mut file = std::fs::File::create(&path).expect("file");
+            file.write_all(body.as_bytes()).expect("write");
+            path
+        };
+        let good = write(
+            "good.json",
+            r#"{"model_dir": "x", "layers": {
+                "model.language_model.layers.1.mlp": [2.0, 1.0],
+                "model.language_model.layers.0.mlp": [0.5, 4.0]}}"#,
+        );
+        assert_eq!(
+            read_expert_stats(good.to_str().unwrap(), 2).expect("read"),
+            vec![vec![0.5, 4.0], vec![2.0, 1.0]]
+        );
+        for (name, body) in [
+            ("badkey.json", "{\"layers\": {\"layers.0.mlp\": [1.0]}}"),
+            (
+                "dup.json",
+                r#"{"layers": {"model.language_model.layers.0.mlp": [1.0], "model.language_model.layers.0.mlp": [2.0]}}"#,
+            ),
+            (
+                "range.json",
+                "{\"layers\": {\"model.language_model.layers.2.mlp\": [1.0]}}",
+            ),
+            (
+                "missing.json",
+                "{\"layers\": {\"model.language_model.layers.0.mlp\": [1.0]}}",
+            ),
+            ("notjson.json", "nope"),
+        ] {
+            let path = write(name, body);
+            assert!(
+                read_expert_stats(path.to_str().unwrap(), 2).is_err(),
+                "{name} must be refused"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
     /// The served kernels are registered and checked before the pack is opened and before any
     /// stream or weight exists, in the order set default, set options, check.
     #[test]
@@ -486,11 +870,14 @@ mod tests {
         let indexed = register
             .find("ctx.set_indexed_default(")
             .expect("the indexed default");
+        let odd = register
+            .find("ctx.set_odd_rate_kernel(true)")
+            .expect("the odd-rate kernel switch");
         let check = register
             .find("ctx.check_single_gather()?")
             .expect("the switch check");
         assert!(
-            single < indexed && indexed < check,
+            single < indexed && indexed < odd && odd < check,
             "the defaults must be registered before check_single_gather()"
         );
         let build = &source[source

@@ -256,9 +256,9 @@ fn a_layout_mismatch_is_refused_before_any_context_work() {
             other => panic!("a mismatched layout must be refused: {other:?}"),
         }
     }
-    // And `new` runs it before anything device-side: the wiring is pinned on the source text, so a
-    // mutant that reads the layout from the options alone still fails.
-    let body = pinned_text(fn_section("pub(crate) fn new("));
+    // And the build runs it before anything device-side: the wiring is pinned on the source
+    // text, so a mutant that reads the layout from the options alone still fails.
+    let body = pinned_text(fn_section("fn build("));
     let length = body.len();
     let agree = body
         .find("agree_layout(weights.layout()?, options.layout)?;")
@@ -339,7 +339,7 @@ fn the_head_launches_write_every_logits_row() {
 
 #[test]
 fn new_validates_the_step_inputs_before_it_touches_the_context() {
-    let body = pinned_text(fn_section("pub(crate) fn new("));
+    let body = pinned_text(fn_section("fn build("));
     let length = body.len();
     assert!(
         body.contains("validate_step_inputs(options, res.dims.shape.vocab, &rules)?"),
@@ -728,7 +728,9 @@ fn an_exl3_step_captures_with_device_picks() {
     let squeeze = |text: &str| text.split_whitespace().collect::<String>();
     let config = squeeze(fn_section("pub(crate) fn set_capture_config("));
     assert!(
-        config.contains("self.exl3_device_ids=config.capture&&self.layout==WeightLayout::Exl3;"),
+        config.contains(
+            "self.exl3_device_ids=config.capture&&self.layout==WeightLayout::Exl3&&self.exl3_bank.is_none();",
+        ),
         "{config}"
     );
     let run = squeeze(fn_section("fn run_op("));

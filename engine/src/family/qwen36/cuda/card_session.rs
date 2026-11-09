@@ -32,7 +32,9 @@ use super::mixer_ops::CardOp;
 use super::mixer_weights::MixerWeights;
 use super::moe::MoeLayerWeights;
 use super::multi::fold_ring_status;
+use super::prefix::CudaPrefillPath;
 use super::resources::{GlobalNames, MoeSpecs, check_native_embed, moe_layer_weights, raw_buffer};
+use super::state::export::ExportedState;
 use super::state::{ResidentState, StepField};
 use super::step_plan::Slot;
 
@@ -42,7 +44,9 @@ use crate::family::executor::{ExecutorOps, GenerationState};
 use crate::family::gguf_model::{Inventory, Role};
 use crate::family::project::cuda::{CudaWeight, CudaWeights, WeightLayout};
 use crate::family::qwen36::cuda::rules::check_token_id;
-use crate::family::session::{DecodeSession, Limits, TokenStepper, check_prompt};
+use crate::family::session::{
+    DecodeSession, Limits, PrefixSlot, SaveKind, StoreLimits, TokenStepper, check_prompt,
+};
 use crate::kernels::cuda::resident::step_params::StepParams;
 use crate::kernels::cuda::{DeviceBuffer, NativeWeight};
 
@@ -74,6 +78,17 @@ pub(crate) struct CardSession {
     context_limit: usize,
     fed: usize,
     poisoned: bool,
+    /// The prefix store of the session: one entry is one `ExportedState`
+    /// per card (the card's sliced KV planes plus its DeltaNet state), so
+    /// an entry's host cost is one replica of cache plus two delta pools.
+    prefix: PrefixSlot<Vec<ExportedState>, CudaPrefillPath>,
+    /// The numeric path every entry of this session saves and restores under.
+    prefix_path: CudaPrefillPath,
+    /// Set by a prefix import: the word block was zeroed, so the next feed
+    /// writes the full step params (token id AND position) again.
+    full_params_next: bool,
+    /// Experimental: prompt-only feeds need state, not the vocabulary row.
+    skip_prefill_head: bool,
     eos: Arc<[u32]>,
     sampler_vocab: usize,
 }
@@ -94,6 +109,7 @@ impl CardSession {
         options: &StepOptions,
         eos: Arc<[u32]>,
         sampler_vocab: usize,
+        prefix_limits: StoreLimits,
     ) -> Result<Self, EngError> {
         let cards = stack.shards().len();
         if weights.len() != cards {
@@ -137,6 +153,8 @@ impl CardSession {
                 views,
                 layout: native,
                 kv_mode: options.kv_mode,
+                // Cards hold native weights only: the tiled-experts hybrid has no card form.
+                moe_tiled: false,
                 paged: None,
                 // Card sessions run dense: no sparse exec is constructed on this
                 // path, so the sparse chain can never launch here.
@@ -238,6 +256,11 @@ impl CardSession {
             context_limit,
             fed: 0,
             poisoned: false,
+            skip_prefill_head: std::env::var_os("Q36_P2P_SKIP_PREFILL_HEAD")
+                .is_some_and(|value| value == "1"),
+            prefix: PrefixSlot::with_limits(prefix_limits),
+            prefix_path: CudaPrefillPath::Steps(options.kv_mode),
+            full_params_next: false,
             eos,
             sampler_vocab,
         })
@@ -245,6 +268,24 @@ impl CardSession {
 
     pub(crate) fn context_limit(&self) -> usize {
         self.context_limit
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_skip_prefill_head_for_test(&mut self, enabled: bool) {
+        self.skip_prefill_head = enabled;
+    }
+
+    /// The prefix rig's comparison vehicle: one export per card of the
+    /// committed state (sliced KV planes plus DeltaNet slots).
+    #[cfg(test)]
+    pub(super) fn export_states_for_test(
+        &self,
+    ) -> Result<Vec<crate::family::qwen36::cuda::state::export::ExportedState>, EngError> {
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
+            .collect()
     }
 
     /// The one launch path of a token: run the whole distributed step, fold
@@ -264,13 +305,19 @@ impl CardSession {
                 self.fed, self.context_limit
             )));
         }
-        if self.fed == 0 {
+        if self.fed == 0 || self.full_params_next {
             // The cleared word block takes the full params: the token id
-            // and the restarted position.
-            let params = StepParams::new(card_token_id(token)?, 0)?;
+            // and the position. After a fresh reset the position is 0; after
+            // a prefix import the word block was zeroed by the import and
+            // the position restarts at the restored token count.
+            let pos = i32::try_from(self.fed).map_err(|_| {
+                EngError::BadRequest("card session: position overflows i32".to_owned())
+            })?;
+            let params = StepParams::new(card_token_id(token)?, pos)?;
             for card in 0..self.stack.shards().len() {
                 self.states[card].write_step_params(&self.stack.streams()[card], &params)?;
             }
+            self.full_params_next = false;
         } else {
             // The next token comes from the HOST draw over the folded
             // logits row, so the global id is injected explicitly on every
@@ -284,6 +331,9 @@ impl CardSession {
                 .map(|card| self.card_ops[card].of(kind))
                 .collect::<Result<Vec<_>, EngError>>()?;
             layer_ops.push(list);
+        }
+        for state in &mut self.states {
+            state.enqueue_step(1)?;
         }
         let ops: Vec<&[&[CardOp]]> = layer_ops.iter().map(|list| list.as_slice()).collect();
         let moe_sets: Vec<&[MoeLayerWeights]> = self.moe.iter().map(|set| set.as_slice()).collect();
@@ -301,6 +351,7 @@ impl CardSession {
             &self.heads,
             self.eps,
             self.fed,
+            read_logits || !self.skip_prefill_head,
         )?;
         // The read-back: every stream joined, then every status word folded
         // BEFORE anything is handed out.
@@ -308,6 +359,11 @@ impl CardSession {
             self.stack.streams()[card].synchronize()?;
         }
         self.fold_statuses()?;
+        // The step committed one clean position on every card; the books
+        // carry the count the prefix export reads.
+        for state in &mut self.states {
+            state.commit_step(1, 0)?;
+        }
         let logits = if read_logits {
             self.read_logits()?
         } else {
@@ -417,6 +473,7 @@ impl TokenStepper for CardSession {
         self.stack.reset_states_and_ring(&mut self.states)?;
         self.fed = 0;
         self.poisoned = false;
+        self.full_params_next = false;
         Ok(())
     }
 }
@@ -457,6 +514,65 @@ impl ExecutorOps for CardSession {
     }
 
     fn boundary(&mut self, _st: &mut DecodeSession) {}
+
+    fn prefix_limits(&self) -> StoreLimits {
+        self.prefix.limits()
+    }
+
+    /// Snapshots every card's state (its sliced KV planes plus its DeltaNet
+    /// slots) into the host store under the shared session rules. An entry
+    /// is one `ExportedState` per card, so restoring hands each card back
+    /// its own slice; the recorded slice identity refuses a mismatched deal.
+    fn save_prefix(
+        &mut self,
+        st: &DecodeSession,
+        key: &[u32],
+        kind: SaveKind,
+    ) -> Result<bool, EngError> {
+        if self.prefix.limits().entries == 0 {
+            return Ok(false);
+        }
+        let fed = self.fed;
+        let mut slot = std::mem::take(&mut self.prefix);
+        let saved = st.save_prefix(&mut slot, key, self.prefix_path, fed, kind, || {
+            self.states
+                .iter()
+                .enumerate()
+                .map(|(card, state)| state.export_state(&self.stack.streams()[card]))
+                .collect()
+        });
+        self.prefix = slot;
+        saved
+    }
+
+    fn restore_prefix(
+        &mut self,
+        st: &mut DecodeSession,
+        prompt: &[u32],
+    ) -> Result<usize, EngError> {
+        if self.prefix.limits().entries == 0 {
+            return Ok(0);
+        }
+        let mut slot = std::mem::take(&mut self.prefix);
+        let covered = st.restore_prefix(&mut slot, prompt, self.prefix_path, |saved| {
+            if saved.len() != self.states.len() {
+                return Err(EngError::BadRequest(format!(
+                    "card prefix: {} saved states for {} cards",
+                    saved.len(),
+                    self.states.len()
+                )));
+            }
+            let tokens = saved[0].tokens;
+            for (card, (state, exported)) in self.states.iter_mut().zip(saved.iter()).enumerate() {
+                state.import_state(&self.stack.streams()[card], exported)?;
+            }
+            self.fed = tokens;
+            self.full_params_next = true;
+            Ok(())
+        });
+        self.prefix = slot;
+        covered
+    }
 }
 
 /// The one CUDA executor type of the start: the single-device resident step
@@ -541,6 +657,36 @@ impl ExecutorOps for Q36CudaStep {
         match self {
             Self::Single(step) => step.decode(st, generation),
             Self::Cards(session) => session.decode(st, generation),
+        }
+    }
+
+    fn prefix_limits(&self) -> StoreLimits {
+        match self {
+            Self::Single(step) => step.prefix_limits(),
+            Self::Cards(session) => session.prefix_limits(),
+        }
+    }
+
+    fn save_prefix(
+        &mut self,
+        st: &DecodeSession,
+        key: &[u32],
+        kind: SaveKind,
+    ) -> Result<bool, EngError> {
+        match self {
+            Self::Single(step) => step.save_prefix(st, key, kind),
+            Self::Cards(session) => session.save_prefix(st, key, kind),
+        }
+    }
+
+    fn restore_prefix(
+        &mut self,
+        st: &mut DecodeSession,
+        prompt: &[u32],
+    ) -> Result<usize, EngError> {
+        match self {
+            Self::Single(step) => step.restore_prefix(st, prompt),
+            Self::Cards(session) => session.restore_prefix(st, prompt),
         }
     }
 

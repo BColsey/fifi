@@ -5,15 +5,20 @@
 //! environment fallback. This file only reads and checks values. It opens no file and starts no
 //! thread.
 //!
-//! The dense Qwen3.8 family uses these settings on MLX and expects the same pinned tokenizer
-//! bundle as Q36. Its session cap is explicit and includes its attention and DeltaNet state.
+//! The dense Qwen3.8 family uses these settings on MLX and expects its own pinned tokenizer
+//! bundle (`dense_tokenizer_pin`). Its session cap is explicit and includes its attention and
+//! DeltaNet state.
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 use crate::family::speculate::driver::{RepeatDrafter, Speculator};
 use crate::{EngError, tensor::Dtype, tokenizer::TokenizerPin};
 use serde::Deserialize;
@@ -76,6 +81,17 @@ const CHAT_TEMPLATE_SHA256: &str =
     "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
+
+/// SHA-256 of the pinned files of the Qwen3.8-27B dense release
+/// (`Qwen3.8-27B-Dense-exl3-4.00bpw`). Its tokenizer serializes differently and its
+/// chat template is its own, but the id count (base 248,044 plus 33 added tokens,
+/// 248,077 ids) and the generation config are identical to Qwen3.6.
+const DENSE_TOKENIZER_JSON_SHA256: &str =
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
+const DENSE_TOKENIZER_CONFIG_SHA256: &str =
+    "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
+const DENSE_CHAT_TEMPLATE_SHA256: &str =
+    "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 
 /// The backend a build serves Q36 from: MLX on Apple Silicon, CUDA on Linux with `native-cuda`; a
 /// build with neither keeps the MLX reading, as before.
@@ -175,6 +191,15 @@ pub(crate) struct Q36Options {
     /// The tiered expert mode of the CUDA arm. Absent means off: the routed experts are all
     /// resident on the device, as before. The MLX arm refuses the member.
     pub(crate) tiered: Option<TieredOptions>,
+    /// The banked EXL3 expert mode of the CUDA arm: `slots` experts per layer stay on the device
+    /// and every expert's packed bytes stay in a pageable host store for miss copies. Absent means
+    /// off. An EXL3-only CUDA member. Measured on a 6 GB laptop GPU over PCIe Gen4 (2.08bpw):
+    /// 40.5-43.8 tok/s served decode. The ngram-drafted `draft_verify: krow` over the bank measured
+    /// net-negative in the same state (31.9/21.7 tok/s vs the 41.7/39.0 baseline, and 10.8/8.1 on
+    /// a Gen1 link) because every extra drafted expert read misses the bank and pays the PCIe
+    /// refill; revisit only with a real draft head, which reads resident experts it already
+    /// picked.
+    pub(crate) expert_bank: Option<ExpertBankOptions>,
     /// The checkpoint format `model_dir` holds: `gguf` (the default, the pinned Q4_K_M file) or
     /// `exl3` (a stock EXL3 pack directory). `exl3` is a CUDA member; the MLX arm refuses it.
     pub(crate) weight_format: Option<String>,
@@ -184,8 +209,8 @@ pub(crate) struct Q36Options {
     /// `kv_offload_host_bytes`, and `capture` (the resolved flag: unset means the CUDA arm's
     /// default, on), each by name.
     pub(crate) cuda_devices: Option<Vec<u32>>,
-    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. A CUDA
-    /// member for `weight_format` `exl3` only.
+    /// Where speculative drafts come from: `disabled` (the default), `ngram` or `mtp`. The
+    /// CUDA arm (`weight_format` `exl3`) and the MLX resident arm (`gguf`) take `ngram`.
     pub(crate) draft_mode: Option<String>,
     /// The most drafts of one verify window, from 1 to 16. The default is 2.
     pub(crate) num_draft_tokens: Option<u32>,
@@ -213,9 +238,9 @@ pub(crate) struct Q36Options {
     /// rows, and start is refused when they cannot be allocated.
     pub(crate) draft_rollback: Option<String>,
     /// How a verify window runs its rows: `eager` (the default: the one-row step once per row) or
-    /// `krow` (one captured K-row graph per window). `krow` needs `draft_rollback` `device` and
-    /// the EXL3 pack. The K-row device path is not built yet: the engine refuses to start with
-    /// `krow` until it is (`family/qwen36/krow.rs`).
+    /// `krow` (one K-row window; a captured graph per window length on a resident engine, the
+    /// uncaptured body with host-mapped slot picks on a banked engine). `krow` needs
+    /// `draft_rollback` `device` and the EXL3 pack.
     pub(crate) draft_verify: Option<String>,
 }
 
@@ -295,6 +320,7 @@ fn rollback_of(
     options: &Q36Options,
     speculation: &SpecConfig,
     kv_offload_host_bytes: Option<u64>,
+    backend: Backend,
 ) -> Result<RollbackMode, EngError> {
     let mode = match options.draft_rollback.as_deref() {
         None | Some("host") => RollbackMode::Host,
@@ -306,6 +332,13 @@ fn rollback_of(
         }
     };
     if mode == RollbackMode::Device {
+        if backend != Backend::Cuda {
+            return Err(bad(
+                "draft_rollback device is CUDA-only: the MLX arm rolls back with a shared-handle \
+                 snapshot"
+                    .into(),
+            ));
+        }
         if !speculation.enabled() {
             return Err(bad("draft_rollback device needs draft_mode ngram".into()));
         }
@@ -430,6 +463,7 @@ fn cuda_devices_of(
         for (set, key) in [
             (weights == WeightFormat::Exl3, "weight_format exl3"),
             (options.tiered.is_some(), "tiered"),
+            (options.expert_bank.is_some(), "expert_bank"),
             (
                 options.kv_offload_host_bytes.is_some(),
                 "kv_offload_host_bytes",
@@ -482,7 +516,11 @@ pub(crate) fn check_window_rows(config: &SpecConfig) -> Result<(), EngError> {
 /// the host. The settings parser refuses a window of more than 8 rows already; a step built from a
 /// hand-made config meets the same cap here, before the mode is looked at. The CUDA step's
 /// `set_speculation` is this function plus an assignment.
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg(any(
+    test,
+    all(feature = "native-cuda", target_os = "linux"),
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
 pub(crate) fn speculator_of(
     config: &SpecConfig,
 ) -> Result<Option<Speculator<RepeatDrafter>>, EngError> {
@@ -502,17 +540,24 @@ pub(crate) fn speculator_of(
     }
 }
 
-/// The speculation members. An enabled mode needs the CUDA arm and an EXL3 pack: those are the
-/// only verify window and the only MTP head the engine has.
+/// The speculation members. An enabled mode needs an arm that has a verify window: the CUDA arm
+/// with an EXL3 pack or the MLX resident arm with GGUF blocks.
 fn speculation_of(
     options: &Q36Options,
     backend: Backend,
     weights: WeightFormat,
 ) -> Result<SpecConfig, EngError> {
     let config = SpecConfig::new(&options.spec_options())?;
-    if config.enabled() && (backend != Backend::Cuda || weights != WeightFormat::Exl3) {
+    if config.enabled()
+        && !matches!(
+            (backend, weights),
+            (Backend::Cuda, WeightFormat::Exl3) | (Backend::Mlx, WeightFormat::Gguf)
+        )
+    {
         return Err(bad(
-            "draft_mode other than disabled needs the CUDA arm with weight_format exl3".into(),
+            "draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the \
+             MLX arm with gguf"
+                .into(),
         ));
     }
     // The MTP head has no draft step yet: accepting the mode would promise a speed the engine
@@ -542,6 +587,44 @@ pub(crate) struct TieredOptions {
     /// Fill every layer's bank with its lowest-numbered experts before the first token. The
     /// default is false: the banks start empty and policy P fills them.
     pub(crate) preload: Option<bool>,
+}
+
+/// The `expert_bank` member of the `qwen36` object: how many routed experts per layer stay
+/// resident when the rest live in a host store. `slots` may name the exact count (8 to 256,
+/// from the 8 picks of one token) or stay absent for "the most that fit"; `mode` is `auto`
+/// (bank only when the resident load does not fit) or `on` (always bank), `auto` by default.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpertBankOptions {
+    pub(crate) slots: Option<u32>,
+    pub(crate) mode: Option<String>,
+    /// How many of the layer's hottest experts stay pinned in their slots instead of
+    /// competing under LRU; 0 (the default) is plain LRU.
+    pub(crate) sticky: Option<u32>,
+}
+
+/// How many bank slots per layer the banked load holds: an exact operator count, or `Fit` for
+/// the largest count the admission arithmetic admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotRequest {
+    Fit,
+    Exactly(usize),
+}
+
+/// Whether the banked load runs only when the resident load does not fit (`Auto`) or always
+/// (`On`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BankMode {
+    Auto,
+    On,
+}
+
+/// The checked `expert_bank` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertBankSettings {
+    pub(crate) slots: SlotRequest,
+    pub(crate) mode: BankMode,
+    pub(crate) sticky: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -823,6 +906,8 @@ pub(crate) struct Q36Settings {
     pub(crate) prefix_reuse: bool,
     /// The tiered expert mode, or `None` for the plain engine. Never on without the member.
     pub(crate) tiered: Option<TieredSettings>,
+    /// The banked EXL3 expert mode, or `None` for the resident engine.
+    pub(crate) expert_bank: Option<ExpertBankSettings>,
     /// The checkpoint format `artifact` holds. The default is the pinned GGUF file.
     pub(crate) weights: WeightFormat,
     /// Speculative decoding. Disabled unless `draft_mode` says otherwise.
@@ -1000,6 +1085,61 @@ pub(crate) fn cache_growth_per_position(
 /// the host inside every layer, which a captured graph cannot do), no chunked prefill (the CUDA
 /// arm refuses the budget keys by name above, and the tiered prefill runs one token per step;
 /// `chunk_ready` keeps a tiered session off the chunk path).
+/// The checked `expert_bank` entry, or `None` when the member is absent. The refusals mirror the
+/// qualified state of the arm: the banked decode is eager-only and reads an EXL3 pack (so
+/// `tiered` and `kv_offload_host_bytes` cannot co-occur — both refuse `exl3` themselves). An
+/// enabled draft rides the same banked body (`ngram` today; `mtp` refuses globally, having no
+/// draft step).
+fn expert_bank_settings(
+    options: &Q36Options,
+    backend: Backend,
+    weights: WeightFormat,
+) -> Result<Option<ExpertBankSettings>, EngError> {
+    let Some(bank) = &options.expert_bank else {
+        return Ok(None);
+    };
+    if backend == Backend::Mlx {
+        return Err(bad(
+            "expert_bank is a CUDA member; the MLX arm refuses it".into()
+        ));
+    }
+    if weights != WeightFormat::Exl3 {
+        return Err(bad(
+            "expert_bank needs weight_format exl3: the host store reads an EXL3 pack".into(),
+        ));
+    }
+    if options.capture == Some(true) {
+        return Err(bad(
+            "expert_bank and capture exclude each other: the banked decode is eager only".into(),
+        ));
+    }
+    let slots = match bank.slots {
+        None => SlotRequest::Fit,
+        // From 8, the picks of one token: a smaller bank cannot hold one token's picks
+        // together, so the resolver would refuse every token after boot.
+        Some(count) => SlotRequest::Exactly(
+            usize::try_from(ranged("expert_bank.slots", Some(count), 8, 8, 256)?)
+                .map_err(|_| bad("expert_bank.slots exceeds usize".into()))?,
+        ),
+    };
+    let mode = match bank.mode.as_deref() {
+        None | Some("auto") => BankMode::Auto,
+        Some("on") => BankMode::On,
+        Some(other) => {
+            return Err(bad(format!(
+                "expert_bank.mode must be auto or on, got {other:?}"
+            )));
+        }
+    };
+    let sticky = usize::try_from(ranged("expert_bank.sticky", bank.sticky, 0, 0, 256)?)
+        .map_err(|_| bad("expert_bank.sticky exceeds usize".into()))?;
+    Ok(Some(ExpertBankSettings {
+        slots,
+        mode,
+        sticky,
+    }))
+}
+
 fn tiered_settings(
     options: &Q36Options,
     backend: Backend,
@@ -1126,7 +1266,7 @@ impl Q36Settings {
         let cuda_devices = cuda_devices_of(options, backend, weights)?;
         let speculation = speculation_of(options, backend, weights)?;
         let kv_offload_host_bytes = kv_offload_of(options, backend)?;
-        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes)?;
+        let draft_rollback = rollback_of(options, &speculation, kv_offload_host_bytes, backend)?;
         let draft_verify = verify_of(options, draft_rollback, weights)?;
         let (prefill_budget, reserve, activation, kv, cache_limit, ignored_mlx_keys) = match backend
         {
@@ -1242,6 +1382,7 @@ impl Q36Settings {
             Backend::Cuda => (0, 0),
         };
         let tiered = tiered_settings(options, backend)?;
+        let expert_bank = expert_bank_settings(options, backend, weights)?;
         let max_seqs = ranged("max_seqs", options.max_seqs, 1, 1, 8)?;
         // The override validates at boot through `ranged` (the same message shape as every
         // other member) so a typo cannot reach the store; the range keeps a fat finger from
@@ -1291,7 +1432,10 @@ impl Q36Settings {
             // The CUDA arm captures by default (EXL3 reads the picks on the device; a GGUF step
             // saves its launch overhead — measured 5.3 percent of wall in the W3 bench, at a
             // one-time first-request capture warmup); `"capture": false` rolls back to eager.
-            capture: options.capture.unwrap_or(backend == Backend::Cuda),
+            // A banked load stays eager: the slot resolver works on the host between the
+            // readback and the launches, which a graph cannot do (an explicit `"capture": true`
+            // was refused above).
+            capture: options.capture.unwrap_or(backend == Backend::Cuda) && expert_bank.is_none(),
             // The CUDA arm has no MLX compile seam: the key stays false there and
             // `ignored_mlx_keys_of` records it for the start line instead.
             compile: match backend {
@@ -1303,6 +1447,7 @@ impl Q36Settings {
             backend,
             prefix_reuse: false,
             tiered,
+            expert_bank,
             weights,
             speculation,
             draft_rollback,
@@ -1388,14 +1533,27 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
     })
 }
 
+/// The same pin for the dense Qwen3.8 family: its own tokenizer, config, and template,
+/// the shared generation config and id count.
+pub(crate) fn dense_tokenizer_pin() -> Result<TokenizerPin, EngError> {
+    Ok(TokenizerPin {
+        tokenizer_json: digest(DENSE_TOKENIZER_JSON_SHA256)?,
+        tokenizer_config_json: digest(DENSE_TOKENIZER_CONFIG_SHA256)?,
+        chat_template_jinja: digest(DENSE_CHAT_TEMPLATE_SHA256)?,
+        generation_config_json: digest(GENERATION_CONFIG_SHA256)?,
+        vocab_size: TOKENIZER_VOCAB_SIZE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BF16_DEFAULT_PREFILL_CHUNK, Backend, DEFAULT_CONTEXT_LIMIT, DEFAULT_PREFILL_CHUNK,
-        DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE, Q36Env, Q36Options,
-        Q36Settings, TieredSettings, activation_name, activation_of, cache_growth_per_position,
-        chunked_prefill_allowed, delta_state_bytes, digest, kv_dtype_name, kv_dtype_of,
-        parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        BF16_DEFAULT_PREFILL_CHUNK, Backend, BankMode, DEFAULT_CONTEXT_LIMIT,
+        DEFAULT_PREFILL_CHUNK, DEFAULT_SESSION_CAP, MLX_DEFAULT_CONTEXT_LIMIT, NO_BUDGET_PIECE,
+        Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
+        activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
+        dense_tokenizer_pin, digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype,
+        scale_pairing_error, tokenizer_pin,
     };
     use super::{
         QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
@@ -1421,6 +1579,85 @@ mod tests {
         assert_eq!(pair.cuda_devices, vec![0, 1]);
         let second = cuda_offload(r#"{"cuda_devices":[1]}"#).unwrap();
         assert_eq!(second.cuda_devices, vec![1]);
+    }
+
+    #[test]
+    fn expert_bank_refuses_wrong_arms_and_floors_slots_by_key() {
+        // Every refusal names the key an operator can fix; the multi-device arm refuses the
+        // member by name the same way it refuses tiered.
+        for (body, needle) in [
+            (r#"{"expert_bank":{}}"#, "weight_format exl3"),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"capture":true}"#,
+                "capture",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"mtp","mtp_model_dir":"/h"}"#,
+                "no draft step",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":4}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"slots":257}}"#,
+                "expert_bank.slots",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"mode":"bogus"}}"#,
+                "expert_bank.mode",
+            ),
+            (
+                r#"{"weight_format":"exl3","expert_bank":{"sticky":257}}"#,
+                "expert_bank.sticky",
+            ),
+            (r#"{"cuda_devices":[0,1],"expert_bank":{}}"#, "expert_bank"),
+        ] {
+            let text = message(cuda_offload(body));
+            assert!(text.contains(needle), "{body}: {text}");
+        }
+        // The member is CUDA-only; on the MLX arm the refusal fires before the pack check
+        // (the cache limit the MLX settings also need comes from the env).
+        let options: Q36Options = serde_json::from_str(r#"{"expert_bank":{}}"#).unwrap();
+        let mlx = Q36Env {
+            cache_limit: Some("1024".to_string()),
+        };
+        assert!(
+            message(settings_for(Some(&options), &mlx, Backend::Mlx))
+                .contains("the MLX arm refuses it")
+        );
+    }
+
+    #[test]
+    fn expert_bank_accepts_the_fit_request_and_explicit_slots_from_the_floor() {
+        // An ngram draft rides the banked window (the refusal above holds mtp out).
+        let draft =
+            cuda_offload(r#"{"weight_format":"exl3","expert_bank":{},"draft_mode":"ngram"}"#)
+                .unwrap();
+        assert!(matches!(
+            draft.speculation.mode,
+            crate::family::speculate::config::DraftMode::Ngram
+        ));
+        let fit = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{}}"#).unwrap();
+        assert_eq!(
+            fit.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Fit, BankMode::Auto, 0))
+        );
+        let on = cuda_offload(
+            r#"{"weight_format":"exl3","expert_bank":{"slots":8,"mode":"on","sticky":64}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            on.expert_bank
+                .map(|bank| (bank.slots, bank.mode, bank.sticky)),
+            Some((SlotRequest::Exactly(8), BankMode::On, 64))
+        );
+        let top = cuda_offload(r#"{"weight_format":"exl3","expert_bank":{"slots":256}}"#).unwrap();
+        assert_eq!(
+            top.expert_bank.map(|bank| bank.slots),
+            Some(SlotRequest::Exactly(256))
+        );
     }
 
     #[test]
@@ -1804,6 +2041,39 @@ mod tests {
     }
 
     #[test]
+    fn the_mlx_arm_takes_ngram_but_not_the_device_rollback_or_mtp() {
+        let mlx =
+            |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Mlx);
+        let on = mlx(Q36Options {
+            draft_mode: Some("ngram".into()),
+            num_draft_tokens: Some(3),
+            cache_limit_bytes: Some(8 << 30),
+            ..Q36Options::default()
+        })
+        .unwrap();
+        assert!(on.speculation.enabled());
+        assert_eq!(on.speculation.num_draft_tokens, 3);
+        assert_eq!(on.draft_rollback, super::RollbackMode::Host);
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("ngram".into()),
+                draft_rollback: Some("device".into()),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_rollback device is CUDA-only: the MLX arm rolls back with a \
+             shared-handle snapshot"
+        );
+        assert_eq!(
+            message(mlx(Q36Options {
+                draft_mode: Some("mtp".into()),
+                mtp_model_dir: Some(PathBuf::from("/h")),
+                ..Q36Options::default()
+            })),
+            "engine config: draft_mode mtp has no draft step yet"
+        );
+    }
+
+    #[test]
     fn a_speculative_window_of_more_than_eight_rows_is_refused_by_name() {
         let cuda =
             |options: Q36Options| settings_for(Some(&options), &Q36Env::default(), Backend::Cuda);
@@ -1904,11 +2174,11 @@ mod tests {
         };
         let text = format!(
             "{:?}",
-            rollback_of(&options, &speculation, Some(1 << 30)).unwrap_err()
+            rollback_of(&options, &speculation, Some(1 << 30), Backend::Cuda).unwrap_err()
         );
         assert!(text.contains("kv_offload_host_bytes"), "{text}");
         assert_eq!(
-            rollback_of(&options, &speculation, None).unwrap(),
+            rollback_of(&options, &speculation, None, Backend::Cuda).unwrap(),
             RollbackMode::Device
         );
     }
@@ -2033,7 +2303,7 @@ mod tests {
 
     #[test]
     fn an_enabled_draft_mode_is_refused_where_no_window_runs() {
-        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3";
+        let want = "engine config: draft_mode other than disabled needs the CUDA arm with weight_format exl3, or the MLX arm with gguf";
         let gguf = Q36Options {
             draft_mode: Some("ngram".into()),
             ..Q36Options::default()
@@ -2046,8 +2316,6 @@ mod tests {
             message(mlx),
             "engine config: weight_format exl3 is CUDA-only"
         );
-        let mlx_gguf = settings_for(Some(&gguf), &Q36Env::default(), Backend::Mlx);
-        assert_eq!(message(mlx_gguf), want);
     }
 
     #[test]
@@ -2362,6 +2630,7 @@ mod tests {
                 backend: Backend::Mlx,
                 prefix_reuse: false,
                 tiered: None,
+                expert_bank: None,
                 weights: super::WeightFormat::Gguf,
                 speculation: SpecConfig::default(),
                 draft_rollback: RollbackMode::Host,
@@ -3211,6 +3480,21 @@ mod tests {
         assert_eq!(pin.tokenizer_config_json[..4], [0xe9, 0x8f, 0x19, 0x01]);
         assert_eq!(pin.chat_template_jinja[..4], [0xe8, 0x4f, 0x32, 0xa2]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
+    }
+
+    #[test]
+    fn the_dense_pin_holds_its_own_digests_and_shares_generation() {
+        let pin = dense_tokenizer_pin().unwrap();
+        let moe = tokenizer_pin().unwrap();
+        assert_eq!(pin.vocab_size, 248_077);
+        assert_eq!(pin.tokenizer_json[..4], [0x09, 0x97, 0xf4, 0x10]);
+        assert_eq!(pin.tokenizer_config_json[..4], [0xb1, 0x13, 0x49, 0xaa]);
+        assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
+        // The release ships the same generation config as Qwen3.6, so the pin shares it.
+        assert_eq!(pin.generation_config_json, moe.generation_config_json);
+        assert_ne!(pin.tokenizer_json, moe.tokenizer_json);
+        assert_ne!(pin.tokenizer_config_json, moe.tokenizer_config_json);
+        assert_ne!(pin.chat_template_jinja, moe.chat_template_jinja);
     }
 
     #[test]

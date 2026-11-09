@@ -374,6 +374,24 @@ impl CudaContext {
         ))
     }
 
+    /// Lets the one-tile wide launches of this context run the compile-time rate 10 and rate 6 body
+    /// of book 2 where every group of a launch allows it. Set by the Flash-Next start; a context
+    /// that never calls it (Qwen3.6, Flint) runs the kernels it ran before. The body takes the DP4A
+    /// decode of book 2 when the DP4A option is on for the context. Every byte written is the same
+    /// either way.
+    pub(crate) fn set_odd_rate_kernel(&self, on: bool) {
+        self.exl3_odd_rates.set(on);
+    }
+
+    /// Lets the grouped launches of this context fuse the input rotation into the projection
+    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start;
+    /// a context that never calls it (Qwen3.6, Flint) runs the launches it ran before. Calls the
+    /// fused kernel cannot take fall back to the separate launches. Every byte written is the
+    /// same either way.
+    pub(crate) fn set_fused_in_kernel(&self, on: bool) {
+        self.exl3_fused_in.set(on);
+    }
+
     /// Registers the id-indexed options an unset [`DP4A_VAR`] or [`INDEXED_PAIRS_VAR`] leaves to
     /// this context: set by the session that owns it, like [`Self::set_single_row_default`], so a
     /// variable that is set still wins for its own option and another context in the process is
@@ -1148,7 +1166,43 @@ impl CudaContext {
         if cols == 1 {
             self.note_projection_rows(calls.iter().map(|call| call.rows).max().unwrap_or(0));
         }
-        self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols))
+        // The odd-rate body takes the DP4A decode when the DP4A option is on for this context.
+        let odd = if self.exl3_odd_rates.get() {
+            Some(self.exl3_indexed_options()?.dp4a)
+        } else {
+            None
+        };
+        self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols, odd))
+    }
+
+    /// The grouped launch with the input rotation fused into the projection kernel
+    /// ([`exl3_decode_fused.h`](crate::kernels::cuda::native::resident)): two launches per group
+    /// set instead of three, no `xh` round trip. Every call must be one row, book 2 at rate 10
+    /// or 6, `n` a multiple of 16 and `k` of 512; the bytes written equal
+    /// [`Self::exl3_grouped_wide`] at `cols` 1.
+    pub(crate) fn exl3_grouped_fin(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+    ) -> Result<(), EngError> {
+        if calls.iter().any(|call| {
+            call.rows != 1
+                || !call.n.is_multiple_of(16)
+                || !call.k.is_multiple_of(512)
+                || call.book != Codebook::Mul1
+                || !matches!(call.bits_twice, 10 | 6)
+        }) {
+            return Err(EngError::BadRequest(
+                "EXL3 fused-input launch: every call must be one row of book 2 at rate 10 or 6, \
+                 n a multiple of 16 and k of 512"
+                    .to_string(),
+            ));
+        }
+        let raw = self.grouped_raw(calls)?;
+        #[cfg(test)]
+        self.note_exl3_launch(SingleRow::Wide(1));
+        let dp4a = self.exl3_indexed_options()?.dp4a;
+        self.launch_on(stream, |s| ffi::grouped_fin(s, &raw, dp4a))
     }
 
     /// The grouped launch of the Qwen3.6 MoE block: the gather kernel, or the wide kernel when
@@ -1159,6 +1213,19 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[Exl3LinearCall<'_>],
     ) -> Result<(), EngError> {
+        // The fused-input launch replaces the separate input rotation where every call allows
+        // it; it notes its own launch, so this path must not note again.
+        if self.exl3_fused_in.get()
+            && calls.iter().all(|call| {
+                call.rows == 1
+                    && call.n.is_multiple_of(16)
+                    && call.k.is_multiple_of(512)
+                    && call.book == Codebook::Mul1
+                    && matches!(call.bits_twice, 10 | 6)
+            })
+        {
+            return self.exl3_grouped_fin(stream, calls);
+        }
         let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
         #[cfg(test)]
         self.note_exl3_launch(match kernel {
@@ -1424,6 +1491,12 @@ impl CudaContext {
     /// all gather, or mixed.
     pub(crate) fn test_routed_grouped_variant() -> Option<&'static str> {
         ffi::launch_observer::grouped_variant()
+    }
+
+    /// The projection kernel the last odd-rate wide launch of this thread enqueued: 3 and 4 the
+    /// compile-time rate 10 and rate 6 body without and with DP4A, 2 the unchanged kernels.
+    pub(crate) fn test_last_odd_variant() -> u32 {
+        ffi::launch_observer::last_odd_variant()
     }
 
     pub(crate) fn test_exl3_routed_scope() -> impl Drop {

@@ -354,9 +354,13 @@ mod tests {
         let (mut outputs, mut keys, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         for n in 0..count {
             let x = input(n);
-            outputs
-                .push(host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &x).unwrap());
-            let kp = cpu.linear(host_w.k, &x).unwrap();
+            // The oracle models the mixer over pre-normed rows; the chunk seam folds the input
+            // norm at the caller and keeps the output residual out, so bridge the norm here.
+            let normed_x = rms_plain(&x, view.layers[1].input_norm, shape.eps).unwrap();
+            outputs.push(
+                host::attn_step(&mut cpu, &shape, host_w, &mut host_cache, n, &normed_x).unwrap(),
+            );
+            let kp = cpu.linear(host_w.k, &normed_x).unwrap();
             let mut key = Vec::new();
             for g in 0..hkv {
                 let mut head =
@@ -365,7 +369,7 @@ mod tests {
                 key.extend(head);
             }
             keys.push(key);
-            vals.push(cpu.linear(host_w.v, &x).unwrap());
+            vals.push(cpu.linear(host_w.v, &normed_x).unwrap());
         }
         HostRun {
             outputs,
@@ -499,7 +503,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         let x = rows(&mut kernels, warm, count);
         let mut ctx = Ctx {
@@ -507,6 +513,12 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle models the mixer over pre-normed rows; the chunk seam keeps the raw input
+        // and lets the caller norm, so bridge the folded contract here.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, warm, &x).unwrap();
         let total = warm as usize + count as usize;
         let (hkv, hd) = (shape.attn.heads_kv, shape.attn.head_dim);
@@ -603,8 +615,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -621,6 +642,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -646,19 +672,30 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,
                 values(&mut kernels, &old.0).unwrap(),
                 "decode step {n} after the chunk differs from the concatenate formulation"
             );
-            assert_parity(
-                &got,
-                &host.outputs[n as usize],
-                &format!("decode step {n} against the host"),
-            );
+            // The decode seam folds the output residual, so bridge it onto the host row.
+            let want: Vec<f32> = host.outputs[n as usize]
+                .iter()
+                .zip(&input(n))
+                .map(|(a, b)| a + b)
+                .collect();
+            assert_parity(&got, &want, &format!("decode step {n} against the host"));
             cache = next.cache;
             concat = old.1;
         }
@@ -712,8 +749,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             assert_eq!(
                 values(&mut kernels, &next.out).unwrap(),
                 values(&mut kernels, &old.0).unwrap(),
@@ -730,6 +776,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 2, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 2, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -754,6 +805,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The oracle rows are pre-normed (the folded contract); the chunk seam keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk(&mut ctx, &shape, rw, cache, 4, &x).unwrap();
         let old = concat_chunk(&mut ctx, &shape, rw, &concat, 4, &x).unwrap();
         let got = values(&mut kernels, &next.out).unwrap();
@@ -779,19 +835,30 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
-            let old = concat_step(&mut ctx, &shape, rw, &concat, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
+            let old = concat_step(
+                &mut ctx,
+                &shape,
+                rw,
+                &concat,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap();
             let got = values(&mut kernels, &next.out).unwrap();
             assert_eq!(
                 got,
                 values(&mut kernels, &old.0).unwrap(),
                 "decode step {n} after the chunks differs from the concatenate formulation"
             );
-            assert_parity(
-                &got,
-                &host.outputs[n as usize],
-                &format!("decode step {n} against the host"),
-            );
+            // The decode seam folds the output residual, so bridge it onto the host row.
+            let want: Vec<f32> = host.outputs[n as usize]
+                .iter()
+                .zip(&input(n))
+                .map(|(a, b)| a + b)
+                .collect();
+            assert_parity(&got, &want, &format!("decode step {n} against the host"));
             cache = next.cache;
             concat = old.1;
         }
@@ -886,7 +953,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         cache
     }
@@ -928,6 +997,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The decode steps norm inside (the folded contract); the chunk keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let next = chunk_sliced(&mut ctx, shape, rw, cache, warm, &x, slice).unwrap();
         assert_eq!(next.cache.len, warm as usize + count as usize);
         values(kernels, &next.out).unwrap()
@@ -949,7 +1023,9 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            cache = step(&mut ctx, shape, rw, cache, n, &xr).unwrap().cache;
+            cache = step(&mut ctx, shape, rw, cache, n, &xr, &w.layers[1].input_norm)
+                .unwrap()
+                .cache;
         }
         cache
     }
@@ -1149,9 +1225,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            let next = step(&mut ctx, &shape, rw, cache, n, &xr).unwrap();
+            let next = step(&mut ctx, &shape, rw, cache, n, &xr, &w.layers[1].input_norm).unwrap();
             cache = next.cache;
-            stepped.extend(values(&mut kernels, &next.out).unwrap());
+            // The decode seam folds the output residual; the chunk keeps the mixer output, so
+            // remove the residual row before comparing the two paths.
+            stepped.extend(
+                values(&mut kernels, &next.out)
+                    .unwrap()
+                    .iter()
+                    .zip(&input(n))
+                    .map(|(v, r)| v - r),
+            );
         }
         assert_eq!(cache.len, 8);
         // The F32 chunk after three F32 decode steps.
@@ -1163,7 +1247,17 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            f32_cache = step(&mut ctx, &shape, rw, f32_cache, n, &xr).unwrap().cache;
+            f32_cache = step(
+                &mut ctx,
+                &shape,
+                rw,
+                f32_cache,
+                n,
+                &xr,
+                &w.layers[1].input_norm,
+            )
+            .unwrap()
+            .cache;
         }
         let x = upload(&mut kernels, vec![count, 64], &data);
         let mut ctx = Ctx {
@@ -1171,6 +1265,11 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
+        // The decode steps norm inside (the folded contract); the chunk keeps raw input.
+        let x = ctx
+            .kernels
+            .rms_norm(&x, &w.layers[1].input_norm, shape.eps)
+            .unwrap();
         let control = chunk(&mut ctx, &shape, rw, f32_cache, warm, &x).unwrap();
         let control = values(&mut kernels, &control.out).unwrap();
         let gap = |a: &[f32], b: &[f32]| {

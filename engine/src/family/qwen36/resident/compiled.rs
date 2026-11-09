@@ -92,6 +92,11 @@ pub(super) fn delta_facts(
         layer,
         hidden: dim(shape.hidden)?,
         dims,
+        fused: u32::from(super::delta::fused_middle_applicable(
+            dim(taps)?,
+            dim(d.key_dim)?,
+            dim(d.value_dim)?,
+        )),
         eps_bits: eps.to_bits(),
         act: compile_key::dtype_key(act),
         weights: [
@@ -124,13 +129,13 @@ pub(super) fn moe_facts(
         clamp: experts
             .checked_sub(1)
             .ok_or_else(|| EngError::BadRequest("resident moe needs experts".into()))?,
+        eps_bits: shape.eps.to_bits(),
         act: compile_key::dtype_key(act),
         weights: [
             weight_facts(&w.shared_gate)?,
             weight_facts(&w.shared_up)?,
             weight_facts(&w.shared_down)?,
-            weight_facts(&w.gate)?,
-            weight_facts(&w.up)?,
+            weight_facts(&w.gate_up)?,
             weight_facts(&w.down)?,
         ],
     })
@@ -202,8 +207,9 @@ pub(super) fn delta_step(
     rec: &crate::tensor::ExecutionTensor,
     ring: &crate::tensor::ExecutionTensor,
     x: &crate::tensor::ExecutionTensor,
+    in_norm: &crate::tensor::ExecutionTensor,
 ) -> Result<DeltaStep, EngError> {
-    let args = delta_args(ctx.consts, shape, w, rec, ring, x)?;
+    let args = delta_args(ctx.consts, shape, w, rec, ring, x, in_norm)?;
     let got = ctx.kernels.compiled_delta_step(&args)?;
     Ok(DeltaStep {
         out: got.out,
@@ -221,10 +227,12 @@ pub(super) fn attn_pre_step(
     shape: &HostShape,
     w: &RAttn,
     x: &crate::tensor::ExecutionTensor,
+    in_norm: &crate::tensor::ExecutionTensor,
 ) -> Result<crate::kernels::mlx::native::compile::CompiledAttnPre, EngError> {
     let a = &shape.attn;
     let args = CompileAttnPreArgs {
         x,
+        in_norm,
         packed: [&w.q, &w.k, &w.v],
         norms: [&w.q_norm, &w.k_norm],
         hidden: dim(shape.hidden)?,
@@ -248,11 +256,13 @@ pub(super) fn attn_post_step(
     w: &RAttn,
     att: &crate::tensor::ExecutionTensor,
     gate: &crate::tensor::ExecutionTensor,
+    res: &crate::tensor::ExecutionTensor,
 ) -> Result<crate::tensor::ExecutionTensor, EngError> {
     let a = &shape.attn;
     let args = CompileAttnPostArgs {
         att,
         gate,
+        res,
         packed: &w.o,
         hidden: dim(shape.hidden)?,
         heads: dim(a.heads_q)?,
@@ -274,6 +284,7 @@ pub(super) fn delta_rows(
         &crate::tensor::ExecutionTensor,
     )],
     x: &crate::tensor::ExecutionTensor,
+    in_norm: &crate::tensor::ExecutionTensor,
 ) -> Result<CompiledDeltaRows, EngError> {
     if !matches!(states.len(), 2 | 4 | 8) || x.shape() != [dim(states.len())?, dim(shape.hidden)?] {
         return Err(EngError::BadRequest(
@@ -281,7 +292,7 @@ pub(super) fn delta_rows(
         ));
     }
     let (rec, ring) = states[0];
-    let args = delta_args(ctx.consts, shape, w, rec, ring, x)?;
+    let args = delta_args(ctx.consts, shape, w, rec, ring, x, in_norm)?;
     ctx.kernels.compiled_delta_rows(&args, &states[1..])
 }
 
@@ -293,11 +304,24 @@ fn delta_args<'a>(
     rec: &'a crate::tensor::ExecutionTensor,
     ring: &'a crate::tensor::ExecutionTensor,
     x: &'a crate::tensor::ExecutionTensor,
+    in_norm: &'a crate::tensor::ExecutionTensor,
 ) -> Result<CompileDeltaArgs<'a>, EngError> {
     let d = &shape.delta;
     let hidden = dim(shape.hidden)?;
+    let taps = d
+        .conv_kernel
+        .checked_sub(1)
+        .ok_or_else(|| EngError::BadRequest("resident delta kernel is empty".into()))?;
+    // Q36_FUSED_DECODE=1 with three taps: the closure's pre-recurrence middle runs as the ONE
+    // delta_middle kernel, and the two norm-weight slots carry the qk_eps and sqrt_kd scalars
+    // instead (the empty shape is how the seam tells the modes apart, in both the key and the
+    // traced body).
+    let fused =
+        super::delta::fused_middle_applicable(dim(taps)?, dim(d.key_dim)?, dim(d.value_dim)?);
+    let middle_consts = consts.middle_consts(fused);
     Ok(CompileDeltaArgs {
         x,
+        in_norm,
         rec,
         ring,
         packed: [&w.qkv, &w.z, &w.b, &w.a, &w.out],
@@ -308,7 +332,7 @@ fn delta_args<'a>(
             &w.dt_bias,
             &w.norm,
         ],
-        consts: [&consts.zero, &consts.q_norm_w, &consts.k_norm_w],
+        consts: middle_consts,
         hidden,
         dims: [
             dim(d.key_heads)?,
@@ -316,10 +340,7 @@ fn delta_args<'a>(
             dim(d.value_heads)?,
             dim(d.value_dim)?,
             dim(d.conv_dim())?,
-            dim(d
-                .conv_kernel
-                .checked_sub(1)
-                .ok_or_else(|| EngError::BadRequest("resident delta kernel is empty".into()))?)?,
+            dim(taps)?,
         ],
         eps: shape.eps,
         act: consts.act,
@@ -334,11 +355,12 @@ pub(super) fn moe_step_device(
     shape: &HostShape,
     w: &RMoe,
     x: &crate::tensor::ExecutionTensor,
+    post_norm: &crate::tensor::ExecutionTensor,
 ) -> Result<(crate::tensor::ExecutionTensor, DeviceRoute), EngError> {
     let m = &shape.moe;
     let (hidden, experts) = (dim(shape.hidden)?, dim(m.experts)?);
     let supported_rows = matches!(x.shape(), &[1 | 2 | 4 | 8, width] if width == hidden);
-    if !supported_rows || w.router_t.shape() != [hidden, experts] {
+    if !supported_rows || w.router_t.shape() != [hidden, experts] || post_norm.shape() != [hidden] {
         return Err(EngError::BadRequest(
             "compile seam inputs differ from the moe block shapes".into(),
         ));
@@ -346,13 +368,15 @@ pub(super) fn moe_step_device(
     let args = CompileMoeArgs {
         x,
         router_t: &w.router_t,
+        post_norm,
         shared: [&w.shared_gate, &w.shared_up, &w.shared_down],
         shared_scalar_t: &w.shared_scalar_t,
-        stacks: [&w.gate, &w.up, &w.down],
+        stacks: [&w.gate_up, &w.down],
         hidden,
         experts,
         top_k: dim(m.top_k)?,
         renorm: m.renorm,
+        eps: shape.eps,
         act: ctx.consts.act,
     };
     let got = ctx.kernels.compiled_moe_step(&args)?;

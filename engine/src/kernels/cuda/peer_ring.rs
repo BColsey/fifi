@@ -9,12 +9,12 @@
 //! sequence advances once per exchange and the slot parity follows it, so
 //! a slot is only reused two exchanges later and never needs clearing.
 //!
-//! Slot reuse is safe only under the stream contract stated in
-//! `native/abi_ring.h`: all ring work for one device is queued in exchange
-//! order on one stream, and exchanges never overlap. The two-exchange
-//! chain through each publisher's own wait is what keeps an S+2 publish
-//! from overwriting a slot a consumer still reads for S. Callers that
-//! queue ring work on several streams break that chain.
+//! Slot reuse requires the stream contract stated in `native/abi_ring.h`:
+//! all ring work for one device is queued in exchange order on one stream.
+//! For sums and gathers, each device's own wait supplies a two-exchange
+//! dependency chain. Consecutive broadcasts have only one publisher, so
+//! they also need a consumer barrier before a slot can be reused. The
+//! Qwen card stack offers an opt-in host synchronization for this case.
 //!
 //! [`PeerRing::reset`] re-zeroes every mailbox and restarts the sequence;
 //! it is the session boundary. It also serves the (practically unreachable)
@@ -85,9 +85,10 @@ impl MailboxLayout {
         Ok(Self { cards, max_values })
     }
 
-    /// Bytes of one slot: header plus the payload at the f32 stride.
+    /// Header plus the f32-stride payload, padded for the native 16-byte
+    /// alignment requirement on every slot, including odd capacities.
     pub(crate) fn slot_bytes(&self) -> usize {
-        HEADER_BYTES + self.max_values * VALUE_BYTES
+        (HEADER_BYTES + self.max_values * VALUE_BYTES).next_multiple_of(16)
     }
 
     /// Bytes of one device's whole mailbox: a slot per source and parity.
@@ -484,6 +485,21 @@ mod tests {
         let layout = MailboxLayout::new(2, 8).expect("layout");
         assert!(layout.slot_offset(2, 1).is_err());
     }
+
+    #[test]
+    fn the_layout_aligns_every_slot_for_odd_capacities() {
+        for capacity in [1, 2, 3, 5, 2049, native::peer_ring::MAX_VALUES - 1] {
+            let layout = MailboxLayout::new(3, capacity).expect("layout");
+            let unpadded = HEADER_BYTES + capacity * VALUE_BYTES;
+            assert!(layout.slot_bytes() >= unpadded);
+            assert!(layout.slot_bytes() - unpadded < 16);
+            for source in 0..3 {
+                for sequence in 1..=2 {
+                    assert_eq!(layout.slot_offset(source, sequence).expect("slot") % 16, 0);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +599,159 @@ mod device_tests {
                 for (i, (&g, (&x, &y))) in got.iter().zip(a.iter().zip(&b)).enumerate() {
                     assert_eq!(g, x + y, "round {round} device {index} value {i}");
                 }
+            }
+        }
+    }
+
+    /// The chunk-prefill transport probe: one 256x2048 f32 mixer-sum-sized
+    /// exchange (the payload every layer of a 256-row chunk sums over the
+    /// ring), on TWO PHYSICAL devices when the process sees them - the
+    /// real PCIe hop - timed over repeats so the chunk design carries a
+    /// measured per-exchange cost, not an estimate.
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn chunk_sized_exchange_sums_on_a_physical_pair() {
+        const NAME: &str = "chunk_sized_exchange_sums_on_a_physical_pair";
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let devices: Vec<usize> = (0..2).collect();
+        let mut contexts = Vec::new();
+        for &device in &devices {
+            if let Ok(context) = CudaContext::with_admission_on(device, &admission) {
+                contexts.push(context);
+            }
+        }
+        assert_eq!(contexts.len(), 2, "{NAME}: two CUDA devices are required");
+        // The real pair needs the same peer-enable the serving start does;
+        // without it the wait kernels fault reading a peer's mailbox.
+        crate::kernels::cuda::peer::enable_peer_access(&devices).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        const ROWS: usize = 256;
+        const HIDDEN: usize = 2048;
+        let values = ROWS * HIDDEN;
+        let ring = PeerRing::new(&contexts, values).expect("ring at chunk payload");
+        let partials: Vec<Vec<f32>> = (0..2)
+            .map(|card| {
+                (0..values)
+                    .map(|i| (card as f32) + (i % 977) as f32 * 0.5)
+                    .collect()
+            })
+            .collect();
+        let uploaded = [
+            upload_f32(&contexts[0], &streams[0], &partials[0]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &partials[1]).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(values * 4).expect("out 0"),
+            contexts[1].allocate(values * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        // Correctness first, then the timed repeats.
+        ring.exchange_sum(
+            &contexts,
+            &streams,
+            &[whole(&uploaded[0]), whole(&uploaded[1])],
+            &[whole(&outs[0]), whole(&outs[1])],
+            &[whole(&statuses[0]), whole(&statuses[1])],
+            values,
+            RingMode::F32,
+        )
+        .expect("exchange");
+        for index in 0..2 {
+            streams[index].synchronize().expect("sync");
+            assert_eq!(
+                status_of(&statuses[index], &streams[index]).expect("status"),
+                0
+            );
+            let got = download_f32(&outs[index], &streams[index], values).expect("download");
+            for (i, &g) in got.iter().enumerate() {
+                assert_eq!(
+                    g,
+                    partials[0][i] + partials[1][i],
+                    "device {index} value {i}"
+                );
+            }
+        }
+        let repeats = 40u32;
+        let began = std::time::Instant::now();
+        for _ in 0..repeats {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&uploaded[0]), whole(&uploaded[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                values,
+                RingMode::F32,
+            )
+            .expect("exchange");
+        }
+        for stream in &streams {
+            stream.synchronize().expect("sync");
+        }
+        let per = began.elapsed().as_secs_f64() / repeats as f64;
+        println!(
+            "{NAME}: {ROWS}x{HIDDEN} f32 ({:.2} MB payload) exchange_sum: {per}*1e3 = {:.3} ms              per exchange; a 40-layer chunk pays 80 sums = {:.1} ms",
+            values as f64 * 4.0 / 1e6,
+            per * 1e3,
+            per * 1e3 * 80.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn odd_capacity_exchanges_on_physical_peers() {
+        const NAME: &str = "odd_capacity_exchanges_on_physical_peers";
+        const N: usize = 2049;
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, N).expect("odd-capacity ring");
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &[1.5; N]).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &[-0.25; N]).expect("partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(N * 4).expect("out 0"),
+            contexts[1].allocate(N * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        // Three rounds exercise both parity slots and reuse the first slot.
+        for mode in [RingMode::F16, RingMode::F32, RingMode::F32] {
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                mode,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                assert_eq!(status_of(&statuses[index], stream).expect("status"), 0);
+                assert_eq!(
+                    download_f32(&outs[index], stream, N).expect("sum"),
+                    vec![1.25; N]
+                );
             }
         }
     }

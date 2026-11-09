@@ -665,11 +665,13 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             &geometry_full,
             WeightLayout::Native,
             options.kv_mode,
+            false,
         )?,
         layout: WeightLayout::Native,
         kv_mode: options.kv_mode,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers_ref = Mixers::new(ctx0, parts_ref)?;
     // The reference MoE weights and buffers.
@@ -853,6 +855,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             kv_mode: options.kv_mode,
             paged: None,
             sparse: None,
+            moe_tiled: false,
         };
         mixers.push(Mixers::new(&stack.contexts()[card], parts)?);
     }
@@ -971,6 +974,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                         resid: ref_view(resid_in(l))?,
                         admit_pos: admitted.admit_pos,
                     },
+                    None,
                 )?;
                 let ref_moe_set = MoeBuffers {
                     route: RouteBufs {
@@ -1089,6 +1093,7 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
             &heads,
             eps,
             t,
+            true,
         )?;
         let mut card_reads = Vec::with_capacity(2);
         let mut boundaries = Vec::with_capacity(2);
@@ -1179,6 +1184,10 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
         ring_words.push(u32::from_le_bytes(word));
     }
     let mut kv_drift = Vec::with_capacity(2);
+    // The card's planes hold only its own K/V heads (sliced at allocation),
+    // so the reference's head-run slice is the expectation; the plane tail
+    // past the card's heads is alignment padding, never compared.
+    let full_heads = d.shape.attn.heads_kv;
     for (card, state) in states.iter().enumerate() {
         let mut per_kv = Vec::with_capacity(full_ordinals.len());
         for &ord in &full_ordinals {
@@ -1197,7 +1206,13 @@ fn run_rig(spec: FamilySpec, tokens: usize, independent: bool) -> Result<Evidenc
                         .read_at(&stack.streams()[card], view.offset(), &mut bytes)?;
                     bytes
                 };
-                planes.push(PlaneDrift::of(&want, &got));
+                let run = table.kv_rows(card)?;
+                let per_head = want.len() / full_heads;
+                let start = (run.start / d.shape.attn.head_dim) * per_head;
+                let len = (run.len() / d.shape.attn.head_dim) * per_head;
+                let want_slice = &want[start..start + len];
+                let got_slice = &got[..len];
+                planes.push(PlaneDrift::of(want_slice, got_slice));
             }
             per_kv.push(planes);
         }

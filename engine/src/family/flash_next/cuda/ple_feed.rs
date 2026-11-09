@@ -412,6 +412,23 @@ impl PleFeed {
         ple::plan_rows(&self.shape, &self.weights(), self.state.history(), token)
     }
 
+    /// The plan for `token` as if `prefix` tokens had been fed after the current history: row
+    /// `i` of a chunk plans against the history it will have when its turn comes. The rows
+    /// depend on the history only, never on the residual stream, so the plans stay valid while
+    /// the device runs.
+    pub(in crate::family) fn plan_after(
+        &self,
+        prefix: &[u32],
+        token: u32,
+    ) -> Result<RowPlan, EngError> {
+        let mut history = self.state.history().to_vec();
+        history.extend_from_slice(prefix);
+        //  reads the pair from a history of at most two; a longer slice would read
+        // the end-of-sequence marker for the second token and pick a different row set.
+        let keep_from = history.len().saturating_sub(2);
+        ple::plan_rows(&self.shape, &self.weights(), &history[keep_from..], token)
+    }
+
     /// Reads and decodes the rows of `plan` (see [`NgramRows::gather`]).
     pub(in crate::family) fn gather(&self, plan: &RowPlan) -> Result<Gathered, EngError> {
         self.rows.gather(plan)

@@ -209,6 +209,19 @@ pub(super) fn dense_weight<'w>(
             check_native_dense(name, (weight.n_rows(), weight.k()), spec)?;
             Ok(DenseWeight::Native(weight))
         }
+        // The tiled-hybrid's override tensors ride tiles beside the native session: the shared
+        // expert's dense projections resolve to the Tiled form, and every op that still needs
+        // the native form (the mixer projections, nobody overrides them today) refuses typed
+        // at its own `native(role)` lookup.
+        (
+            Some(CudaWeight::Tiled {
+                weight, experts, ..
+            }),
+            WeightLayout::Native,
+        ) => {
+            check_dense(name, (weight.n_rows(), weight.k(), *experts), spec)?;
+            Ok(DenseWeight::Tiled(weight))
+        }
         (Some(CudaWeight::Exl3 { weight, .. }), WeightLayout::Exl3) => {
             check_dense(name, (weight.shape[1], weight.shape[0], None), spec)?;
             Ok(DenseWeight::Exl3(weight))

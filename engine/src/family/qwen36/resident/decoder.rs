@@ -34,6 +34,10 @@ pub(super) enum StepMode {
     Prompt,
     /// `Generate` plus the logits, for a sampler.
     Logits,
+    /// A verify window of speculative decoding: the head runs on EVERY row and the logits of
+    /// each row are read back. No token is drawn on the device; the sampler draws on the host
+    /// from `window_logits`. Only `ResidentDecoder::prefill` takes this mode.
+    Window,
     /// Parity runs only: `Logits` plus the residual stream after every layer.
     Record,
 }
@@ -44,6 +48,8 @@ pub(super) struct StepResult {
     pub(super) token: Option<u32>,
     /// Next-token logits `[vocab]`. `Logits` and `Record` only.
     pub(super) logits: Option<Vec<f32>>,
+    /// The next-token logits of every row, `[rows][vocab]`. `Window` only.
+    pub(super) window_logits: Option<Vec<Vec<f32>>>,
     /// The `[hidden]` residual stream after each layer, as the host reference records it. `Record` only.
     pub(super) layer_out: Option<Vec<Vec<f32>>>,
     /// The experts of each layer in rank order, `top_k` per layer. `Record` only.
@@ -137,6 +143,12 @@ fn warm_up_flash_prefill(
     use crate::kernels::QuantizedKv;
     use crate::tensor::Dtype;
     if !flash_prefill_enabled() || head_dim < 128 || kv != KvDtype::Q8 {
+        return Ok(());
+    }
+    // REP 8 (heads_q / heads_kv) closes the envelope: the dense releases run REP 6, whose
+    // prefill serves through the composite `quantized_attention_prefix` path, so there is
+    // no flash program to compile for them.
+    if heads_kv == 0 || heads_q / heads_kv != 8 {
         return Ok(());
     }
     let cells = 8 * heads_kv as usize * head_dim as usize;
@@ -516,11 +528,19 @@ impl<'c> ResidentDecoder<'c> {
             let states: Vec<_> = states.iter().map(|(rec, ring)| (rec, ring)).collect();
             let mut seconds = WarmupSeconds::default();
             for (layer, _) in &plan.delta {
-                let RMixer::Delta(w) = &self.weights.layers[*layer].mixer else {
+                let layer_ref = &self.weights.layers[*layer];
+                let RMixer::Delta(w) = &layer_ref.mixer else {
                     unreachable!("the admitted DeltaNet layer changed during preparation");
                 };
                 let started = std::time::Instant::now();
-                let got = super::compiled::delta_rows(&mut ctx, &shape, w, &states, &x)?;
+                let got = super::compiled::delta_rows(
+                    &mut ctx,
+                    &shape,
+                    w,
+                    &states,
+                    &x,
+                    &layer_ref.input_norm,
+                )?;
                 let mut outputs = vec![&got.out];
                 for (rec, ring) in &got.states {
                     outputs.extend([rec, ring]);
@@ -531,8 +551,15 @@ impl<'c> ResidentDecoder<'c> {
             for (layer, _) in &plan.moe {
                 let started = std::time::Instant::now();
                 // plan.moe holds only MoE layers, so the accessor cannot fail here.
-                let moe = self.weights.layers[*layer].as_moe()?;
-                let got = super::compiled::moe_step_device(&mut ctx, &shape, moe, &x)?;
+                let layer_ref = &self.weights.layers[*layer];
+                let moe = layer_ref.as_moe()?;
+                let got = super::compiled::moe_step_device(
+                    &mut ctx,
+                    &shape,
+                    moe,
+                    &x,
+                    &layer_ref.post_norm,
+                )?;
                 ctx.kernels
                     .evaluate(&[&got.0, got.1.ids.ids(), &got.1.gates, &got.1.health])?;
                 seconds.moe.push(started.elapsed().as_secs_f64());
@@ -661,21 +688,18 @@ impl<'c> ResidentDecoder<'c> {
             let rec = next()?;
             let ring = next()?;
             for (layer, _id) in &plan.delta {
-                let RMixer::Delta(w) = &self
-                    .weights
-                    .layers
-                    .get(*layer)
-                    .ok_or_else(|| {
-                        EngError::BadRequest("the compile warm-up layer is missing".into())
-                    })?
-                    .mixer
-                else {
+                let layer_ref = self.weights.layers.get(*layer).ok_or_else(|| {
+                    EngError::BadRequest("the compile warm-up layer is missing".into())
+                })?;
+                let RMixer::Delta(w) = &layer_ref.mixer else {
                     return Err(EngError::BadRequest(
                         "the compile warm-up found no DeltaNet layer".into(),
                     ));
                 };
+                let norm_in = &layer_ref.input_norm;
                 let started = std::time::Instant::now();
-                let got = super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x)?;
+                let got =
+                    super::compiled::delta_step(&mut ctx, &shape, w, &rec, &ring, &x, &norm_in)?;
                 ctx.kernels.evaluate(&[&got.out, &got.rec, &got.ring])?;
                 delta_seconds.push(started.elapsed().as_secs_f64());
             }
@@ -686,8 +710,10 @@ impl<'c> ResidentDecoder<'c> {
             })?;
             match &layer.feed_forward {
                 RFeedForward::Moe(w) => {
+                    let norm_post = &layer.post_norm;
                     let started = std::time::Instant::now();
-                    let got = super::compiled::moe_step_device(&mut ctx, &shape, w, &x)?;
+                    let got =
+                        super::compiled::moe_step_device(&mut ctx, &shape, w, &x, &norm_post)?;
                     ctx.kernels.evaluate(&[
                         &got.0,
                         got.1.ids.ids(),
@@ -700,19 +726,17 @@ impl<'c> ResidentDecoder<'c> {
             }
         }
         for (layer, _id) in &plan.attn {
-            let RMixer::Attn(w) = &self
-                .weights
-                .layers
-                .get(*layer)
-                .ok_or_else(|| EngError::BadRequest("the compile warm-up layer is missing".into()))?
-                .mixer
-            else {
+            let layer_ref = self.weights.layers.get(*layer).ok_or_else(|| {
+                EngError::BadRequest("the compile warm-up layer is missing".into())
+            })?;
+            let RMixer::Attn(w) = &layer_ref.mixer else {
                 return Err(EngError::BadRequest(
                     "the compile warm-up found no attention layer".into(),
                 ));
             };
             let started = std::time::Instant::now();
-            let got = super::compiled::attn_pre_step(&mut ctx, &shape, w, &x)?;
+            let got =
+                super::compiled::attn_pre_step(&mut ctx, &shape, w, &x, &layer_ref.input_norm)?;
             ctx.kernels.evaluate(&[&got.q, &got.k, &got.v, &got.gate])?;
             // The post-core closure warms on the attention core output dtype this cache form
             // produces: F32 over the F32 cache, BF16 over the BF16 cache, the activation
@@ -728,14 +752,14 @@ impl<'c> ResidentDecoder<'c> {
             } else {
                 ctx.kernels.cast(&got.q, att_dtype)?
             };
-            let out = super::compiled::attn_post_step(&mut ctx, &shape, w, &att, &got.gate)?;
+            let out = super::compiled::attn_post_step(&mut ctx, &shape, w, &att, &got.gate, &x)?;
             ctx.kernels.evaluate(&[&out])?;
             attn_seconds.push(started.elapsed().as_secs_f64());
         }
         for layer in &self.weights.layers {
             if let RFeedForward::Dense(w) = &layer.feed_forward {
                 // Warm the primitives only. A compiled dense seam is a later optimization.
-                let out = super::moe::dense_rows(&mut ctx, w, &x)?;
+                let out = super::moe::dense_rows(&mut ctx, &shape, w, &x, &layer.post_norm)?;
                 ctx.kernels.evaluate(&[&out])?;
             }
         }
@@ -854,9 +878,9 @@ mod tests {
     /// The BF16 constructor keeps the stored BF16 scales and biases, converts the 100-shaped norm
     /// set (here 8 layer norms and 4 head norms) to BF16, and holds `Bf16` as the activation dtype.
     /// The F32 constructor widens every scale and bias and keeps the norms F32. The two censuses
-    /// have the same shape (43 packed weights of 2 parts each), so a wiring that imports F32 scales
-    /// for BF16 activations shows here as an F32 part or a construction refusal from
-    /// `ensure_scale_pairing`.
+    /// have the same shape (39 packed weights of 2 parts each - the gate/up stacks are joined), so
+    /// a wiring that imports F32 scales for BF16 activations shows here as an F32 part or a
+    /// construction refusal from `ensure_scale_pairing`.
     #[test]
     fn the_activation_dtype_pairs_the_scales_and_converts_the_norms() {
         let _serial = crate::native_test_lock();
@@ -880,7 +904,7 @@ mod tests {
         let (f32, bf16) = (f32.weights.scale_census(), bf16.weights.scale_census());
         assert_eq!(
             (f32.weights, f32.f32_parts, f32.bf16_parts, f32.other_parts),
-            (43, 86, 0, 0),
+            (39, 78, 0, 0),
             "the F32 import widens every scale and bias"
         );
         assert_eq!(
@@ -890,7 +914,7 @@ mod tests {
                 bf16.bf16_parts,
                 bf16.other_parts
             ),
-            (43, 0, 86, 0),
+            (39, 0, 78, 0),
             "the BF16 import keeps every scale and bias as stored"
         );
     }
@@ -954,14 +978,14 @@ mod tests {
                 knob: ("Q36_SCALE_DTYPE", "bf16"),
                 activation: Activation::F32,
                 want: "activation_dtype f32 needs F32 scales and biases; the census holds \
-                       43 packed weights with 0 F32, 86 BF16, and 0 other parts",
+                       39 packed weights with 0 F32, 78 BF16, and 0 other parts",
             },
             Mismatch {
                 // F32 scales under a `bf16` activation: every qmm would promote back to F32.
                 knob: ("Q36_SCALE_DTYPE", "f32"),
                 activation: Activation::Bf16,
                 want: "activation_dtype bf16 needs BF16 scales and biases; the census holds \
-                       43 packed weights with 86 F32, 0 BF16, and 0 other parts",
+                       39 packed weights with 78 F32, 0 BF16, and 0 other parts",
             },
         ];
         if let Some(which) = std::env::var_os(CHILD) {

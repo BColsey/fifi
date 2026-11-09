@@ -248,7 +248,7 @@ fn cohort_device_phase(
     };
     let weights = projector.load_model(&model, load)?.device;
     let free = projector.memory_info()?.free;
-    if fixed && free < super::super::pinned::MIN_FREE_AFTER_LOAD {
+    if fixed && free < super::super::pinned::min_free_after_load().expect("floor") {
         return Err(EngError::MemoryPlan(
             "fixed cohort is below the loader free floor".into(),
         ));
@@ -694,7 +694,7 @@ fn wide_stage_matches_the_default_stage_above_the_tier() {
     let weights = projector.load_model(&model, load).expect("weights").device;
     let free = projector.memory_info().expect("free").free;
     assert!(
-        free >= super::super::pinned::MIN_FREE_AFTER_LOAD,
+        free >= super::super::pinned::min_free_after_load().expect("floor"),
         "equivalence rig is below the loader free floor"
     );
     let budget = free

@@ -411,6 +411,7 @@ fn rig_append(
             resid: view,
             admit_pos: admitted.admit_pos,
         },
+        None,
     )?;
     rig.stream.synchronize()?;
     let read = |slot: Slot| -> Result<Vec<f32>, EngError> {
@@ -548,11 +549,13 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
             &geometry,
             WeightLayout::Native,
             KvMode::Int8G32,
+            false,
         )?,
         layout: WeightLayout::Native,
         kv_mode: KvMode::Int8G32,
         paged: None,
         sparse: None,
+        moe_tiled: false,
     };
     let mixers = Mixers::new(&context, parts)?;
     let resid_slot = if layer.is_multiple_of(2) {
@@ -599,6 +602,7 @@ fn rig_phase(clean: usize, poison_words: &[i32]) -> Result<RigData, EngError> {
                 resid: resid_view,
                 admit_pos: clean,
             },
+            None,
         )?;
         stream.synchronize()?;
         let read = |slot: Slot| -> Result<Vec<f32>, EngError> {

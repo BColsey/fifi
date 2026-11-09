@@ -89,6 +89,12 @@ pub(super) struct StartVectors {
 pub(super) trait TokenFeeds {
     /// The start vectors of `token`. Reads the pack and the n-gram table; changes no state.
     fn begin(&mut self, token: u32) -> Result<StartVectors>;
+    /// The start vectors of a whole chunk, in order. The default reads one token at a time,
+    /// which serves a stateless feed; a feed whose `ple_update` consumes per-token rows must
+    /// override it, because the plain `begin` holds one pending row set at a time.
+    fn begin_chunk(&mut self, tokens: &[u32]) -> Result<Vec<StartVectors>> {
+        tokens.iter().map(|&token| self.begin(token)).collect()
+    }
     /// The PLE update for `token` given the stream at the PLE layer's input (`branches * hidden`).
     /// Advances the PLE history and ring: called once per fed token, after [`Self::begin`].
     fn ple_update(&mut self, token: u32, stream: &[f32]) -> Result<Vec<f32>>;
@@ -165,8 +171,7 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
         self.shape.positions
     }
 
-    #[cfg(test)]
-    pub(super) fn device(&self) -> &D {
+    pub(in crate::family::flash_next::cuda) fn device(&self) -> &D {
         &self.device
     }
 
@@ -275,6 +280,18 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
     }
 }
 
+/// The one [`TokenStepper`] method beyond the trait that an executor calls: the number of
+/// positions the caches hold.
+pub(crate) trait StepperPositions: TokenStepper {
+    fn positions(&self) -> usize;
+}
+
+impl<D: TokenDevice, F: TokenFeeds> StepperPositions for TokenDriver<D, F> {
+    fn positions(&self) -> usize {
+        self.positions()
+    }
+}
+
 impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
     const OPERATION: &'static str = "flash_next_cuda";
 
@@ -303,6 +320,12 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
     }
 }
 
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "staged for the chunked prefill step")
+)]
+pub(in crate::family::flash_next::cuda) mod chunk;
 #[cfg(test)]
 pub(super) mod fakes;
 #[cfg(test)]

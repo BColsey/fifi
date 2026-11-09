@@ -1246,6 +1246,7 @@ pub(super) struct ChunkRun<'r, 'w> {
     bufs: &'r ChunkBufs<'r>,
     rows: ChunkRows,
     sparse: Option<ChunkSparse<'r>>,
+    bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
     segmented_parts: std::cell::Cell<usize>,
     #[cfg(test)]
     kernel_class: ChunkKernelClass,
@@ -1293,6 +1294,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
             bufs,
             rows,
             sparse: None,
+            bank: None,
             segmented_parts: std::cell::Cell::new(0),
             #[cfg(test)]
             kernel_class: ChunkKernelClass::ProductionMmq,
@@ -1307,6 +1309,17 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     /// sketches its k rows onto the sparse planes (see `attn_prep`).
     pub(super) fn with_sparse(mut self, sparse: Option<ChunkSparse<'r>>) -> Self {
         self.sparse = sparse;
+        self
+    }
+
+    /// Attaches the EXL3 banked resolver: each layer's moe stage then reads its picks back,
+    /// maps them through the layer's slot table (refilling missed slots from the host store)
+    /// and groups the launches on slot ids. `None` on resident loads.
+    pub(super) fn with_bank(
+        mut self,
+        bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    ) -> Self {
+        self.bank = bank;
         self
     }
 

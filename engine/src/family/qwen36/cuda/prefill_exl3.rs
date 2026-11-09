@@ -298,7 +298,30 @@ pub(super) fn moe_block(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
         shared_out: view(ChunkSlot::ShOut)?,
     };
     let dims = run.model.dims_at(run.rows.m());
-    moe::run(&projector(run, ctx)?, weights, &bufs, &dims)
+    // A banked chunk runs the shared expert once for the whole chunk, then the routed experts
+    // and the combine per sub-block whose whole pick set fits the slots together, mapping each
+    // sub-block's picks through the layer's slot table first.
+    if let Some(cell) = run.bank {
+        let top_k = dims.top_k;
+        let sub_rows = (cell.borrow().slots() / top_k).max(1);
+        let m = dims.rows;
+        let sub = (0..m)
+            .step_by(sub_rows)
+            .map(|r0| (r0, run.model.dims_at((m - r0).min(sub_rows))))
+            .collect::<Vec<_>>();
+        let mut resolver = cell.borrow_mut();
+        let mut bank = resolver.layer(ctx.layer);
+        moe::run_banked(
+            &projector(run, ctx)?,
+            weights,
+            &bufs,
+            &dims,
+            &sub,
+            &mut bank,
+        )
+    } else {
+        moe::run(&projector(run, ctx)?, weights, &bufs, &dims)
+    }
 }
 
 /// Clears the sticky arithmetic flag before the first layer. The write waits for the stream.

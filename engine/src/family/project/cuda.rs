@@ -163,6 +163,7 @@ struct PlannedTensor<'w> {
     tensor: &'w GgufTensor,
     bytes: u64,
     slice: Option<plan::TensorSlice>,
+    mapped: bool,
 }
 
 /// One checkpoint tensor resident on the device.
@@ -280,10 +281,14 @@ impl CudaWeights {
     /// The one device layout of this load's quantized tensors: the resident step derives its
     /// mode from it, and a mixed load is a typed refusal naming the tensor.
     pub(crate) fn layout(&self) -> Result<WeightLayout, EngError> {
+        // The tiled-head hybrid's overridden names do not make the load mixed: they are exempt
+        // from the one-layout rule exactly like the fused in-projection's hidden siblings.
+        let overrides = tiled_head_overrides();
         load_layout(
             self.weights
                 .iter()
-                .map(|weight| (weight.name(), weight.kind())),
+                .map(|weight| (weight.name(), weight.kind()))
+                .filter(|(name, _)| !overrides.iter().any(|o| o == name)),
         )
     }
 }
@@ -361,7 +366,12 @@ struct LoadPlan<'a> {
     index: HashMap<String, usize>,
     policy: LoadPolicy,
     drop_file: Option<&'a File>,
+    /// The load layout - the `tiled_overrides` names of a native load upload as tiles beside
+    /// it and do not change this field.
     layout: WeightLayout,
+    /// The names this load uploads in the `Tiled` layout beside the `Native` load
+    /// (`INFERENCE_CUDA_TILED_HEAD`); empty unless the hybrid is on.
+    tiled_overrides: Vec<String>,
     /// The fused GDN input-projection groups of this load, as `(qkv position, [sibling
     /// positions in column order])`; empty unless the fusion flag is set. The sibling
     /// positions still hold their admission bytes but never upload.
@@ -450,8 +460,16 @@ impl<'a> BorrowedLoader<'a> {
         names: &[&str],
         options: LoadOptions<'_>,
         slices: &[(&str, SliceSpec)],
+        host_expert_bytes: u64,
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, slices)
+        load_inner(
+            &self.knobs(),
+            weights,
+            names,
+            options,
+            slices,
+            host_expert_bytes,
+        )
     }
 }
 
@@ -565,7 +583,7 @@ impl CudaProjector {
         names: &[&str],
         options: LoadOptions<'_>,
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, &[])
+        load_inner(&self.knobs(), weights, names, options, &[], 0)
     }
 
     /// Like [`Self::load`], uploading only the named tensors' slices: each
@@ -590,7 +608,7 @@ impl CudaProjector {
         options: LoadOptions<'_>,
         slices: &[(&str, SliceSpec)],
     ) -> Result<CudaWeights, EngError> {
-        load_inner(&self.knobs(), weights, names, options, slices)
+        load_inner(&self.knobs(), weights, names, options, slices, 0)
     }
 
     /// Loads every tensor of `model` onto the device: the tiled tensors as
@@ -902,6 +920,57 @@ pub(crate) fn gdn_fuse_inproj() -> bool {
         == Some("1")
 }
 
+/// The decode-only tiled-head hybrid: tensor names (comma-separated) that a `Native` load
+/// uploads in the `Tiled` layout instead, so the qwen36 step runs the vendored tiled head
+/// matmul beside its native ops. Read per load and per `CudaWeights::layout()`, like the
+/// `INFERENCE_CUDA_GDN_FUSE_INPROJ` precedent; empty or unset = no override (default).
+pub(crate) fn tiled_head_overrides() -> Vec<String> {
+    std::env::var("INFERENCE_CUDA_TILED_HEAD")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The tiled-head override admission: every override name must be part of this load (a typo
+/// must not silently load the head native), inert on the other layouts. Pure so the CPU tests
+/// pin the refusal without a device load.
+pub(crate) fn tiled_override_admission(
+    layout: WeightLayout,
+    names: &[&str],
+    overrides: &[String],
+) -> Result<Vec<String>, EngError> {
+    if layout != WeightLayout::Native {
+        return Ok(Vec::new());
+    }
+    for name in overrides {
+        if !names.contains(&name.as_str()) {
+            return Err(EngError::Checkpoint(format!(
+                "tensor {name}: the INFERENCE_CUDA_TILED_HEAD override is not part of this load"
+            )));
+        }
+    }
+    Ok(overrides.to_vec())
+}
+
+/// A name that is both sliced and overridden to tiles refuses: a sliced tensor plans rows from
+/// the weight's own shape, and only the native readers take those shapes. Pure so the CPU tests
+/// pin the refusal.
+pub(crate) fn check_sliced_override(
+    name: &str,
+    tensor_layout: WeightLayout,
+    sliced: bool,
+) -> Result<(), EngError> {
+    if sliced && tensor_layout == WeightLayout::Tiled {
+        return Err(EngError::Checkpoint(format!(
+            "tensor {name}: a sliced load cannot override a name to tiles"
+        )));
+    }
+    Ok(())
+}
+
 /// The sibling suffixes of an `attn_qkv` tensor, in DeltaProj column order.
 const GDN_INPROJ_SIBLINGS: [&str; 3] =
     [".attn_gate.weight", ".ssm_beta.weight", ".ssm_alpha.weight"];
@@ -985,7 +1054,7 @@ fn planned<'w>(
 /// one chunk of at most `chunk_limit` bytes.
 fn check_scale_ranges(
     weights: &GgufWeights,
-    tensors: &[PlannedTensor<'_>],
+    tensors: &[&PlannedTensor<'_>],
     chunk_limit: usize,
 ) -> Result<(), EngError> {
     for planned_tensor in tensors {
@@ -1068,12 +1137,41 @@ pub(crate) use exl3::{Exl3JobsIo, Exl3MatrixView};
 mod load_policy;
 #[cfg(test)]
 mod model_tests;
+
+/// Select whole eligible slices from the end of the load until the requested
+/// minimum is met. The only possible overshoot is one complete expert slice.
+fn select_host_experts(
+    candidates: &[(bool, u64)],
+    minimum: u64,
+) -> Result<(Vec<bool>, u64), EngError> {
+    let mut selected = vec![false; candidates.len()];
+    let mut bytes = 0u64;
+    for (index, &(eligible, size)) in candidates.iter().enumerate().rev() {
+        if bytes >= minimum {
+            break;
+        }
+        if eligible && size != 0 {
+            bytes = bytes.checked_add(size).ok_or_else(|| {
+                EngError::MemoryPlan("cuda mapped experts: selected bytes overflow".into())
+            })?;
+            selected[index] = true;
+        }
+    }
+    if bytes < minimum {
+        return Err(EngError::MemoryPlan(format!(
+            "cuda mapped experts: requested {minimum} bytes, but only {bytes} eligible bytes exist"
+        )));
+    }
+    Ok((selected, bytes))
+}
+
 fn load_inner(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
     names: &[&str],
     options: LoadOptions<'_>,
     slices: &[(&str, SliceSpec)],
+    host_expert_bytes: u64,
 ) -> Result<CudaWeights, EngError> {
     knobs.context.ensure_usable()?;
     if options.layout == WeightLayout::Exl3 {
@@ -1083,6 +1181,13 @@ fn load_inner(
     }
     load_index(names)?; // the duplicate-name refusal still covers the whole request
     let layout = options.layout;
+    // The tiled-head hybrid (`INFERENCE_CUDA_TILED_HEAD`): tensor names that upload in the
+    // Tiled layout beside this native load. On any other layout the override is inert (the
+    // tensors already upload as tiles under Tiled, and EXL3 never reaches here); an override
+    // that names no tensor of this load refuses - a typo must not silently load the head
+    // native.
+    let tiled_overrides: Vec<String> =
+        tiled_override_admission(layout, names, &tiled_head_overrides())?;
     // The slice set of a sliced load, by tensor name. A slice for a tensor this load
     // did not name, a name sliced twice, or any slice on a non-native layout refuses
     // before planning: a sliced tensor has a different shape than its file record,
@@ -1123,15 +1228,23 @@ fn load_inner(
             index.insert(name.to_owned(), index.len());
         }
     }
-    let tensors = names
+    let mut tensors = names
         .iter()
         .map(|name| {
-            let (tensor, whole_bytes) = planned(weights, name, layout)?;
+            // A hybrid-overridden name plans (admission bytes, tile-row stacks) as tiles.
+            let tensor_layout = if tiled_overrides.iter().any(|o| o == name) {
+                WeightLayout::Tiled
+            } else {
+                layout
+            };
+            let (tensor, whole_bytes) = planned(weights, name, tensor_layout)?;
+            check_sliced_override(name, tensor_layout, slice_specs.contains_key(name))?;
             match slice_specs.get(name) {
                 None => Ok(PlannedTensor {
                     tensor,
                     bytes: whole_bytes,
                     slice: None,
+                    mapped: false,
                 }),
                 Some(spec) => {
                     let slice = plan::plan_slice_rows(
@@ -1146,15 +1259,67 @@ fn load_inner(
                         tensor,
                         bytes,
                         slice: Some(slice),
+                        mapped: false,
                     })
                 }
             }
         })
         .collect::<Result<Vec<PlannedTensor<'_>>, EngError>>()?;
+    let candidates: Vec<_> = tensors
+        .iter()
+        .map(|t| {
+            let name = t.tensor.name();
+            let eligible = layout == WeightLayout::Native
+                && t.slice.is_some()
+                && t.tensor.dims().len() == 3
+                && [
+                    "ffn_gate_exps.weight",
+                    "ffn_up_exps.weight",
+                    "ffn_down_exps.weight",
+                ]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+                && matches!(
+                    t.tensor.ggml_type(),
+                    GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50
+                );
+            (eligible, t.bytes)
+        })
+        .collect();
+    let (mapped, host_bytes) = select_host_experts(&candidates, host_expert_bytes)?;
+    for (tensor, mapped) in tensors.iter_mut().zip(mapped) {
+        tensor.mapped = mapped;
+    }
+    if host_bytes != 0 {
+        let available = crate::capability::probe::probe_host()
+            .mem_available_bytes
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                EngError::MemoryPlan(
+                    "cuda mapped experts: host memory availability is unknown".into(),
+                )
+            })?;
+        let needed = host_bytes.checked_add(1 << 30).ok_or_else(|| {
+            EngError::MemoryPlan("cuda mapped experts: host memory demand overflows".into())
+        })?;
+        if needed > available {
+            return Err(EngError::MemoryPlan(format!(
+                "cuda mapped experts: need {needed} host bytes including 1 GiB free, have {available}"
+            )));
+        }
+        eprintln!(
+            "cuda mapped experts: placing {host_bytes} bytes in host memory (host available {available} bytes)"
+        );
+    }
     let total = tensors
         .iter()
         .try_fold(0u64, |sum, planned_tensor| {
-            sum.checked_add(planned_tensor.bytes)
+            sum.checked_add(if planned_tensor.mapped {
+                0
+            } else {
+                planned_tensor.bytes
+            })
         })
         .ok_or_else(|| EngError::MemoryPlan("cuda admission: tensors overflow u64".into()))?;
     let policy = LoadPolicy::for_device(knobs.integrated);
@@ -1174,6 +1339,7 @@ fn load_inner(
             policy,
             drop_file,
             layout,
+            tiled_overrides,
             fused,
         },
     )
@@ -1198,13 +1364,22 @@ fn transfer(
         policy,
         drop_file,
         layout,
+        tiled_overrides,
         fused,
     } = plan;
     let scan_began = Instant::now();
     // The fp16 scale scans guard the tile dequantisation (fp16(d * scale)); a native load
-    // keeps the file's exact scales and scans nothing.
+    // keeps the file's exact scales and scans nothing - except the hybrid's overridden
+    // names, which dequantise through the same fp16 tile path.
     if layout == WeightLayout::Tiled {
-        check_scale_ranges(weights, &tensors, knobs.chunk_limit)?;
+        let scanned: Vec<&PlannedTensor> = tensors.iter().collect();
+        check_scale_ranges(weights, &scanned, knobs.chunk_limit)?;
+    } else if !tiled_overrides.is_empty() {
+        let overridden: Vec<&PlannedTensor> = tensors
+            .iter()
+            .filter(|t| tiled_overrides.iter().any(|o| o == t.tensor.name()))
+            .collect();
+        check_scale_ranges(weights, &overridden, knobs.chunk_limit)?;
     }
     let scan = scan_began.elapsed();
     // A tiled load's scan read every Q6_K, Q8_0 and Q5_0 tensor once and refilled the
@@ -1252,8 +1427,14 @@ fn transfer(
                         knobs,
                         weights,
                         tensor,
-                        layout,
+                        // A hybrid-overridden name uploads as tiles beside the native load.
+                        if tiled_overrides.iter().any(|o| o == tensor.name()) {
+                            WeightLayout::Tiled
+                        } else {
+                            layout
+                        },
                         planned_tensor.slice.as_ref(),
+                        planned_tensor.mapped,
                     )
                 },
                 || recover(weights.file(), policy.retry_pause),
@@ -1381,11 +1562,12 @@ fn upload(
     tensor: &GgufTensor,
     layout: WeightLayout,
     slice: Option<&plan::TensorSlice>,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
     let name = tensor.name();
     match (tensor.ggml_type(), layout) {
         (ty @ (GgufType::Q4K | GgufType::Q6K | GgufType::Q80 | GgufType::Q50), layout) => {
-            upload_quant(knobs, weights, tensor, name, ty, layout, slice)
+            upload_quant(knobs, weights, tensor, ty, layout, slice, mapped)
         }
         (ty @ (GgufType::F32 | GgufType::F16), _) => {
             let (_, bytes) = weights.read_tensor(name)?;
@@ -1416,13 +1598,14 @@ fn upload_quant(
     knobs: &LoadKnobs<'_>,
     weights: &GgufWeights,
     tensor: &GgufTensor,
-    name: &str,
     ty: GgufType,
     layout: WeightLayout,
     slice: Option<&plan::TensorSlice>,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
+    let name = tensor.name();
     if let Some(slice) = slice {
-        return upload_quant_sliced(knobs, weights, tensor, name, ty, slice);
+        return upload_quant_sliced(knobs, weights, tensor, name, ty, slice, mapped);
     }
     let (n_rows, k) = matrix_shape(tensor)?;
     let experts = stack_depth(tensor)?;
@@ -1479,6 +1662,7 @@ fn upload_quant_sliced(
     name: &str,
     ty: GgufType,
     slice: &plan::TensorSlice,
+    mapped: bool,
 ) -> Result<CudaWeight, EngError> {
     let shape_error =
         || EngError::Checkpoint(format!("tensor {name} has an unusable sliced shape"));
@@ -1506,14 +1690,21 @@ fn upload_quant_sliced(
         source_len,
     };
     let reader = SliceReader::new(&slice.segments);
-    let weight = knobs
-        .context
-        .upload_native(quant, knobs.chunk_limit, &mut |at, buf| {
-            reader.fill(at as u64, buf, &mut |offset, part| {
-                weights.read_range(name, offset, part)
-            })
-        })?
-        .with_experts(experts);
+    let mut fill = |at, buf: &mut [u8]| {
+        reader.fill(at as u64, buf, &mut |offset, part| {
+            weights.read_range(name, offset, part)
+        })
+    };
+    let weight = if mapped {
+        knobs
+            .context
+            .upload_native_mapped(quant, knobs.chunk_limit, &mut fill)?
+    } else {
+        knobs
+            .context
+            .upload_native(quant, knobs.chunk_limit, &mut fill)?
+    }
+    .with_experts(experts);
     Ok(CudaWeight::Native {
         name: name.to_owned(),
         weight,

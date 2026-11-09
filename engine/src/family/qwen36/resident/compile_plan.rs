@@ -30,6 +30,10 @@ pub(super) struct DeltaLayerFacts {
     pub(super) hidden: u32,
     /// The eight checked dimensions of the block (`compile_key::checked_delta_dims`).
     pub(super) dims: [u32; 8],
+    /// 1 when the pre-recurrence middle runs as the ONE `delta_middle` kernel
+    /// (`Q36_FUSED_DECODE=1` with three taps, read at load): a different closure body, so a
+    /// different warm-up program.
+    pub(super) fused: u32,
     /// `f32::to_bits(eps)`: the RMS norm epsilon of the block.
     pub(super) eps_bits: u32,
     /// The activation dtype key (`compile_key::dtype_key`).
@@ -51,10 +55,12 @@ pub(super) struct MoeLayerFacts {
     pub(super) renorm: u32,
     /// The clamp bound of the expert ids, `experts - 1`.
     pub(super) clamp: u32,
+    /// `f32::to_bits(eps)`: the RMS norm epsilon of the folded post-attention norm.
+    pub(super) eps_bits: u32,
     /// The activation dtype key (`compile_key::dtype_key`).
     pub(super) act: u64,
     /// The weight facts, in the seam's order.
-    pub(super) weights: [WeightFacts; 6],
+    pub(super) weights: [WeightFacts; 5],
 }
 
 /// The facts of one attention layer of the model: where the layer sits, the baked constants of
@@ -134,6 +140,7 @@ pub(super) fn model_warmup(
         let baked = DeltaBaked {
             hidden: facts.hidden,
             dims: facts.dims,
+            fused: facts.fused,
             eps_bits: facts.eps_bits,
             act: facts.act,
             scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
@@ -155,8 +162,7 @@ pub(super) fn model_warmup(
                     "shared gate",
                     "shared up",
                     "shared down",
-                    "gate stack",
-                    "up stack",
+                    "stacked gate/up",
                     "down stack",
                 ],
             )?;
@@ -167,6 +173,7 @@ pub(super) fn model_warmup(
                 renorm: facts.renorm,
                 clamp: facts.clamp,
                 act: facts.act,
+                eps_bits: facts.eps_bits,
                 scale_keys: facts.weights.each_ref().map(|weight| weight.scale_key),
                 quant: facts.weights.each_ref().map(|weight| weight.quant),
             };
@@ -249,6 +256,7 @@ mod tests {
             layer,
             hidden: 2048,
             dims: [16, 128, 32, 128, 8192, 3, 2048, 4096],
+            fused: 0,
             eps_bits: 1e-6f32.to_bits(),
             act: dtype_key(Dtype::F32),
             weights: [affine(bits); 5],
@@ -264,7 +272,8 @@ mod tests {
             renorm: 1,
             clamp: 255,
             act: dtype_key(Dtype::F32),
-            weights: [affine(bits); 6],
+            weights: [affine(bits); 5],
+            eps_bits: 1e-6f32.to_bits(),
         }
     }
 
@@ -349,23 +358,42 @@ mod tests {
     }
 
     #[test]
-    fn more_than_five_distinct_programs_are_refused() {
+    fn more_than_eight_distinct_programs_are_refused() {
         let delta = [delta_layer(0, 4), delta_layer(1, 5), delta_layer(2, 6)];
-        let moe = [moe_layer(0, 4), moe_layer(1, 8)];
-        // Five distinct ids pass: the limit is exactly the program budget.
-        let five = model_warmup(true, true, &delta, &moe, &[]).unwrap();
-        assert_eq!(five.delta.len() + five.moe.len(), 5, "5 ids pass");
-        // A sixth program (one attention set = pre + post) exceeds it.
-        let refused = model_warmup(true, true, &delta, &moe, &[attn_layer(0, 4)]).unwrap_err();
+        let moe = [moe_layer(0, 4)];
+        // Eight distinct ids pass: the limit is exactly the program budget (the dense oQ6
+        // pack needs 2 delta + 3 attention sets = 2*3 attn programs).
+        let eight = model_warmup(
+            true,
+            true,
+            &delta,
+            &moe,
+            &[attn_layer(0, 4), attn_layer(1, 5)],
+        )
+        .unwrap();
+        assert_eq!(
+            eight.delta.len() + eight.moe.len() + 2 * eight.attn.len(),
+            8,
+            "8 ids pass"
+        );
+        // One further attention set (pre + post) exceeds it.
+        let refused = model_warmup(
+            true,
+            true,
+            &delta,
+            &moe,
+            &[attn_layer(0, 4), attn_layer(1, 5), attn_layer(2, 6)],
+        )
+        .unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the admission refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 7 distinct compiled programs (3 delta, 2 moe, 2 attn)"),
+            message.contains("needs 10 distinct compiled programs (3 delta, 1 moe, 6 attn)"),
             "the refusal names the count: {message}"
         );
         assert!(
-            message.contains("at most 5"),
+            message.contains("at most 8"),
             "the refusal names the limit: {message}"
         );
     }
@@ -388,13 +416,13 @@ mod tests {
         );
         // The MoE block refuses its own biasless weights on the device-routed path.
         let mut moe = moe_layer(5, 4);
-        moe.weights[4].biases = false;
+        moe.weights[3].biases = false;
         let refused = model_warmup(true, true, &[], &[moe], &[]).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the biasless refusal is a BadRequest");
         };
         assert!(
-            message.contains("layer 5") && message.contains("the up stack weight has none"),
+            message.contains("layer 5") && message.contains("the stacked gate/up weight has none"),
             "the refusal names the layer and the weight: {message}"
         );
     }
@@ -441,17 +469,17 @@ mod tests {
 
     #[test]
     fn attention_programs_count_against_the_limit() {
-        // two delta quantizations + moe + two attention quantizations (pre + post each)
-        // = seven programs: refused.
+        // two delta quantizations + moe + three attention quantizations (pre + post each)
+        // = nine programs: refused.
         let delta = [delta_layer(0, 4), delta_layer(1, 8)];
         let moe = [moe_layer(0, 4)];
-        let attn = [attn_layer(0, 4), attn_layer(1, 8)];
+        let attn = [attn_layer(0, 4), attn_layer(1, 5), attn_layer(2, 8)];
         let refused = model_warmup(true, true, &delta, &moe, &attn).unwrap_err();
         let EngError::BadRequest(message) = refused else {
             panic!("the limit refusal is a BadRequest");
         };
         assert!(
-            message.contains("needs 7 distinct compiled programs (2 delta, 1 moe, 4 attn)"),
+            message.contains("needs 9 distinct compiled programs (2 delta, 1 moe, 6 attn)"),
             "the refusal names all three kinds: {message}"
         );
     }

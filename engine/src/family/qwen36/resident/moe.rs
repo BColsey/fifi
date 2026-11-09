@@ -16,7 +16,7 @@
 //! probability row (the health). A softmax row sums to 1, so a NaN or infinite entry makes the sum
 //! non-finite. The step adds the sums of all layers and checks the total at the token readback.
 //! The expert ids are clamped below the expert count ONCE per layer (`bound_indices`): the
-//! top-probability take and the gate, up, and down products of the layer share the one clamp
+//! top-probability take and the stacked and down products of the layer share the one clamp
 //! node, and the values stay bit for bit the values of the per-operation clamps.
 
 use super::ops::{Ctx, dim, f32_tensor, short_import, to_act, u32_tensor, values};
@@ -27,7 +27,7 @@ use crate::{
         flash_next::math::expect_len, qwen36::host::HostShape, route::route_experts, spec::Router,
     },
     kernels::{BinaryOp, BoundedIndices, ReduceOp, UnaryOp},
-    tensor::{ExecutionTensor, Tensor},
+    tensor::{Dtype, ExecutionTensor, Tensor},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -43,17 +43,23 @@ pub(super) enum Routing {
 /// and the router probabilities `[E]` that the selection read.
 pub(super) type Selection = (Vec<(u32, f32)>, Vec<f32>);
 
-/// Dense SwiGLU on `[T, H]`, without routing or a shared-expert scalar gate.
+/// Dense SwiGLU on `[T, H]`, without routing or a shared-expert scalar gate. The block folds
+/// the post-attention norm and the output residual add around the FFN: `x` is the raw residual
+/// stream, the norm runs first, and the returned row is the residual sum `x + ffn(norm(x))`.
 pub(super) fn dense_rows(
     ctx: &mut Ctx<'_>,
+    shape: &HostShape,
     w: &RDense,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<ExecutionTensor, EngError> {
-    let gate = ctx.kernels.qmm(x, &w.gate)?;
-    let up = ctx.kernels.qmm(x, &w.up)?;
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let gate = ctx.kernels.qmm(&normed, &w.gate)?;
+    let up = ctx.kernels.qmm(&normed, &w.up)?;
     let act = ctx.kernels.silu(&gate)?;
     let hidden = ctx.kernels.binary(BinaryOp::Mul, &act, &up)?;
-    ctx.kernels.qmm(&hidden, &w.down)
+    let out = ctx.kernels.qmm(&hidden, &w.down)?;
+    ctx.kernels.binary(BinaryOp::Add, x, &out)
 }
 
 /// Whether the fused prefill kernels replace the composite ops. Default ON after their gate
@@ -62,8 +68,6 @@ pub(super) fn fused_prefill() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("Q36_FUSED_PREFILL").is_none_or(|v| v != "0"))
 }
-
-use crate::tensor::Dtype;
 
 /// The shared expert of one row `[1, H]` or of a whole row stack `[B, H]`: the
 /// three dense weights (gate, up, down) meet the rows in ONE qmm each
@@ -99,9 +103,15 @@ pub(super) fn step(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, Selection), EngError> {
-    let ((bounded, gates), tail) = route_row(ctx, shape, w, x)?;
-    let out = combine(ctx, shape, w, x, &bounded, &gates)?;
+    // The folded post-attention norm: the same op the step loop used to run, relocated inside
+    // the block so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let ((bounded, gates), tail) = route_row(ctx, shape, w, &normed)?;
+    let out = combine(ctx, shape, w, &normed, &bounded, &gates)?;
+    // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     Ok((out, tail))
 }
 
@@ -172,8 +182,15 @@ fn combine_core(
 ) -> Result<ExecutionTensor, EngError> {
     let hidden = dim(shape.hidden)?;
     let x3 = ctx.kernels.reshape(x, &[1, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
-    let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
+    // One gathered product of the stacked gate/up operand: rows [0, I) carry the gate
+    // projection and rows [I, 2I) the up projection of every selected expert, so the two
+    // bandwidth-bound gathers of the layer become one.
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let (rows, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[rows, 1, half])?;
+    let hu = ctx
+        .kernels
+        .slice(&stacked, &[0, 0, half], &[rows, 1, half * 2])?;
     // The act_mul fused kernel (Q36_FUSED_PREFILL=1) replaces silu+mul.
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
@@ -274,8 +291,14 @@ pub(super) fn combine_rows(
         .checked_mul(top_k)
         .ok_or_else(|| EngError::BadRequest("moe pair count overflows u32".into()))?;
     let x3 = ctx.kernels.reshape(&x3, &[pairs, 1, hidden])?;
-    let hg = ctx.kernels.gather_qmm_bounded(&x3, &w.gate, ids)?;
-    let hu = ctx.kernels.gather_qmm_bounded(&x3, &w.up, ids)?;
+    // The stacked gate/up operand: one gathered product for the whole window, split into the
+    // gate half [0, I) and the up half [I, 2I) of every selected pair row.
+    let stacked = ctx.kernels.gather_qmm_bounded(&x3, &w.gate_up, ids)?;
+    let (taken, half) = (stacked.shape()[0], stacked.shape()[2] / 2);
+    let hg = ctx.kernels.slice(&stacked, &[0, 0, 0], &[taken, 1, half])?;
+    let hu = ctx
+        .kernels
+        .slice(&stacked, &[0, 0, half], &[taken, 1, half * 2])?;
     let h = if fused_prefill()
         && std::env::var_os("Q36_NO_ACTMUL").is_none()
         && hg.dtype() == Dtype::Bf16
@@ -334,6 +357,20 @@ pub(super) fn route_device(
         ));
     }
     let flat = ctx.kernels.reshape(probs, &[experts])?;
+    // The health reduce runs on the whole row in both paths: its accumulation order is the
+    // MLX reduce's own, unchanged by the fused selection below.
+    let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
+    // The fused top-k kernel of the decode contract: an F32 row with a multiple-of-32 expert
+    // count up to 1024 and a top-k up to 32 selects and renormalizes in ONE launch, with the
+    // same rank order, tie rule, and gate rounding as the op chain below (the general path,
+    // which the tiny shapes and any exotic expert count keep using).
+    if probs.dtype() == Dtype::F32 && experts % 32 == 0 && experts <= 1024 && top_k <= 32 {
+        let (ids, gates) = ctx.kernels.router_topk(probs, experts, k, renorm)?;
+        // The kernel emits ids already below the expert count: the selection picks indices of
+        // the row itself, so the trusted clamp-free bound holds by construction.
+        let ids = BoundedIndices::from_clamped(ids, experts);
+        return Ok(DeviceRoute { ids, gates, health });
+    }
     // A stable ascending sort of the negated row lists the largest probability first and keeps the
     // lower index first among equal values.
     let negated = ctx.kernels.unary(UnaryOp::Neg, &flat)?;
@@ -343,7 +380,6 @@ pub(super) fn route_device(
     // and the three gathered products of `combine` share it.
     let bounded = ctx.kernels.bound_indices(&ids, experts)?;
     let top = ctx.kernels.take_bounded(&flat, &bounded, 0)?;
-    let health = ctx.kernels.reduce(ReduceOp::Sum, &flat, 0, true)?;
     let gates = if renorm {
         let sum = ctx.kernels.reduce(ReduceOp::Sum, &top, 0, true)?;
         ctx.kernels.binary(BinaryOp::Div, &top, &sum)?
@@ -368,6 +404,7 @@ pub(super) fn step_device(
     shape: &HostShape,
     w: &RMoe,
     x: &ExecutionTensor,
+    post_norm: &ExecutionTensor,
 ) -> Result<(ExecutionTensor, DeviceRoute), EngError> {
     let m = &shape.moe;
     // The compiled decode closure: the `qwen36.compile` setting (or the test override of
@@ -376,9 +413,12 @@ pub(super) fn step_device(
     // never compiles: it is the parity reference. No fallback: a failure of the compiled path is
     // a native failure of the adapter.
     if super::compiled::step_requested(ctx.compile) {
-        return super::compiled::moe_step_device(ctx, shape, w, x);
+        return super::compiled::moe_step_device(ctx, shape, w, x, post_norm);
     }
-    let logits = ctx.kernels.mm(x, &w.router_t)?;
+    // The folded post-attention norm: the same op the step loop used to run, relocated inside
+    // the block so the eager and compiled paths share one contract over the raw residual stream.
+    let normed = ctx.kernels.rms_norm(x, post_norm, shape.eps)?;
+    let logits = ctx.kernels.mm(&normed, &w.router_t)?;
     let probs = ctx.kernels.softmax(&logits)?;
     if probs.shape() != [1, dim(m.experts)?] {
         let count = probs
@@ -392,7 +432,9 @@ pub(super) fn step_device(
         )));
     }
     let route = route_device(ctx, &probs, m.top_k, m.renorm)?;
-    let out = combine(ctx, shape, w, x, &route.ids, &route.gates)?;
+    let out = combine(ctx, shape, w, &normed, &route.ids, &route.gates)?;
+    // The folded output residual: the same `binary(Add, x, out)` the step loop used to run.
+    let out = ctx.kernels.binary(BinaryOp::Add, x, &out)?;
     Ok((out, route))
 }
 
@@ -402,7 +444,7 @@ mod tests {
     use super::super::weights::ResidentWeights;
     use super::*;
     use crate::family::project::Projector;
-    use crate::family::qwen36::host::{self, MoeW};
+    use crate::family::qwen36::host::{self, MoeW, rms_plain};
     use crate::family::qwen36::host_cpu::CpuProjector;
     use crate::family::qwen36::host_load::HostWeights;
     use crate::family::qwen36::tiny::{self, TINY};
@@ -421,11 +463,13 @@ mod tests {
     /// Top-2 experts of layer 0 for inputs 0 to 7, from the CPU reference with f64 softmax. The
     /// smallest gap between the second and third probability is 0.0071 (input 2). The expert sets
     /// cover all four experts.
+    // Inputs 2 and 3 are router near-ties: the folded contract norms on the device, whose
+    // rounding flips the second pick relative to the old host-normed uploads (0 -> 2, 0 -> 1).
     const LAYER0_ROUTES: [[u32; 2]; 8] = [
         [2, 1],
-        [0, 3],
-        [1, 0],
         [3, 0],
+        [1, 2],
+        [3, 1],
         [1, 3],
         [0, 2],
         [1, 3],
@@ -484,11 +528,22 @@ mod tests {
         let super::super::weights::RFeedForward::Dense(w) = &weights.layers[0].feed_forward else {
             panic!("expected dense weights");
         };
+        // dense_rows folds the post norm and the residual add: feed it a raw residual and a
+        // ones norm, so the block computes `x + ffn(x / rms(x))`. For a constant row `v` the
+        // normed row is `y = v / sqrt(v^2 + eps)` everywhere, and the uniform gate/up/down
+        // weights turn the SwiGLU into `-6 y^2 / (1 + e^-y)` per element.
+        let post_norm = kernels
+            .import_tensor(&f32_tensor(vec![64], &vec![1.0; 64]).unwrap())
+            .unwrap();
+        let eps = weights.shape.eps;
         for row_values in [&[1.0f32][..], &[1.0, -1.0, 0.0, 0.5][..]] {
             let input: Vec<f32> = row_values.iter().flat_map(|&v| [v; 64]).collect();
             let expected: Vec<f32> = row_values
                 .iter()
-                .flat_map(|&v| [-6.0 * v * v / (1.0 + (-v).exp()); 64])
+                .flat_map(|&v| {
+                    let y = v / (v * v + eps).sqrt();
+                    [v - 6.0 * y * y / (1.0 + (-y).exp()); 64]
+                })
                 .collect();
             let rows = u32::try_from(row_values.len()).unwrap();
             let x = kernels
@@ -499,7 +554,7 @@ mod tests {
                 consts: &weights.consts,
                 compile: false,
             };
-            let out = dense_rows(&mut ctx, w, &x).unwrap();
+            let out = dense_rows(&mut ctx, &weights.shape, w, &x, &post_norm).unwrap();
             assert_eq!(out.shape(), [rows, 64]);
             assert_eq!(out.dtype(), Dtype::F32);
             let got = values(&mut kernels, &out).unwrap();
@@ -535,15 +590,26 @@ mod tests {
         let mut seen = [false; 4];
         for n in 0..8u32 {
             let x = input(n);
-            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &x).unwrap();
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let post_norm = oracle.view().layers[0].post_norm;
+            let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
+            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
             let xr = upload(&mut kernels, &x);
             let mut ctx = Ctx {
                 kernels: &mut kernels,
                 consts: &w.consts,
                 compile: false,
             };
-            let (out, (routes, probs)) =
-                step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+            let (out, (routes, probs)) = step(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap();
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
             let experts: Vec<u32> = routes.iter().map(|r| r.0).collect();
             assert_eq!(experts, LAYER0_ROUTES[n as usize], "input {n} experts");
@@ -565,10 +631,13 @@ mod tests {
             assert_parity(&got, &want, &format!("input {n} output"));
         }
         assert_eq!(seen, [true; 4], "every expert is selected at least once");
-        // The router probabilities of input 2, read back, equal the CPU softmax of the router logits.
+        // The router probabilities of input 2, read back, equal the CPU softmax of the router
+        // logits over the normed row (the folded contract norms inside the block).
         let x = input(2);
+        let post_norm = oracle.view().layers[0].post_norm;
+        let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
         let logits = cpu
-            .linear(oracle.view().layers[0].as_moe().unwrap().router, &x)
+            .linear(oracle.view().layers[0].as_moe().unwrap().router, &normed_x)
             .unwrap();
         let max = logits.iter().copied().fold(f32::MIN, f32::max);
         let exps: Vec<f64> = logits.iter().map(|v| f64::from(v - max).exp()).collect();
@@ -580,7 +649,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (_, (_, probs)) = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (_, (_, probs)) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_parity(&probs, &want, "router probabilities of input 2");
     }
 
@@ -597,8 +673,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (_, (routes, probs)) =
-            step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (_, (routes, probs)) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(routes, [(0, 0.5), (1, 0.5)]);
         assert_eq!(probs, [0.25; 4]);
     }
@@ -616,7 +698,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         assert!(
             matches!(
                 failed,
@@ -635,7 +723,16 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        assert!(step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &good).is_ok());
+        assert!(
+            step(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &good,
+                &w.layers[0].post_norm
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -650,7 +747,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         assert!(
             matches!(failed, Err(EngError::BadRequest(_))),
             "{:?}",
@@ -664,7 +767,13 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let failed = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr);
+        let failed = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        );
         match failed {
             Err(EngError::BadRequest(message)) => assert!(
                 message.contains("moe router has 8 values, expected 4"),
@@ -687,7 +796,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (out, _) = step(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (out, _) = step(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(kernels.qualification_sync_count(), before + 2);
         drop(out);
     }
@@ -888,7 +1004,12 @@ mod tests {
         let mut cpu = CpuProjector::new(&ckpt, 1);
         for n in 0..8u32 {
             let x = input(n);
-            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &x).unwrap();
+            // The oracle models the block over pre-normed input and without the output
+            // residual; the seam folds both, so bridge the contract here.
+            let post_norm = oracle.view().layers[0].post_norm;
+            let normed_x = rms_plain(&x, post_norm, shape.eps).unwrap();
+            let want = host::moe_step(&mut cpu, &shape, &host_moe(&oracle, 0), &normed_x).unwrap();
+            let want: Vec<f32> = want.iter().zip(&x).map(|(a, b)| a + b).collect();
             let xr = upload(&mut kernels, &x);
             let (out, route) = {
                 let mut ctx = Ctx {
@@ -896,7 +1017,14 @@ mod tests {
                     consts: &w.consts,
                     compile: false,
                 };
-                step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+                step_device(
+                    &mut ctx,
+                    &shape,
+                    w.layers[0].as_moe().unwrap(),
+                    &xr,
+                    &w.layers[0].post_norm,
+                )
+                .unwrap()
             };
             assert_eq!(out.shape(), [1, 64], "input {n} output shape");
             assert_eq!(
@@ -930,7 +1058,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         assert_eq!(read_u32(&mut kernels, route.ids.ids()), [0, 1]);
         assert_eq!(values(&mut kernels, &route.gates).unwrap(), [0.5, 0.5]);
@@ -950,7 +1085,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &xr,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         let health = values(&mut kernels, &route.health).unwrap()[0];
         assert!(health.is_nan(), "health {health}");
@@ -962,7 +1104,14 @@ mod tests {
                 consts: &w.consts,
                 compile: false,
             };
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &good).unwrap()
+            step_device(
+                &mut ctx,
+                &shape,
+                w.layers[0].as_moe().unwrap(),
+                &good,
+                &w.layers[0].post_norm,
+            )
+            .unwrap()
         };
         let health = values(&mut kernels, &route.health).unwrap()[0];
         assert!((health - 1.0).abs() <= 1e-5, "health {health}");
@@ -986,7 +1135,8 @@ mod tests {
                 &mut ctx,
                 &shape,
                 w.layers[0].as_moe().unwrap(),
-                &xr
+                &xr,
+                &w.layers[0].post_norm
             )),
             "moe router has 8 values, expected 4"
         );
@@ -1005,8 +1155,14 @@ mod tests {
             consts: &w.consts,
             compile: false,
         };
-        let (out, route) =
-            step_device(&mut ctx, &shape, w.layers[0].as_moe().unwrap(), &xr).unwrap();
+        let (out, route) = step_device(
+            &mut ctx,
+            &shape,
+            w.layers[0].as_moe().unwrap(),
+            &xr,
+            &w.layers[0].post_norm,
+        )
+        .unwrap();
         assert_eq!(kernels.qualification_sync_count(), before);
         drop((out, route));
     }

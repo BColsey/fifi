@@ -1,6 +1,4 @@
-// Launch shim for the vendored gated_delta_k (kern::gated_delta in ops.cu). No kernel is
-// added; this file proves the arguments the kernel does not check and makes one extern "C" call.
-// The kernel is vendored xavier-qwen code.
+// Validated launches for the default vendored GDN kernel and the test-only state partition.
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,6 +7,7 @@
 #include "device.h"
 #include "ops.h"
 #include "resident/gdn_delta.h"
+#include "resident/gdn_delta_partition.cuh"
 
 namespace {
 
@@ -118,7 +117,8 @@ bool valid_snap(const inference_cuda_gdn_delta_snap_args &s) {
 
 }  // namespace
 
-extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args,
+template <bool Partitioned>
+int delta_launch(const inference_cuda_gdn_delta_args *args,
                                                void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -145,7 +145,8 @@ extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_ar
         call.n_v_heads = args->n_v_heads;
         call.eps = args->eps;
         Failure failure;
-        failure.record(kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(Partitioned ? gdn_partition::launch(call, (cudaStream_t)stream)
+                                   : kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
@@ -153,7 +154,8 @@ extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_ar
     }
 }
 
-extern "C" int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args,
+template <bool Partitioned>
+int delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args,
                                                     void *stream, int *out_stage) {
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
@@ -181,10 +183,31 @@ extern "C" int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_del
         call.n_v_heads = a.n_v_heads;
         call.eps = a.eps;
         Failure failure;
-        failure.record(kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
+        failure.record(Partitioned ? gdn_partition::launch(call, (cudaStream_t)stream)
+                                   : kern::gated_delta(call, (cudaStream_t)stream), INFERENCE_CUDA_STAGE_LAUNCH);
         report_stage(out_stage, failure.stage);
         return (int)failure.err;
     } catch (...) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
+}
+
+extern "C" int inference_cuda_gdn_delta_launch(const inference_cuda_gdn_delta_args *args,
+                                               void *stream, int *out_stage) {
+    return delta_launch<false>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_partition_launch(const inference_cuda_gdn_delta_args *args,
+                                                         void *stream, int *out_stage) {
+    return delta_launch<true>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_snap_launch(const inference_cuda_gdn_delta_snap_args *args,
+                                                    void *stream, int *out_stage) {
+    return delta_snap_launch<false>(args, stream, out_stage);
+}
+
+extern "C" int inference_cuda_gdn_delta_partition_snap_launch(const inference_cuda_gdn_delta_snap_args *args,
+                                                              void *stream, int *out_stage) {
+    return delta_snap_launch<true>(args, stream, out_stage);
 }

@@ -60,7 +60,7 @@ use crate::{
         gguf_model::Role,
         project::cuda::{
             CudaWeight, CudaWeights,
-            exl3::{Exl3Io, Exl3Weight},
+            exl3::{Exl3Io, Exl3JobsIo, Exl3Weight},
         },
         qwen36::cuda::{
             exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
@@ -70,6 +70,7 @@ use crate::{
     kernels::cuda::{
         CudaContext, DeviceArena, DeviceBuffer, DeviceRange, DeviceStream,
         resident::{
+            exl3::Exl3Job,
             hyper::{
                 HyperApplyCall, HyperDtype, HyperReadCall, HyperScratch, HyperShape, HyperWeights,
             },
@@ -105,6 +106,9 @@ pub(super) struct FlashStep<'a> {
     /// the block output to the stream instead.
     zeros: DeviceBuffer,
     pub(super) layers: std::ops::Range<usize>,
+    /// The plan's row count: every launch takes `m` rows with `m <= rows` (decode is 1, a chunk
+    /// is its token count). The slots hold this many rows.
+    pub(super) rows: usize,
     /// Set by any error of a launch call; cleared by [`Self::reset`].
     poisoned: Cell<bool>,
 }
@@ -118,6 +122,7 @@ impl<'a> FlashStep<'a> {
         weights: &'a CudaWeights,
         model_config: &[u8],
         positions: usize,
+        rows: usize,
         layers: std::ops::Range<usize>,
     ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
@@ -130,10 +135,10 @@ impl<'a> FlashStep<'a> {
         }
         let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
         let options = StepOptions::default();
-        let step_plan = StepPlan::new(&geometry, 1, positions, &options)?;
+        let step_plan = StepPlan::new(&geometry, rows, positions, &options)?;
         let state = ctx.arena(&state_plan.arena_tensors())?;
         let scratch = ctx.arena(&step_plan.arena_tensors())?;
-        let zeros = ctx.upload(&vec![0u8; geometry.hidden * F32])?;
+        let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
         let step = Self {
             ctx,
             stream,
@@ -147,6 +152,7 @@ impl<'a> FlashStep<'a> {
             scratch,
             zeros,
             layers,
+            rows,
             poisoned: Cell::new(false),
         };
         step.reset()?;
@@ -291,19 +297,146 @@ impl<'a> FlashStep<'a> {
         prefix: &str,
         x: DeviceRange<'_>,
         out: DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        self.check_rows(m)?;
+        let weight = self.exl3(prefix)?;
+        if m == 1 {
+            let view = weight.view()?;
+            let io = Exl3Io {
+                x,
+                xh: self.slot(Slot::Exl3Xh)?,
+                z: self.slot(Slot::Exl3Z)?,
+                out,
+                flag: self.slot(Slot::Exl3Flag)?,
+                rows: m,
+                fused: false,
+            };
+            return self.ctx.exl3_linear(self.stream, view.linear_call(&io));
+        }
+        // The job-table path: the out of many rows is strided (`out_ld` per row), which the
+        // contiguous single-row call cannot express.
+        let [_, n] = weight.shape;
+        self.exl3_jobs(prefix, x, out, n, 0, m)
+    }
+
+    /// The projection of `m` rows into `n` floats at column `col_off` of a `ld`-wide row
+    /// (`DeltaProj`/`AttnProj`): one row writes its columns as today, many rows run the job
+    /// table.
+    pub(super) fn project_cols(
+        &self,
+        prefix: &str,
+        x: DeviceRange<'_>,
+        row: DeviceRange<'_>,
+        col_off: usize,
+        n: usize,
+        ld: usize,
+        m: usize,
+    ) -> Result<(), EngError> {
+        if m == 1 {
+            let out = Self::columns(&row, col_off, n)?;
+            return self.project(prefix, x, out, 1);
+        }
+        self.check_rows(m)?;
+        self.exl3_jobs(prefix, x, row, ld, col_off, m)
+    }
+
+    /// The job-table projection behind [`Self::project`] and [`Self::project_cols`].
+    fn exl3_jobs(
+        &self,
+        prefix: &str,
+        x: DeviceRange<'_>,
+        out: DeviceRange<'_>,
+        out_ld: usize,
+        out_col: usize,
+        m: usize,
     ) -> Result<(), EngError> {
         let weight = self.exl3(prefix)?;
-        let view = weight.view()?;
-        let io = Exl3Io {
+        let members = weight.members()?;
+        let jobs = self.slot(Slot::Exl3Jobs)?;
+        let io = Exl3JobsIo {
             x,
             xh: self.slot(Slot::Exl3Xh)?,
             z: self.slot(Slot::Exl3Z)?,
             out,
             flag: self.slot(Slot::Exl3Flag)?,
-            rows: 1,
-            fused: false,
+            jobs,
+            jobs_count: 1,
+            max_rows: m,
+            total_rows: m,
+            out_ld,
+            out_col,
         };
-        self.ctx.exl3_linear(self.stream, view.linear_call(&io))
+        self.ctx.exl3_jobs(self.stream, members.jobs_call(&io))
+    }
+
+    /// The input projections `parts` as one grouped launch: part `(prefix, col, n)` writes the
+    /// `n` floats of column `col` of `row`, exactly as one [`Self::project`] call per part would;
+    /// only the kernel grouping changes. The scratch slices follow group order, so the plan sizes
+    /// them for the member sums ([`exl3_scratch`]); the flag is shared, as in every group this
+    /// engine launches.
+    pub(super) fn project_group(
+        &self,
+        parts: &[(&str, usize, usize)],
+        x: DeviceRange<'_>,
+        row: &DeviceRange<'_>,
+        m: usize,
+    ) -> Result<(), EngError> {
+        let (xh, z, flag) = (
+            self.slot(Slot::Exl3Xh)?,
+            self.slot(Slot::Exl3Z)?,
+            self.slot(Slot::Exl3Flag)?,
+        );
+        let mut xh_at = xh.offset();
+        let mut z_at = z.offset();
+        // The grouped launch takes one width per group (exl3.cu group_args: every call's k and n
+        // equal the first's), so the guards below refuse a mixer change that mixes widths.
+        let group_n = parts.first().map(|&(_, _, n)| n);
+        // The views and their io outlive the calls that borrow them: collect the members first,
+        // then build the calls in a second pass.
+        let mut members = Vec::with_capacity(parts.len());
+        let mut group_k: Option<usize> = None;
+        for (prefix, col, n) in parts {
+            if Some(*n) != group_n {
+                return Err(refuse(format!(
+                    "{prefix} is {n} wide, the group takes one width ({:?})",
+                    group_n
+                )));
+            }
+            let view = self.exl3(prefix)?.view()?;
+            let [k, wide] = view.shape;
+            if group_k.is_some_and(|gk| gk != k) {
+                return Err(refuse(format!(
+                    "{prefix} reads a {k} wide input, the group takes one input width ({:?})",
+                    group_k
+                )));
+            }
+            group_k = Some(k);
+            if wide != *n {
+                return Err(refuse(format!(
+                    "{prefix} is {wide} wide, the mixer row expects {n}"
+                )));
+            }
+            members.push((
+                view,
+                Exl3Io {
+                    x,
+                    xh: xh.buffer().range(xh_at, k * F32)?,
+                    z: z.buffer().range(z_at, n * F32)?,
+                    out: Self::columns(row, *col, *n)?,
+                    flag,
+                    rows: m,
+                    fused: false,
+                },
+            ));
+            xh_at += k * F32;
+            z_at += n * F32;
+        }
+        let calls: Vec<_> = members
+            .iter()
+            .map(|(view, io)| view.linear_call(io))
+            .collect();
+        self.ctx.exl3_grouped_step(self.stream, &calls)
     }
 
     /// `width` floats of `row` from float column `col`.
@@ -315,9 +448,9 @@ impl<'a> FlashStep<'a> {
         row.buffer().range(row.offset() + col * F32, width * F32)
     }
 
-    fn hyper_shape(&self) -> HyperShape {
+    fn hyper_shape(&self, m: usize) -> HyperShape {
         HyperShape {
-            m: 1,
+            m,
             branches: self.geometry.branches,
             hidden: self.geometry.hidden,
             rank: self.geometry.rank,
@@ -326,7 +459,7 @@ impl<'a> FlashStep<'a> {
 
     /// The read of the hyper-connection site under `prefix`: the mixed row of `site` and, with an
     /// inject projection, its gate.
-    pub(super) fn hyper_read(&self, site: Site, prefix: &str) -> Result<(), EngError> {
+    pub(super) fn hyper_read(&self, site: Site, prefix: &str, m: usize) -> Result<(), EngError> {
         let inject = site != Site::Final;
         let (norm, dtype) = self.half(&format!("{prefix}.hc_norm.weight"))?;
         let (down, down_dtype) = self.half(&format!("{prefix}.input_mix_weight_down.weight"))?;
@@ -346,7 +479,7 @@ impl<'a> FlashStep<'a> {
         self.ctx.hyper_read(
             self.stream,
             HyperReadCall {
-                shape: self.hyper_shape(),
+                shape: self.hyper_shape(m),
                 eps: self.model.hyper.eps(),
                 x: self.slot(Slot::Stream)?,
                 weights: HyperWeights {
@@ -371,12 +504,12 @@ impl<'a> FlashStep<'a> {
         )
     }
 
-    /// `Stream += gate * block` for the site.
-    pub(super) fn hyper_apply(&self, site: Site) -> Result<(), EngError> {
+    /// `Stream += gate * block` for the site's `m` rows.
+    pub(super) fn hyper_apply(&self, site: Site, m: usize) -> Result<(), EngError> {
         self.ctx.hyper_apply(
             self.stream,
             HyperApplyCall {
-                shape: self.hyper_shape(),
+                shape: self.hyper_shape(m),
                 x: self.slot(Slot::Stream)?,
                 gate: self.slot(Slot::Gate(site))?,
                 block: self.slot(Slot::BlockOut(site))?,
@@ -386,9 +519,9 @@ impl<'a> FlashStep<'a> {
 
     // ------------------------------------------------------------------ the MoE seam
 
-    pub(super) fn moe_dims(&self) -> MoeDims {
+    pub(super) fn moe_dims(&self, m: usize) -> MoeDims {
         MoeDims {
-            rows: 1,
+            rows: m,
             hidden: self.geometry.hidden,
             n_expert: self.geometry.experts,
             top_k: self.geometry.top_k,
@@ -416,23 +549,81 @@ impl<'a> FlashStep<'a> {
     /// The buffers of the MoE block, views of the plan's slots: the block reads `Mixed(Mlp)` and
     /// writes `BlockOut(Mlp)` (no residual: the hyper apply adds it to the stream).
     pub(super) fn moe_bufs(&self) -> Result<Exl3MoeBufs<'_>, EngError> {
+        self.moe_bufs_at(0)
+    }
+
+    /// The buffers of row `r` of the plan's multi-row slots: the split block runs one row at a
+    /// time (M1D lifts it), so a chunk loops it per row.
+    fn moe_bufs_at(&self, r: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
+        let g = &self.geometry;
+        let at = |slot: Slot, width: usize| -> Result<DeviceRange<'_>, EngError> {
+            let range = self.slot(slot)?;
+            range
+                .buffer()
+                .range(range.offset() + r * width * F32, width * F32)
+        };
+        let shared_gu = at(Slot::SharedGu, 2 * g.shared_inter)?;
+        let shared_act = at(Slot::SharedAct, g.shared_inter)?;
+        let expert_gu = at(Slot::ExpertGu, g.top_k * 2 * g.inter)?;
+        let expert_act = at(Slot::ExpertAct, g.top_k * g.inter)?;
+        let expert_down = at(Slot::ExpertDown, g.top_k * g.hidden)?;
+        let ids = self.slot(Slot::TopkId)?;
+        let ids = ids
+            .buffer()
+            .range(ids.offset() + r * g.top_k * F32, g.top_k * F32)?;
+        Ok(Exl3MoeBufs {
+            route: RouteBufs {
+                resid_in: self.zeros.range(r * g.hidden * F32, g.hidden * F32)?,
+                resid_out: at(Slot::BlockOut(Site::Mlp), g.hidden)?,
+                norm_row: at(Slot::Mixed(Site::Mlp), g.hidden)?,
+                logits: at(Slot::RouterLogits, g.experts + 1)?,
+                ids,
+                weights: at(Slot::TopkWeight, g.top_k)?,
+                shared_gate: at(Slot::SharedGate, 1)?,
+                status: self.status_word()?,
+            },
+            expert_gu,
+            expert_act,
+            expert_down,
+            shared_gu,
+            shared_act,
+            shared_out: at(Slot::SharedOut, g.hidden)?,
+            scratch: Scratch {
+                xh: self.slot(Slot::Exl3Xh)?,
+                z: self.slot(Slot::Exl3Z)?,
+                flag: self.slot(Slot::Exl3Flag)?,
+            },
+        })
+    }
+
+    /// The buffers of the MoE block over all `m` rows at once: every slot spans `m` rows and
+    /// the residual input is the plan's zero rows. The batched block
+    /// ([`MoeBlock::run_rows`]); `m` must match the plan's row count.
+    pub(super) fn moe_bufs_rows(&self, m: usize) -> Result<Exl3MoeBufs<'_>, EngError> {
+        let g = &self.geometry;
+        let at = |slot: Slot, width: usize| -> Result<DeviceRange<'_>, EngError> {
+            let range = self.slot(slot)?;
+            range.buffer().range(range.offset(), width * m * F32)
+        };
+        let ids = self.slot(Slot::TopkId)?;
+        let ids = ids.buffer().range(ids.offset(), g.top_k * m * F32)?;
         Ok(Exl3MoeBufs {
             route: RouteBufs {
                 resid_in: self.zeros.range(0, self.zeros.bytes())?,
-                resid_out: self.slot(Slot::BlockOut(Site::Mlp))?,
-                norm_row: self.slot(Slot::Mixed(Site::Mlp))?,
-                logits: self.slot(Slot::RouterLogits)?,
-                ids: self.slot(Slot::TopkId)?,
-                weights: self.slot(Slot::TopkWeight)?,
-                shared_gate: self.slot(Slot::SharedGate)?,
+                resid_out: at(Slot::BlockOut(Site::Mlp), g.hidden)?,
+                norm_row: at(Slot::Mixed(Site::Mlp), g.hidden)?,
+                logits: at(Slot::RouterLogits, g.experts + 1)?,
+                ids,
+                weights: at(Slot::TopkWeight, g.top_k)?,
+                shared_gate: at(Slot::SharedGate, 1)?,
                 status: self.status_word()?,
             },
-            expert_gu: self.slot(Slot::ExpertGu)?,
-            expert_act: self.slot(Slot::ExpertAct)?,
-            expert_down: self.slot(Slot::ExpertDown)?,
-            shared_gu: self.slot(Slot::SharedGu)?,
-            shared_act: self.slot(Slot::SharedAct)?,
-            shared_out: self.slot(Slot::SharedOut)?,
+            expert_gu: at(Slot::ExpertGu, g.top_k * 2 * g.inter)?,
+            expert_act: at(Slot::ExpertAct, g.top_k * g.inter)?,
+            expert_down: at(Slot::ExpertDown, g.top_k * g.hidden)?,
+            shared_gu: at(Slot::SharedGu, 2 * g.shared_inter)?,
+            shared_act: at(Slot::SharedAct, g.shared_inter)?,
+            shared_out: at(Slot::SharedOut, g.hidden)?,
             scratch: Scratch {
                 xh: self.slot(Slot::Exl3Xh)?,
                 z: self.slot(Slot::Exl3Z)?,
@@ -443,12 +634,26 @@ impl<'a> FlashStep<'a> {
 
     /// The MoE block of `layer` at the phases `Route` to `Combine`, run by `moe`: the output lands
     /// in `BlockOut(Mlp)`.
-    pub(super) fn moe_block(&self, layer: usize, moe: &mut dyn MoeBlock) -> Result<(), EngError> {
+    pub(super) fn moe_block(
+        &self,
+        layer: usize,
+        moe: &mut dyn MoeBlock,
+        m: usize,
+    ) -> Result<(), EngError> {
         let launch = Launch {
             ctx: self.ctx,
             stream: self.stream,
         };
-        moe.run(&launch, layer, &self.moe_bufs()?, &self.moe_dims())
+        // The split block takes a chunk in one call; every other block loops one row.
+        if m > 1 && moe.batches_rows() {
+            return moe.run_rows(&launch, layer, &self.moe_bufs_rows(m)?, &self.moe_dims(m));
+        }
+        // The split block runs one row; a chunk loops it over its rows.
+        let dims = self.moe_dims(1);
+        for r in 0..m {
+            moe.run(&launch, layer, &self.moe_bufs_at(r)?, &dims)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ layers and the tail
@@ -459,32 +664,51 @@ impl<'a> FlashStep<'a> {
         &self,
         layer: usize,
         pos: usize,
+        m: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let result = (|| {
-            self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"))?;
-            self.mixer(layer, pos)?;
-            self.hyper_apply(Site::Attn)?;
-            self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"))?;
-            self.moe_block(layer, moe)?;
-            self.hyper_apply(Site::Mlp)
+            self.hyper_read(Site::Attn, &layer_name(layer, "attn_hyper_connection"), m)?;
+            self.mixer(layer, pos, m)?;
+            self.hyper_apply(Site::Attn, m)?;
+            self.hyper_read(Site::Mlp, &layer_name(layer, "mlp_hyper_connection"), m)?;
+            self.moe_block(layer, moe, m)?;
+            self.hyper_apply(Site::Mlp, m)
         })();
         self.poison_on(result)
     }
 
     /// The final mixer and `lm_head`: the logits land in the `Logits` slot.
-    pub(super) fn head(&self) -> Result<(), EngError> {
+    pub(super) fn head(&self, m: usize) -> Result<(), EngError> {
         self.ensure_usable()?;
         let result = (|| {
-            self.hyper_read(Site::Final, MIXER)?;
+            self.hyper_read(Site::Final, MIXER, m)?;
             self.project(
                 "lm_head",
                 self.slot(Slot::Mixed(Site::Final))?,
                 self.slot(Slot::Logits)?,
+                m,
             )
         })();
         self.poison_on(result)
+    }
+
+    /// `begin_token` plus the dense job table of an `m`-row chunk: the job-table projections of
+    /// `m > 1` rows read it. The table write waits for the stream, so it runs once per chunk.
+    pub(super) fn begin_chunk(&self, m: usize) -> Result<(), EngError> {
+        self.begin_token()?;
+        self.check_rows(m)?;
+        // A chunk of at most MAX_STEP_ROWS (< 256) rows is one tile of member 0.
+        let job = Exl3Job {
+            member: 0,
+            row0: 0,
+            rows: m as u32,
+        };
+        let table = self.slot(Slot::Exl3Jobs)?;
+        table
+            .buffer()
+            .write_at(self.stream, table.offset(), &Exl3Job::table(&[job]))
     }
 
     /// Clears the sticky EXL3 flag and the status word: the first launch of a token.
@@ -541,6 +765,7 @@ impl<'a> FlashStep<'a> {
         &self,
         range: std::ops::Range<usize>,
         pos: usize,
+        m: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
         if range.start >= range.end
@@ -553,7 +778,7 @@ impl<'a> FlashStep<'a> {
             )));
         }
         self.check_ple(&range)?;
-        self.run_range(range, pos, moe)
+        self.run_range(range, pos, m, moe)
     }
 
     /// `run_layers` over the whole window, for the tests, which run a window across the PLE layer
@@ -562,19 +787,33 @@ impl<'a> FlashStep<'a> {
     pub(super) fn run_layers_without_ple(
         &self,
         pos: usize,
+        m: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
-        self.run_range(self.layers.clone(), pos, moe)
+        self.run_range(self.layers.clone(), pos, m, moe)
     }
 
     fn run_range(
         &self,
         range: std::ops::Range<usize>,
         pos: usize,
+        m: usize,
         moe: &mut dyn MoeBlock,
     ) -> Result<(), EngError> {
+        self.check_rows(m)?;
         for layer in range {
-            self.run_layer(layer, pos, moe)?;
+            self.run_layer(layer, pos, m, moe)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a row count the plan does not hold.
+    fn check_rows(&self, m: usize) -> Result<(), EngError> {
+        if m == 0 || m > self.rows {
+            return Err(refuse(format!(
+                "{m} rows, the step's plan holds 1 to {}",
+                self.rows
+            )));
         }
         Ok(())
     }
@@ -632,6 +871,25 @@ pub(super) trait MoeBlock {
         bufs: &Exl3MoeBufs<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError>;
+
+    /// Whether [`MoeBlock::run_rows`] takes a multi-row chunk in one call.
+    fn batches_rows(&self) -> bool {
+        false
+    }
+
+    /// The block over `dims.rows` rows of `bufs` (every buffer spans that many rows). Only
+    /// called when [`MoeBlock::batches_rows`] says so.
+    fn run_rows(
+        &mut self,
+        _launch: &Launch<'_>,
+        _layer: usize,
+        _bufs: &Exl3MoeBufs<'_>,
+        _dims: &MoeDims,
+    ) -> Result<(), EngError> {
+        Err(EngError::BadRequest(
+            "this MoE block has no multi-row path".into(),
+        ))
+    }
 }
 
 /// The stand-in until the split block lands: Qwen3.6's EXL3 MoE block over routed experts that
@@ -656,7 +914,9 @@ impl MoeBlock for AllResidentMoe<'_> {
                 .map(|(_, name)| name.as_str())
                 .ok_or_else(|| refuse(format!("layer {layer} has no key for {role:?}")))
         })?;
-        run_exl3_moe(launch, &weights, bufs, dims, true)
+        // Flash-Next runs the captured block; the q36 expert bank never reaches it (the
+        // bank is a q36 member and the eager read path is the resolver's).
+        run_exl3_moe(launch, &weights, bufs, dims, true, None)
     }
 }
 
@@ -718,6 +978,11 @@ impl<'w> SplitMoeAt<'w> {
             rows: layers.len(),
         })
     }
+
+    /// The bank behind the split block (its counters and slot row).
+    pub(super) fn bank(&self) -> &super::bank::device::DeviceBank {
+        self.inner.bank()
+    }
 }
 
 impl MoeBlock for SplitMoeAt<'_> {
@@ -739,5 +1004,29 @@ impl MoeBlock for SplitMoeAt<'_> {
                 ))
             })?;
         self.inner.run(launch, row, bufs, dims)
+    }
+
+    fn batches_rows(&self) -> bool {
+        true
+    }
+
+    fn run_rows(
+        &mut self,
+        launch: &Launch<'_>,
+        layer: usize,
+        bufs: &Exl3MoeBufs<'_>,
+        dims: &MoeDims,
+    ) -> Result<(), EngError> {
+        let row = layer
+            .checked_sub(self.first_layer)
+            .filter(|&row| row < self.rows)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is outside the bank's layers {}..{}",
+                    self.first_layer,
+                    self.first_layer + self.rows
+                ))
+            })?;
+        self.inner.run_rows(launch, row, bufs, dims)
     }
 }

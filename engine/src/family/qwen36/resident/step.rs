@@ -121,14 +121,12 @@ pub(super) fn run(
         trace::begin_step()
     };
     for (index, (layer, old_layer)) in weights.layers.iter().zip(old).enumerate() {
-        let normed = ctx.kernels.rms_norm(&h, &layer.input_norm, shape.eps)?;
-        check_dtype("input norm output", &normed, ctx.consts.act)?;
-        // The old layer state moves into its arm: an attention cache is consumed by `kv_append`
-        // (a growth replaces the buffer), and a DeltaNet state drops at the end of the arm, after
-        // the replacement graph exists. The next synchronization frees the dropped arrays.
+        // The folded glue: each block owns its input norm and its output residual add (the
+        // compiled closures bake them; the eager arms run the same ops in the same order), so
+        // the loop only sequences blocks and keeps the trace hook.
         let (mixed, next) = match (&layer.mixer, old_layer) {
             (RMixer::Delta(w), LayerState::Delta { rec, ring }) => {
-                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &normed)?;
+                let s = delta::step(&mut ctx, shape, w, &rec, &ring, &h, &layer.input_norm)?;
                 (
                     s.out,
                     LayerState::Delta {
@@ -138,7 +136,7 @@ pub(super) fn run(
                 )
             }
             (RMixer::Attn(w), LayerState::Attn(cache)) => {
-                let s = attn::step(&mut ctx, shape, w, cache, pos, &normed)?;
+                let s = attn::step(&mut ctx, shape, w, cache, pos, &h, &layer.input_norm)?;
                 (s.out, LayerState::Attn(s.cache))
             }
             _ => {
@@ -148,7 +146,8 @@ pub(super) fn run(
             }
         };
         layers.push(next);
-        let mid = ctx.kernels.binary(BinaryOp::Add, &h, &mixed)?;
+        // `mixed` is the residual sum already: the mixer folded the `h + mixed` add.
+        let mid = mixed;
         if let Some(trace_step) = trace_step {
             trace::hidden(&mut ctx, index, trace_step, &mid)?;
         }
@@ -157,12 +156,13 @@ pub(super) fn run(
             h = mid;
             break;
         }
-        let normed = ctx.kernels.rms_norm(&mid, &layer.post_norm, shape.eps)?;
-        check_dtype("post norm output", &normed, ctx.consts.act)?;
         let routed = match (&layer.feed_forward, routing) {
-            (RFeedForward::Dense(w), _) => moe::dense_rows(&mut ctx, w, &normed)?,
+            (RFeedForward::Dense(w), _) => {
+                moe::dense_rows(&mut ctx, shape, w, &mid, &layer.post_norm)?
+            }
             (RFeedForward::Moe(w), Routing::Host) => {
-                let (out, (selection, probs)) = moe::step(&mut ctx, shape, w, &normed)?;
+                let (out, (selection, probs)) =
+                    moe::step(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 if mode == StepMode::Record {
                     host_routes.push(selection.iter().map(|pick| pick.0).collect());
                     host_probs.push(probs);
@@ -170,7 +170,7 @@ pub(super) fn run(
                 out
             }
             (RFeedForward::Moe(w), Routing::Device) => {
-                let (out, route) = moe::step_device(&mut ctx, shape, w, &normed)?;
+                let (out, route) = moe::step_device(&mut ctx, shape, w, &mid, &layer.post_norm)?;
                 health = Some(match health.take() {
                     Some(sum) => ctx.kernels.binary(BinaryOp::Add, &sum, &route.health)?,
                     None => route.health,
@@ -181,7 +181,8 @@ pub(super) fn run(
                 out
             }
         };
-        h = ctx.kernels.binary(BinaryOp::Add, &mid, &routed)?;
+        // `routed` is the next residual stream already: the FFN folded the `mid + routed` add.
+        h = routed;
         // MLX promotes mixed operands, so a stray F32 operand would turn BF16 activations back to
         // F32 without an error. The check keeps a BF16 run honest.
         check_dtype("layer output", &h, ctx.consts.act)?;
@@ -203,6 +204,11 @@ pub(super) fn run(
     // The head. `Prompt` skips the norm, `lm_head`, and the argmax.
     let head = match mode {
         StepMode::Prompt => None,
+        StepMode::Window => {
+            return Err(EngError::BadRequest(
+                "a verify window needs the chunk path: a one-row step has no window".into(),
+            ));
+        }
         StepMode::Generate | StepMode::Logits | StepMode::Record => {
             let final_h = ctx.kernels.rms_norm(&h, &weights.final_norm, shape.eps)?;
             let logits = linear(&mut ctx, &weights.lm_head, &final_h)?;
@@ -307,6 +313,7 @@ pub(super) fn run(
     };
     state.commit(layers, permit)?;
     Ok(StepResult {
+        window_logits: None,
         token: token_out,
         logits: logits_out,
         layer_out,
@@ -691,6 +698,7 @@ mod tests {
                     StepMode::Prompt => assert_eq!(
                         got,
                         StepResult {
+                            window_logits: None,
                             token: None,
                             logits: None,
                             layer_out: None,
@@ -702,6 +710,7 @@ mod tests {
                     StepMode::Generate => assert_eq!(
                         got,
                         StepResult {
+                            window_logits: None,
                             token: Some(want_token),
                             logits: None,
                             layer_out: None,
@@ -710,6 +719,7 @@ mod tests {
                         },
                         "{what}"
                     ),
+                    StepMode::Window => unreachable!("a one-row step refuses Window"),
                     StepMode::Logits => unreachable!("not used here"),
                     StepMode::Record => {
                         assert_eq!(got.token, Some(want_token), "{what}: argmax");
@@ -1369,10 +1379,14 @@ mod tests {
     /// The end-to-end bit equality of a short decode. Eight `Record` steps of the tiny GQA model
     /// must return the SAME tokens and the SAME logit bits on the trimmed graph (one clamp per
     /// layer, no no-op contiguous nodes) as the frozen expectation from the untrimmed graph, in F32
-    /// and in BF16. The comparison is on `f32::to_bits`.
+    /// and in BF16. The comparison is on `f32::to_bits` - except under `Q36_FUSED_DECODE=1`, where
+    /// the fused `delta_middle` kernel reorders the middle math (a last-digit difference per step,
+    /// within the parity tolerance) and the logits compare with `assert_parity` instead; the
+    /// tokens stay exact either way, and re-freezing happens the day the flag flips default on.
     #[test]
     fn eight_decode_steps_match_the_frozen_expectation_in_f32_and_bf16() {
         let freeze = std::env::var_os("GAP_TRIM_FREEZE").is_some();
+        let fused = super::super::delta::fused_decode_enabled();
         for (name, activation, frozen) in [
             ("FROZEN_F32", Activation::F32, &FROZEN_F32),
             ("FROZEN_BF16", Activation::Bf16, &FROZEN_BF16),
@@ -1398,6 +1412,10 @@ mod tests {
                     want.len(),
                     "{name} step {step}: the vocabulary width"
                 );
+                if fused {
+                    super::super::ops::assert_parity(got, want, &format!("{name} step {step}"));
+                    continue;
+                }
                 for (index, (got, want)) in got.iter().zip(want).enumerate() {
                     assert_eq!(
                         got.to_bits(),

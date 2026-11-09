@@ -30,7 +30,7 @@ fn bank(held: &[u16]) -> ExpertBankState<ReplaceOnMissLru> {
     }
     // The least popular holder is the first victim: count by id, so a low id is evicted last.
     let counts = vec![(0..EXPERTS as u64).rev().collect::<Vec<u64>>()];
-    let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts).unwrap();
+    let policy = ReplaceOnMissLru::from_fill(geometry, &[row.as_slice()], &counts, None).unwrap();
     ExpertBankState::with_policy(geometry, HostMode::Exclusive, policy).unwrap()
 }
 
@@ -138,7 +138,7 @@ fn close(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn the_private_scratch_is_aligned_disjoint_and_small() {
-    let layout = ScratchLayout::new(512, 10, 2560).unwrap();
+    let layout = ScratchLayout::new(512, 10, 2560, 1).unwrap();
     let regions = [
         (layout.slot_row, 512 * 4),
         (layout.slot_ids, 40),

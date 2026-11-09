@@ -51,6 +51,21 @@ pub(super) fn inspect_pack(
     source: &StreamedCheckpoint,
     shape: &HostShape,
 ) -> Result<PackReport, EngError> {
+    inspect_pack_split(source, shape).map(|split| split.report)
+}
+
+/// The pack walk plus its expert/dense split: `routed_bytes` is the device bytes of the routed
+/// experts alone (the banks a banked load replaces with `slots` members per projection), so
+/// `report.device_bytes - routed_bytes` is what a banked load still uploads.
+pub(super) struct PackSplit {
+    pub(super) report: PackReport,
+    pub(super) routed_bytes: u64,
+}
+
+pub(super) fn inspect_pack_split(
+    source: &StreamedCheckpoint,
+    shape: &HostShape,
+) -> Result<PackSplit, EngError> {
     let mut walk = Inspector::new(source, Root::Layers);
     let dim = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     let h = shape.hidden;
@@ -64,6 +79,7 @@ pub(super) fn inspect_pack(
     }
     walk.plain(NORM_NAME, &[dim(h)], false)?;
     walk.matrix(HEAD_PREFIX, h, shape.vocab)?;
+    let mut routed_total = 0u64;
     for (layer, kind) in shape.kinds.iter().enumerate() {
         walk.plain(
             &walk.root().name(layer, "input_layernorm.weight"),
@@ -80,9 +96,13 @@ pub(super) fn inspect_pack(
             AttentionKind::DeltaNet => walk.delta(layer, shape)?,
             other => return Err(refuse(format!("layer {layer} is {other:?}"))),
         }
-        walk.moe(layer, shape)?;
+        routed_total = routed_total.saturating_add(walk.moe(layer, shape)?);
     }
-    walk.report()
+    let report = walk.report()?;
+    Ok(PackSplit {
+        report,
+        routed_bytes: routed_total,
+    })
 }
 
 impl Inspector<'_> {
@@ -142,7 +162,8 @@ impl Inspector<'_> {
         Ok(())
     }
 
-    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<(), EngError> {
+    /// The routed-expert device bytes of the layer (see [`Inspector::moe_block`]).
+    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<u64, EngError> {
         let m = &shape.moe;
         self.moe_block(
             layer,
@@ -152,8 +173,7 @@ impl Inspector<'_> {
                 inter: m.inter,
                 shared_inter: m.shared_inter,
             },
-        )?;
-        Ok(())
+        )
     }
 }
 

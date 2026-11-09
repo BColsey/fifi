@@ -594,6 +594,21 @@ impl Sampler {
         handle
     }
 
+    /// Records an already-selected device argmax without changing the token or RNG state.
+    /// Like host greedy sampling, this records one kept token and no probabilities.
+    #[cfg_attr(
+        not(any(test, all(feature = "native-cuda", target_os = "linux"))),
+        expect(dead_code, reason = "used by the CUDA device argmax")
+    )]
+    pub(crate) fn record_device_greedy(&self, token: u32) {
+        debug_assert!(self.is_greedy());
+        if self.capture.is_some() {
+            let mut observation = SampleObservation::default();
+            observation.fill_greedy(token);
+            self.record(&observation);
+        }
+    }
+
     /// Appends one recorded decision. The selected entry's probability comes from
     /// the observation's own candidates — the selected entry is always present
     /// there — so no walk is repeated.
@@ -3180,5 +3195,34 @@ mod tests {
             assert!(recorded.candidates.is_empty());
         }
         assert_eq!(sampler.rng_state(), before);
+    }
+
+    #[test]
+    fn device_greedy_capture_matches_host_observations_and_limits() {
+        let rows = [
+            vec![0.0, 4.0, 1.0],
+            vec![3.0, 2.0, 1.0],
+            vec![0.0, 1.0, 5.0],
+        ];
+        let mut host = Sampler::greedy();
+        let mut device = Sampler::greedy();
+        let host_trace = host.arm_capture(2);
+        let device_trace = device.arm_capture(2);
+        let rng_before = device.rng_state();
+        for row in rows {
+            let selected = host.sample(&row).expect("host greedy token");
+            device.record_device_greedy(selected);
+        }
+        let host_trace = host_trace.lock().expect("host trace");
+        let device_trace = device_trace.lock().expect("device trace");
+        assert_eq!(device_trace.positions, host_trace.positions);
+        assert!(device_trace.truncated);
+        assert_eq!(device.rng_state(), rng_before);
+
+        let unarmed = Sampler::greedy();
+        let unarmed_rng = unarmed.rng_state();
+        unarmed.record_device_greedy(7);
+        assert!(unarmed.capture.is_none());
+        assert_eq!(unarmed.rng_state(), unarmed_rng);
     }
 }

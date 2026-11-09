@@ -156,6 +156,9 @@ pub(super) enum Slot {
     Exl3Xh,
     Exl3Z,
     Exl3Flag,
+    /// The device job table of a chunk's job-table projections: one entry (a chunk of at most
+    /// `MAX_STEP_ROWS` rows is one tile), 16 bytes.
+    Exl3Jobs,
     /// f32 `[rows][vocab]`.
     Logits,
     ArgmaxPart,
@@ -321,6 +324,10 @@ fn exl3_scratch(geometry: &FlashGeometry, rows: usize) -> Result<(usize, usize),
         (rows, h, qsa.kv_width()),
         (rows, h, qsa.idx_proj()),
         (rows, qsa.q_width(), h),
+        // the grouped k and v input projections of the QSA mixer: both read the same k and share
+        // kv_width, the one mixer pair the grouped launch's single-width contract allows (the
+        // tuple counts members as rows, so z covers both members' outputs)
+        (2 * rows, h, qsa.kv_width()),
         // PLE: key and value projections of the n-gram row
         (rows, geometry.ple_embed, geometry.width()),
         (rows, geometry.ple_embed, h),
@@ -527,6 +534,7 @@ fn list_slots(
     list.add(Slot::Exl3Z, Ok(z), Phase::Ple, Phase::LmHead)?;
     // The step clears the flag at StepBegin and folds it into the status just before the argmax.
     list.add(Slot::Exl3Flag, Ok(4), Phase::StepBegin, Phase::Argmax)?;
+    list.add(Slot::Exl3Jobs, Ok(16), Phase::StepBegin, Phase::Argmax)?;
     list.add(
         Slot::Logits,
         list.row(geometry.vocab),

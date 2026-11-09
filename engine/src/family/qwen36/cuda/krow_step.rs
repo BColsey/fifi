@@ -46,7 +46,7 @@
 //! the one `k`. Moving the construction before the first launch is a later change.
 
 use super::super::{
-    exl3_moe::{Exl3MoeBufs, Scratch, run_exl3_moe_rows},
+    exl3_moe::{Exl3MoeBufs, Scratch, run_exl3_moe_rows, run_exl3_moe_rows_banked},
     krow_ops::{KrowIoLayout, Place, RowsBlockOp, RowsKindOps, check_tail_rows},
     mixer::tail_extent,
     mixer_shapes::{attn_decode_shape, attn_prep_shape, delta_shape, plain_shape},
@@ -850,7 +850,9 @@ impl<'a> QwenResidentStep<'a> {
         }
     }
 
-    /// The MoE block of `layer` for the `k` rows, over the K-row arena.
+    /// The MoE block of `layer` for the `k` rows, over the K-row arena. A banked engine runs
+    /// the host-pick body: its slot resolver maps the layer's read-back picks to bank slots
+    /// between the launches, so the same window runs uncaptured (`capture_on` stays off).
     fn moe_rows(&self, layer: usize, k: usize) -> Result<(), EngError> {
         let weights = self
             .exl3_moe
@@ -888,6 +890,11 @@ impl<'a> QwenResidentStep<'a> {
             rows: k,
             ..self.moe_dims
         };
+        if let Some(resolver) = self.exl3_bank {
+            let mut guard = resolver.borrow_mut();
+            let mut bank = guard.layer(layer);
+            return run_exl3_moe_rows_banked(&launch, weights, &bufs, &dims, &mut bank);
+        }
         run_exl3_moe_rows(&launch, weights, &bufs, &dims)
     }
 

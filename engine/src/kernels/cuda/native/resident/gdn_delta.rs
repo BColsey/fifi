@@ -69,12 +69,37 @@ unsafe extern "C" {
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+    #[cfg(any(test, fifi_gdn_partition_qualification))]
+    #[link_name = "inference_cuda_gdn_delta_partition_launch"]
+    fn gdn_delta_partition_launch_raw(
+        args: *const GdnDeltaArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
+    #[cfg(any(test, fifi_gdn_partition_qualification))]
+    #[link_name = "inference_cuda_gdn_delta_partition_snap_launch"]
+    fn gdn_delta_partition_snap_launch_raw(
+        args: *const GdnDeltaSnapArgsRaw,
+        stream: *mut c_void,
+        out_stage: *mut c_int,
+    ) -> c_int;
     #[link_name = "inference_cuda_gdn_delta_snap_launch"]
     fn gdn_delta_snap_launch_raw(
         args: *const GdnDeltaSnapArgsRaw,
         stream: *mut c_void,
         out_stage: *mut c_int,
     ) -> c_int;
+}
+
+/// Only tests and explicit qualification builds have this selector; normal serving builds do not.
+#[cfg(any(test, fifi_gdn_partition_qualification))]
+fn partitioned_for_tests() -> bool {
+    static SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let enabled = std::env::var_os("FIFI_TEST_GDN_PARTITIONED").is_some();
+        eprintln!("gdn_delta qualification partitioned={enabled}");
+        enabled
+    })
 }
 
 /// Every integer argument of the launch, already bounded and converted by the wrapper before
@@ -214,6 +239,13 @@ pub(in crate::kernels::cuda) fn gdn_delta_launch(
         eps: io.eps,
     };
     let mut stage = STAGE_NONE;
+    let launch = gdn_delta_launch_raw;
+    #[cfg(any(test, fifi_gdn_partition_qualification))]
+    let launch = if partitioned_for_tests() {
+        gdn_delta_partition_launch_raw
+    } else {
+        launch as unsafe extern "C" fn(_, _, _) -> _
+    };
     // SAFETY: `check_delta` proved every range inside its live allocation, large enough for the
     // call and 4-byte aligned, and `state` and `out` disjoint from every other range, so each
     // pointer in `args` addresses bytes the kernel may touch; the C entry repeats these checks on
@@ -222,7 +254,7 @@ pub(in crate::kernels::cuda) fn gdn_delta_launch(
     // argument struct is read only during it (the kernel arguments are copied at launch, so
     // nothing keeps the pointer). `stage` is a live writable `c_int`. `stream` is live for the
     // call.
-    let status = unsafe { gdn_delta_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe { launch(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }
 
@@ -301,6 +333,13 @@ pub(in crate::kernels::cuda) fn gdn_delta_snap_launch(
         snap_bytes: snap.range.bytes,
     };
     let mut stage = STAGE_NONE;
+    let launch = gdn_delta_snap_launch_raw;
+    #[cfg(any(test, fifi_gdn_partition_qualification))]
+    let launch = if partitioned_for_tests() {
+        gdn_delta_partition_snap_launch_raw
+    } else {
+        launch as unsafe extern "C" fn(_, _, _) -> _
+    };
     // SAFETY: `check_delta_snap` proved every range inside its live allocation, large enough for
     // the call and 4-byte aligned (`snap` for `(m - 2) * stride + state` bytes), `m >= 2`, a stride
     // that is a multiple of 4 and holds a state, and that `state`, `out` and `snap`, which the
@@ -309,7 +348,6 @@ pub(in crate::kernels::cuda) fn gdn_delta_snap_launch(
     // `inference_cuda_free` synchronizes the device first. `args` lives across the call and is
     // read only during it (the kernel arguments are copied at launch). `stage` is a live writable
     // `c_int`. `stream` is live for the call.
-    let status =
-        unsafe { gdn_delta_snap_launch_raw(&raw const args, stream.0.as_ptr(), &mut stage) };
+    let status = unsafe { launch(&raw const args, stream.0.as_ptr(), &mut stage) };
     checked(status, stage)
 }

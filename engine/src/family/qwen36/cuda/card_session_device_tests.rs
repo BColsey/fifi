@@ -80,18 +80,43 @@ fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     if !device_present(NAME) {
         return;
     }
-    let result = run_session_rig(NAME);
+    let result = run_session_rig(NAME, [0, 0]);
     result.expect("the card session rig");
 }
 
-fn run_session_rig(name: &'static str) -> Result<(), EngError> {
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
+    const NAME: &str = "prefill_without_head_matches_normal_logits_on_peer_gpus";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_session_rig(NAME, devices).expect("two-GPU session parity");
+}
+
+fn build_rig_session(
+    devices: [usize; 2],
+    context_tokens: usize,
+    prefix_limits: crate::family::session::StoreLimits,
+) -> Result<
+    (
+        CardSession,
+        &'static CardStack,
+        &'static [&'static crate::family::project::cuda::CudaWeights],
+        GlobalNames,
+        usize,
+    ),
+    EngError,
+> {
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec)?;
     let shape = HostShape::from_spec(&spec, 64)?;
     let d = StepDims::new(&shape, &inv)?;
     let options = StepOptions {
         kv_mode: KvMode::Int8G32,
-        context_tokens: 8,
+        context_tokens,
         delta_slots: 1,
         forked_experts: false,
         tiered: None,
@@ -247,7 +272,8 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
     let admission = served_admission();
     let shard = ShardTable::new(&d.shape, 2, 32)?;
     let loads = card_loads(&shard, &inv, GgufType::Q4K)?;
-    let (stack, states) = CardStack::new(&d, &options, &[0, 0], &admission)?;
+    let (mut stack, states) = CardStack::new(&d, &options, &devices, &admission)?;
+    stack.enable_broadcast_sync_for_test();
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
         ..LoadOptions::default()
@@ -280,7 +306,16 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
         &options,
         eos,
         vocab,
+        prefix_limits,
     )?;
+    session.set_skip_prefill_head_for_test(false);
+
+    Ok((session, stack, loaded, names, vocab))
+}
+
+fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
+    let (mut session, stack, loaded, names, vocab) =
+        build_rig_session(devices, 8, crate::family::session::StoreLimits::default())?;
     let limit = session.context_limit();
     if limit < 4 {
         return Err(EngError::Checkpoint(format!(
@@ -333,5 +368,190 @@ fn run_session_rig(name: &'static str) -> Result<(), EngError> {
         row, row_after,
         "{name}: the reset run reproduces the logits row exactly"
     );
+
+    // Record a later decode row after another prompt feed. The optimized
+    // path must preserve state both before and after a logits-producing step.
+    session.feed(3)?;
+    let next_row = session.logits(4)?;
+    TokenStepper::reset(&mut session)?;
+    session.set_skip_prefill_head_for_test(true);
+    session.feed(0)?;
+    session.feed(1)?;
+    let optimized_row = session.logits(2)?;
+    assert_eq!(row, optimized_row, "{name}: first decoded logits");
+    session.feed(3)?;
+    let optimized_next = session.logits(4)?;
+    assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
+
+    // A corrupt head makes a logits-producing step fail. A prompt-only feed
+    // must still succeed with that head, proving that it was not launched.
+    let head = match loaded[0].get(&names.head) {
+        Some(crate::family::project::cuda::CudaWeight::Native { weight, .. }) => weight.buffer(),
+        _ => {
+            return Err(EngError::Checkpoint(
+                "test fixture has no native head".into(),
+            ));
+        }
+    };
+    let stream = &stack.streams()[0];
+    let mut saved = vec![0u8; head.bytes()];
+    head.read_at(stream, 0, &mut saved)?;
+    head.write_at(stream, 0, &vec![0xff; saved.len()])?;
+    TokenStepper::reset(&mut session)?;
+    let feed_result = session.feed(0);
+    let logits_result = if feed_result.is_ok() {
+        Some(session.logits(1))
+    } else {
+        None
+    };
+    head.write_at(stream, 0, &saved)?;
+    feed_result?;
+    assert!(
+        matches!(logits_result, Some(Err(EngError::Backend { .. }))),
+        "{name}: the decode must still reject a non-finite head"
+    );
     Ok(())
+}
+
+/// Each session rig holds its CUDA leases for the process lifetime. Run each
+/// ignored test alone with a device runner and one test thread.
+#[test]
+#[ignore = "holds CUDA adapter leases for the process lifetime; run alone"]
+fn card_prefix_turn_chain_restores_bitwise() {
+    const NAME: &str = "card_prefix_turn_chain_restores_bitwise";
+    assert!(device_present(NAME));
+    run_card_prefix_turn_chain(NAME, [0, 0]);
+}
+
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn card_prefix_turn_chain_restores_bitwise_on_peer_gpus() {
+    const NAME: &str = "card_prefix_turn_chain_restores_bitwise_on_peer_gpus";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_card_prefix_turn_chain(NAME, devices);
+}
+
+/// Exercise the worker's save/restore sequence and compare its resulting
+/// logits and committed state to a run from scratch.
+fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
+    use crate::family::executor::ExecutorOps;
+    use crate::family::session::{DecodeSession, SaveKind, TokenStepper};
+    let (mut session, _stack, _loaded, _names, vocab) = build_rig_session(
+        devices,
+        256,
+        crate::family::session::StoreLimits {
+            roots: 0,
+            entries: 2,
+        },
+    )
+    .expect("the rig session");
+
+    // t1 is a strict prefix of t2 (the growing-conversation shape).
+    let t1: Vec<u32> = (0..60).map(|i| (i * 7 + 1) % 900).collect();
+    let mut t2 = t1.clone();
+    t2.extend((0..40).map(|i| (i * 11 + 3) % 900));
+
+    // Turn 1: prefill t1 piecewise and save at the boundary, exactly like
+    // the worker's save points.
+    let mut st = DecodeSession::default();
+    ExecutorOps::reset(&mut session, &mut st).expect("reset 1");
+    for piece in t1[..59].chunks(16) {
+        ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill t1");
+    }
+    let saved = ExecutorOps::save_prefix(&mut session, &st, &t1[..59], SaveKind::Tip)
+        .expect("the save call itself");
+    assert!(saved, "{name}: the boundary save must succeed");
+
+    // Turn 2 through the restore: same tokens, covered prefix.
+    ExecutorOps::reset(&mut session, &mut st).expect("reset 2");
+    let covered =
+        ExecutorOps::restore_prefix(&mut session, &mut st, &t2).expect("the restore call itself");
+    assert_eq!(covered, 59, "{name}: the restore covers t1's saved prefix");
+    for piece in t2[covered..].chunks(16) {
+        ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill t2 tail");
+    }
+    assert_eq!(
+        st.pending(),
+        t2.last().copied(),
+        "{name}: restored pending token"
+    );
+    assert_eq!(
+        TokenStepper::fed(&session),
+        t2.len() - 1,
+        "{name}: restored prefill count"
+    );
+    let restored_row = TokenStepper::logits(&mut session, t2[t2.len() - 1]).expect("logits");
+    let restored_export = session.export_states_for_test().expect("export restored");
+
+    // Control: the same tokens fed from scratch, no restore.
+    ExecutorOps::reset(&mut session, &mut st).expect("reset 3");
+    for piece in t2.chunks(16) {
+        ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefill control");
+    }
+    assert_eq!(
+        st.pending(),
+        t2.last().copied(),
+        "{name}: control pending token"
+    );
+    assert_eq!(
+        TokenStepper::fed(&session),
+        t2.len() - 1,
+        "{name}: control prefill count"
+    );
+    let control_row = TokenStepper::logits(&mut session, t2[t2.len() - 1]).expect("logits");
+    let control_export = session.export_states_for_test().expect("export control");
+
+    assert_eq!(restored_row.len(), vocab, "{name}: full vocabulary row");
+    assert!(
+        restored_row.iter().all(|v| v.is_finite()),
+        "{name}: finite logits"
+    );
+    assert_eq!(
+        restored_row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        control_row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "{name}: the restored logits match bit for bit"
+    );
+    assert_eq!(
+        restored_export.len(),
+        control_export.len(),
+        "{name}: one export per card"
+    );
+    assert_eq!(restored_export.len(), 2, "{name}: both card exports exist");
+    for (card, (got, want)) in restored_export
+        .iter()
+        .zip(control_export.iter())
+        .enumerate()
+    {
+        assert_eq!(got.identity, want.identity, "{name}: card {card} identity");
+        assert_eq!(got.tokens, want.tokens, "{name}: card {card} token count");
+        assert_eq!(
+            got.tokens,
+            t2.len(),
+            "{name}: card {card} consumed every token"
+        );
+        assert_eq!(got.delta.len(), 1, "{name}: one DeltaNet layer");
+        assert_eq!(got.kv.len(), 1, "{name}: one attention layer");
+        assert_eq!(
+            got.delta.len(),
+            want.delta.len(),
+            "{name}: card {card} DeltaNet layers"
+        );
+        for (layer, (got, want)) in got.delta.iter().zip(&want.delta).enumerate() {
+            for (field, got, want) in [
+                ("recurrent", &got.recurrent, &want.recurrent),
+                ("conv", &got.conv, &want.conv),
+            ] {
+                assert_eq!(
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{name}: card {card} layer {layer} {field} bits"
+                );
+            }
+        }
+        assert_eq!(got.kv, want.kv, "{name}: card {card} KV plane bytes");
+    }
 }

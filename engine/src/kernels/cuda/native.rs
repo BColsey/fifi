@@ -892,7 +892,7 @@ pub(super) fn download(device: &RawDevice, host: &mut [u8]) -> Result<(), Device
 }
 
 /// Waits for device completion without releasing any allocation.
-pub(super) fn device_synchronize() -> Result<(), DeviceFailure> {
+pub(crate) fn device_synchronize() -> Result<(), DeviceFailure> {
     let mut stage = STAGE_NONE;
     // SAFETY: stage is writable for the call; the caller holds the dispatch guard.
     let status = unsafe { device_synchronize_raw(&mut stage) };

@@ -139,11 +139,7 @@ fn the_cuda_step_reports_the_admitted_pinned_store_limits() {
 
 #[test]
 fn the_non_tiered_flag_off_path_keeps_the_one_entry_default_store() {
-    let constructor = pinned(section_of(
-        include_str!("step.rs"),
-        "step.rs",
-        "pub(crate) fn new(",
-    ));
+    let constructor = pinned(section_of(include_str!("step.rs"), "step.rs", "fn build("));
     assert!(constructor.contains("prefix:PrefixSlot::default(),"));
     let make = pinned(fn_section("fn make("));
     assert!(make.contains("ifmodes.prefix!=PrefixMemory::Disabled{step.enable_pinned_prefix()?;"));
@@ -352,14 +348,16 @@ fn the_weight_format_selects_the_load_in_make() {
     let device = make
         .find("CudaProjector::new()")
         .expect("make opens the device");
-    let pack = make.find("load_exl3_dir(").expect("make loads the pack");
+    let pack = make
+        .find("load_exl3_dir_decided(")
+        .expect("make loads the pack");
     let layout = make
         .find("device.layout()?")
         .expect("make reads the layout");
     assert!(device < pack && pack < layout, "{device} {pack} {layout}");
     // Only the GGUF arm reaches the file-based loads.
     assert_eq!(make.matches("open_gguf(").count(), 1);
-    assert_eq!(make.matches("load_exl3_dir(").count(), 1);
+    assert_eq!(make.matches("load_exl3_dir_decided(").count(), 1);
 }
 
 #[test]
