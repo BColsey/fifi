@@ -566,6 +566,7 @@ mod tests {
     #[test]
     fn flash_delta_rejects_mismatched_head_counts() {
         use crate::kernels::MlxKernels;
+        let _serial = crate::native_test_lock();
         let (kh, vh, kd, vd) = (2u32, 3u32, 64u32, 128u32);
         let rows = 4u32;
         let mut kernels = MlxKernels::try_new().unwrap();
@@ -598,6 +599,7 @@ mod tests {
     fn flash_delta_matches_the_recurrent_kernel() {
         use crate::kernels::MlxKernels;
         use crate::kernels::mlx::GatedDeltaOutput;
+        let _serial = crate::native_test_lock();
         let (kh, vh, kd, vd) = (16u32, 32u32, 128u32, 128u32);
         let mut kernels = MlxKernels::try_new().unwrap();
         let mut run = |rows: u32, seed: u32| {
