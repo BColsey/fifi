@@ -324,6 +324,26 @@ impl CardStack {
         Ok(())
     }
 
+    /// A broadcast followed by a consumer barrier, regardless of the eager
+    /// path's optional synchronization setting. Use this when another
+    /// broadcast can reuse the same mailbox parity before a sum or gather.
+    pub(crate) fn broadcast_synchronized(
+        &self,
+        source_card: usize,
+        src: DeviceRange<'_>,
+        outs: &[DeviceRange<'_>],
+        statuses: &[DeviceRange<'_>],
+        count: usize,
+    ) -> Result<(), EngError> {
+        self.broadcast(source_card, src, outs, statuses, count)?;
+        if !self.sync_broadcasts {
+            for stream in &self.streams {
+                stream.synchronize()?;
+            }
+        }
+        Ok(())
+    }
+
     /// One all-gather of a row dealt across the cards: card `i` computed
     /// `ranges[i]` of the `total` row in `parts[i]`; afterwards every
     /// `outs[i]` holds the full row. The K/V gathers of the full-attention
@@ -380,7 +400,6 @@ mod device_tests {
         crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peers");
         let (mut stack, _states) =
             CardStack::new(&dims(), &options(), &devices, &served_admission()).expect("stack");
-        stack.sync_broadcasts = true;
         let mut inputs = Vec::new();
         let mut outputs = [Vec::new(), Vec::new()];
         let mut expected = Vec::new();
@@ -402,43 +421,46 @@ mod device_tests {
             }
             expected.push(bytes);
         }
-        for _ in 0..32 {
-            for message in 0..3 {
-                let outs = [
-                    outputs[0][message].range(0, 16).unwrap(),
-                    outputs[1][message].range(0, 16).unwrap(),
-                ];
-                let statuses = [
-                    stack.shards()[0].ring_status().unwrap(),
-                    stack.shards()[1].ring_status().unwrap(),
-                ];
-                stack
-                    .broadcast(
-                        0,
-                        inputs[message].range(0, 16).unwrap(),
-                        &outs,
-                        &statuses,
-                        4,
-                    )
-                    .expect("broadcast");
-            }
-            for (card, card_outputs) in outputs.iter().enumerate() {
-                let mut status = [0; 4];
-                stack.shards()[card]
-                    .ring_word()
-                    .read_at(&stack.streams()[card], 0, &mut status)
-                    .unwrap();
-                assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+        for sync_broadcasts in [false, true] {
+            stack.sync_broadcasts = sync_broadcasts;
+            for _ in 0..32 {
                 for message in 0..3 {
-                    let mut actual = [0; 16];
-                    card_outputs[message]
-                        .read_at(&stack.streams()[card], 0, &mut actual)
+                    let outs = [
+                        outputs[0][message].range(0, 16).unwrap(),
+                        outputs[1][message].range(0, 16).unwrap(),
+                    ];
+                    let statuses = [
+                        stack.shards()[0].ring_status().unwrap(),
+                        stack.shards()[1].ring_status().unwrap(),
+                    ];
+                    stack
+                        .broadcast_synchronized(
+                            0,
+                            inputs[message].range(0, 16).unwrap(),
+                            &outs,
+                            &statuses,
+                            4,
+                        )
+                        .expect("broadcast");
+                }
+                for (card, card_outputs) in outputs.iter().enumerate() {
+                    let mut status = [0; 4];
+                    stack.shards()[card]
+                        .ring_word()
+                        .read_at(&stack.streams()[card], 0, &mut status)
                         .unwrap();
-                    assert_eq!(
-                        actual.as_slice(),
-                        expected[message],
-                        "card {card}, message {message}"
-                    );
+                    assert_eq!(u32::from_le_bytes(status), 0, "card {card} ring status");
+                    for message in 0..3 {
+                        let mut actual = [0; 16];
+                        card_outputs[message]
+                            .read_at(&stack.streams()[card], 0, &mut actual)
+                            .unwrap();
+                        assert_eq!(
+                            actual.as_slice(),
+                            expected[message],
+                            "card {card}, message {message}"
+                        );
+                    }
                 }
             }
         }

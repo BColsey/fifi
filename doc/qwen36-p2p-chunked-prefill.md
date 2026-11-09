@@ -26,7 +26,10 @@ broadcast to the others. The cards sum their partial mixer outputs before the
 feed-forward normalization, and sum their partial expert outputs before the
 next layer. The mailbox is sized to carry the larger of a chunk sum and an
 eager decode exchange. Requests larger than the selected chunk size are
-split into bounded pieces; a failed piece poisons the session.
+split into bounded pieces; a failed piece poisons the session. Each of the
+three consecutive routing broadcasts waits for every card to consume it
+before the next broadcast. This protects mailbox reuse and has an unmeasured
+performance cost.
 
 Both cards compute the selected experts over their intermediate slices. The
 existing eager K/V gathers are retained. A physical peer test must check both
