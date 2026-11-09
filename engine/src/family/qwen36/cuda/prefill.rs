@@ -1018,18 +1018,27 @@ fn model_facts(
                     (Role::FfnDownShexp, shexp_quant(&mw.shared_down)),
                 ],
             ),
-            None => (
-                [
-                    StackFacts { role: Role::FfnGateExps, quant: None, experts: None, n_rows: 0, k: 0 },
-                    StackFacts { role: Role::FfnUpExps, quant: None, experts: None, n_rows: 0, k: 0 },
-                    StackFacts { role: Role::FfnDownExps, quant: None, experts: None, n_rows: 0, k: 0 },
-                ],
+            None => {
+                // The tiered placeholders carry the model's full-depth geometry (the
+                // shape checks read n_rows/k; the actual stacks live in the banks).
+                let (e, i, h) = (
+                    dims.shape.moe.experts,
+                    dims.shape.moe.inter,
+                    dims.shape.hidden,
+                );
+                (
+                    [
+                        StackFacts { role: Role::FfnGateExps, quant: None, experts: Some(e), n_rows: e * i, k: h },
+                        StackFacts { role: Role::FfnUpExps, quant: None, experts: Some(e), n_rows: e * i, k: h },
+                        StackFacts { role: Role::FfnDownExps, quant: None, experts: Some(e), n_rows: e * h, k: i },
+                    ],
                 [
                     (Role::FfnGateShexp, None),
                     (Role::FfnUpShexp, None),
                     (Role::FfnDownShexp, None),
                 ],
-            ),
+                )
+            }
         };
         facts.push(LayerFacts {
             kind,
