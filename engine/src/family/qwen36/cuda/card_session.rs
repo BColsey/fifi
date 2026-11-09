@@ -291,6 +291,10 @@ impl CardSession {
 
     pub(crate) fn note_chunk_rows(&mut self, rows: usize) {
         self.fed += rows;
+        // The chunk's revalidate left the states needing a start block,
+        // exactly like a prefix import: the next feed writes the full step
+        // params (token id AND position).
+        self.full_params_next = true;
     }
 
     /// Card 0's embedding table: the reference ChunkWeights carries.

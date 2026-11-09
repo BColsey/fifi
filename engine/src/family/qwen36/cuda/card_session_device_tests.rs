@@ -34,7 +34,7 @@ use crate::weights::{GgufLimits, GgufWeights};
 /// paths cover, at a vocabulary the file can afford twice.
 static TWO_LAYERS: [AttentionKind; 2] = [AttentionKind::DeltaNet, AttentionKind::Full];
 
-fn rig_spec() -> FamilySpec {
+pub(super) fn rig_spec() -> FamilySpec {
     FamilySpec {
         layers: 2,
         vocab: 4096,
@@ -94,6 +94,23 @@ fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
     run_session_rig(NAME, devices).expect("two-GPU session parity");
+}
+
+pub(super) fn build_rig_session_for_chunk(
+    devices: [usize; 2],
+    context_tokens: usize,
+    prefix_limits: crate::family::session::StoreLimits,
+) -> Result<
+    (
+        CardSession,
+        &'static CardStack,
+        &'static [&'static crate::family::project::cuda::CudaWeights],
+        GlobalNames,
+        usize,
+    ),
+    EngError,
+> {
+    build_rig_session(devices, context_tokens, prefix_limits)
 }
 
 fn build_rig_session(
@@ -570,12 +587,9 @@ fn card_views_construct_chunk_models() {
         return;
     }
     let _ = NAME;
-    let (session, stack, _loaded, _names, _vocab) = build_rig_session(
-        [0, 0],
-        256,
-        crate::family::session::StoreLimits::default(),
-    )
-    .expect("the rig session");
+    let (session, stack, _loaded, _names, _vocab) =
+        build_rig_session([0, 0], 256, crate::family::session::StoreLimits::default())
+            .expect("the rig session");
     let spec = rig_spec();
     let inv = Inventory::for_spec(&spec).expect("inventory");
     let shape = HostShape::from_spec(&spec, 64).expect("shape");
