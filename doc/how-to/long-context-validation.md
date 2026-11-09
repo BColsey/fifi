@@ -60,9 +60,13 @@ partial files are not overwritten.
 
 `estimated_prompt_tokens_per_second` divides the server-counted prompt by the
 time until the first visible streamed content. It includes tokenization,
-queueing, and response overhead. `server_decode_tokens_per_second` has a value
-only when a matching completed server request record is available; stream
-chunks are never counted as tokens.
+queueing, and response overhead. When a matching completed server record is
+available, `server_prefill_ms` measures engine start to the first generated
+batch, and `server_prompt_tokens_per_second` divides the cold prompt count by
+that interval. It includes the first-batch work, so it is also an estimate.
+`server_queue_wait_ms` and `server_decode_tokens_per_second` come from the same
+record when those fields are available. Stream chunks are never counted as
+tokens.
 
 This synthetic check does not establish coding quality, multi-turn behavior,
 device isolation, or exact build identity. Record the running binary, model,

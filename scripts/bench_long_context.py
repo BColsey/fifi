@@ -7,8 +7,8 @@ Example (run only in an admitted, isolated device window):
 The prompt and reply share the server's context limit. Reserve reply space with
 --max-tokens. This is a synthetic recall check, not a coding-quality evaluation.
 The prefill rate is an end-to-end estimate to the first visible content; it
-includes tokenization, queueing, and response overhead. Decode rate is reported
-only when a matching server request record is available.
+includes tokenization, queueing, and response overhead. Server timing and decode
+rate are reported only when a matching completed request record is available.
 """
 
 from __future__ import annotations
@@ -119,6 +119,62 @@ def context_limit(client: Client, model: str) -> int:
     return limit
 
 
+def matching_server_metrics(rows, model: str, stream: dict) -> dict | None:
+    """Accept timings only from the unique completed record for this response."""
+    if not isinstance(rows, list):
+        return None
+    matches = [row for row in rows if isinstance(row, dict)
+               and row.get("request_id") == stream["request_id"]
+               and row.get("model") == model]
+    if len(matches) != 1:
+        return None
+    row, usage = matches[0], stream["usage"]
+    if (row.get("status") != 200 or row.get("outcome") != "ok"
+            or row.get("stream") is not True
+            or row.get("finish_reason") != stream["finish_reason"]
+            or not bench.nonnegative_int(row.get("prompt_tokens"))
+            or not bench.nonnegative_int(row.get("completion_tokens"))
+            or not bench.nonnegative_int(row.get("reused_tokens"))
+            or row["prompt_tokens"] != usage["prompt_tokens"]
+            or row["completion_tokens"] != usage["completion_tokens"]
+            or row["reused_tokens"] != bench.reused_tokens(usage)):
+        return None
+
+    def milliseconds(value, *, allow_zero: bool) -> float | None:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero)):
+            return None
+        return float(value)
+
+    prefill_ms = milliseconds(row.get("prefill_ms"), allow_zero=False)
+    return {
+        "server_queue_wait_ms": milliseconds(row.get("queue_wait_ms"), allow_zero=True),
+        "server_prefill_ms": prefill_ms,
+        "server_prompt_tokens_per_second": (1000 * usage["prompt_tokens"] / prefill_ms
+                                             if prefill_ms is not None else None),
+        "server_decode_tokens_per_second": bench.matching_server_rate(rows, model, stream),
+    }
+
+
+def recent_server_metrics(client: Client, model: str, stream: dict) -> dict:
+    """The request log may arrive just after the final SSE event."""
+    deadline = time.monotonic() + 5
+    empty = {"server_queue_wait_ms": None, "server_prefill_ms": None,
+             "server_prompt_tokens_per_second": None,
+             "server_decode_tokens_per_second": None}
+    while True:
+        try:
+            data = client.json("/v1/recent-requests")
+        except (OSError, ValueError):
+            return empty
+        metrics = matching_server_metrics(data.get("requests"), model, stream)
+        if metrics is not None:
+            return metrics
+        if time.monotonic() >= deadline:
+            return empty
+        time.sleep(0.1)
+
+
 def measure(client: Client, model: str, prompt: str, count: int, limit: int,
             max_tokens: int, expected: str) -> dict:
     if count + max_tokens > limit:
@@ -159,8 +215,7 @@ def measure(client: Client, model: str, prompt: str, count: int, limit: int,
         "finish_reason": stream["finish_reason"],
         "first_visible_seconds": first,
         "estimated_prompt_tokens_per_second": count / first,
-        "server_decode_tokens_per_second": bench.recent_server_rate(
-            client.base, client.headers, model, stream),
+        **recent_server_metrics(client, model, stream),
         "request_id": stream["request_id"],
         "expected_answer": expected,
         "answer": answer,

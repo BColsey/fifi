@@ -47,7 +47,9 @@ class Handler(BaseHTTPRequestHandler):
                     "status": 200, "outcome": "ok", "stream": True,
                     "finish_reason": self.server.finish_reason,
                     "prompt_tokens": self.server.prompt_count,
-                    "completion_tokens": 14, "decode_tokens_per_second": 17.5}]}
+                    "completion_tokens": 14, "reused_tokens": 0,
+                    "queue_wait_ms": 20, "prefill_ms": 2000,
+                    "decode_tokens_per_second": 17.5}]}
         else:
             self.send_error(404)
             return
@@ -129,6 +131,10 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["completion_tokens"], 14)  # two chunks are not two tokens
         self.assertEqual(evidence["reused_tokens"], 0)
         self.assertEqual(evidence["server_decode_tokens_per_second"], 17.5)
+        self.assertEqual(evidence["server_queue_wait_ms"], 20)
+        self.assertEqual(evidence["server_prefill_ms"], 2000)
+        self.assertEqual(evidence["server_prompt_tokens_per_second"],
+                         evidence["prompt_tokens"] / 2)
         self.assertTrue(3000 <= evidence["prompt_tokens"] <= 3128)
         prompt = bench.prompt_text(evidence["filler_repeats"], evidence["nonce"],
                                    tuple(evidence["expected_answer"].split("|")))
@@ -144,6 +150,30 @@ class EvidenceTests(unittest.TestCase):
         evidence = json.loads(self.output.read_text())
         self.assertFalse(evidence["recall_passed"])
         self.assertEqual(evidence["state"], "complete")
+
+    def test_server_timings_require_a_unique_matching_cold_record(self):
+        stream = {"request_id": "r", "finish_reason": "stop",
+                  "usage": {"prompt_tokens": 100, "completion_tokens": 3,
+                            "reused_tokens": 0}}
+        row = {"request_id": "r", "model": "m", "status": 200,
+               "outcome": "ok", "stream": True, "finish_reason": "stop",
+               "prompt_tokens": 100, "completion_tokens": 3, "reused_tokens": 0,
+               "queue_wait_ms": 0, "prefill_ms": 2500,
+               "decode_tokens_per_second": 4.5}
+        metrics = bench.matching_server_metrics([row], "m", stream)
+        self.assertEqual(metrics["server_queue_wait_ms"], 0)
+        self.assertEqual(metrics["server_prompt_tokens_per_second"], 40)
+        self.assertEqual(metrics["server_decode_tokens_per_second"], 4.5)
+        self.assertIsNone(bench.matching_server_metrics([row, row], "m", stream))
+        for field, value in (("reused_tokens", 1), ("prompt_tokens", 99),
+                             ("finish_reason", "length"), ("status", 500)):
+            with self.subTest(field=field):
+                self.assertIsNone(bench.matching_server_metrics([{**row, field: value}], "m", stream))
+        for value in (0, -1, True, float("inf"), None):
+            with self.subTest(prefill_ms=value):
+                metrics = bench.matching_server_metrics([{**row, "prefill_ms": value}], "m", stream)
+                self.assertIsNone(metrics["server_prefill_ms"])
+                self.assertIsNone(metrics["server_prompt_tokens_per_second"])
 
     def test_large_prompt_budgets_leave_space_for_output(self):
         for target, reply in ((131072, 8192), (257900, 4096)):
