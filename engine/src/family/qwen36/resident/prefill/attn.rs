@@ -1665,7 +1665,7 @@ mod tests {
     /// F32 reference at least as well as the composite prefix attention. Small depth, so it
     /// runs in the suite; the deep measurement lives in `dense_rep6_flash_pad_bench`.
     #[test]
-    fn q8_flash_prefill_dense_rep6_tolerance() {
+    fn the_q8_flash_prefill_dense_rep6_pad_tolerance() {
         let _serial = crate::native_test_lock();
         let mut kernels = MlxKernels::try_new().unwrap();
         let (h, kvh, d, rows) = (24u32, 4u32, 256u32, 96u32);
