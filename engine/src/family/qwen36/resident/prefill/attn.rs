@@ -1732,11 +1732,8 @@ mod tests {
         let flash_out = kernels
             .q8_flash_prefill(&padded, &keys, &values_q, rows, scale, group, bits, None, 0)
             .unwrap();
-        let flash = values(
-            &mut kernels,
-            &unpad_rep6_output(&mut kernels, &flash_out, h, kvh).unwrap(),
-        )
-        .unwrap();
+        let flash = unpad_rep6_output(&mut kernels, &flash_out, h, kvh).unwrap();
+        let flash = values(&mut kernels, &flash).unwrap();
 
         let max_err = |a: &[f32], b: &[f32]| {
             a.iter()
