@@ -2392,6 +2392,7 @@ fn run_chunk_tiered(
     // up, down), swiglu. The launch code mirrors run_chunk_routed's stages 12-16
     // with the bank stacks in place of the full-depth stacks.
     let gate = native_stack(&weights.gate)?;
+    eprintln!("tiered-chunk: launching scatter quantize (k={hidden}, slots={slots})");
     ctx.mmq_quantize_scatter_ids(
         stream,
         &ids,
@@ -2424,8 +2425,11 @@ fn run_chunk_tiered(
             )
         };
     let q8s = d.get(ChunkSlot::Q8S)?;
+    eprintln!("tiered-chunk: launching gate MMQ");
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
+    eprintln!("tiered-chunk: launching up MMQ");
     launch_mmid(native_stack(&weights.up)?, q8s, 2 * dims.inter, up_dst)?;
+    eprintln!("tiered-chunk: launching swiglu");
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2435,6 +2439,7 @@ fn run_chunk_tiered(
         },
     )?;
     let down = native_stack(&weights.down)?;
+    eprintln!("tiered-chunk: launching gather quantize");
     ctx.mmq_quantize_gather_ids(
         stream,
         &ids,
@@ -2678,6 +2683,7 @@ fn run_chunk_shared(
             },
         )?;
     }
+    eprintln!("tiered-chunk: launching swiglu");
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2772,6 +2778,7 @@ fn run_chunk_routed(
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
     launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
     // 14-16, the SwiGLU, the gather quantize and the down launch.
+    eprintln!("tiered-chunk: launching swiglu");
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
