@@ -2518,10 +2518,16 @@ fn tiered_chunk_route_to_host(
     let hidden_bytes = m * hidden * 4;
     let total = ids_bytes + weights_bytes + hidden_bytes;
     let mut pinned = ctx.pinned_buf(total)?;
-    ctx.copy_to_pinned(stream, io.ids, &mut pinned, 0)?;
-    ctx.copy_to_pinned(stream, io.weights, &mut pinned, ids_bytes)?;
+    // Sub-ranges of just this chunk's m rows: the device ranges are arena-sized
+    // (m_sess rows), and copy_to_pinned copies the full range — the pinned buffer
+    // is sized for m, so the copies must be too.
+    let ids_range = io.ids.buffer().range(io.ids.offset(), ids_bytes)?;
+    let weights_range = io.weights.buffer().range(io.weights.offset(), weights_bytes)?;
+    let x2_range = io.x2.buffer().range(io.x2.offset(), hidden_bytes)?;
+    ctx.copy_to_pinned(stream, ids_range, &mut pinned, 0)?;
+    ctx.copy_to_pinned(stream, weights_range, &mut pinned, ids_bytes)?;
     // The normed row the CPU experts read: the router's x2 (the post-norm hidden).
-    ctx.copy_to_pinned(stream, io.x2, &mut pinned, ids_bytes + weights_bytes)?;
+    ctx.copy_to_pinned(stream, x2_range, &mut pinned, ids_bytes + weights_bytes)?;
     let event = ctx.event()?;
     stream.record(&event)?;
     pinned.wait(&event)?;
