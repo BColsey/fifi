@@ -1181,3 +1181,55 @@ fn the_exl3_column_layout_is_checked_for_the_column_scatter() {
     refused(&|g| g.delta.z_off += 1, "an offset");
     refused(&|g| g.attn.ld += 2, "a stride");
 }
+
+/// The tiered miss spread must never land a miss on a slot its own row already holds a
+/// column in: one column per (row, slot) is what keeps every group at <= m entries and
+/// ids_dst a permutation (`check_host_ids`' two value invariants). The case that broke
+/// the plain round-robin: a hot slot every row hits (all m rows' hit land on slot 3)
+/// while every row also misses once — the 4th spread miss would land on its row's own
+/// hit slot and push that group to m+1 columns. Mutation: reverting the skip (a plain
+/// round-robin again) fails the m-columns assert on group 3.
+#[test]
+fn tiered_miss_spread_skips_the_rows_own_slots() {
+    use super::prefill::group_tiered_picks;
+    let m = 4;
+    let top_k = 2;
+    let slots = 5;
+    // Row r: pick 0 hits slot 3, pick 1 misses (weight 0.0, id -1) — except row 3,
+    // whose miss is pick 0 and whose hit is pick 1 (a different scan order).
+    let (mut ids, mut weights) = (Vec::new(), Vec::new());
+    for r in 0..m {
+        let (hit, miss) = if r == 3 { (1, 0) } else { (0, 1) };
+        for p in 0..top_k {
+            ids.push(if p == hit { 3 } else { -1 });
+            weights.push(if p == hit { 0.5 } else { 0.0 });
+        }
+    }
+    let (ids_dst, expert_bounds) =
+        group_tiered_picks(&ids, &weights, m, top_k, slots).expect("the layout");
+    // The deterministic layout: groups 0/1/2 take the first three misses, the 4th
+    // skips slot 3 (row 3's own hit) and lands on 4, and slot 3 keeps exactly its
+    // four hit columns — m, not m+1.
+    assert_eq!(ids_dst, vec![1, 3, 5, 0, 2, 4, 7, 6], "ids_dst");
+    assert_eq!(expert_bounds, vec![0, 1, 2, 3, 7, 8], "expert_bounds");
+    // The invariants check_host_ids holds the launch to, checked here so the spread
+    // cannot regress them: a permutation of 0..m*top_k and <= m columns per group.
+    let mut sorted = ids_dst.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        (0..(m * top_k) as i32).collect::<Vec<_>>(),
+        "a permutation"
+    );
+    for group in expert_bounds.windows(2) {
+        assert!(group[1] - group[0] <= m as i32, "a group holds <= m columns");
+    }
+
+    // The no-free-slot refusal: one slot, one row whose pick already holds it —
+    // the misconfiguration turns into a BadRequest, not a spin.
+    let error = group_tiered_picks(&[0, -1], &[0.5, 0.0], 1, 2, 1).expect_err("refused");
+    assert!(
+        matches!(&error, EngError::BadRequest(text) if text.contains("no free slot")),
+        "{error:?}"
+    );
+}

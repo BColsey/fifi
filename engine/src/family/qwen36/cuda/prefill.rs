@@ -2360,6 +2360,7 @@ fn run_chunk_tiered(
             message: e.to_string(),
         })?;
 
+
     // Start the grouped pool serving BEFORE the GPU stages: the CPU work overlaps
     // the GPU launches (the chunk's whole reason for existing).
     let pending = runtime
@@ -2470,21 +2471,14 @@ fn run_chunk_tiered(
     eprintln!("tiered-chunk: syncing after gather");
     stream.synchronize()?;
     eprintln!("tiered-chunk: sync after gather OK");
-    // ponytail: the vendored MMQ down kernel (k<n, 78 experts) returns CUDA
-    // invalid argument on Turing regardless of variant — the Down buffer is zeroed
-    // and the GPU down launch skipped. The combine multiplies by the (patched)
-    // weights, so zeros produce correct results for misses (weight 0.0) and
-    // zero contributions for hits. This is WRONG for hits — the chunk's MoE
-    // output is incomplete — but it unblocks the pipeline for debugging.
-    // TODO: compute the down projection on CPU from the swiglu output, or
-    // fix the kernel (see the TODO for the minimal reproducer).
-    {
-        let down_range = d.get(ChunkSlot::Down)?;
-        eprintln!("tiered-chunk: zero-fill Down: off={} bytes={}", down_range.offset(), down_range.bytes());
-        let zeros = vec![0u8; down_range.bytes()];
-        down_range.buffer().write_at(stream, down_range.offset(), &zeros)?;
-        eprintln!("tiered-chunk: zero-fill OK");
-    }
+    eprintln!("tiered-chunk: launching down MMQ");
+    launch_mmid(
+        down,
+        d.get(ChunkSlot::Q8Act)?,
+        dims.hidden,
+        d.get(ChunkSlot::Down)?,
+    )?;
+    eprintln!("tiered-chunk: down MMQ OK");
 
     // Stage 17, the combine with the patched weights.
     eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
@@ -2496,14 +2490,50 @@ fn run_chunk_tiered(
 
     // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
     // weights ones, in place) adding `partial` to the block output.
-    // TODO: the partial add's moe_combine returns CUDA invalid argument (same
-    // class as the down MMQ); skip it to complete the pipeline. The misses are
-    // computed by the pool but not contributed to the output — wrong but working.
-    let _ = pending; // (the pool join would timeout without this acknowledgment)
-    // if let Some(pending) = pending {
-    //     let partial = pending.finish(Duration::from_secs(60))?;
-    //     ... upload + M-row moe_combine ...
-    // }
+    if let Some(pending) = pending {
+        let partial = pending
+            .finish(std::time::Duration::from_secs(60))
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_pool_join",
+                message: format!("{e:?}"),
+            })?;
+        if partial.len() != m * hidden || partial.iter().any(|v| !v.is_finite()) {
+            return Err(EngError::Backend {
+                operation: "tiered_chunk_partial",
+                message: format!(
+                    "the partial holds {} values (want {} x {}) or a non-finite one",
+                    partial.len(),
+                    m,
+                    hidden
+                ),
+            });
+        }
+        // Upload the partial and add it: 1.0 * partial through a second M-row
+        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
+        eprintln!("tiered-chunk: uploading the CPU partial ({} bytes)", partial.len() * 4);
+        let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let partial_buf = ctx.upload(&bytes)?;
+        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
+        let ones_buf = ctx.upload(&ones)?;
+        eprintln!("tiered-chunk: adding the partial via moe_combine");
+        ctx.moe_combine(
+            stream,
+            crate::kernels::cuda::resident::moe_combine::CombineCall {
+                shape: crate::kernels::cuda::resident::moe_combine::CombineShape {
+                    m,
+                    n: hidden,
+                    top_k: 1,
+                    ld_down: hidden,
+                },
+                res: io.h,
+                down: partial_buf.range(0, bytes.len())?,
+                weights: ones_buf.range(0, ones.len())?,
+                shared: None,
+                out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
+            },
+        )?;
+        eprintln!("tiered-chunk: partial add OK");
+    }
     Ok(())
 }
 
@@ -2591,34 +2621,27 @@ struct ChunkRouteRead {
     hidden: Vec<f32>,
 }
 
-/// Builds and uploads the grouped ids from the chunk plan: picks are grouped by their
-/// bank slot, misses spread round-robin (the plan's weight is 0.0 for misses, so the
-/// wasted grouped compute is zeroed by the combine). Returns the checked `MmidIds`.
-fn build_tiered_host_ids<'b>(
-    stream: &crate::kernels::cuda::DeviceStream,
-    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+/// The grouped-ids layout of one chunk layer's picks: `ids_dst` (the m*top_k flat pick
+/// indices, grouped) and `expert_bounds` (slots+1 rising bounds). Grouping is two
+/// passes: every pick with a slot of its own claims its group and marks the row's used
+/// slots; then the misses (weight 0.0, the picks the CPU serves) spread round-robin
+/// over the slots, SKIPPING every slot their own row already holds a column in. One
+/// column per (row, slot) is what keeps every group at <= m entries and ids_dst a
+/// permutation — a plain round-robin broke both the moment a spread miss landed on a
+/// slot its token had already hit (a hot slot holding all m rows gained misses on top:
+/// "expert N holds m+k columns, above m", the check_host_ids refusal).
+pub(super) fn group_tiered_picks(
+    slot_ids: &[i32],
+    weights: &[f32],
     m: usize,
     top_k: usize,
     slots: usize,
-    out: crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut<'b>,
-) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>, EngError> {
-    let shape = crate::kernels::cuda::prefill::mmq_mmid::MmidShape {
-        n_experts: slots,
-        m,
-        top_k,
-    };
-    // Group picks by slot. Two passes: every pick with a slot of its own claims its
-    // group and marks the row's used slots; then the misses (weight 0.0, the picks the
-    // CPU serves) spread round-robin over the slots, SKIPPING every slot their own row
-    // already holds a column in. One column per (row, slot) is what keeps every group
-    // at <= m entries and ids_dst a permutation — a plain round-robin broke both the
-    // moment a spread miss landed on a slot its token had already hit (a hot slot
-    // holding all m rows gained misses on top: "expert N holds m+k columns, above m").
+) -> Result<(Vec<i32>, Vec<i32>), EngError> {
     let mut groups: Vec<Vec<i32>> = vec![Vec::new(); slots];
     let words = slots.div_ceil(64);
     let mut used = vec![0u64; m * words];
     let mut spread_set: Vec<usize> = Vec::new();
-    for (flat, (&slot_id, &weight)) in plan.slot_ids.iter().zip(&plan.device_weights).enumerate() {
+    for (flat, (&slot_id, &weight)) in slot_ids.iter().zip(weights).enumerate() {
         let target = if weight == 0.0 && slot_id <= 0 {
             spread_set.push(flat);
             continue;
@@ -2642,10 +2665,20 @@ fn build_tiered_host_ids<'b>(
         let flat_i32 = i32::try_from(flat)
             .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
         let row_words = &mut used[flat / top_k * words..flat / top_k * words + words];
-        // At most top_k slots of this row are marked, so this loop always finds a
-        // free slot while slots > top_k.
+        // At most top_k slots of this row are marked, so this scan finds a free slot
+        // while slots > top_k; the counter turns the misconfigured remainder (every
+        // slot already used by one row) into a refusal instead of a spin.
+        let mut tries = 0;
         while row_words[spread / 64] >> (spread % 64) & 1 == 1 {
             spread = (spread + 1) % slots.max(1);
+            tries += 1;
+            if tries > slots {
+                return Err(EngError::BadRequest(format!(
+                    "tiered chunk: every one of the {slots} slots already holds a column of row {} \
+                     (top_k {top_k}) — no free slot for its miss",
+                    flat / top_k
+                )));
+            }
         }
         let target = spread;
         row_words[target / 64] |= 1u64 << (target % 64);
@@ -2665,6 +2698,26 @@ fn build_tiered_host_ids<'b>(
         ids_dst.extend_from_slice(group);
         expert_bounds.push(i32::try_from(ids_dst.len()).unwrap_or(i32::MAX));
     }
+    Ok((ids_dst, expert_bounds))
+}
+
+/// Builds and uploads the grouped ids from the chunk plan: picks are grouped by their
+/// bank slot, misses spread round-robin (the plan's weight is 0.0 for misses, so the
+/// wasted grouped compute is zeroed by the combine). Returns the checked `MmidIds`.
+fn build_tiered_host_ids<'b>(
+    stream: &crate::kernels::cuda::DeviceStream,
+    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+    m: usize,
+    top_k: usize,
+    slots: usize,
+    out: crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut<'b>,
+) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>, EngError> {
+    let shape = crate::kernels::cuda::prefill::mmq_mmid::MmidShape {
+        n_experts: slots,
+        m,
+        top_k,
+    };
+    let (ids_dst, expert_bounds) = group_tiered_picks(&plan.slot_ids, &plan.device_weights, m, top_k, slots)?;
     crate::kernels::cuda::prefill::mmq_mmid::MmidIds::from_host(
         stream,
         shape,
