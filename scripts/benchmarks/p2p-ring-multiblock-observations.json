@@ -76,7 +76,7 @@
     "The source tree and test-binary hash for the logged runs were not recorded; both logs predate the final small-payload fallback commit.",
     "The successful log has no retained matched baseline; it does not establish a speedup.",
     "The port changes the new test to require two physical devices and be ignored by default; exact-tip tests remain unrun.",
-    "The proposed multi-block path is not gated by an opt-in flag, so it is not ready to merge under the default-off policy.",
+    "The opt-in launch policy was added after these historical logs; neither arm has been tested at the new exact tip.",
     "No full-model prefill or decode benchmark was run for this port."
   ]
 }

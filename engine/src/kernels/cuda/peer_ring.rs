@@ -859,6 +859,106 @@ mod device_tests {
         assert_eq!(got[3], 70_000.0 + 1.5);
     }
 
+    #[test]
+    fn large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot() {
+        if !device_present("large_f32_exchange_clears_an_earlier_fp16_overflow_in_the_reused_slot")
+        {
+            return;
+        }
+        let (contexts, streams, ring) = two_context_ring(2049);
+        assert_large_f32_exchange_clears_overflow(contexts, streams, ring);
+    }
+
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused() {
+        const NAME: &str = "physical_pair_clears_fp16_overflow_when_a_large_f32_slot_is_reused";
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, 2049).expect("ring");
+        assert_large_f32_exchange_clears_overflow(contexts, streams, ring);
+    }
+
+    fn assert_large_f32_exchange_clears_overflow(
+        contexts: [CudaContext; 2],
+        streams: [DeviceStream; 2],
+        ring: PeerRing,
+    ) {
+        const N: usize = 2049;
+        let a = vec![1.5f32; N];
+        let b = vec![2.25f32; N];
+        let mut overflow = b.clone();
+        overflow[N - 1] = 70_000.0;
+        let safe = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let overflowing = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("overflow partial 0"),
+            upload_f32(&contexts[1], &streams[1], &overflow).expect("overflow partial 1"),
+        ];
+        let outs = [
+            contexts[0].allocate(N * 4).expect("out 0"),
+            contexts[1].allocate(N * 4).expect("out 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+
+        // Sequences 1 and 3 use the same slot. Sequence 1 leaves an FP16
+        // overflow flag there; the large FP32 publish must replace it.
+        for round in 0..3 {
+            for index in 0..2 {
+                statuses[index]
+                    .write_at(&streams[index], 0, &0u32.to_le_bytes())
+                    .expect("clear status");
+            }
+            let (partials, mode) = if round == 0 {
+                (&overflowing, RingMode::F16)
+            } else {
+                (&safe, RingMode::F32)
+            };
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&partials[0]), whole(&partials[1])],
+                &[whole(&outs[0]), whole(&outs[1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                mode,
+            )
+            .expect("exchange");
+            for (index, stream) in streams.iter().enumerate() {
+                stream.synchronize().expect("sync");
+                let expected = if round == 0 && index == 0 {
+                    STATUS_OVERFLOW
+                } else {
+                    0
+                };
+                assert_eq!(
+                    status_of(&statuses[index], stream).expect("status"),
+                    expected
+                );
+                if round > 0 {
+                    assert_eq!(
+                        download_f32(&outs[index], stream, N).expect("sum"),
+                        vec![3.75; N]
+                    );
+                }
+            }
+        }
+    }
+
     fn two_context_ring(max_values: usize) -> ([CudaContext; 2], [DeviceStream; 2], PeerRing) {
         let admission = served_admission();
         let contexts = [
@@ -1047,6 +1147,137 @@ mod device_tests {
             native::peer_ring::STATUS_TIMEOUT
         );
         assert_eq!(download_f32(&out, &stream, 4).expect("out"), [-1.0; 4]);
+    }
+
+    #[test]
+    fn large_waits_with_no_publisher_report_timeout_and_leave_output_unchanged() {
+        if !device_present("large_waits_with_no_publisher_report_timeout") {
+            return;
+        }
+        const N: usize = 65_536;
+        let admission = served_admission();
+        let context = CudaContext::with_admission_on(0, &admission).expect("context");
+        let stream = context.stream().expect("stream");
+        let own = upload_f32(&context, &stream, &vec![1.0; N]).expect("own");
+        let out = upload_f32(&context, &stream, &vec![-1.0; N]).expect("out");
+        let status = upload_f32(&context, &stream, &[0.0]).expect("status");
+        let mailbox = context.allocate(HEADER_BYTES + N * 4).expect("mailbox");
+        mailbox
+            .write_at(&stream, 0, &vec![0u8; HEADER_BYTES + N * 4])
+            .expect("zero mailbox");
+        let slot = context.owned(&mailbox).expect("owned").address();
+        let out_range = context.raw_range(&whole(&out)).expect("raw out");
+        let own_range = context.raw_range(&whole(&own)).expect("raw own");
+        let word = context.raw_range(&whole(&status)).expect("raw status");
+
+        // With the option on, all three cases launch multiple waiting blocks.
+        // Every block must time out without writing any portion of the output.
+        for mode in 0..3 {
+            status
+                .write_at(&stream, 0, &0u32.to_le_bytes())
+                .expect("clear status");
+            context
+                .launch_on(&stream, |raw_stream| match mode {
+                    0 | 1 => native::peer_ring::wait_sum(
+                        raw_stream,
+                        out_range,
+                        own_range,
+                        &[slot],
+                        N,
+                        1,
+                        mode == 0,
+                        1_000_000,
+                        word,
+                    ),
+                    _ => native::peer_ring::wait_copy(
+                        raw_stream, out_range, slot, N, 1, 1_000_000, word,
+                    ),
+                })
+                .expect("launch wait");
+            stream.synchronize().expect("sync");
+            assert_eq!(
+                status_of(&status, &stream).expect("status"),
+                native::peer_ring::STATUS_TIMEOUT,
+                "mode {mode}"
+            );
+            assert_eq!(download_f32(&out, &stream, N).expect("out"), vec![-1.0; N]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires two physical peer-enabled CUDA devices"]
+    fn physical_pair_chains_large_exchanges_without_host_synchronization() {
+        const NAME: &str = "physical_pair_chains_large_exchanges_without_host_synchronization";
+        const N: usize = 256 * 2048;
+        const ROUNDS: usize = 16;
+        assert!(device_present(NAME), "{NAME}: CUDA devices are required");
+        let admission = served_admission();
+        let contexts = [
+            CudaContext::with_admission_on(0, &admission).expect("context 0"),
+            CudaContext::with_admission_on(1, &admission).expect("context 1"),
+        ];
+        crate::kernels::cuda::peer::enable_peer_access(&[0, 1]).expect("peer access");
+        let streams = [
+            contexts[0].stream().expect("stream 0"),
+            contexts[1].stream().expect("stream 1"),
+        ];
+        let ring = PeerRing::new(&contexts, N).expect("ring");
+        let a: Vec<f32> = (0..N).map(|i| (i % 101) as f32 - 50.0).collect();
+        let b: Vec<f32> = (0..N).map(|i| (i % 97) as f32 * 0.5 + 1.0).collect();
+        let partials = [
+            upload_f32(&contexts[0], &streams[0], &a).expect("partial 0"),
+            upload_f32(&contexts[1], &streams[1], &b).expect("partial 1"),
+        ];
+        let statuses = [
+            upload_f32(&contexts[0], &streams[0], &[0.0]).expect("status 0"),
+            upload_f32(&contexts[1], &streams[1], &[0.0]).expect("status 1"),
+        ];
+        let outs: Vec<[DeviceBuffer; 2]> = (0..ROUNDS)
+            .map(|_| {
+                [
+                    contexts[0].allocate(N * 4).expect("out 0"),
+                    contexts[1].allocate(N * 4).expect("out 1"),
+                ]
+            })
+            .collect();
+        for round in 0..ROUNDS {
+            let input = if round == 0 {
+                &partials
+            } else {
+                &outs[round - 1]
+            };
+            ring.exchange_sum(
+                &contexts,
+                &streams,
+                &[whole(&input[0]), whole(&input[1])],
+                &[whole(&outs[round][0]), whole(&outs[round][1])],
+                &[whole(&statuses[0]), whole(&statuses[1])],
+                N,
+                RingMode::F32,
+            )
+            .expect("queue exchange");
+        }
+        // No host wait is issued until every exchange has been queued.
+        for (round, pair) in outs.iter().enumerate() {
+            let scale = (1u32 << round) as f32;
+            for (card, buffer) in pair.iter().enumerate() {
+                let got = download_f32(buffer, &streams[card], N).expect("download");
+                for (i, &value) in got.iter().enumerate() {
+                    assert_eq!(
+                        value,
+                        (a[i] + b[i]) * scale,
+                        "round {round}, card {card}, value {i}"
+                    );
+                }
+            }
+        }
+        for (card, stream) in streams.iter().enumerate() {
+            assert_eq!(
+                status_of(&statuses[card], stream).expect("status"),
+                0,
+                "card {card}"
+            );
+        }
     }
 
     /// The coordinator invariant, pinned: ONE stream per card, all ring work
