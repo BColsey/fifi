@@ -1409,4 +1409,157 @@ mod tests {
             "flash err {flash_err:.6} vs composite err {composite_err:.6}"
         );
     }
+
+    /// Dense-shape (QH 24, KVH 4, D 256, REP 6) bench: the composite Q8 prefix attention in
+    /// 256-row blocks against the flash kernel on a duplicate-padded query (24 -> 32 heads,
+    /// each kv group of 6 padded with its own first 2 heads; the pad rows' outputs are
+    /// discarded). Also checks the flash output's 24 real rows against the F32 reference.
+    /// Temporary probe for the dense prefill headroom decision: run with --ignored.
+    #[test]
+    #[ignore]
+    fn dense_rep6_flash_pad_bench() {
+        let _serial = crate::native_test_lock();
+        let mut kernels = MlxKernels::try_new().unwrap();
+        let (h, kvh, d, rows, cap) = (24u32, 4u32, 256u32, 512u32, 16_384u32);
+        let (group, bits) = (64u32, 8u32);
+        let block: u32 = 256;
+        let kv: Vec<f32> = (0..kvh * cap * d)
+            .map(|i| (((i * 37) % 509) as f32 - 254.0) / 254.0)
+            .collect();
+        let k = upload(&mut kernels, vec![1, kvh, cap, d], &kv);
+        let v = upload(&mut kernels, vec![1, kvh, cap, d], &kv);
+        let (kc, ks, kb) = kernels.quantize_rows(&k, group, bits).unwrap();
+        let (vc, vs, vb) = kernels.quantize_rows(&v, group, bits).unwrap();
+        let keys = QuantizedKv {
+            codes: &kc,
+            scales: &ks,
+            biases: &kb,
+        };
+        let values_q = QuantizedKv {
+            codes: &vc,
+            scales: &vs,
+            biases: &vb,
+        };
+        let qd: Vec<f32> = (0..h * rows * d)
+            .map(|i| (((i * 29) % 389) as f32 - 194.0) / 300.0)
+            .collect();
+        let q = upload(&mut kernels, vec![1, h, rows, d], &qd);
+        let scale = 1.0 / (d as f32).sqrt();
+
+        // The duplicate pad: per kv group g, [q[g*6..g*6+6], q[g*6..g*6+2]] -> 32 heads.
+        let build_pad = |kernels: &mut MlxKernels| {
+            let mut parts: Vec<ExecutionTensor> = Vec::with_capacity(8);
+            for g in 0..kvh {
+                let base = g * 6;
+                parts.push(
+                    kernels
+                        .slice(&q, &[0, base, 0, 0], &[1, base + 6, rows, d])
+                        .unwrap(),
+                );
+                parts.push(
+                    kernels
+                        .slice(&q, &[0, base, 0, 0], &[1, base + 2, rows, d])
+                        .unwrap(),
+                );
+            }
+            let views: Vec<&ExecutionTensor> = parts.iter().collect();
+            kernels.concatenate(&views, 1).unwrap()
+        };
+
+        let (cf, composite_ms, composite) = {
+            let mut best = f64::INFINITY;
+            let mut first = 0.0;
+            let mut whole = None;
+            for i in 0..5 {
+                let start = std::time::Instant::now();
+                let mut blocks: Vec<ExecutionTensor> = Vec::new();
+                let mut start_row = 0u32;
+                while start_row < rows {
+                    let end = (start_row + block).min(rows);
+                    let q_block = kernels
+                        .slice(&q, &[0, 0, start_row, 0], &[1, h, end, d])
+                        .unwrap();
+                    blocks.push(
+                        kernels
+                            .quantized_attention_prefix(
+                                &q_block, &keys, &values_q, end, scale, true, group, bits,
+                            )
+                            .unwrap(),
+                    );
+                    start_row = end;
+                }
+                let views: Vec<&ExecutionTensor> = blocks.iter().collect();
+                let out = kernels.concatenate(&views, 2).unwrap();
+                kernels.evaluate(&[&out]).unwrap();
+                let elapsed = start.elapsed().as_secs_f64();
+                if i == 0 {
+                    first = elapsed;
+                } else {
+                    best = best.min(elapsed);
+                }
+                whole = Some(out);
+            }
+            (first, best, whole.unwrap())
+        };
+        let (ff, flash_ms, flash) = {
+            let mut best = f64::INFINITY;
+            let mut first = 0.0;
+            let mut sliced = None;
+            for i in 0..5 {
+                let start = std::time::Instant::now();
+                let pad_q = build_pad(&mut kernels);
+                let out = kernels
+                    .q8_flash_prefill(&pad_q, &keys, &values_q, cap, scale, group, bits, None, 0)
+                    .unwrap();
+                let out = kernels
+                    .slice(&out, &[0, 0, 0, 0], &[1, h, rows, d])
+                    .unwrap();
+                kernels.evaluate(&[&out]).unwrap();
+                let elapsed = start.elapsed().as_secs_f64();
+                if i == 0 {
+                    first = elapsed;
+                } else {
+                    best = best.min(elapsed);
+                }
+                sliced = Some(out);
+            }
+            (first, best, sliced.unwrap())
+        };
+        eprintln!(
+            "dense REP6 rows={rows} depth={cap}: composite {composite_ms:.3}ms (first {cf:.3}), flash+pad {flash_ms:.3}ms (first {ff:.3})"
+        );
+
+        // Numerics: the F32 reference in the same blocks, over the real 24 heads.
+        let mut reference: Vec<f32> = Vec::new();
+        let mut start = 0u32;
+        while start < rows {
+            let end = (start + block).min(rows);
+            let q_block = kernels
+                .slice(&q, &[0, 0, start, 0], &[1, h, end, d])
+                .unwrap();
+            let out = kernels
+                .grouped_attention_prefix(&q_block, &k, &v, end, scale, end - start > 1)
+                .unwrap();
+            let mut block_values = values(&mut kernels, &out).unwrap();
+            reference.append(&mut block_values);
+            start = end;
+        }
+        let composite_flat = values(&mut kernels, &composite).unwrap();
+        let flash_flat = values(&mut kernels, &flash).unwrap();
+        let max_err = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0, f32::max)
+        };
+        let composite_err = max_err(&composite_flat, &reference);
+        let flash_err = max_err(&flash_flat, &reference);
+        eprintln!(
+            "dense REP6 tolerance: composite err {composite_err:.6}, flash err {flash_err:.6}"
+        );
+        assert!(
+            flash_err <= composite_err * 1.10 + 1e-6,
+            "flash err {flash_err:.6} vs composite err {composite_err:.6}"
+        );
+    }
 }
