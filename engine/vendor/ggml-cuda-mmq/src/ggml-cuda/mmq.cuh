@@ -1514,7 +1514,9 @@ cudaError_t mul_mat_q_switch_J(const mmq_args & args, cudaStream_t stream) {
 template <ggml_type type>
 cudaError_t mul_mat_q_case(const mmq_args & args, cudaStream_t stream) {
     FIFI_TRY(fifi_check_device(args.dev));
-    if (args.nrows_x % 128 == 0) {
+    // DEBUG: force fallback for small expert counts (the non-fallback kernel
+    // fails for k<n at n_experts=78 on Turing; the fallback variant works)
+    if (args.nrows_x % 128 == 0 && args.nchannels_x >= 100) {
         constexpr bool fallback = false;
         return mul_mat_q_switch_J<type, fallback>(args, stream);
     } else {
