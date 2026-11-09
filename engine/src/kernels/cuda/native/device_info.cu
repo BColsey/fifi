@@ -26,3 +26,23 @@ extern "C" int inference_cuda_device_integrated(int *out_integrated) {
         return INFERENCE_CUDA_NATIVE_EXCEPTION;
     }
 }
+
+/* One-thread store of a host-known i32, stream-ordered, never blocking:
+ * the KV8 tile loop's causal-length words ride this instead of a
+ * blocking write_at, so the host stops draining the stream between
+ * attention tiles (deep prompts paid ~hundreds of syncs per chunk). */
+__global__ void store_i32_k(int *dst, int value) { *dst = value; }
+
+extern "C" int inference_cuda_store_i32(void *stream, int *dst, int value) {
+    try {
+        if (dst == NULL) {
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        }
+        (void)cudaGetLastError();
+        store_i32_k<<<1, 1, 0, (cudaStream_t)stream>>>(dst, value);
+        const cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess ? INFERENCE_CUDA_OK : (int)err;
+    } catch (...) {
+        return INFERENCE_CUDA_NATIVE_EXCEPTION;
+    }
+}

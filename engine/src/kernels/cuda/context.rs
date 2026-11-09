@@ -1960,3 +1960,32 @@ mod fixed_projection_contract_tests {
         }
     }
 }
+
+impl CudaContext {
+    /// One-thread, stream-ordered i32 store onto a device word (the KV8
+    /// tile loop's causal lengths ride this instead of a blocking
+    /// write_at, so the host never drains the stream between tiles).
+    pub(crate) fn store_i32(
+        &self,
+        stream: &DeviceStream,
+        word: crate::kernels::cuda::DeviceRange<'_>,
+        value: i32,
+    ) -> Result<(), EngError> {
+        if word.bytes() < 4 {
+            return Err(EngError::BadRequest(
+                "the i32 store needs a 4-byte word".to_owned(),
+            ));
+        }
+        let raw_word = self.raw_range(&word)?;
+        let raw_stream = stream.raw()?;
+        // Enter like launch_on: the pin makes the store land on the
+        // stream's card (the chunk driver interleaves cards on one thread).
+        let _pin = self.enter()?;
+        crate::kernels::cuda::native::device_info::store_i32(
+            raw_stream.as_ptr(),
+            raw_word.address().cast::<i32>(),
+            value,
+        )
+        .map_err(|status| native_error(&TERMINAL, "inference_cuda_store_i32", status))
+    }
+}

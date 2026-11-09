@@ -2014,13 +2014,13 @@ fn attn_flash_kv8(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), 
     for row in (0..run.rows.m()).step_by(KV8_ATTN_TILE_ROWS) {
         let (m, first_length) = kv8_attention_tile(run.rows.p0(), run.rows.m(), row)?;
         let [q, proj, out] = kv8_attention_rows(run, row, m)?;
-        // The existing checked copy is stream-ordered but blocking. No fixture initialization
-        // or StepParams word is required, including after reset or an FP16 attention plan.
-        parts.length.buffer().write_at(
-            ctx.launch.stream,
-            parts.length.offset(),
-            &first_length.to_le_bytes(),
-        )?;
+        // The causal-length word rides a one-thread device store:
+        // stream-ordered like the old checked copy, but never blocking, so
+        // the host stops draining the stream between tiles (deep prompts
+        // paid a sync per tile per full-attention layer).
+        ctx.launch
+            .ctx
+            .store_i32(ctx.launch.stream, parts.length, first_length)?;
         let mut shape = attn_q8_shape(g, run.state.layout().kv.capacity);
         shape.m = m;
         ctx.launch.ctx.attn_decode_q8(

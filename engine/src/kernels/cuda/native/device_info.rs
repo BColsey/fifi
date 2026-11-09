@@ -32,6 +32,29 @@ pub(in crate::kernels::cuda) fn device_integrated() -> Result<bool, c_int> {
     }
 }
 
+/// One-thread, stream-ordered store of a host-known i32. Used by the KV8
+/// tile loop for causal-length words so the host never drains the stream
+/// between attention tiles. The raw C status is passed through; a failed
+/// launch latches at the next synchronize exactly as any launch would.
+pub(in crate::kernels::cuda) fn store_i32(
+    stream: *mut core::ffi::c_void,
+    dst: *mut i32,
+    value: i32,
+) -> Result<(), i32> {
+    unsafe extern "C" {
+        #[link_name = "inference_cuda_store_i32"]
+        fn store_i32_entry(stream: *mut core::ffi::c_void, dst: *mut i32, value: i32) -> i32;
+    }
+    // SAFETY: `dst` is a device word the caller proved live on `stream`'s
+    // device; the entry launches one thread and keeps no pointer.
+    let status = unsafe { store_i32_entry(stream, dst, value) };
+    if status == STATUS_OK {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
