@@ -2429,6 +2429,9 @@ fn run_chunk_tiered(
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
     eprintln!("tiered-chunk: launching up MMQ");
     launch_mmid(native_stack(&weights.up)?, q8s, 2 * dims.inter, up_dst)?;
+    eprintln!("tiered-chunk: syncing after up MMQ");
+    stream.synchronize()?;
+    eprintln!("tiered-chunk: sync after up MMQ OK");
     eprintln!("tiered-chunk: launching swiglu");
     ctx.swiglu_rows(
         stream,
@@ -2439,12 +2442,23 @@ fn run_chunk_tiered(
         },
     )?;
     let down = native_stack(&weights.down)?;
-    eprintln!("tiered-chunk: launching gather quantize");
+    let q8act = d.get(ChunkSlot::Q8Act)?;
+    let ids_dst = d.get(ChunkSlot::IdsDst)?;
+    let act = d.get(ChunkSlot::Act)?;
+    eprintln!(
+        "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
+        dims.inter,
+        ids.shape().ne_get_rows(),
+        act.offset(), act.bytes(),
+        q8act.offset(), q8act.bytes(),
+        ids_dst.offset(), ids_dst.bytes(),
+    );
+    eprintln!("tiered-chunk: launching gather quantize (Vendor packing)");
     ctx.mmq_quantize_gather_ids(
         stream,
         &ids,
         MmidQuantCall {
-            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
+            packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
             quant: down.quant(),
             k: dims.inter,
             row_stride: dims.inter,
