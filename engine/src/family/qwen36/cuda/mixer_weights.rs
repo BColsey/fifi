@@ -187,8 +187,8 @@ impl<'w> MixerWeights<'w> {
 }
 
 /// Resolves one dense spec of `layer` in `layout`: the tiles (shape-checked by `check_dense`) or
-/// the native blocks (shape-checked plus the rows%4 rule of `check_native_dense`), and a tensor
-/// of the other layout is a `Checkpoint` naming it, so a mixed load stops at the lookup.
+/// the native blocks (shape-checked plus the rows%4 rule of `check_native_dense`). Tiled
+/// overrides may also resolve under a native session; unsupported layouts refuse at lookup.
 pub(super) fn dense_weight<'w>(
     weights: &'w CudaWeights,
     name: &str,
