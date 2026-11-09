@@ -444,6 +444,7 @@ fn the_worker_feeds_m_sess_tokens_per_piece() {
     let mut finished = 0;
     while let Some(event) = events.events.blocking_recv() {
         match event {
+            JobEvent::Started => {}
             JobEvent::Error(ref e) => {
                 errors += 1;
                 eprintln!("JOB_ERROR {e:?}");

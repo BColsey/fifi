@@ -339,6 +339,7 @@ fn cuda_engine_streams_the_gate_tokens() {
         "the stream job's first event",
     ) {
         match event {
+            JobEvent::Started => {}
             JobEvent::Batch(batch) => {
                 streamed.extend_from_slice(&batch.tokens);
                 if let Some(reason) = batch.finish {
@@ -409,6 +410,7 @@ fn cuda_engine_streams_the_gate_tokens() {
         event_before(&runtime, &mut long_events.events, deadline, "the long job")
     {
         match event {
+            JobEvent::Started => {}
             JobEvent::Batch(batch) => {
                 if let Some(reason) = batch.finish {
                     long_finish = Some(reason);
@@ -440,6 +442,7 @@ fn cuda_engine_streams_the_gate_tokens() {
         event_before(&runtime, &mut next_events.events, deadline, "the next job")
     {
         match event {
+            JobEvent::Started => {}
             JobEvent::Batch(batch) => next_tokens += batch.tokens.len(),
             JobEvent::Finished(_) => break,
             // "The next request works" is ASSERTED, not assumed: an error fails the test.

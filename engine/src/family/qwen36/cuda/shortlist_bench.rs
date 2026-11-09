@@ -89,6 +89,7 @@ fn generate(
     let mut tokens = Vec::new();
     while let Some(event) = owner.events.blocking_recv() {
         match event {
+            JobEvent::Started => {}
             JobEvent::Batch(batch) => {
                 if batch.tokens.is_empty() {
                     continue;
