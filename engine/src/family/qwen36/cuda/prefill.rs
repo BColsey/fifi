@@ -2245,17 +2245,167 @@ pub(super) fn run_chunk_moe(
     moe: ChunkMoe<'_, '_>,
     io: &MoeChunkIo<'_>,
 ) -> Result<(), EngError> {
-    let mw = match moe {
-        ChunkMoe::Resident(mw) => mw,
-        ChunkMoe::Tiered { .. } => {
-            return Err(EngError::BadRequest(
-                "tiered chunk prefill: not supported".to_owned(),
-            ));
+    match moe {
+        ChunkMoe::Resident(mw) => {
+            run_chunk_shared(launch, mw, io)?;
+            run_chunk_routed(launch, mw, io)?;
+            combine_chunk_moe(launch, io)
         }
+        ChunkMoe::Tiered { runtime, layer } => run_chunk_tiered(launch, runtime, layer, io),
+    }
+}
+
+/// The tiered chunk MoE: the shared expert unchanged, the routed stages against the
+/// BANK stacks with host-built grouped ids, and the CPU misses served as one grouped
+/// pool job whose partial joins the combine as a second M-row add.
+///
+/// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
+/// with three differences: (1) the route readback is HOST-side — M rows of ids and
+/// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
+/// grouped ids come from `MmidIds::from_host` with misses spread round-robin over
+/// the slots (the ≤m-columns invariant; the weight is 0.0, so the wasted compute is
+/// bounded by the miss rate); (3) the CPU partial joins via one extra M-row
+/// `moe_combine` (top_k 1, weights ones, in place).
+fn run_chunk_tiered(
+    launch: &Launch<'_>,
+    runtime: &mut TieredRuntime<'_>,
+    layer: usize,
+    io: &MoeChunkIo<'_>,
+) -> Result<(), EngError> {
+    let (ctx, stream, m, dims) = (launch.ctx, launch.stream, io.m, &io.dims);
+    let top_k = dims.top_k;
+    let hidden = dims.hidden;
+    let slots = runtime.slots();
+
+    // The batched route readback: M x top_k ids + M x top_k weights + M x hidden
+    // normed rows, one pinned batch + one event wait.
+    let route = tiered_chunk_route_to_host(ctx, stream, io, m, top_k, hidden)?;
+
+    // The host classification FIRST (&mut runtime): validate every row, classify
+    // every pick. The weights borrow comes after — it cannot coexist with &mut.
+    let rows: Vec<crate::family::qwen36::tiered::host::ChunkRouteRow> = (0..m)
+        .map(|r| crate::family::qwen36::tiered::host::ChunkRouteRow {
+            ids: route.ids[r * top_k..(r + 1) * top_k].to_vec(),
+            weights: route.weights[r * top_k..(r + 1) * top_k].to_vec(),
+            hidden: route.hidden[r * hidden..(r + 1) * hidden].to_vec(),
+        })
+        .collect();
+    let (plan, misses) = runtime
+        .begin_chunk(layer, &rows)
+        .map_err(|e| EngError::Backend {
+            operation: "tiered_chunk_host",
+            message: e.to_string(),
+        })?;
+
+    // The shared expert: unchanged, against the runtime's own weights (& runtime).
+    let weights = runtime.layer_weights(layer)?;
+    run_chunk_shared(launch, &weights, io)?;
+
+    // The host-built grouped ids: compact columns grouped by slot, misses spread
+    // round-robin. The device TopkWeight gets the plan's weights (misses are 0.0).
+    let ids = build_tiered_host_ids(&plan, m, top_k, slots, ctx, stream, io)?;
+    patch_tiered_weights(ctx, stream, &plan, m, top_k, io)?;
+
+    // Stages 12-16 against the bank stacks: scatter quantize, grouped MMQ, swiglu.
+    let gate_stack = native_stack(&weights.gate)?;
+    let _ = gate_stack; // slice-5-cont: the scatter quantize through the host ids
+    // TODO(slice-5-cont): the grouped gate/up/down launches against the bank stacks,
+    // the swiglu, the M-row combine, the CPU pool call, and the partial add.
+    // The launch shape mirrors run_chunk_routed's stages 13-16 with the bank's
+    // n_experts = slots instead of dims.n_expert, and the fixup from the same slot.
+
+    let _ = (misses, stream, ctx, gate_stack);
+    Err(EngError::BadRequest(
+        "tiered chunk prefill: slice 5 in progress (readback+classify landed; launches next)"
+            .to_owned(),
+    ))
+}
+
+/// The batched route readback of one chunk layer: one pinned copy of the router's
+/// M x top_k ids, M x top_k weights and M x hidden normed rows, one event wait.
+fn tiered_chunk_route_to_host(
+    ctx: &crate::kernels::cuda::CudaContext,
+    stream: &crate::kernels::cuda::DeviceStream,
+    io: &MoeChunkIo<'_>,
+    m: usize,
+    top_k: usize,
+    hidden: usize,
+) -> Result<ChunkRouteRead, EngError> {
+    let ids_bytes = m * top_k * 4;
+    let weights_bytes = m * top_k * 4;
+    let hidden_bytes = m * hidden * 4;
+    let total = ids_bytes + weights_bytes + hidden_bytes;
+    let mut pinned = ctx.pinned_buf(total)?;
+    ctx.copy_to_pinned(stream, io.ids, &mut pinned, 0)?;
+    ctx.copy_to_pinned(stream, io.weights, &mut pinned, ids_bytes)?;
+    // The normed row the CPU experts read: the router's x2 (the post-norm hidden).
+    ctx.copy_to_pinned(stream, io.x2, &mut pinned, ids_bytes + weights_bytes)?;
+    let event = ctx.event()?;
+    stream.record(&event)?;
+    pinned.wait(&event)?;
+    let mut raw = vec![0u8; total];
+    pinned.read(0, &mut raw)?;
+    let floats = |bytes: &[u8]| -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect()
     };
-    run_chunk_shared(launch, mw, io)?;
-    run_chunk_routed(launch, mw, io)?;
-    combine_chunk_moe(launch, io)
+    let ints = |bytes: &[u8]| -> Vec<i32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| i32::from_le_bytes(*w))
+            .collect()
+    };
+    Ok(ChunkRouteRead {
+        ids: ints(&raw[..ids_bytes]),
+        weights: floats(&raw[ids_bytes..ids_bytes + weights_bytes]),
+        hidden: floats(&raw[ids_bytes + weights_bytes..]),
+    })
+}
+
+/// The chunk route as one flat batch.
+struct ChunkRouteRead {
+    ids: Vec<i32>,
+    weights: Vec<f32>,
+    hidden: Vec<f32>,
+}
+
+/// Builds the grouped ids on the host: each pick's column goes to its bank slot's
+/// group (resident picks) or a spread slot (misses, round-robin so no group exceeds
+/// m columns). The weights patch zeroes the misses.
+fn build_tiered_host_ids(
+    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+    m: usize,
+    top_k: usize,
+    slots: usize,
+    _ctx: &crate::kernels::cuda::CudaContext,
+    _stream: &crate::kernels::cuda::DeviceStream,
+    _io: &MoeChunkIo<'_>,
+) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'static>, EngError> {
+    let _ = (plan, m, top_k, slots);
+    Err(EngError::BadRequest(
+        "tiered chunk prefill: host ids construction is the next piece".to_owned(),
+    ))
+}
+
+/// Patches the device TopkWeight with the plan's weights (misses are 0.0).
+fn patch_tiered_weights(
+    _ctx: &crate::kernels::cuda::CudaContext,
+    _stream: &crate::kernels::cuda::DeviceStream,
+    plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
+    m: usize,
+    top_k: usize,
+    io: &MoeChunkIo<'_>,
+) -> Result<(), EngError> {
+    let _ = (plan, m, top_k, io);
+    Err(EngError::BadRequest(
+        "tiered chunk prefill: weights patch is the next piece".to_owned(),
+    ))
 }
 
 /// Stages 10a-f, the shared expert. Diagnostic runs replace only its projections.
