@@ -751,7 +751,39 @@ impl CudaContext {
     ) -> Result<(), EngError> {
         self.ensure_usable()?;
         let raw = self.plan_mmid_launch(&call)?;
-        self.launch_on(stream, move |s| mmq_mmid_launch(s, raw))
+        let shape = (
+            call.ids.shape.m,
+            call.ids.shape.top_k,
+            call.ids.shape.n_experts,
+        );
+        let extents = [
+            call.weight.base.offset(),
+            call.weight.base.bytes(),
+            call.y.offset(),
+            call.y.bytes(),
+            call.ids.out.ids_dst.offset(),
+            call.ids.out.ids_dst.bytes(),
+            call.ids.out.expert_bounds.offset(),
+            call.ids.out.expert_bounds.bytes(),
+            call.dst.offset(),
+            call.dst.bytes(),
+            call.fixup.offset(),
+            call.fixup.bytes(),
+            call.weight.n,
+            call.weight.k,
+            call.ld,
+        ];
+        self.launch_on(stream, move |s| {
+            let out = mmq_mmid_launch(s, raw);
+            if out.is_err() {
+                eprintln!(
+                    "mmq-mmid-debug: (m, top_k, experts) {shape:?} extents \
+                     (w_off, w_bytes, y_off, y_bytes, ids_off, ids_bytes, bounds_off, bounds_bytes, \
+                     dst_off, dst_bytes, fix_off, fix_bytes, n, k, ld) {extents:?}"
+                );
+            }
+            out
+        })
     }
 
     fn plan_mmid_launch<'b>(
