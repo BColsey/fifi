@@ -209,14 +209,6 @@ SOFTWARE.
 | `provenance.json` | `c086b791129c9d4fda9b69c135f6132f139a39833c569fc5f2e2cb5c085a2e23` |
 | `src/gated_delta.py` | `3e445528acc01f7bcb0e44847cbdbb1ced69ce81218080f7dd701754e4dee856` |
 
-## llguidance / toktrie / derivre
-
-- Crates, from crates.io (not vendored; versions from `engine/Cargo.lock`):
-  - `llguidance` 1.7.5, https://github.com/guidance-ai/llguidance. `engine/Cargo.toml` declares it with the `lark` feature and default features off.
-  - `toktrie` 1.9.1, https://github.com/guidance-ai/llguidance. A dependency of `llguidance`.
-  - `derivre` 0.3.11, https://github.com/microsoft/derivre. A dependency of `llguidance`.
-- License: MIT, "Copyright (c) Microsoft Corporation.", for all three crates, as declared in each crate's `Cargo.toml` and `LICENSE`.
-
 ## Test data
 
 - `engine/testdata/gemma4/humanizer-config.json` is the unmodified `config.json` of the Hugging Face model `jialinyyzz/humanizer` at revision `2e57b6528a4070c33f3e09ca24e3325a84272f68`. At that revision the repository's `LICENSE` is the Apache License, Version 2.0, and its model card declares `apache-2.0`. Its `NOTICE` file begins: "humanizer / Copyright 2026 Stephen Yu / This product is licensed under the Apache License, Version 2.0 (see LICENSE). This applies to the code in this repository and to the released model weights." `prompt-cases.json` in the same directory holds the prompt instruction and separator from that model's README. It and `parity-prompt.json` hold token ids from that model's tokenizer.
