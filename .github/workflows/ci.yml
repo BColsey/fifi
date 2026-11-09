@@ -56,6 +56,10 @@ jobs:
       - name: Pack qualification registry
         run: python3 ../scripts/qual_inventory.py packs
       - name: Tests (CPU-only default features, evidence and minimum-ran floor)
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           status=0
           python3 ../scripts/qual_inventory.py collect \
