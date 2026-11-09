@@ -1734,6 +1734,10 @@ mod tests {
             .unwrap();
         let flash = unpad_rep6_output(&mut kernels, &flash_out, h, kvh).unwrap();
         let flash = values(&mut kernels, &flash).unwrap();
+        // A last synchronizing evaluate flushes the retire list so the adapter teardown
+        // releases the process owner before the next native test initializes (without it,
+        // the leftover lazy arrays hold the owner and sliced_* fails with "already holds").
+        kernels.evaluate(&[&flash_out]).unwrap();
 
         let max_err = |a: &[f32], b: &[f32]| {
             a.iter()
