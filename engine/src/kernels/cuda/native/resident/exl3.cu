@@ -1424,8 +1424,7 @@ static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t coun
             a.fused_publish != p.fused_publish ||
             a.rows > grouped_capacity - first || !linear_views(a, 2) ||
             !follows(a.xh, calls[0].xh, first * p.k * 4) ||
-            !follows(a.z, calls[0].z, first * p.n * 4) ||
-            !follows(a.out, calls[0].out, first * p.n * 4)) return false;
+            !follows(a.z, calls[0].z, first * p.n * 4)) return false;
         p.entries[i] = {a.trellis, a.suh, a.svh, a.bias, a.x, a.xh, a.z, a.out,
             a.bits_twice, a.book, uint32_t(first), uint32_t(a.rows)};
         for (size_t row = 0; row < a.rows; ++row) p.row_to_group[first + row] = uint8_t(i);
@@ -1434,22 +1433,35 @@ static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t coun
     p.pairs = uint32_t(first);
     struct View { const void *p; size_t bytes; };
     // Unions are used for alias checks only; each live per-group extent was checked above.
+    // The out extents may be scattered: the banked decode writes disjoint rows of one
+    // activation buffer per routed expert, so out is checked per call, not as one span.
     const View writes[] = {{calls[0].xh, first * p.k * 4},
-        {calls[0].z, first * p.n * 4}, {calls[0].out, first * p.n * 4}, {p.flag, 4}};
-    for (size_t i = 0; i < 4; ++i) {
+        {calls[0].z, first * p.n * 4}, {p.flag, 4}};
+    for (size_t i = 0; i < 3; ++i) {
         if (!region(writes[i].p, writes[i].bytes, writes[i].bytes, 4)) return false;
         for (size_t j = 0; j < i; ++j)
             if (!apart(writes[i].p, writes[i].bytes, writes[j].p, writes[j].bytes)) return false;
     }
     for (size_t i = 0; i < count; ++i) {
         const auto &a = calls[i];
+        const size_t out_bytes = size_t(a.rows) * p.n * 4;
+        if (!region(a.out, out_bytes, out_bytes, 4)) return false;
+        for (size_t j = 0; j < 3; ++j)
+            if (!apart(a.out, out_bytes, writes[j].p, writes[j].bytes)) return false;
+        for (size_t j = 0; j < i; ++j)
+            if (!apart(a.out, out_bytes, calls[j].out,
+                       size_t(calls[j].rows) * p.n * 4)) return false;
         const View reads[] = {{a.trellis, a.k * a.n / 256 * size_t(a.bits_twice) * 16},
             {a.suh, a.k * 4}, {a.svh, a.n * 4}, {a.bias, a.bias ? a.n * 4 : 0},
             {a.x, a.rows * a.k * 4}};
         for (const auto &read : reads)
-            if (read.bytes)
+            if (read.bytes) {
                 for (const auto &write : writes)
                     if (!apart(read.p, read.bytes, write.p, write.bytes)) return false;
+                for (size_t j = 0; j < count; ++j)
+                    if (!apart(read.p, read.bytes, calls[j].out,
+                               size_t(calls[j].rows) * p.n * 4)) return false;
+            }
     }
     return true;
 }

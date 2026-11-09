@@ -75,8 +75,10 @@ int inference_cuda_exl3_linear(const inference_cuda_exl3_linear_args *args,
 int inference_cuda_exl3_linear_split(const inference_cuda_exl3_linear_args *args,
                                      uint32_t split_k, void *stream, int *out_stage);
 /* Grouped split-2 small-row projection: 1..48 groups and 1..48 total pairs,
- * each group having 1..8 rows and shared k, n and flag. XH/Z/out must be
- * contiguous in group order; each Z slice holds one split-2 F32 bank.
+ * each group having 1..8 rows and shared k, n and flag. XH and Z must be
+ * contiguous in group order; each Z slice holds one split-2 F32 bank. The
+ * out extents may be scattered (the banked decode writes disjoint rows of
+ * one activation buffer per routed expert) but must be mutually disjoint.
  * Cross-group read/read aliases are allowed; writes must remain disjoint
  * from all reads and other writes. All groups validate before any enqueue;
  * invalid arguments return INVALID_ARGUMENT with STAGE_NONE. Stream and

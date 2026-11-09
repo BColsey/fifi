@@ -256,29 +256,15 @@ fn grouped(launch: &Launch<'_>, pairs: &[Pair<'_>], scratch: &Scratch<'_>) -> Re
     launch.ctx.exl3_grouped_step(launch.stream, &calls)
 }
 
-/// [`grouped`] as one launch per maximal run of plan-contiguous `out` rows (shared with
-/// the merged block's split: both split their groups around the overlap refills). The C side of the
-/// grouped kernels validates that a launch's out rows are consecutive (`follows` in
-/// `group_args`), and a resident/refilling split - or a hit pick inside a miss run - leaves
-/// holes between the kept rows, so each contiguous slice becomes its own launch. A whole
-/// plan is one run, so an unsplit call set still launches once.
+/// [`grouped`] as one launch over the whole set: the C side of the grouped kernels takes
+/// scattered out rows (each group's extent is validated per call), so a resident/refilling
+/// split - or a hit pick inside a miss run - no longer needs one launch per contiguous slice.
 pub(super) fn grouped_runs(
     launch: &Launch<'_>,
     pairs: &[Pair<'_>],
     scratch: &Scratch<'_>,
 ) -> Result<(), EngError> {
-    let mut start = 0;
-    while start < pairs.len() {
-        let mut end = start + 1;
-        while end < pairs.len()
-            && pairs[end].out.offset() == pairs[end - 1].out.offset() + pairs[end - 1].out.bytes()
-        {
-            end += 1;
-        }
-        grouped(launch, &pairs[start..end], scratch)?;
-        start = end;
-    }
-    Ok(())
+    grouped(launch, pairs, scratch)
 }
 
 /// One pair of an id-indexed launch: the bank, the pick slot whose id chooses the member, the row
