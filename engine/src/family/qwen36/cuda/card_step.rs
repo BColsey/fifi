@@ -123,7 +123,22 @@ impl CardStack {
         admission: &Admission,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         let table = ShardTable::new(&dims.shape, devices.len(), 32)?;
-        Self::with_table(dims, options, devices, admission, &table)
+        Self::with_payload(dims, options, devices, admission, &table, None)
+    }
+
+    /// The ring's mailbox payload cap: the default covers the eager step's
+    /// exchanges (hidden*top_k for the fused MoE block); a chunked session
+    /// passes m*hidden so every layer sum of a chunk is one sequence.
+    pub(crate) fn with_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        payload: Option<usize>,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        let ring_payload = payload.unwrap_or(dims.shape.hidden * dims.shape.moe.top_k.max(1));
+        Self::with_table_payload(dims, options, devices, admission, table, ring_payload)
     }
 
     /// The stack over an explicit shard table: the placement planner's
@@ -134,6 +149,24 @@ impl CardStack {
         devices: &[usize],
         admission: &Admission,
         table: &ShardTable,
+    ) -> Result<(Self, Vec<ResidentState>), EngError> {
+        Self::with_table_payload(
+            dims,
+            options,
+            devices,
+            admission,
+            table,
+            dims.shape.hidden * dims.shape.moe.top_k.max(1),
+        )
+    }
+
+    pub(crate) fn with_table_payload(
+        dims: &StepDims,
+        options: &StepOptions,
+        devices: &[usize],
+        admission: &Admission,
+        table: &ShardTable,
+        ring_payload: usize,
     ) -> Result<(Self, Vec<ResidentState>), EngError> {
         if devices.is_empty() {
             return Err(EngError::BadRequest(
@@ -152,7 +185,7 @@ impl CardStack {
         // bare contexts before anything else borrows them. The payload cap
         // covers the MoE all-reduce, which exchanges every `expert_down`
         // pick row (`top_k` hidden rows) in one sequence.
-        let ring = PeerRing::new(&contexts, dims.shape.hidden * dims.shape.moe.top_k.max(1))?;
+        let ring = PeerRing::new(&contexts, ring_payload)?;
         let sync_broadcasts =
             std::env::var_os("Q36_P2P_SYNC_BROADCAST").is_some_and(|value| value == "1");
         let mut plans = Vec::with_capacity(devices.len());
