@@ -941,4 +941,63 @@ mod card_tests {
             "the pair's arenas {both} stay under two full arenas"
         );
     }
+
+    /// The non-primary card writes its partial MoE combine into Delta while all of the
+    /// combine's inputs are still live. The arena must keep that output apart from them.
+    #[test]
+    fn card_combine_output_is_disjoint_from_its_inputs() {
+        let inv = Inventory::for_spec(&QWEN3_6_35B_A3B).expect("inventory");
+        let shape = HostShape::from_spec(
+            &QWEN3_6_35B_A3B,
+            crate::family::qwen36::cuda::pinned::ROTARY_DIM,
+        )
+        .expect("shape");
+        let dims = super::super::dims::StepDims::new(&shape, &inv).expect("dims");
+        let table = super::super::shard::ShardTable::new(&shape, 2, 32).expect("table");
+        for card in 0..2 {
+            let geometry =
+                super::super::mixer_geometry::MixerGeometry::for_card(&dims, &table, card)
+                    .expect("card geometry");
+            let moe = crate::family::qwen36::host::MoeDims {
+                inter: table.expert_inter(card).expect("inter").len(),
+                shared_inter: table.shared_inter(card).expect("shared").len(),
+                ..shape.moe
+            };
+            for nsm in [28, 68] {
+                for m in [1, 15, 16, 31, 32, 64, 96, 128, 256, 512] {
+                    let tensors =
+                        chunk_tensors_for(&dims, &geometry, &moe, m, nsm).expect("card plan");
+                    let plan = plan_arena(&tensors.iter().map(|(_, t)| *t).collect::<Vec<_>>())
+                        .expect("card arena");
+                    let index = |slot| {
+                        tensors
+                            .iter()
+                            .position(|(candidate, _)| *candidate == slot)
+                            .expect("slot in card arena")
+                    };
+                    let out = index(ChunkSlot::Delta);
+                    let output = tensors[out].1;
+                    assert!(
+                        (output.first..=output.last).contains(&(Phase::Combine as usize)),
+                        "card {card}, m {m}, nsm {nsm}: combine output is not live"
+                    );
+                    for slot in [
+                        ChunkSlot::Zero,
+                        ChunkSlot::Down,
+                        ChunkSlot::TopkWeight,
+                        ChunkSlot::SharedGate,
+                        ChunkSlot::ShOut,
+                    ] {
+                        let input = index(slot);
+                        let apart = plan.offsets[out] + output.bytes <= plan.offsets[input]
+                            || plan.offsets[input] + tensors[input].1.bytes <= plan.offsets[out];
+                        assert!(
+                            apart,
+                            "card {card}, m {m}, nsm {nsm}: Delta overlaps {slot:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
