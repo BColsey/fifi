@@ -703,9 +703,12 @@ fn exl3_scratch_rows(dims: &StepDims, g: &MixerGeometry, m: usize) -> Result<Vec
     .ok_or_else(overflow)?;
     let plain = d.beta_rows.max(d.alpha_rows);
     let jobs = EXL3_JOB_WORDS * m.div_ceil(EXL3_TILE_ROWS);
+    // The chunked gate/up pairs are one-row grouped launches, so FIFI_EXL3_GROUP_SPLIT
+    // widens their partial banks here exactly as the step plan does.
+    let banks = (super::exl3_moe::group_split() as usize - 1).max(1);
     Ok(vec![
         (S::Exl3Xh, half_bytes(&[m, widest_k])?, Embed, Combine),
-        (S::Exl3Z, word_bytes(&[m, widest_n])?, Embed, Combine),
+        (S::Exl3Z, word_bytes(&[m, widest_n, banks])?, Embed, Combine),
         (S::Exl3Y, word_bytes(&[m, plain])?, Embed, Combine),
         (S::Exl3Flag, EXL3_FLAG_BYTES, Embed, Combine),
         (S::DenseJobs, word_bytes(&[jobs])?, Embed, Combine),

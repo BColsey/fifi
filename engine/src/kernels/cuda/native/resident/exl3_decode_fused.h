@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) grouped_project_small
     // [base, base + half): point xh at the shared half so it reads the staged values.
     e.xh = s_rot - base;
     if (a.bits_twice == 10)
-        one_tile_by_alignment<2, 10, GroupArgs, Dp4a>(p, e, wtab[threadIdx.x / 32], partial);
+        one_tile_by_alignment<2, 10, GroupArgs, Dp4a>(p, e, wtab[threadIdx.x / 32], partial, 2);
     else
-        one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, e, wtab[threadIdx.x / 32], partial);
+        one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, e, wtab[threadIdx.x / 32], partial, 2);
 }

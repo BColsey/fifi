@@ -1144,6 +1144,29 @@ impl CudaContext {
         self.launch_on(stream, |s| ffi::grouped(s, &raw, gather))
     }
 
+    /// The grouped launch with a k split of 4 or 8 (every call must already carry that
+    /// `split_k` and one row, with z sized for the extra partial banks - see `exl3.h`).
+    /// The fold order changes, so values differ from split 2 in the last ulp; callers
+    /// opt in for the extra blocks in flight of the fill-limited decode.
+    pub(crate) fn exl3_grouped_split(
+        &self,
+        stream: &DeviceStream,
+        calls: &[Exl3LinearCall<'_>],
+    ) -> Result<(), EngError> {
+        let split = calls.first().map(|call| call.split_k).unwrap_or(0);
+        if !matches!(split, 4 | 8)
+            || calls
+                .iter()
+                .any(|call| call.rows != 1 || call.split_k != split)
+        {
+            return Err(EngError::BadRequest(
+                "EXL3 grouped split needs one-row calls of one 4/8 split".into(),
+            ));
+        }
+        let raw = self.grouped_split_raw(calls)?;
+        self.launch_on(stream, |s| ffi::grouped_split(s, &raw))
+    }
+
     /// The grouped launch with the wide projection: each block covers `cols` (1, 2, 4 or 8) adjacent
     /// 16-column tiles, so every call's `n` must be a multiple of `16 * cols`. Every byte
     /// written equals the `gather` launch of [`Self::exl3_grouped`].
@@ -1413,6 +1436,22 @@ impl CudaContext {
             });
         }
         self.launch_on(stream, |s| ffi::grouped_indexed(s, &raw, &index, cols))
+    }
+
+    fn grouped_split_raw<'a>(
+        &self,
+        calls: &[Exl3LinearCall<'a>],
+    ) -> Result<Vec<ffi::LinearRaw<'a>>, EngError> {
+        self.ensure_usable()?;
+        if calls.iter().any(|call| call.fused != calls[0].fused) {
+            return Err(EngError::BadRequest(
+                "EXL3 grouped calls must all use the same fused-publish arm".into(),
+            ));
+        }
+        calls
+            .iter()
+            .map(|call| self.exl3_linear_raw(call, false))
+            .collect()
     }
 
     /// Checks the group of a grouped launch and maps it to native ranges.

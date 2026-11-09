@@ -393,10 +393,50 @@ fn linear_mode(
     checked(status, stage)
 }
 
+pub(in crate::kernels::cuda) fn grouped_split(
+    stream: &RawStream,
+    calls: &[LinearRaw<'_>],
+) -> Result<(), DeviceFailure> {
+    let split = calls.first().map(|call| call.split_k).unwrap_or(0);
+    if calls.is_empty()
+        || calls.len() > 48
+        || !matches!(split, 4 | 8)
+        || calls
+            .iter()
+            .any(|call| call.rows != 1 || call.split_k != split)
+    {
+        return Err(invalid_argument());
+    }
+    let mut args = Vec::with_capacity(calls.len());
+    for call in calls {
+        args.push(linear_args(call, false)?);
+    }
+    let mut stage = STAGE_NONE;
+    // SAFETY: every record has live bounded owners; C validates the group, the widened
+    // z strides and cross-group aliases before ANY enqueue, exactly as the split-2 entry.
+    let status = unsafe {
+        inference_cuda_exl3_grouped_split(
+            args.as_ptr(),
+            args.len(),
+            split,
+            stream.as_ptr(),
+            &mut stage,
+        )
+    };
+    checked(status, stage)
+}
+
 unsafe extern "C" {
     fn inference_cuda_exl3_grouped(
         args: *const LinearArgs,
         count: usize,
+        stream: *mut c_void,
+        stage: *mut c_int,
+    ) -> c_int;
+    fn inference_cuda_exl3_grouped_split(
+        args: *const LinearArgs,
+        count: usize,
+        split_k: u32,
         stream: *mut c_void,
         stage: *mut c_int,
     ) -> c_int;
@@ -2134,12 +2174,14 @@ mod tests {
         let mut pairs: Vec<_> = (0..8).map(|i| grouped_c_fixture(6, i * 6)).collect();
         pairs.push(grouped_c_fixture(1, 48));
         cases.push(("49 pairs", pairs));
-        for (name, field) in [("xh gap", 0), ("z gap", 1), ("out gap", 2)] {
+        // xh and z must stay contiguous across calls; out rows may scatter since the
+        // scattered-outs merge, but must stay disjoint (overlaps would double-write).
+        for (name, field) in [("xh gap", 0), ("z gap", 1), ("out overlap", 2)] {
             let mut calls = base;
             match field {
                 0 => calls[1].xh = without_provenance_mut(0x60404),
                 1 => calls[1].z = without_provenance_mut(0x70204),
-                _ => calls[1].out = without_provenance_mut(0x80204),
+                _ => calls[1].out = without_provenance_mut(0x80100),
             }
             cases.push((name, calls.to_vec()));
         }

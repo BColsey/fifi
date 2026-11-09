@@ -539,3 +539,59 @@ fn the_k_row_shared_expert_takes_two_to_eight_rows() {
         }
     }
 }
+
+/// FIFI_EXL3_GROUP_SPLIT 4/8 slice k further than the byte-pinned 2: more blocks in
+/// flight for the fill-limited decode, at a different but fixed partial fold order.
+/// The routed block stays within a small tolerance of the split-2 output (float reorder
+/// of the same sums, not a different computation), and the override returns to default.
+#[test]
+fn split_4_and_8_stay_within_reorder_tolerance_of_split_2() {
+    if !device_present("grouped split 4/8 tolerance") {
+        return;
+    }
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let launch = Launch {
+        ctx,
+        stream: &stream,
+    };
+    let w = build_weights(&projector);
+    let mut rng = Rng::new(0x9d5c_2e11);
+    let resid = normal(&mut rng, HIDDEN, 1.0);
+    let norm = normal(&mut rng, HIDDEN, 1.0);
+    let mut outs = Vec::with_capacity(3);
+    for split in [2u32, 4, 8] {
+        super::exl3_moe::set_group_split_override(split);
+        let mut b = buffers(ctx, 1, &resid, &norm);
+        // Seven partial banks (split 8) of the widest n the block launches.
+        b.z = zeros(ctx, 20 * HIDDEN * F32 * 7);
+        run_exl3_moe(&launch, &block(&w), &b.row(0), &dims(1), true, None, false)
+            .expect("the one-row block");
+        let bytes = read(ctx, &stream, &b.resid_out);
+        outs.push(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect::<Vec<_>>(),
+        );
+    }
+    super::exl3_moe::set_group_split_override(0);
+    let scale = outs[0].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    for (split, got) in [(4u32, &outs[1]), (8, &outs[2])] {
+        // Reordering the k fold changes float rounding only: the drift stays at the
+        // eps*sqrt(k)*scale level (k = 2048 here). A wrong sum would be O(scale).
+        let worst = got
+            .iter()
+            .zip(&outs[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-5 * scale,
+            "split {split}: worst |delta| {worst} at scale {scale} over {} outputs",
+            got.len()
+        );
+    }
+}

@@ -1105,8 +1105,12 @@ fn list_exl3_scratch(list: &mut SlotList, dims: &StepDims) -> Result<(), EngErro
         .map(|&(rows, _, n)| rows * n)
         .max()
         .unwrap_or(0);
+    // The grouped MoE launches carry split_k - 1 partial banks per pair (FIFI_EXL3_GROUP_SPLIT);
+    // the dense specs stay at split 2 whatever the env says, so only their one bank counts,
+    // but scaling the whole slot by the launch max keeps that simple and safe.
+    let banks = (super::exl3_moe::group_split() as usize - 1).max(1);
     list.add(Slot::Exl3Xh, product(&[xh, F32]), MIX_PACK, LM_HEAD)?;
-    list.add(Slot::Exl3Z, product(&[z, F32]), MIX_PACK, LM_HEAD)?;
+    list.add(Slot::Exl3Z, product(&[z, F32 * banks]), MIX_PACK, LM_HEAD)?;
     // The step clears this word at StepBegin, before its declared birth at MIX_PACK, and folds it
     // into the status just before the argmax. That is safe because the plan has no slot whose
     // lifetime ends before MIX_PACK that could share these bytes; the old host write at the start

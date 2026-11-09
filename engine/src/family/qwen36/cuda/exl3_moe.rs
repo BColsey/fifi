@@ -233,6 +233,33 @@ struct Pair<'a> {
     out: DeviceRange<'a>,
 }
 
+/// `FIFI_EXL3_GROUP_SPLIT`: the k split of the banked grouped launches (2, 4 or 8;
+/// default 2). 4/8 change the partial fold order for more blocks in flight - the
+/// fill-limited decode lever - so outputs differ from 2 in the last ulp; keep 2
+/// wherever the byte pins must hold.
+static GROUP_SPLIT_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Test-only override of [`group_split`] (the env is process-wide and OnceLock-cached).
+#[cfg(test)]
+pub(super) fn set_group_split_override(split: u32) {
+    GROUP_SPLIT_OVERRIDE.store(split, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn group_split() -> u32 {
+    let set = GROUP_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if matches!(set, 2 | 4 | 8) {
+        return set;
+    }
+    static SPLIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| {
+        std::env::var("FIFI_EXL3_GROUP_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| matches!(v, 2 | 4 | 8))
+            .unwrap_or(2)
+    })
+}
+
 /// Queues one grouped launch of `pairs`, all of one shape: pair `p` gets row `p` of the scratch
 /// partial and rotated-input areas.
 fn grouped(launch: &Launch<'_>, pairs: &[Pair<'_>], scratch: &Scratch<'_>) -> Result<(), EngError> {
@@ -240,20 +267,27 @@ fn grouped(launch: &Launch<'_>, pairs: &[Pair<'_>], scratch: &Scratch<'_>) -> Re
         .first()
         .map(|pair| pair.view.shape)
         .ok_or_else(|| refuse("a grouped launch without pairs".into()))?;
+    let split = group_split();
+    let banks = (split as usize - 1).max(1);
     let mut calls = Vec::with_capacity(pairs.len());
     for (index, pair) in pairs.iter().enumerate() {
         let io = Exl3Io {
             x: pair.x,
             xh: row(&scratch.xh, k * F32, index)?,
-            z: row(&scratch.z, n * F32, index)?,
+            z: row(&scratch.z, n * F32 * banks, index)?,
             out: pair.out,
             flag: scratch.flag,
             rows: 1,
             fused: false,
         };
-        calls.push(pair.view.linear_call(&io));
+        let mut call = pair.view.linear_call(&io);
+        call.split_k = split;
+        calls.push(call);
     }
-    launch.ctx.exl3_grouped_step(launch.stream, &calls)
+    if split == 2 {
+        return launch.ctx.exl3_grouped_step(launch.stream, &calls);
+    }
+    launch.ctx.exl3_grouped_split(launch.stream, &calls)
 }
 
 /// [`grouped`] as one launch over the whole set: the C side of the grouped kernels takes

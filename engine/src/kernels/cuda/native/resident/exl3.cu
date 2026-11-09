@@ -757,6 +757,10 @@ struct GroupArgs {
     uint32_t pairs, groups;
     /* Shared like k/n/flag: one arm read for the whole group set. */
     uint32_t fused_publish;
+    /* K slices per group; 2 is the byte-pinned default. 4/8 trade the pinned fold
+     * order for more blocks in flight (Q36 fill-limited decode) and are selected by
+     * the split entry, which refuses rows > 1 and cols != 1 first. */
+    uint32_t split_k;
 };
 // By-value launch parameters need neither a device descriptor buffer nor an upload.
 static_assert(sizeof(GroupEntry) == 80 && offsetof(GroupEntry, first) == 72);
@@ -959,9 +963,9 @@ __device__ __forceinline__ unsigned load_word(const uint16_t *tile, unsigned ind
 // other books ignore it.
 template <int Book, int Bits, bool Aligned, class Args, bool Dp4a = false>
 __device__ __forceinline__ void grouped_projection_one_tile(
-    const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16]) {
+    const Args &p, const GroupEntry &a, unsigned (&wtab)[128], float (&partial)[8][16],
+    uint32_t split_k) {
     const size_t row = size_t(blockIdx.y) - a.first;
-    constexpr uint32_t split_k = 2;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned bits = Bits ? unsigned(Bits) : unsigned(a.bits_twice), words = bits * 4;
     const unsigned k_tiles = unsigned(p.k / 16);
@@ -1168,11 +1172,12 @@ __device__ __forceinline__ void grouped_projection_wide(
 template <int Book, int Bits, class Args, bool Dp4a = false>
 __device__ __forceinline__ void one_tile_by_alignment(const Args &p, const GroupEntry &a,
                                                       unsigned (&wtab)[128],
-                                                      float (&partial)[8][16]) {
+                                                      float (&partial)[8][16],
+                                                      uint32_t split_k) {
     if ((reinterpret_cast<uintptr_t>(a.trellis) & 3u) == 0)
-        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a>(p, a, wtab, partial);
+        grouped_projection_one_tile<Book, Bits, true, Args, Dp4a>(p, a, wtab, partial, split_k);
     else
-        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a>(p, a, wtab, partial);
+        grouped_projection_one_tile<Book, Bits, false, Args, Dp4a>(p, a, wtab, partial, split_k);
 }
 
 // 8 is 4.0 bpw (every projection of the Qwen3.6 pack except the head), 12 is 6.0 bpw (the
@@ -1185,13 +1190,13 @@ __device__ __forceinline__ void wide_by_rate(const Args &p, const GroupEntry &a,
     static_assert(!Dp4a || (Cols == 1 && LeanAnyRate), "the DP4A decode runs one tile per block");
     if constexpr (Cols == 1) {
         switch (a.bits_twice) {
-            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a>(p, a, wtab[0], partial); break;
-            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a>(p, a, wtab[0], partial); break;
+            case 8: one_tile_by_alignment<Book, 8, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
+            case 12: one_tile_by_alignment<Book, 12, Args, Dp4a>(p, a, wtab[0], partial, p.split_k); break;
             default:
                 // The dense kernel keeps the generic body for the rates the model does not use:
                 // the lean body at an unknown rate spills there; the indexed kernel does not.
                 if constexpr (LeanAnyRate)
-                    one_tile_by_alignment<Book, 0, Args, Dp4a>(p, a, wtab[0], partial);
+                    one_tile_by_alignment<Book, 0, Args, Dp4a>(p, a, wtab[0], partial, p.split_k);
                 else
                     grouped_projection_wide<Book, 1, 0>(p, a, wtab, partial);
                 break;
@@ -1244,9 +1249,9 @@ __global__ void __launch_bounds__(256, wide_min_blocks<1>) grouped_project_small
     __shared__ unsigned wtab[8][128];
     const GroupEntry &a = p.entries[p.row_to_group[blockIdx.y]];
     if (a.bits_twice == 10)
-        one_tile_by_alignment<2, 10, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial);
+        one_tile_by_alignment<2, 10, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial, 2);
     else
-        one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial);
+        one_tile_by_alignment<2, 6, GroupArgs, Dp4a>(p, a, wtab[threadIdx.x / 32], partial, 2);
 }
 
 #include "exl3_decode_fused.h"
@@ -1395,7 +1400,13 @@ __global__ void grouped_output_rotate(const __grid_constant__ GroupArgs p) {
     const size_t col = index % p.n;
     float z = a.z[index];
     // Each group retains the original small-row split order, regardless of total P.
-    z = finite_or_flag(z + a.out[index], p.flag);
+    // split_k == 2 degenerates to the historical single add (z + out), byte-identical;
+    // 4/8 fold the extra k partials in the same left-to-right order as output_rotate.
+    for (uint32_t split = 1; split < p.split_k; ++split) {
+        const float partial = split + 1 == p.split_k ? a.out[index] :
+            a.z[size_t(split) * a.rows * p.n + index];
+        z = finite_or_flag(z + partial, p.flag);
+    }
     const float rotated = rotate128(z, values);
     const float value = rotated * a.svh[col] + (a.bias ? a.bias[col] : 0.0f);
     // Fused publish: same roundtrip point as bf16_publish_rows.
@@ -1408,23 +1419,27 @@ static bool follows(const void *p, const void *base, size_t bytes) {
     return uintptr_t(p) >= uintptr_t(base) && uintptr_t(p) - uintptr_t(base) == bytes;
 }
 
-static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t count, GroupArgs &p) {
+static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t count, uint32_t split,
+                       GroupArgs &p) {
     if (!calls || count < 1 || count > grouped_capacity) return false;
+    if (split != 2 && split != 4 && split != 8) return false;
     p = {};
     p.k = calls[0].k;
     p.n = calls[0].n;
     p.flag = calls[0].flag;
     p.groups = uint32_t(count);
     p.fused_publish = calls[0].fused_publish;
+    p.split_k = split;
     size_t first = 0;
     for (size_t i = 0; i < count; ++i) {
         const auto &a = calls[i];
-        if (!linear_geometry(a.rows, a.k, a.n, a.bits_twice, a.book, 2, false) ||
+        if (!linear_geometry(a.rows, a.k, a.n, a.bits_twice, a.book, split, false) ||
             a.rows > grouped_max_rows || a.k != p.k || a.n != p.n || a.flag != p.flag ||
             a.fused_publish != p.fused_publish ||
-            a.rows > grouped_capacity - first || !linear_views(a, 2) ||
+            (split != 2 && a.rows != 1) ||
+            a.rows > grouped_capacity - first || !linear_views(a, split) ||
             !follows(a.xh, calls[0].xh, first * p.k * 4) ||
-            !follows(a.z, calls[0].z, first * p.n * 4)) return false;
+            !follows(a.z, calls[0].z, first * (split - 1) * p.n * 4)) return false;
         p.entries[i] = {a.trellis, a.suh, a.svh, a.bias, a.x, a.xh, a.z, a.out,
             a.bits_twice, a.book, uint32_t(first), uint32_t(a.rows)};
         for (size_t row = 0; row < a.rows; ++row) p.row_to_group[first + row] = uint8_t(i);
@@ -1436,7 +1451,7 @@ static bool group_args(const inference_cuda_exl3_linear_args *calls, size_t coun
     // The out extents may be scattered: the banked decode writes disjoint rows of one
     // activation buffer per routed expert, so out is checked per call, not as one span.
     const View writes[] = {{calls[0].xh, first * p.k * 4},
-        {calls[0].z, first * p.n * 4}, {p.flag, 4}};
+        {calls[0].z, first * (split - 1) * p.n * 4}, {p.flag, 4}};
     for (size_t i = 0; i < 3; ++i) {
         if (!region(writes[i].p, writes[i].bytes, writes[i].bytes, 4)) return false;
         for (size_t j = 0; j < i; ++j)
@@ -1492,6 +1507,9 @@ struct IndexedArgsOf {
     uint32_t *flag;
     size_t k, n;
     uint32_t pairs, groups, fused_publish;
+    // The id-indexed launch is byte-pinned to the split-2 fold; the grouped launch reads its
+    // runtime split_k field. Both spell `p.split_k` the same way in the shared bodies.
+    static constexpr uint32_t split_k = 2;
 };
 using IndexedArgs = IndexedArgsOf<indexed_capacity>;
 using IndexedOptionArgs = IndexedArgsOf<indexed_option_capacity>;
@@ -1631,9 +1649,9 @@ __global__ void book2_probe_states(uint16_t *decoded) {
 
 template<class Emit>
 static inline __attribute__((always_inline)) bool emit_grouped(
-    size_t pairs, size_t k, size_t n, Emit &&emit) {
+    size_t pairs, size_t k, size_t n, uint32_t split, Emit &&emit) {
     return emit(LinearEmission{LinearKind::Input, uint32_t(k / 128), uint32_t(pairs), 1, 128, 1, 1}) &&
-        emit(LinearEmission{LinearKind::Small, uint32_t(n / 16), uint32_t(pairs), 2, 256, 1, 1}) &&
+        emit(LinearEmission{LinearKind::Small, uint32_t(n / 16), uint32_t(pairs), split, 256, 1, 1}) &&
         emit(LinearEmission{LinearKind::Output, uint32_t(n / 128), uint32_t(pairs), 1, 128, 1, 1});
 }
 
@@ -1667,7 +1685,7 @@ static inline __attribute__((always_inline)) int grouped_launch(
     try {
         report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
         GroupArgs args;
-        if (!stream || !group_args(calls, count, args)) return INFERENCE_CUDA_INVALID_ARGUMENT;
+        if (!stream || !group_args(calls, count, 2, args)) return INFERENCE_CUDA_INVALID_ARGUMENT;
         if constexpr (FinIn) {
             // The fused-input kernel stages the row half in shared memory: one row per
             // group, the Flash-Next rates only, a half of whole 256-value rounds.
@@ -1682,7 +1700,7 @@ static inline __attribute__((always_inline)) int grouped_launch(
         Failure failure;
         // Whether the projection kernel the launch enqueued was grouped_project_small_wide_r56.
         bool used_odd = false;
-        emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
+        emit_grouped(args.pairs, args.k, args.n, 2, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
             if (e.kind == LinearKind::Input) {
                 if constexpr (FinIn)
@@ -1751,7 +1769,7 @@ template <class P>
 static bool indexed_args(const inference_cuda_exl3_linear_args *calls,
     const inference_cuda_exl3_index_args *index, size_t count, size_t cols, P &args) {
     GroupArgs checked;
-    if (!index || count < 1 || count > P::capacity || !group_args(calls, count, checked) ||
+    if (!index || count < 1 || count > P::capacity || !group_args(calls, count, 2, checked) ||
         checked.pairs != count || checked.n % (16 * cols)) return false;
     args = {};
     args.flag = checked.flag;
@@ -1782,7 +1800,7 @@ static int indexed_launch(const inference_cuda_exl3_linear_args *calls,
         if (!stream || !indexed_args(calls, index, count, Cols, args))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
+        emit_grouped(args.pairs, args.k, args.n, 2, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
             if (e.kind == LinearKind::Input)
                 indexed_input_rotate<<<grid,block,0,(cudaStream_t)stream>>>(args);
@@ -1808,7 +1826,7 @@ static int option_launch(const inference_cuda_exl3_linear_args *calls,
         if (!stream || !indexed_args(calls, index, count, 1, args))
             return INFERENCE_CUDA_INVALID_ARGUMENT;
         Failure failure;
-        emit_grouped(args.pairs, args.k, args.n, [&](const LinearEmission &e) {
+        emit_grouped(args.pairs, args.k, args.n, 2, [&](const LinearEmission &e) {
             const dim3 grid(e.gx, e.gy, e.gz), block(e.bx, e.by, e.bz);
             if (e.kind == LinearKind::Input)
                 option_input_rotate<P><<<grid,block,0,(cudaStream_t)stream>>>(args);
@@ -1827,6 +1845,39 @@ static int option_launch(const inference_cuda_exl3_linear_args *calls,
 extern "C" int inference_cuda_exl3_grouped(const inference_cuda_exl3_linear_args *calls,
     size_t count, void *stream, int *out_stage) {
     return grouped_launch<>(calls, count, stream, out_stage);
+}
+
+// The grouped launch with an explicit k split of 4 or 8 (2 is refused: callers stay on
+// inference_cuda_exl3_grouped). Slicing k further puts more blocks in flight, which the
+// fill-limited one-row decode needs; the extra partials fold left-to-right in
+// grouped_output_rotate, a different but still fixed order, so the bytes differ from the
+// split-2 launch in the last ulp. One-row calls only, the plain one-tile variants only.
+extern "C" int inference_cuda_exl3_grouped_split(const inference_cuda_exl3_linear_args *calls,
+    size_t count, uint32_t split_k, void *stream, int *out_stage) {
+    try {
+        report_stage(out_stage, INFERENCE_CUDA_STAGE_NONE);
+        GroupArgs args;
+        if (!stream || split_k == 2 || !group_args(calls, count, split_k, args))
+            return INFERENCE_CUDA_INVALID_ARGUMENT;
+        // group_args refuses rows > 1 and non-plain mixes under split != 2; the one-tile
+        // body and the output fold carry the split from GroupArgs.
+        const dim3 input(uint32_t(args.k / 128), args.pairs, 1), iblock(128, 1, 1);
+        grouped_input_rotate<<<input, iblock, 0, (cudaStream_t)stream>>>(args);
+        Failure failure;
+        failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        if (failure.err == cudaSuccess) {
+            const dim3 wide(uint32_t(args.n / 16), args.pairs, split_k), block(256, 1, 1);
+            grouped_project_small_wide<1><<<wide, block, 0, (cudaStream_t)stream>>>(args);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        if (failure.err == cudaSuccess) {
+            const dim3 output(uint32_t(args.n / 128), args.pairs, 1), oblock(128, 1, 1);
+            grouped_output_rotate<<<output, oblock, 0, (cudaStream_t)stream>>>(args);
+            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+        }
+        report_stage(out_stage, failure.stage);
+        return int(failure.err);
+    } catch (...) { return INFERENCE_CUDA_NATIVE_EXCEPTION; }
 }
 
 
@@ -1965,7 +2016,7 @@ int inference_cuda_exl3_observe_grouped(const LinearObserveArgs *a, LinearObserv
         a->split_k != 2 || a->midrows != 0 || a->fail_at > 3 ||
         !geometry(a->k, a->n, 6, 0)) return INFERENCE_CUDA_INVALID_ARGUMENT;
     *out = {};
-    out->complete = emit_grouped(a->rows, a->k, a->n, [&](const LinearEmission &e) {
+    out->complete = emit_grouped(a->rows, a->k, a->n, 2, [&](const LinearEmission &e) {
         out->emissions[out->count++] = e;
         return out->count != a->fail_at;
     });

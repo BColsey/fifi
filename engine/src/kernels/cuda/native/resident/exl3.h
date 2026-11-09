@@ -86,6 +86,18 @@ int inference_cuda_exl3_linear_split(const inference_cuda_exl3_linear_args *args
 int inference_cuda_exl3_grouped(const inference_cuda_exl3_linear_args *calls,
                                 size_t count, void *stream, int *out_stage);
 
+/* The grouped launch with the k split made explicit: 4 or 8 only (2 is refused;
+ * stay on inference_cuda_exl3_grouped). Same views contract except each call's z
+ * spans (split_k - 1) [rows, n] partial banks and the z strides between calls
+ * follow that width. One-row calls, the plain one-tile path only: rows > 1,
+ * the gather and fused variants refuse. The extra k partials fold left-to-right
+ * in the output rotation - a different but fixed order than the split-2 fold,
+ * so values differ from split 2 in the last ulp (not byte-identical; that is
+ * the point: more blocks in flight for the fill-limited one-row decode). */
+int inference_cuda_exl3_grouped_split(const inference_cuda_exl3_linear_args *calls,
+                                      size_t count, uint32_t split_k, void *stream,
+                                      int *out_stage);
+
 /* Same contract and emissions as inference_cuda_exl3_grouped; the small
  * projection runs the per-warp shared-table gather variant with identical
  * arithmetic and reduction order (FIFI_FLINT_CUDA_GROUPED_GATHER, default
