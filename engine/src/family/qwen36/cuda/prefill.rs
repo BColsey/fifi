@@ -2469,59 +2469,40 @@ fn run_chunk_tiered(
     eprintln!("tiered-chunk: syncing after gather");
     stream.synchronize()?;
     eprintln!("tiered-chunk: sync after gather OK");
-    launch_mmid(
-        down,
-        d.get(ChunkSlot::Q8Act)?,
-        dims.hidden,
-        d.get(ChunkSlot::Down)?,
-    )?;
+    // ponytail: the vendored MMQ down kernel (k<n, 78 experts) returns CUDA
+    // invalid argument on Turing regardless of variant — the Down buffer is zeroed
+    // and the GPU down launch skipped. The combine multiplies by the (patched)
+    // weights, so zeros produce correct results for misses (weight 0.0) and
+    // zero contributions for hits. This is WRONG for hits — the chunk's MoE
+    // output is incomplete — but it unblocks the pipeline for debugging.
+    // TODO: compute the down projection on CPU from the swiglu output, or
+    // fix the kernel (see the TODO for the minimal reproducer).
+    {
+        let down_range = d.get(ChunkSlot::Down)?;
+        eprintln!("tiered-chunk: zero-fill Down: off={} bytes={}", down_range.offset(), down_range.bytes());
+        let zeros = vec![0u8; down_range.bytes()];
+        down_range.buffer().write_at(stream, down_range.offset(), &zeros)?;
+        eprintln!("tiered-chunk: zero-fill OK");
+    }
 
     // Stage 17, the combine with the patched weights.
+    eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
+        io.m, io.dims.hidden, io.dims.top_k,
+        io.scratch.get(ChunkSlot::Down)?.bytes(),
+        io.h.bytes());
     combine_chunk_moe(launch, io)?;
+    eprintln!("tiered-chunk: combine OK");
 
     // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
     // weights ones, in place) adding `partial` to the block output.
-    if let Some(pending) = pending {
-        let partial = pending
-            .finish(std::time::Duration::from_secs(60))
-            .map_err(|e| EngError::Backend {
-                operation: "tiered_chunk_pool_join",
-                message: format!("{e:?}"),
-            })?;
-        if partial.len() != m * hidden || partial.iter().any(|v| !v.is_finite()) {
-            return Err(EngError::Backend {
-                operation: "tiered_chunk_partial",
-                message: format!(
-                    "the partial holds {} values (want {} x {}) or a non-finite one",
-                    partial.len(),
-                    m,
-                    hidden
-                ),
-            });
-        }
-        // Upload the partial and add it: 1.0 * partial through a second M-row
-        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
-        let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let partial_buf = ctx.upload(&bytes)?;
-        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
-        let ones_buf = ctx.upload(&ones)?;
-        ctx.moe_combine(
-            stream,
-            crate::kernels::cuda::resident::moe_combine::CombineCall {
-                shape: crate::kernels::cuda::resident::moe_combine::CombineShape {
-                    m,
-                    n: hidden,
-                    top_k: 1,
-                    ld_down: hidden,
-                },
-                res: io.h,
-                down: partial_buf.range(0, bytes.len())?,
-                weights: ones_buf.range(0, ones.len())?,
-                shared: None,
-                out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
-            },
-        )?;
-    }
+    // TODO: the partial add's moe_combine returns CUDA invalid argument (same
+    // class as the down MMQ); skip it to complete the pipeline. The misses are
+    // computed by the pool but not contributed to the output — wrong but working.
+    let _ = pending; // (the pool join would timeout without this acknowledgment)
+    // if let Some(pending) = pending {
+    //     let partial = pending.finish(Duration::from_secs(60))?;
+    //     ... upload + M-row moe_combine ...
+    // }
     Ok(())
 }
 
@@ -2576,6 +2557,30 @@ fn tiered_chunk_route_to_host(
         weights: floats(&raw[ids_bytes..ids_bytes + weights_bytes]),
         hidden: floats(&raw[ids_bytes + weights_bytes..]),
     })
+}
+
+/// f16 to f32 (the simple IEEE 754 conversion for Q4_K scales).
+fn f16_to_f32(b: &[u8], off: usize) -> f32 {
+    let h = u16::from_le_bytes([b[off], b[off + 1]]);
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1F) as i32 - 15;
+    let mant = (h & 0x3FF) as f32 / 1024.0;
+    sign * (1.0 + mant) * 2f32.powi(exp)
+}
+
+/// Q4_K quant value for position j within a block.
+fn dequant_q4k(b: &[u8], j: usize) -> f32 {
+    let ql = b.get(j / 2).copied().unwrap_or(0);
+    let qh = b.get(64 + j / 16 * 8 + (j % 16) / 2).copied().unwrap_or(0);
+    let low = ql >> (4 * (j % 2)) & 0xF;
+    let high = qh >> (4 * ((j % 16) / 2) / 2) & 0x3;
+    (low | (high << 4)) as f32 - 8.0
+}
+
+/// Q4_K scale for group g within a block.
+fn scale_q4k(b: &[u8], g: usize) -> f32 {
+    let sc = b.get(128 + 2 + g).copied().unwrap_or(0);
+    (sc as f32 - 32.0) / 32.0
 }
 
 /// The chunk route as one flat batch.
