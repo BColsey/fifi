@@ -1382,10 +1382,6 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    fprintf(stderr, "launch_mul_mat_q: grid=(%d,%d,%d) block=(%d,%d,%d) shared=%d nrows_x=%lld ncols_max=%lld nchannels_y=%lld\n",
-            block_nums_xy_tiling.x, block_nums_xy_tiling.y, block_nums_xy_tiling.z,
-            block_dims.x, block_dims.y, block_dims.z, nbytes_shared,
-            (long long)args.nrows_x, (long long)args.ncols_max, (long long)args.nchannels_y);
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
@@ -1393,10 +1389,7 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
              ntx_fd);
-        const cudaError_t e_tiling = cudaGetLastError();
-        if (e_tiling != cudaSuccess) fprintf(stderr, "DBG: TILING LAUNCH FAILED err=%d type=%d J=%d fallback=%d\n",
-                (int)e_tiling, (int)type, J, (int)fallback);
-        return e_tiling;
+        return cudaGetLastError();
     }
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
@@ -1421,10 +1414,6 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    fprintf(stderr, "launch_mul_mat_q STREAM-K: grid=(%d,%d,%d) block=(%d,%d,%d) shared=%d fixup=%p fixup_needed=%d ntiles_dst=%d\n",
-            block_nums_stream_k.x, block_nums_stream_k.y, block_nums_stream_k.z,
-            block_dims.x, block_dims.y, block_dims.z, nbytes_shared,
-            (void*)tmp_fixup, (int)fixup_needed, ntiles_dst);
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1433,26 +1422,15 @@ static cudaError_t launch_mul_mat_q(const mmq_args & args, cudaStream_t stream) 
          ntx_fd);
 
     if (!fixup_needed) {
-        const cudaError_t e_nofix = cudaGetLastError();
-        if (e_nofix != cudaSuccess) fprintf(stderr, "DBG: stream-k main (no fixup) launch err=%d\n", (int)e_nofix);
-        return e_nofix;
+        return cudaGetLastError();
     }
 
-    { const cudaError_t e_main = cudaGetLastError();
-      if (e_main != cudaSuccess) fprintf(stderr, "DBG: stream-k main launch err=%d (before fixup)\n", (int)e_main); }
-    fprintf(stderr, "DBG: launching fixup grid=(%d,%d,%d) block=(%d,%d,%d) type=%d J=%d fallback=%d\n",
-            block_nums_fixup.x, block_nums_fixup.y, block_nums_fixup.z,
-            block_dims_fixup.x, block_dims_fixup.y, block_dims_fixup.z, (int)type, J, (int)fallback);
+    FIFI_TRY(cudaGetLastError());
     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
-    const cudaError_t e_fix = cudaGetLastError();
-    if (e_fix != cudaSuccess) fprintf(stderr, "DBG: FIXUP LAUNCH FAILED err=%d type=%d J=%d fallback=%d grid=(%d,%d,%d) block=(%d,%d,%d)\n",
-            (int)e_fix, (int)type, J, (int)fallback,
-            block_nums_fixup.x, block_nums_fixup.y, block_nums_fixup.z,
-            block_dims_fixup.x, block_dims_fixup.y, block_dims_fixup.z);
-    return e_fix;
+    return cudaGetLastError();
 }
 
 template <ggml_type type, bool fallback>
@@ -1481,12 +1459,6 @@ cudaError_t mul_mat_q_switch_J(const mmq_args & args, cudaStream_t stream) {
         }
     }
 
-    fprintf(stderr, "mmq_switch_J: J_best=%d ntiles=%d ncols_opt=%lld nrows_x=%lld nchannels=%lld fallback=%d\n",
-            J_best, ntiles_J_best, (long long)args.ncols_opt, (long long)args.nrows_x,
-            (long long)args.nchannels_x, (int)fallback);
-    if (J_best == 0) {
-        return cudaErrorInvalidValue;
-    }
     switch (J_best) {
         case   8:
             return launch_mul_mat_q<type, 8, fallback>(args, stream);
@@ -1528,8 +1500,6 @@ cudaError_t mul_mat_q_switch_J(const mmq_args & args, cudaStream_t stream) {
 template <ggml_type type>
 cudaError_t mul_mat_q_case(const mmq_args & args, cudaStream_t stream) {
     FIFI_TRY(fifi_check_device(args.dev));
-    // DEBUG: force fallback for small expert counts (the non-fallback kernel
-    // fails for k<n at n_experts=78 on Turing; the fallback variant works)
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
         return mul_mat_q_switch_J<type, fallback>(args, stream);
