@@ -176,6 +176,22 @@ impl<'w> TieredRuntime<'w> {
         self.banks.first().map(|_| self.slot_count).unwrap_or(0)
     }
 
+    /// Starts the grouped pool serving of a chunk layer's misses (the delegate to
+    /// the host's `start_chunk_pool`): one GroupedExpertJob per DISTINCT missed expert,
+    /// started BEFORE the GPU stages so the CPU work overlaps them.
+    pub(super) fn start_chunk_pool(
+        &mut self,
+        layer: usize,
+        misses: &[crate::family::qwen36::tiered::host::ChunkMissGroup],
+        block: &[f32],
+        m: usize,
+    ) -> Result<
+        Option<crate::family::qwen36::tiered::cpu_pool::PendingChunk>,
+        crate::family::qwen36::tiered::host::HostError,
+    > {
+        self.host.start_chunk_pool(layer, misses, block, m)
+    }
+
     /// The M-row classification delegate: the chunk arm's route readback flows through
     /// the host's `begin_chunk_layer` (MR #20 slice 3).
     pub(super) fn begin_chunk(
