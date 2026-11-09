@@ -72,6 +72,41 @@ fn nemotron35_row_pins_to_the_nemotron_factory_refusal() {
     }
 }
 
+/// No other test pins the gemma4 ROW — a wrong row would pass every
+/// other test. Drives the starter with a gate-valid config (the model
+/// directory does not exist) and asserts the staged refusal, so the row
+/// provably refuses before any model or tokenizer read.
+#[test]
+fn gemma4_row_refuses_staged_before_any_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("enginesrv.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "listen": "127.0.0.1:8100",
+            "api_key_env": "ENGINESRV_KEY",
+            "engines": [
+                {"id": "e1", "model_dir": "m", "tokenizer_dir": "t",
+                 "family": "gemma4"}
+            ]
+        }"#,
+    )
+    .expect("write config");
+    let config = crate::server::config::Config::from_file(&path)
+        .expect("gate accepts the staged gemma4 name");
+    let entry = &config.engines[0];
+    let starter = family_starter(&entry.family).expect("gemma4 starter");
+    match starter(entry, false, None) {
+        Err(crate::EngError::BadRequest(message)) => assert_eq!(
+            message,
+            "gemma4 is staged in this build: the server factory does not construct \
+             the Gemma engine yet; nothing was read from the model directory",
+            "the refusal must be the gemma4 row's own staged text"
+        ),
+        other => panic!("expected the staged refusal, got Ok: {}", other.is_ok()),
+    }
+}
+
 /// The config gate is the list of families a user can name. Every family
 /// the gate accepts must resolve through the registry table — a gate entry
 /// with no starter would fall through at startup. Covers the Qwen3.8

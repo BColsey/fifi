@@ -18,6 +18,7 @@ use super::wire::state_name;
 use crate::EngError;
 use crate::family::flash_next::factory;
 use crate::family::flint;
+use crate::family::gemma4;
 use crate::family::nemotron35::factory as nemotron_factory;
 use crate::family::qwen36::factory as q36_factory;
 use crate::family::sampler::SamplingDefaults;
@@ -510,6 +511,23 @@ fn start_fake(
     })
 }
 
+/// The staged Gemma4 row. The registry entry exists so a config naming
+/// the family reaches this precise refusal instead of the config gate's
+/// generic "does not support" text; construct the engine here when the
+/// Gemma factory exists (the Starter doc above documents the one-row
+/// contract).
+fn start_gemma4(
+    _config: &EngineConfig,
+    _prefix_reuse: bool,
+    _ready_note: ReadyNote,
+) -> Result<StartedEngine, EngError> {
+    Err(EngError::BadRequest(
+        "gemma4 is staged in this build: the server factory does not construct \
+         the Gemma engine yet; nothing was read from the model directory"
+            .into(),
+    ))
+}
+
 /// The closed registry of families this build starts. Staged backends
 /// refuse inside their starter before model or tokenizer reads; the
 /// config gate owns the unknown-family rejection text.
@@ -519,6 +537,7 @@ const FAMILY_STARTERS: &[(&str, Starter)] = &[
     (q36_factory::FAMILY, start_q36),
     (q36_factory::DENSE_FAMILY, start_q36),
     (nemotron_factory::FAMILY, start_nemotron),
+    (gemma4::FAMILY, start_gemma4),
     (fake::FAMILY, start_fake),
 ];
 

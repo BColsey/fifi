@@ -7,6 +7,7 @@
 | `nemotron35` | Nemotron 3.5 Super, 120B total, 12B active | no | yes, greedy only | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4` at revision `8a115b9d`. |
 | `qwen3_8_flash_next` | Qwen3.8-Flash-Next | in the source tree | no | Not validated end to end. |
 | `qwen3_8_27b_dense` | Qwen3.8-27B | in the source tree | no | Not validated end to end. |
+| `gemma4` | Gemma4 | staged | staged | Registered name only: a config naming it starts no engine ("gemma4 is staged in this build"). |
 | `fake` | none | yes | yes | Test engine; replies with fixed text. |
 
 "Pilot" means the model serves short contexts and its long-context quality is not measured.
