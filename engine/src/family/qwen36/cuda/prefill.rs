@@ -1026,17 +1026,35 @@ fn model_facts(
                 let q = Some(QuantType::Q4K);
                 (
                     [
-                        StackFacts { role: Role::FfnGateExps, quant: q, experts: Some(e), n_rows: e * i, k: h },
-                        StackFacts { role: Role::FfnUpExps, quant: q, experts: Some(e), n_rows: e * i, k: h },
-                        StackFacts { role: Role::FfnDownExps, quant: q, experts: Some(e), n_rows: e * h, k: i },
+                        StackFacts {
+                            role: Role::FfnGateExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * i,
+                            k: h,
+                        },
+                        StackFacts {
+                            role: Role::FfnUpExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * i,
+                            k: h,
+                        },
+                        StackFacts {
+                            role: Role::FfnDownExps,
+                            quant: q,
+                            experts: Some(e),
+                            n_rows: e * h,
+                            k: i,
+                        },
                     ],
-                // The shared expert is loaded for tiered (it's a non-expert
-                // weight); its quant comes from the model's format.
-                [
-                    (Role::FfnGateShexp, Some(QuantType::Q4K)),
-                    (Role::FfnUpShexp, Some(QuantType::Q4K)),
-                    (Role::FfnDownShexp, Some(QuantType::Q4K)),
-                ],
+                    // The shared expert is loaded for tiered (it's a non-expert
+                    // weight); its quant comes from the model's format.
+                    [
+                        (Role::FfnGateShexp, Some(QuantType::Q4K)),
+                        (Role::FfnUpShexp, Some(QuantType::Q4K)),
+                        (Role::FfnDownShexp, Some(QuantType::Q4K)),
+                    ],
                 )
             }
         };
@@ -1410,7 +1428,10 @@ impl<'a, 'w> LayerMoe<'a, 'w> {
         match self {
             Self::Native(moe) => (moe.router, moe.router_shared),
             Self::Exl3(moe) => (moe.router, moe.router_shared),
-            Self::Tiered { router, router_shared } => (router, router_shared),
+            Self::Tiered {
+                router,
+                router_shared,
+            } => (router, router_shared),
         }
     }
 }
@@ -2317,13 +2338,6 @@ pub(super) fn run_chunk_moe(
     }
 }
 
-/// The tiered chunk MoE: the shared expert unchanged, the routed stages against the
-/// BANK stacks with host-built grouped ids, and the CPU misses served as one grouped
-/// pool job whose partial joins the combine as a second M-row add.
-///
-/// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
-/// with three differences: (1) the route readback is HOST-side — M rows of ids and
-/// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
 /// Per-stage chunk trace prints, on only with Q36_TIERED_TRACE=1 (production logs stay
 /// quiet; the diagnostics earned their keep during bring-up).
 fn tiered_trace() -> bool {
@@ -2331,6 +2345,13 @@ fn tiered_trace() -> bool {
     *TRACE.get_or_init(|| std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1"))
 }
 
+/// The tiered chunk MoE: the shared expert unchanged, the routed stages against the
+/// BANK stacks with host-built grouped ids, and the CPU misses served as one grouped
+/// pool job whose partial joins the combine as a second M-row add.
+///
+/// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
+/// with three differences: (1) the route readback is HOST-side — M rows of ids and
+/// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
 /// grouped ids come from `MmidIds::from_host` with misses spread round-robin over
 /// the slots, each skipping the slots its own row already holds a column in (that
 /// exclusion is the ≤m-columns invariant; a miss's weight is 0.0, so the wasted
@@ -2366,7 +2387,6 @@ fn run_chunk_tiered(
             operation: "tiered_chunk_host",
             message: e.to_string(),
         })?;
-
 
     // Start the grouped pool serving BEFORE the GPU stages: the CPU work overlaps
     // the GPU launches (the chunk's whole reason for existing).
@@ -2449,15 +2469,20 @@ fn run_chunk_tiered(
     let act = d.get(ChunkSlot::Act)?;
     if tiered_trace() {
         eprintln!(
-        "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
-        dims.inter,
-        ids.shape().ne_get_rows(),
-        act.offset(), act.bytes(),
-        q8act.offset(), q8act.bytes(),
-        ids_dst.offset(), ids_dst.bytes(),
-    );
+            "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
+            dims.inter,
+            ids.shape().ne_get_rows(),
+            act.offset(),
+            act.bytes(),
+            q8act.offset(),
+            q8act.bytes(),
+            ids_dst.offset(),
+            ids_dst.bytes(),
+        );
     }
-    if tiered_trace() { eprintln!("tiered-chunk: launching gather quantize (Vendor packing)"); }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: launching gather quantize (Vendor packing)");
+    }
     ctx.mmq_quantize_gather_ids(
         stream,
         &ids,
@@ -2470,25 +2495,31 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8Act)?,
         },
     )?;
-    if tiered_trace() { eprintln!("tiered-chunk: syncing after gather"); }
-    stream.synchronize()?;
-    if tiered_trace() { eprintln!("tiered-chunk: sync after gather OK"); }
-    if tiered_trace() { eprintln!("tiered-chunk: launching down MMQ"); }
     launch_mmid(
         down,
         d.get(ChunkSlot::Q8Act)?,
         dims.hidden,
         d.get(ChunkSlot::Down)?,
     )?;
-    if tiered_trace() { eprintln!("tiered-chunk: down MMQ OK"); }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: down MMQ OK");
+    }
 
     // Stage 17, the combine with the patched weights.
-    if tiered_trace() { eprintln!("tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
-        io.m, io.dims.hidden, io.dims.top_k,
-        io.scratch.get(ChunkSlot::Down)?.bytes(),
-        io.h.bytes()); }
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: combine: m={} hidden={} top_k={} down_bytes={} h_bytes={}",
+            io.m,
+            io.dims.hidden,
+            io.dims.top_k,
+            io.scratch.get(ChunkSlot::Down)?.bytes(),
+            io.h.bytes()
+        );
+    }
     combine_chunk_moe(launch, io)?;
-    if tiered_trace() { eprintln!("tiered-chunk: combine OK"); }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: combine OK");
+    }
 
     // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
     // weights ones, in place) adding `partial` to the block output.
@@ -2512,12 +2543,19 @@ fn run_chunk_tiered(
         }
         // Upload the partial and add it: 1.0 * partial through a second M-row
         // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
-        if tiered_trace() { eprintln!("tiered-chunk: uploading the CPU partial ({} bytes)", partial.len() * 4); }
+        if tiered_trace() {
+            eprintln!(
+                "tiered-chunk: uploading the CPU partial ({} bytes)",
+                partial.len() * 4
+            );
+        }
         let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
         let partial_buf = ctx.upload(&bytes)?;
         let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
         let ones_buf = ctx.upload(&ones)?;
-        if tiered_trace() { eprintln!("tiered-chunk: adding the partial via moe_combine"); }
+        if tiered_trace() {
+            eprintln!("tiered-chunk: adding the partial via moe_combine");
+        }
         ctx.moe_combine(
             stream,
             crate::kernels::cuda::resident::moe_combine::CombineCall {
@@ -2534,7 +2572,9 @@ fn run_chunk_tiered(
                 out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
             },
         )?;
-        if tiered_trace() { eprintln!("tiered-chunk: partial add OK"); }
+        if tiered_trace() {
+            eprintln!("tiered-chunk: partial add OK");
+        }
     }
     Ok(())
 }
@@ -2558,7 +2598,10 @@ fn tiered_chunk_route_to_host(
     // (m_sess rows), and copy_to_pinned copies the full range — the pinned buffer
     // is sized for m, so the copies must be too.
     let ids_range = io.ids.buffer().range(io.ids.offset(), ids_bytes)?;
-    let weights_range = io.weights.buffer().range(io.weights.offset(), weights_bytes)?;
+    let weights_range = io
+        .weights
+        .buffer()
+        .range(io.weights.offset(), weights_bytes)?;
     let x2_range = io.x2.buffer().range(io.x2.offset(), hidden_bytes)?;
     ctx.copy_to_pinned(stream, ids_range, &mut pinned, 0)?;
     ctx.copy_to_pinned(stream, weights_range, &mut pinned, ids_bytes)?;
@@ -2719,7 +2762,8 @@ fn build_tiered_host_ids<'b>(
         m,
         top_k,
     };
-    let (ids_dst, expert_bounds) = group_tiered_picks(&plan.slot_ids, &plan.device_weights, m, top_k, slots)?;
+    let (ids_dst, expert_bounds) =
+        group_tiered_picks(&plan.slot_ids, &plan.device_weights, m, top_k, slots)?;
     crate::kernels::cuda::prefill::mmq_mmid::MmidIds::from_host(
         stream,
         shape,
@@ -2788,7 +2832,9 @@ fn run_chunk_shared(
             },
         )?;
     }
-    if tiered_trace() { eprintln!("tiered-chunk: launching swiglu"); }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: launching swiglu");
+    }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2883,7 +2929,9 @@ fn run_chunk_routed(
     launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
     launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
     // 14-16, the SwiGLU, the gather quantize and the down launch.
-    if tiered_trace() { eprintln!("tiered-chunk: launching swiglu"); }
+    if tiered_trace() {
+        eprintln!("tiered-chunk: launching swiglu");
+    }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -3054,7 +3102,10 @@ pub(super) fn run_chunk_layer(
     // (the stacks live in the banks), so the layer dispatch skips it entirely.
     let moe = if let Some(cell) = run.tiered {
         let (router, router_shared) = cell.borrow().router_of(layer)?;
-        LayerMoe::Tiered { router, router_shared }
+        LayerMoe::Tiered {
+            router,
+            router_shared,
+        }
     } else {
         match &run.model.weights {
             ChunkWeights::Native { moe, .. } => LayerMoe::Native(chunk_layer(moe, layer)?),

@@ -1199,7 +1199,7 @@ fn tiered_miss_spread_skips_the_rows_own_slots() {
     // whose miss is pick 0 and whose hit is pick 1 (a different scan order).
     let (mut ids, mut weights) = (Vec::new(), Vec::new());
     for r in 0..m {
-        let (hit, miss) = if r == 3 { (1, 0) } else { (0, 1) };
+        let hit = if r == 3 { 1 } else { 0 };
         for p in 0..top_k {
             ids.push(if p == hit { 3 } else { -1 });
             weights.push(if p == hit { 0.5 } else { 0.0 });
@@ -1222,7 +1222,10 @@ fn tiered_miss_spread_skips_the_rows_own_slots() {
         "a permutation"
     );
     for group in expert_bounds.windows(2) {
-        assert!(group[1] - group[0] <= m as i32, "a group holds <= m columns");
+        assert!(
+            group[1] - group[0] <= m as i32,
+            "a group holds <= m columns"
+        );
     }
 
     // The no-free-slot refusal: one slot, one row whose pick already holds it —
