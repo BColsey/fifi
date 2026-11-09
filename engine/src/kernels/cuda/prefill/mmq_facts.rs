@@ -60,7 +60,13 @@ impl CudaContext {
         if let Some(facts) = self.mmq_facts.facts.get() {
             return Ok(*facts);
         }
-        let _dispatch = DispatchGuard::enter(&TERMINAL);
+        // Pin THIS context's device around the live query: the C entry
+        // reads the CURRENT device, and a caller that leaves another card
+        // current (the multi-device engine interleaves cards on one
+        // thread) would freeze the wrong card's nsm/smpbo into this
+        // context's cache - the plan then sizes the fixup range for the
+        // wrong SM count and every stream-k MMQ on that card refuses.
+        let _dispatch = self.enter()?;
         self.ensure_usable()?;
         #[cfg(test)]
         self.mmq_facts.queries.set(self.mmq_facts.queries.get() + 1);

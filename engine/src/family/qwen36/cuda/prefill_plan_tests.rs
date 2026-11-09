@@ -746,7 +746,7 @@ const TABLE: [(S, usize, usize, Phase, Phase); 33] = [
     (S::ProjA, 36_864, 0, AProj, AFlash),
     (S::Q, 16_384, 0, APrep, AFlash),
     (S::AttnOut, 16_384, 0, AFlash, AQuant),
-    (S::Delta, 8192, 0, DOut, NormF),
+    (S::Delta, 8192, 0, DOut, Combine), // card 1 writes its partial combine into Delta
     (S::Logits, 1028, 0, Route, Route),
     (S::TopkId, 32, 0, Route, Combine),
     (S::TopkWeight, 32, 0, Route, Combine),

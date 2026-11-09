@@ -435,7 +435,13 @@ fn common_rows(g: &MixerGeometry, m: usize, nsm: usize) -> Result<Vec<Row>, EngE
         (S::X, hidden, NormA, QuantA),
         (S::XfA, xf, NormA, NormA),
         (S::Q8X, q8_1_bytes(g.hidden, m)?, QuantA, AProj),
-        (S::Delta, hidden, DOut, NormF),
+        // The mixer-output row must also survive the MoE combine: the
+        // CARD driver writes card 1's partial combine into Delta (over the
+        // zero residual) while Down is still live, so Delta lives to
+        // Combine and the arena keeps the two apart. Single-device writes
+        // its combine in place on Hidden, so the longer lifetime only
+        // costs arena bytes there.
+        (S::Delta, hidden, DOut, Combine),
         (S::X2, hidden, NormF, Scatter),
         (S::XfF, xf, NormF, NormF),
         (
@@ -604,7 +610,13 @@ fn exl3_common_rows(g: &MixerGeometry, m: usize) -> Result<Vec<Row>, EngError> {
         // The normalized rows are read by the first projection of either mixer.
         (S::X, hidden, NormA, AProj),
         (S::XfA, xf, NormA, NormA),
-        (S::Delta, hidden, DOut, NormF),
+        // The mixer-output row must also survive the MoE combine: the
+        // CARD driver writes card 1's partial combine into Delta (over the
+        // zero residual) while Down is still live, so Delta lives to
+        // Combine and the arena keeps the two apart. Single-device writes
+        // its combine in place on Hidden, so the longer lifetime only
+        // costs arena bytes there.
+        (S::Delta, hidden, DOut, Combine),
         // The post-mixer norm rows feed the router, the shared expert and the routed gather.
         (S::X2, hidden, NormF, Combine),
         (S::XfF, xf, NormF, NormF),
