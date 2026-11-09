@@ -879,7 +879,11 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
             }
         }
         for stack in &facts.stacks {
-            if stack.quant.is_none() {
+            // A tiered load's stacks are absent (quant AND experts both None — the
+            // placeholder from model_facts): the banks hold the hot experts and are
+            // checked separately at attach, so the layout check passes them through.
+            let tiered_placeholder = stack.quant.is_none() && stack.experts.is_none();
+            if stack.quant.is_none() && !tiered_placeholder {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: layout: layer {layer} stack {:?} is not loaded native",
                     stack.role
@@ -887,14 +891,14 @@ pub(super) fn check_model(f: &ModelFacts, expected_layers: usize) -> Result<(), 
             }
         }
         for (role, quant) in &facts.shared {
-            if quant.is_none() {
+            if quant.is_none() && !facts.stacks.iter().all(|s| s.quant.is_none() && s.experts.is_none()) {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: layout: layer {layer} shared {role:?} is not loaded native"
                 )));
             }
         }
         for stack in &facts.stacks {
-            if stack.experts != Some(f.experts) {
+            if stack.experts.is_some() && stack.experts != Some(f.experts) {
                 return Err(EngError::BadRequest(format!(
                     "prefill chunk: experts: layer {layer} stack {:?} holds {:?}, the model has {}",
                     stack.role, stack.experts, f.experts
