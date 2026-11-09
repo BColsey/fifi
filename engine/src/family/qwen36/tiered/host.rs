@@ -454,10 +454,47 @@ impl TieredHost {
         Ok((plan, misses))
     }
 
-    /// Joins the grouped CPU jobs of a chunk layer (slice 4 wires the pool; until then
-    /// a layer with misses must not be finished, so the chunk arm refuses at begin).
+    /// Joins the grouped CPU jobs of a chunk layer and returns the dense [m][hidden]
+    /// partial (the M-row twin of finish_layer's return).
     pub fn finish_chunk_layer(&mut self, layer: usize) -> Result<Option<Vec<f32>>, HostError> {
         self.finish_layer(layer)
+    }
+
+    /// Starts the grouped pool serving of a chunk layer's misses: one GroupedExpertJob
+    /// per DISTINCT missed expert (the locator names its byte ranges; the region, row
+    /// list and per-row weights come from the miss group). The caller runs the GPU
+    /// stages while the workers serve, then joins via `PendingChunk::finish`.
+    pub fn start_chunk_pool(
+        &mut self,
+        layer: usize,
+        misses: &[ChunkMissGroup],
+        block: &[f32],
+        m: usize,
+    ) -> Result<Option<super::cpu_pool::PendingChunk>, HostError> {
+        use super::cpu_pool::GroupedExpertJob;
+        if misses.is_empty() {
+            return Ok(None);
+        }
+        let jobs: Vec<GroupedExpertJob> = misses
+            .iter()
+            .map(|group| {
+                let ranges = self
+                    .locator
+                    .ranges(layer, usize::from(group.expert))
+                    .map_err(HostError::Locator)?;
+                Ok(GroupedExpertJob {
+                    region: Arc::clone(&self.region),
+                    gate: ranges.gate,
+                    up: ranges.up,
+                    down: ranges.down,
+                    rows: group.rows.clone(),
+                    row_weights: group.row_weights.clone(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.pool
+            .start_chunk_layer(jobs, block, m)
+            .map_err(HostError::Pool)
     }
 
     /// Accounts for a whole token from the device's route log: the same counters and the same
