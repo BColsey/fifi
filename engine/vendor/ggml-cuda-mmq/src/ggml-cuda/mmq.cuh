@@ -1459,6 +1459,12 @@ cudaError_t mul_mat_q_switch_J(const mmq_args & args, cudaStream_t stream) {
         }
     }
 
+    fprintf(stderr, "mmq_switch_J: J_best=%d ntiles=%d ncols_opt=%lld nrows_x=%lld nchannels=%lld fallback=%d\n",
+            J_best, ntiles_J_best, (long long)args.ncols_opt, (long long)args.nrows_x,
+            (long long)args.nchannels_x, (int)fallback);
+    if (J_best == 0) {
+        return cudaErrorInvalidValue;
+    }
     switch (J_best) {
         case   8:
             return launch_mul_mat_q<type, 8, fallback>(args, stream);
