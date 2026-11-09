@@ -64,6 +64,7 @@ fn time_served_job(
     let mut reply = String::new();
     while let Some(event) = owner.events.blocking_recv() {
         match event {
+            JobEvent::Started => {}
             JobEvent::Batch(batch) => {
                 first.get_or_insert_with(|| began.elapsed());
                 reply.push_str(&batch.text);
