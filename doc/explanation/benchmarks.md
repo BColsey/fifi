@@ -7,6 +7,8 @@ Tables were measured on different days and builds; compare within a table, not a
 
 Unless a table says otherwise, the workload is a recorded multi-turn chat session whose prompt grows with every turn, and fifi runs with prefix reuse on.
 "Time to first token" is how long a turn takes before the first reply token arrives.
+To check a server's synthetic recall at a chosen context length, see
+[Validate long-context recall](../how-to/long-context-validation.md).
 
 ## Qwen3.6 on Apple Silicon (M4 Max, 36 GB)
 
