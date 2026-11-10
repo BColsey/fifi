@@ -281,6 +281,14 @@ pub(super) struct TieredRuntime<'w> {
     probe_end: Option<crate::kernels::cuda::TimingEvent>,
     probe_waits_ns: u128,
     probe_tokens: u64,
+    /// Probe: one timing event per layer start, layer 1 on (layer 0's start IS
+    /// `probe_start`), for the span-interior split of the device timeline.
+    probe_layers: Vec<crate::kernels::cuda::TimingEvent>,
+    /// Probe: the token-report sum since the last print — bank hits and CPU serves
+    /// per token are the bytes/token crossing PCIe.
+    probe_report: TokenReport,
+    /// Probe: `probe_tokens` at the last counter print, the window's denominator.
+    probe_report_base: u64,
     /// Reusable buffers of the chunk route readback and the pool-partial add. A fresh
     /// 15.85 MB pinned allocation (cudaHostAlloc + full memset) whose drop runs a
     /// device-wide synchronize, per layer, measured 5-27 ms/layer at m up to 2,048
@@ -355,6 +363,9 @@ impl<'w> TieredRuntime<'w> {
             probe_end: None,
             probe_waits_ns: 0,
             probe_tokens: 0,
+            probe_layers: Vec::new(),
+            probe_report: TokenReport::default(),
+            probe_report_base: 0,
             route: RouteScratch::default(),
         })
     }
@@ -700,12 +711,44 @@ impl<'w> TieredRuntime<'w> {
                 let span_ms = start.elapsed_ms_since(&end)?;
                 let waits_ms = self.probe_waits_ns as f32 / 1e6;
                 let sync_ms = (waits_ms - span_ms).max(0.0);
+                // The layer-duration stats: consecutive deltas over the layer start
+                // events (layer 1 on) plus the token-end event cover every layer.
+                let mut count = 0usize;
+                let (mut sum, mut min, mut max) = (0.0f32, f32::INFINITY, 0.0f32);
+                let mut prev = &start;
+                for event in self.probe_layers.iter().chain(std::iter::once(&end)) {
+                    let ms = prev.elapsed_ms_since(event)?;
+                    count += 1;
+                    sum += ms;
+                    min = min.min(ms);
+                    max = max.max(ms);
+                    prev = event;
+                }
+                self.probe_layers.clear();
                 self.probe_tokens += 1;
                 if self.probe_tokens % 50 == 1 {
+                    let window = (self.probe_tokens - self.probe_report_base).max(1);
+                    let per_token = |n: u32| n as f32 / window as f32;
+                    let report = std::mem::take(&mut self.probe_report);
+                    let (avg_ms, min_ms, max_ms) = if count > 0 {
+                        (sum / count as f32, min, max)
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    };
                     eprintln!(
-                        "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2}",
-                        self.probe_tokens, span_ms, waits_ms, sync_ms
+                        "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2} layer_ms avg {:.3} min {:.3} max {:.3} hits/tok {:.2} cpu_served/tok {:.2} swaps/tok {:.2}",
+                        self.probe_tokens,
+                        span_ms,
+                        waits_ms,
+                        sync_ms,
+                        avg_ms,
+                        min_ms,
+                        max_ms,
+                        per_token(report.bank_hits),
+                        per_token(report.cpu_served),
+                        per_token(report.swaps),
                     );
+                    self.probe_report_base = self.probe_tokens;
                 }
                 self.probe_waits_ns = 0;
             }
@@ -752,6 +795,12 @@ impl<'w> TieredRuntime<'w> {
             // The per-layer route wait sample landed in the scratch's cell.
             self.probe_waits_ns += self.scratch.probe_route_ns.get() as u128;
             self.scratch.probe_route_ns.set(0);
+            // The next layer's start event: layer 0's start IS probe_start.
+            if layer > 0 {
+                let event = launch.ctx.event_timing()?;
+                launch.stream.record_timing(&event)?;
+                self.probe_layers.push(event);
+            }
             let layers = self.parts.len();
             if layer + 1 == layers {
                 let end = launch.ctx.event_timing()?;
@@ -787,6 +836,9 @@ impl<'w> TieredRuntime<'w> {
         };
         let report = self.host.end_token(&mut fills).map_err(host_error)?;
         self.syncs.writes += report.swaps * ExpertBank::FILL_WRITES;
+        if super::moe::tiered::tiered_probe() {
+            self.probe_report.merge(&report);
+        }
         Ok(report)
     }
 }
