@@ -5,8 +5,8 @@
 //! environment fallback. This file only reads and checks values. It opens no file and starts no
 //! thread.
 //!
-//! The dense Qwen3.8 family uses these settings on MLX and expects the same pinned tokenizer
-//! bundle as Q36. Its session cap is explicit and includes its attention and DeltaNet state.
+//! The dense Qwen3.8 family uses these settings on MLX and has its own pinned tokenizer
+//! bundle. Its session cap is explicit and includes its attention and DeltaNet state.
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
@@ -70,16 +70,13 @@ pub(crate) const MIN_PREFILL_CHUNK_ROWS: u32 = 4;
 /// prefill_chunk ceiling above.
 pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
 
-/// SHA-256 of the pinned files of `<model_dir>`: the official release `tokenizer.json`
-/// (quants keep it byte-identical) plus the `mlx-community/Qwen3.8-27B-4bit` conversion's
-/// `tokenizer_config.json`/`chat_template.jinja` (the official template uses the `generation`
-/// Jinja statement, which the engine's minijinja cannot parse).
+/// SHA-256 of the pinned Qwen3.6 files (`engine/testdata/mac-phase0a.json`).
 const TOKENIZER_JSON_SHA256: &str =
-    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
+    "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4";
 const TOKENIZER_CONFIG_SHA256: &str =
-    "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
+    "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182";
 const CHAT_TEMPLATE_SHA256: &str =
-    "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
+    "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 
@@ -1523,6 +1520,30 @@ pub(crate) fn tokenizer_pin() -> Result<TokenizerPin, EngError> {
     })
 }
 
+/// The MLX family selects its own bundle. Dense uses the official tokenizer JSON and the
+/// mlx-community conversion's config and template; its release template uses an unsupported
+/// Jinja statement. CUDA supports only Qwen3.6 and calls `tokenizer_pin` directly.
+#[cfg(any(
+    test,
+    all(feature = "native-mlx", target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn tokenizer_pin_for_spec(spec: &FamilySpec) -> Result<TokenizerPin, EngError> {
+    if spec.feed_forward.is_none() {
+        return tokenizer_pin();
+    }
+    Ok(TokenizerPin {
+        tokenizer_json: digest("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3")?,
+        tokenizer_config_json: digest(
+            "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+        )?,
+        chat_template_jinja: digest(
+            "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        )?,
+        generation_config_json: digest(GENERATION_CONFIG_SHA256)?,
+        vocab_size: TOKENIZER_VOCAB_SIZE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1531,6 +1552,7 @@ mod tests {
         Q36Env, Q36Options, Q36Settings, SlotRequest, TieredSettings, activation_name,
         activation_of, cache_growth_per_position, chunked_prefill_allowed, delta_state_bytes,
         digest, kv_dtype_name, kv_dtype_of, parse_kv_dtype, scale_pairing_error, tokenizer_pin,
+        tokenizer_pin_for_spec,
     };
     use super::{
         QWEN36_MAX_WINDOW_ROWS, RollbackMode, VerifyMode, WeightFormat, check_window_rows,
@@ -1538,7 +1560,7 @@ mod tests {
     };
     use crate::EngError;
     use crate::family::session::StoreLimits;
-    use crate::family::spec::QWEN3_6_35B_A3B;
+    use crate::family::spec::{QWEN3_6_35B_A3B, QWEN3_8_27B_DENSE};
     use crate::family::speculate::config::{SpecConfig, SpecOptions};
     use crate::tensor::Dtype;
     use std::path::{Path, PathBuf};
@@ -3452,11 +3474,39 @@ mod tests {
     fn the_pin_holds_the_digest_of_each_tokenizer_file() {
         let pin = tokenizer_pin().unwrap();
         assert_eq!(pin.vocab_size, 248_077);
-        assert_eq!(pin.tokenizer_json[..4], [0x09, 0x97, 0xf4, 0x10]);
-        assert_eq!(pin.tokenizer_json[28..], [0x72, 0x29, 0xb9, 0xf3]);
-        assert_eq!(pin.tokenizer_config_json[..4], [0xb1, 0x13, 0x49, 0xaa]);
-        assert_eq!(pin.chat_template_jinja[..4], [0xc3, 0xcf, 0x9e, 0x34]);
+        assert_eq!(pin.tokenizer_json[..4], [0x87, 0xa7, 0x83, 0x0d]);
+        assert_eq!(pin.tokenizer_json[28..], [0x3d, 0xb7, 0x2d, 0xe4]);
+        assert_eq!(pin.tokenizer_config_json[..4], [0xe9, 0x8f, 0x19, 0x01]);
+        assert_eq!(pin.chat_template_jinja[..4], [0xe8, 0x4f, 0x32, 0xa2]);
         assert_eq!(pin.generation_config_json[..4], [0xe7, 0x0c, 0x13, 0x6c]);
+    }
+
+    #[test]
+    fn tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate() {
+        let moe = tokenizer_pin_for_spec(&QWEN3_6_35B_A3B).unwrap();
+        let cuda = tokenizer_pin().unwrap();
+        let dense = tokenizer_pin_for_spec(&QWEN3_8_27B_DENSE).unwrap();
+        assert_eq!(moe.tokenizer_json, cuda.tokenizer_json);
+        assert_eq!(moe.tokenizer_config_json, cuda.tokenizer_config_json);
+        assert_eq!(moe.chat_template_jinja, cuda.chat_template_jinja);
+        assert_eq!(moe.generation_config_json, cuda.generation_config_json);
+        assert_eq!(
+            dense.tokenizer_json,
+            digest("0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3").unwrap()
+        );
+        assert_eq!(
+            dense.tokenizer_config_json,
+            digest("b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27").unwrap()
+        );
+        assert_eq!(
+            dense.chat_template_jinja,
+            digest("c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041").unwrap()
+        );
+        assert_ne!(dense.tokenizer_json, moe.tokenizer_json);
+        assert_ne!(dense.tokenizer_config_json, moe.tokenizer_config_json);
+        assert_ne!(dense.chat_template_jinja, moe.chat_template_jinja);
+        assert_eq!(dense.generation_config_json, moe.generation_config_json);
+        assert_eq!(dense.vocab_size, moe.vocab_size);
     }
 
     #[test]
