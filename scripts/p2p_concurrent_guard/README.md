@@ -39,6 +39,9 @@ image. It accepts typed bounded options and a private task-owned output root;
 it does not accept key, model, endpoint, lease-descriptor, or prompt overrides.
 The gate itself is pinned and sealed. The parent still must attest its scope,
 PID/start time, inherited descriptors and waiting state before signalling.
+The gate samples directory identity and permissions before and after that
+wait. This is not an openat-based fence against later path replacement; the
+future host adapter must provide independently reviewed output containment.
 An opt-in disposable-scope CPU test exercises the sealed gate and a sealed
 no-network fixture with a temporary lock; it checks that the fixture does not
 execute until the parent signals. It does not attest any live service or GPU.

@@ -192,6 +192,15 @@ class CompanionOptions:
             args += ["--expect-substring", value]
         return args
 
+    def path_identity(self):
+        """Snapshot directory identities; this is not an openat-based fence."""
+        root = Path(self.campaign_root).resolve(strict=True)
+        parent = Path(self.output).parent.resolve(strict=True)
+        return tuple(
+            (st.st_dev, st.st_ino, st.st_uid, st.st_mode)
+            for st in (root.stat(), parent.stat())
+        )
+
 
 def execute(gate_fd, lease_fd, program_fd, options, *, timeout=30):
     """Check, wait, recheck and exec the sealed companion without shell use."""
@@ -200,11 +209,12 @@ def execute(gate_fd, lease_fd, program_fd, options, *, timeout=30):
     if not isinstance(options, CompanionOptions):
         raise ValueError("typed companion options required")
     companion_args = options.arguments()
+    paths_before = options.path_identity()
     verify_lock(lease_fd)
     verify_program(program_fd)
     wait_for_parent(gate_fd, timeout)
     os.close(gate_fd)
-    if options.arguments() != companion_args:
+    if options.arguments() != companion_args or options.path_identity() != paths_before:
         raise ValueError("companion options changed while awaiting release")
     verify_lock(lease_fd)
     verify_program(program_fd)

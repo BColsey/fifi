@@ -219,6 +219,37 @@ class GatedCompanionTests(unittest.TestCase):
                 os.close(read_fd)
             os.close(write_fd)
 
+    def test_replaced_campaign_directory_is_rejected_before_exec(self):
+        options = CompanionOptions(
+            str(self.campaign), str(self.campaign / "out"), 1, 10
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+
+            def replace_directory(_fd, _timeout):
+                self.campaign.rename(self.scratch / "old-campaign")
+                self.campaign.mkdir(mode=0o700)
+
+            with (
+                patch("scripts.p2p_concurrent_guard.gated_companion.verify_lock"),
+                patch("scripts.p2p_concurrent_guard.gated_companion.verify_program"),
+                patch(
+                    "scripts.p2p_concurrent_guard.gated_companion.wait_for_parent",
+                    side_effect=replace_directory,
+                ),
+                patch(
+                    "scripts.p2p_concurrent_guard.gated_companion.os.execv"
+                ) as execute_program,
+                self.assertRaises(ValueError),
+            ):
+                execute(read_fd, 91, 92, options)
+            read_fd = None
+            execute_program.assert_not_called()
+        finally:
+            if read_fd is not None:
+                os.close(read_fd)
+            os.close(write_fd)
+
 
 if __name__ == "__main__":
     unittest.main()
