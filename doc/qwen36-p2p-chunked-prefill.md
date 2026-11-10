@@ -93,3 +93,20 @@ Record prompt and output token counts, prefix reuse, prefill and decode
 rates, VRAM usage, device identities, and failures. Separately validate
 128k and near-256k prompts with reserved output and marker recall; synthetic
 recall alone is not evidence of coding quality.
+
+## Experimental 1,024-row comparison
+
+On the same RTX 3060 + RTX 3080 pair, a same-binary comparison used the
+multi-block FP32 ring in both arms and changed only `Q36_P2P_CHUNK` from 512 to
+1,024. With three samples per arm, the median 4,274-token cold prefill rate
+rose from 546.02 to 911.92 tokens/s with the 512-row setting first, and from
+546.24 to 914.26 tokens/s in the reverse order. The server interval includes
+first-batch generation. The 31-token-prompt decode rate stayed near 39 tokens/s,
+and the tested deterministic answers matched. After warmup, the larger chunk
+used 66 MiB more per card; minimum sampled free VRAM was 1,302 MiB.
+
+The [measurement record](../scripts/benchmarks/qwen36-p2p-chunk1024-results.json)
+contains per-sample results, exact build and test identities, the wide-ring and
+chunk-parity checks, and restoration receipts. It covers short synthetic
+prompts, not 128k/256k behavior or coding quality. The chunk and multi-block
+ring paths remain experimental and off by default.
