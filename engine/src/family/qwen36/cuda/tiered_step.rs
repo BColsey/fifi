@@ -19,10 +19,159 @@ use super::moe::{Launch, MoeBuffers, MoeDims, MoeLayerWeights, StackWeights};
 use super::run_report::HostSyncs;
 use crate::EngError;
 use crate::family::qwen36::tiered::cpu_pool::MappedRegion;
-use crate::family::qwen36::tiered::host::{BankDevice, HostError, TieredHost};
+use crate::family::qwen36::tiered::host::{BankDevice, ChunkColdStage, HostError, TieredHost};
 use crate::family::qwen36::tiered::locator::ExpertRanges;
 use crate::family::qwen36::tiered::report::TokenReport;
-use crate::kernels::cuda::{DeviceBuffer, DeviceStream, ExpertBank};
+use crate::kernels::cuda::{
+    CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, ExpertBank, ExpertBankGeometry,
+    NativeWeight, PinnedBuf,
+};
+
+/// The cold staging bank of the chunked tiered prefill: ONE zero-initialised
+/// [`ExpertBank`] of `cap` slots reused by every layer — the misses of the layer's
+/// hottest `cap` distinct cold experts are gathered from the checkpoint mapping into a
+/// pinned ring and DMA'd in stack-major, then served by the same grouped MMQ launches
+/// as the banks (numerically identical to a hit; strictly closer than the CPU partial).
+/// Zero-filled at attach, so an unstaged slot a bug could still address yields a finite
+/// zero row (the `0 * Inf` argument of the dummy slot).
+///
+/// The chunk path reassigns the whole staging every layer (the channels travel in the
+/// plan's `cold_ids`); a decode-side reuse would add an expert→slot directory on top.
+pub(super) struct ColdStaging {
+    bank: ExpertBank,
+    cap: usize,
+    ring: Vec<RingSlot>,
+}
+
+/// One slot of the pinned staging ring: a slice-sized page-locked buffer, the event
+/// recorded behind its last DMA and whether a transfer is still outstanding. The host
+/// gather (mmap → pinned) runs ahead of the device inside the ring, so the ~9 ms/layer
+/// of memcpy hides under the ~12 ms/layer of DMA.
+struct RingSlot {
+    buf: PinnedBuf,
+    event: DeviceEvent,
+    pending: bool,
+}
+
+/// Ring depth: eight batch-sized slots (~18.9 MiB at the Qwen slice of 589,824 B and
+/// batches of four) — enough ahead-runs to keep the DMA fed while one slot waits its
+/// event.
+const COLD_RING_DEPTH: usize = 8;
+
+impl ColdStaging {
+    /// Builds the zero-filled staging bank of `cap` slots plus its ring. Refuses before
+    /// any allocation for a cap the bank geometry refuses (below `top_k`).
+    pub(super) fn new(
+        ctx: &CudaContext,
+        geometry: ExpertBankGeometry,
+        cap: usize,
+    ) -> Result<Self, EngError> {
+        let bank = ExpertBank::new(ctx, geometry, cap)?;
+        let (gate_up, down) = bank.slice_bytes()?;
+        let slot_bytes = gate_up.max(down) * Self::BATCH;
+        let mut ring = Vec::with_capacity(COLD_RING_DEPTH);
+        for _ in 0..COLD_RING_DEPTH {
+            ring.push(RingSlot {
+                buf: ctx.pinned_buf(slot_bytes)?,
+                event: ctx.event()?,
+                pending: false,
+            });
+        }
+        Ok(Self { bank, cap, ring })
+    }
+
+    pub(super) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The staged gate/up/down stacks for the cold grouped launches.
+    pub(super) fn weights(&self) -> (&NativeWeight, &NativeWeight, &NativeWeight) {
+        (self.bank.gate(), self.bank.up(), self.bank.down())
+    }
+
+    /// Slices per ring batch: consecutive cold channels are contiguous in the staging
+    /// stacks (the list is channel-ordered), so one pinned slot carries a batch as one
+    /// wide DMA — a 590 KiB copy runs the link at a third of a 2.4 MiB one (measured
+    /// 3.4 GB/s per-slice early layers).
+    const BATCH: usize = 4;
+
+    /// Stages one chunk layer's cold experts: for each stack (gate, up, down —
+    /// stack-major), batches of [`Self::BATCH`] consecutive channels' slices are
+    /// gathered mapping → ring slot on the host and queued ring slot → staging as one
+    /// DMA on `stream` (enqueue-only; the waits that recycle a ring slot synchronize
+    /// only that slot's event). The launches queued behind this on the same stream read
+    /// the staged bytes in order.
+    pub(super) fn stage(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        cold: &[ChunkColdStage],
+        region: &Arc<dyn MappedRegion>,
+    ) -> Result<(), EngError> {
+        if cold.is_empty() {
+            return Ok(());
+        }
+        let bytes = region.bytes();
+        let ColdStaging { bank, cap, ring } = self;
+        let (gate_up, down) = bank.slice_bytes()?;
+        let stacks: [(&DeviceBuffer, usize, fn(&ChunkColdStage) -> &Range<usize>); 3] = [
+            (bank.gate().buffer(), gate_up, |c| &c.gate),
+            (bank.up().buffer(), gate_up, |c| &c.up),
+            (bank.down().buffer(), down, |c| &c.down),
+        ];
+        let mut at = 0usize;
+        for (stack, slice_bytes, range_of) in stacks {
+            for batch in cold.chunks(Self::BATCH) {
+                let first = usize::from(batch[0].channel);
+                if first + batch.len() > *cap {
+                    return Err(EngError::BadRequest(format!(
+                        "tiered cold staging: channels {first}..{} of {cap}",
+                        first + batch.len()
+                    )));
+                }
+                // Consecutive channels, or the batched DMA would scramble slots.
+                for (step, entry) in batch.iter().enumerate() {
+                    if usize::from(entry.channel) != first + step {
+                        return Err(EngError::BadRequest(format!(
+                            "tiered cold staging: channel {} follows {} — the staging list is \
+                             not channel-ordered",
+                            entry.channel, first
+                        )));
+                    }
+                }
+                let at_slot = at % ring.len();
+                at += 1;
+                let slot = &mut ring[at_slot];
+                if slot.pending {
+                    slot.buf.wait(&slot.event)?;
+                    slot.pending = false;
+                }
+                for (step, entry) in batch.iter().enumerate() {
+                    let range = range_of(entry);
+                    let slice = bytes.get(range.clone()).ok_or_else(|| {
+                        EngError::Checkpoint(format!(
+                            "tiered cold staging: expert {} range {range:?} is outside the mapping",
+                            entry.expert
+                        ))
+                    })?;
+                    if slice.len() != slice_bytes {
+                        return Err(EngError::Checkpoint(format!(
+                            "tiered cold staging: expert {} slice holds {} bytes, a slot holds {slice_bytes}",
+                            entry.expert,
+                            slice.len()
+                        )));
+                    }
+                    slot.buf.write(step * slice_bytes, slice)?;
+                }
+                let dst = stack.range(first * slice_bytes, batch.len() * slice_bytes)?;
+                ctx.copy_from_pinned(stream, &mut slot.buf, 0, dst)?;
+                stream.record(&slot.event)?;
+                slot.pending = true;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The weights of one layer's MoE block that stay in the loaded model: the router, the shared
 /// gate vector and the shared expert's three projections.
@@ -119,6 +268,9 @@ pub(super) struct TieredRuntime<'w> {
     banks: Vec<ExpertBank>,
     scratch: TieredScratch,
     host: TieredHost,
+    /// The cold staging bank of the chunked prefill: `None` when admission left no
+    /// spare VRAM for it (the chunk path then keeps the CPU pool for every miss).
+    cold: Option<ColdStaging>,
     /// The bank depth (slots per layer) every bank was built with.
     slot_count: usize,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
@@ -131,6 +283,7 @@ impl<'w> TieredRuntime<'w> {
         banks: Vec<ExpertBank>,
         scratch: TieredScratch,
         host: TieredHost,
+        cold: Option<ColdStaging>,
     ) -> Result<Self, EngError> {
         if parts.len() != banks.len() {
             return Err(EngError::BadRequest(format!(
@@ -145,6 +298,7 @@ impl<'w> TieredRuntime<'w> {
             banks,
             scratch,
             host,
+            cold,
             slot_count,
             syncs: HostSyncs::default(),
         })
@@ -211,7 +365,7 @@ impl<'w> TieredRuntime<'w> {
     }
 
     /// The M-row classification delegate: the chunk arm's route readback flows through
-    /// the host's `begin_chunk_layer` (MR #20 slice 3).
+    /// the host's `begin_chunk_layer`, with the cold staging's capacity as the cut.
     pub(super) fn begin_chunk(
         &mut self,
         layer: usize,
@@ -220,10 +374,48 @@ impl<'w> TieredRuntime<'w> {
         (
             crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
             Vec<crate::family::qwen36::tiered::host::ChunkMissGroup>,
+            Vec<crate::family::qwen36::tiered::host::ChunkColdStage>,
         ),
         crate::family::qwen36::tiered::host::HostError,
     > {
-        self.host.begin_chunk_layer(layer, rows)
+        let cap = self.cold.as_ref().map_or(0, ColdStaging::cap);
+        self.host.begin_chunk_layer(layer, rows, cap)
+    }
+
+    /// The cold staging depth (0 when admission built none).
+    pub(super) fn cold_cap(&self) -> usize {
+        self.cold.as_ref().map_or(0, ColdStaging::cap)
+    }
+
+    /// The checkpoint mapping the cold staging fill gathers its slices from.
+    pub(super) fn cold_region(&self) -> Arc<dyn MappedRegion> {
+        self.host.cold_region()
+    }
+
+    /// Queues one layer's cold staging fills (the delegate over [`ColdStaging::stage`]);
+    /// a no-op without a staging bank or cold experts.
+    pub(super) fn stage_cold(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        cold: &[crate::family::qwen36::tiered::host::ChunkColdStage],
+        region: &Arc<dyn MappedRegion>,
+    ) -> Result<(), EngError> {
+        if let Some(staging) = self.cold.as_mut() {
+            staging.stage(ctx, stream, cold, region)?;
+        }
+        Ok(())
+    }
+
+    /// The cold staging stacks for the cold grouped launches, borrowed beside the banks'
+    /// own in `layer_weights`.
+    pub(super) fn cold_weights(
+        &self,
+    ) -> Result<(&NativeWeight, &NativeWeight, &NativeWeight), EngError> {
+        let staging = self.cold.as_ref().ok_or_else(|| {
+            EngError::BadRequest(String::from("tiered runtime: no cold staging bank"))
+        })?;
+        Ok(staging.weights())
     }
 
     /// Runs the MoE block of `layer` with the host decision between the router and the experts.

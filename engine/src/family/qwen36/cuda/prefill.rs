@@ -2346,17 +2346,21 @@ fn tiered_trace() -> bool {
 }
 
 /// The tiered chunk MoE: the shared expert unchanged, the routed stages against the
-/// BANK stacks with host-built grouped ids, and the CPU misses served as one grouped
-/// pool job whose partial joins the combine as a second M-row add.
+/// BANK stacks and the COLD STAGING stacks with host-built grouped ids, and only the
+/// OVERFLOW misses (beyond the staging cut) served by the CPU pool.
 ///
 /// The stages mirror `run_chunk_shared` + `run_chunk_routed` + `combine_chunk_moe`
-/// with three differences: (1) the route readback is HOST-side — M rows of ids and
-/// weights come back in one pinned batch, classified by `begin_chunk_layer`; (2) the
-/// grouped ids come from `MmidIds::from_host` with misses spread round-robin over
-/// the slots, each skipping the slots its own row already holds a column in (that
-/// exclusion is the ≤m-columns invariant; a miss's weight is 0.0, so the wasted
-/// compute is bounded by the miss rate); (3) the CPU partial joins via one extra M-row
-/// `moe_combine` (top_k 1, weights ones, in place).
+/// with four differences: (1) the route readback is HOST-side — M rows of ids and
+/// weights come back in one pinned batch, classified three ways by `begin_chunk_layer`
+/// (bank hit | cold staging channel with its REAL weight | overflow miss); (2) the
+/// grouped ids are ONE dense upload plus two SPAN wraps — the bank and cold launches
+/// read adjacent column spans of the same tables (the kernel addresses each expert's
+/// columns absolutely, so the two launches' gate/up/down write DISJOINT token-slot
+/// rows of the shared Gu/Down buffers); (3) the cold experts are staged first:
+/// stack-major pinned-ring DMAs into the staging bank, enqueue-only, stream-ordered
+/// before the cold launches; (4) the CPU partial joins via one extra M-row
+/// `moe_combine` (top_k 1, weights ones, in place) only when the staging cut left
+/// overflow picks.
 fn run_chunk_tiered(
     launch: &Launch<'_>,
     runtime: &mut TieredRuntime<'_>,
@@ -2368,12 +2372,17 @@ fn run_chunk_tiered(
     let hidden = dims.hidden;
     let slots = runtime.slots();
 
-    // The batched route readback: M x top_k ids + M x top_k weights + M x hidden
-    // normed rows, one pinned batch + one event wait.
-    let route = tiered_chunk_route_to_host(ctx, stream, io, m, top_k, hidden)?;
+    // Enqueue the batched route readback (M x top_k ids + weights + M x hidden normed
+    // rows, one pinned batch), run the shared expert while it flies, THEN wait: the
+    // shared expert's launches execute under the readback's host wait.
+    let t0 = std::time::Instant::now();
+    let mut batch = tiered_chunk_route_enqueue(ctx, stream, io, m, top_k, hidden)?;
+    let weights = runtime.layer_weights(layer)?;
+    run_chunk_shared(launch, &weights, io)?;
+    let route = batch.finish()?;
+    let t_readback = t0.elapsed();
 
-    // The host classification FIRST (&mut runtime): validate every row, classify
-    // every pick. The weights borrow comes after — it cannot coexist with &mut.
+    // The host classification (&mut runtime): validate every row, classify every pick.
     let rows: Vec<crate::family::qwen36::tiered::host::ChunkRouteRow> = (0..m)
         .map(|r| crate::family::qwen36::tiered::host::ChunkRouteRow {
             ids: route.ids[r * top_k..(r + 1) * top_k].to_vec(),
@@ -2381,15 +2390,25 @@ fn run_chunk_tiered(
             hidden: route.hidden[r * hidden..(r + 1) * hidden].to_vec(),
         })
         .collect();
-    let (plan, misses) = runtime
-        .begin_chunk(layer, &rows)
-        .map_err(|e| EngError::Backend {
-            operation: "tiered_chunk_host",
-            message: e.to_string(),
-        })?;
+    let t1 = std::time::Instant::now();
+    let (plan, misses, cold) =
+        runtime
+            .begin_chunk(layer, &rows)
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_host",
+                message: e.to_string(),
+            })?;
+    let t_classify = t1.elapsed();
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: layer {layer}: {} cold staged, {} overflow experts",
+            cold.len(),
+            misses.len()
+        );
+    }
 
-    // Start the grouped pool serving BEFORE the GPU stages: the CPU work overlaps
-    // the GPU launches (the chunk's whole reason for existing).
+    // Start the grouped pool serving of the OVERFLOW BEFORE the GPU stages: the CPU
+    // work overlaps the GPU launches (the chunk's whole reason for existing).
     let pending = runtime
         .start_chunk_pool(layer, &misses, &route.hidden, m)
         .map_err(|e| EngError::Backend {
@@ -2397,33 +2416,40 @@ fn run_chunk_tiered(
             message: e.to_string(),
         })?;
 
-    // The shared expert: unchanged, against the runtime's own weights (& runtime).
-    let weights = runtime.layer_weights(layer)?;
-    run_chunk_shared(launch, &weights, io)?;
-
-    // Build and upload the host ids, patch the weights.
+    // Build and upload the host ids, patch the weights — BEFORE the cold fills: the
+    // table uploads are blocking writes, and queued behind the fill DMAs each would
+    // stall the host a fill's worth (measured 2.9 ms/layer); on a nearly drained
+    // stream they return in tens of microseconds.
+    let t3 = std::time::Instant::now();
     let d = io.scratch;
-    let ids = build_tiered_host_ids(
-        stream,
-        &plan,
-        m,
-        top_k,
-        slots,
-        crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut {
-            ids_src1: d.get(ChunkSlot::IdsSrc1)?,
-            ids_dst: d.get(ChunkSlot::IdsDst)?,
-            expert_bounds: d.get(ChunkSlot::ExpertBounds)?,
-        },
-    )?;
+    let ids = build_tiered_host_ids(stream, &plan, m, top_k, slots, d)?;
     patch_tiered_weights(stream, &plan, io)?;
+    let t_ids = t3.elapsed();
 
-    // Stages 12-16 against the bank stacks: scatter quantize, grouped MMQ (gate,
-    // up, down), swiglu. The launch code mirrors run_chunk_routed's stages 12-16
-    // with the bank stacks in place of the full-depth stacks.
+    // Stage the cold experts (enqueue-only DMAs; the launches below read them in
+    // stream order). The staging list is channel-ordered and consecutive channels
+    // are contiguous in the staging stacks, so each ring slot carries a BATCH of
+    // slices as one wide DMA (a 590 KiB copy runs the PCIe link at a third of what
+    // a 2.4 MiB one reaches).
+    let t2 = std::time::Instant::now();
+    let region = runtime.cold_region();
+    runtime.stage_cold(ctx, stream, &cold, &region)?;
+    let t_stage = t2.elapsed();
+
+    // Stages 12-16 against the bank stacks and the cold staging stacks: scatter
+    // quantize, grouped MMQ (gate, up, down), swiglu. The launch code mirrors
+    // run_chunk_routed's stages 12-16 with the two span sets over the bank and
+    // staging stacks.
+    let weights = runtime.layer_weights(layer)?;
+    let cold_w = if ids.cold.is_some() {
+        Some(runtime.cold_weights()?)
+    } else {
+        None
+    };
     let gate = native_stack(&weights.gate)?;
     ctx.mmq_quantize_scatter_ids(
         stream,
-        &ids,
+        &ids.combined,
         MmidQuantCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::CpuReference,
             quant: gate.quant(),
@@ -2436,25 +2462,39 @@ fn run_chunk_tiered(
     let gu = d.get(ChunkSlot::Gu)?;
     let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
     let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
-    let launch_mmid =
-        |weight: &NativeWeight, y: DeviceRange<'_>, ld: usize, dst: DeviceRange<'_>| {
-            let n = weight.n_rows() / weight.experts().unwrap_or(1);
-            ctx.mmq_mmid_launch(
-                stream,
-                MmidLaunchCall {
-                    shape: ids.shape(),
-                    weight: routed_weight(weight, dims, weight.k(), n)?,
-                    ids: &ids,
-                    y,
-                    dst,
-                    ld,
-                    fixup: d.get(ChunkSlot::Fixup)?,
-                },
-            )
-        };
+    let launch_mmid = |weight: &NativeWeight,
+                       ids_set: &crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'_>,
+                       y: DeviceRange<'_>,
+                       ld: usize,
+                       dst: DeviceRange<'_>|
+     -> Result<(), EngError> {
+        let n = weight.n_rows() / weight.experts().unwrap_or(1);
+        ctx.mmq_mmid_launch(
+            stream,
+            MmidLaunchCall {
+                shape: ids_set.shape(),
+                weight: routed_weight(weight, dims, weight.k(), n)?,
+                ids: ids_set,
+                y,
+                dst,
+                ld,
+                fixup: d.get(ChunkSlot::Fixup)?,
+            },
+        )
+    };
     let q8s = d.get(ChunkSlot::Q8S)?;
-    launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
-    launch_mmid(native_stack(&weights.up)?, q8s, 2 * dims.inter, up_dst)?;
+    launch_mmid(gate, &ids.bank, q8s, 2 * dims.inter, gu)?;
+    launch_mmid(
+        native_stack(&weights.up)?,
+        &ids.bank,
+        q8s,
+        2 * dims.inter,
+        up_dst,
+    )?;
+    if let (Some(cold_ids), Some((cold_gate, cold_up, _))) = (&ids.cold, &cold_w) {
+        launch_mmid(cold_gate, cold_ids, q8s, 2 * dims.inter, gu)?;
+        launch_mmid(cold_up, cold_ids, q8s, 2 * dims.inter, up_dst)?;
+    }
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2465,27 +2505,16 @@ fn run_chunk_tiered(
     )?;
     let down = native_stack(&weights.down)?;
     let q8act = d.get(ChunkSlot::Q8Act)?;
-    let ids_dst = d.get(ChunkSlot::IdsDst)?;
-    let act = d.get(ChunkSlot::Act)?;
     if tiered_trace() {
         eprintln!(
-            "tiered-chunk: gather: k={} ncols={} act(off={} bytes={}) q8act(off={} bytes={}) ids_dst(off={} bytes={})",
+            "tiered-chunk: gather: k={} ncols={}",
             dims.inter,
-            ids.shape().ne_get_rows(),
-            act.offset(),
-            act.bytes(),
-            q8act.offset(),
-            q8act.bytes(),
-            ids_dst.offset(),
-            ids_dst.bytes(),
+            ids.combined.shape().ne_get_rows()
         );
-    }
-    if tiered_trace() {
-        eprintln!("tiered-chunk: launching gather quantize (Vendor packing)");
     }
     ctx.mmq_quantize_gather_ids(
         stream,
-        &ids,
+        &ids.combined,
         MmidQuantCall {
             packing: crate::kernels::cuda::prefill::mmq_quant::MmqPacking::Vendor,
             quant: down.quant(),
@@ -2495,16 +2524,21 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8Act)?,
         },
     )?;
-    launch_mmid(
-        down,
-        d.get(ChunkSlot::Q8Act)?,
-        dims.hidden,
-        d.get(ChunkSlot::Down)?,
-    )?;
+    launch_mmid(down, &ids.bank, q8act, dims.hidden, d.get(ChunkSlot::Down)?)?;
+    if let (Some(cold_ids), Some((_, _, cold_down))) = (&ids.cold, &cold_w) {
+        launch_mmid(
+            cold_down,
+            cold_ids,
+            q8act,
+            dims.hidden,
+            d.get(ChunkSlot::Down)?,
+        )?;
+    }
     if tiered_trace() {
         eprintln!("tiered-chunk: down MMQ OK");
     }
 
+    let t_launches = t3.elapsed();
     // Stage 17, the combine with the patched weights.
     if tiered_trace() {
         eprintln!(
@@ -2523,13 +2557,31 @@ fn run_chunk_tiered(
 
     // Join the CPU work and add the partial: one M-row moe_combine (top_k 1,
     // weights ones, in place) adding `partial` to the block output.
+    if tiered_trace() {
+        eprintln!(
+            "tiered-chunk: layer {layer} ms: readback {:.1} classify {:.1} stage {:.1} ids {:.1} launches {:.1} overflow {}",
+            t_readback.as_secs_f64() * 1e3,
+            t_classify.as_secs_f64() * 1e3,
+            t_stage.as_secs_f64() * 1e3,
+            t_ids.as_secs_f64() * 1e3,
+            (t_launches - t_ids).as_secs_f64() * 1e3,
+            misses.len()
+        );
+    }
     if let Some(pending) = pending {
+        let tj = std::time::Instant::now();
         let partial = pending
             .finish(std::time::Duration::from_secs(60))
             .map_err(|e| EngError::Backend {
                 operation: "tiered_chunk_pool_join",
                 message: format!("{e:?}"),
             })?;
+        if tiered_trace() {
+            eprintln!(
+                "tiered-chunk: layer {layer} pool join ms: {:.1}",
+                tj.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if partial.len() != m * hidden || partial.iter().any(|v| !v.is_finite()) {
             return Err(EngError::Backend {
                 operation: "tiered_chunk_partial",
@@ -2579,16 +2631,33 @@ fn run_chunk_tiered(
     Ok(())
 }
 
-/// The batched route readback of one chunk layer: one pinned copy of the router's
-/// M x top_k ids, M x top_k weights and M x hidden normed rows, one event wait.
-fn tiered_chunk_route_to_host(
+/// The batched route readback of one chunk layer, in two phases so the shared expert's
+/// launches can execute while the copies fly: one pinned copy of the router's
+/// M x top_k ids, M x top_k weights and M x hidden normed rows, one event, then a
+/// host wait and materialize.
+struct ChunkRouteBatch {
+    pinned: crate::kernels::cuda::PinnedBuf,
+    event: crate::kernels::cuda::DeviceEvent,
+    ids_bytes: usize,
+    weights_bytes: usize,
+    total: usize,
+}
+
+/// The chunk route as one flat batch.
+struct ChunkRouteRead {
+    ids: Vec<i32>,
+    weights: Vec<f32>,
+    hidden: Vec<f32>,
+}
+
+fn tiered_chunk_route_enqueue(
     ctx: &crate::kernels::cuda::CudaContext,
     stream: &crate::kernels::cuda::DeviceStream,
     io: &MoeChunkIo<'_>,
     m: usize,
     top_k: usize,
     hidden: usize,
-) -> Result<ChunkRouteRead, EngError> {
+) -> Result<ChunkRouteBatch, EngError> {
     let ids_bytes = m * top_k * 4;
     let weights_bytes = m * top_k * 4;
     let hidden_bytes = m * hidden * 4;
@@ -2609,30 +2678,42 @@ fn tiered_chunk_route_to_host(
     ctx.copy_to_pinned(stream, x2_range, &mut pinned, ids_bytes + weights_bytes)?;
     let event = ctx.event()?;
     stream.record(&event)?;
-    pinned.wait(&event)?;
-    let mut raw = vec![0u8; total];
-    pinned.read(0, &mut raw)?;
-    let floats = |bytes: &[u8]| -> Vec<f32> {
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| f32::from_le_bytes(*w))
-            .collect()
-    };
-    let ints = |bytes: &[u8]| -> Vec<i32> {
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| i32::from_le_bytes(*w))
-            .collect()
-    };
-    Ok(ChunkRouteRead {
-        ids: ints(&raw[..ids_bytes]),
-        weights: floats(&raw[ids_bytes..ids_bytes + weights_bytes]),
-        hidden: floats(&raw[ids_bytes + weights_bytes..]),
+    Ok(ChunkRouteBatch {
+        pinned,
+        event,
+        ids_bytes,
+        weights_bytes,
+        total,
     })
+}
+
+impl ChunkRouteBatch {
+    fn finish(&mut self) -> Result<ChunkRouteRead, EngError> {
+        self.pinned.wait(&self.event)?;
+        let mut raw = vec![0u8; self.total];
+        self.pinned.read(0, &mut raw)?;
+        let floats = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect()
+        };
+        let ints = |bytes: &[u8]| -> Vec<i32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| i32::from_le_bytes(*w))
+                .collect()
+        };
+        Ok(ChunkRouteRead {
+            ids: ints(&raw[..self.ids_bytes]),
+            weights: floats(&raw[self.ids_bytes..self.ids_bytes + self.weights_bytes]),
+            hidden: floats(&raw[self.ids_bytes + self.weights_bytes..]),
+        })
+    }
 }
 
 /// f16 to f32 (the simple IEEE 754 conversion for Q4_K scales).
@@ -2659,34 +2740,65 @@ fn scale_q4k(b: &[u8], g: usize) -> f32 {
     (sc as f32 - 32.0) / 32.0
 }
 
-/// The chunk route as one flat batch.
-struct ChunkRouteRead {
-    ids: Vec<i32>,
-    weights: Vec<f32>,
-    hidden: Vec<f32>,
+/// The grouped-ids layout of one chunk layer's picks over TWO weight stacks: the bank
+/// slots and the cold staging channels. `ids_dst` (the m*top_k flat pick indices)
+/// holds the bank columns first (slot order), then the cold columns (channel order) —
+/// still a permutation of the token slots; `expert_bounds` (slots + cold + 1 rising
+/// bounds) spans the whole domain, so the bank launch reads its head as its own table
+/// and the cold launch its tail (the kernel treats each expert's pair as ABSOLUTE
+/// column offsets into the one full-width q8_1 buffer and the one ids_dst table,
+/// mmq.cuh:962-990). Grouping is two passes: every pick with a slot of its own claims
+/// its group and marks the row's used slots (a cold pick claims its CHANNEL — distinct
+/// per row, since a row's picks are distinct experts); then the OVERFLOW misses (weight
+/// 0.0, the picks the CPU serves beyond the staging cut) spread round-robin over the
+/// slots, SKIPPING every slot their own row already holds a column in. One column per
+/// (row, slot) is what keeps every group at <= m entries and ids_dst a permutation —
+/// a plain round-robin broke both the moment a spread miss landed on a slot its token
+/// had already hit (a hot slot holding all m rows gained misses on top: "expert N
+/// holds m+k columns, above m", the check_host_ids refusal).
+#[derive(Debug)]
+pub(super) struct TieredChunkGroups {
+    pub(super) ids_dst: Vec<i32>,
+    pub(super) expert_bounds: Vec<i32>,
+    /// The cold channels with columns (the cold span is `bounds[slots]..bounds[slots+cold]`).
+    pub(super) cold_count: usize,
 }
 
-/// The grouped-ids layout of one chunk layer's picks: `ids_dst` (the m*top_k flat pick
-/// indices, grouped) and `expert_bounds` (slots+1 rising bounds). Grouping is two
-/// passes: every pick with a slot of its own claims its group and marks the row's used
-/// slots; then the misses (weight 0.0, the picks the CPU serves) spread round-robin
-/// over the slots, SKIPPING every slot their own row already holds a column in. One
-/// column per (row, slot) is what keeps every group at <= m entries and ids_dst a
-/// permutation — a plain round-robin broke both the moment a spread miss landed on a
-/// slot its token had already hit (a hot slot holding all m rows gained misses on top:
-/// "expert N holds m+k columns, above m", the check_host_ids refusal).
 pub(super) fn group_tiered_picks(
     slot_ids: &[i32],
     weights: &[f32],
+    cold_ids: &[i32],
     m: usize,
     top_k: usize,
     slots: usize,
-) -> Result<(Vec<i32>, Vec<i32>), EngError> {
+) -> Result<TieredChunkGroups, EngError> {
+    if slot_ids.len() != cold_ids.len() || weights.len() != slot_ids.len() {
+        return Err(EngError::BadRequest(format!(
+            "tiered chunk: {} slot ids, {} weights and {} cold ids",
+            slot_ids.len(),
+            weights.len(),
+            cold_ids.len()
+        )));
+    }
     let mut groups: Vec<Vec<i32>> = vec![Vec::new(); slots];
+    let mut cold_groups: Vec<Vec<i32>> = Vec::new();
     let words = slots.div_ceil(64);
     let mut used = vec![0u64; m * words];
     let mut spread_set: Vec<usize> = Vec::new();
-    for (flat, (&slot_id, &weight)) in slot_ids.iter().zip(weights).enumerate() {
+    for (flat, ((&slot_id, &weight), &cold)) in
+        slot_ids.iter().zip(weights).zip(cold_ids).enumerate()
+    {
+        let flat_i32 = i32::try_from(flat)
+            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
+        if cold >= 0 {
+            let channel = usize::try_from(cold).unwrap_or(usize::MAX);
+            // Grow-only: `resize(channel + 1)` alone would TRUNCATE the table when a
+            // lower channel follows a higher one (Vec::resize shrinks too), and
+            // `len().max(channel) + 1` ratchets past every real channel.
+            cold_groups.resize(cold_groups.len().max(channel + 1), Vec::new());
+            cold_groups[channel].push(flat_i32);
+            continue;
+        }
         let target = if weight == 0.0 && slot_id <= 0 {
             spread_set.push(flat);
             continue;
@@ -2695,8 +2807,6 @@ pub(super) fn group_tiered_picks(
         } else {
             0
         };
-        let flat_i32 = i32::try_from(flat)
-            .map_err(|_| EngError::BadRequest(String::from("tiered chunk: column overflow")))?;
         groups
             .get_mut(target)
             .map(|g| g.push(flat_i32))
@@ -2735,44 +2845,123 @@ pub(super) fn group_tiered_picks(
             })?;
         spread = (spread + 1) % slots.max(1);
     }
-    // Compact: concatenate the groups, build the bounds.
+    // Compact: the bank groups, then the cold groups; the bounds span the whole domain.
     let mut ids_dst = Vec::with_capacity(m * top_k);
-    let mut expert_bounds = Vec::with_capacity(slots + 1);
+    let mut expert_bounds = Vec::with_capacity(slots + cold_groups.len() + 1);
     expert_bounds.push(0i32);
-    for group in &groups {
+    for group in groups.iter().chain(&cold_groups) {
         ids_dst.extend_from_slice(group);
         expert_bounds.push(i32::try_from(ids_dst.len()).unwrap_or(i32::MAX));
     }
-    Ok((ids_dst, expert_bounds))
+    Ok(TieredChunkGroups {
+        ids_dst,
+        expert_bounds,
+        cold_count: cold_groups.len(),
+    })
 }
 
-/// Builds and uploads the grouped ids from the chunk plan: picks are grouped by their
-/// bank slot, misses spread round-robin (the plan's weight is 0.0 for misses, so the
-/// wasted grouped compute is zeroed by the combine). Returns the checked `MmidIds`.
+/// The three id sets of one chunk layer over one table upload: the dense set (the
+/// scatter and the gather), the bank span and the cold span (the two grouped-launch
+/// families). The cold set is `None` when the layer stages no expert (a grouped launch
+/// refuses `n_experts < 1`).
+pub(super) struct TieredLaunchIds<'b> {
+    pub(super) combined: crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>,
+    pub(super) bank: crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>,
+    pub(super) cold: Option<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>>,
+}
+
+/// Builds, uploads and wraps the grouped ids from the chunk plan: one dense
+/// `MmidIds::from_host` writes the combined tables (the full permutation), then the
+/// bank and cold launches WRAP the same device tables over their column spans — the
+/// bank reads the bounds head, the cold the tail at byte offset `slots * 4`, so no
+/// second upload can race the launches' reads.
 fn build_tiered_host_ids<'b>(
     stream: &crate::kernels::cuda::DeviceStream,
     plan: &crate::family::qwen36::tiered::host::ChunkLayerPlanHost,
     m: usize,
     top_k: usize,
     slots: usize,
-    out: crate::kernels::cuda::prefill::mmq_mmid::MmidIdsOut<'b>,
-) -> Result<crate::kernels::cuda::prefill::mmq_mmid::MmidIds<'b>, EngError> {
-    let shape = crate::kernels::cuda::prefill::mmq_mmid::MmidShape {
-        n_experts: slots,
+    d: &'b ChunkViews<'b>,
+) -> Result<TieredLaunchIds<'b>, EngError> {
+    use crate::kernels::cuda::prefill::mmq_mmid as mmid;
+    let groups = group_tiered_picks(
+        &plan.slot_ids,
+        &plan.device_weights,
+        &plan.cold_ids,
         m,
         top_k,
-    };
-    let (ids_dst, expert_bounds) =
-        group_tiered_picks(&plan.slot_ids, &plan.device_weights, m, top_k, slots)?;
-    crate::kernels::cuda::prefill::mmq_mmid::MmidIds::from_host(
+        slots,
+    )?;
+    let (ne, cold_count) = (m * top_k, groups.cold_count);
+    let bank_columns = usize::try_from(groups.expert_bounds[slots]).unwrap_or(0);
+    let table =
+        |bounds: crate::kernels::cuda::DeviceRange<'b>| -> Result<mmid::MmidIdsOut<'b>, EngError> {
+            Ok(mmid::MmidIdsOut {
+                ids_src1: d.get(ChunkSlot::IdsSrc1)?,
+                ids_dst: d.get(ChunkSlot::IdsDst)?,
+                expert_bounds: bounds,
+            })
+        };
+    // The dense set: every expert of both stacks in one table, a full permutation.
+    let combined = mmid::MmidIds::from_host(
         stream,
-        shape,
-        crate::kernels::cuda::prefill::mmq_mmid::HostIds {
-            ids_dst: &ids_dst,
-            expert_bounds: &expert_bounds,
+        mmid::MmidShape {
+            n_experts: slots + cold_count,
+            m,
+            top_k,
         },
-        out,
-    )
+        mmid::HostIds {
+            ids_dst: &groups.ids_dst,
+            expert_bounds: &groups.expert_bounds,
+        },
+        table(d.get(ChunkSlot::ExpertBounds)?)?,
+    )?;
+    // The bank span: the bounds head, uploaded by the dense set above.
+    let bank = mmid::MmidIds::wrap(
+        mmid::MmidShape {
+            n_experts: slots,
+            m,
+            top_k,
+        },
+        mmid::HostIds {
+            ids_dst: &groups.ids_dst,
+            expert_bounds: &groups.expert_bounds[..slots + 1],
+        },
+        (0, bank_columns),
+        table(d.get(ChunkSlot::ExpertBounds)?)?,
+    )?;
+    // The cold span: the bounds tail at byte offset `slots * 4`, padded to the shape
+    // rule's minimum of top_k channels with zero-width experts (the kernel's tiles
+    // exit immediately on an empty channel).
+    let cold = if cold_count > 0 {
+        let channels = cold_count.max(top_k);
+        let mut bounds = groups.expert_bounds[slots..].to_vec();
+        bounds.resize(channels + 1, i32::try_from(ne).unwrap_or(i32::MAX));
+        let whole = d.get(ChunkSlot::ExpertBounds)?;
+        let tail = whole
+            .buffer()
+            .range(whole.offset() + slots * 4, (channels + 1) * 4)?;
+        Some(mmid::MmidIds::wrap(
+            mmid::MmidShape {
+                n_experts: channels,
+                m,
+                top_k,
+            },
+            mmid::HostIds {
+                ids_dst: &groups.ids_dst,
+                expert_bounds: &bounds,
+            },
+            (bank_columns, ne),
+            table(tail)?,
+        )?)
+    } else {
+        None
+    };
+    Ok(TieredLaunchIds {
+        combined,
+        bank,
+        cold,
+    })
 }
 
 /// Patches the device TopkWeight with the plan's weights (misses are 0.0, hits carry

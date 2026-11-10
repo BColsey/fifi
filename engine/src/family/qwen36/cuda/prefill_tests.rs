@@ -1196,7 +1196,8 @@ fn tiered_miss_spread_skips_the_rows_own_slots() {
     let top_k = 2;
     let slots = 5;
     // Row r: pick 0 hits slot 3, pick 1 misses (weight 0.0, id -1) — except row 3,
-    // whose miss is pick 0 and whose hit is pick 1 (a different scan order).
+    // whose miss is pick 0 and whose hit is pick 1 (a different scan order). No cold
+    // picks (the plan's cold_ids are all -1): the pure spread case.
     let (mut ids, mut weights) = (Vec::new(), Vec::new());
     for r in 0..m {
         let hit = if r == 3 { 1 } else { 0 };
@@ -1205,13 +1206,15 @@ fn tiered_miss_spread_skips_the_rows_own_slots() {
             weights.push(if p == hit { 0.5 } else { 0.0 });
         }
     }
-    let (ids_dst, expert_bounds) =
-        group_tiered_picks(&ids, &weights, m, top_k, slots).expect("the layout");
+    let no_cold = vec![-1; m * top_k];
+    let groups = group_tiered_picks(&ids, &weights, &no_cold, m, top_k, slots).expect("the layout");
+    let (ids_dst, expert_bounds) = (&groups.ids_dst, &groups.expert_bounds);
+    assert_eq!(groups.cold_count, 0);
     // The deterministic layout: groups 0/1/2 take the first three misses, the 4th
     // skips slot 3 (row 3's own hit) and lands on 4, and slot 3 keeps exactly its
     // four hit columns — m, not m+1.
-    assert_eq!(ids_dst, vec![1, 3, 5, 0, 2, 4, 7, 6], "ids_dst");
-    assert_eq!(expert_bounds, vec![0, 1, 2, 3, 7, 8], "expert_bounds");
+    assert_eq!(ids_dst, &vec![1, 3, 5, 0, 2, 4, 7, 6], "ids_dst");
+    assert_eq!(expert_bounds, &vec![0, 1, 2, 3, 7, 8], "expert_bounds");
     // The invariants check_host_ids holds the launch to, checked here so the spread
     // cannot regress them: a permutation of 0..m*top_k and <= m columns per group.
     let mut sorted = ids_dst.clone();
@@ -1230,9 +1233,43 @@ fn tiered_miss_spread_skips_the_rows_own_slots() {
 
     // The no-free-slot refusal: one slot, one row whose pick already holds it —
     // the misconfiguration turns into a BadRequest, not a spin.
-    let error = group_tiered_picks(&[0, -1], &[0.5, 0.0], 1, 2, 1).expect_err("refused");
+    let error = group_tiered_picks(&[0, -1], &[0.5, 0.0], &[-1, -1], 1, 2, 1).expect_err("refused");
     assert!(
         matches!(&error, EngError::BadRequest(text) if text.contains("no free slot")),
         "{error:?}"
     );
+}
+
+/// The two-span layout: cold picks claim their channels' columns (appended after the
+/// bank span), never touch the bank groups, and the combined tables stay a full
+/// permutation — the property the bank and cold launches' dst-row disjointness rests
+/// on. The channels arrive in DESCENDING order on purpose: sizing the cold groups to
+/// `len().max(channel)` ratcheted the table past every real channel (the device
+/// refusal "expert_bounds ... needs" of the first cold-stack run).
+#[test]
+fn cold_picks_take_their_own_span_and_leave_the_bank_groups_alone() {
+    use super::prefill::group_tiered_picks;
+    let (m, top_k, slots) = (3usize, 2usize, 4usize);
+    // Row 0: hit slot 1, cold channel 1. Row 1: cold channel 0, hit slot 1.
+    // Row 2: hit slot 1, overflow miss (spread).
+    let slot_ids = [1, 0, 0, 1, 1, 0];
+    let weights = [0.4, 0.3, 0.5, 0.2, 0.6, 0.0];
+    let cold_ids = [-1, 1, 0, -1, -1, -1];
+    let groups =
+        group_tiered_picks(&slot_ids, &weights, &cold_ids, m, top_k, slots).expect("layout");
+    assert_eq!(groups.cold_count, 2, "exactly the two real channels");
+    let (ids_dst, bounds) = (&groups.ids_dst, &groups.expert_bounds);
+    // The bank span holds slot 0's spread miss (flat 5) then slot 1's three hits
+    // (flat 0, 3, 4); the cold span holds flat 2 (channel 0) then flat 1 (channel 1).
+    assert_eq!(bounds[slots], 4, "the bank span ends at 4 columns");
+    assert_eq!(ids_dst[..4], [5, 0, 3, 4], "the bank columns");
+    assert_eq!(ids_dst[4..], [2, 1], "the cold columns, channel order");
+    assert_eq!(*bounds.last().unwrap(), (m * top_k) as i32);
+    assert_eq!(bounds.len(), slots + groups.cold_count + 1);
+    // The whole-domain invariants: a permutation, <= m per group, rising bounds.
+    let mut sorted = ids_dst.clone();
+    sorted.sort();
+    assert_eq!(sorted, (0..(m * top_k) as i32).collect::<Vec<_>>());
+    assert!(bounds.windows(2).all(|g| g[1] >= g[0]));
+    assert!(bounds.windows(2).all(|g| g[1] - g[0] <= m as i32));
 }
