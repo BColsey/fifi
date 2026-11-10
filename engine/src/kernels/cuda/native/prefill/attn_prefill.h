@@ -50,7 +50,9 @@
  * *status when status != NULL. A valid launch touches neither.
  *
  * The D256 MMA part uses 96 KB of dynamic shared memory; D128 uses 64 KB (two cp.async K/V stages
- * and a 32 KB score exchange). The entry queries the current CUDA device's per-block opt-in limit
+ * and a 32 KB score exchange). By default the entry retains the original PTX-selected kernel and
+ * original shared-memory layout and launch request. With FIFI_CUDA_ATTN_PREFILL_ADAPT=1, it queries
+ * the current CUDA device's per-block opt-in limit
  * and each kernel's static shared allocation, then prefers MMA when the loaded PTX supports it and
  * the request fits. Otherwise it selects an fp32 SIMT part kernel
  * (grid (max_splits, n_kv_head, q_tiles), 128 threads), requesting 64/32 KB for D256/D128.

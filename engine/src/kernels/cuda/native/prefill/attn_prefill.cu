@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 
 #include <math.h>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdint.h>
@@ -191,6 +192,70 @@ __device__ inline void load_kv_tile(const Args &a, const Block &b, int kvh, int 
         sv[i] = v;
     }
 }
+
+/* Retain the original pre-sm80 SIMT layout for the default-off legacy path. */
+template <int kHeadDim, int kGroup>
+__global__ void __launch_bounds__(128) attn_prefill_part_simt_legacy_k(Args a) {
+#if __CUDA_ARCH__ >= 800
+    __trap();
+#else
+    if (!bounds_ok(a)) {
+        report_bound_violation(a);
+        return;  // no partial
+    }
+    extern __shared__ __half smem[];
+    __half *sq = smem;  // [64][256], then stage 0 of K at 32 KB and of V at 64 KB
+    __half *sk = smem + kRows * kHeadDim, *sv = smem + kRows * kHeadDim + 2 * kTile * kHeadDim;
+    const int s = blockIdx.x, kvh = blockIdx.y, tile = blockIdx.z;
+    Block b;
+    if (!block_of<kHeadDim, kGroup>(a, s, kvh, tile, b)) return;
+    load_q_tile<kHeadDim, kGroup>(a, b, kvh, sq);
+    const int row = threadIdx.x >> 1, half = threadIdx.x & 1;
+    const int p_row = a.p0 + b.t0 + (row >> 3);
+    float o_acc[kHeadDim / 2];
+#pragma unroll
+    for (int e = 0; e < kHeadDim / 2; ++e) o_acc[e] = 0.f;
+    float m_run = -INFINITY, l_run = 0.f;
+    for (int base = b.k_begin; base < b.k_end && b.first + base <= b.max_p; base += kTile) {
+        load_kv_tile<kHeadDim>(a, b, kvh, base, sk, sv);
+        __syncthreads();
+        const __half *K = sk, *V = sv;
+        const int nvalid = min(kTile, b.k_end - base);
+        for (int j = 0; j < nvalid; ++j) {
+            const bool vis = sees(a, b.first + base + j, p_row);
+            float dot = 0.f;
+#pragma unroll 8
+            for (int e = 0; e < kHeadDim / 2; ++e)
+                dot = fmaf(__half2float(sq[row * kHeadDim + half * (kHeadDim / 2) + e]),
+                           __half2float(K[j * kHeadDim + half * (kHeadDim / 2) + e]), dot);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            const float s = vis ? dot * a.scale : -INFINITY;
+            const float m_new = fmaxf(m_run, s);
+            const float m_ref = m_new == -INFINITY ? 0.f : m_new;  // the MMA arm's no-key-yet rule
+            const float p = expf(s - m_ref);
+            const float corr = expf(m_run - m_ref);
+            l_run = l_run * corr + normalizer_weight(vis, s, p);
+            m_run = m_new;
+            const float ph = __half2float(__float2half(p));
+#pragma unroll 8
+            for (int e = 0; e < kHeadDim / 2; ++e)
+                o_acc[e] = fmaf(ph, __half2float(V[j * kHeadDim + half * (kHeadDim / 2) + e]),
+                                o_acc[e] * corr);
+        }
+        __syncthreads();
+    }
+    if ((row & 7) >= kGroup) return;
+    const int out_row = (row >> 3) * kGroup + (row & 7);
+    if (half == 0) {
+        b.stats[out_row * 2] = m_run;
+        b.stats[out_row * 2 + 1] = l_run;
+    }
+#pragma unroll 8
+    for (int e = 0; e < kHeadDim / 2; ++e)
+        b.accs[(size_t)out_row * kHeadDim + half * (kHeadDim / 2) + e] = o_acc[e];
+#endif
+}
+
 
 /* The fp32 SIMT kernel (sm_72 has been compile-only), the same block and partial cell as
  * attn_prefill_part_dsplit_k: 128 threads, two per row (each owning one half of the row's 256
@@ -878,6 +943,36 @@ struct PartArm {
     cudaError_t err;       // the first failure of the query or the opt-in
 };
 
+/* Unset and all values other than exactly "1" retain the original path. Read
+ * once per process, so changing the switch requires restarting the engine. */
+bool adaptive_attention_enabled() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_CUDA_ATTN_PREFILL_ADAPT"));
+    return enabled;
+}
+
+/* Preserve the original selection, allocation and cached-error behavior when
+ * the experimental adaptive path is off. */
+template <int kHeadDim, int kGroup>
+PartArm arm_part_legacy() {
+    constexpr int simt_bytes = kRows * kHeadDim * 2 + 4 * kTile * kHeadDim * 2;
+    PartArm arm = {0, attn_prefill_part_simt_legacy_k<kHeadDim, kGroup>, false, 128,
+                   simt_bytes, cudaSuccess};
+    cudaFuncAttributes attr = {};
+    arm.err = cudaFuncGetAttributes(&attr, attn_prefill_part_dsplit_k<kHeadDim, kGroup>);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ptx = attr.ptxVersion;
+    if (arm.ptx >= 80) {
+        arm.kernel = attn_prefill_part_dsplit_k<kHeadDim, kGroup>;
+        arm.dsplit = true;
+        arm.threads = kThreadsD;
+        arm.bytes = 4 * kTile * kHeadDim * 2 + (kThreadsD / 32) * 2048;
+    }
+    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   arm.bytes);
+    return arm;
+}
+
 /* Select by the loaded code's PTX version, the current device's actual opt-in
  * limit, and each compiled kernel's static shared bytes. A compute_72-only
  * image JIT-compiled on sm_86 still needs the SIMT kernel. Head dimension is
@@ -918,28 +1013,33 @@ PartArm arm_part(int device) {
     return arm;
 }
 
-/* Enqueues both kernels. Successful arms are cached by CUDA device for each
- * instantiated model geometry. A failed query or opt-in is propagated and is
- * not cached, so it cannot poison later attempts. */
+/* The legacy path retains its process-wide arm; adaptive successes are cached
+ * by CUDA device and instantiated model geometry. Adaptive failures propagate
+ * and are not cached. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
-        int device = -1;
-        failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
-        if (!failure.ok()) return failure;
-        static std::mutex arms_mutex;
-        static std::map<int, PartArm> arms;
         PartArm arm;
-        {
-            std::lock_guard<std::mutex> lock(arms_mutex);
-            const auto it = arms.find(device);
-            if (it != arms.end()) {
-                arm = it->second;
-            } else {
-                arm = arm_part<kHeadDim, kGroup>(device);
-                if (arm.err == cudaSuccess) arms.emplace(device, arm);
+        if (adaptive_attention_enabled()) {
+            int device = -1;
+            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) return failure;
+            static std::mutex arms_mutex;
+            static std::map<int, PartArm> arms;
+            {
+                std::lock_guard<std::mutex> lock(arms_mutex);
+                const auto it = arms.find(device);
+                if (it != arms.end()) {
+                    arm = it->second;
+                } else {
+                    arm = arm_part<kHeadDim, kGroup>(device);
+                    if (arm.err == cudaSuccess) arms.emplace(device, arm);
+                }
             }
+        } else {
+            static const PartArm legacy = arm_part_legacy<kHeadDim, kGroup>();
+            arm = legacy;
         }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {

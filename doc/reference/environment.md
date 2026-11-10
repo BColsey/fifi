@@ -40,6 +40,12 @@ NVIDIA documents the [GPU compute capabilities](https://developer.nvidia.com/cud
 | `Q36_PREFILL_QUERY_SLICE` | none | Opt-in query-block rows for sliced prefill attention, read once. Applies only where the composite attention runs, so it has no effect while the flash kernel serves the chunk. |
 | `Q36_NO_ACTMUL` (and siblings) | unset | Kill switches for the individual fused-prefill kernels while `Q36_FUSED_PREFILL` stays on: `Q36_NO_ACTMUL`, `Q36_NO_ATTNGATE`, `Q36_NO_EMBEDDED`, `Q36_NO_GDNPREP`, `Q36_NO_GDNPOST`, `Q36_NO_MOECOMBINE`. The variable's presence alone disables that one fusion. |
 
+## CUDA
+
+| Variable | Default | Accepted values | Meaning |
+| --- | --- | --- | --- |
+| `FIFI_CUDA_ATTN_PREFILL_ADAPT` | `0` | `0`, `1` | Experimental FP16 prefill attention selection for supported model geometries. `1` chooses a kernel using the current device's per-block shared-memory and thread limits; unset, `0` and unrecognized values retain the original launch path. Read once per process; restart to change it. The adaptive path is not yet qualified across RTX 20, 30, 40 and 50 series. See [CUDA FP16 prefill attention](configuration.md#cuda-fp16-prefill-attention). |
+
 ## Qwen3.6 on NVIDIA CUDA
 
 The Flash-Next CUDA step runs one row per launch, which is under the 64-row threshold of the two `FIFI_GDN_*` rows at the end of the table, so they do not change it today; its geometry is covered by their tests.
