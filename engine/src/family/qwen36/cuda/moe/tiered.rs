@@ -90,6 +90,15 @@ pub(in crate::family::qwen36::cuda) struct TieredScratch {
     /// The last route readback's host wait, nanoseconds (Q36_TIERED_PROBE only) —
     /// the TCAP sync-vs-drain probe's per-layer sample.
     pub(in crate::family::qwen36::cuda) probe_route_ns: std::cell::Cell<u64>,
+    /// Per-layer host-phase timings of the decode block, nanoseconds (probe only):
+    /// parse (route bytes -> RouteRead), begin_layer (classify + pool dispatch),
+    /// plan upload, the expert launch loop, finish_layer (+ partial). The idle of
+    /// the 52%-util decode lives in these host-paced phases.
+    pub(in crate::family::qwen36::cuda) probe_parse_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_begin_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_plan_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_launch_ns: std::cell::Cell<u64>,
+    pub(in crate::family::qwen36::cuda) probe_finish_ns: std::cell::Cell<u64>,
 }
 
 /// The decode probe flag (Q36_TIERED_PROBE=1): times the per-layer route wait and
@@ -125,6 +134,11 @@ impl TieredScratch {
             hidden,
             top_k,
             probe_route_ns: std::cell::Cell::new(0),
+            probe_parse_ns: std::cell::Cell::new(0),
+            probe_begin_ns: std::cell::Cell::new(0),
+            probe_plan_ns: std::cell::Cell::new(0),
+            probe_launch_ns: std::cell::Cell::new(0),
+            probe_finish_ns: std::cell::Cell::new(0),
         })
     }
 }
@@ -253,6 +267,7 @@ fn route_to_host(
             .set(probe_t0.elapsed().as_nanos() as u64);
     }
     let mut small = vec![0u8; 2 * scratch.top_k * F32];
+    let parse_t0 = std::time::Instant::now();
     scratch.host.read(ids_at, &mut small)?;
     let (id_words, _) = small[..scratch.top_k * F32].as_chunks::<4>();
     let ids = id_words
@@ -265,6 +280,11 @@ fn route_to_host(
     scratch.host.read_f32(0, &mut hidden_vals)?;
     let mut resid_vals = vec![0f32; scratch.hidden];
     scratch.host.read_f32(resid_at, &mut resid_vals)?;
+    if tiered_probe() {
+        scratch
+            .probe_parse_ns
+            .set(parse_t0.elapsed().as_nanos() as u64);
+    }
     Ok(RouteRead {
         ids,
         weights: floats(&small[scratch.top_k * F32..]),
@@ -392,8 +412,16 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         waits: 1,
         writes: 0,
     };
+    let begin_t0 = std::time::Instant::now();
     let plan = host.begin_layer(layer, &route)?;
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_begin_ns
+            .set(begin_t0.elapsed().as_nanos() as u64);
+    }
     check_plan(&plan, dims.top_k, slots)?;
+    let plan_t0 = std::time::Instant::now();
     {
         // Async plan upload: pinned staging + copy_from_pinned + one event (the blocking
         // `write_at` drained the stream per upload). Steady state: the previous layer's
@@ -430,18 +458,38 @@ pub(in crate::family::qwen36::cuda) fn run_moe_block_tiered(
         };
         launch.stream.record(event)?;
     }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_plan_ns
+            .set(plan_t0.elapsed().as_nanos() as u64);
+    }
     syncs.writes += 2;
     let scratch = &*block.scratch;
     let tiered = tiered_bufs(block.bufs, scratch)?;
+    let launch_t0 = std::time::Instant::now();
     for op in moe_sequence(dims.top_k, WeightLayout::Native)
         .into_iter()
         .skip(1)
     {
         launch_op(launch, weights, &tiered, op)?;
     }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_launch_ns
+            .set(launch_t0.elapsed().as_nanos() as u64);
+    }
+    let finish_t0 = std::time::Instant::now();
     if let Some(partial) = host.finish_layer(layer)? {
         add_cpu_partial(launch, block, &partial)?;
         syncs.writes += 1;
+    }
+    if tiered_probe() {
+        block
+            .scratch
+            .probe_finish_ns
+            .set(finish_t0.elapsed().as_nanos() as u64);
     }
     Ok(syncs)
 }

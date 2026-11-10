@@ -280,6 +280,9 @@ pub(super) struct TieredRuntime<'w> {
     probe_start: Option<crate::kernels::cuda::TimingEvent>,
     probe_end: Option<crate::kernels::cuda::TimingEvent>,
     probe_waits_ns: u128,
+    /// Probe: the per-layer host-phase sums (parse, begin, plan, launch, finish) —
+    /// the host-paced phases where the 52%-util decode idles the device.
+    probe_phases_ns: [u128; 5],
     probe_tokens: u64,
     /// Probe: one timing event per layer start, layer 1 on (layer 0's start IS
     /// `probe_start`), for the span-interior split of the device timeline.
@@ -362,6 +365,7 @@ impl<'w> TieredRuntime<'w> {
             probe_start: None,
             probe_end: None,
             probe_waits_ns: 0,
+            probe_phases_ns: [0; 5],
             probe_tokens: 0,
             probe_layers: Vec::new(),
             probe_report: TokenReport::default(),
@@ -735,8 +739,10 @@ impl<'w> TieredRuntime<'w> {
                     } else {
                         (0.0, 0.0, 0.0)
                     };
+                    let [parse, begin, plan, launch, finish] = self.probe_phases_ns;
+                    let phase_ms = |ns: u128| ns as f32 / 1e6 / window as f32;
                     eprintln!(
-                        "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2} layer_ms avg {:.3} min {:.3} max {:.3} hits/tok {:.2} cpu_served/tok {:.2} swaps/tok {:.2}",
+                        "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2} layer_ms avg {:.3} min {:.3} max {:.3} hits/tok {:.2} cpu_served/tok {:.2} swaps/tok {:.2} host_ms/tok parse {:.2} begin {:.2} plan {:.2} launch {:.2} finish {:.2}",
                         self.probe_tokens,
                         span_ms,
                         waits_ms,
@@ -747,7 +753,13 @@ impl<'w> TieredRuntime<'w> {
                         per_token(report.bank_hits),
                         per_token(report.cpu_served),
                         per_token(report.swaps),
+                        phase_ms(parse),
+                        phase_ms(begin),
+                        phase_ms(plan),
+                        phase_ms(launch),
+                        phase_ms(finish),
                     );
+                    self.probe_phases_ns = [0; 5];
                     self.probe_report_base = self.probe_tokens;
                 }
                 self.probe_waits_ns = 0;
@@ -795,6 +807,16 @@ impl<'w> TieredRuntime<'w> {
             // The per-layer route wait sample landed in the scratch's cell.
             self.probe_waits_ns += self.scratch.probe_route_ns.get() as u128;
             self.scratch.probe_route_ns.set(0);
+            let scratch = &self.scratch;
+            for (sum, cell) in self.probe_phases_ns.iter_mut().zip([
+                scratch.probe_parse_ns.get(),
+                scratch.probe_begin_ns.get(),
+                scratch.probe_plan_ns.get(),
+                scratch.probe_launch_ns.get(),
+                scratch.probe_finish_ns.get(),
+            ]) {
+                *sum += cell as u128;
+            }
             // The next layer's start event: layer 0's start IS probe_start.
             if layer > 0 {
                 let event = launch.ctx.event_timing()?;
