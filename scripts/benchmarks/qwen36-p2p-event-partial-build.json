@@ -1,0 +1,88 @@
+{
+  "scope": "Partial build and CPU checks for the default-off P2P event-barrier candidate. No physical-GPU tests, performance measurement, 128k/256k qualification or merged/default-on claim.",
+  "source_commit": "0360fd026452f067c319b53e94ffcbeb656759ea",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "target": "Linux x86_64, native-cuda feature, sm86, release, lib tests",
+  "test_build_command": "cargo test --locked --offline --release --lib --features native-cuda --no-run --message-format=json",
+  "test_binary_sha256": "12a9ced081aa2ec2000b871eb948316689884b844803a27b16b3a1c05561b280",
+  "test_cargo_json_log_sha256": "a944f2b4b5c9e71c5356d138cf2af45f1eb774c8f663e1780d7123a775215d2a",
+  "test_build_completed": true,
+  "selected_host_tests": [
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+      "exit": 0,
+      "sha256": "45bf73c97c017a8c524c271a1260d25bcf83695fa13a8ddd9a22e75feb298dca",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+      "exit": 0,
+      "sha256": "06043a27e4e8ac9a7cc7ad4e0493e0df56ba5f54c618007475d4b231c53a270a",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+      "exit": 0,
+      "sha256": "5628256ef6339c192775767d13ed7722e91387639b9d435005a6bc9956abc365",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+      "exit": 0,
+      "sha256": "8235944d6e42124cfd800fdd8482d2c3d36ad971d70461d3d2f19937a6864e21",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+      "exit": 0,
+      "sha256": "c63f249bbc4db20b8d4f1a181fcf945d19d482142e72f8680585f819cfa4c0d8",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+      "exit": 0,
+      "sha256": "cc1650930b7510a965b5d8d78289930336f5bfec6aff352ce11a8ed9d10d1ccf",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views",
+      "exit": 0,
+      "sha256": "224c148a07899a68848fec830079fe105c749f4739691ac4e5ccb4749f4016cf",
+      "output": "\nrunning 1 test\ntest family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::settings::tests::the_pin_holds_the_digest_of_each_tokenizer_file",
+      "exit": 0,
+      "sha256": "dcc7a0a49ae51702c9948cb66ababdbb66fcfcc3fdbdee12b98653cb13326534",
+      "output": "\nrunning 1 test\ntest family::qwen36::settings::tests::the_pin_holds_the_digest_of_each_tokenizer_file ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "name": "family::qwen36::settings::tests::tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate",
+      "exit": 0,
+      "sha256": "9f456b5efdef1a75557e2da91879450aee152aac9e4c5245104722b8da1e7c50",
+      "output": "\nrunning 1 test\ntest family::qwen36::settings::tests::tokenizer_pin_selection_keeps_dense_and_moe_bundles_separate ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5924 filtered out; finished in 0.00s\n\n"
+    }
+  ],
+  "device_runner_cpu_tests": {
+    "tests_passed": 34,
+    "sha256": "7282c149987f77587f8a87be0ee2da67afac7dee353faabcd94bba71bede5621",
+    "scope": "CPU-only driver and guard tests; service/device actions are mocked"
+  },
+  "benchmark_runner_cpu_tests": {
+    "tests_passed": 37,
+    "sha256": "89a4577f246c66e292b3e7e9042f79d82b6df5e66e883e6257c3dd394aeb3386",
+    "scope": "CPU-only driver and guard tests; service/device actions are mocked"
+  },
+  "other_checks": [
+    "rustfmt --check on changed Rust files",
+    "qualification inventory validation",
+    "documentation link check",
+    "git diff --check"
+  ],
+  "server_build": {
+    "status": "interrupted; no completed server build receipt",
+    "reason": "guard stopped this build after a different session began a Cargo job"
+  },
+  "physical_peer_tests": "not run",
+  "served_model_benchmark": "not run"
+}
