@@ -502,6 +502,7 @@ fn chunk_moe_resident_matches_the_host_reference() {
                 status: status.range(0, 4)?,
                 scratch: &views,
             },
+            None,
         )?;
         stream.synchronize()?;
         let mut out = Vec::new();
@@ -2316,6 +2317,7 @@ fn chunk_moe_tiered_arm_fails_clean_on_empty_banks() {
                 status: status.range(0, 4)?,
                 scratch: &views,
             },
+            None,
         ) {
             Err(EngError::BadRequest(text)) => text,
             other => panic!("the Tiered arm refuses with {other:?}"),
