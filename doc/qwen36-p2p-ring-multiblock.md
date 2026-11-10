@@ -44,3 +44,9 @@ first batch. The [recall receipt](../scripts/benchmarks/qwen36-p2p-ring-long-rec
 records the device guard, source identities and individual results. Each length
 was tested once with a synthetic prompt; this does not qualify multi-turn coding,
 prefix reuse or the full 256k context.
+
+A further separate run counted 262,008 prompt tokens, reserved 64 output
+positions, and finished normally after 21 output tokens; all three markers were
+correct. Its first-batch rate was 442.75 tokens/s. The [near-256k receipt](../scripts/benchmarks/qwen36-p2p-ring-near-256k-recall.json)
+records the count, output budget, result and guard. This is one cold synthetic
+request rather than a multi-turn coding qualification.
