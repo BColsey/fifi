@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 
 #include <math.h>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -880,6 +881,28 @@ struct PartArm {
     cudaError_t err;       // the first failure of the query or the opt-in
 };
 
+/* Diagnostic-only switches in this scratch branch. They let one executable
+ * compare the legacy process-wide arm with the same arm cached per device. */
+bool p2p_arm_trace() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_DIAG_P2P_ARM_TRACE"));
+    return enabled;
+}
+
+bool p2p_arm_per_device() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_DIAG_P2P_ARM_PER_DEVICE"));
+    return enabled;
+}
+
+void p2p_arm_trace_result(const char *op, cudaError_t result) {
+    if (!p2p_arm_trace()) return;
+    int device = -1;
+    const cudaError_t device_result = cudaGetDevice(&device);
+    std::fprintf(stderr, "P2P_ARM_DIAG op=%s device=%d device_error=%d result=%d (%s)\n", op,
+                 device, int(device_result), int(result), cudaGetErrorString(result));
+}
+
 /* Selects by ptxVersion, the virtual arch the loaded code was compiled for (the __CUDA_ARCH__
  * its #if saw), not by the device's compute capability: a compute_72-only build JIT-compiled
  * on sm_86 still runs the SIMT kernel. Then opts the chosen kernel in to its dynamic shared
@@ -895,6 +918,7 @@ PartArm arm_part() {
                    cudaSuccess};
     cudaFuncAttributes attr = {};
     arm.err = cudaFuncGetAttributes(&attr, attn_prefill_part_dsplit_k<kHeadDim, kGroup>);
+    p2p_arm_trace_result("legacy_get_attributes", arm.err);
     if (arm.err != cudaSuccess) return arm;
     arm.ptx = attr.ptxVersion;
     if (arm.ptx >= 80) {
@@ -905,6 +929,7 @@ PartArm arm_part() {
     }
     arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    arm.bytes);
+    p2p_arm_trace_result("legacy_set_attribute", arm.err);
     return arm;
 }
 
@@ -980,6 +1005,22 @@ Failure enqueue_typed(const Args &k, void *stream) {
                     if (arm.err == cudaSuccess) arms.emplace(device, arm);
                 }
             }
+        } else if (p2p_arm_per_device()) {
+            int device = -1;
+            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) return failure;
+            static std::mutex legacy_arms_mutex;
+            static std::map<int, PartArm> legacy_arms;
+            {
+                std::lock_guard<std::mutex> lock(legacy_arms_mutex);
+                const auto it = legacy_arms.find(device);
+                if (it != legacy_arms.end()) {
+                    arm = it->second;
+                } else {
+                    arm = arm_part<kHeadDim, kGroup>();
+                    if (arm.err == cudaSuccess) legacy_arms.emplace(device, arm);
+                }
+            }
         } else {
             static const PartArm original = arm_part<kHeadDim, kGroup>();
             arm = original;
@@ -991,7 +1032,9 @@ Failure enqueue_typed(const Args &k, void *stream) {
             const dim3 grid = arm.dsplit ? dim3(q_tiles, k.n_kv_head, splits)
                                          : dim3(splits, k.n_kv_head, q_tiles);
             arm.kernel<<<grid, arm.threads, arm.bytes, (cudaStream_t)stream>>>(k);
-            failure.record(cudaGetLastError(), INFERENCE_CUDA_STAGE_LAUNCH);
+            const cudaError_t launch_error = cudaGetLastError();
+            p2p_arm_trace_result("part_launch", launch_error);
+            failure.record(launch_error, INFERENCE_CUDA_STAGE_LAUNCH);
         }
     }
     if (failure.ok() && k.mode != 1) {
