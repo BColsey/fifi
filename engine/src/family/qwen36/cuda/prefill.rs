@@ -289,7 +289,10 @@ impl<'a> ChunkViews<'a> {
 }
 
 /// The stages of one mixer layer of a chunk, in launch order; `NormA`, `QuantA`, `NormF`, `Route`
-/// and `Moe` are shared between the two kinds.
+/// and `Moe` are shared between the two kinds. The `Moe*` variants are timing-event
+/// labels recorded inside the tiered MoE arm, never stage-loop entries — the shared
+/// prefix groups them.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stage {
     NormA,
@@ -306,7 +309,20 @@ pub(super) enum Stage {
     AttnOut,
     NormF,
     Route,
+    /// The whole MoE section in the stage loop's terms; the tiered arm records the
+    /// finer Moe* marks inside it.
     Moe,
+    MoeStart,
+    MoeShared,
+    MoeStage,
+    MoeScatter,
+    MoeBankUp,
+    MoeColdUp,
+    MoeSwiglu,
+    MoeGather,
+    MoeBankDown,
+    MoeColdDown,
+    MoeCombine,
 }
 
 /// The stages of the Resident MoE arm (10-17), in launch order; the order is binding.
@@ -404,6 +420,19 @@ pub(super) fn stage_phase(stage: Stage) -> Phase {
         Stage::NormF => Phase::NormF,
         Stage::Route => Phase::Route,
         Stage::Moe => Phase::Shared,
+        // Timing-event labels only (recorded inside the tiered MoE arm); they never
+        // drive a phase, they inherit the MoE section's.
+        Stage::MoeStart
+        | Stage::MoeShared
+        | Stage::MoeStage
+        | Stage::MoeScatter
+        | Stage::MoeBankUp
+        | Stage::MoeColdUp
+        | Stage::MoeSwiglu
+        | Stage::MoeGather
+        | Stage::MoeBankDown
+        | Stage::MoeColdDown
+        | Stage::MoeCombine => Phase::Shared,
     }
 }
 
@@ -467,6 +496,19 @@ pub(super) fn stage_slots(stage: Stage) -> (&'static [ChunkSlot], &'static [Chun
             ],
             &[ChunkSlot::Hidden],
         ),
+        // Timing-event labels only (recorded inside the tiered MoE arm); they never
+        // own arena slots of their own.
+        Stage::MoeStart
+        | Stage::MoeShared
+        | Stage::MoeStage
+        | Stage::MoeScatter
+        | Stage::MoeBankUp
+        | Stage::MoeColdUp
+        | Stage::MoeSwiglu
+        | Stage::MoeGather
+        | Stage::MoeBankDown
+        | Stage::MoeColdDown
+        | Stage::MoeCombine => (&[], &[]),
     }
 }
 
@@ -2327,6 +2369,7 @@ pub(super) fn run_chunk_moe(
     launch: &Launch<'_>,
     moe: ChunkMoe<'_, '_>,
     io: &MoeChunkIo<'_>,
+    marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
 ) -> Result<(), EngError> {
     match moe {
         ChunkMoe::Resident(mw) => {
@@ -2334,7 +2377,7 @@ pub(super) fn run_chunk_moe(
             run_chunk_routed(launch, mw, io)?;
             combine_chunk_moe(launch, io)
         }
-        ChunkMoe::Tiered { runtime, layer } => run_chunk_tiered(launch, runtime, layer, io),
+        ChunkMoe::Tiered { runtime, layer } => run_chunk_tiered(launch, runtime, layer, io, marks),
     }
 }
 
@@ -2366,11 +2409,23 @@ fn run_chunk_tiered(
     runtime: &mut TieredRuntime<'_>,
     layer: usize,
     io: &MoeChunkIo<'_>,
+    mut marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
 ) -> Result<(), EngError> {
     let (ctx, stream, m, dims) = (launch.ctx, launch.stream, io.m, &io.dims);
     let top_k = dims.top_k;
     let hidden = dims.hidden;
     let slots = runtime.slots();
+    // One timing mark per MoE sub-stage: the stream interval between consecutive
+    // marks is that family's GPU time (same convention as the mixer gpu_marks).
+    let mut mark = |stage: Stage| -> Result<(), EngError> {
+        if let Some(v) = marks.as_deref_mut() {
+            let event = ctx.event_timing()?;
+            stream.record_timing(&event)?;
+            v.push((layer, stage, event));
+        }
+        Ok(())
+    };
+    mark(Stage::MoeStart)?;
 
     // Enqueue the batched route readback (M x top_k ids + weights + M x hidden normed
     // rows, one pinned batch), run the shared expert while it flies, THEN wait: the
@@ -2380,6 +2435,7 @@ fn run_chunk_tiered(
     let weights = runtime.layer_weights(layer)?;
     run_chunk_shared(launch, &weights, io)?;
     let route = batch.finish()?;
+    mark(Stage::MoeShared)?;
     let t_readback = t0.elapsed();
 
     // The host classification (&mut runtime): validate every row, classify every pick.
@@ -2435,6 +2491,7 @@ fn run_chunk_tiered(
     let t2 = std::time::Instant::now();
     let region = runtime.cold_region();
     runtime.stage_cold(ctx, stream, &cold, &region)?;
+    mark(Stage::MoeStage)?;
     let t_stage = t2.elapsed();
 
     // Stages 12-16 against the bank stacks and the cold staging stacks: scatter
@@ -2460,6 +2517,7 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8S)?,
         },
     )?;
+    mark(Stage::MoeScatter)?;
     let gu = d.get(ChunkSlot::Gu)?;
     let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
     let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
@@ -2492,10 +2550,12 @@ fn run_chunk_tiered(
         2 * dims.inter,
         up_dst,
     )?;
+    mark(Stage::MoeBankUp)?;
     if let (Some(cold_ids), Some((cold_gate, cold_up, _))) = (&ids.cold, &cold_w) {
         launch_mmid(cold_gate, cold_ids, q8s, 2 * dims.inter, gu)?;
         launch_mmid(cold_up, cold_ids, q8s, 2 * dims.inter, up_dst)?;
     }
+    mark(Stage::MoeColdUp)?;
     ctx.swiglu_rows(
         stream,
         SwigluRowsCall {
@@ -2504,6 +2564,7 @@ fn run_chunk_tiered(
             act: d.get(ChunkSlot::Act)?,
         },
     )?;
+    mark(Stage::MoeSwiglu)?;
     let down = native_stack(&weights.down)?;
     let q8act = d.get(ChunkSlot::Q8Act)?;
     if tiered_trace() {
@@ -2525,7 +2586,9 @@ fn run_chunk_tiered(
             y: d.get(ChunkSlot::Q8Act)?,
         },
     )?;
+    mark(Stage::MoeGather)?;
     launch_mmid(down, &ids.bank, q8act, dims.hidden, d.get(ChunkSlot::Down)?)?;
+    mark(Stage::MoeBankDown)?;
     if let (Some(cold_ids), Some((_, _, cold_down))) = (&ids.cold, &cold_w) {
         launch_mmid(
             cold_down,
@@ -2535,6 +2598,7 @@ fn run_chunk_tiered(
             d.get(ChunkSlot::Down)?,
         )?;
     }
+    mark(Stage::MoeColdDown)?;
     if tiered_trace() {
         eprintln!("tiered-chunk: down MMQ OK");
     }
@@ -2552,6 +2616,7 @@ fn run_chunk_tiered(
         );
     }
     combine_chunk_moe(launch, io)?;
+    mark(Stage::MoeCombine)?;
     if tiered_trace() {
         eprintln!("tiered-chunk: combine OK");
     }
@@ -3218,7 +3283,11 @@ fn chunk_route(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), Eng
 
 /// The MoE dispatch inside the layer walk: v1 always the Resident arm (tiered sessions take
 /// the per-token path, `chunk_ready`).
-fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngError> {
+fn chunk_moe(
+    run: &ChunkRun<'_, '_>,
+    ctx: &LayerCtx<'_, '_>,
+    marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
+) -> Result<(), EngError> {
     let launch = ctx.launch;
     let io = MoeChunkIo {
         m: run.rows.m(),
@@ -3241,6 +3310,7 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
                 layer: ctx.layer,
             },
             &io,
+            marks,
         );
     }
     let LayerMoe::Native(moe) = ctx.moe else {
@@ -3256,7 +3326,7 @@ fn chunk_moe(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
         }
         return combine_chunk_moe(launch, &io);
     }
-    run_chunk_moe(launch, ChunkMoe::Resident(moe), &io)
+    run_chunk_moe(launch, ChunkMoe::Resident(moe), &io, None)
 }
 
 fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
@@ -3339,7 +3409,24 @@ pub(super) fn run_chunk_layer(
                     )?;
                     crate::family::qwen36::trace::write_prefill_rows(piece, layer, &rows)?;
                 }
-                chunk_moe(run, &ctx)?
+                chunk_moe(run, &ctx, gpu_marks.as_deref_mut())?
+            }
+            // The timing-event labels are recorded inside the tiered MoE arm; they
+            // are never yielded by `layer_stages` and cannot drive a launch here.
+            stage @ (Stage::MoeStart
+            | Stage::MoeShared
+            | Stage::MoeStage
+            | Stage::MoeScatter
+            | Stage::MoeBankUp
+            | Stage::MoeColdUp
+            | Stage::MoeSwiglu
+            | Stage::MoeGather
+            | Stage::MoeBankDown
+            | Stage::MoeColdDown
+            | Stage::MoeCombine) => {
+                return Err(EngError::BadRequest(format!(
+                    "prefill chunk: {stage:?} is a timing label, not a runnable stage"
+                )));
             }
         }
         if tiered_trace() {
@@ -3360,7 +3447,7 @@ pub(super) fn run_chunk_layer(
 
 /// The chunk layer loop: every host guard before the first launch, then the embedding and every
 /// layer on the state's owning stream. Resolves the prefill word ONCE; every stage takes it as a
-/// range. KV8 accepts bulk M up to 1024. Unstaged attention uses tiles up to 16; each tile
+/// range. KV8 accepts bulk M up to 2048. Unstaged attention uses tiles up to 16; each tile
 /// initializes its independent part-tail carrier with a blocking write. FP16 and staged KV8
 /// attention are enqueue-only. Normal chunk publication is unchanged.
 pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Result<(), EngError> {
@@ -3464,6 +3551,17 @@ fn stage_name(stage: Stage) -> &'static str {
         Stage::NormF => "NormF",
         Stage::Route => "Route",
         Stage::Moe => "Moe",
+        Stage::MoeStart => "MoeStart",
+        Stage::MoeShared => "MoeShared",
+        Stage::MoeStage => "MoeStage",
+        Stage::MoeScatter => "MoeScatter",
+        Stage::MoeBankUp => "MoeBankUp",
+        Stage::MoeColdUp => "MoeColdUp",
+        Stage::MoeSwiglu => "MoeSwiglu",
+        Stage::MoeGather => "MoeGather",
+        Stage::MoeBankDown => "MoeBankDown",
+        Stage::MoeColdDown => "MoeColdDown",
+        Stage::MoeCombine => "MoeCombine",
     }
 }
 
