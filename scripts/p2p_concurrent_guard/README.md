@@ -14,12 +14,13 @@ unapproved service handoffs, and restore and verify the pair before release.
 The adapter must enforce finite waits and keep the lease alive during manual
 recovery. The core cannot establish any of those host properties itself.
 
-Passing a lease descriptor to a contained companion is not yet validated. A
-future host adapter must inspect the inherited descriptor's inode and prove
-independent contention on the canonical lock before sending any HTTP request.
-It must not unlock the inherited descriptor. CPU fakes and a real, harmless
-scope test are both required; a successful parent `pass_fds` call alone does
-not show that the descriptor survived the service-manager scope.
+An opt-in, harmless scope test checks descriptor inheritance and independent
+contention on a fresh temporary lock. A future host adapter must still inspect
+the inherited descriptor's inode and prove independent contention on the
+canonical lock before sending any HTTP request. It must not unlock the
+inherited descriptor. CPU fakes and a real, harmless scope test are both
+required; a successful parent `pass_fds` call alone does not show that the
+descriptor survived the service-manager scope.
 
 The core only tests whether two supplied request time intervals overlap. This
 does not prove that GPU kernels were simultaneously active, that requests
