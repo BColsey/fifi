@@ -3278,13 +3278,15 @@ fn chunk_layer<T>(blocks: &[T], layer: usize) -> Result<&T, EngError> {
 }
 
 /// One layer of the chunk: the state ranges by the layer's `ordinal`, the weights by `layer`
-/// itself, every stage in `layer_stages` order.
+/// itself, every stage in `layer_stages` order. `gpu_marks`, when given, receives one
+/// timing event per stage launch (the piece's GPU-time profile under Q36_TIERED_TRACE).
 pub(super) fn run_chunk_layer(
     launch: &Launch<'_>,
     run: &ChunkRun<'_, '_>,
     status: DeviceRange<'_>,
     layer: usize,
     trace_piece: Option<u32>,
+    mut gpu_marks: Option<&mut Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)>>,
 ) -> Result<(), EngError> {
     let slot = run.model.table.slot(layer)?;
     // A tiered chunk session routes through run.tiered: the moe slice is empty
@@ -3358,6 +3360,11 @@ pub(super) fn run_chunk_layer(
                 stage_t0.elapsed().as_secs_f64() * 1e3
             );
         }
+        if let Some(marks) = gpu_marks.as_deref_mut() {
+            let event = launch.ctx.event_timing()?;
+            launch.stream.record_timing(&event)?;
+            marks.push((layer, stage, event));
+        }
         exl3::split::mark_stage(launch.stream, stage);
     }
     Ok(())
@@ -3390,13 +3397,86 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
     chunk_embed(launch, run, status)?;
     // One prefill-piece index for every layer of the piece (resident_trace's counter).
     let trace_piece = crate::family::qwen36::trace::begin_prefill();
+    // The GPU-time profile of the piece (Q36_TIERED_TRACE=1): one timing event per
+    // stage launch, drained and summed after the layer loop. Stream time between a
+    // stage's marks includes any stream idle while the host classifies or waits, so
+    // the split attributes wall to the stage that fences it on the stream.
+    let gpu_profile = tiered_trace();
+    let mut marks: Vec<(usize, Stage, crate::kernels::cuda::TimingEvent)> = Vec::new();
     for layer in 0..run.model.layers {
-        run_chunk_layer(launch, run, status, layer, trace_piece)?;
+        run_chunk_layer(
+            launch,
+            run,
+            status,
+            layer,
+            trace_piece,
+            gpu_profile.then_some(&mut marks),
+        )?;
     }
     if run.model.weights.is_exl3() {
         exl3::check_flag(launch, run)?;
     }
+    if gpu_profile {
+        launch.stream.synchronize()?;
+        let mut totals: std::collections::BTreeMap<(usize, &'static str), (f32, usize)> =
+            std::collections::BTreeMap::new();
+        for pair in marks.windows(2) {
+            let (l0, s0, e0) = (&pair[0].0, &pair[0].1, &pair[0].2);
+            let (l1, _s1, e1) = (&pair[1].0, &pair[1].1, &pair[1].2);
+            let ms = e0.elapsed_ms_since(e1)?;
+            let name = if l0 == l1 {
+                stage_name(*s0)
+            } else {
+                "layer-gap"
+            };
+            let slot = totals
+                .entry((if l0 == l1 { *l0 } else { usize::MAX }, name))
+                .or_default();
+            slot.0 += ms;
+            slot.1 += 1;
+        }
+        let mut by_stage: std::collections::BTreeMap<&'static str, (f32, usize)> =
+            std::collections::BTreeMap::new();
+        for ((_l, name), (ms, n)) in &totals {
+            let slot = by_stage.entry(name).or_default();
+            slot.0 += ms;
+            slot.1 += n;
+        }
+        let mut lines: Vec<(f32, &'static str, usize)> = by_stage
+            .into_iter()
+            .map(|(name, (ms, n))| (ms, name, n))
+            .collect();
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        eprintln!(
+            "chunk gpu-time by stage (stream ms, layers {}):",
+            run.model.layers
+        );
+        for (ms, name, n) in lines.iter().rev() {
+            eprintln!("  {name}: {ms:.1} ms ({n} marks)");
+        }
+    }
     Ok(())
+}
+
+/// The name of a stage for the trace profile (a static label per variant).
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::NormA => "NormA",
+        Stage::QuantA => "QuantA",
+        Stage::DeltaProj => "DeltaProj",
+        Stage::Conv => "Conv",
+        Stage::Scan => "Scan",
+        Stage::QuantDOut => "QuantDOut",
+        Stage::SsmOut => "SsmOut",
+        Stage::AttnProj => "AttnProj",
+        Stage::Prep => "Prep",
+        Stage::Flash => "Flash",
+        Stage::QuantAOut => "QuantAOut",
+        Stage::AttnOut => "AttnOut",
+        Stage::NormF => "NormF",
+        Stage::Route => "Route",
+        Stage::Moe => "Moe",
+    }
 }
 
 /// Test-only native MMVQ projections over the existing chunk slots. These functions never
