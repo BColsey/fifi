@@ -908,7 +908,7 @@ PartArm arm_part() {
     return arm;
 }
 
-/* Unset and all values other than exactly "1" retain the original path. Read
+/* Unset and all values other than exactly "1" select the legacy arm. Read
  * once per process, so changing the switch requires restarting the engine. */
 bool adaptive_attention_enabled() {
     static const bool enabled = attn_prefill_plan::adaptive_enabled(
@@ -956,9 +956,9 @@ PartArm arm_part_adaptive(int device) {
     return arm;
 }
 
-/* Enqueue both kernels. The default retains its process-wide arm and cached errors.
- * The opt-in path caches successful arms per device and instantiated geometry; query and opt-in
- * failures propagate without caching. */
+/* Enqueue both kernels. Each path caches successful arms per device and instantiated geometry;
+ * query and opt-in failures propagate without caching. CUDA function attributes must be set on
+ * each device, even when the same kernel and geometry are used on more than one card. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
@@ -981,8 +981,21 @@ Failure enqueue_typed(const Args &k, void *stream) {
                 }
             }
         } else {
-            static const PartArm original = arm_part<kHeadDim, kGroup>();
-            arm = original;
+            int device = -1;
+            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) return failure;
+            static std::mutex arms_mutex;
+            static std::map<int, PartArm> arms;
+            {
+                std::lock_guard<std::mutex> lock(arms_mutex);
+                const auto it = arms.find(device);
+                if (it != arms.end()) {
+                    arm = it->second;
+                } else {
+                    arm = arm_part<kHeadDim, kGroup>();
+                    if (arm.err == cudaSuccess) arms.emplace(device, arm);
+                }
+            }
         }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {
