@@ -93,7 +93,7 @@ pub(crate) struct TieredPlan {
 
 impl TieredPlan {
     /// The thread cap: the machine already runs at its thermal limit.
-    pub(crate) const MAX_THREADS: usize = 8;
+    pub(crate) const MAX_THREADS: usize = 16;
 
     /// The defaults of the measurements: the caller chooses the slots and the thread count (6 in
     /// the measurements); timeout 10 s, 0.25 swaps per token, decay 0.999, no preload.
