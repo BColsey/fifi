@@ -18,7 +18,13 @@ To roll back, remove `Q36_P2P_ASYNC_BROADCAST`, retain
 `Q36_P2P_SYNC_BROADCAST=1`, and restart the engine. Measure on the target
 system before relying on the experimental path.
 
-The [prefill](../scripts/bench_p2p_prefill.py) and
-[decode](../scripts/bench_p2p_decode.py) drivers can compare both modes using
-the same model, context and placement. Each supports `--self-test`; use
-`--help` for endpoint, server-log and output options.
+The [prefill driver](../scripts/bench_p2p_prefill.py) supports `--self-test`;
+[bench_engines.py](../scripts/bench_engines.py) also reports server decode
+telemetry. Compare both modes using the same model, context and placement,
+and verify cache reuse before interpreting a prefill rate.
+
+An [earlier experiment](../scripts/benchmarks/qwen36-p2p-async-broadcast-results.json)
+recorded three short-prompt samples per arm on the 3060 + 3080 pair. It used
+an earlier engine tree: its results do not qualify or measure this port, and
+the configured 128k context was not filled. Rerun the device parity and
+served A/B checks on the exact new build before drawing performance conclusions.
