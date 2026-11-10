@@ -1048,7 +1048,7 @@ fn kv8_attention_tiles_keep_bounds_and_absolute_offsets() {
     assert_eq!(kv8_attention_tile(32, 17, 16).unwrap(), (1, 49));
     for (p0, m, row) in [
         (0, 0, 0),
-        (0, 1025, 0),
+        (0, 2049, 0),
         (0, 1024, 1024),
         (0, 16, 16),
         (usize::MAX, 1, 0),
@@ -1117,9 +1117,12 @@ fn kv8_attention_part_capacity_is_bounded_and_disjoint() {
     let (part, _, v, rows) = kv8_scratch_layout(1024, CPF_ATTN_PART_CAP).unwrap();
     assert_eq!(part, 16_908_288);
     assert_eq!(v + rows, 21_102_592);
+    let (part, _, v, rows) = kv8_scratch_layout(2048, CPF_ATTN_PART_CAP).unwrap();
+    assert_eq!(part, 16_908_288);
+    assert_eq!(v + rows, 25_296_896);
     assert!(kv8_scratch_layout(1024, CPF_ATTN_PART_CAP - 1).is_err());
     assert!(kv8_scratch_layout(0, CPF_ATTN_PART_CAP).is_err());
-    assert!(kv8_scratch_layout(1025, CPF_ATTN_PART_CAP).is_err());
+    assert!(kv8_scratch_layout(2049, CPF_ATTN_PART_CAP).is_err());
 }
 
 /// Each stage passes the prefill word it was given. Mask 8 is unreachable through the body — the

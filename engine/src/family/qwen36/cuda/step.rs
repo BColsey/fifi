@@ -1127,7 +1127,9 @@ impl<'a> QwenResidentStep<'a> {
     /// the no-cap default, and `chunk_ready` carries the cap only in its accept verdict.
     pub(crate) fn set_m_sess_cap(&mut self, m_sess_cap: u32) {
         self.m_sess_cap = if self.kv8_chunked_prefill {
-            m_sess_cap.min(1024)
+            // The KV8 chunk domain (KV8_BULK_ROWS in prefill.rs); raising the env's
+            // accepted rows past this needs that domain extended first.
+            m_sess_cap.min(2048)
         } else {
             m_sess_cap
         };
