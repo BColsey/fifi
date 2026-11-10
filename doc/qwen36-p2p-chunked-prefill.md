@@ -12,11 +12,15 @@ disabled while chunking is active until its numeric path and turn-chain
 behavior have been qualified. The default eager path and its prefix handling
 are unchanged.
 
-The present card chunk arenas do not attach Q8 K/V staging. Q8 attention
-therefore uses the unstaged tiled fallback, which performs a blocking length
-update for each query tile. Its impact at long contexts has not been measured
-on this port. Staged attention on card geometry needs separate investigation
-and device validation before it can be enabled.
+For Q8 K/V, each card can attach an FP16 attention staging buffer after all
+base chunk arenas are allocated. The buffer uses that card's K/V head count
+and the same context-based size rule as single-device fixed staging. It is
+admitted only if the card can retain its free-VRAM floor; otherwise that card
+uses the existing tiled Q8 attention. Staging uses segmented attention beyond
+its capacity when the checked partial-buffer plan fits. An allocation race can
+also fall back to tiled attention; other CUDA failures refuse the chunk arena.
+Tiled attention performs a blocking length update for each query tile.
+Neither staged path has yet been qualified or measured on physical P2P cards.
 
 When this experimental path is active, the card executor advertises the
 admitted chunk size to the serving worker. With chunking off, the worker keeps
@@ -51,8 +55,9 @@ observations are not measurements of this port and do not establish a
 repeatable speedup or long-context behavior.
 
 Before this path is proposed for use, build the exact commit with native
-CUDA, pass the host and physical-peer tests, and compare repeated cold
-served prompts against the eager path with identical weights and settings.
+CUDA, pass the host and physical-peer full and segmented staging tests, and
+compare repeated cold served prompts against the eager path with identical
+weights and settings.
 Record prompt and output token counts, prefix reuse, prefill and decode
 rates, VRAM usage, device identities, and failures. Separately validate
 128k and near-256k prompts with reserved output and marker recall; synthetic
