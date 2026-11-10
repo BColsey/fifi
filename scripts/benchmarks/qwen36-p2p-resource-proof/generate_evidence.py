@@ -184,7 +184,7 @@ def main():
         or sha(Path(receipt["server_binary"])) != receipt["server_binary_sha256"]
     ):
         raise ValueError("server source or binary changed")
-    observer = HERE.parents[1] / "bench_host_gpu_resources.py"
+    observer = HERE / "observer_measured.py.txt"
     if sha(observer) != OBSERVER_SHA:
         raise ValueError("reviewed observer differs from measured observer")
     smoke_summary = load(SMOKE / "attention/summary.json")
