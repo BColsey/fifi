@@ -20,3 +20,19 @@ An earlier device log and a failed attempt are in the [observation
 record](../scripts/benchmarks/p2p-ring-multiblock-observations.json). They do
 not identify the exact binaries or supply a matched baseline, so they do not
 establish a speedup or qualify this implementation.
+
+## RTX 3060 + RTX 3080 observation
+
+A guarded, same-binary comparison on Qwen3.6 35B A3B Q4_K_M with 512-row
+chunks measured the existing opt-in against the default. For a cold 4,274-token
+synthetic prompt, median server prefill rates were 474.09 versus 547.93 tokens/s
+with the control first, and 472.28 versus 547.68 tokens/s with the candidate
+first (three samples per arm and order). The measured interval ends with the
+first emitted batch, so it includes first-token generation. The short decode
+case changed by less than 1% in both orders. Deterministic answer hashes matched.
+
+The [measurement record](../scripts/benchmarks/qwen36-p2p-ring-performance-results.json)
+contains per-sample rates, exact build and device identities, peer correctness
+checks, an instrumented launch-grid observation, and restoration receipts. It is
+a short synthetic observation, not a 128k/256k coding or recall qualification;
+prefix reuse was disabled. The switch remains off by default.
