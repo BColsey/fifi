@@ -50,3 +50,10 @@ positions, and finished normally after 21 output tokens; all three markers were
 correct. Its first-batch rate was 442.75 tokens/s. The [near-256k receipt](../scripts/benchmarks/qwen36-p2p-ring-near-256k-recall.json)
 records the count, output budget, result and guard. This is one cold synthetic
 request rather than a multi-turn coding qualification.
+
+A separate two-turn synthetic coding check passed both the initial Python edit
+and its revision with 131,157 and 131,206 prompt tokens respectively. Prefix
+reuse was disabled; both turns reported zero reused tokens and each took about
+282.2 seconds to the first response batch. The [coding-session receipt](../scripts/benchmarks/qwen36-p2p-ring-coding-session.json)
+records both turns and the guard. One small task does not establish general
+coding quality or warm-prefix correctness.
