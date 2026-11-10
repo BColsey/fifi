@@ -57,3 +57,10 @@ reuse was disabled; both turns reported zero reused tokens and each took about
 282.2 seconds to the first response batch. The [coding-session receipt](../scripts/benchmarks/qwen36-p2p-ring-coding-session.json)
 records both turns and the guard. One small task does not establish general
 coding quality or warm-prefix correctness.
+
+The same two-turn coding check also passed near the context limit: the initial
+edit and revision counted 261,696 and 261,740 prompt tokens, and each returned
+11 tokens with a normal stop. Both turns reused zero tokens and took about
+633 seconds to their first batch. The [near-256k coding receipt](../scripts/benchmarks/qwen36-p2p-ring-coding-256-session.json)
+records the output budgets, results and guard. This is a single synthetic
+session; it does not qualify warm reuse or general coding quality.
