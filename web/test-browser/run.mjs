@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stopChild } from "./cleanup.mjs";
 
 const PORT = 4319;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -56,9 +57,12 @@ async function waitFor(fn, label, timeout = 15000) {
   }
 }
 
-const vite = spawn("npx", ["vite", "preview", "--port", String(PORT), "--host", "127.0.0.1"], { stdio: "ignore" });
+// Spawn Vite directly so the process we stop actually owns the listening port.
+const vite = spawn(process.execPath, [join(process.cwd(), "node_modules", "vite", "bin", "vite.js"),
+  "preview", "--port", String(PORT), "--strictPort", "--host", "127.0.0.1"], { stdio: "ignore" });
 const profile = mkdtempSync(join(tmpdir(), "fifi-browser-test-"));
-const chrome = spawn("chromium", ["--headless=new", "--disable-gpu", "--no-sandbox", "--remote-debugging-port=9339", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
+const chrome = spawn("chromium", ["--headless=new", "--disable-gpu", "--no-sandbox", "--remote-debugging-port=9339", `--user-data-dir=${profile}`, "about:blank"],
+  { stdio: "ignore", detached: process.platform !== "win32" });
 
 let ws; let nextId = 0; const pending = new Map(); let sessionId = null;
 const send = (method, params = {}) => new Promise((resolve, reject) => {
@@ -150,9 +154,8 @@ try {
   check("browser run completed", false, String(err).slice(0, 300));
 } finally {
   try { ws?.close(); } catch {}
-  chrome.kill();
-  vite.kill();
-  rmSync(profile, { recursive: true, force: true });
+  await Promise.all([stopChild(chrome, { processGroup: true }), stopChild(vite)]);
+  rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 console.log(failures.length === 0 ? "ALL BROWSER CHECKS PASSED" : "FAILURES: " + failures.join(", "));
 process.exit(failures.length === 0 ? 0 : 1);
