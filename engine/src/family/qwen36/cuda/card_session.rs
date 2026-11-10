@@ -293,6 +293,12 @@ impl CardSession {
         self.chunk = Some(chunk);
     }
 
+    #[cfg(test)]
+    pub(super) fn set_sampler_vocab_for_test(&mut self, sampler_vocab: usize) {
+        assert!((1..=self.vocab).contains(&sampler_vocab));
+        self.sampler_vocab = sampler_vocab;
+    }
+
     fn build_chunk_if_asked(
         stack: &'static CardStack,
         weights: &'static [&'static crate::family::project::cuda::CudaWeights],
@@ -571,6 +577,10 @@ impl TokenStepper for CardSession {
         if tokens.len() < 2 || self.poisoned {
             return tokens.iter().try_for_each(|&t| self.feed(t));
         }
+        // Match the single-device chunk path: validate the sampler vocabulary and
+        // signed kernel-index range for the whole batch before any card changes
+        // state. The embedding table can contain rows beyond the sampler vocabulary.
+        let _ = super::prefill_driver::chunk_ids(tokens, self.sampler_vocab)?;
         let (rows, tail) = tokens.split_at(tokens.len() - 1);
         let [last] = tail else {
             unreachable!("len checked above");

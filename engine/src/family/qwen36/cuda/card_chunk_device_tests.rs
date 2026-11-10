@@ -8,6 +8,7 @@ use super::card_prefill::{CardChunkInputs, build_card_chunk, run_card_chunk};
 use super::card_session_device_tests::rig_spec;
 use super::dims::{KvMode, StepDims, StepOptions};
 use super::layer_table::LayerTable;
+use crate::EngError;
 use crate::family::executor::ExecutorOps;
 use crate::family::gguf_model::Inventory;
 use crate::family::qwen36::host::HostShape;
@@ -56,7 +57,7 @@ fn large_card_chunk_matches_the_per_token_path_on_physical_peers() {
 
 fn check_card_chunk(devices: [usize; 2], rows: usize) {
     const NAME: &str = "card_chunk_matches_the_per_token_path";
-    let (mut session, stack, loaded, names, _vocab) =
+    let (mut session, stack, loaded, names, vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
             devices,
             256,
@@ -171,6 +172,28 @@ fn check_card_chunk(devices: [usize; 2], rows: usize) {
     TokenStepper::reset(&mut session).expect("reset long chunk");
     session.set_chunk_for_test(chunk);
     assert_eq!(ExecutorOps::prefill_piece(&session), Some(rows));
+
+    // The embedding table has a final padded row outside the sampler vocabulary.
+    // Refuse invalid IDs anywhere in the input, including a later piece and the
+    // eager tail, before any earlier row can change the session.
+    let sampler_vocab = vocab - 1;
+    session.set_sampler_vocab_for_test(sampler_vocab);
+    let padded = u32::try_from(sampler_vocab).expect("rig vocabulary fits u32");
+    let mut late = vec![11; rows + 3];
+    late[rows + 1] = padded;
+    for bad in [vec![padded, 11], vec![11, padded], late, vec![u32::MAX, 11]] {
+        let error = TokenStepper::feed_rows(&mut session, &bad).expect_err("invalid ID refused");
+        assert!(
+            matches!(error, EngError::BadRequest(ref text) if text.contains("outside the sampler vocabulary")),
+            "{NAME}: unexpected refusal: {error:?}"
+        );
+        assert_eq!(
+            TokenStepper::fed(&session),
+            0,
+            "{NAME}: refusal must not feed any row"
+        );
+    }
+    session.set_sampler_vocab_for_test(vocab);
     TokenStepper::feed_rows(&mut session, prompt).expect("long chunk feed");
     let long_chunk = TokenStepper::logits(&mut session, *last).expect("long chunk logits");
     let (want_tok, want_best, want_runner) = winner(&long_control);
