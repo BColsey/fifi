@@ -1,0 +1,161 @@
+{
+  "description": "Exact-source matched staged and unstaged two-GPU synthetic correctness checks. No served-model or throughput result.",
+  "candidate": {
+    "commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+    "test_binary_sha256": "4db6595e6ff145ba2163a12f9076b639561b8ef82e7fce3f35bc4950ab02b8d2",
+    "server_binary_sha256": "efac9000d75f7fddddfa5c50882837f60915dbcfdfa6afa51433fe56da9fd69d",
+    "receipt_sha256": "5de2abfd5cd181741c544c3950b5e35614df381b69b787ba0e9bcff8ebf50cbb",
+    "test_build_log_sha256": "e582b9ad50b77e9f6c3dd5172cd17a5b79d7e1114a10cee7590b94ef24752bc3",
+    "server_build_log_sha256": "e8e6f584731cea8b7c22d1d62924e9affbcc807bdeb515cfaa954f444cfabcfe",
+    "host_tests": 9,
+    "peer_tests": [
+      "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "family::qwen36::cuda::card_chunk_device_tests::segmented_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch"
+    ]
+  },
+  "control": {
+    "commit": "c2df0bd2a8220fe20f39235e5015a96dd8080a79",
+    "test_binary_sha256": "30798f026fe9784227b90c87255eec98c7491a16bc1ac69ccdc5388abb3a06a4",
+    "server_binary_sha256": "46469ea123fb3e8abdf0c716d84eb314dd0dd5bb6181170a2c45f0a1c041f12a",
+    "receipt_sha256": "f2d0c6cadd31567818f718f61873a4786b8832bd6d23204c24ee0af6df5b770d",
+    "test_build_log_sha256": "88b34145603e6f3f818d7e322d36ba48a014b5b4553a690ded7d09920867ed29",
+    "server_build_log_sha256": "1a722680281d18d90fedf135b52c494b2c75c078d4404c04ed0d03bcc18c661e",
+    "host_tests": 8,
+    "peer_tests": [
+      "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch"
+    ]
+  },
+  "candidate_source_url": "https://github.com/BColsey/fifi/commit/76dec8a61d040efa97beefe273bed8dc9e68ff57",
+  "control_source_url": "https://github.com/BColsey/fifi/commit/c2df0bd2a8220fe20f39235e5015a96dd8080a79",
+  "device_uuids_in_order": [
+    "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+    "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+  ],
+  "device_names_in_order": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "fixture": {
+    "context_capacity_tokens": 256,
+    "layers": 2,
+    "kv_mode": "Int8G32"
+  },
+  "method": "Separate processes with adaptive attention unset, --ignored --exact --test-threads=1 --nocapture. The P2P fixtures compare final-token greedy winner and best/runner-up logits to per-token controls for one chunk and two chunks plus an eager tail. The device-arm regression switches 0, 1, 0 and compares every output against a host reference.",
+  "outcomes": [
+    {
+      "case": "candidate_staged8",
+      "arm": "candidate",
+      "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "rows": 8,
+      "stage_rows": 256,
+      "exit": 0,
+      "passed": true,
+      "log": "00.log",
+      "sha256": "9835beaef890492bd231b8ecf9f4001eb3be3259104c9c289bba5fbbb69958d3",
+      "log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 256 rows, 262144 bytes\nq36 cuda: card 1 KV8 staging: 256 rows, 262144 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 8 rows, winner 3256, chunk margin 37.4643/34.8862\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5921 filtered out; finished in 11.12s\n\n"
+    },
+    {
+      "case": "candidate_staged96",
+      "arm": "candidate",
+      "test": "family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "rows": 96,
+      "stage_rows": 256,
+      "exit": 0,
+      "passed": true,
+      "log": "01.log",
+      "sha256": "ef79732b6276e16f2e5d49d24293493e544857c4e26ef77a4686118c15f7a80c",
+      "log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 256 rows, 262144 bytes\nq36 cuda: card 1 KV8 staging: 256 rows, 262144 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 96 rows, winner 3256, chunk margin 37.4642/34.8854\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5921 filtered out; finished in 11.18s\n\n"
+    },
+    {
+      "case": "candidate_segmented96",
+      "arm": "candidate",
+      "test": "family::qwen36::cuda::card_chunk_device_tests::segmented_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "rows": 96,
+      "stage_rows": 32,
+      "exit": 0,
+      "passed": true,
+      "log": "02.log",
+      "sha256": "41117440d06c6211cec2b7b7a6f9882a6177e7a393edd3d39e3b66d7265693ca",
+      "log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::segmented_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 32 rows, 32768 bytes\nq36 cuda: card 1 KV8 staging: 32 rows, 32768 bytes\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 96 rows, winner 3256, chunk margin 37.4642/34.8854\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5921 filtered out; finished in 11.14s\n\n"
+    },
+    {
+      "case": "control_unstaged8",
+      "arm": "control",
+      "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+      "rows": 8,
+      "stage_rows": null,
+      "exit": 0,
+      "passed": true,
+      "log": "03.log",
+      "sha256": "b02b9c502843c9bdb315e3dbd263c1cd30029a2d24693574dbaf8b81a82d913c",
+      "log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 8 rows, winner 3256, chunk margin 37.4643/34.8862\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5919 filtered out; finished in 10.89s\n\n"
+    },
+    {
+      "case": "control_unstaged96",
+      "arm": "control",
+      "test": "family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers",
+      "rows": 96,
+      "stage_rows": null,
+      "exit": 0,
+      "passed": true,
+      "log": "04.log",
+      "sha256": "32c93eebbf83b479813066c4eb65cd5856454cb5a0f6b6bd49ed7deef5828ab8",
+      "log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::large_card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\ngdn_delta qualification partitioned=false\ncard_chunk_matches_the_per_token_path: 96 rows, winner 3256, chunk margin 37.4642/34.8854\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5919 filtered out; finished in 11.12s\n\n"
+    },
+    {
+      "case": "candidate_device_arm",
+      "arm": "candidate",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch",
+      "rows": null,
+      "stage_rows": null,
+      "exit": 0,
+      "passed": true,
+      "log": "05.log",
+      "sha256": "fac4a3869a245e60d9f2c276c54d430e461dc92e7eed664253ed3ebb53fcd2cd",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch ... CUDA devices visible: 2\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nattn_prefill_arms_each_physical_device_before_launch: completed device 1\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5921 filtered out; finished in 0.38s\n\n"
+    },
+    {
+      "case": "control_device_arm",
+      "arm": "control",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch",
+      "rows": null,
+      "stage_rows": null,
+      "exit": 0,
+      "passed": true,
+      "log": "06.log",
+      "sha256": "4ab97e29873f7e52f37185492d1e1651f69cfb8a7fb0befcaf4dd2d6989cf13f",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch ... CUDA devices visible: 2\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nattn_prefill_arms_each_physical_device_before_launch: completed device 1\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5919 filtered out; finished in 0.37s\n\n"
+    }
+  ],
+  "guard": {
+    "sample_count": 48,
+    "all_samples_clear": true,
+    "guard_jsonl_sha256": "f5e7582586946e95af4fceff3eb62e3280dc1158e6e7383844147195eafeaefa",
+    "memory_admission": {
+      "free_mib": {
+        "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 9893,
+        "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 11962
+      },
+      "required_mib": {
+        "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 8537,
+        "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 10683
+      },
+      "service_used_before_mib": {
+        "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 8281,
+        "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 10427
+      },
+      "note": "8192 MiB minimum per card and at least prior service usage plus 256 MiB; a guard, not a measured rig footprint"
+    },
+    "original_pair_service_restored": true
+  },
+  "limitations": [
+    "The staging fixtures do not compare intermediate logits or the full final logit vector.",
+    "The forced 32-row stage selects segmented attention by source control flow; no device dispatch trace was collected.",
+    "The builds include the same local adaptive integration, per-device fix, and tokenizer source patch; their actual runtime difference is staging-related code.",
+    "No 128k/256k prompt, coding quality, served-model performance or production qualification is established."
+  ]
+}
