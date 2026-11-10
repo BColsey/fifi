@@ -1,0 +1,5 @@
+{
+  "scripts/bench_p2p_prefill.py": "90ae74c68eaa3f0c92aa212965818f3dbe6f4cd89c9c0843f6d40e93880b9c1b",
+  "scripts/bench_p2p_decode.py": "be5013449dc88b24e6fbc67dbfe323518ba6a30e281dfbd9d0a3638d58f11ee7",
+  "compare_prefill.py": "60c46fbd0bf5441ba0858c250cebcdb412d1ec31f8b74ce4e3ac202e2efd1218"
+}
