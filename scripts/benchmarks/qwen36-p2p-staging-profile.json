@@ -1,0 +1,1839 @@
+{
+  "description": "Guarded Nsight Systems software CUDA trace of the served 4,274-token cold prompt on the staged P2P integration; diagnostic evidence, not a throughput benchmark.",
+  "tested_source": {
+    "commit": "76dec8a61d040efa97beefe273bed8dc9e68ff57",
+    "url": "https://github.com/BColsey/fifi/commit/76dec8a61d040efa97beefe273bed8dc9e68ff57",
+    "server_binary_sha256": "efac9000d75f7fddddfa5c50882837f60915dbcfdfa6afa51433fe56da9fd69d",
+    "model_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "model": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "nsys_sha256": "8bdff6f409c35cda3032c84f187b6ebf861d1aa7cd0049bf8846ff31e6005fff"
+  },
+  "config": {
+    "context_limit": 262144,
+    "prompt_tokens": 4274,
+    "prefix_reuse": false,
+    "reused_tokens": 0,
+    "kv_dtype": "q8",
+    "chunk_rows": 256,
+    "stage_rows_per_card": 32768,
+    "host_expert_bytes_requested": [
+      1395864370,
+      3489660928
+    ],
+    "gpu_uuids_in_logical_order": [
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+    ]
+  },
+  "method": "NVIDIA Nsight Systems 2026.6.1: launch with --trace=cuda-sw, warm up with a 64-token cold prompt, start collection with --sample=none --cpuctxsw=none --discard-environment=true, run one 4274-token cold prompt, stop collection, and shut down only the unique session. The raw report remains local and is identified by SHA256; its environment collection was disabled. A fake-key positive/negative control separately verified the redaction option.",
+  "short_profile_smoke": {
+    "prompt_tokens": 64,
+    "report_sha256": "4e09fe98851d3d322b9e21d46c0a6f4129746b76da00d74d8ccc0eb493c22aea",
+    "guard_samples": 98,
+    "restored": true,
+    "completed": true
+  },
+  "capture": {
+    "duration_seconds": 14.444,
+    "lost_events_reported": 0,
+    "cuda_kernel_events": 115062,
+    "cuda_api_events": 125680,
+    "cuda_memcpy_events": 726,
+    "cuda_sync_events": 9892,
+    "report_sha256": "56093385c391712e858f35f4aa5056c33ae8912551675cdd3220eb41cfe9a358",
+    "report_bytes": 5697029,
+    "survey_sha256": "35907ec706e4f62fcf4ae6ba9c6120eb86cf8eb632b31f428b97b2d8d2579d6b",
+    "server_log_sha256": "df0823670912709374ebcff41d401d283ad920eab4aad74440363b627f5f9e13",
+    "sample_sha256": "11a055379ef193c3ac81b27e4bf927292b6db3fad0851d2a64797050290698c2",
+    "request_logs": [
+      {
+        "request_id": "chatcmpl-0000000000000001",
+        "method": "POST",
+        "endpoint": "/v1/chat/completions",
+        "model": "fifi-q36",
+        "engine": "q36",
+        "session": null,
+        "started_at_ms": 1794304794568,
+        "stream": false,
+        "status": 200,
+        "outcome": "ok",
+        "error_code": null,
+        "finish_reason": "stop",
+        "prompt_tokens": 64,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "queue_wait_ms": 0.0,
+        "prefill_ms": 421.1,
+        "time_to_first_token_ms": 421.1,
+        "decode_tokens_per_second": 36.65,
+        "prompt_hash_1024": "5a2ecbefdfc9c760",
+        "prompt_hash_4096": "5a2ecbefdfc9c760",
+        "prompt_hash_full": "5a2ecbefdfc9c760",
+        "prompt_hash_anchors": [],
+        "lcp_prev_request_tokens": 0
+      },
+      {
+        "request_id": "chatcmpl-0000000000000002",
+        "method": "POST",
+        "endpoint": "/v1/chat/completions",
+        "model": "fifi-q36",
+        "engine": "q36",
+        "session": null,
+        "started_at_ms": 1794304795932,
+        "stream": false,
+        "status": 200,
+        "outcome": "ok",
+        "error_code": null,
+        "finish_reason": "stop",
+        "prompt_tokens": 4274,
+        "completion_tokens": 2,
+        "reused_tokens": 0,
+        "queue_wait_ms": 0.0,
+        "prefill_ms": 14223.3,
+        "time_to_first_token_ms": 14223.3,
+        "decode_tokens_per_second": 33.76,
+        "prompt_hash_1024": "427318372b35b5ff",
+        "prompt_hash_4096": "79437166242bc0e9",
+        "prompt_hash_full": "326b39c0e74e5e9a",
+        "prompt_hash_anchors": [
+          "731b5c8d3fdbad57",
+          "79437166242bc0e9"
+        ],
+        "lcp_prev_request_tokens": 43
+      }
+    ],
+    "free_mib_after_warmup": {
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 1479,
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 1372
+    },
+    "guard_samples": [
+      {
+        "time": 1794304683.836482,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304684.1939614,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304685.5003526,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304686.8032572,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304688.0347164,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304689.269543,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304690.4981081,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304691.7239366,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304692.9509995,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304694.1764925,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304695.402286,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304696.6289606,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304697.8585486,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304699.0917592,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304700.3205864,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304701.5529168,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304702.7830594,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304704.0122628,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304705.250874,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304706.4854288,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304707.7159386,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304708.953126,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304710.2002804,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304711.4488506,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304712.6887589,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304713.92963,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304715.1652753,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304716.40313,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304717.6399777,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304718.8731258,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304720.103144,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304721.3327785,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304722.570422,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304723.8015127,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304725.041273,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304726.287528,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304727.5310543,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304728.7725787,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304730.0064495,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304731.239103,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304732.4720879,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304733.6970282,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304734.9323134,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304736.164451,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304737.403477,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304738.63412,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304739.8655987,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304741.1049168,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304742.3549604,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304743.5843356,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304744.813214,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304746.0378063,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304747.2611034,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304748.4961202,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304749.7287564,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304750.9555767,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304752.1829762,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304753.4184215,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304754.6503944,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304755.8799438,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304757.109572,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304758.3344414,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304759.5740724,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304760.8148158,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304762.0555396,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304763.2938728,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304764.5358362,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304765.775029,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304767.0121138,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304768.254716,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304769.4990518,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304770.7394965,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304771.9811606,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304773.2236328,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304774.4554033,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304775.7035084,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304776.952833,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304778.2014034,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304779.4468815,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304780.6893277,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304781.9281359,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304783.16633,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304784.4085984,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304785.6453347,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304786.8821583,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304788.1201124,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304789.3680649,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304790.6072242,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304791.8517408,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304793.1007152,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304794.3282065,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304795.593746,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304796.890204,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304798.2093506,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304799.472338,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304800.7679765,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304802.036201,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304803.35282,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304804.5841582,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304805.915725,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304807.1549778,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304808.493443,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304809.8048854,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304811.031637,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304812.2580361,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304813.4824264,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304814.7083614,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304815.9353771,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304817.164232,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      },
+      {
+        "time": 1794304818.3880715,
+        "other_jobs": [],
+        "builders": [],
+        "unexpected": [],
+        "non_target_utilization": {
+          "GPU-699004f8-e2f0-747e-5c02-30141e9d4b7c": 0
+        },
+        "states_ok": true,
+        "clients": false,
+        "listeners": false
+      }
+    ],
+    "restore": {
+      "restored": true,
+      "reason": "original pair service ready"
+    }
+  },
+  "device_mapping": {
+    "method": "TARGET_INFO_CUDA_DEVICE joined to TARGET_INFO_GPU by gpuId for traced process; CUDA_VISIBLE_DEVICES reorders physical devices. Nsight recipe labels logical device 0 with an incorrect global GPU name, so its device-number suffix is mapped using the UUID rows.",
+    "logical_0": {
+      "name": "RTX 3060 12 GB",
+      "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+    },
+    "logical_1": {
+      "name": "RTX 3080 10 GB",
+      "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+    }
+  },
+  "kernel_summary_by_logical_device": [
+    {
+      "table": "rank_stats_by_device",
+      "Name": "mul_mat_q",
+      "Device ID": 0,
+      "Count": 7310,
+      "Mean": 1003284.6,
+      "Std": 3923125.5,
+      "Min": 8416,
+      "Q1": 17120.0,
+      "Median": 63648.0,
+      "Q3": 313208.8,
+      "Max": 22937787,
+      "Sum": 7334010627,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "mul_mat_q",
+      "Device ID": 1,
+      "Count": 7310,
+      "Mean": 1119651.6,
+      "Std": 3030389.6,
+      "Min": 7680,
+      "Q1": 9376.0,
+      "Median": 31072.0,
+      "Q3": 145504.0,
+      "Max": 12606811,
+      "Sum": 8184653284,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "publish_f32_small_kernel",
+      "Device ID": 0,
+      "Count": 13112,
+      "Mean": 48802.7,
+      "Std": 134644.9,
+      "Min": 1856,
+      "Q1": 2176.0,
+      "Median": 2848.0,
+      "Q3": 4256.0,
+      "Max": 616736,
+      "Sum": 639901561,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "publish_f32_small_kernel",
+      "Device ID": 1,
+      "Count": 4400,
+      "Mean": 119108.4,
+      "Std": 173503.6,
+      "Min": 2048,
+      "Q1": 3872.0,
+      "Median": 4192.0,
+      "Q3": 320672.0,
+      "Max": 486496,
+      "Sum": 524076903,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "wait_copy_kernel",
+      "Device ID": 0,
+      "Count": 5116,
+      "Mean": 3353.9,
+      "Std": 32585.8,
+      "Min": 1088,
+      "Q1": 1152.0,
+      "Median": 1280.0,
+      "Q3": 2144.0,
+      "Max": 577377,
+      "Sum": 17158480,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "wait_copy_kernel",
+      "Device ID": 1,
+      "Count": 5116,
+      "Mean": 63153.7,
+      "Std": 160312.2,
+      "Min": 1248,
+      "Q1": 1280.0,
+      "Median": 1440.0,
+      "Q3": 2720.0,
+      "Max": 1310080,
+      "Sum": 323094438,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "wait_sum_kernel",
+      "Device ID": 0,
+      "Count": 3640,
+      "Mean": 1441208.4,
+      "Std": 5428772.2,
+      "Min": 3872,
+      "Q1": 4280.0,
+      "Median": 14240.0,
+      "Q3": 704033.0,
+      "Max": 29756065,
+      "Sum": 5245998719,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "table": "rank_stats_by_device",
+      "Name": "wait_sum_kernel",
+      "Device ID": 1,
+      "Count": 3640,
+      "Mean": 1193434.0,
+      "Std": 4712526.5,
+      "Min": 4096,
+      "Q1": 4320.0,
+      "Median": 15712.0,
+      "Q3": 931040.0,
+      "Max": 31638194,
+      "Sum": 4344099684,
+      "Rank": 0,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    }
+  ],
+  "q4_kernel_shapes_recipe_rows": [
+    {
+      "GrdX": 2,
+      "GrdY": 32,
+      "GrdZ": 256,
+      "calls": 1280,
+      "sum_seconds": 5.312,
+      "mean_ms": 4.15,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "GrdX": 2,
+      "GrdY": 32,
+      "GrdZ": 256,
+      "calls": 1280,
+      "sum_seconds": 4.366,
+      "mean_ms": 3.411,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 32,
+      "GrdZ": 256,
+      "calls": 640,
+      "sum_seconds": 2.401,
+      "mean_ms": 3.752,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 32,
+      "GrdZ": 256,
+      "calls": 640,
+      "sum_seconds": 2.373,
+      "mean_ms": 3.709,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "GrdX": 2,
+      "GrdY": 23,
+      "GrdZ": 256,
+      "calls": 80,
+      "sum_seconds": 0.257,
+      "mean_ms": 3.213,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "GrdX": 2,
+      "GrdY": 23,
+      "GrdZ": 256,
+      "calls": 80,
+      "sum_seconds": 0.212,
+      "mean_ms": 2.656,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 23,
+      "GrdZ": 256,
+      "calls": 40,
+      "sum_seconds": 0.116,
+      "mean_ms": 2.903,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 23,
+      "GrdZ": 256,
+      "calls": 40,
+      "sum_seconds": 0.115,
+      "mean_ms": 2.873,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    }
+  ],
+  "q4_kernel_duration_quantiles_recipe_rows": [
+    {
+      "GrdX": 2,
+      "GrdY": 32,
+      "n": 1280,
+      "p10_ms": 0.31,
+      "p50_ms": 0.36,
+      "p90_ms": 20.24,
+      "max_ms": 22.94,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 32,
+      "n": 640,
+      "p10_ms": 0.96,
+      "p50_ms": 1.01,
+      "p90_ms": 16.66,
+      "max_ms": 19.95,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "GrdX": 2,
+      "GrdY": 32,
+      "n": 1280,
+      "p10_ms": 0.14,
+      "p50_ms": 0.16,
+      "p90_ms": 10.69,
+      "max_ms": 12.61,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    },
+    {
+      "GrdX": 16,
+      "GrdY": 32,
+      "n": 640,
+      "p10_ms": 0.43,
+      "p50_ms": 0.44,
+      "p90_ms": 8.82,
+      "max_ms": 9.35,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    }
+  ],
+  "q4_kernel_streams_recipe_rows": [
+    {
+      "Strm": 22,
+      "calls": 2040,
+      "sec": 7.096,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "Strm": 23,
+      "calls": 2040,
+      "sec": 8.057,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    }
+  ],
+  "peer_wait_overlap_with_other_gpu_q4_recipe_rows": [
+    {
+      "waits_with_overlap": 170,
+      "overlap_intervals": 476,
+      "overlap_seconds": 4.102,
+      "recipe_device_label": "NVIDIA GeForce RTX 2080 Ti (0)",
+      "logical_device_id": 0,
+      "physical_device": {
+        "name": "RTX 3060 12 GB",
+        "uuid": "GPU-704fef60-5280-9b88-fa3d-d11135caf576"
+      }
+    },
+    {
+      "waits_with_overlap": 510,
+      "overlap_intervals": 612,
+      "overlap_seconds": 2.97,
+      "recipe_device_label": "NVIDIA GeForce RTX 3080 (1)",
+      "logical_device_id": 1,
+      "physical_device": {
+        "name": "RTX 3080 10 GB",
+        "uuid": "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+      }
+    }
+  ],
+  "analysis_queries": {
+    "kernel": "nsys recipe cuda_gpu_kern_sum --mode none --format jsonl --input trace.nsys-rep",
+    "trace": "nsys recipe cuda_gpu_trace --mode none --format jl --demangled --input trace.nsys-rep",
+    "device_mapping": "SELECT d.pid, d.cudaId, d.gpuId, d.uuid, g.name, g.uuid AS gpu_uuid FROM TARGET_INFO_CUDA_DEVICE d LEFT JOIN TARGET_INFO_GPU g ON d.gpuId = g.id ORDER BY d.cudaId LIMIT 10",
+    "overlap": "WITH waits AS (SELECT \"Device\" AS dev, \"CorrId\" AS id, \"Start (ns)\" AS s, \"Start (ns)\"+\"Duration (ns)\" AS e FROM cuda_gpu_trace WHERE \"Name\" LIKE '%wait_sum_kernel%'), mmq AS (SELECT \"Device\" AS dev, \"Start (ns)\" AS s, \"Start (ns)\"+\"Duration (ns)\" AS e FROM cuda_gpu_trace WHERE \"Name\" LIKE '%mul_mat_q<(ggml_type)12%') SELECT w.dev, count(DISTINCT w.id) AS waits_with_overlap, count(*) AS overlap_intervals, round(sum(least(w.e,m.e)-greatest(w.s,m.s))/1000000000.0,3) AS overlap_seconds FROM waits w JOIN mmq m ON w.dev != m.dev AND w.s < m.e AND m.s < w.e GROUP BY w.dev ORDER BY w.dev LIMIT 10"
+  },
+  "limitations": [
+    "The measured source is the separately pushed integration commit, not the exact head of the staging MR.",
+    "A kernel duration sum is not application wall time; kernels on different GPUs overlap. Wait time overlapping other-card work is not automatically removable overhead.",
+    "The bimodal Q4 durations are consistent with host-backed weights but this trace does not tag individual weight addresses or prove that placement caused every slow call.",
+    "The CUDA software trace perturbs execution and is not the paired A/B performance measurement.",
+    "Single synthetic prompt; no 128k/256k prompt, coding quality, or production qualification.",
+    "The sample guard checks idleness, connections, ownership, and the separate 2080 service; the confirmed router-poll exception cannot prove no hidden user request."
+  ]
+}

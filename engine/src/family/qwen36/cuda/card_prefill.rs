@@ -29,18 +29,19 @@ use std::ffi::OsStr;
 
 use super::{
     card_step::CardStack,
-    dims::StepDims,
+    dims::{KvMode, StepDims},
     layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     moe::{Launch, MoeLayerWeights},
     prefill::ChunkRows,
     prefill::{
         ChunkBufs, ChunkModel, ChunkRun, ChunkViews, ChunkWeights, LayerCtx, LayerMoe, Stage,
-        attn_flash, attn_out, attn_prep, attn_proj, chunk_embed, chunk_route, combine_chunk_moe,
-        delta_conv, delta_proj, delta_scan, layer_stages, norm_a, norm_f, quant_a, quant_a_out,
-        quant_d_out, run_chunk_routed, run_chunk_shared, ssm_out,
+        attn_flash, attn_out, attn_prep, attn_proj, chunk_attn_geometry, chunk_embed, chunk_route,
+        combine_chunk_moe, delta_conv, delta_proj, delta_scan, kv8_segment_query_rows,
+        kv8_use_segments, layer_stages, norm_a, norm_f, quant_a, quant_a_out, quant_d_out,
+        run_chunk_routed, run_chunk_shared, ssm_out,
     },
-    prefill_driver::PrefillArena,
+    prefill_driver::{Kv8StagingPlan, PrefillArena, fixed_staging_rows},
     prefill_plan::{ChunkSlot, chunk_tensors_for},
     state::ResidentState,
     state_layout::Word,
@@ -115,6 +116,24 @@ fn chunk_budget(free: usize, needed: usize, floor: usize) -> Result<usize, EngEr
     Ok(budget)
 }
 
+/// Admit the full candidate only; no staging is preferable to guessing a
+/// smaller segment size without measurements for this card pair.
+fn card_staging_plan(
+    mode: KvMode,
+    rows: usize,
+    heads: usize,
+    dim: usize,
+    free: usize,
+    floor: usize,
+) -> Result<Option<Kv8StagingPlan>, EngError> {
+    let budget = chunk_budget(free, 0, floor)?;
+    if mode != KvMode::Int8G32 {
+        return Ok(None);
+    }
+    let plan = Kv8StagingPlan::for_context(rows, heads, dim)?;
+    Ok((plan.bytes <= budget).then_some(plan))
+}
+
 /// One card's chunk resources: its arena (the card's narrower slot plan)
 /// and its chunk model (the card's weight views under the card geometry).
 struct CardChunkCard {
@@ -133,6 +152,19 @@ pub(crate) struct CardChunk {
 impl CardChunk {
     pub(super) fn rows(&self) -> usize {
         self.m_sess
+    }
+
+    #[cfg(test)]
+    pub(super) fn staging_for_test(&self) -> Result<Vec<Option<(usize, bool)>>, EngError> {
+        self.cards
+            .iter()
+            .map(|card| {
+                Ok(card
+                    .arena
+                    .kv8_staging()?
+                    .map(|stage| (stage.plan.capacity, stage.segmented)))
+            })
+            .collect()
     }
 }
 
@@ -154,6 +186,28 @@ pub(super) fn build_card_chunk(
     inputs: CardChunkInputs,
     options: &super::dims::StepOptions,
     m_chunk: usize,
+) -> Result<CardChunk, EngError> {
+    build_card_chunk_with_stage_rows(
+        stack,
+        dims,
+        table,
+        inputs,
+        options,
+        m_chunk,
+        fixed_staging_rows(options.context_tokens),
+    )
+}
+
+// The stage-row argument also lets the device fixture force a small stage and
+// exercise segmented attention without allocating a 256K context.
+pub(super) fn build_card_chunk_with_stage_rows(
+    stack: &'static CardStack,
+    dims: &StepDims,
+    table: &LayerTable,
+    inputs: CardChunkInputs,
+    options: &super::dims::StepOptions,
+    m_chunk: usize,
+    stage_rows: usize,
 ) -> Result<CardChunk, EngError> {
     let cards = stack.shards().len();
     let hidden = dims.shape.hidden;
@@ -186,9 +240,8 @@ pub(super) fn build_card_chunk(
             .ok_or_else(|| EngError::MemoryPlan("card chunk: arena size overflow".into()))?;
         let floor = super::pinned::min_free_after_load()?;
         let budget = chunk_budget(context.memory_info()?.free, needed, floor)?;
-        // The card's arena uses the single-device builder over the card's
-        // list. It includes the part buffer but does not attach KV8 staging;
-        // Q8 attention therefore uses the unstaged fallback.
+        // Build all cards' base arenas before spending any memory on optional
+        // staging. In particular, two logical cards can share one device.
         let arena = PrefillArena::allocate_list(
             &stack.contexts()[card],
             &stack.streams()[card],
@@ -247,6 +300,55 @@ pub(super) fn build_card_chunk(
             model,
             moe: moe_card,
         });
+    }
+
+    if options.kv_mode == KvMode::Int8G32 {
+        for (card, chunk_card) in out.iter_mut().enumerate() {
+            let context = &stack.contexts()[card];
+            let floor = super::pinned::min_free_after_load()?;
+            let geometry = MixerGeometry::for_card(dims, stack.table(), card)?;
+            let plan = card_staging_plan(
+                options.kv_mode,
+                stage_rows,
+                geometry.attn.heads_kv,
+                geometry.attn.head_dim,
+                context.memory_info()?.free,
+                floor,
+            )?;
+            let Some(plan) = plan else {
+                eprintln!("q36 cuda: card {card} KV8 staging not admitted; using tiled attention");
+                continue;
+            };
+            // Validate the worst-case segment count and partial buffer before
+            // opting in, just as the single-card fixed admission does.
+            if plan.capacity < options.context_tokens
+                && kv8_use_segments(m_chunk)
+                && let Err(error) = kv8_segment_query_rows(
+                    chunk_attn_geometry(&geometry, m_chunk),
+                    options.context_tokens.div_ceil(plan.capacity),
+                )
+            {
+                eprintln!("q36 cuda: card {card} KV8 staging plan refused: {error:?}");
+                continue;
+            }
+            match chunk_card.arena.attach_kv8_staging(context, plan, true) {
+                Ok(()) => {
+                    chunk_budget(context.memory_info()?.free, 0, floor)?;
+                    eprintln!(
+                        "q36 cuda: card {card} KV8 staging: {} rows, {} bytes",
+                        plan.capacity, plan.bytes
+                    );
+                }
+                // A concurrent allocation can race the free-memory snapshot.
+                // CUDA OOM is non-terminal; other errors must propagate.
+                Err(EngError::MemoryPlan(error)) => {
+                    context.ensure_usable()?;
+                    chunk_budget(context.memory_info()?.free, 0, floor)?;
+                    eprintln!("q36 cuda: card {card} KV8 staging allocation refused: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     Ok(CardChunk {
         cards: out,
@@ -529,6 +631,11 @@ fn run_card_chunk_layer(
                         Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
                         Stage::AttnOut => attn_out(&runs[card], &ctx)?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
+                        timing => {
+                            return Err(EngError::BadRequest(format!(
+                                "card chunk: {timing:?} is a timing label, not a runnable stage"
+                            )));
+                        }
                     }
                 }
             }
@@ -600,7 +707,10 @@ fn moe_io<'b>(
 
 #[cfg(test)]
 mod config_tests {
-    use super::{MAX_VALUES, chunk_budget, chunk_mailbox_values, configured_chunk_rows};
+    use super::{
+        KvMode, MAX_VALUES, card_staging_plan, chunk_budget, chunk_mailbox_values,
+        configured_chunk_rows,
+    };
     use std::ffi::OsStr;
 
     #[test]
@@ -643,5 +753,27 @@ mod config_tests {
         assert_eq!(chunk_budget(100, 30, 70).unwrap(), 30);
         assert!(chunk_budget(99, 30, 70).is_err());
         assert!(chunk_budget(69, 0, 70).is_err());
+    }
+
+    #[test]
+    fn card_staging_respects_shard_geometry_and_live_floor() {
+        let bytes = 131_072 * 2 * 256 * 4;
+        let floor = 100;
+        let plan = card_staging_plan(KvMode::Int8G32, 131_072, 2, 256, floor + bytes, floor)
+            .unwrap()
+            .unwrap();
+        assert_eq!((plan.capacity, plan.bytes), (131_072, bytes));
+        assert!(
+            card_staging_plan(KvMode::Int8G32, 131_072, 2, 256, floor + bytes - 1, floor)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            card_staging_plan(KvMode::Fp16, 131_072, 2, 256, floor + bytes, floor)
+                .unwrap()
+                .is_none()
+        );
+        assert!(card_staging_plan(KvMode::Int8G32, 1, 2, 256, floor - 1, floor).is_err());
+        assert!(card_staging_plan(KvMode::Int8G32, usize::MAX, 2, 256, usize::MAX, 0).is_err());
     }
 }
