@@ -72,6 +72,19 @@ fn max_card_chunk_matches_the_per_token_path_on_physical_peers() {
 
 #[test]
 #[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn wide_card_chunk_matches_the_per_token_path_on_physical_peers() {
+    assert!(device_present(
+        "wide_card_chunk_matches_the_per_token_path_on_physical_peers"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices, 1024, None);
+}
+
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
 fn segmented_card_chunk_matches_the_per_token_path_on_physical_peers() {
     assert!(device_present(
         "segmented_card_chunk_matches_the_per_token_path_on_physical_peers"
@@ -87,8 +100,14 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
     const NAME: &str = "card_chunk_matches_the_per_token_path";
     // The serving-hook parity check below consumes two complete chunks and a
     // final token. Keep the original small fixtures unchanged, but give the
-    // 512-row fixture enough KV capacity for that entire sequence.
-    let capacity = if rows > 127 { 2048 } else { 256 };
+    // larger fixtures enough KV capacity for that entire sequence.
+    let capacity = if rows > 512 {
+        4096
+    } else if rows > 127 {
+        2048
+    } else {
+        256
+    };
     let (mut session, stack, loaded, names, vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
             devices,
@@ -114,7 +133,7 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
     // The rig requests the same mailbox sizing rule as production, so the
     // larger peer test exercises a real multi-row exchange, not a truncation.
     assert!(rows <= super::card_prefill::max_chunk_rows(d.shape.hidden));
-    if rows == 512 {
+    if rows == 1024 {
         assert_eq!(rows, super::card_prefill::max_chunk_rows(d.shape.hidden));
     }
     let inputs = || CardChunkInputs {
