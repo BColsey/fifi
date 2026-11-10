@@ -2428,23 +2428,42 @@ fn run_chunk_tiered(
     mark(Stage::MoeStart)?;
 
     // Enqueue the batched route readback (M x top_k ids + weights + M x hidden normed
-    // rows, one pinned batch), run the shared expert while it flies, THEN wait: the
-    // shared expert's launches execute under the readback's host wait.
+    // rows, one pinned batch into the REUSED route buffer), run the shared expert
+    // while it flies, THEN wait: the shared expert's launches execute under the
+    // readback's host wait.
     let t0 = std::time::Instant::now();
-    let mut batch = tiered_chunk_route_enqueue(ctx, stream, io, m, top_k, hidden)?;
+    let ids_bytes = m * top_k * 4;
+    let weights_bytes = m * top_k * 4;
+    let hidden_bytes = m * hidden * 4;
+    let ids_range = io.ids.buffer().range(io.ids.offset(), ids_bytes)?;
+    let weights_range = io
+        .weights
+        .buffer()
+        .range(io.weights.offset(), weights_bytes)?;
+    let x2_range = io.x2.buffer().range(io.x2.offset(), hidden_bytes)?;
+    let layout = runtime.route_enqueue(
+        ctx,
+        stream,
+        ids_range,
+        weights_range,
+        x2_range,
+        m,
+        top_k,
+        hidden,
+    )?;
     let weights = runtime.layer_weights(layer)?;
     run_chunk_shared(launch, &weights, io)?;
-    let route = batch.finish()?;
+    let (route_ids, route_weights) = runtime.route_finish(layout)?;
     mark(Stage::MoeShared)?;
     let t_readback = t0.elapsed();
 
     // The host classification (&mut runtime): validate every row, classify every pick.
-    // Only ids and weights flow per row — the CPU pool reads the shared `route.hidden`
-    // block directly, so copying each row's hidden slice here was pure waste.
+    // Only ids and weights flow per row — the CPU pool reads the hidden block
+    // zero-copy out of the pinned route buffer (`pool_dispatch`).
     let rows: Vec<crate::family::qwen36::tiered::host::ChunkRouteRow> = (0..m)
         .map(|r| crate::family::qwen36::tiered::host::ChunkRouteRow {
-            ids: route.ids[r * top_k..(r + 1) * top_k].to_vec(),
-            weights: route.weights[r * top_k..(r + 1) * top_k].to_vec(),
+            ids: route_ids[r * top_k..(r + 1) * top_k].to_vec(),
+            weights: route_weights[r * top_k..(r + 1) * top_k].to_vec(),
         })
         .collect();
     let t1 = std::time::Instant::now();
@@ -2466,12 +2485,7 @@ fn run_chunk_tiered(
 
     // Start the grouped pool serving of the OVERFLOW BEFORE the GPU stages: the CPU
     // work overlaps the GPU launches (the chunk's whole reason for existing).
-    let pending = runtime
-        .start_chunk_pool(layer, &misses, &route.hidden, m)
-        .map_err(|e| EngError::Backend {
-            operation: "tiered_chunk_pool",
-            message: e.to_string(),
-        })?;
+    let pending = runtime.pool_dispatch(layer, &misses, layout, m)?;
 
     // Build and upload the host ids, patch the weights — BEFORE the cold fills: the
     // table uploads are blocking writes, and queued behind the fill DMAs each would
@@ -2660,126 +2674,21 @@ fn run_chunk_tiered(
             });
         }
         // Upload the partial and add it: 1.0 * partial through a second M-row
-        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial).
+        // moe_combine (top_k 1, in place — the M-row twin of add_cpu_partial), via
+        // the REUSED pinned staging and device buffer instead of a fresh pageable
+        // upload per layer.
         if tiered_trace() {
             eprintln!(
                 "tiered-chunk: uploading the CPU partial ({} bytes)",
                 partial.len() * 4
             );
         }
-        let bytes: Vec<u8> = partial.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let partial_buf = ctx.upload(&bytes)?;
-        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
-        let ones_buf = ctx.upload(&ones)?;
-        if tiered_trace() {
-            eprintln!("tiered-chunk: adding the partial via moe_combine");
-        }
-        ctx.moe_combine(
-            stream,
-            crate::kernels::cuda::resident::moe_combine::CombineCall {
-                shape: crate::kernels::cuda::resident::moe_combine::CombineShape {
-                    m,
-                    n: hidden,
-                    top_k: 1,
-                    ld_down: hidden,
-                },
-                res: io.h,
-                down: partial_buf.range(0, bytes.len())?,
-                weights: ones_buf.range(0, ones.len())?,
-                shared: None,
-                out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
-            },
-        )?;
+        runtime.add_pool_partial(ctx, stream, io.h, &partial, m, hidden)?;
         if tiered_trace() {
             eprintln!("tiered-chunk: partial add OK");
         }
     }
     Ok(())
-}
-
-/// The batched route readback of one chunk layer, in two phases so the shared expert's
-/// launches can execute while the copies fly: one pinned copy of the router's
-/// M x top_k ids, M x top_k weights and M x hidden normed rows, one event, then a
-/// host wait and materialize.
-struct ChunkRouteBatch {
-    pinned: crate::kernels::cuda::PinnedBuf,
-    event: crate::kernels::cuda::DeviceEvent,
-    ids_bytes: usize,
-    weights_bytes: usize,
-    total: usize,
-}
-
-/// The chunk route as one flat batch.
-struct ChunkRouteRead {
-    ids: Vec<i32>,
-    weights: Vec<f32>,
-    hidden: Vec<f32>,
-}
-
-fn tiered_chunk_route_enqueue(
-    ctx: &crate::kernels::cuda::CudaContext,
-    stream: &crate::kernels::cuda::DeviceStream,
-    io: &MoeChunkIo<'_>,
-    m: usize,
-    top_k: usize,
-    hidden: usize,
-) -> Result<ChunkRouteBatch, EngError> {
-    let ids_bytes = m * top_k * 4;
-    let weights_bytes = m * top_k * 4;
-    let hidden_bytes = m * hidden * 4;
-    let total = ids_bytes + weights_bytes + hidden_bytes;
-    let mut pinned = ctx.pinned_buf(total)?;
-    // Sub-ranges of just this chunk's m rows: the device ranges are arena-sized
-    // (m_sess rows), and copy_to_pinned copies the full range — the pinned buffer
-    // is sized for m, so the copies must be too.
-    let ids_range = io.ids.buffer().range(io.ids.offset(), ids_bytes)?;
-    let weights_range = io
-        .weights
-        .buffer()
-        .range(io.weights.offset(), weights_bytes)?;
-    let x2_range = io.x2.buffer().range(io.x2.offset(), hidden_bytes)?;
-    ctx.copy_to_pinned(stream, ids_range, &mut pinned, 0)?;
-    ctx.copy_to_pinned(stream, weights_range, &mut pinned, ids_bytes)?;
-    // The normed row the CPU experts read: the router's x2 (the post-norm hidden).
-    ctx.copy_to_pinned(stream, x2_range, &mut pinned, ids_bytes + weights_bytes)?;
-    let event = ctx.event()?;
-    stream.record(&event)?;
-    Ok(ChunkRouteBatch {
-        pinned,
-        event,
-        ids_bytes,
-        weights_bytes,
-        total,
-    })
-}
-
-impl ChunkRouteBatch {
-    fn finish(&mut self) -> Result<ChunkRouteRead, EngError> {
-        self.pinned.wait(&self.event)?;
-        let mut raw = vec![0u8; self.total];
-        self.pinned.read(0, &mut raw)?;
-        let floats = |bytes: &[u8]| -> Vec<f32> {
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|w| f32::from_le_bytes(*w))
-                .collect()
-        };
-        let ints = |bytes: &[u8]| -> Vec<i32> {
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|w| i32::from_le_bytes(*w))
-                .collect()
-        };
-        Ok(ChunkRouteRead {
-            ids: ints(&raw[..self.ids_bytes]),
-            weights: floats(&raw[self.ids_bytes..self.ids_bytes + self.weights_bytes]),
-            hidden: floats(&raw[self.ids_bytes + self.weights_bytes..]),
-        })
-    }
 }
 
 /// The grouped-ids layout of one chunk layer's picks over TWO weight stacks: the bank
