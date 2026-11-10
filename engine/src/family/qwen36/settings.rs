@@ -75,11 +75,11 @@ pub(crate) const DEFAULT_CUDA_PREFILL_CHUNK: u32 = 2048;
 /// `tokenizer_config.json`/`chat_template.jinja` (the official template uses the `generation`
 /// Jinja statement, which the engine's minijinja cannot parse).
 const TOKENIZER_JSON_SHA256: &str =
-    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3";
+    "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4";
 const TOKENIZER_CONFIG_SHA256: &str =
-    "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27";
+    "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182";
 const CHAT_TEMPLATE_SHA256: &str =
-    "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
+    "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259";
 const GENERATION_CONFIG_SHA256: &str =
     "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e";
 
