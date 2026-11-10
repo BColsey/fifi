@@ -1,0 +1,162 @@
+{
+  "description": "Exact-tip native CUDA host and device evidence for the legacy per-device typed-attention arm fix.",
+  "tested_commit": "4cbc8a0af6f2b4e093702fdf696bb6c4776de799",
+  "source_url": "https://github.com/BColsey/fifi/commit/4cbc8a0af6f2b4e093702fdf696bb6c4776de799",
+  "base_commit": "b61ab946bc988ff1531dc4b21e7b8390091b0f53",
+  "binary_sha256": "021b5c3c36c64c8b99ce3d79c7c9b793044f7965dab4aff5d2d771bafdbf6af3",
+  "target": "native-cuda linux sm86 release",
+  "build_log_sha256": "3b2505898c775b7bc8224b454c6193dc379b15625a2a8baffb796932534605c9",
+  "device_uuids_in_order": [
+    "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+    "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+  ],
+  "device_names_in_order": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "host_checks": [
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_row_block_accepts_first_shared_head_geometry_cells",
+      "pass": true,
+      "sha256": "7c88955c437dfab2b372d80da414ef72ba771bf2a1a1f6fc48bec320d8a474b0"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_row_block_refuses_unimplemented_cells_before_launch",
+      "pass": true,
+      "sha256": "0ba1957423c21ed31e2de5ec09f25367a09b7d0467924e4d1a614d70aab071a3"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_segment_geometry_keeps_the_fixed_partial_cap",
+      "pass": true,
+      "sha256": "b1f4dbe6fcbf952b02556537d211a29a3c1b32dd9ece33742629221cc5b014ed"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_segments_bound_absolute_keys_and_partial_slots",
+      "pass": true,
+      "sha256": "a12ea8b84f4b76da9dd65180deb6967b1f2f2972072b950ea9f5c7ea3d2a408c"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_workspace_bytes_is_linear_not_quadratic",
+      "pass": true,
+      "sha256": "c8becb7ecb724cc19e3bbd675cfa245a9729930d7ae35a131b9a9ebb8f9e47ed"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_workspace_sizing_at_262144_positions",
+      "pass": true,
+      "sha256": "ee50a7313ebd6cb0853a0853d7f368a986a57a1b59e8edf11149cd218273387e"
+    },
+    {
+      "name": "kernels::cuda::prefill::attn_prefill::tests::cpf_attn_split_plan_reduces_splits_to_fit_the_part_cap",
+      "pass": true,
+      "sha256": "a25f440b8d923034d47268f16529259eba8d7fce40ec6f9c08bdc594ff34de2e"
+    }
+  ],
+  "method": "Each device case ran in a separate process with --exact --test-threads=1 --nocapture. The two-device regression also used --ignored and switches devices 0, 1, then 0; it compares all output values against a host numerical reference. Other cases run on the default device with two devices visible. Adaptive=true sets FIFI_CUDA_ATTN_PREFILL_ADAPT=1; false unsets it.",
+  "smoke": {
+    "outcome": {
+      "case": "legacy_regression",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch",
+      "adaptive": false,
+      "exit": 0,
+      "passed": true,
+      "log": "00.log",
+      "sha256": "64643053bc92ea3c272c8d443d8958e6b6fcde439b7fa9d18763b8dbf900c6c1"
+    },
+    "guard": {
+      "sample_count": 1,
+      "all_samples_clear": true,
+      "sha256": "3cb2b51b528310283f742d52565b38929c12610f46e9c425b1d7cfee10a6c774"
+    },
+    "original_pair_service_restored": true
+  },
+  "outcomes": [
+    {
+      "case": "legacy_regression",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch",
+      "adaptive": false,
+      "exit": 0,
+      "passed": true,
+      "log": "00.log",
+      "sha256": "b109f73bfc435877c5ec65de811b69c909544cb8f1514bcddf896537ab68c084",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch ... CUDA devices visible: 2\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nattn_prefill_arms_each_physical_device_before_launch: completed device 1\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.57s\n\n"
+    },
+    {
+      "case": "adaptive_regression",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch",
+      "adaptive": true,
+      "exit": 0,
+      "passed": true,
+      "log": "01.log",
+      "sha256": "0b25a0500e44eb1cd05b236fd2a5ed8ab15d1b2fb815d9894fe1c2bffd47dec5",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_arms_each_physical_device_before_launch ... CUDA devices visible: 2\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nattn_prefill_arms_each_physical_device_before_launch: completed device 1\nattn_prefill_arms_each_physical_device_before_launch: completed device 0\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.40s\n\n"
+    },
+    {
+      "case": "legacy_causal",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys",
+      "adaptive": false,
+      "exit": 0,
+      "passed": true,
+      "log": "02.log",
+      "sha256": "96542122ed60709933b9b12f0daa73b8a5866ab78afeb93b3ba070bdab1c8999",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.54s\n\n"
+    },
+    {
+      "case": "adaptive_causal",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys",
+      "adaptive": true,
+      "exit": 0,
+      "passed": true,
+      "log": "03.log",
+      "sha256": "a563bceb3518d2b6113f95d5266dcf966b6cf9417a9757ac3373cea3959a3b55",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_causal_mask_drops_future_keys ... CUDA devices visible: 2\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.56s\n\n"
+    },
+    {
+      "case": "legacy_tile",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_fast_path_tile_boundaries_are_exact",
+      "adaptive": false,
+      "exit": 0,
+      "passed": true,
+      "log": "04.log",
+      "sha256": "cbfee07d8edd8b0dbf67307c8a1c2d1e0d1c1d166aa32b5ac5a02032bd6d51aa",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_fast_path_tile_boundaries_are_exact ... CUDA devices visible: 2\nA causal: window 0 p0 94 m 8 \u2014 key tile 2 (base 64, keys 64..95) x row group 0 (tokens 0..1, positions 94..95): last key 95 = P_first + 1, the kTile - 1 clause exact\nA causal window 0 p0 94 m 8: worst |\u0394out| 3.425e-5 at (6, 14, 87) of the derived bound 3.086e-3\nB window: window 40 p0 33 m 8 \u2014 key tile 0 (base 0, first key 0) x row group 3 (tokens 6..8, max_p 40): first + base = max_p - window = 0, the `>` clause exact\nB window window 40 p0 33 m 8: worst |\u0394out| 4.556e-5 at (3, 6, 110) of the derived bound 2.951e-3\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.39s\n\n"
+    },
+    {
+      "case": "adaptive_tile",
+      "test": "kernels::cuda::prefill::attn_prefill::tests::attn_prefill_fast_path_tile_boundaries_are_exact",
+      "adaptive": true,
+      "exit": 0,
+      "passed": true,
+      "log": "05.log",
+      "sha256": "da2fcfb39f73d5309b6cb1228a5aa7b9a3369141405d5212048f026857e2d6e4",
+      "log_utf8": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::attn_prefill_fast_path_tile_boundaries_are_exact ... CUDA devices visible: 2\nA causal: window 0 p0 94 m 8 \u2014 key tile 2 (base 64, keys 64..95) x row group 0 (tokens 0..1, positions 94..95): last key 95 = P_first + 1, the kTile - 1 clause exact\nA causal window 0 p0 94 m 8: worst |\u0394out| 3.425e-5 at (6, 14, 87) of the derived bound 3.086e-3\nB window: window 40 p0 33 m 8 \u2014 key tile 0 (base 0, first key 0) x row group 3 (tokens 6..8, max_p 40): first + base = max_p - window = 0, the `>` clause exact\nB window window 40 p0 33 m 8: worst |\u0394out| 4.556e-5 at (3, 6, 110) of the derived bound 2.951e-3\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5906 filtered out; finished in 0.45s\n\n"
+    }
+  ],
+  "guard": {
+    "sample_count": 4,
+    "all_samples_clear": true,
+    "sha256": "24236f54b7787f6a39e00243da81fc64001e3b5436d01d8349a3a712909845be"
+  },
+  "memory_admission": {
+    "free_mib": {
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 9893,
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 11962
+    },
+    "required_mib": {
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 8537,
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 10683
+    },
+    "service_used_before_mib": {
+      "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a": 8281,
+      "GPU-704fef60-5280-9b88-fa3d-d11135caf576": 10427
+    },
+    "note": "8192 MiB minimum per card and at least prior service usage plus 256 MiB; a guard, not a measured rig footprint"
+  },
+  "original_pair_service_restored": true,
+  "limitations": [
+    "A synthetic attention fixture, not the Qwen served model.",
+    "The causal and tile-boundary tests use the default GPU; the regression test switches both GPUs.",
+    "No measurement of prefill/decode throughput or 128k/256k context inference.",
+    "The tested source is based on the local b61 adaptive integration, not the distinct public head of zbrdc/fifi#36.",
+    "Guard samples are periodic observations, not a continuous hardware trace."
+  ]
+}
