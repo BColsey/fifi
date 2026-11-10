@@ -21,7 +21,7 @@
 //! The embedding runs on card 0 (the table lives there) and one broadcast
 //! carries the embedded rows to card 1's `Hidden`.
 //!
-//! Chunk rows are capped at `m * hidden <= MAX_VALUES` (1,024 rows at
+//! Chunk rows are capped at `m * hidden <= MAX_VALUES` (2,048 rows at
 //! hidden 2048): every exchange of a chunk is one ring sequence. The
 //! driver is enqueue-only until the caller folds the status words.
 
@@ -733,8 +733,12 @@ mod config_tests {
             Some(1024)
         );
         assert_eq!(
+            configured_chunk_rows(Some(OsStr::new("2048")), 2048).unwrap(),
+            Some(2048)
+        );
+        assert_eq!(
             configured_chunk_rows(Some(OsStr::new("9999")), 2048).unwrap(),
-            Some(1024)
+            Some(2048)
         );
         for value in ["", "-1", "auto", " 256"] {
             assert!(configured_chunk_rows(Some(OsStr::new(value)), 2048).is_err());
@@ -748,8 +752,9 @@ mod config_tests {
         assert_eq!(chunk_mailbox_values(1, 2048, 8).unwrap(), 8 * 2048);
         assert_eq!(chunk_mailbox_values(256, 2048, 8).unwrap(), 256 * 2048);
         assert_eq!(chunk_mailbox_values(512, 2048, 8).unwrap(), 512 * 2048);
-        assert_eq!(chunk_mailbox_values(1024, 2048, 8).unwrap(), MAX_VALUES);
-        assert!(chunk_mailbox_values(1025, 2048, 8).is_err());
+        assert_eq!(chunk_mailbox_values(1024, 2048, 8).unwrap(), MAX_VALUES / 2);
+        assert_eq!(chunk_mailbox_values(2048, 2048, 8).unwrap(), MAX_VALUES);
+        assert!(chunk_mailbox_values(2049, 2048, 8).is_err());
         assert!(chunk_mailbox_values(usize::MAX, 2, 8).is_err());
     }
 
