@@ -297,6 +297,7 @@ fn chunk_prefix_turn_chain_diagnostic_on_physical_peers() {
     session.set_prefix_path_for_test(path);
     let tokens: Vec<u32> = (0..100).map(|i| (i * 11 + 3) % 900).collect();
     let mut st = DecodeSession::default();
+    let mut natural_reference = Vec::new();
 
     for cut in [31, 32, 33, 59] {
         ExecutorOps::reset(&mut session, &mut st).expect("reset before save");
@@ -350,6 +351,13 @@ fn chunk_prefix_turn_chain_diagnostic_on_physical_peers() {
         for (card, (got, want)) in restored_states.iter().zip(&aligned_states).enumerate() {
             assert_eq!(got.identity, want.identity, "{NAME}: card {card} identity");
             assert_eq!(got.tokens, want.tokens, "{NAME}: card {card} token count");
+            assert_eq!(
+                got.tokens,
+                tokens.len(),
+                "{NAME}: card {card} consumed tokens"
+            );
+            assert_eq!(got.kv.len(), 1, "{NAME}: card {card} attention layer");
+            assert_eq!(got.delta.len(), 1, "{NAME}: card {card} DeltaNet layer");
             assert_eq!(got.kv, want.kv, "{NAME}: card {card} KV bytes");
             assert_eq!(got.delta.len(), want.delta.len());
             for (g, w) in got.delta.iter().zip(&want.delta) {
@@ -394,5 +402,42 @@ fn chunk_prefix_turn_chain_diagnostic_on_physical_peers() {
             winner(&restored),
             winner(&natural)
         );
+        natural_reference = natural;
     }
+
+    // Negative control: change the history but keep the length and last
+    // token fixed. A matching final-token embedding must not make this test
+    // pass when the synthetic model cannot distinguish changed context.
+    let mut altered = tokens.clone();
+    for token in &mut altered[..59] {
+        *token = (*token + 137) % 900;
+    }
+    ExecutorOps::reset(&mut session, &mut st).expect("reset altered control");
+    assert_eq!(
+        ExecutorOps::restore_prefix(&mut session, &mut st, &altered).expect("changed-key miss"),
+        0,
+        "{NAME}: a changed prefix must miss"
+    );
+    for piece in altered.chunks(32) {
+        ExecutorOps::prefill(&mut session, &mut st, piece).expect("altered context");
+    }
+    let altered_logits =
+        TokenStepper::logits(&mut session, *altered.last().unwrap()).expect("altered logits");
+    assert_eq!(natural_reference.len(), altered_logits.len());
+    assert!(altered_logits.iter().all(|v| v.is_finite()));
+    let changed = natural_reference
+        .iter()
+        .zip(&altered_logits)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let max_abs = natural_reference
+        .iter()
+        .zip(&altered_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("{NAME}: changed_context_logits={changed} changed_context_max_abs={max_abs:.9}");
+    assert!(
+        changed > 0,
+        "{NAME}: altered history must change the logits"
+    );
 }
