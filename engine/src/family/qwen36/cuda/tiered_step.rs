@@ -275,6 +275,12 @@ pub(super) struct TieredRuntime<'w> {
     slot_count: usize,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
     syncs: HostSyncs,
+    /// The TCAP sync-vs-drain probe's state (Q36_TIERED_PROBE=1 only): the previous
+    /// token's device-span event pair, the summed route waits, and a token counter.
+    probe_start: Option<crate::kernels::cuda::TimingEvent>,
+    probe_end: Option<crate::kernels::cuda::TimingEvent>,
+    probe_waits_ns: u128,
+    probe_tokens: u64,
     /// Reusable buffers of the chunk route readback and the pool-partial add. A fresh
     /// 15.85 MB pinned allocation (cudaHostAlloc + full memset) whose drop runs a
     /// device-wide synchronize, per layer, measured 5-27 ms/layer at m up to 2,048
@@ -345,6 +351,10 @@ impl<'w> TieredRuntime<'w> {
             cold,
             slot_count,
             syncs: HostSyncs::default(),
+            probe_start: None,
+            probe_end: None,
+            probe_waits_ns: 0,
+            probe_tokens: 0,
             route: RouteScratch::default(),
         })
     }
@@ -680,6 +690,29 @@ impl<'w> TieredRuntime<'w> {
         bufs: &MoeBuffers<'_>,
         dims: &MoeDims,
     ) -> Result<(), EngError> {
+        if layer == 0 && super::moe::tiered::tiered_probe() {
+            // Close the previous token: device span vs the summed route waits. The
+            // waits minus the span (clamped at zero) is the SYNC share TCAP could
+            // remove; anything the span covers is drain that returns at the boundary.
+            if let (Some(start), Some(end)) = (self.probe_start.take(), self.probe_end.take()) {
+                // The end event completed long ago (the whole boundary ran since);
+                // elapsed on a completed event needs no host sync.
+                let span_ms = start.elapsed_ms_since(&end)?;
+                let waits_ms = self.probe_waits_ns as f32 / 1e6;
+                let sync_ms = (waits_ms - span_ms).max(0.0);
+                self.probe_tokens += 1;
+                if self.probe_tokens % 50 == 1 {
+                    eprintln!(
+                        "tcap-probe: token {} device_span_ms {:.2} waits_ms {:.2} sync_share_ms {:.2}",
+                        self.probe_tokens, span_ms, waits_ms, sync_ms
+                    );
+                }
+                self.probe_waits_ns = 0;
+            }
+            let start = launch.ctx.event_timing()?;
+            launch.stream.record_timing(&start)?;
+            self.probe_start = Some(start);
+        }
         let missing = || EngError::BadRequest(format!("tiered runtime: layer {layer} has no bank"));
         let (parts, bank) = (
             self.parts.get(layer).ok_or_else(missing)?,
@@ -715,6 +748,17 @@ impl<'w> TieredRuntime<'w> {
             &mut block,
         )?;
         self.syncs.add(made);
+        if super::moe::tiered::tiered_probe() {
+            // The per-layer route wait sample landed in the scratch's cell.
+            self.probe_waits_ns += self.scratch.probe_route_ns.get() as u128;
+            self.scratch.probe_route_ns.set(0);
+            let layers = self.parts.len();
+            if layer + 1 == layers {
+                let end = launch.ctx.event_timing()?;
+                launch.stream.record_timing(&end)?;
+                self.probe_end = Some(end);
+            }
+        }
         Ok(())
     }
 
