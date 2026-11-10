@@ -69,6 +69,66 @@ fn q4k_stack(experts: usize, rows: usize, k: usize, rng: &mut Rng) -> FileEntry 
     }
 }
 
+/// Give each Q4_K sub-block a signed range around zero while retaining its
+/// random quantized values and scale. Only the context-sensitivity rig uses
+/// this: the original all-positive-biased fixture can ignore earlier tokens.
+fn center_q4k_fixture(bytes: &mut [u8]) {
+    assert_eq!(bytes.len() % 144, 0);
+    for block in bytes.chunks_exact_mut(144) {
+        let d = u16::from_le_bytes([block[0], block[1]]);
+        let min = match d {
+            0x0400 => 0x1000u16,
+            0x0600 => 0x1200u16,
+            _ => panic!("unexpected Q4_K rig scale {d:#06x}"),
+        };
+        block[2..4].copy_from_slice(&min.to_le_bytes());
+        let scales: [u8; 12] = block[4..16].try_into().expect("Q4_K scale bytes");
+        for i in 0..4 {
+            let low = scales[i] & 63;
+            let high = (scales[i + 8] & 15) | ((scales[i] >> 6) << 4);
+            block[4 + i] = low | ((high >> 4) << 6);
+            block[8 + i] = low | ((high >> 4) << 6);
+            block[12 + i] = (high & 15) | ((high & 15) << 4);
+        }
+    }
+}
+
+#[test]
+fn centered_fixture_preserves_quantized_values_and_has_both_signs() {
+    use super::native_device_rig::q4k_value;
+    let mut rng = Rng::new(0x5E55);
+    let original = q4k_rows(32, 256, &mut rng);
+    let mut centered = original.clone();
+    center_q4k_fixture(&mut centered);
+    for (before, after) in original.chunks_exact(144).zip(centered.chunks_exact(144)) {
+        assert_eq!(&before[..2], &after[..2], "block scale");
+        assert_eq!(&before[16..], &after[16..], "quantized values");
+        let scale = |block: &[u8], i: usize| {
+            let s = &block[4..16];
+            if i < 4 {
+                s[i] & 63
+            } else {
+                (s[i + 4] & 15) | ((s[i - 4] >> 6) << 4)
+            }
+        };
+        for i in 0..8 {
+            assert_eq!(scale(before, i), scale(after, i), "sub-block scale {i}");
+        }
+    }
+    let values: Vec<f64> = centered
+        .chunks_exact(144)
+        .flat_map(|block| (0..256).map(|i| q4k_value(block, i)))
+        .collect();
+    assert!(values.iter().any(|v| *v < 0.0));
+    assert!(values.iter().any(|v| *v > 0.0));
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mean_abs = values.iter().map(|v| v.abs()).sum::<f64>() / values.len() as f64;
+    assert!(
+        mean.abs() < mean_abs * 0.3,
+        "fixture mean {mean}, mean abs {mean_abs}"
+    );
+}
+
 // One-per-process by design: the session keeps its stack, weights and states
 // leaked for its whole life (the 'static owner pattern), so its two CUDA
 // adapter leases never release and every later CUDA test in this process
@@ -101,6 +161,7 @@ pub(super) fn build_rig_session_for_chunk(
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
     chunk_rows: usize,
+    centered_weights: bool,
 ) -> Result<
     (
         CardSession,
@@ -111,7 +172,13 @@ pub(super) fn build_rig_session_for_chunk(
     ),
     EngError,
 > {
-    build_rig_session(devices, context_tokens, prefix_limits, Some(chunk_rows))
+    build_rig_session(
+        devices,
+        context_tokens,
+        prefix_limits,
+        Some(chunk_rows),
+        centered_weights,
+    )
 }
 
 fn build_rig_session(
@@ -119,6 +186,7 @@ fn build_rig_session(
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
     chunk_rows: Option<usize>,
+    centered_weights: bool,
 ) -> Result<
     (
         CardSession,
@@ -275,6 +343,14 @@ fn build_rig_session(
             .collect(),
     });
 
+    if centered_weights {
+        for entry in &mut entries {
+            if entry.ty == GgufType::Q4K {
+                center_q4k_fixture(&mut entry.payload);
+            }
+        }
+    }
+
     let dir = tempfile::tempdir().map_err(|e| EngError::Checkpoint(e.to_string()))?;
     let path = write_gguf(dir.path(), "session.gguf", &entries);
     let weights = GgufWeights::open(
@@ -345,6 +421,7 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
         8,
         crate::family::session::StoreLimits::default(),
         None,
+        false,
     )?;
     let limit = session.context_limit();
     if limit < 4 {
@@ -478,6 +555,7 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
             entries: 2,
         },
         None,
+        false,
     )
     .expect("the rig session");
 
@@ -606,6 +684,7 @@ fn card_views_construct_chunk_models() {
         256,
         crate::family::session::StoreLimits::default(),
         None,
+        false,
     )
     .expect("the rig session");
     let spec = rig_spec();
