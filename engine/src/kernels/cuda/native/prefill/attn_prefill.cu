@@ -11,10 +11,14 @@
 #include <cuda_fp16.h>
 
 #include <math.h>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdint.h>
 
 #include "abi.h"
 #include "device.h"
+#include "prefill/attn_prefill_plan.h"
 
 namespace {
 
@@ -156,7 +160,7 @@ __device__ inline void mma_16816(float *d, const unsigned *a, unsigned b0, unsig
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-#else
+#endif
 /* The Q tile in shared memory, rounded to fp16 once (128 threads): rows past the chunk's end
  * (m not a multiple of 8) hold zeros; their partials are written but never read. */
 template <int kHeadDim, int kGroup>
@@ -189,18 +193,14 @@ __device__ inline void load_kv_tile(const Args &a, const Block &b, int kvh, int 
         sv[i] = v;
     }
 }
-#endif
 
 /* The fp32 SIMT kernel of sm_72 (compile-only: no board run), the same block and partial cell as
  * attn_prefill_part_dsplit_k: 128 threads, two per row (each owning one half of the row's 256
  * dims), the same loaders, masking and part layout; the score halves join with one shuffle, so both
- * halves of a row see the same statistics in the same order. An sm_80+ build traps here (the entry
- * launches the tensor-core kernel there). */
+ * halves of a row see the same statistics in the same order. The adaptive path can use this arm
+ * on newer devices when the tensor-core arm does not fit. */
 template <int kHeadDim, int kGroup>
 __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
-#if __CUDA_ARCH__ >= 800
-    __trap();
-#else
     if (!bounds_ok(a)) {
         report_bound_violation(a);
         return;  // no partial
@@ -255,7 +255,6 @@ __global__ void __launch_bounds__(128) attn_prefill_part_simt_k(Args a) {
 #pragma unroll 8
     for (int e = 0; e < kHeadDim / 2; ++e)
         b.accs[(size_t)out_row * kHeadDim + half * (kHeadDim / 2) + e] = o_acc[e];
-#endif
 }
 
 #if __CUDA_ARCH__ >= 800
@@ -909,14 +908,82 @@ PartArm arm_part() {
     return arm;
 }
 
-/* Enqueues both kernels. The part kernel is chosen and armed once per process, by a function-local
- * static with C++11 thread-safe initialisation. A failed arm is cached too, so a transient failure
- * stays permanent for the process; that assumes one device per process, the engine's model. */
+/* Unset and all values other than exactly "1" retain the original path. Read
+ * once per process, so changing the switch requires restarting the engine. */
+bool adaptive_attention_enabled() {
+    static const bool enabled = attn_prefill_plan::adaptive_enabled(
+        std::getenv("FIFI_CUDA_ATTN_PREFILL_ADAPT"));
+    return enabled;
+}
+
+/* Select by the loaded code's PTX version, the current device's actual opt-in
+ * limit, and each compiled kernel's static shared bytes. A compute_72-only
+ * image JIT-compiled on sm_86 still needs the SIMT kernel. Head dimension is
+ * a template parameter selected from the model geometry. */
+template <int kHeadDim, int kGroup>
+PartArm arm_part_adaptive(int device) {
+    constexpr int simt_bytes = attn_prefill_plan::simt_bytes(kRows, kTile, kHeadDim);
+    constexpr int dsplit_bytes = attn_prefill_plan::dsplit_bytes(kTile, kHeadDim, kThreadsD);
+    PartArm arm = {0, attn_prefill_part_simt_k<kHeadDim, kGroup>, false, 128, simt_bytes,
+                   cudaSuccess};
+    int limit = 0;
+    arm.err = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (arm.err != cudaSuccess) return arm;
+    int device_threads = 0;
+    arm.err = cudaDeviceGetAttribute(&device_threads, cudaDevAttrMaxThreadsPerBlock, device);
+    if (arm.err != cudaSuccess) return arm;
+    cudaFuncAttributes dsplit_attr = {}, simt_attr = {};
+    arm.err = cudaFuncGetAttributes(&dsplit_attr, attn_prefill_part_dsplit_k<kHeadDim, kGroup>);
+    if (arm.err != cudaSuccess) return arm;
+    arm.err = cudaFuncGetAttributes(&simt_attr, attn_prefill_part_simt_k<kHeadDim, kGroup>);
+    if (arm.err != cudaSuccess) return arm;
+    arm.ptx = dsplit_attr.ptxVersion;
+    const auto choice = attn_prefill_plan::select(arm.ptx, limit > 0 ? size_t(limit) : 0,
+        device_threads, dsplit_attr.sharedSizeBytes, dsplit_bytes, dsplit_attr.maxThreadsPerBlock,
+        simt_attr.sharedSizeBytes, simt_bytes, simt_attr.maxThreadsPerBlock);
+    if (choice == attn_prefill_plan::Arm::none) {
+        arm.err = cudaErrorInvalidConfiguration;
+        return arm;
+    }
+    if (choice == attn_prefill_plan::Arm::dsplit) {
+        arm.kernel = attn_prefill_part_dsplit_k<kHeadDim, kGroup>;
+        arm.dsplit = true;
+        arm.threads = kThreadsD;
+        arm.bytes = dsplit_bytes;
+    }
+    arm.err = cudaFuncSetAttribute(arm.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   arm.bytes);
+    return arm;
+}
+
+/* Enqueue both kernels. The default retains its process-wide arm and cached errors.
+ * The opt-in path caches successful arms per device and instantiated geometry; query and opt-in
+ * failures propagate without caching. */
 template <int kHeadDim, int kGroup>
 Failure enqueue_typed(const Args &k, void *stream) {
     Failure failure;
     if (k.mode != 2) {
-        static const PartArm arm = arm_part<kHeadDim, kGroup>();
+        PartArm arm;
+        if (adaptive_attention_enabled()) {
+            int device = -1;
+            failure.record(cudaGetDevice(&device), INFERENCE_CUDA_STAGE_LAUNCH);
+            if (!failure.ok()) return failure;
+            static std::mutex arms_mutex;
+            static std::map<int, PartArm> arms;
+            {
+                std::lock_guard<std::mutex> lock(arms_mutex);
+                const auto it = arms.find(device);
+                if (it != arms.end()) {
+                    arm = it->second;
+                } else {
+                    arm = arm_part_adaptive<kHeadDim, kGroup>(device);
+                    if (arm.err == cudaSuccess) arms.emplace(device, arm);
+                }
+            }
+        } else {
+            static const PartArm original = arm_part<kHeadDim, kGroup>();
+            arm = original;
+        }
         failure.record(arm.err, INFERENCE_CUDA_STAGE_LAUNCH);
         if (failure.ok()) {
             const int q_tiles = (k.m + kQTile - 1) / kQTile;
