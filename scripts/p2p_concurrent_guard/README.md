@@ -1,7 +1,7 @@
 # Experimental concurrent supervisor core
 
-This is a CPU-only sequencing prototype. It has no host adapter, runnable
-entry point, service integration, or permission to use GPUs. It does not
+This is a CPU-only sequencing prototype. It has no real host backend, runnable
+supervisor entry point, service integration, or permission to use GPUs. It does not
 attest any actual process, endpoint, lease, scope, configuration, or service,
 and it does not prove that a server-side request has drained. It cannot be used
 to run a campaign.

@@ -1,5 +1,8 @@
+import fcntl
 import os
+from pathlib import Path
 import select
+import tempfile
 import unittest
 
 from scripts.p2p_concurrent_guard.core import Interval, run
@@ -29,6 +32,9 @@ class FakeLease:
 
     def close(self):
         self.held = False
+
+    def verify_released(self):
+        return not self.held
 
 
 class FakeBackend:
@@ -160,6 +166,59 @@ class HostAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, "inconclusive")
         self.assertNotIn("restore-pair", backend.events)
         self.assertTrue(lease.held)
+
+    def test_unverified_release_reports_unknown(self):
+        class RetainedLease(FakeLease):
+            def verify_released(self):
+                return False
+
+        backend, lease = FakeBackend(), RetainedLease()
+        result = run(HostAdapter(backend, lease), concurrent=True)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertIsNone(result.lease_retained)
+
+    def test_duplicate_flock_fd_makes_release_inconclusive(self):
+        class DuplicatedLease:
+            def __init__(self, path):
+                self.path = path
+                self.fd = self.duplicate = None
+
+            def acquire(self):
+                self.fd = os.open(self.path, os.O_RDWR)
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.duplicate = os.dup(self.fd)
+
+            def verify(self):
+                return self.fd is not None
+
+            def close(self):
+                os.close(self.fd)
+                self.fd = None
+
+            def verify_released(self):
+                probe = os.open(self.path, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return False
+                    return True
+                finally:
+                    os.close(probe)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lease"
+            path.touch()
+            lease = DuplicatedLease(path)
+            try:
+                result = run(HostAdapter(FakeBackend(), lease), concurrent=True)
+                self.assertEqual(result.status, "inconclusive")
+                self.assertIsNone(result.lease_retained)
+            finally:
+                if lease.fd is not None:
+                    os.close(lease.fd)
+                if lease.duplicate is not None:
+                    os.close(lease.duplicate)
 
     def test_partial_spawn_without_handle_never_releases_lease(self):
         for side in ("pair", "client"):

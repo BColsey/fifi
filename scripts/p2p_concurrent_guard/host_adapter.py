@@ -179,3 +179,8 @@ class HostAdapter:
                 os.close(fd)
                 setattr(self, name, None)
         self.lease.close()
+        # An inherited duplicate can keep the flock alive after our close.
+        # A competing new owner is likewise not distinguishable from that
+        # case here: report uncertainty rather than claim a verified release.
+        if self.lease.verify_released() is not True:
+            raise RuntimeError("lease release is not independently verified")
