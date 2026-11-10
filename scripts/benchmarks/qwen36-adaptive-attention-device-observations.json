@@ -7,8 +7,9 @@
   "limits": [
     "Each GPU ran separately, not as a P2P pair.",
     "Both segmented tests were explicitly selected despite being ignored by default.",
-    "The exact draft head, long contexts, served A/B, RTX 40 and RTX 50 devices remain untested.",
-    "This correctness evidence does not establish a prefill or decode speedup."
+    "The exact draft head, long contexts, a served A/B of adaptive dispatch, and RTX 40 and RTX 50 devices remain untested.",
+    "This correctness evidence does not establish a prefill or decode speedup.",
+    "Dispatch traces are observations of the tested candidate, not an exact-draft-tip performance measurement."
   ],
   "devices": [
     {
@@ -95,6 +96,33 @@
           "log_sha256": "560bc185e5255de4fb5412e0cf691abfb6676eaf6b25a808cfcfff8a0829fa98",
           "output": "\nrunning 1 test\ntest kernels::cuda::prefill::attn_prefill::tests::segmented::attn_prefill_segmented_rejects_window_and_ring_without_poisoning ... CUDA devices visible: 1\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5899 filtered out; finished in 0.23s\n\n"
         }
+      ]
+    }
+  ],
+  "dispatch_observations": [
+    {
+      "device": "RTX 2080 Ti",
+      "case": "separate real EXL3 baseline profile",
+      "kernel": "attn_prefill_part_simt_k<256, 8>",
+      "instances": 10,
+      "kernel_csv_sha256": "dc50d1d35e84ce1f885566b846886176a8539573e217be53e02390c731e9ab8a",
+      "service_restored": true
+    },
+    {
+      "device": "RTX 3080 (inferred)",
+      "case": "single profiled causal-mask device test",
+      "kernel": "attn_prefill_part_dsplit_k<256, 8>",
+      "instances": 1,
+      "dynamic_shared_bytes": 98304,
+      "offline_audit_sha256": "ff18777c0b90875742d9d3ea5b651ad043f89a7d61329b4f3debe4675ca4f41f",
+      "profile_sha256": "a4ff90dc913eea7fd2495b4c6ae2aae575f878c12db7ef8b128e67599461bde5",
+      "kernel_csv_sha256": "94d641388ac44063f4594843f379f8c68ae43923d0b57a127908b70e78abd261",
+      "service_restored": true,
+      "attribution": "inferred from captured UUID-pinned launcher environment, single visible device and guard; not a direct SQLite physical-UUID join",
+      "original_validator": "failed due to device-ordinal mapping; offline audit used instead",
+      "limitations": [
+        "single profiled causal-mask case only; GPU attribution inferred from captured launcher visibility and sampled guard, not a direct trace UUID join; launcher scripts were not independently snapshotted at capture time",
+        "sampled during execution; not continuous proof of device idleness"
       ]
     }
   ]
