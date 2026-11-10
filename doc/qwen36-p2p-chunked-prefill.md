@@ -51,20 +51,24 @@ intended devices selected through `CUDA_VISIBLE_DEVICES`.
 ## Measured 512-row comparison
 
 On a 12 GB RTX 3060 and 10 GB RTX 3080, with the Q4_K_M GGUF model, q8 KV,
-mapped host experts, and a configured 262,144-token limit, one matched
-comparison used the same experimental staged server binary with
-`Q36_P2P_CHUNK=256` and `Q36_P2P_CHUNK=512`. Median server job-start-to-first-
-token rate on three cold 4,274-token prompts rose from 304.07 to 471.69
-tokens/s; median decode rate on three 128-token replies was 38.49 and 38.57
-tokens/s. The first-token timing includes generating that token. The 512-row
+mapped host experts, and a configured 262,144-token limit, two matched
+comparisons used the same experimental staged server binary with
+`Q36_P2P_CHUNK=256` and `Q36_P2P_CHUNK=512`. In the 256-first run, median
+server job-start-to-first-token rate on three cold 4,274-token prompts per
+setting was 304.07 and 471.69 tokens/s. With the order reversed, it was
+303.98 and 472.96 tokens/s. Median decode rates for three 128-token replies
+per setting were 38.49 and 38.57 tokens/s in the first run, and 38.58 and
+38.57 tokens/s in the second. First-token timing includes generating that
+token. The 512-row
 setting had 1,368 MiB free on the 3060 and 1,475 MiB on the 3080 after
 warmup, 32 MiB less per card than the 256-row setting in this run.
 
-The [samples and guarded-run evidence](../scripts/benchmarks/qwen36-p2p-512-chunk-ab.json)
-identify the separately tested integration commit. A [physical-peer test](../scripts/benchmarks/qwen36-p2p-512-parity.json)
+The [256-first](../scripts/benchmarks/qwen36-p2p-512-chunk-ab.json) and
+[512-first](../scripts/benchmarks/qwen36-p2p-512-chunk-crossover.json)
+samples and guarded-run evidence identify the separately tested integration
+commit. A [physical-peer test](../scripts/benchmarks/qwen36-p2p-512-parity.json)
 also checks a synthetic two-layer fixture against per-token execution at 512
-rows. The served comparison ran the 256-row arm first and did not cross the
-order; the small fixture compares only the final winner and top-two logits.
+rows. The small fixture compares only the final winner and top-two logits.
 Both arms disable prefix reuse, and neither the configured 256k limit nor a
 successful short response establishes long-context recall or coding quality.
 The setting remains experimental and default off.
