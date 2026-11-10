@@ -17,27 +17,37 @@ from scripts.p2p_concurrent_guard.gated_companion import (
 )
 from scripts.p2p_concurrent_guard.host_attestation import _seal_pinned
 
-TASK_TMP = "/home/ben/fifi-scratch/21942d372298/joint-supervisor/tmp"
-
 
 class GatedCompanionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.scratch = Path(directory.name)
+        self.campaign = self.scratch / "campaign"
+        self.campaign.mkdir(mode=0o700)
+        patcher = patch(
+            "scripts.p2p_concurrent_guard.gated_companion.SCRATCH", self.scratch
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_typed_options_refuse_external_paths_and_bad_values(self):
         options = CompanionOptions("/tmp", "/tmp/out", 1, 10)
         with self.assertRaises(ValueError):
             options.arguments()
         with self.assertRaises(TypeError):
             CompanionOptions("/tmp", "/tmp/out", 1, 10, inherited_lease_fd=3)
-        with tempfile.TemporaryDirectory(dir=TASK_TMP) as directory:
-            valid = CompanionOptions(directory, directory + "/result.jsonl", 1, 10)
-            self.assertNotIn("--url", valid.arguments())
-            self.assertNotIn("--model", valid.arguments())
-            self.assertNotIn("--key-file", valid.arguments())
-            self.assertNotIn("--prompt-file", valid.arguments())
-            with self.assertRaises(ValueError):
-                CompanionOptions(directory, "/tmp/out", 1, 10).arguments()
-            os.chmod(directory, 0o755)
-            with self.assertRaises(ValueError):
-                valid.arguments()
+        directory = str(self.campaign)
+        valid = CompanionOptions(directory, directory + "/result.jsonl", 1, 10)
+        self.assertNotIn("--url", valid.arguments())
+        self.assertNotIn("--model", valid.arguments())
+        self.assertNotIn("--key-file", valid.arguments())
+        self.assertNotIn("--prompt-file", valid.arguments())
+        with self.assertRaises(ValueError):
+            CompanionOptions(directory, "/tmp/out", 1, 10).arguments()
+        os.chmod(directory, 0o755)
+        with self.assertRaises(ValueError):
+            valid.arguments()
 
     def test_cli_rejects_duplicate_descriptor_and_abbreviated_or_raw_args(self):
         base = [
@@ -130,9 +140,8 @@ class GatedCompanionTests(unittest.TestCase):
             os.close(read_fd)
 
     def test_exec_is_not_called_until_parent_release_and_rechecks(self):
-        directory = tempfile.TemporaryDirectory(dir=TASK_TMP)
-        self.addCleanup(directory.cleanup)
-        options = CompanionOptions(directory.name, directory.name + "/out", 1, 10)
+        directory = str(self.campaign)
+        options = CompanionOptions(directory, directory + "/out", 1, 10)
         read_fd, write_fd = os.pipe()
         events = []
         try:
