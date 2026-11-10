@@ -1,14 +1,17 @@
 """Opt-in real user-scope test using a sealed no-network fixture and temp lock."""
 
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from scripts.p2p_concurrent_guard.host_attestation import _seal_pinned, sealed_gate
@@ -31,6 +34,85 @@ print(json.dumps({'pid':os.getpid(), 'groups':groups}),flush=True)
 options = scope['CompanionOptions'](scratch, str(Path(scratch)/'receipt.jsonl'), 1, 10)
 scope['execute'](signal_fd, lease_fd, program_fd, options, timeout=10)
 """
+
+
+def scope_state(unit):
+    text = subprocess.check_output(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            unit,
+            "-p",
+            "Id",
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "-p",
+            "InvocationID",
+            "-p",
+            "ControlGroup",
+        ],
+        text=True,
+        timeout=5,
+    )
+    return dict(line.split("=", 1) for line in text.splitlines())
+
+
+def scope_terminated(data, unit, invocation, populated):
+    if data.get("Id") != unit:
+        raise ValueError("scope unit changed")
+    load = data.get("LoadState")
+    if load == "loaded":
+        if data.get("InvocationID") != invocation:
+            raise ValueError("scope invocation changed")
+        if data.get("ActiveState") not in ("inactive", "failed"):
+            return False
+    elif load == "not-found":
+        if data.get("InvocationID") not in ("", invocation):
+            raise ValueError("removed scope identity changed")
+    else:
+        raise ValueError("scope status ambiguous")
+    if populated is not None and type(populated) is not bool:
+        raise ValueError("scope population ambiguous")
+    return populated is not True
+
+
+def group_populated(group):
+    try:
+        fields = dict(
+            line.split() for line in (group / "cgroup.events").read_text().splitlines()
+        )
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENODEV) and not group.exists():
+            return None
+        raise
+    if fields.get("populated") not in ("0", "1"):
+        raise ValueError("scope population unavailable")
+    return fields["populated"] == "1"
+
+
+class GateScopeStateTests(unittest.TestCase):
+    def test_removed_or_same_inactive_scope_needs_no_population(self):
+        unit, invocation = "test.scope", "a" * 32
+        removed = {"Id": unit, "LoadState": "not-found", "InvocationID": ""}
+        self.assertTrue(scope_terminated(removed, unit, invocation, None))
+        self.assertFalse(scope_terminated(removed, unit, invocation, True))
+        inactive = {
+            "Id": unit,
+            "LoadState": "loaded",
+            "InvocationID": invocation,
+            "ActiveState": "inactive",
+        }
+        self.assertTrue(scope_terminated(inactive, unit, invocation, False))
+        self.assertFalse(scope_terminated(inactive, unit, invocation, True))
+        with self.assertRaises(ValueError):
+            scope_terminated(
+                {**inactive, "InvocationID": "b" * 32}, unit, invocation, None
+            )
+        with self.assertRaises(ValueError):
+            scope_terminated({**inactive, "Id": "other.scope"}, unit, invocation, None)
 
 
 @unittest.skipUnless(
@@ -107,6 +189,13 @@ class GateScopeTest(unittest.TestCase):
                 report = json.loads(child.stdout.readline())
                 self.assertEqual(len(report["groups"]), 1)
                 self.assertEqual(Path(report["groups"][0]).name, unit)
+                observed = scope_state(unit)
+                self.assertEqual(observed.get("Id"), unit)
+                self.assertEqual(observed.get("LoadState"), "loaded")
+                self.assertEqual(observed.get("ActiveState"), "active")
+                self.assertEqual(observed.get("ControlGroup"), report["groups"][0])
+                invocation = observed.get("InvocationID", "")
+                self.assertRegex(invocation, re.compile(r"^[0-9a-f]{32}$"))
                 self.assertFalse(marker.exists(), "fixture ran before parent signalled")
                 self.assertIsNone(child.poll())
                 os.write(write_fd, b"\x01")
@@ -116,8 +205,15 @@ class GateScopeTest(unittest.TestCase):
                 self.assertEqual(child.returncode, 0, stderr)
                 self.assertEqual(marker.read_text(), "ok")
                 group = Path("/sys/fs/cgroup") / report["groups"][0].lstrip("/")
-                if group.exists():
-                    self.assertIn("populated 0", (group / "cgroup.events").read_text())
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if scope_terminated(
+                        scope_state(unit), unit, invocation, group_populated(group)
+                    ):
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("exact scope did not terminate within deadline")
             finally:
                 if child is not None and child.poll() is None:
                     subprocess.run(

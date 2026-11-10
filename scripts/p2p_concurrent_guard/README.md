@@ -39,6 +39,9 @@ image. It accepts typed bounded options and a private task-owned output root;
 it does not accept key, model, endpoint, lease-descriptor, or prompt overrides.
 The gate itself is pinned and sealed. The parent still must attest its scope,
 PID/start time, inherited descriptors and waiting state before signalling.
+An opt-in disposable-scope CPU test exercises the sealed gate and a sealed
+no-network fixture with a temporary lock; it checks that the fixture does not
+execute until the parent signals. It does not attest any live service or GPU.
 
 The adapter currently accepts only an explicitly designated test backend.
 There is no real pair stop/restore, client ownership or request-drain backend,

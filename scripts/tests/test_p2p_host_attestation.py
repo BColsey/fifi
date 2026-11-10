@@ -109,7 +109,10 @@ class AttestationTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "memfd_create"), "Linux memfd required")
     def test_tracked_gate_bytes_match_pin_and_are_sealed(self):
-        path = Path(__file__).resolve().parents[1] / "p2p_concurrent_guard/gated_companion.py"
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "p2p_concurrent_guard/gated_companion.py"
+        )
         fd = sealed_gate(path)
         try:
             with self.assertRaises(OSError):
