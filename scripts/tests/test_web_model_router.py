@@ -70,7 +70,9 @@ class Backend(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.server.stream_started.set()
             deadline = time.monotonic() + 5
-            while not self.server.stream_release.is_set() and time.monotonic() < deadline:
+            while (
+                not self.server.stream_release.is_set() and time.monotonic() < deadline
+            ):
                 readable, _, _ = select.select([self.connection], [], [], 0.05)
                 if readable:
                     try:
