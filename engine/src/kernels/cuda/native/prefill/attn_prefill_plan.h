@@ -8,6 +8,11 @@ namespace attn_prefill_plan {
 
 enum class Arm { none, simt, dsplit };
 
+/* Unset, zero and unrecognized values retain the legacy launch path. */
+constexpr bool adaptive_enabled(const char *value) {
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
 /* optin_limit is the device's cudaDevAttrMaxSharedMemoryPerBlockOptin, already
  * the per-block opt-in limit. static_bytes is each kernel's actual reported
  * static shared allocation. Subtract before comparing to avoid overflow. */
@@ -42,6 +47,12 @@ constexpr size_t dsplit_bytes(int tile, int head_dim, int threads) {
  * unit. They cover loaded PTX, the reported opt-in cap and static bytes. */
 static_assert(simt_bytes(64, 32, 128) == 32768, "D128 SIMT layout");
 static_assert(simt_bytes(64, 32, 256) == 65536, "D256 SIMT layout");
+static_assert(!adaptive_enabled(nullptr), "unset keeps legacy");
+static_assert(!adaptive_enabled(""), "empty keeps legacy");
+static_assert(!adaptive_enabled("0"), "zero keeps legacy");
+static_assert(!adaptive_enabled("true"), "unknown keeps legacy");
+static_assert(!adaptive_enabled("10"), "non-exact one keeps legacy");
+static_assert(adaptive_enabled("1"), "one enables adaptation");
 static_assert(dsplit_bytes(32, 128, 512) == 65536, "D128 dsplit layout");
 static_assert(dsplit_bytes(32, 256, 512) == 98304, "D256 dsplit layout");
 static_assert(select(75, 65536, 1024, 0, 98304, 1024, 0, 65536, 1024) == Arm::simt, "Turing D256");
