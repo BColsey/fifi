@@ -1149,7 +1149,7 @@ fn tiered_settings(
     let built = TieredSettings {
         slots: usize::try_from(ranged("tiered.slots", Some(slots), 8, 8, 256)?)
             .map_err(|_| bad("tiered.slots exceeds usize".into()))?,
-        threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 8)?)
+        threads: usize::try_from(ranged("tiered.threads", tiered.threads, 6, 1, 16)?)
             .map_err(|_| bad("tiered.threads exceeds usize".into()))?,
         timeout_ms: ranged("tiered.timeout_ms", tiered.timeout_ms, 10_000, 1, 600_000)?,
         preload: tiered.preload.unwrap_or(false),
@@ -3683,7 +3683,7 @@ mod tests {
             "tiered.threads",
         );
         refused(
-            r#""tiered": {"slots": 40, "threads": 9}"#,
+            r#""tiered": {"slots": 40, "threads": 17}"#,
             cuda,
             "tiered.threads",
         );
