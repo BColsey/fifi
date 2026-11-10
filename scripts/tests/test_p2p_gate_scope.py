@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import select
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -79,6 +80,15 @@ def scope_terminated(data, unit, invocation, populated):
     return populated is not True
 
 
+def scope_can_stop(data, unit, invocation):
+    return (
+        bool(invocation)
+        and data.get("Id") == unit
+        and data.get("LoadState") == "loaded"
+        and data.get("InvocationID") == invocation
+    )
+
+
 def group_populated(group):
     try:
         fields = dict(
@@ -113,6 +123,12 @@ class GateScopeStateTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             scope_terminated({**inactive, "Id": "other.scope"}, unit, invocation, None)
+        self.assertTrue(scope_can_stop(inactive, unit, invocation))
+        self.assertFalse(
+            scope_can_stop({**inactive, "InvocationID": "b" * 32}, unit, invocation)
+        )
+        self.assertFalse(scope_can_stop(inactive, unit, None))
+        self.assertFalse(scope_can_stop(removed, unit, invocation))
 
 
 @unittest.skipUnless(
@@ -151,6 +167,7 @@ class GateScopeTest(unittest.TestCase):
             lock_fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC)
             read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
             child = None
+            invocation = None
             unit = f"fifi-gate-test-{os.getpid()}-{os.urandom(8).hex()}.scope"
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -179,6 +196,7 @@ class GateScopeTest(unittest.TestCase):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    start_new_session=True,
                 )
                 os.close(read_fd)
                 read_fd = None
@@ -216,15 +234,31 @@ class GateScopeTest(unittest.TestCase):
                     self.fail("exact scope did not terminate within deadline")
             finally:
                 if child is not None and child.poll() is None:
-                    subprocess.run(
-                        ["systemctl", "--user", "stop", unit],
-                        timeout=5,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                    child.kill()
-                    child.communicate(timeout=5)
+                    try:
+                        current = scope_state(unit)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        current = {}
+                    if scope_can_stop(current, unit, invocation):
+                        subprocess.run(
+                            ["systemctl", "--user", "stop", unit],
+                            timeout=5,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    if child.poll() is None:
+                        try:
+                            os.killpg(child.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            child.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(child.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            child.communicate(timeout=5)
                 for fd in (read_fd, write_fd, lock_fd, gate, program):
                     if fd is not None:
                         os.close(fd)
