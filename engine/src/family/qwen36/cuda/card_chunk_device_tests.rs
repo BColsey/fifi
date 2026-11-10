@@ -78,6 +78,7 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
             256,
             crate::family::session::StoreLimits::default(),
             rows,
+            false,
         )
         .expect("the rig session");
     assert_eq!(ExecutorOps::prefill_piece(&session), None);
@@ -256,7 +257,7 @@ fn chunk_prefix_turn_chain_diagnostic_on_physical_peers() {
     };
     let (mut session, stack, loaded, names, _vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
-            devices, 256, limits, 32,
+            devices, 256, limits, 32, true,
         )
         .expect("rig session");
     let spec = rig_spec();
