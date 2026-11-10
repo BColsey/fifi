@@ -471,9 +471,15 @@ impl TieredHost {
                 }
                 let expert = id as u16;
                 let flat = plan.slot_ids.len();
+                // The same accounting the decode classify makes per pick, so a chunk
+                // piece's report separates bank hits, cold-staged serves and pool jobs
+                // (an all-zeros row means no traffic, not an unwired counter).
+                let ppm = weight_ppm(weight);
+                self.report.routed_weight_ppm += ppm;
                 if let Some((slot, _)) = self.table.lookup(layer, expert) {
                     plan.slot_ids.push(slot as i32);
                     plan.device_weights.push(weight);
+                    self.report.bank_hits += 1;
                 } else if let Some(channel) = channel_of(expert) {
                     // Cold-served: the staging launch computes the pick on the device,
                     // so the combine needs the REAL weight and no pool job exists. The
@@ -482,9 +488,13 @@ impl TieredHost {
                     plan.slot_ids.push(0);
                     plan.device_weights.push(weight);
                     plan.cold_ids[flat] = channel as i32;
+                    self.report.cold_served += 1;
+                    self.report.cold_weight_ppm += ppm;
                 } else {
                     plan.slot_ids.push(0);
                     plan.device_weights.push(0.0);
+                    self.report.cpu_served += 1;
+                    self.report.cpu_weight_ppm += ppm;
                     let row_at = row_routes.len();
                     match misses.iter_mut().find(|g| g.expert == expert) {
                         Some(group) => {
@@ -1182,6 +1192,21 @@ mod tests {
         assert_eq!(cold[1].expert, 7);
         assert_eq!(cold[1].channel, 1);
         assert_eq!(cold[1].down, expect(7).down);
+
+        // The report separates the three outcomes — hits, staged serves, pool jobs —
+        // with the mass in millionths per pick, the decode classify's accounting, so a
+        // chunk piece's tiered summary can never read as an unwired counter.
+        assert_eq!(
+            (
+                f.host.report.bank_hits,
+                f.host.report.cold_served,
+                f.host.report.cpu_served
+            ),
+            (3, 5, 4)
+        );
+        assert_eq!(f.host.report.routed_weight_ppm, 1_280_000);
+        assert_eq!(f.host.report.cold_weight_ppm, 800_000);
+        assert_eq!(f.host.report.cpu_weight_ppm, 90_000);
 
         // cold_cap 0: every miss overflows, the plan matches today's two-way form.
         let (plan, overflow, cold) = f.host.begin_chunk_layer(1, &rows, 0).unwrap();
