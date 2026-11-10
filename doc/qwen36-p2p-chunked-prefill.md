@@ -25,7 +25,8 @@ uses the existing tiled Q8 attention. Staging uses segmented attention beyond
 its capacity when the checked partial-buffer plan fits. An allocation race can
 also fall back to tiled attention; other CUDA failures refuse the chunk arena.
 Tiled attention performs a blocking length update for each query tile.
-Neither staged path has yet been qualified or measured on physical P2P cards.
+Neither staged path has yet been qualified or measured on physical P2P cards
+with this integration. Earlier measurements used a different prototype.
 
 When this experimental path is active, the card executor advertises the
 admitted chunk size to the serving worker. With chunking off, the worker keeps
