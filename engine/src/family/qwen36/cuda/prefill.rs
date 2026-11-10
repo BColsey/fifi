@@ -1734,7 +1734,10 @@ fn attn_proj(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Result<(), EngEr
 // Independent of StepParams. Every KV8 attention tile sets this word on the owning stream.
 const KV8_LENGTH_OFFSET: usize = CPF_ATTN_PART_CAP - size_of::<i32>();
 const KV8_ATTN_TILE_ROWS: usize = 16;
-const KV8_BULK_ROWS: usize = 1024;
+/// The bulk-row domain of the unstaged KV8 attention path. The scratch layout bound
+/// (`kv8_scratch_layout`: part_bytes + 2·(m·2048) B) must stay under KV8_LENGTH_OFFSET
+/// (≈ 8.4 MB of the 64 MiB cap at 2,048 rows).
+const KV8_BULK_ROWS: usize = 2048;
 
 /// A native attention tile keeps its absolute first query position, not the chunk end.
 /// Returns `(tile rows, first query's key count)` after checking the complete chunk end.
