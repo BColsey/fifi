@@ -26,7 +26,7 @@ fn card_chunk_matches_the_per_token_path() {
     if !device_present("card_chunk_matches_the_per_token_path") {
         return;
     }
-    check_card_chunk([0, 0], 8, None);
+    check_card_chunk([0, 0], 8, None, false);
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 8, None);
+    check_card_chunk(devices, 8, None, false);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn large_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 96, None);
+    check_card_chunk(devices, 96, None, false);
 }
 
 #[test]
@@ -80,10 +80,28 @@ fn segmented_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 96, Some(32));
+    check_card_chunk(devices, 96, Some(32), false);
 }
 
-fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>) {
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn async_broadcast_chunk_matches_synchronous_on_physical_peers() {
+    assert!(device_present(
+        "async_broadcast_chunk_matches_synchronous_on_physical_peers"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices, 96, Some(32), true);
+}
+
+fn check_card_chunk(
+    devices: [usize; 2],
+    rows: usize,
+    stage_rows: Option<usize>,
+    compare_async: bool,
+) {
     const NAME: &str = "card_chunk_matches_the_per_token_path";
     // The serving-hook parity check below consumes two complete chunks and a
     // final token. Keep the original small fixtures unchanged, but give the
@@ -95,6 +113,7 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
             capacity,
             crate::family::session::StoreLimits::default(),
             rows,
+            compare_async,
         )
         .expect("the rig session");
     assert_eq!(ExecutorOps::prefill_piece(&session), None);
@@ -161,6 +180,18 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
         .unwrap_or_else(|error| panic!("{NAME}: the chunk run refused: {error:?}"));
     session.note_chunk_rows(chunk_rows.len());
     let chunk_last = TokenStepper::logits(&mut session, *last).expect("chunk last");
+
+    if compare_async {
+        TokenStepper::reset(&mut session).expect("reset async chunk");
+        stack.set_async_broadcasts_for_test(true);
+        let fed = TokenStepper::fed(&session);
+        run_card_chunk(stack, session.states_mut(), &chunk, chunk_rows, fed)
+            .expect("async chunk run");
+        session.note_chunk_rows(chunk_rows.len());
+        let async_last = TokenStepper::logits(&mut session, *last).expect("async chunk last");
+        assert_eq!(chunk_last, async_last, "{NAME}: async chunk logits");
+        stack.set_async_broadcasts_for_test(false);
+    }
 
     // The gate: the same greedy winner, margin within the single-device
     // chunk suite's slack (2 * (peak * 1e-3 + 1e-6)).
@@ -241,6 +272,15 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
     session.set_sampler_vocab_for_test(vocab);
     TokenStepper::feed_rows(&mut session, prompt).expect("long chunk feed");
     let long_chunk = TokenStepper::logits(&mut session, *last).expect("long chunk logits");
+    if compare_async {
+        TokenStepper::reset(&mut session).expect("reset async long chunk");
+        stack.set_async_broadcasts_for_test(true);
+        TokenStepper::feed_rows(&mut session, prompt).expect("async long chunk feed");
+        let async_long =
+            TokenStepper::logits(&mut session, *last).expect("async long chunk logits");
+        assert_eq!(long_chunk, async_long, "{NAME}: async multi-chunk logits");
+        stack.set_async_broadcasts_for_test(false);
+    }
     let (want_tok, want_best, want_runner) = winner(&long_control);
     let (got_tok, got_best, got_runner) = winner(&long_chunk);
     let peak = long_control.iter().fold(0f32, |a, &v| a.max(v.abs()));
