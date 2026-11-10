@@ -80,7 +80,7 @@ fn a_card_session_feeds_logits_folds_and_resets_over_a_real_gguf() {
     if !device_present(NAME) {
         return;
     }
-    let result = run_session_rig(NAME, [0, 0]);
+    let result = run_session_rig(NAME, [0, 0], false);
     result.expect("the card session rig");
 }
 
@@ -93,7 +93,19 @@ fn prefill_without_head_matches_normal_logits_on_peer_gpus() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    run_session_rig(NAME, devices).expect("two-GPU session parity");
+    run_session_rig(NAME, devices, false).expect("two-GPU session parity");
+}
+
+#[test]
+#[ignore = "requires two peer-enabled GPUs and holds their adapter leases for the process lifetime"]
+fn async_broadcasts_preserve_logits_on_peer_gpus() {
+    const NAME: &str = "async_broadcasts_preserve_logits_on_peer_gpus";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    run_session_rig(NAME, devices, true).expect("async two-GPU session parity");
 }
 
 pub(super) fn build_rig_session_for_chunk(
@@ -101,6 +113,7 @@ pub(super) fn build_rig_session_for_chunk(
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
     chunk_rows: usize,
+    prepare_async: bool,
 ) -> Result<
     (
         CardSession,
@@ -111,7 +124,13 @@ pub(super) fn build_rig_session_for_chunk(
     ),
     EngError,
 > {
-    build_rig_session(devices, context_tokens, prefix_limits, Some(chunk_rows))
+    build_rig_session(
+        devices,
+        context_tokens,
+        prefix_limits,
+        Some(chunk_rows),
+        prepare_async,
+    )
 }
 
 fn build_rig_session(
@@ -119,6 +138,7 @@ fn build_rig_session(
     context_tokens: usize,
     prefix_limits: crate::family::session::StoreLimits,
     chunk_rows: Option<usize>,
+    prepare_async: bool,
 ) -> Result<
     (
         CardSession,
@@ -299,6 +319,9 @@ fn build_rig_session(
     let (mut stack, states) =
         CardStack::with_payload(&d, &options, &devices, &admission, &shard, payload)?;
     stack.enable_broadcast_sync_for_test();
+    if prepare_async {
+        stack.prepare_async_broadcasts_for_test()?;
+    }
     let load_options = LoadOptions {
         layout: WeightLayout::Native,
         ..LoadOptions::default()
@@ -339,12 +362,17 @@ fn build_rig_session(
     Ok((session, stack, loaded, names, vocab))
 }
 
-fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngError> {
+fn run_session_rig(
+    name: &'static str,
+    devices: [usize; 2],
+    compare_async: bool,
+) -> Result<(), EngError> {
     let (mut session, stack, loaded, names, vocab) = build_rig_session(
         devices,
         8,
         crate::family::session::StoreLimits::default(),
         None,
+        compare_async,
     )?;
     let limit = session.context_limit();
     if limit < 4 {
@@ -413,6 +441,19 @@ fn run_session_rig(name: &'static str, devices: [usize; 2]) -> Result<(), EngErr
     let optimized_next = session.logits(4)?;
     assert_eq!(next_row, optimized_next, "{name}: later decoded logits");
 
+    if compare_async {
+        stack.set_async_broadcasts_for_test(true);
+        TokenStepper::reset(&mut session)?;
+        session.feed(0)?;
+        session.feed(1)?;
+        let async_row = session.logits(2)?;
+        assert_eq!(row, async_row, "{name}: async first decoded logits");
+        session.feed(3)?;
+        let async_next = session.logits(4)?;
+        assert_eq!(next_row, async_next, "{name}: async later decoded logits");
+        stack.set_async_broadcasts_for_test(false);
+    }
+
     // A corrupt head makes a logits-producing step fail. A prompt-only feed
     // must still succeed with that head, proving that it was not launched.
     let head = match loaded[0].get(&names.head) {
@@ -478,6 +519,7 @@ fn run_card_prefix_turn_chain(name: &'static str, devices: [usize; 2]) {
             entries: 2,
         },
         None,
+        false,
     )
     .expect("the rig session");
 
@@ -606,6 +648,7 @@ fn card_views_construct_chunk_models() {
         256,
         crate::family::session::StoreLimits::default(),
         None,
+        false,
     )
     .expect("the rig session");
     let spec = rig_spec();
