@@ -1,0 +1,9 @@
+export FIFI_P2P_BUILD_RECEIPT=/home/ben/fifi-scratch/c01bfb61a695/p2p-staging-fixed/logs/verified-build-1794299001790682767.json
+export FIFI_CONTROL_BUILD_RECEIPT=/home/ben/fifi-scratch/76dec8a61d04/p2p-staging-matched-control/logs/verified-build-1794299537212234321.json
+export FIFI_PEER_PROOF=/home/ben/fifi-scratch/c01bfb61a695/p2p-staging-fixed/peer-check/pair-reserved-94uva6qz
+export FIFI_512_PROOF=/home/ben/fifi-scratch/76dec8a61d04/p2p-chunk512-validation/device-check/pair-reserved-y21enrnp
+export FIFI_256_REFERENCE=/home/ben/fifi-scratch/c01bfb61a695/p2p-staging-fixed/placement-check/pair-reserved-i9yy01hl
+export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR=/home/ben/fifi-scratch/ef3e3df888d6/long-context-validation/tmp
+export TMP=/home/ben/fifi-scratch/ef3e3df888d6/long-context-validation/tmp
+export TEMP=/home/ben/fifi-scratch/ef3e3df888d6/long-context-validation/tmp
