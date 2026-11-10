@@ -64,14 +64,18 @@ count, quantization and allocation backing (`device`, `host-mapped`, or
 `unknown`); card indices follow the serving process's device order. It emits
 no batch unless all cards have completed chunk close and every interval is
 valid. Other chunks and layers are not measured, and the selected layers need
-not contain both backing classes.
+not contain both backing classes. The batch has no request ID or device UUID;
+run an isolated request and separately record the process's device order.
 
 The intervals include scheduling, host enqueue gaps and other-stream
 contention, and a projection can include fixup work. They do not establish
 PCIe bytes, CPU utilization or the identity of individual selected experts.
 Compare tracing on and off with the same binary and workload to measure its
-overhead and check output parity. Diagnostic output is not a performance
-qualification.
+overhead and check output parity. The same switch also enables the existing
+`tiered-chunk: launching swiglu` log for every routed layer on both cards in
+every chunk. Those writes may materially perturb a long-context run, so
+trace-on overhead includes more than the selected timing events. Diagnostic
+output is not a performance qualification.
 
 An earlier, different 3060+3080 prototype produced one short cold sample
 of about 106 prompt tokens/s and an eager sample of about 40 tokens/s. Those
