@@ -3,8 +3,8 @@
 //! The tokenizer bundle loads on the calling thread. It carries only portable data. The engine
 //! thread builds everything native inside the `make` closure (`Q36Executor::open`), so no native
 //! value crosses a thread boundary. The tokenizer files come from `tokenizer_dir` and are checked
-//! against the pinned digests of `settings::tokenizer_pin`, so another template or tokenizer
-//! fails at load. The EOS ids (248046 and 248044) come from the pinned `generation_config.json`.
+//! against the pinned digests for the selected family, so another template or tokenizer fails at
+//! load. The EOS ids (248046 and 248044) come from the pinned `generation_config.json`.
 //!
 //! Chunked prefill: the chunk path stays off unless the settings carry `prefill_budget_bytes`. Then
 //! the engine thread calls `Q36Executor::plan_prefill` once, after the weights are resident and
@@ -20,7 +20,7 @@
 //! allows one.
 
 use super::resident::executor::{Q36Executor, Q36Rules};
-use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin};
+use super::settings::{NO_BUDGET_PIECE, Q36Settings, tokenizer_pin_for_spec};
 use crate::{
     EngError,
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
@@ -61,7 +61,10 @@ pub(crate) fn start(
         // it, ignores it, and says so on start-up.
         eprintln!("q36: capture is a CUDA key and is ignored on this arm");
     }
-    let bundle = TokenizerBundle::load(&settings.tokenizer_dir, &tokenizer_pin()?)?;
+    let bundle = TokenizerBundle::load(
+        &settings.tokenizer_dir,
+        &tokenizer_pin_for_spec(&settings.spec)?,
+    )?;
     let eos = bundle.eos_token_ids().to_vec();
     let sampler_vocab = usize::try_from(bundle.vocab_size())
         .map_err(|_| EngError::Checkpoint("tokenizer vocabulary exceeds usize".to_string()))?;
