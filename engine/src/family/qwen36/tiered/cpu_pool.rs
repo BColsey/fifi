@@ -397,17 +397,6 @@ impl CpuPool {
         })
     }
 
-    /// Computes all jobs of ONE layer: the CPU half of its MoE output, or
-    /// `Ok(None)` for an empty job list (the caller adds nothing; signed zeros
-    /// survive). Every argument is validated before any work — ranges inside the
-    /// region and exactly the shape's slice lengths (gate/up `inter*hidden/256*144`
-    /// bytes, down `hidden*inter/256*144`), `hidden` exactly `shape.hidden` long,
-    /// finite weights; violations are [`PoolError::BadInput`] naming the job, and
-    /// nothing is queued before every job passes. The result is the sum over jobs
-    /// IN JOB ORDER of `weight_j * <pool kernel>(job_j)` (f32 `expert_forward`,
-    /// `expert_forward_q8k` or `expert_forward_q8g` through the pool's backend), f32 from +0.0, so the
-    /// bits never depend on which thread finished first; the wait is bounded by
-    /// `timeout`, and late results die with the run's channel (one per run).
     /// The grouped twin of [`Self::start_layer`]: validates every job against the
     /// shape and the shared activation block, queues one grouped job per DISTINCT
     /// missed expert and returns at once with a [`PendingChunk`].
@@ -491,6 +480,17 @@ impl CpuPool {
         }))
     }
 
+    /// Computes all jobs of ONE layer: the CPU half of its MoE output, or
+    /// `Ok(None)` for an empty job list (the caller adds nothing; signed zeros
+    /// survive). Every argument is validated before any work — ranges inside the
+    /// region and exactly the shape's slice lengths (gate/up `inter*hidden/256*144`
+    /// bytes, down `hidden*inter/256*144`), `hidden` exactly `shape.hidden` long,
+    /// finite weights; violations are [`PoolError::BadInput`] naming the job, and
+    /// nothing is queued before every job passes. The result is the sum over jobs
+    /// IN JOB ORDER of `weight_j * <pool kernel>(job_j)` (f32 `expert_forward`,
+    /// `expert_forward_q8k` or `expert_forward_q8g` through the pool's backend), f32 from +0.0, so the
+    /// bits never depend on which thread finished first; the wait is bounded by
+    /// `timeout`, and late results die with the run's channel (one per run).
     pub fn run_layer(
         &self,
         jobs: Vec<ExpertJob>,
