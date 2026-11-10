@@ -630,6 +630,12 @@ impl PrefillArena {
         Ok(())
     }
 
+    /// Diagnosis only: run the identical card fixture against the Q8 fallback.
+    #[cfg(test)]
+    pub(super) fn disable_kv8_staging_for_test(&mut self) {
+        self.kv8_staging = None;
+    }
+
     pub(super) fn kv8_staging(&self) -> Result<Option<Kv8Staging<'_>>, EngError> {
         self.kv8_staging
             .as_ref()

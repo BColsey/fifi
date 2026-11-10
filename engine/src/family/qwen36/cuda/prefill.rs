@@ -2292,6 +2292,8 @@ fn attn_flash_staged(
         (Plane::K, Plane::KScales, staging.planes[0]),
         (Plane::V, Plane::VScales, staging.planes[1]),
     ] {
+        #[cfg(test)]
+        eprintln!("P2P_DIAG staged_dequant plane={codes:?}");
         ctx.launch.ctx.kv8_dequant(
             ctx.launch.stream,
             Kv8DequantCall {
@@ -2307,6 +2309,8 @@ fn attn_flash_staged(
             },
         )?;
     }
+    #[cfg(test)]
+    eprintln!("P2P_DIAG staged_fp16_attention");
     attn_flash_fp16(run, ctx, staging.plan.capacity, staging.planes)
 }
 

@@ -166,6 +166,13 @@ impl CardChunk {
             })
             .collect()
     }
+
+    #[cfg(test)]
+    pub(super) fn disable_staging_for_test(&mut self) {
+        for card in &mut self.cards {
+            card.arena.disable_kv8_staging_for_test();
+        }
+    }
 }
 
 /// Builds both cards' chunk arenas and models. `m_chunk` is the chunk row
@@ -525,6 +532,8 @@ fn run_card_chunk_layer(
     let cards = stack.shards().len();
     let stages = layer_stages(kind)?;
     for stage in stages {
+        #[cfg(test)]
+        eprintln!("P2P_DIAG layer={layer} stage={stage:?}");
         match stage {
             Stage::NormF => {
                 // The mixer output exchange precedes the norm that reads it.
@@ -567,8 +576,12 @@ fn run_card_chunk_layer(
                 // The shared expert and the routed GEMMs per card, then
                 // the asymmetric combine and the Hidden exchange.
                 for card in 0..cards {
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage=Moe card={card} part=shared");
                     let io = moe_io(&runs[card], &status[card], m)?;
                     run_chunk_shared(&launches[card], &chunk.cards[card].moe[layer], &io)?;
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage=Moe card={card} part=routed");
                     run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)?;
                     if card == 0 {
                         combine_chunk_moe(&launches[card], &io)?;
@@ -616,6 +629,8 @@ fn run_card_chunk_layer(
             other => {
                 // The card-local stages, driven on every card.
                 for card in 0..cards {
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage={other:?} card={card}");
                     let ctx = layer_ctx(launches, chunk, status, card, layer, kind, ordinal)?;
                     match other {
                         Stage::NormA => norm_a(&runs[card], &ctx)?,

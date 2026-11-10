@@ -26,7 +26,7 @@ fn card_chunk_matches_the_per_token_path() {
     if !device_present("card_chunk_matches_the_per_token_path") {
         return;
     }
-    check_card_chunk([0, 0], 8, None);
+    check_card_chunk([0, 0], 8, None, true);
 }
 
 #[test]
@@ -41,7 +41,20 @@ fn card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 8, None);
+    check_card_chunk(devices, 8, None, true);
+}
+
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn unstaged_card_chunk_matches_the_per_token_path_on_physical_peers() {
+    assert!(device_present(
+        "unstaged_card_chunk_matches_the_per_token_path_on_physical_peers"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices, 8, None, false);
 }
 
 #[test]
@@ -54,7 +67,7 @@ fn large_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 96, None);
+    check_card_chunk(devices, 96, None, true);
 }
 
 #[test]
@@ -67,10 +80,10 @@ fn segmented_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 96, Some(32));
+    check_card_chunk(devices, 96, Some(32), true);
 }
 
-fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>) {
+fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>, staged: bool) {
     const NAME: &str = "card_chunk_matches_the_per_token_path";
     let (mut session, stack, loaded, names, vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
@@ -101,7 +114,7 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
         weights: loaded,
         embed_name: Box::leak(names.embed.clone().into_boxed_str()),
     };
-    let chunk = match stage_rows {
+    let mut chunk = match stage_rows {
         Some(stage_rows) => build_card_chunk_with_stage_rows(
             stack,
             &d,
@@ -114,11 +127,15 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
         None => build_card_chunk(stack, &d, &table, inputs(), &options, rows),
     }
     .unwrap_or_else(|error| panic!("{NAME}: the chunk build refused: {error:?}"));
+    if !staged {
+        chunk.disable_staging_for_test();
+    }
     assert_eq!(
         chunk.staging_for_test().expect("staging views"),
-        vec![Some((stage_rows.unwrap_or(256), true)); 2],
-        "{NAME}: both cards must exercise the requested staging path"
+        vec![staged.then_some((stage_rows.unwrap_or(256), true)); 2],
+        "{NAME}: both cards must exercise the requested attention path"
     );
+    eprintln!("P2P_DIAG staged={staged} rows={rows}");
 
     // Deterministic, in-range token ids.
     let tokens: Vec<u32> = (0..rows as u32 + 1).map(|i| (i * 37 + 11) % 900).collect();
