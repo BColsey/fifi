@@ -1396,13 +1396,15 @@ impl<'a> QwenResidentStep<'a> {
         Some(self.prefill.as_ref()?.kv8_staging().ok()??.plan)
     }
 
-    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer
-    /// and the host. Refuses a plain step, a second attach and a bank count other than the layer
-    /// count. The scratch buffers are allocated here.
+    /// Builds the tiered runtime of a step made with `StepOptions.tiered`: one bank per layer,
+    /// the host and the optional cold staging bank of the chunked prefill. Refuses a plain
+    /// step, a second attach and a bank count other than the layer count. The scratch buffers
+    /// are allocated here.
     pub(crate) fn attach_tiered(
         &mut self,
         banks: Vec<ExpertBank>,
         host: TieredHost,
+        cold: Option<super::tiered_step::ColdStaging>,
     ) -> Result<(), EngError> {
         let parts = self.tiered_parts.take().ok_or_else(|| {
             EngError::BadRequest(
@@ -1413,7 +1415,7 @@ impl<'a> QwenResidentStep<'a> {
         let moe = &self.moe_dims;
         let scratch = TieredScratch::new(self.context, moe.hidden, moe.top_k)?;
         self.tiered = Some(std::cell::RefCell::new(TieredRuntime::new(
-            parts, banks, scratch, host,
+            parts, banks, scratch, host, cold,
         )?));
         Ok(())
     }
