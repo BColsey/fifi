@@ -1,9 +1,11 @@
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import select
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.p2p_concurrent_guard.core import Interval, run
 from scripts.p2p_concurrent_guard.host_adapter import (
@@ -11,6 +13,7 @@ from scripts.p2p_concurrent_guard.host_adapter import (
     HostAdapter,
     SecondaryIdentity,
 )
+from scripts.p2p_concurrent_guard.host_attestation import _seal_pinned
 
 
 def identity():
@@ -123,6 +126,20 @@ class FakeBackend:
 
 @unittest.skipUnless(hasattr(os, "memfd_create"), "Linux memfd required")
 class HostAdapterTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        image = Path(directory.name) / "program.py"
+        image.write_bytes(b"print('fixture only')\n")
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        for name in ("sealed_companion", "sealed_gate"):
+            patcher = patch(
+                f"scripts.p2p_concurrent_guard.host_adapter.{name}",
+                side_effect=lambda _path: _seal_pinned(image, digest),
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_nonfake_backend_is_refused(self):
         backend = FakeBackend()
         backend.test_backend_only = False
