@@ -1385,9 +1385,6 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
         self
     }
 
-    /// Sets the tiered runtime: the chunk MoE stage routes through the bank stacks
-    /// + CPU misses when this is present.
-
     /// Selects this run's diagnostic projections without changing another caller.
     /// `DenseMmvq` includes shared-expert projections; `AllMmvq` also replaces routed GEMMs.
     #[cfg(test)]
@@ -2383,11 +2380,12 @@ fn run_chunk_tiered(
     let t_readback = t0.elapsed();
 
     // The host classification (&mut runtime): validate every row, classify every pick.
+    // Only ids and weights flow per row — the CPU pool reads the shared `route.hidden`
+    // block directly, so copying each row's hidden slice here was pure waste.
     let rows: Vec<crate::family::qwen36::tiered::host::ChunkRouteRow> = (0..m)
         .map(|r| crate::family::qwen36::tiered::host::ChunkRouteRow {
             ids: route.ids[r * top_k..(r + 1) * top_k].to_vec(),
             weights: route.weights[r * top_k..(r + 1) * top_k].to_vec(),
-            hidden: route.hidden[r * hidden..(r + 1) * hidden].to_vec(),
         })
         .collect();
     let t1 = std::time::Instant::now();
@@ -2716,30 +2714,6 @@ impl ChunkRouteBatch {
     }
 }
 
-/// f16 to f32 (the simple IEEE 754 conversion for Q4_K scales).
-fn f16_to_f32(b: &[u8], off: usize) -> f32 {
-    let h = u16::from_le_bytes([b[off], b[off + 1]]);
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1F) as i32 - 15;
-    let mant = (h & 0x3FF) as f32 / 1024.0;
-    sign * (1.0 + mant) * 2f32.powi(exp)
-}
-
-/// Q4_K quant value for position j within a block.
-fn dequant_q4k(b: &[u8], j: usize) -> f32 {
-    let ql = b.get(j / 2).copied().unwrap_or(0);
-    let qh = b.get(64 + j / 16 * 8 + (j % 16) / 2).copied().unwrap_or(0);
-    let low = ql >> (4 * (j % 2)) & 0xF;
-    let high = qh >> (4 * ((j % 16) / 2) / 2) & 0x3;
-    (low | (high << 4)) as f32 - 8.0
-}
-
-/// Q4_K scale for group g within a block.
-fn scale_q4k(b: &[u8], g: usize) -> f32 {
-    let sc = b.get(128 + 2 + g).copied().unwrap_or(0);
-    (sc as f32 - 32.0) / 32.0
-}
-
 /// The grouped-ids layout of one chunk layer's picks over TWO weight stacks: the bank
 /// slots and the cold staging channels. `ids_dst` (the m*top_k flat pick indices)
 /// holds the bank columns first (slot order), then the cold columns (channel order) —
@@ -2893,7 +2867,20 @@ fn build_tiered_host_ids<'b>(
         slots,
     )?;
     let (ne, cold_count) = (m * top_k, groups.cold_count);
-    let bank_columns = usize::try_from(groups.expert_bounds[slots]).unwrap_or(0);
+    // The cold span pads its channel count to the shape rule's minimum of top_k
+    // (zero-width experts — the kernel's tiles exit immediately on an empty channel),
+    // and the DENSE table must carry that same padding: from_host is the one upload,
+    // so the padded bounds entries [slots+cold_count+1, slots+channels+1) reach the
+    // device here — otherwise the cold launch reads stale scratch bytes as bounds
+    // whenever cold_count < top_k (a small or warm tail piece).
+    let channels = if cold_count > 0 {
+        cold_count.max(top_k)
+    } else {
+        0
+    };
+    let mut dense_bounds = groups.expert_bounds.clone();
+    dense_bounds.resize(slots + channels + 1, i32::try_from(ne).unwrap_or(i32::MAX));
+    let bank_columns = usize::try_from(dense_bounds[slots]).unwrap_or(0);
     let table =
         |bounds: crate::kernels::cuda::DeviceRange<'b>| -> Result<mmid::MmidIdsOut<'b>, EngError> {
             Ok(mmid::MmidIdsOut {
@@ -2902,17 +2889,18 @@ fn build_tiered_host_ids<'b>(
                 expert_bounds: bounds,
             })
         };
-    // The dense set: every expert of both stacks in one table, a full permutation.
+    // The dense set: every expert of both stacks in one table, a full permutation,
+    // padded to the cold span's channel count.
     let combined = mmid::MmidIds::from_host(
         stream,
         mmid::MmidShape {
-            n_experts: slots + cold_count,
+            n_experts: slots + channels,
             m,
             top_k,
         },
         mmid::HostIds {
             ids_dst: &groups.ids_dst,
-            expert_bounds: &groups.expert_bounds,
+            expert_bounds: &dense_bounds,
         },
         table(d.get(ChunkSlot::ExpertBounds)?)?,
     )?;
@@ -2925,18 +2913,15 @@ fn build_tiered_host_ids<'b>(
         },
         mmid::HostIds {
             ids_dst: &groups.ids_dst,
-            expert_bounds: &groups.expert_bounds[..slots + 1],
+            expert_bounds: &dense_bounds[..slots + 1],
         },
         (0, bank_columns),
         table(d.get(ChunkSlot::ExpertBounds)?)?,
     )?;
-    // The cold span: the bounds tail at byte offset `slots * 4`, padded to the shape
-    // rule's minimum of top_k channels with zero-width experts (the kernel's tiles
-    // exit immediately on an empty channel).
+    // The cold span: the bounds tail at byte offset `slots * 4`, already padded by
+    // the dense table above.
     let cold = if cold_count > 0 {
-        let channels = cold_count.max(top_k);
-        let mut bounds = groups.expert_bounds[slots..].to_vec();
-        bounds.resize(channels + 1, i32::try_from(ne).unwrap_or(i32::MAX));
+        let bounds = dense_bounds[slots..].to_vec();
         let whole = d.get(ChunkSlot::ExpertBounds)?;
         let tail = whole
             .buffer()
@@ -3451,7 +3436,7 @@ pub(super) fn run_chunk_body(launch: &Launch<'_>, run: &ChunkRun<'_, '_>) -> Res
             "chunk gpu-time by stage (stream ms, layers {}):",
             run.model.layers
         );
-        for (ms, name, n) in lines.iter().rev() {
+        for (ms, name, n) in &lines {
             eprintln!("  {name}: {ms:.1} ms ({n} marks)");
         }
     }

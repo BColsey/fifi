@@ -115,12 +115,12 @@ fn weight_ppm(weight: f32) -> u64 {
 }
 
 /// One row of a chunk's route: the token-width inputs of `begin_layer`, one row of
-/// the M the chunk feeds at once. `hidden` is the NORMED row that row's CPU experts read.
+/// the M the chunk feeds at once. The CPU pool reads the chunk's shared normed rows
+/// separately (`start_chunk_pool`'s block), so no hidden slice rides per row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChunkRouteRow {
     pub ids: Vec<i32>,
     pub weights: Vec<f32>,
-    pub hidden: Vec<f32>,
 }
 
 /// The device plan of one chunk layer: `rows.len() * top_k` entries, row-major (row r's
@@ -1136,7 +1136,6 @@ mod tests {
         let row = |ids: &[i32], weights: &[f32]| ChunkRouteRow {
             ids: ids.to_vec(),
             weights: weights.to_vec(),
-            hidden: f.hidden.clone(),
         };
         let rows = [
             row(&[2, 7, 3, 5], &[0.30, 0.20, 0.10, 0.02]),
