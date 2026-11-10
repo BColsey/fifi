@@ -130,7 +130,7 @@ def main():
         raise ValueError("2080 service changed during the campaign")
     snapshots = {
         "long_recall_harness.py.txt": "attention_device.py",
-        "reservation_harness.py.txt": "reserve_pair_attention.py",
+        "../qwen36-p2p-ring-long-proof/reservation_harness.py.txt": "reserve_pair_attention.py",
     }
     for snapshot, source in snapshots.items():
         if (
