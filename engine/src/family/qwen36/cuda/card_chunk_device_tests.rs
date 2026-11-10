@@ -234,3 +234,165 @@ fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>)
     assert_eq!(ExecutorOps::prefill_piece(&executor), Some(rows));
     println!("{NAME}: {rows} rows, winner {want_tok}, chunk margin {got_best:.4}/{got_runner:.4}");
 }
+
+/// Diagnostic only: the rig creates its prefix store before attaching a chunk,
+/// then gives that store a test-only chunk identity. Production chunked P2P
+/// sessions continue to disable prefix reuse.
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn chunk_prefix_turn_chain_diagnostic_on_physical_peers() {
+    use super::prefix::CudaPrefillPath;
+    use crate::family::session::{DecodeSession, SaveKind, StoreLimits};
+
+    const NAME: &str = "chunk_prefix_turn_chain_diagnostic_on_physical_peers";
+    assert!(device_present(NAME));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    let limits = StoreLimits {
+        roots: 0,
+        entries: 2,
+    };
+    let (mut session, stack, loaded, names, _vocab) =
+        crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
+            devices, 256, limits, 32,
+        )
+        .expect("rig session");
+    let spec = rig_spec();
+    let inventory = Inventory::for_spec(&spec).expect("inventory");
+    let shape = HostShape::from_spec(&spec, 64).expect("shape");
+    let dims = StepDims::new(&shape, &inventory).expect("dims");
+    let table = LayerTable::new(&dims, &inventory).expect("layers");
+    let options = StepOptions {
+        kv_mode: KvMode::Int8G32,
+        context_tokens: 256,
+        delta_slots: 1,
+        forked_experts: false,
+        tiered: None,
+        layout: crate::family::project::cuda::WeightLayout::Native,
+    };
+    let chunk = build_card_chunk(
+        stack,
+        &dims,
+        &table,
+        CardChunkInputs {
+            weights: loaded,
+            embed_name: Box::leak(names.embed.clone().into_boxed_str()),
+        },
+        &options,
+        32,
+    )
+    .expect("chunk build");
+    assert_eq!(
+        chunk.staging_for_test().expect("staging views"),
+        vec![Some((256, true)); 2]
+    );
+    // This test-only sequence bypasses the production construction gate:
+    // the prefix store already exists when the chunk is attached.
+    session.set_chunk_for_test(chunk);
+    assert_eq!(ExecutorOps::prefix_limits(&session), limits);
+    let path = CudaPrefillPath::ChunkedForTest(KvMode::Int8G32, 32);
+    let wrong_rows = CudaPrefillPath::ChunkedForTest(KvMode::Int8G32, 16);
+    session.set_prefix_path_for_test(path);
+    let tokens: Vec<u32> = (0..100).map(|i| (i * 11 + 3) % 900).collect();
+    let mut st = DecodeSession::default();
+
+    for cut in [31, 32, 33, 59] {
+        ExecutorOps::reset(&mut session, &mut st).expect("reset before save");
+        for piece in tokens[..cut].chunks(32) {
+            ExecutorOps::prefill(&mut session, &mut st, piece).expect("prefix prefill");
+        }
+        assert!(
+            ExecutorOps::save_prefix(&mut session, &st, &tokens[..cut], SaveKind::Tip)
+                .expect("save prefix"),
+            "{NAME}: cut {cut} must save"
+        );
+        for other in [CudaPrefillPath::Steps(KvMode::Int8G32), wrong_rows] {
+            ExecutorOps::reset(&mut session, &mut st).expect("reset before path miss");
+            session.set_prefix_path_for_test(other);
+            assert_eq!(
+                ExecutorOps::restore_prefix(&mut session, &mut st, &tokens).expect("path miss"),
+                0,
+                "{NAME}: a different numeric identity must miss"
+            );
+        }
+        ExecutorOps::reset(&mut session, &mut st).expect("reset before restore");
+        session.set_prefix_path_for_test(path);
+        let covered =
+            ExecutorOps::restore_prefix(&mut session, &mut st, &tokens).expect("restore prefix");
+        assert_eq!(covered, cut, "{NAME}: restore the intended cut");
+        for piece in tokens[covered..].chunks(32) {
+            ExecutorOps::prefill(&mut session, &mut st, piece).expect("restored tail");
+        }
+        let restored =
+            TokenStepper::logits(&mut session, *tokens.last().unwrap()).expect("restored logits");
+        let restored_states = session.export_states_for_test().expect("restored states");
+
+        // Match the exact save-point split when recomputing from scratch.
+        ExecutorOps::reset(&mut session, &mut st).expect("reset aligned control");
+        for span in [&tokens[..cut], &tokens[cut..]] {
+            for piece in span.chunks(32) {
+                ExecutorOps::prefill(&mut session, &mut st, piece).expect("aligned control");
+            }
+        }
+        let aligned =
+            TokenStepper::logits(&mut session, *tokens.last().unwrap()).expect("aligned logits");
+        let aligned_states = session.export_states_for_test().expect("aligned states");
+        assert_eq!(restored.len(), aligned.len());
+        assert_eq!(
+            restored.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            aligned.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{NAME}: restored and aligned-control logits differ at cut {cut}"
+        );
+        assert_eq!(restored_states.len(), 2);
+        assert_eq!(aligned_states.len(), 2);
+        for (card, (got, want)) in restored_states.iter().zip(&aligned_states).enumerate() {
+            assert_eq!(got.identity, want.identity, "{NAME}: card {card} identity");
+            assert_eq!(got.tokens, want.tokens, "{NAME}: card {card} token count");
+            assert_eq!(got.kv, want.kv, "{NAME}: card {card} KV bytes");
+            assert_eq!(got.delta.len(), want.delta.len());
+            for (g, w) in got.delta.iter().zip(&want.delta) {
+                for (left, right) in [(&g.recurrent, &w.recurrent), (&g.conv, &w.conv)] {
+                    assert_eq!(
+                        left.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        right.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{NAME}: card {card} DeltaNet state bits at cut {cut}"
+                    );
+                }
+            }
+        }
+
+        // A fresh request without that save-point split can group rows
+        // differently. Report its drift instead of assuming equivalence.
+        ExecutorOps::reset(&mut session, &mut st).expect("reset natural control");
+        for piece in tokens.chunks(32) {
+            ExecutorOps::prefill(&mut session, &mut st, piece).expect("natural control");
+        }
+        let natural =
+            TokenStepper::logits(&mut session, *tokens.last().unwrap()).expect("natural logits");
+        assert!(natural.iter().chain(&restored).all(|v| v.is_finite()));
+        let changed = natural
+            .iter()
+            .zip(&restored)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let max_abs = natural
+            .iter()
+            .zip(&restored)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let winner = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        println!(
+            "{NAME}: cut={cut} chunk=32 aligned_bitwise=true natural_changed_logits={changed} natural_max_abs={max_abs:.9} restored_winner={} natural_winner={}",
+            winner(&restored),
+            winner(&natural)
+        );
+    }
+}
