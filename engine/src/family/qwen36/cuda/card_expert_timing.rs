@@ -27,6 +27,19 @@ fn next_phase(current: Phase, start: bool) -> Result<Phase, EngError> {
     }
 }
 
+fn complete_batch(layers: &[Vec<[Phase; 3]>]) -> bool {
+    let Some(first) = layers.first() else {
+        return false;
+    };
+    !first.is_empty()
+        && layers.iter().all(|cards| {
+            cards.len() == first.len()
+                && cards
+                    .iter()
+                    .all(|phases| phases.iter().all(|phase| *phase == Phase::Finished))
+        })
+}
+
 fn format_record(
     card: usize,
     layer: usize,
@@ -110,10 +123,6 @@ impl RoutedTiming {
     }
 
     /// Called only after every card has successfully completed chunk close.
-    fn complete(&self) -> bool {
-        self.marks.iter().all(|mark| mark.phase == Phase::Finished)
-    }
-
     fn records(&self, card: usize, layer: usize, rows: usize) -> Result<Vec<String>, EngError> {
         if self.marks.iter().any(|mark| mark.phase != Phase::Finished) {
             return Err(EngError::BadRequest(
@@ -138,11 +147,16 @@ impl RoutedTiming {
 
 /// Print no partial timing batch if any card has incomplete or invalid marks.
 pub(super) fn report(layers: &[(usize, Vec<RoutedTiming>)], rows: usize) -> Result<(), EngError> {
-    if layers.is_empty()
-        || layers
-            .iter()
-            .any(|(_, cards)| cards.is_empty() || cards.iter().any(|timing| !timing.complete()))
-    {
+    let phases: Vec<Vec<[Phase; 3]>> = layers
+        .iter()
+        .map(|(_, cards)| {
+            cards
+                .iter()
+                .map(|timing| std::array::from_fn(|i| timing.marks[i].phase))
+                .collect()
+        })
+        .collect();
+    if !complete_batch(&phases) {
         return Err(EngError::BadRequest(
             "P2P expert timing: incomplete timing batch".into(),
         ));
@@ -159,7 +173,7 @@ pub(super) fn report(layers: &[(usize, Vec<RoutedTiming>)], rows: usize) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase, format_record, next_phase};
+    use super::{Phase, complete_batch, format_record, next_phase};
 
     #[test]
     fn marks_must_start_then_finish_once() {
@@ -169,6 +183,16 @@ mod tests {
         assert!(next_phase(Phase::Started, true).is_err());
         assert!(next_phase(Phase::Finished, true).is_err());
         assert!(next_phase(Phase::Finished, false).is_err());
+    }
+
+    #[test]
+    fn batch_requires_all_projections_for_each_card_and_layer() {
+        let done = [Phase::Finished; 3];
+        assert!(!complete_batch(&[]));
+        assert!(!complete_batch(&[vec![]]));
+        assert!(complete_batch(&[vec![done, done], vec![done, done]]));
+        assert!(!complete_batch(&[vec![done, done], vec![done]]));
+        assert!(!complete_batch(&[vec![done, [Phase::Started; 3]]]));
     }
 
     #[test]
