@@ -4,7 +4,9 @@
 //! greedy token and a top-2 margin bound (the single-device chunk suite's
 //! own standard for the same comparison), not bit equality.
 
-use super::card_prefill::{CardChunkInputs, build_card_chunk, run_card_chunk};
+use super::card_prefill::{
+    CardChunkInputs, build_card_chunk, build_card_chunk_with_stage_rows, run_card_chunk,
+};
 use super::card_session_device_tests::rig_spec;
 use super::dims::{KvMode, StepDims, StepOptions};
 use super::layer_table::LayerTable;
@@ -24,7 +26,7 @@ fn card_chunk_matches_the_per_token_path() {
     if !device_present("card_chunk_matches_the_per_token_path") {
         return;
     }
-    check_card_chunk([0, 0], 8);
+    check_card_chunk([0, 0], 8, None);
 }
 
 #[test]
@@ -39,7 +41,7 @@ fn card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 8);
+    check_card_chunk(devices, 8, None);
 }
 
 #[test]
@@ -52,10 +54,23 @@ fn large_card_chunk_matches_the_per_token_path_on_physical_peers() {
     let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
     crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
     crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
-    check_card_chunk(devices, 96);
+    check_card_chunk(devices, 96, None);
 }
 
-fn check_card_chunk(devices: [usize; 2], rows: usize) {
+#[test]
+#[ignore = "requires two physical peer-enabled GPUs and holds their adapter leases; run alone"]
+fn segmented_card_chunk_matches_the_per_token_path_on_physical_peers() {
+    assert!(device_present(
+        "segmented_card_chunk_matches_the_per_token_path_on_physical_peers"
+    ));
+    let devices = [0, 1];
+    let facts = crate::kernels::cuda::peer::probe_device_set(&devices).expect("probe GPUs");
+    crate::kernels::cuda::peer::check_peer_facts(&facts).expect("peer access");
+    crate::kernels::cuda::peer::enable_peer_access(&devices).expect("enable peer access");
+    check_card_chunk(devices, 96, Some(32));
+}
+
+fn check_card_chunk(devices: [usize; 2], rows: usize, stage_rows: Option<usize>) {
     const NAME: &str = "card_chunk_matches_the_per_token_path";
     let (mut session, stack, loaded, names, vocab) =
         crate::family::qwen36::cuda::card_session_device_tests::build_rig_session_for_chunk(
@@ -82,18 +97,28 @@ fn check_card_chunk(devices: [usize; 2], rows: usize) {
     // The rig requests the same mailbox sizing rule as production, so the
     // larger peer test exercises a real multi-row exchange, not a truncation.
     assert!(rows <= super::card_prefill::max_chunk_rows(d.shape.hidden));
-    let chunk = build_card_chunk(
-        stack,
-        &d,
-        &table,
-        CardChunkInputs {
-            weights: loaded,
-            embed_name: Box::leak(names.embed.clone().into_boxed_str()),
-        },
-        &options,
-        rows,
-    )
+    let inputs = || CardChunkInputs {
+        weights: loaded,
+        embed_name: Box::leak(names.embed.clone().into_boxed_str()),
+    };
+    let chunk = match stage_rows {
+        Some(stage_rows) => build_card_chunk_with_stage_rows(
+            stack,
+            &d,
+            &table,
+            inputs(),
+            &options,
+            rows,
+            stage_rows,
+        ),
+        None => build_card_chunk(stack, &d, &table, inputs(), &options, rows),
+    }
     .unwrap_or_else(|error| panic!("{NAME}: the chunk build refused: {error:?}"));
+    assert_eq!(
+        chunk.staging_for_test().expect("staging views"),
+        vec![Some((stage_rows.unwrap_or(256), true)); 2],
+        "{NAME}: both cards must exercise the requested staging path"
+    );
 
     // Deterministic, in-range token ids.
     let tokens: Vec<u32> = (0..rows as u32 + 1).map(|i| (i * 37 + 11) % 900).collect();
