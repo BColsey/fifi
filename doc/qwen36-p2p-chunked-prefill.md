@@ -20,7 +20,8 @@ uses the existing tiled Q8 attention. Staging uses segmented attention beyond
 its capacity when the checked partial-buffer plan fits. An allocation race can
 also fall back to tiled attention; other CUDA failures refuse the chunk arena.
 Tiled attention performs a blocking length update for each query tile.
-Neither staged path has yet been qualified or measured on physical P2P cards.
+Neither staged path has yet been qualified. A served comparison with staging
+admitted on both physical P2P cards is recorded below.
 
 When this experimental path is active, the card executor advertises the
 admitted chunk size to the serving worker. With chunking off, the worker keeps
@@ -46,6 +47,27 @@ Both cards compute the selected experts over their intermediate slices. The
 existing eager K/V gathers are retained. A physical peer test must check both
 single- and multiple-chunk output against per-token execution, using the
 intended devices selected through `CUDA_VISIBLE_DEVICES`.
+
+## Measured 512-row comparison
+
+On a 12 GB RTX 3060 and 10 GB RTX 3080, with the Q4_K_M GGUF model, q8 KV,
+mapped host experts, and a configured 262,144-token limit, one matched
+comparison used the same experimental staged server binary with
+`Q36_P2P_CHUNK=256` and `Q36_P2P_CHUNK=512`. Median server job-start-to-first-
+token rate on three cold 4,274-token prompts rose from 304.07 to 471.69
+tokens/s; median decode rate on three 128-token replies was 38.49 and 38.57
+tokens/s. The first-token timing includes generating that token. The 512-row
+setting had 1,368 MiB free on the 3060 and 1,475 MiB on the 3080 after
+warmup, 32 MiB less per card than the 256-row setting in this run.
+
+The [samples and guarded-run evidence](../scripts/benchmarks/qwen36-p2p-512-chunk-ab.json)
+identify the separately tested integration commit. A [physical-peer test](../scripts/benchmarks/qwen36-p2p-512-parity.json)
+also checks a synthetic two-layer fixture against per-token execution at 512
+rows. The served comparison ran the 256-row arm first and did not cross the
+order; the small fixture compares only the final winner and top-two logits.
+Both arms disable prefix reuse, and neither the configured 256k limit nor a
+successful short response establishes long-context recall or coding quality.
+The setting remains experimental and default off.
 
 ## Evidence needed
 
