@@ -28,3 +28,22 @@ signature; it rejects nonempty, unsupported, missing or changing proofs. This
 does not treat missing fields as empty. No live observer, service handoff, GPU
 workload or 2080 integration has been run. CPU-only fake-command/proc tests do
 not qualify live behavior.
+
+The companion `PairLifecycle` module is a **test-gated sequence**, not a live
+service controller. It accepts only explicitly marked fake backends and
+runners, never closes the supplied lease, and does not make systemd calls on
+its own. It plans only the fixed pair service's stop and start commands, marks
+attempts before invoking the fake runner, and requires external proof of the
+unchanged secondary, queue idleness, contexts, sockets, restoration inputs and
+replacement start provenance. Each injected operation receives an absolute
+monotonic deadline and must enforce it internally; post-call checks cannot
+interrupt a blocking implementation. A requested start is not evidence that
+the resulting process came from that start.
+
+For the fake restoration admission the two supplied UUIDs must match the
+baseline, total memory must accommodate the earlier used amount plus 1,024 MiB,
+and sampled free memory must be at least the larger of 8,192 MiB and earlier
+used plus 1,024 MiB. This is a conservative sampled gate, not a guarantee of
+future allocation or a claim about fragmentation. Uncertainty must retain the
+actual lease under an independently supervised recovery process; this module
+cannot do that on its own. No production or live behavior is qualified.
