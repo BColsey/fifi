@@ -30,3 +30,32 @@ measured isolated workloads.
 
 The unit tests inject fake operations and failures. They verify sequencing and
 lease-retention decisions only; they are not service, GPU, or end-to-end tests.
+
+## Host components under development
+
+The gate checks a held lease and sealed, digest-pinned companion image, waits
+for an explicit parent pipe signal before exec, and rechecks the lease and
+image. It accepts typed bounded options and a private task-owned output root;
+it does not accept key, model, endpoint, lease-descriptor, or prompt overrides.
+The gate itself is pinned and sealed. The parent still must attest its scope,
+PID/start time, inherited descriptors and waiting state before signalling.
+
+The adapter currently accepts only an explicitly designated test backend.
+There is no real pair stop/restore, client ownership or request-drain backend,
+and no runnable supervisor entry point. A fake backend is not a security
+boundary or live attestation. In particular, an inconclusive core result must
+not let a real supervisor exit and close its lease without verified recovery.
+
+The pair request-window helper records monotonic nanoseconds around a completed
+request and requires exact synthetic response, expected token count, fixed
+payload digest and explicit zero reuse. A caller must ensure the provided send
+function actually sends the supplied immutable bytes and bind the producer,
+boot, clock, scopes and artifacts. Client-observed request windows may overlap
+while HTTP transfer or GPU activity does not. The companion uses nonce prompts,
+so its response hashes do not establish matched inputs or outputs. The
+separate reviewed overlap validator remains external to this prototype.
+
+System Python `/usr/bin/python3` is needed on this host for memfd sealing;
+the default Conda interpreter does not expose `os.memfd_create`. No adapter
+component should be used against a live service until the missing backend,
+provenance, drain, error/interrupt recovery and independent review are complete.
