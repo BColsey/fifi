@@ -1,0 +1,36 @@
+{
+  "description": "Failed initial P2P staged-attention smoke on local-main integration. This is failure evidence, not a speedup or qualification result.",
+  "tested_commit": "c01bfb61a695b6580a11281511a2e6d4016b002a",
+  "source_url": "https://github.com/BColsey/fifi/commit/c01bfb61a695b6580a11281511a2e6d4016b002a",
+  "base_commit": "ef3e3df888d67b408d0e86be4c11aa473112dc27",
+  "public_draft_code_parent": "9c13ea59167541ac1e17425fc4e76042238d4c21",
+  "device_order": [
+    "RTX 3060 12 GB",
+    "RTX 3080 10 GB"
+  ],
+  "architecture": "sm86",
+  "test_binary_sha256": "5c5fe383cd7db226624cb30862ac579f80df65677c3f73c38d23f4cc681b716d",
+  "test": "family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers",
+  "test_fixture": {
+    "context_capacity_tokens": 256,
+    "chunk_rows": 8,
+    "kv_mode": "Int8G32",
+    "stage_rows_per_card": 256
+  },
+  "result": "failed: CUDA launch invalid argument after both staging buffers were admitted; the failing stage was not identified",
+  "test_log_sha256": "0685cda71b1ed5dc02573fbce56a7054056a69229627dde006bdc25cd32ac8d9",
+  "test_log_utf8": "\nrunning 1 test\ntest family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers ... CUDA devices visible: 2\nq36 cuda: card 0 KV8 staging: 256 rows, 262144 bytes\nq36 cuda: card 1 KV8 staging: 256 rows, 262144 bytes\ngdn_delta qualification partitioned=false\nCUDA FIRST ERROR: invalid argument (code 1) at stage launch\n\nthread 'family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers' (3465977) panicked at src/family/qwen36/cuda/card_chunk_device_tests.rs:141:33:\ncard_chunk_matches_the_per_token_path: the chunk run refused: Backend { operation: \"cuda launch\", message: \"invalid argument (status 1)\" }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    family::qwen36::cuda::card_chunk_device_tests::card_chunk_matches_the_per_token_path_on_physical_peers\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5919 filtered out; finished in 11.27s\n\n",
+  "guard_log_sha256": "27293f78afdbfcf19e52b6c194b34a11174d19533c298b8152686f9234e14cc0",
+  "guard_samples": 10,
+  "all_guard_samples_clear": true,
+  "guard_limit": "Periodic samples do not establish uninterrupted isolation.",
+  "restore": {
+    "restored": true,
+    "reason": "original pair service ready"
+  },
+  "limits": [
+    "The tested integration differs from the public-base draft.",
+    "No performance, long-context, model-quality, or production-qualification claim.",
+    "The P2P path remains default-off."
+  ]
+}
