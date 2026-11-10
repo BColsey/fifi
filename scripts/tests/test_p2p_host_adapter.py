@@ -41,6 +41,8 @@ class FakeBackend:
         self.pin_gate = True
         self.clean_client = True
         self.saw_gate_eof = False
+        self.fail_pair_after_spawn = False
+        self.fail_client_after_spawn = False
 
     def snapshot_pair_and_admit(self):
         self.events.append("admit")
@@ -60,6 +62,8 @@ class FakeBackend:
 
     def start_pair_scope(self, _lease_fd):
         self.events.append("start-pair")
+        if self.fail_pair_after_spawn:
+            raise RuntimeError("injected partial pair start")
         return "pair-scope"
 
     def verify_pair_scope(self, _scope):
@@ -68,6 +72,8 @@ class FakeBackend:
     def start_gated_companion(self, read_fd, _lease_fd, _program_fd, _gate_fd):
         self.gate_read = os.dup(read_fd)
         self.events.append("start-gate")
+        if self.fail_client_after_spawn:
+            raise RuntimeError("injected partial client start")
         return "gated-scope"
 
     def verify_gate_waiting(self, _scope, _lease_fd, _program_fd, _gate_fd):
@@ -154,6 +160,25 @@ class HostAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, "inconclusive")
         self.assertNotIn("restore-pair", backend.events)
         self.assertTrue(lease.held)
+
+    def test_partial_spawn_without_handle_never_releases_lease(self):
+        for side in ("pair", "client"):
+            backend, lease = FakeBackend(), FakeLease()
+            setattr(backend, f"fail_{side}_after_spawn", True)
+            adapter = HostAdapter(backend, lease)
+            try:
+                result = run(adapter, concurrent=True)
+                self.assertEqual(result.status, "inconclusive")
+                self.assertTrue(lease.held)
+                self.assertNotIn("restore-pair", backend.events)
+                self.assertNotIn("verify-exec", backend.events)
+            finally:
+                if backend.gate_read is not None:
+                    os.close(backend.gate_read)
+                for name in ("program_fd", "gate_fd"):
+                    fd = getattr(adapter, name)
+                    if fd is not None:
+                        os.close(fd)
 
     def test_invalid_or_multiple_gpu_owners_are_refused(self):
         backend, lease = FakeBackend(), FakeLease()

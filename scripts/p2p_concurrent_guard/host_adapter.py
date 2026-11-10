@@ -70,6 +70,8 @@ class HostAdapter:
         self.secondary = None
         self.client = None
         self.pair = None
+        self.client_spawn_attempted = False
+        self.pair_spawn_attempted = False
         self.program_fd = self.gate_fd = self.write_fd = None
 
     def acquire(self):
@@ -102,6 +104,7 @@ class HostAdapter:
             raise RuntimeError("pair stop not verified")
 
     def start_pair_scope(self):
+        self.pair_spawn_attempted = True
         self.pair = self.backend.start_pair_scope(self.lease.fd)
         if self.backend.verify_pair_scope(self.pair) is not True:
             raise RuntimeError("pair scope not attested")
@@ -113,6 +116,7 @@ class HostAdapter:
         self.gate_fd = sealed_gate(GATE)
         read_fd, self.write_fd = os.pipe2(os.O_CLOEXEC)
         try:
+            self.client_spawn_attempted = True
             self.client = self.backend.start_gated_companion(
                 read_fd, self.lease.fd, self.program_fd, self.gate_fd
             )
@@ -147,10 +151,16 @@ class HostAdapter:
         if self.write_fd is not None:
             os.close(self.write_fd)
             self.write_fd = None
+        if self.client is None:
+            # A launch can partially succeed before returning its handle. Until
+            # independently recoverable, do not pretend an unknown scope is empty.
+            return not self.client_spawn_attempted
         # Forced termination or unverified server-side drain must return False.
         return self.backend.drain_client_scope(self.client) is True
 
     def drain_pair_scope(self):
+        if self.pair is None:
+            return not self.pair_spawn_attempted
         return self.backend.drain_pair_scope(self.pair) is True
 
     def restore_pair(self):
