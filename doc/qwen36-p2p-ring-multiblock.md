@@ -36,3 +36,11 @@ contains per-sample rates, exact build and device identities, peer correctness
 checks, an instrumented launch-grid observation, and restoration receipts. It is
 a short synthetic observation, not a 128k/256k coding or recall qualification;
 prefix reuse was disabled. The switch remains off by default.
+
+A separate cold-recall run with the same experimental setting completed at
+8,312, 32,882 and 131,194 server-counted prompt tokens. All three markers were
+recalled at each length; the 131,194-token case reached 493.27 tokens/s to the
+first batch. The [recall receipt](../scripts/benchmarks/qwen36-p2p-ring-long-recall.json)
+records the device guard, source identities and individual results. Each length
+was tested once with a synthetic prompt; this does not qualify multi-turn coding,
+prefix reuse or the full 256k context.
