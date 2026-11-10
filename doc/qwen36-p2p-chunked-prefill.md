@@ -5,6 +5,11 @@ for batching prompt processing across the P2P cards. Unset or zero uses the
 existing per-token path. A positive row count is capped by the peer ring's
 maximum payload. A malformed setting is rejected at startup.
 
+The FP32 peer payload limit permits up to 1,024 rows at hidden width 2,048.
+This larger chunk is experimental and can require more VRAM; use 512 rows
+to return to the earlier limit. FP16 ring exchanges retain their previous
+payload limit.
+
 The chunk path is not qualified for production use. Its arena is admitted
 only when each card can retain the configured free-VRAM floor; a failed
 allocation or construction falls back to the eager path. Prefix reuse is
