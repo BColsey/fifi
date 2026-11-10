@@ -204,6 +204,8 @@ def execute(gate_fd, lease_fd, program_fd, options, *, timeout=30):
     verify_program(program_fd)
     wait_for_parent(gate_fd, timeout)
     os.close(gate_fd)
+    if options.arguments() != companion_args:
+        raise ValueError("companion options changed while awaiting release")
     verify_lock(lease_fd)
     verify_program(program_fd)
     os.set_inheritable(lease_fd, True)

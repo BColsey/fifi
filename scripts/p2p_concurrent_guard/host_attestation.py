@@ -15,7 +15,7 @@ import stat
 
 # The integer-clock companion revision independently reviewed by its owner.
 COMPANION_SHA256 = "5c599696a6ad1a0b7ba3228b992fa57cb15ad9f55bb02036ca194ecf826abfbf"
-GATE_SHA256 = "8d69e61b2097cf6c2aab566776677e2cc9bd21f9b77766f7e59f58288ee2f17d"
+GATE_SHA256 = "be999a297821f72a5c3019da3cb457991d9da0a8cf873823c667399368be7e9e"
 MAX_COMPANION_BYTES = 1 << 20
 
 
