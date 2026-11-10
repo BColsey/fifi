@@ -23,8 +23,8 @@ use crate::family::qwen36::tiered::host::{BankDevice, ChunkColdStage, HostError,
 use crate::family::qwen36::tiered::locator::ExpertRanges;
 use crate::family::qwen36::tiered::report::TokenReport;
 use crate::kernels::cuda::{
-    CudaContext, DeviceBuffer, DeviceEvent, DeviceStream, ExpertBank, ExpertBankGeometry,
-    NativeWeight, PinnedBuf,
+    CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream, ExpertBank,
+    ExpertBankGeometry, NativeWeight, PinnedBuf,
 };
 
 /// The cold staging bank of the chunked tiered prefill: ONE zero-initialised
@@ -275,6 +275,50 @@ pub(super) struct TieredRuntime<'w> {
     slot_count: usize,
     /// The host waits of the token so far: the layers' and, after `end_token`, the bank fills'.
     syncs: HostSyncs,
+    /// Reusable buffers of the chunk route readback and the pool-partial add. A fresh
+    /// 15.85 MB pinned allocation (cudaHostAlloc + full memset) whose drop runs a
+    /// device-wide synchronize, per layer, measured 5-27 ms/layer at m up to 2,048
+    /// (the round-2 panel); these grow only when the piece's m grows.
+    route: RouteScratch,
+}
+
+/// The layout of one layer's route readback inside [`RouteScratch::pinned`].
+#[derive(Clone, Copy)]
+pub(super) struct RouteLayout {
+    pub(super) ids_bytes: usize,
+    pub(super) weights_bytes: usize,
+    pub(super) total: usize,
+}
+
+/// Persistent pinned/device buffers of the chunk route readback and the overflow
+/// partial upload (grow-only in `m`; a few tens of MiB, below any admission ledger).
+pub(super) struct RouteScratch {
+    pinned: Option<PinnedBuf>,
+    event: Option<DeviceEvent>,
+    cap: usize,
+    partial: Option<PinnedBuf>,
+    partial_event: Option<DeviceEvent>,
+    partial_cap: usize,
+    partial_bytes: Vec<u8>,
+    partial_dst: Option<DeviceBuffer>,
+    /// The hidden block's f32 staging, grown with m and refilled per layer.
+    hidden_f32: Vec<f32>,
+}
+
+impl Default for RouteScratch {
+    fn default() -> Self {
+        Self {
+            pinned: None,
+            event: None,
+            partial: None,
+            partial_event: None,
+            cap: 0,
+            partial_cap: 0,
+            partial_bytes: Vec::new(),
+            partial_dst: None,
+            hidden_f32: Vec::new(),
+        }
+    }
 }
 
 impl<'w> TieredRuntime<'w> {
@@ -301,6 +345,7 @@ impl<'w> TieredRuntime<'w> {
             cold,
             slot_count,
             syncs: HostSyncs::default(),
+            route: RouteScratch::default(),
         })
     }
 
@@ -362,6 +407,210 @@ impl<'w> TieredRuntime<'w> {
         crate::family::qwen36::tiered::host::HostError,
     > {
         self.host.start_chunk_pool(layer, misses, block, m)
+    }
+
+    /// Enqueues the batched route readback (ids, weights, normed rows) into the
+    /// REUSABLE pinned buffer, growing it only when the piece's `m` grows.
+    pub(super) fn route_enqueue(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        ids: DeviceRange<'_>,
+        weights: DeviceRange<'_>,
+        x2: DeviceRange<'_>,
+        m: usize,
+        top_k: usize,
+        hidden: usize,
+    ) -> Result<RouteLayout, EngError> {
+        let layout = RouteLayout {
+            ids_bytes: m * top_k * 4,
+            weights_bytes: m * top_k * 4,
+            total: m * (2 * top_k + hidden) * 4,
+        };
+        if self.route.cap < layout.total {
+            self.route.pinned = Some(ctx.pinned_buf(layout.total)?);
+            self.route.cap = layout.total;
+        }
+        let pinned = self
+            .route
+            .pinned
+            .as_mut()
+            .expect("the route buffer was just grown");
+        ctx.copy_to_pinned(stream, ids, pinned, 0)?;
+        ctx.copy_to_pinned(stream, weights, pinned, layout.ids_bytes)?;
+        // The normed row the CPU experts read: the router's x2 (the post-norm hidden).
+        ctx.copy_to_pinned(stream, x2, pinned, layout.ids_bytes + layout.weights_bytes)?;
+        let event = match &self.route.event {
+            Some(event) => event,
+            None => {
+                self.route.event = Some(ctx.event()?);
+                self.route.event.as_ref().expect("just created")
+            }
+        };
+        stream.record(event)?;
+        Ok(layout)
+    }
+
+    /// Waits the readback and parses ONLY the ids and weights (the hidden block stays
+    /// in pinned memory — the pool reads it through [`Self::pool_dispatch`]).
+    pub(super) fn route_finish(
+        &mut self,
+        layout: RouteLayout,
+    ) -> Result<(Vec<i32>, Vec<f32>), EngError> {
+        let route = &mut self.route;
+        let (pinned, event) = (
+            route.pinned.as_mut().expect("route_enqueue ran first"),
+            route.event.as_ref().expect("route_enqueue ran first"),
+        );
+        pinned.wait(event)?;
+        let mut raw = vec![0u8; layout.ids_bytes + layout.weights_bytes];
+        pinned.read(0, &mut raw)?;
+        let floats = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect()
+        };
+        let ints = |bytes: &[u8]| -> Vec<i32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| i32::from_le_bytes(*w))
+                .collect()
+        };
+        Ok((
+            ints(&raw[..layout.ids_bytes]),
+            floats(&raw[layout.ids_bytes..]),
+        ))
+    }
+
+    /// Dispatches the overflow pool jobs with the hidden block read out of the pinned
+    /// route buffer through the word-wide `read_f32` (the per-byte read plus per-value
+    /// f32 conversion of 3.9 M values measured 4-15 ms/layer at m 1,922 — the round-2
+    /// panel's MoeStart decomposition). Skips the read entirely when there is no
+    /// overflow (the pool is hidden's only consumer).
+    pub(super) fn pool_dispatch(
+        &mut self,
+        layer: usize,
+        misses: &[crate::family::qwen36::tiered::host::ChunkMissGroup],
+        layout: RouteLayout,
+        m: usize,
+    ) -> Result<Option<crate::family::qwen36::tiered::cpu_pool::PendingChunk>, EngError> {
+        let values = (layout.total - layout.ids_bytes - layout.weights_bytes) / 4;
+        let block: &[f32] = if misses.is_empty() {
+            &[]
+        } else {
+            let route = &mut self.route;
+            route.hidden_f32.resize(values, 0.0);
+            let (pinned, event) = (
+                route.pinned.as_mut().expect("route_enqueue ran first"),
+                route.event.as_ref().expect("route_enqueue ran first"),
+            );
+            pinned.wait(event)?;
+            pinned.read_f32(
+                layout.ids_bytes + layout.weights_bytes,
+                &mut route.hidden_f32,
+            )?;
+            &route.hidden_f32
+        };
+        self.host
+            .start_chunk_pool(layer, misses, block, m)
+            .map_err(|e| EngError::Backend {
+                operation: "tiered_chunk_pool",
+                message: e.to_string(),
+            })
+    }
+
+    /// Uploads the pool partial through the REUSED pinned staging and device buffer
+    /// and adds it in place (1.0 * partial, top_k 1) — the pageable `ctx.upload` per
+    /// layer (fresh device alloc + 15.7 MB pageable copy + device free) was the
+    /// MoeCombine interval's growth to 14.8 ms/layer at m 1,922.
+    pub(super) fn add_pool_partial(
+        &mut self,
+        ctx: &CudaContext,
+        stream: &DeviceStream,
+        res: DeviceRange<'_>,
+        partial: &[f32],
+        m: usize,
+        hidden: usize,
+    ) -> Result<(), EngError> {
+        let bytes = m * hidden * 4;
+        self.route.partial_bytes.clear();
+        self.route.partial_bytes.reserve(bytes);
+        for value in partial {
+            self.route
+                .partial_bytes
+                .extend_from_slice(&value.to_le_bytes());
+        }
+        if self.route.partial_cap < bytes {
+            self.route.partial = Some(ctx.pinned_buf(bytes)?);
+            self.route.partial_cap = bytes;
+            self.route.partial_dst = None;
+        }
+        {
+            let route = &mut self.route;
+            let event = route.partial_event.as_ref();
+            let pinned = route.partial.as_mut().expect("just grown");
+            // A no-op when no copy is outstanding; clears the write refusal otherwise.
+            if let Some(event) = event {
+                pinned.wait(event)?;
+            }
+            pinned.write(0, &route.partial_bytes)?;
+        }
+        // The destination grows only with m; the first copy allocates it.
+        if self
+            .route
+            .partial_dst
+            .as_ref()
+            .is_none_or(|dst| dst.bytes() < bytes)
+        {
+            self.route.partial_dst = Some(ctx.upload(&self.route.partial_bytes)?);
+        } else {
+            let dst_range = self
+                .route
+                .partial_dst
+                .as_ref()
+                .expect("checked above")
+                .range(0, bytes)?;
+            let pinned = self.route.partial.as_mut().expect("grown above");
+            ctx.copy_from_pinned(stream, pinned, 0, dst_range)?;
+            let event = match &self.route.partial_event {
+                Some(event) => event,
+                None => {
+                    self.route.partial_event = Some(ctx.event()?);
+                    self.route.partial_event.as_ref().expect("just created")
+                }
+            };
+            stream.record(event)?;
+        }
+        let ones: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3f].repeat(m); // 1.0f32 LE
+        let ones_buf = ctx.upload(&ones)?;
+        let down = self
+            .route
+            .partial_dst
+            .as_ref()
+            .expect("grown above")
+            .range(0, bytes)?;
+        ctx.moe_combine(
+            stream,
+            crate::kernels::cuda::resident::moe_combine::CombineCall {
+                shape: crate::kernels::cuda::resident::moe_combine::CombineShape {
+                    m,
+                    n: hidden,
+                    top_k: 1,
+                    ld_down: hidden,
+                },
+                res,
+                down,
+                weights: ones_buf.range(0, ones.len())?,
+                shared: None,
+                out: crate::kernels::cuda::resident::moe_combine::CombineOut::InPlace,
+            },
+        )?;
+        Ok(())
     }
 
     /// The M-row classification delegate: the chunk arm's route readback flows through
