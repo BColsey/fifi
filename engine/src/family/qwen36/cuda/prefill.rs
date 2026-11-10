@@ -3313,6 +3313,7 @@ pub(super) fn run_chunk_layer(
     // An EXL3 chunk reads the F32 rows in place: it has no quantize stages.
     let exl3 = run.model.weights.is_exl3();
     for stage in layer_stages(slot.kind)? {
+        let stage_t0 = std::time::Instant::now();
         match stage {
             Stage::NormA => norm_a(run, &ctx)?,
             Stage::QuantA | Stage::QuantDOut | Stage::QuantAOut if exl3 => {}
@@ -3350,6 +3351,12 @@ pub(super) fn run_chunk_layer(
                 }
                 chunk_moe(run, &ctx)?
             }
+        }
+        if tiered_trace() {
+            eprintln!(
+                "chunk-stage L{layer} {stage:?}: {:.2} ms",
+                stage_t0.elapsed().as_secs_f64() * 1e3
+            );
         }
         exl3::split::mark_stage(launch.stream, stage);
     }

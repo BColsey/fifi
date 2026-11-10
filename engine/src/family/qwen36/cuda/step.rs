@@ -1599,6 +1599,7 @@ impl<'a> QwenResidentStep<'a> {
         };
         let segmented_parts = body().inspect_err(|_| state.poison())?;
         prefill_report.note_segmented_parts(segmented_parts);
+        let t_status = std::time::Instant::now();
         let status = state
             .read_prefill_status(stream)
             .inspect_err(|_| state.poison())?;
@@ -1610,9 +1611,18 @@ impl<'a> QwenResidentStep<'a> {
             ns,
             status,
         });
+        let t_reval = std::time::Instant::now();
         state
             .revalidate(stream, p0 + m, status)
             .inspect_err(|_| state.poison())?;
+        if std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1") {
+            eprintln!(
+                "chunk-close p0={p0} m={m}: body {:.0} ms, status-read {:.0} ms, revalidate {:.0} ms",
+                t_status.duration_since(opened).as_secs_f64() * 1e3,
+                t_reval.duration_since(t_status).as_secs_f64() * 1e3,
+                t_reval.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         // R3: the chunk committed [p0, p0 + m) and its sketch cells are queued; the
         // selection-eligible prefix grows with it, but only when this chunk continues
         // it exactly (interrupted or gapped prefill keeps the smaller prefix).
