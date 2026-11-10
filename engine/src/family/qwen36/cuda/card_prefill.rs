@@ -631,6 +631,11 @@ fn run_card_chunk_layer(
                         Stage::QuantAOut => quant_a_out(&runs[card], &ctx)?,
                         Stage::AttnOut => attn_out(&runs[card], &ctx)?,
                         Stage::NormF | Stage::Route | Stage::Moe => unreachable!("handled above"),
+                        timing => {
+                            return Err(EngError::BadRequest(format!(
+                                "card chunk: {timing:?} is a timing label, not a runnable stage"
+                            )));
+                        }
                     }
                 }
             }
