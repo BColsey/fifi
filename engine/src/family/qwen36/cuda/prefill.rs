@@ -11,6 +11,7 @@
 //! stream. The body also calls [`super::state::ResidentState::check_chunk`].
 
 use super::{
+    card_expert_timing::RoutedTiming,
     dims::{KvMode, StepDims},
     exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
@@ -2477,7 +2478,7 @@ pub(super) fn run_chunk_moe(
 
 /// Per-stage chunk trace prints, on only with Q36_TIERED_TRACE=1 (production logs stay
 /// quiet; the diagnostics earned their keep during bring-up).
-fn tiered_trace() -> bool {
+pub(super) fn tiered_trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var_os("Q36_TIERED_TRACE").is_some_and(|v| v == "1"))
 }
@@ -3120,6 +3121,15 @@ pub(super) fn run_chunk_routed(
     mw: &MoeLayerWeights<'_>,
     io: &MoeChunkIo<'_>,
 ) -> Result<(), EngError> {
+    run_chunk_routed_timed(launch, mw, io, None)
+}
+
+pub(super) fn run_chunk_routed_timed(
+    launch: &Launch<'_>,
+    mw: &MoeLayerWeights<'_>,
+    io: &MoeChunkIo<'_>,
+    mut timing: Option<&mut RoutedTiming>,
+) -> Result<(), EngError> {
     let (ctx, stream, m, dims, d) = (launch.ctx, launch.stream, io.m, &io.dims, io.scratch);
     // 11, the ids guard and builder.
     let ids = ctx.mmq_build_ids(
@@ -3154,25 +3164,35 @@ pub(super) fn run_chunk_routed(
     let gu = d.get(ChunkSlot::Gu)?;
     let (up_off, up_len) = routed_up_view(gu.bytes(), dims)?;
     let up_dst = gu.buffer().range(gu.offset() + up_off, up_len)?;
-    let launch_mmid =
-        |weight: &NativeWeight, y: DeviceRange<'_>, ld: usize, dst: DeviceRange<'_>| {
-            let n = weight.n_rows() / weight.experts().unwrap_or(1);
-            ctx.mmq_mmid_launch(
-                stream,
-                MmidLaunchCall {
-                    shape: ids.shape(),
-                    weight: routed_weight(weight, dims, weight.k(), n)?,
-                    ids: &ids,
-                    y,
-                    dst,
-                    ld,
-                    fixup: d.get(ChunkSlot::Fixup)?,
-                },
-            )
-        };
+    let mut launch_mmid = |index: usize,
+                           weight: &NativeWeight,
+                           y: DeviceRange<'_>,
+                           ld: usize,
+                           dst: DeviceRange<'_>| {
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.start(index, weight, stream)?;
+        }
+        let n = weight.n_rows() / weight.experts().unwrap_or(1);
+        ctx.mmq_mmid_launch(
+            stream,
+            MmidLaunchCall {
+                shape: ids.shape(),
+                weight: routed_weight(weight, dims, weight.k(), n)?,
+                ids: &ids,
+                y,
+                dst,
+                ld,
+                fixup: d.get(ChunkSlot::Fixup)?,
+            },
+        )?;
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.finish(index, stream)?;
+        }
+        Ok::<(), EngError>(())
+    };
     let q8s = d.get(ChunkSlot::Q8S)?;
-    launch_mmid(gate, q8s, 2 * dims.inter, gu)?;
-    launch_mmid(native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
+    launch_mmid(0, gate, q8s, 2 * dims.inter, gu)?;
+    launch_mmid(1, native_stack(&mw.up)?, q8s, 2 * dims.inter, up_dst)?;
     // 14-16, the SwiGLU, the gather quantize and the down launch.
     if tiered_trace() {
         eprintln!("tiered-chunk: launching swiglu");
@@ -3199,6 +3219,7 @@ pub(super) fn run_chunk_routed(
         },
     )?;
     launch_mmid(
+        2,
         down,
         d.get(ChunkSlot::Q8Act)?,
         dims.hidden,

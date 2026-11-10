@@ -21,6 +21,7 @@ mod card_block;
 mod card_block_device_tests;
 #[cfg(test)]
 mod card_chunk_device_tests;
+mod card_expert_timing;
 mod card_load;
 #[cfg(test)]
 mod card_load_tests;
