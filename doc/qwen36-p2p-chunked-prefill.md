@@ -107,6 +107,12 @@ used 66 MiB more per card; minimum sampled free VRAM was 1,302 MiB.
 
 The [measurement record](../scripts/benchmarks/qwen36-p2p-chunk1024-results.json)
 contains per-sample results, exact build and test identities, the wide-ring and
-chunk-parity checks, and restoration receipts. It covers short synthetic
-prompts, not 128k/256k behavior or coding quality. The chunk and multi-block
-ring paths remain experimental and off by default.
+chunk-parity checks, and restoration receipts. A separate
+[long-context record](../scripts/benchmarks/qwen36-p2p-chunk1024-long-recall.json)
+shows one cold synthetic recall request at 131,195 prompt tokens with all
+three markers correct and 831.52 tokens/s to the first emitted batch. The
+subsequent near-256k request was interrupted when the separate 2080 service
+restarted; it has no completion result. The pair service was restored.
+Neither short synthetic prompts nor a single recall test qualify coding
+quality. The chunk and multi-block ring paths remain experimental and off
+by default.
