@@ -453,8 +453,12 @@ pub(crate) fn run_card_chunk(
     let status: Vec<_> = (0..cards)
         .map(|card| states[card].word(Word::PrefillStatus))
         .collect::<Result<_, EngError>>()?;
+    #[cfg(test)]
+    eprintln!("P2P_DIAG operation=embed");
     chunk_embed(&launches[0], &runs[0], status[0])?;
     if cards > 1 {
+        #[cfg(test)]
+        eprintln!("P2P_DIAG operation=embed_broadcast");
         let src = views[0].get(ChunkSlot::Hidden)?;
         let outs: Vec<_> = (0..cards)
             .map(|card| views[card].get(ChunkSlot::Hidden))
@@ -539,6 +543,8 @@ fn run_card_chunk_layer(
                 // The mixer output exchange precedes the norm that reads it.
                 exchange_slot(stack, views, status, ChunkSlot::Delta, m * hidden)?;
                 for card in 0..cards {
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage=NormF card={card}");
                     let ctx = layer_ctx(launches, chunk, status, card, layer, kind, ordinal)?;
                     norm_f(&runs[card], &ctx)?;
                 }
@@ -554,6 +560,8 @@ fn run_card_chunk_layer(
                     ChunkSlot::TopkWeight,
                     ChunkSlot::SharedGate,
                 ] {
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage=Route slot={slot:?}");
                     let src = views[0].get(slot)?;
                     let outs: Vec<_> = (0..cards)
                         .map(|card| views[card].get(slot))
@@ -583,6 +591,8 @@ fn run_card_chunk_layer(
                     #[cfg(test)]
                     eprintln!("P2P_DIAG layer={layer} stage=Moe card={card} part=routed");
                     run_chunk_routed(&launches[card], &chunk.cards[card].moe[layer], &io)?;
+                    #[cfg(test)]
+                    eprintln!("P2P_DIAG layer={layer} stage=Moe card={card} part=combine");
                     if card == 0 {
                         combine_chunk_moe(&launches[card], &io)?;
                     } else {

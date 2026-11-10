@@ -2177,6 +2177,8 @@ pub(super) fn attn_flash(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resu
                 return attn_flash_segmented(run, ctx, staging);
             }
         }
+        #[cfg(test)]
+        eprintln!("P2P_DIAG q8_tiled_attention");
         return attn_flash_kv8(run, ctx);
     }
     attn_flash_fp16(
