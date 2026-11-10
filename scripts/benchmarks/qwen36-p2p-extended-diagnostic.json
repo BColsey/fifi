@@ -17,7 +17,7 @@
     "chunk_rows": 96,
     "kv_mode": "Int8G32"
   },
-  "method": "Each case ran in a separate process from the same test executable with FIFI_CUDA_ATTN_PREFILL_ADAPT=1 and --ignored --exact --test-threads=1 --nocapture. Chunk results were compared against per-token results.",
+  "method": "Each case ran in a separate process from the same test executable with FIFI_CUDA_ATTN_PREFILL_ADAPT=1 and --ignored --exact --test-threads=1 --nocapture. The fixture compares the final-token greedy winner and best/runner-up logits against a repeated per-token control, for one chunk and for two chunks plus an eager tail.",
   "outcomes": [
     {
       "case": "large_staged_on",
@@ -67,6 +67,7 @@
     "Synthetic two-layer rig with a 256-token capacity; neither 128k/256k context nor a served model was tested.",
     "The 32-row stage with a 96-row chunk selects segmented attention by source control flow; no device dispatch trace was collected.",
     "These results apply only to the exact diagnostic source and binary above, not to the public MR tip by itself.",
-    "No throughput measurement or production qualification was made."
+    "No throughput measurement or production qualification was made.",
+    "Intermediate chunk logits and the full final-token logit vector are not compared by this fixture."
   ]
 }
