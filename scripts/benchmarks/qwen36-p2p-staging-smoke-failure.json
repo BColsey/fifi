@@ -32,5 +32,46 @@
     "The tested integration differs from the public-base draft.",
     "No performance, long-context, model-quality, or production-qualification claim.",
     "The P2P path remains default-off."
+  ],
+  "device_uuids_in_order": [
+    "GPU-704fef60-5280-9b88-fa3d-d11135caf576",
+    "GPU-282e266a-24ac-6fa8-a16d-4281e52b4c0a"
+  ],
+  "host_checks": [
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_setting_is_explicit_and_bounded",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "96c014cf01099767a49b026b42506ad99853f7e39862dc3fc11bd3e8fe6b3d83"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::mailbox_covers_both_chunk_sums_and_eager_decode",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "427224585e7a4fde8c4e46d18ec372a4c9fcd83380ff31dacd6dcadf883a5cf7"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::chunk_admission_preserves_the_free_vram_floor",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "8dbcb4ee6173a4ed1743d9c10464bf104e975913ae82f1495cc93ed5c2b4b7c9"
+    },
+    {
+      "name": "family::qwen36::cuda::card_prefill::config_tests::card_staging_respects_shard_geometry_and_live_floor",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "42aa5d6ada431ab640e6e40ad1b298f1a45c5af96d65b1fbf81432d3afd0309c"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_chunk_arenas_are_narrower_and_complete",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "764877510ae92ed2fd5e5af784b3ef7db97634d0b8d0c568b2530b881082e4ef"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_plan::card_tests::card_combine_output_is_disjoint_from_its_inputs",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "7a5f66b890621d9467b29a37771dfde38cc8a33b0bcdff0f024f1c4dfba86995"
+    },
+    {
+      "name": "family::qwen36::cuda::prefill_tests::zero_row_is_optional_only_for_native_card_views",
+      "result": "1 passed; 0 failed; 0 ignored",
+      "log_sha256": "0082c53a6099bf75c43acb811d9dcb171fd376135d6a22dd339b4f6356d660f2"
+    }
   ]
 }
