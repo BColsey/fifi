@@ -293,6 +293,13 @@ impl CardSession {
         self.chunk = Some(chunk);
     }
 
+    /// The diagnostic rig can change the in-memory cache identity without
+    /// changing the production rule that disables reuse for card chunks.
+    #[cfg(test)]
+    pub(super) fn set_prefix_path_for_test(&mut self, path: CudaPrefillPath) {
+        self.prefix_path = path;
+    }
+
     #[cfg(test)]
     pub(super) fn set_sampler_vocab_for_test(&mut self, sampler_vocab: usize) {
         assert!((1..=self.vocab).contains(&sampler_vocab));
