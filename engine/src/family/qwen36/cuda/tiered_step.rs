@@ -505,11 +505,10 @@ impl<'w> TieredRuntime<'w> {
         } else {
             let route = &mut self.route;
             route.hidden_f32.resize(values, 0.0);
-            let (pinned, event) = (
-                route.pinned.as_mut().expect("route_enqueue ran first"),
-                route.event.as_ref().expect("route_enqueue ran first"),
-            );
-            pinned.wait(event)?;
+            let pinned = route.pinned.as_mut().expect("route_enqueue ran first");
+            // `route_finish` already waited the readback's event, which releases the
+            // buffer's pending copy — `read_f32` refuses only while one is outstanding
+            // (and `wait` refuses when none is).
             pinned.read_f32(
                 layout.ids_bytes + layout.weights_bytes,
                 &mut route.hidden_f32,
@@ -549,12 +548,16 @@ impl<'w> TieredRuntime<'w> {
             self.route.partial = Some(ctx.pinned_buf(bytes)?);
             self.route.partial_cap = bytes;
             self.route.partial_dst = None;
+            // A fresh buffer holds no outstanding copy; `wait` refuses without one.
+            self.route.partial_event = None;
         }
         {
             let route = &mut self.route;
             let event = route.partial_event.as_ref();
             let pinned = route.partial.as_mut().expect("just grown");
-            // A no-op when no copy is outstanding; clears the write refusal otherwise.
+            // Steady state: the previous layer's copy_from_pinned is the only
+            // outstanding transfer and this wait releases it (a no-op for the
+            // device — long complete — but it clears the write refusal).
             if let Some(event) = event {
                 pinned.wait(event)?;
             }
