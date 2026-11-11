@@ -11,11 +11,19 @@ from pathlib import Path
 import secrets
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+
+from scripts.tests.p2p_scope_helpers import (
+    group_populated,
+    scope_can_stop,
+    scope_state,
+    scope_terminated,
+)
 
 
 CHILD = r"""
@@ -54,13 +62,6 @@ finally:
 """
 
 
-def scope_drained(group):
-    try:
-        return "populated 0" in (group / "cgroup.events").read_text()
-    except FileNotFoundError:
-        return True
-
-
 @unittest.skipUnless(
     os.environ.get("FIFI_SCOPE_REAL_TEST") == "1",
     "explicit CPU-only systemd-scope integration test",
@@ -86,6 +87,7 @@ class ScopeFdTest(unittest.TestCase):
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             process = None
             group = None
+            invocation = None
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 expected = os.fstat(fd)
@@ -107,6 +109,7 @@ class ScopeFdTest(unittest.TestCase):
                     stderr=subprocess.PIPE,
                     text=True,
                     pass_fds=(fd,),
+                    start_new_session=True,
                 )
                 ready, _, _ = select.select([process.stdout], [], [], 10)
                 self.assertTrue(ready, "scope child did not report within deadline")
@@ -124,6 +127,13 @@ class ScopeFdTest(unittest.TestCase):
                 group = Path("/sys/fs/cgroup") / report["cgroups"][0].lstrip("/")
                 self.assertEqual(group.name, unit)
                 self.assertIn("populated 1", (group / "cgroup.events").read_text())
+                observed = scope_state(unit)
+                self.assertEqual(observed.get("Id"), unit)
+                self.assertEqual(observed.get("LoadState"), "loaded")
+                self.assertEqual(observed.get("ActiveState"), "active")
+                self.assertEqual(observed.get("ControlGroup"), report["cgroups"][0])
+                invocation = observed.get("InvocationID", "")
+                self.assertRegex(invocation, r"^[0-9a-f]{32}$")
 
                 contender = subprocess.run(
                     [sys.executable, "-c", CONTENDER, str(lock_path)],
@@ -139,9 +149,14 @@ class ScopeFdTest(unittest.TestCase):
                 _, stderr = process.communicate(timeout=10)
                 self.assertEqual(process.returncode, 0, stderr)
                 deadline = time.monotonic() + 5
-                while not scope_drained(group) and time.monotonic() < deadline:
+                while time.monotonic() < deadline:
+                    if scope_terminated(
+                        scope_state(unit), unit, invocation, group_populated(group)
+                    ):
+                        break
                     time.sleep(0.05)
-                self.assertTrue(scope_drained(group), "test scope did not drain")
+                else:
+                    self.fail("exact scope did not terminate within deadline")
 
                 # Once our only remaining owner closes, an independent process
                 # must be able to acquire the same temporary lock.
@@ -158,18 +173,31 @@ class ScopeFdTest(unittest.TestCase):
                 self.assertEqual(contender.stdout.strip(), "acquired")
             finally:
                 if process is not None and process.poll() is None:
-                    subprocess.run(
-                        ["systemctl", "--user", "stop", unit],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=5,
-                        check=False,
-                    )
                     try:
-                        process.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.communicate(timeout=5)
+                        current = scope_state(unit)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        current = {}
+                    if scope_can_stop(current, unit, invocation):
+                        subprocess.run(
+                            ["systemctl", "--user", "stop", unit],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            check=False,
+                        )
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.communicate(timeout=5)
                 if fd is not None:
                     os.close(fd)
 
