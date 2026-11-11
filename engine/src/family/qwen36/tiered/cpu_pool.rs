@@ -27,7 +27,9 @@ use crate::kernels::expert_cpu::{
     ExpertCpuError, ExpertScratch, ExpertShape, ExpertSlices, Q4K_BLOCK_BYTES, Q4K_BLOCK_VALUES,
     expert_forward,
 };
-use crate::kernels::expert_cpu_q8g::{ExpertScratchQ8g, expert_act_half_q8g, expert_forward_q8g};
+use crate::kernels::expert_cpu_q8g::{
+    ExpertScratchQ8g, expert_act_half_q8g, expert_down_half_q8g, expert_forward_q8g,
+};
 use crate::kernels::expert_cpu_q8k::{DotBackend, ExpertScratchQ8k, expert_forward_q8k};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +121,32 @@ impl Worker {
             )),
         }
     }
+
+    /// The split down pass of one half: Q8_G only, same refusal shape as the side.
+    fn compute_down_half(
+        &self,
+        shape: ExpertShape,
+        down: &[u8],
+        act: &[f32],
+        rows: Range<usize>,
+    ) -> Result<Vec<f32>, ExpertCpuError> {
+        match self {
+            Self::Q8g { backend, .. } => expert_down_half_q8g(
+                *backend,
+                shape,
+                &ExpertSlices {
+                    gate: &[],
+                    up: &[],
+                    down,
+                },
+                act,
+                rows,
+            ),
+            _ => Err(ExpertCpuError::BadShape(
+                "the split down pass runs on the Q8_G kernel only".to_owned(),
+            )),
+        }
+    }
 }
 
 /// Any shared, immutable region holding expert weight bytes (an mmap of the GGUF, a
@@ -161,6 +189,19 @@ pub struct SideJob {
     pub up: Range<usize>,
     /// The half-open `inter`-row range of this half.
     pub rows: Range<usize>,
+}
+
+/// One HALF of a decode expert's down pass (the second split round): the down
+/// slice offsets, the `hidden`-row range this half computes, and the assembled
+/// `act` the whole expert's halves produced. Two halves cover the output; each
+/// quantizes `act` itself (duplicated, ~µs).
+pub struct DownJob {
+    pub region: Arc<dyn MappedRegion>,
+    pub down: Range<usize>,
+    /// The half-open `hidden`-row range of this half.
+    pub rows: Range<usize>,
+    /// The assembled intermediate activations (`inter` long), shared by the halves.
+    pub act: Arc<[f32]>,
 }
 
 /// One DISTINCT missed expert of one chunk layer: the same three Q4_K slices as
@@ -228,6 +269,10 @@ enum JobOutcome {
 /// One split half-job as it travels to a worker: (index, side, shared row, sender).
 struct SideTaskItem(usize, SideJob, Arc<[f32]>, Sender<SideOutcome>);
 
+/// One down half-job as it travels to a worker: (index, job, sender) — the act
+/// rides in the job.
+struct DownTaskItem(usize, DownJob, Sender<SideOutcome>);
+
 enum SideOutcome {
     /// The swiglu'd `act` values of this half's row range, `rows.len()` long.
     Done(usize, Vec<f32>),
@@ -241,6 +286,7 @@ struct PoolQueue {
     jobs: VecDeque<TaskItem>,
     chunk_jobs: VecDeque<ChunkTaskItem>,
     side_jobs: VecDeque<SideTaskItem>,
+    down_jobs: VecDeque<DownTaskItem>,
     shutdown: bool,
 }
 
@@ -276,6 +322,9 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
                 }
                 if let Some(item) = queue.side_jobs.pop_front() {
                     break Some(WorkItem::Side(item));
+                }
+                if let Some(item) = queue.down_jobs.pop_front() {
+                    break Some(WorkItem::Down(item));
                 }
                 if queue.shutdown {
                     break None;
@@ -376,6 +425,29 @@ fn worker_loop(shared: Arc<PoolInner>, shape: ExpertShape, mut worker: Worker) {
                     }
                 }
             }
+            WorkItem::Down(item) => {
+                let (at, job, sender) = (item.0, item.1, item.2);
+                let bytes = job.region.bytes();
+                match catch_unwind(AssertUnwindSafe(|| {
+                    worker.compute_down_half(
+                        shape,
+                        &bytes[job.down.clone()],
+                        &job.act,
+                        job.rows.clone(),
+                    )
+                })) {
+                    Ok(Ok(rows)) => {
+                        let _ = sender.send(SideOutcome::Done(at, rows));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = sender.send(SideOutcome::Failed(at, error));
+                    }
+                    Err(_panic) => {
+                        let _ = sender.send(SideOutcome::Lost);
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -387,6 +459,7 @@ enum WorkItem {
     PerToken(TaskItem),
     Chunk(ChunkTaskItem),
     Side(SideTaskItem),
+    Down(DownTaskItem),
 }
 
 /// A run allocates no kernel scratch: each worker owns the scratch of the
@@ -704,6 +777,60 @@ impl CpuPool {
                 queue
                     .side_jobs
                     .push_back(SideTaskItem(index, job, Arc::clone(&x), tx.clone()));
+            }
+        }
+        self.shared.ready.notify_all();
+        Ok(Some(PendingSides { rx, count }))
+    }
+
+    /// The second split round: one down half-job per [`DownJob`] (each carries its
+    /// expert's assembled `act`), Q8_G pools only. `finish` returns the output row
+    /// halves in job order; the caller concatenates the halves of each expert.
+    pub fn start_down_layer(&self, jobs: Vec<DownJob>) -> Result<Option<PendingSides>, PoolError> {
+        if jobs.is_empty() {
+            return Ok(None);
+        }
+        if !matches!(self.kernel, ExpertKernel::Q8g(_)) {
+            return Err(PoolError::BadInput(format!(
+                "the split down pass needs the Q8_G kernel, the pool runs {:?}",
+                self.kernel
+            )));
+        }
+        let shape = self.shape;
+        let down_len =
+            shape.hidden.saturating_mul(shape.inter) / Q4K_BLOCK_VALUES * Q4K_BLOCK_BYTES;
+        for (j, job) in jobs.iter().enumerate() {
+            let bytes = job.region.bytes();
+            let (start, end) = (job.down.start, job.down.end);
+            if start > end || end > bytes.len() || end - start != down_len {
+                return Err(PoolError::BadInput(format!(
+                    "down job {j} range {start}..{end} is not a {down_len}-byte slice \
+                    inside the {} region bytes",
+                    bytes.len()
+                )));
+            }
+            if job.rows.start >= job.rows.end || job.rows.end > shape.hidden {
+                return Err(PoolError::BadInput(format!(
+                    "down job {j} rows {}..{} of {} hidden rows",
+                    job.rows.start, job.rows.end, shape.hidden
+                )));
+            }
+            if job.act.len() != shape.inter {
+                return Err(PoolError::BadInput(format!(
+                    "down job {j} act is {} long, the shape wants {}",
+                    job.act.len(),
+                    shape.inter
+                )));
+            }
+        }
+        let (tx, rx) = channel();
+        let count = jobs.len();
+        {
+            let mut queue = lock(&self.shared.queue);
+            for (index, job) in jobs.into_iter().enumerate() {
+                queue
+                    .down_jobs
+                    .push_back(DownTaskItem(index, job, tx.clone()));
             }
         }
         self.shared.ready.notify_all();
@@ -1643,5 +1770,42 @@ mod tests {
             split.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
         let _ = side; // the slice length is the same `side` the side jobs validated against
+
+        // The SECOND round: the down halves as pool jobs, the caller only assembles —
+        // bit-identical again (each half computes the same rows as `expert_down_q8g`).
+        use super::DownJob;
+        let mid_h = shape.hidden / 2;
+        let mut split2 = vec![0.0f32; shape.hidden];
+        let mut downs = Vec::with_capacity(jobs.len() * 2);
+        for (at, job) in jobs.iter().enumerate() {
+            let mut act = halves[2 * at].clone();
+            act.extend_from_slice(&halves[2 * at + 1]);
+            let act: Arc<[f32]> = Arc::from(act);
+            let half = |rows: std::ops::Range<usize>| DownJob {
+                region: job.region.clone(),
+                down: job.down.clone(),
+                rows,
+                act: Arc::clone(&act),
+            };
+            downs.push(half(0..mid_h));
+            downs.push(half(mid_h..shape.hidden));
+        }
+        let out_halves = pool
+            .start_down_layer(downs)
+            .unwrap()
+            .expect("six down halves")
+            .finish(LONG)
+            .unwrap();
+        for (at, job) in jobs.iter().enumerate() {
+            let mut out = out_halves[2 * at].clone();
+            out.extend_from_slice(&out_halves[2 * at + 1]);
+            for (s, &v) in split2.iter_mut().zip(out.iter()) {
+                *s += job.weight * v;
+            }
+        }
+        assert_eq!(
+            whole.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            split2.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     }
 }
