@@ -242,6 +242,13 @@ enum Message {
     Stop,
 }
 
+fn publish_job(queue: &SyncSender<Message>, message: Message) -> Result<(), SubmitError> {
+    queue.try_send(message).map_err(|error| match error {
+        TrySendError::Full(_) => SubmitError::QueueFull,
+        TrySendError::Disconnected(_) => SubmitError::Unavailable,
+    })
+}
+
 /// The portable, shareable front of one engine thread.
 #[derive(Clone)]
 pub(crate) struct EngineHandle {
@@ -277,13 +284,13 @@ impl EngineHandle {
     /// A job that a concurrent failure or stop catches in the queue can also end with a closed
     /// channel and no event. The owner then treats the closed channel as a `Backend` failure.
     pub(crate) fn try_submit(&self, job: Job) -> Result<(), SubmitError> {
-        self.try_submit_with(job, SyncSender::try_send)
+        self.try_submit_with(job, publish_job)
     }
 
     fn try_submit_with(
         &self,
         job: Job,
-        publish: impl FnOnce(&SyncSender<Message>, Message) -> Result<(), TrySendError<Message>>,
+        publish: impl FnOnce(&SyncSender<Message>, Message) -> Result<(), SubmitError>,
     ) -> Result<(), SubmitError> {
         if self.shared.stop.load(Ordering::SeqCst) {
             return Err(SubmitError::Unavailable);
@@ -295,10 +302,7 @@ impl EngineHandle {
             EngineState::Loading | EngineState::Ready | EngineState::Busy => {}
         }
         let ticket = QueueTicket::reserve(&self.shared);
-        publish(&self.queue, Message::Job(job, ticket)).map_err(|error| match error {
-            TrySendError::Full(_) => SubmitError::QueueFull,
-            TrySendError::Disconnected(_) => SubmitError::Unavailable,
-        })
+        publish(&self.queue, Message::Job(job, ticket))
     }
 
     /// Jobs waiting to be dequeued or currently attempting submission.
@@ -1708,7 +1712,7 @@ mod tests {
         handle
             .try_submit_with(job, |queue, message| {
                 assert_eq!(handle.queued(), 1, "reserve before publication");
-                queue.try_send(message)?;
+                super::publish_job(queue, message)?;
                 let super::Message::Job(_job, ticket) = receiver.try_recv().expect("job") else {
                     panic!("expected job");
                 };
@@ -1760,7 +1764,7 @@ mod tests {
                 // fail and finish draining before this publication succeeds.
                 handle.shared.set_state(EngineState::Error);
                 super::drain(&receiver, super::reject);
-                queue.try_send(message)
+                super::publish_job(queue, message)
             })
             .expect("late publish");
         assert_eq!(handle.queued(), 1);
