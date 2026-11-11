@@ -27,6 +27,7 @@
 
 use crate::EngError;
 use crate::family::qwen36::cuda::card_block::{run_card_block, run_card_moe_block};
+use crate::family::qwen36::cuda::card_router_trace::RouterTrace;
 use crate::family::qwen36::cuda::card_step::CardStack;
 use crate::family::qwen36::cuda::mixer::Mixers;
 use crate::family::qwen36::cuda::mixer_ops::CardOp;
@@ -214,6 +215,7 @@ pub(crate) fn run_card_token(
         stack.broadcast(0, view(0, Slot::ResidA)?, &outs, &ring_statuses, hidden)?;
     }
     // The layers: mixer block, then MoE block, residual flowing by parity.
+    let mut router_trace = RouterTrace::from_env(admit_pos);
     for (layer, &kind) in kinds.iter().enumerate() {
         let _ = kind;
         let resid: Vec<DeviceRange<'_>> = (0..cards)
@@ -235,7 +237,13 @@ pub(crate) fn run_card_token(
             .map(|card| moe_sequence_card(card == 0))
             .collect();
         let ops: Vec<&[CardMoeOp]> = lists.iter().map(|l| l.as_slice()).collect();
-        run_card_moe_block(stack, moe[layer], &sets, &ops)?;
+        run_card_moe_block(
+            stack,
+            moe[layer],
+            &sets,
+            &ops,
+            router_trace.as_mut().map(|trace| (trace, layer)),
+        )?;
     }
     // Prompt-only feeds can omit the unused vocabulary projection; state
     // advancement still runs. The next token id is always injected by the
