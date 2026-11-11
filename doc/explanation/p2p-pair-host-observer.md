@@ -47,3 +47,25 @@ used plus 1,024 MiB. This is a conservative sampled gate, not a guarantee of
 future allocation or a claim about fragmentation. Uncertainty must retain the
 actual lease under an independently supervised recovery process; this module
 cannot do that on its own. No production or live behavior is qualified.
+
+A separate ctypes NVML reader takes an already loaded library object and never
+loads the driver implicitly. It queries the two requested UUID handles and
+verifies the returned UUIDs, requires successful v3 compute, graphics and MPS
+process lists, and reads byte-valued memory totals/free/used. It rejects
+missing symbols, unsupported/permission errors, inconsistent memory, unstable
+or oversized process lists and aliased handles as inconclusive. There is no
+MPS-disabled fallback: unsupported MPS also fails closed. The optional pure
+headroom check requires a prior matching active pair and both later sampled
+GPUs to show no listed contexts and at least the configured 1-GiB restoration
+margin. The injected boot-ID reader must be trusted; its value is checked
+before and after sampling and bound to both compared samples. The supervisor
+must separately revalidate that the numeric PID has the pinned process start
+ticks and service identity before and after the sample; matching a PID alone
+does not establish process identity.
+
+The ctypes reader and helpers have been exercised **only against a fake Python
+library**. They have not loaded the real NVML library or queried any GPU; ABI,
+library provenance, platform support and actual integration remain unverified.
+The categories are sampled sequentially and cannot exclude contexts appearing
+between calls, unreported driver allocations, or same-user lock bypass. They do
+not establish an exclusive device reservation or guarantee later restoration.
