@@ -21,7 +21,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::cpu_pool::{CpuPool, MappedRegion, PendingLayer, PoolError};
+use super::cpu_pool::{
+    CpuPool, DownJob, ExpertJob, MappedRegion, PendingLayer, PendingSides, PoolError, SideJob,
+};
 use super::guess::{RecallMeter, RouterGuess};
 use super::locator::{ExpertLocator, ExpertRanges, LocatorError};
 use super::policy::{ExpertPolicy, Swap};
@@ -106,7 +108,26 @@ pub struct LayerPlanHost {
 
 struct InFlight {
     layer: usize,
-    jobs: Option<PendingLayer>,
+    jobs: Option<LayerJobs>,
+}
+
+/// The decode layer's pool run: whole experts one job each, or the split shape —
+/// the halves on the workers, the down pass on this thread at the join (the
+/// split-job lever; `Q36_TIERED_SPLIT_JOBS=1`).
+enum LayerJobs {
+    Whole(PendingLayer),
+    Split {
+        sides: PendingSides,
+        /// The expert each half-pair belongs to (down slice, weight, region).
+        experts: Vec<ExpertJob>,
+    },
+}
+
+/// The split-job lever's flag: halves on the workers, the down pass on the joining
+/// thread. Default off — the whole-expert path is the reviewed default.
+fn split_jobs() -> bool {
+    static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| std::env::var_os("Q36_TIERED_SPLIT_JOBS").is_some_and(|v| v == "1"))
 }
 
 /// A router weight in millionths for the weight-mass counters; a negative weight counts as zero.
@@ -242,6 +263,9 @@ pub struct TieredHost {
     meter: RecallMeter,
     /// The meter counts already reported, so a token report carries only its delta.
     meter_seen: (u64, u64),
+    /// The split down pass's quantized-act scratch, grown on first use (the
+    /// split-job lever; one `inter`-long Q8_G row, reused every layer).
+    down_qh: Option<crate::kernels::expert_cpu_q8g::Q8gRow>,
 }
 
 /// The ledger deadline of a synchronous fill: any later clock value expires it, which is how
@@ -303,6 +327,7 @@ impl TieredHost {
             arrived: None,
             meter: RecallMeter::default(),
             meter_seen: (0, 0),
+            down_qh: None,
         })
     }
 
@@ -383,10 +408,7 @@ impl TieredHost {
                 cpu_ppm += ppm;
             }
         }
-        let started = self
-            .pool
-            .start_layer(jobs, hidden)
-            .map_err(HostError::Pool)?;
+        let started = self.start_jobs(jobs, hidden).map_err(HostError::Pool)?;
         self.routes[layer] = ids
             .iter()
             .filter(|&&id| id >= 0)
@@ -684,11 +706,55 @@ impl TieredHost {
     /// Joins the CPU jobs of `layer` (at most the configured timeout) and returns the
     /// job-order partial sum, or `None` when no pick was served on the CPU. The layer is
     /// closed whatever the outcome, so a failed layer does not block the next one.
+    /// Dispatches the layer's misses: the split shape (two half-jobs per expert on
+    /// the workers, the down pass at the join) when the lever is on and the pool is
+    /// a Q8_G pool with a second worker to spare, else the whole-expert run. A
+    /// split refusal falls back to the whole run rather than failing the layer.
+    fn start_jobs(
+        &self,
+        jobs: Vec<ExpertJob>,
+        hidden: &[f32],
+    ) -> Result<Option<LayerJobs>, PoolError> {
+        let whole = |jobs: Vec<ExpertJob>, pool: &CpuPool| {
+            pool.start_layer(jobs, hidden)
+                .map(|p| p.map(LayerJobs::Whole))
+        };
+        let split = split_jobs()
+            && !jobs.is_empty()
+            && self.pool.threads() >= 2
+            && matches!(self.pool.kernel(), super::cpu_pool::ExpertKernel::Q8g(_));
+        if !split {
+            return whole(jobs, &self.pool);
+        }
+        let inter = self.pool.shape().inter;
+        let mid = inter / 2;
+        let mut sides = Vec::with_capacity(jobs.len() * 2);
+        let mut experts = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let side = |rows: std::ops::Range<usize>| SideJob {
+                region: std::sync::Arc::clone(&job.region),
+                gate: job.gate.clone(),
+                up: job.up.clone(),
+                rows,
+            };
+            sides.push(side(0..mid));
+            sides.push(side(mid..inter));
+            experts.push(job);
+        }
+        match self.pool.start_side_layer(sides, hidden)? {
+            Some(sides) => Ok(Some(LayerJobs::Split { sides, experts })),
+            None => whole(experts, &self.pool),
+        }
+    }
+
     pub fn finish_layer(&mut self, layer: usize) -> Result<Option<Vec<f32>>, HostError> {
         match self.in_flight.take() {
             Some(open) if open.layer == layer => match open.jobs {
                 None => Ok(None),
-                Some(jobs) => jobs.finish(self.timeout).map(Some).map_err(HostError::Pool),
+                Some(LayerJobs::Whole(jobs)) => {
+                    jobs.finish(self.timeout).map(Some).map_err(HostError::Pool)
+                }
+                Some(LayerJobs::Split { sides, experts }) => self.finish_split(sides, experts),
             },
             Some(open) => {
                 let busy = open.layer;
@@ -701,6 +767,62 @@ impl TieredHost {
                 "finish_layer({layer}) with no layer begun"
             ))),
         }
+    }
+
+    /// The join half of the split run: collect the halves, assemble each expert's
+    /// `act`, run the down pass on THIS thread (idle at the join anyway) and sum
+    /// `weight * out` in job order from +0.0 — bit-identical to the whole-expert
+    /// run's partial (halves compute the same rows, the down pass is the same
+    /// arithmetic on the same bytes).
+    fn finish_split(
+        &mut self,
+        sides: PendingSides,
+        experts: Vec<ExpertJob>,
+    ) -> Result<Option<Vec<f32>>, HostError> {
+        let halves = sides.finish(self.timeout).map_err(HostError::Pool)?;
+        let shape = self.pool.shape();
+        // Round 2: the down halves go back to the workers (the round-1 post-mortem —
+        // down passes on THIS thread serialized the decode driver at 2-3 misses/layer).
+        // The engine thread only assembles acts and sums the joined rows.
+        let mid_h = shape.hidden / 2;
+        let mut downs = Vec::with_capacity(experts.len() * 2);
+        let mut acts = Vec::with_capacity(experts.len());
+        for (at, job) in experts.iter().enumerate() {
+            let (Some(low), Some(high)) = (halves.get(2 * at), halves.get(2 * at + 1)) else {
+                return Err(HostError::Pool(PoolError::WorkerLost));
+            };
+            let mut act = low.clone();
+            act.extend_from_slice(high);
+            let act: Arc<[f32]> = Arc::from(act);
+            let half = |rows: std::ops::Range<usize>| DownJob {
+                region: std::sync::Arc::clone(&job.region),
+                down: job.down.clone(),
+                rows,
+                act: Arc::clone(&act),
+            };
+            downs.push(half(0..mid_h));
+            downs.push(half(mid_h..shape.hidden));
+            acts.push(act);
+        }
+        let out_halves = match self.pool.start_down_layer(downs).map_err(HostError::Pool)? {
+            Some(pending) => pending.finish(self.timeout).map_err(HostError::Pool)?,
+            None => Vec::new(),
+        };
+        let mut acc = vec![0.0f32; shape.hidden];
+        let mut out = Vec::with_capacity(shape.hidden);
+        for (at, job) in experts.iter().enumerate() {
+            let (Some(low), Some(high)) = (out_halves.get(2 * at), out_halves.get(2 * at + 1))
+            else {
+                return Err(HostError::Pool(PoolError::WorkerLost));
+            };
+            out.clear();
+            out.extend_from_slice(low);
+            out.extend_from_slice(high);
+            for (acc, &v) in acc.iter_mut().zip(out.iter()) {
+                *acc += job.weight * v;
+            }
+        }
+        Ok(Some(acc))
     }
 
     /// Drops what a token that failed left behind: the layer in flight (nobody joins its CPU
