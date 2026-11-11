@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::cpu_pool::{
-    CpuPool, ExpertJob, MappedRegion, PendingLayer, PendingSides, PoolError, SideJob,
+    CpuPool, DownJob, ExpertJob, MappedRegion, PendingLayer, PendingSides, PoolError, SideJob,
 };
 use super::guess::{RecallMeter, RouterGuess};
 use super::locator::{ExpertLocator, ExpertRanges, LocatorError};
@@ -780,44 +780,48 @@ impl TieredHost {
         experts: Vec<ExpertJob>,
     ) -> Result<Option<Vec<f32>>, HostError> {
         let halves = sides.finish(self.timeout).map_err(HostError::Pool)?;
-        let backend = match self.pool.kernel() {
-            super::cpu_pool::ExpertKernel::Q8g(backend) => backend,
-            // The split dispatch only starts on Q8_G pools.
-            _ => unreachable!("a split run reached the join on a non-Q8_G pool"),
-        };
         let shape = self.pool.shape();
-        if self.down_qh.is_none() {
-            self.down_qh = Some(
-                crate::kernels::expert_cpu_q8g::Q8gRow::zeros(shape.inter)
-                    .map_err(|error| HostError::Pool(PoolError::Expert { job: 0, error }))?,
-            );
-        }
-        let mut qh = self.down_qh.take().expect("initialized above");
-        let mut acc = vec![0.0f32; shape.hidden];
-        let mut out = vec![0.0f32; shape.hidden];
-        let mut act = Vec::with_capacity(shape.inter);
+        // Round 2: the down halves go back to the workers (the round-1 post-mortem —
+        // down passes on THIS thread serialized the decode driver at 2-3 misses/layer).
+        // The engine thread only assembles acts and sums the joined rows.
+        let mid_h = shape.hidden / 2;
+        let mut downs = Vec::with_capacity(experts.len() * 2);
+        let mut acts = Vec::with_capacity(experts.len());
         for (at, job) in experts.iter().enumerate() {
             let (Some(low), Some(high)) = (halves.get(2 * at), halves.get(2 * at + 1)) else {
                 return Err(HostError::Pool(PoolError::WorkerLost));
             };
-            act.clear();
-            act.extend_from_slice(low);
+            let mut act = low.clone();
             act.extend_from_slice(high);
-            let bytes = job.region.bytes();
-            let slices = crate::kernels::expert_cpu::ExpertSlices {
-                gate: &[],
-                up: &[],
-                down: &bytes[job.down.clone()],
+            let act: Arc<[f32]> = Arc::from(act);
+            let half = |rows: std::ops::Range<usize>| DownJob {
+                region: std::sync::Arc::clone(&job.region),
+                down: job.down.clone(),
+                rows,
+                act: Arc::clone(&act),
             };
-            crate::kernels::expert_cpu_q8g::expert_down_q8g(
-                backend, shape, &slices, &act, &mut qh, &mut out,
-            )
-            .map_err(|error| HostError::Pool(PoolError::Expert { job: at, error }))?;
+            downs.push(half(0..mid_h));
+            downs.push(half(mid_h..shape.hidden));
+            acts.push(act);
+        }
+        let out_halves = match self.pool.start_down_layer(downs).map_err(HostError::Pool)? {
+            Some(pending) => pending.finish(self.timeout).map_err(HostError::Pool)?,
+            None => Vec::new(),
+        };
+        let mut acc = vec![0.0f32; shape.hidden];
+        let mut out = Vec::with_capacity(shape.hidden);
+        for (at, job) in experts.iter().enumerate() {
+            let (Some(low), Some(high)) = (out_halves.get(2 * at), out_halves.get(2 * at + 1))
+            else {
+                return Err(HostError::Pool(PoolError::WorkerLost));
+            };
+            out.clear();
+            out.extend_from_slice(low);
+            out.extend_from_slice(high);
             for (acc, &v) in acc.iter_mut().zip(out.iter()) {
                 *acc += job.weight * v;
             }
         }
-        self.down_qh = Some(qh);
         Ok(Some(acc))
     }
 
