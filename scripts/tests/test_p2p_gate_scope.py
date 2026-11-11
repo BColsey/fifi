@@ -1,5 +1,6 @@
 """Opt-in real user-scope test using a sealed no-network fixture and temp lock."""
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -43,6 +44,20 @@ scope['execute'](signal_fd, lease_fd, program_fd, options, timeout=10)
 
 
 class GateScopeStateTests(unittest.TestCase):
+    def test_permission_error_does_not_establish_scope_removal(self):
+        class AmbiguousGroup:
+            def __truediv__(self, _name):
+                return self
+
+            def read_text(self):
+                raise OSError(errno.ENODEV, "transient cgroup event")
+
+            def stat(self):
+                raise OSError(errno.EACCES, "cannot verify absence")
+
+        with self.assertRaises(PermissionError):
+            group_populated(AmbiguousGroup())
+
     def test_removed_or_same_inactive_scope_needs_no_population(self):
         unit, invocation = "test.scope", "a" * 32
         removed = {"Id": unit, "LoadState": "not-found", "InvocationID": ""}

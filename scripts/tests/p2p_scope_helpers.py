@@ -62,8 +62,13 @@ def group_populated(group):
             line.split() for line in (group / "cgroup.events").read_text().splitlines()
         )
     except OSError as error:
-        if error.errno in (errno.ENOENT, errno.ENODEV) and not group.exists():
-            return None
+        if error.errno in (errno.ENOENT, errno.ENODEV):
+            try:
+                group.stat()
+            except OSError as status_error:
+                if status_error.errno in (errno.ENOENT, errno.ENODEV):
+                    return None
+                raise
         raise
     if fields.get("populated") not in ("0", "1"):
         raise ValueError("scope population unavailable")
