@@ -69,3 +69,18 @@ library provenance, platform support and actual integration remain unverified.
 The categories are sampled sequentially and cannot exclude contexts appearing
 between calls, unreported driver allocations, or same-user lock bypass. They do
 not establish an exclusive device reservation or guarantee later restoration.
+
+`ScopedUnit` is an unintegrated scope-identity and drain observation slice for
+a future guarded pair runner. It pins a unique nondelegated scope's invocation
+and cgroup; signals are preceded by an exact identity sample. It treats cgroup
+permission and device errors as inconclusive, and considers a collected scope
+drained only with explicit unit-not-found, stat-confirmed cgroup absence and a
+matching second query. Omitted properties are never treated as evidence for a
+loaded scope. Unit identity checks are sampled rather than a same-UID fence;
+filesystem reads also lack an independently enforced absolute deadline.
+
+Only fake-manager/temp-filesystem tests have run. This host's actual
+`systemctl show` output and exit behavior for an auto-collected scope have not
+been captured. The slice has no service controller, child launcher, result
+drain, lease keeper or live entry point. It must not be used to qualify a real
+handoff without a reviewed, bounded controller and disposable scope tests.
