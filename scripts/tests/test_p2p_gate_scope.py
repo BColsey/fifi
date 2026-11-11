@@ -46,6 +46,8 @@ scope['execute'](signal_fd, lease_fd, program_fd, options, timeout=10)
 class GateScopeStateTests(unittest.TestCase):
     def test_permission_error_does_not_establish_scope_removal(self):
         class AmbiguousGroup:
+            stat_errno = errno.EACCES
+
             def __truediv__(self, _name):
                 return self
 
@@ -53,10 +55,14 @@ class GateScopeStateTests(unittest.TestCase):
                 raise OSError(errno.ENODEV, "transient cgroup event")
 
             def stat(self):
-                raise OSError(errno.EACCES, "cannot verify absence")
+                raise OSError(self.stat_errno, "cannot verify absence")
 
-        with self.assertRaises(PermissionError):
-            group_populated(AmbiguousGroup())
+        for code in (errno.EACCES, errno.ENODEV):
+            group = AmbiguousGroup()
+            group.stat_errno = code
+            with self.subTest(code=code), self.assertRaises(OSError) as failure:
+                group_populated(group)
+            self.assertEqual(failure.exception.errno, code)
 
     def test_removed_or_same_inactive_scope_needs_no_population(self):
         unit, invocation = "test.scope", "a" * 32

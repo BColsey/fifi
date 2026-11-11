@@ -66,7 +66,7 @@ def group_populated(group):
             try:
                 group.stat()
             except OSError as status_error:
-                if status_error.errno in (errno.ENOENT, errno.ENODEV):
+                if status_error.errno == errno.ENOENT:
                     return None
                 raise
         raise
