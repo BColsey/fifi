@@ -20,6 +20,18 @@ pub(crate) enum KvMode {
     Int8G32,
 }
 
+impl KvMode {
+    /// The name the activation execution fingerprint embeds. Stated explicitly so the
+    /// fingerprint no longer rides the `Debug` derive; the two strings are pinned
+    /// byte-identical to that text by the c0 kv-bytes golden.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fp16 => "Fp16",
+            Self::Int8G32 => "Int8G32",
+        }
+    }
+}
+
 /// What the server asks for; `Auto` is resolved once, at session admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KvRequest {
