@@ -58,7 +58,7 @@
 use super::dims::{KvMode, StepDims, StepOptions};
 use crate::{
     EngError,
-    family::AttentionKind,
+    family::{AttentionKind, kv_format::KvRowShape},
     kernels::cuda::resident::step_params::{RESULT_PAIR_BYTES, STEP_PARAMS_BYTES},
 };
 
@@ -244,12 +244,16 @@ impl KvPool {
     /// KV bytes for one position over all attention layers (exact, not rounded to the alignment).
     pub(crate) fn bytes_per_token(dims: &StepDims, mode: KvMode) -> Result<usize, EngError> {
         let a = &dims.shape.attn;
-        let width = mul(a.heads_kv, a.head_dim)?;
-        let per_plane = match mode {
-            KvMode::Fp16 => mul(width, HALF)?,
-            KvMode::Int8G32 => add(width, mul(width / KV8_GROUP, HALF)?)?,
-        };
-        mul(mul(per_plane, 2)?, dims.layers_of(AttentionKind::Full))
+        // The per-layer K/V bytes are the shared arithmetic; the layer count is this
+        // family's geometry. One behavior change beyond any caller: the shared form
+        // refuses a head_dim that is not a multiple of the group, where the old divide
+        // truncated silently.
+        let per_layer = usize::try_from(mode.format().layer_position_bytes(KvRowShape {
+            heads_kv: a.heads_kv as u64,
+            head_dim: a.head_dim as u64,
+        })?)
+        .map_err(|_| overflow())?;
+        mul(per_layer, dims.layers_of(AttentionKind::Full))
     }
 
     fn plane_start(&self, ordinal: usize, plane: Plane) -> Result<usize, EngError> {

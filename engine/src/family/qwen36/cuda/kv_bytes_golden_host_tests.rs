@@ -1,6 +1,6 @@
 //! The K/V bytes golden of the device-side planning arithmetic: the pool's per-token figure for
 //! both modes, the prefill window bytes, the loader's admission term at real contexts, the
-//! placement stride and cache figures, and the `KvMode` `Debug` text the activation fingerprint
+//! placement stride and cache figures, and the `KvMode::name()` text the activation fingerprint
 //! embeds (`step_activation.rs`). A change that moves any of these numbers must re-capture
 //! deliberately and name the move in the commit message. `FIFI_GOLDEN_UPDATE=1` rewrites this
 //! family's golden file beside the module.
@@ -97,11 +97,13 @@ fn placement_text() -> String {
     text
 }
 
-/// The `KvMode` `Debug` text the activation execution fingerprint embeds.
+/// The `KvMode` name text the activation execution fingerprint embeds. The label keeps its
+/// historical "debug=" wording so the golden digest does not move; the rendered value is
+/// `name()`, which is what the fingerprint uses.
 fn dtype_text() -> String {
     let mut text = String::new();
-    let _ = writeln!(text, "Fp16 debug={:?}", KvMode::Fp16);
-    let _ = writeln!(text, "Int8G32 debug={:?}", KvMode::Int8G32);
+    let _ = writeln!(text, "Fp16 debug={}", KvMode::Fp16.name());
+    let _ = writeln!(text, "Int8G32 debug={}", KvMode::Int8G32.name());
     text
 }
 
