@@ -13,6 +13,206 @@ fn chunk_driver() -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
     ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap()
 }
 
+#[test]
+fn shared_prefill_opens_once_for_two_chunks_and_closes_after_sampling() {
+    let device = FakeChunkDevice {
+        track_windows: true,
+        ..Default::default()
+    };
+    let mut driver = ChunkDriver::new_shared(device, FakeFeeds::default(), shape()).unwrap();
+    driver.chunk_cap = 2;
+    driver.feed_rows(&[1, 2, 3]).unwrap();
+    assert_eq!(driver.fed(), 3);
+    assert_eq!(
+        driver.device().log,
+        [
+            "begin_prefill",
+            "chunk_params 1 0 2",
+            "chunk_stream",
+            "chunk_ple",
+            "begin",
+            "layers 0..2 @0 m2",
+            "read_stream",
+            "write_back",
+            "layers 2..4 @0 m2",
+            "health",
+            "chunk_params 3 2 1",
+            "chunk_stream",
+            "chunk_ple",
+            "begin",
+            "layers 0..2 @2 m1",
+            "read_stream",
+            "write_back",
+            "layers 2..4 @2 m1",
+            "health",
+        ]
+    );
+    assert_eq!(driver.logits(4).unwrap().len(), LOGITS);
+    assert_eq!(driver.fed(), 4);
+    let log = &driver.device().log;
+    assert_eq!(
+        &log[log.len() - 4..],
+        ["head", "read_logits", "health", "end_prefill"].map(String::from)
+    );
+    assert_eq!(
+        log.iter().filter(|call| *call == "begin_prefill").count(),
+        1
+    );
+}
+
+fn shared_driver(feeds: FakeFeeds) -> ChunkDriver<FakeChunkDevice, FakeFeeds> {
+    let device = FakeChunkDevice {
+        track_windows: true,
+        ..Default::default()
+    };
+    let mut driver = ChunkDriver::new_shared(device, feeds, shape()).unwrap();
+    driver.chunk_cap = 2;
+    driver
+}
+
+#[test]
+fn shared_prefill_preflight_refusals_do_not_open_or_poison() {
+    use crate::family::flash_next::cuda::driver::ResumesState;
+    for token in [SAMPLER_VOCAB as u32, u32::MAX] {
+        let mut driver = shared_driver(FakeFeeds::default());
+        assert!(driver.feed_rows(&[1, 2, token]).is_err());
+        assert!(driver.device().log.is_empty());
+        assert_eq!(driver.resume_generation(), 0);
+        driver.feed_rows(&[1]).unwrap();
+    }
+    for feeds in [
+        FakeFeeds {
+            fail_begin: Some(2),
+            ..Default::default()
+        },
+        FakeFeeds {
+            start_width: Some(STREAM + 1),
+            ..Default::default()
+        },
+    ] {
+        let mut driver = shared_driver(feeds);
+        assert!(driver.feed_rows(&[1, 2]).is_err());
+        assert!(driver.device().log.is_empty());
+        assert_eq!(driver.fed(), 0);
+        assert_eq!(driver.resume_generation(), 0);
+    }
+    let mut driver = shared_driver(FakeFeeds::default());
+    assert!(driver.feed_rows(&[1; 7]).is_err());
+    driver.chunk_cap = 65;
+    assert!(driver.feed_rows(&[1]).is_err());
+    assert!(driver.device().log.is_empty());
+    driver.feed_rows(&[]).unwrap();
+}
+
+#[test]
+fn shared_prefill_device_failures_poison_before_commit_and_reset_recovers() {
+    use crate::family::flash_next::cuda::driver::ResumesState;
+    for failure in [
+        "begin_prefill",
+        "chunk_params",
+        "chunk_stream",
+        "chunk_ple",
+        "begin",
+        "layers",
+        "read_stream",
+        "write_back",
+        "health",
+    ] {
+        let mut driver = shared_driver(FakeFeeds::default());
+        driver.reset().unwrap();
+        driver.device_mut().fail = Some(failure);
+        assert!(driver.feed_rows(&[1, 2]).is_err(), "{failure}");
+        assert_eq!(driver.fed(), 0, "{failure}");
+        assert_eq!(driver.resume_generation(), 1, "{failure}");
+        assert!(driver.feed_rows(&[1]).is_err(), "{failure}");
+        driver.reset().unwrap();
+        driver.feed_rows(&[1, 2]).unwrap();
+        assert_eq!(driver.resume_generation(), 2);
+        assert_eq!(driver.fed(), 2);
+        driver.logits(3).unwrap();
+    }
+}
+
+#[test]
+fn shared_prefill_sampling_failures_preserve_commit_and_close_rules() {
+    for failure in ["head", "read_logits", "health", "end_prefill"] {
+        let mut driver = shared_driver(FakeFeeds::default());
+        driver.feed_rows(&[1, 2]).unwrap();
+        driver.device_mut().fail = Some(failure);
+        assert!(driver.logits(3).is_err(), "{failure}");
+        assert_eq!(driver.fed(), if failure == "end_prefill" { 3 } else { 2 });
+        assert!(driver.feed(1).is_err());
+        driver.reset().unwrap();
+        driver.feed_rows(&[1]).unwrap();
+        driver.logits(2).unwrap();
+    }
+}
+
+#[test]
+fn shared_prefill_reset_and_resume_keep_the_family_generation_rules() {
+    use crate::family::flash_next::cuda::driver::ResumesState;
+    let mut driver = shared_driver(FakeFeeds::default());
+    driver.reset().unwrap();
+    driver.feed_rows(&[1, 2]).unwrap();
+    driver.logits(3).unwrap();
+    let generation = driver.resume_generation();
+    let snapshot = driver.save_resume().unwrap();
+    driver.reset().unwrap();
+    driver.restore_resume(&snapshot).unwrap();
+    assert_eq!(driver.fed(), 3);
+    assert_eq!(driver.resume_generation(), generation);
+    driver.feed_rows(&[4]).unwrap();
+    assert!(
+        driver
+            .device()
+            .log
+            .contains(&"chunk_params 4 3 1".to_owned())
+    );
+    driver.reset().unwrap();
+    driver.feed_rows(&[1]).unwrap();
+    assert_ne!(driver.resume_generation(), generation);
+}
+
+#[test]
+fn shared_prefill_refuses_a_partial_device_ple_pair_list() {
+    let mut driver = shared_driver(FakeFeeds::default());
+    driver.ple_device = true;
+    driver.device_mut().ple_pairs = Some(vec![PleKeyValue {
+        keys: vec![1.0; STREAM],
+        value: vec![1.0],
+    }]);
+    assert!(driver.feed_rows(&[1, 2]).is_err());
+    assert_eq!(driver.fed(), 0);
+    assert!(driver.feed(1).is_err());
+}
+
+#[test]
+fn default_chunk_refuses_partial_device_ple_pairs() {
+    let mut driver = chunk_driver();
+    driver.chunk_cap = 2;
+    driver.ple_device = true;
+    driver.device_mut().ple_pairs = Some(vec![PleKeyValue {
+        keys: vec![1.0; STREAM],
+        value: vec![1.0],
+    }]);
+    assert!(driver.feed_rows(&[1, 2]).is_err());
+    assert_eq!(driver.fed(), 0);
+    assert!(driver.feed(1).is_err());
+}
+
+#[test]
+fn shared_prefill_switch_precedes_cuda_initialization() {
+    let source = include_str!("../../start.rs");
+    let build = &source[source.find("fn build_driver(").expect("driver builder")..];
+    let check = build
+        .find("prof::check_switch_spelling()?")
+        .expect("switch check");
+    let initialize = build
+        .find("CudaProjector::new()")
+        .expect("CUDA initialization");
+    assert!(check < initialize);
+}
+
 /// The route counters are process globals: every test that reads them serialises here, so an
 /// interleaved `run_chunk` of another test cannot add to a read.
 static ROUTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -246,6 +446,28 @@ fn feed_rows_with_the_default_cap_feeds_one_token_at_a_time() {
         params,
         ["chunk_params 1 0 1", "chunk_params 2 1 1"].map(String::from)
     );
+}
+
+#[test]
+fn shared_prefill_switch_refuses_on_requests_before_startup_is_connected() {
+    use super::prof::{SHARED_PREFILL, check_switch_value};
+    for off in [None, Some("0"), Some("false"), Some("off")] {
+        check_switch_value(SHARED_PREFILL, off).unwrap();
+    }
+    for on in ["1", "true", "on"] {
+        assert!(matches!(
+            check_switch_value(SHARED_PREFILL, Some(on)),
+            Err(EngError::BadRequest(message))
+                if message.contains(SHARED_PREFILL) && message.contains("not connected")
+        ));
+    }
+    for bad in ["", "2", "TRUE", " on", "a non-unicode value"] {
+        assert!(matches!(
+            check_switch_value(SHARED_PREFILL, Some(bad)),
+            Err(EngError::BadRequest(message)) if message.contains("must be")
+        ));
+    }
+    check_switch_value("INFERENCE_FLASH_NEXT_PROFILE", Some("on")).unwrap();
 }
 
 #[test]

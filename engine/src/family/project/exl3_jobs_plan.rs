@@ -21,3 +21,46 @@ pub(crate) const EXL3_JOB_WORDS: usize = 4;
 pub(crate) fn exl3_max_jobs(experts: usize, routed: usize) -> usize {
     experts + routed.div_ceil(EXL3_EXPERT_TILE_ROWS)
 }
+
+/// Bytes of the dense table and the routed row lists plus table, in that order.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(crate) fn exl3_job_bytes(
+    rows: usize,
+    tile_rows: usize,
+    experts: usize,
+    top_k: usize,
+) -> Option<(usize, usize)> {
+    if tile_rows == 0 {
+        return None;
+    }
+    let routed = rows.checked_mul(top_k)?;
+    // The byte count is stricter than this bound; first make the shared job count safe.
+    experts.checked_add(routed)?;
+    let table_words = exl3_max_jobs(experts, routed).checked_mul(EXL3_JOB_WORDS)?;
+    let perm_words = routed.checked_mul(2)?.checked_add(table_words)?;
+    let dense_words = rows.div_ceil(tile_rows).checked_mul(EXL3_JOB_WORDS)?;
+    Some((
+        dense_words.checked_mul(size_of::<i32>())?,
+        perm_words.checked_mul(size_of::<i32>())?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_prefill_job_bytes_cover_dense_tiles_and_routed_lists() {
+        assert_eq!(exl3_job_bytes(64, 256, 512, 10), Some((16, 13_472)));
+        assert_eq!(exl3_job_bytes(2048, 256, 512, 10), Some((128, 177_152)));
+        assert_eq!(exl3_job_bytes(257, 256, 1, 1), Some((32, 2152)));
+    }
+
+    #[test]
+    fn shared_prefill_job_bytes_refuse_zero_tiles_and_overflow() {
+        assert_eq!(exl3_job_bytes(1, 0, 512, 10), None);
+        assert_eq!(exl3_job_bytes(usize::MAX, 256, 512, 10), None);
+        assert_eq!(exl3_job_bytes(1, 256, usize::MAX, 1), None);
+        assert_eq!(exl3_job_bytes(usize::MAX, 1, 0, 0), None);
+    }
+}

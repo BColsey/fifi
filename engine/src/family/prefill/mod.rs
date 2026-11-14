@@ -15,16 +15,15 @@
 )]
 pub(crate) mod admission;
 
-// Same host-build situation as `admission`: the CUDA-gated arena consumes this, and the second
-// family's ungated planner arrives with the shared-pass series.
+// Both CUDA drivers consume these helpers. Host builds use them only in tests.
 #[allow(
     dead_code,
-    reason = "the gated arena module is its only current consumer; the second family's ungated planner lands in the shared-pass series"
+    reason = "the CUDA family drivers consume these helpers; host builds use them only in tests"
 )]
 pub(crate) mod steps;
 
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family) mod arena;
 
-#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(in crate::family) mod chunk_family;

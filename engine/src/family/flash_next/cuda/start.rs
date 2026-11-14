@@ -454,6 +454,7 @@ pub(super) fn build_driver(
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
+    super::driver::chunk::prof::check_switch_spelling()?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;

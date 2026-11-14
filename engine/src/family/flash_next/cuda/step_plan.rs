@@ -39,7 +39,10 @@
 use super::state::{FlashGeometry, StateBytes, StatePlan, overflow, product, sum};
 use crate::{
     EngError,
-    family::{flash_next::moe::context_budget::KvFormat, project::exl3_jobs_plan::MAX_EXL3_ROWS},
+    family::{
+        flash_next::moe::context_budget::KvFormat,
+        project::exl3_jobs_plan::{MAX_EXL3_ROWS, exl3_job_bytes},
+    },
     kernels::cuda::{
         ArenaPlan, ArenaTensor, plan_arena,
         prefill::gdn_scan_seq::{cpf_dn_conv_out_bytes, cpf_dn_scan_out_bytes},
@@ -167,6 +170,10 @@ pub(super) enum Slot {
     /// f32 `[rows][vocab]`.
     Logits,
     ArgmaxPart,
+    /// Routed input/output row lists and the shared prefill job table.
+    PrefillPerm,
+    /// f32 `[rows][value_heads]`: a plain beta/alpha projection before column scatter.
+    PrefillY,
 }
 
 /// Phases of one layer plus the prologue and epilogue; the discriminant is the lifetime number.
@@ -607,6 +614,38 @@ impl StepPlan {
             slots,
             arena,
         })
+    }
+
+    /// Extends the existing family list for shared prefill, retaining its row bound and indices.
+    pub(super) fn new_prefill(
+        geometry: &FlashGeometry,
+        rows: usize,
+        positions: usize,
+        options: &StepOptions,
+    ) -> Result<Self, EngError> {
+        let mut plan = Self::new(geometry, rows, positions, options)?;
+        let (dense_bytes, perm_bytes) =
+            exl3_job_bytes(rows, 256, geometry.experts, geometry.top_k).ok_or_else(overflow)?;
+        let mut list = SlotList {
+            rows,
+            slots: plan.slots,
+        };
+        list.slots
+            .iter_mut()
+            .find(|entry| entry.slot == Slot::Exl3Jobs)
+            .ok_or_else(|| refuse("the dense EXL3 job slot is missing".into()))?
+            .bytes = dense_bytes;
+        // One stream serializes dense and routed uses of the existing, pairs-sized EXL3 scratch.
+        list.add(Slot::PrefillPerm, Ok(perm_bytes), Phase::Route, Phase::Down)?;
+        list.add(
+            Slot::PrefillY,
+            product(&[rows, geometry.delta.value_heads, F32]),
+            Phase::Ple,
+            Phase::LmHead,
+        )?;
+        plan.slots = list.slots;
+        plan.arena = plan_arena(&plan.arena_tensors())?;
+        Ok(plan)
     }
 
     pub(super) fn rows(&self) -> usize {

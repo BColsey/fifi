@@ -144,6 +144,22 @@ pub(in crate::family::flash_next) mod prof {
         }
     }
 
+    pub(super) const SHARED_PREFILL: &str = "INFERENCE_FLASH_NEXT_SHARED_PREFILL";
+
+    pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<()> {
+        let on = parse_switch(raw).map_err(|seen| {
+            EngError::BadRequest(format!(
+                "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
+            ))
+        })?;
+        if name == SHARED_PREFILL && on {
+            return Err(EngError::BadRequest(format!(
+                "{SHARED_PREFILL}: shared prefill startup is not connected"
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuses an unknown spelling of the Flash-Next switches at driver build, before any
     /// chunk runs; a driver is never constructed with a value the fast paths would misread.
     pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
@@ -151,23 +167,14 @@ pub(in crate::family::flash_next) mod prof {
             "INFERENCE_FLASH_NEXT_PROFILE",
             "INFERENCE_FLASH_NEXT_DRAIN_TICK",
             "INFERENCE_FLASH_NEXT_PREFIX_RESUME",
+            SHARED_PREFILL,
         ] {
-            let refused = |seen: &str| {
-                EngError::BadRequest(format!(
-                    "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
-                ))
+            let value = match std::env::var(name) {
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => Some("a non-unicode value".into()),
+                Ok(value) => Some(value),
             };
-            match std::env::var(name) {
-                Err(std::env::VarError::NotPresent) => {}
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    return Err(refused("a non-unicode value"));
-                }
-                Ok(value) => {
-                    if let Err(bad) = parse_switch(Some(&value)) {
-                        return Err(refused(&bad));
-                    }
-                }
-            }
+            check_switch_value(name, value.as_deref())?;
         }
         Ok(())
     }
@@ -335,6 +342,9 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     }
 }
 
+mod shared;
+use shared::ChunkClock;
+
 /// The chunk driver: a [`ChunkDevice`] and its [`TokenFeeds`] under the token driver's rules.
 /// `feed_rows` splits the prompt into device chunks of at most `chunk_cap` rows (1 = the token
 /// loop, the decode shape).
@@ -350,6 +360,8 @@ pub(in crate::family::flash_next::cuda) struct ChunkDriver<D: ChunkDevice, F: To
     /// in-place rows a resume leaves on the card belong to the generation that wrote them, so a
     /// snapshot saved at another generation is structurally unusable and never matches.
     generation: u64,
+    shared_prefill: bool,
+    shared_window: bool,
     /// The most rows one device chunk runs; the caller sets it from the memory plan.
     pub(in crate::family::flash_next::cuda) chunk_cap: usize,
     /// Whether the PLE projections run on the device (`ChunkDevice::ple_project_chunk`).
@@ -381,10 +393,23 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             pos: 0,
             poisoned: false,
             generation: 0,
+            shared_prefill: false,
+            shared_window: false,
             chunk_cap: 1,
             ple_device: false,
             ple_host_batch: None,
         })
+    }
+
+    /// Staged entry for direct tests; the served switch refuses until startup is connected.
+    pub(in crate::family::flash_next::cuda) fn new_shared(
+        device: D,
+        feeds: F,
+        shape: DriverShape,
+    ) -> Result<Self> {
+        let mut driver = Self::new(device, feeds, shape)?;
+        driver.shared_prefill = true;
+        Ok(driver)
     }
 
     /// The number of positions the caches hold, for the executor.
@@ -473,16 +498,20 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         starts: &[super::StartVectors],
         want_logits: bool,
     ) -> Result<Option<Vec<f32>>> {
+        let mut clock = ChunkClock::new();
+        let ple_rows = self.write_inputs(tokens, starts)?;
+        self.device.begin_chunk()?;
+        clock.tick(&mut self.device, 1)?;
+        self.queue_layers(tokens, &ple_rows, &mut clock)?;
+        let logits = self.queue_head(want_logits, &mut clock)?;
+        self.device.check_health()?;
+        Ok(logits)
+    }
+
+    fn write_inputs(&mut self, tokens: &[u32], starts: &[super::StartVectors]) -> Result<Vec<f32>> {
         let m = tokens.len();
         let pos = self.pos;
         let shape = self.shape;
-
-        let profile = prof::on();
-        let drain_on = profile && prof::drain_tick();
-        let mut t = Instant::now();
-        let mut tick = |dev: &mut D, slot: usize| -> Result<()> {
-            advance_boundary(dev, slot, &mut t, profile, drain_on, prof::add)
-        };
         self.device
             .write_chunk_params(tokens[0] as i32, pos as i32, m as i32)?;
         let mut stream_rows = Vec::with_capacity(m * shape.start.stream);
@@ -493,10 +522,20 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         }
         self.device.write_chunk_stream(&stream_rows)?;
         self.device.write_chunk_ple(&ple_rows)?;
-        self.device.begin_chunk()?;
-        tick(&mut self.device, 1)?;
+        Ok(ple_rows)
+    }
+
+    fn queue_layers(
+        &mut self,
+        tokens: &[u32],
+        ple_rows: &[f32],
+        clock: &mut ChunkClock,
+    ) -> Result<()> {
+        let m = tokens.len();
+        let pos = self.pos;
+        let shape = self.shape;
         self.device.layers(0..shape.ple_layer, pos, m)?;
-        tick(&mut self.device, 2)?;
+        clock.tick(&mut self.device, 2)?;
         // The batch host route projects the chunk's embeddings after the pre-PLE layers are
         // queued, so the product runs while the card works (its input is the chunk's start
         // vectors, not device output). Chunks narrower than the projection threads keep the
@@ -505,7 +544,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let host_pairs = match self.ple_host_batch.as_deref_mut() {
             Some(host) if m >= host.threads() => {
                 prof::PRODUCTS.fetch_add(1, AtomicOrdering::Relaxed);
-                Some(host.project_chunk(&ple_rows, m)?)
+                Some(host.project_chunk(ple_rows, m)?)
             }
             Some(host) => {
                 let embed = shape.start.ple_embed;
@@ -519,7 +558,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             None => None,
         };
         let mut rows = self.device.read_stream()?;
-        tick(&mut self.device, 3)?;
+        clock.tick(&mut self.device, 3)?;
         let width = shape.start.stream;
         if rows.len() != m * width {
             return Err(EngError::Backend {
@@ -533,12 +572,17 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         // The device route projects the chunk's embeddings on the card (one m-row launch pair)
         // and hands each row's keys/value to the host step, which then runs unchanged; the host
         // route runs its own projections inside `ple_update`.
-        let mut pairs = (if self.ple_device {
+        let pairs = if self.ple_device {
             Some(self.device.ple_project_chunk()?)
         } else {
             host_pairs
-        })
-        .map(IntoIterator::into_iter);
+        };
+        if pairs.as_ref().is_some_and(|pairs| pairs.len() != m) {
+            return Err(EngError::BadRequest(format!(
+                "Flash-Next chunk driver: the PLE projection must return {m} pairs"
+            )));
+        }
+        let mut pairs = pairs.map(IntoIterator::into_iter);
         for (token, row) in tokens.iter().zip(rows.chunks_mut(width)) {
             if let Some(pair) = pairs.as_mut().and_then(std::iter::Iterator::next) {
                 self.feeds.set_ple_pair(pair)?;
@@ -554,21 +598,26 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
                 *value += delta;
             }
         }
-        tick(&mut self.device, 4)?;
+        clock.tick(&mut self.device, 4)?;
         self.device.write_stream_back(&rows)?;
-        tick(&mut self.device, 5)?;
+        clock.tick(&mut self.device, 5)?;
         self.device.layers(shape.ple_layer..shape.layers, pos, m)?;
-        tick(&mut self.device, 6)?;
-        let logits = if want_logits {
-            self.device.head()?;
-            let row = self.device.read_logits()?;
-            tick(&mut self.device, 7)?;
-            Some(row)
-        } else {
-            None
-        };
-        self.device.check_health()?;
-        Ok(logits)
+        clock.tick(&mut self.device, 6)?;
+        Ok(())
+    }
+
+    fn queue_head(
+        &mut self,
+        want_logits: bool,
+        clock: &mut ChunkClock,
+    ) -> Result<Option<Vec<f32>>> {
+        if !want_logits {
+            return Ok(None);
+        }
+        self.device.head()?;
+        let row = self.device.read_logits()?;
+        clock.tick(&mut self.device, 7)?;
+        Ok(Some(row))
     }
 }
 
@@ -591,6 +640,9 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         if tokens.is_empty() {
             return Ok(());
         }
+        if self.shared_prefill {
+            return self.feed_shared_rows(tokens);
+        }
         let cap = self.chunk_cap.max(1);
         self.device.begin_prefill()?;
         for chunk in tokens.chunks(cap) {
@@ -600,12 +652,15 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
     }
 
     fn logits(&mut self, token: u32) -> Result<Vec<f32>> {
-        let logits = self
-            .run_chunk(&[token], true)?
-            .ok_or_else(|| EngError::Backend {
-                operation: Self::OPERATION,
-                message: "the logits step returned no logits".to_string(),
-            })?;
+        let logits = (if self.shared_window {
+            self.run_shared_chunk(&[token], true, false)?
+        } else {
+            self.run_chunk(&[token], true)?
+        })
+        .ok_or_else(|| EngError::Backend {
+            operation: Self::OPERATION,
+            message: "the logits step returned no logits".to_string(),
+        })?;
         // The sampling row closed the prefill: the ring's window ends with it, and every
         // later single-token step takes the decode path. A failure here leaves the prefill
         // window open on an advanced position: poison, so a reset is required.
@@ -613,6 +668,7 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
             self.poisoned = true;
             return Err(error);
         }
+        self.shared_window = false;
         if prof::on() {
             prof::dump_and_reset(prof::ROWS.load(AtomicOrdering::Relaxed));
         }
@@ -628,6 +684,7 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
         self.feeds.reset();
         self.pos = 0;
         self.poisoned = false;
+        self.shared_window = false;
         Ok(())
     }
 }
@@ -663,6 +720,7 @@ impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for Chu
         }
         self.pos = snapshot.pos;
         self.poisoned = false;
+        self.shared_window = false;
         Ok(())
     }
 }

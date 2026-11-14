@@ -1369,6 +1369,45 @@ fn a_chunk_of_rows_matches_the_same_rows_one_at_a_time() {
     }
 }
 
+#[test]
+#[ignore = "needs a GPU, an 8 GiB lease and the pack in FIFI_FLASH_NEXT_EXL3_PACK (root weights only)"]
+fn shared_prefill_owner_allocates_the_extended_list_and_zeroes_it() {
+    assert!(device_present(
+        "shared_prefill_owner_allocates_the_extended_list_and_zeroes_it"
+    ));
+    let checkpoint = checkpoint();
+    let projector = CudaProjector::new().unwrap();
+    let ctx = projector.context();
+    let stream = ctx.stream().unwrap();
+    let weights = device_weights(&projector, &checkpoint, &[], (true, false));
+    let step = FlashStep::new_prefill(
+        ctx,
+        &stream,
+        &weights,
+        &checkpoint.model_config,
+        64,
+        64,
+        0..1,
+    )
+    .unwrap();
+    let view = step.slot(Slot::PrefillY).unwrap();
+    let scratch = view.buffer();
+    assert_eq!(scratch.bytes(), step.step_plan.arena_bytes());
+    assert!(step.step_plan.index(Slot::PrefillPerm).is_some());
+    assert!(step.step_plan.index(Slot::PrefillY).is_some());
+    for entry in step.step_plan.slots() {
+        let range = step.slot(entry.slot).unwrap();
+        assert_eq!(range.bytes(), entry.bytes);
+        assert_eq!(
+            step.step_plan.placement(entry.slot),
+            Some((range.offset(), range.bytes()))
+        );
+    }
+    let mut bytes = vec![0u8; scratch.bytes()];
+    scratch.read_at(&stream, 0, &mut bytes).unwrap();
+    assert!(bytes.iter().all(|&byte| byte == 0));
+}
+
 fn write_params(step: &FlashStep<'_>, token: i32, pos: i32) {
     let (words, words_at) = step.words_buffer().expect("words");
     let params =

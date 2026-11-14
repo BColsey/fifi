@@ -52,7 +52,7 @@ pub(crate) trait ChunkFamily {
     ) -> Result<(), EngError>;
 
     /// The bank's miss count for the per-job report, when a bank exists.
-    #[expect(dead_code, reason = "first caller arrives with the shared driver")]
+    #[expect(dead_code, reason = "per-job miss reporting is not connected yet")]
     fn bank_misses(&self) -> Option<u64> {
         None
     }

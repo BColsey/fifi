@@ -59,6 +59,7 @@ use crate::{
             step::ModelShape,
         },
         gguf_model::Role,
+        prefill::arena::{ArenaHooks, allocate_zeroed},
         project::cuda::{
             CudaWeight, CudaWeights,
             exl3::{Exl3Io, Exl3JobsIo, Exl3Weight},
@@ -123,6 +124,54 @@ impl<'a> FlashStep<'a> {
         rows: usize,
         layers: std::ops::Range<usize>,
     ) -> Result<Self, EngError> {
+        Self::build(
+            ctx,
+            stream,
+            weights,
+            model_config,
+            positions,
+            rows,
+            layers,
+            false,
+        )
+    }
+
+    /// The shared-prefill owner; startup admission remains disabled until its binding is complete.
+    pub(super) fn new_prefill(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model_config: &[u8],
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self, EngError> {
+        Self::build(
+            ctx,
+            stream,
+            weights,
+            model_config,
+            positions,
+            rows,
+            layers,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor for the two arena lists"
+    )]
+    fn build(
+        ctx: &'a CudaContext,
+        stream: &'a DeviceStream,
+        weights: &'a CudaWeights,
+        model_config: &[u8],
+        positions: usize,
+        rows: usize,
+        layers: std::ops::Range<usize>,
+        shared_prefill: bool,
+    ) -> Result<Self, EngError> {
         let (model, kinds) = model_shape(model_config)?;
         let geometry = FlashGeometry::new(&model, &kinds)?;
         if layers.start >= layers.end || layers.end > geometry.layers.len() {
@@ -133,9 +182,18 @@ impl<'a> FlashStep<'a> {
         }
         let state_plan = StatePlan::new(&geometry, positions, KvFormat::F16)?;
         let options = StepOptions::default();
-        let step_plan = StepPlan::new(&geometry, rows, positions, &options)?;
+        let step_plan = if shared_prefill {
+            StepPlan::new_prefill(&geometry, rows, positions, &options)?
+        } else {
+            StepPlan::new(&geometry, rows, positions, &options)?
+        };
         let state = ctx.arena(&state_plan.arena_tensors())?;
-        let scratch = ctx.arena(&step_plan.arena_tensors())?;
+        let tensors = step_plan.arena_tensors();
+        let scratch = if shared_prefill {
+            allocate_zeroed(ctx, stream, &tensors, false, ArenaHooks::default())?
+        } else {
+            ctx.arena(&tensors)?
+        };
         let zeros = ctx.upload(&vec![0u8; rows * geometry.hidden * F32])?;
         let step = Self {
             ctx,

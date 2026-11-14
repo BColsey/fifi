@@ -157,6 +157,7 @@ pub(in crate::family::flash_next::cuda) struct FakeChunkDevice {
     pub(in crate::family::flash_next::cuda) resets: usize,
     /// The last state the resume seam wrote back, as read.
     pub(in crate::family::flash_next::cuda) state: Vec<(StateSlot, Vec<u8>)>,
+    pub(in crate::family::flash_next::cuda) track_windows: bool,
 }
 
 impl FakeChunkDevice {
@@ -214,6 +215,20 @@ impl ChunkDevice for FakeChunkDevice {
 
     fn begin_chunk(&mut self) -> Result<(), EngError> {
         self.step("begin", String::new())
+    }
+
+    fn begin_prefill(&mut self) -> Result<(), EngError> {
+        if self.track_windows {
+            self.step("begin_prefill", String::new())?;
+        }
+        Ok(())
+    }
+
+    fn end_prefill(&mut self) -> Result<(), EngError> {
+        if self.track_windows {
+            self.step("end_prefill", String::new())?;
+        }
+        Ok(())
     }
 
     fn layers(&mut self, range: Range<usize>, pos: usize, m: usize) -> Result<(), EngError> {
@@ -283,6 +298,7 @@ pub(in crate::family::flash_next::cuda) struct FakeFeeds {
     pub(in crate::family::flash_next::cuda) fail_update: bool,
     /// The width of the update (the stream's, unless a test breaks it).
     pub(in crate::family::flash_next::cuda) update_width: Option<usize>,
+    pub(in crate::family::flash_next::cuda) start_width: Option<usize>,
 }
 
 impl TokenFeeds for FakeFeeds {
@@ -291,7 +307,7 @@ impl TokenFeeds for FakeFeeds {
             return Err(EngError::Checkpoint("the pack read failed".into()));
         }
         Ok(StartVectors {
-            stream: vec![token as f32; STREAM],
+            stream: vec![token as f32; self.start_width.unwrap_or(STREAM)],
             ple_embedding: vec![token as f32; PLE_EMBED],
         })
     }
