@@ -10,7 +10,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use super::{
-    super::exl3_pack::{ExpertPart, expert_name, router_name, shared_gate_name, shared_name},
+    super::exl3_pack::{expert_name, router_name, shared_gate_name, shared_name},
     common_tests::{dims, inventory},
     exl3_load_device_tests::{matrix_of, relative_l2, values_of},
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
@@ -21,6 +21,7 @@ use super::{
     resources::STEP_ROWS,
 };
 use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};
+use crate::family::exl3_pack::ExpertPart;
 use crate::{
     EngError,
     family::project::cuda::{CudaProjector, CudaWeights, Reserve},

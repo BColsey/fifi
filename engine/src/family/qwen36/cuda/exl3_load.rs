@@ -10,10 +10,7 @@
 use std::path::Path;
 
 use super::{
-    super::{
-        exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root, inspect_pack_split},
-        mtp_pack::inspect_mtp_pack,
-    },
+    super::{exl3_pack::inspect_pack_split, mtp_pack::inspect_mtp_pack},
     dims::StepDims,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
     exl3_source::{PackReader, attention_weights, delta_weights},
@@ -24,6 +21,7 @@ use super::{
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root};
 use crate::{
     EngError,
     capability::probe::probe_host,

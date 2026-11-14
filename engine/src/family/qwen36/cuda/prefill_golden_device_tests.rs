@@ -52,7 +52,7 @@ use super::exl3_load::load_exl3_dir;
 use super::prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillArena, PrefillBudget, ZERO_CHUNK};
 use super::prefill_exl3_step_device_tests::{SAMPLER_VOCAB, rules as step_rules};
 use super::prefill_plan::{
-    ChunkSlot, PrefillStep, chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
+    ChunkSlot, chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
 };
 use super::resources::StepResources;
 use super::state::export::ExportedState;
@@ -60,6 +60,7 @@ use super::step::ChunkVerdict;
 use super::step::QwenResidentStep;
 use crate::EngError;
 use crate::family::gguf_model::open_qwen3_6_35b_a3b;
+use crate::family::prefill::arena::PrefillStep;
 use crate::family::project::cuda::{
     CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
 };

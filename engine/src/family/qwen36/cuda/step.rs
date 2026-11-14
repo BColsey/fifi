@@ -1464,7 +1464,7 @@ impl<'a> QwenResidentStep<'a> {
         m_sess: usize,
     ) -> Result<(), EngError> {
         use super::prefill_driver::drive_chunks;
-        use super::prefill_plan::PrefillStep;
+        use crate::family::prefill::arena::PrefillStep;
         use crate::family::session::TokenStepper;
 
         let start = self.tokens();

@@ -93,7 +93,8 @@ pub(crate) fn m_pos(p0: usize) -> usize {
 // The admission types moved to the shared prefill core (`family::prefill`); these re-exports
 // keep the old paths alive for the driver, the step and the plan tests.
 pub(crate) use crate::family::prefill::admission::{Admission, ChunkCost, Extra};
-pub(crate) use crate::family::prefill::arena::PrefillStep;
+use crate::family::prefill::arena::PrefillStep;
+use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 impl Admission {
     /// The Qwen3.6 rule: the ladder, the flat part charge and the spare minimum bind here, so
@@ -395,8 +396,6 @@ fn moe_rows(dims: &StepDims, m: usize) -> Result<Vec<Row>, EngError> {
 /// The most rows of one job of a dense EXL3 projection: the tallest CTA of the job-table kernel
 /// (256 rows decode each weight tile once for the whole job).
 pub(crate) const EXL3_TILE_ROWS: usize = 256;
-
-pub(crate) use crate::family::project::exl3_jobs_plan::{EXL3_JOB_WORDS, exl3_max_jobs};
 
 /// Every slot of an EXL3 chunk arena exactly once, in [`exl3_chunk_tensors`] order. An EXL3 chunk
 /// has no q8_1 copies, no MMQ id tables and no stream-k fixup range.

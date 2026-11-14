@@ -7,11 +7,13 @@ use super::{
     dims::KvMode,
     prefill_plan::{
         Admission, ChunkCost, ChunkSlot as S, EXL3_SLOTS, EXL3_TILE_ROWS, Extra, M_LADDER,
-        PART_CHARGE, Phase, Phase::*, PrefillStep, SPARE_MIN, chunk_cost, chunk_costs, chunk_list,
+        PART_CHARGE, Phase, Phase::*, SPARE_MIN, chunk_cost, chunk_costs, chunk_list,
         chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_cost, exl3_chunk_costs,
-        exl3_chunk_tensors, exl3_max_jobs, fixed_depth_rows, kv_bytes, m_pos, state_bytes,
+        exl3_chunk_tensors, fixed_depth_rows, kv_bytes, m_pos, state_bytes,
     },
 };
+use crate::family::prefill::arena::PrefillStep;
+use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,

@@ -13,15 +13,13 @@ use super::{
     mixer_geometry::{DenseSpec, MixerGeometry},
     moe::MoeDims,
 };
+use crate::family::exl3_pack::Root;
 use crate::{
     EngError,
     family::{
         gguf_model::Role,
         project::cuda::CudaWeight,
-        qwen36::{
-            exl3_pack::Root,
-            mtp_pack::{FC_PREFIX, NORM_NAME, PRE_FC_NORM_EMBEDDING, PRE_FC_NORM_HIDDEN},
-        },
+        qwen36::mtp_pack::{FC_PREFIX, NORM_NAME, PRE_FC_NORM_EMBEDDING, PRE_FC_NORM_HIDDEN},
     },
 };
 

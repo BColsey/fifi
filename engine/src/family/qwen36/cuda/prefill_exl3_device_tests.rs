@@ -19,6 +19,7 @@ use crate::family::exl3::prefill::{Exl3Scratch, F32, Output, Projector};
 use crate::{
     family::{
         AttentionKind,
+        exl3_pack::layer_name,
         gguf_model::Role,
         project::cuda::{CudaProjector, CudaWeights, Exl3MatrixView, Reserve, WeightLayout},
         qwen36::cuda::{
@@ -30,7 +31,6 @@ use crate::{
             mixer_weights::MixerWeights,
             moe::Launch,
         },
-        qwen36::exl3_pack::layer_name,
     },
     kernels::cuda::{DeviceBuffer, DeviceRange, device_present, resident::router::RouterShape},
     weights::exl3::Checkpoint,

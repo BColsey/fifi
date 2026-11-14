@@ -11,7 +11,7 @@ use std::{fs, path::Path, time::Instant};
 use serde_json::json;
 
 use super::{
-    super::exl3_pack::{ExpertPart, Root, expert_name_in, inspect_pack_split, layer_name},
+    super::exl3_pack::inspect_pack_split,
     common_tests::{dims, inventory},
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
     layer_table::LayerTable,
@@ -21,6 +21,7 @@ use super::{
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
+use crate::family::exl3_pack::{ExpertPart, Root, expert_name_in, layer_name};
 use crate::{
     family::{
         AttentionKind, QWEN3_6_35B_A3B,

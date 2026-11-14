@@ -14,11 +14,11 @@ use crate::{
     weights::StreamedCheckpoint,
 };
 
-pub(in crate::family) use crate::family::exl3_pack::{
-    EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root, layer_name,
+use crate::family::exl3_pack::{
+    EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root,
 };
 #[cfg(test)]
-pub(in crate::family) use crate::family::exl3_pack::{
+use crate::family::exl3_pack::{
     ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in,
 };
 

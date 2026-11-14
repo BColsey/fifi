@@ -14,6 +14,8 @@
 use std::path::Path;
 
 use crate::family::exl3::prefill_moe::{Bufs, routed_with, run, run_banked};
+use crate::family::exl3_pack::ExpertPart;
+use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
     family::{
         exl3::bank::{Exl3SlotResolver, ExpertStore},
@@ -28,9 +30,8 @@ use crate::{
                 layer_table::LayerTable,
                 moe::{Launch, MoeDims},
                 prefill::{RouteIo, run_chunk_route},
-                prefill_plan::exl3_max_jobs,
             },
-            exl3_pack::{ExpertPart, expert_name, shared_name},
+            exl3_pack::{expert_name, shared_name},
         },
     },
     kernels::cuda::{

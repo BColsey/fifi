@@ -15,10 +15,11 @@
 use super::{
     dims::{KvMode, StepDims},
     prefill_plan::{
-        Admission, ChunkCost, ChunkSlot, Extra, M_LADDER, PART_CHARGE, PrefillStep, SPARE_MIN,
+        Admission, ChunkCost, ChunkSlot, Extra, M_LADDER, PART_CHARGE, SPARE_MIN,
         chunk_list_with_depth_tier, chunk_tensors, exl3_chunk_tensors,
     },
 };
+use crate::family::prefill::arena::PrefillStep;
 use crate::{
     EngError,
     family::{

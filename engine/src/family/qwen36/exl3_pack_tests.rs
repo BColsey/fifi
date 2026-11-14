@@ -6,11 +6,11 @@
 use std::path::Path;
 
 use super::{
-    exl3_pack::{ExpertPart, expert_name, inspect_pack_split, layer_name},
+    exl3_pack::{expert_name, inspect_pack_split},
     fixtures::{self, Entry},
     host::{AttnDims, DeltaDims, HostShape, MoeDims},
 };
-use crate::family::exl3_pack::{Marker, codebook_name};
+use crate::family::exl3_pack::{ExpertPart, Marker, codebook_name, layer_name};
 use crate::{
     EngError,
     family::{AttentionKind, QWEN3_6_35B_A3B},
@@ -345,7 +345,8 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
 #[test]
 fn exl3_plan_refuses_a_directory_without_pack_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let error = super::exl3_plan(dir.path()).expect_err("an empty directory is not a pack");
+    let error =
+        super::exl3_pack::exl3_plan(dir.path()).expect_err("an empty directory is not a pack");
     let text = format!("{error:?}");
     assert!(
         text.contains("config.json"),
@@ -367,7 +368,7 @@ fn codebook_names_are_the_markers_own() {
 #[ignore = "reads the headers of a real pack in FIFI_EXL3_CHECKPOINT"]
 fn exl3_plan_reports_the_real_packs_walk() {
     let dir = std::env::var_os("FIFI_EXL3_CHECKPOINT").expect("FIFI_EXL3_CHECKPOINT");
-    let plan = super::exl3_plan(Path::new(&dir)).expect("the pack fits the model");
+    let plan = super::exl3_pack::exl3_plan(Path::new(&dir)).expect("the pack fits the model");
     let expected: u64 = std::env::var("FIFI_EXL3_EXPECT_BYTES")
         .expect("FIFI_EXL3_EXPECT_BYTES")
         .parse()

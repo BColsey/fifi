@@ -12,8 +12,8 @@
 //! tiled order of the kernels (see `exl3_tensors`): whole heads of every matrix, vector and conv
 //! row that carries a value-head axis.
 
+use crate::family::exl3_pack::{Root, layer_name};
 use crate::family::project::cuda::WeightLayout;
-use crate::family::qwen36::exl3_pack::{Root, layer_name};
 use crate::family::qwen36::exl3_tensors::{
     decay_from_log, effective_norm_bytes, f32_le_bytes, norm_layout, permute_blocks,
     tiled_head_order, widen_f32,
