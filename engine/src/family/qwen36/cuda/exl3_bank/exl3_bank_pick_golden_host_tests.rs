@@ -16,7 +16,8 @@
 //! checkout cannot pass a compare it should fail. The Flash-Next pick golden
 //! (`flash_next/cuda/bank_pick_golden_host_tests.rs`) owns its own file, same format.
 
-use super::{DECAY_CALLS, EMPTY, LayerSlots, LayerTables, NO_SLOT, refill_plan};
+use super::LayerTables;
+use crate::family::exl3::bank::{DECAY_CALLS, EMPTY, LayerSlots, NO_SLOT, refill_plan};
 use crate::family::expert_bank::SlotTable;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;

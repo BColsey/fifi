@@ -1,7 +1,7 @@
 //! The stock-pack tensor names of Qwen3.6 and a header-only inspection of a pack against the
 //! model shape.
 //!
-//! [`inspect_pack`] reads no payload: it walks every tensor the loader will read, checks its
+//! [`inspect_pack_split`] reads no payload: it walks every tensor the loader will read, checks its
 //! stored dtype and shape against the model, requires the routed experts of a projection to
 //! share one rate (a bank has one stride), and sums the device bytes the load will hold. A pack
 //! of another size, rate, codebook or layout is refused here, before the first upload, and the
@@ -48,13 +48,6 @@ pub(in crate::family) fn shared_name(layer: usize, part: ExpertPart) -> String {
 
 fn refuse(detail: String) -> EngError {
     EngError::Checkpoint(format!("EXL3 pack: {detail}"))
-}
-
-pub(super) fn inspect_pack(
-    source: &StreamedCheckpoint,
-    shape: &HostShape,
-) -> Result<PackReport, EngError> {
-    inspect_pack_split(source, shape)
 }
 
 /// The routed experts' device bytes are the report's `expert_bytes` (the banks a banked load
@@ -155,8 +148,8 @@ impl Inspector<'_> {
         Ok(())
     }
 
-    /// The routed-expert device bytes of the layer (see [`Inspector::moe_block`]).
-    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<u64, EngError> {
+    /// The routed-expert block of the layer (see [`Inspector::moe_block`]).
+    pub(super) fn moe(&mut self, layer: usize, shape: &HostShape) -> Result<(), EngError> {
         let m = &shape.moe;
         self.moe_block(
             layer,
@@ -170,23 +163,16 @@ impl Inspector<'_> {
     }
 }
 
-/// Walks the pack of `dir` the way the serving load does (`load_exl3_dir`: pinned model,
-/// pinned rotary dimension, no MTP head) and returns its planning facts. A pack of another
-/// size, rate, codebook or layout is refused here, exactly as the load would refuse it
-/// before the first upload.
 /// The Q36 walk: the header rules of `load_exl3_dir` (pinned model, pinned rotary
-/// dimension, no MTP head).
-struct Q36Walk;
-
-impl Q36Walk {
-    fn walk(&self, dir: &std::path::Path) -> Result<PackReport, EngError> {
-        let checkpoint = crate::weights::exl3::Checkpoint::open(dir)?;
-        let shape = HostShape::from_spec(
-            &crate::family::spec::QWEN3_6_35B_A3B,
-            super::settings::ROTARY_DIM,
-        )?;
-        inspect_pack(&checkpoint.source, &shape)
-    }
+/// dimension, no MTP head). A pack of another size, rate, codebook or layout is refused
+/// here, exactly as the load would refuse it before the first upload.
+fn walk_q36(dir: &std::path::Path) -> Result<PackReport, EngError> {
+    let checkpoint = crate::weights::exl3::Checkpoint::open(dir)?;
+    let shape = HostShape::from_spec(
+        &crate::family::spec::QWEN3_6_35B_A3B,
+        super::settings::ROTARY_DIM,
+    )?;
+    inspect_pack_split(&checkpoint.source, &shape)
 }
 
 /// The device-free estimate of one pack directory for this family's serving load:
@@ -194,7 +180,5 @@ impl Q36Walk {
 pub(crate) fn exl3_plan(
     dir: &std::path::Path,
 ) -> Result<crate::family::exl3_pack::PackPlan, EngError> {
-    Q36Walk
-        .walk(dir)
-        .map(crate::family::exl3_pack::plan_from_report)
+    walk_q36(dir).map(crate::family::exl3_pack::plan_from_report)
 }

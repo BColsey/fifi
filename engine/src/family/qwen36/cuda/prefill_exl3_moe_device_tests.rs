@@ -16,11 +16,11 @@ use std::path::Path;
 use super::{Bufs, routed_with, run, run_banked};
 use crate::{
     family::{
+        exl3::bank::{Exl3SlotResolver, ExpertStore},
         project::cuda::{CudaProjector, CudaWeights, Reserve},
         qwen36::{
             cuda::{
                 common_tests::{dims, inventory},
-                exl3_bank::{Exl3SlotResolver, ExpertStore},
                 exl3_load_device_tests::{matrix_of, relative_l2, values_of},
                 exl3_moe::Exl3MoeWeights,
                 exl3_moe_source::{moe_weights, moe_weights_banked},
@@ -435,7 +435,7 @@ fn banked_sub_blocked_chunk_is_byte_identical_to_the_resident_chunk() {
     // hidden rows. `bank` pairs the layer's resolver view with the sub-block plan.
     let leg = |block: &Exl3MoeWeights<'_>,
                bank: Option<(
-        &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
+        &mut crate::family::exl3::bank::LayerResolver<'_, '_>,
         &[(usize, MoeDims)],
     )>|
      -> Vec<f32> {

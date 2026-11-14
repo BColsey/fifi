@@ -24,7 +24,6 @@ use super::{
     card_step::CardStack,
     card_weights::{load_card_weights, load_card_weights_mapped},
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
-    exl3_bank::{Exl3SlotResolver, ExpertStore},
     exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
     exl3_moe::Exl3MoeWeights,
     layer_table::LayerTable,
@@ -44,6 +43,7 @@ use crate::{
     EngError,
     family::{
         QWEN3_6_35B_A3B,
+        exl3::bank::{Exl3SlotResolver, ExpertStore},
         gguf_model::{GgufModel, Inventory, Role, open_qwen3_6_35b_a3b},
         project::cuda::{
             BorrowedLoader, CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,

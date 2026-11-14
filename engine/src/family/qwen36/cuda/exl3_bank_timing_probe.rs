@@ -15,7 +15,6 @@ use std::{cell::RefCell, path::Path, time::Instant};
 
 use super::{
     common_tests::{dims, inventory},
-    exl3_bank::Exl3SlotResolver,
     exl3_load::{BankedModel, load_exl3_banked_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, HEAD_ROWS, PROMPT, SAMPLER_VOCAB, options},
@@ -25,6 +24,7 @@ use super::{
     rules::QwenRules,
     step::{CaptureConfig, QwenResidentStep},
 };
+use crate::family::exl3::bank::Exl3SlotResolver;
 use crate::family::project::cuda::{CudaProjector, Reserve};
 
 /// The trace path: when set, every decode-phase resolve's picks are dumped (one
@@ -128,7 +128,7 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
     }
     let prompt_wall = began.elapsed();
     let ((prompt_drains, prompt_drain_ns), (prompt_resolves, prompt_resolve_ns)) =
-        crate::family::qwen36::cuda::exl3_bank::probe::take();
+        crate::family::exl3::bank::probe::take();
     let ms_prompt = |ns: u64, count: u64| ns as f64 / 1e6 / count.max(1) as f64;
     println!(
         "banked decode probe: prompt {} rows {:.0} ms ({} drains {:.2} ms each, {} resolves \
@@ -142,14 +142,14 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
     );
     let began = Instant::now();
     if trace_path().is_some() {
-        crate::family::qwen36::cuda::exl3_bank::trace::arm();
+        crate::family::exl3::bank::trace::arm();
     }
     for _ in 0..tokens {
         id = step.run_token(id, true).expect("decoded token");
     }
     let decode_wall = began.elapsed();
     let ((readback_calls, readback_ns), (_resolve_calls, resolve_ns)) =
-        crate::family::qwen36::cuda::exl3_bank::probe::take();
+        crate::family::exl3::bank::probe::take();
     let (hits, misses) = bank.borrow().stats();
     println!(
         "banked decode probe: overlap {overlap}, slots {slots}, sticky {sticky}: decode \
@@ -162,8 +162,7 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         resolve_ns as f64 / 1e6 / tokens as f64,
     );
     if let Some(path) = &trace_path() {
-        let lines =
-            crate::family::qwen36::cuda::exl3_bank::trace::dump(path).expect("the trace dump");
+        let lines = crate::family::exl3::bank::trace::dump(path).expect("the trace dump");
         println!(
             "banked decode probe: trace {lines} resolve calls to {}",
             path.display()

@@ -11,11 +11,10 @@ use std::path::Path;
 
 use super::{
     super::{
-        exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root, inspect_pack, inspect_pack_split},
+        exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root, inspect_pack_split},
         mtp_pack::inspect_mtp_pack,
     },
     dims::StepDims,
-    exl3_bank::ExpertStore,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
     exl3_source::{PackReader, attention_weights, delta_weights},
     layer_table::LayerTable,
@@ -30,6 +29,7 @@ use crate::{
     capability::probe::probe_host,
     family::{
         AttentionKind, FamilySpec, QWEN3_6_35B_A3B,
+        exl3::bank::ExpertStore,
         gguf_model::Inventory,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         qwen36::{host::HostShape, settings::ExpertBankSettings},
@@ -265,7 +265,7 @@ fn model_weights(
 ) -> Result<Vec<CudaWeight>, EngError> {
     // Every tensor is checked against the model from the headers alone, and the whole load is
     // admitted against the free memory, before the first upload.
-    let report = inspect_pack(&reader.checkpoint.source, &facts.dims.shape)?;
+    let report = inspect_pack_split(&reader.checkpoint.source, &facts.dims.shape)?;
     reader.admit(report.device_bytes)?;
     model_weights_admitted(reader, facts, None)
 }

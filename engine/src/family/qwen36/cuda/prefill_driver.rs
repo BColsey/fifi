@@ -699,7 +699,7 @@ pub(super) struct Q36ChunkCtx<'a, 'w> {
 /// `segmented_parts` for the step's report (a Qwen3.6-only figure, so it stays here and not in
 /// the trait).
 pub(super) struct Q36ChunkFamily<'a, 'w> {
-    bank: Option<&'a std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     #[cfg(test)]
     kernel_class: super::prefill::ChunkKernelClass,
     pub(super) segmented_parts: usize,
@@ -707,7 +707,7 @@ pub(super) struct Q36ChunkFamily<'a, 'w> {
 
 impl<'a, 'w> Q36ChunkFamily<'a, 'w> {
     pub(super) fn new(
-        bank: Option<&'a std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+        bank: Option<&'a std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
         #[cfg(test)] kernel_class: super::prefill::ChunkKernelClass,
     ) -> Self {
         Self {

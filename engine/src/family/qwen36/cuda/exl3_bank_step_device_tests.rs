@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 
 use super::{
     common_tests::{dims, inventory},
-    exl3_bank::Exl3SlotResolver,
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, GENERATED, HEAD_ROWS, PROMPT, SAMPLER_VOCAB, options},
@@ -27,6 +26,7 @@ use super::{
     rules::QwenRules,
     step::{CaptureConfig, QwenResidentStep},
 };
+use crate::family::exl3::bank::Exl3SlotResolver;
 use crate::{
     EngError,
     family::project::cuda::{CudaProjector, CudaWeights, Reserve},

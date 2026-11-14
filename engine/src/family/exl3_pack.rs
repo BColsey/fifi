@@ -397,12 +397,12 @@ impl<'a> Inspector<'a> {
 
     /// The routed-expert block of `layer`: the router and the shared-expert gate as plain tensors
     /// (F32 on the device), the routed experts of each projection at one rate (a bank has one
-    /// stride), and the shared expert. Returns the device bytes of the routed experts alone.
+    /// stride), and the shared expert; the routed experts' bytes land in `expert_bytes`.
     pub(in crate::family) fn moe_block(
         &mut self,
         layer: usize,
         block: MoeBlock,
-    ) -> Result<u64, EngError> {
+    ) -> Result<(), EngError> {
         let MoeBlock {
             hidden: h,
             experts,
@@ -416,7 +416,6 @@ impl<'a> Inspector<'a> {
             false,
         )?;
         self.plain(&shared_gate_name_in(self.root, layer), &[1, dim(h)], false)?;
-        let mut routed = 0;
         for part in ExpertPart::ALL {
             let (k, n) = match part {
                 ExpertPart::Down => (inter, h),
@@ -432,7 +431,6 @@ impl<'a> Inspector<'a> {
                     )));
                 }
             }
-            routed += self.bytes - before;
             self.expert_bytes += self.bytes - before;
             let (k, n) = match part {
                 ExpertPart::Down => (shared_inter, h),
@@ -440,6 +438,6 @@ impl<'a> Inspector<'a> {
             };
             self.matrix(&shared_name_in(self.root, layer, part), k, n)?;
         }
-        Ok(routed)
+        Ok(())
     }
 }

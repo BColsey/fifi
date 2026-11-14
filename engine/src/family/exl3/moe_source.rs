@@ -8,13 +8,10 @@
 //! projection as one bank, the shared expert as three single matrices.
 
 use crate::family::{
+    exl3::bank::{ExpertStore, PartStore},
     exl3_pack::{ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in},
     qwen36::cuda::{
-        exl3_bank::{ExpertStore, PartStore},
-        exl3_source::PackReader,
-        layer_table::LayerTable,
-        mixer_geometry::DenseSpec,
-        moe::MoeDims,
+        exl3_source::PackReader, layer_table::LayerTable, mixer_geometry::DenseSpec, moe::MoeDims,
     },
 };
 use crate::{

@@ -1218,7 +1218,7 @@ pub(super) struct ChunkRun<'r, 'w> {
     bufs: &'r ChunkBufs<'r>,
     rows: ChunkRows,
     sparse: Option<ChunkSparse<'r>>,
-    bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+    bank: Option<&'r std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     segmented_parts: std::cell::Cell<usize>,
     #[cfg(test)]
     kernel_class: ChunkKernelClass,
@@ -1289,7 +1289,7 @@ impl<'r, 'w> ChunkRun<'r, 'w> {
     /// and groups the launches on slot ids. `None` on resident loads.
     pub(super) fn with_bank(
         mut self,
-        bank: Option<&'r std::cell::RefCell<super::exl3_bank::Exl3SlotResolver<'w>>>,
+        bank: Option<&'r std::cell::RefCell<crate::family::exl3::bank::Exl3SlotResolver<'w>>>,
     ) -> Self {
         self.bank = bank;
         self

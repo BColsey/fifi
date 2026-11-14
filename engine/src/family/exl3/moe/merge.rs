@@ -390,7 +390,7 @@ pub(in crate::family) fn run_exl3_moe_merged(
     (weights, bufs, merge): (&Exl3MoeWeights<'_>, &Exl3MoeBufs<'_>, &SharedMerge),
     dims: &MoeDims,
     device_ids: bool,
-    mut bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut crate::family::exl3::bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     check_dims(&plan_dims(dims)).map_err(refuse)?;

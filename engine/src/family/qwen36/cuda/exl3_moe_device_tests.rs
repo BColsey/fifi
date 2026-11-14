@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use super::{
     super::exl3_pack::{ExpertPart, expert_name, router_name, shared_gate_name, shared_name},
     common_tests::{dims, inventory},
-    exl3_bank::{Exl3SlotResolver, ExpertStore},
     exl3_load_device_tests::{matrix_of, relative_l2, values_of},
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
     exl3_moe_source::{moe_weights, moe_weights_banked},
@@ -21,6 +20,7 @@ use super::{
     moe::{Launch, MoeDims, RouteBufs},
     resources::STEP_ROWS,
 };
+use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};
 use crate::{
     EngError,
     family::project::cuda::{CudaProjector, CudaWeights, Reserve},
@@ -268,7 +268,7 @@ fn run_block_rounded(
     moe: &MoeDims,
     device_ids: bool,
     row: &[f32],
-    bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+    bank: Option<&mut crate::family::exl3::bank::LayerResolver<'_, '_>>,
 ) -> Result<Device, EngError> {
     let (_, resid) = inputs(moe.hidden);
     let h = moe.hidden * F32;

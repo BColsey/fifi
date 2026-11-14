@@ -17,7 +17,6 @@ use super::{
     common_tests::{dims, inventory},
     d1_window_device_tests::{arm_rollback, arm_verify},
     dims::{KvMode, StepOptions},
-    exl3_bank::Exl3SlotResolver,
     exl3_load::{BankedModel, load_exl3_banked_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, GENERATED, HEAD_ROWS, PROMPT, SAMPLER_VOCAB},
@@ -27,6 +26,7 @@ use super::{
     rules::QwenRules,
     step::{CaptureConfig, QwenResidentStep},
 };
+use crate::family::exl3::bank::Exl3SlotResolver;
 use crate::{
     EngError,
     family::{

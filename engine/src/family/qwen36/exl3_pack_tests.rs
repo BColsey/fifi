@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use super::{
-    exl3_pack::{ExpertPart, expert_name, inspect_pack, inspect_pack_split, layer_name},
+    exl3_pack::{ExpertPart, expert_name, inspect_pack_split, layer_name},
     fixtures::{self, Entry},
     host::{AttnDims, DeltaDims, HostShape, MoeDims},
 };
@@ -200,7 +200,7 @@ fn counted(entries: &[Entry]) -> u64 {
 
 fn refusal(entries: Vec<Entry>) -> String {
     let source = fixtures::checkpoint(entries);
-    match inspect_pack(&source, &shape()) {
+    match inspect_pack_split(&source, &shape()) {
         Err(EngError::Checkpoint(message)) => message,
         other => panic!("expected a pack refusal, got {other:?}"),
     }
@@ -217,7 +217,7 @@ fn position(entries: &[Entry], name: &str) -> usize {
 fn a_pack_of_the_model_shape_is_counted_from_its_headers() {
     let entries = pack(&shape());
     let expected = counted(&entries);
-    let report = inspect_pack(&fixtures::checkpoint(entries), &shape()).unwrap();
+    let report = inspect_pack_split(&fixtures::checkpoint(entries), &shape()).unwrap();
     assert_eq!(report.device_bytes, expected);
     assert_eq!(report.codebook, Marker::Mcg);
     // The head at 6 bits and every other matrix at 4: the rate is per matrix, the experts of one
@@ -312,7 +312,7 @@ fn a_model_whose_widths_are_not_multiples_of_128_is_refused() {
     narrow.hidden = 192;
     let source = fixtures::checkpoint(pack(&narrow));
     assert!(matches!(
-        inspect_pack(&source, &narrow),
+        inspect_pack_split(&source, &narrow),
         Err(EngError::Checkpoint(m)) if m.contains("multiple of 128")
     ));
 }
@@ -330,7 +330,7 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
         .check_architecture_config(&checkpoint.model_config)
         .expect("the pack config is the model's");
     let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).unwrap();
-    let report = inspect_pack(&checkpoint.source, &shape).expect("the pack fits the model");
+    let report = inspect_pack_split(&checkpoint.source, &shape).expect("the pack fits the model");
     println!("{report:?}");
     let expected: u64 = std::env::var("FIFI_EXL3_EXPECT_BYTES")
         .expect("FIFI_EXL3_EXPECT_BYTES")

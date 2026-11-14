@@ -226,7 +226,7 @@ fn read_picks(
     ids.buffer()
         .read_at(launch.stream, ids.offset(), &mut raw)?;
     #[cfg(test)]
-    crate::family::qwen36::cuda::exl3_bank::probe::readback(began.elapsed());
+    crate::family::exl3::bank::probe::readback(began.elapsed());
     raw.as_chunks::<I32>()
         .0
         .iter()
@@ -725,7 +725,7 @@ pub(in crate::family) fn run_exl3_moe(
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
     device_ids: bool,
-    mut bank: Option<&mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>>,
+    mut bank: Option<&mut crate::family::exl3::bank::LayerResolver<'_, '_>>,
     overlap: bool,
 ) -> Result<(), EngError> {
     if dims.rows != 1 {
@@ -752,7 +752,7 @@ pub(in crate::family) fn run_exl3_moe(
                 let began = std::time::Instant::now();
                 let split = bank.resolve_split(launch.stream, &picks, overlap);
                 #[cfg(test)]
-                crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+                crate::family::exl3::bank::probe::resolve(began.elapsed());
                 // A resolve that fails mid-refill leaves copies on the copy stream with no
                 // event recorded, so no wait would ever order them (fence_copy_stream).
                 let (slots, missed, event) = match split {
@@ -906,7 +906,7 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
     weights: &Exl3MoeWeights<'_>,
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
-    bank: &mut crate::family::qwen36::cuda::exl3_bank::LayerResolver<'_, '_>,
+    bank: &mut crate::family::exl3::bank::LayerResolver<'_, '_>,
 ) -> Result<(), EngError> {
     let rows = dims.rows;
     if !(2..=8).contains(&rows) {
@@ -922,7 +922,7 @@ pub(in crate::family) fn run_exl3_moe_rows_banked(
         let began = std::time::Instant::now();
         let mapped = bank.resolve(launch.stream, row)?;
         #[cfg(test)]
-        crate::family::qwen36::cuda::exl3_bank::probe::resolve(began.elapsed());
+        crate::family::exl3::bank::probe::resolve(began.elapsed());
         routed(
             launch,
             weights,

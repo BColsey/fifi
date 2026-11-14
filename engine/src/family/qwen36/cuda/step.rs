@@ -37,7 +37,6 @@ use std::cell::RefCell;
 
 use super::{
     dims::{KvMode, StepOptions},
-    exl3_bank::Exl3SlotResolver,
     exl3_moe::{
         Exl3MoeBufs, Exl3MoeWeights, Scratch,
         merge::{SharedMerge, run_exl3_moe_merged},
@@ -82,6 +81,7 @@ use super::{
 };
 use crate::{
     EngError,
+    family::exl3::bank::Exl3SlotResolver,
     family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
     family::qwen36::exl3_merge_plan::{
         Intent, Source, load_suffix, resolve_switch, shared_in_routed_explicit,

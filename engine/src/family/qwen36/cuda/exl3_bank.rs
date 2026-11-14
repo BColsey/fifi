@@ -1,11 +1,12 @@
 //! The banked EXL3 expert load's Qwen3.6 half: the admission arithmetic that decides
 //! banking and the slot count (pure, mirrored on `project::cuda`'s demand rule) and the
-//! seam's table half ([`LayerTables`]). The store, the slot table and the resolver moved
-//! to [`crate::family::exl3::bank`]; their paths re-export from here.
+//! seam's table half ([`LayerTables`]). The store, the slot table and the resolver live in
+//! [`crate::family::exl3::bank`]; every consumer imports them there.
 
 use crate::{
     EngError,
     family::{
+        exl3::bank::{LayerSlots, per_member_bytes},
         project::cuda::Reserve,
         qwen36::settings::{BankMode, SlotRequest},
     },
@@ -169,15 +170,7 @@ impl crate::family::expert_bank::SlotTable for LayerTables {
     }
 }
 
-// The family-neutral store machinery moved to `family::exl3::bank`; these re-exports keep
-// every existing path (the loader, the step, the probes, the pick-golden harness) stable.
 #[cfg(test)]
-pub(in crate::family) use crate::family::exl3::bank::{
-    DECAY_CALLS, EMPTY, NO_SLOT, probe, refill_plan, trace,
-};
-pub(in crate::family) use crate::family::exl3::bank::{
-    Exl3SlotResolver, ExpertStore, LayerResolver, LayerSlots, PartStore, per_member_bytes,
-};
 mod tests {
     use super::*;
 
