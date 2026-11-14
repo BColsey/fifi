@@ -362,23 +362,28 @@ fn a_miss_pass_adds_each_missed_pick_once() {
     assert_eq!(classified.misses.len(), 2);
     let (result, inputs) = split(&mut state, &ids, &w, 0.6);
     let (slots, miss_weights) = inputs.miss.expect("two misses");
-    // The weights of the two passes add to the router's weights bit for bit, one pick per pick.
+    // The compact list carries the missed picks (rank positions 2 and 7) in pick order; every
+    // other pick contributes exactly +0.0 to the split by being absent, not by a filler entry.
+    assert_eq!(slots.len(), 2);
     for (pick, &weight) in w.iter().enumerate() {
-        let sum = classified.weights[pick] + miss_weights[pick];
-        assert_eq!(sum.to_bits(), weight.to_bits(), "pick {pick}");
         let missed = pick == 2 || pick == 7;
-        assert_eq!(miss_weights[pick] != 0.0, missed, "pick {pick}");
         assert_eq!(classified.weights[pick] != 0.0, !missed, "pick {pick}");
-        if !missed {
-            assert_eq!(slots[pick], 0, "a filler pick reads slot 0");
-            assert_eq!(miss_weights[pick].to_bits(), 0.0f32.to_bits());
-        }
+        let carried = match pick {
+            2 | 7 => miss_weights[if pick == 2 { 0 } else { 1 }],
+            _ => 0.0,
+        };
+        // The weights of the two passes add to the router's weights bit for bit.
+        assert_eq!(
+            (classified.weights[pick] + carried).to_bits(),
+            weight.to_bits(),
+            "pick {pick}"
+        );
     }
     // The missed picks sit on slots the copies filled, never on slot 0.
-    for &pick in &[2usize, 7] {
-        assert_ne!(slots[pick], 0);
+    for (entry, &pick) in [2usize, 7].iter().enumerate() {
+        assert_ne!(slots[entry], 0);
         assert_eq!(
-            state.expert_in_slot(0, slots[pick] as usize),
+            state.expert_in_slot(0, slots[entry] as usize),
             Some(ids[pick] as u16)
         );
     }
@@ -458,7 +463,8 @@ fn the_bank_state_after_a_pass_is_what_the_second_pass_reads() {
     assert_eq!((copies.hits, copies.ops.len()), (9, 1));
     let second = plan_second_pass(&ids, &w, &classified, state.slot_row(0)).unwrap();
     let (slots, _) = second.miss.unwrap();
-    assert_eq!(slots[9], i32::from(copies.ops[0].slot));
+    // Pick 9 is the only miss, so the compact list holds it at index 0.
+    assert_eq!(slots[0], i32::from(copies.ops[0].slot));
     // The classification made before the copies is stale after them: a second use of the old row
     // would send the missed pick to the filler.
     assert_eq!(row_before[200], -1);

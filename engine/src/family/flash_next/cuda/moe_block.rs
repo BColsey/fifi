@@ -14,9 +14,9 @@
 //!    not ordered with the block's stream: they overlap the resident pass, and the host waits for
 //!    them before it queues the miss pass.
 //! 5. With at least one miss, the miss pass is queued: the same launches over the slot row after
-//!    the copies, with the missed picks on their new slots at their true weights and every other
-//!    pick on the filler at +0.0 ([`miss_pass_inputs`]); the combine adds it to the resident
-//!    result.
+//!    the copies, carrying ONLY the missed picks on their new slots at their true weights
+//!    ([`miss_pass_inputs`]) — no +0.0 filler, the launch is as wide as the miss count; the
+//!    combine adds it to the resident result.
 //!
 //! WHY this shape: the resident pass needs nothing a miss brings, so it runs while the host
 //! plans and waits for the copies. The overlap is safe because of one rule of the bank's policy:
@@ -806,6 +806,7 @@ mod device {
             let slot_row_after = self.bank.slot_row(layer)?.to_vec();
             let second = plan_second_pass(&ids, &weights, &classified, &slot_row_after)?;
             if let Some((miss_slots, miss_weights)) = second.miss {
+                let n = miss_slots.len();
                 let scratch = &self.scratch;
                 prof::blocked(36, profile, || {
                     scratch.write_at(stream, sc.miss_ids, &le_i32(&miss_slots))?;
@@ -817,16 +818,15 @@ mod device {
                     dims,
                     Pass {
                         layer,
-                        ids: scratch.range(sc.miss_ids, k * I32)?,
-                        weights: scratch.range(sc.miss_weights, k * F32)?,
+                        ids: scratch.range(sc.miss_ids, n * I32)?,
+                        weights: scratch.range(sc.miss_weights, n * F32)?,
                         shared: false,
                         res: scratch.range(sc.partial, h * F32)?,
                         out: bufs.route.resid_out,
                     },
                 )?;
-                if self.verify_finite_filler {
-                    self.check_filler(launch, bufs, dims, 0, &miss_weights)?;
-                }
+                // No filler picks remain in the compact list, so there is no zero-weight
+                // row to poison the sum; the resident pass keeps its check.
             }
             Ok(())
         }
@@ -1203,6 +1203,7 @@ mod device {
                     plan_second_pass(&picks[r].0, &picks[r].1, &classified[r], &slot_row_after)?;
                 tick(32);
                 if let Some((miss_slots, miss_weights)) = second.miss {
+                    let n = miss_slots.len();
                     prof::blocked(39, profile, || {
                         scratch.write_at(
                             stream,
@@ -1222,16 +1223,14 @@ mod device {
                         dims,
                         Pass {
                             layer,
-                            ids: scratch.range(sc.miss_ids + r * k * I32, k * I32)?,
-                            weights: scratch.range(sc.miss_weights + r * k * F32, k * F32)?,
+                            ids: scratch.range(sc.miss_ids + r * k * I32, n * I32)?,
+                            weights: scratch.range(sc.miss_weights + r * k * F32, n * F32)?,
                             shared: false,
                             res: row(&partial, h * F32, r)?,
                             out: row(&bufs.route.resid_out, h * F32, r)?,
                         },
                     )?;
-                    if self.verify_finite_filler {
-                        self.check_filler(launch, &row_bufs, dims, 0, &miss_weights)?;
-                    }
+                    // Compact list: no filler picks, so no filler check (same as `run`).
                 }
             }
             tick(33);
@@ -1694,7 +1693,10 @@ mod device {
             dims: &MoeDims,
             pass: Pass<'_>,
         ) -> Result<(), EngError> {
-            let (h, i, k) = (dims.hidden, dims.inter, dims.top_k);
+            let (h, i) = (dims.hidden, dims.inter);
+            // The resident pass carries top_k picks; the miss pass only the missed ones, so
+            // the width comes from the ids range, not the dims.
+            let k = pass.ids.bytes() / I32;
             let mut items = Vec::with_capacity(2 * k);
             for pick in 0..k {
                 for part in 0..2usize {

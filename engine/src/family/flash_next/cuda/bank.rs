@@ -12,8 +12,9 @@
 //!    [`ExpertBankState::begin_pass`] can plan the copies: every expert of the pass is protected, a
 //!    miss takes the least recently used unprotected slot, and the slot's old expert leaves the card.
 //! 3. [`PassCopies`] says what to move. The copy is synchronous (the missed picks wait for it).
-//! 4. The missed picks run on their new slots with their true weights, every other pick on the
-//!    filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit for bit.
+//! 4. The missed picks run on their new slots with their true weights — the missed picks ONLY,
+//!    no filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit
+//!    for bit.
 //!
 //! WHY this shape:
 //!
@@ -648,10 +649,11 @@ impl ExpertBankState<ReplaceOnMissLru> {
 // The filler rule for the second pass.
 // ---------------------------------------------------------------------------------------------
 
-/// The slot ids and weights of the missed-pick launch, after the copies: a missed pick runs on its
-/// new slot with the router's weight, every other pick on the filler (slot 0, weight +0.0). The
-/// resident pass (`classified.slot_ids`, `classified.weights`) and this one add to the router's
-/// weights bit for bit, so the combine sees each pick exactly once.
+/// The slot ids and weights of the missed-pick launch, after the copies: every missed pick runs
+/// on its new slot with the router's weight — the missed picks ONLY, no +0.0 filler, so the
+/// launch carries [`Classified::misses`] entries instead of `top_k`. The resident pass
+/// (`classified.slot_ids`, `classified.weights`) carries the rest: the two passes' weights add
+/// to the router's weights bit for bit, so the combine sees each pick exactly once.
 ///
 /// Refuses a row the classifier flagged invalid, a router fault, lists of different lengths and a
 /// missed expert that still has no slot.
@@ -669,8 +671,8 @@ pub(super) fn miss_pass_inputs(
             "the classifier flagged the route invalid".into(),
         ));
     }
-    let mut slots = Vec::with_capacity(ids.len());
-    let mut out = Vec::with_capacity(ids.len());
+    let mut slots = Vec::with_capacity(classified.misses.len());
+    let mut out = Vec::with_capacity(classified.misses.len());
     for (&id, &weight) in ids.iter().zip(weights) {
         if id < 0 {
             return Err(bank_error("a router fault has no second pass".into()));
@@ -685,9 +687,6 @@ pub(super) fn miss_pass_inputs(
                 })?;
             slots.push(slot);
             out.push(weight);
-        } else {
-            slots.push(0);
-            out.push(0.0);
         }
     }
     Ok((slots, out))
