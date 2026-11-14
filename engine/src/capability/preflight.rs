@@ -1739,6 +1739,88 @@ fn largest_fitting_cuda(
 
 #[cfg(test)]
 mod tests {
+    use super::{largest_fitting_cuda, largest_resident_context};
+
+    /// c0 goldens (P4): `largest_fitting_cuda` on a linear charge model. The
+    /// demand carries the four canonical constants (part 64 MiB, spare 64 MiB,
+    /// margin 256 MiB, floor 384 MiB, so 768 MiB fixed) plus 1 MiB per lattice
+    /// step, and the admit rule is `free - weights - charges >= band`
+    /// (band 128 MiB), all in i128. Free values sit exactly on the boundary of
+    /// a chosen step count and one byte/one step either side.
+    #[test]
+    fn largest_fitting_cuda_golden_grid() {
+        const MIB: u64 = 1 << 20;
+        let demand = |context: u32| {
+            Ok(crate::family::qwen36::admission_sketch::admission_demand(
+                (u64::from(context) / 1024) * MIB,
+                0,
+                0,
+                0,
+            ))
+        };
+        let band = crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES;
+        let fixed = 768 * MIB + band; // part+spare+margin+floor+band
+        // free(fitting steps) = fixed + steps*MiB. Boundary at 97 steps.
+        let at = |steps: u64| fixed + steps * MIB;
+        let grid: [(u64, u32, Option<u32>); 8] = [
+            (at(96), 100_000, Some(98_304)),     // exactly 96 admitting steps
+            (at(97) - 1, 100_000, Some(98_304)), // one byte under 97 steps: still 96
+            (at(97), 100_000, Some(98_304)),     // 97 steps strand at 98_304 (off-lattice request)
+            (at(99), 100_000, Some(98_304)),     // 99 steps strand too: the request is off-lattice
+            (at(128), 131_072, Some(130_048)),   // 128 steps = 131_072 == request: never asked
+            (at(128), 262_144, Some(131_072)),   // 128 steps, room to return it
+            (at(0) - 1, 2048, None),             // under even the first probe
+            (at(1), 1024, None),                 // request at the step floor
+        ];
+        for (free, requested, expected) in grid {
+            assert_eq!(
+                largest_fitting_cuda(free, 0, &demand, requested),
+                expected,
+                "free={free} requested={requested}"
+            );
+        }
+    }
+
+    /// c0 goldens (P4): the Flint resident-context scan. It starts at 1024,
+    /// steps by 1024, and STOPS at the first non-admitting step - a later gap
+    /// never rescues a larger value - and never returns the limit itself.
+    #[test]
+    fn largest_resident_context_golden_scan() {
+        let opts = |limit: u32| {
+            let mut options = crate::family::flint::settings::FlintOptions::cuda_default();
+            options.context_limit = limit;
+            options
+        };
+        // Monotone cut at 50_000 (off-lattice): last admitting step 49_152.
+        let cut = |context: u32, _free: u64| context <= 50_000;
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &cut, 1 << 40),
+            Some(49_152)
+        );
+        // A gap (20_480..=30_720 refuses, above admits): the scan STOPS in the
+        // gap and returns 19_456, not the later larger value.
+        let gap = |context: u32, _free: u64| !(20_480..=30_720).contains(&context);
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &gap, 1 << 40),
+            Some(19_456)
+        );
+        // First step refuses, or the limit is below the first step.
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &|_, _| false, 1 << 40),
+            None
+        );
+        assert_eq!(
+            largest_resident_context(&opts(1023), &|_, _| true, 1 << 40),
+            None
+        );
+        // A cut exactly on the lattice returns that step.
+        let on_lattice = |context: u32, _free: u64| context <= 30_720;
+        assert_eq!(
+            largest_resident_context(&opts(131_072), &on_lattice, 1 << 40),
+            Some(30_720)
+        );
+    }
+
     use super::{
         Check, CheckStatus, Compatibility, Estimate, PlanFixity, Qualification, ResourceFit,
         Verdict, q36_dimensions, q36_verdict,

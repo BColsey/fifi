@@ -323,3 +323,37 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
     // A quiet host keeps the 8 GiB OS floor.
     assert_eq!(measured(free, 62 * GIB).host.non_reclaimable, 8 * GIB);
 }
+
+/// c0 goldens (P4): `TierInputs::measured` as a literal struct. The four
+/// qwen36::admission_sketch constants it imports (a family-to-family import
+/// today) land in named fields; P4 moving the constants must not change a
+/// byte of this table.
+#[test]
+fn tier_inputs_measured_golden_struct() {
+    let kv = KvPlan {
+        positions: 131_072,
+        bytes_per_position: 4096,
+    };
+    let inputs = TierInputs::measured(
+        shape(),
+        (7 * GIB, 512 * MIB),
+        kv,
+        22 * GIB,
+        (64 * GIB, 6 * GIB),
+    );
+    assert_eq!(inputs.vram.usable, 22 * GIB);
+    assert_eq!(inputs.vram.non_expert, 7 * GIB + 512 * MIB);
+    assert_eq!(inputs.vram.state, 64 * MIB);
+    assert_eq!(inputs.vram.arena, 384 * MIB);
+    assert_eq!(inputs.vram.desktop_reserve, (256 + 64 + 128) * MIB);
+    assert_eq!(inputs.kv.positions, 131_072);
+    assert_eq!(inputs.kv.bytes_per_position, 4096);
+    assert_eq!(inputs.host.total, 64 * GIB);
+    assert_eq!(inputs.host.non_reclaimable, 58 * GIB);
+    assert_eq!(inputs.host.engine_heap, 2 * GIB);
+    assert_eq!(inputs.host.staging, GIB);
+    assert_eq!(inputs.host.margin, GIB);
+    // The host floor: available memory cannot push non-reclaimable under 8 GiB.
+    let clamped = TierInputs::measured(shape(), (0, 0), kv, 0, (64 * GIB, 60 * GIB));
+    assert_eq!(clamped.host.non_reclaimable, 8 * GIB);
+}

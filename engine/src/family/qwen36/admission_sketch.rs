@@ -172,6 +172,67 @@ pub(crate) fn admission_demand(
 
 #[cfg(test)]
 mod tests {
+    /// c0 goldens (P4): the probe SEQUENCE of `largest_fitting_context` is
+    /// qualified output - a later consumer writes its result into refusal text -
+    /// so the answers below are pinned per predicate, derived by hand from the
+    /// loop before any P4 change. Do NOT "improve" a row: the lattice-floor in
+    /// the midpoint makes some answers land BELOW the largest fitting step when
+    /// the request is not lattice-aligned, and that is shipped behavior.
+    #[test]
+    fn largest_fitting_context_golden_probes() {
+        // Degenerate arms: a request at or below the step, or a first step
+        // that does not fit, refuse.
+        assert_eq!(largest_fitting_context(1024, &|_| true), None);
+        assert_eq!(largest_fitting_context(2048, &|_| false), None);
+        // The request itself is never asked: even a predicate that accepts
+        // everything returns the step below it.
+        assert_eq!(largest_fitting_context(2048, &|_| true), Some(1024));
+        // A monotone cut at 200_704 (= 196 steps exactly, on the lattice) over
+        // a 262_144 request: the FIRST probe lands exactly on 131_072 (the
+        // staging tier bound), and the search converges onto the cut.
+        let cut = |context: u32| context <= 200_704;
+        assert_eq!(largest_fitting_context(262_144, &cut), Some(200_704));
+        // The Q8 staging cliff as a predicate: 131_072 alone refuses, every
+        // other step up to 200_704 admits. Once the first probe (131_072)
+        // refuses, no row above it is ever probed: the answer is 130_048 even
+        // though 200_704 would admit. Non-monotone by design; keep it.
+        let cliff = |context: u32| context != 131_072 && context <= 200_704;
+        assert_eq!(largest_fitting_context(262_144, &cliff), Some(130_048));
+        // A cut OFF the lattice (below 100_000, itself off-lattice): the
+        // lattice-floored midpoint strands the low pointer at 98_304, three
+        // steps under the largest admitting step 99_328. Shipped behavior.
+        let odd_cut = |context: u32| context < 100_000;
+        assert_eq!(largest_fitting_context(100_000, &odd_cut), Some(98_304));
+    }
+
+    /// c0 goldens (P4): the charge terms of `admission_demand` and its checked
+    /// total as literal cells. `state_bytes` folds kv + fixed + prefix tip.
+    #[test]
+    fn admission_demand_golden_cells() {
+        let sketch = admission_demand(1 << 20, 2 << 20, 3 << 20, 4 << 20);
+        assert_eq!(sketch.state_bytes, 6 << 20);
+        assert_eq!(sketch.staging_bytes, 4 << 20);
+        assert_eq!(sketch.part_charge_bytes, PREFILL_PART_CHARGE_BYTES as u64);
+        assert_eq!(sketch.spare_min_bytes, PREFILL_SPARE_MIN_BYTES as u64);
+        assert_eq!(sketch.margin_bytes, FIXED_ADMISSION_MARGIN_BYTES as u64);
+        assert_eq!(sketch.overhead_floor_bytes, RUNTIME_OVERHEAD_FLOOR_BYTES);
+        let total = sketch.total_after_weights().expect("fits u64");
+        assert_eq!(
+            total,
+            (6u64 << 20)
+                + (4u64 << 20)
+                + PREFILL_PART_CHARGE_BYTES as u64
+                + PREFILL_SPARE_MIN_BYTES as u64
+                + FIXED_ADMISSION_MARGIN_BYTES as u64
+                + RUNTIME_OVERHEAD_FLOOR_BYTES
+        );
+        // The composition saturates its state instead of panicking, and the
+        // checked total then REPORTS the overflow rather than wrapping.
+        let huge = admission_demand(u64::MAX, u64::MAX, u64::MAX, 0);
+        assert_eq!(huge.state_bytes, u64::MAX);
+        assert!(huge.total_after_weights().is_err());
+    }
+
     use super::*;
 
     #[test]

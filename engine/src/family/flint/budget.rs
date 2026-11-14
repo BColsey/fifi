@@ -769,6 +769,31 @@ mod tests {
         );
     }
 
+    /// c0 goldens (P4): `bank_note` verbatim, all three reason arms - the
+    /// load line is a qualified surface; P4 adapters must reproduce these
+    /// strings byte for byte.
+    #[test]
+    fn bank_note_golden_strings() {
+        assert_eq!(
+            bank_note(131_072, 128, "auto"),
+            "Flint expert bank: context 131072 does not fit with every expert on the GPU. \
+             128 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
+             memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
+        );
+        assert_eq!(
+            bank_note(65_536, 64, "forced"),
+            "Flint expert bank: FIFI_FLINT_CUDA_EXPERT_CACHE=1 asks for the host buffer. \
+             64 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
+             memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
+        );
+        assert_eq!(
+            bank_note(32_768, 32, "override"),
+            "Flint expert bank: FIFI_FLINT_CUDA_EXPERT_SLOTS asks for a smaller bank. \
+             32 of 256 experts per layer stay on the GPU and all 256 sit in pinned host \
+             memory. FIFI_FLINT_CUDA_EXPERT_CACHE=0 keeps every expert on the GPU instead."
+        );
+    }
+
     #[test]
     fn bank_budget_sums_the_named_fixed_terms() {
         let fixed = 10 + 20 + 30 + FLINT_HEADROOM_BYTES + BANK_MARGIN_BYTES;
