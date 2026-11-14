@@ -1,11 +1,15 @@
 //! The shared host half of the expert-bank seam: the slot-policy contract, the host places,
-//! the copy plan of a pass and the counters. Ungated on purpose — plain host gates compile and
-//! run the seam's tests without the card feature (knowledge:
-//! `native-cuda-gated-tests-invisible-to-featureless-lib-gates`). The Flash-Next bank
-//! (`family/flash_next/cuda/bank.rs`) keeps the device owner, the pinned-store budget and its
-//! `ReplaceOnMissLru` policy; this module is what a second family's bank can share without
-//! adopting Flash-Next's pass protocol: the state types are policy-agnostic, the trait is the
-//! four-method contract whose rules are stated there.
+//! the copy plan of a pass, the counters, and (in [`policy`]) the slot policies themselves.
+//! Ungated on purpose — plain host gates compile and run the seam's tests without the card
+//! feature (knowledge: `native-cuda-gated-tests-invisible-to-featureless-lib-gates`). The
+//! first family's bank (`family/flash_next/cuda/bank.rs`) keeps the device owner, the
+//! pinned-store budget and its construction of the seam's [`ReplaceOnMissLru`]; this module
+//! is what a second family's bank can share without adopting that family's pass protocol:
+//! the state types are policy-agnostic, the trait is the four-method contract whose rules
+//! are stated there.
+
+pub(crate) mod policy;
+pub(crate) use policy::ReplaceOnMissLru;
 
 use crate::EngError;
 
@@ -72,9 +76,9 @@ impl BankGeometry {
         })
     }
 
-    // The bank the tier plan settled is Flash-Next's construction: `from_plan` lives in
+    // The bank the tier plan settled is the first family's construction: `from_plan` lives in
     // `family/flash_next/cuda/bank.rs` (an inherent impl of this struct) so the seam does not
-    // depend on the Flash-Next moe modules.
+    // depend on that family's moe modules.
 
     /// Byte offset of `slot` (or of a host place) in a layer's buffer.
     pub(crate) fn offset(&self, index: usize) -> usize {
@@ -128,7 +132,7 @@ pub(crate) struct PassPlan {
 }
 
 /// The classifier-facing table half of the seam: the slot row a tiered classifier reads and
-/// the slot -> expert inverse. A family whose pass protocol differs from Flash-Next's
+/// the slot -> expert inverse. A family whose pass protocol differs from the first bank's
 /// copy planning implements just this half without adopting `SlotPolicy`.
 pub(crate) trait SlotTable {
     /// The classifier's table of `layer`: the slot of every expert, or -1.
