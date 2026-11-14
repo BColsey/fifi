@@ -1,0 +1,156 @@
+//! The device-budget arithmetic shared by every family preflight.
+//!
+//! The families each know WHICH charges a load pins and HOW MUCH the search
+//! step is; the ledger rules — how a set of labelled charges folds into a
+//! checked total, and how a slack compares against an admission band — are
+//! the same everywhere, so they live here once. Nothing in this module
+//! touches a device, a feature gate, or an error string: the callers own
+//! their refusal text and their gate.
+//!
+//! * [`largest_fitting`] is the bisecting context search (a monotone
+//!   `fits`): the paper admission and its `enginesrv check` proposal
+//!   search both delegate to it.
+//! * [`largest_fitting_linear`] is the stop-at-first-false scan for
+//!   predicates that need not be monotone (an admitting later step must not
+//!   hide a refusing earlier one): the resident-context receipt uses
+//!   it.
+//! * [`DeviceReserve`] is the ordered, labelled charge list plus the
+//!   admission band, with a checked total.
+
+/// The largest context, a multiple of `step` and below `requested`, for which
+/// `fits` holds; `None` when not even one step fits (or `requested` is at
+/// most one step). `fits` must be monotone (a longer context never fits
+/// where a shorter one does not) and `requested` is assumed not to fit: it is
+/// never asked.
+pub(crate) fn largest_fitting(
+    requested: u32,
+    step: u32,
+    fits: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
+    if requested <= step || !fits(step) {
+        return None;
+    }
+    let mut low = step;
+    let mut high = requested;
+    while high - low > step {
+        let mid = low + (high - low) / 2 / step * step;
+        if mid <= low {
+            break;
+        }
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some(low)
+}
+
+/// The largest context, a multiple of `step` and at most `limit`, for which
+/// `admits` holds on EVERY step up to it: the scan stops at the first
+/// refusal, so a non-monotone predicate cannot report an admitting step
+/// beyond a refusing one. `None` when the first step does not admit.
+pub(crate) fn largest_fitting_linear(
+    limit: u32,
+    step: u32,
+    admits: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
+    let mut largest = None;
+    let mut context = step;
+    while context <= limit {
+        if admits(context) {
+            largest = Some(context);
+        } else {
+            break;
+        }
+        context += step;
+    }
+    largest
+}
+
+/// An ordered, labelled charge list with the admission band. The labels are
+/// the receipt's own words, in push order; the total folds with
+/// [`u64::checked_add`] so an untrusted composition reports instead of
+/// wrapping. The band is explicit, carried rather than global, so a future
+/// ledger can widen it without touching the others.
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceReserve {
+    band_bytes: u64,
+    charges: Vec<(&'static str, u64)>,
+}
+
+impl DeviceReserve {
+    /// An empty reserve admitting against `band_bytes`.
+    pub(crate) fn new(band_bytes: u64) -> Self {
+        Self {
+            band_bytes,
+            charges: Vec::new(),
+        }
+    }
+
+    /// Appends one labelled charge, in receipt order.
+    pub(crate) fn push(mut self, label: &'static str, bytes: u64) -> Self {
+        self.charges.push((label, bytes));
+        self
+    }
+
+    /// The band the reserve's slack is judged against.
+    pub(crate) fn band_bytes(&self) -> u64 {
+        self.band_bytes
+    }
+
+    /// The charge pairs, in push order.
+    pub(crate) fn charges(&self) -> &[(&'static str, u64)] {
+        &self.charges
+    }
+
+    /// The folded charge total; `None` on u64 overflow.
+    pub(crate) fn checked_total(&self) -> Option<u64> {
+        self.charges
+            .iter()
+            .try_fold(0u64, |acc, &(_, bytes)| acc.checked_add(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceReserve, largest_fitting, largest_fitting_linear};
+
+    /// The two searches agree on a monotone predicate, and the linear scan
+    /// keeps its stop-at-first-false rule on a gap where the bisect does not
+    /// (the pinned resident-receipt case).
+    #[test]
+    fn linear_scan_stops_at_first_refusal() {
+        let cut = |context: u32| context <= 5120;
+        assert_eq!(largest_fitting(8192, 1024, &cut), Some(5120));
+        assert_eq!(largest_fitting_linear(8192, 1024, &cut), Some(5120));
+        // A refusal at 3072 hiding an admitting range above it: the linear
+        // scan stops at the refusal (2048) while the bisect jumps over it
+        // (4096) — the documented reason the linear scan exists.
+        let gap = |context: u32| context <= 2048 || context >= 4096;
+        assert_eq!(largest_fitting_linear(8192, 1024, &gap), Some(2048));
+        assert_eq!(largest_fitting(8192, 1024, &gap), Some(7168));
+    }
+
+    /// The reserve folds in push order, saturates to `None` on overflow, and
+    /// reports the exact labels back.
+    #[test]
+    fn device_reserve_folds_and_reports() {
+        let reserve = DeviceReserve::new(128 << 20)
+            .push("kv cache", 1 << 20)
+            .push("work reserve", 2 << 20);
+        assert_eq!(reserve.checked_total(), Some(3 << 20));
+        assert_eq!(
+            reserve.charges(),
+            &[("kv cache", 1 << 20), ("work reserve", 2 << 20)]
+        );
+        assert_eq!(reserve.band_bytes(), 128 << 20);
+        assert_eq!(
+            DeviceReserve::new(0)
+                .push("saturate", u64::MAX)
+                .push("one more", 1)
+                .checked_total(),
+            None
+        );
+    }
+}

@@ -14,6 +14,11 @@ pub(crate) mod exl3_pack;
 )]
 pub(crate) mod flash_next;
 
+#[allow(
+    dead_code,
+    reason = "first users: the families' byte sites; the ladder switches them one family at a time"
+)]
+pub(crate) mod device_budget;
 /// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
 /// the copy plan of a pass, the counters. Ungated on purpose so plain host gates compile and
 /// run the seam's tests without the card feature.
@@ -30,10 +35,6 @@ pub mod gguf_model;
 // (kernels::cuda::resident::step_params), even though the bookkeeping itself is pure.
 pub(in crate::family) mod graph_state;
 pub mod keys;
-#[allow(
-    dead_code,
-    reason = "first users: the families' byte sites; the ladder switches them one family at a time"
-)]
 pub(crate) mod kv_format;
 pub mod layer_weights;
 pub mod nemotron35;

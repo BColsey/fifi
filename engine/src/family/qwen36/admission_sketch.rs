@@ -48,24 +48,7 @@ pub(crate) const CONTEXT_SEARCH_STEP: u32 = 1024;
 /// assumed not to fit: it is never asked. Shared by the `enginesrv check` proposal and the Flash-Next
 /// expert budget, so both bisect the same way.
 pub(crate) fn largest_fitting_context(requested: u32, fits: &dyn Fn(u32) -> bool) -> Option<u32> {
-    const STEP: u32 = CONTEXT_SEARCH_STEP;
-    if requested <= STEP || !fits(STEP) {
-        return None;
-    }
-    let mut low = STEP;
-    let mut high = requested;
-    while high - low > STEP {
-        let mid = low + (high - low) / 2 / STEP * STEP;
-        if mid <= low {
-            break;
-        }
-        if fits(mid) {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    Some(low)
+    crate::family::device_budget::largest_fitting(requested, CONTEXT_SEARCH_STEP, fits)
 }
 
 /// The staged KV8 rows a context of `context_limit` positions pins at boot:

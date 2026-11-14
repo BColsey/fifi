@@ -1051,43 +1051,42 @@ fn flint_estimate(
         }
     };
 
-    let charge_terms = |margin: u64| {
-        let mut terms = vec![
-            ("kv cache".to_string(), kv_bytes),
-            ("work reserve".to_string(), work),
-            ("load headroom".to_string(), headroom),
-            ("bank margin".to_string(), margin),
-            (
-                "device scratch (excluded here; charged at load)".to_string(),
-                0,
-            ),
-        ];
+    let reserve = crate::family::device_budget::DeviceReserve::new(
+        crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+    )
+    .push("kv cache", kv_bytes)
+    .push("work reserve", work)
+    .push("load headroom", headroom)
+    .push("bank margin", margin);
+    // The receipt is the reserve's own charges (four terms when a bank
+    // margin applies, three when not) with the load-time scratch line
+    // appended last, exactly as before.
+    let charge_terms = || {
+        let mut terms: Vec<(String, u64)> = reserve
+            .charges()
+            .iter()
+            .map(|&(label, bytes)| (label.to_string(), bytes))
+            .collect();
         if margin == 0 {
             terms.retain(|(name, _)| name != "bank margin");
         }
+        terms.push((
+            "device scratch (excluded here; charged at load)".to_string(),
+            0,
+        ));
         terms
     };
-    let charges = [kv_bytes, work, headroom, margin]
-        .into_iter()
-        .try_fold(0u64, u64::checked_add)
-        .ok_or_else(estimate_overflow)?;
+    let charges = reserve.checked_total().ok_or_else(estimate_overflow)?;
     let total = weight_bytes
         .checked_add(charges)
         .ok_or_else(estimate_overflow)?;
 
-    let band =
-        i128::from(crate::family::qwen36::admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
+    let band = i128::from(reserve.band_bytes());
     let (fit, borderline, largest_fitting) = match free {
         None => (ResourceFit::Unknown, false, None),
         Some(free) => {
             let slack = i128::from(free) - i128::from(weight_bytes) - i128::from(charges);
-            let (fit, borderline) = if slack >= band {
-                (ResourceFit::Fits, false)
-            } else if slack >= -band {
-                (ResourceFit::Unknown, true)
-            } else {
-                (ResourceFit::DoesNotFit, false)
-            };
+            let (fit, borderline) = band_verdict(slack, band);
             // The receipt sentence for an automatically banked load: the
             // largest context the all-resident plan would have admitted.
             let largest_fitting = if matches!(placement, BankPlan::Bank(BankReason::Auto)) {
@@ -1274,11 +1273,25 @@ fn flint_estimate(
         budget_limit_is_policy_share: false,
         largest_fitting_context: largest_fitting,
         admission_charges_bytes: charges,
-        admission_charge_terms: charge_terms(margin),
+        admission_charge_terms: charge_terms(),
         fit,
         borderline,
     };
     Ok((estimate, decisions))
+}
+
+/// The one band rule both family preflights judge slack by: at least a band
+/// above zero is a fit, within a band either side is borderline, and a band
+/// below zero does not fit. Shared by the Flint all-resident plan and the
+/// Qwen3.6 CUDA admission so the boundary is one rule, not two.
+fn band_verdict(slack: i128, band: i128) -> (ResourceFit, bool) {
+    if slack >= band {
+        (ResourceFit::Fits, false)
+    } else if slack >= -band {
+        (ResourceFit::Unknown, true)
+    } else {
+        (ResourceFit::DoesNotFit, false)
+    }
 }
 
 /// The largest context (a multiple of 1024, capped at the requested
@@ -1290,17 +1303,9 @@ fn largest_resident_context(
     resident_admits_at: &dyn Fn(u32, u64) -> bool,
     free: u64,
 ) -> Option<u32> {
-    let mut largest = None;
-    let mut context = 1024;
-    while context <= options.context_limit {
-        if resident_admits_at(context, free) {
-            largest = Some(context);
-        } else {
-            break;
-        }
-        context += 1024;
-    }
-    largest
+    crate::family::device_budget::largest_fitting_linear(options.context_limit, 1024, &|context| {
+        resident_admits_at(context, free)
+    })
 }
 
 /// The CUDA checkpoint check, through the loader's own gates: the
@@ -1560,30 +1565,28 @@ fn estimate_q36(
     let (free_bytes, limit_bytes, charges, charge_terms, fit, borderline) = match (&free, backend) {
         (Probe::Measured(free), Backend::Cuda) => {
             let demand = cuda_demand_at(settings.context_limit)?;
+            // The charge total is the whole demand (state included); the
+            // receipt lists only the five admission terms, as it always has.
             let charges = demand.total_after_weights()?;
+            let reserve = crate::family::device_budget::DeviceReserve::new(
+                sketch::ADMISSION_UNCERTAINTY_BAND_BYTES,
+            )
+            .push("staged kv8 rows", demand.staging_bytes)
+            .push("part charge", demand.part_charge_bytes)
+            .push("spare minimum", demand.spare_min_bytes)
+            .push("admission margin", demand.margin_bytes)
+            .push("runtime overhead floor", demand.overhead_floor_bytes);
             let slack = i128::from(*free) - i128::from(weights) - i128::from(charges);
-            let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
-            let (fit, borderline) = if slack >= band {
-                (ResourceFit::Fits, false)
-            } else if slack >= -band {
-                (ResourceFit::Unknown, true)
-            } else {
-                (ResourceFit::DoesNotFit, false)
-            };
+            let (fit, borderline) = band_verdict(slack, i128::from(reserve.band_bytes()));
             (
                 Some(*free),
                 Some(*free),
                 charges,
-                vec![
-                    ("staged kv8 rows".to_string(), demand.staging_bytes),
-                    ("part charge".to_string(), demand.part_charge_bytes),
-                    ("spare minimum".to_string(), demand.spare_min_bytes),
-                    ("admission margin".to_string(), demand.margin_bytes),
-                    (
-                        "runtime overhead floor".to_string(),
-                        demand.overhead_floor_bytes,
-                    ),
-                ],
+                reserve
+                    .charges()
+                    .iter()
+                    .map(|&(label, bytes)| (label.to_string(), bytes))
+                    .collect(),
                 fit,
                 borderline,
             )
@@ -1734,7 +1737,7 @@ fn largest_fitting_cuda(
         };
         i128::from(free) - i128::from(weights) - i128::from(charges) >= band
     };
-    sketch::largest_fitting_context(requested, &fits)
+    crate::family::device_budget::largest_fitting(requested, sketch::CONTEXT_SEARCH_STEP, &fits)
 }
 
 #[cfg(test)]
