@@ -14,20 +14,89 @@ use super::{BankGeometry, PassPlan, SlotMove, SlotPolicy, SlotTable, bank_error}
 use crate::EngError;
 
 #[derive(Debug, Clone)]
-struct LayerLru {
+pub(crate) struct LayerLru {
     /// Slot of every expert or -1.
-    slot_of: Vec<i32>,
+    pub(in crate::family) slot_of: Vec<i32>,
     /// Expert of every slot.
-    resident: Vec<u16>,
+    pub(in crate::family) resident: Vec<u16>,
     /// Slots, least recently used first.
-    recency: Vec<u16>,
+    pub(in crate::family) recency: Vec<u16>,
 }
 
 impl LayerLru {
+    /// Expert `i` in slot `i` for every slot, recency in slot order: the identity fill a
+    /// freshly published bank starts from.
+    pub(crate) fn from_identity(experts: usize, slots: usize) -> Self {
+        Self {
+            slot_of: (0..slots as i32)
+                .chain(std::iter::repeat_n(-1, experts - slots))
+                .collect(),
+            resident: (0..slots as u16).collect(),
+            recency: (0..slots as u16).collect(),
+        }
+    }
+
+    /// Back to the identity fill, whatever the table held.
+    pub(crate) fn reset_identity(&mut self) {
+        *self = Self::from_identity(self.slot_of.len(), self.resident.len());
+    }
+
+    /// Gives `incoming` the slot `outgoing` holds; the slot becomes the most recent. Fails when
+    /// `incoming` is already resident, `outgoing` holds no slot, or either expert is outside the
+    /// table.
+    pub(crate) fn swap(&mut self, incoming: u16, outgoing: u16) -> Result<u16, EngError> {
+        let slot = self
+            .slot_of(outgoing)
+            .ok_or_else(|| bank_error("outgoing expert holds no slot".into()))?;
+        if self.is_resident(usize::from(incoming)) {
+            return Err(bank_error("incoming expert already holds a slot".into()));
+        }
+        self.slot_of[usize::from(outgoing)] = -1;
+        self.slot_of[usize::from(incoming)] = i32::from(slot);
+        self.resident[usize::from(slot)] = incoming;
+        let at = self
+            .recency
+            .iter()
+            .position(|&other| other == slot)
+            .ok_or_else(|| bank_error("invalid recency order".into()))?;
+        self.recency.remove(at);
+        self.recency.push(slot);
+        Ok(slot)
+    }
+
+    /// Marks `experts` as just used, in the order given and without any copy: the later in the
+    /// list, the more recent. Experts without a slot are skipped.
+    pub(crate) fn touch(&mut self, experts: &[u16]) -> Result<(), EngError> {
+        for &expert in experts {
+            let Some(slot) = self.slot_of(expert) else {
+                continue;
+            };
+            let at = self
+                .recency
+                .iter()
+                .position(|&other| other == slot)
+                .ok_or_else(|| bank_error("invalid recency order".into()))?;
+            self.recency.remove(at);
+            self.recency.push(slot);
+        }
+        Ok(())
+    }
+
+    /// The slot `expert` holds, if it holds one.
+    pub(crate) fn slot_of(&self, expert: u16) -> Option<u16> {
+        let slot = *self.slot_of.get(usize::from(expert))?;
+        u16::try_from(slot).ok()
+    }
+
+    /// Whether `expert` holds a slot.
+    pub(crate) fn is_resident(&self, expert: usize) -> bool {
+        self.slot_of.get(expert).is_some_and(|&slot| slot >= 0)
+    }
+
     /// Runs the experts of `order` through the layer: a hit becomes the most recent, a miss takes
     /// the least recent slot whose expert `demanded` does not protect. Fails only when everything
     /// is protected, which the callers' capacity check rules out.
-    fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, EngError> {
+    pub(crate) fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, EngError> {
         let mut plan = PassPlan {
             distinct: order.len(),
             ..PassPlan::default()

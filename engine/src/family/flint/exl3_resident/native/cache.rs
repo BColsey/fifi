@@ -6,6 +6,7 @@ use crate::EngError;
 // The pure bank policy lives in `family::flint::budget` so host builds
 // compose the same decisions; re-exported here because the native loader
 // and its tests historically reach it through this module.
+use crate::family::expert_bank::policy::LayerLru;
 #[cfg(test)]
 use crate::family::flint::budget::CpuMoeConfig;
 #[cfg(test)]
@@ -222,10 +223,8 @@ pub(super) struct LayerCache {
     stream: u64,
     key: PassKey,
     phase: Phase,
-    // These three are sized by the layer's resident count, not by a compile-time bank.
-    residents: Box<[u16]>,
-    slots: [Option<u16>; EXPERTS],
-    recency: Box<[u16]>,
+    // The slot table, the resident map and the recency order: one shared LRU row.
+    row: LayerLru,
     demanded: [bool; EXPERTS],
     copies: Box<[MissCopy]>,
     copy_count: usize,
@@ -242,11 +241,9 @@ impl LayerCache {
                 |value| value.checked_add(1),
             )
             .map_err(|_| cache_overflow())?;
-        let canonical: Box<[u16]> = (0..geometry.slot_count).map(|index| index as u16).collect();
+        let canonical = LayerLru::from_identity(EXPERTS, geometry.slot_count);
         Ok(Self {
-            slots: Self::canonical_slots(geometry.slot_count),
-            residents: canonical.clone(),
-            recency: canonical,
+            row: canonical,
             copies: vec![MissCopy::EMPTY; geometry.slot_count].into(),
             geometry,
             stream,
@@ -258,10 +255,6 @@ impl LayerCache {
             demanded: [false; EXPERTS],
             copy_count: 0,
         })
-    }
-
-    fn canonical_slots(slot_count: usize) -> [Option<u16>; EXPERTS] {
-        std::array::from_fn(|index| (index < slot_count).then_some(index as u16))
     }
 
     fn check(&self, phase: Phase, stream: u64) -> Result<(), EngError> {
@@ -314,6 +307,9 @@ impl LayerCache {
         self.check(Phase::Idle, self.stream)?;
         let mut demanded = [false; EXPERTS];
         let mut count = 0;
+        // The raw id order, duplicates kept: a repeated id re-promotes its slot, so the
+        // recency a pass leaves is the last-occurrence order, as before.
+        let mut order = Vec::with_capacity(ids.len());
         for &id in ids {
             let index = usize::try_from(id).map_err(|_| cache_error("unknown expert ID"))?;
             let entry = demanded
@@ -323,6 +319,7 @@ impl LayerCache {
                 count += 1;
                 *entry = true;
             }
+            order.push(id as u16);
         }
         let slot_count = self.geometry.slot_count;
         if count > slot_count {
@@ -333,44 +330,22 @@ impl LayerCache {
             .generation
             .checked_add(1)
             .ok_or_else(cache_overflow)?;
-        let mut residents = self.residents.clone();
-        let mut slots = self.slots;
-        let mut recency = self.recency.clone();
+        // The pass runs on a scratch row and only lands on Ok, so a refusal leaves the
+        // live table exactly as the call found it.
+        let mut next = self.row.clone();
+        let plan = next.apply(&order, &demanded)?;
         let mut copies = [MissCopy::EMPTY; EXPERTS];
-        let mut copy_count = 0usize;
-        for &id in ids {
-            let expert = id as u16;
-            let slot = if let Some(slot) = slots[usize::from(expert)] {
-                usize::from(slot)
-            } else {
-                let slot = recency
-                    .iter()
-                    .copied()
-                    .find(|&slot| !demanded[usize::from(residents[usize::from(slot)])])
-                    .ok_or_else(|| cache_error("no unprotected victim"))?;
-                slots[usize::from(residents[usize::from(slot)])] = None;
-                residents[usize::from(slot)] = expert;
-                slots[usize::from(expert)] = Some(slot);
-                copies[copy_count] = self.copy(expert, slot)?;
-                copy_count += 1;
-                usize::from(slot)
-            };
-            let position = recency
-                .iter()
-                .position(|&value| usize::from(value) == slot)
-                .ok_or_else(|| cache_error("invalid recency order"))?;
-            recency.copy_within(position + 1..slot_count, position);
-            recency[slot_count - 1] = slot as u16;
+        for (index, swap) in plan.moves.iter().enumerate() {
+            copies[index] = self.copy(swap.incoming, swap.slot)?;
         }
+        let copy_count = plan.moves.len();
         let bytes = copy_count
             .checked_mul(self.geometry.stride)
             .ok_or_else(cache_overflow)?;
         if bytes > max_copy_bytes {
             return Err(cache_error("miss copies exceed byte bound"));
         }
-        self.residents = residents;
-        self.slots = slots;
-        self.recency = recency;
+        self.row = next;
         self.demanded = demanded;
         self.copies[..copy_count].copy_from_slice(&copies[..copy_count]);
         self.copy_count = copy_count;
@@ -381,7 +356,7 @@ impl LayerCache {
 
     /// Which experts hold a device slot now.
     pub(super) fn resident_flags(&self) -> [bool; EXPERTS] {
-        std::array::from_fn(|expert| self.slots[expert].is_some())
+        std::array::from_fn(|expert| self.row.is_resident(expert))
     }
 
     /// Gives `incoming` the slot `outgoing` holds, for the slow hot-set policy of CPU-served
@@ -389,23 +364,8 @@ impl LayerCache {
     /// pass of this layer; the slot becomes the most recently used one.
     pub(super) fn swap_in(&mut self, incoming: u16, outgoing: u16) -> Result<MissCopy, EngError> {
         self.check(Phase::Idle, self.stream)?;
-        if self.slots[usize::from(incoming)].is_some() {
-            return Err(cache_error("incoming expert already holds a slot"));
-        }
-        let slot = self.slots[usize::from(outgoing)]
-            .take()
-            .ok_or_else(|| cache_error("outgoing expert holds no slot"))?;
+        let slot = self.row.swap(incoming, outgoing)?;
         let copy = self.copy(incoming, slot)?;
-        self.residents[usize::from(slot)] = incoming;
-        self.slots[usize::from(incoming)] = Some(slot);
-        let position = self
-            .recency
-            .iter()
-            .position(|&value| value == slot)
-            .ok_or_else(|| cache_error("invalid recency order"))?;
-        let last = self.geometry.slot_count;
-        self.recency.copy_within(position + 1..last, position);
-        self.recency[last - 1] = slot;
         Ok(copy)
     }
 
@@ -432,7 +392,9 @@ impl LayerCache {
         {
             return Err(cache_error("expert is outside this pass"));
         }
-        self.slots[usize::from(expert)].ok_or_else(|| cache_error("expert has no slot"))
+        self.row
+            .slot_of(expert)
+            .ok_or_else(|| cache_error("expert has no slot"))
     }
 
     pub(super) fn release<T>(
@@ -456,20 +418,7 @@ impl LayerCache {
     /// which the decode that follows then evicts against.
     pub(super) fn touch(&mut self, experts: &[u16]) -> Result<(), EngError> {
         self.check(Phase::Idle, self.stream)?;
-        let slot_count = self.geometry.slot_count;
-        for &expert in experts {
-            let Some(slot) = self.slots.get(usize::from(expert)).copied().flatten() else {
-                continue;
-            };
-            let position = self
-                .recency
-                .iter()
-                .position(|&value| value == slot)
-                .ok_or_else(|| cache_error("invalid recency order"))?;
-            self.recency.copy_within(position + 1..slot_count, position);
-            self.recency[slot_count - 1] = slot;
-        }
-        Ok(())
+        self.row.touch(experts)
     }
 
     pub(super) fn poison(&mut self) {
@@ -489,11 +438,7 @@ impl LayerCache {
             .ok_or_else(cache_overflow)?;
         self.phase = Phase::Poisoned;
         drain()?;
-        for (index, resident) in self.residents.iter_mut().enumerate() {
-            *resident = index as u16;
-        }
-        self.recency.copy_from_slice(&self.residents);
-        self.slots = Self::canonical_slots(self.geometry.slot_count);
+        self.row.reset_identity();
         self.demanded = [false; EXPERTS];
         self.copies.fill(MissCopy::EMPTY);
         self.copy_count = 0;
@@ -801,9 +746,9 @@ mod tests {
     const SLOTS: usize = 224;
 
     type BankState = (
-        [Option<u16>; EXPERTS],
-        Box<[u16]>,
-        Box<[u16]>,
+        Vec<i32>,
+        Vec<u16>,
+        Vec<u16>,
         [bool; EXPERTS],
         Box<[MissCopy]>,
         usize,
@@ -812,9 +757,9 @@ mod tests {
     // What the bank holds, without the pass key that every cache owns uniquely.
     fn bank_state(cache: &LayerCache) -> BankState {
         (
-            cache.slots,
-            cache.residents.clone(),
-            cache.recency.clone(),
+            cache.row.slot_of.clone(),
+            cache.row.resident.clone(),
+            cache.row.recency.clone(),
             cache.demanded,
             cache.copies.clone(),
             cache.copy_count,
@@ -882,8 +827,8 @@ mod tests {
         assert!(flags[9] && !flags[1] && flags[0] && flags[2] && flags[3]);
         assert_eq!(flags.iter().filter(|f| **f).count(), 4);
         // The swapped slot is the most recently used one, so the next LRU victim is slot 0.
-        assert_eq!(cache.recency.last().copied(), Some(1));
-        assert_eq!(cache.recency[0], 0);
+        assert_eq!(cache.row.recency.last().copied(), Some(1));
+        assert_eq!(cache.row.recency[0], 0);
         // Refusals leave the cache untouched.
         let before = snapshot(&cache);
         assert!(cache.swap_in(9, 2).is_err(), "incoming already resident");
@@ -1014,10 +959,10 @@ mod tests {
         // Experts 0, 1 and 2 are the oldest. Touching them in the order 2, 0, 1 makes expert 1 the
         // newest and expert 3 the oldest, so the next two misses evict 3 and 4, not 0, 1 or 2.
         cache.touch(&[2, 0, 1, 250]).unwrap();
-        assert_eq!(cache.recency[SLOTS - 1], 1);
-        assert_eq!(cache.recency[SLOTS - 2], 0);
-        assert_eq!(cache.recency[SLOTS - 3], 2);
-        assert_eq!(cache.recency[0], 3);
+        assert_eq!(cache.row.recency[SLOTS - 1], 1);
+        assert_eq!(cache.row.recency[SLOTS - 2], 0);
+        assert_eq!(cache.row.recency[SLOTS - 3], 2);
+        assert_eq!(cache.row.recency[0], 3);
         let pass = cache.prepare(&[224, 225], usize::MAX).unwrap();
         let ready = cache
             .copy_ready(pass, 7, |copies| {
@@ -1029,9 +974,9 @@ mod tests {
         cache.release(ready, 7, || Ok(())).unwrap();
         // A touch outside the idle phase is refused and changes nothing.
         let pass = cache.prepare(&[1], usize::MAX).unwrap();
-        let before = cache.recency.clone();
+        let before = cache.row.recency.clone();
         assert!(cache.touch(&[5]).is_err());
-        assert_eq!(cache.recency, before);
+        assert_eq!(cache.row.recency, before);
         let _ = pass;
     }
 
@@ -1149,8 +1094,8 @@ mod tests {
         assert!(cache.prepare(&[224], 2).is_err());
         assert_eq!(snapshot(&cache), before);
         let pass = cache.prepare(&[224, 0, 224, 1], 3).unwrap();
-        assert_eq!(cache.slots[2], None);
-        assert_eq!(cache.slots[224], Some(2));
+        assert_eq!(cache.row.slot_of[2], -1);
+        assert_eq!(cache.row.slot_of[224], 2);
         assert!(cache.prepare(&[225], 3).is_err());
         assert!(
             cache
@@ -1249,7 +1194,10 @@ mod tests {
             ["initial", "copy", "finish", "drain", "reinitialize"]
         );
         for id in 0..EXPERTS {
-            assert_eq!(cache.slots[id], (id < SLOTS).then_some(id as u16));
+            assert_eq!(
+                cache.row.slot_of[id],
+                if id < SLOTS { id as i32 } else { -1 }
+            );
         }
         let pass = cache.prepare(&[0], 0).unwrap();
         assert!(
@@ -1929,16 +1877,17 @@ mod tests {
                 for &id in &ids {
                     let slot = cache.slot(ready, id as u16).unwrap();
                     assert!(usize::from(slot) < slots);
-                    assert_eq!(cache.residents[usize::from(slot)], id as u16);
+                    assert_eq!(cache.row.resident[usize::from(slot)], id as u16);
                     used.insert((id, slot));
                 }
                 // One slot per demanded expert: a victim is never a member of the pass.
                 assert_eq!(used.len(), unique.len());
                 cache.release(ready, 7, || Ok(())).unwrap();
                 let recency: Vec<u16> = cache
+                    .row
                     .recency
                     .iter()
-                    .map(|&slot| cache.residents[usize::from(slot)])
+                    .map(|&slot| cache.row.resident[usize::from(slot)])
                     .collect();
                 assert_eq!(recency, bank, "slots={slots}");
             }
@@ -2006,7 +1955,10 @@ mod tests {
             // A recovered bank is indistinguishable from a freshly loaded one.
             assert_eq!(bank_state(&cache), bank_state(&fresh));
             for id in 0..EXPERTS {
-                assert_eq!(cache.slots[id], (id < slots).then_some(id as u16));
+                assert_eq!(
+                    cache.row.slot_of[id],
+                    if id < slots { id as i32 } else { -1 }
+                );
             }
         }
     }
