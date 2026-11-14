@@ -682,7 +682,8 @@ use crate::family::prefill::chunk_family::ChunkFamily;
 /// What the chunk body captures today, handed to the trait opaquely: the state, the launch, the
 /// host-checked ids with their arena range, the prebuilt model, buffers, rows and sparse
 /// projection. The ids are a PREFLIGHT product (`chunk_ids` runs before the window opens), so a
-/// refused token id changes nothing on the device.
+/// refused token id changes nothing on the device. The context is single-use: `run_layers`
+/// consumes its sparse projection; each chunk builds a fresh context.
 pub(super) struct Q36ChunkCtx<'a, 'w> {
     pub(super) state: &'a mut ResidentState,
     pub(super) launch: Launch<'a>,
@@ -764,10 +765,6 @@ impl<'a, 'w> ChunkFamily for Q36ChunkFamily<'a, 'w> {
         status: i32,
     ) -> Result<(), EngError> {
         ctx.state.revalidate(ctx.launch.stream, p0 + m, status)
-    }
-
-    fn reset(&mut self, ctx: &mut Self::Ctx) -> Result<(), EngError> {
-        ctx.state.reset(ctx.launch.stream)
     }
 
     fn bank_misses(&self) -> Option<u64> {

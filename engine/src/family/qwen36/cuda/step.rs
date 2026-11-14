@@ -1600,9 +1600,9 @@ impl<'a> QwenResidentStep<'a> {
             chunk_rows,
             sparse,
         };
-        // The window opens, the status clears, the ids stage and the layers run: today's body,
-        // unchanged, one instruction order. Each call takes its own dyn borrow of `fam`, so the
-        // step's report reads `fam.segmented_parts` between them.
+        // Qwen3.6 opens and commits per chunk, clearing status before staging ids. This caller
+        // owns that order and window lifetime. Each call takes its own dyn borrow of `fam`, so
+        // the step's report reads `fam.segmented_parts` between them.
         fn open_and_run<'a, 'w>(
             family: &mut dyn ChunkFamily<Ctx = Q36ChunkCtx<'a, 'w>>,
             ctx: &mut Q36ChunkCtx<'a, 'w>,
