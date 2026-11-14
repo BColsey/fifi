@@ -87,6 +87,31 @@ fn the_slot_counts_track_the_cost_model_at_each_context() {
 }
 
 #[test]
+fn prefill_arena_charge_is_additive_and_off_inputs_are_identical() {
+    let base = inputs(131_072, 2);
+    assert_eq!(base.with_prefill_arena(0).unwrap(), base);
+    let bytes = base.shape.slot_cost();
+    let charged = base.with_prefill_arena(bytes).unwrap();
+    assert_eq!(charged.vram.arena, base.vram.arena + bytes);
+    let mut restored = charged;
+    restored.vram.arena -= bytes;
+    assert_eq!(restored, base);
+    assert_eq!(
+        TierPlan::new(&charged).unwrap().slots_per_layer(),
+        TierPlan::new(&base).unwrap().slots_per_layer() - 1
+    );
+}
+
+#[test]
+fn prefill_arena_charge_refuses_overflow() {
+    let base = inputs(131_072, 2);
+    assert!(matches!(
+        base.with_prefill_arena(u64::MAX),
+        Err(EngError::MemoryPlan(message)) if message.contains("prefill arena")
+    ));
+}
+
+#[test]
 fn the_plan_accounts_for_every_byte() {
     let plan = TierPlan::new(&inputs(131_072, 2)).unwrap();
     let slots = plan.slots_per_layer() as u64;

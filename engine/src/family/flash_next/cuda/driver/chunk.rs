@@ -146,7 +146,7 @@ pub(in crate::family::flash_next) mod prof {
 
     pub(super) const SHARED_PREFILL: &str = "INFERENCE_FLASH_NEXT_SHARED_PREFILL";
 
-    pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<()> {
+    pub(super) fn check_switch_value(name: &str, raw: Option<&str>) -> Result<bool> {
         let on = parse_switch(raw).map_err(|seen| {
             EngError::BadRequest(format!(
                 "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
@@ -157,12 +157,13 @@ pub(in crate::family::flash_next) mod prof {
                 "{SHARED_PREFILL}: shared prefill startup is not connected"
             )));
         }
-        Ok(())
+        Ok(on)
     }
 
-    /// Refuses an unknown spelling of the Flash-Next switches at driver build, before any
-    /// chunk runs; a driver is never constructed with a value the fast paths would misread.
-    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<()> {
+    /// Validates the switches and returns the shared mode for startup's arena/owner binding.
+    /// ON still refuses until the complete shared path is connected.
+    pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<bool> {
+        let mut shared_prefill = false;
         for name in [
             "INFERENCE_FLASH_NEXT_PROFILE",
             "INFERENCE_FLASH_NEXT_DRAIN_TICK",
@@ -174,9 +175,12 @@ pub(in crate::family::flash_next) mod prof {
                 Err(std::env::VarError::NotUnicode(_)) => Some("a non-unicode value".into()),
                 Ok(value) => Some(value),
             };
-            check_switch_value(name, value.as_deref())?;
+            let on = check_switch_value(name, value.as_deref())?;
+            if name == SHARED_PREFILL {
+                shared_prefill = on;
+            }
         }
-        Ok(())
+        Ok(shared_prefill)
     }
 
     /// The host-stage measurement switch (`INFERENCE_FLASH_NEXT_DRAIN_TICK`): with the
@@ -502,7 +506,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         let ple_rows = self.write_inputs(tokens, starts)?;
         self.device.begin_chunk()?;
         clock.tick(&mut self.device, 1)?;
-        self.queue_layers(tokens, &ple_rows, &mut clock)?;
+        self.queue_layers(self.pos, tokens, &ple_rows, &mut clock)?;
         let logits = self.queue_head(want_logits, &mut clock)?;
         self.device.check_health()?;
         Ok(logits)
@@ -527,12 +531,12 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
 
     fn queue_layers(
         &mut self,
+        pos: usize,
         tokens: &[u32],
         ple_rows: &[f32],
         clock: &mut ChunkClock,
     ) -> Result<()> {
         let m = tokens.len();
-        let pos = self.pos;
         let shape = self.shape;
         self.device.layers(0..shape.ple_layer, pos, m)?;
         clock.tick(&mut self.device, 2)?;

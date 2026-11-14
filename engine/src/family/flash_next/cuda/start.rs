@@ -47,7 +47,9 @@ use super::{
     moe_block::{SplitMoe, SplitMoeTrunk},
     pack_feeds::PackFeeds,
     ple_feed::{FixedProjection, NgramRows, PleFeed, PleVectors},
+    state::FlashGeometry,
     step::{FlashStep, SplitMoeAt},
+    step_plan::StepPlan,
 };
 use crate::{
     EngError,
@@ -454,7 +456,7 @@ pub(super) fn build_driver(
     sampler_vocab: usize,
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
-    super::driver::chunk::prof::check_switch_spelling()?;
+    let shared_prefill = super::driver::chunk::prof::check_switch_spelling()?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -482,6 +484,13 @@ pub(super) fn build_driver(
         report.expert_bytes,
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
+    let rows = wanted.prefill_rows as usize;
+    let prefill_arena_bytes = StepPlan::prefill_bytes(
+        shared_prefill,
+        &FlashGeometry::new(&model, &kinds)?,
+        rows,
+        wanted.context as usize,
+    )?;
     // The prefill ring's budget, carved out before the load plan so the bank sizes itself
     // into what remains: at most 1.5 GiB and 30% of the free card, only for chunked prefill.
     // A ring below one streamed layer is not built (the multi-row path then keeps its
@@ -508,7 +517,8 @@ pub(super) fn build_driver(
         },
         free_vram.saturating_sub(ring_budget),
         (mem_total, mem_available),
-    );
+    )
+    .with_prefill_arena(prefill_arena_bytes)?;
     let load_plan = FlashLoadPlan::new(&report, &checkpoint.model_config, ngram_bytes, card)?;
     let load = load_plan.at_context(
         u64::from(wanted.context),
@@ -665,9 +675,13 @@ pub(super) fn build_driver(
     stage("building the step");
     // `prefill_rows` above one builds the step's plans at that width, so a prompt chunk runs as
     // device chunks of that many rows; one (the default) is the decode shape of before.
-    let rows = wanted.prefill_rows as usize;
     let stream = Box::leak(Box::new(ctx.stream()?));
-    let step = FlashStep::new(
+    let new_step = if shared_prefill {
+        FlashStep::new_prefill
+    } else {
+        FlashStep::new
+    };
+    let step = new_step(
         ctx,
         stream,
         weights,

@@ -1116,6 +1116,92 @@ fn a_chunk_of_rows_over_a_partial_bank_matches_the_all_resident_block() {
 #[test]
 #[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
+    chunk_union_pass(2, false);
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), about 3 GiB of pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
+    for rows in [1, 3] {
+        chunk_union_pass(rows, true);
+    }
+}
+
+fn shared_prefill_pass(
+    split: &mut SplitMoe<'_>,
+    launch: &Launch<'_>,
+    bufs: &Exl3MoeBufs<'_>,
+    dims: &MoeDims,
+) {
+    use crate::family::{
+        exl3::prefill::{Exl3Scratch, Projector, write_dense_jobs},
+        project::exl3_jobs_plan::exl3_job_bytes,
+    };
+    let (dense_bytes, perm_bytes) =
+        exl3_job_bytes(dims.rows, 256, dims.n_expert, dims.top_k).expect("job sizes");
+    let ctx = launch.ctx;
+    let y = ctx
+        .upload(&vec![
+            0u8;
+            dims.rows * dims.hidden.max(dims.shared_inter) * F32
+        ])
+        .expect("dense scratch");
+    let jobs = ctx.upload(&vec![0u8; dense_bytes]).expect("dense jobs");
+    let guarded = ctx
+        .upload(&vec![0xA5; perm_bytes + 16])
+        .expect("guarded permutation");
+    let scratch = Exl3Scratch {
+        xh: bufs.scratch.xh,
+        z: bufs.scratch.z,
+        y: y.range(0, y.bytes()).expect("y range"),
+        flag: bufs.scratch.flag,
+        jobs: jobs.range(0, jobs.bytes()).expect("jobs range"),
+    };
+    write_dense_jobs(launch, &scratch, dims.rows, 256).expect("write dense jobs");
+    let projector = Projector {
+        launch,
+        scratch,
+        rows: dims.rows,
+        tile_rows: 256,
+    };
+    let row_before = split.bank().state().slot_row(0).to_vec();
+    let short = guarded.range(8, perm_bytes - 1).expect("short permutation");
+    let error = split
+        .run_prefill(&projector, 0, bufs, dims, short)
+        .expect_err("refuse before routing or admitting");
+    assert!(
+        matches!(error, crate::EngError::BadRequest(message) if message.contains("permutation range"))
+    );
+    assert_eq!(split.bank().state().slot_row(0), row_before);
+    // The in-place combine must receive the residual, not bytes left in the output face.
+    bufs.route
+        .resid_out
+        .buffer()
+        .write_at(
+            launch.stream,
+            bufs.route.resid_out.offset(),
+            &vec![0xFF; dims.rows * dims.hidden * F32],
+        )
+        .expect("poison output");
+    split
+        .run_prefill(
+            &projector,
+            0,
+            bufs,
+            dims,
+            guarded.range(8, perm_bytes).expect("permutation range"),
+        )
+        .expect("the shared banked pass");
+    launch.stream.synchronize().expect("drain shared pass");
+    let mut bytes = vec![0u8; guarded.bytes()];
+    guarded
+        .read_at(launch.stream, 0, &mut bytes)
+        .expect("read guards");
+    assert_eq!(&bytes[..8], &[0xA5; 8]);
+    assert_eq!(&bytes[8 + perm_bytes..], &[0xA5; 8]);
+}
+
+fn chunk_union_pass(m: usize, shared: bool) {
     assert!(
         device_present("Flash-Next split MoE block"),
         "a GPU is required"
@@ -1137,7 +1223,6 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
         shared_inter: shape.shared_inter(),
     };
     assert_eq!((one_row.n_expert, one_row.top_k), (512, 10));
-    let m = 2;
     let chunk = MoeDims { rows: m, ..one_row };
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
@@ -1214,16 +1299,22 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
         }
         union
     };
-    assert!(
-        union.len() <= 20,
-        "the two rows pick at most 20 distinct experts"
-    );
+    if !shared {
+        assert!(
+            union.len() <= 20,
+            "the two rows pick at most 20 distinct experts"
+        );
+    }
     for run in 0..2 {
         let rig = RigRows::new(&projector, &chunk, &row_inputs).expect("rig");
         let passes = split.bank().state().stats().passes;
-        split
-            .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)
-            .expect("the chunked block");
+        if shared {
+            shared_prefill_pass(&mut split, &launch, &rig.bufs().expect("bufs"), &chunk);
+        } else {
+            split
+                .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)
+                .expect("the chunked block");
+        }
         stream.synchronize().expect("sync");
         let tag = format!("run {run}");
         // The admit is not decode traffic and never moves the pass counter; a per-row `step`
@@ -1233,22 +1324,31 @@ fn a_chunk_whose_picks_fit_the_bank_admits_the_union_in_one_pass() {
             passes,
             "{tag}: no per-row bank steps"
         );
+        // The promoted pass uses the same FP16 job family as the measured ring path.
+        let (resident_bound, oracle_bound) = if shared {
+            (RING_BOUND, RING_BOUND)
+        } else {
+            (SPLIT_BOUND, OUTPUT_BOUND)
+        };
         for r in 0..m {
             let got = rig.out_row(&projector, r);
             assert!(
-                relative_l2(&floats(&got), &floats_f64(&residents[r])) < SPLIT_BOUND,
+                relative_l2(&floats(&got), &floats_f64(&residents[r])) < resident_bound,
                 "{tag}, row {r}: the all-resident bound"
             );
             assert!(
-                relative_l2(&floats(&got), &wants[r].out) < OUTPUT_BOUND,
+                relative_l2(&floats(&got), &wants[r].out) < oracle_bound,
                 "{tag}, row {r}: the fp64 bound"
             );
         }
-        for &pick in &union {
-            assert!(
-                split.bank().state().slot_row(0)[pick as usize] >= 0,
-                "{tag}: pick {pick} of the union is in the bank"
-            );
+        let last_window = if shared { (m - 1) / 2 * 2 } else { 0 };
+        for want in &wants[last_window..] {
+            for &pick in &want.ids {
+                assert!(
+                    split.bank().state().slot_row(0)[pick] >= 0,
+                    "{tag}: pick {pick} of the final window is in the bank"
+                );
+            }
         }
     }
 }

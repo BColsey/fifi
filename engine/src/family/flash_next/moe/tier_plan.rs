@@ -158,8 +158,8 @@ impl TierInputs {
     /// "desktop reserve"), plus the ledger's 64 MiB chunked-attention part charge, which stands in for
     /// Flash-Next's own engine state until the step's arena plan supplies the real term. The host keeps the larger of
     /// the memory in use now (`total - available`) and Flint's 8 GiB OS floor, 2 GiB of engine
-    /// heap, 1 GiB of staging and a 1 GiB margin. Prefill transients (the hyper stream, QSA scratch
-    /// and expert streaming planes) are not charged yet; the step's arena plan supplies them.
+    /// heap, 1 GiB of staging and a 1 GiB margin. The caller adds the live shared-prefill scratch
+    /// through `with_prefill_arena` before selecting the expert slots; the legacy path adds zero.
     pub(in crate::family::flash_next) fn measured(
         shape: TierShape,
         (trunk_bytes, state_bytes): (u64, u64),
@@ -192,6 +192,20 @@ impl TierInputs {
                 margin: GIB,
             },
         }
+    }
+
+    /// Adds the live shared-prefill arena without reclaiming the measured runtime reserves.
+    /// Zero preserves the legacy inputs byte-for-byte.
+    pub(in crate::family::flash_next) fn with_prefill_arena(
+        mut self,
+        bytes: u64,
+    ) -> Result<Self, EngError> {
+        self.vram.arena = self
+            .vram
+            .arena
+            .checked_add(bytes)
+            .ok_or_else(|| refuse("prefill arena bytes overflow".into()))?;
+        Ok(self)
     }
 
     /// The cost model's card: an RTX 3090 (24 GiB) with a 62 GiB host and fixed reserves of 64 MiB of

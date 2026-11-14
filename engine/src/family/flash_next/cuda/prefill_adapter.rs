@@ -12,9 +12,8 @@
 //!    union fits the bank's slots, and how many of the union are not resident.
 //! 3. If the union fits and anything is missing, the caller drains its own stream, then
 //!    [`PrefillAdapter::admit_union`] admits the union in one pass. An admit that does not
-//!    run returns `None`; the per-row step tail is the caller's fallback, also for an
-//!    over-capacity union (the shared pass keeps that rule until it needs the policy's
-//!    keep-last-slots admit, which `DeviceBank::admit` already accepts).
+//!    run returns `None`. An already-resident union needs only its slot mapping; an
+//!    over-capacity union requires smaller sub-blocks or the legacy per-row step tail.
 //! 4. Whenever the returned copies have ops, the caller uploads the bank's slot row again
 //!    before the next classify.
 //!
@@ -80,8 +79,89 @@ pub(in crate::family::flash_next) mod device {
     use super::AdmitPlan;
     use crate::{
         EngError,
+        family::{
+            exl3::{
+                prefill::window,
+                prefill_moe::{PrefillStore, SlotResolver},
+            },
+            flash_next::cuda::moe_block::SlotSpans,
+            project::cuda::exl3::Exl3Members,
+        },
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
+        weights::exl3::Codebook,
     };
+
+    /// One layer's borrowing store handle; no buffer or bank ownership is duplicated.
+    pub(in crate::family::flash_next::cuda) struct LayerStore<'a> {
+        pub(in crate::family::flash_next::cuda) adapter: PrefillAdapter<'a>,
+        pub(in crate::family::flash_next::cuda) ctx: &'a CudaContext,
+        pub(in crate::family::flash_next::cuda) layer: usize,
+        pub(in crate::family::flash_next::cuda) spans: &'a SlotSpans,
+        pub(in crate::family::flash_next::cuda) book: Codebook,
+        pub(in crate::family::flash_next::cuda) slot_row: DeviceRange<'a>,
+    }
+
+    impl SlotResolver for LayerStore<'_> {
+        fn resolve_slots(
+            &mut self,
+            stream: &DeviceStream,
+            picks: &[usize],
+        ) -> Result<Vec<usize>, EngError> {
+            let ids: Vec<i32> = picks
+                .iter()
+                .map(|&id| {
+                    i32::try_from(id).map_err(|_| {
+                        EngError::BadRequest("Flash-Next prefill store: a pick exceeds i32".into())
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let plan = self.adapter.admit_plan(self.layer, &[&ids])?;
+            if !plan.fits {
+                return Err(EngError::BadRequest(
+                    "Flash-Next prefill store: the sub-block exceeds the bank's slots".into(),
+                ));
+            }
+            if plan.admits() {
+                // Earlier sub-blocks can still read the slots this admit will overwrite.
+                stream.synchronize()?;
+                let copies = self.adapter.admit_planned(self.ctx, self.layer, &plan)?;
+                if copies.as_ref().is_some_and(|pass| !pass.ops.is_empty()) {
+                    let bytes: Vec<u8> = self
+                        .adapter
+                        .slot_row(self.layer)?
+                        .iter()
+                        .flat_map(|slot| slot.to_le_bytes())
+                        .collect();
+                    let destination = window(self.slot_row, 0, bytes.len())?;
+                    destination
+                        .buffer()
+                        .write_at(stream, destination.offset(), &bytes)?;
+                }
+            }
+            let row = self.adapter.slot_row(self.layer)?;
+            picks
+                .iter()
+                .map(|&id| {
+                    usize::try_from(row[id]).map_err(|_| {
+                        EngError::BadRequest(
+                            "Flash-Next prefill store: an admitted pick is absent".into(),
+                        )
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl PrefillStore for LayerStore<'_> {
+        fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
+            let buffer = self.adapter.slots(self.layer)?;
+            Ok([
+                self.spans.members_of(buffer, 0, self.book)?,
+                self.spans.members_of(buffer, 1, self.book)?,
+                self.spans.members_of(buffer, 2, self.book)?,
+            ])
+        }
+    }
 
     pub(in crate::family::flash_next) struct PrefillAdapter<'a> {
         bank: &'a mut DeviceBank,
@@ -137,8 +217,9 @@ pub(in crate::family::flash_next) mod device {
         }
 
         /// Admits the chunk's union in one pass when the plan admits; `None` when it does not
-        /// (the union does not fit, or everything is already resident) — the caller's fallback
-        /// is the per-row [`Self::step`] tail. A caller that wants to drain its own stream only
+        /// (the union does not fit, or everything is already resident). An over-capacity union
+        /// needs smaller sub-blocks or the per-row [`Self::step`] tail; a resident union only
+        /// needs its mapping. A caller that wants to drain its own stream only
         /// when an admit will run computes [`Self::admit_plan`] first and uses
         /// [`Self::admit_planned`] instead, so the union is not computed twice. The copies run
         /// on the bank's own stream and the call returns when they have finished; the caller

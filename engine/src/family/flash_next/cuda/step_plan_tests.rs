@@ -29,6 +29,23 @@ fn live(slot: &PlannedSlot, phase: Phase) -> bool {
 }
 
 #[test]
+fn prefill_arena_charge_uses_the_full_aligned_owner_list() {
+    let (_, g) = real();
+    assert_eq!(StepPlan::prefill_bytes(false, &g, 0, 0).unwrap(), 0);
+    for rows in [1, 64] {
+        let plan = StepPlan::new_prefill(&g, rows, 32_768, &StepOptions::default()).unwrap();
+        let actual = crate::kernels::cuda::plan_arena(&plan.arena_tensors())
+            .unwrap()
+            .total;
+        assert_eq!(
+            StepPlan::prefill_bytes(true, &g, rows, 32_768).unwrap(),
+            u64::try_from(actual).unwrap()
+        );
+    }
+    assert!(StepPlan::prefill_bytes(true, &g, 65, 32_768).is_err());
+}
+
+#[test]
 fn shared_prefill_extension_replans_the_full_tensor_list() {
     let (_, g) = real();
     for rows in [1, 64] {

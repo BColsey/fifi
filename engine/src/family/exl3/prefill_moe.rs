@@ -31,7 +31,7 @@
 use super::prefill::{Output, Projector, split, window};
 use crate::family::exl3::{
     bank::LayerResolver,
-    moe::Exl3MoeWeights,
+    moe::{Exl3MoeWeights, SharedWeights},
     shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu},
 };
 use crate::family::project::cuda::exl3_jobs::{
@@ -40,7 +40,10 @@ use crate::family::project::cuda::exl3_jobs::{
 };
 use crate::{
     EngError,
-    family::{exl3::launch::MoeDims, project::cuda::exl3::Exl3Bank},
+    family::{
+        exl3::launch::MoeDims,
+        project::cuda::exl3::{Exl3Bank, Exl3Members},
+    },
     kernels::cuda::{
         DeviceRange,
         prefill::swiglu_rows::SwigluRowsCall,
@@ -70,6 +73,41 @@ impl SlotResolver for LayerResolver<'_, '_> {
     ) -> Result<Vec<usize>, EngError> {
         self.resolve(stream, picks)
     }
+}
+
+/// Routed views are borrowed only after resolving, until this sub-block's projections end.
+/// The next resolve may replace the bytes that those views address.
+pub(in crate::family) trait PrefillStore: SlotResolver {
+    fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError>;
+}
+
+struct ResidentStore<'r, 'w, R> {
+    resolver: &'r mut R,
+    banks: [&'w Exl3Bank; 3],
+}
+
+impl<R: SlotResolver> SlotResolver for ResidentStore<'_, '_, R> {
+    fn resolve_slots(
+        &mut self,
+        stream: &crate::kernels::cuda::DeviceStream,
+        picks: &[usize],
+    ) -> Result<Vec<usize>, EngError> {
+        self.resolver.resolve_slots(stream, picks)
+    }
+}
+
+impl<R: SlotResolver> PrefillStore for ResidentStore<'_, '_, R> {
+    fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
+        bank_members(self.banks)
+    }
+}
+
+fn bank_members(banks: [&Exl3Bank; 3]) -> Result<[Exl3Members<'_>; 3], EngError> {
+    Ok([
+        banks[0].members()?,
+        banks[1].members()?,
+        banks[2].members()?,
+    ])
 }
 
 pub(in crate::family) struct Bufs<'b> {
@@ -123,15 +161,12 @@ fn read_plan(
 /// The shared expert: gate and up into the halves of `shared_gu`, the SwiGLU, down.
 fn shared(
     projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
+    weights: &SharedWeights<'_>,
     bufs: &Bufs<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
     let (m, s) = (dims.rows, dims.shared_inter);
-    for (half, weight) in [weights.shared_gate, weights.shared_up]
-        .into_iter()
-        .enumerate()
-    {
+    for (half, weight) in [weights.gate, weights.up].into_iter().enumerate() {
         let out = Output::Columns {
             dst: bufs.shared_gu,
             ld: 2 * s,
@@ -147,15 +182,11 @@ fn shared(
             act: bufs.shared_act,
         },
     )?;
-    projector.project(
-        weights.shared_down,
-        bufs.shared_act,
-        Output::Rows(bufs.shared_out),
-    )
+    projector.project(weights.down, bufs.shared_act, Output::Rows(bufs.shared_out))
 }
 
 struct Routed<'a, 'b> {
-    bank: &'a Exl3Bank,
+    members: Exl3Members<'a>,
     x: DeviceRange<'b>,
     /// The output face, its row stride and its first column.
     out: (DeviceRange<'b>, usize, usize),
@@ -178,12 +209,11 @@ fn project_jobs(
         xh: bufs.expert_xh,
         z: bufs.expert_z,
     };
-    let members = call.bank.members()?;
     let launch = jobs_call(
         projector.scratch.flag,
         scratch,
         table,
-        &members,
+        &call.members,
         call.x,
         call.out,
         call.lists,
@@ -222,14 +252,21 @@ pub(in crate::family) fn routed_with(
     pair: bool,
 ) -> Result<bool, EngError> {
     let plan = read_plan(projector, bufs.ids, dims)?;
-    routed_plan(projector, weights, bufs, dims, plan, pair)
+    routed_plan(
+        projector,
+        bank_members([weights.gate, weights.up, weights.down])?,
+        bufs,
+        dims,
+        plan,
+        pair,
+    )
 }
 
 /// [`routed_with`] with the pair plan given: the caller has already read (and possibly
 /// mapped) the picks, so this stages only the sort lists and the projections.
 fn routed_plan(
     projector: &Projector<'_>,
-    weights: &Exl3MoeWeights<'_>,
+    members: [Exl3Members<'_>; 3],
     bufs: &Bufs<'_>,
     dims: &MoeDims,
     plan: PairPlan,
@@ -237,12 +274,13 @@ fn routed_plan(
 ) -> Result<bool, EngError> {
     let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
     let jobs = plan_jobs(&plan.counts);
+    let table_range = window(bufs.perm, 2 * pairs * I32, jobs.len() * 16)?;
     write_lists(projector.launch, bufs.perm, (&plan, &jobs))?;
     split::mark(projector.launch.stream, "ids read and sort");
     let list = |at: usize| window(bufs.perm, at * pairs * I32, pairs * I32);
     let table = Table {
         jobs: &jobs,
-        range: window(bufs.perm, 2 * pairs * I32, jobs.len() * 16)?,
+        range: table_range,
         rows: pairs,
     };
     // Gate and up read the rows of the chunk through the first list, each sorted pair once.
@@ -264,13 +302,12 @@ fn routed_plan(
         for _ in 0..2 {
             split::count("routed job-table projections");
         }
-        let (gate_members, up_members) = (weights.gate.members()?, weights.up.members()?);
         let calls = (
             jobs_call(
                 projector.scratch.flag,
                 first,
                 table,
-                &gate_members,
+                &members[0],
                 bufs.x2,
                 (bufs.gu, 2 * i, 0),
                 listed,
@@ -279,7 +316,7 @@ fn routed_plan(
                 projector.scratch.flag,
                 second,
                 table,
-                &up_members,
+                &members[1],
                 bufs.x2,
                 (bufs.gu, 2 * i, i),
                 listed,
@@ -291,13 +328,13 @@ fn routed_plan(
             (true, None),
         )?;
     } else {
-        for (half, bank) in [weights.gate, weights.up].into_iter().enumerate() {
+        for (half, &members) in members[..2].iter().enumerate() {
             project_jobs(
                 projector,
                 bufs,
                 table,
                 Routed {
-                    bank,
+                    members,
                     x: bufs.x2,
                     out: (bufs.gu, 2 * i, half * i),
                     lists: listed,
@@ -317,7 +354,7 @@ fn routed_plan(
     split::mark(projector.launch.stream, "routed swiglu");
     // Down writes each sorted pair to its (row, rank) place through the second list.
     let call = Routed {
-        bank: weights.down,
+        members: members[2],
         x: bufs.act,
         out: (bufs.paired, dims.hidden, 0),
         lists: Lists {
@@ -358,7 +395,12 @@ pub(in crate::family) fn run(
     bufs: &Bufs<'_>,
     dims: &MoeDims,
 ) -> Result<(), EngError> {
-    shared(projector, weights, bufs, dims)?;
+    let shared_weights = SharedWeights {
+        gate: weights.shared_gate,
+        up: weights.shared_up,
+        down: weights.shared_down,
+    };
+    shared(projector, &shared_weights, bufs, dims)?;
     split::mark(projector.launch.stream, "shared expert");
     routed(projector, weights, bufs, dims)?;
     combine(projector, bufs, dims)?;
@@ -414,6 +456,27 @@ pub(in crate::family) fn run_banked(
     sub: &[(usize, MoeDims)],
     bank: &mut impl SlotResolver,
 ) -> Result<(), EngError> {
+    let shared_weights = SharedWeights {
+        gate: weights.shared_gate,
+        up: weights.shared_up,
+        down: weights.shared_down,
+    };
+    let mut store = ResidentStore {
+        resolver: bank,
+        banks: [weights.gate, weights.up, weights.down],
+    };
+    run_store(projector, &shared_weights, bufs, dims, sub, &mut store)
+}
+
+/// The same banked pass over a store that lends typed, possibly interleaved routed views.
+pub(in crate::family) fn run_store(
+    projector: &Projector<'_>,
+    weights: &SharedWeights<'_>,
+    bufs: &Bufs<'_>,
+    dims: &MoeDims,
+    sub: &[(usize, MoeDims)],
+    bank: &mut impl PrefillStore,
+) -> Result<(), EngError> {
     shared(projector, weights, bufs, dims)?;
     split::mark(projector.launch.stream, "shared expert");
     // One readback for the whole chunk: each sub-block's mapping then runs host-side from
@@ -432,19 +495,28 @@ pub(in crate::family) fn run_banked(
         } else {
             let wanted = raw.iter().map(|&id| id as usize).collect::<Vec<_>>();
             let mapped = bank.resolve_slots(projector.launch.stream, &wanted)?;
-            let bytes: Vec<u8> = mapped
-                .iter()
-                .flat_map(|&slot| (slot as i32).to_le_bytes())
-                .collect();
+            if mapped.len() != wanted.len() {
+                return Err(EngError::BadRequest(
+                    "prefill chunk: the bank changed the pick count".into(),
+                ));
+            }
+            let slots: Vec<i32> = mapped
+                .into_iter()
+                .map(|slot| {
+                    i32::try_from(slot).map_err(|_| {
+                        EngError::BadRequest("prefill chunk: a bank slot exceeds i32".into())
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let bytes: Vec<u8> = slots.iter().flat_map(|slot| slot.to_le_bytes()).collect();
             sub_bufs.ids.buffer().write_at(
                 projector.launch.stream,
                 sub_bufs.ids.offset(),
                 &bytes,
             )?;
-            let slots: Vec<i32> = mapped.iter().map(|&slot| slot as i32).collect();
             plan_pairs(&slots, dims.n_expert, k)?
         };
-        routed_plan(projector, weights, &sub_bufs, sub_dims, plan, pair)?;
+        routed_plan(projector, bank.members()?, &sub_bufs, sub_dims, plan, pair)?;
         combine(projector, &sub_bufs, sub_dims)?;
     }
     split::mark(projector.launch.stream, "combine");

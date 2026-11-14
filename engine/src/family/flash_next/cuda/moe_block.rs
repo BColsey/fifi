@@ -355,11 +355,21 @@ mod device {
     use crate::{
         EngError,
         family::{
-            exl3::moe::{
-                Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights, grouped_indexed,
-                shared_of, shared_rows,
+            exl3::{
+                moe::{
+                    Exl3MoeBufs, IndexedPair, Scratch, SharedRowsIo, SharedWeights,
+                    grouped_indexed, shared_of, shared_rows,
+                },
+                prefill::{Projector, window},
+                prefill_moe,
             },
-            flash_next::{cuda::bank::device::DeviceBank, moe::slot_bank::SlotBankLayout},
+            flash_next::{
+                cuda::{
+                    bank::device::DeviceBank,
+                    prefill_adapter::device::{LayerStore, PrefillAdapter},
+                },
+                moe::slot_bank::SlotBankLayout,
+            },
             project::{
                 cuda::{
                     exl3::{Exl3BankSpan, Exl3Members, Exl3Weight},
@@ -368,7 +378,7 @@ mod device {
                         plan_jobs, plan_pairs, project_jobs, write_lists,
                     },
                 },
-                exl3_jobs_plan::EXL3_JOB_WORDS,
+                exl3_jobs_plan::{EXL3_JOB_WORDS, MAX_EXL3_ROWS, exl3_job_bytes},
             },
             qwen36::cuda::moe::{Launch, MoeDims, RouteBufs},
         },
@@ -516,6 +526,34 @@ mod device {
         pick: u32,
         x: DeviceRange<'a>,
         out: DeviceRange<'a>,
+    }
+
+    impl SlotSpans {
+        /// Record-strided members; trellis strides count u16s and scale strides count f32s.
+        pub(in crate::family::flash_next) fn members_of<'b>(
+            &self,
+            buffer: &'b DeviceBuffer,
+            part: usize,
+            book: Codebook,
+        ) -> Result<Exl3Members<'b>, EngError> {
+            let span = &self.parts[part];
+            if !self.trellis_stride.is_multiple_of(2) {
+                return Err(refuse(
+                    "the bank's record stride is not a whole u16 count".into(),
+                ));
+            }
+            Ok(Exl3Members {
+                trellis: buffer.range(span.trellis.start, span.trellis.len())?,
+                suh: buffer.range(span.suh.start, span.suh.len())?,
+                svh: buffer.range(span.svh.start, span.svh.len())?,
+                trellis_stride: self.trellis_stride / 2,
+                scale_stride: self.scale_stride,
+                members: self.slots,
+                shape: span.shape,
+                bits_twice: span.bits_twice,
+                book,
+            })
+        }
     }
 
     fn whole(buffer: &DeviceBuffer) -> Result<DeviceRange<'_>, EngError> {
@@ -864,15 +902,14 @@ mod device {
             })
         }
 
-        /// One router launch over every row of the chunk, then one read-back: `(ids, weights)`
-        /// per row. Shared by the admit path and the ring path of `run_rows`.
-        fn route_rows(
+        /// One router launch over the chunk; the picks stay on the device for the shared pass.
+        fn route(
             &self,
             launch: &Launch<'_>,
             layer: usize,
             bufs: &Exl3MoeBufs<'_>,
             dims: &MoeDims,
-        ) -> Result<RoutedPicks, EngError> {
+        ) -> Result<(), EngError> {
             let m = dims.rows;
             let (h, k, e) = (dims.hidden, dims.top_k, dims.n_expert);
             let (ctx, stream) = (launch.ctx, launch.stream);
@@ -899,7 +936,21 @@ mod device {
                         status: bufs.route.status,
                     },
                 },
-            )?;
+            )
+        }
+
+        /// One router launch, then one bulk read-back of `(ids, weights)` per row.
+        /// Shared by the admit path and the ring path of `run_rows`.
+        fn route_rows(
+            &self,
+            launch: &Launch<'_>,
+            layer: usize,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+        ) -> Result<RoutedPicks, EngError> {
+            self.route(launch, layer, bufs, dims)?;
+            let (m, k, e) = (dims.rows, dims.top_k, dims.n_expert);
+            let stream = launch.stream;
             let mut raw_ids = vec![0u8; m * k * I32];
             let profile = prof::on();
             let raw_weights = prof::blocked(37, profile, || {
@@ -937,6 +988,100 @@ mod device {
                 picks.push((ids, weights));
             }
             Ok(picks)
+        }
+
+        /// The promoted FP16-staged pass. The caller supplies its jobs-sized permutation
+        /// region, never the legacy classify/split layout's six-words-per-pair region.
+        /// The caller has written the dense job table before the first layer of the chunk.
+        #[cfg_attr(
+            not(test),
+            expect(dead_code, reason = "shared startup remains fail-closed")
+        )]
+        pub(in crate::family::flash_next) fn run_prefill(
+            &mut self,
+            projector: &Projector<'_>,
+            layer: usize,
+            bufs: &Exl3MoeBufs<'_>,
+            dims: &MoeDims,
+            perm: DeviceRange<'_>,
+        ) -> Result<(), EngError> {
+            let geometry = *self.bank.geometry();
+            if !(1..=MAX_EXL3_ROWS).contains(&dims.rows)
+                || dims.rows > self.layout.rows
+                || projector.rows != dims.rows
+                || layer >= geometry.layers
+                || dims.n_expert != geometry.experts
+                || dims.top_k != geometry.top_k
+                || self.ring.is_some()
+            {
+                return Err(refuse(
+                    "the shared pass does not fit the planned bank window".into(),
+                ));
+            }
+            let (_, perm_bytes) =
+                exl3_job_bytes(dims.rows, projector.tile_rows, dims.n_expert, dims.top_k)
+                    .ok_or_else(|| refuse("the shared job sizes overflow".into()))?;
+            if perm.bytes() < perm_bytes {
+                return Err(refuse("the shared permutation range is too short".into()));
+            }
+            let sub_rows = geometry
+                .slots
+                .checked_div(dims.top_k)
+                .filter(|&n| n > 0)
+                .ok_or_else(|| refuse("the bank cannot hold one routed row".into()))?;
+            let sub: Vec<_> = (0..dims.rows)
+                .step_by(sub_rows)
+                .map(|r0| {
+                    (
+                        r0,
+                        MoeDims {
+                            rows: sub_rows.min(dims.rows - r0),
+                            ..*dims
+                        },
+                    )
+                })
+                .collect();
+            let launch = projector.launch;
+            self.route(launch, layer, bufs, dims)?;
+            let bytes = dims.rows * dims.hidden * F32;
+            launch.ctx.copy_device(
+                launch.stream,
+                window(bufs.route.resid_in, 0, bytes)?,
+                window(bufs.route.resid_out, 0, bytes)?,
+            )?;
+            let common = prefill_moe::Bufs {
+                x2: bufs.route.norm_row,
+                ids: bufs.route.ids,
+                weights: bufs.route.weights,
+                shared_gate: bufs.route.shared_gate,
+                hidden: bufs.route.resid_out,
+                perm,
+                gu: bufs.expert_gu,
+                act: bufs.expert_act,
+                paired: bufs.expert_down,
+                shared_gu: bufs.shared_gu,
+                shared_act: bufs.shared_act,
+                shared_out: bufs.shared_out,
+                expert_xh: bufs.scratch.xh,
+                expert_z: bufs.scratch.z,
+            };
+            let trunk = &self.trunks[layer];
+            let weights = SharedWeights {
+                gate: trunk.shared_gate,
+                up: trunk.shared_up,
+                down: trunk.shared_down,
+            };
+            let mut store = LayerStore {
+                adapter: PrefillAdapter::new(&mut self.bank),
+                ctx: launch.ctx,
+                layer,
+                spans: &self.spans,
+                book: self.book,
+                slot_row: self
+                    .scratch
+                    .range(self.layout.slot_row, dims.n_expert * I32)?,
+            };
+            prefill_moe::run_store(projector, &weights, &common, dims, &sub, &mut store)
         }
 
         /// The MoE block of a chunk of `dims.rows` rows (`2..=MAX_STEP_ROWS`), the batched shape of
@@ -1434,8 +1579,8 @@ mod device {
                     z: rows_of(&bufs.scratch.z, i * F32, 0, n)?,
                 };
                 let members = [
-                    self.members_of(buffer, spans, 0)?,
-                    self.members_of(buffer, spans, 1)?,
+                    spans.members_of(buffer, 0, self.book)?,
+                    spans.members_of(buffer, 1, self.book)?,
                 ];
                 let fused = if pair {
                     pair_scratch_of(&bufs.scratch, n, i, h)?
@@ -1537,7 +1682,7 @@ mod device {
                         z: rows_of(&bufs.scratch.z, h * F32, 0, n)?,
                     },
                     table,
-                    &self.members_of(buffer, spans, 2)?,
+                    &spans.members_of(buffer, 2, self.book)?,
                     act,
                     (bufs.expert_down, h, 0),
                     listed,
@@ -1657,35 +1802,6 @@ mod device {
                 ids,
                 scratch,
             )
-        }
-
-        /// The members of part `part` over one source of expert records — the bank's layer
-        /// buffer or the ring's staging — as the job table addresses them: member `i`'s part
-        /// matrices sit at the part's offsets of the record plus `i` record strides. The
-        /// strides of the shared struct count u16 elements (trellis) and f32 values (scales).
-        fn members_of<'b>(
-            &self,
-            buffer: &'b DeviceBuffer,
-            spans: &SlotSpans,
-            part: usize,
-        ) -> Result<Exl3Members<'b>, EngError> {
-            let span = &spans.parts[part];
-            if !spans.trellis_stride.is_multiple_of(2) {
-                return Err(refuse(
-                    "the bank's record stride is not a whole u16 count".into(),
-                ));
-            }
-            Ok(Exl3Members {
-                trellis: buffer.range(span.trellis.start, span.trellis.len())?,
-                suh: buffer.range(span.suh.start, span.suh.len())?,
-                svh: buffer.range(span.svh.start, span.svh.len())?,
-                trellis_stride: spans.trellis_stride / 2,
-                scale_stride: spans.scale_stride,
-                members: spans.slots,
-                shape: span.shape,
-                bits_twice: span.bits_twice,
-                book: self.book,
-            })
         }
 
         /// One pass over the bank of `pass.layer`: gate and up of the picks, SwiGLU, down, the

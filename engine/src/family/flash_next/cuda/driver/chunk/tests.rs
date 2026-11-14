@@ -452,7 +452,7 @@ fn feed_rows_with_the_default_cap_feeds_one_token_at_a_time() {
 fn shared_prefill_switch_refuses_on_requests_before_startup_is_connected() {
     use super::prof::{SHARED_PREFILL, check_switch_value};
     for off in [None, Some("0"), Some("false"), Some("off")] {
-        check_switch_value(SHARED_PREFILL, off).unwrap();
+        assert!(!check_switch_value(SHARED_PREFILL, off).unwrap());
     }
     for on in ["1", "true", "on"] {
         assert!(matches!(
@@ -467,7 +467,7 @@ fn shared_prefill_switch_refuses_on_requests_before_startup_is_connected() {
             Err(EngError::BadRequest(message)) if message.contains("must be")
         ));
     }
-    check_switch_value("INFERENCE_FLASH_NEXT_PROFILE", Some("on")).unwrap();
+    assert!(check_switch_value("INFERENCE_FLASH_NEXT_PROFILE", Some("on")).unwrap());
 }
 
 #[test]

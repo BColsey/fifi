@@ -648,6 +648,20 @@ impl StepPlan {
         Ok(plan)
     }
 
+    /// The full aligned scratch of the shared owner; no shared list is built while it is off.
+    pub(super) fn prefill_bytes(
+        enabled: bool,
+        geometry: &FlashGeometry,
+        rows: usize,
+        positions: usize,
+    ) -> Result<u64, EngError> {
+        if !enabled {
+            return Ok(0);
+        }
+        let plan = Self::new_prefill(geometry, rows, positions, &StepOptions::default())?;
+        u64::try_from(plan.arena_bytes()).map_err(|_| overflow())
+    }
+
     pub(super) fn rows(&self) -> usize {
         self.rows
     }

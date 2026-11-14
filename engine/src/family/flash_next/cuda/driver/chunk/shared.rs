@@ -76,9 +76,12 @@ impl<'a, D: ChunkDevice, F: TokenFeeds> ChunkFamily for FlashChunkFamily<'a, D, 
         Ok(())
     }
 
-    fn run_layers(&mut self, ctx: &mut Self::Ctx, _p0: usize, _m: usize) -> Result<()> {
+    fn run_layers(&mut self, ctx: &mut Self::Ctx, p0: usize, m: usize) -> Result<()> {
+        if m != ctx.tokens.len() {
+            return Err(refuse("the layer row count differs from the chunk"));
+        }
         self.driver
-            .queue_layers(ctx.tokens, &ctx.ple_rows, &mut ctx.clock)
+            .queue_layers(p0, ctx.tokens, &ctx.ple_rows, &mut ctx.clock)
     }
 
     fn read_health(&mut self, _ctx: &mut Self::Ctx) -> Result<i32> {
@@ -216,5 +219,48 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
             family.driver.poisoned = true;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::{
+        flash_next::cuda::driver::fakes::{FakeChunkDevice, FakeFeeds, shape},
+        session::TokenStepper,
+    };
+
+    #[test]
+    fn layer_queue_uses_the_walkers_position_without_publishing_it() {
+        let mut driver =
+            ChunkDriver::new(FakeChunkDevice::default(), FakeFeeds::default(), shape()).unwrap();
+        driver.feed_rows(&[1]).unwrap();
+        driver.device.log.clear();
+        {
+            let mut family = FlashChunkFamily {
+                driver: &mut driver,
+            };
+            let mut ctx = FlashChunkCtx {
+                tokens: &[2],
+                starts: &[],
+                ple_rows: Vec::new(),
+                clock: ChunkClock::new(),
+            };
+            assert!(family.run_layers(&mut ctx, 7, 2).is_err());
+            assert!(family.driver.device.log.is_empty());
+            family.run_layers(&mut ctx, 7, 1).unwrap();
+        }
+        let shape = shape();
+        assert!(
+            driver
+                .device
+                .log
+                .contains(&format!("layers 0..{} @7 m1", shape.ple_layer))
+        );
+        assert!(driver.device.log.contains(&format!(
+            "layers {}..{} @7 m1",
+            shape.ple_layer, shape.layers
+        )));
+        assert_eq!(driver.fed(), 1);
     }
 }
