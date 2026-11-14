@@ -353,19 +353,7 @@ fn largest_resident_context(
             plan::admit(&demand, free).is_ok()
         })
     };
-    if !admits(1) {
-        return None;
-    }
-    let (mut fits, mut over) = (1, MODEL_CONTEXT_LIMIT + 1);
-    while over - fits > 1 {
-        let middle = fits + (over - fits) / 2;
-        if admits(middle) {
-            fits = middle;
-        } else {
-            over = middle;
-        }
-    }
-    Some(fits)
+    crate::family::device_budget::largest_fitting(MODEL_CONTEXT_LIMIT + 1, 1, &admits)
 }
 
 /// What to tell the operator after a refused load that the host buffer could have avoided, or
@@ -1217,6 +1205,74 @@ mod resident_advice_tests {
             headroom: reserve.headroom,
         };
         plan::admit(&demand, free).is_ok()
+    }
+
+    /// The private step-1 bisection the shared search replaced, kept
+    /// verbatim as the oracle: same admits predicate, same arithmetic.
+    fn legacy_largest_resident_context(
+        options: &FlintOptions,
+        free: u64,
+        resident: u64,
+        cache_bytes: u64,
+    ) -> Option<u32> {
+        let admits = |context: u32| {
+            let options = FlintOptions {
+                context_limit: context,
+                ..options.clone()
+            };
+            reserve_for(&options, cache_bytes).is_ok_and(|reserve| {
+                let demand = plan::Demand {
+                    tensors: resident,
+                    kv_cache: reserve.kv_cache,
+                    work: reserve.work,
+                    headroom: reserve.headroom,
+                };
+                plan::admit(&demand, free).is_ok()
+            })
+        };
+        if !admits(1) {
+            return None;
+        }
+        let (mut fits, mut over) = (1, MODEL_CONTEXT_LIMIT + 1);
+        while over - fits > 1 {
+            let middle = fits + (over - fits) / 2;
+            if admits(middle) {
+                fits = middle;
+            } else {
+                over = middle;
+            }
+        }
+        Some(fits)
+    }
+
+    #[test]
+    fn the_shared_search_matches_the_old_bisection_on_the_pinned_grid() {
+        let cache_bytes = CudaContext::alloc_cache_reserve(true);
+        // The pinned grid (the published-ceiling neighborhood and the tight
+        // card) plus three off-lattice arms: a step-1 cut lands between
+        // lattice points, and the two searches must agree exactly there too.
+        let mut off_lattice = 0;
+        for (profile, free) in [
+            ("f16", 24_000_000_000u64),
+            ("f16", 23_500_000_000),
+            ("f16", 22_500_000_000),
+            ("q8", 24_000_000_000),
+            ("q8", 23_000_000_000),
+        ] {
+            let base = options(1, profile);
+            let new = largest_resident_context(&base, free, RESIDENT, cache_bytes);
+            let old = legacy_largest_resident_context(&base, free, RESIDENT, cache_bytes);
+            assert_eq!(new, old, "{profile} {free}");
+            if new.is_some_and(|largest| largest % 1024 != 0) {
+                off_lattice += 1;
+            }
+        }
+        let base = options(1, "f16");
+        assert_eq!(
+            largest_resident_context(&base, RESIDENT, RESIDENT, cache_bytes),
+            legacy_largest_resident_context(&base, RESIDENT, RESIDENT, cache_bytes)
+        );
+        assert!(off_lattice >= 3, "{off_lattice} off-lattice results");
     }
 
     #[test]

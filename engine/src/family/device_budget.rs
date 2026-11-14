@@ -132,6 +132,68 @@ mod tests {
         assert_eq!(largest_fitting(8192, 1024, &gap), Some(7168));
     }
 
+    /// A caller adopted `largest_fitting` at step 1 in place of a private bisection.
+    /// This oracle runs both against the same predicates — pinned cut shapes plus
+    /// off-lattice cuts — comparing both the results and the exact list of contexts
+    /// each loop asks, so a different midpoint rule cannot pass.
+    #[test]
+    fn largest_fitting_matches_the_step_one_bisection_oracle() {
+        let legacy =
+            |requested: u32, admits: &dyn Fn(u32) -> bool, asked: &mut Vec<u32>| -> Option<u32> {
+                let probe = |context: u32, asked: &mut Vec<u32>| {
+                    asked.push(context);
+                    admits(context)
+                };
+                if !probe(1, asked) {
+                    return None;
+                }
+                let (mut fits, mut over) = (1, requested);
+                while over - fits > 1 {
+                    let middle = fits + (over - fits) / 2;
+                    if probe(middle, asked) {
+                        fits = middle;
+                    } else {
+                        over = middle;
+                    }
+                }
+                Some(fits)
+            };
+        let shared = |admits: &dyn Fn(u32) -> bool, asked: &mut Vec<u32>| -> Option<u32> {
+            let recorder = std::cell::RefCell::new(Vec::<u32>::new());
+            let result = largest_fitting(262_145, 1, &|context| {
+                recorder.borrow_mut().push(context);
+                admits(context)
+            });
+            asked.extend(recorder.into_inner());
+            result
+        };
+        let compare = |admits: &dyn Fn(u32) -> bool| {
+            let mut old_asked = Vec::new();
+            let mut new_asked = Vec::new();
+            let old = legacy(262_145, admits, &mut old_asked);
+            let new = shared(admits, &mut new_asked);
+            assert_eq!(new, old);
+            assert_eq!(new_asked, old_asked);
+        };
+        // Pinned on-lattice cut, three off-lattice cuts, and the near-top arm.
+        for cut in [30_720u32, 50_000, 86_013, 100_001, 262_143] {
+            let admits = |context: u32| context <= cut;
+            compare(&admits);
+        }
+        // Cuts at the top and above it: the predicate stays true everywhere
+        // probed, and both loops return the last in-range context.
+        for cut in [262_144u32, 262_145] {
+            let admits = |context: u32| context <= cut;
+            assert_eq!(largest_fitting(262_145, 1, &admits), Some(262_144));
+            compare(&admits);
+        }
+        // The gap and refusing arms.
+        let gap = |context: u32| !(20_480..=30_720).contains(&context);
+        compare(&gap);
+        let refuses_all = |_: u32| false;
+        compare(&refuses_all);
+    }
+
     /// The reserve folds in push order, saturates to `None` on overflow, and
     /// reports the exact labels back.
     #[test]

@@ -340,9 +340,13 @@ pub(crate) fn bank_budget(
     work: u64,
     headroom: u64,
 ) -> Result<BankBudget, EngError> {
-    let fixed = [kv_cache, work, headroom, BANK_MARGIN_BYTES]
-        .into_iter()
-        .try_fold(arena_base, u64::checked_add)
+    let fixed = crate::family::device_budget::DeviceReserve::new(0)
+        .push("non-routed weights", arena_base)
+        .push("kv cache", kv_cache)
+        .push("work reserve", work)
+        .push("load headroom", headroom)
+        .push("bank margin", BANK_MARGIN_BYTES)
+        .checked_total()
         .ok_or_else(|| {
             EngError::MemoryPlan("Flint expert bank fixed charge overflows u64".into())
         })?;
@@ -800,6 +804,23 @@ mod tests {
         let budget = bank_budget(fixed + 2_000, 10, 100, 20, 30, FLINT_HEADROOM_BYTES).unwrap();
         assert_eq!(budget.fixed, fixed);
         assert_eq!(budget.room(), 2_000);
+    }
+
+    #[test]
+    fn bank_budget_overflows_exactly_one_byte_past_the_last_fitting_arena() {
+        let (kv, work, headroom) = (1u64 << 20, 2 << 20, 3 << 20);
+        let tail = kv + work + headroom + BANK_MARGIN_BYTES;
+        // The last fitting arena base folds to exactly u64::MAX.
+        let budget = bank_budget(0, u64::MAX - tail, 100, kv, work, headroom).unwrap();
+        assert_eq!(budget.fixed, u64::MAX);
+        assert_eq!(budget.room(), 0);
+        // One byte more is the only overflow, with the exact refusal text.
+        let Err(EngError::MemoryPlan(message)) =
+            bank_budget(0, u64::MAX - tail + 1, 100, kv, work, headroom)
+        else {
+            panic!("one byte past the last fitting arena must refuse");
+        };
+        assert_eq!(message, "Flint expert bank fixed charge overflows u64");
     }
 
     #[test]
