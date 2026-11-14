@@ -15,12 +15,10 @@ use crate::{
     EngError,
     kernels::cuda::resident::{exl3::Exl3Job, router::RouterShape},
 };
-// The moved core's types, re-exported for the driver, the device tests and the golden host
-// test, which reach them through this module.
+// The moved core's types, reached through this module's wrappers only.
 use crate::family::exl3::prefill as core;
-#[cfg(test)]
-pub(super) use crate::family::exl3::prefill::F32;
-pub(super) use crate::family::exl3::prefill::{Exl3Scratch, Output, Projector};
+use crate::family::exl3::prefill::{Exl3Scratch, Output, Projector};
+use crate::family::exl3::prefill_moe;
 
 // The most rows of one job: the tallest CTA of the job-table kernel, this family's own
 // constant, passed to every call of the moved core.
@@ -44,8 +42,9 @@ pub(super) fn write_dense_jobs(
 #[cfg(test)]
 #[path = "prefill_exl3_device_tests.rs"]
 mod device_tests;
-#[path = "prefill_exl3_moe.rs"]
-mod moe;
+#[cfg(test)]
+#[path = "prefill_exl3_moe_device_tests.rs"]
+mod moe_device_tests;
 
 pub(super) fn projector<'a>(
     run: &'a ChunkRun<'_, '_>,
@@ -126,7 +125,7 @@ pub(super) fn moe_block(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
         ));
     };
     let view = |slot| run.v(slot);
-    let bufs = moe::Bufs {
+    let bufs = prefill_moe::Bufs {
         x2: view(ChunkSlot::X2)?,
         ids: view(ChunkSlot::TopkId)?,
         weights: view(ChunkSlot::TopkWeight)?,
@@ -156,7 +155,7 @@ pub(super) fn moe_block(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
             .collect::<Vec<_>>();
         let mut resolver = cell.borrow_mut();
         let mut bank = resolver.layer(ctx.layer);
-        moe::run_banked(
+        prefill_moe::run_banked(
             &projector(run, ctx)?,
             weights,
             &bufs,
@@ -165,7 +164,7 @@ pub(super) fn moe_block(run: &ChunkRun<'_, '_>, ctx: &LayerCtx<'_, '_>) -> Resul
             &mut bank,
         )
     } else {
-        moe::run(&projector(run, ctx)?, weights, &bufs, &dims)
+        prefill_moe::run(&projector(run, ctx)?, weights, &bufs, &dims)
     }
 }
 

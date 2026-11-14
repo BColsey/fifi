@@ -14,7 +14,8 @@
 
 use std::path::Path;
 
-use super::{Exl3Scratch, F32, Output, Projector, TILE_ROWS, write_dense_jobs};
+use super::{TILE_ROWS, write_dense_jobs};
+use crate::family::exl3::prefill::{Exl3Scratch, F32, Output, Projector};
 use crate::{
     family::{
         AttentionKind,

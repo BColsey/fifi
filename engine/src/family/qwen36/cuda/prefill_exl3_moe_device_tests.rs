@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use super::{Bufs, routed_with, run, run_banked};
+use crate::family::exl3::prefill_moe::{Bufs, routed_with, run, run_banked};
 use crate::{
     family::{
         exl3::bank::{Exl3SlotResolver, ExpertStore},
@@ -40,10 +40,8 @@ use crate::{
     weights::exl3::{Checkpoint, Matrix},
 };
 
-use super::super::{
-    F32,
-    device_tests::{Scratch, filled, read, upload, whole},
-};
+use super::device_tests::{Scratch, filled, read, upload, whole};
+use crate::family::exl3::prefill::F32;
 
 /// Rows of the chunk: 1,024 rows * 8 picks over 256 experts is 32 rows per expert on average.
 const ROWS: usize = 1024;

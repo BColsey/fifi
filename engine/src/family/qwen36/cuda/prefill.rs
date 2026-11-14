@@ -28,9 +28,8 @@ use super::{
     state_layout::{Plane, Word},
     tiered_step::TieredRuntime,
 };
-pub(in crate::family) use crate::family::exl3::shapes::{
-    chunk_combine_shape, routed_swiglu, shared_swiglu,
-};
+use crate::family::exl3::prefill::Exl3Scratch;
+use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::spec::AttentionKind;
 use crate::{
@@ -73,6 +72,7 @@ use crate::{
         },
     },
 };
+
 #[cfg(test)]
 use kernel_diagnostics::{
     diagnostic_dense, diagnostic_dense_input, diagnostic_routed, diagnostic_shared,
@@ -1337,8 +1337,8 @@ impl ChunkRun<'_, '_> {
         self.bufs.views.get(slot)
     }
 
-    fn exl3_scratch(&self) -> Result<exl3::Exl3Scratch<'_>, EngError> {
-        Ok(exl3::Exl3Scratch {
+    fn exl3_scratch(&self) -> Result<Exl3Scratch<'_>, EngError> {
+        Ok(Exl3Scratch {
             xh: self.v(ChunkSlot::Exl3Xh)?,
             z: self.v(ChunkSlot::Exl3Z)?,
             y: self.v(ChunkSlot::Exl3Y)?,

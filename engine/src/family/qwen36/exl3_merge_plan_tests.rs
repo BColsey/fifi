@@ -359,10 +359,6 @@ fn only_the_merged_block_asks_for_the_wide_indexed_launch() {
             "exl3/prefill_moe.rs",
             include_str!("../exl3/prefill_moe.rs"),
         ),
-        (
-            "prefill_exl3_moe.rs",
-            include_str!("cuda/prefill_exl3_moe.rs"),
-        ),
     ] {
         assert!(!source.contains("exl3_grouped_indexed_wide"), "{file}");
     }
