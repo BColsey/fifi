@@ -28,9 +28,9 @@
 use super::tier_plan::{TierInputs, TierPlan, indexer_key_bytes};
 use crate::{
     EngError,
-    family::qwen36::{
-        admission_sketch::{CONTEXT_SEARCH_STEP, largest_fitting_context},
-        tiered::budget::KvPlan,
+    family::{
+        device_budget::largest_fitting,
+        qwen36::{admission_sketch::CONTEXT_SEARCH_STEP, tiered::budget::KvPlan},
     },
 };
 
@@ -176,7 +176,7 @@ impl ContextBudget {
     /// The longest context, a multiple of [`CONTEXT_GRANULE`] and at most `limit`, whose plan has at
     /// least `min_slots` experts per layer. `None` when not even one granule does. A longer context
     /// never has more slots, so the search is the bisection `enginesrv check` uses for its context
-    /// proposal ([`largest_fitting_context`]); `limit` itself is tried first, because that search
+    /// proposal ([`largest_fitting`]); `limit` itself is tried first, because that search
     /// never asks for its upper end.
     pub(super) fn largest_context(
         &self,
@@ -192,7 +192,7 @@ impl ContextBudget {
         if fits(top) {
             return Some(u64::from(top));
         }
-        largest_fitting_context(top, &fits).map(u64::from)
+        largest_fitting(top, CONTEXT_GRANULE as u32, &fits).map(u64::from)
     }
 
     /// What the step calls at load: the plan for `requested` positions, or a refusal that states
