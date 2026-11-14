@@ -10,6 +10,7 @@
 
 use super::host::HostShape;
 use super::host_load::rotary_dim;
+use crate::family::kv_format::KvRowShape;
 use crate::family::session::StoreLimits;
 use crate::family::spec::{AttentionKind, FamilySpec, QWEN3_6_35B_A3B};
 use crate::family::speculate::config::{DraftMode, SpecConfig, SpecOptions};
@@ -753,34 +754,14 @@ pub(crate) fn kv_growth_per_position(
             "kv_dtype q8 needs a head_dim that is a multiple of {Q8_GROUP}, got {head_dim}"
         )));
     }
-    let scale_bytes = act.dtype().byte_width();
-    let heads = u64::from(kv_heads);
-    let width = u64::from(head_dim);
-    let bytes = match kv {
-        // Keys and values `[1, KVH, 1, D]` F32.
-        KvDtype::F32 => heads
-            .checked_mul(width)
-            .and_then(|row| row.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(4)),
-        // Keys and values `[1, KVH, 1, D]` BF16: the F32 shapes at half storage.
-        KvDtype::Bf16 => heads
-            .checked_mul(width)
-            .and_then(|row| row.checked_mul(2))
-            .and_then(|bytes| bytes.checked_mul(2)),
-        // Per side: codes `[1, KVH, 1, D/4]` U32 (`KVH * D` bytes), plus scales and biases
-        // `[1, KVH, 1, D/64]` (`2 sides * 2 arrays * KVH * groups * scale_bytes`).
-        KvDtype::Q8 => heads.checked_mul(width).and_then(|codes| {
-            let codes = codes.checked_mul(2)?;
-            let params = width
-                .checked_div(u64::from(Q8_GROUP))
-                .and_then(|groups| heads.checked_mul(groups))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_mul(scale_bytes))?;
-            codes.checked_add(params)
-        }),
-    };
-    bytes.ok_or_else(|| EngError::MemoryPlan("attention growth bytes overflow u64".into()))
+    let bytes = kv
+        .format(act)
+        .layer_position_bytes(KvRowShape {
+            heads_kv: u64::from(kv_heads),
+            head_dim: u64::from(head_dim),
+        })
+        .map_err(|_| EngError::MemoryPlan("attention growth bytes overflow u64".into()))?;
+    Ok(bytes)
 }
 
 /// Parses the `activation_dtype` member: `f32` or `bf16`. Any other text is refused in the style of
@@ -852,6 +833,24 @@ pub(crate) fn kv_dtype_name(kv: KvDtype) -> &'static str {
         KvDtype::F32 => "f32",
         KvDtype::Bf16 => "bf16",
         KvDtype::Q8 => "q8",
+    }
+}
+
+impl KvDtype {
+    /// The storage format in the shared byte arithmetic (`family::kv_format`): Q8 keeps its
+    /// group-64 affine codes with a scale AND a bias of the activation width each
+    /// (2 sides x 2 arrays x groups x scale bytes).
+    pub(crate) fn format(self, act: Activation) -> crate::family::kv_format::KvFormat {
+        match self {
+            Self::F32 => crate::family::kv_format::KvFormat::F32,
+            Self::Bf16 => crate::family::kv_format::KvFormat::Bf16,
+            Self::Q8 => crate::family::kv_format::KvFormat::Affine8 {
+                group: Q8_GROUP,
+                param_bytes: u32::try_from(act.dtype().byte_width()).expect(
+                    "an activation width of more than 4 GiB per element is not a real dtype",
+                ),
+            },
+        }
     }
 }
 
