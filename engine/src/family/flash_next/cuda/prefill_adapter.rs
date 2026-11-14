@@ -23,6 +23,15 @@
 
 use super::moe_block::pick_union;
 
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) fn drain_before_admit<T>(
+    drain: impl FnOnce() -> Result<(), crate::EngError>,
+    admit: impl FnOnce() -> Result<T, crate::EngError>,
+) -> Result<T, crate::EngError> {
+    drain()?;
+    admit()
+}
+
 /// The chunk-admit decision of one layer: the union of the chunk's pick rows in first-seen
 /// order, whether that union fits the bank's slots, and how many of the union are not
 /// resident. An admit runs only when `fits && missing > 0`.
@@ -70,13 +79,44 @@ impl AdmitPlan {
     }
 }
 
+/// Maps picks against a frozen bank row, with cold picks in a disjoint logical member range.
+/// Resolving does not admit: the ring owns those records until the queued reads finish.
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(super) fn ring_slots(
+    row: &[i32],
+    bank_slots: usize,
+    picks: &[usize],
+    ring_slot: impl Fn(u16) -> Option<u16>,
+) -> Result<Vec<usize>, crate::EngError> {
+    picks
+        .iter()
+        .map(|&id| {
+            let refuse = || {
+                crate::EngError::BadRequest(
+                    "prefill ring: a pick has no valid bank or ring slot".into(),
+                )
+            };
+            let &slot = row.get(id).ok_or_else(refuse)?;
+            if slot >= 0 {
+                return usize::try_from(slot)
+                    .ok()
+                    .filter(|&s| s < bank_slots)
+                    .ok_or_else(refuse);
+            }
+            let expert = u16::try_from(id).map_err(|_| refuse())?;
+            let slot = ring_slot(expert).ok_or_else(refuse)?;
+            bank_slots.checked_add(usize::from(slot)).ok_or_else(refuse)
+        })
+        .collect()
+}
+
 /// The device half of the contract: [`DeviceBank`](super::bank::device::DeviceBank) behind the
 /// chunk-facing methods. Borrowing, additive: the served path keeps constructing the bank it
 /// constructs today; a caller that wants the contract constructs this over it.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::flash_next) mod device {
     use super::super::bank::{BankGeometry, BankStats, PassCopies, device::DeviceBank};
-    use super::AdmitPlan;
+    use super::{AdmitPlan, drain_before_admit, ring_slots};
     use crate::{
         EngError,
         family::{
@@ -84,12 +124,60 @@ pub(in crate::family::flash_next) mod device {
                 prefill::window,
                 prefill_moe::{PrefillStore, SlotResolver},
             },
-            flash_next::cuda::moe_block::SlotSpans,
+            flash_next::cuda::{moe_block::SlotSpans, prefill_ring::device::PrefillRing},
             project::cuda::exl3::Exl3Members,
         },
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream},
         weights::exl3::Codebook,
     };
+
+    /// Frozen-bank/ring views of one layer. The caller issues copies before the shared pass,
+    /// and frees the layer only after all of its projections have been queued.
+    pub(in crate::family::flash_next::cuda) struct RingStore<'a> {
+        pub(in crate::family::flash_next::cuda) adapter: PrefillAdapter<'a>,
+        pub(in crate::family::flash_next::cuda) ring: &'a PrefillRing,
+        pub(in crate::family::flash_next::cuda) layer: usize,
+        pub(in crate::family::flash_next::cuda) spans: &'a SlotSpans,
+        pub(in crate::family::flash_next::cuda) ring_spans: SlotSpans,
+        pub(in crate::family::flash_next::cuda) book: Codebook,
+    }
+
+    impl SlotResolver for RingStore<'_> {
+        fn resolve_slots(
+            &mut self,
+            stream: &DeviceStream,
+            picks: &[usize],
+        ) -> Result<Vec<usize>, EngError> {
+            let slots = ring_slots(
+                self.adapter.slot_row(self.layer)?,
+                self.adapter.geometry().slots,
+                picks,
+                |expert| self.ring.slot_of(self.layer, expert),
+            )?;
+            self.ring.wait_layer(stream, self.layer)?;
+            Ok(slots)
+        }
+    }
+
+    impl PrefillStore for RingStore<'_> {
+        fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError> {
+            let slots = self.adapter.slots(self.layer)?;
+            Ok([
+                self.spans.members_of(slots, 0, self.book)?,
+                self.spans.members_of(slots, 1, self.book)?,
+                self.spans.members_of(slots, 2, self.book)?,
+            ])
+        }
+
+        fn ring_members(&self) -> Result<Option<[Exl3Members<'_>; 3]>, EngError> {
+            let slots = self.ring.slots();
+            Ok(Some([
+                self.ring_spans.members_of(slots, 0, self.book)?,
+                self.ring_spans.members_of(slots, 1, self.book)?,
+                self.ring_spans.members_of(slots, 2, self.book)?,
+            ]))
+        }
+    }
 
     /// One layer's borrowing store handle; no buffer or bank ownership is duplicated.
     pub(in crate::family::flash_next::cuda) struct LayerStore<'a> {
@@ -123,8 +211,10 @@ pub(in crate::family::flash_next) mod device {
             }
             if plan.admits() {
                 // Earlier sub-blocks can still read the slots this admit will overwrite.
-                stream.synchronize()?;
-                let copies = self.adapter.admit_planned(self.ctx, self.layer, &plan)?;
+                let copies = drain_before_admit(
+                    || stream.synchronize(),
+                    || self.adapter.admit_planned(self.ctx, self.layer, &plan),
+                )?;
                 if copies.as_ref().is_some_and(|pass| !pass.ops.is_empty()) {
                     let bytes: Vec<u8> = self
                         .adapter

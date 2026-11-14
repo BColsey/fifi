@@ -46,13 +46,16 @@ use std::cell::Cell;
 use crate::{
     EngError,
     family::{
-        exl3::moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
+        exl3::{
+            moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
+            prefill::{Exl3Scratch, Output, Projector, write_dense_jobs},
+        },
         exl3_pack::layer_name,
         flash_next::{
             cuda::{
                 moe_block::{SplitMoe, SplitMoeTrunk},
                 state::{FlashGeometry, StatePlan, StateSlot, WORD_STEP_PARAMS},
-                step_plan::{Site, Slot, StepOptions, StepPlan},
+                step_plan::{PREFILL_TILE_ROWS, Site, Slot, StepOptions, StepPlan},
             },
             load::model_shape,
             moe::context_budget::KvFormat,
@@ -108,6 +111,8 @@ pub(super) struct FlashStep<'a> {
     /// The plan's row count: every launch takes `m` rows with `m <= rows` (decode is 1, a chunk
     /// is its token count). The slots hold this many rows.
     pub(super) rows: usize,
+    /// The shared owner also serves decode: only an open prefill window uses its new launches.
+    pub(super) prefill_window: Cell<bool>,
     /// Set by any error of a launch call; cleared by [`Self::reset`].
     poisoned: Cell<bool>,
 }
@@ -136,7 +141,7 @@ impl<'a> FlashStep<'a> {
         )
     }
 
-    /// The shared-prefill owner; startup admission remains disabled until its binding is complete.
+    /// The shared-prefill owner, with dense and routed scratch from the shared plan.
     pub(super) fn new_prefill(
         ctx: &'a CudaContext,
         stream: &'a DeviceStream,
@@ -209,6 +214,7 @@ impl<'a> FlashStep<'a> {
             zeros,
             layers,
             rows,
+            prefill_window: Cell::new(false),
             poisoned: Cell::new(false),
         };
         step.reset()?;
@@ -224,6 +230,7 @@ impl<'a> FlashStep<'a> {
     /// the indexer keys stay in place for a restore to rewind the valid length onto (see
     /// [`StatePlan::is_position_state`] for why a fresh sequence never observes them).
     pub(super) fn reset(&self) -> Result<(), EngError> {
+        self.prefill_window.set(false);
         let zeros = vec![0u8; 1 << 24];
         let ranges: Vec<(usize, usize)> = if crate::family::flash_next::cuda::resume::on() {
             self.state_plan
@@ -432,6 +439,30 @@ impl<'a> FlashStep<'a> {
         }
     }
 
+    pub(super) fn shared_prefill(&self) -> bool {
+        self.prefill_window.get() && self.step_plan.index(Slot::PrefillPerm).is_some()
+    }
+
+    pub(super) fn prefill_projector<'b>(
+        &'b self,
+        launch: &'b Launch<'b>,
+        m: usize,
+    ) -> Result<Projector<'b>, EngError> {
+        self.check_rows(m)?;
+        Ok(Projector {
+            launch,
+            rows: m,
+            tile_rows: PREFILL_TILE_ROWS,
+            scratch: Exl3Scratch {
+                xh: self.slot(Slot::Exl3Xh)?,
+                z: self.slot(Slot::Exl3Z)?,
+                y: self.slot(Slot::PrefillY)?,
+                flag: self.slot(Slot::Exl3Flag)?,
+                jobs: self.slot(Slot::Exl3Jobs)?,
+            },
+        })
+    }
+
     // ------------------------------------------------------------------ launches
 
     /// One EXL3 projection of the row `x` into `out`. The scratch is the plan's: rotated inputs,
@@ -445,6 +476,15 @@ impl<'a> FlashStep<'a> {
     ) -> Result<(), EngError> {
         self.check_rows(m)?;
         let weight = self.exl3(prefix)?;
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return self
+                .prefill_projector(&launch, m)?
+                .project(weight, x, Output::Rows(out));
+        }
         if m == 1 {
             let view = weight.view()?;
             let io = Exl3Io {
@@ -478,6 +518,21 @@ impl<'a> FlashStep<'a> {
         ld: usize,
         m: usize,
     ) -> Result<(), EngError> {
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return self.prefill_projector(&launch, m)?.project(
+                self.exl3(prefix)?,
+                x,
+                Output::Columns {
+                    dst: row,
+                    ld,
+                    col_off,
+                },
+            );
+        }
         if m == 1 {
             let out = Self::columns(&row, col_off, n)?;
             return self.project(prefix, x, out, 1);
@@ -789,6 +844,15 @@ impl<'a> FlashStep<'a> {
             ctx: self.ctx,
             stream: self.stream,
         };
+        if self.shared_prefill() {
+            return moe.run_prefill(
+                &self.prefill_projector(&launch, m)?,
+                layer,
+                &self.moe_bufs_rows(m)?,
+                &self.moe_dims(m),
+                self.slot(Slot::PrefillPerm)?,
+            );
+        }
         // The split block takes a chunk in one call; every other block loops one row.
         if m > 1 && moe.batches_rows() {
             return moe.run_rows(&launch, layer, &self.moe_bufs_rows(m)?, &self.moe_dims(m));
@@ -857,6 +921,18 @@ impl<'a> FlashStep<'a> {
     pub(super) fn begin_chunk(&self, m: usize) -> Result<(), EngError> {
         self.begin_token()?;
         self.check_rows(m)?;
+        if self.shared_prefill() {
+            let launch = Launch {
+                ctx: self.ctx,
+                stream: self.stream,
+            };
+            return write_dense_jobs(
+                &launch,
+                &self.prefill_projector(&launch, m)?.scratch,
+                m,
+                PREFILL_TILE_ROWS,
+            );
+        }
         // A chunk of at most MAX_STEP_ROWS rows is one dense job of member 0: the kernel's
         // job row cap (`jobs_row_cap`, 256, exl3.cu) is wider than any planned chunk.
         let job = Exl3Job {
@@ -1031,6 +1107,17 @@ pub(super) trait MoeBlock {
         dims: &MoeDims,
     ) -> Result<(), EngError>;
 
+    fn run_prefill(
+        &mut self,
+        _projector: &Projector<'_>,
+        _layer: usize,
+        _bufs: &Exl3MoeBufs<'_>,
+        _dims: &MoeDims,
+        _perm: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        Err(refuse("this MoE block has no shared prefill path".into()))
+    }
+
     /// Whether [`MoeBlock::run_rows`] takes a multi-row chunk in one call.
     fn batches_rows(&self) -> bool {
         false
@@ -1182,6 +1269,27 @@ impl MoeBlock for SplitMoeAt<'_> {
 
     fn batches_rows(&self) -> bool {
         true
+    }
+
+    fn run_prefill(
+        &mut self,
+        projector: &Projector<'_>,
+        layer: usize,
+        bufs: &Exl3MoeBufs<'_>,
+        dims: &MoeDims,
+        perm: DeviceRange<'_>,
+    ) -> Result<(), EngError> {
+        let row = layer
+            .checked_sub(self.first_layer)
+            .filter(|&row| row < self.rows)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is outside the bank's layers {}..{}",
+                    self.first_layer,
+                    self.first_layer + self.rows
+                ))
+            })?;
+        self.inner.run_prefill(projector, row, bufs, dims, perm)
     }
 
     fn run_rows(

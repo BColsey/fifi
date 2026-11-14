@@ -457,6 +457,7 @@ pub(super) fn build_driver(
     mut guard: Option<BuildGuard>,
 ) -> Result<StepDriver, EngError> {
     let shared_prefill = super::driver::chunk::prof::check_switch_spelling()?;
+    super::driver::chunk::prof::check_shared_prefill_rows(shared_prefill, wanted.prefill_rows)?;
     let began = Instant::now();
     stage("initializing CUDA");
     let projector = CudaProjector::new()?;
@@ -485,12 +486,16 @@ pub(super) fn build_driver(
     )?;
     let (mem_total, mem_available) = read_meminfo()?;
     let rows = wanted.prefill_rows as usize;
-    let prefill_arena_bytes = StepPlan::prefill_bytes(
-        shared_prefill,
-        &FlashGeometry::new(&model, &kinds)?,
-        rows,
-        wanted.context as usize,
-    )?;
+    let prefill_arena_bytes = if shared_prefill {
+        StepPlan::prefill_bytes(
+            true,
+            &FlashGeometry::new(&model, &kinds)?,
+            rows,
+            wanted.context as usize,
+        )?
+    } else {
+        0
+    };
     // The prefill ring's budget, carved out before the load plan so the bank sizes itself
     // into what remains: at most 1.5 GiB and 30% of the free card, only for chunked prefill.
     // A ring below one streamed layer is not built (the multi-row path then keeps its
@@ -819,11 +824,12 @@ pub(super) fn build_driver(
     let driver = if rows > 1 {
         let ple_route = device_ple;
         let ple_on_card = ple_route.is_some();
-        let mut chunked = ChunkDriver::new(
-            CardChunkDevice::with_ple(step, moe, ple_route),
-            feeds,
-            shape,
-        )?;
+        let device = CardChunkDevice::with_ple(step, moe, ple_route);
+        let mut chunked = if shared_prefill {
+            ChunkDriver::new_shared(device, feeds, shape)?
+        } else {
+            ChunkDriver::new(device, feeds, shape)?
+        };
         chunked.chunk_cap = rows;
         chunked.ple_device = ple_on_card;
         let route_note = if ple_on_card {

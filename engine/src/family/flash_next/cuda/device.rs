@@ -294,11 +294,13 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
     }
 
     fn begin_prefill(&mut self) -> Result<(), EngError> {
+        self.step.prefill_window.set(true);
         self.moe.begin_prefill();
         Ok(())
     }
 
     fn end_prefill(&mut self) -> Result<(), EngError> {
+        self.step.prefill_window.set(false);
         self.moe.end_prefill()
     }
 

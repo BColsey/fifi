@@ -26,58 +26,7 @@ const I32: usize = size_of::<i32>();
 
 use crate::family::project::exl3_jobs_plan::EXL3_EXPERT_TILE_ROWS;
 
-/// The sorted plan of a chunk's `m * top_k` pairs: the counting sort by member and the two row
-/// lists the launches read.
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::family) struct PairPlan {
-    /// Pairs of each member.
-    pub(in crate::family) counts: Vec<usize>,
-    /// For each sorted position, the row of the chunk it reads.
-    pub(in crate::family) order: Vec<i32>,
-    /// For each sorted position, its pair `row * top_k + rank`: the place its output lands in.
-    pub(in crate::family) scatter: Vec<i32>,
-}
-
-/// Counting sort of the pairs by member: within a member the rows keep their chunk order. An id
-/// outside `0..n_member` is a fault mark (-1) or a corrupt word, and refuses the chunk.
-pub(in crate::family) fn plan_pairs(
-    picks: &[i32],
-    n_member: usize,
-    top_k: usize,
-) -> Result<PairPlan, EngError> {
-    let mut counts = vec![0usize; n_member];
-    for &pick in picks {
-        let member = usize::try_from(pick).ok().filter(|&e| e < n_member);
-        let Some(member) = member else {
-            return Err(EngError::ModelOutput(
-                "EXL3 moe chunk: the router picked no valid expert (non-finite logits)".into(),
-            ));
-        };
-        counts[member] += 1;
-    }
-    let mut next = Vec::with_capacity(n_member);
-    let mut at = 0;
-    for &count in &counts {
-        next.push(at);
-        at += count;
-    }
-    let (mut order, mut scatter) = (vec![0i32; picks.len()], vec![0i32; picks.len()]);
-    for (pair, &pick) in picks.iter().enumerate() {
-        let slot = &mut next[pick as usize];
-        order[*slot] = i32::try_from(pair / top_k).map_err(|_| too_many())?;
-        scatter[*slot] = i32::try_from(pair).map_err(|_| too_many())?;
-        *slot += 1;
-    }
-    Ok(PairPlan {
-        counts,
-        order,
-        scatter,
-    })
-}
-
-fn too_many() -> EngError {
-    EngError::BadRequest("EXL3 moe chunk: the pair count exceeds i32".into())
-}
+pub(in crate::family) use crate::family::project::exl3_jobs_plan::{PairPlan, plan_pairs};
 
 /// Reads the picks of the chunk back, which waits for the stream.
 pub(in crate::family) fn read_ids(

@@ -152,16 +152,22 @@ pub(in crate::family::flash_next) mod prof {
                 "Flash-Next driver: {name} must be 1, true, on, 0, false or off, not {seen}"
             ))
         })?;
-        if name == SHARED_PREFILL && on {
-            return Err(EngError::BadRequest(format!(
-                "{SHARED_PREFILL}: shared prefill startup is not connected"
-            )));
-        }
         Ok(on)
     }
 
+    pub(in crate::family::flash_next) fn check_shared_prefill_rows(
+        shared_prefill: bool,
+        rows: u32,
+    ) -> Result<()> {
+        if shared_prefill && rows <= 1 {
+            return Err(EngError::BadRequest(format!(
+                "{SHARED_PREFILL} requires prefill_rows > 1"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates the switches and returns the shared mode for startup's arena/owner binding.
-    /// ON still refuses until the complete shared path is connected.
     pub(in crate::family::flash_next) fn check_switch_spelling() -> Result<bool> {
         let mut shared_prefill = false;
         for name in [
@@ -405,7 +411,7 @@ impl<D: ChunkDevice, F: TokenFeeds> ChunkDriver<D, F> {
         })
     }
 
-    /// Staged entry for direct tests; the served switch refuses until startup is connected.
+    /// Selects the shared protocol and its whole-prompt preflight.
     pub(in crate::family::flash_next::cuda) fn new_shared(
         device: D,
         feeds: F,

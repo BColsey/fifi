@@ -576,6 +576,26 @@ impl RigRows {
 #[test]
 #[ignore = "needs a GPU (about 3 GiB of ring and bank, about 2 GiB of pinned host memory per bank and FIFI_FLASH_NEXT_EXL3_PACK"]
 fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
+    ring_chunk_pass(49, false, None);
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_shared_prefill_ring_matches_the_oracle_for_full_tiles_tails_and_one_row() {
+    for rows in [1, 3, 64] {
+        ring_chunk_pass(rows, true, Some(6));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU (about 3 GiB), pinned host memory and FIFI_FLASH_NEXT_EXL3_PACK"]
+fn the_shared_prefill_ring_handles_an_empty_bank_or_ring_pair_subset() {
+    for held in [0, 10] {
+        ring_chunk_pass(1, true, Some(held));
+    }
+}
+
+fn ring_chunk_pass(m: usize, shared: bool, held: Option<usize>) {
     assert!(
         device_present("Flash-Next split MoE block"),
         "a GPU is required"
@@ -596,9 +616,8 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
         inter: shape.inter(),
         shared_inter: shape.shared_inter(),
     };
-    // 49 rows: three gate/up pair batches (24 + 24 + 1) and a multi-group down window —
-    // wider than any single launch bound of the shared expert.
-    let m = 49;
+    // The legacy oracle uses 49 rows; the promoted-store arms also cover the full tile,
+    // a short tail and the active prefill's trailing one-row window.
     let chunk = MoeDims { rows: m, ..one_row };
     let projector = CudaProjector::new().expect("projector");
     let ctx = projector.context();
@@ -666,8 +685,10 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
     // experts: the default 6 leaves row 0 mixed; the ring-tolerance measurements hold every
     // pick of row 0 (FIFI_FLASH_NEXT_RING_HELD=10, the all-bank arm) or none (0, the
     // all-ring arm). Rows 1.. keep the default split in every arm.
-    let held_of: usize = std::env::var("FIFI_FLASH_NEXT_RING_HELD")
-        .map_or(6, |v| v.parse().expect("a held-pick count"));
+    let held_of: usize = held.unwrap_or_else(|| {
+        std::env::var("FIFI_FLASH_NEXT_RING_HELD")
+            .map_or(6, |v| v.parse().expect("a held-pick count"))
+    });
     let held: Vec<Vec<u16>> = arms
         .iter()
         .map(|arm| {
@@ -715,18 +736,37 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
                 split.begin_chunk();
             }
             let rig = RigRows::new(&projector, &chunk, &arm.row_inputs).expect("rig");
-            let before = split.bank().state().stats().misses;
-            split
-                .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
-                .expect("the ring block");
+            let before = split.bank().state().stats().clone();
+            let frozen = split.bank().state().slot_row(bank_layer).to_vec();
+            if shared {
+                shared_prefill_pass(
+                    &mut split,
+                    &launch,
+                    bank_layer,
+                    &rig.bufs().expect("bufs"),
+                    &chunk,
+                );
+            } else {
+                split
+                    .run_rows(&launch, bank_layer, &rig.bufs().expect("bufs"), &chunk)
+                    .expect("the ring block");
+            }
             stream.synchronize().expect("sync");
-            let misses = (split.bank().state().stats().misses - before) as usize;
             let tag = format!(
                 "bank layer {bank_layer} (pack layer {}), run {run}",
                 layers[bank_layer]
             );
-            // The ring path never steps or admits the bank: the miss counter cannot move.
-            assert_eq!(misses, 0, "{tag}: the ring path does not touch the bank");
+            // Streaming changes neither the slot mapping nor any decode/admission counter.
+            assert_eq!(
+                split.bank().state().stats(),
+                &before,
+                "{tag}: bank counters"
+            );
+            assert_eq!(
+                split.bank().state().slot_row(bank_layer),
+                frozen,
+                "{tag}: frozen bank"
+            );
             for r in 0..m {
                 let got = rig.out_row(&projector, r);
                 let resident_error = relative_l2(&floats(&got), &floats_f64(&arm.residents[r]));
@@ -742,6 +782,7 @@ fn a_chunk_over_the_prefill_ring_matches_the_all_resident_block() {
             }
         }
     }
+    split.end_prefill().expect("hand the ring's stores back");
 }
 
 /// The job-table family's per-projection bounds against fp64, split by projection and
@@ -1130,6 +1171,7 @@ fn the_shared_prefill_pass_resolves_misses_and_a_trailing_one_row_window() {
 fn shared_prefill_pass(
     split: &mut SplitMoe<'_>,
     launch: &Launch<'_>,
+    layer: usize,
     bufs: &Exl3MoeBufs<'_>,
     dims: &MoeDims,
 ) {
@@ -1164,15 +1206,15 @@ fn shared_prefill_pass(
         rows: dims.rows,
         tile_rows: 256,
     };
-    let row_before = split.bank().state().slot_row(0).to_vec();
+    let row_before = split.bank().state().slot_row(layer).to_vec();
     let short = guarded.range(8, perm_bytes - 1).expect("short permutation");
     let error = split
-        .run_prefill(&projector, 0, bufs, dims, short)
+        .run_prefill(&projector, layer, bufs, dims, short)
         .expect_err("refuse before routing or admitting");
     assert!(
         matches!(error, crate::EngError::BadRequest(message) if message.contains("permutation range"))
     );
-    assert_eq!(split.bank().state().slot_row(0), row_before);
+    assert_eq!(split.bank().state().slot_row(layer), row_before);
     // The in-place combine must receive the residual, not bytes left in the output face.
     bufs.route
         .resid_out
@@ -1186,7 +1228,7 @@ fn shared_prefill_pass(
     split
         .run_prefill(
             &projector,
-            0,
+            layer,
             bufs,
             dims,
             guarded.range(8, perm_bytes).expect("permutation range"),
@@ -1309,7 +1351,7 @@ fn chunk_union_pass(m: usize, shared: bool) {
         let rig = RigRows::new(&projector, &chunk, &row_inputs).expect("rig");
         let passes = split.bank().state().stats().passes;
         if shared {
-            shared_prefill_pass(&mut split, &launch, &rig.bufs().expect("bufs"), &chunk);
+            shared_prefill_pass(&mut split, &launch, 0, &rig.bufs().expect("bufs"), &chunk);
         } else {
             split
                 .run_rows(&launch, 0, &rig.bufs().expect("bufs"), &chunk)

@@ -67,6 +67,9 @@ const I32: usize = size_of::<i32>();
 /// raising this is a planning decision, not a kernel port; see `begin_chunk`.
 pub(super) const MAX_STEP_ROWS: usize = MAX_EXL3_ROWS;
 
+/// Shared by the arena charge, dense job writer and actual prefill Projector.
+pub(super) const PREFILL_TILE_ROWS: usize = 256;
+
 /// Splits of the QSA attention in a decode step unless the options say otherwise. The attended
 /// positions of a token are the selected blocks (2,048 at most) and the open tail; the part
 /// scratch grows linearly with the count (`n_head x splits x 258` f32 per row).
@@ -625,7 +628,8 @@ impl StepPlan {
     ) -> Result<Self, EngError> {
         let mut plan = Self::new(geometry, rows, positions, options)?;
         let (dense_bytes, perm_bytes) =
-            exl3_job_bytes(rows, 256, geometry.experts, geometry.top_k).ok_or_else(overflow)?;
+            exl3_job_bytes(rows, PREFILL_TILE_ROWS, geometry.experts, geometry.top_k)
+                .ok_or_else(overflow)?;
         let mut list = SlotList {
             rows,
             slots: plan.slots,

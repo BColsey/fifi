@@ -4,7 +4,74 @@
 //! the policy and the slot row, the parts of the contract that live on the host.
 
 use super::bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
-use super::prefill_adapter::AdmitPlan;
+use super::prefill_adapter::{AdmitPlan, drain_before_admit, ring_slots};
+use crate::EngError;
+use std::cell::RefCell;
+
+#[test]
+fn ring_mapping_keeps_bank_and_ring_slots_disjoint_without_admission() {
+    let row = [2, -1, 0, -1];
+    let original = row;
+    // Seven bank slots but only four experts: capacity is not an expert/job bound.
+    let mapped = ring_slots(&row, 7, &[0, 1, 2, 3, 1], |id| match id {
+        1 => Some(0),
+        3 => Some(5),
+        _ => None,
+    })
+    .expect("mixed sources");
+    assert_eq!(mapped, [2, 7, 0, 12, 7]);
+    assert_eq!(row, original, "streaming leaves the bank frozen");
+    assert_eq!(ring_slots(&row, 7, &[2, 0], |_| None).unwrap(), [0, 2]);
+    assert_eq!(ring_slots(&row, 7, &[1, 3], |_| Some(0)).unwrap(), [7, 7]);
+}
+
+#[test]
+fn ring_mapping_refuses_invalid_or_unavailable_picks_and_overflow() {
+    let row = [0, -1];
+    for picks in [vec![2], vec![usize::MAX], vec![1]] {
+        assert!(ring_slots(&row, 2, &picks, |_| None).is_err());
+    }
+    assert!(
+        ring_slots(&[2], 2, &[0], |_| None).is_err(),
+        "invalid bank slot"
+    );
+    assert!(ring_slots(&row, usize::MAX, &[1], |_| Some(1)).is_err());
+}
+
+#[test]
+fn shared_store_drains_readers_before_admitting() {
+    let calls = RefCell::new(Vec::new());
+    let copied = drain_before_admit(
+        || {
+            calls.borrow_mut().push("drain");
+            Ok(())
+        },
+        || {
+            calls.borrow_mut().push("admit");
+            Ok(7)
+        },
+    )
+    .expect("the drained store can admit");
+    assert_eq!(*calls.borrow(), ["drain", "admit"]);
+    assert_eq!(copied, 7);
+}
+
+#[test]
+fn shared_store_does_not_admit_after_a_failed_drain() {
+    let calls = RefCell::new(Vec::new());
+    let result = drain_before_admit(
+        || {
+            calls.borrow_mut().push("drain");
+            Err(EngError::BadRequest("drain failed".into()))
+        },
+        || {
+            calls.borrow_mut().push("admit");
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(EngError::BadRequest(message)) if message == "drain failed"));
+    assert_eq!(*calls.borrow(), ["drain"]);
+}
 
 const LAYERS: usize = 2;
 const EXPERTS: usize = 512;

@@ -36,7 +36,7 @@ use super::{
     moe_block::SplitMoe,
     state::StateSlot,
     step::{AllResidentMoe, FlashStep, MIXER, MoeBlock, SplitMoeAt, bank_key, split_trunk},
-    step_plan::{Site, Slot},
+    step_plan::{PREFILL_TILE_ROWS, Site, Slot},
 };
 use crate::{
     EngError,
@@ -56,7 +56,7 @@ use crate::{
             DenseProjector, DenseWeight, Projector,
             cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         },
-        qwen36::cuda::exl3_source::PackReader,
+        qwen36::cuda::{exl3_source::PackReader, moe::Launch},
     },
     kernels::{
         cuda::{DeviceStream, device_present},
@@ -65,6 +65,64 @@ use crate::{
     },
     weights::exl3::{COMPONENT_SUFFIXES, Checkpoint, Matrix},
 };
+
+#[test]
+#[ignore = "needs CUDA and FIFI_FLASH_NEXT_EXL3_PACK layer-3 trunk"]
+fn shared_arena_ownership_does_not_enable_shared_decode() {
+    assert!(
+        device_present("Flash-Next prefill phase"),
+        "a GPU is required"
+    );
+    let pack = checkpoint();
+    let projector = CudaProjector::new().expect("projector");
+    let ctx = projector.context();
+    let stream = ctx.stream().expect("stream");
+    let weights = device_weights(&projector, &pack, &[3], (false, false));
+    for shared in [false, true] {
+        let make = if shared {
+            FlashStep::new_prefill
+        } else {
+            FlashStep::new
+        };
+        let step = make(
+            ctx,
+            &stream,
+            &weights,
+            &pack.model_config,
+            POSITIONS,
+            3,
+            3..4,
+        )
+        .expect("metadata-only step");
+        assert_eq!(step.step_plan.index(Slot::PrefillPerm).is_some(), shared);
+        assert!(
+            !step.shared_prefill(),
+            "decode starts outside the prefill window"
+        );
+        step.prefill_window.set(true);
+        assert_eq!(step.shared_prefill(), shared);
+        if shared {
+            let launch = Launch {
+                ctx,
+                stream: &stream,
+            };
+            let actual = step
+                .prefill_projector(&launch, 3)
+                .expect("actual projector");
+            assert_eq!(actual.tile_rows, PREFILL_TILE_ROWS);
+            let jobs = crate::family::exl3::prefill::dense_jobs(3, actual.tile_rows);
+            assert_eq!(
+                actual.scratch.jobs.bytes(),
+                crate::kernels::cuda::resident::exl3::Exl3Job::table(&jobs).len()
+            );
+        }
+        step.prefill_window.set(false);
+        assert!(!step.shared_prefill(), "closing the window restores decode");
+        step.prefill_window.set(true);
+        step.reset().expect("reset inside an open window");
+        assert!(!step.shared_prefill(), "reset closes the window");
+    }
+}
 
 /// Tokens of the sequence a layer runs.
 const TOKENS: usize = 10;

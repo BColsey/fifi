@@ -366,7 +366,7 @@ mod device {
             flash_next::{
                 cuda::{
                     bank::device::DeviceBank,
-                    prefill_adapter::device::{LayerStore, PrefillAdapter},
+                    prefill_adapter::device::{LayerStore, PrefillAdapter, RingStore},
                 },
                 moe::slot_bank::SlotBankLayout,
             },
@@ -993,10 +993,6 @@ mod device {
         /// The promoted FP16-staged pass. The caller supplies its jobs-sized permutation
         /// region, never the legacy classify/split layout's six-words-per-pair region.
         /// The caller has written the dense job table before the first layer of the chunk.
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "shared startup remains fail-closed")
-        )]
         pub(in crate::family::flash_next) fn run_prefill(
             &mut self,
             projector: &Projector<'_>,
@@ -1012,7 +1008,6 @@ mod device {
                 || layer >= geometry.layers
                 || dims.n_expert != geometry.experts
                 || dims.top_k != geometry.top_k
-                || self.ring.is_some()
             {
                 return Err(refuse(
                     "the shared pass does not fit the planned bank window".into(),
@@ -1024,11 +1019,18 @@ mod device {
             if perm.bytes() < perm_bytes {
                 return Err(refuse("the shared permutation range is too short".into()));
             }
-            let sub_rows = geometry
-                .slots
-                .checked_div(dims.top_k)
-                .filter(|&n| n > 0)
-                .ok_or_else(|| refuse("the bank cannot hold one routed row".into()))?;
+            let ring_active = self.ring.as_ref().is_some_and(|ring| ring.active());
+            let sub_rows = if ring_active {
+                // The frozen bank plus the ring cover every expert; one whole-chunk plan
+                // groups each source, without bank admission or row-at-a-time launches.
+                dims.rows
+            } else {
+                geometry
+                    .slots
+                    .checked_div(dims.top_k)
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| refuse("the bank cannot hold one routed row".into()))?
+            };
             let sub: Vec<_> = (0..dims.rows)
                 .step_by(sub_rows)
                 .map(|r0| {
@@ -1042,6 +1044,13 @@ mod device {
                 })
                 .collect();
             let launch = projector.launch;
+            if ring_active {
+                self.ring.as_mut().expect("active ring").issue_through(
+                    launch.ctx,
+                    &mut self.bank,
+                    layer + 1,
+                )?;
+            }
             self.route(launch, layer, bufs, dims)?;
             let bytes = dims.rows * dims.hidden * F32;
             launch.ctx.copy_device(
@@ -1071,6 +1080,25 @@ mod device {
                 up: trunk.shared_up,
                 down: trunk.shared_down,
             };
+            if ring_active {
+                let ring = self.ring.as_ref().expect("active ring");
+                let mut store = RingStore {
+                    adapter: PrefillAdapter::new(&mut self.bank),
+                    ring,
+                    layer,
+                    spans: &self.spans,
+                    ring_spans: SlotSpans::new(&self.bank_layout, ring.ring_slots())?,
+                    book: self.book,
+                };
+                prefill_moe::run_store(projector, &weights, &common, dims, &sub, &mut store)?;
+                // Record used events only after both sources' reads are queued. A reused
+                // ring slot's next copy waits these on the copy stream.
+                return self
+                    .ring
+                    .as_mut()
+                    .expect("active ring")
+                    .free_layer(launch.stream, layer);
+            }
             let mut store = LayerStore {
                 adapter: PrefillAdapter::new(&mut self.bank),
                 ctx: launch.ctx,

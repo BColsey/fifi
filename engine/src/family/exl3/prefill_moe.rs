@@ -79,6 +79,13 @@ impl SlotResolver for LayerResolver<'_, '_> {
 /// The next resolve may replace the bytes that those views address.
 pub(in crate::family) trait PrefillStore: SlotResolver {
     fn members(&self) -> Result<[Exl3Members<'_>; 3], EngError>;
+
+    /// An optional disjoint source. Its logical slots follow `members()`'s slots; it borrows
+    /// the ring's own records, never copies them into the bank. Single-source stores retain
+    /// their original launch sequence.
+    fn ring_members(&self) -> Result<Option<[Exl3Members<'_>; 3]>, EngError> {
+        Ok(None)
+    }
 }
 
 struct ResidentStore<'r, 'w, R> {
@@ -272,7 +279,9 @@ fn routed_plan(
     plan: PairPlan,
     pair: bool,
 ) -> Result<bool, EngError> {
-    let (m, pairs, i) = (dims.rows, dims.rows * dims.top_k, dims.inter);
+    // A source may own only some pairs. Packed intermediates use that subset's length,
+    // while down's scatter still addresses the full original (row, rank) face.
+    let (m, pairs, i) = (dims.rows, plan.order.len(), dims.inter);
     let jobs = plan_jobs(&plan.counts);
     let table_range = window(bufs.perm, 2 * pairs * I32, jobs.len() * 16)?;
     write_lists(projector.launch, bufs.perm, (&plan, &jobs))?;
@@ -346,7 +355,10 @@ fn routed_plan(
     projector.launch.ctx.swiglu_rows(
         projector.launch.stream,
         SwigluRowsCall {
-            shape: routed_swiglu(m, dims),
+            shape: crate::kernels::cuda::prefill::swiglu_rows::SwigluRowsShape {
+                rows: pairs,
+                ..routed_swiglu(m, dims)
+            },
             gu: bufs.gu,
             act: bufs.act,
         },
@@ -361,7 +373,7 @@ fn routed_plan(
             input: None,
             output: Some(list(1)?),
             x_rows: pairs,
-            out_rows: pairs,
+            out_rows: m * dims.top_k,
         },
     };
     project_jobs(projector, bufs, table, call)?;
@@ -514,9 +526,32 @@ pub(in crate::family) fn run_store(
                 sub_bufs.ids.offset(),
                 &bytes,
             )?;
-            plan_pairs(&slots, dims.n_expert, k)?
+            let n_member = if let Some(ring) = bank.ring_members()? {
+                bank.members()?[0]
+                    .members
+                    .checked_add(ring[0].members)
+                    .ok_or_else(|| {
+                        EngError::BadRequest("prefill chunk: the member count overflows".into())
+                    })?
+            } else {
+                dims.n_expert
+            };
+            plan_pairs(&slots, n_member, k)?
         };
-        routed_plan(projector, bank.members()?, &sub_bufs, sub_dims, plan, pair)?;
+        let members = bank.members()?;
+        if let Some(ring) = bank.ring_members()? {
+            let plans = plan.split_members(members[0].members)?;
+            // Reuse the packed intermediates and permutation region on the same stream;
+            // down scatters each source to disjoint original pair positions. No phantom
+            // jobs for unused physical slots, and no combine until both sources finish.
+            for (members, plan) in [members, ring].into_iter().zip(plans) {
+                if !plan.order.is_empty() {
+                    routed_plan(projector, members, &sub_bufs, sub_dims, plan, pair)?;
+                }
+            }
+        } else {
+            routed_plan(projector, members, &sub_bufs, sub_dims, plan, pair)?;
+        }
         combine(projector, &sub_bufs, sub_dims)?;
     }
     split::mark(projector.launch.stream, "combine");
