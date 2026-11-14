@@ -32,11 +32,13 @@
 //! picks and the missed picks are summed in two groups, so the floating-point association
 //! differs. Every product is the same. The tests state the tolerance.
 //!
-//! The filler rule multiplies slot 0's expert output by +0.0. If that output held an infinity or
-//! a NaN the product would be NaN and would poison the sum. With the check off (the default) a
-//! non-finite slot 0 output turns the whole block output, and so the token, into NaN with no
-//! error; [`SplitMoe::verify_finite_filler`] reads the filler rows back and refuses it, at the
-//! price of a wait on the stream before the copies start, which removes the overlap of step 4.
+//! The resident pass carries a missed pick on the filler (slot 0) at +0.0 until the copies
+//! land, so the filler rule multiplies slot 0's expert output by +0.0 there. If that output
+//! held an infinity or a NaN the product would be NaN and would poison the sum. With the check
+//! off (the default) a non-finite slot 0 output turns the whole block output, and so the token,
+//! into NaN with no error; [`SplitMoe::verify_finite_filler`] reads the resident pass's filler
+//! rows back and refuses it, at the price of a wait on the stream before the copies start,
+//! which removes the overlap of step 4. The miss pass has no filler picks.
 //!
 //! The pure parts (the classify oracle, the log parser, the spans of the bank buffer and the
 //! private scratch layout) are host code with host tests; the launches are native-cuda only.
@@ -495,9 +497,10 @@ mod device {
     /// One pass over the bank.
     struct Pass<'a> {
         layer: usize,
-        /// i32 `[top_k]`: the bank slot of each pick.
+        /// i32 `[picks]`: the bank slot of each pick of this pass — `top_k` entries for the
+        /// resident pass, the missed count for the compact miss pass.
         ids: DeviceRange<'a>,
-        /// f32 `[top_k]`: the combine weight of each pick.
+        /// f32 `[picks]`: the combine weight of each pick (same width as `ids`).
         weights: DeviceRange<'a>,
         /// Whether the shared expert rides in this pass.
         shared: bool,
@@ -667,9 +670,10 @@ mod device {
             &self.bank
         }
 
-        /// When set, every pass reads the down rows back and refuses a filler pick (weight +0.0)
-        /// whose expert output is not finite. Off by default: it adds a read of
-        /// `top_k * hidden` floats to every pass.
+        /// When set, the RESIDENT pass reads its down rows back and refuses a filler pick
+        /// (weight +0.0, slot 0) whose expert output is not finite — the compact miss pass has
+        /// no filler picks to check. Off by default: it adds a read of `top_k * hidden` floats
+        /// to every pass.
         pub(in crate::family::flash_next) fn verify_finite_filler(&mut self, on: bool) {
             self.verify_finite_filler = on;
         }
@@ -680,7 +684,7 @@ mod device {
         /// `bufs.route.resid_out`. A `resid_in` that is not zero is added into the result. Returns
         /// after every launch of the block is queued. It waits on the stream for the slot row, for
         /// the classify log and, on a miss, for the bank copies. With the filler check off, a
-        /// non-finite output of slot 0 makes the block output NaN without an error.
+        /// non-finite output of slot 0 poisons the resident pass's sum as NaN without an error.
         pub(in crate::family::flash_next) fn run(
             &mut self,
             launch: &Launch<'_>,

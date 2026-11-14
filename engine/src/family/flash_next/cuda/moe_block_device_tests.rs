@@ -371,7 +371,7 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
     let layout = source.layout().clone();
 
     for verify in [true, false] {
-        for case in ["mixed", "forced miss"] {
+        for case in ["mixed", "one miss", "forced miss"] {
             // Per bank layer: the experts its slots hold and the misses its row will cause.
             let held: Vec<Vec<u16>> = prepared
                 .iter()
@@ -381,6 +381,14 @@ fn a_real_layer_split_over_a_partial_bank_matches_the_all_resident_block_and_fp6
                         let mut held: Vec<u16> =
                             p.picks().iter().take(6).map(|&e| e as u16).collect();
                         held.extend(others(p.picks(), SLOTS - 6));
+                        held
+                    }
+                    // Nine of the ten picks held: exactly one miss, the narrowest compact
+                    // miss pass (width 1 where the filler launch always carried 10).
+                    "one miss" => {
+                        let mut held: Vec<u16> =
+                            p.picks().iter().take(9).map(|&e| e as u16).collect();
+                        held.extend(others(p.picks(), SLOTS - 9));
                         held
                     }
                     // None held: ten misses, the resident pass is all filler.
