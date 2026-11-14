@@ -746,6 +746,7 @@ mod tests {
         apply_replay_overrides, block_match_line, block_match_note, defaults_line,
         entry_prefix_reuse, outcome, serve, shutdown_failure, start_engines,
     };
+    #[cfg(all(feature = "native-cuda", target_os = "linux"))]
     use crate::family::flash_next::factory;
     use crate::family::flash_next::settings::FlashOptions;
     use crate::family::qwen36::factory as q36_factory;
@@ -846,9 +847,10 @@ mod tests {
             if !tiered {
                 return None;
             }
-            let mut options = Q36Options::default();
-            options.tiered = Some(Default::default());
-            Some(options)
+            Some(Q36Options {
+                tiered: Some(Default::default()),
+                ..Q36Options::default()
+            })
         };
         for family in super::family_names() {
             let plain_q36 = q36_options(false);
