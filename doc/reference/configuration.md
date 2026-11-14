@@ -12,7 +12,7 @@ Example files are in [`engine/config`](../../engine/config/README.md).
 | --- | --- | --- | --- |
 | `listen` | yes | | Address and port, for example `127.0.0.1:18791`. The address must be `127.0.0.1` or `::1`. Port 8788 is refused. |
 | `api_key_env` | yes | | Name of the environment variable that holds the API key. Startup fails if the variable is unset or empty. |
-| `prefix_reuse` | no | `false` | Keep finished conversation prefixes so that a follow-up turn only processes its new tokens. Applies to every engine that supports it. See [How conversation reuse works](../explanation/prefix-reuse.md). |
+| `prefix_reuse` | no | unset | Keep finished conversation prefixes so that a follow-up turn only processes its new tokens. Unset resolves per family at startup: on for the two qualified reuse paths (Flash-Next CUDA, Qwen3.6 CUDA on the CUDA build) and off for every other family, because the boundary marking alone splits the prefill and changes greedy text. An explicit `true` or `false` overrides for all engines. Setting the Flash-Next environment switch to `0` does not revert this key's marking. See [How conversation reuse works](../explanation/prefix-reuse.md). |
 | `web_dir` | no | | Directory with the built web frontend (`npm run build` in `web/` writes `web/dist`). When set, `GET /` serves its `index.html` and `GET /assets/...` its hashed assets; startup refuses a directory without `index.html`. The shell is public like `/health`; every API route keeps its key. |
 | `engines` | yes | | The engines to serve, one object each. |
 
@@ -114,7 +114,7 @@ A prefix saved after a chunked prefill and restored from the device tip or the p
 ### Host-memory KV cache (CUDA)
 
 `kv_offload_host_bytes` keeps the KV cache in host memory for contexts that do not fit on the GPU.
-It needs `"kv_dtype": "q8"`, `"capture": false`, `"prefix_reuse": false` and `Q36_CUDA_CHUNK_PREFILL=0`.
+It needs `"kv_dtype": "q8"`, `"capture": false`, `"prefix_reuse": false` and `Q36_CUDA_CHUNK_PREFILL=0`; startup refuses the combination without `prefix_reuse` false, so on the CUDA build an omitted `prefix_reuse` key (which defaults on for Qwen3.6) also refuses `kv_offload_host_bytes` until the key is set to false explicitly.
 It reloads the cache from host memory for every token, so it is slow: an 8K-token replay decoded at 34.95 tokens/s, against 147.14 tokens/s with the cache on the GPU.
 `Q36_CUDA_PAGED_DEVICE_FIRST=1` keeps as much of the cache on the GPU as fits after a 1 GiB reserve.
 

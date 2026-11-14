@@ -50,11 +50,14 @@ pub(crate) struct Config {
     pub(crate) listen: String,
     pub(crate) api_key_env: String,
     /// True when the chat handler marks the last message boundary of each prompt, so that an
-    /// engine can save and restore a prefix state. The default is false: the handler then sends
-    /// no boundary, and no engine saves or restores. One value serves every engine of the
-    /// process. An engine without prefix support ignores it.
+    /// engine can save and restore a prefix state. Unset resolves per family at engine
+    /// construction: on for the two qualified reuse paths (the Flash-Next CUDA resume and
+    /// the Qwen3.6 CUDA serve, both default on since the 2026-11-13 qualification), off for
+    /// every other family - the marking would only split their prefill. Set true or false
+    /// explicitly to override for all engines; false serves every turn as a full prefill.
+    /// One value serves every engine of the process.
     #[serde(default)]
-    pub(crate) prefix_reuse: bool,
+    pub(crate) prefix_reuse: Option<bool>,
     /// True when requests may arm sampler-trace capture with `x-sample-trace:
     /// true`. The default is false: no request is traced, and the field is
     /// refused (400) at submit unless this setting permits it. One value
@@ -412,12 +415,23 @@ mod tests {
     }
 
     #[test]
-    fn prefix_reuse_is_off_by_default_and_reads_a_boolean() {
-        assert!(!load(VALID).expect("valid").prefix_reuse, "the default");
+    fn prefix_reuse_defaults_to_unset_and_reads_a_boolean() {
+        assert_eq!(
+            load(VALID).expect("valid").prefix_reuse,
+            None,
+            "the default"
+        );
         let on = VALID.replace(r#""listen""#, r#""prefix_reuse": true, "listen""#);
-        assert!(load(&on).expect("valid").prefix_reuse, "true");
+        assert_eq!(load(&on).expect("valid").prefix_reuse, Some(true), "true");
         let off = VALID.replace(r#""listen""#, r#""prefix_reuse": false, "listen""#);
-        assert!(!load(&off).expect("valid").prefix_reuse, "false");
+        assert_eq!(
+            load(&off).expect("valid").prefix_reuse,
+            Some(false),
+            "false"
+        );
+        // null reads as unset: the same resolution as an omitted key.
+        let null = VALID.replace(r#""listen""#, r#""prefix_reuse": null, "listen""#);
+        assert_eq!(load(&null).expect("valid").prefix_reuse, None, "null");
         let text = VALID.replace(r#""listen""#, r#""prefix_reuse": "yes", "listen""#);
         assert!(
             message(load(&text)).contains("expected a boolean"),

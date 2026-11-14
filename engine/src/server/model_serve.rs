@@ -236,7 +236,7 @@ fn config_from(discovered: &Discovered, args: &ModelServeArgs) -> Config {
             .clone()
             .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
         api_key_env: DEFAULT_API_KEY_ENV.to_string(),
-        prefix_reuse: false,
+        prefix_reuse: Some(false),
         sample_trace: false,
         web_dir: None,
         engines: vec![EngineConfig {
@@ -641,7 +641,7 @@ mod tests {
         let reread = Config::from_file(&file).expect("the printed config is a valid file");
         assert_eq!(reread.listen, "127.0.0.1:9100");
         assert_eq!(reread.api_key_env, "ENGINESRV_API_KEY");
-        assert!(!reread.prefix_reuse);
+        assert_eq!(reread.prefix_reuse, Some(false));
         assert_eq!(reread.engines.len(), 1);
         let engine = &reread.engines[0];
         assert_eq!(engine.family, "qwen3_6_35b_a3b");

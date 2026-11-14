@@ -1,7 +1,8 @@
-//! The prefix-resume switch (`INFERENCE_FLASH_NEXT_PREFIX_RESUME`): `1`, `true` or `on` arms the
-//! save/restore of the boundary state; unset, `0`, `false` or `off` leaves the executor exactly as
-//! before (no save, no restore, the reset zeroes the whole state arena). The spelling is checked
-//! at driver build with the other Flash-Next switches, so a value that would misread never arms.
+//! The prefix-resume switch (`INFERENCE_FLASH_NEXT_PREFIX_RESUME`): unset (the default since
+//! the 2026-11-13 qualification), `1`, `true` or `on` arms the save/restore of the boundary
+//! state; `0`, `false` or `off` leaves the executor exactly as before (no save, no restore, the
+//! reset zeroes the whole state arena). The spelling is checked at driver build with the other
+//! Flash-Next switches, so a value that would misread never arms.
 //!
 //! With the switch on, a job's reset zeroes only the fixed state (the GDN recurrent state, its
 //! conv rings, the PLE ring, the words AND the QSA raw-key ring): the QSA K/V planes and the
@@ -51,13 +52,32 @@ pub(in crate::family::flash_next) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        prof::parse_switch(
-            std::env::var("INFERENCE_FLASH_NEXT_PREFIX_RESUME")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or(false)
+        // Default on since the 2026-11-13 qualification: the served A/B at 32K
+        // restored 31,936/31,974 tokens of a follow-up turn (TTFT 819.8 s ->
+        // 1.06 s), with byte-identical greedy text for MATCHED switches. The
+        // full off is this switch AND the server config's prefix_reuse key:
+        // marking the boundary alone (key true, switch 0) still splits the
+        // prefill. Disclosure: with the key omitted the default now arms both
+        // Flash-Next CUDA and Qwen3.6 CUDA, so a stock launch's late greedy
+        // text differs from the old default; measured on Flash-Next only
+        // (divergence from about token 175 of 200), Qwen3.6 CUDA unmeasured.
+        // `0`/`false`/`off` opts out; unset arms.
+        resume_default(std::env::var("INFERENCE_FLASH_NEXT_PREFIX_RESUME"))
     })
+}
+
+/// The default-on polarity of the resume switch: an unset variable arms it (the qualified
+/// default), `0`/`false`/`off` opts out, and every other value - a bad spelling or a
+/// non-UTF-8 variable - is refused at driver build by `check_switch_spelling`, so the
+/// fallback here is the default (true) for both: a booted process never reaches it.
+pub(in crate::family::flash_next) fn resume_default(
+    value: std::result::Result<String, std::env::VarError>,
+) -> bool {
+    match value {
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => true,
+        Ok(raw) => prof::parse_switch(Some(raw.as_str())).unwrap_or(true),
+    }
 }
 
 #[cfg(test)]
@@ -79,3 +99,31 @@ pub(in crate::family::flash_next) fn arm_for_tests() {
 /// fewer entries instead of growing host RAM. A denied save is skipped; correctness never
 /// depends on it.
 pub(in crate::family::flash_next) const HOST_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+mod default_tests {
+    use super::resume_default;
+    use std::env::VarError;
+
+    #[test]
+    fn unset_arms_and_the_spellings_read_exactly() {
+        // The qualified default: no variable, resume on.
+        assert!(resume_default(Err(VarError::NotPresent)));
+        for arm_on in ["1", "true", "on"] {
+            assert!(resume_default(Ok(arm_on.to_owned())));
+        }
+        for opt_out in ["0", "false", "off"] {
+            assert!(!resume_default(Ok(opt_out.to_owned())));
+        }
+    }
+
+    #[test]
+    fn refused_values_fall_back_to_the_default() {
+        // Both are refused at driver build by check_switch_spelling; if one ever reached
+        // on(), the default (on) applies, never a silent opt-out.
+        assert!(resume_default(Err(VarError::NotUnicode(
+            std::ffi::OsString::new()
+        ))));
+        assert!(resume_default(Ok("yes".to_owned())));
+    }
+}
