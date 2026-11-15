@@ -68,6 +68,8 @@ use crate::{
         },
         flint::exl3_resident::HostBudget,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
+        // The cross-family pack-reading seam: Flash-Next reads qwen36-shaped EXL3 packs
+        // through the Qwen3.6 loader's reader by design (closure-D ruling).
         qwen36::cuda::exl3_source::PackReader,
         session::DecodeSession,
     },
