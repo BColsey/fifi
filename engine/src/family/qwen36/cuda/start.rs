@@ -54,7 +54,7 @@ use crate::{
         speculate::config::DraftMode,
     },
     kernels::cuda::peer::{check_peer_facts, enable_peer_access, probe_device_set},
-    kernels::cuda::resident::exl3::SERVED_SINGLE_ROW,
+    kernels::cuda::resident::exl3::{SERVED_SINGLE_ROW, ServedKernels},
     sched::worker::{Engine, ReadyNote, spawn_engine_noted},
     tokenizer::TokenizerBundle,
 };
@@ -1234,9 +1234,14 @@ fn make(
             let began = Instant::now();
             // A served EXL3 pack runs its projections on the wide kernel unless the operator names
             // another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); bit-identical output.
-            projector
-                .context()
-                .set_single_row_default(SERVED_SINGLE_ROW);
+            // The shared applier also runs the launch-switch check this start never ran, so a bad
+            // switch combination now refuses the open instead of the first routed launch.
+            projector.context().register_served_kernels(ServedKernels {
+                single_row: SERVED_SINGLE_ROW,
+                indexed: None,
+                odd_rates: false,
+                fused_in: false,
+            })?;
             let mut banked_inner: Option<(ExpertStore, usize, usize)> = None;
             let device = match load_exl3_dir_decided(
                 &projector,
