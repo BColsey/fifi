@@ -50,6 +50,10 @@ pub(crate) fn largest_fitting(
 /// `admits` holds on EVERY step up to it: the scan stops at the first
 /// refusal, so a non-monotone predicate cannot report an admitting step
 /// beyond a refusing one. `None` when the first step does not admit.
+#[allow(
+    dead_code,
+    reason = "the resident-context scan in capability::preflight reaches it under native-cuda; a plain host build compiles that caller away"
+)]
 pub(crate) fn largest_fitting_linear(
     limit: u32,
     step: u32,

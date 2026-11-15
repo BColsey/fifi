@@ -14,17 +14,13 @@ pub(crate) mod exl3_pack;
 )]
 pub(crate) mod flash_next;
 
-#[allow(
-    dead_code,
-    reason = "first users: the families' byte sites; the ladder switches them one family at a time"
-)]
 pub(crate) mod device_budget;
 /// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
 /// the copy plan of a pass, the counters. Ungated on purpose so plain host gates compile and
 /// run the seam's tests without the card feature.
 #[allow(
     dead_code,
-    reason = "compiled on every platform; only the Flash-Next bank and the tests call it until the shared pass lands"
+    reason = "ungated so plain host gates compile the seam; the Flash-Next bank reaches it everywhere, the flint resident cache under test or native-cuda; the allow covers the members only tests still reach"
 )]
 pub(crate) mod expert_bank;
 pub mod flint;
