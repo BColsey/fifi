@@ -20,8 +20,7 @@ use crate::family::exl3_tensors::{decay_from_log, permute_blocks, tiled_head_ord
 use crate::family::project::cuda::WeightLayout;
 
 use super::mixer_geometry::{DeltaGeometry, MixerGeometry, RawSpec};
-use crate::family::exl3::source::DenseSpec;
-pub(in crate::family) use crate::family::exl3::source::PackReader;
+use crate::family::exl3::source::{DenseSpec, PackReader};
 use crate::{
     EngError,
     family::{AttentionKind, gguf_model::Role, project::cuda::CudaWeight},

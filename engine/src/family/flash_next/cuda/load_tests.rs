@@ -283,8 +283,8 @@ mod device {
     use super::pack;
     use crate::{
         family::{
+            exl3::source::PackReader,
             project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
-            qwen36::cuda::exl3_source::PackReader,
         },
         kernels::cuda::{CudaContext, DeviceBuffer, device_present},
         tensor::Dtype,

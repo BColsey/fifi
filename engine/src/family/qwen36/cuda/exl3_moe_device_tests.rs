@@ -17,10 +17,10 @@ use super::{
     exl3_load_device_tests::{matrix_of, relative_l2, values_of},
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
     exl3_moe_source::{moe_weights, moe_weights_banked},
-    exl3_source::PackReader,
     resources::STEP_ROWS,
 };
 use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};
+use crate::family::exl3::source::PackReader;
 use crate::family::exl3_pack::ExpertPart;
 use crate::{
     EngError,

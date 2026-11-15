@@ -40,6 +40,7 @@ use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, Replac
 use crate::{
     EngError,
     family::{
+        exl3::source::PackReader,
         exl3_pack::{ExpertPart, Root, expert_name_in, layer_name},
         flash_next::{
             deltanet::{self, DeltaState, DeltaWeights},
@@ -55,7 +56,6 @@ use crate::{
             DenseProjector, DenseWeight, Projector,
             cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve},
         },
-        qwen36::cuda::exl3_source::PackReader,
     },
     kernels::{
         cuda::{DeviceStream, device_present},

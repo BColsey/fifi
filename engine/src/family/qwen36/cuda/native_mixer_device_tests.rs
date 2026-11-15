@@ -44,7 +44,7 @@ struct BlockRun {
 /// The device phase (the isolation rule: only `?` inside). One mixer block of `layer` in
 /// `layout` from the same Q4_K sources - uploaded as tiles and as native blocks, OWNED in this
 /// scope (no leaks).
-fn tiled_index(specs: &[super::mixer_geometry::DenseSpec], role: Role) -> usize {
+fn tiled_index(specs: &[crate::family::exl3::source::DenseSpec], role: Role) -> usize {
     specs
         .iter()
         .position(|s| s.role == role)

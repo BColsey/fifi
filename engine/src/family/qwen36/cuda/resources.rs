@@ -12,7 +12,7 @@ use crate::family::exl3::layer_table::LayerTable;
 use super::sparse_exec::{SparseConfig, SparseExec, SparseGeometry};
 use super::{
     dims::{KvMode, StepDims, StepOptions},
-    mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
+    mixer_geometry::{MixerGeometry, check_native_dense},
     mixer_weights::dense_weight,
     moe::{MoeLayerWeights, StackWeights},
     paging_plan::PagingPlan,
@@ -24,6 +24,7 @@ use super::{
     tiered_step::LayerParts,
 };
 use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::{
     EngError,
     family::spec::AttentionKind,

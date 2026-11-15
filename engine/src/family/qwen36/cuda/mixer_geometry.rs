@@ -10,7 +10,7 @@
 
 use super::dims::StepDims;
 use super::shard::ShardTable;
-pub(in crate::family) use crate::family::exl3::source::{DenseSpec, check_dense};
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::family::project::cuda::WeightLayout;
 use crate::{
     EngError,

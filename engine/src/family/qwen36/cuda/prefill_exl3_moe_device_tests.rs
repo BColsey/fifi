@@ -16,6 +16,7 @@ use crate::family::exl3::launch::{Launch, MoeDims};
 use std::path::Path;
 
 use crate::family::exl3::prefill_moe::{Bufs, routed_with, run, run_banked};
+use crate::family::exl3::source::PackReader;
 use crate::family::exl3_pack::ExpertPart;
 use crate::family::project::exl3_jobs_plan::exl3_max_jobs;
 use crate::{
@@ -28,7 +29,6 @@ use crate::{
                 exl3_load_device_tests::{matrix_of, relative_l2, values_of},
                 exl3_moe::Exl3MoeWeights,
                 exl3_moe_source::{moe_weights, moe_weights_banked},
-                exl3_source::PackReader,
                 prefill::{RouteIo, run_chunk_route},
             },
             exl3_pack::{expert_name, shared_name},

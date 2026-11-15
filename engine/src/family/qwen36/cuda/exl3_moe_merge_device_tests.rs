@@ -33,9 +33,9 @@ use super::{
         run_exl3_moe,
     },
     exl3_moe_source::moe_weights,
-    exl3_source::PackReader,
     resources::STEP_ROWS,
 };
+use crate::family::exl3::source::PackReader;
 use crate::{
     EngError,
     family::project::cuda::{

@@ -26,7 +26,7 @@ use super::card_step::CardStack;
 use super::card_token::run_card_token;
 use super::dims::{StepDims, StepOptions};
 use super::mixer::{CardKindOps, MixerParts, MixerViews, Mixers};
-use super::mixer_geometry::{DenseSpec, MixerGeometry, check_native_dense};
+use super::mixer_geometry::{MixerGeometry, check_native_dense};
 use super::mixer_ops::CardOp;
 use super::mixer_weights::MixerWeights;
 use super::moe::MoeLayerWeights;
@@ -37,6 +37,7 @@ use super::state::export::ExportedState;
 use super::state::{ResidentState, StepField};
 use super::step_plan::Slot;
 use crate::family::exl3::layer_table::LayerTable;
+use crate::family::exl3::source::DenseSpec;
 
 use crate::EngError;
 use crate::family::AttentionKind;

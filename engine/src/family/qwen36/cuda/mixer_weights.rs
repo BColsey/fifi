@@ -12,7 +12,8 @@
 //! Native rows%4 rule is `mixer_geometry::check_native_dense`.
 use crate::family::exl3::layer_table::LayerTable;
 
-use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
+use super::mixer_geometry::{MixerGeometry, check_native_dense};
+use crate::family::exl3::source::{DenseSpec, check_dense};
 use crate::{
     EngError,
     family::{

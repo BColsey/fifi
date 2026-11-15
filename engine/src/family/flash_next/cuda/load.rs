@@ -277,12 +277,10 @@ pub(in crate::family) mod upload {
     use crate::{
         EngError,
         family::{
+            exl3::source::PackReader,
             exl3_tensors::decay_from_log,
             flash_next::moe::load_plan::FlashLoadPlan,
             project::cuda::{CudaWeight, CudaWeights},
-            // The cross-family pack-reading seam: Flash-Next reads qwen36-shaped EXL3
-            // packs through the Qwen3.6 loader's reader by design (closure-D ruling).
-            qwen36::cuda::exl3_source::PackReader,
         },
     };
 

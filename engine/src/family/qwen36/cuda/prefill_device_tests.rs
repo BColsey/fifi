@@ -992,7 +992,7 @@ fn build_rig() -> Result<Rig, EngError> {
                 // wrap produces them (a separate weight of `rows` rows reads a 4 MiB pool
                 // as an infinite tape), so the fused upload's rows are bitwise the bytes
                 // the unfused arm's weights hold.
-                let exact_tape = |sibling: &super::mixer_geometry::DenseSpec| {
+                let exact_tape = |sibling: &crate::family::exl3::source::DenseSpec| {
                     let pool = role_pool(sibling.role);
                     let need = sibling.rows * (sibling.k / 32) * 34;
                     (0..need)
@@ -1098,7 +1098,7 @@ fn build_rig() -> Result<Rig, EngError> {
                 // wrap produces them (a separate weight of `rows` rows reads a 4 MiB pool
                 // as an infinite tape), so the fused upload's rows are bitwise the bytes
                 // the unfused arm's weights hold.
-                let exact_tape = |sibling: &super::mixer_geometry::DenseSpec| {
+                let exact_tape = |sibling: &crate::family::exl3::source::DenseSpec| {
                     let pool = role_pool(sibling.role);
                     let need = sibling.rows * (sibling.k / 32) * 34;
                     (0..need)

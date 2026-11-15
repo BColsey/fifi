@@ -18,6 +18,7 @@ use std::path::Path;
 use super::{TILE_ROWS, write_dense_jobs};
 use crate::family::exl3::launch::Launch;
 use crate::family::exl3::prefill::{Exl3Scratch, F32, Output, Projector};
+use crate::family::exl3::source::PackReader;
 use crate::{
     family::{
         AttentionKind,
@@ -27,7 +28,7 @@ use crate::{
         qwen36::cuda::{
             common_tests::{dims, inventory},
             exl3_load_device_tests::{matrix_of, relative_l2},
-            exl3_source::{PackReader, attention_weights, delta_weights},
+            exl3_source::{attention_weights, delta_weights},
             mixer_geometry::MixerGeometry,
             mixer_weights::MixerWeights,
         },

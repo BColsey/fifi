@@ -11,8 +11,8 @@ use super::layer_table::LayerTable;
 use crate::family::exl3::launch::MoeDims;
 use crate::family::{
     exl3::bank::{ExpertStore, PartStore},
+    exl3::source::{DenseSpec, PackReader},
     exl3_pack::{ExpertPart, expert_name_in, router_name_in, shared_gate_name_in, shared_name_in},
-    qwen36::cuda::{exl3_source::PackReader, mixer_geometry::DenseSpec},
 };
 use crate::{
     EngError,
@@ -249,7 +249,7 @@ fn fill_part_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::qwen36::exl3_pack::{expert_name, router_name, shared_name};
+    use crate::family::exl3_pack::{Root, expert_name_in, router_name_in, shared_name_in};
 
     fn moe() -> MoeDims {
         MoeDims {
@@ -274,19 +274,19 @@ mod tests {
     #[test]
     fn names_follow_the_stock_pack_layout() {
         assert_eq!(
-            router_name(7),
+            router_name_in(Root::Layers, 7),
             "model.language_model.layers.7.mlp.gate.weight"
         );
         assert_eq!(
-            expert_name(7, 123, ExpertPart::Gate),
+            expert_name_in(Root::Layers, 7, 123, ExpertPart::Gate),
             "model.language_model.layers.7.mlp.experts.123.gate_proj"
         );
         assert_eq!(
-            expert_name(0, 255, ExpertPart::Down),
+            expert_name_in(Root::Layers, 0, 255, ExpertPart::Down),
             "model.language_model.layers.0.mlp.experts.255.down_proj"
         );
         assert_eq!(
-            shared_name(39, ExpertPart::Up),
+            shared_name_in(Root::Layers, 39, ExpertPart::Up),
             "model.language_model.layers.39.mlp.shared_expert.up_proj"
         );
     }
