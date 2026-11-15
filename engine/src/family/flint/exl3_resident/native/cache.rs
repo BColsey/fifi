@@ -333,7 +333,9 @@ impl LayerCache {
         // The pass runs on a scratch row and only lands on Ok, so a refusal leaves the
         // live table exactly as the call found it.
         let mut next = self.row.clone();
-        let plan = next.apply(&order, &demanded)?;
+        let plan = next
+            .apply(&order, &demanded)
+            .map_err(|detail| cache_error(&detail))?;
         let mut copies = [MissCopy::EMPTY; EXPERTS];
         for (index, swap) in plan.moves.iter().enumerate() {
             copies[index] = self.copy(swap.incoming, swap.slot)?;
@@ -364,8 +366,21 @@ impl LayerCache {
     /// pass of this layer; the slot becomes the most recently used one.
     pub(super) fn swap_in(&mut self, incoming: u16, outgoing: u16) -> Result<MissCopy, EngError> {
         self.check(Phase::Idle, self.stream)?;
-        let slot = self.row.swap(incoming, outgoing)?;
+        if usize::from(incoming) >= EXPERTS || usize::from(outgoing) >= EXPERTS {
+            return Err(cache_error("expert or slot is out of range"));
+        }
+        if self.row.is_resident(usize::from(incoming)) {
+            return Err(cache_error("incoming expert already holds a slot"));
+        }
+        let slot = self
+            .row
+            .slot_of(outgoing)
+            .ok_or_else(|| cache_error("outgoing expert holds no slot"))?;
+        // The copy builds before the row commits: a refused build leaves the row untouched.
         let copy = self.copy(incoming, slot)?;
+        self.row
+            .swap(incoming, outgoing)
+            .map_err(|detail| cache_error(&detail))?;
         Ok(copy)
     }
 
@@ -418,7 +433,9 @@ impl LayerCache {
     /// which the decode that follows then evicts against.
     pub(super) fn touch(&mut self, experts: &[u16]) -> Result<(), EngError> {
         self.check(Phase::Idle, self.stream)?;
-        self.row.touch(experts)
+        self.row
+            .touch(experts)
+            .map_err(|detail| cache_error(&detail))
     }
 
     pub(super) fn poison(&mut self) {
@@ -757,9 +774,9 @@ mod tests {
     // What the bank holds, without the pass key that every cache owns uniquely.
     fn bank_state(cache: &LayerCache) -> BankState {
         (
-            cache.row.slot_of.clone(),
-            cache.row.resident.clone(),
-            cache.row.recency.clone(),
+            cache.row.state().0.to_vec(),
+            cache.row.state().1.to_vec(),
+            cache.row.state().2.to_vec(),
             cache.demanded,
             cache.copies.clone(),
             cache.copy_count,
@@ -827,8 +844,8 @@ mod tests {
         assert!(flags[9] && !flags[1] && flags[0] && flags[2] && flags[3]);
         assert_eq!(flags.iter().filter(|f| **f).count(), 4);
         // The swapped slot is the most recently used one, so the next LRU victim is slot 0.
-        assert_eq!(cache.row.recency.last().copied(), Some(1));
-        assert_eq!(cache.row.recency[0], 0);
+        assert_eq!(cache.row.state().2.last().copied(), Some(1));
+        assert_eq!(cache.row.state().2[0], 0);
         // Refusals leave the cache untouched.
         let before = snapshot(&cache);
         assert!(cache.swap_in(9, 2).is_err(), "incoming already resident");
@@ -959,10 +976,10 @@ mod tests {
         // Experts 0, 1 and 2 are the oldest. Touching them in the order 2, 0, 1 makes expert 1 the
         // newest and expert 3 the oldest, so the next two misses evict 3 and 4, not 0, 1 or 2.
         cache.touch(&[2, 0, 1, 250]).unwrap();
-        assert_eq!(cache.row.recency[SLOTS - 1], 1);
-        assert_eq!(cache.row.recency[SLOTS - 2], 0);
-        assert_eq!(cache.row.recency[SLOTS - 3], 2);
-        assert_eq!(cache.row.recency[0], 3);
+        assert_eq!(cache.row.state().2[SLOTS - 1], 1);
+        assert_eq!(cache.row.state().2[SLOTS - 2], 0);
+        assert_eq!(cache.row.state().2[SLOTS - 3], 2);
+        assert_eq!(cache.row.state().2[0], 3);
         let pass = cache.prepare(&[224, 225], usize::MAX).unwrap();
         let ready = cache
             .copy_ready(pass, 7, |copies| {
@@ -974,9 +991,9 @@ mod tests {
         cache.release(ready, 7, || Ok(())).unwrap();
         // A touch outside the idle phase is refused and changes nothing.
         let pass = cache.prepare(&[1], usize::MAX).unwrap();
-        let before = cache.row.recency.clone();
+        let before = cache.row.state().2.to_vec();
         assert!(cache.touch(&[5]).is_err());
-        assert_eq!(cache.row.recency, before);
+        assert_eq!(cache.row.state().2, before.as_slice());
         let _ = pass;
     }
 
@@ -1094,8 +1111,8 @@ mod tests {
         assert!(cache.prepare(&[224], 2).is_err());
         assert_eq!(snapshot(&cache), before);
         let pass = cache.prepare(&[224, 0, 224, 1], 3).unwrap();
-        assert_eq!(cache.row.slot_of[2], -1);
-        assert_eq!(cache.row.slot_of[224], 2);
+        assert_eq!(cache.row.state().0[2], -1);
+        assert_eq!(cache.row.state().0[224], 2);
         assert!(cache.prepare(&[225], 3).is_err());
         assert!(
             cache
@@ -1195,7 +1212,7 @@ mod tests {
         );
         for id in 0..EXPERTS {
             assert_eq!(
-                cache.row.slot_of[id],
+                cache.row.state().0[id],
                 if id < SLOTS { id as i32 } else { -1 }
             );
         }
@@ -1877,7 +1894,7 @@ mod tests {
                 for &id in &ids {
                     let slot = cache.slot(ready, id as u16).unwrap();
                     assert!(usize::from(slot) < slots);
-                    assert_eq!(cache.row.resident[usize::from(slot)], id as u16);
+                    assert_eq!(cache.row.state().1[usize::from(slot)], id as u16);
                     used.insert((id, slot));
                 }
                 // One slot per demanded expert: a victim is never a member of the pass.
@@ -1885,9 +1902,10 @@ mod tests {
                 cache.release(ready, 7, || Ok(())).unwrap();
                 let recency: Vec<u16> = cache
                     .row
-                    .recency
+                    .state()
+                    .2
                     .iter()
-                    .map(|&slot| cache.row.resident[usize::from(slot)])
+                    .map(|&slot| cache.row.state().1[usize::from(slot)])
                     .collect();
                 assert_eq!(recency, bank, "slots={slots}");
             }
@@ -1919,6 +1937,39 @@ mod tests {
                 .unwrap();
             cache.release(ready, 7, || Ok(())).unwrap();
         }
+    }
+
+    #[test]
+    fn swap_in_refuses_an_out_of_range_expert_and_leaves_the_row_untouched() {
+        let layout = HostLayout::new(&[1], 4).unwrap();
+        let store = HostStore::build(layout, |_, _, range| Ok(range.bytes)).unwrap();
+        let mut cache = LayerCache::new(&store, 0, 1).unwrap();
+        cache.publish_initial(1, |_| Ok(())).unwrap();
+        let before = snapshot(&cache);
+        for (incoming, outgoing) in [(EXPERTS as u16, 0), (2, EXPERTS as u16)] {
+            let error = cache.swap_in(incoming, outgoing).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(text.contains("Flint expert cache"), "{text}");
+            assert!(text.contains("expert or slot is out of range"), "{text}");
+        }
+        assert_eq!(snapshot(&cache), before);
+    }
+
+    #[test]
+    fn a_refused_prepare_with_duplicate_ids_leaves_the_live_row_untouched() {
+        let layout = HostLayout::new(&[1], 4).unwrap();
+        let store = HostStore::build(layout, |_, _, range| Ok(range.bytes)).unwrap();
+        let mut cache = LayerCache::new(&store, 0, 1).unwrap();
+        cache.publish_initial(1, |_| Ok(())).unwrap();
+        // A duplicate counts once toward the demanded union: four distinct experts fill
+        // the four-slot bank exactly.
+        let pass = cache.prepare(&[0, 0, 1, 2, 3, 0], usize::MAX).unwrap();
+        let ready = cache.copy_ready(pass, 1, |_| Ok(())).unwrap();
+        cache.release(ready, 1, || Ok(())).unwrap();
+        let before = snapshot(&cache);
+        // Five distinct experts still exceed the bank with duplicates in the list.
+        assert!(cache.prepare(&[4, 4, 0, 1, 2, 3], usize::MAX).is_err());
+        assert_eq!(snapshot(&cache), before);
     }
 
     #[test]
@@ -1956,7 +2007,7 @@ mod tests {
             assert_eq!(bank_state(&cache), bank_state(&fresh));
             for id in 0..EXPERTS {
                 assert_eq!(
-                    cache.row.slot_of[id],
+                    cache.row.state().0[id],
                     if id < slots { id as i32 } else { -1 }
                 );
             }

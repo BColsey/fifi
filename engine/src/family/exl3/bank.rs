@@ -8,7 +8,6 @@
 //! a host that refuses it serves staged but correct. The admission arithmetic that decides
 //! banking stays with the family that owns its settings.
 
-#[allow(unused_imports)]
 pub(crate) use crate::family::expert_bank::policy::LayerSlots;
 // The sentinels serve only the pick-golden tests, so the re-export stays test-gated.
 #[cfg(test)]

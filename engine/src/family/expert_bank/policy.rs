@@ -16,11 +16,11 @@ use crate::EngError;
 #[derive(Debug, Clone)]
 pub(crate) struct LayerLru {
     /// Slot of every expert or -1.
-    pub(in crate::family) slot_of: Vec<i32>,
+    slot_of: Vec<i32>,
     /// Expert of every slot.
-    pub(in crate::family) resident: Vec<u16>,
+    resident: Vec<u16>,
     /// Slots, least recently used first.
-    pub(in crate::family) recency: Vec<u16>,
+    recency: Vec<u16>,
 }
 
 impl LayerLru {
@@ -42,42 +42,37 @@ impl LayerLru {
     }
 
     /// Gives `incoming` the slot `outgoing` holds; the slot becomes the most recent. Fails when
-    /// `incoming` is already resident, `outgoing` holds no slot, or either expert is outside the
-    /// table.
-    pub(crate) fn swap(&mut self, incoming: u16, outgoing: u16) -> Result<u16, EngError> {
+    /// either expert is outside the table (checked before any write), `incoming` is already
+    /// resident, or `outgoing` holds no slot. The failure text is the bare detail: the owning
+    /// family's error prefix wraps it.
+    pub(crate) fn swap(&mut self, incoming: u16, outgoing: u16) -> Result<u16, String> {
+        if usize::from(incoming) >= self.slot_of.len()
+            || usize::from(outgoing) >= self.slot_of.len()
+        {
+            return Err("expert or slot is out of range".into());
+        }
         let slot = self
             .slot_of(outgoing)
-            .ok_or_else(|| bank_error("outgoing expert holds no slot".into()))?;
+            .ok_or_else(|| "outgoing expert holds no slot".to_string())?;
         if self.is_resident(usize::from(incoming)) {
-            return Err(bank_error("incoming expert already holds a slot".into()));
+            return Err("incoming expert already holds a slot".into());
         }
         self.slot_of[usize::from(outgoing)] = -1;
         self.slot_of[usize::from(incoming)] = i32::from(slot);
         self.resident[usize::from(slot)] = incoming;
-        let at = self
-            .recency
-            .iter()
-            .position(|&other| other == slot)
-            .ok_or_else(|| bank_error("invalid recency order".into()))?;
-        self.recency.remove(at);
-        self.recency.push(slot);
+        self.promote(slot)?;
         Ok(slot)
     }
 
     /// Marks `experts` as just used, in the order given and without any copy: the later in the
-    /// list, the more recent. Experts without a slot are skipped.
-    pub(crate) fn touch(&mut self, experts: &[u16]) -> Result<(), EngError> {
+    /// list, the more recent. Experts without a slot are skipped. Failure text is the bare
+    /// detail; the owning family's error prefix wraps it.
+    pub(crate) fn touch(&mut self, experts: &[u16]) -> Result<(), String> {
         for &expert in experts {
             let Some(slot) = self.slot_of(expert) else {
                 continue;
             };
-            let at = self
-                .recency
-                .iter()
-                .position(|&other| other == slot)
-                .ok_or_else(|| bank_error("invalid recency order".into()))?;
-            self.recency.remove(at);
-            self.recency.push(slot);
+            self.promote(slot)?;
         }
         Ok(())
     }
@@ -95,8 +90,9 @@ impl LayerLru {
 
     /// Runs the experts of `order` through the layer: a hit becomes the most recent, a miss takes
     /// the least recent slot whose expert `demanded` does not protect. Fails only when everything
-    /// is protected, which the callers' capacity check rules out.
-    pub(crate) fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, EngError> {
+    /// is protected, which the callers' capacity check rules out. Failure text is the bare
+    /// detail; the owning family's error prefix wraps it.
+    pub(crate) fn apply(&mut self, order: &[u16], demanded: &[bool]) -> Result<PassPlan, String> {
         let mut plan = PassPlan {
             distinct: order.len(),
             ..PassPlan::default()
@@ -113,7 +109,7 @@ impl LayerLru {
                         .iter()
                         .copied()
                         .find(|&slot| !demanded[usize::from(self.resident[usize::from(slot)])])
-                        .ok_or_else(|| bank_error("no unprotected victim".into()))?;
+                        .ok_or_else(|| "no unprotected victim".to_string())?;
                     let outgoing = self.resident[usize::from(slot)];
                     self.slot_of[usize::from(outgoing)] = -1;
                     self.slot_of[usize::from(expert)] = i32::from(slot);
@@ -126,15 +122,30 @@ impl LayerLru {
                     slot
                 }
             };
-            let at = self
-                .recency
-                .iter()
-                .position(|&other| other == slot)
-                .ok_or_else(|| bank_error("invalid recency order".into()))?;
-            self.recency.remove(at);
-            self.recency.push(slot);
+            self.promote(slot)?;
         }
         Ok(plan)
+    }
+
+    /// Moves `slot` to the most-recent end of the recency order. The one place a row's
+    /// recency is rewritten; a slot missing from the order is the row's own invariant
+    /// break, not a caller error.
+    fn promote(&mut self, slot: u16) -> Result<(), String> {
+        let at = self
+            .recency
+            .iter()
+            .position(|&other| other == slot)
+            .ok_or_else(|| "invalid recency order".to_string())?;
+        self.recency.remove(at);
+        self.recency.push(slot);
+        Ok(())
+    }
+
+    /// Test-only view of the raw row state: the expert -> slot map, the slot -> expert
+    /// map and the recency order, least recently used first.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> (&[i32], &[u16], &[u16]) {
+        (&self.slot_of, &self.resident, &self.recency)
     }
 }
 
@@ -331,7 +342,7 @@ impl SlotPolicy for ReplaceOnMissLru {
                 usage[layer][expert] += 1;
             }
         }
-        let plan = next.apply(&order, &demanded)?;
+        let plan = next.apply(&order, &demanded).map_err(bank_error)?;
         self.miss_counts[layer] += plan.moves.len() as u64;
         self.layers[layer] = next;
         Ok(plan)
@@ -351,7 +362,7 @@ impl SlotPolicy for ReplaceOnMissLru {
         }
         newest_first.reverse();
         let mut next = current.clone();
-        let plan = next.apply(&newest_first, &demanded)?;
+        let plan = next.apply(&newest_first, &demanded).map_err(bank_error)?;
         self.layers[layer] = next;
         Ok(plan)
     }
