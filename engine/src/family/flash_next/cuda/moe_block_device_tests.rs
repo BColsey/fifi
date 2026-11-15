@@ -33,13 +33,11 @@
 use std::path::PathBuf;
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     moe_block::{SplitMoe, SplitMoeTrunk},
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{

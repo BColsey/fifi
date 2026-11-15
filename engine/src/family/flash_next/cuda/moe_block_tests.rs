@@ -3,13 +3,11 @@
 //! bank. The expert outputs are synthetic and deterministic; the device test (ignored) runs the
 //! real kernels on a real layer.
 
-use super::{
-    bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru},
-    moe_block::{
-        PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
-        pick_union, plan_second_pass,
-    },
+use super::moe_block::{
+    PassInputs, ScratchLayout, SlotSpans, classify_picks, first_poisoned_filler, parse_log,
+    pick_union, plan_second_pass,
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{flash_next::moe::slot_bank::SlotBankLayout, project::exl3_jobs_plan::EXL3_JOB_WORDS},

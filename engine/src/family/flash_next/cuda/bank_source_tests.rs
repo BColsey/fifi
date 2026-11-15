@@ -432,11 +432,12 @@ fn a_read_that_fails_after_the_open_is_refused_by_name() {
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
     use super::*;
+    use crate::family::expert_bank::ReplaceOnMissLru;
+    use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode};
     use crate::{
         family::{
             flash_next::cuda::bank::{
-                BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms,
-                ReplaceOnMissLru, device::DeviceBank, parse_route_counts,
+                HostMemory, HostPinPlan, HostTerms, device::DeviceBank, parse_route_counts,
             },
             project::cuda::CudaProjector,
         },

@@ -115,8 +115,9 @@ pub(super) fn ring_slots(
 /// constructs today; a caller that wants the contract constructs this over it.
 #[cfg(all(feature = "native-cuda", target_os = "linux"))]
 pub(in crate::family::flash_next) mod device {
-    use super::super::bank::{BankGeometry, BankStats, PassCopies, device::DeviceBank};
+    use super::super::bank::device::DeviceBank;
     use super::{AdmitPlan, drain_before_admit, ring_slots};
+    use crate::family::expert_bank::{BankGeometry, BankStats, PassCopies};
     use crate::{
         EngError,
         family::{

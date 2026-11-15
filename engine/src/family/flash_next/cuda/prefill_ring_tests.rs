@@ -1,8 +1,8 @@
 //! The prefill ring's stream plan: layer-major, skipping the banked experts, ring slots by
 //! round-robin.
 
-use super::bank::NO_PLACE;
 use super::prefill_ring::{StreamEntry, plan_from_rows};
+use crate::family::expert_bank::NO_PLACE;
 
 fn entry(layer: u16, expert: u16, place: u32, slot: u16) -> StreamEntry {
     StreamEntry {

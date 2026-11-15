@@ -3,9 +3,9 @@
 //! repeats, which is the mapping the golden's admit arm pins. Cardless: everything here runs on
 //! the policy and the slot row, the parts of the contract that live on the host.
 
-use super::bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use super::prefill_adapter::{AdmitPlan, drain_before_admit, ring_slots};
 use crate::EngError;
+use crate::family::expert_bank::{BankGeometry, ReplaceOnMissLru, SlotPolicy, SlotTable};
 use std::cell::RefCell;
 
 #[test]

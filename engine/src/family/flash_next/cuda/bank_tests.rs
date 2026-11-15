@@ -4,6 +4,7 @@
 //! the device bank. Host tests need no model and no GPU.
 
 use super::bank::*;
+use crate::family::expert_bank::*;
 use crate::{
     EngError,
     family::{
@@ -1093,10 +1094,9 @@ fn the_policy_reproduces_the_recorded_lru_hit_rates_on_the_t0_trace() {
 
 #[cfg(all(test, feature = "native-cuda", target_os = "linux"))]
 mod device_tests {
-    use super::super::bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::*,
-    };
+    use super::super::bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::*};
+    use crate::family::expert_bank::ReplaceOnMissLru;
+    use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode};
     use crate::{EngError, family::project::cuda::CudaProjector, kernels::cuda::device_present};
 
     /// The record of an expert is a pattern of its layer and number, distinct per byte position.

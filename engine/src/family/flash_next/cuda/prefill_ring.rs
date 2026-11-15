@@ -9,7 +9,7 @@
 //! first read. The bank is frozen read-only for the whole chunk, so the host places the plan
 //! reads are stable.
 
-use super::bank::NO_PLACE;
+use crate::family::expert_bank::NO_PLACE;
 
 /// An expert the chunk needs that the bank does not hold: streamed into a ring slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub(super) mod device {
     use super::{NO_PLACE, StreamEntry, plan_from_rows};
     use crate::{
         EngError,
-        family::flash_next::cuda::bank::{BankGeometry, device::DeviceBank},
+        family::{expert_bank::BankGeometry, flash_next::cuda::bank::device::DeviceBank},
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceEvent, DeviceRange, DeviceStream},
     };
 

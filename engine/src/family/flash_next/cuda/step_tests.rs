@@ -24,10 +24,7 @@
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     load::{
         TrunkList,
@@ -38,6 +35,7 @@ use super::{
     step::{AllResidentMoe, FlashStep, MIXER, MoeBlock, SplitMoeAt, bank_key, split_trunk},
     step_plan::{PREFILL_TILE_ROWS, Site, Slot},
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{

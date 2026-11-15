@@ -11,7 +11,7 @@
 //! 2. The resident pass runs, and the host learns the picks (hits included) so that
 //!    [`ExpertBankState::begin_pass`] can plan the copies: every expert of the pass is protected, a
 //!    miss takes the least recently used unprotected slot, and the slot's old expert leaves the card.
-//! 3. [`PassCopies`] says what to move. The copy is synchronous (the missed picks wait for it).
+//! 3. `PassCopies` says what to move. The copy is synchronous (the missed picks wait for it).
 //! 4. The missed picks run on their new slots with their true weights — the missed picks ONLY,
 //!    no filler ([`miss_pass_inputs`]); the two passes' weights add to the router's weights bit
 //!    for bit.
@@ -36,7 +36,7 @@
 //!   the host.
 //!
 //! The slot policy lives in the shared module (`family::expert_bank::policy`): the same
-//! `ReplaceOnMissLru` behind the same [`SlotPolicy`] seam, moved there so a second family's bank
+//! `ReplaceOnMissLru` behind the same `SlotPolicy` seam, moved there so a second family's bank
 //! can serve it unchanged. The interface is `plan_pass(layer, picks) -> PassPlan`,
 //! `admit(layer, experts_by_use) -> PassPlan`, `slot_row(layer)` and `expert_in_slot(layer, slot)`.
 //! Host places, copies, budget and the device owner do not change. The policy must keep three rules:
@@ -56,15 +56,8 @@ use crate::{
     },
 };
 
-// The seam moved to `family/expert_bank` (c2): re-exported here so every existing path
-// under `flash_next::cuda` and the golden harnesses keep compiling unchanged. The five
-// marked names are consumed only by native-cuda-gated modules, so a plain host build sees
-// the re-export as unused (knowledge: `cpu-clippy-red-on-main-delta-layer-seam`).
-#[allow(unused_imports)]
-pub(super) use crate::family::expert_bank::{
-    BankGeometry, BankStats, CopyOp, Demote, ExpertBankState, HostMode, HostPlaces, NO_PLACE,
-    PassCopies, PassPlan, ReplaceOnMissLru, SlotMove, SlotPolicy, SlotTable, bank_error,
-    plan_error,
+use crate::family::expert_bank::{
+    BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru, bank_error, plan_error,
 };
 
 impl BankGeometry {
@@ -441,10 +434,8 @@ pub(super) mod device {
     //! the path Flint's store works on under the 8 MiB `RLIMIT_MEMLOCK`; nothing here calls `mlock`.
     //! They are allocated once and held: dropping one synchronizes the device.
 
-    use super::{
-        BankGeometry, BankStats, ExpertBankState, HostPinPlan, PassCopies, RecordSource,
-        ReplaceOnMissLru,
-    };
+    use super::{HostPinPlan, RecordSource, ReplaceOnMissLru};
+    use crate::family::expert_bank::{BankGeometry, BankStats, ExpertBankState, PassCopies};
     use crate::{
         EngError,
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},

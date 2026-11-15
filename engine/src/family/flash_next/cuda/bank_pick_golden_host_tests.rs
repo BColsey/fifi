@@ -13,7 +13,7 @@
 //! format; one golden mechanism, same switch as the prefill golden harness); without it
 //! the compile-time pin is compared.
 
-use super::bank::*;
+use crate::family::expert_bank::*;
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 

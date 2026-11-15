@@ -30,10 +30,7 @@ use std::{
 };
 
 use super::{
-    bank::{
-        BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-        ReplaceOnMissLru, device::DeviceBank,
-    },
+    bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank},
     bank_source::PackRecordSource,
     device::{CardChunkDevice, CardDevice},
     driver::chunk::ChunkDriver,
@@ -51,6 +48,7 @@ use super::{
     step::{FlashStep, SplitMoeAt},
     step_plan::StepPlan,
 };
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{
     EngError,
     family::{

@@ -3,11 +3,9 @@
 //! ring slots are exactly the store's records. Three layers with a ring of two layers' worth of
 //! entries exercises the wrap: layer 2 reuses layer 0's slots after `free_layer`.
 
-use super::bank::{
-    BankGeometry, ExpertBankState, HostMemory, HostMode, HostPinPlan, HostTerms, RecordSource,
-    ReplaceOnMissLru, device::DeviceBank,
-};
+use super::bank::{HostMemory, HostPinPlan, HostTerms, RecordSource, device::DeviceBank};
 use super::prefill_ring::device::PrefillRing;
+use crate::family::expert_bank::{BankGeometry, ExpertBankState, HostMode, ReplaceOnMissLru};
 use crate::{EngError, kernels::cuda::device_present};
 
 /// The record of an expert is a pattern of its layer and number, distinct per byte position
