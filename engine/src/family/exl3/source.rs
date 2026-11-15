@@ -23,6 +23,7 @@ use crate::{
     },
 };
 
+/// A dense (tiled) mixer weight: its role, output rows and input length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::family) struct DenseSpec {
     pub(in crate::family) role: Role,
@@ -47,6 +48,7 @@ pub(in crate::family) fn check_dense(
     Ok(())
 }
 
+/// Largest stored matrix read at once: the head's trellis is the biggest, at 318 MB.
 const MATRIX_READ_LIMIT: u64 = 1 << 30;
 
 pub(in crate::family) struct PackReader<'a> {
