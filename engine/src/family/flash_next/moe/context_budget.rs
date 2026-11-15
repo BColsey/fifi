@@ -29,8 +29,8 @@ use super::tier_plan::{TierInputs, TierPlan, indexer_key_bytes};
 use crate::{
     EngError,
     family::{
-        admission_sketch::CONTEXT_SEARCH_STEP, device_budget::KvPlan,
-        device_budget::largest_fitting,
+        admission_sketch::{CONTEXT_SEARCH_STEP, largest_fitting_context},
+        device_budget::KvPlan,
     },
 };
 
@@ -192,7 +192,7 @@ impl ContextBudget {
         if fits(top) {
             return Some(u64::from(top));
         }
-        largest_fitting(top, CONTEXT_GRANULE as u32, &fits).map(u64::from)
+        largest_fitting_context(top, &fits).map(u64::from)
     }
 
     /// What the step calls at load: the plan for `requested` positions, or a refusal that states

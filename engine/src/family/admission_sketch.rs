@@ -24,13 +24,7 @@ pub(crate) const CONTEXT_SEARCH_STEP: u32 = 1024;
 /// `fits` holds; `None` when not even one step fits (or `requested` is at most one step). `fits`
 /// must be monotone (a longer context never fits where a shorter one does not) and `requested` is
 /// assumed not to fit: it is never asked. Shared by the `enginesrv check` proposal and the
-/// expert-budget search, so both bisect the same way. Today both call
-/// `device_budget::largest_fitting` directly; this canonical wrapper keeps the
-/// step binding and the probe-sequence goldens staged in one place for the
-/// search unification.
-// shortcut: dead in the plain lib build until the P4 search unification wires
-// callers back through it; remove the attribute when that lands.
-#[cfg_attr(not(test), allow(dead_code))]
+/// expert-budget search, so both bisect the same way.
 pub(crate) fn largest_fitting_context(requested: u32, fits: &dyn Fn(u32) -> bool) -> Option<u32> {
     crate::family::device_budget::largest_fitting(requested, CONTEXT_SEARCH_STEP, fits)
 }
@@ -90,12 +84,12 @@ impl AdmissionSketch {
 mod tests {
     use super::*;
 
-    /// c0 goldens (P4): the probe SEQUENCE of `largest_fitting_context` is
-    /// qualified output - a later consumer writes its result into refusal text -
-    /// so the answers below are pinned per predicate, derived by hand from the
-    /// loop before any P4 change. Do NOT "improve" a row: the lattice-floor in
-    /// the midpoint makes some answers land BELOW the largest fitting step when
-    /// the request is not lattice-aligned, and that is shipped behavior.
+    /// The probe SEQUENCE of `largest_fitting_context` is qualified output - a
+    /// later consumer writes its result into refusal text - so the answers below
+    /// are pinned per predicate, derived by hand from the loop. Do NOT "improve"
+    /// a row: the lattice-floor in the midpoint makes some answers land BELOW the
+    /// largest fitting step when the request is not lattice-aligned, and that is
+    /// shipped behavior.
     #[test]
     fn largest_fitting_context_golden_probes() {
         // Degenerate arms: a request at or below the step, or a first step

@@ -1730,7 +1730,6 @@ fn largest_fitting_cuda(
     >,
     requested: u32,
 ) -> Option<u32> {
-    use crate::family::admission_sketch::CONTEXT_SEARCH_STEP;
     use crate::family::qwen36::admission_sketch as sketch;
     let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
     let fits = |context: u32| -> bool {
@@ -1742,7 +1741,7 @@ fn largest_fitting_cuda(
         };
         i128::from(free) - i128::from(weights) - i128::from(charges) >= band
     };
-    crate::family::device_budget::largest_fitting(requested, CONTEXT_SEARCH_STEP, &fits)
+    crate::family::admission_sketch::largest_fitting_context(requested, &fits)
 }
 
 #[cfg(test)]
