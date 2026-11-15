@@ -28,7 +28,6 @@
 use super::card_step::CardStack;
 use super::card_token::{merge_head_candidates, run_card_token};
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer::{BlockIo, CardKindOps, MixerParts, MixerViews, Mixers};
 use super::mixer_geometry::MixerGeometry;
 use super::mixer_ops::CardOp;
@@ -43,6 +42,7 @@ use super::step_ops::{final_resid, resid_in, resid_out};
 use super::step_plan::{KernelScratch, Slot, StepPlan};
 use crate::EngError;
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
 use crate::family::project::cuda::WeightLayout;
 use crate::family::project::cuda::served_admission;

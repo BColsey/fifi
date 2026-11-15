@@ -32,6 +32,7 @@
 //! Drop order: the captured graph first (it keeps the holds of its capture and covers the state
 //! buffers by drop order), then the borrowed weights and views, the state, the pinned word, the
 //! event and the stream; `Drop` synchronizes the stream first.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::cell::RefCell;
@@ -43,7 +44,6 @@ use super::{
         merge::{SharedMerge, run_exl3_moe_merged},
         run_exl3_moe,
     },
-    layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
@@ -1292,7 +1292,7 @@ impl<'a> QwenResidentStep<'a> {
                     arena: ledger_cost.map_or(0, |cost| cost.arena),
                     extras: &budget.extras,
                     staging: &plan,
-                    wide: wide.as_ref()
+                    wide: wide.as_ref(),
                 })
             );
             let full_capacity = plan.capacity;

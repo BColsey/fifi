@@ -10,6 +10,7 @@
 //! round trips) and the host resolves (the slot mapping and the miss refills). The numbers
 //! say whether the follow-up lever is the drain (device-side id mapping) or the refills.
 //! The probe changes no production behavior; its only assertion is that the decode finished.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{cell::RefCell, path::Path, time::Instant};
 
@@ -18,7 +19,6 @@ use super::{
     exl3_load::{BankedModel, load_exl3_banked_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, HEAD_ROWS, PROMPT, SAMPLER_VOCAB, options},
-    layer_table::LayerTable,
     native_device_rig::device_present,
     resources::{StepResources, moe_dims},
     rules::QwenRules,

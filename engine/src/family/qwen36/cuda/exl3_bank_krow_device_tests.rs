@@ -10,6 +10,7 @@
 //! must round every layer exactly as the one-row banked step does, on a bank that misses.
 //! A scripted drafter forces a full accept, a partial accept and a full reject in turn; a second
 //! leg runs the engine's real n-gram drafter over the same prompt.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{cell::RefCell, path::Path};
 
@@ -20,7 +21,6 @@ use super::{
     exl3_load::{BankedModel, load_exl3_banked_dir},
     exl3_moe::Exl3MoeWeights,
     exl3_step_device_tests::{EOS, GENERATED, HEAD_ROWS, PROMPT, SAMPLER_VOCAB},
-    layer_table::LayerTable,
     native_device_rig::device_present,
     resources::{StepResources, moe_dims},
     rules::QwenRules,

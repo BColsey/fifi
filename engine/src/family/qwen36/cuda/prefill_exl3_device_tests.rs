@@ -11,6 +11,7 @@
 //!
 //! Row counts straddle every boundary of the tiling: one row, the split-K limit of eight, the
 //! SIMT/tensor-core switch at 64, one full tile, one row over a tile and several tiles.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::path::Path;
 
@@ -27,7 +28,6 @@ use crate::{
             common_tests::{dims, inventory},
             exl3_load_device_tests::{matrix_of, relative_l2},
             exl3_source::{PackReader, attention_weights, delta_weights},
-            layer_table::LayerTable,
             mixer_geometry::MixerGeometry,
             mixer_weights::MixerWeights,
         },

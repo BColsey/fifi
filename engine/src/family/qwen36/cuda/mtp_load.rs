@@ -5,11 +5,11 @@
 //! the device under the names of a one-layer table (`LayerTable::single`), the rest under the
 //! names below, so they join the model's `CudaWeights` without colliding with it. The head has no
 //! embedding table and no output head: the draft step reads the model's.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
     exl3_moe_source::moe_weights,
     exl3_source::{PackReader, attention_weights},
-    layer_table::LayerTable,
     mixer_geometry::{DenseSpec, MixerGeometry},
 };
 use crate::family::exl3::launch::MoeDims;

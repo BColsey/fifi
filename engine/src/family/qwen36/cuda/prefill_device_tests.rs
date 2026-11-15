@@ -900,13 +900,13 @@ fn chunk_moe_resident_matches_the_host_reference() {
 // ---- the five-layer rig (real dims) -----------------------------------------------------------
 
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer_geometry::MixerGeometry;
 use super::mixer_weights::LayerWeights;
 use super::prefill::ChunkMoe;
 use super::prefill_plan::Phase;
 use super::state::{ResidentState, StepField};
 use super::state_layout::Word;
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 

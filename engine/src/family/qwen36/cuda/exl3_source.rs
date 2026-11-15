@@ -11,6 +11,7 @@
 //! A DeltaNet layer additionally moves its value heads from the pack's grouped order into the
 //! tiled order of the kernels (see `exl3_tensors`): whole heads of every matrix, vector and conv
 //! row that carries a value-head axis.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3_pack::{Root, layer_name};
 use crate::family::project::cuda::WeightLayout;
@@ -19,10 +20,7 @@ use crate::family::qwen36::exl3_tensors::{
     tiled_head_order, widen_f32,
 };
 
-use super::{
-    layer_table::LayerTable,
-    mixer_geometry::{DeltaGeometry, DenseSpec, MixerGeometry, RawSpec, check_dense},
-};
+use super::mixer_geometry::{DeltaGeometry, DenseSpec, MixerGeometry, RawSpec, check_dense};
 use crate::{
     EngError,
     family::{

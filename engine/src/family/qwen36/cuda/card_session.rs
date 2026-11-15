@@ -25,7 +25,6 @@ use std::sync::Arc;
 use super::card_step::CardStack;
 use super::card_token::run_card_token;
 use super::dims::{StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer::{CardKindOps, MixerParts, MixerViews, Mixers};
 use super::mixer_geometry::{DenseSpec, MixerGeometry, check_native_dense};
 use super::mixer_ops::CardOp;
@@ -37,6 +36,7 @@ use super::resources::{GlobalNames, MoeSpecs, check_native_embed, moe_layer_weig
 use super::state::export::ExportedState;
 use super::state::{ResidentState, StepField};
 use super::step_plan::Slot;
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::EngError;
 use crate::family::AttentionKind;

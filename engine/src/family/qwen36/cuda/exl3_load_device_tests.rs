@@ -5,6 +5,7 @@
 //! tensor's shape through the step's own lookups, compares the device bytes with an independent
 //! sum over the pack's headers and the free memory before and after, and then checks the moved
 //! value heads and the bank members against the fp64 reference of the pack's original matrices.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{fs, path::Path, time::Instant};
 
@@ -14,7 +15,6 @@ use super::{
     super::exl3_pack::inspect_pack_split,
     common_tests::{dims, inventory},
     exl3_load::{BankedModel, load_exl3_banked_dir, load_exl3_dir},
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,
     pinned::ROTARY_DIM,

@@ -10,6 +10,7 @@
 //! The chunk is tall enough that the busiest experts take tensor-core tiles (64 rows or more)
 //! and the least busy take the split-K tail (8 rows or fewer), so the block crosses every tile
 //! kernel of the rows entry.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims};
 use std::path::Path;
@@ -28,7 +29,6 @@ use crate::{
                 exl3_moe::Exl3MoeWeights,
                 exl3_moe_source::{moe_weights, moe_weights_banked},
                 exl3_source::PackReader,
-                layer_table::LayerTable,
                 prefill::{RouteIo, run_chunk_route},
             },
             exl3_pack::{expert_name, shared_name},

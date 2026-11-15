@@ -8,6 +8,7 @@
 //! qualified step, >= 1,000 lines). ONE CUDA engine is built per process: `BuildGuard` pins the
 //! flag before `spawn_engine`, commits it right after the leaks, and every retry in the same
 //! process is refused.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::super::exl3_merge_plan::{
     SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
@@ -26,7 +27,6 @@ use super::{
     dims::{KvMode, StepDims, StepOptions, TieredPlan},
     exl3_load::{BankedModel, DecidedLoad, load_exl3_dir_decided},
     exl3_moe::Exl3MoeWeights,
-    layer_table::LayerTable,
     pinned::{ROTARY_DIM, head_rows_of, min_free_after_load},
     placement::{PlacementPolicy, PlacementRequest, plan_placement, profiles_from_facts},
     prefill_driver::{FIXED_ADMISSION_MARGIN, PrefillBudget},

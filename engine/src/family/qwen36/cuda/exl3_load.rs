@@ -14,13 +14,13 @@ use super::{
     dims::StepDims,
     exl3_moe_source::{check_moe_source_geometry, moe_weights, moe_weights_banked},
     exl3_source::{PackReader, attention_weights, delta_weights},
-    layer_table::LayerTable,
     mixer_geometry::MixerGeometry,
     mtp_load::mtp_weights,
     pinned::ROTARY_DIM,
     resources::{GlobalNames, GlobalSpecs, STEP_ROWS},
 };
 use crate::family::exl3::launch::MoeDims;
+use crate::family::exl3::layer_table::LayerTable;
 use crate::family::exl3_pack::{EMBED_NAME, HEAD_PREFIX, NORM_NAME, Root};
 use crate::{
     EngError,

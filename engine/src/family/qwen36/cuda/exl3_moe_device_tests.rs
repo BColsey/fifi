@@ -4,6 +4,7 @@
 //! runs the block on a fixed normalized row and residual, and compares the router's picks, their
 //! weights and the block output with a host evaluation: the router in fp64, every picked
 //! expert's projections through the fp64 reference of the stored matrices, SiLU in fp64.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::path::Path;
@@ -17,7 +18,6 @@ use super::{
     exl3_moe::{Exl3MoeBufs, Exl3MoeWeights, Scratch, run_exl3_moe},
     exl3_moe_source::{moe_weights, moe_weights_banked},
     exl3_source::PackReader,
-    layer_table::LayerTable,
     resources::STEP_ROWS,
 };
 use crate::family::exl3::bank::{Exl3SlotResolver, ExpertStore};

@@ -8,8 +8,7 @@ use crate::{
     family::{AttentionKind, gguf_model::Inventory},
 };
 
-use crate::family::exl3::layer_table::LayerEntry;
-pub(in crate::family) use crate::family::exl3::layer_table::{LayerTable, layer_of};
+use crate::family::exl3::layer_table::{LayerEntry, LayerTable, layer_of};
 
 impl LayerTable {
     pub(super) fn new(dims: &StepDims, inventory: &Inventory) -> Result<Self, EngError> {

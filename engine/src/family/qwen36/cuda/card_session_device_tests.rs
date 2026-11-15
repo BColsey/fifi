@@ -12,11 +12,11 @@ use super::card_block_device_tests::{FileEntry, write_gguf};
 use super::card_session::CardSession;
 use super::card_step::CardStack;
 use super::dims::{KvMode, StepDims, StepOptions};
-use super::layer_table::LayerTable;
 use super::mixer_geometry::MixerGeometry;
 use super::native_device_rig::{Rng, device_present, q4k_rows, raw_values};
 use super::resources::{GlobalNames, MoeSpecs};
 use super::shard::ShardTable;
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::EngError;
 use crate::family::AttentionKind;

@@ -61,6 +61,7 @@
 //! is set to `1` (`refuse_switches`; any set value, even `0`, is already refused by the
 //! `FIFI_EXL3_` name rule). Unset is the engine default (the shared expert inside the routed
 //! launches); this test builds no MoE block, and the step tests force the separate block.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::MoeDims;
 use std::{fs, path::PathBuf, time::Instant};
@@ -70,7 +71,6 @@ use serde_json::{Map, Value, json};
 use super::{
     common_tests::{dims, inventory},
     d1_window_device_tests::{Loaded, load_pack},
-    layer_table::LayerTable,
     resources::GlobalNames,
 };
 use crate::family::speculate::krow_measure::{

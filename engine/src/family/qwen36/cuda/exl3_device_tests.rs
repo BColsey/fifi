@@ -5,6 +5,7 @@
 //! `FIFI_EXL3_MIXER_OUT` must name a new directory. Files contain raw LE F32.
 //! This runs only the first full-attention mixer at position zero with fresh FP16 KV.
 //! It does not qualify MoE, a Transformer, a model, throughput, or batched execution.
+use crate::family::exl3::layer_table::LayerTable;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -16,7 +17,6 @@ use super::{
     common_tests::{dims, inventory},
     dims::{KvMode, StepDims, StepOptions},
     exl3_source,
-    layer_table::LayerTable,
     mixer::{BlockIo, MixerParts, MixerViews, Mixers},
     mixer_geometry::MixerGeometry,
     mixer_weights::MixerWeights,

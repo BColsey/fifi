@@ -11,11 +11,11 @@
 //! timing events only when `FIFI_Q36_SERVE_PHASE` arms it. KV8 attention tiles update one device
 //! word with `write_at`, which waits for the owning stream. The body also calls
 //! [`super::state::ResidentState::check_chunk`].
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::{
     dims::{KvMode, StepDims},
     exl3_moe::Exl3MoeWeights,
-    layer_table::LayerTable,
     mixer::tail_extent,
     mixer_geometry::MixerGeometry,
     mixer_shapes::{attn_q8_shape, kv8_shape},

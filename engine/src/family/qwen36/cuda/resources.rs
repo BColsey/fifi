@@ -7,11 +7,11 @@
 //!
 //! One row only: the MoE block takes `m = 1`, so the plan, the arena and every launch of the step
 //! are made for [`STEP_ROWS`] row.
+use crate::family::exl3::layer_table::LayerTable;
 
 use super::sparse_exec::{SparseConfig, SparseExec, SparseGeometry};
 use super::{
     dims::{KvMode, StepDims, StepOptions},
-    layer_table::LayerTable,
     mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
     mixer_weights::dense_weight,
     moe::{MoeLayerWeights, StackWeights},

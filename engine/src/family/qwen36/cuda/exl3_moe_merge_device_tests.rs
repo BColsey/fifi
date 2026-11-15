@@ -20,6 +20,7 @@
 //!   outputs; and the routed pairs of that launch against the default 16-pair launch.
 //! - `shared_in_routed_graph_has_seven_fewer_kernel_nodes`: the captured block has exactly 7
 //!   nodes fewer per layer.
+use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3::launch::{Launch, MoeDims, RouteBufs};
 use std::{collections::BTreeSet, path::Path};
@@ -33,7 +34,6 @@ use super::{
     },
     exl3_moe_source::moe_weights,
     exl3_source::PackReader,
-    layer_table::LayerTable,
     resources::STEP_ROWS,
 };
 use crate::{

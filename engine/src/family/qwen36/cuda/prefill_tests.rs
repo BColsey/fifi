@@ -854,9 +854,9 @@ fn bufs_refuse_each_guard() {
 /// The valid 40-layer `ModelFacts` fixture of `model_refuses_each_guard` and
 /// `run_refuses_each_bound`: kinds and roles from the real table and geometry, every weight Native.
 fn model_fixture() -> super::prefill::ModelFacts {
-    use super::layer_table::LayerTable;
     use super::mixer_geometry::MixerGeometry;
     use super::prefill::LayerFacts;
+    use crate::family::exl3::layer_table::LayerTable;
     use crate::kernels::cuda::prefill::gdn_scan_seq::GDN_SCAN_EPS;
 
     let dims = common_tests::dims();

@@ -10,11 +10,9 @@
 //! Native load; `new` takes the session's layout and refuses a tensor of the other layout by name,
 //! so a mixed load cannot reach a launch (beside `CudaWeights::layout`'s own mixed refusal). The
 //! Native rows%4 rule is `mixer_geometry::check_native_dense`.
+use crate::family::exl3::layer_table::LayerTable;
 
-use super::{
-    layer_table::LayerTable,
-    mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense},
-};
+use super::mixer_geometry::{DenseSpec, MixerGeometry, check_dense, check_native_dense};
 use crate::{
     EngError,
     family::{
