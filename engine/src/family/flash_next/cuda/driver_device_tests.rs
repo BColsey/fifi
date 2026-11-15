@@ -564,6 +564,221 @@ fn the_suffix_turn_resumed_from_the_block_matches_a_fresh_prefill() {
     );
 }
 
+/// Device proof on the served 16|64 default: a plain conversation extension restores
+/// the off-lattice tip (4,557 = 284 x 16 + 13), the extension's prefill runs from there in
+/// 16-row pieces, and the turn's rolling cut at 5,056 - (5,056 - 4,557) = 499, not a
+/// multiple of 16 - is saved at its true boundary: the piece that contains it splits and
+/// re-anchors, where the pre-change ride to 4,557 + 32 x 16 = 5,069 would have passed the
+/// tip and dropped the cut. The resumed turn must still draw the fresh greedy tokens
+/// within the family's stream bound.
+#[test]
+#[ignore = "needs a GPU (about 21 GiB), the full pack in FIFI_FLASH_NEXT_EXL3_PACK and the oracle run JSON"]
+fn the_extension_turn_after_an_off_lattice_tip_restore_matches_a_fresh_prefill() {
+    use crate::family::executor::ExecutorOps;
+
+    assert!(
+        device_present("Flash-Next off-lattice extension resume"),
+        "this test needs a CUDA card"
+    );
+    resume::arm_for_tests();
+    let pack = PathBuf::from(var("FIFI_FLASH_NEXT_EXL3_PACK").expect("FIFI_FLASH_NEXT_EXL3_PACK"));
+    let oracle_path =
+        PathBuf::from(var("FIFI_FLASH_NEXT_DRIVER_ORACLE").expect("FIFI_FLASH_NEXT_DRIVER_ORACLE"));
+    let oracle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&oracle_path).expect("oracle json")).expect("json");
+    let actual_vocab = oracle["vocab"]["actual_vocab"].as_u64().expect("vocab") as usize;
+    let steps: usize =
+        var("FIFI_FLASH_NEXT_DRIVER_STEPS").map_or(32, |v| v.parse().expect("steps"));
+    let record = oracle["prompts"]
+        .as_array()
+        .expect("prompts")
+        .iter()
+        .find(|p| p["id"] == "prefill-4k")
+        .expect("the prefill-4k prompt");
+    let prompt: Vec<u32> = record["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    // The worker's served shape: the first turn ends at the off-lattice tip 4,557, the
+    // extension appends 544 tokens (5,101 total, new tip 5,100), and the plan cuts at
+    // 5,056 - a true boundary, not a chunk end of the restored cursor.
+    const PIECE: usize = 16;
+    const SPACING: usize = 64;
+    let tip1 = 4_557;
+    assert_eq!(
+        tip1 % PIECE,
+        13,
+        "the restored tip is off the piece lattice"
+    );
+    let mut c = prompt[..tip1].to_vec();
+    c.extend((0..544).map(|i| (i * 13 + 5) as u32 % actual_vocab as u32));
+    let tip2 = c.len() - 1;
+    // The plan the worker will rule for this turn, taken from the projection itself: the
+    // cut keeps its true boundary 5,056 - 4,557 = 499 tokens above the restored cursor,
+    // 31 chunks and 3 tokens, so the piece that contains it splits. The pre-fix ride
+    // would land the Block at 5,069 - still below the tip, so the old plan emitted it,
+    // 13 tokens above the true boundary; the ride drops a cut only when it reaches the
+    // tip, which needs a tip within one piece of the boundary.
+    let plan = crate::sched::worker::planned_points_for_tests(
+        Some(tip2),
+        None,
+        tip1,
+        PIECE,
+        crate::family::session::StoreLimits {
+            roots: 0,
+            entries: 2,
+        },
+        Some(SPACING),
+    );
+    assert_eq!(
+        plan,
+        vec![(5_056, SaveKind::Block), (tip2, SaveKind::Tip)],
+        "the ruled plan cuts at the true boundary below the new tip"
+    );
+    assert_eq!((5_056 - tip1) % PIECE, 3, "the cut is not a chunk end");
+    let cut2 = 5_056;
+    let context = u32::try_from(c.len() + steps + 8).expect("a context that fits");
+    let wanted = CudaSettings {
+        context,
+        kv_format: KvFormatName::F16,
+        slots: None,
+        expert_stats: None,
+        prefill_rows: PIECE as u32,
+    };
+    let driver = build_driver(&|_| {}, &pack, &wanted, actual_vocab, None).expect("driver");
+    let (mut executor, mut session) = FlashCudaExecutor::new(
+        driver,
+        CudaRules {
+            eos: Arc::from(vec![]),
+            sampler_vocab: actual_vocab,
+        },
+    )
+    .expect("executor");
+
+    // The fresh reference of the extension prompt.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c).unwrap();
+    let (fresh_ids, fresh_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+
+    // Turn 1: prefill to the off-lattice tip and save it.
+    executor.reset(&mut session).unwrap();
+    executor.prefill(&mut session, &c[..tip1]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip1], SaveKind::Tip)
+            .unwrap(),
+        "the armed switch saves the off-lattice tip"
+    );
+    // The extension turn: the tip restores (a plain extension re-renders nothing), the
+    // pieces run from the restored cursor, the cut's piece splits at the true boundary,
+    // and the turn's own Block and Tip save there and at the new tip.
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, tip1, "the off-lattice tip serves the extension");
+    let mut pos = tip1;
+    while pos < cut2 {
+        let end = (pos + PIECE).min(cut2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    assert!(
+        executor
+            .save_prefix(&session, &c[..cut2], SaveKind::Block)
+            .unwrap(),
+        "the split piece saves the cut at its true boundary"
+    );
+    while pos < tip2 {
+        let end = (pos + PIECE).min(tip2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip2], SaveKind::Tip)
+            .unwrap()
+    );
+    // The one token past the tip, the position the worker's `start` prefills after the
+    // tip save: without it the session holds c[tip2 - 1] pending and never feeds it.
+    executor.prefill(&mut session, &c[tip2..]).unwrap();
+    let (resumed_ids, resumed_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        resumed_ids, fresh_ids,
+        "the off-lattice restored turn draws the fresh greedy tokens"
+    );
+
+    // The control leg: the same tip restore and the same 16-row tail tiling with NO
+    // mid-turn Block save - the pre-change restored-turn shape. Both legs hold the
+    // family's cross-path ladder stream bound (step_tests: 2e-4), the same class the tip
+    // and block restores above hold: measured 1.462e-4 on both legs of this prompt
+    // (restores at 4,557 with a 544-token differently-tiled tail), so a real restore's
+    // depth-scaled rounding stays inside it while a stale-read class - a restore that
+    // misses rows - still lands orders of magnitude above. The control-relative ratio is
+    // the second assertion: it isolates the split's own contribution from the restore's
+    // depth noise, and both legs must draw the fresh greedy tokens.
+    executor.reset(&mut session).unwrap();
+    // Re-arm the 4,557 tip: the split leg's Tip save at 5,100 evicted it (the Tip store
+    // holds one entry), so turn 1's prefill and save run a second time before the
+    // control restores.
+    executor.prefill(&mut session, &c[..tip1]).unwrap();
+    assert!(
+        executor
+            .save_prefix(&session, &c[..tip1], SaveKind::Tip)
+            .unwrap(),
+        "the control's turn 1 re-arms the off-lattice tip"
+    );
+    executor.reset(&mut session).unwrap();
+    let reused = executor.restore_prefix(&mut session, &c).unwrap();
+    assert_eq!(reused, tip1, "the control restores the same tip");
+    let mut pos = tip1;
+    while pos < tip2 {
+        let end = (pos + PIECE).min(tip2);
+        executor.prefill(&mut session, &c[pos..end]).unwrap();
+        pos = end;
+    }
+    executor.prefill(&mut session, &c[tip2..]).unwrap();
+    let (control_ids, control_rows) = greedy(&mut executor, &c, steps, actual_vocab);
+    assert_eq!(
+        control_ids, fresh_ids,
+        "the control restored turn draws the fresh greedy tokens"
+    );
+    let worst = |rows: &[Vec<f32>]| {
+        rows.iter()
+            .zip(&fresh_rows)
+            .map(|(got, want)| relative_l2(got, want))
+            .fold(0.0f64, f64::max)
+    };
+    let mean = |rows: &[Vec<f32>]| {
+        rows.iter()
+            .zip(&fresh_rows)
+            .map(|(got, want)| relative_l2(got, want))
+            .sum::<f64>()
+            / rows.len().max(1) as f64
+    };
+    let split_drift = worst(&resumed_rows);
+    let control_drift = worst(&control_rows);
+    println!(
+        "off-lattice extension rel-L2: split max {split_drift:.3e} mean {:.3e}, control max \
+         {control_drift:.3e} mean {:.3e} over {steps} rows, bound 2e-4",
+        mean(&resumed_rows),
+        mean(&control_rows)
+    );
+    assert!(
+        split_drift <= 2e-4,
+        "the split's logits drift {split_drift:.3e} escapes the family stream bound 2e-4"
+    );
+    assert!(
+        control_drift <= 2e-4,
+        "the control's logits drift {control_drift:.3e} escapes the family stream bound 2e-4"
+    );
+    assert!(
+        split_drift <= 4.0 * control_drift,
+        "the split's logits drift {split_drift:.3e} escapes the no-split control \
+         {control_drift:.3e} - a stale-read class, not depth noise"
+    );
+}
+
 /// The mid-block boundary case of the raw-key ring: a boundary whose open block is partially
 /// filled (`(boundary - 1) % ratio != 0`), a continuation longer than the block's remainder, and
 /// a prompt whose completed blocks exceed the indexer budget (the real pack: ratio 4, budget

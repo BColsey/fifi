@@ -102,14 +102,14 @@ const RESUME_LIMITS: StoreLimits = StoreLimits {
 /// tip, so the block sits `((tip - 1) % spacing) + 1` tokens under it; the re-rendered seam
 /// sits exactly two tokens under the tip (see `RESUME_LIMITS`). A fresh prefill cuts on the
 /// lattice, and only the `tip % spacing <= 2` residue classes fall through the seam
-/// (2 in 64 at the default spacing). A turn that STARTS from a restored position keeps the
-/// cut at its true boundary only when the prefill piece does not divide the spacing: the
-/// worker then emits the cut there and re-anchors the piece that contains it, and the same
-/// residue classes fall through as on a fresh prefill. A piece that divides the spacing
-/// (the 16-row default) still projects the cut to the next piece end of the restored
-/// cursor's lattice, 0-15 tokens above the cut, and the projection is dropped whenever it
-/// reaches the tip - about 12 percent of tips, most of them restored turns. Closing that
-/// loss is a separate decision, not this constant's.
+/// (2 in 64 at the default spacing). A turn that STARTS from a restored position, or runs
+/// after a root, keeps the cut at its true boundary whatever the piece: the worker emits
+/// the cut there whenever it is not a chunk end of the cursor, re-anchoring the piece that
+/// contains it, and the same residue classes fall through as on a fresh prefill (the
+/// deeper-periodic guard of `save_points` never fires on the served families, because
+/// every periodic target is a block-spacing multiple). The restored-turn chunk tiling
+/// differs from a build before that rule - the chunk containing the cut splits - the same
+/// disclosure class as the seam itself: a restored turn's late greedy text can differ.
 const RESUME_BLOCK_SPACING: usize = 64;
 
 impl<S: ResumesState> FlashCudaExecutor<S> {

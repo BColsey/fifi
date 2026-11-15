@@ -56,9 +56,10 @@ fn request(engine: &crate::sched::worker::Engine, prompt: &[u32], boundary: usiz
     (usage.reused_tokens, usage.completion_tokens)
 }
 
-/// The three-turn conversation round, on a prefill piece of 4 so a turn that restores a
-/// Tip still rolls a Block (with 16-row pieces the moved cut lands at or above the tip and
-/// the worker skips it). The suffix grows PAST the old tip and re-words the seam, so the
+/// The three-turn conversation round, on a prefill piece of 4: a turn that restores a
+/// Tip still rolls a Block from the true-boundary cut (any piece now keeps it; piece 4
+/// also keeps the piece small enough that the moved cut lands well below the tip, so the
+/// store rolls it every turn). The suffix grows PAST the old tip and re-words the seam, so the
 /// restoring turn's own saves cannot land on the stale Tip's key and heal it: only the
 /// drop rule can retire the stale entry. Mutations this test fails under (verified by
 /// editing the source and rerunning, 2026-11-12):
@@ -135,15 +136,16 @@ fn the_worker_drives_three_turns_a_suffix_and_a_switch() {
     assert_eq!(reused, 23, "turn 2 restores the tip of turn 1");
     let (reused, _) = request(&engine, &c, boundary(&c));
     assert_eq!(
-        reused, 27,
+        reused, 24,
         "the suffix restores the rolled Block of turn 2 (not the re-worded tip): turn 2's \
-        Tip save kept the Block beside it"
+        Tip save kept the Block beside it, rolled to its true boundary under the restored \
+        cursor 23 (the old ride pushed it to 27)"
     );
     let (reused, _) = request(&engine, &e, boundary(&e));
     assert_eq!(
-        reused, 27,
-        "the conversation's second turn after the suffix restores the rolled Block, not the \
-        stale Tip the suffix overwrote (the drop rule)"
+        reused, 24,
+        "the conversation's second turn after the suffix restores the rolled Block at its \
+        true boundary, not the stale Tip the suffix overwrote (the drop rule)"
     );
     let (reused, _) = request(&engine, &f, boundary(&f));
     assert_eq!(
