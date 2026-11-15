@@ -10,9 +10,6 @@
 //! process is refused.
 use crate::family::exl3::layer_table::LayerTable;
 
-use super::super::exl3_merge_plan::{
-    SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
-};
 use super::super::krow::{SINGLE_GATHER_NAME, check_krow_env};
 use super::super::rollback::{Cover, startup_line as rollback_startup_line};
 use super::super::settings::{
@@ -38,6 +35,9 @@ use super::{
     step::{CaptureConfig, ChunkVerdict, QwenResidentStep},
     step_plan::{KernelScratch, StepPlan},
     tiered_load::{attach_tiered_parts, names_without_experts},
+};
+use crate::family::exl3_merge_plan::{
+    SHARED_IN_ROUTED_VAR, resolve_switch, shared_in_routed_explicit,
 };
 use crate::{
     EngError,

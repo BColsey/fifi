@@ -81,9 +81,9 @@ use crate::family::speculate::krow_measure::{
 use crate::{
     EngError,
     family::{
+        exl3_merge_plan::shared_in_routed_explicit,
         gguf_model::Role,
         project::cuda::{CudaWeight, Exl3MatrixView, exl3::Exl3Io},
-        qwen36::exl3_merge_plan::shared_in_routed_explicit,
         speculate::window_cost::{PackManifest, median, sha256_file, summary},
     },
     kernels::{

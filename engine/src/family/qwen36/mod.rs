@@ -14,8 +14,6 @@ mod default_path_pin_tests;
 #[cfg(test)]
 mod exl3_admission;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(in crate::family) use crate::family::exl3_merge_plan;
-#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(in crate::family) mod exl3_pack;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
 pub(crate) use self::exl3_pack::exl3_plan;

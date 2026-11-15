@@ -84,10 +84,10 @@ use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::exl3::bank::Exl3SlotResolver,
-    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
-    family::qwen36::exl3_merge_plan::{
+    family::exl3_merge_plan::{
         Intent, Source, load_suffix, resolve_switch, shared_in_routed_explicit,
     },
+    family::project::cuda::{CudaWeight, CudaWeights, WeightLayout, exl3::Exl3Io},
     family::qwen36::settings::{DEFAULT_CUDA_PREFILL_CHUNK, speculator_of},
     family::qwen36::tiered::{host::TieredHost, report::TokenReport},
     family::qwen36::window_logic,
