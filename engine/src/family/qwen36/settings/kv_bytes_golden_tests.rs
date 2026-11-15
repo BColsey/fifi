@@ -8,7 +8,7 @@ use super::{
     Activation, KvDtype, activation_name, cache_growth_per_position, kv_dtype_name,
     kv_growth_per_position, parse_activation, parse_kv_dtype,
 };
-use crate::family::qwen36::admission_sketch::kv8_staging_bytes;
+use crate::family::admission_sketch::kv8_staging_bytes;
 use crate::family::spec::QWEN3_6_35B_A3B;
 use std::fmt::Write as _;
 

@@ -1,3 +1,4 @@
+pub(crate) mod admission_sketch;
 mod config;
 #[allow(
     dead_code,

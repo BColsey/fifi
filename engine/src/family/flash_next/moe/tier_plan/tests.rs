@@ -349,10 +349,10 @@ fn a_plan_from_the_machine_charges_the_admission_ledger_and_follows_the_free_mem
     assert_eq!(measured(free, 62 * GIB).host.non_reclaimable, 8 * GIB);
 }
 
-/// c0 goldens (P4): `TierInputs::measured` as a literal struct. The four
-/// qwen36::admission_sketch constants it imports (a family-to-family import
-/// today) land in named fields; P4 moving the constants must not change a
-/// byte of this table.
+/// c0 goldens (P4): `TierInputs::measured` as a literal struct. The part
+/// charge comes from the family admission home and the four borrowed policy
+/// constants from the family that measured them; P4 moving them must not
+/// change a byte of this table.
 #[test]
 fn tier_inputs_measured_golden_struct() {
     let kv = KvPlan {

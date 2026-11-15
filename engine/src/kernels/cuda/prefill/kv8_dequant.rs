@@ -15,10 +15,10 @@ pub(crate) fn staging_bytes(
     n_kv_head: usize,
     head_dim: usize,
 ) -> Result<usize, EngError> {
-    // Canonical arithmetic lives in `family::qwen36::admission_sketch`, shared
+    // Canonical arithmetic lives in `family::admission_sketch`, shared
     // with the preflight estimate, so launch-side and estimate-side cannot
     // compute different staging sizes.
-    crate::family::qwen36::admission_sketch::kv8_staging_bytes(capacity, n_kv_head, head_dim)
+    crate::family::admission_sketch::kv8_staging_bytes(capacity, n_kv_head, head_dim)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

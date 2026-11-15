@@ -1499,6 +1499,7 @@ fn estimate_q36(
     backend: crate::family::qwen36::settings::Backend,
     facts: &HardwareFacts,
 ) -> Result<Estimate, crate::EngError> {
+    use crate::family::admission_sketch::kv8_staging_bytes;
     use crate::family::qwen36::admission_sketch as sketch;
     use crate::family::qwen36::settings::{
         Backend, KvDtype, cache_growth_per_position, delta_state_bytes,
@@ -1541,14 +1542,17 @@ fn estimate_q36(
             return Ok(0);
         }
         let rows = sketch::fixed_staging_rows(usize::try_from(context).unwrap_or(usize::MAX));
-        u64::try_from(sketch::kv8_staging_bytes(
+        u64::try_from(kv8_staging_bytes(
             rows,
             spec.heads_kv as usize,
             spec.head_dim as usize,
         )?)
         .map_err(|_| crate::EngError::MemoryPlan("staging bytes exceed u64".to_string()))
     };
-    let cuda_demand_at = |context: u32| -> Result<sketch::AdmissionSketch, crate::EngError> {
+    let cuda_demand_at = |context: u32| -> Result<
+        crate::family::admission_sketch::AdmissionSketch,
+        crate::EngError,
+    > {
         let kv = per_position
             .checked_mul(u64::from(context))
             .ok_or_else(|| {
@@ -1721,11 +1725,12 @@ fn largest_fitting_cuda(
     cuda_demand_at: &dyn Fn(
         u32,
     ) -> Result<
-        crate::family::qwen36::admission_sketch::AdmissionSketch,
+        crate::family::admission_sketch::AdmissionSketch,
         crate::EngError,
     >,
     requested: u32,
 ) -> Option<u32> {
+    use crate::family::admission_sketch::CONTEXT_SEARCH_STEP;
     use crate::family::qwen36::admission_sketch as sketch;
     let band = i128::from(sketch::ADMISSION_UNCERTAINTY_BAND_BYTES);
     let fits = |context: u32| -> bool {
@@ -1737,7 +1742,7 @@ fn largest_fitting_cuda(
         };
         i128::from(free) - i128::from(weights) - i128::from(charges) >= band
     };
-    crate::family::device_budget::largest_fitting(requested, sketch::CONTEXT_SEARCH_STEP, &fits)
+    crate::family::device_budget::largest_fitting(requested, CONTEXT_SEARCH_STEP, &fits)
 }
 
 #[cfg(test)]
@@ -2375,6 +2380,7 @@ mod tests {
 
     #[test]
     fn largest_fitting_search_is_none_when_nothing_fits() {
+        use crate::family::admission_sketch::PREFILL_PART_CHARGE_BYTES;
         use crate::family::qwen36::admission_sketch;
         // A paper demand proportional to context, as the real one is.
         let demand = |context: u32| {
@@ -2391,7 +2397,7 @@ mod tests {
         let free = admission_sketch::RUNTIME_OVERHEAD_FLOOR_BYTES
             + admission_sketch::FIXED_ADMISSION_MARGIN_BYTES as u64
             + admission_sketch::PREFILL_SPARE_MIN_BYTES as u64
-            + admission_sketch::PREFILL_PART_CHARGE_BYTES as u64
+            + PREFILL_PART_CHARGE_BYTES as u64
             + admission_sketch::ADMISSION_UNCERTAINTY_BAND_BYTES
             + 10 * 1024 * 1024;
         let got = super::largest_fitting_cuda(free, 0, &demand, 1_048_576);
