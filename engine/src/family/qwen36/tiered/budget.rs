@@ -30,7 +30,7 @@ pub struct VramBudget {
     pub desktop_reserve: u64,
 }
 
-pub use crate::family::device_budget::KvPlan;
+use crate::family::device_budget::KvPlan;
 
 /// The expert geometry: one expert size shared by every MoE layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
