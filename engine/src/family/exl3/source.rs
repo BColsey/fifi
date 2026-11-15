@@ -8,7 +8,11 @@
 //! `DenseSpec` and its shape refusal live here because every family's dense
 //! EXL3 upload checks the same role-rows-k contract.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use crate::family::exl3_pack::Root;
+use crate::family::exl3_pack::{CoverageVerdict, Visit, coverage_verdict};
 use crate::family::exl3_tensors::{effective_norm_bytes, f32_le_bytes, norm_layout, widen_f32};
 use crate::{
     EngError,
@@ -56,6 +60,9 @@ pub(in crate::family) struct PackReader<'a> {
     pub(in crate::family) checkpoint: &'a Checkpoint,
     reserve: Reserve,
     root: Root,
+    /// The pack tensor names this reader has read, for the load's coverage check. A load is
+    /// single-threaded, so the interior mutability is unshared.
+    reads: RefCell<BTreeSet<String>>,
 }
 
 impl<'a> PackReader<'a> {
@@ -69,7 +76,31 @@ impl<'a> PackReader<'a> {
             checkpoint,
             reserve,
             root: Root::Layers,
+            reads: RefCell::new(BTreeSet::new()),
         }
+    }
+
+    fn record_read(&self, name: &str) {
+        self.reads.borrow_mut().insert(name.to_owned());
+    }
+
+    /// Proves this reader's coverage against the recording walk's `visits`, naming `pack` in
+    /// the refusal and the report: a read the walk never stood for refuses the load (the walk
+    /// and the reader have drifted, or the pack is not what the walk checked); the visits no
+    /// read touched are reported on stderr, because extra tensors are a property of the pack,
+    /// not a defect of the load. The words come from [`coverage_verdict`], pinned by a host
+    /// test.
+    pub(in crate::family) fn check_coverage(
+        &self,
+        visits: &[Visit],
+        pack: &str,
+    ) -> Result<(), EngError> {
+        let reads = self.reads.borrow();
+        let verdict: CoverageVerdict = coverage_verdict(&reads, visits, pack);
+        if let Some(report) = verdict.report {
+            eprintln!("{report}");
+        }
+        verdict.result
     }
 
     /// Reads the layers from `root` instead of the model's own: the MTP head's block.
@@ -97,6 +128,11 @@ impl<'a> PackReader<'a> {
             .checkpoint
             .source
             .read_selected(&keys, MATRIX_READ_LIMIT)?;
+        for key in keys {
+            if selected.tensor(key).is_some() {
+                self.record_read(key);
+            }
+        }
         Matrix::load(&selected, prefix, &self.checkpoint.config)
     }
 
@@ -108,6 +144,7 @@ impl<'a> PackReader<'a> {
                 "EXL3 source: {name} is stored as {stored:?}, expected {shape:?}"
             )));
         }
+        self.record_read(name);
         let values = shape.iter().map(|&dim| u64::from(dim)).product::<u64>();
         let budget = values.saturating_mul(dtype.byte_width());
         let selected = self.checkpoint.source.read_selected(&[name], budget)?;
@@ -180,6 +217,7 @@ impl<'a> PackReader<'a> {
         let output_len = norm_layout(dtype, &shape, values)?;
         let budget = u64::try_from(output_len)
             .map_err(|_| EngError::MemoryPlan("EXL3 norm read budget overflow".into()))?;
+        self.record_read(source);
         let selected = self.checkpoint.source.read_selected(&[source], budget)?;
         let tensor = selected.tensor(source).ok_or_else(|| {
             EngError::Checkpoint(format!("EXL3 attention source: missing tensor {source}"))

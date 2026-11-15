@@ -15,7 +15,7 @@ use crate::{
 };
 
 use crate::family::exl3_pack::{
-    EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root,
+    EMBED_NAME, HEAD_PREFIX, Inspector, MoeBlock, NORM_NAME, PackReport, Root, Visit,
 };
 #[cfg(test)]
 use crate::family::exl3_pack::{
@@ -57,7 +57,16 @@ pub(super) fn inspect_pack_split(
     source: &StreamedCheckpoint,
     shape: &HostShape,
 ) -> Result<PackReport, EngError> {
-    let mut walk = Inspector::new(source, Root::Layers);
+    Ok(inspect_pack_split_visits(source, shape)?.0)
+}
+
+/// The pack report with the walk's recorded visits, for the load's coverage check: the
+/// loader reads exactly what a recording walk stood for, or refuses.
+pub(super) fn inspect_pack_split_visits(
+    source: &StreamedCheckpoint,
+    shape: &HostShape,
+) -> Result<(PackReport, Vec<Visit>), EngError> {
+    let mut walk = Inspector::new(source, Root::Layers).recording();
     let dim = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     let h = shape.hidden;
     // The step gathers rows from the table as BF16 (`exl3_global`); another width would load
@@ -88,7 +97,7 @@ pub(super) fn inspect_pack_split(
         }
         walk.moe(layer, shape)?;
     }
-    walk.report()
+    walk.report_with_visits()
 }
 
 impl Inspector<'_> {

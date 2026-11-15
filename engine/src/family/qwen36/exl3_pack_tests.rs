@@ -1,7 +1,6 @@
 //! Header-only inspection of EXL3 packs: a synthetic pack of the Qwen3.6 layout at small widths,
 //! built from the same shape arithmetic with its byte total counted independently, and the
-//! refusals a changed header must raise. The real packs are checked by the ignored test at the
-//! end.
+//! refusals a changed header must raise. The real packs are checked by the survey test.
 
 use std::path::Path;
 
@@ -337,6 +336,176 @@ fn the_real_pack_matches_the_model_and_its_independent_byte_sum() {
         .parse()
         .unwrap();
     assert_eq!(report.device_bytes, expected);
+}
+
+/// The coverage split: a read a visit stands for is neither unrecorded nor unread, a matrix
+/// visit stands for its component suffixes (including the legacy ones the reader must refuse),
+/// and a visit no read touches is listed unread.
+#[test]
+fn coverage_splits_reads_from_visits() {
+    use crate::family::exl3_pack::{Visit, VisitKind, coverage};
+    use std::collections::BTreeSet;
+
+    let visits = vec![
+        Visit {
+            name: "model.norm.weight".into(),
+            kind: VisitKind::Plain {
+                dtype: crate::tensor::Dtype::F16,
+                shape: vec![128],
+                keep: false,
+            },
+            bytes: 512,
+        },
+        Visit {
+            name: "lm_head".into(),
+            kind: VisitKind::Matrix {
+                k: 128,
+                n: 128,
+                rate: 4,
+            },
+            bytes: 4096,
+        },
+    ];
+    let reads = BTreeSet::from([
+        "model.norm.weight".to_owned(),
+        "lm_head.trellis".to_owned(),
+        "lm_head.mcg".to_owned(),
+    ]);
+    let (unrecorded, unread) = coverage(&reads, &visits);
+    assert!(unrecorded.is_empty(), "covered reads: {unrecorded:?}");
+    assert!(unread.is_empty(), "both visits touched: {unread:?}");
+
+    let legacy = BTreeSet::from(["lm_head.su".to_owned()]);
+    let (unrecorded, _unread) = coverage(&legacy, &visits);
+    assert!(
+        unrecorded.is_empty(),
+        "a legacy component is the matrix visit's: {unrecorded:?}"
+    );
+
+    let stray = BTreeSet::from(["model.vision.patch.weight".to_owned()]);
+    let (unrecorded, unread) = coverage(&stray, &visits);
+    assert_eq!(unrecorded, vec!["model.vision.patch.weight".to_owned()]);
+    assert_eq!(
+        unread,
+        vec!["model.norm.weight".to_owned(), "lm_head".to_owned()],
+        "untouched visits listed"
+    );
+}
+
+/// The refusal and the report the served load shows, pinned as pure functions of the name
+/// sets: [`coverage_verdict`] builds both without a projector, so the words of the check are
+/// testable on the host, capped at twenty names plus a count and naming the pack.
+#[test]
+fn coverage_verdict_words_refuse_report_and_cap() {
+    use std::collections::BTreeSet;
+
+    use crate::family::exl3_pack::{Visit, VisitKind, coverage_verdict};
+
+    let visits = vec![
+        Visit {
+            name: "model.norm.weight".into(),
+            kind: VisitKind::Plain {
+                dtype: crate::tensor::Dtype::F16,
+                shape: vec![128],
+                keep: false,
+            },
+            bytes: 256,
+        },
+        Visit {
+            name: "lm_head".into(),
+            kind: VisitKind::Matrix {
+                k: 128,
+                n: 128,
+                rate: 4,
+            },
+            bytes: 4096,
+        },
+    ];
+
+    // A clean load: every read stood for a visit, every visit touched, nothing printed.
+    let reads = BTreeSet::from(["model.norm.weight".to_owned(), "lm_head.svh".to_owned()]);
+    let verdict = coverage_verdict(&reads, &visits, "/packs/4.00bpw");
+    verdict.result.expect("covered load");
+    assert!(
+        verdict.report.is_none(),
+        "nothing to report: {:?}",
+        verdict.report
+    );
+
+    // Unrecorded reads refuse, capped at twenty names plus the count, naming the pack.
+    // The stray names are zero-padded so the set's sorted order is the numeric order and the
+    // one name left out is known.
+    let mut drifted = BTreeSet::new();
+    for index in 0..21 {
+        drifted.insert(format!("stray.{index:02}"));
+    }
+    let verdict = coverage_verdict(&drifted, &visits, "/packs/4.00bpw");
+    let error = format!("{:?}", verdict.result.expect_err("21 stray reads"));
+    assert!(error.contains("/packs/4.00bpw"), "names the pack: {error}");
+    assert!(error.contains("21 read tensors"), "counts them: {error}");
+    assert!(error.contains("stray.00"), "shows the first: {error}");
+    assert!(error.contains("(+1)"), "caps at twenty: {error}");
+    assert!(
+        !error.contains("stray.20"),
+        "the 21st is only counted: {error}"
+    );
+    assert_eq!(
+        verdict.report.as_deref(),
+        Some(
+            "EXL3 load of /packs/4.00bpw: 2 recorded tensors left unread: \
+             model.norm.weight, lm_head"
+        ),
+        "both visits untouched, reported in visit order"
+    );
+
+    // No visits is itself a refusal: a non-recording walk must not feed the check.
+    let verdict = coverage_verdict(&reads, &[], "/packs/4.00bpw");
+    let error = format!("{:?}", verdict.result.expect_err("no visits"));
+    assert!(error.contains("no recorded visits"), "says so: {error}");
+}
+
+/// The survey over every local Qwen3.6 EXL3 pack: `Q36_EXL3_PACK_DIRS` is a colon-separated
+/// list of pack directories. The walk refuses a missing tensor, so a pack that walks proves
+/// every visited name exists; the listed remainder is index-routed tensors no visit stands
+/// for (the vision tower and the mtp head), a property of the pack the load's coverage check
+/// never reports. That a load's reads stand for visits — the check's own property — is
+/// established by loading the pack, not by this survey. Host-only: no projector, no device.
+#[test]
+#[ignore = "reads the headers of every pack in Q36_EXL3_PACK_DIRS"]
+fn every_local_packs_tensors_are_walked_or_listed() {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    let dirs: Vec<PathBuf> = std::env::var_os("Q36_EXL3_PACK_DIRS")
+        .expect("Q36_EXL3_PACK_DIRS")
+        .to_string_lossy()
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    assert!(!dirs.is_empty(), "at least one pack directory");
+    for dir in &dirs {
+        let checkpoint = Checkpoint::open(dir).expect("open the pack");
+        let shape = HostShape::from_spec(&QWEN3_6_35B_A3B, 64).unwrap();
+        let (_, visits) = super::exl3_pack::inspect_pack_split_visits(&checkpoint.source, &shape)
+            .unwrap_or_else(|error| panic!("{}: the walk refuses: {error:?}", dir.display()));
+        let mut stood_for = BTreeSet::new();
+        for visit in &visits {
+            stood_for.extend(visit.tensor_names());
+        }
+        let unread: Vec<&str> = checkpoint
+            .source
+            .names()
+            .filter(|name| !stood_for.contains(*name))
+            .collect();
+        println!(
+            "{}: {} visits, {} index tensors no visit stands for: {:?}",
+            dir.display(),
+            visits.len(),
+            unread.len(),
+            unread
+        );
+    }
 }
 
 /// The planning seam of [`exl3_plan`]: a directory without a pack's metadata is refused with

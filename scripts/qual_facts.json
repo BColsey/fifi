@@ -16,8 +16,8 @@
   "targets": {
     "lib": {
       "path": "src/lib.rs",
-      "test_fns": 6902,
-      "ignored": 618,
+      "test_fns": 6905,
+      "ignored": 619,
       "env_gates": [
         "CUDA_MODULE_LOADING",
         "DEFAULT_ON_CHILD",
@@ -312,6 +312,7 @@
         "Q36_CUDA_REFERENCE",
         "Q36_CUDA_STATE_ONLY_PREFIX",
         "Q36_CUDA_TOKENIZER_DIR",
+        "Q36_EXL3_PACK_DIRS",
         "Q36_FLASH_DELTA",
         "Q36_FLASH_PREFILL",
         "Q36_FORMAT_GATE",
