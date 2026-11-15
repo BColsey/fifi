@@ -133,6 +133,24 @@ pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
 /// registered. Process-wide, read once, strict.
 pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 
+/// The served-kernel profile one family's context registers at open: the single-row default
+/// of the dense projections, the id-indexed default of the routed experts (`None` leaves the
+/// launch to the environment's switches, the state of a family that never chose one), and the
+/// odd-rate and fused-input kernels. [`CudaContext::register_served_kernels`] applies the
+/// whole profile through one path, so a family start cannot register a subset or run the
+/// switch check before its defaults are in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServedKernels {
+    /// The wide-launch default of the dense projections.
+    pub(crate) single_row: SingleRow,
+    /// The id-indexed launch default; `None` keeps the environment's switches in charge.
+    pub(crate) indexed: Option<IndexedOptions>,
+    /// Whether the one-tile wide launches run the compile-time odd-rate body of book 2.
+    pub(crate) odd_rates: bool,
+    /// Whether the grouped launches fuse the input rotation into the projection kernel.
+    pub(crate) fused_in: bool,
+}
+
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
 /// book 2 ([`DP4A_VAR`]), one launch of up to 20 pairs ([`INDEXED_PAIRS_VAR`]) and the pipelined
 /// tile loop ([`PIPE_VAR`]). All off is the default launch, which stays the fallback. Every byte
@@ -545,6 +563,20 @@ impl CudaContext {
     /// unaffected.
     pub(crate) fn set_indexed_default(&self, options: IndexedOptions) {
         self.exl3_indexed_default.set(Some(options));
+    }
+
+    /// Applies a family's [`ServedKernels`] profile: the single-row and id-indexed defaults,
+    /// the odd-rate and fused-input kernel switches, then the launch-switch check. Every
+    /// family start registers through this one path - defaults before the check - so the
+    /// setter order and the check placement live in one place.
+    pub(crate) fn register_served_kernels(&self, profile: ServedKernels) -> Result<(), EngError> {
+        self.set_single_row_default(profile.single_row);
+        if let Some(indexed) = profile.indexed {
+            self.set_indexed_default(indexed);
+        }
+        self.set_odd_rate_kernel(profile.odd_rates);
+        self.set_fused_in_kernel(profile.fused_in);
+        self.check_single_gather()
     }
 
     /// Sets the options of this context's id-indexed launches (test builds only); `None` returns
@@ -1956,6 +1988,8 @@ mod jobs_tests;
 mod linear_tests;
 #[cfg(test)]
 mod rows_wide1_tests;
+#[cfg(test)]
+mod served_order_tests;
 #[cfg(test)]
 mod single_gather_tests;
 #[cfg(test)]

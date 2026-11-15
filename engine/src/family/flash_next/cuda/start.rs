@@ -74,7 +74,7 @@ use crate::{
     },
     kernels::cuda::{
         CudaContext, DeviceBuffer,
-        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW},
+        resident::exl3::{IndexedOptions, SERVED_SINGLE_ROW, ServedKernels},
     },
     sched::worker::{Engine, ReadyNote, Stages, spawn_engine_noted},
     tokenizer::TokenizerBundle,
@@ -141,9 +141,6 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 /// register their own; a bad launch switch or an option the kernel cannot combine with is refused
 /// here, before any weight is uploaded.
 fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
-    ctx.set_single_row_default(SERVED_SINGLE_ROW);
-    ctx.set_indexed_default(SERVED_INDEXED);
-    ctx.set_odd_rate_kernel(true);
     // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
     // runs inside the projection kernel, two launches per set instead of three, bit-identical
     // bytes (64/64 receipt logits match). Isolated it saves ~1.27 us per launch, but measured on
@@ -163,8 +160,12 @@ fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
             )));
         }
     };
-    ctx.set_fused_in_kernel(fused_in);
-    ctx.check_single_gather()?;
+    ctx.register_served_kernels(ServedKernels {
+        single_row: SERVED_SINGLE_ROW,
+        indexed: Some(SERVED_INDEXED),
+        odd_rates: true,
+        fused_in,
+    })?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
         ctx.single_row_kernel_name()?,
@@ -1092,29 +1093,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// The served kernels are registered and checked before the pack is opened and before any
-    /// stream or weight exists, in the order set default, set options, check.
+    /// The served kernels are registered through the shared applier after the family's fused
+    /// switch is parsed, and before the pack is opened and before any stream or weight exists.
     #[test]
     fn the_served_kernels_are_registered_and_checked_before_the_first_upload() {
         let source = include_str!("start.rs");
         let register = &source[source
             .find("fn register_served_kernels(")
             .expect("register_served_kernels")..];
-        let single = register
-            .find("ctx.set_single_row_default(")
-            .expect("the single-row default");
-        let indexed = register
-            .find("ctx.set_indexed_default(")
-            .expect("the indexed default");
-        let odd = register
-            .find("ctx.set_odd_rate_kernel(true)")
-            .expect("the odd-rate kernel switch");
-        let check = register
-            .find("ctx.check_single_gather()?")
-            .expect("the switch check");
+        let fused = register
+            .find("let fused_in = match std::env::var(")
+            .expect("the fused-input switch parse");
+        let applier = register
+            .find("ctx.register_served_kernels(ServedKernels {")
+            .expect("the shared applier call");
         assert!(
-            single < indexed && indexed < odd && odd < check,
-            "the defaults must be registered before check_single_gather()"
+            fused < applier,
+            "the family switch parses before the profile is applied"
         );
         let build = &source[source
             .find("pub(super) fn build_driver(")
