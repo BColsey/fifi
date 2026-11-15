@@ -2,8 +2,8 @@
 //! They load the pinned 20 GB model, so they are ignored by default and run by name. The rows cover
 //! a clean chunk, continuation at the committed rows, an injected router fault, a stale prefill
 //! word, the token ids of the chunk rows, an unadmitted session and the worker's pieces.
+use crate::family::graph_state::book::Health;
 
-use super::book::Health;
 use super::common_tests::{dims as step_dims, inventory};
 use super::dims::{KvMode, StepOptions};
 use super::prefill_driver::PrefillBudget;

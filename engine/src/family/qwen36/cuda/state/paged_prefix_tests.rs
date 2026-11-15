@@ -1,8 +1,8 @@
 //! Native state-only prefix roundtrip at a committed nonzero position, without a model.
+use crate::family::graph_state::book::Health;
 use std::cell::RefMut;
 
 use super::super::{
-    book::Health,
     common_tests::dims,
     dims::{KvMode, StepDims, StepOptions},
     paging_cow_tests::{read_page, write_page},

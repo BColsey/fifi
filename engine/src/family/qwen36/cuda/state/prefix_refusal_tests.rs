@@ -1,6 +1,5 @@
 //! Prefix admission and validation must refuse before state mutation or native enqueue.
 use super::super::{
-    book::Health,
     common_tests::dims,
     dims::KvMode,
     paging_cow_tests::{read_loaded, write_loaded},
@@ -12,6 +11,7 @@ use super::{
         delta_matches, fill_delta, options, pages, seeded_state, snapshot_budget,
     },
 };
+use crate::family::graph_state::book::Health;
 use crate::{
     EngError,
     kernels::cuda::{CapturePlan, CudaContext, device_present},

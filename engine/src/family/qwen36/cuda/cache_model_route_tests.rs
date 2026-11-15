@@ -1,12 +1,12 @@
 // Synthetic session routing, not the approved real-VRAM-pressure model acceptance.
 mod cache_routes {
+use crate::family::graph_state::book::Health;
     use super::{counts, options};
     use crate::{
         EngError,
         family::{
             project::cuda::WeightLayout,
             qwen36::cuda::{
-                book::Health,
                 common_tests::dims,
                 dims::KvMode,
                 paging_pipeline_tests::{floats, inputs, plane, query_and_gate, read, upload},

@@ -1,6 +1,5 @@
 //! Paged state construction chooses storage before any full resident KV allocation.
 use super::{
-    book::Health,
     common_tests::dims,
     dims::{KvMode, StepOptions},
     paging_pipeline_tests::read,
@@ -8,6 +7,7 @@ use super::{
     state::ResidentState,
     state_layout::{Plane, StateLayout, Word},
 };
+use crate::family::graph_state::book::Health;
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,

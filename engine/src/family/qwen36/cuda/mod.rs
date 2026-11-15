@@ -10,7 +10,6 @@
 
 #[cfg(all(test, feature = "research-activation"))]
 mod activation_device_tests;
-pub(in crate::family) use crate::family::graph_state::book;
 mod card_attn;
 #[cfg(test)]
 mod card_attn_device_tests;
