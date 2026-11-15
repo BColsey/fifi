@@ -133,17 +133,20 @@ pub(crate) const PIPE_VAR: &str = "FIFI_EXL3_PIPELINE";
 /// registered. Process-wide, read once, strict.
 pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 
-/// The served-kernel profile one family's context registers at open: the single-row default
+/// The served-kernel profile a family start registers at open: the single-row default
 /// of the dense projections, the id-indexed default of the routed experts (`None` leaves the
 /// launch to the environment's switches, the state of a family that never chose one), and the
 /// odd-rate and fused-input kernels. [`CudaContext::register_served_kernels`] applies the
 /// whole profile through one path, so a family start cannot register a subset or run the
-/// switch check before its defaults are in.
+/// switch check before its defaults are in. `None` and `false` are values, not resets of the
+/// context: a `None` leaves any default an earlier registration set on the same context
+/// standing, and a `false` sets its switch off over an earlier `true`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ServedKernels {
-    /// The wide-launch default of the dense projections.
+    /// The default of the dense projections' one-tile wide launches.
     pub(crate) single_row: SingleRow,
-    /// The id-indexed launch default; `None` keeps the environment's switches in charge.
+    /// The id-indexed launch default; `None` keeps the environment's switches in charge and
+    /// leaves any default an earlier registration set on the same context in place.
     pub(crate) indexed: Option<IndexedOptions>,
     /// Whether the one-tile wide launches run the compile-time odd-rate body of book 2.
     pub(crate) odd_rates: bool,
@@ -540,19 +543,21 @@ impl CudaContext {
     }
 
     /// Lets the one-tile wide launches of this context run the compile-time rate 10 and rate 6 body
-    /// of book 2 where every group of a launch allows it. Set by the Flash-Next start; a context
-    /// that never calls it (Qwen3.6, Flint) runs the kernels it ran before. The body takes the DP4A
-    /// decode of book 2 when the DP4A option is on for the context. Every byte written is the same
-    /// either way.
+    /// of book 2 where every group of a launch allows it. Set by the Flash-Next start and by
+    /// family starts through their [`ServedKernels`] profile (Qwen3.6 calls it with `false`
+    /// through the applier); a context that never calls it runs the kernels it ran before. The
+    /// body takes the DP4A decode of book 2 when the DP4A option is on for the context. Every
+    /// byte written is the same either way.
     pub(crate) fn set_odd_rate_kernel(&self, on: bool) {
         self.exl3_odd_rates.set(on);
     }
 
     /// Lets the grouped launches of this context fuse the input rotation into the projection
-    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start;
-    /// a context that never calls it (Qwen3.6, Flint) runs the launches it ran before. Calls the
-    /// fused kernel cannot take fall back to the separate launches. Every byte written is the
-    /// same either way.
+    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start
+    /// and by family starts through their [`ServedKernels`] profile (Qwen3.6 calls it with
+    /// `false` through the applier); a context that never calls it runs the launches it ran
+    /// before. Calls the fused kernel cannot take fall back to the separate launches. Every
+    /// byte written is the same either way.
     pub(crate) fn set_fused_in_kernel(&self, on: bool) {
         self.exl3_fused_in.set(on);
     }
@@ -566,9 +571,9 @@ impl CudaContext {
     }
 
     /// Applies a family's [`ServedKernels`] profile: the single-row and id-indexed defaults,
-    /// the odd-rate and fused-input kernel switches, then the launch-switch check. Every
-    /// family start registers through this one path - defaults before the check - so the
-    /// setter order and the check placement live in one place.
+    /// the odd-rate and fused-input kernel switches, then the launch-switch check. A family
+    /// start registers through this one path - defaults before the check - so the setter order
+    /// and the check placement live in one place.
     pub(crate) fn register_served_kernels(&self, profile: ServedKernels) -> Result<(), EngError> {
         self.set_single_row_default(profile.single_row);
         if let Some(indexed) = profile.indexed {

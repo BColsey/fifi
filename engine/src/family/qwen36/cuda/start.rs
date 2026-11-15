@@ -1234,8 +1234,8 @@ fn make(
             let began = Instant::now();
             // A served EXL3 pack runs its projections on the wide kernel unless the operator names
             // another in FIFI_EXL3_SINGLE_GATHER (`off` is the shuffle kernel); bit-identical output.
-            // The shared applier also runs the launch-switch check this start never ran, so a bad
-            // switch combination now refuses the open instead of the first routed launch.
+            // The shared applier runs the launch-switch check the step build also runs, so a bad
+            // switch combination refuses the open before the weight load instead of at step build.
             projector.context().register_served_kernels(ServedKernels {
                 single_row: SERVED_SINGLE_ROW,
                 indexed: None,
