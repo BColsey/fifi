@@ -1240,7 +1240,6 @@ fn make(
                 single_row: SERVED_SINGLE_ROW,
                 indexed: None,
                 odd_rates: false,
-                fused_in: false,
             })?;
             let mut banked_inner: Option<(ExpertStore, usize, usize)> = None;
             let device = match load_exl3_dir_decided(

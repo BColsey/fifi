@@ -139,39 +139,16 @@ const SERVED_INDEXED: IndexedOptions = IndexedOptions {
 /// register their own; a bad launch switch or an option the kernel cannot combine with is refused
 /// here, before any weight is uploaded.
 fn register_served_kernels(ctx: &CudaContext) -> Result<(), EngError> {
-    // The fused-input launch of the dense projections (exl3_decode_fused.h): the input rotation
-    // runs inside the projection kernel, two launches per set instead of three, bit-identical
-    // bytes (64/64 receipt logits match). Isolated it saves ~1.27 us per launch, but measured on
-    // the full 64-step decode it REGRESSES the step: median 39.25 vs 38.28 ms and paired mean
-    // +2.25 ms (steps 9-64 of the adjacent off/on pair; REPORT.md cites the artifacts) - the
-    // larger shared footprint and the per-column-block rotation recompute reduce the overlap the
-    // 253 small launches had with the attention and expert kernels. Kept off for re-measuring
-    // after the launch floor changes (e.g. graph capture); `FIFI_FLASH_NEXT_FUSED_IN=1` opts in,
-    // any other non-empty value is refused, never a silent fallback. Read once here, per process.
-    let fused_in = match std::env::var("FIFI_FLASH_NEXT_FUSED_IN") {
-        Err(_) => false,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v.is_empty() || v == "0" => false,
-        Ok(v) => {
-            return Err(EngError::BadRequest(format!(
-                "FIFI_FLASH_NEXT_FUSED_IN={v}: only 0 and 1 are valid"
-            )));
-        }
-    };
     ctx.register_served_kernels(ServedKernels {
         single_row: SERVED_SINGLE_ROW,
         indexed: Some(SERVED_INDEXED),
         odd_rates: true,
-        fused_in,
     })?;
     eprintln!(
         "flash-next cuda: single-row kernel {}{}",
         ctx.single_row_kernel_name()?,
         ctx.single_gather_suffix()
     );
-    if fused_in {
-        eprintln!("flash-next cuda: fused-input launch on");
-    }
     Ok(())
 }
 
@@ -1091,24 +1068,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// The served kernels are registered through the shared applier after the family's fused
-    /// switch is parsed, and before the pack is opened and before any stream or weight exists.
+    /// The served kernels are registered through the shared applier, before the pack is opened
+    /// and before any stream or weight exists.
     #[test]
     fn the_served_kernels_are_registered_and_checked_before_the_first_upload() {
         let source = include_str!("start.rs");
-        let register = &source[source
-            .find("fn register_served_kernels(")
-            .expect("register_served_kernels")..];
-        let fused = register
-            .find("let fused_in = match std::env::var(")
-            .expect("the fused-input switch parse");
-        let applier = register
-            .find("ctx.register_served_kernels(ServedKernels {")
-            .expect("the shared applier call");
-        assert!(
-            fused < applier,
-            "the family switch parses before the profile is applied"
-        );
         let build = &source[source
             .find("pub(super) fn build_driver(")
             .expect("build_driver")..];

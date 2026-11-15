@@ -136,7 +136,7 @@ pub(crate) const TABLE_VAR: &str = "FIFI_EXL3_TABLE";
 /// The served-kernel profile a family start registers at open: the single-row default
 /// of the dense projections, the id-indexed default of the routed experts (`None` leaves the
 /// launch to the environment's switches, the state of a family that never chose one), and the
-/// odd-rate and fused-input kernels. [`CudaContext::register_served_kernels`] applies the
+/// odd-rate kernels. [`CudaContext::register_served_kernels`] applies the
 /// whole profile through one path, so a family start cannot register a subset or run the
 /// switch check before its defaults are in. `None` and `false` are values, not resets of the
 /// context: a `None` leaves any default an earlier registration set on the same context
@@ -150,8 +150,6 @@ pub(crate) struct ServedKernels {
     pub(crate) indexed: Option<IndexedOptions>,
     /// Whether the one-tile wide launches run the compile-time odd-rate body of book 2.
     pub(crate) odd_rates: bool,
-    /// Whether the grouped launches fuse the input rotation into the projection kernel.
-    pub(crate) fused_in: bool,
 }
 
 /// The opt-in options of the id-indexed launch, each selected on its own: the DP4A decode of
@@ -552,16 +550,6 @@ impl CudaContext {
         self.exl3_odd_rates.set(on);
     }
 
-    /// Lets the grouped launches of this context fuse the input rotation into the projection
-    /// kernel (`exl3_decode_fused.h`) where every call allows it. Set by the Flash-Next start
-    /// and by family starts through their [`ServedKernels`] profile (Qwen3.6 calls it with
-    /// `false` through the applier); a context that never calls it runs the launches it ran
-    /// before. Calls the fused kernel cannot take fall back to the separate launches. Every
-    /// byte written is the same either way.
-    pub(crate) fn set_fused_in_kernel(&self, on: bool) {
-        self.exl3_fused_in.set(on);
-    }
-
     /// Registers the id-indexed options an unset [`DP4A_VAR`] or [`INDEXED_PAIRS_VAR`] leaves to
     /// this context: set by the session that owns it, like [`Self::set_single_row_default`], so a
     /// variable that is set still wins for its own option and another context in the process is
@@ -571,7 +559,7 @@ impl CudaContext {
     }
 
     /// Applies a family's [`ServedKernels`] profile: the single-row and id-indexed defaults,
-    /// the odd-rate and fused-input kernel switches, then the launch-switch check. A family
+    /// the odd-rate kernel switch, then the launch-switch check. A family
     /// start registers through this one path - defaults before the check - so the setter order
     /// and the check placement live in one place.
     pub(crate) fn register_served_kernels(&self, profile: ServedKernels) -> Result<(), EngError> {
@@ -580,7 +568,6 @@ impl CudaContext {
             self.set_indexed_default(indexed);
         }
         self.set_odd_rate_kernel(profile.odd_rates);
-        self.set_fused_in_kernel(profile.fused_in);
         self.check_single_gather()
     }
 
@@ -1383,36 +1370,6 @@ impl CudaContext {
         self.launch_on(stream, |s| ffi::grouped_wide(s, &raw, cols, odd))
     }
 
-    /// The grouped launch with the input rotation fused into the projection kernel
-    /// ([`exl3_decode_fused.h`](crate::kernels::cuda::native::resident)): two launches per group
-    /// set instead of three, no `xh` round trip. Every call must be one row, book 2 at rate 10
-    /// or 6, `n` a multiple of 16 and `k` of 512; the bytes written equal
-    /// [`Self::exl3_grouped_wide`] at `cols` 1.
-    pub(crate) fn exl3_grouped_fin(
-        &self,
-        stream: &DeviceStream,
-        calls: &[Exl3LinearCall<'_>],
-    ) -> Result<(), EngError> {
-        if calls.iter().any(|call| {
-            call.rows != 1
-                || !call.n.is_multiple_of(16)
-                || !call.k.is_multiple_of(512)
-                || call.book != Codebook::Mul1
-                || !matches!(call.bits_twice, 10 | 6)
-        }) {
-            return Err(EngError::BadRequest(
-                "EXL3 fused-input launch: every call must be one row of book 2 at rate 10 or 6, \
-                 n a multiple of 16 and k of 512"
-                    .to_string(),
-            ));
-        }
-        let raw = self.grouped_raw(calls)?;
-        #[cfg(test)]
-        self.note_exl3_launch(SingleRow::Wide(1));
-        let dp4a = self.exl3_indexed_options()?.dp4a;
-        self.launch_on(stream, |s| ffi::grouped_fin(s, &raw, dp4a))
-    }
-
     /// The grouped launch of the Qwen3.6 MoE block: the gather kernel, or the wide kernel when
     /// `FIFI_EXL3_SINGLE_GATHER` names one (`wide1`, `wide2`, `wide4`) and every call's `n` is a
     /// multiple of its tile span. Both write the same bytes.
@@ -1421,19 +1378,6 @@ impl CudaContext {
         stream: &DeviceStream,
         calls: &[Exl3LinearCall<'_>],
     ) -> Result<(), EngError> {
-        // The fused-input launch replaces the separate input rotation where every call allows
-        // it; it notes its own launch, so this path must not note again.
-        if self.exl3_fused_in.get()
-            && calls.iter().all(|call| {
-                call.rows == 1
-                    && call.n.is_multiple_of(16)
-                    && call.k.is_multiple_of(512)
-                    && call.book == Codebook::Mul1
-                    && matches!(call.bits_twice, 10 | 6)
-            })
-        {
-            return self.exl3_grouped_fin(stream, calls);
-        }
         let kernel = grouped_kernel_for(self.single_row_setting()?, calls.iter().map(|c| c.n));
         #[cfg(test)]
         self.note_exl3_launch(match kernel {
