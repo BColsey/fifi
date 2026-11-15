@@ -8,9 +8,10 @@ use super::super::{
     paging_cow_tests::{read_page, write_page},
     paging_plan::PagingPlan,
     paging_store::PagedKv,
-    state_layout::{StateLayout, Word},
+    state_layout::StateLayout,
 };
 use super::{KvStorage, ResidentState};
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::project::cuda::WeightLayout,

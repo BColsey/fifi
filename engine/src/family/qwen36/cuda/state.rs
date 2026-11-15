@@ -26,8 +26,9 @@ use super::{
         PagedKv,
         device_first::{DeviceCachePlan, DeviceFirstKv},
     },
-    state_layout::{Plane, StateLayout, Word},
+    state_layout::{Plane, StateLayout},
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::{AttentionKind, project::cuda::WeightLayout},

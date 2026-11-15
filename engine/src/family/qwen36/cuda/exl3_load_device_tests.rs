@@ -84,7 +84,7 @@ fn tensor_of(checkpoint: &Checkpoint, name: &str) -> Tensor {
 pub(super) fn values_of(checkpoint: &Checkpoint, name: &str) -> Vec<f32> {
     let tensor = tensor_of(checkpoint, name);
     let count = tensor.shape().iter().map(|&d| d as usize).product();
-    crate::family::qwen36::exl3_tensors::widen_f32(&tensor, count, name).unwrap()
+    crate::family::exl3_tensors::widen_f32(&tensor, count, name).unwrap()
 }
 
 fn raw_values(projector: &CudaProjector, weights: &CudaWeights, name: &str) -> Vec<f32> {
@@ -456,7 +456,7 @@ fn real_pack_loads_every_layer_with_the_shapes_and_bytes_of_the_step() {
     let banks = check_shapes(&weights, &table, &geometry);
 
     let checkpoint = Checkpoint::open(dir).unwrap();
-    let heads = crate::family::qwen36::exl3_tensors::tiled_head_order(16, 32).unwrap();
+    let heads = crate::family::exl3_tensors::tiled_head_order(16, 32).unwrap();
     let pack = Pack {
         projector: &projector,
         checkpoint: &checkpoint,

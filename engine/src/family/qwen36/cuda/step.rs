@@ -72,7 +72,7 @@ use super::{
     run_report::{CaptureOutcome, HostSyncs, PrefillReport, RunReport, StepKind, StepRecord},
     section_timing::{FineSplit, MarkedGroup, SectionPlan, SectionTimes, section_plan},
     state::{ResidentState, StepField, export::ExportedState},
-    state_layout::{StateLayout, Word},
+    state_layout::StateLayout,
     step_ops::{StepOp, final_resid, resid_in, resid_out, token_ops},
     step_plan::Slot,
     tiered_step::{LayerParts, TieredRuntime},
@@ -80,6 +80,7 @@ use super::{
         Decision, FailureAction, action_for, bad_token_error, decide, entered_after_failed_sync,
     },
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::exl3::bank::Exl3SlotResolver,

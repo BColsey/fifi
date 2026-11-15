@@ -32,9 +32,10 @@ use super::{
     shard::ShardTable,
     sparse_exec::SparseExec,
     state::{ResidentState, StepField},
-    state_layout::{Plane, Word},
+    state_layout::Plane,
     step_plan::{Slot, StepPlan},
 };
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::{

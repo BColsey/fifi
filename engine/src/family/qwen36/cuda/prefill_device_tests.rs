@@ -905,9 +905,9 @@ use super::mixer_weights::LayerWeights;
 use super::prefill::ChunkMoe;
 use super::prefill_plan::Phase;
 use super::state::{ResidentState, StepField};
-use super::state_layout::Word;
 use crate::family::exl3::layer_table::LayerTable;
 use crate::family::gguf_model::Role;
+use crate::family::state_words::Word;
 use crate::kernels::cuda::prefill::attn_prefill::CPF_ATTN_PART_CAP;
 
 const RIG_LAYERS: usize = 5;

@@ -35,9 +35,9 @@ use crate::family::qwen36::cuda::moe::{
     CardMoeOp, ExpertBufs, MoeBuffers, MoeLayerWeights, Packs, moe_sequence_card,
 };
 use crate::family::qwen36::cuda::state::{ResidentState, StepField};
-use crate::family::qwen36::cuda::state_layout::Word;
 use crate::family::qwen36::cuda::step_ops::{final_resid, resid_in, resid_out};
 use crate::family::qwen36::cuda::step_plan::Slot;
+use crate::family::state_words::Word;
 use crate::kernels::cuda::DeviceBuffer;
 use crate::kernels::cuda::DeviceRange;
 use crate::kernels::cuda::NativeWeight;

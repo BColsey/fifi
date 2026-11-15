@@ -2,6 +2,7 @@
 mod cache_routes {
 use crate::family::graph_state::book::Health;
     use super::{counts, options};
+use crate::family::state_words::Word;
     use crate::{
         EngError,
         family::{
@@ -16,7 +17,7 @@ use crate::family::graph_state::book::Health;
                     device_first::{CachedAttention, DeviceCachePlan},
                 },
                 state::{PagedStatePlan, ResidentState, StepField},
-                state_layout::{KvPool, Plane, StateLayout, Word},
+                state_layout::{KvPool, Plane, StateLayout},
             },
         },
         kernels::cuda::{

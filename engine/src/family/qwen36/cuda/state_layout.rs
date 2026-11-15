@@ -397,4 +397,4 @@ impl StateLayout {
     }
 }
 
-pub(in crate::family) use crate::family::state_words::Word;
+use crate::family::state_words::Word;

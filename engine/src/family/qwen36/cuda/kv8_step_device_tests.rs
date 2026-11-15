@@ -22,7 +22,7 @@ use super::native_device_rig::{Rng, assert_finite, device_present, f16 as f16_va
 use super::{
     dims::{KvMode, StepOptions},
     state::{ResidentState, StepField},
-    state_layout::{Plane, Word},
+    state_layout::Plane,
     step::{CaptureConfig, QwenResidentStep},
     step_plan::{KernelScratch, Slot, StepPlan},
 };
@@ -31,6 +31,7 @@ use crate::family::gguf_model::{Role, open_qwen3_6_35b_a3b};
 use crate::family::project::cuda::{
     CudaProjector, CudaWeights, LoadOptions, Reserve, WeightLayout,
 };
+use crate::family::state_words::Word;
 use crate::kernels::cuda::resident::step_params::{OFFSET_POS, StepParams};
 use crate::kernels::cuda::{ArenaTensor, CudaContext, DeviceStream, QuantTensor};
 use crate::weights::GgufType;

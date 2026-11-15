@@ -25,7 +25,7 @@ use super::{
     prefill_plan::{ChunkSlot, EXL3_SLOTS, Phase},
     sparse_exec::SparseExec,
     state::ResidentState,
-    state_layout::{Plane, Word},
+    state_layout::Plane,
     tiered_step::TieredRuntime,
 };
 use crate::family::exl3::launch::{Launch, MoeDims};
@@ -33,6 +33,7 @@ use crate::family::exl3::prefill::Exl3Scratch;
 use crate::family::exl3::shapes::{chunk_combine_shape, routed_swiglu, shared_swiglu};
 use crate::family::project::cuda::WeightLayout;
 use crate::family::spec::AttentionKind;
+use crate::family::state_words::Word;
 use crate::{
     EngError,
     family::gguf_model::Role,

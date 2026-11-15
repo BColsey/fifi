@@ -14,11 +14,11 @@
 use crate::family::exl3::layer_table::LayerTable;
 
 use crate::family::exl3_pack::{Root, layer_name};
-use crate::family::project::cuda::WeightLayout;
-use crate::family::qwen36::exl3_tensors::{
+use crate::family::exl3_tensors::{
     decay_from_log, effective_norm_bytes, f32_le_bytes, norm_layout, permute_blocks,
     tiled_head_order, widen_f32,
 };
+use crate::family::project::cuda::WeightLayout;
 
 use super::mixer_geometry::{DeltaGeometry, DenseSpec, MixerGeometry, RawSpec, check_dense};
 use crate::{
