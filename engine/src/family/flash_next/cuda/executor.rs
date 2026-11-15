@@ -186,6 +186,12 @@ impl<S: ResumesState> FlashCudaExecutor<S> {
 impl<S: ResumesState> ExecutorOps for FlashCudaExecutor<S> {
     type Session = DecodeSession;
 
+    /// The expert bank's lifetime counters for the request log's `prefill_bank_*` keys
+    /// (log-only). `None` when this driver keeps no bank (the fake test drivers).
+    fn prefill_bank_report(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        ResumesState::bank_snapshot(&self.driver)
+    }
+
     /// Refuses a prompt that cannot fit before any state changes.
     fn check_prompt(&self, prompt_tokens: usize) -> Result<()> {
         check_prompt(prompt_tokens, self.context_limit())

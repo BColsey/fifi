@@ -3120,7 +3120,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 4,
                 reused_tokens: 0,
-                prefix: Some(PrefixReport::default())
+                prefix: Some(PrefixReport::default()),
+                prefill_bank: None,
             }),
             "usage"
         );
@@ -3487,7 +3488,8 @@ mod tests {
                     prompt_tokens,
                     completion_tokens: 4,
                     reused_tokens: 0,
-                    prefix: Some(PrefixReport::default())
+                    prefix: Some(PrefixReport::default()),
+                    prefill_bank: None,
                 }),
                 "round {round}: usage"
             );
@@ -4839,6 +4841,7 @@ mod tests {
                     completion_tokens: 4,
                     reused_tokens: reused,
                     prefix: report,
+                    prefill_bank: None,
                 }),
                 "round {round}: usage"
             );

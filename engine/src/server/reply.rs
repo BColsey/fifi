@@ -11,7 +11,7 @@ use super::reqlog::RequestLog;
 use super::sampler_trace::TraceAligner;
 use super::wire::{FinishReason, ReplyParts, ToolCall, Usage};
 use crate::EngError;
-use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefixReport};
+use crate::sched::job::{JobEvent, JobHandle, JobUsage, PrefillBankReport, PrefixReport};
 use crate::tokenizer::{DecodeBatch, DecodeFinish, OutputAssembler};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +45,10 @@ pub(crate) struct RunningJob {
     /// the same fallback: it stays `None` unless the pump read the event, so a cancelled, failed,
     /// refused, or stop-string reply logs no prefix keys.
     prefix: Option<PrefixReport>,
+    /// The expert-bank counters of the job, read from the same `Finished` event: the
+    /// per-request delta of the counters (log-only `prefill_bank_*` keys); `None` keeps
+    /// them out.
+    prefill_bank: Option<PrefillBankReport>,
     calls: u32,
     /// The alignment replay of a traced reply: fed every batch's tokens,
     /// finished at `Done`. `None` on every request that did not arm capture.
@@ -79,6 +83,7 @@ impl RunningJob {
             produced: 0,
             reused: 0,
             prefix: None,
+            prefill_bank: None,
             calls: 0,
             trace,
             log,
@@ -135,6 +140,7 @@ impl RunningJob {
                         let usage = self.read_finished().await?;
                         self.reused = usage.reused_tokens;
                         self.prefix = usage.prefix;
+                        self.prefill_bank = usage.prefill_bank;
                     }
                     if let Some(step) = self.on_batch(&batch)? {
                         return Ok(step);
@@ -158,6 +164,7 @@ impl RunningJob {
                 completion_tokens: 0,
                 reused_tokens: 0,
                 prefix: None,
+                prefill_bank: None,
             }),
         }
     }
@@ -183,6 +190,9 @@ impl RunningJob {
         Ok((!pieces.is_empty()).then_some(Step::Pieces(pieces)))
     }
 
+    /// Assembles the reply's final step: finishes the trace, counts the tool calls, logs the
+    /// request line (with the prefix and expert-bank reports when the pump read them) and
+    /// returns the pieces with the usage.
     fn done(&mut self, pieces: Vec<Piece>, finish: FinishReason) -> Step {
         if let Some(trace) = self.trace.as_mut() {
             trace.finish();
@@ -194,7 +204,12 @@ impl RunningJob {
             finish
         };
         let usage = Usage::new(self.prompt_tokens, self.produced, self.reused);
-        self.log.done(finish, &usage, self.prefix.as_ref());
+        self.log.done(
+            finish,
+            &usage,
+            self.prefix.as_ref(),
+            self.prefill_bank.as_ref(),
+        );
         Step::Done {
             pieces,
             finish,

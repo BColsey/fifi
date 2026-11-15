@@ -66,6 +66,11 @@ impl CardDevice {
         self.moe.bank().stats().misses
     }
 
+    /// The bank's admit-path counters for the request log's `prefill_bank_*` keys (log-only).
+    pub(super) fn bank_report(&self) -> crate::sched::job::PrefillBankReport {
+        self.moe.bank().prefill_report()
+    }
+
     /// The bank's placement digest ([`bank_placement_digest`]): what a run record's step-0
     /// logits hash compares at.
     #[cfg(test)]
@@ -159,6 +164,10 @@ impl TokenDevice for CardDevice {
     fn bank_misses(&self) -> Option<u64> {
         Some(CardDevice::bank_misses(self))
     }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        Some(CardDevice::bank_report(self))
+    }
 }
 
 impl super::driver::StateIo for CardDevice {
@@ -228,6 +237,11 @@ impl CardChunkDevice {
     /// The bank's statistics line, as 's.
     pub(super) fn bank_misses(&self) -> u64 {
         self.moe.bank().stats().misses
+    }
+
+    /// The bank's admit-path counters for the request log's `prefill_bank_*` keys (log-only).
+    pub(super) fn bank_report(&self) -> crate::sched::job::PrefillBankReport {
+        self.moe.bank().prefill_report()
     }
 
     /// The bank's placement digest (slots per layer, SHA-256 of the residents at load):
@@ -355,6 +369,10 @@ impl super::driver::chunk::ChunkDevice for CardChunkDevice {
 
     fn bank_misses(&self) -> Option<u64> {
         Some(self.moe.bank().stats().misses)
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        Some(CardChunkDevice::bank_report(self))
     }
 }
 

@@ -845,6 +845,9 @@ fn run_job<E: ExecutorOps>(
         send_terminal(events, JobEvent::Error(error));
         return EngineState::Ready;
     }
+    // The admit-path bank counters before the prefill, for this request's delta (log-only;
+    // `None` is the report of an executor without an expert bank, and the delta stays `None`).
+    let bank_before = executor.prefill_bank_report();
     let reused = match start(
         executor,
         session,
@@ -964,6 +967,12 @@ fn run_job<E: ExecutorOps>(
     // the entries and bytes then include this job's save points. `None` is the report of an
     // executor that keeps none.
     let prefix = executor.prefix_report();
+    // The expert-bank counters after the prefill, for the request log's `prefill_bank_*` keys
+    // (log-only; `None` is the report of an executor without an expert bank).
+    let prefill_bank = match (executor.prefill_bank_report(), bank_before) {
+        (Some(after), Some(before)) => Some(after.saturating_sub(&before)),
+        _ => None,
+    };
     let mut completion_tokens: u32 = 0;
     loop {
         let batch = match executor.decode(session, &mut generation) {
@@ -989,6 +998,7 @@ fn run_job<E: ExecutorOps>(
                     completion_tokens,
                     reused_tokens,
                     prefix,
+                    prefill_bank,
                 }),
             );
             return EngineState::Ready;
@@ -1270,6 +1280,12 @@ mod tests {
         piece_after_prefill: Option<usize>,
         /// The context limit that `check_prompt` applies, or `None` to accept every prompt.
         context_limit: Option<usize>,
+        /// The admit-path bank reports the spy answers: the `before` sample until the first
+        /// prefill, the `after` sample from it on, both log-only.
+        bank_reports: Option<(
+            crate::sched::job::PrefillBankReport,
+            crate::sched::job::PrefillBankReport,
+        )>,
     }
 
     impl Spy {
@@ -1298,6 +1314,7 @@ mod tests {
                 piece: None,
                 piece_after_prefill: None,
                 context_limit: None,
+                bank_reports: None,
             }
         }
 
@@ -1341,6 +1358,15 @@ mod tests {
 
         fn prefix_report(&self) -> Option<PrefixReport> {
             self.inner.prefix_report()
+        }
+
+        fn prefill_bank_report(&self) -> Option<crate::sched::job::PrefillBankReport> {
+            let (before, after) = self.bank_reports.as_ref()?;
+            if self.prefill_calls > 0 {
+                Some(after.clone())
+            } else {
+                Some(before.clone())
+            }
         }
 
         fn evict_one_prefix_entry(&mut self, protect: Option<u64>) -> Option<u64> {
@@ -1490,6 +1516,56 @@ mod tests {
         Job::new(prompt.to_vec(), generation()).expect("job")
     }
 
+    #[test]
+    fn the_finished_usage_carries_the_prefill_bank_delta() {
+        use crate::sched::job::PrefillBankReport;
+
+        fn report(
+            passes: u64,
+            misses: u64,
+            histogram: Vec<u64>,
+            bytes: u64,
+            ns: u64,
+        ) -> PrefillBankReport {
+            PrefillBankReport {
+                passes,
+                misses,
+                miss_histogram: histogram.clone(),
+                route_histogram: histogram,
+                upload_bytes: bytes,
+                upload_ns: ns,
+            }
+        }
+        let log = Log::default();
+        let mut spy = Spy::new(vec![vec![EOS]], &log);
+        // Before the prefill the bank had already served one zero-miss admit; the request's
+        // own prefill adds three passes, seven misses and the byte/nanosecond deltas.
+        spy.bank_reports = Some((
+            report(2, 0, vec![1], 10, 5),
+            report(5, 7, vec![1, 0, 1], 110, 50),
+        ));
+        let engine = start_spy(4, spy);
+        let handle = engine.handle();
+        let (job, events) = job(&[1, 2, 3]);
+        handle.try_submit(job).expect("submit");
+        let events = collect(events);
+        let report = events
+            .iter()
+            .find_map(|event| match event {
+                JobEvent::Finished(usage) => usage.prefill_bank.as_ref(),
+                _ => None,
+            })
+            .expect("the finished usage carries the report");
+        assert_eq!(report.passes, 3);
+        assert_eq!(report.misses, 7);
+        assert_eq!(report.miss_histogram, vec![0, 0, 1]);
+        assert_eq!(report.route_histogram, vec![0, 0, 1]);
+        assert_eq!(report.upload_bytes, 100);
+        assert_eq!(report.upload_ns, 45);
+        drop(handle);
+        engine.shutdown();
+    }
+
     fn start_spy(chunk: usize, spy: Spy) -> super::Engine {
         spawn_engine(chunk, move |_| {
             Ok((spy, <FakeExecutor as ExecutorOps>::Session::default()))
@@ -1612,6 +1688,7 @@ mod tests {
             completion_tokens: completion,
             reused_tokens: reused,
             prefix,
+            prefill_bank: None,
         })
     }
 

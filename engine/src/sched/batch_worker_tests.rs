@@ -394,7 +394,7 @@ fn wait(condition: impl Fn() -> bool) {
 
 fn usage(events: &[JobEvent]) -> crate::sched::job::JobUsage {
     match events.last() {
-        Some(JobEvent::Finished(usage)) => *usage,
+        Some(JobEvent::Finished(usage)) => usage.clone(),
         other => panic!("missing usage: {other:?}"),
     }
 }

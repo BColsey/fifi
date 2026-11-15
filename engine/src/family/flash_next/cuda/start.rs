@@ -898,6 +898,10 @@ impl ResumesState for StepDriver {
         }
     }
 
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        StepDriver::bank_snapshot(self)
+    }
+
     fn resume_host_bytes(&self) -> u64 {
         match self {
             Self::Token(driver) => driver.resume_host_bytes(),
@@ -926,6 +930,15 @@ impl StepDriver {
         match self {
             Self::Token(driver) => driver.device().bank_misses(),
             Self::Chunk(driver) => driver.device().bank_misses(),
+        }
+    }
+
+    /// The bank's lifetime counters for the request log's `prefill_bank_*` keys (log-only):
+    /// the counters of whichever driver mode holds the device.
+    pub(super) fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        match self {
+            Self::Token(driver) => ResumesState::bank_snapshot(driver),
+            Self::Chunk(driver) => ResumesState::bank_snapshot(driver),
         }
     }
 

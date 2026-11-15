@@ -361,6 +361,11 @@ pub(in crate::family::flash_next::cuda) trait ChunkDevice {
     fn bank_misses(&self) -> Option<u64> {
         None
     }
+    /// The bank's lifetime counters for the request log's `prefill_bank_*` keys (log-only),
+    /// for a device with a bank.
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        None
+    }
 }
 
 mod shared;
@@ -713,6 +718,10 @@ impl<D: ChunkDevice, F: TokenFeeds> TokenStepper for ChunkDriver<D, F> {
 impl<D: ChunkDevice + super::StateIo, F: TokenFeeds> super::ResumesState for ChunkDriver<D, F> {
     fn resume_generation(&self) -> u64 {
         self.generation
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        self.device().bank_snapshot()
     }
 
     fn resume_host_bytes(&self) -> u64 {

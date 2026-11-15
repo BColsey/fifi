@@ -149,6 +149,7 @@ pub(in crate::family::flash_next) mod device {
             stream: &DeviceStream,
             picks: &[usize],
         ) -> Result<Vec<usize>, EngError> {
+            self.adapter.record_route(picks);
             let slots = ring_slots(
                 self.adapter.slot_row(self.layer)?,
                 self.adapter.geometry().slots,
@@ -196,6 +197,7 @@ pub(in crate::family::flash_next) mod device {
             stream: &DeviceStream,
             picks: &[usize],
         ) -> Result<Vec<usize>, EngError> {
+            self.adapter.record_route(picks);
             let ids: Vec<i32> = picks
                 .iter()
                 .map(|&id| {
@@ -395,6 +397,11 @@ pub(in crate::family::flash_next) mod device {
         /// The counters of the passes so far (hits, misses, write-backs, miss histogram).
         pub(in crate::family::flash_next) fn stats(&self) -> &BankStats {
             self.bank.stats()
+        }
+
+        /// Log-only: folds one resolve's picks into the bank's rows-per-expert route histogram.
+        pub(in crate::family::flash_next) fn record_route(&mut self, picks: &[usize]) {
+            self.bank.record_route(picks);
         }
 
         /// The sizes of the bank: layers, experts, top-k, slots per layer and the record size.

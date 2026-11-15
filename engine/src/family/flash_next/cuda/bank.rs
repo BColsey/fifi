@@ -440,12 +440,71 @@ pub(super) mod device {
         EngError,
         kernels::cuda::{CudaContext, DeviceBuffer, DeviceRange, DeviceStream, PinnedBuf},
     };
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
+    };
+
+    /// The buckets of the rows-per-expert route histogram: 1, 2, 3-4, 5-8, ..., 1025-2048 and
+    /// 2049+. The prefill tiers experts at eight rows (the experts under it run on the CPU
+    /// tail), so buckets 0-2 carry the tiered rows and bucket 3 straddles the edge at exactly
+    /// eight.
+    pub(in crate::family::flash_next) const ROUTE_BUCKETS: usize = 13;
+
+    fn route_bucket(rows: usize) -> usize {
+        match rows {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 5,
+            33..=64 => 6,
+            65..=128 => 7,
+            129..=256 => 8,
+            257..=512 => 9,
+            513..=1024 => 10,
+            1025..=2048 => 11,
+            _ => 12,
+        }
+    }
+
+    /// Folds one resolve's picks into per-expert row counts in `scratch` (reused across
+    /// resolves, so the fold hashes nothing and allocates nothing); one nonzero count per
+    /// distinct expert.
+    fn route_counts(picks: &[usize], scratch: &mut [u32]) {
+        for rows in scratch.iter_mut() {
+            *rows = 0;
+        }
+        for &id in picks {
+            if let Some(count) = scratch.get_mut(id) {
+                *count += 1;
+            }
+        }
+    }
 
     pub(in crate::family::flash_next) struct DeviceBank {
         state: ExpertBankState<ReplaceOnMissLru>,
         slots: Vec<DeviceBuffer>,
         store: Vec<PinnedBuf>,
         stream: DeviceStream,
+        /// Log-only counters for the request log's `prefill_bank_*` keys, counted on the admit
+        /// path only (the decode `step` traffic stays out): one admit pass per call, the experts
+        /// each moved in (misses), those misses bucketed by [`route_bucket`], the bytes the
+        /// admit copies and the ring's streamed records queued, and the wall time of the admit
+        /// copy spans, which end in the existing store synchronize. Atomics only to satisfy the
+        /// shared borrows of the ring views; the engine thread is the sole writer.
+        admit_passes: AtomicU64,
+        admit_misses: AtomicU64,
+        admit_miss_histogram: Vec<AtomicU64>,
+        upload_bytes: AtomicU64,
+        upload_ns: AtomicU64,
+        /// Log-only rows-per-expert histogram over every resolve of the prefill stores, by
+        /// [`route_bucket`]. Same counters convention as `admit_passes`.
+        route_histogram: Vec<AtomicU64>,
+        /// Scratch for [`DeviceBank::record_route`]: one counter per expert, reused across
+        /// resolves so the fold allocates nothing and hashes nothing per call.
+        route_scratch: std::cell::RefCell<Vec<u32>>,
     }
 
     impl DeviceBank {
@@ -498,11 +557,19 @@ pub(super) mod device {
                 }
             }
             stream.synchronize()?;
+            let experts = geometry.experts;
             Ok(Self {
                 state,
                 slots,
                 store,
                 stream,
+                admit_passes: AtomicU64::new(0),
+                admit_misses: AtomicU64::new(0),
+                admit_miss_histogram: (0..ROUTE_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+                upload_bytes: AtomicU64::new(0),
+                upload_ns: AtomicU64::new(0),
+                route_histogram: (0..ROUTE_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+                route_scratch: std::cell::RefCell::new(vec![0u32; experts]),
             })
         }
 
@@ -608,7 +675,49 @@ pub(super) mod device {
             let store = self.store.get_mut(layer).ok_or_else(|| {
                 EngError::BadRequest(format!("layer {layer} is outside the bank"))
             })?;
+            // Log-only: the ring streams one record of a held expert to the device, a real
+            // prefill upload; only its bytes are counted (its wait is a GPU-side enqueue that
+            // returns at once, so it carries no honest wall time).
+            self.upload_bytes
+                .fetch_add(geometry.record_bytes as u64, Ordering::Relaxed);
             ctx.copy_from_pinned(stream, store, geometry.offset(place as usize), dst)
+        }
+
+        /// Log-only: folds one prefill resolve's picks into the rows-per-expert route histogram:
+        /// one histogram count per distinct expert, at that expert's row count in the resolve.
+        /// Counts into the per-expert scratch, so the fold hashes nothing and allocates nothing.
+        pub(in crate::family::flash_next) fn record_route(&self, picks: &[usize]) {
+            let mut scratch = self.route_scratch.borrow_mut();
+            route_counts(picks, &mut scratch);
+            for rows in scratch.iter() {
+                if *rows > 0
+                    && let Some(bucket) = self.route_histogram.get(route_bucket(*rows as usize))
+                {
+                    bucket.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        /// The log-only admit-path counters of the bank, for the per-request report.
+        pub(in crate::family::flash_next) fn prefill_report(
+            &self,
+        ) -> crate::sched::job::PrefillBankReport {
+            crate::sched::job::PrefillBankReport {
+                passes: self.admit_passes.load(Ordering::Relaxed),
+                misses: self.admit_misses.load(Ordering::Relaxed),
+                miss_histogram: self
+                    .admit_miss_histogram
+                    .iter()
+                    .map(|bucket| bucket.load(Ordering::Relaxed))
+                    .collect(),
+                route_histogram: self
+                    .route_histogram
+                    .iter()
+                    .map(|bucket| bucket.load(Ordering::Relaxed))
+                    .collect(),
+                upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+                upload_ns: self.upload_ns.load(Ordering::Relaxed),
+            }
         }
 
         pub(in crate::family::flash_next) fn stream(&self) -> &DeviceStream {
@@ -645,7 +754,36 @@ pub(super) mod device {
         ) -> Result<PassCopies, EngError> {
             self.check_usable()?;
             let copies = self.state.admit(layer, experts_by_use)?;
-            self.finish(ctx, copies)
+            // Log-only, admit path: one pass, the experts it moved in (misses) with their
+            // bucket, the bytes queued (H2D plus any demotion D2H) and the wall of the copy
+            // span, which ends in the existing store synchronize. The decode `step` traffic
+            // never enters these counters.
+            self.admit_passes.fetch_add(1, Ordering::Relaxed);
+            self.admit_misses
+                .fetch_add(copies.ops.len() as u64, Ordering::Relaxed);
+            // A zero-miss admit (everything already resident) lands in no bucket; the passes
+            // count minus the histogram sum carries it.
+            if !copies.ops.is_empty()
+                && let Some(bucket) = self
+                    .admit_miss_histogram
+                    .get(route_bucket(copies.ops.len()))
+            {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+            let record = self.state.geometry().record_bytes as u64;
+            let mut bytes = 0u64;
+            for op in &copies.ops {
+                bytes += record;
+                if op.demote.is_some() {
+                    bytes += record;
+                }
+            }
+            self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+            let started = Instant::now();
+            self.finish(ctx, copies).inspect(|_| {
+                self.upload_ns
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            })
         }
 
         fn finish(
@@ -710,6 +848,54 @@ pub(super) mod device {
                 .get(layer)
                 .ok_or_else(|| EngError::BadRequest(format!("layer {layer} is outside the bank")))?
                 .read(geometry.offset(place as usize), out)
+        }
+    }
+
+    #[cfg(test)]
+    mod route_tests {
+        use super::{ROUTE_BUCKETS, route_bucket, route_counts};
+
+        #[test]
+        fn the_route_buckets_hold_the_tier_edge_exactly_at_eight() {
+            for (rows, bucket) in [
+                (1usize, 0usize),
+                (2, 1),
+                (3, 2),
+                (4, 2),
+                (5, 3),
+                (7, 3),
+                (8, 3),
+                (9, 4),
+                (16, 4),
+                (17, 5),
+                (64, 6),
+                (65, 7),
+                (128, 7),
+                (256, 8),
+                (2048, 11),
+                (2049, 12),
+                (4096, 12),
+            ] {
+                assert_eq!(route_bucket(rows), bucket, "rows {rows}");
+            }
+            assert_eq!(ROUTE_BUCKETS, 13);
+        }
+
+        #[test]
+        fn one_resolve_folds_to_one_count_per_distinct_expert() {
+            let mut scratch = vec![0u32; 5];
+            route_counts(&[0, 0, 1, 3, 3, 3], &mut scratch);
+            assert_eq!(scratch, vec![2, 1, 0, 3, 0]);
+            // Reuse resets: a second resolve sees only its own picks.
+            route_counts(&[4], &mut scratch);
+            assert_eq!(scratch, vec![0, 0, 0, 0, 1]);
+        }
+
+        #[test]
+        fn an_out_of_range_pick_counts_nowhere_rather_than_panicking() {
+            let mut scratch = vec![0u32; 2];
+            route_counts(&[0, 7, 1], &mut scratch);
+            assert_eq!(scratch, vec![1, 1]);
         }
     }
 }

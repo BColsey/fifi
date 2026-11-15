@@ -194,6 +194,11 @@ pub(crate) trait ResumesState: StepperPositions {
     /// stamps it into the prefix store's path, so a restore at any other generation never
     /// matches the entry — the rows it left in place may have been overwritten meanwhile.
     fn resume_generation(&self) -> u64;
+    /// The expert bank's lifetime counters for the request log's `prefill_bank_*` keys
+    /// (log-only). The default is `None`: a driver without an expert bank reports nothing.
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        None
+    }
     /// The host bytes [`Self::save_resume`] would produce now, without reading any device
     /// state: the budget charge of one more entry.
     fn resume_host_bytes(&self) -> u64;
@@ -220,6 +225,11 @@ pub(super) trait TokenDevice: StartSink {
     fn reset(&mut self) -> Result<()>;
     /// Expert bank misses so far, for a device with a bank.
     fn bank_misses(&self) -> Option<u64> {
+        None
+    }
+    /// The bank's lifetime counters for the request log's `prefill_bank_*` keys (log-only),
+    /// for a device with a bank.
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
         None
     }
 }
@@ -268,6 +278,11 @@ impl<D: TokenDevice, F: TokenFeeds> TokenDriver<D, F> {
     /// Expert bank misses so far.
     pub(super) fn bank_misses(&self) -> Option<u64> {
         self.device.bank_misses()
+    }
+
+    /// The bank's lifetime counters for the request log (log-only).
+    pub(super) fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        self.device.bank_snapshot()
     }
 
     /// Positions the caches hold.
@@ -440,6 +455,10 @@ impl<D: TokenDevice, F: TokenFeeds> TokenStepper for TokenDriver<D, F> {
 impl<D: TokenDevice + StateIo, F: TokenFeeds> ResumesState for TokenDriver<D, F> {
     fn resume_generation(&self) -> u64 {
         self.generation
+    }
+
+    fn bank_snapshot(&self) -> Option<crate::sched::job::PrefillBankReport> {
+        TokenDriver::bank_snapshot(self)
     }
 
     fn save_resume(&self) -> Result<ResumeSnapshot> {
