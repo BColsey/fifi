@@ -22,8 +22,7 @@ use super::{
 };
 use crate::family::flash_next::cuda::feeds::device::DevicePle;
 use crate::{
-    EngError, family::qwen36::exl3_tensors::f32_le_bytes,
-    kernels::cuda::resident::step_params::StepParams,
+    EngError, family::exl3_tensors::f32_le_bytes, kernels::cuda::resident::step_params::StepParams,
 };
 
 pub(super) struct CardDevice {

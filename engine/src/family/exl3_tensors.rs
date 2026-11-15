@@ -15,7 +15,11 @@ use crate::{
 };
 
 /// Exact source vectors, not reshapes of another tensor with the same byte count.
-pub(super) fn norm_layout(dtype: Dtype, shape: &[u32], values: usize) -> Result<usize, EngError> {
+pub(in crate::family) fn norm_layout(
+    dtype: Dtype,
+    shape: &[u32],
+    values: usize,
+) -> Result<usize, EngError> {
     if values == 0 || shape.len() != 1 || shape[0] as usize != values {
         return Err(EngError::Checkpoint(format!(
             "EXL3 attention norm: shape {shape:?}, expected [{values}]"
@@ -32,7 +36,10 @@ pub(super) fn norm_layout(dtype: Dtype, shape: &[u32], values: usize) -> Result<
 }
 
 /// Convert actual storage to F32, then add one in F32, never in F16 or BF16.
-pub(super) fn effective_norm_bytes(tensor: &Tensor, values: usize) -> Result<Vec<u8>, EngError> {
+pub(in crate::family) fn effective_norm_bytes(
+    tensor: &Tensor,
+    values: usize,
+) -> Result<Vec<u8>, EngError> {
     let output_len = norm_layout(tensor.dtype(), tensor.shape(), values)?;
     let bytes = tensor
         .host_bytes()
@@ -136,7 +143,7 @@ pub(in crate::family) fn decay_from_log(log: &[f32]) -> Result<Vec<f32>, EngErro
 
 /// For each value head `t` of the kernel's tiled order, the head it takes from the pack's
 /// grouped order.
-pub(super) fn tiled_head_order(
+pub(in crate::family) fn tiled_head_order(
     key_heads: usize,
     value_heads: usize,
 ) -> Result<Vec<usize>, EngError> {
@@ -151,7 +158,7 @@ pub(super) fn tiled_head_order(
         .collect())
 }
 
-pub(super) fn permute_blocks<T: Copy>(
+pub(in crate::family) fn permute_blocks<T: Copy>(
     values: &[T],
     block: usize,
     order: &[usize],

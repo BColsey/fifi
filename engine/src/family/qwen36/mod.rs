@@ -32,7 +32,7 @@ pub(crate) use self::exl3_pack::exl3_plan;
 #[cfg(test)]
 mod exl3_pack_tests;
 #[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
-pub(in crate::family) mod exl3_tensors;
+pub(in crate::family) use crate::family::exl3_tensors;
 #[cfg(test)]
 mod exl3_tokenizer_tests;
 pub(crate) mod factory;

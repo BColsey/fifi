@@ -277,9 +277,10 @@ pub(in crate::family) mod upload {
     use crate::{
         EngError,
         family::{
+            exl3_tensors::decay_from_log,
             flash_next::moe::load_plan::FlashLoadPlan,
             project::cuda::{CudaWeight, CudaWeights},
-            qwen36::{cuda::exl3_source::PackReader, exl3_tensors::decay_from_log},
+            qwen36::cuda::exl3_source::PackReader,
         },
     };
 

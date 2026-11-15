@@ -59,12 +59,11 @@ use super::dims::{KvMode, StepDims, StepOptions};
 use crate::{
     EngError,
     family::{AttentionKind, kv_format::KvRowShape},
-    kernels::cuda::resident::step_params::{RESULT_PAIR_BYTES, STEP_PARAMS_BYTES},
 };
 
 /// Offsets inside a state pool are multiples of this many bytes (the `cudaMalloc` alignment, as
-/// in the arena planner).
-pub(super) const STATE_ALIGN: usize = 256;
+/// in the arena planner). The shared words contract owns the constant.
+use crate::family::state_words::STATE_ALIGN;
 /// Values per fp16 scale in the `Int8G32` format.
 pub(super) const KV8_GROUP: usize = 32;
 const HALF: usize = 2;
@@ -346,49 +345,6 @@ impl KvPool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Word {
-    StepParams,
-    /// The result pair `{token, status}`; the host copies these 8 bytes after a step.
-    ResultPair,
-    /// The prefill status word; the host zeroes it at chunk open
-    /// (`ResidentState::clear_prefill_status`), not the first kernel of the chunk.
-    PrefillStatus,
-}
-
-// The merged ABI: the pair must be 8-aligned in its slot and every word must fit one slot.
-const _: () = assert!(
-    Word::StepParams.bytes() == 32 && Word::ResultPair.bytes() == 8,
-    "the words block is laid out for StepParams of 32 bytes and a result pair of 8 bytes"
-);
-const _: () = assert!(
-    Word::StepParams.bytes() <= STATE_ALIGN
-        && Word::ResultPair.bytes() <= STATE_ALIGN
-        && Word::PrefillStatus.bytes() <= STATE_ALIGN
-        && Word::ResultPair.offset().is_multiple_of(8)
-);
-
-impl Word {
-    /// Bytes the kernels use: `STEP_PARAMS_BYTES` (32) and `RESULT_PAIR_BYTES` (8), taken from the
-    /// kernel wrapper, and one i32 for the prefill status.
-    pub(crate) const fn bytes(self) -> usize {
-        match self {
-            Self::StepParams => STEP_PARAMS_BYTES,
-            Self::ResultPair => RESULT_PAIR_BYTES,
-            Self::PrefillStatus => 4,
-        }
-    }
-
-    /// Byte offset in the words block: one `STATE_ALIGN` slot per word, in declaration order.
-    pub(crate) const fn offset(self) -> usize {
-        match self {
-            Self::StepParams => 0,
-            Self::ResultPair => STATE_ALIGN,
-            Self::PrefillStatus => 2 * STATE_ALIGN,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WordsBlock {
     pub(crate) total: usize,
 }
@@ -440,3 +396,5 @@ impl StateLayout {
         })
     }
 }
+
+pub(in crate::family) use crate::family::state_words::Word;

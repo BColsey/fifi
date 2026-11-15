@@ -55,7 +55,7 @@ use crate::{
             step::ModelShape,
         },
         graph_state::book::StateBook,
-        qwen36::cuda::state_layout::Word,
+        state_words::Word,
     },
     kernels::{
         ARENA_ALIGN,

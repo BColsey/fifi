@@ -15,6 +15,8 @@ pub(crate) mod exl3_pack;
 pub(crate) mod flash_next;
 
 pub(crate) mod device_budget;
+#[cfg(any(test, all(feature = "native-cuda", target_os = "linux")))]
+pub(in crate::family) mod exl3_tensors;
 /// The shared host half of the expert-bank seam: the slot-policy contract, the host places,
 /// the copy plan of a pass, the counters. Ungated on purpose so plain host gates compile and
 /// run the seam's tests without the card feature.
@@ -73,6 +75,8 @@ pub mod spec;
     reason = "the CUDA n-gram step reaches the repeat index, the accept rule, the window and the driver; the MTP chain, the calibrator and the hybrid and dynamic settings are reached only from tests until the MTP draft step exists"
 )]
 pub(crate) mod speculate;
+#[cfg(all(feature = "native-cuda", target_os = "linux"))]
+pub(in crate::family) mod state_words;
 pub(crate) mod tiered_classify;
 /// Qualification only: the device harnesses and the offline verdict are tests.
 #[cfg(test)]

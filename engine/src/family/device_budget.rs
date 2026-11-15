@@ -19,7 +19,7 @@
 
 /// The KV side of a family preflight: how many positions the caller configured and
 /// what one position costs. A plain pair of the caller's measurements (8-bit KV on
-/// every backend); the tiered plans and the Flash-Next loaders both fill it.
+/// every backend); the tiered plans and other family loaders fill it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvPlan {
     /// Context positions the caller configured (positions, not bytes).

@@ -77,7 +77,7 @@ impl Classified {
 /// listed and still published: `[1, 1]` with expert 1 missing lists `(1, w0)` AND sets
 /// [`ROUTE_INVALID`] for the repeat, because the token fails on the word later and the kernel does
 /// not look ahead. `Err` when the lists differ in length. The function does not bound the number of
-/// picks: the kernel takes `top_k <= 12` as a launch argument (8 for Qwen3.6, 10 for Flash-Next).
+/// picks: the kernel takes `top_k <= 12` as a launch argument (the served models use 8 and 10).
 pub fn classify_reference(
     slot_row: &[i32],
     slots: usize,
@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(got.weights[1].to_bits(), 0.0f32.to_bits(), "+0.0, not -0.0");
     }
 
-    /// Flash-Next: 512 experts, 10 picks. The reference does not bound the picks, so ten classify like eight.
+    /// A 512-expert, 10-pick shape. The reference does not bound the picks, so ten classify like eight.
     #[test]
     fn ten_picks_over_512_experts_classify_by_the_same_rule() {
         let mut row = vec![-1i32; 512];
