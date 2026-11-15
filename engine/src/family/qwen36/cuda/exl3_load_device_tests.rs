@@ -152,12 +152,10 @@ fn banked_load_holds_dense_plus_slots_and_stores_every_expert() {
         store,
         slots: got_slots,
         experts: got_experts,
-        routed_bytes,
         dense_bytes,
     } = load_exl3_banked_dir(&projector, dir, slots, Reserve::default()).expect("banked load");
     assert_eq!(got_slots, slots);
     assert_eq!(got_experts, experts);
-    assert_eq!(routed_bytes, routed);
     assert_eq!(dense_bytes, dense);
     assert_eq!(weights.device_bytes() as u64, expected_device);
     assert_eq!(store.layers(), layers);

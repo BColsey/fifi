@@ -1270,7 +1270,6 @@ fn make(
                         store,
                         slots,
                         experts,
-                        routed_bytes: _,
                         dense_bytes: _,
                     } = *banked;
                     banked_inner = Some((store, slots, experts));

@@ -70,7 +70,6 @@ fn banked_decode_timing_probe_reports_the_round_trip_shares() {
         store,
         slots,
         experts,
-        routed_bytes: _,
         dense_bytes: _,
     } = banked;
     let table = LayerTable::new(&dims(), &inventory()).expect("table");

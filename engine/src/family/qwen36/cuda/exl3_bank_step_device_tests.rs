@@ -107,7 +107,6 @@ fn banked_leg(
         store,
         slots,
         experts,
-        routed_bytes: _,
         dense_bytes: _,
     } = model;
     let table = LayerTable::new(&dims(), &inventory())?;

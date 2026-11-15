@@ -201,7 +201,6 @@ fn the_banked_krow_window_commits_the_one_row_tokens_and_state() {
         store,
         slots,
         experts,
-        routed_bytes: _,
         dense_bytes: _,
     } = model;
     let context = projector.context();

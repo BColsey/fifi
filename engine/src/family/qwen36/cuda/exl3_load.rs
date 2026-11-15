@@ -59,7 +59,6 @@ pub(super) struct BankedModel {
     /// The model's routed experts per layer (the store holds every one; the banks hold
     /// `slots`).
     pub(super) experts: usize,
-    pub(super) routed_bytes: u64,
     pub(super) dense_bytes: u64,
 }
 
@@ -99,7 +98,6 @@ pub(super) fn load_exl3_banked_dir(
         store,
         slots,
         experts: shape.moe.experts,
-        routed_bytes: report.expert_bytes,
         dense_bytes: dense,
     })
 }
