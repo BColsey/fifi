@@ -683,6 +683,7 @@ pub(super) fn build_driver(
         let slots = block.plan_ring(
             ctx,
             (ring_budget / u64::try_from(record_bytes).unwrap_or(u64::MAX)) as usize,
+            wanted.ring_rows as usize,
         )?;
         if slots == 0 {
             eprintln!(
@@ -692,8 +693,10 @@ pub(super) fn build_driver(
             );
         } else {
             eprintln!(
-                "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank",
-                slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                "flash-next cuda: prefill ring of {slots} slots ({:.2} GiB) behind the bank; \
+                 shared prefill whole-chunk at {} rows and above (legacy path always streams)",
+                slots as f64 * record_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                wanted.ring_rows
             );
         }
     }

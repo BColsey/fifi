@@ -1163,6 +1163,9 @@ fn prefill_chunks<E: ExecutorOps>(
             ));
         }
         let (piece, rest) = remaining.split_at(rows.min(remaining.len()));
+        // The executor's prefill error passes through unchanged: this is shared scheduler
+        // code, and a piece-index prefix would reach HTTP 400 clients of every family on
+        // default-off paths. The piece shape is recorded in the request log instead.
         executor.prefill(session, piece)?;
         pieces.count = pieces.count.saturating_add(1);
         pieces.max_rows = pieces

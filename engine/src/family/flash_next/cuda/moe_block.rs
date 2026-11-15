@@ -502,6 +502,18 @@ mod device {
         /// The prefill expert ring: `None` until [`SplitMoe::plan_ring`] funds one; the
         /// multi-row path streams through it instead of admitting into the bank.
         ring: Option<crate::family::flash_next::cuda::prefill_ring::device::PrefillRing>,
+        /// The chunked-prefill row count at and above which an active ring serves the whole
+        /// chunk; smaller chunks take the bank's union-admit path. Set when the ring is
+        /// planned (`ring_rows`, default 32).
+        ring_min_rows: usize,
+        /// Latched once a prefill window streams a whole chunk through the ring: the rest of
+        /// that window, including its trailing single-row logits step, stays on the ring.
+        /// Switching mid-window would read the pinned store on the bank stream while the
+        /// ring's copies are outstanding on the copy stream, which `PinnedBuf` refuses (one
+        /// outstanding stream per store). Reset at `begin_prefill`, which also drains any ring
+        /// copy a reopened window left outstanding; a window whose chunks are all below
+        /// `ring_min_rows` never engages the ring and admits against that quiet store.
+        ring_engaged: bool,
     }
 
     /// One pass over the bank.
@@ -638,6 +650,8 @@ mod device {
                 book,
                 verify_finite_filler: false,
                 ring: None,
+                ring_min_rows: 1,
+                ring_engaged: false,
             })
         }
 
@@ -650,6 +664,7 @@ mod device {
             &mut self,
             ctx: &CudaContext,
             budget: usize,
+            min_rows: usize,
         ) -> Result<usize, EngError> {
             let geometry = *self.bank.geometry();
             let streamed = geometry
@@ -667,17 +682,31 @@ mod device {
             }
             let slots = ring.ring_slots();
             self.ring = Some(ring);
+            self.ring_min_rows = min_rows;
             Ok(slots)
         }
 
         /// Re-plans the ring against the bank as decode left it, at the start of every prompt's
         /// chunked prefill.
-        pub(in crate::family::flash_next) fn begin_prefill(&mut self) {
+        pub(in crate::family::flash_next) fn begin_prefill(&mut self) -> Result<(), EngError> {
+            self.ring_engaged = false;
             if let Some(ring) = &mut self.ring {
+                // A save-point segment re-opens the window with no intervening end_prefill, so
+                // the prior segment's ring-stream copies may still be outstanding on the shared
+                // stores. Drain them before this window's bank-stream union-admit copies refuse
+                // a copy outstanding on the copy stream. Only ring-stream pendings are ours;
+                // decode's bank-stream copies are left alone.
+                let layers = self.bank.geometry().layers;
+                for layer in 0..layers {
+                    if self.bank.store_pending_stream(layer) == Some(ring.copy_stream().id()) {
+                        self.bank.synchronize_store(layer, ring.copy_stream())?;
+                    }
+                }
                 ring.replan(&self.bank);
                 ring.set_active(true);
                 ring.begin_chunk();
             }
+            Ok(())
         }
 
         /// Closes the prefill window: waits the ring's copies out and hands the pinned stores
@@ -1020,7 +1049,23 @@ mod device {
                 return Err(refuse("the shared permutation range is too short".into()));
             }
             let ring_active = self.ring.as_ref().is_some_and(|ring| ring.active());
-            let sub_rows = if ring_active {
+            // A window whose chunks are all below `ring_min_rows` takes the bank's union-admit
+            // path: a small chunk's picks usually fit the bank without admission, and the ring
+            // re-issues its copies every chunk, which costs more than grouping saves there.
+            // Once a window streams a whole chunk it latches onto the ring (`ring_engaged`) for
+            // the rest of the window, so the trailing single-row logits step does not switch to
+            // the bank stream while the ring's copies are outstanding on the copy stream.
+            // Invariant: pieces within a window never grow (the chunk driver feeds equal-sized
+            // pieces, a smaller remainder, then the 1-row logits step), so a union admit never
+            // follows a whole chunk in the same window and the begin_prefill ring plan stays
+            // valid; each scheduler piece reopens its own window.
+            let whole_chunk = crate::family::flash_next::settings::ring_whole_chunk(
+                ring_active,
+                dims.rows,
+                self.ring_min_rows,
+                self.ring_engaged,
+            );
+            let sub_rows = if whole_chunk {
                 // The frozen bank plus the ring cover every expert; one whole-chunk plan
                 // groups each source, without bank admission or row-at-a-time launches.
                 dims.rows
@@ -1044,7 +1089,8 @@ mod device {
                 })
                 .collect();
             let launch = projector.launch;
-            if ring_active {
+            if whole_chunk {
+                self.ring_engaged = true;
                 self.ring.as_mut().expect("active ring").issue_through(
                     launch.ctx,
                     &mut self.bank,
@@ -1080,7 +1126,7 @@ mod device {
                 up: trunk.shared_up,
                 down: trunk.shared_down,
             };
-            if ring_active {
+            if whole_chunk {
                 let ring = self.ring.as_ref().expect("active ring");
                 let mut store = RingStore {
                     adapter: PrefillAdapter::new(&mut self.bank),
@@ -1099,6 +1145,11 @@ mod device {
                     .expect("active ring")
                     .free_layer(launch.stream, layer);
             }
+            // No ring drain is needed here: ring copies are issued only by the whole-chunk
+            // branch, which latches `ring_engaged`, so a union admit never follows a ring copy
+            // in the same window; `begin_prefill` drains a reopened window's outstanding ring
+            // copies before the latch resets.
+            let ring_funded = self.ring.is_some();
             let mut store = LayerStore {
                 adapter: PrefillAdapter::new(&mut self.bank),
                 ctx: launch.ctx,
@@ -1109,7 +1160,22 @@ mod device {
                     .scratch
                     .range(self.layout.slot_row, dims.n_expert * I32)?,
             };
-            prefill_moe::run_store(projector, &weights, &common, dims, &sub, &mut store)
+            prefill_moe::run_store(projector, &weights, &common, dims, &sub, &mut store).map_err(
+                |error| {
+                    // The admit-site context is ring-path only; without a ring the union admit
+                    // is the stock shared-prefill path and its error text stays unchanged.
+                    if ring_funded {
+                        match error {
+                            EngError::BadRequest(message) => EngError::BadRequest(format!(
+                                "prefill union admit at layer {layer}: {message}"
+                            )),
+                            other => other,
+                        }
+                    } else {
+                        error
+                    }
+                },
+            )
         }
 
         /// The MoE block of a chunk of `dims.rows` rows (`2..=MAX_STEP_ROWS`), the batched shape of

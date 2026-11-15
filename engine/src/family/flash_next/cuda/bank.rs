@@ -627,6 +627,17 @@ pub(super) mod device {
             store.synchronize(stream)
         }
 
+        /// The stream id holding `layer`'s pinned store copy, if any (read-only). The prefill
+        /// union admit drains a pending ring-stream copy before admitting on the bank stream.
+        pub(in crate::family::flash_next) fn store_pending_stream(
+            &self,
+            layer: usize,
+        ) -> Option<u64> {
+            self.store
+                .get(layer)
+                .and_then(|store| store.pending_stream())
+        }
+
         /// The classifier's slot row of `layer` (upload it after every pass that moved a slot).
         /// Refused once the bank is poisoned, so a launch cannot classify against a table the
         /// device does not hold.
