@@ -67,7 +67,7 @@ use crate::{
             },
             settings::{CudaSettings, FlashSettings},
         },
-        flint::exl3_resident::HostBudget,
+        host_admit::HostAdmission,
         project::cuda::{CudaProjector, CudaWeight, CudaWeights, Reserve, exl3::Exl3Weight},
         session::DecodeSession,
     },
@@ -578,7 +578,7 @@ pub(super) fn build_driver(
     );
     let ple_width = (model.hyper.hidden() * model.hyper.branches() + model.hyper.hidden()) as u64;
     let ple_bytes = ple_width * model.ple.embed() as u64 * 4;
-    HostBudget::probe()?.admit_for(
+    HostAdmission::probe()?.admit_for(
         host_plan.process_bytes + ple_bytes,
         "Flash-Next expert bank and PLE projections",
     )?;
